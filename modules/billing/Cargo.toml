@@ -9,7 +9,13 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
-# Dependencies land in PR-4 (billing module scaffold) and PR-5 (the binary
-# wiring). This Cargo.toml currently declares the package shell only so the
-# workspace compiles cleanly under `cargo build --workspace --locked`.
+# Per ADR-0021 Part A item 2: library crates use thiserror, not anyhow.
 [dependencies]
+duckdb = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]

@@ -24,6 +24,14 @@ dependencies = [
 [[package]]
 name = "aberp-billing"
 version = "0.0.0"
+dependencies = [
+ "duckdb",
+ "serde",
+ "thiserror 1.0.69",
+ "time",
+ "tracing",
+ "ulid",
+]
 
 [[package]]
 name = "adler2"
