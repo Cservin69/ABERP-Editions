@@ -25,6 +25,13 @@ build/
 # Tauri build output
 src-tauri/target/
 src-tauri/gen/
+# Custom Tauri layout: aberp-ui places its Tauri crate at the workspace
+# member root (apps/aberp-ui/) rather than the conventional src-tauri/
+# subdir, so tauri-build emits `apps/aberp-ui/gen/` instead of
+# `src-tauri/gen/`. The schemas there are codegen output from
+# capabilities/*.json + tauri.conf.json and regenerate on every
+# `cargo build` — checking them in adds noise to every capability tweak.
+apps/aberp-ui/gen/
 
 # --- ABERP runtime data (NEVER commit) ----------------------
 # Per-tenant DuckDB files and their audit-ledger mirrors.
