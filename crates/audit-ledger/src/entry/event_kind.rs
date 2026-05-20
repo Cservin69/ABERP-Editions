@@ -16,10 +16,26 @@
 /// `submit-invoice` flow; `InvoiceAckStatus` is added now (rather than
 /// in PR-7-C) so the three-coordinated-edit trap (PR-6.1 F12 — variant +
 /// `as_str` + `from_storage_str` + the test-list array) is closed for the
-/// whole NAV submission path in one PR. The remaining invoice-lifecycle
-/// kinds (`Finalized`, `Rejected`, `SubmissionStuck`, `Voided`, `Amended`,
-/// `StornoIssued`, `TechnicalAnnulmentRequested`) land when their state
-/// transition first fires in the codebase.
+/// whole NAV submission path in one PR.
+///
+/// PR-8 adds two operator-unblock kinds from ADR-0009 §5
+/// (`InvoiceRetryRequested`, `InvoiceMarkedAbandoned`). Each marks an
+/// **operator-initiated** event distinct from the per-attempt NAV
+/// evidence kinds: `InvoiceRetryRequested` records the operator's
+/// decision to re-submit a stuck invoice (the retry itself then
+/// produces normal `InvoiceSubmissionAttempt` / `InvoiceSubmissionResponse`
+/// entries via the existing submit pipeline); `InvoiceMarkedAbandoned`
+/// records the operator's decision to stop retrying. Both adds
+/// re-exercise the F12 four-coordinated-edit trap — variant +
+/// `as_str` + `from_storage_str` + the `round_trip_for_every_variant`
+/// hand-listed array. This is the first PR since PR-6.1 to add a new
+/// variant; the trap is performing its job by definition only if all
+/// four edits land in the same commit.
+///
+/// The remaining invoice-lifecycle kinds (`Finalized`, `Rejected`,
+/// `SubmissionStuck`, `Voided`, `Amended`, `StornoIssued`,
+/// `TechnicalAnnulmentRequested`) land when their state transition
+/// first fires in the codebase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
     /// Test-only kind used by `tests/chain_conformance.rs`. Not allowed in
@@ -54,6 +70,24 @@ pub enum EventKind {
     /// emit this; the variant is declared in PR-7-B-3 to close the
     /// three-coordinated-edit trap in one go.
     InvoiceAckStatus,
+
+    /// The operator initiated a re-submission of an invoice that is in
+    /// the `SubmissionStuck` precondition per ADR-0009 §5. Payload
+    /// carries the prior `transaction_id`, the prior last ack status
+    /// (the audit precondition justification), and the operator's
+    /// reason text. The retry itself then fires the normal
+    /// `InvoiceSubmissionAttempt` + `InvoiceSubmissionResponse` pair
+    /// via the existing submit pipeline; this kind records the
+    /// **operator's decision** distinctly so the audit-evidence
+    /// bundle (ADR-0009 §8) makes the unblock explicit. PR-8.
+    InvoiceRetryRequested,
+
+    /// The operator marked a stuck invoice abandoned per ADR-0009 §5.
+    /// Terminal in the audit ledger — no further automatic state
+    /// advance is permitted for this invoice. Payload carries the
+    /// prior `transaction_id`, the prior last ack status, and the
+    /// operator's reason text. PR-8.
+    InvoiceMarkedAbandoned,
 }
 
 impl EventKind {
@@ -68,6 +102,8 @@ impl EventKind {
             EventKind::InvoiceSubmissionAttempt => "invoice.submission_attempt",
             EventKind::InvoiceSubmissionResponse => "invoice.submission_response",
             EventKind::InvoiceAckStatus => "invoice.ack_status",
+            EventKind::InvoiceRetryRequested => "invoice.retry_requested",
+            EventKind::InvoiceMarkedAbandoned => "invoice.marked_abandoned",
         }
     }
 
@@ -91,6 +127,8 @@ impl EventKind {
             "invoice.submission_attempt" => Ok(EventKind::InvoiceSubmissionAttempt),
             "invoice.submission_response" => Ok(EventKind::InvoiceSubmissionResponse),
             "invoice.ack_status" => Ok(EventKind::InvoiceAckStatus),
+            "invoice.retry_requested" => Ok(EventKind::InvoiceRetryRequested),
+            "invoice.marked_abandoned" => Ok(EventKind::InvoiceMarkedAbandoned),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -118,6 +156,8 @@ mod tests {
             EventKind::InvoiceSubmissionAttempt,
             EventKind::InvoiceSubmissionResponse,
             EventKind::InvoiceAckStatus,
+            EventKind::InvoiceRetryRequested,
+            EventKind::InvoiceMarkedAbandoned,
         ];
         for v in variants {
             let s = v.as_str();
@@ -146,5 +186,19 @@ mod tests {
             .as_str()
             .starts_with("invoice."));
         assert!(EventKind::InvoiceAckStatus.as_str().starts_with("invoice."));
+    }
+
+    /// PR-8 specifically: the two operator-unblock kinds must also use
+    /// the `invoice.` prefix so the audit-evidence bundle (ADR-0009 §8)
+    /// can be filtered with the same prefix glob as the NAV-evidence
+    /// kinds. Same loud-fail rationale as `pr_7_b_3_kinds_use_invoice_prefix`.
+    #[test]
+    fn pr_8_operator_unblock_kinds_use_invoice_prefix() {
+        assert!(EventKind::InvoiceRetryRequested
+            .as_str()
+            .starts_with("invoice."));
+        assert!(EventKind::InvoiceMarkedAbandoned
+            .as_str()
+            .starts_with("invoice."));
     }
 }

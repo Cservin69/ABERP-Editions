@@ -267,8 +267,7 @@ impl RejectedInvoice {
 /// exhausted, OR NAV returned a non-retryable error during the poll
 /// (per ADR-0009 §5). No automatic state advance — the operator
 /// unblocks via a typed `RetrySubmission` or `MarkSubmissionAbandoned`
-/// command (future scope; ADR-0009 §5 names both). Fields mirror
-/// [`SubmittedInvoice`] verbatim.
+/// command (PR-8). Fields mirror [`SubmittedInvoice`] verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionStuckInvoice {
     pub id: InvoiceId,
@@ -283,6 +282,60 @@ pub struct SubmissionStuckInvoice {
 
 impl SubmissionStuckInvoice {
     /// Sum of all line gross totals. Returns `None` on overflow.
+    pub fn total_gross(&self) -> Option<Huf> {
+        self.lines
+            .iter()
+            .try_fold(Huf::ZERO, |acc, line| acc.checked_add(line.gross_total()?))
+    }
+
+    /// Consume this `SubmissionStuckInvoice` and produce an
+    /// [`AbandonedInvoice`]. Driven by the operator's
+    /// `MarkSubmissionAbandoned` decision per ADR-0009 §5 (PR-8).
+    /// The transition consumes `self` per the new-type-state rule —
+    /// an abandoned invoice cannot be re-submitted, re-polled, or
+    /// re-abandoned through this codepath. The sequence slot is NOT
+    /// reused (gap-free invariant remains intact); the audit ledger's
+    /// `InvoiceMarkedAbandoned` entry documents the abandonment and
+    /// a corrective new invoice must be issued if the business
+    /// transaction still needs reporting.
+    pub fn into_abandoned(self) -> AbandonedInvoice {
+        AbandonedInvoice {
+            id: self.id,
+            series_id: self.series_id,
+            customer_id: self.customer_id,
+            lines: self.lines,
+            issue_date: self.issue_date,
+            sequence_number: self.sequence_number,
+            fiscal_year: self.fiscal_year,
+            nav_transaction_id: self.nav_transaction_id,
+        }
+    }
+}
+
+/// An abandoned invoice: the operator ran `MarkSubmissionAbandoned`
+/// per ADR-0009 §5. Terminal in the typestate machine — no transition
+/// out exists, by design. The sequence slot is NOT reused (gap-free
+/// invariant); the audit ledger's `InvoiceMarkedAbandoned` entry plus
+/// the upstream `InvoiceSubmissionAttempt` / `InvoiceSubmissionResponse`
+/// / `InvoiceAckStatus` chain is the audit-evidence body. Fields
+/// mirror [`SubmissionStuckInvoice`] verbatim so the audit-evidence
+/// bundle can reconstruct the full invoice body from this state alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbandonedInvoice {
+    pub id: InvoiceId,
+    pub series_id: SeriesId,
+    pub customer_id: CustomerId,
+    pub lines: Vec<LineItem>,
+    pub issue_date: OffsetDateTime,
+    pub sequence_number: u64,
+    pub fiscal_year: i32,
+    pub nav_transaction_id: String,
+}
+
+impl AbandonedInvoice {
+    /// Sum of all line gross totals. Returns `None` on overflow.
+    /// Mirrors every other typestate's `total_gross` for the same
+    /// operator-visible-totals reason.
     pub fn total_gross(&self) -> Option<Huf> {
         self.lines
             .iter()
@@ -387,6 +440,35 @@ mod tests {
         assert_eq!(stuck.nav_transaction_id, txid);
     }
 
+    /// PR-8: `SubmissionStuckInvoice → AbandonedInvoice` is a pure rename
+    /// of typestate; every field must survive the transition byte-for-
+    /// byte. Field-by-field walk (CLAUDE.md rule 9: tests verify intent,
+    /// not just behavior — a test that only checked `id` would still
+    /// pass if `into_abandoned` lost half the lines).
+    #[test]
+    fn into_abandoned_preserves_every_field() {
+        let s = fixture_submitted();
+        let id = s.id;
+        let series_id = s.series_id;
+        let customer_id = s.customer_id;
+        let lines = s.lines.clone();
+        let issue_date = s.issue_date;
+        let seq = s.sequence_number;
+        let fy = s.fiscal_year;
+        let txid = s.nav_transaction_id.clone();
+
+        let stuck = s.into_submission_stuck();
+        let abandoned = stuck.into_abandoned();
+        assert_eq!(abandoned.id, id);
+        assert_eq!(abandoned.series_id, series_id);
+        assert_eq!(abandoned.customer_id, customer_id);
+        assert_eq!(abandoned.lines, lines);
+        assert_eq!(abandoned.issue_date, issue_date);
+        assert_eq!(abandoned.sequence_number, seq);
+        assert_eq!(abandoned.fiscal_year, fy);
+        assert_eq!(abandoned.nav_transaction_id, txid);
+    }
+
     #[test]
     fn total_gross_consistent_across_states() {
         // 3 * 1000 = 3000 net, 27% VAT = 810, gross = 3810
@@ -396,9 +478,18 @@ mod tests {
         let s_gross = s.total_gross().expect("totals");
         let s2 = s.clone();
         let s3 = s.clone();
+        let s4 = s.clone();
 
         assert_eq!(s2.into_finalized().total_gross().unwrap(), s_gross);
         assert_eq!(s3.into_rejected().total_gross().unwrap(), s_gross);
-        assert_eq!(s.into_submission_stuck().total_gross().unwrap(), s_gross);
+        assert_eq!(s4.into_submission_stuck().total_gross().unwrap(), s_gross);
+        // Through the full Submitted → Stuck → Abandoned chain.
+        assert_eq!(
+            s.into_submission_stuck()
+                .into_abandoned()
+                .total_gross()
+                .unwrap(),
+            s_gross
+        );
     }
 }

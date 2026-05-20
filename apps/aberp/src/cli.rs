@@ -65,6 +65,40 @@ pub enum Command {
     /// `SubmissionStuckInvoice` with a loud operator alert via
     /// tracing.
     PollAck(PollAckArgs),
+
+    /// Re-submit an invoice that is in the `SubmissionStuck` posture
+    /// per ADR-0009 §5 (PR-8-1). The retry re-runs `tokenExchange` +
+    /// `manageInvoice` via the same pipeline as `submit-invoice`, and
+    /// writes one extra `InvoiceRetryRequested` audit entry that
+    /// records the operator's decision distinctly from the per-
+    /// attempt NAV evidence.
+    ///
+    /// Precondition: the audit ledger must show this invoice in the
+    /// `Stuck` state — there must be an `InvoiceSubmissionResponse`
+    /// for it, no `InvoiceMarkedAbandoned` for it, and the most-
+    /// recent `InvoiceAckStatus` for it (if any) must be non-terminal
+    /// (`RECEIVED` / `PROCESSING`). A SAVED, ABORTED, or already-
+    /// abandoned invoice loud-fails before any NAV call.
+    ///
+    /// On success the invoice is left at the `Submitted` typestate
+    /// with a fresh NAV `transactionId`; the operator runs
+    /// `aberp poll-ack` next to drive the terminal state.
+    RetrySubmission(RetrySubmissionArgs),
+
+    /// Mark a `SubmissionStuck` invoice as abandoned per ADR-0009 §5
+    /// (PR-8-2). Records the operator's decision to stop retrying;
+    /// **terminal** in the audit ledger — no further `aberp`
+    /// subcommand will operate on this invoice afterward.
+    ///
+    /// `mark-abandoned` does NOT call NAV. Per ADR-0009 §6, this is
+    /// distinct from a **technical annulment** (which DOES call
+    /// `manageAnnulment` to withdraw a faulty data submission from
+    /// NAV's side). Abandonment is a local audit-ledger fact: ABERP
+    /// has decided not to keep retrying; the invoice's status at NAV
+    /// remains whatever NAV last reported.
+    ///
+    /// Precondition: same `Stuck` precondition as `retry-submission`.
+    MarkAbandoned(MarkAbandonedArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -172,6 +206,72 @@ pub struct PollAckArgs {
     /// per ADR-0020 §1 (same posture as `submit-invoice`).
     #[arg(long, value_enum)]
     pub endpoint: NavEnv,
+}
+
+#[derive(Debug, Parser)]
+pub struct RetrySubmissionArgs {
+    /// Path to the `<InvoiceData>` XML written by the prior
+    /// `aberp issue-invoice --out ...` run. The retry submits the
+    /// same bytes — the original invoice content (and its sequence
+    /// number / issue date) does not change, only the wire attempt.
+    #[arg(long = "invoice-xml")]
+    pub invoice_xml: PathBuf,
+
+    /// Invoice id (prefixed form, `inv_<ULID>`) of the stuck invoice
+    /// to retry.
+    #[arg(long = "invoice-id")]
+    pub invoice_id: String,
+
+    /// Hungarian tax number of the submitter. Same accepted forms +
+    /// parser as `submit-invoice` / `poll-ack` (`12345678`,
+    /// `12345678-1`, `12345678-1-42`).
+    #[arg(long = "tax-number")]
+    pub tax_number: String,
+
+    /// Path to the tenant DuckDB file.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives both the audit-ledger genesis hash
+    /// and the keychain service-name lookup.
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Which NAV environment to retry against. No default — explicit
+    /// per ADR-0020 §1 (same posture as `submit-invoice` / `poll-ack`).
+    #[arg(long, value_enum)]
+    pub endpoint: NavEnv,
+
+    /// Operator-supplied reason for the retry. Required per
+    /// ADR-0009 §5 — the audit-evidence bundle (ADR-0009 §8) must
+    /// carry a human-readable justification for each operator
+    /// unblock decision.
+    #[arg(long)]
+    pub reason: String,
+}
+
+#[derive(Debug, Parser)]
+pub struct MarkAbandonedArgs {
+    /// Invoice id (prefixed form, `inv_<ULID>`) of the stuck invoice
+    /// to mark abandoned.
+    #[arg(long = "invoice-id")]
+    pub invoice_id: String,
+
+    /// Path to the tenant DuckDB file.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives the audit-ledger genesis hash.
+    /// (NAV credentials are NOT loaded — `mark-abandoned` does not
+    /// call NAV, so the keychain is not consulted.)
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Operator-supplied reason for the abandonment. Required per
+    /// ADR-0009 §5 — a terminal operator decision must carry a
+    /// human-readable justification.
+    #[arg(long)]
+    pub reason: String,
 }
 
 #[derive(Debug, Parser)]

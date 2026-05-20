@@ -257,6 +257,116 @@ impl InvoiceAckStatusPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// InvoiceRetryRequested  (PR-8 — operator-initiated retry of a stuck
+// invoice per ADR-0009 §5. Distinct from `InvoiceSubmissionAttempt`:
+// the operator's *decision* to retry is the audit-bearing event, and
+// the retry itself fires the normal Attempt/Response pair after.)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceRetryRequested`].
+///
+/// Captures the **precondition justification** for the retry (the
+/// prior NAV `transaction_id` and the last observed ack status, if
+/// any) alongside the operator's reason text. Reading just this entry
+/// from the audit-evidence bundle (ADR-0009 §8) lets a NAV inspector
+/// reconstruct "the operator chose to retry because X was the prior
+/// ack and the prior submission did not finalize" without walking
+/// the full chain.
+///
+/// `prior_last_ack_status` is `None` iff no `InvoiceAckStatus` entry
+/// exists for this invoice yet (operator retried before running
+/// `poll-ack` — legitimate but unusual; surfaced so a future audit
+/// can see it happened).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceRetryRequestedPayload {
+    pub invoice_id: String,
+    pub idempotency_key: String,
+    /// The NAV `transaction_id` recorded by the most-recent prior
+    /// `InvoiceSubmissionResponse` for this invoice. The retry's own
+    /// `InvoiceSubmissionResponse` will record a fresh `transaction_id`;
+    /// keeping the prior id here makes the unblock decision traceable.
+    pub prior_transaction_id: String,
+    /// The string form of the most-recent `InvoiceAckStatus` payload's
+    /// `ack_status` field for this invoice. `None` if no ack entry
+    /// exists (the operator retried before polling — captured here
+    /// rather than silently elided).
+    pub prior_last_ack_status: Option<String>,
+    /// Free-form operator-supplied reason for the retry. Required at
+    /// the CLI surface so the audit-evidence bundle (ADR-0009 §8)
+    /// always carries a human-readable justification.
+    pub reason: String,
+}
+
+impl InvoiceRetryRequestedPayload {
+    pub fn new(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        prior_transaction_id: &str,
+        prior_last_ack_status: Option<String>,
+        reason: &str,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            prior_transaction_id: prior_transaction_id.to_string(),
+            prior_last_ack_status,
+            reason: reason.to_string(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// InvoiceMarkedAbandoned  (PR-8 — operator chose to stop retrying a
+// stuck invoice per ADR-0009 §5. Terminal in the audit ledger.)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceMarkedAbandoned`].
+///
+/// Same precondition-justification shape as
+/// [`InvoiceRetryRequestedPayload`]. The two payloads share their
+/// fields by design: an audit-evidence bundle reader treats
+/// "retry-requested" and "marked-abandoned" as paired operator
+/// decisions on the same `SubmissionStuck` precondition surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceMarkedAbandonedPayload {
+    pub invoice_id: String,
+    pub idempotency_key: String,
+    /// The NAV `transaction_id` recorded by the most-recent prior
+    /// `InvoiceSubmissionResponse` for this invoice. There is no
+    /// further `InvoiceSubmissionResponse` after this entry — the
+    /// invoice's audit chain is terminal-by-operator-decision.
+    pub prior_transaction_id: String,
+    pub prior_last_ack_status: Option<String>,
+    pub reason: String,
+}
+
+impl InvoiceMarkedAbandonedPayload {
+    pub fn new(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        prior_transaction_id: &str,
+        prior_last_ack_status: Option<String>,
+        reason: &str,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            prior_transaction_id: prior_transaction_id.to_string(),
+            prior_last_ack_status,
+            reason: reason.to_string(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -426,6 +536,76 @@ mod tests {
         let decoded: InvoiceAckStatusPayload =
             serde_json::from_slice(&bytes).expect("typed decode");
         assert_eq!(decoded, payload);
+    }
+
+    // ── PR-8 operator-unblock payload round-trips ───────────────────
+
+    /// `InvoiceRetryRequestedPayload` round-trips clean even when the
+    /// operator's reason text carries JSON-hostile characters — the
+    /// typed-struct path is the only `format!`-free surface, so an
+    /// operator who quotes a stuck-invoice number inside their reason
+    /// cannot break the audit chain.
+    #[test]
+    fn retry_requested_round_trips_with_hostile_reason() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceRetryRequestedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "txid-with-\"-quote-and-\\-backslash",
+            Some("PROCESSING".to_string()),
+            "operator note: \"customer X\" insists on resubmit \\ urgent",
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceRetryRequestedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert!(decoded.idempotency_key.starts_with("idem_"));
+    }
+
+    /// `InvoiceRetryRequestedPayload` accepts `prior_last_ack_status =
+    /// None` — captures the legitimate-but-unusual case of an operator
+    /// retrying before any poll ran (e.g. the submit-invoice flow saw a
+    /// non-retryable error from NAV's per-attempt error path and the
+    /// operator decided to retry without first running poll-ack).
+    #[test]
+    fn retry_requested_accepts_none_prior_last_ack_status() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceRetryRequestedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "prior-txid",
+            None,
+            "no prior poll — operator retried directly",
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceRetryRequestedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert!(decoded.prior_last_ack_status.is_none());
+    }
+
+    /// `InvoiceMarkedAbandonedPayload` round-trips clean with hostile
+    /// reason text. Same F9 trap-closing posture as
+    /// `retry_requested_round_trips_with_hostile_reason`.
+    #[test]
+    fn marked_abandoned_round_trips_with_hostile_reason() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceMarkedAbandonedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "prior-txid",
+            Some("RECEIVED".to_string()),
+            "abandoned: NAV inspector said issue corrective \"new\" invoice instead",
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceMarkedAbandonedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert!(decoded.idempotency_key.starts_with("idem_"));
     }
 
     /// The trap PR-6.1 closed: PR-5's `format!`-built JSON could not
