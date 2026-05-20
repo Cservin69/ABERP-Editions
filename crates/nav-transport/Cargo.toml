@@ -41,7 +41,54 @@ zeroize = { workspace = true }
 # Tracing — ADR-0007 §Logging.
 tracing = { workspace = true }
 
+# ── PR-7-B additions ──────────────────────────────────────────────────
+#
+# Hashes for NAV's application-level authentication per ADR-0020 §2:
+#   sha2 → SHA-512 passwordHash
+#   sha3 → SHA3-512 requestSignature
+# Both are RustCrypto MIT/Apache-2.0 dual.
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+
+# AES-128/ECB for the NAV exchangeToken envelope per ADR-0020 §2 + ADR-0021
+# §A9. The use is protocol-imposed by NAV and MUST NOT generalize; the
+# call-site comment in `src/cipher.rs` carries the constraint per ADR-0021
+# §A9 adversarial-review bullet 3.
+aes = { workspace = true }
+
+# base64 — encodes invoiceData for the per-invoice-index signature
+# extension (ADR-0009 §4) and decodes the exchangeToken response
+# (ADR-0020 §2).
+base64 = { workspace = true }
+
+# XML serialization for the SOAP envelope. Hand-rolled per ADR-0021 §A8
+# (codegen-from-XSD rejected) — `quick-xml` writes the envelope and
+# parses NAV's response bodies. PR-5 already exercised it for the
+# InvoiceData payload (`apps/aberp/src/nav_xml.rs`).
+quick-xml = { workspace = true }
+
+# Time formatting for the NAV requestTimestamp (YYYYMMDDhhmmss UTC per
+# ADR-0009 §4). Same crate ADR-0021 §A11 pins for RFC3339 elsewhere; the
+# format string is built inline because NAV's compact form does not have
+# a well-known constant in `time::format_description::well_known`.
+time = { workspace = true }
+
+# ULID — minted as `requestId` for each NAV operation (ADR-0009 §4
+# `requestSignature` input; ADR-0005 newtype). The bare 26-character
+# Crockford-base32 form is what NAV accepts as an alphanumeric `requestId`
+# (verified against the NAV v3.0 XSD `RequestIdType` pattern at PR-7-B-1
+# pin time).
+ulid = { workspace = true }
+
 [dev-dependencies]
+# Self-referential dev-dep enabling the `test-support` feature for
+# integration tests in `tests/`. Cargo treats this as "build the
+# library with `test-support` ON when compiling test targets," giving
+# `tests/soap_golden.rs` access to `NavCredentials::from_parts`
+# without exposing it on the production code path. Same idiom serde
+# / tokio / RustCrypto use for test-only fixture helpers.
+aberp-nav-transport = { path = ".", features = ["test-support"] }
+
 # A throwaway self-signed CA used in `tests/trust_negation.rs` to prove
 # that the production trust store does NOT trust certs rooted elsewhere.
 # Build-time only; never linked into the release binary.

@@ -118,6 +118,145 @@ impl InvoiceDraftCreatedPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// InvoiceSubmissionAttempt  (PR-7-B-3 — ADR-0009 §8 invoice.submission_attempt)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceSubmissionAttempt`].
+///
+/// Written by the binary's `submit_invoice` flow just BEFORE the
+/// `manageInvoice` POST returns — capturing the request before the
+/// response means a crash mid-flight still leaves the audit trail
+/// pointing at "we tried to submit X with body Y", which is the
+/// evidence ADR-0009 §8 names.
+///
+/// `request_xml` is the verbatim bytes of the `<ManageInvoiceRequest>`
+/// envelope POSTed to NAV (NOT the inner `<InvoiceData>`; that is
+/// reconstructable from the local `invoice` table + the per-index
+/// position recorded here). The typed-struct path through
+/// `serde_json::to_vec` handles all JSON escaping — closes F9 for the
+/// NAV submission path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceSubmissionAttemptPayload {
+    pub invoice_id: String,
+    pub idempotency_key: String,
+    /// `"test"` or `"production"` — which NAV environment we POSTed to.
+    /// Recorded so the audit-evidence bundle (ADR-0009 §8) makes the
+    /// environment explicit; a production invoice attempted against
+    /// `api-test` is a class of operator-error that should be visible
+    /// in the ledger without consulting the URL.
+    pub endpoint: String,
+    /// Verbatim `<ManageInvoiceRequest>` bytes (UTF-8 — the envelope is
+    /// always XML; serde_json::to_vec base64-encodes Vec<u8> by
+    /// default, so this round-trips cleanly even with embedded quotes,
+    /// backslashes, or non-ASCII bytes in the invoice descriptions).
+    pub request_xml: Vec<u8>,
+}
+
+impl InvoiceSubmissionAttemptPayload {
+    pub fn new(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        endpoint: &'static str,
+        request_xml: Vec<u8>,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            endpoint: endpoint.to_string(),
+            request_xml,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// InvoiceSubmissionResponse  (PR-7-B-3 — ADR-0009 §8 invoice.submission_response)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceSubmissionResponse`].
+///
+/// Written immediately after a successful `manageInvoice` response is
+/// received. Carries the verbatim `<ManageInvoiceResponse>` bytes per
+/// ADR-0009 §8 plus the parsed `transaction_id` (NAV's opaque tracking
+/// token used by `queryTransactionStatus` polls — PR-7-C).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceSubmissionResponsePayload {
+    pub invoice_id: String,
+    pub idempotency_key: String,
+    /// NAV-assigned transaction id. Opaque to ABERP; passed verbatim
+    /// to `queryTransactionStatus` in PR-7-C.
+    pub transaction_id: String,
+    pub response_xml: Vec<u8>,
+}
+
+impl InvoiceSubmissionResponsePayload {
+    pub fn new(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        transaction_id: &str,
+        response_xml: Vec<u8>,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            transaction_id: transaction_id.to_string(),
+            response_xml,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// InvoiceAckStatus  (PR-7-C — variant declared in PR-7-B-3 to close
+// the three-coordinated-edit trap; payload type lives here for the
+// same reason — typed at first use, not at first emission.)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceAckStatus`].
+///
+/// Written by the PR-7-C poll loop after each `queryTransactionStatus`
+/// call. Carries the parsed ack status and the verbatim response body.
+/// One entry per poll — `RECEIVED → PROCESSING → SAVED|ABORTED` is the
+/// expected sequence, but ABERP records every poll's result so the
+/// audit-evidence bundle (ADR-0009 §8) shows the full latency curve.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceAckStatusPayload {
+    pub invoice_id: String,
+    pub transaction_id: String,
+    /// `"RECEIVED"` | `"PROCESSING"` | `"SAVED"` | `"ABORTED"` per NAV
+    /// v3.0. Recorded verbatim; the typed Rust state-machine transition
+    /// (PR-7-C scope) is downstream of this.
+    pub ack_status: String,
+    pub response_xml: Vec<u8>,
+}
+
+impl InvoiceAckStatusPayload {
+    pub fn new(
+        invoice_id: &str,
+        transaction_id: &str,
+        ack_status: &str,
+        response_xml: Vec<u8>,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            transaction_id: transaction_id.to_string(),
+            ack_status: ack_status.to_string(),
+            response_xml,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -207,6 +346,86 @@ mod tests {
 
         // The line_count must match the fixture's line count exactly.
         assert_eq!(decoded.line_count, 2);
+    }
+
+    // ── PR-7-B-3 NAV-submission payload round-trips ─────────────────
+
+    /// Fixture XML carrying the same JSON-hostile bytes as
+    /// `fixture_invoice()` carries in line descriptions — quotes,
+    /// backslashes, control chars, non-ASCII. The typed-struct path
+    /// MUST escape every one of these when wrapping the verbatim NAV
+    /// body into the audit-payload `Vec<u8>` field. Closes F9 for the
+    /// PR-7-B-3 NAV submission path.
+    fn fixture_hostile_xml() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"<ManageInvoiceRequest>");
+        out.extend_from_slice(b"<note>\"quotes\" \\ backslashes \n\t control</note>");
+        out.extend_from_slice("ünïcödé and other non-ASCII: 日本語".as_bytes());
+        out.extend_from_slice(b"</ManageInvoiceRequest>");
+        out
+    }
+
+    #[test]
+    fn submission_attempt_round_trips_hostile_xml() {
+        let payload = InvoiceSubmissionAttemptPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            IdempotencyKey::new(),
+            "test",
+            fixture_hostile_xml(),
+        );
+        let bytes = payload.to_bytes();
+
+        // First: the bytes must be valid JSON. PR-5's `format!`-built
+        // JSON failed exactly this assertion when interpolating a
+        // string with `"`.
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+
+        // Second: the typed round-trip must reproduce the struct
+        // byte-for-byte — including the hostile XML bytes inside
+        // `request_xml`. If serde drops or re-escapes a byte, this
+        // fails for that variant.
+        let decoded: InvoiceSubmissionAttemptPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.request_xml, fixture_hostile_xml());
+        assert_eq!(decoded.endpoint, "test");
+        assert!(decoded.idempotency_key.starts_with("idem_"));
+    }
+
+    #[test]
+    fn submission_response_round_trips_hostile_xml() {
+        let payload = InvoiceSubmissionResponsePayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            IdempotencyKey::new(),
+            "txid-with-\"-quote-and-\\-backslash",
+            fixture_hostile_xml(),
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceSubmissionResponsePayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        // Even the transaction_id round-trips with hostile chars —
+        // NAV's tracking ids are opaque, so ABERP defends downstream
+        // tooling against unusual but legal characters.
+        assert_eq!(
+            decoded.transaction_id,
+            "txid-with-\"-quote-and-\\-backslash"
+        );
+    }
+
+    #[test]
+    fn ack_status_round_trips_hostile_xml() {
+        let payload = InvoiceAckStatusPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "txid-1",
+            "SAVED",
+            fixture_hostile_xml(),
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceAckStatusPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
     }
 
     /// The trap PR-6.1 closed: PR-5's `format!`-built JSON could not

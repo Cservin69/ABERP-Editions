@@ -8,10 +8,18 @@
 //! via [`EventKind::as_str`]. Serde will join when a serialization path
 //! (export bundle, wire protocol) actually needs it.
 
-/// PR-3 shipped only `Test`. PR-5 adds the first two invoice-lifecycle
-/// kinds from ADR-0009 §2 needed by the XML-on-disk binary. Remaining
-/// invoice kinds (`InvoiceSubmitted`, `InvoiceAckPending`, ...) land
-/// when their state transition first fires in the codebase.
+/// PR-3 shipped only `Test`. PR-5 added the first two invoice-lifecycle
+/// kinds from ADR-0009 §2 (`InvoiceSequenceReserved`, `InvoiceDraftCreated`).
+/// PR-7-B-3 adds the three NAV-submission evidence kinds from ADR-0009 §8
+/// (`InvoiceSubmissionAttempt`, `InvoiceSubmissionResponse`,
+/// `InvoiceAckStatus`). The first two of those three fire in PR-7-B-3's
+/// `submit-invoice` flow; `InvoiceAckStatus` is added now (rather than
+/// in PR-7-C) so the three-coordinated-edit trap (PR-6.1 F12 — variant +
+/// `as_str` + `from_storage_str` + the test-list array) is closed for the
+/// whole NAV submission path in one PR. The remaining invoice-lifecycle
+/// kinds (`Finalized`, `Rejected`, `SubmissionStuck`, `Voided`, `Amended`,
+/// `StornoIssued`, `TechnicalAnnulmentRequested`) land when their state
+/// transition first fires in the codebase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
     /// Test-only kind used by `tests/chain_conformance.rs`. Not allowed in
@@ -27,6 +35,25 @@ pub enum EventKind {
     /// because the binary's command path goes Draft -> Ready in one
     /// allocator call. A future PR may split them.
     InvoiceDraftCreated,
+
+    /// A `manageInvoice` request was POSTed to NAV. Payload carries the
+    /// verbatim request XML (ADR-0009 §8). Fires before the response is
+    /// received so a crash between POST and response still leaves the
+    /// audit trail intact. PR-7-B-3.
+    InvoiceSubmissionAttempt,
+
+    /// A `manageInvoice` response was received from NAV with the
+    /// `transactionId`. Payload carries the verbatim response XML and
+    /// the parsed `transaction_id`. Fires AFTER `InvoiceSubmissionAttempt`
+    /// in the same `submit-invoice` flow. PR-7-B-3.
+    InvoiceSubmissionResponse,
+
+    /// A `queryTransactionStatus` poll completed. Payload carries the
+    /// verbatim response XML and the parsed ack status
+    /// (`RECEIVED` / `PROCESSING` / `SAVED` / `ABORTED`). PR-7-C will
+    /// emit this; the variant is declared in PR-7-B-3 to close the
+    /// three-coordinated-edit trap in one go.
+    InvoiceAckStatus,
 }
 
 impl EventKind {
@@ -38,6 +65,9 @@ impl EventKind {
             EventKind::Test => "test",
             EventKind::InvoiceSequenceReserved => "invoice.sequence_reserved",
             EventKind::InvoiceDraftCreated => "invoice.draft_created",
+            EventKind::InvoiceSubmissionAttempt => "invoice.submission_attempt",
+            EventKind::InvoiceSubmissionResponse => "invoice.submission_response",
+            EventKind::InvoiceAckStatus => "invoice.ack_status",
         }
     }
 
@@ -58,6 +88,9 @@ impl EventKind {
             "test" => Ok(EventKind::Test),
             "invoice.sequence_reserved" => Ok(EventKind::InvoiceSequenceReserved),
             "invoice.draft_created" => Ok(EventKind::InvoiceDraftCreated),
+            "invoice.submission_attempt" => Ok(EventKind::InvoiceSubmissionAttempt),
+            "invoice.submission_response" => Ok(EventKind::InvoiceSubmissionResponse),
+            "invoice.ack_status" => Ok(EventKind::InvoiceAckStatus),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -82,6 +115,9 @@ mod tests {
             EventKind::Test,
             EventKind::InvoiceSequenceReserved,
             EventKind::InvoiceDraftCreated,
+            EventKind::InvoiceSubmissionAttempt,
+            EventKind::InvoiceSubmissionResponse,
+            EventKind::InvoiceAckStatus,
         ];
         for v in variants {
             let s = v.as_str();
@@ -94,5 +130,21 @@ mod tests {
     fn from_storage_str_rejects_unknown() {
         assert!(EventKind::from_storage_str("invoice.future_kind").is_err());
         assert!(EventKind::from_storage_str("").is_err());
+    }
+
+    /// PR-7-B-3 specifically: the three new on-disk strings must
+    /// match the dot-separated convention so existing tooling that
+    /// filters by prefix (`invoice.*`) catches them. If a future
+    /// contributor renames one without the `invoice.` prefix, this
+    /// assertion fires.
+    #[test]
+    fn pr_7_b_3_kinds_use_invoice_prefix() {
+        assert!(EventKind::InvoiceSubmissionAttempt
+            .as_str()
+            .starts_with("invoice."));
+        assert!(EventKind::InvoiceSubmissionResponse
+            .as_str()
+            .starts_with("invoice."));
+        assert!(EventKind::InvoiceAckStatus.as_str().starts_with("invoice."));
     }
 }

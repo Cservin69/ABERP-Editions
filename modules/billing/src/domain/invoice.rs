@@ -86,4 +86,60 @@ impl ReadyInvoice {
             .iter()
             .try_fold(Huf::ZERO, |acc, line| acc.checked_add(line.gross_total()?))
     }
+
+    /// Consume this `ReadyInvoice` and produce a [`SubmittedInvoice`]
+    /// carrying the NAV-assigned transaction id. The new-type-state
+    /// pattern (ADR-0009 §2) requires the transition to consume the
+    /// previous state — accidentally re-submitting a `ReadyInvoice`
+    /// after a successful `manageInvoice` is a compile error rather
+    /// than a runtime hunt.
+    pub fn into_submitted(self, nav_transaction_id: String) -> SubmittedInvoice {
+        SubmittedInvoice {
+            id: self.id,
+            series_id: self.series_id,
+            customer_id: self.customer_id,
+            lines: self.lines,
+            issue_date: self.issue_date,
+            sequence_number: self.sequence_number,
+            fiscal_year: self.fiscal_year,
+            nav_transaction_id,
+        }
+    }
+}
+
+/// A submitted invoice: `manageInvoice` returned an `OK` response with
+/// a NAV-assigned `transactionId`. The state is now past the point
+/// where ABERP can void or modify; advancement is by NAV's terminal
+/// ack (`SAVED` → `Finalized`; `ABORTED` → `Rejected`) per ADR-0009 §2
+/// and §5. PR-7-C polls `queryTransactionStatus` to drive that.
+///
+/// The fields mirror [`ReadyInvoice`] (same id, same series, same
+/// sequence, same lines) plus the NAV transaction id. Carrying the
+/// full body forward keeps the post-submit flow self-contained — the
+/// PR-7-C poll loop can format log lines and audit-evidence bundles
+/// without re-reading the `invoice` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmittedInvoice {
+    pub id: InvoiceId,
+    pub series_id: SeriesId,
+    pub customer_id: CustomerId,
+    pub lines: Vec<LineItem>,
+    pub issue_date: OffsetDateTime,
+    pub sequence_number: u64,
+    pub fiscal_year: i32,
+    /// NAV's opaque tracking id, returned by `manageInvoice`. Treated
+    /// as a string at this layer — ABERP does not parse its shape.
+    pub nav_transaction_id: String,
+}
+
+impl SubmittedInvoice {
+    /// Sum of all line gross totals. Returns `None` on overflow.
+    /// Mirrors `ReadyInvoice::total_gross` so the post-submit flow
+    /// can produce the same operator-visible totals without
+    /// down-converting to `ReadyInvoice`.
+    pub fn total_gross(&self) -> Option<Huf> {
+        self.lines
+            .iter()
+            .try_fold(Huf::ZERO, |acc, line| acc.checked_add(line.gross_total()?))
+    }
 }

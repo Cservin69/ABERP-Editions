@@ -1,27 +1,28 @@
-//! ABERP — modular multi-tenant ERP backend.
+//! ABERP — modular multi-tenant ERP backend (binary entry point).
 //!
-//! Commit #1 surface: an `issue-invoice` subcommand that wires the
-//! billing module (ADR-0009) and the audit ledger (ADR-0008) to produce
-//! a NAV-compatible invoice XML on disk, while writing audit-ledger
-//! entries for the issuance into the tenant DuckDB. See
-//! `docs/commit-1-success-criterion.md`.
+//! The actual orchestration modules live in `lib.rs`; `main.rs` is a
+//! thin shim that wires clap parsing to the per-subcommand `run`
+//! functions. The split lets integration tests under
+//! `apps/aberp/tests/` exercise the same orchestration via the library
+//! face (Cargo does not expose `src/main.rs`'s sibling modules to
+//! integration tests).
+//!
+//! See `lib.rs` for the per-module commentary.
 
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
 use clap::Parser;
 
-mod audit_payloads;
-mod binary_hash;
-mod cli;
-mod issue_invoice;
-mod nav_xml;
+use aberp::{cli, issue_invoice, setup_nav_credentials, submit_invoice};
 
 fn main() -> Result<()> {
     init_tracing();
     let args = cli::Cli::parse();
     match args.command {
         cli::Command::IssueInvoice(a) => issue_invoice::run(&a),
+        cli::Command::SubmitInvoice(a) => submit_invoice::run(&a),
+        cli::Command::SetupNavCredentials(a) => setup_nav_credentials::run(&a),
     }
 }
 

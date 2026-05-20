@@ -9,6 +9,15 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+# PR-7-B-3 split: the binary keeps the operator-facing entry point in
+# `main.rs`, but the orchestration modules live in `lib.rs` so the
+# integration tests under `apps/aberp/tests/` can import them via the
+# library face. Cargo does not expose `src/main.rs`'s sibling modules
+# to integration tests; the lib + bin split is the standard workaround.
+[lib]
+name = "aberp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "aberp"
 path = "src/main.rs"
@@ -49,6 +58,26 @@ duckdb = { workspace = true }
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# PR-7-B-3 additions.
+#
+# `tokio` is needed because the NAV operations in
+# `aberp-nav-transport::operations` are async (reqwest's `Client::send`
+# is async). The binary builds a current-thread runtime per
+# `submit-invoice` invocation rather than tagging `main` with
+# `#[tokio::main]` so the existing sync `issue-invoice` path is
+# unchanged (no runtime startup overhead for the no-NAV flow). Feature
+# set mirrors what the workspace catalogue pins; `rt` would suffice for
+# the current-thread flavour but the catalogue is `rt-multi-thread` and
+# inheriting cleanly is cheaper than diverging.
+tokio = { workspace = true }
+
+# `keyring` is needed in production because the binary's
+# `setup-nav-credentials` subcommand WRITES to the keychain — the
+# library `aberp-nav-transport` only owns the READ path
+# (`NavCredentials::load_from_keychain`). Re-using the same crate that
+# the read path uses keeps the platform-backend behaviour identical.
+keyring = { workspace = true }
 
 [dev-dependencies]
 # Integration tests need `Actor::test_only` (rollback_conformance.rs).

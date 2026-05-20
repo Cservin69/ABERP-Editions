@@ -526,6 +526,54 @@ fn row_to_reservation(row: &duckdb::Row<'_>) -> duckdb::Result<SequenceReservati
     })
 }
 
+/// Load a previously-issued `ReadyInvoice` plus the
+/// [`crate::app::issue_invoice::IdempotencyKey`] that was burned with
+/// it. Used by `apps/aberp/src/submit_invoice.rs` (PR-7-B-3) to feed
+/// `manageInvoice` and to thread the same idempotency key into the new
+/// audit-ledger entries so the F8 contract (every NAV-related entry
+/// for an invoice carries the same idempotency key) holds across
+/// issue + submit.
+///
+/// Returns `Ok(None)` if no invoice with that id exists — the caller
+/// surfaces that as a loud operator error, not as a silent fallback
+/// to "issue a new one" (CLAUDE.md rule 12).
+///
+/// `invoice_id` is the ULID-prefixed form (`inv_XXXX...`). Free
+/// function (not a trait method) for the same reason
+/// [`allocate_in_tx`] is: the binary owns the `Transaction` lifecycle
+/// and calls this inside its own tx that also drives audit-ledger
+/// appends per ADR-0008 §Storage.
+pub fn load_ready_invoice_by_id(
+    tx: &duckdb::Transaction<'_>,
+    invoice_id: &str,
+) -> Result<Option<(ReadyInvoice, crate::app::issue_invoice::IdempotencyKey)>, BillingError> {
+    // Two reads: the invoice row (for the idempotency key) + the lines
+    // via the existing `load_invoice`. Doing both in one method keeps
+    // the binary's submit_invoice.rs from having to compose two billing
+    // calls in the same tx (and reach for `idempotency_key` parsing
+    // logic that already lives in this crate).
+    let idem_str: Option<String> = {
+        let mut stmt = tx.prepare("SELECT idempotency_key FROM invoice WHERE id = ?;")?;
+        let mut rows = stmt.query_map([invoice_id], |r| r.get::<_, String>(0))?;
+        match rows.next() {
+            Some(r) => Some(r?),
+            None => None,
+        }
+    };
+    let idem_str = match idem_str {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let idempotency_key = crate::app::issue_invoice::IdempotencyKey::from_canonical_string(
+        &idem_str,
+    )
+    .ok_or(BillingError::Invalid(
+        "stored idempotency_key failed to parse — DB has been hand-edited",
+    ))?;
+    let invoice = load_invoice(tx, invoice_id)?;
+    Ok(Some((invoice, idempotency_key)))
+}
+
 fn load_invoice(
     tx: &duckdb::Transaction<'_>,
     invoice_id_str: &str,

@@ -12,10 +12,11 @@
 # the version lines here are the floor, Cargo.lock is the exact pin.
 #
 # Only crates actually exercised by a landed PR appear here. Crates pinned
-# by ADR-0021 but not yet used (axum, axum-server, rcgen, sha3, aes) are
-# added when the first PR that uses them lands. This matches CLAUDE.md
-# rule 2 (simplicity first) without losing the pins, which remain
-# authoritative in ADR-0021 Part A.
+# by ADR-0021 but not yet used (axum, axum-server, rcgen) are added when
+# the first PR that uses them lands. This matches CLAUDE.md rule 2
+# (simplicity first) without losing the pins, which remain authoritative
+# in ADR-0021 Part A. (sha3 + aes joined the catalogue in PR-7-B-1; the
+# remaining axum / axum-server / rcgen wait for the wire-protocol PR.)
 
 [workspace]
 resolver = "2"
@@ -65,10 +66,22 @@ quick-xml = { version = "0.36", features = ["serialize"] }
 
 # Cryptography — ADR-0021 Part A, item 9.
 # sha2 used by audit-ledger entry_hash. zeroize joins here with PR-7-A
-# (first NAV credential load). sha3 and aes wait for PR-7-B (signature
-# + exchangeToken).
+# (first NAV credential load). sha3 + aes added in PR-7-B-1: sha3 for
+# the SHA3-512 requestSignature, aes for AES-128/ECB exchangeToken
+# decryption (per ADR-0020 §2; ECB is protocol-imposed by NAV and the
+# call-site comment in `crates/nav-transport/src/cipher.rs` names the
+# constraint per ADR-0021 §A9 adversarial-review bullet 3).
 sha2 = "0.10"
+sha3 = "0.10"
+aes = "0.8"
 zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# base64 — used by PR-7-B-1's per-invoice-index signature extension
+# (SHA3-512(operation || base64(invoiceData)) per ADR-0009 §4) and by
+# PR-7-B-2's tokenExchange response parser (NAV returns the
+# exchangeToken as a base64-encoded AES-128/ECB ciphertext per ADR-0020
+# §2). License: MIT/Apache-2.0 dual.
+base64 = "0.22"
 
 # HTTP client — ADR-0021 Part A, item 5. First use: nav-transport (PR-7-A).
 # default-features = false strips reqwest's default native-tls; `rustls`

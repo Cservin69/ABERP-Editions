@@ -7,7 +7,7 @@
 
 // ── Domain value types ────────────────────────────────────────────────
 pub use crate::domain::ids::{CustomerId, InvoiceId, ReservationId, SeriesId};
-pub use crate::domain::invoice::{DraftInvoice, LineItem, ReadyInvoice};
+pub use crate::domain::invoice::{DraftInvoice, LineItem, ReadyInvoice, SubmittedInvoice};
 pub use crate::domain::money::Huf;
 pub use crate::domain::reservation::{ReservationStatus, SequenceReservation};
 pub use crate::domain::series::{InvoiceSeries, ResetPolicy, SeriesCode};
@@ -17,7 +17,9 @@ pub use crate::ports::clock::{Clock, SystemClock};
 pub use crate::ports::storage::BillingStore;
 
 // ── Adapters ──────────────────────────────────────────────────────────
-pub use crate::adapters::duckdb_store::{allocate_in_tx, DuckDbBillingStore};
+pub use crate::adapters::duckdb_store::{
+    allocate_in_tx, load_ready_invoice_by_id, DuckDbBillingStore,
+};
 pub use crate::adapters::in_memory_store::InMemoryBillingStore;
 
 // ── Port arg/result types (re-exported so binary callers using

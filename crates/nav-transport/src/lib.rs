@@ -1,38 +1,56 @@
-//! `aberp-nav-transport` — NAV TLS transport + credential loading.
+//! `aberp-nav-transport` — NAV TLS transport, credentials, SOAP envelope,
+//! signature primitives, AES-128/ECB exchange-token decryption, and the
+//! typed `tokenExchange` / `manageInvoice` operations.
 //!
 //! See ADR-0009 §4 (NAV authentication and credentials), ADR-0020 §1-3
-//! (transport / credential / threat-model correction), ADR-0021 §A14
-//! (keyring + NAV trust-anchor pin amendment).
+//! (transport / credential / threat-model correction), ADR-0021 §A9 +
+//! §A14 (AES-128/ECB / keychain).
 //!
-//! ## What this crate provides
+//! # PR-7-A scope (landed)
 //!
-//!   - [`NavEndpoint`] — the prod / test endpoint enum.
-//!   - [`NavTransport`] — a constructed `reqwest::Client` with the two
-//!     pinned trust anchors (`Microsec e-Szigno Root CA 2009` and
-//!     `e-Szigno OV TLS CA 2023`) and the OS trust store disabled.
-//!   - [`NavCredentials`] — the four-artifact credential bundle
-//!     (login + password + xmlSignKey + xmlChangeKey) loaded from the
-//!     OS keychain via the `keyring` crate (per ADR-0021 §A14).
+//!   - [`NavEndpoint`], [`NavTransport`] — pinned-trust reqwest client.
+//!   - [`NavCredentials`] — four-artifact keychain bundle.
 //!
-//! ## What this crate does NOT provide (PR-7-A scope discipline)
+//! # PR-7-B-1 scope (this PR's first commit)
 //!
-//!   - No SOAP envelope or XML serialization (PR-7-B).
-//!   - No `passwordHash` / `requestSignature` computation (PR-7-B).
-//!   - No `tokenExchange` / `manageInvoice` / `queryTransactionStatus`
-//!     (PR-7-B for the submit pair, PR-7-C for the poll).
-//!   - No audit-ledger writes — those are the binary's responsibility,
-//!     called from the NAV submission path in PR-7-B.
+//!   - [`signatures`] — SHA-512 `passwordHash`, SHA3-512
+//!     `requestSignature` (with per-invoice-index extension for
+//!     `manageInvoice` / `manageAnnulment`).
+//!   - [`soap`] — hand-rolled NAV v3.0 SOAP envelope assembly
+//!     (`<TokenExchangeRequest>`, `<ManageInvoiceRequest>`) per
+//!     ADR-0021 §A8.
 //!
-//! PR-7-A's success criterion is: the transport CAN be constructed
-//! against pinned trust anchors and the credentials CAN be loaded
-//! from the keychain; both fail loud on any missing or malformed
-//! input.
+//! # PR-7-B-2 scope (this PR's second commit)
+//!
+//!   - [`cipher`] — AES-128/ECB decryption of NAV's exchangeToken
+//!     envelope per ADR-0020 §2 + ADR-0021 §A9 ("protocol-imposed by
+//!     NAV; must not generalize").
+//!   - [`operations::token_exchange`] — `tokenExchange` call against
+//!     the pinned [`NavTransport`].
+//!
+//! # PR-7-B-3 scope (this PR's third commit)
+//!
+//!   - [`operations::manage_invoice`] — `manageInvoice` call + typed
+//!     response parsing + retryable/non-retryable error mapping per
+//!     ADR-0009 §5.
+//!
+//! # What this crate still does NOT provide
+//!
+//!   - `queryTransactionStatus` ack-poll loop (PR-7-C).
+//!   - `manageAnnulment` (technical annulment, PR-7-C+).
+//!   - Audit-ledger writes — those are the binary's responsibility,
+//!     called from the NAV submission path in `apps/aberp/src/
+//!     submit_invoice.rs`.
 
 #![forbid(unsafe_code)]
 
+pub mod cipher;
 pub mod credentials;
 pub mod endpoint;
 pub mod error;
+pub mod operations;
+pub mod signatures;
+pub mod soap;
 pub mod trust;
 
 mod client;
