@@ -1,14 +1,26 @@
 //! DuckDB-backed [`BillingStore`] adapter.
 //!
 //! Five tables, no foreign keys (ADR-0019). The allocator is the heart:
-//! `allocate_and_insert` runs the entire ADR-0009 §3 "Allocate (atomic)"
-//! sequence inside a single DuckDB transaction. Crash mid-flight rolls
-//! back the whole thing — no burned number without an invoice, no invoice
-//! without a reservation.
+//! [`allocate_in_tx`] runs the entire ADR-0009 §3 "Allocate (atomic)"
+//! sequence against a borrowed [`duckdb::Transaction`]. Crash mid-flight
+//! rolls back the whole thing — no burned number without an invoice, no
+//! invoice without a reservation.
 //!
-//! PR-4 does **not** wire the audit-ledger writes into this transaction
-//! (ADR-0009 §3 step 6); that consolidation happens in PR-5 when the
-//! binary owns a single DuckDB Connection shared across modules.
+//! # Two entry points
+//!
+//! - [`allocate_in_tx`] (free function) — for the binary path where one
+//!   `Connection`/`Transaction` is shared across `aberp-billing` and
+//!   `aberp-audit-ledger` so that ADR-0009 §3 step 6 (audit-ledger
+//!   entries in the same transaction) holds. PR-6 added this; the
+//!   binary in `apps/aberp` is the production caller.
+//! - [`DuckDbBillingStore::allocate_and_insert`] (trait method) — opens
+//!   its own transaction and calls [`allocate_in_tx`]. Retained for
+//!   in-process tests where the caller is not coordinating an audit
+//!   write in the same tx.
+//!
+//! The two paths share one body of SQL — the trait method is a five-line
+//! wrapper around the free function so there is exactly one place that
+//! knows how to allocate.
 
 use duckdb::{params, Connection};
 use time::format_description::well_known::Rfc3339;
@@ -99,6 +111,220 @@ impl DuckDbBillingStore {
     pub fn from_connection(conn: Connection) -> Self {
         Self { conn }
     }
+
+    /// Hand the wrapped Connection back to the caller. PR-6 uses this:
+    /// the binary creates the store, drives idempotent pre-tx setup
+    /// (`ensure_schema`, `ensure_series`) through the trait, then takes
+    /// the Connection back so it can `Connection::transaction()` and
+    /// drive [`allocate_in_tx`] + audit-ledger appends inside the same
+    /// tx. The store cannot be reused after this call.
+    pub fn into_connection(self) -> Connection {
+        self.conn
+    }
+}
+
+/// Run the ADR-0009 §3 "Allocate (atomic)" sequence inside a borrowed
+/// [`duckdb::Transaction`]. Caller owns commit/rollback.
+///
+/// This is the body the [`BillingStore::allocate_and_insert`] trait impl
+/// delegates to. The binary path (PR-6) calls this directly so that the
+/// audit-ledger appends for the issuance can ride the same transaction
+/// per ADR-0008 §Storage: "Entries are written in the same transaction
+/// as the state change they describe."
+///
+/// Crash/error semantics: the caller's `Transaction` rolls back on drop
+/// when not committed, so a return of `Err(_)` or a panic between this
+/// call and `tx.commit()` leaves the tenant DB unchanged. Conformance
+/// tests in `apps/aberp/tests/rollback_conformance.rs` exercise both
+/// paths.
+pub fn allocate_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    args: AllocateArgs,
+    now: OffsetDateTime,
+) -> Result<AllocateOutcome, BillingError> {
+    // ── Pre-flight validation. `IssueInvoiceCommand` handler does these
+    //    before delegating to the store; PR-6 callers that drive
+    //    `allocate_in_tx` directly (the binary path) bypass the handler,
+    //    so we re-assert here to fail loud at the lowest write surface
+    //    rather than silently allowing a zero-line or overflowing
+    //    invoice to be written.
+    if args.draft.lines.is_empty() {
+        return Err(BillingError::Invalid(
+            "DraftInvoice.lines must contain at least one line item",
+        ));
+    }
+    for (line_index, line) in args.draft.lines.iter().enumerate() {
+        if line.gross_total().is_none() {
+            return Err(BillingError::MoneyOverflow { line_index });
+        }
+    }
+
+    // ── ADR-0009 §5 Layer 1 idempotency check. Same idempotency key
+    //    => return the prior outcome unchanged. Hit before any number
+    //    is burned.
+    let idem_str = args.idempotency_key.0.to_string();
+    let prior: Option<String> = {
+        let mut stmt = tx.prepare("SELECT id FROM invoice WHERE idempotency_key = ?;")?;
+        let mut rows = stmt.query_map([&idem_str], |r| r.get::<_, String>(0))?;
+        match rows.next() {
+            Some(r) => Some(r?),
+            None => None,
+        }
+    };
+
+    if let Some(prior_invoice_id) = prior {
+        let invoice = load_invoice(tx, &prior_invoice_id)?;
+        let reservation = load_reservation_by_invoice(tx, &prior_invoice_id)?;
+        // No commit here — caller controls the tx boundary. Replay must
+        // still close cleanly so the caller's tx can also commit any
+        // sibling work (audit-ledger appends are skipped on replay per
+        // `apps/aberp/src/issue_invoice.rs`).
+        return Ok(AllocateOutcome::Replay {
+            invoice,
+            reservation,
+        });
+    }
+
+    // ── Resolve series + fiscal_year. PR-4 supports `Never` only;
+    //    the handler rejected Annual before reaching us.
+    let series = {
+        let mut stmt = tx.prepare(
+            "SELECT id, code, reset_policy, fiscal_year, created_at
+             FROM invoice_series WHERE id = ?;",
+        )?;
+        let mut rows = stmt.query_map([args.series_id.to_prefixed_string()], row_to_series)?;
+        match rows.next() {
+            Some(r) => r?,
+            None => {
+                return Err(BillingError::SeriesNotFound(
+                    args.series_id.to_prefixed_string(),
+                ))
+            }
+        }
+    };
+    let fiscal_year: i32 = match series.reset_policy {
+        ResetPolicy::Never => 0,
+        ResetPolicy::AnnualOnFiscalYear => {
+            return Err(BillingError::AnnualResetUnimplemented);
+        }
+    };
+
+    // ── ADR-0009 §3 step 1+3: read next_number (creating the row at
+    //    1 if absent), then UPDATE to advance.
+    let series_id_str = series.id.to_prefixed_string();
+    let now_str = now.format(&Rfc3339)?;
+    let allocated: u64 = {
+        let mut stmt = tx.prepare(
+            "SELECT next_number FROM invoice_sequence_state
+             WHERE series_id = ? AND fiscal_year = ?;",
+        )?;
+        let mut rows =
+            stmt.query_map(params![&series_id_str, fiscal_year], |r| r.get::<_, i64>(0))?;
+        match rows.next() {
+            Some(r) => r? as u64,
+            None => {
+                // First allocation for this series/fiscal_year — seed
+                // the state row at next_number = 1 (and we are about
+                // to burn 1 and advance to 2 below).
+                tx.execute(
+                    "INSERT INTO invoice_sequence_state
+                     (series_id, fiscal_year, next_number, updated_at)
+                     VALUES (?, ?, 1, ?);",
+                    params![&series_id_str, fiscal_year, &now_str],
+                )?;
+                1
+            }
+        }
+    };
+
+    tx.execute(
+        "UPDATE invoice_sequence_state
+         SET next_number = next_number + 1, updated_at = ?
+         WHERE series_id = ? AND fiscal_year = ?;",
+        params![&now_str, &series_id_str, fiscal_year],
+    )?;
+
+    // ── ADR-0009 §3 step 4: insert the reservation.
+    let reservation_id = ReservationId::new();
+    let draft = args.draft;
+    tx.execute(
+        "INSERT INTO invoice_sequence_reservation
+         (id, series_id, fiscal_year, number, invoice_id, status,
+          void_reason, reserved_at, used_at, voided_at)
+         VALUES (?, ?, ?, ?, ?, 'reserved', NULL, ?, NULL, NULL);",
+        params![
+            reservation_id.to_prefixed_string(),
+            &series_id_str,
+            fiscal_year,
+            allocated as i64,
+            draft.id.to_prefixed_string(),
+            &now_str,
+        ],
+    )?;
+
+    // ── ADR-0009 §3 step 5: insert the invoice row + line items.
+    let issue_date_str = draft.issue_date.format(&Rfc3339)?;
+    tx.execute(
+        "INSERT INTO invoice
+         (id, series_id, customer_id, issue_date, sequence_number,
+          fiscal_year, idempotency_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?);",
+        params![
+            draft.id.to_prefixed_string(),
+            &series_id_str,
+            draft.customer_id.to_prefixed_string(),
+            &issue_date_str,
+            allocated as i64,
+            fiscal_year,
+            &idem_str,
+        ],
+    )?;
+
+    for (ordinal, line) in draft.lines.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO invoice_line
+             (invoice_id, ordinal, description, quantity,
+              unit_price, vat_rate_basis_points)
+             VALUES (?, ?, ?, ?, ?, ?);",
+            params![
+                draft.id.to_prefixed_string(),
+                ordinal as i64,
+                &line.description,
+                line.quantity as i64,
+                line.unit_price.as_i64(),
+                line.vat_rate_basis_points as i64,
+            ],
+        )?;
+    }
+
+    // ── ADR-0009 §3 step 6: audit-ledger entries land via the caller
+    //    using the same `tx`. Step 7 (commit) is also the caller's.
+    let invoice = ReadyInvoice {
+        id: draft.id,
+        series_id: draft.series_id,
+        customer_id: draft.customer_id,
+        lines: draft.lines,
+        issue_date: draft.issue_date,
+        sequence_number: allocated,
+        fiscal_year,
+    };
+    let reservation = SequenceReservation {
+        id: reservation_id,
+        series_id: series.id,
+        fiscal_year,
+        number: allocated,
+        invoice_id: invoice.id,
+        status: ReservationStatus::Reserved,
+        void_reason: None,
+        reserved_at: now,
+        used_at: None,
+        voided_at: None,
+    };
+
+    Ok(AllocateOutcome::Fresh {
+        invoice,
+        reservation,
+    })
 }
 
 impl BillingStore for DuckDbBillingStore {
@@ -155,174 +381,14 @@ impl BillingStore for DuckDbBillingStore {
         args: AllocateArgs,
         now: OffsetDateTime,
     ) -> Result<AllocateOutcome, BillingError> {
+        // Thin wrapper: open a tx, delegate to the free function, commit.
+        // The body of the allocator lives in `allocate_in_tx` so the
+        // binary can drive a single tx that also covers the audit-ledger
+        // appends (ADR-0009 §3 step 6, closed in PR-6).
         let tx = self.conn.transaction()?;
-
-        // ── ADR-0009 §5 Layer 1 idempotency check. Same idempotency key
-        //    => return the prior outcome unchanged. Hit before any number
-        //    is burned.
-        let idem_str = args.idempotency_key.0.to_string();
-        let prior: Option<String> = {
-            let mut stmt = tx.prepare("SELECT id FROM invoice WHERE idempotency_key = ?;")?;
-            let mut rows = stmt.query_map([&idem_str], |r| r.get::<_, String>(0))?;
-            match rows.next() {
-                Some(r) => Some(r?),
-                None => None,
-            }
-        };
-
-        if let Some(prior_invoice_id) = prior {
-            let invoice = load_invoice(&tx, &prior_invoice_id)?;
-            let reservation = load_reservation_by_invoice(&tx, &prior_invoice_id)?;
-            tx.commit()?;
-            return Ok(AllocateOutcome::Replay {
-                invoice,
-                reservation,
-            });
-        }
-
-        // ── Resolve series + fiscal_year. PR-4 supports `Never` only;
-        //    the handler rejected Annual before reaching us.
-        let series = {
-            let mut stmt = tx.prepare(
-                "SELECT id, code, reset_policy, fiscal_year, created_at
-                 FROM invoice_series WHERE id = ?;",
-            )?;
-            let mut rows = stmt.query_map([args.series_id.to_prefixed_string()], row_to_series)?;
-            match rows.next() {
-                Some(r) => r?,
-                None => {
-                    return Err(BillingError::SeriesNotFound(
-                        args.series_id.to_prefixed_string(),
-                    ))
-                }
-            }
-        };
-        let fiscal_year: i32 = match series.reset_policy {
-            ResetPolicy::Never => 0,
-            ResetPolicy::AnnualOnFiscalYear => {
-                return Err(BillingError::AnnualResetUnimplemented);
-            }
-        };
-
-        // ── ADR-0009 §3 step 1+3: read next_number (creating the row at
-        //    1 if absent), then UPDATE to advance.
-        let series_id_str = series.id.to_prefixed_string();
-        let now_str = now.format(&Rfc3339)?;
-        let allocated: u64 = {
-            let mut stmt = tx.prepare(
-                "SELECT next_number FROM invoice_sequence_state
-                 WHERE series_id = ? AND fiscal_year = ?;",
-            )?;
-            let mut rows =
-                stmt.query_map(params![&series_id_str, fiscal_year], |r| r.get::<_, i64>(0))?;
-            match rows.next() {
-                Some(r) => r? as u64,
-                None => {
-                    // First allocation for this series/fiscal_year — seed
-                    // the state row at next_number = 1 (and we are about
-                    // to burn 1 and advance to 2 below).
-                    tx.execute(
-                        "INSERT INTO invoice_sequence_state
-                         (series_id, fiscal_year, next_number, updated_at)
-                         VALUES (?, ?, 1, ?);",
-                        params![&series_id_str, fiscal_year, &now_str],
-                    )?;
-                    1
-                }
-            }
-        };
-
-        tx.execute(
-            "UPDATE invoice_sequence_state
-             SET next_number = next_number + 1, updated_at = ?
-             WHERE series_id = ? AND fiscal_year = ?;",
-            params![&now_str, &series_id_str, fiscal_year],
-        )?;
-
-        // ── ADR-0009 §3 step 4: insert the reservation.
-        let reservation_id = ReservationId::new();
-        let draft = args.draft;
-        tx.execute(
-            "INSERT INTO invoice_sequence_reservation
-             (id, series_id, fiscal_year, number, invoice_id, status,
-              void_reason, reserved_at, used_at, voided_at)
-             VALUES (?, ?, ?, ?, ?, 'reserved', NULL, ?, NULL, NULL);",
-            params![
-                reservation_id.to_prefixed_string(),
-                &series_id_str,
-                fiscal_year,
-                allocated as i64,
-                draft.id.to_prefixed_string(),
-                &now_str,
-            ],
-        )?;
-
-        // ── ADR-0009 §3 step 5: insert the invoice row + line items.
-        let issue_date_str = draft.issue_date.format(&Rfc3339)?;
-        tx.execute(
-            "INSERT INTO invoice
-             (id, series_id, customer_id, issue_date, sequence_number,
-              fiscal_year, idempotency_key)
-             VALUES (?, ?, ?, ?, ?, ?, ?);",
-            params![
-                draft.id.to_prefixed_string(),
-                &series_id_str,
-                draft.customer_id.to_prefixed_string(),
-                &issue_date_str,
-                allocated as i64,
-                fiscal_year,
-                &idem_str,
-            ],
-        )?;
-
-        for (ordinal, line) in draft.lines.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO invoice_line
-                 (invoice_id, ordinal, description, quantity,
-                  unit_price, vat_rate_basis_points)
-                 VALUES (?, ?, ?, ?, ?, ?);",
-                params![
-                    draft.id.to_prefixed_string(),
-                    ordinal as i64,
-                    &line.description,
-                    line.quantity as i64,
-                    line.unit_price.as_i64(),
-                    line.vat_rate_basis_points as i64,
-                ],
-            )?;
-        }
-
-        // ── ADR-0009 §3 step 7: commit. (Step 6 — audit-ledger entries —
-        //    is intentionally deferred to PR-5 when the binary shares the
-        //    connection; flagged loudly in the crate docs.)
+        let outcome = allocate_in_tx(&tx, args, now)?;
         tx.commit()?;
-
-        let invoice = ReadyInvoice {
-            id: draft.id,
-            series_id: draft.series_id,
-            customer_id: draft.customer_id,
-            lines: draft.lines,
-            issue_date: draft.issue_date,
-            sequence_number: allocated,
-            fiscal_year,
-        };
-        let reservation = SequenceReservation {
-            id: reservation_id,
-            series_id: series.id,
-            fiscal_year,
-            number: allocated,
-            invoice_id: invoice.id,
-            status: ReservationStatus::Reserved,
-            void_reason: None,
-            reserved_at: now,
-            used_at: None,
-            voided_at: None,
-        };
-
-        Ok(AllocateOutcome::Fresh {
-            invoice,
-            reservation,
-        })
+        Ok(outcome)
     }
 
     fn void_reservation(

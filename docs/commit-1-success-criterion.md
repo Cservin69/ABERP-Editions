@@ -56,14 +56,14 @@ Expected outputs:
 - **NAV submission** — the binary writes the XML to disk; submission
   belongs to the NAV adapter PR (out-of-scope per the handoff:
   "without submitting").
-- **Cross-crate transactional audit** — the audit-ledger writes happen
-  in a separate DuckDB transaction from the billing writes. ADR-0008
-  §Storage requires them to be in the same transaction; the binary's
-  pipeline does not yet satisfy that. Tracked for the next adversarial
-  review; the mitigation in the meantime is that a crash between the
-  billing commit and the audit append leaves an invoice without its
-  audit entries, which the reconciliation scan would surface as an
-  anomaly (loud-failure mode per ADR-0007).
+- **Cross-crate transactional audit** — *closed in PR-6.* The binary
+  now owns the tenant `Connection`, opens one `Transaction`, and drives
+  both `aberp_billing::allocate_in_tx` and
+  `aberp_audit_ledger::append_in_tx` inside it. ADR-0008 §Storage's
+  "same transaction as the state change they describe" is now satisfied
+  on the issuance path. Rollback is pinned by
+  `apps/aberp/tests/rollback_conformance.rs` (drop-without-commit and
+  panic-injection variants).
 - **Real authentication** — the audit-ledger entries use
   `Actor::test_only`. The keychain-bound credential flow ships with
   the keychain ADR (named trigger: first PR that loads keychain-bound

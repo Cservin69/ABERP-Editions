@@ -14,6 +14,24 @@
 //! `Ledger::open` accepts a `tenant_id` and a `binary_hash`. Multi-tenant
 //! separation is at the DuckDB-file level per ADR-0002; one `Ledger`
 //! instance == one tenant's chain.
+//!
+//! # Cross-crate transactional appends (PR-6)
+//!
+//! [`Ledger::append`] above opens its own DuckDB transaction. For the
+//! binary path where the same transaction must also cover billing-state
+//! writes (ADR-0008 §Storage: "Entries are written in the same
+//! transaction as the state change they describe"), this module exposes
+//! [`ensure_schema`] and [`append_in_tx`] as free functions. The binary
+//! (`apps/aberp/src/issue_invoice.rs`) owns the `Connection`, opens one
+//! `Transaction`, calls [`crate::storage::ensure_schema`] up-front,
+//! drives both the billing allocator and [`append_in_tx`] inside it, and
+//! commits once. A panic or `Err(_)` between those calls and `commit`
+//! rolls back both halves cleanly; conformance tests in
+//! `apps/aberp/tests/rollback_conformance.rs` exercise both rollback
+//! paths.
+//!
+//! The `Ledger::append` trait-style wrapper delegates to
+//! [`append_in_tx`] so there is one body of insert logic, not two.
 
 pub mod schema;
 
@@ -30,16 +48,43 @@ use crate::chain::verify::verify_chain;
 use crate::entry::{Actor, BinaryHash, Entry, EntryHash, EntryId, EventKind, Sequence, TenantId};
 use crate::error::{AppendError, VerifyError};
 
+/// Per-tenant invariants the append path needs but the borrowed
+/// [`duckdb::Transaction`] cannot supply on its own. Constructed once
+/// per process by the binary (or once per `Ledger` by the trait-style
+/// wrapper) and threaded into [`append_in_tx`] as `&LedgerMeta`.
+///
+/// `process_start` is captured at construction and never updated, per
+/// ADR-0008 §"Adversarial review" — `time_mono` resets across
+/// processes by design.
+#[derive(Debug, Clone)]
+pub struct LedgerMeta {
+    tenant_id: TenantId,
+    binary_hash: BinaryHash,
+    process_start: Instant,
+}
+
+impl LedgerMeta {
+    /// Build a `LedgerMeta` and anchor `time_mono` to "now". One call
+    /// per process is the expected pattern; the binary builds it once
+    /// at startup and re-uses it for every append.
+    pub fn new(tenant_id: TenantId, binary_hash: BinaryHash) -> Self {
+        Self {
+            tenant_id,
+            binary_hash,
+            process_start: Instant::now(),
+        }
+    }
+
+    pub fn tenant_id(&self) -> &TenantId {
+        &self.tenant_id
+    }
+}
+
 /// Append-only tamper-evident audit ledger backed by DuckDB.
 #[derive(Debug)]
 pub struct Ledger {
     conn: Connection,
-    tenant_id: TenantId,
-    binary_hash: BinaryHash,
-    /// Process-start anchor for `time_mono`. Captured at [`Ledger::open`]
-    /// time; resets across processes per ADR-0008 §"Adversarial review"
-    /// ("Wall clock can be moved, monotonic cannot (within a process)").
-    process_start: Instant,
+    meta: LedgerMeta,
 }
 
 impl Ledger {
@@ -69,28 +114,25 @@ impl Ledger {
         tenant_id: TenantId,
         binary_hash: BinaryHash,
     ) -> Result<Self, AppendError> {
-        conn.execute_batch(schema::CREATE_TABLE)?;
+        ensure_schema(&conn)?;
         Ok(Self {
             conn,
-            tenant_id,
-            binary_hash,
-            process_start: Instant::now(),
+            meta: LedgerMeta::new(tenant_id, binary_hash),
         })
     }
 
     /// Tenant identifier this ledger belongs to.
     pub fn tenant_id(&self) -> &TenantId {
-        &self.tenant_id
+        &self.meta.tenant_id
     }
 
-    /// Append a new entry. Returns the appended entry's id.
+    /// Append a new entry. Opens a fresh DuckDB transaction, delegates
+    /// to [`append_in_tx`], and commits. Used by callers that are not
+    /// coordinating a state change in the same transaction.
     ///
-    /// The append computes `seq`, `prev_hash`, `time_wall`, `time_mono`,
-    /// and `entry_hash` itself; the caller supplies the business
-    /// content (`kind`, `payload`, `actor`, `idempotency_key`). All of
-    /// the row insert happens in a single DuckDB transaction so a crash
-    /// mid-append rolls back cleanly (ADR-0009 §"sequence allocator"
-    /// invariant — same pattern reused here for the ledger).
+    /// The binary path in `apps/aberp/src/issue_invoice.rs` does **not**
+    /// use this method; it drives [`append_in_tx`] directly under a tx
+    /// shared with `aberp-billing` so ADR-0008 §Storage holds.
     pub fn append(
         &mut self,
         kind: EventKind,
@@ -98,59 +140,10 @@ impl Ledger {
         actor: Actor,
         idempotency_key: Option<String>,
     ) -> Result<EntryId, AppendError> {
-        // Resolve the chain head before opening the tx so we can compute
-        // seq and prev_hash without serializing against ourselves.
-        let head = self.head()?;
-        let seq = next_seq(head.as_ref());
-        let prev_hash = next_prev_hash(&self.tenant_id, head.as_ref());
-
-        // Capture clocks.
-        let time_wall = OffsetDateTime::now_utc();
-        let time_mono = self.process_start.elapsed().as_nanos() as u64;
-
-        // Build the entry with a zero entry_hash, then compute the real
-        // hash from the canonical bytes, then patch the field.
-        let mut entry = Entry {
-            id: EntryId::new(),
-            seq,
-            prev_hash,
-            time_wall,
-            time_mono,
-            actor,
-            binary_hash: self.binary_hash,
-            tenant_id: self.tenant_id.clone(),
-            kind,
-            payload,
-            idempotency_key,
-            entry_hash: EntryHash::from_bytes([0u8; 32]),
-        };
-        entry.entry_hash = compute_entry_hash(&entry);
-
-        // Single-statement insert is atomic in DuckDB; no explicit tx needed.
-        let inserted = self.conn.execute(
-            schema::INSERT,
-            params![
-                entry.id.to_prefixed_string(),
-                entry.seq.as_u64() as i64,
-                entry.prev_hash.as_bytes().as_slice(),
-                time_wall.format(&Rfc3339)?,
-                entry.time_mono as i64,
-                entry.actor.to_storage_json(),
-                entry.binary_hash.as_bytes().as_slice(),
-                entry.tenant_id.as_str(),
-                entry.kind.as_str(),
-                entry.payload.as_slice(),
-                entry.idempotency_key.as_deref(),
-                entry.entry_hash.as_bytes().as_slice(),
-            ],
-        )?;
-
-        if inserted != 1 {
-            return Err(AppendError::SequenceConflict {
-                seq: entry.seq.as_u64(),
-            });
-        }
-        Ok(entry.id)
+        let tx = self.conn.transaction()?;
+        let id = append_in_tx(&tx, &self.meta, kind, payload, actor, idempotency_key)?;
+        tx.commit()?;
+        Ok(id)
     }
 
     /// Read every entry in seq order.
@@ -164,21 +157,116 @@ impl Ledger {
         Ok(out)
     }
 
-    /// Read the head entry (highest seq), if any.
-    fn head(&self) -> Result<Option<Entry>, AppendError> {
-        let mut stmt = self.conn.prepare(schema::SELECT_HEAD)?;
-        let mut rows = stmt.query_map([], row_to_entry)?;
-        match rows.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
-        }
-    }
-
     /// Verify the full chain against the tenant genesis. See
     /// [`crate::chain::verify_chain`] for the exact contract.
     pub fn verify_chain(&self) -> Result<u64, LedgerVerifyError> {
         let entries = self.entries().map_err(LedgerVerifyError::Read)?;
-        verify_chain(&self.tenant_id, entries.iter()).map_err(LedgerVerifyError::Chain)
+        verify_chain(&self.meta.tenant_id, entries.iter()).map_err(LedgerVerifyError::Chain)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Cross-crate transactional surface (PR-6).
+//
+// The binary owns the [`Connection`], opens one transaction via
+// [`Connection::transaction`], runs the billing allocator + audit-ledger
+// appends against that single `&Transaction`, and commits once. Schema
+// creation runs separately because DDL inside a transaction is awkward;
+// `ensure_schema` is idempotent and is called before opening the tx.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Create the `audit_ledger` table if it does not yet exist. Idempotent.
+/// Callers expecting to drive transactional appends through
+/// [`append_in_tx`] must invoke this against the [`Connection`] before
+/// opening their transaction; DuckDB DDL inside a multi-statement tx is
+/// not the path PR-6 wants to defend.
+pub fn ensure_schema(conn: &Connection) -> Result<(), AppendError> {
+    conn.execute_batch(schema::CREATE_TABLE)?;
+    Ok(())
+}
+
+/// Append a new entry inside a caller-owned transaction. The caller is
+/// responsible for `commit()`; an error return or panic before commit
+/// leaves the ledger and any sibling state unchanged (Drop on
+/// `Transaction` rolls back).
+///
+/// Computes `seq`, `prev_hash`, `time_wall`, `time_mono`, and
+/// `entry_hash` from `meta` + the current chain head read inside the
+/// same `tx`. Caller supplies the business content (`kind`, `payload`,
+/// `actor`, `idempotency_key`).
+pub fn append_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    meta: &LedgerMeta,
+    kind: EventKind,
+    payload: Vec<u8>,
+    actor: Actor,
+    idempotency_key: Option<String>,
+) -> Result<EntryId, AppendError> {
+    // Resolve the chain head inside the tx so the seq/prev_hash we
+    // compute reflect any sibling appends that already landed earlier
+    // in the same tx (e.g., the binary appends two entries per
+    // issuance — InvoiceSequenceReserved, then InvoiceDraftCreated).
+    let head = read_head(tx)?;
+    let seq = next_seq(head.as_ref());
+    let prev_hash = next_prev_hash(&meta.tenant_id, head.as_ref());
+
+    // Capture clocks.
+    let time_wall = OffsetDateTime::now_utc();
+    let time_mono = meta.process_start.elapsed().as_nanos() as u64;
+
+    // Build the entry with a zero entry_hash, then compute the real
+    // hash from the canonical bytes, then patch the field.
+    let mut entry = Entry {
+        id: EntryId::new(),
+        seq,
+        prev_hash,
+        time_wall,
+        time_mono,
+        actor,
+        binary_hash: meta.binary_hash,
+        tenant_id: meta.tenant_id.clone(),
+        kind,
+        payload,
+        idempotency_key,
+        entry_hash: EntryHash::from_bytes([0u8; 32]),
+    };
+    entry.entry_hash = compute_entry_hash(&entry);
+
+    let inserted = tx.execute(
+        schema::INSERT,
+        params![
+            entry.id.to_prefixed_string(),
+            entry.seq.as_u64() as i64,
+            entry.prev_hash.as_bytes().as_slice(),
+            time_wall.format(&Rfc3339)?,
+            entry.time_mono as i64,
+            entry.actor.to_storage_json(),
+            entry.binary_hash.as_bytes().as_slice(),
+            entry.tenant_id.as_str(),
+            entry.kind.as_str(),
+            entry.payload.as_slice(),
+            entry.idempotency_key.as_deref(),
+            entry.entry_hash.as_bytes().as_slice(),
+        ],
+    )?;
+
+    if inserted != 1 {
+        return Err(AppendError::SequenceConflict {
+            seq: entry.seq.as_u64(),
+        });
+    }
+    Ok(entry.id)
+}
+
+/// Read the chain head (highest seq) inside the borrowed transaction.
+/// Shared between [`Ledger`] (which used to own this as a method) and
+/// [`append_in_tx`].
+fn read_head(tx: &duckdb::Transaction<'_>) -> Result<Option<Entry>, AppendError> {
+    let mut stmt = tx.prepare(schema::SELECT_HEAD)?;
+    let mut rows = stmt.query_map([], row_to_entry)?;
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
     }
 }
 

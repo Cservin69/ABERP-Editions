@@ -22,14 +22,19 @@
 //! # Out of PR-4 scope
 //!
 //! - NAV submission, ack polling, retry queue.
-//! - Audit-ledger writes from inside the allocator. ADR-0008 requires them
-//!   to be transactional with the state change; that wiring lands in PR-5
-//!   when the binary owns the DuckDB connection and can share it with the
-//!   audit-ledger crate. Until then, audit entries for invoice events are
-//!   written by the caller after the allocator commits — surfaced loudly
-//!   in PR-5's commit message.
 //! - Storno / modification chain (ADR-0009 §6).
 //! - Startup reconciliation scan (ADR-0009 §3 "Startup reconciliation").
+//!
+//! # PR-6 addition: tx-aware allocator
+//!
+//! [`adapters::duckdb_store::allocate_in_tx`] is the free-function flavor
+//! of the trait-method allocator. The binary in `apps/aberp` calls it
+//! against a borrowed `duckdb::Transaction` so the audit-ledger appends
+//! for the issuance ride the same transaction (ADR-0008 §Storage,
+//! ADR-0009 §3 step 6). The trait method
+//! [`adapters::duckdb_store::DuckDbBillingStore::allocate_and_insert`]
+//! delegates to it for the non-coordinated callers (in-memory tests,
+//! future single-module callers).
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]

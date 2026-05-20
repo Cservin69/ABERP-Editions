@@ -42,4 +42,4 @@ mod storage;
 
 pub use entry::{Actor, BinaryHash, Entry, EntryHash, EntryId, EventKind, Sequence, TenantId};
 pub use error::{AppendError, VerifyError};
-pub use storage::{Ledger, LedgerVerifyError};
+pub use storage::{append_in_tx, ensure_schema, Ledger, LedgerMeta, LedgerVerifyError};

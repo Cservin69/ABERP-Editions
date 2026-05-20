@@ -10,6 +10,7 @@ dependencies = [
  "aberp-billing",
  "anyhow",
  "clap",
+ "duckdb",
  "quick-xml",
  "serde",
  "serde_json",

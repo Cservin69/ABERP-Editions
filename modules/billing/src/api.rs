@@ -17,8 +17,13 @@ pub use crate::ports::clock::{Clock, SystemClock};
 pub use crate::ports::storage::BillingStore;
 
 // ── Adapters ──────────────────────────────────────────────────────────
-pub use crate::adapters::duckdb_store::DuckDbBillingStore;
+pub use crate::adapters::duckdb_store::{allocate_in_tx, DuckDbBillingStore};
 pub use crate::adapters::in_memory_store::InMemoryBillingStore;
+
+// ── Port arg/result types (re-exported so binary callers using
+//     `allocate_in_tx` directly can build `AllocateArgs` without
+//     reaching into `crate::ports::storage`) ────────────────────────────
+pub use crate::ports::storage::{AllocateArgs, AllocateOutcome};
 
 // ── App layer (commands + handler) ────────────────────────────────────
 pub use crate::app::error::BillingError;

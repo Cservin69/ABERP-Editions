@@ -33,6 +33,11 @@ quick-xml = { workspace = true }
 time = { workspace = true }
 sha2 = { workspace = true }
 
+# Storage — the binary owns the tenant DuckDB connection so it can drive
+# one transaction across `aberp-billing` and `aberp-audit-ledger` per
+# ADR-0008 §Storage. PR-6 close-out.
+duckdb = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
