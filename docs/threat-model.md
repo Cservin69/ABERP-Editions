@@ -48,10 +48,17 @@ thereafter; and immediately on any incident.
    per-invoice-index extension for `manageInvoice` / `manageAnnulment`),
    and an AES-128/ECB-decrypted `exchangeToken`. Replay protection
    comes from `requestId` + `requestTimestamp` being inputs to the
-   signature. **Response integrity is TLS-only at the time of writing**;
-   signed-response-body verification is [OPEN] pending external check
-   (see ADR-0020 §6 and `docs/research/nav-and-billingo.md`). Authority:
-   ADR-0020 (partially supersedes ADR-0007's earlier mTLS-to-NAV claim).
+   signature. **Response integrity is TLS-only by decision**, with a
+   retroactive-verification path provisioned: both the verbatim and
+   parsed response body are committed to the audit ledger (ADR-0009
+   §8), so a future signing-scheme disclosure by NAV unlocks offline
+   re-verification of historical responses without an in-flight code
+   change. The external fact "does NAV sign response bodies?" is
+   tracked separately in ADR-0020 §Open Questions §1 against the
+   Hungarian-dev research check; the ABERP-side posture is decided
+   regardless. Authority: ADR-0020 §6 (editorially clarified
+   2026-05-20 per F7), which partially supersedes ADR-0007's earlier
+   mTLS-to-NAV claim.
 4. Backend ↔ Billingo — TLS with pinned roots, API-key header from OS
    keychain. One-time read-path scope only (historical NAV invoice
    ingestion per ADR-0010); not on the issuance path. Deep posture
@@ -91,3 +98,4 @@ that addresses it.
 | 2026-05-19 | Ervin    | Initial v0.1 — to be reviewed in two weeks |
 | 2026-05-19 | Ervin    | Trust-boundary #3 corrected and split (NAV vs Billingo) per ADR-0020; response-body integrity flagged [OPEN] |
 | 2026-05-19 | Ervin    | First full-spine adversarial review — see `docs/reviews/2026-05-19-pre-code-spine-review.md`; three blockers (F1–F3) and one tracked finding (F4) closed in ADR-0021 amendment same day; F5 + F6 deferred to build phase with named triggers; F7 (NAV response-body integrity) carried forward against external check |
+| 2026-05-20 | Ervin    | Fortnightly adversarial review — see `docs/reviews/2026-05-20-fortnightly-review.md`; PR-6 closes the cross-crate transactional audit deviation; PR-6.1 closes F8/F9/F12; F7 closed editorially in ADR-0020 §6 (TLS-only with retroactive-verification path is the decided posture; the external fact about NAV's signing scheme is tracked separately and is no longer a blocking [OPEN]); F5 + F6 + F15 about to fire in PR-7-A |

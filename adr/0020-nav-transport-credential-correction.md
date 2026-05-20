@@ -139,9 +139,10 @@ following edit to `docs/threat-model.md`:
   authentication (technical-user, SHA-512 `passwordHash`, SHA3-512
   `requestSignature`, AES-128/ECB-decrypted `exchangeToken`);
   replay protection through `requestId` + `requestTimestamp` inputs
-  to the signature; **response integrity is TLS-only at the time of
-  this ADR**, with signed-response-body verification flagged
-  **[OPEN]** pending external check (see §6 below).
+  to the signature; **response integrity is TLS-only by decision**,
+  with a retroactive-verification path provisioned via ADR-0009 §8's
+  verbatim-store (see §6 below). The external fact "does NAV sign
+  response bodies?" is tracked in §Open Questions §1.
 - **Backend ↔ Billingo** becomes its own entry: TLS with pinned
   roots; an API-key header for authentication; scope limited to the
   one-time migration read path per ADR-0010. Detail belongs in
@@ -163,25 +164,55 @@ factual claim; it does not strip mTLS as a general posture from the
 security baseline. (Surgical-changes principle — CLAUDE.md rule 3 —
 applied to ADRs.)
 
-### 6. Response-body integrity is [OPEN], not soft-asserted
+### 6. Response-body integrity: TLS-only today, retroactive verification path provisioned
 
-Whether NAV signs HTTP response bodies independent of TLS is not
-conclusively established in the public sources reviewed in
-`docs/research/nav-and-billingo.md`. This ADR explicitly **does not
-claim** that ABERP verifies signed NAV response bodies today.
+**Decision.** ABERP's response-body integrity posture toward NAV is
+**TLS-only**: the response body is trusted at the transport level
+only (server-cert chain rooted at the pinned NAV issuing root per
+§1), with no application-layer signature verification of the body
+itself.
 
-The factual posture today is: TLS to NAV terminates with the
-server-cert chain rooted at the pinned NAV issuing root; the
-response body is trusted at the transport level only; the parsed
-body and the verbatim original are both committed to the audit
-ledger per ADR-0009 §8 so a later integrity check is possible if
-NAV publishes the signing details.
+**Mitigations actually shipped.** Both the verbatim response body
+and the parsed body are committed to the audit ledger per ADR-0009
+§8. This provisions a **retroactive-verification path**: if NAV
+publishes its response-body signing scheme later, every historical
+response in the ledger can be re-verified offline against the
+disclosed scheme without changing the in-flight code path. The
+parsed body is additionally constrained by the pinned NAV v3.0 XSD
+set (ADR-0009 §1), which bounds what a tampered response can cause
+downstream.
 
-If the Hungarian-dev external check establishes that NAV signs
-response bodies, ADR-0009 §8's verbatim-store path absorbs
-signature verification at that point and a follow-up amendment to
-this ADR records the change. Until then: **TLS-only**, said out
-loud, not papered over.
+**What is and is not pending.** *Not* pending: the ABERP-side
+decision. It is made (TLS-only + verbatim store). *Pending*: an
+external fact — whether NAV signs response bodies independent of
+TLS, and if so, the algorithm, the verification-key location, and
+the wire encoding. This is tracked in Open Questions §1 below
+against the Hungarian-dev external check.
+
+**Named amendment trigger.** A follow-up amendment to this ADR
+adds the verification step when *either* of the following fires,
+whichever first:
+
+1. The external check (Hungarian-dev review of the
+   `docs/research/nav-and-billingo.md` posture) confirms NAV's
+   signing scheme and provides the verification key location.
+2. NAV publishes the signing details in its interface
+   specification.
+
+Until one of those fires: **TLS-only**, decided, said out loud,
+not papered over. Soft-asserting verification we cannot perform
+is refused at the bar of CLAUDE.md rule 12 (fail loud) and the
+session-2 minority-report lesson.
+
+> **Editorial amendment, 2026-05-20.** This section was originally
+> titled "Response-body integrity is [OPEN], not soft-asserted"
+> with the body asserting the same TLS-only posture. The
+> fortnightly review on 2026-05-20 (`docs/reviews/2026-05-20-
+> fortnightly-review.md`, finding F7) surfaced that the `[OPEN]`
+> label in the section title implied an undecided ABERP posture
+> while the body already stated the decision. The title and body
+> were rewritten editorially to be decision-shaped; no direction
+> change. The external-fact tracking lives in §Open Questions §1.
 
 ### 7. Forward stance (one paragraph, principled)
 
@@ -330,12 +361,16 @@ These are tracked against the next adversarial-review cadence and
 against the external-check items in
 `docs/research/nav-and-billingo.md`.
 
-- **NAV response-body signing — does it exist?** If yes, the
+- **NAV response-body signing — does it exist?** External-fact
+  tracking item, *not* an open ABERP-side decision. §6 above
+  documents ABERP's posture (TLS-only with retroactive-verification
+  path) which holds regardless of how this resolves. If yes, the
   algorithm, the location of the verification key, and the wire
   encoding. Resolution path: Hungarian-dev external check on the
   research file. If positive, an amendment to this ADR adds the
   verification step and ADR-0009 §8's verbatim-store path absorbs
-  it.
+  it. Status check: open at the 2026-05-20 fortnightly review (F7);
+  no progress in the two-week window.
 - **`exchangeToken` lifetime.** Pinned by NAV server-side
   behaviour. ABERP currently treats the token as single-use per
   modifying request, per the consulted clients. Confirmation of
