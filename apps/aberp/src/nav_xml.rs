@@ -65,6 +65,23 @@ pub struct CustomerInfo {
     pub name: String,
 }
 
+/// Storno chain-link reference data for [`render_storno_data`] (PR-10,
+/// ADR-0023). Pinpoints the base invoice and the chain index this
+/// storno asserts. The XML emitter renders these into an
+/// `<invoiceReference>` block inside `<invoice>` (positioned BEFORE
+/// `<invoiceHead>` per NAV v3.0 schema).
+#[derive(Debug, Clone)]
+pub struct StornoReference {
+    /// Base invoice's NAV-facing number — formatted as `<series>/<5-digit-seq>`
+    /// (e.g. `INV-default/00007`). The caller constructs this from the
+    /// base invoice row's series + sequence_number; see
+    /// `issue_storno::run` step 10.
+    pub base_invoice_number: String,
+    /// `<modificationIndex>` allocated by the chain walker per
+    /// ADR-0023 §4 — starts at 1, increments per chain entry.
+    pub modification_index: u32,
+}
+
 const NAV_NS_DATA: &str = "http://schemas.nav.gov.hu/OSA/3.0/data";
 const NAV_NS_BASE: &str = "http://schemas.nav.gov.hu/OSA/3.0/base";
 
@@ -125,6 +142,133 @@ pub fn render_invoice_data(
     w.write_event(Event::End(BytesEnd::new("InvoiceData")))?;
 
     Ok(buf)
+}
+
+/// Render the storno's `<InvoiceData>` to bytes (PR-10, ADR-0023).
+///
+/// Two differences from [`render_invoice_data`]:
+///
+/// 1. An `<invoiceReference>` block appears inside `<invoice>`,
+///    positioned BEFORE `<invoiceHead>` per NAV v3.0 schema. Carries
+///    `originalInvoiceNumber` + `modifyWithoutMaster` (always `false`
+///    for PR-10 — ADR-0023 §4 names the migrated-base path that
+///    would set this `true` and explicitly defers it) +
+///    `modificationIndex`.
+///
+/// 2. Line and summary amounts are **negated** per NAV's storno
+///    convention. Negation is done by constructing a parallel
+///    `Vec<LineItem>` with negated `unit_price` (`Huf` wraps `i64`,
+///    so negative is representable); `net_total` /  `vat_amount` /
+///    `gross_total` cascade to negative naturally because the same
+///    multiplications now run against a negative `unit_price`. This
+///    keeps the line-writer logic shared with [`render_invoice_data`]
+///    instead of forking a parallel `write_storno_lines` — CLAUDE.md
+///    rule 2 (no speculative abstractions).
+///
+/// The `invoice` argument carries the STORNO's own sequence number
+/// (the storno is itself an invoice with its own allocator slot per
+/// ADR-0009 §6 / ADR-0023 §3); `storno_reference.base_invoice_number`
+/// names what is being cancelled.
+pub fn render_storno_data(
+    invoice: &ReadyInvoice,
+    series_code: &SeriesCode,
+    parties: &NavParties,
+    storno_reference: &StornoReference,
+) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut w = Writer::new_with_indent(&mut buf, b' ', 2);
+
+    w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+        .context("XML declaration")?;
+
+    let mut root = BytesStart::new("InvoiceData");
+    root.push_attribute(("xmlns", NAV_NS_DATA));
+    root.push_attribute(("xmlns:common", NAV_NS_BASE));
+    w.write_event(Event::Start(root))
+        .context("write <InvoiceData> (storno)")?;
+
+    // Storno's OWN invoice number — the cancellation is itself an invoice.
+    let invoice_number = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number);
+    text_element(&mut w, "invoiceNumber", &invoice_number)?;
+    let date = invoice.issue_date.date();
+    let issue_date = format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        date.month() as u8,
+        date.day(),
+    );
+    text_element(&mut w, "invoiceIssueDate", &issue_date)?;
+
+    w.write_event(Event::Start(BytesStart::new("invoiceMain")))?;
+    w.write_event(Event::Start(BytesStart::new("invoice")))?;
+
+    // <invoiceReference> — STORNO-only. Position: direct child of
+    // <invoice>, BEFORE <invoiceHead>, per NAV v3.0 schema.
+    write_invoice_reference(&mut w, storno_reference)?;
+
+    // <invoiceHead> reuses the standard supplier/customer/detail
+    // section writers — the storno's parties and detail block are
+    // identical in shape to a fresh invoice's. The NAV-side operation
+    // (CREATE vs STORNO vs MODIFY) is set on the SOAP envelope at
+    // submit time, not inside <InvoiceData>; submit_invoice.rs
+    // detects the storno shape by the presence of <invoiceReference>
+    // (PR-10 F20).
+    w.write_event(Event::Start(BytesStart::new("invoiceHead")))?;
+    write_supplier(&mut w, &parties.supplier)?;
+    write_customer(&mut w, &parties.customer)?;
+    write_invoice_detail(&mut w, &issue_date)?;
+    w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
+
+    // <invoiceLines> with negated amounts. Negate by constructing a
+    // parallel Vec with negated unit_price; net/vat/gross cascade
+    // through `LineItem::net_total` etc. unchanged.
+    let negated_lines: Vec<LineItem> = invoice.lines.iter().map(negate_line).collect();
+    write_lines(&mut w, &negated_lines)?;
+    write_summary(&mut w, &negated_lines)?;
+
+    w.write_event(Event::End(BytesEnd::new("invoice")))?;
+    w.write_event(Event::End(BytesEnd::new("invoiceMain")))?;
+    w.write_event(Event::End(BytesEnd::new("InvoiceData")))?;
+
+    Ok(buf)
+}
+
+/// Negate a `LineItem` for storno emission. Quantities stay positive
+/// (`u32` cannot represent negative); the negation lives in
+/// `unit_price`, which is `Huf(i64)` and can be negative. The
+/// cascading `net_total` / `vat_amount` / `gross_total` are all
+/// negative as a result, which matches NAV's storno convention.
+fn negate_line(line: &LineItem) -> LineItem {
+    LineItem {
+        description: line.description.clone(),
+        quantity: line.quantity,
+        unit_price: Huf(line.unit_price.as_i64().saturating_neg()),
+        vat_rate_basis_points: line.vat_rate_basis_points,
+    }
+}
+
+/// Write the `<invoiceReference>` chain-link block. PR-10 always
+/// emits `modifyWithoutMaster=false`: ADR-0023 §4 names the
+/// `queryInvoiceChainDigest` path for migrated-from-Billingo bases
+/// (the case where `modifyWithoutMaster=true` would be the right
+/// value) and explicitly defers it. When the migrated-base path
+/// lands, this function gains a `modify_without_master: bool` field
+/// on `StornoReference`; for PR-10 the constant-false value is
+/// loud-pinned here.
+fn write_invoice_reference(
+    w: &mut Writer<&mut Vec<u8>>,
+    storno_reference: &StornoReference,
+) -> Result<()> {
+    w.write_event(Event::Start(BytesStart::new("invoiceReference")))?;
+    text_element(w, "originalInvoiceNumber", &storno_reference.base_invoice_number)?;
+    text_element(w, "modifyWithoutMaster", "false")?;
+    text_element(
+        w,
+        "modificationIndex",
+        &storno_reference.modification_index.to_string(),
+    )?;
+    w.write_event(Event::End(BytesEnd::new("invoiceReference")))?;
+    Ok(())
 }
 
 // ── Section writers ───────────────────────────────────────────────────

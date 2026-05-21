@@ -32,8 +32,20 @@
 /// variant; the trap is performing its job by definition only if all
 /// four edits land in the same commit.
 ///
+/// PR-10 (ADR-0023) graduates the long-anticipated `InvoiceStornoIssued`
+/// from doc-comment hint to actual variant. A storno is itself an
+/// invoice (ADR-0009 §6); its sequence-reservation + draft-creation
+/// audit entries reuse `InvoiceSequenceReserved` / `InvoiceDraftCreated`
+/// unchanged. `InvoiceStornoIssued` is the **chain-link** entry: it
+/// carries the base invoice's id + sequence number + the new storno's
+/// own ids + the `modificationIndex` allocated in the same DuckDB
+/// transaction (per ADR-0023 §4). The base invoice's typestate
+/// transition (`Finalized → Storno` per ADR-0009 §2) is DERIVED from
+/// the existence of this entry — no second ledger entry is written
+/// against the base (ADR-0023 §2).
+///
 /// The remaining invoice-lifecycle kinds (`Finalized`, `Rejected`,
-/// `SubmissionStuck`, `Voided`, `Amended`, `StornoIssued`,
+/// `SubmissionStuck`, `Voided`, `Amended`,
 /// `TechnicalAnnulmentRequested`) land when their state transition
 /// first fires in the codebase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +100,21 @@ pub enum EventKind {
     /// prior `transaction_id`, the prior last ack status, and the
     /// operator's reason text. PR-8.
     InvoiceMarkedAbandoned,
+
+    /// A storno invoice was issued against a base invoice
+    /// (ADR-0009 §6, ADR-0023). The storno is itself an invoice and
+    /// got its own `InvoiceSequenceReserved` + `InvoiceDraftCreated`
+    /// entries in the same DuckDB transaction; THIS entry is the
+    /// chain-link payload (ADR-0023 §3) — it carries the base
+    /// invoice's id, the base's NAV-facing sequence number, the new
+    /// storno's own id + sequence + reservation id + idempotency
+    /// key, and the allocated `modificationIndex`.
+    ///
+    /// The base invoice's typestate transition (`Finalized → Storno`)
+    /// is **derived** from the existence of this entry pointing at
+    /// the base; no separate ledger entry is written against the
+    /// base (ADR-0023 §2). PR-10.
+    InvoiceStornoIssued,
 }
 
 impl EventKind {
@@ -104,6 +131,7 @@ impl EventKind {
             EventKind::InvoiceAckStatus => "invoice.ack_status",
             EventKind::InvoiceRetryRequested => "invoice.retry_requested",
             EventKind::InvoiceMarkedAbandoned => "invoice.marked_abandoned",
+            EventKind::InvoiceStornoIssued => "invoice.storno_issued",
         }
     }
 
@@ -129,6 +157,7 @@ impl EventKind {
             "invoice.ack_status" => Ok(EventKind::InvoiceAckStatus),
             "invoice.retry_requested" => Ok(EventKind::InvoiceRetryRequested),
             "invoice.marked_abandoned" => Ok(EventKind::InvoiceMarkedAbandoned),
+            "invoice.storno_issued" => Ok(EventKind::InvoiceStornoIssued),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -158,6 +187,7 @@ mod tests {
             EventKind::InvoiceAckStatus,
             EventKind::InvoiceRetryRequested,
             EventKind::InvoiceMarkedAbandoned,
+            EventKind::InvoiceStornoIssued,
         ];
         for v in variants {
             let s = v.as_str();
@@ -198,6 +228,24 @@ mod tests {
             .as_str()
             .starts_with("invoice."));
         assert!(EventKind::InvoiceMarkedAbandoned
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// PR-10 specifically: `InvoiceStornoIssued` is the chain-link
+    /// kind for ADR-0009 §6 / ADR-0023. The on-disk string must keep
+    /// the `invoice.` prefix so the audit-evidence bundle's
+    /// `invoice.*` glob picks it up alongside every other invoice-
+    /// lifecycle entry — a storno that did not match the glob would
+    /// be silently absent from the per-invoice export bundle, which
+    /// is the exact failure mode CLAUDE.md rule 12 names.
+    #[test]
+    fn pr_10_storno_kind_uses_invoice_prefix() {
+        assert_eq!(
+            EventKind::InvoiceStornoIssued.as_str(),
+            "invoice.storno_issued"
+        );
+        assert!(EventKind::InvoiceStornoIssued
             .as_str()
             .starts_with("invoice."));
     }

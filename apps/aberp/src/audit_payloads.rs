@@ -367,6 +367,93 @@ impl InvoiceMarkedAbandonedPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// InvoiceStornoIssued  (PR-10 / ADR-0023 — storno chain-link entry.
+// A storno is itself an invoice and burns its own sequence number via
+// the standard allocator path (which writes its own
+// `InvoiceSequenceReservedPayload` + `InvoiceDraftCreatedPayload`
+// pair). THIS payload is the chain-link — it carries both the storno's
+// identity (so an audit reader can pivot from the chain entry to the
+// storno's own ledger entries via `idempotency_key`) and the base
+// invoice's identity (so the per-invoice export bundle can walk the
+// chain by following `base_invoice_id`). ADR-0023 §3.)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceStornoIssued`].
+///
+/// Pinned by ADR-0023 §3. Written by `aberp issue-storno` in the same
+/// DuckDB transaction as the storno's own allocator + audit-ledger
+/// entries.
+///
+/// `base_sequence_number` is denormalized from the base invoice's row
+/// by design (ADR-0023 §3 + Adversarial review #2). Drift is guarded
+/// by the integrity-scan extension named in ADR-0023 §4: the base
+/// row's `sequence_number` is immutable after issuance, so a mismatch
+/// against this payload's copy indicates direct DB tampering — exactly
+/// what the audit ledger's hash chain (ADR-0008) is designed to make
+/// visible.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceStornoIssuedPayload {
+    /// The storno's own invoice id — prefixed `inv_<ULID>` form.
+    pub storno_invoice_id: String,
+    /// The storno's own sequence number (allocated in the same
+    /// DuckDB transaction per ADR-0009 §3).
+    pub storno_seq: u64,
+    /// The storno's own sequence-reservation id (ULID-keyed,
+    /// matches `InvoiceSequenceReservedPayload::reservation_id`).
+    pub storno_reservation_id: String,
+    /// Idempotency key of the `IssueStornoCommand`. Same shape + role
+    /// as on `InvoiceSequenceReservedPayload`; threads through F8.
+    pub idempotency_key: String,
+    /// The **base invoice's** id — prefixed `inv_<ULID>` form. This is
+    /// the chain link: ULID-keyed per ADR-0019 (no cross-table FK),
+    /// explicit per ADR-0009 §6.
+    pub base_invoice_id: String,
+    /// The **base invoice's** NAV-facing sequence number, captured
+    /// verbatim so the per-invoice export bundle (ADR-0009 §8) can
+    /// reconstruct the `<invoiceReference>` value without re-querying
+    /// the base row. Denormalized by design — see the type-level doc
+    /// comment above.
+    pub base_sequence_number: u64,
+    /// The `<modificationIndex>` this storno asserts against the base
+    /// invoice's chain. Starts at 1 for the first chain entry against
+    /// the base, increments for each subsequent storno or future
+    /// modification. Allocator rules per ADR-0023 §4.
+    pub modification_index: u32,
+}
+
+impl InvoiceStornoIssuedPayload {
+    /// Build a payload from the parts the allocator just produced.
+    /// `new()` rather than `from_outcome(...)` because the chain-link
+    /// fields cross multiple domain types (base + storno + chain
+    /// index) — no single domain struct carries them all today, and a
+    /// speculative `StornoIssuanceOutcome` type would be a CLAUDE.md
+    /// rule-2 violation.
+    pub fn new(
+        storno_invoice_id: &str,
+        storno_seq: u64,
+        storno_reservation_id: &str,
+        idempotency_key: IdempotencyKey,
+        base_invoice_id: &str,
+        base_sequence_number: u64,
+        modification_index: u32,
+    ) -> Self {
+        Self {
+            storno_invoice_id: storno_invoice_id.to_string(),
+            storno_seq,
+            storno_reservation_id: storno_reservation_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            base_invoice_id: base_invoice_id.to_string(),
+            base_sequence_number,
+            modification_index,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -606,6 +693,68 @@ mod tests {
             serde_json::from_slice(&bytes).expect("typed decode");
         assert_eq!(decoded, payload);
         assert!(decoded.idempotency_key.starts_with("idem_"));
+    }
+
+    // ── PR-10 storno-chain payload round-trips (ADR-0023 §3) ────────
+
+    /// Round-trip the storno chain-link payload through the typed
+    /// serde path. Same F9 trap-closing posture: even though the
+    /// invoice id and reservation id are constrained by their
+    /// ULID-prefixed shape (no quote/backslash chars by construction),
+    /// the round-trip is the canonical proof that ADR-0023 §3's
+    /// payload contract holds in code.
+    #[test]
+    fn storno_issued_round_trip() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceStornoIssuedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            42,
+            "rsv_01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            idem,
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            7,
+            1,
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceStornoIssuedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        // Pin every chain-link field byte-for-byte. CLAUDE.md rule 9:
+        // a test that only checked `decoded == payload` would still
+        // pass if a future refactor dropped fields and PartialEq
+        // happened to drop with them. Field-by-field walk catches it.
+        assert_eq!(decoded.storno_invoice_id, "inv_01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        assert_eq!(decoded.storno_seq, 42);
+        assert_eq!(
+            decoded.storno_reservation_id,
+            "rsv_01ARZ3NDEKTSV4RRFFQ69G5FAX"
+        );
+        assert!(decoded.idempotency_key.starts_with("idem_"));
+        assert_eq!(decoded.base_invoice_id, "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(decoded.base_sequence_number, 7);
+        assert_eq!(decoded.modification_index, 1);
+    }
+
+    /// `modification_index` must round-trip cleanly across the full
+    /// `u32` range. Higher chain indices on a long-running base
+    /// invoice are legitimate; storage as `u32` should not truncate.
+    #[test]
+    fn storno_issued_round_trip_preserves_high_modification_index() {
+        let payload = InvoiceStornoIssuedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            42,
+            "rsv_01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            IdempotencyKey::new(),
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            7,
+            u32::MAX,
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceStornoIssuedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded.modification_index, u32::MAX);
     }
 
     /// The trap PR-6.1 closed: PR-5's `format!`-built JSON could not

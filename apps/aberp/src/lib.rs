@@ -25,6 +25,7 @@ pub mod audit_query;
 pub mod binary_hash;
 pub mod cli;
 pub mod issue_invoice;
+pub mod issue_storno;
 pub mod mark_abandoned;
 pub mod nav_xml;
 pub mod poll_ack;

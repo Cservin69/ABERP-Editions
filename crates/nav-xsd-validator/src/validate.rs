@@ -169,7 +169,20 @@ fn walk_invoice_main(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationE
 
 fn walk_invoice(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
     const PARENT: &str = "invoice";
-    const ALLOWED: &[&str] = &["invoiceHead", "invoiceLines", "invoiceSummary"];
+    // `invoiceReference` is optional and present only on STORNO / MODIFY
+    // chain invoices (ADR-0023). NAV v3.0 schema positions it BEFORE
+    // `invoiceHead`; the ABERP emitter (`apps/aberp/src/nav_xml.rs`
+    // ::render_storno_data) writes it there. The validator does NOT
+    // enforce that position because the projection-based ordered-
+    // required check only cares about the position of REQUIRED
+    // children — surfaced explicitly here so a future tightening is a
+    // deliberate decision, not a silent regression.
+    const ALLOWED: &[&str] = &[
+        "invoiceReference",
+        "invoiceHead",
+        "invoiceLines",
+        "invoiceSummary",
+    ];
     const ORDERED_REQUIRED: &[&str] = &["invoiceHead", "invoiceLines", "invoiceSummary"];
 
     let mut seen: Vec<&'static str> = Vec::new();
@@ -184,6 +197,7 @@ fn walk_invoice(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError>
                     }
                 })?;
                 match canonical {
+                    "invoiceReference" => walk_invoice_reference(reader)?,
                     "invoiceHead" => walk_invoice_head(reader)?,
                     "invoiceLines" => walk_invoice_lines(reader)?,
                     "invoiceSummary" => walk_invoice_summary(reader)?,
@@ -196,6 +210,58 @@ fn walk_invoice(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError>
                 return Ok(());
             }
             Event::Eof => return Err(eof_in("invoice", reader)),
+            _ => {}
+        }
+    }
+}
+
+/// `<invoiceReference>` chain-link block — PR-10, ADR-0023. Present
+/// only on STORNO / MODIFY chain invoices. NAV v3.0 schema requires
+/// all three children below in order. The ABERP emitter writes
+/// `modifyWithoutMaster=false` always (the migrated-from-Billingo
+/// `true` path is deferred per ADR-0023 §4); the validator does not
+/// constrain the value here — value-level checks live in the
+/// per-invoice export bundle's evidence walker, not in the XSD
+/// allowlist.
+fn walk_invoice_reference(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "invoiceReference";
+    const ALLOWED: &[&str] = &[
+        "originalInvoiceNumber",
+        "modifyWithoutMaster",
+        "modificationIndex",
+    ];
+    const ORDERED_REQUIRED: &[&str] = ALLOWED;
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                match canonical {
+                    "originalInvoiceNumber" => {
+                        let _ = collect_text(reader, "originalInvoiceNumber")?;
+                    }
+                    "modifyWithoutMaster" => {
+                        let _ = collect_text(reader, "modifyWithoutMaster")?;
+                    }
+                    "modificationIndex" => {
+                        let _ = collect_text(reader, "modificationIndex")?;
+                    }
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
             _ => {}
         }
     }
@@ -982,10 +1048,29 @@ fn ensure_numeric_amount(field: &'static str, text: &str) -> Result<(), NavXsdVa
             actual: text.to_string(),
         });
     }
+    // NAV v3.0 storno line/summary amounts are NEGATIVE per the schema
+    // (PR-10, ADR-0023). Accept a single optional leading `-`; reject
+    // `--`, a trailing `-`, or any other sign-like glyph. A bare `-`
+    // (no digits) is also rejected because the digits loop would see
+    // an empty remainder. CLAUDE.md rule 12 — fail loud on garbage.
+    let mut bytes = text.bytes();
     let mut decimal_seen = false;
-    for b in text.bytes() {
+    let mut digit_seen = false;
+    let first = bytes.next().expect("empty case handled above");
+    match first {
+        b'-' => {} // legal leading sign
+        b'0'..=b'9' => digit_seen = true,
+        b'.' => decimal_seen = true,
+        _ => {
+            return Err(NavXsdValidationError::NonNumericAmount {
+                field,
+                actual: text.to_string(),
+            });
+        }
+    }
+    for b in bytes {
         match b {
-            b'0'..=b'9' => {}
+            b'0'..=b'9' => digit_seen = true,
             b'.' if !decimal_seen => decimal_seen = true,
             _ => {
                 return Err(NavXsdValidationError::NonNumericAmount {
@@ -994,6 +1079,12 @@ fn ensure_numeric_amount(field: &'static str, text: &str) -> Result<(), NavXsdVa
                 });
             }
         }
+    }
+    if !digit_seen {
+        return Err(NavXsdValidationError::NonNumericAmount {
+            field,
+            actual: text.to_string(),
+        });
     }
     Ok(())
 }
@@ -1239,6 +1330,29 @@ mod tests {
             }
             other => panic!("expected NonNumericAmount, got {other:?}"),
         }
+    }
+
+    /// PR-10 / ADR-0023: NAV v3.0 storno convention is negative line
+    /// and summary amounts. The validator must accept a leading `-`
+    /// followed by digits.
+    #[test]
+    fn negative_amount_is_accepted_for_storno() {
+        assert!(ensure_numeric_amount("unitPrice", "-1000").is_ok());
+        assert!(ensure_numeric_amount("lineNetAmount", "-2000").is_ok());
+        assert!(ensure_numeric_amount("vatPercentage", "-0.27").is_ok());
+    }
+
+    /// CLAUDE.md rule 12: a leading `-` with no digits, a doubled
+    /// minus, a trailing minus, or a stray `+` are all garbage. The
+    /// negative-acceptance must not become a free-pass for sign-shaped
+    /// nonsense.
+    #[test]
+    fn bare_minus_and_doubled_signs_are_loud_fail() {
+        assert!(ensure_numeric_amount("unitPrice", "-").is_err());
+        assert!(ensure_numeric_amount("unitPrice", "--1000").is_err());
+        assert!(ensure_numeric_amount("unitPrice", "1000-").is_err());
+        assert!(ensure_numeric_amount("unitPrice", "+1000").is_err());
+        assert!(ensure_numeric_amount("unitPrice", "-.").is_err());
     }
 
     #[test]

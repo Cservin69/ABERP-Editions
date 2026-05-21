@@ -114,6 +114,38 @@ pub enum Command {
     /// <token>`. Future operator-action routes will land
     /// incrementally as the Svelte shell asks for them.
     Serve(ServeArgs),
+
+    /// Issue a storno (cancellation invoice) against a previously-
+    /// finalized base invoice per ADR-0009 §6 / ADR-0023 (PR-10).
+    ///
+    /// A storno is itself an invoice: it burns its own sequence
+    /// number from the requested series via the same allocator path
+    /// as `issue-invoice`, writes its own `<InvoiceData>` XML on
+    /// disk (with the `<invoiceReference>` chain block + negated
+    /// amounts), and lands three audit-ledger entries in one
+    /// DuckDB transaction — `InvoiceSequenceReserved`,
+    /// `InvoiceDraftCreated`, and the chain-link
+    /// `InvoiceStornoIssued`. The base invoice's typestate
+    /// transition (`Finalized → Storno`) is DERIVED from the
+    /// chain-link entry; no separate ledger entry is written
+    /// against the base (ADR-0023 §2).
+    ///
+    /// **`issue-storno` does NOT call NAV** (ADR-0023 §1). After
+    /// this command writes the storno XML on disk, the operator's
+    /// next step is `aberp submit-invoice --invoice-xml <storno.xml>
+    /// --invoice-id <storno-id> --endpoint {test|production}` — the
+    /// existing wire path detects the storno shape from the
+    /// `<invoiceReference>` element and submits with
+    /// `InvoiceOperation::Storno`.
+    ///
+    /// **Precondition.** `--references` must point at an invoice
+    /// whose audit-ledger trace shows a terminal-positive
+    /// `InvoiceAckStatus` of `"SAVED"` (i.e. the base is
+    /// `Finalized` per ADR-0009 §2). Stornos against an unsubmitted
+    /// invoice, a stuck invoice, a NAV-rejected invoice, or an
+    /// abandoned invoice are loud-fails before any write
+    /// (CLAUDE.md rule 12).
+    IssueStorno(IssueStornoArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -316,6 +348,49 @@ pub struct ServeArgs {
     /// matter to the SPA.
     #[arg(long, default_value_t = 0)]
     pub port: u16,
+}
+
+#[derive(Debug, Parser)]
+pub struct IssueStornoArgs {
+    /// Invoice id (prefixed form, `inv_<ULID>`) of the base invoice
+    /// this storno cancels. Must already be in the local `Finalized`
+    /// typestate — i.e. the audit ledger carries an
+    /// `InvoiceAckStatus` of `"SAVED"` for it (ADR-0023 §1). A
+    /// storno against a not-yet-finalized invoice loud-fails before
+    /// any ledger write.
+    #[arg(long = "references")]
+    pub references: String,
+
+    /// Path to the input JSON file describing the storno's own line
+    /// content. Same shape as `issue-invoice --in`; the storno
+    /// subcommand sets the implicit "this is a storno" flag so the
+    /// XML emitter negates line/summary amounts and emits the
+    /// `<invoiceReference>` chain block (ADR-0023 §1).
+    #[arg(long)]
+    pub r#in: PathBuf,
+
+    /// Path to write the storno's NAV InvoiceData XML. Same on-disk
+    /// gate as `issue-invoice --out`; the resulting bytes are what
+    /// `submit-invoice` later POSTs to NAV.
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Path to the tenant DuckDB file.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — used for the audit-ledger genesis hash
+    /// and the keychain service-name lookup
+    /// (`aberp.nav.<tenant>`).
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Series the storno's own sequence number is drawn from. By
+    /// default the same series as the base invoice. Override iff
+    /// the accountant has set up a dedicated storno series — no
+    /// silent series switch happens (ADR-0023 §1).
+    #[arg(long, default_value = "INV-default")]
+    pub series: String,
 }
 
 #[derive(Debug, Parser)]

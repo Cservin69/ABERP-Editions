@@ -236,14 +236,22 @@ async fn call_nav(
         .await
         .context("NAV tokenExchange")?;
 
-    // 6b. manageInvoice with the decrypted token.
+    // 6b. manageInvoice with the decrypted token. The per-invoice
+    //     `operation` is detected from the XML body's shape
+    //     (presence of `<invoiceReference>` => STORNO chain invoice).
+    //     PR-10 / ADR-0023 §1 named this as "submit-invoice reads the
+    //     operation field out of the XML envelope"; the previous
+    //     hard-coded `Create` would have rejected every storno at NAV
+    //     because the storno body carries `<invoiceReference>` which
+    //     is invalid for CREATE.
+    let operation = detect_operation_from_xml(invoice_xml)?;
     let manage = manage_invoice::call(
         &transport,
         credentials,
         tax_number_8,
         &token.decoded_token,
         &[ManageInvoiceItem {
-            operation: InvoiceOperation::Create,
+            operation,
             invoice_data_xml: invoice_xml,
         }],
     )
@@ -255,6 +263,35 @@ async fn call_nav(
         request_xml: manage.request_xml,
         response_xml: manage.response_xml,
     })
+}
+
+/// Detect the per-invoice `<operation>` value from the
+/// `<InvoiceData>` body's shape. Deterministic code, not an LLM
+/// classification (CLAUDE.md rule 5).
+///
+/// Today's logic: presence of `<invoiceReference>` => `STORNO`;
+/// absence => `CREATE`. MODIFY (PR-11+) will share the
+/// `<invoiceReference>` block with STORNO and needs an additional
+/// disambiguator (e.g. the operator-set `<modificationIssueDate>`
+/// field that NAV requires for MODIFY but not STORNO). Surfaced as
+/// PR-10 F22: when MODIFY lands, this detector must split into a
+/// three-way classifier.
+fn detect_operation_from_xml(xml: &[u8]) -> Result<InvoiceOperation> {
+    let body = std::str::from_utf8(xml).context(
+        "invoice XML is not valid UTF-8 — NAV requires UTF-8 per the v3.0 schema",
+    )?;
+    // Match the OPENING tag with no attributes; the emitter always
+    // writes it bare. A future emitter that adds an attribute would
+    // change `<invoiceReference>` to `<invoiceReference attr="...">`
+    // and the contains-check would miss — the round-trip test
+    // (apps/aberp/tests/nav_xsd_validator_round_trip.rs) is the
+    // closer of this trap, and the storno-XML test added in PR-10
+    // exercises the detector by construction.
+    if body.contains("<invoiceReference>") {
+        Ok(InvoiceOperation::Storno)
+    } else {
+        Ok(InvoiceOperation::Create)
+    }
 }
 
 /// Open a scoped read tx, look up the issued invoice, and return it
@@ -400,5 +437,43 @@ mod tests {
     fn tax_number_8_rejects_leading_dash() {
         let err = parse_tax_number_8("-12345678").unwrap_err();
         assert!(err.to_string().contains("not 8 ASCII digits"));
+    }
+
+    // ── PR-10 / F20: operation detection from XML body ──────────────
+
+    #[test]
+    fn detect_operation_create_on_plain_invoice() {
+        let xml = b"<?xml version=\"1.0\"?>\
+            <InvoiceData><invoiceNumber>X/00001</invoiceNumber>\
+            <invoiceMain><invoice><invoiceHead/></invoice></invoiceMain></InvoiceData>";
+        assert_eq!(
+            detect_operation_from_xml(xml).unwrap(),
+            InvoiceOperation::Create
+        );
+    }
+
+    #[test]
+    fn detect_operation_storno_when_invoice_reference_present() {
+        let xml = b"<?xml version=\"1.0\"?>\
+            <InvoiceData><invoiceNumber>X/00002</invoiceNumber>\
+            <invoiceMain><invoice>\
+            <invoiceReference><originalInvoiceNumber>X/00001</originalInvoiceNumber>\
+            <modifyWithoutMaster>false</modifyWithoutMaster>\
+            <modificationIndex>1</modificationIndex></invoiceReference>\
+            <invoiceHead/></invoice></invoiceMain></InvoiceData>";
+        assert_eq!(
+            detect_operation_from_xml(xml).unwrap(),
+            InvoiceOperation::Storno
+        );
+    }
+
+    /// Non-UTF-8 bytes must loud-fail rather than silently treating
+    /// the body as CREATE. CLAUDE.md rule 12.
+    #[test]
+    fn detect_operation_loud_fails_on_non_utf8() {
+        let xml = [0xff, 0xfe, 0xfd];
+        let err = detect_operation_from_xml(&xml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("UTF-8"), "expected UTF-8 error, got: {msg}");
     }
 }
