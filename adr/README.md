@@ -85,7 +85,7 @@ Things not decided here that this ADR depends on, with the ADR number that will 
 
 ### Module-level (stubs — to be filled in)
 
-- [ADR-0009 — NAV invoice issuing](0009-nav-invoice-issuing.md) — *§1 extended by ADR-0022; §6 extended by ADR-0023*
+- [ADR-0009 — NAV invoice issuing](0009-nav-invoice-issuing.md) — *§1 extended by ADR-0022; §6 extended by ADR-0023 (storno) and ADR-0024 (modify)*
 - [ADR-0010 — Billingo + NAV invoice ingestion (read path)](0010-invoice-ingestion.md) — *Billingo migration Accepted; NAV historical read path deferred to build phase*
 - [ADR-0011 — Inventory model](0011-inventory-model.md) — *stub*
 - [ADR-0012 — QR / vignette labels and no-touch handling](0012-qr-labels-no-touch.md) — *stub*
