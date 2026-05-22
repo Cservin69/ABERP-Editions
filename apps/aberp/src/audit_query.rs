@@ -17,6 +17,20 @@
 //! exactly the failure mode CLAUDE.md rule 7 names ("surface
 //! conflicts, don't average them").
 //!
+//! # PR-19 / ADR-0032 §4 — state-2 Pending extension
+//!
+//! Under the two-tx posture ADR-0032 §1 names, an invoice can sit
+//! in a third recoverable state: an `InvoiceSubmissionAttempt` exists
+//! (TX1 committed) but no `InvoiceSubmissionResponse` and no
+//! `InvoiceMarkedAbandoned` (TX2 never committed — wire broke, process
+//! crashed mid-flight, or NAV returned an error which produced an
+//! `InvoiceSubmissionAttemptFailed` entry instead of a Response). This
+//! is state-2 Pending. The precondition walker classifies it as
+//! `Stuck(StuckStage::Pending)` so the same `retry-submission` /
+//! `mark-abandoned` commands can recover it. State-3 (the existing
+//! Response-without-terminal-ack posture) classifies as
+//! `Stuck(StuckStage::AwaitingAck)`.
+//!
 //! # Why a separate module
 //!
 //! `submit_invoice.rs` and `poll_ack.rs` each carry their own audit
@@ -36,28 +50,82 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::audit_payloads;
 
+/// Which stage of stuck-ness the invoice is in. PR-19 / ADR-0032 §4
+/// introduces the two-stage distinction; pre-PR-19 the only stage
+/// was `AwaitingAck`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StuckStage {
+    /// **State-2 (PR-19 / ADR-0032 §4).** An `InvoiceSubmissionAttempt`
+    /// exists for this invoice but no `InvoiceSubmissionResponse`
+    /// (and no `InvoiceMarkedAbandoned`). The Attempt was committed
+    /// in TX1 but TX2 never committed — either the wire broke
+    /// mid-flight, the process crashed before TX2, or NAV returned
+    /// an error which produced an `InvoiceSubmissionAttemptFailed`
+    /// entry instead of a Response.
+    ///
+    /// Recovery: `retry-submission` produces a fresh Attempt /
+    /// Response (or AttemptFailed) pair. The Layer-2
+    /// `queryInvoiceCheck` surface (ADR-0009 §5; named-deferred per
+    /// ADR-0032 §"Open questions") would let the retry disambiguate
+    /// "NAV already has this submission" from "the wire broke before
+    /// NAV saw it" — until it lands, the state-2 retry produces a
+    /// potential duplicate submission to NAV (loud-warned in the
+    /// operator-visible summary per ADR-0032 §"Adversarial review"
+    /// #2 + CLAUDE.md rule 12).
+    Pending,
+    /// **State-3 (the pre-PR-19 / PR-8 / ADR-0009 §5 surface).** An
+    /// `InvoiceSubmissionResponse` exists for this invoice but no
+    /// terminal `InvoiceAckStatus` (`SAVED` or `ABORTED`) and no
+    /// `InvoiceMarkedAbandoned`. NAV accepted the submission but
+    /// the ack poll either did not reach a terminal status or
+    /// never ran.
+    ///
+    /// Recovery: `retry-submission` produces a fresh Attempt /
+    /// Response pair (NAV will return a fresh `transaction_id`;
+    /// Layer-2 `queryInvoiceCheck` would also disambiguate here if
+    /// the prior Response actually finalized at NAV's side after
+    /// ABERP gave up polling — same residual as state-2).
+    AwaitingAck,
+}
+
 /// The audit-ledger view of a stuck invoice's precondition state.
 /// Returned by [`stuck_precondition`] when the invoice IS stuck;
 /// carries every field the PR-8 commands need to write their
 /// own audit entries (the prior `transaction_id` and last ack status)
 /// alongside the `IdempotencyKey` that links to the original issuance
 /// per F8.
+///
+/// # PR-19 / ADR-0032 §4 — Option-shaped fields
+///
+/// `prior_transaction_id` becomes `Option<String>` to support state-2
+/// `Pending` (where no prior `InvoiceSubmissionResponse` exists yet,
+/// so no `transaction_id`). State-3 `AwaitingAck` retains the
+/// `Some(transaction_id)` shape the pre-PR-19 callers depended on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StuckPrecondition {
+    /// Which stage of stuck-ness the invoice is in. Drives the
+    /// operator-visible summary and the audit-payload field
+    /// values the orchestration writes. PR-19 / ADR-0032 §4.
+    pub stage: StuckStage,
     /// The NAV `transaction_id` from the most-recent
-    /// `InvoiceSubmissionResponse` for this invoice. Always populated —
-    /// a stuck invoice by definition has a prior submission response.
-    pub prior_transaction_id: String,
+    /// `InvoiceSubmissionResponse` for this invoice. `Some(...)` for
+    /// state-3 `AwaitingAck`; `None` for state-2 `Pending` (no prior
+    /// Response exists).
+    pub prior_transaction_id: Option<String>,
     /// String form (`"RECEIVED"` / `"PROCESSING"`) of the most-recent
     /// `InvoiceAckStatus` payload's `ack_status` field. `None` if no
-    /// ack entry exists yet — the operator can still retry/abandon at
-    /// this point (an `InvoiceSubmissionResponse` is sufficient for
-    /// the stuck precondition; the poll loop need not have ever run).
+    /// ack entry exists yet (state-3 with no poll yet; or state-2,
+    /// where no ack poll is possible without a Response). The
+    /// operator can still retry/abandon at this point regardless of
+    /// stage.
     pub prior_last_ack_status: Option<String>,
     /// The original issuance's idempotency key. The PR-8 audit entries
     /// thread it through per F8 ("every NAV-related entry for an
     /// invoice carries the SAME idempotency_key as the issuance
-    /// entries").
+    /// entries"). For state-3 the key is taken from the prior
+    /// `InvoiceSubmissionResponse`; for state-2 from the prior
+    /// `InvoiceSubmissionAttempt` — both equal the original
+    /// issuance's key per the F8 contract.
     pub idempotency_key: IdempotencyKey,
 }
 
@@ -124,25 +192,37 @@ pub enum StuckOutcome {
 /// ledger. Loud-fail surface for the orchestration callers.
 ///
 /// Walks the ledger's entries in seq order (oldest → newest) and
-/// classifies the state. The classification rules in one place:
+/// classifies the state. The classification rules in one place
+/// (PR-19 / ADR-0032 §4):
 ///
-///   - If any `InvoiceMarkedAbandoned` exists for this invoice →
-///     `NotStuck(AlreadyAbandoned)`. (Terminal-by-operator-decision.)
-///   - Else: find the most-recent `InvoiceSubmissionResponse`. If
-///     none → `NotStuck(NeverSubmitted)`.
-///   - Else: walk every `InvoiceAckStatus` for this invoice; the
-///     most-recent one's `ack_status` decides:
-///       - `"SAVED"`     → `NotStuck(AlreadyFinalized)`
-///       - `"ABORTED"`   → `NotStuck(AlreadyRejected)`
-///       - any other     → `Stuck(...)` carrying that string as `prior_last_ack_status`
-///       - no ack entry  → `Stuck(...)` with `None`
+///   1. If any `InvoiceMarkedAbandoned` exists for this invoice →
+///      `NotStuck(AlreadyAbandoned)`. (Terminal-by-operator-decision.)
+///   2. Else: find the most-recent `InvoiceSubmissionResponse`.
+///      - If present, walk acks for terminal status:
+///        - `"SAVED"`     → `NotStuck(AlreadyFinalized)`
+///        - `"ABORTED"`   → `NotStuck(AlreadyRejected)`
+///        - any other     → `Stuck(StuckStage::AwaitingAck, ...)`
+///                          carrying the ack string as
+///                          `prior_last_ack_status`.
+///        - no ack entry  → `Stuck(StuckStage::AwaitingAck, ...)`
+///                          with `prior_last_ack_status = None`.
+///      - If absent, fall through to step 3.
+///   3. Else: find the most-recent `InvoiceSubmissionAttempt`.
+///      - If present → `Stuck(StuckStage::Pending, prior_transaction_id=None,
+///        prior_last_ack_status=None, idempotency_key=from Attempt)`.
+///      - If absent → `NotStuck(NeverSubmitted)`.
 ///
 /// The `IdempotencyKey` on the returned `StuckPrecondition` is taken
-/// from the most-recent `InvoiceSubmissionResponse`'s payload (its
-/// `idempotency_key` field is the same as the original issuance's
-/// per F8). This couples the PR-8 audit writes' idempotency_key to
-/// the submission_response's, which is the closest in-time anchor
-/// for the retry/abandon decision.
+/// from the most-recent `InvoiceSubmissionResponse`'s payload for
+/// state-3, OR from the most-recent `InvoiceSubmissionAttempt`'s
+/// payload for state-2. Both equal the original issuance's key per
+/// the F8 contract.
+///
+/// The presence of an `InvoiceSubmissionAttemptFailed` entry does
+/// NOT change classification. An Attempt followed by an AttemptFailed
+/// is still state-2 Pending (the operator may retry; multiple
+/// failures accumulate in the audit chain as evidence). Per
+/// ADR-0032 §4.
 pub fn stuck_precondition(ledger: &Ledger, invoice_id: &str) -> Result<StuckOutcome> {
     let entries = ledger
         .entries()
@@ -153,24 +233,39 @@ pub fn stuck_precondition(ledger: &Ledger, invoice_id: &str) -> Result<StuckOutc
         return Ok(StuckOutcome::NotStuck(NotStuckReason::AlreadyAbandoned));
     }
 
-    // 2. No prior submission_response → never submitted.
-    let Some((prior_transaction_id, idempotency_key)) =
+    // 2. State-3 path: a Response exists.
+    if let Some((prior_transaction_id, idempotency_key)) =
         latest_submission_response(&entries, invoice_id)?
-    else {
-        return Ok(StuckOutcome::NotStuck(NotStuckReason::NeverSubmitted));
-    };
-
-    // 3. Walk acks for terminal status; non-terminal (or none) → stuck.
-    let prior_last_ack_status = latest_ack_status(&entries, invoice_id)?;
-    match prior_last_ack_status.as_deref() {
-        Some("SAVED") => Ok(StuckOutcome::NotStuck(NotStuckReason::AlreadyFinalized)),
-        Some("ABORTED") => Ok(StuckOutcome::NotStuck(NotStuckReason::AlreadyRejected)),
-        _ => Ok(StuckOutcome::Stuck(StuckPrecondition {
-            prior_transaction_id,
-            prior_last_ack_status,
-            idempotency_key,
-        })),
+    {
+        let prior_last_ack_status = latest_ack_status(&entries, invoice_id)?;
+        return match prior_last_ack_status.as_deref() {
+            Some("SAVED") => Ok(StuckOutcome::NotStuck(NotStuckReason::AlreadyFinalized)),
+            Some("ABORTED") => Ok(StuckOutcome::NotStuck(NotStuckReason::AlreadyRejected)),
+            _ => Ok(StuckOutcome::Stuck(StuckPrecondition {
+                stage: StuckStage::AwaitingAck,
+                prior_transaction_id: Some(prior_transaction_id),
+                prior_last_ack_status,
+                idempotency_key,
+            })),
+        };
     }
+
+    // 3. State-2 path (PR-19 / ADR-0032 §4): no Response, but an
+    //    Attempt exists → Pending. The Attempt was committed in TX1
+    //    but TX2 never committed (wire broke / crash mid-flight) or
+    //    TX2 committed an AttemptFailed entry instead of a Response
+    //    (NAV-side or transport-side failure surfaced).
+    if let Some(idempotency_key) = latest_submission_attempt(&entries, invoice_id)? {
+        return Ok(StuckOutcome::Stuck(StuckPrecondition {
+            stage: StuckStage::Pending,
+            prior_transaction_id: None,
+            prior_last_ack_status: None,
+            idempotency_key,
+        }));
+    }
+
+    // 4. No Attempt, no Response → never submitted.
+    Ok(StuckOutcome::NotStuck(NotStuckReason::NeverSubmitted))
 }
 
 /// True iff any `InvoiceMarkedAbandoned` entry with a payload whose
@@ -228,6 +323,46 @@ fn latest_submission_response(
                 )
             })?;
         return Ok(Some((payload.transaction_id, idem)));
+    }
+    Ok(None)
+}
+
+/// Most-recent (highest-seq) `InvoiceSubmissionAttempt` for this
+/// invoice id. Returns the persisted `idempotency_key` only — the
+/// state-2 Pending precondition does NOT carry a NAV
+/// `transaction_id` (no Response exists yet). `None` if no Attempt
+/// entry exists for this invoice (then `stuck_precondition` returns
+/// `NotStuck(NeverSubmitted)`).
+///
+/// PR-19 / ADR-0032 §4 — the state-2 Pending classifier's evidence
+/// source.
+fn latest_submission_attempt(
+    entries: &[Entry],
+    invoice_id: &str,
+) -> Result<Option<IdempotencyKey>> {
+    for entry in entries.iter().rev() {
+        if entry.kind != EventKind::InvoiceSubmissionAttempt {
+            continue;
+        }
+        let payload: audit_payloads::InvoiceSubmissionAttemptPayload =
+            serde_json::from_slice(&entry.payload).map_err(|e| {
+                anyhow!(
+                    "InvoiceSubmissionAttempt audit payload (seq {:?}) failed typed decode: {e}",
+                    entry.seq
+                )
+            })?;
+        if payload.invoice_id != invoice_id {
+            continue;
+        }
+        let idem =
+            IdempotencyKey::from_canonical_string(&payload.idempotency_key).ok_or_else(|| {
+                anyhow!(
+                    "InvoiceSubmissionAttempt idempotency_key '{}' failed parse — \
+                     the audit ledger appears tampered or schema-drifted",
+                    payload.idempotency_key
+                )
+            })?;
+        return Ok(Some(idem));
     }
     Ok(None)
 }
@@ -329,13 +464,69 @@ mod tests {
         let payload = audit_payloads::InvoiceMarkedAbandonedPayload::new(
             invoice_id,
             idem,
-            txid,
+            Some(txid.to_string()),
             None,
             "test abandon",
         );
         ledger
             .append(
                 EventKind::InvoiceMarkedAbandoned,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    /// PR-19 / ADR-0032 §1 — write an `InvoiceSubmissionAttempt` entry
+    /// in isolation (no Response). Used by the state-2 Pending
+    /// classifier tests below to simulate the "TX1 committed, TX2 did
+    /// not" precondition.
+    fn write_submission_attempt(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        invoice_id: &str,
+        idem: IdempotencyKey,
+    ) {
+        let payload = audit_payloads::InvoiceSubmissionAttemptPayload::new(
+            invoice_id,
+            idem,
+            "test",
+            b"<request/>".to_vec(),
+        );
+        ledger
+            .append(
+                EventKind::InvoiceSubmissionAttempt,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    /// PR-19 / ADR-0032 §2 — write an `InvoiceSubmissionAttemptFailed`
+    /// entry. Used by the state-2 Pending classifier tests to verify
+    /// that the AttemptFailed entry does NOT change classification
+    /// (Attempt-with-AttemptFailed-without-Response is still state-2
+    /// Pending per ADR-0032 §4).
+    fn write_submission_attempt_failed(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        invoice_id: &str,
+        idem: IdempotencyKey,
+    ) {
+        let payload = audit_payloads::InvoiceSubmissionAttemptFailedPayload::new(
+            invoice_id,
+            idem,
+            "test",
+            "transport",
+            None,
+            "test transport failure".to_string(),
+            None,
+        );
+        ledger
+            .append(
+                EventKind::InvoiceSubmissionAttemptFailed,
                 payload.to_bytes(),
                 actor.clone(),
                 Some(idem.to_canonical_string()),
@@ -359,7 +550,8 @@ mod tests {
         write_submission_response(&mut ledger, &actor, "inv_A", idem, "TXID-A");
         match stuck_precondition(&ledger, "inv_A").unwrap() {
             StuckOutcome::Stuck(p) => {
-                assert_eq!(p.prior_transaction_id, "TXID-A");
+                assert_eq!(p.stage, StuckStage::AwaitingAck);
+                assert_eq!(p.prior_transaction_id.as_deref(), Some("TXID-A"));
                 assert_eq!(p.prior_last_ack_status, None);
                 assert_eq!(p.idempotency_key, idem);
             }
@@ -376,9 +568,10 @@ mod tests {
         write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "PROCESSING");
         match stuck_precondition(&ledger, "inv_A").unwrap() {
             StuckOutcome::Stuck(p) => {
+                assert_eq!(p.stage, StuckStage::AwaitingAck);
                 // Latest = PROCESSING (the second ack), not RECEIVED.
                 assert_eq!(p.prior_last_ack_status.as_deref(), Some("PROCESSING"));
-                assert_eq!(p.prior_transaction_id, "TXID-A");
+                assert_eq!(p.prior_transaction_id.as_deref(), Some("TXID-A"));
             }
             other => panic!("expected Stuck, got {other:?}"),
         }
@@ -443,7 +636,10 @@ mod tests {
         write_marked_abandoned(&mut ledger, &actor, "inv_B", idem_b, "TXID-B");
         // A's classification ignores B's abandon.
         match stuck_precondition(&ledger, "inv_A").unwrap() {
-            StuckOutcome::Stuck(p) => assert_eq!(p.prior_transaction_id, "TXID-A"),
+            StuckOutcome::Stuck(p) => {
+                assert_eq!(p.stage, StuckStage::AwaitingAck);
+                assert_eq!(p.prior_transaction_id.as_deref(), Some("TXID-A"));
+            }
             other => panic!("expected Stuck for inv_A, got {other:?}"),
         }
         // B is correctly abandoned.
@@ -451,5 +647,117 @@ mod tests {
             StuckOutcome::NotStuck(NotStuckReason::AlreadyAbandoned) => {}
             other => panic!("expected AlreadyAbandoned for inv_B, got {other:?}"),
         }
+    }
+
+    // ── PR-19 / ADR-0032 §4 — state-2 Pending classifier ────────────
+
+    /// State-2 Pending: an Attempt exists, no Response, no Abandoned.
+    /// The classifier returns `Stuck(StuckStage::Pending,
+    /// prior_transaction_id=None, ...)` carrying the
+    /// idempotency_key from the Attempt payload (F8). CLAUDE.md
+    /// rule 9: pins the load-bearing state-2 path against a
+    /// regression that collapses state-2 into NeverSubmitted.
+    #[test]
+    fn pending_when_attempt_exists_and_no_response() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        match stuck_precondition(&ledger, "inv_A").unwrap() {
+            StuckOutcome::Stuck(p) => {
+                assert_eq!(p.stage, StuckStage::Pending);
+                assert!(p.prior_transaction_id.is_none());
+                assert!(p.prior_last_ack_status.is_none());
+                assert_eq!(p.idempotency_key, idem);
+            }
+            other => panic!("expected Stuck(Pending), got {other:?}"),
+        }
+    }
+
+    /// State-2 Pending survives an AttemptFailed entry. The classifier
+    /// does not consult AttemptFailed; multiple failed attempts
+    /// accumulate as audit evidence but do not change the stage.
+    /// Pins ADR-0032 §4's "AttemptFailed does NOT change
+    /// classification" contract against a future refactor that
+    /// silently changes the semantics.
+    #[test]
+    fn pending_when_attempt_followed_by_attempt_failed() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        write_submission_attempt_failed(&mut ledger, &actor, "inv_A", idem);
+        match stuck_precondition(&ledger, "inv_A").unwrap() {
+            StuckOutcome::Stuck(p) => {
+                assert_eq!(p.stage, StuckStage::Pending);
+                assert!(p.prior_transaction_id.is_none());
+                assert_eq!(p.idempotency_key, idem);
+            }
+            other => panic!("expected Stuck(Pending), got {other:?}"),
+        }
+    }
+
+    /// State-2 → State-3 transition: once a Response arrives the
+    /// stage flips to AwaitingAck (the precondition walker prefers
+    /// Response over Attempt — step 2 in the classifier walks
+    /// before step 3). Pins the ordering of the classifier's match
+    /// arms against accidental re-ordering.
+    #[test]
+    fn awaiting_ack_when_attempt_and_response_both_exist() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        write_submission_response(&mut ledger, &actor, "inv_A", idem, "TXID-A");
+        match stuck_precondition(&ledger, "inv_A").unwrap() {
+            StuckOutcome::Stuck(p) => {
+                assert_eq!(p.stage, StuckStage::AwaitingAck);
+                assert_eq!(p.prior_transaction_id.as_deref(), Some("TXID-A"));
+            }
+            other => panic!("expected Stuck(AwaitingAck), got {other:?}"),
+        }
+    }
+
+    /// State-2 → AlreadyAbandoned: an Abandoned entry for a state-2
+    /// Pending invoice transitions it to AlreadyAbandoned (the
+    /// terminal-by-operator-decision branch wins regardless of
+    /// stage). Pins ADR-0032 §"Adversarial review" #8's contract
+    /// — mark-abandoned works on state-2 too.
+    #[test]
+    fn already_abandoned_overrides_pending_state_2() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        write_marked_abandoned(&mut ledger, &actor, "inv_A", idem, "<none>");
+        match stuck_precondition(&ledger, "inv_A").unwrap() {
+            StuckOutcome::NotStuck(NotStuckReason::AlreadyAbandoned) => {}
+            other => panic!("expected AlreadyAbandoned, got {other:?}"),
+        }
+    }
+
+    /// Cross-invoice contamination check for the state-2 classifier:
+    /// an Attempt for B does NOT push A into state-2. Mirror of
+    /// `precondition_does_not_cross_invoice_ids` against the new
+    /// `latest_submission_attempt` helper.
+    #[test]
+    fn pending_classification_does_not_cross_invoice_ids() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem_a = IdempotencyKey::new();
+        let idem_b = IdempotencyKey::new();
+        // A has an Attempt; B has nothing.
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem_a);
+        // B's classification is NeverSubmitted, not Pending.
+        match stuck_precondition(&ledger, "inv_B").unwrap() {
+            StuckOutcome::NotStuck(NotStuckReason::NeverSubmitted) => {}
+            other => panic!("expected NeverSubmitted for inv_B, got {other:?}"),
+        }
+        // A's classification is Pending.
+        match stuck_precondition(&ledger, "inv_A").unwrap() {
+            StuckOutcome::Stuck(p) => {
+                assert_eq!(p.stage, StuckStage::Pending);
+                assert_eq!(p.idempotency_key, idem_a);
+            }
+            other => panic!("expected Stuck(Pending) for inv_A, got {other:?}"),
+        }
+        // Unused — only here so clippy does not complain that idem_b
+        // is declared but never read.
+        let _ = idem_b;
     }
 }

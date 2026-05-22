@@ -60,7 +60,7 @@ use duckdb::Connection;
 use ulid::Ulid;
 
 use crate::audit_payloads;
-use crate::audit_query::{self, StuckOutcome, StuckPrecondition};
+use crate::audit_query::{self, StuckOutcome, StuckPrecondition, StuckStage};
 use crate::binary_hash;
 use crate::cli::MarkAbandonedArgs;
 
@@ -166,32 +166,77 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
         .sync_mirror(&mirror_path)
         .context("sync audit-ledger mirror file after mark-abandoned commit")?;
 
-    // 6. Typestate advance + operator-visible summary.
-    let submitted = ready_invoice.into_submitted(stuck.prior_transaction_id.clone());
-    let stuck_typestate = submitted.into_submission_stuck();
-    let abandoned = stuck_typestate.into_abandoned();
-    // tracing::error rather than info: a marked-abandoned invoice is
-    // an operator-visible escalation — surfaced loud (rule 12) so it
-    // appears in any structured-log alerting that watches for
-    // error-level events on the audit path.
-    tracing::error!(
-        invoice_id = %abandoned.id.to_prefixed_string(),
-        seq = abandoned.sequence_number,
-        prior_transaction_id = %abandoned.nav_transaction_id,
-        prior_last_ack_status = ?stuck.prior_last_ack_status,
-        "invoice marked ABANDONED by operator — terminal; sequence not reused; \
-         a corrective new invoice may be required"
-    );
-    println!(
-        "mark-abandoned OK: invoice {} (seq {}) marked ABANDONED (prior txid {}, prior last ack {}) \
-         — sequence not reused; audit chain verified across {} entries; \
-         issue a corrective new invoice if the business transaction still needs reporting",
-        abandoned.id.to_prefixed_string(),
-        abandoned.sequence_number,
-        abandoned.nav_transaction_id,
-        stuck.prior_last_ack_status.as_deref().unwrap_or("<none>"),
-        verified,
-    );
+    // 6. Typestate advance + operator-visible summary. PR-19 /
+    //    ADR-0032 §4: state-2 Pending has no prior_transaction_id;
+    //    the typestate-display path is taken only for state-3
+    //    AwaitingAck (where the prior txid exists). State-2 prints
+    //    a stage-aware summary directly without the typestate
+    //    dance — the audit ledger is the source of truth per
+    //    ADR-0023 A5/A6, and the typestate transition is purely
+    //    cosmetic for the summary message.
+    let invoice_id_str = ready_invoice.id.to_prefixed_string();
+    let invoice_seq = ready_invoice.sequence_number;
+    let prior_last_ack = stuck.prior_last_ack_status.as_deref().unwrap_or("<none>");
+    let stage_label = match stuck.stage {
+        StuckStage::Pending => "state-2 Pending",
+        StuckStage::AwaitingAck => "state-3 AwaitingAck",
+    };
+    match stuck.prior_transaction_id.clone() {
+        Some(txid) => {
+            // State-3 path — the existing pre-PR-19 typestate
+            // advance is retained for the operator-visible message.
+            let submitted = ready_invoice.into_submitted(txid);
+            let stuck_typestate = submitted.into_submission_stuck();
+            let abandoned = stuck_typestate.into_abandoned();
+            tracing::error!(
+                invoice_id = %abandoned.id.to_prefixed_string(),
+                seq = abandoned.sequence_number,
+                prior_transaction_id = %abandoned.nav_transaction_id,
+                prior_last_ack_status = ?stuck.prior_last_ack_status,
+                stage = stage_label,
+                "invoice marked ABANDONED by operator — terminal; sequence not reused; \
+                 a corrective new invoice may be required"
+            );
+            println!(
+                "mark-abandoned OK ({}): invoice {} (seq {}) marked ABANDONED \
+                 (prior txid {}, prior last ack {}) \
+                 — sequence not reused; audit chain verified across {} entries; \
+                 issue a corrective new invoice if the business transaction still needs reporting",
+                stage_label,
+                abandoned.id.to_prefixed_string(),
+                abandoned.sequence_number,
+                abandoned.nav_transaction_id,
+                prior_last_ack,
+                verified,
+            );
+        }
+        None => {
+            // State-2 Pending path — no prior_transaction_id; skip
+            // the typestate dance and print the stage-aware summary
+            // directly.
+            tracing::error!(
+                invoice_id = %invoice_id_str,
+                seq = invoice_seq,
+                prior_last_ack_status = ?stuck.prior_last_ack_status,
+                stage = stage_label,
+                "invoice marked ABANDONED by operator — terminal; sequence not reused; \
+                 NO prior NAV transactionId (state-2 Pending — the prior Attempt's wire \
+                 broke or the process crashed before TX2 commit per ADR-0032 §1)"
+            );
+            println!(
+                "mark-abandoned OK ({}): invoice {} (seq {}) marked ABANDONED \
+                 (no prior NAV transactionId — state-2 Pending) \
+                 — sequence not reused; audit chain verified across {} entries; \
+                 NOTE the prior Attempt's submission may or may not have reached NAV \
+                 (Layer-2 queryInvoiceCheck per ADR-0009 §5 / ADR-0032 §\"Open questions\" F44 \
+                 is named-deferred — until it lands, the NAV-side fate is unknown)",
+                stage_label,
+                invoice_id_str,
+                invoice_seq,
+                verified,
+            );
+        }
+    }
 
     Ok(())
 }
@@ -267,7 +312,7 @@ fn write_marked_abandoned_audit_entry(
     let payload = audit_payloads::InvoiceMarkedAbandonedPayload::new(
         &invoice_id_str,
         idempotency_key,
-        &stuck.prior_transaction_id,
+        stuck.prior_transaction_id.clone(),
         stuck.prior_last_ack_status.clone(),
         reason,
     );

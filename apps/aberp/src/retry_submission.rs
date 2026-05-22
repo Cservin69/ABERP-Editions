@@ -1,4 +1,7 @@
-//! Orchestration for the `aberp retry-submission` subcommand (PR-8-1).
+//! Orchestration for the `aberp retry-submission` subcommand (PR-8-1,
+//! amended by PR-19 / ADR-0032 §4 to accept state-2 Pending in
+//! addition to state-3 AwaitingAck, and §1 to use the two-tx
+//! Attempt-before-call posture).
 //!
 //! Operator-unblock command for an invoice in the `SubmissionStuck`
 //! posture per ADR-0009 §5: re-submits the invoice via the existing
@@ -22,39 +25,72 @@
 //!   5. Re-read the NAV InvoiceData XML bytes from disk (same source
 //!      `submit_invoice` reads — operator points the command at the
 //!      same `--invoice-xml` file).
-//!   6. Build a tokio current-thread runtime and drive the NAV calls
-//!      (`tokenExchange` + `manageInvoice` for `operation = CREATE`,
-//!      same shape as `submit_invoice::call_nav`).
-//!   7. Under a single DuckDB transaction, append THREE audit entries:
-//!      `InvoiceRetryRequested` (operator decision + precondition),
-//!      `InvoiceSubmissionAttempt` (verbatim request body), and
-//!      `InvoiceSubmissionResponse` (verbatim response body + new
-//!      transactionId). All three carry the same F8 idempotency key
-//!      as the original issuance.
-//!   8. Verify the audit chain after commit (success-criterion gate).
-//!   9. Advance the typestate (Stuck → Submitted with the new txid)
-//!      and print the operator-visible summary.
+//!   6. Build a tokio current-thread runtime and drive the NAV
+//!      prepare phase (`tokenExchange` + `manage_invoice::build_request`
+//!      for `operation = CREATE`, same shape as
+//!      `submit_invoice::prepare_for_attempt_audit`). NO wire send
+//!      yet — that happens in step 8 after TX1 commit.
+//!   7. **TX1 — RetryRequested + Attempt-before-call** (PR-19 /
+//!      ADR-0032 §1). Under one DuckDB transaction, append TWO audit
+//!      entries: `InvoiceRetryRequested` (operator decision +
+//!      precondition; `prior_transaction_id` is `Option<String>` per
+//!      ADR-0032 §4 — `None` for state-2 Pending, `Some` for
+//!      state-3 AwaitingAck) and `InvoiceSubmissionAttempt`
+//!      (verbatim request body from the prepare phase). Commit. Sync
+//!      mirror per ADR-0030 §2.
+//!   8. **Wire send** — POST the pre-rendered envelope via
+//!      `manage_invoice::send_built_request`.
+//!   9. **TX2 — Response on success, AttemptFailed on failure**
+//!      (PR-19 / ADR-0032 §1). Under a second DuckDB transaction,
+//!      append `InvoiceSubmissionResponse` (verbatim response + new
+//!      transactionId) on success OR `InvoiceSubmissionAttemptFailed`
+//!      (typed error_class + code + message per
+//!      `submission_queue::classify_attempt_failure`) on failure.
+//!      Commit. Sync mirror.
+//!  10. Verify the audit chain after TX2 commit (success-criterion
+//!      gate). Advance the typestate (Stuck → Submitted with the
+//!      new txid, on success) and print the operator-visible
+//!      summary.
 //!
-//! # Why one transaction for all three audit appends
+//! # Why TX1 widens to two entries (RetryRequested + Attempt)
 //!
-//! Same posture as `submit_invoice`: attempt + response are siblings in
-//! time, and adding `retry_requested` to the same tx keeps the unblock
-//! decision atomically tied to the resulting NAV interaction. If the
-//! process crashes between writing `retry_requested` and writing the
-//! attempt entry, the rollback discards both — the operator runs the
-//! command again from scratch rather than discovering a half-written
-//! retry-decision-with-no-evidence in the ledger.
+//! Per `submit_invoice`'s two-tx posture rationale: the Attempt entry
+//! must commit BEFORE the wire send so a transport-mid-flight loss
+//! leaves the Attempt row in the ledger. The operator's
+//! `retry_requested` decision and the resulting Attempt are
+//! atomically paired in TX1 — a process crash between the two would
+//! produce a half-written retry-decision-with-no-evidence (or
+//! vice versa) that the operator cannot reason about. The single
+//! TX1 commit guarantees the pair lands together. TX2 commits the
+//! Response or AttemptFailed entry independently of TX1.
+//!
+//! # State-2 Pending acceptance (PR-19 / ADR-0032 §4)
+//!
+//! Pre-PR-19 `retry-submission` accepted only state-3 (a Response
+//! exists, no terminal ack — the AwaitingAck stage). PR-19 extends
+//! the precondition walker to also accept state-2 (an Attempt
+//! exists, no Response — the Pending stage), which the new two-tx
+//! posture introduces. State-2 retries write the same TX1 +
+//! TX2 shape as state-3 retries; the only difference is the
+//! `prior_transaction_id` field on the `InvoiceRetryRequestedPayload`
+//! (None for state-2 because no prior Response exists). The
+//! operator-visible summary names the stage explicitly and surfaces
+//! the duplicate-submission residual loud for state-2 (CLAUDE.md
+//! rule 12 — Layer-2 `queryInvoiceCheck` per ADR-0009 §5 is
+//! named-deferred per ADR-0032 §"Open questions" / F44).
 //!
 //! # Why not call into `submit_invoice::run` directly
 //!
-//! `submit_invoice::run` writes exactly two audit entries per call —
-//! the attempt + the response. Adding the `retry_requested` entry
-//! requires injecting a third write into the same tx, which means
-//! either parametrizing `submit_invoice`'s tx body (would invade its
-//! scope) or wrapping the call (would split the tx into two,
-//! defeating the atomicity above). The structural NAV-call code is
-//! lifted via `submit_invoice::call_nav` re-export — the only
-//! duplication is in the orchestration shell.
+//! `submit_invoice::run` is shaped for the initial-submission case
+//! and writes Attempt + Response (or AttemptFailed) per ADR-0032 §1.
+//! Adding the `InvoiceRetryRequested` entry on top would require
+//! either parametrising `submit_invoice`'s TX1 body (would invade
+//! its scope) or wrapping the call (would split the
+//! RetryRequested + Attempt pairing across two txs, defeating the
+//! atomicity rationale above). The structural NAV-call shape is
+//! mirrored here inline per the operator-facing-twin posture
+//! (CLAUDE.md rule 2 — neither extracted nor speculatively shared
+//! until a third caller appears with the same shape).
 //!
 //! # F12 trap status
 //!
@@ -64,6 +100,9 @@
 //! hand-listed array) land in the same commit as this file. If a
 //! future contributor adds an EventKind without those four edits, the
 //! round-trip test fails — but this header is the loud reminder.
+//! PR-19 / ADR-0032 §2 adds `InvoiceSubmissionAttemptFailed` —
+//! tenth landing of the four-edit ritual; the TX2 failure-path
+//! write target in this module.
 //!
 //! # What this flow does NOT do
 //!
@@ -84,16 +123,17 @@ use aberp_billing::{self as billing, IdempotencyKey, ReadyInvoice};
 use aberp_nav_transport::{
     operations::{manage_invoice, token_exchange},
     soap::{InvoiceOperation, ManageInvoiceItem},
-    NavCredentials, NavEndpoint, NavTransport,
+    NavCredentials, NavEndpoint, NavTransport, NavTransportError,
 };
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
 use ulid::Ulid;
 
 use crate::audit_payloads;
-use crate::audit_query::{self, StuckOutcome, StuckPrecondition};
+use crate::audit_query::{self, StuckOutcome, StuckPrecondition, StuckStage};
 use crate::binary_hash;
 use crate::cli::{NavEnv, RetrySubmissionArgs};
+use crate::submission_queue;
 
 pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
     let _span = tracing::info_span!(
@@ -201,26 +241,30 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
         "on-disk InvoiceData XML passed v3.0 invariant check before NAV retry"
     );
 
-    // 6. NAV calls on a tokio current-thread runtime.
+    // 6. NAV prepare phase: tokenExchange + build envelope. NO wire
+    //    send yet (PR-19 / ADR-0032 §1).
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build tokio current-thread runtime for retry NAV calls")?;
-    let nav_outcome = runtime.block_on(call_nav(
+    let prepared = runtime.block_on(prepare_for_attempt_audit(
         nav_endpoint,
         &credentials,
         &tax_number_8,
         &invoice_xml,
     ))?;
     tracing::info!(
-        new_transaction_id = %nav_outcome.transaction_id,
-        prior_transaction_id = %stuck.prior_transaction_id,
-        "NAV manageInvoice (retry) OK"
+        request_bytes = prepared.request_xml.len(),
+        stage = ?stuck.stage,
+        "manageInvoice envelope built; writing TX1 (RetryRequested + Attempt)"
     );
 
-    // 7. Write all three audit entries under one tx, then commit.
-    write_retry_audit_entries(
+    // 7. TX1 — RetryRequested + Attempt-before-call (PR-19 /
+    //    ADR-0032 §1). Two audit entries in one tx so the
+    //    operator-decision and the resulting Attempt are atomically
+    //    paired.
+    write_retry_requested_and_attempt_audit(
         &mut conn,
         &ledger_meta,
         actor.clone(),
@@ -229,42 +273,128 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
         endpoint_audit_label,
         reason,
         &stuck,
-        &nav_outcome,
+        prepared.request_xml.clone(),
     )?;
+    {
+        let ledger_tx1 = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+            .context("open audit ledger after TX1 commit")?;
+        let mirror_path = audit_ledger::mirror_path_for(&args.db);
+        ledger_tx1
+            .sync_mirror(&mirror_path)
+            .context("sync audit-ledger mirror file after TX1 RetryRequested+Attempt commit")?;
+    }
 
-    // 8. Verify the audit chain after commit (success-criterion gate).
-    drop(conn);
-    let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes).context("open audit ledger")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER retry-submission")?;
-    tracing::info!(entries_verified = verified, "audit chain verified");
+    // 8. Wire send — POST the pre-rendered envelope.
+    let wire_result = runtime.block_on(manage_invoice::send_built_request(
+        &prepared.transport,
+        &prepared.request_xml,
+    ));
 
-    // 8a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit.
-    let mirror_path = audit_ledger::mirror_path_for(&args.db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after retry-submission commit")?;
-
-    // 9. Typestate advance + operator-visible summary. The retry
-    //    leaves the invoice in `Submitted` with the new txid; the
-    //    operator runs `aberp poll-ack` next.
-    let submitted = ready_invoice.into_submitted(nav_outcome.transaction_id.clone());
-    println!(
-        "retry-submission OK: invoice {} (seq {}) re-submitted -> NAV transactionId {} \
-         (prior txid {}, prior last ack {}) \
-         (audit chain verified across {} entries); \
-         run `aberp poll-ack` to drive terminal state",
-        submitted.id.to_prefixed_string(),
-        submitted.sequence_number,
-        submitted.nav_transaction_id,
-        stuck.prior_transaction_id,
-        stuck.prior_last_ack_status.as_deref().unwrap_or("<none>"),
-        verified,
-    );
-
-    Ok(())
+    // 9. TX2 — Response or AttemptFailed.
+    match wire_result {
+        Ok(send_outcome) => {
+            tracing::info!(
+                new_transaction_id = %send_outcome.transaction_id,
+                prior_transaction_id = ?stuck.prior_transaction_id,
+                stage = ?stuck.stage,
+                "NAV manageInvoice (retry) OK"
+            );
+            write_response_audit(
+                &mut conn,
+                &ledger_meta,
+                actor.clone(),
+                &ready_invoice,
+                idempotency_key,
+                &send_outcome.transaction_id,
+                send_outcome.response_xml,
+            )?;
+            drop(conn);
+            let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
+                .context("open audit ledger after TX2 Response commit")?;
+            let verified = ledger
+                .verify_chain()
+                .context("audit-ledger chain verification failed AFTER retry-submission")?;
+            tracing::info!(entries_verified = verified, "audit chain verified");
+            let mirror_path = audit_ledger::mirror_path_for(&args.db);
+            ledger
+                .sync_mirror(&mirror_path)
+                .context("sync audit-ledger mirror file after TX2 Response commit")?;
+            let submitted =
+                ready_invoice.into_submitted(send_outcome.transaction_id.clone());
+            let prior_txid_label = stuck
+                .prior_transaction_id
+                .as_deref()
+                .unwrap_or("<no prior NAV transaction id — state-2 Pending>");
+            let stage_label = match stuck.stage {
+                StuckStage::Pending => "state-2 Pending",
+                StuckStage::AwaitingAck => "state-3 AwaitingAck",
+            };
+            println!(
+                "retry-submission OK ({}): invoice {} (seq {}) re-submitted -> NAV transactionId {} \
+                 (prior txid {}, prior last ack {}) \
+                 (audit chain verified across {} entries); \
+                 run `aberp poll-ack` to drive terminal state",
+                stage_label,
+                submitted.id.to_prefixed_string(),
+                submitted.sequence_number,
+                submitted.nav_transaction_id,
+                prior_txid_label,
+                stuck.prior_last_ack_status.as_deref().unwrap_or("<none>"),
+                verified,
+            );
+            Ok(())
+        }
+        Err(wire_err) => {
+            let (error_class, error_code) =
+                submission_queue::classify_attempt_failure(&wire_err);
+            let error_message = format!("{wire_err}");
+            let response_xml: Option<Vec<u8>> = None;
+            write_attempt_failed_audit(
+                &mut conn,
+                &ledger_meta,
+                actor.clone(),
+                &ready_invoice,
+                idempotency_key,
+                endpoint_audit_label,
+                error_class,
+                error_code,
+                error_message.clone(),
+                response_xml,
+            )?;
+            drop(conn);
+            let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
+                .context("open audit ledger after TX2 AttemptFailed commit")?;
+            let verified = ledger
+                .verify_chain()
+                .context("audit-ledger chain verification failed AFTER AttemptFailed")?;
+            let mirror_path = audit_ledger::mirror_path_for(&args.db);
+            ledger
+                .sync_mirror(&mirror_path)
+                .context("sync audit-ledger mirror file after TX2 AttemptFailed commit")?;
+            tracing::error!(
+                invoice_id = %ready_invoice.id.to_prefixed_string(),
+                entries_verified = verified,
+                error_class = error_class,
+                "retry-submission: manageInvoice failed; TX2 AttemptFailed audit written"
+            );
+            eprintln!(
+                "retry-submission FAILED for invoice {}: {} \
+                 (audit chain verified across {} entries; \
+                 InvoiceSubmissionAttemptFailed recorded with error_class={}); \
+                 invoice remains in state-2 Pending — re-run `aberp retry-submission` \
+                 (note: a state-2 retry may produce a duplicate submission to NAV \
+                 until Layer-2 queryInvoiceCheck per ADR-0009 §5 lands; F44)",
+                ready_invoice.id.to_prefixed_string(),
+                error_message,
+                verified,
+                error_class,
+            );
+            Err(anyhow!(
+                "retry-submission manageInvoice failed: {}",
+                error_message
+            ))
+        }
+    }
 }
 
 /// Open the audit ledger, resolve the stuck precondition. Loud-fail
@@ -274,8 +404,14 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
 ///
 /// The idempotency-key mismatch check is defence-in-depth: the F8
 /// contract pins the issuance's key to every NAV-related entry. If
-/// the submission_response carries a different key than the billing
-/// row, something has tampered with the ledger (rule 12 — fail loud).
+/// the precondition's key differs from the billing row, something
+/// has tampered with the ledger (rule 12 — fail loud).
+///
+/// PR-19 / ADR-0032 §4: accepts state-2 (StuckStage::Pending) in
+/// addition to state-3 (StuckStage::AwaitingAck) — both share the
+/// retry-submission command shape; only the
+/// `prior_transaction_id` field on the `InvoiceRetryRequestedPayload`
+/// differs (`None` for state-2 because no prior Response exists).
 fn resolve_stuck_or_loud_fail(
     db_path: &std::path::Path,
     tenant: TenantId,
@@ -289,7 +425,7 @@ fn resolve_stuck_or_loud_fail(
         StuckOutcome::Stuck(p) => {
             if p.idempotency_key != *issuance_idempotency_key {
                 return Err(anyhow!(
-                    "F8 contract violation: submission_response idempotency_key '{}' \
+                    "F8 contract violation: precondition idempotency_key '{}' \
                      does not match issuance idempotency_key '{}' — \
                      the audit ledger appears tampered or schema-drifted",
                     p.idempotency_key.to_canonical_string(),
@@ -306,29 +442,30 @@ fn resolve_stuck_or_loud_fail(
     }
 }
 
-/// Internal: the NAV-side outcome of one retry attempt. Same shape as
-/// `submit_invoice::NavSubmissionOutcome`; we keep the type private
-/// here (instead of re-exporting `submit_invoice`'s) so a future
-/// divergence (e.g. retry-specific fields) does not surface as a
-/// silent rename of a shared type.
-struct NavSubmissionOutcome {
-    transaction_id: String,
+/// PR-19 / ADR-0032 §1: the retry prepare-for-attempt-audit bundle.
+/// Mirror of `submit_invoice::PreparedSubmission`.
+struct PreparedSubmission {
+    transport: NavTransport,
     request_xml: Vec<u8>,
-    response_xml: Vec<u8>,
 }
 
-async fn call_nav(
+/// PR-19 / ADR-0032 §1 + §3: open transport, tokenExchange, build
+/// envelope. Mirror of `submit_invoice::prepare_for_attempt_audit`
+/// per the operator-facing-twin posture. The retry path always uses
+/// `InvoiceOperation::Create` (same as the pre-PR-19 retry-submission
+/// shape) — chain operations (STORNO / MODIFY) are not yet on the
+/// retry surface (separate trigger).
+async fn prepare_for_attempt_audit(
     endpoint: NavEndpoint,
     credentials: &NavCredentials,
     tax_number_8: &str,
     invoice_xml: &[u8],
-) -> Result<NavSubmissionOutcome> {
+) -> Result<PreparedSubmission> {
     let transport = NavTransport::new(endpoint).context("build NAV transport")?;
     let token = token_exchange::call(&transport, credentials, tax_number_8)
         .await
         .context("NAV tokenExchange (retry)")?;
-    let manage = manage_invoice::call(
-        &transport,
+    let request_xml = manage_invoice::build_request(
         credentials,
         tax_number_8,
         &token.decoded_token,
@@ -337,12 +474,12 @@ async fn call_nav(
             invoice_data_xml: invoice_xml,
         }],
     )
-    .await
-    .context("NAV manageInvoice (retry)")?;
-    Ok(NavSubmissionOutcome {
-        transaction_id: manage.transaction_id,
-        request_xml: manage.request_xml,
-        response_xml: manage.response_xml,
+    .map_err(|e: NavTransportError| {
+        anyhow!("manage_invoice::build_request (envelope construction; retry) failed: {e}")
+    })?;
+    Ok(PreparedSubmission {
+        transport,
+        request_xml,
     })
 }
 
@@ -367,11 +504,14 @@ fn load_issued_invoice(
     Ok(pair)
 }
 
-/// Open one audit-write tx, append three entries (retry_requested +
-/// attempt + response), commit. All three share the F8 idempotency
-/// key.
+/// PR-19 / ADR-0032 §1: TX1 audit-write — open one audit tx, append
+/// `InvoiceRetryRequested` + `InvoiceSubmissionAttempt` in that order,
+/// commit. Both entries share the F8 idempotency key. The pair lands
+/// atomically so the operator's decision and the resulting Attempt
+/// are inseparable in the audit chain (a crash mid-tx rolls both
+/// back; a crash post-commit leaves both).
 #[allow(clippy::too_many_arguments)]
-fn write_retry_audit_entries(
+fn write_retry_requested_and_attempt_audit(
     conn: &mut Connection,
     ledger_meta: &LedgerMeta,
     actor: Actor,
@@ -380,21 +520,25 @@ fn write_retry_audit_entries(
     endpoint_label: &'static str,
     reason: &str,
     stuck: &StuckPrecondition,
-    nav_outcome: &NavSubmissionOutcome,
+    request_xml: Vec<u8>,
 ) -> Result<()> {
-    audit_ledger::ensure_schema(conn).context("ensure audit-ledger schema for retry-submission")?;
+    audit_ledger::ensure_schema(conn)
+        .context("ensure audit-ledger schema for retry-submission TX1")?;
     let tx = conn
         .transaction()
-        .context("begin DuckDB transaction (retry-submission audit appends)")?;
+        .context("begin DuckDB transaction (retry-submission TX1 RetryRequested+Attempt)")?;
 
     let invoice_id_str = invoice.id.to_prefixed_string();
     let idem_str = idempotency_key.to_canonical_string();
 
-    // 1. InvoiceRetryRequested — the operator's decision + precondition.
+    // 1. InvoiceRetryRequested — operator's decision + precondition.
+    //    `prior_transaction_id` threads from the StuckPrecondition's
+    //    Option directly per ADR-0032 §4: Some for state-3
+    //    AwaitingAck; None for state-2 Pending.
     let retry_payload = audit_payloads::InvoiceRetryRequestedPayload::new(
         &invoice_id_str,
         idempotency_key,
-        &stuck.prior_transaction_id,
+        stuck.prior_transaction_id.clone(),
         stuck.prior_last_ack_status.clone(),
         reason,
     );
@@ -406,31 +550,54 @@ fn write_retry_audit_entries(
         actor.clone(),
         Some(idem_str.clone()),
     )
-    .context("audit_ledger::append_in_tx InvoiceRetryRequested")?;
+    .context("audit_ledger::append_in_tx InvoiceRetryRequested (retry TX1)")?;
 
     // 2. InvoiceSubmissionAttempt — verbatim retry-request body.
     let attempt = audit_payloads::InvoiceSubmissionAttemptPayload::new(
         &invoice_id_str,
         idempotency_key,
         endpoint_label,
-        nav_outcome.request_xml.clone(),
+        request_xml,
     );
     audit_ledger::append_in_tx(
         &tx,
         ledger_meta,
         EventKind::InvoiceSubmissionAttempt,
         attempt.to_bytes(),
-        actor.clone(),
-        Some(idem_str.clone()),
+        actor,
+        Some(idem_str),
     )
-    .context("audit_ledger::append_in_tx InvoiceSubmissionAttempt (retry)")?;
+    .context("audit_ledger::append_in_tx InvoiceSubmissionAttempt (retry TX1)")?;
 
-    // 3. InvoiceSubmissionResponse — verbatim retry-response body + new txid.
+    tx.commit()
+        .context("commit DuckDB transaction (retry-submission TX1 RetryRequested+Attempt)")?;
+    Ok(())
+}
+
+/// PR-19 / ADR-0032 §1: TX2 success audit-write — append
+/// `InvoiceSubmissionResponse` in its own tx after the wire send
+/// returns success. Mirror of `submit_invoice::write_response_audit`.
+fn write_response_audit(
+    conn: &mut Connection,
+    ledger_meta: &LedgerMeta,
+    actor: Actor,
+    invoice: &ReadyInvoice,
+    idempotency_key: IdempotencyKey,
+    transaction_id: &str,
+    response_xml: Vec<u8>,
+) -> Result<()> {
+    audit_ledger::ensure_schema(conn)
+        .context("ensure audit-ledger schema for retry-submission TX2 Response")?;
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (retry-submission TX2 Response audit append)")?;
+    let invoice_id_str = invoice.id.to_prefixed_string();
+    let idem_str = idempotency_key.to_canonical_string();
     let response = audit_payloads::InvoiceSubmissionResponsePayload::new(
         &invoice_id_str,
         idempotency_key,
-        &nav_outcome.transaction_id,
-        nav_outcome.response_xml.clone(),
+        transaction_id,
+        response_xml,
     );
     audit_ledger::append_in_tx(
         &tx,
@@ -440,10 +607,57 @@ fn write_retry_audit_entries(
         actor,
         Some(idem_str),
     )
-    .context("audit_ledger::append_in_tx InvoiceSubmissionResponse (retry)")?;
-
+    .context("audit_ledger::append_in_tx InvoiceSubmissionResponse (retry TX2)")?;
     tx.commit()
-        .context("commit DuckDB transaction (retry-submission audit appends)")?;
+        .context("commit DuckDB transaction (retry-submission TX2 Response audit append)")?;
+    Ok(())
+}
+
+/// PR-19 / ADR-0032 §1 + §2: TX2 failure audit-write — append
+/// `InvoiceSubmissionAttemptFailed` in its own tx after the wire
+/// send returns an error. Mirror of
+/// `submit_invoice::write_attempt_failed_audit`.
+#[allow(clippy::too_many_arguments)]
+fn write_attempt_failed_audit(
+    conn: &mut Connection,
+    ledger_meta: &LedgerMeta,
+    actor: Actor,
+    invoice: &ReadyInvoice,
+    idempotency_key: IdempotencyKey,
+    endpoint_label: &'static str,
+    error_class: &'static str,
+    error_code: Option<String>,
+    error_message: String,
+    response_xml: Option<Vec<u8>>,
+) -> Result<()> {
+    audit_ledger::ensure_schema(conn)
+        .context("ensure audit-ledger schema for retry-submission TX2 AttemptFailed")?;
+    let tx = conn.transaction().context(
+        "begin DuckDB transaction (retry-submission TX2 AttemptFailed audit append)",
+    )?;
+    let invoice_id_str = invoice.id.to_prefixed_string();
+    let idem_str = idempotency_key.to_canonical_string();
+    let failed = audit_payloads::InvoiceSubmissionAttemptFailedPayload::new(
+        &invoice_id_str,
+        idempotency_key,
+        endpoint_label,
+        error_class,
+        error_code,
+        error_message,
+        response_xml,
+    );
+    audit_ledger::append_in_tx(
+        &tx,
+        ledger_meta,
+        EventKind::InvoiceSubmissionAttemptFailed,
+        failed.to_bytes(),
+        actor,
+        Some(idem_str),
+    )
+    .context("audit_ledger::append_in_tx InvoiceSubmissionAttemptFailed (retry TX2)")?;
+    tx.commit().context(
+        "commit DuckDB transaction (retry-submission TX2 AttemptFailed audit append)",
+    )?;
     Ok(())
 }
 

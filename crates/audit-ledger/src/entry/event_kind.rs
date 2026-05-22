@@ -121,6 +121,27 @@
 /// PR-7-B-3 / PR-8 / PR-10 / PR-11 / PR-12 / PR-13 / PR-14 /
 /// PR-15, mechanical at this point.
 ///
+/// PR-19 (ADR-0032) adds `InvoiceSubmissionAttemptFailed` — the
+/// failure half of the Attempt/Response audit pair per ADR-0009
+/// §8's "Fires before the response is received" design intent.
+/// Closes F40 at the issuing-path level. The new variant pairs
+/// with the existing `InvoiceSubmissionAttempt` (PR-7-B-3) under
+/// the two-tx posture ADR-0032 §1 names: TX1 commits the Attempt
+/// before the NAV `manageInvoice` POST; TX2 commits either
+/// `InvoiceSubmissionResponse` (success) or
+/// `InvoiceSubmissionAttemptFailed` (failure). Failure classes
+/// (transport / http_status / application / retryable_application
+/// / envelope / credential / client_build) are carried as a
+/// typed string field on the payload per ADR-0032 §2 + §"Surfaced
+/// conflict 2 Reading B" — kind-alone classification would multiply
+/// the F12 ritual surface for sub-types of "the wire call failed."
+/// The state-2 Pending precondition (Attempt-without-Response per
+/// ADR-0032 §4) is operator-recoverable via the existing
+/// `retry-submission` command — no new operator command.
+/// The F12 four-edit ritual fires once — the tenth landing
+/// across PR-6.1 / PR-7-B-3 / PR-8 / PR-10 / PR-11 / PR-12 /
+/// PR-13 / PR-14 / PR-15 / PR-19, mechanical at this point.
+///
 /// The remaining invoice-lifecycle kinds (`Finalized`, `Rejected`,
 /// `SubmissionStuck`, `Voided`) land when their state transition
 /// first fires in the codebase.
@@ -339,6 +360,41 @@ pub enum EventKind {
     /// NOT claim a parsed receiver-confirmation state per
     /// CLAUDE.md rule 12. PR-15, ADR-0028 §2.
     InvoiceAnnulmentReceiverConfirmation,
+
+    /// A `manageInvoice` submission attempt failed — the failure
+    /// half of the `InvoiceSubmissionAttempt` / response pair per
+    /// ADR-0009 §8's "Fires before the response is received"
+    /// design intent and ADR-0032's two-tx posture (§1). Written
+    /// in TX2 of the submission flow when the NAV call returns
+    /// an error (transport-layer, HTTP-status, application-layer,
+    /// envelope-construction, credential, or client-build failure)
+    /// instead of `InvoiceSubmissionResponse`.
+    ///
+    /// Payload (`InvoiceSubmissionAttemptFailedPayload` in the
+    /// binary's `audit_payloads.rs`) carries the `invoice_id`,
+    /// the F8 `idempotency_key` carry-forward, the `endpoint`
+    /// label (`"test"` / `"production"`), a typed `error_class`
+    /// string (one of `"transport"`, `"http_status"`,
+    /// `"application"`, `"retryable_application"`, `"envelope"`,
+    /// `"credential"`, `"client_build"` per ADR-0032 §2), an
+    /// optional `error_code` (NAV code or HTTP status as string),
+    /// the operator-visible `error_message`, and the verbatim
+    /// response bytes IF a response body was received before the
+    /// error fired (None for transport / envelope / credential
+    /// / client-build classes).
+    ///
+    /// An invoice with `InvoiceSubmissionAttempt` + this kind +
+    /// no `InvoiceSubmissionResponse` classifies as state-2
+    /// Pending per ADR-0032 §4 — operator-recoverable via the
+    /// existing `retry-submission` command (which writes a fresh
+    /// Attempt-Response pair).
+    ///
+    /// The `invoice.` prefix MUST hold so the per-invoice export
+    /// bundle's (ADR-0009 §8) `invoice.*` glob picks up the new
+    /// entries alongside every other lifecycle entry — same
+    /// silent-omission-failure-mode posture every prior PR's
+    /// prefix-pin test names. PR-19, ADR-0032 §2.
+    InvoiceSubmissionAttemptFailed,
 }
 
 impl EventKind {
@@ -370,6 +426,7 @@ impl EventKind {
             EventKind::InvoiceAnnulmentReceiverConfirmation => {
                 "invoice.annulment_receiver_confirmation"
             }
+            EventKind::InvoiceSubmissionAttemptFailed => "invoice.submission_attempt_failed",
         }
     }
 
@@ -410,6 +467,7 @@ impl EventKind {
             "invoice.annulment_receiver_confirmation" => {
                 Ok(EventKind::InvoiceAnnulmentReceiverConfirmation)
             }
+            "invoice.submission_attempt_failed" => Ok(EventKind::InvoiceSubmissionAttemptFailed),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -446,6 +504,7 @@ mod tests {
             EventKind::InvoiceAnnulmentSubmissionResponse,
             EventKind::InvoiceAnnulmentAckStatus,
             EventKind::InvoiceAnnulmentReceiverConfirmation,
+            EventKind::InvoiceSubmissionAttemptFailed,
         ];
         for v in variants {
             let s = v.as_str();
@@ -673,6 +732,46 @@ mod tests {
         assert_ne!(
             EventKind::InvoiceAnnulmentReceiverConfirmation.as_str(),
             EventKind::InvoiceAnnulmentAckStatus.as_str()
+        );
+    }
+
+    /// PR-19 / ADR-0032 §2: the failure half of the Attempt /
+    /// Response audit pair. The `invoice.` prefix MUST hold so
+    /// the per-invoice export bundle's (ADR-0009 §8) `invoice.*`
+    /// glob picks up the new entries alongside every other
+    /// lifecycle entry — same silent-omission-failure-mode
+    /// posture every prior PR's prefix-pin test names.
+    #[test]
+    fn pr_19_submission_attempt_failed_kind_uses_invoice_prefix() {
+        assert_eq!(
+            EventKind::InvoiceSubmissionAttemptFailed.as_str(),
+            "invoice.submission_attempt_failed"
+        );
+        assert!(EventKind::InvoiceSubmissionAttemptFailed
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// PR-19 / ADR-0032 §2: deliberate fork from the success-side
+    /// `InvoiceSubmissionResponse`. The two outcomes of a
+    /// submission attempt (NAV-acknowledged-with-transactionId vs
+    /// NAV-rejected-or-wire-broken) are operationally distinct
+    /// facts per ADR-0032 §2 + §"Surfaced conflict 2" — pinning
+    /// the discriminator-level distinction here catches a future
+    /// refactor accidentally collapsing the two outcomes onto one
+    /// on-disk string. Same posture
+    /// `pr_13_annulment_kinds_are_distinct_from_invoice_kinds` /
+    /// `pr_15_receiver_confirmation_is_distinct_from_annulment_ack_status`
+    /// use for their respective fork-discipline pins.
+    #[test]
+    fn pr_19_attempt_failed_is_distinct_from_submission_response() {
+        assert_ne!(
+            EventKind::InvoiceSubmissionAttemptFailed.as_str(),
+            EventKind::InvoiceSubmissionResponse.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceSubmissionAttemptFailed.as_str(),
+            EventKind::InvoiceSubmissionAttempt.as_str()
         );
     }
 }

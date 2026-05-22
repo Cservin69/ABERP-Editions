@@ -36,9 +36,13 @@
 //!      Loud-fail with a named-reason message per CLAUDE.md rule 12
 //!      on each rejection.
 //!   5. NAV calls on a tokio current-thread runtime — `tokenExchange`
-//!      + `manageAnnulment` with the same decrypted-token flow as
-//!      `submit_invoice::call_nav`. The `manageAnnulment` operation
-//!      uses the new envelope from PR-13's
+//!      + `manageAnnulment` with the same decrypted-token flow the
+//!      pre-PR-19 `submit_invoice::call_nav` used (the
+//!      manageInvoice-side flow has since been split into prepare +
+//!      send per PR-19 / ADR-0032 §1; the manage-annulment-side
+//!      retains the single-call shape — F40-equivalent finding on
+//!      the annulment side is named-deferred). The `manageAnnulment`
+//!      operation uses the new envelope from PR-13's
 //!      `soap::render_manage_annulment_request`.
 //!   6. Under a single DuckDB transaction, append two audit entries:
 //!      `InvoiceAnnulmentSubmissionAttempt` (verbatim request bytes)
@@ -273,11 +277,15 @@ pub fn run(args: &SubmitAnnulmentArgs) -> Result<()> {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// NAV-side outcome bundle. Private — held distinct from
-// `submit_invoice::NavSubmissionOutcome` so a future
-// manageAnnulment-specific field (e.g. annulment-status hint) does
-// not surface as a silent rename of a shared type. Same posture
-// `retry_submission.rs` takes per CLAUDE.md rule 2.
+// NAV-side outcome bundle. Private — held distinct from the now-
+// removed pre-PR-19 `submit_invoice::NavSubmissionOutcome` so a
+// future manageAnnulment-specific field (e.g. annulment-status hint)
+// does not surface as a silent rename of a shared type. Same posture
+// `retry_submission.rs` takes per CLAUDE.md rule 2 (PR-19 also kept
+// the manageInvoice-side outcome types local to submit_invoice /
+// drain / retry_submission — `ManageInvoiceOutcome` exists in
+// `nav-transport`, but the binary's per-orchestration outcome
+// structs remain duplicated by design).
 // ──────────────────────────────────────────────────────────────────────
 
 struct NavAnnulmentOutcome {

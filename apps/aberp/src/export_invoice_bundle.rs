@@ -564,6 +564,22 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
                 })?;
             Some(payload.response_xml)
         }
+        // PR-19 / ADR-0032 §2: the new failure-side kind carries a
+        // verbatim NAV response body IFF the failure had one
+        // (`http_status` / `application` / `retryable_application`
+        // classes); for `transport` / `envelope` / `credential` /
+        // `client_build` classes the payload's `response_xml` is
+        // `None` and no nav/ file is produced for this entry.
+        EventKind::InvoiceSubmissionAttemptFailed => {
+            let payload: crate::audit_payloads::InvoiceSubmissionAttemptFailedPayload =
+                serde_json::from_slice(&entry.payload).with_context(|| {
+                    format!(
+                        "decode InvoiceSubmissionAttemptFailed payload at seq {}",
+                        entry.seq.as_u64()
+                    )
+                })?;
+            payload.response_xml
+        }
         // Non-NAV-bearing kinds — no nav/ file produced for
         // these. The match is deliberately exhaustive (no
         // `_ => ...` arm) so a future EventKind variant
@@ -1225,7 +1241,7 @@ mod tests {
         let payload = audit_payloads::InvoiceMarkedAbandonedPayload::new(
             "inv_A",
             idem,
-            "TXID-A",
+            Some("TXID-A".to_string()),
             None,
             "test abandon",
         )

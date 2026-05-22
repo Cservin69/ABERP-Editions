@@ -153,6 +153,25 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
+    // 5a. PR-18 / ADR-0031 §5 — pre-allocation hard-cap check.
+    //     A modification burns its own sequence number, so it counts
+    //     against the same ADR-0009 §7 backlog as a fresh invoice.
+    let pending_count = crate::submission_queue::count_pending(
+        &args.db,
+        tenant.clone(),
+        binary_hash_bytes,
+    )
+    .context("count pending submissions (ADR-0031 §5 cap check) for modification")?;
+    if pending_count >= crate::submission_queue::HARD_CAP_PENDING {
+        return Err(anyhow!(
+            "submission queue is full ({}/{} pending invoices per ADR-0009 §7 / ADR-0031 §5); \
+             run `aberp drain-submission-queue --endpoint <test|production> --tax-number ...` \
+             to submit the backlog before issuing a modification",
+            pending_count,
+            crate::submission_queue::HARD_CAP_PENDING,
+        ));
+    }
+
     // 6. Pre-flight precondition: base is Finalized OR already
     //    Amended, and not Storno-cancelled. Read-only ledger; drop
     //    before opening the write transaction.
@@ -183,6 +202,8 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         idempotency_key,
     };
 
+    // PR-18 / ADR-0031 §2: thread --out so the InvoiceDraftCreated
+    // payload records where the modification XML will be written.
     let outcome = run_single_tx(
         conn,
         &ledger_meta,
@@ -191,6 +212,7 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         actor,
         &args.references,
         &args.modification_date,
+        args.out.clone(),
     )?;
 
     let modification = outcome.modification;
@@ -502,6 +524,7 @@ fn run_single_tx(
     actor: Actor,
     base_invoice_id: &str,
     modification_issue_date: &str,
+    nav_xml_path: std::path::PathBuf,
 ) -> Result<TxOutcome> {
     let tx = conn
         .transaction()
@@ -563,10 +586,13 @@ fn run_single_tx(
         )
         .context("audit_ledger::append_in_tx InvoiceSequenceReserved (modification)")?;
 
-        // 2) InvoiceDraftCreated for the MODIFICATION.
-        let draft_payload = audit_payloads::InvoiceDraftCreatedPayload::from_invoice(
+        // 2) InvoiceDraftCreated for the MODIFICATION. PR-18 /
+        //    ADR-0031 §2 — record the operator's --out path on
+        //    the audit payload.
+        let draft_payload = audit_payloads::InvoiceDraftCreatedPayload::from_invoice_with_xml_path(
             &modification_invoice,
             idempotency_key,
+            nav_xml_path,
         );
         audit_ledger::append_in_tx(
             &tx,
@@ -1098,7 +1124,7 @@ mod tests {
         let aban = audit_payloads::InvoiceMarkedAbandonedPayload::new(
             "inv_A",
             idem,
-            "TXID-A",
+            Some("TXID-A".to_string()),
             Some("PROCESSING".to_string()),
             "operator decision",
         );

@@ -170,6 +170,27 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
+    // 4a. PR-18 / ADR-0031 §5 — pre-allocation hard-cap check.
+    //     A storno burns its own sequence number, so it counts
+    //     against the same ADR-0009 §7 backlog as a fresh invoice.
+    //     Loud-fail before any allocator tx opens so the
+    //     sequence-slot invariant is preserved.
+    let pending_count = crate::submission_queue::count_pending(
+        &args.db,
+        tenant.clone(),
+        binary_hash_bytes,
+    )
+    .context("count pending submissions (ADR-0031 §5 cap check) for storno")?;
+    if pending_count >= crate::submission_queue::HARD_CAP_PENDING {
+        return Err(anyhow!(
+            "submission queue is full ({}/{} pending invoices per ADR-0009 §7 / ADR-0031 §5); \
+             run `aberp drain-submission-queue --endpoint <test|production> --tax-number ...` \
+             to submit the backlog before issuing a storno",
+            pending_count,
+            crate::submission_queue::HARD_CAP_PENDING,
+        ));
+    }
+
     // 5. Pre-flight precondition: base must be Finalized (last ack =
     //    SAVED). Open a fresh Ledger for the read; close it before
     //    opening the write transaction so the file lock is released.
@@ -207,6 +228,10 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
 
     // 8. One transaction across base-load + chain-index walk + storno
     //    allocator + three audit-ledger appends.
+    //
+    //    PR-18 / ADR-0031 §2: thread the storno's --out path so the
+    //    InvoiceDraftCreated payload records where the storno XML
+    //    will be written.
     let outcome = run_single_tx(
         conn,
         &ledger_meta,
@@ -214,6 +239,7 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
         idempotency_key,
         actor,
         &args.references,
+        args.out.clone(),
     )?;
 
     let storno = outcome.storno;
@@ -516,6 +542,7 @@ fn run_single_tx(
     idempotency_key: IdempotencyKey,
     actor: Actor,
     base_invoice_id: &str,
+    nav_xml_path: std::path::PathBuf,
 ) -> Result<TxOutcome> {
     let tx = conn
         .transaction()
@@ -581,10 +608,13 @@ fn run_single_tx(
         )
         .context("audit_ledger::append_in_tx InvoiceSequenceReserved (storno)")?;
 
-        // 2) InvoiceDraftCreated for the STORNO.
-        let draft_payload = audit_payloads::InvoiceDraftCreatedPayload::from_invoice(
+        // 2) InvoiceDraftCreated for the STORNO. PR-18 / ADR-0031 §2
+        //    — record the operator's --out path so the drain worker
+        //    can submit without a per-invocation path argument.
+        let draft_payload = audit_payloads::InvoiceDraftCreatedPayload::from_invoice_with_xml_path(
             &storno_invoice,
             idempotency_key,
+            nav_xml_path,
         );
         audit_ledger::append_in_tx(
             &tx,
@@ -1023,7 +1053,7 @@ mod tests {
         let aban = audit_payloads::InvoiceMarkedAbandonedPayload::new(
             "inv_A",
             idem,
-            "TXID-A",
+            Some("TXID-A".to_string()),
             Some("SAVED".to_string()),
             "operator decision",
         );

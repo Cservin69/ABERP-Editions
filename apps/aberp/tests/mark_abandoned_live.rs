@@ -213,7 +213,12 @@ fn mark_abandoned_against_stuck_invoice_end_to_end() {
     let abandoned_payload: InvoiceMarkedAbandonedPayload =
         serde_json::from_slice(&abandoned[0].payload).expect("typed marked-abandoned decode");
     assert_eq!(abandoned_payload.invoice_id, invoice_id);
-    assert_eq!(abandoned_payload.prior_transaction_id, prior_txid);
+    // PR-19 / ADR-0032 §4: prior_transaction_id is now Option<String>.
+    // The state-3 AwaitingAck path (this test) carries Some(txid).
+    assert_eq!(
+        abandoned_payload.prior_transaction_id.as_deref(),
+        Some(prior_txid.as_str())
+    );
     assert!(abandoned_payload.reason.contains("live conformance"));
     assert_eq!(
         abandoned_payload.idempotency_key, issuance_idempotency_key,

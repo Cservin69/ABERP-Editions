@@ -32,6 +32,8 @@
 //! header: "bumping a payload schema renames the kind, and the old
 //! kind remains valid for historical entries").
 
+use std::path::PathBuf;
+
 use aberp_billing::{IdempotencyKey, ReadyInvoice, SequenceReservation};
 use serde::{Deserialize, Serialize};
 
@@ -96,19 +98,72 @@ impl InvoiceSequenceReservedPayload {
 /// just the invoice id and line count — because the full draft
 /// content is reconstructible from the `invoice` + `invoice_line`
 /// tables. The payload is a pointer, not a duplicate.
+///
+/// # `nav_xml_path` (PR-18, ADR-0031 §2)
+///
+/// The on-disk path the binary wrote the NAV InvoiceData XML to
+/// (`issue-invoice --out`, `issue-storno --out`,
+/// `issue-modification --out`). Consumed by the
+/// `drain-submission-queue` worker so it can submit the verbatim
+/// bytes without an operator-provided per-invoice path argument.
+///
+/// `#[serde(default)]` keeps pre-PR-18 entries readable — they
+/// deserialise with `nav_xml_path: None`. The drain worker loud-
+/// fails on `None` entries unless the operator passes a per-
+/// invocation `--xml-path-override` flag (CLAUDE.md rule 12: the
+/// missing-path case is operator-visible, never silent).
+///
+/// Adding the field this way is the additive path the audit-
+/// payloads header explicitly names: "Adding a field is backward-
+/// compatible (older readers see the old shape via
+/// `#[serde(default)]` if they choose to parse)." Removing or
+/// renaming would change the payload's semantic shape and require
+/// a new `EventKind` variant; the additive surface here keeps the
+/// existing `InvoiceDraftCreated` kind unchanged. F12 four-edit
+/// ritual does NOT fire for PR-18.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InvoiceDraftCreatedPayload {
     pub invoice_id: String,
     pub line_count: usize,
     pub idempotency_key: String,
+    /// PR-18 / ADR-0031 §2. NAV InvoiceData XML path the issuing
+    /// binary wrote at `--out` time. `None` for pre-PR-18 entries.
+    #[serde(default)]
+    pub nav_xml_path: Option<String>,
 }
 
 impl InvoiceDraftCreatedPayload {
+    /// Pre-PR-18 constructor — keeps the round-trip test
+    /// (`draft_created_round_trip`) and any future call site that
+    /// has no XML path to record. Sets `nav_xml_path: None`.
     pub fn from_invoice(invoice: &ReadyInvoice, idempotency_key: IdempotencyKey) -> Self {
         Self {
             invoice_id: invoice.id.to_prefixed_string(),
             line_count: invoice.lines.len(),
             idempotency_key: idempotency_key.to_canonical_string(),
+            nav_xml_path: None,
+        }
+    }
+
+    /// PR-18 constructor — populates `nav_xml_path` from the
+    /// `--out` argument the issuing binary received. The three
+    /// issue-* binary call sites (`issue_invoice`, `issue_storno`,
+    /// `issue_modification`) switch to this constructor; the
+    /// path is converted via `Path::to_string_lossy().to_string()`
+    /// at the call site, matching the operator-chosen path on
+    /// disk byte-for-byte except where the OS reports a non-UTF-8
+    /// path (rare; the operator-visible failure surfaces at file-
+    /// read time in the drain worker per CLAUDE.md rule 12).
+    pub fn from_invoice_with_xml_path(
+        invoice: &ReadyInvoice,
+        idempotency_key: IdempotencyKey,
+        nav_xml_path: PathBuf,
+    ) -> Self {
+        Self {
+            invoice_id: invoice.id.to_prefixed_string(),
+            line_count: invoice.lines.len(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            nav_xml_path: Some(nav_xml_path.to_string_lossy().to_string()),
         }
     }
 
@@ -277,19 +332,47 @@ impl InvoiceAckStatusPayload {
 /// exists for this invoice yet (operator retried before running
 /// `poll-ack` — legitimate but unusual; surfaced so a future audit
 /// can see it happened).
+///
+/// # PR-19 / ADR-0032 §4 — state-2 Pending support
+///
+/// `prior_transaction_id` becomes `Option<String>` to carry the
+/// `StuckPrecondition.prior_transaction_id` verbatim from the
+/// precondition walker. State-3 `AwaitingAck` (the existing
+/// PR-8 surface) writes `Some(transaction_id)` from the prior
+/// `InvoiceSubmissionResponse`; state-2 `Pending` (the new
+/// ADR-0032 §4 surface) writes `None` because no
+/// `InvoiceSubmissionResponse` exists yet.
+///
+/// Pre-PR-19 entries deserialise transparently — JSON strings
+/// map to `Some(String)` via serde_json's default `Option<T>`
+/// deserialisation; pre-PR-19 entries always wrote a non-null
+/// string in this field so the round-trip is `String → Some(String)`.
+/// The `#[serde(default)]` attribute is NOT strictly required for
+/// the round-trip path, but is added defensively against any future
+/// entry shape that elides the field entirely.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InvoiceRetryRequestedPayload {
     pub invoice_id: String,
     pub idempotency_key: String,
     /// The NAV `transaction_id` recorded by the most-recent prior
-    /// `InvoiceSubmissionResponse` for this invoice. The retry's own
-    /// `InvoiceSubmissionResponse` will record a fresh `transaction_id`;
-    /// keeping the prior id here makes the unblock decision traceable.
-    pub prior_transaction_id: String,
+    /// `InvoiceSubmissionResponse` for this invoice (`Some` for
+    /// state-3 `AwaitingAck` retries) OR `None` for state-2
+    /// `Pending` retries (no prior `InvoiceSubmissionResponse`
+    /// exists — the prior Attempt's wire either broke or the
+    /// process crashed before TX2 commit per ADR-0032 §1). The
+    /// retry's own `InvoiceSubmissionResponse` (on success) or
+    /// `InvoiceSubmissionAttemptFailed` (on failure) will record
+    /// a fresh outcome regardless of stage; keeping the prior
+    /// id here makes the state-3 unblock decision traceable
+    /// without walking the chain.
+    #[serde(default)]
+    pub prior_transaction_id: Option<String>,
     /// The string form of the most-recent `InvoiceAckStatus` payload's
     /// `ack_status` field for this invoice. `None` if no ack entry
-    /// exists (the operator retried before polling — captured here
-    /// rather than silently elided).
+    /// exists (the operator retried before polling — legitimate;
+    /// or state-2 `Pending` retries — by construction no
+    /// `InvoiceSubmissionResponse` exists so no ack poll could
+    /// have run). Captured here rather than silently elided.
     pub prior_last_ack_status: Option<String>,
     /// Free-form operator-supplied reason for the retry. Required at
     /// the CLI surface so the audit-evidence bundle (ADR-0009 §8)
@@ -301,14 +384,14 @@ impl InvoiceRetryRequestedPayload {
     pub fn new(
         invoice_id: &str,
         idempotency_key: IdempotencyKey,
-        prior_transaction_id: &str,
+        prior_transaction_id: Option<String>,
         prior_last_ack_status: Option<String>,
         reason: &str,
     ) -> Self {
         Self {
             invoice_id: invoice_id.to_string(),
             idempotency_key: idempotency_key.to_canonical_string(),
-            prior_transaction_id: prior_transaction_id.to_string(),
+            prior_transaction_id,
             prior_last_ack_status,
             reason: reason.to_string(),
         }
@@ -331,15 +414,31 @@ impl InvoiceRetryRequestedPayload {
 /// fields by design: an audit-evidence bundle reader treats
 /// "retry-requested" and "marked-abandoned" as paired operator
 /// decisions on the same `SubmissionStuck` precondition surface.
+///
+/// # PR-19 / ADR-0032 §4 — state-2 Pending support
+///
+/// `prior_transaction_id` becomes `Option<String>` matching
+/// [`InvoiceRetryRequestedPayload`]'s shape. State-3 `AwaitingAck`
+/// retains the existing PR-8 `Some(transaction_id)` shape; state-2
+/// `Pending` writes `None` (no prior `InvoiceSubmissionResponse`
+/// exists when an operator marks an Attempt-only invoice abandoned).
+/// Pre-PR-19 entries round-trip as `Some` per serde_json's default
+/// `Option<T>` deserialisation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InvoiceMarkedAbandonedPayload {
     pub invoice_id: String,
     pub idempotency_key: String,
     /// The NAV `transaction_id` recorded by the most-recent prior
-    /// `InvoiceSubmissionResponse` for this invoice. There is no
-    /// further `InvoiceSubmissionResponse` after this entry — the
-    /// invoice's audit chain is terminal-by-operator-decision.
-    pub prior_transaction_id: String,
+    /// `InvoiceSubmissionResponse` for this invoice (`Some` for
+    /// state-3 `AwaitingAck` abandonments — the existing PR-8 shape)
+    /// OR `None` for state-2 `Pending` abandonments (no
+    /// `InvoiceSubmissionResponse` exists; the prior Attempt's wire
+    /// either broke or the process crashed before TX2 commit per
+    /// ADR-0032 §1). There is no further `InvoiceSubmissionResponse`
+    /// after this entry — the invoice's audit chain is
+    /// terminal-by-operator-decision regardless of stage.
+    #[serde(default)]
+    pub prior_transaction_id: Option<String>,
     pub prior_last_ack_status: Option<String>,
     pub reason: String,
 }
@@ -348,16 +447,128 @@ impl InvoiceMarkedAbandonedPayload {
     pub fn new(
         invoice_id: &str,
         idempotency_key: IdempotencyKey,
-        prior_transaction_id: &str,
+        prior_transaction_id: Option<String>,
         prior_last_ack_status: Option<String>,
         reason: &str,
     ) -> Self {
         Self {
             invoice_id: invoice_id.to_string(),
             idempotency_key: idempotency_key.to_canonical_string(),
-            prior_transaction_id: prior_transaction_id.to_string(),
+            prior_transaction_id,
             prior_last_ack_status,
             reason: reason.to_string(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// InvoiceSubmissionAttemptFailed  (PR-19 / ADR-0032 §2 — failure half
+// of the Attempt/Response audit pair under the two-tx posture per
+// ADR-0032 §1. Written in TX2 of `submit-invoice` / `retry-submission`
+// / `drain-submission-queue` when the NAV call returns an error
+// instead of `InvoiceSubmissionResponse`. Closes F40 at the
+// issuing-path level.)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceSubmissionAttemptFailed`].
+///
+/// Carries the failure-class discriminator + the operator-visible
+/// error message + the verbatim response body (when one was received
+/// before the error fired). The bundle reader (ADR-0009 §8) sees the
+/// preceding `InvoiceSubmissionAttempt` (with the request bytes) and
+/// this entry (with the failure-class + the response bytes if any)
+/// as the paired evidence record for one failed submission attempt.
+///
+/// # Error class enumeration (ADR-0032 §2)
+///
+/// The `error_class` field is one of:
+///
+///   - `"transport"` — TLS / DNS / socket failure (the wire broke;
+///     NAV may or may not have processed the submission). The
+///     residual that motivates the deferred Layer-2 `queryInvoiceCheck`
+///     surface per ADR-0009 §5 + ADR-0032 §"Open questions".
+///   - `"http_status"` — non-2xx HTTP response from NAV. `error_code`
+///     carries the status as decimal string; `response_xml` carries
+///     the body NAV returned (if any).
+///   - `"application"` — NAV-side non-retryable application error
+///     (`INVALID_SECURITY_USER`, `SCHEMA_VIOLATION`, etc. per
+///     ADR-0009 §5). `error_code` carries the NAV `funcCode` /
+///     `errorCode` string.
+///   - `"retryable_application"` — NAV-side retryable application
+///     error (`OPERATION_FAILED`, HTTP 504 per ADR-0009 §5).
+///     `error_code` carries the NAV code.
+///   - `"envelope"` — envelope construction failure (rare; indicates
+///     a programmer error or upstream quick-xml change). No
+///     `error_code`; no `response_xml`.
+///   - `"credential"` — keychain access failure
+///     (`KeychainItemMissing` / `KeychainBackend`). No `error_code`;
+///     no `response_xml`.
+///   - `"client_build"` — reqwest::Client construction failure. No
+///     `error_code`; no `response_xml`.
+///
+/// The classification is deterministic (CLAUDE.md rule 5) and lives
+/// next to the existing `submission_queue::is_transport_error` helper
+/// in `submission_queue::classify_attempt_failure`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceSubmissionAttemptFailedPayload {
+    /// Prefixed `inv_<ULID>` form — same shape as every other
+    /// invoice-bearing payload.
+    pub invoice_id: String,
+    /// F8 idempotency key carry-forward — same canonical form as
+    /// every other NAV-related entry for this invoice.
+    pub idempotency_key: String,
+    /// `"test"` or `"production"` — same shape as
+    /// [`InvoiceSubmissionAttemptPayload`]'s `endpoint` field. The
+    /// audit-evidence bundle (ADR-0009 §8) needs the environment
+    /// explicit for inspector triage.
+    pub endpoint: String,
+    /// Failure-class discriminator per the enumeration above. Read
+    /// by the bundle reader for diagnosis; not used for routing
+    /// (the bundle filter is by EventKind alone per ADR-0009 §8).
+    pub error_class: String,
+    /// NAV error code (for `application` / `retryable_application`)
+    /// or HTTP status as decimal string (for `http_status`) or
+    /// `None` (for `transport` / `envelope` / `credential` /
+    /// `client_build` — no NAV-side code exists at those layers).
+    pub error_code: Option<String>,
+    /// Operator-visible error message — the
+    /// `NavTransportError::Display` rendering of the failure.
+    /// Never includes secret material per the
+    /// `NavTransportError::Display` implementation discipline
+    /// (ADR-0020 §3).
+    pub error_message: String,
+    /// Verbatim response bytes IF a response body was received
+    /// before the error fired (typical for `http_status` /
+    /// `application` / `retryable_application` classes — NAV's
+    /// error response body carries the `<funcCode>` + `<errorCode>`
+    /// + `<message>` triple the bundle reader uses for diagnosis).
+    /// `None` for `transport` / `envelope` / `credential` /
+    /// `client_build` classes where no response body exists.
+    pub response_xml: Option<Vec<u8>>,
+}
+
+impl InvoiceSubmissionAttemptFailedPayload {
+    pub fn new(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        endpoint: &'static str,
+        error_class: &'static str,
+        error_code: Option<String>,
+        error_message: String,
+        response_xml: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            endpoint: endpoint.to_string(),
+            error_class: error_class.to_string(),
+            error_code,
+            error_message,
+            response_xml,
         }
     }
 
@@ -1077,6 +1288,60 @@ mod tests {
 
         // The line_count must match the fixture's line count exactly.
         assert_eq!(decoded.line_count, 2);
+        // PR-18 / ADR-0031 §2: the pre-PR-18 constructor leaves
+        // nav_xml_path: None. The drain worker treats None as the
+        // operator-must-supply-override case.
+        assert_eq!(decoded.nav_xml_path, None);
+    }
+
+    /// PR-18 / ADR-0031 §2 — the with-xml-path constructor populates
+    /// `nav_xml_path: Some(...)` and round-trips cleanly. CLAUDE.md
+    /// rule 9: this test pins the new constructor's intent (the
+    /// drain worker keys on the value of this field), not just its
+    /// shape — without it a future regression flattening
+    /// `from_invoice_with_xml_path` back into `from_invoice` would
+    /// pass the existing `draft_created_round_trip` but break drain.
+    #[test]
+    fn draft_created_with_xml_path_round_trip() {
+        use std::path::PathBuf;
+        let invoice = fixture_invoice();
+        let idem = IdempotencyKey::new();
+        let path = PathBuf::from("/tmp/out/inv_01J0.xml");
+        let original = InvoiceDraftCreatedPayload::from_invoice_with_xml_path(
+            &invoice,
+            idem,
+            path.clone(),
+        );
+        let bytes = original.to_bytes();
+
+        let decoded: InvoiceDraftCreatedPayload =
+            serde_json::from_slice(&bytes).expect("decode must succeed");
+        assert_eq!(decoded, original);
+        assert_eq!(
+            decoded.nav_xml_path.as_deref(),
+            Some("/tmp/out/inv_01J0.xml")
+        );
+    }
+
+    /// PR-18 / ADR-0031 §2 — pre-PR-18 serialized form (no
+    /// `nav_xml_path` field at all) MUST deserialise cleanly with
+    /// `nav_xml_path: None`. The `#[serde(default)]` attribute is
+    /// the load-bearing posture; this test pins it. A future
+    /// regression removing the attribute would surface here, not
+    /// at runtime on a real pre-PR-18 ledger.
+    #[test]
+    fn draft_created_deserialises_pre_pr_18_bytes_without_xml_path_field() {
+        let pre_pr_18 = br#"{
+            "invoice_id": "inv_01J0",
+            "line_count": 2,
+            "idempotency_key": "idem_01J0"
+        }"#;
+        let decoded: InvoiceDraftCreatedPayload =
+            serde_json::from_slice(pre_pr_18).expect("pre-PR-18 form must deserialise");
+        assert_eq!(decoded.invoice_id, "inv_01J0");
+        assert_eq!(decoded.line_count, 2);
+        assert_eq!(decoded.idempotency_key, "idem_01J0");
+        assert_eq!(decoded.nav_xml_path, None);
     }
 
     // ── PR-7-B-3 NAV-submission payload round-trips ─────────────────
@@ -1172,7 +1437,7 @@ mod tests {
         let payload = InvoiceRetryRequestedPayload::new(
             "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
             idem,
-            "txid-with-\"-quote-and-\\-backslash",
+            Some("txid-with-\"-quote-and-\\-backslash".to_string()),
             Some("PROCESSING".to_string()),
             "operator note: \"customer X\" insists on resubmit \\ urgent",
         );
@@ -1196,7 +1461,7 @@ mod tests {
         let payload = InvoiceRetryRequestedPayload::new(
             "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
             idem,
-            "prior-txid",
+            Some("prior-txid".to_string()),
             None,
             "no prior poll — operator retried directly",
         );
@@ -1205,6 +1470,60 @@ mod tests {
             serde_json::from_slice(&bytes).expect("typed decode");
         assert_eq!(decoded, payload);
         assert!(decoded.prior_last_ack_status.is_none());
+    }
+
+    /// PR-19 / ADR-0032 §4: `InvoiceRetryRequestedPayload` accepts
+    /// `prior_transaction_id = None` — the state-2 Pending retry
+    /// shape. Captures the case where the prior Attempt's wire broke
+    /// (or the process crashed before TX2 commit per ADR-0032 §1) so
+    /// no `InvoiceSubmissionResponse` exists yet. CLAUDE.md rule 9:
+    /// the round-trip pins the wire shape so a future serde refactor
+    /// that drops `Option`-ness from the field surfaces here, not
+    /// silently in production audit bytes.
+    #[test]
+    fn retry_requested_accepts_none_prior_transaction_id_for_state_2() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceRetryRequestedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            None,
+            None,
+            "state-2 Pending retry — prior Attempt's wire broke before NAV responded",
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceRetryRequestedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert!(decoded.prior_transaction_id.is_none());
+        assert!(decoded.prior_last_ack_status.is_none());
+    }
+
+    /// PR-19 / ADR-0032 §4: pre-PR-19 `InvoiceRetryRequestedPayload`
+    /// bytes (where `prior_transaction_id` was a bare `String`,
+    /// not `Option<String>`) deserialise transparently into the new
+    /// `Option<String>` shape as `Some(...)`. Pins the serde
+    /// backward-compat contract so a future refactor that breaks
+    /// the round-trip surface here, not silently against historical
+    /// ledger entries.
+    #[test]
+    fn retry_requested_deserialises_pre_pr_19_string_bytes_as_some() {
+        // Build the pre-PR-19 wire shape by hand — JSON string for
+        // `prior_transaction_id`, no `Option` discriminator. The
+        // serde_json default for `Option<String>` parses a string
+        // as `Some(String)`.
+        let pre_pr_19_bytes = br#"{
+            "invoice_id":"inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "idempotency_key":"idem_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "prior_transaction_id":"TXID-PR-7-B-3",
+            "prior_last_ack_status":"PROCESSING",
+            "reason":"pre-PR-19 retry"
+        }"#;
+        let decoded: InvoiceRetryRequestedPayload =
+            serde_json::from_slice(pre_pr_19_bytes).expect("typed decode");
+        assert_eq!(
+            decoded.prior_transaction_id.as_deref(),
+            Some("TXID-PR-7-B-3")
+        );
     }
 
     /// `InvoiceMarkedAbandonedPayload` round-trips clean with hostile
@@ -1216,7 +1535,7 @@ mod tests {
         let payload = InvoiceMarkedAbandonedPayload::new(
             "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
             idem,
-            "prior-txid",
+            Some("prior-txid".to_string()),
             Some("RECEIVED".to_string()),
             "abandoned: NAV inspector said issue corrective \"new\" invoice instead",
         );
@@ -1227,6 +1546,151 @@ mod tests {
             serde_json::from_slice(&bytes).expect("typed decode");
         assert_eq!(decoded, payload);
         assert!(decoded.idempotency_key.starts_with("idem_"));
+    }
+
+    /// PR-19 / ADR-0032 §4: `InvoiceMarkedAbandonedPayload` accepts
+    /// `prior_transaction_id = None` — the state-2 Pending
+    /// abandonment shape. The operator marks an Attempt-only invoice
+    /// abandoned; no `InvoiceSubmissionResponse` exists yet so the
+    /// prior transaction id is `None`.
+    #[test]
+    fn marked_abandoned_accepts_none_prior_transaction_id_for_state_2() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceMarkedAbandonedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            None,
+            None,
+            "state-2 Pending abandonment — operator gives up after multiple AttemptFailed",
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceMarkedAbandonedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert!(decoded.prior_transaction_id.is_none());
+    }
+
+    /// PR-19 / ADR-0032 §4: pre-PR-19 `InvoiceMarkedAbandonedPayload`
+    /// bytes deserialise transparently into the new `Option<String>`
+    /// shape as `Some(...)`. Mirror of
+    /// `retry_requested_deserialises_pre_pr_19_string_bytes_as_some`.
+    #[test]
+    fn marked_abandoned_deserialises_pre_pr_19_string_bytes_as_some() {
+        let pre_pr_19_bytes = br#"{
+            "invoice_id":"inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "idempotency_key":"idem_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "prior_transaction_id":"TXID-PR-8",
+            "prior_last_ack_status":"ABORTED",
+            "reason":"pre-PR-19 abandonment"
+        }"#;
+        let decoded: InvoiceMarkedAbandonedPayload =
+            serde_json::from_slice(pre_pr_19_bytes).expect("typed decode");
+        assert_eq!(decoded.prior_transaction_id.as_deref(), Some("TXID-PR-8"));
+    }
+
+    /// PR-19 / ADR-0032 §2: `InvoiceSubmissionAttemptFailedPayload`
+    /// round-trips clean for every documented `error_class`. CLAUDE.md
+    /// rule 9: the round-trip pins both the wire shape AND the
+    /// classifier's enumeration vocabulary; a future refactor that
+    /// renames `"transport"` to `"net"` (or similar) surfaces here.
+    #[test]
+    fn attempt_failed_round_trips_for_transport_class() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceSubmissionAttemptFailedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "test",
+            "transport",
+            None,
+            "manageInvoice HTTP call failed: connection reset".to_string(),
+            None,
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceSubmissionAttemptFailedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.error_class, "transport");
+        assert!(decoded.error_code.is_none());
+        assert!(decoded.response_xml.is_none());
+    }
+
+    /// PR-19 / ADR-0032 §2: an `application`-class failure carries
+    /// the NAV error code + the verbatim response body. The bundle
+    /// reader pulls `funcCode` / `errorCode` / `message` from the
+    /// response body for inspector triage.
+    #[test]
+    fn attempt_failed_round_trips_for_application_class() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceSubmissionAttemptFailedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "production",
+            "application",
+            Some("INVALID_SECURITY_USER".to_string()),
+            "manageInvoice non-retryable error: INVALID_SECURITY_USER — bad credentials"
+                .to_string(),
+            Some(b"<ManageInvoiceResponse>...</ManageInvoiceResponse>".to_vec()),
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceSubmissionAttemptFailedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.error_class, "application");
+        assert_eq!(
+            decoded.error_code.as_deref(),
+            Some("INVALID_SECURITY_USER")
+        );
+        assert!(decoded.response_xml.is_some());
+    }
+
+    /// PR-19 / ADR-0032 §2: an `http_status`-class failure carries
+    /// the HTTP status as decimal string in `error_code` + the
+    /// verbatim response body. Pinned distinctly from `application`
+    /// because NAV returns a body for 5xx replies too.
+    #[test]
+    fn attempt_failed_round_trips_for_http_status_class() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceSubmissionAttemptFailedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "test",
+            "http_status",
+            Some("503".to_string()),
+            "manageInvoice returned non-success HTTP status: 503".to_string(),
+            Some(b"<html>Service Unavailable</html>".to_vec()),
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceSubmissionAttemptFailedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.error_class, "http_status");
+        assert_eq!(decoded.error_code.as_deref(), Some("503"));
+    }
+
+    /// PR-19 / ADR-0032 §2: hostile bytes in `error_message`
+    /// (operator-facing NAV diagnostic with quote / backslash /
+    /// non-ASCII) round-trip clean through the typed-struct path.
+    /// Same F9 trap-closing posture as the hostile-reason tests on
+    /// the operator-decision payloads.
+    #[test]
+    fn attempt_failed_round_trips_with_hostile_error_message() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceSubmissionAttemptFailedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "test",
+            "application",
+            Some("SCHEMA_VIOLATION".to_string()),
+            "NAV said: \"<invoiceMain>\" has \\bad shape; \u{00e1}rv\u{00ed}zt\u{0151}r\u{0151} test"
+                .to_string(),
+            Some(b"<response>...</response>".to_vec()),
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceSubmissionAttemptFailedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
     }
 
     // ── PR-10 storno-chain payload round-trips (ADR-0023 §3) ────────

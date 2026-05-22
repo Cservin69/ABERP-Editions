@@ -249,7 +249,12 @@ fn retry_submission_against_api_test_end_to_end() {
         serde_json::from_slice(&retry_requested[0].payload)
             .expect("typed retry-requested payload decode");
     assert_eq!(retry_payload.invoice_id, invoice_id);
-    assert_eq!(retry_payload.prior_transaction_id, prior_txid);
+    // PR-19 / ADR-0032 §4: prior_transaction_id is now Option<String>.
+    // The state-3 AwaitingAck path (this test) carries Some(txid).
+    assert_eq!(
+        retry_payload.prior_transaction_id.as_deref(),
+        Some(prior_txid.as_str())
+    );
     assert!(retry_payload.reason.contains("live conformance"));
     assert_eq!(
         retry_payload.idempotency_key, issuance_idempotency_key,

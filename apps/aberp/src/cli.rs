@@ -373,6 +373,55 @@ pub enum Command {
     /// clobbering.
     ExportInvoiceBundle(ExportInvoiceBundleArgs),
 
+    /// Drain the offline submission queue per ADR-0009 §7 /
+    /// ADR-0031 (PR-18). Walks the audit ledger, classifies every
+    /// invoice with `InvoiceDraftCreated` but no
+    /// `InvoiceSubmissionResponse` / `InvoiceMarkedAbandoned` as
+    /// `pending`, and submits them to NAV in FIFO order by issue
+    /// date.
+    ///
+    /// **Per-invoice pipeline:** read the NAV InvoiceData XML
+    /// from the recorded path (per ADR-0031 §2 — populated by
+    /// `issue-*` since PR-18) OR from a per-invocation
+    /// `--xml-path-override <invoice-id>=<path>` mapping for
+    /// pre-PR-18 entries; validate via the NAV v3.0 invariant
+    /// check (ADR-0022, same gate every `submit-*` runs); call
+    /// `tokenExchange` + `manageInvoice` per ADR-0009 §4; write
+    /// `InvoiceSubmissionAttempt` + `InvoiceSubmissionResponse`
+    /// audit entries under one DuckDB transaction; verify the
+    /// audit chain; sync the audit-ledger mirror file per
+    /// ADR-0030 §2; print the per-invoice OK line.
+    ///
+    /// **Offline detection** (ADR-0031 §4). Drain stops on the
+    /// first NAV TRANSPORT-layer error (HTTP / TLS / DNS); the
+    /// remaining pending invoices stay pending for the next
+    /// drain run. NAV-side APPLICATION errors (non-success HTTP
+    /// status, response-parse failures, credential errors) DO
+    /// NOT stop the drain — drain surfaces the per-invoice
+    /// failure LOUD and continues to the next invoice.
+    ///
+    /// **Alert thresholds** (ADR-0031 §6). Before the loop body,
+    /// drain prints a WARN if `pending.len() >= 5` OR the
+    /// oldest pending invoice's issue date is more than 30
+    /// minutes ago. Non-control-flow; the hard cap of 50 lives
+    /// in `issue-invoice` (ADR-0031 §5).
+    ///
+    /// **What this command does NOT do:**
+    ///
+    ///   - It does NOT process `SubmissionStuck` invoices.
+    ///     `retry-submission` is the operator-confirmed path
+    ///     for post-submission stuck invoices.
+    ///   - It does NOT enforce the ADR-0009 §7 24h soft /
+    ///     72h hard submission deadlines. Deferred per ADR-0031
+    ///     §7 (F41 named-trigger).
+    ///   - It does NOT write a per-attempt audit entry on a
+    ///     failed NAV call. Deferred per ADR-0031 §7 (F40 named-
+    ///     trigger).
+    ///   - It does NOT call NAV for credential setup. Per the
+    ///     `submit-*` family's posture, NAV credentials are
+    ///     loaded once at the start.
+    DrainSubmissionQueue(DrainSubmissionQueueArgs),
+
     /// Request a NAV-side technical annulment of a prior data
     /// submission against an invoice (ADR-0009 §6, ADR-0025; PR-12).
     /// A technical annulment **withdraws** the data submission to
@@ -995,6 +1044,61 @@ pub struct ExportInvoiceBundleArgs {
     /// `mark-abandoned` / `request-technical-annulment`.)
     #[arg(long, default_value = "default")]
     pub tenant: String,
+}
+
+/// Args for `aberp drain-submission-queue` (PR-18, ADR-0031 §3).
+///
+/// Five-plus-two fields. The five mirror every other NAV-touching
+/// subcommand (`--tax-number`, `--tenant`, `--db`, `--endpoint`,
+/// implicit per-invocation actor); the two extra are
+/// `--xml-path-override` (repeatable; rescues pre-PR-18 entries
+/// whose audit payload lacks `nav_xml_path`) and `--max-invoices`
+/// (bounds the per-run wall-clock; default unbounded = whole queue).
+#[derive(Debug, Parser)]
+pub struct DrainSubmissionQueueArgs {
+    /// Hungarian tax number of the submitter. Same accepted forms +
+    /// parser as `submit-invoice` (`12345678`, `12345678-1`,
+    /// `12345678-1-42`); only the 8-digit base goes to NAV per
+    /// ADR-0009 §4.
+    #[arg(long = "tax-number")]
+    pub tax_number: String,
+
+    /// Path to the tenant DuckDB file.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives both the audit-ledger genesis
+    /// hash and the keychain service-name lookup
+    /// (`aberp.nav.<tenant>`).
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Which NAV environment to submit against. No default —
+    /// explicit per ADR-0020 §1 (same posture as every other
+    /// `submit-*` / `poll-*` command).
+    #[arg(long, value_enum)]
+    pub endpoint: NavEnv,
+
+    /// Per-invocation rescue mapping for pending invoices whose
+    /// `InvoiceDraftCreatedPayload.nav_xml_path` is `None` (i.e.
+    /// pre-PR-18 entries). Format: `<invoice-id>=<path>`. Repeatable
+    /// (`--xml-path-override inv_X=/p/X.xml --xml-path-override
+    /// inv_Y=/p/Y.xml`). The mapping takes precedence over the
+    /// recorded path; this lets an operator drain a recovered
+    /// backup with a different on-disk layout (`/Volumes/Backup/...`
+    /// instead of `/Users/.../Documents/...`). Loud-fail per
+    /// CLAUDE.md rule 12 if both the recorded path is `None` AND no
+    /// override is supplied for the invoice id in question.
+    #[arg(long = "xml-path-override")]
+    pub xml_path_overrides: Vec<String>,
+
+    /// Bound the number of invoices the drain submits in this run.
+    /// `0` (default) means unbounded — drain the entire queue. Use
+    /// a non-zero value when the operator wants to inspect the
+    /// progress after a few invoices (e.g., the first NAV-testbed
+    /// drain on a backlog).
+    #[arg(long = "max-invoices", default_value_t = 0)]
+    pub max_invoices: usize,
 }
 
 #[derive(Debug, Parser)]

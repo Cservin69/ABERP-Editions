@@ -64,6 +64,7 @@ use crate::audit_payloads;
 use crate::binary_hash;
 use crate::cli::IssueInvoiceArgs;
 use crate::nav_xml::{self, CustomerInfo, NavParties, SupplierInfo};
+use crate::submission_queue;
 
 // ──────────────────────────────────────────────────────────────────────
 // Input JSON shape (NAV-aligned per Ervin's preference, session 5)
@@ -169,6 +170,36 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
+    // 4a. PR-18 / ADR-0031 §5 — pre-allocation hard-cap check
+    //     against the offline submission queue. Refuses fresh
+    //     allocation when the ledger already shows the
+    //     `HARD_CAP_PENDING` threshold of unsubmitted invoices.
+    //     Loud-fail per CLAUDE.md rule 12 BEFORE the allocator
+    //     tx opens so the sequence-slot invariant (ADR-0009 §3)
+    //     is preserved. The check opens + drops its own Ledger
+    //     handle; pre_tx_setup below opens a fresh Connection.
+    let pending_count = submission_queue::count_pending(
+        &args.db,
+        tenant.clone(),
+        binary_hash_bytes,
+    )
+    .context("count pending submissions (ADR-0031 §5 cap check)")?;
+    if pending_count >= submission_queue::HARD_CAP_PENDING {
+        return Err(anyhow!(
+            "submission queue is full ({}/{} pending invoices per ADR-0009 §7 / ADR-0031 §5); \
+             run `aberp drain-submission-queue --endpoint <test|production> --tax-number ...` \
+             to submit the backlog, or `aberp mark-abandoned --invoice-id <id> --reason ...` \
+             on invoices the operator has decided not to submit",
+            pending_count,
+            submission_queue::HARD_CAP_PENDING,
+        ));
+    }
+    tracing::info!(
+        pending_count = pending_count,
+        cap = submission_queue::HARD_CAP_PENDING,
+        "ADR-0031 §5 cap check passed"
+    );
+
     // 5–6. Pre-tx setup: schemas + series.
     let (conn, series) = pre_tx_setup(&args.db, &series_code)?;
 
@@ -192,7 +223,20 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
     // 8. One transaction across the billing writes and audit appends.
     //    `run_single_tx` owns the tx lifecycle: it commits on Ok and
     //    relies on `Transaction::drop` for rollback on Err or panic.
-    let outcome = run_single_tx(conn, &ledger_meta, allocate_args, idempotency_key, actor)?;
+    //
+    //    PR-18 / ADR-0031 §2: the operator-chosen `--out` path is
+    //    threaded into `run_single_tx` so the InvoiceDraftCreated
+    //    payload's new `nav_xml_path` field records where the XML
+    //    will be written. The drain worker consumes this at submit
+    //    time without requiring an operator-supplied path argument.
+    let outcome = run_single_tx(
+        conn,
+        &ledger_meta,
+        allocate_args,
+        idempotency_key,
+        actor,
+        args.out.clone(),
+    )?;
 
     let invoice = outcome.invoice;
     let is_fresh = outcome.was_fresh;
@@ -336,6 +380,7 @@ fn run_single_tx(
     allocate_args: AllocateArgs,
     idempotency_key: IdempotencyKey,
     actor: Actor,
+    nav_xml_path: std::path::PathBuf,
 ) -> Result<TxOutcome> {
     let tx = conn
         .transaction()
@@ -383,8 +428,14 @@ fn run_single_tx(
         )
         .context("audit_ledger::append_in_tx InvoiceSequenceReserved")?;
 
-        let draft_payload =
-            audit_payloads::InvoiceDraftCreatedPayload::from_invoice(&invoice, idempotency_key);
+        // PR-18 / ADR-0031 §2 — record the operator's --out path on
+        // the audit payload so the drain worker can submit without
+        // a per-invocation path argument.
+        let draft_payload = audit_payloads::InvoiceDraftCreatedPayload::from_invoice_with_xml_path(
+            &invoice,
+            idempotency_key,
+            nav_xml_path,
+        );
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
