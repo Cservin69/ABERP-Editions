@@ -1,7 +1,8 @@
 //! Typed NAV operations: `tokenExchange` (PR-7-B-2), `manageInvoice`
 //! (PR-7-B-3), `queryTransactionStatus` (PR-7-C-1),
-//! `manageAnnulment` (PR-13 / ADR-0026 §3), and `queryInvoiceData`
-//! (PR-15 / ADR-0028 §3).
+//! `manageAnnulment` (PR-13 / ADR-0026 §3), `queryInvoiceData`
+//! (PR-15 / ADR-0028 §3), and `queryInvoiceCheck` (PR-20 /
+//! ADR-0033 §3).
 //!
 //! All three operations share the same flow shape:
 //!
@@ -49,6 +50,17 @@
 //!     ADR-0028 §"Surfaced conflict 3"; the audit-evidence-bundle
 //!     reader inspects `response_xml` to determine receiver-
 //!     confirmation state.
+//!   - `query_invoice_check::build_request` /
+//!     `query_invoice_check::send_built_request` are the
+//!     `build_request` + `send_built_request` split for
+//!     `queryInvoiceCheck` per ADR-0033 §3 (no backward-compat
+//!     `call` wrapper because this is a brand-new operation
+//!     with no pre-existing callers). The `send_built_request`
+//!     outcome carries a parsed boolean `check_result` (which
+//!     the binary's `retry-submission` state-2 branch maps to
+//!     `QueryInvoiceCheckOutcome::Exists` / `Absent` and
+//!     records on the new `InvoiceCheckPerformedPayload`)
+//!     plus the verbatim response bytes for the audit ledger.
 //!
 //! None of these operations write to the audit ledger directly — the
 //! binary is responsible for that per ADR-0008 §Storage. These
@@ -62,6 +74,7 @@ use crate::error::NavTransportError;
 
 pub mod manage_annulment;
 pub mod manage_invoice;
+pub mod query_invoice_check;
 pub mod query_invoice_data;
 pub mod query_transaction_status;
 pub mod token_exchange;

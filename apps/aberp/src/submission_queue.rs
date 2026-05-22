@@ -326,44 +326,54 @@ pub fn is_transport_error(err: &NavTransportError) -> bool {
 /// (the function is total).
 pub fn classify_attempt_failure(err: &NavTransportError) -> (&'static str, Option<String>) {
     match err {
-        // Transport classes (the wire broke).
+        // Transport classes (the wire broke). PR-20 / ADR-0033 §5
+        // adds the queryInvoiceCheck variant; same shape.
         NavTransportError::TokenExchangeHttp(_)
         | NavTransportError::ManageInvoiceHttp(_)
         | NavTransportError::QueryTransactionStatusHttp(_)
         | NavTransportError::ManageAnnulmentHttp(_)
-        | NavTransportError::QueryInvoiceDataHttp(_) => ("transport", None),
+        | NavTransportError::QueryInvoiceDataHttp(_)
+        | NavTransportError::QueryInvoiceCheckHttp(_) => ("transport", None),
 
-        // HTTP-status classes (NAV returned non-2xx).
+        // HTTP-status classes (NAV returned non-2xx). PR-20 /
+        // ADR-0033 §5 adds the queryInvoiceCheck variant.
         NavTransportError::TokenExchangeHttpStatus { status }
         | NavTransportError::ManageInvoiceHttpStatus { status }
         | NavTransportError::QueryTransactionStatusHttpStatus { status }
         | NavTransportError::ManageAnnulmentHttpStatus { status }
-        | NavTransportError::QueryInvoiceDataHttpStatus { status } => {
+        | NavTransportError::QueryInvoiceDataHttpStatus { status }
+        | NavTransportError::QueryInvoiceCheckHttpStatus { status } => {
             ("http_status", Some(status.to_string()))
         }
 
         // Application-class non-retryable (NAV-side error code).
+        // PR-20 / ADR-0033 §5 adds the queryInvoiceCheck variant.
         NavTransportError::ManageInvoiceNonRetryable { code, .. }
         | NavTransportError::QueryTransactionStatusNonRetryable { code, .. }
         | NavTransportError::ManageAnnulmentNonRetryable { code, .. }
-        | NavTransportError::QueryInvoiceDataNonRetryable { code, .. } => {
+        | NavTransportError::QueryInvoiceDataNonRetryable { code, .. }
+        | NavTransportError::QueryInvoiceCheckNonRetryable { code, .. } => {
             ("application", Some(code.clone()))
         }
 
         // Application-class retryable (NAV-side OPERATION_FAILED / 504).
+        // PR-20 / ADR-0033 §5 adds the queryInvoiceCheck variant.
         NavTransportError::ManageInvoiceRetryable { code, .. }
         | NavTransportError::QueryTransactionStatusRetryable { code, .. }
         | NavTransportError::ManageAnnulmentRetryable { code, .. }
-        | NavTransportError::QueryInvoiceDataRetryable { code, .. } => {
+        | NavTransportError::QueryInvoiceDataRetryable { code, .. }
+        | NavTransportError::QueryInvoiceCheckRetryable { code, .. } => {
             ("retryable_application", Some(code.clone()))
         }
 
         // Application-class response-parse (NAV body unparseable).
+        // PR-20 / ADR-0033 §5 adds the queryInvoiceCheck variant.
         NavTransportError::TokenExchangeResponseParse(_)
         | NavTransportError::ManageInvoiceResponseParse(_)
         | NavTransportError::QueryTransactionStatusResponseParse(_)
         | NavTransportError::ManageAnnulmentResponseParse(_)
-        | NavTransportError::QueryInvoiceDataResponseParse(_) => ("application", None),
+        | NavTransportError::QueryInvoiceDataResponseParse(_)
+        | NavTransportError::QueryInvoiceCheckResponseParse(_) => ("application", None),
 
         // Application-class token-decoding failures (NAV bytes failed
         // local decrypt / base64 / length checks). These are NAV-side
@@ -805,6 +815,67 @@ mod tests {
     #[test]
     fn classify_attempt_failure_classifies_token_decode_as_application() {
         let err = NavTransportError::TokenExchangeBase64Decode("bad base64".to_string());
+        let (class, code) = classify_attempt_failure(&err);
+        assert_eq!(class, "application");
+        assert!(code.is_none());
+    }
+
+    /// PR-20 / ADR-0033 §5: `QueryInvoiceCheckHttpStatus` →
+    /// ("http_status", Some(status)). The Layer-2 disambiguation
+    /// surface's HTTP-status failures classify the same as
+    /// manageInvoice / queryInvoiceData HTTP-status failures.
+    /// CLAUDE.md rule 9: pins the new arm explicitly so a future
+    /// refactor that drops one of the five queryInvoiceCheck
+    /// variants from `classify_attempt_failure` would surface
+    /// here, not at the first failed Layer-2 retry.
+    #[test]
+    fn classify_attempt_failure_classifies_query_invoice_check_http_status_as_http_status() {
+        let err = NavTransportError::QueryInvoiceCheckHttpStatus { status: 503 };
+        let (class, code) = classify_attempt_failure(&err);
+        assert_eq!(class, "http_status");
+        assert_eq!(code.as_deref(), Some("503"));
+    }
+
+    /// PR-20 / ADR-0033 §5: `QueryInvoiceCheckNonRetryable` →
+    /// ("application", Some(code)). The NAV-side error code
+    /// threads through to the `InvoiceCheckPerformedPayload.failure_code`
+    /// field for inspector triage.
+    #[test]
+    fn classify_attempt_failure_classifies_query_invoice_check_non_retryable_as_application() {
+        let err = NavTransportError::QueryInvoiceCheckNonRetryable {
+            code: "INVALID_SECURITY_USER".to_string(),
+            message: "bad creds".to_string(),
+        };
+        let (class, code) = classify_attempt_failure(&err);
+        assert_eq!(class, "application");
+        assert_eq!(code.as_deref(), Some("INVALID_SECURITY_USER"));
+    }
+
+    /// PR-20 / ADR-0033 §5: `QueryInvoiceCheckRetryable` →
+    /// ("retryable_application", Some(code)). Even though
+    /// retry-submission's Phase 0 aborts on BOTH retryable and
+    /// non-retryable per ADR-0033 §"Surfaced conflict 1 Reading
+    /// A", the audit payload's `failure_class` keeps the
+    /// distinction for inspector triage.
+    #[test]
+    fn classify_attempt_failure_classifies_query_invoice_check_retryable_as_retryable_application() {
+        let err = NavTransportError::QueryInvoiceCheckRetryable {
+            code: "OPERATION_FAILED".to_string(),
+            message: "try again".to_string(),
+        };
+        let (class, code) = classify_attempt_failure(&err);
+        assert_eq!(class, "retryable_application");
+        assert_eq!(code.as_deref(), Some("OPERATION_FAILED"));
+    }
+
+    /// PR-20 / ADR-0033 §5: `QueryInvoiceCheckResponseParse` →
+    /// ("application", None). Same posture as the analogous
+    /// queryInvoiceData / manageInvoice response-parse arms.
+    #[test]
+    fn classify_attempt_failure_classifies_query_invoice_check_response_parse_as_application() {
+        let err = NavTransportError::QueryInvoiceCheckResponseParse(
+            "missing <invoiceCheckResult>".to_string(),
+        );
         let (class, code) = classify_attempt_failure(&err);
         assert_eq!(class, "application");
         assert!(code.is_none());

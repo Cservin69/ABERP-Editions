@@ -580,6 +580,28 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
                 })?;
             payload.response_xml
         }
+        // PR-20 / ADR-0033 §2: Layer-2 queryInvoiceCheck evidence.
+        // The payload's `response_xml` is Option<Vec<u8>> — Some
+        // for `outcome = "exists"` / `"absent"` (NAV returned a
+        // body) and Some-or-None for `outcome = "failure"` (Some
+        // for http_status / application / retryable_application
+        // classes where NAV returned an error body; None for
+        // transport / envelope / credential / client_build classes
+        // where no body was received). The request_xml (verbatim
+        // `<QueryInvoiceCheckRequest>` bytes) lives in-payload via
+        // chain.jsonl per ADR-0033 §10 — the bundle's nav/
+        // directory carries the response side only, mirroring the
+        // existing per-NAV-kind shape.
+        EventKind::InvoiceCheckPerformed => {
+            let payload: crate::audit_payloads::InvoiceCheckPerformedPayload =
+                serde_json::from_slice(&entry.payload).with_context(|| {
+                    format!(
+                        "decode InvoiceCheckPerformed payload at seq {}",
+                        entry.seq.as_u64()
+                    )
+                })?;
+            payload.response_xml
+        }
         // Non-NAV-bearing kinds — no nav/ file produced for
         // these. The match is deliberately exhaustive (no
         // `_ => ...` arm) so a future EventKind variant

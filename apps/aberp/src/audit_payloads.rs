@@ -578,6 +578,193 @@ impl InvoiceSubmissionAttemptFailedPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// InvoiceCheckPerformed  (PR-20 / ADR-0033 §2 — Layer-2
+// `queryInvoiceCheck` evidence per ADR-0009 §5's named-deferred
+// disambiguation surface. Written by `retry-submission`'s state-2
+// Pending branch BEFORE the manageInvoice re-POST so the retry can
+// skip the re-POST when NAV already has the invoice. Closes F44 at
+// the state-2 disambiguation level.)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceCheckPerformed`].
+///
+/// Carries the verbatim `<QueryInvoiceCheckRequest>` bytes (always),
+/// the verbatim NAV response bytes (Option — `Some` whenever NAV
+/// returned a body, including error bodies), the typed outcome
+/// discriminator, and three optional failure-class fields populated
+/// iff `outcome == "failure"`.
+///
+/// # Outcome enumeration (ADR-0033 §2)
+///
+/// The `outcome` field is one of:
+///
+///   - `"exists"`  — NAV returned `<invoiceCheckResult>true</>`.
+///                   The retry SKIPPED the manageInvoice re-POST
+///                   per ADR-0033 §1. No duplicate-submission risk.
+///                   The post-positive-check NAV-side state
+///                   recovery (fetching the chain via
+///                   `queryInvoiceData` per ADR-0009 §5) is named-
+///                   deferred as F48; the operator-visible summary
+///                   names the gap loud per CLAUDE.md rule 12.
+///   - `"absent"`  — NAV returned `<invoiceCheckResult>false</>`.
+///                   The retry PROCEEDED to the manageInvoice
+///                   re-POST per ADR-0033 §1. The subsequent
+///                   `InvoiceSubmissionAttempt` +
+///                   `InvoiceSubmissionResponse` (or
+///                   `InvoiceSubmissionAttemptFailed`) entries
+///                   record the re-POST's outcome.
+///   - `"failure"` — `queryInvoiceCheck` failed at any layer
+///                   (transport / http_status / response_parse /
+///                   application). The retry ABORTED per ADR-0033 §
+///                   "Surfaced conflict 1 Reading A"; the operator
+///                   re-runs `retry-submission` later. The
+///                   `failure_class` / `failure_code` /
+///                   `failure_message` fields are populated; the
+///                   `response_xml` field is `Some` if a NAV body
+///                   was received before the failure fired, `None`
+///                   otherwise.
+///
+/// # Failure-class enumeration (ADR-0033 §2 + §5)
+///
+/// When `outcome == "failure"`, the `failure_class` field is one of
+/// the same seven classes
+/// [`InvoiceSubmissionAttemptFailedPayload::error_class`] enumerates
+/// (`"transport"` / `"http_status"` / `"application"` /
+/// `"retryable_application"` / `"envelope"` / `"credential"` /
+/// `"client_build"`). The deterministic classifier lives in
+/// `submission_queue::classify_attempt_failure` (extended in PR-20
+/// to cover the five new `NavTransportError::QueryInvoiceCheck*`
+/// variants).
+///
+/// # Audit-query / classifier UNCHANGED
+///
+/// Per ADR-0033 §6, the precondition walker
+/// `audit_query::stuck_precondition` does NOT consult this entry.
+/// An invoice with `Attempt` + `InvoiceCheckPerformed(outcome=exists)`
+/// + no `Response` is still classified as state-2 Pending. The
+/// state-2 → not-stuck transition is the F48-deferred recover-from-
+/// nav surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceCheckPerformedPayload {
+    /// Prefixed `inv_<ULID>` form — same shape as every other
+    /// invoice-bearing payload.
+    pub invoice_id: String,
+    /// F8 idempotency key carry-forward — same canonical form as
+    /// every other NAV-related entry for this invoice.
+    pub idempotency_key: String,
+    /// `"test"` or `"production"` — same shape as
+    /// [`InvoiceSubmissionAttemptPayload`]'s `endpoint` field.
+    /// The audit-evidence bundle (ADR-0009 §8) needs the
+    /// environment explicit for inspector triage.
+    pub endpoint: String,
+    /// The NAV-facing invoice number string that was queried
+    /// (e.g., `"INV-default/00042"`). The bundle reader sees the
+    /// exact identifier that hit NAV's queryInvoiceCheck endpoint
+    /// without re-deriving from series.code + seq.
+    pub nav_invoice_number: String,
+    /// Outcome discriminator per the §2 enumeration above. Read by
+    /// the bundle reader for diagnosis and by the orchestration
+    /// for the operator-visible summary; not used by the
+    /// precondition walker (which is informational-only per
+    /// ADR-0033 §6).
+    pub outcome: String,
+    /// Verbatim `<QueryInvoiceCheckRequest>` envelope bytes.
+    /// Persisted for every outcome — even on `"failure"` the
+    /// request bytes show what ABERP attempted.
+    pub request_xml: Vec<u8>,
+    /// Verbatim NAV response bytes IF a response body was received.
+    /// `Some(...)` for `"exists"` and `"absent"` outcomes (NAV
+    /// returned an OK body); `Some(...)` for `"failure"` outcomes
+    /// where a body was received before the failure fired (e.g.,
+    /// `http_status` / `application` / `retryable_application`
+    /// classes — NAV's body carries the `<funcCode>` /
+    /// `<errorCode>` / `<message>` triple). `None` for `"failure"`
+    /// outcomes where no body was received (transport / envelope
+    /// / credential / client_build classes).
+    pub response_xml: Option<Vec<u8>>,
+    /// Failure-class discriminator per the §2 enumeration above.
+    /// `Some(...)` iff `outcome == "failure"`; `None` otherwise.
+    /// Same seven-class enumeration as
+    /// [`InvoiceSubmissionAttemptFailedPayload::error_class`].
+    pub failure_class: Option<String>,
+    /// `Some(...)` for `failure_class == "application"` (NAV code)
+    /// or `"retryable_application"` (NAV code) or `"http_status"`
+    /// (HTTP status as decimal string); `None` otherwise.
+    pub failure_code: Option<String>,
+    /// Operator-visible error message — the
+    /// `NavTransportError::Display` rendering of the failure.
+    /// `Some(...)` iff `outcome == "failure"`. Never includes
+    /// secret material per ADR-0020 §3.
+    pub failure_message: Option<String>,
+}
+
+impl InvoiceCheckPerformedPayload {
+    /// Construct a payload for an `Exists` or `Absent` outcome.
+    /// The orchestration's OK happy path (NAV answered cleanly)
+    /// lands here. `response_xml` is always `Some` because NAV
+    /// returned an OK body.
+    pub fn new_for_outcome(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        endpoint: &'static str,
+        nav_invoice_number: &str,
+        outcome: &'static str,
+        request_xml: Vec<u8>,
+        response_xml: Vec<u8>,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            endpoint: endpoint.to_string(),
+            nav_invoice_number: nav_invoice_number.to_string(),
+            outcome: outcome.to_string(),
+            request_xml,
+            response_xml: Some(response_xml),
+            failure_class: None,
+            failure_code: None,
+            failure_message: None,
+        }
+    }
+
+    /// Construct a payload for a `"failure"` outcome.
+    /// `response_xml` is `Option` because some failure classes
+    /// (transport / envelope / credential / client_build) have no
+    /// NAV body. The `failure_class` / `failure_code` /
+    /// `failure_message` fields are populated per the
+    /// `submission_queue::classify_attempt_failure` classifier
+    /// output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_failure(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        endpoint: &'static str,
+        nav_invoice_number: &str,
+        request_xml: Vec<u8>,
+        response_xml: Option<Vec<u8>>,
+        failure_class: &'static str,
+        failure_code: Option<String>,
+        failure_message: String,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            endpoint: endpoint.to_string(),
+            nav_invoice_number: nav_invoice_number.to_string(),
+            outcome: "failure".to_string(),
+            request_xml,
+            response_xml,
+            failure_class: Some(failure_class.to_string()),
+            failure_code,
+            failure_message: Some(failure_message),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // InvoiceStornoIssued  (PR-10 / ADR-0023 — storno chain-link entry.
 // A storno is itself an invoice and burns its own sequence number via
 // the standard allocator path (which writes its own
@@ -1689,6 +1876,149 @@ mod tests {
         let _: serde_json::Value =
             serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
         let decoded: InvoiceSubmissionAttemptFailedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+    }
+
+    // ── PR-20 / ADR-0033 §2 — InvoiceCheckPerformed round-trips ────
+
+    /// PR-20 / ADR-0033 §2: an `Exists` outcome round-trips with
+    /// `failure_class` / `failure_code` / `failure_message` all
+    /// `None`. The `response_xml` field is `Some` because NAV
+    /// returned an OK body. Pins the constructor's invariant:
+    /// `new_for_outcome` cannot populate failure fields.
+    #[test]
+    fn check_performed_round_trips_for_exists_outcome() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceCheckPerformedPayload::new_for_outcome(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "test",
+            "INV-default/00042",
+            "exists",
+            b"<QueryInvoiceCheckRequest>...</QueryInvoiceCheckRequest>".to_vec(),
+            b"<QueryInvoiceCheckResponse><invoiceCheckResult>true</invoiceCheckResult></QueryInvoiceCheckResponse>".to_vec(),
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceCheckPerformedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.outcome, "exists");
+        assert!(decoded.response_xml.is_some());
+        assert!(decoded.failure_class.is_none());
+        assert!(decoded.failure_code.is_none());
+        assert!(decoded.failure_message.is_none());
+    }
+
+    /// PR-20 / ADR-0033 §2: an `Absent` outcome round-trips
+    /// with the same shape as `Exists` (failure fields None;
+    /// response_xml Some). The discriminator is the `outcome`
+    /// field; the bundle reader filters on it.
+    #[test]
+    fn check_performed_round_trips_for_absent_outcome() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceCheckPerformedPayload::new_for_outcome(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "production",
+            "INV-default/00099",
+            "absent",
+            b"<QueryInvoiceCheckRequest>...</QueryInvoiceCheckRequest>".to_vec(),
+            b"<QueryInvoiceCheckResponse><invoiceCheckResult>false</invoiceCheckResult></QueryInvoiceCheckResponse>".to_vec(),
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceCheckPerformedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.outcome, "absent");
+        assert!(decoded.failure_class.is_none());
+    }
+
+    /// PR-20 / ADR-0033 §2: a `"failure"` outcome with a
+    /// transport-class failure (no NAV body) round-trips with
+    /// `response_xml` = None and the three failure fields populated.
+    /// Mirrors the transport-class shape of
+    /// `attempt_failed_round_trips_for_transport_class`.
+    #[test]
+    fn check_performed_round_trips_for_transport_failure() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceCheckPerformedPayload::new_for_failure(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "test",
+            "INV-default/00042",
+            b"<QueryInvoiceCheckRequest>...</QueryInvoiceCheckRequest>".to_vec(),
+            None,
+            "transport",
+            None,
+            "queryInvoiceCheck HTTP call failed: connection reset".to_string(),
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceCheckPerformedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.outcome, "failure");
+        assert_eq!(decoded.failure_class.as_deref(), Some("transport"));
+        assert!(decoded.failure_code.is_none());
+        assert!(decoded.response_xml.is_none());
+        assert!(decoded.failure_message.is_some());
+    }
+
+    /// PR-20 / ADR-0033 §2: a `"failure"` outcome with an
+    /// application-class failure (NAV returned a body) round-trips
+    /// with `response_xml` = Some + `failure_code` carrying the
+    /// NAV error code. Mirrors the application-class shape of
+    /// `attempt_failed_round_trips_for_application_class`.
+    #[test]
+    fn check_performed_round_trips_for_application_failure() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceCheckPerformedPayload::new_for_failure(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "production",
+            "INV-default/00042",
+            b"<QueryInvoiceCheckRequest>...</QueryInvoiceCheckRequest>".to_vec(),
+            Some(b"<QueryInvoiceCheckResponse><common:funcCode>ERROR</common:funcCode></QueryInvoiceCheckResponse>".to_vec()),
+            "application",
+            Some("INVALID_SECURITY_USER".to_string()),
+            "queryInvoiceCheck non-retryable error: INVALID_SECURITY_USER — bad creds"
+                .to_string(),
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoiceCheckPerformedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.failure_class.as_deref(), Some("application"));
+        assert_eq!(
+            decoded.failure_code.as_deref(),
+            Some("INVALID_SECURITY_USER")
+        );
+        assert!(decoded.response_xml.is_some());
+    }
+
+    /// PR-20 / ADR-0033 §2: hostile bytes in `failure_message`
+    /// round-trip clean through the typed-struct path. Same F9
+    /// trap-closing posture as
+    /// `attempt_failed_round_trips_with_hostile_error_message`.
+    #[test]
+    fn check_performed_round_trips_with_hostile_failure_message() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoiceCheckPerformedPayload::new_for_failure(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "test",
+            "INV-default/00042",
+            b"<x/>".to_vec(),
+            Some(b"<response>...</response>".to_vec()),
+            "application",
+            Some("SCHEMA_VIOLATION".to_string()),
+            "NAV said: \"<invoiceMain>\" has \\bad shape; \u{00e1}rv\u{00ed}zt\u{0151}r\u{0151} test"
+                .to_string(),
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoiceCheckPerformedPayload =
             serde_json::from_slice(&bytes).expect("typed decode");
         assert_eq!(decoded, payload);
     }

@@ -32,6 +32,14 @@
 //!     non-`manageInvoice` request-signature shape as
 //!     `queryTransactionStatus` (no per-invoice-index extension;
 //!     keys on the invoice number, not a transaction id).
+//!   - [`render_query_invoice_check_request`] — full
+//!     `<QueryInvoiceCheckRequest>` XML body, ready to POST to
+//!     `/queryInvoiceCheck`. PR-20 / ADR-0033 consumer. Structural
+//!     parallel to `queryInvoiceData` — same non-`manageInvoice`
+//!     request-signature shape and same `<invoiceNumberQuery>`
+//!     body wrapper. Used by `retry-submission`'s state-2 Pending
+//!     branch as the Layer-2 NAV-side disambiguation surface per
+//!     ADR-0009 §5.
 //!
 //! Lower-level building blocks (header, user, software type, request-id
 //! generation, timestamp formatting) live in [`parts`] so the unit tests
@@ -498,6 +506,70 @@ pub fn render_query_invoice_data_request(
             // (rename here); the audit-payload's `response_xml`
             // field carries the verbatim NAV-error response so a
             // wire-rejected attempt is still recorded.
+            w.write_event(Event::Start(BytesStart::new("invoiceNumberQuery")))
+                .map_err(envelope_io)?;
+            write_text_in_default_ns(w, "invoiceNumber", invoice_number)?;
+            write_text_in_default_ns(w, "invoiceDirection", direction_str)?;
+            write_text_in_default_ns(w, "batchIndex", &batch_index_str)?;
+            w.write_event(Event::End(BytesEnd::new("invoiceNumberQuery")))
+                .map_err(envelope_io)?;
+            Ok(())
+        },
+    )
+}
+
+/// Render a `<QueryInvoiceCheckRequest>` body, ready for HTTP POST.
+///
+/// PR-20 / ADR-0033 §3 consumer. Structurally parallel to
+/// [`render_query_invoice_data_request`] — both are non-
+/// `manageInvoice` query operations per ADR-0009 §4 (plain three-
+/// input request signature, no per-invoice-index extension; no
+/// exchangeToken). The body wrapper is the same `<invoiceNumberQuery>`
+/// shape as queryInvoiceData per the structural-parallel posture
+/// (ADR-0033 §3): `<invoiceNumber>` + `<invoiceDirection>` +
+/// `<batchIndex>`.
+///
+/// The NAV-side OK response carries `<invoiceCheckResult>true|false</>`
+/// which the operations-module parser extracts. Per ADR-0033 §3 +
+/// §"Open questions", NAV-testbed verification is the named trigger
+/// for amendment if NAV's actual request/response shape differs
+/// from the modelled one.
+pub fn render_query_invoice_check_request(
+    credentials: &NavCredentials,
+    tax_number_8: &str,
+    request_id: &str,
+    request_timestamp: &str,
+    invoice_number: &str,
+    invoice_direction: InvoiceDirection,
+    batch_index: u32,
+) -> Result<Vec<u8>, NavTransportError> {
+    let signature = request_signature(request_id, request_timestamp, credentials.sign_key_bytes());
+    let batch_index_str = batch_index.to_string();
+    let direction_str = invoice_direction.as_nav_str();
+    render_request(
+        "QueryInvoiceCheckRequest",
+        credentials,
+        tax_number_8,
+        request_id,
+        request_timestamp,
+        &signature,
+        |w| {
+            // XSD-sequence body per NAV v3.0 (modelled — NAV-testbed
+            // verification per ADR-0033 §"Open questions"):
+            //   <invoiceNumberQuery>
+            //     <invoiceNumber>...</invoiceNumber>
+            //     <invoiceDirection>OUTBOUND</invoiceDirection>
+            //     <batchIndex>1</batchIndex>
+            //   </invoiceNumberQuery>
+            //
+            // The structural-parallel posture per ADR-0033 §3 mirrors
+            // queryInvoiceData's body wrapper verbatim. If NAV-testbed
+            // surfaces a different actual shape (e.g., a different
+            // wrapping element name for queryInvoiceCheck), the
+            // amendment is mechanical (rename here); the audit
+            // payload's `response_xml` field carries the verbatim
+            // NAV-error response so a wire-rejected attempt is still
+            // recorded.
             w.write_event(Event::Start(BytesStart::new("invoiceNumberQuery")))
                 .map_err(envelope_io)?;
             write_text_in_default_ns(w, "invoiceNumber", invoice_number)?;

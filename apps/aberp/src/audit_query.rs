@@ -534,6 +534,37 @@ mod tests {
             .unwrap();
     }
 
+    /// PR-20 / ADR-0033 §2 — write an `InvoiceCheckPerformed`
+    /// entry for a given outcome (`"exists"` / `"absent"`).
+    /// Used by the §6 informational-only pins below to verify
+    /// that Layer-2 entries do NOT change `stuck_precondition`
+    /// classification.
+    fn write_check_performed(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        invoice_id: &str,
+        idem: IdempotencyKey,
+        outcome: &'static str,
+    ) {
+        let payload = audit_payloads::InvoiceCheckPerformedPayload::new_for_outcome(
+            invoice_id,
+            idem,
+            "test",
+            "INV-default/00042",
+            outcome,
+            b"<QueryInvoiceCheckRequest/>".to_vec(),
+            b"<QueryInvoiceCheckResponse/>".to_vec(),
+        );
+        ledger
+            .append(
+                EventKind::InvoiceCheckPerformed,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
     #[test]
     fn never_submitted_when_no_submission_response() {
         let (ledger, _actor) = fixture_ledger();
@@ -759,5 +790,99 @@ mod tests {
         // Unused — only here so clippy does not complain that idem_b
         // is declared but never read.
         let _ = idem_b;
+    }
+
+    // ── PR-20 / ADR-0033 §6 — Layer-2 is informational-only ──────────
+
+    /// PR-20 / ADR-0033 §6: an `InvoiceCheckPerformed(outcome=exists)`
+    /// entry does NOT change classification. An invoice with
+    /// `Attempt` + `InvoiceCheckPerformed(outcome=exists)` and no
+    /// `Response` is still state-2 Pending — the precondition
+    /// walker classifies by ABERP-side state changes (Attempt /
+    /// Response / Abandoned) only; Layer-2 NAV-side facts are NOT
+    /// classification-bearing per the deliberate minimal scope.
+    /// CLAUDE.md rule 9: a future refactor that silently makes
+    /// Layer-2 entries classification-bearing would surface here,
+    /// not at the first F48 state-recovery PR.
+    #[test]
+    fn check_performed_exists_does_not_change_state_2_classification() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        write_check_performed(&mut ledger, &actor, "inv_A", idem, "exists");
+        match stuck_precondition(&ledger, "inv_A").unwrap() {
+            StuckOutcome::Stuck(p) => {
+                assert_eq!(p.stage, StuckStage::Pending);
+                assert!(p.prior_transaction_id.is_none());
+                assert_eq!(p.idempotency_key, idem);
+            }
+            other => panic!("expected Stuck(Pending), got {other:?}"),
+        }
+    }
+
+    /// PR-20 / ADR-0033 §6: same pin for `outcome=absent`. The
+    /// retry orchestration follows up with a fresh Attempt /
+    /// Response pair after an `Absent` outcome (see
+    /// `retry_submission::run`'s Phase 0 → Phase 1+2 transition);
+    /// but a hypothetical `Absent` entry WITHOUT the subsequent
+    /// retry-pair (e.g., process crashed between TX0 and TX1)
+    /// must still classify as state-2 Pending — the prior Attempt
+    /// stands; Layer-2 is informational.
+    #[test]
+    fn check_performed_absent_does_not_change_state_2_classification() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        write_check_performed(&mut ledger, &actor, "inv_A", idem, "absent");
+        match stuck_precondition(&ledger, "inv_A").unwrap() {
+            StuckOutcome::Stuck(p) => {
+                assert_eq!(p.stage, StuckStage::Pending);
+                assert_eq!(p.idempotency_key, idem);
+            }
+            other => panic!("expected Stuck(Pending), got {other:?}"),
+        }
+    }
+
+    /// PR-20 / ADR-0033 §6: an `InvoiceCheckPerformed` entry on a
+    /// state-3 invoice (Attempt + Response present + an Exists
+    /// check) classifies as AwaitingAck regardless of the Layer-2
+    /// outcome. The Response is the deciding factor; Layer-2 is
+    /// informational.
+    #[test]
+    fn check_performed_does_not_change_state_3_classification() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        write_submission_response(&mut ledger, &actor, "inv_A", idem, "TXID-A");
+        // Even if a Layer-2 check was performed (hypothetical —
+        // PR-20 only fires Layer-2 on state-2; this pins the
+        // classifier's robustness to any ordering).
+        write_check_performed(&mut ledger, &actor, "inv_A", idem, "exists");
+        match stuck_precondition(&ledger, "inv_A").unwrap() {
+            StuckOutcome::Stuck(p) => {
+                assert_eq!(p.stage, StuckStage::AwaitingAck);
+                assert_eq!(p.prior_transaction_id.as_deref(), Some("TXID-A"));
+            }
+            other => panic!("expected Stuck(AwaitingAck), got {other:?}"),
+        }
+    }
+
+    /// PR-20 / ADR-0033 §6: `InvoiceMarkedAbandoned` still wins
+    /// over any Layer-2 entry. A divergence (NAV has the invoice
+    /// per `outcome=exists`; operator chose to abandon locally)
+    /// is preserved as audit evidence but classifies as
+    /// `AlreadyAbandoned`. CLAUDE.md rule 12: the divergence is
+    /// loud in the audit chain, not hidden in classification.
+    #[test]
+    fn already_abandoned_wins_over_check_performed_exists() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        write_check_performed(&mut ledger, &actor, "inv_A", idem, "exists");
+        write_marked_abandoned(&mut ledger, &actor, "inv_A", idem, "<none>");
+        match stuck_precondition(&ledger, "inv_A").unwrap() {
+            StuckOutcome::NotStuck(NotStuckReason::AlreadyAbandoned) => {}
+            other => panic!("expected AlreadyAbandoned, got {other:?}"),
+        }
     }
 }

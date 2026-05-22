@@ -1,7 +1,11 @@
 //! Orchestration for the `aberp retry-submission` subcommand (PR-8-1,
 //! amended by PR-19 / ADR-0032 §4 to accept state-2 Pending in
 //! addition to state-3 AwaitingAck, and §1 to use the two-tx
-//! Attempt-before-call posture).
+//! Attempt-before-call posture; further amended by PR-20 /
+//! ADR-0033 §1 to add a Phase 0 Layer-2 `queryInvoiceCheck`
+//! disambiguation step for state-2 retries that closes the
+//! duplicate-submission residual PR-19's adversarial review #2
+//! named-warned).
 //!
 //! Operator-unblock command for an invoice in the `SubmissionStuck`
 //! posture per ADR-0009 §5: re-submits the invoice via the existing
@@ -73,11 +77,36 @@
 //! posture introduces. State-2 retries write the same TX1 +
 //! TX2 shape as state-3 retries; the only difference is the
 //! `prior_transaction_id` field on the `InvoiceRetryRequestedPayload`
-//! (None for state-2 because no prior Response exists). The
-//! operator-visible summary names the stage explicitly and surfaces
-//! the duplicate-submission residual loud for state-2 (CLAUDE.md
-//! rule 12 — Layer-2 `queryInvoiceCheck` per ADR-0009 §5 is
-//! named-deferred per ADR-0032 §"Open questions" / F44).
+//! (None for state-2 because no prior Response exists).
+//!
+//! # State-2 Layer-2 disambiguation (PR-20 / ADR-0033 §1)
+//!
+//! PR-20 adds a Phase 0 step BEFORE TX1 for state-2 retries: a
+//! `queryInvoiceCheck` call against the NAV-facing invoice number,
+//! recorded in a new `InvoiceCheckPerformed` audit entry. Three
+//! outcomes per ADR-0033 §1:
+//!
+//!   - **Exists** — NAV already has the invoice. Skip TX1 + TX2;
+//!     no re-POST happens; no duplicate-submission risk. The
+//!     operator-visible summary names the F48-deferred chain-
+//!     reconstruction gap loud (the local Response/Ack chain
+//!     remains absent — the operator inspects NAV's web UI or
+//!     waits for F48).
+//!   - **Absent** — NAV does NOT have the invoice. Proceed to
+//!     TX1 + TX2 per the pre-PR-20 / PR-19 shape. Genuine
+//!     transport-mid-flight loss; the re-POST is safe.
+//!   - **Failure** — queryInvoiceCheck failed at any layer. Abort
+//!     the retry per ADR-0033 §"Surfaced conflict 1 Reading A"; do
+//!     NOT proceed to TX1 + TX2. The `InvoiceCheckPerformed` audit
+//!     entry carries the typed `failure_class` / `failure_code` /
+//!     `failure_message`; the operator re-runs `retry-submission`
+//!     later. The invoice remains in state-2 Pending.
+//!
+//! State-3 retries (AwaitingAck) skip Phase 0 entirely — they have
+//! a prior NAV `transaction_id`, and NAV's Layer-1
+//! `INVOICE_NUMBER_NOT_UNIQUE` guard already covers the state-3
+//! duplicate residual per ADR-0033 §1. The state-3 path is the
+//! verbatim PR-19 shape.
 //!
 //! # Why not call into `submit_invoice::run` directly
 //!
@@ -106,23 +135,36 @@
 //!
 //! # What this flow does NOT do
 //!
-//!   - It does NOT implement ADR-0009 §5 Layer-2 idempotency
-//!     (`queryInvoiceCheck` against the invoice number on
-//!     `INVOICE_NUMBER_NOT_UNIQUE`). That disambiguation belongs in a
-//!     separate PR that lands the `queryInvoiceCheck` nav-transport
-//!     operation; until then, `INVOICE_NUMBER_NOT_UNIQUE` from NAV
-//!     surfaces as a loud failure per CLAUDE.md rule 12.
+//!   - It does NOT extend Layer-2 to state-3 retries. PR-20 /
+//!     ADR-0033 §1 names state-3 explicitly out of scope; NAV's
+//!     Layer-1 `INVOICE_NUMBER_NOT_UNIQUE` guard is the existing
+//!     state-3 disambiguation surface. A future F (named-
+//!     deferred) may add belt-and-braces Layer-2 to state-3 if
+//!     operational evidence surfaces.
+//!   - It does NOT reconstruct the local Response/Ack chain after
+//!     a positive Layer-2 check. The post-positive-check NAV-side
+//!     state recovery (fetching the chain via `queryInvoiceData`
+//!     per ADR-0009 §5's full intent) is named-deferred as F48;
+//!     the operator-visible summary names the gap loud per
+//!     CLAUDE.md rule 12.
 //!   - It does NOT poll `queryTransactionStatus` — the operator runs
 //!     `aberp poll-ack` after the retry, same as the original
-//!     submission flow.
+//!     submission flow. (For an `Exists` outcome there's no fresh
+//!     `transactionId` to poll; the operator's next move is
+//!     `mark-abandoned` locally or waiting for F48.)
 //!   - It does NOT mutate any billing row — the `submission_state`
 //!     fact lives in the audit ledger per A5/A6.
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
-use aberp_billing::{self as billing, IdempotencyKey, ReadyInvoice};
+use aberp_billing::{
+    self as billing, BillingStore, DuckDbBillingStore, IdempotencyKey, InvoiceSeries, ReadyInvoice,
+};
 use aberp_nav_transport::{
-    operations::{manage_invoice, token_exchange},
-    soap::{InvoiceOperation, ManageInvoiceItem},
+    operations::{
+        manage_invoice, query_invoice_check::{self, QueryInvoiceCheckOutcome},
+        token_exchange,
+    },
+    soap::{InvoiceDirection, InvoiceOperation, ManageInvoiceItem},
     NavCredentials, NavEndpoint, NavTransport, NavTransportError,
 };
 use anyhow::{anyhow, Context, Result};
@@ -241,13 +283,135 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
         "on-disk InvoiceData XML passed v3.0 invariant check before NAV retry"
     );
 
-    // 6. NAV prepare phase: tokenExchange + build envelope. NO wire
-    //    send yet (PR-19 / ADR-0032 §1).
+    // 5b. Hoisted from step 6 per PR-20 / ADR-0033 §1: the tokio
+    //     runtime + ledger_meta are needed by Phase 0 (state-2
+    //     Layer-2 disambiguation) AND by Phase 1-2 (the existing
+    //     PR-19 prepare → TX1 → wire → TX2 shape).
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build tokio current-thread runtime for retry NAV calls")?;
+
+    // 5c. PR-20 / ADR-0033 §1: Phase 0 — Layer-2 disambiguation for
+    //     state-2 Pending retries. State-3 (AwaitingAck) skips this
+    //     step entirely (the existing PR-19 path applies; NAV's
+    //     Layer-1 INVOICE_NUMBER_NOT_UNIQUE guard is the existing
+    //     state-3 dedup per ADR-0033 §1). The Phase 0 step
+    //     writes one `InvoiceCheckPerformed` audit entry in its
+    //     own TX (TX0); the outcome drives whether the retry
+    //     proceeds (Absent), skips re-POST (Exists), or aborts
+    //     (Failure per ADR-0033 §"Surfaced conflict 1 Reading A").
+    if stuck.stage == StuckStage::Pending {
+        let nav_invoice_number = derive_nav_invoice_number(&args.db, &ready_invoice)?;
+        tracing::info!(
+            nav_invoice_number = %nav_invoice_number,
+            "state-2 retry: performing Layer-2 queryInvoiceCheck per ADR-0033 §1"
+        );
+        let decision = perform_layer_2_check(
+            &runtime,
+            nav_endpoint,
+            &credentials,
+            &tax_number_8,
+            &nav_invoice_number,
+            &mut conn,
+            &ledger_meta,
+            actor.clone(),
+            &ready_invoice,
+            idempotency_key,
+            endpoint_audit_label,
+            &args.db,
+            tenant.clone(),
+            binary_hash_bytes,
+        )?;
+        match decision {
+            Layer2Decision::SkipRePost => {
+                // NAV already has the invoice. Skip the re-POST per
+                // ADR-0033 §1 — no duplicate-submission risk. The
+                // local Response/Ack chain remains absent (F48-
+                // deferred chain reconstruction); operator-visible
+                // summary names the gap loud per CLAUDE.md rule 12.
+                drop(conn);
+                let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes).context(
+                    "open audit ledger after TX0 Exists for chain verification",
+                )?;
+                let verified = ledger.verify_chain().context(
+                    "audit-ledger chain verification failed AFTER Phase 0 Exists",
+                )?;
+                tracing::info!(
+                    entries_verified = verified,
+                    nav_invoice_number = %nav_invoice_number,
+                    "Layer-2 queryInvoiceCheck returned Exists — re-POST skipped"
+                );
+                println!(
+                    "retry-submission Layer-2 Exists: NAV already has invoice {} ({}) \
+                     — re-POST skipped (no duplicate submission) \
+                     (audit chain verified across {} entries; \
+                     InvoiceCheckPerformed recorded with outcome=exists); \
+                     invoice remains state-2 Pending locally because the \
+                     prior submission's Response/Ack chain is absent — \
+                     the chain-reconstruction surface is named-deferred per F48 \
+                     (ADR-0033 §9); inspect NAV's web UI to view the prior \
+                     submission's transactionId, or run `aberp mark-abandoned` \
+                     locally to terminate the chain by operator decision",
+                    ready_invoice.id.to_prefixed_string(),
+                    nav_invoice_number,
+                    verified,
+                );
+                return Ok(());
+            }
+            Layer2Decision::Abort(failure_message) => {
+                // Layer-2 itself failed. Per ADR-0033 §"Surfaced
+                // conflict 1 Reading A" the retry aborts; the
+                // operator re-runs `retry-submission` later. The
+                // invoice remains in state-2 Pending; the
+                // InvoiceCheckPerformed audit entry with
+                // outcome=failure was written by
+                // perform_layer_2_check before this branch fired.
+                drop(conn);
+                let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes).context(
+                    "open audit ledger after TX0 Failure for chain verification",
+                )?;
+                let verified = ledger.verify_chain().context(
+                    "audit-ledger chain verification failed AFTER Phase 0 Failure",
+                )?;
+                tracing::error!(
+                    invoice_id = %ready_invoice.id.to_prefixed_string(),
+                    entries_verified = verified,
+                    "retry-submission: Layer-2 queryInvoiceCheck failed; \
+                     TX0 InvoiceCheckPerformed(outcome=failure) audit written; \
+                     retry ABORTED per ADR-0033 §1"
+                );
+                eprintln!(
+                    "retry-submission Layer-2 FAILED for invoice {}: {} \
+                     (audit chain verified across {} entries; \
+                     InvoiceCheckPerformed recorded with outcome=failure); \
+                     invoice remains in state-2 Pending — re-run \
+                     `aberp retry-submission` after NAV is reachable",
+                    ready_invoice.id.to_prefixed_string(),
+                    failure_message,
+                    verified,
+                );
+                return Err(anyhow!(
+                    "Layer-2 queryInvoiceCheck failed: {}",
+                    failure_message
+                ));
+            }
+            Layer2Decision::ProceedToRePost => {
+                // NAV does not have the invoice. The state-2 retry
+                // is genuinely "wire broke before NAV saw it";
+                // proceed to the existing PR-19 prepare → TX1 →
+                // wire → TX2 path below.
+                tracing::info!(
+                    nav_invoice_number = %nav_invoice_number,
+                    "Layer-2 queryInvoiceCheck returned Absent — proceeding to manageInvoice re-POST"
+                );
+            }
+        }
+    }
+
+    // 6. NAV prepare phase: tokenExchange + build envelope. NO wire
+    //    send yet (PR-19 / ADR-0032 §1).
     let prepared = runtime.block_on(prepare_for_attempt_audit(
         nav_endpoint,
         &credentials,
@@ -382,8 +546,9 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
                  (audit chain verified across {} entries; \
                  InvoiceSubmissionAttemptFailed recorded with error_class={}); \
                  invoice remains in state-2 Pending — re-run `aberp retry-submission` \
-                 (note: a state-2 retry may produce a duplicate submission to NAV \
-                 until Layer-2 queryInvoiceCheck per ADR-0009 §5 lands; F44)",
+                 (the Layer-2 queryInvoiceCheck step PR-20 / ADR-0033 §1 added \
+                 to state-2 retries will reconfirm the NAV-side state before any \
+                 next re-POST)",
                 ready_invoice.id.to_prefixed_string(),
                 error_message,
                 verified,
@@ -658,6 +823,211 @@ fn write_attempt_failed_audit(
     tx.commit().context(
         "commit DuckDB transaction (retry-submission TX2 AttemptFailed audit append)",
     )?;
+    Ok(())
+}
+
+/// PR-20 / ADR-0033 §1: the three decisions Phase 0 emits to its
+/// caller. The orchestration matches on this to either skip
+/// Phase 1+2 (Exists), abort (Failure), or proceed (Absent).
+#[derive(Debug)]
+enum Layer2Decision {
+    /// NAV has the invoice. Skip the manageInvoice re-POST.
+    SkipRePost,
+    /// NAV does not have the invoice. Proceed to the PR-19
+    /// prepare → TX1 → wire → TX2 path.
+    ProceedToRePost,
+    /// queryInvoiceCheck failed at some layer. Abort the retry;
+    /// operator re-runs later. The wrapped String is the operator-
+    /// visible failure message (already recorded in the audit
+    /// payload's `failure_message` field by the time this decision
+    /// is returned).
+    Abort(String),
+}
+
+/// PR-20 / ADR-0033 §1: derive the NAV-facing invoice number
+/// string (`"{series_code}/{seq:05}"`) from the loaded ReadyInvoice.
+/// Mirror of `observe_receiver_confirmation::load_base_nav_invoice_number`
+/// — the same canonical NAV-facing invoice number shape per
+/// ADR-0009 §3 and `nav_xml::render_invoice_data`.
+///
+/// Opens a fresh `DuckDbBillingStore` to consult the
+/// `find_series_by_id` port. The caller already has the `ReadyInvoice`
+/// in hand (loaded by `load_issued_invoice`); the only missing piece
+/// is the series code, which the billing store resolves by ULID.
+fn derive_nav_invoice_number(
+    db_path: &std::path::Path,
+    invoice: &ReadyInvoice,
+) -> Result<String> {
+    let store = DuckDbBillingStore::open(db_path)
+        .with_context(|| format!("open billing DuckDB at {} for Layer-2 series lookup", db_path.display()))?;
+    let series: InvoiceSeries = store
+        .find_series_by_id(invoice.series_id)
+        .context("billing::find_series_by_id (retry-submission Layer-2 series lookup)")?
+        .ok_or_else(|| {
+            anyhow!(
+                "invoice {} references series_id {} which is not present in \
+                 invoice_series — tenant DB appears tampered between invoice \
+                 insertion and retry-submission",
+                invoice.id.to_prefixed_string(),
+                invoice.series_id.to_prefixed_string()
+            )
+        })?;
+    Ok(format!(
+        "{}/{:05}",
+        series.code.as_str(),
+        invoice.sequence_number
+    ))
+}
+
+/// PR-20 / ADR-0033 §1: perform Phase 0 — the Layer-2
+/// `queryInvoiceCheck` disambiguation step. Drives the NAV wire
+/// call, writes the `InvoiceCheckPerformed` audit entry in TX0,
+/// syncs the mirror, and returns a [`Layer2Decision`] for the
+/// caller to act on.
+///
+/// On wire success: the boolean `check_result` maps via
+/// [`QueryInvoiceCheckOutcome::from_check_result`] to either
+/// `Exists` (→ [`Layer2Decision::SkipRePost`]) or `Absent` (→
+/// [`Layer2Decision::ProceedToRePost`]). The payload's `outcome`
+/// is `"exists"` or `"absent"`; the failure fields are `None`.
+///
+/// On wire failure: the typed error classifies through
+/// [`submission_queue::classify_attempt_failure`] (extended in
+/// PR-20 to cover the five `QueryInvoiceCheck*` variants); the
+/// audit payload's `outcome` is `"failure"` with the typed
+/// `failure_class` / `failure_code` / `failure_message`. The
+/// returned [`Layer2Decision::Abort`] wraps the operator-visible
+/// failure message.
+#[allow(clippy::too_many_arguments)]
+fn perform_layer_2_check(
+    runtime: &tokio::runtime::Runtime,
+    nav_endpoint: NavEndpoint,
+    credentials: &NavCredentials,
+    tax_number_8: &str,
+    nav_invoice_number: &str,
+    conn: &mut Connection,
+    ledger_meta: &LedgerMeta,
+    actor: Actor,
+    invoice: &ReadyInvoice,
+    idempotency_key: IdempotencyKey,
+    endpoint_audit_label: &'static str,
+    db_path: &std::path::Path,
+    tenant: TenantId,
+    binary_hash: aberp_audit_ledger::BinaryHash,
+) -> Result<Layer2Decision> {
+    // Build transport. (No tokenExchange — queryInvoiceCheck is a
+    // NAV query operation per ADR-0009 §4 / ADR-0033 §3.)
+    let transport = NavTransport::new(nav_endpoint)
+        .context("build NAV transport for Layer-2 queryInvoiceCheck")?;
+
+    // Build the request envelope. Loud-fail on any envelope-
+    // construction error.
+    let request_xml = query_invoice_check::build_request(
+        credentials,
+        tax_number_8,
+        nav_invoice_number,
+        InvoiceDirection::Outbound,
+    )
+    .map_err(|e: NavTransportError| {
+        anyhow!("query_invoice_check::build_request (envelope construction) failed: {e}")
+    })?;
+
+    // Wire send.
+    let wire_result =
+        runtime.block_on(query_invoice_check::send_built_request(&transport, &request_xml));
+
+    // Classify outcome + build payload.
+    let (decision, payload) = match wire_result {
+        Ok(send_outcome) => {
+            let outcome_enum = QueryInvoiceCheckOutcome::from_check_result(send_outcome.check_result);
+            let payload = audit_payloads::InvoiceCheckPerformedPayload::new_for_outcome(
+                &invoice.id.to_prefixed_string(),
+                idempotency_key,
+                endpoint_audit_label,
+                nav_invoice_number,
+                outcome_enum.as_audit_str(),
+                request_xml.clone(),
+                send_outcome.response_xml,
+            );
+            let decision = match outcome_enum {
+                QueryInvoiceCheckOutcome::Exists => Layer2Decision::SkipRePost,
+                QueryInvoiceCheckOutcome::Absent => Layer2Decision::ProceedToRePost,
+            };
+            (decision, payload)
+        }
+        Err(wire_err) => {
+            let (failure_class, failure_code) =
+                submission_queue::classify_attempt_failure(&wire_err);
+            let failure_message = format!("{wire_err}");
+            // queryInvoiceCheck::send_built_request returns Err
+            // without surfacing the response bytes (matches the
+            // convention every other operations module uses); for
+            // failure outcomes the audit entry's response_xml is
+            // therefore None. A future amendment that wires
+            // response-body capture for NAV-error funcCode bodies
+            // could populate this — out of PR-20 scope.
+            let response_xml: Option<Vec<u8>> = None;
+            let payload = audit_payloads::InvoiceCheckPerformedPayload::new_for_failure(
+                &invoice.id.to_prefixed_string(),
+                idempotency_key,
+                endpoint_audit_label,
+                nav_invoice_number,
+                request_xml.clone(),
+                response_xml,
+                failure_class,
+                failure_code,
+                failure_message.clone(),
+            );
+            (Layer2Decision::Abort(failure_message), payload)
+        }
+    };
+
+    // TX0 — write the InvoiceCheckPerformed audit entry.
+    write_check_performed_audit(conn, ledger_meta, actor, idempotency_key, payload)?;
+
+    // Sync mirror after TX0 commit. Same pattern as every other
+    // post-tx mirror sync; the mirror is the secondary-evidence
+    // source per ADR-0030 §2.
+    {
+        let ledger_tx0 = Ledger::open(db_path, tenant, binary_hash)
+            .context("open audit ledger after TX0 InvoiceCheckPerformed commit")?;
+        let mirror_path = audit_ledger::mirror_path_for(db_path);
+        ledger_tx0.sync_mirror(&mirror_path).context(
+            "sync audit-ledger mirror file after TX0 InvoiceCheckPerformed commit",
+        )?;
+    }
+
+    Ok(decision)
+}
+
+/// PR-20 / ADR-0033 §1: TX0 audit-write — open one DuckDB
+/// transaction, append the `InvoiceCheckPerformed` entry, commit.
+/// One entry per Phase 0 execution regardless of outcome (Exists /
+/// Absent / Failure).
+fn write_check_performed_audit(
+    conn: &mut Connection,
+    ledger_meta: &LedgerMeta,
+    actor: Actor,
+    idempotency_key: IdempotencyKey,
+    payload: audit_payloads::InvoiceCheckPerformedPayload,
+) -> Result<()> {
+    audit_ledger::ensure_schema(conn)
+        .context("ensure audit-ledger schema for retry-submission TX0 InvoiceCheckPerformed")?;
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (retry-submission TX0 InvoiceCheckPerformed)")?;
+    let idem_str = idempotency_key.to_canonical_string();
+    audit_ledger::append_in_tx(
+        &tx,
+        ledger_meta,
+        EventKind::InvoiceCheckPerformed,
+        payload.to_bytes(),
+        actor,
+        Some(idem_str),
+    )
+    .context("audit_ledger::append_in_tx InvoiceCheckPerformed (retry TX0)")?;
+    tx.commit()
+        .context("commit DuckDB transaction (retry-submission TX0 InvoiceCheckPerformed)")?;
     Ok(())
 }
 

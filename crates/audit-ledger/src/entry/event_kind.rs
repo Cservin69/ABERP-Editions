@@ -142,6 +142,26 @@
 /// across PR-6.1 / PR-7-B-3 / PR-8 / PR-10 / PR-11 / PR-12 /
 /// PR-13 / PR-14 / PR-15 / PR-19, mechanical at this point.
 ///
+/// PR-20 (ADR-0033) adds `InvoiceCheckPerformed` — the Layer-2
+/// NAV-side existence-check evidence per ADR-0009 §5's named
+/// disambiguation surface. Closes F44 at the state-2 Pending
+/// disambiguation level. The new variant captures the outcome
+/// of a `queryInvoiceCheck` call performed by `retry-submission`
+/// BEFORE the manageInvoice re-POST, so the operator-visible
+/// retry path no longer carries the duplicate-submission residual
+/// PR-19's adversarial review #2 named-warned. Outcomes
+/// (`"exists"` / `"absent"` / `"failure"`) are carried as a typed
+/// string field on the payload per ADR-0033 §2 + §"Surfaced
+/// conflict 2 Reading B" — kind-alone classification would
+/// multiply the F12 ritual surface for sub-types of "ABERP asked
+/// NAV whether it has invoice X." The post-positive-check chain-
+/// reconstruction surface (fetching the chain via queryInvoiceData
+/// per ADR-0009 §5's full intent) is named-deferred as F48.
+/// The F12 four-edit ritual fires once — the eleventh landing
+/// across PR-6.1 / PR-7-B-3 / PR-8 / PR-10 / PR-11 / PR-12 /
+/// PR-13 / PR-14 / PR-15 / PR-19 / PR-20, mechanical at this
+/// point.
+///
 /// The remaining invoice-lifecycle kinds (`Finalized`, `Rejected`,
 /// `SubmissionStuck`, `Voided`) land when their state transition
 /// first fires in the codebase.
@@ -395,6 +415,49 @@ pub enum EventKind {
     /// silent-omission-failure-mode posture every prior PR's
     /// prefix-pin test names. PR-19, ADR-0032 §2.
     InvoiceSubmissionAttemptFailed,
+
+    /// A Layer-2 `queryInvoiceCheck` against the invoice's
+    /// NAV-facing invoice number completed (ADR-0009 §5,
+    /// ADR-0033 §1). Written by `retry-submission`'s state-2
+    /// Pending branch BEFORE the manageInvoice re-POST, so the
+    /// retry can disambiguate "NAV already has this submission"
+    /// from "the wire broke before NAV saw it" and skip the
+    /// re-POST in the former case (no duplicate submission to
+    /// NAV).
+    ///
+    /// Payload (`InvoiceCheckPerformedPayload` in the binary's
+    /// `audit_payloads.rs`) carries the `invoice_id`, the F8
+    /// `idempotency_key` carry-forward, the `endpoint` label
+    /// (`"test"` / `"production"`), the
+    /// `nav_invoice_number` that was queried, a typed `outcome`
+    /// string (one of `"exists"` / `"absent"` / `"failure"` per
+    /// ADR-0033 §2), the verbatim
+    /// `<QueryInvoiceCheckRequest>` bytes, the verbatim NAV
+    /// response bytes (Option — Some when a body was received),
+    /// and three optional `failure_*` fields populated iff
+    /// `outcome == "failure"` (matching the seven-class
+    /// enumeration `InvoiceSubmissionAttemptFailedPayload.error_class`
+    /// uses).
+    ///
+    /// An `InvoiceCheckPerformed` entry is **informational
+    /// only** in the sense that `audit_query::stuck_precondition`
+    /// does NOT consult it — the precondition walker continues
+    /// to classify by `InvoiceSubmissionAttempt` /
+    /// `InvoiceSubmissionResponse` / `InvoiceMarkedAbandoned`
+    /// presence per ADR-0032 §4. Per ADR-0033 §6, the state-2
+    /// → not-stuck transition (when NAV has the invoice but
+    /// ABERP did not record the prior Response) is the
+    /// F48-deferred recover-from-nav surface; until F48 lands,
+    /// `InvoiceCheckPerformed(outcome=exists)` entries
+    /// accumulate as audit evidence that the operator skipped
+    /// re-POST despite the local state-2 Pending classification.
+    ///
+    /// The `invoice.` prefix MUST hold so the per-invoice export
+    /// bundle's (ADR-0009 §8) `invoice.*` glob picks up the new
+    /// entries alongside every other lifecycle entry — same
+    /// silent-omission-failure-mode posture every prior PR's
+    /// prefix-pin test names. PR-20, ADR-0033 §2.
+    InvoiceCheckPerformed,
 }
 
 impl EventKind {
@@ -427,6 +490,7 @@ impl EventKind {
                 "invoice.annulment_receiver_confirmation"
             }
             EventKind::InvoiceSubmissionAttemptFailed => "invoice.submission_attempt_failed",
+            EventKind::InvoiceCheckPerformed => "invoice.check_performed",
         }
     }
 
@@ -468,6 +532,7 @@ impl EventKind {
                 Ok(EventKind::InvoiceAnnulmentReceiverConfirmation)
             }
             "invoice.submission_attempt_failed" => Ok(EventKind::InvoiceSubmissionAttemptFailed),
+            "invoice.check_performed" => Ok(EventKind::InvoiceCheckPerformed),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -505,6 +570,7 @@ mod tests {
             EventKind::InvoiceAnnulmentAckStatus,
             EventKind::InvoiceAnnulmentReceiverConfirmation,
             EventKind::InvoiceSubmissionAttemptFailed,
+            EventKind::InvoiceCheckPerformed,
         ];
         for v in variants {
             let s = v.as_str();
@@ -772,6 +838,50 @@ mod tests {
         assert_ne!(
             EventKind::InvoiceSubmissionAttemptFailed.as_str(),
             EventKind::InvoiceSubmissionAttempt.as_str()
+        );
+    }
+
+    /// PR-20 / ADR-0033 §2: the Layer-2 queryInvoiceCheck
+    /// evidence kind. The `invoice.` prefix MUST hold so the
+    /// per-invoice export bundle's (ADR-0009 §8) `invoice.*`
+    /// glob picks up the new entries alongside every other
+    /// lifecycle entry — same silent-omission-failure-mode
+    /// posture every prior PR's prefix-pin test names.
+    #[test]
+    fn pr_20_check_performed_kind_uses_invoice_prefix() {
+        assert_eq!(
+            EventKind::InvoiceCheckPerformed.as_str(),
+            "invoice.check_performed"
+        );
+        assert!(EventKind::InvoiceCheckPerformed
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// PR-20 / ADR-0033 §2: deliberate fork from the
+    /// submission-side kinds. The Layer-2 existence-check
+    /// outcome is a NAV-side query event, structurally
+    /// distinct from a manageInvoice submission attempt /
+    /// response / failure. Pinning the discriminator-level
+    /// distinction here catches a future refactor accidentally
+    /// collapsing the Layer-2 evidence kind onto one of the
+    /// existing submission kinds. Same posture
+    /// `pr_19_attempt_failed_is_distinct_from_submission_response`
+    /// + `pr_13_annulment_kinds_are_distinct_from_invoice_kinds`
+    /// use for their respective fork-discipline pins.
+    #[test]
+    fn pr_20_check_performed_is_distinct_from_submission_kinds() {
+        assert_ne!(
+            EventKind::InvoiceCheckPerformed.as_str(),
+            EventKind::InvoiceSubmissionAttempt.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceCheckPerformed.as_str(),
+            EventKind::InvoiceSubmissionResponse.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceCheckPerformed.as_str(),
+            EventKind::InvoiceSubmissionAttemptFailed.as_str()
         );
     }
 }

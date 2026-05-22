@@ -20,6 +20,7 @@
 //!   7. queryTransactionStatus operation (PR-7-C-1).
 //!   8. manageAnnulment operation (PR-13).
 //!   9. queryInvoiceData operation (PR-15).
+//!  10. queryInvoiceCheck operation (PR-20 / ADR-0033).
 //!
 //! Each variant carries enough context for an audit-ledger entry without
 //! leaking secret material — credential errors deliberately do NOT
@@ -328,4 +329,63 @@ pub enum NavTransportError {
     /// conflict 2").
     #[error("queryInvoiceData retryable error: {code} — {message}")]
     QueryInvoiceDataRetryable { code: String, message: String },
+
+    // ── 10. queryInvoiceCheck operation (PR-20 / ADR-0033) ─────────
+    /// HTTP-layer failure on queryInvoiceCheck (DNS, connection
+    /// reset, TLS handshake). Same shape as
+    /// `QueryInvoiceDataHttp` / `QueryTransactionStatusHttp`; held
+    /// distinct so the audit entry can distinguish operations
+    /// without reaching for the URL. PR-20 / ADR-0033 §4.
+    ///
+    /// `retry-submission`'s state-2 Layer-2 branch routes this
+    /// into the new `InvoiceCheckPerformed` audit entry with
+    /// `outcome = "failure"` and `failure_class = "transport"`
+    /// per ADR-0033 §1's three-phase posture (Phase 0 aborts the
+    /// retry on any queryInvoiceCheck failure; the operator
+    /// re-runs later).
+    #[error("queryInvoiceCheck HTTP call failed: {0}")]
+    QueryInvoiceCheckHttp(#[source] reqwest::Error),
+
+    /// NAV returned a non-success HTTP status to queryInvoiceCheck.
+    /// The body itself is captured by the caller per ADR-0009 §8
+    /// (the `InvoiceCheckPerformedPayload.response_xml` field
+    /// carries the verbatim bytes regardless of HTTP status).
+    /// PR-20 / ADR-0033 §4.
+    #[error("queryInvoiceCheck returned non-success HTTP status: {status}")]
+    QueryInvoiceCheckHttpStatus { status: u16 },
+
+    /// The queryInvoiceCheck response body could not be parsed
+    /// against the expected `<QueryInvoiceCheckResponse>` shape
+    /// (missing `<funcCode>`, missing or non-boolean
+    /// `<invoiceCheckResult>`, malformed XML, unexpected root
+    /// element, etc.). Loud per CLAUDE.md rule 12 — the boolean
+    /// parse refuses silent coercion to either truthiness on
+    /// unknown values (`"1"`, `"yes"`, etc.) so a NAV-side
+    /// schema change surfaces at the boundary, not as a wrong-
+    /// branch retry decision. PR-20 / ADR-0033 §3.
+    #[error("queryInvoiceCheck response parse failed: {0}")]
+    QueryInvoiceCheckResponseParse(String),
+
+    /// NAV responded with a non-retryable application-layer error
+    /// against queryInvoiceCheck (`INVALID_SECURITY_USER`,
+    /// `INVALID_REQUEST_SIGNATURE`, etc. per ADR-0009 §5). The
+    /// classification set is shared across operations per
+    /// ADR-0009 §5; `retry-submission`'s Phase 0 routes this into
+    /// the `InvoiceCheckPerformed` audit entry with
+    /// `outcome = "failure"` + `failure_class = "application"` and
+    /// aborts the retry. PR-20 / ADR-0033 §4.
+    #[error("queryInvoiceCheck non-retryable error: {code} — {message}")]
+    QueryInvoiceCheckNonRetryable { code: String, message: String },
+
+    /// NAV responded with a retryable application-layer error
+    /// against queryInvoiceCheck (`OPERATION_FAILED`, HTTP 504
+    /// per ADR-0009 §5). PR-20's Phase 0 surfaces this loud per
+    /// ADR-0033 §"Surfaced conflict 1" — the retry aborts on
+    /// any queryInvoiceCheck failure (Reading A) regardless of
+    /// retryable/non-retryable distinction; the operator re-runs
+    /// later. The `InvoiceCheckPerformed` audit entry's
+    /// `failure_class = "retryable_application"` keeps the
+    /// inspector-visible distinction for triage.
+    #[error("queryInvoiceCheck retryable error: {code} — {message}")]
+    QueryInvoiceCheckRetryable { code: String, message: String },
 }
