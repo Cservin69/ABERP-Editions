@@ -34,6 +34,7 @@ pub mod nav_xml;
 pub mod observe_receiver_confirmation;
 pub mod poll_ack;
 pub mod poll_annulment_ack;
+pub mod recover_from_nav;
 pub mod request_technical_annulment;
 pub mod retry_submission;
 pub mod serve;

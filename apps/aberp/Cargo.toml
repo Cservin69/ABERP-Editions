@@ -115,3 +115,13 @@ zstd = { workspace = true }
 # Enabling the feature here keeps it OUT of the production [dependencies]
 # above — production code paths cannot reach `Actor::test_only`. F15.
 aberp-audit-ledger = { path = "../../crates/audit-ledger", features = ["test-support"] }
+
+# PR-22 / ADR-0035 — the end-to-end writer-verifier round-trip test
+# at `tests/verify_bundle_round_trip.rs` exercises the real
+# `export_invoice_bundle::run` producer against `aberp_verify::
+# verify_bundle`'s consumer. Dev-dep only — the production aberp
+# binary does NOT depend on aberp-verify (the verifier is the
+# inspector-side artifact per ADR-0035 §"Surfaced conflict 1"
+# Reading A and lives outside the operator binary's trust
+# boundary).
+aberp-verify = { path = "../../crates/aberp-verify" }

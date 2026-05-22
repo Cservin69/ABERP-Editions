@@ -10,6 +10,7 @@ dependencies = [
  "aberp-billing",
  "aberp-nav-transport",
  "aberp-nav-xsd-validator",
+ "aberp-verify",
  "anyhow",
  "axum",
  "axum-server",
@@ -111,6 +112,25 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "aberp-verify"
+version = "0.0.0"
+dependencies = [
+ "aberp-audit-ledger",
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "tar",
+ "time",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+ "zstd",
 ]
 
 [[package]]

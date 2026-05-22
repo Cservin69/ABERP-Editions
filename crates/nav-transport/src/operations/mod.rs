@@ -49,7 +49,15 @@
 //!     parsed receiver-confirmation field is included today per
 //!     ADR-0028 §"Surfaced conflict 3"; the audit-evidence-bundle
 //!     reader inspects `response_xml` to determine receiver-
-//!     confirmation state.
+//!     confirmation state. PR-21 / ADR-0034 §3 ADDITIVELY adds
+//!     `query_invoice_data::parse_audit_data_transaction_id` —
+//!     a standalone parse helper that extracts the
+//!     `<auditData>/<transactionId>` element from a verbatim
+//!     `<QueryInvoiceDataResponse>` body. Invoked by the binary's
+//!     `recover_from_nav` orchestration on the chain-reconstruction
+//!     path; the `call` / `QueryInvoiceDataOutcome` surface is
+//!     UNCHANGED (the verbatim-bytes-first posture for the
+//!     receiver-confirmation field remains intact).
 //!   - `query_invoice_check::build_request` /
 //!     `query_invoice_check::send_built_request` are the
 //!     `build_request` + `send_built_request` split for

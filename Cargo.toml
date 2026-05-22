@@ -2,6 +2,11 @@
 #
 # Members:
 #   crates/audit-ledger      - tamper-evident hash-chained audit ledger (ADR-0008).
+#   crates/aberp-verify      - bundle verifier CLI (ADR-0035, PR-22) — re-verifies
+#                              a per-invoice export bundle from its own bytes alone;
+#                              separate-crate boundary per ADR-0035 §"Surfaced conflict 1"
+#                              so the inspector-side tool does NOT inherit NAV /
+#                              billing / DuckDB-write / Tauri transitive deps.
 #   crates/nav-transport     - NAV TLS transport + credential loading (ADR-0009 §4,
 #                              ADR-0020 §1-3, ADR-0021 §A14). PR-7-A.
 #   crates/nav-xsd-validator - hand-rolled <InvoiceData> v3.0 invariant check
@@ -28,6 +33,7 @@
 resolver = "2"
 members = [
     "crates/audit-ledger",
+    "crates/aberp-verify",
     "crates/nav-transport",
     "crates/nav-xsd-validator",
     "modules/billing",

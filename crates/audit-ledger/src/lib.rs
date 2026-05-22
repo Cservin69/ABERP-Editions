@@ -45,3 +45,24 @@ pub use entry::{Actor, BinaryHash, Entry, EntryHash, EntryId, EventKind, Sequenc
 pub use error::{AppendError, VerifyError};
 pub use mirror::{mirror_path_for, read_mirror_entries, sync_mirror, MirrorEntry};
 pub use storage::{append_in_tx, ensure_schema, Ledger, LedgerMeta, LedgerVerifyError};
+
+// PR-22 / ADR-0035 §8 — additive `pub use` re-exports of the chain
+// primitives that `aberp-verify` needs to re-verify a per-invoice
+// export bundle from its own bytes alone. Both items live in the
+// private `chain` module; the re-exports here are the only new
+// public surface PR-22 adds.
+//
+// `compute_entry_hash` re-runs the canonical CBOR encoder + SHA-256
+// over an [`Entry`] (excluding the `entry_hash` field itself); the
+// verifier compares the result against the entry's claimed
+// `entry_hash` to catch per-entry tampering. `genesis_hash` is the
+// chain anchor for entries with `seq == 1`; the verifier asserts
+// the first-entry `prev_hash` matches the genesis derived from the
+// manifest's tenant id.
+//
+// No behaviour change. No new EventKind variant. No F12 four-edit
+// ritual firing. ADR-0021 §A12's "one place for the canonical
+// encoder" discipline is preserved — the verifier reuses this
+// implementation rather than copying it.
+pub use chain::compute::compute_entry_hash;
+pub use chain::genesis::genesis_hash;

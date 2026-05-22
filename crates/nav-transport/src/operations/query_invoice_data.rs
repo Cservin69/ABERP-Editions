@@ -59,13 +59,32 @@
 //!     is a NAV *query* operation per ADR-0009 §4 — it
 //!     authenticates via the per-request `<user>` block alone,
 //!     same as `queryTransactionStatus`.
+//!
+//! # PR-21 / ADR-0034 §3 — additive `parse_audit_data_transaction_id`
+//!
+//! Alongside [`call`] (the verbatim-bytes-first operation per
+//! ADR-0028) PR-21 ADDITIVELY adds
+//! [`parse_audit_data_transaction_id`] — a standalone parse helper
+//! that extracts the `<auditData>/<transactionId>` element from a
+//! verbatim `<QueryInvoiceDataResponse>` body. Invoked by the
+//! binary's `recover_from_nav` orchestration to recover the
+//! NAV-assigned transactionId of an invoice whose original
+//! `manageInvoice` submission's Response was lost in transit
+//! (state-2 Pending with a prior `InvoiceCheckPerformed(outcome=exists)`
+//! audit entry per ADR-0033 §1). The [`call`] /
+//! [`QueryInvoiceDataOutcome`] surface is UNCHANGED — the
+//! receiver-confirmation field's verbatim-bytes-first posture per
+//! ADR-0028 §"Surfaced conflict 3" remains intact; the
+//! `query_invoice_data_outcome_shape_has_no_parsed_status_field`
+//! pin test continues to assert the absence of any parsed field on
+//! the outcome struct.
 
 use crate::credentials::NavCredentials;
 use crate::error::NavTransportError;
 use crate::soap::{self, InvoiceDirection};
 use crate::NavTransport;
 
-use super::{is_non_retryable, parse_result_block, NavResultBlock};
+use super::{find_first_text, is_non_retryable, parse_result_block, NavResultBlock};
 
 /// Successful queryInvoiceData outcome.
 ///
@@ -198,6 +217,66 @@ pub async fn call(
     })
 }
 
+/// PR-21 / ADR-0034 §3: extract the `<auditData>/<transactionId>` field
+/// from a verbatim `<QueryInvoiceDataResponse>` body. Used by the binary's
+/// `recover_from_nav` orchestration to recover the NAV-assigned
+/// transactionId of an invoice whose original `manageInvoice` submission's
+/// Response was lost in transit (state-2 Pending with a prior
+/// `InvoiceCheckPerformed(outcome=exists)` audit entry per ADR-0033 §1).
+///
+/// **Additive — does NOT touch the verbatim-bytes-first posture of
+/// [`call`] / [`QueryInvoiceDataOutcome`].** Per ADR-0028 §"Surfaced
+/// conflict 3" the OK happy path of `call` returns the verbatim bytes
+/// only; PR-15's `query_invoice_data_outcome_shape_has_no_parsed_status_field`
+/// pin test continues to assert the absence of a parsed
+/// receiver-confirmation field on the outcome struct. This helper
+/// extracts a **different** element (`<transactionId>` from the
+/// `<auditData>` block — NAV's record of the original submission's
+/// transactionId, unrelated to receiver-confirmation) and is invoked
+/// by the orchestration layer ONLY on the recovery path. The
+/// receiver-confirmation parsing remains named-deferred per
+/// ADR-0028; PR-21 does NOT fire the ADR-0028 §"Surfaced conflict 3"
+/// amendment trigger.
+///
+/// The NAV v3.0 spec places `<transactionId>` inside the
+/// `<auditData>` block of `<invoiceDataResult>`. The
+/// [`find_first_text`] helper is namespace-blind (matches by local
+/// name) and returns the FIRST occurrence — sufficient because the
+/// response shape carries at most one `<transactionId>` element.
+///
+/// Returns [`NavTransportError::QueryInvoiceDataResponseParse`] on:
+/// - Element missing entirely (NAV-side response-shape divergence;
+///   named trigger for an amendment ADR per ADR-0034 §"Open
+///   questions").
+/// - Element present but the text content is empty (defence-in-depth
+///   against a NAV-side bug or a hand-edited response fixture; the
+///   audit-ledger contract requires a non-empty transaction_id per
+///   `audit_payloads::InvoiceSubmissionResponsePayload`'s shape).
+/// - XML parse failure (delegated to [`find_first_text`]'s Result;
+///   routed through the same `QueryInvoiceDataResponseParse` variant
+///   as the existing parse-side failures inside [`call`]).
+pub fn parse_audit_data_transaction_id(
+    response_xml: &[u8],
+) -> Result<String, NavTransportError> {
+    let raw = find_first_text(response_xml, "transactionId")?.ok_or_else(|| {
+        NavTransportError::QueryInvoiceDataResponseParse(
+            "queryInvoiceData response missing <auditData>/<transactionId> — NAV-side \
+             response-shape divergence; NAV-testbed verification is the named trigger for \
+             an amendment ADR per ADR-0034 §\"Open questions\""
+                .to_string(),
+        )
+    })?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(NavTransportError::QueryInvoiceDataResponseParse(
+            "queryInvoiceData response carries empty <auditData>/<transactionId> — \
+             defence-in-depth loud-fail per CLAUDE.md rule 12"
+                .to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +311,100 @@ mod tests {
         ));
     }
 
+    /// PR-21 / ADR-0034 §3 happy path: extracts the
+    /// `<transactionId>` text from a verbatim queryInvoiceData
+    /// response body. The fixture's `<auditData>` block carries
+    /// the canonical NAV v3.0 placement (`<auditData>` inside
+    /// `<invoiceDataResult>` inside `<QueryInvoiceDataResponse>`).
+    /// CLAUDE.md rule 9: pins the recovery surface's load-bearing
+    /// transactionId extraction against a future refactor of
+    /// `find_first_text` (or a namespace-strictification pass).
+    #[test]
+    fn pr_21_parse_audit_data_transaction_id_extracts_recovered_txid() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<QueryInvoiceDataResponse xmlns="http://schemas.nav.gov.hu/OSA/3.0/api"
+                          xmlns:common="http://schemas.nav.gov.hu/NTCA/1.0/common">
+  <common:header>
+    <common:requestId>REQ-1</common:requestId>
+    <common:timestamp>20260520T120000Z</common:timestamp>
+    <common:requestVersion>3.0</common:requestVersion>
+    <common:headerVersion>1.0</common:headerVersion>
+  </common:header>
+  <common:result>
+    <common:funcCode>OK</common:funcCode>
+  </common:result>
+  <invoiceDataResult>
+    <invoiceData>BASE64INVOICEDATA</invoiceData>
+    <auditData>
+      <insdate>2026-05-20T11:59:30Z</insdate>
+      <insctsuser>technical-user</insctsuser>
+      <source>XML</source>
+      <transactionId>RECOVERED-TXID-12345</transactionId>
+      <index>1</index>
+      <batchIndex>1</batchIndex>
+      <originalRequestVersion>3.0</originalRequestVersion>
+    </auditData>
+  </invoiceDataResult>
+</QueryInvoiceDataResponse>"#;
+        let got =
+            parse_audit_data_transaction_id(body).expect("recovered transactionId must parse");
+        assert_eq!(got, "RECOVERED-TXID-12345");
+    }
+
+    /// PR-21 / ADR-0034 §3: an absent `<transactionId>` element
+    /// loud-fails with a named-route message that triggers the
+    /// NAV-testbed amendment surface. Pins the absence-shape
+    /// against a future contributor who collapses the loud-fail
+    /// into a `Ok(String::new())` (the silent-coercion failure
+    /// mode CLAUDE.md rule 12 specifically names).
+    #[test]
+    fn pr_21_parse_audit_data_transaction_id_loud_fails_on_missing_element() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<QueryInvoiceDataResponse xmlns="http://schemas.nav.gov.hu/OSA/3.0/api">
+  <common:result xmlns:common="http://schemas.nav.gov.hu/NTCA/1.0/common">
+    <common:funcCode>OK</common:funcCode>
+  </common:result>
+  <invoiceDataResult>
+    <invoiceData>BASE64</invoiceData>
+    <auditData>
+      <insdate>2026-05-20T11:59:30Z</insdate>
+    </auditData>
+  </invoiceDataResult>
+</QueryInvoiceDataResponse>"#;
+        let err = parse_audit_data_transaction_id(body)
+            .expect_err("missing transactionId must loud-fail");
+        assert!(matches!(
+            err,
+            NavTransportError::QueryInvoiceDataResponseParse(_)
+        ));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("missing <auditData>/<transactionId>"),
+            "loud-fail message must name the missing element: {msg}"
+        );
+    }
+
+    /// PR-21 / ADR-0034 §3: an empty (or whitespace-only)
+    /// `<transactionId>` text loud-fails the defence-in-depth
+    /// path. Pins the empty-shape against a tampered or
+    /// hand-edited fixture (the audit-ledger contract requires a
+    /// non-empty transaction_id).
+    #[test]
+    fn pr_21_parse_audit_data_transaction_id_loud_fails_on_empty_text() {
+        let body = br#"<auditData><transactionId>   </transactionId></auditData>"#;
+        let err = parse_audit_data_transaction_id(body)
+            .expect_err("empty transactionId must loud-fail");
+        assert!(matches!(
+            err,
+            NavTransportError::QueryInvoiceDataResponseParse(_)
+        ));
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("empty"),
+            "loud-fail message must name the empty-text case: {msg}"
+        );
+    }
+
     /// ADR-0028 §"Surfaced conflict 3" load-bearing pin: PR-15
     /// must NOT parse a receiver-confirmation status field out
     /// of the OK response. The contract is verbatim-bytes-only.
@@ -243,6 +416,12 @@ mod tests {
     /// a speculative parse step (CLAUDE.md rule 2 violation)
     /// would need to add a new field to `QueryInvoiceDataOutcome`
     /// and would surface that intent at type-system level.
+    ///
+    /// PR-21 / ADR-0034 §3 PRESERVES this contract — the new
+    /// `parse_audit_data_transaction_id` helper is invoked at the
+    /// orchestration layer, NOT inside `call`; the
+    /// `QueryInvoiceDataOutcome` struct shape stays at exactly two
+    /// public fields.
     #[test]
     fn query_invoice_data_outcome_shape_has_no_parsed_status_field() {
         // The outcome struct has exactly two public fields per

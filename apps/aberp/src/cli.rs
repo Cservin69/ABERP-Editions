@@ -373,6 +373,72 @@ pub enum Command {
     /// clobbering.
     ExportInvoiceBundle(ExportInvoiceBundleArgs),
 
+    /// Reconstruct the missing local `InvoiceSubmissionResponse`
+    /// audit entry for a state-2 Pending invoice that NAV already
+    /// has, per ADR-0009 §5 / ADR-0034 (PR-21). Closes F48 (the
+    /// second half of ADR-0009 §5's Layer-2 idempotency intent:
+    /// "fetch the chain via `queryInvoiceData` and reconstruct
+    /// local state").
+    ///
+    /// **Precondition** (ADR-0034 §5). `--invoice-id` must point
+    /// at an invoice classified as `Stuck(StuckStage::Pending)` by
+    /// `audit_query::stuck_precondition` AND whose most-recent
+    /// `InvoiceCheckPerformed` audit entry has `outcome="exists"`.
+    /// The Layer-2 Exists evidence is produced by PR-20 / ADR-0033
+    /// §1's `retry-submission` Phase 0 step — if no prior
+    /// `InvoiceCheckPerformed` exists for this invoice, run
+    /// `aberp retry-submission` first to disambiguate the NAV-side
+    /// state. A state-3 (AwaitingAck), terminal, or abandoned
+    /// invoice loud-fails before any NAV call.
+    ///
+    /// **Calls `queryInvoiceData` against the invoice's NAV-facing
+    /// invoice number** (constructed from the billing row's series
+    /// code + sequence number per ADR-0009 §3 — same shape every
+    /// `<invoiceNumber>` element ABERP emits). One-shot per
+    /// ADR-0034 §2 / ADR-0028 §4 (no loop). Parses
+    /// `<auditData>/<transactionId>` from the verbatim response
+    /// bytes per ADR-0034 §3 to recover the NAV-assigned
+    /// transactionId of the original submission.
+    ///
+    /// **Writes ONE recovered `InvoiceSubmissionResponse` audit
+    /// entry** carrying the recovered transactionId + the verbatim
+    /// `<QueryInvoiceDataResponse>` bytes as provenance evidence.
+    /// Reuses the existing payload shape per ADR-0034 §4 — no
+    /// new `EventKind` variant, no schema change, F12 four-edit
+    /// ritual does NOT fire. The preceding
+    /// `InvoiceCheckPerformed(outcome=exists)` entry IS the
+    /// recovered-from-NAV provenance marker.
+    ///
+    /// **Does NOT fabricate `InvoiceAckStatus`** per ADR-0034
+    /// §"Why reconstruct only `InvoiceSubmissionResponse`, not
+    /// `InvoiceAckStatus`" + CLAUDE.md rule 12. The operator's
+    /// next move is `aberp poll-ack` against the recovered
+    /// transactionId; `queryTransactionStatus` produces the
+    /// authoritative ack status via the existing PR-7-C-2 path.
+    ///
+    /// **`audit_query::stuck_precondition` UNCHANGED.** The
+    /// PR-20 / ADR-0033 §6 pin tests stay valid; Layer-2 entries
+    /// remain informational-only at the shared classifier per
+    /// ADR-0034 §"Surfaced conflict 3 Reading B".
+    ///
+    /// **What this command does NOT do:**
+    ///
+    ///   - It does NOT call `manageInvoice`. There is no re-POST
+    ///     on the recovery path — NAV already has the invoice.
+    ///   - It does NOT call `queryInvoiceCheck`. The Layer-2
+    ///     check is PR-20 / `retry-submission`'s responsibility;
+    ///     the precondition consumes the existing
+    ///     `InvoiceCheckPerformed(outcome=exists)` entry.
+    ///   - It does NOT call `queryTransactionStatus`. PR-7-C-2's
+    ///     `poll-ack` is the operator's next step.
+    ///   - It does NOT loop. One queryInvoiceData call per
+    ///     invocation.
+    ///   - It does NOT take a `--reason` flag. The recovery is
+    ///     mechanical reconstruction; the audit-evidence chain
+    ///     itself is the justification per ADR-0034 §1.
+    ///   - It does NOT mutate any billing row.
+    RecoverFromNav(RecoverFromNavArgs),
+
     /// Drain the offline submission queue per ADR-0009 §7 /
     /// ADR-0031 (PR-18). Walks the audit ledger, classifies every
     /// invoice with `InvoiceDraftCreated` but no
@@ -904,6 +970,58 @@ pub struct SubmitAnnulmentArgs {
     /// explicit per ADR-0020 §1 / ADR-0026 §1. Silently submitting
     /// an annulment to production when the operator meant test is
     /// the exact failure mode CLAUDE.md rule 12 names.
+    #[arg(long, value_enum)]
+    pub endpoint: NavEnv,
+}
+
+/// Args for `aberp recover-from-nav` (PR-21, ADR-0034 §1).
+///
+/// Five fields — same shape as
+/// [`ObserveReceiverConfirmationArgs`]. ABERP looks up the
+/// previously-issued invoice's NAV-facing invoice number from
+/// the billing store (no `--nav-invoice-number` flag — same
+/// posture as `observe-receiver-confirmation` per ADR-0028 §1).
+/// No `--reason` flag per ADR-0034 §1: the recovery is
+/// mechanical reconstruction of state NAV already has; the
+/// audit-evidence chain (the preceding
+/// `InvoiceCheckPerformed(outcome=exists)` entry plus the
+/// recovered `InvoiceSubmissionResponse`) is itself the
+/// justification.
+#[derive(Debug, Parser)]
+pub struct RecoverFromNavArgs {
+    /// Invoice id (prefixed form, `inv_<ULID>`) — the state-2
+    /// Pending invoice whose local Response chain needs
+    /// reconstruction from NAV's prior record. The precondition
+    /// (state-2 Pending AND most-recent
+    /// `InvoiceCheckPerformed.outcome == "exists"`) is
+    /// resolved from the audit ledger per ADR-0034 §5; loud-fail
+    /// with operator-visible guidance on every non-recoverable
+    /// shape (no prior check entry → run `aberp retry-submission`
+    /// first to produce the Layer-2 Exists evidence).
+    #[arg(long = "invoice-id")]
+    pub invoice_id: String,
+
+    /// Hungarian tax number of the submitter. Same accepted
+    /// forms + parser as every other `submit-*` / `poll-*` /
+    /// `observe-*` / `retry-*` command (`12345678`,
+    /// `12345678-1`, `12345678-1-42`); only the 8-digit base
+    /// goes to NAV per ADR-0009 §4.
+    #[arg(long = "tax-number")]
+    pub tax_number: String,
+
+    /// Path to the tenant DuckDB file.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives both the audit-ledger
+    /// genesis hash and the keychain service-name lookup
+    /// (`aberp.nav.<tenant>`).
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Which NAV environment to query against. No default —
+    /// explicit per ADR-0020 §1 / ADR-0034 §1 (same posture as
+    /// every other NAV-touching command).
     #[arg(long, value_enum)]
     pub endpoint: NavEnv,
 }

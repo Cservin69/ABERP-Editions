@@ -1,0 +1,76 @@
+[package]
+name = "aberp-verify"
+description = "Bundle verifier CLI for ABERP per-invoice export bundles (ADR-0035, PR-22 — closes F38 at the operator-driven level)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# The verifier ships as a single binary `aberp-verify`. A library face
+# exposes `verify_bundle` so consumers (today: the crate's own
+# integration tests under `tests/`) can drive the orchestration without
+# spawning a subprocess.
+[lib]
+name = "aberp_verify"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aberp-verify"
+path = "src/main.rs"
+
+# Production deps — deliberately narrow per ADR-0035 §2. The verifier
+# does NOT pull in `aberp-billing`, `aberp-nav-transport`,
+# `aberp-nav-xsd-validator`, `aberp` (the operator binary), `tauri`,
+# `axum`, `rcgen`, `rustls`, `reqwest`, `keyring`, or any other NAV /
+# UI / wire-protocol surface. The inspector's trust boundary is
+# narrowed accordingly.
+#
+# The `aberp-audit-ledger` dep transitively pulls in `duckdb` per the
+# audit-ledger crate's Cargo.toml — accepted per ADR-0035 §"Adversarial
+# review" #4 (the canonical encoder's one-place discipline per
+# ADR-0021 §A12 outweighs the duckdb-transitive cost; a future
+# `aberp-audit-chain` sub-crate extraction is named as the trigger-
+# driven amendment if the cost surfaces operationally).
+[dependencies]
+aberp-audit-ledger = { path = "../audit-ledger" }
+
+# Binary boundary: anyhow per ADR-0021 Part A item 2.
+anyhow = { workspace = true }
+
+# CLI scaffolding per ADR-0021 Part A item 4.
+clap = { workspace = true }
+
+# JSON parsing for the manifest + chain.jsonl per ADR-0029 §3.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Bundle archive format per ADR-0029 §8.
+tar = { workspace = true }
+zstd = { workspace = true }
+
+# chain.jsonl carries hex-encoded SHA-256 + base64-encoded payload
+# bytes per ADR-0029 §3.
+base64 = { workspace = true }
+hex = { workspace = true }
+
+# Time + ULID for entry reconstruction (parsing RFC3339 `time_wall`
+# strings + the `aud_<ULID>` entry-id prefix per ADR-0005).
+time = { workspace = true }
+ulid = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# Integration tests construct synthetic Ledger fixtures and pack
+# them into tar.zst bundles in-memory so the verifier can exercise
+# the full round-trip without depending on the `aberp` binary. The
+# `test-support` feature on `aberp-audit-ledger` exposes
+# `Actor::test_only` per the standard `feedback_self_referential_dev_dep`
+# pattern (apps/aberp's Cargo.toml uses the same idiom for
+# rollback_conformance.rs).
+aberp-audit-ledger = { path = "../audit-ledger", features = ["test-support"] }

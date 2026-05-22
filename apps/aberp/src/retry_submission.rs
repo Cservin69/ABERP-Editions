@@ -88,10 +88,13 @@
 //!
 //!   - **Exists** — NAV already has the invoice. Skip TX1 + TX2;
 //!     no re-POST happens; no duplicate-submission risk. The
-//!     operator-visible summary names the F48-deferred chain-
-//!     reconstruction gap loud (the local Response/Ack chain
-//!     remains absent — the operator inspects NAV's web UI or
-//!     waits for F48).
+//!     operator-visible summary points the operator at
+//!     `aberp recover-from-nav` (PR-21 / ADR-0034) to reconstruct
+//!     the local `InvoiceSubmissionResponse` from NAV's
+//!     `queryInvoiceData` and then `aberp poll-ack` to drive the
+//!     terminal state. The operator may alternatively run
+//!     `aberp mark-abandoned` locally to terminate the chain by
+//!     operator decision.
 //!   - **Absent** — NAV does NOT have the invoice. Proceed to
 //!     TX1 + TX2 per the pre-PR-20 / PR-19 shape. Genuine
 //!     transport-mid-flight loss; the re-POST is safe.
@@ -144,14 +147,21 @@
 //!   - It does NOT reconstruct the local Response/Ack chain after
 //!     a positive Layer-2 check. The post-positive-check NAV-side
 //!     state recovery (fetching the chain via `queryInvoiceData`
-//!     per ADR-0009 §5's full intent) is named-deferred as F48;
-//!     the operator-visible summary names the gap loud per
-//!     CLAUDE.md rule 12.
+//!     per ADR-0009 §5's full intent) lives on PR-21 / ADR-0034's
+//!     `aberp recover-from-nav` operator command (which closes
+//!     F48). retry-submission's state-2 + Exists operator-visible
+//!     summary points at recover-from-nav rather than completing
+//!     the recovery inline (per ADR-0034 §"Surfaced conflict 1
+//!     Reading B" — operator-driven explicit invocation; no
+//!     automatic chain reconstruction inside retry-submission).
 //!   - It does NOT poll `queryTransactionStatus` — the operator runs
 //!     `aberp poll-ack` after the retry, same as the original
-//!     submission flow. (For an `Exists` outcome there's no fresh
-//!     `transactionId` to poll; the operator's next move is
-//!     `mark-abandoned` locally or waiting for F48.)
+//!     submission flow. (For an `Exists` outcome the operator's
+//!     next move is `aberp recover-from-nav` to reconstruct the
+//!     Response from NAV's `queryInvoiceData`, then `aberp
+//!     poll-ack` against the recovered transactionId; or
+//!     `mark-abandoned` locally to terminate the chain by
+//!     operator decision.)
 //!   - It does NOT mutate any billing row — the `submission_state`
 //!     fact lives in the audit ledger per A5/A6.
 
@@ -350,13 +360,17 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
                      InvoiceCheckPerformed recorded with outcome=exists); \
                      invoice remains state-2 Pending locally because the \
                      prior submission's Response/Ack chain is absent — \
-                     the chain-reconstruction surface is named-deferred per F48 \
-                     (ADR-0033 §9); inspect NAV's web UI to view the prior \
-                     submission's transactionId, or run `aberp mark-abandoned` \
-                     locally to terminate the chain by operator decision",
+                     run `aberp recover-from-nav --invoice-id {} --tax-number ... \
+                     --endpoint {{test|production}}` to reconstruct the local \
+                     InvoiceSubmissionResponse from NAV's queryInvoiceData \
+                     (PR-21 / ADR-0034), then `aberp poll-ack` to drive the \
+                     terminal state via queryTransactionStatus; or run \
+                     `aberp mark-abandoned` locally to terminate the chain by \
+                     operator decision",
                     ready_invoice.id.to_prefixed_string(),
                     nav_invoice_number,
                     verified,
+                    ready_invoice.id.to_prefixed_string(),
                 );
                 return Ok(());
             }
