@@ -177,6 +177,18 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 # matches against; using hex here keeps that lineage.
 hex = "0.4"
 
+# ── PR-16 additions — per-invoice export bundle per ADR-0029 §8 ─────
+#
+# `.tar.zst` archive shape per ADR-0009 §8 (the per-invoice audit-
+# evidence bundle NAV inspectors consume). Both crates are
+# MIT/Apache-2.0 dual-licensed and pass the `deny.toml` allowlist;
+# the `tar` crate is pure-Rust with no native deps; the `zstd` crate
+# vendors libzstd via the `zstd-sys` chain (default features). Pin
+# floors here; Cargo.lock is the exact pin per ADR-0007 §"Supply
+# chain". No new feature flags off the defaults.
+tar = "0.4"
+zstd = "0.13"
+
 # ── PR-9-2 additions — Tauri operator UI shell per ADR-0004 ─────────
 #
 # Tauri 2.x is the desktop runtime. `default-features = false` strips

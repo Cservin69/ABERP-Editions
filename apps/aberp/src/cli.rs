@@ -315,6 +315,64 @@ pub enum Command {
     /// `submit-annulment` first otherwise.
     ObserveReceiverConfirmation(ObserveReceiverConfirmationArgs),
 
+    /// Export a per-invoice audit-evidence bundle as a single
+    /// `.tar.zst` archive that a NAV inspector can audit
+    /// without trusting ABERP at runtime (ADR-0008 §"Export",
+    /// ADR-0009 §8, ADR-0029; PR-16). The bundle contains the
+    /// full audit-ledger trail for one invoice (every entry
+    /// whose primary or chain-link invoice-id field matches),
+    /// every NAV-side request/response XML extracted as a
+    /// separate file inside the archive, and a top-level
+    /// manifest with the bundle's metadata + chain-verify
+    /// result.
+    ///
+    /// **Read-only.** No NAV calls. No audit-ledger writes.
+    /// No billing mutations. The keychain is not consulted.
+    /// Per ADR-0008 §"What goes in the ledger" + §"Access":
+    /// read-only queries do not produce audit entries; the
+    /// operator-visible event lands in `tracing` output
+    /// (RUST_LOG-routed), not in the audit ledger.
+    ///
+    /// **Chain verification gates the write.** Per ADR-0029
+    /// §6: `Ledger::verify_chain()` runs over the FULL
+    /// tenant chain BEFORE any archive bytes are produced.
+    /// On verify failure, the orchestration aborts loud
+    /// (CLAUDE.md rule 12) and produces no output file.
+    /// A tampered chain that shipped as a bundle would
+    /// mislead the inspector into trusting a forged history.
+    ///
+    /// **Unsigned + no-mirror at PR-16 time.** Per ADR-0029
+    /// §4 + §5: the bundle ships unsigned (F5 attestation-
+    /// signing key deferred; trigger has not fired) and
+    /// without mirror-file second-source assertion (F10
+    /// deferred to PR-17). Both gaps are named LOUD in the
+    /// manifest's `signed: false` / `signature_status:
+    /// "deferred-per-f5"` / `mirror_file_present: false` /
+    /// `mirror_file_status: "deferred-per-f10"` fields. A
+    /// future PR additively extends the manifest when the
+    /// gates lift; PR-16 bundles remain valid in their
+    /// stored form.
+    ///
+    /// **Bundle membership (ADR-0029 §2).** Every audit
+    /// entry whose payload has any invoice-id-shaped field
+    /// equal to `--invoice-id` is included: `invoice_id`,
+    /// `storno_invoice_id`, `modification_invoice_id`, OR
+    /// `base_invoice_id`. The BASE invoice's bundle thus
+    /// picks up the storno + modification chain-link entries
+    /// (which reference the base via `base_invoice_id`) as
+    /// well as its own primary-id entries; the chain
+    /// invoice's bundle picks up its own primary-id entries
+    /// + the same chain-link entry (which references it via
+    /// `storno_invoice_id` / `modification_invoice_id`).
+    /// Entries are written to `chain.jsonl` in `seq` order.
+    ///
+    /// **Refuse-overwrite by default.** Per ADR-0029 §1:
+    /// the orchestrator refuses to overwrite an existing
+    /// `--out` file unless `--allow-overwrite` is passed.
+    /// Preserves operator-visible artifacts from accidental
+    /// clobbering.
+    ExportInvoiceBundle(ExportInvoiceBundleArgs),
+
     /// Request a NAV-side technical annulment of a prior data
     /// submission against an invoice (ADR-0009 §6, ADR-0025; PR-12).
     /// A technical annulment **withdraws** the data submission to
@@ -887,6 +945,56 @@ pub struct PollAnnulmentAckArgs {
     /// every other `submit-*` / `poll-*` command).
     #[arg(long, value_enum)]
     pub endpoint: NavEnv,
+}
+
+/// Args for `aberp export-invoice-bundle` (PR-16, ADR-0029 §1).
+///
+/// Four-plus-one fields: required invoice id + output path,
+/// optional opt-in overwrite flag, plus the standard `--db` /
+/// `--tenant` pair every CLI command takes. No `--tax-number`,
+/// no `--endpoint`: the bundle reader does not call NAV.
+#[derive(Debug, Parser)]
+pub struct ExportInvoiceBundleArgs {
+    /// Invoice id (prefixed form, `inv_<ULID>`) of the invoice
+    /// whose audit-evidence bundle to produce. Every audit
+    /// entry whose primary or chain-link invoice-id field
+    /// matches per ADR-0029 §2 ("any-id-field-equality")
+    /// lands in the bundle's `chain.jsonl` in `seq` order.
+    /// Loud-fail if the bundle would contain zero entries
+    /// (no audit-ledger entries reference this invoice id
+    /// in any role).
+    #[arg(long = "invoice-id")]
+    pub invoice_id: String,
+
+    /// Path to write the `.tar.zst` archive. Refuses to
+    /// overwrite an existing file by default per ADR-0029
+    /// §1 + CLAUDE.md rule 12; opt in to overwrite via
+    /// [`Self::allow_overwrite`].
+    #[arg(long)]
+    pub out: PathBuf,
+
+    /// Opt-in to overwriting an existing `--out` file. Default
+    /// `false`. The refuse-overwrite default preserves
+    /// operator-visible artifacts from accidental clobbering;
+    /// the explicit opt-in makes overwrite a deliberate
+    /// operator decision per CLAUDE.md rule 12.
+    #[arg(long = "allow-overwrite", default_value_t = false)]
+    pub allow_overwrite: bool,
+
+    /// Path to the tenant DuckDB file. Read-only access; the
+    /// audit-ledger crate opens the file via `Ledger::open`
+    /// and runs `Ledger::entries()` + `Ledger::verify_chain()`
+    /// against it. No DDL, no mutations.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives the audit-ledger genesis
+    /// hash. (NAV credentials are NOT loaded —
+    /// `export-invoice-bundle` does not call NAV, so the
+    /// keychain is not consulted. Same posture as
+    /// `mark-abandoned` / `request-technical-annulment`.)
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
 }
 
 #[derive(Debug, Parser)]

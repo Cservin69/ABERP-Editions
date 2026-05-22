@@ -24,6 +24,7 @@ pub mod audit_payloads;
 pub mod audit_query;
 pub mod binary_hash;
 pub mod cli;
+pub mod export_invoice_bundle;
 pub mod issue_invoice;
 pub mod issue_modification;
 pub mod issue_storno;

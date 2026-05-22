@@ -15,7 +15,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use aberp::{
-    cli, issue_invoice, issue_modification, issue_storno, mark_abandoned,
+    cli, export_invoice_bundle, issue_invoice, issue_modification, issue_storno, mark_abandoned,
     observe_receiver_confirmation, poll_ack, poll_annulment_ack, request_technical_annulment,
     retry_submission, serve, setup_nav_credentials, submit_annulment, submit_invoice,
 };
@@ -38,6 +38,7 @@ fn main() -> Result<()> {
         cli::Command::SubmitAnnulment(a) => submit_annulment::run(&a),
         cli::Command::PollAnnulmentAck(a) => poll_annulment_ack::run(&a),
         cli::Command::ObserveReceiverConfirmation(a) => observe_receiver_confirmation::run(&a),
+        cli::Command::ExportInvoiceBundle(a) => export_invoice_bundle::run(&a),
     }
 }
 

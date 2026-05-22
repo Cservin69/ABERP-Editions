@@ -96,6 +96,20 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 hex = { workspace = true }
 
+# PR-16 additions — per-invoice export bundle per ADR-0029. The
+# `export-invoice-bundle` orchestration lives in the binary because
+# it consumes the existing audit-ledger crate's read surface
+# (`Ledger::entries` + `Ledger::verify_chain`) and the existing
+# per-payload audit_payloads structs. No new module-boundary surface
+# is introduced — the bundle reader is read-only orchestration over
+# the binary-side crates already in scope, per CLAUDE.md rule 3.
+# base64 is needed to encode the entry payload bytes into the
+# chain.jsonl manifest entries (per ADR-0029 §3's chain.jsonl line
+# shape); workspace already pins base64 from PR-7-B-1.
+base64 = { workspace = true }
+tar = { workspace = true }
+zstd = { workspace = true }
+
 [dev-dependencies]
 # Integration tests need `Actor::test_only` (rollback_conformance.rs).
 # Enabling the feature here keeps it OUT of the production [dependencies]
