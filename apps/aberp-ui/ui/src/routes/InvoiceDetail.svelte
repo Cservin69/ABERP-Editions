@@ -77,6 +77,55 @@
   // inspection-context posture from PR-26 / PR-27 / PR-29). No
   // new audit event — inspection remains read-only per CLAUDE.md
   // rule 13.
+  //
+  // PR-32 / session-36 — chain-children list on the BASE's detail
+  // view (Option T). PR-31 surfaced "this row has chain children"
+  // at the list-row badge layer; this PR answers "WHICH children"
+  // inside the modal. The backend's `get_invoice_detail` walker
+  // collects every `InvoiceStornoIssued` / `InvoiceModificationIssued`
+  // entry whose `base_invoice_id` equals the queried invoice and
+  // emits the chain child's own id under a typed `chain_children:
+  // ChainChildView[]` wire field. The renderer mounts a section
+  // between the meta-grid and the audit-trail table, one row per
+  // child (`<kind> → <invoice_id>`); each invoice_id reuses the
+  // `onNavigate` callback that PR-26 wired for audit-row chain-
+  // link buttons, so the operator can step in either direction of
+  // the chain (child → base via the audit-row link, base → child
+  // via this new list). No new Tauri command, no new audit event
+  // — inspection remains read-only per CLAUDE.md rule 13.
+  //
+  // PR-33 / session-37 — typed wire mirror of the latest NAV ack
+  // (Option Q). The backend's `get_invoice_detail` now emits a
+  // typed `last_ack_status: AckStatus | null` field; the renderer
+  // surfaces the value as a fifth meta-grid row beneath State /
+  // Total (gross). `null` renders as `—` (matches the
+  // `total_gross` null-render posture from PR-25). The value is
+  // the most-recent NAV ack for the invoice — useful for the
+  // RECEIVED / PROCESSING intermediate states the `Submitted`
+  // state chip collapses (the chip discriminates only the
+  // terminal SAVED / ABORTED ack values via `Finalized` /
+  // `Rejected`). Continues the typed-enum precedent from PR-28
+  // (`InvoiceState`) and PR-32 (`ChainChildKind`). No new Tauri
+  // command, no new audit event — inspection remains read-only
+  // per CLAUDE.md rule 13.
+  //
+  // PR-34 / session-38 — kind-label dispatch on the chain-children
+  // list (Option V). The PR-32 chain-children section rendered each
+  // row's kind as plain mono text (`<span class="chain-child-kind">
+  // Storno</span>`); this PR routes the kind through `labelMeta(...)`
+  // from `labels.ts` so the row carries the same icon + signal
+  // colour + tooltip as the state chip in the meta-grid above. The
+  // `ChainChildKind` typed union ("Storno" | "Amended") is a strict
+  // subset of `InvoiceState` so `labelMeta` resolves to a known
+  // entry on every wire value (`⊘` warning for Storno, `✎` warning
+  // for Amended); the muted "?" fallback per CLAUDE.md rule 12
+  // remains as a guardrail if the backend ever invents a kind the
+  // SPA does not model. No wire-shape change, no api.ts change, no
+  // labels.ts change, no new SPA dependency. Reuses the existing
+  // `.state-pill` CSS plus the per-signal classes; the now-unused
+  // `.chain-child-kind` rule is removed (its `color:
+  // var(--color-text-secondary)` lived only inside this list and is
+  // superseded by the per-signal-class colouring on the pill).
 
   import {
     getInvoice,
@@ -292,7 +341,36 @@
         </dd>
         <dt>Total (gross)</dt>
         <dd class="mono">{formatHuf(detail.total_gross)}</dd>
+        <dt>Latest ack</dt>
+        <dd class="mono">{detail.last_ack_status ?? "—"}</dd>
       </dl>
+
+      {#if detail.chain_children.length > 0}
+        <h3 class="section-head">Chain children</h3>
+        <ul class="chain-children-list">
+          {#each detail.chain_children as child (child.invoice_id)}
+            {@const childMeta = labelMeta(child.kind)}
+            <li class="mono">
+              <span
+                class="state-pill {signalClass(childMeta.signal)}"
+                title={childMeta.tooltip}
+              >
+                <span class="state-icon" aria-hidden="true">{childMeta.icon}</span>
+                <span class="state-text">{child.kind}</span>
+              </span>
+              <span class="chain-arrow" aria-hidden="true">→</span>
+              <button
+                type="button"
+                class="id-link"
+                onclick={() => onNavigate(child.invoice_id)}
+                aria-label={`Navigate to chain child invoice ${child.invoice_id}`}
+              >
+                {child.invoice_id}
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
 
       <h3 class="section-head">Audit trail</h3>
       {#if detail.audit_entries.length === 0}
@@ -599,6 +677,23 @@
   .chain-arrow {
     color: var(--color-text-muted);
     margin: 0 var(--space-1);
+  }
+
+  /* PR-32 — chain-children list. Quiet column of `<kind> →
+   * <invoice_id>` rows between the meta-grid and the audit-trail
+   * table. Aesthetic mirrors the audit-row chain-link affordance
+   * (`.id-link` + `.chain-arrow`) so the operator recognises the
+   * same chain semantics on both surfaces. Per ADR-0017 §1-2 the
+   * chrome stays quiet; the affordance is the underline-on-hover
+   * id-link. */
+  .chain-children-list {
+    list-style: none;
+    margin: 0 0 var(--space-5) 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: var(--type-size-sm);
   }
 
   /* PR-27 — disclosure-triangle toggle for the per-row payload

@@ -89,6 +89,40 @@ export interface AuditEntryView {
   payload: unknown;
 }
 
+/** PR-32 / session-36 — chain-children list entry. One per storno
+ * / modification invoice issued against a base. The detail-modal
+ * renderer lists these in a section between the meta-grid and the
+ * audit-trail table; each `invoice_id` is a clickable affordance
+ * that reuses the same `onNavigate` callback as the audit-row
+ * chain-link button (PR-26). Pinned by
+ * `invoice_detail_emits_chain_children` on the Rust side. */
+export interface ChainChildView {
+  kind: ChainChildKind;
+  invoice_id: string;
+}
+
+/** PR-32 / session-36 — typed kind discriminator for chain-children
+ * rows. PascalCase wire mirror of the two terminal `InvoiceState`
+ * labels (`Storno` / `Amended`); the SPA's `labels.ts` carries the
+ * same labels at the state-chip layer, so a chain-children row
+ * renders with the same affordance the operator already
+ * recognises from the list-row chip. */
+export type ChainChildKind = "Storno" | "Amended";
+
+/** PR-33 / session-37 — typed wire mirror for the four NAV v3.0
+ * `processingResult` values (Option Q). Mirrors `serve::AckStatus`
+ * under serde's `rename_all = "UPPERCASE"` so the wire form is the
+ * verbatim NAV literal. Two intermediate values
+ * (`RECEIVED`, `PROCESSING`) and two terminal (`SAVED`, `ABORTED`)
+ * per ADR-0009 §2; the deprecated pre-v3.0 `DONE` value is NOT
+ * represented — the NAV-transport inbound parser rejects it and the
+ * audit-ledger never persists it. Pinned by
+ * `ack_status_wire_shape_pins_uppercase_strings` on the Rust side;
+ * TS reads the wire shape strictly via the
+ * `last_ack_status: AckStatus | null` field on `InvoiceDetail` so a
+ * backend drift surfaces at `npm run check`. */
+export type AckStatus = "RECEIVED" | "PROCESSING" | "SAVED" | "ABORTED";
+
 /** The single-invoice detail — shape mirrors
  * `serve::InvoiceDetailResponse`. */
 export interface InvoiceDetail {
@@ -98,6 +132,28 @@ export interface InvoiceDetail {
   state: InvoiceState;
   total_gross: number | null;
   audit_entries: AuditEntryView[];
+  /** PR-32 / session-36 — chain-children list (Option T). For an
+   * invoice that is the BASE of at least one chain entry, this
+   * array enumerates every storno / modification invoice issued
+   * against it, in ledger-walk (i.e., issuance) order. Empty for
+   * invoices with no chain children (NOT null — the backend
+   * always emits a JSON array). The detail-modal renderer
+   * conditionally renders the section only when the array is
+   * non-empty. Pinned by `invoice_detail_emits_chain_children` on
+   * the Rust side; TS reads the wire shape strictly so a backend
+   * drift surfaces at `npm run check`. */
+  chain_children: ChainChildView[];
+  /** PR-33 / session-37 — latest NAV ack for this invoice (Option Q).
+   * `null` when no `InvoiceAckStatus` audit entry has been written
+   * yet (Draft / Pending lifecycle states) OR when a persisted
+   * string fails to parse as one of the four NAV v3.0 values (the
+   * audit-entries drill-down still surfaces the raw string via
+   * `payload`, so no information is lost). The detail-modal
+   * renderer surfaces the value as a meta-grid row next to State /
+   * Total (gross). Pinned by `invoice_detail_emits_last_ack_status`
+   * on the Rust side; TS reads the wire shape strictly via this
+   * typed field so a backend drift surfaces at `npm run check`. */
+  last_ack_status: AckStatus | null;
 }
 
 /** `GET /health` response — `serve::HealthResponse`. */

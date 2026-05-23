@@ -13,7 +13,15 @@
   //                       — PR-24 / ADR-0036 §7: chip carries icon +
   //                       label + hover tooltip; eleven labels per
   //                       ADR-0036 §2; per-label affordances come
-  //                       from `../lib/labels`.
+  //                       from `../lib/labels`. PR-31 / session-35
+  //                       appends a small `↘` chain-link badge to
+  //                       the right of the chip when the row's
+  //                       `has_chain_children` flag is true (the
+  //                       invoice is the base of at least one
+  //                       storno or amendment chain entry) so an
+  //                       inspector can see at a glance which rows
+  //                       have a chain history without opening the
+  //                       detail modal.
   //   Total (gross, HUF)  monospace, tabular numbers, right-aligned
   //
   // Per ADR-0017 §3 every numeric column is monospace + tabular +

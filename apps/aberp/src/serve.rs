@@ -495,6 +495,120 @@ struct InvoiceDetailResponse {
     state: InvoiceState,
     total_gross: Option<i64>,
     audit_entries: Vec<AuditEntryView>,
+    /// PR-32 / session-36 — chain-children list (Option T). For an
+    /// invoice that is the BASE of at least one chain entry, this
+    /// vector enumerates every storno / modification invoice issued
+    /// against it, in ledger-walk (i.e., issuance) order. Empty for
+    /// invoices with no chain children. The list-row badge from
+    /// PR-31 (`has_chain_children: bool`) tells the inspector
+    /// "this row has children"; this field tells the inspector
+    /// "WHICH children." The SPA renders the list in a section
+    /// between the meta-grid and the audit-trail table, each entry
+    /// clickable via the same `onNavigate` callback as the
+    /// audit-row chain-link affordance (PR-26). Pinned by
+    /// `invoice_detail_emits_chain_children`.
+    chain_children: Vec<ChainChildView>,
+    /// PR-33 / session-37 — typed wire emit of the latest NAV ack
+    /// for this invoice (Option Q). `Some(AckStatus)` when at least
+    /// one `InvoiceAckStatus` audit entry has been written for the
+    /// invoice; `None` for invoices with no ack yet (Draft / Pending
+    /// / etc) and for the rare case where a persisted string fails
+    /// to parse as one of the four NAV v3.0 values. The SPA's
+    /// `InvoiceDetail.svelte` renders the value as a meta-grid row
+    /// alongside Series #, Fiscal year, State, and Total (gross); a
+    /// `null` wire form renders as `—`. Mirrors the
+    /// `InvoiceTrace.last_ack_status` accumulator (which stays
+    /// `Option<String>` to preserve the persisted form for
+    /// `derive_state`'s string-keyed match per ADR-0036 §3 and the
+    /// `audit_query.rs` `prior_last_ack_status` command-side
+    /// posture). Pinned by `invoice_detail_emits_last_ack_status` +
+    /// `ack_status_wire_shape_pins_uppercase_strings`.
+    last_ack_status: Option<AckStatus>,
+}
+
+/// PR-32 / session-36 — chain-children list entry. One per storno /
+/// modification invoice issued against a base.
+#[derive(Serialize)]
+struct ChainChildView {
+    /// Which chain operation issued this child. Mirrors the two
+    /// chain-link `EventKind` variants
+    /// (`InvoiceStornoIssued` / `InvoiceModificationIssued`) under
+    /// the same PascalCase wire shape as `InvoiceState` for SPA-
+    /// side consumption (typed enum on the TS side per PR-28
+    /// precedent).
+    kind: ChainChildKind,
+    /// The chain child's own invoice id (the `storno_invoice_id` /
+    /// `modification_invoice_id` field from the chain-link payload
+    /// per ADR-0023 / ADR-0024).
+    invoice_id: String,
+}
+
+/// PR-32 / session-36 — typed kind discriminator for chain-children
+/// rows. Mirrors the terminal `InvoiceState` labels rather than the
+/// `EventKind` names so the SPA can render the same label set the
+/// state chip uses (`labels.ts`).
+#[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy)]
+enum ChainChildKind {
+    Storno,
+    Amended,
+}
+
+/// PR-33 / session-37 — typed wire mirror for the four NAV v3.0
+/// `processingResult` values (Option Q). The audit-ledger stores the
+/// NAV ack as a free `String` on `InvoiceAckStatusPayload.ack_status`
+/// (per `apps/aberp/src/audit_payloads.rs`); the wire shape now
+/// surfaces the latest-per-invoice value as a typed enum on
+/// `InvoiceDetailResponse.last_ack_status` so the SPA reads "the
+/// invoice's most-recent NAV ack" without parsing the audit-entries
+/// payload soup. Continues the typed-enum precedent set by PR-28
+/// (`InvoiceState`) and PR-32 (`ChainChildKind`).
+///
+/// `#[serde(rename_all = "UPPERCASE")]` matches the NAV wire literals
+/// verbatim — see `ProcessingStatus` in
+/// `crates/nav-transport/src/operations/query_transaction_status.rs`
+/// for the same four strings on the inbound parse path. The four
+/// values per ADR-0009 §2: two intermediate (`RECEIVED`,
+/// `PROCESSING`) and two terminal (`SAVED`, `ABORTED`). The
+/// deprecated `DONE` value is NOT represented — it does not appear
+/// in NAV v3.0 and the inbound `from_nav_str` parse already rejects
+/// it.
+///
+/// `Debug` + `PartialEq` + `Eq` + `Clone` + `Copy` keep test
+/// assertions ergonomic (the per-variant wire-pin test compares
+/// against literal variants via `assert_eq!`), mirroring `InvoiceState`'s
+/// derive set.
+#[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "UPPERCASE")]
+enum AckStatus {
+    Received,
+    Processing,
+    Saved,
+    Aborted,
+}
+
+/// PR-33 / session-37 — parse a persisted `InvoiceAckStatusPayload.ack_status`
+/// string to the typed wire enum.
+///
+/// The stored values SHOULD always be one of the four NAV v3.0
+/// strings — `query_transaction_status::ProcessingStatus::from_nav_str`
+/// rejects every other value on the inbound parse path, so a stored
+/// non-NAV string would indicate DB tampering OR a schema drift.
+/// Returns `None` for unrecognised input rather than failing the
+/// whole read endpoint; the audit-entries drill-down (PR-27) still
+/// surfaces the raw string verbatim via the typed payload JSON, so
+/// no information is lost at the operator surface.
+///
+/// Strict per-variant match (not a `serde_json::from_str` round-trip)
+/// keeps the conversion local and avoids an allocation on the hot
+/// path of `get_invoice_detail`.
+fn parse_ack_status(s: &str) -> Option<AckStatus> {
+    match s {
+        "RECEIVED" => Some(AckStatus::Received),
+        "PROCESSING" => Some(AckStatus::Processing),
+        "SAVED" => Some(AckStatus::Saved),
+        "ABORTED" => Some(AckStatus::Aborted),
+        _ => None,
+    }
 }
 
 #[derive(Serialize)]
@@ -670,11 +784,12 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
         // via its own InvoiceSequenceReserved + InvoiceDraftCreated
         // pair) AND `base_invoice_id` (the chain link's anchor,
         // which is what flips the BASE invoice's trace into Storno
-        // / Amended). Probe specifically for the base_invoice_id
-        // and tag the base's trace.
-        if let Some((kind, base_id)) = extract_chain_base_link(entry) {
-            let trace = by_invoice.entry(base_id).or_default();
-            match kind {
+        // / Amended). Probe extracts both ids so this base-side
+        // trace flip and the PR-32 chain-children walker (in
+        // `get_invoice_detail`) share one parse per chain entry.
+        if let Some(link) = extract_chain_link(entry) {
+            let trace = by_invoice.entry(link.base_invoice_id).or_default();
+            match link.kind {
                 EventKind::InvoiceStornoIssued => trace.is_storno_base = true,
                 EventKind::InvoiceModificationIssued => trace.is_amended_base = true,
                 _ => {}
@@ -710,6 +825,7 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
 
     let mut trace = InvoiceTrace::default();
     let mut audit_entries: Vec<AuditEntryView> = Vec::new();
+    let mut chain_children: Vec<ChainChildView> = Vec::new();
     let mut found_any = false;
     for entry in &entries {
         if let Some(id) = extract_invoice_id(entry) {
@@ -727,12 +843,32 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         // entries belong to the storno / modification invoice's
         // own audit lineage; the base's lineage references them
         // only via the derived state label per ADR-0009 §2.
-        if let Some((kind, base_id)) = extract_chain_base_link(entry) {
-            if base_id == invoice_id {
+        //
+        // PR-32 / session-36 — same pass also collects the
+        // chain CHILD's id into `chain_children` so the detail
+        // modal can list "WHICH children" alongside the badge's
+        // "has children." Ordering is ledger-walk order
+        // (insertion order into `Vec`), which is monotonically
+        // increasing seq per ADR-0008 — operator-meaningful as
+        // "chain entries in the order they were issued."
+        if let Some(link) = extract_chain_link(entry) {
+            if link.base_invoice_id == invoice_id {
                 found_any = true;
-                match kind {
-                    EventKind::InvoiceStornoIssued => trace.is_storno_base = true,
-                    EventKind::InvoiceModificationIssued => trace.is_amended_base = true,
+                match link.kind {
+                    EventKind::InvoiceStornoIssued => {
+                        trace.is_storno_base = true;
+                        chain_children.push(ChainChildView {
+                            kind: ChainChildKind::Storno,
+                            invoice_id: link.child_invoice_id,
+                        });
+                    }
+                    EventKind::InvoiceModificationIssued => {
+                        trace.is_amended_base = true;
+                        chain_children.push(ChainChildView {
+                            kind: ChainChildKind::Amended,
+                            invoice_id: link.child_invoice_id,
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -755,6 +891,16 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         ),
         None => (0, 0, None),
     };
+    // PR-33 / session-37 — typed wire emit of the latest NAV ack
+    // for this invoice. `trace.last_ack_status` carries the raw
+    // persisted string from `InvoiceAckStatusPayload.ack_status`;
+    // parse it to the four-valued `AckStatus` enum at the wire
+    // boundary. Unknown strings fall through to `None` (the audit-
+    // entries drill-down still exposes the raw value).
+    let last_ack_status = trace
+        .last_ack_status
+        .as_deref()
+        .and_then(parse_ack_status);
     Ok(Some(InvoiceDetailResponse {
         invoice_id: invoice_id.to_string(),
         sequence_number,
@@ -762,6 +908,8 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         state: trace.derive_state(),
         total_gross,
         audit_entries,
+        chain_children,
+        last_ack_status,
     }))
 }
 
@@ -792,8 +940,10 @@ fn audit_view_of(entry: &Entry) -> AuditEntryView {
         occurred_at: entry.time_wall.to_string(),
         // PR-26 — reuse the existing chain-link probe. The probe
         // already short-circuits on kind first per ADR-0036 §4, so
-        // the cost is bounded for non-chain entries.
-        chain_base_invoice_id: extract_chain_base_link(entry).map(|(_, base)| base),
+        // the cost is bounded for non-chain entries. PR-32 widened
+        // the probe's return to also carry the chain child id; the
+        // audit-entry view consumes only the base id here.
+        chain_base_invoice_id: extract_chain_link(entry).map(|link| link.base_invoice_id),
         // PR-27 — the full typed payload as raw JSON. Every
         // `audit_payloads::*` type serialises via `serde_json::to_vec`
         // (F9 — closed in PR-6.1) so the bytes always parse cleanly;
@@ -840,7 +990,7 @@ fn read_invoice_row(
 ///     `InvoiceCheckPerformed`'s `outcome` field (PR-20 / ADR-0033
 ///     §6). Drives the `PendingNavExists` sub-label.
 ///   - `is_storno_base` / `is_amended_base` — set by
-///     [`extract_chain_base_link`] from
+///     [`extract_chain_link`] from
 ///     `InvoiceStornoIssuedPayload` / `InvoiceModificationIssuedPayload`
 ///     entries whose `base_invoice_id` equals this invoice's id
 ///     (PR-10 / ADR-0023, PR-11 / ADR-0024). Drives the `Storno` /
@@ -861,10 +1011,10 @@ struct InvoiceTrace {
     /// Values per ADR-0033 §2: `"exists"` / `"absent"` / `"failure"`.
     latest_check_outcome: Option<String>,
     /// PR-23 / ADR-0036 §4 — base of an `InvoiceStornoIssued` chain
-    /// entry. Set via [`extract_chain_base_link`].
+    /// entry. Set via [`extract_chain_link`].
     is_storno_base: bool,
     /// PR-23 / ADR-0036 §4 — base of an `InvoiceModificationIssued`
-    /// chain entry. Set via [`extract_chain_base_link`].
+    /// chain entry. Set via [`extract_chain_link`].
     is_amended_base: bool,
 }
 
@@ -1054,32 +1204,76 @@ fn is_recovered_response_xml(response_xml: &[u8]) -> bool {
 /// auditable in one place per ADR-0036 §5.
 const NEEDLE_QUERY_INVOICE_DATA_RESPONSE: &[u8] = b"QueryInvoiceDataResponse";
 
-/// PR-23 / ADR-0036 §4 — chain-base detection probe.
+/// PR-23 / ADR-0036 §4 — chain-link detection probe.
 ///
 /// `InvoiceStornoIssuedPayload` and
 /// `InvoiceModificationIssuedPayload` do NOT carry a top-level
 /// `invoice_id` field; the existing [`extract_invoice_id`] probe
 /// returns `None` for these entries. This sister probe walks the
-/// per-payload `base_invoice_id` field and returns the
-/// (kind, base_id) pair so the BASE invoice's trace can be
-/// flipped into Storno / Amended at the list-and-detail walker
-/// level.
+/// per-payload chain-link fields and returns the chain entry's
+/// own invoice id (`storno_invoice_id` / `modification_invoice_id`)
+/// alongside the `base_invoice_id` so the BASE invoice's trace
+/// can be flipped into Storno / Amended at the list-and-detail
+/// walker level AND the base's detail view can list its children
+/// (PR-32 / Option T).
+///
+/// PR-32 / session-36 — extended in place rather than forked into
+/// a sister probe per reuse-over-fork (A106). The added field
+/// `child_invoice_id` is the chain entry's own id, parsed from
+/// whichever payload-specific field carries it; every call site
+/// that previously consumed `(kind, base_id)` is updated to
+/// destructure the [`ChainLink`] struct.
 ///
 /// Returns `None` for every other `EventKind` (the typed probe
 /// would fail to decode on the wrong payload shape; we
 /// short-circuit on kind match first to keep the cost bounded).
-fn extract_chain_base_link(entry: &Entry) -> Option<(EventKind, String)> {
+fn extract_chain_link(entry: &Entry) -> Option<ChainLink> {
     #[derive(Deserialize)]
-    struct Probe {
+    struct StornoProbe {
+        storno_invoice_id: String,
+        base_invoice_id: String,
+    }
+    #[derive(Deserialize)]
+    struct ModificationProbe {
+        modification_invoice_id: String,
         base_invoice_id: String,
     }
     match entry.kind {
-        EventKind::InvoiceStornoIssued | EventKind::InvoiceModificationIssued => {
-            let probe: Probe = serde_json::from_slice(&entry.payload).ok()?;
-            Some((entry.kind.clone(), probe.base_invoice_id))
+        EventKind::InvoiceStornoIssued => {
+            let probe: StornoProbe = serde_json::from_slice(&entry.payload).ok()?;
+            Some(ChainLink {
+                kind: entry.kind.clone(),
+                child_invoice_id: probe.storno_invoice_id,
+                base_invoice_id: probe.base_invoice_id,
+            })
+        }
+        EventKind::InvoiceModificationIssued => {
+            let probe: ModificationProbe = serde_json::from_slice(&entry.payload).ok()?;
+            Some(ChainLink {
+                kind: entry.kind.clone(),
+                child_invoice_id: probe.modification_invoice_id,
+                base_invoice_id: probe.base_invoice_id,
+            })
         }
         _ => None,
     }
+}
+
+/// PR-32 / session-36 — chain-link probe return shape.
+///
+/// Carries the two chain-link identifiers needed by every consumer:
+///   - `child_invoice_id` — the chain entry's OWN invoice id (i.e.,
+///     the storno or modification invoice itself).
+///   - `base_invoice_id` — the BASE invoice the chain entry is
+///     attached to.
+///
+/// Plus `kind`, the originating `EventKind` discriminant so callers
+/// can match `InvoiceStornoIssued` / `InvoiceModificationIssued`
+/// without re-parsing the payload.
+struct ChainLink {
+    kind: EventKind,
+    child_invoice_id: String,
+    base_invoice_id: String,
 }
 
 /// Extract the `invoice_id` field (if any) from an audit-ledger entry's
@@ -1393,9 +1587,9 @@ mod tests {
                     trace.merge_entry(entry, invoice_id);
                 }
             }
-            if let Some((kind, base_id)) = extract_chain_base_link(entry) {
-                if base_id == invoice_id {
-                    match kind {
+            if let Some(link) = extract_chain_link(entry) {
+                if link.base_invoice_id == invoice_id {
+                    match link.kind {
                         EventKind::InvoiceStornoIssued => trace.is_storno_base = true,
                         EventKind::InvoiceModificationIssued => trace.is_amended_base = true,
                         _ => {}
@@ -1904,5 +2098,270 @@ mod tests {
             Some(false),
             "has_chain_children must serialise as a JSON boolean (false case)",
         );
+    }
+
+    /// PR-32 / session-36 — `InvoiceDetailResponse` MUST carry a
+    /// `chain_children: ChainChildView[]` field on the JSON wire
+    /// shape per the session-35-named Option T lift. The SPA's
+    /// `InvoiceDetail` modal reads this list strictly (the TS
+    /// interface in `apps/aberp-ui/ui/src/lib/api.ts` types it as
+    /// `ChainChildView[]`); a silent field rename, removal, or
+    /// re-shape (e.g., `kind` swapped from the typed PascalCase
+    /// enum to a free-string) would diverge the wire shape and
+    /// collapse the chain-children section. CLAUDE.md rule 12:
+    /// pin the contract loud.
+    ///
+    /// CLAUDE.md rule 9: BOTH the empty-list case and the
+    /// two-children-of-different-kinds case are covered so a
+    /// regression that hard-codes the field (or returns a
+    /// constant) cannot pass both assertions vacuously. The
+    /// kinds-of-different-kinds case also pins the
+    /// `ChainChildKind::Storno` / `Amended` wire form to the
+    /// PascalCase strings `"Storno"` / `"Amended"` so a future
+    /// serde-rename gone wrong is caught here rather than at the
+    /// SPA labels-table lookup.
+    ///
+    /// The production derivation (the chain-children walker pass
+    /// in `get_invoice_detail` that pushes a `ChainChildView` per
+    /// matching chain entry) is exercised end-to-end by
+    /// `derive_state_label_table_mirror` indirectly via the same
+    /// `trace_for` walker shape; this pin catches the WIRE drift
+    /// independent of the walker drift.
+    #[test]
+    fn invoice_detail_emits_chain_children() {
+        // Empty-list case — every non-chain-base invoice must
+        // serialise an empty array for the field (NOT `null`,
+        // NOT a missing key) so the SPA's strict TS read
+        // (`ChainChildView[]`) does not need an undefined guard.
+        let empty = InvoiceDetailResponse {
+            invoice_id: "inv_PLAIN".to_string(),
+            sequence_number: 1,
+            fiscal_year: 2026,
+            state: InvoiceState::Ready,
+            total_gross: None,
+            audit_entries: Vec::new(),
+            chain_children: Vec::new(),
+            last_ack_status: None,
+        };
+        let v = serde_json::to_value(&empty)
+            .expect("InvoiceDetailResponse must always serialise");
+        let arr = v
+            .get("chain_children")
+            .and_then(|x| x.as_array())
+            .expect("chain_children must serialise as a JSON array");
+        assert!(
+            arr.is_empty(),
+            "chain_children must serialise as an empty array when there are no children",
+        );
+
+        // Non-empty case — two children of different kinds. Pins
+        // both the per-entry shape (`{kind, invoice_id}`) AND the
+        // PascalCase wire form of the two `ChainChildKind`
+        // variants.
+        let with_chain = InvoiceDetailResponse {
+            invoice_id: "inv_BASE".to_string(),
+            sequence_number: 42,
+            fiscal_year: 2026,
+            state: InvoiceState::Storno,
+            total_gross: Some(123_456),
+            audit_entries: Vec::new(),
+            chain_children: vec![
+                ChainChildView {
+                    kind: ChainChildKind::Amended,
+                    invoice_id: "inv_MOD".to_string(),
+                },
+                ChainChildView {
+                    kind: ChainChildKind::Storno,
+                    invoice_id: "inv_STORNO".to_string(),
+                },
+            ],
+            last_ack_status: None,
+        };
+        let v = serde_json::to_value(&with_chain)
+            .expect("InvoiceDetailResponse must always serialise");
+        let arr = v
+            .get("chain_children")
+            .and_then(|x| x.as_array())
+            .expect("chain_children must serialise as a JSON array");
+        assert_eq!(arr.len(), 2, "two chain children must round-trip");
+
+        assert_eq!(
+            arr[0].get("kind").and_then(|x| x.as_str()),
+            Some("Amended"),
+            "ChainChildKind::Amended must serialise as PascalCase `Amended`",
+        );
+        assert_eq!(
+            arr[0].get("invoice_id").and_then(|x| x.as_str()),
+            Some("inv_MOD"),
+            "chain child invoice_id must serialise verbatim",
+        );
+
+        assert_eq!(
+            arr[1].get("kind").and_then(|x| x.as_str()),
+            Some("Storno"),
+            "ChainChildKind::Storno must serialise as PascalCase `Storno`",
+        );
+        assert_eq!(
+            arr[1].get("invoice_id").and_then(|x| x.as_str()),
+            Some("inv_STORNO"),
+            "chain child invoice_id must serialise verbatim",
+        );
+    }
+
+    /// PR-33 / session-37 — the typed `AckStatus` enum MUST serialise
+    /// each variant to the exact UPPERCASE string NAV v3.0 emits on
+    /// the inbound parse path and the SPA expects in
+    /// `apps/aberp-ui/ui/src/lib/api.ts`. A silent rename at either
+    /// end (e.g., dropping `#[serde(rename_all = "UPPERCASE")]` on
+    /// the enum, swapping it for SCREAMING_SNAKE_CASE, or a typo in
+    /// the SPA `AckStatus` union) would diverge the wire shape from
+    /// the persisted form in `InvoiceAckStatusPayload.ack_status` and
+    /// collapse the detail-modal "Latest ack" meta-grid value to an
+    /// empty render. CLAUDE.md rule 12: pin the contract loud.
+    ///
+    /// CLAUDE.md rule 9: per-variant coverage means a regression that
+    /// collapses all variants to one string (or to PascalCase) cannot
+    /// hide behind a single matching assertion.
+    ///
+    /// Mirror invariant with `parse_ack_status` covered by
+    /// `ack_status_parse_round_trip`: every variant that serialises to
+    /// a UPPERCASE string MUST parse back from that same string. The
+    /// pair prevents a one-sided rename that would let serialise and
+    /// parse drift.
+    #[test]
+    fn ack_status_wire_shape_pins_uppercase_strings() {
+        let cases: [(AckStatus, &str); 4] = [
+            (AckStatus::Received, "RECEIVED"),
+            (AckStatus::Processing, "PROCESSING"),
+            (AckStatus::Saved, "SAVED"),
+            (AckStatus::Aborted, "ABORTED"),
+        ];
+        for (variant, expected) in cases {
+            let value = serde_json::to_value(variant)
+                .expect("AckStatus variants must always serialise");
+            assert_eq!(
+                value,
+                serde_json::Value::String(expected.to_string()),
+                "AckStatus::{variant:?} wire form drifted from `{expected}`",
+            );
+        }
+    }
+
+    /// PR-33 / session-37 — `parse_ack_status` MUST round-trip with
+    /// `Serialize` for every variant. A regression that re-cases the
+    /// match arms (e.g., to PascalCase) without re-casing the serde
+    /// rename would let `get_invoice_detail` emit `null` for every
+    /// invoice and the operator would see a permanent `—` in the
+    /// "Latest ack" cell — a silent failure mode rather than a loud
+    /// one. The round-trip pins both sides at the same call site so
+    /// the drift is impossible.
+    ///
+    /// Also pins the two unknown-input behaviours used by the
+    /// production path: a non-NAV string parses to `None` (so the
+    /// wire field falls back to `null` rather than failing the read
+    /// endpoint), and the empty string also parses to `None`.
+    #[test]
+    fn ack_status_parse_round_trip() {
+        for variant in [
+            AckStatus::Received,
+            AckStatus::Processing,
+            AckStatus::Saved,
+            AckStatus::Aborted,
+        ] {
+            let wire = serde_json::to_value(variant)
+                .expect("AckStatus must serialise");
+            let s = wire.as_str().expect("AckStatus emits a string");
+            assert_eq!(
+                parse_ack_status(s),
+                Some(variant),
+                "AckStatus::{variant:?} wire `{s}` must parse back to the same variant",
+            );
+        }
+        assert_eq!(
+            parse_ack_status("DONE"),
+            None,
+            "deprecated pre-v3.0 `DONE` must NOT parse — NAV v3.0 dropped it",
+        );
+        assert_eq!(
+            parse_ack_status(""),
+            None,
+            "empty string must NOT parse to any AckStatus variant",
+        );
+        assert_eq!(
+            parse_ack_status("saved"),
+            None,
+            "lowercase must NOT parse — wire form is strictly UPPERCASE per NAV v3.0",
+        );
+    }
+
+    /// PR-33 / session-37 — `InvoiceDetailResponse` MUST carry a
+    /// typed `last_ack_status: Option<AckStatus>` field on the JSON
+    /// wire shape per the session-36-named Option Q lift. The SPA's
+    /// `InvoiceDetail` modal reads this field strictly (the TS
+    /// interface in `apps/aberp-ui/ui/src/lib/api.ts` types it as
+    /// `AckStatus | null`); a silent field rename, removal, or
+    /// re-shape would diverge the wire shape and collapse the
+    /// detail-modal "Latest ack" cell. CLAUDE.md rule 12: pin the
+    /// contract loud.
+    ///
+    /// CLAUDE.md rule 9: BOTH the `None` (null) case AND each of the
+    /// four `Some` cases are covered so a regression that hard-codes
+    /// the field to a single value cannot pass every assertion
+    /// vacuously. Together with
+    /// `ack_status_wire_shape_pins_uppercase_strings` this pins the
+    /// per-variant wire-emit AND the field-presence-plus-shape on
+    /// the parent struct.
+    #[test]
+    fn invoice_detail_emits_last_ack_status() {
+        // Null case — an invoice with no ack yet must serialise the
+        // field as JSON `null` (NOT a missing key) so the SPA's
+        // strict TS read (`AckStatus | null`) does not need an
+        // undefined guard.
+        let none = InvoiceDetailResponse {
+            invoice_id: "inv_NONE".to_string(),
+            sequence_number: 1,
+            fiscal_year: 2026,
+            state: InvoiceState::Ready,
+            total_gross: None,
+            audit_entries: Vec::new(),
+            chain_children: Vec::new(),
+            last_ack_status: None,
+        };
+        let v = serde_json::to_value(&none)
+            .expect("InvoiceDetailResponse must always serialise");
+        assert!(
+            v.get("last_ack_status").map(|x| x.is_null()).unwrap_or(false),
+            "last_ack_status must serialise as JSON null when there is no ack",
+        );
+
+        // Each Some variant — covers all four NAV v3.0 values
+        // through the parent struct's serialisation path. The wire
+        // emit on the parent must match the per-variant pin from
+        // `ack_status_wire_shape_pins_uppercase_strings`.
+        let cases: [(AckStatus, &str); 4] = [
+            (AckStatus::Received, "RECEIVED"),
+            (AckStatus::Processing, "PROCESSING"),
+            (AckStatus::Saved, "SAVED"),
+            (AckStatus::Aborted, "ABORTED"),
+        ];
+        for (variant, expected) in cases {
+            let some = InvoiceDetailResponse {
+                invoice_id: "inv_SOME".to_string(),
+                sequence_number: 7,
+                fiscal_year: 2026,
+                state: InvoiceState::Submitted,
+                total_gross: Some(1_000),
+                audit_entries: Vec::new(),
+                chain_children: Vec::new(),
+                last_ack_status: Some(variant),
+            };
+            let v = serde_json::to_value(&some)
+                .expect("InvoiceDetailResponse must always serialise");
+            assert_eq!(
+                v.get("last_ack_status").and_then(|x| x.as_str()),
+                Some(expected),
+                "last_ack_status must serialise AckStatus::{variant:?} as `{expected}`",
+            );
+        }
     }
 }
