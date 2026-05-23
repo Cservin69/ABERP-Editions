@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <GetExchangeRatesResponse xmlns="http://www.mnbarfolyamservice.hu/">
+      <GetExchangeRatesResult>&lt;MNBExchangeRates&gt;&lt;Day date="2026-05-22"&gt;&lt;Rate curr="EUR" unit="1"&gt;405,2300&lt;/Rate&gt;&lt;/Day&gt;&lt;/MNBExchangeRates&gt;</GetExchangeRatesResult>
+    </GetExchangeRatesResponse>
+  </soap:Body>
+</soap:Envelope>
