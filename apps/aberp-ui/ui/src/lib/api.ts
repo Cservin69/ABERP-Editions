@@ -99,6 +99,21 @@ export interface AuditEntryView {
 export interface ChainChildView {
   kind: ChainChildKind;
   invoice_id: string;
+  /** PR-41 / session-45 — per-base chain index allocated at issuance
+   * time (`InvoiceStornoIssuedPayload.modification_index` /
+   * `InvoiceModificationIssuedPayload.modification_index` on the
+   * Rust side). Shared name space across both kinds: the next
+   * storno or modification against the same base receives
+   * `max(modification_index) + 1` per
+   * `next_modification_index_in_tx` in `issue_storno.rs` /
+   * `issue_modification.rs`. Operator-meaningful as the per-row
+   * answer to "which entry in this base's chain?"; the
+   * detail-modal renderer surfaces it as a leading `#N` glyph on
+   * each chain-children row. Pinned by
+   * `invoice_detail_emits_chain_children` on the Rust side; TS
+   * reads the wire shape strictly via this typed field so a
+   * backend drift surfaces at `npm run check`. */
+  modification_index: number;
 }
 
 /** PR-32 / session-36 — typed kind discriminator for chain-children
@@ -106,8 +121,19 @@ export interface ChainChildView {
  * labels (`Storno` / `Amended`); the SPA's `labels.ts` carries the
  * same labels at the state-chip layer, so a chain-children row
  * renders with the same affordance the operator already
- * recognises from the list-row chip. */
-export type ChainChildKind = "Storno" | "Amended";
+ * recognises from the list-row chip.
+ *
+ * PR-37 / session-41 — tightened via `Extract<InvoiceState, ...>` so
+ * the PR-34 `labelMeta(kind)` dispatch's `ChainChildKind ⊆ InvoiceState`
+ * invariant is pinned at the type level. If a future ADR drops or
+ * renames one of the two terminal labels in `InvoiceState`, this
+ * alias degenerates (to `"Amended"`, `"Storno"`, or `never`) and
+ * every consumer fails `npm run check` per CLAUDE.md rule 12 (fail
+ * loud) rather than silently dispatching to the muted "?" fallback.
+ * The runtime shape is byte-identical pre/post PR-37 — the Extract
+ * evaluates to the same `"Storno" | "Amended"` union today; only the
+ * type-level dependency on `InvoiceState` is new. */
+export type ChainChildKind = Extract<InvoiceState, "Storno" | "Amended">;
 
 /** PR-33 / session-37 — typed wire mirror for the four NAV v3.0
  * `processingResult` values (Option Q). Mirrors `serve::AckStatus`

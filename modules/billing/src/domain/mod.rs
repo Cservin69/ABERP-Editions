@@ -6,7 +6,9 @@
 //! Sub-files:
 //!
 //! - [`ids`]         ULID newtypes for entities owned by billing.
-//! - [`money`]       HUF-only `Huf` amount type (ADR-0009 §1 — currency).
+//! - [`money`]       `Huf` + `Eur` amount types, `Currency` closed-vocab
+//!                   enum, and the currency-aware `Money` sum (ADR-0009 §1
+//!                   extended by ADR-0037 §3 — see PR-44α).
 //! - [`invoice`]     `LineItem`, `DraftInvoice`, `ReadyInvoice`.
 //! - [`series`]      `InvoiceSeries`, `SeriesCode`, `ResetPolicy`.
 //! - [`reservation`] `SequenceReservation`, `ReservationStatus`.

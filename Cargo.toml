@@ -7,6 +7,11 @@
 #                              separate-crate boundary per ADR-0035 §"Surfaced conflict 1"
 #                              so the inspector-side tool does NOT inherit NAV /
 #                              billing / DuckDB-write / Tauri transitive deps.
+#   crates/mnb-rates         - MNB (Magyar Nemzeti Bank) exchange-rate fetcher
+#                              (ADR-0037 §2). PR-44β. Hand-rolled SOAP over the
+#                              MNB GetExchangeRates web service; same operator-
+#                              twin posture as nav-transport (no SOAP-client
+#                              dep; quick-xml only).
 #   crates/nav-transport     - NAV TLS transport + credential loading (ADR-0009 §4,
 #                              ADR-0020 §1-3, ADR-0021 §A14). PR-7-A.
 #   crates/nav-xsd-validator - hand-rolled <InvoiceData> v3.0 invariant check
@@ -34,6 +39,7 @@ resolver = "2"
 members = [
     "crates/audit-ledger",
     "crates/aberp-verify",
+    "crates/mnb-rates",
     "crates/nav-transport",
     "crates/nav-xsd-validator",
     "modules/billing",

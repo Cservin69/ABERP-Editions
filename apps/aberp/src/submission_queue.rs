@@ -11,6 +11,19 @@
 //! `pending` / `submitted` / `abandoned`, plus the constants ADR-0009
 //! §7 names (hard cap, alert thresholds).
 //!
+//! # PR-42 / F45 — state-2 Pending classifier extension
+//!
+//! [`pending_retries_from_ledger`] is the state-2 Pending sibling of
+//! [`pending_from_ledger`]: the `aberp drain-pending-retries` worker
+//! consumes it to drive an automatic Layer-2 + TX1+wire+TX2 retry per
+//! state-2 stuck invoice. Predicate per ADR-0032 §4: an Attempt
+//! exists, no Response, no MarkedAbandoned. Sibling-and-not-fused
+//! per CLAUDE.md rule 7 — drain-submission-queue and drain-pending-
+//! retries are operator-confirmed-distinct phases of the offline-
+//! recovery surface (state-1 backlog vs. state-2 mid-flight loss);
+//! merging them would average two distinct predicates into one
+//! ambiguous list.
+//!
 //! # Predicate (ADR-0031 §1, extended by ADR-0032 §5)
 //!
 //! An invoice is `pending submission` iff ALL of the following hold:
@@ -251,6 +264,182 @@ fn classify_pending(entries: &[Entry]) -> Result<Vec<PendingInvoice>> {
             idempotency_key,
             nav_xml_path: payload.nav_xml_path,
             issue_date: entry.time_wall,
+        });
+    }
+
+    // FIFO by issue_date asc, tie-break by invoice_id asc.
+    pending.sort_by(|a, b| {
+        a.issue_date
+            .cmp(&b.issue_date)
+            .then_with(|| a.invoice_id.cmp(&b.invoice_id))
+    });
+
+    Ok(pending)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// PendingRetry — state-2 Pending classifier (PR-42 / F45 / ADR-0032 §4)
+// ──────────────────────────────────────────────────────────────────────
+
+/// One invoice currently in state-2 Pending per ADR-0032 §4: an
+/// `InvoiceSubmissionAttempt` entry exists, but no
+/// `InvoiceSubmissionResponse` and no `InvoiceMarkedAbandoned`. The
+/// `aberp drain-pending-retries` worker drives one Layer-2 →
+/// TX1+wire+TX2 retry pipeline per entry, FIFO by issuance.
+///
+/// PR-42 / F45 closure. The struct mirrors [`PendingInvoice`]'s field
+/// shape so the drain-pending-retries per-invoice driver and the
+/// drain-submission-queue per-invoice driver share idempotency-key /
+/// nav_xml_path / issue_date semantics; the `aberp retry-submission`
+/// operator command keeps its own CLI-arg input shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRetry {
+    /// Prefixed `inv_<ULID>` form.
+    pub invoice_id: String,
+    /// The original issuance's idempotency key (F8 contract — every
+    /// NAV-related entry for an invoice shares the same key). Read
+    /// from the most-recent `InvoiceSubmissionAttempt` entry's payload
+    /// per ADR-0032 §4's idempotency_key semantics.
+    pub idempotency_key: IdempotencyKey,
+    /// On-disk NAV InvoiceData XML path, read from the matching
+    /// `InvoiceDraftCreatedPayload.nav_xml_path`. `None` for pre-
+    /// PR-18 entries; the drain worker loud-fails per CLAUDE.md
+    /// rule 12 — pre-PR-18 state-2 invoices must be drained via the
+    /// operator-driven `aberp retry-submission --invoice-xml <path>`
+    /// command, not the automatic loop.
+    pub nav_xml_path: Option<String>,
+    /// Issuance wall-clock time — read from the
+    /// `InvoiceDraftCreated` audit entry's `time_wall` column. Drives
+    /// FIFO ordering across pending retries (oldest stuck invoice
+    /// retries first; matches the `pending_from_ledger` posture).
+    pub issue_date: OffsetDateTime,
+}
+
+/// Walk the audit ledger once and return every state-2 Pending
+/// invoice in issue-date order (FIFO).
+///
+/// Single-pass O(n) over the ledger. Predicate per ADR-0032 §4:
+///
+///   - The audit ledger contains an `InvoiceSubmissionAttempt` entry
+///     whose payload's `invoice_id` equals the invoice's prefixed
+///     ULID.
+///   - The audit ledger does NOT contain any
+///     `InvoiceSubmissionResponse` entry for the same invoice_id.
+///   - The audit ledger does NOT contain any
+///     `InvoiceMarkedAbandoned` entry for the same invoice_id.
+///
+/// The presence of `InvoiceSubmissionAttemptFailed` does NOT change
+/// classification (an Attempt + AttemptFailed is still state-2
+/// Pending; the operator may re-retry per ADR-0032 §4). Multiple
+/// Attempts for the same invoice deduplicate to a single PendingRetry
+/// (the F8 contract pins one idempotency key per invoice).
+///
+/// Returned vec is sorted by `issue_date` ascending, ties broken by
+/// `invoice_id` ascending — deterministic and stable across runs.
+pub fn pending_retries_from_ledger(ledger: &Ledger) -> Result<Vec<PendingRetry>> {
+    let entries = ledger
+        .entries()
+        .context("read audit ledger entries to classify pending retries")?;
+    classify_pending_retries(&entries)
+}
+
+/// Pure classifier — operates on a borrowed entry slice so unit
+/// tests can drive it with fixtures without round-tripping a real
+/// `Ledger`.
+fn classify_pending_retries(entries: &[Entry]) -> Result<Vec<PendingRetry>> {
+    use std::collections::{HashMap, HashSet};
+
+    // First pass: collect the invoice_ids excluded by Response or
+    // MarkedAbandoned, AND index the Draft entries for nav_xml_path +
+    // issue_date lookup.
+    let mut excluded: HashSet<String> = HashSet::new();
+    let mut draft_meta: HashMap<String, (Option<String>, OffsetDateTime)> = HashMap::new();
+    for entry in entries {
+        match entry.kind {
+            EventKind::InvoiceSubmissionResponse => {
+                let payload: audit_payloads::InvoiceSubmissionResponsePayload =
+                    serde_json::from_slice(&entry.payload).map_err(|e| {
+                        anyhow!(
+                            "InvoiceSubmissionResponse audit payload (seq {}) failed typed decode: {e} \
+                             — audit ledger appears tampered or schema-drifted",
+                            entry.seq.as_u64()
+                        )
+                    })?;
+                excluded.insert(payload.invoice_id);
+            }
+            EventKind::InvoiceMarkedAbandoned => {
+                let payload: audit_payloads::InvoiceMarkedAbandonedPayload =
+                    serde_json::from_slice(&entry.payload).map_err(|e| {
+                        anyhow!(
+                            "InvoiceMarkedAbandoned audit payload (seq {}) failed typed decode: {e} \
+                             — audit ledger appears tampered or schema-drifted",
+                            entry.seq.as_u64()
+                        )
+                    })?;
+                excluded.insert(payload.invoice_id);
+            }
+            EventKind::InvoiceDraftCreated => {
+                let payload: audit_payloads::InvoiceDraftCreatedPayload =
+                    serde_json::from_slice(&entry.payload).map_err(|e| {
+                        anyhow!(
+                            "InvoiceDraftCreated audit payload (seq {}) failed typed decode: {e} \
+                             — audit ledger appears tampered or schema-drifted",
+                            entry.seq.as_u64()
+                        )
+                    })?;
+                draft_meta.insert(payload.invoice_id, (payload.nav_xml_path, entry.time_wall));
+            }
+            _ => {}
+        }
+    }
+
+    // Second pass: collect every Attempt's invoice_id (deduplicated),
+    // then build PendingRetry rows for those not excluded.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut pending: Vec<PendingRetry> = Vec::new();
+    for entry in entries {
+        if entry.kind != EventKind::InvoiceSubmissionAttempt {
+            continue;
+        }
+        let payload: audit_payloads::InvoiceSubmissionAttemptPayload =
+            serde_json::from_slice(&entry.payload).map_err(|e| {
+                anyhow!(
+                    "InvoiceSubmissionAttempt audit payload (seq {}) failed typed decode: {e} \
+                     — audit ledger appears tampered or schema-drifted",
+                    entry.seq.as_u64()
+                )
+            })?;
+        if excluded.contains(&payload.invoice_id) {
+            continue;
+        }
+        if !seen.insert(payload.invoice_id.clone()) {
+            continue;
+        }
+        let idempotency_key = IdempotencyKey::from_canonical_string(&payload.idempotency_key)
+            .ok_or_else(|| {
+                anyhow!(
+                    "InvoiceSubmissionAttempt payload (seq {}) idempotency_key '{}' failed parse — \
+                     the audit ledger appears tampered or schema-drifted",
+                    entry.seq.as_u64(),
+                    payload.idempotency_key
+                )
+            })?;
+        let (nav_xml_path, issue_date) = match draft_meta.get(&payload.invoice_id) {
+            Some((p, d)) => (p.clone(), *d),
+            None => {
+                return Err(anyhow!(
+                    "InvoiceSubmissionAttempt for invoice {} has no matching \
+                     InvoiceDraftCreated entry in the ledger — \
+                     the audit ledger appears tampered or schema-drifted",
+                    payload.invoice_id
+                ));
+            }
+        };
+        pending.push(PendingRetry {
+            invoice_id: payload.invoice_id,
+            idempotency_key,
+            nav_xml_path,
+            issue_date,
         });
     }
 
@@ -880,6 +1069,188 @@ mod tests {
         assert_eq!(class, "application");
         assert!(code.is_none());
     }
+
+    // ── PR-42 / F45 — PendingRetry classifier ───────────────────────
+
+    fn write_submission_attempt(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        invoice_id: &str,
+        idem: IdempotencyKey,
+    ) {
+        let payload = audit_payloads::InvoiceSubmissionAttemptPayload::new(
+            invoice_id,
+            idem,
+            "test",
+            b"<request/>".to_vec(),
+        );
+        ledger
+            .append(
+                EventKind::InvoiceSubmissionAttempt,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    /// Empty ledger has no pending retries. Pins the degenerate-input
+    /// behaviour against future regressions.
+    #[test]
+    fn empty_ledger_has_no_pending_retries() {
+        let (ledger, _actor) = fixture_ledger();
+        let pending = pending_retries_from_ledger(&ledger).unwrap();
+        assert!(pending.is_empty());
+    }
+
+    /// A Draft alone (no Attempt) is NOT a pending retry — that's a
+    /// state-1 Draft, handled by `pending_from_ledger`. Pins the
+    /// fork-by-state-2-vs-state-1 contract.
+    #[test]
+    fn draft_alone_is_not_a_pending_retry() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft_created(&mut ledger, &actor, "inv_A", idem, Some("/tmp/A.xml"));
+        let pending = pending_retries_from_ledger(&ledger).unwrap();
+        assert!(pending.is_empty());
+    }
+
+    /// Draft + Attempt with no Response or Abandon classifies as
+    /// state-2 Pending. The base case of the PendingRetry classifier.
+    #[test]
+    fn draft_with_attempt_classifies_as_pending_retry() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft_created(&mut ledger, &actor, "inv_A", idem, Some("/tmp/A.xml"));
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        let pending = pending_retries_from_ledger(&ledger).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].invoice_id, "inv_A");
+        assert_eq!(pending[0].nav_xml_path.as_deref(), Some("/tmp/A.xml"));
+        assert_eq!(pending[0].idempotency_key, idem);
+    }
+
+    /// Draft + Attempt + Response is NOT pending — the Response
+    /// excludes per ADR-0032 §4 (state-2 requires NO Response).
+    #[test]
+    fn draft_attempt_response_is_not_pending_retry() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft_created(&mut ledger, &actor, "inv_A", idem, Some("/tmp/A.xml"));
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        write_submission_response(&mut ledger, &actor, "inv_A", idem, "TXID-A");
+        let pending = pending_retries_from_ledger(&ledger).unwrap();
+        assert!(pending.is_empty());
+    }
+
+    /// Draft + Attempt + MarkedAbandoned is NOT pending — the
+    /// abandonment excludes per ADR-0032 §4.
+    #[test]
+    fn draft_attempt_abandoned_is_not_pending_retry() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft_created(&mut ledger, &actor, "inv_A", idem, Some("/tmp/A.xml"));
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        write_marked_abandoned(&mut ledger, &actor, "inv_A", idem, "TXID-A");
+        let pending = pending_retries_from_ledger(&ledger).unwrap();
+        assert!(pending.is_empty());
+    }
+
+    /// Multiple Attempts for the same invoice (a state-2 retry that
+    /// itself failed and wrote a fresh Attempt) dedupe to ONE
+    /// PendingRetry. The F8 contract pins one idempotency key per
+    /// invoice; the classifier returns one entry per still-pending
+    /// invoice regardless of how many failed attempts accumulated.
+    #[test]
+    fn multiple_attempts_dedupe_to_one_pending_retry() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft_created(&mut ledger, &actor, "inv_A", idem, Some("/tmp/A.xml"));
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        let pending = pending_retries_from_ledger(&ledger).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].invoice_id, "inv_A");
+    }
+
+    /// Cross-invoice contamination: a Response for B does NOT block
+    /// A's pending-retry classification. Mirrors the
+    /// `pending_classification_does_not_cross_invoice_ids` pin.
+    #[test]
+    fn pending_retry_classification_does_not_cross_invoice_ids() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem_a = IdempotencyKey::new();
+        let idem_b = IdempotencyKey::new();
+        write_draft_created(&mut ledger, &actor, "inv_A", idem_a, Some("/tmp/A.xml"));
+        write_draft_created(&mut ledger, &actor, "inv_B", idem_b, Some("/tmp/B.xml"));
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem_a);
+        write_submission_attempt(&mut ledger, &actor, "inv_B", idem_b);
+        // B's submission completed; A is stuck.
+        write_submission_response(&mut ledger, &actor, "inv_B", idem_b, "TXID-B");
+        let pending = pending_retries_from_ledger(&ledger).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].invoice_id, "inv_A");
+    }
+
+    /// Pre-PR-18 Draft entries (no `nav_xml_path` field) classify
+    /// with `nav_xml_path: None`. The drain worker loud-fails on
+    /// `None` per CLAUDE.md rule 12; the classifier reports the data
+    /// faithfully and lets the driver name the recovery flag.
+    #[test]
+    fn pre_pr_18_draft_with_attempt_classifies_with_none_path() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_draft_created(&mut ledger, &actor, "inv_A", idem, None);
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
+        let pending = pending_retries_from_ledger(&ledger).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].nav_xml_path, None);
+    }
+
+    /// Deterministic ordering: two calls on the same ledger return
+    /// the same order. CLAUDE.md rule 9 — non-determinism from a
+    /// HashMap leak would surface here.
+    #[test]
+    fn pending_retries_are_deterministically_ordered() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem_a = IdempotencyKey::new();
+        let idem_b = IdempotencyKey::new();
+        write_draft_created(&mut ledger, &actor, "inv_B", idem_b, Some("/tmp/B.xml"));
+        write_draft_created(&mut ledger, &actor, "inv_A", idem_a, Some("/tmp/A.xml"));
+        write_submission_attempt(&mut ledger, &actor, "inv_B", idem_b);
+        write_submission_attempt(&mut ledger, &actor, "inv_A", idem_a);
+        let p1 = pending_retries_from_ledger(&ledger).unwrap();
+        let p2 = pending_retries_from_ledger(&ledger).unwrap();
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p1, p2);
+    }
+
+    /// Attempt entry without a matching Draft loud-fails — the
+    /// audit ledger appears tampered or schema-drifted. CLAUDE.md
+    /// rule 12 surface: silently swallowing the missing Draft would
+    /// mask ledger corruption.
+    #[test]
+    fn attempt_without_matching_draft_loud_fails() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        // Skip Draft; write Attempt directly.
+        write_submission_attempt(&mut ledger, &actor, "inv_orphan", idem);
+        let err = pending_retries_from_ledger(&ledger).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no matching InvoiceDraftCreated"));
+        assert!(msg.contains("inv_orphan"));
+    }
+
+    /// Classify on empty slice returns empty vec.
+    #[test]
+    fn classify_pending_retries_returns_empty_on_empty_slice() {
+        let entries: Vec<Entry> = vec![];
+        let pending = classify_pending_retries(&entries).unwrap();
+        assert_eq!(pending.len(), 0);
+    }
+
+    // ── PR-19 / ADR-0032 §2 — classify_attempt_failure (continued) ──
 
     /// PR-19 / ADR-0032 §2: cross-classifier symmetry pin. For
     /// every variant `is_transport_error` returns true on, the

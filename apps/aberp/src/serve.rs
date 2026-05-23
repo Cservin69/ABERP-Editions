@@ -541,6 +541,18 @@ struct ChainChildView {
     /// `modification_invoice_id` field from the chain-link payload
     /// per ADR-0023 / ADR-0024).
     invoice_id: String,
+    /// PR-41 / session-45 — the per-base chain index allocated at
+    /// issuance time (`InvoiceStornoIssuedPayload.modification_index`
+    /// / `InvoiceModificationIssuedPayload.modification_index`).
+    /// Shared name space across both kinds: the next storno or
+    /// modification against the same base receives
+    /// `max(modification_index) + 1` per
+    /// `next_modification_index_in_tx` in `issue_storno.rs` /
+    /// `issue_modification.rs`. Operator-meaningful as the per-row
+    /// answer to "which entry in this base's chain?"; surfaced on
+    /// the detail-modal chain-children list per Option W. Pinned by
+    /// `invoice_detail_emits_chain_children`.
+    modification_index: u32,
 }
 
 /// PR-32 / session-36 — typed kind discriminator for chain-children
@@ -860,6 +872,7 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
                         chain_children.push(ChainChildView {
                             kind: ChainChildKind::Storno,
                             invoice_id: link.child_invoice_id,
+                            modification_index: link.modification_index,
                         });
                     }
                     EventKind::InvoiceModificationIssued => {
@@ -867,6 +880,7 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
                         chain_children.push(ChainChildView {
                             kind: ChainChildKind::Amended,
                             invoice_id: link.child_invoice_id,
+                            modification_index: link.modification_index,
                         });
                     }
                     _ => {}
@@ -1232,11 +1246,13 @@ fn extract_chain_link(entry: &Entry) -> Option<ChainLink> {
     struct StornoProbe {
         storno_invoice_id: String,
         base_invoice_id: String,
+        modification_index: u32,
     }
     #[derive(Deserialize)]
     struct ModificationProbe {
         modification_invoice_id: String,
         base_invoice_id: String,
+        modification_index: u32,
     }
     match entry.kind {
         EventKind::InvoiceStornoIssued => {
@@ -1245,6 +1261,7 @@ fn extract_chain_link(entry: &Entry) -> Option<ChainLink> {
                 kind: entry.kind.clone(),
                 child_invoice_id: probe.storno_invoice_id,
                 base_invoice_id: probe.base_invoice_id,
+                modification_index: probe.modification_index,
             })
         }
         EventKind::InvoiceModificationIssued => {
@@ -1253,6 +1270,7 @@ fn extract_chain_link(entry: &Entry) -> Option<ChainLink> {
                 kind: entry.kind.clone(),
                 child_invoice_id: probe.modification_invoice_id,
                 base_invoice_id: probe.base_invoice_id,
+                modification_index: probe.modification_index,
             })
         }
         _ => None,
@@ -1261,11 +1279,18 @@ fn extract_chain_link(entry: &Entry) -> Option<ChainLink> {
 
 /// PR-32 / session-36 — chain-link probe return shape.
 ///
-/// Carries the two chain-link identifiers needed by every consumer:
+/// Carries the chain-link identifiers needed by every consumer:
 ///   - `child_invoice_id` — the chain entry's OWN invoice id (i.e.,
 ///     the storno or modification invoice itself).
 ///   - `base_invoice_id` — the BASE invoice the chain entry is
 ///     attached to.
+///   - `modification_index` — the per-base chain index allocated by
+///     `next_modification_index_in_tx` in `issue_storno.rs` /
+///     `issue_modification.rs` (PR-41 / session-45 — surfaced on the
+///     chain-children list per Option W). Shared name space across
+///     stornos and modifications against the same base; the persisted
+///     payload field is the same `modification_index: u32` on both
+///     `InvoiceStornoIssuedPayload` and `InvoiceModificationIssuedPayload`.
 ///
 /// Plus `kind`, the originating `EventKind` discriminant so callers
 /// can match `InvoiceStornoIssued` / `InvoiceModificationIssued`
@@ -1274,6 +1299,7 @@ struct ChainLink {
     kind: EventKind,
     child_invoice_id: String,
     base_invoice_id: String,
+    modification_index: u32,
 }
 
 /// Extract the `invoice_id` field (if any) from an audit-ledger entry's
@@ -2121,6 +2147,17 @@ mod tests {
     /// serde-rename gone wrong is caught here rather than at the
     /// SPA labels-table lookup.
     ///
+    /// PR-41 / session-45 — extended to pin the new
+    /// `modification_index: number` per-row field (Option W). The
+    /// two children use distinct non-1 indices (3 and 7) so a
+    /// regression that hard-codes `1` or collapses the two rows to
+    /// the same number cannot pass both assertions vacuously per
+    /// CLAUDE.md rule 9. The chain-link probe in
+    /// `extract_chain_link` pulls the value off
+    /// `InvoiceStornoIssuedPayload.modification_index` /
+    /// `InvoiceModificationIssuedPayload.modification_index`; this
+    /// pin catches the wire-shape drift independent of the probe.
+    ///
     /// The production derivation (the chain-children walker pass
     /// in `get_invoice_detail` that pushes a `ChainChildView` per
     /// matching chain entry) is exercised end-to-end by
@@ -2155,9 +2192,11 @@ mod tests {
         );
 
         // Non-empty case — two children of different kinds. Pins
-        // both the per-entry shape (`{kind, invoice_id}`) AND the
-        // PascalCase wire form of the two `ChainChildKind`
-        // variants.
+        // both the per-entry shape (`{kind, invoice_id,
+        // modification_index}`) AND the PascalCase wire form of
+        // the two `ChainChildKind` variants AND the per-row
+        // modification_index field name + u64 numeric type (PR-41).
+        // Distinct non-1 indices (3, 7) per CLAUDE.md rule 9.
         let with_chain = InvoiceDetailResponse {
             invoice_id: "inv_BASE".to_string(),
             sequence_number: 42,
@@ -2169,10 +2208,12 @@ mod tests {
                 ChainChildView {
                     kind: ChainChildKind::Amended,
                     invoice_id: "inv_MOD".to_string(),
+                    modification_index: 3,
                 },
                 ChainChildView {
                     kind: ChainChildKind::Storno,
                     invoice_id: "inv_STORNO".to_string(),
+                    modification_index: 7,
                 },
             ],
             last_ack_status: None,
@@ -2195,6 +2236,11 @@ mod tests {
             Some("inv_MOD"),
             "chain child invoice_id must serialise verbatim",
         );
+        assert_eq!(
+            arr[0].get("modification_index").and_then(|x| x.as_u64()),
+            Some(3),
+            "chain child modification_index must serialise verbatim as a JSON number (Amended row, distinct non-1 value)",
+        );
 
         assert_eq!(
             arr[1].get("kind").and_then(|x| x.as_str()),
@@ -2205,6 +2251,11 @@ mod tests {
             arr[1].get("invoice_id").and_then(|x| x.as_str()),
             Some("inv_STORNO"),
             "chain child invoice_id must serialise verbatim",
+        );
+        assert_eq!(
+            arr[1].get("modification_index").and_then(|x| x.as_u64()),
+            Some(7),
+            "chain child modification_index must serialise verbatim as a JSON number (Storno row, distinct non-1 value)",
         );
     }
 

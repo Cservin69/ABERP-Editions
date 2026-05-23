@@ -367,6 +367,57 @@ fn latest_submission_attempt(
     Ok(None)
 }
 
+/// Most-recent (highest-seq) `InvoiceCheckPerformed` outcome for this
+/// invoice id. Returns the `outcome` string (`"exists"` / `"absent"` /
+/// `"failure"`) or `None` if no such entry exists.
+///
+/// PR-43 / F49 closure. Read by `mark-abandoned` as a Layer-2-aware
+/// guard: when the most-recent outcome is `"exists"`, NAV already
+/// has the invoice and abandoning locally would create a silent
+/// divergence between ABERP's terminal-abandoned state and NAV's
+/// accepted-submission state. The operator's recovery path on Exists
+/// is `aberp recover-from-nav` (PR-21 / ADR-0034) followed by
+/// `aberp poll-ack`; an explicit `--force-despite-nav-exists` flag
+/// on `mark-abandoned` overrides the guard when the operator has
+/// out-of-band knowledge that abandonment is correct anyway.
+///
+/// Per ADR-0033 §6: Layer-2 entries remain informational-only at the
+/// `stuck_precondition` classifier (NOT classification-bearing). This
+/// helper is a SECOND surface that reads the same evidence for the
+/// orthogonal mark-abandoned-guard purpose; the classifier semantic
+/// is unchanged.
+pub fn latest_check_performed_outcome(
+    ledger: &Ledger,
+    invoice_id: &str,
+) -> Result<Option<String>> {
+    let entries = ledger
+        .entries()
+        .context("read audit ledger entries to resolve latest_check_performed_outcome")?;
+    latest_check_performed_outcome_from_entries(&entries, invoice_id)
+}
+
+fn latest_check_performed_outcome_from_entries(
+    entries: &[Entry],
+    invoice_id: &str,
+) -> Result<Option<String>> {
+    for entry in entries.iter().rev() {
+        if entry.kind != EventKind::InvoiceCheckPerformed {
+            continue;
+        }
+        let payload: audit_payloads::InvoiceCheckPerformedPayload =
+            serde_json::from_slice(&entry.payload).map_err(|e| {
+                anyhow!(
+                    "InvoiceCheckPerformed audit payload (seq {:?}) failed typed decode: {e}",
+                    entry.seq
+                )
+            })?;
+        if payload.invoice_id == invoice_id {
+            return Ok(Some(payload.outcome));
+        }
+    }
+    Ok(None)
+}
+
 /// Most-recent (highest-seq) `InvoiceAckStatus` for this invoice id.
 /// Returns the parsed `ack_status` string. `None` if no such entry
 /// exists for this invoice (the poll loop never ran or only saw
@@ -865,6 +916,72 @@ mod tests {
             }
             other => panic!("expected Stuck(AwaitingAck), got {other:?}"),
         }
+    }
+
+    // ── PR-43 / F49 — latest_check_performed_outcome ─────────────────
+
+    /// No check entries → `None`. Pins the degenerate-input behaviour
+    /// against future regressions.
+    #[test]
+    fn latest_check_performed_outcome_returns_none_on_empty_ledger() {
+        let (ledger, _actor) = fixture_ledger();
+        let outcome = latest_check_performed_outcome(&ledger, "inv_A").unwrap();
+        assert!(outcome.is_none());
+    }
+
+    /// Single `outcome="exists"` entry → `Some("exists")`. The base
+    /// case of the F49 guard's evidence read.
+    #[test]
+    fn latest_check_performed_outcome_returns_exists_when_only_exists_entry() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_check_performed(&mut ledger, &actor, "inv_A", idem, "exists");
+        let outcome = latest_check_performed_outcome(&ledger, "inv_A").unwrap();
+        assert_eq!(outcome.as_deref(), Some("exists"));
+    }
+
+    /// Single `outcome="absent"` entry → `Some("absent")`. The
+    /// guard's negative-evidence case (NAV does not have the
+    /// invoice; abandonment is safe).
+    #[test]
+    fn latest_check_performed_outcome_returns_absent_when_only_absent_entry() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_check_performed(&mut ledger, &actor, "inv_A", idem, "absent");
+        let outcome = latest_check_performed_outcome(&ledger, "inv_A").unwrap();
+        assert_eq!(outcome.as_deref(), Some("absent"));
+    }
+
+    /// Multiple entries: latest (highest seq) wins. Pins the walk-
+    /// reverse contract — an earlier Exists followed by a later
+    /// Absent must surface as Absent. The guard fires on the latest
+    /// evidence per ADR-0033 §6.
+    #[test]
+    fn latest_check_performed_outcome_returns_latest_when_multiple_entries() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_check_performed(&mut ledger, &actor, "inv_A", idem, "exists");
+        write_check_performed(&mut ledger, &actor, "inv_A", idem, "absent");
+        let outcome = latest_check_performed_outcome(&ledger, "inv_A").unwrap();
+        assert_eq!(outcome.as_deref(), Some("absent"));
+    }
+
+    /// Cross-invoice isolation: a check entry on inv_B does NOT
+    /// surface for inv_A. Defence-in-depth pin per CLAUDE.md
+    /// rule 9 — a regression that drops the invoice_id filter
+    /// would surface here, not at the first cross-tenant guard
+    /// false-positive.
+    #[test]
+    fn latest_check_performed_outcome_does_not_cross_invoice_ids() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem_a = IdempotencyKey::new();
+        let idem_b = IdempotencyKey::new();
+        write_check_performed(&mut ledger, &actor, "inv_B", idem_b, "exists");
+        let outcome_a = latest_check_performed_outcome(&ledger, "inv_A").unwrap();
+        let outcome_b = latest_check_performed_outcome(&ledger, "inv_B").unwrap();
+        assert!(outcome_a.is_none());
+        assert_eq!(outcome_b.as_deref(), Some("exists"));
+        let _ = idem_a;
     }
 
     /// PR-20 / ADR-0033 §6: `InvoiceMarkedAbandoned` still wins

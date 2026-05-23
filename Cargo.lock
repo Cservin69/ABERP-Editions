@@ -60,10 +60,24 @@ version = "0.0.0"
 dependencies = [
  "duckdb",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "time",
  "tracing",
  "ulid",
+]
+
+[[package]]
+name = "aberp-mnb-rates"
+version = "0.0.0"
+dependencies = [
+ "aberp-billing",
+ "quick-xml 0.36.2",
+ "reqwest 0.13.3",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

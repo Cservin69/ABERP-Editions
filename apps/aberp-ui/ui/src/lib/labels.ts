@@ -17,7 +17,7 @@
 // (the `LIFECYCLE_ORDER` length / dedup checks) per CLAUDE.md rule
 // 12 (fail loud).
 
-import type { InvoiceState } from "./api";
+import type { AckStatus, InvoiceState } from "./api";
 
 /** Categorical signal classes from ADR-0017 §"Token namespaces"
  * `color.signal.*`. The five values map to the existing CSS custom
@@ -202,5 +202,74 @@ export function labelMeta(state: InvoiceState | string): LabelMeta {
     signal: "muted",
     icon: "?",
     tooltip: `Unknown label '${state}'. The backend emitted a state this SPA does not model — update labels.ts and api.ts.`,
+  };
+}
+
+// ─── PR-36 / session-40 — Ack-status label table (Option Y) ──────────
+//
+// `AckStatus` and `InvoiceState` are disjoint concept domains: the
+// former carries NAV's `processingResult` literals (per ADR-0009 §2),
+// the latter the eleven derive_state labels per ADR-0036 §2. They
+// share zero members, so `ACK_LABELS` is forked as its own
+// `Record<AckStatus, LabelMeta>` table next to `LABELS` rather than
+// widening the latter to a union key — that widening would conflate
+// two domains and break the `LIFECYCLE_ORDER` invariant (which only
+// makes sense for InvoiceState). The two surfaces share `LabelMeta`
+// itself, so the chip CSS classes (.state-pill.signal-*) and the
+// shape contract on the renderer are byte-identical to the State row
+// per CLAUDE.md rule 11 (match conventions).
+//
+// Icon choices: SAVED and ABORTED reuse the same glyphs as the
+// terminal `Finalized` / `Rejected` lifecycle states (per the
+// existing tooltips on those labels, they ARE the SAVED / ABORTED
+// outcomes). The two intermediate values get distinct glyphs so the
+// operator can tell at a glance which NAV-side stage a Submitted
+// invoice is at — `Submitted` collapses both per ADR-0036 §2.
+//   - RECEIVED → `⇣` (mirrors `Submitted`'s `⇧` — request out,
+//     ack in)
+//   - PROCESSING → `⟳` (NAV-side work in progress; distinct from
+//     the local-side `⧖` Pending hourglass)
+//   - SAVED → `✓` (same glyph as `Finalized`)
+//   - ABORTED → `✗` (same glyph as `Rejected`)
+export const ACK_LABELS: Record<AckStatus, LabelMeta> = {
+  RECEIVED: {
+    signal: "warning",
+    icon: "⇣",
+    tooltip:
+      "NAV acknowledged receipt; parsing not yet complete. Awaiting PROCESSING and then SAVED or ABORTED.",
+  },
+  PROCESSING: {
+    signal: "warning",
+    icon: "⟳",
+    tooltip:
+      "NAV started processing the submission; awaiting terminal ack (SAVED or ABORTED).",
+  },
+  SAVED: {
+    signal: "positive",
+    icon: "✓",
+    tooltip:
+      "NAV terminal ack: invoice stored. Equivalent to the Finalized lifecycle state.",
+  },
+  ABORTED: {
+    signal: "negative",
+    icon: "✗",
+    tooltip:
+      "NAV terminal ack: invoice rejected. Equivalent to the Rejected lifecycle state.",
+  },
+};
+
+/** Mirror of `labelMeta` for the AckStatus surface. Muted-"?"
+ * fallback for unknown strings per CLAUDE.md rule 12 — a persisted
+ * ack literal the SPA does not model surfaces as a visible
+ * divergence rather than silently bucketing with a known value. */
+export function ackLabelMeta(status: AckStatus | string): LabelMeta {
+  const known = (ACK_LABELS as Record<string, LabelMeta | undefined>)[status];
+  if (known !== undefined) {
+    return known;
+  }
+  return {
+    signal: "muted",
+    icon: "?",
+    tooltip: `Unknown ack '${status}'. The backend emitted a NAV processingResult this SPA does not model — update labels.ts and api.ts.`,
   };
 }

@@ -11,7 +11,7 @@ pub use crate::domain::invoice::{
     AbandonedInvoice, DraftInvoice, FinalizedInvoice, LineItem, ReadyInvoice, RejectedInvoice,
     SubmissionStuckInvoice, SubmittedInvoice,
 };
-pub use crate::domain::money::Huf;
+pub use crate::domain::money::{Currency, Eur, Huf, Money};
 pub use crate::domain::reservation::{ReservationStatus, SequenceReservation};
 pub use crate::domain::series::{InvoiceSeries, ResetPolicy, SeriesCode};
 

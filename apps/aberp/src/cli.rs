@@ -488,6 +488,62 @@ pub enum Command {
     ///     loaded once at the start.
     DrainSubmissionQueue(DrainSubmissionQueueArgs),
 
+    /// Drain state-2 Pending invoices through the automatic retry
+    /// loop per ADR-0032 §4 (PR-42, F45 closure). Walks the audit
+    /// ledger, classifies every invoice that has an
+    /// `InvoiceSubmissionAttempt` but no `InvoiceSubmissionResponse`
+    /// and no `InvoiceMarkedAbandoned` as state-2 Pending, and drives
+    /// each one through the same Layer-2 + TX1 + wire + TX2 pipeline
+    /// the operator-confirmed `aberp retry-submission` uses (PR-19 /
+    /// ADR-0032 §1, PR-20 / ADR-0033 §1).
+    ///
+    /// **Per-invoice pipeline:** read NAV InvoiceData XML from the
+    /// recorded `nav_xml_path` (loud-fail on pre-PR-18 entries — the
+    /// operator drains those via the manual `aberp retry-submission
+    /// --invoice-xml <path>` command); validate via the NAV v3.0
+    /// invariant check (ADR-0022); run `queryInvoiceCheck` Phase 0
+    /// (PR-20 / ADR-0033 §1) — on Exists skip the re-POST and
+    /// continue the loop (operator next-step is `aberp recover-from-
+    /// nav`), on Absent proceed to TX1 (RetryRequested + Attempt) +
+    /// wire + TX2 (Response or AttemptFailed); verify the audit
+    /// chain; sync the mirror; print the per-invoice OK line.
+    ///
+    /// **Auto-reason text:** the operator's decision is to run this
+    /// drain command; the per-invoice `InvoiceRetryRequested` audit
+    /// entries carry a fixed reason string naming the F45 closure +
+    /// ADR-0032 §4 — distinct from `aberp retry-submission --reason`
+    /// (operator-supplied per invoice).
+    ///
+    /// **Transport-vs-application fork** (ADR-0031 §4 / ADR-0032 §2).
+    /// Same posture as `drain-submission-queue`: a transport-class
+    /// wire failure at any phase (Layer-2 check or manageInvoice
+    /// POST) short-circuits the FIFO loop; application-class failures
+    /// surface per-invoice LOUD and the loop continues. Layer-2
+    /// Exists is a per-invoice "skip re-POST" decision (not a stop);
+    /// Layer-2 Failure is classified into the same fork by substring
+    /// scan on the typed-error message.
+    ///
+    /// **What this command does NOT do:**
+    ///
+    ///   - It does NOT process state-1 Draft invoices.
+    ///     `drain-submission-queue` is the operator surface for those.
+    ///   - It does NOT process state-3 AwaitingAck invoices. The
+    ///     classifier filters only state-2 Pending; state-3 invoices
+    ///     are recoverable via `aberp retry-submission` or
+    ///     `aberp poll-ack` depending on intent.
+    ///   - It does NOT support `--xml-path-override`. Pre-PR-18
+    ///     state-2 invoices loud-fail at the `nav_xml_path: None`
+    ///     check; the operator drains those manually via
+    ///     `aberp retry-submission --invoice-xml <path>`.
+    ///   - It does NOT take a `--reason` flag. The auto-reason
+    ///     names the drain run; per-invoice operator-decision
+    ///     rationale lives on the manual `aberp retry-submission
+    ///     --reason` command.
+    ///   - It does NOT poll `queryTransactionStatus`. The operator
+    ///     runs `aberp poll-ack` after the drain (or schedules it
+    ///     independently).
+    DrainPendingRetries(DrainPendingRetriesArgs),
+
     /// Request a NAV-side technical annulment of a prior data
     /// submission against an invoice (ADR-0009 §6, ADR-0025; PR-12).
     /// A technical annulment **withdraws** the data submission to
@@ -703,6 +759,31 @@ pub struct MarkAbandonedArgs {
     /// human-readable justification.
     #[arg(long)]
     pub reason: String,
+
+    /// PR-43 / F49 closure — override the Layer-2-aware guard. By
+    /// default, `mark-abandoned` consults the most-recent
+    /// `InvoiceCheckPerformed` audit entry for this invoice (written
+    /// by `retry-submission` or `drain-pending-retries` Phase 0 per
+    /// ADR-0033 §1) and loud-fails when the outcome is `"exists"` —
+    /// NAV already has the invoice, and a local abandonment would
+    /// create a silent divergence between ABERP's terminal-abandoned
+    /// state and NAV's accepted-submission state.
+    ///
+    /// Pass `--force-despite-nav-exists` to override the guard when
+    /// the operator has out-of-band knowledge that abandonment is
+    /// correct anyway (e.g., NAV's accepted record will be technically
+    /// annulled separately, or the divergence is documented in the
+    /// reason text). The override is loud in the audit-evidence
+    /// bundle: the resulting `InvoiceMarkedAbandoned` entry's
+    /// `reason` field is automatically suffixed with a
+    /// `[forced-despite-nav-side-exists]` marker so the bundle
+    /// reader sees the override flag's effect without consulting
+    /// CLI history.
+    ///
+    /// Default `false`. The explicit opt-in makes the override a
+    /// deliberate operator decision per CLAUDE.md rule 12.
+    #[arg(long = "force-despite-nav-exists", default_value_t = false)]
+    pub force_despite_nav_exists: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1215,6 +1296,49 @@ pub struct DrainSubmissionQueueArgs {
     /// a non-zero value when the operator wants to inspect the
     /// progress after a few invoices (e.g., the first NAV-testbed
     /// drain on a backlog).
+    #[arg(long = "max-invoices", default_value_t = 0)]
+    pub max_invoices: usize,
+}
+
+/// Args for `aberp drain-pending-retries` (PR-42, F45 closure /
+/// ADR-0032 §4).
+///
+/// Five fields — mirror of [`DrainSubmissionQueueArgs`] minus
+/// `--xml-path-override` (pre-PR-18 state-2 invoices loud-fail and
+/// route to the manual `aberp retry-submission --invoice-xml <path>`
+/// command) and minus `--reason` (the auto-reason names the drain
+/// run; per-invoice operator-decision rationale lives on the manual
+/// command).
+#[derive(Debug, Parser)]
+pub struct DrainPendingRetriesArgs {
+    /// Hungarian tax number of the submitter. Same accepted forms +
+    /// parser as `retry-submission` (`12345678`, `12345678-1`,
+    /// `12345678-1-42`); only the 8-digit base goes to NAV per
+    /// ADR-0009 §4.
+    #[arg(long = "tax-number")]
+    pub tax_number: String,
+
+    /// Path to the tenant DuckDB file.
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — drives both the audit-ledger genesis hash
+    /// and the keychain service-name lookup
+    /// (`aberp.nav.<tenant>`).
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Which NAV environment to retry against. No default — explicit
+    /// per ADR-0020 §1 (same posture as every other `submit-*` /
+    /// `poll-*` / `retry-*` / `drain-*` command).
+    #[arg(long, value_enum)]
+    pub endpoint: NavEnv,
+
+    /// Bound the number of state-2 invoices the drain retries in
+    /// this run. `0` (default) means unbounded — drain the whole
+    /// state-2 backlog. Use a non-zero value when the operator
+    /// wants to inspect progress after a few retries (e.g., the
+    /// first NAV-testbed drain of a state-2 accumulation).
     #[arg(long = "max-invoices", default_value_t = 0)]
     pub max_invoices: usize,
 }

@@ -185,6 +185,10 @@ fn mark_abandoned_against_stuck_invoice_end_to_end() {
         db: db_path.clone(),
         tenant: tenant_id_str,
         reason: "live conformance test — abandoned by operator".to_string(),
+        // PR-43 / F49: this test runs against an invoice with no
+        // prior InvoiceCheckPerformed entry; the guard does not
+        // fire, so the override flag is irrelevant.
+        force_despite_nav_exists: false,
     };
     mark_abandoned::run(&abandon_args).expect("mark-abandoned must succeed against stuck invoice");
 
@@ -246,6 +250,9 @@ fn mark_abandoned_against_stuck_invoice_end_to_end() {
         db: db_path,
         tenant: tenant_str,
         reason: "second attempt".to_string(),
+        // PR-43 / F49: same as above; the AlreadyAbandoned
+        // precondition fires before the guard is reached.
+        force_despite_nav_exists: false,
     };
     let err = mark_abandoned::run(&abandon_again_args)
         .expect_err("re-abandon must loud-fail with AlreadyAbandoned");

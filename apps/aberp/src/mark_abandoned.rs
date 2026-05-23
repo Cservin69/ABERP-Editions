@@ -36,6 +36,39 @@
 //! the future `request-technical-annulment` command (ADR-0009 §6) —
 //! NOT this one.
 //!
+//! # PR-43 / F49 — Layer-2-aware abandonment guard
+//!
+//! Between the stuck-precondition resolve and the audit-ledger write,
+//! the orchestration consults the most-recent `InvoiceCheckPerformed`
+//! audit entry for the invoice via
+//! [`crate::audit_query::latest_check_performed_outcome`]. When the
+//! outcome is `"exists"` — i.e., `retry-submission` or
+//! `drain-pending-retries` Phase 0 (PR-20 / ADR-0033 §1) confirmed
+//! NAV has the invoice — the orchestration refuses the abandonment
+//! by default. Abandoning locally on top of NAV-side acceptance
+//! creates a silent divergence: ABERP records the chain as
+//! terminal-abandoned while NAV's record stands; an inspector
+//! reading the bundle would see contradictory evidence.
+//!
+//! The default-refuse loud message names `aberp recover-from-nav`
+//! (PR-21 / ADR-0034) as the recovery path: reconstruct the local
+//! `InvoiceSubmissionResponse` from NAV's `queryInvoiceData`, then
+//! `aberp poll-ack` to drive the terminal state via NAV's
+//! `queryTransactionStatus`. An explicit
+//! `--force-despite-nav-exists` flag overrides the guard for the
+//! cases where the operator has out-of-band justification for the
+//! divergence (e.g., the NAV-side record will be technically
+//! annulled separately). The overriden audit entry's `reason` is
+//! automatically suffixed with `[forced-despite-nav-side-exists]`
+//! so the bundle reader sees the override's effect without
+//! consulting CLI history.
+//!
+//! Outcome `"absent"` (NAV does not have the invoice) and
+//! `"failure"` (the Layer-2 check itself failed) do NOT trigger
+//! the guard — abandonment is safe-or-unknown in those cases;
+//! per CLAUDE.md rule 2 the guard is minimal, refusing only the
+//! one clearly-divergent case.
+//!
 //! # NAV credentials NOT loaded
 //!
 //! Unlike `retry-submission`, `mark-abandoned` does not load
@@ -139,15 +172,59 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
         &idempotency_key,
     )?;
 
-    // 4. Write the InvoiceMarkedAbandoned entry under one tx.
+    // 3a. PR-43 / F49 closure — Layer-2-aware guard. Consult the
+    //     most-recent InvoiceCheckPerformed for this invoice; if
+    //     outcome is "exists", refuse the abandonment by default
+    //     (NAV has the invoice; local abandonment would create
+    //     silent divergence). The operator overrides with
+    //     --force-despite-nav-exists when out-of-band justification
+    //     applies; the override is loud in the audit reason field.
+    let latest_check = {
+        let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+            .context("open audit ledger to consult latest_check_performed_outcome (F49 guard)")?;
+        audit_query::latest_check_performed_outcome(&ledger, &args.invoice_id)?
+    };
+    let nav_side_exists = matches!(latest_check.as_deref(), Some("exists"));
+    if nav_side_exists && !args.force_despite_nav_exists {
+        return Err(anyhow!(
+            "F49 guard: mark-abandoned REFUSED for invoice {}: \
+             the most-recent InvoiceCheckPerformed audit entry has outcome=\"exists\" — \
+             NAV already has the invoice (Layer-2 queryInvoiceCheck per ADR-0033 §1). \
+             Abandoning locally would silently diverge ABERP's terminal-abandoned state \
+             from NAV's accepted-submission state. \
+             Run `aberp recover-from-nav --invoice-id {} --tax-number ... \
+             --endpoint {{test|production}}` (PR-21 / ADR-0034) to reconstruct the local \
+             InvoiceSubmissionResponse from NAV's queryInvoiceData, then `aberp poll-ack` \
+             to drive the terminal state via queryTransactionStatus. \
+             If the divergence is intentional (e.g., the NAV-side record will be technically \
+             annulled separately and the operator wants to terminate the local chain now), \
+             re-run with --force-despite-nav-exists — the resulting audit entry's reason \
+             field will carry a [forced-despite-nav-side-exists] marker.",
+            args.invoice_id, args.invoice_id,
+        ));
+    }
+    let forced_marker_active = nav_side_exists && args.force_despite_nav_exists;
+    if forced_marker_active {
+        tracing::warn!(
+            invoice_id = %args.invoice_id,
+            "F49 guard OVERRIDDEN: --force-despite-nav-exists is set; \
+             writing InvoiceMarkedAbandoned despite NAV-side Exists evidence"
+        );
+    }
+
+    // 4. Write the InvoiceMarkedAbandoned entry under one tx. The
+    //    audit reason carries a [forced-despite-nav-side-exists]
+    //    suffix when the F49 guard was overridden (CLAUDE.md rule 12
+    //    — the override is loud in the bundle).
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
+    let effective_reason = effective_reason_for_audit(reason, forced_marker_active);
     write_marked_abandoned_audit_entry(
         &mut conn,
         &ledger_meta,
         actor,
         &ready_invoice,
         idempotency_key,
-        reason,
+        &effective_reason,
         &stuck,
     )?;
 
@@ -292,6 +369,20 @@ fn load_issued_invoice(
     Ok(pair)
 }
 
+/// PR-43 / F49 closure — compose the audit-payload `reason` text.
+/// When the operator overrode the Layer-2-aware guard with
+/// `--force-despite-nav-exists`, suffix the operator-supplied reason
+/// with a `[forced-despite-nav-side-exists]` marker so the audit-
+/// evidence bundle reader sees the override's effect without
+/// consulting CLI history (CLAUDE.md rule 12 — fail loud).
+fn effective_reason_for_audit(reason: &str, forced_marker_active: bool) -> String {
+    if forced_marker_active {
+        format!("{reason} [forced-despite-nav-side-exists]")
+    } else {
+        reason.to_string()
+    }
+}
+
 /// Open one audit-write tx, append the InvoiceMarkedAbandoned entry, commit.
 fn write_marked_abandoned_audit_entry(
     conn: &mut Connection,
@@ -332,6 +423,37 @@ fn write_marked_abandoned_audit_entry(
 
 #[cfg(test)]
 mod tests {
+    use super::effective_reason_for_audit;
+
+    /// PR-43 / F49 closure — the override-marker is appended verbatim
+    /// after a single space. Pin per CLAUDE.md rule 9: the marker
+    /// text is load-bearing for the audit-evidence bundle's
+    /// loud-divergence signal; a refactor that silently changes the
+    /// marker text would mask the override in the bundle.
+    #[test]
+    fn effective_reason_appends_forced_marker_when_active() {
+        let reason = "operator chose to abandon despite NAV-side acceptance";
+        let composed = effective_reason_for_audit(reason, true);
+        assert_eq!(
+            composed,
+            "operator chose to abandon despite NAV-side acceptance [forced-despite-nav-side-exists]"
+        );
+        assert!(composed.contains("[forced-despite-nav-side-exists]"));
+        assert!(composed.starts_with(reason));
+    }
+
+    /// PR-43 / F49 closure — when the guard was not overridden the
+    /// operator's reason is preserved verbatim. Pins the orthogonal
+    /// case so a future regression that always appends the marker
+    /// (and thus pollutes every non-forced bundle) surfaces here.
+    #[test]
+    fn effective_reason_preserves_reason_verbatim_when_not_forced() {
+        let reason = "non-divergent abandonment";
+        let composed = effective_reason_for_audit(reason, false);
+        assert_eq!(composed, reason);
+        assert!(!composed.contains("forced-despite"));
+    }
+
     #[test]
     fn reason_must_be_non_empty() {
         // Empty / whitespace-only reason is loud-failed before any

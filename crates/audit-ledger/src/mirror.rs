@@ -796,17 +796,24 @@ mod tests {
     /// for tests. Falls back to `std::env::temp_dir()` if unset
     /// (e.g., out-of-cargo invocations). Returns a fresh
     /// subdirectory unique to this test invocation.
+    ///
+    /// The suffix combines `process::id()` (cross-process guard,
+    /// so parallel integration-test binaries sharing
+    /// `CARGO_TARGET_TMPDIR` do not collide) with a monotonic
+    /// `AtomicUsize` (within-process guard, so parallel
+    /// `#[test]` threads do not collide). A `SystemTime`-based
+    /// suffix is not safe here: two threads can sample the same
+    /// nanosecond on a fast machine and produce the same path.
     fn tempdir_under_target() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let base = std::env::var_os("CARGO_TARGET_TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let unique = format!(
             "aberp-mirror-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            COUNTER.fetch_add(1, Ordering::Relaxed),
         );
         let dir = base.join(unique);
         std::fs::create_dir_all(&dir).unwrap();

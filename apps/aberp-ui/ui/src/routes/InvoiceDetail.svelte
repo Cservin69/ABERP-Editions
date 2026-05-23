@@ -126,12 +126,51 @@
   // `.chain-child-kind` rule is removed (its `color:
   // var(--color-text-secondary)` lived only inside this list and is
   // superseded by the per-signal-class colouring on the pill).
+  //
+  // PR-36 / session-40 — ack-pill render (Option Y). The PR-33
+  // "Latest ack" meta-grid cell rendered the typed `last_ack_status`
+  // wire field as plain mono text (`{detail.last_ack_status ?? "—"}`);
+  // this PR routes the value through `ackLabelMeta(...)` from
+  // `labels.ts` so the cell carries the same icon + signal colour +
+  // tooltip as the State chip directly above. `null` continues to
+  // render as a plain `—` (no pill — there is no value to label, and
+  // that matches the `total_gross` null-render posture). The new
+  // `ACK_LABELS` table is a fork (sibling table next to `LABELS`),
+  // not a widening, because `AckStatus` and `InvoiceState` are
+  // disjoint concept domains — see the design comment in labels.ts.
+  // Reuses the existing `.state-pill` CSS plus the per-signal
+  // classes. Completes the detail modal's label-rendering
+  // consistency: every label-typed cell in the modal (State, chain-
+  // children kind, Latest ack) now renders as the same labelMeta
+  // chip. No wire-shape change, no api.ts change, no new SPA
+  // dependency.
+  //
+  // PR-41 / session-45 — `modification_index` on chain-children rows
+  // (Option W). The PR-32 chain-children section emitted one row per
+  // child (`<kind> → <invoice_id>`) but did NOT carry the per-base
+  // chain index. The backend's `extract_chain_link` probe pulls the
+  // value off `InvoiceStornoIssuedPayload.modification_index` /
+  // `InvoiceModificationIssuedPayload.modification_index` (shared name
+  // space per `next_modification_index_in_tx`); the renderer surfaces
+  // it as a leading `#N` mono glyph on each row so the operator can
+  // cross-reference the per-row index against the NAV-side
+  // `<modificationIndex>` that the storno / modification XML emits.
+  // No wire-shape change beyond the one new field, no labels.ts
+  // change, no new SPA dependency. Reuses the existing
+  // `.chain-children-list` row layout; the new `.chain-index-prefix`
+  // span carries the quiet mono `#N` glyph in the same secondary text
+  // colour as `.chain-arrow`.
+
 
   import {
     getInvoice,
     type InvoiceDetail,
   } from "../lib/api";
-  import { labelMeta, type LabelSignal } from "../lib/labels";
+  import {
+    ackLabelMeta,
+    labelMeta,
+    type LabelSignal,
+  } from "../lib/labels";
   import { bytesAsUtf8Replacer } from "../lib/payload-reviver";
 
   interface Props {
@@ -342,7 +381,20 @@
         <dt>Total (gross)</dt>
         <dd class="mono">{formatHuf(detail.total_gross)}</dd>
         <dt>Latest ack</dt>
-        <dd class="mono">{detail.last_ack_status ?? "—"}</dd>
+        <dd>
+          {#if detail.last_ack_status === null}
+            <span class="mono">—</span>
+          {:else}
+            {@const ackMeta = ackLabelMeta(detail.last_ack_status)}
+            <span
+              class="state-pill {signalClass(ackMeta.signal)}"
+              title={ackMeta.tooltip}
+            >
+              <span class="state-icon" aria-hidden="true">{ackMeta.icon}</span>
+              <span class="state-text">{detail.last_ack_status}</span>
+            </span>
+          {/if}
+        </dd>
       </dl>
 
       {#if detail.chain_children.length > 0}
@@ -351,6 +403,7 @@
           {#each detail.chain_children as child (child.invoice_id)}
             {@const childMeta = labelMeta(child.kind)}
             <li class="mono">
+              <span class="chain-index-prefix">#{child.modification_index}</span>
               <span
                 class="state-pill {signalClass(childMeta.signal)}"
                 title={childMeta.tooltip}
@@ -363,7 +416,7 @@
                 type="button"
                 class="id-link"
                 onclick={() => onNavigate(child.invoice_id)}
-                aria-label={`Navigate to chain child invoice ${child.invoice_id}`}
+                aria-label={`Navigate to chain child invoice ${child.invoice_id} (modification index ${child.modification_index})`}
               >
                 {child.invoice_id}
               </button>
@@ -677,6 +730,16 @@
   .chain-arrow {
     color: var(--color-text-muted);
     margin: 0 var(--space-1);
+  }
+
+  /* PR-41 — per-row chain index glyph. Quiet leading `#N` mono
+   * prefix that pins the row to its position in the base's chain.
+   * Same secondary-text colour as `.chain-arrow` per ADR-0017
+   * §1-2 (chrome stays quiet; the affordance is the id-link to
+   * the right). */
+  .chain-index-prefix {
+    color: var(--color-text-muted);
+    margin-right: var(--space-2);
   }
 
   /* PR-32 — chain-children list. Quiet column of `<kind> →

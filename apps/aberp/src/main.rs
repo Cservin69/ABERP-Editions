@@ -15,10 +15,10 @@ use anyhow::Result;
 use clap::Parser;
 
 use aberp::{
-    cli, drain_submission_queue, export_invoice_bundle, issue_invoice, issue_modification,
-    issue_storno, mark_abandoned, observe_receiver_confirmation, poll_ack, poll_annulment_ack,
-    recover_from_nav, request_technical_annulment, retry_submission, serve, setup_nav_credentials,
-    submit_annulment, submit_invoice,
+    cli, drain_pending_retries, drain_submission_queue, export_invoice_bundle, issue_invoice,
+    issue_modification, issue_storno, mark_abandoned, observe_receiver_confirmation, poll_ack,
+    poll_annulment_ack, recover_from_nav, request_technical_annulment, retry_submission, serve,
+    setup_nav_credentials, submit_annulment, submit_invoice,
 };
 
 fn main() -> Result<()> {
@@ -41,6 +41,7 @@ fn main() -> Result<()> {
         cli::Command::ObserveReceiverConfirmation(a) => observe_receiver_confirmation::run(&a),
         cli::Command::ExportInvoiceBundle(a) => export_invoice_bundle::run(&a),
         cli::Command::DrainSubmissionQueue(a) => drain_submission_queue::run(&a),
+        cli::Command::DrainPendingRetries(a) => drain_pending_retries::run(&a),
         cli::Command::RecoverFromNav(a) => recover_from_nav::run(&a),
     }
 }

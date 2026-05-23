@@ -1,0 +1,48 @@
+[package]
+name = "aberp-mnb-rates"
+description = "Magyar Nemzeti Bank (MNB) exchange-rate fetcher (ADR-0037 §2, PR-44β)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_mnb_rates"
+path = "src/lib.rs"
+
+[dependencies]
+# Library boundary: thiserror per ADR-0021 Part A item 2.
+thiserror = { workspace = true }
+
+# HTTPS client for the MNB SOAP endpoint. Same workspace pin
+# nav-transport consumes — `rustls` feature only, no native-tls. MNB's
+# endpoint cert chain is rooted in the public WebPKI; reqwest's
+# `rustls` feature ships webpki-roots transitively (different posture
+# from nav-transport, which pins NAV-specific anchors per ADR-0020 §1
+# — MNB has no published trust-anchor pin, so the public WebPKI is the
+# correct trust posture here).
+reqwest = { workspace = true }
+
+# Hand-rolled SOAP envelope + response parser per ADR-0021 §A8 + the
+# nav-transport precedent. No SOAP-client dep.
+quick-xml = { workspace = true }
+
+# Date type for the per-(currency, date) fetch surface per ADR-0037
+# §2.b. `time` is the workspace standard per ADR-0021 §A11.
+time = { workspace = true }
+
+# Tracing — ADR-0007 §Logging. The fetcher emits one span per HTTP
+# call so operator-side latency / outcome is visible alongside the
+# rest of ABERP's spans.
+tracing = { workspace = true }
+
+# The closed `Currency` vocab the fetcher keys on (Currency::Eur,
+# Currency::Huf, future Currency::Chf) per ADR-0037 §3 — landed in
+# PR-44α as the typed in-domain surface PR-44β consumes here.
+aberp-billing = { path = "../../modules/billing" }
+
+[dev-dependencies]
+tokio = { workspace = true }

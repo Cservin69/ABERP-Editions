@@ -19,3 +19,9 @@ tracing = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
+# PR-44α — Currency wire-shape pin test reads
+# `serde_json::to_value(Currency::*)` to assert the ISO 4217 string emit
+# per ADR-0037 §3 (`currency_wire_shape_pins_iso_4217_strings`). Mirrors
+# the dev-only `serde_json` use in `apps/aberp/src/serve.rs`'s
+# `ack_status_wire_shape_pins_uppercase_strings`.
+serde_json = { workspace = true }
