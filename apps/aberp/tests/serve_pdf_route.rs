@@ -166,9 +166,16 @@ fn build_state(wired: &WiredInvoice) -> AppState {
     AppState {
         db_path: Arc::new(wired.db_path.clone()),
         tenant,
-        binary_hash,
+        binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),
         session_token: Arc::new("test-token".to_string()),
-        operator_login: Arc::new("test-operator".to_string()),
+        // PR-46α / session-62 — Ready boot state (see
+        // `serve_setup_nav_credentials_route.rs` for the
+        // NeedsSetup-path coverage).
+        boot_state: Arc::new(std::sync::RwLock::new(
+            aberp::serve::ServeBootState::Ready {
+                operator_login: "test-operator".to_string(),
+            },
+        )),
     }
 }
 

@@ -66,13 +66,13 @@
 //!     The error message in JSON is sanitised to "internal error"; the
 //!     real error goes to `tracing::error!`.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aberp_audit_ledger::{Actor, Entry, EventKind, Ledger, TenantId};
 use aberp_billing::{self as billing, Currency, ReadyInvoice};
-use aberp_nav_transport::{NavCredentials, NavEndpoint};
+use aberp_nav_transport::{NavCredentials, NavEndpoint, NavTransportError};
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Path as AxumPath, State},
@@ -89,7 +89,7 @@ use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::audit_payloads;
-use crate::binary_hash;
+use crate::binary_hash::BinaryHashHandle;
 use crate::cli::ServeArgs;
 use crate::invoice_currency_metadata::{
     load_invoice_currency_metadata_in_tx, InvoiceCurrencyMetadata,
@@ -98,6 +98,9 @@ use crate::issue_invoice::{self, InvoiceInputJson};
 use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
 use crate::poll_ack;
 use crate::print_invoice;
+use crate::setup_nav_credentials::{
+    self, NavCredentialInputs, SetupCredentialsError,
+};
 use crate::submit_invoice;
 
 /// Default keychain service-name prefix for the session token (one per
@@ -151,29 +154,98 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     )
     .entered();
 
+    // PR-46α.1 / session-62-fix — explicit step-entry log emits so a
+    // hang at any boot step surfaces in the SPA's loading pane (via
+    // recent_logs) with a name. Pre-fix, the only operator-visible
+    // emit between subprocess spawn and the cert-ready log was the
+    // background-thread binary-hash completion — which made a hung
+    // foreground boot indistinguishable from a missing-handshake
+    // emit. Step markers below name what step is in flight; the
+    // LAST one logged before a stall is the suspect.
+    tracing::info!("boot step: spawning background binary-hash compute");
+
+    // PR-45a / session-61 — kick off the binary-hash compute FIRST,
+    // before any other boot work. On a cold-cache debug build this
+    // read+hash takes 5-10s; doing it on a background OS thread lets
+    // the listener bind + handshake fire while the hash is still
+    // crunching. Handlers block on `BinaryHashHandle::wait` if they
+    // beat the background thread to the finish line (vanishingly
+    // unlikely once the SPA finishes its initial /health probe).
+    let binary_hash_handle = BinaryHashHandle::start_background();
+
     // 1. Resolve tenant id + load session token from the keychain.
+    tracing::info!("boot step: resolving tenant id");
     let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
         anyhow!(
             "--tenant value '{}' is empty or has a null byte",
             args.tenant
         )
     })?;
-    let session_token = load_or_create_session_token(&args.tenant)?;
+    // PR-46α.1 / session-62-fix — explicit step-entry log so a
+    // macOS keychain ACL prompt blocking `entry.get_password()` is
+    // visible at the operator-facing layer. The keychain re-prompts
+    // any time the binary signature changes (e.g. a rebuild); the
+    // prompt window may be hidden behind the Tauri window and the
+    // operator can't tell what they're waiting for.
+    tracing::info!(
+        "boot step: reading session token from OS keychain (may prompt for keychain access)"
+    );
+    let session_token = {
+        let _s = tracing::info_span!("serve.session_token").entered();
+        load_or_create_session_token(&args.tenant)?
+    };
 
     // PR-44ζ / session-59 — load the NAV credentials at startup so the
     // `POST /invoices/issue` mutation route can derive a per-request
     // `Actor` without paying keychain latency on every issuance. The
     // only field we stash is `login()` (non-secret); the secret bytes
     // are dropped when this scope exits.
-    let operator_login = NavCredentials::load_from_keychain(&args.tenant)
-        .context(
-            "load NAV credentials from OS keychain for actor derivation \
-             (run `aberp setup-nav-credentials --tenant <id>` if missing)",
-        )?
-        .login()
-        .to_string();
+    //
+    // PR-46α / session-62 — pre-PR-46α a missing keychain entry exited
+    // the backend non-zero, which made the desktop window flash blank
+    // (post-PR-45a: the Tauri shell rendered an unrecoverable Failed
+    // pane). Now: a `KeychainItemMissing` variant transitions the
+    // backend into the `NeedsSetup` boot state — the listener still
+    // binds, the handshake still fires (with `state=needs-setup`
+    // suffix), and the new `POST /api/setup-nav-credentials` route
+    // lets the SPA's first-run wizard populate the four artifacts
+    // without any terminal interaction. Every OTHER credential failure
+    // (locked keychain, permission denied, etc.) still loud-fails per
+    // CLAUDE.md rule 12 — those are operator-triage situations, not
+    // first-run setup situations.
+    // PR-46α.1 / session-62-fix — same prompt-warning posture as the
+    // session_token step above. `NavCredentials::load_from_keychain`
+    // calls `entry.get_password()` four times (one per artifact); on
+    // a rebuilt binary each call may prompt for keychain access. If
+    // the operator sees this log in the loading pane and the boot
+    // hangs immediately after, the prompts are the cause.
+    tracing::info!(
+        "boot step: reading NAV credentials from OS keychain (may prompt for keychain access)"
+    );
+    let initial_boot_state = {
+        let _s = tracing::info_span!("serve.nav_credentials").entered();
+        match NavCredentials::load_from_keychain(&args.tenant) {
+            Ok(creds) => ServeBootState::Ready {
+                operator_login: creds.login().to_string(),
+            },
+            Err(NavTransportError::KeychainItemMissing { item, .. }) => {
+                tracing::warn!(
+                    item = item,
+                    "NAV credential missing from OS keychain — entering needs-setup boot state; \
+                     SPA first-run wizard will populate via POST /api/setup-nav-credentials"
+                );
+                ServeBootState::NeedsSetup
+            }
+            Err(other) => {
+                return Err(anyhow!(other).context(
+                    "load NAV credentials from OS keychain for actor derivation",
+                ));
+            }
+        }
+    };
 
     // 2. Resolve / generate the loopback cert + key.
+    tracing::info!("boot step: preparing serve-artifacts directory");
     let artifacts_dir = serve_artifacts_dir(&args.tenant)?;
     std::fs::create_dir_all(&artifacts_dir).with_context(|| {
         format!(
@@ -184,8 +256,11 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     let cert_path = artifacts_dir.join("loopback.crt.pem");
     let key_path = artifacts_dir.join("loopback.key.pem");
     let fingerprint_path = artifacts_dir.join("loopback.fingerprint.sha256");
-    let (cert_pem, key_pem, fingerprint_hex) =
-        ensure_loopback_cert(&cert_path, &key_path, &fingerprint_path)?;
+    tracing::info!("boot step: ensuring loopback TLS cert + key (rcgen on first launch)");
+    let (cert_pem, key_pem, fingerprint_hex) = {
+        let _s = tracing::info_span!("serve.loopback_cert").entered();
+        ensure_loopback_cert(&cert_path, &key_path, &fingerprint_path)?
+    };
     tracing::info!(
         cert = %cert_path.display(),
         fingerprint = %fingerprint_hex,
@@ -193,32 +268,54 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     );
 
     // 3. Build the rustls server config.
-    let rustls_config = build_rustls_config(&cert_pem, &key_pem)?;
+    tracing::info!("boot step: building rustls server config");
+    let rustls_config = {
+        let _s = tracing::info_span!("serve.rustls_config").entered();
+        build_rustls_config(&cert_pem, &key_pem)?
+    };
 
-    // 4. Build the shared application state.
-    let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
+    // 4. Build the shared application state. `binary_hash` is the
+    //    handle to the background compute kicked off at the top;
+    //    handlers block on it if they need the hash before it
+    //    resolves.
+    //
+    // PR-46α / session-62 — `boot_state` carries the (possibly
+    // mutable) Ready / NeedsSetup discriminator. The setup route
+    // takes the write lock when transitioning; every other handler
+    // takes a read lock to either pull `operator_login` or reject
+    // with 503 needs-setup.
+    let state_token_at_print = initial_boot_state.state_token();
     let state = AppState {
         db_path: Arc::new(args.db.clone()),
         tenant,
-        binary_hash: binary_hash_bytes,
+        binary_hash: binary_hash_handle,
         session_token: Arc::new(session_token.clone()),
-        operator_login: Arc::new(operator_login),
+        boot_state: Arc::new(std::sync::RwLock::new(initial_boot_state)),
     };
 
     // 5. Build the axum router.
     let app = build_router(state);
 
-    // 6. Build a tokio current-thread runtime (matches the rest of
-    //    the binary's blocking-CLI posture; the serve subcommand is
-    //    long-running but we still avoid the multi-thread runtime
-    //    overhead — one operator workstation, low concurrency).
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build tokio multi-thread runtime for axum")?;
+    // 6. Build a tokio multi-thread runtime (the serve subcommand is
+    //    long-running on a single operator workstation; a small
+    //    worker pool is fine here).
+    tracing::info!("boot step: building tokio multi-thread runtime");
+    let runtime = {
+        let _s = tracing::info_span!("serve.tokio_runtime").entered();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("build tokio multi-thread runtime for axum")?
+    };
 
-    // 7. Bind + serve.
-    let addr: SocketAddr = format!("127.0.0.1:{}", args.port)
+    // 7. Bind the TCP listener synchronously so we can read the
+    //    kernel-assigned port BEFORE printing the handshake. Pre-
+    //    PR-45a we passed `127.0.0.1:0` straight to `bind_rustls`,
+    //    which made the handshake unparseable: the operator-visible
+    //    line read `https://127.0.0.1:0/`, and the desktop shell's
+    //    handshake parser had no way to learn the resolved port.
+    tracing::info!(port = args.port, "boot step: binding loopback TCP listener");
+    let bind_addr: SocketAddr = format!("127.0.0.1:{}", args.port)
         .parse()
         .with_context(|| {
             format!(
@@ -226,26 +323,54 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 args.port
             )
         })?;
+    let listener = {
+        let _s = tracing::info_span!("serve.tcp_bind").entered();
+        TcpListener::bind(bind_addr)
+            .with_context(|| format!("bind TCP listener at {bind_addr}"))?
+    };
+    let resolved_addr = listener
+        .local_addr()
+        .context("read resolved local_addr from TCP listener")?;
     tracing::info!(
-        bind = %addr,
+        bind = %resolved_addr,
         fingerprint = %fingerprint_hex,
         session_token_first8 = &session_token[..8.min(session_token.len())],
         "starting HTTPS loopback listener — present \
          `Authorization: Bearer <session_token>` to authenticated routes; \
          verify TLS cert against the SHA-256 fingerprint"
     );
+
+    // PR-45a / session-61 — machine-parseable handshake line. The
+    // Tauri shell's `handshake::parse` consumes the line as
+    // whitespace-separated tokens (literal `READY`, a `SocketAddr`,
+    // `sha256:<64-hex>`, and PR-46α-added optional `state=<token>`);
+    // the addr token round-trips through `parse::<SocketAddr>()`
+    // cleanly. The human-readable `aberp serve: …` line moved to the
+    // tracing log above so an operator running the shell still sees
+    // the resolved port in the forwarded stderr stream. A drift in
+    // either side fails loudly at the SPA's handshake step rather
+    // than silently mis-routing.
+    //
+    // PR-46α / session-62 — the trailing `state=<token>` token
+    // exposes the boot lifecycle (Ready vs NeedsSetup) at the
+    // handshake boundary so the Tauri shell can dispatch the SPA's
+    // first-paint between the normal app and the first-run setup
+    // wizard. Token values: `ready` | `needs-setup`. Missing token =
+    // `ready` (backwards-compat with the PR-45a line shape for any
+    // future-stable third-party reader; the parser tolerates absence).
     println!(
-        "aberp serve: https://{}/ (fingerprint sha256:{})",
-        addr, fingerprint_hex
+        "READY {} sha256:{} state={}",
+        resolved_addr, fingerprint_hex, state_token_at_print
     );
+
     runtime.block_on(async move {
         let config = RustlsConfig::from_der(rustls_config.0, rustls_config.1)
             .await
             .context("build axum-server RustlsConfig")?;
-        axum_server::bind_rustls(addr, config)
+        axum_server::from_tcp_rustls(listener, config)
             .serve(app.into_make_service())
             .await
-            .context("axum_server::bind_rustls(...).serve(...)")
+            .context("axum_server::from_tcp_rustls(...).serve(...)")
     })?;
 
     Ok(())
@@ -417,6 +542,51 @@ fn generate_session_token() -> String {
 
 // ── Axum router + handlers ───────────────────────────────────────────
 
+/// PR-46α / session-62 — boot lifecycle discriminator on the
+/// [`AppState`]. `NeedsSetup` means the keychain is empty for this
+/// tenant; the listener still binds + the handshake still fires so the
+/// Tauri shell + SPA can render a first-run setup wizard against the
+/// loopback. `Ready` carries the operator-login string the audit-
+/// ledger actor derivation needs (mirrors the pre-PR-46α
+/// `Arc<String>` shape).
+///
+/// Single-tenant scope per the brief: the boot-state is one bit of
+/// in-process state shared between the setup route (which writes when
+/// transitioning) and every other route (which reads to either pull
+/// the login OR reject with 503). Multi-tenant CRUD lifts this to a
+/// per-tenant registry in a later PR-46β.
+#[derive(Debug, Clone)]
+pub enum ServeBootState {
+    /// Keychain has no NAV credentials for this tenant. The only
+    /// route that responds to mutations is
+    /// `POST /api/setup-nav-credentials`; every other gated route
+    /// returns 503 with a typed body the SPA renders inline.
+    NeedsSetup,
+    /// Keychain is populated; the per-request audit-actor login was
+    /// extracted at startup (or at setup-route-transition time) and
+    /// is cached here for the Actor derivation site.
+    Ready { operator_login: String },
+}
+
+impl ServeBootState {
+    /// String token emitted on the handshake `state=<token>` suffix
+    /// (PR-46α). The Tauri shell's `handshake::parse` reads it to
+    /// route the SPA's first paint between the normal app and the
+    /// setup wizard.
+    pub fn state_token(&self) -> &'static str {
+        match self {
+            ServeBootState::NeedsSetup => "needs-setup",
+            ServeBootState::Ready { .. } => "ready",
+        }
+    }
+
+    /// `true` iff the backend is past the needs-setup gate. Used by
+    /// the route precondition helper.
+    pub fn is_ready(&self) -> bool {
+        matches!(self, ServeBootState::Ready { .. })
+    }
+}
+
 /// Per-request shared state passed to every authenticated handler.
 ///
 /// Public surface as of PR-44ε.UI / session-58 so the
@@ -427,25 +597,39 @@ fn generate_session_token() -> String {
 /// to `run` per ADR-0007 §Transport (the SPA never sees them, and
 /// neither does the read-path test surface).
 ///
-/// PR-44ζ / session-59 added `operator_login: Arc<String>` so the new
+/// PR-44ζ / session-59 added `operator_login` so the new
 /// `POST /invoices/issue` mutation route can derive an `Actor` per
 /// request without re-loading NAV credentials from the keychain
 /// (which already happened once at `run` startup). The full
 /// [`NavCredentials`] is NOT stored on the state — only the
 /// non-secret `login()` value, which is the only field the audit-
 /// ledger actor needs. Keeps secrets out of the route surface.
+///
+/// PR-46α / session-62 — `operator_login` moved inside the
+/// [`ServeBootState`] enum (`Arc<RwLock<ServeBootState>>`). On a
+/// fresh install with empty keychain the backend now starts in
+/// `NeedsSetup`; the new `POST /api/setup-nav-credentials` route
+/// flips it to `Ready` after writing the four keychain entries.
+/// Every existing route checks the state via [`require_ready`] and
+/// either pulls `operator_login` OR returns 503 needs-setup.
 #[derive(Clone)]
 pub struct AppState {
     pub db_path: Arc<PathBuf>,
     pub tenant: TenantId,
-    pub binary_hash: aberp_audit_ledger::BinaryHash,
+    /// PR-45a / session-61 — handle to the background-computed binary
+    /// hash. Reading a debug `aberp` binary off cold disk + hashing it
+    /// took ~7.5s in `aberp serve`'s synchronous boot path, which
+    /// blew the desktop shell's 10s `HANDSHAKE_TIMEOUT`. The compute
+    /// now runs on a dedicated OS thread spawned at `run` entry; HTTP
+    /// handlers call `binary_hash.wait()` (essentially zero-latency
+    /// after a few seconds of uptime). See [`BinaryHashHandle`] for
+    /// the failure-mode posture.
+    pub binary_hash: BinaryHashHandle,
     pub session_token: Arc<String>,
-    /// PR-44ζ / session-59 — operator login string extracted from the
-    /// startup-loaded `NavCredentials` (the technical-user identifier
-    /// per ADR-0009 §4). Baked into the `Actor::from_local_cli` value
-    /// every `POST /invoices/issue` request writes to the audit ledger.
-    /// Non-secret per the [`NavCredentials::login`] surface contract.
-    pub operator_login: Arc<String>,
+    /// PR-46α / session-62 — boot lifecycle gate. `Ready` carries
+    /// the operator-login string; `NeedsSetup` means the keychain is
+    /// empty and only the setup route responds to mutations.
+    pub boot_state: Arc<std::sync::RwLock<ServeBootState>>,
 }
 
 fn build_router(state: AppState) -> Router {
@@ -458,7 +642,208 @@ fn build_router(state: AppState) -> Router {
         .route("/invoices/:id/submit", post(handle_submit_invoice))
         .route("/invoices/:id/poll-ack", post(handle_poll_ack))
         .route("/audit/:invoice_id", get(handle_get_audit))
+        // PR-46α / session-62 — first-run setup route. Accepts the
+        // four NAV credential artifacts and writes them to the OS
+        // keychain. In `NeedsSetup` mode it bypasses bearer-auth (the
+        // SPA wizard has no other way to populate the keychain on a
+        // fresh machine — A170); once the boot state transitions to
+        // `Ready` the route requires the standard Bearer-auth header
+        // like every other mutation.
+        .route(
+            "/api/setup-nav-credentials",
+            post(handle_setup_nav_credentials),
+        )
         .with_state(state)
+}
+
+/// PR-46α / session-62 — typed response body emitted when the backend
+/// is in `NeedsSetup` and a gated route is called. The SPA reads the
+/// `state` field to dispatch to the first-run wizard; the human-
+/// readable `message` is rendered inline so an operator inspecting
+/// the route via `curl` sees a recognisable string.
+fn needs_setup_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "state": "needs-setup",
+            "message": "Set up NAV credentials before using this endpoint.",
+        })),
+    )
+        .into_response()
+}
+
+/// PR-46α / session-62 — precondition gate for every Ready-only
+/// route. Returns `Ok(operator_login)` if the backend is `Ready`;
+/// returns `Err(response)` with the typed 503 needs-setup body
+/// otherwise. The poison-arm guards against a panic in the setup
+/// route's write transaction leaving the RwLock unusable — that's
+/// treated as a 500 (the operator-visible message points at
+/// internal-state corruption, which is the truth at that point).
+fn require_ready(state: &AppState) -> std::result::Result<String, Response> {
+    let guard = state.boot_state.read().map_err(|e| {
+        tracing::error!(error = %e, "boot_state RwLock poisoned");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(error_body("boot_state lock poisoned".to_string())),
+        )
+            .into_response()
+    })?;
+    match &*guard {
+        ServeBootState::Ready { operator_login } => Ok(operator_login.clone()),
+        ServeBootState::NeedsSetup => Err(needs_setup_response()),
+    }
+}
+
+/// PR-46α / session-62 — request body for
+/// `POST /api/setup-nav-credentials`. Field names are the
+/// operator-readable form rather than the on-disk `ITEM_*` keychain
+/// names; the SPA composer mirrors this shape.
+#[derive(Debug, Deserialize)]
+pub struct SetupNavCredentialsRequest {
+    pub technical_user_login: String,
+    pub technical_user_password: String,
+    pub xml_sign_key: String,
+    pub xml_change_key: String,
+}
+
+/// PR-46α / session-62 — response body for the setup route. Surfaces
+/// the post-write boot state so the SPA can flip its wizard view-mode
+/// to the normal app without a second probe roundtrip.
+#[derive(Debug, Serialize)]
+struct SetupNavCredentialsResponse {
+    state: &'static str,
+}
+
+/// PR-46α / session-62 — `POST /api/setup-nav-credentials` handler.
+///
+/// 1. Bearer-auth check ONLY if already `Ready` (chicken-and-egg
+///    bypass in `NeedsSetup`; A170).
+/// 2. Validate-then-write via [`setup_nav_credentials::setup_credentials_from_inputs`]
+///    (the shared core both the CLI subcommand and this route go
+///    through — A167).
+/// 3. Re-load NAV credentials from the now-populated keychain to
+///    extract the audit-actor login.
+/// 4. Take the boot_state write lock and flip
+///    `NeedsSetup → Ready { operator_login }`.
+/// 5. Return 200 with `{ "state": "ready" }`. From the SPA's
+///    perspective, this is the operator's exit from the wizard.
+///
+/// Failure modes:
+///   - `400 Bad Request` — validation failure (empty field).
+///   - `401 Unauthorized` — bearer missing in `Ready` mode.
+///   - `500 Internal Server Error` — keychain write failed OR the
+///     re-load couldn't find the entries we just wrote (which would
+///     indicate the OS keychain backend silently dropped a write —
+///     CLAUDE.md rule 12 surfaces it as a 500 rather than a partial-
+///     success lie).
+async fn handle_setup_nav_credentials(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<SetupNavCredentialsRequest>,
+) -> Response {
+    // Bearer check only in Ready mode. In NeedsSetup mode the operator
+    // has no way to acquire a bearer (the SPA's session-token loader
+    // path runs after the backend handshake, but the setup wizard
+    // fires BEFORE the normal app mounts — A170).
+    let is_ready_pre_call = state
+        .boot_state
+        .read()
+        .map(|g| g.is_ready())
+        .unwrap_or(false);
+    if is_ready_pre_call {
+        if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+            return resp;
+        }
+    }
+
+    let inputs = NavCredentialInputs {
+        technical_user_login: request.technical_user_login,
+        technical_user_password: request.technical_user_password,
+        xml_sign_key: request.xml_sign_key,
+        xml_change_key: request.xml_change_key,
+    };
+
+    match setup_nav_credentials_request(&state, &inputs) {
+        Ok(()) => Json(SetupNavCredentialsResponse { state: "ready" }).into_response(),
+        Err(SetupRouteHelperError::Validation(msg)) => {
+            (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response()
+        }
+        Err(SetupRouteHelperError::Other(e)) => {
+            internal_error("setup_nav_credentials_request", e)
+        }
+    }
+}
+
+/// PR-46α / session-62 — typed error from
+/// [`setup_nav_credentials_request`]. The route handler maps
+/// `Validation` → 400 and `Other` → 500 via the existing
+/// [`internal_error`] helper.
+#[derive(Debug)]
+pub enum SetupRouteHelperError {
+    Validation(String),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for SetupRouteHelperError {
+    fn from(e: anyhow::Error) -> Self {
+        SetupRouteHelperError::Other(e)
+    }
+}
+
+/// PR-46α / session-62 — library helper that backs the
+/// `POST /api/setup-nav-credentials` handler. Extracted as `pub` so
+/// the integration test can hit it for end-to-end pin tests without
+/// spinning the HTTPS listener (same posture as `get_invoice_pdf` per
+/// A158 and `issue_invoice_request` per A159 / A162 / A163).
+///
+/// On success: writes the four keychain entries via the shared core,
+/// re-loads to extract the operator login, and flips the boot state
+/// to Ready. On validation failure: returns
+/// `SetupRouteHelperError::Validation` (→ 400). On any other error:
+/// returns `SetupRouteHelperError::Other` (→ 500).
+pub fn setup_nav_credentials_request(
+    state: &AppState,
+    inputs: &NavCredentialInputs,
+) -> std::result::Result<(), SetupRouteHelperError> {
+    match setup_nav_credentials::setup_credentials_from_inputs(state.tenant.as_str(), inputs) {
+        Ok(()) => {}
+        Err(SetupCredentialsError::Validation(msg)) => {
+            return Err(SetupRouteHelperError::Validation(msg));
+        }
+        Err(SetupCredentialsError::Backend(e)) => {
+            return Err(SetupRouteHelperError::Other(e));
+        }
+    }
+
+    // Re-load to confirm the writes landed AND to extract the actor
+    // login. A re-load failure here would indicate the OS keychain
+    // silently dropped one of the four writes — loud per rule 12.
+    let operator_login = NavCredentials::load_from_keychain(state.tenant.as_str())
+        .map_err(|e| {
+            SetupRouteHelperError::Other(anyhow!(e).context(
+                "setup route wrote keychain entries but re-load failed; \
+                 keychain backend may have silently dropped a write",
+            ))
+        })?
+        .login()
+        .to_string();
+
+    // Flip the boot state. The write-lock acquisition can only fail
+    // on a poisoned RwLock — same surface as `require_ready`'s poison
+    // arm.
+    let mut guard = state.boot_state.write().map_err(|e| {
+        SetupRouteHelperError::Other(anyhow!(
+            "boot_state RwLock poisoned during setup transition: {e}"
+        ))
+    })?;
+    *guard = ServeBootState::Ready { operator_login };
+
+    tracing::info!(
+        tenant = %state.tenant.as_str(),
+        "NAV credentials populated via setup route; boot state transitioned to Ready"
+    );
+
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -468,12 +853,28 @@ struct HealthResponse {
     nav_xsd_version: &'static str,
 }
 
-async fn handle_health(State(state): State<AppState>) -> Json<HealthResponse> {
-    Json(HealthResponse {
-        ok: true,
-        binary_hash: hex::encode(state.binary_hash.as_bytes()),
-        nav_xsd_version: aberp_nav_xsd_validator::NAV_XSD_VERSION,
-    })
+async fn handle_health(State(state): State<AppState>) -> Response {
+    // PR-45a / session-61 — `binary_hash` is now a background-computed
+    // handle (see `BinaryHashHandle`). `wait()` essentially never
+    // blocks once the SPA has finished its first probe; the only
+    // failure mode is the background compute itself erroring out
+    // (e.g. macOS sandbox denied `current_exe`), which is the same
+    // catastrophic surface pre-PR-45a hit at startup. Surface it as
+    // 503 here rather than a Json with an "ok":true claim that
+    // would be a lie.
+    match state.binary_hash.wait() {
+        Ok(hash) => Json(HealthResponse {
+            ok: true,
+            binary_hash: hex::encode(hash.as_bytes()),
+            nav_xsd_version: aberp_nav_xsd_validator::NAV_XSD_VERSION,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(error_body(format!("binary hash unavailable: {e:#}"))),
+        )
+            .into_response(),
+    }
 }
 
 /// PR-28 / ADR-0036 §9 — typed wire shape for the eleven UI labels
@@ -753,6 +1154,9 @@ struct AuditEntryView {
 }
 
 async fn handle_list_invoices(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
@@ -767,6 +1171,9 @@ async fn handle_get_invoice(
     State(state): State<AppState>,
     AxumPath(invoice_id): AxumPath<String>,
 ) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
@@ -786,6 +1193,9 @@ async fn handle_get_audit(
     State(state): State<AppState>,
     AxumPath(invoice_id): AxumPath<String>,
 ) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
@@ -829,6 +1239,9 @@ async fn handle_get_invoice_pdf(
     State(state): State<AppState>,
     AxumPath(invoice_id): AxumPath<String>,
 ) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
@@ -977,6 +1390,10 @@ async fn handle_issue_invoice(
     State(state): State<AppState>,
     Json(request): Json<IssueInvoiceRequest>,
 ) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
@@ -996,7 +1413,7 @@ async fn handle_issue_invoice(
         Err(e) => return internal_error("build_live_provider", e),
     };
 
-    let actor = Actor::from_local_cli(Ulid::new().to_string(), &state.operator_login);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
 
     match issue_invoice_request(&state, request, provider.as_ref(), actor) {
         Ok(summary) => Json(IssueInvoiceResponse {
@@ -1203,6 +1620,9 @@ async fn handle_submit_invoice(
     State(state): State<AppState>,
     AxumPath(invoice_id): AxumPath<String>,
 ) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
@@ -1246,6 +1666,9 @@ async fn handle_poll_ack(
     State(state): State<AppState>,
     AxumPath(invoice_id): AxumPath<String>,
 ) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
@@ -1311,6 +1734,29 @@ pub fn submit_invoice_request(
     state: &AppState,
     invoice_id: &str,
 ) -> std::result::Result<submit_invoice::SubmitInvoiceOutcome, SubmitRouteError> {
+    // PR-46α / session-62 — pull operator_login from the Ready
+    // boot-state. The route-level `require_ready` guard runs first,
+    // so this read should always succeed; the NeedsSetup arm here is
+    // defence in depth (e.g., the integration test driving this
+    // helper without spinning the listener still has to construct a
+    // Ready AppState).
+    let operator_login = match state.boot_state.read() {
+        Ok(guard) => match &*guard {
+            ServeBootState::Ready { operator_login } => operator_login.clone(),
+            ServeBootState::NeedsSetup => {
+                return Err(SubmitRouteError::Other(anyhow!(
+                    "submit_invoice_request called in NeedsSetup state — \
+                     /api/setup-nav-credentials must run first"
+                )));
+            }
+        },
+        Err(e) => {
+            return Err(SubmitRouteError::Other(anyhow!(
+                "boot_state RwLock poisoned: {e}"
+            )));
+        }
+    };
+
     // 1. Precondition check — derive current state from audit trace.
     let derived = derive_state_for(state, invoice_id)?;
     if !matches!(derived.state, InvoiceState::Ready) {
@@ -1366,7 +1812,7 @@ pub fn submit_invoice_request(
         })?;
 
     // 6. Mint per-request Actor from startup-loaded operator login.
-    let actor = Actor::from_local_cli(Ulid::new().to_string(), &state.operator_login);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
 
     // 7. Dispatch into the library helper. The route surface routes
     //    only to NAV test per the standing boilerplate (production
@@ -1402,6 +1848,26 @@ pub fn poll_ack_request(
     state: &AppState,
     invoice_id: &str,
 ) -> std::result::Result<poll_ack::PollAckOutcome, SubmitRouteError> {
+    // PR-46α / session-62 — operator login read from Ready boot-state
+    // (same posture as `submit_invoice_request`). Loud-fail in
+    // NeedsSetup as defence in depth past the route-level gate.
+    let operator_login = match state.boot_state.read() {
+        Ok(guard) => match &*guard {
+            ServeBootState::Ready { operator_login } => operator_login.clone(),
+            ServeBootState::NeedsSetup => {
+                return Err(SubmitRouteError::Other(anyhow!(
+                    "poll_ack_request called in NeedsSetup state — \
+                     /api/setup-nav-credentials must run first"
+                )));
+            }
+        },
+        Err(e) => {
+            return Err(SubmitRouteError::Other(anyhow!(
+                "boot_state RwLock poisoned: {e}"
+            )));
+        }
+    };
+
     // 1. Precondition check.
     let derived = derive_state_for(state, invoice_id)?;
     let poll_eligible = matches!(
@@ -1443,7 +1909,7 @@ pub fn poll_ack_request(
         })?;
 
     // 4. Mint per-request Actor.
-    let actor = Actor::from_local_cli(Ulid::new().to_string(), &state.operator_login);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
 
     // 5. Dispatch into the library helper. NAV test endpoint only
     //    per the standing boilerplate (production cutover gated by
@@ -1525,7 +1991,11 @@ fn derive_state_for(
     state: &AppState,
     invoice_id: &str,
 ) -> std::result::Result<DerivedStateForInvoice, SubmitRouteError> {
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), state.binary_hash)
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute")?;
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
         .context("open audit ledger for serve mutation precondition")?;
     let entries = ledger
         .entries()
@@ -1687,7 +2157,11 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
     // The audit ledger is the source of truth for "what invoices
     // exist." Walk every entry once; group by invoice_id; derive
     // state.
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), state.binary_hash)
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute")?;
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
         .context("open audit ledger for serve list")?;
     let entries = ledger.entries().context("read audit ledger entries")?;
 
@@ -1742,7 +2216,11 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
 }
 
 fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<InvoiceDetailResponse>> {
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), state.binary_hash)
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute")?;
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
         .context("open audit ledger for serve detail")?;
     let entries = ledger.entries().context("read audit ledger entries")?;
 
@@ -1865,7 +2343,11 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
 }
 
 fn get_audit_for_invoice(state: &AppState, invoice_id: &str) -> Result<Vec<AuditEntryView>> {
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), state.binary_hash)
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute")?;
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
         .context("open audit ledger for serve audit")?;
     let entries = ledger.entries().context("read audit ledger entries")?;
     let mut out = Vec::new();

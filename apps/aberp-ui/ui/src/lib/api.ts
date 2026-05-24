@@ -376,3 +376,85 @@ export async function submitInvoice(
 export async function pollAck(invoiceId: string): Promise<PollAckResponse> {
   return invoke<PollAckResponse>("poll_ack", { invoiceId });
 }
+
+/** PR-45a / session-61 — boot lifecycle status the Tauri shell
+ * exposes so the SPA can render a loading / error pane instead of
+ * sitting blank while `aberp serve` cold-boots. PR-46α / session-62
+ * extended the union with `"needs-setup"` for the first-run
+ * NAV-credentials wizard. Four states:
+ *
+ *   - `"starting"`: the backend subprocess is mid-spawn / mid-
+ *     handshake. SPA renders the loading pane with recent log lines.
+ *   - `"needs-setup"`: the backend's handshake reported an empty
+ *     keychain. SPA renders the first-run setup wizard (four-field
+ *     form → POST /api/setup-nav-credentials → flip to ready).
+ *   - `"ready"`: the handshake parsed, the backend is reachable. SPA
+ *     mounts its normal screens.
+ *   - `"failed"`: boot errored out. `error` carries the message;
+ *     SPA renders the error pane with a Retry button.
+ *
+ * Wire form is the lower-case string emitted by
+ * `aberp-ui::commands::get_boot_status` on the Rust side; the SPA
+ * reads it strictly via this typed union so a backend drift surfaces
+ * at `npm run check`. */
+export type BootStatus = "starting" | "needs-setup" | "ready" | "failed";
+
+/** PR-45a / session-61 — boot lifecycle snapshot, mirrors the Tauri
+ * shell's `get_boot_status` JSON body. `error` is `null` unless
+ * `status === "failed"`. `recent_logs` is the bounded ring buffer
+ * of backend stderr lines (oldest first; capped at 20 entries on
+ * the Rust side via `RECENT_LOGS_CAP`). */
+export interface BootStatusResponse {
+  status: BootStatus;
+  error: string | null;
+  recent_logs: string[];
+}
+
+/** PR-45a / session-61 — read the boot lifecycle snapshot. The SPA
+ * polls this until `status !== "starting"`. */
+export async function getBootStatus(): Promise<BootStatusResponse> {
+  return invoke<BootStatusResponse>("get_boot_status");
+}
+
+/** PR-45a / session-61 — re-invoke `boot_backend` after a Failed
+ * boot. The Retry button on the SPA's error pane calls this. The
+ * command returns immediately; the SPA continues polling
+ * `getBootStatus` and re-renders against the lifecycle that follows. */
+export async function retryBoot(): Promise<void> {
+  await invoke<void>("retry_boot");
+}
+
+/** PR-46α / session-62 — wire request body for the first-run setup
+ * wizard. Mirrors the Rust-side
+ * `serve::SetupNavCredentialsRequest` (snake_case JSON fields). The
+ * SPA composer in `./setup-credentials.ts` builds this shape from
+ * the four form fields. */
+export interface SetupNavCredentialsRequest {
+  technical_user_login: string;
+  technical_user_password: string;
+  xml_sign_key: string;
+  xml_change_key: string;
+}
+
+/** PR-46α / session-62 — wire response body for the setup route on
+ * the happy path. The Rust side returns `{ "state": "ready" }`; the
+ * SPA reads this to confirm the keychain write landed before
+ * re-rendering. */
+export interface SetupNavCredentialsResponse {
+  state: "ready";
+}
+
+/** PR-46α / session-62 — POST the SPA's first-run wizard form to the
+ * backend's `/api/setup-nav-credentials` route via the matching
+ * Tauri command. On success the backend has written all four
+ * credential entries to the OS keychain AND flipped its boot state
+ * to Ready; the Tauri shell mirrors that transition (the SPA's next
+ * `getBootStatus` poll returns `"ready"` and the wizard pane swaps
+ * out for the normal app). Errors propagate as the rejected promise
+ * (the typed 400 validation body surfaces verbatim so the SPA renders
+ * the operator-actionable inline message per A157). */
+export async function setupNavCredentials(
+  body: SetupNavCredentialsRequest,
+): Promise<SetupNavCredentialsResponse> {
+  return invoke<SetupNavCredentialsResponse>("setup_nav_credentials", { body });
+}

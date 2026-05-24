@@ -61,9 +61,17 @@ fn build_state(db_path: PathBuf) -> AppState {
     AppState {
         db_path: Arc::new(db_path),
         tenant,
-        binary_hash,
+        binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),
         session_token: Arc::new("test-token".to_string()),
-        operator_login: Arc::new("test-operator".to_string()),
+        // PR-46α / session-62 — `operator_login` moved inside the
+        // [`ServeBootState::Ready`] variant. Tests construct the
+        // Ready state directly; the in-process setup-route flip path
+        // is covered by `serve_setup_nav_credentials_route.rs`.
+        boot_state: Arc::new(std::sync::RwLock::new(
+            aberp::serve::ServeBootState::Ready {
+                operator_login: "test-operator".to_string(),
+            },
+        )),
     }
 }
 

@@ -16,9 +16,10 @@
 //! programs. Spawning via `tokio::process::Command` from the Rust
 //! setup hook keeps the subprocess off the SPA-reachable surface.
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -26,12 +27,17 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use crate::handshake::{self, Handshake};
+use crate::handshake::{self, Handshake, ServeBootState};
+use crate::push_recent_log;
 
 /// Wait at most this long for `aberp serve` to print its handshake
-/// line. Cold-start usually completes in under 200ms; a 10s ceiling
-/// is generous for the slowest first-launch (cert generation, DuckDB
-/// schema migration). Beyond that we loud-fail per rule 12.
+/// line. Post-PR-45a cold-start completes in well under 2s on a
+/// clean machine state (binary-hash compute is now off the handshake
+/// critical path; the listener bind + READY-line emit is essentially
+/// instantaneous after cert generation). A 10s ceiling stays
+/// generous so a slow first-launch (e.g. rcgen key gen on a
+/// power-throttled machine) does not surface as a spurious timeout.
+/// Beyond that we loud-fail per rule 12.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Outcome of a successful subprocess launch.
@@ -41,6 +47,11 @@ pub struct StartedBackend {
     pub url: String,
     /// Hex SHA-256 fingerprint of the loopback cert DER.
     pub fingerprint_hex: String,
+    /// PR-46α / session-62 — backend boot lifecycle as reported on the
+    /// handshake line's optional `state=<token>` suffix. Drives the
+    /// SPA's first-paint dispatch between the normal app and the
+    /// first-run setup wizard.
+    pub handshake_state: ServeBootState,
     /// Kept around for kill-on-drop. We never need to read from it
     /// again after the handshake; the stderr drain owns its `tokio`
     /// task.
@@ -80,7 +91,17 @@ impl BackendHandle {
 
 /// Spawn `aberp serve --tenant <tenant> --db <db> --port 0` and parse
 /// the handshake.
-pub async fn spawn(aberp_bin: &Path, tenant: &str, db_path: &str) -> Result<StartedBackend> {
+///
+/// PR-45a / session-61 — takes a `recent_logs` ring buffer; every
+/// stderr line forwarded from the backend is pushed onto the buffer
+/// so the SPA's loading-state pane can render the most recent
+/// backend output during cold boot.
+pub async fn spawn(
+    aberp_bin: &Path,
+    tenant: &str,
+    db_path: &str,
+    recent_logs: Arc<StdMutex<VecDeque<String>>>,
+) -> Result<StartedBackend> {
     tracing::info!(
         bin = %aberp_bin.display(),
         tenant = %tenant,
@@ -119,14 +140,18 @@ pub async fn spawn(aberp_bin: &Path, tenant: &str, db_path: &str) -> Result<Star
         .take()
         .ok_or_else(|| anyhow!("subprocess stderr pipe not opened — Stdio::piped did not stick"))?;
 
-    // Pump stderr verbatim to our own tracing. Backend logs are useful
-    // to surface in the same window the operator runs the Tauri shell
-    // in — debugging a "the SPA shows no invoices" report without the
-    // backend's log stream is the kind of failure rule 12 names.
+    // Pump stderr verbatim to our own tracing + the SPA-visible
+    // recent-logs ring buffer. Backend logs are useful to surface in
+    // the same window the operator runs the Tauri shell in;
+    // PR-45a additionally renders the most recent N lines inside the
+    // SPA's cold-boot loading pane so the operator sees what the
+    // backend is doing instead of staring at a blank window.
+    let recent_logs_for_pump = Arc::clone(&recent_logs);
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             tracing::info!(target: "aberp.serve", "{line}");
+            push_recent_log(&recent_logs_for_pump, line);
         }
     });
 
@@ -144,6 +169,7 @@ pub async fn spawn(aberp_bin: &Path, tenant: &str, db_path: &str) -> Result<Star
     Ok(StartedBackend {
         url: handshake.url,
         fingerprint_hex: handshake.fingerprint_hex,
+        handshake_state: handshake.state,
         child: Arc::new(Mutex::new(child)),
     })
 }
@@ -208,9 +234,7 @@ mod tests {
     async fn handshake_preceded_by_noise_is_accepted() {
         let fp = hex::encode([0xa5u8; 32]);
         let mut buf = b"some startup chatter\nmore chatter\n".to_vec();
-        buf.extend_from_slice(
-            format!("aberp serve: https://127.0.0.1:12345/ (fingerprint sha256:{fp})\n").as_bytes(),
-        );
+        buf.extend_from_slice(format!("READY 127.0.0.1:12345 sha256:{fp}\n").as_bytes());
         let buf_slice: &[u8] = &buf;
         let parsed = wait_for_handshake_line(buf_slice)
             .await

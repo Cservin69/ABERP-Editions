@@ -26,6 +26,17 @@
 //! `technical_user.login` etc.) the production `submit-invoice` path
 //! reads via `NavCredentials::load_from_keychain`.
 //!
+//! # PR-46α / session-62 — shared core
+//!
+//! The CLI `run()` and the new `POST /api/setup-nav-credentials` HTTP
+//! route both write the same four keychain entries. The actual write
+//! is factored into [`setup_credentials_from_inputs`] (mirrors the
+//! A159 / A162 / A163 extract-library-helper pattern) so a single
+//! validate-then-write implementation backs both flows. The CLI's
+//! interactive prompts populate a [`NavCredentialInputs`] struct then
+//! call the shared core; the HTTP route deserialises the request body
+//! straight into [`NavCredentialInputs`] and calls the same core.
+//!
 //! # Why this lives in `apps/aberp/src/` and not in `crates/nav-transport`
 //!
 //! `aberp-nav-transport` is a library; the keychain WRITE path (as
@@ -79,6 +90,104 @@ const PROMPTS: [ItemPrompt; 4] = [
     },
 ];
 
+/// PR-46α / session-62 — bundled inputs for the shared
+/// [`setup_credentials_from_inputs`] core. Mirrors the four NAV
+/// credential artifacts; the CLI populates it from stdin, the HTTP
+/// route deserialises the request body straight into it.
+///
+/// The struct does NOT carry the tenant — the tenant is the surface-
+/// level parameter, threaded as `&str` to the core function so the CLI
+/// args struct and the HTTP route's `state.tenant` can both supply
+/// theirs without lifting `TenantId` to the shared seam.
+#[derive(Debug, Clone)]
+pub struct NavCredentialInputs {
+    pub technical_user_login: String,
+    pub technical_user_password: String,
+    pub xml_sign_key: String,
+    pub xml_change_key: String,
+}
+
+/// PR-46α / session-62 — typed error from
+/// [`setup_credentials_from_inputs`]. Two arms so the HTTP route can
+/// map `Validation` → 400 and `Backend` → 500; the CLI wraps both
+/// into `anyhow::Error` for its existing surface.
+#[derive(Debug)]
+pub enum SetupCredentialsError {
+    /// One of the four inputs was empty (after trim). The associated
+    /// string names the offending field in operator-readable form.
+    Validation(String),
+    /// The OS keychain backend itself errored (locked keychain,
+    /// permission denied, unsupported platform).
+    Backend(anyhow::Error),
+}
+
+impl std::fmt::Display for SetupCredentialsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetupCredentialsError::Validation(msg) => write!(f, "{msg}"),
+            SetupCredentialsError::Backend(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for SetupCredentialsError {}
+
+/// PR-46α / session-62 — shared core that writes the four NAV
+/// credential entries to the OS keychain for a tenant. Backs both the
+/// CLI `aberp setup-nav-credentials` subcommand AND the
+/// `POST /api/setup-nav-credentials` HTTP route the SPA's first-run
+/// setup wizard hits.
+///
+/// Validates that all four inputs are non-empty (after trim) per
+/// CLAUDE.md rule 12 — a half-populated keychain produces a hard
+/// error downstream at `NavCredentials::load_from_keychain`, so we
+/// refuse to write partial state at this seam. Writes overwrite any
+/// existing entries (the CLI's `--refuse-overwrite` flag is CLI-only
+/// scope; the HTTP route is for first-run setup OR re-credentialing,
+/// both of which want overwrite semantics).
+pub fn setup_credentials_from_inputs(
+    tenant: &str,
+    inputs: &NavCredentialInputs,
+) -> std::result::Result<(), SetupCredentialsError> {
+    validate_input(&inputs.technical_user_login, "Technical-user login")?;
+    validate_input(&inputs.technical_user_password, "Technical-user password")?;
+    validate_input(&inputs.xml_sign_key, "xmlSignKey")?;
+    validate_input(&inputs.xml_change_key, "xmlChangeKey")?;
+
+    let service = service_name(tenant);
+    write_entry(&service, ITEM_LOGIN, &inputs.technical_user_login)?;
+    write_entry(&service, ITEM_PASSWORD, &inputs.technical_user_password)?;
+    write_entry(&service, ITEM_SIGN_KEY, &inputs.xml_sign_key)?;
+    write_entry(&service, ITEM_CHANGE_KEY, &inputs.xml_change_key)?;
+    Ok(())
+}
+
+fn validate_input(value: &str, label: &'static str) -> std::result::Result<(), SetupCredentialsError> {
+    if value.trim().is_empty() {
+        return Err(SetupCredentialsError::Validation(format!(
+            "{label} is required"
+        )));
+    }
+    Ok(())
+}
+
+fn write_entry(
+    service: &str,
+    item: &'static str,
+    value: &str,
+) -> std::result::Result<(), SetupCredentialsError> {
+    let entry = keyring::Entry::new(service, item).map_err(|e| {
+        SetupCredentialsError::Backend(anyhow!(
+            "open keychain entry for service `{service}` item `{item}`: {e}"
+        ))
+    })?;
+    entry.set_password(value).map_err(|e| {
+        SetupCredentialsError::Backend(anyhow!(
+            "write keychain entry `{item}` for service `{service}`: {e}"
+        ))
+    })
+}
+
 pub fn run(args: &SetupNavCredentialsArgs) -> Result<()> {
     let service = service_name(&args.tenant);
     eprintln!(
@@ -95,10 +204,11 @@ pub fn run(args: &SetupNavCredentialsArgs) -> Result<()> {
 
     let stdin = std::io::stdin();
     let mut stdin_lock = stdin.lock();
-    let mut populated = 0usize;
+    let mut values: [String; 4] = Default::default();
     let mut skipped = 0usize;
+    let mut populated = 0usize;
 
-    for prompt in &PROMPTS {
+    for (idx, prompt) in PROMPTS.iter().enumerate() {
         // Prompt to stderr (not stdout) so a stdin-redirected pipe
         // doesn't see the prompt text in its own output stream.
         if prompt.is_secret {
@@ -118,13 +228,13 @@ pub fn run(args: &SetupNavCredentialsArgs) -> Result<()> {
         if n == 0 {
             return Err(anyhow!(
                 "stdin closed before all four credentials were read \
-                 (expected 4, got {populated})"
+                 (expected 4, got {idx})"
             ));
         }
         // Trim only trailing newline / CR; do not touch leading
         // whitespace in case it is part of the value (NAV-generated
         // keys don't carry whitespace, but stay defensive).
-        let value = buf.trim_end_matches(['\n', '\r']);
+        let value = buf.trim_end_matches(['\n', '\r']).to_string();
 
         if args.refuse_overwrite && keychain_entry_exists(&service, prompt.storage_name)? {
             eprintln!(
@@ -132,19 +242,40 @@ pub fn run(args: &SetupNavCredentialsArgs) -> Result<()> {
                 prompt.storage_name,
             );
             skipped += 1;
+            values[idx] = String::new();
             continue;
         }
-
-        let entry = keyring::Entry::new(&service, prompt.storage_name).with_context(|| {
-            format!(
-                "open keychain entry for service `{service}` item `{}`",
-                prompt.storage_name
-            )
-        })?;
-        entry
-            .set_password(value)
-            .with_context(|| format!("write keychain entry `{}`", prompt.storage_name))?;
+        values[idx] = value;
         populated += 1;
+    }
+
+    // PR-46α / session-62 — route through the shared core when we have
+    // all four values to write. For the `--refuse-overwrite` mix-and-
+    // match case (some entries skipped) we cannot use the shared core
+    // because it refuses empty inputs; fall back to per-entry writes
+    // for those slots that survived the skip check.
+    if skipped == 0 {
+        let inputs = NavCredentialInputs {
+            technical_user_login: values[0].clone(),
+            technical_user_password: values[1].clone(),
+            xml_sign_key: values[2].clone(),
+            xml_change_key: values[3].clone(),
+        };
+        setup_credentials_from_inputs(&args.tenant, &inputs)
+            .map_err(|e| anyhow!("setup_credentials_from_inputs: {e}"))?;
+    } else {
+        // --refuse-overwrite hit at least one entry; write per-slot
+        // for the slots that survived. Validation still applies to
+        // each non-skipped value (empty → loud-fail).
+        for (idx, prompt) in PROMPTS.iter().enumerate() {
+            if values[idx].is_empty() {
+                continue;
+            }
+            validate_input(&values[idx], prompt.label)
+                .map_err(|e| anyhow!("setup_credentials_from_inputs: {e}"))?;
+            write_entry(&service, prompt.storage_name, &values[idx])
+                .map_err(|e| anyhow!("setup_credentials_from_inputs: {e}"))?;
+        }
     }
 
     eprintln!(
@@ -186,5 +317,53 @@ fn keychain_entry_exists(service: &str, item: &'static str) -> Result<bool> {
         Err(other) => Err(anyhow!(
             "keychain probe failed for service `{service}` item `{item}`: {other}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PR-46α / session-62 — validation rejects an empty
+    /// `technical_user_login`. The other three fields share the same
+    /// validator; one pin per field would be tautological. Covers
+    /// the CLI + HTTP-route 400 branch.
+    #[test]
+    fn setup_credentials_rejects_empty_login() {
+        let inputs = NavCredentialInputs {
+            technical_user_login: "  ".to_string(),
+            technical_user_password: "pw".to_string(),
+            xml_sign_key: "sk".to_string(),
+            xml_change_key: "ck".to_string(),
+        };
+        let err = setup_credentials_from_inputs("t-validation", &inputs)
+            .expect_err("blank login must fail validation");
+        match err {
+            SetupCredentialsError::Validation(msg) => {
+                assert!(msg.contains("Technical-user login"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// PR-46α / session-62 — validation rejects an empty
+    /// `xml_change_key` (the LAST field). Guards against a regression
+    /// that drops a validate call from the chain.
+    #[test]
+    fn setup_credentials_rejects_empty_change_key() {
+        let inputs = NavCredentialInputs {
+            technical_user_login: "lg".to_string(),
+            technical_user_password: "pw".to_string(),
+            xml_sign_key: "sk".to_string(),
+            xml_change_key: "".to_string(),
+        };
+        let err = setup_credentials_from_inputs("t-validation", &inputs)
+            .expect_err("blank change_key must fail validation");
+        match err {
+            SetupCredentialsError::Validation(msg) => {
+                assert!(msg.contains("xmlChangeKey"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 }

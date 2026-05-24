@@ -10,10 +10,10 @@
 //! per rule 12.
 
 use anyhow::Context;
-use serde_json::Value;
-use tauri::State;
+use serde_json::{json, Value};
+use tauri::{AppHandle, Manager, State};
 
-use crate::AppState;
+use crate::{boot_backend, mark_ready_after_setup, AppState, BootStatus};
 
 /// `GET /health` — unauthenticated on the backend, but we still
 /// route it through the same pinned client so the SPA never bypasses
@@ -120,6 +120,124 @@ pub async fn poll_ack(
     validate_invoice_id(&invoice_id).map_err(|e| format!("{e:#}"))?;
     let path = format!("/invoices/{invoice_id}/poll-ack");
     forward_post(&state, &path, Value::Null).await
+}
+
+/// PR-45a / session-61 — boot lifecycle snapshot the SPA polls
+/// while it's deciding which screen to render. Returns a JSON object
+/// with three fields:
+///
+///   - `status`: one of `"starting"`, `"ready"`, `"failed"`.
+///   - `error`: error message (`string` iff `status == "failed"`,
+///     `null` otherwise).
+///   - `recent_logs`: array of strings (oldest first) — the last N
+///     backend stderr lines, so the SPA's loading pane shows what
+///     the backend is doing during the cold-boot window. The buffer
+///     is bounded by `RECENT_LOGS_CAP` (20 lines).
+///
+/// The SPA polls this every few hundred ms while the backend isn't
+/// `ready`; once `ready` the SPA mounts the existing screens and
+/// stops polling. A `failed` status renders an error pane with a
+/// Retry button that calls `retry_boot`.
+#[tauri::command]
+pub async fn get_boot_status(state: State<'_, AppState>) -> Result<Value, String> {
+    let boot_state = {
+        let guard = state
+            .boot_state
+            .lock()
+            .map_err(|e| format!("boot_state mutex poisoned: {e}"))?;
+        guard.clone()
+    };
+    let recent_logs: Vec<String> = {
+        let guard = state
+            .recent_logs
+            .lock()
+            .map_err(|e| format!("recent_logs mutex poisoned: {e}"))?;
+        guard.iter().cloned().collect()
+    };
+    let status_str = match boot_state.status {
+        BootStatus::Starting => "starting",
+        BootStatus::NeedsSetup => "needs-setup",
+        BootStatus::Ready => "ready",
+        BootStatus::Failed => "failed",
+    };
+    Ok(json!({
+        "status": status_str,
+        "error": boot_state.error,
+        "recent_logs": recent_logs,
+    }))
+}
+
+/// PR-46α / session-62 — relay the SPA's first-run setup wizard
+/// payload to the backend's `POST /api/setup-nav-credentials` route.
+/// In `NeedsSetup` boot state the backend bypasses Bearer-auth
+/// (A170 chicken-and-egg posture); this command forwards the JSON
+/// body verbatim and on a 200 response flips the Tauri-side boot
+/// state to `Ready` via [`mark_ready_after_setup`] so the SPA's next
+/// `get_boot_status` poll picks up the transition seamlessly.
+///
+/// The body is taken as a generic `Value` (matching the
+/// `issue_invoice` posture per A156): the SPA composer owns the
+/// snake_case shape; the backend's `SetupNavCredentialsRequest`
+/// deserialiser is the type-level pin. Adding a strongly-typed
+/// `#[derive(Deserialize)]` here would force a new workspace
+/// dependency (`serde` derives) on the Tauri shell — out of scope
+/// per CLAUDE.md rule 2 (minimum code, no speculative abstractions).
+///
+/// Failure modes propagate as the rejected promise (matching the
+/// existing `issue_invoice` / `submit_invoice_to_nav` posture):
+/// the typed `400` validation body and the `503` not-in-needs-setup
+/// body both surface as `Err(String)` to the SPA's inline-error
+/// renderer.
+#[tauri::command]
+pub async fn setup_nav_credentials(
+    app: AppHandle,
+    body: Value,
+) -> Result<Value, String> {
+    let state = app.state::<AppState>();
+    let response = forward_post(&state, "/api/setup-nav-credentials", body).await?;
+    // A successful response means the backend wrote all four keychain
+    // entries AND flipped its own boot state to Ready. Mirror that on
+    // the Tauri shell side so the SPA's next `get_boot_status` poll
+    // returns the Ready snapshot and the wizard pane swaps out for
+    // the normal app.
+    mark_ready_after_setup(&app);
+    Ok(response)
+}
+
+/// PR-45a / session-61 — the SPA's Retry button calls this command
+/// from the "backend boot failed" error pane. Spawns a fresh
+/// `boot_backend` attempt; the SPA continues polling
+/// `get_boot_status` and re-renders based on the lifecycle that
+/// follows. On a successful retry the SPA flips from the error pane
+/// to the normal screen with no further operator action.
+///
+/// Note the boot_state reset happens inside `boot_backend` itself
+/// (idempotent), so the SPA sees `starting` immediately on the next
+/// poll.
+#[tauri::command]
+pub async fn retry_boot(app: AppHandle) -> Result<(), String> {
+    // Spawn on the Tauri-owned async runtime so the await on this
+    // command returns immediately — the SPA does not want a Retry
+    // click to block on the full boot timeline.
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = boot_backend(&app).await {
+            let message = format!("{e:#}");
+            tracing::error!(error = %message, "backend boot failed (retry)");
+            let state = app.state::<AppState>();
+            let mut guard = match state.boot_state.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::error!(error = %e, "boot_state mutex poisoned on retry");
+                    return;
+                }
+            };
+            *guard = crate::BootState {
+                status: BootStatus::Failed,
+                error: Some(message),
+            };
+        }
+    });
+    Ok(())
 }
 
 /// Single point of contact with the backend. Locks the backend

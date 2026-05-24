@@ -60,11 +60,43 @@ fn install_rustls_crypto_provider() {
 }
 
 fn init_tracing() {
-    // Human-readable logs to stderr by default; production deployments
-    // can flip to JSON via RUST_LOG / a config flag in a later PR.
+    // PR-46α.1 / session-62-fix — explicitly route tracing emits to
+    // STDERR. `tracing_subscriber::fmt()` defaults to STDOUT, which
+    // mixes structured-log output with the `aberp serve` handshake
+    // line on the same byte-stream the Tauri shell's
+    // `wait_for_handshake_line` reads. Two consequences pre-fix:
+    //
+    //   1. The Tauri shell's stderr-pump task (which populates the
+    //      SPA's `recent_logs` ring buffer per session-61's
+    //      loading-pane work) saw an empty stream. `latestLogLine`
+    //      stayed null on every poll, so the boot-pane only showed
+    //      the static fallback string — there was no live progress
+    //      surface during a slow boot, which is exactly when the
+    //      operator needs it most.
+    //   2. The `printlnly`-written `READY ...` handshake line
+    //      shared a Mutex<BufWriter<Stdout>> with every tracing
+    //      emit. A drift that re-introduced a synchronous
+    //      heavyweight write to stdout could in principle interleave
+    //      with the handshake println (rust's `io::stdout()` is
+    //      LineWriter, so newline-flushing keeps lines atomic in
+    //      practice — but routing observability to a different stream
+    //      removes the hazard entirely).
+    //
+    // The fix routes tracing to stderr. The Tauri shell's stderr
+    // pump then forwards every backend log line into recent_logs;
+    // the SPA's loading pane shows real-time progress; stdout
+    // carries only the handshake line + any intentional
+    // operator-facing `println!` (currently just the READY emit).
+    //
+    // Operators running `aberp` subcommands directly in a terminal
+    // see the same logs in stderr that they previously saw in
+    // stdout. Terminal-attached stderr is line-buffered and visible
+    // by default; pipelines that captured stdout for the handshake
+    // line continue to work (the line stays where they expect).
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .with_target(false)
         .init();
