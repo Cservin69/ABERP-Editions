@@ -1,8 +1,28 @@
 # ADR-0037 — EUR-denominated outgoing invoicing: compliance test surface pin (regulatory fields, MNB exchange-rate source, Currency closed-vocab) — extends ADR-0009 §1 ("Currency: HUF only for v1 — trigger: first non-HUF customer signed")
 
-- **Status:** Accepted
+- **Status:** Accepted (legal cleanup 2026-05-23 / session 50)
 - **Date:** 2026-05-23
 - **Deciders:** Ervin
+- **Source-of-legal-confirmation:** Legal citations confirmed
+  by Ervin Csengeri, CEO of Aben Consulting, on 2026-05-23
+  (session 50). Resolved citations: Áfa tv. §80(1)(g) (HUF
+  equivalent must be shown when invoice currency ≠ HUF);
+  Áfa tv. §80(2) (applied rate is MNB official mid-rate of
+  the fulfillment date, or D-1 if no rate that day —
+  weekend / holiday); NAV `Online Számla` XSD fields
+  `invoiceData/currencyCode` (ISO 4217),
+  `invoiceData/exchangeRate` (decimal, 6 places),
+  `invoiceSummary/summaryNormal/invoiceVatAmountHUF`;
+  rate precision = 6 decimals per NAV schema; HUF rounding
+  = round-half-even per Áfa convention. Placeholders that
+  remain open after this cleanup: Áfa tv. §169 (general
+  invoice-content list — whether the source name itself
+  and the per-VAT-rate net HUF amount are individually
+  required on the printed sheet) and Áfa tv. §172
+  (storno-currency constraint). F47 partially closed — the
+  §80 family + the NAV XSD-field family + the rate precision
+  / rounding mode are resolved; F47 remains open for the
+  §169 + §172 residue.
 - **Class:** Build-phase just-in-time ADR — fires ADR-0009
   §1's named trigger ("first non-HUF customer signed").
   Mid-session-46 scope injection: outgoing invoices must
@@ -89,9 +109,14 @@
     additions; PR-43 does NOT extend the wire shape.
 - **Source material:** ADR-0009 §1 (currency trigger) +
   Áfa tv. (2007. évi CXXVII. törvény az általános
-  forgalmi adóról) §80 + §169 + §172 [NEEDS-LEGAL-CHECK
-  on exact subsection alignment per §1 below] + NAV
-  Online Számla 3.0 XSD (the vendored copy already
+  forgalmi adóról) §80(1)(g) (HUF equivalent must be
+  shown when invoice currency ≠ HUF — confirmed
+  2026-05-23) + §80(2) (applied rate = MNB official
+  mid-rate of the fulfillment date, or D-1 if no rate
+  that day — confirmed 2026-05-23) + §169 + §172
+  [NEEDS-LEGAL-CHECK on exact §169 and §172 subsections;
+  §80(1)(g) and §80(2) confirmed by Ervin 2026-05-23] +
+  NAV Online Számla 3.0 XSD (the vendored copy already
   pinned per ADR-0009 §1 schema-drift detection) + MNB
   exchange-rate publication policy
   (https://www.mnb.hu/arfolyamok — the daily official
@@ -121,14 +146,19 @@ lift:
    the Magyar Nemzeti Bank (MNB, Hungarian National
    Bank). The MNB's official daily mid-rate is the
    regulatory-acceptable source per Áfa tv. §80(2)
-   [NEEDS-LEGAL-CHECK on exact subsection — the
-   currency-conversion clause for VAT-base calculation
-   in foreign-currency invoicing].
+   (confirmed 2026-05-23 — the applied rate is the
+   MNB official mid-rate of the fulfillment date, or
+   D-1 if no rate is published that day — weekend or
+   Hungarian public holiday).
 2. The rate value, rate source name ("MNB"), and rate
    date MUST appear on the printed invoice itself.
-   This is a Hungarian regulatory informational
-   requirement per Áfa tv. §169 [NEEDS-LEGAL-CHECK on
-   exact subsection — the invoice-content list].
+   The HUF-equivalent gross total MUST also appear on
+   the printed invoice when invoice currency ≠ HUF per
+   Áfa tv. §80(1)(g) (confirmed 2026-05-23). The
+   broader printed-invoice-content list lives under
+   Áfa tv. §169 [NEEDS-LEGAL-CHECK on the §169
+   subsection that enumerates every printed field —
+   §80(1)(g) confirmed; §169 subsection still pending].
 
 ### Why a doc-only ADR before any code
 
@@ -208,11 +238,14 @@ publication date if that day has no rate).
 **Reading B:** use the rate of the issuance date.
 **Reading C:** use the rate of the day BEFORE the
 supply-fulfillment date. **Decision below picks
-Reading A** — the §80(2) [NEEDS-LEGAL-CHECK] rule
-is canonical for VAT-base calculation; the issuance
-date and the day-before reading are not regulatory.
-This MUST be revisited at PR-44β implementation time
-if a legal review surfaces a different reading.
+Reading A** — the §80(2) rule (confirmed 2026-05-23:
+MNB official mid-rate of the fulfillment date, or D-1
+if no rate that day) is canonical for VAT-base
+calculation; the issuance date and the
+flat-day-before reading are not regulatory. The §80(2)
+text covers Reading A's walked-back-fallback for
+non-publication days; the legal-review pass at
+session 50 confirmed this reading.
 
 **Conflict 2 — MNB endpoint: SOAP `MNBArfolyamServiceSoap`
 vs. the JSON endpoint.** MNB publishes daily exchange
@@ -348,11 +381,17 @@ when `currencyCode != HUF`:
   **`invoiceVatAmountHUF`** — invoice-level totals in
   HUF. MUST be populated when `currencyCode != HUF`.
 
-[NEEDS-LEGAL-CHECK: the exact XPath under the v3.0
-namespace `http://schemas.nav.gov.hu/OSA/3.0/data`
-varies slightly between minor patch releases; PR-44δ's
-test posture pins the actual XPath against the
-vendored XSD at implementation time.]
+Confirmed NAV Online Számla XSD field paths
+(2026-05-23): `invoiceData/currencyCode` (ISO 4217
+three-letter code), `invoiceData/exchangeRate`
+(decimal, 6 decimal places), and
+`invoiceSummary/summaryNormal/invoiceVatAmountHUF`
+(decimal, the regulatory HUF-equivalent VAT total).
+The fuller `invoiceMain/invoice/...` paths above are
+the in-body wrapper context; PR-44δ's golden-XML test
+pins both the wrapper context and the confirmed
+field-leaf names against the vendored XSD at
+implementation time.
 
 #### 1.c Rounding and HUF-conversion precision
 
@@ -360,10 +399,20 @@ vendored XSD at implementation time.]
   are computed by converting the EUR amount at the
   applied exchange rate, then rounding to the whole
   forint (HUF has no sub-unit per ADR-0009 §1 /
-  `Huf(pub i64)`). The rounding mode is **half-up**
-  per Hungarian regulatory practice [NEEDS-LEGAL-CHECK
-  on whether banker's rounding is permitted as an
-  alternative; PR-44α's domain test pins half-up].
+  `Huf(pub i64)`). The rounding mode is
+  **round-half-even** (banker's rounding) per Áfa
+  convention (confirmed 2026-05-23). Ties round to
+  the even forint (`123.5 → 124`, `124.5 → 124`); this
+  is the Áfa-compliant rule and supersedes the
+  pre-cleanup half-up posture.
+- **Exchange-rate value precision.** The exchange rate
+  is stored and serialized to the NAV-submitted XML at
+  **6 decimal places** per the NAV `Online Számla` XSD
+  (confirmed 2026-05-23). The printed-invoice display
+  per §1.a MAY show fewer decimals (MNB publishes the
+  EUR/HUF mid-rate at lower precision); the wire body
+  carries the 6-decimal form regardless of the printed
+  form.
 - **Per-line vs. per-VAT-rate posture.** The HUF
   conversion happens at the per-VAT-rate summary
   level, NOT per-line. Per-line totals stay in EUR
@@ -405,14 +454,17 @@ vendored XSD at implementation time.]
 
 #### 2.b Date alignment
 
-- **Primary rule (Áfa tv. §80(2) [NEEDS-LEGAL-CHECK]):**
-  the applied exchange rate is the MNB rate published
-  for the **supply-fulfillment date**
-  (`teljesítés napja`).
-- **Non-publication-day fallback:** when MNB does not
-  publish a rate for the supply-fulfillment date
-  (weekends, Hungarian public holidays), the most-recent
-  prior publication date's rate is used. The
+- **Primary rule (Áfa tv. §80(2), confirmed 2026-05-23):**
+  the applied exchange rate is the MNB official mid-rate
+  published for the **supply-fulfillment date**
+  (`teljesítés napja`). When no rate is published that
+  day (weekend, Hungarian public holiday), the rate of
+  D-1 is used; if D-1 also has no published rate (long
+  weekend, multi-day holiday window), the walk-back
+  continues to the most-recent prior publication date.
+- **Non-publication-day fallback:** as above — D-1 is the
+  primary fallback per §80(2); the walk-back extends as
+  needed for multi-day non-publication windows. The
   `Exchange-rate date` printed per §1.a is the
   publication date that was actually consulted, NOT
   the supply-fulfillment date.
@@ -507,12 +559,15 @@ and propagates via the test).
 | C8 | The `Currency` enum is closed; the command boundary refuses any currency not in the closed vocab (§3 refusal posture). | PR-44α | Unit test — issuance command with `currency = "CHF"` (string-typed on the API boundary) → loud-fail `UnsupportedCurrency` error. |
 | C9 | The exchange rate's source identifier on the printed invoice is the literal string `MNB`. | PR-44ε | SPA / print-render test asserting the rendered source name is exactly `MNB` (or the operator-visible expansion `Magyar Nemzeti Bank`). |
 | C10 | No retroactive rewrite of HUF-only invoices into the new `Currency::Huf` shape changes the audit-ledger byte contents. The migration is a domain-type rename only; the wire bytes for existing HUF invoices are byte-identical pre/post PR-44α. | PR-44α | Differential test — replay a representative sample of pre-PR-44α HUF invoices through the post-PR-44α builder; assert the produced XML bytes are byte-identical to the on-disk audit-ledger bytes. |
+| C11 | The NAV-submitted `exchangeRate` carries six decimal places per the `Online Számla` XSD; per-VAT-rate HUF amounts are rounded with round-half-even (banker's rounding) per Áfa convention. | PR-44β (rate-value serialization) + PR-44δ (HUF rounding application) | Property-style test — pin `exchangeRate` serialization at 6-decimal precision (`405.230000`, NOT `405.23`); unit tests pinning the half-even tie-break case for HUF amounts (`123.5 HUF → 124`, `124.5 HUF → 124`); both tests assert against the confirmed §80(2) + Áfa convention combination. |
 
 These invariants compose. C1+C2+C3 pin the rate-fetch
 slice; C4+C5 pin the wire-body slice; C6 pins the
 chain-currency slice; C7+C9 pin the print-render
 slice; C8 pins the closed-vocab refusal slice; C10
-pins the migration safety slice.
+pins the migration safety slice; **C11 pins the
+rate-precision + HUF-rounding-mode slice (added at
+the 2026-05-23 legal cleanup)**.
 
 ### 5. Out-of-scope for PR-43 (deferred-items list with named PR-44+ candidates)
 
@@ -538,7 +593,7 @@ include (CLAUDE.md rule 2):
 |---|---|
 | `ExchangeRateFetched` audit event (per (currency, date) cache observability) | First operator survey reporting that rate-fetch latency / cache-behaviour is not diagnosable from the wire bytes alone. The default per §2.c is NO new event. |
 | MNB JSON endpoint as fallback / replacement for the SOAP endpoint | First operational case where the SOAP service is unreliable AND the JSON service is verified stable. |
-| Banker's-rounding alternative to half-up HUF conversion | Legal review surfacing banker's rounding as permitted; PR-43's pin per §1.c is half-up. |
+| ~~Banker's-rounding alternative to half-up HUF conversion~~ | **RESOLVED 2026-05-23 (session 50): round-half-even per Áfa convention is the active rule per §1.c; half-up was the pre-cleanup posture and is superseded.** No deferred row remains. |
 | Cross-currency chain children (storno of HUF base in EUR or vice versa) | Operator request OR regulatory-practice change. PR-43 refuses per C6. |
 | Third (and Nth) currency variant on the `Currency` enum (`Chf`, `Usd`, etc.) | Operator signs a customer needing that currency per ADR-0009 §1's posture inherited here. |
 | Print-rendering path for the EUR invoice (the §1.a fields on the printed sheet) | The existing ADR-0021 "Print rendering path" deferred row — same trigger ("first PR that produces a printed invoice"). |
@@ -695,20 +750,23 @@ itself touches only `adr/` and `_handoffs/`.
 
 1. **"You marked legal citations `[NEEDS-LEGAL-CHECK]`
    without resolving them. A regulatorily incorrect
-   invoice is a fine."** Accepted, with mitigation.
-   The §1 + §2 placeholders are precisely the spots
-   where the author's confidence in the exact
-   subsection number is below the bar for citing it as
-   authoritative; resolving them requires legal
-   review, which is named in §Open as a hard
-   precondition for accepting any of PR-44γ / PR-44δ /
-   PR-44ε. The compliance invariants in §4 are
-   independent of the precise citation — they pin the
-   behaviour even if the §-numbers resolve to slightly
-   different sections. Mitigation: the gate for moving
-   any of the `[NEEDS-LEGAL-CHECK]` lines from
-   "needs check" to "resolved" is an explicit ADR
-   amendment, NOT a comment in a code PR.
+   invoice is a fine."** PARTIALLY RESOLVED at the
+   2026-05-23 legal cleanup (session 50): §80(1)(g)
+   + §80(2) + the NAV XSD field-path family + the
+   rate precision (6 decimals) + the HUF rounding
+   mode (round-half-even per Áfa convention) are now
+   confirmed citations. The §169 invoice-content list
+   subsection and the §172 storno-currency
+   subsection remain `[NEEDS-LEGAL-CHECK]` because
+   Ervin's source walk did not surface a subsection
+   precise enough to cite. The C1-C11 compliance
+   invariants are independent of the §169 + §172
+   residues — they pin the behaviour even if those
+   §-numbers resolve to slightly different sections.
+   Mitigation unchanged: moving any remaining
+   `[NEEDS-LEGAL-CHECK]` line from "needs check" to
+   "resolved" requires an explicit ADR amendment,
+   NOT a comment in a code PR.
 2. **"You picked MNB SOAP without verifying it's
    actually online and stable in 2026. MNB might have
    deprecated it."** Accepted. PR-44β implementation
@@ -721,13 +779,17 @@ itself touches only `adr/` and `_handoffs/`.
    publish the same MNB-authoritative rates.
 3. **"The half-up rounding rule in §1.c is wrong;
    Hungarian regulation actually requires banker's
-   rounding."** Possible. §1.c names half-up as the
-   pin AND §5's deferred-items table names "Banker's
-   rounding alternative" with the trigger "legal
-   review surfacing banker's rounding as permitted."
-   PR-44α's HUF-conversion test pins half-up;
-   switching to banker's rounding is a one-line
-   change + a test re-pin + an ADR amendment.
+   rounding."** Confirmed at the 2026-05-23 legal
+   cleanup. §1.c now pins round-half-even (banker's
+   rounding) per Áfa convention; the pre-cleanup
+   half-up posture was wrong. §5's "Banker's-rounding
+   alternative" deferred row is removed (it is now
+   the active rule, not the alternative). PR-44α's
+   HUF-conversion test MUST pin round-half-even
+   (the half-up pin the pre-cleanup ADR named is now
+   superseded; if PR-44α had already landed with
+   half-up, it would be a test re-pin + a one-line
+   rounding-mode change at the conversion call site).
 4. **"C10 (byte-identical HUF audit ledger pre/post
    PR-44α) is impossible if the type rename produces
    different serialization output."** Defensible.
@@ -904,16 +966,26 @@ itself touches only `adr/` and `_handoffs/`.
    already carry the applied rate); §5's deferred
    row names the trigger for revisiting.
 4. **Legal review of `[NEEDS-LEGAL-CHECK]` placeholders.**
-   Specifically: Áfa tv. §80(2) for the rate-date
-   alignment rule; §169(?) for the printed-invoice
-   field list; §172(?) for any storno-currency
-   constraint; the rounding-mode citation for §1.c.
-   The PR-44+ code PRs can be implemented against
-   the C1-C10 invariants without resolving these,
-   BUT no code PR can be marked "Accepted" until
-   the legal-review pass either resolves the
-   placeholder or adds a footnote naming the
-   surviving uncertainty.
+   PARTIALLY CLOSED at the 2026-05-23 cleanup
+   (session 50). **Resolved:** Áfa tv. §80(2) for the
+   rate-date alignment rule (MNB official mid-rate of
+   the fulfillment date, or D-1 if no rate); Áfa tv.
+   §80(1)(g) for the HUF-equivalent printed-invoice
+   requirement; NAV XSD field paths for
+   `currencyCode` + `exchangeRate` +
+   `invoiceVatAmountHUF`; rate precision (6 decimals);
+   HUF rounding mode (round-half-even per Áfa
+   convention) — superseded the pre-cleanup half-up
+   pin. **Still open:** the precise §169 subsection
+   that enumerates each printed-invoice field
+   individually (rate source name; per-VAT-rate net
+   HUF amount); the §172 subsection (if any) carrying
+   a storno-currency constraint. The PR-44+ code PRs
+   can be implemented against the C1-C11 invariants
+   without resolving these residues; no code PR can
+   be marked "Accepted" until the §169 + §172
+   residues either resolve or get a footnote naming
+   the surviving uncertainty.
 5. **NAV XSD per-patch-level `vatRateNetAmountHUF` /
    `vatRateVatAmountHUF` cardinality.** §1.b lists
    them as MUST-populate when `currencyCode != HUF`;

@@ -147,6 +147,8 @@ fn submit_annulment_against_api_test_end_to_end() {
         db: db_path.clone(),
         tenant: tenant_id_str.clone(),
         series: "INV-ANNUL-LIVE-TEST".to_string(),
+
+        currency: aberp::cli::CurrencyArg::Huf,
     };
     issue_invoice::run(&issue_args).expect("issue-invoice must succeed");
 

@@ -224,6 +224,11 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
         series_id: series.id,
         draft,
         idempotency_key,
+        // PR-44γ — STORNO chain stays HUF-only at this PR per the
+        // session-51 brief's "DO NOT touch storno chain" guidance.
+        // C6 (chain-currency match) is owner-deferred to a follow-up.
+        currency: aberp_billing::Currency::Huf,
+        rate_metadata: None,
     };
 
     // 8. One transaction across base-load + chain-index walk + storno

@@ -46,16 +46,19 @@
 //! same business event.
 
 use std::path::Path;
+use std::str::FromStr;
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_billing::{
-    self as billing, AllocateArgs, AllocateOutcome, BillingStore, CustomerId, DraftInvoice,
-    DuckDbBillingStore, Huf, IdempotencyKey, InvoiceId, InvoiceSeries, IssueInvoiceCommand,
-    LineItem, ResetPolicy, SeriesCode, SeriesId,
+    self as billing, huf_equivalent_round_half_even, AllocateArgs, AllocateOutcome, BillingStore,
+    Currency, CustomerId, DraftInvoice, DuckDbBillingStore, Huf, IdempotencyKey, InvoiceId,
+    InvoiceSeries, IssueInvoiceCommand, LineItem, RateMetadata, ResetPolicy, SeriesCode, SeriesId,
 };
+use aberp_mnb_rates::{MnbError, MnbRate, SOURCE as MNB_SOURCE};
 use aberp_nav_transport::NavCredentials;
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use time::OffsetDateTime;
 use ulid::Ulid;
@@ -63,8 +66,48 @@ use ulid::Ulid;
 use crate::audit_payloads;
 use crate::binary_hash;
 use crate::cli::IssueInvoiceArgs;
+use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
 use crate::nav_xml::{self, CustomerInfo, NavParties, SupplierInfo};
 use crate::submission_queue;
+
+/// Maximum number of days to walk back per ADR-0037 §2.b when MNB has no
+/// rate for the supply-fulfillment date. A139 — the cap is **7
+/// calendar days** (one week), chosen because:
+///
+/// 1. **Hungarian non-publication windows are short.** Standard weekend
+///    (Sat + Sun) + a Monday public holiday gives 3 consecutive
+///    non-publication days; the longest Hungarian holiday window
+///    historically is the Christmas → New Year stretch (≤ 5 days in
+///    practice). A 7-day cap absorbs that with margin.
+///
+/// 2. **Operator-clock-skew loud-fail.** A larger cap would silently
+///    accept a fulfillment-date pushed back into a pre-MNB-publication
+///    epoch (operator clock skew, or a typo in the supply date). 7 days
+///    is the largest window where "this is a real holiday stretch"
+///    remains the more-likely explanation than "the date is wrong";
+///    beyond that, loud-fail is the CLAUDE.md rule 12 posture.
+///
+/// 3. **Calendar-week is operator-intuitive.** The cap surfaces in the
+///    typed loud-fail error as "no MNB rate found in the 7 days
+///    preceding {date}"; one calendar week is a unit operators
+///    reconcile against without needing to count business days.
+///
+/// A larger cap is a deferred candidate per ADR-0037 §5; the trigger
+/// would be a real operational case where a legitimate fulfillment date
+/// falls into a > 7-day non-publication window AND the operator
+/// confirms the rate is still regulatorily applicable.
+pub const MNB_WALKBACK_DAYS_CAP: i64 = 7;
+
+/// PR-44γ — sentinel substring on the walk-back-exhausted loud-fail
+/// message; pinned by the offline integration test so a future
+/// refactor that drops the C2 + ADR-0037 §2.b loud-fail surface
+/// would break the test, not silently regress. Per CLAUDE.md rule 12.
+pub const ERR_NO_RATE_AFTER_WALKBACK: &str = "no MNB rate published";
+
+/// PR-44γ — sentinel substring on the transport / parse / other-MNB-
+/// error loud-fail message (every non-`NoRateForCurrency` variant
+/// propagates as-is per ADR-0037 §4 invariant C2; no silent fallback).
+pub const ERR_MNB_FETCH_FAILED: &str = "MNB rate-fetch failed";
 
 // ──────────────────────────────────────────────────────────────────────
 // Input JSON shape (NAV-aligned per Ervin's preference, session 5)
@@ -117,6 +160,50 @@ pub struct LineJson {
 // ──────────────────────────────────────────────────────────────────────
 
 pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
+    // PR-44γ — construct the production MNB-rates provider only when
+    // the EUR (non-HUF) path actually needs one. The HUF path stays
+    // network-free (no reqwest::Client built, no tokio runtime
+    // spawned); a hypothetical `reqwest::Client::builder().build()`
+    // failure does NOT loud-fail a HUF issuance.
+    match args.currency.to_billing_currency() {
+        Currency::Huf => run_with_provider(args, &NeverProvider),
+        _ => {
+            let provider = LiveMnbRatesProvider::new()
+                .context("build MNB rates provider for non-HUF issuance")?;
+            run_with_provider(args, &provider)
+        }
+    }
+}
+
+/// PR-44γ — stand-in [`MnbRatesProvider`] for the HUF code path.
+/// Never expected to be invoked (the HUF branch of
+/// `run_with_provider` does not consult the provider); any call here
+/// is a bug, so the impl panics with a named message rather than
+/// silently returning a placeholder rate. Pinned by the
+/// `huf_default_path_unchanged_no_rate_metadata`-style tests via the
+/// call-count assertions on the fake provider.
+struct NeverProvider;
+
+impl MnbRatesProvider for NeverProvider {
+    fn fetch_official_rate(
+        &self,
+        _currency: Currency,
+        _date: time::Date,
+    ) -> Result<MnbRate, MnbError> {
+        unreachable!(
+            "NeverProvider must not be consulted — the HUF issuance path is rate-free per ADR-0037 §1"
+        )
+    }
+}
+
+/// PR-44γ — `run`'s body, parameterised on the
+/// [`MnbRatesProvider`]. Production calls reach here via `run()` with
+/// the real `LiveMnbRatesProvider`; tests inject a fake provider to
+/// exercise the EUR path offline.
+pub fn run_with_provider<P: MnbRatesProvider>(
+    args: &IssueInvoiceArgs,
+    provider: &P,
+) -> Result<()> {
     let _span = tracing::info_span!("issue_invoice").entered();
 
     // 1. Read + parse the JSON input.
@@ -211,13 +298,33 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
         id: InvoiceId::new(),
         series_id: series.id,
         customer_id: command.customer_id,
-        lines: command.lines,
+        lines: command.lines.clone(),
         issue_date,
     };
+    let currency = args.currency.to_billing_currency();
+
+    // PR-44γ — for non-HUF currencies, fetch the MNB rate (with D-1
+    // walk-back per ADR-0037 §2.b up to A139's 7-day cap) and compute
+    // the round-half-even HUF-equivalent total per §1.c + C11. The
+    // rate fetch happens BEFORE the tx opens so a fetch failure
+    // leaves the tenant DB unchanged (no half-issued state).
+    let rate_metadata: Option<RateMetadata> = if matches!(currency, Currency::Huf) {
+        None
+    } else {
+        Some(fetch_and_stamp_rate(
+            provider,
+            currency,
+            issue_date.date(),
+            &command.lines,
+        )?)
+    };
+
     let allocate_args = AllocateArgs {
         series_id: series.id,
         draft,
         idempotency_key,
+        currency,
+        rate_metadata: rate_metadata.clone(),
     };
 
     // 8. One transaction across the billing writes and audit appends.
@@ -236,6 +343,8 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
         idempotency_key,
         actor,
         args.out.clone(),
+        currency,
+        rate_metadata.clone(),
     )?;
 
     let invoice = outcome.invoice;
@@ -268,6 +377,15 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
         .context("sync audit-ledger mirror file after commit")?;
 
     // 10. Serialize the ReadyInvoice to NAV XML.
+    //
+    // PR-44δ — currency + rate_metadata thread into `render_invoice_data`
+    // so EUR invoices serialize `<currencyCode>EUR`, `<exchangeRate>` at
+    // 6 decimals, and per-VAT-rate `*HUF` amounts computed from the
+    // stamped MNB rate (NOT re-fetched — read from the in-memory
+    // `RateMetadata` we just stamped onto the DuckDB row + audit payload
+    // earlier in this same call). HUF invoices serialize the same
+    // byte-near-identical shape as pre-PR-44δ with `<exchangeRate>1.000000`
+    // (uniformly 6-decimal per C11 — the prior `1` form is superseded).
     let parties = NavParties {
         supplier: SupplierInfo {
             tax_number: input.supplier.tax_number,
@@ -282,8 +400,14 @@ pub fn run(args: &IssueInvoiceArgs) -> Result<()> {
             name: input.customer.name,
         },
     };
-    let xml =
-        nav_xml::render_invoice_data(&invoice, &series_code, &parties).context("render NAV XML")?;
+    let xml = nav_xml::render_invoice_data(
+        &invoice,
+        &series_code,
+        &parties,
+        currency,
+        rate_metadata.as_ref(),
+    )
+    .context("render NAV XML")?;
     // PR-9-0 / ADR-0022: runtime <InvoiceData> v3.0 invariant check
     // between render and disk write. On failure the typed
     // `NavXsdValidationError` flows up as `anyhow::Error` — loud-fail
@@ -381,6 +505,8 @@ fn run_single_tx(
     idempotency_key: IdempotencyKey,
     actor: Actor,
     nav_xml_path: std::path::PathBuf,
+    currency: Currency,
+    rate_metadata: Option<RateMetadata>,
 ) -> Result<TxOutcome> {
     let tx = conn
         .transaction()
@@ -431,11 +557,27 @@ fn run_single_tx(
         // PR-18 / ADR-0031 §2 — record the operator's --out path on
         // the audit payload so the drain worker can submit without
         // a per-invocation path argument.
-        let draft_payload = audit_payloads::InvoiceDraftCreatedPayload::from_invoice_with_xml_path(
-            &invoice,
-            idempotency_key,
-            nav_xml_path,
-        );
+        //
+        // PR-44γ / ADR-0037 — for non-HUF invoices the currency +
+        // rate metadata are stamped onto the same payload (existing
+        // EventKind reused per the brief's task #4; no F12 ritual).
+        // For HUF the existing path is preserved (currency stamped
+        // explicitly as "HUF"; rate fields all `None`).
+        let draft_payload = if let Some(rate) = rate_metadata.as_ref() {
+            audit_payloads::InvoiceDraftCreatedPayload::from_invoice_with_rate(
+                &invoice,
+                idempotency_key,
+                Some(nav_xml_path),
+                currency,
+                rate,
+            )
+        } else {
+            audit_payloads::InvoiceDraftCreatedPayload::from_invoice_with_xml_path(
+                &invoice,
+                idempotency_key,
+                nav_xml_path,
+            )
+        };
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
@@ -479,4 +621,138 @@ fn build_command(input: &InvoiceInputJson, code: &SeriesCode) -> Result<IssueInv
 
 fn percent_to_basis_points(percent: u16) -> u16 {
     percent.saturating_mul(100)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// PR-44γ — MNB rate fetch + walk-back + round-half-even HUF conversion
+// ──────────────────────────────────────────────────────────────────────
+
+/// Fetch the MNB official mid-rate for `currency` on `supply_date`,
+/// walking back per ADR-0037 §2.b up to [`MNB_WALKBACK_DAYS_CAP`]
+/// days when MNB returns `NoRateForCurrency` (non-publication day —
+/// weekend or holiday). Compute the round-half-even HUF-equivalent
+/// of the invoice's gross total per ADR-0037 §1.c + §4 C11 / A137.
+///
+/// # Returns
+///
+/// `Ok(RateMetadata)` carrying the parsed rate, the literal source
+/// identifier (`MNB_SOURCE` const = `"MNB"` per ADR-0037 §1.a), the
+/// publication date MNB actually answered with (which may be < supply
+/// date per the walk-back), and the rounded HUF total.
+///
+/// # Errors
+///
+/// - [`IssueRateError::NoRateAfterWalkback`] — walked back the full
+///   cap without finding a publication; per ADR-0037 §4 invariant
+///   C2 the loud-fail is mandatory, no silent fallback.
+/// - [`IssueRateError::Mnb`] — any other [`MnbError`] (transport,
+///   HTTP status, envelope parse, unsupported currency, etc.) —
+///   loud-fail per C2.
+/// - [`IssueRateError::MalformedDecimal`] — MNB's rate value did
+///   not parse as a `rust_decimal::Decimal`. The mnb-rates crate
+///   stores the value as a verbatim dot-decimal string (per A135);
+///   parse failure here is a regression in MNB's response shape OR
+///   in our normalizer.
+/// - [`IssueRateError::HufOverflow`] — extreme operand combination
+///   (loud-fail per CLAUDE.md rule 12 + §1.c arithmetic).
+pub fn fetch_and_stamp_rate<P: MnbRatesProvider>(
+    provider: &P,
+    currency: Currency,
+    supply_date: time::Date,
+    lines: &[LineItem],
+) -> Result<RateMetadata> {
+    let currency_iso = currency.iso_code().to_string();
+    let supply_date_str = supply_date.to_string();
+
+    // ── ADR-0037 §2.b walk-back. Up to MNB_WALKBACK_DAYS_CAP days back
+    //    inclusive of the supply date (offset 0). The first MNB
+    //    response with a rate wins; the publication date that MNB
+    //    answered with may differ from `candidate` if MNB internally
+    //    answered with its own walk-back (the mnb-rates crate
+    //    returns whatever date MNB names in the response).
+    for offset in 0..=MNB_WALKBACK_DAYS_CAP {
+        let candidate = supply_date - time::Duration::days(offset);
+        tracing::debug!(
+            target: "issue_invoice",
+            currency = %currency_iso,
+            candidate = %candidate,
+            offset,
+            "MNB walk-back fetch attempt"
+        );
+        match provider.fetch_official_rate(currency, candidate) {
+            Ok(rate) => {
+                return finalize_rate(&rate, lines);
+            }
+            Err(MnbError::NoRateForCurrency { .. }) => {
+                continue;
+            }
+            Err(other) => {
+                return Err(anyhow!(
+                    "{} for {} on {}: {}",
+                    ERR_MNB_FETCH_FAILED,
+                    currency_iso,
+                    candidate,
+                    other
+                ));
+            }
+        }
+    }
+    Err(anyhow!(
+        "{} for {} in the {} days preceding (and including) {}; \
+         the supply-fulfillment date may be in a multi-day non-publication window \
+         OR before MNB began publishing this currency (ADR-0037 §2.b walk-back exhausted)",
+        ERR_NO_RATE_AFTER_WALKBACK,
+        currency_iso,
+        MNB_WALKBACK_DAYS_CAP,
+        supply_date_str
+    ))
+}
+
+/// Parse the MNB rate value into a `Decimal`, sum the invoice's
+/// gross total in EUR cents, compute the round-half-even HUF
+/// equivalent, and assemble the [`RateMetadata`] stamp. Pulled out
+/// of [`fetch_and_stamp_rate`] so the offset-loop body stays narrow
+/// — the post-fetch arithmetic is uniform across happy + walked-back
+/// branches.
+fn finalize_rate(rate: &MnbRate, lines: &[LineItem]) -> Result<RateMetadata> {
+    let rate_decimal = Decimal::from_str(&rate.value).map_err(|_| {
+        anyhow!(
+            "MNB rate value `{}` is not a parseable decimal (expected rust_decimal-compatible canonical form)",
+            rate.value
+        )
+    })?;
+
+    // Invoice gross total. The line `unit_price` is typed `Huf` today
+    // (PR-44α preserved the field; PR-44γ does NOT lift it per the
+    // session-51 brief's "Surgical posture"). For an EUR invoice the
+    // operator-supplied `unitPrice` JSON values are interpreted as
+    // EUR cents, stored in the `Huf` wrapper as an i64; the
+    // round-half-even conversion below treats them as cents
+    // explicitly. PR-44δ will lift this to a typed-EUR LineItem.
+    let gross_total_minor_units: i64 =
+        lines.iter().try_fold(0i64, |acc, line| -> Result<i64> {
+            let line_gross = line
+                .gross_total()
+                .ok_or_else(|| anyhow!("line gross total overflowed i64"))?;
+            acc.checked_add(line_gross.as_i64())
+                .ok_or_else(|| anyhow!("invoice gross total overflowed i64"))
+        })?;
+
+    let huf_equivalent_total =
+        huf_equivalent_round_half_even(gross_total_minor_units, &rate_decimal).ok_or_else(
+            || {
+                anyhow!(
+                    "EUR amount {} cents × rate {} overflows i64 HUF equivalent (ADR-0037 §1.c)",
+                    gross_total_minor_units,
+                    rate.value
+                )
+            },
+        )?;
+
+    Ok(RateMetadata {
+        rate: rate_decimal,
+        source: MNB_SOURCE.to_string(),
+        date: rate.date,
+        huf_equivalent_total,
+    })
 }

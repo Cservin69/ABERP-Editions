@@ -611,6 +611,47 @@ pub struct IssueInvoiceArgs {
     /// already exist (with reset_policy = Never).
     #[arg(long, default_value = "INV-default")]
     pub series: String,
+
+    /// PR-44γ / ADR-0037 §3. Invoice currency. Default `Huf` preserves
+    /// pre-PR-44γ behaviour byte-identically (the C10 invariant
+    /// prerequisite); `Eur` lights up the MNB-rate-fetch + HUF-equivalent
+    /// stamp path. The closed vocab is enforced by clap's `ValueEnum`
+    /// derive (per ADR-0037 §4 invariant C8 — invalid values are
+    /// rejected at parse time, before any DB write).
+    #[arg(long, value_enum, default_value_t = CurrencyArg::Huf)]
+    pub currency: CurrencyArg,
+}
+
+/// CLI mirror of `aberp_billing::Currency`. The two enums are pinned
+/// closed-vocab-to-closed-vocab; a regression that drops a variant on
+/// one side surfaces as a missing match arm via the
+/// `CurrencyArg::to_billing_currency` conversion. Per ADR-0037 §3 +
+/// CLAUDE.md rule 11 (match codebase conventions: the
+/// `aberp_billing::Currency` enum is the domain-side canon; the CLI's
+/// clap-`ValueEnum` shape is the operator-facing canon).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CurrencyArg {
+    /// HUF (Hungarian forint) — the pre-PR-44γ default. No MNB-rate
+    /// fetch; no rate-metadata stamp.
+    Huf,
+    /// EUR (Euro) — the PR-44γ EUR path. Triggers an MNB-rate fetch
+    /// (with D-1 walk-back per ADR-0037 §2.b), HUF-equivalent
+    /// computation (round-half-even per A137 / C11), and the rate-
+    /// metadata stamp on the DuckDB row + audit-ledger entry.
+    Eur,
+}
+
+impl CurrencyArg {
+    /// Convert to the domain-side typed `Currency`. Closed-vocab pair
+    /// per ADR-0037 §3; the `match` is exhaustive at the type level so
+    /// adding a CLI variant without adding a domain variant (or vice
+    /// versa) is a compile error.
+    pub fn to_billing_currency(self) -> aberp_billing::Currency {
+        match self {
+            CurrencyArg::Huf => aberp_billing::Currency::Huf,
+            CurrencyArg::Eur => aberp_billing::Currency::Eur,
+        }
+    }
 }
 
 /// Which NAV environment a submission targets. Explicit value rather

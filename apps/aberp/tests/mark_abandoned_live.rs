@@ -111,6 +111,8 @@ fn mark_abandoned_against_stuck_invoice_end_to_end() {
         db: db_path.clone(),
         tenant: tenant_id_str.clone(),
         series: "INV-LIVE-ABANDON".to_string(),
+
+        currency: aberp::cli::CurrencyArg::Huf,
     };
     issue_invoice::run(&issue_args).expect("issue-invoice must succeed");
 

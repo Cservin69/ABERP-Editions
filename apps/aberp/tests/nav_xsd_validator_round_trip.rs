@@ -17,7 +17,9 @@
 use std::time::Duration;
 
 use aberp::nav_xml::{self, CustomerInfo, NavParties, SupplierInfo};
-use aberp_billing::{CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId};
+use aberp_billing::{
+    Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
+};
 use aberp_nav_xsd_validator::{validate_invoice_data, NAV_XSD_VERSION};
 use time::OffsetDateTime;
 
@@ -80,7 +82,7 @@ fn emitter_minimal_invoice_passes_validator() {
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = minimal_parties();
 
-    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties)
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
         .expect("emitter must succeed on the minimal fixture");
 
     match validate_invoice_data(&xml) {
@@ -103,7 +105,8 @@ fn malformed_xml_loud_fails_validator() {
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = minimal_parties();
 
-    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties).unwrap();
+    let xml =
+        nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None).unwrap();
     // Strip the invoiceNumber element entirely. The validator must
     // surface `MissingRequiredChild` (or a wrapping malformed-XML
     // error if the strip happened to leave a tag pair unbalanced).
@@ -127,7 +130,8 @@ fn validator_is_fast_on_minimal_payload() {
     let invoice = build_minimal_invoice();
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = minimal_parties();
-    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties).unwrap();
+    let xml =
+        nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None).unwrap();
 
     let start = std::time::Instant::now();
     for _ in 0..200 {

@@ -211,11 +211,24 @@ where
     };
 
     // 4. Delegate to the storage adapter for the atomic allocate.
+    //
+    //    PR-44γ — this handler is the in-process aberp-billing
+    //    surface (used by unit tests + the in-memory store). It
+    //    defaults `currency: Huf` / `rate_metadata: None` because
+    //    the CLI binary is the surface that fetches the MNB rate
+    //    and constructs the EUR `AllocateArgs` (per ADR-0037 §2
+    //    — the rate fetch is an orchestration concern, not a
+    //    domain-handler concern). When a future PR moves the
+    //    EUR-aware command-build into the handler, this default
+    //    becomes the closed-vocab default and the handler takes
+    //    a typed `Currency` parameter.
     let outcome = store.allocate_and_insert(
         AllocateArgs {
             series_id: series.id,
             draft,
             idempotency_key: cmd.idempotency_key,
+            currency: crate::domain::money::Currency::Huf,
+            rate_metadata: None,
         },
         issue_date,
     )?;

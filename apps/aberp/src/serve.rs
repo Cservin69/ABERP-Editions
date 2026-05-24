@@ -1387,6 +1387,14 @@ mod tests {
             line_count: 1,
             idempotency_key: idem.to_canonical_string(),
             nav_xml_path: None,
+            // PR-44γ — test fixture for the HUF path; the five
+            // rate-metadata fields are `None` per the C10
+            // byte-identical invariant prerequisite.
+            currency: None,
+            exchange_rate: None,
+            exchange_rate_source: None,
+            exchange_rate_date: None,
+            huf_equivalent_total: None,
         };
         ledger
             .append(

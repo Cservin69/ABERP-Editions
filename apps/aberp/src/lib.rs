@@ -31,6 +31,7 @@ pub mod issue_invoice;
 pub mod issue_modification;
 pub mod issue_storno;
 pub mod mark_abandoned;
+pub mod mnb_rates_provider;
 pub mod nav_xml;
 pub mod observe_receiver_confirmation;
 pub mod poll_ack;

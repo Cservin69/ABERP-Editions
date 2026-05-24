@@ -17,12 +17,28 @@ use time::OffsetDateTime;
 use crate::app::error::BillingError;
 use crate::domain::ids::{InvoiceId, SeriesId};
 use crate::domain::invoice::ReadyInvoice;
+use crate::domain::money::{Currency, RateMetadata};
 use crate::domain::reservation::SequenceReservation;
 use crate::domain::series::{InvoiceSeries, SeriesCode};
 
 /// Arguments to the atomic `allocate_and_insert` operation. Grouped here
 /// so the trait signature stays readable and so adapters do not develop
 /// drifting parameter orders.
+///
+/// # Currency + rate metadata fields (PR-44γ / ADR-0037)
+///
+/// `currency` carries the typed `Currency` per ADR-0037 §3's closed
+/// vocab + the §4 invariant C8 refusal posture. Pre-PR-44γ call sites
+/// continue to pass `Currency::Huf` (the existing HUF-only default
+/// preserved by the back-compat constructors on the binary side).
+///
+/// `rate_metadata` is `Some(_)` iff `currency` is a non-HUF variant —
+/// the C10 byte-identical invariant for HUF rows holds at PR-44γ
+/// because HUF rows persist `currency = "HUF"` + `rate_metadata = None`
+/// + the four exchange-rate columns NULL. EUR rows persist the MNB
+/// rate, the rate-publication date (which may be D-1 per ADR-0037
+/// §2.b's walk-back), the literal source identifier `"MNB"`, and the
+/// round-half-even HUF-equivalent total (C11 per A137).
 #[derive(Debug, Clone)]
 pub struct AllocateArgs {
     pub series_id: SeriesId,
@@ -31,6 +47,19 @@ pub struct AllocateArgs {
     /// If a reservation already exists with this key, the allocator
     /// returns the prior outcome without burning a new number.
     pub idempotency_key: crate::app::issue_invoice::IdempotencyKey,
+    /// Invoice currency per ADR-0037 §3. `Currency::Huf` for HUF
+    /// invoices (the pre-PR-44γ shape); `Currency::Eur` lights up the
+    /// EUR path at PR-44γ. Persisted to the DuckDB `invoice.currency`
+    /// column (TEXT, NOT NULL, default `'HUF'` for the migration
+    /// backfill of pre-PR-44γ rows).
+    pub currency: Currency,
+    /// MNB-rate metadata. `Some(_)` iff `currency` is non-HUF; persisted
+    /// to the four nullable DuckDB columns (`exchange_rate`,
+    /// `exchange_rate_source`, `exchange_rate_date`,
+    /// `huf_equivalent_total`). The CLI boundary surfaces a typed
+    /// loud-fail error if `currency == Eur` and this field is `None`
+    /// (per ADR-0037 §4 invariant C1).
+    pub rate_metadata: Option<RateMetadata>,
 }
 
 /// Outcome of an `allocate_and_insert` call. The fresh and replay

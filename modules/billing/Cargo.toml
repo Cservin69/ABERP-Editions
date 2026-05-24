@@ -12,6 +12,10 @@ publish.workspace = true
 # Per ADR-0021 Part A item 2: library crates use thiserror, not anyhow.
 [dependencies]
 duckdb = { workspace = true }
+# PR-44γ — first arithmetic consumer of `rust_decimal` per A135's
+# "deferred-to-arithmetic-consumer" trigger. Round-half-even HUF
+# conversion per ADR-0037 §1.c + C11 lives in `domain::money`.
+rust_decimal = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }

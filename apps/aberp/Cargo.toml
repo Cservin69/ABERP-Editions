@@ -33,6 +33,17 @@ aberp-nav-transport = { path = "../../crates/nav-transport" }
 # PR-9-0: runtime <InvoiceData> v3.0 invariant check per ADR-0022. Three
 # call sites — issue_invoice::run, submit_invoice::run, retry_submission::run.
 aberp-nav-xsd-validator = { path = "../../crates/nav-xsd-validator" }
+# PR-44γ — MNB exchange-rate fetcher per ADR-0037 §2 (consumed via the
+# `mnb_rates_provider` trait abstraction). The binary owns the
+# production wiring (`LiveMnbRatesProvider`); the issuance path
+# itself works against the trait so offline integration tests can
+# inject a fake provider.
+aberp-mnb-rates = { path = "../../crates/mnb-rates" }
+# PR-44γ — decimal arithmetic for the EUR→HUF round-half-even
+# conversion at the CLI boundary (the `aberp-billing` module is the
+# arithmetic owner; the binary needs the type for the
+# `aberp_billing::RateMetadata.rate` field at the call site).
+rust_decimal = { workspace = true }
 
 # Binary boundary: anyhow per ADR-0021 Part A item 2.
 anyhow = { workspace = true }

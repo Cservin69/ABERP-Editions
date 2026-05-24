@@ -200,6 +200,12 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         series_id: series.id,
         draft,
         idempotency_key,
+        // PR-44γ — MODIFY chain stays HUF-only at this PR per the
+        // session-51 brief's "DO NOT touch storno chain" guidance
+        // (the MODIFY chain rides the same posture as STORNO). C6
+        // owner-deferred to a follow-up.
+        currency: aberp_billing::Currency::Huf,
+        rate_metadata: None,
     };
 
     // PR-18 / ADR-0031 §2: thread --out so the InvoiceDraftCreated

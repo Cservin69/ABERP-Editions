@@ -24,13 +24,14 @@
 
 use duckdb::{params, Connection};
 use time::format_description::well_known::Rfc3339;
+use time::macros::format_description;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
 use crate::app::error::BillingError;
 use crate::domain::ids::{CustomerId, InvoiceId, ReservationId, SeriesId};
 use crate::domain::invoice::{LineItem, ReadyInvoice};
-use crate::domain::money::Huf;
+use crate::domain::money::{Currency, Huf};
 use crate::domain::reservation::{ReservationStatus, SequenceReservation};
 use crate::domain::series::{InvoiceSeries, ResetPolicy, SeriesCode};
 use crate::ports::storage::{AllocateArgs, AllocateOutcome, BillingStore};
@@ -74,6 +75,31 @@ CREATE TABLE IF NOT EXISTS invoice (
     sequence_number BIGINT  NOT NULL,
     fiscal_year     INTEGER NOT NULL,
     idempotency_key VARCHAR NOT NULL UNIQUE,
+    -- PR-44γ / ADR-0037 §3 + §1.a + §1.b additions. Fresh-DB callers
+    -- pick up the columns via this CREATE; pre-PR-44γ databases pick
+    -- them up via `MIGRATE_PR_44C_SQL` below (the idempotent
+    -- `ALTER TABLE ADD COLUMN IF NOT EXISTS` ladder).
+    --
+    -- Migration backfill posture: existing rows are HUF (the only
+    -- currency before PR-44γ); the migration ADDs the column as
+    -- nullable, then UPDATEs NULL rows to `'HUF'`. The CREATE form
+    -- mirrors that nullable shape so a fresh DB has the SAME column
+    -- definitions as a migrated DB — DuckDB v1 does not support
+    -- `ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT ...`, so the two
+    -- code paths converge on nullable + explicit-INSERT-value. NULL
+    -- in `currency` is treated as HUF at read time (the only value
+    -- pre-PR-44γ rows could possibly carry).
+    --
+    -- The four exchange-rate columns are nullable on both fresh +
+    -- migrated DBs since there IS no equivalent for a HUF invoice
+    -- (the regulatory record is the HUF amount itself). This is the
+    -- C10 byte-identical invariant prerequisite: no existing HUF row
+    -- gains a non-trivial rate stamp.
+    currency             VARCHAR,
+    exchange_rate        DECIMAL(18, 6),
+    exchange_rate_source VARCHAR,
+    exchange_rate_date   DATE,
+    huf_equivalent_total DECIMAL(18, 0),
     UNIQUE (series_id, fiscal_year, sequence_number)
 );
 
@@ -86,6 +112,47 @@ CREATE TABLE IF NOT EXISTS invoice_line (
     vat_rate_basis_points INTEGER NOT NULL,
     PRIMARY KEY (invoice_id, ordinal)
 );
+";
+
+/// Migration ladder for PR-44γ — additive columns on the pre-existing
+/// `invoice` table per ADR-0037 §3 + §1.a + §1.b.
+///
+/// # Backfill posture (per the session-51 brief task #5)
+///
+/// The five columns are added with `ADD COLUMN IF NOT EXISTS` so this
+/// SQL is safe to run against:
+///   - Fresh DBs (where `CREATE_TABLES_SQL` above already defined the
+///     columns; the `IF NOT EXISTS` makes the ALTER a no-op).
+///   - Pre-PR-44γ DBs (where the columns are missing; the ALTER adds
+///     each with its DEFAULT / nullable shape).
+///
+/// The five new columns are added without `NOT NULL` or `DEFAULT`
+/// constraints because DuckDB v1's `ALTER TABLE ADD COLUMN` rejects
+/// inline constraints ("Adding columns with constraints not yet
+/// supported" — verified empirically by the rollback conformance
+/// tests). The follow-up `UPDATE` statement backfills `currency` to
+/// `'HUF'` on pre-PR-44γ rows; the four exchange-rate columns stay
+/// NULL on those rows because HUF invoices have no equivalent —
+/// the regulatory record IS the HUF amount itself per ADR-0009 §1.
+/// This is the C10 byte-identical invariant prerequisite: no
+/// existing HUF row gains a non-trivial rate stamp.
+///
+/// EUR (and future non-HUF) rows MUST populate all four exchange-rate
+/// columns at INSERT time — `allocate_in_tx` writes them in one step
+/// per the `AllocateArgs.rate_metadata` field; a missing rate triggers
+/// the typed loud-fail at the CLI boundary per ADR-0037 §4 invariant
+/// C1 BEFORE the tx opens.
+///
+/// Read posture: a NULL `currency` is treated as HUF at read time
+/// (the only value pre-PR-44γ rows could carry). Fresh DBs INSERT the
+/// explicit `'HUF'` string; the two code paths converge structurally.
+const MIGRATE_PR_44C_SQL: &str = "
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS currency             VARCHAR;
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS exchange_rate        DECIMAL(18, 6);
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS exchange_rate_source VARCHAR;
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS exchange_rate_date   DATE;
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS huf_equivalent_total DECIMAL(18, 0);
+UPDATE invoice SET currency = 'HUF' WHERE currency IS NULL;
 ";
 
 #[derive(Debug)]
@@ -263,12 +330,57 @@ pub fn allocate_in_tx(
     )?;
 
     // ── ADR-0009 §3 step 5: insert the invoice row + line items.
+    //
+    // PR-44γ — the seven pre-PR-44γ columns are joined by the five
+    // PR-44γ additive columns per ADR-0037 §3 + §1.a + §1.b. HUF rows
+    // pass `currency = "HUF"` + four NULL rate columns (the C10
+    // byte-identical invariant prerequisite: HUF rows continue to
+    // carry NO rate metadata, mirroring their pre-PR-44γ shape).
+    // Non-HUF rows pass the full rate stamp; `allocate_in_tx`'s
+    // pre-flight refuses non-HUF rows lacking rate metadata.
     let issue_date_str = draft.issue_date.format(&Rfc3339)?;
+    let currency_iso = args.currency.iso_code();
+    // Pre-flight: ADR-0037 §4 invariant C1 — refuse non-HUF allocation
+    // when rate metadata is missing. The CLI surfaces this loud per
+    // CLAUDE.md rule 12; here it is the lowest write boundary defense.
+    if !matches!(args.currency, Currency::Huf) && args.rate_metadata.is_none() {
+        return Err(BillingError::Invalid(
+            "non-HUF invoice requires AllocateArgs.rate_metadata (ADR-0037 §4 C1)",
+        ));
+    }
+    let date_fmt = format_description!("[year]-[month]-[day]");
+    // The rate-metadata fields are written as four nullable column
+    // parameters. We bind them as `Option<String>` for the decimal
+    // columns (DuckDB casts the string at column-write per the
+    // declared `DECIMAL(...)` type) and `Option<String>` for the
+    // DATE column (DuckDB casts ISO-8601 `YYYY-MM-DD` to DATE).
+    // `rust_decimal::Decimal::to_string` emits a canonical decimal
+    // form that DuckDB accepts.
+    let rate_value_str: Option<String> = args
+        .rate_metadata
+        .as_ref()
+        .map(|r| r.rate.to_string());
+    let rate_source: Option<String> = args
+        .rate_metadata
+        .as_ref()
+        .map(|r| r.source.clone());
+    let rate_date_str: Option<String> = args
+        .rate_metadata
+        .as_ref()
+        .map(|r| r.date.format(&date_fmt))
+        .transpose()
+        .map_err(|_| BillingError::Invalid("rate_metadata.date formatting failed"))?;
+    let huf_eq_str: Option<String> = args
+        .rate_metadata
+        .as_ref()
+        .map(|r| r.huf_equivalent_total.to_string());
     tx.execute(
         "INSERT INTO invoice
          (id, series_id, customer_id, issue_date, sequence_number,
-          fiscal_year, idempotency_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?);",
+          fiscal_year, idempotency_key,
+          currency, exchange_rate, exchange_rate_source,
+          exchange_rate_date, huf_equivalent_total)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
         params![
             draft.id.to_prefixed_string(),
             &series_id_str,
@@ -277,6 +389,11 @@ pub fn allocate_in_tx(
             allocated as i64,
             fiscal_year,
             &idem_str,
+            currency_iso,
+            &rate_value_str,
+            &rate_source,
+            &rate_date_str,
+            &huf_eq_str,
         ],
     )?;
 
@@ -330,6 +447,11 @@ pub fn allocate_in_tx(
 impl BillingStore for DuckDbBillingStore {
     fn ensure_schema(&mut self) -> Result<(), BillingError> {
         self.conn.execute_batch(CREATE_TABLES_SQL)?;
+        // PR-44γ — additive migration for the five non-HUF columns on
+        // `invoice`. Idempotent via `ADD COLUMN IF NOT EXISTS`; safe on
+        // fresh + pre-PR-44γ DBs. See `MIGRATE_PR_44C_SQL`'s comment
+        // block for the backfill posture.
+        self.conn.execute_batch(MIGRATE_PR_44C_SQL)?;
         Ok(())
     }
 

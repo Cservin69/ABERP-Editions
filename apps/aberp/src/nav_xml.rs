@@ -35,10 +35,14 @@
 
 use std::io::Write;
 
-use aberp_billing::{Huf, LineItem, ReadyInvoice, SeriesCode};
-use anyhow::{Context, Result};
+use aberp_billing::{
+    huf_equivalent_round_half_even, Currency, Huf, LineItem, RateMetadata, ReadyInvoice,
+    SeriesCode,
+};
+use anyhow::{anyhow, Context, Result};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
+use rust_decimal::Decimal;
 
 /// Supplier + customer party data that the billing module does not own.
 /// Supplied by the input JSON in PR-5; will move into its own module
@@ -152,11 +156,40 @@ pub struct AnnulmentReference {
 
 /// Render `<InvoiceData>` to bytes. The invoice number is built from the
 /// series code and the allocator-burned sequence number: `INV-default/00042`.
+///
+/// # Currency + rate metadata (PR-44δ / ADR-0037 §1.b)
+///
+/// `currency` carries the typed `Currency` (HUF or EUR per ADR-0037 §3's
+/// closed vocab). `rate_metadata` MUST be `Some(_)` when `currency` is a
+/// non-HUF variant (ADR-0037 §4 invariant C1's wire-side counterpart) and
+/// SHOULD be `None` for HUF. The function loud-fails on
+/// `Currency::Eur` + `None` rather than silently emitting a HUF-shaped
+/// body for an EUR invoice — CLAUDE.md rule 12.
+///
+/// For HUF the wire body is byte-near-identical to the pre-PR-44δ shape
+/// (`<currencyCode>HUF</currencyCode>`, all per-VAT-rate + invoice-level
+/// `*HUF` amounts equal to their non-HUF siblings) with one deliberate
+/// change: `<exchangeRate>` now serializes as `1.000000` (6 decimals per
+/// ADR-0037 §1.c + C11) rather than the prior `1`. The NAV XSD accepts
+/// both; the 6-decimal form pins the C11 precision invariant uniformly
+/// across HUF and EUR.
+///
+/// For EUR the rate stamped at PR-44γ is read from `rate_metadata.rate`
+/// (a `rust_decimal::Decimal` — full precision MNB returned). Per-VAT-rate
+/// and invoice-level HUF amounts are computed via the same
+/// `huf_equivalent_round_half_even` helper PR-44γ uses for the per-invoice
+/// gross-total stamp; the rate is NOT re-fetched here (per the
+/// session-52 brief — drift from the audit ledger's stamped rate is the
+/// failure mode this design rules out).
 pub fn render_invoice_data(
     invoice: &ReadyInvoice,
     series_code: &SeriesCode,
     parties: &NavParties,
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
 ) -> Result<Vec<u8>> {
+    ensure_rate_metadata_invariant(currency, rate_metadata)?;
+
     let mut buf: Vec<u8> = Vec::new();
     let mut w = Writer::new_with_indent(&mut buf, b' ', 2);
 
@@ -193,20 +226,39 @@ pub fn render_invoice_data(
     w.write_event(Event::Start(BytesStart::new("invoiceHead")))?;
     write_supplier(&mut w, &parties.supplier)?;
     write_customer(&mut w, &parties.customer)?;
-    write_invoice_detail(&mut w, &issue_date)?;
+    write_invoice_detail(&mut w, &issue_date, currency, rate_metadata)?;
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
     // <invoiceLines>
-    write_lines(&mut w, &invoice.lines)?;
+    write_lines(&mut w, &invoice.lines, currency, rate_metadata)?;
 
     // <invoiceSummary>
-    write_summary(&mut w, &invoice.lines)?;
+    write_summary(&mut w, &invoice.lines, currency, rate_metadata)?;
 
     w.write_event(Event::End(BytesEnd::new("invoice")))?;
     w.write_event(Event::End(BytesEnd::new("invoiceMain")))?;
     w.write_event(Event::End(BytesEnd::new("InvoiceData")))?;
 
     Ok(buf)
+}
+
+/// Refuse a non-HUF currency without rate metadata; pinned by the
+/// `eur_render_without_rate_metadata_loud_fails` test. The mirror of
+/// the issuance-side ADR-0037 §4 invariant C1 check that PR-44γ
+/// enforces in `aberp_billing::allocate_in_tx`'s pre-flight.
+fn ensure_rate_metadata_invariant(
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
+) -> Result<()> {
+    match (currency, rate_metadata) {
+        (Currency::Huf, _) => Ok(()),
+        (_, Some(_)) => Ok(()),
+        (other, None) => Err(anyhow!(
+            "non-HUF invoice currency {} requires rate_metadata at NAV body render time \
+             (ADR-0037 §4 invariant C1, NAV-body side)",
+            other.iso_code()
+        )),
+    }
 }
 
 /// Render the storno's `<InvoiceData>` to bytes (PR-10, ADR-0023).
@@ -281,15 +333,17 @@ pub fn render_storno_data(
     w.write_event(Event::Start(BytesStart::new("invoiceHead")))?;
     write_supplier(&mut w, &parties.supplier)?;
     write_customer(&mut w, &parties.customer)?;
-    write_invoice_detail(&mut w, &issue_date)?;
+    // PR-44δ — storno chain stays HUF-only at this PR per the session-51
+    // narrowed scope; PR-44γ.1 lifts the chain to currency-aware.
+    write_invoice_detail(&mut w, &issue_date, Currency::Huf, None)?;
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
     // <invoiceLines> with negated amounts. Negate by constructing a
     // parallel Vec with negated unit_price; net/vat/gross cascade
     // through `LineItem::net_total` etc. unchanged.
     let negated_lines: Vec<LineItem> = invoice.lines.iter().map(negate_line).collect();
-    write_lines(&mut w, &negated_lines)?;
-    write_summary(&mut w, &negated_lines)?;
+    write_lines(&mut w, &negated_lines, Currency::Huf, None)?;
+    write_summary(&mut w, &negated_lines, Currency::Huf, None)?;
 
     w.write_event(Event::End(BytesEnd::new("invoice")))?;
     w.write_event(Event::End(BytesEnd::new("invoiceMain")))?;
@@ -371,14 +425,17 @@ pub fn render_modification_data(
     w.write_event(Event::Start(BytesStart::new("invoiceHead")))?;
     write_supplier(&mut w, &parties.supplier)?;
     write_customer(&mut w, &parties.customer)?;
-    write_invoice_detail(&mut w, &issue_date)?;
+    // PR-44δ — modification chain stays HUF-only at this PR per the
+    // session-51 narrowed scope; PR-44γ.1 lifts the chain to
+    // currency-aware.
+    write_invoice_detail(&mut w, &issue_date, Currency::Huf, None)?;
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
     // <invoiceLines> + <invoiceSummary> — NOT negated. Full-replace
     // per ADR-0024 §4; the modification's `invoice.lines` already
     // carry the new effective values.
-    write_lines(&mut w, &invoice.lines)?;
-    write_summary(&mut w, &invoice.lines)?;
+    write_lines(&mut w, &invoice.lines, Currency::Huf, None)?;
+    write_summary(&mut w, &invoice.lines, Currency::Huf, None)?;
 
     w.write_event(Event::End(BytesEnd::new("invoice")))?;
     w.write_event(Event::End(BytesEnd::new("invoiceMain")))?;
@@ -579,12 +636,30 @@ fn write_address(w: &mut Writer<&mut Vec<u8>>, tag: &str, s: &SupplierInfo) -> R
     Ok(())
 }
 
-fn write_invoice_detail(w: &mut Writer<&mut Vec<u8>>, issue_date: &str) -> Result<()> {
+fn write_invoice_detail(
+    w: &mut Writer<&mut Vec<u8>>,
+    issue_date: &str,
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
+) -> Result<()> {
+    // ADR-0037 §1.b — `<currencyCode>` is the ISO 4217 code; `<exchangeRate>`
+    // is the rate at exactly 6 decimal places per the NAV `Online Számla`
+    // XSD (confirmed 2026-05-23 legal cleanup). For HUF the conceptual rate
+    // is 1 (HUF-per-HUF); we serialize the same 6-decimal form
+    // (`1.000000`) so the C11 precision invariant holds uniformly across
+    // HUF and EUR. The validator accepts both forms (`ensure_numeric_amount`
+    // is shape-agnostic on decimal-places); the uniform precision is the
+    // load-bearing posture pin.
+    let exchange_rate = match (currency, rate_metadata) {
+        (Currency::Huf, _) => "1.000000".to_string(),
+        (_, Some(meta)) => format_rate_six_decimals(&meta.rate),
+        (_, None) => unreachable!("ensure_rate_metadata_invariant ruled this out"),
+    };
     w.write_event(Event::Start(BytesStart::new("invoiceDetail")))?;
     text_element(w, "invoiceCategory", "NORMAL")?;
     text_element(w, "invoiceDeliveryDate", issue_date)?;
-    text_element(w, "currencyCode", "HUF")?;
-    text_element(w, "exchangeRate", "1")?;
+    text_element(w, "currencyCode", currency.iso_code())?;
+    text_element(w, "exchangeRate", &exchange_rate)?;
     text_element(w, "paymentMethod", "TRANSFER")?;
     text_element(w, "paymentDate", issue_date)?;
     text_element(w, "invoiceAppearance", "ELECTRONIC")?;
@@ -592,7 +667,75 @@ fn write_invoice_detail(w: &mut Writer<&mut Vec<u8>>, issue_date: &str) -> Resul
     Ok(())
 }
 
-fn write_lines(w: &mut Writer<&mut Vec<u8>>, lines: &[LineItem]) -> Result<()> {
+/// Serialize a `rust_decimal::Decimal` rate at exactly 6 decimal places
+/// per ADR-0037 §1.c + §4 invariant C11. `Decimal`'s `Display` impl
+/// honours the precision specifier (`{:.6}`) and pads with trailing
+/// zeros — exactly what the NAV XSD `decimal(6)` shape requires. Pinned
+/// by `rate_serializes_at_six_decimals` in the round-trip test file.
+fn format_rate_six_decimals(rate: &Decimal) -> String {
+    format!("{:.6}", rate)
+}
+
+/// Format an `i64` of minor units (EUR cents) as a two-decimal EUR
+/// amount string. Used by [`write_lines`] / [`write_summary`] on the
+/// EUR branch — the wire body's `lineNetAmount` / `vatRateNetAmount` /
+/// `invoiceNetAmount` etc. carry the native-currency amount; for EUR
+/// that is `cents / 100` with two decimal places. Negative amounts
+/// (storno chain children, future) prepend a single `-`.
+fn format_minor_units_two_decimals(minor_units: i64) -> String {
+    let sign = if minor_units < 0 { "-" } else { "" };
+    let abs = minor_units.unsigned_abs();
+    format!("{sign}{}.{:02}", abs / 100, abs % 100)
+}
+
+/// HUF equivalent of an invoice-currency minor-unit amount under the
+/// supplied rate-metadata. For `Currency::Huf` the amount is already in
+/// whole forints — no conversion. For non-HUF currencies the amount is
+/// in cents and we apply [`huf_equivalent_round_half_even`] using the
+/// PR-44γ-stamped rate (read from the persisted `RateMetadata`, NOT
+/// re-fetched) per ADR-0037 §1.c + §4 invariant C11.
+fn huf_equivalent_for(
+    minor_units: i64,
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
+) -> Result<i64> {
+    match (currency, rate_metadata) {
+        (Currency::Huf, _) => Ok(minor_units),
+        (_, Some(meta)) => huf_equivalent_round_half_even(minor_units, &meta.rate).ok_or_else(
+            || {
+                anyhow!(
+                    "HUF-equivalent conversion overflowed i64 for {} cents at rate {}",
+                    minor_units,
+                    meta.rate
+                )
+            },
+        ),
+        (other, None) => Err(anyhow!(
+            "non-HUF currency {} requires rate_metadata at HUF-equivalent computation",
+            other.iso_code()
+        )),
+    }
+}
+
+/// Serialize a per-line / per-VAT-rate / invoice-level amount in its
+/// native currency: integer forints for HUF; two-decimal EUR cents for
+/// EUR. The two branches diverge at the wire boundary; the underlying
+/// `i64` carries minor units in both cases (the EUR amount lives inside
+/// a `Huf(cents)` wrapper today per PR-44γ's interim posture — see
+/// `apps/aberp/src/issue_invoice.rs::finalize_rate`).
+fn format_native_amount(minor_units: i64, currency: Currency) -> String {
+    match currency {
+        Currency::Huf => minor_units.to_string(),
+        _ => format_minor_units_two_decimals(minor_units),
+    }
+}
+
+fn write_lines(
+    w: &mut Writer<&mut Vec<u8>>,
+    lines: &[LineItem],
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
+) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("invoiceLines")))?;
     text_element(w, "mergedItemIndicator", "false")?;
     for (ordinal, line) in lines.iter().enumerate() {
@@ -603,7 +746,11 @@ fn write_lines(w: &mut Writer<&mut Vec<u8>>, lines: &[LineItem]) -> Result<()> {
         text_element(w, "lineDescription", &line.description)?;
         text_element(w, "quantity", &line.quantity.to_string())?;
         text_element(w, "unitOfMeasure", "PIECE")?;
-        text_element(w, "unitPrice", &line.unit_price.as_i64().to_string())?;
+        text_element(
+            w,
+            "unitPrice",
+            &format_native_amount(line.unit_price.as_i64(), currency),
+        )?;
 
         let net = line
             .net_total()
@@ -616,10 +763,10 @@ fn write_lines(w: &mut Writer<&mut Vec<u8>>, lines: &[LineItem]) -> Result<()> {
             .context("line gross_total overflow during XML render")?;
 
         w.write_event(Event::Start(BytesStart::new("lineAmountsNormal")))?;
-        write_line_net(w, net)?;
+        write_line_net(w, net, currency, rate_metadata)?;
         write_line_vat_rate(w, line.vat_rate_basis_points)?;
-        write_line_vat_amount(w, vat)?;
-        write_line_gross(w, gross)?;
+        write_line_vat_amount(w, vat, currency, rate_metadata)?;
+        write_line_gross(w, gross, currency, rate_metadata)?;
         w.write_event(Event::End(BytesEnd::new("lineAmountsNormal")))?;
 
         w.write_event(Event::End(BytesEnd::new("line")))?;
@@ -628,10 +775,16 @@ fn write_lines(w: &mut Writer<&mut Vec<u8>>, lines: &[LineItem]) -> Result<()> {
     Ok(())
 }
 
-fn write_line_net(w: &mut Writer<&mut Vec<u8>>, net: Huf) -> Result<()> {
+fn write_line_net(
+    w: &mut Writer<&mut Vec<u8>>,
+    net: Huf,
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
+) -> Result<()> {
+    let huf = huf_equivalent_for(net.as_i64(), currency, rate_metadata)?;
     w.write_event(Event::Start(BytesStart::new("lineNetAmountData")))?;
-    text_element(w, "lineNetAmount", &net.as_i64().to_string())?;
-    text_element(w, "lineNetAmountHUF", &net.as_i64().to_string())?;
+    text_element(w, "lineNetAmount", &format_native_amount(net.as_i64(), currency))?;
+    text_element(w, "lineNetAmountHUF", &huf.to_string())?;
     w.write_event(Event::End(BytesEnd::new("lineNetAmountData")))?;
     Ok(())
 }
@@ -644,23 +797,44 @@ fn write_line_vat_rate(w: &mut Writer<&mut Vec<u8>>, vat_rate_basis_points: u16)
     Ok(())
 }
 
-fn write_line_vat_amount(w: &mut Writer<&mut Vec<u8>>, vat: Huf) -> Result<()> {
+fn write_line_vat_amount(
+    w: &mut Writer<&mut Vec<u8>>,
+    vat: Huf,
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
+) -> Result<()> {
+    let huf = huf_equivalent_for(vat.as_i64(), currency, rate_metadata)?;
     w.write_event(Event::Start(BytesStart::new("lineVatData")))?;
-    text_element(w, "lineVatAmount", &vat.as_i64().to_string())?;
-    text_element(w, "lineVatAmountHUF", &vat.as_i64().to_string())?;
+    text_element(w, "lineVatAmount", &format_native_amount(vat.as_i64(), currency))?;
+    text_element(w, "lineVatAmountHUF", &huf.to_string())?;
     w.write_event(Event::End(BytesEnd::new("lineVatData")))?;
     Ok(())
 }
 
-fn write_line_gross(w: &mut Writer<&mut Vec<u8>>, gross: Huf) -> Result<()> {
+fn write_line_gross(
+    w: &mut Writer<&mut Vec<u8>>,
+    gross: Huf,
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
+) -> Result<()> {
+    let huf = huf_equivalent_for(gross.as_i64(), currency, rate_metadata)?;
     w.write_event(Event::Start(BytesStart::new("lineGrossAmountData")))?;
-    text_element(w, "lineGrossAmountNormal", &gross.as_i64().to_string())?;
-    text_element(w, "lineGrossAmountNormalHUF", &gross.as_i64().to_string())?;
+    text_element(
+        w,
+        "lineGrossAmountNormal",
+        &format_native_amount(gross.as_i64(), currency),
+    )?;
+    text_element(w, "lineGrossAmountNormalHUF", &huf.to_string())?;
     w.write_event(Event::End(BytesEnd::new("lineGrossAmountData")))?;
     Ok(())
 }
 
-fn write_summary(w: &mut Writer<&mut Vec<u8>>, lines: &[LineItem]) -> Result<()> {
+fn write_summary(
+    w: &mut Writer<&mut Vec<u8>>,
+    lines: &[LineItem],
+    currency: Currency,
+    rate_metadata: Option<&RateMetadata>,
+) -> Result<()> {
     let mut net_total = Huf::ZERO;
     let mut vat_total = Huf::ZERO;
     let mut gross_total = Huf::ZERO;
@@ -676,6 +850,16 @@ fn write_summary(w: &mut Writer<&mut Vec<u8>>, lines: &[LineItem]) -> Result<()>
             .with_context(|| format!("gross overflow at line {i}"))?;
     }
 
+    // PR-44δ — ADR-0037 §1.c invoice-level HUF totals are the sum of
+    // per-VAT-rate HUF amounts (NOT a fresh round_half_even on the
+    // EUR invoice total). PR-5's single-`summaryByVatRate` posture
+    // collapses everything into one VAT rate today; when a future PR
+    // extends to multi-rate invoices the per-rate HUF amounts here
+    // need to be summed before serializing the invoice-level *HUF.
+    let net_total_huf = huf_equivalent_for(net_total.as_i64(), currency, rate_metadata)?;
+    let vat_total_huf = huf_equivalent_for(vat_total.as_i64(), currency, rate_metadata)?;
+    let gross_total_huf = huf_equivalent_for(gross_total.as_i64(), currency, rate_metadata)?;
+
     w.write_event(Event::Start(BytesStart::new("invoiceSummary")))?;
     w.write_event(Event::Start(BytesStart::new("summaryNormal")))?;
     // summaryByVatRate (one entry, assuming all lines share a rate; PR-5
@@ -685,35 +869,51 @@ fn write_summary(w: &mut Writer<&mut Vec<u8>>, lines: &[LineItem]) -> Result<()>
         w.write_event(Event::Start(BytesStart::new("summaryByVatRate")))?;
         write_line_vat_rate(w, first.vat_rate_basis_points)?;
         w.write_event(Event::Start(BytesStart::new("vatRateNetData")))?;
-        text_element(w, "vatRateNetAmount", &net_total.as_i64().to_string())?;
-        text_element(w, "vatRateNetAmountHUF", &net_total.as_i64().to_string())?;
-        w.write_event(Event::End(BytesEnd::new("vatRateNetData")))?;
-        w.write_event(Event::Start(BytesStart::new("vatRateVatData")))?;
-        text_element(w, "vatRateVatAmount", &vat_total.as_i64().to_string())?;
-        text_element(w, "vatRateVatAmountHUF", &vat_total.as_i64().to_string())?;
-        w.write_event(Event::End(BytesEnd::new("vatRateVatData")))?;
-        w.write_event(Event::Start(BytesStart::new("vatRateGrossData")))?;
-        text_element(w, "vatRateGrossAmount", &gross_total.as_i64().to_string())?;
         text_element(
             w,
-            "vatRateGrossAmountHUF",
-            &gross_total.as_i64().to_string(),
+            "vatRateNetAmount",
+            &format_native_amount(net_total.as_i64(), currency),
         )?;
+        text_element(w, "vatRateNetAmountHUF", &net_total_huf.to_string())?;
+        w.write_event(Event::End(BytesEnd::new("vatRateNetData")))?;
+        w.write_event(Event::Start(BytesStart::new("vatRateVatData")))?;
+        text_element(
+            w,
+            "vatRateVatAmount",
+            &format_native_amount(vat_total.as_i64(), currency),
+        )?;
+        text_element(w, "vatRateVatAmountHUF", &vat_total_huf.to_string())?;
+        w.write_event(Event::End(BytesEnd::new("vatRateVatData")))?;
+        w.write_event(Event::Start(BytesStart::new("vatRateGrossData")))?;
+        text_element(
+            w,
+            "vatRateGrossAmount",
+            &format_native_amount(gross_total.as_i64(), currency),
+        )?;
+        text_element(w, "vatRateGrossAmountHUF", &gross_total_huf.to_string())?;
         w.write_event(Event::End(BytesEnd::new("vatRateGrossData")))?;
         w.write_event(Event::End(BytesEnd::new("summaryByVatRate")))?;
     }
-    text_element(w, "invoiceNetAmount", &net_total.as_i64().to_string())?;
-    text_element(w, "invoiceNetAmountHUF", &net_total.as_i64().to_string())?;
-    text_element(w, "invoiceVatAmount", &vat_total.as_i64().to_string())?;
-    text_element(w, "invoiceVatAmountHUF", &vat_total.as_i64().to_string())?;
-    w.write_event(Event::End(BytesEnd::new("summaryNormal")))?;
-    w.write_event(Event::Start(BytesStart::new("summaryGrossData")))?;
-    text_element(w, "invoiceGrossAmount", &gross_total.as_i64().to_string())?;
     text_element(
         w,
-        "invoiceGrossAmountHUF",
-        &gross_total.as_i64().to_string(),
+        "invoiceNetAmount",
+        &format_native_amount(net_total.as_i64(), currency),
     )?;
+    text_element(w, "invoiceNetAmountHUF", &net_total_huf.to_string())?;
+    text_element(
+        w,
+        "invoiceVatAmount",
+        &format_native_amount(vat_total.as_i64(), currency),
+    )?;
+    text_element(w, "invoiceVatAmountHUF", &vat_total_huf.to_string())?;
+    w.write_event(Event::End(BytesEnd::new("summaryNormal")))?;
+    w.write_event(Event::Start(BytesStart::new("summaryGrossData")))?;
+    text_element(
+        w,
+        "invoiceGrossAmount",
+        &format_native_amount(gross_total.as_i64(), currency),
+    )?;
+    text_element(w, "invoiceGrossAmountHUF", &gross_total_huf.to_string())?;
     w.write_event(Event::End(BytesEnd::new("summaryGrossData")))?;
     w.write_event(Event::End(BytesEnd::new("invoiceSummary")))?;
     Ok(())

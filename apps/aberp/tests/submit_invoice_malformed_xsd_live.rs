@@ -115,6 +115,8 @@ fn malformed_xml_loud_fails_before_any_nav_call() {
         db: db_path.clone(),
         tenant: tenant_id_str.clone(),
         series: "INV-malformed-test".to_string(),
+
+        currency: aberp::cli::CurrencyArg::Huf,
     };
     issue_invoice::run(&issue_args).expect("issue-invoice must succeed");
 

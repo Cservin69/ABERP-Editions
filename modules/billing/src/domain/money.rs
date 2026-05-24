@@ -17,7 +17,9 @@
 
 use std::fmt;
 
+use rust_decimal::Decimal;
 use serde::Serialize;
+use time::Date;
 
 /// Whole forints. Hungarian invoicing rounds to the forint at the line
 /// level; sub-forint precision is not used.
@@ -196,6 +198,102 @@ impl fmt::Display for Money {
     }
 }
 
+/// MNB-rate metadata stamped onto an issued non-HUF invoice per ADR-0037
+/// §1.a + §1.b + §2. Composed at issuance time from
+/// `aberp-mnb-rates`'s response (the rate value + publication date) plus
+/// the per-Áfa-convention round-half-even HUF-equivalent total (per
+/// ADR-0037 §1.c + §4 invariant C11).
+///
+/// The struct is intentionally inline-stamped onto each EUR (or future
+/// non-HUF) invoice row rather than externalised into a separate table.
+/// Two forces drove the inline-stamp posture:
+///
+/// 1. **Regulatory record fidelity.** ADR-0037 §1.a requires the rate
+///    value, source name, and rate-publication date to appear on the
+///    printed invoice; the per-issued-invoice row is the canonical
+///    record those three printed fields read back from.
+/// 2. **No retroactive rewrite.** Existing HUF-only rows pre-PR-44γ
+///    carry `currency = "HUF"` and `exchange_rate = NULL` per the
+///    migration backfill — a NULL rate means "no conversion needed",
+///    NOT "rate missing"; the C10 byte-identical invariant holds at
+///    PR-44γ because HUF rows do not gain a non-trivial rate stamp.
+///
+/// The `source` field is intentionally a `String`, not a typed
+/// `RateSource` enum, because ADR-0037 §2.a confirms the literal `"MNB"`
+/// as the only source at PR-44γ time; a future operator-walk that
+/// surfaces a second source (e.g., ECB) lifts this into an enum at that
+/// PR's surface, not speculatively here (CLAUDE.md rule 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateMetadata {
+    /// MNB-published rate value at the precision MNB returns (typically
+    /// 4 decimal places — e.g., `405.2300`). Stored as
+    /// `rust_decimal::Decimal` so the per-invoice round-half-even
+    /// arithmetic is exact (per A135's deferred-to-arithmetic-consumer
+    /// trigger lifted at THIS PR).
+    pub rate: Decimal,
+    /// Exchange-rate source identifier — the literal string `"MNB"`
+    /// per ADR-0037 §2.a (printed-invoice surface) + the
+    /// `aberp_mnb_rates::SOURCE` constant the network-side fetcher
+    /// emits. Pinned by the `rate_metadata_source_matches_mnb_constant`
+    /// test in the binary's issuance path.
+    pub source: String,
+    /// Publication date of the rate that was applied. May differ from
+    /// the supply-fulfillment date if MNB walked back to the most-recent
+    /// prior publication date per ADR-0037 §2.b (weekend, holiday).
+    /// Consumers MUST read this when populating the printed-invoice
+    /// `Exchange-rate date` field per ADR-0037 §1.a.
+    pub date: Date,
+    /// The round-half-even HUF equivalent of the invoice's gross total,
+    /// in whole forints, per ADR-0037 §1.c + §4 invariant C11. Computed
+    /// at the per-invoice level using [`huf_equivalent_round_half_even`].
+    /// Per-VAT-rate HUF amounts on the wire body (C5 / PR-44δ) decompose
+    /// this total; PR-44γ stamps the invoice-level figure only.
+    pub huf_equivalent_total: i64,
+}
+
+/// Round-half-even (banker's rounding) HUF-equivalent of an EUR cent
+/// amount converted at `rate` (HUF per 1 EUR). Per ADR-0037 §1.c +
+/// §4 invariant C11 / A137 — the Áfa-convention rounding mode that
+/// supersedes the pre-cleanup half-up posture at the 2026-05-23 legal
+/// walk.
+///
+/// HUF amounts are whole forints (`Huf(pub i64)`) per ADR-0009 §1;
+/// the rounding mode reaches for `rust_decimal::Decimal::ROUND_HALF_EVEN`
+/// after multiplying-and-dividing-by-100 (cents → euros) at full
+/// `Decimal` precision so neither input units nor the rate's published
+/// precision lose information.
+///
+/// `eur_cents` is the EUR amount in cents (e.g., `1234` for `€12.34`),
+/// the same shape `Eur(pub i64)` carries internally per the session-46
+/// pre-PR-44α `Eur` introduction.
+///
+/// # Pin-test handle
+///
+/// The half-even tie-break is pinned by
+/// `huf_equivalent_uses_banker_rounding_on_ties` in this file's test
+/// module — `1230 cents × 1.0 HUF/EUR = 12.30 HUF` rounds to `12` (the
+/// even forint), `1250 cents × 1.0 HUF/EUR = 12.50 HUF` rounds to `12`
+/// (the even forint), `1350 cents × 1.0 HUF/EUR = 13.50 HUF` rounds to
+/// `14` (the even forint). Half-up would produce `13` / `13` / `14`
+/// — the differential is the load-bearing pin per CLAUDE.md rule 9.
+///
+/// Returns `None` only when the intermediate
+/// `Decimal * Decimal` overflows the 96-bit mantissa OR the final
+/// rounded value doesn't fit in `i64`. Both surface as loud-fail at the
+/// CLI boundary per CLAUDE.md rule 12.
+pub fn huf_equivalent_round_half_even(eur_cents: i64, rate: &Decimal) -> Option<i64> {
+    use rust_decimal::prelude::ToPrimitive;
+    use rust_decimal::RoundingStrategy;
+
+    let cents = Decimal::from(eur_cents);
+    let hundred = Decimal::from(100);
+    // huf = (eur_cents / 100) * rate, kept at full Decimal precision
+    // through the multiply so neither operand truncates.
+    let huf_full = cents.checked_mul(*rate)?.checked_div(hundred)?;
+    let huf_rounded = huf_full.round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven);
+    huf_rounded.to_i64()
+}
+
 #[cfg(test)]
 mod currency_tests {
     //! PR-44α / ADR-0037 §3 pin tests. The compile-time invariant (closed
@@ -264,6 +362,100 @@ mod currency_tests {
             variants.len(),
             2,
             "Currency variant count drifted from ADR-0037 §3's pinned `{{Huf, Eur}}` vocab",
+        );
+    }
+
+    /// PR-44γ — `huf_equivalent_round_half_even` ties round to the even
+    /// forint per ADR-0037 §1.c + A137 (the 2026-05-23 legal-cleanup
+    /// correction superseding the pre-cleanup half-up posture). The
+    /// load-bearing pin is the differential against half-up: this test
+    /// is constructed so its assertions WOULD FAIL if anyone reverted
+    /// the rounding mode to half-up. Per CLAUDE.md rule 9 (tests verify
+    /// intent, not just behaviour) — a test that asserted only
+    /// `eur * rate = huf` regardless of fractional part would pass
+    /// under either rounding mode and would NOT catch the regression
+    /// the C11 invariant exists to prevent.
+    ///
+    /// Cases:
+    /// - `12.50 EUR × 1.0 = 12.50 HUF` → round-half-even = `12`,
+    ///   half-up = `13`. Differential pin.
+    /// - `13.50 EUR × 1.0 = 13.50 HUF` → round-half-even = `14`,
+    ///   half-up = `14`. (Both agree; included to show the rule does
+    ///   round AWAY when the next-even direction is up.)
+    /// - `12.30 EUR × 1.0 = 12.30 HUF` → both modes = `12` (no tie;
+    ///   sanity check that non-tied values agree.)
+    /// - `12.70 EUR × 1.0 = 12.70 HUF` → both modes = `13` (no tie;
+    ///   sanity check that round-up applies to the > 0.5 half too.)
+    #[test]
+    fn huf_equivalent_uses_banker_rounding_on_ties() {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let rate_one = Decimal::from(1);
+
+        // Half-even tie-break case 1: `12.50 → 12` (even forint).
+        // Half-up would produce `13` — the regression this test catches.
+        assert_eq!(
+            huf_equivalent_round_half_even(1250, &rate_one),
+            Some(12),
+            "12.50 HUF must round half-even to 12 (the even forint); half-up would give 13"
+        );
+
+        // Half-even tie-break case 2: `13.50 → 14` (even forint).
+        // Half-up also gives `14`; this case confirms the rule rounds AWAY
+        // on the half whose next-even neighbour is the higher integer.
+        assert_eq!(
+            huf_equivalent_round_half_even(1350, &rate_one),
+            Some(14),
+            "13.50 HUF must round half-even to 14 (the even forint)"
+        );
+
+        // Non-tied below-half: `12.30 → 12` under either rule.
+        assert_eq!(
+            huf_equivalent_round_half_even(1230, &rate_one),
+            Some(12),
+            "12.30 HUF rounds down to 12 (below-half; non-tied)"
+        );
+
+        // Non-tied above-half: `12.70 → 13` under either rule.
+        assert_eq!(
+            huf_equivalent_round_half_even(1270, &rate_one),
+            Some(13),
+            "12.70 HUF rounds up to 13 (above-half; non-tied)"
+        );
+
+        // Realistic MNB EUR/HUF rate: `12.50 EUR × 405.230000 HUF/EUR`
+        // = `5065.375 HUF`. The fractional part is `.375` — non-tied,
+        // rounds down to `5065` under either rule. Included as a sanity
+        // check that the helper composes correctly with a typical MNB
+        // precision value.
+        let rate_mnb = Decimal::from_str("405.230000").expect("rate parses");
+        assert_eq!(
+            huf_equivalent_round_half_even(1250, &rate_mnb),
+            Some(5065),
+            "12.50 EUR × 405.230000 HUF/EUR = 5065.375 HUF; rounds to 5065 under either rule"
+        );
+    }
+
+    /// PR-44γ — `huf_equivalent_round_half_even` returns `None` on
+    /// arithmetic overflow rather than silently producing a wrong
+    /// figure. Per CLAUDE.md rule 12 (fail loud); the CLI boundary
+    /// surfaces the `None` as a typed loud-fail error.
+    #[test]
+    fn huf_equivalent_returns_none_on_overflow() {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        // `i64::MAX cents × 1.0 = i64::MAX / 100` HUF. That fits in i64
+        // (it's smaller than i64::MAX). Pick a value that doesn't.
+        // `i64::MAX cents × 1000.0 = 10× too big after /100`. The
+        // intermediate Decimal multiply succeeds but the final
+        // `to_i64` returns None.
+        let huge_rate = Decimal::from_str("1000.0").expect("rate parses");
+        assert_eq!(
+            huf_equivalent_round_half_even(i64::MAX, &huge_rate),
+            None,
+            "extreme cents × rate must loud-fail (None) rather than wrap silently"
         );
     }
 

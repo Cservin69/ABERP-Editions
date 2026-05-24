@@ -8,6 +8,7 @@ version = "0.0.0"
 dependencies = [
  "aberp-audit-ledger",
  "aberp-billing",
+ "aberp-mnb-rates",
  "aberp-nav-transport",
  "aberp-nav-xsd-validator",
  "aberp-verify",
@@ -21,6 +22,7 @@ dependencies = [
  "keyring",
  "quick-xml 0.36.2",
  "rcgen",
+ "rust_decimal",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -59,6 +61,7 @@ name = "aberp-billing"
 version = "0.0.0"
 dependencies = [
  "duckdb",
+ "rust_decimal",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

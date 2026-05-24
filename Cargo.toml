@@ -146,6 +146,14 @@ duckdb = { version = "1", features = ["bundled"] }
 # Date / time — ADR-0021 Part A, item 11 (closes F2).
 time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde", "serde-well-known"] }
 
+# Decimal arithmetic for EUR→HUF conversion per ADR-0037 §1.c (PR-44γ —
+# A135's deferred-to-arithmetic-consumer trigger fires here). First
+# runtime consumer is `modules/billing`'s round-half-even HUF-equivalent
+# helper (per A137 / C11). `rust_decimal` was already in `Cargo.lock`
+# transitively via `duckdb`'s arrow chain; lifting it to the workspace
+# pin is the standard ADR-0021 §A0 "pin on first direct use" posture.
+rust_decimal = "1"
+
 # Canonical CBOR encoding for the audit-ledger hash chain — ADR-0021 Part A,
 # item 12 (closes F3). The encoder lives in ONE place inside aberp-audit-ledger.
 ciborium = "0.2"

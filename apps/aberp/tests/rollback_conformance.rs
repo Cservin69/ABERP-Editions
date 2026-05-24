@@ -98,6 +98,11 @@ fn build_allocate_args(series_id: SeriesId) -> AllocateArgs {
             issue_date: OffsetDateTime::now_utc(),
         },
         idempotency_key: IdempotencyKey::new(),
+        // PR-44γ — rollback conformance exercises the HUF path. The
+        // C10 byte-identical invariant prerequisite is preserved here:
+        // HUF rows carry no rate metadata.
+        currency: aberp_billing::Currency::Huf,
+        rate_metadata: None,
     }
 }
 

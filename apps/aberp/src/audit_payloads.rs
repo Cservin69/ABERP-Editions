@@ -34,7 +34,7 @@
 
 use std::path::PathBuf;
 
-use aberp_billing::{IdempotencyKey, ReadyInvoice, SequenceReservation};
+use aberp_billing::{Currency, IdempotencyKey, RateMetadata, ReadyInvoice, SequenceReservation};
 use serde::{Deserialize, Serialize};
 
 // ──────────────────────────────────────────────────────────────────────
@@ -130,18 +130,64 @@ pub struct InvoiceDraftCreatedPayload {
     /// binary wrote at `--out` time. `None` for pre-PR-18 entries.
     #[serde(default)]
     pub nav_xml_path: Option<String>,
+    /// PR-44γ / ADR-0037 §3. Invoice currency in ISO 4217 form (`"HUF"`
+    /// or `"EUR"` per the closed vocab at PR-44γ time). Same wire form
+    /// as `Currency::iso_code()`; pinned by
+    /// `currency_wire_shape_pins_iso_4217_strings` in
+    /// `modules/billing/src/domain/money.rs`. Pre-PR-44γ entries
+    /// deserialise with `currency: None`; the binary's read path treats
+    /// `None` AND `Some("HUF")` identically (both are HUF invoices).
+    #[serde(default)]
+    pub currency: Option<String>,
+    /// PR-44γ / ADR-0037 §1.a + §1.b. The applied MNB rate value as a
+    /// canonical-decimal string (matches `rust_decimal::Decimal`'s
+    /// `to_string` output; round-trips back via
+    /// `Decimal::from_str`). `Some(_)` iff `currency` is a non-HUF
+    /// variant; `None` for HUF (the C10 byte-identical invariant
+    /// prerequisite — HUF rows carry no rate metadata).
+    #[serde(default)]
+    pub exchange_rate: Option<String>,
+    /// PR-44γ / ADR-0037 §1.a + §2.a. Source identifier — the literal
+    /// `"MNB"` constant from `aberp_mnb_rates::SOURCE`. `Some("MNB")`
+    /// for EUR rows; `None` for HUF. Read by the future printed-
+    /// invoice render (PR-44ε / C9).
+    #[serde(default)]
+    pub exchange_rate_source: Option<String>,
+    /// PR-44γ / ADR-0037 §1.a + §2.b. Publication date of the rate
+    /// that was applied, in canonical `YYYY-MM-DD` form. May differ
+    /// from the supply-fulfillment date if MNB walked back to the
+    /// most-recent prior publication date (weekend, holiday). Read by
+    /// the future printed-invoice render's `Exchange-rate date` field.
+    /// `Some(_)` for non-HUF rows; `None` for HUF.
+    #[serde(default)]
+    pub exchange_rate_date: Option<String>,
+    /// PR-44γ / ADR-0037 §1.c + §4 invariant C11 / A137. The round-
+    /// half-even HUF-equivalent of the invoice's gross total, in whole
+    /// forints, expressed as a canonical-decimal string (DECIMAL(18,0)
+    /// at the storage layer). `Some(_)` for non-HUF rows; `None` for
+    /// HUF (HUF rows carry the regulatory HUF amount in the line
+    /// items directly).
+    #[serde(default)]
+    pub huf_equivalent_total: Option<String>,
 }
 
 impl InvoiceDraftCreatedPayload {
     /// Pre-PR-18 constructor — keeps the round-trip test
     /// (`draft_created_round_trip`) and any future call site that
-    /// has no XML path to record. Sets `nav_xml_path: None`.
+    /// has no XML path to record. Sets `nav_xml_path: None` AND the
+    /// five PR-44γ rate-metadata fields to `None`. Default HUF
+    /// posture (the only currency available before PR-44γ).
     pub fn from_invoice(invoice: &ReadyInvoice, idempotency_key: IdempotencyKey) -> Self {
         Self {
             invoice_id: invoice.id.to_prefixed_string(),
             line_count: invoice.lines.len(),
             idempotency_key: idempotency_key.to_canonical_string(),
             nav_xml_path: None,
+            currency: None,
+            exchange_rate: None,
+            exchange_rate_source: None,
+            exchange_rate_date: None,
+            huf_equivalent_total: None,
         }
     }
 
@@ -154,6 +200,11 @@ impl InvoiceDraftCreatedPayload {
     /// disk byte-for-byte except where the OS reports a non-UTF-8
     /// path (rare; the operator-visible failure surfaces at file-
     /// read time in the drain worker per CLAUDE.md rule 12).
+    ///
+    /// PR-44γ — HUF path. Currency is HUF (so the five rate-metadata
+    /// fields are `None`). Stamps `currency: Some("HUF")` so a future
+    /// reader can distinguish "pre-PR-44γ entry (currency = None)"
+    /// from "explicit HUF entry post-PR-44γ" without ambiguity.
     pub fn from_invoice_with_xml_path(
         invoice: &ReadyInvoice,
         idempotency_key: IdempotencyKey,
@@ -164,6 +215,48 @@ impl InvoiceDraftCreatedPayload {
             line_count: invoice.lines.len(),
             idempotency_key: idempotency_key.to_canonical_string(),
             nav_xml_path: Some(nav_xml_path.to_string_lossy().to_string()),
+            currency: Some(Currency::Huf.iso_code().to_string()),
+            exchange_rate: None,
+            exchange_rate_source: None,
+            exchange_rate_date: None,
+            huf_equivalent_total: None,
+        }
+    }
+
+    /// PR-44γ / ADR-0037 — non-HUF constructor. Stamps the currency +
+    /// rate-metadata quintet onto the audit payload alongside the
+    /// existing PR-18 `nav_xml_path` field. Called by the binary's
+    /// `issue_invoice::run()` when `--currency EUR` is in effect.
+    ///
+    /// The exchange-rate date is rendered in canonical `YYYY-MM-DD`
+    /// form (the same form ADR-0037 §1.a names for the
+    /// `Exchange-rate date` printed-invoice field); the rate value is
+    /// the canonical `rust_decimal::Decimal::to_string` form
+    /// (DECIMAL(18,6) at the DuckDB storage layer); the HUF-equivalent
+    /// total is the round-half-even integer per ADR-0037 §1.c + C11.
+    pub fn from_invoice_with_rate(
+        invoice: &ReadyInvoice,
+        idempotency_key: IdempotencyKey,
+        nav_xml_path: Option<PathBuf>,
+        currency: Currency,
+        rate: &RateMetadata,
+    ) -> Self {
+        let date_str = rate
+            .date
+            .format(&time::macros::format_description!(
+                "[year]-[month]-[day]"
+            ))
+            .unwrap_or_else(|_| "INVALID-DATE".to_string());
+        Self {
+            invoice_id: invoice.id.to_prefixed_string(),
+            line_count: invoice.lines.len(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            nav_xml_path: nav_xml_path.map(|p| p.to_string_lossy().to_string()),
+            currency: Some(currency.iso_code().to_string()),
+            exchange_rate: Some(rate.rate.to_string()),
+            exchange_rate_source: Some(rate.source.clone()),
+            exchange_rate_date: Some(date_str),
+            huf_equivalent_total: Some(rate.huf_equivalent_total.to_string()),
         }
     }
 
@@ -1529,6 +1622,93 @@ mod tests {
         assert_eq!(decoded.line_count, 2);
         assert_eq!(decoded.idempotency_key, "idem_01J0");
         assert_eq!(decoded.nav_xml_path, None);
+        // PR-44γ — pre-PR-44γ entries deserialise with the five
+        // rate-metadata fields all `None`; the `#[serde(default)]`
+        // attribute on each field is the load-bearing posture.
+        assert_eq!(decoded.currency, None);
+        assert_eq!(decoded.exchange_rate, None);
+        assert_eq!(decoded.exchange_rate_source, None);
+        assert_eq!(decoded.exchange_rate_date, None);
+        assert_eq!(decoded.huf_equivalent_total, None);
+    }
+
+    /// PR-44γ / ADR-0037 — the EUR issuance audit payload carries the
+    /// five rate-metadata fields and round-trips through serde without
+    /// drift. Per CLAUDE.md rule 9 (tests verify intent, not just
+    /// behaviour) — each field is asserted by exact value, so a
+    /// regression that drops or renames any field surfaces loud.
+    ///
+    /// The fixture rate is `405.230000` (a realistic MNB EUR/HUF
+    /// publication shape — 6 decimal precision per C11). The
+    /// rate-publication date is `2026-05-22` (Friday — a normal
+    /// publication day in the 2026-05-23 issuance window the brief
+    /// names). The HUF-equivalent total is `5_065` (the
+    /// `12.50 EUR × 405.230000` worked example from the
+    /// `huf_equivalent_uses_banker_rounding_on_ties` differential).
+    #[test]
+    fn draft_created_round_trip_with_rate_metadata() {
+        use rust_decimal::Decimal;
+        use std::path::PathBuf;
+        use std::str::FromStr;
+
+        let invoice = fixture_invoice();
+        let idem = IdempotencyKey::new();
+        let rate = aberp_billing::RateMetadata {
+            rate: Decimal::from_str("405.230000").expect("rate parses"),
+            source: "MNB".to_string(),
+            date: time::macros::date!(2026 - 05 - 22),
+            huf_equivalent_total: 5_065,
+        };
+        let path = PathBuf::from("/tmp/out/inv_01J0.xml");
+        let original = InvoiceDraftCreatedPayload::from_invoice_with_rate(
+            &invoice,
+            idem,
+            Some(path.clone()),
+            aberp_billing::Currency::Eur,
+            &rate,
+        );
+        let bytes = original.to_bytes();
+
+        let decoded: InvoiceDraftCreatedPayload =
+            serde_json::from_slice(&bytes).expect("EUR audit payload must round-trip");
+        assert_eq!(decoded, original);
+        // Field-by-field pin per CLAUDE.md rule 9. A future
+        // PartialEq-dropping refactor still surfaces because each field
+        // is asserted.
+        assert_eq!(decoded.currency.as_deref(), Some("EUR"));
+        assert_eq!(decoded.exchange_rate.as_deref(), Some("405.230000"));
+        assert_eq!(decoded.exchange_rate_source.as_deref(), Some("MNB"));
+        assert_eq!(decoded.exchange_rate_date.as_deref(), Some("2026-05-22"));
+        assert_eq!(decoded.huf_equivalent_total.as_deref(), Some("5065"));
+        assert_eq!(
+            decoded.nav_xml_path.as_deref(),
+            Some("/tmp/out/inv_01J0.xml")
+        );
+    }
+
+    /// PR-44γ / ADR-0037 §3 — the HUF path through
+    /// `from_invoice_with_xml_path` stamps `currency: Some("HUF")`
+    /// explicitly (NOT `None`, which would alias with pre-PR-44γ
+    /// entries). The five rate-metadata fields are `None` for HUF
+    /// per the C10 byte-identical invariant prerequisite — HUF rows
+    /// carry no rate metadata.
+    #[test]
+    fn draft_created_huf_explicit_currency_no_rate_metadata() {
+        use std::path::PathBuf;
+
+        let invoice = fixture_invoice();
+        let idem = IdempotencyKey::new();
+        let path = PathBuf::from("/tmp/out/inv_01J0.xml");
+        let payload =
+            InvoiceDraftCreatedPayload::from_invoice_with_xml_path(&invoice, idem, path);
+        let decoded: InvoiceDraftCreatedPayload =
+            serde_json::from_slice(&payload.to_bytes()).expect("HUF payload must round-trip");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.currency.as_deref(), Some("HUF"));
+        assert_eq!(decoded.exchange_rate, None);
+        assert_eq!(decoded.exchange_rate_source, None);
+        assert_eq!(decoded.exchange_rate_date, None);
+        assert_eq!(decoded.huf_equivalent_total, None);
     }
 
     // ── PR-7-B-3 NAV-submission payload round-trips ─────────────────
