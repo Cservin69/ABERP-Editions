@@ -132,6 +132,19 @@
 
 set -uo pipefail   # NOTE: no -e — we want to handle child exit code, not abort on it
 
+# ---------- self-syntax-check (PR-55) ---------------------------------------
+# Catch a parse-error regression at startup so a typo doesn't manifest as a
+# half-run launcher dying mid-flight. Cheap (~5 ms) and runs before any real
+# work. NOTE: bash -n only catches syntax errors, not unbound-variable issues
+# — those still fail at runtime, but the defensive array expansion below
+# (${arr[@]+"${arr[@]}"}) prevents the macOS-bash-3.2 empty-array gotcha
+# that PR-55 was opened to fix.
+if ! bash -n "$0" 2>/dev/null; then
+  echo "[fail] $0 failed 'bash -n' syntax check — refusing to run" >&2
+  bash -n "$0"   # rerun without redirect so the operator sees the error
+  exit 2
+fi
+
 # ---------- config (edit if your launch shape differs) -----------------------
 readonly REPO_ROOT="/Users/aben/Documents/Claude/Projects/ABERP"
 readonly DESKTOP_DIR="${REPO_ROOT}/apps/aberp-ui"
@@ -248,7 +261,13 @@ fi
 # at runtime. Two passes settle the linker fingerprint; subsequent cargo
 # invocations (within this launcher run and across runs without source
 # changes) are true no-ops, so the linker-signed CDHash stays stable.
-aberp_build_cmd=(cargo build -p "${ABERP_BIN_NAME}" --bin "${ABERP_BIN_NAME}" "${profile_flag[@]}")
+#
+# NOTE on ${profile_flag[@]+"${profile_flag[@]}"}: macOS ships bash 3.2, where
+# expanding an empty array under `set -u` raises "unbound variable" even if
+# the array was initialized with `arr=()`. The `${arr[@]+...}` parameter-
+# expansion form yields nothing when the array is empty and the quoted
+# expansion when it's not — safe under bash 3.2 AND modern bash. (PR-55.)
+aberp_build_cmd=(cargo build -p "${ABERP_BIN_NAME}" --bin "${ABERP_BIN_NAME}" ${profile_flag[@]+"${profile_flag[@]}"})
 echo "[build] ${aberp_build_cmd[*]}  (pass 1/2)"
 "${aberp_build_cmd[@]}" || { echo "[fail] cargo build (aberp pass 1) failed" >&2; exit 4; }
 echo "[build] ${aberp_build_cmd[*]}  (pass 2/2 — settle linker fingerprint)"
@@ -257,7 +276,7 @@ echo "[build] ${aberp_build_cmd[*]}  (pass 2/2 — settle linker fingerprint)"
 # aberp-ui: same pattern, but with --no-default-features matching tauri-CLI's
 # `cargo run` invocation so tauri-CLI later sees the build as up-to-date and
 # its internal cargo step is a true no-op.
-ui_build_cmd=(cargo build -p "${TAURI_BIN_NAME}" --bin "${TAURI_BIN_NAME}" --no-default-features "${profile_flag[@]}")
+ui_build_cmd=(cargo build -p "${TAURI_BIN_NAME}" --bin "${TAURI_BIN_NAME}" --no-default-features ${profile_flag[@]+"${profile_flag[@]}"})
 echo "[build] ${ui_build_cmd[*]}  (pass 1/2)"
 "${ui_build_cmd[@]}" || { echo "[fail] cargo build (aberp-ui pass 1) failed" >&2; exit 4; }
 echo "[build] ${ui_build_cmd[*]}  (pass 2/2 — settle linker fingerprint)"
