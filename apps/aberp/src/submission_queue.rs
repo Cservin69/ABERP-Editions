@@ -526,7 +526,13 @@ pub fn classify_attempt_failure(err: &NavTransportError) -> (&'static str, Optio
 
         // HTTP-status classes (NAV returned non-2xx). PR-20 /
         // ADR-0033 §5 adds the queryInvoiceCheck variant.
-        NavTransportError::TokenExchangeHttpStatus { status }
+        // PR-58 / session-78 — the tokenExchange variant gained
+        // `fault_code` / `fault_message` / `body_preview` fields; only
+        // the `status` is meaningful to the classifier (the parsed
+        // fault is surfaced loud to the operator higher up). The
+        // `..` rest-pattern keeps this arm tolerant of future
+        // additions.
+        NavTransportError::TokenExchangeHttpStatus { status, .. }
         | NavTransportError::ManageInvoiceHttpStatus { status }
         | NavTransportError::QueryTransactionStatusHttpStatus { status }
         | NavTransportError::ManageAnnulmentHttpStatus { status }
@@ -843,7 +849,12 @@ mod tests {
     /// `INVALID_SECURITY_USER`), which is exactly the wrong behaviour.
     #[test]
     fn is_transport_error_classifies_token_exchange_http_status_as_application() {
-        let err = NavTransportError::TokenExchangeHttpStatus { status: 500 };
+        let err = NavTransportError::TokenExchangeHttpStatus {
+            status: 500,
+            fault_code: None,
+            fault_message: None,
+            body_preview: String::new(),
+        };
         assert!(!is_transport_error(&err));
     }
 

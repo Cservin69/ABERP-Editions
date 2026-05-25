@@ -133,9 +133,28 @@ pub enum NavTransportError {
     /// NAV returned a non-success HTTP status to tokenExchange. The
     /// status is preserved for the audit-ledger entry; the response
     /// body itself is captured separately by the caller (verbatim) per
-    /// ADR-0009 §8 and not included in this variant.
-    #[error("tokenExchange returned non-success HTTP status: {status}")]
-    TokenExchangeHttpStatus { status: u16 },
+    /// ADR-0009 §8.
+    ///
+    /// PR-58 / session-78 — extended with `body_preview` + parsed
+    /// `fault_code` / `fault_message`. Pre-PR-58 only `status` was
+    /// carried, which made every 400 from NAV indistinguishable from
+    /// the next (the actual diagnostic — `INVALID_REQUEST_SIGNATURE` vs
+    /// `IP_ADDRESS_NOT_AUTHORIZED` vs schema mismatch — lives in the
+    /// response body, and we were throwing it away). The body_preview
+    /// is a UTF-8-lossy first-500-chars slice so the error message is
+    /// inspectable from the log line alone; the parsed fault fields are
+    /// best-effort (`None` if NAV returned a non-XML body).
+    #[error(
+        "tokenExchange returned non-success HTTP status: {status} \
+         (fault_code={fault_code:?}, fault_message={fault_message:?}) \
+         body_preview=`{body_preview}`"
+    )]
+    TokenExchangeHttpStatus {
+        status: u16,
+        fault_code: Option<String>,
+        fault_message: Option<String>,
+        body_preview: String,
+    },
 
     /// The tokenExchange response body could not be parsed against the
     /// expected `<TokenExchangeResponse>` shape (missing

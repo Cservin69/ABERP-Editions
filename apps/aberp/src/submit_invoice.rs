@@ -198,6 +198,30 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
                 error_message
             ))
         }
+        Err(SubmitFromInputsError::NavUpstreamFault {
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        }) => {
+            // PR-58 / session-78 — operator-visible eprintln for the
+            // CLI path. The fault code + Hungarian-localized message
+            // (when present) are the actionable diagnostic; the
+            // body_preview is the fallback evidence when parsing
+            // could not extract a typed pair.
+            eprintln!(
+                "submit-invoice FAILED at NAV tokenExchange (HTTP {}): \
+                 fault_code={} fault_message={} body_preview=`{}`",
+                status,
+                fault_code.as_deref().unwrap_or("<none>"),
+                fault_message.as_deref().unwrap_or("<none>"),
+                body_preview,
+            );
+            Err(anyhow!(
+                "NAV tokenExchange returned HTTP {status} \
+                 (fault_code={fault_code:?})"
+            ))
+        }
         Err(SubmitFromInputsError::Other(e)) => Err(e),
     }
 }
@@ -244,6 +268,18 @@ pub struct SubmitFromInputs<'a> {
 /// error, audit-write error, etc.) is folded into
 /// [`SubmitFromInputsError::Other`] which carries the inner anyhow
 /// error verbatim.
+///
+/// PR-58 / session-78 — the `NavUpstreamFault` variant lifts NAV's
+/// tokenExchange non-2xx HTTP response (HTTP-layer rejection BEFORE
+/// any application-layer envelope was built) into a typed surface so
+/// the route can return 502 with the parsed `fault_code` /
+/// `fault_message` / `body_preview` instead of an opaque 500. Pre-PR-58
+/// this rejection was anyhow-wrapped and squashed into "internal error"
+/// at the route boundary, hiding the operator-actionable diagnostic
+/// (e.g. NAV-portal IP-whitelist mismatch, expired technical-user
+/// password, signature drift). No audit-ledger entry is written for
+/// the tokenExchange failure path per ADR-0032 §1 — the invoice
+/// remains NeverSubmitted and is operator-retriable.
 #[derive(Debug)]
 pub enum SubmitFromInputsError {
     WireFailed {
@@ -251,6 +287,12 @@ pub enum SubmitFromInputsError {
         error_message: String,
         entries_verified: u64,
         error_class: &'static str,
+    },
+    NavUpstreamFault {
+        status: u16,
+        fault_code: Option<String>,
+        fault_message: Option<String>,
+        body_preview: String,
     },
     Other(anyhow::Error),
 }
@@ -267,6 +309,17 @@ impl std::fmt::Display for SubmitFromInputsError {
                 f,
                 "submit-invoice manageInvoice failed for {invoice_id} \
                  (error_class={error_class}): {error_message}"
+            ),
+            SubmitFromInputsError::NavUpstreamFault {
+                status,
+                fault_code,
+                fault_message,
+                body_preview,
+            } => write!(
+                f,
+                "NAV tokenExchange returned HTTP {status} \
+                 (fault_code={fault_code:?}, fault_message={fault_message:?}) \
+                 body_preview=`{body_preview}`"
             ),
             SubmitFromInputsError::Other(e) => write!(f, "{e:#}"),
         }
@@ -388,7 +441,20 @@ pub async fn submit_from_inputs(
         &invoice_xml,
     )
     .await
-    .map_err(SubmitFromInputsError::Other)?;
+    .map_err(|e| match e {
+        PrepareError::NavUpstreamFault {
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        } => SubmitFromInputsError::NavUpstreamFault {
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        },
+        PrepareError::Other(inner) => SubmitFromInputsError::Other(inner),
+    })?;
     tracing::info!(
         request_bytes = prepared.request_xml.len(),
         "manageInvoice envelope built; ready to write TX1 Attempt audit"
@@ -538,17 +604,50 @@ async fn prepare_for_attempt_audit(
     credentials: &NavCredentials,
     tax_number_8: &str,
     invoice_xml: &[u8],
-) -> Result<PreparedSubmission> {
-    let transport = NavTransport::new(endpoint).context("build NAV transport")?;
-    let token = token_exchange::call(&transport, credentials, tax_number_8)
-        .await
-        .context("NAV tokenExchange")?;
+) -> std::result::Result<PreparedSubmission, PrepareError> {
+    let transport = NavTransport::new(endpoint)
+        .context("build NAV transport")
+        .map_err(PrepareError::Other)?;
+    let token = match token_exchange::call(&transport, credentials, tax_number_8).await {
+        Ok(t) => t,
+        // PR-58 / session-78 — surface NAV's HTTP-layer rejection as a
+        // typed fault so the route boundary returns 502 with the
+        // parsed fault_code / fault_message / body_preview instead of
+        // anyhow-wrapping it into an opaque 500. Every other
+        // tokenExchange failure (transport / parse / decrypt) folds
+        // into `PrepareError::Other`.
+        Err(NavTransportError::TokenExchangeHttpStatus {
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        }) => {
+            tracing::error!(
+                status,
+                fault_code = ?fault_code,
+                fault_message = ?fault_message,
+                body_preview = %body_preview,
+                "NAV tokenExchange rejected: non-2xx HTTP status"
+            );
+            return Err(PrepareError::NavUpstreamFault {
+                status,
+                fault_code,
+                fault_message,
+                body_preview,
+            });
+        }
+        Err(other) => {
+            return Err(PrepareError::Other(
+                anyhow::Error::new(other).context("NAV tokenExchange"),
+            ));
+        }
+    };
     // The per-invoice `operation` is detected from the XML body's
     // shape via the three-way classifier (CREATE / STORNO / MODIFY).
     // PR-11 / ADR-0024 §3 closed F22 by extending PR-10's two-way
     // classifier with the `<modificationIssueDate>` disambiguator
     // for MODIFY.
-    let operation = detect_operation_from_xml(invoice_xml)?;
+    let operation = detect_operation_from_xml(invoice_xml).map_err(PrepareError::Other)?;
     let request_xml = manage_invoice::build_request(
         credentials,
         tax_number_8,
@@ -559,12 +658,30 @@ async fn prepare_for_attempt_audit(
         }],
     )
     .map_err(|e: NavTransportError| {
-        anyhow!("manage_invoice::build_request (envelope construction) failed: {e}")
+        PrepareError::Other(anyhow!(
+            "manage_invoice::build_request (envelope construction) failed: {e}"
+        ))
     })?;
     Ok(PreparedSubmission {
         transport,
         request_xml,
     })
+}
+
+/// PR-58 / session-78 — typed error returned by
+/// [`prepare_for_attempt_audit`]. The `NavUpstreamFault` variant lifts
+/// NAV's HTTP-layer rejection (tokenExchange non-2xx) so the calling
+/// layers can route it into a typed 502 instead of an opaque 500. Every
+/// other failure (transport, envelope construction, XML parse) folds
+/// into `Other` and surfaces as 500.
+enum PrepareError {
+    NavUpstreamFault {
+        status: u16,
+        fault_code: Option<String>,
+        fault_message: Option<String>,
+        body_preview: String,
+    },
+    Other(anyhow::Error),
 }
 
 /// Detect the per-invoice `<operation>` value from the

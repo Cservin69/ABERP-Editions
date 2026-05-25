@@ -198,6 +198,54 @@ pub(crate) fn parse_result_block(
     }
 }
 
+/// PR-58 / session-78 — best-effort parse of a NAV error body into a
+/// `(fault_code, fault_message)` pair. Used on the non-2xx-HTTP path
+/// where the response is not guaranteed to be the OK-shape NAV envelope
+/// `parse_result_block` expects.
+///
+/// Two body shapes are tolerated:
+///
+///   1. `GeneralErrorResponse` with `<common:errorCode>` + `<common:message>`
+///      (NAV's typical OSA REST error shape — same fixture
+///      `GENERAL_ERROR_BODY` in this module's tests).
+///   2. SOAP `<s:Fault>` with `<faultcode>` + `<faultstring>` (and
+///      possibly a nested `<detail><GeneralExceptionResponse><errorCode>`).
+///
+/// `find_first_text` is namespace-blind (local-name match), so this
+/// helper picks up both shapes without an explicit XPath. If the body
+/// is not parseable XML at all, both fields come back `None` — the raw
+/// body preview on the error variant is the operator's fallback
+/// diagnostic.
+pub(crate) fn parse_nav_fault(xml: &[u8]) -> (Option<String>, Option<String>) {
+    // Try the most-specific NAV-OSA shape first.
+    let error_code = find_first_text(xml, "errorCode").ok().flatten();
+    let message = find_first_text(xml, "message").ok().flatten();
+    if error_code.is_some() || message.is_some() {
+        return (error_code, message);
+    }
+    // Fall back to SOAP-fault shape — `faultcode` + `faultstring`.
+    let faultcode = find_first_text(xml, "faultcode").ok().flatten();
+    let faultstring = find_first_text(xml, "faultstring").ok().flatten();
+    (faultcode, faultstring)
+}
+
+/// PR-58 / session-78 — produce a short, log-safe preview of a NAV
+/// response body. UTF-8-lossy decode + first 500 chars + newline
+/// collapse so the value lands cleanly on one tracing log line. The
+/// audit-ledger gets the full verbatim bytes separately per ADR-0009 §8.
+pub(crate) fn body_preview(xml: &[u8]) -> String {
+    let s = String::from_utf8_lossy(xml);
+    let collapsed: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if collapsed.chars().count() <= 500 {
+        collapsed
+    } else {
+        collapsed.chars().take(500).collect::<String>() + "…"
+    }
+}
+
 /// NAV error codes that ADR-0009 §5 names as **non-retryable**. Mapped
 /// in one place so both operations agree on the bucket. The caller's
 /// state-machine transition (`SubmissionStuck` for non-retryable)
@@ -337,6 +385,70 @@ mod tests {
             err,
             NavTransportError::ManageInvoiceResponseParse(_)
         ));
+    }
+
+    // ── PR-58 / session-78: parse_nav_fault + body_preview ──────────
+
+    /// `GeneralErrorResponse`-shaped body — NAV's typical OSA REST
+    /// error envelope. The parser must pull both `errorCode` and
+    /// `message` out of the namespaced common prefix (local-name
+    /// match, namespace-blind).
+    #[test]
+    fn parse_nav_fault_extracts_general_error_shape() {
+        let (code, msg) = parse_nav_fault(GENERAL_ERROR_BODY);
+        assert_eq!(code.as_deref(), Some("INVALID_REQUEST_SIGNATURE"));
+        assert_eq!(msg.as_deref(), Some("The request signature does not match."));
+    }
+
+    /// SOAP fault-shaped body — `<s:Envelope><s:Fault><faultcode>` +
+    /// `<faultstring>` with a nested `<GeneralExceptionResponse>`
+    /// detail. NAV occasionally returns this shape for transport-level
+    /// rejections; the parser falls back from the OSA-REST shape to
+    /// the SOAP-fault shape via the `find_first_text` local-name match.
+    /// The nested `<errorCode>` is picked up by the primary path; we
+    /// pin the SOAP-only fallback case here.
+    #[test]
+    fn parse_nav_fault_falls_back_to_soap_fault_shape() {
+        // Hungarian phrase exercised here verbatim — NAV's localized
+        // diagnostics are Hungarian; the test guards against a future
+        // contributor swapping in an ASCII-only string and losing the
+        // UTF-8 round-trip pin.
+        let body = "<?xml version=\"1.0\"?>\n\
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\n\
+  <s:Body>\n\
+    <s:Fault>\n\
+      <faultcode>s:Client</faultcode>\n\
+      <faultstring>A kérés nem értelmezhető (malformed request)</faultstring>\n\
+    </s:Fault>\n\
+  </s:Body>\n\
+</s:Envelope>";
+        let (code, msg) = parse_nav_fault(body.as_bytes());
+        assert_eq!(code.as_deref(), Some("s:Client"));
+        assert!(msg.as_deref().unwrap().contains("A kérés"));
+    }
+
+    /// Body the parser cannot extract anything from (HTML error page,
+    /// plain text, etc.) returns `(None, None)` — the caller renders
+    /// the raw body preview instead.
+    #[test]
+    fn parse_nav_fault_returns_none_for_unparseable_body() {
+        let body = b"<html><body>500 Internal Server Error</body></html>";
+        let (code, msg) = parse_nav_fault(body);
+        assert!(code.is_none());
+        assert!(msg.is_none());
+    }
+
+    /// `body_preview` caps at 500 chars + collapses newlines to spaces.
+    #[test]
+    fn body_preview_caps_long_input_and_collapses_newlines() {
+        let body = "x".repeat(600);
+        let p = body_preview(body.as_bytes());
+        assert_eq!(p.chars().count(), 501); // 500 + the elision "…"
+        assert!(p.ends_with('…'));
+
+        let multiline = b"line1\nline2\r\nline3";
+        let p = body_preview(multiline);
+        assert_eq!(p, "line1 line2  line3");
     }
 
     #[test]

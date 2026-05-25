@@ -33,7 +33,7 @@ use crate::error::NavTransportError;
 use crate::soap;
 use crate::NavTransport;
 
-use super::{find_first_text, parse_result_block, NavResultBlock};
+use super::{body_preview, find_first_text, parse_nav_fault, parse_result_block, NavResultBlock};
 
 /// Successful tokenExchange outcome. The token IS the secret the caller
 /// will include in the next modifying request; the verbatim bytes go to
@@ -102,14 +102,23 @@ pub async fn call(
         .to_vec();
 
     if !status.is_success() {
-        // Loud-fail on non-success status — the verbatim response_xml
-        // bytes are NOT lost (caller pattern: capture this error AND
-        // hold the bytes alongside the typed audit-payload). PR-7-B-3's
-        // submit_invoice orchestration is the producer of that audit
-        // entry. For now this surface tells the caller the operation
-        // did not succeed.
+        // Loud-fail on non-success status. PR-58 / session-78 — pre-PR-58
+        // this dropped the response body and only carried the HTTP
+        // status code, which made every NAV 400 indistinguishable. We
+        // now best-effort-parse the body for a NAV fault shape
+        // (`<errorCode>` + `<message>` OR SOAP `<faultcode>` +
+        // `<faultstring>`) and carry both the parsed pair AND a
+        // first-500-chars preview on the error variant. The verbatim
+        // bytes are NOT lost — the caller still receives them
+        // separately on its audit-payload path (a future audit
+        // amendment may attach the response_xml even on the
+        // tokenExchange failure path; out of scope for PR-58).
+        let (fault_code, fault_message) = parse_nav_fault(&response_xml);
         return Err(NavTransportError::TokenExchangeHttpStatus {
             status: status.as_u16(),
+            fault_code,
+            fault_message,
+            body_preview: body_preview(&response_xml),
         });
     }
 

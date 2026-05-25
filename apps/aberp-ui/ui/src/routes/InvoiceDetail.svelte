@@ -166,10 +166,12 @@
     cancelInvoiceStorno,
     downloadInvoicePdf,
     getInvoice,
+    parseNavUpstreamFault,
     pollAck,
     submitInvoice,
     type Currency,
     type InvoiceDetail,
+    type NavUpstreamFault,
   } from "../lib/api";
   import {
     ackLabelMeta,
@@ -252,6 +254,12 @@
   // PR-47α / session-64 — `cancelling` extends the discriminator for
   // the storno button. Shares the `mutationState` slot so only one
   // mutation banner ever renders at once (same rationale as PR-44η).
+  // PR-58 / session-78 — the error variant carries an optional parsed
+  // `NavUpstreamFault` payload. When the backend rejects with HTTP 502
+  // and the typed `nav_upstream_fault` body, we display the parsed
+  // `fault_code` + `fault_message` prominently (operator-actionable)
+  // instead of the opaque "internal error" string. `message` remains
+  // the fallback so non-fault errors render unchanged.
   type MutationState =
     | { kind: "idle" }
     | { kind: "submitting" }
@@ -261,6 +269,7 @@
         kind: "error";
         action: "submit" | "poll" | "cancel";
         message: string;
+        navFault: NavUpstreamFault | null;
       };
   let mutationState: MutationState = $state({ kind: "idle" });
   // PR-27 — per-row expanded-payload state. Reassignment pattern
@@ -392,10 +401,12 @@
       await load(detail.invoice_id);
       mutationState = { kind: "idle" };
     } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
       mutationState = {
         kind: "error",
         action: "submit",
-        message: err instanceof Error ? err.message : String(err),
+        message,
+        navFault: parseNavUpstreamFault(message),
       };
     }
   }
@@ -414,10 +425,12 @@
       await load(detail.invoice_id);
       mutationState = { kind: "idle" };
     } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
       mutationState = {
         kind: "error",
         action: "poll",
-        message: err instanceof Error ? err.message : String(err),
+        message,
+        navFault: parseNavUpstreamFault(message),
       };
     }
   }
@@ -473,10 +486,12 @@
       await load(detail.invoice_id);
       mutationState = { kind: "idle" };
     } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
       mutationState = {
         kind: "error",
         action: "cancel",
-        message: err instanceof Error ? err.message : String(err),
+        message,
+        navFault: parseNavUpstreamFault(message),
       };
     }
   }
@@ -677,13 +692,46 @@
       </p>
     {/if}
     {#if mutationState.kind === "error"}
-      <p class="error download-error" role="alert">
-        {mutationState.action === "submit"
-          ? "Submit"
-          : mutationState.action === "poll"
-            ? "Poll ack"
-            : "Cancel invoice"} failed: {mutationState.message}
-      </p>
+      {#if mutationState.navFault}
+        <!-- PR-58 / session-78 — typed NAV upstream-fault rendering.
+             The backend returned HTTP 502 with the parsed fault_code +
+             Hungarian-localized fault_message; render both prominently
+             so the operator can act (e.g. IP whitelist mismatch,
+             expired technical-user password, signature drift). The raw
+             body preview is the fallback evidence for the cases NAV
+             returns a shape the backend parser does not recognise. -->
+        <div class="error download-error nav-fault" role="alert">
+          <p class="nav-fault-headline">
+            {mutationState.action === "submit"
+              ? "Submit"
+              : mutationState.action === "poll"
+                ? "Poll ack"
+                : "Cancel invoice"} rejected by NAV (HTTP {mutationState.navFault.status})
+          </p>
+          <dl class="nav-fault-grid">
+            <dt>Fault code</dt>
+            <dd class="mono">
+              {mutationState.navFault.fault_code ?? "<no fault code>"}
+            </dd>
+            <dt>Fault message</dt>
+            <dd>
+              {mutationState.navFault.fault_message ?? "<no fault message>"}
+            </dd>
+            <dt>Body preview</dt>
+            <dd>
+              <pre class="nav-fault-body">{mutationState.navFault.raw_body_preview}</pre>
+            </dd>
+          </dl>
+        </div>
+      {:else}
+        <p class="error download-error" role="alert">
+          {mutationState.action === "submit"
+            ? "Submit"
+            : mutationState.action === "poll"
+              ? "Poll ack"
+              : "Cancel invoice"} failed: {mutationState.message}
+        </p>
+      {/if}
     {/if}
 
     {#if loadState === "loading"}
@@ -973,6 +1021,57 @@
    * the header rather than in the body-load region. */
   .error.download-error {
     margin: 0 0 var(--space-3) 0;
+  }
+
+  /* PR-58 / session-78 — typed NAV upstream-fault inline panel. Distinct
+   * from the plain string-error panel by virtue of its dt/dd grid;
+   * operator triages the fault by scanning fault_code / fault_message
+   * top-down without parsing a wall-of-text. */
+  .nav-fault {
+    border: 1px solid var(--color-signal-negative);
+    border-radius: var(--radius-md, 6px);
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-surface-sunken);
+  }
+
+  .nav-fault-headline {
+    margin: 0 0 var(--space-2) 0;
+    font-family: var(--type-family-base);
+    font-weight: 600;
+  }
+
+  .nav-fault-grid {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: var(--space-1) var(--space-3);
+    margin: 0;
+    font-family: var(--type-family-base);
+  }
+
+  .nav-fault-grid dt {
+    color: var(--color-text-secondary);
+    text-transform: uppercase;
+    font-size: var(--type-size-xs);
+    letter-spacing: 0.06em;
+    align-self: start;
+  }
+
+  .nav-fault-grid dd {
+    margin: 0;
+    color: var(--color-text-strong);
+  }
+
+  .nav-fault-body {
+    margin: 0;
+    padding: var(--space-1) var(--space-2);
+    background: var(--color-surface);
+    border-radius: var(--radius-sm, 3px);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 8em;
+    overflow: auto;
   }
 
   /* Two-column dt/dd grid for the invoice metadata. */

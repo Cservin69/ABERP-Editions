@@ -365,6 +365,50 @@ export async function submitInvoice(
   });
 }
 
+/** PR-58 / session-78 — typed shape for the backend's
+ * `nav_upstream_fault` JSON body (HTTP 502). Returned by
+ * `POST /invoices/:id/submit` when NAV's `tokenExchange` rejects the
+ * request at the HTTP layer (signature mismatch, IP not whitelisted,
+ * expired technical-user password, etc.). The `fault_code` /
+ * `fault_message` pair is NAV's parsed diagnostic (Hungarian-localized
+ * message when present); `raw_body_preview` is the first 500 chars of
+ * the verbatim response body as a fallback when parsing did not find
+ * a typed pair. Mirrors `serve::NavUpstreamFaultBody`. */
+export interface NavUpstreamFault {
+  error: "nav_upstream_fault";
+  status: number;
+  fault_code: string | null;
+  fault_message: string | null;
+  raw_body_preview: string;
+}
+
+/** PR-58 / session-78 — best-effort extract a [`NavUpstreamFault`] from
+ * the error string the Tauri forwarder produces on a non-2xx response.
+ * `forward_post` stringifies non-success responses as
+ * `"backend returned <status> for <path>: <body>"`; this helper finds
+ * the JSON tail, parses it, and returns the typed shape only if the
+ * `error` discriminator is `"nav_upstream_fault"`. Returns `null` for
+ * everything else (plain 4xx error_body, network failure, non-JSON
+ * trailer) so the caller can fall through to its existing string-
+ * rendering path. */
+export function parseNavUpstreamFault(message: string): NavUpstreamFault | null {
+  const brace = message.indexOf("{");
+  if (brace < 0) return null;
+  try {
+    const parsed: unknown = JSON.parse(message.slice(brace));
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      (parsed as { error?: unknown }).error === "nav_upstream_fault"
+    ) {
+      return parsed as NavUpstreamFault;
+    }
+  } catch {
+    // Not JSON — caller renders the raw string.
+  }
+  return null;
+}
+
 /** PR-44η / session-60 — POST the SPA's "Poll ack now" button to the
  * backend's `/invoices/<id>/poll-ack` route via the matching Tauri
  * command. No body — the backend resolves the NAV transactionId

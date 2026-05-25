@@ -2725,6 +2725,18 @@ async fn handle_submit_invoice(
             Json(error_body(message)),
         )
             .into_response(),
+        Err(SubmitRouteError::NavUpstreamFault {
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        }) => nav_upstream_fault_response(
+            "submit_invoice_request",
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        ),
         Err(SubmitRouteError::Other(e)) => internal_error("submit_invoice_request", e),
     }
 }
@@ -2773,6 +2785,23 @@ async fn handle_poll_ack(
             Json(error_body(message)),
         )
             .into_response(),
+        // PR-58 / session-78 — poll_ack does not currently produce a
+        // NavUpstreamFault (it runs after tokenExchange already
+        // succeeded for the prior submit), but the variant is on the
+        // shared SubmitRouteError surface; route it through the same
+        // typed 502 helper for symmetry.
+        Err(SubmitRouteError::NavUpstreamFault {
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        }) => nav_upstream_fault_response(
+            "poll_ack_request",
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        ),
         Err(SubmitRouteError::Other(e)) => internal_error("poll_ack_request", e),
     }
 }
@@ -2781,6 +2810,13 @@ async fn handle_poll_ack(
 /// helpers below. `PreconditionMismatch` maps to 409; `NotFound`
 /// maps to 404; `Other` maps to 500 via the existing
 /// [`internal_error`] helper.
+///
+/// PR-58 / session-78 — `NavUpstreamFault` carries NAV's HTTP-layer
+/// rejection of `tokenExchange` and maps to 502 with a typed JSON
+/// body so the SPA can render the parsed `fault_code` +
+/// `fault_message` instead of a generic "internal error". Operator-
+/// actionable diagnostics (IP whitelist, expired technical-user
+/// password, signature drift) flow through this surface verbatim.
 #[derive(Debug)]
 pub enum SubmitRouteError {
     PreconditionMismatch {
@@ -2794,6 +2830,12 @@ pub enum SubmitRouteError {
         message: String,
     },
     NotFound(String),
+    NavUpstreamFault {
+        status: u16,
+        fault_code: Option<String>,
+        fault_message: Option<String>,
+        body_preview: String,
+    },
     Other(anyhow::Error),
 }
 
@@ -2921,6 +2963,21 @@ pub async fn submit_invoice_request(
                 "manageInvoice wire send failed: {error_message}"
             ))
         }
+        // PR-58 / session-78 — propagate the typed NAV-upstream fault
+        // verbatim through the route surface so the SPA receives the
+        // parsed fault_code / fault_message instead of a generic
+        // "internal error" body.
+        submit_invoice::SubmitFromInputsError::NavUpstreamFault {
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        } => SubmitRouteError::NavUpstreamFault {
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        },
         submit_invoice::SubmitFromInputsError::Other(inner) => SubmitRouteError::Other(inner),
     })
 }
@@ -3113,6 +3170,25 @@ async fn handle_storno_invoice(
         Err(SubmitRouteError::NotFound(message)) => {
             (StatusCode::NOT_FOUND, Json(error_body(message))).into_response()
         }
+        // PR-58 / session-78 — storno_invoice_request does not call NAV
+        // tokenExchange (it issues a storno locally and lets the
+        // operator drive the subsequent submit), so this variant is
+        // unreachable here. Wired through symmetrically so a future
+        // refactor that lifts NAV-tokenExchange into storno issuance
+        // does not silently degrade to "internal error". CLAUDE.md
+        // rule 12.
+        Err(SubmitRouteError::NavUpstreamFault {
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        }) => nav_upstream_fault_response(
+            "storno_invoice_request",
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        ),
         Err(SubmitRouteError::Other(e)) => internal_error("storno_invoice_request", e),
     }
 }
@@ -3292,6 +3368,16 @@ pub enum ModificationRouteError {
     /// `400 Bad Request` — operator-correctable input shape error
     /// (today: C6 chain-currency mismatch).
     BadRequest(String),
+    /// PR-58 / session-78 — propagated NAV upstream-fault. Modification
+    /// issuance does not call tokenExchange directly today, but the
+    /// shared [`SubmitRouteError::NavUpstreamFault`] surface means the
+    /// `From<SubmitRouteError>` conversion must remain total.
+    NavUpstreamFault {
+        status: u16,
+        fault_code: Option<String>,
+        fault_message: Option<String>,
+        body_preview: String,
+    },
     Other(anyhow::Error),
 }
 
@@ -3312,6 +3398,17 @@ impl From<SubmitRouteError> for ModificationRouteError {
                 message,
             },
             SubmitRouteError::NotFound(m) => ModificationRouteError::NotFound(m),
+            SubmitRouteError::NavUpstreamFault {
+                status,
+                fault_code,
+                fault_message,
+                body_preview,
+            } => ModificationRouteError::NavUpstreamFault {
+                status,
+                fault_code,
+                fault_message,
+                body_preview,
+            },
             SubmitRouteError::Other(inner) => ModificationRouteError::Other(inner),
         }
     }
@@ -3378,6 +3475,21 @@ async fn handle_modification_invoice(
         Err(ModificationRouteError::BadRequest(message)) => {
             (StatusCode::BAD_REQUEST, Json(error_body(message))).into_response()
         }
+        // PR-58 / session-78 — see notes on the storno handler. Not
+        // reachable from today's modification path but kept symmetric
+        // through the typed surface.
+        Err(ModificationRouteError::NavUpstreamFault {
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        }) => nav_upstream_fault_response(
+            "modification_invoice_request",
+            status,
+            fault_code,
+            fault_message,
+            body_preview,
+        ),
         Err(ModificationRouteError::Other(e)) => {
             internal_error("modification_invoice_request", e)
         }
@@ -3593,6 +3705,23 @@ pub fn get_issuance_input(
         Err(SubmitRouteError::Other(e)) => return Err(e),
         Err(SubmitRouteError::PreconditionMismatch { message, .. }) => {
             return Err(anyhow!(message))
+        }
+        // PR-58 / session-78 — derive_state_for does not call NAV, so
+        // this variant is structurally unreachable here. The arm
+        // exists so the match stays exhaustive when the typed surface
+        // grows; the anyhow-wrap is the loud-fail per CLAUDE.md rule 12.
+        Err(SubmitRouteError::NavUpstreamFault {
+            status,
+            fault_code,
+            fault_message,
+            ..
+        }) => {
+            return Err(anyhow!(
+                "derive_state_for surfaced an unexpected NavUpstreamFault \
+                 (status={status}, fault_code={fault_code:?}, \
+                 fault_message={fault_message:?}) — this code path does not \
+                 call NAV; investigate"
+            ));
         }
     };
     let xml_path = match derived.nav_xml_path {
@@ -4089,6 +4218,49 @@ fn internal_error(context_label: &'static str, e: anyhow::Error) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(error_body("internal error".to_string())),
+    )
+        .into_response()
+}
+
+/// PR-58 / session-78 — typed JSON body for NAV upstream-fault rejection
+/// (HTTP-layer non-2xx returned by NAV's `tokenExchange`). Mapped to
+/// HTTP 502 (Bad Gateway): the local server processed the request fine,
+/// but the upstream NAV API rejected it. The four fields surface the
+/// operator-actionable diagnostic verbatim; the SPA's invoice-detail
+/// modal renders `fault_code` + `fault_message` prominently.
+#[derive(Serialize)]
+struct NavUpstreamFaultBody {
+    error: &'static str,
+    status: u16,
+    fault_code: Option<String>,
+    fault_message: Option<String>,
+    raw_body_preview: String,
+}
+
+fn nav_upstream_fault_response(
+    context_label: &'static str,
+    status: u16,
+    fault_code: Option<String>,
+    fault_message: Option<String>,
+    body_preview: String,
+) -> Response {
+    tracing::error!(
+        nav_status = status,
+        fault_code = ?fault_code,
+        fault_message = ?fault_message,
+        body_preview = %body_preview,
+        "NAV upstream fault in {}",
+        context_label,
+    );
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(NavUpstreamFaultBody {
+            error: "nav_upstream_fault",
+            status,
+            fault_code,
+            fault_message,
+            raw_body_preview: body_preview,
+        }),
     )
         .into_response()
 }
