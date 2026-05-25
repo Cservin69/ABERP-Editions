@@ -202,8 +202,17 @@ fn read_back(service: &str, item: &'static str) -> Option<String> {
 
 /// PR-46α / session-62 — happy path: POSTing the four credential
 /// inputs writes all four keychain entries AND flips the boot state
-/// from NeedsSetup to Ready with operator_login extracted from the
-/// just-written login entry.
+/// out of NeedsSetup with operator_login extracted from the just-
+/// written login entry.
+///
+/// PR-51 / session-71 — the post-NAV-creds boot state is now either
+/// `Ready` (seller.toml already populated) or `NeedsSellerConfig`
+/// (seller.toml missing or identity-incomplete). The test uses a
+/// unique-per-run tenant id, so `~/.aberp/<tenant>/seller.toml`
+/// definitely does not exist — the transition lands on
+/// NeedsSellerConfig and the operator_login is carried forward on
+/// that variant so the next wizard step can flip to Ready without
+/// re-reading the keychain.
 #[test]
 fn setup_route_happy_path_writes_keychain_and_flips_boot_state() {
     init_mock_keyring();
@@ -211,7 +220,7 @@ fn setup_route_happy_path_writes_keychain_and_flips_boot_state() {
     let state = build_state(ServeBootState::NeedsSetup, &tenant);
 
     let inputs = fixture_inputs();
-    serve::setup_nav_credentials_request(&state, &inputs)
+    let next_token = serve::setup_nav_credentials_request(&state, &inputs)
         .expect("happy path must succeed");
 
     // Per-field keychain verification: all four entries land verbatim.
@@ -233,14 +242,17 @@ fn setup_route_happy_path_writes_keychain_and_flips_boot_state() {
         Some(inputs.xml_change_key.as_str()),
     );
 
-    // Boot state flipped to Ready with the login extracted from the
-    // just-written keychain entry.
+    // PR-51 / session-71 — unique tenant means seller.toml is absent;
+    // post-transition state is NeedsSellerConfig, operator_login is
+    // carried forward on the variant. The returned token mirrors the
+    // boot-state.
+    assert_eq!(next_token, "needs-seller-config");
     let guard = state.boot_state.read().unwrap();
     match &*guard {
-        ServeBootState::Ready { operator_login } => {
+        ServeBootState::NeedsSellerConfig { operator_login } => {
             assert_eq!(operator_login, &inputs.technical_user_login);
         }
-        ServeBootState::NeedsSetup => panic!("boot state should have flipped to Ready"),
+        other => panic!("expected NeedsSellerConfig, got {other:?}"),
     }
 }
 
@@ -272,7 +284,8 @@ fn setup_route_rejects_empty_login_without_partial_write() {
     assert_eq!(read_back(&service, ITEM_SIGN_KEY), None);
     assert_eq!(read_back(&service, ITEM_CHANGE_KEY), None);
 
-    // Boot state is still NeedsSetup.
+    // Boot state is still NeedsSetup — validation failure must not
+    // advance the wizard chain.
     let guard = state.boot_state.read().unwrap();
     assert!(matches!(*guard, ServeBootState::NeedsSetup));
 }
@@ -322,9 +335,18 @@ fn poll_ack_request_refuses_when_needs_setup() {
 /// backend's println includes on the handshake line; the Tauri shell's
 /// handshake parser keys on it. Pin one per variant so a future
 /// rename (e.g. "ready" → "running") surfaces here loud.
+///
+/// PR-51 / session-71 — extended for the third boot-state variant.
 #[test]
 fn boot_state_token_matches_handshake_wire_form() {
     assert_eq!(ServeBootState::NeedsSetup.state_token(), "needs-setup");
+    assert_eq!(
+        ServeBootState::NeedsSellerConfig {
+            operator_login: "x".to_string()
+        }
+        .state_token(),
+        "needs-seller-config"
+    );
     assert_eq!(
         ServeBootState::Ready {
             operator_login: "x".to_string()

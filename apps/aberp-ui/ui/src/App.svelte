@@ -44,6 +44,7 @@
     type BootViewMode,
   } from "./lib/boot-status";
   import InvoiceList from "./routes/InvoiceList.svelte";
+  import SellerConfigWizard from "./routes/SellerConfigWizard.svelte";
   import SetupWizard from "./routes/SetupWizard.svelte";
 
   // Boot-lifecycle gate state. We default to a `starting` snapshot
@@ -187,6 +188,11 @@
         <span class="dot" aria-hidden="true"></span>
         <span class="label">first-run setup</span>
       </div>
+    {:else if viewMode === "seller-config"}
+      <div class="status" data-state="pending">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="label">seller setup</span>
+      </div>
     {:else}
       <div class="status" data-state="error">
         <span class="dot" aria-hidden="true"></span>
@@ -198,6 +204,8 @@
   <main>
     {#if viewMode === "setup"}
       <SetupWizard />
+    {:else if viewMode === "seller-config"}
+      <SellerConfigWizard />
     {:else if viewMode === "loading"}
       <section class="boot-pane boot-pane--loading" role="status" aria-live="polite">
         <div class="boot-pane__spinner" aria-hidden="true"></div>

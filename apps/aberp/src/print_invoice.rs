@@ -566,8 +566,24 @@ fn handle_text(
             "paymentMethod" => {
                 out.payment_method = value.to_string();
             }
-            "supplierTaxNumber" => {
+            // PR-50 / session-70 — `<supplierTaxNumber>` is structured
+            // (`<taxpayerId>` + `<vatCode>` + `<countyCode>`) per NAV
+            // v3.0. Assemble the canonical `xxxxxxxx-y-zz` form for the
+            // printed-invoice header by appending each child as it
+            // streams in (XML guarantees the ordered children per the
+            // emitter's writer order). The flat-string fallback at
+            // path `["supplierInfo", "supplierTaxNumber"]` is gone —
+            // structured-only is the wire shape post-PR-50.
+            "taxpayerId" if ends_with(path, &["supplierTaxNumber", "taxpayerId"]) => {
                 out.supplier_tax_number = value.to_string();
+            }
+            "vatCode" if ends_with(path, &["supplierTaxNumber", "vatCode"]) => {
+                out.supplier_tax_number.push('-');
+                out.supplier_tax_number.push_str(value);
+            }
+            "countyCode" if ends_with(path, &["supplierTaxNumber", "countyCode"]) => {
+                out.supplier_tax_number.push('-');
+                out.supplier_tax_number.push_str(value);
             }
             "supplierName" => {
                 out.supplier_name = value.to_string();

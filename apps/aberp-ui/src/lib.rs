@@ -84,18 +84,27 @@ pub const RECENT_LOGS_CAP: usize = 20;
 /// PR-45a / session-61 — three-state boot lifecycle exposed to the
 /// SPA via `get_boot_status`. PR-46α / session-62 added the fourth
 /// variant `NeedsSetup` for the first-run NAV-credentials wizard.
+/// PR-51 / session-71 added the fifth variant `NeedsSellerConfig`
+/// for the seller-identity wizard (NAV creds present, but
+/// `~/.aberp/<tenant>/seller.toml` missing or identity-incomplete).
 /// The variants are JSON-serialised as lower-case strings
-/// (`"starting"`, `"needs-setup"`, `"ready"`, `"failed"`) in the
-/// `commands::get_boot_status` handler; the SPA's typed mirror lives
-/// in `ui/src/lib/api.ts`.
+/// (`"starting"`, `"needs-setup"`, `"needs-seller-config"`,
+/// `"ready"`, `"failed"`) in the `commands::get_boot_status` handler;
+/// the SPA's typed mirror lives in `ui/src/lib/api.ts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootStatus {
     Starting,
     /// PR-46α / session-62 — backend handshake parsed with
     /// `state=needs-setup`; the SPA renders the first-run wizard
-    /// against the loopback. The transition to `Ready` happens after
-    /// the wizard's POST to `/api/setup-nav-credentials` succeeds.
+    /// against the loopback. The transition to `Ready` (or
+    /// `NeedsSellerConfig` per PR-51) happens after the wizard's
+    /// POST to `/api/setup-nav-credentials` succeeds.
     NeedsSetup,
+    /// PR-51 / session-71 — backend handshake parsed with
+    /// `state=needs-seller-config`; the SPA renders the
+    /// `SellerConfigWizard`. Transition to `Ready` after the
+    /// wizard's POST to `/api/setup-seller-info` succeeds.
+    NeedsSellerConfig,
     Ready,
     Failed,
 }
@@ -205,6 +214,7 @@ pub fn run() {
             commands::get_boot_status,
             commands::retry_boot,
             commands::setup_nav_credentials,
+            commands::setup_seller_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -299,6 +309,7 @@ pub async fn boot_backend(handle: &tauri::AppHandle) -> Result<()> {
     let new_status = match handshake_state {
         handshake::ServeBootState::Ready => BootStatus::Ready,
         handshake::ServeBootState::NeedsSetup => BootStatus::NeedsSetup,
+        handshake::ServeBootState::NeedsSellerConfig => BootStatus::NeedsSellerConfig,
     };
     *state.boot_state.lock().expect("boot_state mutex poisoned") = BootState {
         status: new_status.clone(),
@@ -308,20 +319,44 @@ pub async fn boot_backend(handle: &tauri::AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// PR-46α / session-62 — flip the Tauri-side boot state to `Ready`
-/// after the SPA's setup wizard succeeds. Called from the
-/// `setup_nav_credentials` Tauri command on a 200 response from the
-/// backend's `POST /api/setup-nav-credentials`. The SPA's
-/// `getBootStatus` poll will pick up the new state on the next
-/// invocation and re-render against `Ready`.
-pub fn mark_ready_after_setup(handle: &tauri::AppHandle) {
+/// PR-46α / session-62 — flip the Tauri-side boot state mirror after
+/// a setup-wizard POST succeeds. Called from the
+/// `setup_nav_credentials` and `setup_seller_info` Tauri commands.
+///
+/// PR-51 / session-71 — the post-NAV-creds state is no longer always
+/// Ready (the seller-config wizard may still be pending), so this
+/// helper now takes the backend-reported `next_state` token verbatim
+/// and flips to the matching variant. Recognised tokens:
+///
+///   - `"ready"` → `BootStatus::Ready`
+///   - `"needs-seller-config"` → `BootStatus::NeedsSellerConfig`
+///
+/// An unknown token is treated as a no-op + WARN log; the SPA's
+/// next `getBootStatus` poll picks up the real state from the
+/// backend within ~300ms via the existing poll cadence (so a
+/// missing-mirror-update is a small visual lag, not a stuck wizard).
+pub fn mark_post_setup_state(handle: &tauri::AppHandle, next_state: &str) {
+    let new_status = match next_state {
+        "ready" => BootStatus::Ready,
+        "needs-seller-config" => BootStatus::NeedsSellerConfig,
+        other => {
+            tracing::warn!(
+                state = other,
+                "unknown post-setup state token; deferring to backend boot-status poll"
+            );
+            return;
+        }
+    };
     let state = handle.state::<AppState>();
     let mut guard = state.boot_state.lock().expect("boot_state mutex poisoned");
     *guard = BootState {
-        status: BootStatus::Ready,
+        status: new_status.clone(),
         error: None,
     };
-    tracing::info!("Tauri-side boot state flipped to Ready after setup-wizard success");
+    tracing::info!(
+        next_state = ?new_status,
+        "Tauri-side boot state mirror flipped after setup-wizard success"
+    );
 }
 
 /// Look up the session token in the OS keychain — mirrors

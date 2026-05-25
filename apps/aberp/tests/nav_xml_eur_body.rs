@@ -54,7 +54,7 @@ use time::OffsetDateTime;
 fn minimal_parties() -> NavParties {
     NavParties {
         supplier: SupplierInfo {
-            tax_number: "12345678".to_string(),
+            tax_number: "12345678-1-42".to_string(),
             name: "ABERP Supplier Kft.".to_string(),
             address_country_code: "HU".to_string(),
             address_postal_code: "1011".to_string(),
@@ -442,5 +442,79 @@ fn huf_with_rate_metadata_is_accepted_and_ignored() {
     assert!(
         !body.contains("999.999999"),
         "HUF + rate_metadata: stamped rate must NOT appear on the wire"
+    );
+}
+
+/// PR-50 / session-70 — pin the structured `<supplierTaxNumber>`
+/// emit. NAV `Online Számla` v3.0 requires three sub-elements
+/// (`<taxpayerId>` + `<vatCode>` + `<countyCode>`) in that order;
+/// the pre-PR-50 renderer emitted a flat dashed string, which NAV's
+/// submit endpoint rejected. This pin catches a regression that
+/// reverts the fix.
+#[test]
+fn supplier_tax_number_emits_three_structured_subchildren() {
+    let invoice = build_huf_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("HUF render");
+    let body = String::from_utf8(xml).expect("UTF-8 body");
+
+    // The structured block — byte-verbatim, indented per the
+    // `Writer::new_with_indent(b' ', 2)` posture in `nav_xml.rs`.
+    // A regression that re-introduced the flat string would fail
+    // every contains() below.
+    assert!(
+        body.contains("<taxpayerId>12345678</taxpayerId>"),
+        "supplier <taxpayerId> must carry the 8-digit base, got body:\n{body}"
+    );
+    assert!(
+        body.contains("<vatCode>1</vatCode>"),
+        "supplier <vatCode> must carry the 1-digit VAT code, got body:\n{body}"
+    );
+    assert!(
+        body.contains("<countyCode>42</countyCode>"),
+        "supplier <countyCode> must carry the 2-digit county code, got body:\n{body}"
+    );
+    // And the flat shape must NOT appear — a regression would make
+    // both the flat and structured forms present (one would lose
+    // the brackets); the negative pin catches that.
+    assert!(
+        !body.contains("<supplierTaxNumber>12345678-1-42</supplierTaxNumber>"),
+        "supplier tax number must NOT serialize as a flat dashed string — that's the pre-PR-50 bug. Body:\n{body}"
+    );
+
+    // Defence in depth — the XSD validator that runs at issuance
+    // time MUST accept the structured form. A regression that
+    // drifted the renderer past the validator's reading would
+    // surface here before the live test on Ervin's tree.
+    aberp_nav_xsd_validator::validate_invoice_data(body.as_bytes())
+        .expect("structured <supplierTaxNumber> must pass the XSD validator");
+}
+
+/// PR-50 / session-70 — renderer must loud-fail when handed a
+/// `SupplierInfo` whose `tax_number` does not match Hungarian
+/// `xxxxxxxx-y-zz` shape. Defence in depth for any CLI / library
+/// caller that bypasses the route-layer validate. Mirror pin for
+/// the unit test inside `nav_xml::tests` but exercised at the
+/// outer `render_invoice_data` surface.
+#[test]
+fn render_invoice_data_rejects_malformed_supplier_tax_number() {
+    let invoice = build_huf_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let mut parties = minimal_parties();
+    parties.supplier.tax_number = "24904362".to_string(); // ← bare base; pre-PR-50 leak
+
+    let err = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect_err("renderer must loud-fail on malformed supplier tax");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("supplier tax number"),
+        "loud-fail must name the field: {msg}"
+    );
+    assert!(
+        msg.contains("xxxxxxxx-y-zz") || msg.contains("dash-separated"),
+        "loud-fail must surface the expected shape: {msg}"
     );
 }

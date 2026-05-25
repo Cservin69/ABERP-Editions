@@ -44,6 +44,7 @@ pub mod request_technical_annulment;
 pub mod retry_submission;
 pub mod serve;
 pub mod setup_nav_credentials;
+pub mod setup_seller_info;
 pub mod submission_queue;
 pub mod submit_annulment;
 pub mod submit_invoice;

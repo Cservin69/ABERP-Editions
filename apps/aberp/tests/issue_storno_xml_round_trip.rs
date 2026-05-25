@@ -54,7 +54,7 @@ fn build_minimal_storno_invoice() -> ReadyInvoice {
 fn minimal_parties() -> NavParties {
     NavParties {
         supplier: SupplierInfo {
-            tax_number: "12345678".to_string(),
+            tax_number: "12345678-1-42".to_string(),
             name: "ABERP Supplier Kft.".to_string(),
             address_country_code: "HU".to_string(),
             address_postal_code: "1011".to_string(),

@@ -16,10 +16,17 @@ import type { BootStatus, BootStatusResponse } from "./api";
 /** What the SPA renders for a given boot lifecycle state.
  *
  * PR-46α / session-62 added the `setup` view-mode for the first-run
- * NAV-credentials wizard. The mapping is total over `BootStatus`;
- * no default arm so a future variant added without a matching map
- * row fails `npm run check`. */
-export type BootViewMode = "loading" | "setup" | "ready" | "error";
+ * NAV-credentials wizard. PR-51 / session-71 added the
+ * `seller-config` view-mode for the seller-identity wizard (chained
+ * after NAV creds when `~/.aberp/<tenant>/seller.toml` is missing).
+ * The mapping is total over `BootStatus`; no default arm so a future
+ * variant added without a matching map row fails `npm run check`. */
+export type BootViewMode =
+  | "loading"
+  | "setup"
+  | "seller-config"
+  | "ready"
+  | "error";
 
 /** Map a boot-status string to a view mode. Total over the typed
  * union; no default arm so a future variant added to `BootStatus`
@@ -30,6 +37,8 @@ export function bootViewMode(status: BootStatus): BootViewMode {
       return "loading";
     case "needs-setup":
       return "setup";
+    case "needs-seller-config":
+      return "seller-config";
     case "ready":
       return "ready";
     case "failed":

@@ -63,6 +63,180 @@ pub struct SupplierInfo {
     pub address_street: String,
 }
 
+/// PR-50 / session-70 — decomposed Hungarian tax number per NAV
+/// `Online Számla` v3.0 schema. The canonical wire form is
+/// `xxxxxxxx-y-zz`: 8-digit base taxpayer id, 1-digit VAT code,
+/// 2-digit county code. NAV's `<supplierTaxNumber>` is NOT a flat
+/// string — it carries three required sub-elements (`<taxpayerId>`
+/// + `<vatCode>` + `<countyCode>`), and the submit endpoint loud-
+/// fails any body that emits the flat shape.
+///
+/// Held as raw strings (not `u32` + `u8` + `u8`) so the renderer
+/// preserves byte-verbatim what the operator typed — leading zeros
+/// in `taxpayerId` (none currently allocated by NAV, but the field is
+/// 8 digits and a future allocation could carry a leading zero) and
+/// `countyCode` survive the round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HungarianTaxNumber {
+    /// 8 ASCII digits — the base taxpayer id surfaced inside
+    /// `<taxpayerId>`. Validated for shape only; NAV owns the
+    /// allocation registry.
+    pub taxpayer_id: String,
+    /// 1 ASCII digit — the VAT code surfaced inside `<vatCode>`.
+    /// `1` = non-VAT-group taxpayer; `2` = VAT-group member;
+    /// `3` = group representative; `4` = group internal. The
+    /// renderer does not interpret the value, only its shape.
+    pub vat_code: String,
+    /// 2 ASCII digits — the county code surfaced inside
+    /// `<countyCode>`. NAV publishes the registry separately;
+    /// shape-validated here, semantically validated server-side at
+    /// submit time.
+    pub county_code: String,
+}
+
+/// PR-50 / session-70 — typed loud-fail error for supplier-config
+/// validation. Surfaces at TWO points:
+///
+/// 1. `issue_from_parsed`'s pre-render guard — issuance refuses to
+///    burn a sequence number when supplier data is malformed, so
+///    the audit ledger never carries a half-issued invoice that
+///    couldn't be submitted (CLAUDE.md rule 12, fail loud).
+/// 2. `serve::handle_issue_invoice`'s route-layer validation — the
+///    SPA receives a typed 400 body the operator can act on instead
+///    of a 500 `internal error` that names nothing.
+///
+/// The variants pin distinct failure modes so the route handler can
+/// craft a per-variant operator-actionable message; the SPA renders
+/// the discriminant verbatim (the `Display` impl IS the
+/// operator-facing message).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupplierConfigError {
+    /// `tax_number` field is empty after trim. The form field /
+    /// `supplier.taxNumber` JSON property is required.
+    MissingTaxNumber,
+    /// `tax_number` failed `parse_hungarian_tax_number` shape
+    /// validation. Carries the raw input for the error message so
+    /// the operator sees exactly what was rejected.
+    MalformedTaxNumber {
+        /// The raw value the operator supplied — surfaced verbatim
+        /// in the loud-fail message so the operator can spot the
+        /// typo (missing dash, extra digit, etc.).
+        input: String,
+        /// One-line "what's wrong" diagnostic — appended to the
+        /// `MalformedTaxNumber` Display surface so the message
+        /// names the specific shape miss (length / non-digit
+        /// character / dash placement).
+        reason: &'static str,
+    },
+}
+
+impl std::fmt::Display for SupplierConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SupplierConfigError::MissingTaxNumber => {
+                write!(
+                    f,
+                    "supplier tax number (ADÓSZÁM) is required \
+                     (expected Hungarian shape `xxxxxxxx-y-zz`, e.g. `24904362-2-41`)"
+                )
+            }
+            SupplierConfigError::MalformedTaxNumber { input, reason } => {
+                write!(
+                    f,
+                    "supplier tax number `{input}` is not a valid Hungarian \
+                     ADÓSZÁM ({reason}; expected `xxxxxxxx-y-zz`, \
+                     e.g. `24904362-2-41`)"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SupplierConfigError {}
+
+/// PR-50 / session-70 — decompose a Hungarian ADÓSZÁM string in the
+/// canonical `xxxxxxxx-y-zz` form into its three NAV-required sub-
+/// elements. Validates:
+///
+///   - Three dash-separated segments (8 + 1 + 2 chars).
+///   - Each segment is ASCII-digits-only.
+///
+/// Does NOT validate the semantic registry (taxpayer-id allocation,
+/// county-code registry, vat-code value-range) — those live with
+/// NAV's submit endpoint, which loud-fails server-side on a value
+/// that's well-shaped but unallocated. Shape-validation here catches
+/// the common operator-form-typo failure mode (missing dash, extra
+/// digit) BEFORE the audit ledger burns a sequence number.
+pub fn parse_hungarian_tax_number(input: &str) -> Result<HungarianTaxNumber, SupplierConfigError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(SupplierConfigError::MissingTaxNumber);
+    }
+    let segments: Vec<&str> = trimmed.split('-').collect();
+    if segments.len() != 3 {
+        return Err(SupplierConfigError::MalformedTaxNumber {
+            input: trimmed.to_string(),
+            reason: "expected three dash-separated segments",
+        });
+    }
+    let (tp, vc, cc) = (segments[0], segments[1], segments[2]);
+    if tp.len() != 8 {
+        return Err(SupplierConfigError::MalformedTaxNumber {
+            input: trimmed.to_string(),
+            reason: "taxpayerId segment must be exactly 8 digits",
+        });
+    }
+    if vc.len() != 1 {
+        return Err(SupplierConfigError::MalformedTaxNumber {
+            input: trimmed.to_string(),
+            reason: "vatCode segment must be exactly 1 digit",
+        });
+    }
+    if cc.len() != 2 {
+        return Err(SupplierConfigError::MalformedTaxNumber {
+            input: trimmed.to_string(),
+            reason: "countyCode segment must be exactly 2 digits",
+        });
+    }
+    for (seg, name) in [(tp, "taxpayerId"), (vc, "vatCode"), (cc, "countyCode")] {
+        if !seg.chars().all(|c| c.is_ascii_digit()) {
+            // Static reason picks the segment name without per-input alloc.
+            let reason: &'static str = match name {
+                "taxpayerId" => "taxpayerId segment must be ASCII digits only",
+                "vatCode" => "vatCode segment must be an ASCII digit",
+                _ => "countyCode segment must be ASCII digits only",
+            };
+            return Err(SupplierConfigError::MalformedTaxNumber {
+                input: trimmed.to_string(),
+                reason,
+            });
+        }
+    }
+    Ok(HungarianTaxNumber {
+        taxpayer_id: tp.to_string(),
+        vat_code: vc.to_string(),
+        county_code: cc.to_string(),
+    })
+}
+
+/// PR-50 / session-70 — supplier-info shape guard, called from
+/// `issue_from_parsed` BEFORE any DB write and from
+/// `serve::handle_issue_invoice` BEFORE dispatching to the issuance
+/// pipeline. Inverts the prior "issuance succeeds, submit hours
+/// later discovers garbage XML" failure mode (the bug Ervin hit on
+/// 2026-05-25, INV-default/00001).
+///
+/// Today the surface is the tax-number shape — the supplier name +
+/// address fields already get empty-string checks at the route
+/// layer (`serve::validate_issue_request`). When PR-51 (the
+/// SetupWizard's seller-config persistence) lands, this guard
+/// extends to "seller.toml exists at `~/.aberp/<tenant>/seller.toml`"
+/// without callers changing.
+pub fn validate_supplier_info(supplier: &SupplierInfo) -> Result<(), SupplierConfigError> {
+    let _ = parse_hungarian_tax_number(&supplier.tax_number)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct CustomerInfo {
     pub tax_number: String,
@@ -619,8 +793,22 @@ fn write_modification_reference(
 // ── Section writers ───────────────────────────────────────────────────
 
 fn write_supplier(w: &mut Writer<&mut Vec<u8>>, s: &SupplierInfo) -> Result<()> {
+    // PR-50 / session-70 — NAV `Online Számla` v3.0 schema requires
+    // `<supplierTaxNumber>` to carry three structured sub-elements
+    // (`<taxpayerId>` + `<vatCode>` + `<countyCode>`), NOT a flat
+    // dashed string. The flat shape ships clean past `nav-xsd-
+    // validator`'s pre-2026-05-25 reading of the schema but loud-
+    // fails server-side when NAV's submit endpoint rejects the body
+    // with `<supplierTaxNumber> missing <taxpayerId>`. Decompose at
+    // render time so issuance + submit agree on the wire shape.
+    let parsed = parse_hungarian_tax_number(&s.tax_number)
+        .map_err(|e| anyhow!("supplier tax number invalid at NAV-XML render time: {e}"))?;
     w.write_event(Event::Start(BytesStart::new("supplierInfo")))?;
-    text_element(w, "supplierTaxNumber", &s.tax_number)?;
+    w.write_event(Event::Start(BytesStart::new("supplierTaxNumber")))?;
+    text_element(w, "taxpayerId", &parsed.taxpayer_id)?;
+    text_element(w, "vatCode", &parsed.vat_code)?;
+    text_element(w, "countyCode", &parsed.county_code)?;
+    w.write_event(Event::End(BytesEnd::new("supplierTaxNumber")))?;
     text_element(w, "supplierName", &s.name)?;
     write_address(w, "supplierAddress", s)?;
     w.write_event(Event::End(BytesEnd::new("supplierInfo")))?;
@@ -949,4 +1137,110 @@ pub fn write_to_path(path: &std::path::Path, xml: &[u8]) -> Result<()> {
     file.write_all(xml)
         .with_context(|| format!("write XML to {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hungarian_tax_number_decomposes_canonical_form() {
+        let parsed = parse_hungarian_tax_number("24904362-2-41").expect("canonical form");
+        assert_eq!(parsed.taxpayer_id, "24904362");
+        assert_eq!(parsed.vat_code, "2");
+        assert_eq!(parsed.county_code, "41");
+    }
+
+    #[test]
+    fn parse_hungarian_tax_number_trims_surrounding_whitespace() {
+        let parsed = parse_hungarian_tax_number("  12345678-1-42  ").expect("trims");
+        assert_eq!(parsed.taxpayer_id, "12345678");
+        assert_eq!(parsed.vat_code, "1");
+        assert_eq!(parsed.county_code, "42");
+    }
+
+    #[test]
+    fn parse_hungarian_tax_number_rejects_empty() {
+        let err = parse_hungarian_tax_number("").unwrap_err();
+        assert!(matches!(err, SupplierConfigError::MissingTaxNumber));
+    }
+
+    #[test]
+    fn parse_hungarian_tax_number_rejects_bare_eight_digits() {
+        // Pre-PR-50 fixtures used `12345678` (bare base) and rode the
+        // flat-string renderer; the new shape demands `xxxxxxxx-y-zz`
+        // so the bare base is rejected at the boundary.
+        let err = parse_hungarian_tax_number("12345678").unwrap_err();
+        assert!(matches!(err, SupplierConfigError::MalformedTaxNumber { .. }));
+    }
+
+    #[test]
+    fn parse_hungarian_tax_number_rejects_non_digit_segments() {
+        let err = parse_hungarian_tax_number("abcd1234-2-41").unwrap_err();
+        match err {
+            SupplierConfigError::MalformedTaxNumber { reason, .. } => {
+                assert!(
+                    reason.contains("taxpayerId"),
+                    "reason must name the bad segment: {reason}"
+                );
+            }
+            other => panic!("expected MalformedTaxNumber, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hungarian_tax_number_rejects_wrong_segment_lengths() {
+        // 7 + 1 + 2 — taxpayer too short.
+        let err = parse_hungarian_tax_number("1234567-1-42").unwrap_err();
+        assert!(matches!(err, SupplierConfigError::MalformedTaxNumber { .. }));
+        // 8 + 2 + 2 — vat-code too long.
+        let err = parse_hungarian_tax_number("12345678-12-42").unwrap_err();
+        assert!(matches!(err, SupplierConfigError::MalformedTaxNumber { .. }));
+        // 8 + 1 + 3 — county-code too long.
+        let err = parse_hungarian_tax_number("12345678-1-421").unwrap_err();
+        assert!(matches!(err, SupplierConfigError::MalformedTaxNumber { .. }));
+    }
+
+    #[test]
+    fn validate_supplier_info_accepts_valid_dashed_form() {
+        let s = SupplierInfo {
+            tax_number: "24904362-2-41".to_string(),
+            name: "Áben Consulting KFT.".to_string(),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatérő köz 6".to_string(),
+        };
+        assert!(validate_supplier_info(&s).is_ok());
+    }
+
+    #[test]
+    fn validate_supplier_info_rejects_empty_tax_number() {
+        let s = SupplierInfo {
+            tax_number: String::new(),
+            name: "X".to_string(),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatérő köz 6".to_string(),
+        };
+        assert!(matches!(
+            validate_supplier_info(&s),
+            Err(SupplierConfigError::MissingTaxNumber)
+        ));
+    }
+
+    #[test]
+    fn supplier_config_error_display_names_the_input() {
+        let err = SupplierConfigError::MalformedTaxNumber {
+            input: "24904362".to_string(),
+            reason: "expected three dash-separated segments",
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("24904362"), "must echo the bad input: {msg}");
+        assert!(
+            msg.contains("xxxxxxxx-y-zz"),
+            "must show the expected shape: {msg}"
+        );
+    }
 }

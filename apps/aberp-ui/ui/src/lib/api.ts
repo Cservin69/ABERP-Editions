@@ -510,7 +510,12 @@ export async function getIssuanceInput(
  * `aberp-ui::commands::get_boot_status` on the Rust side; the SPA
  * reads it strictly via this typed union so a backend drift surfaces
  * at `npm run check`. */
-export type BootStatus = "starting" | "needs-setup" | "ready" | "failed";
+export type BootStatus =
+  | "starting"
+  | "needs-setup"
+  | "needs-seller-config"
+  | "ready"
+  | "failed";
 
 /** PR-45a / session-61 — boot lifecycle snapshot, mirrors the Tauri
  * shell's `get_boot_status` JSON body. `error` is `null` unless
@@ -561,13 +566,70 @@ export interface SetupNavCredentialsResponse {
  * backend's `/api/setup-nav-credentials` route via the matching
  * Tauri command. On success the backend has written all four
  * credential entries to the OS keychain AND flipped its boot state
- * to Ready; the Tauri shell mirrors that transition (the SPA's next
- * `getBootStatus` poll returns `"ready"` and the wizard pane swaps
- * out for the normal app). Errors propagate as the rejected promise
+ * to Ready (or to NeedsSellerConfig if seller.toml is still missing
+ * — PR-51 / session-71 chained-wizard posture); the Tauri shell
+ * mirrors that transition. Errors propagate as the rejected promise
  * (the typed 400 validation body surfaces verbatim so the SPA renders
  * the operator-actionable inline message per A157). */
 export async function setupNavCredentials(
   body: SetupNavCredentialsRequest,
 ): Promise<SetupNavCredentialsResponse> {
   return invoke<SetupNavCredentialsResponse>("setup_nav_credentials", { body });
+}
+
+/** PR-51 / session-71 — wire request body for the seller-config
+ * wizard. Mirror of the Rust-side `serve::SetupSellerInfoRequest`.
+ * Address + optional bank as flat sub-objects so the SPA's form
+ * state maps 1:1 to the wire shape with no per-field renaming. */
+export interface SetupSellerInfoRequest {
+  legal_name: string;
+  tax_number: string;
+  eu_vat_number: string | null;
+  address: {
+    country_code: string;
+    postal_code: string;
+    city: string;
+    street: string;
+  };
+  bank: {
+    account_number: string | null;
+    iban: string | null;
+    name: string | null;
+    swift_bic: string | null;
+  };
+}
+
+/** PR-51 / session-71 — wire response body for the seller-info setup
+ * route on the happy path. Backend returns `{ "state": "ready" }`;
+ * the Tauri shell reads it to flip its boot-state mirror. */
+export interface SetupSellerInfoResponse {
+  state: "ready";
+}
+
+/** PR-51 / session-71 — per-field error from the typed 400 body. The
+ * `field` matches the wizard composer's camelCase form-field name so
+ * the SPA can highlight the offending input without a lookup table. */
+export interface SetupSellerInfoFieldError {
+  field: string;
+  message: string;
+}
+
+/** PR-51 / session-71 — typed 400 body. The SPA's wizard parses this
+ * out of the rejected-promise message and renders a per-field inline
+ * error for each entry. */
+export interface SetupSellerInfoErrorBody {
+  error: "validation_failed";
+  fields: SetupSellerInfoFieldError[];
+}
+
+/** PR-51 / session-71 — POST the SellerConfigWizard form to the
+ * backend's `/api/setup-seller-info` route via the matching Tauri
+ * command. On success the backend has written
+ * `~/.aberp/<tenant>/seller.toml` and flipped its boot state to
+ * Ready. Errors (typed 400 validation, 500 atomic-write failure)
+ * propagate as the rejected promise. */
+export async function setupSellerInfo(
+  body: SetupSellerInfoRequest,
+): Promise<SetupSellerInfoResponse> {
+  return invoke<SetupSellerInfoResponse>("setup_seller_info", { body });
 }

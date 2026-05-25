@@ -53,11 +53,14 @@ use anyhow::{anyhow, Result};
 /// PR-46α / session-62 — boot lifecycle discriminator parsed off the
 /// handshake line's optional `state=<token>` suffix. The Tauri shell
 /// reads this to route the SPA's first paint between the normal app
-/// (`Ready`) and the first-run setup wizard (`NeedsSetup`).
+/// (`Ready`), the first-run NAV-credentials wizard (`NeedsSetup`),
+/// and the seller-identity wizard (`NeedsSellerConfig`, added in
+/// PR-51 / session-71).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeBootState {
     Ready,
     NeedsSetup,
+    NeedsSellerConfig,
 }
 
 /// The structured outcome of parsing one handshake line.
@@ -172,8 +175,9 @@ fn parse_state_value(value: &str) -> Result<ServeBootState> {
     match value {
         "ready" => Ok(ServeBootState::Ready),
         "needs-setup" => Ok(ServeBootState::NeedsSetup),
+        "needs-seller-config" => Ok(ServeBootState::NeedsSellerConfig),
         other => Err(anyhow!(
-            "handshake state value `{other}` is not one of [ready, needs-setup]"
+            "handshake state value `{other}` is not one of [ready, needs-setup, needs-seller-config]"
         )),
     }
 }
@@ -261,6 +265,18 @@ mod tests {
         let line = format!("READY 127.0.0.1:54321 sha256:{fp} state=needs-setup");
         let parsed = parse(&line).expect("state=needs-setup line must parse");
         assert_eq!(parsed.state, ServeBootState::NeedsSetup);
+        assert_eq!(parsed.port, 54321);
+    }
+
+    /// PR-51 / session-71 — `state=needs-seller-config` parses to
+    /// `NeedsSellerConfig`. The Tauri shell's first-paint dispatch
+    /// reads this to render the seller-info wizard.
+    #[test]
+    fn parses_state_needs_seller_config_suffix() {
+        let fp = make_fingerprint(0xab);
+        let line = format!("READY 127.0.0.1:54321 sha256:{fp} state=needs-seller-config");
+        let parsed = parse(&line).expect("state=needs-seller-config line must parse");
+        assert_eq!(parsed.state, ServeBootState::NeedsSellerConfig);
         assert_eq!(parsed.port, 54321);
     }
 

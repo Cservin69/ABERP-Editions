@@ -1,0 +1,54 @@
+# ABERP seller config — operator-facing template.
+#
+# Copy this file to ~/.aberp/<tenant>/seller.toml and fill in your
+# real company data. The tenant directory mirrors the `--tenant`
+# argument the binary is launched with (default: `test`).
+#
+# Example:
+#
+#     cp samples/seller.toml.example ~/.aberp/test/seller.toml
+#     # then edit ~/.aberp/test/seller.toml in place
+#
+# Today (PR-50 / session 70) only the bottom `bank_*` block is
+# consumed at runtime — by the `print-invoice` PDF renderer
+# (`apps/aberp/src/print_invoice.rs::read_seller_toml`), which folds
+# the IBAN + bank-name + SWIFT lines into the printed invoice
+# footer. The top `[seller]` + `[seller.address]` blocks are
+# documented here for forward compatibility: PR-51 (the SetupWizard
+# extension) will route seller-identity fields (legal name, tax
+# number, address) through this file instead of having the operator
+# retype them on every issuance. Until then, those fields flow via
+# the SPA Issue-invoice form's Supplier section.
+#
+# Hungarian tax-number format (ADÓSZÁM): `xxxxxxxx-y-zz`
+#   - xxxxxxxx — 8-digit base taxpayer id
+#   - y        — 1-digit VAT code
+#   - zz       — 2-digit county code
+# Example: `24904362-2-41`.
+#
+# A malformed tax number on the SPA Issue form surfaces as a typed
+# 400 `missing_seller_config` error with this file's path + the
+# sample path as actionable hints.
+
+# ── PR-51 (forward-looking) — seller identity ─────────────────────
+# Uncomment + populate when PR-51 lands. Leave commented until then;
+# the runtime ignores the entries today.
+#
+# [seller]
+# legal_name    = "Áben Consulting KFT."
+# tax_number    = "24904362-2-41"      # required, Hungarian xxxxxxxx-y-zz
+# eu_vat_number = "HU24904362"         # optional, EU cross-border invoices only
+#
+# [seller.address]
+# country_code = "HU"
+# postal_code  = "1037"
+# city         = "Budapest"
+# street       = "Visszatérő köz 6"
+
+# ── PR-44ε.1 / session 57 — bank info (LIVE; consumed today) ──────
+# Flat-key shape (matching `SellerToml` in print_invoice.rs). Each
+# field is optional — the PDF renderer hides empty rows.
+bank_account_number = "12345678-12345678-12345678"
+iban                = "LT14 3250 0448 1318 6860"
+bank_name           = "Revolut"
+swift_bic           = "REVOLT21"

@@ -364,3 +364,63 @@ fn issue_route_rejects_empty_lines_with_loud_error() {
         "loud-fail message must reference the lines validation: got `{msg}`"
     );
 }
+
+/// PR-50 / session-70 — supplier-config gate must fire at the
+/// LIBRARY layer (defence in depth for any future caller that
+/// bypasses `serve::handle_issue_invoice`'s route-layer validate).
+///
+/// This pin covers `issue_from_parsed`'s pre-issuance shape check
+/// directly: a malformed supplier tax (`"24904362"` — the exact
+/// failure mode Ervin hit on 2026-05-25, bare 8 digits without the
+/// `-y-zz` segments) must loud-fail BEFORE the audit ledger burns a
+/// sequence number. A regression that drops the gate would let a
+/// fresh draft land on disk and then fail at submit time — the
+/// pre-PR-50 failure mode the brief inverts.
+#[test]
+fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
+    let dir = test_dir("malformed-supplier");
+    std::env::set_var("HOME", &dir);
+    let state = build_state(dir.join("aberp.duckdb"));
+    let actor = Actor::from_local_cli("test-session".to_string(), "test-user");
+
+    let mut bad_supplier = fixture_supplier();
+    bad_supplier.tax_number = "24904362".to_string(); // ← bare base; no `-y-zz`
+
+    let request = IssueInvoiceRequest {
+        supplier: bad_supplier,
+        customer: fixture_customer(),
+        lines: fixture_lines(),
+        currency: Currency::Huf,
+        series: None,
+    };
+
+    let err = serve::issue_invoice_request(
+        &state,
+        request,
+        &UnreachableProvider,
+        actor,
+    )
+    .expect_err("malformed supplier tax number must fail loud");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("supplier_config_invalid"),
+        "loud-fail must carry the `supplier_config_invalid` sentinel for the route layer's detection: got `{msg}`"
+    );
+    assert!(
+        msg.contains("24904362"),
+        "loud-fail must echo the rejected input so the operator sees the typo: got `{msg}`"
+    );
+    assert!(
+        msg.contains("xxxxxxxx-y-zz"),
+        "loud-fail must surface the expected shape so the operator knows the fix: got `{msg}`"
+    );
+
+    // The audit ledger must NOT have a fresh draft — the gate fires
+    // BEFORE `pre_tx_setup`. A regression that opened the DB before
+    // the gate would surface here as a present-but-empty DB file.
+    assert!(
+        !dir.join("aberp.duckdb").exists(),
+        "pre-issuance gate must fail before any DB write; aberp.duckdb leaked at {}",
+        dir.join("aberp.duckdb").display()
+    );
+}

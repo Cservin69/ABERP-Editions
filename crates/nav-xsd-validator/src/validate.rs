@@ -344,15 +344,50 @@ fn walk_supplier_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidation
                     }
                 })?;
                 match canonical {
-                    "supplierTaxNumber" => {
-                        let _ = collect_text(reader, canonical)?;
-                    }
+                    "supplierTaxNumber" => walk_supplier_tax_number(reader)?,
                     "supplierName" => {
                         let _ = collect_text(reader, canonical)?;
                     }
                     "supplierAddress" => walk_address("supplierAddress", reader)?,
                     other => unreachable!("canonicalized unknown element {other}"),
                 }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+/// PR-50 / session-70 — walk the structured `<supplierTaxNumber>`
+/// children per NAV `Online Számla` v3.0. Mirror of
+/// [`walk_customer_tax_number`] with the three Hungarian-specific
+/// supplier sub-elements (taxpayerId + vatCode + countyCode all
+/// required for a domestic supplier). The pre-PR-50 validator
+/// accepted a flat string here — that shape ships clean past this
+/// gate but NAV's submit endpoint loud-fails it, so the gate now
+/// matches the wire reality.
+fn walk_supplier_tax_number(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "supplierTaxNumber";
+    const ALLOWED: &[&str] = &["taxpayerId", "vatCode", "countyCode"];
+    const ORDERED_REQUIRED: &[&str] = ALLOWED;
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                let _ = collect_text(reader, canonical)?;
                 seen.push(canonical);
             }
             Event::End(_) => {
@@ -1302,7 +1337,11 @@ mod tests {
     <invoice>
       <invoiceHead>
         <supplierInfo>
-          <supplierTaxNumber>12345678</supplierTaxNumber>
+          <supplierTaxNumber>
+            <taxpayerId>12345678</taxpayerId>
+            <vatCode>1</vatCode>
+            <countyCode>42</countyCode>
+          </supplierTaxNumber>
           <supplierName>ABERP Supplier Kft.</supplierName>
           <supplierAddress>
             <simpleAddress>

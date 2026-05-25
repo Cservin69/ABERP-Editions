@@ -14,7 +14,11 @@
 
 import { describe, expect, it } from "vitest";
 
-import { composeIssueInvoiceBody, emptyForm } from "./issue-invoice";
+import {
+  composeIssueInvoiceBody,
+  emptyForm,
+  parseMissingSellerConfigError,
+} from "./issue-invoice";
 
 describe("composeIssueInvoiceBody", () => {
   it("reshapes HUF form state into the wire body verbatim", () => {
@@ -167,5 +171,68 @@ describe("composeIssueInvoiceBody", () => {
     expect(body.lines.map((l) => l.description)).toEqual(["A", "B", "C"]);
     expect(body.lines.map((l) => l.unitPrice)).toEqual([100, 200, 300]);
     expect(body.lines.map((l) => l.vatRatePercent)).toEqual([27, 5, 0]);
+  });
+});
+
+// PR-50 / session-70 — pins for the typed `missing_seller_config`
+// error parser. The SPA's IssueInvoice modal calls
+// `parseMissingSellerConfigError` on every catch arm; a regression
+// that mis-detects the discriminant (or fails to extract the
+// config_path + sample_path hints) would silently degrade to the
+// raw-string error display, defeating the whole point of the typed
+// 400 body. Per CLAUDE.md rule 9 — happy path + each rejection arm
+// pinned.
+describe("parseMissingSellerConfigError", () => {
+  it("extracts the typed body from the Tauri-wrapped error string", () => {
+    // The Tauri forward helper wraps the backend's JSON body in a
+    // human-readable prefix; the parser strips the prefix and parses
+    // the embedded JSON object.
+    const raw =
+      'backend returned 400 Bad Request for /invoices/issue: ' +
+      '{"error":"missing_seller_config",' +
+      '"message":"supplier tax number `24904362` is not a valid ' +
+      'Hungarian ADÓSZÁM (expected three dash-separated segments; ' +
+      "expected `xxxxxxxx-y-zz`, e.g. `24904362-2-41`)\"," +
+      '"config_path":"/Users/aben/.aberp/test/seller.toml",' +
+      '"sample_path":"/Users/aben/Documents/Claude/Projects/ABERP/' +
+      'samples/seller.toml.example"}';
+    const parsed = parseMissingSellerConfigError(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.error).toBe("missing_seller_config");
+    expect(parsed!.config_path).toBe(
+      "/Users/aben/.aberp/test/seller.toml",
+    );
+    expect(parsed!.sample_path).toBe(
+      "/Users/aben/Documents/Claude/Projects/ABERP/samples/seller.toml.example",
+    );
+    expect(parsed!.message).toContain("24904362");
+    expect(parsed!.message).toContain("xxxxxxxx-y-zz");
+  });
+
+  it("returns null for a plain `{error: ...}` 400 body", () => {
+    // Pre-PR-50 400 bodies (empty lines, missing customer name) carry
+    // only the `error` discriminant string. The parser must NOT
+    // misidentify those as the typed shape — the SPA falls back to
+    // the raw-string display.
+    const raw =
+      'backend returned 400 Bad Request for /invoices/issue: ' +
+      '{"error":"at least one line item is required"}';
+    expect(parseMissingSellerConfigError(raw)).toBeNull();
+  });
+
+  it("returns null when the error body is malformed JSON", () => {
+    const raw = "backend returned 500 Internal Server Error: <html>...</html>";
+    expect(parseMissingSellerConfigError(raw)).toBeNull();
+  });
+
+  it("returns null when the discriminant is present but hints are missing", () => {
+    // A backend drift that emits the discriminant without the
+    // hint fields would surface here — fall back to raw-string
+    // display rather than rendering a broken `undefined` path
+    // (CLAUDE.md rule 12, fail loud).
+    const raw =
+      'backend returned 400 Bad Request for /invoices/issue: ' +
+      '{"error":"missing_seller_config","message":"X"}';
+    expect(parseMissingSellerConfigError(raw)).toBeNull();
   });
 });

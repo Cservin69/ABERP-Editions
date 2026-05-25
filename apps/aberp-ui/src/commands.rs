@@ -13,7 +13,7 @@ use anyhow::Context;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, State};
 
-use crate::{boot_backend, mark_ready_after_setup, AppState, BootStatus};
+use crate::{boot_backend, mark_post_setup_state, AppState, BootStatus};
 
 /// `GET /health` — unauthenticated on the backend, but we still
 /// route it through the same pinned client so the SPA never bypasses
@@ -221,6 +221,7 @@ pub async fn get_boot_status(state: State<'_, AppState>) -> Result<Value, String
     let status_str = match boot_state.status {
         BootStatus::Starting => "starting",
         BootStatus::NeedsSetup => "needs-setup",
+        BootStatus::NeedsSellerConfig => "needs-seller-config",
         BootStatus::Ready => "ready",
         BootStatus::Failed => "failed",
     };
@@ -259,12 +260,37 @@ pub async fn setup_nav_credentials(
 ) -> Result<Value, String> {
     let state = app.state::<AppState>();
     let response = forward_post(&state, "/api/setup-nav-credentials", body).await?;
-    // A successful response means the backend wrote all four keychain
-    // entries AND flipped its own boot state to Ready. Mirror that on
-    // the Tauri shell side so the SPA's next `get_boot_status` poll
-    // returns the Ready snapshot and the wizard pane swaps out for
-    // the normal app.
-    mark_ready_after_setup(&app);
+    // PR-51 / session-71 — the response body's `state` field carries
+    // the backend's post-transition boot state, which is now either
+    // `"ready"` (seller.toml already populated) OR
+    // `"needs-seller-config"` (the seller-config wizard fires next).
+    // Mirror that on the Tauri shell side so the SPA's next
+    // `get_boot_status` poll returns the matching snapshot.
+    if let Some(token) = response.get("state").and_then(Value::as_str) {
+        mark_post_setup_state(&app, token);
+    }
+    Ok(response)
+}
+
+/// PR-51 / session-71 — relay the SPA's seller-config wizard payload
+/// to the backend's `POST /api/setup-seller-info` route. Mirrors the
+/// `setup_nav_credentials` command's shape exactly: forwards the
+/// JSON body verbatim, flips the Tauri-side boot state mirror on
+/// success, propagates the typed 400 / 500 error bodies as the
+/// rejected promise.
+#[tauri::command]
+pub async fn setup_seller_info(
+    app: AppHandle,
+    body: Value,
+) -> Result<Value, String> {
+    let state = app.state::<AppState>();
+    let response = forward_post(&state, "/api/setup-seller-info", body).await?;
+    // The seller-config wizard is the last gate; the response's
+    // `state` field is always `"ready"`. Flip the mirror so the SPA
+    // re-renders the normal app without waiting for the next poll.
+    if let Some(token) = response.get("state").and_then(Value::as_str) {
+        mark_post_setup_state(&app, token);
+    }
     Ok(response)
 }
 

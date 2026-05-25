@@ -67,7 +67,7 @@ use crate::audit_payloads;
 use crate::binary_hash;
 use crate::cli::IssueInvoiceArgs;
 use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
-use crate::nav_xml::{self, CustomerInfo, NavParties, SupplierInfo};
+use crate::nav_xml::{self, CustomerInfo, NavParties, SupplierConfigError, SupplierInfo};
 use crate::submission_queue;
 
 /// Maximum number of days to walk back per ADR-0037 §2.b when MNB has no
@@ -320,6 +320,27 @@ pub fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
 ) -> Result<IssuedInvoiceSummary> {
     if input.lines.is_empty() {
         return Err(anyhow!("input has no lines"));
+    }
+
+    // PR-50 / session-70 — pre-issuance supplier shape guard. Refuse
+    // to burn a sequence slot when the supplier's tax number isn't
+    // a valid Hungarian ADÓSZÁM, so the audit ledger never carries
+    // a fresh draft that the NAV submit endpoint will reject hours
+    // later for a malformed `<supplierTaxNumber>`. The route layer
+    // (`serve::validate_issue_request`) also calls this so the SPA
+    // gets a typed 400 before reaching the issuance pipeline; this
+    // guard is the defence in depth for the CLI surface (and any
+    // future library caller) per CLAUDE.md rule 12.
+    let supplier_for_check = SupplierInfo {
+        tax_number: input.supplier.tax_number.clone(),
+        name: input.supplier.name.clone(),
+        address_country_code: input.supplier.address.country_code.clone(),
+        address_postal_code: input.supplier.address.postal_code.clone(),
+        address_city: input.supplier.address.city.clone(),
+        address_street: input.supplier.address.street.clone(),
+    };
+    if let Err(e) = nav_xml::validate_supplier_info(&supplier_for_check) {
+        return Err(supplier_config_error_anyhow(e));
     }
 
     // 2. Resolve tenant id + series code (loud-fail on invalid input).
@@ -857,4 +878,19 @@ fn finalize_rate(rate: &MnbRate, lines: &[LineItem]) -> Result<RateMetadata> {
         date: rate.date,
         huf_equivalent_total,
     })
+}
+
+/// PR-50 / session-70 — error sentinel substring that the SPA route
+/// (`serve::handle_issue_invoice`) and the integration test
+/// `serve_issue_route::issue_request_400_on_malformed_supplier_tax_number`
+/// pattern-match on to detect a supplier-config loud-fail emerging
+/// from `issue_from_parsed`. Hard-coded into the anyhow message
+/// rather than threaded via a downcast because `issue_from_parsed`
+/// is `Result<_, anyhow::Error>` and the route layer's defence in
+/// depth runs BEFORE the issuance call anyway — the sentinel
+/// surfaces only the rare CLI-bypass path where this guard fires.
+pub const ERR_SUPPLIER_CONFIG_INVALID: &str = "supplier_config_invalid";
+
+fn supplier_config_error_anyhow(e: SupplierConfigError) -> anyhow::Error {
+    anyhow!("{ERR_SUPPLIER_CONFIG_INVALID}: {e}")
 }

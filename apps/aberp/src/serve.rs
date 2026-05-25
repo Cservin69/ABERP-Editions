@@ -98,11 +98,15 @@ use crate::issue_invoice::{self, InvoiceInputJson};
 use crate::issue_modification;
 use crate::issue_storno;
 use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
+use crate::nav_xml::{self, SupplierConfigError, SupplierInfo};
 use crate::partners::{self, Partner, PartnerInputs, ValidationError as PartnerValidationError};
 use crate::poll_ack;
 use crate::print_invoice;
 use crate::setup_nav_credentials::{
     self, NavCredentialInputs, SetupCredentialsError,
+};
+use crate::setup_seller_info::{
+    self, FieldError as SellerFieldError, SellerInfoInputs, SetupSellerInfoError,
 };
 use crate::submit_invoice;
 
@@ -228,9 +232,19 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     let initial_boot_state = {
         let _s = tracing::info_span!("serve.nav_credentials").entered();
         match NavCredentials::load_from_keychain(&args.tenant) {
-            Ok(creds) => ServeBootState::Ready {
-                operator_login: creds.login().to_string(),
-            },
+            Ok(creds) => {
+                // PR-51 / session-71 — NAV creds present; the second
+                // gate is the per-tenant seller.toml. A missing or
+                // identity-incomplete file transitions to
+                // NeedsSellerConfig so the SPA can fire its wizard
+                // INSTEAD OF letting the operator hit the route
+                // surface and get a typed `missing_seller_config` 400
+                // hours later.
+                derive_initial_boot_state_with_seller_check(
+                    creds.login().to_string(),
+                    &args.tenant,
+                )
+            }
             Err(NavTransportError::KeychainItemMissing { item, .. }) => {
                 tracing::warn!(
                     item = item,
@@ -558,6 +572,17 @@ fn generate_session_token() -> String {
 /// transitioning) and every other route (which reads to either pull
 /// the login OR reject with 503). Multi-tenant CRUD lifts this to a
 /// per-tenant registry in a later PR-46β.
+///
+/// PR-51 / session-71 — third variant `NeedsSellerConfig` for the
+/// SPA's seller-config wizard. Detected at boot when the NAV
+/// credentials load but `~/.aberp/<tenant>/seller.toml` is absent or
+/// missing required identity fields. The state token
+/// `needs-seller-config` rides the handshake suffix so the Tauri
+/// shell's first-paint dispatch picks the right wizard without an
+/// extra round-trip. `operator_login` is carried on the variant
+/// because NAV creds are already loaded — only the seller-config gate
+/// remains; the same login feeds the audit actor once the wizard
+/// flips the state to Ready.
 #[derive(Debug, Clone)]
 pub enum ServeBootState {
     /// Keychain has no NAV credentials for this tenant. The only
@@ -565,6 +590,14 @@ pub enum ServeBootState {
     /// `POST /api/setup-nav-credentials`; every other gated route
     /// returns 503 with a typed body the SPA renders inline.
     NeedsSetup,
+    /// PR-51 / session-71 — keychain populated, but
+    /// `~/.aberp/<tenant>/seller.toml` is missing or its identity
+    /// block (legal_name + tax_number + address) is incomplete. The
+    /// SPA's `SellerConfigWizard` fires; `POST /api/setup-seller-info`
+    /// is the only mutation route that responds (bypasses Bearer-auth
+    /// for the same A170 chicken-and-egg reason as the NAV-creds
+    /// wizard). Every other gated route returns 503.
+    NeedsSellerConfig { operator_login: String },
     /// Keychain is populated; the per-request audit-actor login was
     /// extracted at startup (or at setup-route-transition time) and
     /// is cached here for the Actor derivation site.
@@ -576,9 +609,14 @@ impl ServeBootState {
     /// (PR-46α). The Tauri shell's `handshake::parse` reads it to
     /// route the SPA's first paint between the normal app and the
     /// setup wizard.
+    ///
+    /// PR-51 / session-71 — added the `needs-seller-config` token for
+    /// the new boot-state variant. Mirror in
+    /// `apps/aberp-ui/src/handshake.rs::parse_state_value`.
     pub fn state_token(&self) -> &'static str {
         match self {
             ServeBootState::NeedsSetup => "needs-setup",
+            ServeBootState::NeedsSellerConfig { .. } => "needs-seller-config",
             ServeBootState::Ready { .. } => "ready",
         }
     }
@@ -587,6 +625,66 @@ impl ServeBootState {
     /// the route precondition helper.
     pub fn is_ready(&self) -> bool {
         matches!(self, ServeBootState::Ready { .. })
+    }
+
+    /// PR-51 / session-71 — `true` iff a setup-flow route (NAV creds
+    /// OR seller info) should bypass the Bearer-auth gate. The
+    /// chicken-and-egg posture from A170 (the SPA wizard runs BEFORE
+    /// the operator has acquired a session token) extends to the
+    /// seller-config wizard too. Used by both setup-route handlers.
+    pub fn allows_setup_bypass(&self) -> bool {
+        !matches!(self, ServeBootState::Ready { .. })
+    }
+}
+
+/// PR-51 / session-71 — pick the boot state to enter when NAV creds
+/// load cleanly. Reads `~/.aberp/<tenant>/seller.toml` and:
+///
+///   - missing file OR identity-incomplete → `NeedsSellerConfig`
+///   - identity present → `Ready`
+///
+/// Reads outside the `RwLock` so a slow filesystem doesn't delay the
+/// listener bind; called once at boot. Errors reading the file fall
+/// through to `NeedsSellerConfig` with a tracing warning — that
+/// surfaces the bad file to the operator AND lets the wizard
+/// overwrite it (better than refusing to boot).
+fn derive_initial_boot_state_with_seller_check(
+    operator_login: String,
+    tenant: &str,
+) -> ServeBootState {
+    match setup_seller_info::seller_toml_path_for_tenant(tenant) {
+        Ok(path) => match setup_seller_info::read_seller_identity(&path) {
+            Ok(Some(_id)) => {
+                tracing::info!(
+                    seller_toml = %path.display(),
+                    "seller.toml identity block present; entering Ready boot state"
+                );
+                ServeBootState::Ready { operator_login }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    seller_toml = %path.display(),
+                    "seller.toml missing or identity-incomplete; entering needs-seller-config boot state; \
+                     SPA SellerConfigWizard will populate via POST /api/setup-seller-info"
+                );
+                ServeBootState::NeedsSellerConfig { operator_login }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    seller_toml = %path.display(),
+                    error = %format!("{e:#}"),
+                    "seller.toml read failed; entering needs-seller-config boot state so the wizard can overwrite"
+                );
+                ServeBootState::NeedsSellerConfig { operator_login }
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "HOME env var missing; entering needs-seller-config boot state so the wizard can surface the error"
+            );
+            ServeBootState::NeedsSellerConfig { operator_login }
+        }
     }
 }
 
@@ -665,6 +763,21 @@ fn build_router(state: AppState) -> Router {
             "/api/setup-nav-credentials",
             post(handle_setup_nav_credentials),
         )
+        // PR-51 / session-71 — second-run-setup route. Accepts the
+        // operator-typed seller identity (legal name + tax number +
+        // address) + bank info and writes it to
+        // `~/.aberp/<tenant>/seller.toml` atomically. In
+        // `NeedsSetup` OR `NeedsSellerConfig` mode the route
+        // bypasses Bearer-auth (the SPA wizard chain has no session-
+        // token bearer yet — same A170 chicken-and-egg posture as
+        // the NAV-creds wizard); once the boot state transitions to
+        // `Ready` the route requires the standard Bearer-auth
+        // header (so an operator can re-run the wizard from the
+        // settings screen without losing auth).
+        .route(
+            "/api/setup-seller-info",
+            post(handle_setup_seller_info),
+        )
         // PR-48α / session-68 — partner CRUD. Five routes (list +
         // create on the collection; get + update + delete on the
         // resource), all require_ready + bearer auth — partners is a
@@ -698,6 +811,20 @@ fn needs_setup_response() -> Response {
         .into_response()
 }
 
+/// PR-51 / session-71 — sibling of [`needs_setup_response`] for the
+/// post-NAV-creds, pre-seller-config gate. SPA reads `state` to
+/// dispatch to `SellerConfigWizard` instead of `SetupWizard`.
+fn needs_seller_config_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "state": "needs-seller-config",
+            "message": "Save seller identity (legal name, tax number, address) before using this endpoint.",
+        })),
+    )
+        .into_response()
+}
+
 /// PR-46α / session-62 — precondition gate for every Ready-only
 /// route. Returns `Ok(operator_login)` if the backend is `Ready`;
 /// returns `Err(response)` with the typed 503 needs-setup body
@@ -705,6 +832,10 @@ fn needs_setup_response() -> Response {
 /// route's write transaction leaving the RwLock unusable — that's
 /// treated as a 500 (the operator-visible message points at
 /// internal-state corruption, which is the truth at that point).
+///
+/// PR-51 / session-71 — `NeedsSellerConfig` now exists as a third
+/// state; the gate emits a distinct 503 body (`needs-seller-config`)
+/// so the SPA can route the operator to the right wizard.
 fn require_ready(state: &AppState) -> std::result::Result<String, Response> {
     let guard = state.boot_state.read().map_err(|e| {
         tracing::error!(error = %e, "boot_state RwLock poisoned");
@@ -717,6 +848,7 @@ fn require_ready(state: &AppState) -> std::result::Result<String, Response> {
     match &*guard {
         ServeBootState::Ready { operator_login } => Ok(operator_login.clone()),
         ServeBootState::NeedsSetup => Err(needs_setup_response()),
+        ServeBootState::NeedsSellerConfig { .. } => Err(needs_seller_config_response()),
     }
 }
 
@@ -735,6 +867,13 @@ pub struct SetupNavCredentialsRequest {
 /// PR-46α / session-62 — response body for the setup route. Surfaces
 /// the post-write boot state so the SPA can flip its wizard view-mode
 /// to the normal app without a second probe roundtrip.
+///
+/// PR-51 / session-71 — `state` widened from a single `"ready"`
+/// literal to either `"ready"` or `"needs-seller-config"`. The
+/// chained-wizard posture (NAV creds first → seller config next when
+/// the file is missing) means the post-success state is no longer
+/// always Ready. The SPA's Tauri-shell wrapper reads this field and
+/// flips its boot-state mirror to the matching variant.
 #[derive(Debug, Serialize)]
 struct SetupNavCredentialsResponse {
     state: &'static str,
@@ -790,7 +929,9 @@ async fn handle_setup_nav_credentials(
     };
 
     match setup_nav_credentials_request(&state, &inputs) {
-        Ok(()) => Json(SetupNavCredentialsResponse { state: "ready" }).into_response(),
+        Ok(next_state_token) => {
+            Json(SetupNavCredentialsResponse { state: next_state_token }).into_response()
+        }
         Err(SetupRouteHelperError::Validation(msg)) => {
             (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response()
         }
@@ -824,13 +965,21 @@ impl From<anyhow::Error> for SetupRouteHelperError {
 ///
 /// On success: writes the four keychain entries via the shared core,
 /// re-loads to extract the operator login, and flips the boot state
-/// to Ready. On validation failure: returns
-/// `SetupRouteHelperError::Validation` (→ 400). On any other error:
-/// returns `SetupRouteHelperError::Other` (→ 500).
+/// to Ready (or `NeedsSellerConfig` if the seller.toml is still
+/// missing — PR-51 / session-71 chained-wizard posture). On
+/// validation failure: returns `SetupRouteHelperError::Validation`
+/// (→ 400). On any other error: returns
+/// `SetupRouteHelperError::Other` (→ 500).
+///
+/// Returns the `state_token` of the post-transition boot state
+/// (`"ready"` or `"needs-seller-config"`) so the HTTP route layer can
+/// echo it on the 200 response body — the SPA's Tauri-shell wrapper
+/// reads it to flip its mirror to the right variant without a second
+/// probe.
 pub fn setup_nav_credentials_request(
     state: &AppState,
     inputs: &NavCredentialInputs,
-) -> std::result::Result<(), SetupRouteHelperError> {
+) -> std::result::Result<&'static str, SetupRouteHelperError> {
     match setup_nav_credentials::setup_credentials_from_inputs(state.tenant.as_str(), inputs) {
         Ok(()) => {}
         Err(SetupCredentialsError::Validation(msg)) => {
@@ -857,16 +1006,246 @@ pub fn setup_nav_credentials_request(
     // Flip the boot state. The write-lock acquisition can only fail
     // on a poisoned RwLock — same surface as `require_ready`'s poison
     // arm.
+    //
+    // PR-51 / session-71 — the post-NAV-creds transition is no longer
+    // unconditionally Ready. If the per-tenant seller.toml is still
+    // missing the wizard chain continues with the seller-config step;
+    // the SPA's next `getBootStatus` poll picks up
+    // `needs-seller-config` and dispatches `SellerConfigWizard`.
+    let next_state = derive_initial_boot_state_with_seller_check(
+        operator_login,
+        state.tenant.as_str(),
+    );
+    let next_token = next_state.state_token();
     let mut guard = state.boot_state.write().map_err(|e| {
         SetupRouteHelperError::Other(anyhow!(
             "boot_state RwLock poisoned during setup transition: {e}"
         ))
     })?;
+    *guard = next_state;
+
+    tracing::info!(
+        tenant = %state.tenant.as_str(),
+        next_state = next_token,
+        "NAV credentials populated via setup route; boot state transitioned"
+    );
+
+    Ok(next_token)
+}
+
+// ── PR-51 / session-71 — POST /api/setup-seller-info ─────────────────
+
+/// PR-51 / session-71 — request body for
+/// `POST /api/setup-seller-info`. Mirror of the SPA composer
+/// `seller-config.ts::composeSellerConfigBody`. Snake_case wire
+/// names; address + bank are flat sub-objects so the SPA's form
+/// state maps 1:1 to the wire shape with no per-field renaming.
+#[derive(Debug, Deserialize)]
+pub struct SetupSellerInfoRequest {
+    pub legal_name: String,
+    pub tax_number: String,
+    #[serde(default)]
+    pub eu_vat_number: Option<String>,
+    pub address: SetupSellerInfoAddress,
+    #[serde(default)]
+    pub bank: Option<SetupSellerInfoBank>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetupSellerInfoAddress {
+    pub country_code: String,
+    pub postal_code: String,
+    pub city: String,
+    pub street: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SetupSellerInfoBank {
+    #[serde(default)]
+    pub account_number: Option<String>,
+    #[serde(default)]
+    pub iban: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub swift_bic: Option<String>,
+}
+
+/// PR-51 / session-71 — response body for the seller-info setup
+/// route. `state` is always `"ready"` (a successful write means the
+/// last gate has passed); the explicit field keeps the SPA's wrapper
+/// posture identical to the NAV-creds route's response (one field
+/// the Tauri shell reads to flip its mirror).
+#[derive(Debug, Serialize)]
+struct SetupSellerInfoResponse {
+    state: &'static str,
+}
+
+/// PR-51 / session-71 — typed 400 body for field-level validation
+/// failures. Mirrors the shape the SPA's `seller-config.ts` parser
+/// reads: a top-level `error` discriminant + a `fields` array of
+/// `{field, message}` records the wizard renders inline next to the
+/// offending input.
+#[derive(Serialize)]
+struct SetupSellerInfoErrorBody {
+    error: &'static str,
+    fields: Vec<SetupSellerInfoFieldError>,
+}
+
+#[derive(Serialize)]
+struct SetupSellerInfoFieldError {
+    field: &'static str,
+    message: String,
+}
+
+const ERR_SELLER_INFO_VALIDATION: &str = "validation_failed";
+
+/// PR-51 / session-71 — `POST /api/setup-seller-info` handler. Same
+/// shape as `handle_setup_nav_credentials`:
+///
+///   1. Bearer-auth check ONLY when already `Ready` (A170 bypass
+///      while a wizard chain is in flight).
+///   2. Validate-then-write via
+///      [`setup_seller_info::setup_seller_info_from_inputs`] (the
+///      shared core).
+///   3. Take the boot_state write lock and flip to `Ready` (this is
+///      the last gate; success means the operator is done).
+///   4. Return 200 with `{ "state": "ready" }`.
+///
+/// Failure modes:
+///   - `400 Bad Request` — one or more fields failed validation; the
+///     typed body carries the per-field errors.
+///   - `401 Unauthorized` — bearer missing in `Ready` mode.
+///   - `500 Internal Server Error` — atomic write failed (parent
+///     mkdir, tempfile open / write / fsync / rename, chmod).
+async fn handle_setup_seller_info(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<SetupSellerInfoRequest>,
+) -> Response {
+    let bypass_bearer = state
+        .boot_state
+        .read()
+        .map(|g| g.allows_setup_bypass())
+        .unwrap_or(false);
+    if !bypass_bearer {
+        if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+            return resp;
+        }
+    }
+
+    let bank = request.bank.unwrap_or_default();
+    let inputs = SellerInfoInputs {
+        legal_name: request.legal_name,
+        tax_number: request.tax_number,
+        eu_vat_number: request.eu_vat_number,
+        address_country_code: request.address.country_code,
+        address_postal_code: request.address.postal_code,
+        address_city: request.address.city,
+        address_street: request.address.street,
+        bank_account_number: bank.account_number,
+        iban: bank.iban,
+        bank_name: bank.name,
+        swift_bic: bank.swift_bic,
+    };
+
+    match setup_seller_info_request(&state, &inputs, None) {
+        Ok(()) => Json(SetupSellerInfoResponse { state: "ready" }).into_response(),
+        Err(SetupSellerRouteError::Validation(fields)) => {
+            let body = SetupSellerInfoErrorBody {
+                error: ERR_SELLER_INFO_VALIDATION,
+                fields: fields
+                    .into_iter()
+                    .map(|f| SetupSellerInfoFieldError {
+                        field: f.field,
+                        message: f.message,
+                    })
+                    .collect(),
+            };
+            (StatusCode::BAD_REQUEST, Json(body)).into_response()
+        }
+        Err(SetupSellerRouteError::Other(e)) => {
+            internal_error("setup_seller_info_request", e)
+        }
+    }
+}
+
+/// PR-51 / session-71 — typed error from
+/// [`setup_seller_info_request`]. Two arms so the route handler can
+/// map `Validation` → 400 with the field-level body and `Other` →
+/// 500 with the opaque internal-error body.
+#[derive(Debug)]
+pub enum SetupSellerRouteError {
+    Validation(Vec<SellerFieldError>),
+    Other(anyhow::Error),
+}
+
+/// PR-51 / session-71 — library helper that backs the
+/// `POST /api/setup-seller-info` handler. Extracted as `pub` so the
+/// integration test in `tests/serve_setup_seller_info_route.rs` can
+/// hit it without spinning the HTTPS listener (same posture as
+/// [`setup_nav_credentials_request`] per A167).
+///
+/// On success: writes the file and flips the boot state to Ready.
+/// On validation: returns `SetupSellerRouteError::Validation` (→ 400).
+/// On any other error: returns `SetupSellerRouteError::Other` (→ 500).
+///
+/// `path_override`: production callers (the route handler) pass
+/// `None` so the helper derives `~/.aberp/<tenant>/seller.toml` from
+/// HOME; the integration test passes `Some(path)` to a per-test
+/// tempfile so it doesn't mutate the dev box's actual seller.toml or
+/// race with cargo's parallel test runner via HOME mutation. Mirrors
+/// the `get_invoice_pdf(seller_toml_override)` precedent from
+/// session-58.
+pub fn setup_seller_info_request(
+    state: &AppState,
+    inputs: &SellerInfoInputs,
+    path_override: Option<&std::path::Path>,
+) -> std::result::Result<(), SetupSellerRouteError> {
+    let result = match path_override {
+        Some(p) => setup_seller_info::setup_seller_info_to_path(p, inputs),
+        None => setup_seller_info::setup_seller_info_from_inputs(state.tenant.as_str(), inputs),
+    };
+    match result {
+        Ok(_echo) => {}
+        Err(SetupSellerInfoError::Validation(fields)) => {
+            return Err(SetupSellerRouteError::Validation(fields));
+        }
+        Err(SetupSellerInfoError::Backend(e)) => {
+            return Err(SetupSellerRouteError::Other(e));
+        }
+    }
+
+    // Flip to Ready. The operator_login was carried on the
+    // NeedsSellerConfig variant (it was extracted at boot when NAV
+    // creds loaded); pull it out so the post-transition Ready state
+    // carries the same value. The Ready-already case (operator re-
+    // running the wizard from a future settings screen) re-uses the
+    // current operator_login.
+    let mut guard = state.boot_state.write().map_err(|e| {
+        SetupSellerRouteError::Other(anyhow!(
+            "boot_state RwLock poisoned during seller-info setup transition: {e}"
+        ))
+    })?;
+    let operator_login = match &*guard {
+        ServeBootState::Ready { operator_login } => operator_login.clone(),
+        ServeBootState::NeedsSellerConfig { operator_login } => operator_login.clone(),
+        ServeBootState::NeedsSetup => {
+            // Should be unreachable in practice — the route runs
+            // AFTER NAV creds are present. If it fires here, that
+            // means the wizard chain was driven out of order; loud-
+            // fail per CLAUDE.md rule 12.
+            return Err(SetupSellerRouteError::Other(anyhow!(
+                "setup_seller_info_request called in NeedsSetup state — \
+                 /api/setup-nav-credentials must run first"
+            )));
+        }
+    };
     *guard = ServeBootState::Ready { operator_login };
 
     tracing::info!(
         tenant = %state.tenant.as_str(),
-        "NAV credentials populated via setup route; boot state transitioned to Ready"
+        "seller-info populated via setup route; boot state transitioned to Ready"
     );
 
     Ok(())
@@ -1391,6 +1770,80 @@ struct IssueInvoiceResponse {
 /// consume both 4xx and 5xx surfaces with one parser.
 const DEFAULT_SERIES_CODE: &str = "INV-default";
 
+/// PR-50 / session-70 — typed `400 Bad Request` body for the
+/// supplier-config validation gate. Sibling of [`ErrorBody`] with an
+/// `error_code` discriminant + the operator-actionable hints
+/// (`config_path` + `sample_path`) the SPA's inline-error renderer
+/// surfaces when the operator's form-typed tax number fails the
+/// shape check.
+///
+/// Wire shape:
+///
+/// ```json
+/// {
+///   "error": "missing_seller_config",
+///   "message": "supplier tax number `24904362` ... `xxxxxxxx-y-zz`",
+///   "config_path": "/Users/aben/.aberp/test/seller.toml",
+///   "sample_path": "/path/to/repo/samples/seller.toml.example"
+/// }
+/// ```
+///
+/// The discriminant `"missing_seller_config"` anticipates PR-51
+/// (the SetupWizard's seller-config persistence) — today the
+/// proximate fix is the form field, but the eventual fix is the
+/// per-tenant seller.toml, and the SPA renders the
+/// `config_path` + `sample_path` hint regardless. Mirrors A157's
+/// inline-error posture for the issuance modal.
+#[derive(Serialize)]
+struct TypedErrorBody {
+    error: &'static str,
+    message: String,
+    config_path: String,
+    sample_path: String,
+}
+
+/// PR-50 / session-70 — sentinel string for the
+/// `missing_seller_config` discriminant. Hard-coded both here and in
+/// the SPA's error renderer (`apps/aberp-ui/ui/src/lib/issue-invoice.ts`)
+/// — a regression that drifts one without the other surfaces at
+/// `issue-invoice.test.ts`'s pin per CLAUDE.md rule 12.
+const ERR_MISSING_SELLER_CONFIG: &str = "missing_seller_config";
+
+/// PR-50 / session-70 — build the per-tenant `seller.toml` path the
+/// operator should populate when the SetupWizard (PR-51) lands.
+/// Today the supplier identity flows via the SPA form; this path is
+/// the forward-looking destination the typed error names so
+/// operators have one config home to anchor on.
+fn seller_toml_path_for_tenant(tenant: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/operator".to_string());
+    format!("{home}/.aberp/{tenant}/seller.toml")
+}
+
+/// PR-50 / session-70 — repo-relative sample-template path the typed
+/// error names. Constructed from `CARGO_MANIFEST_DIR` at compile
+/// time so the operator-facing hint is correct in dev runs from any
+/// working directory; the path is `<workspace_root>/samples/seller.toml.example`.
+fn seller_toml_sample_path() -> String {
+    // `apps/aberp/Cargo.toml` lives two levels under the workspace
+    // root; the sample sits at `<root>/samples/seller.toml.example`.
+    // env! is compile-time so this path bakes into the binary; the
+    // operator-facing hint stays accurate for the dev tree the
+    // binary was built in.
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let path = std::path::PathBuf::from(manifest)
+        .join("..")
+        .join("..")
+        .join("samples")
+        .join("seller.toml.example");
+    // Canonicalize at runtime when possible so the message renders
+    // a clean absolute path; fall back to the join'd string on
+    // filesystem unavailability (CI, sandboxed runs).
+    match std::fs::canonicalize(&path) {
+        Ok(p) => p.display().to_string(),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 /// PR-44ζ / session-59 — `POST /invoices/issue` route handler. The
 /// SPA's "New Invoice" form posts here; the handler:
 ///
@@ -1426,12 +1879,25 @@ async fn handle_issue_invoice(
     // Pre-issuance validation. Loud-fail per CLAUDE.md rule 12 with a
     // 400 + a typed error body so the SPA's inline-error surface can
     // distinguish operator-correctable input from server-side faults.
-    if let Err(msg) = validate_issue_request(&request) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(error_body(msg)),
-        )
-            .into_response();
+    match validate_issue_request(&request) {
+        Ok(()) => {}
+        Err(IssueRequestValidationError::Plain(msg)) => {
+            return (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response();
+        }
+        Err(IssueRequestValidationError::SupplierConfig(supplier_err)) => {
+            // PR-50 / session-70 — typed 400 body the SPA's
+            // inline-error renderer detects (by the
+            // `missing_seller_config` discriminant) and surfaces
+            // with the config_path + sample_path hint instead of the
+            // bare anyhow string.
+            let body = TypedErrorBody {
+                error: ERR_MISSING_SELLER_CONFIG,
+                message: supplier_err.to_string(),
+                config_path: seller_toml_path_for_tenant(state.tenant.as_str()),
+                sample_path: seller_toml_sample_path(),
+            };
+            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+        }
     }
 
     let provider = match build_live_provider_for_currency(request.currency) {
@@ -1461,23 +1927,67 @@ async fn handle_issue_invoice(
 /// distinct field-level rule so a regression that drops one check
 /// surfaces at the route_validation_rejects_* test rather than at a
 /// silent 500.
-fn validate_issue_request(request: &IssueInvoiceRequest) -> std::result::Result<(), String> {
+///
+/// PR-50 / session-70 — return type widened to distinguish the
+/// supplier-config shape failure (which maps to the typed
+/// `missing_seller_config` 400 body the SPA renders with
+/// `config_path` + `sample_path` hints) from the generic string-
+/// shape failures (empty fields, missing tax number entirely).
+fn validate_issue_request(
+    request: &IssueInvoiceRequest,
+) -> std::result::Result<(), IssueRequestValidationError> {
     if request.lines.is_empty() {
-        return Err("at least one line item is required".to_string());
+        return Err(IssueRequestValidationError::Plain(
+            "at least one line item is required".to_string(),
+        ));
     }
     if request.customer.name.trim().is_empty() {
-        return Err("customer name is required".to_string());
+        return Err(IssueRequestValidationError::Plain(
+            "customer name is required".to_string(),
+        ));
     }
     if request.customer.tax_number.trim().is_empty() {
-        return Err("customer tax number (ADÓSZÁM) is required".to_string());
+        return Err(IssueRequestValidationError::Plain(
+            "customer tax number (ADÓSZÁM) is required".to_string(),
+        ));
     }
     if request.supplier.name.trim().is_empty() {
-        return Err("supplier name is required".to_string());
+        return Err(IssueRequestValidationError::Plain(
+            "supplier name is required".to_string(),
+        ));
     }
-    if request.supplier.tax_number.trim().is_empty() {
-        return Err("supplier tax number (ADÓSZÁM) is required".to_string());
+    // PR-50 / session-70 — supplier tax-number SHAPE check happens
+    // via `nav_xml::validate_supplier_info` so the typed error
+    // surfaces with `config_path` + `sample_path`. The pre-existing
+    // empty-string check stays inside the supplier_config branch as
+    // `MissingTaxNumber` per the `SupplierConfigError` discriminant.
+    let supplier_for_check = SupplierInfo {
+        tax_number: request.supplier.tax_number.clone(),
+        name: request.supplier.name.clone(),
+        address_country_code: request.supplier.address.country_code.clone(),
+        address_postal_code: request.supplier.address.postal_code.clone(),
+        address_city: request.supplier.address.city.clone(),
+        address_street: request.supplier.address.street.clone(),
+    };
+    if let Err(e) = nav_xml::validate_supplier_info(&supplier_for_check) {
+        return Err(IssueRequestValidationError::SupplierConfig(e));
     }
     Ok(())
+}
+
+/// PR-50 / session-70 — typed validation error for the issue route.
+/// Two variants:
+///
+///   - `Plain(String)` — every pre-PR-50 string-shape failure
+///     (empty customer name, etc.) maps to a generic 400 with the
+///     `{error}` body. Pin tests still pass on the legacy shape.
+///   - `SupplierConfig(SupplierConfigError)` — the supplier-shape
+///     branch the route handler maps to the typed
+///     `missing_seller_config` 400 body with the operator-actionable
+///     hint pointers.
+enum IssueRequestValidationError {
+    Plain(String),
+    SupplierConfig(SupplierConfigError),
 }
 
 /// PR-44ζ / session-59 — build the production `MnbRatesProvider` for
@@ -1822,6 +2332,12 @@ pub fn submit_invoice_request(
                      /api/setup-nav-credentials must run first"
                 )));
             }
+            ServeBootState::NeedsSellerConfig { .. } => {
+                return Err(SubmitRouteError::Other(anyhow!(
+                    "submit_invoice_request called in NeedsSellerConfig state — \
+                     /api/setup-seller-info must run first"
+                )));
+            }
         },
         Err(e) => {
             return Err(SubmitRouteError::Other(anyhow!(
@@ -1931,6 +2447,12 @@ pub fn poll_ack_request(
                 return Err(SubmitRouteError::Other(anyhow!(
                     "poll_ack_request called in NeedsSetup state — \
                      /api/setup-nav-credentials must run first"
+                )));
+            }
+            ServeBootState::NeedsSellerConfig { .. } => {
+                return Err(SubmitRouteError::Other(anyhow!(
+                    "poll_ack_request called in NeedsSellerConfig state — \
+                     /api/setup-seller-info must run first"
                 )));
             }
         },
@@ -2117,6 +2639,12 @@ pub fn storno_invoice_request(
                 return Err(SubmitRouteError::Other(anyhow!(
                     "storno_invoice_request called in NeedsSetup state — \
                      /api/setup-nav-credentials must run first"
+                )));
+            }
+            ServeBootState::NeedsSellerConfig { .. } => {
+                return Err(SubmitRouteError::Other(anyhow!(
+                    "storno_invoice_request called in NeedsSellerConfig state — \
+                     /api/setup-seller-info must run first"
                 )));
             }
         },
@@ -2380,6 +2908,12 @@ pub fn modification_invoice_request(
                 return Err(ModificationRouteError::Other(anyhow!(
                     "modification_invoice_request called in NeedsSetup state — \
                      /api/setup-nav-credentials must run first"
+                )));
+            }
+            ServeBootState::NeedsSellerConfig { .. } => {
+                return Err(ModificationRouteError::Other(anyhow!(
+                    "modification_invoice_request called in NeedsSellerConfig state — \
+                     /api/setup-seller-info must run first"
                 )));
             }
         },

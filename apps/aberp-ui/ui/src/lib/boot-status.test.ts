@@ -37,6 +37,16 @@ describe("bootViewMode", () => {
   it("maps needs-setup to setup", () => {
     expect(bootViewMode("needs-setup")).toBe("setup");
   });
+
+  // PR-51 / session-71 — the new needs-seller-config variant maps
+  // to its own `seller-config` view-mode. Defence against a future
+  // refactor that collapsed it into `setup` (which would mount the
+  // NAV-creds wizard a second time) or `ready` (which would mount
+  // the InvoiceList and let the operator hit the route surface
+  // before the seller.toml is in place).
+  it("maps needs-seller-config to seller-config", () => {
+    expect(bootViewMode("needs-seller-config")).toBe("seller-config");
+  });
 });
 
 describe("bootErrorMessage", () => {

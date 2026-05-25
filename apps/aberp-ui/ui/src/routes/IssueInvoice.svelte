@@ -40,7 +40,9 @@
     composeIssueInvoiceBody,
     emptyForm,
     emptyLine,
+    parseMissingSellerConfigError,
     type IssueInvoiceFormState,
+    type MissingSellerConfigError,
   } from "../lib/issue-invoice";
 
   interface Props {
@@ -64,6 +66,12 @@
   let form: IssueInvoiceFormState = $state(emptyForm());
   let submitState: "idle" | "submitting" | "error" = $state("idle");
   let submitError: string | null = $state(null);
+  /** PR-50 / session-70 — when the backend's `400` body carries the
+   * `missing_seller_config` discriminant, hold the typed shape so the
+   * template can render the operator-actionable `config_path` +
+   * `sample_path` hints instead of just the raw message. `null` for
+   * every other error class (network, 500, plain 400). */
+  let missingSellerConfig: MissingSellerConfigError | null = $state(null);
 
   // Sync the native <dialog>'s open state with the `open` prop.
   // `showModal()` and `close()` are imperative; the prop is the
@@ -81,6 +89,7 @@
     form = emptyForm();
     submitState = "idle";
     submitError = null;
+    missingSellerConfig = null;
   }
 
   function addLine() {
@@ -104,6 +113,7 @@
     event.preventDefault();
     submitState = "submitting";
     submitError = null;
+    missingSellerConfig = null;
     try {
       const body = composeIssueInvoiceBody(form);
       const response = await issueInvoice(body);
@@ -114,7 +124,14 @@
       onIssued(response.invoice_id);
     } catch (err: unknown) {
       submitState = "error";
-      submitError = err instanceof Error ? err.message : String(err);
+      const raw = err instanceof Error ? err.message : String(err);
+      // PR-50 / session-70 — when the backend's 400 body carries the
+      // typed `missing_seller_config` discriminant, populate the
+      // structured state so the template renders the
+      // config_path + sample_path hints. Otherwise fall back to
+      // displaying the raw error string verbatim.
+      missingSellerConfig = parseMissingSellerConfigError(raw);
+      submitError = raw;
     }
   }
 
@@ -161,7 +178,20 @@
     </header>
 
     {#if submitState === "error" && submitError}
-      <p class="error" role="alert">{submitError}</p>
+      {#if missingSellerConfig}
+        <div class="error error-typed" role="alert">
+          <p class="error-summary">{missingSellerConfig.message}</p>
+          <p class="error-hint">
+            Per-tenant config home (PR-51 will route this through the
+            wizard):
+          </p>
+          <p class="error-path">{missingSellerConfig.config_path}</p>
+          <p class="error-hint">Template to copy from:</p>
+          <p class="error-path">{missingSellerConfig.sample_path}</p>
+        </div>
+      {:else}
+        <p class="error" role="alert">{submitError}</p>
+      {/if}
     {/if}
 
     <fieldset>
@@ -467,5 +497,39 @@
     margin: 0;
     white-space: pre-wrap;
     word-break: break-word;
+  }
+
+  /* PR-50 / session-70 — typed `missing_seller_config` block. Same
+   * negative-signal colour as the plain inline error, with extra
+   * structure so the config_path + sample_path hints render as
+   * monospaced "you can copy this" lines. */
+  .error-typed {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .error-summary {
+    color: var(--color-signal-negative);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .error-hint {
+    color: var(--color-text-secondary);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-xs);
+    margin: 0;
+  }
+
+  .error-path {
+    color: var(--color-text-strong);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+    margin: 0;
+    word-break: break-all;
   }
 </style>
