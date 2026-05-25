@@ -22,11 +22,17 @@
 //!
 //!      Each signature computation also emits one `tracing::info!`
 //!      line with lengths, non-alphanumeric byte counts, the raw
-//!      key's first and last byte (hex), and the first 8 hex chars
-//!      of the resulting digest. PR-62 emitted this at `debug!` —
-//!      session-83 / PR-63 promoted it to `info!` so the diagnostic
-//!      is visible under the default `RUST_LOG=info` without operators
-//!      having to discover the magic env-var dance. See
+//!      key's first and last byte (hex), the first 8 hex chars
+//!      of the resulting digest, and (PR-64 / session-84) a
+//!      per-class breakdown of the trimmed key + hex values of
+//!      every non-alphanumeric byte. PR-62 emitted the base set at
+//!      `debug!`; session-83 / PR-63 promoted it to `info!` so the
+//!      diagnostic is visible under the default `RUST_LOG=info`
+//!      without operators having to discover the magic env-var
+//!      dance; PR-64 added the class breakdown to disambiguate
+//!      "interior space" vs "legitimate punctuation" vs
+//!      "high-bit Unicode artifact" — three different root causes
+//!      that the prior counts-only view couldn't tell apart. See
 //!      [`log_signature_diagnostics`] for the disclosure-budget
 //!      reasoning.
 //!
@@ -350,6 +356,7 @@ fn log_signature_diagnostics(
     let first_byte = sign_key_raw.first().copied().unwrap_or(0);
     let last_byte = sign_key_raw.last().copied().unwrap_or(0);
     let prefix_end = signature_hex.len().min(8);
+    let class = key_class_breakdown(sign_key_trimmed);
     tracing::info!(
         target: "aberp_nav_transport::signatures",
         operation_family,
@@ -362,9 +369,93 @@ fn log_signature_diagnostics(
         sign_key_nonalnum_trimmed = nonalnum_trimmed,
         sign_key_first_byte = format_args!("\\x{:02x}", first_byte),
         sign_key_last_byte = format_args!("\\x{:02x}", last_byte),
+        sign_key_class_alpha = class.alpha,
+        sign_key_class_digit = class.digit,
+        sign_key_class_punct = class.punctuation,
+        sign_key_class_whitespace = class.whitespace,
+        sign_key_class_control = class.control,
+        sign_key_class_high_bit = class.high_bit,
+        sign_key_nonalnum_bytes_hex = %class.nonalnum_bytes_hex,
         signature_hex_prefix_8 = &signature_hex[..prefix_end],
         "NAV requestSignature input metadata (no secret bytes logged)"
     );
+}
+
+/// Per-class byte counts + hex of every non-alphanumeric byte in the
+/// trimmed `xml_sign_key`. PR-64 / session-84 — session 83's diagnostic
+/// surfaced `sign_key_nonalnum_trimmed=2` for Ervin's NAV-test reject,
+/// but the existing two boundary-byte fields could not distinguish
+/// "two interior spaces from paste" (`\x20 \x20`) from "two legitimate
+/// NAV punctuation chars" (`\x2d \x5f`) from "two high-bit-set Unicode
+/// bytes" (e.g. `\xc3 \xa9` for UTF-8 `é`). The three root causes have
+/// three different fixes; this breakdown disambiguates them in one INFO
+/// line without requiring another submit-retry cycle.
+///
+/// **Disclosure budget.** The six per-class counts are zero per-byte
+/// disclosure — they expose the structural shape of the key but not
+/// any specific byte values. The `nonalnum_bytes_hex` field discloses
+/// up to N byte VALUES where N = `sign_key_nonalnum_trimmed`; for a
+/// typical 32-byte alphanumeric NAV key with a small paste artifact,
+/// that's 1-2 bytes out of 32 (3-6% of the key). The remaining 30 ish
+/// alphanumeric bytes stay hidden, leaving ~62^30 ≈ 10^53 brute-force
+/// entropy on the unknown positions — well above any practical attack
+/// threshold for an artifact that lands in an operator's terminal log
+/// and not in a publicly-shipped sink.
+///
+/// Classification is mutually exclusive. High-bit-set is checked first
+/// (a `0xC3` UTF-8 lead byte is not "alphabetic" even though
+/// `is_ascii_alphabetic()` happens to return false on it — explicit
+/// high-bit branch makes the intent clear). The remaining branches
+/// match Rust's `u8::is_ascii_*` definitions exactly so a future
+/// contributor reaching for a hand-rolled char check doesn't
+/// silently drift.
+fn key_class_breakdown(key: &[u8]) -> KeyClassBreakdown {
+    let mut b = KeyClassBreakdown::default();
+    for &byte in key {
+        if byte >= 0x80 {
+            b.high_bit += 1;
+        } else if byte.is_ascii_alphabetic() {
+            b.alpha += 1;
+        } else if byte.is_ascii_digit() {
+            b.digit += 1;
+        } else if byte.is_ascii_whitespace() {
+            b.whitespace += 1;
+        } else if byte.is_ascii_control() {
+            b.control += 1;
+        } else {
+            // Remaining printable-ASCII range (0x21..=0x7E minus
+            // alphanumeric) = `is_ascii_punctuation` per Rust's
+            // definition. Includes `-`, `_`, `+`, `/`, `=`, etc.
+            b.punctuation += 1;
+        }
+        if !byte.is_ascii_alphanumeric() {
+            if !b.nonalnum_bytes_hex.is_empty() {
+                b.nonalnum_bytes_hex.push(' ');
+            }
+            // Lowercase `{:02x}` (not `{:02X}`) so the breakdown
+            // visually differs from the uppercase-hex signature
+            // output — operators scanning the log don't conflate
+            // "the bytes that are suspect" with "the bytes I sent".
+            b.nonalnum_bytes_hex
+                .push_str(&format!("{byte:02x}"));
+        }
+    }
+    b
+}
+
+/// Per-class breakdown of an `xml_sign_key` byte slice. Returned by
+/// [`key_class_breakdown`]. Every byte falls into exactly one class
+/// (alpha, digit, punctuation, whitespace, control, high_bit). The
+/// sum of the six fields equals the input length.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct KeyClassBreakdown {
+    alpha: usize,
+    digit: usize,
+    punctuation: usize,
+    whitespace: usize,
+    control: usize,
+    high_bit: usize,
+    nonalnum_bytes_hex: String,
 }
 
 /// Encode a hash as uppercase hex. NAV's XSD types pin `[0-9A-F]{128}`;
@@ -774,6 +865,143 @@ mod tests {
         // trim. Pinning the negative case is what keeps the helper
         // honest about which bytes it accepts.
         assert_eq!(trim_ascii_ws(b"\x0Bx\x0B"), b"\x0Bx\x0B");
+    }
+
+    // ── PR-64 / session-84: key_class_breakdown pins ──────────────
+
+    /// A pure-alphanumeric key produces no nonalnum bytes, no
+    /// punctuation, no whitespace, no control, no high-bit. The
+    /// breakdown's nonalnum hex string is empty. This is the
+    /// "clean keychain" baseline; if Ervin's INFO line ever shows
+    /// `sign_key_class_*` all-zero except alpha + digit, the key
+    /// is clean and the signature mismatch lives somewhere else.
+    #[test]
+    fn key_class_breakdown_pure_alnum_has_zero_nonalnum() {
+        let b = key_class_breakdown(b"abcdefghijklmnop0123456789ABCDEF");
+        assert_eq!(b.alpha, 22);
+        assert_eq!(b.digit, 10);
+        assert_eq!(b.punctuation, 0);
+        assert_eq!(b.whitespace, 0);
+        assert_eq!(b.control, 0);
+        assert_eq!(b.high_bit, 0);
+        assert!(b.nonalnum_bytes_hex.is_empty());
+    }
+
+    /// Interior ASCII spaces (the most common paste artifact —
+    /// operator copied a key formatted in two halves) surface as
+    /// `whitespace=N` in the breakdown and `20 20` in the hex
+    /// string. PR-62's trim only removes boundary whitespace, so
+    /// interior spaces still participate in the hash and surface
+    /// here.
+    #[test]
+    fn key_class_breakdown_interior_space_surfaces_as_whitespace() {
+        let b = key_class_breakdown(b"abcdefghij klmnopqrstuvwxy012345");
+        assert_eq!(b.whitespace, 1);
+        assert_eq!(b.punctuation, 0);
+        assert_eq!(b.high_bit, 0);
+        assert_eq!(b.nonalnum_bytes_hex, "20");
+    }
+
+    /// ASCII punctuation (the "NAV's key legitimately contains
+    /// hyphens" hypothesis) surfaces as `punctuation=N`. Distinct
+    /// from whitespace — operator can tell from one INFO line
+    /// whether the artifact is a space or a legitimate symbol.
+    #[test]
+    fn key_class_breakdown_ascii_punctuation_distinct_from_whitespace() {
+        let b = key_class_breakdown(b"abc-def_ghi+jkl/mno=pqr.stu");
+        assert_eq!(b.punctuation, 6);
+        assert_eq!(b.whitespace, 0);
+        assert_eq!(b.high_bit, 0);
+        // Six punctuation chars in order: - _ + / = .
+        //   0x2d 0x5f 0x2b 0x2f 0x3d 0x2e
+        assert_eq!(b.nonalnum_bytes_hex, "2d 5f 2b 2f 3d 2e");
+    }
+
+    /// High-bit-set bytes (UTF-8 sequences for non-ASCII chars,
+    /// e.g. operator pasted from a portal that auto-corrected
+    /// `é` into a 2-byte UTF-8 sequence) surface as
+    /// `high_bit=N`. Distinct from ASCII whitespace and
+    /// punctuation — the breakdown distinguishes "operator typed
+    /// curly quote" from "operator typed straight quote".
+    #[test]
+    fn key_class_breakdown_high_bit_distinct_from_ascii_classes() {
+        // UTF-8 for "é" = 0xc3 0xa9 ; for "ö" = 0xc3 0xb6.
+        let b = key_class_breakdown(b"abc\xc3\xa9def\xc3\xb6");
+        assert_eq!(b.high_bit, 4);
+        assert_eq!(b.whitespace, 0);
+        assert_eq!(b.punctuation, 0);
+        assert_eq!(b.alpha, 6);
+        assert_eq!(b.nonalnum_bytes_hex, "c3 a9 c3 b6");
+    }
+
+    /// ASCII control bytes (NUL, BEL, BS, etc.) surface as
+    /// `control=N`. Distinct from whitespace per Rust's
+    /// definition — VT (0x0B) is control, not whitespace.
+    /// Pinned negatively here so a future contributor switching
+    /// to a custom check doesn't quietly merge the two classes.
+    #[test]
+    fn key_class_breakdown_ascii_control_distinct_from_whitespace() {
+        // VT (0x0B) is control per Rust's `u8::is_ascii_control`.
+        // NUL (0x00) is also control. Both should land in `control`,
+        // not `whitespace`.
+        let b = key_class_breakdown(b"abc\x0bdef\x00ghi");
+        assert_eq!(b.control, 2);
+        assert_eq!(b.whitespace, 0);
+        assert_eq!(b.alpha, 9);
+        assert_eq!(b.nonalnum_bytes_hex, "0b 00");
+    }
+
+    /// Every byte falls into exactly one class — sum of the six
+    /// counts equals the input length. Pin so a future refactor
+    /// that adds a new class (or changes a branch's order) is
+    /// loud-failed if the partition stops being mutually
+    /// exclusive.
+    #[test]
+    fn key_class_breakdown_counts_partition_the_input() {
+        let inputs: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"0123456789",
+            b"  \t\r\nVT-only-here",
+            b"\x00\x01\x7f",
+            b"\xc3\xa9\xc3\xb6",
+            b"mix3d-K3y_W1th.lots+of$junk?",
+            // 32-char NAV-shape key with two interior `\xa0` NBSPs
+            // (Latin-1 non-breaking space) that `trim_ascii_ws`
+            // does NOT trim — exactly the "session-84 case (3)"
+            // shape session 83 named.
+            b"abc\xa0defghij\xa0klmnopqrstuvwxyz012345",
+        ];
+        for &input in inputs {
+            let b = key_class_breakdown(input);
+            assert_eq!(
+                b.alpha + b.digit + b.punctuation + b.whitespace + b.control + b.high_bit,
+                input.len(),
+                "class partition does not sum to input length on input {:?}",
+                input
+            );
+        }
+    }
+
+    /// The hex string preserves byte order — second nonalnum byte
+    /// in the input is the second hex pair in the output. Pin so
+    /// a future contributor reaching for a HashSet (which would
+    /// dedupe and reorder) is loud-failed.
+    #[test]
+    fn key_class_breakdown_nonalnum_hex_preserves_input_order() {
+        let b = key_class_breakdown(b"a-b_c+d");
+        assert_eq!(b.nonalnum_bytes_hex, "2d 5f 2b");
+    }
+
+    /// Empty input produces a zeroed breakdown with empty hex.
+    /// `log_signature_diagnostics` does not call this on the raw
+    /// key (which could be empty per `from_keychain` edge cases),
+    /// but the function must not panic on empty input regardless.
+    #[test]
+    fn key_class_breakdown_empty_input_is_zeroed() {
+        let b = key_class_breakdown(b"");
+        assert_eq!(b, KeyClassBreakdown::default());
+        assert!(b.nonalnum_bytes_hex.is_empty());
     }
 
     #[test]
