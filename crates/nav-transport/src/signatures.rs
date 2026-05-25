@@ -20,6 +20,16 @@
 //!      produce `INVALID_REQUEST_SIGNATURE` rejections. See
 //!      [`trim_ascii_ws`] for the full rationale.
 //!
+//!      Each signature computation also emits one `tracing::info!`
+//!      line with lengths, non-alphanumeric byte counts, the raw
+//!      key's first and last byte (hex), and the first 8 hex chars
+//!      of the resulting digest. PR-62 emitted this at `debug!` —
+//!      session-83 / PR-63 promoted it to `info!` so the diagnostic
+//!      is visible under the default `RUST_LOG=info` without operators
+//!      having to discover the magic env-var dance. See
+//!      [`log_signature_diagnostics`] for the disclosure-budget
+//!      reasoning.
+//!
 //!      For `manageInvoice` and `manageAnnulment` the input is extended by a
 //!      per-invoice-index suffix:
 //!
@@ -60,6 +70,14 @@
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use sha2::{Digest as _, Sha512};
+// `sha3::Sha3_512` is the RustCrypto **FIPS 202 / Keccak** SHA3-512
+// — NOT SHA-2/512. NAV's v3.0 `<requestSignature cryptoType="SHA3-512">`
+// names FIPS 202. Distinct crate (`sha3` vs `sha2`), distinct hash family.
+// Session-83 / PR-63 audit pinned this against the SHA-2/512 lookalike;
+// see `request_signature_pins_known_sha3_512_vector` below — the test
+// hardcodes a precomputed Keccak digest that differs byte-for-byte from
+// the SHA-2/512 digest of the same input, so an accidental swap to
+// `sha2::Sha512` here would loud-fail at test time, not at NAV reject time.
 use sha3::Sha3_512;
 
 /// SHA-512 of `password` rendered as uppercase hex. Used as the per-request
@@ -92,6 +110,21 @@ pub fn password_hash(password: &[u8]) -> String {
 pub fn request_signature(request_id: &str, request_timestamp: &str, xml_sign_key: &[u8]) -> String {
     let key = trim_ascii_ws(xml_sign_key);
     let mut hasher = Sha3_512::new();
+    // Concatenation audit pinned in session-83 / PR-63:
+    //   - ORDER:     request_id, then request_timestamp, then sign_key.
+    //                Matches ADR-0009 §4 + ADR-0020 §2. Reordering produces
+    //                INVALID_REQUEST_SIGNATURE; the three `update()` calls
+    //                below ARE the wire order.
+    //   - SEPARATOR: none. NAV does not insert any byte between the parts.
+    //                Three back-to-back `update()`s with no padding byte
+    //                (verified by the empty-input test below, which equals
+    //                SHA3-512("") exactly).
+    //   - CASE:      `.as_bytes()` preserves the caller's case verbatim.
+    //                NAV is case-sensitive on all three inputs.
+    //   - ENCODING:  `.as_bytes()` returns the UTF-8 byte stream of the
+    //                `&str`, NOT codepoints. ASCII inputs hash identically
+    //                to their byte form. The sign_key is already `&[u8]`,
+    //                so no transcoding is possible there.
     hasher.update(request_id.as_bytes());
     hasher.update(request_timestamp.as_bytes());
     hasher.update(key);
@@ -146,6 +179,12 @@ pub fn request_signature_manage(
 ) -> String {
     let key = trim_ascii_ws(xml_sign_key);
     let mut hasher = Sha3_512::new();
+    // Same concatenation properties as `request_signature` above
+    // (order, no separator, case-preserved, UTF-8 bytes). Pinned in
+    // session-83 / PR-63 audit. The manage variant appends per-index
+    // suffix hex strings AFTER the sign_key, in the index order the
+    // caller supplied (which must equal the wire order — enforced at
+    // the call site in `crate::soap::render_manage_invoice_request`).
     hasher.update(request_id.as_bytes());
     hasher.update(request_timestamp.as_bytes());
     hasher.update(key);
@@ -247,20 +286,46 @@ fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
-/// PR-62 / session-82 — emit one structured `tracing::debug!` line per
-/// signature computation. NO secret bytes are logged — only lengths,
-/// non-alphanumeric byte counts (a smell for whitespace / BOM / non-
-/// ASCII drift), and the first 16 hex chars of the resulting signature.
+/// Session-83 / PR-63 — emit one structured `tracing::info!` line per
+/// signature computation. PR-62 introduced this at `debug!` so it was
+/// silent under the default `RUST_LOG=info` and Ervin's terminal showed
+/// nothing after the retry; the second `INVALID_REQUEST_SIGNATURE` we
+/// could not triangulate. Promoted to `info!` so it is **always**
+/// visible in the operator's terminal without extra env vars — one
+/// line per submit, ~250 bytes, well inside any reasonable log budget.
 ///
-/// The 16-char prefix is enough to triangulate against a NAV-side echo
-/// when one is available but is **not** enough to recover the key. The
-/// raw vs trimmed length pair is the load-bearing diagnostic: if they
-/// differ, the keychain blob has whitespace and the trim path saved
-/// the request.
+/// **No secret bytes are logged.** Disclosure budget per the
+/// session-83 brief:
 ///
-/// Logged at `debug!` (not `info!`) so a normal production session
-/// stays quiet; operators triaging a signature reject add
-/// `RUST_LOG=aberp_nav_transport::signatures=debug` to surface the line.
+///   - `request_id`, `request_id_len`, `request_timestamp`:
+///     not secret — NAV echoes both back verbatim in every response,
+///     and they appear in the audit-ledger payload. Logging them lets
+///     us correlate this line with NAV's reject body byte-for-byte.
+///   - `sign_key_len_raw`, `sign_key_len_trimmed`,
+///     `sign_key_nonalnum_raw`, `sign_key_nonalnum_trimmed`:
+///     lengths and class-counts only, never bytes. If `raw != trimmed`
+///     the keychain blob has boundary whitespace and PR-62's trim
+///     path saved the request. If `nonalnum_trimmed > 0` the key
+///     still has non-alphanumeric bytes after trim (BOM, mid-string
+///     whitespace, non-ASCII) — surface for follow-up.
+///   - `sign_key_first_byte` / `sign_key_last_byte`:
+///     two single-byte hex values. Two bytes out of (typically) 32
+///     leak too little entropy to attack the key, but they catch the
+///     entire "is the boundary clean?" class of bug — a NAV-portal
+///     copy whose first byte is `\x20` (space) or `\xef` (UTF-8 BOM
+///     lead) is instantly visible. Reported on the **raw** key so
+///     the trim path's effect is observable from the log.
+///   - `signature_hex_prefix_8`:
+///     first eight hex chars of the SHA3-512 output. The full digest
+///     is 128 hex chars; eight is 32 bits, not enough to attack a
+///     SHA3-512 inversion, but enough to triangulate against a
+///     NAV-side echo when one becomes available, and enough to
+///     distinguish two same-input calls (which should match) from
+///     two different-input calls (which should not).
+///
+/// Format: one structured `tracing` event with all fields named, so
+/// `RUST_LOG=info` operators see a single human-readable line and
+/// machine-readable shippers (JSON sink) get the fields tagged.
 fn log_signature_diagnostics(
     operation_family: &'static str,
     request_id: &str,
@@ -277,18 +342,28 @@ fn log_signature_diagnostics(
         .iter()
         .filter(|b| !b.is_ascii_alphanumeric())
         .count();
-    let prefix_end = signature_hex.len().min(16);
-    tracing::debug!(
+    // Single-byte first/last reports on the RAW key, so the operator
+    // sees what landed in the keychain blob — the trimmed key just
+    // hides paste artifacts. Empty key → report 0x00 sentinel; NAV
+    // would reject an empty key for a different reason anyway, but
+    // the log must not panic.
+    let first_byte = sign_key_raw.first().copied().unwrap_or(0);
+    let last_byte = sign_key_raw.last().copied().unwrap_or(0);
+    let prefix_end = signature_hex.len().min(8);
+    tracing::info!(
         target: "aberp_nav_transport::signatures",
         operation_family,
         request_id,
+        request_id_len = request_id.len(),
         request_timestamp,
         sign_key_len_raw = sign_key_raw.len(),
         sign_key_len_trimmed = sign_key_trimmed.len(),
         sign_key_nonalnum_raw = nonalnum_raw,
         sign_key_nonalnum_trimmed = nonalnum_trimmed,
-        signature_hex_prefix = &signature_hex[..prefix_end],
-        "computed NAV requestSignature (no secret bytes logged)"
+        sign_key_first_byte = format_args!("\\x{:02x}", first_byte),
+        sign_key_last_byte = format_args!("\\x{:02x}", last_byte),
+        signature_hex_prefix_8 = &signature_hex[..prefix_end],
+        "NAV requestSignature input metadata (no secret bytes logged)"
     );
 }
 
