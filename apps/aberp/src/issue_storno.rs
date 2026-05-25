@@ -88,7 +88,7 @@
 //!    trigger for the migrated-base path: the first PR that lands the
 //!    Billingo migration read (ADR-0010 build phase).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aberp_audit_ledger::{
     self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId,
@@ -128,37 +128,15 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
         serde_json::from_slice(&input_bytes).context("parse input JSON")?;
     tracing::info!(lines = input.lines.len(), "JSON input parsed");
 
-    if input.lines.is_empty() {
-        return Err(anyhow!("input JSON has no lines"));
-    }
-
-    // 2. Resolve tenant id + series code (loud-fail on invalid input).
-    let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
-        anyhow!(
-            "--tenant value '{}' is empty or has a null byte",
-            args.tenant
-        )
-    })?;
-    let series_code = SeriesCode::new(args.series.clone()).ok_or_else(|| {
-        anyhow!(
-            "--series value '{}' fails SeriesCode validation",
-            args.series
-        )
-    })?;
-
-    // Validate the --references shape minimally up-front. The full
-    // existence + finalized check happens in step 5 (audit-ledger
-    // walk) and step 7 (DB row load); a malformed prefix is cheaper
-    // to reject here than to discover via a "no such invoice" load.
-    if !args.references.starts_with("inv_") {
-        bail!(
-            "--references value '{}' is not a prefixed invoice id (expected inv_<ULID>)",
-            args.references
-        );
-    }
-
     // 3. Load NAV credentials BEFORE any DB write — same Actor-identity
-    //    discipline as `issue_invoice.rs` step 3, closes F15.
+    //    discipline as `issue_invoice.rs` step 3, closes F15. PR-47α /
+    //    session-64: the actor derivation moves here (the CLI wrapper)
+    //    so the library helper `storno_from_inputs` can be called from
+    //    the SPA route with a pre-loaded actor (the route mints its own
+    //    Actor from the AppState's startup-cached operator_login; reading
+    //    keychain credentials per route is the submit/poll posture
+    //    (A159) — but for storno the route does not need NavCredentials
+    //    at all since storno does not call NAV).
     let credentials = NavCredentials::load_from_keychain(&args.tenant)
         .context("load NAV credentials from OS keychain")?;
     let session_id = Ulid::new().to_string();
@@ -170,6 +148,107 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
         "NAV credentials loaded; actor derived for this CLI invocation"
     );
 
+    let summary = storno_from_inputs(
+        input,
+        &args.db,
+        &args.tenant,
+        &args.series,
+        &args.references,
+        args.out.clone(),
+        actor,
+    )?;
+
+    println!(
+        "issued storno {} -> {} (references {} as modificationIndex {}, audit chain verified across {} entries)",
+        summary.invoice_number,
+        args.out.display(),
+        args.references,
+        summary.modification_index,
+        summary.entries_verified,
+    );
+    Ok(())
+}
+
+/// PR-47α / session-64 — operator-visible summary of a single storno
+/// issuance, returned by [`storno_from_inputs`]. Mirrors the shape of
+/// `issue_invoice::IssuedInvoiceSummary` (the same wire-level data
+/// the SPA route surfaces back to the SPA so the modal can re-fetch
+/// the base invoice's audit-trail + flip the chip without an extra
+/// round-trip). `entries_verified` matches the `Ledger::verify_chain`
+/// return — the same shape submit/poll-ack already surface.
+#[derive(Debug, Clone)]
+pub struct StornoIssuedSummary {
+    /// Prefixed-ULID id of the storno invoice itself
+    /// (`inv_<ULID>`). Distinct from the BASE invoice's id — the
+    /// caller already knows which base was stornoed.
+    pub invoice_id: String,
+    /// NAV-facing number of the storno (`<series>/<5-digit-seq>`).
+    pub invoice_number: String,
+    /// 1-based chain index allocated to this storno per ADR-0023 §4
+    /// (`modificationIndex` on the wire).
+    pub modification_index: u32,
+    /// Ledger entry count `verify_chain` walked. Mirrors the
+    /// `entries_verified` field on the submit/poll-ack response
+    /// bodies; the SPA renders this verbatim for parity.
+    pub entries_verified: u64,
+}
+
+/// PR-47α / session-64 — library helper that wires the storno
+/// pipeline over an already-parsed `InvoiceInputJson` + an already-
+/// derived `Actor`. The CLI's `run` calls into this after parsing the
+/// `--in` file and loading NAV credentials; the SPA route calls into
+/// this after reading the side-stored `<ULID>.input.json` (written at
+/// issuance time per A174) and minting an Actor from
+/// `AppState::operator_login`.
+///
+/// Mirrors `issue_invoice::issue_from_parsed` per A159's library-helper
+/// posture. `pub` so the integration test (`tests/serve_storno_route.rs`)
+/// can drive it without spinning the HTTPS listener.
+///
+/// Steps 1-2 + 4-10 from the pre-PR-47α `run` body, moved here verbatim.
+/// Step 3 (NAV-creds + actor derivation) stays on the caller because
+/// the SPA route loads creds differently (per-request, A159) — but
+/// for storno the route does not even need creds (storno does not
+/// call NAV). The CLI path stays compatible by passing the same
+/// `Actor::from_local_cli` it always built.
+pub fn storno_from_inputs(
+    input: InvoiceInputJson,
+    db: &Path,
+    tenant_str: &str,
+    series_str: &str,
+    references: &str,
+    nav_xml_out: PathBuf,
+    actor: Actor,
+) -> Result<StornoIssuedSummary> {
+    if input.lines.is_empty() {
+        return Err(anyhow!("input JSON has no lines"));
+    }
+
+    // 2. Resolve tenant id + series code (loud-fail on invalid input).
+    let tenant = TenantId::new(tenant_str.to_string()).ok_or_else(|| {
+        anyhow!(
+            "tenant value '{}' is empty or has a null byte",
+            tenant_str
+        )
+    })?;
+    let series_code = SeriesCode::new(series_str.to_string()).ok_or_else(|| {
+        anyhow!(
+            "series value '{}' fails SeriesCode validation",
+            series_str
+        )
+    })?;
+
+    // Validate the references shape minimally up-front. The full
+    // existence + finalized check happens in step 5 (audit-ledger
+    // walk) and step 7 (DB row load); a malformed prefix is cheaper
+    // to reject here than to discover via a "no such invoice" load.
+    if !references.starts_with("inv_") {
+        bail!(
+            "references value '{}' is not a prefixed invoice id (expected inv_<ULID>)",
+            references
+        );
+    }
+
     // 4. Compute binary hash + ledger meta. Cloned per-append.
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
@@ -180,7 +259,7 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
     //     Loud-fail before any allocator tx opens so the
     //     sequence-slot invariant is preserved.
     let pending_count = crate::submission_queue::count_pending(
-        &args.db,
+        db,
         tenant.clone(),
         binary_hash_bytes,
     )
@@ -199,16 +278,16 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
     //    SAVED). Open a fresh Ledger for the read; close it before
     //    opening the write transaction so the file lock is released.
     {
-        let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+        let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
             .context("open audit ledger for storno precondition check")?;
-        check_base_is_finalized(&ledger, &args.references)?;
+        check_base_is_finalized(&ledger, references)?;
         // ledger drops here, releasing the DuckDB read connection
     }
 
     // 6. Pre-tx setup: schemas + series. Reuses the helper shape
     //    `issue_invoice.rs` uses (kept inlined here to avoid a
     //    speculative shared-helper extraction — rule 2).
-    let (conn, series) = pre_tx_setup(&args.db, &series_code)?;
+    let (conn, series) = pre_tx_setup(db, &series_code)?;
 
     // 7. Build the IssueInvoiceCommand for the STORNO's own content
     //    + AllocateArgs. The storno burns its own sequence number;
@@ -240,18 +319,14 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
 
     // 8. One transaction across base-load + chain-index walk + storno
     //    allocator + three audit-ledger appends.
-    //
-    //    PR-18 / ADR-0031 §2: thread the storno's --out path so the
-    //    InvoiceDraftCreated payload records where the storno XML
-    //    will be written.
     let outcome = run_single_tx(
         conn,
         &ledger_meta,
         allocate_args,
         idempotency_key,
         actor,
-        &args.references,
-        args.out.clone(),
+        references,
+        nav_xml_out.clone(),
     )?;
 
     let storno = outcome.storno;
@@ -270,7 +345,7 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
     );
 
     // 9. Verify the audit chain — success-criterion gate.
-    let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+    let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
         .context("re-open audit ledger after storno commit")?;
     let verified = ledger
         .verify_chain()
@@ -279,7 +354,7 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
 
     // 9a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
     //     post-commit (matches the issue_invoice posture).
-    let mirror_path = audit_ledger::mirror_path_for(&args.db);
+    let mirror_path = audit_ledger::mirror_path_for(db);
     ledger
         .sync_mirror(&mirror_path)
         .context("sync audit-ledger mirror file after storno commit")?;
@@ -301,17 +376,6 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
             name: input.customer.name,
         },
     };
-    // The base's invoice-number-on-NAV is `<series>/<5-digit-seq>` —
-    // we don't know the base's *series* directly without another DB
-    // hop; for PR-10 we use the same series as the storno (the
-    // operator-default), which matches the storno-against-same-series
-    // case the ADR §1 default covers. The override path (operator
-    // sets a dedicated storno series) makes this denormalization
-    // wrong — surfaced as F22 in the PR-10 commit message; for PR-10
-    // the operator running issue-storno with --series different from
-    // the base's series is out of the supported surface (and the
-    // precondition check above does not load the base's series_id
-    // because we don't need it for chain-index allocation).
     let base_invoice_number = format!(
         "{}/{:05}",
         series_code.as_str(),
@@ -337,19 +401,20 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
         nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
         "NAV storno InvoiceData XML passed v3.0 invariant check"
     );
-    nav_xml::write_to_path(&args.out, &xml)?;
-    tracing::info!(path = %args.out.display(), bytes = xml.len(), "NAV storno XML written");
+    nav_xml::write_to_path(&nav_xml_out, &xml)?;
+    tracing::info!(path = %nav_xml_out.display(), bytes = xml.len(), "NAV storno XML written");
 
-    println!(
-        "issued storno {}/{:05} -> {} (references {} as modificationIndex {}, audit chain verified across {} entries)",
+    let invoice_number = format!(
+        "{}/{:05}",
         series_code.as_str(),
-        storno.sequence_number,
-        args.out.display(),
-        args.references,
-        modification_index,
-        verified,
+        storno.sequence_number
     );
-    Ok(())
+    Ok(StornoIssuedSummary {
+        invoice_id: storno.id.to_prefixed_string(),
+        invoice_number,
+        modification_index,
+        entries_verified: verified,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────

@@ -30,6 +30,7 @@
 #   ./run_desktop.sh --tenant default  # which tenant the backend uses (default: default)
 #   ./run_desktop.sh --db PATH         # DuckDB file path (default: ./aberp.duckdb)
 #   ./run_desktop.sh --build-spa       # rebuild the SPA front-end first (npm run build)
+#   ./run_desktop.sh --no-codesign     # skip the ad-hoc macOS codesign pre-step (PR-46β)
 #   ./run_desktop.sh -- --extra-arg    # everything after '--' is forwarded to the app
 #
 # Verified layout (per repo inspection 2026-05-24):
@@ -52,6 +53,25 @@
 #
 #   The CLI fallback `cargo run --bin aberp -- setup-nav-credentials
 #   --tenant <id>` is preserved for scripted / automation flows.
+#
+# AD-HOC CODESIGN PRE-STEP (PR-46β / session-63):
+#   Before launch we run `codesign --force --sign - target/<profile>/aberp`
+#   and the same for `aberp-ui`. The `--sign -` argument means an ad-hoc
+#   signature (no Apple Developer ID required) — its purpose is purely to
+#   give the Mach-O binary a stable code-signing identity across cargo
+#   rebuilds so the macOS keychain's "Always Allow" ACL persists for that
+#   identity. Without it, every `cargo run` produces a fresh binary that
+#   the keychain treats as a NEW client and re-prompts the operator for
+#   each of the four NAV-credential entries + the session-token entry.
+#   Five prompts × ~7s each blew the Tauri shell's 10s HANDSHAKE_TIMEOUT
+#   before this PR (a real regression Ervin saw at session-63 cold boot).
+#
+#   The codesign step is a no-op the first time the script runs on a
+#   freshly-cloned tree (the target/ binaries don't exist yet) — cargo
+#   then builds them and the next launch picks them up. The `|| true`
+#   tail keeps that no-op silent. Pass --no-codesign to opt out entirely
+#   (e.g. if another tool you use verifies against a different signing
+#   identity).
 #
 # The Tauri binary expects the SPA's built assets to be present. If you've
 # edited Svelte / TS source since the last build, pass --build-spa or run
@@ -83,6 +103,7 @@ mode="debug"
 tenant="${ABERP_TENANT:-$DEFAULT_TENANT}"
 db_path="${ABERP_DB:-./aberp.duckdb}"
 build_spa=0
+codesign_enabled=1
 extra_args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -91,8 +112,9 @@ while [[ $# -gt 0 ]]; do
     --tenant)       tenant="$2"; shift 2 ;;
     --db)           db_path="$2"; shift 2 ;;
     --build-spa)    build_spa=1; shift ;;
+    --no-codesign)  codesign_enabled=0; shift ;;
     --help|-h)
-      sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,65p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     --)             shift; extra_args=("$@"); break ;;
@@ -145,6 +167,30 @@ if [[ -f "${OPERATOR_DB_DEFAULT}.wal" ]] || [[ -f "${OPERATOR_DB_DEFAULT}.tmp" ]
   echo "[warn] possible stale DuckDB lock companion files near ${OPERATOR_DB_DEFAULT}"
   echo "       (a .wal or .tmp file exists — usually fine, DuckDB will recover on open;"
   echo "       if launch fails with 'database is locked', stop here and inspect)"
+fi
+
+# ---------- ad-hoc codesign (macOS keychain ACL stability) ------------------
+# See the AD-HOC CODESIGN PRE-STEP block at the top of this file for the
+# full WHY. Short version: a stable ad-hoc identity means the macOS
+# keychain's "Always Allow" ACL persists across cargo rebuilds, so the
+# five-prompt cold-boot cycle Ervin saw at session-63 doesn't recur on
+# subsequent launches.
+if [[ "$(uname -s)" == "Darwin" && $codesign_enabled -eq 1 ]]; then
+  if [[ "$mode" == "release" ]]; then
+    cs_dir="${REPO_ROOT}/target/release"
+  else
+    cs_dir="${REPO_ROOT}/target/debug"
+  fi
+  for cs_bin in aberp aberp-ui; do
+    if [[ -f "${cs_dir}/${cs_bin}" ]]; then
+      codesign --force --sign - "${cs_dir}/${cs_bin}" 2>/dev/null \
+        && echo "[codesign] ad-hoc signed ${cs_dir}/${cs_bin}" \
+        || echo "[codesign] could not sign ${cs_dir}/${cs_bin} (continuing — keychain may re-prompt)"
+    fi
+  done
+  unset cs_dir cs_bin
+elif [[ $codesign_enabled -eq 0 ]]; then
+  echo "[codesign] skipped (--no-codesign)"
 fi
 
 # ---------- launch ----------------------------------------------------------

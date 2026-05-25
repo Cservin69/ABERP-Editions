@@ -163,10 +163,12 @@
 
 
   import {
+    cancelInvoiceStorno,
     downloadInvoicePdf,
     getInvoice,
     pollAck,
     submitInvoice,
+    type Currency,
     type InvoiceDetail,
   } from "../lib/api";
   import {
@@ -206,10 +208,22 @@
      * top of the stack and the `$effect` below re-fetches into the
      * same modal. */
     onJumpBack: (index: number) => void;
+    /** PR-47β / session-65 — Modification button callback. Invoked
+     * when the operator clicks "Amend invoice (modification)" on a
+     * `Finalized` or `Amended` base. The parent opens the
+     * `ModificationInvoice` modal pre-filled from the base; the new
+     * modification's id is then surfaced via the modal's own
+     * `onAmended` and the parent navigates the detail modal to the
+     * chain child. */
+    onAmend: (
+      baseInvoiceId: string,
+      baseCurrency: Currency,
+      baseInvoiceNumber: string,
+    ) => void;
   }
 
-  let { invoiceId, ancestors, onClose, onNavigate, onJumpBack }: Props =
-    $props();
+  let { invoiceId, ancestors, onClose, onNavigate, onJumpBack, onAmend }:
+    Props = $props();
 
   let dialogEl: HTMLDialogElement | null = $state(null);
   let detail: InvoiceDetail | null = $state(null);
@@ -235,11 +249,19 @@
   // (disables every action button and shows an inline spinner glyph
   // on the active one); `error` to render the inline failure message
   // in the dialog header below the buttons.
+  // PR-47α / session-64 — `cancelling` extends the discriminator for
+  // the storno button. Shares the `mutationState` slot so only one
+  // mutation banner ever renders at once (same rationale as PR-44η).
   type MutationState =
     | { kind: "idle" }
     | { kind: "submitting" }
     | { kind: "polling" }
-    | { kind: "error"; action: "submit" | "poll"; message: string };
+    | { kind: "cancelling" }
+    | {
+        kind: "error";
+        action: "submit" | "poll" | "cancel";
+        message: string;
+      };
   let mutationState: MutationState = $state({ kind: "idle" });
   // PR-27 — per-row expanded-payload state. Reassignment pattern
   // (build a new Set on every toggle) guarantees Svelte 5
@@ -400,6 +422,65 @@
     }
   }
 
+  // PR-47β / session-65 — "Amend invoice (modification)" button
+  // handler. Unlike storno/submit/poll, modification opens a fresh
+  // form modal (operator-edited body); the actual issuance flow
+  // lives in `ModificationInvoice.svelte` and the parent listens for
+  // its `onAmended` callback to navigate to the new modification
+  // invoice. This handler just bubbles up the base's `invoice_id` +
+  // `currency` + a displayable identifier to the parent's modal-
+  // opening callback.
+  function triggerModification() {
+    if (!detail) return;
+    const baseNumber = `${detail.fiscal_year}-${String(
+      detail.sequence_number,
+    ).padStart(6, "0")}`;
+    onAmend(detail.invoice_id, detail.currency, baseNumber);
+  }
+
+  // PR-47α / session-64 — "Cancel invoice (storno)" button handler.
+  // POSTs to `/api/invoices/<id>/storno` via the matching Tauri
+  // command. A small `confirm` dialog runs first so a stray click
+  // doesn't burn a sequence number — the storno carves a fresh
+  // sequence slot (ADR-0023 §3) and writes three audit-ledger rows,
+  // none of which are reversible. On success refetches the base's
+  // detail so the chip flips to `Storno`, the audit-trail picks up
+  // the `InvoiceStornoIssued` chain-link row, and the `chain_children`
+  // list grows to include the new storno's id. The inline confirm
+  // uses the browser-native `window.confirm` to avoid a new modal
+  // component (CLAUDE.md rule 13 — no toast component, mirror
+  // posture for confirm).
+  async function triggerCancelStorno() {
+    if (!detail) return;
+    const number = `${detail.fiscal_year}-${String(
+      detail.sequence_number,
+    ).padStart(6, "0")}`;
+    const ok = window.confirm(
+      `Cancel invoice ${number}?\n\n` +
+        `A storno will be issued in the same currency at the same exchange rate. ` +
+        `This carves a fresh sequence number and writes three audit-ledger rows; ` +
+        `it cannot be reversed.`,
+    );
+    if (!ok) return;
+    mutationState = { kind: "cancelling" };
+    try {
+      await cancelInvoiceStorno(detail.invoice_id);
+      // Refetch so the base's audit-trail picks up the
+      // InvoiceStornoIssued chain-link row AND the chip flips from
+      // `Finalized` → `Storno` (the `is_storno_base` arm of
+      // derive_state's priority ladder, ADR-0036 §3) AND the
+      // `chain_children` list grows.
+      await load(detail.invoice_id);
+      mutationState = { kind: "idle" };
+    } catch (err: unknown) {
+      mutationState = {
+        kind: "error",
+        action: "cancel",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
   function signalClass(signal: LabelSignal): string {
     return `signal-${signal}`;
   }
@@ -498,7 +579,8 @@
           {@const buttons = buttonsForState(detail.state)}
           {@const mutationBusy =
             mutationState.kind === "submitting" ||
-            mutationState.kind === "polling"}
+            mutationState.kind === "polling" ||
+            mutationState.kind === "cancelling"}
           {#if buttons.includes("Submit")}
             <button
               type="button"
@@ -531,6 +613,34 @@
               {:else}
                 Poll ack now
               {/if}
+            </button>
+          {/if}
+          {#if buttons.includes("Storno")}
+            <button
+              type="button"
+              class="quiet-button"
+              onclick={triggerCancelStorno}
+              disabled={mutationBusy}
+              aria-label={mutationState.kind === "cancelling"
+                ? "Cancelling invoice via storno"
+                : "Cancel invoice (storno)"}
+            >
+              {#if mutationState.kind === "cancelling"}
+                <span aria-hidden="true">…</span> Cancelling
+              {:else}
+                Cancel invoice (storno)
+              {/if}
+            </button>
+          {/if}
+          {#if buttons.includes("Modification")}
+            <button
+              type="button"
+              class="quiet-button"
+              onclick={triggerModification}
+              disabled={mutationBusy}
+              aria-label="Amend invoice with a modification"
+            >
+              Amend invoice (modification)
             </button>
           {/if}
           {#if buttons.includes("Download")}
@@ -568,7 +678,11 @@
     {/if}
     {#if mutationState.kind === "error"}
       <p class="error download-error" role="alert">
-        {mutationState.action === "submit" ? "Submit" : "Poll ack"} failed: {mutationState.message}
+        {mutationState.action === "submit"
+          ? "Submit"
+          : mutationState.action === "poll"
+            ? "Poll ack"
+            : "Cancel invoice"} failed: {mutationState.message}
       </p>
     {/if}
 

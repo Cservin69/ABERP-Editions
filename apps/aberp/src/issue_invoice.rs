@@ -59,7 +59,7 @@ use aberp_nav_transport::NavCredentials;
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
@@ -113,14 +113,26 @@ pub const ERR_MNB_FETCH_FAILED: &str = "MNB rate-fetch failed";
 // Input JSON shape (NAV-aligned per Ervin's preference, session 5)
 // ──────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+// PR-47α / session-64 — `Serialize` added so the SPA-issue route can
+// side-store the operator's invoice-content payload alongside the
+// NAV-output XML at `~/.aberp/serve/<tenant>/issued/<ULID>.input.json`.
+// The storno route reads this sibling file back to reconstruct the
+// storno's own body content (lines + parties) — the storno's wire
+// content is the base's content, modulo the negation that the
+// `render_storno_data` emitter performs at render time. The CLI's
+// `--in <PATH>` flow does NOT consume the side-stored file (the CLI
+// operator owns their own JSON); side-store is purely the SPA-storno
+// reconstruction path. Field-name discipline matches the existing
+// `Deserialize`-side `serde(rename = "...")` so the round-trip preserves
+// the camelCase wire form.
+#[derive(Debug, Deserialize, Serialize)]
 pub struct InvoiceInputJson {
     pub supplier: SupplierJson,
     pub customer: CustomerJson,
     pub lines: Vec<LineJson>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SupplierJson {
     #[serde(rename = "taxNumber")]
     pub tax_number: String,
@@ -128,7 +140,7 @@ pub struct SupplierJson {
     pub address: AddressJson,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AddressJson {
     #[serde(rename = "countryCode")]
     pub country_code: String,
@@ -138,14 +150,14 @@ pub struct AddressJson {
     pub street: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CustomerJson {
     #[serde(rename = "taxNumber")]
     pub tax_number: String,
     pub name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct LineJson {
     pub description: String,
     pub quantity: u32,

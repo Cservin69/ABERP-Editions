@@ -34,11 +34,28 @@ use crate::push_recent_log;
 /// line. Post-PR-45a cold-start completes in well under 2s on a
 /// clean machine state (binary-hash compute is now off the handshake
 /// critical path; the listener bind + READY-line emit is essentially
-/// instantaneous after cert generation). A 10s ceiling stays
-/// generous so a slow first-launch (e.g. rcgen key gen on a
-/// power-throttled machine) does not surface as a spurious timeout.
-/// Beyond that we loud-fail per rule 12.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// instantaneous after cert generation).
+///
+/// PR-46β / session-63 — raised from 10s to 60s. On a freshly
+/// rebuilt macOS binary whose code-signing identity the keychain has
+/// not seen before, the credential-load step inside
+/// `serve.rs::run` triggers an OS keychain prompt per entry (one
+/// session-token + four NAV-credential entries = five prompts). The
+/// operator clicks Always Allow ~7s per prompt; the cumulative wall
+/// time blew the prior 10s ceiling and surfaced as a "boot failed"
+/// pane even though `aberp serve` itself was healthy. 60s is the
+/// observed upper bound for that first-prompt-cycle path. Once the
+/// `aberp` + `aberp-ui` binaries are ad-hoc-signed (the launcher
+/// `run/run_desktop.sh` handles this on Darwin), the keychain ACL
+/// persists across cargo rebuilds and subsequent launches complete
+/// in <2s — the 60s ceiling is purely insurance for the first
+/// prompt-cycle after a clean checkout or a deliberate keychain
+/// wipe.
+///
+/// Beyond this ceiling we loud-fail per CLAUDE.md rule 12; the floor
+/// is pinned at 30s by `handshake_timeout_floor_pin` so a future
+/// "let's tighten this back to 10s" cleanup is caught.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Outcome of a successful subprocess launch.
 pub struct StartedBackend {
@@ -241,5 +258,20 @@ mod tests {
             .expect("handshake after chatter must parse");
         assert_eq!(parsed.port, 12345);
         assert_eq!(parsed.fingerprint_hex, fp);
+    }
+
+    /// PR-46β / session-63 floor pin. A future "let's tighten this
+    /// back to 10s" cleanup must trip this test. The 30s floor is
+    /// half of the documented 60s ceiling — anything below 30s
+    /// re-opens the cold-keychain-ACL regression Ervin hit at
+    /// session-63 (~7s × 5 prompts).
+    #[test]
+    fn handshake_timeout_floor_pin() {
+        assert!(
+            HANDSHAKE_TIMEOUT >= Duration::from_secs(30),
+            "HANDSHAKE_TIMEOUT must stay >= 30s to absorb cold macOS \
+             keychain prompts on a freshly rebuilt binary (got {:?})",
+            HANDSHAKE_TIMEOUT
+        );
     }
 }

@@ -21,10 +21,16 @@ import type { InvoiceState } from "./api";
 
 /** Closed vocab of operator-visible action buttons that can appear
  * in the invoice-detail modal header. Kept narrow per CLAUDE.md
- * rule 3 (surgical) — three buttons today; a future PR may add
- * `RetrySubmission` / `Recover` / `MarkAbandoned` here when the SPA
- * surfaces those NAV-recovery affordances. */
-export type DetailActionButton = "Submit" | "PollAck" | "Download";
+ * rule 3 (surgical) — five buttons today (PR-47α added `Storno`,
+ * PR-47β added `Modification`); a future PR may add `RetrySubmission`
+ * / `Recover` / `MarkAbandoned` here when the SPA surfaces those
+ * NAV-recovery affordances. */
+export type DetailActionButton =
+  | "Submit"
+  | "PollAck"
+  | "Storno"
+  | "Modification"
+  | "Download";
 
 /** Per-state action-button visibility table. Returned in operator-
  * reading order (left-to-right on the modal header); the renderer
@@ -48,11 +54,28 @@ export function buttonsForState(state: InvoiceState): DetailActionButton[] {
       // The SPA does not surface those affordances yet — PR-44η scope
       // is the standard lifecycle only. Download stays available.
       return ["Download"];
-    case "Recovered":
     case "Finalized":
+      // PR-47α / session-64 — Finalized is the state where storno is
+      // legal (ADR-0023 §1: NAV terminal SAVED precondition).
+      // PR-47β / session-65 — Finalized is ALSO the base case for
+      // modification per ADR-0024 §6 (the `Finalized | Amended`
+      // accept set). The backend's `modification_invoice_request`
+      // precondition guard mirrors this; surfacing the button on a
+      // non-modifiable state would produce a 409 the operator was
+      // not warned about.
+      return ["Storno", "Modification", "Download"];
+    case "Amended":
+      // PR-47β / session-65 — Amended is the second arm of the
+      // modify-after-modify accept set (ADR-0024 §6 default-permit
+      // posture for chains of modifications). Storno is NOT in this
+      // arm: ADR-0024 §6 rejects modification of a stornoed base, and
+      // ADR-0023 §1 requires Finalized (SAVED) — an Amended base has
+      // no remaining SAVED ack at the top of its chain. The CLI's
+      // `issue-storno` would loud-fail at the precondition walker.
+      return ["Modification", "Download"];
+    case "Recovered":
     case "Rejected":
     case "Storno":
-    case "Amended":
     case "Abandoned":
     case "Unknown":
       // Terminal / read-only states: download only.

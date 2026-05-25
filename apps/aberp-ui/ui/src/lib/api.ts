@@ -377,6 +377,119 @@ export async function pollAck(invoiceId: string): Promise<PollAckResponse> {
   return invoke<PollAckResponse>("poll_ack", { invoiceId });
 }
 
+/** PR-47α / session-64 — wire response body for
+ * `POST /api/invoices/<id>/storno`. Mirrors `serve::StornoInvoiceResponse`.
+ * `invoice_id` + `invoice_number` identify the NEW storno (the operator
+ * already has the base in the modal); `state` is the BASE's new state
+ * after this route — always `Storno` per ADR-0036 §3. */
+export interface StornoInvoiceResponse {
+  invoice_id: string;
+  invoice_number: string;
+  state: InvoiceState;
+  modification_index: number;
+  entries_verified: number;
+}
+
+/** PR-47α / session-64 — POST the SPA's "Cancel invoice (storno)"
+ * button to the backend's `/api/invoices/<id>/storno` route via the
+ * matching Tauri command. No body — the backend resolves the
+ * operator's original invoice JSON from the side-stored input.json
+ * file written at issuance time per A174. Errors propagate as the
+ * rejected promise (including the typed 409 body for precondition
+ * mismatch); the caller renders the message inline (no toast
+ * component per A157). */
+export async function cancelInvoiceStorno(
+  invoiceId: string,
+): Promise<StornoInvoiceResponse> {
+  return invoke<StornoInvoiceResponse>("cancel_invoice_storno", {
+    invoiceId,
+  });
+}
+
+/** PR-47β / session-65 — wire request body for
+ * `POST /api/invoices/<id>/modification`. Mirrors
+ * `serve::ModificationInvoiceRequest`. Shape is the
+ * [`IssueInvoiceRequest`] fields plus an operator-supplied
+ * `modificationDate` per ADR-0024 §1 (canonical `YYYY-MM-DD`; no
+ * silent today-default). The `currency` MUST match the base invoice's
+ * stored currency per ADR-0037 §4 invariant C6 — the SPA's form locks
+ * the dropdown to the base's currency; the backend additionally
+ * enforces a 400 if the body's currency differs (defence in depth
+ * against a curl bypass). */
+export interface ModificationInvoiceRequest {
+  supplier: {
+    taxNumber: string;
+    name: string;
+    address: {
+      countryCode: string;
+      postalCode: string;
+      city: string;
+      street: string;
+    };
+  };
+  customer: {
+    taxNumber: string;
+    name: string;
+  };
+  lines: Array<{
+    description: string;
+    quantity: number;
+    unitPrice: number;
+    vatRatePercent: number;
+  }>;
+  currency: Currency;
+  /** ADR-0024 §1 — operator-supplied `YYYY-MM-DD`. Frozen onto the
+   * `InvoiceModificationIssued` audit payload at issuance time. */
+  modificationDate: string;
+  /** Optional series code; backend defaults to `"INV-default"` when
+   * omitted. Same posture as [`IssueInvoiceRequest.series`]. */
+  series?: string;
+}
+
+/** PR-47β / session-65 — wire response body for
+ * `POST /api/invoices/<id>/modification`. Mirrors
+ * `serve::ModificationInvoiceResponse`. `invoice_id` + `invoice_number`
+ * identify the NEW modification; `state` is the BASE's new state
+ * after this route — always `Amended` per ADR-0036 §3. */
+export interface ModificationInvoiceResponse {
+  invoice_id: string;
+  invoice_number: string;
+  state: InvoiceState;
+  modification_index: number;
+  entries_verified: number;
+}
+
+/** PR-47β / session-65 — POST the SPA's "Amend invoice (modification)"
+ * button to the backend's `/api/invoices/<id>/modification` route via
+ * the matching Tauri command. Unlike storno, the body IS operator-
+ * edited (full corrected invoice content + `modificationDate`).
+ * Errors propagate as the rejected promise (including the typed 400
+ * body for C6 currency mismatch and the typed 409 for precondition
+ * mismatch); the caller renders the message inline per A157. */
+export async function amendInvoiceModification(
+  invoiceId: string,
+  body: ModificationInvoiceRequest,
+): Promise<ModificationInvoiceResponse> {
+  return invoke<ModificationInvoiceResponse>("amend_invoice_modification", {
+    invoiceId,
+    body,
+  });
+}
+
+/** PR-47β / session-65 — GET the operator's original
+ * [`IssueInvoiceRequest`]-shaped body side-stored at issuance time
+ * (per A174). The SPA's modification modal calls this on open to
+ * pre-fill its form so the operator edits in place rather than
+ * retyping the entire invoice. On 404 (CLI-issued invoice or
+ * pre-PR-47α SPA-issued) the promise rejects with the backend's
+ * loud-fail message; the caller catches and falls back to an empty
+ * form with an explanatory banner. */
+export async function getIssuanceInput(
+  invoiceId: string,
+): Promise<IssueInvoiceRequest> {
+  return invoke<IssueInvoiceRequest>("get_issuance_input", { invoiceId });
+}
+
 /** PR-45a / session-61 — boot lifecycle status the Tauri shell
  * exposes so the SPA can render a loading / error pane instead of
  * sitting blank while `aberp serve` cold-boots. PR-46α / session-62

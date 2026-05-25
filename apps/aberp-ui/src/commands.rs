@@ -122,6 +122,70 @@ pub async fn poll_ack(
     forward_post(&state, &path, Value::Null).await
 }
 
+/// PR-47α / session-64 — `POST /api/invoices/<id>/storno`; the SPA's
+/// "Cancel invoice (storno)" button on the invoice-detail modal posts
+/// here. No body — the backend resolves the operator's original
+/// invoice-content JSON from the side-stored `<ULID>.input.json` (per
+/// A174) and the base's NAV XML path from the audit ledger.
+///
+/// Returns the backend's typed response body (`{invoice_id,
+/// invoice_number, state, modification_index, entries_verified}`).
+/// On precondition mismatch (base not in `Finalized`) the backend
+/// returns 409; the SPA renders the typed error body inline per A157.
+#[tauri::command]
+pub async fn cancel_invoice_storno(
+    state: State<'_, AppState>,
+    invoice_id: String,
+) -> Result<Value, String> {
+    validate_invoice_id(&invoice_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/invoices/{invoice_id}/storno");
+    forward_post(&state, &path, Value::Null).await
+}
+
+/// PR-47β / session-65 — `POST /api/invoices/<id>/modification`; the
+/// SPA's "Amend invoice (modification)" button on the invoice-detail
+/// modal posts here with the operator-edited body (full corrected
+/// invoice content + operator-supplied `modificationDate`). Unlike
+/// storno, modification IS operator-edited — the new wire content can
+/// differ from the base's, but the currency must match (ADR-0037 §4
+/// invariant C6, enforced 400 at the route layer).
+///
+/// Returns the backend's typed response body (`{invoice_id,
+/// invoice_number, state, modification_index, entries_verified}`).
+/// On precondition mismatch (base not in `Finalized` or `Amended`)
+/// the backend returns 409; on C6 mismatch the backend returns 400.
+/// The SPA renders both inline per A157.
+#[tauri::command]
+pub async fn amend_invoice_modification(
+    state: State<'_, AppState>,
+    invoice_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_invoice_id(&invoice_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/invoices/{invoice_id}/modification");
+    forward_post(&state, &path, body).await
+}
+
+/// PR-47β / session-65 — `GET /api/invoices/<id>/issuance-input`;
+/// returns the operator's original [`InvoiceInputJson`] side-stored
+/// alongside the NAV XML at issuance time (per A174). The SPA's
+/// modification modal calls this on open to pre-fill its form fields
+/// so the operator edits in place rather than retyping.
+///
+/// On 404 (no side-stored input — CLI-issued or pre-PR-47α SPA-issued)
+/// the forwarding helper surfaces the error string; the SPA detects
+/// the "no side-stored issuance input" message and falls back to a
+/// fresh empty form with an explanatory banner.
+#[tauri::command]
+pub async fn get_issuance_input(
+    state: State<'_, AppState>,
+    invoice_id: String,
+) -> Result<Value, String> {
+    validate_invoice_id(&invoice_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/invoices/{invoice_id}/issuance-input");
+    forward_get(&state, &path, true).await
+}
+
 /// PR-45a / session-61 — boot lifecycle snapshot the SPA polls
 /// while it's deciding which screen to render. Returns a JSON object
 /// with three fields:

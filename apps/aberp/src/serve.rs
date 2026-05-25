@@ -95,6 +95,8 @@ use crate::invoice_currency_metadata::{
     load_invoice_currency_metadata_in_tx, InvoiceCurrencyMetadata,
 };
 use crate::issue_invoice::{self, InvoiceInputJson};
+use crate::issue_modification;
+use crate::issue_storno;
 use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
 use crate::poll_ack;
 use crate::print_invoice;
@@ -641,6 +643,15 @@ fn build_router(state: AppState) -> Router {
         .route("/invoices/:id/pdf", get(handle_get_invoice_pdf))
         .route("/invoices/:id/submit", post(handle_submit_invoice))
         .route("/invoices/:id/poll-ack", post(handle_poll_ack))
+        .route("/api/invoices/:id/storno", post(handle_storno_invoice))
+        .route(
+            "/api/invoices/:id/modification",
+            post(handle_modification_invoice),
+        )
+        .route(
+            "/api/invoices/:id/issuance-input",
+            get(handle_get_issuance_input),
+        )
         .route("/audit/:invoice_id", get(handle_get_audit))
         // PR-46α / session-62 — first-run setup route. Accepts the
         // four NAV credential artifacts and writes them to the OS
@@ -1516,6 +1527,28 @@ pub fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         customer: request.customer,
         lines: request.lines,
     };
+    // PR-47α / session-64 — side-store the InvoiceInputJson alongside
+    // the NAV-XML output path so the SPA storno route can reconstruct
+    // the storno's own body content (lines + parties) without parsing
+    // the rendered NAV XML back out (the renderer's flat-string
+    // supplierTaxNumber emit and the nested-taxpayerId customer emit
+    // diverge, so an XML-back parser would be the wrong abstraction).
+    // The sibling-path convention matches `sibling_input_json_path`
+    // both at write (here) and at read (the storno route).
+    //
+    // Write the input.json BEFORE `issue_from_parsed` so a failed write
+    // aborts the issuance entirely — better than half-issued state
+    // where the NAV XML lands on disk but the storno path can't find
+    // its companion (CLAUDE.md rule 12, fail loud).
+    let input_json_path = sibling_input_json_path(&xml_path);
+    let input_json_bytes = serde_json::to_vec(&input)
+        .context("serialize side-stored InvoiceInputJson (PR-47α / A174)")?;
+    std::fs::write(&input_json_path, &input_json_bytes).with_context(|| {
+        format!(
+            "side-store InvoiceInputJson at {} (PR-47α)",
+            input_json_path.display()
+        )
+    })?;
     let series = request
         .series
         .as_deref()
@@ -1530,6 +1563,31 @@ pub fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         actor,
         provider,
     )
+}
+
+/// PR-47α / session-64 — given an issued NAV-XML path, return the
+/// sibling `<ULID>.input.json` path the SPA-issue route side-stores
+/// the operator's `InvoiceInputJson` to. The storno route reads back
+/// from the same sibling computation so a renamed/moved XML carries
+/// its companion in lockstep.
+///
+/// Replaces the trailing `.xml` extension with `.input.json`. If the
+/// path has no `.xml` extension (impossible via `mint_issued_xml_path`
+/// but documented for the test path), falls back to appending the
+/// suffix — the result is still deterministic + recoverable.
+pub fn sibling_input_json_path(xml_path: &std::path::Path) -> std::path::PathBuf {
+    if xml_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("xml"))
+        .unwrap_or(false)
+    {
+        xml_path.with_extension("input.json")
+    } else {
+        let mut s = xml_path.as_os_str().to_owned();
+        s.push(".input.json");
+        std::path::PathBuf::from(s)
+    }
 }
 
 /// PR-44ζ / session-59 — mint a per-issuance NAV-XML on-disk path
@@ -1924,6 +1982,583 @@ pub fn poll_ack_request(
         actor,
     )
     .map_err(SubmitRouteError::Other)
+}
+
+// ── PR-47α / session-64 — POST /api/invoices/:id/storno ──────────────
+
+/// PR-47α / session-64 — wire response body for
+/// `POST /api/invoices/:id/storno`. Mirrors the submit / poll-ack
+/// response shape — the SPA reads `invoice_id` + `invoice_number` for
+/// the new storno (NOT the base, which the operator already has open
+/// in the detail modal) so it can render the new chain-child row
+/// inline; `state` is always `Storno` on the BASE invoice after this
+/// route succeeds (the base flips from `Finalized` → `Storno` via
+/// `derive_state`'s `is_storno_base` arm), so the SPA can flip the
+/// chip without a separate `getInvoice` roundtrip; `entries_verified`
+/// is the post-commit `Ledger::verify_chain` count, surfaced for
+/// parity with the existing mutation routes.
+#[derive(Debug, Serialize)]
+struct StornoInvoiceResponse {
+    invoice_id: String,
+    invoice_number: String,
+    /// The base invoice's NEW state after this route succeeds. Always
+    /// `Storno` per ADR-0036 §3 — the `is_storno_base` arm of
+    /// `derive_state`'s priority ladder fires once an
+    /// `InvoiceStornoIssued` audit row exists for the base.
+    state: InvoiceState,
+    modification_index: u32,
+    entries_verified: u64,
+}
+
+/// PR-47α / session-64 — `POST /api/invoices/:id/storno` handler.
+///
+/// Operator-pathless mutation route that wraps the existing
+/// `issue_storno::storno_from_inputs` library helper. The SPA renders
+/// a "Cancel invoice (storno)" button on the invoice-detail modal
+/// when the base is in `Finalized` state; this route is the end-to-
+/// end backend leg.
+///
+/// 1. Bearer-auth check (post-Ready); 503 in NeedsSetup.
+/// 2. Precondition: derive base's state; loud-fail 409 unless
+///    `Finalized` (the only state where a fresh storno is legal per
+///    ADR-0023 §1 and `check_base_is_finalized`'s named-reason
+///    classifier).
+/// 3. Resolve the base's `nav_xml_path` from its most-recent
+///    `InvoiceDraftCreated` audit entry (per ADR-0031 §2). Loud-fail
+///    if absent — surfaces the pre-PR-18 invoice case.
+/// 4. Read the sibling `<ULID>.input.json` written by
+///    `issue_invoice_request` at issuance time (PR-47α / A174). Loud-
+///    fail if absent — surfaces the pre-PR-47α SPA-issued invoice OR
+///    a CLI-issued invoice case, with a message steering the operator
+///    to the CLI's `aberp issue-storno` fallback. NAV creds are NOT
+///    loaded here (storno does not call NAV per ADR-0023 §1, so the
+///    submit/poll-route fresh-creds posture is unnecessary).
+/// 5. Mint a fresh server-side output path for the storno's NAV XML.
+/// 6. Mint per-request `Actor` from startup-cached `operator_login`.
+/// 7. Dispatch into `issue_storno::storno_from_inputs`.
+///
+/// Failure modes:
+///   - `401 Unauthorized` — bearer missing or wrong.
+///   - `503 Service Unavailable` — NeedsSetup boot state.
+///   - `404 Not Found` — unknown invoice id.
+///   - `409 Conflict` — base not in `Finalized`. Operator-actionable
+///     message names the current state.
+///   - `500 Internal Server Error` — any propagated error (audit-write,
+///     DB error, missing sibling input.json, etc.).
+async fn handle_storno_invoice(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(invoice_id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match storno_invoice_request(&state, &invoice_id) {
+        Ok(summary) => Json(StornoInvoiceResponse {
+            invoice_id: summary.invoice_id,
+            invoice_number: summary.invoice_number,
+            state: InvoiceState::Storno,
+            modification_index: summary.modification_index,
+            entries_verified: summary.entries_verified,
+        })
+        .into_response(),
+        Err(SubmitRouteError::PreconditionMismatch {
+            current_state,
+            message,
+        }) => (
+            StatusCode::CONFLICT,
+            Json(error_body(format!(
+                "{message} (current state: {current_state})"
+            ))),
+        )
+            .into_response(),
+        Err(SubmitRouteError::NotFound(message)) => {
+            (StatusCode::NOT_FOUND, Json(error_body(message))).into_response()
+        }
+        Err(SubmitRouteError::Other(e)) => internal_error("storno_invoice_request", e),
+    }
+}
+
+/// PR-47α / session-64 — library helper that wires
+/// `issue_storno::storno_from_inputs` over the [`AppState`]'s
+/// db_path + tenant + operator login. `pub` so the integration test
+/// (`tests/serve_storno_route.rs`) can hit it for precondition pin
+/// tests without spinning the HTTPS listener (same posture as
+/// `submit_invoice_request` per A159).
+pub fn storno_invoice_request(
+    state: &AppState,
+    invoice_id: &str,
+) -> std::result::Result<issue_storno::StornoIssuedSummary, SubmitRouteError> {
+    // PR-46α / session-62 — operator login read from Ready boot-state
+    // (same posture as `submit_invoice_request`). Loud-fail in
+    // NeedsSetup as defence in depth past the route-level gate.
+    let operator_login = match state.boot_state.read() {
+        Ok(guard) => match &*guard {
+            ServeBootState::Ready { operator_login } => operator_login.clone(),
+            ServeBootState::NeedsSetup => {
+                return Err(SubmitRouteError::Other(anyhow!(
+                    "storno_invoice_request called in NeedsSetup state — \
+                     /api/setup-nav-credentials must run first"
+                )));
+            }
+        },
+        Err(e) => {
+            return Err(SubmitRouteError::Other(anyhow!(
+                "boot_state RwLock poisoned: {e}"
+            )));
+        }
+    };
+
+    // 1. Precondition check — base must be Finalized. Any other state
+    //    surfaces as 409 with the current state named in the message
+    //    (same shape as submit/poll). `Storno` itself (already-stornoed)
+    //    bounces here too — the operator cannot storno the same base
+    //    twice via the SPA (the CLI's `aberp issue-storno` would
+    //    allocate `modification_index = 2` and write a second chain
+    //    entry; the brief explicitly scopes PR-47α to the operator-
+    //    expected single-storno path).
+    let derived = derive_state_for(state, invoice_id)?;
+    if !matches!(derived.state, InvoiceState::Finalized) {
+        return Err(SubmitRouteError::PreconditionMismatch {
+            current_state: format!("{:?}", derived.state),
+            message: format!(
+                "POST /api/invoices/{invoice_id}/storno requires state `Finalized`; \
+                 re-fetch detail and retry"
+            ),
+        });
+    }
+
+    // 2. Resolve the base's nav_xml_path from the most-recent
+    //    InvoiceDraftCreated audit entry (per ADR-0031 §2). Loud-fail
+    //    if absent.
+    let base_xml_path = derived.nav_xml_path.ok_or_else(|| {
+        SubmitRouteError::Other(anyhow!(
+            "invoice {invoice_id} is Finalized but no `nav_xml_path` recorded on the \
+             InvoiceDraftCreated audit entry — pre-PR-18 entry; \
+             fall back to `aberp issue-storno --references {invoice_id} --in <PATH>`"
+        ))
+    })?;
+
+    // 3. Read the sibling InvoiceInputJson side-stored at issuance
+    //    time. Loud-fail if absent — pre-PR-47α SPA-issued invoice OR
+    //    CLI-issued invoice; the message steers to CLI fallback per
+    //    CLAUDE.md rule 12.
+    let input_json_path = sibling_input_json_path(&base_xml_path);
+    let input_json_bytes = std::fs::read(&input_json_path).map_err(|e| {
+        SubmitRouteError::Other(anyhow!(
+            "invoice {invoice_id} has no side-stored InvoiceInputJson at {} ({}); \
+             the SPA storno path requires the input.json side-store added at PR-47α — \
+             fall back to `aberp issue-storno --references {invoice_id} --in <PATH>` \
+             with the operator's original issuance JSON",
+            input_json_path.display(),
+            e
+        ))
+    })?;
+    let input: InvoiceInputJson = serde_json::from_slice(&input_json_bytes).map_err(|e| {
+        SubmitRouteError::Other(anyhow!(
+            "parse side-stored InvoiceInputJson at {}: {e} — \
+             the file appears corrupted or hand-edited",
+            input_json_path.display()
+        ))
+    })?;
+
+    // 4. Mint a fresh server-side output path for the storno's XML.
+    let storno_xml_path = mint_issued_xml_path(state.tenant.as_str())
+        .context("mint server-side NAV-XML output path for storno")?;
+
+    // 5. Mint per-request Actor from startup-loaded operator login
+    //    (same posture as submit/poll routes — A159 boilerplate).
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
+
+    // 6. Dispatch into the library helper. Default series unchanged —
+    //    the CLI's `--series` flag carries the storno's own
+    //    sequence-burning series; the SPA route uses the default per
+    //    the operator-pathless posture. The same-series-as-base case
+    //    is the documented default per ADR-0023 §1.
+    issue_storno::storno_from_inputs(
+        input,
+        &state.db_path,
+        state.tenant.as_str(),
+        DEFAULT_SERIES_CODE,
+        invoice_id,
+        storno_xml_path,
+        actor,
+    )
+    .map_err(SubmitRouteError::Other)
+}
+
+// ── PR-47β / session-65 — POST /api/invoices/:id/modification ────────
+
+/// PR-47β / session-65 — wire request body for
+/// `POST /api/invoices/:id/modification`. Mirrors
+/// [`IssueInvoiceRequest`] field-for-field plus the operator-supplied
+/// `modification_date` per ADR-0024 §1 (no silent today-default; the
+/// operator owns the audit-payload-frozen date string).
+///
+/// The `currency` field MUST match the base invoice's stored currency
+/// per ADR-0037 §4 invariant C6 (chain-currency-match by inheritance);
+/// the route layer enforces this loudly with a `400 Bad Request` rather
+/// than silently overriding inside `run_single_tx`. The SPA's form
+/// pre-locks the dropdown to the base's currency, so the 400 is
+/// defence-in-depth against a curl bypass.
+#[derive(Debug, Deserialize)]
+pub struct ModificationInvoiceRequest {
+    pub supplier: issue_invoice::SupplierJson,
+    pub customer: issue_invoice::CustomerJson,
+    pub lines: Vec<issue_invoice::LineJson>,
+    pub currency: Currency,
+    #[serde(rename = "modificationDate")]
+    pub modification_date: String,
+    #[serde(default)]
+    pub series: Option<String>,
+}
+
+/// PR-47β / session-65 — wire response body for
+/// `POST /api/invoices/:id/modification`. Mirrors
+/// [`StornoInvoiceResponse`] field-for-field; the only difference is
+/// `state` flips to `Amended` (the `is_amended_base` arm of
+/// `derive_state`'s ladder) once an `InvoiceModificationIssued` audit
+/// row exists for the base.
+#[derive(Debug, Serialize)]
+struct ModificationInvoiceResponse {
+    invoice_id: String,
+    invoice_number: String,
+    /// The BASE invoice's new state after this route succeeds. Always
+    /// `Amended` per ADR-0036 §3 — the `is_amended_base` arm of
+    /// `derive_state`'s priority ladder fires once an
+    /// `InvoiceModificationIssued` audit row exists for the base.
+    state: InvoiceState,
+    modification_index: u32,
+    entries_verified: u64,
+}
+
+/// PR-47β / session-65 — typed error returned by
+/// [`modification_invoice_request`]. Mirrors [`SubmitRouteError`]'s
+/// three existing variants and adds `BadRequest` for the C6 currency-
+/// mismatch case so the handler can map it to `400` cleanly. A
+/// separate enum (rather than extending [`SubmitRouteError`]) keeps the
+/// storno / submit / poll handlers byte-for-byte unchanged — surgical
+/// per CLAUDE.md rule 3.
+#[derive(Debug)]
+pub enum ModificationRouteError {
+    PreconditionMismatch {
+        current_state: String,
+        message: String,
+    },
+    NotFound(String),
+    /// `400 Bad Request` — operator-correctable input shape error
+    /// (today: C6 chain-currency mismatch).
+    BadRequest(String),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for ModificationRouteError {
+    fn from(e: anyhow::Error) -> Self {
+        ModificationRouteError::Other(e)
+    }
+}
+
+impl From<SubmitRouteError> for ModificationRouteError {
+    fn from(e: SubmitRouteError) -> Self {
+        match e {
+            SubmitRouteError::PreconditionMismatch {
+                current_state,
+                message,
+            } => ModificationRouteError::PreconditionMismatch {
+                current_state,
+                message,
+            },
+            SubmitRouteError::NotFound(m) => ModificationRouteError::NotFound(m),
+            SubmitRouteError::Other(inner) => ModificationRouteError::Other(inner),
+        }
+    }
+}
+
+/// PR-47β / session-65 — `POST /api/invoices/:id/modification` handler.
+///
+/// Operator-edited mutation route wrapping
+/// [`issue_modification::modification_from_inputs`]. The SPA's
+/// "Amend invoice (modification)" button on the invoice-detail modal
+/// posts the operator-edited body here.
+///
+/// 1. Bearer-auth + Ready gate (503 in NeedsSetup).
+/// 2. Precondition: base derives to `Finalized` OR `Amended` per
+///    ADR-0024 §6; loud-fail 409 otherwise.
+/// 3. C6 chain-currency invariant: `request.currency` MUST equal the
+///    base's stored currency. Loud-fail 400 on mismatch.
+/// 4. Mint a fresh server-side output path for the modification XML.
+/// 5. Mint per-request `Actor` from startup-cached `operator_login`.
+/// 6. Dispatch into the library helper.
+///
+/// Failure modes:
+///   - `400 Bad Request` — C6 currency mismatch (the body's currency
+///     differs from the base's stored currency).
+///   - `401 Unauthorized` — bearer missing or wrong.
+///   - `503 Service Unavailable` — NeedsSetup boot state.
+///   - `404 Not Found` — unknown base invoice id.
+///   - `409 Conflict` — base not in `Finalized` or `Amended`.
+///   - `500 Internal Server Error` — any propagated error.
+async fn handle_modification_invoice(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(invoice_id): AxumPath<String>,
+    Json(request): Json<ModificationInvoiceRequest>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match modification_invoice_request(&state, &invoice_id, request) {
+        Ok(summary) => Json(ModificationInvoiceResponse {
+            invoice_id: summary.invoice_id,
+            invoice_number: summary.invoice_number,
+            state: InvoiceState::Amended,
+            modification_index: summary.modification_index,
+            entries_verified: summary.entries_verified,
+        })
+        .into_response(),
+        Err(ModificationRouteError::PreconditionMismatch {
+            current_state,
+            message,
+        }) => (
+            StatusCode::CONFLICT,
+            Json(error_body(format!(
+                "{message} (current state: {current_state})"
+            ))),
+        )
+            .into_response(),
+        Err(ModificationRouteError::NotFound(message)) => {
+            (StatusCode::NOT_FOUND, Json(error_body(message))).into_response()
+        }
+        Err(ModificationRouteError::BadRequest(message)) => {
+            (StatusCode::BAD_REQUEST, Json(error_body(message))).into_response()
+        }
+        Err(ModificationRouteError::Other(e)) => {
+            internal_error("modification_invoice_request", e)
+        }
+    }
+}
+
+/// PR-47β / session-65 — library helper that wires
+/// [`issue_modification::modification_from_inputs`] over the
+/// [`AppState`]'s db_path + tenant + operator login. `pub` so the
+/// integration test (`tests/serve_modification_route.rs`) drives it
+/// without spinning the HTTPS listener (same posture as
+/// [`storno_invoice_request`] / [`submit_invoice_request`] per A159).
+pub fn modification_invoice_request(
+    state: &AppState,
+    invoice_id: &str,
+    request: ModificationInvoiceRequest,
+) -> std::result::Result<issue_modification::ModificationIssuedSummary, ModificationRouteError>
+{
+    // Operator login from Ready boot-state (same posture as the other
+    // mutation helpers). Defence in depth past the route-level gate.
+    let operator_login = match state.boot_state.read() {
+        Ok(guard) => match &*guard {
+            ServeBootState::Ready { operator_login } => operator_login.clone(),
+            ServeBootState::NeedsSetup => {
+                return Err(ModificationRouteError::Other(anyhow!(
+                    "modification_invoice_request called in NeedsSetup state — \
+                     /api/setup-nav-credentials must run first"
+                )));
+            }
+        },
+        Err(e) => {
+            return Err(ModificationRouteError::Other(anyhow!(
+                "boot_state RwLock poisoned: {e}"
+            )));
+        }
+    };
+
+    // 1. Precondition check — base must be Finalized OR Amended per
+    //    ADR-0024 §6. Other states (Storno, Rejected, Pending,
+    //    Submitted, etc.) bounce with 409 + the current state named.
+    let derived = derive_state_for(state, invoice_id)?;
+    let modify_eligible = matches!(
+        derived.state,
+        InvoiceState::Finalized | InvoiceState::Amended
+    );
+    if !modify_eligible {
+        return Err(ModificationRouteError::PreconditionMismatch {
+            current_state: format!("{:?}", derived.state),
+            message: format!(
+                "POST /api/invoices/{invoice_id}/modification requires state \
+                 `Finalized` or `Amended`; re-fetch detail and retry"
+            ),
+        });
+    }
+
+    // 2. C6 chain-currency invariant check (ADR-0037 §4). Load the
+    //    base's stored currency and reject 400 if the body's currency
+    //    differs. The SPA's modification form locks the currency
+    //    dropdown to the base's currency, so the 400 is operator-
+    //    actionable defence against a curl bypass. Inside
+    //    `run_single_tx` the core would silently override the
+    //    operator-supplied currency via `inherit_rate_metadata_for_chain`;
+    //    surfacing the mismatch loud here keeps the wire shape honest
+    //    per CLAUDE.md rule 12.
+    let base_currency = read_base_currency(&state.db_path, invoice_id)
+        .map_err(ModificationRouteError::Other)?;
+    if base_currency != request.currency {
+        return Err(ModificationRouteError::BadRequest(format!(
+            "modification body currency {} differs from base invoice {} \
+             currency {} — ADR-0037 §4 invariant C6 requires chain children to \
+             inherit the base's currency (rate metadata is frozen at base \
+             issuance time and re-fetching at chain-child time would risk a \
+             different rate for the same referenced invoice)",
+            request.currency.iso_code(),
+            invoice_id,
+            base_currency.iso_code(),
+        )));
+    }
+
+    // 3. Mint a fresh server-side output path for the modification's
+    //    XML (operator-pathless route posture, same as issue / storno).
+    let modification_xml_path = mint_issued_xml_path(state.tenant.as_str())
+        .context("mint server-side NAV-XML output path for modification")?;
+
+    // 4. Mint per-request Actor from startup-loaded operator login
+    //    (A159 boilerplate).
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
+
+    // 5. Build the parsed input shape the library helper expects.
+    let input = InvoiceInputJson {
+        supplier: request.supplier,
+        customer: request.customer,
+        lines: request.lines,
+    };
+    let series = request
+        .series
+        .as_deref()
+        .unwrap_or(DEFAULT_SERIES_CODE);
+
+    // 6. Dispatch into the library helper.
+    issue_modification::modification_from_inputs(
+        input,
+        &state.db_path,
+        state.tenant.as_str(),
+        series,
+        invoice_id,
+        &request.modification_date,
+        modification_xml_path,
+        actor,
+    )
+    .map_err(ModificationRouteError::Other)
+}
+
+/// PR-47β / session-65 — open a quick read-only DuckDB transaction and
+/// return the base invoice's stored `Currency` per ADR-0037 §3. Wraps
+/// [`load_invoice_currency_metadata_in_tx`] for the route-layer C6
+/// invariant guard so the modification handler does not have to open
+/// the tx itself.
+///
+/// Returns the typed `Currency` value (NOT the full
+/// [`InvoiceCurrencyMetadata`] bundle) — the route only needs the
+/// currency for the equality check; reading the rate columns here would
+/// be speculative work the core re-reads anyway inside its own write tx.
+fn read_base_currency(db_path: &Path, invoice_id: &str) -> Result<Currency> {
+    let mut conn = Connection::open(db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    let tx = conn
+        .transaction()
+        .context("begin read transaction for base-currency lookup (modification route)")?;
+    let metadata = load_invoice_currency_metadata_in_tx(&tx, invoice_id)
+        .with_context(|| {
+            format!(
+                "read base invoice {} currency metadata for modification route C6 check",
+                invoice_id
+            )
+        })?;
+    tx.commit()
+        .context("commit read transaction for base-currency lookup")?;
+    Ok(metadata.currency)
+}
+
+// ── PR-47β / session-65 — GET /api/invoices/:id/issuance-input ───────
+
+/// PR-47β / session-65 — `GET /api/invoices/:id/issuance-input` handler.
+///
+/// Returns the operator's original [`InvoiceInputJson`] side-stored
+/// alongside the NAV XML at issuance time (per A174). The SPA's
+/// modification modal pre-fills its form fields from this so the
+/// operator edits in place rather than retyping the entire invoice.
+///
+/// Failure modes:
+///   - `401 Unauthorized` — bearer missing or wrong.
+///   - `503 Service Unavailable` — NeedsSetup boot state.
+///   - `404 Not Found` — no side-stored input.json for this invoice
+///     (CLI-issued OR pre-PR-47α SPA-issued). The SPA falls back to a
+///     fresh form with an explanatory banner.
+///   - `500 Internal Server Error` — propagated parse / read error.
+async fn handle_get_issuance_input(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(invoice_id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match get_issuance_input(&state, &invoice_id) {
+        Ok(Some(input)) => Json(input).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!(
+                "no side-stored issuance input for invoice {invoice_id} \
+                 (CLI-issued or pre-PR-47α SPA-issued); the modification form \
+                 will open empty"
+            ))),
+        )
+            .into_response(),
+        Err(e) => internal_error("get_issuance_input", e),
+    }
+}
+
+/// PR-47β / session-65 — library helper for the issuance-input read.
+/// `pub` for symmetry with the other route helpers; surfaces `Ok(None)`
+/// for the missing-sibling case so the handler can map it to 404
+/// without an anyhow error string round-trip.
+pub fn get_issuance_input(
+    state: &AppState,
+    invoice_id: &str,
+) -> Result<Option<InvoiceInputJson>> {
+    let derived = match derive_state_for(state, invoice_id) {
+        Ok(d) => d,
+        Err(SubmitRouteError::NotFound(_)) => return Ok(None),
+        Err(SubmitRouteError::Other(e)) => return Err(e),
+        Err(SubmitRouteError::PreconditionMismatch { message, .. }) => {
+            return Err(anyhow!(message))
+        }
+    };
+    let xml_path = match derived.nav_xml_path {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let input_json_path = sibling_input_json_path(&xml_path);
+    let bytes = match std::fs::read(&input_json_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(anyhow!(
+                "read side-stored InvoiceInputJson at {}: {e}",
+                input_json_path.display()
+            ))
+        }
+    };
+    let parsed: InvoiceInputJson = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parse side-stored InvoiceInputJson at {}",
+            input_json_path.display()
+        )
+    })?;
+    Ok(Some(parsed))
 }
 
 /// PR-44η / session-60 — wire-state mapper for the poll-ack response.
@@ -2856,6 +3491,60 @@ mod tests {
         assert!(!constant_time_eq("abcd", "abc"));
         assert!(!constant_time_eq("", "x"));
         assert!(constant_time_eq("", ""));
+    }
+
+    /// PR-47α / session-64 — `sibling_input_json_path` MUST replace
+    /// the `.xml` extension with `.input.json` on the standard XML
+    /// path shape that `mint_issued_xml_path` emits. The SPA-issue
+    /// route writes the side-stored JSON via this helper; the SPA-
+    /// storno route reads it back via the same helper. A regression
+    /// that diverged the write and read paths would surface as the
+    /// 500 "no side-stored InvoiceInputJson" loud-fail in
+    /// `storno_invoice_request` on every storno attempt — the
+    /// failure mode CLAUDE.md rule 12 names. Three pins per rule 9:
+    /// the happy path (standard ULID-keyed XML), the case-insensitive
+    /// extension match (uppercase `.XML`), and the no-extension
+    /// fallback (defence in depth for any future path-shape change).
+    #[test]
+    fn sibling_input_json_path_replaces_xml_extension() {
+        let p = std::path::PathBuf::from("/tmp/aberp-test/issued/01ABC.xml");
+        let sib = sibling_input_json_path(&p);
+        assert_eq!(
+            sib,
+            std::path::PathBuf::from("/tmp/aberp-test/issued/01ABC.input.json"),
+            "standard `.xml` extension must swap to `.input.json`"
+        );
+    }
+
+    #[test]
+    fn sibling_input_json_path_case_insensitive_xml() {
+        // Belt-and-braces — Darwin's HFS+/APFS is case-preserving but
+        // case-insensitive on the default volume; an `.XML` path
+        // arriving here (e.g., via an operator-renamed file) must
+        // still resolve to the standard `.input.json` companion.
+        let p = std::path::PathBuf::from("/tmp/aberp-test/01ABC.XML");
+        let sib = sibling_input_json_path(&p);
+        assert_eq!(
+            sib,
+            std::path::PathBuf::from("/tmp/aberp-test/01ABC.input.json"),
+            "uppercase `.XML` must also swap to `.input.json`"
+        );
+    }
+
+    #[test]
+    fn sibling_input_json_path_no_xml_extension_appends_suffix() {
+        // Defence in depth — if a future PR changes the issued-path
+        // shape to drop the extension, the read seam must still find
+        // its companion. The fallback appends `.input.json` verbatim
+        // so the result remains deterministic + recoverable rather
+        // than collapsing to an unrelated path.
+        let p = std::path::PathBuf::from("/tmp/aberp-test/issued/01ABC");
+        let sib = sibling_input_json_path(&p);
+        assert_eq!(
+            sib,
+            std::path::PathBuf::from("/tmp/aberp-test/issued/01ABC.input.json"),
+            "no-extension path must append `.input.json` verbatim"
+        );
     }
 
     /// PR-44ε.UI / session-58 — the `Content-Disposition` filename

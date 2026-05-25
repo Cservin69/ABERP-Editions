@@ -44,8 +44,10 @@
     type LabelSignal,
   } from "../lib/labels";
   import { formatTotal } from "../lib/format";
+  import type { Currency } from "../lib/api";
   import InvoiceDetail from "./InvoiceDetail.svelte";
   import IssueInvoice from "./IssueInvoice.svelte";
+  import ModificationInvoice from "./ModificationInvoice.svelte";
 
   let rows: InvoiceListItem[] = $state([]);
   let loadState: "idle" | "loading" | "loaded" | "error" = $state("idle");
@@ -79,6 +81,21 @@
   // and this screen rebinds `navStack` to navigate the detail modal
   // open on the just-issued invoice + reloads the list.
   let issueOpen: boolean = $state(false);
+
+  // PR-47β / session-65 — modification modal state. Holds the base
+  // invoice's id, currency, and displayable number while the modal
+  // is open; `null` keeps the modal closed. The detail modal's
+  // Modification button bubbles its base context up through the
+  // `onAmend` callback; on a successful modification the modal
+  // invokes `onAmended(newInvoiceId)` and this screen navigates the
+  // detail modal to the NEW modification invoice (the operator's
+  // regulatory record is the chain child, not the base they amended)
+  // + reloads the list.
+  let modificationContext: {
+    baseInvoiceId: string;
+    baseCurrency: Currency;
+    baseInvoiceNumber: string;
+  } | null = $state(null);
 
   onMount(() => {
     void refresh();
@@ -231,6 +248,12 @@
     onClose={() => (navStack = [])}
     onNavigate={(baseId) => (navStack = [...navStack, baseId])}
     onJumpBack={(index) => (navStack = navStack.slice(0, index + 1))}
+    onAmend={(baseInvoiceId, baseCurrency, baseInvoiceNumber) =>
+      (modificationContext = {
+        baseInvoiceId,
+        baseCurrency,
+        baseInvoiceNumber,
+      })}
   />
 
   <IssueInvoice
@@ -244,6 +267,24 @@
       issueOpen = false;
       void refresh();
       navStack = [invoiceId];
+    }}
+  />
+
+  <ModificationInvoice
+    baseInvoiceId={modificationContext?.baseInvoiceId ?? null}
+    baseCurrency={modificationContext?.baseCurrency ?? null}
+    baseInvoiceNumber={modificationContext?.baseInvoiceNumber ?? null}
+    onClose={() => (modificationContext = null)}
+    onAmended={(newInvoiceId) => {
+      // PR-47β — close the modification modal + refresh the list +
+      // navigate the detail modal to the NEW modification invoice
+      // (the chain child IS the operator's regulatory record for
+      // this amendment; the base flips to `Amended` automatically
+      // on the next list refresh via `derive_state`'s
+      // `is_amended_base` arm).
+      modificationContext = null;
+      void refresh();
+      navStack = [newInvoiceId];
     }}
   />
 </section>

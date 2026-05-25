@@ -51,15 +51,28 @@ const TABLE: Expected[] = [
   // line, and PR-44η scope is the standard lifecycle. Download only;
   // a future PR can add a "Poll ack" button on Recovered too.
   { state: "Recovered", buttons: ["Download"] },
-  // Finalized — terminal SAVED. Download only.
-  { state: "Finalized", buttons: ["Download"] },
+  // Finalized — terminal SAVED. PR-47α / session-64: operator can
+  // issue a storno (ADR-0023 §1). PR-47β / session-65: operator can
+  // also issue a modification (ADR-0024 §6 base case). Download
+  // remains available.
+  {
+    state: "Finalized",
+    buttons: ["Storno", "Modification", "Download"],
+  },
   // Rejected — terminal ABORTED. Download only.
   { state: "Rejected", buttons: ["Download"] },
   // Storno — base invoice has a storno chain entry. Download only.
   { state: "Storno", buttons: ["Download"] },
-  // Amended — base invoice has a modification chain entry. Download
-  // only.
-  { state: "Amended", buttons: ["Download"] },
+  // Amended — base invoice has a modification chain entry.
+  // PR-47β / session-65: modify-after-modify is permitted per
+  // ADR-0024 §6 default-permit posture; storno is NOT (a stornoed
+  // base + modification is malformed per §6, AND Amended carries no
+  // SAVED ack at the top of the chain so ADR-0023 §1's classifier
+  // would reject anyway).
+  {
+    state: "Amended",
+    buttons: ["Modification", "Download"],
+  },
   // Abandoned — operator marked terminal. Download only.
   { state: "Abandoned", buttons: ["Download"] },
   // Unknown — no entries; nothing actionable but download (which
@@ -95,6 +108,37 @@ describe("buttonsForState", () => {
     ).map((row) => row.state);
     expect(statesWithPoll.sort()).toEqual(
       ["PendingNavExists", "Submitted"].sort(),
+    );
+  });
+
+  it("Storno button only appears on Finalized", () => {
+    // PR-47α / session-64 — counter-pin: Storno is visible exactly on
+    // the one state the backend's `storno_invoice_request` accepts
+    // (`Finalized`). The ADR-0023 §1 precondition + the loud-fail
+    // classifier in `check_base_is_finalized` rejects every other
+    // state with a named reason; surfacing the button elsewhere would
+    // produce a 409 the operator was not warned about.
+    const statesWithStorno = TABLE.filter((row) =>
+      row.buttons.includes("Storno"),
+    ).map((row) => row.state);
+    expect(statesWithStorno).toEqual(["Finalized"]);
+  });
+
+  it("Modification button only appears on Finalized and Amended", () => {
+    // PR-47β / session-65 — counter-pin: Modification is visible on
+    // exactly the two states the backend's
+    // `modification_invoice_request` accepts (`Finalized` for the
+    // base case, `Amended` for modify-after-modify per ADR-0024 §6).
+    // The precondition guard at the route + the
+    // `check_base_is_modifiable` classifier in `issue_modification.rs`
+    // reject every other state with a named reason; surfacing the
+    // button elsewhere would produce a 409 the operator was not
+    // warned about.
+    const statesWithModification = TABLE.filter((row) =>
+      row.buttons.includes("Modification"),
+    ).map((row) => row.state);
+    expect(statesWithModification.sort()).toEqual(
+      ["Amended", "Finalized"].sort(),
     );
   });
 

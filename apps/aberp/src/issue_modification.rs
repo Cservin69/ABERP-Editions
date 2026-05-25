@@ -57,7 +57,7 @@
 //! schema has no `origin` column today, so the migrated-base
 //! conditional never fires.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aberp_audit_ledger::{
     self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId,
@@ -101,47 +101,15 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         serde_json::from_slice(&input_bytes).context("parse input JSON")?;
     tracing::info!(lines = input.lines.len(), "JSON input parsed");
 
-    if input.lines.is_empty() {
-        return Err(anyhow!("input JSON has no lines"));
-    }
-
-    // 2. Validate --modification-date is canonical YYYY-MM-DD per
-    //    ADR-0024 §1. No silent today-default. The parsed Date is
-    //    discarded (the audit payload stores the original String per
-    //    ADR-0024 §5); the parse is purely to fail loud on a bad
-    //    operator input.
-    let date_format = format_description!("[year]-[month]-[day]");
-    let _parsed_date = Date::parse(&args.modification_date, &date_format).map_err(|e| {
-        anyhow!(
-            "--modification-date '{}' is not a well-formed YYYY-MM-DD: {e} \
-             (ADR-0024 §1 requires explicit operator-supplied date — no silent default)",
-            args.modification_date
-        )
-    })?;
-
-    // 3. Resolve tenant id + series code (loud-fail on invalid input).
-    let tenant = TenantId::new(args.tenant.clone()).ok_or_else(|| {
-        anyhow!(
-            "--tenant value '{}' is empty or has a null byte",
-            args.tenant
-        )
-    })?;
-    let series_code = SeriesCode::new(args.series.clone()).ok_or_else(|| {
-        anyhow!(
-            "--series value '{}' fails SeriesCode validation",
-            args.series
-        )
-    })?;
-
-    if !args.references.starts_with("inv_") {
-        bail!(
-            "--references value '{}' is not a prefixed invoice id (expected inv_<ULID>)",
-            args.references
-        );
-    }
-
-    // 4. Load NAV credentials BEFORE any DB write — Actor identity
+    // 2. Load NAV credentials BEFORE any DB write — Actor identity
     //    discipline (closes F15 the same way issue_storno does).
+    //    PR-47β / session-65: the actor derivation moves here (the CLI
+    //    wrapper) so the library helper `modification_from_inputs` can
+    //    be called from the SPA route with a pre-loaded actor (the
+    //    route mints its own Actor from AppState's startup-cached
+    //    operator_login; modification — like storno — does not call
+    //    NAV at issuance time per ADR-0024 §3, so the route does not
+    //    even need fresh credentials).
     let credentials = NavCredentials::load_from_keychain(&args.tenant)
         .context("load NAV credentials from OS keychain")?;
     let session_id = Ulid::new().to_string();
@@ -153,15 +121,117 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         "NAV credentials loaded; actor derived for this CLI invocation"
     );
 
-    // 5. Compute binary hash + ledger meta.
+    let summary = modification_from_inputs(
+        input,
+        &args.db,
+        &args.tenant,
+        &args.series,
+        &args.references,
+        &args.modification_date,
+        args.out.clone(),
+        actor,
+    )?;
+
+    println!(
+        "issued modification {} -> {} (references {} as modificationIndex {} \
+         on {}, audit chain verified across {} entries)",
+        summary.invoice_number,
+        args.out.display(),
+        args.references,
+        summary.modification_index,
+        args.modification_date,
+        summary.entries_verified,
+    );
+    Ok(())
+}
+
+/// PR-47β / session-65 — operator-visible summary of a single
+/// modification issuance, returned by [`modification_from_inputs`].
+/// Mirrors [`crate::issue_storno::StornoIssuedSummary`] field-for-field
+/// so the SPA route surfaces a uniform wire shape across the two
+/// chain-child actions; the only domain-relevant difference is the
+/// audit kind on the chain link (`InvoiceModificationIssued` vs
+/// `InvoiceStornoIssued`).
+#[derive(Debug, Clone)]
+pub struct ModificationIssuedSummary {
+    /// Prefixed-ULID id of the modification invoice itself
+    /// (`inv_<ULID>`). Distinct from the BASE invoice's id.
+    pub invoice_id: String,
+    /// NAV-facing number of the modification
+    /// (`<series>/<5-digit-seq>`).
+    pub invoice_number: String,
+    /// 1-based chain index allocated to this modification per
+    /// ADR-0024 §7 (`modificationIndex` on the wire). Shared name
+    /// space with prior storno entries against the same base.
+    pub modification_index: u32,
+    /// Ledger entry count `verify_chain` walked post-commit.
+    pub entries_verified: u64,
+}
+
+/// PR-47β / session-65 — library helper that wires the modification
+/// pipeline over an already-parsed `InvoiceInputJson` + an already-
+/// derived `Actor`. The CLI's `run` calls into this after parsing
+/// `--in` and loading NAV credentials; the SPA route calls into this
+/// with the operator-edited body and an Actor minted from
+/// `AppState::operator_login`.
+///
+/// Mirrors `issue_storno::storno_from_inputs` per the same library-
+/// helper posture (A159 / PR-47α). `pub` so the integration test
+/// (`tests/serve_modification_route.rs`) can drive it without
+/// spinning the HTTPS listener.
+///
+/// Steps 1 + 3-10 from the pre-PR-47β `run` body, moved here verbatim.
+/// Step 2 (NAV-creds + actor derivation) stays on the caller because
+/// the SPA route mints its Actor differently (per-request, from
+/// `operator_login`).
+#[allow(clippy::too_many_arguments)]
+pub fn modification_from_inputs(
+    input: InvoiceInputJson,
+    db: &Path,
+    tenant_str: &str,
+    series_str: &str,
+    references: &str,
+    modification_date: &str,
+    nav_xml_out: PathBuf,
+    actor: Actor,
+) -> Result<ModificationIssuedSummary> {
+    if input.lines.is_empty() {
+        return Err(anyhow!("input has no lines"));
+    }
+
+    // Validate modification_date is canonical YYYY-MM-DD per ADR-0024
+    // §1. No silent today-default. The parsed Date is discarded (the
+    // audit payload stores the original String per ADR-0024 §5).
+    let date_format = format_description!("[year]-[month]-[day]");
+    let _parsed_date = Date::parse(modification_date, &date_format).map_err(|e| {
+        anyhow!(
+            "modification_date '{}' is not a well-formed YYYY-MM-DD: {e} \
+             (ADR-0024 §1 requires explicit operator-supplied date — no silent default)",
+            modification_date
+        )
+    })?;
+
+    // Resolve tenant id + series code.
+    let tenant = TenantId::new(tenant_str.to_string()).ok_or_else(|| {
+        anyhow!("tenant value '{}' is empty or has a null byte", tenant_str)
+    })?;
+    let series_code = SeriesCode::new(series_str.to_string()).ok_or_else(|| {
+        anyhow!("series value '{}' fails SeriesCode validation", series_str)
+    })?;
+    if !references.starts_with("inv_") {
+        bail!(
+            "references value '{}' is not a prefixed invoice id (expected inv_<ULID>)",
+            references
+        );
+    }
+
+    // Compute binary hash + ledger meta.
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
-    // 5a. PR-18 / ADR-0031 §5 — pre-allocation hard-cap check.
-    //     A modification burns its own sequence number, so it counts
-    //     against the same ADR-0009 §7 backlog as a fresh invoice.
+    // ADR-0031 §5 pre-allocation hard-cap check.
     let pending_count = crate::submission_queue::count_pending(
-        &args.db,
+        db,
         tenant.clone(),
         binary_hash_bytes,
     )
@@ -176,20 +246,19 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         ));
     }
 
-    // 6. Pre-flight precondition: base is Finalized OR already
-    //    Amended, and not Storno-cancelled. Read-only ledger; drop
-    //    before opening the write transaction.
+    // Pre-flight precondition: base is Finalized OR already Amended,
+    // and not Storno-cancelled. Read-only ledger; drop before opening
+    // the write transaction.
     {
-        let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+        let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
             .context("open audit ledger for modification precondition check")?;
-        check_base_is_modifiable(&ledger, &args.references)?;
+        check_base_is_modifiable(&ledger, references)?;
     }
 
-    // 7. Pre-tx setup: schemas + series.
-    let (conn, series) = pre_tx_setup(&args.db, &series_code)?;
+    // Pre-tx setup: schemas + series.
+    let (conn, series) = pre_tx_setup(db, &series_code)?;
 
-    // 8. Build the modification command — same allocator inputs as
-    //    issue_storno, just a different audit kind on the chain link.
+    // Build the modification command.
     let command = build_modification_command(&input, &series_code)?;
     let idempotency_key = command.idempotency_key;
     let issue_date = OffsetDateTime::now_utc();
@@ -200,9 +269,9 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         lines: command.lines,
         issue_date,
     };
-    // PR-44γ.1 — placeholder defaults; `run_single_tx` reads the base's
-    // stored currency metadata and overrides per ADR-0037 §4 invariant
-    // C6 (chain-currency-match by inheritance).
+    // PR-44γ.1 — placeholder defaults; `run_single_tx` reads the
+    // base's stored currency metadata and overrides per ADR-0037 §4
+    // invariant C6 (chain-currency-match by inheritance).
     let allocate_args = AllocateArgs {
         series_id: series.id,
         draft,
@@ -211,17 +280,15 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         rate_metadata: None,
     };
 
-    // PR-18 / ADR-0031 §2: thread --out so the InvoiceDraftCreated
-    // payload records where the modification XML will be written.
     let outcome = run_single_tx(
         conn,
         &ledger_meta,
         allocate_args,
         idempotency_key,
         actor,
-        &args.references,
-        &args.modification_date,
-        args.out.clone(),
+        references,
+        modification_date,
+        nav_xml_out.clone(),
     )?;
 
     let modification = outcome.modification;
@@ -239,23 +306,23 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         "modification issued"
     );
 
-    // 9. Verify the audit chain — success-criterion gate.
-    let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+    // Verify the audit chain — success-criterion gate.
+    let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
         .context("re-open audit ledger after modification commit")?;
     let verified = ledger
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER modification issuance")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
-    // 9a. PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    //     post-commit.
-    let mirror_path = audit_ledger::mirror_path_for(&args.db);
+    // PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
+    // post-commit.
+    let mirror_path = audit_ledger::mirror_path_for(db);
     ledger
         .sync_mirror(&mirror_path)
         .context("sync audit-ledger mirror file after modification commit")?;
 
-    // 10. Render the modification's <InvoiceData> XML + run the
-    //     ADR-0022 runtime XSD invariant check before writing to disk.
+    // Render the modification's <InvoiceData> XML + ADR-0022 runtime
+    // XSD invariant check before writing to disk.
     let parties = NavParties {
         supplier: SupplierInfo {
             tax_number: input.supplier.tax_number,
@@ -270,12 +337,6 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
             name: input.customer.name,
         },
     };
-    // Same default-series-as-base assumption as issue_storno.rs's
-    // step 10 — the operator-default. An override path (modification
-    // in a different series than the base) would produce a wrong
-    // `originalInvoiceNumber`; surfaced as ADR-0024 §1's reference to
-    // ADR-0023 §1's same caveat. Out of scope for PR-11's supported
-    // surface.
     let base_invoice_number = format!(
         "{}/{:05}",
         series_code.as_str(),
@@ -284,7 +345,7 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
     let modification_reference = ModificationReference {
         base_invoice_number,
         modification_index,
-        modification_issue_date: args.modification_date.clone(),
+        modification_issue_date: modification_date.to_string(),
     };
     let xml = nav_xml::render_modification_data(
         &modification,
@@ -303,21 +364,24 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
         "NAV modification InvoiceData XML passed v3.0 invariant check"
     );
-    nav_xml::write_to_path(&args.out, &xml)?;
-    tracing::info!(path = %args.out.display(), bytes = xml.len(), "NAV modification XML written");
-
-    println!(
-        "issued modification {}/{:05} -> {} (references {} as modificationIndex {} \
-         on {}, audit chain verified across {} entries)",
-        series_code.as_str(),
-        modification.sequence_number,
-        args.out.display(),
-        args.references,
-        modification_index,
-        args.modification_date,
-        verified,
+    nav_xml::write_to_path(&nav_xml_out, &xml)?;
+    tracing::info!(
+        path = %nav_xml_out.display(),
+        bytes = xml.len(),
+        "NAV modification XML written"
     );
-    Ok(())
+
+    let invoice_number = format!(
+        "{}/{:05}",
+        series_code.as_str(),
+        modification.sequence_number
+    );
+    Ok(ModificationIssuedSummary {
+        invoice_id: modification.id.to_prefixed_string(),
+        invoice_number,
+        modification_index,
+        entries_verified: verified,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────
