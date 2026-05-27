@@ -14,6 +14,15 @@
 // invariant precedent.
 
 import type { Currency, IssueInvoiceRequest } from "./api";
+import {
+  addDays,
+  comfortZone,
+  DEFAULT_PAYMENT_OFFSET_DAYS,
+  overrideKindForZone,
+  todayLocalIso,
+  type DeliveryDateOverride,
+  type IsoDate,
+} from "./invoice-dates";
 
 /** PR-44ζ — per-line form state. `unitPriceMinor` is the operator-
  * typed amount: whole forints for HUF, cents for EUR (the SPA mirrors
@@ -72,6 +81,34 @@ export interface IssueInvoiceFormState {
    * "no note" signal. Recipient-facing only — NEVER reaches the
    * NAV InvoiceData XML. */
   invoiceNote: string;
+  /** PR-84 — operator-visible invoice date (Számla kelte). Read-only
+   * in the UI; defaulted to today's local date. The server stamps the
+   * TRUE issue date at issuance time (immutable, never trusts the
+   * client clock); this is purely a display default for the form's
+   * date section + an anchor for the payment-deadline and delivery-
+   * date pickers. Canonical YYYY-MM-DD. */
+  invoiceDate: IsoDate;
+  /** PR-84 — operator-supplied payment deadline (Fizetési határidő).
+   * Bidirectional: the form exposes both an offset-days input and an
+   * absolute date picker; the two update each other live. This field
+   * carries the resolved absolute date (the offset is derived on
+   * render via `daysBetween(invoiceDate, paymentDeadline)`). */
+  paymentDeadline: IsoDate;
+  /** PR-84 — operator-chosen delivery / fulfillment date (Teljesítési
+   * dátum). REGULATORY: drives the NAV `<invoiceDeliveryDate>` field.
+   * Defaults to invoiceDate; the operator can pick any date but
+   * out-of-range choices (before invoiceDate OR after paymentDeadline)
+   * trigger an inline "Are you sure?" confirm that captures the audit
+   * override. */
+  deliveryDate: IsoDate;
+  /** PR-84 — comfort-zone audit discriminant the operator has
+   * confirmed for the current `deliveryDate`. `null` when the
+   * delivery date is in range (default, no audit flag); a non-null
+   * value persists across edits until the operator picks a different
+   * date OR confirms the new override. The composer stamps the
+   * current value verbatim into the wire body's `deliveryDateOverride`
+   * field. */
+  deliveryDateOverride: DeliveryDateOverride;
 }
 
 /** PR-44ζ — sensible defaults for an empty form. The 27% VAT rate is
@@ -79,6 +116,13 @@ export interface IssueInvoiceFormState {
  * the CLI's default). One empty line is included so the form is
  * editable on first paint without a separate "+ Add line" click. */
 export function emptyForm(): IssueInvoiceFormState {
+  const today = todayLocalIso();
+  // PR-84 — payment deadline seeds to `today + DEFAULT_PAYMENT_OFFSET_DAYS`
+  // (a sensible business default per the brief; 8 days). The form's
+  // bidirectional control lets the operator edit either side of the
+  // pair. The unwrap is safe — `todayLocalIso()` produces a well-formed
+  // YYYY-MM-DD and `addDays` only returns null on malformed input.
+  const defaultDeadline = addDays(today, DEFAULT_PAYMENT_OFFSET_DAYS) ?? today;
   return {
     customerTaxNumber: "",
     customerName: "",
@@ -98,6 +142,16 @@ export function emptyForm(): IssueInvoiceFormState {
     bankAccountId: null,
     // PR-82 — invoice-level note seeds blank; operator opt-in.
     invoiceNote: "",
+    // PR-84 — three invoice-date fields seeded for the form's first
+    // paint. The display value mirrors today; the server stamps the
+    // real issue date at issuance time. Delivery date defaults to the
+    // invoice date (the common case — supply delivered same day as
+    // invoicing); operator can pick any date with the comfort-zone
+    // confirm UX.
+    invoiceDate: today,
+    paymentDeadline: defaultDeadline,
+    deliveryDate: today,
+    deliveryDateOverride: null,
   };
 }
 
@@ -111,6 +165,38 @@ export function emptyLine(): LineFormState {
     // PR-82 — per-line note seeds blank; operator opt-in.
     note: "",
   };
+}
+
+/** PR-84 — bidirectional payment-deadline helper. Given the form's
+ * current `invoiceDate` and a new `offsetDays` value the operator just
+ * typed, return the resolved absolute `paymentDeadline`. Returns null
+ * on malformed input. The companion direction (operator picks an
+ * absolute date) just sets `paymentDeadline` directly; the offset is
+ * a derived read via `daysBetween(invoiceDate, paymentDeadline)`. */
+export function paymentDeadlineFromOffset(
+  invoiceDate: IsoDate,
+  offsetDays: number,
+): IsoDate | null {
+  return addDays(invoiceDate, offsetDays);
+}
+
+/** PR-84 — classify a candidate delivery date against the form's
+ * comfort zone [invoiceDate, paymentDeadline] and return the audit-
+ * wire discriminant the form should stamp. `null` means in-range (no
+ * audit flag, no confirm prompt needed); non-null means the operator
+ * picked an out-of-range date and the form should surface the inline
+ * "Are you sure?" confirm before stamping this on the wire body.
+ *
+ * Returns `null` on malformed input — the form's per-field validator
+ * surfaces the precise gap separately. */
+export function deliveryDateOverrideFor(
+  invoiceDate: IsoDate,
+  paymentDeadline: IsoDate,
+  deliveryDate: IsoDate,
+): DeliveryDateOverride {
+  const zone = comfortZone(invoiceDate, paymentDeadline, deliveryDate);
+  if (zone === null) return null;
+  return overrideKindForZone(zone);
 }
 
 /** PR-50 / session-70 — typed `missing_seller_config` error body the
@@ -406,6 +492,23 @@ export function composeIssueInvoiceBody(
     // normalisation as per-line notes; the backend's `Option<String>`
     // deserialiser treats `null` and an absent field identically.
     invoiceNote: blankToNull(form.invoiceNote),
+    // PR-84 — operator-supplied payment deadline + delivery date go
+    // on the wire verbatim. Both are canonical YYYY-MM-DD strings.
+    // The wire body does NOT carry the form's `invoiceDate` field —
+    // the server stamps the immutable issue date from its own clock
+    // (per ADR-0007 §"Operator-as-threat-actor"); the form's display
+    // value is purely UX-anchoring.
+    paymentDeadline: form.paymentDeadline,
+    deliveryDate: form.deliveryDate,
+    // PR-84 — comfort-zone audit discriminant. `null` for in-range
+    // (default operator path, no audit flag); a non-null value
+    // travels into the backend's `InvoiceDraftCreated` audit payload
+    // verbatim. The composer does NOT re-classify here — the SPA's
+    // Svelte component owns the operator's confirm UX and writes the
+    // discriminant only after the operator has confirmed the out-of-
+    // range choice. The backend independently re-classifies via
+    // `aberp_billing::classify_delivery_date` for defence in depth.
+    deliveryDateOverride: form.deliveryDateOverride,
   };
 }
 

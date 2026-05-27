@@ -121,6 +121,13 @@ fn fixture_request(currency: Currency) -> IssueInvoiceRequest {
         series: None,
         bank_account_id: None,
         invoice_note: None,
+        // PR-84 — fixture defaults all three date fields to `None`;
+        // the issuance pipeline defaults payment_deadline + delivery_date
+        // to the system issue date when absent, preserving the pre-PR-84
+        // wire byte shape the integration tests pin against.
+        payment_deadline: None,
+        delivery_date: None,
+        delivery_date_override: None,
     }
 }
 
@@ -390,6 +397,9 @@ async fn issue_route_rejects_empty_lines_with_loud_error() {
         series: None,
         bank_account_id: None,
         invoice_note: None,
+        payment_deadline: None,
+        delivery_date: None,
+        delivery_date_override: None,
     };
 
     let err = serve::issue_invoice_request(
@@ -437,6 +447,9 @@ async fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
         series: None,
         bank_account_id: None,
         invoice_note: None,
+        payment_deadline: None,
+        delivery_date: None,
+        delivery_date_override: None,
     };
 
     // PR-53 / session-73 — supplier comes via the new arg, not the

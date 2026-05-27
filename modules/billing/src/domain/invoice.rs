@@ -6,7 +6,7 @@
 //! its own type per the new-type-state pattern ADR-0009 §2 names, so
 //! illegal transitions are compile errors.
 
-use time::OffsetDateTime;
+use time::{Date, OffsetDateTime};
 
 use super::ids::{CustomerId, InvoiceId, SeriesId};
 use super::money::Huf;
@@ -68,6 +68,18 @@ pub struct DraftInvoice {
     /// the operator cannot set this; the allocator captures it from the
     /// injected [`crate::ports::clock::Clock`].
     pub issue_date: OffsetDateTime,
+    /// PR-84 — payment deadline (Fizetési határidő). Calendar date, NOT
+    /// a timestamp — Hungarian invoices carry calendar dates for
+    /// payment terms. Operator picks via the SPA's bidirectional
+    /// offset/absolute control; the resolved absolute date is what is
+    /// persisted and emitted to NAV as `<paymentDate>`.
+    pub payment_deadline: Date,
+    /// PR-84 — delivery / fulfillment date (Teljesítési dátum). REGULATORY:
+    /// this is the NAV `<invoiceDeliveryDate>` field and drives which
+    /// VAT period the invoice belongs to. Operator picks via the SPA's
+    /// guarded picker (comfort-zone in-range silent; out-of-range
+    /// confirms inline + flags the audit payload). Calendar date.
+    pub delivery_date: Date,
 }
 
 /// A ready invoice: passed local validation; sequence number reserved in
@@ -82,6 +94,16 @@ pub struct ReadyInvoice {
     pub customer_id: CustomerId,
     pub lines: Vec<LineItem>,
     pub issue_date: OffsetDateTime,
+    /// PR-84 — payment deadline (Fizetési határidő); promoted verbatim
+    /// from [`DraftInvoice::payment_deadline`] at allocator time.
+    /// Persisted on the `invoice.payment_deadline` DuckDB column;
+    /// emitted to NAV as `<paymentDate>`; rendered on the printed PDF
+    /// at the FIZETÉSI HATÁRIDŐ slot.
+    pub payment_deadline: Date,
+    /// PR-84 — delivery / fulfillment date (Teljesítési dátum); promoted
+    /// verbatim from [`DraftInvoice::delivery_date`]. REGULATORY: drives
+    /// the NAV VAT-period assignment via `<invoiceDeliveryDate>`.
+    pub delivery_date: Date,
     /// The contiguous sequence number assigned in this series for this
     /// fiscal year. Stable; not reused even if the invoice is voided.
     pub sequence_number: u64,

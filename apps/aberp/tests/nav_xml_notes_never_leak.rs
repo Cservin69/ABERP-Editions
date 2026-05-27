@@ -28,7 +28,9 @@
 //! byte equality + one assertion on the literal absence of the note
 //! text in the rendered bytes.
 
-use aberp::nav_xml::{self, CustomerAddress, CustomerInfo, NavParties, SupplierInfo};
+use aberp::nav_xml::{
+    self, CustomerAddress, CustomerInfo, NavParties, StornoReference, SupplierInfo,
+};
 use aberp_billing::{
     Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
 };
@@ -44,6 +46,18 @@ const SENTINEL_LINE_A_NOTE: &str =
     "PR-82-sentinel-line-A-MEGJEGYZÉS-leave-at-back-door-MUST-NOT-LEAK";
 const SENTINEL_LINE_B_NOTE: &str =
     "PR-82-sentinel-line-B-MEGJEGYZÉS-deliver-in-the-morning-MUST-NOT-LEAK";
+
+/// PR-83 — buyer-facing storno reason sentinel. Distinctive enough that
+/// any byte of the string showing up in the rendered NAV body would be
+/// a needle-in-haystack hit, not a silent pass. The storno renderer
+/// (`render_storno_data`) MUST NEVER emit this text into the wire body
+/// — the storno reason is recipient-facing only (printed PDF + future
+/// email), and NAV has no `annulmentReason`-shape slot in the storno's
+/// `<InvoiceData>` body (NAV's annulment reason lives on the separate
+/// `manageAnnulment` /technicalAnnulment surface, not on the data
+/// submission per ADR-0023 §1).
+const SENTINEL_STORNO_REASON: &str =
+    "PR-83-sentinel-storno-INDOKA-buyer-facing-WHY-cancelled-MUST-NOT-LEAK";
 
 fn parties() -> NavParties {
     NavParties {
@@ -112,6 +126,13 @@ fn fixture_invoice(with_notes: bool) -> ReadyInvoice {
         customer_id: CustomerId::new(),
         lines,
         issue_date: fixed_date,
+        // PR-84 — fixture defaults both date fields to the fixed issue
+        // date so the wire-byte-identical pin survives the PR-84
+        // signature change (delivery + payment dates were previously
+        // mirrored to issue_date by the emitter; now they come off the
+        // ReadyInvoice — same byte shape, different code path).
+        payment_deadline: fixed_date.date(),
+        delivery_date: fixed_date.date(),
         sequence_number: 42,
         fiscal_year: 0,
     }
@@ -233,4 +254,121 @@ fn nav_xml_invoice_data_byte_identical_with_partial_line_notes() {
         base.lines[1].note.is_none() && partial.lines[1].note.is_some(),
         "test fixture invariant: only `partial` should carry a line-1 note"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// PR-83 — storno-emit cases. The storno renderer
+// (`render_storno_data`) reuses the same per-line writer as
+// `render_invoice_data` (intentional per `issue_storno.rs::run`'s
+// "negation only touches unit price" comment), so PR-82's
+// `render_invoice_data` byte-identity pin already covers the per-line
+// note path through both renderers. These pins close the storno-
+// reason channel: a storno reason lands on the storno's own
+// `invoice.invoice_note` column AND on the audit payload's
+// `invoice_note` field, but MUST NOT reach the wire body.
+//
+// The pin defends against a hypothetical future commit that wires
+// `invoice.invoice_note` into `render_storno_data` (e.g. as a NAV
+// `<comments>`-style annotation, which the v3.0 schema does not
+// carry). The byte-identity assertion catches it loud per
+// CLAUDE.md rule 12 + ADR-0042.
+// ──────────────────────────────────────────────────────────────────────
+
+fn storno_reference() -> StornoReference {
+    StornoReference {
+        base_invoice_number: "INV-default/00041".to_string(),
+        modification_index: 1,
+    }
+}
+
+/// THE storno-channel headline pin. PR-83 / ADR-0042 — render the
+/// storno NAV body with and without per-line notes (which the storno
+/// inherits from the base) and assert the bytes are byte-identical.
+/// The storno's `invoice_note` (storno reason) is NOT carried on the
+/// `ReadyInvoice` fixture today — it lives only on the DuckDB column
+/// and the audit payload; the renderer takes the `ReadyInvoice` shape
+/// and has no field to consume. This test fixes that surface area at
+/// the renderer layer.
+#[test]
+fn nav_xml_storno_data_byte_identical_with_or_without_notes() {
+    let parties = parties();
+    let series = SeriesCode::new("INV-default".to_string()).expect("valid series code");
+    let storno_ref = storno_reference();
+
+    let without_notes = fixture_invoice(false);
+    let mut with_notes = fixture_invoice(true);
+    with_notes.id = without_notes.id;
+    with_notes.series_id = without_notes.series_id;
+    with_notes.customer_id = without_notes.customer_id;
+
+    let xml_without = nav_xml::render_storno_data(
+        &without_notes,
+        &series,
+        &parties,
+        &storno_ref,
+        Currency::Huf,
+        None,
+    )
+    .expect("render NAV storno XML (no notes)");
+    let xml_with = nav_xml::render_storno_data(
+        &with_notes,
+        &series,
+        &parties,
+        &storno_ref,
+        Currency::Huf,
+        None,
+    )
+    .expect("render NAV storno XML (with notes)");
+
+    assert_eq!(
+        xml_without, xml_with,
+        "PR-83 / ADR-0042 INVARIANT VIOLATION: rendering a STORNO with \
+         per-line notes produced different bytes than rendering the same \
+         storno without notes. Notes MUST NEVER appear in the NAV \
+         InvoiceData XML (storno or otherwise). See \
+         adr/0042-invoice-notes-never-in-nav-xml.md."
+    );
+}
+
+/// PR-83 — storno-reason sentinel-substring pin. The storno reason
+/// the operator types in the SPA confirm panel lands on the storno's
+/// own `invoice_note` column AND on the `InvoiceDraftCreated` audit
+/// payload. This test pins that NEITHER the per-line note sentinels
+/// NOR the storno-reason sentinel appears anywhere in the rendered
+/// storno NAV body. Belt-and-braces against a hypothetical future
+/// emitter regression that incidentally interpolates an external note
+/// string somewhere on the wire.
+#[test]
+fn nav_xml_storno_data_never_contains_note_sentinel_text() {
+    let parties = parties();
+    let series = SeriesCode::new("INV-default".to_string()).expect("valid series code");
+    let storno_ref = storno_reference();
+    let with_notes = fixture_invoice(true);
+
+    let xml = nav_xml::render_storno_data(
+        &with_notes,
+        &series,
+        &parties,
+        &storno_ref,
+        Currency::Huf,
+        None,
+    )
+    .expect("render NAV storno XML (with notes)");
+    let body = std::str::from_utf8(&xml).expect("NAV storno body is UTF-8");
+
+    for needle in [
+        SENTINEL_INVOICE_NOTE,
+        SENTINEL_LINE_A_NOTE,
+        SENTINEL_LINE_B_NOTE,
+        SENTINEL_STORNO_REASON,
+    ] {
+        assert!(
+            !body.contains(needle),
+            "PR-83 / ADR-0042 INVARIANT VIOLATION: NAV storno InvoiceData \
+             XML body contained the note-sentinel substring `{needle}`. \
+             The storno reason (and the per-line notes inherited from the \
+             base) is recipient-facing ONLY — it leaked into the regulatory \
+             wire body. See adr/0042-invoice-notes-never-in-nav-xml.md."
+        );
+    }
 }

@@ -11,6 +11,7 @@ pub use crate::domain::invoice::{
     AbandonedInvoice, DraftInvoice, FinalizedInvoice, LineItem, ReadyInvoice, RejectedInvoice,
     SubmissionStuckInvoice, SubmittedInvoice,
 };
+pub use crate::domain::invoice_dates::{classify_delivery_date, DeliveryDateZone};
 pub use crate::domain::money::{
     huf_equivalent_round_half_even, BankAccountSnapshot, Currency, Eur, Huf, Money, RateMetadata,
 };

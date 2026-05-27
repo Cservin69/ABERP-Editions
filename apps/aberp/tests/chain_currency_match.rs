@@ -86,6 +86,9 @@ fn build_eur_chain_child() -> ReadyInvoice {
             note: None,
         }],
         issue_date: OffsetDateTime::now_utc(),
+        // PR-84 — chain-child fixture defaults both date fields to issue.
+        payment_deadline: OffsetDateTime::now_utc().date(),
+        delivery_date: OffsetDateTime::now_utc().date(),
     }
 }
 

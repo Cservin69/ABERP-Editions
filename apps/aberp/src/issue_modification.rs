@@ -256,12 +256,21 @@ pub fn modification_from_inputs(
     let command = build_modification_command(&input, &series_code)?;
     let idempotency_key = command.idempotency_key;
     let issue_date = OffsetDateTime::now_utc();
+    // PR-84 — MODIFICATION chains default both invoice-date fields to
+    // the server-clock issue date. Same posture as
+    // `apps/aberp/src/issue_storno.rs`: the modification UX does not
+    // yet surface operator-supplied delivery / payment pickers
+    // (out of scope per the PR-84 brief — "keep PR-84 to the issue
+    // path"); preserving pre-PR-84 wire behaviour is surgical.
+    let default_calendar_date = issue_date.date();
     let draft = DraftInvoice {
         id: InvoiceId::new(),
         series_id: series.id,
         customer_id: command.customer_id,
         lines: command.lines,
         issue_date,
+        payment_deadline: default_calendar_date,
+        delivery_date: default_calendar_date,
     };
     // PR-44γ.1 — placeholder defaults; `run_single_tx` reads the
     // base's stored currency metadata and overrides per ADR-0037 §4

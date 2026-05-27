@@ -651,6 +651,11 @@ mod tests {
             bank_account_swift_bic: None,
             invoice_note: None,
             line_notes: Vec::new(),
+            // PR-84 — test fixture predates the date pickers; NULL
+            // across all three invoice-date audit fields.
+            payment_deadline: None,
+            delivery_date: None,
+            delivery_date_override: None,
         };
         ledger
             .append(

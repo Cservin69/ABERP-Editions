@@ -128,6 +128,8 @@ impl BillingStore for InMemoryBillingStore {
             customer_id: draft.customer_id,
             lines: draft.lines,
             issue_date: draft.issue_date,
+            payment_deadline: draft.payment_deadline,
+            delivery_date: draft.delivery_date,
             sequence_number: allocated,
             fiscal_year,
         };

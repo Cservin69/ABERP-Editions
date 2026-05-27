@@ -107,6 +107,11 @@ fn build_eur_invoice() -> ReadyInvoice {
         // Fixed wall-clock date so the rate-publication-date assertion
         // is deterministic across runs.
         issue_date: OffsetDateTime::now_utc(),
+        // PR-84 — fixture defaults both invoice-date fields to issue
+        // date (preserves the pre-PR-84 wire-on-disk byte shape this
+        // test asserts against).
+        payment_deadline: OffsetDateTime::now_utc().date(),
+        delivery_date: OffsetDateTime::now_utc().date(),
     }
 }
 
@@ -134,6 +139,8 @@ fn build_huf_invoice() -> ReadyInvoice {
             },
         ],
         issue_date: OffsetDateTime::now_utc(),
+        payment_deadline: OffsetDateTime::now_utc().date(),
+        delivery_date: OffsetDateTime::now_utc().date(),
     }
 }
 

@@ -144,6 +144,33 @@ pub struct InvoiceInputJson {
     /// `rename = "invoiceNote"` matches the SPA's camelCase wire form.
     #[serde(default, rename = "invoiceNote")]
     pub invoice_note: Option<String>,
+    /// PR-84 — operator-supplied payment deadline (Fizetési határidő) in
+    /// canonical YYYY-MM-DD form. `None` for pre-PR-84 side-stored
+    /// bodies AND for CLI callers that do not yet surface the field —
+    /// the issuance pipeline defaults to the system issue date in that
+    /// case (preserves pre-PR-84 wire-on-disk behaviour).
+    #[serde(default, rename = "paymentDeadline")]
+    pub payment_deadline: Option<String>,
+    /// PR-84 — operator-supplied delivery / fulfillment date
+    /// (Teljesítési dátum) in canonical YYYY-MM-DD form. REGULATORY:
+    /// drives NAV's VAT-period assignment via `<invoiceDeliveryDate>`.
+    /// `None` for pre-PR-84 bodies / CLI callers — defaulted to issue
+    /// date.
+    #[serde(default, rename = "deliveryDate")]
+    pub delivery_date: Option<String>,
+    /// PR-84 — audit discriminant captured at form time when the
+    /// operator picked a delivery date OUTSIDE the comfort zone
+    /// [invoice_date, payment_deadline]. The SPA's inline "Are you
+    /// sure?" affordance stamps this as `"BeforeInvoiceDate"` or
+    /// `"AfterPaymentDeadline"`; in-range choices send `None` (no
+    /// audit flag, default operator path). The server independently
+    /// re-classifies post-issuance via
+    /// `aberp_billing::classify_delivery_date` for defence in depth;
+    /// the wire value here is what the operator SAW + confirmed at
+    /// form time, persisted to the audit payload verbatim so the
+    /// tamper-evident trail records the operator's UI experience.
+    #[serde(default, rename = "deliveryDateOverride")]
+    pub delivery_date_override: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -454,13 +481,40 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     // 7. Build IssueInvoiceCommand + AllocateArgs for the tx body.
     let command = build_command(&input, &series_code)?;
     let idempotency_key = command.idempotency_key;
+    // PR-84 — server-stamp the immutable invoice date (no client clock
+    // ever sets this). The two operator-supplied dates (payment
+    // deadline + delivery date) parse off the wire body; absent fields
+    // fall back to the issue date (preserves pre-PR-84 behaviour for
+    // CLI callers / older side-stored input.json files).
     let issue_date = OffsetDateTime::now_utc();
+    let issue_date_calendar = issue_date.date();
+    let date_fmt = time::macros::format_description!("[year]-[month]-[day]");
+    let payment_deadline_date = match input.payment_deadline.as_deref() {
+        Some(s) => time::Date::parse(s, &date_fmt).map_err(|_| {
+            anyhow!(
+                "payment_deadline `{}` is not a YYYY-MM-DD calendar date (PR-84 wire shape)",
+                s
+            )
+        })?,
+        None => issue_date_calendar,
+    };
+    let delivery_date_date = match input.delivery_date.as_deref() {
+        Some(s) => time::Date::parse(s, &date_fmt).map_err(|_| {
+            anyhow!(
+                "delivery_date `{}` is not a YYYY-MM-DD calendar date (PR-84 wire shape)",
+                s
+            )
+        })?,
+        None => issue_date_calendar,
+    };
     let draft = DraftInvoice {
         id: InvoiceId::new(),
         series_id: series.id,
         customer_id: command.customer_id,
         lines: command.lines.clone(),
         issue_date,
+        payment_deadline: payment_deadline_date,
+        delivery_date: delivery_date_date,
     };
 
     // PR-44γ — for non-HUF currencies, fetch the MNB rate (with D-1
@@ -513,6 +567,14 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         // payload alongside the per-line notes (which the audit payload
         // builder reads off `outcome.invoice.lines[i].note`).
         input.invoice_note.clone(),
+        // PR-84 — operator's SPA-form override discriminant for the
+        // delivery-date choice. `None` means in-range (default path,
+        // no audit flag); `Some(...)` carries the operator's confirmed
+        // out-of-range choice verbatim for the audit trail. The audit
+        // payload's `with_invoice_dates` builder also stamps the two
+        // calendar dates so an inspector can reconstruct the
+        // comfort-zone classification independently.
+        input.delivery_date_override.clone(),
     )?;
 
     let invoice = outcome.invoice;
@@ -722,6 +784,15 @@ fn run_single_tx(
     // `outcome.invoice.lines[i].note` and are read inline by the
     // payload builder.
     invoice_note: Option<String>,
+    // PR-84 — operator's SPA-form override discriminant for the
+    // delivery-date choice. `None` (in-range) leaves the audit payload's
+    // `delivery_date_override` field at `None`; `Some("BeforeInvoiceDate")`
+    // / `Some("AfterPaymentDeadline")` records the operator's confirmed
+    // out-of-range choice verbatim. The two calendar dates ride on the
+    // allocated `ReadyInvoice` and are stamped by the same `with_invoice_dates`
+    // builder so the audit row carries the full triple
+    // (invoice_date + payment_deadline + delivery_date + override).
+    delivery_date_override: Option<String>,
 ) -> Result<TxOutcome> {
     let tx = conn
         .transaction()
@@ -803,7 +874,14 @@ fn run_single_tx(
         // `invoice.lines[i].note` and persists them alongside the
         // operator-typed `invoice_note` so the operator-twin record
         // captures everything the buyer will see on the PDF.
-        .with_notes(&invoice, invoice_note.as_deref());
+        .with_notes(&invoice, invoice_note.as_deref())
+        // PR-84 — stamp the three invoice-date fields onto the audit
+        // payload. `payment_deadline` + `delivery_date` come off the
+        // freshly-allocated `ReadyInvoice`; `delivery_date_override`
+        // carries the operator's SPA-form comfort-zone discriminant
+        // verbatim (None for in-range, Some("BeforeInvoiceDate") /
+        // Some("AfterPaymentDeadline") for confirmed out-of-range).
+        .with_invoice_dates(&invoice, delivery_date_override.as_deref());
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,

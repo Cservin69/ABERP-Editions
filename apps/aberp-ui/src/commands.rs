@@ -118,9 +118,17 @@ pub async fn poll_ack(state: State<'_, AppState>, invoice_id: String) -> Result<
 
 /// PR-47α / session-64 — `POST /api/invoices/<id>/storno`; the SPA's
 /// "Cancel invoice (storno)" button on the invoice-detail modal posts
-/// here. No body — the backend resolves the operator's original
-/// invoice-content JSON from the side-stored `<ULID>.input.json` (per
-/// A174) and the base's NAV XML path from the audit ledger.
+/// here. The backend resolves the operator's original invoice-content
+/// JSON from the side-stored `<ULID>.input.json` (per A174) and the
+/// base's NAV XML path from the audit ledger.
+///
+/// PR-83 — the body now carries an optional buyer-facing storno
+/// reason ("Sztornó indoka / Storno reason"). Wire shape:
+/// `{ "stornoReason": <string> | null }`. The body is forwarded
+/// verbatim — the typed shape lives on the backend's
+/// `StornoInvoiceRequest`; this command is the pass-through seam.
+/// A `null` reason matches the pre-PR-83 wire (no buyer-facing
+/// reason); CLI fallback unaffected.
 ///
 /// Returns the backend's typed response body (`{invoice_id,
 /// invoice_number, state, modification_index, entries_verified}`).
@@ -130,10 +138,11 @@ pub async fn poll_ack(state: State<'_, AppState>, invoice_id: String) -> Result<
 pub async fn cancel_invoice_storno(
     state: State<'_, AppState>,
     invoice_id: String,
+    body: Value,
 ) -> Result<Value, String> {
     validate_invoice_id(&invoice_id).map_err(|e| format!("{e:#}"))?;
     let path = format!("/api/invoices/{invoice_id}/storno");
-    forward_post(&state, &path, Value::Null).await
+    forward_post(&state, &path, body).await
 }
 
 /// PR-47β / session-65 — `POST /api/invoices/<id>/modification`; the

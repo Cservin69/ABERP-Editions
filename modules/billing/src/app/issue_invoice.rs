@@ -201,13 +201,25 @@ where
 
     // 3. Build the draft. `issue_date` and `id` are decided here — never
     //    pulled from the command — per ADR-0007 §"Operator-as-threat-actor".
+    //
+    // PR-84 — `payment_deadline` and `delivery_date` are operator-supplied
+    // for the SPA path (the binary's library helper constructs the
+    // `DraftInvoice` directly with the wire-body values); the in-process
+    // handler defaults both to the captured clock date. The handler is
+    // a unit-test + in-memory adapter surface only (CLI / SPA do NOT
+    // route through here per the PR-44γ comment below); keeping the
+    // default rule narrow here matches the existing
+    // `currency: Huf` / `rate_metadata: None` posture.
     let issue_date = clock.now_utc();
+    let default_calendar_date = issue_date.date();
     let draft = DraftInvoice {
         id: crate::domain::ids::InvoiceId::new(),
         series_id: series.id,
         customer_id: cmd.customer_id,
         lines: cmd.lines,
         issue_date,
+        payment_deadline: default_calendar_date,
+        delivery_date: default_calendar_date,
     };
 
     // 4. Delegate to the storage adapter for the atomic allocate.

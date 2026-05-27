@@ -73,6 +73,13 @@ fn build_allocate_args(series_id: SeriesId, idem: IdempotencyKey) -> AllocateArg
                 note: None,
             }],
             issue_date: OffsetDateTime::now_utc(),
+            // PR-84 — in-memory store / round-trip test path. Default
+            // both invoice-date fields to the issue date (preserves
+            // pre-PR-84 behaviour for unit-test surfaces; the SPA path
+            // is the only surface that exercises operator-supplied
+            // dates today).
+            payment_deadline: OffsetDateTime::now_utc().date(),
+            delivery_date: OffsetDateTime::now_utc().date(),
         },
         idempotency_key: idem,
         currency: Currency::Huf,

@@ -17,9 +17,11 @@ import { describe, expect, it } from "vitest";
 import {
   cannotIssueDueToBank,
   composeIssueInvoiceBody,
+  deliveryDateOverrideFor,
   emptyForm,
   parseInvoicePreflightErrors,
   parseMissingSellerConfigError,
+  paymentDeadlineFromOffset,
   targetForFieldPath,
   type InvoicePreflightErrorKind,
 } from "./issue-invoice";
@@ -70,6 +72,15 @@ describe("composeIssueInvoiceBody", () => {
       bankAccountId: null,
       // PR-82 — blank invoice-level note normalises to `null`.
       invoiceNote: null,
+      // PR-84 — the form's seeded dates are emitted verbatim. The
+      // composer does NOT carry the form's `invoiceDate` (server
+      // stamps it); only payment_deadline + delivery_date + the
+      // comfort-zone override discriminant. The seeded defaults from
+      // `emptyForm()` flow through: paymentDeadline = today+8;
+      // deliveryDate = today; override = null (in range).
+      paymentDeadline: form.paymentDeadline,
+      deliveryDate: form.deliveryDate,
+      deliveryDateOverride: null,
     });
   });
 
@@ -775,5 +786,113 @@ describe("cannotIssueDueToBank — Submit gate when bank picker is unresolvable"
       banksForCurrencyCount: 3,
     });
     expect(blocked).toBe(false);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// PR-84 — invoice-date composer pins
+// ──────────────────────────────────────────────────────────────────────
+
+describe("paymentDeadlineFromOffset", () => {
+  it("returns invoiceDate + offsetDays as a YYYY-MM-DD string", () => {
+    expect(paymentDeadlineFromOffset("2026-05-27", 8)).toBe("2026-06-04");
+    expect(paymentDeadlineFromOffset("2026-05-27", 0)).toBe("2026-05-27");
+    expect(paymentDeadlineFromOffset("2026-05-27", 30)).toBe("2026-06-26");
+  });
+
+  it("handles month and year boundaries", () => {
+    expect(paymentDeadlineFromOffset("2026-12-25", 10)).toBe("2027-01-04");
+  });
+
+  it("returns null on malformed input", () => {
+    expect(paymentDeadlineFromOffset("not-a-date", 8)).toBeNull();
+    expect(paymentDeadlineFromOffset("2026-05-27", Number.NaN)).toBeNull();
+  });
+});
+
+describe("deliveryDateOverrideFor", () => {
+  // The form uses this helper to decide whether to fire the inline
+  // "Are you sure?" confirm — and to stamp the audit discriminant on
+  // the wire body. The three pins below cover the three closed-vocab
+  // outcomes; the underlying boundary semantics are pinned in
+  // `invoice-dates.test.ts`'s comfortZone block.
+
+  it("returns null for an in-range delivery date (no audit flag)", () => {
+    expect(deliveryDateOverrideFor("2026-05-27", "2026-06-04", "2026-05-30")).toBeNull();
+  });
+
+  it("returns null at either inclusive endpoint", () => {
+    expect(deliveryDateOverrideFor("2026-05-27", "2026-06-04", "2026-05-27")).toBeNull();
+    expect(deliveryDateOverrideFor("2026-05-27", "2026-06-04", "2026-06-04")).toBeNull();
+  });
+
+  it("returns 'BeforeInvoiceDate' for back-dated delivery", () => {
+    expect(deliveryDateOverrideFor("2026-05-27", "2026-06-04", "2026-05-26")).toBe(
+      "BeforeInvoiceDate",
+    );
+  });
+
+  it("returns 'AfterPaymentDeadline' for forward-dated delivery", () => {
+    expect(deliveryDateOverrideFor("2026-05-27", "2026-06-04", "2026-06-05")).toBe(
+      "AfterPaymentDeadline",
+    );
+  });
+
+  it("returns null on a malformed range (form-level validator catches separately)", () => {
+    // payment_deadline < invoice_date — the form's input validator
+    // should already surface the problem; the override helper refuses
+    // to classify against a malformed range rather than producing a
+    // misleading confirm prompt.
+    expect(deliveryDateOverrideFor("2026-06-04", "2026-05-27", "2026-05-30")).toBeNull();
+  });
+});
+
+describe("composeIssueInvoiceBody — PR-84 invoice-date fields", () => {
+  it("emits paymentDeadline and deliveryDate verbatim from the form", () => {
+    const form = {
+      ...emptyForm(),
+      customerName: "Vevő Kft.",
+      customerTaxNumber: "87654321-2-13",
+      invoiceDate: "2026-05-27",
+      paymentDeadline: "2026-06-04",
+      deliveryDate: "2026-05-30",
+      deliveryDateOverride: null,
+    };
+    const body = composeIssueInvoiceBody(form);
+    expect(body.paymentDeadline).toBe("2026-06-04");
+    expect(body.deliveryDate).toBe("2026-05-30");
+    expect(body.deliveryDateOverride).toBeNull();
+  });
+
+  it("emits a non-null deliveryDateOverride verbatim (operator confirmed out-of-range)", () => {
+    const form = {
+      ...emptyForm(),
+      customerName: "Vevő Kft.",
+      customerTaxNumber: "87654321-2-13",
+      invoiceDate: "2026-05-27",
+      paymentDeadline: "2026-06-04",
+      deliveryDate: "2026-05-10",
+      deliveryDateOverride: "BeforeInvoiceDate" as const,
+    };
+    const body = composeIssueInvoiceBody(form);
+    expect(body.deliveryDate).toBe("2026-05-10");
+    expect(body.deliveryDateOverride).toBe("BeforeInvoiceDate");
+  });
+
+  it("does NOT carry the form's invoiceDate on the wire (server stamps the issue date)", () => {
+    // Per ADR-0007 §"Operator-as-threat-actor" the server stamps the
+    // immutable issue date. The form's `invoiceDate` is purely UX
+    // anchoring for the two operator-supplied dates; emitting it on
+    // the wire would be a regression that lets the client clock
+    // influence the regulatory record.
+    const form = {
+      ...emptyForm(),
+      customerName: "Vevő Kft.",
+      customerTaxNumber: "87654321-2-13",
+      invoiceDate: "1999-01-01", // operator-typed lie
+    };
+    const body = composeIssueInvoiceBody(form);
+    expect(body).not.toHaveProperty("invoiceDate");
+    expect(body).not.toHaveProperty("issueDate");
   });
 });

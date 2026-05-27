@@ -52,6 +52,9 @@ fn build_minimal_invoice() -> ReadyInvoice {
             },
         ],
         issue_date: OffsetDateTime::now_utc(),
+        // PR-84 — minimal fixture defaults both date fields to issue.
+        payment_deadline: OffsetDateTime::now_utc().date(),
+        delivery_date: OffsetDateTime::now_utc().date(),
     }
 }
 

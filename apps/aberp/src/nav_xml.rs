@@ -405,16 +405,14 @@ pub fn render_invoice_data(
 
     let invoice_number = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number,);
     text_element(&mut w, "invoiceNumber", &invoice_number)?;
-    // NAV InvoiceData wants `xs:date` (YYYY-MM-DD), not full RFC3339.
-    // Format manually rather than depending on `time::Iso8601`'s
-    // const-generic configuration.
-    let date = invoice.issue_date.date();
-    let issue_date = format!(
-        "{:04}-{:02}-{:02}",
-        date.year(),
-        date.month() as u8,
-        date.day(),
-    );
+    // PR-84 — three NAV date fields share one formatter
+    // (`nav_date_string`). `invoiceIssueDate` is the server-stamped
+    // immutable date; `invoiceDeliveryDate` is the operator-chosen
+    // REGULATORY date (drives VAT-period assignment); `paymentDate` is
+    // the operator-chosen payment deadline.
+    let issue_date = nav_date_string(invoice.issue_date.date());
+    let delivery_date = nav_date_string(invoice.delivery_date);
+    let payment_date = nav_date_string(invoice.payment_deadline);
     text_element(&mut w, "invoiceIssueDate", &issue_date)?;
     // <completenessIndicator> — PR-76. NAV v3.0 InvoiceData XSD names this
     // as a REQUIRED element positioned between `<invoiceIssueDate>` and
@@ -434,7 +432,13 @@ pub fn render_invoice_data(
     w.write_event(Event::Start(BytesStart::new("invoiceHead")))?;
     write_supplier(&mut w, &parties.supplier)?;
     write_customer(&mut w, &parties.customer)?;
-    write_invoice_detail(&mut w, &issue_date, currency, rate_metadata)?;
+    write_invoice_detail(
+        &mut w,
+        &delivery_date,
+        &payment_date,
+        currency,
+        rate_metadata,
+    )?;
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
     // <invoiceLines>
@@ -448,6 +452,23 @@ pub fn render_invoice_data(
     w.write_event(Event::End(BytesEnd::new("InvoiceData")))?;
 
     Ok(buf)
+}
+
+/// PR-84 — uniform calendar-date formatter for the three NAV date
+/// fields (`<invoiceIssueDate>`, `<invoiceDeliveryDate>`, `<paymentDate>`).
+/// NAV's XSD pins `xs:date` (YYYY-MM-DD); format manually rather than
+/// depending on `time::Iso8601`'s const-generic configuration so the
+/// formatting code matches the existing `OffsetDateTime`-based emit shape
+/// byte-for-byte. The three callers (`render_invoice_data`,
+/// `render_storno_data`, `render_modification_data`) share one helper so
+/// a future format drift surfaces in one place.
+fn nav_date_string(date: time::Date) -> String {
+    format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        date.month() as u8,
+        date.day(),
+    )
 }
 
 /// Refuse a non-HUF currency without rate metadata; pinned by the
@@ -524,13 +545,15 @@ pub fn render_storno_data(
     // Storno's OWN invoice number — the cancellation is itself an invoice.
     let invoice_number = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number);
     text_element(&mut w, "invoiceNumber", &invoice_number)?;
-    let date = invoice.issue_date.date();
-    let issue_date = format!(
-        "{:04}-{:02}-{:02}",
-        date.year(),
-        date.month() as u8,
-        date.day(),
-    );
+    // PR-84 — STORNO chains inherit pre-PR-84 behaviour (delivery +
+    // payment mirror the chain-storno's issue date). The storno UX
+    // does not surface operator-supplied date pickers yet; `ReadyInvoice`
+    // carries `delivery_date == payment_deadline == issue_date.date()`
+    // from `issue_storno.rs`. Same `nav_date_string` formatter as the
+    // fresh-issuance renderer so a format drift surfaces in one place.
+    let issue_date = nav_date_string(invoice.issue_date.date());
+    let delivery_date = nav_date_string(invoice.delivery_date);
+    let payment_date = nav_date_string(invoice.payment_deadline);
     text_element(&mut w, "invoiceIssueDate", &issue_date)?;
     // <completenessIndicator> — PR-76. NAV v3.0 schema-required element
     // between `<invoiceIssueDate>` and `<invoiceMain>`; same posture as
@@ -558,7 +581,13 @@ pub fn render_storno_data(
     // PR-44γ.1 — currency + rate metadata inherited from base per
     // ADR-0037 §4 invariant C6 (built by the chain caller via
     // `invoice_currency_metadata::inherit_rate_metadata_for_chain`).
-    write_invoice_detail(&mut w, &issue_date, currency, rate_metadata)?;
+    write_invoice_detail(
+        &mut w,
+        &delivery_date,
+        &payment_date,
+        currency,
+        rate_metadata,
+    )?;
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
     // <invoiceLines> with negated amounts. Negate by constructing a
@@ -632,13 +661,14 @@ pub fn render_modification_data(
     // Modification's OWN invoice number — the correction is itself an invoice.
     let invoice_number = format!("{}/{:05}", series_code.as_str(), invoice.sequence_number);
     text_element(&mut w, "invoiceNumber", &invoice_number)?;
-    let date = invoice.issue_date.date();
-    let issue_date = format!(
-        "{:04}-{:02}-{:02}",
-        date.year(),
-        date.month() as u8,
-        date.day(),
-    );
+    // PR-84 — MODIFICATION chains inherit pre-PR-84 behaviour. The
+    // modification's `ReadyInvoice` carries
+    // `delivery_date == payment_deadline == issue_date.date()` from
+    // `issue_modification.rs` because the modification UX does not
+    // surface date pickers yet.
+    let issue_date = nav_date_string(invoice.issue_date.date());
+    let delivery_date = nav_date_string(invoice.delivery_date);
+    let payment_date = nav_date_string(invoice.payment_deadline);
     text_element(&mut w, "invoiceIssueDate", &issue_date)?;
     // <completenessIndicator> — PR-76. NAV v3.0 schema-required element
     // between `<invoiceIssueDate>` and `<invoiceMain>`; same posture as
@@ -661,7 +691,13 @@ pub fn render_modification_data(
     write_customer(&mut w, &parties.customer)?;
     // PR-44γ.1 — currency + rate metadata inherited from base per
     // ADR-0037 §4 invariant C6.
-    write_invoice_detail(&mut w, &issue_date, currency, rate_metadata)?;
+    write_invoice_detail(
+        &mut w,
+        &delivery_date,
+        &payment_date,
+        currency,
+        rate_metadata,
+    )?;
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
     // <invoiceLines> + <invoiceSummary> — NOT negated. Full-replace
@@ -924,7 +960,8 @@ fn write_address(w: &mut Writer<&mut Vec<u8>>, tag: &str, s: &SupplierInfo) -> R
 
 fn write_invoice_detail(
     w: &mut Writer<&mut Vec<u8>>,
-    issue_date: &str,
+    delivery_date: &str,
+    payment_deadline: &str,
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
 ) -> Result<()> {
@@ -936,6 +973,17 @@ fn write_invoice_detail(
     // HUF and EUR. The validator accepts both forms (`ensure_numeric_amount`
     // is shape-agnostic on decimal-places); the uniform precision is the
     // load-bearing posture pin.
+    //
+    // PR-84 — `invoiceDeliveryDate` (Teljesítési dátum) and `paymentDate`
+    // (Fizetési határidő) are now operator-supplied and may differ from
+    // each other AND from `<invoiceIssueDate>`. The two YYYY-MM-DD
+    // strings come from `ReadyInvoice.delivery_date` and
+    // `ReadyInvoice.payment_deadline` at the caller — both fields are
+    // server-validated calendar dates (the wire parse loud-fails on a
+    // malformed date BEFORE we reach this writer). The pre-PR-84 path
+    // silently mirrored `<invoiceIssueDate>` for both fields; that bug
+    // (regulatory: would mis-file the VAT period for any back- or
+    // forward-dated invoice) is closed by this signature.
     let exchange_rate = match (currency, rate_metadata) {
         (Currency::Huf, _) => "1.000000".to_string(),
         (_, Some(meta)) => format_rate_six_decimals(&meta.rate),
@@ -943,11 +991,11 @@ fn write_invoice_detail(
     };
     w.write_event(Event::Start(BytesStart::new("invoiceDetail")))?;
     text_element(w, "invoiceCategory", "NORMAL")?;
-    text_element(w, "invoiceDeliveryDate", issue_date)?;
+    text_element(w, "invoiceDeliveryDate", delivery_date)?;
     text_element(w, "currencyCode", currency.iso_code())?;
     text_element(w, "exchangeRate", &exchange_rate)?;
     text_element(w, "paymentMethod", "TRANSFER")?;
-    text_element(w, "paymentDate", issue_date)?;
+    text_element(w, "paymentDate", payment_deadline)?;
     text_element(w, "invoiceAppearance", "ELECTRONIC")?;
     w.write_event(Event::End(BytesEnd::new("invoiceDetail")))?;
     Ok(())

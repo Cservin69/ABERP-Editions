@@ -2380,6 +2380,36 @@ pub struct IssueInvoiceRequest {
     /// ride on `LineJson.note` inside each `lines[i]`.
     #[serde(default, rename = "invoiceNote")]
     pub invoice_note: Option<String>,
+    /// PR-84 — operator-supplied payment deadline (Fizetési határidő)
+    /// in canonical YYYY-MM-DD form. The SPA's IssueInvoice form
+    /// surfaces a bidirectional offset/absolute pair (the offset days
+    /// + the resolved absolute date update each other live); the wire
+    /// form is the resolved absolute date. Optional on the wire so
+    /// pre-PR-84 callers (integration tests pinned at the prior shape)
+    /// still type-check; the issuance pipeline defaults to the system
+    /// issue date when absent.
+    #[serde(default, rename = "paymentDeadline")]
+    pub payment_deadline: Option<String>,
+    /// PR-84 — operator-supplied delivery / fulfillment date
+    /// (Teljesítési dátum) in canonical YYYY-MM-DD form. REGULATORY:
+    /// this is what the NAV emit writes as `<invoiceDeliveryDate>`,
+    /// which drives the VAT-period assignment for the invoice.
+    /// Optional on the wire for the same pre-PR-84 back-compat reason;
+    /// the issuance pipeline defaults to the system issue date when
+    /// absent.
+    #[serde(default, rename = "deliveryDate")]
+    pub delivery_date: Option<String>,
+    /// PR-84 — audit discriminant the SPA's IssueInvoice form stamps
+    /// when the operator picks a delivery date OUTSIDE the comfort
+    /// zone [invoice_date, payment_deadline] and confirms via the
+    /// inline "Are you sure?" affordance. Closed vocab:
+    /// `"BeforeInvoiceDate"`, `"AfterPaymentDeadline"`, or `null`
+    /// (in-range default path). Persisted verbatim on the
+    /// `InvoiceDraftCreated` audit payload via `with_invoice_dates`
+    /// so the tamper-evident regulatory trail records every confirmed
+    /// out-of-range override.
+    #[serde(default, rename = "deliveryDateOverride")]
+    pub delivery_date_override: Option<String>,
 }
 
 /// Response body for `POST /invoices/issue`. The SPA reads
@@ -2957,6 +2987,15 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         // Stored on `invoice.invoice_note`, stamped on the audit payload,
         // rendered on the printed PDF — NEVER reaches the NAV XML.
         invoice_note: request.invoice_note,
+        // PR-84 — three invoice-date fields thread the operator's SPA
+        // form choices straight to the issuance pipeline. `payment_deadline`
+        // + `delivery_date` are canonical YYYY-MM-DD strings parsed by
+        // `issue_from_parsed`; `delivery_date_override` is the comfort-zone
+        // audit discriminant stamped onto the `InvoiceDraftCreated`
+        // payload verbatim.
+        payment_deadline: request.payment_deadline,
+        delivery_date: request.delivery_date,
+        delivery_date_override: request.delivery_date_override,
     };
     // PR-47α / session-64 — side-store the InvoiceInputJson alongside
     // the NAV-XML output path so the SPA storno route can reconstruct
@@ -3496,6 +3535,28 @@ pub async fn poll_ack_request(
 
 // ── PR-47α / session-64 — POST /api/invoices/:id/storno ──────────────
 
+/// PR-83 — wire request body for `POST /api/invoices/:id/storno`. The
+/// pre-PR-83 route accepted no body (the storno's content is
+/// reconstructed server-side from the base's side-stored
+/// `<ULID>.input.json`). PR-83 adds the optional buyer-facing
+/// "Sztornó indoka / Storno reason" — a free-text note the operator
+/// types in the SPA's inline storno confirm panel so the buyer sees
+/// WHY the invoice was cancelled on the printed PDF / email body.
+///
+/// Recipient-facing only. NEVER carried into the NAV InvoiceData XML
+/// wire body — the storno emitter (`render_storno_data`) does not read
+/// this field and the never-leak pin extends to storno-emit cases.
+/// See `adr/0042-invoice-notes-never-in-nav-xml.md`.
+///
+/// Optional on the wire — pre-PR-83 SPA / curl callers that do not
+/// send a body OR send `{}` continue to work (the field defaults to
+/// `None`).
+#[derive(Debug, Default, Deserialize)]
+pub struct StornoInvoiceRequest {
+    #[serde(default, rename = "stornoReason")]
+    pub storno_reason: Option<String>,
+}
+
 /// PR-47α / session-64 — wire response body for
 /// `POST /api/invoices/:id/storno`. Mirrors the submit / poll-ack
 /// response shape — the SPA reads `invoice_id` + `invoice_number` for
@@ -3559,6 +3620,12 @@ async fn handle_storno_invoice(
     headers: HeaderMap,
     State(state): State<AppState>,
     AxumPath(invoice_id): AxumPath<String>,
+    // PR-83 — `Option<Json<...>>` so a pre-PR-83 caller that POSTs no
+    // body OR an empty body still works. Axum's `Option<Json<T>>`
+    // extractor returns `None` when the request has no body OR the
+    // Content-Type header is missing; the unit-default of
+    // `StornoInvoiceRequest` (all-`None`) covers both shapes.
+    body: Option<Json<StornoInvoiceRequest>>,
 ) -> Response {
     if let Err(resp) = require_ready(&state) {
         return resp;
@@ -3566,7 +3633,8 @@ async fn handle_storno_invoice(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match storno_invoice_request(&state, &invoice_id) {
+    let request = body.map(|Json(r)| r).unwrap_or_default();
+    match storno_invoice_request(&state, &invoice_id, request) {
         Ok(summary) => Json(StornoInvoiceResponse {
             invoice_id: summary.invoice_id,
             invoice_number: summary.invoice_number,
@@ -3622,6 +3690,11 @@ async fn handle_storno_invoice(
 pub fn storno_invoice_request(
     state: &AppState,
     invoice_id: &str,
+    // PR-83 — typed request body carrying the buyer-facing storno
+    // reason. `Default::default()` (all-`None`) covers the no-body /
+    // pre-PR-83 wire case so existing tests and CLI fallbacks continue
+    // to work without churn.
+    request: StornoInvoiceRequest,
 ) -> std::result::Result<issue_storno::StornoIssuedSummary, SubmitRouteError> {
     // PR-46α / session-62 — operator login read from Ready boot-state
     // (same posture as `submit_invoice_request`). Loud-fail in
@@ -3715,6 +3788,19 @@ pub fn storno_invoice_request(
     //    sequence-burning series; the SPA route uses the default per
     //    the operator-pathless posture. The same-series-as-base case
     //    is the documented default per ADR-0023 §1.
+    // PR-83 — normalise the storno reason: trim, then treat empty-
+    // after-trim as `None`. Matches PR-82's `blankToNull` posture for
+    // the issue path's note channels (single rule across both
+    // buyer-facing note surfaces).
+    let storno_reason = request.storno_reason.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
     issue_storno::storno_from_inputs(
         input,
         &state.db_path,
@@ -3723,6 +3809,7 @@ pub fn storno_invoice_request(
         invoice_id,
         storno_xml_path,
         actor,
+        storno_reason,
     )
     .map_err(SubmitRouteError::Other)
 }
@@ -4029,6 +4116,16 @@ pub fn modification_invoice_request(
         // chain-level note (storno reason); the modification surface
         // can follow when an operational need surfaces.
         invoice_note: None,
+        // PR-84 — modification chains do not yet surface operator
+        // date pickers (out of scope per the PR-84 brief: "keep PR-84
+        // to the issue path"). All three fields stay `None`; the
+        // modification's allocator (`issue_modification.rs`) defaults
+        // payment_deadline + delivery_date to its own server-stamped
+        // issue date, preserving pre-PR-84 wire behaviour for chain
+        // children.
+        payment_deadline: None,
+        delivery_date: None,
+        delivery_date_override: None,
     };
     let series = request.series.as_deref().unwrap_or(DEFAULT_SERIES_CODE);
 
@@ -6652,6 +6749,7 @@ mod tests {
         };
         use time::OffsetDateTime;
 
+        let now = OffsetDateTime::now_utc();
         let invoice = ReadyInvoice {
             id: InvoiceId::new(),
             series_id: SeriesId::new(),
@@ -6665,7 +6763,9 @@ mod tests {
                 vat_rate_basis_points: 2700,
                 note: None,
             }],
-            issue_date: OffsetDateTime::now_utc(),
+            issue_date: now,
+            payment_deadline: now.date(),
+            delivery_date: now.date(),
         };
         let series = SeriesCode::new("INV-default".to_string()).unwrap();
         let parties = crate::nav_xml::NavParties {
@@ -6879,6 +6979,12 @@ mod tests {
             bank_account_swift_bic: None,
             invoice_note: None,
             line_notes: Vec::new(),
+            // PR-84 — test-only fixture; the three invoice-date audit
+            // fields stay `None` (matches the pre-PR-84 ledger entry
+            // shape the audit-query tests round-trip).
+            payment_deadline: None,
+            delivery_date: None,
+            delivery_date_override: None,
         };
         ledger
             .append(

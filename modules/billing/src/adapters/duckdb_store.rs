@@ -132,6 +132,17 @@ CREATE TABLE IF NOT EXISTS invoice (
     -- by design (most invoices carry no global note); pre-PR-82 rows
     -- gain the column via MIGRATE_PR_82_SQL and stay NULL.
     invoice_note           VARCHAR,
+    -- PR-84 — operator-supplied payment deadline (Fizetési határidő)
+    -- and delivery / fulfillment date (Teljesítési dátum). Calendar
+    -- dates in canonical YYYY-MM-DD form (DuckDB DATE type accepts the
+    -- ISO string). Pre-PR-84 rows pick these up via MIGRATE_PR_84_SQL
+    -- and stay NULL until backfilled; the read path treats NULL as
+    -- "fall back to issue_date" so old rows keep their pre-PR-84
+    -- behaviour (delivery + payment mirror issue, per the current
+    -- nav_xml emit). Fresh issuances post-PR-84 write both values
+    -- non-NULL.
+    payment_deadline       DATE,
+    delivery_date          DATE,
     UNIQUE (series_id, fiscal_year, sequence_number)
 );
 
@@ -237,6 +248,22 @@ ALTER TABLE invoice ADD COLUMN IF NOT EXISTS bank_account_swift_bic VARCHAR;
 const MIGRATE_PR_82_SQL: &str = "
 ALTER TABLE invoice      ADD COLUMN IF NOT EXISTS invoice_note VARCHAR;
 ALTER TABLE invoice_line ADD COLUMN IF NOT EXISTS note         VARCHAR;
+";
+
+/// PR-84 — additive migration for the two invoice-date columns
+/// (`payment_deadline`, `delivery_date`). Idempotent via
+/// `ADD COLUMN IF NOT EXISTS`; safe on fresh + pre-PR-84 DBs.
+///
+/// No backfill `UPDATE` runs here — pre-PR-84 rows have no operator-
+/// chosen delivery or payment date to recover (the NAV wire previously
+/// mirrored issue_date for both), and NULL is the natural
+/// representation of "not stored." The read path's `load_invoice`
+/// treats NULL columns as "fall back to `issue_date.date()`" so
+/// pre-PR-84 rows continue to render the pre-PR-84 wire/PDF behaviour
+/// — identical bytes-on-disk, by design.
+const MIGRATE_PR_84_SQL: &str = "
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS payment_deadline DATE;
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS delivery_date    DATE;
 ";
 
 #[derive(Debug)]
@@ -486,6 +513,17 @@ pub fn allocate_in_tx(
     // `apps/aberp/tests/nav_xml_notes_never_leak.rs` enforces the
     // byte-identical invariant on the wire output.
     let invoice_note = args.invoice_note.clone();
+    // PR-84 — invoice-date columns rendered as canonical YYYY-MM-DD
+    // strings (DuckDB's DATE type casts the ISO string at column-write
+    // per the declared `DATE` type, same posture as `exchange_rate_date`).
+    let payment_deadline_str = draft
+        .payment_deadline
+        .format(&date_fmt)
+        .map_err(|_| BillingError::Invalid("draft.payment_deadline formatting failed"))?;
+    let delivery_date_str = draft
+        .delivery_date
+        .format(&date_fmt)
+        .map_err(|_| BillingError::Invalid("draft.delivery_date formatting failed"))?;
     tx.execute(
         "INSERT INTO invoice
          (id, series_id, customer_id, issue_date, sequence_number,
@@ -494,8 +532,9 @@ pub fn allocate_in_tx(
           exchange_rate_date, huf_equivalent_total,
           bank_account_id, bank_account_currency, bank_account_number,
           bank_account_bank_name, bank_account_swift_bic,
-          invoice_note)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+          invoice_note,
+          payment_deadline, delivery_date)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
         params![
             draft.id.to_prefixed_string(),
             &series_id_str,
@@ -515,6 +554,8 @@ pub fn allocate_in_tx(
             &bank_account_bank_name,
             &bank_account_swift_bic,
             &invoice_note,
+            &payment_deadline_str,
+            &delivery_date_str,
         ],
     )?;
 
@@ -548,6 +589,8 @@ pub fn allocate_in_tx(
         customer_id: draft.customer_id,
         lines: draft.lines,
         issue_date: draft.issue_date,
+        payment_deadline: draft.payment_deadline,
+        delivery_date: draft.delivery_date,
         sequence_number: allocated,
         fiscal_year,
     };
@@ -587,6 +630,12 @@ impl BillingStore for DuckDbBillingStore {
         // columns. Idempotent; old DBs gain `invoice.invoice_note` +
         // `invoice_line.note` on first boot.
         self.conn.execute_batch(MIGRATE_PR_82_SQL)?;
+        // PR-84 — additive migration for the operator-supplied
+        // payment_deadline + delivery_date columns. Old DBs gain the
+        // columns NULL; the read path falls back to `issue_date` for
+        // NULL rows so byte-on-wire behaviour is preserved for pre-PR-84
+        // invoices.
+        self.conn.execute_batch(MIGRATE_PR_84_SQL)?;
         Ok(())
     }
 
@@ -835,9 +884,24 @@ fn load_invoice(
     tx: &duckdb::Transaction<'_>,
     invoice_id_str: &str,
 ) -> Result<ReadyInvoice, BillingError> {
-    let (series_id_str, customer_id_str, issue_date_str, seq_number, fiscal_year) = {
+    // PR-84 — `payment_deadline` and `delivery_date` are NULLable
+    // (pre-PR-84 rows). The read path treats NULL as "fall back to
+    // `issue_date`" so a pre-PR-84 invoice continues to render the
+    // pre-PR-84 wire behaviour (delivery + payment mirror issue) when
+    // it round-trips through this loader — same posture the NAV emit
+    // had before PR-84. Fresh rows post-PR-84 always carry both.
+    let (
+        series_id_str,
+        customer_id_str,
+        issue_date_str,
+        seq_number,
+        fiscal_year,
+        payment_deadline_str,
+        delivery_date_str,
+    ) = {
         let mut stmt = tx.prepare(
-            "SELECT series_id, customer_id, issue_date, sequence_number, fiscal_year
+            "SELECT series_id, customer_id, issue_date, sequence_number, fiscal_year,
+                    CAST(payment_deadline AS VARCHAR), CAST(delivery_date AS VARCHAR)
              FROM invoice WHERE id = ?;",
         )?;
         let mut rows = stmt.query_map([invoice_id_str], |r| {
@@ -847,6 +911,8 @@ fn load_invoice(
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, i32>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         })?;
         match rows.next() {
@@ -887,12 +953,29 @@ fn load_invoice(
     }
 
     let issue_date = OffsetDateTime::parse(&issue_date_str, &Rfc3339)?;
+    // PR-84 — NULL date columns fall back to `issue_date.date()` so
+    // pre-PR-84 rows preserve their pre-PR-84 wire behaviour
+    // byte-identically. Post-PR-84 rows always carry both columns
+    // non-NULL.
+    let date_fmt = format_description!("[year]-[month]-[day]");
+    let payment_deadline = match payment_deadline_str {
+        Some(s) => time::Date::parse(&s, &date_fmt)
+            .map_err(|_| BillingError::Invalid("invoice.payment_deadline not YYYY-MM-DD"))?,
+        None => issue_date.date(),
+    };
+    let delivery_date = match delivery_date_str {
+        Some(s) => time::Date::parse(&s, &date_fmt)
+            .map_err(|_| BillingError::Invalid("invoice.delivery_date not YYYY-MM-DD"))?,
+        None => issue_date.date(),
+    };
     Ok(ReadyInvoice {
         id: InvoiceId(parse_prefixed_ulid(invoice_id_str, "inv")?),
         series_id: SeriesId(parse_prefixed_ulid(&series_id_str, "srs")?),
         customer_id: CustomerId(parse_prefixed_ulid(&customer_id_str, "cus")?),
         lines,
         issue_date,
+        payment_deadline,
+        delivery_date,
         sequence_number: seq_number as u64,
         fiscal_year,
     })

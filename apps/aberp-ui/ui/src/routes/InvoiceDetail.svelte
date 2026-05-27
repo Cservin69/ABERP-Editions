@@ -295,12 +295,19 @@
   // and a long block of explanatory text, not the invoice they're
   // about to storno). PR-80 elevates this to an in-place panel within
   // the action bar that surfaces the invoice's identifying fields
-  // alongside the explanatory copy. `stornoConfirmOpen` is the simple
-  // open-state flag; the confirm + cancel handlers below close it.
-  // Reason field is named-deferred (the backend's
-  // `cancel_invoice_storno` route accepts no body — collecting a
-  // reason that goes nowhere would violate CLAUDE.md rule 12).
+  // alongside the explanatory copy.
+  //
+  // PR-83 / session-103 — buyer-facing storno reason. The reason is
+  // the operator's "here's why I cancelled" note to the buyer; it
+  // lands on the storno's printed PDF / email body so the buyer reads
+  // it on the same document. Bound to `stornoReason` below; trimmed +
+  // normalised empty-to-null at the wire boundary by the backend
+  // route (matches PR-82's blankToNull posture). NEVER carried into
+  // the NAV XML — see ADR-0042. Bilingual label per Ervin's
+  // HU/EN labelling convention; hint copy makes the recipient-facing
+  // surface obvious to the operator.
   let stornoConfirmOpen: boolean = $state(false);
+  let stornoReason: string = $state("");
 
   // PR-70 / ADR-0039 — mark-as-paid modal state. The modal is a
   // small inline <dialog> driven by `paymentDialogOpen` rather than
@@ -382,6 +389,7 @@
       // on navigation so a half-typed confirm doesn't leak into the
       // next inspection context.
       stornoConfirmOpen = false;
+      stornoReason = "";
       void load(invoiceId);
     } else {
       if (dialogEl.open) dialogEl.close();
@@ -396,6 +404,7 @@
       paymentDialogOpen = false;
       payFormError = null;
       stornoConfirmOpen = false;
+      stornoReason = "";
     }
   });
 
@@ -568,25 +577,36 @@
   // screen, not a tiny browser dialog.
   function triggerOpenStornoConfirm() {
     if (!detail) return;
+    // PR-83 — reset the reason field on every fresh open so a stale
+    // value from a prior (cancelled) confirm does not leak.
+    stornoReason = "";
     stornoConfirmOpen = true;
   }
 
   function triggerCancelStornoConfirm() {
     stornoConfirmOpen = false;
+    stornoReason = "";
   }
 
   async function triggerConfirmStorno() {
     if (!detail) return;
+    // PR-83 — trim + normalise empty-after-trim to `null` so the wire
+    // body matches PR-82's blankToNull rule. The backend's route also
+    // normalises (defence in depth); doing it here keeps the wire
+    // shape honest for the operator's first-look network inspection.
+    const trimmed = stornoReason.trim();
+    const reason: string | null = trimmed === "" ? null : trimmed;
     stornoConfirmOpen = false;
     mutationState = { kind: "cancelling" };
     try {
-      await cancelInvoiceStorno(detail.invoice_id);
+      await cancelInvoiceStorno(detail.invoice_id, { stornoReason: reason });
       // Refetch so the base's audit-trail picks up the
       // InvoiceStornoIssued chain-link row AND the chip flips from
       // `Finalized` → `Storno` (the `is_storno_base` arm of
       // derive_state's priority ladder, ADR-0036 §3) AND the
       // `chain_children` list grows.
       await load(detail.invoice_id);
+      stornoReason = "";
       mutationState = { kind: "idle" };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -961,6 +981,31 @@
             <strong>nem visszafordítható</strong>. A beküldéshez ezután
             külön NAV beküldés szükséges.
           </p>
+          <!-- PR-83 / session-103 — buyer-facing storno reason. Free-
+               text "here's why we cancelled" note that lands on the
+               storno's printed PDF / future email body so the buyer
+               sees it on the same document. Optional; blank leaves
+               the storno's `invoice_note` column NULL. NEVER reaches
+               the NAV XML — see ADR-0042. Bilingual label + hint
+               make the recipient-facing surface obvious so the
+               operator does not type internal-only notes here. -->
+          <label class="storno-reason-label" for="storno-reason-input">
+            <span class="storno-reason-label-text">
+              Sztornó indoka / Storno reason
+            </span>
+            <span class="storno-reason-hint">
+              Megjelenik a vevő példányán / Shown on the buyer's copy
+            </span>
+          </label>
+          <textarea
+            id="storno-reason-input"
+            class="storno-reason-input"
+            bind:value={stornoReason}
+            maxlength="4000"
+            rows="3"
+            placeholder="pl. Téves vevő adatok kerültek a számlára…"
+            data-testid="storno-confirm-reason"
+          ></textarea>
           <div class="storno-confirm-actions">
             <button
               type="button"
@@ -1691,6 +1736,44 @@
     display: flex;
     justify-content: flex-end;
     gap: var(--space-2);
+  }
+
+  /* PR-83 / session-103 — buyer-facing storno reason input. Sits
+   * between the explanatory copy and the action buttons so the
+   * operator confirms with the reason visible. Matches the pay-form
+   * input typography for visual consistency within the modal. */
+  .storno-reason-label {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    margin: 0 0 var(--space-1) 0;
+  }
+
+  .storno-reason-label-text {
+    font-size: var(--type-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-text-secondary);
+  }
+
+  .storno-reason-hint {
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
+  }
+
+  .storno-reason-input {
+    width: 100%;
+    padding: var(--space-1) var(--space-2);
+    margin: 0 0 var(--space-3) 0;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    line-height: var(--type-line-normal);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 2px;
+    background: var(--color-surface-base);
+    color: var(--color-text-primary);
+    resize: vertical;
+    box-sizing: border-box;
   }
 
   /* PR-44ε.UI — inline download-error message. Same `.error` styling

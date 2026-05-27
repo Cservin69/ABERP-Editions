@@ -43,16 +43,19 @@
   import {
     cannotIssueDueToBank,
     composeIssueInvoiceBody,
+    deliveryDateOverrideFor,
     emptyForm,
     emptyLine,
     parseInvoicePreflightErrors,
     parseMissingSellerConfigError,
+    paymentDeadlineFromOffset,
     targetForFieldPath,
     type InvoicePreflightErrorBody,
     type InvoicePreflightErrorItem,
     type IssueInvoiceFormState,
     type MissingSellerConfigError,
   } from "../lib/issue-invoice";
+  import { daysBetween } from "../lib/invoice-dates";
   import { buyerFieldsFromPartner } from "../lib/partners";
   import { buyerComboboxState } from "../lib/buyer-combobox";
 
@@ -420,6 +423,105 @@
     }
   }
 
+  // ── PR-84 — invoice-date section state + handlers ─────────────────
+  //
+  // Three dates, three rules (see `agent/memory/project_aberp_invoice_dates.md`
+  // for the spec):
+  //   1. Invoice date — read-only display; the server stamps the
+  //      immutable issue date at issuance time. Never trust the client
+  //      clock for the regulatory record.
+  //   2. Payment deadline — bidirectional: offset-days input and
+  //      absolute-date input edit each other live.
+  //   3. Delivery date — REGULATORY (NAV `invoiceDeliveryDate`). In
+  //      the comfort zone [invoice, deadline] → silent; out-of-range
+  //      → inline "Are you sure?" confirm + audit override flag.
+  //
+  // The pure helpers (`paymentDeadlineFromOffset`, `deliveryDateOverrideFor`)
+  // live in `lib/issue-invoice.ts`; this component owns the UX
+  // (confirm-pending state + side-effects on the form).
+
+  /** Live-derived offset in days from invoiceDate to paymentDeadline.
+   * Shown verbatim in the offset input; an operator edit updates the
+   * paymentDeadline via `paymentDeadlineFromOffset`. */
+  let paymentOffsetDisplay = $derived(
+    daysBetween(form.invoiceDate, form.paymentDeadline) ?? 0,
+  );
+
+  /** Pending out-of-range delivery date the operator has typed but not
+   * yet confirmed. `null` means "no confirm pending" (either the
+   * operator has not typed anything OR the current `form.deliveryDate`
+   * is in range). When non-null, the form surfaces the inline
+   * "Are you sure?" affordance; confirming commits the value, cancelling
+   * reverts. */
+  let pendingDeliveryDate: { value: string; kind: "BeforeInvoiceDate" | "AfterPaymentDeadline" } | null =
+    $state(null);
+
+  function onPaymentOffsetChange(rawOffset: number) {
+    if (!Number.isFinite(rawOffset) || !Number.isInteger(rawOffset)) return;
+    const next = paymentDeadlineFromOffset(form.invoiceDate, rawOffset);
+    if (next === null) return;
+    form = { ...form, paymentDeadline: next };
+    // PR-84 — payment deadline moved; the existing delivery-date may
+    // shift from in-range to out-of-range (or vice versa). Reclassify
+    // the current delivery date and update the audit-override flag.
+    // If a non-null override results, we DON'T fire the confirm
+    // automatically — the operator did not edit the delivery date, so
+    // the comfort-zone change is incidental; the audit flag updates
+    // silently and the operator sees the inline hint on next edit.
+    form = {
+      ...form,
+      deliveryDateOverride: deliveryDateOverrideFor(
+        form.invoiceDate,
+        next,
+        form.deliveryDate,
+      ),
+    };
+  }
+
+  function onPaymentDeadlineChange(absolute: string) {
+    form = { ...form, paymentDeadline: absolute };
+    form = {
+      ...form,
+      deliveryDateOverride: deliveryDateOverrideFor(
+        form.invoiceDate,
+        absolute,
+        form.deliveryDate,
+      ),
+    };
+  }
+
+  function onDeliveryDateChange(candidate: string) {
+    const override = deliveryDateOverrideFor(
+      form.invoiceDate,
+      form.paymentDeadline,
+      candidate,
+    );
+    if (override === null) {
+      // In-range: commit silently.
+      form = { ...form, deliveryDate: candidate, deliveryDateOverride: null };
+      pendingDeliveryDate = null;
+      return;
+    }
+    // Out-of-range: stage the confirm. The form's `deliveryDate` stays
+    // at the previous value until the operator confirms; the inline
+    // affordance carries the kind ("backwards" / "forwards").
+    pendingDeliveryDate = { value: candidate, kind: override };
+  }
+
+  function confirmPendingDeliveryDate() {
+    if (pendingDeliveryDate === null) return;
+    form = {
+      ...form,
+      deliveryDate: pendingDeliveryDate.value,
+      deliveryDateOverride: pendingDeliveryDate.kind,
+    };
+    pendingDeliveryDate = null;
+  }
+
+  function cancelPendingDeliveryDate() {
+    pendingDeliveryDate = null;
+  }
+
   function addLine() {
     form = { ...form, lines: [...form.lines, emptyLine()] };
   }
@@ -723,6 +825,135 @@
         <p class="hint">
           The MNB exchange rate will be fetched at issuance per
           ADR-0037 §2.b (with D-1 walk-back).
+        </p>
+      {/if}
+    </fieldset>
+
+    <!-- PR-84 — invoice-date section. Three rules:
+         1. Számla kelte (invoice date): read-only display; server
+            stamps the immutable issue date at issuance time.
+         2. Fizetési határidő (payment deadline): bidirectional
+            offset+absolute pair.
+         3. Teljesítési dátum (delivery date): comfort-zone guarded
+            picker; out-of-range choices fire an inline confirm and
+            stamp the audit override discriminant. REGULATORY — drives
+            NAV's VAT-period assignment. -->
+    <fieldset>
+      <legend>Dates</legend>
+      <label>
+        <span>Számla kelte / Invoice date</span>
+        <input
+          type="date"
+          value={form.invoiceDate}
+          readonly
+          aria-readonly="true"
+          data-testid="invoice-date-display"
+        />
+        <span class="hint">
+          A kiállítás dátuma a kiállítás napja (rendszerdátum) — nem szerkeszthető.
+          The issue date is stamped by the server at issuance; the
+          display value is today's local date for reference.
+        </span>
+      </label>
+
+      <label>
+        <span>Fizetési határidő / Payment deadline (days)</span>
+        <input
+          type="number"
+          min="-365"
+          max="365"
+          step="1"
+          value={paymentOffsetDisplay}
+          onchange={(e) =>
+            onPaymentOffsetChange(Number((e.target as HTMLInputElement).value))}
+          data-testid="payment-offset-input"
+        />
+      </label>
+      <label>
+        <span>Fizetési határidő (date)</span>
+        <input
+          type="date"
+          value={form.paymentDeadline}
+          onchange={(e) =>
+            onPaymentDeadlineChange((e.target as HTMLInputElement).value)}
+          data-testid="payment-deadline-input"
+        />
+        <span class="hint">
+          Bidirectional — edit either the offset (+N days) or the
+          absolute date; the other updates live.
+        </span>
+      </label>
+
+      <label>
+        <span>Teljesítési dátum / Delivery date</span>
+        <input
+          type="date"
+          value={form.deliveryDate}
+          onchange={(e) =>
+            onDeliveryDateChange((e.target as HTMLInputElement).value)}
+          data-testid="delivery-date-input"
+        />
+        <span class="hint">
+          A teljesítés dátuma a NAV szerinti ÁFA-időszak alapja. The
+          comfort zone is [invoice date, payment deadline] inclusive;
+          choices outside the range will ask for confirmation and are
+          recorded on the audit trail.
+        </span>
+      </label>
+
+      {#if pendingDeliveryDate !== null}
+        <div class="inline-confirm" data-testid="delivery-date-confirm">
+          <p>
+            <strong>Figyelem — Are you sure?</strong>
+            {#if pendingDeliveryDate.kind === "BeforeInvoiceDate"}
+              A teljesítés dátuma ({pendingDeliveryDate.value}) korábbi mint a
+              számla kelte. Ez az ÁFA-időszakot korábbra tolja.
+              <br />
+              The delivery date is before the invoice date. This shifts
+              the VAT period earlier.
+            {:else}
+              A teljesítés dátuma ({pendingDeliveryDate.value}) későbbi mint a
+              fizetési határidő. Ez az ÁFA-időszakot későbbre tolja.
+              <br />
+              The delivery date is after the payment deadline. This
+              shifts the VAT period later.
+            {/if}
+          </p>
+          <p class="hint">
+            A választás bekerül az audit naplóba. The choice will be
+            recorded on the tamper-evident audit ledger.
+          </p>
+          <button
+            type="button"
+            class="quiet-button"
+            onclick={confirmPendingDeliveryDate}
+            data-testid="delivery-date-confirm-yes"
+          >
+            Confirm
+          </button>
+          <button
+            type="button"
+            class="quiet-button"
+            onclick={cancelPendingDeliveryDate}
+            data-testid="delivery-date-confirm-no"
+          >
+            Cancel
+          </button>
+        </div>
+      {/if}
+
+      {#if form.deliveryDateOverride !== null}
+        <p
+          class="inline-error"
+          data-testid="delivery-date-override-stamp"
+          data-kind={form.deliveryDateOverride}
+        >
+          <span class="inline-error-hu">
+            A teljesítés dátuma a komfortzónán kívül esik (audit naplózva: {form.deliveryDateOverride}).
+          </span>
+          <span class="inline-error-en">
+            Delivery date is outside the comfort zone (audit-flagged: {form.deliveryDateOverride}).
+          </span>
         </p>
       {/if}
     </fieldset>

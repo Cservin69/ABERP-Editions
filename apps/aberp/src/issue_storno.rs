@@ -157,6 +157,11 @@ pub fn run(args: &IssueStornoArgs) -> Result<()> {
         &args.references,
         args.out.clone(),
         actor,
+        // PR-83 — CLI surface keeps the storno-reason `None`; the
+        // buyer-facing reason field is a SPA-only affordance today.
+        // Adding `--reason <TEXT>` to the CLI is the named-deferred
+        // option if an operator ever needs it from the command line.
+        None,
     )?;
 
     println!(
@@ -220,6 +225,18 @@ pub fn storno_from_inputs(
     references: &str,
     nav_xml_out: PathBuf,
     actor: Actor,
+    // PR-83 — buyer-facing "Sztornó indoka / Storno reason". `Some(text)`
+    // when the operator typed a reason in the SPA's storno confirm panel;
+    // `None` for the CLI surface (no `--reason` flag in PR-83 scope).
+    // Persisted on the storno's own `invoice.invoice_note` column (the
+    // storno IS an invoice; PR-82's column carries it), stamped on the
+    // `InvoiceDraftCreated` audit payload via `with_notes`, and rendered
+    // on the printed PDF via the existing `load_invoice_notes` path. The
+    // reason is NEVER carried into the NAV XML wire body — the storno
+    // emitter (`render_storno_data`) does not read this field and the
+    // never-leak pin (`nav_xml_notes_never_leak`) extends to storno-emit
+    // cases. See `adr/0042-invoice-notes-never-in-nav-xml.md`.
+    storno_reason: Option<String>,
 ) -> Result<StornoIssuedSummary> {
     if input.lines.is_empty() {
         return Err(anyhow!("input JSON has no lines"));
@@ -286,12 +303,22 @@ pub fn storno_from_inputs(
     let command = build_storno_command(&input, &series_code)?;
     let idempotency_key = command.idempotency_key;
     let issue_date = OffsetDateTime::now_utc();
+    // PR-84 — STORNO chains default both invoice-date fields to the
+    // server-clock issue date. The storno UX does not yet surface
+    // operator-supplied payment-deadline / delivery-date pickers (out
+    // of scope per the PR-84 brief: "keep PR-84 to the issue path");
+    // preserving the pre-PR-84 wire behaviour (delivery + payment
+    // mirror issue) is the surgical move here. A future PR can widen
+    // the storno UX to surface the pickers as well.
+    let default_calendar_date = issue_date.date();
     let draft = DraftInvoice {
         id: InvoiceId::new(),
         series_id: series.id,
         customer_id: command.customer_id,
         lines: command.lines,
         issue_date,
+        payment_deadline: default_calendar_date,
+        delivery_date: default_calendar_date,
     };
     // PR-44γ.1 — currency + rate_metadata are placeholders here; the
     // real values are inherited from the base invoice's stored
@@ -311,14 +338,14 @@ pub fn storno_from_inputs(
         currency: Currency::Huf,
         rate_metadata: None,
         bank_snapshot: None,
-        // PR-82 — buyer-facing storno-level note ("Megjegyzés") is
-        // out of scope for the storno path in PR-82. PR-83 will wire
-        // the storno-reason note here (and into the audit payload via
-        // `with_notes`) so the buyer sees WHY the invoice was
-        // cancelled on the printed PDF. Per-line notes inherited from
+        // PR-83 — buyer-facing storno-level note ("Sztornó indoka /
+        // Storno reason"). Persisted on the STORNO's own `invoice_note`
+        // column via `allocate_in_tx` (the storno IS an invoice and
+        // burns its own row per ADR-0023 §3 — the base invoice's
+        // `invoice_note` is untouched). Per-line notes inherited from
         // the base ride on `draft.lines[i].note` naturally — the
         // negation only touches the unit-price sign, not the note.
-        invoice_note: None,
+        invoice_note: storno_reason.clone(),
     };
 
     // 8. One transaction across base-load + chain-index walk + storno
@@ -331,6 +358,12 @@ pub fn storno_from_inputs(
         actor,
         references,
         nav_xml_out.clone(),
+        // PR-83 — thread the buyer-facing storno reason into the audit
+        // payload via `with_notes`. Stamps both the storno-level
+        // `invoice_note` AND the per-line notes (inherited from the
+        // base) onto the `InvoiceDraftCreated` payload so the
+        // operator-twin record matches the printed-PDF surface.
+        storno_reason.clone(),
     )?;
 
     let storno = outcome.storno;
@@ -641,6 +674,7 @@ struct TxOutcome {
 /// `issue_invoice::run_single_tx` (drop-on-error rolls back both
 /// halves; `apps/aberp/tests/rollback_conformance.rs` exercises the
 /// shape).
+#[allow(clippy::too_many_arguments)]
 fn run_single_tx(
     mut conn: Connection,
     ledger_meta: &LedgerMeta,
@@ -649,6 +683,13 @@ fn run_single_tx(
     actor: Actor,
     base_invoice_id: &str,
     nav_xml_path: std::path::PathBuf,
+    // PR-83 — buyer-facing storno reason. Stamped on the
+    // `InvoiceDraftCreated` audit payload via `with_notes` so the
+    // operator-twin's record carries the same note the printed PDF
+    // renders to the buyer. `None` is a no-op — the with_notes call
+    // is unconditional but the payload's `invoice_note` field stays
+    // `None`.
+    storno_reason: Option<String>,
 ) -> Result<TxOutcome> {
     let tx = conn
         .transaction()
@@ -793,7 +834,14 @@ fn run_single_tx(
         }
         // PR-73 / ADR-0040 §addendum — inherit the base's bank-account
         // snapshot onto the storno's audit payload.
-        .with_bank_snapshot(inherited_bank_snapshot.as_ref());
+        .with_bank_snapshot(inherited_bank_snapshot.as_ref())
+        // PR-83 — stamp the buyer-facing storno reason (and the
+        // inherited per-line notes) onto the audit payload so the
+        // operator-twin record matches the printed-PDF surface. The
+        // `invoice_note` field on the payload carries the storno
+        // reason verbatim; per-line notes are pulled off
+        // `storno_invoice.lines[i].note` by the builder.
+        .with_notes(&storno_invoice, storno_reason.as_deref());
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,

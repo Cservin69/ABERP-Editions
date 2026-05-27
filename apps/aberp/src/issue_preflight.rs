@@ -554,6 +554,13 @@ mod tests {
             series: None,
             bank_account_id: None,
             invoice_note: None,
+            // PR-84 — preflight covers customer / lines / bank only;
+            // the three date fields are optional on the wire and the
+            // issuance pipeline defaults them to the system issue date
+            // when absent. The good-request fixture doesn't set them.
+            payment_deadline: None,
+            delivery_date: None,
+            delivery_date_override: None,
         }
     }
 
@@ -808,6 +815,9 @@ mod tests {
             series: None,
             bank_account_id: None,
             invoice_note: None,
+            payment_deadline: None,
+            delivery_date: None,
+            delivery_date_override: None,
         };
         let errs = validate_invoice_preflight(&r);
 

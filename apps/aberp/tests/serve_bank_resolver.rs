@@ -108,6 +108,10 @@ fn fixture_request(currency: Currency, bank_account_id: Option<String>) -> Issue
         series: None,
         bank_account_id,
         invoice_note: None,
+        // PR-84 — fixture defaults all three date fields to None.
+        payment_deadline: None,
+        delivery_date: None,
+        delivery_date_override: None,
     }
 }
 

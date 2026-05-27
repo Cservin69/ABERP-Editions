@@ -51,6 +51,11 @@ fn build_minimal_modification_invoice() -> ReadyInvoice {
             note: None,
         }],
         issue_date: OffsetDateTime::now_utc(),
+        // PR-84 — modification chains default both date fields to the
+        // chain-issue's server-clock issue date (out of scope for PR-84
+        // operator UX).
+        payment_deadline: OffsetDateTime::now_utc().date(),
+        delivery_date: OffsetDateTime::now_utc().date(),
     }
 }
 

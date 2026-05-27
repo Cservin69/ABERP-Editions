@@ -100,6 +100,10 @@ fn build_allocate_args(series_id: SeriesId) -> AllocateArgs {
                 note: None,
             }],
             issue_date: OffsetDateTime::now_utc(),
+            // PR-84 — rollback conformance fixture defaults both date
+            // fields to the issue date.
+            payment_deadline: OffsetDateTime::now_utc().date(),
+            delivery_date: OffsetDateTime::now_utc().date(),
         },
         idempotency_key: IdempotencyKey::new(),
         // PR-44γ — rollback conformance exercises the HUF path. The

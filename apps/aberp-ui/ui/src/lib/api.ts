@@ -454,6 +454,25 @@ export interface IssueInvoiceRequest {
    * the audit payload; the printed PDF + SPA detail view render it
    * for buyer + operator preview. NEVER on the NAV XML wire. */
   invoiceNote?: string | null;
+  /** PR-84 — operator-supplied payment deadline (Fizetési határidő),
+   * canonical `YYYY-MM-DD`. Resolved absolute date from the form's
+   * bidirectional offset/absolute pair. Optional on the wire so
+   * pre-PR-84 callers keep type-checking; the backend defaults to the
+   * server-stamped issue date when absent. */
+  paymentDeadline?: string | null;
+  /** PR-84 — operator-supplied delivery / fulfillment date
+   * (Teljesítési dátum), canonical `YYYY-MM-DD`. REGULATORY: this is
+   * what the NAV emit writes as `<invoiceDeliveryDate>`. Optional on
+   * the wire for the same pre-PR-84 back-compat reason. */
+  deliveryDate?: string | null;
+  /** PR-84 — audit discriminant for the delivery-date choice's
+   * comfort-zone classification. `null` for in-range (default operator
+   * path, no audit flag); `"BeforeInvoiceDate"` /
+   * `"AfterPaymentDeadline"` carry the operator's confirmed out-of-
+   * range choice verbatim. The backend persists this on the
+   * `InvoiceDraftCreated` audit payload so the tamper-evident
+   * regulatory trail records every override. */
+  deliveryDateOverride?: "BeforeInvoiceDate" | "AfterPaymentDeadline" | null;
 }
 
 /** PR-44ζ / session-59 — wire response body for `POST /invoices/issue`.
@@ -616,19 +635,44 @@ export interface StornoInvoiceResponse {
   entries_verified: number;
 }
 
+/** PR-83 — wire request body for `POST /api/invoices/<id>/storno`.
+ * Mirrors `serve::StornoInvoiceRequest`. The optional
+ * `stornoReason` is the buyer-facing "Sztornó indoka / Storno reason"
+ * the operator types into the inline storno confirm panel — it
+ * persists onto the storno's own `invoice_note` column and renders on
+ * the printed PDF / future email body. NEVER carried into the NAV
+ * InvoiceData XML — recipient-facing only. */
+export interface StornoInvoiceRequest {
+  /** Operator-typed buyer-facing reason for the cancellation. `null`
+   * when the operator did not type one — pre-PR-83 callers and the
+   * "leave blank" case both wire as `null`. The backend trims +
+   * normalises empty-after-trim to `null` as a single rule shared
+   * with PR-82's `blankToNull` normalisation. */
+  stornoReason: string | null;
+}
+
 /** PR-47α / session-64 — POST the SPA's "Cancel invoice (storno)"
  * button to the backend's `/api/invoices/<id>/storno` route via the
- * matching Tauri command. No body — the backend resolves the
- * operator's original invoice JSON from the side-stored input.json
- * file written at issuance time per A174. Errors propagate as the
- * rejected promise (including the typed 409 body for precondition
- * mismatch); the caller renders the message inline (no toast
- * component per A157). */
+ * matching Tauri command. The backend resolves the operator's
+ * original invoice JSON from the side-stored input.json file written
+ * at issuance time per A174.
+ *
+ * PR-83 — the body now carries an optional buyer-facing storno
+ * reason. Callers that pass an empty body OR `{ stornoReason: null }`
+ * preserve the pre-PR-83 behaviour (no buyer note); a non-null
+ * `stornoReason` lands on the storno's `invoice_note` column and
+ * surfaces on the printed PDF.
+ *
+ * Errors propagate as the rejected promise (including the typed 409
+ * body for precondition mismatch); the caller renders the message
+ * inline (no toast component per A157). */
 export async function cancelInvoiceStorno(
   invoiceId: string,
+  body: StornoInvoiceRequest = { stornoReason: null },
 ): Promise<StornoInvoiceResponse> {
   return invoke<StornoInvoiceResponse>("cancel_invoice_storno", {
     invoiceId,
+    body,
   });
 }
 

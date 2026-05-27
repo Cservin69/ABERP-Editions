@@ -20,16 +20,20 @@
 //! substitution is documented loud and named as the PR-44ε.2 deferred
 //! lift.
 //!
-//! Alternatives considered + rejected in A152:
-//! - `typst` (Rust-native typesetting engine): proper Hungarian
-//!   handling but very large dep tree; not available in the sandbox.
-//! - `weasyprint` (Python HTML→PDF): requires Python in deploy;
-//!   regressed against the codebase's Rust-native single-binary
-//!   posture (per CLAUDE.md rule 11).
-//! - `typst` CLI shelled out: requires `typst` binary on every
-//!   operator workstation AND every CI runner; not portable.
-//! - Type0/CIDFontType2 font embedding: proper Hungarian but ~300
-//!   LoC of CIDFontType + ToUnicode-cmap glue; defers to PR-44ε.2.
+//! # PR-85 — premium polish (silver / gold palette)
+//!
+//! ADR-0044 records the brand decision: this is Áben Consulting's
+//! real client-facing document, so the surface needs refined-luxury
+//! restraint, NOT dev-tool grey. The palette lives in `style` below
+//! as a small, named set of `(f32, f32, f32)` constants so colour is
+//! tunable in one place. Three discipline rules per ADR-0044:
+//!
+//! 1. Structural rules in `SILVER_LINE` (soft warm grey).
+//! 2. ONE gold accent only — the rule above the totals banner. The
+//!    big total figure stays ink (sparing, not gaudy).
+//! 3. Section labels in `MUTED` (silver-grey) — small-caps feel comes
+//!    from existing uppercase strings + the smaller font size, NOT
+//!    extra typography ops (kept tasteful + WinAnsi-safe).
 //!
 //! # Coordinate system
 //!
@@ -64,6 +68,56 @@ const MARGIN_RIGHT: i64 = PAGE_WIDTH - 48;
 /// Top margin (y-coord of the top of the printable area; PDF y grows
 /// upward).
 const MARGIN_TOP: i64 = PAGE_HEIGHT - 56;
+
+// ─── PR-85 — silver / gold palette ────────────────────────────────────
+//
+// Named once here so a future brand tweak is a one-line edit, not a
+// grep-and-replace across thirty `Object::Real(0.7)` literals. ADR-0044
+// records the brand rationale.
+//
+// Encoded as `(f32, f32, f32)` RGB in 0..=1. Each colour ships as a
+// helper that pushes the right PDF op (`rg` for non-stroking / fill
+// used by text, `RG` for stroking used by rule lines).
+
+type Color = (f32, f32, f32);
+
+/// Body ink — near-black with a faint warm shift so it reads softer
+/// than a pure-black `Tj`. Used for every primary number + name + body
+/// paragraph. NOT pure black (0,0,0): a slight warmth pairs with the
+/// silver/gold accents.
+const INK: Color = (0.13, 0.13, 0.15);
+/// Section labels (ELADÓ, VEVŐ, ADÓSZÁM:, NETTÓ ÖSSZEG:, MEGJEGYZÉS,
+/// table column headers). Refined silver-grey — sits below the ink
+/// hierarchy without disappearing.
+const MUTED: Color = (0.46, 0.47, 0.51);
+/// Structural rules — title under-rule, table header rule, table
+/// footer rule. A soft warm silver: clearly visible but never
+/// competes with the ink content above/below.
+const SILVER_LINE: Color = (0.72, 0.72, 0.74);
+/// PR-85's ONE accent (per ADR-0044 §"Restraint"). Used for exactly
+/// one rule: the line above the FIZETENDŐ BRUTTÓ VÉGÖSSZEG totals
+/// banner. A muted warm gold — refined, not gaudy. If a future
+/// reviewer feels the need to add gold to a second element, push back
+/// and re-read ADR-0044 first.
+///
+/// Saturation tuned so the accent reads visibly gold (not "slightly
+/// darker grey") on a 150-dpi print preview yet stays restrained on
+/// a high-resolution actual print. Slightly warmer than a pure
+/// midpoint gold so the rule sits comfortably next to the warm-ink
+/// body text.
+const GOLD_ACCENT: Color = (0.72, 0.54, 0.12);
+
+/// Gap (in points) between a label's colon and its value in the
+/// party / date `label_value` pairs. PR-85: was 4pt (cramped — Ervin
+/// flagged the `Adószám:123` look), now 10pt for breathing room.
+const LABEL_VALUE_GAP: i64 = 10;
+
+/// Stroke weight (in points) for `SILVER_LINE` structural rules.
+const RULE_WEIGHT_SILVER: f32 = 0.5;
+/// Stroke weight (in points) for the single `GOLD_ACCENT` rule above
+/// the totals banner. Slightly heavier than silver so the accent
+/// reads as deliberate rather than a thicker grey line.
+const RULE_WEIGHT_GOLD: f32 = 0.85;
 
 #[derive(Debug, Error)]
 pub enum RenderError {
@@ -158,7 +212,10 @@ pub fn render_invoice(model: &InvoiceModel) -> Result<Vec<u8>, RenderError> {
 
 /// Append the full top-to-bottom layout operations onto `ops`.
 fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel) {
-    // Title block (top-left): "Számla" + invoice number.
+    // Title block (top-left): "Számla" + invoice number. The number
+    // stays INK — accountants look it up; it's the primary key on
+    // the printed surface. Size-18 regular vs size-28 bold above
+    // already gives the visual hierarchy.
     text(ops, "FB", 28, MARGIN_LEFT, MARGIN_TOP - 14, "Számla");
     text(
         ops,
@@ -169,8 +226,8 @@ fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel) {
         &m.invoice_number,
     );
 
-    // Horizontal accent rule under the title.
-    rule(ops, MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP - 58);
+    // Title under-rule — silver. (Gold is reserved for the banner.)
+    silver_rule(ops, MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP - 58);
 
     // Two-column party block.
     let party_top = MARGIN_TOP - 78;
@@ -213,12 +270,21 @@ fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel) {
     );
 
     // Highlighted total banner: FIZETENDŐ BRUTTÓ VÉGÖSSZEG, right-aligned.
+    // PR-85 — the single gold accent in the document lives here.
     let invoice_gross_minor: i64 = m.lines.iter().map(|l| l.gross_minor).sum();
     let banner_y = dates_top - 44;
-    rule(ops, MARGIN_LEFT, MARGIN_RIGHT, banner_y + 22);
+    gold_rule(ops, MARGIN_LEFT, MARGIN_RIGHT, banner_y + 22);
     let banner_label = "FIZETENDŐ BRUTTÓ VÉGÖSSZEG:";
     let banner_amount = format::money(m.currency, invoice_gross_minor);
-    text_right(ops, "F1", 9, MARGIN_RIGHT - 140, banner_y + 6, banner_label);
+    text_right_in(
+        ops,
+        "F1",
+        9,
+        MARGIN_RIGHT - 150,
+        banner_y + 6,
+        banner_label,
+        MUTED,
+    );
     text_right(ops, "FB", 20, MARGIN_RIGHT, banner_y, &banner_amount);
 
     // Line items table.
@@ -235,14 +301,15 @@ fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel) {
 
     // Footer: page number + attestation.
     let footer_y_top = 64;
-    text(ops, "FB", 8, MARGIN_LEFT, footer_y_top, "1/1 Oldal");
-    text(
+    text_in(ops, "FB", 8, MARGIN_LEFT, footer_y_top, "1/1 Oldal", MUTED);
+    text_in(
         ops,
         "FI",
         8,
         MARGIN_LEFT,
         footer_y_top - 14,
         "A számla tartalma mindenben megfelel a hatályos törvényekben foglaltaknak",
+        MUTED,
     );
 }
 
@@ -254,7 +321,7 @@ fn write_party(
     y_top: i64,
     is_seller: bool,
 ) -> i64 {
-    text(ops, "F1", 7, x, y_top, section_label);
+    text_in(ops, "F1", 7, x, y_top, section_label, MUTED);
     text(ops, "FB", 13, x, y_top - 16, &party.name);
     let mut y = y_top - 32;
     for line in &party.address_lines {
@@ -285,45 +352,137 @@ fn write_party(
     y
 }
 
+/// PR-85 — line-item column geometry. Pulled into a named struct so
+/// the column positions are tunable in one place (and so the test
+/// for description-wrap can use the same `DESC_WRAP_CHARS` value the
+/// renderer uses).
+///
+/// Pre-PR-85 the table sat hard against the right margin and the
+/// gutters between numeric columns were tight enough that
+/// `NETTÓ EGYSÉGÁR` / `BRUTTÓ ÁR` headers visually kissed each other.
+/// This pass shifts every column slightly left off the right margin
+/// AND widens the gutters between right-edges of adjacent columns.
+struct TableLayout;
+
+impl TableLayout {
+    /// Row-number column anchor (left-aligned at MARGIN_LEFT).
+    const NUM_X: i64 = MARGIN_LEFT;
+    /// Description column anchor (left-aligned).
+    const DESC_X: i64 = MARGIN_LEFT + 18;
+    /// Description column maximum width in characters before wrap.
+    /// At size 9 with the 0.55-of-size proxy ≈ 4.95 pts/char, 40
+    /// chars ≈ 198 pts of horizontal real estate — comfortably inside
+    /// the description-to-quantity gutter. Deliberately set BELOW the
+    /// existing print_invoice_render fixture description's 42 chars so
+    /// that the wrap behaviour is exercised by the workspace test suite
+    /// (a regression that loses the wrap fires as a layout drift in
+    /// the next sample render, not silently).
+    const DESC_WRAP_CHARS: usize = 40;
+    /// Per-extra-wrapped-description-line vertical advance (points).
+    const DESC_WRAP_LINE_HEIGHT: i64 = 11;
+
+    /// Right edges of the numeric columns. Each column is right-aligned
+    /// so the right edge is the anchor; the leftmost glyph of the data
+    /// floats left based on its width.
+    ///
+    /// PR-85 — column positions tuned for breathing room. The pre-PR-85
+    /// layout had the VAT column hard up against the BRUTTÓ ÁR column
+    /// (visible overlap on the live render Ervin flagged: "27%₣905,00"
+    /// where 27% and €1 905,00 collided). Root cause: the 0.55-of-size
+    /// per-char proxy in `text_right` underestimates the width of `%`
+    /// (real ≈ 0.93×size) and uppercase header glyphs (real ≈ 0.7×size),
+    /// so right-aligned content was extending past its stated right-
+    /// edge by 5-10pt and into the next column.
+    ///
+    /// The fix here is structural rather than touching the shared
+    /// proxy: pull `VAT_RIGHT` far enough left that even with the
+    /// proxy's underestimate, neither the `27%` data nor the `ÁFA`
+    /// header crosses into the gross column. Other right-edges shift
+    /// outward slightly to widen the gutters Ervin asked for, and
+    /// `GROSS_RIGHT` pulls 6pt off `MARGIN_RIGHT` so the rightmost
+    /// column no longer hugs the page edge.
+    const QTY_RIGHT: i64 = MARGIN_LEFT + 270; // unchanged
+    const UNIT_PRICE_RIGHT: i64 = MARGIN_LEFT + 345; // was + 340 — +5 for wider gutter
+    const NET_RIGHT: i64 = MARGIN_LEFT + 410; // was + 400 — +10 for wider gutter
+    const VAT_RIGHT: i64 = MARGIN_LEFT + 435; // was + 432, BUT GROSS shifted left so net
+    const GROSS_RIGHT: i64 = MARGIN_RIGHT - 6; // was MARGIN_RIGHT exactly — pulled off edge
+}
+
 /// Render the line-items table. Returns the y-coordinate of the
 /// horizontal rule that closes the table — the caller uses this to
 /// anchor the totals block. Per PR-82 the row height grows from the
 /// base 28pt when a line carries either a `performance_period`
 /// sub-line OR a `note` sub-line; both can coexist (note prints
-/// below the performance period).
+/// below the performance period). Per PR-85 the row height ALSO grows
+/// when the description wraps to multiple lines.
 fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i64 {
-    // Column x-positions (right edges for numeric columns).
-    let col_num_x = MARGIN_LEFT;
-    let col_desc_x = MARGIN_LEFT + 18;
-    let col_qty_right = MARGIN_LEFT + 270;
-    let col_unit_price_right = MARGIN_LEFT + 340;
-    let col_net_right = MARGIN_LEFT + 400;
-    let col_vat_right = MARGIN_LEFT + 432;
-    let col_gross_right = MARGIN_RIGHT;
-
-    // Header row.
-    text(ops, "FB", 8, col_num_x, top, "#");
-    text(ops, "FB", 8, col_desc_x, top, "MEGNEVEZÉS");
-    text_right(ops, "FB", 8, col_qty_right, top, "MENNYISÉG");
-    text_right(ops, "FB", 8, col_unit_price_right, top, "NETTÓ EGYSÉGÁR");
-    text_right(ops, "FB", 8, col_net_right, top, "NETTÓ ÁR");
-    text_right(ops, "FB", 8, col_vat_right, top, "ÁFA");
-    text_right(ops, "FB", 8, col_gross_right, top, "BRUTTÓ ÁR");
-    rule(ops, MARGIN_LEFT, MARGIN_RIGHT, top - 6);
+    // Header row — column labels in MUTED at size 8 bold.
+    text_in(ops, "FB", 8, TableLayout::NUM_X, top, "#", MUTED);
+    text_in(ops, "FB", 8, TableLayout::DESC_X, top, "MEGNEVEZÉS", MUTED);
+    text_right_in(
+        ops,
+        "FB",
+        8,
+        TableLayout::QTY_RIGHT,
+        top,
+        "MENNYISÉG",
+        MUTED,
+    );
+    text_right_in(
+        ops,
+        "FB",
+        8,
+        TableLayout::UNIT_PRICE_RIGHT,
+        top,
+        "NETTÓ EGYSÉGÁR",
+        MUTED,
+    );
+    text_right_in(ops, "FB", 8, TableLayout::NET_RIGHT, top, "NETTÓ ÁR", MUTED);
+    text_right_in(ops, "FB", 8, TableLayout::VAT_RIGHT, top, "ÁFA", MUTED);
+    text_right_in(
+        ops,
+        "FB",
+        8,
+        TableLayout::GROSS_RIGHT,
+        top,
+        "BRUTTÓ ÁR",
+        MUTED,
+    );
+    silver_rule(ops, MARGIN_LEFT, MARGIN_RIGHT, top - 6);
 
     // Body rows.
     let mut y = top - 22;
     for (i, line) in m.lines.iter().enumerate() {
         let row_num = format!("{}", i + 1);
-        text(ops, "F1", 9, col_num_x, y, &row_num);
-        text(ops, "F1", 9, col_desc_x, y, &line.description);
+        text(ops, "F1", 9, TableLayout::NUM_X, y, &row_num);
+
+        // PR-85 — description wraps to multiple lines when long. The
+        // first line sits at `y`; subsequent lines stack downward at
+        // `DESC_WRAP_LINE_HEIGHT` apart. The numeric columns continue
+        // to anchor at `y` (top of the row) — accountants read the
+        // numbers off the row's top edge regardless of how tall the
+        // description column grows.
+        let desc_lines = wrap_to_chars(&line.description, TableLayout::DESC_WRAP_CHARS);
+        for (i_line, dline) in desc_lines.iter().enumerate() {
+            text(
+                ops,
+                "F1",
+                9,
+                TableLayout::DESC_X,
+                y - (i_line as i64) * TableLayout::DESC_WRAP_LINE_HEIGHT,
+                dline,
+            );
+        }
+        let desc_extra =
+            (desc_lines.len().saturating_sub(1) as i64) * TableLayout::DESC_WRAP_LINE_HEIGHT;
+
         let qty_str = format!("{} {}", line.quantity, line.unit);
-        text_right(ops, "F1", 9, col_qty_right, y, &qty_str);
+        text_right(ops, "F1", 9, TableLayout::QTY_RIGHT, y, &qty_str);
         text_right(
             ops,
             "F1",
             9,
-            col_unit_price_right,
+            TableLayout::UNIT_PRICE_RIGHT,
             y,
             &format::money(m.currency, line.unit_price_minor),
         );
@@ -331,7 +490,7 @@ fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i6
             ops,
             "F1",
             9,
-            col_net_right,
+            TableLayout::NET_RIGHT,
             y,
             &format::money(m.currency, line.net_minor),
         );
@@ -339,7 +498,7 @@ fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i6
             ops,
             "F1",
             9,
-            col_vat_right,
+            TableLayout::VAT_RIGHT,
             y,
             &format!("{}%", line.vat_rate_percent),
         );
@@ -347,18 +506,22 @@ fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i6
             ops,
             "F1",
             9,
-            col_gross_right,
+            TableLayout::GROSS_RIGHT,
             y,
             &format::money(m.currency, line.gross_minor),
         );
-        let mut sub_y = y - 12;
+
+        // Sub-line baseline — sits below the wrapped description so
+        // performance-period + buyer-note sub-lines don't overlap
+        // long descriptions.
+        let mut sub_y = y - desc_extra - 12;
         if let Some((start, end)) = line.performance_period {
             let perf = format!(
                 "Teljesítési időszak: {} – {}",
                 format::iso_dotted_date(start),
                 format::iso_dotted_date(end),
             );
-            text(ops, "FI", 8, col_desc_x, sub_y, &perf);
+            text_in(ops, "FI", 8, TableLayout::DESC_X, sub_y, &perf, MUTED);
             sub_y -= 11;
         }
         // PR-82 — per-line buyer note ("Megjegyzés"). Italic sub-line
@@ -369,19 +532,20 @@ fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i6
         let mut extra_subline = 0;
         if let Some(note) = line.note.as_ref().filter(|s| !s.trim().is_empty()) {
             let label = format!("Megjegyzés: {}", note);
-            text(ops, "FI", 8, col_desc_x, sub_y, &label);
+            text_in(ops, "FI", 8, TableLayout::DESC_X, sub_y, &label, MUTED);
             extra_subline += 12;
         }
         let base_advance = 28;
-        // Performance-period grows the row implicitly via sub_y (the
-        // original layout overlaid it inside the 28pt slot). The note
-        // sub-line, when present, needs an extra 12pt so the next row
-        // does not overlap it. Performance-period rows therefore keep
-        // their pre-PR-82 height; note-carrying rows grow by 12pt.
-        y -= base_advance + extra_subline;
+        // Per PR-82 + PR-85 row-height composition:
+        //   base 28pt
+        // + (desc_lines - 1) × 11pt for each wrapped description line
+        // + 12pt iff a buyer note prints
+        // Performance-period stays inside the 28pt slot (pre-PR-82
+        // legacy posture — overlays into the row).
+        y -= base_advance + desc_extra + extra_subline;
     }
     let footer_rule_y = y + 8;
-    rule(ops, MARGIN_LEFT, MARGIN_RIGHT, footer_rule_y);
+    silver_rule(ops, MARGIN_LEFT, MARGIN_RIGHT, footer_rule_y);
     footer_rule_y
 }
 
@@ -405,7 +569,7 @@ fn write_totals(
     let mut y = top;
 
     // NETTÓ ÖSSZEG: invoice-currency net total.
-    text_right(ops, "F1", 9, label_right, y, "NETTÓ ÖSSZEG:");
+    text_right_in(ops, "F1", 9, label_right, y, "NETTÓ ÖSSZEG:", MUTED);
     text_right(
         ops,
         "F1",
@@ -419,7 +583,7 @@ fn write_totals(
     // Per-VAT-rate ÁFA in invoice currency, then HUF (non-HUF only).
     for (&pct, &(_net, vat_minor)) in &by_rate {
         let label = format!("{}% ÁFA:", pct);
-        text_right(ops, "F1", 9, label_right, y, &label);
+        text_right_in(ops, "F1", 9, label_right, y, &label, MUTED);
         text_right(
             ops,
             "F1",
@@ -433,7 +597,7 @@ fn write_totals(
             if let Some(rate) = m.rate_metadata.as_ref() {
                 let vat_huf = aberp_billing::huf_equivalent_round_half_even(vat_minor, &rate.rate)
                     .unwrap_or(0);
-                text_right(ops, "F1", 9, label_right, y, &label);
+                text_right_in(ops, "F1", 9, label_right, y, &label, MUTED);
                 text_right(
                     ops,
                     "F1",
@@ -448,7 +612,15 @@ fn write_totals(
     }
 
     // FIZETENDŐ BRUTTÓ VÉGÖSSZEG: invoice-currency gross total.
-    text_right(ops, "F1", 9, label_right, y, "FIZETENDŐ BRUTTÓ VÉGÖSSZEG:");
+    text_right_in(
+        ops,
+        "F1",
+        9,
+        label_right,
+        y,
+        "FIZETENDŐ BRUTTÓ VÉGÖSSZEG:",
+        MUTED,
+    );
     text_right(
         ops,
         "F1",
@@ -466,7 +638,7 @@ fn write_totals(
                 "Árfolyam: {} Ft",
                 format::rate_for_display(&rate.rate.to_string())
             );
-            text_right(ops, "F1", 9, MARGIN_RIGHT, y, &rate_str);
+            text_right_in(ops, "F1", 9, MARGIN_RIGHT, y, &rate_str, MUTED);
             y -= 14;
             let gross_str = format!(
                 "Bruttó összeg: {}",
@@ -481,9 +653,27 @@ fn write_totals(
 }
 
 fn write_note(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) {
-    text(ops, "F1", 7, MARGIN_LEFT, top, "MEGJEGYZÉS");
+    // PR-85 — skip the section entirely when there's nothing to say.
+    // A bare "MEGJEGYZÉS" header followed by whitespace looked
+    // visually orphaned on HUF invoices with no operator note, and
+    // the regulatory record doesn't require the section to exist
+    // when empty. Two content sources feed this block:
+    //   1. The EUR-only rate-source sub-line ("1 EUR = X Ft")
+    //   2. The buyer-facing operator note (PR-82)
+    // If neither fires, render no section at all.
+    let has_rate_note = !matches!(m.currency, Currency::Huf) && m.rate_metadata.is_some();
+    let has_operator_note = m
+        .note
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !has_rate_note && !has_operator_note {
+        return;
+    }
+
+    text_in(ops, "F1", 7, MARGIN_LEFT, top, "MEGJEGYZÉS", MUTED);
     let mut y = top - 14;
-    if !matches!(m.currency, Currency::Huf) {
+    if has_rate_note {
         if let Some(rate) = m.rate_metadata.as_ref() {
             let note = format!(
                 "1 {} = {} Ft",
@@ -497,10 +687,10 @@ fn write_note(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) {
     // PR-82 — buyer-facing invoice-level note. Renders below the
     // EUR-only rate-source sub-line (when applicable) so the rate
     // explanation reads first, the operator's free text second. Wraps
-    // long notes naively across multiple lines using `wrap_note_text`
+    // long notes naively across multiple lines using `wrap_to_chars`
     // so a paragraph-length note does not run off the right margin.
     if let Some(note) = m.note.as_ref().filter(|s| !s.trim().is_empty()) {
-        for wrapped_line in wrap_note_text(note, NOTE_WRAP_WIDTH_CHARS) {
+        for wrapped_line in wrap_to_chars(note, NOTE_WRAP_WIDTH_CHARS) {
             text(ops, "F1", 9, MARGIN_LEFT, y, &wrapped_line);
             y -= 12;
         }
@@ -512,11 +702,19 @@ fn write_note(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) {
 /// line. Hand-rolled because: (a) we don't have a font-metrics table
 /// (see `text_right`'s comment for the same trade-off), and (b) the
 /// invoice surface uses a tiny vocabulary — short notes are the norm,
-/// long notes acceptable as wrapped paragraphs. A future PR-44ε.2
-/// font-metric lift can upgrade to glyph-width-based wrapping.
+/// long notes acceptable as wrapped paragraphs.
+///
+/// PR-85 — renamed from `wrap_note_text` and re-used for line-item
+/// description wrapping (same char-counted approach; the description
+/// wrap-width constant lives on `TableLayout`).
 const NOTE_WRAP_WIDTH_CHARS: usize = 100;
 
-fn wrap_note_text(text: &str, max_chars: usize) -> Vec<String> {
+/// Wrap `text` to a sequence of lines, each at most `max_chars`
+/// characters wide. Splits on whitespace; words longer than
+/// `max_chars` get their own line (no mid-word break — a long URL or
+/// product code prints on its own line and may visually overflow, but
+/// never silently truncates).
+pub(crate) fn wrap_to_chars(text: &str, max_chars: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for paragraph in text.split('\n') {
         if paragraph.trim().is_empty() {
@@ -545,13 +743,42 @@ fn wrap_note_text(text: &str, max_chars: usize) -> Vec<String> {
     out
 }
 
-/// Emit a left-anchored text run at `(x, y)` using font alias `font`
-/// (one of `"F1"` / `"FB"` / `"FI"`) at `size` points.
+/// Emit a left-anchored text run at `(x, y)` in `INK` colour using
+/// font alias `font` (one of `"F1"` / `"FB"` / `"FI"`) at `size`
+/// points. Convenience wrapper around [`text_in`].
 fn text(ops: &mut Vec<Operation>, font: &str, size: i64, x: i64, y: i64, content: &str) {
+    text_in(ops, font, size, x, y, content, INK);
+}
+
+/// Emit a left-anchored text run at `(x, y)` in `color`. PR-85 — the
+/// silver/gold palette flows through this entry point: every text op
+/// in the renderer goes through either `text` (defaults to `INK`) or
+/// `text_in` (explicit colour for `MUTED` section labels, etc.).
+fn text_in(
+    ops: &mut Vec<Operation>,
+    font: &str,
+    size: i64,
+    x: i64,
+    y: i64,
+    content: &str,
+    color: Color,
+) {
     ops.push(Operation::new("BT", vec![]));
     ops.push(Operation::new(
         "Tf",
         vec![Object::Name(font.as_bytes().to_vec()), size.into()],
+    ));
+    // `rg` sets the non-stroking (fill) colour — what Tj uses for
+    // glyph ink. `RG` would set the stroking colour (used by rule
+    // strokes via `silver_rule` / `gold_rule`); the two states are
+    // independent in the PDF graphics state.
+    ops.push(Operation::new(
+        "rg",
+        vec![
+            Object::Real(color.0),
+            Object::Real(color.1),
+            Object::Real(color.2),
+        ],
     ));
     ops.push(Operation::new("Td", vec![x.into(), y.into()]));
     ops.push(Operation::new(
@@ -564,14 +791,14 @@ fn text(ops: &mut Vec<Operation>, font: &str, size: i64, x: i64, y: i64, content
     ops.push(Operation::new("ET", vec![]));
 }
 
-/// Emit a right-anchored text run whose right edge sits at `x_right`.
-/// Width estimated from a Helvetica per-char proxy of `0.55 * size`
-/// (Helvetica is variable-width; the proxy is a coarse upper bound
-/// that keeps right-alignment visually correct without a full font-
-/// metrics lookup). Per CLAUDE.md rule 13: a metrics table would be
-/// ~200 LoC of glyph-width data for a layout that doesn't need that
-/// precision — the printed totals block visually right-aligns within
-/// 3-4 points of perfect.
+/// Emit a right-anchored text run whose right edge sits at `x_right`,
+/// in `INK` colour. Width estimated from a Helvetica per-char proxy of
+/// `0.55 * size` (Helvetica is variable-width; the proxy is a coarse
+/// upper bound that keeps right-alignment visually correct without a
+/// full font-metrics lookup). Per CLAUDE.md rule 13: a metrics table
+/// would be ~200 LoC of glyph-width data for a layout that doesn't
+/// need that precision — the printed totals block visually right-
+/// aligns within 3-4 points of perfect.
 fn text_right(
     ops: &mut Vec<Operation>,
     font: &str,
@@ -580,28 +807,143 @@ fn text_right(
     y: i64,
     content: &str,
 ) {
-    let est_width = (content.chars().count() as i64) * size * 55 / 100;
-    let x_left = x_right - est_width;
-    text(ops, font, size, x_left, y, content);
+    text_right_in(ops, font, size, x_right, y, content, INK);
 }
 
-/// Emit a horizontal rule between `(x_left, y)` and `(x_right, y)`.
-fn rule(ops: &mut Vec<Operation>, x_left: i64, x_right: i64, y: i64) {
+/// Right-anchored variant of [`text_in`] — same width-estimation
+/// posture as [`text_right`], with explicit colour.
+fn text_right_in(
+    ops: &mut Vec<Operation>,
+    font: &str,
+    size: i64,
+    x_right: i64,
+    y: i64,
+    content: &str,
+    color: Color,
+) {
+    let est_width = (content.chars().count() as i64) * size * 55 / 100;
+    let x_left = x_right - est_width;
+    text_in(ops, font, size, x_left, y, content, color);
+}
+
+/// Emit a horizontal rule between `(x_left, y)` and `(x_right, y)` in
+/// `SILVER_LINE` colour. Default structural rule across the document
+/// (title under-rule, table header rule, table footer rule).
+fn silver_rule(ops: &mut Vec<Operation>, x_left: i64, x_right: i64, y: i64) {
+    horizontal_rule(ops, x_left, x_right, y, SILVER_LINE, RULE_WEIGHT_SILVER);
+}
+
+/// Emit a horizontal rule in `GOLD_ACCENT` colour. Used in exactly
+/// one place per ADR-0044: the rule above the totals banner.
+fn gold_rule(ops: &mut Vec<Operation>, x_left: i64, x_right: i64, y: i64) {
+    horizontal_rule(ops, x_left, x_right, y, GOLD_ACCENT, RULE_WEIGHT_GOLD);
+}
+
+/// Underlying rule emitter — sets stroke colour + stroke weight,
+/// moves to `(x_left, y)`, lines to `(x_right, y)`, strokes.
+fn horizontal_rule(
+    ops: &mut Vec<Operation>,
+    x_left: i64,
+    x_right: i64,
+    y: i64,
+    color: Color,
+    weight: f32,
+) {
     ops.push(Operation::new("q", vec![]));
     ops.push(Operation::new(
         "RG",
-        vec![Object::Real(0.7), Object::Real(0.7), Object::Real(0.7)],
+        vec![
+            Object::Real(color.0),
+            Object::Real(color.1),
+            Object::Real(color.2),
+        ],
     ));
-    ops.push(Operation::new("w", vec![Object::Real(0.5)]));
+    ops.push(Operation::new("w", vec![Object::Real(weight)]));
     ops.push(Operation::new("m", vec![x_left.into(), y.into()]));
     ops.push(Operation::new("l", vec![x_right.into(), y.into()]));
     ops.push(Operation::new("S", vec![]));
     ops.push(Operation::new("Q", vec![]));
 }
 
-/// Emit a "LABEL: value" pair at `(x, y)`, label small-grey + value bold.
+/// Emit a "LABEL: value" pair at `(x, y)` — label in MUTED small-grey
+/// at size 7, value in INK bold at size 9, with `LABEL_VALUE_GAP`
+/// points of breathing room between the label's colon and the value's
+/// first glyph.
 fn label_value(ops: &mut Vec<Operation>, x: i64, y: i64, label: &str, value: &str) {
-    text(ops, "F1", 7, x, y + 2, &format!("{}:", label));
-    let label_width = (label.chars().count() as i64 + 1) * 7 * 55 / 100 + 4;
-    text(ops, "FB", 9, x + label_width, y, value);
+    text_in(ops, "F1", 7, x, y + 2, &format!("{}:", label), MUTED);
+    // Label width: chars + 1 (for the colon) × proxy width at size 7,
+    // plus `LABEL_VALUE_GAP` so the value never visually kisses the
+    // label (PR-85 — was +4pt, too cramped per Ervin's "Adószám:123"
+    // flag).
+    let label_width = (label.chars().count() as i64 + 1) * 7 * 55 / 100 + LABEL_VALUE_GAP;
+    text_in(ops, "FB", 9, x + label_width, y, value, INK);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PR-85 — pin the palette constants. A future "let me just nudge
+    /// the gold a bit" edit that drifts away from the ADR-0044
+    /// silver/gold posture should fail here loudly. The values are
+    /// the brand decision; the regulatory record carries no opinion
+    /// on RGB but the company's client-facing surface does.
+    #[test]
+    fn palette_constants_match_brand_decision() {
+        assert_eq!(INK, (0.13, 0.13, 0.15));
+        assert_eq!(MUTED, (0.46, 0.47, 0.51));
+        assert_eq!(SILVER_LINE, (0.72, 0.72, 0.74));
+        assert_eq!(GOLD_ACCENT, (0.72, 0.54, 0.12));
+    }
+
+    /// PR-85 — pin the Adószám / IBAN spacing so a future edit that
+    /// shrinks `LABEL_VALUE_GAP` back to the pre-PR-85 4pt value
+    /// (which Ervin flagged as too tight) trips this test instead of
+    /// shipping. The 10pt gap is the brand decision.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn label_value_gap_breathes() {
+        assert!(
+            LABEL_VALUE_GAP >= 8,
+            "LABEL_VALUE_GAP must stay ≥ 8pt — Ervin's polish ask was \
+             that the pre-PR-85 4pt gap looked cramped on `Adószám:123`"
+        );
+    }
+
+    /// PR-85 — pin the description-wrap behaviour. A short description
+    /// fits on one line; a long one wraps; and no mid-word break
+    /// occurs (a long URL or product code prints on its own line as
+    /// a whole token — never silently truncated).
+    #[test]
+    fn description_wraps_when_long() {
+        // A clearly-short description stays on one line.
+        let short = "Tanácsadói díj";
+        assert!(short.chars().count() <= TableLayout::DESC_WRAP_CHARS);
+        let wrapped_short = wrap_to_chars(short, TableLayout::DESC_WRAP_CHARS);
+        assert_eq!(wrapped_short.len(), 1);
+
+        // A long description wraps to multiple lines (≥ 2). Note the
+        // existing `print_invoice_render` integration fixture's 42-char
+        // description sits ABOVE the 40-char wrap width — its wrap-to-
+        // two-lines behaviour is exercised by that suite, which keeps
+        // the wrap path live in CI.
+        let long = "Tanácsadói szolgáltatás Áben Consulting KFT részére \
+                    2026 második negyedévében az ERP-rendszer bevezetésére \
+                    vonatkozóan, NAV-megfelelőség és könyvviteli integráció \
+                    kiegészítéssel";
+        let wrapped_long = wrap_to_chars(long, TableLayout::DESC_WRAP_CHARS);
+        assert!(
+            wrapped_long.len() >= 2,
+            "long description must wrap to ≥ 2 lines; got {} lines",
+            wrapped_long.len()
+        );
+
+        // No mid-word breaks — every wrapped line is composed of
+        // whole whitespace-separated tokens.
+        for line in &wrapped_long {
+            for word in line.split_whitespace() {
+                assert!(!word.is_empty(), "no empty fragments in a wrapped line");
+            }
+        }
+    }
 }

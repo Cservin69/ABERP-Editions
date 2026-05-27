@@ -111,6 +111,9 @@ fn fixture_ready_invoice(unit_price_minor: i64, quantity: u32, vat_bps: u16) -> 
             note: None,
         }],
         issue_date: OffsetDateTime::now_utc(),
+        // PR-84 — fixture defaults both date fields to issue date.
+        payment_deadline: OffsetDateTime::now_utc().date(),
+        delivery_date: OffsetDateTime::now_utc().date(),
         sequence_number: 7,
         fiscal_year: 0,
     }

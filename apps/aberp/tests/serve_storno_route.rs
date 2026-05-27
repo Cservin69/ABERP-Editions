@@ -83,6 +83,9 @@ fn fixture_ready_invoice() -> ReadyInvoice {
             note: None,
         }],
         issue_date: OffsetDateTime::now_utc(),
+        // PR-84 — fixture defaults both date fields to issue date.
+        payment_deadline: OffsetDateTime::now_utc().date(),
+        delivery_date: OffsetDateTime::now_utc().date(),
         sequence_number: 13,
         fiscal_year: 0,
     }
@@ -175,7 +178,7 @@ fn storno_route_rejects_ready_invoice_with_precondition_mismatch() {
     }
 
     let state = build_state(db_path);
-    let err = serve::storno_invoice_request(&state, &invoice_id)
+    let err = serve::storno_invoice_request(&state, &invoice_id, Default::default())
         .expect_err("storno on Ready must reject");
     match err {
         SubmitRouteError::PreconditionMismatch {
@@ -218,7 +221,7 @@ fn storno_route_rejects_submitted_invoice_with_precondition_mismatch() {
     }
 
     let state = build_state(db_path);
-    let err = serve::storno_invoice_request(&state, &invoice_id)
+    let err = serve::storno_invoice_request(&state, &invoice_id, Default::default())
         .expect_err("storno on Submitted must reject");
     match err {
         SubmitRouteError::PreconditionMismatch {
@@ -283,7 +286,7 @@ fn storno_route_returns_not_found_for_unknown_invoice() {
     let state = build_state(db_path);
     let unknown = "inv_01ARZ3NDEKTSV4RRFFQ69G5XYZ";
 
-    let storno_err = serve::storno_invoice_request(&state, unknown)
+    let storno_err = serve::storno_invoice_request(&state, unknown, Default::default())
         .expect_err("storno on unknown id must reject");
     match storno_err {
         SubmitRouteError::NotFound(message) => {

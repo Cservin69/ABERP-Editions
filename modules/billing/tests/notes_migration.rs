@@ -232,6 +232,7 @@ fn line_note_round_trips_through_allocate_and_load() {
     store.create_series(&series).expect("create series");
 
     let invoice_id = InvoiceId::new();
+    let now = OffsetDateTime::now_utc();
     let draft = DraftInvoice {
         id: invoice_id,
         series_id: series.id,
@@ -243,7 +244,10 @@ fn line_note_round_trips_through_allocate_and_load() {
             vat_rate_basis_points: 2700,
             note: Some("Please ship to dock B".to_string()),
         }],
-        issue_date: OffsetDateTime::now_utc(),
+        issue_date: now,
+        // PR-84 — round-trip pin defaults both dates to the issue date.
+        payment_deadline: now.date(),
+        delivery_date: now.date(),
     };
 
     let outcome = store

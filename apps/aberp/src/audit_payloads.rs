@@ -203,6 +203,37 @@ pub struct InvoiceDraftCreatedPayload {
     /// matches `line_count` — a drift indicates ledger tampering.
     #[serde(default)]
     pub line_notes: Vec<Option<String>>,
+    /// PR-84 — operator-supplied payment deadline (Fizetési határidő)
+    /// in canonical YYYY-MM-DD form. `Some(date)` for SPA-issued
+    /// invoices post-PR-84; `None` for pre-PR-84 audit entries AND for
+    /// CLI / library callers that do not yet thread the field. The
+    /// duckdb `invoice` row carries the same value verbatim — the
+    /// audit stamp is the regulatorily authoritative copy (ADR-0008's
+    /// hash chain forbids silent mutation).
+    #[serde(default)]
+    pub payment_deadline: Option<String>,
+    /// PR-84 — operator-chosen delivery / fulfillment date (Teljesítési
+    /// dátum, NAV `<invoiceDeliveryDate>`) in canonical YYYY-MM-DD
+    /// form. REGULATORY: drives which VAT-return month the invoice
+    /// belongs to. `Some(date)` for SPA-issued invoices post-PR-84;
+    /// `None` for pre-PR-84 entries (the pre-PR-84 NAV emit silently
+    /// mirrored issue_date, so pre-PR-84 audit rows have no separate
+    /// delivery-date to record). Inspector recovery: read this field
+    /// for post-PR-84 rows; fall back to the invoice's issue_date for
+    /// pre-PR-84 rows.
+    #[serde(default)]
+    pub delivery_date: Option<String>,
+    /// PR-84 — audit discriminant for the delivery-date choice's
+    /// comfort-zone classification. `None` means in-range (default
+    /// operator path, no flag); `Some("BeforeInvoiceDate")` /
+    /// `Some("AfterPaymentDeadline")` record the operator's confirmed
+    /// out-of-range choice verbatim. Mirrors the SPA's
+    /// `DeliveryDateOverride` union and the Rust domain's
+    /// `DeliveryDateZone::audit_discriminant` output exactly. Closed
+    /// vocab; an unknown string indicates ledger tampering or a
+    /// forward-compat schema drift the inspector should investigate.
+    #[serde(default)]
+    pub delivery_date_override: Option<String>,
 }
 
 impl InvoiceDraftCreatedPayload {
@@ -229,6 +260,14 @@ impl InvoiceDraftCreatedPayload {
             bank_account_swift_bic: None,
             invoice_note: None,
             line_notes: Vec::new(),
+            // PR-84 — invoice-date fields default to `None` at every
+            // constructor; the SPA-issue path stamps real values via
+            // `with_invoice_dates` below. CLI / library callers that
+            // do not exercise the date pickers continue to emit the
+            // pre-PR-84 shape (None across all three).
+            payment_deadline: None,
+            delivery_date: None,
+            delivery_date_override: None,
         }
     }
 
@@ -268,6 +307,14 @@ impl InvoiceDraftCreatedPayload {
             bank_account_swift_bic: None,
             invoice_note: None,
             line_notes: Vec::new(),
+            // PR-84 — invoice-date fields default to `None` at every
+            // constructor; the SPA-issue path stamps real values via
+            // `with_invoice_dates` below. CLI / library callers that
+            // do not exercise the date pickers continue to emit the
+            // pre-PR-84 shape (None across all three).
+            payment_deadline: None,
+            delivery_date: None,
+            delivery_date_override: None,
         }
     }
 
@@ -310,6 +357,14 @@ impl InvoiceDraftCreatedPayload {
             bank_account_swift_bic: None,
             invoice_note: None,
             line_notes: Vec::new(),
+            // PR-84 — invoice-date fields default to `None` at every
+            // constructor; the SPA-issue path stamps real values via
+            // `with_invoice_dates` below. CLI / library callers that
+            // do not exercise the date pickers continue to emit the
+            // pre-PR-84 shape (None across all three).
+            payment_deadline: None,
+            delivery_date: None,
+            delivery_date_override: None,
         }
     }
 
@@ -347,6 +402,41 @@ impl InvoiceDraftCreatedPayload {
     pub fn with_notes(mut self, invoice: &ReadyInvoice, invoice_note: Option<&str>) -> Self {
         self.invoice_note = invoice_note.map(|s| s.to_string());
         self.line_notes = invoice.lines.iter().map(|l| l.note.clone()).collect();
+        self
+    }
+
+    /// PR-84 — stamp the three invoice-date fields onto an existing
+    /// payload (post-`from_invoice_*` step). Reads `payment_deadline`
+    /// and `delivery_date` off the freshly-allocated `ReadyInvoice`
+    /// (both fields are guaranteed non-default on the SPA-issue path);
+    /// records the operator's `delivery_date_override` discriminant
+    /// verbatim from the wire body.
+    ///
+    /// Loud-fails on a malformed date format only via the time-crate's
+    /// formatter — the dates on the `ReadyInvoice` are typed
+    /// `time::Date` so a parse error here is impossible; `unwrap_or`
+    /// with `"INVALID-DATE"` mirrors the `from_invoice_with_rate`
+    /// posture so a hypothetical format-failure surfaces in the audit
+    /// row rather than poisoning the bytes-to-disk write.
+    pub fn with_invoice_dates(
+        mut self,
+        invoice: &ReadyInvoice,
+        delivery_date_override: Option<&str>,
+    ) -> Self {
+        let fmt = time::macros::format_description!("[year]-[month]-[day]");
+        self.payment_deadline = Some(
+            invoice
+                .payment_deadline
+                .format(&fmt)
+                .unwrap_or_else(|_| "INVALID-DATE".to_string()),
+        );
+        self.delivery_date = Some(
+            invoice
+                .delivery_date
+                .format(&fmt)
+                .unwrap_or_else(|_| "INVALID-DATE".to_string()),
+        );
+        self.delivery_date_override = delivery_date_override.map(|s| s.to_string());
         self
     }
 
@@ -1744,6 +1834,7 @@ mod tests {
     /// cleanly, the typed-struct path is doing the escaping the old
     /// path did not.
     fn fixture_invoice() -> ReadyInvoice {
+        let now = OffsetDateTime::now_utc();
         ReadyInvoice {
             id: InvoiceId::new(),
             series_id: SeriesId::new(),
@@ -1765,7 +1856,9 @@ mod tests {
                     note: None,
                 },
             ],
-            issue_date: OffsetDateTime::now_utc(),
+            issue_date: now,
+            payment_deadline: now.date(),
+            delivery_date: now.date(),
             sequence_number: 7,
             fiscal_year: 0,
         }
@@ -1931,6 +2024,98 @@ mod tests {
             decoded.nav_xml_path.as_deref(),
             Some("/tmp/out/inv_01J0.xml")
         );
+    }
+
+    /// PR-83 — `with_notes` stamps the storno-reason / invoice-note
+    /// channel onto the payload. This pin guarantees the storno path's
+    /// reason field round-trips through `serde_json` and lands on the
+    /// `invoice_note` audit field verbatim (NOT silently coerced to an
+    /// empty string or stripped of whitespace).
+    ///
+    /// The fixture invoice's two lines carry distinct note states (one
+    /// annotated, one not) so the `line_notes` ordinal-aligned shape
+    /// is also pinned — the storno path inherits the base's per-line
+    /// notes when present.
+    #[test]
+    fn draft_created_with_notes_round_trips_storno_reason_and_line_notes() {
+        use std::path::PathBuf;
+
+        // Two-line invoice — line 0 carries a per-line note, line 1
+        // does not. The storno path inherits these verbatim and
+        // `with_notes` builds the ordinal-aligned line_notes vec from
+        // `invoice.lines[i].note`.
+        let mut invoice = fixture_invoice();
+        invoice.lines[0].note =
+            Some("PR-83: line note travels along with the storno render".to_string());
+        invoice.lines[1].note = None;
+
+        let idem = IdempotencyKey::new();
+        let path = PathBuf::from("/tmp/out/inv_storno_01J0.xml");
+        let original = InvoiceDraftCreatedPayload::from_invoice_with_xml_path(&invoice, idem, path)
+            .with_notes(
+                &invoice,
+                Some(
+                    "Sztornó indoka: téves vevő adatok kerültek a számlára — \
+                     buyer-facing reason",
+                ),
+            );
+
+        let bytes = original.to_bytes();
+        let decoded: InvoiceDraftCreatedPayload =
+            serde_json::from_slice(&bytes).expect("storno-reason audit payload must round-trip");
+        assert_eq!(decoded, original);
+        assert_eq!(
+            decoded.invoice_note.as_deref(),
+            Some(
+                "Sztornó indoka: téves vevő adatok kerültek a számlára — \
+                 buyer-facing reason"
+            ),
+            "PR-83 storno reason must round-trip onto the audit payload's invoice_note field"
+        );
+        assert_eq!(
+            decoded.line_notes.len(),
+            2,
+            "line_notes ordinal-aligned with lines"
+        );
+        assert_eq!(
+            decoded.line_notes[0].as_deref(),
+            Some("PR-83: line note travels along with the storno render"),
+            "PR-83 per-line note inherits onto the audit payload at the correct ordinal"
+        );
+        assert_eq!(
+            decoded.line_notes[1], None,
+            "PR-83 line_notes[1] stays None when the line carries no note"
+        );
+    }
+
+    /// PR-83 — `with_notes(invoice, None)` leaves the payload's
+    /// `invoice_note` as `None` (the storno-without-reason path).
+    /// Belt-and-braces: the previous test pins the Some-path, this
+    /// one pins the None-path so a future refactor that swaps the
+    /// argument shape (e.g., to `&str`) surfaces both branches.
+    #[test]
+    fn draft_created_with_notes_storno_without_reason_keeps_invoice_note_none() {
+        use std::path::PathBuf;
+
+        let invoice = fixture_invoice();
+        let idem = IdempotencyKey::new();
+        let path = PathBuf::from("/tmp/out/inv_storno_no_reason.xml");
+        let original = InvoiceDraftCreatedPayload::from_invoice_with_xml_path(&invoice, idem, path)
+            .with_notes(&invoice, None);
+
+        let decoded: InvoiceDraftCreatedPayload = serde_json::from_slice(&original.to_bytes())
+            .expect("storno-without-reason audit payload must round-trip");
+        assert_eq!(
+            decoded.invoice_note, None,
+            "PR-83 storno-without-reason must keep invoice_note = None on the audit payload"
+        );
+        // line_notes still populated from the invoice's lines (both
+        // None in the fixture), so the vec is length-2 with both
+        // entries None — line_notes follows invoice.lines.len(),
+        // independent of the global note's Some/None state.
+        assert_eq!(decoded.line_notes.len(), 2);
+        assert_eq!(decoded.line_notes[0], None);
+        assert_eq!(decoded.line_notes[1], None);
     }
 
     /// PR-44γ / ADR-0037 §3 — the HUF path through

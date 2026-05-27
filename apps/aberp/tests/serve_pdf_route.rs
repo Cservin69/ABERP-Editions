@@ -106,6 +106,9 @@ fn fixture_ready_invoice() -> ReadyInvoice {
             note: None,
         }],
         issue_date: OffsetDateTime::now_utc(),
+        // PR-84 — fixture defaults both date fields to issue date.
+        payment_deadline: OffsetDateTime::now_utc().date(),
+        delivery_date: OffsetDateTime::now_utc().date(),
         sequence_number: 13,
         fiscal_year: 0,
     }

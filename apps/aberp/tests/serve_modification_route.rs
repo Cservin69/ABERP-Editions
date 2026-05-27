@@ -84,6 +84,9 @@ fn fixture_ready_invoice() -> ReadyInvoice {
             note: None,
         }],
         issue_date: OffsetDateTime::now_utc(),
+        // PR-84 — fixture defaults both date fields to issue date.
+        payment_deadline: OffsetDateTime::now_utc().date(),
+        delivery_date: OffsetDateTime::now_utc().date(),
         sequence_number: 13,
         fiscal_year: 0,
     }
@@ -272,6 +275,12 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
                 note: None,
             }],
             invoice_note: None,
+            // PR-84 — fixture leaves all three date fields `None`; the
+            // issuance pipeline defaults payment_deadline + delivery_date
+            // to the system issue date.
+            payment_deadline: None,
+            delivery_date: None,
+            delivery_date_override: None,
         },
         &db_path,
         TEST_TENANT,

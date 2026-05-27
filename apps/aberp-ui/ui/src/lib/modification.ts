@@ -119,6 +119,19 @@ export function formFromIssuanceInput(
     // PR-82 — modification form inherits any invoice-level note from
     // the base's side-stored issuance input. Operator can edit.
     invoiceNote: input.invoiceNote ?? "",
+    // PR-84 — modification form inherits the date fields from the
+    // base where present (the side-stored issuance input may carry
+    // them post-PR-84) and falls back to `modificationDate` otherwise.
+    // The modification UX does not surface the comfort-zone pickers
+    // yet (out of scope per the PR-84 brief: "keep PR-84 to the
+    // issue path"); these fields are present on the form state for
+    // type-compatibility with `IssueInvoiceFormState` but the
+    // modification's `composeModificationBody` does not thread them
+    // onto the wire.
+    invoiceDate: input.deliveryDate ?? todayIsoDate(),
+    paymentDeadline: input.paymentDeadline ?? todayIsoDate(),
+    deliveryDate: input.deliveryDate ?? todayIsoDate(),
+    deliveryDateOverride: null,
   };
 }
 
