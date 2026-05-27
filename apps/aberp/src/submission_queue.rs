@@ -649,6 +649,8 @@ mod tests {
             bank_account_number: None,
             bank_account_bank_name: None,
             bank_account_swift_bic: None,
+            invoice_note: None,
+            line_notes: Vec::new(),
         };
         ledger
             .append(

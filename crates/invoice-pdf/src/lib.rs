@@ -223,10 +223,7 @@ fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel) {
 
     // Line items table.
     let table_top = banner_y - 28;
-    write_lines_table(ops, m, table_top);
-
-    // Compute the bottom of the table dynamically.
-    let table_bottom = table_top - 22 - (m.lines.len() as i64) * 28;
+    let table_bottom = write_lines_table(ops, m, table_top);
 
     // Totals block (right-aligned).
     let totals_top = table_bottom - 24;
@@ -288,7 +285,13 @@ fn write_party(
     y
 }
 
-fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) {
+/// Render the line-items table. Returns the y-coordinate of the
+/// horizontal rule that closes the table — the caller uses this to
+/// anchor the totals block. Per PR-82 the row height grows from the
+/// base 28pt when a line carries either a `performance_period`
+/// sub-line OR a `note` sub-line; both can coexist (note prints
+/// below the performance period).
+fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i64 {
     // Column x-positions (right edges for numeric columns).
     let col_num_x = MARGIN_LEFT;
     let col_desc_x = MARGIN_LEFT + 18;
@@ -348,17 +351,38 @@ fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) {
             y,
             &format::money(m.currency, line.gross_minor),
         );
+        let mut sub_y = y - 12;
         if let Some((start, end)) = line.performance_period {
             let perf = format!(
                 "Teljesítési időszak: {} – {}",
                 format::iso_dotted_date(start),
                 format::iso_dotted_date(end),
             );
-            text(ops, "FI", 8, col_desc_x, y - 12, &perf);
+            text(ops, "FI", 8, col_desc_x, sub_y, &perf);
+            sub_y -= 11;
         }
-        y -= 28;
+        // PR-82 — per-line buyer note ("Megjegyzés"). Italic sub-line
+        // labelled in Hungarian ("Megjegyzés:") so the buyer reads it
+        // in context. Only renders when present; absent notes leave
+        // the row at its base height so unannotated invoices look
+        // identical to pre-PR-82 output.
+        let mut extra_subline = 0;
+        if let Some(note) = line.note.as_ref().filter(|s| !s.trim().is_empty()) {
+            let label = format!("Megjegyzés: {}", note);
+            text(ops, "FI", 8, col_desc_x, sub_y, &label);
+            extra_subline += 12;
+        }
+        let base_advance = 28;
+        // Performance-period grows the row implicitly via sub_y (the
+        // original layout overlaid it inside the 28pt slot). The note
+        // sub-line, when present, needs an extra 12pt so the next row
+        // does not overlap it. Performance-period rows therefore keep
+        // their pre-PR-82 height; note-carrying rows grow by 12pt.
+        y -= base_advance + extra_subline;
     }
-    rule(ops, MARGIN_LEFT, MARGIN_RIGHT, y + 8);
+    let footer_rule_y = y + 8;
+    rule(ops, MARGIN_LEFT, MARGIN_RIGHT, footer_rule_y);
+    footer_rule_y
 }
 
 fn write_totals(
@@ -470,9 +494,55 @@ fn write_note(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) {
             y -= 12;
         }
     }
-    if let Some(note) = &m.note {
-        text(ops, "F1", 9, MARGIN_LEFT, y, note);
+    // PR-82 — buyer-facing invoice-level note. Renders below the
+    // EUR-only rate-source sub-line (when applicable) so the rate
+    // explanation reads first, the operator's free text second. Wraps
+    // long notes naively across multiple lines using `wrap_note_text`
+    // so a paragraph-length note does not run off the right margin.
+    if let Some(note) = m.note.as_ref().filter(|s| !s.trim().is_empty()) {
+        for wrapped_line in wrap_note_text(note, NOTE_WRAP_WIDTH_CHARS) {
+            text(ops, "F1", 9, MARGIN_LEFT, y, &wrapped_line);
+            y -= 12;
+        }
     }
+}
+
+/// PR-82 — naive word-wrap for the MEGJEGYZÉS / Megjegyzés text.
+/// Splits on whitespace and accumulates words up to `max_chars` per
+/// line. Hand-rolled because: (a) we don't have a font-metrics table
+/// (see `text_right`'s comment for the same trade-off), and (b) the
+/// invoice surface uses a tiny vocabulary — short notes are the norm,
+/// long notes acceptable as wrapped paragraphs. A future PR-44ε.2
+/// font-metric lift can upgrade to glyph-width-based wrapping.
+const NOTE_WRAP_WIDTH_CHARS: usize = 100;
+
+fn wrap_note_text(text: &str, max_chars: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.chars().count() + 1 + word.chars().count() <= max_chars {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut current));
+                current.push_str(word);
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 /// Emit a left-anchored text run at `(x, y)` using font alias `font`

@@ -877,6 +877,22 @@
             ✕
           </button>
         </div>
+        <!-- PR-82 — per-line buyer note ("Megjegyzés"). Compact
+             always-visible textarea below each line so the operator
+             can annotate without an extra "+ note" click. Blank
+             values normalise to `null` on the wire via
+             `composeIssueInvoiceBody`. Recipient-facing only — NEVER
+             reaches the NAV InvoiceData XML. -->
+        <label class="line-note">
+          <span class="line-note-label">Megjegyzés / Note</span>
+          <textarea
+            bind:value={line.note}
+            rows="1"
+            maxlength="2000"
+            placeholder="Optional buyer-facing note for this line"
+            data-testid={`line-${index}-note-input`}
+          ></textarea>
+        </label>
         {#if lineErrors[index]}
           <div class="line-errors" data-testid={`line-${index}-errors`}>
             {#each Object.entries(lineErrors[index]) as [field, item] (field)}
@@ -891,6 +907,28 @@
       <button type="button" class="quiet-button" onclick={addLine}>
         + Add line
       </button>
+    </fieldset>
+
+    <!-- PR-82 — buyer-facing invoice-level note ("Megjegyzés"). Recipient-
+         facing free text rendered on the printed PDF + (later) the SMTP
+         email body. Optional; blank ⇒ null on the wire. NEVER reaches
+         the NAV InvoiceData XML — see
+         adr/0042-invoice-notes-never-in-nav-xml.md. -->
+    <fieldset>
+      <legend>Megjegyzés / Note</legend>
+      <label class="invoice-note">
+        <textarea
+          bind:value={form.invoiceNote}
+          rows="3"
+          maxlength="4000"
+          placeholder="Optional buyer-facing note for the whole invoice (Hungarian or English, plain text)."
+          data-testid="invoice-note-input"
+        ></textarea>
+        <span class="invoice-note-hint">
+          Appears on the printed invoice under "MEGJEGYZÉS"; visible to
+          the buyer. Not sent to NAV.
+        </span>
+      </label>
     </fieldset>
 
     <footer class="issue-foot">
@@ -1133,6 +1171,43 @@
 
   .line-errors {
     margin-bottom: var(--space-2);
+  }
+
+  /* PR-82 — per-line buyer note. Inline under the line row, sized
+   * down so the line table stays readable when notes are absent. */
+  .line-note {
+    display: block;
+    margin: 0 0 var(--space-2) var(--space-3);
+    font-size: var(--type-size-2);
+  }
+
+  .line-note-label {
+    display: block;
+    color: var(--color-text-muted);
+    margin-bottom: var(--space-1);
+  }
+
+  .line-note textarea {
+    width: 100%;
+    resize: vertical;
+    font-family: inherit;
+    font-size: inherit;
+  }
+
+  /* PR-82 — invoice-level buyer note. Larger textarea, hint below. */
+  .invoice-note textarea {
+    width: 100%;
+    resize: vertical;
+    font-family: inherit;
+    font-size: var(--type-size-2);
+  }
+
+  .invoice-note-hint {
+    display: block;
+    margin-top: var(--space-1);
+    font-size: var(--type-size-1);
+    color: var(--color-text-muted);
+    font-style: italic;
   }
 
   /* PR-69 / session-91 — Submit-button count badge surfaces the

@@ -155,12 +155,14 @@ fn fixture_eur_lines() -> Vec<LineItem> {
             quantity: 2,
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
+            note: None,
         },
         LineItem {
             description: "Service B".to_string(),
             quantity: 1,
             unit_price: Huf(5000),
             vat_rate_basis_points: 2700,
+            note: None,
         },
     ]
 }

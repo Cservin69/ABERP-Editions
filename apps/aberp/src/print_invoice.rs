@@ -50,9 +50,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use aberp_audit_ledger::{BinaryHash, EventKind, Ledger, TenantId};
-use aberp_billing::{Currency, RateMetadata};
+use aberp_billing::{self as billing, Currency, RateMetadata};
 use aberp_invoice_pdf::{render_invoice, InvoiceModel, LineItem as PdfLine, PartyInfo};
 use anyhow::{anyhow, Context, Result};
+use duckdb::Connection;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use rust_decimal::Decimal;
@@ -210,10 +211,23 @@ pub fn render_to_bytes(
         swift_bic: None,
     };
 
+    // PR-82 — buyer-facing notes ride OUTSIDE the NAV XML (never-leak
+    // invariant; see `adr/0042-invoice-notes-never-in-nav-xml.md`). The
+    // printed-PDF render is therefore the consumer that re-joins the
+    // NAV XML (parties + amounts) with the DuckDB-stored notes
+    // (`invoice.invoice_note` + `invoice_line.note`). The read happens
+    // here, after the XML parse, in a fresh DuckDB tx — same posture as
+    // the audit-ledger read above. Operator-twin record stays in the
+    // audit-ledger payload too; the DuckDB read is the operational
+    // index for fast lookup.
+    let invoice_notes = load_invoice_notes(db, invoice_id)
+        .with_context(|| format!("load buyer-facing notes for invoice {invoice_id} (PR-82)"))?;
+
     let lines: Vec<PdfLine> = parsed
         .lines
         .iter()
-        .map(|l| PdfLine {
+        .enumerate()
+        .map(|(idx, l)| PdfLine {
             description: l.description.clone(),
             quantity: l.quantity,
             unit: "PIECE".to_string(),
@@ -223,6 +237,14 @@ pub fn render_to_bytes(
             vat_minor: native_to_minor(&l.vat_native, currency),
             gross_minor: native_to_minor(&l.gross_native, currency),
             performance_period: None,
+            // PR-82 — pair the per-line note off the DuckDB read by
+            // ordinal. The NAV-XML line order is the regulatory wire
+            // order (ordered by `ordinal` ascending at write time per
+            // `allocate_in_tx`'s `invoice_line` INSERT loop), so
+            // index-pairing here is sound. A drift on either side
+            // would surface visibly: NAV line 1's gross next to the
+            // wrong line's note.
+            note: invoice_notes.line_notes.get(idx).cloned().unwrap_or(None),
         })
         .collect();
 
@@ -237,7 +259,8 @@ pub fn render_to_bytes(
         supplier,
         customer,
         lines,
-        note: None,
+        // PR-82 — invoice-level buyer note flows from the DuckDB read.
+        note: invoice_notes.invoice_note,
     };
 
     // 7. Render.
@@ -701,6 +724,89 @@ pub fn native_to_minor(native: &str, currency: Currency) -> i64 {
             }
         }
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// PR-82 — buyer-facing notes read
+// ──────────────────────────────────────────────────────────────────────
+
+/// PR-82 — buyer-facing notes for one invoice, fetched off DuckDB at
+/// print time. The NAV XML on disk does NOT carry notes (never-leak
+/// invariant; see `adr/0042-invoice-notes-never-in-nav-xml.md`), so
+/// the printed-PDF render rejoins the regulatory NAV body with the
+/// stored notes here.
+#[derive(Debug, Default, Clone)]
+pub struct InvoiceNotes {
+    pub invoice_note: Option<String>,
+    /// Per-line notes in ordinal order. `line_notes[i]` is the note
+    /// for `invoice.lines[i]`; `None` for unannotated lines. Length
+    /// matches `invoice.lines.len()` for invoices issued post-PR-82;
+    /// pre-PR-82 invoices return an empty Vec (the column is NULL
+    /// across all lines).
+    pub line_notes: Vec<Option<String>>,
+}
+
+/// PR-82 — read the buyer-facing notes for `invoice_id` off the
+/// tenant DuckDB. Uses `billing::load_invoice_note_in_tx` for the
+/// invoice-level note and walks `invoice_line.note` in ordinal order
+/// for the per-line vector.
+///
+/// Caller already holds the invoice id from the audit-ledger walk; we
+/// open a fresh read tx here rather than thread the existing
+/// `Ledger`-side connection through (the ledger crate manages its own
+/// connection internally and exposes no tx handle).
+///
+/// Returns `InvoiceNotes::default()` (empty) if the billing tables do
+/// not exist in this DB. That class of failure happens in two
+/// situations: (a) a stand-alone audit-ledger-only DB (some tests
+/// construct one), and (b) a hypothetical pre-PR-82 DB that never
+/// passed through `DuckDbBillingStore::ensure_schema()`. Either way,
+/// the invoice cannot carry notes (the columns don't exist), so an
+/// empty `InvoiceNotes` is the correct read posture — not a loud-fail.
+/// Real DB corruption (column missing but table present) still
+/// surfaces as an error because `load_invoice_note_in_tx`'s SELECT
+/// errors on that specific shape.
+pub fn load_invoice_notes(db: &Path, invoice_id: &str) -> Result<InvoiceNotes> {
+    let mut conn = Connection::open(db)
+        .with_context(|| format!("open tenant DuckDB for notes read at {}", db.display()))?;
+    let tx = conn
+        .transaction()
+        .context("begin read transaction for buyer-notes lookup")?;
+    // Probe the `invoice` table existence cheaply. DuckDB's
+    // information_schema is the portable path here; a missing table
+    // returns zero rows, not an error.
+    let table_present: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = 'invoice';",
+            [],
+            |r| r.get(0),
+        )
+        .context("probe invoice table existence")?;
+    if table_present == 0 {
+        tx.commit().context("commit notes-read tx (no tables)")?;
+        return Ok(InvoiceNotes::default());
+    }
+    let invoice_note = billing::load_invoice_note_in_tx(&tx, invoice_id)
+        .context("billing::load_invoice_note_in_tx (print)")?;
+    // Per-line notes by ordinal. We deliberately do NOT call
+    // `load_ready_invoice_by_id` (which returns the full ReadyInvoice
+    // including amounts) — the renderer already has line amounts from
+    // the NAV XML parse, and pulling them twice would invite drift.
+    let line_notes = {
+        let mut stmt =
+            tx.prepare("SELECT note FROM invoice_line WHERE invoice_id = ? ORDER BY ordinal ASC;")?;
+        let rows = stmt.query_map([invoice_id], |r| r.get::<_, Option<String>>(0))?;
+        let mut out: Vec<Option<String>> = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        out
+    };
+    tx.commit().context("commit notes-read tx")?;
+    Ok(InvoiceNotes {
+        invoice_note,
+        line_notes,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────

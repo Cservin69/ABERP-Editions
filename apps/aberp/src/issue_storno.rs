@@ -311,6 +311,14 @@ pub fn storno_from_inputs(
         currency: Currency::Huf,
         rate_metadata: None,
         bank_snapshot: None,
+        // PR-82 — buyer-facing storno-level note ("Megjegyzés") is
+        // out of scope for the storno path in PR-82. PR-83 will wire
+        // the storno-reason note here (and into the audit payload via
+        // `with_notes`) so the buyer sees WHY the invoice was
+        // cancelled on the printed PDF. Per-line notes inherited from
+        // the base ride on `draft.lines[i].note` naturally — the
+        // negation only touches the unit-price sign, not the note.
+        invoice_note: None,
     };
 
     // 8. One transaction across base-load + chain-index walk + storno
@@ -934,6 +942,11 @@ fn build_storno_command(
             quantity: l.quantity,
             unit_price: Huf(l.unit_price),
             vat_rate_basis_points: percent_to_basis_points(l.vat_rate_percent),
+            // PR-82 — pass through whatever per-line note the
+            // side-stored input.json carries from the base's issuance.
+            // The negation step `negate_line` preserves notes too, so
+            // the storno's printed PDF inherits the base's line notes.
+            note: l.note.clone(),
         })
         .collect();
     Ok(IssueInvoiceCommand {

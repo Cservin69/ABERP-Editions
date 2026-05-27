@@ -15,6 +15,14 @@ use super::money::Huf;
 /// don't fractionalize quantities for typical CNC manufacturing outputs;
 /// when a future product line needs decimal quantities, a separate
 /// `LineItemKind` variant lands.
+///
+/// # PR-82 — `note` (Megjegyzés) field
+///
+/// Buyer-facing free-text note per line. NOT a NAV field — never emitted
+/// into the InvoiceData XML (NAV's XSD has no slot). Persisted on the
+/// `invoice_line.note` DuckDB column, rendered as a sub-line on the
+/// printed PDF, and (later) carried in the email body. See
+/// `adr/0042-invoice-notes-never-in-nav-xml.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineItem {
     pub description: String,
@@ -23,6 +31,9 @@ pub struct LineItem {
     /// VAT rate in basis points: 2700 = 27% (Hungarian standard rate).
     /// Integer to avoid floating-point in invariant calculations.
     pub vat_rate_basis_points: u16,
+    /// PR-82 — optional buyer-facing per-line note ("Megjegyzés").
+    /// Recipient-facing only; never reaches the NAV InvoiceData XML.
+    pub note: Option<String>,
 }
 
 impl LineItem {
@@ -372,12 +383,14 @@ mod tests {
                     quantity: 3,
                     unit_price: Huf(1_000),
                     vat_rate_basis_points: 2700,
+                    note: None,
                 },
                 LineItem {
                     description: "widget B".to_string(),
                     quantity: 1,
                     unit_price: Huf(500),
                     vat_rate_basis_points: 2700,
+                    note: None,
                 },
             ],
             issue_date: OffsetDateTime::now_utc(),

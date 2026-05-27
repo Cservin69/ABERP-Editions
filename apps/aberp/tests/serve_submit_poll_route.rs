@@ -86,6 +86,7 @@ fn fixture_ready_invoice() -> ReadyInvoice {
             quantity: 1,
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
+            note: None,
         }],
         issue_date: OffsetDateTime::now_utc(),
         sequence_number: 13,

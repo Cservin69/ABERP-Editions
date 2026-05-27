@@ -83,6 +83,7 @@ fn build_eur_chain_child() -> ReadyInvoice {
             quantity: 2,
             unit_price: Huf(1000), // 10.00 EUR per unit
             vat_rate_basis_points: 2700,
+            note: None,
         }],
         issue_date: OffsetDateTime::now_utc(),
     }

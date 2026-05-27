@@ -108,6 +108,7 @@ fn fixture_ready_invoice(unit_price_minor: i64, quantity: u32, vat_bps: u16) -> 
             quantity,
             unit_price: Huf(unit_price_minor),
             vat_rate_basis_points: vat_bps,
+            note: None,
         }],
         issue_date: OffsetDateTime::now_utc(),
         sequence_number: 7,

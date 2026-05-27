@@ -14,9 +14,17 @@
 
 /** Typed slug union for the SPA's top-level routes. PR-53 surfaced
  * three; PR-54 / session-74 added `partners` (the saved-buyers
- * management screen + the typeahead's owner). Extending the union is a
- * one-line change here + a render arm in `App.svelte`. */
-export type AppRoute = "invoices" | "tenant" | "nav-credentials" | "partners";
+ * management screen + the typeahead's owner); PR-79 added
+ * `maintenance` (the maintenance-area landing dashboard — the
+ * destination of the topbar gear, with a tile grid of the area's
+ * modules + live status counts). Extending the union is a one-line
+ * change here + a render arm in `App.svelte`. */
+export type AppRoute =
+  | "invoices"
+  | "tenant"
+  | "nav-credentials"
+  | "partners"
+  | "maintenance";
 
 /** Default route the SPA falls back to on first paint (or on a hash
  * with an unknown slug). The Invoices list was the only screen
@@ -56,6 +64,8 @@ export function parseRoute(hash: string): AppRoute {
       return "nav-credentials";
     case "partners":
       return "partners";
+    case "maintenance":
+      return "maintenance";
     default:
       return DEFAULT_ROUTE;
   }

@@ -40,6 +40,7 @@ describe("composeIssueInvoiceBody", () => {
           quantity: 2,
           unitPriceMinor: 1000,
           vatRatePercent: 27,
+          note: "",
         },
       ],
     };
@@ -50,6 +51,9 @@ describe("composeIssueInvoiceBody", () => {
       customer: {
         taxNumber: "87654321-2-13",
         name: "Vevő Kft.",
+        // PR-77 — `address: undefined` flows out of `composeCustomerAddress`
+        // when the form's address fields are all blank.
+        address: undefined,
       },
       lines: [
         {
@@ -57,10 +61,15 @@ describe("composeIssueInvoiceBody", () => {
           quantity: 2,
           unitPrice: 1000,
           vatRatePercent: 27,
+          // PR-82 — blank line note normalises to `null` on the wire
+          // so the backend sees a clean "no note" signal.
+          note: null,
         },
       ],
       currency: "HUF",
       bankAccountId: null,
+      // PR-82 — blank invoice-level note normalises to `null`.
+      invoiceNote: null,
     });
   });
 
@@ -71,6 +80,7 @@ describe("composeIssueInvoiceBody", () => {
       customerName: "Vevő Kft.",
       customerTaxNumber: "87654321-2-13",
       bankAccountId: "bnk_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      invoiceNote: "",
     };
     const body = composeIssueInvoiceBody(form);
     expect(body.bankAccountId).toBe("bnk_01ARZ3NDEKTSV4RRFFQ69G5FAV");
@@ -87,6 +97,7 @@ describe("composeIssueInvoiceBody", () => {
       customerName: "C",
       customerTaxNumber: "y",
       bankAccountId: "   ",
+      invoiceNote: "",
     };
     const body = composeIssueInvoiceBody(form);
     expect(body.bankAccountId).toBeNull();
@@ -99,6 +110,73 @@ describe("composeIssueInvoiceBody", () => {
       customerTaxNumber: "y",
     });
     expect(body.bankAccountId).toBeNull();
+  });
+
+  // PR-82 — buyer-facing notes composer pins.
+  it("emits per-line and per-invoice notes verbatim when the operator typed text", () => {
+    const form = {
+      ...emptyForm(),
+      customerName: "Vevő Kft.",
+      customerTaxNumber: "87654321-2-13",
+      invoiceNote: "Köszönjük a vásárlást!",
+      lines: [
+        {
+          description: "Widget A",
+          quantity: 1,
+          unitPriceMinor: 1000,
+          vatRatePercent: 27,
+          note: "Please ship to dock B",
+        },
+      ],
+    };
+    const body = composeIssueInvoiceBody(form);
+    expect(body.invoiceNote).toBe("Köszönjük a vásárlást!");
+    expect(body.lines[0].note).toBe("Please ship to dock B");
+  });
+
+  it("trims whitespace and normalises blank notes to null on the wire", () => {
+    // Whitespace-only notes are the operator's "I almost typed
+    // something then deleted it" residue — the wire should not
+    // carry empty strings.
+    const form = {
+      ...emptyForm(),
+      customerName: "C",
+      customerTaxNumber: "y",
+      invoiceNote: "   \n  ",
+      lines: [
+        {
+          description: "Widget A",
+          quantity: 1,
+          unitPriceMinor: 100,
+          vatRatePercent: 27,
+          note: "  ",
+        },
+      ],
+    };
+    const body = composeIssueInvoiceBody(form);
+    expect(body.invoiceNote).toBeNull();
+    expect(body.lines[0].note).toBeNull();
+  });
+
+  it("trims surrounding whitespace on notes while preserving inner content", () => {
+    const form = {
+      ...emptyForm(),
+      customerName: "C",
+      customerTaxNumber: "y",
+      invoiceNote: "  Pay by NET 30.  ",
+      lines: [
+        {
+          description: "Widget A",
+          quantity: 1,
+          unitPriceMinor: 100,
+          vatRatePercent: 27,
+          note: "  Line A note  ",
+        },
+      ],
+    };
+    const body = composeIssueInvoiceBody(form);
+    expect(body.invoiceNote).toBe("Pay by NET 30.");
+    expect(body.lines[0].note).toBe("Line A note");
   });
 
   it("does not emit a supplier field on the wire body (PR-53)", () => {
@@ -126,6 +204,7 @@ describe("composeIssueInvoiceBody", () => {
           quantity: 8,
           unitPriceMinor: 12500, // 125.00 EUR in cents
           vatRatePercent: 27,
+          note: "",
         },
       ],
     };
@@ -138,6 +217,8 @@ describe("composeIssueInvoiceBody", () => {
       quantity: 8,
       unitPrice: 12500,
       vatRatePercent: 27,
+      // PR-82 — blank-after-trim ⇒ null on the wire.
+      note: null,
     });
   });
 
@@ -158,6 +239,7 @@ describe("composeIssueInvoiceBody", () => {
           quantity: 1,
           unitPriceMinor: 500,
           vatRatePercent: 27,
+          note: "",
         },
       ],
     };
@@ -244,9 +326,9 @@ describe("composeIssueInvoiceBody", () => {
       customerTaxNumber: "y",
       currency: "HUF" as const,
       lines: [
-        { description: "A", quantity: 1, unitPriceMinor: 100, vatRatePercent: 27 },
-        { description: "B", quantity: 2, unitPriceMinor: 200, vatRatePercent: 5 },
-        { description: "C", quantity: 3, unitPriceMinor: 300, vatRatePercent: 0 },
+        { description: "A", quantity: 1, unitPriceMinor: 100, vatRatePercent: 27, note: "" },
+        { description: "B", quantity: 2, unitPriceMinor: 200, vatRatePercent: 5, note: "" },
+        { description: "C", quantity: 3, unitPriceMinor: 300, vatRatePercent: 0, note: "" },
       ],
     };
 

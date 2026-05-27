@@ -757,6 +757,13 @@ fn negate_line(line: &LineItem) -> LineItem {
         quantity: line.quantity,
         unit_price: Huf(line.unit_price.as_i64().saturating_neg()),
         vat_rate_basis_points: line.vat_rate_basis_points,
+        // PR-82 — preserve the base's per-line `note` verbatim through
+        // negation. The note is recipient-facing metadata, NOT part of
+        // the amount-sign reversal; carrying it forward keeps the
+        // storno's stored line shape consistent with the printed PDF.
+        // (NAV XML emission still does not consume the note — see the
+        // never-leak invariant in `adr/0042-invoice-notes-never-in-nav-xml.md`.)
+        note: line.note.clone(),
     }
 }
 

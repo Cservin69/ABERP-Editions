@@ -134,6 +134,16 @@ pub struct InvoiceInputJson {
     pub supplier: SupplierJson,
     pub customer: CustomerJson,
     pub lines: Vec<LineJson>,
+    /// PR-82 — buyer-facing per-invoice global note ("Megjegyzés").
+    /// Optional; `None` for invoices the operator does not annotate.
+    /// Recipient-facing only — NEVER emitted into the NAV InvoiceData
+    /// XML (see `adr/0042-invoice-notes-never-in-nav-xml.md`).
+    ///
+    /// `#[serde(default)]` keeps pre-PR-82 side-stored input.json files
+    /// readable — they deserialise with `invoice_note: None`. The
+    /// `rename = "invoiceNote"` matches the SPA's camelCase wire form.
+    #[serde(default, rename = "invoiceNote")]
+    pub invoice_note: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -180,6 +190,13 @@ pub struct LineJson {
     pub unit_price: i64,
     #[serde(rename = "vatRatePercent")]
     pub vat_rate_percent: u16,
+    /// PR-82 — buyer-facing per-line note ("Megjegyzés"). Optional;
+    /// `None` for lines the operator does not annotate. Recipient-
+    /// facing only — NEVER reaches the NAV InvoiceData XML. Pre-PR-82
+    /// side-stored bodies deserialise with `note: None` via
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -466,6 +483,11 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         // PR-73 / ADR-0040 §addendum — bank snapshot resolved by the
         // route handler (or `None` for CLI / library callers).
         bank_snapshot: bank_snapshot.clone(),
+        // PR-82 — buyer-facing global note. Threads from the wire body
+        // straight to DuckDB via `allocate_in_tx`. The audit payload's
+        // `with_notes` builder stamps the same value below so the
+        // operator-twin's record of "what was issued" is complete.
+        invoice_note: input.invoice_note.clone(),
     };
 
     // 8. One transaction across the billing writes and audit appends.
@@ -487,6 +509,10 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         currency,
         rate_metadata.clone(),
         bank_snapshot.clone(),
+        // PR-82 — invoice-level buyer note. Threaded into the audit
+        // payload alongside the per-line notes (which the audit payload
+        // builder reads off `outcome.invoice.lines[i].note`).
+        input.invoice_note.clone(),
     )?;
 
     let invoice = outcome.invoice;
@@ -689,6 +715,13 @@ fn run_single_tx(
     currency: Currency,
     rate_metadata: Option<RateMetadata>,
     bank_snapshot: Option<BankAccountSnapshot>,
+    // PR-82 — invoice-level buyer note ("Megjegyzés"). Stamped onto the
+    // `InvoiceDraftCreated` audit payload via `with_notes` so the
+    // operator-twin's regulatory record of "what was issued" includes
+    // the note alongside the wire-XML pointer. Per-line notes ride on
+    // `outcome.invoice.lines[i].note` and are read inline by the
+    // payload builder.
+    invoice_note: Option<String>,
 ) -> Result<TxOutcome> {
     let tx = conn
         .transaction()
@@ -764,7 +797,13 @@ fn run_single_tx(
         // (resolved by the route handler or inherited from the base
         // for chain children). `None` is a no-op so the CLI path
         // continues to emit a snapshot-free payload.
-        .with_bank_snapshot(bank_snapshot.as_ref());
+        .with_bank_snapshot(bank_snapshot.as_ref())
+        // PR-82 — stamp the buyer-facing notes onto the audit payload.
+        // `with_notes` reads the invoice's per-line notes off
+        // `invoice.lines[i].note` and persists them alongside the
+        // operator-typed `invoice_note` so the operator-twin record
+        // captures everything the buyer will see on the PDF.
+        .with_notes(&invoice, invoice_note.as_deref());
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
@@ -796,6 +835,10 @@ fn build_command(input: &InvoiceInputJson, code: &SeriesCode) -> Result<IssueInv
             quantity: l.quantity,
             unit_price: Huf(l.unit_price),
             vat_rate_basis_points: percent_to_basis_points(l.vat_rate_percent),
+            // PR-82 — per-line buyer note threads from the wire body
+            // through to `LineItem`. The NAV emitter does not consume
+            // this field; the printed-PDF + SPA detail surfaces do.
+            note: l.note.clone(),
         })
         .collect();
     Ok(IssueInvoiceCommand {

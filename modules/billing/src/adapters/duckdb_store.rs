@@ -127,6 +127,11 @@ CREATE TABLE IF NOT EXISTS invoice (
     bank_account_number    VARCHAR,
     bank_account_bank_name VARCHAR,
     bank_account_swift_bic VARCHAR,
+    -- PR-82 — buyer-facing invoice-level note ("Megjegyzés"). Recipient-
+    -- facing only; never emitted into the NAV InvoiceData XML. Nullable
+    -- by design (most invoices carry no global note); pre-PR-82 rows
+    -- gain the column via MIGRATE_PR_82_SQL and stay NULL.
+    invoice_note           VARCHAR,
     UNIQUE (series_id, fiscal_year, sequence_number)
 );
 
@@ -137,6 +142,10 @@ CREATE TABLE IF NOT EXISTS invoice_line (
     quantity              INTEGER NOT NULL CHECK (quantity >= 0),
     unit_price            BIGINT  NOT NULL,
     vat_rate_basis_points INTEGER NOT NULL,
+    -- PR-82 — buyer-facing per-line note ("Megjegyzés"). Recipient-
+    -- facing only; never emitted into the NAV InvoiceData XML. Nullable;
+    -- pre-PR-82 rows gain the column via MIGRATE_PR_82_SQL and stay NULL.
+    note                  VARCHAR,
     PRIMARY KEY (invoice_id, ordinal)
 );
 "#;
@@ -205,6 +214,29 @@ ALTER TABLE invoice ADD COLUMN IF NOT EXISTS bank_account_currency  VARCHAR;
 ALTER TABLE invoice ADD COLUMN IF NOT EXISTS bank_account_number    VARCHAR;
 ALTER TABLE invoice ADD COLUMN IF NOT EXISTS bank_account_bank_name VARCHAR;
 ALTER TABLE invoice ADD COLUMN IF NOT EXISTS bank_account_swift_bic VARCHAR;
+";
+
+/// PR-82 — additive migration for the two buyer-facing note columns
+/// ("Megjegyzés"): `invoice.invoice_note` (per-invoice global note) and
+/// `invoice_line.note` (per-line note). Idempotent via
+/// `ADD COLUMN IF NOT EXISTS`; safe on fresh + pre-PR-82 DBs (the
+/// `CREATE TABLE IF NOT EXISTS` posture means fresh DBs already
+/// have the columns; the ALTER is a no-op there).
+///
+/// # Why notes live in their own migration block
+///
+/// The "notes never reach the NAV InvoiceData XML" invariant is
+/// load-bearing (see `adr/0042-invoice-notes-never-in-nav-xml.md`).
+/// Keeping the migration block named for PR-82 makes the regulatory
+/// boundary visible in `git blame`: any future code change that
+/// would emit notes onto the wire surfaces here as the place where
+/// "notes were stored" sits beside the emitter that never reads them.
+///
+/// No backfill `UPDATE` runs here — pre-PR-82 rows have no note value
+/// to recover, and NULL is the natural representation of "no note."
+const MIGRATE_PR_82_SQL: &str = "
+ALTER TABLE invoice      ADD COLUMN IF NOT EXISTS invoice_note VARCHAR;
+ALTER TABLE invoice_line ADD COLUMN IF NOT EXISTS note         VARCHAR;
 ";
 
 #[derive(Debug)]
@@ -447,6 +479,13 @@ pub fn allocate_in_tx(
         .map(|b| b.account_number.clone());
     let bank_account_bank_name = args.bank_snapshot.as_ref().map(|b| b.bank_name.clone());
     let bank_account_swift_bic = args.bank_snapshot.as_ref().map(|b| b.swift_bic.clone());
+    // PR-82 — buyer-facing invoice-level note ("Megjegyzés"). Persisted
+    // to the new `invoice.invoice_note` column. NEVER reaches the NAV
+    // InvoiceData XML — the emitter in `apps/aberp/src/nav_xml.rs` does
+    // not consume it, and the "never-leak" pin in
+    // `apps/aberp/tests/nav_xml_notes_never_leak.rs` enforces the
+    // byte-identical invariant on the wire output.
+    let invoice_note = args.invoice_note.clone();
     tx.execute(
         "INSERT INTO invoice
          (id, series_id, customer_id, issue_date, sequence_number,
@@ -454,8 +493,9 @@ pub fn allocate_in_tx(
           currency, exchange_rate, exchange_rate_source,
           exchange_rate_date, huf_equivalent_total,
           bank_account_id, bank_account_currency, bank_account_number,
-          bank_account_bank_name, bank_account_swift_bic)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+          bank_account_bank_name, bank_account_swift_bic,
+          invoice_note)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
         params![
             draft.id.to_prefixed_string(),
             &series_id_str,
@@ -474,15 +514,20 @@ pub fn allocate_in_tx(
             &bank_account_number,
             &bank_account_bank_name,
             &bank_account_swift_bic,
+            &invoice_note,
         ],
     )?;
 
     for (ordinal, line) in draft.lines.iter().enumerate() {
+        // PR-82 — per-line note ("Megjegyzés") persisted alongside the
+        // line content. Same "never on the wire" posture as
+        // `invoice.invoice_note`; the per-line emitter in
+        // `nav_xml::render_line` does not read this field.
         tx.execute(
             "INSERT INTO invoice_line
              (invoice_id, ordinal, description, quantity,
-              unit_price, vat_rate_basis_points)
-             VALUES (?, ?, ?, ?, ?, ?);",
+              unit_price, vat_rate_basis_points, note)
+             VALUES (?, ?, ?, ?, ?, ?, ?);",
             params![
                 draft.id.to_prefixed_string(),
                 ordinal as i64,
@@ -490,6 +535,7 @@ pub fn allocate_in_tx(
                 line.quantity as i64,
                 line.unit_price.as_i64(),
                 line.vat_rate_basis_points as i64,
+                &line.note,
             ],
         )?;
     }
@@ -537,6 +583,10 @@ impl BillingStore for DuckDbBillingStore {
         // PR-73 rows stay NULL across all five (no backfill — the
         // regulatory record forbids fabricating a snapshot).
         self.conn.execute_batch(MIGRATE_PR_73_SQL)?;
+        // PR-82 — additive migration for the two buyer-facing note
+        // columns. Idempotent; old DBs gain `invoice.invoice_note` +
+        // `invoice_line.note` on first boot.
+        self.conn.execute_batch(MIGRATE_PR_82_SQL)?;
         Ok(())
     }
 
@@ -806,8 +856,13 @@ fn load_invoice(
     };
 
     // Load lines in ordinal order.
+    //
+    // PR-82 — `note` column included in the SELECT so per-line buyer
+    // notes round-trip through every load path (SPA detail, storno
+    // base-read for chain content, PDF re-render). The column is
+    // nullable; pre-PR-82 rows decode as `note: None`.
     let mut stmt = tx.prepare(
-        "SELECT description, quantity, unit_price, vat_rate_basis_points
+        "SELECT description, quantity, unit_price, vat_rate_basis_points, note
          FROM invoice_line WHERE invoice_id = ? ORDER BY ordinal ASC;",
     )?;
     let rows = stmt.query_map([invoice_id_str], |r| {
@@ -816,16 +871,18 @@ fn load_invoice(
             r.get::<_, i64>(1)?,
             r.get::<_, i64>(2)?,
             r.get::<_, i64>(3)?,
+            r.get::<_, Option<String>>(4)?,
         ))
     })?;
     let mut lines = Vec::new();
     for r in rows {
-        let (description, quantity, unit_price, vat) = r?;
+        let (description, quantity, unit_price, vat, note) = r?;
         lines.push(LineItem {
             description,
             quantity: quantity as u32,
             unit_price: Huf(unit_price),
             vat_rate_basis_points: vat as u16,
+            note,
         });
     }
 
@@ -839,6 +896,32 @@ fn load_invoice(
         sequence_number: seq_number as u64,
         fiscal_year,
     })
+}
+
+/// PR-82 — read the per-invoice global note ("Megjegyzés") off the
+/// `invoice.invoice_note` column. `None` when the column is NULL
+/// (operator did not supply a note OR pre-PR-82 row) AND when the
+/// invoice row does not exist (the caller's wider read path surfaces
+/// the missing-invoice case as `None` from `load_ready_invoice_by_id`).
+///
+/// Free function (not a `BillingStore` trait method) for the same reason
+/// `load_ready_invoice_by_id` is: the binary owns the `Transaction`
+/// lifecycle and calls this inside its own tx that also drives audit-
+/// ledger appends or sibling reads.
+///
+/// NEVER consulted by the NAV XML emitter — the note column is
+/// recipient-facing storage only (see
+/// `adr/0042-invoice-notes-never-in-nav-xml.md`).
+pub fn load_invoice_note_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    invoice_id_str: &str,
+) -> Result<Option<String>, BillingError> {
+    let mut stmt = tx.prepare("SELECT invoice_note FROM invoice WHERE id = ?;")?;
+    let mut rows = stmt.query_map([invoice_id_str], |r| r.get::<_, Option<String>>(0))?;
+    match rows.next() {
+        Some(r) => Ok(r?),
+        None => Ok(None),
+    }
 }
 
 fn load_reservation_by_invoice(

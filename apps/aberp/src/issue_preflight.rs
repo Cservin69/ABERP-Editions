@@ -538,6 +538,7 @@ mod tests {
             quantity: 1,
             unit_price: 10_000,
             vat_rate_percent: 27,
+            note: None,
         }
     }
 
@@ -552,6 +553,7 @@ mod tests {
             currency: Currency::Huf,
             series: None,
             bank_account_id: None,
+            invoice_note: None,
         }
     }
 
@@ -791,6 +793,7 @@ mod tests {
                     quantity: 0,                 // zero
                     unit_price: -1,              // negative
                     vat_rate_percent: 12,        // off-vocab
+                    note: None,
                 },
                 good_line(), // line 1 is fine
                 LineJson {
@@ -798,11 +801,13 @@ mod tests {
                     quantity: 1,
                     unit_price: 10,
                     vat_rate_percent: 99, // off-vocab
+                    note: None,
                 },
             ],
             currency: Currency::Huf,
             series: None,
             bank_account_id: None,
+            invoice_note: None,
         };
         let errs = validate_invoice_preflight(&r);
 

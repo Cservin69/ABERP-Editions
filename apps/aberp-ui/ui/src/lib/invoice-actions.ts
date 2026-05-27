@@ -16,6 +16,14 @@
 // a Svelte 5 component (a component-test runner is named-deferred per
 // CLAUDE.md rule 2 — the composer-pin pattern works for every per-
 // state UI affordance the modal needs).
+//
+// PR-80 / session-102 — `detailActionMeta` + `ActionGroup` extend the
+// per-button surface with presentational metadata (glyph + bilingual
+// label + group) so the InvoiceDetail action bar renders with
+// consistent affordance across lifecycle / operational / chain /
+// export sections. The group decision is load-bearing (it drives the
+// visual hierarchy on the operator's daily console) so it lives next
+// to `buttonsForState` and is pinned by the same test file.
 
 import type { InvoiceState } from "./api";
 
@@ -104,5 +112,154 @@ export function buttonsForState(
     case "Unknown":
       // Terminal / read-only states: download only.
       return ["Download"];
+  }
+}
+
+/** PR-80 / session-102 — visual grouping of action bar buttons. Drives
+ * the section labels in the InvoiceDetail action bar so the operator
+ * scans a coherent hierarchy rather than an ambiguous row of buttons:
+ *
+ *   Lifecycle  — moves through the NAV regulatory ladder
+ *                (Submit → PollAck). The most-attention-demanding row.
+ *   Operational — operational-side recording that doesn't change the
+ *                NAV state (Pay).
+ *   Chain      — issues a downstream chain child (Storno, Modification).
+ *                Read as "spawns a new invoice referencing this one."
+ *   Export     — operator-deliverable artifacts (Download PDF).
+ *
+ * Closed-vocab so a new ActionGroup variant requires a paired pin. */
+export type ActionGroup = "Lifecycle" | "Operational" | "Chain" | "Export";
+
+/** PR-80 / session-102 — bilingual labels per ADR-0036's HU + EN
+ * affordance precedent. The visible button shows the Hungarian label
+ * (the operator is HU-native; this is the operator's daily console);
+ * the English string is the screen-reader aria-label + tooltip
+ * fallback so non-HU developers / support contractors can still scan
+ * the UI. */
+export interface DetailActionMeta {
+  /** The action's group bucket, drives section labels. */
+  group: ActionGroup;
+  /** Leading icon glyph rendered before the label. Mirrors the
+   * `quickActionMeta` glyph vocabulary in `invoice-list.ts` so the
+   * operator recognises the same affordance on the row + detail
+   * surfaces. */
+  glyph: string;
+  /** Hungarian visible label — operator's native language. */
+  label_hu: string;
+  /** English label — used as the screen-reader aria-label fallback. */
+  label_en: string;
+  /** One-sentence tooltip explaining what the action does. Surfaced
+   * on hover so a regression that disables the button still tells
+   * the operator what would happen. Hungarian per the operator-
+   * surface convention. */
+  tooltip_hu: string;
+}
+
+/** PR-80 / session-102 — per-button metadata table. The visible button
+ * renders `glyph + label_hu`; aria-label is `label_en`; tooltip is
+ * `tooltip_hu`. Pinned by `detailActionMeta` table tests in
+ * `invoice-actions.test.ts` so a glyph drift / label drift surfaces at
+ * `npm test`. */
+export function detailActionMeta(button: DetailActionButton): DetailActionMeta {
+  switch (button) {
+    case "Submit":
+      return {
+        group: "Lifecycle",
+        glyph: "↗",
+        label_hu: "Beküldés a NAV-hoz",
+        label_en: "Submit to NAV",
+        tooltip_hu:
+          "Beküldi a számlát a NAV Online Számla rendszerébe. A NAV nyugta után az állapot Submitted lesz.",
+      };
+    case "PollAck":
+      return {
+        group: "Lifecycle",
+        glyph: "↻",
+        label_hu: "NAV státusz lekérése",
+        label_en: "Poll NAV ack",
+        tooltip_hu:
+          "Lekéri a NAV-tól a feldolgozás státuszát. Eredmény: SAVED (Finalized) vagy ABORTED (Rejected).",
+      };
+    case "Pay":
+      return {
+        group: "Operational",
+        glyph: "💰",
+        label_hu: "Fizetettnek jelölés",
+        label_en: "Mark as paid",
+        tooltip_hu:
+          "Rögzíti, hogy a vevő kifizette a számlát. Nem változtatja a NAV státuszt.",
+      };
+    case "Storno":
+      return {
+        group: "Chain",
+        glyph: "⊘",
+        label_hu: "Sztornózás",
+        label_en: "Cancel (storno)",
+        tooltip_hu:
+          "Sztornó számlát állít ki az eredeti tartalmával ellentétes előjelű összegekkel. Új sorszámot foglal le; nem visszafordítható.",
+      };
+    case "Modification":
+      return {
+        group: "Chain",
+        glyph: "✎",
+        label_hu: "Módosítás",
+        label_en: "Amend (modification)",
+        tooltip_hu:
+          "Módosító számlát állít ki javított tartalommal. A pénznem örökölt; új sorszámot foglal le.",
+      };
+    case "Download":
+      return {
+        group: "Export",
+        glyph: "📄",
+        label_hu: "PDF letöltése",
+        label_en: "Download PDF",
+        tooltip_hu:
+          "Letölti a nyomtatható PDF számlát. A NAV státusztól függetlenül elérhető.",
+      };
+  }
+}
+
+/** PR-80 / session-102 — group buttons returned by `buttonsForState`
+ * into the four visual sections the action bar renders. Preserves the
+ * per-state operator-reading order within each group. Returns groups
+ * with at least one button (empty groups are omitted so the rendered
+ * bar has no orphan section labels). Pinned by table tests so a group
+ * drift / order drift surfaces at `npm test`.
+ *
+ * Returned shape: array of `{ group, buttons }` in the canonical group
+ * order (Lifecycle → Operational → Chain → Export) so the operator's
+ * eye lands on the NAV-ladder actions first, then operational,
+ * then chain, then export. */
+export function groupButtons(
+  buttons: DetailActionButton[],
+): { group: ActionGroup; buttons: DetailActionButton[] }[] {
+  const order: ActionGroup[] = ["Lifecycle", "Operational", "Chain", "Export"];
+  const grouped: Map<ActionGroup, DetailActionButton[]> = new Map();
+  for (const button of buttons) {
+    const { group } = detailActionMeta(button);
+    const existing = grouped.get(group) ?? [];
+    existing.push(button);
+    grouped.set(group, existing);
+  }
+  return order
+    .filter((g) => grouped.has(g))
+    .map((g) => ({ group: g, buttons: grouped.get(g)! }));
+}
+
+/** PR-80 / session-102 — Hungarian section labels rendered above each
+ * group of buttons. Pinned so a label drift surfaces. */
+export function actionGroupLabel(group: ActionGroup): {
+  label_hu: string;
+  label_en: string;
+} {
+  switch (group) {
+    case "Lifecycle":
+      return { label_hu: "NAV státusz", label_en: "NAV lifecycle" };
+    case "Operational":
+      return { label_hu: "Művelet", label_en: "Operational" };
+    case "Chain":
+      return { label_hu: "Számlalánc", label_en: "Invoice chain" };
+    case "Export":
+      return { label_hu: "Export", label_en: "Export" };
   }
 }

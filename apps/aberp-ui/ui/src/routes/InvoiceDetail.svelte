@@ -171,6 +171,7 @@
     parseNavUpstreamFault,
     pollAck,
     submitInvoice,
+    type BankAccountSnapshot,
     type Currency,
     type InvoiceDetail,
     type MarkPaidRequest,
@@ -182,7 +183,13 @@
     labelMeta,
     type LabelSignal,
   } from "../lib/labels";
-  import { buttonsForState } from "../lib/invoice-actions";
+  import {
+    actionGroupLabel,
+    buttonsForState,
+    detailActionMeta,
+    groupButtons,
+    type DetailActionButton,
+  } from "../lib/invoice-actions";
   import {
     filenameForInvoice,
     formatHufEquivalent,
@@ -227,6 +234,7 @@
       baseInvoiceId: string,
       baseCurrency: Currency,
       baseInvoiceNumber: string,
+      baseBankAccount: BankAccountSnapshot | null,
     ) => void;
   }
 
@@ -279,6 +287,20 @@
         navFault: NavUpstreamFault | null;
       };
   let mutationState: MutationState = $state({ kind: "idle" });
+
+  // PR-80 / session-102 — inline storno confirm panel. The pre-PR-80
+  // posture (PR-47α) used a browser-native `window.confirm()` which
+  // pops a modal-over-modal that visually disconnects the confirmation
+  // from the invoice being cancelled (the operator sees a tiny dialog
+  // and a long block of explanatory text, not the invoice they're
+  // about to storno). PR-80 elevates this to an in-place panel within
+  // the action bar that surfaces the invoice's identifying fields
+  // alongside the explanatory copy. `stornoConfirmOpen` is the simple
+  // open-state flag; the confirm + cancel handlers below close it.
+  // Reason field is named-deferred (the backend's
+  // `cancel_invoice_storno` route accepts no body — collecting a
+  // reason that goes nowhere would violate CLAUDE.md rule 12).
+  let stornoConfirmOpen: boolean = $state(false);
 
   // PR-70 / ADR-0039 — mark-as-paid modal state. The modal is a
   // small inline <dialog> driven by `paymentDialogOpen` rather than
@@ -356,6 +378,10 @@
       // currency + total).
       paymentDialogOpen = false;
       payFormError = null;
+      // PR-80 / session-102 — close the inline storno confirm panel
+      // on navigation so a half-typed confirm doesn't leak into the
+      // next inspection context.
+      stornoConfirmOpen = false;
       void load(invoiceId);
     } else {
       if (dialogEl.open) dialogEl.close();
@@ -369,6 +395,7 @@
       mutationState = { kind: "idle" };
       paymentDialogOpen = false;
       payFormError = null;
+      stornoConfirmOpen = false;
     }
   });
 
@@ -507,33 +534,50 @@
     const baseNumber = `${detail.fiscal_year}-${String(
       detail.sequence_number,
     ).padStart(6, "0")}`;
-    onAmend(detail.invoice_id, detail.currency, baseNumber);
+    // PR-80 / session-102 — pass the base's bank-account snapshot
+    // through so the modification form can surface the inherited
+    // bank readout. Modification chain children inherit the bank
+    // from the base (ADR-0040 §addendum); the form's readout lets
+    // the operator confirm the routing before submitting.
+    onAmend(detail.invoice_id, detail.currency, baseNumber, detail.bank_account);
   }
 
-  // PR-47α / session-64 — "Cancel invoice (storno)" button handler.
-  // POSTs to `/api/invoices/<id>/storno` via the matching Tauri
-  // command. A small `confirm` dialog runs first so a stray click
-  // doesn't burn a sequence number — the storno carves a fresh
-  // sequence slot (ADR-0023 §3) and writes three audit-ledger rows,
-  // none of which are reversible. On success refetches the base's
-  // detail so the chip flips to `Storno`, the audit-trail picks up
-  // the `InvoiceStornoIssued` chain-link row, and the `chain_children`
-  // list grows to include the new storno's id. The inline confirm
-  // uses the browser-native `window.confirm` to avoid a new modal
-  // component (CLAUDE.md rule 13 — no toast component, mirror
-  // posture for confirm).
-  async function triggerCancelStorno() {
+  // PR-47α / session-64 — "Cancel invoice (storno)" handlers. Two-
+  // stage flow per PR-80 / session-102:
+  //
+  //   1. `triggerOpenStornoConfirm` — opens the inline confirm panel
+  //      below the action bar. The panel shows the invoice's
+  //      identifying fields + an explanation of what storno does +
+  //      Confirm / Cancel buttons. No NAV call yet.
+  //
+  //   2. `triggerConfirmStorno` — fires the actual POST to
+  //      `/api/invoices/<id>/storno` via the matching Tauri command.
+  //      On success refetches the base's detail so the chip flips to
+  //      `Storno`, the audit-trail picks up the `InvoiceStornoIssued`
+  //      chain-link row, and the `chain_children` list grows to
+  //      include the new storno's id. On failure the typed NAV-upstream
+  //      fault renders inline like the other mutation routes.
+  //
+  // The pre-PR-80 posture wrapped both stages behind a single
+  // `window.confirm()` which visually disconnected the confirmation
+  // from the invoice being cancelled — a stray click on the modal-
+  // over-modal dialog was the only thing between the operator and an
+  // irreversible audit-ledger write. The inline panel keeps the
+  // invoice's identifying fields visible alongside the explanatory
+  // copy so the operator confirms with the regulatory record on
+  // screen, not a tiny browser dialog.
+  function triggerOpenStornoConfirm() {
     if (!detail) return;
-    const number = `${detail.fiscal_year}-${String(
-      detail.sequence_number,
-    ).padStart(6, "0")}`;
-    const ok = window.confirm(
-      `Cancel invoice ${number}?\n\n` +
-        `A storno will be issued in the same currency at the same exchange rate. ` +
-        `This carves a fresh sequence number and writes three audit-ledger rows; ` +
-        `it cannot be reversed.`,
-    );
-    if (!ok) return;
+    stornoConfirmOpen = true;
+  }
+
+  function triggerCancelStornoConfirm() {
+    stornoConfirmOpen = false;
+  }
+
+  async function triggerConfirmStorno() {
+    if (!detail) return;
+    stornoConfirmOpen = false;
     mutationState = { kind: "cancelling" };
     try {
       await cancelInvoiceStorno(detail.invoice_id);
@@ -651,6 +695,56 @@
     return `signal-${signal}`;
   }
 
+  // PR-80 / session-102 — dispatch the matching handler for the
+  // operator-clicked action button. Routes through `detailActionMeta`'s
+  // closed-vocab so a new variant requires a paired arm here (the
+  // TypeScript exhaustiveness check on the switch surfaces a missing
+  // arm at `npm run check`).
+  function dispatchAction(button: DetailActionButton): void {
+    switch (button) {
+      case "Submit":
+        void triggerSubmit();
+        return;
+      case "PollAck":
+        void triggerPollAck();
+        return;
+      case "Pay":
+        triggerOpenMarkPaid();
+        return;
+      case "Storno":
+        triggerOpenStornoConfirm();
+        return;
+      case "Modification":
+        triggerModification();
+        return;
+      case "Download":
+        void triggerDownload();
+        return;
+    }
+  }
+
+  // PR-80 / session-102 — Hungarian busy-state label per button. A
+  // regression that collapsed every busy state to "…" would erase the
+  // affordance during the most ambiguous part of the flow (the
+  // operator clicked → something is happening → what?). Keeping the
+  // labels visible during the spinner reads as a professional product.
+  function actionBusyLabel(button: DetailActionButton): string {
+    switch (button) {
+      case "Submit":
+        return "Beküldés folyamatban…";
+      case "PollAck":
+        return "Lekérés folyamatban…";
+      case "Pay":
+        return "Fizetés rögzítése…";
+      case "Storno":
+        return "Sztornózás folyamatban…";
+      case "Modification":
+        return "Módosítás…";
+      case "Download":
+        return "Letöltés…";
+    }
+  }
+
   // ESC + backdrop dismiss both fire the native `close` event; we
   // mirror it back to the parent so the parent's `selectedId` resets.
   // Without this, a second click on the same row would not re-open
@@ -741,120 +835,154 @@
         <h2 class="detail-id mono">{invoiceId ?? ""}</h2>
       </div>
       <div class="detail-actions">
-        {#if detail}
-          {@const buttons = buttonsForState(detail.state, detail.payment !== null)}
-          {@const mutationBusy =
-            mutationState.kind === "submitting" ||
-            mutationState.kind === "polling" ||
-            mutationState.kind === "cancelling" ||
-            mutationState.kind === "paying"}
-          {#if buttons.includes("Submit")}
-            <button
-              type="button"
-              class="quiet-button"
-              onclick={triggerSubmit}
-              disabled={mutationBusy}
-              aria-label={mutationState.kind === "submitting"
-                ? "Submitting invoice to NAV"
-                : "Submit invoice to NAV"}
-            >
-              {#if mutationState.kind === "submitting"}
-                <span aria-hidden="true">…</span> Submitting
-              {:else}
-                Submit to NAV
-              {/if}
-            </button>
-          {/if}
-          {#if buttons.includes("PollAck")}
-            <button
-              type="button"
-              class="quiet-button"
-              onclick={triggerPollAck}
-              disabled={mutationBusy}
-              aria-label={mutationState.kind === "polling"
-                ? "Polling NAV for ack status"
-                : "Poll NAV for ack status now"}
-            >
-              {#if mutationState.kind === "polling"}
-                <span aria-hidden="true">…</span> Polling
-              {:else}
-                Poll ack now
-              {/if}
-            </button>
-          {/if}
-          {#if buttons.includes("Pay")}
-            <button
-              type="button"
-              class="quiet-button"
-              onclick={triggerOpenMarkPaid}
-              disabled={mutationBusy}
-              aria-label={mutationState.kind === "paying"
-                ? "Recording payment"
-                : "Mark invoice as paid"}
-            >
-              {#if mutationState.kind === "paying"}
-                <span aria-hidden="true">…</span> Recording payment
-              {:else}
-                💰 Mark as paid
-              {/if}
-            </button>
-          {/if}
-          {#if buttons.includes("Storno")}
-            <button
-              type="button"
-              class="quiet-button"
-              onclick={triggerCancelStorno}
-              disabled={mutationBusy}
-              aria-label={mutationState.kind === "cancelling"
-                ? "Cancelling invoice via storno"
-                : "Cancel invoice (storno)"}
-            >
-              {#if mutationState.kind === "cancelling"}
-                <span aria-hidden="true">…</span> Cancelling
-              {:else}
-                Cancel invoice (storno)
-              {/if}
-            </button>
-          {/if}
-          {#if buttons.includes("Modification")}
-            <button
-              type="button"
-              class="quiet-button"
-              onclick={triggerModification}
-              disabled={mutationBusy}
-              aria-label="Amend invoice with a modification"
-            >
-              Amend invoice (modification)
-            </button>
-          {/if}
-          {#if buttons.includes("Download")}
-            <button
-              type="button"
-              class="quiet-button"
-              onclick={triggerDownload}
-              disabled={downloadState === "downloading" || mutationBusy}
-              aria-label={downloadState === "downloading"
-                ? "Downloading invoice PDF"
-                : "Download invoice PDF"}
-            >
-              {#if downloadState === "downloading"}
-                <span aria-hidden="true">…</span> Downloading
-              {:else}
-                Download PDF
-              {/if}
-            </button>
-          {/if}
-        {/if}
         <button
           type="button"
           class="quiet-button"
           onclick={() => dialogEl?.close()}
           aria-label="Close invoice detail"
+          title="Bezárás"
         >
-          Close
+          Bezár
         </button>
       </div>
     </header>
+
+    <!-- PR-80 / session-102 — operator action bar. The pre-PR-80 posture
+         packed every button into the modal header's `.detail-actions`
+         row with no visual hierarchy; the operator scanned an
+         ambiguous strip of buttons with no signal about which actions
+         move through the NAV ladder versus which spawn chain children
+         versus which export an artifact. PR-80 elevates this to a
+         dedicated action bar sectioned by `groupButtons`: Lifecycle
+         (NAV submit/poll) → Operational (Pay) → Chain (Storno /
+         Modification) → Export (Download). Each section carries a
+         bilingual label; buttons within a section render with a
+         consistent glyph + Hungarian label + tooltip vocabulary
+         sourced from `detailActionMeta` so the affordance is identical
+         to the row-level quick-action surface. -->
+    {#if detail}
+      {@const buttons = buttonsForState(detail.state, detail.payment !== null)}
+      {@const groups = groupButtons(buttons)}
+      {@const mutationBusy =
+        mutationState.kind === "submitting" ||
+        mutationState.kind === "polling" ||
+        mutationState.kind === "cancelling" ||
+        mutationState.kind === "paying"}
+      {#if groups.length > 0}
+        <div class="action-bar" role="toolbar" aria-label="Számla műveletek">
+          {#each groups as group (group.group)}
+            {@const groupLabel = actionGroupLabel(group.group)}
+            <div
+              class="action-group"
+              data-group={group.group}
+              data-testid={`action-group-${group.group}`}
+            >
+              <p class="action-group-label" title={groupLabel.label_en}>
+                {groupLabel.label_hu}
+              </p>
+              <div class="action-group-buttons">
+                {#each group.buttons as button (button)}
+                  {@const meta = detailActionMeta(button)}
+                  {@const busy =
+                    (button === "Submit" && mutationState.kind === "submitting") ||
+                    (button === "PollAck" && mutationState.kind === "polling") ||
+                    (button === "Pay" && mutationState.kind === "paying") ||
+                    (button === "Storno" && mutationState.kind === "cancelling") ||
+                    (button === "Download" && downloadState === "downloading")}
+                  {@const disabled =
+                    (button === "Download"
+                      ? downloadState === "downloading" || mutationBusy
+                      : mutationBusy) ||
+                    (button === "Storno" && stornoConfirmOpen)}
+                  <button
+                    type="button"
+                    class="action-button {busy ? 'action-button-busy' : ''}"
+                    onclick={() => dispatchAction(button)}
+                    disabled={disabled}
+                    aria-label={meta.label_en}
+                    title={meta.tooltip_hu}
+                    data-testid={`action-button-${button}`}
+                  >
+                    {#if busy}
+                      <span class="action-glyph" aria-hidden="true">…</span>
+                      <span class="action-label">
+                        {actionBusyLabel(button)}
+                      </span>
+                    {:else}
+                      <span class="action-glyph" aria-hidden="true"
+                        >{meta.glyph}</span
+                      >
+                      <span class="action-label">{meta.label_hu}</span>
+                    {/if}
+                  </button>
+                {/each}
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+
+      <!-- PR-80 / session-102 — inline storno confirm panel. Replaces
+           the pre-PR-80 `window.confirm()` modal-over-modal that
+           visually disconnected the confirmation from the invoice
+           being cancelled. The panel surfaces the invoice's
+           identifying fields alongside the explanatory copy so the
+           operator confirms with the regulatory record on screen. -->
+      {#if stornoConfirmOpen}
+        <div
+          class="storno-confirm"
+          role="alertdialog"
+          aria-labelledby="storno-confirm-title"
+          data-testid="storno-confirm-panel"
+        >
+          <p id="storno-confirm-title" class="storno-confirm-title">
+            <span aria-hidden="true">⊘</span>
+            Sztornó megerősítése
+          </p>
+          <dl class="storno-confirm-grid">
+            <dt>Számlaszám</dt>
+            <dd class="mono">
+              {detail.fiscal_year}-{String(detail.sequence_number).padStart(
+                6,
+                "0",
+              )}
+            </dd>
+            <dt>Pénznem</dt>
+            <dd class="mono">{detail.currency}</dd>
+            <dt>Bruttó végösszeg</dt>
+            <dd class="mono">
+              {formatTotal(detail.total_gross, detail.currency)}
+            </dd>
+          </dl>
+          <p class="storno-confirm-copy">
+            Egy ellentétes előjelű sztornó számla kerül kiállításra
+            ugyanezen a pénznemen és árfolyamon. Új sorszámot foglal le
+            (ADR-0023 §3), és három audit-bejegyzést ír; ez a művelet
+            <strong>nem visszafordítható</strong>. A beküldéshez ezután
+            külön NAV beküldés szükséges.
+          </p>
+          <div class="storno-confirm-actions">
+            <button
+              type="button"
+              class="action-button"
+              onclick={triggerCancelStornoConfirm}
+              data-testid="storno-confirm-cancel"
+            >
+              <span class="action-label">Mégse</span>
+            </button>
+            <button
+              type="button"
+              class="action-button action-button-danger"
+              onclick={triggerConfirmStorno}
+              data-testid="storno-confirm-accept"
+            >
+              <span class="action-glyph" aria-hidden="true">⊘</span>
+              <span class="action-label">Igen, sztornózás</span>
+            </button>
+          </div>
+        </div>
+      {/if}
+    {/if}
     {#if downloadState === "error" && downloadError}
       <p class="error download-error" role="alert">
         Download failed: {downloadError}
@@ -1041,6 +1169,32 @@
           {/if}
         </dd>
       </dl>
+
+      <!-- PR-82 — buyer-facing notes ("Megjegyzés") section. Renders
+           when the operator typed an invoice-level note OR at least
+           one line carries a per-line note. Both come from the
+           detail wire shape; the printed PDF shows the same content.
+           NEVER on the NAV XML wire — see ADR-0042. -->
+      {#if detail.invoice_note !== null || detail.line_notes.length > 0}
+        <h3 class="section-head">Megjegyzés / Note</h3>
+        {#if detail.invoice_note !== null}
+          <p class="invoice-note-text" data-testid="detail-invoice-note">
+            {detail.invoice_note}
+          </p>
+        {/if}
+        {#if detail.line_notes.length > 0}
+          <ul class="line-notes-list" data-testid="detail-line-notes">
+            {#each detail.line_notes as ln (ln.ordinal)}
+              <li>
+                <span class="line-note-prefix">
+                  Line {ln.ordinal + 1} ({ln.description}):
+                </span>
+                <span class="line-note-text">{ln.note}</span>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      {/if}
 
       {#if detail.chain_children.length > 0}
         <h3 class="section-head">Chain children</h3>
@@ -1362,17 +1516,181 @@
     opacity: 0.7;
   }
 
-  /* PR-44ε.UI — header actions row. The pre-PR-44ε.UI header carried
-   * only the Close button; we now add a Download-PDF sibling. A
-   * `.detail-actions` flex wrapper keeps the two buttons aligned
-   * horizontally with consistent spacing — secondary (download)
-   * leading, primary-by-position (close) trailing per ADR-0017's
-   * quiet-chrome posture (no primary-accent button; both stay
-   * `.quiet-button`). */
+  /* PR-44ε.UI — header actions row. PR-80 lifted the operator action
+   * buttons out into a dedicated `.action-bar` (see below); this row
+   * now only carries the Close button. */
   .detail-actions {
     display: flex;
     gap: var(--space-2);
     align-items: center;
+  }
+
+  /* PR-80 / session-102 — operator action bar. Sectioned by
+   * `groupButtons` into Lifecycle / Operational / Chain / Export so
+   * the operator scans a coherent hierarchy. Each section's header
+   * is a quiet uppercase label per the dt/dd label convention
+   * (ADR-0017 §1-2). Buttons within a section sit on a raised
+   * surface so the action bar reads as a distinct workspace zone
+   * within the modal. */
+  .action-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+    margin: 0 0 var(--space-4) 0;
+    padding: var(--space-3);
+    background: var(--color-surface-sunken);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: var(--radius-md, 6px);
+  }
+
+  .action-group {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    /* Keep groups visually distinct via a vertical hairline rather
+     * than another box — too many nested boxes flatten the hierarchy.
+     * The hairline lives on the LEFT of every group except the
+     * first, drawn via the next-sibling combinator below. */
+  }
+
+  .action-group + .action-group {
+    padding-left: var(--space-4);
+    border-left: 1px solid var(--color-surface-divider);
+  }
+
+  .action-group-label {
+    margin: 0;
+    text-transform: uppercase;
+    font-size: var(--type-size-xs);
+    letter-spacing: 0.06em;
+    color: var(--color-text-secondary);
+    cursor: help;
+  }
+
+  .action-group-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  /* PR-80 / session-102 — operator action button. Sized larger than
+   * the chrome-quiet `.quiet-button` so the action bar reads as the
+   * operator's primary task surface; still uses the dense token
+   * vocabulary (no accent colour by default; the danger variant for
+   * destructive confirms uses the negative signal token). */
+  .action-button {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    background: var(--color-surface-raised);
+    color: var(--color-text-primary);
+    border: 1px solid var(--color-surface-divider);
+    padding: var(--space-2) var(--space-3);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    cursor: pointer;
+    transition: color var(--motion-fade-in), border-color var(--motion-fade-in);
+    min-height: 2rem;
+  }
+
+  .action-button:hover:not(:disabled) {
+    color: var(--color-text-strong);
+    border-color: var(--color-text-muted);
+  }
+
+  .action-button:focus-visible {
+    outline: 1px solid var(--color-text-muted);
+    outline-offset: 2px;
+  }
+
+  .action-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  .action-button-busy {
+    cursor: progress !important;
+    opacity: 0.8;
+  }
+
+  .action-button-danger {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
+  }
+
+  .action-button-danger:hover:not(:disabled) {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
+    background: var(--color-surface-base);
+  }
+
+  .action-glyph {
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-md);
+    line-height: 1;
+  }
+
+  .action-label {
+    line-height: 1.2;
+  }
+
+  /* PR-80 / session-102 — inline storno confirm panel. Sits below the
+   * action bar with a clear destructive-action affordance. The
+   * left-border accent in the negative-signal colour signals
+   * "irreversible" without screaming. */
+  .storno-confirm {
+    margin: 0 0 var(--space-4) 0;
+    padding: var(--space-3) var(--space-4);
+    background: var(--color-surface-sunken);
+    border: 1px solid var(--color-signal-negative);
+    border-left: 4px solid var(--color-signal-negative);
+    border-radius: var(--radius-md, 6px);
+    animation: aberp-fade-in var(--motion-fade-in) both;
+  }
+
+  .storno-confirm-title {
+    margin: 0 0 var(--space-2) 0;
+    color: var(--color-signal-negative);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-md);
+    font-weight: 600;
+  }
+
+  .storno-confirm-grid {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: var(--space-1) var(--space-3);
+    margin: 0 0 var(--space-3) 0;
+    font-size: var(--type-size-sm);
+  }
+
+  .storno-confirm-grid dt {
+    text-transform: uppercase;
+    font-size: var(--type-size-xs);
+    letter-spacing: 0.06em;
+    color: var(--color-text-secondary);
+  }
+
+  .storno-confirm-grid dd {
+    margin: 0;
+    color: var(--color-text-strong);
+  }
+
+  .storno-confirm-copy {
+    margin: 0 0 var(--space-3) 0;
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-sm);
+    line-height: var(--type-line-normal);
+  }
+
+  .storno-confirm-copy strong {
+    color: var(--color-signal-negative);
+  }
+
+  .storno-confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
   }
 
   /* PR-44ε.UI — inline download-error message. Same `.error` styling
@@ -1667,6 +1985,36 @@
     flex-direction: column;
     gap: var(--space-1);
     font-size: var(--type-size-sm);
+  }
+
+  /* PR-82 — buyer-facing notes section. Plain-text rendering matches
+   * the printed-PDF surface; the operator's preview of what the
+   * buyer sees. Whitespace preserved so multi-line notes look right. */
+  .invoice-note-text {
+    white-space: pre-wrap;
+    margin: 0 0 var(--space-4) 0;
+    font-size: var(--type-size-sm);
+    color: var(--color-text-primary);
+  }
+
+  .line-notes-list {
+    list-style: none;
+    margin: 0 0 var(--space-5) 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: var(--type-size-sm);
+  }
+
+  .line-note-prefix {
+    color: var(--color-text-muted);
+    margin-right: var(--space-1);
+  }
+
+  .line-note-text {
+    white-space: pre-wrap;
+    color: var(--color-text-primary);
   }
 
   /* PR-27 — disclosure-triangle toggle for the per-row payload

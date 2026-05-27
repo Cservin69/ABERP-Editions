@@ -48,6 +48,7 @@ fn build_minimal_modification_invoice() -> ReadyInvoice {
             // negation (contrast with STORNO emitter).
             unit_price: Huf(1200),
             vat_rate_basis_points: 2700,
+            note: None,
         }],
         issue_date: OffsetDateTime::now_utc(),
     }

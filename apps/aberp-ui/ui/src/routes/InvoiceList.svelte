@@ -48,7 +48,7 @@
     type LabelSignal,
   } from "../lib/labels";
   import { formatTotal, filenameForInvoice } from "../lib/format";
-  import type { Currency } from "../lib/api";
+  import type { BankAccountSnapshot, Currency } from "../lib/api";
   import {
     buyerColumnDisplay,
     quickActionMeta,
@@ -117,6 +117,10 @@
     baseInvoiceId: string;
     baseCurrency: Currency;
     baseInvoiceNumber: string;
+    /** PR-80 / session-102 — base invoice's bank-account snapshot
+     * forwarded into the modify form so it can render the inherited
+     * bank readout. `null` for CLI-issued bases (no snapshot). */
+    baseBankAccount: BankAccountSnapshot | null;
   } | null = $state(null);
 
   // PR-65 / session-86 — per-row quick-action state. One row at a
@@ -584,11 +588,12 @@
     onClose={() => (navStack = [])}
     onNavigate={(baseId) => (navStack = [...navStack, baseId])}
     onJumpBack={(index) => (navStack = navStack.slice(0, index + 1))}
-    onAmend={(baseInvoiceId, baseCurrency, baseInvoiceNumber) =>
+    onAmend={(baseInvoiceId, baseCurrency, baseInvoiceNumber, baseBankAccount) =>
       (modificationContext = {
         baseInvoiceId,
         baseCurrency,
         baseInvoiceNumber,
+        baseBankAccount,
       })}
   />
 
@@ -610,6 +615,7 @@
     baseInvoiceId={modificationContext?.baseInvoiceId ?? null}
     baseCurrency={modificationContext?.baseCurrency ?? null}
     baseInvoiceNumber={modificationContext?.baseInvoiceNumber ?? null}
+    baseBankAccount={modificationContext?.baseBankAccount ?? null}
     onClose={() => (modificationContext = null)}
     onAmended={(newInvoiceId) => {
       // PR-47β — close the modification modal + refresh the list +

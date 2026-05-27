@@ -234,6 +234,11 @@ where
             // the surface that populates this field (same posture as
             // `rate_metadata` per the PR-44γ comment above).
             bank_snapshot: None,
+            // PR-82 — buyer-facing global note ("Megjegyzés"). Same
+            // posture as `bank_snapshot`: the binary's SPA-issue route
+            // is the surface that threads the operator-typed value;
+            // the in-process handler defaults to None.
+            invoice_note: None,
         },
         issue_date,
     )?;

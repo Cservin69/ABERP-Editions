@@ -96,6 +96,7 @@ fn fixture_lines() -> Vec<LineJson> {
         quantity: 1,
         unit_price: 10_000,
         vat_rate_percent: 27,
+        note: None,
     }]
 }
 
@@ -106,6 +107,7 @@ fn fixture_request(currency: Currency, bank_account_id: Option<String>) -> Issue
         currency,
         series: None,
         bank_account_id,
+        invoice_note: None,
     }
 }
 

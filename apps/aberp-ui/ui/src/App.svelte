@@ -59,6 +59,7 @@
     type AppRoute,
   } from "./lib/router";
   import InvoiceList from "./routes/InvoiceList.svelte";
+  import MaintenanceDashboard from "./routes/MaintenanceDashboard.svelte";
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
   import PartnersList from "./routes/PartnersList.svelte";
   import SellerConfigWizard from "./routes/SellerConfigWizard.svelte";
@@ -103,12 +104,13 @@
 
   // Click handler for the topbar's area-swap button. Navigates to
   // the default route of the *other* area (operational ↔
-  // maintenance). The "default route" is the first route of the
-  // first module in that area per `defaultRouteForArea` —
-  // operational → "invoices", maintenance → "partners". A future
-  // PR could add a per-area landing dashboard (e.g. tile grid for
-  // maintenance) and swap the entry point here; ADR-0041 §3 leaves
-  // that as a deliberate future widening.
+  // maintenance). PR-79 / session 102 elevated the maintenance
+  // area's entry point from the first-module-first-route fall-
+  // through (PR-78: `partners`) to its own landing dashboard at
+  // `#/maintenance` — the operator now sees a glanceable tile grid
+  // of master-data + settings before drilling in. Operational stays
+  // bare per the roadmap Tier-3 pushback: the Invoice list IS the
+  // daily-driver home, no dashboard widget set.
   function swapArea() {
     const target: ErpArea =
       activeArea === "operational" ? "maintenance" : "operational";
@@ -379,6 +381,8 @@
           <NavCredentialsSettings />
         {:else if route === "partners"}
           <PartnersList />
+        {:else if route === "maintenance"}
+          <MaintenanceDashboard />
         {:else}
           <InvoiceList />
         {/if}
@@ -580,13 +584,16 @@
     padding: var(--space-4) 0;
   }
 
-  /* The maintenance area gets a faintly distinct surface so the
-   * operator immediately recognises "I am in the configuration
-   * area, not in my daily workflow". The shift is subtle (a
-   * slightly different tone) — strong enough to be a cue, not
-   * strong enough to feel like a different app. */
+  /* PR-78 + PR-79 — the maintenance area gets a distinct surface so
+   * the operator immediately recognises "I am in the configuration
+   * area, not in my daily workflow". PR-78 shipped subtle (one
+   * surface step); PR-79 bumps it one notch — uses the sunken
+   * surface (darker than operational's raised) so the chrome reads
+   * as visibly a different space without crossing into "different
+   * app". Pair with the area-caption accent stripe below for the
+   * "you are here" cue at glance. */
   .sidenav[data-area="maintenance"] {
-    background: var(--color-surface-base, var(--color-surface-raised));
+    background: var(--color-surface-sunken, var(--color-surface-base));
   }
 
   /* Area caption at the top of the sidebar. Tells the operator
@@ -604,6 +611,15 @@
     text-transform: uppercase;
     letter-spacing: 0.1em;
     color: var(--color-text-strong);
+  }
+
+  /* PR-79 — area-caption accent stripe in maintenance mode. A short
+   * left-edge bar in the warning color gives the "you are not in
+   * your daily workflow" cue at glance. Absent in operational so
+   * the daily-driver chrome stays unaffected. One CSS rule. */
+  .sidenav[data-area="maintenance"] .sidenav__area-caption {
+    border-left: 3px solid var(--color-signal-warning);
+    padding-left: calc(var(--space-4) - 3px);
   }
 
   /* PR-78 / session 101 — two-level sidebar (ADR-0041 §3). Outer

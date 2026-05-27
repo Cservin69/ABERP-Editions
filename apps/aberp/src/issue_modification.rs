@@ -281,6 +281,11 @@ pub fn modification_from_inputs(
         currency: Currency::Huf,
         rate_metadata: None,
         bank_snapshot: None,
+        // PR-82 — modification-level note ("Megjegyzés") is out of
+        // scope for PR-82's chain paths. Per-line notes inherited from
+        // the base flow through `draft.lines[i].note` naturally.
+        // Chain-level note threading lands at PR-83.
+        invoice_note: None,
     };
 
     let outcome = run_single_tx(
@@ -889,6 +894,13 @@ fn build_modification_command(
             quantity: l.quantity,
             unit_price: Huf(l.unit_price),
             vat_rate_basis_points: percent_to_basis_points(l.vat_rate_percent),
+            // PR-82 — pass through any per-line note. Modification
+            // chains inherit the base's notes naturally; operator-
+            // facing edits to per-line notes on modifications are
+            // out of scope for PR-82 (PR-83 wires the storno-reason
+            // surface; a future PR can extend to modification-line
+            // notes if needed).
+            note: l.note.clone(),
         })
         .collect();
     Ok(IssueInvoiceCommand {

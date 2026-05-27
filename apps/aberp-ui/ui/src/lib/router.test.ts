@@ -15,12 +15,13 @@ import {
 } from "./router";
 
 describe("parseRoute", () => {
-  it("maps the four canonical slugs verbatim", () => {
+  it("maps the five canonical slugs verbatim", () => {
     const cases: { hash: string; expected: AppRoute }[] = [
       { hash: "#/invoices", expected: "invoices" },
       { hash: "#/tenant", expected: "tenant" },
       { hash: "#/nav-credentials", expected: "nav-credentials" },
       { hash: "#/partners", expected: "partners" },
+      { hash: "#/maintenance", expected: "maintenance" },
     ];
     for (const { hash, expected } of cases) {
       expect(parseRoute(hash)).toBe(expected);
@@ -53,6 +54,7 @@ describe("routeHash", () => {
     expect(routeHash("tenant")).toBe(`${HASH_PREFIX}tenant`);
     expect(routeHash("nav-credentials")).toBe(`${HASH_PREFIX}nav-credentials`);
     expect(routeHash("partners")).toBe(`${HASH_PREFIX}partners`);
+    expect(routeHash("maintenance")).toBe(`${HASH_PREFIX}maintenance`);
   });
 
   it("round-trips with parseRoute", () => {
@@ -63,6 +65,7 @@ describe("routeHash", () => {
       "tenant",
       "nav-credentials",
       "partners",
+      "maintenance",
     ];
     for (const r of all) {
       expect(parseRoute(routeHash(r))).toBe(r);

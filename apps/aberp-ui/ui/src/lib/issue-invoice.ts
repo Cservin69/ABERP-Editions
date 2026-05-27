@@ -25,6 +25,11 @@ export interface LineFormState {
   quantity: number;
   unitPriceMinor: number;
   vatRatePercent: number;
+  /** PR-82 — operator-typed per-line note ("Megjegyzés"). Empty
+   * string when blank; `composeIssueInvoiceBody` normalises to
+   * `null` on the wire so the backend sees a clean "no note"
+   * signal. Recipient-facing only — NEVER reaches the NAV XML. */
+  note: string;
 }
 
 /** PR-44ζ — top-level form state. Captures every operator-typed
@@ -61,6 +66,12 @@ export interface IssueInvoiceFormState {
    * resolver treats `null` the same as missing-field and falls back
    * to the per-currency default. */
   bankAccountId: string | null;
+  /** PR-82 — operator-typed per-invoice global note ("Megjegyzés").
+   * Empty string when the textarea is blank; the composer
+   * normalises to `null` on the wire so the backend sees a clean
+   * "no note" signal. Recipient-facing only — NEVER reaches the
+   * NAV InvoiceData XML. */
+  invoiceNote: string;
 }
 
 /** PR-44ζ — sensible defaults for an empty form. The 27% VAT rate is
@@ -85,6 +96,8 @@ export function emptyForm(): IssueInvoiceFormState {
     // IssueInvoice.svelte effect re-runs whenever `currency` changes
     // and pre-populates this from the currency's `is_default` entry.
     bankAccountId: null,
+    // PR-82 — invoice-level note seeds blank; operator opt-in.
+    invoiceNote: "",
   };
 }
 
@@ -95,6 +108,8 @@ export function emptyLine(): LineFormState {
     quantity: 1,
     unitPriceMinor: 0,
     vatRatePercent: 27,
+    // PR-82 — per-line note seeds blank; operator opt-in.
+    note: "",
   };
 }
 
@@ -373,6 +388,10 @@ export function composeIssueInvoiceBody(
       quantity: l.quantity,
       unitPrice: l.unitPriceMinor,
       vatRatePercent: l.vatRatePercent,
+      // PR-82 — per-line buyer note. Trim + normalise empty to
+      // `null` so the backend's preflight / persistence path sees a
+      // clean "no note" signal rather than a blank-string row.
+      note: blankToNull(l.note),
     })),
     currency: form.currency,
     // PR-73 / ADR-0040 §addendum — operator-selected bank account.
@@ -383,7 +402,23 @@ export function composeIssueInvoiceBody(
       form.bankAccountId !== null && form.bankAccountId.trim() !== ""
         ? form.bankAccountId
         : null,
+    // PR-82 — per-invoice global buyer note. Same blank-to-null
+    // normalisation as per-line notes; the backend's `Option<String>`
+    // deserialiser treats `null` and an absent field identically.
+    invoiceNote: blankToNull(form.invoiceNote),
   };
+}
+
+/** PR-82 — trim + normalise a form-supplied note string to `null`
+ * when blank, `string` otherwise. Centralised so the per-line and
+ * per-invoice note channels share one rule (empty-after-trim ⇒
+ * `null`). The backend's note channel is `Option<String>`; passing
+ * `Some("")` would be wire-confusing and litter the DuckDB column
+ * with empty strings that the renderer would then filter out anyway. */
+function blankToNull(raw: string | null | undefined): string | null {
+  if (raw === null || raw === undefined) return null;
+  const trimmed = raw.trim();
+  return trimmed === "" ? null : trimmed;
 }
 
 /** PR-77 / session-101 — build the customer-address body shape from

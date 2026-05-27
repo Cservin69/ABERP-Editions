@@ -70,6 +70,7 @@ fn build_allocate_args(series_id: SeriesId, idem: IdempotencyKey) -> AllocateArg
                 quantity: 1,
                 unit_price: Huf(1_000),
                 vat_rate_basis_points: 2700,
+                note: None,
             }],
             issue_date: OffsetDateTime::now_utc(),
         },
@@ -82,6 +83,7 @@ fn build_allocate_args(series_id: SeriesId, idem: IdempotencyKey) -> AllocateArg
         // (per the comment there): in-process callers pass `None`;
         // only the SPA-issue route populates this field.
         bank_snapshot: None,
+        invoice_note: None,
     }
 }
 

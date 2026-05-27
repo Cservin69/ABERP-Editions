@@ -97,6 +97,7 @@ fn build_allocate_args(series_id: SeriesId) -> AllocateArgs {
                 quantity: 1,
                 unit_price: Huf(1_000),
                 vat_rate_basis_points: 2700,
+                note: None,
             }],
             issue_date: OffsetDateTime::now_utc(),
         },
@@ -107,6 +108,7 @@ fn build_allocate_args(series_id: SeriesId) -> AllocateArgs {
         currency: aberp_billing::Currency::Huf,
         rate_metadata: None,
         bank_snapshot: None,
+        invoice_note: None,
     }
 }
 

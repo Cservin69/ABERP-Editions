@@ -319,6 +319,26 @@ export interface InvoiceDetail {
    * non-null; the renderer falls back to "(no bank account on file)"
    * on `null`. */
   bank_account: BankAccountSnapshot | null;
+  /** PR-82 — buyer-facing per-invoice global note ("Megjegyzés").
+   * `null` when the operator did not annotate the invoice at
+   * issuance. The detail modal renders this in a "Megjegyzés"
+   * section so the operator previews what the buyer will see on
+   * the printed PDF. NEVER on the NAV XML wire. */
+  invoice_note: string | null;
+  /** PR-82 — buyer-facing per-line notes. Empty array when no
+   * line carries a note. Each entry is keyed by the original
+   * line's zero-based `ordinal` and carries the line description
+   * + the note text. The detail modal renders this beneath the
+   * global note so the operator sees "Line 1 (Widget A): ...". */
+  line_notes: LineNoteView[];
+}
+
+/** PR-82 — one row in the detail-modal's per-line note list.
+ * Mirrors `serve::LineNoteView`. */
+export interface LineNoteView {
+  ordinal: number;
+  description: string;
+  note: string;
 }
 
 /** `GET /health` response — `serve::HealthResponse`. */
@@ -410,6 +430,11 @@ export interface IssueInvoiceRequest {
     quantity: number;
     unitPrice: number;
     vatRatePercent: number;
+    /** PR-82 — buyer-facing per-line note ("Megjegyzés"). Optional;
+     * the SPA emits `null` for unannotated lines so the backend
+     * sees a clean "no note" signal. NEVER reaches the NAV
+     * InvoiceData XML — recipient-facing only. */
+    note?: string | null;
   }>;
   currency: Currency;
   /** Optional series code; backend defaults to `"INV-default"` when
@@ -423,6 +448,12 @@ export interface IssueInvoiceRequest {
    * `is_default: true` entry and lets the operator switch to any
    * other entry for that currency. */
   bankAccountId?: string | null;
+  /** PR-82 — buyer-facing per-invoice global note ("Megjegyzés").
+   * Optional; `null` when the operator left the textarea blank. The
+   * backend persists it on `invoice.invoice_note` and stamps it on
+   * the audit payload; the printed PDF + SPA detail view render it
+   * for buyer + operator preview. NEVER on the NAV XML wire. */
+  invoiceNote?: string | null;
 }
 
 /** PR-44ζ / session-59 — wire response body for `POST /invoices/issue`.

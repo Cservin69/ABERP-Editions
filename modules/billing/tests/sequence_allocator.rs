@@ -66,6 +66,7 @@ fn one_line() -> LineItem {
         quantity: 1,
         unit_price: Huf(1_000),
         vat_rate_basis_points: 2700, // 27% Hungarian standard rate
+        note: None,
     }
 }
 

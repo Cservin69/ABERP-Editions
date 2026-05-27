@@ -36,6 +36,7 @@
   import {
     amendInvoiceModification,
     getIssuanceInput,
+    type BankAccountSnapshot,
     type Currency,
     type Partner,
   } from "../lib/api";
@@ -62,6 +63,17 @@
      * "INV-default/00013") — surfaced in the banner so the operator
      * confirms they're modifying the right invoice. */
     baseInvoiceNumber: string | null;
+    /** PR-80 / session-102 — base invoice's bank-account snapshot, so
+     * the modify form can render a read-only "inherited bank account"
+     * affordance. Modification chain children inherit the bank from
+     * the base implicitly (the backend's `issue_modification` stamps
+     * the base's snapshot onto the new modification's invoice row);
+     * the form shows what the inherited bank IS so the operator
+     * confirms the right routing before submitting. `null` for
+     * CLI-issued bases (no snapshot on the base) or any forward-compat
+     * gap; the form falls back to a muted "inherited from base"
+     * placeholder in that case. */
+    baseBankAccount: BankAccountSnapshot | null;
     /** Invoked with the freshly-issued modification's id when the
      * backend returns 200. The parent uses this to navigate the
      * detail modal to the NEW modification invoice. */
@@ -71,8 +83,14 @@
     onClose: () => void;
   }
 
-  let { baseInvoiceId, baseCurrency, baseInvoiceNumber, onAmended, onClose }:
-    Props = $props();
+  let {
+    baseInvoiceId,
+    baseCurrency,
+    baseInvoiceNumber,
+    baseBankAccount,
+    onAmended,
+    onClose,
+  }: Props = $props();
 
   let dialogEl: HTMLDialogElement | null = $state(null);
   let form: ModificationFormState = $state(emptyModificationForm("HUF"));
@@ -170,6 +188,8 @@
           quantity: 1,
           unitPriceMinor: 0,
           vatRatePercent: 27,
+          // PR-82 — fresh line has no buyer note; operator opt-in.
+          note: "",
         },
       ],
     };
@@ -323,21 +343,44 @@
     </fieldset>
 
     <fieldset disabled={modalState === "prefilling"}>
-      <legend>Chain</legend>
+      <legend>Számlalánc / Chain</legend>
       <label>
-        <span>Currency (locked to base)</span>
+        <span>Pénznem (örökölt — locked to base)</span>
         <select bind:value={form.currency} disabled>
           <option value={form.currency}>{form.currency}</option>
         </select>
       </label>
       <label>
-        <span>Modification date</span>
+        <span>Módosítás dátuma / Modification date</span>
         <input
           type="date"
           bind:value={form.modificationDate}
           required
         />
       </label>
+      <!-- PR-80 / session-102 — inherited bank readout. Modification
+           chain children inherit the bank-account snapshot from the
+           base (backend's `issue_modification` stamps the base's
+           snapshot onto the new invoice row); the form surfaces what
+           the inherited bank IS so the operator confirms the routing
+           before submitting. Display-only — no picker, because the
+           inheritance is the rule (ADR-0040 §addendum). -->
+      <div class="inherited-bank" data-testid="modification-inherited-bank">
+        <span class="inherited-bank-label">
+          Örökölt bankszámla / Inherited bank account
+        </span>
+        {#if baseBankAccount === null}
+          <span class="inherited-bank-empty mono">
+            — (alap számlán nincs banki adat — base has no bank snapshot)
+          </span>
+        {:else}
+          <div class="inherited-bank-grid mono">
+            <span>{baseBankAccount.bank_name}</span>
+            <span>{baseBankAccount.account_number}</span>
+            <span>SWIFT/BIC: {baseBankAccount.swift_bic}</span>
+          </div>
+        {/if}
+      </div>
     </fieldset>
 
     <fieldset disabled={modalState === "prefilling"}>
@@ -587,5 +630,43 @@
     margin: 0;
     white-space: pre-wrap;
     word-break: break-word;
+  }
+
+  /* PR-80 / session-102 — inherited-bank readout. Display-only — no
+   * input affordance because the inheritance is the rule. Same dt/dd
+   * label convention as the rest of the form's fieldsets. */
+  .inherited-bank {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-secondary);
+    flex: 1 1 auto;
+  }
+
+  .inherited-bank-label {
+    font-size: var(--type-size-xs);
+    color: var(--color-text-secondary);
+  }
+
+  .inherited-bank-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--space-1) var(--space-2);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: var(--radius-sm, 3px);
+    color: var(--color-text-strong);
+    font-size: var(--type-size-sm);
+  }
+
+  .inherited-bank-empty {
+    color: var(--color-text-muted);
+    font-size: var(--type-size-sm);
+    padding: var(--space-1) var(--space-2);
+    background: var(--color-surface-raised);
+    border: 1px dashed var(--color-surface-divider);
+    border-radius: var(--radius-sm, 3px);
   }
 </style>

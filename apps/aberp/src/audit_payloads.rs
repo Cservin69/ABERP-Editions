@@ -187,6 +187,22 @@ pub struct InvoiceDraftCreatedPayload {
     pub bank_account_bank_name: Option<String>,
     #[serde(default)]
     pub bank_account_swift_bic: Option<String>,
+    /// PR-82 — buyer-facing per-invoice global note ("Megjegyzés").
+    /// `Some(text)` when the operator typed a note at issuance; `None`
+    /// otherwise. NEVER carried into the NAV InvoiceData XML — the
+    /// emitter does not read this field. Pre-PR-82 entries
+    /// deserialise with `invoice_note: None` via `#[serde(default)]`.
+    /// See `adr/0042-invoice-notes-never-in-nav-xml.md` for the
+    /// load-bearing invariant.
+    #[serde(default)]
+    pub invoice_note: Option<String>,
+    /// PR-82 — buyer-facing per-line notes ("Megjegyzés") in ordinal
+    /// order. `line_notes[i]` is the note for ordinal-i; `None` for
+    /// unannotated lines. Empty vec on pre-PR-82 entries via
+    /// `#[serde(default)]`. For post-PR-82 entries `line_notes.len()`
+    /// matches `line_count` — a drift indicates ledger tampering.
+    #[serde(default)]
+    pub line_notes: Vec<Option<String>>,
 }
 
 impl InvoiceDraftCreatedPayload {
@@ -211,6 +227,8 @@ impl InvoiceDraftCreatedPayload {
             bank_account_number: None,
             bank_account_bank_name: None,
             bank_account_swift_bic: None,
+            invoice_note: None,
+            line_notes: Vec::new(),
         }
     }
 
@@ -248,6 +266,8 @@ impl InvoiceDraftCreatedPayload {
             bank_account_number: None,
             bank_account_bank_name: None,
             bank_account_swift_bic: None,
+            invoice_note: None,
+            line_notes: Vec::new(),
         }
     }
 
@@ -288,6 +308,8 @@ impl InvoiceDraftCreatedPayload {
             bank_account_number: None,
             bank_account_bank_name: None,
             bank_account_swift_bic: None,
+            invoice_note: None,
+            line_notes: Vec::new(),
         }
     }
 
@@ -306,6 +328,25 @@ impl InvoiceDraftCreatedPayload {
             self.bank_account_bank_name = Some(b.bank_name.clone());
             self.bank_account_swift_bic = Some(b.swift_bic.clone());
         }
+        self
+    }
+
+    /// PR-82 — stamp buyer-facing notes onto an existing payload
+    /// (post-`from_invoice_*` step). Reads each `LineItem.note` off the
+    /// invoice's lines so the operator-twin's record of "what was
+    /// issued" matches the printed PDF byte-for-byte. The
+    /// `invoice_note` argument carries the operator-typed per-invoice
+    /// global note (or `None` when absent).
+    ///
+    /// Idempotent — calling twice with the same invoice replays the
+    /// same Vec into `line_notes`. Used by `issue_invoice::run_single_tx`
+    /// (fresh issuance) and by the chain-issue paths
+    /// (`issue_storno` / `issue_modification`) when they thread inherited
+    /// line notes through. PR-82 wires it on the fresh-issuance path
+    /// only — chain inheritance of notes lands at PR-83.
+    pub fn with_notes(mut self, invoice: &ReadyInvoice, invoice_note: Option<&str>) -> Self {
+        self.invoice_note = invoice_note.map(|s| s.to_string());
+        self.line_notes = invoice.lines.iter().map(|l| l.note.clone()).collect();
         self
     }
 
@@ -1714,12 +1755,14 @@ mod tests {
                     quantity: 2,
                     unit_price: Huf(1_500),
                     vat_rate_basis_points: 2700,
+                    note: None,
                 },
                 LineItem {
                     description: "ünïcödé and other non-ASCII: 日本語".to_string(),
                     quantity: 1,
                     unit_price: Huf(500),
                     vat_rate_basis_points: 2700,
+                    note: None,
                 },
             ],
             issue_date: OffsetDateTime::now_utc(),

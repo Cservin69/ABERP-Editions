@@ -87,6 +87,11 @@ export function formFromIssuanceInput(
     quantity: l.quantity,
     unitPriceMinor: l.unitPrice,
     vatRatePercent: l.vatRatePercent,
+    // PR-82 — inherit any per-line note recorded on the base's
+    // side-stored issuance input. The modification form keeps the
+    // operator's freedom to edit; the textarea pre-fills with the
+    // base value (empty string for unannotated lines).
+    note: l.note ?? "",
   }));
   return {
     customerTaxNumber: input.customer.taxNumber,
@@ -111,6 +116,9 @@ export function formFromIssuanceInput(
     // Sending `null` keeps the wire shape clean; the backend ignores
     // the wire field for modifications since inheritance is the rule.
     bankAccountId: null,
+    // PR-82 — modification form inherits any invoice-level note from
+    // the base's side-stored issuance input. Operator can edit.
+    invoiceNote: input.invoiceNote ?? "",
   };
 }
 
@@ -137,6 +145,12 @@ export function composeModificationBody(
       quantity: l.quantity,
       unitPrice: l.unitPriceMinor,
       vatRatePercent: l.vatRatePercent,
+      // PR-82 — pass through any per-line note. The backend's
+      // modification route does not yet wire chain-level note
+      // editing into the audit payload (named-deferred until an
+      // operational need surfaces); the persisted line shape still
+      // carries the note via the standard allocator path.
+      note: l.note.trim() === "" ? null : l.note.trim(),
     })),
     currency: form.currency,
     modificationDate: form.modificationDate.trim(),

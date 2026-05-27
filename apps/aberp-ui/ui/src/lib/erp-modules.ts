@@ -133,11 +133,26 @@ export function moduleForRoute(route: AppRoute): ErpModule | null {
 /** Derive the active area for the route the operator is currently
  * on. The chrome uses this to (a) decide which area's modules to
  * render in the sidebar and (b) decide which area the topbar's
- * area-swap button targets. Falls back to "operational" for
- * unknown routes — `parseRoute` already routes unknowns to the
- * default `invoices` route, so this branch is defence-in-depth. */
+ * area-swap button targets.
+ *
+ * Resolution order:
+ *   1. A module owns the route → that module's area.
+ *   2. The route is an area-landing (`AREA_LANDING_ROUTES`) →
+ *      that landing's area (PR-79 — the maintenance dashboard's
+ *      home route).
+ *   3. Defence-in-depth fallback "operational" for unknown routes
+ *      (`parseRoute` already routes unknowns to the default
+ *      `invoices` route, so this branch is rarely hit). */
 export function areaForRoute(route: AppRoute): ErpArea {
-  return moduleForRoute(route)?.area ?? "operational";
+  const owner = moduleForRoute(route);
+  if (owner !== null) return owner.area;
+  for (const [area, landing] of Object.entries(AREA_LANDING_ROUTES) as [
+    ErpArea,
+    AppRoute,
+  ][]) {
+    if (landing === route) return area;
+  }
+  return "operational";
 }
 
 /** Return every module belonging to a given area, preserving the
@@ -147,22 +162,122 @@ export function modulesInArea(area: ErpArea): ErpModule[] {
   return MODULES.filter((m) => m.area === area);
 }
 
-/** The first (display-order) route the chrome should navigate to
- * when the operator enters an area via the topbar's area-swap
- * affordance. By convention: the first route of the first module in
- * that area. Today: operational → "invoices", maintenance →
- * "partners". Returns `null` if the area has no modules at all (a
- * registry inconsistency a future pin would catch).
+/** PR-79 / session 102 — per-area landing route. The chrome's
+ * area-swap (topbar gear) navigates to the landing for the target
+ * area; the landing is the area's "home". Today:
  *
- * This is the chrome's "entry point" answer for each area. If a
- * future PR adds a per-area landing dashboard (e.g. a tile grid for
- * maintenance), the dashboard route would either become the entry
- * point here or live alongside as an explicit `/maintenance` route
- * — ADR-0041 §3 explicitly leaves that as a future widening, not
- * required for PR-78. */
+ *   - operational → no landing route; the area's daily-driver
+ *     screen (Invoices) IS the home, so the entry point falls
+ *     through to the first module's first route.
+ *   - maintenance → "maintenance" — a tile-grid dashboard that
+ *     glances at each maintenance module + live status counts
+ *     (partner count, bank-account count, NAV cred presence).
+ *     PR-79 ships this dashboard.
+ *
+ * The closed-vocab `AREA_LANDING_ROUTES` table is the single source
+ * of truth: the route-coverage pin in `erp-modules.test.ts` exempts
+ * these from per-module ownership (they are AREA affordances, not
+ * MODULE routes), and `defaultRouteForArea` consults this table
+ * first before falling through to the first-module-first-route
+ * default. Adding a future operational dashboard is a one-line
+ * widening here. */
+export const AREA_LANDING_ROUTES: Partial<Record<ErpArea, AppRoute>> = {
+  maintenance: "maintenance",
+};
+
+/** PR-78 / PR-79 — the route the chrome's area-swap (topbar gear)
+ * navigates to when entering an area. PR-79 elevates the maintenance
+ * area to its own landing dashboard route (`#/maintenance`); the
+ * operational area keeps the pre-existing fall-through to the first
+ * module's first route (`#/invoices`) because that is the area's
+ * actual daily-driver home, not a dashboard.
+ *
+ * Returns `null` only for an empty area with no landing — a registry
+ * inconsistency the pin would catch. */
 export function defaultRouteForArea(area: ErpArea): AppRoute | null {
+  const landing = AREA_LANDING_ROUTES[area];
+  if (landing !== undefined) return landing;
   const modules = modulesInArea(area);
   if (modules.length === 0) return null;
   const firstRoute = modules[0].routes[0];
   return firstRoute?.id ?? null;
 }
+
+// ── PR-79 / session 102 — maintenance dashboard tile config ────────────
+//
+// The maintenance landing dashboard (`#/maintenance`) renders a tile
+// grid: one tile per *route* in the maintenance area. Each tile shows
+// a bilingual label + description plus a live "status" — a small
+// glance metric fetched from an existing read-only backend route. The
+// statusKind is a closed-vocab discriminator the dashboard component
+// dispatches on; adding a new status-kind is a deliberate one-line
+// widening here + a render arm in the component (CLAUDE.md rule 7,
+// surface conflicts don't average them).
+//
+// Pinned by `erp-modules.test.ts`:
+//   - tile shape (non-empty fields, bilingual labels + descriptions),
+//   - one tile per non-landing maintenance route,
+//   - every tile's moduleId resolves to a maintenance-area module,
+//   - every tile's route is a maintenance-area route owned by its
+//     declared moduleId,
+//   - the statusKind set matches the closed vocab.
+
+/** Closed-vocab status discriminator on a maintenance tile. The
+ * dashboard component dispatches on this to pick the read endpoint +
+ * the chip's render. Adding a status kind is an explicit widening
+ * (deny-default) — there is no "Other" or "Unknown" bucket. */
+export type MaintenanceTileStatusKind =
+  | "PartnerCount"
+  | "BankAccountCount"
+  | "NavCredStatus";
+
+/** One tile on the maintenance landing dashboard. The dashboard
+ * renders the tiles grouped under their sub-area headers (today:
+ * MASTER DATA, SETTINGS) — i.e. by the resolved module's id. The
+ * tile knows nothing about fetching; the dashboard component owns
+ * the read calls (failure-isolated per tile per the PR-74/PR-75
+ * loadError + retry pattern). */
+export interface MaintenanceTile {
+  moduleId: ErpModuleId;
+  route: AppRoute;
+  label_hu: string;
+  label_en: string;
+  description_hu: string;
+  description_en: string;
+  statusKind: MaintenanceTileStatusKind;
+}
+
+/** The maintenance landing's tile registry. Display order is the
+ * order here. One tile per non-landing maintenance route — adding a
+ * new maintenance route without a tile fails the coverage pin in
+ * `erp-modules.test.ts`, surfacing as a build error rather than a
+ * silently missing tile on the dashboard. */
+export const MAINTENANCE_TILES: MaintenanceTile[] = [
+  {
+    moduleId: "master-data",
+    route: "partners",
+    label_hu: "Partnerek",
+    label_en: "Partners",
+    description_hu: "Ügyfelek és beszállítók kezelése",
+    description_en: "Manage customers & vendors",
+    statusKind: "PartnerCount",
+  },
+  {
+    moduleId: "settings",
+    route: "tenant",
+    label_hu: "Cégadatok",
+    label_en: "Tenant Settings",
+    description_hu: "Azonosság, bankszámlák, megjelenés",
+    description_en: "Identity, bank accounts, branding",
+    statusKind: "BankAccountCount",
+  },
+  {
+    moduleId: "settings",
+    route: "nav-credentials",
+    label_hu: "NAV hitelesítés",
+    label_en: "NAV Credentials",
+    description_hu: "Technikai felhasználó és kulcsok",
+    description_en: "Technical user & keys",
+    statusKind: "NavCredStatus",
+  },
+];

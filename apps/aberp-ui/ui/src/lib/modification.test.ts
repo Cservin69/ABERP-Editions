@@ -32,6 +32,7 @@ describe("composeModificationBody", () => {
           quantity: 3,
           unitPriceMinor: 1200,
           vatRatePercent: 27,
+          note: "",
         },
       ],
       modificationDate: "2026-05-24",
@@ -41,6 +42,8 @@ describe("composeModificationBody", () => {
       customer: {
         taxNumber: "87654321-2-13",
         name: "Vevő Kft.",
+        // PR-77 — `address: undefined` when the form's address quartet is blank.
+        address: undefined,
       },
       lines: [
         {
@@ -48,6 +51,8 @@ describe("composeModificationBody", () => {
           quantity: 3,
           unitPrice: 1200,
           vatRatePercent: 27,
+          // PR-82 — blank-after-trim ⇒ null on the wire.
+          note: null,
         },
       ],
       currency: "HUF",
@@ -78,6 +83,7 @@ describe("composeModificationBody", () => {
           quantity: 1,
           unitPriceMinor: 100,
           vatRatePercent: 27,
+          note: "",
         },
       ],
     };
@@ -116,12 +122,14 @@ describe("formFromIssuanceInput", () => {
           quantity: 2,
           unitPrice: 1000,
           vatRatePercent: 27,
+          note: "",
         },
         {
           description: "Widget B",
           quantity: 1,
           unitPrice: 5000,
           vatRatePercent: 5,
+          note: "",
         },
       ],
       currency: "EUR",
@@ -136,12 +144,14 @@ describe("formFromIssuanceInput", () => {
         quantity: 2,
         unitPriceMinor: 1000,
         vatRatePercent: 27,
+        note: "",
       },
       {
         description: "Widget B",
         quantity: 1,
         unitPriceMinor: 5000,
         vatRatePercent: 5,
+        note: "",
       },
     ]);
     // modificationDate defaults to today; the operator can overwrite.
@@ -163,6 +173,7 @@ describe("formFromIssuanceInput", () => {
           quantity: 1,
           unitPrice: 1,
           vatRatePercent: 27,
+          note: "",
         },
       ],
       currency: "HUF", // body says HUF…

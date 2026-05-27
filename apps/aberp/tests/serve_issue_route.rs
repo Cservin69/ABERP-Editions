@@ -109,6 +109,7 @@ fn fixture_lines() -> Vec<LineJson> {
         quantity: 2,
         unit_price: 1000,
         vat_rate_percent: 27,
+        note: None,
     }]
 }
 
@@ -119,6 +120,7 @@ fn fixture_request(currency: Currency) -> IssueInvoiceRequest {
         currency,
         series: None,
         bank_account_id: None,
+        invoice_note: None,
     }
 }
 
@@ -387,6 +389,7 @@ async fn issue_route_rejects_empty_lines_with_loud_error() {
         currency: Currency::Huf,
         series: None,
         bank_account_id: None,
+        invoice_note: None,
     };
 
     let err = serve::issue_invoice_request(
@@ -433,6 +436,7 @@ async fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
         currency: Currency::Huf,
         series: None,
         bank_account_id: None,
+        invoice_note: None,
     };
 
     // PR-53 / session-73 — supplier comes via the new arg, not the

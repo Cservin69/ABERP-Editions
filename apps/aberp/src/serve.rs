@@ -1995,6 +1995,37 @@ struct InvoiceDetailResponse {
     /// facing surface only; the renderer falls back to "(no bank
     /// account on file)" on `null`.
     bank_account: Option<BankAccountSnapshotResponse>,
+    /// PR-82 — buyer-facing per-invoice global note ("Megjegyzés").
+    /// `Some(text)` when the operator typed a note at issuance; `null`
+    /// otherwise. Surfaced on the detail-modal "Megjegyzés" section so
+    /// the operator can preview what the buyer will see on the printed
+    /// PDF. NEVER on the NAV XML wire — recipient-facing only.
+    invoice_note: Option<String>,
+    /// PR-82 — buyer-facing per-line notes, one entry per annotated
+    /// line. Empty array when no line has a note. Each entry carries
+    /// the ordinal + the line's description (so the operator sees
+    /// "Line 1 (Widget A): leave at the back door") and the note
+    /// text. Pre-PR-82 invoices return an empty array regardless of
+    /// `lines` shape.
+    line_notes: Vec<LineNoteView>,
+}
+
+/// PR-82 — one per-line note row on the detail wire shape. Surfaces
+/// only lines that carry a non-empty `note`; unannotated lines are
+/// omitted so the SPA's renderer can iterate the array directly.
+#[derive(Serialize, Debug, PartialEq, Eq, Clone)]
+struct LineNoteView {
+    /// Zero-based ordinal matching the `invoice_line.ordinal` column.
+    /// The SPA renders this as `Line {ordinal + 1}` to match the
+    /// printed-PDF row numbering.
+    ordinal: u32,
+    /// The line's description, copied verbatim from
+    /// `invoice_line.description` so the operator sees note context
+    /// without the SPA having to issue a separate lines fetch.
+    description: String,
+    /// The per-line note text. Non-empty (empty / whitespace-only
+    /// notes are filtered out at the wire boundary).
+    note: String,
 }
 
 /// PR-32 / session-36 — chain-children list entry. One per storno /
@@ -2339,6 +2370,16 @@ pub struct IssueInvoiceRequest {
     /// `resolve_bank_snapshot` below for the typed loud-fail surface.
     #[serde(default, rename = "bankAccountId")]
     pub bank_account_id: Option<String>,
+    /// PR-82 — buyer-facing per-invoice global note ("Megjegyzés").
+    /// Optional; the SPA's IssueInvoice form surfaces a textarea that
+    /// emits `null` when blank. Persisted on `invoice.invoice_note`
+    /// and stamped on the `InvoiceDraftCreated` audit payload via
+    /// `with_notes`. NEVER reaches the NAV InvoiceData XML —
+    /// recipient-facing only. See
+    /// `adr/0042-invoice-notes-never-in-nav-xml.md`. Per-line notes
+    /// ride on `LineJson.note` inside each `lines[i]`.
+    #[serde(default, rename = "invoiceNote")]
+    pub invoice_note: Option<String>,
 }
 
 /// Response body for `POST /invoices/issue`. The SPA reads
@@ -2911,6 +2952,11 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         supplier,
         customer: request.customer,
         lines: request.lines,
+        // PR-82 — thread the operator-typed global note ("Megjegyzés")
+        // straight from the SPA wire body into the issuance pipeline.
+        // Stored on `invoice.invoice_note`, stamped on the audit payload,
+        // rendered on the printed PDF — NEVER reaches the NAV XML.
+        invoice_note: request.invoice_note,
     };
     // PR-47α / session-64 — side-store the InvoiceInputJson alongside
     // the NAV-XML output path so the SPA storno route can reconstruct
@@ -3978,6 +4024,11 @@ pub fn modification_invoice_request(
         supplier,
         customer: request.customer,
         lines: request.lines,
+        // PR-82 — modification-route does not yet surface an operator
+        // note input on the SPA form; pass `None`. PR-83 wires the
+        // chain-level note (storno reason); the modification surface
+        // can follow when an operational need surfaces.
+        invoice_note: None,
     };
     let series = request.series.as_deref().unwrap_or(DEFAULT_SERIES_CODE);
 
@@ -5845,29 +5896,65 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
     // default `currency` to `Currency::Huf` so the wire shape stays
     // valid; the four rate fields stay `None` because there is no
     // metadata to surface.
-    let (sequence_number, fiscal_year, total_gross, currency_metadata, bank_snapshot) =
-        match billing {
-            Some(row) => (
+    let (
+        sequence_number,
+        fiscal_year,
+        total_gross,
+        currency_metadata,
+        bank_snapshot,
+        invoice_note,
+        line_notes,
+    ) = match billing {
+        Some(row) => {
+            // PR-82 — assemble the per-line notes view by walking
+            // `row.ready_invoice.lines` (which carries each line's
+            // `description` + `note` via the post-PR-82
+            // `load_invoice` read). Filter out unannotated lines so
+            // the SPA renderer can iterate the array directly
+            // without per-row None checks.
+            let line_notes_view: Vec<LineNoteView> = row
+                .ready_invoice
+                .lines
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, line)| {
+                    let note_text = line.note.as_ref()?.trim();
+                    if note_text.is_empty() {
+                        return None;
+                    }
+                    Some(LineNoteView {
+                        ordinal: idx as u32,
+                        description: line.description.clone(),
+                        note: note_text.to_string(),
+                    })
+                })
+                .collect();
+            (
                 row.ready_invoice.sequence_number,
                 row.ready_invoice.fiscal_year,
                 row.ready_invoice.total_gross().map(|h| h.as_i64()),
                 row.currency_metadata,
                 row.bank_snapshot,
-            ),
-            None => (
-                0,
-                0,
-                None,
-                InvoiceCurrencyMetadata {
-                    currency: Currency::Huf,
-                    exchange_rate: None,
-                    exchange_rate_source: None,
-                    exchange_rate_date: None,
-                    huf_equivalent_total: None,
-                },
-                None,
-            ),
-        };
+                row.invoice_note,
+                line_notes_view,
+            )
+        }
+        None => (
+            0,
+            0,
+            None,
+            InvoiceCurrencyMetadata {
+                currency: Currency::Huf,
+                exchange_rate: None,
+                exchange_rate_source: None,
+                exchange_rate_date: None,
+                huf_equivalent_total: None,
+            },
+            None,
+            None,
+            Vec::new(),
+        ),
+    };
     // PR-33 / session-37 — typed wire emit of the latest NAV ack
     // for this invoice. `trace.last_ack_status` carries the raw
     // persisted string from `InvoiceAckStatusPayload.ack_status`;
@@ -5894,6 +5981,12 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         // PR-73 / ADR-0040 §addendum — bank-account snapshot for the
         // SPA's "Pay to" sub-section. `null` for pre-PR-73 / CLI rows.
         bank_account: bank_snapshot.map(BankAccountSnapshotResponse::from_typed),
+        // PR-82 — buyer-facing notes (global + per-line). NEVER on
+        // the NAV XML wire (see ADR-0042); the SPA's
+        // `InvoiceDetail.svelte` renders them so the operator can
+        // preview what the buyer will see on the printed PDF.
+        invoice_note,
+        line_notes,
     }))
 }
 
@@ -6020,6 +6113,13 @@ struct ReadInvoiceRow {
     /// PR-73 / CLI-issued rows (those rows have NULL across all five
     /// columns; `InvoiceBankSnapshot.into_typed()` returns `None`).
     bank_snapshot: Option<aberp_billing::BankAccountSnapshot>,
+    /// PR-82 — buyer-facing per-invoice note ("Megjegyzés") loaded
+    /// from the `invoice.invoice_note` column. `None` for invoices the
+    /// operator did not annotate AND for pre-PR-82 rows (the migration
+    /// added the column without backfill). Per-line notes ride on
+    /// `ready_invoice.lines[i].note` via the billing crate's
+    /// `load_invoice` read.
+    invoice_note: Option<String>,
 }
 
 /// Scoped read tx + billing lookup; returns None if the row is not
@@ -6044,12 +6144,20 @@ fn read_invoice_row(conn: &mut Connection, invoice_id: &str) -> Result<Option<Re
     let bank_snapshot = load_invoice_bank_snapshot_in_tx(&tx, invoice_id)
         .context("load_invoice_bank_snapshot_in_tx (serve)")?
         .into_typed();
+    // PR-82 — read the buyer-facing per-invoice note in the SAME tx so
+    // the list + detail wire surfaces share one read trip with the rest
+    // of the row's data. Per-line notes already round-trip through
+    // `pair.0.lines[i].note` because `load_ready_invoice_by_id` selects
+    // the column.
+    let invoice_note = billing::load_invoice_note_in_tx(&tx, invoice_id)
+        .context("billing::load_invoice_note_in_tx (serve)")?;
     tx.commit().context("commit read transaction (serve)")?;
     Ok(Some(ReadInvoiceRow {
         ready_invoice: pair.0,
         idempotency_key: pair.1,
         currency_metadata,
         bank_snapshot,
+        invoice_note,
     }))
 }
 
@@ -6555,6 +6663,7 @@ mod tests {
                 quantity: 1,
                 unit_price: Huf(69),
                 vat_rate_basis_points: 2700,
+                note: None,
             }],
             issue_date: OffsetDateTime::now_utc(),
         };
@@ -6768,6 +6877,8 @@ mod tests {
             bank_account_number: None,
             bank_account_bank_name: None,
             bank_account_swift_bic: None,
+            invoice_note: None,
+            line_notes: Vec::new(),
         };
         ledger
             .append(
@@ -7611,6 +7722,8 @@ mod tests {
             huf_equivalent_total: None,
             payment: None,
             bank_account: None,
+            invoice_note: None,
+            line_notes: Vec::new(),
         };
         let v = serde_json::to_value(&empty).expect("InvoiceDetailResponse must always serialise");
         let arr = v
@@ -7655,6 +7768,8 @@ mod tests {
             huf_equivalent_total: None,
             payment: None,
             bank_account: None,
+            invoice_note: None,
+            line_notes: Vec::new(),
         };
         let v =
             serde_json::to_value(&with_chain).expect("InvoiceDetailResponse must always serialise");
@@ -7821,6 +7936,8 @@ mod tests {
             huf_equivalent_total: None,
             payment: None,
             bank_account: None,
+            invoice_note: None,
+            line_notes: Vec::new(),
         };
         let v = serde_json::to_value(&none).expect("InvoiceDetailResponse must always serialise");
         assert!(
@@ -7857,6 +7974,8 @@ mod tests {
                 huf_equivalent_total: None,
                 payment: None,
                 bank_account: None,
+                invoice_note: None,
+                line_notes: Vec::new(),
             };
             let v =
                 serde_json::to_value(&some).expect("InvoiceDetailResponse must always serialise");
@@ -8129,6 +8248,8 @@ mod tests {
             huf_equivalent_total: None,
             payment: None,
             bank_account: None,
+            invoice_note: None,
+            line_notes: Vec::new(),
         };
         let v = serde_json::to_value(&huf).expect("InvoiceDetailResponse must always serialise");
         assert_eq!(
@@ -8167,6 +8288,8 @@ mod tests {
             huf_equivalent_total: Some(3_500_565),
             payment: None,
             bank_account: None,
+            invoice_note: None,
+            line_notes: Vec::new(),
         };
         let v = serde_json::to_value(&eur).expect("InvoiceDetailResponse must always serialise");
         assert_eq!(

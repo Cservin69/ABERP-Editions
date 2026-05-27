@@ -93,4 +93,11 @@ pub struct LineItem {
     /// template carries this for periodic-billing invoices; the
     /// renderer hides the row when `None`.
     pub performance_period: Option<(Date, Date)>,
+    /// PR-82 — buyer-facing per-line note ("Megjegyzés"). Optional;
+    /// rendered as an italic sub-line under the description column
+    /// when present, prefixed with the "Megjegyzés:" label so the
+    /// buyer sees it clearly. `None` → no sub-line (the line renders
+    /// at its standard height). Recipient-facing only — comes off the
+    /// DuckDB `invoice_line.note` column, NOT the NAV XML.
+    pub note: Option<String>,
 }

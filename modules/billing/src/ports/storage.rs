@@ -68,6 +68,14 @@ pub struct AllocateArgs {
     /// callers that do not exercise the bank picker. Persisted to the
     /// five nullable DuckDB columns.
     pub bank_snapshot: Option<BankAccountSnapshot>,
+    /// PR-82 — buyer-facing invoice-level note ("Megjegyzés"). Optional;
+    /// when `Some(text)` persisted to `invoice.invoice_note` and
+    /// rendered on the printed PDF + SPA detail view. NEVER emitted into
+    /// the NAV InvoiceData XML — recipient-facing only. See
+    /// `adr/0042-invoice-notes-never-in-nav-xml.md`. Per-line notes ride
+    /// on each `LineItem.note` inside `draft.lines` for the same
+    /// invariant.
+    pub invoice_note: Option<String>,
 }
 
 /// Outcome of an `allocate_and_insert` call. The fresh and replay

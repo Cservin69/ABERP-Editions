@@ -19,7 +19,14 @@
 
 import { describe, expect, it } from "vitest";
 
-import { buttonsForState, type DetailActionButton } from "./invoice-actions";
+import {
+  actionGroupLabel,
+  buttonsForState,
+  detailActionMeta,
+  groupButtons,
+  type ActionGroup,
+  type DetailActionButton,
+} from "./invoice-actions";
 import type { InvoiceState } from "./api";
 
 interface Expected {
@@ -208,6 +215,131 @@ describe("buttonsForState", () => {
       "Modification",
       "Download",
     ]);
+  });
+
+  // ── PR-80 / session-102 — Action metadata + grouping pins ─────────
+
+  it("detailActionMeta returns load-bearing fields for every button", () => {
+    // Pin the closed-vocab metadata table: every variant must surface
+    // a glyph, both labels (HU + EN), a tooltip, and a group. A
+    // regression that omitted any of these would render a half-formed
+    // affordance — the operator would see a button without a label.
+    const all: DetailActionButton[] = [
+      "Submit",
+      "PollAck",
+      "Storno",
+      "Modification",
+      "Pay",
+      "Download",
+    ];
+    for (const button of all) {
+      const meta = detailActionMeta(button);
+      expect(meta.glyph.length).toBeGreaterThan(0);
+      expect(meta.label_hu.length).toBeGreaterThan(0);
+      expect(meta.label_en.length).toBeGreaterThan(0);
+      expect(meta.tooltip_hu.length).toBeGreaterThan(0);
+      expect(["Lifecycle", "Operational", "Chain", "Export"]).toContain(
+        meta.group,
+      );
+    }
+  });
+
+  it("detailActionMeta groups each button into its expected section", () => {
+    // The group assignment is load-bearing: it drives the visual
+    // hierarchy on the action bar. A regression that bucketed Storno
+    // into Lifecycle would render the storno button under the NAV-
+    // ladder section header, misleading the operator about what the
+    // action does.
+    expect(detailActionMeta("Submit").group).toBe("Lifecycle");
+    expect(detailActionMeta("PollAck").group).toBe("Lifecycle");
+    expect(detailActionMeta("Pay").group).toBe("Operational");
+    expect(detailActionMeta("Storno").group).toBe("Chain");
+    expect(detailActionMeta("Modification").group).toBe("Chain");
+    expect(detailActionMeta("Download").group).toBe("Export");
+  });
+
+  it("groupButtons preserves canonical group order", () => {
+    // The canonical order is Lifecycle → Operational → Chain → Export
+    // (matches the operator's eye-flow: NAV-ladder first, operational
+    // recording next, chain children, export last). A regression that
+    // re-ordered the groups would force the operator to re-learn the
+    // layout.
+    const result = groupButtons([
+      "Download",
+      "Storno",
+      "Pay",
+      "Modification",
+      "Submit",
+    ]);
+    expect(result.map((r) => r.group)).toEqual([
+      "Lifecycle",
+      "Operational",
+      "Chain",
+      "Export",
+    ]);
+  });
+
+  it("groupButtons preserves per-group reading order", () => {
+    // Within each group the input order is preserved so the operator
+    // sees the same per-state ordering `buttonsForState` returned.
+    const result = groupButtons(["Storno", "Modification"]);
+    expect(result).toEqual([
+      { group: "Chain", buttons: ["Storno", "Modification"] },
+    ]);
+  });
+
+  it("groupButtons omits empty groups", () => {
+    // A Ready state has [Submit, Download] only; the rendered bar
+    // should NOT show an empty `Operational` or `Chain` section
+    // header (which would render as an orphan label with no buttons).
+    const result = groupButtons(["Submit", "Download"]);
+    expect(result.map((r) => r.group)).toEqual(["Lifecycle", "Export"]);
+  });
+
+  it("groupButtons of buttonsForState('Finalized') yields Operational/Chain/Export", () => {
+    // Mirror-pin: Finalized (unpaid) is the most-action-rich state on
+    // the regulatory ladder — Pay (Operational), Storno+Modification
+    // (Chain), Download (Export). Lifecycle is empty because the
+    // NAV ladder has already terminated at SAVED. A regression
+    // collapsing a section would surface as a missing label here.
+    const buttons = buttonsForState("Finalized", false);
+    const groups = groupButtons(buttons).map((g) => g.group);
+    expect(groups).toEqual(["Operational", "Chain", "Export"]);
+  });
+
+  it("groupButtons of buttonsForState('Ready') yields Lifecycle/Export", () => {
+    // Pre-submission state — Submit (Lifecycle) + Download (Export).
+    // The Operational and Chain sections are absent so their labels
+    // don't render.
+    const buttons = buttonsForState("Ready", false);
+    const groups = groupButtons(buttons).map((g) => g.group);
+    expect(groups).toEqual(["Lifecycle", "Export"]);
+  });
+
+  it("groupButtons of buttonsForState('Submitted') yields Lifecycle/Export", () => {
+    // Mid-flight state — PollAck (Lifecycle) + Download (Export).
+    // No operational or chain actions until the NAV ladder
+    // terminates.
+    const buttons = buttonsForState("Submitted", false);
+    const groups = groupButtons(buttons).map((g) => g.group);
+    expect(groups).toEqual(["Lifecycle", "Export"]);
+  });
+
+  it("actionGroupLabel returns bilingual labels for every group", () => {
+    // Closed-vocab guard: every ActionGroup variant has a bilingual
+    // label. A new variant would force this test to fail at the
+    // TypeScript exhaustiveness check on the switch.
+    const groups: ActionGroup[] = [
+      "Lifecycle",
+      "Operational",
+      "Chain",
+      "Export",
+    ];
+    for (const group of groups) {
+      const label = actionGroupLabel(group);
+      expect(label.label_hu.length).toBeGreaterThan(0);
+      expect(label.label_en.length).toBeGreaterThan(0);
+    }
   });
 
   it("Pay button is never shown on non-Finalized states regardless of paid", () => {
