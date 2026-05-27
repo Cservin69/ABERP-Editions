@@ -675,10 +675,20 @@ fn write_note(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) {
     let mut y = top - 14;
     if has_rate_note {
         if let Some(rate) = m.rate_metadata.as_ref() {
+            // PR-86 / session-111 — surface the rate-publication date
+            // so the operator and buyer can see WHICH date's MNB rate
+            // was applied. The date may differ from the supply date
+            // when MNB walked back to a prior publication (weekend,
+            // holiday, before that day's publish time) per the
+            // ADR-0037 §2.b walk-back rule. Format mirrors the
+            // Hungarian short-date convention used by the date block
+            // (`YYYY.MM.DD.`).
             let note = format!(
-                "1 {} = {} Ft",
+                "1 {} = {} Ft ({}, {})",
                 m.currency.iso_code(),
                 format::rate_for_display(&rate.rate.to_string()),
+                rate.source,
+                format::hungarian_date(rate.date),
             );
             text(ops, "FI", 9, MARGIN_LEFT, y, &note);
             y -= 12;

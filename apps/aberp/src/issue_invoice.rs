@@ -994,6 +994,20 @@ pub async fn fetch_and_stamp_rate<P: MnbRatesProvider + ?Sized>(
             Err(MnbError::NoRateForCurrency { .. }) => {
                 continue;
             }
+            // PR-86 / session-111 — also walk back on HTTP 404. MNB
+            // historically signalled "no publication for this date"
+            // with an empty `<MNBExchangeRates>` payload (which the
+            // parser surfaces as `NoRateForCurrency`), but at
+            // session-111 implementation time the live endpoint was
+            // observed to additionally return bare `HTTP 404` for
+            // dates with no publication. Operationally these are the
+            // same condition (no rate exists for that date) and the
+            // Hungarian invoicing rule is identical: fall back to the
+            // most-recent prior publication. Other HTTP status codes
+            // (5xx, 403, etc.) still loud-fail per ADR-0037 §4 C2.
+            Err(MnbError::HttpStatus { status: 404 }) => {
+                continue;
+            }
             Err(other) => {
                 return Err(anyhow!(
                     "{} for {} on {}: {}",

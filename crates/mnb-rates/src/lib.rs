@@ -53,10 +53,18 @@ use tracing::{debug, error, info, warn};
 
 use aberp_billing::Currency;
 
-/// MNB GetExchangeRates SOAP endpoint. HTTPS form per ADR-0007
-/// §Transport hygiene; MNB also serves the plain `http://` URL but
-/// TLS is the right default when both work.
-pub const MNB_ENDPOINT_URL: &str = "https://www.mnb.hu/arfolyamok.asmx";
+/// MNB GetExchangeRates SOAP endpoint.
+///
+/// **PR-86 / session-111 — HTTP, not HTTPS.** The `https://` form
+/// returns `HTTP/1.1 404 Not Found` + `Clear-Site-Data: *` for SOAP
+/// POSTs as of session 111 (the response shape suggests an Akamai /
+/// TS-cookie WAF that rejects unbrowserlike POSTs to the TLS edge).
+/// The plain `http://` form continues to accept and answer SOAP
+/// requests with `HTTP/1.1 200 OK`. ADR-0007 §Transport hygiene's
+/// "prefer TLS" guidance is overridden HERE — at this single host —
+/// because MNB no longer serves the API over TLS. Live-verified at
+/// session-111 implementation time; revisit if MNB restores TLS.
+pub const MNB_ENDPOINT_URL: &str = "http://www.mnb.hu/arfolyamok.asmx";
 
 /// Default per-request timeout. MNB's GetExchangeRates is fast
 /// (single-digit-second p99 historically); 10 seconds gives generous

@@ -15,9 +15,10 @@ import {
 } from "./router";
 
 describe("parseRoute", () => {
-  it("maps the five canonical slugs verbatim", () => {
+  it("maps the six canonical slugs verbatim", () => {
     const cases: { hash: string; expected: AppRoute }[] = [
       { hash: "#/invoices", expected: "invoices" },
+      { hash: "#/invoices-new", expected: "invoices-new" },
       { hash: "#/tenant", expected: "tenant" },
       { hash: "#/nav-credentials", expected: "nav-credentials" },
       { hash: "#/partners", expected: "partners" },
@@ -51,6 +52,7 @@ describe("parseRoute", () => {
 describe("routeHash", () => {
   it("composes the canonical hash form for each route", () => {
     expect(routeHash("invoices")).toBe(`${HASH_PREFIX}invoices`);
+    expect(routeHash("invoices-new")).toBe(`${HASH_PREFIX}invoices-new`);
     expect(routeHash("tenant")).toBe(`${HASH_PREFIX}tenant`);
     expect(routeHash("nav-credentials")).toBe(`${HASH_PREFIX}nav-credentials`);
     expect(routeHash("partners")).toBe(`${HASH_PREFIX}partners`);
@@ -62,6 +64,7 @@ describe("routeHash", () => {
     // renames a slug in one without the other would surface here.
     const all: AppRoute[] = [
       "invoices",
+      "invoices-new",
       "tenant",
       "nav-credentials",
       "partners",

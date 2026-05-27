@@ -17,10 +17,16 @@
  * management screen + the typeahead's owner); PR-79 added
  * `maintenance` (the maintenance-area landing dashboard — the
  * destination of the topbar gear, with a tile grid of the area's
- * modules + live status counts). Extending the union is a one-line
- * change here + a render arm in `App.svelte`. */
+ * modules + live status counts); PR-86 / session-111 added
+ * `invoices-new` (the full-page IssueInvoice form, promoted from a
+ * modal-on-top-of-the-list to a routable surface so the operator can
+ * deep-link / bookmark / browser-back the issuance flow and so the
+ * surface itself can be as large as the operator's screen for a
+ * legally-binding document review). Extending the union is a one-
+ * line change here + a render arm in `App.svelte`. */
 export type AppRoute =
   | "invoices"
+  | "invoices-new"
   | "tenant"
   | "nav-credentials"
   | "partners"
@@ -58,6 +64,8 @@ export function parseRoute(hash: string): AppRoute {
   switch (slug) {
     case "invoices":
       return "invoices";
+    case "invoices-new":
+      return "invoices-new";
     case "tenant":
       return "tenant";
     case "nav-credentials":

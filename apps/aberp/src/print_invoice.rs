@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use aberp_audit_ledger::{BinaryHash, EventKind, Ledger, TenantId};
-use aberp_billing::{self as billing, Currency, RateMetadata};
+use aberp_billing::{self as billing, BankAccountSnapshot, Currency, RateMetadata};
 use aberp_invoice_pdf::{render_invoice, InvoiceModel, LineItem as PdfLine, PartyInfo};
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
@@ -64,6 +64,7 @@ use time::Date;
 use crate::audit_payloads::InvoiceDraftCreatedPayload;
 use crate::binary_hash;
 use crate::cli::PrintInvoiceArgs;
+use crate::invoice_bank_snapshot::load_invoice_bank_snapshot_in_tx;
 
 // ──────────────────────────────────────────────────────────────────────
 // Entry points
@@ -191,15 +192,30 @@ pub fn render_to_bytes(
     let seller_info = read_seller_toml(&seller_toml_path)
         .with_context(|| format!("read seller-info TOML at {}", seller_toml_path.display()))?;
 
-    // 6. Build the renderer model.
+    // PR-86 / session-111 — read the per-invoice bank snapshot stamped
+    // at issuance (PR-73 / ADR-0040 §addendum-C). For invoices issued
+    // after PR-73, this is the regulatory record of WHICH bank
+    // account the operator chose at issuance time — it survives
+    // operator edits to `seller.toml` after the fact. PRE-PR-73
+    // invoices return an empty snapshot; the renderer falls back to
+    // the legacy flat-root fields read from `seller.toml` for those
+    // rows so historical re-renders stay byte-stable.
+    let bank_snapshot = load_invoice_bank_snapshot(db, invoice_id)
+        .with_context(|| format!("load bank snapshot for invoice {invoice_id} (PR-86)"))?;
+
+    // 6. Build the renderer model. The supplier's bank block prefers
+    //    the per-invoice snapshot (PR-86) and falls back to the
+    //    legacy `seller.toml` flat-root fields only when no snapshot
+    //    was stamped (pre-PR-73 invoices).
+    let supplier_bank = supplier_bank_fields(bank_snapshot.as_ref(), &seller_info);
     let supplier = PartyInfo {
         name: parsed.supplier_name.clone(),
         address_lines: parsed.supplier_address_lines.clone(),
         tax_number: parsed.supplier_tax_number.clone(),
-        bank_account_number: seller_info.bank_account_number.clone(),
-        iban: seller_info.iban.clone(),
-        bank_name: seller_info.bank_name.clone(),
-        swift_bic: seller_info.swift_bic.clone(),
+        bank_account_number: supplier_bank.bank_account_number,
+        iban: supplier_bank.iban,
+        bank_name: supplier_bank.bank_name,
+        swift_bic: supplier_bank.swift_bic,
     };
     let customer = PartyInfo {
         name: parsed.customer_name.clone(),
@@ -810,6 +826,102 @@ pub fn load_invoice_notes(db: &Path, invoice_id: &str) -> Result<InvoiceNotes> {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// PR-86 — per-invoice bank snapshot read
+// ──────────────────────────────────────────────────────────────────────
+
+/// PR-86 / session-111 — load the per-invoice bank snapshot off the
+/// `invoice` row (PR-73's denormalised `bank_account_*` columns).
+/// Returns `Ok(Some(snapshot))` when all five columns are populated
+/// (post-PR-73 invoices), `Ok(None)` when the snapshot is empty
+/// (pre-PR-73 invoices), and an `Err` only on real I/O / schema
+/// corruption.
+///
+/// Same defensive posture as [`load_invoice_notes`]: a stand-alone
+/// audit-ledger-only DB (where the `invoice` table doesn't exist)
+/// returns `Ok(None)` so test harnesses constructing such DBs don't
+/// have to scaffold a phantom snapshot.
+pub fn load_invoice_bank_snapshot(
+    db: &Path,
+    invoice_id: &str,
+) -> Result<Option<BankAccountSnapshot>> {
+    let mut conn = Connection::open(db)
+        .with_context(|| format!("open tenant DuckDB for bank snapshot at {}", db.display()))?;
+    let tx = conn
+        .transaction()
+        .context("begin read transaction for bank snapshot lookup")?;
+    let table_present: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = 'invoice';",
+            [],
+            |r| r.get(0),
+        )
+        .context("probe invoice table existence")?;
+    if table_present == 0 {
+        tx.commit().context("commit snapshot-read tx (no tables)")?;
+        return Ok(None);
+    }
+    let raw = load_invoice_bank_snapshot_in_tx(&tx, invoice_id)
+        .context("load_invoice_bank_snapshot_in_tx (print)")?;
+    tx.commit().context("commit snapshot-read tx")?;
+    Ok(raw.into_typed())
+}
+
+/// PR-86 — bank fields ready for the renderer's [`PartyInfo`] block.
+/// One small struct rather than a four-tuple so the field meanings
+/// stay explicit at the call site in `render_to_bytes`.
+struct SupplierBankFields {
+    bank_account_number: Option<String>,
+    iban: Option<String>,
+    bank_name: Option<String>,
+    swift_bic: Option<String>,
+}
+
+/// PR-86 / session-111 — resolve the supplier bank block.
+///
+/// Precedence:
+///   1. **Per-invoice snapshot (PR-73)** when present — this is the
+///      regulatory record of the bank account the operator chose at
+///      issuance. The snapshot's `account_number` is rendered under
+///      the canonical Hungarian `BANKSZÁMLASZÁM` label (modern HU
+///      accounts are IBAN-form already, e.g. `HU71 12011375 ...`;
+///      operationally this IS the IBAN). The `iban` slot stays
+///      empty to avoid double-printing the same number under two
+///      labels. `bank_name` and `swift_bic` flow through as the
+///      secondary identifiers.
+///   2. **Legacy `seller.toml` flat-root fields** as fallback for
+///      pre-PR-73 invoices (snapshot is `None`). Preserves
+///      byte-stable historical re-renders per ADR-0040 §addendum-C.
+///
+/// The brief's operator complaint — "not the swift code matters
+/// which the pdf renders but the actual IBAN" — closes here. Before
+/// PR-86, the renderer always read the legacy `seller.toml` flat-
+/// root fields, which on a multi-bank tenant typically carried only
+/// `bank_name` + `swift_bic` (no IBAN), so the printed invoice
+/// surfaced the SWIFT but not the account number the buyer actually
+/// needed to pay. After PR-86, the snapshot's account_number is
+/// rendered as the primary pay-to line, and the SWIFT/BIC sits below
+/// as the secondary identifier.
+fn supplier_bank_fields(
+    snapshot: Option<&BankAccountSnapshot>,
+    legacy: &SellerToml,
+) -> SupplierBankFields {
+    if let Some(s) = snapshot {
+        return SupplierBankFields {
+            bank_account_number: Some(s.account_number.clone()),
+            iban: None,
+            bank_name: Some(s.bank_name.clone()),
+            swift_bic: Some(s.swift_bic.clone()),
+        };
+    }
+    SupplierBankFields {
+        bank_account_number: legacy.bank_account_number.clone(),
+        iban: legacy.iban.clone(),
+        bank_name: legacy.bank_name.clone(),
+        swift_bic: legacy.swift_bic.clone(),
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Seller-info TOML
 // ──────────────────────────────────────────────────────────────────────
 
@@ -969,5 +1081,106 @@ swift_bic = "OTPVHUHB"
         assert_eq!(payment_method_display("TRANSFER"), "Átutalás");
         assert_eq!(payment_method_display("CASH"), "Készpénz");
         assert_eq!(payment_method_display("UNKNOWN"), "UNKNOWN");
+    }
+
+    /// PR-86 / session-111 — pin: when the per-invoice bank snapshot
+    /// (PR-73) is present, the renderer reads its account_number as
+    /// `BANKSZÁMLASZÁM`. Pre-PR-86 the renderer silently ignored the
+    /// snapshot and rendered the legacy flat-root fields — closed
+    /// here by `supplier_bank_fields`'s precedence rule.
+    #[test]
+    fn supplier_bank_fields_prefers_snapshot_when_present() {
+        let snapshot = BankAccountSnapshot {
+            id: "bnk_huf_raiffeisen".to_string(),
+            currency: "HUF".to_string(),
+            account_number: "HU71 12011375 01945291 00100002".to_string(),
+            bank_name: "Raiffeisen Bank Magyarorszag".to_string(),
+            swift_bic: "UBRTHUHB".to_string(),
+        };
+        let legacy = SellerToml {
+            bank_account_number: None,
+            iban: None,
+            bank_name: Some("Raiffeisem".to_string()), // typo + stale
+            swift_bic: Some("RAIFHU".to_string()),     // truncated + stale
+        };
+        let fields = supplier_bank_fields(Some(&snapshot), &legacy);
+
+        assert_eq!(
+            fields.bank_account_number.as_deref(),
+            Some("HU71 12011375 01945291 00100002"),
+            "snapshot account_number must render as BANKSZÁMLASZÁM",
+        );
+        // Snapshot path: iban slot stays empty to avoid double-printing
+        // the same number under two labels.
+        assert!(
+            fields.iban.is_none(),
+            "iban slot is empty when snapshot is present",
+        );
+        assert_eq!(
+            fields.bank_name.as_deref(),
+            Some("Raiffeisen Bank Magyarorszag"),
+            "snapshot bank_name supersedes legacy `Raiffeisem` typo",
+        );
+        assert_eq!(
+            fields.swift_bic.as_deref(),
+            Some("UBRTHUHB"),
+            "snapshot swift_bic supersedes legacy truncated `RAIFHU`",
+        );
+    }
+
+    /// PR-86 / session-111 — pin: when no snapshot is present
+    /// (pre-PR-73 invoices), the renderer falls back to legacy
+    /// `seller.toml` flat-root fields verbatim. Forward-compatibility
+    /// for historical re-renders.
+    #[test]
+    fn supplier_bank_fields_falls_back_to_legacy_when_no_snapshot() {
+        let legacy = SellerToml {
+            bank_account_number: Some("12345678-12345678-12345678".to_string()),
+            iban: Some("HU12 3456 7890".to_string()),
+            bank_name: Some("OTP Bank".to_string()),
+            swift_bic: Some("OTPVHUHB".to_string()),
+        };
+        let fields = supplier_bank_fields(None, &legacy);
+
+        assert_eq!(
+            fields.bank_account_number.as_deref(),
+            Some("12345678-12345678-12345678"),
+        );
+        assert_eq!(fields.iban.as_deref(), Some("HU12 3456 7890"));
+        assert_eq!(fields.bank_name.as_deref(), Some("OTP Bank"));
+        assert_eq!(fields.swift_bic.as_deref(), Some("OTPVHUHB"));
+    }
+
+    /// PR-86 — closing the bug Ervin caught live: the EUR snapshot
+    /// (Revolut + LT IBAN) must NOT be displaced by the legacy
+    /// flat-root Raiffeisen fields. Same precedence as the HUF case
+    /// — the snapshot wins regardless of currency.
+    #[test]
+    fn supplier_bank_fields_eur_snapshot_displaces_legacy_huf_flat_root() {
+        let snapshot = BankAccountSnapshot {
+            id: "bnk_eur_revolut".to_string(),
+            currency: "EUR".to_string(),
+            account_number: "LT143250044813186860".to_string(),
+            bank_name: "Revolut".to_string(),
+            swift_bic: "REVOLT21".to_string(),
+        };
+        // Pre-PR-86 these legacy fields polluted EUR invoices too —
+        // even though the EUR invoice was meant to be paid to Revolut,
+        // the renderer surfaced Raiffeisem (typo) and RAIFHU (HUF).
+        let legacy = SellerToml {
+            bank_account_number: None,
+            iban: None,
+            bank_name: Some("Raiffeisem".to_string()),
+            swift_bic: Some("RAIFHU".to_string()),
+        };
+        let fields = supplier_bank_fields(Some(&snapshot), &legacy);
+
+        assert_eq!(
+            fields.bank_account_number.as_deref(),
+            Some("LT143250044813186860"),
+            "EUR Revolut IBAN must render, not the stale HUF Raiffeisen legacy field",
+        );
+        assert_eq!(fields.bank_name.as_deref(), Some("Revolut"));
+        assert_eq!(fields.swift_bic.as_deref(), Some("REVOLT21"));
     }
 }

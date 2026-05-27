@@ -389,3 +389,108 @@ async fn eur_mid_walk_back_transport_failure_surfaces_typed() {
         "mid-walk-back transport fault MUST NOT alias as walk-back-exhausted"
     );
 }
+
+/// PR-86 / session-111 — HTTP 404 from MNB triggers walk-back. The
+/// live MNB edge was observed to return bare `HTTP/1.1 404 Not Found`
+/// for non-publication-day fetches at session-111 implementation time
+/// (in addition to the historical empty `<MNBExchangeRates>` payload
+/// shape that surfaces as `NoRateForCurrency`). Operationally both
+/// mean the same thing — "no MNB rate published for this date" — so
+/// the helper treats them identically and walks back to the
+/// most-recent prior publication.
+///
+/// Fixture: provider returns `HttpStatus { status: 404 }` on the
+/// supply date and on D-1, then a successful rate on D-2.
+#[tokio::test(flavor = "current_thread")]
+async fn eur_walks_back_on_http_404_same_as_no_rate_for_currency() {
+    struct Http404ThenRate {
+        d_minus_2_rate: MnbRate,
+        calls: Mutex<u32>,
+    }
+    #[async_trait::async_trait]
+    impl MnbRatesProvider for Http404ThenRate {
+        async fn fetch_official_rate(
+            &self,
+            _currency: Currency,
+            _date: Date,
+        ) -> Result<MnbRate, MnbError> {
+            let n = {
+                let mut c = self.calls.lock().unwrap();
+                let v = *c;
+                *c += 1;
+                v
+            };
+            if n < 2 {
+                Err(MnbError::HttpStatus { status: 404 })
+            } else {
+                Ok(self.d_minus_2_rate.clone())
+            }
+        }
+    }
+    let d_minus_2 = SUPPLY_DATE - time::Duration::days(2);
+    let provider = Http404ThenRate {
+        d_minus_2_rate: MnbRate {
+            currency: Currency::Eur,
+            date: d_minus_2,
+            unit: 1,
+            value: "402.500000".to_string(),
+        },
+        calls: Mutex::new(0),
+    };
+    let lines = fixture_eur_lines();
+
+    let metadata = fetch_and_stamp_rate(&provider, Currency::Eur, SUPPLY_DATE, &lines)
+        .await
+        .expect("HTTP 404 must trigger walk-back, NOT loud-fail");
+
+    assert_eq!(
+        metadata.date, d_minus_2,
+        "walk-back must land on the date MNB actually answered with (D-2)",
+    );
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+    assert_eq!(metadata.rate, Decimal::from_str("402.500000").unwrap());
+}
+
+/// PR-86 / session-111 — non-404 HTTP errors (5xx, 503, etc.) still
+/// loud-fail without walk-back. Only 404 is the documented
+/// "no-publication-for-this-date" signal; treating a 503 (MNB-down) as
+/// a walk-back trigger would burn the whole window before surfacing
+/// what is actually a transient MNB outage. C2 hygiene.
+#[tokio::test(flavor = "current_thread")]
+async fn eur_http_503_propagates_without_walk_back() {
+    struct Http503 {
+        calls: Mutex<u32>,
+    }
+    #[async_trait::async_trait]
+    impl MnbRatesProvider for Http503 {
+        async fn fetch_official_rate(
+            &self,
+            _currency: Currency,
+            _date: Date,
+        ) -> Result<MnbRate, MnbError> {
+            let mut c = self.calls.lock().unwrap();
+            *c += 1;
+            Err(MnbError::HttpStatus { status: 503 })
+        }
+    }
+    let provider = Http503 {
+        calls: Mutex::new(0),
+    };
+    let lines = fixture_eur_lines();
+
+    let err = fetch_and_stamp_rate(&provider, Currency::Eur, SUPPLY_DATE, &lines)
+        .await
+        .expect_err("HTTP 503 MUST loud-fail without walk-back");
+    let msg = format!("{:#}", err);
+    assert!(
+        msg.contains(ERR_MNB_FETCH_FAILED),
+        "non-404 HTTP failure must carry the transport sentinel — got: {}",
+        msg
+    );
+    assert_eq!(
+        *provider.calls.lock().unwrap(),
+        1,
+        "non-404 HTTP failure MUST NOT invoke walk-back",
+    );
+}

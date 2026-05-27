@@ -9,16 +9,22 @@
 //!
 //! # Transport details
 //!
-//! Verified against MNB's published WSDL at PR-44β implementation
-//! time:
+//! Re-verified against MNB's currently-published WSDL
+//! (`https://www.mnb.hu/arfolyamok.asmx?WSDL`) at PR-86 / session-111
+//! implementation time. The PR-44β baseline used the legacy
+//! `http://www.mnbarfolyamservice.hu/` namespace; MNB has since
+//! migrated to `http://www.mnb.hu/webservices/` on the same endpoint
+//! path, and the legacy namespace now produces a SOAP fault
+//! (`Object reference not set to an instance of an object` —
+//! WCF binding refuses the unbound message). The new shape:
 //!
-//!   - URL: `https://www.mnb.hu/arfolyamok.asmx` (TLS via
-//!     `https`; the http:// form also works but TLS is the
-//!     hygiene posture).
+//!   - URL: `http://www.mnb.hu/arfolyamok.asmx` (HTTP — the HTTPS
+//!     form 404s SOAP POSTs at the WAF layer; see
+//!     `lib.rs::MNB_ENDPOINT_URL` for the live-verified rationale).
 //!   - SOAPAction header:
-//!     `"http://www.mnbarfolyamservice.hu/GetExchangeRates"`.
+//!     `"http://www.mnb.hu/webservices/MNBArfolyamServiceSoap/GetExchangeRates"`.
 //!   - Content-Type: `text/xml; charset=utf-8` (SOAP 1.1 convention).
-//!   - Operation namespace: `http://www.mnbarfolyamservice.hu/`.
+//!   - Operation namespace: `http://www.mnb.hu/webservices/`.
 //!
 //! These three transport details are exercised end-to-end by the
 //! env-gated live test in `tests/live_mnb.rs`; a regression on any
@@ -33,14 +39,27 @@ use crate::error::MnbError;
 pub const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 
 /// MNB operation namespace, used as default-ns on the
-/// `<GetExchangeRates>` body element. Same string is the prefix on
-/// the SOAPAction header (`<ns>GetExchangeRates`).
-pub const MNB_NS: &str = "http://www.mnbarfolyamservice.hu/";
+/// `<GetExchangeRates>` body element.
+///
+/// **PR-86 / session-111** — migrated from the pre-PR-86 value
+/// `http://www.mnbarfolyamservice.hu/` (which no longer matches the
+/// live WSDL — a request carrying the old namespace produces a WCF
+/// `Object reference not set to an instance of an object` SOAP fault
+/// because the binding has no handler bound to the old URI). The
+/// PR-86 value matches the live WSDL emitted by
+/// `https://www.mnb.hu/arfolyamok.asmx?WSDL`.
+pub const MNB_NS: &str = "http://www.mnb.hu/webservices/";
 
 /// SOAPAction header value for the `GetExchangeRates` operation.
 /// MUST be sent quoted per SOAP 1.1; the caller wraps it in
 /// `header("SOAPAction", format!("\"{}\"", SOAP_ACTION_GET_RATES))`.
-pub const SOAP_ACTION_GET_RATES: &str = "http://www.mnbarfolyamservice.hu/GetExchangeRates";
+///
+/// **PR-86 / session-111** — migrated from the pre-PR-86 value
+/// `http://www.mnbarfolyamservice.hu/GetExchangeRates`. The new
+/// value mirrors the operation binding in the live WSDL —
+/// `<namespace>/MNBArfolyamServiceSoap/GetExchangeRates`.
+pub const SOAP_ACTION_GET_RATES: &str =
+    "http://www.mnb.hu/webservices/MNBArfolyamServiceSoap/GetExchangeRates";
 
 /// Render a `<GetExchangeRates>` SOAP 1.1 envelope, ready for HTTP
 /// POST. Single-date queries (start == end) are the only shape PR-44β
@@ -119,9 +138,9 @@ mod tests {
         assert!(s.contains("<soap:Envelope"));
         assert!(s.contains("xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\""));
         assert!(s.contains("<soap:Body>"));
-        // Operation + MNB namespace.
+        // Operation + MNB namespace (PR-86 — live WSDL namespace).
         assert!(s.contains("<GetExchangeRates"));
-        assert!(s.contains("xmlns=\"http://www.mnbarfolyamservice.hu/\""));
+        assert!(s.contains("xmlns=\"http://www.mnb.hu/webservices/\""));
         // Parameters in XSD-sequence order.
         assert!(s.contains("<startDate>2026-05-22</startDate>"));
         assert!(s.contains("<endDate>2026-05-22</endDate>"));

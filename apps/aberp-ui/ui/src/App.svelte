@@ -59,12 +59,27 @@
     type AppRoute,
   } from "./lib/router";
   import InvoiceList from "./routes/InvoiceList.svelte";
+  import IssueInvoice from "./routes/IssueInvoice.svelte";
   import MaintenanceDashboard from "./routes/MaintenanceDashboard.svelte";
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
   import PartnersList from "./routes/PartnersList.svelte";
   import SellerConfigWizard from "./routes/SellerConfigWizard.svelte";
   import SetupWizard from "./routes/SetupWizard.svelte";
   import TenantSettings from "./routes/TenantSettings.svelte";
+
+  // PR-87 / session-112 — sessionStorage key the IssueInvoice route
+  // uses to hand the just-issued invoice id back to InvoiceList on
+  // navigation. Pre-PR-87 the IssueInvoice modal called `onIssued`
+  // synchronously on the parent (InvoiceList), which then seeded its
+  // local `navStack` to open the detail modal on the just-issued
+  // invoice. Now that IssueInvoice is its own route, the post-issue
+  // navigation back to `#/invoices` unmounts IssueInvoice before
+  // InvoiceList mounts — sessionStorage bridges the two mounts
+  // without widening the router to carry route-params (which the
+  // tiny PR-53 router deliberately does NOT support). On the next
+  // mount of InvoiceList, it reads + clears the key and seeds its
+  // navStack; staleness is bounded by the tab lifetime.
+  const JUST_ISSUED_KEY = "aberp:just-issued-invoice-id";
 
   // PR-53 / session-73 — hash-routing for the top-level navigation
   // shell. Three routes (`invoices` / `tenant` / `nav-credentials`);
@@ -338,7 +353,14 @@
                 <span class="sidenav__module-label">{mod.label_en}</span>
               </div>
               <ul class="sidenav__routes">
-                {#each mod.routes as r (r.id)}
+                <!-- PR-86 / session-111 — skip routes flagged
+                     `hidden: true` (e.g. `invoices-new`, which is
+                     reached via the "+ New invoice" button on the
+                     list rather than via a sidebar row). The route
+                     is still registered under its owning module so
+                     `areaForRoute` resolves correctly; only the
+                     sidebar rendering hides it. -->
+                {#each mod.routes.filter((r) => !r.hidden) as r (r.id)}
                   <li>
                     <a
                       class="sidenav__item"
@@ -383,6 +405,44 @@
           <PartnersList />
         {:else if route === "maintenance"}
           <MaintenanceDashboard />
+        {:else if route === "invoices-new"}
+          <!-- PR-87 / session-112 — full-page issuance route. The
+               IssueInvoice form was a `<dialog>` modal mounted inside
+               InvoiceList pre-PR-87 (PR-86 enlarged the modal which
+               Ervin declined — he asked explicitly for full-page SPA
+               navigation so the app becomes more portable). The form
+               now lives here as a routable surface. On success, stash
+               the just-issued invoice id in sessionStorage + navigate
+               back to `#/invoices`; the list reads the stash on
+               mount and opens the detail modal on that id. On cancel
+               (button or ESC), navigate back without stashing. -->
+          <section class="issue-page" aria-labelledby="issue-page-title">
+            <header class="issue-page__head">
+              <h2 id="issue-page-title">New invoice</h2>
+              <p class="issue-page__hint">
+                Review every field — buyer, currency, dates, bank, lines, notes,
+                totals — before pressing "Issue invoice". The issuance writes
+                to the regulatory audit ledger and submits to NAV.
+              </p>
+            </header>
+            <IssueInvoice
+              onIssued={(invoiceId) => {
+                try {
+                  sessionStorage.setItem(JUST_ISSUED_KEY, invoiceId);
+                } catch (_e) {
+                  // sessionStorage can throw in private-browsing or
+                  // quota-full contexts; the navigation still
+                  // completes — the operator just doesn't get the
+                  // auto-open-detail affordance on landing back at
+                  // the list. CLAUDE.md rule 12 — fail loud at the
+                  // store boundary, but don't gate navigation.
+                  console.warn("could not stash just-issued invoice id", _e);
+                }
+                navigateTo("invoices");
+              }}
+              onClose={() => navigateTo("invoices")}
+            />
+          </section>
         {:else}
           <InvoiceList />
         {/if}
@@ -710,6 +770,40 @@
   .main {
     padding: var(--space-5);
     overflow: auto;
+  }
+
+  /* PR-87 / session-112 — full-page Issue Invoice route chrome. The
+   * `<IssueInvoice>` form owns its own .issue-frame stack-of-fieldsets
+   * layout; the page chrome here adds a quiet title bar + hint line so
+   * the operator immediately knows what surface they're on (and so a
+   * deep-link / back-button arrival from elsewhere lands with context).
+   * Centred max-width matches the form's own 960px cap so the title
+   * sits over the same column. */
+  .issue-page {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .issue-page__head {
+    max-width: 960px;
+    margin: 0 auto;
+    width: 100%;
+    padding-bottom: var(--space-3);
+    border-bottom: 1px solid var(--color-surface-divider);
+  }
+
+  .issue-page__head h2 {
+    margin: 0;
+    font-size: var(--type-size-lg);
+    font-weight: 500;
+    color: var(--color-text-strong);
+  }
+
+  .issue-page__hint {
+    margin: var(--space-2) 0 0 0;
+    color: var(--color-text-muted);
+    font-size: var(--type-size-sm);
   }
 
   .banner {

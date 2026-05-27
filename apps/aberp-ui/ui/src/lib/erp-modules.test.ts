@@ -46,6 +46,7 @@ import type { AppRoute } from "./router";
 // closed vocab.
 const ALL_APP_ROUTES: AppRoute[] = [
   "invoices",
+  "invoices-new",
   "partners",
   "tenant",
   "nav-credentials",
@@ -70,6 +71,7 @@ const AREA_LANDING_ROUTE_SET: Set<AppRoute> = new Set<AppRoute>([
 // Landing routes (`maintenance`) are intentionally absent.
 const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   invoices: "invoicing",
+  "invoices-new": "invoicing",
   partners: "master-data",
   tenant: "settings",
   "nav-credentials": "settings",
@@ -82,6 +84,7 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
 // (it IS the area's home).
 const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   invoices: "operational",
+  "invoices-new": "operational",
   partners: "maintenance",
   tenant: "maintenance",
   "nav-credentials": "maintenance",
@@ -442,6 +445,57 @@ describe("area-swap round-trip (PR-81)", () => {
     expect(areaForRoute("maintenance")).toBe("maintenance");
     // And the swap-out direction matches what the topbar button
     // promises ("← OPERATIONAL" → invoices).
+    expect(defaultRouteForArea("operational")).toBe("invoices");
+  });
+});
+
+describe("invoices-new sub-page (PR-87)", () => {
+  // PR-87 / session-112 — the Issue Invoice form is now a full-page
+  // route (`#/invoices-new`), not a modal. The route is REGISTERED
+  // under the invoicing module so area-routing stays correct on
+  // deep-link, but MARKED `hidden: true` so the operational sidebar
+  // does not gain a second "New invoice" row beside "Invoices". The
+  // entry point is the contextual "+ New invoice" action on the
+  // invoices list; deep-link + browser-back still resolve the chrome.
+
+  it("'invoices-new' resolves to the invoicing module in the operational area", () => {
+    // The chrome's area derivation reads moduleForRoute first; a
+    // regression that detached the sub-page from invoicing would
+    // surface here (the topbar would flip to `← OPERATIONAL` on this
+    // route, which would be a chrome bug because the operator IS in
+    // the operational area).
+    const owner = moduleForRoute("invoices-new");
+    expect(owner?.id).toBe("invoicing");
+    expect(owner?.area).toBe("operational");
+    expect(areaForRoute("invoices-new")).toBe("operational");
+  });
+
+  it("'invoices-new' is marked hidden so the sidebar does not render it as a row", () => {
+    // The sidebar filters routes by `r.hidden !== true` (App.svelte).
+    // Pre-PR-87 a registry entry with no hidden flag would have
+    // appeared as "New invoice" beside "Invoices" — cluttering the
+    // operational nav with an action already reachable via the list's
+    // "+ New invoice" button. Pin the flag is set so the chrome stays
+    // clean.
+    const invoicing = MODULES.find((m) => m.id === "invoicing");
+    const ref = invoicing?.routes.find((r) => r.id === "invoices-new");
+    expect(ref?.hidden).toBe(true);
+  });
+
+  it("'invoices' (the daily-driver list) is NOT hidden", () => {
+    // Mirror of the pin above: the muscle-memory home stays visible
+    // in the sidebar. A regression that mistakenly flipped the wrong
+    // route's hidden flag would surface here.
+    const invoicing = MODULES.find((m) => m.id === "invoicing");
+    const ref = invoicing?.routes.find((r) => r.id === "invoices");
+    expect(ref?.hidden).toBeFalsy();
+  });
+
+  it("'invoices-new' is NOT the area's default landing (the daily list still is)", () => {
+    // The topbar's `← OPERATIONAL` button must keep landing on the
+    // invoices list, NOT on the issuance form. A regression that
+    // re-ordered Invoicing's routes (putting `invoices-new` first)
+    // would silently flip the area landing — pin against that.
     expect(defaultRouteForArea("operational")).toBe("invoices");
   });
 });

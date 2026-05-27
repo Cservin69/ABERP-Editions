@@ -67,9 +67,20 @@
     nextRowIndex,
     parseHotkey,
   } from "../lib/keyboard-nav";
+  import { navigateTo } from "../lib/router";
   import InvoiceDetail from "./InvoiceDetail.svelte";
-  import IssueInvoice from "./IssueInvoice.svelte";
   import ModificationInvoice from "./ModificationInvoice.svelte";
+
+  // PR-87 / session-112 — sessionStorage key the new `#/invoices-new`
+  // route stashes the just-issued invoice id under, so that on
+  // navigation back to `#/invoices` this list can seed its `navStack`
+  // and open the detail modal on the just-issued invoice (matching
+  // the pre-PR-87 modal-flow's auto-open-detail affordance). Mirror
+  // of the `JUST_ISSUED_KEY` in App.svelte — kept duplicated rather
+  // than centralised because the constant is read in two places and
+  // the duplication keeps each call site self-contained (CLAUDE.md
+  // rule 2 — no new module for a single string).
+  const JUST_ISSUED_KEY = "aberp:just-issued-invoice-id";
 
   let rows: InvoiceListItem[] = $state([]);
   let loadState: "idle" | "loading" | "loaded" | "error" = $state("idle");
@@ -97,12 +108,15 @@
   // $state proxy.
   let navStack: string[] = $state([]);
 
-  // PR-44ζ / session-59 — issue-invoice modal open state. The modal
-  // is a separate component; this boolean toggles its visibility.
-  // On successful issuance, the modal invokes `onIssued(invoice_id)`
-  // and this screen rebinds `navStack` to navigate the detail modal
-  // open on the just-issued invoice + reloads the list.
-  let issueOpen: boolean = $state(false);
+  // PR-87 / session-112 — issue-invoice is now a full-page route
+  // (`#/invoices-new`), not a modal mounted here. The "+ New invoice"
+  // button below navigates via `navigateTo("invoices-new")`; the
+  // route's onIssued callback (in App.svelte) stashes the just-issued
+  // id in sessionStorage and navigates back here; `onMount` below
+  // reads the stash and seeds `navStack` to open the detail modal on
+  // the just-issued invoice (the same auto-open-detail affordance
+  // the pre-PR-87 modal flow provided, just bridged across the route
+  // transition).
 
   // PR-47β / session-65 — modification modal state. Holds the base
   // invoice's id, currency, and displayable number while the modal
@@ -153,6 +167,23 @@
   onMount(() => {
     void refresh();
     window.addEventListener("keydown", handleKeydown);
+    // PR-87 / session-112 — read the just-issued stash left by the
+    // `#/invoices-new` route's onIssued callback, clear it, and seed
+    // `navStack` so the detail modal opens on the just-issued
+    // invoice. Defensive: missing-stash and storage-API exceptions
+    // are silently no-ops (the list still renders fine; the operator
+    // just doesn't get the auto-open affordance).
+    try {
+      const stashed = sessionStorage.getItem(JUST_ISSUED_KEY);
+      if (stashed !== null && stashed.length > 0) {
+        sessionStorage.removeItem(JUST_ISSUED_KEY);
+        navStack = [stashed];
+      }
+    } catch (_e) {
+      // sessionStorage can throw in private-browsing / quota-full
+      // contexts; navigation back to the list already succeeded, so
+      // swallowing here is the right posture.
+    }
   });
 
   onDestroy(() => {
@@ -160,13 +191,15 @@
   });
 
   function handleKeydown(event: KeyboardEvent) {
-    // The detail modal, issue modal, and modification modal all
-    // mount inside this component but each manages its own Escape
-    // posture. If ANY of those is open, we stand down — modal
-    // navigation owns the keyboard while it's visible.
+    // The detail modal and modification modal mount inside this
+    // component but each manages its own Escape posture. If ANY of
+    // those is open, we stand down — modal navigation owns the
+    // keyboard while it's visible. PR-87 / session-112 dropped the
+    // `issueOpen` gate (IssueInvoice is now its own route; when
+    // mounted at `#/invoices-new`, InvoiceList itself is unmounted
+    // so this handler isn't wired anyway).
     if (
       navStack.length > 0 ||
-      issueOpen ||
       modificationContext !== null
     ) {
       return;
@@ -433,7 +466,7 @@
       <button
         type="button"
         class="quiet-button primary"
-        onclick={() => (issueOpen = true)}
+        onclick={() => navigateTo("invoices-new")}
       >
         + New invoice
       </button>
@@ -597,19 +630,13 @@
       })}
   />
 
-  <IssueInvoice
-    open={issueOpen}
-    onClose={() => (issueOpen = false)}
-    onIssued={(invoiceId) => {
-      // PR-44ζ — Close the issue modal + refresh the list + navigate
-      // the detail modal open on the just-issued invoice so the
-      // operator immediately sees the regulatory record (EUR + MNB
-      // rate + HUF-equivalent on the EUR branch).
-      issueOpen = false;
-      void refresh();
-      navStack = [invoiceId];
-    }}
-  />
+  <!-- PR-87 / session-112 — IssueInvoice mount removed. Issuance now
+       lives at `#/invoices-new` as a full-page route (the "+ New
+       invoice" button above navigates there). Post-issuance the
+       route navigates back here; this component reads the just-
+       issued id from sessionStorage in onMount and seeds navStack
+       to open the detail modal — preserving the pre-PR-87 auto-
+       open-detail affordance. -->
 
   <ModificationInvoice
     baseInvoiceId={modificationContext?.baseInvoiceId ?? null}

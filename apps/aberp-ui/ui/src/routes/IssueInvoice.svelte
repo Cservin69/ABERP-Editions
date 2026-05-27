@@ -1,11 +1,28 @@
 <script lang="ts">
-  // PR-44ζ / session-59 — Issue-invoice modal.
+  // PR-44ζ / session-59 — Issue-invoice form.
   //
   // The first MUTATION-route surface on the SPA (every prior screen
-  // is read-only per ADR-0021 §Part B). Wraps the new
-  // `POST /invoices/issue` route behind a native <dialog> modal,
-  // matching `InvoiceDetail.svelte`'s posture per A157 (no toast
-  // component; inline error rendering).
+  // is read-only per ADR-0021 §Part B). Wraps the
+  // `POST /invoices/issue` route in a host-agnostic form component
+  // that the parent mounts directly (no `<dialog>`).
+  //
+  // PR-87 / session-112 — pre-PR-87 this was a `<dialog>`-wrapped
+  // modal mounted inside `InvoiceList.svelte`. Ervin found the
+  // modal too cramped for a legally-binding document — the operator
+  // couldn't see all lines, dates, bank, notes, totals before
+  // committing. PR-86 enlarged the modal (90vw/90vh) which Ervin
+  // declined ("make this a full-page SPA route, the app becomes more
+  // portable"); PR-87 finishes the container swap. The form is now
+  // mounted at `#/invoices-new` per the PR-78/PR-79 ERP-shell routing
+  // pattern: each navigable surface is a route, not a modal-on-top-of-
+  // another-route. The form contents are unchanged; only the wrapper
+  // shifted from `<dialog>` to a normal page section. The host route
+  // (App.svelte's render arm for `invoices-new`) owns the page chrome
+  // (h2 title + brief operator hint) + the navigate-on-success /
+  // navigate-on-cancel behaviour; this component owns ONLY the form,
+  // its state, and the submit pipeline. The `onClose` prop fires when
+  // the operator clicks Cancel or presses ESC; the route navigates
+  // back to `#/invoices`.
   //
   // Form fields (per the session-59 brief, surgical subset):
   //   - Supplier (name, taxNumber, address: country/postal/city/street)
@@ -32,6 +49,7 @@
   //      navigates the detail modal open on the just-issued invoice.
   //   4. On failure, render the error string inline (no toast).
 
+  import { onDestroy, onMount } from "svelte";
   import {
     issueInvoice,
     listPartners,
@@ -60,34 +78,30 @@
   import { buyerComboboxState } from "../lib/buyer-combobox";
 
   interface Props {
-    /** Whether the modal is open. The parent toggles by reassigning
-     * this boolean prop; `null`-vs-string would mirror the detail
-     * modal's posture but the issue modal has no per-invocation
-     * payload to carry, so a boolean is the simpler shape. */
-    open: boolean;
     /** Invoked with the freshly-issued invoice id when the backend
-     * returns 200. The parent uses this to navigate the detail
-     * modal open at the just-issued invoice. */
+     * returns 200. The parent route uses this to navigate back to
+     * the invoice list (and optionally seed the just-issued id so
+     * the detail modal can open on it). */
     onIssued: (invoiceId: string) => void;
-    /** Invoked when the operator closes the modal (ESC / backdrop /
-     * Cancel button) without issuing. */
+    /** Invoked when the operator cancels the issuance. The parent
+     * route uses this to navigate back to the invoice list without
+     * issuing anything. */
     onClose: () => void;
   }
 
-  let { open, onIssued, onClose }: Props = $props();
+  let { onIssued, onClose }: Props = $props();
 
-  let dialogEl: HTMLDialogElement | null = $state(null);
   let form: IssueInvoiceFormState = $state(emptyForm());
   let submitState: "idle" | "submitting" | "error" = $state("idle");
   let submitError: string | null = $state(null);
   /** PR-74 / session-96 — saved-partners cache for the buyer combobox.
-   * Lazy-loaded on first dialog open via `loadPartners()`; the
-   * combobox filters this client-side rather than per-keystroke fetch.
-   * `partnersLoaded` flips to `true` after the first successful load
-   * so subsequent opens reuse the cached list (the partners list is
-   * small in practice — operator-scale, not data-warehouse-scale). */
+   * The combobox filters this client-side rather than per-keystroke
+   * fetch — partners list is small in practice (operator-scale, not
+   * data-warehouse-scale). PR-87 / session-112: pre-PR-87 a sibling
+   * `partnersLoaded` boolean gated re-fetch on subsequent modal opens;
+   * the full-page route mounts fresh each navigation so the gate is
+   * gone — `loadPartners()` runs on mount and on Retry. */
   let savedPartners: Partner[] = $state([]);
-  let partnersLoaded = $state(false);
   /** PR-75 / session-99 — load-error state for the partners fetch.
    * Pre-PR-75 `loadPartners`'s catch silently swallowed the error and
    * left `savedPartners = []`, so the combobox surfaced the "No saved
@@ -206,11 +220,9 @@
     try {
       const response = await listPartners();
       savedPartners = response;
-      partnersLoaded = true;
       partnersLoadError = null;
     } catch (err: unknown) {
       savedPartners = [];
-      partnersLoaded = true;
       partnersLoadError = err instanceof Error ? err.message : String(err);
     }
   }
@@ -295,42 +307,41 @@
     return preflightErrors?.errors.length ?? 0;
   }
 
-  // Sync the native <dialog>'s open state with the `open` prop.
-  // `showModal()` and `close()` are imperative; the prop is the
-  // declarative source of truth.
-  $effect(() => {
-    if (!dialogEl) return;
-    if (open) {
-      if (!dialogEl.open) dialogEl.showModal();
-      // PR-73 — lazy-load seller banks on first open (subsequent opens
-      // reuse the cached list). The list is small (≤ ~6 entries per
-      // tenant in practice) so a periodic re-fetch is unnecessary.
-      if (!sellerBanksLoaded) {
-        void loadSellerBanks();
-      }
-      // PR-74 — lazy-load partners on first open so the buyer
-      // combobox has its candidate list ready by the time the
-      // operator focuses the input.
-      if (!partnersLoaded) {
-        void loadPartners();
-      }
-    } else {
-      if (dialogEl.open) dialogEl.close();
-    }
+  // PR-86 / session-111 — mount-once load of the bank-account list +
+  // partners list. Pre-PR-86 these loads were gated on the modal's
+  // `open` $effect (lazy on first dialog open, cached for subsequent
+  // opens). Now that the form is a full-page route mounted at
+  // navigation time, the same lazy-load posture collapses to a single
+  // `onMount` call per route entry — the lists are small (operator-
+  // scale) so a fresh load on each navigation to `#/invoices-new` is
+  // cheap and avoids the cache-invalidation surface a long-lived
+  // singleton would introduce.
+  //
+  // PR-87 / session-112 — also wire a window-level ESC handler so the
+  // form-as-route preserves the pre-PR-86 modal's ESC-to-close
+  // behaviour. A native `<dialog>` intercepts ESC automatically; a
+  // routed page does not, so we re-create the affordance explicitly.
+  // The handler:
+  //   - listens on `window` so it fires from anywhere on the page,
+  //   - skips when `defaultPrevented` so a focused buyer-combobox
+  //     dropdown still gets to close itself first (its own
+  //     `onBuyerKeyDown` `preventDefault`s the ESC),
+  //   - calls `onClose()` (the route navigates back to `#/invoices`).
+  function handleWindowKeydown(event: KeyboardEvent) {
+    if (event.key !== "Escape") return;
+    if (event.defaultPrevented) return;
+    onClose();
+  }
+
+  onMount(() => {
+    void loadSellerBanks();
+    void loadPartners();
+    window.addEventListener("keydown", handleWindowKeydown);
   });
 
-  function resetForm() {
-    form = emptyForm();
-    submitState = "idle";
-    submitError = null;
-    missingSellerConfig = null;
-    clearPreflightErrors();
-    buyerDropdownOpen = false;
-    buyerHighlight = -1;
-    // Note: do NOT reset `partnersLoaded` / `partnersLoadError` here —
-    // the cache outlives the per-open form state per PR-74's load-once
-    // posture. Same for `sellerBanksLoaded` / `sellerBanksLoadError`.
-  }
+  onDestroy(() => {
+    window.removeEventListener("keydown", handleWindowKeydown);
+  });
 
   /** PR-74 — operator clicked / Enter-selected a saved partner row.
    * Auto-fills the customer fields from the partner and closes the
@@ -549,9 +560,10 @@
       const body = composeIssueInvoiceBody(form);
       const response = await issueInvoice(body);
       submitState = "idle";
-      // Reset the form so the next opening starts fresh; the parent
-      // owns the open/close lifecycle.
-      resetForm();
+      // PR-86 / session-111 — the parent route navigates away on
+      // success (back to `#/invoices`), which unmounts this
+      // component. No local reset needed — the next visit to
+      // `#/invoices-new` re-mounts a fresh form.
       onIssued(response.invoice_id);
     } catch (err: unknown) {
       submitState = "error";
@@ -576,19 +588,14 @@
     }
   }
 
-  function handleDialogClose() {
-    // Reset form on close so an aborted issuance does not leak
-    // operator-typed values into the next opening — the same
-    // posture InvoiceDetail.svelte uses for its per-invocation
-    // state (download error, expanded payloads).
-    resetForm();
+  function handleCancel() {
+    // PR-86 / session-111 — Cancel just notifies the parent route,
+    // which navigates back to `#/invoices` (the route unmount drops
+    // all form state, so no explicit reset is needed). The route is
+    // also bound to the browser back button via the hash router, so
+    // the operator can navigate away with the back gesture and the
+    // form discards naturally.
     onClose();
-  }
-
-  function handleDialogClick(event: MouseEvent) {
-    if (event.target === dialogEl) {
-      dialogEl?.close();
-    }
   }
 
   // Currency dropdown options. The backend's `Currency` Deserialize
@@ -598,25 +605,23 @@
   const CURRENCY_OPTIONS: Currency[] = ["HUF", "EUR"];
 </script>
 
-<dialog
-  bind:this={dialogEl}
-  class="issue"
-  onclose={handleDialogClose}
-  onclick={handleDialogClick}
-  aria-label="Issue new invoice"
->
-  <form class="issue-frame" onsubmit={handleSubmit}>
-    <header class="issue-head">
-      <h2>New invoice</h2>
-      <button
-        type="button"
-        class="quiet-button"
-        onclick={() => dialogEl?.close()}
-        aria-label="Cancel issuance"
-      >
-        Cancel
-      </button>
-    </header>
+<!-- PR-86 / session-111 — the page chrome (title + Back to invoices)
+     lives on the host route component (App.svelte's render arm for
+     `#/invoices-new`); this form starts directly with the section
+     content so the form scrolls within the route's natural surface.
+     `data-testid="issue-form"` keeps a stable handle for future
+     e2e selectors. -->
+<form class="issue-frame" onsubmit={handleSubmit} data-testid="issue-form">
+  <header class="issue-head">
+    <button
+      type="button"
+      class="quiet-button"
+      onclick={handleCancel}
+      data-testid="issue-cancel"
+    >
+      ← Cancel
+    </button>
+  </header>
 
     {#if submitState === "error" && submitError}
       {#if preflightErrors}
@@ -701,7 +706,6 @@
                   class="quiet-button"
                   onmousedown={(e) => {
                     e.preventDefault();
-                    partnersLoaded = false;
                     partnersLoadError = null;
                     void loadPartners();
                   }}
@@ -1185,45 +1189,35 @@
       </button>
     </footer>
   </form>
-</dialog>
 
 <style>
-  dialog.issue {
-    border: 1px solid var(--color-surface-divider);
-    background: var(--color-surface-base);
-    color: var(--color-text-primary);
-    padding: 0;
-    max-width: 90vw;
-    max-height: 90vh;
-    width: 720px;
-    overflow: hidden;
-  }
-
-  dialog.issue::backdrop {
-    background: rgba(0, 0, 0, 0.5);
-  }
+  /* PR-86 / session-111 — full-page route surface. Pre-PR-86 this
+   * component wrapped its `<form>` in a `<dialog>`; Ervin's feedback
+   * was that a modal cramped a legally-binding document. The form
+   * now mounts directly into the route's main pane (App.svelte's
+   * render arm for `#/invoices-new`) with the page chrome (title +
+   * back) owned by the host route component. The `.issue-frame`
+   * stack-of-fieldsets layout below is unchanged from PR-44ζ — the
+   * operator scrolls within a single column so the whole invoice
+   * (buyer, currency, dates, bank, lines, notes, totals) reads
+   * top-to-bottom before committing. A 960px max-width keeps line
+   * lengths comfortable on wide screens; the surface centres in the
+   * main pane via `margin: 0 auto`. */
 
   .issue-frame {
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
-    max-height: 90vh;
-    overflow: auto;
-    padding: var(--space-4) var(--space-5);
+    max-width: 960px;
+    margin: 0 auto;
+    padding: var(--space-3) 0;
     animation: aberp-fade-in var(--motion-fade-in) both;
   }
 
   .issue-head {
     display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-  }
-
-  h2 {
-    margin: 0;
-    font-size: var(--type-size-lg);
-    font-weight: 500;
-    color: var(--color-text-strong);
+    align-items: center;
+    justify-content: flex-start;
   }
 
   fieldset {

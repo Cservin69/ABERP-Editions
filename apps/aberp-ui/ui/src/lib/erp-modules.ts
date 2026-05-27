@@ -42,10 +42,21 @@ export type ErpModuleId = "invoicing" | "master-data" | "settings";
 /** A route reference inside a module. `id` is the typed `AppRoute`
  * slug (the router's closed vocab); `label` is the chrome's display
  * string for the sidenav row. Today labels stay English to match
- * the existing flat sidebar (PR-53 / session-73). */
+ * the existing flat sidebar (PR-53 / session-73).
+ *
+ * PR-87 / session-112 — `hidden` marks a sub-page that BELONGS to the
+ * module (so `areaForRoute` resolves it and the area chrome stays
+ * correct on deep-link) but is NOT rendered as a sidebar row. The
+ * full-page IssueInvoice form (`invoices-new`) is reached via the
+ * "+ New invoice" action on the list, not via a sidebar item — adding
+ * a sidebar row would clutter the operational nav with an action the
+ * operator already has one click away inside the daily-driver list.
+ * Deep-link + browser-back still work because the route is registered
+ * and the page chrome still mounts. */
 export interface ErpRouteRef {
   id: AppRoute;
   label: string;
+  hidden?: boolean;
 }
 
 /** A registered ERP module. See ADR-0041 §1 + §2 for the per-field
@@ -86,7 +97,20 @@ export const MODULES: ErpModule[] = [
     label_hu: "Számlázás",
     label_en: "Invoicing",
     glyph: "§",
-    routes: [{ id: "invoices", label: "Invoices" }],
+    // PR-87 / session-112 — `invoices-new` is the full-page issuance
+    // form (pre-PR-87 it was a `<dialog>` modal mounted inside
+    // InvoiceList; PR-86 enlarged the modal which Ervin declined, this
+    // PR finishes the container swap). It is REGISTERED under Invoicing
+    // so `areaForRoute("invoices-new") === "operational"` and the
+    // chrome stays in the operational area on deep-link / back-from-
+    // form. It is MARKED `hidden: true` so the sidebar doesn't render a
+    // second "New invoice" row beside "Invoices" — the action is
+    // reached via the "+ New invoice" button on the list (one click,
+    // contextual) and via deep link / browser back.
+    routes: [
+      { id: "invoices", label: "Invoices" },
+      { id: "invoices-new", label: "New invoice", hidden: true },
+    ],
   },
   {
     id: "master-data",
@@ -189,8 +213,15 @@ export const AREA_LANDING_ROUTES: Partial<Record<ErpArea, AppRoute>> = {
  * navigates to when entering an area. PR-79 elevates the maintenance
  * area to its own landing dashboard route (`#/maintenance`); the
  * operational area keeps the pre-existing fall-through to the first
- * module's first route (`#/invoices`) because that is the area's
- * actual daily-driver home, not a dashboard.
+ * module's first VISIBLE route (`#/invoices`) because that is the
+ * area's actual daily-driver home, not a dashboard.
+ *
+ * PR-87 / session-112 — skip routes marked `hidden: true` (e.g. the
+ * full-page `invoices-new` issuance form) so the topbar's "back to
+ * operational" button never lands the operator on an action sub-page
+ * by accident. A module with ONLY hidden routes effectively has no
+ * area entry; in practice every module ships at least one visible
+ * row, so this is defence-in-depth.
  *
  * Returns `null` only for an empty area with no landing — a registry
  * inconsistency the pin would catch. */
@@ -199,8 +230,8 @@ export function defaultRouteForArea(area: ErpArea): AppRoute | null {
   if (landing !== undefined) return landing;
   const modules = modulesInArea(area);
   if (modules.length === 0) return null;
-  const firstRoute = modules[0].routes[0];
-  return firstRoute?.id ?? null;
+  const firstVisible = modules[0].routes.find((r) => r.hidden !== true);
+  return firstVisible?.id ?? null;
 }
 
 // ── PR-79 / session 102 — maintenance dashboard tile config ────────────
