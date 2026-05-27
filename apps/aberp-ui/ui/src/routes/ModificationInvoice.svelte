@@ -186,7 +186,11 @@
         {
           description: "",
           quantity: 1,
-          unitPriceMinor: 0,
+          // PR-88 / session-113 — fresh line seeds with an empty
+          // operator-input string. The form's required-attribute
+          // forces a value before submit; the parser produces the
+          // wire-side minor units at compose time.
+          unitPriceInput: "",
           vatRatePercent: 27,
           // PR-82 — fresh line has no buyer note; operator opt-in.
           note: "",
@@ -402,13 +406,21 @@
             />
           </label>
           <label class="narrow">
-            <span>Unit price</span>
+            <!-- PR-88 / session-113 — operator-input text field +
+                 `parseAmountToMinor` at compose time. Same cents-shift
+                 fix as the issue form (see IssueInvoice.svelte:
+                 unit-price block). The modification form's currency
+                 is LOCKED to the base invoice's currency (ADR-0037 §4
+                 C6) so the parser sees a stable scaling factor. -->
+            <span>Unit price ({form.currency === "EUR" ? "EUR, e.g. 340 or 340,50" : "HUF, whole forints"})</span>
             <input
-              type="number"
-              min="0"
-              step="1"
-              bind:value={line.unitPriceMinor}
+              type="text"
+              inputmode="decimal"
+              autocomplete="off"
+              spellcheck="false"
+              bind:value={line.unitPriceInput}
               required
+              placeholder={form.currency === "EUR" ? "340,50" : "340000"}
             />
           </label>
           <label class="narrow">

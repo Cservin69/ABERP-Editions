@@ -618,7 +618,21 @@
   <InvoiceDetail
     invoiceId={navStack.length > 0 ? navStack[navStack.length - 1] : null}
     ancestors={navStack.slice(0, -1)}
-    onClose={() => (navStack = [])}
+    onClose={() => {
+      // PR-88 / session-113 — auto-refresh the list on detail-modal
+      // close. The detail modal hosts the Submit, Poll-ack, Storno,
+      // and Mark-as-paid actions; each refreshes the modal's own
+      // detail (`load(invoice_id)`) but pre-PR-88 NONE refreshed the
+      // parent list. The operator saw stale row state (chip not
+      // flipped, paid badge missing, sequence number missing on a
+      // just-issued chain child) until they manually clicked the
+      // (now-obsolete) Refresh button. Refreshing on every close is
+      // harmless: a single Tauri invoke + a `<tbody>` re-render is
+      // cheap, and the operator's mental model is "modal close ⇒
+      // list view is fresh" anyway.
+      navStack = [];
+      void refresh();
+    }}
     onNavigate={(baseId) => (navStack = [...navStack, baseId])}
     onJumpBack={(index) => (navStack = navStack.slice(0, index + 1))}
     onAmend={(baseInvoiceId, baseCurrency, baseInvoiceNumber, baseBankAccount) =>
@@ -643,7 +657,15 @@
     baseCurrency={modificationContext?.baseCurrency ?? null}
     baseInvoiceNumber={modificationContext?.baseInvoiceNumber ?? null}
     baseBankAccount={modificationContext?.baseBankAccount ?? null}
-    onClose={() => (modificationContext = null)}
+    onClose={() => {
+      // PR-88 / session-113 — same auto-refresh discipline as the
+      // detail modal: closing the modification flow should leave the
+      // list in a fresh state. Even on a CANCEL the refresh is
+      // harmless; the operator's mental model is "modal close ⇒
+      // list is fresh."
+      modificationContext = null;
+      void refresh();
+    }}
     onAmended={(newInvoiceId) => {
       // PR-47β — close the modification modal + refresh the list +
       // navigate the detail modal to the NEW modification invoice

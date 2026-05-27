@@ -17,7 +17,9 @@ import {
   formatRate,
   formatRateDate,
   formatTotal,
+  parseAmountToMinor,
 } from "./format";
+import type { Currency } from "./api";
 
 describe("formatTotal", () => {
   // The HUF branch is byte-equal to the pre-PR-44ε
@@ -172,6 +174,96 @@ describe("filenameForInvoice", () => {
 
   it("handles a storno invoice's `S`-prefixed series", () => {
     expect(filenameForInvoice("S2026-000001")).toBe("invoice_S2026-000001.pdf");
+  });
+});
+
+// PR-88 / session-113 — exhaustive table-driven pins for the operator-
+// input → minor-units parser. This is the load-bearing fix for the
+// money-correctness bug Ervin caught in live test (he typed `340` EUR
+// expecting 340.00 EUR; the SPA sent 340 cents = 3.40 EUR, a 100×
+// underbill; he issued a real wrong-amount invoice before noticing).
+// The rule (CLAUDE.md rule 9): every row of the table below is one
+// distinct regression mode. A parser that hard-codes one branch would
+// fail at least one assertion; a parser that drops the comma-separator
+// path would fail half the EUR rows; a parser that reverts to the
+// auto-cents posture would fail the bare-integer EUR rows. Together
+// these pins make Bug 1 impossible to reintroduce silently.
+describe("parseAmountToMinor — operator-input → minor-units", () => {
+  // Table of (input, currency, expected) tuples. Co-located with the
+  // helper so a future widening (e.g., adding a 3-decimal currency)
+  // surfaces both ends.
+  const cases: Array<{ input: string; currency: Currency; expected: number | null; why: string }> = [
+    // ── EUR (2-decimal) — the bug class Ervin caught ────────────
+    // Bare integer: WHOLE major units. The pre-PR-88 bug sent 340
+    // cents = 3.40 EUR here; the fix sends 34000 cents = 340.00 EUR.
+    { input: "340", currency: "EUR", expected: 34_000, why: "EUR bare int = whole euros" },
+    { input: "340.50", currency: "EUR", expected: 34_050, why: "EUR `.` separator" },
+    { input: "340,50", currency: "EUR", expected: 34_050, why: "EUR `,` separator (Hungarian)" },
+    { input: "340.5", currency: "EUR", expected: 34_050, why: "EUR fractional pads to 2 digits" },
+    { input: "0,99", currency: "EUR", expected: 99, why: "EUR sub-1-euro amount" },
+    { input: "0.99", currency: "EUR", expected: 99, why: "EUR sub-1-euro amount with dot" },
+    { input: "1000", currency: "EUR", expected: 100_000, why: "EUR large bare int" },
+    { input: "1", currency: "EUR", expected: 100, why: "EUR exact 1.00 euro" },
+    { input: "1,00", currency: "EUR", expected: 100, why: "EUR explicit zero fractional" },
+    { input: "1.00", currency: "EUR", expected: 100, why: "EUR explicit zero fractional dot" },
+    // Hungarian thousands-space convention: `340 000` → 340000 EUR
+    // major units = 34000000 cents. Operators may paste copy-paste
+    // values with NBSP from another sheet.
+    { input: "340 000", currency: "EUR", expected: 34_000_000, why: "EUR thousands ASCII space" },
+    { input: "340 000", currency: "EUR", expected: 34_000_000, why: "EUR thousands NBSP" },
+    { input: "340 000,50", currency: "EUR", expected: 34_000_050, why: "EUR thousands + decimal" },
+    // ── HUF (0-decimal) — must NOT have been broken by the fix ──
+    // ADR-0009 §1: HUF has no sub-unit; `Huf(pub i64)` counts whole
+    // forints. Bare integer = whole forint = exactly the wire
+    // minor-unit count.
+    { input: "340", currency: "HUF", expected: 340, why: "HUF bare int = whole forints" },
+    { input: "1000", currency: "HUF", expected: 1_000, why: "HUF large bare int" },
+    { input: "1", currency: "HUF", expected: 1, why: "HUF 1 forint" },
+    { input: "654883", currency: "HUF", expected: 654_883, why: "HUF reference-template total" },
+    { input: "340 000", currency: "HUF", expected: 340_000, why: "HUF thousands space" },
+    // ── Whitespace tolerance ────────────────────────────────────
+    { input: "  340  ", currency: "EUR", expected: 34_000, why: "EUR surrounding whitespace trims" },
+    { input: " 340,50 ", currency: "EUR", expected: 34_050, why: "EUR whitespace + decimal" },
+    // ── Rejection arms — return null (composer treats as 0) ─────
+    { input: "", currency: "EUR", expected: null, why: "empty string" },
+    { input: "   ", currency: "EUR", expected: null, why: "whitespace-only" },
+    { input: "abc", currency: "EUR", expected: null, why: "non-numeric" },
+    { input: "-340", currency: "EUR", expected: null, why: "leading minus rejected (invoice prices positive)" },
+    { input: "+340", currency: "EUR", expected: null, why: "leading plus rejected" },
+    { input: "340.", currency: "EUR", expected: null, why: "trailing separator rejected" },
+    { input: ".50", currency: "EUR", expected: null, why: "bare-decimal rejected (no leading whole)" },
+    { input: ",50", currency: "EUR", expected: null, why: "bare-decimal comma rejected" },
+    { input: "340.50.20", currency: "EUR", expected: null, why: "two separators rejected" },
+    { input: "340,505", currency: "EUR", expected: null, why: "EUR over-decimals rejected (3 > 2)" },
+    { input: "340.5", currency: "HUF", expected: null, why: "HUF rejects any fractional part" },
+    { input: "340,50", currency: "HUF", expected: null, why: "HUF rejects fractional comma" },
+    { input: "1e3", currency: "EUR", expected: null, why: "scientific notation rejected" },
+  ];
+
+  for (const { input, currency, expected, why } of cases) {
+    const label = `${JSON.stringify(input)} as ${currency} → ${expected === null ? "null" : `${expected} minor units`} (${why})`;
+    it(label, () => {
+      expect(parseAmountToMinor(input, currency)).toBe(expected);
+    });
+  }
+
+  // Round-trip pin: the operator-typed integer string for EUR must
+  // ALWAYS produce a minor count exactly 100× the typed value. This
+  // is the headline anti-regression assertion — if a future change
+  // re-introduces the cents-shift bug, this loop fails on every
+  // EUR row.
+  it("EUR: a bare integer N reads as exactly N × 100 cents (anti-cents-shift)", () => {
+    for (const n of [1, 7, 42, 340, 1000, 999_999]) {
+      expect(parseAmountToMinor(String(n), "EUR")).toBe(n * 100);
+    }
+  });
+
+  // Round-trip pin: the operator-typed integer string for HUF must
+  // ALWAYS pass through unchanged (HUF is 0-decimal).
+  it("HUF: a bare integer N reads as exactly N forints (no shift)", () => {
+    for (const n of [1, 7, 42, 340, 1000, 999_999]) {
+      expect(parseAmountToMinor(String(n), "HUF")).toBe(n);
+    }
   });
 });
 

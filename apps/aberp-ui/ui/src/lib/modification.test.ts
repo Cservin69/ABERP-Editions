@@ -30,7 +30,10 @@ describe("composeModificationBody", () => {
         {
           description: "Corrected widget A",
           quantity: 3,
-          unitPriceMinor: 1200,
+          // PR-88 / session-113 — operator-typed string parsed at
+          // compose time. HUF 0-decimal so `"1200"` → 1200 minor =
+          // 1200 forints (same wire output as pre-PR-88 `unitPriceMinor: 1200`).
+          unitPriceInput: "1200",
           vatRatePercent: 27,
           note: "",
         },
@@ -81,7 +84,11 @@ describe("composeModificationBody", () => {
         {
           description: "  trimmed desc  ",
           quantity: 1,
-          unitPriceMinor: 100,
+          // PR-88 / session-113 — operator-typed EUR amount. `"1"`
+          // parses to 100 cents (= 1.00 EUR). The trim assertions
+          // below don't check unitPrice so any non-zero amount works
+          // here; using `"1"` makes the round-trip obvious.
+          unitPriceInput: "1",
           vatRatePercent: 27,
           note: "",
         },
@@ -138,18 +145,24 @@ describe("formFromIssuanceInput", () => {
     expect(form.customerTaxNumber).toBe("87654321-2-13");
     expect(form.customerName).toBe("Vevő Kft.");
     expect(form.currency).toBe("EUR");
+    // PR-88 / session-113 — the pre-fill mapper converts the
+    // backend's integer minor-unit count back into the operator-
+    // editable display string via `formatMinorToInput`. For EUR
+    // (2-decimal) 1000 minor = "10.00" major; 5000 minor = "50.00"
+    // major. The composer's round-trip re-produces the original
+    // 1000 / 5000 minor on submit (pinned in format.test.ts).
     expect(form.lines).toEqual([
       {
         description: "Widget A",
         quantity: 2,
-        unitPriceMinor: 1000,
+        unitPriceInput: "10.00",
         vatRatePercent: 27,
         note: "",
       },
       {
         description: "Widget B",
         quantity: 1,
-        unitPriceMinor: 5000,
+        unitPriceInput: "50.00",
         vatRatePercent: 5,
         note: "",
       },

@@ -148,3 +148,117 @@ export function formatRateDate(date: string): string {
 export function filenameForInvoice(invoiceNumber: string): string {
   return `invoice_${invoiceNumber}.pdf`;
 }
+
+/** PR-88 / session-113 — minor-unit count per currency. EUR is a
+ * 2-decimal currency (1 EUR = 100 cents); HUF is 0-decimal (1 HUF =
+ * 1 forint, no sub-unit per ADR-0009 §1 / `Huf(pub i64)`). The
+ * parser uses this to validate operator-typed decimal precision and
+ * to scale whole-major-unit input to minor units. */
+const MINOR_DECIMALS: Record<Currency, number> = {
+  HUF: 0,
+  EUR: 2,
+};
+
+/** PR-88 / session-113 — parse an operator-typed money amount string
+ * into the integer minor-unit count the wire shape carries.
+ *
+ * **The bug this closes**: pre-PR-88 the IssueInvoice form bound the
+ * operator's typed value DIRECTLY to a `unitPriceMinor: number`
+ * field on the form state, and the composer sent that integer on
+ * the wire verbatim. For HUF this happened to work (HUF is
+ * 0-decimal, so `340` typed = 340 forints on the wire). For EUR
+ * (2-decimal) the same `340` typed became 340 minor units = 3.40
+ * EUR on the wire — a 100× underbill. Ervin issued one invoice at
+ * 1/100 of intent before catching it.
+ *
+ * **Rules** (exhaustively pinned in `format.test.ts`):
+ *   - A bare integer is interpreted as WHOLE MAJOR UNITS. `340` →
+ *     340.00 EUR (= 34000 cents); never as 3.40 EUR.
+ *   - `.` and `,` are both accepted as the decimal separator
+ *     (Hungarian uses comma; the operator's keyboard convenience
+ *     wins over locale orthodoxy).
+ *   - ASCII spaces and NBSP are stripped as thousands separators
+ *     (`340 000` → 340000 major units).
+ *   - Cents (sub-unit) is only ever produced when the operator
+ *     EXPLICITLY types a separator. Never auto-derived.
+ *   - The fractional part may not exceed the currency's decimals
+ *     (HUF rejects any decimal; EUR rejects 3+ decimal digits).
+ *   - Negative, malformed, or empty input returns `null`. The form's
+ *     `required` attribute + the backend preflight's
+ *     `LineItemUnitPriceNonPositive` gate already cover the empty-
+ *     after-trim path; the parser refuses to guess.
+ *
+ * Pure function — no DOM, no side effects — so vitest can pin every
+ * row of the rule table without mounting a Svelte component.
+ *
+ * Returns `null` for unparseable input. The composer treats `null`
+ * as 0 on the wire so the existing preflight surfaces the inline
+ * error (see `composeIssueInvoiceBody`).
+ */
+export function parseAmountToMinor(raw: string, currency: Currency): number | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+
+  // Strip ASCII spaces + NBSP as thousands separators. Hungarian
+  // writes `340 000` with a regular space; some locales paste with
+  // NBSP. Both collapse to bare digits.
+  const noSpaces = trimmed.replace(/[\s ]/g, "");
+
+  // Closed grammar: one-or-more digits, optionally followed by ONE
+  // decimal separator (`.` or `,`) + one-or-more digits. No leading
+  // sign (invoice unit prices are positive — storno/modification is
+  // a separate flow per the backend preflight's
+  // `LineItemUnitPriceNonPositive`). No trailing separator. No
+  // bare-decimal `.50`.
+  const match = /^(\d+)(?:[.,](\d+))?$/.exec(noSpaces);
+  if (!match) return null;
+
+  const wholePart = match[1];
+  const fracPart = match[2] ?? "";
+  const decimals = MINOR_DECIMALS[currency];
+
+  // Reject more decimal digits than the currency supports. `340,505`
+  // for EUR is operator ambiguity (rounded to the half-cent?
+  // truncated?); refuse rather than guess. HUF with ANY fractional
+  // part rejects here.
+  if (fracPart.length > decimals) return null;
+
+  // Pad the fractional part with trailing zeros so `340.5` (EUR) →
+  // "50" (= 50 cents), not "5" (= 5 cents). For HUF (decimals=0)
+  // this is a no-op.
+  const fracPadded = fracPart.padEnd(decimals, "0");
+
+  // Compose minor units by string concatenation then integer parse —
+  // avoids float arithmetic (`3.40 * 100 = 339.99999...`) entirely.
+  // `parseInt("099", 10)` correctly returns 99 (no octal coercion in
+  // modern JS).
+  const combined = wholePart + fracPadded;
+  const minor = parseInt(combined, 10);
+  if (!Number.isSafeInteger(minor)) return null;
+  return minor;
+}
+
+/** PR-88 / session-113 — inverse of [`parseAmountToMinor`]. Formats an
+ * integer minor-unit count back into the operator-editable input
+ * string the modification form pre-fills with. Round-trips: for any
+ * valid `parseAmountToMinor(s, c)` returning `n`,
+ * `formatMinorToInput(n, c)` returns a canonical form that re-parses
+ * to the same `n`.
+ *
+ * Uses `.` as the decimal separator (the parser accepts both `.` and
+ * `,` — the operator can re-type with comma if they prefer the
+ * Hungarian convention). For HUF (0-decimal) the output is the bare
+ * integer with no separator. */
+export function formatMinorToInput(minor: number, currency: Currency): string {
+  if (!Number.isFinite(minor) || !Number.isInteger(minor)) return "";
+  const decimals = MINOR_DECIMALS[currency];
+  if (decimals === 0) return String(minor);
+  const sign = minor < 0 ? "-" : "";
+  const abs = Math.abs(minor);
+  const divisor = 10 ** decimals;
+  const whole = Math.floor(abs / divisor);
+  const frac = abs % divisor;
+  const fracStr = String(frac).padStart(decimals, "0");
+  return `${sign}${whole}.${fracStr}`;
+}

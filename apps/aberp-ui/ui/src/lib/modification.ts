@@ -32,6 +32,7 @@ import type {
   IssueInvoiceRequest,
   ModificationInvoiceRequest,
 } from "./api";
+import { formatMinorToInput, parseAmountToMinor } from "./format";
 import {
   composeCustomerAddress,
   emptyForm as emptyIssueForm,
@@ -85,7 +86,12 @@ export function formFromIssuanceInput(
   const lines: LineFormState[] = input.lines.map((l) => ({
     description: l.description,
     quantity: l.quantity,
-    unitPriceMinor: l.unitPrice,
+    // PR-88 / session-113 — convert the backend's integer minor-unit
+    // count back into the operator-editable display string the form
+    // pre-fills with. For HUF (0-decimal) this is the bare integer;
+    // for EUR (2-decimal) it's `"125.00"` form. The parser round-
+    // trips both back to the same minor count on submit.
+    unitPriceInput: formatMinorToInput(l.unitPrice, baseCurrency),
     vatRatePercent: l.vatRatePercent,
     // PR-82 — inherit any per-line note recorded on the base's
     // side-stored issuance input. The modification form keeps the
@@ -156,7 +162,12 @@ export function composeModificationBody(
     lines: form.lines.map((l) => ({
       description: l.description.trim(),
       quantity: l.quantity,
-      unitPrice: l.unitPriceMinor,
+      // PR-88 / session-113 — same parse-at-compose-time discipline as
+      // `composeIssueInvoiceBody`. The modification form's unit-price
+      // input is the operator-typed string; the parser converts to
+      // minor units using the form's (locked) currency. Failure → 0,
+      // backend preflight surfaces `LineItemUnitPriceNonPositive`.
+      unitPrice: parseAmountToMinor(l.unitPriceInput, form.currency) ?? 0,
       vatRatePercent: l.vatRatePercent,
       // PR-82 — pass through any per-line note. The backend's
       // modification route does not yet wire chain-level note

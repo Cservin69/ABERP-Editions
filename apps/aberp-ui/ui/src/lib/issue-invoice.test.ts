@@ -40,7 +40,11 @@ describe("composeIssueInvoiceBody", () => {
         {
           description: "Widget A",
           quantity: 2,
-          unitPriceMinor: 1000,
+          // PR-88 / session-113 — operator-typed raw string. HUF is
+          // 0-decimal, so `"1000"` parses to 1000 minor units (= 1000
+          // forints) — same wire output as the pre-PR-88
+          // `unitPriceMinor: 1000` posture.
+          unitPriceInput: "1000",
           vatRatePercent: 27,
           note: "",
         },
@@ -134,7 +138,7 @@ describe("composeIssueInvoiceBody", () => {
         {
           description: "Widget A",
           quantity: 1,
-          unitPriceMinor: 1000,
+          unitPriceInput: "1000",
           vatRatePercent: 27,
           note: "Please ship to dock B",
         },
@@ -158,7 +162,7 @@ describe("composeIssueInvoiceBody", () => {
         {
           description: "Widget A",
           quantity: 1,
-          unitPriceMinor: 100,
+          unitPriceInput: "100",
           vatRatePercent: 27,
           note: "  ",
         },
@@ -179,7 +183,7 @@ describe("composeIssueInvoiceBody", () => {
         {
           description: "Widget A",
           quantity: 1,
-          unitPriceMinor: 100,
+          unitPriceInput: "100",
           vatRatePercent: 27,
           note: "  Line A note  ",
         },
@@ -213,7 +217,12 @@ describe("composeIssueInvoiceBody", () => {
         {
           description: "Consulting (1h)",
           quantity: 8,
-          unitPriceMinor: 12500, // 125.00 EUR in cents
+          // PR-88 / session-113 — operator-typed raw string. EUR is
+          // 2-decimal, so `"125.00"` parses to 12500 minor units
+          // (= 125.00 EUR). The pre-PR-88 form stored 12500 in
+          // `unitPriceMinor` directly; the new posture is "type
+          // what's on the invoice, the parser converts."
+          unitPriceInput: "125.00",
           vatRatePercent: 27,
           note: "",
         },
@@ -248,7 +257,7 @@ describe("composeIssueInvoiceBody", () => {
         {
           description: "  Trimmed description  ",
           quantity: 1,
-          unitPriceMinor: 500,
+          unitPriceInput: "500",
           vatRatePercent: 27,
           note: "",
         },
@@ -337,9 +346,9 @@ describe("composeIssueInvoiceBody", () => {
       customerTaxNumber: "y",
       currency: "HUF" as const,
       lines: [
-        { description: "A", quantity: 1, unitPriceMinor: 100, vatRatePercent: 27, note: "" },
-        { description: "B", quantity: 2, unitPriceMinor: 200, vatRatePercent: 5, note: "" },
-        { description: "C", quantity: 3, unitPriceMinor: 300, vatRatePercent: 0, note: "" },
+        { description: "A", quantity: 1, unitPriceInput: "100", vatRatePercent: 27, note: "" },
+        { description: "B", quantity: 2, unitPriceInput: "200", vatRatePercent: 5, note: "" },
+        { description: "C", quantity: 3, unitPriceInput: "300", vatRatePercent: 0, note: "" },
       ],
     };
 

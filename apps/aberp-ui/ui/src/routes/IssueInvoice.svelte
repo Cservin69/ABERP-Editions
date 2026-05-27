@@ -1073,13 +1073,28 @@
             />
           </label>
           <label class="narrow">
-            <span>Unit price</span>
+            <!-- PR-88 / session-113 — unit-price text input. Pre-PR-88
+                 this was `<input type="number">` bound to
+                 `line.unitPriceMinor: number`; the operator's typed
+                 digits were stored as MINOR units (cents for EUR),
+                 producing the 100× underbill bug Ervin caught in
+                 live test. The fix: capture the raw typed string +
+                 parse at compose time via `parseAmountToMinor` so
+                 bare ints are interpreted as WHOLE major units
+                 (`340` EUR → 340.00, not 3.40). `inputmode="decimal"`
+                 surfaces the numeric keypad on touch devices while
+                 still accepting `.` / `,` separators (which
+                 `type="number"` would reject locale-inconsistently
+                 in some browsers). -->
+            <span>Unit price ({form.currency === "EUR" ? "EUR, e.g. 340 or 340,50" : "HUF, whole forints"})</span>
             <input
-              type="number"
-              min="0"
-              step="1"
-              bind:value={line.unitPriceMinor}
+              type="text"
+              inputmode="decimal"
+              autocomplete="off"
+              spellcheck="false"
+              bind:value={line.unitPriceInput}
               required
+              placeholder={form.currency === "EUR" ? "340,50" : "340000"}
               class:input-invalid={lineErrors[index]?.unitPrice !== undefined}
               aria-invalid={lineErrors[index]?.unitPrice !== undefined}
               data-testid={`line-${index}-unit-price-input`}

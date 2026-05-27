@@ -14,6 +14,7 @@
 // invariant precedent.
 
 import type { Currency, IssueInvoiceRequest } from "./api";
+import { parseAmountToMinor } from "./format";
 import {
   addDays,
   comfortZone,
@@ -24,15 +25,31 @@ import {
   type IsoDate,
 } from "./invoice-dates";
 
-/** PR-44ζ — per-line form state. `unitPriceMinor` is the operator-
- * typed amount: whole forints for HUF, cents for EUR (the SPA mirrors
- * the issuance-path posture documented on
- * `InvoiceListItem.total_gross`). `quantity` and `vatRatePercent`
- * are integers. */
+/** PR-88 / session-113 — per-line form state.
+ *
+ * `unitPriceInput` is the OPERATOR-TYPED RAW STRING from the form's
+ * unit-price input. The composer converts it to integer minor units
+ * via [`parseAmountToMinor`] at submit time, using the form's
+ * currency to drive the major→minor scaling (`340` typed under EUR
+ * becomes 34000 cents; under HUF, 340 forints).
+ *
+ * Pre-PR-88 this field was `unitPriceMinor: number` bound directly
+ * to a `type="number"` input — the operator's typed digits were
+ * persisted verbatim as MINOR units. That worked for HUF (HUF is
+ * 0-decimal so major == minor) but produced a 100× underbill for
+ * EUR: `340` typed → 340 cents on the wire = 3.40 EUR instead of
+ * 340.00 EUR. Ervin issued one wrong-amount invoice in live test
+ * before catching it. The fix is to read raw operator input as a
+ * string and convert at compose time so the major-unit
+ * interpretation is canonical.
+ *
+ * `quantity` and `vatRatePercent` remain integer because the form's
+ * `<input type="number">` for those fields is unambiguous (no
+ * decimal-separator ambiguity, no minor-unit scaling). */
 export interface LineFormState {
   description: string;
   quantity: number;
-  unitPriceMinor: number;
+  unitPriceInput: string;
   vatRatePercent: number;
   /** PR-82 — operator-typed per-line note ("Megjegyzés"). Empty
    * string when blank; `composeIssueInvoiceBody` normalises to
@@ -155,12 +172,20 @@ export function emptyForm(): IssueInvoiceFormState {
   };
 }
 
-/** PR-44ζ — sensible defaults for a freshly-added line. */
+/** PR-44ζ — sensible defaults for a freshly-added line.
+ *
+ * PR-88 / session-113 — `unitPriceInput` seeds to an empty string;
+ * the form's required-attribute on the text input forces the
+ * operator to type a value before submission. A 0-default would
+ * silently round-trip through the parser as `null` (rejected via
+ * the empty-string arm) which the backend preflight then catches
+ * as `LineItemUnitPriceNonPositive` — but presenting an empty
+ * input matches the "blank canvas" UX a fresh line should have. */
 export function emptyLine(): LineFormState {
   return {
     description: "",
     quantity: 1,
-    unitPriceMinor: 0,
+    unitPriceInput: "",
     vatRatePercent: 27,
     // PR-82 — per-line note seeds blank; operator opt-in.
     note: "",
@@ -472,7 +497,17 @@ export function composeIssueInvoiceBody(
     lines: form.lines.map((l) => ({
       description: l.description.trim(),
       quantity: l.quantity,
-      unitPrice: l.unitPriceMinor,
+      // PR-88 / session-113 — parse the operator-typed string into
+      // integer minor units using the form's currency. Bare ints
+      // are interpreted as WHOLE major units (`340` EUR = 34000
+      // cents; `340` HUF = 340 forints). A parse failure surfaces
+      // as 0 on the wire so the backend preflight's
+      // `LineItemUnitPriceNonPositive` rule renders the inline
+      // error at this line's unit-price input — the operator gets
+      // the existing PR-69 actionable message rather than a silent
+      // bad-amount issuance. See [`parseAmountToMinor`] for the
+      // closed grammar.
+      unitPrice: parseAmountToMinor(l.unitPriceInput, form.currency) ?? 0,
       vatRatePercent: l.vatRatePercent,
       // PR-82 — per-line buyer note. Trim + normalise empty to
       // `null` so the backend's preflight / persistence path sees a
