@@ -30,13 +30,28 @@ export type DetailActionButton =
   | "PollAck"
   | "Storno"
   | "Modification"
+  | "Pay"
   | "Download";
 
 /** Per-state action-button visibility table. Returned in operator-
  * reading order (left-to-right on the modal header); the renderer
  * mounts each one as a quiet button. Pinned by
- * `buttonsForState` table tests in `invoice-actions.test.ts`. */
-export function buttonsForState(state: InvoiceState): DetailActionButton[] {
+ * `buttonsForState` table tests in `invoice-actions.test.ts`.
+ *
+ * PR-70 / ADR-0039 — `paid` second parameter gates the new
+ * operational "Pay" button. The button appears ONLY on
+ * `state === "Finalized" && !paid` per the brief's explicit rule:
+ * unpaid Finalized invoices get the affordance; already-paid
+ * Finalized invoices do not; every other state hides the button
+ * regardless of payment status (the precondition guard at the
+ * backend route layer rejects mark-paid on non-Finalized states
+ * with a 409). `paid` defaults to `false` so the unpaid baseline
+ * is the default behaviour; existing test fixtures explicitly
+ * cover both branches. */
+export function buttonsForState(
+  state: InvoiceState,
+  paid: boolean = false,
+): DetailActionButton[] {
   switch (state) {
     case "Ready":
       // Pre-submission: operator can submit or download.
@@ -63,7 +78,16 @@ export function buttonsForState(state: InvoiceState): DetailActionButton[] {
       // precondition guard mirrors this; surfacing the button on a
       // non-modifiable state would produce a 409 the operator was
       // not warned about.
-      return ["Storno", "Modification", "Download"];
+      //
+      // PR-70 / ADR-0039 — Mark-as-paid is gated to Finalized AND
+      // unpaid. The button order places "Pay" before the chain
+      // operations so the operator-most-common action (recording
+      // a payment) sits at the natural left-side button position;
+      // a paid Finalized invoice retains only the chain operations.
+      if (paid) {
+        return ["Storno", "Modification", "Download"];
+      }
+      return ["Pay", "Storno", "Modification", "Download"];
     case "Amended":
       // PR-47β / session-65 — Amended is the second arm of the
       // modify-after-modify accept set (ADR-0024 §6 default-permit

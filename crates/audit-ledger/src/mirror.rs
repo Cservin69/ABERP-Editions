@@ -191,10 +191,7 @@ pub fn read_mirror_entries(mirror_path: &Path) -> Result<Vec<MirrorEntry>, Appen
     // byte of the file before line-iteration. An empty file is OK
     // (no entries yet); a non-empty file with no trailing newline
     // is a partial-write signal per ADR-0030 §3.
-    let len = file
-        .metadata()
-        .map_err(AppendError::MirrorIo)?
-        .len();
+    let len = file.metadata().map_err(AppendError::MirrorIo)?.len();
     if len > 0 {
         let mut tail = [0u8; 1];
         let mut last_byte_reader = File::open(mirror_path).map_err(AppendError::MirrorIo)?;
@@ -231,11 +228,10 @@ pub fn read_mirror_entries(mirror_path: &Path) -> Result<Vec<MirrorEntry>, Appen
                 reason: format!("empty line at line {line_no}"),
             });
         }
-        let record: MirrorEntry = serde_json::from_str(trimmed).map_err(|e| {
-            AppendError::MirrorCorrupt {
+        let record: MirrorEntry =
+            serde_json::from_str(trimmed).map_err(|e| AppendError::MirrorCorrupt {
                 reason: format!("JSON decode failure at line {line_no}: {e}"),
-            }
-        })?;
+            })?;
         // Ascending-contiguous seq from 1 — same invariant
         // `verify_chain` enforces on the DB side.
         let expected = (out.len() as u64) + 1;
@@ -297,10 +293,7 @@ pub fn sync_mirror(
     //    the bytes we own. `read_mirror_entries` opens the file
     //    separately for read; that's fine because the lock is
     //    advisory and we hold it on the directory entry.
-    let bytes_at_lock = file
-        .metadata()
-        .map_err(AppendError::MirrorIo)?
-        .len();
+    let bytes_at_lock = file.metadata().map_err(AppendError::MirrorIo)?.len();
 
     let mirror_head_seq: u64;
     let mirror_head_hash: Option<String>;
@@ -482,8 +475,8 @@ fn row_to_entry_for_mirror(row: &duckdb::Row<'_>) -> duckdb::Result<Entry> {
         .map_err(|_| decode_err("time_wall is not RFC3339"))?;
     let actor = Actor::from_storage_json(&actor_json)
         .map_err(|_| decode_err("actor JSON failed to deserialize"))?;
-    let kind = EventKind::from_storage_str(&kind_str)
-        .map_err(|_| decode_err("unknown event kind"))?;
+    let kind =
+        EventKind::from_storage_str(&kind_str).map_err(|_| decode_err("unknown event kind"))?;
 
     Ok(Entry {
         id: EntryId(id_ulid),
@@ -819,5 +812,4 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
-
 }

@@ -165,30 +165,27 @@ pub fn inherit_rate_metadata_for_chain(
     if matches!(base_metadata.currency, Currency::Huf) {
         return Ok((Currency::Huf, None));
     }
-    let rate_str = base_metadata
-        .exchange_rate
-        .as_deref()
-        .ok_or_else(|| anyhow!(
+    let rate_str = base_metadata.exchange_rate.as_deref().ok_or_else(|| {
+        anyhow!(
             "base invoice has non-HUF currency {} but missing exchange_rate column \
              — DB row corrupt (ADR-0037 §4 invariant C1, read-side counterpart)",
             base_metadata.currency.iso_code(),
-        ))?;
-    let source = base_metadata
-        .exchange_rate_source
-        .clone()
-        .ok_or_else(|| anyhow!(
+        )
+    })?;
+    let source = base_metadata.exchange_rate_source.clone().ok_or_else(|| {
+        anyhow!(
             "base invoice has non-HUF currency {} but missing exchange_rate_source column \
              — DB row corrupt (ADR-0037 §4 invariant C1, read-side counterpart)",
             base_metadata.currency.iso_code(),
-        ))?;
-    let date_str = base_metadata
-        .exchange_rate_date
-        .as_deref()
-        .ok_or_else(|| anyhow!(
+        )
+    })?;
+    let date_str = base_metadata.exchange_rate_date.as_deref().ok_or_else(|| {
+        anyhow!(
             "base invoice has non-HUF currency {} but missing exchange_rate_date column \
              — DB row corrupt (ADR-0037 §4 invariant C1, read-side counterpart)",
             base_metadata.currency.iso_code(),
-        ))?;
+        )
+    })?;
     let rate = Decimal::from_str(rate_str).map_err(|_| {
         anyhow!(
             "base invoice exchange_rate value `{}` is not a parseable decimal — \
@@ -196,29 +193,25 @@ pub fn inherit_rate_metadata_for_chain(
             rate_str
         )
     })?;
-    let date = Date::parse(
-        date_str,
-        &format_description!("[year]-[month]-[day]"),
-    )
-    .map_err(|e| {
-        anyhow!(
-            "base invoice exchange_rate_date `{}` does not parse as YYYY-MM-DD: {e} \
+    let date =
+        Date::parse(date_str, &format_description!("[year]-[month]-[day]")).map_err(|e| {
+            anyhow!(
+                "base invoice exchange_rate_date `{}` does not parse as YYYY-MM-DD: {e} \
              — DB row corrupt or schema-drifted",
-            date_str
-        )
-    })?;
-    let huf_equivalent_total = aberp_billing::huf_equivalent_round_half_even(
-        child_gross_cents,
-        &rate,
-    )
-    .ok_or_else(|| {
-        anyhow!(
-            "chain-child gross {} cents × inherited rate {} overflows i64 HUF equivalent \
+                date_str
+            )
+        })?;
+    let huf_equivalent_total =
+        aberp_billing::huf_equivalent_round_half_even(child_gross_cents, &rate).ok_or_else(
+            || {
+                anyhow!(
+                    "chain-child gross {} cents × inherited rate {} overflows i64 HUF equivalent \
              (ADR-0037 §1.c)",
-            child_gross_cents,
-            rate
-        )
-    })?;
+                    child_gross_cents,
+                    rate
+                )
+            },
+        )?;
     Ok((
         base_metadata.currency,
         Some(RateMetadata {
@@ -294,8 +287,7 @@ mod tests {
     #[test]
     fn inherit_rate_metadata_eur_base_inherits_rate_source_date_and_recomputes_huf() {
         let base = eur_base_metadata();
-        let (currency, rate_metadata) =
-            inherit_rate_metadata_for_chain(&base, 10_000).unwrap();
+        let (currency, rate_metadata) = inherit_rate_metadata_for_chain(&base, 10_000).unwrap();
         assert_eq!(currency, Currency::Eur);
         let rate = rate_metadata.expect("EUR child must carry rate_metadata");
         // Decimal `to_string` preserves the canonical decimal form
@@ -305,11 +297,9 @@ mod tests {
         assert_eq!(rate.source, "MNB");
         assert_eq!(rate.date.to_string(), "2026-05-08");
         // Recomputed huf_equivalent — NOT base's stored 40_523.
-        let expected = huf_equivalent_round_half_even(
-            10_000,
-            &Decimal::from_str("405.230000").unwrap(),
-        )
-        .unwrap();
+        let expected =
+            huf_equivalent_round_half_even(10_000, &Decimal::from_str("405.230000").unwrap())
+                .unwrap();
         assert_eq!(rate.huf_equivalent_total, expected);
     }
 
@@ -320,8 +310,7 @@ mod tests {
     #[test]
     fn inherit_rate_metadata_eur_base_negative_child_gross_produces_negative_huf() {
         let base = eur_base_metadata();
-        let (_currency, rate_metadata) =
-            inherit_rate_metadata_for_chain(&base, -10_000).unwrap();
+        let (_currency, rate_metadata) = inherit_rate_metadata_for_chain(&base, -10_000).unwrap();
         let rate = rate_metadata.unwrap();
         assert!(
             rate.huf_equivalent_total < 0,
@@ -335,8 +324,7 @@ mod tests {
     #[test]
     fn inherit_rate_metadata_huf_base_produces_none() {
         let base = huf_base_metadata();
-        let (currency, rate_metadata) =
-            inherit_rate_metadata_for_chain(&base, 12_345).unwrap();
+        let (currency, rate_metadata) = inherit_rate_metadata_for_chain(&base, 12_345).unwrap();
         assert_eq!(currency, Currency::Huf);
         assert!(rate_metadata.is_none());
     }
@@ -360,12 +348,8 @@ mod tests {
     /// message so an audit-evidence reader can grep for it.
     #[test]
     fn chain_currency_mismatch_huf_child_against_eur_base_loud_fails() {
-        let err = require_chain_currency_match(
-            Currency::Eur,
-            Currency::Huf,
-            "inv_BASE_FOR_EUR",
-        )
-        .unwrap_err();
+        let err = require_chain_currency_match(Currency::Eur, Currency::Huf, "inv_BASE_FOR_EUR")
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("ChainCurrencyMismatch"),
@@ -382,12 +366,8 @@ mod tests {
     /// coerce in either direction.
     #[test]
     fn chain_currency_mismatch_eur_child_against_huf_base_loud_fails() {
-        let err = require_chain_currency_match(
-            Currency::Huf,
-            Currency::Eur,
-            "inv_BASE_FOR_HUF",
-        )
-        .unwrap_err();
+        let err = require_chain_currency_match(Currency::Huf, Currency::Eur, "inv_BASE_FOR_HUF")
+            .unwrap_err();
         assert!(
             format!("{err:#}").contains("ChainCurrencyMismatch"),
             "loud-fail message must carry the ChainCurrencyMismatch token: {err:#}"

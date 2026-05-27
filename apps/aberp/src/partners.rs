@@ -241,15 +241,30 @@ pub fn validate_tax_number(s: &str) -> Result<(), String> {
     }
     match chars.next() {
         Some('-') => {}
-        _ => return Err(format!("tax number must have `-` after the 8 digits (got `{}`)", s)),
+        _ => {
+            return Err(format!(
+                "tax number must have `-` after the 8 digits (got `{}`)",
+                s
+            ))
+        }
     }
     match chars.next() {
         Some(c) if c.is_ascii_digit() => {}
-        _ => return Err(format!("tax number must have a single digit (VAT code) after the first `-` (got `{}`)", s)),
+        _ => {
+            return Err(format!(
+                "tax number must have a single digit (VAT code) after the first `-` (got `{}`)",
+                s
+            ))
+        }
     }
     match chars.next() {
         Some('-') => {}
-        _ => return Err(format!("tax number must have `-` after the VAT-code digit (got `{}`)", s)),
+        _ => {
+            return Err(format!(
+                "tax number must have `-` after the VAT-code digit (got `{}`)",
+                s
+            ))
+        }
     }
     for i in 0..2 {
         match chars.next() {
@@ -263,7 +278,10 @@ pub fn validate_tax_number(s: &str) -> Result<(), String> {
         }
     }
     if chars.next().is_some() {
-        return Err(format!("tax number has trailing characters after `xxxxxxxx-y-zz` (got `{}`)", s));
+        return Err(format!(
+            "tax number has trailing characters after `xxxxxxxx-y-zz` (got `{}`)",
+            s
+        ));
     }
     Ok(())
 }
@@ -664,7 +682,11 @@ mod tests {
             (PartnerKind::Both, "\"Both\""),
         ] {
             let json = serde_json::to_string(&variant).unwrap();
-            assert_eq!(json, literal, "PartnerKind::{:?} must emit {}", variant, literal);
+            assert_eq!(
+                json, literal,
+                "PartnerKind::{:?} must emit {}",
+                variant, literal
+            );
             let back: PartnerKind = serde_json::from_str(&json).unwrap();
             assert_eq!(back, variant, "PartnerKind round-trip for {}", literal);
         }
@@ -752,9 +774,14 @@ mod tests {
             ..minimal_valid_inputs()
         };
         let errors = validate_partner_inputs(&bad).expect_err("must reject");
-        let fields: BTreeMap<&'static str, &str> =
-            errors.iter().map(|e| (e.field, e.message.as_str())).collect();
-        assert!(fields.contains_key("display_name"), "must flag display_name");
+        let fields: BTreeMap<&'static str, &str> = errors
+            .iter()
+            .map(|e| (e.field, e.message.as_str()))
+            .collect();
+        assert!(
+            fields.contains_key("display_name"),
+            "must flag display_name"
+        );
         assert!(fields.contains_key("legal_name"), "must flag legal_name");
         assert!(fields.contains_key("tax_number"), "must flag tax_number");
     }

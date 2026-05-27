@@ -229,6 +229,11 @@ where
             idempotency_key: cmd.idempotency_key,
             currency: crate::domain::money::Currency::Huf,
             rate_metadata: None,
+            // PR-73 — in-process handler has no notion of operator-
+            // selected bank account; the binary's SPA-issue route is
+            // the surface that populates this field (same posture as
+            // `rate_metadata` per the PR-44γ comment above).
+            bank_snapshot: None,
         },
         issue_date,
     )?;

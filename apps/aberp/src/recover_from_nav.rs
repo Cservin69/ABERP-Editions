@@ -124,9 +124,7 @@
 
 use std::path::Path;
 
-use aberp_audit_ledger::{
-    self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId,
-};
+use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_billing::{
     self as billing, BillingStore, DuckDbBillingStore, IdempotencyKey, InvoiceSeries, ReadyInvoice,
 };
@@ -269,17 +267,17 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
     //    a parse failure short-circuits the audit write and the
     //    operator inspects the error message + re-runs after the
     //    NAV-testbed verification surfaces the actual shape).
-    let recovered_transaction_id =
-        query_invoice_data::parse_audit_data_transaction_id(&outcome.response_xml).map_err(
-            |e: NavTransportError| {
-                anyhow!(
-                    "queryInvoiceData succeeded but the recovered transactionId could not be \
+    let recovered_transaction_id = query_invoice_data::parse_audit_data_transaction_id(
+        &outcome.response_xml,
+    )
+    .map_err(|e: NavTransportError| {
+        anyhow!(
+            "queryInvoiceData succeeded but the recovered transactionId could not be \
                      parsed from the response: {e} (NAV-side response-shape divergence; \
                      NAV-testbed verification is the named trigger for an amendment ADR \
                      per ADR-0034 §\"Open questions\")"
-                )
-            },
-        )?;
+        )
+    })?;
     tracing::info!(
         recovered_transaction_id = %recovered_transaction_id,
         "queryInvoiceData auditData.transactionId parsed; writing recovered Response"
@@ -618,8 +616,7 @@ fn write_recovered_response_audit_entry(
     recovered_transaction_id: &str,
     response_xml: Vec<u8>,
 ) -> Result<()> {
-    audit_ledger::ensure_schema(conn)
-        .context("ensure audit-ledger schema for recover-from-nav")?;
+    audit_ledger::ensure_schema(conn).context("ensure audit-ledger schema for recover-from-nav")?;
     let tx = conn
         .transaction()
         .context("begin DuckDB transaction (recover-from-nav recovered Response audit append)")?;
@@ -643,9 +640,8 @@ fn write_recovered_response_audit_entry(
     )
     .context("audit_ledger::append_in_tx InvoiceSubmissionResponse (recover-from-nav)")?;
 
-    tx.commit().context(
-        "commit DuckDB transaction (recover-from-nav recovered Response audit append)",
-    )?;
+    tx.commit()
+        .context("commit DuckDB transaction (recover-from-nav recovered Response audit append)")?;
     Ok(())
 }
 
@@ -701,12 +697,7 @@ mod tests {
         (ledger, actor)
     }
 
-    fn write_attempt(
-        ledger: &mut Ledger,
-        actor: &Actor,
-        invoice_id: &str,
-        idem: IdempotencyKey,
-    ) {
+    fn write_attempt(ledger: &mut Ledger, actor: &Actor, invoice_id: &str, idem: IdempotencyKey) {
         let payload = audit_payloads::InvoiceSubmissionAttemptPayload::new(
             invoice_id,
             idem,
@@ -816,7 +807,10 @@ mod tests {
         let got = latest_invoice_check_performed(&ledger, "inv_A")
             .expect("ledger read")
             .expect("must find the latest entry");
-        assert_eq!(got.0, "exists", "latest-by-seq must win over earlier failure");
+        assert_eq!(
+            got.0, "exists",
+            "latest-by-seq must win over earlier failure"
+        );
     }
 
     /// PR-21 / ADR-0034 §5 cross-invoice contamination check: an

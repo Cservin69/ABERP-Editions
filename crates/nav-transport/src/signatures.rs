@@ -446,8 +446,7 @@ fn key_class_breakdown(key: &[u8]) -> KeyClassBreakdown {
             // visually differs from the uppercase-hex signature
             // output — operators scanning the log don't conflate
             // "the bytes that are suspect" with "the bytes I sent".
-            b.nonalnum_bytes_hex
-                .push_str(&format!("{byte:02x}"));
+            b.nonalnum_bytes_hex.push_str(&format!("{byte:02x}"));
         }
     }
     b
@@ -828,16 +827,8 @@ mod tests {
     /// alphanumerics on both sides of a paste artifact at position 5.
     #[test]
     fn request_signature_does_not_trim_interior_whitespace() {
-        let no_interior = request_signature(
-            "REQ-1",
-            "2026-05-25T16:41:07Z",
-            b"abcdefghij",
-        );
-        let with_interior = request_signature(
-            "REQ-1",
-            "2026-05-25T16:41:07Z",
-            b"abcde fghij",
-        );
+        let no_interior = request_signature("REQ-1", "2026-05-25T16:41:07Z", b"abcdefghij");
+        let with_interior = request_signature("REQ-1", "2026-05-25T16:41:07Z", b"abcde fghij");
         assert_ne!(no_interior, with_interior);
     }
 

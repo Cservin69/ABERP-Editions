@@ -408,15 +408,9 @@ pub async fn submit_from_inputs(
 
     // 1. Parse + validate inputs.
     let tenant = TenantId::new(tenant_str.to_string())
-        .ok_or_else(|| {
-            anyhow!(
-                "tenant value '{}' is empty or has a null byte",
-                tenant_str
-            )
-        })
+        .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", tenant_str))
         .map_err(SubmitFromInputsError::Other)?;
-    let tax_number_8 =
-        parse_tax_number_8(tax_number_raw).map_err(SubmitFromInputsError::Other)?;
+    let tax_number_8 = parse_tax_number_8(tax_number_raw).map_err(SubmitFromInputsError::Other)?;
 
     // 3a. PR-9-0 / ADR-0022: validate on-disk XML BEFORE any NAV call.
     aberp_nav_xsd_validator::validate_invoice_data(&invoice_xml)
@@ -463,29 +457,25 @@ pub async fn submit_from_inputs(
     //    already-running multi-thread runtime ("Cannot start a runtime
     //    from within a runtime"). The CLI now owns the runtime at the
     //    top of `run`; the HTTP handler simply `.await`s.
-    let prepared = prepare_for_attempt_audit(
-        nav_endpoint,
-        credentials,
-        &tax_number_8,
-        &invoice_xml,
-    )
-    .await
-    .map_err(|e| match e {
-        PrepareError::NavUpstreamFault {
-            status,
-            fault_code,
-            fault_message,
-            technical_validations,
-            body_preview,
-        } => SubmitFromInputsError::NavUpstreamFault {
-            status,
-            fault_code,
-            fault_message,
-            technical_validations,
-            body_preview,
-        },
-        PrepareError::Other(inner) => SubmitFromInputsError::Other(inner),
-    })?;
+    let prepared =
+        prepare_for_attempt_audit(nav_endpoint, credentials, &tax_number_8, &invoice_xml)
+            .await
+            .map_err(|e| match e {
+                PrepareError::NavUpstreamFault {
+                    status,
+                    fault_code,
+                    fault_message,
+                    technical_validations,
+                    body_preview,
+                } => SubmitFromInputsError::NavUpstreamFault {
+                    status,
+                    fault_code,
+                    fault_message,
+                    technical_validations,
+                    body_preview,
+                },
+                PrepareError::Other(inner) => SubmitFromInputsError::Other(inner),
+            })?;
     tracing::info!(
         request_bytes = prepared.request_xml.len(),
         "manageInvoice envelope built; ready to write TX1 Attempt audit"
@@ -515,11 +505,8 @@ pub async fn submit_from_inputs(
     tracing::info!("TX1 Attempt audit committed; mirror synced; sending manageInvoice");
 
     // 8. Wire send.
-    let wire_result = manage_invoice::send_built_request(
-        &prepared.transport,
-        &prepared.request_xml,
-    )
-    .await;
+    let wire_result =
+        manage_invoice::send_built_request(&prepared.transport, &prepared.request_xml).await;
 
     // 9. TX2 — Response on success, AttemptFailed on failure.
     match wire_result {
@@ -561,8 +548,7 @@ pub async fn submit_from_inputs(
             })
         }
         Err(wire_err) => {
-            let (error_class, error_code) =
-                submission_queue::classify_attempt_failure(&wire_err);
+            let (error_class, error_code) = submission_queue::classify_attempt_failure(&wire_err);
             let error_message = format!("{wire_err}");
             let response_xml: Option<Vec<u8>> = None;
             write_attempt_failed_audit(
@@ -741,9 +727,8 @@ enum PrepareError {
 /// trap by construction: the validator + emitter pair fail together
 /// if a structural assumption breaks.
 fn detect_operation_from_xml(xml: &[u8]) -> Result<InvoiceOperation> {
-    let body = std::str::from_utf8(xml).context(
-        "invoice XML is not valid UTF-8 — NAV requires UTF-8 per the v3.0 schema",
-    )?;
+    let body = std::str::from_utf8(xml)
+        .context("invoice XML is not valid UTF-8 — NAV requires UTF-8 per the v3.0 schema")?;
     if !body.contains("<invoiceReference>") {
         return Ok(InvoiceOperation::Create);
     }
@@ -899,9 +884,8 @@ fn write_attempt_failed_audit(
         Some(idem_str),
     )
     .context("audit_ledger::append_in_tx InvoiceSubmissionAttemptFailed (TX2)")?;
-    tx.commit().context(
-        "commit DuckDB transaction (submit-invoice TX2 AttemptFailed audit append)",
-    )?;
+    tx.commit()
+        .context("commit DuckDB transaction (submit-invoice TX2 AttemptFailed audit append)")?;
     Ok(())
 }
 

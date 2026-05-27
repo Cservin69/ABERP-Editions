@@ -90,9 +90,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aberp_audit_ledger::{
-    self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId,
-};
+use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_billing::{
     self as billing, AllocateArgs, AllocateOutcome, BillingStore, Currency, CustomerId,
     DraftInvoice, DuckDbBillingStore, Huf, IdempotencyKey, InvoiceId, InvoiceSeries,
@@ -107,6 +105,7 @@ use ulid::Ulid;
 use crate::audit_payloads;
 use crate::binary_hash;
 use crate::cli::IssueStornoArgs;
+use crate::invoice_bank_snapshot::load_invoice_bank_snapshot_in_tx;
 use crate::invoice_currency_metadata::{
     inherit_rate_metadata_for_chain, load_invoice_currency_metadata_in_tx,
     require_chain_currency_match,
@@ -225,18 +224,10 @@ pub fn storno_from_inputs(
     }
 
     // 2. Resolve tenant id + series code (loud-fail on invalid input).
-    let tenant = TenantId::new(tenant_str.to_string()).ok_or_else(|| {
-        anyhow!(
-            "tenant value '{}' is empty or has a null byte",
-            tenant_str
-        )
-    })?;
-    let series_code = SeriesCode::new(series_str.to_string()).ok_or_else(|| {
-        anyhow!(
-            "series value '{}' fails SeriesCode validation",
-            series_str
-        )
-    })?;
+    let tenant = TenantId::new(tenant_str.to_string())
+        .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", tenant_str))?;
+    let series_code = SeriesCode::new(series_str.to_string())
+        .ok_or_else(|| anyhow!("series value '{}' fails SeriesCode validation", series_str))?;
 
     // Validate the references shape minimally up-front. The full
     // existence + finalized check happens in step 5 (audit-ledger
@@ -258,12 +249,9 @@ pub fn storno_from_inputs(
     //     against the same ADR-0009 §7 backlog as a fresh invoice.
     //     Loud-fail before any allocator tx opens so the
     //     sequence-slot invariant is preserved.
-    let pending_count = crate::submission_queue::count_pending(
-        db,
-        tenant.clone(),
-        binary_hash_bytes,
-    )
-    .context("count pending submissions (ADR-0031 §5 cap check) for storno")?;
+    let pending_count =
+        crate::submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
+            .context("count pending submissions (ADR-0031 §5 cap check) for storno")?;
     if pending_count >= crate::submission_queue::HARD_CAP_PENDING {
         return Err(anyhow!(
             "submission queue is full ({}/{} pending invoices per ADR-0009 §7 / ADR-0031 §5); \
@@ -309,12 +297,18 @@ pub fn storno_from_inputs(
     // same write-tx that load_ready_invoice_by_id runs in, per ADR-0023
     // §4 + ADR-0037 §4 invariant C6). Setting HUF/None here is the
     // pre-inheritance default; `run_single_tx` overrides per base.
+    // PR-73 / ADR-0040 §addendum — same inheritance posture for the
+    // bank-account snapshot. Storno's regulatory record IS the base
+    // invoice's bank account (the operator cannot choose a different
+    // one when cancelling), so `run_single_tx` inherits the base's
+    // quintet inside the same tx; the placeholder here is `None`.
     let allocate_args = AllocateArgs {
         series_id: series.id,
         draft,
         idempotency_key,
         currency: Currency::Huf,
         rate_metadata: None,
+        bank_snapshot: None,
     };
 
     // 8. One transaction across base-load + chain-index walk + storno
@@ -376,11 +370,7 @@ pub fn storno_from_inputs(
             name: input.customer.name,
         },
     };
-    let base_invoice_number = format!(
-        "{}/{:05}",
-        series_code.as_str(),
-        base_sequence_number
-    );
+    let base_invoice_number = format!("{}/{:05}", series_code.as_str(), base_sequence_number);
     let storno_reference = StornoReference {
         base_invoice_number,
         modification_index,
@@ -394,8 +384,9 @@ pub fn storno_from_inputs(
         chain_rate_metadata.as_ref(),
     )
     .context("render NAV storno XML")?;
-    aberp_nav_xsd_validator::validate_invoice_data(&xml)
-        .context("NAV InvoiceData v3.0 invariant check (ADR-0022) failed for rendered storno XML")?;
+    aberp_nav_xsd_validator::validate_invoice_data(&xml).context(
+        "NAV InvoiceData v3.0 invariant check (ADR-0022) failed for rendered storno XML",
+    )?;
     tracing::info!(
         bytes = xml.len(),
         nav_xsd_version = aberp_nav_xsd_validator::NAV_XSD_VERSION,
@@ -404,11 +395,7 @@ pub fn storno_from_inputs(
     nav_xml::write_to_path(&nav_xml_out, &xml)?;
     tracing::info!(path = %nav_xml_out.display(), bytes = xml.len(), "NAV storno XML written");
 
-    let invoice_number = format!(
-        "{}/{:05}",
-        series_code.as_str(),
-        storno.sequence_number
-    );
+    let invoice_number = format!("{}/{:05}", series_code.as_str(), storno.sequence_number);
     Ok(StornoIssuedSummary {
         invoice_id: storno.id.to_prefixed_string(),
         invoice_number,
@@ -668,20 +655,20 @@ fn run_single_tx(
     //      Finalized. The storno's huf_equivalent_total is computed
     //      against its OWN negated gross (matching what
     //      `nav_xml::render_storno_data` emits on the wire).
-    let base_currency_metadata =
-        load_invoice_currency_metadata_in_tx(&tx, base_invoice_id)
-            .context("load base invoice currency metadata for storno (ADR-0037 §4 C6)")?;
-    let storno_positive_gross_cents: i64 = allocate_args
-        .draft
-        .lines
-        .iter()
-        .try_fold(0i64, |acc, line| {
-            let line_gross = line
-                .gross_total()
-                .ok_or_else(|| anyhow!("storno line gross_total overflow"))?;
-            acc.checked_add(line_gross.as_i64())
-                .ok_or_else(|| anyhow!("storno gross accumulator overflow"))
-        })?;
+    let base_currency_metadata = load_invoice_currency_metadata_in_tx(&tx, base_invoice_id)
+        .context("load base invoice currency metadata for storno (ADR-0037 §4 C6)")?;
+    let storno_positive_gross_cents: i64 =
+        allocate_args
+            .draft
+            .lines
+            .iter()
+            .try_fold(0i64, |acc, line| {
+                let line_gross = line
+                    .gross_total()
+                    .ok_or_else(|| anyhow!("storno line gross_total overflow"))?;
+                acc.checked_add(line_gross.as_i64())
+                    .ok_or_else(|| anyhow!("storno gross accumulator overflow"))
+            })?;
     let storno_negated_gross_cents = storno_positive_gross_cents
         .checked_neg()
         .ok_or_else(|| anyhow!("storno gross negation overflow"))?;
@@ -690,6 +677,18 @@ fn run_single_tx(
             .context("inherit rate metadata for storno chain child")?;
     allocate_args.currency = inherited_currency;
     allocate_args.rate_metadata = inherited_rate_metadata.clone();
+    // PR-73 / ADR-0040 §addendum — chain children inherit the BASE
+    // invoice's bank-account snapshot verbatim. Re-resolving against
+    // current `seller.toml` could surface a different bank if the
+    // operator rotated the per-currency default between issuance and
+    // storno; the regulatory record is "the bank account the base
+    // asked to be paid to." A `None` snapshot (pre-PR-73 base) propagates
+    // forward as `None` — the chain child has no bank-account snapshot
+    // either, matching the base's render.
+    let inherited_bank_snapshot = load_invoice_bank_snapshot_in_tx(&tx, base_invoice_id)
+        .context("load base invoice bank snapshot for storno chain inheritance")?
+        .into_typed();
+    allocate_args.bank_snapshot = inherited_bank_snapshot.clone();
     // (a'') Defensive C6 invariant guard. By construction
     //       allocate_args.currency == base_currency_metadata.currency
     //       (we just assigned it), so this never trips at runtime via
@@ -711,8 +710,8 @@ fn run_single_tx(
     // (c) Standard allocator path: burn the storno's own sequence
     //     number + write its reservation + invoice rows.
     let now = OffsetDateTime::now_utc();
-    let outcome =
-        billing::allocate_in_tx(&tx, allocate_args, now).context("billing::allocate_in_tx (storno)")?;
+    let outcome = billing::allocate_in_tx(&tx, allocate_args, now)
+        .context("billing::allocate_in_tx (storno)")?;
 
     let (storno_invoice, reservation, was_fresh) = match outcome {
         AllocateOutcome::Fresh {
@@ -767,7 +766,10 @@ fn run_single_tx(
                 idempotency_key,
                 nav_xml_path,
             )
-        };
+        }
+        // PR-73 / ADR-0040 §addendum — inherit the base's bank-account
+        // snapshot onto the storno's audit payload.
+        .with_bank_snapshot(inherited_bank_snapshot.as_ref());
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
@@ -862,8 +864,7 @@ fn next_modification_index_in_tx(
                          — audit ledger appears tampered or schema-drifted"
                     )
                 })?;
-            if payload.base_invoice_id == base_invoice_id
-                && payload.modification_index > max_index
+            if payload.base_invoice_id == base_invoice_id && payload.modification_index > max_index
             {
                 max_index = payload.modification_index;
             }
@@ -886,12 +887,11 @@ fn next_modification_index_in_tx(
             let payload: audit_payloads::InvoiceModificationIssuedPayload =
                 serde_json::from_slice(&payload_bytes).map_err(|e| {
                     anyhow!(
-                        "InvoiceModificationIssued audit payload (seq {seq}) failed typed decode: {e} \
+                    "InvoiceModificationIssued audit payload (seq {seq}) failed typed decode: {e} \
                          — audit ledger appears tampered or schema-drifted"
-                    )
+                )
                 })?;
-            if payload.base_invoice_id == base_invoice_id
-                && payload.modification_index > max_index
+            if payload.base_invoice_id == base_invoice_id && payload.modification_index > max_index
             {
                 max_index = payload.modification_index;
             }
@@ -906,7 +906,10 @@ fn next_modification_index_in_tx(
 // Storno command construction — same shape as issue_invoice
 // ──────────────────────────────────────────────────────────────────────
 
-fn build_storno_command(input: &InvoiceInputJson, code: &SeriesCode) -> Result<IssueInvoiceCommand> {
+fn build_storno_command(
+    input: &InvoiceInputJson,
+    code: &SeriesCode,
+) -> Result<IssueInvoiceCommand> {
     let lines = input
         .lines
         .iter()
@@ -990,8 +993,7 @@ mod tests {
 
     #[test]
     fn next_modification_index_increments_past_max_against_same_base() {
-        let mut conn =
-            fixture_ledger_with_chain(&[("inv_BASE", 1), ("inv_BASE", 2)]);
+        let mut conn = fixture_ledger_with_chain(&[("inv_BASE", 1), ("inv_BASE", 2)]);
         let tx = conn.transaction().unwrap();
         let idx = next_modification_index_in_tx(&tx, "inv_BASE").unwrap();
         assert_eq!(idx, 3);
@@ -1002,11 +1004,8 @@ mod tests {
     /// failure mode. The walker must isolate by base_invoice_id.
     #[test]
     fn next_modification_index_ignores_unrelated_base() {
-        let mut conn = fixture_ledger_with_chain(&[
-            ("inv_OTHER", 1),
-            ("inv_OTHER", 2),
-            ("inv_OTHER", 3),
-        ]);
+        let mut conn =
+            fixture_ledger_with_chain(&[("inv_OTHER", 1), ("inv_OTHER", 2), ("inv_OTHER", 3)]);
         let tx = conn.transaction().unwrap();
         let idx = next_modification_index_in_tx(&tx, "inv_BASE").unwrap();
         assert_eq!(

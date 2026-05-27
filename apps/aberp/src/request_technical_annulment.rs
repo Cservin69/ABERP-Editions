@@ -63,9 +63,7 @@
 //! annulment decision regardless of whether the operator's
 //! workstation has a keychain.
 
-use aberp_audit_ledger::{
-    self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId,
-};
+use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_billing::IdempotencyKey;
 use anyhow::{anyhow, bail, Context, Result};
 use duckdb::Connection;
@@ -211,9 +209,8 @@ pub fn run(args: &RequestTechnicalAnnulmentArgs) -> Result<()> {
     };
     let xml = nav_xml::render_annulment_data(&annulment_reference)
         .context("render NAV InvoiceAnnulment XML")?;
-    check_annulment_xml_minimum(&xml).context(
-        "rendered InvoiceAnnulment XML failed the call-site sanity check (ADR-0025 §4)",
-    )?;
+    check_annulment_xml_minimum(&xml)
+        .context("rendered InvoiceAnnulment XML failed the call-site sanity check (ADR-0025 §4)")?;
     tracing::info!(
         bytes = xml.len(),
         "InvoiceAnnulment XML passed call-site sanity check (full XSD validator deferred per ADR-0025 §4)"
@@ -505,9 +502,7 @@ mod tests {
     /// optionally by a submission response (`InvoiceSubmissionResponse`)
     /// and any other entries the test wants to seed. Returns the
     /// (in-memory) ledger for the test to read.
-    fn ledger_with_entries(
-        entries: Vec<(EventKind, Vec<u8>, Option<String>)>,
-    ) -> Ledger {
+    fn ledger_with_entries(entries: Vec<(EventKind, Vec<u8>, Option<String>)>) -> Ledger {
         let tenant = TenantId::new("t1".to_string()).unwrap();
         let bh = BinaryHash::from_bytes([0u8; 32]);
         let mut ledger = Ledger::open_in_memory(tenant, bh).unwrap();
@@ -567,8 +562,8 @@ mod tests {
             ),
         ];
         let ledger = ledger_with_entries(entries);
-        let pre = check_base_is_annullable(&ledger, "inv_A")
-            .expect("submitted base must be annullable");
+        let pre =
+            check_base_is_annullable(&ledger, "inv_A").expect("submitted base must be annullable");
         assert_eq!(pre.prior_transaction_id, "TXID-7");
         assert_eq!(pre.base_sequence_number, 7);
         assert_eq!(pre.base_invoice_number, "INV-default/00007");

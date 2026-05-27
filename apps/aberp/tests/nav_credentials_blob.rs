@@ -43,9 +43,7 @@ use aberp_nav_transport::credentials::keychain::{
     ITEM_PASSWORD, ITEM_SIGN_KEY,
 };
 use aberp_nav_transport::credentials::NavCredentials;
-use keyring::credential::{
-    Credential, CredentialApi, CredentialBuilderApi, CredentialPersistence,
-};
+use keyring::credential::{Credential, CredentialApi, CredentialBuilderApi, CredentialPersistence};
 use keyring::Error as KeyringError;
 use ulid::Ulid;
 
@@ -259,15 +257,13 @@ fn rotation_preserves_other_three_fields() {
     let tenant = unique_tenant("rotate");
 
     // Set up a populated blob.
-    write_blob(&tenant, "lg-pre", "pw-pre", "sk-pre", "ck-pre")
-        .expect("seed blob must succeed");
+    write_blob(&tenant, "lg-pre", "pw-pre", "sk-pre", "ck-pre").expect("seed blob must succeed");
 
     // Build a minimal AppState to invoke the rotation helper. We
     // reuse the helper directly (not the HTTP route) to keep this
     // file independent of axum.
     use std::sync::Arc;
-    let tenant_id =
-        aberp_audit_ledger::TenantId::new(tenant.to_string()).expect("tenant id");
+    let tenant_id = aberp_audit_ledger::TenantId::new(tenant.to_string()).expect("tenant id");
     let binary_hash = aberp_audit_ledger::BinaryHash::from_bytes([0u8; 32]);
     let state = aberp::serve::AppState {
         db_path: Arc::new(std::env::temp_dir().join(format!("aberp-blob-{}.duckdb", Ulid::new()))),
@@ -285,11 +281,19 @@ fn rotation_preserves_other_three_fields() {
     aberp::serve::rotate_nav_credential_request(&state, "password", "pw-NEW")
         .expect("password rotation must succeed");
 
-    let creds = NavCredentials::load_from_keychain(&tenant)
-        .expect("blob must round-trip after rotation");
+    let creds =
+        NavCredentials::load_from_keychain(&tenant).expect("blob must round-trip after rotation");
     assert_eq!(creds.login(), "lg-pre", "login must NOT have changed");
-    assert_eq!(creds.password_bytes(), b"pw-NEW", "password must have changed");
-    assert_eq!(creds.sign_key_bytes(), b"sk-pre", "sign_key must NOT have changed");
+    assert_eq!(
+        creds.password_bytes(),
+        b"pw-NEW",
+        "password must have changed"
+    );
+    assert_eq!(
+        creds.sign_key_bytes(),
+        b"sk-pre",
+        "sign_key must NOT have changed"
+    );
     assert_eq!(
         creds.change_key_bytes(),
         b"ck-pre",

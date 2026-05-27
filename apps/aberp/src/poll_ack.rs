@@ -341,17 +341,13 @@ pub async fn poll_ack_from_inputs(
     actor: Actor,
 ) -> Result<PollAckOutcome> {
     // 1. Parse + validate inputs.
-    let tenant = TenantId::new(tenant_str.to_string()).ok_or_else(|| {
-        anyhow!(
-            "tenant value '{}' is empty or has a null byte",
-            tenant_str
-        )
-    })?;
+    let tenant = TenantId::new(tenant_str.to_string())
+        .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", tenant_str))?;
     let tax_number_8 = parse_tax_number_8(tax_number_raw)?;
 
     // 3. Open DuckDB; load the invoice + its idempotency key.
-    let mut conn = Connection::open(db)
-        .with_context(|| format!("open tenant DuckDB at {}", db.display()))?;
+    let mut conn =
+        Connection::open(db).with_context(|| format!("open tenant DuckDB at {}", db.display()))?;
     let (ready_invoice, idempotency_key) = load_issued_invoice(&mut conn, invoice_id_str)?;
     if ready_invoice.id.to_prefixed_string() != invoice_id_str {
         return Err(anyhow!(
@@ -413,8 +409,12 @@ pub async fn poll_ack_from_inputs(
         .context("sync audit-ledger mirror file after poll-ack commit")?;
 
     let (terminal, attempts_made) = match terminus {
-        LoopTerminus::LastStatus(ProcessingStatus::Saved) => (PollAckTerminal::Finalized, MAX_POLL_ATTEMPTS),
-        LoopTerminus::LastStatus(ProcessingStatus::Aborted) => (PollAckTerminal::Rejected, MAX_POLL_ATTEMPTS),
+        LoopTerminus::LastStatus(ProcessingStatus::Saved) => {
+            (PollAckTerminal::Finalized, MAX_POLL_ATTEMPTS)
+        }
+        LoopTerminus::LastStatus(ProcessingStatus::Aborted) => {
+            (PollAckTerminal::Rejected, MAX_POLL_ATTEMPTS)
+        }
         LoopTerminus::LastStatus(intermediate) => (
             PollAckTerminal::StuckIntermediate {
                 last_status: intermediate.as_nav_str().to_string(),

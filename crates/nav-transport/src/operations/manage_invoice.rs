@@ -144,13 +144,15 @@ pub async fn send_built_request(
         .to_vec();
 
     if !status.is_success() {
-        let body_str = String::from_utf8_lossy(&response_xml);
-        tracing::error!(
-            target: "aberp_nav_transport::operations::manage_invoice",
-            status = status.as_u16(),
-            response_body = %body_str,
-            "manageInvoice non-success HTTP status — full NAV response"
-        );
+        // PR-65 / session-86 — the verbose `tracing::error!` that
+        // dumped the full NAV response body here was a debug-arc
+        // diagnostic from sessions 78-84 (the great signature
+        // debugging) and is now noise post-fix. The typed
+        // `NavTransportError::ManageInvoiceHttpStatus` already
+        // carries the status; the route boundary surfaces it via
+        // the SPA's A157 inline render. If a future investigation
+        // wants the body, re-add the log behind an env-gated debug
+        // hook rather than as a permanent `error!`.
         return Err(NavTransportError::ManageInvoiceHttpStatus {
             status: status.as_u16(),
         });

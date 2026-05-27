@@ -34,9 +34,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
-use aberp_billing::{
-    CustomerId, Huf, IdempotencyKey, InvoiceId, LineItem, ReadyInvoice, SeriesId,
-};
+use aberp_billing::{CustomerId, Huf, IdempotencyKey, InvoiceId, LineItem, ReadyInvoice, SeriesId};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
@@ -107,7 +105,6 @@ fn fixture_request_body(currency: aberp_billing::Currency) -> ModificationInvoic
         series: None,
     }
 }
-
 
 fn open_ledger(db_path: &PathBuf) -> Ledger {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
@@ -264,6 +261,7 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
         xml_out,
         Actor::from_local_cli("sess".to_string(), "test-user"),
         &NeverProvider,
+        None,
     )
     .await
     .expect("issue base HUF invoice");

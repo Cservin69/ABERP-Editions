@@ -92,10 +92,7 @@ pub enum NavTransportError {
     /// <X>`), which overwrites the blob with a fresh, well-formed
     /// payload.
     #[error("NAV credentials blob malformed for tenant `{tenant_id}`: {detail}")]
-    KeychainBlobMalformed {
-        tenant_id: String,
-        detail: String,
-    },
+    KeychainBlobMalformed { tenant_id: String, detail: String },
 
     // ── 4. SOAP envelope construction (PR-7-B-1) ────────────────────
     /// `quick_xml::Writer` returned an error while assembling the

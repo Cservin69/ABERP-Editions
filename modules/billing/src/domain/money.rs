@@ -48,8 +48,6 @@ impl fmt::Display for Huf {
     }
 }
 
-
-
 /// EUR implemented by Ervin
 /// Internal representation: cents (i64) → exact two decimal places, no rounding issues
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -251,6 +249,50 @@ pub struct RateMetadata {
     pub huf_equivalent_total: i64,
 }
 
+/// PR-73 / ADR-0040 §addendum — denormalized per-invoice snapshot of the
+/// `[[seller.banks]]` entry the operator selected (or defaulted to) at
+/// issuance time.
+///
+/// Inline-stamped onto each issued invoice row rather than resolved live
+/// from `seller.toml` at read time. Two forces drove the inline-stamp
+/// posture (mirroring [`RateMetadata`]'s rationale):
+///
+/// 1. **Operator-twin survivor.** If the operator later edits or deletes
+///    the `SellerBank` entry, the historical invoice continues to render
+///    the bank account it was issued with. The `id` field is preserved
+///    so a future audit can pivot back to the still-present entry when
+///    one exists; the other four fields are the regulatory-record copy.
+/// 2. **No retroactive rewrite.** Pre-PR-73 invoices carry the snapshot
+///    as NULL across all five columns — they were issued before the
+///    multi-bank-account schema existed, and the read path falls back
+///    to "(no bank account on file)" rendering rather than silently
+///    fabricating one from current state.
+///
+/// Chain children (storno + modification) inherit the snapshot verbatim
+/// from the base invoice rather than re-resolving against the operator's
+/// current `seller.toml` — the regulatory record is "the bank account
+/// the base invoice asked to be paid to", and a fresh resolution at chain
+/// time could surface a different account if the operator rotated the
+/// default between issuance and storno/modification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BankAccountSnapshot {
+    /// `bnk_<26-char>` deterministic id from `aberp::seller_banks` per
+    /// ADR-0040 §1.
+    pub id: String,
+    /// ISO 4217 string (`"HUF"` / `"EUR"`) of the bank account at
+    /// issuance time. Pinned to the invoice's currency by the route
+    /// resolver (currency mismatch surfaces as
+    /// `InvoicePreflightError::SellerBankCurrencyMismatch`).
+    pub currency: String,
+    /// Bank account number string verbatim — IBAN form for EUR,
+    /// domestic form for HUF.
+    pub account_number: String,
+    /// Operator-typed bank name (e.g., `"Erste Bank"`).
+    pub bank_name: String,
+    /// SWIFT/BIC code (8 or 11 chars).
+    pub swift_bic: String,
+}
+
 /// Round-half-even (banker's rounding) HUF-equivalent of an EUR cent
 /// amount converted at `rate` (HUF per 1 EUR). Per ADR-0037 §1.c +
 /// §4 invariant C11 / A137 — the Áfa-convention rounding mode that
@@ -320,13 +362,10 @@ mod currency_tests {
     /// rule 12 (fail loud).
     #[test]
     fn currency_wire_shape_pins_iso_4217_strings() {
-        let cases: [(Currency, &str); 2] = [
-            (Currency::Huf, "HUF"),
-            (Currency::Eur, "EUR"),
-        ];
+        let cases: [(Currency, &str); 2] = [(Currency::Huf, "HUF"), (Currency::Eur, "EUR")];
         for (variant, expected) in cases {
-            let value = serde_json::to_value(variant)
-                .expect("Currency variants must always serialise");
+            let value =
+                serde_json::to_value(variant).expect("Currency variants must always serialise");
             assert_eq!(
                 value,
                 serde_json::Value::String(expected.to_string()),

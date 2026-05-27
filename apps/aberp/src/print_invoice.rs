@@ -144,9 +144,8 @@ pub fn render_to_bytes(
     tenant: &str,
     seller_toml: Option<&Path>,
 ) -> Result<RenderedInvoice> {
-    let tenant_id = TenantId::new(tenant.to_string()).ok_or_else(|| {
-        anyhow!("--tenant value '{}' is empty or has a null byte", tenant)
-    })?;
+    let tenant_id = TenantId::new(tenant.to_string())
+        .ok_or_else(|| anyhow!("--tenant value '{}' is empty or has a null byte", tenant))?;
 
     // 1. Locate the InvoiceDraftCreated payload from the audit ledger.
     //    The binary hash is computed but only used to satisfy the
@@ -171,8 +170,8 @@ pub fn render_to_bytes(
                 invoice_id
             )
         })?;
-    let xml_bytes = fs::read(&xml_path)
-        .with_context(|| format!("read NAV XML from {}", xml_path.display()))?;
+    let xml_bytes =
+        fs::read(&xml_path).with_context(|| format!("read NAV XML from {}", xml_path.display()))?;
 
     // 3. Parse NAV XML for the printed-invoice field set.
     let parsed = parse_nav_invoice_xml(&xml_bytes)
@@ -188,12 +187,8 @@ pub fn render_to_bytes(
     //    that don't appear on the NAV body but are on the printed
     //    invoice per the reference template).
     let seller_toml_path = resolve_seller_toml_path(seller_toml, tenant)?;
-    let seller_info = read_seller_toml(&seller_toml_path).with_context(|| {
-        format!(
-            "read seller-info TOML at {}",
-            seller_toml_path.display()
-        )
-    })?;
+    let seller_info = read_seller_toml(&seller_toml_path)
+        .with_context(|| format!("read seller-info TOML at {}", seller_toml_path.display()))?;
 
     // 6. Build the renderer model.
     let supplier = PartyInfo {
@@ -257,10 +252,7 @@ pub fn render_to_bytes(
 // Audit-ledger lookup
 // ──────────────────────────────────────────────────────────────────────
 
-fn find_invoice_draft(
-    ledger: &Ledger,
-    invoice_id: &str,
-) -> Result<InvoiceDraftCreatedPayload> {
+fn find_invoice_draft(ledger: &Ledger, invoice_id: &str) -> Result<InvoiceDraftCreatedPayload> {
     let entries = ledger
         .entries()
         .context("read audit-ledger entries to resolve InvoiceDraftCreated")?;
@@ -331,9 +323,10 @@ fn build_rate_metadata_from_payload(
         .exchange_rate_date
         .as_deref()
         .ok_or_else(|| anyhow!("non-HUF InvoiceDraftCreated has no exchange_rate_date"))?;
-    let huf_total_str = payload.huf_equivalent_total.as_deref().ok_or_else(|| {
-        anyhow!("non-HUF InvoiceDraftCreated has no huf_equivalent_total")
-    })?;
+    let huf_total_str = payload
+        .huf_equivalent_total
+        .as_deref()
+        .ok_or_else(|| anyhow!("non-HUF InvoiceDraftCreated has no huf_equivalent_total"))?;
 
     let rate = Decimal::from_str(rate_str).map_err(|_| {
         anyhow!(
@@ -342,14 +335,13 @@ fn build_rate_metadata_from_payload(
             rate_str
         )
     })?;
-    let date = Date::parse(date_str, &format_description!("[year]-[month]-[day]")).map_err(
-        |e| {
+    let date =
+        Date::parse(date_str, &format_description!("[year]-[month]-[day]")).map_err(|e| {
             anyhow!(
                 "InvoiceDraftCreated.exchange_rate_date `{}` does not parse as YYYY-MM-DD: {e}",
                 date_str
             )
-        },
-    )?;
+        })?;
     let huf_equivalent_total = i64::from_str(huf_total_str).map_err(|_| {
         anyhow!(
             "InvoiceDraftCreated.huf_equivalent_total `{}` is not a parseable i64 — \
@@ -445,14 +437,29 @@ pub fn parse_nav_invoice_xml(bytes: &[u8]) -> Result<ParsedNavInvoice> {
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Err(e) => return Err(anyhow!("XML parse error at position {}: {e}", reader.buffer_position())),
+            Err(e) => {
+                return Err(anyhow!(
+                    "XML parse error at position {}: {e}",
+                    reader.buffer_position()
+                ))
+            }
             Ok(Event::Eof) => break,
             Ok(Event::Start(e)) => {
-                let name =
-                    String::from_utf8_lossy(local_name(e.name().as_ref())).to_string();
+                let name = String::from_utf8_lossy(local_name(e.name().as_ref())).to_string();
                 path.push(name.clone());
                 match name.as_str() {
-                    "line" if matches_path(&path, &["InvoiceData", "invoiceMain", "invoice", "invoiceLines", "line"]) => {
+                    "line"
+                        if matches_path(
+                            &path,
+                            &[
+                                "InvoiceData",
+                                "invoiceMain",
+                                "invoice",
+                                "invoiceLines",
+                                "line",
+                            ],
+                        ) =>
+                    {
                         cur_line = Some(ParsedNavLine::default());
                     }
                     "supplierAddress" => {
@@ -463,8 +470,7 @@ pub fn parse_nav_invoice_xml(bytes: &[u8]) -> Result<ParsedNavInvoice> {
                 }
             }
             Ok(Event::End(e)) => {
-                let name =
-                    String::from_utf8_lossy(local_name(e.name().as_ref())).to_string();
+                let name = String::from_utf8_lossy(local_name(e.name().as_ref())).to_string();
                 if name == "line" && cur_line.is_some() {
                     out.lines.push(cur_line.take().unwrap());
                 }
@@ -649,16 +655,14 @@ fn handle_text(
             "vatPercentage" if ends_with(path, &["lineVatRate", "vatPercentage"]) => {
                 // NAV writes the VAT rate as `0.27` (27%). Convert to
                 // a u16 percent by × 100 + round.
-                let dec: Decimal = Decimal::from_str(value).map_err(|e| {
-                    anyhow!("<vatPercentage> `{value}` parse: {e}")
-                })?;
+                let dec: Decimal = Decimal::from_str(value)
+                    .map_err(|e| anyhow!("<vatPercentage> `{value}` parse: {e}"))?;
                 let pct = dec
                     .checked_mul(Decimal::from(100))
                     .ok_or_else(|| anyhow!("<vatPercentage> × 100 overflow"))?;
                 let pct_rounded = pct.round();
-                line.vat_rate_percent =
-                    rust_decimal::prelude::ToPrimitive::to_u16(&pct_rounded)
-                        .ok_or_else(|| anyhow!("<vatPercentage> → u16 overflow"))?;
+                line.vat_rate_percent = rust_decimal::prelude::ToPrimitive::to_u16(&pct_rounded)
+                    .ok_or_else(|| anyhow!("<vatPercentage> → u16 overflow"))?;
             }
             _ => {}
         }
@@ -719,10 +723,7 @@ pub struct SellerToml {
     pub swift_bic: Option<String>,
 }
 
-fn resolve_seller_toml_path(
-    explicit_override: Option<&Path>,
-    tenant: &str,
-) -> Result<PathBuf> {
+fn resolve_seller_toml_path(explicit_override: Option<&Path>, tenant: &str) -> Result<PathBuf> {
     if let Some(p) = explicit_override {
         return Ok(p.to_path_buf());
     }
@@ -828,7 +829,10 @@ swift_bic = "OTPVHUHB"
             parsed.bank_account_number.as_deref(),
             Some("12345678-12345678-12345678")
         );
-        assert_eq!(parsed.iban.as_deref(), Some("HU12 1234 5678 9012 3456 7890"));
+        assert_eq!(
+            parsed.iban.as_deref(),
+            Some("HU12 1234 5678 9012 3456 7890")
+        );
         assert_eq!(parsed.bank_name.as_deref(), Some("OTP Bank"));
         assert_eq!(parsed.swift_bic.as_deref(), Some("OTPVHUHB"));
     }

@@ -76,6 +76,12 @@ fn build_allocate_args(series_id: SeriesId, idem: IdempotencyKey) -> AllocateArg
         idempotency_key: idem,
         currency: Currency::Huf,
         rate_metadata: None,
+        // PR-73 — round-trip test exercises the in-memory store path
+        // which does not run the route resolver. Match the
+        // `modules/billing/src/app/issue_invoice.rs` handler's posture
+        // (per the comment there): in-process callers pass `None`;
+        // only the SPA-issue route populates this field.
+        bank_snapshot: None,
     }
 }
 
@@ -96,8 +102,8 @@ fn allocate_in_tx_idempotency_key_round_trips_through_load_ready() {
         let tx = conn.transaction().expect("begin tx");
         let args = build_allocate_args(series_id, original_key);
         let id_str = args.draft.id.to_prefixed_string();
-        let outcome = allocate_in_tx(&tx, args, OffsetDateTime::now_utc())
-            .expect("allocate_in_tx Ok");
+        let outcome =
+            allocate_in_tx(&tx, args, OffsetDateTime::now_utc()).expect("allocate_in_tx Ok");
         match outcome {
             AllocateOutcome::Fresh { .. } => {}
             AllocateOutcome::Replay { .. } => panic!("fresh issuance must not Replay"),
@@ -108,8 +114,8 @@ fn allocate_in_tx_idempotency_key_round_trips_through_load_ready() {
 
     let read_back = {
         let tx = conn.transaction().expect("begin read tx");
-        let pair = load_ready_invoice_by_id(&tx, &draft_id_str)
-            .expect("load_ready_invoice_by_id Ok");
+        let pair =
+            load_ready_invoice_by_id(&tx, &draft_id_str).expect("load_ready_invoice_by_id Ok");
         tx.commit().expect("commit read tx");
         pair.expect("invoice must be present after allocate+commit")
     };
@@ -145,8 +151,7 @@ fn invoice_idempotency_key_on_disk_format_is_canonical_idem_prefix() {
     {
         let tx = conn.transaction().expect("begin tx");
         let args = build_allocate_args(series_id, key);
-        allocate_in_tx(&tx, args, OffsetDateTime::now_utc())
-            .expect("allocate_in_tx Ok");
+        allocate_in_tx(&tx, args, OffsetDateTime::now_utc()).expect("allocate_in_tx Ok");
         tx.commit().expect("commit");
     }
 

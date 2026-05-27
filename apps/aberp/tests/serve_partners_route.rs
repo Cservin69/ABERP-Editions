@@ -33,9 +33,7 @@ use aberp_audit_ledger::{BinaryHash, TenantId};
 use ulid::Ulid;
 
 use aberp::partners::{PartnerInputs, PartnerKind};
-use aberp::serve::{
-    self, AppState, PartnerRouteError,
-};
+use aberp::serve::{self, AppState, PartnerRouteError};
 
 const TEST_TENANT: &str = "serve_partners_route_test";
 
@@ -99,8 +97,8 @@ fn partners_create_happy_path_returns_populated_partner() {
     let state = build_state(dir.join("aberp.duckdb"));
     let inputs = minimal_valid_inputs("BSCE");
 
-    let partner = serve::create_partner_request(&state, &inputs)
-        .expect("create happy path must succeed");
+    let partner =
+        serve::create_partner_request(&state, &inputs).expect("create happy path must succeed");
 
     assert!(
         partner.id.starts_with("prt_"),
@@ -150,8 +148,8 @@ fn partners_create_rejects_invalid_inputs_with_structured_errors() {
         contact_phone: None,
     };
 
-    let err = serve::create_partner_request(&state, &inputs)
-        .expect_err("invalid inputs must reject");
+    let err =
+        serve::create_partner_request(&state, &inputs).expect_err("invalid inputs must reject");
     let errors = match err {
         PartnerRouteError::Validation(v) => v,
         other => panic!("expected Validation, got {other:?}"),
@@ -179,13 +177,10 @@ fn partners_list_returns_active_rows_ordered_by_display_name() {
     let dir = test_dir("list");
     let state = build_state(dir.join("aberp.duckdb"));
 
-    serve::create_partner_request(&state, &minimal_valid_inputs("Zeta"))
-        .expect("create Zeta");
-    serve::create_partner_request(&state, &minimal_valid_inputs("Alpha"))
-        .expect("create Alpha");
+    serve::create_partner_request(&state, &minimal_valid_inputs("Zeta")).expect("create Zeta");
+    serve::create_partner_request(&state, &minimal_valid_inputs("Alpha")).expect("create Alpha");
 
-    let listed = serve::list_partners_request(&state, None)
-        .expect("list must succeed");
+    let listed = serve::list_partners_request(&state, None).expect("list must succeed");
     assert_eq!(listed.len(), 2, "list must return both created partners");
     assert_eq!(
         listed[0].display_name, "Alpha",
@@ -195,8 +190,7 @@ fn partners_list_returns_active_rows_ordered_by_display_name() {
 
     // ?search=al filters case-insensitive prefix on display_name OR
     // legal_name. "Alpha" matches; "Zeta" does not.
-    let filtered = serve::list_partners_request(&state, Some("al"))
-        .expect("search must succeed");
+    let filtered = serve::list_partners_request(&state, Some("al")).expect("search must succeed");
     assert_eq!(filtered.len(), 1, "search=al must match Alpha only");
     assert_eq!(filtered[0].display_name, "Alpha");
 
@@ -212,9 +206,11 @@ fn partners_get_by_id_round_trips_every_field() {
     let created = serve::create_partner_request(&state, &minimal_valid_inputs("Test"))
         .expect("create must succeed");
 
-    let fetched = serve::get_partner_request(&state, &created.id)
-        .expect("get must succeed");
-    assert_eq!(fetched, created, "get must return the exact Partner stored at create");
+    let fetched = serve::get_partner_request(&state, &created.id).expect("get must succeed");
+    assert_eq!(
+        fetched, created,
+        "get must return the exact Partner stored at create"
+    );
 
     // Unknown id surfaces as NotFound (404 at the HTTP layer).
     let unknown_id = format!("prt_{}", Ulid::new());
@@ -233,8 +229,8 @@ fn partners_get_by_id_round_trips_every_field() {
 fn partners_update_persists_mutated_field_and_bumps_updated_at() {
     let dir = test_dir("update");
     let state = build_state(dir.join("aberp.duckdb"));
-    let created = serve::create_partner_request(&state, &minimal_valid_inputs("Original"))
-        .expect("create");
+    let created =
+        serve::create_partner_request(&state, &minimal_valid_inputs("Original")).expect("create");
 
     // Sleep a millisecond so the formatted Rfc3339 string definitely
     // advances. Without this the test can race the same-instant case
@@ -276,8 +272,8 @@ fn partners_update_persists_mutated_field_and_bumps_updated_at() {
 fn partners_soft_delete_makes_partner_invisible_to_api() {
     let dir = test_dir("delete");
     let state = build_state(dir.join("aberp.duckdb"));
-    let created = serve::create_partner_request(&state, &minimal_valid_inputs("ToDelete"))
-        .expect("create");
+    let created =
+        serve::create_partner_request(&state, &minimal_valid_inputs("ToDelete")).expect("create");
 
     serve::delete_partner_request(&state, &created.id).expect("delete must succeed");
 

@@ -59,9 +59,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aberp_audit_ledger::{
-    self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId,
-};
+use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_billing::{
     self as billing, AllocateArgs, AllocateOutcome, BillingStore, Currency, CustomerId,
     DraftInvoice, DuckDbBillingStore, Huf, IdempotencyKey, InvoiceId, InvoiceSeries,
@@ -78,14 +76,13 @@ use ulid::Ulid;
 use crate::audit_payloads;
 use crate::binary_hash;
 use crate::cli::IssueModificationArgs;
+use crate::invoice_bank_snapshot::load_invoice_bank_snapshot_in_tx;
 use crate::invoice_currency_metadata::{
     inherit_rate_metadata_for_chain, load_invoice_currency_metadata_in_tx,
     require_chain_currency_match,
 };
 use crate::issue_invoice::InvoiceInputJson;
-use crate::nav_xml::{
-    self, CustomerInfo, ModificationReference, NavParties, SupplierInfo,
-};
+use crate::nav_xml::{self, CustomerInfo, ModificationReference, NavParties, SupplierInfo};
 
 // ──────────────────────────────────────────────────────────────────────
 // Entry point
@@ -212,12 +209,10 @@ pub fn modification_from_inputs(
     })?;
 
     // Resolve tenant id + series code.
-    let tenant = TenantId::new(tenant_str.to_string()).ok_or_else(|| {
-        anyhow!("tenant value '{}' is empty or has a null byte", tenant_str)
-    })?;
-    let series_code = SeriesCode::new(series_str.to_string()).ok_or_else(|| {
-        anyhow!("series value '{}' fails SeriesCode validation", series_str)
-    })?;
+    let tenant = TenantId::new(tenant_str.to_string())
+        .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", tenant_str))?;
+    let series_code = SeriesCode::new(series_str.to_string())
+        .ok_or_else(|| anyhow!("series value '{}' fails SeriesCode validation", series_str))?;
     if !references.starts_with("inv_") {
         bail!(
             "references value '{}' is not a prefixed invoice id (expected inv_<ULID>)",
@@ -230,12 +225,9 @@ pub fn modification_from_inputs(
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
 
     // ADR-0031 §5 pre-allocation hard-cap check.
-    let pending_count = crate::submission_queue::count_pending(
-        db,
-        tenant.clone(),
-        binary_hash_bytes,
-    )
-    .context("count pending submissions (ADR-0031 §5 cap check) for modification")?;
+    let pending_count =
+        crate::submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
+            .context("count pending submissions (ADR-0031 §5 cap check) for modification")?;
     if pending_count >= crate::submission_queue::HARD_CAP_PENDING {
         return Err(anyhow!(
             "submission queue is full ({}/{} pending invoices per ADR-0009 §7 / ADR-0031 §5); \
@@ -272,12 +264,21 @@ pub fn modification_from_inputs(
     // PR-44γ.1 — placeholder defaults; `run_single_tx` reads the
     // base's stored currency metadata and overrides per ADR-0037 §4
     // invariant C6 (chain-currency-match by inheritance).
+    // PR-73 / ADR-0040 §addendum — same inheritance posture for the
+    // bank-account snapshot: the modification chain inherits the base
+    // invoice's bank-account quintet inside `run_single_tx`, so the
+    // placeholder here is `None`. Diverges from the SPA-issue route
+    // (`serve.rs::issue_from_parsed`) which resolves a snapshot from
+    // the route's `bank_account_id` request field, because the
+    // modification flow's regulatory record IS the base invoice's
+    // bank account — the operator cannot choose a different one.
     let allocate_args = AllocateArgs {
         series_id: series.id,
         draft,
         idempotency_key,
         currency: Currency::Huf,
         rate_metadata: None,
+        bank_snapshot: None,
     };
 
     let outcome = run_single_tx(
@@ -337,11 +338,7 @@ pub fn modification_from_inputs(
             name: input.customer.name,
         },
     };
-    let base_invoice_number = format!(
-        "{}/{:05}",
-        series_code.as_str(),
-        base_sequence_number
-    );
+    let base_invoice_number = format!("{}/{:05}", series_code.as_str(), base_sequence_number);
     let modification_reference = ModificationReference {
         base_invoice_number,
         modification_index,
@@ -632,25 +629,37 @@ fn run_single_tx(
     //      metadata and inherit onto the modification. The modification
     //      is full-replace per ADR-0024 §4, so `huf_equivalent_total`
     //      is computed against the modification's OWN positive gross.
-    let base_currency_metadata =
-        load_invoice_currency_metadata_in_tx(&tx, base_invoice_id)
-            .context("load base invoice currency metadata for modification (ADR-0037 §4 C6)")?;
-    let modification_gross_cents: i64 = allocate_args
-        .draft
-        .lines
-        .iter()
-        .try_fold(0i64, |acc, line| {
-            let line_gross = line
-                .gross_total()
-                .ok_or_else(|| anyhow!("modification line gross_total overflow"))?;
-            acc.checked_add(line_gross.as_i64())
-                .ok_or_else(|| anyhow!("modification gross accumulator overflow"))
-        })?;
+    let base_currency_metadata = load_invoice_currency_metadata_in_tx(&tx, base_invoice_id)
+        .context("load base invoice currency metadata for modification (ADR-0037 §4 C6)")?;
+    let modification_gross_cents: i64 =
+        allocate_args
+            .draft
+            .lines
+            .iter()
+            .try_fold(0i64, |acc, line| {
+                let line_gross = line
+                    .gross_total()
+                    .ok_or_else(|| anyhow!("modification line gross_total overflow"))?;
+                acc.checked_add(line_gross.as_i64())
+                    .ok_or_else(|| anyhow!("modification gross accumulator overflow"))
+            })?;
     let (inherited_currency, inherited_rate_metadata) =
         inherit_rate_metadata_for_chain(&base_currency_metadata, modification_gross_cents)
             .context("inherit rate metadata for modification chain child")?;
     allocate_args.currency = inherited_currency;
     allocate_args.rate_metadata = inherited_rate_metadata.clone();
+    // PR-73 / ADR-0040 §addendum — chain children inherit the BASE
+    // invoice's bank-account snapshot verbatim. Same posture as
+    // `issue_storno.rs` — the regulatory record is "the bank account
+    // the base asked to be paid to"; re-resolving against current
+    // `seller.toml` could surface a different account if the operator
+    // rotated the per-currency default between base issuance and
+    // modification. A `None` snapshot (pre-PR-73 base) propagates as
+    // `None`.
+    let inherited_bank_snapshot = load_invoice_bank_snapshot_in_tx(&tx, base_invoice_id)
+        .context("load base invoice bank snapshot for modification chain inheritance")?
+        .into_typed();
+    allocate_args.bank_snapshot = inherited_bank_snapshot.clone();
     require_chain_currency_match(
         base_currency_metadata.currency,
         allocate_args.currency,
@@ -720,7 +729,10 @@ fn run_single_tx(
                 idempotency_key,
                 nav_xml_path,
             )
-        };
+        }
+        // PR-73 / ADR-0040 §addendum — inherit the base's bank-account
+        // snapshot onto the modification's audit payload.
+        .with_bank_snapshot(inherited_bank_snapshot.as_ref());
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
@@ -800,8 +812,8 @@ fn next_modification_index_in_tx(
             })
             .context("query audit_ledger for storno chain index (modification walker)")?;
         for row in rows {
-            let (seq, payload_bytes) = row
-                .context("read audit_ledger row during storno chain-index walk (modification)")?;
+            let (seq, payload_bytes) =
+                row.context("read audit_ledger row during storno chain-index walk (modification)")?;
             let payload: audit_payloads::InvoiceStornoIssuedPayload =
                 serde_json::from_slice(&payload_bytes).map_err(|e| {
                     anyhow!(
@@ -809,8 +821,7 @@ fn next_modification_index_in_tx(
                          — audit ledger appears tampered or schema-drifted"
                     )
                 })?;
-            if payload.base_invoice_id == base_invoice_id
-                && payload.modification_index > max_index
+            if payload.base_invoice_id == base_invoice_id && payload.modification_index > max_index
             {
                 max_index = payload.modification_index;
             }
@@ -833,12 +844,11 @@ fn next_modification_index_in_tx(
             let payload: audit_payloads::InvoiceModificationIssuedPayload =
                 serde_json::from_slice(&payload_bytes).map_err(|e| {
                     anyhow!(
-                        "InvoiceModificationIssued audit payload (seq {seq}) failed typed decode: {e} \
+                    "InvoiceModificationIssued audit payload (seq {seq}) failed typed decode: {e} \
                          — audit ledger appears tampered or schema-drifted"
-                    )
+                )
                 })?;
-            if payload.base_invoice_id == base_invoice_id
-                && payload.modification_index > max_index
+            if payload.base_invoice_id == base_invoice_id && payload.modification_index > max_index
             {
                 max_index = payload.modification_index;
             }
@@ -989,10 +999,8 @@ mod tests {
     /// behaviour.
     #[test]
     fn next_modification_index_unions_storno_and_modify_against_same_base() {
-        let mut conn = fixture_ledger_with_mixed_chain(&[
-            ("S", "inv_BASE", 1),
-            ("M", "inv_BASE", 2),
-        ]);
+        let mut conn =
+            fixture_ledger_with_mixed_chain(&[("S", "inv_BASE", 1), ("M", "inv_BASE", 2)]);
         let tx = conn.transaction().unwrap();
         let idx = next_modification_index_in_tx(&tx, "inv_BASE").unwrap();
         assert_eq!(

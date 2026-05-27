@@ -106,7 +106,10 @@ mod tests {
 
     #[test]
     fn euro_glyph_maps_to_0x80() {
-        assert_eq!(winansi_bytes("\u{20AC}8 636"), vec![0x80, b'8', b' ', b'6', b'3', b'6']);
+        assert_eq!(
+            winansi_bytes("\u{20AC}8 636"),
+            vec![0x80, b'8', b' ', b'6', b'3', b'6']
+        );
     }
 
     #[test]
@@ -116,8 +119,7 @@ mod tests {
         assert_eq!(
             bytes,
             vec![
-                b'S', b'z', 0xE1, b'm', b'l', b'a', b' ',
-                0xD6, b's', b's', b'z', b'e', b'g', b' ',
+                b'S', b'z', 0xE1, b'm', b'l', b'a', b' ', 0xD6, b's', b's', b'z', b'e', b'g', b' ',
                 0xC1, b'f', b'a',
             ]
         );

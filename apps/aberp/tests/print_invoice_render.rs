@@ -251,12 +251,18 @@ fn eur_invoice_renders_with_arfolyam_and_huf_totals() {
     let pdf = run_print_invoice(&wired);
     let text = read_pdf_text(&pdf);
 
-    assert!(text.contains("EUR"), "expected EUR currency in PDF text:\n{text}");
+    assert!(
+        text.contains("EUR"),
+        "expected EUR currency in PDF text:\n{text}"
+    );
     assert!(
         text.contains("Árfolyam") || text.contains("rfolyam"),
         "expected Árfolyam rate line in PDF text:\n{text}"
     );
-    assert!(text.contains("Ft"), "expected Ft suffix in PDF text:\n{text}");
+    assert!(
+        text.contains("Ft"),
+        "expected Ft suffix in PDF text:\n{text}"
+    );
     assert!(
         text.contains("12345678-1-42"),
         "expected seller ADÓSZÁM in PDF text:\n{text}"
@@ -279,7 +285,10 @@ fn huf_invoice_renders_without_arfolyam_line() {
     let pdf = run_print_invoice(&wired);
     let text = read_pdf_text(&pdf);
 
-    assert!(text.contains("Ft"), "expected Ft suffix in PDF text:\n{text}");
+    assert!(
+        text.contains("Ft"),
+        "expected Ft suffix in PDF text:\n{text}"
+    );
     assert!(
         !text.contains("Árfolyam:"),
         "HUF PDF must NOT carry the Árfolyam: rate line:\n{text}"

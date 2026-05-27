@@ -379,10 +379,7 @@ fn drive_one_retry(
 
     // b. Read the XML bytes.
     let invoice_xml = std::fs::read(&xml_path).map_err(|e| {
-        DrainRetryError::Application(format!(
-            "read NAV InvoiceData XML from {}: {e}",
-            xml_path
-        ))
+        DrainRetryError::Application(format!("read NAV InvoiceData XML from {}: {e}", xml_path))
     })?;
     if invoice_xml.is_empty() {
         return Err(DrainRetryError::Application(format!(
@@ -409,9 +406,8 @@ fn drive_one_retry(
         ))
     })?;
     let (ready_invoice, billing_idempotency_key) =
-        load_issued_invoice(&mut conn, &retry.invoice_id).map_err(|e| {
-            DrainRetryError::Application(format!("{e:#}"))
-        })?;
+        load_issued_invoice(&mut conn, &retry.invoice_id)
+            .map_err(|e| DrainRetryError::Application(format!("{e:#}")))?;
     if billing_idempotency_key != retry.idempotency_key {
         return Err(DrainRetryError::Application(format!(
             "F8 contract violation: billing idempotency_key '{}' does not match \
@@ -424,9 +420,8 @@ fn drive_one_retry(
     }
 
     // e. Derive the NAV-facing invoice number.
-    let nav_invoice_number = derive_nav_invoice_number(db_path, &ready_invoice).map_err(|e| {
-        DrainRetryError::Application(format!("{e:#}"))
-    })?;
+    let nav_invoice_number = derive_nav_invoice_number(db_path, &ready_invoice)
+        .map_err(|e| DrainRetryError::Application(format!("{e:#}")))?;
 
     // f. Build tokio runtime + Phase 0: Layer-2 disambiguation.
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -587,8 +582,7 @@ fn drive_one_retry(
             Ok(DriveOutcome::RetriedOk)
         }
         Err(wire_err) => {
-            let (error_class, error_code) =
-                submission_queue::classify_attempt_failure(&wire_err);
+            let (error_class, error_code) = submission_queue::classify_attempt_failure(&wire_err);
             let error_message = format!("{wire_err}");
             let response_xml: Option<Vec<u8>> = None;
             write_attempt_failed_audit(
@@ -679,8 +673,10 @@ fn perform_layer_2_check(
         anyhow!("query_invoice_check::build_request (envelope construction; drain-pending-retries) failed: {e}")
     })?;
 
-    let wire_result =
-        runtime.block_on(query_invoice_check::send_built_request(&transport, &request_xml));
+    let wire_result = runtime.block_on(query_invoice_check::send_built_request(
+        &transport,
+        &request_xml,
+    ));
 
     let (decision, payload) = match wire_result {
         Ok(send_outcome) => {
@@ -870,9 +866,9 @@ fn write_retry_requested_and_attempt_audit(
 ) -> Result<()> {
     audit_ledger::ensure_schema(conn)
         .context("ensure audit-ledger schema for drain-pending-retries TX1")?;
-    let tx = conn.transaction().context(
-        "begin DuckDB transaction (drain-pending-retries TX1 RetryRequested+Attempt)",
-    )?;
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (drain-pending-retries TX1 RetryRequested+Attempt)")?;
 
     let invoice_id_str = invoice.id.to_prefixed_string();
     let idem_str = idempotency_key.to_canonical_string();
@@ -913,9 +909,8 @@ fn write_retry_requested_and_attempt_audit(
     )
     .context("audit_ledger::append_in_tx InvoiceSubmissionAttempt (drain-pending-retries TX1)")?;
 
-    tx.commit().context(
-        "commit DuckDB transaction (drain-pending-retries TX1 RetryRequested+Attempt)",
-    )?;
+    tx.commit()
+        .context("commit DuckDB transaction (drain-pending-retries TX1 RetryRequested+Attempt)")?;
     Ok(())
 }
 
@@ -932,9 +927,9 @@ fn write_response_audit(
 ) -> Result<()> {
     audit_ledger::ensure_schema(conn)
         .context("ensure audit-ledger schema for drain-pending-retries TX2 Response")?;
-    let tx = conn.transaction().context(
-        "begin DuckDB transaction (drain-pending-retries TX2 Response audit append)",
-    )?;
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (drain-pending-retries TX2 Response audit append)")?;
     let invoice_id_str = invoice.id.to_prefixed_string();
     let idem_str = idempotency_key.to_canonical_string();
     let response = audit_payloads::InvoiceSubmissionResponsePayload::new(
@@ -952,9 +947,8 @@ fn write_response_audit(
         Some(idem_str),
     )
     .context("audit_ledger::append_in_tx InvoiceSubmissionResponse (drain-pending-retries TX2)")?;
-    tx.commit().context(
-        "commit DuckDB transaction (drain-pending-retries TX2 Response audit append)",
-    )?;
+    tx.commit()
+        .context("commit DuckDB transaction (drain-pending-retries TX2 Response audit append)")?;
     Ok(())
 }
 
@@ -1015,11 +1009,12 @@ fn write_check_performed_audit(
     idempotency_key: IdempotencyKey,
     payload: audit_payloads::InvoiceCheckPerformedPayload,
 ) -> Result<()> {
-    audit_ledger::ensure_schema(conn)
-        .context("ensure audit-ledger schema for drain-pending-retries TX0 InvoiceCheckPerformed")?;
-    let tx = conn.transaction().context(
-        "begin DuckDB transaction (drain-pending-retries TX0 InvoiceCheckPerformed)",
+    audit_ledger::ensure_schema(conn).context(
+        "ensure audit-ledger schema for drain-pending-retries TX0 InvoiceCheckPerformed",
     )?;
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (drain-pending-retries TX0 InvoiceCheckPerformed)")?;
     let idem_str = idempotency_key.to_canonical_string();
     audit_ledger::append_in_tx(
         &tx,
@@ -1030,9 +1025,8 @@ fn write_check_performed_audit(
         Some(idem_str),
     )
     .context("audit_ledger::append_in_tx InvoiceCheckPerformed (drain-pending-retries TX0)")?;
-    tx.commit().context(
-        "commit DuckDB transaction (drain-pending-retries TX0 InvoiceCheckPerformed)",
-    )?;
+    tx.commit()
+        .context("commit DuckDB transaction (drain-pending-retries TX0 InvoiceCheckPerformed)")?;
     Ok(())
 }
 

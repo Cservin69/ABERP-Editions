@@ -100,9 +100,7 @@ use ulid::Ulid;
 use crate::audit_payloads;
 use crate::binary_hash;
 use crate::cli::{DrainSubmissionQueueArgs, NavEnv};
-use crate::submission_queue::{
-    self, PendingInvoice, ALERT_OLDEST_PENDING, ALERT_PENDING_COUNT,
-};
+use crate::submission_queue::{self, PendingInvoice, ALERT_OLDEST_PENDING, ALERT_PENDING_COUNT};
 
 // ──────────────────────────────────────────────────────────────────────
 // Entry point
@@ -301,9 +299,8 @@ fn drive_one_invoice(
     actor: Actor,
 ) -> Result<(), DrainPerInvoiceError> {
     // a. Resolve the on-disk XML path.
-    let xml_path = resolve_xml_path(invoice, override_map).map_err(|e| {
-        DrainPerInvoiceError::Application(format!("{e:#}"))
-    })?;
+    let xml_path = resolve_xml_path(invoice, override_map)
+        .map_err(|e| DrainPerInvoiceError::Application(format!("{e:#}")))?;
 
     // b. Read the XML bytes.
     let invoice_xml = std::fs::read(&xml_path).map_err(|e| {
@@ -442,8 +439,7 @@ fn drive_one_invoice(
             Ok(())
         }
         Err(wire_err) => {
-            let (error_class, error_code) =
-                submission_queue::classify_attempt_failure(&wire_err);
+            let (error_class, error_code) = submission_queue::classify_attempt_failure(&wire_err);
             let error_message = format!("{wire_err}");
             let response_xml: Option<Vec<u8>> = None;
             write_attempt_failed_audit(

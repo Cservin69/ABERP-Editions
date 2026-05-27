@@ -20,9 +20,7 @@
 //! commit message as PR-10 follow-on work (no F number — it is
 //! mechanical test plumbing, not a finding).
 
-use aberp::nav_xml::{
-    self, CustomerInfo, NavParties, StornoReference, SupplierInfo,
-};
+use aberp::nav_xml::{self, CustomerInfo, NavParties, StornoReference, SupplierInfo};
 use aberp_billing::{
     Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
 };
@@ -85,8 +83,9 @@ fn storno_emitter_minimal_invoice_passes_validator() {
     let parties = minimal_parties();
     let reference = minimal_storno_reference();
 
-    let xml = nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
-        .expect("storno emitter must succeed on minimal fixture");
+    let xml =
+        nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
+            .expect("storno emitter must succeed on minimal fixture");
 
     match validate_invoice_data(&xml) {
         Ok(()) => {}
@@ -114,7 +113,9 @@ fn storno_xml_carries_invoice_reference_block() {
         base_invoice_number: "INV-default/00001".to_string(),
         modification_index: 3, // pin a non-1 index to defend against literal 1 elision
     };
-    let xml = nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None).unwrap();
+    let xml =
+        nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
+            .unwrap();
     let body = std::str::from_utf8(&xml).expect("storno XML must be UTF-8");
 
     assert!(
@@ -150,17 +151,31 @@ fn storno_xml_carries_negative_line_amounts() {
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = minimal_parties();
     let reference = minimal_storno_reference();
-    let xml = nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None).unwrap();
+    let xml =
+        nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
+            .unwrap();
     let body = std::str::from_utf8(&xml).unwrap();
 
     // The fixture line is quantity=2, unit_price=1000, vat=27%. With
     // negation: unit_price = -1000, net = 2 * -1000 = -2000,
     // vat = floor(-2000 * 2700 / 10000) = floor(-540) = -540,
     // gross = -2000 + -540 = -2540.
-    assert!(body.contains("<unitPrice>-1000</unitPrice>"), "unit_price must be negated: {body}");
-    assert!(body.contains("<lineNetAmount>-2000</lineNetAmount>"), "line net must be negated: {body}");
-    assert!(body.contains("<lineVatAmount>-540</lineVatAmount>"), "line vat must be negated: {body}");
-    assert!(body.contains("<lineGrossAmountNormal>-2540</lineGrossAmountNormal>"), "line gross must be negated: {body}");
+    assert!(
+        body.contains("<unitPrice>-1000</unitPrice>"),
+        "unit_price must be negated: {body}"
+    );
+    assert!(
+        body.contains("<lineNetAmount>-2000</lineNetAmount>"),
+        "line net must be negated: {body}"
+    );
+    assert!(
+        body.contains("<lineVatAmount>-540</lineVatAmount>"),
+        "line vat must be negated: {body}"
+    );
+    assert!(
+        body.contains("<lineGrossAmountNormal>-2540</lineGrossAmountNormal>"),
+        "line gross must be negated: {body}"
+    );
 }
 
 /// The storno emitter MUST format its own invoice number from the
@@ -178,7 +193,9 @@ fn storno_xml_invoice_number_is_the_stornos_own_seq() {
         base_invoice_number: "INV-default/00007".to_string(), // base's
         modification_index: 1,
     };
-    let xml = nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None).unwrap();
+    let xml =
+        nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
+            .unwrap();
     let body = std::str::from_utf8(&xml).unwrap();
 
     // The OUTER invoiceNumber is the storno's own.

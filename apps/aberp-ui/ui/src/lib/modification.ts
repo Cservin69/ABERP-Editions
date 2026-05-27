@@ -93,6 +93,13 @@ export function formFromIssuanceInput(
     currency: baseCurrency,
     lines,
     modificationDate: todayIsoDate(),
+    // PR-73 / ADR-0040 §addendum — modification form inherits the
+    // bank-account snapshot from the base implicitly (the backend's
+    // `issue_modification` reads the base's snapshot inside the
+    // chain-tx and stamps it onto the modification's invoice row).
+    // Sending `null` keeps the wire shape clean; the backend ignores
+    // the wire field for modifications since inheritance is the rule.
+    bankAccountId: null,
   };
 }
 

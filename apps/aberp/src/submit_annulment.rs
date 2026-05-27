@@ -158,10 +158,7 @@ pub fn run(args: &SubmitAnnulmentArgs) -> Result<()> {
             args.annulment_xml.display()
         ));
     }
-    tracing::info!(
-        bytes = annulment_xml.len(),
-        "InvoiceAnnulment XML loaded"
-    );
+    tracing::info!(bytes = annulment_xml.len(), "InvoiceAnnulment XML loaded");
 
     // 3a. ADR-0026 §4 / F30 closure: validate the on-disk
     //     <InvoiceAnnulment> bytes BEFORE any NAV call. Same
@@ -422,11 +419,8 @@ fn check_annulment_is_submittable(
                                 payload.idempotency_key
                             )
                         })?;
-                    latest_annulment_request = Some((
-                        idem,
-                        payload.annulment_code,
-                        payload.prior_transaction_id,
-                    ));
+                    latest_annulment_request =
+                        Some((idem, payload.annulment_code, payload.prior_transaction_id));
                 }
             }
             EventKind::InvoiceAnnulmentSubmissionResponse => {
@@ -570,9 +564,7 @@ mod tests {
     /// mod tests block — kept duplicate per the operator-facing-
     /// twin posture (CLAUDE.md rule 2 / rule 3 — neither extracted
     /// nor speculatively shared until a third caller appears).
-    fn ledger_with_entries(
-        entries: Vec<(EventKind, Vec<u8>, Option<String>)>,
-    ) -> Ledger {
+    fn ledger_with_entries(entries: Vec<(EventKind, Vec<u8>, Option<String>)>) -> Ledger {
         let tenant = TenantId::new("t1".to_string()).unwrap();
         let bh = BinaryHash::from_bytes([0u8; 32]);
         let mut ledger = Ledger::open_in_memory(tenant, bh).unwrap();
@@ -717,8 +709,9 @@ mod tests {
             ),
         ];
         let ledger = ledger_with_entries(entries);
-        let pre = check_annulment_is_submittable(&ledger, "inv_A")
-            .expect("retry after failed wire must be permitted (ADR-0026 §\"Surfaced conflict 3\")");
+        let pre = check_annulment_is_submittable(&ledger, "inv_A").expect(
+            "retry after failed wire must be permitted (ADR-0026 §\"Surfaced conflict 3\")",
+        );
         assert_eq!(pre.annulment_idempotency_key, idem);
     }
 

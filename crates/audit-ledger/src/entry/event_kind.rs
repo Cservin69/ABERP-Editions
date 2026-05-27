@@ -162,6 +162,38 @@
 /// PR-13 / PR-14 / PR-15 / PR-19 / PR-20, mechanical at this
 /// point.
 ///
+/// PR-70 (ADR-0039) adds `InvoicePaymentRecorded` — the operational
+/// "quick mark as paid" event per the Tier-2-lifted-to-Tier-1
+/// roadmap decision at session 81 (`project_aberp_ux_roadmap.md`).
+/// Structurally distinct from every prior invoice-lifecycle kind:
+/// it does NOT touch `derive_state` (paid-vs-unpaid is operational
+/// metadata, not a NAV regulatory typestate transition; the ladder
+/// remains `Draft / Ready / Pending / Submitted / Finalized /
+/// Stornoed / Modified / Abandoned / ...` per ADR-0036). The
+/// payment record is queried separately via
+/// `audit_query::payment_record_for` and rendered alongside the
+/// state chip as a parallel "Paid" badge.
+///
+/// Payload (`InvoicePaymentRecordedPayload` in the binary's
+/// `audit_payloads.rs`) carries the `invoice_id`, the
+/// operator-decision `idempotency_key`, the operator-supplied
+/// `paid_at` date (canonical `YYYY-MM-DD`), the `amount_minor`
+/// in the invoice's stored minor-unit form (i64), the `currency`
+/// (must match the invoice's currency — enforced at the route
+/// boundary), the `method` (closed-vocab: `BankTransfer` / `Cash`
+/// / `Card` / `Other`), and an optional `reference` (free-form
+/// operator note: bank transaction id, cheque number, etc.).
+///
+/// One entry per invoice; the route layer enforces no-double-pay
+/// via 409 Conflict. The audit chain remains append-only — if a
+/// payment is recorded in error, the operator fixes it via a new
+/// audit entry in a future PR or via direct ledger inspection
+/// (rare; not in v1 scope per the session-92 brief). The F12
+/// four-edit ritual fires once — the twelfth landing across
+/// PR-6.1 / PR-7-B-3 / PR-8 / PR-10 / PR-11 / PR-12 / PR-13 /
+/// PR-14 / PR-15 / PR-19 / PR-20 / PR-70, mechanical at this
+/// point.
+///
 /// The remaining invoice-lifecycle kinds (`Finalized`, `Rejected`,
 /// `SubmissionStuck`, `Voided`) land when their state transition
 /// first fires in the codebase.
@@ -458,6 +490,22 @@ pub enum EventKind {
     /// silent-omission-failure-mode posture every prior PR's
     /// prefix-pin test names. PR-20, ADR-0033 §2.
     InvoiceCheckPerformed,
+
+    /// An operator recorded a payment against a `Finalized` invoice
+    /// (PR-70, ADR-0039). Operational metadata only — the NAV
+    /// regulatory state ladder is unchanged by this entry. Payload
+    /// (`InvoicePaymentRecordedPayload`) carries `invoice_id`,
+    /// `idempotency_key`, `paid_at` (YYYY-MM-DD), `amount_minor`
+    /// (i64), `currency` (must match invoice), `method`
+    /// (closed-vocab: BankTransfer / Cash / Card / Other), and
+    /// optional `reference`.
+    ///
+    /// The `invoice.` prefix MUST hold so the per-invoice export
+    /// bundle's (ADR-0009 §8) `invoice.*` glob picks up the new
+    /// entries alongside every other lifecycle entry — same
+    /// silent-omission-failure-mode posture every prior PR's
+    /// prefix-pin test names. PR-70, ADR-0039 §2.
+    InvoicePaymentRecorded,
 }
 
 impl EventKind {
@@ -479,9 +527,7 @@ impl EventKind {
             EventKind::InvoiceTechnicalAnnulmentRequested => {
                 "invoice.technical_annulment_requested"
             }
-            EventKind::InvoiceAnnulmentSubmissionAttempt => {
-                "invoice.annulment_submission_attempt"
-            }
+            EventKind::InvoiceAnnulmentSubmissionAttempt => "invoice.annulment_submission_attempt",
             EventKind::InvoiceAnnulmentSubmissionResponse => {
                 "invoice.annulment_submission_response"
             }
@@ -491,6 +537,7 @@ impl EventKind {
             }
             EventKind::InvoiceSubmissionAttemptFailed => "invoice.submission_attempt_failed",
             EventKind::InvoiceCheckPerformed => "invoice.check_performed",
+            EventKind::InvoicePaymentRecorded => "invoice.payment_recorded",
         }
     }
 
@@ -533,6 +580,7 @@ impl EventKind {
             }
             "invoice.submission_attempt_failed" => Ok(EventKind::InvoiceSubmissionAttemptFailed),
             "invoice.check_performed" => Ok(EventKind::InvoiceCheckPerformed),
+            "invoice.payment_recorded" => Ok(EventKind::InvoicePaymentRecorded),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -571,6 +619,7 @@ mod tests {
             EventKind::InvoiceAnnulmentReceiverConfirmation,
             EventKind::InvoiceSubmissionAttemptFailed,
             EventKind::InvoiceCheckPerformed,
+            EventKind::InvoicePaymentRecorded,
         ];
         for v in variants {
             let s = v.as_str();
@@ -882,6 +931,58 @@ mod tests {
         assert_ne!(
             EventKind::InvoiceCheckPerformed.as_str(),
             EventKind::InvoiceSubmissionAttemptFailed.as_str()
+        );
+    }
+
+    /// PR-70 / ADR-0039 §2: the operational mark-as-paid event.
+    /// The `invoice.` prefix MUST hold so the per-invoice export
+    /// bundle's (ADR-0009 §8) `invoice.*` glob picks up the new
+    /// entries alongside every other lifecycle entry — same
+    /// silent-omission-failure-mode posture every prior PR's
+    /// prefix-pin test names.
+    #[test]
+    fn pr_70_payment_recorded_kind_uses_invoice_prefix() {
+        assert_eq!(
+            EventKind::InvoicePaymentRecorded.as_str(),
+            "invoice.payment_recorded"
+        );
+        assert!(EventKind::InvoicePaymentRecorded
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// PR-70 / ADR-0039 §2: deliberate fork from every other kind.
+    /// Payment recording is operational metadata, structurally
+    /// distinct from every regulatory-ladder entry; pinning the
+    /// discriminator-level distinction here catches a future refactor
+    /// accidentally collapsing payment-recorded onto an existing
+    /// lifecycle kind. Same fork-discipline posture as
+    /// `pr_20_check_performed_is_distinct_from_submission_kinds`.
+    #[test]
+    fn pr_70_payment_recorded_is_distinct_from_all_other_kinds() {
+        // Spot-check against the closest semantic neighbours — the
+        // chain-link entries (which also mark non-regulatory-ladder
+        // transitions) and the operator-decision entries
+        // (retry-requested / marked-abandoned).
+        assert_ne!(
+            EventKind::InvoicePaymentRecorded.as_str(),
+            EventKind::InvoiceStornoIssued.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoicePaymentRecorded.as_str(),
+            EventKind::InvoiceModificationIssued.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoicePaymentRecorded.as_str(),
+            EventKind::InvoiceRetryRequested.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoicePaymentRecorded.as_str(),
+            EventKind::InvoiceMarkedAbandoned.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoicePaymentRecorded.as_str(),
+            EventKind::InvoiceTechnicalAnnulmentRequested.as_str()
         );
     }
 }

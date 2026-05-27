@@ -34,7 +34,9 @@
 
 use std::path::PathBuf;
 
-use aberp_billing::{Currency, IdempotencyKey, RateMetadata, ReadyInvoice, SequenceReservation};
+use aberp_billing::{
+    BankAccountSnapshot, Currency, IdempotencyKey, RateMetadata, ReadyInvoice, SequenceReservation,
+};
 use serde::{Deserialize, Serialize};
 
 // ──────────────────────────────────────────────────────────────────────
@@ -169,6 +171,22 @@ pub struct InvoiceDraftCreatedPayload {
     /// items directly).
     #[serde(default)]
     pub huf_equivalent_total: Option<String>,
+    /// PR-73 / ADR-0040 §addendum — denormalized bank-account snapshot
+    /// quintet. `Some(_)` for SPA-issued invoices post-PR-73; `None`
+    /// for pre-PR-73 entries AND for CLI / library callers that do not
+    /// exercise the bank picker. The five fields are populated as a
+    /// quintet (either all five `Some(_)` or all five `None`); a
+    /// partial state would indicate ledger tampering.
+    #[serde(default)]
+    pub bank_account_id: Option<String>,
+    #[serde(default)]
+    pub bank_account_currency: Option<String>,
+    #[serde(default)]
+    pub bank_account_number: Option<String>,
+    #[serde(default)]
+    pub bank_account_bank_name: Option<String>,
+    #[serde(default)]
+    pub bank_account_swift_bic: Option<String>,
 }
 
 impl InvoiceDraftCreatedPayload {
@@ -188,6 +206,11 @@ impl InvoiceDraftCreatedPayload {
             exchange_rate_source: None,
             exchange_rate_date: None,
             huf_equivalent_total: None,
+            bank_account_id: None,
+            bank_account_currency: None,
+            bank_account_number: None,
+            bank_account_bank_name: None,
+            bank_account_swift_bic: None,
         }
     }
 
@@ -220,6 +243,11 @@ impl InvoiceDraftCreatedPayload {
             exchange_rate_source: None,
             exchange_rate_date: None,
             huf_equivalent_total: None,
+            bank_account_id: None,
+            bank_account_currency: None,
+            bank_account_number: None,
+            bank_account_bank_name: None,
+            bank_account_swift_bic: None,
         }
     }
 
@@ -243,9 +271,7 @@ impl InvoiceDraftCreatedPayload {
     ) -> Self {
         let date_str = rate
             .date
-            .format(&time::macros::format_description!(
-                "[year]-[month]-[day]"
-            ))
+            .format(&time::macros::format_description!("[year]-[month]-[day]"))
             .unwrap_or_else(|_| "INVALID-DATE".to_string());
         Self {
             invoice_id: invoice.id.to_prefixed_string(),
@@ -257,7 +283,30 @@ impl InvoiceDraftCreatedPayload {
             exchange_rate_source: Some(rate.source.clone()),
             exchange_rate_date: Some(date_str),
             huf_equivalent_total: Some(rate.huf_equivalent_total.to_string()),
+            bank_account_id: None,
+            bank_account_currency: None,
+            bank_account_number: None,
+            bank_account_bank_name: None,
+            bank_account_swift_bic: None,
         }
+    }
+
+    /// PR-73 / ADR-0040 §addendum — stamp the bank-account snapshot
+    /// quintet onto an existing payload (post-`from_invoice_*` step).
+    /// Used by the three issue-paths (`issue_invoice`, `issue_storno`,
+    /// `issue_modification`) to attach the snapshot the route resolver
+    /// (or the chain-inheritance read) produced. `None` argument is a
+    /// no-op so CLI / library callers without a snapshot do not have
+    /// to special-case the call.
+    pub fn with_bank_snapshot(mut self, bank_snapshot: Option<&BankAccountSnapshot>) -> Self {
+        if let Some(b) = bank_snapshot {
+            self.bank_account_id = Some(b.id.clone());
+            self.bank_account_currency = Some(b.currency.clone());
+            self.bank_account_number = Some(b.account_number.clone());
+            self.bank_account_bank_name = Some(b.bank_name.clone());
+            self.bank_account_swift_bic = Some(b.swift_bic.clone());
+        }
+        self
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -1479,6 +1528,164 @@ impl InvoiceAnnulmentReceiverConfirmationPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// InvoicePaymentRecorded  (PR-70 / ADR-0039 §2 — operational
+// "quick mark as paid" event. Operational metadata only — the NAV
+// regulatory state ladder is unchanged by this entry. One entry per
+// invoice; double-payment is rejected at the route layer with 409.)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Closed-vocab payment method discriminator carried on
+/// [`InvoicePaymentRecordedPayload::method`] (PR-70 / ADR-0039 §2).
+///
+/// Closed-vocab posture per CLAUDE.md rule 7: the four documented
+/// methods cover every payment shape Áben Consulting has seen in
+/// practice (bank transfer / cash / card / catch-all `Other`).
+/// Unrecognised wire values fail loud at deserialize time per
+/// serde's default-strict enum behaviour — a future PR adding a
+/// fifth method (e.g. crypto) lands the variant additively and the
+/// existing four wire shapes round-trip unchanged.
+///
+/// Wire form is the PascalCase variant identifier verbatim
+/// (`"BankTransfer"`, `"Cash"`, `"Card"`, `"Other"`) — matches the
+/// SPA's TS string union in `apps/aberp-ui/ui/src/lib/api.ts`.
+/// Drift between this enum and the SPA mirror surfaces at the
+/// Rust-side `payment_method_wire_shape_pins_pascalcase_strings`
+/// test (each variant's JSON form is asserted by exact value), the
+/// SPA's `Record<PaymentMethod, LabelMeta>` table (failing `npm run
+/// check` on a missing key), and `cargo clippy`'s exhaustive-match
+/// requirement when this enum is consumed downstream.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PaymentMethod {
+    BankTransfer,
+    Cash,
+    Card,
+    Other,
+}
+
+impl PaymentMethod {
+    /// Render the variant in the wire-form PascalCase string. Used
+    /// by tests that pin the exact byte shape of the wire JSON,
+    /// independent of `serde_json::to_string`'s quoting.
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            PaymentMethod::BankTransfer => "BankTransfer",
+            PaymentMethod::Cash => "Cash",
+            PaymentMethod::Card => "Card",
+            PaymentMethod::Other => "Other",
+        }
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoicePaymentRecorded`].
+///
+/// Pinned by ADR-0039 §2. Written by the binary's mark-paid command /
+/// `POST /api/invoices/:id/mark-paid` route in a single DuckDB
+/// transaction. No companion entries (sequence-reservation,
+/// draft-created, etc. — the payment record is not itself an
+/// invoice).
+///
+/// `paid_at` is stored as `String` in canonical `YYYY-MM-DD` form,
+/// same posture as
+/// [`InvoiceModificationIssuedPayload::modification_issue_date`] per
+/// ADR-0024 §5 — operator already supplies the value in canonical
+/// form, a typed-time wrapper would force serde-with adapters for
+/// no marginal value. Validation that the string parses as a
+/// well-formed date happens at the route boundary
+/// (`apps/aberp/src/serve.rs::mark_paid_request`); a malformed
+/// date never reaches this payload type.
+///
+/// `amount_minor` is the i64 minor-unit form of the invoice's
+/// currency: whole forints for HUF (`Huf(pub i64)`), EUR cents for
+/// EUR. Matches the wire shape `InvoiceListItem.total_gross` uses
+/// and the SPA's per-currency formatter consumes. Currency must
+/// match the invoice's stored currency — enforced at the route
+/// boundary with a 400 Bad Request rather than silently overriding.
+///
+/// `currency` is stored as the ISO-4217 wire string (`"HUF"` /
+/// `"EUR"`) matching the same Currency::iso_code() form every
+/// audit payload's `currency` field uses (PR-44γ precedent).
+///
+/// `method` is one of the four closed-vocab [`PaymentMethod`]
+/// variants. Closed-vocab serde fails loud on unrecognised wire
+/// strings per CLAUDE.md rule 12.
+///
+/// `reference` is the optional operator-supplied free-form note
+/// (bank transaction id, cheque number, cash-handover witness
+/// name, etc.). Required-with-empty-string would be a CLAUDE.md
+/// rule-12 silent-success anti-pattern; `Option<String>` makes the
+/// absence explicit at the type level.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoicePaymentRecordedPayload {
+    /// The invoice id this payment is recorded against — prefixed
+    /// `inv_<ULID>` form. The payment is FOR this invoice; same
+    /// field semantics as
+    /// [`InvoiceTechnicalAnnulmentRequestedPayload::invoice_id`].
+    pub invoice_id: String,
+    /// Operator-decision idempotency key minted by the mark-paid
+    /// command. Distinct from the invoice's issuance key; threads
+    /// through F8 only within the payment-recording surface (a
+    /// future "unpay" or amend-payment PR would carry it forward).
+    pub idempotency_key: String,
+    /// Operator-supplied payment date in canonical `YYYY-MM-DD`
+    /// form. Validated as a well-formed ISO-8601 date at the route
+    /// boundary; the audit payload stores the canonical string as
+    /// the source of truth (ADR-0039 §2).
+    pub paid_at: String,
+    /// Amount paid in the invoice's stored minor-unit form (whole
+    /// forints for HUF, EUR cents for EUR). Mirrors the wire shape
+    /// `InvoiceListItem.total_gross` uses; the SPA's per-currency
+    /// formatter divides by 100 on the EUR branch.
+    pub amount_minor: i64,
+    /// Currency ISO-4217 wire string (`"HUF"` / `"EUR"`). MUST
+    /// match the invoice's stored currency per ADR-0039 §3 — the
+    /// route layer enforces this with a 400 Bad Request. Stored as
+    /// the canonical string rather than the typed `Currency` enum
+    /// to match every other audit payload's `currency` field
+    /// (PR-44γ precedent).
+    pub currency: String,
+    /// Closed-vocab payment method per [`PaymentMethod`]. Serde
+    /// fails loud on unrecognised wire strings (CLAUDE.md rule 12).
+    pub method: PaymentMethod,
+    /// Optional operator-supplied free-form reference text (bank
+    /// transaction id, cheque number, cash-handover witness name,
+    /// etc.). `None` when the operator left the field blank.
+    pub reference: Option<String>,
+}
+
+impl InvoicePaymentRecordedPayload {
+    /// Build a payload from the parts the mark-paid route just
+    /// resolved. `new()` (not `from_outcome(...)`) because the
+    /// payload's fields cross the operator decision (paid_at +
+    /// amount + method + reference) AND the audit chain (invoice
+    /// id + idempotency key); no single domain struct carries them
+    /// all, and a speculative `PaymentRecordingOutcome` type would
+    /// be a CLAUDE.md rule-2 violation.
+    pub fn new(
+        invoice_id: &str,
+        idempotency_key: IdempotencyKey,
+        paid_at: &str,
+        amount_minor: i64,
+        currency: &str,
+        method: PaymentMethod,
+        reference: Option<String>,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.to_string(),
+            idempotency_key: idempotency_key.to_canonical_string(),
+            paid_at: paid_at.to_string(),
+            amount_minor,
+            currency: currency.to_string(),
+            method,
+            reference,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1587,11 +1794,8 @@ mod tests {
         let invoice = fixture_invoice();
         let idem = IdempotencyKey::new();
         let path = PathBuf::from("/tmp/out/inv_01J0.xml");
-        let original = InvoiceDraftCreatedPayload::from_invoice_with_xml_path(
-            &invoice,
-            idem,
-            path.clone(),
-        );
+        let original =
+            InvoiceDraftCreatedPayload::from_invoice_with_xml_path(&invoice, idem, path.clone());
         let bytes = original.to_bytes();
 
         let decoded: InvoiceDraftCreatedPayload =
@@ -1699,8 +1903,7 @@ mod tests {
         let invoice = fixture_invoice();
         let idem = IdempotencyKey::new();
         let path = PathBuf::from("/tmp/out/inv_01J0.xml");
-        let payload =
-            InvoiceDraftCreatedPayload::from_invoice_with_xml_path(&invoice, idem, path);
+        let payload = InvoiceDraftCreatedPayload::from_invoice_with_xml_path(&invoice, idem, path);
         let decoded: InvoiceDraftCreatedPayload =
             serde_json::from_slice(&payload.to_bytes()).expect("HUF payload must round-trip");
         assert_eq!(decoded, payload);
@@ -2003,10 +2206,7 @@ mod tests {
             serde_json::from_slice(&bytes).expect("typed decode");
         assert_eq!(decoded, payload);
         assert_eq!(decoded.error_class, "application");
-        assert_eq!(
-            decoded.error_code.as_deref(),
-            Some("INVALID_SECURITY_USER")
-        );
+        assert_eq!(decoded.error_code.as_deref(), Some("INVALID_SECURITY_USER"));
         assert!(decoded.response_xml.is_some());
     }
 
@@ -2742,5 +2942,166 @@ mod tests {
             "txid-with-\"-quote-and-\\-backslash"
         );
         assert_eq!(decoded.annulment_code, "ERRATIC_INVOICE_NUMBER");
+    }
+
+    // ── PR-70 / ADR-0039 §2 — InvoicePaymentRecorded round-trips ────
+
+    /// PR-70 / ADR-0039 §2: bank-transfer payment with reference
+    /// round-trips clean. The base case of the mark-paid audit
+    /// surface — HUF invoice, BankTransfer method, operator-supplied
+    /// reference text.
+    #[test]
+    fn payment_recorded_round_trip_bank_transfer_with_reference() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoicePaymentRecordedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "2026-05-26",
+            12_500,
+            "HUF",
+            PaymentMethod::BankTransfer,
+            Some("REF-12345 OTP-Banking".to_string()),
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoicePaymentRecordedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.paid_at, "2026-05-26");
+        assert_eq!(decoded.amount_minor, 12_500);
+        assert_eq!(decoded.currency, "HUF");
+        assert_eq!(decoded.method, PaymentMethod::BankTransfer);
+        assert_eq!(decoded.reference.as_deref(), Some("REF-12345 OTP-Banking"));
+        assert!(decoded.idempotency_key.starts_with("idem_"));
+    }
+
+    /// PR-70 / ADR-0039 §2: cash payment with no reference round-trips
+    /// clean. The `reference: None` case pins that the operator may
+    /// legitimately leave the field blank for a cash-on-handover
+    /// payment (rule 12 — make absence explicit, not silently empty).
+    #[test]
+    fn payment_recorded_round_trip_cash_no_reference() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoicePaymentRecordedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "2026-05-26",
+            5_000,
+            "HUF",
+            PaymentMethod::Cash,
+            None,
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoicePaymentRecordedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert!(decoded.reference.is_none());
+        assert_eq!(decoded.method, PaymentMethod::Cash);
+    }
+
+    /// PR-70 / ADR-0039 §2: EUR invoice payment round-trips clean
+    /// with `amount_minor` carrying EUR cents (the i64 minor-unit
+    /// posture per ADR-0037).
+    #[test]
+    fn payment_recorded_round_trip_eur_card() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoicePaymentRecordedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "2026-05-26",
+            1_250, // 12.50 EUR in cents
+            "EUR",
+            PaymentMethod::Card,
+            Some("Stripe-ch_3PqXY".to_string()),
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoicePaymentRecordedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.currency, "EUR");
+        assert_eq!(decoded.amount_minor, 1_250);
+        assert_eq!(decoded.method, PaymentMethod::Card);
+    }
+
+    /// PR-70 / ADR-0039 §2: `PaymentMethod::Other` round-trips
+    /// clean. Pins the catch-all variant for the operator's
+    /// "anything else" payment cases (crypto / barter / etc.).
+    #[test]
+    fn payment_recorded_round_trip_other_method() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoicePaymentRecordedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "2026-05-26",
+            10_000,
+            "HUF",
+            PaymentMethod::Other,
+            Some("barter — see contract addendum 3".to_string()),
+        );
+        let bytes = payload.to_bytes();
+        let decoded: InvoicePaymentRecordedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.method, PaymentMethod::Other);
+    }
+
+    /// PR-70 / ADR-0039 §2: hostile bytes in `reference` round-trip
+    /// clean through the typed-struct path. Same F9 trap-closing
+    /// posture as `retry_requested_round_trips_with_hostile_reason`.
+    #[test]
+    fn payment_recorded_round_trips_with_hostile_reference() {
+        let idem = IdempotencyKey::new();
+        let payload = InvoicePaymentRecordedPayload::new(
+            "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            idem,
+            "2026-05-26",
+            10_000,
+            "HUF",
+            PaymentMethod::BankTransfer,
+            Some("operator note: \"customer X\" \\ urgent ünïcödé 日本語".to_string()),
+        );
+        let bytes = payload.to_bytes();
+        let _: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("bytes must be valid JSON");
+        let decoded: InvoicePaymentRecordedPayload =
+            serde_json::from_slice(&bytes).expect("typed decode");
+        assert_eq!(decoded, payload);
+    }
+
+    /// PR-70 / ADR-0039 §2: PaymentMethod wire shape is verbatim
+    /// PascalCase. Pins the SPA mirror invariant — a future serde
+    /// refactor that flipped to lowercase would surface here before
+    /// the SPA's `Record<PaymentMethod, LabelMeta>` table breaks.
+    #[test]
+    fn payment_method_wire_shape_pins_pascalcase_strings() {
+        assert_eq!(
+            serde_json::to_string(&PaymentMethod::BankTransfer).unwrap(),
+            "\"BankTransfer\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PaymentMethod::Cash).unwrap(),
+            "\"Cash\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PaymentMethod::Card).unwrap(),
+            "\"Card\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PaymentMethod::Other).unwrap(),
+            "\"Other\""
+        );
+    }
+
+    /// PR-70 / ADR-0039 §2: closed-vocab deny-default. An unknown
+    /// PaymentMethod wire string fails loud at deserialize time
+    /// rather than silently dropping to a default variant. Pins the
+    /// CLAUDE.md rule-12 deny-default posture against a future
+    /// `#[serde(other)]` regression.
+    #[test]
+    fn payment_method_rejects_unknown_wire_strings() {
+        assert!(serde_json::from_str::<PaymentMethod>("\"PixCryptoCheque\"").is_err());
+        assert!(serde_json::from_str::<PaymentMethod>("\"bank_transfer\"").is_err());
+        assert!(serde_json::from_str::<PaymentMethod>("\"\"").is_err());
     }
 }

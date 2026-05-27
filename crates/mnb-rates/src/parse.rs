@@ -89,9 +89,10 @@ pub fn parse_get_exchange_rates_response(
     }
 
     // 2. Extract the inner XML text.
-    let inner = find_first_text_local(envelope_xml, "GetExchangeRatesResult")?.ok_or_else(
-        || MnbError::EnvelopeParse("response missing <GetExchangeRatesResult>".to_string()),
-    )?;
+    let inner =
+        find_first_text_local(envelope_xml, "GetExchangeRatesResult")?.ok_or_else(|| {
+            MnbError::EnvelopeParse("response missing <GetExchangeRatesResult>".to_string())
+        })?;
 
     parse_mnb_exchange_rates_inner(inner.as_bytes(), currency)
 }
@@ -128,19 +129,18 @@ pub fn parse_mnb_exchange_rates_inner(
                 if local == b"Day" {
                     current_day_date = attribute_value(&e, "date")?;
                 } else if local == b"Rate" {
-                    let curr = attribute_value(&e, "curr")?
-                        .ok_or_else(|| MnbError::PayloadParse(
-                            "<Rate> missing curr attribute".to_string(),
-                        ))?;
+                    let curr = attribute_value(&e, "curr")?.ok_or_else(|| {
+                        MnbError::PayloadParse("<Rate> missing curr attribute".to_string())
+                    })?;
                     if curr.as_str() == iso_target {
                         let unit = attribute_value(&e, "unit")?
-                            .ok_or_else(|| MnbError::PayloadParse(
-                                "<Rate> missing unit attribute".to_string(),
-                            ))?
+                            .ok_or_else(|| {
+                                MnbError::PayloadParse("<Rate> missing unit attribute".to_string())
+                            })?
                             .parse::<u32>()
-                            .map_err(|e| MnbError::PayloadParse(format!(
-                                "<Rate unit=...> is not a u32: {e}"
-                            )))?;
+                            .map_err(|e| {
+                                MnbError::PayloadParse(format!("<Rate unit=...> is not a u32: {e}"))
+                            })?;
                         let day_date = current_day_date.clone().ok_or_else(|| {
                             MnbError::PayloadParse(
                                 "<Rate> appeared outside any <Day> element".to_string(),
@@ -235,9 +235,8 @@ fn attribute_value(
     target: &str,
 ) -> Result<Option<String>, MnbError> {
     for attr in e.attributes().with_checks(false) {
-        let attr = attr.map_err(|err| {
-            MnbError::PayloadParse(format!("attribute parse failed: {err}"))
-        })?;
+        let attr =
+            attr.map_err(|err| MnbError::PayloadParse(format!("attribute parse failed: {err}")))?;
         if attr.key.as_ref() == target.as_bytes() {
             let v = attr.unescape_value().map_err(|err| {
                 MnbError::PayloadParse(format!("attribute unescape failed: {err}"))
@@ -271,9 +270,7 @@ fn find_first_text_local(xml: &[u8], target: &str) -> Result<Option<String>, Mnb
             Ok(Event::Start(e)) if local_name(e.name().as_ref()) == target.as_bytes() => {
                 inside = true;
             }
-            Ok(Event::End(e))
-                if inside && local_name(e.name().as_ref()) == target.as_bytes() =>
-            {
+            Ok(Event::End(e)) if inside && local_name(e.name().as_ref()) == target.as_bytes() => {
                 return Ok(Some(collected));
             }
             Ok(Event::Text(t)) if inside => {
@@ -283,9 +280,8 @@ fn find_first_text_local(xml: &[u8], target: &str) -> Result<Option<String>, Mnb
                 collected.push_str(unescaped.as_ref());
             }
             Ok(Event::CData(c)) if inside => {
-                let raw = std::str::from_utf8(c.as_ref()).map_err(|e| {
-                    MnbError::EnvelopeParse(format!("CDATA is not UTF-8: {e}"))
-                })?;
+                let raw = std::str::from_utf8(c.as_ref())
+                    .map_err(|e| MnbError::EnvelopeParse(format!("CDATA is not UTF-8: {e}")))?;
                 collected.push_str(raw);
             }
             Ok(Event::Eof) => return Ok(None),
@@ -316,8 +312,8 @@ mod tests {
 
     #[test]
     fn inner_payload_parses_eur_rate_with_comma_normalization() {
-        let r = parse_mnb_exchange_rates_inner(INNER_OK_EUR.as_bytes(), Currency::Eur)
-            .expect("parse");
+        let r =
+            parse_mnb_exchange_rates_inner(INNER_OK_EUR.as_bytes(), Currency::Eur).expect("parse");
         assert_eq!(r.currency, Currency::Eur);
         assert_eq!(r.date, date!(2026 - 05 - 22));
         assert_eq!(r.unit, 1);

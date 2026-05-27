@@ -187,10 +187,7 @@ pub fn run() {
                     let message = format!("{e:#}");
                     tracing::error!(error = %message, "backend boot failed");
                     let state = handle.state::<AppState>();
-                    let mut guard = state
-                        .boot_state
-                        .lock()
-                        .expect("boot_state mutex poisoned");
+                    let mut guard = state.boot_state.lock().expect("boot_state mutex poisoned");
                     *guard = BootState {
                         status: BootStatus::Failed,
                         error: Some(message),
@@ -210,6 +207,7 @@ pub fn run() {
             commands::poll_ack,
             commands::cancel_invoice_storno,
             commands::amend_invoice_modification,
+            commands::mark_invoice_paid,
             commands::get_issuance_input,
             commands::get_boot_status,
             commands::retry_boot,
@@ -223,6 +221,11 @@ pub fn run() {
             commands::create_partner,
             commands::update_partner,
             commands::delete_partner,
+            commands::list_seller_banks,
+            commands::create_seller_bank,
+            commands::update_seller_bank,
+            commands::set_default_seller_bank,
+            commands::delete_seller_bank,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

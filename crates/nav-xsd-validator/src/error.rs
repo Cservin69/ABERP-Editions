@@ -99,4 +99,36 @@ pub enum NavXsdValidationError {
     /// schema-level cardinality here is `1..N`, not `1`.
     #[error("<invoiceLines> requires at least one <line>, found none")]
     NoInvoiceLines,
+
+    /// PR-66 / session-87 — a structured child of `<supplierTaxNumber>`
+    /// or `<customerTaxNumber>` carried the wrong (or missing)
+    /// namespace prefix. NAV v3.0 places `taxpayerId` / `vatCode` /
+    /// `countyCode` in the `base` namespace; the canonical wire shape
+    /// is the `common:` prefix bound to that namespace at the root
+    /// (see `apps/aberp/src/nav_xml.rs::common_element`).
+    ///
+    /// Distinct from `UnexpectedElement` because the LOCAL name IS in
+    /// the allowlist — only the prefix is wrong. Pre-PR-66 the
+    /// validator was prefix-blind (via `local_name_of`) so a future
+    /// emit regression that dropped the prefix would slip past the
+    /// invariant check and surface only as a NAV-side rejection.
+    /// Session 87 surfaced the symmetric regression in
+    /// `parse_supplier_tax_number_from_xml`'s substring scan; this
+    /// variant closes the emit-side mirror so the v3.0 invariant
+    /// check is now load-bearing against both directions.
+    ///
+    /// `actual_prefix` is the empty string when the child was written
+    /// bare (no prefix at all — would inherit the default `data`
+    /// namespace from the root, which is semantically wrong for these
+    /// elements).
+    #[error(
+        "namespace-prefix mismatch on <{actual_prefix}:{element}> inside <{parent}>: \
+         NAV v3.0 requires the `{expected_prefix}:` prefix (base namespace)"
+    )]
+    WrongChildNamespacePrefix {
+        parent: &'static str,
+        element: &'static str,
+        expected_prefix: &'static str,
+        actual_prefix: String,
+    },
 }

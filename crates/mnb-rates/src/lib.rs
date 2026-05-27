@@ -127,10 +127,7 @@ impl MnbClient {
             .client
             .post(&self.endpoint_url)
             .header("Content-Type", "text/xml; charset=utf-8")
-            .header(
-                "SOAPAction",
-                format!("\"{}\"", soap::SOAP_ACTION_GET_RATES),
-            )
+            .header("SOAPAction", format!("\"{}\"", soap::SOAP_ACTION_GET_RATES))
             .body(envelope)
             .send()
             .await

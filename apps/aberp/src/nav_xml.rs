@@ -36,8 +36,7 @@
 use std::io::Write;
 
 use aberp_billing::{
-    huf_equivalent_round_half_even, Currency, Huf, LineItem, RateMetadata, ReadyInvoice,
-    SeriesCode,
+    huf_equivalent_round_half_even, Currency, Huf, LineItem, RateMetadata, ReadyInvoice, SeriesCode,
 };
 use anyhow::{anyhow, Context, Result};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
@@ -392,7 +391,6 @@ pub fn render_invoice_data(
     );
     text_element(&mut w, "invoiceIssueDate", &issue_date)?;
 
-
     // <invoiceMain>
     w.write_event(Event::Start(BytesStart::new("invoiceMain")))?;
     w.write_event(Event::Start(BytesStart::new("invoice")))?;
@@ -676,7 +674,6 @@ pub fn render_annulment_data(annulment_reference: &AnnulmentReference) -> Result
     w.write_event(Event::Start(root))
         .context("write <InvoiceAnnulment>")?;
 
-
     text_element(
         &mut w,
         "annulmentReference",
@@ -697,11 +694,7 @@ pub fn render_annulment_data(annulment_reference: &AnnulmentReference) -> Result
         now.second(),
     );
     text_element(&mut w, "annulmentTimestamp", &timestamp)?;
-    text_element(
-        &mut w,
-        "annulmentCode",
-        annulment_reference.annulment_code,
-    )?;
+    text_element(&mut w, "annulmentCode", annulment_reference.annulment_code)?;
     text_element(&mut w, "annulmentReason", &annulment_reference.reason)?;
 
     w.write_event(Event::End(BytesEnd::new("InvoiceAnnulment")))?;
@@ -736,7 +729,11 @@ fn write_invoice_reference(
     storno_reference: &StornoReference,
 ) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("invoiceReference")))?;
-    text_element(w, "originalInvoiceNumber", &storno_reference.base_invoice_number)?;
+    text_element(
+        w,
+        "originalInvoiceNumber",
+        &storno_reference.base_invoice_number,
+    )?;
     text_element(w, "modifyWithoutMaster", "false")?;
     text_element(
         w,
@@ -911,15 +908,15 @@ fn huf_equivalent_for(
 ) -> Result<i64> {
     match (currency, rate_metadata) {
         (Currency::Huf, _) => Ok(minor_units),
-        (_, Some(meta)) => huf_equivalent_round_half_even(minor_units, &meta.rate).ok_or_else(
-            || {
+        (_, Some(meta)) => {
+            huf_equivalent_round_half_even(minor_units, &meta.rate).ok_or_else(|| {
                 anyhow!(
                     "HUF-equivalent conversion overflowed i64 for {} cents at rate {}",
                     minor_units,
                     meta.rate
                 )
-            },
-        ),
+            })
+        }
         (other, None) => Err(anyhow!(
             "non-HUF currency {} requires rate_metadata at HUF-equivalent computation",
             other.iso_code()
@@ -993,7 +990,11 @@ fn write_line_net(
 ) -> Result<()> {
     let huf = huf_equivalent_for(net.as_i64(), currency, rate_metadata)?;
     w.write_event(Event::Start(BytesStart::new("lineNetAmountData")))?;
-    text_element(w, "lineNetAmount", &format_native_amount(net.as_i64(), currency))?;
+    text_element(
+        w,
+        "lineNetAmount",
+        &format_native_amount(net.as_i64(), currency),
+    )?;
     text_element(w, "lineNetAmountHUF", &huf.to_string())?;
     w.write_event(Event::End(BytesEnd::new("lineNetAmountData")))?;
     Ok(())
@@ -1022,7 +1023,11 @@ fn write_line_vat_amount(
 ) -> Result<()> {
     let huf = huf_equivalent_for(vat.as_i64(), currency, rate_metadata)?;
     w.write_event(Event::Start(BytesStart::new("lineVatData")))?;
-    text_element(w, "lineVatAmount", &format_native_amount(vat.as_i64(), currency))?;
+    text_element(
+        w,
+        "lineVatAmount",
+        &format_native_amount(vat.as_i64(), currency),
+    )?;
     text_element(w, "lineVatAmountHUF", &huf.to_string())?;
     w.write_event(Event::End(BytesEnd::new("lineVatData")))?;
     Ok(())
@@ -1194,7 +1199,10 @@ mod tests {
         // flat-string renderer; the new shape demands `xxxxxxxx-y-zz`
         // so the bare base is rejected at the boundary.
         let err = parse_hungarian_tax_number("12345678").unwrap_err();
-        assert!(matches!(err, SupplierConfigError::MalformedTaxNumber { .. }));
+        assert!(matches!(
+            err,
+            SupplierConfigError::MalformedTaxNumber { .. }
+        ));
     }
 
     #[test]
@@ -1215,13 +1223,22 @@ mod tests {
     fn parse_hungarian_tax_number_rejects_wrong_segment_lengths() {
         // 7 + 1 + 2 — taxpayer too short.
         let err = parse_hungarian_tax_number("1234567-1-42").unwrap_err();
-        assert!(matches!(err, SupplierConfigError::MalformedTaxNumber { .. }));
+        assert!(matches!(
+            err,
+            SupplierConfigError::MalformedTaxNumber { .. }
+        ));
         // 8 + 2 + 2 — vat-code too long.
         let err = parse_hungarian_tax_number("12345678-12-42").unwrap_err();
-        assert!(matches!(err, SupplierConfigError::MalformedTaxNumber { .. }));
+        assert!(matches!(
+            err,
+            SupplierConfigError::MalformedTaxNumber { .. }
+        ));
         // 8 + 1 + 3 — county-code too long.
         let err = parse_hungarian_tax_number("12345678-1-421").unwrap_err();
-        assert!(matches!(err, SupplierConfigError::MalformedTaxNumber { .. }));
+        assert!(matches!(
+            err,
+            SupplierConfigError::MalformedTaxNumber { .. }
+        ));
     }
 
     #[test]

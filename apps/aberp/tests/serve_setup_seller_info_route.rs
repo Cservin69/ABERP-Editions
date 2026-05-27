@@ -77,10 +77,7 @@ fn good_inputs() -> SellerInfoInputs {
 /// Per-test tempfile path. `Ulid` keeps parallel test binaries +
 /// parallel test cases isolated.
 fn temp_path(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "aberp-seller-info-{label}-{}.toml",
-        Ulid::new()
-    ))
+    std::env::temp_dir().join(format!("aberp-seller-info-{label}-{}.toml", Ulid::new()))
 }
 
 /// Test 1 — happy path: route helper writes the file AND flips boot
@@ -101,10 +98,20 @@ fn route_happy_path_writes_file_and_flips_boot_state() {
     serve::setup_seller_info_request(&state, &inputs, Some(&path))
         .expect("happy path must succeed");
 
-    assert!(path.exists(), "seller.toml must exist at {}", path.display());
+    assert!(
+        path.exists(),
+        "seller.toml must exist at {}",
+        path.display()
+    );
     let body = std::fs::read_to_string(&path).expect("read seller.toml");
-    assert!(body.contains("legal_name = \"Áben Consulting KFT.\""), "body: {body}");
-    assert!(body.contains("tax_number = \"24904362-2-41\""), "body: {body}");
+    assert!(
+        body.contains("legal_name = \"Áben Consulting KFT.\""),
+        "body: {body}"
+    );
+    assert!(
+        body.contains("tax_number = \"24904362-2-41\""),
+        "body: {body}"
+    );
     assert!(body.contains("country_code = \"HU\""), "body: {body}");
 
     let guard = state.boot_state.read().unwrap();
@@ -217,7 +224,10 @@ fn route_overwrites_existing_file_atomically() {
         .expect("overwrite must succeed");
     let body2 = std::fs::read_to_string(&path).unwrap();
     assert!(body2.contains("Other Company"), "second body: {body2}");
-    assert!(!body2.contains("Áben Consulting"), "first body must be fully replaced: {body2}");
+    assert!(
+        !body2.contains("Áben Consulting"),
+        "first body must be fully replaced: {body2}"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -261,8 +271,7 @@ fn legacy_parse_seller_toml_round_trips_bank_fields_from_wizard_write() {
     let path = temp_path("legacy-bank");
 
     let inputs = good_inputs();
-    serve::setup_seller_info_request(&state, &inputs, Some(&path))
-        .expect("write must succeed");
+    serve::setup_seller_info_request(&state, &inputs, Some(&path)).expect("write must succeed");
     let body = std::fs::read_to_string(&path).unwrap();
 
     let bank = aberp::print_invoice::parse_seller_toml(&body).expect("legacy parses");

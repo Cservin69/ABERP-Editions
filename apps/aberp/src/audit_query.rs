@@ -386,10 +386,7 @@ fn latest_submission_attempt(
 /// helper is a SECOND surface that reads the same evidence for the
 /// orthogonal mark-abandoned-guard purpose; the classifier semantic
 /// is unchanged.
-pub fn latest_check_performed_outcome(
-    ledger: &Ledger,
-    invoice_id: &str,
-) -> Result<Option<String>> {
+pub fn latest_check_performed_outcome(ledger: &Ledger, invoice_id: &str) -> Result<Option<String>> {
     let entries = ledger
         .entries()
         .context("read audit ledger entries to resolve latest_check_performed_outcome")?;
@@ -413,6 +410,105 @@ fn latest_check_performed_outcome_from_entries(
             })?;
         if payload.invoice_id == invoice_id {
             return Ok(Some(payload.outcome));
+        }
+    }
+    Ok(None)
+}
+
+/// PR-70 / ADR-0039 §2 — operational payment record returned by
+/// [`payment_record_for`]. Mirrors the
+/// [`audit_payloads::InvoicePaymentRecordedPayload`] shape minus
+/// the audit-chain bookkeeping fields the read-side does not need
+/// (idempotency_key is internal to the audit chain; payment_record
+/// surfaces the operator-visible facts).
+///
+/// Wire emission of this struct (via the SPA's invoice list +
+/// detail responses) is handled by the route layer, which converts
+/// `PaymentRecord` to `PaymentRecordSummary` (`apps/aberp/src/serve.rs`)
+/// at the JSON-emit boundary so the wire shape stays controlled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentRecord {
+    pub paid_at: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub method: audit_payloads::PaymentMethod,
+    pub reference: Option<String>,
+}
+
+/// True iff at least one `InvoicePaymentRecorded` entry has been
+/// written for this `invoice_id`. PR-70 / ADR-0039 §2 idempotency
+/// gate — the mark-paid route bounces a second attempt with 409
+/// Conflict per the no-double-pay invariant.
+///
+/// The audit chain is append-only; once a payment is recorded, this
+/// returns `true` forever (no "unpay" surface in v1 per the
+/// session-92 brief out-of-scope list).
+pub fn is_invoice_paid(ledger: &Ledger, invoice_id: &str) -> Result<bool> {
+    let entries = ledger
+        .entries()
+        .context("read audit ledger entries to resolve is_invoice_paid")?;
+    is_invoice_paid_from_entries(&entries, invoice_id)
+}
+
+fn is_invoice_paid_from_entries(entries: &[Entry], invoice_id: &str) -> Result<bool> {
+    for entry in entries {
+        if entry.kind != EventKind::InvoicePaymentRecorded {
+            continue;
+        }
+        let payload: audit_payloads::InvoicePaymentRecordedPayload =
+            serde_json::from_slice(&entry.payload).map_err(|e| {
+                anyhow!(
+                    "InvoicePaymentRecorded audit payload (seq {:?}) failed typed decode: {e}",
+                    entry.seq
+                )
+            })?;
+        if payload.invoice_id == invoice_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Returns the most-recent (highest-seq) [`PaymentRecord`] for this
+/// invoice id, or `None` if no `InvoicePaymentRecorded` entry exists.
+/// PR-70 / ADR-0039 §2 read-side surface for the SPA's mark-paid
+/// chip rendering + the route's 409-Conflict echo payload.
+///
+/// "Most-recent" is a defensive posture — v1 enforces no-double-pay
+/// at the route layer, so only one entry per invoice exists in
+/// practice. Walking newest-to-oldest here means a hypothetical
+/// future "amend payment" PR can append a fresh entry and this
+/// helper picks it up correctly without a schema migration.
+pub fn payment_record_for(ledger: &Ledger, invoice_id: &str) -> Result<Option<PaymentRecord>> {
+    let entries = ledger
+        .entries()
+        .context("read audit ledger entries to resolve payment_record_for")?;
+    payment_record_for_from_entries(&entries, invoice_id)
+}
+
+fn payment_record_for_from_entries(
+    entries: &[Entry],
+    invoice_id: &str,
+) -> Result<Option<PaymentRecord>> {
+    for entry in entries.iter().rev() {
+        if entry.kind != EventKind::InvoicePaymentRecorded {
+            continue;
+        }
+        let payload: audit_payloads::InvoicePaymentRecordedPayload =
+            serde_json::from_slice(&entry.payload).map_err(|e| {
+                anyhow!(
+                    "InvoicePaymentRecorded audit payload (seq {:?}) failed typed decode: {e}",
+                    entry.seq
+                )
+            })?;
+        if payload.invoice_id == invoice_id {
+            return Ok(Some(PaymentRecord {
+                paid_at: payload.paid_at,
+                amount_minor: payload.amount_minor,
+                currency: payload.currency,
+                method: payload.method,
+                reference: payload.reference,
+            }));
         }
     }
     Ok(None)
@@ -1001,5 +1097,140 @@ mod tests {
             StuckOutcome::NotStuck(NotStuckReason::AlreadyAbandoned) => {}
             other => panic!("expected AlreadyAbandoned, got {other:?}"),
         }
+    }
+
+    // ── PR-70 / ADR-0039 §2 — is_invoice_paid + payment_record_for ──
+
+    fn write_payment_recorded(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        invoice_id: &str,
+        idem: IdempotencyKey,
+        paid_at: &str,
+        amount_minor: i64,
+        currency: &str,
+        method: audit_payloads::PaymentMethod,
+        reference: Option<String>,
+    ) {
+        let payload = audit_payloads::InvoicePaymentRecordedPayload::new(
+            invoice_id,
+            idem,
+            paid_at,
+            amount_minor,
+            currency,
+            method,
+            reference,
+        );
+        ledger
+            .append(
+                EventKind::InvoicePaymentRecorded,
+                payload.to_bytes(),
+                actor.clone(),
+                Some(idem.to_canonical_string()),
+            )
+            .unwrap();
+    }
+
+    /// Base case: empty ledger → `is_invoice_paid` false. Pins the
+    /// degenerate-input behaviour against future regressions.
+    #[test]
+    fn is_invoice_paid_returns_false_on_empty_ledger() {
+        let (ledger, _actor) = fixture_ledger();
+        assert!(!is_invoice_paid(&ledger, "inv_A").unwrap());
+    }
+
+    /// Single `InvoicePaymentRecorded` entry → true.
+    #[test]
+    fn is_invoice_paid_returns_true_after_payment_entry() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_payment_recorded(
+            &mut ledger,
+            &actor,
+            "inv_A",
+            idem,
+            "2026-05-26",
+            12_500,
+            "HUF",
+            audit_payloads::PaymentMethod::BankTransfer,
+            Some("REF-1".to_string()),
+        );
+        assert!(is_invoice_paid(&ledger, "inv_A").unwrap());
+    }
+
+    /// Cross-invoice isolation: a payment entry on inv_B does NOT
+    /// flip inv_A's flag. Mirrors the same defence-in-depth check
+    /// every other audit_query helper carries.
+    #[test]
+    fn is_invoice_paid_does_not_cross_invoice_ids() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_payment_recorded(
+            &mut ledger,
+            &actor,
+            "inv_B",
+            idem,
+            "2026-05-26",
+            5_000,
+            "HUF",
+            audit_payloads::PaymentMethod::Cash,
+            None,
+        );
+        assert!(!is_invoice_paid(&ledger, "inv_A").unwrap());
+        assert!(is_invoice_paid(&ledger, "inv_B").unwrap());
+    }
+
+    /// `payment_record_for` returns `None` on empty ledger.
+    #[test]
+    fn payment_record_for_returns_none_on_empty_ledger() {
+        let (ledger, _actor) = fixture_ledger();
+        assert!(payment_record_for(&ledger, "inv_A").unwrap().is_none());
+    }
+
+    /// `payment_record_for` returns the full PaymentRecord shape.
+    /// All fields are pinned by exact value so a regression dropping
+    /// or renaming any field surfaces loud (CLAUDE.md rule 9).
+    #[test]
+    fn payment_record_for_returns_full_record() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_payment_recorded(
+            &mut ledger,
+            &actor,
+            "inv_A",
+            idem,
+            "2026-05-26",
+            12_500,
+            "HUF",
+            audit_payloads::PaymentMethod::BankTransfer,
+            Some("REF-1".to_string()),
+        );
+        let record = payment_record_for(&ledger, "inv_A").unwrap().unwrap();
+        assert_eq!(record.paid_at, "2026-05-26");
+        assert_eq!(record.amount_minor, 12_500);
+        assert_eq!(record.currency, "HUF");
+        assert_eq!(record.method, audit_payloads::PaymentMethod::BankTransfer);
+        assert_eq!(record.reference.as_deref(), Some("REF-1"));
+    }
+
+    /// `payment_record_for` cross-invoice isolation. Defence-in-depth
+    /// per CLAUDE.md rule 9.
+    #[test]
+    fn payment_record_for_does_not_cross_invoice_ids() {
+        let (mut ledger, actor) = fixture_ledger();
+        let idem = IdempotencyKey::new();
+        write_payment_recorded(
+            &mut ledger,
+            &actor,
+            "inv_B",
+            idem,
+            "2026-05-26",
+            5_000,
+            "HUF",
+            audit_payloads::PaymentMethod::Cash,
+            None,
+        );
+        assert!(payment_record_for(&ledger, "inv_A").unwrap().is_none());
+        assert!(payment_record_for(&ledger, "inv_B").unwrap().is_some());
     }
 }

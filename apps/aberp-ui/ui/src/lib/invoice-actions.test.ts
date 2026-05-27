@@ -55,9 +55,13 @@ const TABLE: Expected[] = [
   // issue a storno (ADR-0023 §1). PR-47β / session-65: operator can
   // also issue a modification (ADR-0024 §6 base case). Download
   // remains available.
+  //
+  // PR-70 / ADR-0039 — the default (paid=false) baseline includes
+  // the "Pay" button for the mark-as-paid affordance. The paid=true
+  // branch is pinned by `finalized_paid_hides_pay_button` below.
   {
     state: "Finalized",
-    buttons: ["Storno", "Modification", "Download"],
+    buttons: ["Pay", "Storno", "Modification", "Download"],
   },
   // Rejected — terminal ABORTED. Download only.
   { state: "Rejected", buttons: ["Download"] },
@@ -177,5 +181,55 @@ describe("buttonsForState", () => {
       "Unknown",
     ];
     expect(stateNames).toEqual(expected);
+  });
+
+  // ── PR-70 / ADR-0039 — Pay-button gating ──────────────────────────
+
+  it("Pay button appears on Finalized when paid=false", () => {
+    // The unpaid baseline. Mirror-pin against the default-paid=false
+    // branch above; this test explicitly asserts the boolean's
+    // contract so a regression that ignored the parameter surfaces.
+    expect(buttonsForState("Finalized", false)).toEqual([
+      "Pay",
+      "Storno",
+      "Modification",
+      "Download",
+    ]);
+  });
+
+  it("Pay button is hidden on Finalized when paid=true", () => {
+    // The paid branch — operator cannot record a payment twice
+    // (backend enforces no-double-pay with 409 per ADR-0039 §3).
+    // Surfacing the button on a paid invoice would produce a 409 the
+    // operator was not warned about — exactly the failure mode A161
+    // / A163 named for the existing per-state buttons.
+    expect(buttonsForState("Finalized", true)).toEqual([
+      "Storno",
+      "Modification",
+      "Download",
+    ]);
+  });
+
+  it("Pay button is never shown on non-Finalized states regardless of paid", () => {
+    // Counter-pin: the `paid` flag is a no-op on every other state.
+    // The backend's mark-paid route 409s on non-Finalized states; a
+    // regression that surfaced Pay on Ready/Submitted/etc. would
+    // produce a 409 the operator was not warned about.
+    const nonFinalized: InvoiceState[] = [
+      "Unknown",
+      "Ready",
+      "Pending",
+      "PendingNavExists",
+      "Submitted",
+      "Recovered",
+      "Rejected",
+      "Storno",
+      "Amended",
+      "Abandoned",
+    ];
+    for (const state of nonFinalized) {
+      expect(buttonsForState(state, false).includes("Pay")).toBe(false);
+      expect(buttonsForState(state, true).includes("Pay")).toBe(false);
+    }
   });
 });

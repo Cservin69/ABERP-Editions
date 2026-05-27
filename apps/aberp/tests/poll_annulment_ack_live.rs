@@ -45,8 +45,8 @@ use aberp::audit_payloads::{
     InvoiceAnnulmentAckStatusPayload, InvoiceAnnulmentSubmissionResponsePayload,
 };
 use aberp::cli::{
-    AnnulmentCode, IssueInvoiceArgs, NavEnv, PollAnnulmentAckArgs,
-    RequestTechnicalAnnulmentArgs, SubmitAnnulmentArgs, SubmitInvoiceArgs,
+    AnnulmentCode, IssueInvoiceArgs, NavEnv, PollAnnulmentAckArgs, RequestTechnicalAnnulmentArgs,
+    SubmitAnnulmentArgs, SubmitInvoiceArgs,
 };
 use aberp::{
     issue_invoice, poll_annulment_ack, request_technical_annulment, submit_annulment,
@@ -232,8 +232,7 @@ fn poll_annulment_ack_against_api_test_end_to_end() {
         tenant: tenant_id_str,
         endpoint: NavEnv::Test,
     };
-    poll_annulment_ack::run(&poll_args)
-        .expect("poll-annulment-ack must succeed against api-test");
+    poll_annulment_ack::run(&poll_args).expect("poll-annulment-ack must succeed against api-test");
 
     // 5. Re-open the ledger; verify post-state.
     let ledger = Ledger::open(&db_path, tenant, binary_hash).expect("re-open ledger");

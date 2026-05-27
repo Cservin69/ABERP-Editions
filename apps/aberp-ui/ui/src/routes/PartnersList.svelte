@@ -13,13 +13,22 @@
   // wired into the issue/modification forms; this page's "search"
   // input is for admin browsing, not invoice issuance.
 
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import {
     deletePartner,
     listPartners,
     type Partner,
   } from "../lib/api";
   import { filterPartners } from "../lib/partners";
+  // PR-68 / session-90 — keyboard navigation Tier-1 UX lift, mirror
+  // of the InvoiceList wiring. The existing `.page__search` input
+  // becomes the `/`-focus target; j/k walk filtered rows; Enter
+  // opens the focused partner's edit modal.
+  import {
+    makeHotkeyParserState,
+    nextRowIndex,
+    parseHotkey,
+  } from "../lib/keyboard-nav";
   import PartnerForm from "./PartnerForm.svelte";
 
   let rows: Partner[] = $state([]);
@@ -38,9 +47,79 @@
 
   let filtered = $derived(filterPartners(rows, search));
 
+  // PR-68 / session-90 — keyboard-nav state. `focusedRowIndex` walks
+  // the filtered row set; `hintsVisible` toggles the footer chip.
+  // `searchInputEl` is the DOM ref the `/` hotkey focuses.
+  let focusedRowIndex: number = $state(-1);
+  let hintsVisible: boolean = $state(true);
+  let searchInputEl: HTMLInputElement | null = $state(null);
+  const parserState = makeHotkeyParserState();
+
+  $effect(() => {
+    if (filtered.length === 0) {
+      focusedRowIndex = -1;
+    } else if (focusedRowIndex >= filtered.length) {
+      focusedRowIndex = filtered.length - 1;
+    }
+  });
+
   onMount(() => {
     void loadPartners();
+    window.addEventListener("keydown", handleKeydown);
   });
+
+  onDestroy(() => {
+    window.removeEventListener("keydown", handleKeydown);
+  });
+
+  function handleKeydown(event: KeyboardEvent) {
+    // Stand down while the create/edit modal owns the keyboard.
+    if (modalState !== null) return;
+    const hotkey = parseHotkey(event, parserState);
+    if (hotkey === null) return;
+    switch (hotkey.kind) {
+      case "focus-search":
+        event.preventDefault();
+        searchInputEl?.focus();
+        searchInputEl?.select();
+        return;
+      case "blur-or-clear":
+        if (event.target === searchInputEl) {
+          if (search.length > 0) {
+            search = "";
+          } else {
+            searchInputEl?.blur();
+          }
+        }
+        return;
+      case "row-down":
+        event.preventDefault();
+        focusedRowIndex = nextRowIndex(focusedRowIndex, 1, filtered.length);
+        return;
+      case "row-up":
+        event.preventDefault();
+        focusedRowIndex = nextRowIndex(focusedRowIndex, -1, filtered.length);
+        return;
+      case "row-top":
+        event.preventDefault();
+        focusedRowIndex = filtered.length > 0 ? 0 : -1;
+        return;
+      case "row-bottom":
+        event.preventDefault();
+        focusedRowIndex = filtered.length > 0 ? filtered.length - 1 : -1;
+        return;
+      case "row-open":
+        if (focusedRowIndex >= 0 && focusedRowIndex < filtered.length) {
+          event.preventDefault();
+          openEdit(filtered[focusedRowIndex]);
+        }
+        return;
+      case "toggle-hints":
+        event.preventDefault();
+        hintsVisible = !hintsVisible;
+        return;
+    }
+  }
 
   async function loadPartners() {
     loadState = "loading";
@@ -119,9 +198,10 @@
     <label class="page__search">
       <span class="visually-hidden">Filter partners</span>
       <input
-        type="text"
+        bind:this={searchInputEl}
+        type="search"
         bind:value={search}
-        placeholder="Filter by name or tax number…"
+        placeholder="Filter by name or tax number… (press /)"
         autocomplete="off"
         spellcheck="false"
       />
@@ -160,8 +240,9 @@
         </tr>
       </thead>
       <tbody>
-        {#each filtered as partner (partner.id)}
-          <tr>
+        {#each filtered as partner, rowIndex (partner.id)}
+          {@const isKeyboardFocused = rowIndex === focusedRowIndex}
+          <tr class:row-focused={isKeyboardFocused}>
             <td>{partner.display_name}</td>
             <td>{partner.legal_name}</td>
             <td>
@@ -225,6 +306,14 @@
         {/each}
       </tbody>
     </table>
+  {/if}
+
+  <!-- PR-68 / session-90 — keyboard hints footer. `?` toggles. -->
+  {#if hintsVisible}
+    <p class="keyboard-hints" aria-hidden="true">
+      Press <kbd>/</kbd> to search • <kbd>j</kbd>/<kbd>k</kbd> to navigate •
+      <kbd>Enter</kbd> to edit • <kbd>?</kbd> to hide
+    </p>
   {/if}
 </section>
 
@@ -450,5 +539,34 @@
     overflow: hidden;
     clip: rect(0 0 0 0);
     white-space: nowrap;
+  }
+
+  /* PR-68 / session-90 — focused-row highlight for the j/k cursor.
+   * Mirrors the InvoiceList screen's posture so the two list views
+   * share a single keyboard-cursor signal. */
+  .partners-table tbody tr.row-focused {
+    background: var(--color-surface-raised);
+    outline: 1px solid var(--color-text-muted);
+    outline-offset: -1px;
+  }
+
+  .keyboard-hints {
+    margin: var(--space-3) 0 0 0;
+    text-align: right;
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
+    font-family: var(--type-family-body);
+  }
+
+  .keyboard-hints kbd {
+    display: inline-block;
+    padding: 0 var(--space-1);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 2px;
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    line-height: 1.4;
   }
 </style>

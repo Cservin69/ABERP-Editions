@@ -22,9 +22,7 @@
 //! mirror `submit_invoice_live.rs`'s shape and is named in the PR-11
 //! commit message as PR-11 follow-on work.
 
-use aberp::nav_xml::{
-    self, CustomerInfo, ModificationReference, NavParties, SupplierInfo,
-};
+use aberp::nav_xml::{self, CustomerInfo, ModificationReference, NavParties, SupplierInfo};
 use aberp_billing::{
     Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
 };
@@ -88,8 +86,15 @@ fn modification_emitter_minimal_invoice_passes_validator() {
     let parties = minimal_parties();
     let reference = minimal_modification_reference();
 
-    let xml = nav_xml::render_modification_data(&modification, &series, &parties, &reference, Currency::Huf, None)
-        .expect("modification emitter must succeed on minimal fixture");
+    let xml = nav_xml::render_modification_data(
+        &modification,
+        &series,
+        &parties,
+        &reference,
+        Currency::Huf,
+        None,
+    )
+    .expect("modification emitter must succeed on minimal fixture");
 
     match validate_invoice_data(&xml) {
         Ok(()) => {}
@@ -120,8 +125,15 @@ fn modification_xml_carries_invoice_reference_and_modification_issue_date() {
         modification_index: 3, // pin a non-1 index to defend against literal-1 elision
         modification_issue_date: "2026-05-21".to_string(),
     };
-    let xml = nav_xml::render_modification_data(&modification, &series, &parties, &reference, Currency::Huf, None)
-        .unwrap();
+    let xml = nav_xml::render_modification_data(
+        &modification,
+        &series,
+        &parties,
+        &reference,
+        Currency::Huf,
+        None,
+    )
+    .unwrap();
     let body = std::str::from_utf8(&xml).expect("modification XML must be UTF-8");
 
     assert!(
@@ -160,8 +172,15 @@ fn modification_xml_carries_positive_line_amounts() {
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = minimal_parties();
     let reference = minimal_modification_reference();
-    let xml = nav_xml::render_modification_data(&modification, &series, &parties, &reference, Currency::Huf, None)
-        .unwrap();
+    let xml = nav_xml::render_modification_data(
+        &modification,
+        &series,
+        &parties,
+        &reference,
+        Currency::Huf,
+        None,
+    )
+    .unwrap();
     let body = std::str::from_utf8(&xml).unwrap();
 
     // The fixture line is quantity=2, unit_price=1200, vat=27%.
@@ -208,8 +227,15 @@ fn modification_xml_invoice_number_is_the_modifications_own_seq() {
         modification_index: 1,
         modification_issue_date: "2026-05-21".to_string(),
     };
-    let xml = nav_xml::render_modification_data(&modification, &series, &parties, &reference, Currency::Huf, None)
-        .unwrap();
+    let xml = nav_xml::render_modification_data(
+        &modification,
+        &series,
+        &parties,
+        &reference,
+        Currency::Huf,
+        None,
+    )
+    .unwrap();
     let body = std::str::from_utf8(&xml).unwrap();
 
     assert!(

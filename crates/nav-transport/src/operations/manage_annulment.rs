@@ -123,7 +123,10 @@ pub async fn call(
         });
     }
 
-    match parse_result_block(&response_xml, NavTransportError::ManageAnnulmentResponseParse)? {
+    match parse_result_block(
+        &response_xml,
+        NavTransportError::ManageAnnulmentResponseParse,
+    )? {
         NavResultBlock::Ok => {}
         NavResultBlock::Error { code, message } => {
             // ADR-0009 §5 split, shared via `is_non_retryable` per

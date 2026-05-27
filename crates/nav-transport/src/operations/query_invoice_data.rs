@@ -190,7 +190,10 @@ pub async fn call(
         });
     }
 
-    match parse_result_block(&response_xml, NavTransportError::QueryInvoiceDataResponseParse)? {
+    match parse_result_block(
+        &response_xml,
+        NavTransportError::QueryInvoiceDataResponseParse,
+    )? {
         NavResultBlock::Ok => {}
         NavResultBlock::Error { code, message } => {
             // ADR-0009 §5 retry classification reused (same NAV-side
@@ -255,9 +258,7 @@ pub async fn call(
 /// - XML parse failure (delegated to [`find_first_text`]'s Result;
 ///   routed through the same `QueryInvoiceDataResponseParse` variant
 ///   as the existing parse-side failures inside [`call`]).
-pub fn parse_audit_data_transaction_id(
-    response_xml: &[u8],
-) -> Result<String, NavTransportError> {
+pub fn parse_audit_data_transaction_id(response_xml: &[u8]) -> Result<String, NavTransportError> {
     let raw = find_first_text(response_xml, "transactionId")?.ok_or_else(|| {
         NavTransportError::QueryInvoiceDataResponseParse(
             "queryInvoiceData response missing <auditData>/<transactionId> — NAV-side \
@@ -392,8 +393,8 @@ mod tests {
     #[test]
     fn pr_21_parse_audit_data_transaction_id_loud_fails_on_empty_text() {
         let body = br#"<auditData><transactionId>   </transactionId></auditData>"#;
-        let err = parse_audit_data_transaction_id(body)
-            .expect_err("empty transactionId must loud-fail");
+        let err =
+            parse_audit_data_transaction_id(body).expect_err("empty transactionId must loud-fail");
         assert!(matches!(
             err,
             NavTransportError::QueryInvoiceDataResponseParse(_)

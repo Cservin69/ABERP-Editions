@@ -160,7 +160,14 @@ pub fn render_invoice(model: &InvoiceModel) -> Result<Vec<u8>, RenderError> {
 fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel) {
     // Title block (top-left): "Számla" + invoice number.
     text(ops, "FB", 28, MARGIN_LEFT, MARGIN_TOP - 14, "Számla");
-    text(ops, "F1", 18, MARGIN_LEFT, MARGIN_TOP - 38, &m.invoice_number);
+    text(
+        ops,
+        "F1",
+        18,
+        MARGIN_LEFT,
+        MARGIN_TOP - 38,
+        &m.invoice_number,
+    );
 
     // Horizontal accent rule under the title.
     rule(ops, MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP - 58);
@@ -400,11 +407,8 @@ fn write_totals(
         y -= 14;
         if !matches!(m.currency, Currency::Huf) {
             if let Some(rate) = m.rate_metadata.as_ref() {
-                let vat_huf = aberp_billing::huf_equivalent_round_half_even(
-                    vat_minor,
-                    &rate.rate,
-                )
-                .unwrap_or(0);
+                let vat_huf = aberp_billing::huf_equivalent_round_half_even(vat_minor, &rate.rate)
+                    .unwrap_or(0);
                 text_right(ops, "F1", 9, label_right, y, &label);
                 text_right(
                     ops,
@@ -434,7 +438,10 @@ fn write_totals(
     // Árfolyam + Bruttó összeg in HUF, non-HUF only.
     if !matches!(m.currency, Currency::Huf) {
         if let Some(rate) = m.rate_metadata.as_ref() {
-            let rate_str = format!("Árfolyam: {} Ft", format::rate_for_display(&rate.rate.to_string()));
+            let rate_str = format!(
+                "Árfolyam: {} Ft",
+                format::rate_for_display(&rate.rate.to_string())
+            );
             text_right(ops, "F1", 9, MARGIN_RIGHT, y, &rate_str);
             y -= 14;
             let gross_str = format!(

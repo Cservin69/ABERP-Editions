@@ -371,33 +371,20 @@ fn walk_supplier_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidation
 /// accepted a flat string here — that shape ships clean past this
 /// gate but NAV's submit endpoint loud-fails it, so the gate now
 /// matches the wire reality.
+///
+/// PR-66 / session-87 — additionally asserts the `common:` namespace
+/// prefix on each of the three structured children. NAV v3.0 places
+/// these in the `base` namespace (declared as `xmlns:common` at the
+/// `<InvoiceData>` root); a bare-prefix child would inherit the
+/// default `data` namespace which is semantically wrong. The
+/// emitter (`nav_xml::common_element`) always writes the prefix, so
+/// a violation here means an upstream regression dropped it. Loud-
+/// fail per CLAUDE.md rule 12.
 fn walk_supplier_tax_number(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
     const PARENT: &str = "supplierTaxNumber";
     const ALLOWED: &[&str] = &["taxpayerId", "vatCode", "countyCode"];
     const ORDERED_REQUIRED: &[&str] = ALLOWED;
-
-    let mut seen: Vec<&'static str> = Vec::new();
-    loop {
-        match read_event(reader)? {
-            Event::Start(e) => {
-                let local = local_name_of(e.name()).to_string();
-                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
-                    NavXsdValidationError::UnexpectedElement {
-                        parent: PARENT,
-                        element: local.clone(),
-                    }
-                })?;
-                let _ = collect_text(reader, canonical)?;
-                seen.push(canonical);
-            }
-            Event::End(_) => {
-                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
-                return Ok(());
-            }
-            Event::Eof => return Err(eof_in(PARENT, reader)),
-            _ => {}
-        }
-    }
+    walk_structured_tax_number(reader, PARENT, ALLOWED, ORDERED_REQUIRED)
 }
 
 fn walk_customer_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
@@ -450,25 +437,62 @@ fn walk_customer_tax_number(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdVali
     const PARENT: &str = "customerTaxNumber";
     const ALLOWED: &[&str] = &["taxpayerId", "vatCode", "countyCode"];
     const ORDERED_REQUIRED: &[&str] = ALLOWED;
+    walk_structured_tax_number(reader, PARENT, ALLOWED, ORDERED_REQUIRED)
+}
+
+/// PR-66 / session-87 — shared walker for `<supplierTaxNumber>` and
+/// `<customerTaxNumber>`. Factored out so the `common:` prefix
+/// assertion (the PR-66 tightening) is written once and stays
+/// symmetric between the two sides. The flat shape (no children, a
+/// dashed-string text body) is rejected by `MissingRequiredChild` —
+/// the load-bearing PR-50 invariant. The wrong-prefix shape is
+/// rejected by `WrongChildNamespacePrefix` — the load-bearing PR-66
+/// invariant.
+///
+/// Kept private (no `pub`) — the two call sites above are the only
+/// allowed parents; a third structured-tax-number parent would be a
+/// schema-level decision and would land its own walker.
+fn walk_structured_tax_number(
+    reader: &mut Reader<&[u8]>,
+    parent: &'static str,
+    allowed: &'static [&'static str],
+    ordered_required: &'static [&'static str],
+) -> Result<(), NavXsdValidationError> {
+    const EXPECTED_PREFIX: &str = "common";
     let mut seen: Vec<&'static str> = Vec::new();
     loop {
         match read_event(reader)? {
             Event::Start(e) => {
-                let local = local_name_of(e.name()).to_string();
-                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                // Capture the raw prefix BEFORE local-name canonicalization
+                // so the loud-fail name names exactly what was written
+                // on the wire (per CLAUDE.md rule 12 — the operator-
+                // actionable message must point at the dropped prefix,
+                // not at a generic "wrong element").
+                let raw = e.name();
+                let actual_prefix = prefix_of(raw).unwrap_or("").to_string();
+                let local = local_name_of(raw).to_string();
+                let canonical = canonicalize(allowed, &local).ok_or_else(|| {
                     NavXsdValidationError::UnexpectedElement {
-                        parent: PARENT,
+                        parent,
                         element: local.clone(),
                     }
                 })?;
+                if actual_prefix != EXPECTED_PREFIX {
+                    return Err(NavXsdValidationError::WrongChildNamespacePrefix {
+                        parent,
+                        element: canonical,
+                        expected_prefix: EXPECTED_PREFIX,
+                        actual_prefix,
+                    });
+                }
                 let _ = collect_text(reader, canonical)?;
                 seen.push(canonical);
             }
             Event::End(_) => {
-                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                check_ordered_required(parent, ordered_required, &seen)?;
                 return Ok(());
             }
-            Event::Eof => return Err(eof_in(PARENT, reader)),
+            Event::Eof => return Err(eof_in(parent, reader)),
             _ => {}
         }
     }
@@ -1228,6 +1252,22 @@ fn local_name_of<'a>(name: QName<'a>) -> &'a str {
     std::str::from_utf8(local).unwrap_or("")
 }
 
+/// PR-66 / session-87 — namespace-prefix slice of a `QName`. Returns
+/// `Some("common")` for `<common:taxpayerId>`, `None` for bare
+/// `<taxpayerId>`. Used by `walk_structured_tax_number` to enforce
+/// the `common:` prefix on supplier/customer tax-number children
+/// (NAV v3.0 base namespace).
+///
+/// Mirrors `local_name_of`'s lifetime posture — the returned `&str`
+/// borrows from the same `QName<'a>` source. `rposition` matches
+/// `local_name_of`'s rightmost-colon split so the prefix and local
+/// name partition the same byte slice consistently.
+fn prefix_of<'a>(name: QName<'a>) -> Option<&'a str> {
+    let raw: &'a [u8] = name.0;
+    let idx = raw.iter().position(|&b| b == b':')?;
+    std::str::from_utf8(&raw[..idx]).ok()
+}
+
 fn canonicalize(allowed: &'static [&'static str], local: &str) -> Option<&'static str> {
     allowed.iter().copied().find(|a| *a == local)
 }
@@ -1374,9 +1414,9 @@ mod tests {
       <invoiceHead>
         <supplierInfo>
           <supplierTaxNumber>
-            <taxpayerId>12345678</taxpayerId>
-            <vatCode>1</vatCode>
-            <countyCode>42</countyCode>
+            <common:taxpayerId>12345678</common:taxpayerId>
+            <common:vatCode>1</common:vatCode>
+            <common:countyCode>42</common:countyCode>
           </supplierTaxNumber>
           <supplierName>ABERP Supplier Kft.</supplierName>
           <supplierAddress>
@@ -1392,9 +1432,9 @@ mod tests {
           <customerVatStatus>DOMESTIC</customerVatStatus>
           <customerVatData>
             <customerTaxNumber>
-              <taxpayerId>87654321</taxpayerId>
-              <vatCode>1</vatCode>
-              <countyCode>42</countyCode>
+              <common:taxpayerId>87654321</common:taxpayerId>
+              <common:vatCode>1</common:vatCode>
+              <common:countyCode>42</common:countyCode>
             </customerTaxNumber>
           </customerVatData>
           <customerName>Test Customer Zrt.</customerName>
@@ -1694,17 +1734,17 @@ mod tests {
 
     #[test]
     fn missing_annulment_reference_is_loud_fail() {
-        let bad = MIN_VALID_ANNULMENT
-            .replace("<annulmentReference>INV-default/00007</annulmentReference>", "");
+        let bad = MIN_VALID_ANNULMENT.replace(
+            "<annulmentReference>INV-default/00007</annulmentReference>",
+            "",
+        );
         let err = validate_annulment_data(bad.as_bytes()).unwrap_err();
         match err {
             NavXsdValidationError::MissingRequiredChild { parent, expected } => {
                 assert_eq!(parent, "InvoiceAnnulment");
                 assert_eq!(expected, "annulmentReference");
             }
-            other => panic!(
-                "expected MissingRequiredChild annulmentReference, got {other:?}"
-            ),
+            other => panic!("expected MissingRequiredChild annulmentReference, got {other:?}"),
         }
     }
 
@@ -1810,6 +1850,96 @@ mod tests {
         }
     }
 
+    /// PR-66 / session-87 — the supplier tax-number's three structured
+    /// children must carry the `common:` namespace prefix. A bare-
+    /// prefix child (the regression class session 87 closes on the
+    /// emit side) must loud-fail with the new variant, naming the
+    /// dropped prefix so the operator's next step is to fix the
+    /// emitter rather than relax the validator.
+    #[test]
+    fn supplier_tax_number_bare_prefix_child_is_loud_fail() {
+        let bad = MIN_VALID.replace(
+            "<common:taxpayerId>12345678</common:taxpayerId>",
+            "<taxpayerId>12345678</taxpayerId>",
+        );
+        let err = validate_invoice_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::WrongChildNamespacePrefix {
+                parent,
+                element,
+                expected_prefix,
+                actual_prefix,
+            } => {
+                assert_eq!(parent, "supplierTaxNumber");
+                assert_eq!(element, "taxpayerId");
+                assert_eq!(expected_prefix, "common");
+                assert_eq!(actual_prefix, "");
+            }
+            other => panic!(
+                "expected WrongChildNamespacePrefix for bare-prefix supplier taxpayerId, got {other:?}"
+            ),
+        }
+    }
+
+    /// PR-66 / session-87 — symmetric pin on the customer side. The
+    /// emit code in `nav_xml::write_customer` is a mirror of
+    /// `write_supplier`; the validator must enforce the prefix on
+    /// both sides so a regression on either side surfaces here.
+    #[test]
+    fn customer_tax_number_bare_prefix_child_is_loud_fail() {
+        let bad = MIN_VALID.replace(
+            "<common:taxpayerId>87654321</common:taxpayerId>",
+            "<taxpayerId>87654321</taxpayerId>",
+        );
+        let err = validate_invoice_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::WrongChildNamespacePrefix {
+                parent,
+                element,
+                expected_prefix,
+                actual_prefix,
+            } => {
+                assert_eq!(parent, "customerTaxNumber");
+                assert_eq!(element, "taxpayerId");
+                assert_eq!(expected_prefix, "common");
+                assert_eq!(actual_prefix, "");
+            }
+            other => panic!(
+                "expected WrongChildNamespacePrefix for bare-prefix customer taxpayerId, got {other:?}"
+            ),
+        }
+    }
+
+    /// PR-66 / session-87 — a non-`common` prefix (e.g. a typo
+    /// `base:taxpayerId` from a future contributor confusing the
+    /// declared `xmlns:common="...base"` binding) must also fail
+    /// loud. The `actual_prefix` field surfaces exactly what was on
+    /// the wire so the error message points at the typo.
+    #[test]
+    fn supplier_tax_number_wrong_prefix_is_loud_fail() {
+        let bad = MIN_VALID.replace(
+            "<common:vatCode>1</common:vatCode>",
+            "<base:vatCode>1</base:vatCode>",
+        );
+        let err = validate_invoice_data(bad.as_bytes()).unwrap_err();
+        match err {
+            NavXsdValidationError::WrongChildNamespacePrefix {
+                parent,
+                element,
+                expected_prefix,
+                actual_prefix,
+            } => {
+                assert_eq!(parent, "supplierTaxNumber");
+                assert_eq!(element, "vatCode");
+                assert_eq!(expected_prefix, "common");
+                assert_eq!(actual_prefix, "base");
+            }
+            other => panic!(
+                "expected WrongChildNamespacePrefix for wrong-prefix supplier vatCode, got {other:?}"
+            ),
+        }
+    }
+
     #[test]
     fn error_variants_have_distinct_display() {
         let v = vec![
@@ -1850,6 +1980,12 @@ mod tests {
                 actual: "y".into(),
             },
             NavXsdValidationError::NoInvoiceLines,
+            NavXsdValidationError::WrongChildNamespacePrefix {
+                parent: "x",
+                element: "y",
+                expected_prefix: "common",
+                actual_prefix: "z".into(),
+            },
         ];
 
         for i in 0..v.len() {

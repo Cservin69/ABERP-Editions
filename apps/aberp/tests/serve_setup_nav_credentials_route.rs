@@ -55,9 +55,7 @@ use aberp_nav_transport::credentials::keychain::{
     ITEM_SIGN_KEY,
 };
 use aberp_nav_transport::credentials::NavCredentials;
-use keyring::credential::{
-    Credential, CredentialApi, CredentialBuilderApi, CredentialPersistence,
-};
+use keyring::credential::{Credential, CredentialApi, CredentialBuilderApi, CredentialPersistence};
 use keyring::Error as KeyringError;
 use ulid::Ulid;
 
@@ -222,15 +220,15 @@ fn setup_route_happy_path_writes_keychain_and_flips_boot_state() {
     let state = build_state(ServeBootState::NeedsSetup, &tenant);
 
     let inputs = fixture_inputs();
-    let next_token = serve::setup_nav_credentials_request(&state, &inputs)
-        .expect("happy path must succeed");
+    let next_token =
+        serve::setup_nav_credentials_request(&state, &inputs).expect("happy path must succeed");
 
     // PR-57 / session-77 — the four artifacts now live in ONE
     // keychain entry (`nav_credentials_blob`). Round-trip via the
     // production load path: the JSON blob must parse and yield the
     // four input fields verbatim.
-    let creds = NavCredentials::load_from_keychain(&tenant)
-        .expect("blob must round-trip after setup");
+    let creds =
+        NavCredentials::load_from_keychain(&tenant).expect("blob must round-trip after setup");
     assert_eq!(creds.login(), inputs.technical_user_login.as_str());
     assert_eq!(
         creds.password_bytes(),
@@ -397,7 +395,11 @@ fn cli_and_http_reach_same_keychain_end_state() {
     for (tenant_label, tenant) in [("CLI", &cli_tenant), ("HTTP", &http_tenant)] {
         let creds = NavCredentials::load_from_keychain(tenant)
             .unwrap_or_else(|e| panic!("{tenant_label}: blob load: {e}"));
-        assert_eq!(creds.login(), inputs.technical_user_login.as_str(), "{tenant_label}: login");
+        assert_eq!(
+            creds.login(),
+            inputs.technical_user_login.as_str(),
+            "{tenant_label}: login"
+        );
         assert_eq!(
             creds.password_bytes(),
             inputs.technical_user_password.as_bytes(),
@@ -428,11 +430,8 @@ fn shared_core_validation_names_offending_field() {
     let mut inputs = fixture_inputs();
     inputs.xml_sign_key = "".to_string();
 
-    let err = aberp::setup_nav_credentials::setup_credentials_from_inputs(
-        "any-tenant",
-        &inputs,
-    )
-    .expect_err("blank sign key must fail validation");
+    let err = aberp::setup_nav_credentials::setup_credentials_from_inputs("any-tenant", &inputs)
+        .expect_err("blank sign key must fail validation");
     match err {
         SetupCredentialsError::Validation(msg) => {
             assert!(msg.contains("xmlSignKey"), "got: {msg}");

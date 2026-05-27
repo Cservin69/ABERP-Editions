@@ -75,10 +75,7 @@ pub async fn download_invoice_pdf(
 /// (`{invoice_id, invoice_number, state}`); the SPA navigates the
 /// detail modal open on the returned `invoice_id`.
 #[tauri::command]
-pub async fn issue_invoice(
-    state: State<'_, AppState>,
-    body: Value,
-) -> Result<Value, String> {
+pub async fn issue_invoice(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
     forward_post(&state, "/invoices/issue", body).await
 }
 
@@ -113,10 +110,7 @@ pub async fn submit_invoice_to_nav(
 /// `PendingNavExists`) the backend returns 409; the SPA renders the
 /// typed error body inline per A157.
 #[tauri::command]
-pub async fn poll_ack(
-    state: State<'_, AppState>,
-    invoice_id: String,
-) -> Result<Value, String> {
+pub async fn poll_ack(state: State<'_, AppState>, invoice_id: String) -> Result<Value, String> {
     validate_invoice_id(&invoice_id).map_err(|e| format!("{e:#}"))?;
     let path = format!("/invoices/{invoice_id}/poll-ack");
     forward_post(&state, &path, Value::Null).await
@@ -163,6 +157,31 @@ pub async fn amend_invoice_modification(
 ) -> Result<Value, String> {
     validate_invoice_id(&invoice_id).map_err(|e| format!("{e:#}"))?;
     let path = format!("/api/invoices/{invoice_id}/modification");
+    forward_post(&state, &path, body).await
+}
+
+/// PR-70 / ADR-0039 — `POST /api/invoices/<id>/mark-paid`; the SPA's
+/// "Mark as paid" button on the invoice-detail modal posts here with
+/// the operator-supplied payment metadata (paid_at + amount_minor +
+/// currency + method + optional reference). Records the payment as
+/// operational audit metadata WITHOUT changing the NAV regulatory
+/// state ladder.
+///
+/// Returns the backend's typed response body (`{invoice_id, payment,
+/// entries_verified}`). Failure modes:
+///   - 400 — invalid paid_at format OR currency mismatch with invoice.
+///   - 409 — invoice not in `Finalized` state, OR already paid (the
+///     409 body carries the existing payment record so the SPA can
+///     render the duplicate gracefully).
+///   - 500 — propagated audit-write / chain-verify error.
+#[tauri::command]
+pub async fn mark_invoice_paid(
+    state: State<'_, AppState>,
+    invoice_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_invoice_id(&invoice_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/invoices/{invoice_id}/mark-paid");
     forward_post(&state, &path, body).await
 }
 
@@ -254,10 +273,7 @@ pub async fn get_boot_status(state: State<'_, AppState>) -> Result<Value, String
 /// body both surface as `Err(String)` to the SPA's inline-error
 /// renderer.
 #[tauri::command]
-pub async fn setup_nav_credentials(
-    app: AppHandle,
-    body: Value,
-) -> Result<Value, String> {
+pub async fn setup_nav_credentials(app: AppHandle, body: Value) -> Result<Value, String> {
     let state = app.state::<AppState>();
     let response = forward_post(&state, "/api/setup-nav-credentials", body).await?;
     // PR-51 / session-71 — the response body's `state` field carries
@@ -279,10 +295,7 @@ pub async fn setup_nav_credentials(
 /// success, propagates the typed 400 / 500 error bodies as the
 /// rejected promise.
 #[tauri::command]
-pub async fn setup_seller_info(
-    app: AppHandle,
-    body: Value,
-) -> Result<Value, String> {
+pub async fn setup_seller_info(app: AppHandle, body: Value) -> Result<Value, String> {
     let state = app.state::<AppState>();
     let response = forward_post(&state, "/api/setup-seller-info", body).await?;
     // The seller-config wizard is the last gate; the response's
@@ -307,9 +320,7 @@ pub async fn get_seller_info(state: State<'_, AppState>) -> Result<Value, String
 /// the SPA's NAV Credentials settings page to show the four presence
 /// rows + the operator-visible login value.
 #[tauri::command]
-pub async fn get_nav_credentials_status(
-    state: State<'_, AppState>,
-) -> Result<Value, String> {
+pub async fn get_nav_credentials_status(state: State<'_, AppState>) -> Result<Value, String> {
     forward_get(&state, "/api/nav-credentials-status", true).await
 }
 
@@ -346,10 +357,7 @@ pub async fn list_partners(
 /// an operator clicks "Edit" on a list row OR when a deep-link wants
 /// to surface a single partner by id. Returns the full Partner JSON.
 #[tauri::command]
-pub async fn get_partner(
-    state: State<'_, AppState>,
-    partner_id: String,
-) -> Result<Value, String> {
+pub async fn get_partner(state: State<'_, AppState>, partner_id: String) -> Result<Value, String> {
     validate_partner_id(&partner_id).map_err(|e| format!("{e:#}"))?;
     let path = format!("/api/partners/{partner_id}");
     forward_get(&state, &path, true).await
@@ -361,10 +369,7 @@ pub async fn get_partner(
 /// failures surface as the typed `{ "error": "validation_failed",
 /// "fields": [...] }` 400 body the SPA renders inline per A157.
 #[tauri::command]
-pub async fn create_partner(
-    state: State<'_, AppState>,
-    body: Value,
-) -> Result<Value, String> {
+pub async fn create_partner(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
     forward_post(&state, "/api/partners", body).await
 }
 
@@ -389,13 +394,68 @@ pub async fn update_partner(
 /// historical-invoice resolution per A182); subsequent GETs surface
 /// 404. Returns `null` on the happy path (HTTP 204 → no JSON body).
 #[tauri::command]
-pub async fn delete_partner(
-    state: State<'_, AppState>,
-    partner_id: String,
-) -> Result<(), String> {
+pub async fn delete_partner(state: State<'_, AppState>, partner_id: String) -> Result<(), String> {
     validate_partner_id(&partner_id).map_err(|e| format!("{e:#}"))?;
     let path = format!("/api/partners/{partner_id}");
     forward_delete(&state, &path).await
+}
+
+/// PR-72 / session-94 — `GET /api/seller/banks`. Used by the SPA's
+/// Tenant Settings page (bank-accounts subsection) + the
+/// SellerConfigWizard's multi-row block to render the current
+/// per-tenant bank-account collection. Body is `{banks: [...]}`.
+#[tauri::command]
+pub async fn list_seller_banks(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/seller/banks", true).await
+}
+
+/// PR-72 / session-94 — `POST /api/seller/banks`. The Tenant Settings
+/// "Add bank account" modal + the SetupWizard's "+ Add another bank
+/// account" affordance POST here. Body shape mirrors the backend
+/// `SellerBankInputs` (snake_case `currency`, `account_number`,
+/// `bank_name`, `swift_bic`, `set_as_default`).
+#[tauri::command]
+pub async fn create_seller_bank(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/seller/banks", body).await
+}
+
+/// PR-72 / session-94 — `PUT /api/seller/banks/:id`. The "Edit"
+/// affordance on the bank-accounts list PUTs here.
+#[tauri::command]
+pub async fn update_seller_bank(
+    state: State<'_, AppState>,
+    bank_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_bank_id(&bank_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/seller/banks/{bank_id}");
+    forward_put(&state, &path, body).await
+}
+
+/// PR-72 / session-94 — `POST /api/seller/banks/:id/set-default`.
+/// The "Set as default" per-row button POSTs here (no body).
+#[tauri::command]
+pub async fn set_default_seller_bank(
+    state: State<'_, AppState>,
+    bank_id: String,
+) -> Result<Value, String> {
+    validate_bank_id(&bank_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/seller/banks/{bank_id}/set-default");
+    forward_post(&state, &path, Value::Null).await
+}
+
+/// PR-72 / session-94 — `DELETE /api/seller/banks/:id`. The "Delete"
+/// per-row button POSTs here. 409 Conflict surfaces if the delete
+/// would leave a currency unrepresented while others still have
+/// entries (the brief's explicit refusal rule).
+#[tauri::command]
+pub async fn delete_seller_bank(
+    state: State<'_, AppState>,
+    bank_id: String,
+) -> Result<Value, String> {
+    validate_bank_id(&bank_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/seller/banks/{bank_id}");
+    forward_delete_returning_json(&state, &path).await
 }
 
 /// PR-45a / session-61 — the SPA's Retry button calls this command
@@ -574,7 +634,9 @@ async fn forward_post(
         // Surface the backend's typed `{ "error": "..." }` body verbatim
         // so the SPA can render the operator-actionable message inline.
         // A non-JSON body (rare) falls through as the raw text.
-        return Err(format!("backend returned {status} for {path}: {response_body}"));
+        return Err(format!(
+            "backend returned {status} for {path}: {response_body}"
+        ));
     }
     let value: Value = serde_json::from_str(&response_body)
         .with_context(|| format!("parse JSON body of {url}: `{response_body}`"))
@@ -620,7 +682,9 @@ async fn forward_put(
         .map_err(|e| format!("{e:#}"))?;
 
     if !status.is_success() {
-        return Err(format!("backend returned {status} for {path}: {response_body}"));
+        return Err(format!(
+            "backend returned {status} for {path}: {response_body}"
+        ));
     }
     let value: Value = serde_json::from_str(&response_body)
         .with_context(|| format!("parse JSON body of {url}: `{response_body}`"))
@@ -656,8 +720,77 @@ async fn forward_delete(state: &State<'_, AppState>, path: &str) -> Result<(), S
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<no body>".to_string());
         return Err(format!("backend returned {status} for {path}: {body}"));
+    }
+    Ok(())
+}
+
+/// PR-72 / session-94 — JSON-returning DELETE sibling of
+/// [`forward_delete`]. The bank-account DELETE route returns 200 +
+/// the full updated collection (so the SPA re-renders the list view
+/// from one source of truth without a second GET roundtrip). Pre-PR-72
+/// the only DELETE seam was partner soft-delete (204 No Content), so
+/// the existing helper's `Ok(())` return shape did not generalise.
+async fn forward_delete_returning_json(
+    state: &State<'_, AppState>,
+    path: &str,
+) -> Result<Value, String> {
+    let (url, token, client) = {
+        let guard = state.backend.lock().await;
+        let backend = guard
+            .as_ref()
+            .ok_or_else(|| "backend not ready yet — wait a moment and retry".to_string())?;
+        (
+            format!("{}{}", backend.url, path),
+            backend.session_token.clone(),
+            backend.client.clone(),
+        )
+    };
+
+    let resp = client
+        .delete(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .with_context(|| format!("HTTPS DELETE {url}"))
+        .map_err(|e| format!("{e:#}"))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .with_context(|| format!("read body of {url}"))
+        .map_err(|e| format!("{e:#}"))?;
+
+    if !status.is_success() {
+        return Err(format!("backend returned {status} for {path}: {body}"));
+    }
+    let value: Value = serde_json::from_str(&body)
+        .with_context(|| format!("parse JSON body of {url}: `{body}`"))
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(value)
+}
+
+/// PR-72 / session-94 — defence-in-depth path-parameter validator for
+/// the `:id` segment on bank-account routes. The `bnk_<26-char-ULID>`
+/// id is 30 chars total, alphanumeric + `_`; mirrors
+/// [`validate_partner_id`].
+fn validate_bank_id(s: &str) -> anyhow::Result<()> {
+    if s.is_empty() {
+        anyhow::bail!("bank_id is empty");
+    }
+    if s.len() > 64 {
+        anyhow::bail!("bank_id length {} exceeds 64", s.len());
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!("bank_id `{s}` contains characters outside [A-Za-z0-9_-]");
     }
     Ok(())
 }
@@ -768,6 +901,19 @@ mod tests {
     fn validate_partner_id_rejects_path_traversal() {
         assert!(validate_partner_id("../etc/passwd").is_err());
         assert!(validate_partner_id("prt/foo").is_err());
+    }
+
+    #[test]
+    fn validate_bank_id_accepts_typical_prefixed_ulid() {
+        // `bnk_<26-char-ULID>` (Crockford-base32 over SHA-256[..16]).
+        assert!(validate_bank_id("bnk_01ARZ3NDEKTSV4RRFFQ69G5FAV").is_ok());
+    }
+
+    #[test]
+    fn validate_bank_id_rejects_path_traversal() {
+        assert!(validate_bank_id("../etc/passwd").is_err());
+        assert!(validate_bank_id("bnk/foo").is_err());
+        assert!(validate_bank_id("").is_err());
     }
 
     #[test]

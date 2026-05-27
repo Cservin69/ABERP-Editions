@@ -171,7 +171,8 @@ use aberp_billing::{
 };
 use aberp_nav_transport::{
     operations::{
-        manage_invoice, query_invoice_check::{self, QueryInvoiceCheckOutcome},
+        manage_invoice,
+        query_invoice_check::{self, QueryInvoiceCheckOutcome},
         token_exchange,
     },
     soap::{InvoiceDirection, InvoiceOperation, ManageInvoiceItem},
@@ -342,12 +343,11 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
                 // deferred chain reconstruction); operator-visible
                 // summary names the gap loud per CLAUDE.md rule 12.
                 drop(conn);
-                let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes).context(
-                    "open audit ledger after TX0 Exists for chain verification",
-                )?;
-                let verified = ledger.verify_chain().context(
-                    "audit-ledger chain verification failed AFTER Phase 0 Exists",
-                )?;
+                let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+                    .context("open audit ledger after TX0 Exists for chain verification")?;
+                let verified = ledger
+                    .verify_chain()
+                    .context("audit-ledger chain verification failed AFTER Phase 0 Exists")?;
                 tracing::info!(
                     entries_verified = verified,
                     nav_invoice_number = %nav_invoice_number,
@@ -383,12 +383,11 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
                 // outcome=failure was written by
                 // perform_layer_2_check before this branch fired.
                 drop(conn);
-                let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes).context(
-                    "open audit ledger after TX0 Failure for chain verification",
-                )?;
-                let verified = ledger.verify_chain().context(
-                    "audit-ledger chain verification failed AFTER Phase 0 Failure",
-                )?;
+                let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
+                    .context("open audit ledger after TX0 Failure for chain verification")?;
+                let verified = ledger
+                    .verify_chain()
+                    .context("audit-ledger chain verification failed AFTER Phase 0 Failure")?;
                 tracing::error!(
                     invoice_id = %ready_invoice.id.to_prefixed_string(),
                     entries_verified = verified,
@@ -497,8 +496,7 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
             ledger
                 .sync_mirror(&mirror_path)
                 .context("sync audit-ledger mirror file after TX2 Response commit")?;
-            let submitted =
-                ready_invoice.into_submitted(send_outcome.transaction_id.clone());
+            let submitted = ready_invoice.into_submitted(send_outcome.transaction_id.clone());
             let prior_txid_label = stuck
                 .prior_transaction_id
                 .as_deref()
@@ -523,8 +521,7 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
             Ok(())
         }
         Err(wire_err) => {
-            let (error_class, error_code) =
-                submission_queue::classify_attempt_failure(&wire_err);
+            let (error_class, error_code) = submission_queue::classify_attempt_failure(&wire_err);
             let error_message = format!("{wire_err}");
             let response_xml: Option<Vec<u8>> = None;
             write_attempt_failed_audit(
@@ -811,9 +808,9 @@ fn write_attempt_failed_audit(
 ) -> Result<()> {
     audit_ledger::ensure_schema(conn)
         .context("ensure audit-ledger schema for retry-submission TX2 AttemptFailed")?;
-    let tx = conn.transaction().context(
-        "begin DuckDB transaction (retry-submission TX2 AttemptFailed audit append)",
-    )?;
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (retry-submission TX2 AttemptFailed audit append)")?;
     let invoice_id_str = invoice.id.to_prefixed_string();
     let idem_str = idempotency_key.to_canonical_string();
     let failed = audit_payloads::InvoiceSubmissionAttemptFailedPayload::new(
@@ -834,9 +831,8 @@ fn write_attempt_failed_audit(
         Some(idem_str),
     )
     .context("audit_ledger::append_in_tx InvoiceSubmissionAttemptFailed (retry TX2)")?;
-    tx.commit().context(
-        "commit DuckDB transaction (retry-submission TX2 AttemptFailed audit append)",
-    )?;
+    tx.commit()
+        .context("commit DuckDB transaction (retry-submission TX2 AttemptFailed audit append)")?;
     Ok(())
 }
 
@@ -868,12 +864,13 @@ enum Layer2Decision {
 /// `find_series_by_id` port. The caller already has the `ReadyInvoice`
 /// in hand (loaded by `load_issued_invoice`); the only missing piece
 /// is the series code, which the billing store resolves by ULID.
-fn derive_nav_invoice_number(
-    db_path: &std::path::Path,
-    invoice: &ReadyInvoice,
-) -> Result<String> {
-    let store = DuckDbBillingStore::open(db_path)
-        .with_context(|| format!("open billing DuckDB at {} for Layer-2 series lookup", db_path.display()))?;
+fn derive_nav_invoice_number(db_path: &std::path::Path, invoice: &ReadyInvoice) -> Result<String> {
+    let store = DuckDbBillingStore::open(db_path).with_context(|| {
+        format!(
+            "open billing DuckDB at {} for Layer-2 series lookup",
+            db_path.display()
+        )
+    })?;
     let series: InvoiceSeries = store
         .find_series_by_id(invoice.series_id)
         .context("billing::find_series_by_id (retry-submission Layer-2 series lookup)")?
@@ -947,13 +944,16 @@ fn perform_layer_2_check(
     })?;
 
     // Wire send.
-    let wire_result =
-        runtime.block_on(query_invoice_check::send_built_request(&transport, &request_xml));
+    let wire_result = runtime.block_on(query_invoice_check::send_built_request(
+        &transport,
+        &request_xml,
+    ));
 
     // Classify outcome + build payload.
     let (decision, payload) = match wire_result {
         Ok(send_outcome) => {
-            let outcome_enum = QueryInvoiceCheckOutcome::from_check_result(send_outcome.check_result);
+            let outcome_enum =
+                QueryInvoiceCheckOutcome::from_check_result(send_outcome.check_result);
             let payload = audit_payloads::InvoiceCheckPerformedPayload::new_for_outcome(
                 &invoice.id.to_prefixed_string(),
                 idempotency_key,
@@ -1006,9 +1006,9 @@ fn perform_layer_2_check(
         let ledger_tx0 = Ledger::open(db_path, tenant, binary_hash)
             .context("open audit ledger after TX0 InvoiceCheckPerformed commit")?;
         let mirror_path = audit_ledger::mirror_path_for(db_path);
-        ledger_tx0.sync_mirror(&mirror_path).context(
-            "sync audit-ledger mirror file after TX0 InvoiceCheckPerformed commit",
-        )?;
+        ledger_tx0
+            .sync_mirror(&mirror_path)
+            .context("sync audit-ledger mirror file after TX0 InvoiceCheckPerformed commit")?;
     }
 
     Ok(decision)

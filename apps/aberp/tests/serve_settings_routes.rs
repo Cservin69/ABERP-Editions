@@ -33,9 +33,7 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use aberp_audit_ledger::{BinaryHash, TenantId};
 use aberp_nav_transport::credentials::keychain::write_blob;
-use keyring::credential::{
-    Credential, CredentialApi, CredentialBuilderApi, CredentialPersistence,
-};
+use keyring::credential::{Credential, CredentialApi, CredentialBuilderApi, CredentialPersistence};
 use keyring::Error as KeyringError;
 use ulid::Ulid;
 
@@ -214,8 +212,8 @@ fn supplier_from_seller_toml_happy_path() {
     let path = dir.join("seller.toml");
     write_fixture_seller_toml_at(&path);
 
-    let supplier = aberp::serve::supplier_from_seller_toml_path(&path)
-        .expect("happy path must read fixture");
+    let supplier =
+        aberp::serve::supplier_from_seller_toml_path(&path).expect("happy path must read fixture");
     assert_eq!(supplier.tax_number, "12345678-1-42");
     assert_eq!(supplier.name, "ABERP Supplier Kft.");
     assert_eq!(supplier.address.country_code, "HU");
@@ -286,12 +284,9 @@ fn rotate_nav_credential_updates_single_slot() {
     write_blob_for_tenant(&tenant, "old-login", "old-pass", "old-sign", "old-change");
 
     let state = build_state_for(&tenant, dir.join("aberp.duckdb"));
-    let response = aberp::serve::rotate_nav_credential_request(
-        &state,
-        "password",
-        "new-pass-value",
-    )
-    .expect("rotation must succeed");
+    let response =
+        aberp::serve::rotate_nav_credential_request(&state, "password", "new-pass-value")
+            .expect("rotation must succeed");
     assert_eq!(response, "password");
 
     // PR-57 — re-read via the public load helper. The blob round-trip
@@ -389,13 +384,19 @@ fn nav_credentials_status_reports_presence_and_login_value() {
     write_blob_for_tenant(&tenant, "visible-login", "secret-pass", "sk", "ck");
 
     let state = build_state_for(&tenant, dir.join("aberp.duckdb"));
-    let status = aberp::serve::nav_credentials_status_request(&state)
-        .expect("status read must succeed");
+    let status =
+        aberp::serve::nav_credentials_status_request(&state).expect("status read must succeed");
 
     assert!(status.login, "login slot must report present");
     assert!(status.password, "password slot must report present");
-    assert!(status.sign_key, "sign_key must report present (blob carries all 4)");
-    assert!(status.change_key, "change_key must report present (blob carries all 4)");
+    assert!(
+        status.sign_key,
+        "sign_key must report present (blob carries all 4)"
+    );
+    assert!(
+        status.change_key,
+        "change_key must report present (blob carries all 4)"
+    );
     assert_eq!(
         status.login_value.as_deref(),
         Some("visible-login"),
@@ -413,8 +414,8 @@ fn nav_credentials_status_reports_all_false_when_blob_absent() {
     // No blob write — keychain entry is absent for this unique tenant.
 
     let state = build_state_for(&tenant, dir.join("aberp.duckdb"));
-    let status = aberp::serve::nav_credentials_status_request(&state)
-        .expect("status read must succeed");
+    let status =
+        aberp::serve::nav_credentials_status_request(&state).expect("status read must succeed");
 
     assert!(!status.login);
     assert!(!status.password);
@@ -454,7 +455,7 @@ fn get_seller_info_returns_none_when_file_missing() {
     let dir = test_dir("seller-info-missing");
     let path = dir.join("seller.toml"); // not written
 
-    let result = aberp::serve::seller_info_request_from_path(&path)
-        .expect("read attempt must not error");
+    let result =
+        aberp::serve::seller_info_request_from_path(&path).expect("read attempt must not error");
     assert!(result.is_none(), "missing file must surface as Ok(None)");
 }

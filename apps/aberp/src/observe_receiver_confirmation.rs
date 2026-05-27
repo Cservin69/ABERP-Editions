@@ -521,9 +521,9 @@ fn write_receiver_confirmation_audit_entry(
 ) -> Result<()> {
     audit_ledger::ensure_schema(conn)
         .context("ensure audit-ledger schema for observe-receiver-confirmation")?;
-    let tx = conn.transaction().context(
-        "begin DuckDB transaction (observe-receiver-confirmation audit append)",
-    )?;
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (observe-receiver-confirmation audit append)")?;
 
     let idem_str = annulment_idempotency_key.to_canonical_string();
     let payload = audit_payloads::InvoiceAnnulmentReceiverConfirmationPayload::new(
@@ -555,9 +555,8 @@ fn write_receiver_confirmation_audit_entry(
     )
     .context("audit_ledger::append_in_tx InvoiceAnnulmentReceiverConfirmation")?;
 
-    tx.commit().context(
-        "commit DuckDB transaction (observe-receiver-confirmation audit append)",
-    )?;
+    tx.commit()
+        .context("commit DuckDB transaction (observe-receiver-confirmation audit append)")?;
     Ok(())
 }
 

@@ -12,7 +12,7 @@ pub use crate::domain::invoice::{
     SubmissionStuckInvoice, SubmittedInvoice,
 };
 pub use crate::domain::money::{
-    huf_equivalent_round_half_even, Currency, Eur, Huf, Money, RateMetadata,
+    huf_equivalent_round_half_even, BankAccountSnapshot, Currency, Eur, Huf, Money, RateMetadata,
 };
 pub use crate::domain::reservation::{ReservationStatus, SequenceReservation};
 pub use crate::domain::series::{InvoiceSeries, ResetPolicy, SeriesCode};

@@ -240,15 +240,9 @@ fn huf_storno_back_compat_no_rate_metadata_required() {
     let parties = minimal_parties();
     let reference = build_storno_reference();
 
-    let xml = nav_xml::render_storno_data(
-        &storno,
-        &series,
-        &parties,
-        &reference,
-        Currency::Huf,
-        None,
-    )
-    .expect("HUF storno render must succeed with no rate metadata (C10 prerequisite)");
+    let xml =
+        nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
+            .expect("HUF storno render must succeed with no rate metadata (C10 prerequisite)");
 
     validate_invoice_data(&xml).expect("HUF storno body must validate against NAV v3.0");
 
@@ -273,15 +267,9 @@ fn eur_storno_without_rate_metadata_loud_fails() {
     let parties = minimal_parties();
     let reference = build_storno_reference();
 
-    let err = nav_xml::render_storno_data(
-        &storno,
-        &series,
-        &parties,
-        &reference,
-        Currency::Eur,
-        None,
-    )
-    .unwrap_err();
+    let err =
+        nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Eur, None)
+            .unwrap_err();
     let msg = format!("{err:#}");
     assert!(
         msg.contains("non-HUF") && msg.contains("rate_metadata"),

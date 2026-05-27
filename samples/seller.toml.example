@@ -48,7 +48,44 @@
 # ── PR-44ε.1 / session 57 — bank info (LIVE; consumed today) ──────
 # Flat-key shape (matching `SellerToml` in print_invoice.rs). Each
 # field is optional — the PDF renderer hides empty rows.
+#
+# NOTE (PR-71 / session 93 / ADR-0040): this flat-root form is now
+# LEGACY. The PR-71 `seller_banks` loader folds it on load into a
+# single-element `[[seller.banks]]` array with `default = true`
+# and a SWIFT-inferred currency (HU country code → HUF). The
+# existing PDF renderer + `GET /api/seller-info` route still read
+# the flat keys directly; PR-B (UI) + PR-D (NAV/PDF render) will
+# swap them to the new array form. Until then, an operator copying
+# this template keeps a working PDF + Settings page.
 bank_account_number = "12345678-12345678-12345678"
 iban                = "LT14 3250 0448 1318 6860"
 bank_name           = "Revolut"
 swift_bic           = "REVOLT21"
+
+# ── PR-71 / session 93 — multi-bank-account schema (forward-looking)
+#
+# Once PR-B + PR-D land, the CANONICAL shape is one
+# `[[seller.banks]]` array-of-tables entry per (currency,
+# account_number) pair, replacing the four flat keys above:
+#
+#   [[seller.banks]]
+#   currency       = "HUF"
+#   account_number = "12345678-12345678-12345678"
+#   bank_name      = "Erste Bank"
+#   swift_bic      = "GIBAHUHB"
+#   default        = true
+#
+#   [[seller.banks]]
+#   currency       = "EUR"
+#   account_number = "HU12-3456-7890-1234-5678-9012-3456"
+#   bank_name      = "Erste Bank"
+#   swift_bic      = "GIBAHUHB"
+#   default        = true
+#
+# Each entry requires `currency` (closed-vocab "HUF" / "EUR" per
+# ADR-0037), `account_number`, `bank_name`, `swift_bic`, and a
+# bool `default`. Per ADR-0040 §2 the loader enforces EXACTLY ONE
+# `default = true` per currency that has entries (two HUF
+# defaults or zero HUF defaults loud-fail at load). PR-B's
+# Tenant Settings page is the operator's surface for writing this
+# form once PR-B ships.

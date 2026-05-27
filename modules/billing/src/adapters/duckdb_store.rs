@@ -36,7 +36,13 @@ use crate::domain::reservation::{ReservationStatus, SequenceReservation};
 use crate::domain::series::{InvoiceSeries, ResetPolicy, SeriesCode};
 use crate::ports::storage::{AllocateArgs, AllocateOutcome, BillingStore};
 
-const CREATE_TABLES_SQL: &str = "
+// PR-73 / ADR-0040 §addendum added the per-invoice bank-account-snapshot
+// columns; the SQL-comment rationale alongside them quotes operator-
+// facing phrases like "no bank account on file" with embedded `"`
+// characters. A plain double-quoted Rust string literal would terminate
+// at those quotes, so this const switched to a raw string. The two
+// migration consts below stay as plain strings (no embedded quotes).
+const CREATE_TABLES_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS invoice_series (
     id           VARCHAR NOT NULL PRIMARY KEY,
     code         VARCHAR NOT NULL UNIQUE,
@@ -100,6 +106,27 @@ CREATE TABLE IF NOT EXISTS invoice (
     exchange_rate_source VARCHAR,
     exchange_rate_date   DATE,
     huf_equivalent_total DECIMAL(18, 0),
+    -- PR-73 / ADR-0040 §addendum — denormalized per-invoice bank-account
+    -- snapshot. Mirrors the `[[seller.banks]]` entry shape (per
+    -- ADR-0040 §1) the operator selected (or defaulted to) at issuance
+    -- time. NULL across all five columns iff the invoice was issued
+    -- before PR-73's wire shape OR by a non-SPA caller that does not
+    -- exercise the bank picker. The read path
+    -- (`invoice_bank_snapshot.rs`) treats a NULL row as "no bank
+    -- account on file" — never fabricates one from current
+    -- `seller.toml` state, since the regulatory record is "the bank
+    -- account the invoice was issued with."
+    --
+    -- Migration backfill posture: pre-PR-73 rows pick up the columns
+    -- via `MIGRATE_PR_73_SQL` below; existing HUF + EUR rows stay NULL
+    -- across all five (no retroactive rewrite — the C10 byte-identical
+    -- invariant carries through). Fresh-DB callers populate the
+    -- columns iff `AllocateArgs.bank_snapshot` is `Some(_)`.
+    bank_account_id        VARCHAR,
+    bank_account_currency  VARCHAR,
+    bank_account_number    VARCHAR,
+    bank_account_bank_name VARCHAR,
+    bank_account_swift_bic VARCHAR,
     UNIQUE (series_id, fiscal_year, sequence_number)
 );
 
@@ -112,7 +139,7 @@ CREATE TABLE IF NOT EXISTS invoice_line (
     vat_rate_basis_points INTEGER NOT NULL,
     PRIMARY KEY (invoice_id, ordinal)
 );
-";
+"#;
 
 /// Migration ladder for PR-44γ — additive columns on the pre-existing
 /// `invoice` table per ADR-0037 §3 + §1.a + §1.b.
@@ -153,6 +180,31 @@ ALTER TABLE invoice ADD COLUMN IF NOT EXISTS exchange_rate_source VARCHAR;
 ALTER TABLE invoice ADD COLUMN IF NOT EXISTS exchange_rate_date   DATE;
 ALTER TABLE invoice ADD COLUMN IF NOT EXISTS huf_equivalent_total DECIMAL(18, 0);
 UPDATE invoice SET currency = 'HUF' WHERE currency IS NULL;
+";
+
+/// PR-73 / ADR-0040 §addendum — additive migration for the five
+/// denormalized bank-account snapshot columns. Mirrors the PR-44γ
+/// posture: idempotent `ADD COLUMN IF NOT EXISTS`, no `NOT NULL` /
+/// `DEFAULT` constraints (DuckDB v1's ALTER TABLE rejects inline
+/// constraints — same trap PR-44γ documented). Pre-PR-73 rows stay
+/// NULL across all five columns; the read path treats NULL as "no
+/// bank account on file" and renders an em-dash placeholder rather
+/// than fabricating a snapshot from current `seller.toml` state.
+///
+/// No backfill `UPDATE` runs here. Unlike PR-44γ's `currency = 'HUF'`
+/// backfill (which preserved a regulatorily meaningful default for the
+/// HUF-only legacy posture), there is no per-PR-73-row default that
+/// would carry regulatory weight — a pre-PR-73 invoice was issued
+/// against `seller.toml`'s flat-root bank slot, which PR-D will
+/// re-source for those rows at render time. Backfilling a fabricated
+/// snapshot here would corrupt the regulatory record per
+/// CLAUDE.md rule 12 (fail loud) — silent fabrication is the trap.
+const MIGRATE_PR_73_SQL: &str = "
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS bank_account_id        VARCHAR;
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS bank_account_currency  VARCHAR;
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS bank_account_number    VARCHAR;
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS bank_account_bank_name VARCHAR;
+ALTER TABLE invoice ADD COLUMN IF NOT EXISTS bank_account_swift_bic VARCHAR;
 ";
 
 #[derive(Debug)]
@@ -364,14 +416,8 @@ pub fn allocate_in_tx(
     // DATE column (DuckDB casts ISO-8601 `YYYY-MM-DD` to DATE).
     // `rust_decimal::Decimal::to_string` emits a canonical decimal
     // form that DuckDB accepts.
-    let rate_value_str: Option<String> = args
-        .rate_metadata
-        .as_ref()
-        .map(|r| r.rate.to_string());
-    let rate_source: Option<String> = args
-        .rate_metadata
-        .as_ref()
-        .map(|r| r.source.clone());
+    let rate_value_str: Option<String> = args.rate_metadata.as_ref().map(|r| r.rate.to_string());
+    let rate_source: Option<String> = args.rate_metadata.as_ref().map(|r| r.source.clone());
     let rate_date_str: Option<String> = args
         .rate_metadata
         .as_ref()
@@ -382,13 +428,34 @@ pub fn allocate_in_tx(
         .rate_metadata
         .as_ref()
         .map(|r| r.huf_equivalent_total.to_string());
+    // PR-73 / ADR-0040 §addendum — bank-account snapshot columns. All
+    // five columns are written together iff `bank_snapshot` is `Some(_)`;
+    // a `None` snapshot writes all five as NULL (the pre-PR-73 row
+    // shape). The route resolver (`serve::resolve_bank_snapshot`)
+    // refuses to call into `allocate_in_tx` with a snapshot whose
+    // currency mismatches `args.currency` — the typed preflight
+    // surfaces `SellerBankCurrencyMismatch` BEFORE we reach this
+    // boundary. As defence in depth, the read path's
+    // `InvoiceBankSnapshot.currency` reads back the value verbatim;
+    // a downstream renderer that wants invariant safety can re-check
+    // against the invoice's `currency` column.
+    let bank_account_id = args.bank_snapshot.as_ref().map(|b| b.id.clone());
+    let bank_account_currency = args.bank_snapshot.as_ref().map(|b| b.currency.clone());
+    let bank_account_number = args
+        .bank_snapshot
+        .as_ref()
+        .map(|b| b.account_number.clone());
+    let bank_account_bank_name = args.bank_snapshot.as_ref().map(|b| b.bank_name.clone());
+    let bank_account_swift_bic = args.bank_snapshot.as_ref().map(|b| b.swift_bic.clone());
     tx.execute(
         "INSERT INTO invoice
          (id, series_id, customer_id, issue_date, sequence_number,
           fiscal_year, idempotency_key,
           currency, exchange_rate, exchange_rate_source,
-          exchange_rate_date, huf_equivalent_total)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+          exchange_rate_date, huf_equivalent_total,
+          bank_account_id, bank_account_currency, bank_account_number,
+          bank_account_bank_name, bank_account_swift_bic)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
         params![
             draft.id.to_prefixed_string(),
             &series_id_str,
@@ -402,6 +469,11 @@ pub fn allocate_in_tx(
             &rate_source,
             &rate_date_str,
             &huf_eq_str,
+            &bank_account_id,
+            &bank_account_currency,
+            &bank_account_number,
+            &bank_account_bank_name,
+            &bank_account_swift_bic,
         ],
     )?;
 
@@ -460,6 +532,11 @@ impl BillingStore for DuckDbBillingStore {
         // fresh + pre-PR-44γ DBs. See `MIGRATE_PR_44C_SQL`'s comment
         // block for the backfill posture.
         self.conn.execute_batch(MIGRATE_PR_44C_SQL)?;
+        // PR-73 — additive migration for the five denormalized
+        // bank-account snapshot columns. Same idempotent posture; pre-
+        // PR-73 rows stay NULL across all five (no backfill — the
+        // regulatory record forbids fabricating a snapshot).
+        self.conn.execute_batch(MIGRATE_PR_73_SQL)?;
         Ok(())
     }
 

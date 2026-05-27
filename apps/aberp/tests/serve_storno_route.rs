@@ -34,9 +34,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
-use aberp_billing::{
-    CustomerId, Huf, IdempotencyKey, InvoiceId, LineItem, ReadyInvoice, SeriesId,
-};
+use aberp_billing::{CustomerId, Huf, IdempotencyKey, InvoiceId, LineItem, ReadyInvoice, SeriesId};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
@@ -108,7 +106,8 @@ fn write_draft(ledger: &mut Ledger, actor: &Actor, invoice: &ReadyInvoice, idem:
 }
 
 fn write_attempt(ledger: &mut Ledger, actor: &Actor, invoice_id: &str, idem: IdempotencyKey) {
-    let payload = InvoiceSubmissionAttemptPayload::new(invoice_id, idem, "test", b"<req/>".to_vec());
+    let payload =
+        InvoiceSubmissionAttemptPayload::new(invoice_id, idem, "test", b"<req/>".to_vec());
     ledger
         .append(
             EventKind::InvoiceSubmissionAttempt,
@@ -260,12 +259,7 @@ fn storno_route_returns_not_found_for_unknown_invoice() {
     {
         let mut ledger = open_ledger(&db_path);
         write_draft(&mut ledger, &actor, &invoice, idem);
-        write_attempt(
-            &mut ledger,
-            &actor,
-            &invoice.id.to_prefixed_string(),
-            idem,
-        );
+        write_attempt(&mut ledger, &actor, &invoice.id.to_prefixed_string(), idem);
         write_response(
             &mut ledger,
             &actor,

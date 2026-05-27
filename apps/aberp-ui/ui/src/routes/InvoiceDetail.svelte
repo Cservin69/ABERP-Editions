@@ -166,12 +166,16 @@
     cancelInvoiceStorno,
     downloadInvoicePdf,
     getInvoice,
+    markInvoicePaid,
+    parseAlreadyPaidError,
     parseNavUpstreamFault,
     pollAck,
     submitInvoice,
     type Currency,
     type InvoiceDetail,
+    type MarkPaidRequest,
     type NavUpstreamFault,
+    type PaymentMethod,
   } from "../lib/api";
   import {
     ackLabelMeta,
@@ -187,6 +191,8 @@
     formatTotal,
   } from "../lib/format";
   import { bytesAsUtf8Replacer } from "../lib/payload-reviver";
+  import InvoiceTimeline from "../lib/InvoiceTimeline.svelte";
+  import { timelineFromAuditEntries } from "../lib/invoice-timeline";
 
   interface Props {
     invoiceId: string | null;
@@ -265,13 +271,43 @@
     | { kind: "submitting" }
     | { kind: "polling" }
     | { kind: "cancelling" }
+    | { kind: "paying" }
     | {
         kind: "error";
-        action: "submit" | "poll" | "cancel";
+        action: "submit" | "poll" | "cancel" | "pay";
         message: string;
         navFault: NavUpstreamFault | null;
       };
   let mutationState: MutationState = $state({ kind: "idle" });
+
+  // PR-70 / ADR-0039 — mark-as-paid modal state. The modal is a
+  // small inline <dialog> driven by `paymentDialogOpen` rather than
+  // a full route component (the form is four fields + a submit
+  // button; a dedicated route would be overkill per CLAUDE.md
+  // rule 2). The form state lives here so the modal mounts and
+  // unmounts cleanly with the parent InvoiceDetail modal.
+  let paymentDialogOpen: boolean = $state(false);
+  let paymentDialogEl: HTMLDialogElement | null = $state(null);
+  // Form fields. Defaults are populated when the operator clicks
+  // the "Mark as paid" button (`triggerOpenMarkPaid`) so today's
+  // date and the invoice's total_gross / currency are pre-filled
+  // — the operator only needs to pick a method and (optionally)
+  // type a reference for the common case.
+  let payForm: {
+    paid_at: string;
+    amount_minor: string; // string for the <input type="number"> binding
+    method: PaymentMethod;
+    reference: string;
+  } = $state({
+    paid_at: "",
+    amount_minor: "",
+    method: "BankTransfer",
+    reference: "",
+  });
+  // Inline error message for the modal form. Populated when the
+  // backend rejects the POST (400 invalid date, 409 already paid,
+  // etc.); cleared on every fresh submit attempt.
+  let payFormError: string | null = $state(null);
   // PR-27 — per-row expanded-payload state. Reassignment pattern
   // (build a new Set on every toggle) guarantees Svelte 5
   // reactivity without depending on Set-mutation tracking through
@@ -279,6 +315,16 @@
   // is the audit-ledger's append-only primary key per ADR-0008 —
   // unique per ledger AND stable across the lifetime of the modal.
   let expandedSeqs: Set<number> = $state(new Set());
+  // PR-67 / session-89 — "Show raw table" toggle for the audit
+  // trail. The pre-PR-67 detail modal rendered the audit entries
+  // as a dense seq/kind/actor/occurred_at table; PR-67 swaps the
+  // default to the visual lifecycle timeline (operator-meaningful
+  // narrative) but preserves the table behind this toggle for
+  // power-user inspection (payload drill-down, chain navigation
+  // affordance, raw kind strings). Per-modal-mount state only —
+  // no localStorage per the brief's "persisted only in component
+  // state" rule; a fresh modal open resets to timeline-visible.
+  let showRawTable: boolean = $state(false);
 
   // Drive the dialog open/close lifecycle from the `invoiceId` prop.
   // Opening: invoke `showModal()` and kick off the fetch. Closing:
@@ -294,12 +340,22 @@
       // unrelated to another's, so a stale set would leak
       // expansion state across inspection contexts.
       expandedSeqs = new Set();
+      // PR-67 — reset the raw-table toggle on every navigation so
+      // the operator's chain-link traversal starts at the timeline
+      // (the default narrative view), not whichever toggle state
+      // a prior modal left.
+      showRawTable = false;
       // PR-44ε.UI — reset the download state on every navigation so
       // a stale error from a prior invoice doesn't leak into the
       // new inspection context.
       downloadState = "idle";
       downloadError = null;
       mutationState = { kind: "idle" };
+      // PR-70 / ADR-0039 — drop any open Pay dialog on navigation
+      // (the form's defaults are bound to the previous invoice's
+      // currency + total).
+      paymentDialogOpen = false;
+      payFormError = null;
       void load(invoiceId);
     } else {
       if (dialogEl.open) dialogEl.close();
@@ -307,9 +363,12 @@
       loadState = "idle";
       errorMessage = null;
       expandedSeqs = new Set();
+      showRawTable = false;
       downloadState = "idle";
       downloadError = null;
       mutationState = { kind: "idle" };
+      paymentDialogOpen = false;
+      payFormError = null;
     }
   });
 
@@ -496,6 +555,98 @@
     }
   }
 
+  // PR-70 / ADR-0039 — open the mark-as-paid dialog with sensible
+  // defaults pre-populated from the loaded invoice. `paid_at` is
+  // today (the operator can override for a back-dated record);
+  // `amount_minor` is the invoice's total_gross (the v1 single-
+  // payment-per-invoice posture per ADR-0039 §3); `method` defaults
+  // to BankTransfer (Ervin's most-common in the session-81 source).
+  function triggerOpenMarkPaid() {
+    if (!detail) return;
+    const today = new Date();
+    const yyyy = today.getFullYear();
+    const mm = String(today.getMonth() + 1).padStart(2, "0");
+    const dd = String(today.getDate()).padStart(2, "0");
+    payForm = {
+      paid_at: `${yyyy}-${mm}-${dd}`,
+      amount_minor:
+        detail.total_gross !== null ? String(detail.total_gross) : "",
+      method: "BankTransfer",
+      reference: "",
+    };
+    payFormError = null;
+    paymentDialogOpen = true;
+    // showModal() is called by the $effect bound to the dialog
+    // element below; we just flip the flag here.
+  }
+
+  function triggerClosePaymentDialog() {
+    paymentDialogOpen = false;
+    payFormError = null;
+  }
+
+  // PR-70 / ADR-0039 — submit the mark-as-paid form. Validates the
+  // amount field locally (must parse to a positive integer) and
+  // POSTs the rest verbatim; the backend handles the date-format
+  // check (loud 400) and the no-double-pay + state-gate (409).
+  async function triggerSubmitMarkPaid(e: SubmitEvent) {
+    e.preventDefault();
+    if (!detail) return;
+    payFormError = null;
+    const amount = Number.parseInt(payForm.amount_minor, 10);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      payFormError =
+        "Amount must be a positive integer in the invoice's minor-unit form (whole HUF or EUR cents).";
+      return;
+    }
+    const body: MarkPaidRequest = {
+      paid_at: payForm.paid_at,
+      amount_minor: amount,
+      currency: detail.currency,
+      method: payForm.method,
+      reference: payForm.reference.trim() === "" ? null : payForm.reference.trim(),
+    };
+    mutationState = { kind: "paying" };
+    try {
+      await markInvoicePaid(detail.invoice_id, body);
+      // Refetch so the Paid chip + payment meta-grid pick up the
+      // new audit entry. The fetched detail is the same shape
+      // `getInvoice` already returns; no special handling needed.
+      await load(detail.invoice_id);
+      mutationState = { kind: "idle" };
+      paymentDialogOpen = false;
+      payFormError = null;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      // The 409 already-paid branch carries a typed body; extract
+      // it and render the existing payment record inline rather
+      // than the generic "internal error" string. Same posture as
+      // `parseNavUpstreamFault`.
+      const alreadyPaid = parseAlreadyPaidError(message);
+      if (alreadyPaid !== null) {
+        payFormError = `Already paid on ${alreadyPaid.payment.paid_at} (${alreadyPaid.payment.method}). Refresh to see the recorded payment.`;
+      } else {
+        payFormError = message;
+      }
+      mutationState = {
+        kind: "error",
+        action: "pay",
+        message,
+        navFault: null,
+      };
+    }
+  }
+
+  // Drive the payment-dialog open/close lifecycle from the flag.
+  $effect(() => {
+    if (!paymentDialogEl) return;
+    if (paymentDialogOpen) {
+      if (!paymentDialogEl.open) paymentDialogEl.showModal();
+    } else {
+      if (paymentDialogEl.open) paymentDialogEl.close();
+    }
+  });
+
   function signalClass(signal: LabelSignal): string {
     return `signal-${signal}`;
   }
@@ -591,11 +742,12 @@
       </div>
       <div class="detail-actions">
         {#if detail}
-          {@const buttons = buttonsForState(detail.state)}
+          {@const buttons = buttonsForState(detail.state, detail.payment !== null)}
           {@const mutationBusy =
             mutationState.kind === "submitting" ||
             mutationState.kind === "polling" ||
-            mutationState.kind === "cancelling"}
+            mutationState.kind === "cancelling" ||
+            mutationState.kind === "paying"}
           {#if buttons.includes("Submit")}
             <button
               type="button"
@@ -627,6 +779,23 @@
                 <span aria-hidden="true">…</span> Polling
               {:else}
                 Poll ack now
+              {/if}
+            </button>
+          {/if}
+          {#if buttons.includes("Pay")}
+            <button
+              type="button"
+              class="quiet-button"
+              onclick={triggerOpenMarkPaid}
+              disabled={mutationBusy}
+              aria-label={mutationState.kind === "paying"
+                ? "Recording payment"
+                : "Mark invoice as paid"}
+            >
+              {#if mutationState.kind === "paying"}
+                <span aria-hidden="true">…</span> Recording payment
+              {:else}
+                💰 Mark as paid
               {/if}
             </button>
           {/if}
@@ -793,6 +962,17 @@
             <span class="state-icon" aria-hidden="true">{meta.icon}</span>
             <span class="state-text">{detail.state}</span>
           </span>
+          {#if detail.payment !== null}
+            <!-- PR-70 / ADR-0039 §2 — operational Paid badge. Sits
+                 next to the regulatory state chip; paid-vs-unpaid is
+                 parallel operational metadata, NOT a NAV-ladder
+                 transition (the state chip continues to read
+                 `Finalized`, the SAVED-ack terminal). -->
+            <span class="state-pill paid-pill" title={`Paid on ${detail.payment.paid_at}`}>
+              <span class="state-icon" aria-hidden="true">✓</span>
+              <span class="state-text">Paid</span>
+            </span>
+          {/if}
         </dd>
         <dt>Total (gross)</dt>
         <dd class="mono">{formatTotal(detail.total_gross, detail.currency)}</dd>
@@ -827,6 +1007,39 @@
             </span>
           {/if}
         </dd>
+        {#if detail.payment !== null}
+          <!-- PR-70 / ADR-0039 §2 — payment details rendered after
+               the regulatory ladder rows so the operator's eye lands
+               on the NAV state first, then the operational payment
+               metadata. -->
+          <dt>Paid on</dt>
+          <dd class="mono">{detail.payment.paid_at}</dd>
+          <dt>Paid amount</dt>
+          <dd class="mono">{formatTotal(detail.payment.amount_minor, detail.currency)}</dd>
+          <dt>Payment method</dt>
+          <dd class="mono">{detail.payment.method}</dd>
+          {#if detail.payment.reference !== null}
+            <dt>Payment reference</dt>
+            <dd class="mono">{detail.payment.reference}</dd>
+          {/if}
+        {/if}
+        <!-- PR-73 / ADR-0040 §addendum — operator-facing "Pay to"
+             sub-section. Renders the per-invoice bank-account
+             snapshot the invoice was issued with; falls back to a
+             muted em-dash placeholder on `null` (pre-PR-73 /
+             CLI-issued invoices). -->
+        <dt>Pay to</dt>
+        <dd data-testid="invoice-detail-bank-account">
+          {#if detail.bank_account === null}
+            <span class="mono">—</span>
+          {:else}
+            <div class="bank-snapshot">
+              <span class="mono">{detail.bank_account.bank_name}</span>
+              <span class="mono">{detail.bank_account.account_number}</span>
+              <span class="mono">SWIFT/BIC: {detail.bank_account.swift_bic}</span>
+            </div>
+          {/if}
+        </dd>
       </dl>
 
       {#if detail.chain_children.length > 0}
@@ -858,70 +1071,178 @@
       {/if}
 
       <h3 class="section-head">Audit trail</h3>
-      {#if detail.audit_entries.length === 0}
-        <p class="muted">
-          No audit-ledger entries reference this invoice id directly.
-          Chain-link entries (storno / modification) reference this
-          invoice via their <code>base_invoice_id</code> payload field
-          and do not appear in this list per <code>serve.rs</code>'s
-          per-id walker.
-        </p>
-      {:else}
-        <table class="dense">
-          <thead>
-            <tr>
-              <th scope="col" class="col-num">Seq</th>
-              <th scope="col" class="col-kind">Kind</th>
-              <th scope="col" class="col-actor">Actor</th>
-              <th scope="col" class="col-time">Occurred at</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each detail.audit_entries as entry (entry.seq)}
-              {@const expanded = expandedSeqs.has(entry.seq)}
+      <!-- PR-67 / session-89 — visual lifecycle timeline. Replaces
+           the pre-PR-67 dense audit-row table as the default view.
+           The pure-module helper in `../lib/invoice-timeline.ts`
+           does every kind-dispatch decision (glyph, kind_class,
+           label, body lines) so the Svelte component stays
+           presentational. The raw table sits beneath a "Show raw
+           table" toggle for power-user inspection (payload drill-
+           down + chain-link navigation affordance). -->
+      <InvoiceTimeline nodes={timelineFromAuditEntries(detail.audit_entries)} />
+      {#if detail.audit_entries.length > 0}
+        <button
+          type="button"
+          class="raw-table-toggle"
+          onclick={() => (showRawTable = !showRawTable)}
+          aria-expanded={showRawTable}
+        >
+          {showRawTable ? "Hide raw table" : "Show raw table"}
+        </button>
+        {#if showRawTable}
+          <table class="dense">
+            <thead>
               <tr>
-                <td class="col-num mono">{entry.seq}</td>
-                <td class="col-kind mono">
-                  <button
-                    type="button"
-                    class="expand-toggle"
-                    onclick={() => toggleExpand(entry.seq)}
-                    aria-expanded={expanded}
-                    aria-label={expanded
-                      ? `Hide payload for seq ${entry.seq}`
-                      : `Show payload for seq ${entry.seq}`}
-                  >
-                    {expanded ? "▾" : "▸"}
-                  </button>
-                  {entry.kind}
-                  {#if entry.chain_base_invoice_id}
-                    <span class="chain-arrow" aria-hidden="true">→</span>
+                <th scope="col" class="col-num">Seq</th>
+                <th scope="col" class="col-kind">Kind</th>
+                <th scope="col" class="col-actor">Actor</th>
+                <th scope="col" class="col-time">Occurred at</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each detail.audit_entries as entry (entry.seq)}
+                {@const expanded = expandedSeqs.has(entry.seq)}
+                <tr>
+                  <td class="col-num mono">{entry.seq}</td>
+                  <td class="col-kind mono">
                     <button
                       type="button"
-                      class="id-link"
-                      onclick={() => onNavigate(entry.chain_base_invoice_id!)}
-                      aria-label={`Navigate to base invoice ${entry.chain_base_invoice_id}`}
+                      class="expand-toggle"
+                      onclick={() => toggleExpand(entry.seq)}
+                      aria-expanded={expanded}
+                      aria-label={expanded
+                        ? `Hide payload for seq ${entry.seq}`
+                        : `Show payload for seq ${entry.seq}`}
                     >
-                      {entry.chain_base_invoice_id}
+                      {expanded ? "▾" : "▸"}
                     </button>
-                  {/if}
-                </td>
-                <td class="col-actor mono">{entry.actor}</td>
-                <td class="col-time mono">{entry.occurred_at}</td>
-              </tr>
-              {#if expanded}
-                <tr class="payload-row">
-                  <td colspan="4">
-                    <pre class="payload-json">{formatPayload(entry.payload)}</pre>
+                    {entry.kind}
+                    {#if entry.chain_base_invoice_id}
+                      <span class="chain-arrow" aria-hidden="true">→</span>
+                      <button
+                        type="button"
+                        class="id-link"
+                        onclick={() => onNavigate(entry.chain_base_invoice_id!)}
+                        aria-label={`Navigate to base invoice ${entry.chain_base_invoice_id}`}
+                      >
+                        {entry.chain_base_invoice_id}
+                      </button>
+                    {/if}
                   </td>
+                  <td class="col-actor mono">{entry.actor}</td>
+                  <td class="col-time mono">{entry.occurred_at}</td>
                 </tr>
-              {/if}
-            {/each}
-          </tbody>
-        </table>
+                {#if expanded}
+                  <tr class="payload-row">
+                    <td colspan="4">
+                      <pre class="payload-json">{formatPayload(entry.payload)}</pre>
+                    </td>
+                  </tr>
+                {/if}
+              {/each}
+            </tbody>
+          </table>
+        {/if}
       {/if}
     {/if}
   </div>
+</dialog>
+
+<!-- PR-70 / ADR-0039 §2 — mark-as-paid form modal. Nested inline
+     <dialog> so the form mounts/unmounts cleanly with the parent
+     InvoiceDetail modal; the parent's dialog stays open behind it
+     (same posture as the Storno confirm via window.confirm — but
+     this form needs four fields so a richer UI is justified). -->
+<dialog
+  bind:this={paymentDialogEl}
+  class="detail pay-dialog"
+  onclose={triggerClosePaymentDialog}
+  aria-label="Mark invoice as paid"
+>
+  {#if detail !== null}
+    <form class="pay-form" onsubmit={triggerSubmitMarkPaid}>
+      <h3 class="pay-title">Mark invoice as paid</h3>
+      <p class="pay-subtitle mono">
+        Invoice {detail.invoice_id}
+      </p>
+      <label class="pay-row">
+        <span class="pay-label">Paid on</span>
+        <input
+          type="date"
+          required
+          bind:value={payForm.paid_at}
+          disabled={mutationState.kind === "paying"}
+        />
+      </label>
+      <label class="pay-row">
+        <span class="pay-label">
+          Amount ({detail.currency === "EUR" ? "EUR cents" : "HUF"})
+        </span>
+        <input
+          type="number"
+          required
+          min="1"
+          step="1"
+          bind:value={payForm.amount_minor}
+          disabled={mutationState.kind === "paying"}
+        />
+      </label>
+      <label class="pay-row">
+        <span class="pay-label">Currency</span>
+        <input
+          type="text"
+          readonly
+          value={detail.currency}
+          class="mono"
+        />
+      </label>
+      <label class="pay-row">
+        <span class="pay-label">Payment method</span>
+        <select
+          bind:value={payForm.method}
+          disabled={mutationState.kind === "paying"}
+        >
+          <option value="BankTransfer">Bank transfer (Átutalás)</option>
+          <option value="Cash">Cash (Készpénz)</option>
+          <option value="Card">Card (Kártya)</option>
+          <option value="Other">Other (Egyéb)</option>
+        </select>
+      </label>
+      <label class="pay-row">
+        <span class="pay-label">Reference (optional)</span>
+        <input
+          type="text"
+          placeholder="Bank transaction id, cheque #, …"
+          bind:value={payForm.reference}
+          disabled={mutationState.kind === "paying"}
+        />
+      </label>
+      {#if payFormError !== null}
+        <p class="error pay-error" role="alert">{payFormError}</p>
+      {/if}
+      <div class="pay-actions">
+        <button
+          type="button"
+          class="quiet-button"
+          onclick={triggerClosePaymentDialog}
+          disabled={mutationState.kind === "paying"}
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          class="quiet-button"
+          disabled={mutationState.kind === "paying"}
+        >
+          {#if mutationState.kind === "paying"}
+            <span aria-hidden="true">…</span> Recording payment
+          {:else}
+            Record payment
+          {/if}
+        </button>
+      </div>
+    </form>
+  {/if}
 </dialog>
 
 <style>
@@ -1376,6 +1697,35 @@
     outline-offset: 2px;
   }
 
+  /* PR-67 / session-89 — "Show raw table" toggle beneath the
+   * timeline. Quiet-link aesthetic per ADR-0017 §1-2 (chrome stays
+   * quiet; the affordance is the underline-on-hover). Sits flush-
+   * left under the timeline with a small top margin so the
+   * timeline's last node and the toggle do not collide. */
+  .raw-table-toggle {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0 0 var(--space-3) 0;
+    font: inherit;
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
+    cursor: pointer;
+  }
+
+  .raw-table-toggle:hover,
+  .raw-table-toggle:focus-visible {
+    color: var(--color-text-strong);
+    text-decoration: underline;
+    text-decoration-color: var(--color-text-muted);
+    text-underline-offset: 2px;
+  }
+
+  .raw-table-toggle:focus-visible {
+    outline: 1px solid var(--color-text-muted);
+    outline-offset: 2px;
+  }
+
   /* PR-27 — drill-down sub-row. Sunken background distinguishes
    * it from the regular audit row above; the JSON pre uses the
    * same monospace family as the rest of the table but a slightly
@@ -1452,8 +1802,75 @@
     border-color: var(--color-surface-divider);
   }
 
-  code {
-    font-family: var(--type-family-mono);
-    color: var(--color-text-strong);
+  /* PR-70 / ADR-0039 §2 — operational "Paid" badge sits next to the
+     regulatory state chip. Distinct positive-signal colour to read
+     as "operationally complete" without colliding with the
+     `signal-positive` ack-status chip (which signals NAV-side SAVED
+     terminal). The two chips render side-by-side; the small gap is
+     inherited from the parent dd's whitespace. */
+  .state-pill.paid-pill {
+    color: var(--color-signal-positive);
+    border-color: var(--color-signal-positive);
+    margin-left: var(--space-1);
+  }
+
+  /* PR-70 / ADR-0039 — mark-as-paid form modal. Compact form layout;
+     each row is a `<label>` with a leading caption + an aligned
+     control. Reuses the existing `.error` colour for the inline
+     submit failure. */
+  .pay-dialog {
+    /* Native <dialog> wraps a sizing-by-content body; the form's
+       width is constrained by the inputs' default min-width so the
+       modal stays narrow. */
+    width: min(420px, 90vw);
+    padding: var(--space-4);
+  }
+  .pay-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+  .pay-title {
+    margin: 0;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-md);
+  }
+  .pay-subtitle {
+    margin: 0;
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-xs);
+  }
+  .pay-row {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--space-1);
+  }
+  .pay-label {
+    font-size: var(--type-size-xs);
+    color: var(--color-text-secondary);
+  }
+  .pay-row input,
+  .pay-row select {
+    padding: var(--space-1) var(--space-2);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 2px;
+    background: var(--color-surface-base);
+    color: var(--color-text-primary);
+  }
+  .pay-row input[readonly] {
+    color: var(--color-text-secondary);
+    cursor: default;
+  }
+  .pay-error {
+    margin: 0;
+    font-size: var(--type-size-xs);
+  }
+  .pay-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
   }
 </style>

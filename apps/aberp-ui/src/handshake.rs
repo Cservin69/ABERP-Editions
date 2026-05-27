@@ -112,7 +112,9 @@ pub fn parse(line: &str) -> Result<Handshake> {
     }
 
     let addr_token = tokens.next().ok_or_else(|| {
-        anyhow!("handshake line missing the addr token (expected `127.0.0.1:<port>`) — got `{line}`")
+        anyhow!(
+            "handshake line missing the addr token (expected `127.0.0.1:<port>`) — got `{line}`"
+        )
     })?;
     let socket: SocketAddr = addr_token
         .parse()
@@ -127,9 +129,9 @@ pub fn parse(line: &str) -> Result<Handshake> {
         ));
     }
 
-    let fp_token = tokens.next().ok_or_else(|| {
-        anyhow!("handshake line missing the `sha256:<hex>` token — got `{line}`")
-    })?;
+    let fp_token = tokens
+        .next()
+        .ok_or_else(|| anyhow!("handshake line missing the `sha256:<hex>` token — got `{line}`"))?;
     let fingerprint_hex = fp_token
         .strip_prefix(FINGERPRINT_MARKER)
         .ok_or_else(|| {
@@ -337,8 +339,7 @@ mod tests {
         // handshake source. The shell's stderr forward picks it up as
         // a regular log line; the parser rejects it loud.
         let fp = make_fingerprint(0xa0);
-        let line =
-            format!("aberp serve: https://127.0.0.1:12345/ (fingerprint sha256:{fp})");
+        let line = format!("aberp serve: https://127.0.0.1:12345/ (fingerprint sha256:{fp})");
         assert!(parse(&line).is_err());
     }
 

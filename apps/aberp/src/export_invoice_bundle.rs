@@ -351,10 +351,7 @@ enum MirrorAgreementStatus {
 /// - Mirror file present but malformed (delegated to
 ///   `read_mirror_entries`'s `MirrorCorrupt` surface).
 /// - Mirror file I/O error other than `NotFound`.
-fn detect_mirror_agreement(
-    db_path: &Path,
-    db_entries: &[Entry],
-) -> Result<MirrorAgreementStatus> {
+fn detect_mirror_agreement(db_path: &Path, db_entries: &[Entry]) -> Result<MirrorAgreementStatus> {
     let mirror_path = mirror_path_for(db_path);
     match read_mirror_entries(&mirror_path) {
         Ok(mirror_entries) => {
@@ -617,7 +614,14 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::InvoiceMarkedAbandoned
         | EventKind::InvoiceStornoIssued
         | EventKind::InvoiceModificationIssued
-        | EventKind::InvoiceTechnicalAnnulmentRequested => None,
+        | EventKind::InvoiceTechnicalAnnulmentRequested
+        // PR-70 / ADR-0039 §2 — operational payment-recorded
+        // entry carries no NAV-side bytes (it's a local
+        // operator decision, not a NAV submission). The audit
+        // payload (paid_at + amount + method + reference) is
+        // preserved in chain.jsonl per ADR-0009 §8; nothing
+        // lands in the nav/ directory.
+        | EventKind::InvoicePaymentRecorded => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -813,8 +817,8 @@ pub fn run(args: &ExportInvoiceBundleArgs) -> Result<()> {
         slice.len() as u64,
         mirror_status,
     )?;
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-        .context("serialize manifest.json (pretty)")?;
+    let manifest_bytes =
+        serde_json::to_vec_pretty(&manifest).context("serialize manifest.json (pretty)")?;
     let chain_jsonl_bytes = build_chain_jsonl(&slice)?;
     let mut nav_files: Vec<NavXmlFile> = Vec::new();
     for entry in &slice {
@@ -947,9 +951,8 @@ mod tests {
     /// the base, via `storno_invoice_id` for the storno.
     #[test]
     fn storno_chain_link_matches_both_base_and_storno_bundles() {
-        let payload = format!(
-            r#"{{"storno_invoice_id":"inv_STORNO","base_invoice_id":"inv_BASE"}}"#
-        );
+        let payload =
+            format!(r#"{{"storno_invoice_id":"inv_STORNO","base_invoice_id":"inv_BASE"}}"#);
         let probe: BundleMembershipProbe = serde_json::from_str(&payload).unwrap();
         assert!(probe.matches("inv_BASE"));
         assert!(probe.matches("inv_STORNO"));
@@ -961,9 +964,8 @@ mod tests {
     /// id field.
     #[test]
     fn modification_chain_link_matches_both_base_and_modification_bundles() {
-        let payload = format!(
-            r#"{{"modification_invoice_id":"inv_MOD","base_invoice_id":"inv_BASE"}}"#
-        );
+        let payload =
+            format!(r#"{{"modification_invoice_id":"inv_MOD","base_invoice_id":"inv_BASE"}}"#);
         let probe: BundleMembershipProbe = serde_json::from_str(&payload).unwrap();
         assert!(probe.matches("inv_BASE"));
         assert!(probe.matches("inv_MOD"));
@@ -1037,10 +1039,7 @@ mod tests {
         assert_eq!(serialized["invoice_id"], serde_json::json!("inv_TEST"));
         assert_eq!(serialized["tenant_id"], serde_json::json!("tenantX"));
         assert_eq!(serialized["chain_verified"], serde_json::json!(true));
-        assert_eq!(
-            serialized["chain_verified_entries"],
-            serde_json::json!(42)
-        );
+        assert_eq!(serialized["chain_verified_entries"], serde_json::json!(42));
         assert_eq!(serialized["entries_in_bundle"], serde_json::json!(7));
         assert_eq!(serialized["version"], serde_json::json!(MANIFEST_VERSION));
     }
@@ -1122,11 +1121,7 @@ mod tests {
         .to_bytes()
     }
 
-    fn fixture_submission_response(
-        invoice_id: &str,
-        idem: IdempotencyKey,
-        txid: &str,
-    ) -> Vec<u8> {
+    fn fixture_submission_response(invoice_id: &str, idem: IdempotencyKey, txid: &str) -> Vec<u8> {
         audit_payloads::InvoiceSubmissionResponsePayload::new(
             invoice_id,
             idem,
@@ -1278,10 +1273,7 @@ mod tests {
             .unwrap();
         let entries = ledger.entries().unwrap();
         let nav = extract_nav_xml(&entries[0]).unwrap();
-        assert!(
-            nav.is_none(),
-            "non-NAV-bearing kinds produce no nav/ file"
-        );
+        assert!(nav.is_none(), "non-NAV-bearing kinds produce no nav/ file");
     }
 
     /// ADR-0029 §3: `chain.jsonl` carries one JSON object per
@@ -1322,11 +1314,7 @@ mod tests {
         );
         // entry_hash is hex-encoded.
         let entry_hash_hex = parsed["entry_hash"].as_str().unwrap();
-        assert_eq!(
-            entry_hash_hex.len(),
-            64,
-            "hex-encoded SHA-256 is 64 chars"
-        );
+        assert_eq!(entry_hash_hex.len(), 64, "hex-encoded SHA-256 is 64 chars");
         assert!(
             entry_hash_hex.chars().all(|c| c.is_ascii_hexdigit()),
             "entry_hash must be pure hex"
@@ -1421,17 +1409,13 @@ mod tests {
 
         // Pack into a tempfile.
         let mut tmp = std::env::temp_dir();
-        tmp.push(format!(
-            "aberp_bundle_test_{}.tar.zst",
-            ulid::Ulid::new()
-        ));
+        tmp.push(format!("aberp_bundle_test_{}.tar.zst", ulid::Ulid::new()));
         pack_bundle(&tmp, false, &manifest_bytes, &chain_jsonl_bytes, &nav_files).unwrap();
         assert!(tmp.exists(), "pack_bundle must produce an output file");
 
         // Read it back: decompress + untar in memory.
         let compressed = std::fs::read(&tmp).unwrap();
-        let decoded =
-            zstd::stream::decode_all(&compressed[..]).expect("zstd-decode round-trip");
+        let decoded = zstd::stream::decode_all(&compressed[..]).expect("zstd-decode round-trip");
         let mut ar = tar::Archive::new(&decoded[..]);
         let mut found_manifest = false;
         let mut found_chain = false;
@@ -1561,9 +1545,8 @@ mod tests {
             entry_hash: "ff".repeat(32),
         }];
         let db_empty: Vec<Entry> = Vec::new();
-        let err =
-            assert_mirror_db_agreement(&mirror_only, &db_empty, Path::new("/dev/null"))
-                .unwrap_err();
+        let err = assert_mirror_db_agreement(&mirror_only, &db_empty, Path::new("/dev/null"))
+            .unwrap_err();
         let msg = format!("{:#}", err);
         assert!(
             msg.contains("entries") && msg.contains("DB"),

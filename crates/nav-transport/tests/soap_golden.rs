@@ -84,7 +84,7 @@ fn token_exchange_request_byte_shape_is_stable() {
     let expected_signature = sha3_512_upper_hex(&{
         let mut buf = Vec::new();
         buf.extend_from_slice(b"REQ01ABCDEFGHIJKLMNOP012345");
-        buf.extend_from_slice(b"20260520120000");  // stripped: YYYYMMDDhhmmss
+        buf.extend_from_slice(b"20260520120000"); // stripped: YYYYMMDDhhmmss
         buf.extend_from_slice(b"SIGN-KEY-32B-ASCII-XXXXXXXXXXXXX");
         buf
     });

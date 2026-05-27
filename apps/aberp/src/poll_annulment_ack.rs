@@ -346,11 +346,7 @@ pub fn run(args: &PollAnnulmentAckArgs) -> Result<()> {
                 "poll-annulment-ack STUCK: invoice {} -> annulment transactionId {} -> all {} \
                  attempts errored, last: {} (audit chain verified across {} entries) — \
                  operator action required",
-                args.invoice_id,
-                inputs.transaction_id,
-                MAX_POLL_ATTEMPTS,
-                diagnostic,
-                verified,
+                args.invoice_id, inputs.transaction_id, MAX_POLL_ATTEMPTS, diagnostic, verified,
             );
         }
     }
@@ -364,10 +360,7 @@ pub fn run(args: &PollAnnulmentAckArgs) -> Result<()> {
 /// (the operator must run `aberp submit-annulment` first) — the
 /// named-error message is the operator-visible review surface
 /// per CLAUDE.md rule 12.
-fn lookup_annulment_poll_inputs(
-    ledger: &Ledger,
-    invoice_id: &str,
-) -> Result<AnnulmentPollInputs> {
+fn lookup_annulment_poll_inputs(ledger: &Ledger, invoice_id: &str) -> Result<AnnulmentPollInputs> {
     let entries = ledger.entries().context("read audit ledger entries")?;
     let inputs = entries
         .iter()
@@ -581,9 +574,9 @@ fn write_annulment_ack_audit_entry(
     annulment_idempotency_key: &str,
     outcome: &QueryTransactionStatusOutcome,
 ) -> Result<()> {
-    let tx = conn.transaction().context(
-        "begin per-poll DuckDB transaction (InvoiceAnnulmentAckStatus append)",
-    )?;
+    let tx = conn
+        .transaction()
+        .context("begin per-poll DuckDB transaction (InvoiceAnnulmentAckStatus append)")?;
 
     let payload = audit_payloads::InvoiceAnnulmentAckStatusPayload::new(
         invoice_id,
@@ -687,9 +680,7 @@ mod tests {
         assert!(parse_tax_number_8("123456789-1-42").is_err());
     }
 
-    fn ledger_with_entries(
-        entries: Vec<(EventKind, Vec<u8>, Option<String>)>,
-    ) -> Ledger {
+    fn ledger_with_entries(entries: Vec<(EventKind, Vec<u8>, Option<String>)>) -> Ledger {
         let tenant = TenantId::new("t1".to_string()).unwrap();
         let bh = BinaryHash::from_bytes([0u8; 32]);
         let mut ledger = Ledger::open_in_memory(tenant, bh).unwrap();

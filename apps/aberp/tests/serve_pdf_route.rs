@@ -44,9 +44,10 @@ const TEST_TENANT: &str = "serve_pdf_route_test";
 /// `print_invoice_render.rs::test_dir` per A155: a fresh ULID-suffixed
 /// directory per fixture, leaked at end-of-test.
 fn test_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join("aberp-serve-pdf")
-        .join(format!("{}-{}", label, Ulid::new()));
+    let dir =
+        std::env::temp_dir()
+            .join("aberp-serve-pdf")
+            .join(format!("{}-{}", label, Ulid::new()));
     fs::create_dir_all(&dir).expect("create test dir");
     dir
 }

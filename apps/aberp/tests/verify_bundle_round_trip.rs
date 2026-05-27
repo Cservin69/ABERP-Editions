@@ -252,7 +252,9 @@ fn verifier_fails_on_post_production_chain_jsonl_payload_tampering() {
     // files. Same archive shape; the verifier should still parse
     // and reach the per-entry-hash check.
     let file = std::fs::File::create(&tampered_out).unwrap();
-    let zstd_enc = zstd::stream::write::Encoder::new(file, 0).unwrap().auto_finish();
+    let zstd_enc = zstd::stream::write::Encoder::new(file, 0)
+        .unwrap()
+        .auto_finish();
     let mut builder = tar::Builder::new(zstd_enc);
     let append = |builder: &mut tar::Builder<_>, rel: &str, bytes: &[u8]| {
         let full = format!("bundle/{}", rel);

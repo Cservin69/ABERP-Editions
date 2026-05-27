@@ -188,7 +188,10 @@ pub fn setup_credentials_from_inputs(
     Ok(())
 }
 
-fn validate_input(value: &str, label: &'static str) -> std::result::Result<(), SetupCredentialsError> {
+fn validate_input(
+    value: &str,
+    label: &'static str,
+) -> std::result::Result<(), SetupCredentialsError> {
     if value.trim().is_empty() {
         return Err(SetupCredentialsError::Validation(format!(
             "{label} is required"
@@ -219,9 +222,7 @@ pub fn run(args: &SetupNavCredentialsArgs) -> Result<()> {
         );
         return Ok(());
     }
-    eprintln!(
-        "(Existing keychain blob WILL be replaced; pass --refuse-overwrite to opt out.)"
-    );
+    eprintln!("(Existing keychain blob WILL be replaced; pass --refuse-overwrite to opt out.)");
 
     let stdin = std::io::stdin();
     let mut stdin_lock = stdin.lock();
@@ -283,9 +284,7 @@ pub fn run(args: &SetupNavCredentialsArgs) -> Result<()> {
 fn blob_already_populated(tenant: &str) -> Result<bool> {
     let service = service_name(tenant);
     let entry = keyring::Entry::new(&service, ITEM_NAV_CREDENTIALS_BLOB).with_context(|| {
-        format!(
-            "probe keychain entry for service `{service}` item `{ITEM_NAV_CREDENTIALS_BLOB}`"
-        )
+        format!("probe keychain entry for service `{service}` item `{ITEM_NAV_CREDENTIALS_BLOB}`")
     })?;
     match entry.get_password() {
         Ok(_) => Ok(true),

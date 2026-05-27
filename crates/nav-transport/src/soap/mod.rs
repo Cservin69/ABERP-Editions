@@ -1039,9 +1039,7 @@ mod tests {
         // XSD-sequence order pin per ADR-0028 §3: the three
         // children of <invoiceNumberQuery> must appear in
         // invoiceNumber → invoiceDirection → batchIndex order.
-        let r_num = s
-            .find("<invoiceNumber>")
-            .expect("invoiceNumber present");
+        let r_num = s.find("<invoiceNumber>").expect("invoiceNumber present");
         let r_dir = s
             .find("<invoiceDirection>")
             .expect("invoiceDirection present");

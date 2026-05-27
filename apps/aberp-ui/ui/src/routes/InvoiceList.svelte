@@ -31,9 +31,13 @@
   // a glyph + label. Per §4 a freshly-fetched table fades in over
   // 200ms — no spinners, no skeleton shimmers.
 
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import {
+    cancelInvoiceStorno,
+    downloadInvoicePdf,
     listInvoices,
+    parseNavUpstreamFault,
+    submitInvoice,
     type InvoiceListItem,
     type InvoiceState,
   } from "../lib/api";
@@ -43,8 +47,26 @@
     lifecycleIndex,
     type LabelSignal,
   } from "../lib/labels";
-  import { formatTotal } from "../lib/format";
+  import { formatTotal, filenameForInvoice } from "../lib/format";
   import type { Currency } from "../lib/api";
+  import {
+    buyerColumnDisplay,
+    quickActionMeta,
+    quickActionsForState,
+    type RowQuickAction,
+  } from "../lib/invoice-list";
+  // PR-68 / session-90 — keyboard navigation Tier-1 UX lift.
+  // `/` focuses the search box, j/k walk rows, Enter opens the
+  // focused row's detail, `g g`/`G` jump to top/bottom, `?` toggles
+  // the keyboard hints footer. The pure-module helper lives in
+  // `../lib/keyboard-nav.ts`; this file wires its closed-vocab
+  // `Hotkey` output to the per-list state.
+  import {
+    filterInvoicesByNeedle,
+    makeHotkeyParserState,
+    nextRowIndex,
+    parseHotkey,
+  } from "../lib/keyboard-nav";
   import InvoiceDetail from "./InvoiceDetail.svelte";
   import IssueInvoice from "./IssueInvoice.svelte";
   import ModificationInvoice from "./ModificationInvoice.svelte";
@@ -97,9 +119,102 @@
     baseInvoiceNumber: string;
   } | null = $state(null);
 
+  // PR-65 / session-86 — per-row quick-action state. One row at a
+  // time is in-flight (sequential rather than concurrent so the
+  // operator's eye tracks the single spinner; a queued second click
+  // is no-oped via the `busyRow` gate). On error the row's message
+  // surfaces inline below the table — same A157 inline-render
+  // posture the detail modal uses; no toast component per
+  // CLAUDE.md rule 13. The `actionError` carries the invoice_id so
+  // the message lands next to the row that produced it; a fresh
+  // click on any row clears the prior error.
+  let busyRow: { invoiceId: string; action: RowQuickAction } | null = $state(null);
+  let actionError: { invoiceId: string; action: RowQuickAction; message: string } | null =
+    $state(null);
+
+  // PR-68 / session-90 — keyboard-nav state. `searchNeedle` drives
+  // the client-side substring filter; `focusedRowIndex` tracks the
+  // j/k cursor within `visibleRows` (-1 = no row focused yet so the
+  // first j/k press parks at row 0 per `nextRowIndex`'s posture).
+  // `hintsVisible` toggles the bottom-right hints footer (`?` flips
+  // it; closed-vocab `toggle-hints` hotkey). `searchInputEl` is the
+  // DOM reference the `/` hotkey focuses; bound via Svelte 5
+  // `bind:this`.
+  let searchNeedle: string = $state("");
+  let focusedRowIndex: number = $state(-1);
+  let hintsVisible: boolean = $state(true);
+  let searchInputEl: HTMLInputElement | null = $state(null);
+  const parserState = makeHotkeyParserState();
+
   onMount(() => {
     void refresh();
+    window.addEventListener("keydown", handleKeydown);
   });
+
+  onDestroy(() => {
+    window.removeEventListener("keydown", handleKeydown);
+  });
+
+  function handleKeydown(event: KeyboardEvent) {
+    // The detail modal, issue modal, and modification modal all
+    // mount inside this component but each manages its own Escape
+    // posture. If ANY of those is open, we stand down — modal
+    // navigation owns the keyboard while it's visible.
+    if (
+      navStack.length > 0 ||
+      issueOpen ||
+      modificationContext !== null
+    ) {
+      return;
+    }
+    const hotkey = parseHotkey(event, parserState);
+    if (hotkey === null) return;
+    switch (hotkey.kind) {
+      case "focus-search":
+        event.preventDefault();
+        searchInputEl?.focus();
+        searchInputEl?.select();
+        return;
+      case "blur-or-clear":
+        // Only act when the search input is the one focused — other
+        // INPUT targets (e.g. the modal-mounted form fields, if any
+        // ever bubble) keep their native behaviour.
+        if (event.target === searchInputEl) {
+          if (searchNeedle.length > 0) {
+            searchNeedle = "";
+          } else {
+            searchInputEl?.blur();
+          }
+        }
+        return;
+      case "row-down":
+        event.preventDefault();
+        focusedRowIndex = nextRowIndex(focusedRowIndex, 1, visibleRows.length);
+        return;
+      case "row-up":
+        event.preventDefault();
+        focusedRowIndex = nextRowIndex(focusedRowIndex, -1, visibleRows.length);
+        return;
+      case "row-top":
+        event.preventDefault();
+        focusedRowIndex = visibleRows.length > 0 ? 0 : -1;
+        return;
+      case "row-bottom":
+        event.preventDefault();
+        focusedRowIndex = visibleRows.length > 0 ? visibleRows.length - 1 : -1;
+        return;
+      case "row-open":
+        if (focusedRowIndex >= 0 && focusedRowIndex < visibleRows.length) {
+          event.preventDefault();
+          navStack = [visibleRows[focusedRowIndex].invoice_id];
+        }
+        return;
+      case "toggle-hints":
+        event.preventDefault();
+        hintsVisible = !hintsVisible;
+        return;
+    }
+  }
 
   async function refresh() {
     loadState = "loading";
@@ -110,6 +225,121 @@
     } catch (err: unknown) {
       loadState = "error";
       errorMessage = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // PR-65 / session-86 — per-row quick-action dispatch. Mirrors
+  // each detail-modal handler 1:1 (`triggerDownload` /
+  // `triggerSubmit` / `triggerCancelStorno` in `InvoiceDetail.svelte`)
+  // so the row-level path hits the same Tauri command, the same
+  // backend route, the same A157 inline-error rendering, and the
+  // same audit-ledger sequence. The detail-modal path stays
+  // available for the operator who wants to see the audit trail
+  // before clicking; the row-level path is the "one click from the
+  // list" lift the brief named. A successful action refreshes the
+  // list so the state chip flips without re-mounting.
+  //
+  // The Storno path keeps the same `window.confirm` gate the modal
+  // uses — a stray row click MUST NOT burn a sequence number per
+  // ADR-0023 §3.
+
+  async function triggerRowDownload(row: InvoiceListItem) {
+    actionError = null;
+    busyRow = { invoiceId: row.invoice_id, action: "Download" };
+    try {
+      const blob = await downloadInvoicePdf(row.invoice_id);
+      const composedNumber = `${row.fiscal_year}-${String(row.sequence_number).padStart(6, "0")}`;
+      const filename = filenameForInvoice(composedNumber);
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err: unknown) {
+      actionError = {
+        invoiceId: row.invoice_id,
+        action: "Download",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      busyRow = null;
+    }
+  }
+
+  async function triggerRowSubmit(row: InvoiceListItem) {
+    actionError = null;
+    busyRow = { invoiceId: row.invoice_id, action: "Submit" };
+    try {
+      await submitInvoice(row.invoice_id);
+      // Refresh so the row's state chip flips to Submitted (and the
+      // quick-action button set switches from Submit → PollAck which
+      // is detail-modal-only; the row's actions column thins to PDF
+      // only on the next render).
+      await refresh();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      // parseNavUpstreamFault returns null for non-NAV errors; the
+      // raw message is the load-bearing surface for inline render.
+      // The row-level UX intentionally does not unpack the typed
+      // technicalValidations array — that surface belongs to the
+      // detail modal where the operator already has the audit
+      // trail context.
+      parseNavUpstreamFault(message);
+      actionError = { invoiceId: row.invoice_id, action: "Submit", message };
+    } finally {
+      busyRow = null;
+    }
+  }
+
+  async function triggerRowStorno(row: InvoiceListItem) {
+    actionError = null;
+    const number = `${row.fiscal_year}-${String(row.sequence_number).padStart(6, "0")}`;
+    const ok = window.confirm(
+      `Cancel invoice ${number}?\n\n` +
+        `A storno will be issued in the same currency at the same exchange rate. ` +
+        `This carves a fresh sequence number and writes three audit-ledger rows; ` +
+        `it cannot be reversed.`,
+    );
+    if (!ok) return;
+    busyRow = { invoiceId: row.invoice_id, action: "Storno" };
+    try {
+      await cancelInvoiceStorno(row.invoice_id);
+      await refresh();
+    } catch (err: unknown) {
+      actionError = {
+        invoiceId: row.invoice_id,
+        action: "Storno",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      busyRow = null;
+    }
+  }
+
+  function dispatchQuickAction(row: InvoiceListItem, action: RowQuickAction) {
+    if (busyRow !== null) return; // one in-flight at a time
+    switch (action) {
+      case "Download":
+        void triggerRowDownload(row);
+        return;
+      case "Submit":
+        void triggerRowSubmit(row);
+        return;
+      case "Pay":
+        // PR-70 / ADR-0039 — the mark-as-paid form has four fields;
+        // duplicating it at the row level would diverge two surfaces
+        // (CLAUDE.md rule 7). Open the detail modal so the operator
+        // fills the form there. The detail modal renders the
+        // "Mark as paid" button on Finalized-and-unpaid invoices
+        // (mirror of `quickActionsForState` at the modal level).
+        navStack = [row.invoice_id];
+        return;
+      case "Storno":
+        void triggerRowStorno(row);
+        return;
     }
   }
 
@@ -132,8 +362,10 @@
   // ladder in `serve.rs::derive_state`. Within a bucket, secondary
   // sort by invoice id keeps the display stable across refreshes.
   let visibleRows = $derived(
-    rows
-      .filter((r) => filterLabel === "All" || r.state === filterLabel)
+    filterInvoicesByNeedle(
+      rows.filter((r) => filterLabel === "All" || r.state === filterLabel),
+      searchNeedle,
+    )
       .slice()
       .sort((a, b) => {
         const dx = lifecycleIndex(a.state) - lifecycleIndex(b.state);
@@ -141,12 +373,39 @@
         return a.invoice_id.localeCompare(b.invoice_id);
       }),
   );
+
+  // PR-68 / session-90 — keep `focusedRowIndex` valid as the filtered
+  // list shrinks. If the operator narrows the search to fewer rows
+  // than the prior focus index, clamp to the new bottom; if the list
+  // becomes empty, drop to -1.
+  $effect(() => {
+    if (visibleRows.length === 0) {
+      focusedRowIndex = -1;
+    } else if (focusedRowIndex >= visibleRows.length) {
+      focusedRowIndex = visibleRows.length - 1;
+    }
+  });
 </script>
 
 <section class="screen">
   <div class="screen-head">
     <h2>Invoices</h2>
     <div class="actions">
+      <!-- PR-68 / session-90 — substring search across invoice number,
+           ULID, buyer name, and state. `/` focuses this input from
+           anywhere on the page. -->
+      <label class="search">
+        <span class="visually-hidden">Search invoices</span>
+        <input
+          bind:this={searchInputEl}
+          bind:value={searchNeedle}
+          type="search"
+          placeholder="Search by number, buyer, state… (press /)"
+          autocomplete="off"
+          spellcheck="false"
+          aria-label="Search invoices by number, buyer, or state"
+        />
+      </label>
       <label class="filter">
         <span class="filter-label">State</span>
         <select
@@ -185,19 +444,34 @@
     <thead>
       <tr>
         <th scope="col" class="col-id">Invoice id</th>
+        <!-- PR-65 / session-86 — Partner column. Positioned between
+             Invoice id and the numeric Series # / Fiscal year columns
+             so the operator's left-to-right scan answers "who was
+             this for?" before "which series number?". -->
+        <th scope="col" class="col-partner">Partner</th>
         <th scope="col" class="col-num">Series #</th>
         <th scope="col" class="col-num">Fiscal year</th>
         <th scope="col" class="col-state">State</th>
         <th scope="col" class="col-num">Total (gross)</th>
+        <!-- PR-65 / session-86 — Actions column. Per-row quick-action
+             buttons gated by `quickActionsForState`; empty for
+             terminal states with only Download (still rendered, kept
+             stable column shape). -->
+        <th scope="col" class="col-actions">Actions</th>
       </tr>
     </thead>
     <tbody>
       {#if loadState === "loaded" && visibleRows.length === 0}
         <tr class="empty">
-          <td colspan="5">
+          <td colspan="7">
             {#if rows.length === 0}
               No invoices on this tenant yet. Issue one with
               <code>aberp issue-invoice</code> and reload.
+            {:else if searchNeedle.trim().length > 0}
+              No invoices match the search
+              <code>{searchNeedle}</code>{filterLabel !== "All"
+                ? ` and the state filter ${filterLabel}.`
+                : "."}
             {:else}
               No invoices match the filter
               <code>{filterLabel}</code>.
@@ -205,9 +479,13 @@
           </td>
         </tr>
       {/if}
-      {#each visibleRows as row (row.invoice_id)}
+      {#each visibleRows as row, rowIndex (row.invoice_id)}
         {@const meta = labelMeta(row.state)}
-        <tr>
+        {@const partnerLabel = buyerColumnDisplay(row.buyer_name)}
+        {@const isPartnerMissing = row.buyer_name === null || row.buyer_name.trim().length === 0}
+        {@const actions = quickActionsForState(row.state, row.payment !== null)}
+        {@const isKeyboardFocused = rowIndex === focusedRowIndex}
+        <tr class:row-focused={isKeyboardFocused}>
           <td class="col-id mono">
             <button
               type="button"
@@ -217,6 +495,9 @@
             >
               {row.invoice_id}
             </button>
+          </td>
+          <td class="col-partner" class:partner-missing={isPartnerMissing}>
+            {partnerLabel}
           </td>
           <td class="col-num mono">{row.sequence_number}</td>
           <td class="col-num mono">{row.fiscal_year}</td>
@@ -235,12 +516,67 @@
                 title="This invoice is the base of a storno or amendment chain — open the row to inspect."
               >↘</span>
             {/if}
+            {#if row.payment !== null}
+              <!-- PR-70 / ADR-0039 §2 — operational Paid badge next to
+                   the regulatory state chip. Parallel signal: the
+                   state chip continues to render the NAV ladder
+                   verbatim (e.g. `Finalized` — the SAVED-ack terminal),
+                   the Paid badge announces that an operational payment
+                   record exists. -->
+              <span
+                class="state-pill paid-pill"
+                title={`Paid on ${row.payment.paid_at}`}
+                aria-label={`Payment recorded on ${row.payment.paid_at}`}
+              >
+                <span class="state-icon" aria-hidden="true">✓</span>
+                <span class="state-text">Paid</span>
+              </span>
+            {/if}
           </td>
           <td class="col-num mono">{formatTotal(row.total_gross, row.currency)}</td>
+          <td class="col-actions">
+            <div class="row-actions">
+              {#each actions as action (action)}
+                {@const meta = quickActionMeta(action)}
+                {@const busy =
+                  busyRow !== null &&
+                  busyRow.invoiceId === row.invoice_id &&
+                  busyRow.action === action}
+                <button
+                  type="button"
+                  class="row-action"
+                  class:busy
+                  disabled={busyRow !== null}
+                  onclick={() => dispatchQuickAction(row, action)}
+                  aria-label={`${meta.label} — invoice ${row.invoice_id}`}
+                  title={meta.label}
+                >
+                  <span class="row-action-glyph" aria-hidden="true">{meta.glyph}</span>
+                  <span class="row-action-label">{meta.label.split(" ")[0]}</span>
+                </button>
+              {/each}
+            </div>
+          </td>
         </tr>
       {/each}
     </tbody>
   </table>
+
+  {#if actionError !== null}
+    <p class="row-action-error" role="alert">
+      {actionError.action} failed for
+      <code>{actionError.invoiceId}</code>: {actionError.message}
+    </p>
+  {/if}
+
+  <!-- PR-68 / session-90 — keyboard hints footer. Quiet aesthetic per
+       ADR-0017 §1-2; `?` toggles visibility. -->
+  {#if hintsVisible}
+    <p class="keyboard-hints" aria-hidden="true">
+      Press <kbd>/</kbd> to search • <kbd>j</kbd>/<kbd>k</kbd> to navigate •
+      <kbd>Enter</kbd> to open • <kbd>?</kbd> to hide
+    </p>
+  {/if}
 
   <InvoiceDetail
     invoiceId={navStack.length > 0 ? navStack[navStack.length - 1] : null}
@@ -529,6 +865,17 @@
     border-color: var(--color-surface-divider);
   }
 
+  /* PR-70 / ADR-0039 §2 — Paid badge. Sits next to the regulatory
+     state chip on the row. Uses the positive signal colour but is
+     a separate class from `signal-positive` because paid-vs-unpaid
+     is OFF the NAV regulatory ladder; the SAVED chip and Paid chip
+     can render side-by-side and need distinguishable signals. */
+  .state-pill.paid-pill {
+    color: var(--color-signal-positive);
+    border-color: var(--color-signal-positive);
+    margin-left: var(--space-1);
+  }
+
   .empty td {
     color: var(--color-text-muted);
     font-style: italic;
@@ -539,5 +886,155 @@
   code {
     font-family: var(--type-family-mono);
     color: var(--color-text-strong);
+  }
+
+  /* PR-65 / session-86 — Partner column. Body font (not mono — the
+   * buyer name is operator-meaningful prose, not a tabular value)
+   * with a width floor wide enough for typical Hungarian legal
+   * names without horizontal scroll. The muted variant carries the
+   * em-dash placeholder for invoices with no side-store snapshot
+   * (CLI-issued, pre-PR-47α) so the operator's eye reads "no value"
+   * the same way it reads other empty signal slots elsewhere in the
+   * ADR-0017 vocabulary. */
+  .col-partner {
+    width: 28ch;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-primary);
+  }
+
+  .col-partner.partner-missing {
+    color: var(--color-text-muted);
+  }
+
+  /* PR-65 / session-86 — Actions column. Quiet per-row buttons with
+   * an icon-glyph + short label. Per ADR-0017 §1-2 the chrome stays
+   * quiet (no accent fill); per ADR-0017 §"Adversarial review #4"
+   * the glyph carries the categorical signal in addition to the
+   * label, so a colour-blind operator still distinguishes Download
+   * from Submit from Storno.
+   *
+   * The `disabled` posture (busyRow !== null) prevents a second
+   * concurrent click while one is in-flight — the spinner indicator
+   * is the `.busy` class on the active row's button. */
+  .col-actions {
+    width: 22ch;
+    text-align: right;
+  }
+
+  .row-actions {
+    display: inline-flex;
+    gap: var(--space-1);
+    justify-content: flex-end;
+  }
+
+  .row-action {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-surface-divider);
+    padding: 0 var(--space-2);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-xs);
+    line-height: 1.8;
+    cursor: pointer;
+    transition: color var(--motion-fade-in);
+  }
+
+  .row-action:hover:not(:disabled) {
+    color: var(--color-text-strong);
+    border-color: var(--color-text-muted);
+  }
+
+  .row-action:disabled {
+    opacity: 0.5;
+    cursor: progress;
+  }
+
+  /* Visual cue for the in-flight row's button. The cursor flips to
+   * `progress` and the glyph dims; the parent's `disabled` state
+   * already prevents re-click. */
+  .row-action.busy {
+    color: var(--color-text-muted);
+  }
+
+  .row-action-glyph {
+    font-size: var(--type-size-sm);
+    line-height: 1;
+  }
+
+  .row-action-error {
+    color: var(--color-signal-negative);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+    margin: var(--space-2) 0 0 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* PR-68 / session-90 — `/`-targeted search input. Matches the
+   * PartnersList screen's `.page__search input` posture so the two
+   * list views feel like siblings. */
+  .search input {
+    width: 320px;
+    max-width: 100%;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    color: var(--color-text-strong);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+  }
+
+  .search input::placeholder {
+    color: var(--color-text-muted);
+  }
+
+  .search input:focus-visible {
+    outline: 1px solid var(--color-text-muted);
+    outline-offset: 1px;
+  }
+
+  /* PR-68 / session-90 — focused-row highlight for the j/k cursor.
+   * Subtle outline + slight surface lift; categorical signal is the
+   * outline (not colour alone) per ADR-0017 §"Adversarial review #4".
+   * The hover background still wins on cursor hover so the operator
+   * can keep using the mouse without the keyboard cursor stealing
+   * the cue. */
+  table.dense tbody tr.row-focused {
+    background: var(--color-surface-raised);
+    outline: 1px solid var(--color-text-muted);
+    outline-offset: -1px;
+  }
+
+  .keyboard-hints {
+    margin: var(--space-3) 0 0 0;
+    text-align: right;
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
+    font-family: var(--type-family-body);
+  }
+
+  .keyboard-hints kbd {
+    display: inline-block;
+    padding: 0 var(--space-1);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 2px;
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    line-height: 1.4;
+  }
+
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
   }
 </style>

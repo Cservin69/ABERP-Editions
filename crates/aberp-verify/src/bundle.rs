@@ -76,10 +76,10 @@ pub struct Archive {
 ///   - tar parse failure.
 ///   - missing `bundle/manifest.json` or `bundle/chain.jsonl`.
 pub fn read_archive(path: &Path) -> Result<Archive> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("read bundle file at {}", path.display()))?;
-    let decoded = zstd::stream::decode_all(bytes.as_slice())
-        .context("zstd-decompress bundle archive")?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("read bundle file at {}", path.display()))?;
+    let decoded =
+        zstd::stream::decode_all(bytes.as_slice()).context("zstd-decompress bundle archive")?;
     let mut ar = tar::Archive::new(decoded.as_slice());
 
     let mut manifest_bytes: Option<Vec<u8>> = None;
@@ -232,8 +232,12 @@ pub fn reconstruct_entry(line: &ChainJsonlLine) -> Result<Entry> {
         .with_context(|| format!("decode prev_hash {} on chain.jsonl line", line.prev_hash))?;
     let entry_hash = parse_entry_hash(&line.entry_hash)
         .with_context(|| format!("decode entry_hash {} on chain.jsonl line", line.entry_hash))?;
-    let binary_hash = parse_binary_hash(&line.binary_hash)
-        .with_context(|| format!("decode binary_hash {} on chain.jsonl line", line.binary_hash))?;
+    let binary_hash = parse_binary_hash(&line.binary_hash).with_context(|| {
+        format!(
+            "decode binary_hash {} on chain.jsonl line",
+            line.binary_hash
+        )
+    })?;
     let time_wall = OffsetDateTime::parse(&line.time_wall, &Rfc3339)
         .with_context(|| format!("parse time_wall {} as RFC3339", line.time_wall))?;
     let kind = EventKind::from_storage_str(&line.kind).map_err(|e| {
@@ -243,8 +247,12 @@ pub fn reconstruct_entry(line: &ChainJsonlLine) -> Result<Entry> {
             e
         )
     })?;
-    let tenant_id = TenantId::new(line.tenant_id.clone())
-        .ok_or_else(|| anyhow!("tenant_id {:?} is empty or contains a null byte", line.tenant_id))?;
+    let tenant_id = TenantId::new(line.tenant_id.clone()).ok_or_else(|| {
+        anyhow!(
+            "tenant_id {:?} is empty or contains a null byte",
+            line.tenant_id
+        )
+    })?;
     let payload = BASE64_STANDARD
         .decode(&line.payload)
         .with_context(|| format!("base64-decode payload bytes for entry {}", line.id))?;
@@ -268,9 +276,12 @@ pub fn reconstruct_entry(line: &ChainJsonlLine) -> Result<Entry> {
 /// Parse the `aud_<26-char-Crockford-ULID>` prefixed-string form per
 /// ADR-0005 into an [`EntryId`].
 fn parse_entry_id(s: &str) -> Result<EntryId> {
-    let rest = s
-        .strip_prefix("aud_")
-        .ok_or_else(|| anyhow!("entry id {:?} missing required `aud_` prefix per ADR-0005", s))?;
+    let rest = s.strip_prefix("aud_").ok_or_else(|| {
+        anyhow!(
+            "entry id {:?} missing required `aud_` prefix per ADR-0005",
+            s
+        )
+    })?;
     let ulid = ulid::Ulid::from_string(rest)
         .map_err(|e| anyhow!("entry id {:?} is not a valid ULID: {}", s, e))?;
     Ok(EntryId(ulid))
@@ -454,8 +465,7 @@ mod tests {
 
     #[test]
     fn reconstruct_entry_loud_fails_on_unknown_event_kind() {
-        let mut line: ChainJsonlLine =
-            serde_json::from_str(&fixture_chain_jsonl_line()).unwrap();
+        let mut line: ChainJsonlLine = serde_json::from_str(&fixture_chain_jsonl_line()).unwrap();
         line.kind = "invoice.future_kind_not_yet_known".to_string();
         let err = reconstruct_entry(&line).unwrap_err();
         let msg = format!("{err:#}");
@@ -467,8 +477,7 @@ mod tests {
 
     #[test]
     fn reconstruct_entry_loud_fails_on_short_hash() {
-        let mut line: ChainJsonlLine =
-            serde_json::from_str(&fixture_chain_jsonl_line()).unwrap();
+        let mut line: ChainJsonlLine = serde_json::from_str(&fixture_chain_jsonl_line()).unwrap();
         line.entry_hash = "ab".repeat(16); // 16 bytes, not 32
         let err = reconstruct_entry(&line).unwrap_err();
         let msg = format!("{err:#}");
@@ -480,8 +489,7 @@ mod tests {
 
     #[test]
     fn reconstruct_entry_loud_fails_on_missing_aud_prefix() {
-        let mut line: ChainJsonlLine =
-            serde_json::from_str(&fixture_chain_jsonl_line()).unwrap();
+        let mut line: ChainJsonlLine = serde_json::from_str(&fixture_chain_jsonl_line()).unwrap();
         line.id = ulid::Ulid::new().to_string(); // No prefix
         let err = reconstruct_entry(&line).unwrap_err();
         let msg = format!("{err:#}");

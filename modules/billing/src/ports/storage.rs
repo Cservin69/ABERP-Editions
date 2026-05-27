@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 use crate::app::error::BillingError;
 use crate::domain::ids::{InvoiceId, SeriesId};
 use crate::domain::invoice::ReadyInvoice;
-use crate::domain::money::{Currency, RateMetadata};
+use crate::domain::money::{BankAccountSnapshot, Currency, RateMetadata};
 use crate::domain::reservation::SequenceReservation;
 use crate::domain::series::{InvoiceSeries, SeriesCode};
 
@@ -60,6 +60,14 @@ pub struct AllocateArgs {
     /// loud-fail error if `currency == Eur` and this field is `None`
     /// (per ADR-0037 §4 invariant C1).
     pub rate_metadata: Option<RateMetadata>,
+    /// PR-73 / ADR-0040 §addendum — denormalized per-invoice snapshot of
+    /// the operator-selected `[[seller.banks]]` entry. `Some(_)` for
+    /// SPA-issued invoices (the route handler resolves the bank from
+    /// the request body's optional `bank_account_id` or the per-currency
+    /// default before calling [`allocate_in_tx`]); `None` for CLI / library
+    /// callers that do not exercise the bank picker. Persisted to the
+    /// five nullable DuckDB columns.
+    pub bank_snapshot: Option<BankAccountSnapshot>,
 }
 
 /// Outcome of an `allocate_and_insert` call. The fresh and replay

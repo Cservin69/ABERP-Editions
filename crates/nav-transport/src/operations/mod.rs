@@ -340,8 +340,7 @@ fn find_all_technical_validations(
             Ok(Event::End(e)) => {
                 let qualified = e.name();
                 let qualified = qualified.as_ref();
-                if block_depth == 1
-                    && local_name_matches(qualified, "technicalValidationMessages")
+                if block_depth == 1 && local_name_matches(qualified, "technicalValidationMessages")
                 {
                     out.push(std::mem::take(&mut current));
                     block_depth = 0;
@@ -591,7 +590,10 @@ mod tests {
     #[test]
     fn parse_nav_fault_extracts_general_error_shape() {
         let fault = parse_nav_fault(GENERAL_ERROR_BODY);
-        assert_eq!(fault.fault_code.as_deref(), Some("INVALID_REQUEST_SIGNATURE"));
+        assert_eq!(
+            fault.fault_code.as_deref(),
+            Some("INVALID_REQUEST_SIGNATURE")
+        );
         assert_eq!(
             fault.fault_message.as_deref(),
             Some("The request signature does not match.")

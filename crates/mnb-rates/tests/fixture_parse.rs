@@ -14,10 +14,8 @@ use aberp_billing::Currency;
 use aberp_mnb_rates::parse::parse_get_exchange_rates_response;
 use time::macros::date;
 
-const FIXTURE_ESCAPED: &[u8] =
-    include_bytes!("fixtures/get_exchange_rates_eur_2026-05-22.xml");
-const FIXTURE_CDATA: &[u8] =
-    include_bytes!("fixtures/get_exchange_rates_eur_2026-05-22_cdata.xml");
+const FIXTURE_ESCAPED: &[u8] = include_bytes!("fixtures/get_exchange_rates_eur_2026-05-22.xml");
+const FIXTURE_CDATA: &[u8] = include_bytes!("fixtures/get_exchange_rates_eur_2026-05-22_cdata.xml");
 
 #[test]
 fn escaped_inner_xml_round_trips_to_typed_rate() {
@@ -44,9 +42,8 @@ fn cdata_wrapped_inner_xml_round_trips_to_same_typed_rate() {
 /// identical. A regression that diverges them surfaces here.
 #[test]
 fn escaped_and_cdata_encodings_produce_identical_rate() {
-    let a = parse_get_exchange_rates_response(FIXTURE_ESCAPED, Currency::Eur)
-        .expect("escaped parses");
-    let b = parse_get_exchange_rates_response(FIXTURE_CDATA, Currency::Eur)
-        .expect("cdata parses");
+    let a =
+        parse_get_exchange_rates_response(FIXTURE_ESCAPED, Currency::Eur).expect("escaped parses");
+    let b = parse_get_exchange_rates_response(FIXTURE_CDATA, Currency::Eur).expect("cdata parses");
     assert_eq!(a, b);
 }

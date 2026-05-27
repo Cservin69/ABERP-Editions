@@ -175,20 +175,18 @@ pub fn write_blob(
         xml_sign_key: xml_sign_key.to_string(),
         xml_change_key: xml_change_key.to_string(),
     };
-    let json = serde_json::to_string(&blob).map_err(|e| {
-        NavTransportError::KeychainBlobMalformed {
+    let json =
+        serde_json::to_string(&blob).map_err(|e| NavTransportError::KeychainBlobMalformed {
             tenant_id: tenant_id.to_string(),
             detail: format!("serialize NAV credentials blob to JSON: {e}"),
+        })?;
+    let service = service_name(tenant_id);
+    let entry = Entry::new(&service, ITEM_NAV_CREDENTIALS_BLOB).map_err(|e| {
+        NavTransportError::KeychainBackend {
+            item: ITEM_NAV_CREDENTIALS_BLOB,
+            source: e,
         }
     })?;
-    let service = service_name(tenant_id);
-    let entry =
-        Entry::new(&service, ITEM_NAV_CREDENTIALS_BLOB).map_err(|e| {
-            NavTransportError::KeychainBackend {
-                item: ITEM_NAV_CREDENTIALS_BLOB,
-                source: e,
-            }
-        })?;
     entry
         .set_password(&json)
         .map_err(|e| NavTransportError::KeychainBackend {
@@ -204,13 +202,12 @@ pub fn write_blob(
 /// the blob is malformed (both loud per rule 12).
 pub(crate) fn read_blob(tenant_id: &str) -> Result<Option<LoadedBlob>, NavTransportError> {
     let service = service_name(tenant_id);
-    let entry =
-        Entry::new(&service, ITEM_NAV_CREDENTIALS_BLOB).map_err(|e| {
-            NavTransportError::KeychainBackend {
-                item: ITEM_NAV_CREDENTIALS_BLOB,
-                source: e,
-            }
-        })?;
+    let entry = Entry::new(&service, ITEM_NAV_CREDENTIALS_BLOB).map_err(|e| {
+        NavTransportError::KeychainBackend {
+            item: ITEM_NAV_CREDENTIALS_BLOB,
+            source: e,
+        }
+    })?;
     let raw = match entry.get_password() {
         Ok(s) => Zeroizing::new(s),
         Err(keyring::Error::NoEntry) => return Ok(None),
@@ -347,8 +344,14 @@ mod tests {
         };
         let json = serde_json::to_string(&blob).unwrap();
         // Field names match legacy item constants verbatim.
-        assert!(json.contains(r#""technical_user.login":"lg""#), "json = {json}");
-        assert!(json.contains(r#""technical_user.password":"pw""#), "json = {json}");
+        assert!(
+            json.contains(r#""technical_user.login":"lg""#),
+            "json = {json}"
+        );
+        assert!(
+            json.contains(r#""technical_user.password":"pw""#),
+            "json = {json}"
+        );
         assert!(json.contains(r#""xml_sign_key":"sk""#), "json = {json}");
         assert!(json.contains(r#""xml_change_key":"ck""#), "json = {json}");
 

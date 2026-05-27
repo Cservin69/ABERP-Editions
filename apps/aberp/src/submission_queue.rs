@@ -168,11 +168,7 @@ pub fn pending_from_ledger(ledger: &Ledger) -> Result<Vec<PendingInvoice>> {
 /// takes the same `(db_path, tenant, binary_hash)` triple every
 /// other call site already builds; this keeps the cap check a one-
 /// liner at the `issue-*` orchestration boundaries.
-pub fn count_pending(
-    db_path: &Path,
-    tenant: TenantId,
-    binary_hash: BinaryHash,
-) -> Result<usize> {
+pub fn count_pending(db_path: &Path, tenant: TenantId, binary_hash: BinaryHash) -> Result<usize> {
     let ledger = Ledger::open(db_path, tenant, binary_hash)
         .context("open audit ledger to count pending submissions")?;
     Ok(pending_from_ledger(&ledger)?.len())
@@ -646,6 +642,13 @@ mod tests {
             exchange_rate_source: None,
             exchange_rate_date: None,
             huf_equivalent_total: None,
+            // PR-73 — test fixture predates the bank picker; NULL across
+            // the five bank-snapshot fields.
+            bank_account_id: None,
+            bank_account_currency: None,
+            bank_account_number: None,
+            bank_account_bank_name: None,
+            bank_account_swift_bic: None,
         };
         ledger
             .append(
@@ -1072,7 +1075,8 @@ mod tests {
     /// A", the audit payload's `failure_class` keeps the
     /// distinction for inspector triage.
     #[test]
-    fn classify_attempt_failure_classifies_query_invoice_check_retryable_as_retryable_application() {
+    fn classify_attempt_failure_classifies_query_invoice_check_retryable_as_retryable_application()
+    {
         let err = NavTransportError::QueryInvoiceCheckRetryable {
             code: "OPERATION_FAILED".to_string(),
             message: "try again".to_string(),

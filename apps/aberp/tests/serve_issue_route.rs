@@ -37,7 +37,7 @@ use time::Date;
 use ulid::Ulid;
 
 use aberp::audit_payloads::InvoiceDraftCreatedPayload;
-use aberp::issue_invoice::{CustomerJson, LineJson, SupplierJson, AddressJson};
+use aberp::issue_invoice::{AddressJson, CustomerJson, LineJson, SupplierJson};
 use aberp::mnb_rates_provider::MnbRatesProvider;
 use aberp::serve::{self, AppState, IssueInvoiceRequest};
 
@@ -48,9 +48,10 @@ const TEST_TENANT: &str = "serve_issue_route_test";
 // ──────────────────────────────────────────────────────────────────────
 
 fn test_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join("aberp-serve-issue")
-        .join(format!("{}-{}", label, Ulid::new()));
+    let dir =
+        std::env::temp_dir()
+            .join("aberp-serve-issue")
+            .join(format!("{}-{}", label, Ulid::new()));
     std::fs::create_dir_all(&dir).expect("create test dir");
     dir
 }
@@ -110,6 +111,7 @@ fn fixture_request(currency: Currency) -> IssueInvoiceRequest {
         lines: fixture_lines(),
         currency,
         series: None,
+        bank_account_id: None,
     }
 }
 
@@ -132,8 +134,7 @@ postal_code = "1011"
 city = "Budapest"
 street = "Fő utca 1."
 "#;
-    std::fs::write(tenant_dir.join("seller.toml"), body)
-        .expect("write seller.toml fixture");
+    std::fs::write(tenant_dir.join("seller.toml"), body).expect("write seller.toml fixture");
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -182,9 +183,7 @@ impl MnbRatesProvider for UnreachableProvider {
         _currency: Currency,
         _date: Date,
     ) -> Result<MnbRate, MnbError> {
-        unreachable!(
-            "UnreachableProvider must not be consulted — HUF path is rate-free"
-        )
+        unreachable!("UnreachableProvider must not be consulted — HUF path is rate-free")
     }
 }
 
@@ -215,6 +214,7 @@ async fn issue_route_huf_happy_path_writes_audit_pair_and_xml() {
         fixture_supplier(),
         &UnreachableProvider,
         actor,
+        None,
     )
     .await
     .expect("HUF happy path must succeed");
@@ -306,6 +306,7 @@ async fn issue_route_eur_happy_path_stamps_rate_metadata_on_draft() {
         fixture_supplier(),
         &provider,
         actor,
+        None,
     )
     .await
     .expect("EUR happy path must succeed");
@@ -378,6 +379,7 @@ async fn issue_route_rejects_empty_lines_with_loud_error() {
         lines: Vec::new(), // ← validation failure trigger
         currency: Currency::Huf,
         series: None,
+        bank_account_id: None,
     };
 
     let err = serve::issue_invoice_request(
@@ -386,6 +388,7 @@ async fn issue_route_rejects_empty_lines_with_loud_error() {
         fixture_supplier(),
         &UnreachableProvider,
         actor,
+        None,
     )
     .await
     .expect_err("empty-lines request must fail loud");
@@ -422,6 +425,7 @@ async fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
         lines: fixture_lines(),
         currency: Currency::Huf,
         series: None,
+        bank_account_id: None,
     };
 
     // PR-53 / session-73 — supplier comes via the new arg, not the
@@ -435,6 +439,7 @@ async fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
         bad_supplier,
         &UnreachableProvider,
         actor,
+        None,
     )
     .await
     .expect_err("malformed supplier tax number must fail loud");

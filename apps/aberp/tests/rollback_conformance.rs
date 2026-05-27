@@ -85,6 +85,9 @@ fn pre_tx_setup(path: &std::path::Path) -> (Connection, InvoiceSeries) {
 fn build_allocate_args(series_id: SeriesId) -> AllocateArgs {
     AllocateArgs {
         series_id,
+        // PR-73 — rollback conformance test doesn't exercise the bank
+        // picker; `bank_snapshot: None` keeps the test's allocation
+        // shape pre-PR-73 (NULL across the five bank columns).
         draft: DraftInvoice {
             id: InvoiceId::new(),
             series_id,
@@ -103,6 +106,7 @@ fn build_allocate_args(series_id: SeriesId) -> AllocateArgs {
         // HUF rows carry no rate metadata.
         currency: aberp_billing::Currency::Huf,
         rate_metadata: None,
+        bank_snapshot: None,
     }
 }
 

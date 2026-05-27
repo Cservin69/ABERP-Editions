@@ -244,7 +244,10 @@ pub async fn send_built_request(
         });
     }
 
-    match parse_result_block(&response_xml, NavTransportError::QueryInvoiceCheckResponseParse)? {
+    match parse_result_block(
+        &response_xml,
+        NavTransportError::QueryInvoiceCheckResponseParse,
+    )? {
         NavResultBlock::Ok => {}
         NavResultBlock::Error { code, message } => {
             // ADR-0009 §5 retry classification reused (same NAV-

@@ -33,8 +33,7 @@ fn serve_println_round_trip() {
     // contract, not the spawn.
     let port = 51847u16;
     let fingerprint_hex: String = (0..32).map(|i| format!("{:02x}", (i * 7) as u8)).collect();
-    let serve_println =
-        format!("READY 127.0.0.1:{port} sha256:{fingerprint_hex} state=ready");
+    let serve_println = format!("READY 127.0.0.1:{port} sha256:{fingerprint_hex} state=ready");
 
     let parsed = handshake::parse(&serve_println)
         .expect("round-trip from serve.rs format string MUST parse");
@@ -57,8 +56,7 @@ fn serve_println_round_trip_needs_setup() {
     let serve_println =
         format!("READY 127.0.0.1:{port} sha256:{fingerprint_hex} state=needs-setup");
 
-    let parsed = handshake::parse(&serve_println)
-        .expect("needs-setup line MUST parse");
+    let parsed = handshake::parse(&serve_println).expect("needs-setup line MUST parse");
 
     assert_eq!(parsed.state, ServeBootState::NeedsSetup);
     assert_eq!(parsed.port, port);

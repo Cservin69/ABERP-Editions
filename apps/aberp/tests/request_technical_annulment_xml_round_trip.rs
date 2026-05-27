@@ -168,7 +168,10 @@ fn render_annulment_data_timestamp_is_iso8601_utc_z() {
         20,
         "timestamp must be `YYYY-MM-DDTHH:MM:SSZ` (20 chars): got {ts:?}"
     );
-    assert!(ts.ends_with('Z'), "timestamp must end with Z per ADR-0025 §4: got {ts:?}");
+    assert!(
+        ts.ends_with('Z'),
+        "timestamp must end with Z per ADR-0025 §4: got {ts:?}"
+    );
     assert!(
         ts.chars().nth(4) == Some('-')
             && ts.chars().nth(7) == Some('-')

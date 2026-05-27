@@ -290,7 +290,10 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             })?;
         }
         let mut billing_store = DuckDbBillingStore::open(&args.db).with_context(|| {
-            format!("open billing DuckDB at {} for boot migration", args.db.display())
+            format!(
+                "open billing DuckDB at {} for boot migration",
+                args.db.display()
+            )
         })?;
         billing_store
             .ensure_schema()

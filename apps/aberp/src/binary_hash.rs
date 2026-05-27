@@ -99,9 +99,7 @@ impl BinaryHashHandle {
         let (lock, cvar) = &*self.inner;
         let mut guard = lock.lock().expect("binary-hash mutex poisoned");
         while guard.is_none() {
-            guard = cvar
-                .wait(guard)
-                .expect("binary-hash condvar wait poisoned");
+            guard = cvar.wait(guard).expect("binary-hash condvar wait poisoned");
         }
         match guard.as_ref().expect("just-checked is_some") {
             Ok(h) => Ok(*h),

@@ -76,12 +76,7 @@ fn seed_ledger(db_path: &std::path::Path, invoice_id: &str) {
         b"<QueryTransactionStatusResponse>SAVED</QueryTransactionStatusResponse>".to_vec(),
     );
     ledger
-        .append(
-            EventKind::InvoiceAckStatus,
-            ack.to_bytes(),
-            actor,
-            None,
-        )
+        .append(EventKind::InvoiceAckStatus, ack.to_bytes(), actor, None)
         .unwrap();
 }
 
@@ -198,8 +193,7 @@ fn run_produces_well_formed_tar_zst_bundle() {
         .find(|(p, _)| p.contains("invoice_ack_status"))
         .expect("ack_status XML present");
     assert_eq!(
-        saved_payload.1,
-        b"<QueryTransactionStatusResponse>SAVED</QueryTransactionStatusResponse>",
+        saved_payload.1, b"<QueryTransactionStatusResponse>SAVED</QueryTransactionStatusResponse>",
         "verbatim NAV response bytes must round-trip through the bundle"
     );
 
@@ -309,7 +303,10 @@ fn run_produces_verified_agreement_bundle_when_mirror_is_synced() {
     let mirror_path = aberp_audit_ledger::mirror_path_for(&db);
     let head = ledger.sync_mirror(&mirror_path).unwrap();
     assert_eq!(head, 3, "mirror should backfill all three seeded entries");
-    assert!(mirror_path.exists(), "mirror file present on disk after sync");
+    assert!(
+        mirror_path.exists(),
+        "mirror file present on disk after sync"
+    );
 
     let args = ExportInvoiceBundleArgs {
         invoice_id: invoice_id.to_string(),
@@ -335,8 +332,7 @@ fn run_produces_verified_agreement_bundle_when_mirror_is_synced() {
             manifest_json = Some(bytes);
         }
     }
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&manifest_json.unwrap()).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_json.unwrap()).unwrap();
     assert_eq!(manifest["mirror_file_present"], serde_json::json!(true));
     assert_eq!(
         manifest["mirror_file_status"],

@@ -43,14 +43,13 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use aberp_billing::Currency;
-use aberp_mnb_rates::{MnbError, MnbRate};
 use aberp::issue_invoice::{
-    fetch_and_stamp_rate, ERR_MNB_FETCH_FAILED, ERR_NO_RATE_AFTER_WALKBACK,
-    MNB_WALKBACK_DAYS_CAP,
+    fetch_and_stamp_rate, ERR_MNB_FETCH_FAILED, ERR_NO_RATE_AFTER_WALKBACK, MNB_WALKBACK_DAYS_CAP,
 };
 use aberp::mnb_rates_provider::MnbRatesProvider;
+use aberp_billing::Currency;
 use aberp_billing::{Huf, LineItem};
+use aberp_mnb_rates::{MnbError, MnbRate};
 use time::Date;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -177,8 +176,7 @@ const SUPPLY_DATE: Date = time::macros::date!(2026 - 05 - 22);
 /// round-half-even HUF-equivalent total.
 #[tokio::test(flavor = "current_thread")]
 async fn eur_happy_path_stamps_all_four_metadata_fields() {
-    let provider =
-        FakeMnbRates::empty().with_rate(Currency::Eur, SUPPLY_DATE, "405.230000");
+    let provider = FakeMnbRates::empty().with_rate(Currency::Eur, SUPPLY_DATE, "405.230000");
     let lines = fixture_eur_lines();
 
     let metadata = fetch_and_stamp_rate(&provider, Currency::Eur, SUPPLY_DATE, &lines)
@@ -208,8 +206,7 @@ async fn eur_happy_path_stamps_all_four_metadata_fields() {
 #[tokio::test(flavor = "current_thread")]
 async fn eur_walks_back_to_d_minus_1_when_supply_date_has_no_rate() {
     let d_minus_1 = SUPPLY_DATE - time::Duration::days(1);
-    let provider =
-        FakeMnbRates::empty().with_rate(Currency::Eur, d_minus_1, "404.000000");
+    let provider = FakeMnbRates::empty().with_rate(Currency::Eur, d_minus_1, "404.000000");
     let lines = fixture_eur_lines();
 
     let metadata = fetch_and_stamp_rate(&provider, Currency::Eur, SUPPLY_DATE, &lines)

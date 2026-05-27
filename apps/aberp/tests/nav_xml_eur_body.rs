@@ -234,8 +234,7 @@ fn eur_body_pins_currency_code_exchange_rate_invoice_vat_amount_huf() {
         .iter()
         .map(|l| l.vat_amount().unwrap().as_i64())
         .sum();
-    let vat_huf_expected =
-        huf_equivalent_round_half_even(vat_cents, &rate_metadata.rate).unwrap();
+    let vat_huf_expected = huf_equivalent_round_half_even(vat_cents, &rate_metadata.rate).unwrap();
     let needle = format!("<invoiceVatAmountHUF>{vat_huf_expected}</invoiceVatAmountHUF>");
     assert!(
         body.contains(&needle),
@@ -382,8 +381,7 @@ fn round_trip_parse_pins_three_confirmed_xsd_leaves() {
         .iter()
         .map(|l| l.vat_amount().unwrap().as_i64())
         .sum();
-    let vat_huf_expected =
-        huf_equivalent_round_half_even(vat_cents, &rate_metadata.rate).unwrap();
+    let vat_huf_expected = huf_equivalent_round_half_even(vat_cents, &rate_metadata.rate).unwrap();
     assert_eq!(invoice_vat_amount_huf, vat_huf_expected.to_string());
 }
 
@@ -491,6 +489,64 @@ fn supplier_tax_number_emits_three_structured_subchildren() {
     // surface here before the live test on Ervin's tree.
     aberp_nav_xsd_validator::validate_invoice_data(body.as_bytes())
         .expect("structured <supplierTaxNumber> must pass the XSD validator");
+}
+
+/// PR-66 / session-88 — symmetric pin for the customer side. The
+/// session-87 partial fix that landed `walk_structured_tax_number`
+/// is symmetric between supplier and customer, but the only
+/// pre-session-88 byte-verbatim pin was supplier-only. A future
+/// regression that dropped the `common:` prefix from
+/// `nav_xml::write_customer` (which uses the same `common_element`
+/// helper as `write_supplier` — see CLAUDE.md rule 7 / 11 about
+/// keeping parallel code in lockstep) would currently fail only
+/// the validator pin, not a byte-shape pin. This test closes that
+/// asymmetry so a customer-side prefix regression surfaces both as
+/// a byte-shape diff AND as a validator rejection at commit time.
+#[test]
+fn customer_tax_number_emits_three_structured_subchildren() {
+    let invoice = build_huf_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("HUF render");
+    let body = String::from_utf8(xml).expect("UTF-8 body");
+
+    // The structured block — byte-verbatim, mirroring the supplier
+    // pin above. `minimal_parties().customer.tax_number` is
+    // `87654321-1-42`, so the three children carry the parsed
+    // 8-digit base / 1-digit vatCode / 2-digit countyCode.
+    assert!(
+        body.contains("<common:taxpayerId>87654321</common:taxpayerId>"),
+        "customer <common:taxpayerId> must carry the 8-digit base, got body:\n{body}"
+    );
+    assert!(
+        body.contains("<common:vatCode>1</common:vatCode>"),
+        "customer <common:vatCode> must carry the 1-digit VAT code, got body:\n{body}"
+    );
+    assert!(
+        body.contains("<common:countyCode>42</common:countyCode>"),
+        "customer <common:countyCode> must carry the 2-digit county code, got body:\n{body}"
+    );
+    // Negative byte-shape pin for the bare-prefix regression — the
+    // session-87 live failure mode on the supplier side. Same rule
+    // both sides per nav-gotchas section 5.
+    assert!(
+        !body.contains("<customerTaxNumber><taxpayerId>"),
+        "customer tax number MUST NOT carry a bare-prefix `<taxpayerId>` child — \
+         that's the session-87 regression class. Body:\n{body}"
+    );
+    // And the dashed flat string must not leak either (the pre-PR-50
+    // shape). Symmetric to the supplier pin above.
+    assert!(
+        !body.contains("<customerTaxNumber>87654321-1-42</customerTaxNumber>"),
+        "customer tax number must NOT serialize as a flat dashed string — that's the pre-PR-50 bug. Body:\n{body}"
+    );
+
+    // Defence in depth — the XSD validator must accept the structured
+    // customer form. Mirror of the supplier-side assertion.
+    aberp_nav_xsd_validator::validate_invoice_data(body.as_bytes())
+        .expect("structured <customerTaxNumber> must pass the XSD validator");
 }
 
 /// PR-50 / session-70 — renderer must loud-fail when handed a

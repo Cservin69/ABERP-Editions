@@ -24,6 +24,26 @@ import { invoke } from "@tauri-apps/api/core";
  * drift surfaces at `npm run check`. */
 export type Currency = "HUF" | "EUR";
 
+/** PR-73 / ADR-0040 §addendum — denormalized per-invoice bank-account
+ * snapshot mirror of `serve::BankAccountSnapshotResponse`. Carried on
+ * BOTH the list-row and the detail wire shape so a single TS interface
+ * drives both surfaces. `null` for pre-PR-73 / CLI-issued invoices
+ * (which have NULL across the five `bank_account_*` DuckDB columns).
+ * The `InvoiceDetail.svelte` "Pay to" sub-section renders the snapshot;
+ * the list view does not. */
+export interface BankAccountSnapshot {
+  /** `bnk_<26-char>` deterministic id from the seller-banks schema. */
+  id: string;
+  /** ISO 4217 string matching the invoice's currency. */
+  currency: Currency;
+  /** Account number string verbatim (IBAN form for EUR, domestic for HUF). */
+  account_number: string;
+  /** Operator-typed bank name (e.g., `"Erste Bank"`). */
+  bank_name: string;
+  /** SWIFT/BIC code (8 or 11 chars). */
+  swift_bic: string;
+}
+
 /** Single invoice row — shape mirrors `serve::InvoiceListItem`. */
 export interface InvoiceListItem {
   invoice_id: string;
@@ -60,6 +80,30 @@ export interface InvoiceListItem {
    * render as forints (off by a factor of 100 + wrong symbol).
    * Pinned by `invoice_list_item_emits_currency` on the Rust side. */
   currency: Currency;
+  /** PR-65 / session-86 — buyer label for the SPA's list-row Partner
+   * column (Tier-1 UX lift). Best-effort read of the PR-47α / A174
+   * side-stored `<ULID>.input.json`'s `customer.name` field on the
+   * Rust side; `null` for CLI-issued invoices, pre-PR-47α SPA-issued
+   * invoices, or any I/O failure. The SPA renders the value via
+   * `buyerColumnDisplay` in `./invoice-list.ts`, which falls back to
+   * a quiet em-dash placeholder on `null` rather than fabricating a
+   * label. Pinned by `invoice_list_item_emits_buyer_name` on the
+   * Rust side; TS reads the wire shape strictly via this typed
+   * field so a backend drift surfaces at `npm run check`. */
+  buyer_name: string | null;
+  /** PR-70 / ADR-0039 §2 — operational payment-receipt summary for
+   * the SPA's "Paid" chip + quick-action gating. `null` for unpaid
+   * invoices; the SPA renders no Paid badge + shows the "💰 Pay"
+   * quick action on the row when the state is `Finalized`. Pinned
+   * by `invoice_list_item_emits_payment` on the Rust side (PR-70
+   * pin set); TS reads the wire shape strictly via this typed field
+   * so a backend drift surfaces at `npm run check`. */
+  payment: PaymentRecordSummary | null;
+  /** PR-73 / ADR-0040 §addendum — denormalized bank-account snapshot.
+   * `null` for pre-PR-73 / CLI-issued invoices. The list view does
+   * not render this field today; it rides on the same wire shape as
+   * `InvoiceDetail.bank_account` so a single TS interface drives both. */
+  bank_account: BankAccountSnapshot | null;
 }
 
 /** Possible derived states from `InvoiceTrace::derive_state` on the
@@ -173,6 +217,39 @@ export type ChainChildKind = Extract<InvoiceState, "Storno" | "Amended">;
  * backend drift surfaces at `npm run check`. */
 export type AckStatus = "RECEIVED" | "PROCESSING" | "SAVED" | "ABORTED";
 
+/** PR-70 / ADR-0039 §2 — typed wire mirror of the four closed-vocab
+ * payment methods on `serve::PaymentMethod` (Rust enum). PascalCase
+ * variant identifiers verbatim per CLAUDE.md rule 7 (closed-vocab).
+ * Drift between this union and the Rust enum surfaces at three layers:
+ * the Rust-side `payment_method_wire_shape_pins_pascalcase_strings`
+ * test pins each variant's JSON form; the SPA's
+ * `paymentMethodLabel` dispatch covers every variant via TypeScript's
+ * exhaustive-match check; the route's `deserialize` fails loud on
+ * unrecognised wire strings. */
+export type PaymentMethod = "BankTransfer" | "Cash" | "Card" | "Other";
+
+/** PR-70 / ADR-0039 §2 — typed wire mirror of the operational payment
+ * record carried on `InvoiceListItem.payment` /
+ * `InvoiceDetail.payment`. Mirrors `serve::PaymentRecordSummary` on
+ * the Rust side; pinned to PaymentRecord drift via the Rust-side
+ * round-trip tests in `audit_payloads.rs`. */
+export interface PaymentRecordSummary {
+  /** Operator-supplied payment date in canonical YYYY-MM-DD form. */
+  paid_at: string;
+  /** Amount paid in the invoice's stored minor-unit form (whole
+   * forints for HUF, EUR cents for EUR). Mirrors the
+   * `InvoiceListItem.total_gross` shape — divide by 100 on the EUR
+   * branch for display. */
+  amount_minor: number;
+  /** ISO-4217 currency code matching the invoice's currency. */
+  currency: string;
+  /** Closed-vocab payment method per [`PaymentMethod`]. */
+  method: PaymentMethod;
+  /** Optional free-form operator note (bank transaction id, cheque
+   * number, etc.). `null` when the operator left the field blank. */
+  reference: string | null;
+}
+
 /** The single-invoice detail — shape mirrors
  * `serve::InvoiceDetailResponse`. */
 export interface InvoiceDetail {
@@ -231,6 +308,17 @@ export interface InvoiceDetail {
    * §1.a + §1.c / C5. Whole forints (HUF has no sub-unit); `null`
    * iff `currency === "HUF"`. */
   huf_equivalent_total: number | null;
+  /** PR-70 / ADR-0039 §2 — operational payment summary mirror of
+   * [`InvoiceListItem.payment`]. Same wire shape on both list and
+   * detail surfaces so one TS interface drives the SPA's chip
+   * rendering. `null` for unpaid invoices. */
+  payment: PaymentRecordSummary | null;
+  /** PR-73 / ADR-0040 §addendum — denormalized bank-account snapshot.
+   * `null` for pre-PR-73 / CLI-issued invoices. The
+   * `InvoiceDetail.svelte` "Pay to" sub-section renders this when
+   * non-null; the renderer falls back to "(no bank account on file)"
+   * on `null`. */
+  bank_account: BankAccountSnapshot | null;
 }
 
 /** `GET /health` response — `serve::HealthResponse`. */
@@ -303,6 +391,13 @@ export interface IssueInvoiceRequest {
    * omitted. Kept opt-in so the SPA form does not have to expose a
    * series-picker on the first cut. */
   series?: string;
+  /** PR-73 / ADR-0040 §addendum — operator-selected bank account id
+   * (the `bnk_<26-char>` deterministic value from `listSellerBanks`).
+   * `null` (or absent) → backend falls back to the per-currency
+   * default. The SPA's bank picker defaults to the currency's
+   * `is_default: true` entry and lets the operator switch to any
+   * other entry for that currency. */
+  bankAccountId?: string | null;
 }
 
 /** PR-44ζ / session-59 — wire response body for `POST /invoices/issue`.
@@ -536,6 +631,100 @@ export async function amendInvoiceModification(
   body: ModificationInvoiceRequest,
 ): Promise<ModificationInvoiceResponse> {
   return invoke<ModificationInvoiceResponse>("amend_invoice_modification", {
+    invoiceId,
+    body,
+  });
+}
+
+/** PR-70 / ADR-0039 — wire request body for
+ * `POST /api/invoices/<id>/mark-paid`. Mirrors
+ * `serve::MarkPaidRequest` on the backend. `currency` MUST match the
+ * invoice's stored currency per ADR-0039 §3; the SPA pre-locks the
+ * form's currency display to the invoice's currency and the backend
+ * additionally rejects with 400 on mismatch as defence-in-depth. */
+export interface MarkPaidRequest {
+  /** Operator-supplied payment date — canonical YYYY-MM-DD. Defaults
+   * to today on the SPA form; the backend additionally validates the
+   * string with `time::Date::parse` and rejects with 400 on malformed
+   * input per CLAUDE.md rule 12. */
+  paid_at: string;
+  /** Amount paid in the invoice's stored minor-unit form. Defaults
+   * to the invoice's `total_gross` on the SPA form; the operator
+   * may override for partial-payment-recorded-as-full edge cases
+   * (v1 records the operator-supplied amount verbatim — partial
+   * payments as a typed lifecycle are out of scope per the session-92
+   * brief). */
+  amount_minor: number;
+  /** Must equal the invoice's stored currency. */
+  currency: Currency;
+  /** Closed-vocab payment method. */
+  method: PaymentMethod;
+  /** Optional free-form operator reference (bank txn id, cheque
+   * number, etc.). Empty / whitespace-only is normalised to `null`
+   * server-side. */
+  reference?: string | null;
+}
+
+/** PR-70 / ADR-0039 — wire response body for
+ * `POST /api/invoices/<id>/mark-paid` on the success path. */
+export interface MarkPaidResponse {
+  invoice_id: string;
+  /** The just-appended payment record echoed back so the SPA can
+   * render the Paid chip + detail immediately without a follow-up
+   * `getInvoice` round-trip. */
+  payment: PaymentRecordSummary;
+  entries_verified: number;
+}
+
+/** PR-70 / ADR-0039 — wire response body for the `409 Conflict`
+ * already-paid arm. Carries the existing payment record verbatim
+ * so the SPA can render "this invoice was already paid on X by Y"
+ * inline rather than surfacing a generic conflict. The
+ * `parseAlreadyPaidError` helper below extracts this shape from
+ * the Tauri forwarder's stringified error message. */
+export interface AlreadyPaidErrorBody {
+  error: "already_paid";
+  message: string;
+  payment: PaymentRecordSummary;
+}
+
+/** PR-70 / ADR-0039 — best-effort extract an [`AlreadyPaidErrorBody`]
+ * from the error string the Tauri forwarder produces on a non-2xx
+ * response. Returns the typed body only if the `error` discriminator
+ * is `"already_paid"`; returns `null` for everything else so the
+ * caller can fall through to its generic-error-rendering path. Same
+ * posture as `parseNavUpstreamFault` above. */
+export function parseAlreadyPaidError(
+  message: string,
+): AlreadyPaidErrorBody | null {
+  const brace = message.indexOf("{");
+  if (brace < 0) return null;
+  try {
+    const parsed: unknown = JSON.parse(message.slice(brace));
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      (parsed as { error?: unknown }).error === "already_paid"
+    ) {
+      return parsed as AlreadyPaidErrorBody;
+    }
+  } catch {
+    // Not JSON — caller renders the raw string.
+  }
+  return null;
+}
+
+/** PR-70 / ADR-0039 — POST the SPA's "Mark as paid" button to the
+ * backend's `/api/invoices/<id>/mark-paid` route via the matching
+ * Tauri command. Errors propagate as the rejected promise (including
+ * the typed 409 body for already-paid and the typed 400 for
+ * currency-mismatch / invalid-date); the caller renders the message
+ * inline per A157. */
+export async function markInvoicePaid(
+  invoiceId: string,
+  body: MarkPaidRequest,
+): Promise<MarkPaidResponse> {
+  return invoke<MarkPaidResponse>("mark_invoice_paid", {
     invoiceId,
     body,
   });
@@ -878,4 +1067,107 @@ export async function updatePartner(
  * row stays in the DB for historical-invoice resolution per A182. */
 export async function deletePartner(partnerId: string): Promise<void> {
   await invoke<void>("delete_partner", { partnerId });
+}
+
+// ── PR-72 / session-94 — multi-bank-account routes (PR-B) ─────────────
+
+/** PR-72 / session-94 — closed-vocab currency on a bank-account row.
+ * Mirror of the Rust-side ADR-0037 `Currency` enum. Pinned by the
+ * Rust round-trip pins on `Currency::iso_code`; the SPA's TS-strict
+ * consumption catches a backend drift at `npm run check`. */
+export type SellerBankCurrency = "HUF" | "EUR";
+
+/** PR-72 / session-94 — one bank-account row. Snake_case JSON mirrors
+ * the Rust-side `serve::SellerBankResponse`. `id` is the deterministic
+ * `bnk_<26-char-ULID>` derived over `(currency, account_number)`. */
+export interface SellerBankResponse {
+  id: string;
+  currency: SellerBankCurrency;
+  account_number: string;
+  bank_name: string;
+  swift_bic: string;
+  is_default: boolean;
+}
+
+/** PR-72 / session-94 — list / mutation response shape. Always carries
+ * the full updated collection so the SPA re-renders the list view
+ * from one source of truth after every mutation (one round-trip, not
+ * two). */
+export interface SellerBanksListResponse {
+  banks: SellerBankResponse[];
+}
+
+/** PR-72 / session-94 — request body for create + update. Snake_case
+ * to match the Rust-side `serve::SellerBankInputs`. `set_as_default`
+ * is only meaningful on the POST + PUT paths; the dedicated
+ * set-default route has no body. */
+export interface SellerBankInputs {
+  currency: SellerBankCurrency;
+  account_number: string;
+  bank_name: string;
+  swift_bic: string;
+  set_as_default: boolean;
+}
+
+/** PR-72 / session-94 — per-field error from the typed 400 body.
+ * Field names are camelCase to match the form input names in
+ * TenantSettings + SellerConfigWizard's bank-row composer. */
+export interface SellerBankFieldError {
+  field: string;
+  message: string;
+}
+
+/** PR-72 / session-94 — typed 400 body. Discriminant matches the
+ * setup-seller-info + partners routes so the existing parser
+ * pattern can be reused for the bank-account form. */
+export interface SellerBankValidationErrorBody {
+  error: "validation_failed";
+  fields: SellerBankFieldError[];
+}
+
+/** PR-72 / session-94 — `GET /api/seller/banks`. The TenantSettings
+ * "Bank accounts" subsection calls this on open. */
+export async function listSellerBanks(): Promise<SellerBanksListResponse> {
+  return invoke<SellerBanksListResponse>("list_seller_banks");
+}
+
+/** PR-72 / session-94 — `POST /api/seller/banks`. The "Add bank
+ * account" modal POSTs the composed inputs body here. */
+export async function createSellerBank(
+  body: SellerBankInputs,
+): Promise<SellerBanksListResponse> {
+  return invoke<SellerBanksListResponse>("create_seller_bank", { body });
+}
+
+/** PR-72 / session-94 — `PUT /api/seller/banks/:id`. The "Edit"
+ * affordance PUTs here. `set_as_default` MUST be `false` on this path
+ * — the route preserves the existing flag and ignores the input
+ * value; the dedicated set-default route owns the flip intent. */
+export async function updateSellerBank(
+  bankId: string,
+  body: SellerBankInputs,
+): Promise<SellerBanksListResponse> {
+  return invoke<SellerBanksListResponse>("update_seller_bank", {
+    bankId,
+    body,
+  });
+}
+
+/** PR-72 / session-94 — `POST /api/seller/banks/:id/set-default`.
+ * Flips the marked default to this entry for its currency; demotes
+ * the previous default in the same write. */
+export async function setDefaultSellerBank(
+  bankId: string,
+): Promise<SellerBanksListResponse> {
+  return invoke<SellerBanksListResponse>("set_default_seller_bank", { bankId });
+}
+
+/** PR-72 / session-94 — `DELETE /api/seller/banks/:id`. Returns the
+ * updated collection on success. Surfaces 409 Conflict if the delete
+ * would leave the currency unrepresented while other currencies still
+ * have entries (see the brief's explicit refusal rule). */
+export async function deleteSellerBank(
+  bankId: string,
+): Promise<SellerBanksListResponse> {
+  return invoke<SellerBanksListResponse>("delete_seller_bank", { bankId });
 }

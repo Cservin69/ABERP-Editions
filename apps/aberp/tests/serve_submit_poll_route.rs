@@ -38,9 +38,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
-use aberp_billing::{
-    CustomerId, Huf, IdempotencyKey, InvoiceId, LineItem, ReadyInvoice, SeriesId,
-};
+use aberp_billing::{CustomerId, Huf, IdempotencyKey, InvoiceId, LineItem, ReadyInvoice, SeriesId};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
@@ -116,7 +114,8 @@ fn write_draft(ledger: &mut Ledger, actor: &Actor, invoice: &ReadyInvoice, idem:
 }
 
 fn write_attempt(ledger: &mut Ledger, actor: &Actor, invoice_id: &str, idem: IdempotencyKey) {
-    let payload = InvoiceSubmissionAttemptPayload::new(invoice_id, idem, "test", b"<req/>".to_vec());
+    let payload =
+        InvoiceSubmissionAttemptPayload::new(invoice_id, idem, "test", b"<req/>".to_vec());
     ledger
         .append(
             EventKind::InvoiceSubmissionAttempt,

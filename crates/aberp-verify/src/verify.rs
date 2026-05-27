@@ -151,10 +151,7 @@ pub fn run_checks(bundle_path: &Path, archive: &Archive) -> Report {
     if lines.len() as u64 == manifest.entries_in_bundle {
         report.push(CheckOutcome::ok(
             "chain.jsonl entries",
-            format!(
-                "{} (matches manifest.entries_in_bundle)",
-                lines.len()
-            ),
+            format!("{} (matches manifest.entries_in_bundle)", lines.len()),
         ));
     } else {
         report.push(CheckOutcome::fail(
@@ -236,7 +233,8 @@ fn check_manifest_invariants(m: &Manifest, report: &mut Report) {
             "manifest chain_verified",
             "false — a tampered chain at bundle-write time would have refused \
              the bundle per ADR-0029 §6; the manifest claims otherwise, which is \
-             a contradiction that must be investigated".to_string(),
+             a contradiction that must be investigated"
+                .to_string(),
         ));
     }
 
@@ -301,12 +299,7 @@ fn reconstruct_entries(lines: &[ChainJsonlLine], report: &mut Report) -> Vec<Ent
                 decode_failures += 1;
                 report.push(CheckOutcome::fail(
                     "per-entry decode",
-                    format!(
-                        "chain.jsonl line {} (seq={}): {:#}",
-                        idx + 1,
-                        line.seq,
-                        e
-                    ),
+                    format!("chain.jsonl line {} (seq={}): {:#}", idx + 1, line.seq, e),
                 ));
             }
         }
@@ -314,7 +307,11 @@ fn reconstruct_entries(lines: &[ChainJsonlLine], report: &mut Report) -> Vec<Ent
     if decode_failures == 0 {
         report.push(CheckOutcome::ok(
             "per-entry decode",
-            format!("{}/{} chain.jsonl lines decoded cleanly", entries.len(), lines.len()),
+            format!(
+                "{}/{} chain.jsonl lines decoded cleanly",
+                entries.len(),
+                lines.len()
+            ),
         ));
     }
     entries
@@ -522,7 +519,11 @@ fn check_bundle_membership(manifest: &Manifest, entries: &[Entry], report: &mut 
 /// archive, decode the payload's request_xml or response_xml,
 /// compare bytes, and check the root element matches the per-kind
 /// expected list.
-fn check_nav_xml_pins(entries: &[Entry], nav_files: &HashMap<String, Vec<u8>>, report: &mut Report) {
+fn check_nav_xml_pins(
+    entries: &[Entry],
+    nav_files: &HashMap<String, Vec<u8>>,
+    report: &mut Report,
+) {
     let mut consumed_paths: BTreeSet<String> = BTreeSet::new();
     let mut ok_count = 0usize;
     let mut fail_count = 0usize;
@@ -745,7 +746,12 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::InvoiceMarkedAbandoned
         | EventKind::InvoiceStornoIssued
         | EventKind::InvoiceModificationIssued
-        | EventKind::InvoiceTechnicalAnnulmentRequested => (None, ""),
+        | EventKind::InvoiceTechnicalAnnulmentRequested
+        // PR-70 / ADR-0039 §2 — operational mark-as-paid carries no
+        // NAV-side XML (purely local audit metadata); mirrors the
+        // bundle writer's "no nav/ file" arm in
+        // `export_invoice_bundle::extract_nav_xml`.
+        | EventKind::InvoicePaymentRecorded => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -934,8 +940,7 @@ mod tests {
             assert!(p.matches("inv_TEST"), "probe must match on {field}");
         }
         // Empty target rejected.
-        let p: MembershipProbe =
-            serde_json::from_str(r#"{"invoice_id":""}"#).unwrap();
+        let p: MembershipProbe = serde_json::from_str(r#"{"invoice_id":""}"#).unwrap();
         assert!(!p.matches(""));
         assert!(!p.matches("inv_TEST"));
     }
@@ -949,7 +954,8 @@ mod tests {
         let manage = b"<ManageInvoiceResponse/>";
         let query = b"<QueryInvoiceDataResponse/>";
         assert!(
-            check_root_element(EventKind::InvoiceSubmissionResponse, "response_xml", manage).is_ok(),
+            check_root_element(EventKind::InvoiceSubmissionResponse, "response_xml", manage)
+                .is_ok(),
             "ManageInvoiceResponse root must be accepted (PR-7-B-3 manageInvoice path)"
         );
         assert!(
@@ -964,12 +970,8 @@ mod tests {
     #[test]
     fn invoice_submission_response_rejects_unrelated_root_element() {
         let other = b"<SomeOtherResponse/>";
-        let err = check_root_element(
-            EventKind::InvoiceSubmissionResponse,
-            "response_xml",
-            other,
-        )
-        .unwrap_err();
+        let err = check_root_element(EventKind::InvoiceSubmissionResponse, "response_xml", other)
+            .unwrap_err();
         assert!(
             err.contains("SomeOtherResponse")
                 && err.contains("ManageInvoiceResponse")

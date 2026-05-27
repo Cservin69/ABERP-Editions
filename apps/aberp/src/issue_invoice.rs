@@ -50,9 +50,10 @@ use std::str::FromStr;
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
 use aberp_billing::{
-    self as billing, huf_equivalent_round_half_even, AllocateArgs, AllocateOutcome, BillingStore,
-    Currency, CustomerId, DraftInvoice, DuckDbBillingStore, Huf, IdempotencyKey, InvoiceId,
-    InvoiceSeries, IssueInvoiceCommand, LineItem, RateMetadata, ResetPolicy, SeriesCode, SeriesId,
+    self as billing, huf_equivalent_round_half_even, AllocateArgs, AllocateOutcome,
+    BankAccountSnapshot, BillingStore, Currency, CustomerId, DraftInvoice, DuckDbBillingStore, Huf,
+    IdempotencyKey, InvoiceId, InvoiceSeries, IssueInvoiceCommand, LineItem, RateMetadata,
+    ResetPolicy, SeriesCode, SeriesId,
 };
 use aberp_mnb_rates::{MnbError, MnbRate, SOURCE as MNB_SOURCE};
 use aberp_nav_transport::NavCredentials;
@@ -286,6 +287,13 @@ pub async fn run_with_provider<P: MnbRatesProvider + ?Sized>(
             args.out.clone(),
             actor,
             provider,
+            // PR-73 — CLI invocation does not exercise the bank picker
+            // (the SPA route is the only surface that resolves the
+            // `bank_account_id`). CLI-issued rows persist NULL across
+            // the five `bank_account_*` invoice columns; the printed
+            // PDF render (PR-D) falls back to the seller.toml
+            // legacy-flat-root bank for those rows.
+            None,
         )
         .await?;
 
@@ -345,6 +353,7 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     nav_xml_out: std::path::PathBuf,
     actor: Actor,
     provider: &P,
+    bank_snapshot: Option<aberp_billing::BankAccountSnapshot>,
 ) -> Result<IssuedInvoiceSummary> {
     if input.lines.is_empty() {
         return Err(anyhow!("input has no lines"));
@@ -372,12 +381,10 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     }
 
     // 2. Resolve tenant id + series code (loud-fail on invalid input).
-    let tenant = TenantId::new(tenant_str.to_string()).ok_or_else(|| {
-        anyhow!("tenant value '{}' is empty or has a null byte", tenant_str)
-    })?;
-    let series_code = SeriesCode::new(series_str.to_string()).ok_or_else(|| {
-        anyhow!("series value '{}' fails SeriesCode validation", series_str)
-    })?;
+    let tenant = TenantId::new(tenant_str.to_string())
+        .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", tenant_str))?;
+    let series_code = SeriesCode::new(series_str.to_string())
+        .ok_or_else(|| anyhow!("series value '{}' fails SeriesCode validation", series_str))?;
 
     // 4. Compute binary hash, then build the audit-ledger metadata once
     //    for the entire process. `LedgerMeta` anchors `time_mono` and is
@@ -393,12 +400,8 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     //     tx opens so the sequence-slot invariant (ADR-0009 §3)
     //     is preserved. The check opens + drops its own Ledger
     //     handle; pre_tx_setup below opens a fresh Connection.
-    let pending_count = submission_queue::count_pending(
-        db,
-        tenant.clone(),
-        binary_hash_bytes,
-    )
-    .context("count pending submissions (ADR-0031 §5 cap check)")?;
+    let pending_count = submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
+        .context("count pending submissions (ADR-0031 §5 cap check)")?;
     if pending_count >= submission_queue::HARD_CAP_PENDING {
         return Err(anyhow!(
             "submission queue is full ({}/{} pending invoices per ADR-0009 §7 / ADR-0031 §5); \
@@ -438,10 +441,7 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     let rate_metadata: Option<RateMetadata> = if matches!(currency, Currency::Huf) {
         None
     } else {
-        Some(
-            fetch_and_stamp_rate(provider, currency, issue_date.date(), &command.lines)
-                .await?,
-        )
+        Some(fetch_and_stamp_rate(provider, currency, issue_date.date(), &command.lines).await?)
     };
 
     let allocate_args = AllocateArgs {
@@ -450,6 +450,9 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         idempotency_key,
         currency,
         rate_metadata: rate_metadata.clone(),
+        // PR-73 / ADR-0040 §addendum — bank snapshot resolved by the
+        // route handler (or `None` for CLI / library callers).
+        bank_snapshot: bank_snapshot.clone(),
     };
 
     // 8. One transaction across the billing writes and audit appends.
@@ -470,6 +473,7 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         nav_xml_out.clone(),
         currency,
         rate_metadata.clone(),
+        bank_snapshot.clone(),
     )?;
 
     let invoice = outcome.invoice;
@@ -647,6 +651,7 @@ struct TxOutcome {
 /// unwinds across this function, the same `drop` runs. Both paths leave
 /// the tenant DB in its pre-call state. Exercised by
 /// `apps/aberp/tests/rollback_conformance.rs`.
+#[allow(clippy::too_many_arguments)]
 fn run_single_tx(
     mut conn: Connection,
     ledger_meta: &LedgerMeta,
@@ -656,6 +661,7 @@ fn run_single_tx(
     nav_xml_path: std::path::PathBuf,
     currency: Currency,
     rate_metadata: Option<RateMetadata>,
+    bank_snapshot: Option<BankAccountSnapshot>,
 ) -> Result<TxOutcome> {
     let tx = conn
         .transaction()
@@ -726,7 +732,12 @@ fn run_single_tx(
                 idempotency_key,
                 nav_xml_path,
             )
-        };
+        }
+        // PR-73 / ADR-0040 §addendum — stamp the bank-account snapshot
+        // (resolved by the route handler or inherited from the base
+        // for chain children). `None` is a no-op so the CLI path
+        // continues to emit a snapshot-free payload.
+        .with_bank_snapshot(bank_snapshot.as_ref());
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,
@@ -878,14 +889,13 @@ fn finalize_rate(rate: &MnbRate, lines: &[LineItem]) -> Result<RateMetadata> {
     // EUR cents, stored in the `Huf` wrapper as an i64; the
     // round-half-even conversion below treats them as cents
     // explicitly. PR-44δ will lift this to a typed-EUR LineItem.
-    let gross_total_minor_units: i64 =
-        lines.iter().try_fold(0i64, |acc, line| -> Result<i64> {
-            let line_gross = line
-                .gross_total()
-                .ok_or_else(|| anyhow!("line gross total overflowed i64"))?;
-            acc.checked_add(line_gross.as_i64())
-                .ok_or_else(|| anyhow!("invoice gross total overflowed i64"))
-        })?;
+    let gross_total_minor_units: i64 = lines.iter().try_fold(0i64, |acc, line| -> Result<i64> {
+        let line_gross = line
+            .gross_total()
+            .ok_or_else(|| anyhow!("line gross total overflowed i64"))?;
+        acc.checked_add(line_gross.as_i64())
+            .ok_or_else(|| anyhow!("invoice gross total overflowed i64"))
+    })?;
 
     let huf_equivalent_total =
         huf_equivalent_round_half_even(gross_total_minor_units, &rate_decimal).ok_or_else(

@@ -200,7 +200,8 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
              annulled separately and the operator wants to terminate the local chain now), \
              re-run with --force-despite-nav-exists — the resulting audit entry's reason \
              field will carry a [forced-despite-nav-side-exists] marker.",
-            args.invoice_id, args.invoice_id,
+            args.invoice_id,
+            args.invoice_id,
         ));
     }
     let forced_marker_active = nav_side_exists && args.force_despite_nav_exists;
@@ -307,10 +308,7 @@ pub fn run(args: &MarkAbandonedArgs) -> Result<()> {
                  NOTE the prior Attempt's submission may or may not have reached NAV \
                  (Layer-2 queryInvoiceCheck per ADR-0009 §5 / ADR-0032 §\"Open questions\" F44 \
                  is named-deferred — until it lands, the NAV-side fate is unknown)",
-                stage_label,
-                invoice_id_str,
-                invoice_seq,
-                verified,
+                stage_label, invoice_id_str, invoice_seq, verified,
             );
         }
     }
