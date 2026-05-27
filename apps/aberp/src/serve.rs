@@ -71,7 +71,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aberp_audit_ledger::{Actor, Entry, EventKind, Ledger, TenantId};
-use aberp_billing::{self as billing, Currency, ReadyInvoice};
+use aberp_billing::{self as billing, BillingStore, Currency, DuckDbBillingStore, ReadyInvoice};
 use aberp_nav_transport::{
     operations::TechnicalValidation, NavCredentials, NavEndpoint, NavTransportError,
 };
@@ -90,29 +90,33 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
-use crate::audit_payloads;
+use crate::audit_payloads::{self, PaymentMethod};
+use crate::audit_query::PaymentRecord;
 use crate::binary_hash::BinaryHashHandle;
 use crate::cli::ServeArgs;
+use crate::invoice_bank_snapshot::load_invoice_bank_snapshot_in_tx;
 use crate::invoice_currency_metadata::{
     load_invoice_currency_metadata_in_tx, InvoiceCurrencyMetadata,
 };
 use crate::issue_invoice::{self, InvoiceInputJson};
 use crate::issue_modification;
+use crate::issue_preflight::{
+    validate_invoice_preflight, InvoicePreflightError, ERR_INVOICE_PREFLIGHT_FAILED,
+};
 use crate::issue_storno;
+use crate::mark_invoice_paid::{self, MarkPaidError, MarkPaidInput};
 use crate::mnb_rates_provider::{LiveMnbRatesProvider, MnbRatesProvider};
-use async_trait::async_trait;
 use crate::nav_xml::{self, SupplierConfigError, SupplierInfo};
 use crate::partners::{self, Partner, PartnerInputs, ValidationError as PartnerValidationError};
 use crate::poll_ack;
 use crate::print_invoice;
-use crate::setup_nav_credentials::{
-    self, NavCredentialInputs, SetupCredentialsError,
-};
+use crate::seller_banks::{self, SellerBankEntry, SellerBanks, SellerBanksError};
+use crate::setup_nav_credentials::{self, NavCredentialInputs, SetupCredentialsError};
 use crate::setup_seller_info::{
-    self, FieldError as SellerFieldError, SellerIdentity, SellerInfoInputs,
-    SetupSellerInfoError,
+    self, FieldError as SellerFieldError, SellerIdentity, SellerInfoInputs, SetupSellerInfoError,
 };
 use crate::submit_invoice;
+use async_trait::async_trait;
 
 /// Default keychain service-name prefix for the session token (one per
 /// tenant). The matching account-name is `session_token`. The Tauri
@@ -247,10 +251,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 // INSTEAD OF letting the operator hit the route
                 // surface and get a typed `missing_seller_config` 400
                 // hours later.
-                derive_initial_boot_state_with_seller_check(
-                    creds.login().to_string(),
-                    &args.tenant,
-                )
+                derive_initial_boot_state_with_seller_check(creds.login().to_string(), &args.tenant)
             }
             Err(NavTransportError::KeychainItemMissing { item, .. }) => {
                 tracing::warn!(
@@ -261,12 +262,40 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 ServeBootState::NeedsSetup
             }
             Err(other) => {
-                return Err(anyhow!(other).context(
-                    "load NAV credentials from OS keychain for actor derivation",
-                ));
+                return Err(anyhow!(other)
+                    .context("load NAV credentials from OS keychain for actor derivation"));
             }
         }
     };
+
+    // PR-73a / hotfix — run the idempotent billing schema migrations
+    // at boot so an existing pre-PR-73 tenant DB picks up the five
+    // `bank_account_*` columns on `invoice` before the first
+    // `list_invoices` request runs `load_invoice_bank_snapshot_in_tx`.
+    // Pre-PR-73a the migration only ran lazily inside the issue path's
+    // `pre_tx_setup` (issue_invoice / issue_storno / issue_modification);
+    // a read-only operator who opened the SPA without issuing first hit
+    // a 500 from the bank-snapshot SELECT against the un-migrated
+    // schema. `ADD COLUMN IF NOT EXISTS` is idempotent so re-running on
+    // every boot costs nothing on already-migrated DBs.
+    tracing::info!("boot step: ensuring billing schema (idempotent migrations)");
+    {
+        let _s = tracing::info_span!("serve.ensure_billing_schema").entered();
+        if let Some(parent) = args.db.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create parent directory {} for tenant DuckDB",
+                    parent.display()
+                )
+            })?;
+        }
+        let mut billing_store = DuckDbBillingStore::open(&args.db).with_context(|| {
+            format!("open billing DuckDB at {} for boot migration", args.db.display())
+        })?;
+        billing_store
+            .ensure_schema()
+            .context("ensure billing schema at serve boot")?;
+    }
 
     // 2. Resolve / generate the loopback cert + key.
     tracing::info!("boot step: preparing serve-artifacts directory");
@@ -349,8 +378,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         })?;
     let listener = {
         let _s = tracing::info_span!("serve.tcp_bind").entered();
-        TcpListener::bind(bind_addr)
-            .with_context(|| format!("bind TCP listener at {bind_addr}"))?
+        TcpListener::bind(bind_addr).with_context(|| format!("bind TCP listener at {bind_addr}"))?
     };
     let resolved_addr = listener
         .local_addr()
@@ -758,6 +786,14 @@ fn build_router(state: AppState) -> Router {
             "/api/invoices/:id/issuance-input",
             get(handle_get_issuance_input),
         )
+        // PR-70 / ADR-0039 — operational "quick mark as paid" route.
+        // Records a payment receipt against a Finalized invoice
+        // WITHOUT changing the NAV regulatory state ladder
+        // (paid-vs-unpaid is operational metadata, queried separately).
+        .route(
+            "/api/invoices/:id/mark-paid",
+            post(handle_mark_invoice_paid),
+        )
         .route("/audit/:invoice_id", get(handle_get_audit))
         // PR-46α / session-62 — first-run setup route. Accepts the
         // four NAV credential artifacts and writes them to the OS
@@ -781,10 +817,7 @@ fn build_router(state: AppState) -> Router {
         // `Ready` the route requires the standard Bearer-auth
         // header (so an operator can re-run the wizard from the
         // settings screen without losing auth).
-        .route(
-            "/api/setup-seller-info",
-            post(handle_setup_seller_info),
-        )
+        .route("/api/setup-seller-info", post(handle_setup_seller_info))
         // PR-53 / session-73 — read-side counterparts of the two setup
         // routes, plus the single-slot rotate route. All three are
         // Ready-only + bearer-required (rotation happens after the
@@ -811,6 +844,26 @@ fn build_router(state: AppState) -> Router {
             get(handle_get_partner)
                 .put(handle_update_partner)
                 .delete(handle_delete_partner),
+        )
+        // PR-72 / session-94 — multi-bank-account CRUD (PR-B of the
+        // multi-bank initiative; ADR-0040 §addendum). Five routes
+        // (list + create on the collection; update + delete + flip-
+        // default on the resource), all require_ready + bearer auth —
+        // bank-accounts is a Ready-state feature; first-run setup goes
+        // through SellerConfigWizard. The set-default flip is its own
+        // route to keep the mental model crisp (mutating the default
+        // is a separate intent from editing the entry's fields).
+        .route(
+            "/api/seller/banks",
+            get(handle_list_seller_banks).post(handle_create_seller_bank),
+        )
+        .route(
+            "/api/seller/banks/:id",
+            axum::routing::put(handle_update_seller_bank).delete(handle_delete_seller_bank),
+        )
+        .route(
+            "/api/seller/banks/:id/set-default",
+            post(handle_set_default_seller_bank),
         )
         .with_state(state)
 }
@@ -949,15 +1002,14 @@ async fn handle_setup_nav_credentials(
     };
 
     match setup_nav_credentials_request(&state, &inputs) {
-        Ok(next_state_token) => {
-            Json(SetupNavCredentialsResponse { state: next_state_token }).into_response()
-        }
+        Ok(next_state_token) => Json(SetupNavCredentialsResponse {
+            state: next_state_token,
+        })
+        .into_response(),
         Err(SetupRouteHelperError::Validation(msg)) => {
             (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response()
         }
-        Err(SetupRouteHelperError::Other(e)) => {
-            internal_error("setup_nav_credentials_request", e)
-        }
+        Err(SetupRouteHelperError::Other(e)) => internal_error("setup_nav_credentials_request", e),
     }
 }
 
@@ -1032,10 +1084,8 @@ pub fn setup_nav_credentials_request(
     // missing the wizard chain continues with the seller-config step;
     // the SPA's next `getBootStatus` poll picks up
     // `needs-seller-config` and dispatches `SellerConfigWizard`.
-    let next_state = derive_initial_boot_state_with_seller_check(
-        operator_login,
-        state.tenant.as_str(),
-    );
+    let next_state =
+        derive_initial_boot_state_with_seller_check(operator_login, state.tenant.as_str());
     let next_token = next_state.state_token();
     let mut guard = state.boot_state.write().map_err(|e| {
         SetupRouteHelperError::Other(anyhow!(
@@ -1184,9 +1234,7 @@ async fn handle_setup_seller_info(
             };
             (StatusCode::BAD_REQUEST, Json(body)).into_response()
         }
-        Err(SetupSellerRouteError::Other(e)) => {
-            internal_error("setup_seller_info_request", e)
-        }
+        Err(SetupSellerRouteError::Other(e)) => internal_error("setup_seller_info_request", e),
     }
 }
 
@@ -1320,10 +1368,7 @@ pub struct SellerInfoBank {
 ///     should have caught this — the route surfaces a loud-fail
 ///     message rather than synthesising defaults).
 ///   - `500` on filesystem read errors.
-async fn handle_get_seller_info(
-    headers: HeaderMap,
-    State(state): State<AppState>,
-) -> Response {
+async fn handle_get_seller_info(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(resp) = require_ready(&state) {
         return resp;
     }
@@ -1333,11 +1378,10 @@ async fn handle_get_seller_info(
     match seller_info_request(&state) {
         Ok(Some(body)) => Json(body).into_response(),
         Ok(None) => {
-            let path =
-                match setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str()) {
-                    Ok(p) => p,
-                    Err(e) => return internal_error("seller_toml_path_for_tenant", e),
-                };
+            let path = match setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str()) {
+                Ok(p) => p,
+                Err(e) => return internal_error("seller_toml_path_for_tenant", e),
+            };
             (
                 StatusCode::NOT_FOUND,
                 Json(error_body(format!(
@@ -1370,9 +1414,7 @@ pub fn seller_info_request(state: &AppState) -> Result<Option<SellerInfoResponse
 /// PR-53 / session-73 — path-explicit sibling of
 /// [`seller_info_request`] for the integration tests (HOME-mutation-
 /// free per the session-58 path-override pattern).
-pub fn seller_info_request_from_path(
-    path: &std::path::Path,
-) -> Result<Option<SellerInfoResponse>> {
+pub fn seller_info_request_from_path(path: &std::path::Path) -> Result<Option<SellerInfoResponse>> {
     let identity = match setup_seller_info::read_seller_identity(path)? {
         Some(id) => id,
         None => return Ok(None),
@@ -1631,9 +1673,9 @@ pub fn rotate_nav_credential_request(
         tenant, login, password, sign_key, change_key,
     )
     .map_err(|e| {
-        RotateNavCredentialError::Backend(anyhow!(e).context(
-            "write NAV credentials blob to OS keychain during rotation",
-        ))
+        RotateNavCredentialError::Backend(
+            anyhow!(e).context("write NAV credentials blob to OS keychain during rotation"),
+        )
     })?;
 
     // If the rotated slot is the login, refresh the cached operator_login
@@ -1670,9 +1712,7 @@ pub fn rotate_nav_credential_request(
 /// fires only on a corrupted keychain backend that returned non-UTF-8
 /// bytes for one of the three retained fields. Loud per CLAUDE.md
 /// rule 12.
-fn utf8_err(
-    field: &'static str,
-) -> impl Fn(std::str::Utf8Error) -> RotateNavCredentialError {
+fn utf8_err(field: &'static str) -> impl Fn(std::str::Utf8Error) -> RotateNavCredentialError {
     move |e| {
         RotateNavCredentialError::Backend(anyhow!(
             "NAV credentials blob field `{field}` is not valid UTF-8 \
@@ -1799,6 +1839,75 @@ struct InvoiceListItem {
     /// serde shape — `"HUF"` or `"EUR"` — pinned by
     /// `invoice_list_item_emits_currency`.
     currency: Currency,
+    /// PR-65 / session-86 — buyer label for the SPA's list-row
+    /// "Partner" column (Tier-1 UX lift). Best-effort read of the
+    /// PR-47α / A174 side-stored `<ULID>.input.json`'s
+    /// `customer.name` field; `None` when the side-store is missing
+    /// (CLI-issued invoices, pre-PR-47α SPA-issued invoices, or any
+    /// I/O failure) so the SPA can render an em-dash placeholder
+    /// rather than fabricate a label.
+    ///
+    /// A185 — single-name surface, not the brief's display/legal
+    /// dual. Rationale: the side-store snapshot only carries one
+    /// name field (`CustomerJson.name`), and per
+    /// `partners::buyerFieldsFromPartner` the typeahead writes
+    /// `partner.legal_name` into that slot at issuance time. The
+    /// dual-name shape the brief opened with would require either a
+    /// schema migration (add `partner_id` FK + JOIN at query time)
+    /// OR a wire-shape extension to `CustomerJson` — both larger
+    /// blast radius than the read-side snapshot consumption this
+    /// field implements. The single `buyer_name` surface IS the
+    /// regulatory legal name for partner-selected buyers and IS
+    /// whatever the operator typed for one-off entries. Pinned by
+    /// `invoice_list_item_emits_buyer_name` +
+    /// `read_buyer_name_from_side_store_round_trip`.
+    buyer_name: Option<String>,
+    /// PR-70 / ADR-0039 §2 — operational payment-receipt summary
+    /// for the SPA's "Paid" chip + quick-action gating. `Some` iff
+    /// at least one `InvoicePaymentRecorded` audit entry exists for
+    /// this invoice; `None` for unpaid invoices (the SPA renders no
+    /// chip + shows the "💰 Pay" quick action on the row). The wire
+    /// shape mirrors [`PaymentRecordSummary`] so a single TS
+    /// interface drives both list-row and detail-modal rendering.
+    /// Paid-vs-unpaid is operational metadata, NOT a regulatory
+    /// state — the `state` field above continues to render the NAV
+    /// ladder verbatim; the badge sits next to it.
+    payment: Option<PaymentRecordSummary>,
+    /// PR-73 / ADR-0040 §addendum — denormalized bank-account snapshot
+    /// surfaced on the list row. `Some(_)` for SPA-issued invoices
+    /// post-PR-73; `None` for pre-PR-73 invoices AND CLI-issued
+    /// invoices (which never wrote the snapshot quintet). The SPA
+    /// list view does NOT render the bank account on a list row
+    /// (the "Pay to" surface lives on the detail modal), but the
+    /// field rides on the same shape as the detail response so a
+    /// single TS interface drives both surfaces.
+    bank_account: Option<BankAccountSnapshotResponse>,
+}
+
+/// PR-73 / ADR-0040 §addendum — wire-shape mirror of the typed
+/// `BankAccountSnapshot` from the billing crate. Mirrors the shape
+/// of `SellerBankResponse` (PR-72) minus the `is_default` flag —
+/// per-invoice snapshots are immutable post-issuance and have no
+/// default-flag semantics.
+#[derive(Debug, Serialize, Clone)]
+struct BankAccountSnapshotResponse {
+    id: String,
+    currency: String,
+    account_number: String,
+    bank_name: String,
+    swift_bic: String,
+}
+
+impl BankAccountSnapshotResponse {
+    fn from_typed(snapshot: aberp_billing::BankAccountSnapshot) -> Self {
+        Self {
+            id: snapshot.id,
+            currency: snapshot.currency,
+            account_number: snapshot.account_number,
+            bank_name: snapshot.bank_name,
+            swift_bic: snapshot.swift_bic,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1868,6 +1977,20 @@ struct InvoiceDetailResponse {
     /// Currency::Huf`. Pinned by
     /// `invoice_detail_emits_currency_and_rate_metadata`.
     huf_equivalent_total: Option<i64>,
+    /// PR-70 / ADR-0039 §2 — operational payment summary mirror of
+    /// [`InvoiceListItem::payment`]. Same wire shape on both list
+    /// and detail surfaces so one TS interface drives the SPA's
+    /// chip rendering. `Some` iff at least one
+    /// `InvoicePaymentRecorded` audit entry exists for this invoice.
+    payment: Option<PaymentRecordSummary>,
+    /// PR-73 / ADR-0040 §addendum — denormalized bank-account snapshot
+    /// surfaced on the detail wire shape so the `InvoiceDetail.svelte`
+    /// "Pay to" sub-section renders the bank account the invoice was
+    /// issued with. `Some(_)` for SPA-issued invoices post-PR-73;
+    /// `None` for pre-PR-73 invoices and CLI-issued rows. Operator-
+    /// facing surface only; the renderer falls back to "(no bank
+    /// account on file)" on `null`.
+    bank_account: Option<BankAccountSnapshotResponse>,
 }
 
 /// PR-32 / session-36 — chain-children list entry. One per storno /
@@ -2101,7 +2224,10 @@ async fn handle_get_invoice_pdf(
             let disposition = format!("attachment; filename=\"{filename}\"");
             (
                 [
-                    (axum::http::header::CONTENT_TYPE, "application/pdf".to_string()),
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        "application/pdf".to_string(),
+                    ),
                     (axum::http::header::CONTENT_DISPOSITION, disposition),
                 ],
                 rendered.pdf_bytes,
@@ -2201,6 +2327,14 @@ pub struct IssueInvoiceRequest {
     pub currency: Currency,
     #[serde(default)]
     pub series: Option<String>,
+    /// PR-73 / ADR-0040 §addendum — operator-selected bank account
+    /// id (the `bnk_<26-char>` deterministic value from
+    /// `aberp::seller_banks`). `None` (or absent on the wire) → the
+    /// resolver falls back to `default_bank_for(invoice.currency)`;
+    /// `Some(id)` → looked up by id with a currency-match check. See
+    /// `resolve_bank_snapshot` below for the typed loud-fail surface.
+    #[serde(default, rename = "bankAccountId")]
+    pub bank_account_id: Option<String>,
 }
 
 /// Response body for `POST /invoices/issue`. The SPA reads
@@ -2260,6 +2394,56 @@ struct TypedErrorBody {
 /// — a regression that drifts one without the other surfaces at
 /// `issue-invoice.test.ts`'s pin per CLAUDE.md rule 12.
 const ERR_MISSING_SELLER_CONFIG: &str = "missing_seller_config";
+
+/// PR-69 / session-91 — typed `400 Bad Request` body for the
+/// pre-issuance preflight validator (ADR-0038). Sibling of
+/// [`TypedErrorBody`] with an `errors` array instead of a single
+/// message — the operator sees every problem at once instead of
+/// one-per-resubmit.
+///
+/// Wire shape:
+///
+/// ```json
+/// {
+///   "error": "invoice_preflight_failed",
+///   "errors": [
+///     {
+///       "kind": "CustomerTaxNumberMalformed",
+///       "field_path": "customer.taxNumber",
+///       "message_hu": "Az ügyfél adószáma (`1234`) hibás formátum …",
+///       "message_en": "Customer ADÓSZÁM `1234` is not a valid Hungarian …"
+///     }
+///   ]
+/// }
+/// ```
+///
+/// The SPA's `parseInvoicePreflightErrors` discriminates on the outer
+/// `error` field and routes each inner error to the matching input by
+/// `field_path`.
+#[derive(Serialize)]
+struct PreflightErrorBody {
+    error: &'static str,
+    errors: Vec<PreflightErrorItem>,
+}
+
+#[derive(Serialize)]
+struct PreflightErrorItem {
+    kind: &'static str,
+    field_path: String,
+    message_hu: String,
+    message_en: String,
+}
+
+impl PreflightErrorItem {
+    fn from_preflight_error(e: &InvoicePreflightError) -> Self {
+        PreflightErrorItem {
+            kind: e.kind(),
+            field_path: e.field_path(),
+            message_hu: e.message_hu(),
+            message_en: e.message_en(),
+        }
+    }
+}
 
 /// PR-50 / session-70 — build the per-tenant `seller.toml` path the
 /// operator should populate when the SetupWizard (PR-51) lands.
@@ -2357,6 +2541,104 @@ fn seller_toml_sample_path() -> String {
     }
 }
 
+/// PR-73 / ADR-0040 §addendum — outcome of the bank-account resolver.
+/// Either a typed snapshot for the issuance path to thread, or one
+/// of three loud-fail classes the route layer maps to its respective
+/// HTTP status:
+///
+/// - [`Self::Preflight`] → 400 with the `invoice_preflight_failed`
+///   typed body (`SellerBankMissingForCurrency` /
+///   `SellerBankCurrencyMismatch`). Operator-correctable.
+/// - [`Self::NotFound`] → 404. The selected `bank_account_id` does
+///   not exist in the current `seller.toml`. Defence in depth — the
+///   SPA's dropdown is populated from the same endpoint
+///   (`GET /api/seller/banks`) so this surface should not fire under
+///   correct SPA operation; a stale operator click or a curl bypass
+///   surfaces here.
+/// - [`Self::Other`] → 500 (delegated to `internal_error`). I/O,
+///   parser, or unexpected error reading `seller.toml`.
+enum BankResolveOutcome {
+    Snapshot(aberp_billing::BankAccountSnapshot),
+    Preflight(InvoicePreflightError),
+    NotFound,
+    Other(anyhow::Error),
+}
+
+/// PR-73 / ADR-0040 §addendum — resolve the operator's bank-account
+/// selection (or the per-currency default) into a typed
+/// [`aberp_billing::BankAccountSnapshot`] suitable for stamping onto
+/// the issued invoice row.
+///
+/// Resolution rules (per the session-95 brief):
+///
+/// 1. `bank_account_id == None` (or empty) → look up
+///    `default_bank_for(currency)`. Missing →
+///    `SellerBankMissingForCurrency` preflight.
+/// 2. `bank_account_id == Some(id)` → look up by id.
+///    - Missing → `NotFound` (404).
+///    - Currency mismatch → `SellerBankCurrencyMismatch` preflight.
+///    - Match → `Snapshot(BankAccountSnapshot { ... })`.
+///
+/// Reads `seller.toml` via [`seller_banks::read_seller_banks`]; any
+/// I/O / parse failure becomes `Other(anyhow::Error)` so the route
+/// layer surfaces it as 500.
+fn resolve_bank_snapshot(tenant: &str, request: &IssueInvoiceRequest) -> BankResolveOutcome {
+    let path = match setup_seller_info::seller_toml_path_for_tenant(tenant) {
+        Ok(p) => p,
+        Err(e) => return BankResolveOutcome::Other(e),
+    };
+    let banks = match seller_banks::read_seller_banks(&path) {
+        Ok(b) => b,
+        Err(SellerBanksError::Io(e)) => {
+            return BankResolveOutcome::Other(anyhow!("read seller.toml: {e}"))
+        }
+        Err(e) => return BankResolveOutcome::Other(anyhow!("{e}")),
+    };
+
+    let entry = match request.bank_account_id.as_deref().map(str::trim) {
+        None | Some("") => match banks.default_bank_for(request.currency) {
+            Some(e) => e,
+            None => {
+                return BankResolveOutcome::Preflight(
+                    InvoicePreflightError::SellerBankMissingForCurrency {
+                        currency: request.currency,
+                    },
+                )
+            }
+        },
+        Some(id) => match banks.bank_by_id(id) {
+            None => return BankResolveOutcome::NotFound,
+            Some(e) if e.currency != request.currency => {
+                return BankResolveOutcome::Preflight(
+                    InvoicePreflightError::SellerBankCurrencyMismatch {
+                        selected_id: e.id.clone(),
+                        selected_currency: e.currency,
+                        invoice_currency: request.currency,
+                    },
+                )
+            }
+            Some(e) => e,
+        },
+    };
+
+    BankResolveOutcome::Snapshot(bank_snapshot_from_entry(entry))
+}
+
+/// PR-73 / ADR-0040 §addendum — convert a `SellerBankEntry` (the
+/// in-memory read-side type from `seller_banks.rs`) into the typed
+/// `BankAccountSnapshot` (the billing-crate denormalized stamp).
+/// Mirror of `SellerBankResponse` from PR-72 with the snapshot fields
+/// — same name set, narrower domain.
+fn bank_snapshot_from_entry(entry: &SellerBankEntry) -> aberp_billing::BankAccountSnapshot {
+    aberp_billing::BankAccountSnapshot {
+        id: entry.id.clone(),
+        currency: entry.currency.iso_code().to_string(),
+        account_number: entry.account_number.clone(),
+        bank_name: entry.bank_name.clone(),
+        swift_bic: entry.swift_bic.clone(),
+    }
+}
+
 /// PR-44ζ / session-59 — `POST /invoices/issue` route handler. The
 /// SPA's "New Invoice" form posts here; the handler:
 ///
@@ -2389,9 +2671,32 @@ async fn handle_issue_invoice(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
+    // PR-69 / session-91 — pre-issuance preflight validator (ADR-0038)
+    // runs FIRST so operator-correctable per-invoice errors (empty
+    // customer name, malformed ADÓSZÁM, off-vocab VAT rate, …)
+    // surface as a typed 400 the SPA renders inline per field, BEFORE
+    // the legacy string-shape gate / the seller.toml read / the
+    // issuance pipeline. Nothing downstream runs if preflight rejects;
+    // no DB write, no audit entry, no NAV XML render.
+    let preflight = validate_invoice_preflight(&request);
+    if !preflight.is_empty() {
+        let body = PreflightErrorBody {
+            error: ERR_INVOICE_PREFLIGHT_FAILED,
+            errors: preflight
+                .iter()
+                .map(PreflightErrorItem::from_preflight_error)
+                .collect(),
+        };
+        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    }
     // Pre-issuance validation. Loud-fail per CLAUDE.md rule 12 with a
     // 400 + a typed error body so the SPA's inline-error surface can
     // distinguish operator-correctable input from server-side faults.
+    //
+    // PR-69 retains this defence-in-depth surface (ADR-0038
+    // §"Adversarial review" #3) — the preflight strictly covers it,
+    // but a future drift on the preflight surface would still fail
+    // loud here rather than reaching the issuance pipeline.
     match validate_issue_request(&request) {
         Ok(()) => {}
         Err(IssueRequestValidationError::Plain(msg)) => {
@@ -2417,6 +2722,40 @@ async fn handle_issue_invoice(
         }
     };
 
+    // PR-73 / ADR-0040 §addendum — resolve the operator's bank-account
+    // selection (or the per-currency default) BEFORE the issuance
+    // pipeline. Three loud-fail surfaces:
+    //   - Preflight (typed 400 `invoice_preflight_failed`): the same
+    //     wire body PR-69 emits for the per-field preflight errors,
+    //     so the SPA's inline-error renderer surfaces the bank-picker
+    //     dropdown errors at the same `bankAccountId` field path.
+    //   - NotFound (404): the operator passed an id that does not
+    //     exist in the current `seller.toml`. Defence in depth — the
+    //     SPA's dropdown is populated from `GET /api/seller/banks`,
+    //     so this surface fires only on stale clicks or curl bypass.
+    //   - Other (500): I/O or parse error reading `seller.toml`.
+    let bank_snapshot = match resolve_bank_snapshot(state.tenant.as_str(), &request) {
+        BankResolveOutcome::Snapshot(s) => s,
+        BankResolveOutcome::Preflight(err) => {
+            let body = PreflightErrorBody {
+                error: ERR_INVOICE_PREFLIGHT_FAILED,
+                errors: vec![PreflightErrorItem::from_preflight_error(&err)],
+            };
+            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+        }
+        BankResolveOutcome::NotFound => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(error_body(format!(
+                    "bank_account_id `{}` not found in seller.toml",
+                    request.bank_account_id.as_deref().unwrap_or("(none)")
+                ))),
+            )
+                .into_response();
+        }
+        BankResolveOutcome::Other(e) => return internal_error("resolve_bank_snapshot", e),
+    };
+
     let provider = match build_live_provider_for_currency(request.currency) {
         Ok(p) => p,
         Err(e) => return internal_error("build_live_provider", e),
@@ -2424,7 +2763,16 @@ async fn handle_issue_invoice(
 
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
 
-    match issue_invoice_request(&state, request, supplier, provider.as_ref(), actor).await {
+    match issue_invoice_request(
+        &state,
+        request,
+        supplier,
+        provider.as_ref(),
+        actor,
+        Some(bank_snapshot),
+    )
+    .await
+    {
         Ok(summary) => Json(IssueInvoiceResponse {
             invoice_id: summary.invoice_id,
             invoice_number: summary.invoice_number,
@@ -2502,15 +2850,12 @@ enum IssueRequestValidationError {
 /// per-instance tokio runtime; the issuance pipeline is now async-
 /// native and `.await`s the underlying `MnbClient::fetch_official_rate`
 /// directly on the runtime owned by axum's request executor.
-fn build_live_provider_for_currency(
-    currency: Currency,
-) -> Result<Box<dyn MnbRatesProvider>> {
+fn build_live_provider_for_currency(currency: Currency) -> Result<Box<dyn MnbRatesProvider>> {
     match currency {
         Currency::Huf => Ok(Box::new(NeverProvider)),
-        _ => Ok(Box::new(
-            LiveMnbRatesProvider::new()
-                .context("build MNB rates provider for non-HUF issuance via serve route")?,
-        )),
+        _ => Ok(Box::new(LiveMnbRatesProvider::new().context(
+            "build MNB rates provider for non-HUF issuance via serve route",
+        )?)),
     }
 }
 
@@ -2548,6 +2893,13 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
     supplier: issue_invoice::SupplierJson,
     provider: &P,
     actor: Actor,
+    // PR-73 / ADR-0040 §addendum — typed bank-account snapshot
+    // already resolved by the route handler via
+    // `resolve_bank_snapshot` (or `None` from the integration test
+    // path / future library callers that do not exercise the bank
+    // picker). Threaded down into `issue_from_parsed` so the five
+    // `bank_account_*` invoice columns are populated at INSERT time.
+    bank_snapshot: Option<aberp_billing::BankAccountSnapshot>,
 ) -> Result<issue_invoice::IssuedInvoiceSummary> {
     let xml_path = mint_issued_xml_path(state.tenant.as_str())
         .context("mint server-side NAV-XML output path for issuance")?;
@@ -2578,10 +2930,7 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
             input_json_path.display()
         )
     })?;
-    let series = request
-        .series
-        .as_deref()
-        .unwrap_or(DEFAULT_SERIES_CODE);
+    let series = request.series.as_deref().unwrap_or(DEFAULT_SERIES_CODE);
     issue_invoice::issue_from_parsed(
         input,
         &state.db_path,
@@ -2591,6 +2940,13 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         xml_path,
         actor,
         provider,
+        // PR-73 / ADR-0040 §addendum — the route handler resolved the
+        // operator's `bank_account_id` (or per-currency default) via
+        // `resolve_bank_snapshot` BEFORE invoking this helper and
+        // passed the typed snapshot here. Persisted by `allocate_in_tx`
+        // to the five `bank_account_*` invoice columns; surfaced on
+        // the list + detail wire shape via `load_invoice_bank_snapshot_in_tx`.
+        bank_snapshot,
     )
     .await
 }
@@ -2634,9 +2990,8 @@ pub fn sibling_input_json_path(xml_path: &std::path::Path) -> std::path::PathBuf
 /// next to the keychain material" posture from PR-9-1.
 fn mint_issued_xml_path(tenant: &str) -> Result<std::path::PathBuf> {
     let dir = serve_artifacts_dir(tenant)?.join("issued");
-    std::fs::create_dir_all(&dir).with_context(|| {
-        format!("create issued-XML directory at {}", dir.display())
-    })?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create issued-XML directory at {}", dir.display()))?;
     Ok(dir.join(format!("{}.xml", Ulid::new())))
 }
 
@@ -2722,18 +3077,19 @@ async fn handle_submit_invoice(
             entries_verified: outcome.entries_verified,
         })
         .into_response(),
-        Err(SubmitRouteError::PreconditionMismatch { current_state, message }) => (
+        Err(SubmitRouteError::PreconditionMismatch {
+            current_state,
+            message,
+        }) => (
             StatusCode::CONFLICT,
             Json(error_body(format!(
                 "{message} (current state: {current_state})"
             ))),
         )
             .into_response(),
-        Err(SubmitRouteError::NotFound(message)) => (
-            StatusCode::NOT_FOUND,
-            Json(error_body(message)),
-        )
-            .into_response(),
+        Err(SubmitRouteError::NotFound(message)) => {
+            (StatusCode::NOT_FOUND, Json(error_body(message))).into_response()
+        }
         Err(SubmitRouteError::NavUpstreamFault {
             status,
             fault_code,
@@ -2784,18 +3140,19 @@ async fn handle_poll_ack(
             entries_verified: outcome.entries_verified,
         })
         .into_response(),
-        Err(SubmitRouteError::PreconditionMismatch { current_state, message }) => (
+        Err(SubmitRouteError::PreconditionMismatch {
+            current_state,
+            message,
+        }) => (
             StatusCode::CONFLICT,
             Json(error_body(format!(
                 "{message} (current state: {current_state})"
             ))),
         )
             .into_response(),
-        Err(SubmitRouteError::NotFound(message)) => (
-            StatusCode::NOT_FOUND,
-            Json(error_body(message)),
-        )
-            .into_response(),
+        Err(SubmitRouteError::NotFound(message)) => {
+            (StatusCode::NOT_FOUND, Json(error_body(message))).into_response()
+        }
         // PR-58 / session-78 — poll_ack does not currently produce a
         // NavUpstreamFault (it runs after tokenExchange already
         // succeeded for the prior submit), but the variant is on the
@@ -2912,24 +3269,21 @@ pub async fn submit_invoice_request(
 
     // 2. Resolve nav_xml_path from the most-recent
     //    InvoiceDraftCreated entry per ADR-0031 §2.
-    let nav_xml_path = derived
-        .nav_xml_path
-        .ok_or_else(|| {
-            SubmitRouteError::Other(anyhow!(
-                "invoice {invoice_id} is Ready but no `nav_xml_path` recorded on the \
+    let nav_xml_path = derived.nav_xml_path.ok_or_else(|| {
+        SubmitRouteError::Other(anyhow!(
+            "invoice {invoice_id} is Ready but no `nav_xml_path` recorded on the \
                  InvoiceDraftCreated audit entry — pre-PR-18 entry; \
                  fall back to `aberp submit-invoice --invoice-xml <path>`"
-            ))
-        })?;
+        ))
+    })?;
 
     // 3. Read the on-disk XML.
-    let invoice_xml = std::fs::read(&nav_xml_path)
-        .with_context(|| {
-            format!(
-                "read NAV InvoiceData XML from {} (server-resolved from audit ledger)",
-                nav_xml_path.display()
-            )
-        })?;
+    let invoice_xml = std::fs::read(&nav_xml_path).with_context(|| {
+        format!(
+            "read NAV InvoiceData XML from {} (server-resolved from audit ledger)",
+            nav_xml_path.display()
+        )
+    })?;
     if invoice_xml.is_empty() {
         return Err(SubmitRouteError::Other(anyhow!(
             "NAV InvoiceData XML at {} is empty",
@@ -2943,8 +3297,8 @@ pub async fn submit_invoice_request(
     // 5. Load NAV credentials fresh per request (per A159 — secrets
     //    are not stashed on AppState; only the non-secret
     //    `operator_login` is).
-    let credentials = NavCredentials::load_from_keychain(state.tenant.as_str())
-        .with_context(|| {
+    let credentials =
+        NavCredentials::load_from_keychain(state.tenant.as_str()).with_context(|| {
             format!(
                 "load NAV credentials from OS keychain for tenant `{}` \
                  (run `aberp setup-nav-credentials` if missing)",
@@ -2973,9 +3327,7 @@ pub async fn submit_invoice_request(
     .await
     .map_err(|e| match e {
         submit_invoice::SubmitFromInputsError::WireFailed { error_message, .. } => {
-            SubmitRouteError::Other(anyhow!(
-                "manageInvoice wire send failed: {error_message}"
-            ))
+            SubmitRouteError::Other(anyhow!("manageInvoice wire send failed: {error_message}"))
         }
         // PR-58 / session-78 — propagate the typed NAV-upstream fault
         // verbatim through the route surface so the SPA receives the
@@ -3065,8 +3417,8 @@ pub async fn poll_ack_request(
     let tax_number_8 = parse_supplier_tax_number_from_xml(&invoice_xml)?;
 
     // 3. Load NAV credentials fresh per request.
-    let credentials = NavCredentials::load_from_keychain(state.tenant.as_str())
-        .with_context(|| {
+    let credentials =
+        NavCredentials::load_from_keychain(state.tenant.as_str()).with_context(|| {
             format!(
                 "load NAV credentials from OS keychain for tenant `{}`",
                 state.tenant.as_str()
@@ -3513,9 +3865,7 @@ async fn handle_modification_invoice(
             technical_validations,
             body_preview,
         ),
-        Err(ModificationRouteError::Other(e)) => {
-            internal_error("modification_invoice_request", e)
-        }
+        Err(ModificationRouteError::Other(e)) => internal_error("modification_invoice_request", e),
     }
 }
 
@@ -3529,8 +3879,7 @@ pub fn modification_invoice_request(
     state: &AppState,
     invoice_id: &str,
     request: ModificationInvoiceRequest,
-) -> std::result::Result<issue_modification::ModificationIssuedSummary, ModificationRouteError>
-{
+) -> std::result::Result<issue_modification::ModificationIssuedSummary, ModificationRouteError> {
     // Operator login from Ready boot-state (same posture as the other
     // mutation helpers). Defence in depth past the route-level gate.
     let operator_login = match state.boot_state.read() {
@@ -3583,8 +3932,8 @@ pub fn modification_invoice_request(
     //    operator-supplied currency via `inherit_rate_metadata_for_chain`;
     //    surfacing the mismatch loud here keeps the wire shape honest
     //    per CLAUDE.md rule 12.
-    let base_currency = read_base_currency(&state.db_path, invoice_id)
-        .map_err(ModificationRouteError::Other)?;
+    let base_currency =
+        read_base_currency(&state.db_path, invoice_id).map_err(ModificationRouteError::Other)?;
     if base_currency != request.currency {
         return Err(ModificationRouteError::BadRequest(format!(
             "modification body currency {} differs from base invoice {} \
@@ -3616,19 +3965,17 @@ pub fn modification_invoice_request(
     //    typed 400 via `ModificationRouteError::BadRequest` rather
     //    than a 500 so the SPA's inline-error renderer stays
     //    operator-actionable.
-    let supplier = supplier_from_seller_toml(state.tenant.as_str())
-        .map_err(|e| ModificationRouteError::BadRequest(format!(
+    let supplier = supplier_from_seller_toml(state.tenant.as_str()).map_err(|e| {
+        ModificationRouteError::BadRequest(format!(
             "seller.toml identity unavailable for modification: {e}"
-        )))?;
+        ))
+    })?;
     let input = InvoiceInputJson {
         supplier,
         customer: request.customer,
         lines: request.lines,
     };
-    let series = request
-        .series
-        .as_deref()
-        .unwrap_or(DEFAULT_SERIES_CODE);
+    let series = request.series.as_deref().unwrap_or(DEFAULT_SERIES_CODE);
 
     // 6. Dispatch into the library helper.
     issue_modification::modification_from_inputs(
@@ -3660,13 +4007,12 @@ fn read_base_currency(db_path: &Path, invoice_id: &str) -> Result<Currency> {
     let tx = conn
         .transaction()
         .context("begin read transaction for base-currency lookup (modification route)")?;
-    let metadata = load_invoice_currency_metadata_in_tx(&tx, invoice_id)
-        .with_context(|| {
-            format!(
-                "read base invoice {} currency metadata for modification route C6 check",
-                invoice_id
-            )
-        })?;
+    let metadata = load_invoice_currency_metadata_in_tx(&tx, invoice_id).with_context(|| {
+        format!(
+            "read base invoice {} currency metadata for modification route C6 check",
+            invoice_id
+        )
+    })?;
     tx.commit()
         .context("commit read transaction for base-currency lookup")?;
     Ok(metadata.currency)
@@ -3718,10 +4064,7 @@ async fn handle_get_issuance_input(
 /// `pub` for symmetry with the other route helpers; surfaces `Ok(None)`
 /// for the missing-sibling case so the handler can map it to 404
 /// without an anyhow error string round-trip.
-pub fn get_issuance_input(
-    state: &AppState,
-    invoice_id: &str,
-) -> Result<Option<InvoiceInputJson>> {
+pub fn get_issuance_input(state: &AppState, invoice_id: &str) -> Result<Option<InvoiceInputJson>> {
     let derived = match derive_state_for(state, invoice_id) {
         Ok(d) => d,
         Err(SubmitRouteError::NotFound(_)) => return Ok(None),
@@ -3769,6 +4112,343 @@ pub fn get_issuance_input(
         )
     })?;
     Ok(Some(parsed))
+}
+
+// ── PR-70 / ADR-0039 — POST /api/invoices/:id/mark-paid ──────────────
+
+/// PR-70 / ADR-0039 — wire request body for
+/// `POST /api/invoices/:id/mark-paid`. Mirrors the
+/// `MarkPaidInput` shape minus the `invoice_id` field (URL path
+/// segment). `currency` MUST match the invoice's stored currency
+/// per ADR-0039 §3; the route layer enforces this with a 400.
+#[derive(Debug, Deserialize)]
+pub struct MarkPaidRequest {
+    pub paid_at: String,
+    pub amount_minor: i64,
+    pub currency: Currency,
+    pub method: PaymentMethod,
+    #[serde(default)]
+    pub reference: Option<String>,
+}
+
+/// PR-70 / ADR-0039 — wire response body for
+/// `POST /api/invoices/:id/mark-paid` on the success path.
+/// `payment` carries the just-appended audit-payload echo (the SPA
+/// re-uses this to render the Paid chip + payment detail immediately
+/// without a follow-up `GET /invoices/:id` round-trip);
+/// `entries_verified` is the post-commit `Ledger::verify_chain`
+/// count, surfaced for parity with the existing mutation routes.
+#[derive(Debug, Serialize)]
+struct MarkPaidResponse {
+    invoice_id: String,
+    payment: PaymentRecordSummary,
+    entries_verified: u64,
+}
+
+/// PR-70 / ADR-0039 — wire-shape mirror of
+/// [`audit_query::PaymentRecord`]. A separate struct (vs. deriving
+/// `Serialize` on the audit-query type) keeps the wire field names
+/// controlled here (snake_case to match the SPA's TS interface
+/// `PaymentRecordSummary`) and lets the wire shape evolve
+/// independently of the read-side accessor's Rust types.
+#[derive(Debug, Serialize)]
+struct PaymentRecordSummary {
+    paid_at: String,
+    amount_minor: i64,
+    currency: String,
+    method: PaymentMethod,
+    reference: Option<String>,
+}
+
+impl From<PaymentRecord> for PaymentRecordSummary {
+    fn from(p: PaymentRecord) -> Self {
+        Self {
+            paid_at: p.paid_at,
+            amount_minor: p.amount_minor,
+            currency: p.currency,
+            method: p.method,
+            reference: p.reference,
+        }
+    }
+}
+
+/// PR-70 / ADR-0039 — wire response body for the `409 Conflict`
+/// already-paid arm. Carries the existing payment record verbatim
+/// so the SPA can render "this invoice was already paid on
+/// 2026-05-26 by BankTransfer for HUF 12,500" inline rather than
+/// surfacing a generic conflict.
+#[derive(Debug, Serialize)]
+struct AlreadyPaidBody {
+    error: &'static str,
+    message: String,
+    payment: PaymentRecordSummary,
+}
+
+/// PR-70 / ADR-0039 — `POST /api/invoices/:id/mark-paid` handler.
+///
+/// 1. Bearer-auth check (post-Ready); 503 in NeedsSetup.
+/// 2. Precondition: derive the invoice's state; loud-fail with 409
+///    Conflict unless `Finalized`. Operational metadata only — the
+///    NAV regulatory state ladder is unchanged.
+/// 3. Currency-match check: the request's `currency` MUST equal the
+///    invoice's stored currency; otherwise 400 Bad Request.
+/// 4. Dispatch into [`mark_invoice_paid::mark_paid`] (which handles
+///    the date-format check, idempotency gate, audit-write, and
+///    chain verify).
+///
+/// Failure modes:
+///   - `401 Unauthorized` — bearer missing or wrong.
+///   - `503 Service Unavailable` — NeedsSetup boot state.
+///   - `404 Not Found` — unknown invoice id.
+///   - `409 Conflict` — base not in `Finalized`, OR an
+///     `InvoicePaymentRecorded` entry already exists. The
+///     already-paid response body carries the existing payment
+///     record so the SPA can render the duplicate gracefully.
+///   - `400 Bad Request` — currency mismatch OR malformed `paid_at`.
+///   - `500 Internal Server Error` — any propagated error
+///     (audit-write, DB error, chain verify failure).
+async fn handle_mark_invoice_paid(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(invoice_id): AxumPath<String>,
+    Json(body): Json<MarkPaidRequest>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match mark_paid_request(&state, &invoice_id, body) {
+        Ok(outcome) => Json(MarkPaidResponse {
+            invoice_id,
+            payment: outcome.payment.into(),
+            entries_verified: outcome.entries_verified,
+        })
+        .into_response(),
+        Err(MarkPaidRouteError::PreconditionMismatch {
+            current_state,
+            message,
+        }) => (
+            StatusCode::CONFLICT,
+            Json(error_body(format!(
+                "{message} (current state: {current_state})"
+            ))),
+        )
+            .into_response(),
+        Err(MarkPaidRouteError::NotFound(message)) => {
+            (StatusCode::NOT_FOUND, Json(error_body(message))).into_response()
+        }
+        Err(MarkPaidRouteError::AlreadyPaid(existing)) => (
+            StatusCode::CONFLICT,
+            Json(AlreadyPaidBody {
+                error: "already_paid",
+                message: format!(
+                    "invoice {invoice_id} already has a recorded payment \
+                     (paid_at {}, amount_minor {}, currency {})",
+                    existing.paid_at, existing.amount_minor, existing.currency
+                ),
+                payment: existing.into(),
+            }),
+        )
+            .into_response(),
+        Err(MarkPaidRouteError::CurrencyMismatch {
+            invoice_currency,
+            body_currency,
+        }) => (
+            StatusCode::BAD_REQUEST,
+            Json(error_body(format!(
+                "payment currency {body_currency} does not match invoice currency \
+                 {invoice_currency}; a mark-paid request must record the payment in \
+                 the invoice's own currency"
+            ))),
+        )
+            .into_response(),
+        Err(MarkPaidRouteError::InvalidPaidAt(message)) => {
+            (StatusCode::BAD_REQUEST, Json(error_body(message))).into_response()
+        }
+        Err(MarkPaidRouteError::Other(e)) => internal_error("mark_paid_request", e),
+    }
+}
+
+/// PR-70 / ADR-0039 — typed error returned by [`mark_paid_request`].
+/// Mirrors the closed-vocab posture of [`SubmitRouteError`] and adds
+/// two PR-70-specific arms (`AlreadyPaid` + `CurrencyMismatch`).
+#[derive(Debug)]
+pub enum MarkPaidRouteError {
+    PreconditionMismatch {
+        current_state: String,
+        message: String,
+    },
+    NotFound(String),
+    AlreadyPaid(PaymentRecord),
+    CurrencyMismatch {
+        invoice_currency: String,
+        body_currency: String,
+    },
+    InvalidPaidAt(String),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for MarkPaidRouteError {
+    fn from(e: anyhow::Error) -> Self {
+        MarkPaidRouteError::Other(e)
+    }
+}
+
+impl From<SubmitRouteError> for MarkPaidRouteError {
+    fn from(e: SubmitRouteError) -> Self {
+        match e {
+            SubmitRouteError::PreconditionMismatch {
+                current_state,
+                message,
+            } => MarkPaidRouteError::PreconditionMismatch {
+                current_state,
+                message,
+            },
+            SubmitRouteError::NotFound(s) => MarkPaidRouteError::NotFound(s),
+            SubmitRouteError::Other(e) => MarkPaidRouteError::Other(e),
+            // mark-paid never calls NAV; this arm is unreachable in
+            // practice. Wired through symmetrically so a future
+            // refactor that lifts NAV calls into the mark-paid surface
+            // does not silently degrade per CLAUDE.md rule 12.
+            SubmitRouteError::NavUpstreamFault {
+                status,
+                fault_code,
+                fault_message,
+                ..
+            } => MarkPaidRouteError::Other(anyhow!(
+                "mark_paid_request received an unexpected NavUpstreamFault \
+                 (status={status}, fault_code={fault_code:?}, \
+                 fault_message={fault_message:?}) — this surface does not call NAV"
+            )),
+        }
+    }
+}
+
+/// PR-70 / ADR-0039 — library helper that drives the mark-paid
+/// orchestration end-to-end. `pub` so the integration test can hit
+/// it for precondition pin tests without spinning the HTTPS listener
+/// (same posture as `storno_invoice_request` per A159).
+pub fn mark_paid_request(
+    state: &AppState,
+    invoice_id: &str,
+    body: MarkPaidRequest,
+) -> std::result::Result<mark_invoice_paid::MarkPaidOutcome, MarkPaidRouteError> {
+    // 1. Operator login from Ready boot-state.
+    let operator_login = match state.boot_state.read() {
+        Ok(guard) => match &*guard {
+            ServeBootState::Ready { operator_login } => operator_login.clone(),
+            ServeBootState::NeedsSetup => {
+                return Err(MarkPaidRouteError::Other(anyhow!(
+                    "mark_paid_request called in NeedsSetup state — \
+                     /api/setup-nav-credentials must run first"
+                )));
+            }
+            ServeBootState::NeedsSellerConfig { .. } => {
+                return Err(MarkPaidRouteError::Other(anyhow!(
+                    "mark_paid_request called in NeedsSellerConfig state — \
+                     /api/setup-seller-info must run first"
+                )));
+            }
+        },
+        Err(e) => {
+            return Err(MarkPaidRouteError::Other(anyhow!(
+                "boot_state RwLock poisoned: {e}"
+            )));
+        }
+    };
+
+    // 2. Precondition: derive the invoice's state. Mark-paid is
+    //    legal only on Finalized invoices per ADR-0039 §3 — the
+    //    NAV-side regulatory ladder must have reached terminal
+    //    SAVED before the operator records a payment. Storno /
+    //    Modified / Abandoned / Pending / etc. all 409 here.
+    let derived = derive_state_for(state, invoice_id)?;
+    if !matches!(derived.state, InvoiceState::Finalized) {
+        return Err(MarkPaidRouteError::PreconditionMismatch {
+            current_state: format!("{:?}", derived.state),
+            message: format!(
+                "POST /api/invoices/{invoice_id}/mark-paid requires state `Finalized`; \
+                 the invoice must be terminally accepted at NAV (SAVED) before a \
+                 payment can be recorded"
+            ),
+        });
+    }
+
+    // 3. Currency-match check — defence-in-depth against a curl
+    //    bypass (the SPA pre-locks the dropdown to the invoice's
+    //    currency). Read the invoice's currency from the billing
+    //    store using the same scoped-read-tx posture as
+    //    `read_base_currency`.
+    let invoice_currency = read_invoice_currency(&state.db_path, invoice_id).map_err(|e| {
+        MarkPaidRouteError::Other(anyhow!(
+            "read invoice currency for mark-paid currency-match check: {e}"
+        ))
+    })?;
+    if body.currency != invoice_currency {
+        return Err(MarkPaidRouteError::CurrencyMismatch {
+            invoice_currency: invoice_currency.iso_code().to_string(),
+            body_currency: body.currency.iso_code().to_string(),
+        });
+    }
+
+    // 4. Dispatch into the library helper.
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| MarkPaidRouteError::Other(anyhow!("await binary hash: {e}")))?;
+    let input = MarkPaidInput {
+        invoice_id: invoice_id.to_string(),
+        paid_at: body.paid_at,
+        amount_minor: body.amount_minor,
+        currency: body.currency.iso_code().to_string(),
+        method: body.method,
+        reference: body.reference.and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }),
+    };
+    match mark_invoice_paid::mark_paid(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        &operator_login,
+        input,
+    ) {
+        Ok(outcome) => Ok(outcome),
+        Err(MarkPaidError::AlreadyPaid(existing)) => Err(MarkPaidRouteError::AlreadyPaid(existing)),
+        Err(MarkPaidError::InvalidPaidAt(message)) => {
+            Err(MarkPaidRouteError::InvalidPaidAt(message))
+        }
+        Err(MarkPaidError::Other(e)) => Err(MarkPaidRouteError::Other(e)),
+    }
+}
+
+/// PR-70 / ADR-0039 — read the invoice's stored currency from the
+/// billing store. Same scoped-read-tx posture as
+/// [`read_base_currency`] but does not require the invoice to be
+/// the base of a chain — works for any invoice id that exists in
+/// the billing table.
+fn read_invoice_currency(db_path: &Path, invoice_id: &str) -> Result<Currency> {
+    let mut conn = Connection::open(db_path).with_context(|| {
+        format!(
+            "open tenant DuckDB at {} for currency lookup",
+            db_path.display()
+        )
+    })?;
+    let tx = conn
+        .transaction()
+        .context("begin read transaction for invoice-currency lookup")?;
+    let metadata = load_invoice_currency_metadata_in_tx(&tx, invoice_id)
+        .with_context(|| format!("load invoice_currency_metadata for invoice {invoice_id}"))?;
+    tx.commit()
+        .context("commit read transaction for invoice-currency lookup")?;
+    Ok(metadata.currency)
 }
 
 // ── PR-48α / session-68 — partner CRUD ───────────────────────────────
@@ -3869,9 +4549,8 @@ pub fn list_partners_request(
     state: &AppState,
     search: Option<&str>,
 ) -> std::result::Result<Vec<Partner>, PartnerRouteError> {
-    let conn = Connection::open(&*state.db_path).with_context(|| {
-        format!("open tenant DuckDB at {}", state.db_path.display())
-    })?;
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let partners = partners::list_partners(&conn, state.tenant.as_str(), search)?;
     Ok(partners)
 }
@@ -3904,9 +4583,8 @@ pub fn get_partner_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<Partner, PartnerRouteError> {
-    let conn = Connection::open(&*state.db_path).with_context(|| {
-        format!("open tenant DuckDB at {}", state.db_path.display())
-    })?;
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     match partners::get_partner(&conn, state.tenant.as_str(), id)? {
         Some(p) => Ok(p),
         None => Err(PartnerRouteError::NotFound),
@@ -3944,9 +4622,8 @@ pub fn create_partner_request(
     if let Err(errors) = partners::validate_partner_inputs(inputs) {
         return Err(PartnerRouteError::Validation(errors));
     }
-    let conn = Connection::open(&*state.db_path).with_context(|| {
-        format!("open tenant DuckDB at {}", state.db_path.display())
-    })?;
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let partner = partners::create_partner(&conn, state.tenant.as_str(), inputs)?;
     Ok(partner)
 }
@@ -3981,9 +4658,8 @@ pub fn update_partner_request(
     if let Err(errors) = partners::validate_partner_inputs(inputs) {
         return Err(PartnerRouteError::Validation(errors));
     }
-    let conn = Connection::open(&*state.db_path).with_context(|| {
-        format!("open tenant DuckDB at {}", state.db_path.display())
-    })?;
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     match partners::update_partner(&conn, state.tenant.as_str(), id, inputs)? {
         Some(p) => Ok(p),
         None => Err(PartnerRouteError::NotFound),
@@ -4018,15 +4694,620 @@ pub fn delete_partner_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<(), PartnerRouteError> {
-    let conn = Connection::open(&*state.db_path).with_context(|| {
-        format!("open tenant DuckDB at {}", state.db_path.display())
-    })?;
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let deleted = partners::soft_delete_partner(&conn, state.tenant.as_str(), id)?;
     if deleted {
         Ok(())
     } else {
         Err(PartnerRouteError::NotFound)
     }
+}
+
+// ── PR-72 / session-94 — multi-bank-account routes ───────────────────
+//
+// Five routes (list + create on the collection; update + delete +
+// flip-default on the resource) over the per-tenant
+// `~/.aberp/<tenant>/seller.toml` `[[seller.banks]]` block. The PR-71
+// `seller_banks` module owns the schema, the parser, the validator,
+// the atomic-write helper, and the deterministic id derivation; this
+// section is the HTTP boundary that maps typed errors onto status
+// codes and surfaces the validated `SellerBanks` collection to the
+// SPA.
+
+/// PR-72 / session-94 — closed-vocab error for the bank-account
+/// routes (ADR-0040 §addendum). `Validation` → 400 with per-field /
+/// per-invariant errors; `NotFound` → 404 for unknown ids;
+/// `Conflict` → 409 for the "deleting this entry would leave a
+/// currency unrepresented when other currencies still have entries"
+/// invariant; `Other` → 500.
+///
+/// The closed vocab is the deliberate part — adding a new failure
+/// mode means adding a variant + a 4xx/5xx mapping, NOT a free-text
+/// string the operator has to interpret.
+#[derive(Debug)]
+pub enum SellerBankRouteError {
+    /// Validation failure (per-currency-default invariant breach,
+    /// missing required field, currency outside ADR-0037 closed
+    /// vocab). The body shape mirrors the partner / seller-info
+    /// validation envelope: `{ "error": "validation_failed", "fields":
+    /// [{field, message}, ...] }`. Bilingual operator messages live
+    /// inside the field messages.
+    Validation(Vec<SellerBankFieldError>),
+    /// 404 — no bank entry exists with this id for the active tenant.
+    NotFound,
+    /// 409 — deleting this entry would leave its currency
+    /// unrepresented when other currencies still have entries. The
+    /// validator-load path enforces this implicitly (a load with zero
+    /// HUF + N EUR is fine; a load with zero HUF after a delete would
+    /// surface at the issue-path picker as `MissingDefault`). We
+    /// surface it pre-write so the operator sees the typed error
+    /// instead of an apparently-successful delete + a downstream
+    /// issue failure.
+    Conflict {
+        /// Bilingual message naming the currency that would lose its
+        /// last entry. Surfaced verbatim to the operator.
+        message: String,
+    },
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for SellerBankRouteError {
+    fn from(e: anyhow::Error) -> Self {
+        SellerBankRouteError::Other(e)
+    }
+}
+
+impl From<SellerBanksError> for SellerBankRouteError {
+    /// Map the typed read/write error to a 400 validation envelope
+    /// with a single field-error carrying the bilingual operator
+    /// message. The route handler may choose a different status code
+    /// when it has stronger context (e.g. a 409 Conflict from the
+    /// delete path) — this `From` is the conservative default.
+    fn from(e: SellerBanksError) -> Self {
+        let field = match &e {
+            SellerBanksError::MultipleDefaults { .. }
+            | SellerBanksError::NoDefaultAmongEntries { .. } => "default",
+            SellerBanksError::MissingField { field, .. } => field,
+            SellerBanksError::UnsupportedCurrency { .. } => "currency",
+            SellerBanksError::Io(_) => "_",
+        };
+        SellerBankRouteError::Validation(vec![SellerBankFieldError {
+            field,
+            message: e.to_string(),
+        }])
+    }
+}
+
+/// PR-72 / session-94 — per-field error mirroring the
+/// `setup_seller_info` + partners route shape so the SPA's A157
+/// inline-error renderer reuses the same parser. `field` is the
+/// camelCase form field name; the SPA highlights the matching input.
+#[derive(Serialize, Debug, Clone)]
+pub struct SellerBankFieldError {
+    pub field: &'static str,
+    pub message: String,
+}
+
+#[derive(Serialize)]
+struct SellerBankValidationBody {
+    error: &'static str,
+    fields: Vec<SellerBankFieldError>,
+}
+
+fn seller_bank_validation_response(errors: Vec<SellerBankFieldError>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(SellerBankValidationBody {
+            error: "validation_failed",
+            fields: errors,
+        }),
+    )
+        .into_response()
+}
+
+fn seller_bank_not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(error_body("bank account not found".to_string())),
+    )
+        .into_response()
+}
+
+fn seller_bank_conflict_response(message: String) -> Response {
+    (StatusCode::CONFLICT, Json(error_body(message))).into_response()
+}
+
+/// PR-72 / session-94 — wire shape for a single bank-account row.
+/// Mirror of [`seller_banks::SellerBankEntry`] with snake_case JSON
+/// names (matching the partners + seller-info route convention). All
+/// fields are required because the parser already loud-fails on
+/// missing-field load errors; the SPA never sees a half-populated
+/// entry.
+#[derive(Serialize, Debug, Clone)]
+pub struct SellerBankResponse {
+    /// `bnk_<26-char>` deterministic id over `(currency, account_number)`.
+    pub id: String,
+    /// ADR-0037 closed-vocab string (`"HUF"` / `"EUR"`).
+    pub currency: String,
+    pub account_number: String,
+    pub bank_name: String,
+    pub swift_bic: String,
+    pub is_default: bool,
+}
+
+impl From<&SellerBankEntry> for SellerBankResponse {
+    fn from(entry: &SellerBankEntry) -> Self {
+        Self {
+            id: entry.id.clone(),
+            currency: entry.currency.iso_code().to_string(),
+            account_number: entry.account_number.clone(),
+            bank_name: entry.bank_name.clone(),
+            swift_bic: entry.swift_bic.clone(),
+            is_default: entry.default,
+        }
+    }
+}
+
+/// PR-72 / session-94 — wire response for list + mutation paths.
+/// Always the full collection (in declaration order) so the SPA
+/// re-renders the list view from one source of truth after every
+/// mutation. Saves a second GET roundtrip on every Add / Edit /
+/// Delete / Set-default click.
+#[derive(Serialize, Debug, Clone)]
+pub struct SellerBanksListResponse {
+    pub banks: Vec<SellerBankResponse>,
+}
+
+impl From<&SellerBanks> for SellerBanksListResponse {
+    fn from(banks: &SellerBanks) -> Self {
+        Self {
+            banks: banks
+                .entries()
+                .iter()
+                .map(SellerBankResponse::from)
+                .collect(),
+        }
+    }
+}
+
+/// PR-72 / session-94 — wire request shape for create + update.
+/// `set_as_default` is only meaningful on create + update; the
+/// flip-default route has its own minimal shape (no body — the id
+/// in the path is the whole intent).
+#[derive(Deserialize, Debug, Clone)]
+pub struct SellerBankInputs {
+    pub currency: String,
+    pub account_number: String,
+    pub bank_name: String,
+    pub swift_bic: String,
+    #[serde(default)]
+    pub set_as_default: bool,
+}
+
+/// PR-72 / session-94 — validate the operator-typed inputs at the
+/// route boundary. Returns one `SellerBankFieldError` per failing
+/// field so the SPA can surface every problem at once (A157 inline-
+/// error rendering). Currency is the only field where the closed
+/// vocab matters at this layer; the per-currency-default invariants
+/// are enforced by `SellerBanks::replace_entries` after the
+/// candidate mutation is folded in.
+fn validate_seller_bank_inputs(
+    inputs: &SellerBankInputs,
+) -> std::result::Result<Currency, Vec<SellerBankFieldError>> {
+    let mut errors: Vec<SellerBankFieldError> = Vec::new();
+    let currency = match inputs.currency.trim().to_ascii_uppercase().as_str() {
+        "HUF" => Some(Currency::Huf),
+        "EUR" => Some(Currency::Eur),
+        _ => {
+            errors.push(SellerBankFieldError {
+                field: "currency",
+                message: format!(
+                    "Pénznem nem támogatott: `{}`. Engedélyezett: HUF, EUR.\n\
+                     Unsupported currency `{}`. Allowed: HUF, EUR.",
+                    inputs.currency, inputs.currency
+                ),
+            });
+            None
+        }
+    };
+    if inputs.account_number.trim().is_empty() {
+        errors.push(SellerBankFieldError {
+            field: "accountNumber",
+            message: "Bankszámlaszám kötelező.\nAccount number is required.".to_string(),
+        });
+    }
+    if inputs.bank_name.trim().is_empty() {
+        errors.push(SellerBankFieldError {
+            field: "bankName",
+            message: "Bank neve kötelező.\nBank name is required.".to_string(),
+        });
+    }
+    if inputs.swift_bic.trim().is_empty() {
+        errors.push(SellerBankFieldError {
+            field: "swiftBic",
+            message: "SWIFT/BIC kötelező.\nSWIFT/BIC is required.".to_string(),
+        });
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(currency.expect("currency present when no errors"))
+}
+
+/// PR-72 / session-94 — resolve the per-tenant seller.toml path,
+/// load the current `SellerBanks`, mutate it via `op`, validate +
+/// write back atomically. Shared core for all four mutation routes.
+fn mutate_seller_banks(
+    state: &AppState,
+    path_override: Option<&Path>,
+    op: impl FnOnce(&mut Vec<SellerBankEntry>) -> std::result::Result<(), SellerBankRouteError>,
+) -> std::result::Result<SellerBanks, SellerBankRouteError> {
+    let owned_path;
+    let path: &Path = match path_override {
+        Some(p) => p,
+        None => {
+            owned_path = setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str())
+                .context("resolve seller.toml path for /api/seller/banks")?;
+            owned_path.as_path()
+        }
+    };
+    let mut banks = seller_banks::read_seller_banks(path)?;
+    let mut entries = banks.entries().to_vec();
+    op(&mut entries)?;
+    banks.replace_entries(entries)?;
+    seller_banks::write_seller_banks_section(path, &banks)
+        .context("write seller.toml bank section")?;
+    Ok(banks)
+}
+
+/// PR-72 / session-94 — when an operator adds (or sets) a new
+/// `default = true` entry, demote the previous default for the same
+/// currency in the same write so the per-currency-defaults invariant
+/// stays satisfied. `skip_id` lets the caller exclude a specific
+/// entry from the demote (the entry being updated, so the update
+/// itself can flip it on rather than getting demoted by the helper).
+fn demote_previous_default(
+    entries: &mut [SellerBankEntry],
+    currency: Currency,
+    skip_id: Option<&str>,
+) {
+    for entry in entries.iter_mut() {
+        if entry.currency == currency && entry.default {
+            if let Some(skip) = skip_id {
+                if entry.id == skip {
+                    continue;
+                }
+            }
+            entry.default = false;
+        }
+    }
+}
+
+// ── GET /api/seller/banks ────────────────────────────────────────────
+
+async fn handle_list_seller_banks(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match list_seller_banks_request(&state, None) {
+        Ok(banks) => Json(SellerBanksListResponse::from(&banks)).into_response(),
+        Err(SellerBankRouteError::Validation(errors)) => seller_bank_validation_response(errors),
+        Err(SellerBankRouteError::Other(e)) => internal_error("list_seller_banks_request", e),
+        Err(SellerBankRouteError::NotFound) => internal_error(
+            "list_seller_banks_request",
+            anyhow!("list_seller_banks_request surfaced unexpected NotFound"),
+        ),
+        Err(SellerBankRouteError::Conflict { .. }) => internal_error(
+            "list_seller_banks_request",
+            anyhow!("list_seller_banks_request surfaced unexpected Conflict"),
+        ),
+    }
+}
+
+/// PR-72 / session-94 — library helper for the list route. `pub` so
+/// the integration tests can hit it without spinning the HTTPS
+/// listener (mirrors `list_partners_request`'s posture per A159).
+pub fn list_seller_banks_request(
+    state: &AppState,
+    path_override: Option<&Path>,
+) -> std::result::Result<SellerBanks, SellerBankRouteError> {
+    let owned_path;
+    let path: &Path = match path_override {
+        Some(p) => p,
+        None => {
+            owned_path = setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str())
+                .context("resolve seller.toml path for /api/seller/banks")?;
+            owned_path.as_path()
+        }
+    };
+    let banks = seller_banks::read_seller_banks(path)?;
+    Ok(banks)
+}
+
+// ── POST /api/seller/banks ───────────────────────────────────────────
+
+async fn handle_create_seller_bank(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<SellerBankInputs>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match create_seller_bank_request(&state, &inputs, None) {
+        Ok(banks) => (
+            StatusCode::CREATED,
+            Json(SellerBanksListResponse::from(&banks)),
+        )
+            .into_response(),
+        Err(SellerBankRouteError::Validation(errors)) => seller_bank_validation_response(errors),
+        Err(SellerBankRouteError::Conflict { message }) => seller_bank_conflict_response(message),
+        Err(SellerBankRouteError::Other(e)) => internal_error("create_seller_bank_request", e),
+        Err(SellerBankRouteError::NotFound) => internal_error(
+            "create_seller_bank_request",
+            anyhow!("create_seller_bank_request surfaced unexpected NotFound"),
+        ),
+    }
+}
+
+pub fn create_seller_bank_request(
+    state: &AppState,
+    inputs: &SellerBankInputs,
+    path_override: Option<&Path>,
+) -> std::result::Result<SellerBanks, SellerBankRouteError> {
+    let currency = validate_seller_bank_inputs(inputs).map_err(SellerBankRouteError::Validation)?;
+    let bank_name = inputs.bank_name.trim().to_string();
+    let account_number = inputs.account_number.trim().to_string();
+    let swift_bic = inputs.swift_bic.trim().to_string();
+    let set_as_default = inputs.set_as_default;
+
+    mutate_seller_banks(state, path_override, move |entries| {
+        let new_entry = seller_banks::mint_entry(
+            currency,
+            account_number.clone(),
+            bank_name,
+            swift_bic,
+            // If the operator asks to set as default, mint with
+            // default=true AND demote the prior default below. If
+            // the operator did NOT ask AND there is no existing
+            // default for this currency, mark this entry the
+            // de-facto default (the per-currency-default invariant
+            // requires at least one default per used currency).
+            set_as_default || !has_default_for(entries, currency),
+        );
+        // Reject duplicates by deterministic id (same currency +
+        // account_number → same id). The deterministic-id pin is
+        // the load-bearing invariant PR-C relies on; a duplicate id
+        // would mean two rows pointing at the same audit reference.
+        if entries.iter().any(|e| e.id == new_entry.id) {
+            return Err(SellerBankRouteError::Validation(vec![
+                SellerBankFieldError {
+                    field: "accountNumber",
+                    message: format!(
+                        "Ez a számlaszám már létezik a(z) {iso} pénznemhez.\n\
+                     This account number already exists for {iso}.",
+                        iso = currency.iso_code(),
+                    ),
+                },
+            ]));
+        }
+        if new_entry.default {
+            demote_previous_default(entries, currency, Some(&new_entry.id));
+        }
+        entries.push(new_entry);
+        Ok(())
+    })
+}
+
+fn has_default_for(entries: &[SellerBankEntry], currency: Currency) -> bool {
+    entries.iter().any(|e| e.currency == currency && e.default)
+}
+
+// ── PUT /api/seller/banks/:id ────────────────────────────────────────
+
+async fn handle_update_seller_bank(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<SellerBankInputs>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match update_seller_bank_request(&state, &id, &inputs, None) {
+        Ok(banks) => Json(SellerBanksListResponse::from(&banks)).into_response(),
+        Err(SellerBankRouteError::Validation(errors)) => seller_bank_validation_response(errors),
+        Err(SellerBankRouteError::NotFound) => seller_bank_not_found_response(),
+        Err(SellerBankRouteError::Conflict { message }) => seller_bank_conflict_response(message),
+        Err(SellerBankRouteError::Other(e)) => internal_error("update_seller_bank_request", e),
+    }
+}
+
+pub fn update_seller_bank_request(
+    state: &AppState,
+    id: &str,
+    inputs: &SellerBankInputs,
+    path_override: Option<&Path>,
+) -> std::result::Result<SellerBanks, SellerBankRouteError> {
+    let currency = validate_seller_bank_inputs(inputs).map_err(SellerBankRouteError::Validation)?;
+    let bank_name = inputs.bank_name.trim().to_string();
+    let account_number = inputs.account_number.trim().to_string();
+    let swift_bic = inputs.swift_bic.trim().to_string();
+    let id = id.to_string();
+
+    mutate_seller_banks(state, path_override, move |entries| {
+        let idx = entries
+            .iter()
+            .position(|e| e.id == id)
+            .ok_or(SellerBankRouteError::NotFound)?;
+
+        // Preserve the existing `default` flag (set-default is its
+        // own route to keep the mental model crisp per the brief).
+        let was_default = entries[idx].default;
+
+        // Re-mint the id over the new (currency, account_number) so
+        // a typo correction on either field keeps the id stable for
+        // the corrected value. If the new id collides with a
+        // different entry, refuse — that would mean two rows
+        // pointing at the same audit reference.
+        let new_entry = seller_banks::mint_entry(
+            currency,
+            account_number.clone(),
+            bank_name,
+            swift_bic,
+            was_default,
+        );
+        if new_entry.id != id
+            && entries
+                .iter()
+                .enumerate()
+                .any(|(j, e)| j != idx && e.id == new_entry.id)
+        {
+            return Err(SellerBankRouteError::Validation(vec![
+                SellerBankFieldError {
+                    field: "accountNumber",
+                    message: format!(
+                        "Ez a számlaszám már létezik a(z) {iso} pénznemhez.\n\
+                     This account number already exists for {iso}.",
+                        iso = currency.iso_code(),
+                    ),
+                },
+            ]));
+        }
+        entries[idx] = new_entry;
+        Ok(())
+    })
+}
+
+// ── POST /api/seller/banks/:id/set-default ───────────────────────────
+
+async fn handle_set_default_seller_bank(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match set_default_seller_bank_request(&state, &id, None) {
+        Ok(banks) => Json(SellerBanksListResponse::from(&banks)).into_response(),
+        Err(SellerBankRouteError::Validation(errors)) => seller_bank_validation_response(errors),
+        Err(SellerBankRouteError::NotFound) => seller_bank_not_found_response(),
+        Err(SellerBankRouteError::Conflict { message }) => seller_bank_conflict_response(message),
+        Err(SellerBankRouteError::Other(e)) => internal_error("set_default_seller_bank_request", e),
+    }
+}
+
+pub fn set_default_seller_bank_request(
+    state: &AppState,
+    id: &str,
+    path_override: Option<&Path>,
+) -> std::result::Result<SellerBanks, SellerBankRouteError> {
+    let id = id.to_string();
+    mutate_seller_banks(state, path_override, move |entries| {
+        let target_currency = entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.currency)
+            .ok_or(SellerBankRouteError::NotFound)?;
+        for entry in entries.iter_mut() {
+            if entry.currency == target_currency {
+                entry.default = entry.id == id;
+            }
+        }
+        Ok(())
+    })
+}
+
+// ── DELETE /api/seller/banks/:id ─────────────────────────────────────
+
+async fn handle_delete_seller_bank(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match delete_seller_bank_request(&state, &id, None) {
+        Ok(banks) => Json(SellerBanksListResponse::from(&banks)).into_response(),
+        Err(SellerBankRouteError::NotFound) => seller_bank_not_found_response(),
+        Err(SellerBankRouteError::Conflict { message }) => seller_bank_conflict_response(message),
+        Err(SellerBankRouteError::Validation(errors)) => seller_bank_validation_response(errors),
+        Err(SellerBankRouteError::Other(e)) => internal_error("delete_seller_bank_request", e),
+    }
+}
+
+pub fn delete_seller_bank_request(
+    state: &AppState,
+    id: &str,
+    path_override: Option<&Path>,
+) -> std::result::Result<SellerBanks, SellerBankRouteError> {
+    let id = id.to_string();
+    mutate_seller_banks(state, path_override, move |entries| {
+        let idx = entries
+            .iter()
+            .position(|e| e.id == id)
+            .ok_or(SellerBankRouteError::NotFound)?;
+        let target_currency = entries[idx].currency;
+        let was_default = entries[idx].default;
+        // Refuse the delete pre-write if it would leave this currency
+        // with zero entries AND there are other currencies still
+        // represented. This is the brief's §"Refuse with 409 if this
+        // is the ONLY entry for its currency AND there are other
+        // entries with a different currency" rule — the validator at
+        // load also catches this implicitly (zero defaults), but
+        // surfacing it pre-write gives the operator a clearer error.
+        let same_currency_remaining = entries
+            .iter()
+            .enumerate()
+            .filter(|(j, e)| *j != idx && e.currency == target_currency)
+            .count();
+        let other_currency_remaining = entries
+            .iter()
+            .enumerate()
+            .filter(|(j, e)| *j != idx && e.currency != target_currency)
+            .count();
+        if same_currency_remaining == 0 && other_currency_remaining > 0 {
+            return Err(SellerBankRouteError::Conflict {
+                message: format!(
+                    "Nem törölhető az utolsó {iso} bankszámla — más pénznemek bankjai még \
+                     léteznek. Töröld előbb azokat is, vagy adj hozzá másik {iso} bankszámlát.\n\
+                     Cannot delete the only {iso} bank entry while other currencies still have \
+                     entries. Add another {iso} entry first, or delete every entry.",
+                    iso = target_currency.iso_code(),
+                ),
+            });
+        }
+        entries.remove(idx);
+        // If we just removed the marked default, promote the first
+        // remaining entry for that currency (declaration order) so
+        // the per-currency-default invariant remains satisfied. If
+        // none remain (the legal "every entry gone" case above) the
+        // validator is happy with an empty collection per ADR-0040 §2.
+        if was_default {
+            if let Some(new_default) = entries.iter_mut().find(|e| e.currency == target_currency) {
+                new_default.default = true;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// PR-44η / session-60 — wire-state mapper for the poll-ack response.
@@ -4151,17 +5432,39 @@ fn derive_state_for(
 /// number from a NAV `<InvoiceData>` body. The CLI's
 /// `submit-invoice --tax-number` accepts the dashed forms; the
 /// NAV-emitted XML always carries the bare 8-digit base inside
-/// `<supplierTaxNumber><taxpayerId>...</taxpayerId>`. Server-
-/// derived so the SPA does not need to surface a tax-number input
-/// on the operator-facing button.
+/// `<supplierTaxNumber><common:taxpayerId>...</common:taxpayerId>`.
+/// Server-derived so the SPA does not need to surface a tax-number
+/// input on the operator-facing button.
 ///
 /// Substring scan rather than a full XML parse per CLAUDE.md rule 2
 /// (minimum code). Loud-fail on missing element OR a non-8-digit
 /// payload per rule 12.
+///
+/// # PR-66 / session-87 — `common:` namespace prefix
+///
+/// PR-50 / session-70 restructured the emitter to write the three
+/// supplier/customer tax-number children with the `common:` prefix
+/// (the NAV v3.0 `base` namespace) — but this extractor was missed
+/// and continued scanning for the bare-prefix form. The
+/// substring-scan would then `None` at submit time, raising
+/// `<supplierTaxNumber> missing <taxpayerId>` — the misleading error
+/// in session 87's live log on invoice 16 against NAV-test. The
+/// emit was correct; this scan was wrong. The inline unit-test
+/// fixtures below ALSO used the bare-prefix form so the tests
+/// passed-but-lied (CLAUDE.md rule 9 — tests verify intent, not
+/// just behavior); they are now updated to the wire-real prefixed
+/// form. The cross-module emit→validate→extract pin in
+/// `apps/aberp/tests/nav_xsd_validator_round_trip.rs` is the
+/// load-bearing closer against future prefix divergence between
+/// emitter and extractor.
+///
+/// The scan REQUIRES the `common:` prefix (no defensive accept of
+/// the bare form) per CLAUDE.md rule 12 — a future emit regression
+/// that drops the prefix must surface here as a loud-fail rather
+/// than be silently accepted.
 fn parse_supplier_tax_number_from_xml(xml: &[u8]) -> Result<String> {
-    let body = std::str::from_utf8(xml).context(
-        "InvoiceData XML is not valid UTF-8 — NAV requires UTF-8 per the v3.0 schema",
-    )?;
+    let body = std::str::from_utf8(xml)
+        .context("InvoiceData XML is not valid UTF-8 — NAV requires UTF-8 per the v3.0 schema")?;
     let open = "<supplierTaxNumber>";
     let close = "</supplierTaxNumber>";
     let start = body
@@ -4173,20 +5476,23 @@ fn parse_supplier_tax_number_from_xml(xml: &[u8]) -> Result<String> {
         .ok_or_else(|| anyhow!("InvoiceData XML missing </supplierTaxNumber>"))?
         + start;
     let block = &body[start..end];
-    let tag_open = "<taxpayerId>";
-    let tag_close = "</taxpayerId>";
-    let id_start = block
-        .find(tag_open)
-        .ok_or_else(|| anyhow!("InvoiceData XML <supplierTaxNumber> missing <taxpayerId>"))?
-        + tag_open.len();
-    let id_end = block[id_start..]
-        .find(tag_close)
-        .ok_or_else(|| anyhow!("InvoiceData XML <supplierTaxNumber> missing </taxpayerId>"))?
-        + id_start;
+    let tag_open = "<common:taxpayerId>";
+    let tag_close = "</common:taxpayerId>";
+    let id_start = block.find(tag_open).ok_or_else(|| {
+        anyhow!(
+            "InvoiceData XML <supplierTaxNumber> missing <common:taxpayerId> \
+             (NAV v3.0 base-namespace prefix required per PR-50; if the bare \
+             form `<taxpayerId>` is present, the emitter dropped the prefix \
+             — fix nav_xml::write_supplier rather than relaxing this scan)"
+        )
+    })? + tag_open.len();
+    let id_end = block[id_start..].find(tag_close).ok_or_else(|| {
+        anyhow!("InvoiceData XML <supplierTaxNumber> missing </common:taxpayerId>")
+    })? + id_start;
     let id = block[id_start..id_end].trim();
     if id.len() != 8 || !id.chars().all(|c| c.is_ascii_digit()) {
         return Err(anyhow!(
-            "supplier <taxpayerId> value '{id}' is not 8 ASCII digits"
+            "supplier <common:taxpayerId> value '{id}' is not 8 ASCII digits"
         ));
     }
     Ok(id.to_string())
@@ -4353,6 +5659,15 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
         .context("open audit ledger for serve list")?;
     let entries = ledger.entries().context("read audit ledger entries")?;
 
+    // PR-65 / session-86 — sidecar map from invoice_id to the
+    // `InvoiceDraftCreated` payload's `nav_xml_path`. Collected on
+    // the same single walk so the items loop below can resolve each
+    // invoice's side-store path (via `sibling_input_json_path`)
+    // without a second ledger scan. Mirrors the parse posture in
+    // `derive_state_for` so a future ADR that changes how nav_xml_path
+    // is recorded surfaces in both places.
+    let mut nav_xml_paths: std::collections::BTreeMap<String, std::path::PathBuf> =
+        Default::default();
     let mut by_invoice: std::collections::BTreeMap<String, InvoiceTrace> = Default::default();
     for entry in &entries {
         if let Some(id) = extract_invoice_id(entry) {
@@ -4360,6 +5675,16 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
                 .entry(id.clone())
                 .or_default()
                 .merge_entry(entry, &id);
+            if entry.kind == EventKind::InvoiceDraftCreated {
+                if let Ok(parsed) = serde_json::from_slice::<
+                    audit_payloads::InvoiceDraftCreatedPayload,
+                >(&entry.payload)
+                {
+                    if let Some(path_str) = parsed.nav_xml_path {
+                        nav_xml_paths.insert(id.clone(), std::path::PathBuf::from(path_str));
+                    }
+                }
+            }
         }
         // PR-23 / ADR-0036 §4 — chain-link entries do not carry a
         // top-level `invoice_id` field; they carry
@@ -4390,6 +5715,10 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
             Some(row) => row,
             None => continue, // ledger has it but billing row gone — skip silently
         };
+        let buyer_name = nav_xml_paths
+            .get(&id)
+            .and_then(|p| read_buyer_name_from_side_store(p));
+        let payment = trace.payment.clone().map(PaymentRecordSummary::from);
         items.push(InvoiceListItem {
             invoice_id: id,
             sequence_number: row.ready_invoice.sequence_number,
@@ -4398,9 +5727,38 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
             total_gross: row.ready_invoice.total_gross().map(|h| h.as_i64()),
             has_chain_children: trace.is_storno_base || trace.is_amended_base,
             currency: row.currency_metadata.currency,
+            buyer_name,
+            payment,
+            // PR-73 / ADR-0040 §addendum — bank-account snapshot on the
+            // list row. `None` for pre-PR-73 / CLI-issued rows.
+            bank_account: row
+                .bank_snapshot
+                .clone()
+                .map(BankAccountSnapshotResponse::from_typed),
         });
     }
     Ok(items)
+}
+
+/// PR-65 / session-86 — best-effort read of the side-stored
+/// [`InvoiceInputJson`] alongside a NAV-XML path, returning the
+/// `customer.name` field for the SPA's Partner column. Returns
+/// `None` for any failure (missing file, unreadable, malformed
+/// JSON, blank name) — the list endpoint must not loud-fail when
+/// the read-side enrichment misses, since the side-store is only
+/// present for PR-47α+ SPA-issued invoices (CLI-issued invoices
+/// and pre-PR-47α SPA-issued invoices never wrote one). Pinned by
+/// `read_buyer_name_from_side_store_round_trip`.
+fn read_buyer_name_from_side_store(nav_xml_path: &std::path::Path) -> Option<String> {
+    let path = sibling_input_json_path(nav_xml_path);
+    let bytes = std::fs::read(&path).ok()?;
+    let parsed: issue_invoice::InvoiceInputJson = serde_json::from_slice(&bytes).ok()?;
+    let trimmed = parsed.customer.name.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<InvoiceDetailResponse>> {
@@ -4483,36 +5841,37 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
     // default `currency` to `Currency::Huf` so the wire shape stays
     // valid; the four rate fields stay `None` because there is no
     // metadata to surface.
-    let (sequence_number, fiscal_year, total_gross, currency_metadata) = match billing {
-        Some(row) => (
-            row.ready_invoice.sequence_number,
-            row.ready_invoice.fiscal_year,
-            row.ready_invoice.total_gross().map(|h| h.as_i64()),
-            row.currency_metadata,
-        ),
-        None => (
-            0,
-            0,
-            None,
-            InvoiceCurrencyMetadata {
-                currency: Currency::Huf,
-                exchange_rate: None,
-                exchange_rate_source: None,
-                exchange_rate_date: None,
-                huf_equivalent_total: None,
-            },
-        ),
-    };
+    let (sequence_number, fiscal_year, total_gross, currency_metadata, bank_snapshot) =
+        match billing {
+            Some(row) => (
+                row.ready_invoice.sequence_number,
+                row.ready_invoice.fiscal_year,
+                row.ready_invoice.total_gross().map(|h| h.as_i64()),
+                row.currency_metadata,
+                row.bank_snapshot,
+            ),
+            None => (
+                0,
+                0,
+                None,
+                InvoiceCurrencyMetadata {
+                    currency: Currency::Huf,
+                    exchange_rate: None,
+                    exchange_rate_source: None,
+                    exchange_rate_date: None,
+                    huf_equivalent_total: None,
+                },
+                None,
+            ),
+        };
     // PR-33 / session-37 — typed wire emit of the latest NAV ack
     // for this invoice. `trace.last_ack_status` carries the raw
     // persisted string from `InvoiceAckStatusPayload.ack_status`;
     // parse it to the four-valued `AckStatus` enum at the wire
     // boundary. Unknown strings fall through to `None` (the audit-
     // entries drill-down still exposes the raw value).
-    let last_ack_status = trace
-        .last_ack_status
-        .as_deref()
-        .and_then(parse_ack_status);
+    let last_ack_status = trace.last_ack_status.as_deref().and_then(parse_ack_status);
+    let payment = trace.payment.clone().map(PaymentRecordSummary::from);
     Ok(Some(InvoiceDetailResponse {
         invoice_id: invoice_id.to_string(),
         sequence_number,
@@ -4527,6 +5886,10 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         exchange_rate_source: currency_metadata.exchange_rate_source,
         exchange_rate_date: currency_metadata.exchange_rate_date,
         huf_equivalent_total: currency_metadata.huf_equivalent_total,
+        payment,
+        // PR-73 / ADR-0040 §addendum — bank-account snapshot for the
+        // SPA's "Pay to" sub-section. `null` for pre-PR-73 / CLI rows.
+        bank_account: bank_snapshot.map(BankAccountSnapshotResponse::from_typed),
     }))
 }
 
@@ -4602,14 +5965,16 @@ struct ReadInvoiceRow {
     #[allow(dead_code)]
     idempotency_key: billing::IdempotencyKey,
     currency_metadata: InvoiceCurrencyMetadata,
+    /// PR-73 / ADR-0040 §addendum — typed bank-account snapshot loaded
+    /// from the five `bank_account_*` invoice columns. `None` for pre-
+    /// PR-73 / CLI-issued rows (those rows have NULL across all five
+    /// columns; `InvoiceBankSnapshot.into_typed()` returns `None`).
+    bank_snapshot: Option<aberp_billing::BankAccountSnapshot>,
 }
 
 /// Scoped read tx + billing lookup; returns None if the row is not
 /// present.
-fn read_invoice_row(
-    conn: &mut Connection,
-    invoice_id: &str,
-) -> Result<Option<ReadInvoiceRow>> {
+fn read_invoice_row(conn: &mut Connection, invoice_id: &str) -> Result<Option<ReadInvoiceRow>> {
     let tx = conn
         .transaction()
         .context("begin read transaction for invoice lookup (serve)")?;
@@ -4624,11 +5989,17 @@ fn read_invoice_row(
     };
     let currency_metadata = load_invoice_currency_metadata_in_tx(&tx, invoice_id)
         .context("load_invoice_currency_metadata_in_tx (serve)")?;
+    // PR-73 / ADR-0040 §addendum — read the five bank-snapshot columns
+    // in the same tx so list + detail share one read trip.
+    let bank_snapshot = load_invoice_bank_snapshot_in_tx(&tx, invoice_id)
+        .context("load_invoice_bank_snapshot_in_tx (serve)")?
+        .into_typed();
     tx.commit().context("commit read transaction (serve)")?;
     Ok(Some(ReadInvoiceRow {
         ready_invoice: pair.0,
         idempotency_key: pair.1,
         currency_metadata,
+        bank_snapshot,
     }))
 }
 
@@ -4679,6 +6050,14 @@ struct InvoiceTrace {
     /// PR-23 / ADR-0036 §4 — base of an `InvoiceModificationIssued`
     /// chain entry. Set via [`extract_chain_link`].
     is_amended_base: bool,
+    /// PR-70 / ADR-0039 §2 — most-recent `InvoicePaymentRecorded`
+    /// payload's operator-facing fields for the SPA's Paid chip.
+    /// `Some(...)` when at least one payment entry exists for this
+    /// invoice; the audit ledger is append-only so once `Some`,
+    /// stays `Some`. Does NOT change `derive_state` — paid-vs-unpaid
+    /// is operational metadata, separate from the NAV regulatory
+    /// ladder per ADR-0039 §3.
+    payment: Option<PaymentRecord>,
 }
 
 impl InvoiceTrace {
@@ -4752,6 +6131,29 @@ impl InvoiceTrace {
             }
             EventKind::InvoiceMarkedAbandoned => {
                 self.has_marked_abandoned = true;
+            }
+            EventKind::InvoicePaymentRecorded => {
+                // PR-70 / ADR-0039 §2 — capture the operator-facing
+                // payment fields onto the trace. Walk is in seq
+                // order (oldest → newest), so the last matching
+                // entry wins — defensive against a hypothetical
+                // future "amend payment" PR that appends a fresh
+                // entry without breaking the no-double-pay v1
+                // invariant the route layer enforces.
+                if let Ok(parsed) = serde_json::from_slice::<
+                    audit_payloads::InvoicePaymentRecordedPayload,
+                >(&entry.payload)
+                {
+                    if parsed.invoice_id == invoice_id {
+                        self.payment = Some(PaymentRecord {
+                            paid_at: parsed.paid_at,
+                            amount_minor: parsed.amount_minor,
+                            currency: parsed.currency,
+                            method: parsed.method,
+                            reference: parsed.reference,
+                        });
+                    }
+                }
             }
             _ => {}
         }
@@ -4985,25 +6387,31 @@ mod tests {
     /// would surface as an `INVALID_SECURITY_USER` from NAV — a
     /// confusing failure mode CLAUDE.md rule 12 names.
     ///
+    /// PR-66 / session-87 — fixtures updated to the wire-real
+    /// `<common:taxpayerId>` shape (PR-50 / session-70 added the
+    /// `common:` prefix to the emitter but this extractor + its
+    /// fixtures missed the rename; the tests passed-but-lied per
+    /// CLAUDE.md rule 9 until session 87's live error on invoice
+    /// 16 surfaced the divergence).
+    ///
     /// CLAUDE.md rule 9: happy path + each loud-fail arm pinned
     /// individually so a regression that collapsed validation
     /// cannot pass every assertion vacuously.
     #[test]
     fn parse_supplier_tax_number_from_xml_extracts_eight_digit_base() {
-        // Happy path — well-formed body.
+        // Happy path — well-formed body matching the wire shape
+        // the PR-50 emitter writes (common: prefix on the three
+        // structured children of <supplierTaxNumber>).
         let xml = b"<?xml version=\"1.0\"?>\
             <InvoiceData>\
             <invoiceNumber>INV-default/00013</invoiceNumber>\
             <invoiceMain><invoice><invoiceHead>\
             <supplierInfo>\
-            <supplierTaxNumber><taxpayerId>12345678</taxpayerId><vatCode>1</vatCode><countyCode>42</countyCode></supplierTaxNumber>\
+            <supplierTaxNumber><common:taxpayerId>12345678</common:taxpayerId><common:vatCode>1</common:vatCode><common:countyCode>42</common:countyCode></supplierTaxNumber>\
             <supplierName>Test Kft.</supplierName>\
             </supplierInfo>\
             </invoiceHead></invoice></invoiceMain></InvoiceData>";
-        assert_eq!(
-            parse_supplier_tax_number_from_xml(xml).unwrap(),
-            "12345678"
-        );
+        assert_eq!(parse_supplier_tax_number_from_xml(xml).unwrap(), "12345678");
     }
 
     #[test]
@@ -5018,15 +6426,40 @@ mod tests {
         );
     }
 
+    /// PR-66 / session-87 — the exact regression class that bit
+    /// invoice 16 on NAV-test. The emitter writes
+    /// `<common:taxpayerId>` (PR-50); a fixture lacking the prefix
+    /// must loud-fail with a message that points the operator at
+    /// the EMITTER (not at relaxing this scan). The message must
+    /// name `common:taxpayerId` so a future contributor reading
+    /// the error sees the namespace requirement without diffing
+    /// commit history.
+    #[test]
+    fn parse_supplier_tax_number_from_xml_rejects_bare_prefix_taxpayer_id() {
+        let xml = b"<?xml version=\"1.0\"?>\
+            <InvoiceData><invoiceMain><invoice><invoiceHead>\
+            <supplierInfo>\
+            <supplierTaxNumber><taxpayerId>12345678</taxpayerId><vatCode>1</vatCode><countyCode>42</countyCode></supplierTaxNumber>\
+            </supplierInfo>\
+            </invoiceHead></invoice></invoiceMain></InvoiceData>";
+        let err = parse_supplier_tax_number_from_xml(xml).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("common:taxpayerId"),
+            "bare-prefix rejection must name the required `common:` prefix: {msg}"
+        );
+    }
+
     #[test]
     fn parse_supplier_tax_number_from_xml_rejects_non_eight_digit() {
         // 9-digit value — the dashed full form (12345678-1-42) would
         // arrive here without the dashes stripped, which is exactly
-        // the failure mode the loud-fail catches.
+        // the failure mode the loud-fail catches. PR-66 — fixture
+        // uses the wire-real `common:` prefix.
         let xml = b"<?xml version=\"1.0\"?>\
             <InvoiceData><invoiceMain><invoice><invoiceHead>\
             <supplierInfo>\
-            <supplierTaxNumber><taxpayerId>123456789</taxpayerId></supplierTaxNumber>\
+            <supplierTaxNumber><common:taxpayerId>123456789</common:taxpayerId></supplierTaxNumber>\
             </supplierInfo>\
             </invoiceHead></invoice></invoiceMain></InvoiceData>";
         let err = parse_supplier_tax_number_from_xml(xml).unwrap_err();
@@ -5035,6 +6468,81 @@ mod tests {
             msg.contains("8 ASCII digits"),
             "non-8-digit error must name the constraint: {msg}"
         );
+    }
+
+    /// PR-66 / session-87 — the load-bearing cross-source pin. Runs
+    /// `crate::nav_xml::render_invoice_data` (the production emit
+    /// path) for invoice 16's actual supplier and customer tax
+    /// numbers (Áben Consulting KFT. `24904362-2-41`, AZ9 Services
+    /// `27952890-2-42` per `~/.aberp/serve/test/issued/01KSJVFW...
+    /// xml`) and feeds the resulting bytes through
+    /// `parse_supplier_tax_number_from_xml` — the very extractor
+    /// that loud-failed at submit time before this fix.
+    ///
+    /// Before PR-66 the bare-prefix fixtures in the inline tests
+    /// above let the function appear to work while wire reality
+    /// (the `common:`-prefixed emit) silently broke the extractor.
+    /// This test closes that divergence by forcing the extractor
+    /// against bytes the emitter actually produces; a future
+    /// regression on EITHER side surfaces here at CI time. CLAUDE.md
+    /// rule 9 / rule 7 — two sources of truth must agree, and a
+    /// test that crosses both is the load-bearing closer.
+    #[test]
+    fn parse_supplier_tax_number_from_xml_round_trips_against_emitter() {
+        use aberp_billing::{
+            Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
+        };
+        use time::OffsetDateTime;
+
+        let invoice = ReadyInvoice {
+            id: InvoiceId::new(),
+            series_id: SeriesId::new(),
+            customer_id: CustomerId::new(),
+            sequence_number: 16,
+            fiscal_year: 2026,
+            lines: vec![LineItem {
+                description: "Try_to_save_test".to_string(),
+                quantity: 1,
+                unit_price: Huf(69),
+                vat_rate_basis_points: 2700,
+            }],
+            issue_date: OffsetDateTime::now_utc(),
+        };
+        let series = SeriesCode::new("INV-default".to_string()).unwrap();
+        let parties = crate::nav_xml::NavParties {
+            supplier: crate::nav_xml::SupplierInfo {
+                tax_number: "24904362-2-41".to_string(),
+                name: "Aben Consulting Kft".to_string(),
+                address_country_code: "HU".to_string(),
+                address_postal_code: "1037".to_string(),
+                address_city: "Budapest".to_string(),
+                address_street: "Visszatero koz 6".to_string(),
+            },
+            customer: crate::nav_xml::CustomerInfo {
+                tax_number: "27952890-2-42".to_string(),
+                name: "AZ9 Services".to_string(),
+            },
+        };
+
+        let xml =
+            crate::nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+                .expect("emitter must succeed on the invoice-16 fixture");
+
+        let extracted = parse_supplier_tax_number_from_xml(&xml)
+            .expect("extractor must round-trip against the production emitter");
+        assert_eq!(
+            extracted, "24904362",
+            "extractor must return Áben's 8-digit base from the emitted bytes"
+        );
+
+        // Belt-and-braces: confirm the v3.0 invariant check also
+        // passes on these bytes. If a future change widens the
+        // emitter without updating the invariant check (or vice
+        // versa), this assertion surfaces the divergence in the
+        // same test that exercises the extractor — the same
+        // failure mode session 87 closed.
+        aberp_nav_xsd_validator::validate_invoice_data(&xml)
+            .expect("v3.0 invariant check must pass on the same bytes the extractor accepts");
     }
 
     #[test]
@@ -5189,6 +6697,14 @@ mod tests {
             exchange_rate_source: None,
             exchange_rate_date: None,
             huf_equivalent_total: None,
+            // PR-73 / ADR-0040 §addendum — test fixture; the five
+            // bank-account fields stay `None` (matches the pre-PR-73
+            // ledger entries the audit-query tests round-trip).
+            bank_account_id: None,
+            bank_account_currency: None,
+            bank_account_number: None,
+            bank_account_bank_name: None,
+            bank_account_swift_bic: None,
         };
         ledger
             .append(
@@ -5357,13 +6873,7 @@ mod tests {
         idem: IdempotencyKey,
     ) {
         let payload = audit_payloads::InvoiceStornoIssuedPayload::new(
-            storno_id,
-            2,
-            "rsv_test",
-            idem,
-            base_id,
-            1,
-            1,
+            storno_id, 2, "rsv_test", idem, base_id, 1, 1,
         );
         ledger
             .append(
@@ -5445,14 +6955,20 @@ mod tests {
         // 1. Unknown — no entries for this invoice.
         {
             let (ledger, _actor) = fixture_ledger();
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Unknown);
+            assert_eq!(
+                trace_for(&ledger, "inv_A").derive_state(),
+                InvoiceState::Unknown
+            );
         }
         // 2. Ready — Draft only.
         {
             let (mut ledger, actor) = fixture_ledger();
             let idem = IdempotencyKey::new();
             write_draft(&mut ledger, &actor, "inv_A", idem);
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Ready);
+            assert_eq!(
+                trace_for(&ledger, "inv_A").derive_state(),
+                InvoiceState::Ready
+            );
         }
         // 3. Pending — Attempt without Response, no Check entry.
         //    Mirrors stuck_precondition's
@@ -5462,7 +6978,10 @@ mod tests {
             let idem = IdempotencyKey::new();
             write_draft(&mut ledger, &actor, "inv_A", idem);
             write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Pending);
+            assert_eq!(
+                trace_for(&ledger, "inv_A").derive_state(),
+                InvoiceState::Pending
+            );
         }
         // 4. PendingNavExists — Pending + latest Check is exists.
         //    ADR-0033 §6: Layer-2 entries are informational at the
@@ -5493,7 +7012,10 @@ mod tests {
                 idem,
                 "TXID-A",
             );
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Submitted);
+            assert_eq!(
+                trace_for(&ledger, "inv_A").derive_state(),
+                InvoiceState::Submitted
+            );
         }
         // 6. Recovered — Response carries QueryInvoiceDataResponse
         //    bytes. ADR-0034 §4 + ADR-0035 §4 / A91.
@@ -5504,7 +7026,10 @@ mod tests {
             write_submission_attempt(&mut ledger, &actor, "inv_A", idem);
             write_check_performed(&mut ledger, &actor, "inv_A", idem, "exists");
             write_submission_response_recovered(&mut ledger, &actor, "inv_A", idem, "TXID-A");
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Recovered);
+            assert_eq!(
+                trace_for(&ledger, "inv_A").derive_state(),
+                InvoiceState::Recovered
+            );
         }
         // 7. Finalized — last ack is SAVED. Mirrors
         //    stuck_precondition's `finalized_when_last_ack_is_saved`.
@@ -5522,7 +7047,10 @@ mod tests {
             );
             write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "PROCESSING");
             write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "SAVED");
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Finalized);
+            assert_eq!(
+                trace_for(&ledger, "inv_A").derive_state(),
+                InvoiceState::Finalized
+            );
         }
         // 8. Rejected — last ack is ABORTED. Mirrors
         //    stuck_precondition's `rejected_when_last_ack_is_aborted`.
@@ -5539,7 +7067,10 @@ mod tests {
                 "TXID-A",
             );
             write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "ABORTED");
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Rejected);
+            assert_eq!(
+                trace_for(&ledger, "inv_A").derive_state(),
+                InvoiceState::Rejected
+            );
         }
         // 9. Storno — InvoiceStornoIssued points at this id as
         //    base. ADR-0009 §2's Finalized → Storno transition.
@@ -5562,12 +7093,18 @@ mod tests {
             // chain-link pointing at the base.
             write_draft(&mut ledger, &actor, "inv_B", idem_storno);
             write_storno_issued(&mut ledger, &actor, "inv_B", "inv_A", idem_storno);
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Storno);
+            assert_eq!(
+                trace_for(&ledger, "inv_A").derive_state(),
+                InvoiceState::Storno
+            );
             // The storno's OWN trace is `Ready` — it has its own
             // Draft but no Attempt yet. (In production the storno
             // would proceed through the same submit/poll/ack
             // lifecycle; the test fixture stops at the draft.)
-            assert_eq!(trace_for(&ledger, "inv_B").derive_state(), InvoiceState::Ready);
+            assert_eq!(
+                trace_for(&ledger, "inv_B").derive_state(),
+                InvoiceState::Ready
+            );
         }
         // 10. Amended — InvoiceModificationIssued points at this id
         //     as base. ADR-0009 §2's Finalized → Amended transition.
@@ -5587,7 +7124,10 @@ mod tests {
             write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "SAVED");
             write_draft(&mut ledger, &actor, "inv_M", idem_mod);
             write_modification_issued(&mut ledger, &actor, "inv_M", "inv_A", idem_mod);
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Amended);
+            assert_eq!(
+                trace_for(&ledger, "inv_A").derive_state(),
+                InvoiceState::Amended
+            );
         }
         // 11. Abandoned — InvoiceMarkedAbandoned exists. Mirrors
         //     stuck_precondition's
@@ -5605,7 +7145,10 @@ mod tests {
                 "TXID-A",
             );
             write_marked_abandoned(&mut ledger, &actor, "inv_A", idem, "TXID-A");
-            assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Abandoned);
+            assert_eq!(
+                trace_for(&ledger, "inv_A").derive_state(),
+                InvoiceState::Abandoned
+            );
         }
     }
 
@@ -5633,7 +7176,10 @@ mod tests {
         write_ack_status(&mut ledger, &actor, "inv_A", "TXID-A", "SAVED");
         write_storno_issued(&mut ledger, &actor, "inv_B", "inv_A", idem_storno);
         write_marked_abandoned(&mut ledger, &actor, "inv_A", idem_base, "TXID-A");
-        assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Abandoned);
+        assert_eq!(
+            trace_for(&ledger, "inv_A").derive_state(),
+            InvoiceState::Abandoned
+        );
     }
 
     /// PR-23 / ADR-0036 §3 priority-ordering pin: Recovered wins
@@ -5660,7 +7206,10 @@ mod tests {
         // from-nav precondition guard prevents this, but the UI
         // walker handles whatever the ledger carries).
         write_submission_response_recovered(&mut ledger, &actor, "inv_A", idem, "TXID-B");
-        assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Recovered);
+        assert_eq!(
+            trace_for(&ledger, "inv_A").derive_state(),
+            InvoiceState::Recovered
+        );
     }
 
     /// PR-23 / ADR-0036 §5 substring-scan discriminator pin:
@@ -5674,9 +7223,7 @@ mod tests {
     /// collapse Recovered into Submitted.
     #[test]
     fn is_recovered_response_xml_prefix_match() {
-        assert!(is_recovered_response_xml(
-            b"<QueryInvoiceDataResponse/>"
-        ));
+        assert!(is_recovered_response_xml(b"<QueryInvoiceDataResponse/>"));
         assert!(is_recovered_response_xml(
             b"<?xml version=\"1.0\"?><ns0:QueryInvoiceDataResponse xmlns:ns0=\"http://schemas.nav.gov.hu/OSA/3.0/api\"/>"
         ));
@@ -5823,9 +7370,15 @@ mod tests {
         // Storno points at inv_B as base.
         write_storno_issued(&mut ledger, &actor, "inv_S", "inv_B", idem_storno);
         // inv_A is unaffected — still Ready.
-        assert_eq!(trace_for(&ledger, "inv_A").derive_state(), InvoiceState::Ready);
+        assert_eq!(
+            trace_for(&ledger, "inv_A").derive_state(),
+            InvoiceState::Ready
+        );
         // inv_B IS flipped.
-        assert_eq!(trace_for(&ledger, "inv_B").derive_state(), InvoiceState::Storno);
+        assert_eq!(
+            trace_for(&ledger, "inv_B").derive_state(),
+            InvoiceState::Storno
+        );
     }
 
     /// PR-28 / ADR-0036 §9 — the typed `InvoiceState` enum MUST
@@ -5855,8 +7408,8 @@ mod tests {
             (InvoiceState::Abandoned, "Abandoned"),
         ];
         for (variant, expected) in cases {
-            let value = serde_json::to_value(variant)
-                .expect("InvoiceState variants must always serialise");
+            let value =
+                serde_json::to_value(variant).expect("InvoiceState variants must always serialise");
             assert_eq!(
                 value,
                 serde_json::Value::String(expected.to_string()),
@@ -5903,9 +7456,11 @@ mod tests {
             total_gross: Some(123_456),
             has_chain_children: true,
             currency: Currency::Huf,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
         };
-        let v = serde_json::to_value(&with_chain)
-            .expect("InvoiceListItem must always serialise");
+        let v = serde_json::to_value(&with_chain).expect("InvoiceListItem must always serialise");
         assert_eq!(
             v.get("has_chain_children").and_then(|x| x.as_bool()),
             Some(true),
@@ -5920,9 +7475,12 @@ mod tests {
             total_gross: None,
             has_chain_children: false,
             currency: Currency::Huf,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
         };
-        let v = serde_json::to_value(&without_chain)
-            .expect("InvoiceListItem must always serialise");
+        let v =
+            serde_json::to_value(&without_chain).expect("InvoiceListItem must always serialise");
         assert_eq!(
             v.get("has_chain_children").and_then(|x| x.as_bool()),
             Some(false),
@@ -5988,9 +7546,10 @@ mod tests {
             exchange_rate_source: None,
             exchange_rate_date: None,
             huf_equivalent_total: None,
+            payment: None,
+            bank_account: None,
         };
-        let v = serde_json::to_value(&empty)
-            .expect("InvoiceDetailResponse must always serialise");
+        let v = serde_json::to_value(&empty).expect("InvoiceDetailResponse must always serialise");
         let arr = v
             .get("chain_children")
             .and_then(|x| x.as_array())
@@ -6031,9 +7590,11 @@ mod tests {
             exchange_rate_source: None,
             exchange_rate_date: None,
             huf_equivalent_total: None,
+            payment: None,
+            bank_account: None,
         };
-        let v = serde_json::to_value(&with_chain)
-            .expect("InvoiceDetailResponse must always serialise");
+        let v =
+            serde_json::to_value(&with_chain).expect("InvoiceDetailResponse must always serialise");
         let arr = v
             .get("chain_children")
             .and_then(|x| x.as_array())
@@ -6102,8 +7663,8 @@ mod tests {
             (AckStatus::Aborted, "ABORTED"),
         ];
         for (variant, expected) in cases {
-            let value = serde_json::to_value(variant)
-                .expect("AckStatus variants must always serialise");
+            let value =
+                serde_json::to_value(variant).expect("AckStatus variants must always serialise");
             assert_eq!(
                 value,
                 serde_json::Value::String(expected.to_string()),
@@ -6133,8 +7694,7 @@ mod tests {
             AckStatus::Saved,
             AckStatus::Aborted,
         ] {
-            let wire = serde_json::to_value(variant)
-                .expect("AckStatus must serialise");
+            let wire = serde_json::to_value(variant).expect("AckStatus must serialise");
             let s = wire.as_str().expect("AckStatus emits a string");
             assert_eq!(
                 parse_ack_status(s),
@@ -6196,11 +7756,14 @@ mod tests {
             exchange_rate_source: None,
             exchange_rate_date: None,
             huf_equivalent_total: None,
+            payment: None,
+            bank_account: None,
         };
-        let v = serde_json::to_value(&none)
-            .expect("InvoiceDetailResponse must always serialise");
+        let v = serde_json::to_value(&none).expect("InvoiceDetailResponse must always serialise");
         assert!(
-            v.get("last_ack_status").map(|x| x.is_null()).unwrap_or(false),
+            v.get("last_ack_status")
+                .map(|x| x.is_null())
+                .unwrap_or(false),
             "last_ack_status must serialise as JSON null when there is no ack",
         );
 
@@ -6229,9 +7792,11 @@ mod tests {
                 exchange_rate_source: None,
                 exchange_rate_date: None,
                 huf_equivalent_total: None,
+                payment: None,
+                bank_account: None,
             };
-            let v = serde_json::to_value(&some)
-                .expect("InvoiceDetailResponse must always serialise");
+            let v =
+                serde_json::to_value(&some).expect("InvoiceDetailResponse must always serialise");
             assert_eq!(
                 v.get("last_ack_status").and_then(|x| x.as_str()),
                 Some(expected),
@@ -6267,9 +7832,11 @@ mod tests {
             total_gross: Some(123_456),
             has_chain_children: false,
             currency: Currency::Huf,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
         };
-        let v = serde_json::to_value(&huf)
-            .expect("InvoiceListItem must always serialise");
+        let v = serde_json::to_value(&huf).expect("InvoiceListItem must always serialise");
         assert_eq!(
             v.get("currency").and_then(|x| x.as_str()),
             Some("HUF"),
@@ -6284,14 +7851,171 @@ mod tests {
             total_gross: Some(863_600),
             has_chain_children: false,
             currency: Currency::Eur,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
         };
-        let v = serde_json::to_value(&eur)
-            .expect("InvoiceListItem must always serialise");
+        let v = serde_json::to_value(&eur).expect("InvoiceListItem must always serialise");
         assert_eq!(
             v.get("currency").and_then(|x| x.as_str()),
             Some("EUR"),
             "currency must serialise as the ISO 4217 string per ADR-0037 §3",
         );
+    }
+
+    /// PR-65 / session-86 — `InvoiceListItem` MUST carry a typed
+    /// `buyer_name: Option<String>` field on the JSON wire shape.
+    /// The SPA's list-row "Partner" column reads this field strictly
+    /// (the TS interface in `apps/aberp-ui/ui/src/lib/api.ts` types
+    /// it as `string | null`); a silent field rename, removal, or
+    /// shape change (e.g., turning the optional into a flat string
+    /// with `""` as the empty marker) would diverge the wire shape
+    /// and collapse the operator-visible Partner column. CLAUDE.md
+    /// rule 12: pin the contract loud.
+    ///
+    /// CLAUDE.md rule 9: BOTH the `Some` (partner name present) AND
+    /// `None` (side-store missing — CLI-issued or pre-PR-47α
+    /// invoices) branches are covered so a regression that hard-
+    /// codes the field to one value cannot pass both assertions
+    /// vacuously. The `None` case asserts JSON `null`, not key-
+    /// absent — a future serde `skip_serializing_if` regression
+    /// would surface here.
+    #[test]
+    fn invoice_list_item_emits_buyer_name() {
+        let with_name = InvoiceListItem {
+            invoice_id: "inv_NAMED".to_string(),
+            sequence_number: 1,
+            fiscal_year: 2026,
+            state: InvoiceState::Ready,
+            total_gross: Some(50_000),
+            has_chain_children: false,
+            currency: Currency::Huf,
+            buyer_name: Some("Budapesti Sport-Egyesület Kft.".to_string()),
+            payment: None,
+            bank_account: None,
+        };
+        let v = serde_json::to_value(&with_name).expect("InvoiceListItem must always serialise");
+        assert_eq!(
+            v.get("buyer_name").and_then(|x| x.as_str()),
+            Some("Budapesti Sport-Egyesület Kft."),
+            "buyer_name must serialise as a JSON string when Some",
+        );
+
+        let without_name = InvoiceListItem {
+            invoice_id: "inv_BLANK".to_string(),
+            sequence_number: 2,
+            fiscal_year: 2026,
+            state: InvoiceState::Ready,
+            total_gross: None,
+            has_chain_children: false,
+            currency: Currency::Huf,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
+        };
+        let v = serde_json::to_value(&without_name).expect("InvoiceListItem must always serialise");
+        assert!(
+            v.get("buyer_name").map(|x| x.is_null()).unwrap_or(false),
+            "buyer_name MUST serialise as JSON null when None (not absent) — the SPA reads `string | null` strictly",
+        );
+    }
+
+    /// PR-65 / session-86 — `read_buyer_name_from_side_store` MUST
+    /// resolve the `<ULID>.input.json` sibling of a NAV-XML path
+    /// and pull `customer.name` out of it. The list endpoint
+    /// consumes this helper for the Partner column; a regression
+    /// that returns the wrong field, fails to trim, or panics on a
+    /// missing file would collapse the column for every row at
+    /// once. Pins three cases per CLAUDE.md rule 9 so neither a
+    /// hard-coded `Some(_)` nor `None` shortcut passes vacuously:
+    ///
+    ///   1. Side-store present + populated → `Some(trimmed_name)`.
+    ///   2. Side-store missing on disk → `None` (no panic).
+    ///   3. Side-store present but `customer.name` is blank /
+    ///      whitespace → `None` (no fabricated empty label).
+    #[test]
+    fn read_buyer_name_from_side_store_round_trip() {
+        // Per-test scratch dir under the platform temp root. The
+        // workspace does NOT pin `tempfile` as a dev-dep (the other
+        // serve.rs test sites that mention "tempfile" do so only in
+        // comments), so a hand-rolled unique-suffix dir keeps the
+        // dev-dep surface unchanged. ULID timestamp + thread id give
+        // collision-free uniqueness for concurrent test threads.
+        let scratch = std::env::temp_dir().join(format!(
+            "aberp-pr65-side-store-{}-{:?}",
+            ulid::Ulid::new(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+
+        // Case 1: side-store present + populated name.
+        let xml_path = scratch.join("01HXYZTEST.xml");
+        let json = serde_json::json!({
+            "supplier": {
+                "taxNumber": "12345678-1-42",
+                "name": "ACME Kft.",
+                "address": {
+                    "countryCode": "HU",
+                    "postalCode": "1000",
+                    "city": "Budapest",
+                    "street": "Main 1",
+                }
+            },
+            "customer": {
+                "taxNumber": "87654321-2-13",
+                "name": "  BSCE Kft.  ",
+            },
+            "lines": [],
+        });
+        std::fs::write(
+            sibling_input_json_path(&xml_path),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_buyer_name_from_side_store(&xml_path),
+            Some("BSCE Kft.".to_string()),
+            "populated customer.name must round-trip (and trim surrounding whitespace)",
+        );
+
+        // Case 2: side-store missing on disk — no panic, returns None.
+        let missing_xml = scratch.join("01HXYZMISSING.xml");
+        assert_eq!(
+            read_buyer_name_from_side_store(&missing_xml),
+            None,
+            "absent side-store must return None (not panic) — CLI-issued invoices have no companion file",
+        );
+
+        // Case 3: blank customer.name → None (no fabricated label).
+        let blank_xml = scratch.join("01HXYZBLANK.xml");
+        let blank_json = serde_json::json!({
+            "supplier": {
+                "taxNumber": "12345678-1-42",
+                "name": "ACME Kft.",
+                "address": {
+                    "countryCode": "HU",
+                    "postalCode": "1000",
+                    "city": "Budapest",
+                    "street": "Main 1",
+                }
+            },
+            "customer": { "taxNumber": "87654321-2-13", "name": "   " },
+            "lines": [],
+        });
+        std::fs::write(
+            sibling_input_json_path(&blank_xml),
+            serde_json::to_vec(&blank_json).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_buyer_name_from_side_store(&blank_xml),
+            None,
+            "blank / whitespace-only customer.name must collapse to None — em-dash in the SPA, not an empty cell",
+        );
+
+        // Best-effort cleanup; ignore errors so a partial dir doesn't
+        // mask the actual assertion outcomes.
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// PR-44ε / session-53 — `InvoiceDetailResponse` MUST carry the
@@ -6340,9 +8064,10 @@ mod tests {
             exchange_rate_source: None,
             exchange_rate_date: None,
             huf_equivalent_total: None,
+            payment: None,
+            bank_account: None,
         };
-        let v = serde_json::to_value(&huf)
-            .expect("InvoiceDetailResponse must always serialise");
+        let v = serde_json::to_value(&huf).expect("InvoiceDetailResponse must always serialise");
         assert_eq!(
             v.get("currency").and_then(|x| x.as_str()),
             Some("HUF"),
@@ -6377,9 +8102,10 @@ mod tests {
             exchange_rate_source: Some("MNB".to_string()),
             exchange_rate_date: Some("2026-05-22".to_string()),
             huf_equivalent_total: Some(3_500_565),
+            payment: None,
+            bank_account: None,
         };
-        let v = serde_json::to_value(&eur)
-            .expect("InvoiceDetailResponse must always serialise");
+        let v = serde_json::to_value(&eur).expect("InvoiceDetailResponse must always serialise");
         assert_eq!(
             v.get("currency").and_then(|x| x.as_str()),
             Some("EUR"),
