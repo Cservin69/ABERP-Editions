@@ -63,7 +63,7 @@ fn create_default_series<S: BillingStore + ?Sized>(store: &mut S) -> SeriesId {
 fn one_line() -> LineItem {
     LineItem {
         description: "Test widget".to_string(),
-        quantity: 1,
+        quantity: rust_decimal::Decimal::from(1),
         unit_price: Huf(1_000),
         vat_rate_basis_points: 2700, // 27% Hungarian standard rate
         note: None,

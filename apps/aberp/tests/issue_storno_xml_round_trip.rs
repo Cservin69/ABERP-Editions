@@ -41,7 +41,7 @@ fn build_minimal_storno_invoice() -> ReadyInvoice {
         fiscal_year: 0,
         lines: vec![LineItem {
             description: "Cancellation of widget".to_string(),
-            quantity: 2,
+            quantity: rust_decimal::Decimal::from(2),
             // Positive in the in-memory model — the emitter handles
             // negation by constructing a parallel negated Vec; see
             // `nav_xml::render_storno_data` doc comment.

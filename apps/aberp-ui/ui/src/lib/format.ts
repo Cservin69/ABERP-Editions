@@ -296,3 +296,63 @@ export function formatMinorToInput(minor: number, currency: Currency): string {
   const fracStr = String(frac).padStart(decimals, "0");
   return `${sign}${whole}.${fracStr}`;
 }
+
+/** S157 — parse an operator-typed line quantity into the canonical
+ * dot-decimal string the wire carries (e.g. `"1.5"`).
+ *
+ * **The bug this closes**: pre-S157 the IssueInvoice line quantity was an
+ * `<input type="number" step="1">` bound to a `number`, so the operator
+ * could only enter whole units — `1.5` consulting days was unreachable.
+ *
+ * **Rules** (exhaustively pinned in `format.test.ts`):
+ *   - `.` and `,` are both accepted as the decimal separator (Hungarian
+ *     writes `1,5`; the operator's keyboard often types `1.5`). Both
+ *     decode to the same value.
+ *   - ASCII spaces + NBSP are stripped (paste tolerance).
+ *   - The value must be strictly positive; `0`, negatives, blank, and
+ *     non-numeric all return `null`.
+ *   - At most 6 fractional digits — NAV's `<quantity>` ceiling and the
+ *     `DECIMAL(18,6)` storage scale. More digits return `null` rather
+ *     than silently rounding (CLAUDE.md rule 12 — fail loud).
+ *
+ * Returns the canonical **string** (not a number) so the wire stays exact
+ * — the C11 Decimal-as-string convention the `exchange_rate` field
+ * already uses. The composer sends `"0"` on `null` so the backend
+ * preflight's `LineItemQuantityZero` renders the inline error rather than
+ * a silent bad-quantity issuance. Pure function — no DOM — so vitest pins
+ * every rule-table row without mounting a Svelte component.
+ */
+export function parseDecimalQuantity(raw: string): string | null {
+  if (typeof raw !== "string") return null;
+  const noSpaces = raw.trim().replace(/[\s ]/g, "");
+  if (noSpaces === "") return null;
+  // One-or-more digits, optionally a single `.`/`,` separator + 1..6
+  // fractional digits. No sign (quantities are positive), no bare-decimal
+  // `.5`, no trailing separator.
+  const match = /^(\d+)(?:[.,](\d{1,6}))?$/.exec(noSpaces);
+  if (!match) return null;
+  const whole = match[1];
+  const frac = match[2] ?? "";
+  // Canonical dot-decimal; trim trailing-zero fractional noise so `1,50`
+  // and `1.5` collapse to the same `"1.5"`.
+  const fracTrimmed = frac.replace(/0+$/, "");
+  const canonical = fracTrimmed === "" ? whole : `${whole}.${fracTrimmed}`;
+  // Reject zero (`0`, `0.0`, `00`) — strictly positive only.
+  if (/^0+$/.test(canonical.replace(".", ""))) return null;
+  return canonical;
+}
+
+/** S157 — format a line quantity (canonical dot-decimal string OR a
+ * number, to tolerate both the new string wire shape and pre-S157
+ * side-store rows that carry a JSON number) for read-only display in the
+ * Hungarian convention: decimal **comma**, trailing zeros trimmed
+ * (`1.5` → `1,5`, `1` → `1`, `0.25` → `0,25`). A non-numeric input passes
+ * through verbatim so a backend drift is operator-visible rather than
+ * silently zeroed (CLAUDE.md rule 12). */
+export function formatQuantity(value: string | number): string {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return String(value);
+  // `Number` already drops trailing zeros; swap the `.` for the Hungarian
+  // comma. (Quantities are small counts — no thousands grouping.)
+  return String(n).replace(".", ",");
+}

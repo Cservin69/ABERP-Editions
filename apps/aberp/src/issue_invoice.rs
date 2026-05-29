@@ -238,7 +238,13 @@ pub struct CustomerJson {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct LineJson {
     pub description: String,
-    pub quantity: u32,
+    /// S157 — decimal line quantity (1.5 days, 0.25 hours). `Decimal`'s
+    /// default serde accepts BOTH a JSON string (`"1.5"` — what the SPA
+    /// composer now sends, mirroring the C11 Decimal-as-string wire
+    /// convention used for `exchange_rate`) AND a JSON number (`1` —
+    /// pre-S157 side-stored bodies, CLI callers); it serialises back to a
+    /// string. Both legacy and new side-store rows therefore round-trip.
+    pub quantity: Decimal,
     #[serde(rename = "unitPrice")]
     pub unit_price: i64,
     #[serde(rename = "vatRatePercent")]

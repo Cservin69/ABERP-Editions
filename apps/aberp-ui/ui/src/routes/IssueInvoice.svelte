@@ -1439,13 +1439,22 @@
             {/if}
           </label>
           <label class="narrow">
+            <!-- S157 — decimal quantity. Pre-S157 this was
+                 `<input type="number" step="1">` bound to `line.quantity:
+                 number`, which rejected fractional units (1.5 days). Now
+                 a text input bound to the raw string + parsed at compose
+                 via `parseDecimalQuantity`, mirroring the unit-price
+                 input below. `inputmode="decimal"` surfaces the numeric
+                 keypad while still accepting `.` / `,` separators. -->
             <span>Qty</span>
             <input
-              type="number"
-              min="1"
-              step="1"
-              bind:value={line.quantity}
+              type="text"
+              inputmode="decimal"
+              autocomplete="off"
+              spellcheck="false"
+              bind:value={line.quantityInput}
               required
+              placeholder="1,5"
               class:input-invalid={lineErrors[index]?.quantity !== undefined}
               aria-invalid={lineErrors[index]?.quantity !== undefined}
               data-testid={`line-${index}-quantity-input`}

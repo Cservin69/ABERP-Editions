@@ -43,6 +43,7 @@
 //!     stay off the table.
 
 use aberp_billing::Currency;
+use rust_decimal::Decimal;
 
 use crate::nav_xml::{parse_hungarian_tax_number, CustomerVatStatus, SupplierConfigError};
 use crate::serve::IssueInvoiceRequest;
@@ -118,8 +119,9 @@ pub enum InvoicePreflightError {
     InvoiceLinesEmpty,
     /// `lines[line_index].description.trim().is_empty()`.
     LineItemDescriptionEmpty { line_index: usize },
-    /// `lines[line_index].quantity == 0`. u32 cannot be negative;
-    /// non-positive collapses to zero on this wire shape.
+    /// `lines[line_index].quantity <= 0`. S157 — quantity is `Decimal`;
+    /// the gate now rejects zero AND negative (the SPA composer maps an
+    /// unparseable input to `"0"` so this fires for blank/garbage too).
     LineItemQuantityZero { line_index: usize },
     /// `lines[line_index].unit_price <= 0`. An invoice with a zero or
     /// negative unit price is not a meaningful business document; a
@@ -290,8 +292,10 @@ impl InvoicePreflightError {
                 )
             }
             InvoicePreflightError::LineItemQuantityZero { line_index } => {
+                // S157 — fractional quantities are valid; the gate is
+                // "strictly positive" (nullánál nagyobb), not "≥ 1".
                 format!(
-                    "A(z) {}. tételsor mennyisége legalább 1 kell legyen.",
+                    "A(z) {}. tételsor mennyisége nullánál nagyobb kell legyen.",
                     line_index + 1
                 )
             }
@@ -370,7 +374,13 @@ impl InvoicePreflightError {
                 format!("Line {} description is required.", line_index + 1)
             }
             InvoicePreflightError::LineItemQuantityZero { line_index } => {
-                format!("Line {} quantity must be at least 1.", line_index + 1)
+                // S157 — fractional quantities are now valid (1.5 days,
+                // 0.25 hours); the gate is "strictly positive", not
+                // "integer ≥ 1".
+                format!(
+                    "Line {} quantity must be greater than zero.",
+                    line_index + 1
+                )
             }
             InvoicePreflightError::LineItemUnitPriceNonPositive { line_index, actual } => {
                 format!(
@@ -606,7 +616,10 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
             if line.description.trim().is_empty() {
                 errors.push(InvoicePreflightError::LineItemDescriptionEmpty { line_index });
             }
-            if line.quantity == 0 {
+            // S157 — quantity is `Decimal`; reject zero and negative (a
+            // line must move strictly positive units). Fractional positive
+            // values (1.5, 0.25) pass.
+            if line.quantity <= Decimal::ZERO {
                 errors.push(InvoicePreflightError::LineItemQuantityZero { line_index });
             }
             if line.unit_price <= 0 {
@@ -650,7 +663,7 @@ mod tests {
     fn good_line() -> LineJson {
         LineJson {
             description: "CNC machining service".to_string(),
-            quantity: 1,
+            quantity: Decimal::from(1),
             unit_price: 10_000,
             vat_rate_percent: 27,
             note: None,
@@ -836,11 +849,38 @@ mod tests {
     #[test]
     fn fires_line_item_quantity_zero_for_zero_quantity() {
         let mut r = good_request();
-        r.lines[0].quantity = 0;
+        r.lines[0].quantity = Decimal::ZERO;
         let errs = validate_invoice_preflight(&r);
         assert!(
             errs.contains(&InvoicePreflightError::LineItemQuantityZero { line_index: 0 }),
             "expected LineItemQuantityZero, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn fires_line_item_quantity_zero_for_negative_quantity() {
+        // S157 — negative is now reachable (Decimal, not u32) and must
+        // collapse onto the same positive-quantity gate as zero.
+        let mut r = good_request();
+        r.lines[0].quantity = Decimal::from(-1);
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.contains(&InvoicePreflightError::LineItemQuantityZero { line_index: 0 }),
+            "expected LineItemQuantityZero for negative, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_fractional_quantity() {
+        // S157 — the headline behaviour: 1.5 days is a valid quantity.
+        let mut r = good_request();
+        r.lines[0].quantity = Decimal::new(15, 1); // 1.5
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, InvoicePreflightError::LineItemQuantityZero { .. })),
+            "1.5 must not trip the quantity gate, got {errs:?}"
         );
     }
 
@@ -927,7 +967,7 @@ mod tests {
             lines: vec![
                 LineJson {
                     description: "".to_string(), // empty
-                    quantity: 0,                 // zero
+                    quantity: Decimal::ZERO,     // zero
                     unit_price: -1,              // negative
                     vat_rate_percent: 12,        // off-vocab
                     note: None,
@@ -935,7 +975,7 @@ mod tests {
                 good_line(), // line 1 is fine
                 LineJson {
                     description: "second bad line".to_string(),
-                    quantity: 1,
+                    quantity: Decimal::from(1),
                     unit_price: 10,
                     vat_rate_percent: 99, // off-vocab
                     note: None,

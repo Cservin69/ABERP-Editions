@@ -39,7 +39,7 @@ describe("composeIssueInvoiceBody", () => {
       lines: [
         {
           description: "Widget A",
-          quantity: 2,
+          quantityInput: "2",
           // PR-88 / session-113 — operator-typed raw string. HUF is
           // 0-decimal, so `"1000"` parses to 1000 minor units (= 1000
           // forints) — same wire output as the pre-PR-88
@@ -72,7 +72,7 @@ describe("composeIssueInvoiceBody", () => {
       lines: [
         {
           description: "Widget A",
-          quantity: 2,
+          quantity: "2",
           unitPrice: 1000,
           vatRatePercent: 27,
           // PR-82 — blank line note normalises to `null` on the wire
@@ -102,6 +102,50 @@ describe("composeIssueInvoiceBody", () => {
       // mirror posture as `emailBuyerOnIssue`.
       submitToNavOnIssue: true,
     });
+  });
+
+  // S157 — decimal quantity round-trips through the composer. Both `1.5`
+  // and `1,5` typed must reach the wire as the canonical string `"1.5"`.
+  it("composes a decimal quantity (1.5) to the canonical dot-decimal wire string", () => {
+    const dotForm = {
+      ...emptyForm(),
+      customerName: "C",
+      customerTaxNumber: "y",
+      lines: [
+        {
+          description: "Consulting",
+          quantityInput: "1.5",
+          unitPriceInput: "1000",
+          vatRatePercent: 27,
+          note: "",
+        },
+      ],
+    };
+    const commaForm = {
+      ...dotForm,
+      lines: [{ ...dotForm.lines[0], quantityInput: "1,5" }],
+    };
+    expect(composeIssueInvoiceBody(dotForm).lines[0].quantity).toBe("1.5");
+    // The headline requirement: `1,5` and `1.5` produce the same wire value.
+    expect(composeIssueInvoiceBody(commaForm).lines[0].quantity).toBe("1.5");
+  });
+
+  it("composes an unparseable/zero quantity to \"0\" so the backend preflight fires", () => {
+    const form = {
+      ...emptyForm(),
+      customerName: "C",
+      customerTaxNumber: "y",
+      lines: [
+        {
+          description: "Bad qty",
+          quantityInput: "",
+          unitPriceInput: "1000",
+          vatRatePercent: 27,
+          note: "",
+        },
+      ],
+    };
+    expect(composeIssueInvoiceBody(form).lines[0].quantity).toBe("0");
   });
 
   // PR-99 Item 4 Part B — submit-to-NAV toggle composer pins.
@@ -201,7 +245,7 @@ describe("composeIssueInvoiceBody", () => {
       lines: [
         {
           description: "Widget A",
-          quantity: 1,
+          quantityInput: "1",
           unitPriceInput: "1000",
           vatRatePercent: 27,
           note: "Please ship to dock B",
@@ -225,7 +269,7 @@ describe("composeIssueInvoiceBody", () => {
       lines: [
         {
           description: "Widget A",
-          quantity: 1,
+          quantityInput: "1",
           unitPriceInput: "100",
           vatRatePercent: 27,
           note: "  ",
@@ -246,7 +290,7 @@ describe("composeIssueInvoiceBody", () => {
       lines: [
         {
           description: "Widget A",
-          quantity: 1,
+          quantityInput: "1",
           unitPriceInput: "100",
           vatRatePercent: 27,
           note: "  Line A note  ",
@@ -280,7 +324,7 @@ describe("composeIssueInvoiceBody", () => {
       lines: [
         {
           description: "Consulting (1h)",
-          quantity: 8,
+          quantityInput: "8",
           // PR-88 / session-113 — operator-typed raw string. EUR is
           // 2-decimal, so `"125.00"` parses to 12500 minor units
           // (= 125.00 EUR). The pre-PR-88 form stored 12500 in
@@ -298,7 +342,7 @@ describe("composeIssueInvoiceBody", () => {
     expect(body.currency).toBe("EUR");
     expect(body.lines[0]).toEqual({
       description: "Consulting (1h)",
-      quantity: 8,
+      quantity: "8",
       unitPrice: 12500,
       vatRatePercent: 27,
       // PR-82 — blank-after-trim ⇒ null on the wire.
@@ -320,7 +364,7 @@ describe("composeIssueInvoiceBody", () => {
       lines: [
         {
           description: "  Trimmed description  ",
-          quantity: 1,
+          quantityInput: "1",
           unitPriceInput: "500",
           vatRatePercent: 27,
           note: "",
@@ -410,9 +454,9 @@ describe("composeIssueInvoiceBody", () => {
       customerTaxNumber: "y",
       currency: "HUF" as const,
       lines: [
-        { description: "A", quantity: 1, unitPriceInput: "100", vatRatePercent: 27, note: "" },
-        { description: "B", quantity: 2, unitPriceInput: "200", vatRatePercent: 5, note: "" },
-        { description: "C", quantity: 3, unitPriceInput: "300", vatRatePercent: 0, note: "" },
+        { description: "A", quantityInput: "1", unitPriceInput: "100", vatRatePercent: 27, note: "" },
+        { description: "B", quantityInput: "2", unitPriceInput: "200", vatRatePercent: 5, note: "" },
+        { description: "C", quantityInput: "3", unitPriceInput: "300", vatRatePercent: 0, note: "" },
       ],
     };
 
@@ -634,8 +678,8 @@ describe("parseInvoicePreflightErrors — per-variant rendering pins", () => {
     {
       kind: "LineItemQuantityZero",
       field_path: "lines[0].quantity",
-      message_hu: "A(z) 1. tételsor mennyisége legalább 1 kell legyen.",
-      message_en: "Line 1 quantity must be at least 1.",
+      message_hu: "A(z) 1. tételsor mennyisége nullánál nagyobb kell legyen.",
+      message_en: "Line 1 quantity must be greater than zero.",
     },
     {
       kind: "LineItemUnitPriceNonPositive",

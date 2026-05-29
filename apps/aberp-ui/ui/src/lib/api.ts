@@ -474,7 +474,10 @@ export interface IssueInvoiceRequest {
   };
   lines: Array<{
     description: string;
-    quantity: number;
+    /** S157 — canonical dot-decimal quantity string (e.g. `"1.5"`). The
+     * backend's `LineJson.quantity: Decimal` accepts this string (C11
+     * Decimal-as-string wire convention, as `exchange_rate` uses). */
+    quantity: string;
     unitPrice: number;
     vatRatePercent: number;
     /** PR-82 — buyer-facing per-line note ("Megjegyzés"). Optional;
@@ -795,7 +798,9 @@ export interface ModificationInvoiceRequest {
   };
   lines: Array<{
     description: string;
-    quantity: number;
+    /** S157 — canonical dot-decimal quantity string (e.g. `"1.5"`); see
+     * [`IssueInvoiceRequest.lines`]. */
+    quantity: string;
     unitPrice: number;
     vatRatePercent: number;
   }>;

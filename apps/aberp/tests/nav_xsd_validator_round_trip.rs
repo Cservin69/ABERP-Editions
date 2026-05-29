@@ -40,14 +40,14 @@ fn build_minimal_invoice() -> ReadyInvoice {
         lines: vec![
             LineItem {
                 description: "Test widget".to_string(),
-                quantity: 2,
+                quantity: rust_decimal::Decimal::from(2),
                 unit_price: Huf(1000),
                 vat_rate_basis_points: 2700, // 27%
                 note: None,
             },
             LineItem {
                 description: "Test installation service".to_string(),
-                quantity: 1,
+                quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(5000),
                 vat_rate_basis_points: 2700,
                 note: None,
@@ -112,6 +112,46 @@ fn emitter_minimal_invoice_passes_validator() {
             String::from_utf8_lossy(&xml)
         ),
     }
+}
+
+/// S157 — a decimal line quantity (1.5 days) must emit as
+/// `<quantity>1.5</quantity>` (dot-separated, trailing zeros trimmed),
+/// NOT truncated to `<quantity>1</quantity>`, AND the resulting body must
+/// still pass the NAV XSD validator. This pins both the emit shape and
+/// the round-trip in one test.
+#[test]
+fn decimal_quantity_emits_dot_separated_and_validates() {
+    let mut invoice = build_minimal_invoice();
+    invoice.lines = vec![LineItem {
+        description: "Consulting".to_string(),
+        quantity: rust_decimal::Decimal::new(15, 1), // 1.5
+        unit_price: Huf(1000),
+        vat_rate_basis_points: 2700,
+        note: None,
+    }];
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("emitter must succeed");
+    let body = std::str::from_utf8(&xml).expect("emitter output must be UTF-8");
+
+    assert!(
+        body.contains("<quantity>1.5</quantity>"),
+        "decimal quantity must emit dot-separated and untruncated; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<quantity>1</quantity>"),
+        "1.5 must NOT be truncated to 1; body:\n{body}"
+    );
+    // The net total of 1.5 × 1000 = 1500 forints must appear (rounding
+    // path exercised — here it is exact).
+    assert!(
+        body.contains("<lineNetAmount>1500</lineNetAmount>"),
+        "net = round(1.5 × 1000) = 1500; body:\n{body}"
+    );
+
+    validate_invoice_data(&xml).expect("decimal-quantity body must validate against NAV XSD");
 }
 
 /// ADR-0049 §NAV emit (session 156) — the NEGATIVE side of the

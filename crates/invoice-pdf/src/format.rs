@@ -15,6 +15,18 @@
 //!   line totals per ADR-0009 §6.
 
 use aberp_billing::Currency;
+use rust_decimal::Decimal;
+
+/// S157 — format a decimal line quantity for the printed invoice using the
+/// Hungarian decimal comma. `.normalize()` drops the trailing zeros a
+/// DECIMAL(18,6) read-back carries, so `1.500000` → `1,5`, `3.000000` →
+/// `3`, and `0.25` → `0,25`. `Decimal::to_string` is locale-independent
+/// (always `.`), so the single `replace('.', ",")` is the only locale
+/// transform needed. No thousands grouping — quantities are small counts,
+/// not money amounts.
+pub fn quantity(qty: Decimal) -> String {
+    qty.normalize().to_string().replace('.', ",")
+}
 
 /// Format a minor-unit amount in the given currency for printed-invoice
 /// display. EUR cents → "€X XXX,XX"; HUF forints → "X XXX Ft".
@@ -133,6 +145,17 @@ mod tests {
         assert_eq!(money(Currency::Huf, 3_080_374), "3 080 374 Ft");
         assert_eq!(money(Currency::Huf, 0), "0 Ft");
         assert_eq!(money(Currency::Huf, -654_883), "-654 883 Ft");
+    }
+
+    #[test]
+    fn quantity_uses_hungarian_comma_and_trims_trailing_zeros() {
+        // S157 — headline: 1.5 renders as 1,5 (comma), integers stay bare.
+        assert_eq!(quantity(Decimal::new(15, 1)), "1,5");
+        assert_eq!(quantity(Decimal::from(1)), "1");
+        // DECIMAL(18,6) read-back carries trailing zeros — normalize drops them.
+        assert_eq!(quantity(Decimal::new(1_500_000, 6)), "1,5");
+        assert_eq!(quantity(Decimal::new(3_000_000, 6)), "3");
+        assert_eq!(quantity(Decimal::new(25, 2)), "0,25");
     }
 
     #[test]

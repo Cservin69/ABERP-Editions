@@ -29,7 +29,7 @@ describe("composeModificationBody", () => {
       lines: [
         {
           description: "Corrected widget A",
-          quantity: 3,
+          quantityInput: "3",
           // PR-88 / session-113 — operator-typed string parsed at
           // compose time. HUF 0-decimal so `"1200"` → 1200 minor =
           // 1200 forints (same wire output as pre-PR-88 `unitPriceMinor: 1200`).
@@ -54,7 +54,7 @@ describe("composeModificationBody", () => {
       lines: [
         {
           description: "Corrected widget A",
-          quantity: 3,
+          quantity: "3",
           unitPrice: 1200,
           vatRatePercent: 27,
           // PR-82 — blank-after-trim ⇒ null on the wire.
@@ -86,7 +86,7 @@ describe("composeModificationBody", () => {
       lines: [
         {
           description: "  trimmed desc  ",
-          quantity: 1,
+          quantityInput: "1",
           // PR-88 / session-113 — operator-typed EUR amount. `"1"`
           // parses to 100 cents (= 1.00 EUR). The trim assertions
           // below don't check unitPrice so any non-zero amount works
@@ -129,14 +129,14 @@ describe("formFromIssuanceInput", () => {
       lines: [
         {
           description: "Widget A",
-          quantity: 2,
+          quantity: "2",
           unitPrice: 1000,
           vatRatePercent: 27,
           note: "",
         },
         {
           description: "Widget B",
-          quantity: 1,
+          quantity: "1",
           unitPrice: 5000,
           vatRatePercent: 5,
           note: "",
@@ -157,14 +157,14 @@ describe("formFromIssuanceInput", () => {
     expect(form.lines).toEqual([
       {
         description: "Widget A",
-        quantity: 2,
+        quantityInput: "2",
         unitPriceInput: "10.00",
         vatRatePercent: 27,
         note: "",
       },
       {
         description: "Widget B",
-        quantity: 1,
+        quantityInput: "1",
         unitPriceInput: "50.00",
         vatRatePercent: 5,
         note: "",
@@ -186,7 +186,7 @@ describe("formFromIssuanceInput", () => {
       lines: [
         {
           description: "L",
-          quantity: 1,
+          quantity: "1",
           unitPrice: 1,
           vatRatePercent: 27,
           note: "",

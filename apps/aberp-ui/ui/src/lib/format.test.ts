@@ -16,10 +16,12 @@ import {
   formatHufEquivalent,
   formatInvoiceDate,
   formatInvoiceTotal,
+  formatQuantity,
   formatRate,
   formatRateDate,
   formatTotal,
   parseAmountToMinor,
+  parseDecimalQuantity,
 } from "./format";
 import type { Currency } from "./api";
 
@@ -387,5 +389,71 @@ describe("formatInvoiceTotal (storno negation)", () => {
     expect(storno).not.toBe(regular);
     expect(storno.startsWith("-")).toBe(true);
     expect(regular.startsWith("-")).toBe(false);
+  });
+});
+
+describe("parseDecimalQuantity — operator-input → canonical dot-decimal", () => {
+  it("parses an integer to a bare string", () => {
+    expect(parseDecimalQuantity("1")).toBe("1");
+    expect(parseDecimalQuantity("42")).toBe("42");
+  });
+
+  it("decodes `.` and `,` to the SAME value (the headline S157 rule)", () => {
+    expect(parseDecimalQuantity("1.5")).toBe("1.5");
+    expect(parseDecimalQuantity("1,5")).toBe("1.5");
+    expect(parseDecimalQuantity("1.5")).toBe(parseDecimalQuantity("1,5"));
+  });
+
+  it("trims trailing-zero fractional noise so 1,50 == 1.5 == 1,5", () => {
+    expect(parseDecimalQuantity("1,50")).toBe("1.5");
+    expect(parseDecimalQuantity("1.500")).toBe("1.5");
+    expect(parseDecimalQuantity("2,00")).toBe("2");
+  });
+
+  it("keeps sub-unit precision up to 6 fractional digits", () => {
+    expect(parseDecimalQuantity("0,25")).toBe("0.25");
+    expect(parseDecimalQuantity("0.125")).toBe("0.125");
+    expect(parseDecimalQuantity("1.234567")).toBe("1.234567");
+  });
+
+  it("strips ASCII spaces + NBSP (paste tolerance)", () => {
+    expect(parseDecimalQuantity(" 1,5 ")).toBe("1.5");
+    expect(parseDecimalQuantity("1 5")).toBe("15");
+  });
+
+  it("returns null for empty, zero, negative, and non-numeric", () => {
+    expect(parseDecimalQuantity("")).toBeNull();
+    expect(parseDecimalQuantity("   ")).toBeNull();
+    expect(parseDecimalQuantity("0")).toBeNull();
+    expect(parseDecimalQuantity("0,0")).toBeNull();
+    expect(parseDecimalQuantity("00")).toBeNull();
+    expect(parseDecimalQuantity("-1")).toBeNull();
+    expect(parseDecimalQuantity("abc")).toBeNull();
+    expect(parseDecimalQuantity("1.2.3")).toBeNull();
+    expect(parseDecimalQuantity(".5")).toBeNull(); // bare-decimal rejected
+    expect(parseDecimalQuantity("1,")).toBeNull(); // trailing separator
+  });
+
+  it("rejects more than 6 fractional digits rather than rounding (fail loud)", () => {
+    expect(parseDecimalQuantity("1.1234567")).toBeNull();
+  });
+});
+
+describe("formatQuantity — value → Hungarian-comma display", () => {
+  it("renders the headline 1.5 → 1,5 and an integer as a bare integer", () => {
+    expect(formatQuantity("1.5")).toBe("1,5");
+    expect(formatQuantity(1.5)).toBe("1,5");
+    expect(formatQuantity("1")).toBe("1");
+    expect(formatQuantity(1)).toBe("1");
+  });
+
+  it("trims trailing zeros and renders sub-unit precision", () => {
+    expect(formatQuantity("1.500000")).toBe("1,5"); // DECIMAL(18,6) read-back
+    expect(formatQuantity("3.000000")).toBe("3");
+    expect(formatQuantity("0.25")).toBe("0,25");
+  });
+
+  it("passes a non-numeric input through verbatim (fail loud)", () => {
+    expect(formatQuantity("not-a-number")).toBe("not-a-number");
   });
 });

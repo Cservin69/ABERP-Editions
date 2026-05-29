@@ -105,7 +105,7 @@ fn fixture_ready_invoice() -> ReadyInvoice {
         customer_id: CustomerId::new(),
         lines: vec![LineItem {
             description: "Test megnevezés".to_string(),
-            quantity: 1,
+            quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
             note: None,

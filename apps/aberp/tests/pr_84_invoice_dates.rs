@@ -77,7 +77,7 @@ fn nav_emit_surfaces_three_distinct_dates() {
         fiscal_year: 0,
         lines: vec![LineItem {
             description: "Pin line".to_string(),
-            quantity: 1,
+            quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(1_000),
             vat_rate_basis_points: 2700,
             note: None,
@@ -147,7 +147,7 @@ fn duckdb_round_trip_preserves_payment_deadline_and_delivery_date() {
         customer_id: CustomerId::new(),
         lines: vec![LineItem {
             description: "round-trip line".to_string(),
-            quantity: 1,
+            quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(1_000),
             vat_rate_basis_points: 2700,
             note: None,

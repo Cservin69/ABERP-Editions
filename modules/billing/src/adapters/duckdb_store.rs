@@ -23,6 +23,8 @@
 //! knows how to allocate.
 
 use duckdb::{params, Connection};
+use rust_decimal::Decimal;
+use std::str::FromStr;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::OffsetDateTime;
@@ -150,7 +152,13 @@ CREATE TABLE IF NOT EXISTS invoice_line (
     invoice_id            VARCHAR NOT NULL,
     ordinal               INTEGER NOT NULL,
     description           VARCHAR NOT NULL,
-    quantity              INTEGER NOT NULL CHECK (quantity >= 0),
+    -- S157 — DECIMAL (not INTEGER) so fractional quantities (1.5 days,
+    -- 0.25 hours) persist exactly. (18,6) mirrors the `exchange_rate`
+    -- precision precedent and NAV's 6-decimal quantity ceiling. Pre-S157
+    -- DBs created this column as INTEGER; `MIGRATE_S157_SQL` widens them
+    -- (DuckDB forbids ALTER COLUMN TYPE on a CHECK-constrained column, so
+    -- that path is add/backfill/drop/rename — see the constant below).
+    quantity              DECIMAL(18, 6) NOT NULL CHECK (quantity >= 0),
     unit_price            BIGINT  NOT NULL,
     vat_rate_basis_points INTEGER NOT NULL,
     -- PR-82 — buyer-facing per-line note ("Megjegyzés"). Recipient-
@@ -266,6 +274,38 @@ ALTER TABLE invoice ADD COLUMN IF NOT EXISTS payment_deadline DATE;
 ALTER TABLE invoice ADD COLUMN IF NOT EXISTS delivery_date    DATE;
 ";
 
+/// S157 — widen `invoice_line.quantity` from `INTEGER` to
+/// `DECIMAL(18, 6)` so decimal quantities (1.5 days, 0.25 hours) persist
+/// exactly rather than being rejected/truncated to whole units.
+///
+/// # Why this is not a one-line `ALTER COLUMN ... TYPE`
+///
+/// DuckDB refuses to change a column's type while a CHECK constraint
+/// references it ("Binder Error: Cannot change the type of a column that
+/// has a CHECK constraint specified" — verified empirically). The
+/// `quantity >= 0` CHECK on the pre-S157 column blocks the direct path,
+/// so we add a fresh DECIMAL column, backfill it from the legacy INTEGER
+/// values, drop the old column (which carries its CHECK away), and rename
+/// the new column into its place. The new column has no CHECK; the
+/// issuance preflight's `LineItemQuantityZero` gate (now "must be greater
+/// than zero") is the surviving positive-quantity guard.
+///
+/// # One-shot, not idempotent-cheap
+///
+/// Unlike the `ADD COLUMN IF NOT EXISTS` migrations above, this batch is
+/// NOT safe to re-run every boot — a second run would drop and rebuild
+/// the (now-DECIMAL) column on each launch. `ensure_schema` guards it on
+/// the current column type (`quantity_column_is_integer`) so it executes
+/// exactly once, on the first boot after this change against a pre-S157
+/// DB. Fresh DBs create the column as DECIMAL directly (CREATE_TABLES_SQL
+/// above) and skip the migration entirely.
+const MIGRATE_S157_SQL: &str = "
+ALTER TABLE invoice_line ADD COLUMN IF NOT EXISTS quantity_dec DECIMAL(18, 6);
+UPDATE invoice_line SET quantity_dec = quantity WHERE quantity_dec IS NULL;
+ALTER TABLE invoice_line DROP COLUMN IF EXISTS quantity;
+ALTER TABLE invoice_line RENAME COLUMN quantity_dec TO quantity;
+";
+
 #[derive(Debug)]
 pub struct DuckDbBillingStore {
     conn: Connection,
@@ -288,6 +328,24 @@ impl DuckDbBillingStore {
     /// the tenant DB connection and wants the billing module to share it.
     pub fn from_connection(conn: Connection) -> Self {
         Self { conn }
+    }
+
+    /// S157 — `true` iff `invoice_line.quantity` still has the pre-S157
+    /// `INTEGER` declared type (i.e. this DB predates the DECIMAL widening
+    /// and `MIGRATE_S157_SQL` must run). DuckDB reports the type via
+    /// `information_schema.columns.data_type` (e.g. `"INTEGER"` vs
+    /// `"DECIMAL(18,6)"`).
+    fn quantity_column_is_integer(&self) -> Result<bool, BillingError> {
+        let data_type: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data_type FROM information_schema.columns
+                 WHERE table_name = 'invoice_line' AND column_name = 'quantity';",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        Ok(matches!(data_type, Some(t) if t.to_uppercase().contains("INT")))
     }
 
     /// Hand the wrapped Connection back to the caller. PR-6 uses this:
@@ -588,7 +646,10 @@ pub fn allocate_in_tx(
                 draft.id.to_prefixed_string(),
                 ordinal as i64,
                 &line.description,
-                line.quantity as i64,
+                // S157 — bind the quantity as its canonical decimal string;
+                // DuckDB casts it to the column's DECIMAL type at write,
+                // same posture as `exchange_rate` (Decimal-as-string bind).
+                line.quantity.to_string(),
                 line.unit_price.as_i64(),
                 line.vat_rate_basis_points as i64,
                 &line.note,
@@ -651,6 +712,13 @@ impl BillingStore for DuckDbBillingStore {
         // NULL rows so byte-on-wire behaviour is preserved for pre-PR-84
         // invoices.
         self.conn.execute_batch(MIGRATE_PR_84_SQL)?;
+        // S157 — widen `invoice_line.quantity` to DECIMAL on pre-S157 DBs.
+        // Guarded on the column type so the (non-idempotent-cheap)
+        // drop/rename rebuild runs exactly once; fresh DBs already created
+        // the column as DECIMAL and skip it.
+        if self.quantity_column_is_integer()? {
+            self.conn.execute_batch(MIGRATE_S157_SQL)?;
+        }
         Ok(())
     }
 
@@ -957,14 +1025,20 @@ fn load_invoice(
     // notes round-trip through every load path (SPA detail, storno
     // base-read for chain content, PDF re-render). The column is
     // nullable; pre-PR-82 rows decode as `note: None`.
+    // S157 — `CAST(quantity AS VARCHAR)` reads the DECIMAL column as its
+    // canonical string (same posture as the DATE columns above), then
+    // `Decimal::from_str` reconstructs it exactly. Pre-S157 rows widened
+    // by `MIGRATE_S157_SQL` read back as e.g. `"3.000000"` (whole values
+    // gain trailing zeros from the DECIMAL(18,6) scale); the emit/render
+    // layers `.normalize()` those away.
     let mut stmt = tx.prepare(
-        "SELECT description, quantity, unit_price, vat_rate_basis_points, note
+        "SELECT description, CAST(quantity AS VARCHAR), unit_price, vat_rate_basis_points, note
          FROM invoice_line WHERE invoice_id = ? ORDER BY ordinal ASC;",
     )?;
     let rows = stmt.query_map([invoice_id_str], |r| {
         Ok((
             r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
+            r.get::<_, String>(1)?,
             r.get::<_, i64>(2)?,
             r.get::<_, i64>(3)?,
             r.get::<_, Option<String>>(4)?,
@@ -972,10 +1046,12 @@ fn load_invoice(
     })?;
     let mut lines = Vec::new();
     for r in rows {
-        let (description, quantity, unit_price, vat, note) = r?;
+        let (description, quantity_str, unit_price, vat, note) = r?;
+        let quantity = Decimal::from_str(&quantity_str)
+            .map_err(|_| BillingError::Invalid("stored invoice_line.quantity is not a decimal"))?;
         lines.push(LineItem {
             description,
-            quantity: quantity as u32,
+            quantity,
             unit_price: Huf(unit_price),
             vat_rate_basis_points: vat as u16,
             note,

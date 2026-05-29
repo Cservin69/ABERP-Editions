@@ -7,6 +7,7 @@
 //! per CLAUDE.md rule 2.
 
 use aberp_billing::{Currency, RateMetadata};
+use rust_decimal::Decimal;
 use time::Date;
 
 /// The full set of data the renderer needs to produce one printed
@@ -81,7 +82,10 @@ pub struct PartyInfo {
 #[derive(Debug, Clone)]
 pub struct LineItem {
     pub description: String,
-    pub quantity: u32,
+    /// S157 — decimal quantity (1.5 days, 0.25 hours), rendered with the
+    /// Hungarian comma via [`crate::format::quantity`]. Pre-S157 this was
+    /// `u32`, which truncated fractional quantities off the printed PDF.
+    pub quantity: Decimal,
     pub unit: String,
     pub unit_price_minor: i64,
     pub net_minor: i64,

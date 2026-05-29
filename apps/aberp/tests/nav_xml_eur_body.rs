@@ -96,14 +96,14 @@ fn build_eur_invoice() -> ReadyInvoice {
         lines: vec![
             LineItem {
                 description: "EUR widget".to_string(),
-                quantity: 2,
+                quantity: rust_decimal::Decimal::from(2),
                 unit_price: Huf(1000), // 10.00 EUR per unit
                 vat_rate_basis_points: 2700,
                 note: None,
             },
             LineItem {
                 description: "EUR install".to_string(),
-                quantity: 1,
+                quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(5000), // 50.00 EUR
                 vat_rate_basis_points: 2700,
                 note: None,
@@ -130,14 +130,14 @@ fn build_huf_invoice() -> ReadyInvoice {
         lines: vec![
             LineItem {
                 description: "HUF widget".to_string(),
-                quantity: 2,
+                quantity: rust_decimal::Decimal::from(2),
                 unit_price: Huf(1000),
                 vat_rate_basis_points: 2700,
                 note: None,
             },
             LineItem {
                 description: "HUF install".to_string(),
-                quantity: 1,
+                quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(5000),
                 vat_rate_basis_points: 2700,
                 note: None,

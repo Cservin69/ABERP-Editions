@@ -2013,14 +2013,14 @@ mod tests {
                 LineItem {
                     description: "line with \"quotes\" and \\ backslashes \n\t newlines"
                         .to_string(),
-                    quantity: 2,
+                    quantity: rust_decimal::Decimal::from(2),
                     unit_price: Huf(1_500),
                     vat_rate_basis_points: 2700,
                     note: None,
                 },
                 LineItem {
                     description: "ünïcödé and other non-ASCII: 日本語".to_string(),
-                    quantity: 1,
+                    quantity: rust_decimal::Decimal::from(1),
                     unit_price: Huf(500),
                     vat_rate_basis_points: 2700,
                     note: None,

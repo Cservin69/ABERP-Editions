@@ -6,15 +6,19 @@
 //! its own type per the new-type-state pattern ADR-0009 §2 names, so
 //! illegal transitions are compile errors.
 
+use rust_decimal::Decimal;
 use time::{Date, OffsetDateTime};
 
 use super::ids::{CustomerId, InvoiceId, SeriesId};
 use super::money::Huf;
 
-/// A line on the invoice. Quantities are `u32` because Hungarian invoices
-/// don't fractionalize quantities for typical CNC manufacturing outputs;
-/// when a future product line needs decimal quantities, a separate
-/// `LineItemKind` variant lands.
+/// A line on the invoice. Quantities are `Decimal` (S157) so the operator
+/// can bill fractional units — `1.5` consulting days, `0.25` hours. The
+/// pre-S157 `u32` shape rejected any non-integer quantity at the SPA's
+/// integer-stepper input AND truncated decimals on the printed PDF; both
+/// are gone. `Decimal` (not `f64`) keeps `unit_price × quantity` exact —
+/// the same precision posture `money::Huf`'s integer minor-units and the
+/// MNB `rate: Decimal` already hold.
 ///
 /// # PR-82 — `note` (Megjegyzés) field
 ///
@@ -26,7 +30,7 @@ use super::money::Huf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineItem {
     pub description: String,
-    pub quantity: u32,
+    pub quantity: Decimal,
     pub unit_price: Huf,
     /// VAT rate in basis points: 2700 = 27% (Hungarian standard rate).
     /// Integer to avoid floating-point in invariant calculations.
@@ -37,9 +41,12 @@ pub struct LineItem {
 }
 
 impl LineItem {
-    /// Pre-tax line total. Returns `None` on overflow.
+    /// Pre-tax line total: `round_half_even(unit_price × quantity)` in
+    /// whole minor units. Returns `None` on overflow. S157 — quantity is
+    /// `Decimal`, so the product is rounded back to integer minor units
+    /// (a fractional forint/cent cannot exist on the wire).
     pub fn net_total(&self) -> Option<Huf> {
-        self.unit_price.checked_mul_u32(self.quantity)
+        self.unit_price.checked_mul_decimal(self.quantity)
     }
 
     /// VAT amount for the line: `floor(net_total * rate / 10_000)`.
@@ -402,14 +409,14 @@ mod tests {
             lines: vec![
                 LineItem {
                     description: "widget A".to_string(),
-                    quantity: 3,
+                    quantity: Decimal::from(3),
                     unit_price: Huf(1_000),
                     vat_rate_basis_points: 2700,
                     note: None,
                 },
                 LineItem {
                     description: "widget B".to_string(),
-                    quantity: 1,
+                    quantity: Decimal::from(1),
                     unit_price: Huf(500),
                     vat_rate_basis_points: 2700,
                     note: None,

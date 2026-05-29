@@ -487,7 +487,7 @@ fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i6
         let desc_extra =
             (desc_lines.len().saturating_sub(1) as i64) * TableLayout::DESC_WRAP_LINE_HEIGHT;
 
-        let qty_str = format!("{} {}", line.quantity, line.unit);
+        let qty_str = format!("{} {}", format::quantity(line.quantity), line.unit);
         text_right(ops, "F1", 9, TableLayout::QTY_RIGHT, y, &qty_str);
         text_right(
             ops,

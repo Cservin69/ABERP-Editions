@@ -239,7 +239,7 @@ fn line_note_round_trips_through_allocate_and_load() {
         customer_id: CustomerId::new(),
         lines: vec![LineItem {
             description: "annotated-line".to_string(),
-            quantity: 3,
+            quantity: rust_decimal::Decimal::from(3),
             unit_price: Huf(1_500),
             vat_rate_basis_points: 2700,
             note: Some("Please ship to dock B".to_string()),

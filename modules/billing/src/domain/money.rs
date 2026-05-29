@@ -40,6 +40,26 @@ impl Huf {
     pub fn checked_mul_u32(self, n: u32) -> Option<Self> {
         self.0.checked_mul(n as i64).map(Self)
     }
+
+    /// Multiply this minor-unit amount by a decimal `quantity`, rounding
+    /// the product half-even to whole minor units. `Huf` doubles as the
+    /// generic minor-unit holder on `LineItem` (forints for HUF, cents
+    /// for EUR), so the rounding lands on the smallest representable
+    /// minor unit either way. Round-half-even matches the MNB
+    /// HUF-conversion rounding (`huf_equivalent_round_half_even`) so the
+    /// whole money surface shares one tie-breaking rule. Returns `None`
+    /// on overflow or a non-`i64`-representable product (S157 — decimal
+    /// line quantities; the prior `checked_mul_u32` path could not
+    /// express `1.5 days × unit_price`).
+    pub fn checked_mul_decimal(self, quantity: Decimal) -> Option<Self> {
+        use rust_decimal::prelude::ToPrimitive;
+        use rust_decimal::RoundingStrategy;
+        Decimal::from(self.0)
+            .checked_mul(quantity)?
+            .round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven)
+            .to_i64()
+            .map(Self)
+    }
 }
 
 impl fmt::Display for Huf {
@@ -522,5 +542,49 @@ mod currency_tests {
         // `Money::Huf(Huf(N))` is structurally identical.
         assert_eq!(Money::huf(1_000), Money::Huf(Huf(1_000)));
         assert_eq!(Money::eur(1_000), Money::Eur(Eur(1_000)));
+    }
+}
+
+#[cfg(test)]
+mod mul_decimal_tests {
+    //! S157 — `Huf::checked_mul_decimal` is the decimal-quantity net-total
+    //! path. Pins the exact case (whole-forint products), the rounding
+    //! case (fractional products → round-half-even to whole minor units),
+    //! and the overflow guard.
+    use super::*;
+    use rust_decimal::Decimal;
+
+    #[test]
+    fn exact_when_product_is_whole() {
+        // 1.5 × 1000 = 1500 — exact, no rounding needed.
+        assert_eq!(
+            Huf(1_000).checked_mul_decimal(Decimal::new(15, 1)),
+            Some(Huf(1_500))
+        );
+        // Integer quantity behaves like the old checked_mul_u32 path.
+        assert_eq!(
+            Huf(1_000).checked_mul_decimal(Decimal::from(3)),
+            Some(Huf(3_000))
+        );
+    }
+
+    #[test]
+    fn rounds_half_even_to_whole_minor_units() {
+        // 1.5 × 333 = 499.5 → round-half-even → 500 (nearest even).
+        assert_eq!(
+            Huf(333).checked_mul_decimal(Decimal::new(15, 1)),
+            Some(Huf(500))
+        );
+        // 0.5 × 333 = 166.5 → round-half-even → 166 (166 is even).
+        assert_eq!(
+            Huf(333).checked_mul_decimal(Decimal::new(5, 1)),
+            Some(Huf(166))
+        );
+    }
+
+    #[test]
+    fn none_on_overflow() {
+        // i64::MAX × 2 overflows the i64 minor-unit range.
+        assert_eq!(Huf(i64::MAX).checked_mul_decimal(Decimal::from(2)), None);
     }
 }

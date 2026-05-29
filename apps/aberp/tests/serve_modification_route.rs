@@ -80,7 +80,7 @@ fn fixture_ready_invoice() -> ReadyInvoice {
         customer_id: CustomerId::new(),
         lines: vec![LineItem {
             description: "Test megnevezés".to_string(),
-            quantity: 1,
+            quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
             note: None,
@@ -113,7 +113,7 @@ fn fixture_request_body(currency: aberp_billing::Currency) -> ModificationInvoic
         },
         lines: vec![LineJson {
             description: "Corrected line".to_string(),
-            quantity: 2,
+            quantity: rust_decimal::Decimal::from(2),
             unit_price: 1500,
             vat_rate_percent: 27,
             note: None,
@@ -279,7 +279,7 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
             },
             lines: vec![LineJson {
                 description: "Base line".to_string(),
-                quantity: 1,
+                quantity: rust_decimal::Decimal::from(1),
                 unit_price: 1000,
                 vat_rate_percent: 27,
                 note: None,

@@ -8327,7 +8327,7 @@ mod tests {
             fiscal_year: 2026,
             lines: vec![LineItem {
                 description: "Try_to_save_test".to_string(),
-                quantity: 1,
+                quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(69),
                 vat_rate_basis_points: 2700,
                 note: None,

@@ -112,7 +112,7 @@ fn fixture_customer() -> CustomerJson {
 fn fixture_lines() -> Vec<LineJson> {
     vec![LineJson {
         description: "Widget A".to_string(),
-        quantity: 2,
+        quantity: rust_decimal::Decimal::from(2),
         unit_price: 1000,
         vat_rate_percent: 27,
         note: None,

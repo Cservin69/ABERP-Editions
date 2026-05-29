@@ -32,7 +32,7 @@ import type {
   IssueInvoiceRequest,
   ModificationInvoiceRequest,
 } from "./api";
-import { formatMinorToInput, parseAmountToMinor } from "./format";
+import { formatMinorToInput, parseAmountToMinor, parseDecimalQuantity } from "./format";
 import {
   composeCustomerAddress,
   emptyForm as emptyIssueForm,
@@ -85,7 +85,11 @@ export function formFromIssuanceInput(
 ): ModificationFormState {
   const lines: LineFormState[] = input.lines.map((l) => ({
     description: l.description,
-    quantity: l.quantity,
+    // S157 — pre-fill the editable quantity string from the base's
+    // stored value. `String(...)` tolerates BOTH the new string wire
+    // shape (`"1.5"`) and pre-S157 side-store rows that carry a JSON
+    // number (`1`); `parseDecimalQuantity` re-parses it on submit.
+    quantityInput: String(l.quantity),
     // PR-88 / session-113 — convert the backend's integer minor-unit
     // count back into the operator-editable display string the form
     // pre-fills with. For HUF (0-decimal) this is the bare integer;
@@ -190,7 +194,10 @@ export function composeModificationBody(
     },
     lines: form.lines.map((l) => ({
       description: l.description.trim(),
-      quantity: l.quantity,
+      // S157 — parse the operator-typed quantity (`1.5`/`1,5`) to the
+      // canonical dot-decimal string; failure → `"0"` so the backend
+      // preflight surfaces `LineItemQuantityZero`.
+      quantity: parseDecimalQuantity(l.quantityInput) ?? "0",
       // PR-88 / session-113 — same parse-at-compose-time discipline as
       // `composeIssueInvoiceBody`. The modification form's unit-price
       // input is the operator-typed string; the parser converts to

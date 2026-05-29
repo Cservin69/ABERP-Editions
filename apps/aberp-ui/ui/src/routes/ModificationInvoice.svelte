@@ -191,7 +191,9 @@
         ...form.lines,
         {
           description: "",
-          quantity: 1,
+          // S157 — fresh line seeds quantity "1"; operator can enter any
+          // positive decimal.
+          quantityInput: "1",
           // PR-88 / session-113 — fresh line seeds with an empty
           // operator-input string. The form's required-attribute
           // forces a value before submit; the parser produces the
@@ -402,13 +404,17 @@
             <input type="text" bind:value={line.description} required />
           </label>
           <label class="narrow">
+            <!-- S157 — decimal quantity (text + `parseDecimalQuantity` at
+                 compose), same posture as IssueInvoice.svelte. -->
             <span>Qty</span>
             <input
-              type="number"
-              min="1"
-              step="1"
-              bind:value={line.quantity}
+              type="text"
+              inputmode="decimal"
+              autocomplete="off"
+              spellcheck="false"
+              bind:value={line.quantityInput}
               required
+              placeholder="1,5"
             />
           </label>
           <label class="narrow">

@@ -980,8 +980,9 @@ pub fn render_annulment_data(annulment_reference: &AnnulmentReference) -> Result
 }
 
 /// Negate a `LineItem` for storno emission. Quantities stay positive
-/// (`u32` cannot represent negative); the negation lives in
-/// `unit_price`, which is `Huf(i64)` and can be negative. The
+/// (S157 — `Decimal`, but the storno convention keeps quantity positive
+/// regardless); the negation lives in `unit_price`, which is `Huf(i64)`
+/// and can be negative. The
 /// cascading `net_total` / `vat_amount` / `gross_total` are all
 /// negative as a result, which matches NAV's storno convention.
 fn negate_line(line: &LineItem) -> LineItem {
@@ -1361,7 +1362,13 @@ fn write_lines(
         }
         text_element(w, "lineExpressionIndicator", "false")?;
         text_element(w, "lineDescription", &line.description)?;
-        text_element(w, "quantity", &line.quantity.to_string())?;
+        // S157 — decimal quantity. NAV's `<quantity>` is a dot-separated
+        // decimal (the XSD validator's `ensure_numeric_amount` accepts
+        // `1.5` and `1`). `.normalize()` strips the trailing zeros a
+        // DECIMAL(18,6) read-back carries (`1.500000` → `1.5`, `3.000000`
+        // → `3`) so the wire stays minimal; `Decimal::to_string` always
+        // emits `.` regardless of locale.
+        text_element(w, "quantity", &line.quantity.normalize().to_string())?;
         text_element(w, "unitOfMeasure", "PIECE")?;
         text_element(
             w,

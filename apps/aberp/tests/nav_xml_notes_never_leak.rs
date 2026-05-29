@@ -101,14 +101,14 @@ fn fixture_invoice(with_notes: bool) -> ReadyInvoice {
     let mut lines = vec![
         LineItem {
             description: "Widget A".to_string(),
-            quantity: 2,
+            quantity: rust_decimal::Decimal::from(2),
             unit_price: Huf(1_000),
             vat_rate_basis_points: 2700,
             note: None,
         },
         LineItem {
             description: "Install B".to_string(),
-            quantity: 1,
+            quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(5_000),
             vat_rate_basis_points: 2700,
             note: None,

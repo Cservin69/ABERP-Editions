@@ -18,7 +18,7 @@ import type {
   CustomerVatStatusBody,
   IssueInvoiceRequest,
 } from "./api";
-import { parseAmountToMinor } from "./format";
+import { parseAmountToMinor, parseDecimalQuantity } from "./format";
 import {
   addDays,
   comfortZone,
@@ -47,12 +47,16 @@ import {
  * string and convert at compose time so the major-unit
  * interpretation is canonical.
  *
- * `quantity` and `vatRatePercent` remain integer because the form's
- * `<input type="number">` for those fields is unambiguous (no
- * decimal-separator ambiguity, no minor-unit scaling). */
+ * `vatRatePercent` remains integer because its `<input type="number">`
+ * is unambiguous (no decimal-separator ambiguity, no minor-unit scaling).
+ *
+ * S157 — `quantity` is now `quantityInput: string` for the same reason
+ * `unitPriceInput` is a string: the operator may type a decimal with
+ * either separator (`1.5` or `1,5`), so we capture the raw string and
+ * parse it at compose time via `parseDecimalQuantity`. */
 export interface LineFormState {
   description: string;
-  quantity: number;
+  quantityInput: string;
   unitPriceInput: string;
   vatRatePercent: number;
   /** PR-82 — operator-typed per-line note ("Megjegyzés"). Empty
@@ -245,7 +249,9 @@ export function emptyForm(): IssueInvoiceFormState {
 export function emptyLine(): LineFormState {
   return {
     description: "",
-    quantity: 1,
+    // S157 — quantity seeds to "1" (the common case); the operator can
+    // overwrite with any positive decimal (`1.5`, `0.25`).
+    quantityInput: "1",
     unitPriceInput: "",
     vatRatePercent: 27,
     // PR-82 — per-line note seeds blank; operator opt-in.
@@ -595,7 +601,12 @@ export function composeIssueInvoiceBody(
     },
     lines: form.lines.map((l) => ({
       description: l.description.trim(),
-      quantity: l.quantity,
+      // S157 — parse the operator-typed quantity (`1.5` or `1,5`) into the
+      // canonical dot-decimal string. A parse failure (blank, zero,
+      // negative, garbage) sends `"0"` so the backend preflight's
+      // `LineItemQuantityZero` renders the inline error at this line's
+      // quantity input — same posture as the unit-price `?? 0` below.
+      quantity: parseDecimalQuantity(l.quantityInput) ?? "0",
       // PR-88 / session-113 — parse the operator-typed string into
       // integer minor units using the form's currency. Bare ints
       // are interpreted as WHOLE major units (`340` EUR = 34000

@@ -459,7 +459,11 @@ impl ParsedNavInvoice {
 #[derive(Debug, Default, Clone)]
 pub struct ParsedNavLine {
     pub description: String,
-    pub quantity: u32,
+    /// S157 — decimal quantity parsed verbatim from the `<quantity>`
+    /// element. Pre-S157 this was `u32` and the parser truncated `1.5` →
+    /// `1` on the printed PDF; the renderer now shows the full value with
+    /// the Hungarian comma.
+    pub quantity: Decimal,
     /// Native-currency unit price as written on the wire — `"1000"` for
     /// HUF (integer forints), `"12.34"` for EUR (two-decimal cents
     /// rendered as euros-and-cents). Converted to minor units by
@@ -698,20 +702,10 @@ fn handle_text(
         match last {
             "lineDescription" => line.description = value.to_string(),
             "quantity" => {
-                line.quantity = value
-                    .parse::<u32>()
-                    .or_else(|_| {
-                        // NAV permits decimal quantities; we truncate
-                        // to an integer for the printed quantity since
-                        // the renderer's LineItem::quantity is u32. A
-                        // future PR-44ε.UI / typed-quantity lift would
-                        // be the trigger to widen this.
-                        value
-                            .split_once('.')
-                            .map(|(w, _)| w)
-                            .unwrap_or(value)
-                            .parse::<u32>()
-                    })
+                // S157 — parse the full decimal quantity (NAV writes
+                // `<quantity>` dot-separated). The renderer's
+                // `LineItem::quantity` is now `Decimal`, so no truncation.
+                line.quantity = Decimal::from_str(value)
                     .map_err(|e| anyhow!("<quantity> `{value}` parse: {e}"))?;
             }
             "unitPrice" => line.unit_price_native = value.to_string(),

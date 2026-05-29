@@ -43,7 +43,7 @@ fn build_minimal_modification_invoice() -> ReadyInvoice {
         fiscal_year: 0,
         lines: vec![LineItem {
             description: "Corrected widget price".to_string(),
-            quantity: 2,
+            quantity: rust_decimal::Decimal::from(2),
             // Full-replace per ADR-0024 §4 — the modification body
             // carries the NEW effective values, not a delta. No
             // negation (contrast with STORNO emitter).

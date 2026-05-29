@@ -94,7 +94,7 @@ fn build_allocate_args(series_id: SeriesId) -> AllocateArgs {
             customer_id: CustomerId::new(),
             lines: vec![LineItem {
                 description: "rollback-line".to_string(),
-                quantity: 1,
+                quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(1_000),
                 vat_rate_basis_points: 2700,
                 note: None,

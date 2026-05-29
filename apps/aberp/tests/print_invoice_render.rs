@@ -103,7 +103,11 @@ fn fixture_parties() -> NavParties {
 /// + VAT-rate-basis-points. Helper for both HUF (Huf(forints)) and EUR
 /// (Huf(cents)) — the underlying field is `i64` regardless per PR-44γ's
 /// interim posture.
-fn fixture_ready_invoice(unit_price_minor: i64, quantity: u32, vat_bps: u16) -> ReadyInvoice {
+fn fixture_ready_invoice(
+    unit_price_minor: i64,
+    quantity: rust_decimal::Decimal,
+    vat_bps: u16,
+) -> ReadyInvoice {
     ReadyInvoice {
         id: InvoiceId::new(),
         series_id: SeriesId::new(),
@@ -248,7 +252,7 @@ fn pdf_page_count(path: &Path) -> u32 {
 #[test]
 fn eur_invoice_renders_with_arfolyam_and_huf_totals() {
     // 100 cents × 1 unit × 27% VAT = net 100c / vat 27c / gross 127c.
-    let invoice = fixture_ready_invoice(100, 1, 2700);
+    let invoice = fixture_ready_invoice(100, rust_decimal::Decimal::from(1), 2700);
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = fixture_parties();
     let rate = RateMetadata {
@@ -290,12 +294,34 @@ fn eur_invoice_renders_with_arfolyam_and_huf_totals() {
     );
 }
 
+/// S157 — a decimal line quantity renders on the printed PDF with the
+/// Hungarian comma (`1,5`), NOT truncated to `1` and NOT dot-separated.
+#[test]
+fn decimal_quantity_renders_with_hungarian_comma() {
+    // 1000 HUF × 1.5 units = net 1500.
+    let invoice = fixture_ready_invoice(1000, Decimal::new(15, 1), 2700);
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = fixture_parties();
+    let wired = wire_invoice("qty-dec", &invoice, &series, &parties, Currency::Huf, None);
+    let pdf = run_print_invoice(&wired);
+    let text = read_pdf_text(&pdf);
+
+    assert!(
+        text.contains("1,5"),
+        "expected decimal quantity '1,5' (Hungarian comma) in PDF text:\n{text}"
+    );
+    assert!(
+        !text.contains("1.5"),
+        "quantity must use the Hungarian comma, not a dot:\n{text}"
+    );
+}
+
 /// HUF invoice — the printed PDF text contains `Ft` but NOT `Árfolyam:`
 /// (the EUR-only rate line) and NOT `EUR` (the currency code).
 #[test]
 fn huf_invoice_renders_without_arfolyam_line() {
     // 1000 HUF × 1 unit × 27% VAT = net 1000 / vat 270 / gross 1270.
-    let invoice = fixture_ready_invoice(1000, 1, 2700);
+    let invoice = fixture_ready_invoice(1000, rust_decimal::Decimal::from(1), 2700);
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = fixture_parties();
     let wired = wire_invoice("huf", &invoice, &series, &parties, Currency::Huf, None);
@@ -346,7 +372,7 @@ fn eur_invoice_uses_round_half_even_for_per_rate_huf() {
     //
     // At rate=1.0: vat HUF = 12.50 → round-half-even = 12 (even forint);
     // half-up = 13.
-    let invoice = fixture_ready_invoice(10_000, 1, 1250);
+    let invoice = fixture_ready_invoice(10_000, rust_decimal::Decimal::from(1), 1250);
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = fixture_parties();
     let rate = RateMetadata {
@@ -383,7 +409,7 @@ fn eur_invoice_uses_round_half_even_for_per_rate_huf() {
 /// adds an overflow second page would surface here.
 #[test]
 fn printed_invoice_pdf_is_single_page() {
-    let invoice = fixture_ready_invoice(1000, 1, 2700);
+    let invoice = fixture_ready_invoice(1000, rust_decimal::Decimal::from(1), 2700);
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = fixture_parties();
     let wired = wire_invoice(

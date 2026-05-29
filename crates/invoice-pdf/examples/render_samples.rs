@@ -93,7 +93,7 @@ fn sample_huf_short() -> InvoiceModel {
         customer: customer_huf(),
         lines: vec![LineItem {
             description: "Tanácsadói díj — 2026. május".to_string(),
-            quantity: 1,
+            quantity: Decimal::from(1),
             unit: "db".to_string(),
             unit_price_minor: 250_000,
             net_minor: 250_000,
@@ -131,7 +131,7 @@ fn sample_eur_long() -> InvoiceModel {
                                részére 2026 második negyedévében az ERP-rendszer \
                                bevezetésére vonatkozóan, NAV-megfelelőséggel"
                     .to_string(),
-                quantity: 1,
+                quantity: Decimal::from(1),
                 unit: "db".to_string(),
                 unit_price_minor: 150_000,
                 net_minor: 150_000,
@@ -143,7 +143,7 @@ fn sample_eur_long() -> InvoiceModel {
             },
             LineItem {
                 description: "Implementáció: telepítés + integráció".to_string(),
-                quantity: 1,
+                quantity: Decimal::from(1),
                 unit: "db".to_string(),
                 unit_price_minor: 50_000,
                 net_minor: 50_000,
