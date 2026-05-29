@@ -184,7 +184,14 @@
     labelMeta,
     type LabelSignal,
   } from "../lib/labels";
+  import { onDestroy } from "svelte";
   import { navStatusPictogram } from "../lib/nav-status-pictogram";
+  import {
+    createDetailPoller,
+    isPollTerminal,
+    type DetailPoller,
+    type DetailPollSnapshot,
+  } from "../lib/invoice-detail-poll";
   import {
     actionGroupLabel,
     buttonsForState,
@@ -430,6 +437,70 @@
   // state" rule; a fresh modal open resets to timeline-visible.
   let showRawTable: boolean = $state(false);
 
+  // ── Session 158 — live audit-entries poll ────────────────────────
+  // Ervin's flow: Issue → navigate straight here → watch the NAV
+  // pictogram + email status progress LIVE as the post-issue background
+  // tail (auto-submit → poll → SAVED/ABORTED, plus the auto-send-to-
+  // buyer email) lands its audit-ledger entries. The pictogram (PR-95)
+  // and the email-sent status (PR-99 `lastSuccessfulEmail`) already
+  // derive reactively from `detail.audit_entries`; this loop simply
+  // re-fetches `detail` every ~2s while the invoice is still in flight
+  // so those derivations see fresh data without an operator click.
+  //
+  // The loop's brain (terminal predicates + interval lifecycle + the
+  // 5-minute cap) lives in `lib/invoice-detail-poll.ts` as injectable
+  // pure functions so vitest pins every branch; this component supplies
+  // the real refetch (a QUIET reload that updates `detail` in place,
+  // without the loading-spinner flicker `load` would cause) and the
+  // real timer/clock. `start()` is called from `load` only when the
+  // freshly-loaded invoice is non-terminal (an already-SAVED invoice
+  // opened from the list does one fetch, no interval); `stop()` fires
+  // on navigation, on close, and on destroy so no zombie interval
+  // outlives the modal.
+  function detailSnapshot(d: InvoiceDetail): DetailPollSnapshot {
+    return {
+      navState: navStatusPictogram(d.state).state,
+      hasEmailAttempt: d.audit_entries.some(
+        (e) => e.kind === "InvoiceEmailedSent",
+      ),
+    };
+  }
+
+  const poller: DetailPoller = createDetailPoller({
+    refetch: async () => {
+      const id = detail?.invoice_id ?? invoiceId;
+      if (id === null || id === undefined) {
+        // Nothing to poll (modal closed mid-flight). Return a settled
+        // snapshot so the loop stops cleanly; `stop()` will also have
+        // fired from the close branch.
+        return { navState: "Final", hasEmailAttempt: true };
+      }
+      const fresh = await getInvoice(id);
+      detail = fresh;
+      return detailSnapshot(fresh);
+    },
+    onCapExceeded: () => {
+      console.warn(
+        "InvoiceDetail live poll hit the 5-minute cap without a terminal " +
+          "state; stopping. The operator can refresh manually or click the " +
+          "actionable pictogram.",
+      );
+    },
+    onError: (err) => {
+      // Tolerate a transient local fetch blip — keep the last-good
+      // detail on screen and retry on the next tick.
+      console.warn("InvoiceDetail live poll refetch failed (will retry)", err);
+    },
+    now: () => Date.now(),
+    setIntervalFn: (cb, ms) => setInterval(cb, ms),
+    clearIntervalFn: (handle) => clearInterval(handle),
+  });
+
+  // No zombie interval if the operator navigates away (the parent
+  // unmounts this component when the dialog's `close` resets the
+  // navStack).
+  onDestroy(() => poller.stop());
+
   // Drive the dialog open/close lifecycle from the `invoiceId` prop.
   // Opening: invoke `showModal()` and kick off the fetch. Closing:
   // invoke `close()` if the dialog is still open. Guarded against the
@@ -469,6 +540,11 @@
       // latch from the prop. `load` consumes it on success (one-shot),
       // so a later refetch in the same modal does not re-open the panel.
       stornoAutoOpenPending = openStornoOnLoad === true;
+      // Session 158 — stop any live poll from the PRIOR invoice before
+      // the chain-navigation fetch starts, so an in-flight tick can't
+      // race the new load. `load` (re)starts it once the new detail
+      // lands and proves non-terminal.
+      poller.stop();
       void load(invoiceId);
     } else {
       if (dialogEl.open) dialogEl.close();
@@ -484,6 +560,8 @@
       payFormError = null;
       stornoConfirmOpen = false;
       stornoReason = "";
+      // Session 158 — modal closed; tear down the live poll.
+      poller.stop();
     }
   });
 
@@ -513,9 +591,24 @@
           stornoConfirmOpen = true;
         }
       }
+      // Session 158 — (re)start the live poll iff this invoice is still
+      // in flight. Stop first so a re-load (chain navigation, or a
+      // post-mutation refetch from triggerSubmit / triggerEmail) never
+      // stacks a second interval; then start only when the fresh detail
+      // is non-terminal. An already-terminal invoice (e.g. opening an
+      // old SAVED invoice from the list) does one fetch and no interval
+      // (Part E). The poll halts itself once it observes a terminal NAV
+      // ack + settled email (Part C), or after the 5-minute cap.
+      poller.stop();
+      if (!isPollTerminal(detailSnapshot(detail))) {
+        poller.start();
+      }
     } catch (err: unknown) {
       loadState = "error";
       errorMessage = err instanceof Error ? err.message : String(err);
+      // Session 158 — a failed (re)load means no live detail to watch;
+      // make sure no prior interval keeps firing against a dead fetch.
+      poller.stop();
     }
   }
 

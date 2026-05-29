@@ -3079,72 +3079,84 @@ async fn handle_issue_invoice(
     .await
     {
         Ok(summary) => {
-            // PR-92 — default-on auto-send fires HERE. The send is
-            // best-effort with respect to the issue response: the
-            // invoice is already issued + persisted + the NAV XML is
-            // on disk; failing the response on an SMTP failure would
-            // confuse the operator into thinking the invoice wasn't
-            // created. We record the audit-ledger entry regardless
-            // (success OR failure) so the operator-twin record never
-            // has gaps, then return the invoice response WITH the
-            // email outcome for the SPA to surface.
-            let mut email_outcome: Option<EmailRouteOutcomeBody> = None;
-            if email_buyer_flag {
-                email_outcome = Some(
-                    auto_send_after_issue(
-                        &state,
-                        &summary.invoice_id,
-                        &summary.invoice_number,
-                        &customer_tax_number_for_email,
-                        &operator_login,
+            // [[post-issue-async]] (session 158) — the post-issue tail
+            // (default-on auto-send-to-buyer email + default-on
+            // auto-submit-to-NAV + bounded poll) used to run HERE,
+            // synchronously, BEFORE this response returned. The bounded
+            // poll alone can take up to 31s (ADR-0009 §5) and the SMTP
+            // send adds seconds on top, so the SPA's `await issueInvoice`
+            // — and therefore the operator's Issue-invoice form — sat
+            // frozen for the entire tail. Ervin's session-158 ask:
+            // navigate to the invoice's detail view IMMEDIATELY on issue
+            // and watch the NAV pictogram + email status progress LIVE.
+            // That requires the response to return as soon as the
+            // issuance is durable, so the slow externals move to a
+            // detached background task on the same tokio runtime axum
+            // already owns (it lives for the desktop app's whole
+            // lifetime — the task always outlives the request).
+            //
+            // The task writes exactly the same audit-ledger entries it
+            // always did — `auto_send_after_issue` → InvoiceEmailedSent;
+            // `submit_invoice_request` → InvoiceSubmission*;
+            // `poll_ack_request` → InvoiceAckStatus — only from the
+            // background task rather than inline. The SPA's InvoiceDetail
+            // view live-polls `getInvoice` (PR-95 pictogram + PR-99 email
+            // status both already derive reactively from the audit
+            // entries) and surfaces each transition as it lands. The tail
+            // stays best-effort and fire-and-forget: a NAV/SMTP failure
+            // is logged + recorded on the audit ledger (same toleration
+            // posture as before) and leaves the pictogram actionable for
+            // a manual retry from the detail surface. The email outcome
+            // is no longer known at response time, so the response's
+            // `email` field is `None` — the SPA never read it on this
+            // path (it derives email status from the live-polled audit
+            // entries), so dropping it is observationally inert.
+            let task_invoice_id = summary.invoice_id.clone();
+            let task_invoice_number = summary.invoice_number.clone();
+            let task_state = state.clone();
+            let task_login = operator_login.clone();
+            let task_customer_tax = customer_tax_number_for_email;
+            tokio::spawn(async move {
+                if email_buyer_flag {
+                    // Audit-ledger entry is written inside regardless of
+                    // outcome; the returned body is unused now that the
+                    // response no longer carries it.
+                    let _ = auto_send_after_issue(
+                        &task_state,
+                        &task_invoice_id,
+                        &task_invoice_number,
+                        &task_customer_tax,
+                        &task_login,
                     )
-                    .await,
-                );
-            }
-            // PR-99 Item 4 Part B — default-on auto-submit-to-NAV. Fires
-            // the same path the manual button hits so the audit-ledger
-            // footprint is identical (one InvoiceSubmissionAttempt +
-            // one InvoiceSubmissionResponse from `submit_invoice_request`;
-            // one or more InvoiceAckStatus rows from `poll_ack_request`).
-            // Best-effort: a NAV-side failure leaves the invoice in
-            // `Ready` (submit failed) or `Submitted` (submit fine, poll
-            // failed) so the SPA's pictogram remains actionable. We log
-            // but do NOT propagate — the issuance commit is already
-            // durable and the operator can retry via the InvoiceDetail
-            // surface.
-            if submit_to_nav_flag {
-                match submit_invoice_request(&state, &summary.invoice_id).await {
-                    Ok(_) => {
-                        // Submit succeeded — kick the bounded poll loop
-                        // so the audit ledger picks up the terminal ack
-                        // (SAVED / ABORTED) before the operator's next
-                        // navigation. Same toleration posture: poll
-                        // failure stays the pictogram in Submitted; the
-                        // operator's manual re-poll affordance still
-                        // works.
-                        if let Err(e) = poll_ack_request(&state, &summary.invoice_id).await {
+                    .await;
+                }
+                if submit_to_nav_flag {
+                    match submit_invoice_request(&task_state, &task_invoice_id).await {
+                        Ok(_) => {
+                            if let Err(e) = poll_ack_request(&task_state, &task_invoice_id).await {
+                                tracing::warn!(
+                                    invoice_id = %task_invoice_id,
+                                    error = ?e,
+                                    "post-issue auto-poll failed; pictogram stays actionable"
+                                );
+                            }
+                        }
+                        Err(e) => {
                             tracing::warn!(
-                                invoice_id = %summary.invoice_id,
+                                invoice_id = %task_invoice_id,
                                 error = ?e,
-                                "auto-poll-after-submit failed; pictogram stays actionable"
+                                "post-issue auto-submit failed; invoice remains Ready, \
+                                 operator can submit manually from InvoiceDetail"
                             );
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            invoice_id = %summary.invoice_id,
-                            error = ?e,
-                            "auto-submit-on-issue failed; invoice remains Ready, \
-                             operator can submit manually from InvoiceDetail"
-                        );
-                    }
                 }
-            }
+            });
             Json(IssueInvoiceResponse {
                 invoice_id: summary.invoice_id,
                 invoice_number: summary.invoice_number,
                 state: InvoiceState::Ready,
-                email: email_outcome,
+                email: None,
             })
             .into_response()
         }
