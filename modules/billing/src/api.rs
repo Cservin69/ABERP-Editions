@@ -17,6 +17,7 @@ pub use crate::domain::money::{
 };
 pub use crate::domain::reservation::{ReservationStatus, SequenceReservation};
 pub use crate::domain::series::{InvoiceSeries, ResetPolicy, SeriesCode};
+pub use crate::domain::unit_of_measure::{NavUnitOfMeasure, ProductUnit};
 
 // ── Ports (traits) ────────────────────────────────────────────────────
 pub use crate::ports::clock::{Clock, SystemClock};

@@ -98,6 +98,7 @@ fn build_allocate_args(series_id: SeriesId) -> AllocateArgs {
                 unit_price: Huf(1_000),
                 vat_rate_basis_points: 2700,
                 note: None,
+                unit: None,
             }],
             issue_date: OffsetDateTime::now_utc(),
             // PR-84 — rollback conformance fixture defaults both date

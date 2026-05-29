@@ -118,6 +118,7 @@ fn fixture_ready_invoice(
             unit_price: Huf(unit_price_minor),
             vat_rate_basis_points: vat_bps,
             note: None,
+            unit: None,
         }],
         issue_date: OffsetDateTime::now_utc(),
         // PR-84 — fixture defaults both date fields to issue date.

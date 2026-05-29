@@ -15,6 +15,9 @@
 //!                   `invoice-dates.ts` helper.
 //! - [`series`]      `InvoiceSeries`, `SeriesCode`, `ResetPolicy`.
 //! - [`reservation`] `SequenceReservation`, `ReservationStatus`.
+//! - [`unit_of_measure`] S159 — `NavUnitOfMeasure`, `ProductUnit` (moved
+//!                   down from products so `LineItem` can carry a line's
+//!                   unit to the NAV `<unitOfMeasure>` emit).
 
 pub mod ids;
 pub mod invoice;
@@ -22,3 +25,4 @@ pub mod invoice_dates;
 pub mod money;
 pub mod reservation;
 pub mod series;
+pub mod unit_of_measure;

@@ -667,6 +667,7 @@ mod tests {
             unit_price: 10_000,
             vat_rate_percent: 27,
             note: None,
+            unit: None,
         }
     }
 
@@ -971,6 +972,7 @@ mod tests {
                     unit_price: -1,              // negative
                     vat_rate_percent: 12,        // off-vocab
                     note: None,
+                    unit: None,
                 },
                 good_line(), // line 1 is fine
                 LineJson {
@@ -979,6 +981,7 @@ mod tests {
                     unit_price: 10,
                     vat_rate_percent: 99, // off-vocab
                     note: None,
+                    unit: None,
                 },
             ],
             currency: Currency::Huf,

@@ -1078,6 +1078,11 @@ fn build_storno_command(
             // The negation step `negate_line` preserves notes too, so
             // the storno's printed PDF inherits the base's line notes.
             note: l.note.clone(),
+            // S159 — carry the base line's unit through the storno so the
+            // negated correction line emits the SAME `<unitOfMeasure>` as
+            // the original (read off the side-store `input.json`).
+            // `negate_line` preserves it too.
+            unit: l.unit.clone(),
         })
         .collect();
     Ok(IssueInvoiceCommand {

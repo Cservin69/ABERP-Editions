@@ -1055,6 +1055,14 @@ fn load_invoice(
             unit_price: Huf(unit_price),
             vat_rate_basis_points: vat as u16,
             note,
+            // S159 — the unit is NOT persisted on `invoice_line` (no
+            // column; it rides the side-store `input.json` per-line
+            // payload). A DB-reconstructed line therefore carries
+            // `None`, falling back to `<unitOfMeasure>PIECE</...>`. This
+            // path serves the idempotent Replay branch; fresh issuance +
+            // storno / modification re-emit from `input.json`, which DOES
+            // carry the unit.
+            unit: None,
         });
     }
 

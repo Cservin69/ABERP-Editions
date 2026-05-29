@@ -81,6 +81,7 @@ fn one_line() -> LineItem {
         unit_price: Huf(1_000),
         vat_rate_basis_points: 2700,
         note: None,
+        unit: None,
     }
 }
 

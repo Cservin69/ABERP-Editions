@@ -243,6 +243,7 @@ fn line_note_round_trips_through_allocate_and_load() {
             unit_price: Huf(1_500),
             vat_rate_basis_points: 2700,
             note: Some("Please ship to dock B".to_string()),
+            unit: None,
         }],
         issue_date: now,
         // PR-84 — round-trip pin defaults both dates to the issue date.

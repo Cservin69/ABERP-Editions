@@ -986,6 +986,10 @@ fn build_modification_command(
             // surface; a future PR can extend to modification-line
             // notes if needed).
             note: l.note.clone(),
+            // S159 — carry each line's unit through the modification chain
+            // so the replacement lines emit the SAME `<unitOfMeasure>` as
+            // the side-store `input.json` recorded at the base's issuance.
+            unit: l.unit.clone(),
         })
         .collect();
     Ok(IssueInvoiceCommand {

@@ -320,6 +320,11 @@
         unitPriceInput: formatMinorToInput(product.unit_price_minor, product.currency),
         productCurrencyAtPick:
           product.currency !== form.currency ? product.currency : null,
+        // S159 — stamp the picked product's unit of measure onto the
+        // line so `composeIssueInvoiceBody` carries it to the backend's
+        // NAV `<unitOfMeasure>` emit. Re-picking overwrites it; a
+        // one-off freetext line keeps its `null` (PIECE fallback).
+        unit: product.unit,
       };
     });
     form = { ...form, lines: updatedLines };

@@ -81,6 +81,7 @@ fn nav_emit_surfaces_three_distinct_dates() {
             unit_price: Huf(1_000),
             vat_rate_basis_points: 2700,
             note: None,
+            unit: None,
         }],
         issue_date: issue_dt,
         // Three distinct calendar dates so the bytes-on-wire
@@ -151,6 +152,7 @@ fn duckdb_round_trip_preserves_payment_deadline_and_delivery_date() {
             unit_price: Huf(1_000),
             vat_rate_basis_points: 2700,
             note: None,
+            unit: None,
         }],
         issue_date: now,
         payment_deadline: date!(2026 - 06 - 15),

@@ -36,7 +36,8 @@
 use std::io::Write;
 
 use aberp_billing::{
-    huf_equivalent_round_half_even, Currency, Huf, LineItem, RateMetadata, ReadyInvoice, SeriesCode,
+    huf_equivalent_round_half_even, Currency, Huf, LineItem, ProductUnit, RateMetadata,
+    ReadyInvoice, SeriesCode,
 };
 use anyhow::{anyhow, Context, Result};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
@@ -998,6 +999,11 @@ fn negate_line(line: &LineItem) -> LineItem {
         // (NAV XML emission still does not consume the note — see the
         // never-leak invariant in `adr/0042-invoice-notes-never-in-nav-xml.md`.)
         note: line.note.clone(),
+        // S159 — preserve the base line's unit verbatim through negation
+        // so the storno's correction line emits the SAME `<unitOfMeasure>`
+        // as the original. Unit, like the description and VAT rate, is not
+        // part of the amount-sign reversal.
+        unit: line.unit.clone(),
     }
 }
 
@@ -1369,7 +1375,27 @@ fn write_lines(
         // → `3`) so the wire stays minimal; `Decimal::to_string` always
         // emits `.` regardless of locale.
         text_element(w, "quantity", &line.quantity.normalize().to_string())?;
-        text_element(w, "unitOfMeasure", "PIECE")?;
+        // S159 — the line's unit of measure. NAV's `LineType` places
+        // `<unitOfMeasure>` here (after `<quantity>`, before `<unitPrice>`),
+        // and `<unitOfMeasureOwn>` is valid ONLY when `<unitOfMeasure>` is
+        // the literal `OWN`. The closed-vocab `Nav` variants emit their
+        // token directly; `Own(text)` emits `OWN` + the free-text element
+        // (text XML-escaped by `text_element`); `None` (freetext line or a
+        // pre-S159 / DB-reconstructed line) falls back to PIECE. The XSD
+        // validator (`nav-xsd-validator::walk_line`) enforces the
+        // OWN ↔ unitOfMeasureOwn pairing.
+        match line.unit.as_ref() {
+            Some(ProductUnit::Nav(unit)) => {
+                text_element(w, "unitOfMeasure", unit.nav_token())?;
+            }
+            Some(ProductUnit::Own(text)) => {
+                text_element(w, "unitOfMeasure", "OWN")?;
+                text_element(w, "unitOfMeasureOwn", text)?;
+            }
+            None => {
+                text_element(w, "unitOfMeasure", "PIECE")?;
+            }
+        }
         text_element(
             w,
             "unitPrice",

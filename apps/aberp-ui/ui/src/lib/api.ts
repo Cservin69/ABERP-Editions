@@ -485,6 +485,14 @@ export interface IssueInvoiceRequest {
      * sees a clean "no note" signal. NEVER reaches the NAV
      * InvoiceData XML — recipient-facing only. */
     note?: string | null;
+    /** S159 — the line's unit of measure, stamped from the picked
+     * product (PR-100 picker). `null` for one-off freetext lines the
+     * operator typed without picking a product; the backend's emit
+     * falls back to `<unitOfMeasure>PIECE</...>`. A `Nav` token emits
+     * that token; an `Own` label emits `OWN` + `<unitOfMeasureOwn>`.
+     * Wire form is the Rust internally-tagged serde shape — see
+     * [`ProductUnit`]. */
+    unit?: ProductUnit | null;
   }>;
   currency: Currency;
   /** Optional series code; backend defaults to `"INV-default"` when

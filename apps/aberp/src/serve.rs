@@ -8343,6 +8343,7 @@ mod tests {
                 unit_price: Huf(69),
                 vat_rate_basis_points: 2700,
                 note: None,
+                unit: None,
             }],
             issue_date: now,
             payment_deadline: now.date(),

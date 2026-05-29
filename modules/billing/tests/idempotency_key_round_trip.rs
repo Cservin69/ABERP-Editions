@@ -71,6 +71,7 @@ fn build_allocate_args(series_id: SeriesId, idem: IdempotencyKey) -> AllocateArg
                 unit_price: Huf(1_000),
                 vat_rate_basis_points: 2700,
                 note: None,
+                unit: None,
             }],
             issue_date: OffsetDateTime::now_utc(),
             // PR-84 — in-memory store / round-trip test path. Default

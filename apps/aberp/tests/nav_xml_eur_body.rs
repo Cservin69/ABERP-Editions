@@ -100,6 +100,7 @@ fn build_eur_invoice() -> ReadyInvoice {
                 unit_price: Huf(1000), // 10.00 EUR per unit
                 vat_rate_basis_points: 2700,
                 note: None,
+                unit: None,
             },
             LineItem {
                 description: "EUR install".to_string(),
@@ -107,6 +108,7 @@ fn build_eur_invoice() -> ReadyInvoice {
                 unit_price: Huf(5000), // 50.00 EUR
                 vat_rate_basis_points: 2700,
                 note: None,
+                unit: None,
             },
         ],
         // Fixed wall-clock date so the rate-publication-date assertion
@@ -134,6 +136,7 @@ fn build_huf_invoice() -> ReadyInvoice {
                 unit_price: Huf(1000),
                 vat_rate_basis_points: 2700,
                 note: None,
+                unit: None,
             },
             LineItem {
                 description: "HUF install".to_string(),
@@ -141,6 +144,7 @@ fn build_huf_invoice() -> ReadyInvoice {
                 unit_price: Huf(5000),
                 vat_rate_basis_points: 2700,
                 note: None,
+                unit: None,
             },
         ],
         issue_date: OffsetDateTime::now_utc(),

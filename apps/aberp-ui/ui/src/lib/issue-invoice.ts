@@ -17,6 +17,7 @@ import type {
   Currency,
   CustomerVatStatusBody,
   IssueInvoiceRequest,
+  ProductUnit,
 } from "./api";
 import { parseAmountToMinor, parseDecimalQuantity } from "./format";
 import {
@@ -77,6 +78,13 @@ export interface LineFormState {
    * keeps the per-line warning state correct across add/remove-line
    * shuffles. */
   productCurrencyAtPick?: Currency | null;
+  /** S159 — the unit of measure stamped by `pickProduct()` from the
+   * picked product's `unit`. `null`/absent for one-off freetext lines
+   * (operator typed a description without picking a product); the
+   * composer emits it as `lines[i].unit` and the backend's NAV emit
+   * falls back to `<unitOfMeasure>PIECE</...>` for a null unit. Cleared
+   * to `null` only implicitly — re-picking a product overwrites it. */
+  unit?: ProductUnit | null;
 }
 
 /** PR-44ζ — top-level form state. Captures every operator-typed
@@ -258,6 +266,8 @@ export function emptyLine(): LineFormState {
     note: "",
     // PR-100 — no product picked yet on a fresh line.
     productCurrencyAtPick: null,
+    // S159 — no unit until a product is picked; null → PIECE fallback.
+    unit: null,
   };
 }
 
@@ -623,6 +633,11 @@ export function composeIssueInvoiceBody(
       // `null` so the backend's preflight / persistence path sees a
       // clean "no note" signal rather than a blank-string row.
       note: blankToNull(l.note),
+      // S159 — the picked product's unit (PR-100 picker). `null` for
+      // one-off freetext lines; the backend's NAV emit falls back to
+      // PIECE for a null unit. Emitted verbatim — the backend's
+      // `LineJson.unit: Option<ProductUnit>` deserialises null as None.
+      unit: l.unit ?? null,
     })),
     currency: form.currency,
     // PR-73 / ADR-0040 §addendum — operator-selected bank account.

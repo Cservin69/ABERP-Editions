@@ -105,6 +105,7 @@ fn fixture_invoice(with_notes: bool) -> ReadyInvoice {
             unit_price: Huf(1_000),
             vat_rate_basis_points: 2700,
             note: None,
+            unit: None,
         },
         LineItem {
             description: "Install B".to_string(),
@@ -112,6 +113,7 @@ fn fixture_invoice(with_notes: bool) -> ReadyInvoice {
             unit_price: Huf(5_000),
             vat_rate_basis_points: 2700,
             note: None,
+            unit: None,
         },
     ];
     if with_notes {

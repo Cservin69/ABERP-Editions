@@ -116,6 +116,7 @@ fn fixture_lines() -> Vec<LineJson> {
         unit_price: 1000,
         vat_rate_percent: 27,
         note: None,
+        unit: None,
     }]
 }
 

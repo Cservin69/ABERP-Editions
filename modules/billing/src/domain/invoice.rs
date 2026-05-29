@@ -11,6 +11,7 @@ use time::{Date, OffsetDateTime};
 
 use super::ids::{CustomerId, InvoiceId, SeriesId};
 use super::money::Huf;
+use super::unit_of_measure::ProductUnit;
 
 /// A line on the invoice. Quantities are `Decimal` (S157) so the operator
 /// can bill fractional units — `1.5` consulting days, `0.25` hours. The
@@ -38,6 +39,16 @@ pub struct LineItem {
     /// PR-82 — optional buyer-facing per-line note ("Megjegyzés").
     /// Recipient-facing only; never reaches the NAV InvoiceData XML.
     pub note: Option<String>,
+    /// S159 — the line's unit of measure, threaded from the product the
+    /// operator picked (PR-100 picker → `LineJson.unit`). `None` for
+    /// one-off freetext lines that did not pick a product, AND for lines
+    /// reconstructed from a pre-S159 side-store / DB row; both fall back
+    /// to `<unitOfMeasure>PIECE</...>` at the NAV emit. Unlike `note`,
+    /// this field DOES reach the NAV InvoiceData XML
+    /// (`nav_xml::write_lines`). Not persisted on `invoice_line` — it
+    /// rides the side-store `input.json` per-line payload, so storno /
+    /// modification re-emits preserve it.
+    pub unit: Option<ProductUnit>,
 }
 
 impl LineItem {
@@ -413,6 +424,7 @@ mod tests {
                     unit_price: Huf(1_000),
                     vat_rate_basis_points: 2700,
                     note: None,
+                    unit: None,
                 },
                 LineItem {
                     description: "widget B".to_string(),
@@ -420,6 +432,7 @@ mod tests {
                     unit_price: Huf(500),
                     vat_rate_basis_points: 2700,
                     note: None,
+                    unit: None,
                 },
             ],
             issue_date: OffsetDateTime::now_utc(),

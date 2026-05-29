@@ -79,6 +79,12 @@ use time::OffsetDateTime;
 use ulid::Ulid;
 
 use aberp_billing::Currency;
+// S159 — `NavUnitOfMeasure` + `ProductUnit` moved DOWN into billing's
+// domain so `LineItem` can carry a line's unit to the NAV
+// `<unitOfMeasure>` emit without a backwards `billing → app` dependency.
+// Re-exported here so the products module's public path
+// (`aberp::products::{NavUnitOfMeasure, ProductUnit}`) is unchanged.
+pub use aberp_billing::{NavUnitOfMeasure, ProductUnit};
 
 // ──────────────────────────────────────────────────────────────────────
 // ProductId — prefixed-ULID newtype (`prd_<26-char-ULID>`).
@@ -107,153 +113,44 @@ impl Default for ProductId {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// NavUnitOfMeasure — closed-vocab mirror of the NAV v3.0
-// unitOfMeasureType enum (sans OWN — see ProductUnit).
+// ProductUnit DB-column (de)serialisation.
+//
+// `NavUnitOfMeasure` + `ProductUnit` themselves live in billing's domain
+// (S159 — see the re-export above). The two-column DB persistence is a
+// products-table concern, so it stays here as free functions over the
+// re-exported types (inherent methods cannot be added to a foreign type).
 // ──────────────────────────────────────────────────────────────────────
 
-/// NAV v3.0 `unitOfMeasureType` enum mirror. Each variant serialises as
-/// the NAV-defined token (`PIECE`, `KILOGRAM`, …) via serde's
-/// `rename_all = "SCREAMING_SNAKE_CASE"` — wire body and NAV XML body
-/// agree by construction.
+/// Serialise a [`ProductUnit`] to the two-column DB form: `(kind, value)`.
 ///
-/// `OWN` is intentionally NOT a variant here. The `OWN` /
-/// `unitOfMeasureOwn` pairing on the NAV side is modelled at the
-/// outer [`ProductUnit`] level so callers cannot accidentally emit
-/// `OWN` without the paired free-text payload — a class of bug that a
-/// flat `Nav(OWN)` shape would invite.
+/// - `Nav(token)` → (`"Nav"`, `token.nav_token()`).
+/// - `Own(label)` → (`"Own"`, `label`).
 ///
-/// Adding a variant: confirm against NAV's v3.0 unitOfMeasureType
-/// schema, extend the enum + the SCREAMING_SNAKE serde mapping, then
-/// widen the SPA's dropdown. See ADR-0046.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum NavUnitOfMeasure {
-    Piece,
-    Kilogram,
-    Ton,
-    Kwh,
-    Day,
-    Hour,
-    Minute,
-    Month,
-    Liter,
-    Kilometer,
-    CubicMeter,
-    Meter,
-    LinearMeter,
-    Carton,
-    Pack,
-}
-
-impl NavUnitOfMeasure {
-    /// NAV v3.0 token body — what goes between
-    /// `<unitOfMeasure>` and `</unitOfMeasure>` in InvoiceData XML.
-    /// Non-serde callers (the future NAV XML emitter once it reads
-    /// the product's unit) use this directly; serde callers receive
-    /// the same string via `Serialize`.
-    pub fn nav_token(self) -> &'static str {
-        match self {
-            NavUnitOfMeasure::Piece => "PIECE",
-            NavUnitOfMeasure::Kilogram => "KILOGRAM",
-            NavUnitOfMeasure::Ton => "TON",
-            NavUnitOfMeasure::Kwh => "KWH",
-            NavUnitOfMeasure::Day => "DAY",
-            NavUnitOfMeasure::Hour => "HOUR",
-            NavUnitOfMeasure::Minute => "MINUTE",
-            NavUnitOfMeasure::Month => "MONTH",
-            NavUnitOfMeasure::Liter => "LITER",
-            NavUnitOfMeasure::Kilometer => "KILOMETER",
-            NavUnitOfMeasure::CubicMeter => "CUBIC_METER",
-            NavUnitOfMeasure::Meter => "METER",
-            NavUnitOfMeasure::LinearMeter => "LINEAR_METER",
-            NavUnitOfMeasure::Carton => "CARTON",
-            NavUnitOfMeasure::Pack => "PACK",
-        }
-    }
-
-    fn from_nav_token(token: &str) -> Option<Self> {
-        match token {
-            "PIECE" => Some(NavUnitOfMeasure::Piece),
-            "KILOGRAM" => Some(NavUnitOfMeasure::Kilogram),
-            "TON" => Some(NavUnitOfMeasure::Ton),
-            "KWH" => Some(NavUnitOfMeasure::Kwh),
-            "DAY" => Some(NavUnitOfMeasure::Day),
-            "HOUR" => Some(NavUnitOfMeasure::Hour),
-            "MINUTE" => Some(NavUnitOfMeasure::Minute),
-            "MONTH" => Some(NavUnitOfMeasure::Month),
-            "LITER" => Some(NavUnitOfMeasure::Liter),
-            "KILOMETER" => Some(NavUnitOfMeasure::Kilometer),
-            "CUBIC_METER" => Some(NavUnitOfMeasure::CubicMeter),
-            "METER" => Some(NavUnitOfMeasure::Meter),
-            "LINEAR_METER" => Some(NavUnitOfMeasure::LinearMeter),
-            "CARTON" => Some(NavUnitOfMeasure::Carton),
-            "PACK" => Some(NavUnitOfMeasure::Pack),
-            _ => None,
-        }
+/// Two columns rather than a single JSON blob so a future "filter products
+/// by NAV unit" query is a plain SQL predicate instead of a JSON-extract.
+fn unit_to_db_columns(unit: &ProductUnit) -> (&'static str, String) {
+    match unit {
+        ProductUnit::Nav(token) => ("Nav", token.nav_token().to_string()),
+        ProductUnit::Own(label) => ("Own", label.clone()),
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// ProductUnit — `Nav(enum) | Own(String)` outer sum.
-// ──────────────────────────────────────────────────────────────────────
-
-/// Product's unit of measure: either one of the NAV-defined tokens
-/// ([`NavUnitOfMeasure`]) or a free-text label that the future NAV
-/// emitter will render as `OWN` + `<unitOfMeasureOwn>{label}</...>`.
-///
-/// Wire shape (internally-tagged serde):
-///
-/// ```json
-/// {"kind": "Nav", "value": "PIECE"}
-/// {"kind": "Own", "value": "liter@15C"}
-/// ```
-///
-/// The tagged shape keeps the JSON self-describing for SPA debugging
-/// at minimal cost (one extra field name). Pinned by
-/// `product_unit_serde_round_trip_pin`.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
-#[serde(tag = "kind", content = "value")]
-pub enum ProductUnit {
-    /// One of the NAV v3.0 unitOfMeasure tokens.
-    Nav(NavUnitOfMeasure),
-    /// Operator-typed free-text label. The future NAV emitter pairs
-    /// this with the literal `OWN` token in the wire `<unitOfMeasure>`
-    /// element. `liter@15C` (fuel measure) is the canonical example —
-    /// no plain LITER variant covers the temperature correction.
-    Own(String),
-}
-
-impl ProductUnit {
-    /// Serialise to the two-column DB form: `(kind, value)`.
-    ///
-    /// - `Nav(token)` → (`"Nav"`, `token.nav_token()`).
-    /// - `Own(label)` → (`"Own"`, `label`).
-    ///
-    /// Two columns rather than a single JSON blob so a future
-    /// "filter products by NAV unit" query is a plain SQL predicate
-    /// instead of a JSON-extract.
-    fn to_db_columns(&self) -> (&'static str, String) {
-        match self {
-            ProductUnit::Nav(token) => ("Nav", token.nav_token().to_string()),
-            ProductUnit::Own(label) => ("Own", label.clone()),
-        }
-    }
-
-    fn from_db_columns(kind: &str, value: &str) -> Result<Self> {
-        match kind {
-            "Nav" => match NavUnitOfMeasure::from_nav_token(value) {
-                Some(token) => Ok(ProductUnit::Nav(token)),
-                None => Err(anyhow::anyhow!(
-                    "products.unit_value `{}` is not a known NAV unitOfMeasure token",
-                    value
-                )),
-            },
-            "Own" => Ok(ProductUnit::Own(value.to_string())),
-            other => Err(anyhow::anyhow!(
-                "products.unit_kind has unexpected value `{}` (expected Nav | Own)",
-                other
+/// Reconstruct a [`ProductUnit`] from the two DB columns. Loud-fails on an
+/// unknown `kind` or a `Nav` value outside the closed vocab.
+fn unit_from_db_columns(kind: &str, value: &str) -> Result<ProductUnit> {
+    match kind {
+        "Nav" => match NavUnitOfMeasure::from_nav_token(value) {
+            Some(token) => Ok(ProductUnit::Nav(token)),
+            None => Err(anyhow::anyhow!(
+                "products.unit_value `{}` is not a known NAV unitOfMeasure token",
+                value
             )),
-        }
+        },
+        "Own" => Ok(ProductUnit::Own(value.to_string())),
+        other => Err(anyhow::anyhow!(
+            "products.unit_kind has unexpected value `{}` (expected Nav | Own)",
+            other
+        )),
     }
 }
 
@@ -390,7 +287,7 @@ pub fn create_product(conn: &Connection, tenant: &str, inputs: &ProductInputs) -
         ProductUnit::Nav(token) => ProductUnit::Nav(*token),
         ProductUnit::Own(label) => ProductUnit::Own(label.trim().to_string()),
     };
-    let (unit_kind, unit_value) = unit.to_db_columns();
+    let (unit_kind, unit_value) = unit_to_db_columns(&unit);
     conn.execute(
         "INSERT INTO products (
             id, tenant_id, name, unit_kind, unit_value, currency,
@@ -501,7 +398,7 @@ pub fn update_product(
         ProductUnit::Nav(token) => ProductUnit::Nav(*token),
         ProductUnit::Own(label) => ProductUnit::Own(label.trim().to_string()),
     };
-    let (unit_kind, unit_value) = unit.to_db_columns();
+    let (unit_kind, unit_value) = unit_to_db_columns(&unit);
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .context("format updated_at as Rfc3339")?;
@@ -558,7 +455,7 @@ fn row_to_product(row: &duckdb::Row<'_>) -> duckdb::Result<Result<Product>> {
     let updated_at: String = row.get(7)?;
     let deleted_at: Option<String> = row.get(8)?;
 
-    let unit = match ProductUnit::from_db_columns(&unit_kind, &unit_value) {
+    let unit = match unit_from_db_columns(&unit_kind, &unit_value) {
         Ok(u) => u,
         Err(e) => return Ok(Err(e)),
     };
@@ -659,15 +556,15 @@ mod tests {
     fn product_unit_db_columns_round_trip() {
         // Nav variant.
         let unit = ProductUnit::Nav(NavUnitOfMeasure::Day);
-        let (kind, value) = unit.to_db_columns();
+        let (kind, value) = unit_to_db_columns(&unit);
         assert_eq!((kind, value.as_str()), ("Nav", "DAY"));
-        assert_eq!(ProductUnit::from_db_columns(kind, &value).unwrap(), unit);
+        assert_eq!(unit_from_db_columns(kind, &value).unwrap(), unit);
 
         // Own variant — the load-bearing liter@15C case.
         let unit = ProductUnit::Own("liter@15C".to_string());
-        let (kind, value) = unit.to_db_columns();
+        let (kind, value) = unit_to_db_columns(&unit);
         assert_eq!((kind, value.as_str()), ("Own", "liter@15C"));
-        assert_eq!(ProductUnit::from_db_columns(kind, &value).unwrap(), unit);
+        assert_eq!(unit_from_db_columns(kind, &value).unwrap(), unit);
     }
 
     #[test]
@@ -675,7 +572,7 @@ mod tests {
         // Defence against a hand-edited DuckDB row: an unrecognised
         // unit_value paired with `Nav` must surface as a loud error
         // rather than silently coerce.
-        let err = ProductUnit::from_db_columns("Nav", "NOT_A_REAL_TOKEN").unwrap_err();
+        let err = unit_from_db_columns("Nav", "NOT_A_REAL_TOKEN").unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("NOT_A_REAL_TOKEN"),
@@ -685,7 +582,7 @@ mod tests {
 
     #[test]
     fn product_unit_from_db_rejects_unknown_kind() {
-        let err = ProductUnit::from_db_columns("Bogus", "anything").unwrap_err();
+        let err = unit_from_db_columns("Bogus", "anything").unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("Bogus"),

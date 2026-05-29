@@ -2017,6 +2017,7 @@ mod tests {
                     unit_price: Huf(1_500),
                     vat_rate_basis_points: 2700,
                     note: None,
+                    unit: None,
                 },
                 LineItem {
                     description: "ünïcödé and other non-ASCII: 日本語".to_string(),
@@ -2024,6 +2025,7 @@ mod tests {
                     unit_price: Huf(500),
                     vat_rate_basis_points: 2700,
                     note: None,
+                    unit: None,
                 },
             ],
             issue_date: now,

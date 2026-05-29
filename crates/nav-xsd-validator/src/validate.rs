@@ -735,6 +735,11 @@ fn walk_line(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
         "lineDescription",
         "quantity",
         "unitOfMeasure",
+        // S159 — `<unitOfMeasureOwn>` (free-text unit) is permitted by
+        // NAV's LineType ONLY when `<unitOfMeasure>` is `OWN`. The
+        // post-walk pair-rule below enforces that conditional; the
+        // allowlist just admits the element.
+        "unitOfMeasureOwn",
         "unitPrice",
         "lineAmountsNormal",
     ];
@@ -747,6 +752,10 @@ fn walk_line(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
         "lineAmountsNormal",
     ];
 
+    // S159 — capture the `<unitOfMeasure>` text so the post-walk pair-rule
+    // can decide whether `<unitOfMeasureOwn>` is required (status `OWN`),
+    // forbidden (any other token), or absent-and-fine.
+    let mut unit_of_measure: Option<String> = None;
     let mut seen: Vec<&'static str> = Vec::new();
     loop {
         match read_event(reader)? {
@@ -774,6 +783,9 @@ fn walk_line(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
                         ensure_numeric_amount(canonical, &text)?;
                     }
                     "unitOfMeasure" => {
+                        unit_of_measure = Some(collect_text(reader, canonical)?);
+                    }
+                    "unitOfMeasureOwn" => {
                         let _ = collect_text(reader, canonical)?;
                     }
                     "unitPrice" => {
@@ -788,6 +800,25 @@ fn walk_line(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
             }
             Event::End(_) => {
                 check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                // S159 — `<unitOfMeasure>OWN</...>` ↔ `<unitOfMeasureOwn>`
+                // pair rule. NAV's LineType permits the free-text element
+                // ONLY alongside the `OWN` token. `check_ordered_required`
+                // already guaranteed `<unitOfMeasure>` is present.
+                let is_own = unit_of_measure
+                    .as_deref()
+                    .is_some_and(|u| u.eq_ignore_ascii_case("OWN"));
+                let has_own_text = seen.contains(&"unitOfMeasureOwn");
+                if is_own && !has_own_text {
+                    return Err(NavXsdValidationError::MissingRequiredChild {
+                        parent: PARENT,
+                        expected: "unitOfMeasureOwn",
+                    });
+                }
+                if !is_own && has_own_text {
+                    return Err(NavXsdValidationError::ForbiddenUnitOfMeasureOwn {
+                        unit_of_measure: unit_of_measure.unwrap_or_default(),
+                    });
+                }
                 return Ok(());
             }
             Event::Eof => return Err(eof_in(PARENT, reader)),
@@ -2367,6 +2398,65 @@ mod tests {
         }
     }
 
+    /// S159 — positive case: `<unitOfMeasure>OWN</...>` paired with
+    /// `<unitOfMeasureOwn>{label}</...>` (the fuel-measure `liter@15C`)
+    /// validates. This is the wire shape the emitter produces for a
+    /// `ProductUnit::Own` line; the validator must accept it.
+    #[test]
+    fn unit_of_measure_own_with_free_text_validates() {
+        let original = "<unitOfMeasure>PIECE</unitOfMeasure>";
+        let replacement =
+            "<unitOfMeasure>OWN</unitOfMeasure>\n          <unitOfMeasureOwn>liter@15C</unitOfMeasureOwn>";
+        assert!(
+            MIN_VALID.contains(original),
+            "MIN_VALID must contain the PIECE unitOfMeasure this pin replaces — fixture drift"
+        );
+        let mutated = MIN_VALID.replace(original, replacement);
+        validate_invoice_data(mutated.as_bytes())
+            .expect("OWN + unitOfMeasureOwn is a valid NAV LineType shape");
+    }
+
+    /// S159 — POSITIVE half of the pair rule: `<unitOfMeasure>OWN</...>`
+    /// REQUIRES the free-text `<unitOfMeasureOwn>` sibling. An `OWN`
+    /// token with no free-text element loud-fails as a missing child so
+    /// the gap surfaces at the ADR-0022 invariant check, not as a
+    /// NAV-side rejection.
+    #[test]
+    fn unit_of_measure_own_without_free_text_is_rejected() {
+        let original = "<unitOfMeasure>PIECE</unitOfMeasure>";
+        let replacement = "<unitOfMeasure>OWN</unitOfMeasure>";
+        let mutated = MIN_VALID.replace(original, replacement);
+        let err = validate_invoice_data(mutated.as_bytes())
+            .expect_err("OWN without <unitOfMeasureOwn> must loud-fail");
+        match err {
+            NavXsdValidationError::MissingRequiredChild { parent, expected } => {
+                assert_eq!(parent, "line");
+                assert_eq!(expected, "unitOfMeasureOwn");
+            }
+            other => panic!("expected MissingRequiredChild unitOfMeasureOwn, got {other:?}"),
+        }
+    }
+
+    /// S159 — NEGATIVE half of the pair rule: `<unitOfMeasureOwn>` is
+    /// FORBIDDEN when `<unitOfMeasure>` is a closed-vocab token (here
+    /// `PIECE`). NAV's LineType permits the free-text element only
+    /// alongside `OWN`.
+    #[test]
+    fn unit_of_measure_free_text_without_own_is_rejected() {
+        let original = "<unitOfMeasure>PIECE</unitOfMeasure>";
+        let replacement =
+            "<unitOfMeasure>PIECE</unitOfMeasure>\n          <unitOfMeasureOwn>liter@15C</unitOfMeasureOwn>";
+        let mutated = MIN_VALID.replace(original, replacement);
+        let err = validate_invoice_data(mutated.as_bytes())
+            .expect_err("PIECE + <unitOfMeasureOwn> must loud-fail");
+        match err {
+            NavXsdValidationError::ForbiddenUnitOfMeasureOwn { unit_of_measure } => {
+                assert_eq!(unit_of_measure, "PIECE");
+            }
+            other => panic!("expected ForbiddenUnitOfMeasureOwn, got {other:?}"),
+        }
+    }
+
     #[test]
     fn error_variants_have_distinct_display() {
         let v = vec![
@@ -2417,6 +2507,9 @@ mod tests {
                 parent: "x",
                 element: "y",
                 status: "PRIVATE_PERSON",
+            },
+            NavXsdValidationError::ForbiddenUnitOfMeasureOwn {
+                unit_of_measure: "PIECE".into(),
             },
         ];
 

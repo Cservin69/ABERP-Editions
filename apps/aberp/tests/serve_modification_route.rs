@@ -84,6 +84,7 @@ fn fixture_ready_invoice() -> ReadyInvoice {
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
             note: None,
+            unit: None,
         }],
         issue_date: OffsetDateTime::now_utc(),
         // PR-84 — fixture defaults both date fields to issue date.
@@ -117,6 +118,7 @@ fn fixture_request_body(currency: aberp_billing::Currency) -> ModificationInvoic
             unit_price: 1500,
             vat_rate_percent: 27,
             note: None,
+            unit: None,
         }],
         currency,
         modification_date: "2026-05-24".to_string(),
@@ -283,6 +285,7 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
                 unit_price: 1000,
                 vat_rate_percent: 27,
                 note: None,
+                unit: None,
             }],
             invoice_note: None,
             // PR-84 — fixture leaves all three date fields `None`; the

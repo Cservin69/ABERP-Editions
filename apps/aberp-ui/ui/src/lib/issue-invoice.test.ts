@@ -78,6 +78,9 @@ describe("composeIssueInvoiceBody", () => {
           // PR-82 — blank line note normalises to `null` on the wire
           // so the backend sees a clean "no note" signal.
           note: null,
+          // S159 — no product picked on this one-off line, so `unit`
+          // is `null`; the backend's NAV emit falls back to PIECE.
+          unit: null,
         },
       ],
       currency: "HUF",
@@ -347,6 +350,8 @@ describe("composeIssueInvoiceBody", () => {
       vatRatePercent: 27,
       // PR-82 — blank-after-trim ⇒ null on the wire.
       note: null,
+      // S159 — no product picked ⇒ unit null ⇒ PIECE fallback.
+      unit: null,
     });
   });
 
@@ -466,6 +471,68 @@ describe("composeIssueInvoiceBody", () => {
     expect(body.lines.map((l) => l.description)).toEqual(["A", "B", "C"]);
     expect(body.lines.map((l) => l.unitPrice)).toEqual([100, 200, 300]);
     expect(body.lines.map((l) => l.vatRatePercent)).toEqual([27, 5, 0]);
+  });
+
+  // S159 — the composer carries each line's `unit` (stamped by the
+  // PR-100 product picker) onto the wire `lines[i].unit`, where the
+  // backend threads it to the NAV `<unitOfMeasure>` emit. A freetext
+  // line (no product picked) emits `unit: null` → PIECE fallback.
+  describe("S159 — line.unit carries to the wire body", () => {
+    it("carries a Nav unit (LITER) verbatim", () => {
+      const body = composeIssueInvoiceBody({
+        ...emptyForm(),
+        customerName: "C",
+        customerTaxNumber: "y",
+        lines: [
+          {
+            description: "Áram",
+            quantityInput: "2",
+            unitPriceInput: "1000",
+            vatRatePercent: 27,
+            note: "",
+            unit: { kind: "Nav", value: "LITER" },
+          },
+        ],
+      });
+      expect(body.lines[0].unit).toEqual({ kind: "Nav", value: "LITER" });
+    });
+
+    it("carries an Own unit (liter@15C) verbatim", () => {
+      const body = composeIssueInvoiceBody({
+        ...emptyForm(),
+        customerName: "C",
+        customerTaxNumber: "y",
+        lines: [
+          {
+            description: "Áram",
+            quantityInput: "2",
+            unitPriceInput: "1000",
+            vatRatePercent: 27,
+            note: "",
+            unit: { kind: "Own", value: "liter@15C" },
+          },
+        ],
+      });
+      expect(body.lines[0].unit).toEqual({ kind: "Own", value: "liter@15C" });
+    });
+
+    it("emits unit: null for a one-off freetext line (no product picked)", () => {
+      const body = composeIssueInvoiceBody({
+        ...emptyForm(),
+        customerName: "C",
+        customerTaxNumber: "y",
+        lines: [
+          {
+            description: "freetext",
+            quantityInput: "1",
+            unitPriceInput: "100",
+            vatRatePercent: 27,
+            note: "",
+          },
+        ],
+      });
+      expect(body.lines[0].unit).toBeNull();
+    });
   });
 
   // PR-97 / ADR-0048 — composer per buyer-kind branch.

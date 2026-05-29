@@ -52,8 +52,8 @@ use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerM
 use aberp_billing::{
     self as billing, huf_equivalent_round_half_even, AllocateArgs, AllocateOutcome,
     BankAccountSnapshot, BillingStore, Currency, CustomerId, DraftInvoice, DuckDbBillingStore, Huf,
-    IdempotencyKey, InvoiceId, InvoiceSeries, IssueInvoiceCommand, LineItem, RateMetadata,
-    ResetPolicy, SeriesCode, SeriesId,
+    IdempotencyKey, InvoiceId, InvoiceSeries, IssueInvoiceCommand, LineItem, ProductUnit,
+    RateMetadata, ResetPolicy, SeriesCode, SeriesId,
 };
 use aberp_mnb_rates::{MnbError, MnbRate, SOURCE as MNB_SOURCE};
 use aberp_nav_transport::NavCredentials;
@@ -256,6 +256,15 @@ pub struct LineJson {
     /// `#[serde(default)]`.
     #[serde(default)]
     pub note: Option<String>,
+    /// S159 — the line's unit of measure, stamped by the SPA's PR-100
+    /// product picker (`pickProduct` → `composeIssueInvoiceBody`). `None`
+    /// for one-off freetext lines the operator typed without picking a
+    /// product. `#[serde(default)]` so pre-S159 side-store `input.json`
+    /// bodies (already-issued invoices replayed by the storno /
+    /// modification flows) deserialise with `unit: None`, which the NAV
+    /// emitter renders as the `<unitOfMeasure>PIECE</...>` fallback.
+    #[serde(default)]
+    pub unit: Option<ProductUnit>,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1069,6 +1078,10 @@ fn build_command(input: &InvoiceInputJson, code: &SeriesCode) -> Result<IssueInv
             // through to `LineItem`. The NAV emitter does not consume
             // this field; the printed-PDF + SPA detail surfaces do.
             note: l.note.clone(),
+            // S159 — the line's picked-product unit threads through to the
+            // NAV `<unitOfMeasure>` emit. `None` (freetext line) falls back
+            // to PIECE at `nav_xml::write_lines`.
+            unit: l.unit.clone(),
         })
         .collect();
     Ok(IssueInvoiceCommand {

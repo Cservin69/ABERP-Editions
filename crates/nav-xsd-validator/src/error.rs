@@ -164,4 +164,20 @@ pub enum NavXsdValidationError {
         element: &'static str,
         status: &'static str,
     },
+
+    /// S159 — `<unitOfMeasureOwn>` appeared on a `<line>` whose
+    /// `<unitOfMeasure>` is NOT the literal `OWN`. NAV v3.0's `LineType`
+    /// permits the free-text `<unitOfMeasureOwn>` ONLY when
+    /// `<unitOfMeasure>` carries `OWN`; any closed-vocab token
+    /// (`PIECE`, `KILOGRAM`, …) forbids it. The symmetric POSITIVE half
+    /// (`OWN` REQUIRES `<unitOfMeasureOwn>`) surfaces as
+    /// `MissingRequiredChild { parent: "line", expected: "unitOfMeasureOwn" }`.
+    /// Distinct from `UnexpectedElement` because `<unitOfMeasureOwn>` IS in
+    /// the `<line>` allowlist — its validity is conditional on a sibling's
+    /// text value.
+    #[error(
+        "<unitOfMeasureOwn> is valid only when <unitOfMeasure> is `OWN`, \
+         but <unitOfMeasure> was `{unit_of_measure}`"
+    )]
+    ForbiddenUnitOfMeasureOwn { unit_of_measure: String },
 }

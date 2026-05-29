@@ -44,6 +44,7 @@ fn build_minimal_invoice() -> ReadyInvoice {
                 unit_price: Huf(1000),
                 vat_rate_basis_points: 2700, // 27%
                 note: None,
+                unit: None,
             },
             LineItem {
                 description: "Test installation service".to_string(),
@@ -51,6 +52,7 @@ fn build_minimal_invoice() -> ReadyInvoice {
                 unit_price: Huf(5000),
                 vat_rate_basis_points: 2700,
                 note: None,
+                unit: None,
             },
         ],
         issue_date: OffsetDateTime::now_utc(),
@@ -128,6 +130,7 @@ fn decimal_quantity_emits_dot_separated_and_validates() {
         unit_price: Huf(1000),
         vat_rate_basis_points: 2700,
         note: None,
+        unit: None,
     }];
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = minimal_parties();
