@@ -503,8 +503,9 @@ fn emitter_writes_customer_address_under_domestic_status() {
 ///   2. NO `<customerVatData>` element anywhere in the emitted body.
 ///   3. NO `<customerTaxNumber>` block anywhere (the structured
 ///      Hungarian tax-number children that DOMESTIC requires).
-///   4. `<customerName>` IS present (universally required regardless
-///      of status).
+///   4. NO `<customerName>` element (Session-154: NAV business rule
+///      CUSTOMER_DATA_NOT_EXPECTED forbids it under PRIVATE_PERSON; §169
+///      governs the printed PDF, not the wire).
 ///   5. The validator passes the round-trip — confirming the symmetric
 ///      ForbiddenChildUnderStatus rule does not falsely fire on a
 ///      compliant PRIVATE_PERSON body.
@@ -551,18 +552,18 @@ fn emitter_writes_customer_info_under_private_person_omits_vat_data() {
         !body.contains("<customerTaxNumber>"),
         "PRIVATE_PERSON buyer MUST NOT carry <customerTaxNumber>; body:\n{body}"
     );
-    // PR-97 / ADR-0048 (Ervin override 2 / GDPR) — `customerName` is
-    // OPTIONAL under PRIVATE_PERSON. This fixture supplies a name so
-    // the body keeps a readable Kovács János reference; the
-    // sibling pin `emitter_writes_customer_info_under_private_person_omits_name_and_address`
-    // below covers the empty-name GDPR posture.
+    // Session-154 (ADR-0048 amendment 2026-05-29) — `<customerName>` is
+    // SUPPRESSED on the wire under PRIVATE_PERSON even though the operator
+    // supplied "Kovács János" (it still renders on the §169 PDF). NAV
+    // business rule CUSTOMER_DATA_NOT_EXPECTED forbids it server-side.
     assert!(
-        body.contains("<customerName>Kovács János</customerName>"),
-        "<customerName> still emitted when the operator supplied one; body:\n{body}"
+        !body.contains("<customerName>"),
+        "PRIVATE_PERSON wire body must OMIT <customerName> \
+         (NAV CUSTOMER_DATA_NOT_EXPECTED), even with an operator-supplied name; body:\n{body}"
     );
     assert!(
         !body.contains("<customerAddress>"),
-        "absent address must NOT emit an empty <customerAddress> wrapper; body:\n{body}"
+        "PRIVATE_PERSON wire body must OMIT <customerAddress>; body:\n{body}"
     );
 
     validate_invoice_data(&xml).expect(
@@ -572,15 +573,14 @@ fn emitter_writes_customer_info_under_private_person_omits_vat_data() {
     );
 }
 
-/// Session-148 (Ervin override 3) — `<customerName>` is emitted
-/// UNCONDITIONALLY for PRIVATE_PERSON buyers (the PR-97 GDPR carve-out
-/// that omitted it is removed). The buyer name is mandatory per Áfa
-/// tv. §169 for every customer type; upstream preflight guarantees a
-/// non-empty name reaches the emitter. The wire body still omits
-/// `<customerVatData>` (NAV forbids it under PRIVATE_PERSON) and may
-/// omit `<customerAddress>` (NAV tolerates absence at the wire layer
-/// for natural persons). This pin asserts the name IS present while
-/// the address may be absent.
+/// Session-154 (ADR-0048 amendment 2026-05-29) — INVERTS the
+/// session-148 pin. `<customerName>` is SUPPRESSED on the NAV wire for
+/// PRIVATE_PERSON buyers: NAV business rule CUSTOMER_DATA_NOT_EXPECTED
+/// ("Magánszemély vevő adatai nem adhatók meg.") ABORTS a submit that
+/// carries it (confirmed against invoice 31, 2026-05-29). §169's
+/// buyer-name mandate is a printed-PDF obligation, NOT a wire one — the
+/// PDF still renders the name. The wire body omits `<customerVatData>`,
+/// `<customerName>`, AND `<customerAddress>` for natural-person buyers.
 #[test]
 fn emitter_writes_customer_info_under_private_person_omits_name_and_address() {
     let invoice = build_minimal_invoice();
@@ -597,10 +597,17 @@ fn emitter_writes_customer_info_under_private_person_omits_name_and_address() {
         customer: CustomerInfo {
             customer_vat_status: CustomerVatStatus::PrivatePerson,
             tax_number: None,
-            // Session-148 — the buyer name is mandatory (§169); a
-            // PrivatePerson buyer carries a name like any other.
+            // §169 populates the buyer name for the PDF; the wire emit
+            // suppresses it under PRIVATE_PERSON (Session-154).
             name: "Teszt Magánszemély".to_string(),
-            address: None,
+            // Address present on the struct (§169 preflight populates it)
+            // to prove the wire suppression holds even when populated.
+            address: Some(CustomerAddress {
+                country_code: "HU".to_string(),
+                postal_code: "1011".to_string(),
+                city: "Budapest".to_string(),
+                street: "Fő utca 1.".to_string(),
+            }),
         },
     };
 
@@ -617,16 +624,18 @@ fn emitter_writes_customer_info_under_private_person_omits_name_and_address() {
         "PRIVATE_PERSON forbids <customerVatData>; body:\n{body}"
     );
     assert!(
-        body.contains("<customerName>Teszt Magánszemély</customerName>"),
-        "§169: PRIVATE_PERSON buyer name must be emitted as <customerName>; body:\n{body}"
+        !body.contains("<customerName>"),
+        "Session-154: PRIVATE_PERSON wire body must OMIT <customerName> \
+         (NAV CUSTOMER_DATA_NOT_EXPECTED); body:\n{body}"
     );
     assert!(
         !body.contains("<customerAddress>"),
-        "absent address must NOT emit an empty <customerAddress> wrapper; body:\n{body}"
+        "Session-154: PRIVATE_PERSON wire body must OMIT <customerAddress> even when \
+         populated (NAV CUSTOMER_DATA_NOT_EXPECTED); body:\n{body}"
     );
 
     validate_invoice_data(&xml).expect(
-        "v3.0 invariant check must pass — PRIVATE_PERSON + name + omitted address \
+        "v3.0 invariant check must pass — PRIVATE_PERSON + omitted name/address \
          is a valid minimal body",
     );
 }

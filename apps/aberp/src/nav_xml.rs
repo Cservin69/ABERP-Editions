@@ -1121,21 +1121,22 @@ fn write_customer(w: &mut Writer<&mut Vec<u8>>, c: &CustomerInfo) -> Result<()> 
         }
     }
 
-    // Session-148 (Ervin override 3) — `<customerName>` is emitted
-    // UNCONDITIONALLY for ALL buyer kinds. The buyer name is required
-    // per Áfa tv. §169 (ADR-0048 amendment, PR-104); the PR-97 GDPR
-    // carve-out that omitted `<customerName>` for PRIVATE_PERSON is
-    // removed. Preflight already guarantees a non-empty name reaches
-    // this emit for every customer type.
-    text_element(w, "customerName", &c.name)?;
-    // PR-77 / session-101 — `<customerAddress>` per NAV v3.0 business-rule
-    // `CUSTOMER_DATA_EXPECTED`. Required whenever `customerVatStatus !=
-    // PRIVATE_PERSON`; for PrivatePerson buyers the wire layer permits
-    // absence (ADR-0048 §3 open-question #5 + Ervin override 2 GDPR).
-    // Position is AFTER `<customerName>` per the v3.0 XSD
-    // CustomerInfoType ordering.
-    if let Some(address) = c.address.as_ref() {
-        write_customer_address(w, address)?;
+    // Session-154 (ADR-0048 amendment 2026-05-29) — `<customerName>` and
+    // `<customerAddress>` are emitted on the NAV wire for every buyer kind
+    // EXCEPT PRIVATE_PERSON. NAV's business-tier rule
+    // `CUSTOMER_DATA_NOT_EXPECTED` ("Magánszemély vevő adatai nem adhatók
+    // meg.") rejects a PrivatePerson body carrying either field, ABORTING
+    // the submit. §169 of the Áfa tv. mandates buyer name + address on the
+    // *printed* invoice — that governs the PDF, NOT the NAV wire — so the
+    // PDF still renders both unconditionally (PR-148/150 preserved). The
+    // unconditional emit added in sessions 148/150 leaked PDF logic into the
+    // wire; this re-separates the two surfaces. Position is AFTER any
+    // `<customerVatData>` per the v3.0 XSD CustomerInfoType ordering.
+    if !matches!(c.customer_vat_status, CustomerVatStatus::PrivatePerson) {
+        text_element(w, "customerName", &c.name)?;
+        if let Some(address) = c.address.as_ref() {
+            write_customer_address(w, address)?;
+        }
     }
     w.write_event(Event::End(BytesEnd::new("customerInfo")))?;
     Ok(())
@@ -1670,12 +1671,17 @@ mod tests {
         assert_eq!(CustomerVatStatus::default(), CustomerVatStatus::Domestic);
     }
 
-    /// Session-148 (Ervin override 3) — `<customerName>` is emitted
-    /// UNCONDITIONALLY, including for PRIVATE_PERSON buyers (the PR-97
-    /// GDPR carve-out that omitted it is removed). Pins the wire-shape
-    /// against regression to the conditional-omit branch.
+    /// Session-154 (ADR-0048 amendment 2026-05-29) — INVERTS the
+    /// session-148 pin. NAV's business-tier rule
+    /// `CUSTOMER_DATA_NOT_EXPECTED` ("Magánszemély vevő adatai nem adhatók
+    /// meg.") ABORTS a PRIVATE_PERSON submit that carries `<customerName>`
+    /// or `<customerAddress>`. Confirmed against NAV's response XML to
+    /// Ervin's invoice 31 (2026-05-29). §169 buyer-name/address is a
+    /// *printed-invoice* obligation (the PDF, unchanged) — it does NOT
+    /// govern the NAV wire. The wire emit therefore SUPPRESSES both fields
+    /// for natural-person buyers.
     #[test]
-    fn write_customer_emits_customer_name_for_private_person() {
+    fn write_customer_omits_customer_name_for_private_person() {
         let c = CustomerInfo {
             customer_vat_status: CustomerVatStatus::PrivatePerson,
             // PrivatePerson carries no ADÓSZÁM.
@@ -1690,25 +1696,30 @@ mod tests {
         }
         let xml = String::from_utf8(buf).expect("utf8");
         assert!(
-            xml.contains("<customerName>Teszt Magánszemély</customerName>"),
-            "PRIVATE_PERSON wire body must carry <customerName>, got: {xml}"
+            !xml.contains("<customerName>"),
+            "PRIVATE_PERSON wire body must OMIT <customerName> \
+             (NAV CUSTOMER_DATA_NOT_EXPECTED), got: {xml}"
         );
     }
 
-    /// Session-150 — the NAV WIRE-side data-minimisation for
-    /// PrivatePerson is PRESERVED: with `address: None` the emitter
-    /// omits `<customerAddress>` entirely (the `if let Some(address)`
-    /// gate in `write_customer`). The §169 buyer-address obligation is
-    /// enforced at issuance preflight + on the printed PDF, NOT by
-    /// changing this wire emit (ADR-0048 amendment 2026-05-29, Part G).
-    /// Pins that session-150 did not touch nav_xml.rs's customer emit.
+    /// Session-154 — the wire emit SUPPRESSES `<customerAddress>` for
+    /// PRIVATE_PERSON even when an address IS present on the struct (§169
+    /// preflight populates it for the PDF). NAV rule
+    /// `CUSTOMER_DATA_NOT_EXPECTED` forbids it on the wire regardless.
+    /// Strengthens the prior `address: None` pin by proving suppression of
+    /// a *populated* address. `<customerVatData>` omission is held too.
     #[test]
-    fn write_customer_omits_address_for_private_person_without_address() {
+    fn write_customer_omits_address_for_private_person_with_address() {
         let c = CustomerInfo {
             customer_vat_status: CustomerVatStatus::PrivatePerson,
             tax_number: None,
             name: "Teszt Magánszemély".to_string(),
-            address: None,
+            address: Some(CustomerAddress {
+                country_code: "HU".to_string(),
+                postal_code: "1011".to_string(),
+                city: "Budapest".to_string(),
+                street: "Fő utca 1.".to_string(),
+            }),
         };
         let mut buf: Vec<u8> = Vec::new();
         {
@@ -1718,11 +1729,45 @@ mod tests {
         let xml = String::from_utf8(buf).expect("utf8");
         assert!(
             !xml.contains("<customerAddress>"),
-            "PRIVATE_PERSON + no address must omit <customerAddress> on the wire, got: {xml}"
+            "PRIVATE_PERSON must OMIT <customerAddress> on the wire even when \
+             populated (NAV CUSTOMER_DATA_NOT_EXPECTED), got: {xml}"
         );
         assert!(
             !xml.contains("<customerVatData>"),
             "PRIVATE_PERSON must omit <customerVatData> on the wire, got: {xml}"
+        );
+    }
+
+    /// Session-154 — positive regression: DOMESTIC buyers still emit
+    /// `<customerName>` AND `<customerAddress>` on the wire (PR-148/150
+    /// path for non-natural-person buyers is unchanged). Guards against an
+    /// over-broad suppression that would strip these from taxable buyers.
+    #[test]
+    fn write_customer_emits_name_and_address_for_domestic() {
+        let c = CustomerInfo {
+            customer_vat_status: CustomerVatStatus::Domestic,
+            tax_number: Some("24904362-2-41".to_string()),
+            name: "Teszt Kft.".to_string(),
+            address: Some(CustomerAddress {
+                country_code: "HU".to_string(),
+                postal_code: "1011".to_string(),
+                city: "Budapest".to_string(),
+                street: "Fő utca 1.".to_string(),
+            }),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            write_customer(&mut w, &c).expect("write_customer");
+        }
+        let xml = String::from_utf8(buf).expect("utf8");
+        assert!(
+            xml.contains("<customerName>Teszt Kft.</customerName>"),
+            "DOMESTIC wire body must carry <customerName>, got: {xml}"
+        );
+        assert!(
+            xml.contains("<customerAddress>"),
+            "DOMESTIC wire body must carry <customerAddress>, got: {xml}"
         );
     }
 

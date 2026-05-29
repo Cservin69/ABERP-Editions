@@ -148,7 +148,17 @@ pub enum NavXsdValidationError {
     /// (`MissingRequiredChild` for `<customerVatData>` under non-
     /// PRIVATE_PERSON); this variant is the symmetric NEGATIVE half
     /// that NAV's business-rule layer also enforces server-side.
-    #[error("forbidden child <{element}> inside <{parent}> when status is `{status}`")]
+    ///
+    /// Session-154 (ADR-0048 amendment 2026-05-29) extended this to
+    /// `<customerName>` + `<customerAddress>` under PRIVATE_PERSON. NAV
+    /// rejects all three with business rule `CUSTOMER_DATA_NOT_EXPECTED`
+    /// ("Magánszemély vevő adatai nem adhatók meg."); the Display message
+    /// cites that code so a local validation failure maps straight to the
+    /// server-side rule it pre-empts.
+    #[error(
+        "forbidden child <{element}> inside <{parent}> when status is `{status}` \
+         (NAV business rule CUSTOMER_DATA_NOT_EXPECTED)"
+    )]
     ForbiddenChildUnderStatus {
         parent: &'static str,
         element: &'static str,

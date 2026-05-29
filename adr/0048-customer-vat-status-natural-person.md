@@ -765,3 +765,28 @@ stub a partner); the §169 gate fires at invoice-issuance preflight
 and the printed PDF renders the buyer address from the audit-immutable NAV XML
 snapshot. nav_xml.rs's `write_customer` is UNCHANGED — `<customerAddress>` is still
 emitted only when present, preserving the wire-side data-minimisation.
+
+## Amendment 2026-05-29 (Session 154) — NAV business rule CUSTOMER_DATA_NOT_EXPECTED
+
+Production NAV test endpoint rejected a PrivatePerson invoice (Ervin's invoice 31,
+2026-05-29) with business rule CUSTOMER_DATA_NOT_EXPECTED ("Magánszemély vevő adatai
+nem adhatók meg."). The rule forbids `<customerName>` and `<customerAddress>` in the
+NAV wire format for customerVatStatus = PRIVATE_PERSON.
+
+Sessions 148 and 150 made these elements unconditional in the emit path because §169
+of the Hungarian ÁFA Act mandates buyer name + address on the printed invoice. That
+work was correct for the PDF (where §169 applies) but accidentally leaked the same
+fields into the NAV wire (where they are forbidden for natural-person buyers).
+
+Decision: separate the two surfaces explicitly.
+- PDF: ALWAYS emits buyer name + address regardless of customerVatStatus (PR-148/150 preserved).
+- NAV wire: SUPPRESSES customerName + customerAddress for PRIVATE_PERSON; emits for
+  DOMESTIC + OTHER (this amendment).
+- nav-xsd-validator gains a defense-in-depth rule rejecting PrivatePerson bodies
+  with name/address before they hit NAV (extends the §5 `ForbiddenChildUnderStatus`
+  rule from `<customerVatData>` to `<customerName>` + `<customerAddress>`).
+
+This reaffirms the original ADR-0048 asymmetric stance: §169 governs the printed
+invoice document; NAV wire follows NAV's own business rules. It also corrects the
+Session-150 amendment's claim that the wire layer "permits absence" of name/address
+under PRIVATE_PERSON — the wire layer in fact FORBIDS their presence.

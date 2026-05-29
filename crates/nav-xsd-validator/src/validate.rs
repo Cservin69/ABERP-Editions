@@ -413,22 +413,23 @@ fn walk_customer_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidation
         "customerAddress",
     ];
     // PR-97 / ADR-0048 (Ervin override 2 / GDPR) — `customerVatStatus`
-    // is now the ONLY unconditionally-required child. `customerName`
-    // moves to the conditional set: required when status !=
-    // PRIVATE_PERSON; optional under PRIVATE_PERSON per Ervin's GDPR
-    // posture. `customerVatData` + `customerAddress` remain
-    // conditionally required for non-PRIVATE_PERSON (PR-77 hold).
+    // is the ONLY unconditionally-required child. `customerName` +
+    // `customerAddress` are conditional: REQUIRED when status !=
+    // PRIVATE_PERSON (the PR-77 `CUSTOMER_DATA_EXPECTED` positive half),
+    // FORBIDDEN under PRIVATE_PERSON. `customerVatData` is likewise
+    // conditionally required for non-PRIVATE_PERSON and forbidden under
+    // PRIVATE_PERSON.
     //
-    // XSD verification status: the public NAV v3.0
-    // `CustomerInfoType` declares `<customerName>` as `minOccurs="0"`
-    // at the schema level; the business-rule layer fires
-    // `CUSTOMER_DATA_EXPECTED` for non-PRIVATE_PERSON missing this
-    // child. The PRIVATE_PERSON-with-no-name shape has not been
-    // exercised against the live NAV-test endpoint as of PR-97;
-    // first PRIVATE_PERSON GDPR-omit-name issuance will confirm or
-    // reveal a NAV business-rule that promotes it back to required.
-    // If NAV rejects, revert this branch to `["customerVatStatus",
-    // "customerName"]` and reinstate the unconditional required pin.
+    // Session-154 (ADR-0048 amendment 2026-05-29) resolved the PR-97
+    // open question. The NAV-test endpoint did NOT promote
+    // `<customerName>` back to required under PRIVATE_PERSON — it
+    // FORBADE it: invoice 31 (2026-05-29) ABORTED with business rule
+    // `CUSTOMER_DATA_NOT_EXPECTED` ("Magánszemély vevő adatai nem adhatók
+    // meg.") because the wire body carried `<customerName>` +
+    // `<customerAddress>` under PRIVATE_PERSON. §169's buyer-name/address
+    // mandate governs the printed PDF (unchanged), NOT the NAV wire. The
+    // post-walk branch below enforces both the positive (non-PP requires)
+    // and negative (PP forbids) halves.
     const ORDERED_REQUIRED: &[&str] = &["customerVatStatus"];
 
     // PR-77 / session-101 — capture the customerVatStatus text so the
@@ -505,6 +506,31 @@ fn walk_customer_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidation
                         return Err(NavXsdValidationError::ForbiddenChildUnderStatus {
                             parent: PARENT,
                             element: "customerVatData",
+                            status: "PRIVATE_PERSON",
+                        });
+                    }
+                    // Session-154 (ADR-0048 amendment 2026-05-29) —
+                    // NAV business rule `CUSTOMER_DATA_NOT_EXPECTED`
+                    // ("Magánszemély vevő adatai nem adhatók meg.")
+                    // ABORTED Ervin's invoice 31 (2026-05-29) because the
+                    // wire body carried `<customerName>` + `<customerAddress>`
+                    // under PRIVATE_PERSON. Sessions 148/150 made the emit
+                    // unconditional for §169 (a *printed-invoice* obligation
+                    // — the PDF still renders both). This branch closes the
+                    // wire-side trap door: a PrivatePerson body carrying
+                    // either field loud-fails at the ADR-0022 invariant
+                    // check before it can reach NAV.
+                    if seen.contains(&"customerName") {
+                        return Err(NavXsdValidationError::ForbiddenChildUnderStatus {
+                            parent: PARENT,
+                            element: "customerName",
+                            status: "PRIVATE_PERSON",
+                        });
+                    }
+                    if seen.contains(&"customerAddress") {
+                        return Err(NavXsdValidationError::ForbiddenChildUnderStatus {
+                            parent: PARENT,
+                            element: "customerAddress",
                             status: "PRIVATE_PERSON",
                         });
                     }
@@ -1789,20 +1815,20 @@ mod tests {
         }
     }
 
-    /// PR-77 / session-101 — sanity-check the OTHER side of the
-    /// conditional branch: a `PRIVATE_PERSON` customerVatStatus may
-    /// legitimately omit both `<customerVatData>` and `<customerAddress>`
-    /// (the natural-person buyer's data is intentionally absent per NAV
-    /// privacy posture). The validator's conditional-required logic
-    /// must NOT fire on this shape. This pin guards against a future
-    /// regression that promotes the two elements to unconditionally
-    /// required.
+    /// PR-77 / session-101, amended Session-154 — sanity-check the OTHER
+    /// side of the conditional branch: a `PRIVATE_PERSON` customerVatStatus
+    /// legitimately carries NONE of `<customerVatData>`, `<customerName>`,
+    /// `<customerAddress>` (the natural-person buyer's data is intentionally
+    /// absent — NAV's `CUSTOMER_DATA_NOT_EXPECTED` rule forbids all three).
+    /// The validator's conditional-required logic must NOT fire on this
+    /// bare shape. This pin guards against a regression that promotes any
+    /// of the three to unconditionally required.
     #[test]
     fn private_person_status_accepts_missing_customer_vat_data_and_address() {
         // Replace the customerInfo block wholesale: PRIVATE_PERSON +
-        // bare customerName, no vatData, no address.
+        // status only — no vatData, no name, no address.
         let original = "<customerInfo>\n          <customerVatStatus>DOMESTIC</customerVatStatus>\n          <customerVatData>\n            <customerTaxNumber>\n              <common:taxpayerId>87654321</common:taxpayerId>\n              <common:vatCode>1</common:vatCode>\n              <common:countyCode>42</common:countyCode>\n            </customerTaxNumber>\n          </customerVatData>\n          <customerName>Test Customer Zrt.</customerName>\n          <customerAddress>\n            <common:simpleAddress>\n              <common:countryCode>HU</common:countryCode>\n              <common:postalCode>1052</common:postalCode>\n              <common:city>Budapest</common:city>\n              <common:additionalAddressDetail>Váci utca 19.</common:additionalAddressDetail>\n            </common:simpleAddress>\n          </customerAddress>\n        </customerInfo>";
-        let replacement = "<customerInfo>\n          <customerVatStatus>PRIVATE_PERSON</customerVatStatus>\n          <customerName>Test Private Buyer</customerName>\n        </customerInfo>";
+        let replacement = "<customerInfo>\n          <customerVatStatus>PRIVATE_PERSON</customerVatStatus>\n        </customerInfo>";
         assert!(
             MIN_VALID.contains(original),
             "MIN_VALID must contain the full customerInfo block this pin replaces — \
@@ -1810,7 +1836,7 @@ mod tests {
         );
         let mutated = MIN_VALID.replace(original, replacement);
         validate_invoice_data(mutated.as_bytes())
-            .expect("PRIVATE_PERSON must not require customerVatData or customerAddress");
+            .expect("PRIVATE_PERSON must accept a bare customerInfo (no vatData/name/address)");
     }
 
     /// PR-97 / ADR-0048 §5 — symmetric NEGATIVE half of
@@ -1847,6 +1873,74 @@ mod tests {
             }
             other => panic!(
                 "expected ForbiddenChildUnderStatus(customerVatData under PRIVATE_PERSON), \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    /// Session-154 (ADR-0048 amendment 2026-05-29) — defense-in-depth for
+    /// NAV business rule `CUSTOMER_DATA_NOT_EXPECTED`. A PRIVATE_PERSON
+    /// body carrying `<customerName>` ABORTED Ervin's invoice 31
+    /// (2026-05-29) server-side; the validator now loud-fails it locally,
+    /// before the wire, with `ForbiddenChildUnderStatus`.
+    #[test]
+    fn private_person_status_forbids_customer_name_in_input() {
+        let original = "<customerInfo>\n          <customerVatStatus>DOMESTIC</customerVatStatus>\n          <customerVatData>\n            <customerTaxNumber>\n              <common:taxpayerId>87654321</common:taxpayerId>\n              <common:vatCode>1</common:vatCode>\n              <common:countyCode>42</common:countyCode>\n            </customerTaxNumber>\n          </customerVatData>\n          <customerName>Test Customer Zrt.</customerName>\n          <customerAddress>\n            <common:simpleAddress>\n              <common:countryCode>HU</common:countryCode>\n              <common:postalCode>1052</common:postalCode>\n              <common:city>Budapest</common:city>\n              <common:additionalAddressDetail>Váci utca 19.</common:additionalAddressDetail>\n            </common:simpleAddress>\n          </customerAddress>\n        </customerInfo>";
+        // PRIVATE_PERSON + customerName present (forbidden combination).
+        let replacement = "<customerInfo>\n          <customerVatStatus>PRIVATE_PERSON</customerVatStatus>\n          <customerName>Test Private Buyer</customerName>\n        </customerInfo>";
+        assert!(
+            MIN_VALID.contains(original),
+            "MIN_VALID must contain the full customerInfo block this pin replaces"
+        );
+        let mutated = MIN_VALID.replace(original, replacement);
+        let err = validate_invoice_data(mutated.as_bytes())
+            .expect_err("PRIVATE_PERSON + customerName must loud-fail");
+        match err {
+            NavXsdValidationError::ForbiddenChildUnderStatus {
+                parent,
+                element,
+                status,
+            } => {
+                assert_eq!(parent, "customerInfo");
+                assert_eq!(element, "customerName");
+                assert_eq!(status, "PRIVATE_PERSON");
+            }
+            other => panic!(
+                "expected ForbiddenChildUnderStatus(customerName under PRIVATE_PERSON), \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    /// Session-154 (ADR-0048 amendment 2026-05-29) — defense-in-depth for
+    /// NAV business rule `CUSTOMER_DATA_NOT_EXPECTED`. A PRIVATE_PERSON
+    /// body carrying `<customerAddress>` is rejected locally with
+    /// `ForbiddenChildUnderStatus` before it can reach the NAV wire.
+    #[test]
+    fn private_person_status_forbids_customer_address_in_input() {
+        let original = "<customerInfo>\n          <customerVatStatus>DOMESTIC</customerVatStatus>\n          <customerVatData>\n            <customerTaxNumber>\n              <common:taxpayerId>87654321</common:taxpayerId>\n              <common:vatCode>1</common:vatCode>\n              <common:countyCode>42</common:countyCode>\n            </customerTaxNumber>\n          </customerVatData>\n          <customerName>Test Customer Zrt.</customerName>\n          <customerAddress>\n            <common:simpleAddress>\n              <common:countryCode>HU</common:countryCode>\n              <common:postalCode>1052</common:postalCode>\n              <common:city>Budapest</common:city>\n              <common:additionalAddressDetail>Váci utca 19.</common:additionalAddressDetail>\n            </common:simpleAddress>\n          </customerAddress>\n        </customerInfo>";
+        // PRIVATE_PERSON + customerAddress present (forbidden combination),
+        // no customerName so the name rule does not pre-empt this one.
+        let replacement = "<customerInfo>\n          <customerVatStatus>PRIVATE_PERSON</customerVatStatus>\n          <customerAddress>\n            <common:simpleAddress>\n              <common:countryCode>HU</common:countryCode>\n              <common:postalCode>1052</common:postalCode>\n              <common:city>Budapest</common:city>\n              <common:additionalAddressDetail>Váci utca 19.</common:additionalAddressDetail>\n            </common:simpleAddress>\n          </customerAddress>\n        </customerInfo>";
+        assert!(
+            MIN_VALID.contains(original),
+            "MIN_VALID must contain the full customerInfo block this pin replaces"
+        );
+        let mutated = MIN_VALID.replace(original, replacement);
+        let err = validate_invoice_data(mutated.as_bytes())
+            .expect_err("PRIVATE_PERSON + customerAddress must loud-fail");
+        match err {
+            NavXsdValidationError::ForbiddenChildUnderStatus {
+                parent,
+                element,
+                status,
+            } => {
+                assert_eq!(parent, "customerInfo");
+                assert_eq!(element, "customerAddress");
+                assert_eq!(status, "PRIVATE_PERSON");
+            }
+            other => panic!(
+                "expected ForbiddenChildUnderStatus(customerAddress under PRIVATE_PERSON), \
                  got {other:?}"
             ),
         }
