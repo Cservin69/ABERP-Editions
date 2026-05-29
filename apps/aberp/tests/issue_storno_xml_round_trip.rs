@@ -230,3 +230,59 @@ fn storno_xml_invoice_number_is_the_stornos_own_seq() {
         "originalInvoiceNumber must be INV-default/00007: {body}"
     );
 }
+
+/// ADR-0049 §NAV emit (session 156) — the storno body MUST carry a
+/// `<lineModificationReference>` on every `<line>`, or NAV ABORTS the
+/// submit with business rule `LINE_MODIFICATION_EXPECTED`. The reference
+/// carries `<lineNumberReference>` (the original line's position) +
+/// `<lineOperation>MODIFY</lineOperation>`, positioned directly AFTER
+/// `<lineNumber>` per NAV `LineType` ordering. This is the intent-pin
+/// for the fix that unblocked a SAVED storno end-to-end.
+#[test]
+fn storno_xml_carries_line_modification_reference_after_line_number() {
+    let storno = build_minimal_storno_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let reference = minimal_storno_reference();
+    let xml =
+        nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
+            .unwrap();
+    let body = std::str::from_utf8(&xml).unwrap();
+
+    assert!(
+        body.contains("<lineModificationReference>"),
+        "storno line MUST carry <lineModificationReference> \
+         (NAV LINE_MODIFICATION_EXPECTED); body:\n{body}"
+    );
+    assert!(
+        body.contains("<lineNumberReference>1</lineNumberReference>"),
+        "lineNumberReference must be the original line position (1); body:\n{body}"
+    );
+    assert!(
+        body.contains("<lineOperation>MODIFY</lineOperation>"),
+        "lineOperation must be MODIFY for a storno line; body:\n{body}"
+    );
+
+    // Ordering: <lineNumber> first, then <lineModificationReference>,
+    // then <lineExpressionIndicator> — NAV LineType sequence. The
+    // session-155 memo said "first child", but NAV requires <lineNumber>
+    // to be the literal first child; the reference is the second element.
+    let line_number_pos = body
+        .find("</lineNumber>")
+        .expect("storno line must write <lineNumber>");
+    let line_mod_pos = body
+        .find("<lineModificationReference>")
+        .expect("storno line must write <lineModificationReference>");
+    let line_expr_pos = body
+        .find("<lineExpressionIndicator>")
+        .expect("storno line must write <lineExpressionIndicator>");
+    assert!(
+        line_number_pos < line_mod_pos && line_mod_pos < line_expr_pos,
+        "expected ordering lineNumber < lineModificationReference < lineExpressionIndicator; \
+         got {line_number_pos} / {line_mod_pos} / {line_expr_pos}; body:\n{body}"
+    );
+
+    // Round-trip: the body carrying the new element must still validate.
+    validate_invoice_data(&xml)
+        .expect("storno body with <lineModificationReference> must pass the v3.0 invariant check");
+}

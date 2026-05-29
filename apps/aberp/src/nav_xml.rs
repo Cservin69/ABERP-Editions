@@ -566,8 +566,9 @@ pub fn render_invoice_data_with_number(
     )?;
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
-    // <invoiceLines>
-    write_lines(&mut w, &invoice.lines, currency, rate_metadata)?;
+    // <invoiceLines> — plain new invoice: NORMAL lines, no
+    // <lineModificationReference> (no <invoiceReference> at the head).
+    write_lines(&mut w, &invoice.lines, currency, rate_metadata, None)?;
 
     // <invoiceSummary>
     write_summary(&mut w, &invoice.lines, currency, rate_metadata)?;
@@ -746,7 +747,18 @@ pub fn render_storno_data_with_number(
     // parallel Vec with negated unit_price; net/vat/gross cascade
     // through `LineItem::net_total` etc. unchanged.
     let negated_lines: Vec<LineItem> = invoice.lines.iter().map(negate_line).collect();
-    write_lines(&mut w, &negated_lines, currency, rate_metadata)?;
+    // Storno carries <invoiceReference>, so every line MUST carry a
+    // <lineModificationReference> (ADR-0049 §NAV emit / NAV
+    // LINE_MODIFICATION_EXPECTED). lineNumberReference is 1:1 with the
+    // base line position; lineOperation is MODIFY (the negated line
+    // modifies the original).
+    write_lines(
+        &mut w,
+        &negated_lines,
+        currency,
+        rate_metadata,
+        Some(CHAIN_LINE_OPERATION),
+    )?;
     write_summary(&mut w, &negated_lines, currency, rate_metadata)?;
 
     w.write_event(Event::End(BytesEnd::new("invoice")))?;
@@ -878,8 +890,17 @@ pub fn render_modification_data_with_number(
 
     // <invoiceLines> + <invoiceSummary> — NOT negated. Full-replace
     // per ADR-0024 §4; the modification's `invoice.lines` already
-    // carry the new effective values.
-    write_lines(&mut w, &invoice.lines, currency, rate_metadata)?;
+    // carry the new effective values. The modification carries
+    // <invoiceReference>, so every line MUST carry a
+    // <lineModificationReference> (ADR-0049 §NAV emit) — same
+    // LINE_MODIFICATION_EXPECTED gap the storno emitter had.
+    write_lines(
+        &mut w,
+        &invoice.lines,
+        currency,
+        rate_metadata,
+        Some(CHAIN_LINE_OPERATION),
+    )?;
     write_summary(&mut w, &invoice.lines, currency, rate_metadata)?;
 
     w.write_event(Event::End(BytesEnd::new("invoice")))?;
@@ -1278,11 +1299,54 @@ fn format_native_amount(minor_units: i64, currency: Currency) -> String {
     }
 }
 
+/// `<lineOperation>` value for STORNO and MODIFY chain bodies (ADR-0049
+/// §NAV emit). NAV's `LINE_OPERATION` enum is `{CREATE, MODIFY}`; every
+/// line of a storno is a referenced-line correction (the negated amounts
+/// modify the original), so `MODIFY` is the fit. `CREATE` is reserved for
+/// a brand-new line added on top of a modification — not a path either
+/// emitter takes today (storno is 1:1 with the base; the modification
+/// emitter is a full-replace of the same lines). Pinned as `MODIFY` for
+/// both; session 156 flagged the storno value for NAV-XSD confirmation.
+const CHAIN_LINE_OPERATION: &str = "MODIFY";
+
+/// Emit the per-line `<lineModificationReference>` block (ADR-0049
+/// §NAV emit). Present only on chain bodies (storno / modification) —
+/// any invoice carrying `<invoiceReference>` at the head must carry this
+/// on EVERY `<line>`, or NAV rejects with `LINE_MODIFICATION_EXPECTED`.
+///
+/// Position: NAV's `LineType` sequence places `lineModificationReference`
+/// as the SECOND element — directly AFTER `<lineNumber>` and BEFORE
+/// `<lineExpressionIndicator>`. (ADR-0049 / the session-155 memo phrased
+/// it "first child"; the NAV XSD requires `<lineNumber>` to be the
+/// literal first child, so the reference is emitted immediately after it.
+/// Session 156 surfaced this conflict and followed the XSD ordering.)
+///
+/// `line_number_reference` is the line's position on the ORIGINAL invoice.
+/// For a storno that is 1:1 with the base, and for the full-replace
+/// modification, this equals the line's own 1-based ordinal.
+fn write_line_modification_reference(
+    w: &mut Writer<&mut Vec<u8>>,
+    line_number_reference: u32,
+    line_operation: &str,
+) -> Result<()> {
+    w.write_event(Event::Start(BytesStart::new("lineModificationReference")))?;
+    text_element(w, "lineNumberReference", &line_number_reference.to_string())?;
+    text_element(w, "lineOperation", line_operation)?;
+    w.write_event(Event::End(BytesEnd::new("lineModificationReference")))?;
+    Ok(())
+}
+
+/// Write `<invoiceLines>`. `line_operation` is `Some(op)` only for chain
+/// bodies (storno / modification — those carrying `<invoiceReference>`);
+/// when set, every `<line>` carries a `<lineModificationReference>` after
+/// its `<lineNumber>`. `None` (plain new invoice) emits a NORMAL line with
+/// no reference (ADR-0049 §NAV emit).
 fn write_lines(
     w: &mut Writer<&mut Vec<u8>>,
     lines: &[LineItem],
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
+    line_operation: Option<&str>,
 ) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("invoiceLines")))?;
     text_element(w, "mergedItemIndicator", "false")?;
@@ -1290,6 +1354,11 @@ fn write_lines(
         let line_number = (ordinal + 1) as u32;
         w.write_event(Event::Start(BytesStart::new("line")))?;
         text_element(w, "lineNumber", &line_number.to_string())?;
+        // <lineModificationReference> — chain-body-only (storno / modify).
+        // Positioned after <lineNumber> per NAV LineType ordering.
+        if let Some(op) = line_operation {
+            write_line_modification_reference(w, line_number, op)?;
+        }
         text_element(w, "lineExpressionIndicator", "false")?;
         text_element(w, "lineDescription", &line.description)?;
         text_element(w, "quantity", &line.quantity.to_string())?;

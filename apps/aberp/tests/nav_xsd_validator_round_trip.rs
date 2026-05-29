@@ -114,6 +114,35 @@ fn emitter_minimal_invoice_passes_validator() {
     }
 }
 
+/// ADR-0049 §NAV emit (session 156) — the NEGATIVE side of the
+/// `<lineModificationReference>` fix. A plain new invoice carries NO
+/// `<invoiceReference>` at the head, so its lines MUST NOT carry a
+/// `<lineModificationReference>` (it is a chain-body-only element;
+/// emitting it on a fresh CREATE would itself be a schema/business-rule
+/// violation). The storno/modification round-trip tests pin the
+/// positive side; this pins that the fix did not leak onto fresh
+/// issuance.
+#[test]
+fn plain_invoice_omits_line_modification_reference() {
+    let invoice = build_minimal_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("emitter must succeed on the minimal fixture");
+    let body = std::str::from_utf8(&xml).expect("emitter output must be UTF-8");
+
+    assert!(
+        !body.contains("<lineModificationReference>"),
+        "a plain new invoice (no <invoiceReference>) MUST NOT carry \
+         <lineModificationReference>; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<lineOperation>"),
+        "a plain new invoice MUST NOT carry <lineOperation>; body:\n{body}"
+    );
+}
+
 /// A trivially-broken byte string (the minimal fixture with a required
 /// child removed) must FAIL validation. This pins the negative side of
 /// the trap-door: if a future refactor makes the validator over-

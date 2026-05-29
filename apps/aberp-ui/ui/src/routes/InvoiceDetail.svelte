@@ -196,6 +196,7 @@
     filenameForInvoice,
     formatHufEquivalent,
     formatInvoiceDate,
+    formatInvoiceTotal,
     formatRate,
     formatRateDate,
     formatTotal,
@@ -239,10 +240,34 @@
       baseInvoiceNumber: string,
       baseBankAccount: BankAccountSnapshot | null,
     ) => void;
+    /** ADR-0049 §Initiation (session 156) — when `true`, the modal
+     * auto-opens the inline storno confirm panel once `invoiceId`'s
+     * detail loads (and only if the invoice is storno-eligible). This is
+     * the row quick-action's entry point: `InvoiceList.svelte::
+     * triggerRowStorno` sets this instead of firing its own (Tauri-
+     * unreliable) `window.confirm`, routing the operator into the one
+     * canonical confirm+reason surface. One-shot: consumed on the first
+     * load after open; the parent resets it on close / chain-navigation.
+     * Defaults to `false` (the normal "open to inspect" path). */
+    openStornoOnLoad?: boolean;
   }
 
-  let { invoiceId, ancestors, onClose, onNavigate, onJumpBack, onAmend }:
-    Props = $props();
+  let {
+    invoiceId,
+    ancestors,
+    onClose,
+    onNavigate,
+    onJumpBack,
+    onAmend,
+    openStornoOnLoad = false,
+  }: Props = $props();
+
+  // ADR-0049 §Initiation (session 156) — one-shot latch for the row
+  // quick-action's auto-open. Armed from `openStornoOnLoad` when the
+  // modal opens (the `invoiceId` open-effect below); consumed by `load`
+  // on the first successful fetch so a subsequent refetch (post-storno,
+  // post-pay) or chain-navigation does NOT re-open the panel.
+  let stornoAutoOpenPending: boolean = $state(false);
 
   let dialogEl: HTMLDialogElement | null = $state(null);
   let detail: InvoiceDetail | null = $state(null);
@@ -440,6 +465,10 @@
       // next inspection context.
       stornoConfirmOpen = false;
       stornoReason = "";
+      // ADR-0049 §Initiation — arm the row quick-action's auto-open
+      // latch from the prop. `load` consumes it on success (one-shot),
+      // so a later refetch in the same modal does not re-open the panel.
+      stornoAutoOpenPending = openStornoOnLoad === true;
       void load(invoiceId);
     } else {
       if (dialogEl.open) dialogEl.close();
@@ -465,6 +494,25 @@
     try {
       detail = await getInvoice(id);
       loadState = "loaded";
+      // ADR-0049 §Initiation (session 156) — consume the row quick-
+      // action's one-shot auto-open latch. Open the inline storno
+      // confirm panel only if the loaded invoice is actually storno-
+      // eligible (the same `buttonsForState` gate the action bar uses);
+      // a non-Finalized invoice has no Storno button, so arming it would
+      // surface a panel for an action the backend would 409. Resetting
+      // the latch here means a subsequent refetch (post-storno, post-pay)
+      // never re-opens the panel.
+      if (stornoAutoOpenPending) {
+        stornoAutoOpenPending = false;
+        const eligible = buttonsForState(
+          detail.state,
+          detail.payment !== null,
+        ).includes("Storno");
+        if (eligible) {
+          stornoReason = "";
+          stornoConfirmOpen = true;
+        }
+      }
     } catch (err: unknown) {
       loadState = "error";
       errorMessage = err instanceof Error ? err.message : String(err);
@@ -1358,7 +1406,13 @@
           {/if}
         </dd>
         <dt>Total (gross)</dt>
-        <dd class="mono">{formatTotal(detail.total_gross, detail.currency)}</dd>
+        <dd class="mono">
+          {formatInvoiceTotal(
+            detail.total_gross,
+            detail.currency,
+            detail.is_storno,
+          )}
+        </dd>
         {#if detail.currency !== "HUF" && detail.exchange_rate !== null}
           <dt>Exchange rate</dt>
           <dd class="mono">{formatRate(detail.exchange_rate)}</dd>
@@ -1373,7 +1427,13 @@
         {/if}
         {#if detail.currency !== "HUF" && detail.huf_equivalent_total !== null}
           <dt>HUF equivalent</dt>
-          <dd class="mono">{formatHufEquivalent(detail.huf_equivalent_total)}</dd>
+          <dd class="mono">
+            {formatHufEquivalent(
+              detail.is_storno
+                ? -detail.huf_equivalent_total
+                : detail.huf_equivalent_total,
+            )}
+          </dd>
         {/if}
         <dt>Latest ack</dt>
         <dd>

@@ -1962,6 +1962,14 @@ struct InvoiceListItem {
     /// hiding the prior amendment history at the state chip). Pinned
     /// by `list_invoices_emits_has_chain_children`.
     has_chain_children: bool,
+    /// ADR-0049 §Screen render (session 156) — `true` iff this row IS a
+    /// storno (the chain CHILD). Mirrors `InvoiceTrace::is_storno_self`.
+    /// The billing row stores the storno's `total_gross` POSITIVE
+    /// (negation lives only in the NAV-XML / PDF path), so the SPA reads
+    /// this flag to render the list total negated (`-127 000 Ft`),
+    /// matching the buyer-facing PDF. Not a DB column — derived from the
+    /// ledger's `InvoiceStornoIssued` chain-link at read time.
+    is_storno: bool,
     /// PR-44ε / session-53 — currency on the list-row wire shape per
     /// ADR-0037 §1.a + §3. Mirrors the `invoice.currency` DuckDB
     /// column PR-44γ added (NULL is treated as HUF at read time per
@@ -2052,6 +2060,11 @@ struct InvoiceDetailResponse {
     fiscal_year: i32,
     state: InvoiceState,
     total_gross: Option<i64>,
+    /// ADR-0049 §Screen render (session 156) — `true` iff this invoice IS
+    /// a storno (the chain CHILD). Mirrors `InvoiceListItem.is_storno`;
+    /// the SPA detail modal reads it to render the total negated, matching
+    /// the buyer-facing PDF. Not a DB column — derived from the ledger.
+    is_storno: bool,
     audit_entries: Vec<AuditEntryView>,
     /// PR-32 / session-36 — chain-children list (Option T). For an
     /// invoice that is the BASE of at least one chain entry, this
@@ -7358,6 +7371,15 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
         // trace flip and the PR-32 chain-children walker (in
         // `get_invoice_detail`) share one parse per chain entry.
         if let Some(link) = extract_chain_link(entry) {
+            // ADR-0049 §Screen render — flag the storno CHILD's own row so
+            // the SPA list negates its total. Do this before the base flip
+            // so `child_invoice_id` is read before the move below.
+            if link.kind == EventKind::InvoiceStornoIssued {
+                by_invoice
+                    .entry(link.child_invoice_id)
+                    .or_default()
+                    .is_storno_self = true;
+            }
             let trace = by_invoice.entry(link.base_invoice_id).or_default();
             match link.kind {
                 EventKind::InvoiceStornoIssued => trace.is_storno_base = true,
@@ -7387,6 +7409,7 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
             state: trace.derive_state(),
             total_gross: row.ready_invoice.total_gross().map(|h| h.as_i64()),
             has_chain_children: trace.is_storno_base || trace.is_amended_base,
+            is_storno: trace.is_storno_self,
             currency: row.currency_metadata.currency,
             buyer_name,
             payment,
@@ -7481,6 +7504,16 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
                     }
                     _ => {}
                 }
+            } else if link.kind == EventKind::InvoiceStornoIssued
+                && link.child_invoice_id == invoice_id
+            {
+                // ADR-0049 §Screen render — this invoice IS the storno.
+                // The `InvoiceStornoIssued` payload carries no top-level
+                // `invoice_id`, so `extract_invoice_id` never attributes
+                // it to the storno's own audit lineage; this chain-link
+                // walk is the only place the storno child's id surfaces.
+                trace.is_storno_self = true;
+                found_any = true;
             }
         }
     }
@@ -7587,6 +7620,7 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         fiscal_year,
         state: trace.derive_state(),
         total_gross,
+        is_storno: trace.is_storno_self,
         audit_entries,
         chain_children,
         last_ack_status,
@@ -7830,6 +7864,16 @@ struct InvoiceTrace {
     /// PR-23 / ADR-0036 §4 — base of an `InvoiceModificationIssued`
     /// chain entry. Set via [`extract_chain_link`].
     is_amended_base: bool,
+    /// ADR-0049 §Screen render (session 156) — this invoice IS a storno
+    /// (the chain CHILD, not the base). Set via [`extract_chain_link`]
+    /// when an `InvoiceStornoIssued` entry's `storno_invoice_id`
+    /// (`child_invoice_id`) equals this invoice's id. The billing tables
+    /// store the storno line with a POSITIVE `unit_price` (negation lives
+    /// only in the NAV-XML render path), so the SPA needs this flag to
+    /// negate the displayed total — matching the buyer-facing PDF, which
+    /// parses the negated NAV XML. Does NOT change `derive_state` (the
+    /// storno child's own NAV ladder is independent of being a storno).
+    is_storno_self: bool,
     /// PR-70 / ADR-0039 §2 — most-recent `InvoicePaymentRecorded`
     /// payload's operator-facing fields for the SPA's Paid chip.
     /// `Some(...)` when at least one payment entry exists for this
@@ -9267,6 +9311,7 @@ mod tests {
             state: InvoiceState::Storno,
             total_gross: Some(123_456),
             has_chain_children: true,
+            is_storno: false,
             currency: Currency::Huf,
             buyer_name: None,
             payment: None,
@@ -9286,6 +9331,7 @@ mod tests {
             state: InvoiceState::Ready,
             total_gross: None,
             has_chain_children: false,
+            is_storno: false,
             currency: Currency::Huf,
             buyer_name: None,
             payment: None,
@@ -9297,6 +9343,92 @@ mod tests {
             v.get("has_chain_children").and_then(|x| x.as_bool()),
             Some(false),
             "has_chain_children must serialise as a JSON boolean (false case)",
+        );
+    }
+
+    /// ADR-0049 §Screen render (session 156) — both `InvoiceListItem`
+    /// and `InvoiceDetailResponse` MUST carry an `is_storno: bool` field
+    /// on the JSON wire shape. The SPA reads it strictly (`is_storno:
+    /// boolean` in `api.ts`) to negate the displayed total for a storno,
+    /// matching the buyer-facing PDF. A silent field rename / removal
+    /// would collapse the negation and the screen would show a positive
+    /// storno total again — the exact §Screen-render gap session 156
+    /// closed. CLAUDE.md rule 12: pin the contract loud. CLAUDE.md rule
+    /// 9: BOTH the true and false branches are covered so a regression
+    /// that hard-codes the field cannot pass vacuously.
+    #[test]
+    fn invoice_views_emit_is_storno_bool() {
+        let storno_list = InvoiceListItem {
+            invoice_id: "inv_STORNO".to_string(),
+            sequence_number: 7,
+            fiscal_year: 2026,
+            state: InvoiceState::Finalized,
+            total_gross: Some(131_175),
+            has_chain_children: false,
+            is_storno: true,
+            currency: Currency::Huf,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
+        };
+        let v = serde_json::to_value(&storno_list).expect("InvoiceListItem must serialise");
+        assert_eq!(
+            v.get("is_storno").and_then(|x| x.as_bool()),
+            Some(true),
+            "InvoiceListItem.is_storno must serialise as a JSON boolean (true case)",
+        );
+
+        let storno_detail = InvoiceDetailResponse {
+            invoice_id: "inv_STORNO".to_string(),
+            sequence_number: 7,
+            fiscal_year: 2026,
+            state: InvoiceState::Finalized,
+            total_gross: Some(131_175),
+            is_storno: true,
+            audit_entries: Vec::new(),
+            chain_children: Vec::new(),
+            last_ack_status: None,
+            currency: Currency::Huf,
+            exchange_rate: None,
+            exchange_rate_source: None,
+            exchange_rate_date: None,
+            huf_equivalent_total: None,
+            payment: None,
+            bank_account: None,
+            invoice_note: None,
+            line_notes: Vec::new(),
+            issue_date: None,
+            payment_deadline: None,
+            delivery_date: None,
+        };
+        let v = serde_json::to_value(&storno_detail).expect("InvoiceDetailResponse must serialise");
+        assert_eq!(
+            v.get("is_storno").and_then(|x| x.as_bool()),
+            Some(true),
+            "InvoiceDetailResponse.is_storno must serialise as a JSON boolean (true case)",
+        );
+
+        // False branch — a plain invoice. The other literals in this
+        // module already cover `is_storno: false`, but pin it explicitly
+        // here so a regression that inverts the flag is caught.
+        let plain = InvoiceListItem {
+            invoice_id: "inv_PLAIN".to_string(),
+            sequence_number: 1,
+            fiscal_year: 2026,
+            state: InvoiceState::Finalized,
+            total_gross: Some(131_175),
+            has_chain_children: false,
+            is_storno: false,
+            currency: Currency::Huf,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
+        };
+        let v = serde_json::to_value(&plain).expect("InvoiceListItem must serialise");
+        assert_eq!(
+            v.get("is_storno").and_then(|x| x.as_bool()),
+            Some(false),
+            "InvoiceListItem.is_storno must serialise false for a plain invoice",
         );
     }
 
@@ -9350,6 +9482,7 @@ mod tests {
             fiscal_year: 2026,
             state: InvoiceState::Ready,
             total_gross: None,
+            is_storno: false,
             audit_entries: Vec::new(),
             chain_children: Vec::new(),
             last_ack_status: None,
@@ -9388,6 +9521,7 @@ mod tests {
             fiscal_year: 2026,
             state: InvoiceState::Storno,
             total_gross: Some(123_456),
+            is_storno: false,
             audit_entries: Vec::new(),
             chain_children: vec![
                 ChainChildView {
@@ -9570,6 +9704,7 @@ mod tests {
             fiscal_year: 2026,
             state: InvoiceState::Ready,
             total_gross: None,
+            is_storno: false,
             audit_entries: Vec::new(),
             chain_children: Vec::new(),
             last_ack_status: None,
@@ -9611,6 +9746,7 @@ mod tests {
                 fiscal_year: 2026,
                 state: InvoiceState::Submitted,
                 total_gross: Some(1_000),
+                is_storno: false,
                 audit_entries: Vec::new(),
                 chain_children: Vec::new(),
                 last_ack_status: Some(variant),
@@ -9663,6 +9799,7 @@ mod tests {
             state: InvoiceState::Ready,
             total_gross: Some(123_456),
             has_chain_children: false,
+            is_storno: false,
             currency: Currency::Huf,
             buyer_name: None,
             payment: None,
@@ -9682,6 +9819,7 @@ mod tests {
             state: InvoiceState::Ready,
             total_gross: Some(863_600),
             has_chain_children: false,
+            is_storno: false,
             currency: Currency::Eur,
             buyer_name: None,
             payment: None,
@@ -9721,6 +9859,7 @@ mod tests {
             state: InvoiceState::Ready,
             total_gross: Some(50_000),
             has_chain_children: false,
+            is_storno: false,
             currency: Currency::Huf,
             buyer_name: Some("Budapesti Sport-Egyesület Kft.".to_string()),
             payment: None,
@@ -9740,6 +9879,7 @@ mod tests {
             state: InvoiceState::Ready,
             total_gross: None,
             has_chain_children: false,
+            is_storno: false,
             currency: Currency::Huf,
             buyer_name: None,
             payment: None,
@@ -9888,6 +10028,7 @@ mod tests {
             fiscal_year: 2026,
             state: InvoiceState::Ready,
             total_gross: Some(123_456),
+            is_storno: false,
             audit_entries: Vec::new(),
             chain_children: Vec::new(),
             last_ack_status: None,
@@ -9931,6 +10072,7 @@ mod tests {
             fiscal_year: 2026,
             state: InvoiceState::Ready,
             total_gross: Some(863_600), // EUR cents — 8 636,00 €
+            is_storno: false,
             audit_entries: Vec::new(),
             chain_children: Vec::new(),
             last_ack_status: None,

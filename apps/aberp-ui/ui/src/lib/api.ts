@@ -73,6 +73,14 @@ export interface InvoiceListItem {
    * reads the wire shape strictly via this typed field so a
    * backend drift surfaces at `npm run check`. */
   has_chain_children: boolean;
+  /** ADR-0049 §Screen render (session 156) — `true` iff this row IS a
+   * storno (the chain child). The backend stores the storno's
+   * `total_gross` positive (negation lives only in the NAV-XML / PDF
+   * path); the list-row total formatter negates the displayed value
+   * when this is true so the screen matches the buyer-facing PDF
+   * (`-127 000 Ft`). Derived from the ledger, NOT a DB column. Pinned
+   * by `invoice-list-storno-negation.test.ts`. */
+  is_storno: boolean;
   /** PR-44ε / session-53 — currency on the list-row wire shape per
    * ADR-0037 §1.a + §3. The list-row formatter consumes this
    * field to pick the HUF-vs-EUR symbol + minor-unit interpretation
@@ -258,6 +266,12 @@ export interface InvoiceDetail {
   fiscal_year: number;
   state: InvoiceState;
   total_gross: number | null;
+  /** ADR-0049 §Screen render (session 156) — `true` iff this invoice IS
+   * a storno (the chain child). The detail modal negates the displayed
+   * total when true, matching the buyer-facing PDF. Mirrors
+   * `InvoiceListItem.is_storno`; derived from the ledger, NOT a DB
+   * column. */
+  is_storno: boolean;
   audit_entries: AuditEntryView[];
   /** PR-32 / session-36 — chain-children list (Option T). For an
    * invoice that is the BASE of at least one chain entry, this

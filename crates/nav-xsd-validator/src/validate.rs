@@ -719,8 +719,18 @@ fn walk_invoice_lines(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidation
 
 fn walk_line(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
     const PARENT: &str = "line";
+    // `lineModificationReference` is optional — present only on chain
+    // bodies (storno / modification, i.e. those carrying
+    // `<invoiceReference>` at the head per ADR-0049 §NAV emit). It is
+    // NOT in ORDERED_REQUIRED because plain new-invoice lines must
+    // continue to validate without it; NAV's `LineType` positions it as
+    // the second element (after `<lineNumber>`), and the emitter writes
+    // it there. The projection-based ordered-required check does not
+    // enforce that position — same posture as `<invoiceReference>`'s own
+    // position within `<invoice>` (A40).
     const ALLOWED: &[&str] = &[
         "lineNumber",
+        "lineModificationReference",
         "lineExpressionIndicator",
         "lineDescription",
         "quantity",
@@ -771,7 +781,55 @@ fn walk_line(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
                         ensure_numeric_amount(canonical, &text)?;
                     }
                     "lineAmountsNormal" => walk_line_amounts_normal(reader)?,
+                    "lineModificationReference" => walk_line_modification_reference(reader)?,
                     other => unreachable!("canonicalized unknown element {other}"),
+                }
+                seen.push(canonical);
+            }
+            Event::End(_) => {
+                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
+}
+
+/// `<lineModificationReference>` chain-line block — ADR-0049 §NAV emit.
+/// Present on every `<line>` of a storno / modification body (those
+/// carrying `<invoiceReference>`). NAV rejects a chain body whose lines
+/// omit it with business rule `LINE_MODIFICATION_EXPECTED`. Both children
+/// are required by NAV's `LineModificationReferenceType`:
+///   - `<lineNumberReference>` — the line's position on the ORIGINAL
+///     invoice (positive int).
+///   - `<lineOperation>` — `LINE_OPERATION` enum (`CREATE` | `MODIFY`).
+///     The validator does NOT constrain the enum value (same posture as
+///     `<modifyWithoutMaster>` / `<annulmentCode>` — the closed-set lives
+///     at the emitter's `CHAIN_LINE_OPERATION` const, not the XSD walk).
+fn walk_line_modification_reference(
+    reader: &mut Reader<&[u8]>,
+) -> Result<(), NavXsdValidationError> {
+    const PARENT: &str = "lineModificationReference";
+    const ALLOWED: &[&str] = &["lineNumberReference", "lineOperation"];
+    const ORDERED_REQUIRED: &[&str] = ALLOWED;
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                if canonical == "lineNumberReference" {
+                    let text = collect_text(reader, canonical)?;
+                    ensure_numeric_amount(canonical, &text)?;
+                } else {
+                    let _ = collect_text(reader, canonical)?;
                 }
                 seen.push(canonical);
             }

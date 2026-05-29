@@ -95,6 +95,27 @@ export function formatTotal(value: number | null, currency: Currency): string {
   return HUF_FORMATTER.format(value);
 }
 
+/** ADR-0049 §Screen render (session 156) — format an invoice total,
+ * negating the sign when the invoice IS a storno.
+ *
+ * The billing tables store a storno's `total_gross` POSITIVE (the
+ * negation lives only in the NAV-XML render path, which the
+ * buyer-facing PDF parses). The operator's mental model — and the PDF —
+ * show a storno as a negative document (`-127 000 Ft`). This helper
+ * flips the sign for display only; the wire value stays positive
+ * (audit-immutable). `Intl.NumberFormat`'s currency style renders the
+ * minus in the Hungarian-correct position, so we just negate the number
+ * and delegate to [`formatTotal`]. `null` passes through as the em-dash.
+ */
+export function formatInvoiceTotal(
+  value: number | null,
+  currency: Currency,
+  isStorno: boolean,
+): string {
+  if (value === null) return formatTotal(null, currency);
+  return formatTotal(isStorno ? -value : value, currency);
+}
+
 /** Format the MNB exchange rate for the operator surface.
  *
  * Normalises to 6 decimal places per ADR-0037 §1.c / C11 — the

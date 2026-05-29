@@ -33,7 +33,6 @@
 
   import { onDestroy, onMount } from "svelte";
   import {
-    cancelInvoiceStorno,
     downloadInvoicePdf,
     listInvoices,
     parseNavUpstreamFault,
@@ -49,7 +48,7 @@
     lifecycleIndex,
     type LabelSignal,
   } from "../lib/labels";
-  import { formatTotal, filenameForInvoice } from "../lib/format";
+  import { formatInvoiceTotal, filenameForInvoice } from "../lib/format";
   import type { BankAccountSnapshot, Currency } from "../lib/api";
   import {
     EMPTY_FILTER,
@@ -131,6 +130,14 @@
   // without depending on Array-mutation tracking through the
   // $state proxy.
   let navStack: string[] = $state([]);
+
+  // ADR-0049 §Initiation (session 156) — one-shot flag passed to the
+  // detail modal so the row quick-action's Storno opens the modal's
+  // inline confirm panel (the canonical confirm+reason surface) instead
+  // of the Tauri-unreliable `window.confirm` the row path used to fire.
+  // Reset on modal close + on chain-navigation so a normal "open to
+  // inspect" never auto-opens the panel.
+  let stornoArmOnOpen: boolean = $state(false);
 
   // PR-87 / session-112 — issue-invoice is now a full-page route
   // (`#/invoices-new`), not a modal mounted here. The "+ New invoice"
@@ -322,9 +329,10 @@
   // list" lift the brief named. A successful action refreshes the
   // list so the state chip flips without re-mounting.
   //
-  // The Storno path keeps the same `window.confirm` gate the modal
-  // uses — a stray row click MUST NOT burn a sequence number per
-  // ADR-0023 §3.
+  // The Storno path is the exception (ADR-0049 §Initiation): it does
+  // NOT POST from the row. A stray row click MUST NOT burn a sequence
+  // number (ADR-0023 §3), so it routes into the detail modal's inline
+  // confirm panel — see `triggerRowStorno` below.
 
   async function triggerRowDownload(row: InvoiceListItem) {
     actionError = null;
@@ -384,29 +392,19 @@
     }
   }
 
-  async function triggerRowStorno(row: InvoiceListItem) {
+  // ADR-0049 §Initiation (session 156) — the row quick-action no longer
+  // fires its own `window.confirm` + `cancelInvoiceStorno`. That
+  // `window.confirm` gate returns falsy in the Tauri webview (the same
+  // unreliability PR-80 abandoned in the modal), so the row path
+  // silently did nothing ("storno did not start"). Instead the row
+  // action opens the detail modal pre-armed to the inline storno confirm
+  // panel — one confirm surface, one reason-capture surface, the path
+  // that works today. The actual POST happens in
+  // `InvoiceDetail.svelte::triggerConfirmStorno`.
+  function triggerRowStorno(row: InvoiceListItem) {
     actionError = null;
-    const number = `${row.fiscal_year}-${String(row.sequence_number).padStart(6, "0")}`;
-    const ok = window.confirm(
-      `Cancel invoice ${number}?\n\n` +
-        `A storno will be issued in the same currency at the same exchange rate. ` +
-        `This carves a fresh sequence number and writes three audit-ledger rows; ` +
-        `it cannot be reversed.`,
-    );
-    if (!ok) return;
-    busyRow = { invoiceId: row.invoice_id, action: "Storno" };
-    try {
-      await cancelInvoiceStorno(row.invoice_id);
-      await refresh();
-    } catch (err: unknown) {
-      actionError = {
-        invoiceId: row.invoice_id,
-        action: "Storno",
-        message: err instanceof Error ? err.message : String(err),
-      };
-    } finally {
-      busyRow = null;
-    }
+    stornoArmOnOpen = true;
+    navStack = [row.invoice_id];
   }
 
   // PR-95 / session-115 — clickable pictogram handler. Invoked when
@@ -879,7 +877,9 @@
               </span>
             {/if}
           </td>
-          <td class="col-num mono">{formatTotal(row.total_gross, row.currency)}</td>
+          <td class="col-num mono"
+            >{formatInvoiceTotal(row.total_gross, row.currency, row.is_storno)}</td
+          >
           <td class="col-actions">
             <div class="row-actions">
               {#each actions as action (action)}
@@ -937,6 +937,7 @@
   <InvoiceDetail
     invoiceId={navStack.length > 0 ? navStack[navStack.length - 1] : null}
     ancestors={navStack.slice(0, -1)}
+    openStornoOnLoad={stornoArmOnOpen}
     onClose={() => {
       // PR-88 / session-113 — auto-refresh the list on detail-modal
       // close. The detail modal hosts the Submit, Poll-ack, Storno,
@@ -950,9 +951,17 @@
       // cheap, and the operator's mental model is "modal close ⇒
       // list view is fresh" anyway.
       navStack = [];
+      // ADR-0049 §Initiation — disarm the one-shot so a later "open to
+      // inspect" never auto-opens the storno panel.
+      stornoArmOnOpen = false;
       void refresh();
     }}
-    onNavigate={(baseId) => (navStack = [...navStack, baseId])}
+    onNavigate={(baseId) => {
+      // Chain-navigation moves to a different invoice; disarm so the
+      // storno panel does not auto-open on the navigated-to invoice.
+      stornoArmOnOpen = false;
+      navStack = [...navStack, baseId];
+    }}
     onJumpBack={(index) => (navStack = navStack.slice(0, index + 1))}
     onAmend={(baseInvoiceId, baseCurrency, baseInvoiceNumber, baseBankAccount) =>
       (modificationContext = {

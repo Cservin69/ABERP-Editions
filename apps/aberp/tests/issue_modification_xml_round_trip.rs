@@ -230,6 +230,48 @@ fn modification_xml_carries_positive_line_amounts() {
     );
 }
 
+/// ADR-0049 §NAV emit (session 156) — defense-in-depth for the
+/// `<lineModificationReference>` fix on the MODIFY leg. The
+/// `LINE_MODIFICATION_EXPECTED` gap was latent in the SHARED
+/// `write_lines` path, so a modification body must ALSO carry the
+/// per-line reference. Symmetric to
+/// `storno_xml_carries_line_modification_reference_after_line_number`.
+#[test]
+fn modification_xml_carries_line_modification_reference() {
+    let modification = build_minimal_modification_invoice();
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let reference = minimal_modification_reference();
+    let xml = nav_xml::render_modification_data(
+        &modification,
+        &series,
+        &parties,
+        &reference,
+        Currency::Huf,
+        None,
+    )
+    .unwrap();
+    let body = std::str::from_utf8(&xml).unwrap();
+
+    assert!(
+        body.contains("<lineModificationReference>"),
+        "modification line MUST carry <lineModificationReference> \
+         (NAV LINE_MODIFICATION_EXPECTED); body:\n{body}"
+    );
+    assert!(
+        body.contains("<lineNumberReference>1</lineNumberReference>"),
+        "lineNumberReference must be the original line position (1); body:\n{body}"
+    );
+    assert!(
+        body.contains("<lineOperation>MODIFY</lineOperation>"),
+        "lineOperation must be MODIFY for a modification line; body:\n{body}"
+    );
+
+    validate_invoice_data(&xml).expect(
+        "modification body with <lineModificationReference> must pass the v3.0 invariant check",
+    );
+}
+
 /// The modification emitter MUST format its OWN invoice number from
 /// the passed series + modification's own sequence number (NOT the
 /// base's). Symmetric to the STORNO test

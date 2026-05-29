@@ -15,6 +15,7 @@ import {
   filenameForInvoice,
   formatHufEquivalent,
   formatInvoiceDate,
+  formatInvoiceTotal,
   formatRate,
   formatRateDate,
   formatTotal,
@@ -341,5 +342,50 @@ describe("Conditional render contract (documented behaviour pin)", () => {
     // operator-visible signal is the missing row, not a
     // garbled value.
     expect(shouldRenderRow("EUR", null)).toBe(false);
+  });
+});
+
+// ADR-0049 §Screen render (session 156) — `formatInvoiceTotal` negates
+// the displayed total for a storno invoice. The billing tables store a
+// storno's `total_gross` POSITIVE (negation lives only in the NAV-XML /
+// PDF render path); this helper flips the sign for the operator surface
+// so the screen matches the buyer-facing PDF. Paired with the Rust
+// `invoice_views_emit_is_storno_bool` pin so the wire-to-render contract
+// is end-to-end. CLAUDE.md rule 9: the storno (negated) and regular
+// (unchanged) branches are pinned distinctly so a regression that drops
+// the negation — or negates a regular invoice — cannot pass vacuously.
+describe("formatInvoiceTotal (storno negation)", () => {
+  it("HUF storno: renders the total negated (`-131 175 Ft`)", () => {
+    const out = formatInvoiceTotal(131_175, "HUF", true);
+    // Leading minus, grouped digits, Ft suffix. The thousands
+    // separator under hu-HU is U+00A0; tolerate any single char.
+    expect(out).toMatch(/^-.*131.?175.?Ft/);
+  });
+
+  it("HUF regular: renders the total unchanged (`131 175 Ft`, no minus)", () => {
+    const out = formatInvoiceTotal(131_175, "HUF", false);
+    expect(out).toMatch(/131.?175.?Ft/);
+    expect(out).not.toMatch(/-/);
+  });
+
+  it("EUR storno: negates the cents value before euro formatting", () => {
+    // 863600 cents = €8 636,00; storno renders the negative.
+    const out = formatInvoiceTotal(863_600, "EUR", true);
+    expect(out).toMatch(/8.?636,00/);
+    expect(out).toMatch(/€/);
+    expect(out).toMatch(/-/);
+  });
+
+  it("null renders as the em-dash regardless of the storno flag", () => {
+    expect(formatInvoiceTotal(null, "HUF", true)).toBe("—");
+    expect(formatInvoiceTotal(null, "EUR", false)).toBe("—");
+  });
+
+  it("storno and regular differ in sign on the same input", () => {
+    const storno = formatInvoiceTotal(127_000, "HUF", true);
+    const regular = formatInvoiceTotal(127_000, "HUF", false);
+    expect(storno).not.toBe(regular);
+    expect(storno.startsWith("-")).toBe(true);
+    expect(regular.startsWith("-")).toBe(false);
   });
 });
