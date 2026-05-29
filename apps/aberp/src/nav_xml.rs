@@ -1121,27 +1121,13 @@ fn write_customer(w: &mut Writer<&mut Vec<u8>>, c: &CustomerInfo) -> Result<()> 
         }
     }
 
-    // PR-97 / ADR-0048 (Ervin override 2 / GDPR) — `<customerName>`
-    // is conditional on the buyer kind. For DOMESTIC / OTHER buyers
-    // the name is required (NAV business-rule layer); the emitter
-    // unconditionally writes it. For PRIVATE_PERSON the name is
-    // OPTIONAL per Ervin's GDPR posture — emit only if the operator
-    // supplied a non-empty value. Empty-after-trim collapses to a
-    // wire body without `<customerName>`. XSD verification: NAV v3.0
-    // `CustomerInfoType` declares `customerName` as `minOccurs="0"`
-    // at the schema level; the first PRIVATE_PERSON + omitted-name
-    // issuance against the live NAV-test endpoint will confirm the
-    // business-rule layer follows.
-    match c.customer_vat_status {
-        CustomerVatStatus::PrivatePerson => {
-            if !c.name.trim().is_empty() {
-                text_element(w, "customerName", &c.name)?;
-            }
-        }
-        _ => {
-            text_element(w, "customerName", &c.name)?;
-        }
-    }
+    // Session-148 (Ervin override 3) — `<customerName>` is emitted
+    // UNCONDITIONALLY for ALL buyer kinds. The buyer name is required
+    // per Áfa tv. §169 (ADR-0048 amendment, PR-104); the PR-97 GDPR
+    // carve-out that omitted `<customerName>` for PRIVATE_PERSON is
+    // removed. Preflight already guarantees a non-empty name reaches
+    // this emit for every customer type.
+    text_element(w, "customerName", &c.name)?;
     // PR-77 / session-101 — `<customerAddress>` per NAV v3.0 business-rule
     // `CUSTOMER_DATA_EXPECTED`. Required whenever `customerVatStatus !=
     // PRIVATE_PERSON`; for PrivatePerson buyers the wire layer permits
@@ -1682,6 +1668,31 @@ mod tests {
         // Pre-PR-97 wire bodies omit the field — serde defaults to
         // Domestic which matches the pre-PR-97 implicit posture.
         assert_eq!(CustomerVatStatus::default(), CustomerVatStatus::Domestic);
+    }
+
+    /// Session-148 (Ervin override 3) — `<customerName>` is emitted
+    /// UNCONDITIONALLY, including for PRIVATE_PERSON buyers (the PR-97
+    /// GDPR carve-out that omitted it is removed). Pins the wire-shape
+    /// against regression to the conditional-omit branch.
+    #[test]
+    fn write_customer_emits_customer_name_for_private_person() {
+        let c = CustomerInfo {
+            customer_vat_status: CustomerVatStatus::PrivatePerson,
+            // PrivatePerson carries no ADÓSZÁM.
+            tax_number: None,
+            name: "Teszt Magánszemély".to_string(),
+            address: None,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            write_customer(&mut w, &c).expect("write_customer");
+        }
+        let xml = String::from_utf8(buf).expect("utf8");
+        assert!(
+            xml.contains("<customerName>Teszt Magánszemély</customerName>"),
+            "PRIVATE_PERSON wire body must carry <customerName>, got: {xml}"
+        );
     }
 
     #[test]

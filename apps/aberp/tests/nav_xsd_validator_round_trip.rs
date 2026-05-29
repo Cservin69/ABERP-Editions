@@ -572,20 +572,15 @@ fn emitter_writes_customer_info_under_private_person_omits_vat_data() {
     );
 }
 
-/// PR-97 / ADR-0048 (Ervin override 2 / GDPR) — `<customerName>` is
-/// OPTIONAL under PRIVATE_PERSON per Ervin's GDPR posture. A
-/// natural-person buyer can be issued an invoice without ABERP
-/// recording any identifying detail beyond the closed-vocab status —
-/// the emitter omits `<customerName>` when the operator-supplied name
-/// is empty-after-trim.
-///
-/// XSD verification status: NAV v3.0 `CustomerInfoType` declares
-/// `<customerName>` as `minOccurs="0"` at the schema level. The
-/// PRIVATE_PERSON + omitted-name combination has not been exercised
-/// against the live NAV-test endpoint as of PR-97; the first such
-/// issuance will confirm the business-rule layer agrees. If NAV
-/// rejects, revert this branch + the validator's
-/// `customerVatStatus`-only ORDERED_REQUIRED set.
+/// Session-148 (Ervin override 3) — `<customerName>` is emitted
+/// UNCONDITIONALLY for PRIVATE_PERSON buyers (the PR-97 GDPR carve-out
+/// that omitted it is removed). The buyer name is mandatory per Áfa
+/// tv. §169 for every customer type; upstream preflight guarantees a
+/// non-empty name reaches the emitter. The wire body still omits
+/// `<customerVatData>` (NAV forbids it under PRIVATE_PERSON) and may
+/// omit `<customerAddress>` (NAV tolerates absence at the wire layer
+/// for natural persons). This pin asserts the name IS present while
+/// the address may be absent.
 #[test]
 fn emitter_writes_customer_info_under_private_person_omits_name_and_address() {
     let invoice = build_minimal_invoice();
@@ -602,16 +597,15 @@ fn emitter_writes_customer_info_under_private_person_omits_name_and_address() {
         customer: CustomerInfo {
             customer_vat_status: CustomerVatStatus::PrivatePerson,
             tax_number: None,
-            // Empty-after-trim ⇒ omitted from the wire body. GDPR
-            // posture allows ABERP to record zero identifying detail
-            // for a natural-person buyer.
-            name: "   ".to_string(),
+            // Session-148 — the buyer name is mandatory (§169); a
+            // PrivatePerson buyer carries a name like any other.
+            name: "Teszt Magánszemély".to_string(),
             address: None,
         },
     };
 
     let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
-        .expect("emitter must succeed on the PRIVATE_PERSON GDPR-minimal fixture");
+        .expect("emitter must succeed on the PRIVATE_PERSON fixture");
     let body = std::str::from_utf8(&xml).expect("emitter output must be UTF-8");
 
     assert!(
@@ -623,8 +617,8 @@ fn emitter_writes_customer_info_under_private_person_omits_name_and_address() {
         "PRIVATE_PERSON forbids <customerVatData>; body:\n{body}"
     );
     assert!(
-        !body.contains("<customerName>"),
-        "GDPR posture: empty-after-trim name must NOT emit <customerName>; body:\n{body}"
+        body.contains("<customerName>Teszt Magánszemély</customerName>"),
+        "§169: PRIVATE_PERSON buyer name must be emitted as <customerName>; body:\n{body}"
     );
     assert!(
         !body.contains("<customerAddress>"),
@@ -632,9 +626,8 @@ fn emitter_writes_customer_info_under_private_person_omits_name_and_address() {
     );
 
     validate_invoice_data(&xml).expect(
-        "v3.0 invariant check must pass — PRIVATE_PERSON + omitted name + omitted address \
-         is the GDPR-compliant minimal body; the validator's relaxed customerName \
-         ORDERED_REQUIRED set must NOT false-fire here",
+        "v3.0 invariant check must pass — PRIVATE_PERSON + name + omitted address \
+         is a valid minimal body",
     );
 }
 

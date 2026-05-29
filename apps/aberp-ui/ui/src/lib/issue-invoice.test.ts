@@ -447,6 +447,22 @@ describe("composeIssueInvoiceBody", () => {
       expect(body.customer.taxNumber).toBe("");
     });
 
+    // Session-148 (Ervin override 3) — the buyer name is mandatory on
+    // the invoice (§169) for ALL customer types. The composer must
+    // carry `customer.name` for a PrivatePerson buyer; it must NEVER be
+    // null/empty when the operator entered a name (the regression that
+    // POSTed a null name and blocked issuance).
+    it("carries customer.name for PrivatePerson (never null when entered)", () => {
+      const body = composeIssueInvoiceBody({
+        ...emptyForm(),
+        customerVatStatus: "PrivatePerson",
+        customerName: "Teszt Magánszemély",
+        customerTaxNumber: "",
+      });
+      expect(body.customer.name).toBe("Teszt Magánszemély");
+      expect(body.customer.name).not.toBe("");
+    });
+
     it("emits vatStatus=Other if the form somehow carries it (preflight gate behind)", () => {
       const body = composeIssueInvoiceBody({
         ...emptyForm(),

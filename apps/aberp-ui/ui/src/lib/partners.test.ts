@@ -203,6 +203,24 @@ describe("buyerFieldsFromPartner", () => {
     expect(fields.customerTaxNumber).toBe("");
   });
 
+  // Session-148 (Ervin override 3) — selecting a PrivatePerson partner
+  // must populate the IssueInvoice form's buyer-name field from the
+  // partner's legal_name (non-empty). This is the load-bearing seam
+  // for the bug Ervin hit: "the data loads but the name disappears."
+  // The buyer name must carry through, NOT be suppressed for natural
+  // persons.
+  it("populates the buyer name from legal_name for a PrivatePerson partner", () => {
+    const privatePerson: Partner = {
+      ...SAMPLE_PARTNER,
+      customer_vat_status: "PrivatePerson",
+      legal_name: "Teszt Magánszemély",
+      tax_number: null,
+    };
+    const fields = buyerFieldsFromPartner(privatePerson);
+    expect(fields.customerName).toBe("Teszt Magánszemély");
+    expect(fields.customerName).not.toBe("");
+  });
+
   /** PR-77 / session-101 — the partner's address fields flow into the
    * buyer-fields surface so the IssueInvoice / Modification form
    * pre-populates NAV's required `<customerAddress>` block end-to-end.
@@ -332,5 +350,23 @@ describe("parsePartnerValidationError", () => {
     const raw =
       'backend returned 400: {"error":"validation_failed","fields":"oops"}';
     expect(parsePartnerValidationError(raw)).toBeNull();
+  });
+
+  // Session-148 (Ervin override 3) — saving a PrivatePerson partner
+  // WITHOUT a name is now rejected by the backend with the bilingual
+  // §169 legal_name error. Pin that the parser surfaces that field +
+  // message so the form's inline error renders the bilingual chip
+  // (the operator sees WHY the save failed, not a silent block).
+  it("parses the bilingual §169 legal_name rejection for a name-less PrivatePerson", () => {
+    const raw =
+      'backend returned 400 Bad Request for /api/partners: ' +
+      '{"error":"validation_failed","fields":[' +
+      '{"field":"legal_name","message":"A vevő neve kötelező a számlán (Áfa tv. §169) / Buyer name required per §169"}' +
+      "]}";
+    const parsed = parsePartnerValidationError(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.fields[0].field).toBe("legal_name");
+    expect(parsed!.fields[0].message).toContain("§169");
+    expect(parsed!.fields[0].message).toContain("Buyer name required");
   });
 });

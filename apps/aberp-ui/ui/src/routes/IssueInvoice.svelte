@@ -868,18 +868,12 @@
            buyer-name on submit. -->
       <label class="buyer-combobox">
         <span>
-          Buyer name
-          {#if form.customerVatStatus === "PrivatePerson"}
-            <span class="vat-radio__hint">
-              GDPR: magánszemély vevő esetén a név megadása opcionális /
-              optional under GDPR
-            </span>
-          {/if}
+          Buyer name *
         </span>
         <input
           type="text"
           bind:value={form.customerName}
-          required={form.customerVatStatus !== "PrivatePerson"}
+          required
           role="combobox"
           autocomplete="off"
           spellcheck="false"

@@ -3128,11 +3128,15 @@ fn validate_issue_request(
             "customer name is required".to_string(),
         ));
     }
-    if request.customer.tax_number.trim().is_empty() {
-        return Err(IssueRequestValidationError::Plain(
-            "customer tax number (ADÓSZÁM) is required".to_string(),
-        ));
-    }
+    // Session-148 — the customer tax-number requirement is NOT
+    // unconditional: PRIVATE_PERSON buyers legitimately carry no
+    // ADÓSZÁM (and OTHER is v1-deferred). The vat-status-aware
+    // `validate_invoice_preflight` (which runs FIRST, above) owns the
+    // per-status tax-number rule — Domestic requires a well-formed
+    // number, PrivatePerson requires its absence. This stale gate
+    // (pre-PR-97, when every buyer was Domestic) blocked all
+    // PrivatePerson issuance; the check is dropped here so the canonical
+    // preflight is the single source of truth for the tax-number rule.
     // PR-53 / session-73 — supplier validation moved off the wire
     // shape. The synthesiser inside `issue_invoice_request` reads
     // seller.toml and dispatches the same typed

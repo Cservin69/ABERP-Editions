@@ -261,7 +261,7 @@ impl InvoicePreflightError {
     pub fn message_hu(&self) -> String {
         match self {
             InvoicePreflightError::CustomerNameEmpty => {
-                "Az ügyfél neve kötelező.".to_string()
+                "A vevő neve kötelező a számlán (Áfa tv. §169)".to_string()
             }
             InvoicePreflightError::CustomerTaxNumberMissing => {
                 "Az ügyfél adószáma (ADÓSZÁM) kötelező (helyes: `xxxxxxxx-y-zz`, pl. `87654321-2-13`)."
@@ -347,7 +347,7 @@ impl InvoicePreflightError {
     /// SPA's inline-error renderer alongside the Hungarian message.
     pub fn message_en(&self) -> String {
         match self {
-            InvoicePreflightError::CustomerNameEmpty => "Customer name is required.".to_string(),
+            InvoicePreflightError::CustomerNameEmpty => "Buyer name required per §169".to_string(),
             InvoicePreflightError::CustomerTaxNumberMissing => {
                 "Customer ADÓSZÁM is required (expected `xxxxxxxx-y-zz`, e.g. `87654321-2-13`)."
                     .to_string()
@@ -492,18 +492,13 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
 
     // Customer block.
     //
-    // PR-97 / ADR-0048 (Ervin override 2 / GDPR) — `CustomerNameEmpty`
-    // is now CONDITIONAL on `vat_status != PrivatePerson`. For
-    // natural-person buyers the operator may omit the name per
-    // Ervin's GDPR posture; preflight stays quiet on the empty-name
-    // case under PRIVATE_PERSON. DOMESTIC / OTHER preserve the
-    // pre-PR-97 "name always required" invariant.
-    let name_empty = request.customer.name.trim().is_empty();
-    let is_private_person = matches!(
-        request.customer.vat_status,
-        CustomerVatStatus::PrivatePerson
-    );
-    if name_empty && !is_private_person {
+    // Session-148 (Ervin override 3) — the buyer name is now
+    // UNCONDITIONALLY required for ALL customer types per Áfa tv. §169
+    // (the PR-104 ADR-0048 amendment made §169 mandatory on the PDF for
+    // every buyer kind; this finishes the cleanup). The PR-97 GDPR
+    // carve-out that suppressed `CustomerNameEmpty` for PRIVATE_PERSON
+    // is removed — "forget GDPR, show the name, always."
+    if request.customer.name.trim().is_empty() {
         errors.push(InvoicePreflightError::CustomerNameEmpty);
     }
 
@@ -1293,36 +1288,69 @@ mod tests {
         );
     }
 
-    /// PR-97 / ADR-0048 (Ervin override 2 / GDPR) — PrivatePerson
-    /// buyers may omit `customer.name` per the GDPR posture
-    /// ("magánszemély vevő esetén a név megadása opcionális"). The
-    /// preflight must NOT fire `CustomerNameEmpty` on a PRIVATE_PERSON
-    /// body with an empty name.
+    /// Session-148 (Ervin override 3) — the §169 buyer-name rule is now
+    /// UNCONDITIONAL. A whitespace-only `customer.name` must fire
+    /// `CustomerNameEmpty` for EVERY customer type, including the
+    /// PRIVATE_PERSON branch that the PR-97 GDPR carve-out used to
+    /// exempt. (Other also surfaces its v1-deferral error, but the
+    /// name gate fires regardless.)
     #[test]
-    fn does_not_fire_customer_name_empty_for_private_person() {
-        let mut r = good_request();
-        r.customer.vat_status = CustomerVatStatus::PrivatePerson;
-        r.customer.tax_number = "".to_string();
-        r.customer.name = "".to_string();
-        let errs = validate_invoice_preflight(&r);
+    fn fires_customer_name_empty_for_every_customer_type() {
+        for vat_status in [
+            CustomerVatStatus::Domestic,
+            CustomerVatStatus::PrivatePerson,
+            CustomerVatStatus::Other,
+        ] {
+            let mut r = good_request();
+            r.customer.vat_status = vat_status;
+            // PrivatePerson tolerates no tax number; clear it so the
+            // only name-related signal under test is CustomerNameEmpty.
+            r.customer.tax_number = "".to_string();
+            r.customer.name = "   ".to_string();
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.contains(&InvoicePreflightError::CustomerNameEmpty),
+                "{vat_status:?} + blank name must fire CustomerNameEmpty (§169 unconditional), got {errs:?}"
+            );
+        }
+    }
+
+    /// Session-148 — the §169 message names the statute in both
+    /// languages so the SPA's inline chip is operator-actionable.
+    #[test]
+    fn customer_name_empty_message_names_section_169() {
+        let e = InvoicePreflightError::CustomerNameEmpty;
         assert!(
-            !errs.contains(&InvoicePreflightError::CustomerNameEmpty),
-            "PrivatePerson + empty name must NOT fire CustomerNameEmpty (GDPR override), got {errs:?}"
+            e.message_hu().contains("§169"),
+            "HU message must cite §169, got {}",
+            e.message_hu()
+        );
+        assert!(
+            e.message_en().contains("§169"),
+            "EN message must cite §169, got {}",
+            e.message_en()
         );
     }
 
-    /// Domestic + empty name must still fire `CustomerNameEmpty` — the
-    /// PR-97 GDPR relaxation applies ONLY to PRIVATE_PERSON.
+    /// Session-148 — happy path: a buyer with a name present issues
+    /// cleanly (no CustomerNameEmpty) for every supported customer
+    /// type. Pins that the unconditional gate did not over-fire.
     #[test]
-    fn fires_customer_name_empty_for_domestic_with_blank_name() {
-        let mut r = good_request();
-        r.customer.vat_status = CustomerVatStatus::Domestic;
-        r.customer.name = "   ".to_string();
-        let errs = validate_invoice_preflight(&r);
-        assert!(
-            errs.contains(&InvoicePreflightError::CustomerNameEmpty),
-            "Domestic + blank name must still fire CustomerNameEmpty, got {errs:?}"
-        );
+    fn does_not_fire_customer_name_empty_when_name_present() {
+        for (vat_status, tax) in [
+            (CustomerVatStatus::Domestic, "12345678-2-13"),
+            (CustomerVatStatus::PrivatePerson, ""),
+        ] {
+            let mut r = good_request();
+            r.customer.vat_status = vat_status;
+            r.customer.tax_number = tax.to_string();
+            r.customer.name = "Teszt Magánszemély".to_string();
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                !errs.contains(&InvoicePreflightError::CustomerNameEmpty),
+                "{vat_status:?} + present name must NOT fire CustomerNameEmpty, got {errs:?}"
+            );
+        }
     }
 
     /// Field-path closed-vocab: the new PR-97 variants route to the
