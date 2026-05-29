@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-05-19
+- **Amended:** 2026-05-29 (`DONE` status value; forward-tolerant poll parse — see [Amendment 2026-05-29](#amendment-2026-05-29--done-added-to-the-closed-status-vocab-poll-parse-made-forward-tolerant))
 - **Deciders:** Ervin
 - **Depends on:** ADR-0001 (Rust), ADR-0002 (DB-per-tenant), ADR-0004 (Tauri+Svelte), ADR-0005 (ULID), ADR-0006 (module boundaries), ADR-0007 (security baseline), ADR-0008 (audit ledger), ADR-0019 (storage strategy / no FKs)
 - **Source material:** [docs/research/nav-and-billingo.md](../docs/research/nav-and-billingo.md)
@@ -552,6 +553,51 @@ A hostile NAV inspector and a hostile-engineer review, in alternation.
 - **Use Billingo's submission path during early period to defer the
   direct-NAV work.** Rejected per the project's explicit framing:
   Billingo is migration-only, ABERP owns the issuance path.
+
+## Amendment 2026-05-29 — `DONE` added to the closed status vocab; poll parse made forward-tolerant
+
+The production NAV test endpoint was observed (2026-05-28) returning
+`<invoiceStatus>DONE</invoiceStatus>` for terminally-processed invoices.
+The original §2 closed vocabulary (`RECEIVED`, `PROCESSING`, `SAVED`,
+`ABORTED`) is incomplete against current NAV behaviour, and the strict
+parser in `crates/nav-transport/src/operations/query_transaction_status.rs`
+(`ProcessingStatus::from_nav_str`) was rejecting the entire response as a
+non-retryable parse error. The poll loop (`apps/aberp/src/poll_ack.rs`)
+classified that as `StuckNonRetryable`, so the SPA pictogram stayed on
+⌛ Submitted forever with no operator recourse.
+
+Decision:
+
+1. **`DONE` is terminal-success, semantically identical to `SAVED`.**
+   `ProcessingStatus::from_nav_str("DONE")` now parses to
+   `ProcessingStatus::Saved` rather than erroring. Collapsing at this single
+   parse boundary means the entire downstream pipeline is unchanged: the
+   poll-ack handler writes the same `InvoiceAckStatus` audit entry it writes
+   for `SAVED` (`ack_status = "SAVED"`), and `serve::derive_state`'s existing
+   `Some("SAVED") => Finalized` rule flips the pictogram to ✓ Final. The
+   verbatim `DONE` bytes are still preserved in the audit `response_xml`, so
+   no audit fidelity is lost. (A distinct `Done` enum variant was considered
+   and rejected per CLAUDE.md rules 2/3/13 — it would be behaviourally
+   identical to `Saved` everywhere and would force matching edits across the
+   SPA `AckStatus` wire mirror, `parse_ack_status`, and `derive_state`.)
+
+2. **The poll read is forward-tolerant.** Any *other* unrecognized
+   `<invoiceStatus>` value no longer fatals the read. `from_nav_str` stays
+   strict (fail-loud, returns `Err`), but the read boundary
+   (`parse_processing_status_forward_tolerant`, used by `call`) logs the raw
+   value at WARN and maps it to a new `ProcessingStatus::Unknown` variant.
+   `Unknown` is non-terminal: the loop keeps polling and, at attempt
+   exhaustion, surfaces `StuckIntermediate("UNKNOWN")` — actionable, not a
+   silent terminal. Future NAV additions therefore never strand an invoice.
+
+   `Unknown` is a unit variant (the enum keeps `#[derive(Copy)]`, which is
+   relied on pervasively); the raw NAV string is preserved via the WARN log
+   and the verbatim `response_xml` rather than carried in the variant.
+
+The closed vocab is still a real closed vocab on the WRITE side — ABERP
+never *emits* `Unknown`; it only arises when *reading back* an external NAV
+response. Forward-tolerance applies in one direction only: external reads,
+never internal writes.
 
 ## Open questions
 

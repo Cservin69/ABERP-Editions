@@ -54,13 +54,27 @@ use crate::NavTransport;
 use super::{find_first_text, is_non_retryable, parse_result_block, NavResultBlock};
 
 /// Parsed NAV `invoiceStatus` enumeration per the v3.0 `InvoiceStatusType`
-/// XSD.
+/// XSD, extended per the ADR-0009 amendment of 2026-05-29.
 ///
-/// Four values per ADR-0009 §2: two intermediate (`RECEIVED`,
-/// `PROCESSING`) and two terminal (`SAVED`, `ABORTED`). The deprecated
-/// `DONE` value is not represented — it does not appear in v3.0
-/// responses; if it ever does, [`ProcessingStatus::from_nav_str`]
-/// loud-fails rather than silently coercing.
+/// Four NAV-wire values per ADR-0009 §2: two intermediate (`RECEIVED`,
+/// `PROCESSING`) and two terminal (`SAVED`, `ABORTED`).
+///
+/// `DONE`: NAV's production test endpoint was observed (2026-05-28)
+/// returning `<invoiceStatus>DONE</...>` for terminally-processed
+/// invoices. Per the 2026-05-29 amendment, `DONE` is terminal-success
+/// semantically identical to `SAVED`; [`ProcessingStatus::from_nav_str`]
+/// parses it AS [`ProcessingStatus::Saved`] so the entire downstream
+/// pipeline (audit `ack_status`, the SPA's `AckStatus` wire mirror, and
+/// `derive_state`'s `SAVED => Finalized` rule) treats it as Final with no
+/// further changes. The verbatim `DONE` is still preserved byte-for-byte
+/// in the audit `response_xml`, so no audit fidelity is lost.
+///
+/// [`ProcessingStatus::Unknown`] is a forward-tolerant catch-all so a
+/// future NAV value never fatals the poll read (which previously stuck the
+/// invoice on Submitted with no recourse). It is never constructed from a
+/// write path; [`call`] mints it only when reading back an unrecognized
+/// NAV value, logging the raw string first. Non-terminal: the poll loop
+/// keeps polling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessingStatus {
     /// Intermediate. The request was received by NAV's queue. Caller
@@ -71,6 +85,7 @@ pub enum ProcessingStatus {
     Processing,
     /// Terminal-positive. NAV saved the invoice; legally issued and
     /// reported. Caller transitions `SubmittedInvoice → FinalizedInvoice`.
+    /// NAV's `DONE` value parses to this variant (2026-05-29 amendment).
     Saved,
     /// Terminal-negative. NAV aborted the submission (business
     /// validation failure or similar). Caller transitions
@@ -78,6 +93,12 @@ pub enum ProcessingStatus {
     /// rejected sequence slot is NOT reused — the audit ledger documents
     /// the rejection and a corrective new invoice must be issued.
     Aborted,
+    /// Forward-tolerant catch-all for an unrecognized NAV `invoiceStatus`
+    /// value (2026-05-29 amendment). Non-terminal — the poll loop keeps
+    /// polling. Read-side only: never produced by [`ProcessingStatus::from_nav_str`]
+    /// (which stays strict) — [`call`] mints it after logging the raw
+    /// value. Exempt from the as_nav_str/from_nav_str round-trip.
+    Unknown,
 }
 
 impl ProcessingStatus {
@@ -93,21 +114,35 @@ impl ProcessingStatus {
             ProcessingStatus::Processing => "PROCESSING",
             ProcessingStatus::Saved => "SAVED",
             ProcessingStatus::Aborted => "ABORTED",
+            // Read-side catch-all (2026-05-29 amendment). The verbatim
+            // NAV value is preserved in `response_xml`; this is the
+            // ledger `ack_status` mirror string for an unrecognized poll.
+            ProcessingStatus::Unknown => "UNKNOWN",
         }
     }
 
     /// Parse the NAV-facing enumeration string back into a typed value.
     /// Round-trip-proven against [`ProcessingStatus::as_nav_str`] by the
-    /// unit test below. An unknown string returns `Err` rather than a
-    /// silent default — per CLAUDE.md rule 12, a NAV-side schema change
-    /// must fail loud at the boundary, not coerce into the wrong
-    /// terminal.
+    /// unit test below.
+    ///
+    /// `DONE` parses to [`ProcessingStatus::Saved`] — NAV's terminal-success
+    /// value added post-ADR-0009 and semantically equal to `SAVED` per the
+    /// 2026-05-29 amendment.
+    ///
+    /// An otherwise-unknown string returns `Err`. This method stays strict
+    /// (fail-loud per CLAUDE.md rule 12); forward-tolerance lives one level
+    /// up in [`call`], which logs the raw value and maps it to
+    /// [`ProcessingStatus::Unknown`] rather than fataling the whole poll
+    /// read. Strictness here keeps the round-trip contract honest and lets
+    /// callers that genuinely want loud-fail (none today) opt in.
     pub fn from_nav_str(s: &str) -> Result<Self, &'static str> {
         match s {
             "RECEIVED" => Ok(ProcessingStatus::Received),
             "PROCESSING" => Ok(ProcessingStatus::Processing),
             "SAVED" => Ok(ProcessingStatus::Saved),
             "ABORTED" => Ok(ProcessingStatus::Aborted),
+            // 2026-05-29 amendment: terminal-success, identical to SAVED.
+            "DONE" => Ok(ProcessingStatus::Saved),
             _ => Err("unknown NAV invoiceStatus enumeration value"),
         }
     }
@@ -117,6 +152,28 @@ impl ProcessingStatus {
     pub fn is_terminal(self) -> bool {
         matches!(self, ProcessingStatus::Saved | ProcessingStatus::Aborted)
     }
+}
+
+/// Map a raw NAV `<invoiceStatus>` value to a [`ProcessingStatus`],
+/// forward-tolerantly (ADR-0009 2026-05-29 amendment).
+///
+/// Known values (including `DONE`, which maps to [`ProcessingStatus::Saved`])
+/// parse to their typed variant. Anything else — an unrecognized value,
+/// the empty string, whitespace, or any future NAV addition — is logged
+/// with its raw bytes and mapped to [`ProcessingStatus::Unknown`]
+/// (non-terminal) rather than fataling the poll read. The pre-amendment
+/// code returned a non-retryable parse error here, which the poll loop
+/// surfaced to the operator as a permanent "stuck on Submitted" with no
+/// recourse the moment NAV started emitting `DONE`.
+fn parse_processing_status_forward_tolerant(raw: &str) -> ProcessingStatus {
+    ProcessingStatus::from_nav_str(raw).unwrap_or_else(|_| {
+        tracing::warn!(
+            invoice_status = %raw,
+            "unrecognized <invoiceStatus> value from NAV; treating as opaque \
+             non-terminal (keep polling) per ADR-0009 2026-05-29 amendment"
+        );
+        ProcessingStatus::Unknown
+    })
 }
 
 /// Successful queryTransactionStatus outcome.
@@ -222,12 +279,7 @@ pub async fn call(
         )
     })?;
 
-    let processing_status = ProcessingStatus::from_nav_str(&raw_status).map_err(|_| {
-        NavTransportError::QueryTransactionStatusResponseParse(format!(
-            "unexpected <invoiceStatus> value `{raw_status}` \
-             (expected RECEIVED, PROCESSING, SAVED, or ABORTED per ADR-0009 §2)"
-        ))
-    })?;
+    let processing_status = parse_processing_status_forward_tolerant(&raw_status);
 
     Ok(QueryTransactionStatusOutcome {
         processing_status,
@@ -295,15 +347,62 @@ mod tests {
         }
     }
 
+    /// 2026-05-29 amendment: `DONE` is NAV's terminal-success value (it
+    /// reappeared on the production test endpoint) and parses to `Saved`
+    /// — semantically identical for our state machine. This unsticks the
+    /// invoice-17 "stuck on Submitted" Ervin reported on 2026-05-28.
     #[test]
-    fn processing_status_from_nav_str_rejects_unknown() {
-        // DONE was deprecated in v3.0 per docs/research/nav-and-billingo.md;
-        // we explicitly do NOT silently coerce it into something else.
-        assert!(ProcessingStatus::from_nav_str("DONE").is_err());
+    fn from_nav_str_maps_done_to_saved() {
+        assert_eq!(
+            ProcessingStatus::from_nav_str("DONE").unwrap(),
+            ProcessingStatus::Saved
+        );
+    }
+
+    /// `from_nav_str` itself stays strict (fail-loud); forward-tolerance
+    /// lives in `parse_processing_status_forward_tolerant` / `call`.
+    #[test]
+    fn from_nav_str_rejects_truly_unknown_strict() {
         assert!(ProcessingStatus::from_nav_str("").is_err());
+        assert!(ProcessingStatus::from_nav_str("FUTURE_VALUE").is_err());
         assert!(
             ProcessingStatus::from_nav_str("saved").is_err(),
             "case-sensitive — NAV's enum is upper-case"
+        );
+    }
+
+    /// The forward-tolerant read path (used by `call`) NEVER fatals: a
+    /// future/garbage value maps to `Unknown` (non-terminal, keep polling)
+    /// instead of erroring the whole poll. Pins the ADR-0009 2026-05-29
+    /// amendment's core invariant.
+    #[test]
+    fn forward_tolerant_parse_never_fatals_on_unknown() {
+        assert_eq!(
+            parse_processing_status_forward_tolerant("FUTURE_VALUE"),
+            ProcessingStatus::Unknown
+        );
+        // Empty, whitespace, and weird unicode all fall back to Unknown
+        // rather than panicking or erroring.
+        assert_eq!(
+            parse_processing_status_forward_tolerant(""),
+            ProcessingStatus::Unknown
+        );
+        assert_eq!(
+            parse_processing_status_forward_tolerant("   "),
+            ProcessingStatus::Unknown
+        );
+        assert_eq!(
+            parse_processing_status_forward_tolerant("✓状態🚀"),
+            ProcessingStatus::Unknown
+        );
+        // Known values (including DONE) still parse to their real variant.
+        assert_eq!(
+            parse_processing_status_forward_tolerant("SAVED"),
+            ProcessingStatus::Saved
+        );
+        assert_eq!(
+            parse_processing_status_forward_tolerant("DONE"),
+            ProcessingStatus::Saved
         );
     }
 
@@ -313,6 +412,26 @@ mod tests {
         assert!(!ProcessingStatus::Processing.is_terminal());
         assert!(ProcessingStatus::Saved.is_terminal());
         assert!(ProcessingStatus::Aborted.is_terminal());
+        // Forward-tolerant catch-all is non-terminal: keep polling.
+        assert!(!ProcessingStatus::Unknown.is_terminal());
+    }
+
+    /// A `DONE` poll response drives the same terminal-success path a
+    /// `SAVED` response does: the parsed status is `Saved`, whose
+    /// `as_nav_str()` ("SAVED") becomes the audit `ack_status`, which
+    /// `serve::derive_state` maps to `Finalized`. Mirrors
+    /// `parse_picks_first_invoice_status_saved`.
+    #[test]
+    fn parse_done_response_drives_saved_terminal_success() {
+        let body = response_with_status("DONE");
+        let raw = find_first_text(&body, "invoiceStatus")
+            .expect("parse")
+            .expect("element present");
+        assert_eq!(raw, "DONE");
+        let status = parse_processing_status_forward_tolerant(&raw);
+        assert_eq!(status, ProcessingStatus::Saved);
+        assert!(status.is_terminal());
+        assert_eq!(status.as_nav_str(), "SAVED");
     }
 
     /// Pin the local-name parse against a fixed RECEIVED response body
