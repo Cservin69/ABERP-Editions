@@ -419,6 +419,37 @@ pub fn parse_numbering_section(body: &str) -> Result<NumberingTemplate> {
     Ok(template)
 }
 
+/// PR-170 — like [`parse_numbering_section`], but returns `Ok(None)`
+/// when the `[seller.numbering]` section is absent instead of falling
+/// back to [`default_template`]. Used by the identity-write path in
+/// [`crate::setup_seller_info::setup_seller_info_to_path`] to preserve
+/// an operator-configured template across the write without
+/// materialising a phantom default for tenants that never set one.
+pub fn parse_numbering_section_if_present(body: &str) -> Result<Option<NumberingTemplate>> {
+    let Some(raw) = collect_raw_section(body) else {
+        return Ok(None);
+    };
+    let template = raw.into_template()?;
+    validate_template(&template).map_err(|e| anyhow!("{e}"))?;
+    Ok(Some(template))
+}
+
+/// PR-170 — sibling of [`read_numbering_template`] that returns
+/// `Ok(None)` when the file is missing OR the section is absent.
+/// The identity-writer uses this to distinguish "preserve nothing"
+/// from "preserve the default" — the latter would silently bake a
+/// `default_template()` into a tenant's `seller.toml` on every
+/// identity save, which is exactly the data-fabrication this bug fix
+/// is supposed to prevent.
+pub fn read_numbering_section_if_present(path: &Path) -> Result<Option<NumberingTemplate>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let body = fs::read_to_string(path)
+        .with_context(|| format!("read seller.toml at {}", path.display()))?;
+    parse_numbering_section_if_present(&body)
+}
+
 #[derive(Debug, Default)]
 struct RawNumberingSection {
     segments_line: Option<String>,
@@ -715,6 +746,10 @@ pub fn to_toml_section(t: &NumberingTemplate) -> String {
 /// three SPA write surfaces (identity, banks, numbering) compose
 /// without stomping each other.
 pub fn write_numbering_section(path: &Path, template: &NumberingTemplate) -> Result<()> {
+    // PR-170 defense-in-depth: snapshot prior seller.toml body before
+    // the merge-and-write replaces it. See seller_toml_backup module.
+    let _ = crate::seller_toml_backup::snapshot_and_rotate(path);
+
     validate_template(template)
         .map_err(|e| anyhow!("numbering template invariants violated pre-write: {e}"))?;
     let new_section = to_toml_section(template);

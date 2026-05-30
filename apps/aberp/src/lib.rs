@@ -52,6 +52,7 @@ pub mod request_technical_annulment;
 pub mod retry_submission;
 pub mod secrets_cache;
 pub mod seller_banks;
+pub mod seller_toml_backup;
 pub mod serve;
 pub mod setup_nav_credentials;
 pub mod setup_seller_info;

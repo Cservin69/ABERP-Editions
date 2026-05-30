@@ -154,6 +154,12 @@ pub fn setup_seller_info_to_path(
     path: &Path,
     inputs: &SellerInfoInputs,
 ) -> std::result::Result<SellerInfoInputs, SetupSellerInfoError> {
+    // PR-170 defense-in-depth: snapshot the prior seller.toml body
+    // before we touch it. Best-effort — see seller_toml_backup module
+    // docs for the failure posture. The snapshot is the recovery
+    // handle if a future write-path regression costs operator state.
+    let _ = crate::seller_toml_backup::snapshot_and_rotate(path);
+
     let mut errors: Vec<FieldError> = Vec::new();
     require_nonblank(
         "legalName",
@@ -210,23 +216,63 @@ pub fn setup_seller_info_to_path(
     // keys) into new-form entries on the way through; a malformed bank
     // section loud-fails per CLAUDE.md rule 12 rather than silently
     // dropping data.
+    //
+    // PR-170 / session-170 — same preservation discipline now extended
+    // to `[seller.smtp]` and `[seller.numbering]`. Ervin's PROD_v1.0 →
+    // PROD_v1.1 update pilot lost both because the identity-write
+    // surface only re-appended banks. The compliance risk is real:
+    // losing the numbering template silently flips the rendered prefix
+    // back to `INV-default/00043` (counter state is in DuckDB so the
+    // sequence number itself does not duplicate, but format-drift on
+    // the legal invoice number is just as bad). Both reads use the
+    // *_if_present helpers so a tenant that never configured one does
+    // NOT have a phantom default baked into seller.toml on each save.
     let preserved = crate::seller_banks::read_seller_banks(path).map_err(|e| {
         SetupSellerInfoError::Backend(anyhow!(
             "read existing bank section for preservation across identity write: {e}"
         ))
     })?;
+    let preserved_smtp = crate::smtp_config::read_smtp_config(path).map_err(|e| {
+        SetupSellerInfoError::Backend(anyhow!(
+            "read existing [seller.smtp] for preservation across identity write: {e}"
+        ))
+    })?;
+    let preserved_numbering =
+        crate::numbering::read_numbering_section_if_present(path).map_err(|e| {
+            SetupSellerInfoError::Backend(anyhow!(
+                "read existing [seller.numbering] for preservation across identity write: {e}"
+            ))
+        })?;
 
     let mut body = render_seller_toml(inputs);
     if !preserved.entries().is_empty() {
-        if !body.ends_with('\n') {
-            body.push('\n');
-        }
-        body.push('\n');
-        body.push_str(&preserved.to_toml_section());
+        append_section(&mut body, &preserved.to_toml_section());
+    }
+    if let Some(smtp) = preserved_smtp.as_ref() {
+        append_section(&mut body, &crate::smtp_config::to_toml_section(smtp));
+    }
+    if let Some(template) = preserved_numbering.as_ref() {
+        append_section(&mut body, &crate::numbering::to_toml_section(template));
     }
 
     write_atomic(path, body.as_bytes()).map_err(SetupSellerInfoError::Backend)?;
     Ok(inputs.clone())
+}
+
+/// PR-170 — append a TOML section to `body` with exactly one blank-line
+/// separator between blocks. Centralised so the three preservation
+/// re-appends (banks, smtp, numbering) compose deterministically — a
+/// missing separator would let the next section's `[header]` chain onto
+/// the previous section's last key, breaking the line-walker parsers.
+fn append_section(body: &mut String, section: &str) {
+    if section.is_empty() {
+        return;
+    }
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push('\n');
+    body.push_str(section);
 }
 
 fn require_nonblank(field: &'static str, value: &str, message: &str, out: &mut Vec<FieldError>) {
@@ -798,6 +844,291 @@ default        = true
             "12345678-12345678-12345678"
         );
         assert!(reparsed.entries()[0].default);
+    }
+
+    /// PR-170 / session-170 — Ervin's prod-update regression. The
+    /// SetupWizard / TenantSettings identity save MUST NOT wipe
+    /// `[seller.smtp]`. Pre-PR-170 the identity-write surface only
+    /// re-appended `[[seller.banks]]`, so any operator-configured
+    /// SMTP block disappeared on the next identity save. The PROD_v1.0
+    /// → PROD_v1.1 update pilot lost SMTP this way; this pin catches
+    /// any regression.
+    #[test]
+    fn identity_save_preserves_existing_smtp_section() {
+        let tmp = test_dir("preserves_smtp");
+        let path = tmp.join("seller.toml");
+        let pre = "\
+[seller]
+legal_name = \"Old Name\"
+tax_number = \"24904362-2-41\"
+
+[seller.address]
+country_code = \"HU\"
+postal_code = \"1037\"
+city = \"Budapest\"
+street = \"Old Street\"
+
+[seller.smtp]
+host = \"smtppro.zoho.eu\"
+port = 465
+from_address = \"ervin@aben.ch\"
+from_display_name = \"Áben Consulting Számlázás\"
+username = \"ervin@aben.ch\"
+security = \"Tls\"
+attach_xml = true
+";
+        std::fs::write(&path, pre).expect("write pre-condition file");
+
+        let inputs = SellerInfoInputs {
+            legal_name: "New Name".to_string(),
+            tax_number: "24904362-2-41".to_string(),
+            eu_vat_number: None,
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatérő köz 6".to_string(),
+            bank_account_number: None,
+            iban: None,
+            bank_name: None,
+            swift_bic: None,
+        };
+
+        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+
+        // Re-parse via the SMTP module's own reader — round-trip MUST
+        // recover the original SmtpConfig byte-for-byte at the value
+        // level. A surface-level `contains("smtppro.zoho.eu")` would
+        // miss a regression that mangled `port`/`security`.
+        let smtp = crate::smtp_config::read_smtp_config(&path)
+            .expect("re-read smtp")
+            .expect("smtp section present after identity save");
+        assert_eq!(smtp.host, "smtppro.zoho.eu");
+        assert_eq!(smtp.port, 465);
+        assert_eq!(smtp.from_address, "ervin@aben.ch");
+        assert_eq!(
+            smtp.from_display_name.as_deref(),
+            Some("Áben Consulting Számlázás")
+        );
+        assert_eq!(smtp.username, "ervin@aben.ch");
+        assert_eq!(smtp.security, crate::smtp_config::SmtpSecurity::Tls);
+        assert!(smtp.attach_xml);
+        // Identity edited:
+        let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
+        assert!(
+            after.contains("legal_name = \"New Name\""),
+            "identity updated: {after}"
+        );
+    }
+
+    /// PR-170 / session-170 — same pin for `[seller.numbering]`. This
+    /// is the compliance-load-bearing one: silently losing the operator's
+    /// template flips the next invoice number from `ABERP/2026/00043`
+    /// to `INV-default/00043` (default_template's prefix). The counter
+    /// sequence itself survives in DuckDB so no duplicate numbers, but
+    /// format-drift on a Hungarian invoice number is a §169 fail.
+    #[test]
+    fn identity_save_preserves_existing_numbering_section() {
+        let tmp = test_dir("preserves_numbering");
+        let path = tmp.join("seller.toml");
+        let pre = "\
+[seller]
+legal_name = \"Old Name\"
+tax_number = \"24904362-2-41\"
+
+[seller.address]
+country_code = \"HU\"
+postal_code = \"1037\"
+city = \"Budapest\"
+street = \"Old Street\"
+
+[seller.numbering]
+segments = [{ kind = \"Literal\", text = \"ABERP/\" }, { kind = \"Year\", digits = 4 }, { kind = \"Literal\", text = \"/\" }, { kind = \"Counter\", pad_width = 5 }]
+reset_policy = \"on_year_change\"
+start_value = 1
+";
+        std::fs::write(&path, pre).expect("write pre-condition file");
+
+        let inputs = SellerInfoInputs {
+            legal_name: "New Name".to_string(),
+            tax_number: "24904362-2-41".to_string(),
+            eu_vat_number: None,
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatérő köz 6".to_string(),
+            bank_account_number: None,
+            iban: None,
+            bank_name: None,
+            swift_bic: None,
+        };
+
+        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+
+        let template =
+            crate::numbering::read_numbering_template(&path).expect("re-read numbering template");
+        // The render path MUST yield Ervin's prod prefix, not the
+        // default `INV-default/`. This is the load-bearing assertion.
+        let rendered = template.render(2026, 43);
+        assert_eq!(
+            rendered, "ABERP/2026/00043",
+            "numbering template lost across identity save — rendered `{rendered}`"
+        );
+        assert_eq!(template.start_value, 1);
+        assert!(matches!(
+            template.reset_policy,
+            crate::numbering::ResetPolicy::OnYearChange
+        ));
+    }
+
+    /// PR-170 / session-170 — four-way invariant. The full live-prod
+    /// shape (identity + banks + smtp + numbering) MUST survive an
+    /// identity save with every section recovered via its own typed
+    /// reader. This is the full reproduction of Ervin's production
+    /// seller.toml; a regression that drops ANY of the three preserved
+    /// sections trips this pin.
+    #[test]
+    fn identity_save_preserves_all_three_sections_together() {
+        let tmp = test_dir("preserves_all_three");
+        let path = tmp.join("seller.toml");
+        let pre = "\
+[seller]
+legal_name = \"ÁBEN CONSULTING KFT.\"
+tax_number = \"24904362-2-41\"
+eu_vat_number = \"HU24904362\"
+
+[seller.address]
+country_code = \"HU\"
+postal_code = \"1037\"
+city = \"Budapest\"
+street = \"Old Street\"
+
+[[seller.banks]]
+currency       = \"HUF\"
+account_number = \"HU71 12011375 01945291 00100002\"
+bank_name      = \"Raiffeisen\"
+swift_bic      = \"RAIFHUHB\"
+default        = true
+
+[[seller.banks]]
+currency       = \"EUR\"
+account_number = \"LT143250044813186860\"
+bank_name      = \"Revolut\"
+swift_bic      = \"REVOLT21\"
+default        = true
+
+[seller.smtp]
+host = \"smtppro.zoho.eu\"
+port = 465
+from_address = \"ervin@aben.ch\"
+from_display_name = \"Áben Consulting Számlázás\"
+username = \"ervin@aben.ch\"
+security = \"Tls\"
+attach_xml = true
+
+[seller.numbering]
+segments = [{ kind = \"Literal\", text = \"ABERP/\" }, { kind = \"Year\", digits = 4 }, { kind = \"Literal\", text = \"/\" }, { kind = \"Counter\", pad_width = 5 }]
+reset_policy = \"on_year_change\"
+start_value = 1
+";
+        std::fs::write(&path, pre).expect("write pre-condition file");
+
+        let inputs = SellerInfoInputs {
+            legal_name: "ÁBEN CONSULTING KFT.".to_string(),
+            tax_number: "24904362-2-41".to_string(),
+            eu_vat_number: Some("HU24904362".to_string()),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatérő köz 6".to_string(),
+            bank_account_number: None,
+            iban: None,
+            bank_name: None,
+            swift_bic: None,
+        };
+
+        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+
+        let banks = crate::seller_banks::read_seller_banks(&path).expect("re-read banks");
+        assert_eq!(banks.entries().len(), 2, "both bank entries must survive");
+
+        let smtp = crate::smtp_config::read_smtp_config(&path)
+            .expect("re-read smtp")
+            .expect("smtp section present");
+        assert_eq!(smtp.host, "smtppro.zoho.eu");
+
+        let template =
+            crate::numbering::read_numbering_template(&path).expect("re-read numbering template");
+        assert_eq!(template.render(2026, 1), "ABERP/2026/00001");
+    }
+
+    /// PR-170 / session-170 — defense-in-depth wiring pin. The identity
+    /// writer MUST trigger [`crate::seller_toml_backup::snapshot_and_rotate`]
+    /// before clobbering the prior file body. Proves the wiring works
+    /// end-to-end (the helper's own unit tests cover the backup logic
+    /// in isolation; this one proves the writer actually calls it).
+    #[test]
+    fn identity_save_creates_backup_of_prior_seller_toml() {
+        let tmp = test_dir("creates_backup");
+        let path = tmp.join("seller.toml");
+        let pre_body = "[seller]\nlegal_name = \"Old\"\ntax_number = \"24904362-2-41\"\n";
+        std::fs::write(&path, pre_body).expect("write pre-condition file");
+
+        let inputs = good_inputs();
+        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+
+        let backups: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".seller.toml.backup-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one backup of the prior body");
+        let backup_body = std::fs::read_to_string(backups[0].path()).unwrap();
+        assert_eq!(
+            backup_body, pre_body,
+            "backup captures the prior body byte-for-byte"
+        );
+    }
+
+    /// PR-170 / session-170 — pin the "no phantom default" invariant.
+    /// A tenant that never configured a numbering template must not
+    /// gain one on identity save. Without the *_if_present helper, the
+    /// existing `read_numbering_template` falls back to the default
+    /// template, which would bake `INV-default/` into seller.toml on
+    /// every save — silently flipping a tenant from "auto-default" to
+    /// "explicit-default" behaviour. This pin catches that regression.
+    #[test]
+    fn identity_save_does_not_materialise_default_numbering_when_section_absent() {
+        let tmp = test_dir("no_phantom_numbering");
+        let path = tmp.join("seller.toml");
+        let pre = "\
+[seller]
+legal_name = \"Old Name\"
+tax_number = \"24904362-2-41\"
+
+[seller.address]
+country_code = \"HU\"
+postal_code = \"1037\"
+city = \"Budapest\"
+street = \"Old Street\"
+";
+        std::fs::write(&path, pre).expect("write pre-condition file");
+
+        let inputs = good_inputs();
+        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+
+        let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
+        assert!(
+            !after.contains("[seller.numbering]"),
+            "no phantom [seller.numbering] section when none existed pre-write: {after}"
+        );
+        assert!(
+            !after.contains("INV-default"),
+            "no default-template prefix leaked into file: {after}"
+        );
     }
 
     /// PR-75 / session-99 — exercises the

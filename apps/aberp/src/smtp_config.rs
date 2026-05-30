@@ -403,7 +403,14 @@ fn strip_quotes(s: &str) -> &str {
 }
 
 /// Render the `[seller.smtp]` section to its canonical TOML form.
-fn to_toml_section(cfg: &SmtpConfig) -> String {
+///
+/// PR-170 — exposed `pub` so
+/// [`crate::setup_seller_info::setup_seller_info_to_path`] can re-append
+/// a preserved SMTP config across the identity write (mirror of the
+/// `[[seller.banks]]` preservation PR-75 added). Without this, the
+/// SetupWizard / identity-only TenantSettings save would silently
+/// drop `[seller.smtp]` — Ervin's S170 production-update regression.
+pub fn to_toml_section(cfg: &SmtpConfig) -> String {
     let mut out = String::new();
     out.push_str("[seller.smtp]\n");
     out.push_str(&format!("host = \"{}\"\n", cfg.host));
@@ -426,6 +433,10 @@ fn to_toml_section(cfg: &SmtpConfig) -> String {
 /// PR-89's `write_numbering_section` posture so the four SPA write
 /// surfaces compose without stomping each other.
 pub fn write_smtp_section(path: &Path, cfg: &SmtpConfig) -> Result<()> {
+    // PR-170 defense-in-depth: snapshot prior seller.toml body before
+    // the merge-and-write replaces it. See seller_toml_backup module.
+    let _ = crate::seller_toml_backup::snapshot_and_rotate(path);
+
     cfg.validate()
         .map_err(|errs| anyhow!("SMTP config invariants violated pre-write: {errs:?}"))?;
     let new_section = to_toml_section(cfg);

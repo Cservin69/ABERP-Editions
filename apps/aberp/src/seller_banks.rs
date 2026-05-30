@@ -798,6 +798,10 @@ pub fn mint_entry(
 /// the redundant gate here keeps a non-route caller (a future CLI
 /// command, for example) safe.
 pub fn write_seller_banks_section(path: &Path, banks: &SellerBanks) -> Result<()> {
+    // PR-170 defense-in-depth: snapshot prior seller.toml body before
+    // the merge-and-write replaces it. See seller_toml_backup module.
+    let _ = crate::seller_toml_backup::snapshot_and_rotate(path);
+
     validate_per_currency_defaults(banks.entries())
         .map_err(|e| anyhow!("bank invariants violated pre-write: {e}"))?;
 

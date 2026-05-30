@@ -1,7 +1,7 @@
 # ABERP production cutover runbook
 
-**Last updated:** 2026-05-30 — Session 169 / PR-169 (icons + Tauri SPA
-embed + runbook + release.sh).
+**Last updated:** 2026-05-30 — Session 170 / PR-170 (identity-write
+preserves SMTP + numbering, snapshot-prod.sh, real Áben logo).
 **Audience:** Ervin (sole operator).
 **Language:** EN-primary; HU clarifications inline where they help at the
 machine.
@@ -421,14 +421,20 @@ the previous code; if the previous code's schema is older, **do not
 roll back across a destructive migration without first restoring a
 DB snapshot from before the migration ran**.
 
-> **Snapshot the DB before any cutover or upgrade.**
-> Standard belt-and-suspenders backup:
+> **Snapshot the full prod state before any cutover or upgrade.**
+> Belt-and-suspenders backup (S170 / PR-170 — captures `~/.aberp/<tenant>/`
+> AND the per-tenant macOS keychain entries to a password-protected zip):
+> ```bash
+> ./tools/snapshot-prod.sh
+> ```
+> Do this before Step 2 and before any future Step 9 upgrade.
+> Snapshots land under `~/aberp-snapshots/`. The DuckDB-only one-liner
+> below is still valid as a quick-and-dirty fallback when you only need
+> a DB rollback target (no keychain, no seller.toml):
 > ```bash
 > cp ~/.aberp/prod/aberp.duckdb \
 >    ~/.aberp/prod/aberp.duckdb.snapshot-$(date +%Y%m%d-%H%M%S)
 > ```
-> Do this before Step 2 and before any future Step 9 upgrade. DuckDB
-> is a single file; the snapshot IS the rollback target.
 
 **HU:** A rollback biztonságos, mert az audit ledger csak hozzáfűzhető,
 és a séma-migrációk ütközésmentesek (`ensure_schema` idempotens). DB-
@@ -446,9 +452,20 @@ Routine: dev work continues to land on `main`. When you want a fix or
 feature to reach prod:
 
 ```bash
-# 1. (Optional but recommended) DB snapshot first.
-cp ~/.aberp/prod/aberp.duckdb \
-   ~/.aberp/prod/aberp.duckdb.snapshot-$(date +%Y%m%d-%H%M%S)
+# 1. *** REQUIRED *** snapshot current prod state BEFORE switching
+#    release branches. This is the recovery handle if the new release
+#    has a bug that costs operator state (the S170 prod-update pilot
+#    lost SMTP + numbering this way; PR-170 fixed the write path but
+#    we still snapshot every upgrade defense-in-depth).
+#
+#    The snapshot captures the full ~/.aberp/prod/ tenant directory
+#    (seller.toml + DuckDB + side-store invoices + audit log + first-
+#    launch touchfile) AND the per-tenant macOS keychain entries
+#    (NAV credentials blob + SMTP password) into a password-protected
+#    zip. Snapshots land in ~/aberp-snapshots/.
+./tools/snapshot-prod.sh
+# (will prompt twice for an encryption password — pick one you can
+#  remember; you need it to restore.)
 
 # 2. From the DEV clone: publish a new release branch.
 cd ~/Documents/Claude/Projects/ABERP
@@ -466,6 +483,38 @@ git checkout PROD_v1.1
 ./run/run_prod.sh
 
 # 5. Smoke-test on a low-stakes path before bulk-issuing.
+```
+
+### Restoring from a snapshot
+
+If the new release loses operator state (or anything else goes wrong
+that warrants a full rollback to pre-upgrade), the snapshot artifacts
+land under `~/aberp-snapshots/`:
+
+- `<tenant>-<timestamp>.tgz` — the tenant directory.
+- `<tenant>-<timestamp>-keychain.zip` — encrypted keychain dump.
+
+```bash
+# 1. Stop the running app (Ctrl-C in the run_prod.sh terminal).
+# 2. Restore the tenant directory in-place. The tarball expands to
+#    `prod/` under ~/.aberp/, so cd into the parent first.
+#    NOTE: this OVERWRITES the current ~/.aberp/prod/ directory.
+cd ~/.aberp
+tar -xzf ~/aberp-snapshots/prod-20260601-143022.tgz   # pick the right ts
+
+# 3. Restore keychain entries from the encrypted zip. The zip contains
+#    one JSON file; unzip with the password you set at snapshot time.
+cd /tmp
+unzip ~/aberp-snapshots/prod-20260601-143022-keychain.zip
+# Then for each entry in the JSON, re-import:
+#   security add-generic-password -U -s <service> -a <account> -w <password>
+# (The `-U` flag updates an existing entry instead of failing on duplicate.)
+# Don't leave the unzipped JSON on disk — `shred -uz` it after you're done.
+
+# 4. Relaunch with the prior release branch (Step 8 procedure).
+cd ~/ABERP-prod
+git checkout PROD_v1.0    # whichever release matched the snapshot
+./run/run_prod.sh
 ```
 
 **Schema migrations** are automatic — `ensure_schema` runs at boot
@@ -636,7 +685,8 @@ the reason the runbook bangs the snapshot-the-DB drum at every step.
 | Regenerate placeholder icons | `python3 tools/generate-icons.py` |
 | Verify NAV creds are in keychain | `security find-generic-password -s "aberp.nav.prod" -a "nav_credentials_blob"` |
 | Verify SMTP creds are in keychain | `security find-generic-password -s "aberp.smtp.prod" -a "smtp_password"` |
-| Snapshot the DB | `cp ~/.aberp/prod/aberp.duckdb ~/.aberp/prod/aberp.duckdb.snapshot-$(date +%Y%m%d-%H%M%S)` |
+| Snapshot the DB + seller.toml + keychain (preferred) | `./tools/snapshot-prod.sh` |
+| Snapshot the DB only (DuckDB single-file fallback) | `cp ~/.aberp/prod/aberp.duckdb ~/.aberp/prod/aberp.duckdb.snapshot-$(date +%Y%m%d-%H%M%S)` |
 | See recent audit entries | (via the SPA's audit timeline on the invoice detail page) |
 | Roll back to previous release | `cd ABERP-prod && git fetch && git checkout PROD_vX.Y-prev && ./run/run_prod.sh` |
 | Re-trigger first-launch modal | `rm ~/.aberp/prod/.first-launch-acknowledged && ./run/run_prod.sh` |
