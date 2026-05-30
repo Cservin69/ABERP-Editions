@@ -86,6 +86,20 @@ cd ABERP-prod
 `./run/release.sh PROD_v1.0` is the dev-side script that publishes a
 release branch from `main`.
 
+## Branding the printed invoice (optional)
+
+Drop your logo at `~/.aberp/<tenant>/logo.png` to brand the printed
+invoice header. PNG only for v1; ≤ 512×512 recommended; the renderer
+preserves the aspect ratio and fits the image inside a 50×50-point box
+top-left of the header (no operator config). Absent file → text-only
+header, same as pre-PR-176. A malformed PNG loud-fails the render so
+the operator sees the broken state rather than shipping a logo-less
+PDF silently.
+
+No `seller.toml` knob, no UI upload yet, no DB column — pure
+filesystem convention. Re-export a different logo at the same path to
+switch.
+
 ## Updating an existing prod install
 
 → **[`docs/CUTOVER_RUNBOOK.md` § Step 9](docs/CUTOVER_RUNBOOK.md)**

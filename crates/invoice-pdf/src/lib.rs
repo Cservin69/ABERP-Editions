@@ -46,6 +46,7 @@
 #![forbid(unsafe_code)]
 
 pub mod format;
+pub mod logo;
 pub mod model;
 pub mod text;
 
@@ -55,6 +56,7 @@ use thiserror::Error;
 
 use aberp_billing::Currency;
 
+pub use logo::TenantLogo;
 pub use model::{InvoiceModel, LineItem, PartyInfo};
 
 /// A4 page width in PDF points (210 mm × 72/25.4).
@@ -119,6 +121,43 @@ const RULE_WEIGHT_SILVER: f32 = 0.5;
 /// reads as deliberate rather than a thicker grey line.
 const RULE_WEIGHT_GOLD: f32 = 0.85;
 
+// ─── PR-176 — tenant-logo header geometry ─────────────────────────────
+//
+// Convention over config: a PNG at `~/.aberp/<tenant>/logo.png` is
+// drawn top-left of the header inside a fixed `LOGO_BOX_SIDE`-pt
+// square. The actual draw is aspect-preserved within the box — a wide
+// logo uses the full width and less than full height, a tall logo the
+// inverse — so operators can drop any reasonable PNG without picking
+// dimensions.
+//
+// Box size is 50pt (not the brief's example 64pt) because the existing
+// header geometry — title baseline at MARGIN_TOP-14, invoice-number
+// baseline at MARGIN_TOP-38, silver under-rule at MARGIN_TOP-58 — has
+// 58pt of vertical real estate above the under-rule. A 50pt box sits
+// comfortably inside that with breathing room, vs. a 64pt box that
+// would cross the under-rule and force the entire downstream layout
+// to shift. The brief explicitly allows "64×64 OR equivalent — match
+// what looks right against the existing header layout"; 50pt is the
+// match.
+//
+// `LOGO_TITLE_GAP` keeps the title text from kissing the logo's right
+// edge. Total horizontal slot the title cluster shifts right by is
+// `LOGO_BOX_SIDE + LOGO_TITLE_GAP` when a logo is present; absent →
+// no shift, byte-for-byte identical title positioning vs pre-PR-176.
+
+/// Side length (points) of the square box reserved for the tenant
+/// logo in the header. The logo is scaled aspect-preserved to fit
+/// inside this box; empty space inside the box (e.g. when a wide logo
+/// uses < `LOGO_BOX_SIDE` of vertical height) is intentional.
+const LOGO_BOX_SIDE: i64 = 50;
+/// Horizontal breathing room between the logo box's right edge and
+/// the title cluster's left edge.
+const LOGO_TITLE_GAP: i64 = 10;
+/// Name under which the logo Image XObject is registered in the page
+/// resources `/XObject` dict. The content stream emits a `Do` op with
+/// this exact name to draw it; both sides must agree on the spelling.
+const LOGO_XOBJECT_NAME: &str = "Im1";
+
 #[derive(Debug, Error)]
 pub enum RenderError {
     #[error("non-HUF invoice requires rate_metadata for the printed render (ADR-0037 §1.a)")]
@@ -129,6 +168,13 @@ pub enum RenderError {
     ContentEncode(String),
     #[error("PDF document save failed: {0}")]
     Save(String),
+    /// PR-176 — the operator-supplied PNG at the tenant-logo convention
+    /// path failed to decode. Surfaces loudly per CLAUDE.md rule 12
+    /// rather than silently dropping the logo — a corrupted file is an
+    /// operator-actionable signal (re-export the PNG), not a noise
+    /// case to swallow.
+    #[error("tenant logo PNG decode failed: {0}")]
+    LogoDecode(String),
 }
 
 /// Render the invoice to PDF bytes.
@@ -166,16 +212,43 @@ pub fn render_invoice(model: &InvoiceModel) -> Result<Vec<u8>, RenderError> {
         "BaseFont" => "Helvetica-Oblique",
         "Encoding" => "WinAnsiEncoding",
     });
-    let resources_id = doc.add_object(dictionary! {
-        "Font" => dictionary! {
-            "F1" => font_regular,
-            "FB" => font_bold,
-            "FI" => font_italic,
-        },
-    });
+    // PR-176 — embed the optional tenant logo as a PDF Image XObject
+    // and register it under the page resources `/XObject` map. The
+    // layout step then references the same name (`Im1`) via a `Do`
+    // operator to place it top-left of the header. Absent logo →
+    // identical resources dict shape as pre-PR-176 (no `/XObject` key),
+    // which keeps the byte-for-byte cmp under existing pin tests stable
+    // for the no-logo path.
+    let logo_xobject_name: Option<&str> = if model.tenant_logo.is_some() {
+        Some(LOGO_XOBJECT_NAME)
+    } else {
+        None
+    };
+    let resources_id = if let Some(logo) = &model.tenant_logo {
+        let img_stream = build_logo_image_xobject(logo);
+        let img_id = doc.add_object(img_stream);
+        doc.add_object(dictionary! {
+            "Font" => dictionary! {
+                "F1" => font_regular,
+                "FB" => font_bold,
+                "FI" => font_italic,
+            },
+            "XObject" => dictionary! {
+                LOGO_XOBJECT_NAME => img_id,
+            },
+        })
+    } else {
+        doc.add_object(dictionary! {
+            "Font" => dictionary! {
+                "F1" => font_regular,
+                "FB" => font_bold,
+                "FI" => font_italic,
+            },
+        })
+    };
 
     let mut ops: Vec<Operation> = Vec::new();
-    layout(&mut ops, model);
+    layout(&mut ops, model, logo_xobject_name);
     let content = Content { operations: ops };
     let content_bytes = content
         .encode()
@@ -211,22 +284,33 @@ pub fn render_invoice(model: &InvoiceModel) -> Result<Vec<u8>, RenderError> {
 }
 
 /// Append the full top-to-bottom layout operations onto `ops`.
-fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel) {
-    // Title block (top-left): "Számla" + invoice number. The number
-    // stays INK — accountants look it up; it's the primary key on
-    // the printed surface. Size-18 regular vs size-28 bold above
-    // already gives the visual hierarchy.
-    text(ops, "FB", 28, MARGIN_LEFT, MARGIN_TOP - 14, "Számla");
-    text(
-        ops,
-        "F1",
-        18,
-        MARGIN_LEFT,
-        MARGIN_TOP - 38,
-        &m.invoice_number,
-    );
+fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel, logo_xobject_name: Option<&str>) {
+    // PR-176 — optional tenant logo top-left of the header. When
+    // present, the title cluster shifts right by the logo box width
+    // plus a small gap so logo + title sit side-by-side without
+    // overlap. When absent, every coordinate matches the pre-PR-176
+    // layout byte-for-byte.
+    let (logo_shift, logo_box) = match (&m.tenant_logo, logo_xobject_name) {
+        (Some(logo), Some(name)) => {
+            place_logo(ops, logo, name);
+            (LOGO_BOX_SIDE + LOGO_TITLE_GAP, LOGO_BOX_SIDE)
+        }
+        _ => (0, 0),
+    };
+    let _ = logo_box; // reserved for a future header-rule extension
 
-    // Title under-rule — silver. (Gold is reserved for the banner.)
+    let title_x = MARGIN_LEFT + logo_shift;
+    // Title block (top-left, shifted right when a logo is present):
+    // "Számla" + invoice number. The number stays INK — accountants
+    // look it up; it's the primary key on the printed surface. Size-18
+    // regular vs size-28 bold above already gives the visual hierarchy.
+    text(ops, "FB", 28, title_x, MARGIN_TOP - 14, "Számla");
+    text(ops, "F1", 18, title_x, MARGIN_TOP - 38, &m.invoice_number);
+
+    // Title under-rule — silver. Spans the full printable width whether
+    // a logo is present or not (the rule's role is to separate the
+    // header band from the party block below, NOT to underline the
+    // title cluster). (Gold is reserved for the banner.)
     silver_rule(ops, MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP - 58);
 
     // Two-column party block.
@@ -898,6 +982,85 @@ fn label_value(ops: &mut Vec<Operation>, x: i64, y: i64, label: &str, value: &st
     // flag).
     let label_width = (label.chars().count() as i64 + 1) * 7 * 55 / 100 + LABEL_VALUE_GAP;
     text_in(ops, "FB", 9, x + label_width, y, value, INK);
+}
+
+// ─── PR-176 — tenant-logo placement + XObject build ───────────────────
+
+/// Emit the content-stream operators that draw the tenant logo at the
+/// top-left of the header. The image XObject is registered under
+/// `name` in the page resources (see [`render_invoice`] resource
+/// assembly); the operators here position + scale the unit-square
+/// XObject via a `cm` (current matrix) op and dispatch the draw with
+/// `Do`. The `q`/`Q` save/restore brackets isolate the matrix change
+/// from the rest of the layout stream.
+///
+/// Scaling: the logo box is `LOGO_BOX_SIDE × LOGO_BOX_SIDE` points;
+/// the actual draw fits inside the box with aspect preserved. A
+/// landscape (wide) logo uses the full `LOGO_BOX_SIDE` width and less
+/// vertical height; a portrait logo the inverse; a square logo fills
+/// the box exactly. The image is anchored to the top-left corner of
+/// the box regardless of aspect — left edge at `MARGIN_LEFT`, top
+/// edge at `MARGIN_TOP`.
+fn place_logo(ops: &mut Vec<Operation>, logo: &TenantLogo, name: &str) {
+    let box_side = LOGO_BOX_SIDE as f32;
+    let w = logo.width.max(1) as f32;
+    let h = logo.height.max(1) as f32;
+    let scale = (box_side / w).min(box_side / h);
+    let draw_w = w * scale;
+    let draw_h = h * scale;
+    // Anchor top-left of the box. PDF y grows upward, so the image's
+    // bottom edge sits at `MARGIN_TOP - draw_h`; its top edge at
+    // `MARGIN_TOP` (the printable-area top). PDF's Image XObject is
+    // implicitly placed with its bottom-left at the cm-translated
+    // origin, so the cm op below places the bottom-left of the drawn
+    // rectangle at (MARGIN_LEFT, MARGIN_TOP - draw_h).
+    let x_left = MARGIN_LEFT as f32;
+    let y_bottom = (MARGIN_TOP as f32) - draw_h;
+
+    ops.push(Operation::new("q", vec![]));
+    // cm a b c d e f — with a=draw_w, d=draw_h, b=c=0, e=x, f=y, this
+    // scales the unit square to (draw_w × draw_h) and translates it
+    // to (x, y). The unit-square XObject's pixels then map directly
+    // into that rectangle.
+    ops.push(Operation::new(
+        "cm",
+        vec![
+            Object::Real(draw_w),
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(draw_h),
+            Object::Real(x_left),
+            Object::Real(y_bottom),
+        ],
+    ));
+    ops.push(Operation::new(
+        "Do",
+        vec![Object::Name(name.as_bytes().to_vec())],
+    ));
+    ops.push(Operation::new("Q", vec![]));
+}
+
+/// Build the Image XObject Stream for a decoded tenant logo. The
+/// stream's raw content is the 8-bit RGB pixel buffer; `Stream::compress`
+/// adds `/Filter /FlateDecode` (zlib) when it shrinks the payload,
+/// which it always does for typical brand logos. The PDF reader maps
+/// the byte stream back to pixels via the dict's
+/// `Width / Height / ColorSpace / BitsPerComponent`.
+fn build_logo_image_xobject(logo: &TenantLogo) -> Stream {
+    let dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Image",
+        "Width" => logo.width as i64,
+        "Height" => logo.height as i64,
+        "ColorSpace" => Object::Name(b"DeviceRGB".to_vec()),
+        "BitsPerComponent" => 8_i64,
+    };
+    let mut stream = Stream::new(dict, logo.rgb_bytes.clone());
+    // Ignore compression errors per the same posture as lopdf's own
+    // image embedding path — a failed FlateDecode still yields a valid
+    // (uncompressed) Image XObject; the PDF reader handles both.
+    let _ = stream.compress();
+    stream
 }
 
 #[cfg(test)]

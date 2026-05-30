@@ -83,6 +83,7 @@ dependencies = [
  "aberp-billing",
  "lopdf",
  "pdf-extract",
+ "png 0.17.16",
  "rust_decimal",
  "thiserror 1.0.69",
  "time",

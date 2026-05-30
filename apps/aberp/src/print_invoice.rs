@@ -51,7 +51,7 @@ use std::str::FromStr;
 
 use aberp_audit_ledger::{BinaryHash, EventKind, Ledger, TenantId};
 use aberp_billing::{self as billing, BankAccountSnapshot, Currency, RateMetadata};
-use aberp_invoice_pdf::{render_invoice, InvoiceModel, LineItem as PdfLine, PartyInfo};
+use aberp_invoice_pdf::{render_invoice, InvoiceModel, LineItem as PdfLine, PartyInfo, TenantLogo};
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
 use quick_xml::events::Event;
@@ -195,6 +195,16 @@ pub fn render_to_bytes(
     let seller_info = read_seller_toml(&seller_toml_path)
         .with_context(|| format!("read seller-info TOML at {}", seller_toml_path.display()))?;
 
+    // PR-176 — load the optional tenant logo from `~/.aberp/<tenant>/logo.png`
+    // (or the parent of `seller_toml` when an explicit override is in
+    // play, mirroring the seller.toml resolution so test fixtures land
+    // the logo next to the toml). Absent file → `None`, no error,
+    // header falls back to text-only. Malformed PNG → loud error,
+    // caller sees the failure. The convention is documented in
+    // `README.md` + `docs/CUTOVER_RUNBOOK.md` per the brief.
+    let tenant_logo = load_tenant_logo(&seller_toml_path)
+        .with_context(|| format!("load tenant logo for {tenant} (PR-176)"))?;
+
     // PR-86 / session-111 — read the per-invoice bank snapshot stamped
     // at issuance (PR-73 / ADR-0040 §addendum-C). For invoices issued
     // after PR-73, this is the regulatory record of WHICH bank
@@ -290,6 +300,8 @@ pub fn render_to_bytes(
         lines,
         // PR-82 — invoice-level buyer note flows from the DuckDB read.
         note: invoice_notes.invoice_note,
+        // PR-176 — optional tenant-logo for the printed header.
+        tenant_logo,
     };
 
     // 7. Render.
@@ -1136,6 +1148,44 @@ pub fn parse_seller_toml(body: &str) -> Result<SellerToml> {
         }
     }
     Ok(out)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// PR-176 — tenant-logo convention load
+// ──────────────────────────────────────────────────────────────────────
+
+/// PR-176 — read the operator-supplied tenant logo from the convention
+/// path. Anchored on the same directory as the seller-info TOML, so
+/// the explicit `--seller-toml` override path naturally co-locates the
+/// logo next to the override (test fixtures, secondary tenant
+/// directories) while the default `~/.aberp/<tenant>/seller.toml`
+/// keeps the logo at `~/.aberp/<tenant>/logo.png`.
+///
+/// File absent → `Ok(None)`: the renderer falls back to the pre-PR-176
+/// text-only header. Decoding the bytes is also done here (rather than
+/// returning raw bytes for the renderer to decode) so a malformed PNG
+/// surfaces at the orchestrator boundary, which has anyhow context for
+/// the operator-actionable error message.
+fn load_tenant_logo(seller_toml_path: &Path) -> Result<Option<TenantLogo>> {
+    let logo_path = seller_toml_path
+        .parent()
+        .map(|parent| parent.join("logo.png"))
+        .ok_or_else(|| {
+            anyhow!(
+                "seller_toml path {} has no parent directory — cannot resolve logo.png alongside it",
+                seller_toml_path.display()
+            )
+        })?;
+    let bytes = match fs::read(&logo_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(anyhow!("read tenant logo at {}: {e}", logo_path.display()));
+        }
+    };
+    let logo = TenantLogo::from_png_bytes(&bytes)
+        .with_context(|| format!("decode tenant logo PNG at {}", logo_path.display()))?;
+    Ok(Some(logo))
 }
 
 // ──────────────────────────────────────────────────────────────────────

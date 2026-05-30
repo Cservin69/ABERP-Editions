@@ -36,6 +36,14 @@ rust_decimal = { workspace = true }
 # rate publication date per §1.a.
 time = { workspace = true }
 
+# PR-176 — PNG decode for the optional tenant-logo block in the printed
+# invoice header. Only decoded when the renderer is given a `TenantLogo`
+# (loaded from `~/.aberp/<tenant>/logo.png` by the binary-side
+# orchestrator); HUF + EUR sample renders that omit the logo do not
+# exercise it at all. PNG only by deliberate v1 scope per the brief
+# (SVG / JPG flagged as a follow-up).
+png = { workspace = true }
+
 [dev-dependencies]
 # Pin tests parse the rendered PDF back into text and assert every
 # §1.a field is present. Dev-dep only — production renderer does not

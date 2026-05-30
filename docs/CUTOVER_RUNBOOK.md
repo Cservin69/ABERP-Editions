@@ -228,6 +228,30 @@ What happens inside the binary as it boots:
 ki — ne kézzel szerkeszd a TOML-t. A backend atomikusan írja ki és
 megőrzi az invariánsokat (S148).
 
+### Step 3a — Drop the tenant logo (optional, PR-176)
+
+Place a PNG at `~/.aberp/<tenant>/logo.png` to brand the printed
+invoice header. Recommendations:
+
+- PNG only for v1 (SVG / JPG flagged as a follow-up).
+- ≤ 512×512 pixels — the renderer fits it inside a 50×50-point box
+  top-left of the header with aspect ratio preserved, so any square-
+  ish source works; oversized PNGs just waste decode bytes.
+- Transparent background (RGBA) is fine — alpha is dropped to RGB
+  against the page's implicit white background, so transparent edges
+  display their RGB ink (no black halo).
+
+Absent file → the header renders text-only (pre-PR-176 layout, all
+other invoice content unchanged). Malformed PNG → loud render error
+(re-export the file). No `seller.toml` edit, no DB row — convention
+only.
+
+```bash
+cp ~/Downloads/our-logo.png ~/.aberp/prod/logo.png
+# Verify by re-rendering an existing invoice's PDF; the logo appears
+# top-left of the header above the silver under-rule.
+```
+
 ---
 
 ## Step 4 — Populate NAV credentials (via SPA wizard)

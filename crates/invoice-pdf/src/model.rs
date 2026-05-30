@@ -10,6 +10,8 @@ use aberp_billing::{Currency, RateMetadata};
 use rust_decimal::Decimal;
 use time::Date;
 
+use crate::TenantLogo;
+
 /// The full set of data the renderer needs to produce one printed
 /// invoice. Built by the binary's `print_invoice` orchestration from
 /// the NAV XML on disk + the audit-ledger rate stamp + the tenant
@@ -47,6 +49,16 @@ pub struct InvoiceModel {
     /// The renderer prefixes the rate-source note for EUR invoices
     /// (e.g., "1 EUR = 356,69 Ft") above the operator's free text.
     pub note: Option<String>,
+    /// PR-176 — optional tenant logo embedded top-left of the printed
+    /// header. Convention-based: the orchestrator reads
+    /// `~/.aberp/<tenant>/logo.png`, decodes it via
+    /// [`TenantLogo::from_png_bytes`], and passes it here; an absent
+    /// file yields `None` (no error, no placeholder — the header
+    /// falls back to the text-only pre-PR-176 shape). The renderer
+    /// places the image aspect-preserved inside a fixed 50×50-pt box
+    /// and shifts the title cluster right by the box width + small
+    /// gap when present.
+    pub tenant_logo: Option<TenantLogo>,
 }
 
 /// Seller or buyer party data. Bank fields are SELLER-only; for the

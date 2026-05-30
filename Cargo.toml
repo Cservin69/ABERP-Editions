@@ -256,6 +256,18 @@ fs2 = "0.4"
 lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }
 pdf-extract = "0.7"
 
+# PR-176 — PNG decode for tenant-logo embedding on the printed-invoice
+# PDF header (convention `~/.aberp/<tenant>/logo.png`). Pure-Rust PNG
+# decoder, already transitively present via lopdf's deps; promoting to a
+# direct workspace pin per ADR-0021 §A0 ("pin on first direct use"). The
+# embed_image feature of lopdf was the alternative — rejected because it
+# pulls the full `image` umbrella crate (TIFF / WebP / GIF / BMP / etc.)
+# for a code path that only renders PNG. CLAUDE.md rule 13 — delete the
+# part: a 4-MB transitive bloat to satisfy a 50-LoC RGB-decode is exactly
+# the wrapper-around-one-consumed-field trap. Default features cover the
+# decoder.
+png = "0.17"
+
 # ── PR-92 additions — SMTP email delivery per ADR-0047 ──────────────
 #
 # `lettre` is the Rust SMTP client. Default features pull in OpenSSL

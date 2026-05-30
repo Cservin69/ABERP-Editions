@@ -425,3 +425,137 @@ fn printed_invoice_pdf_is_single_page() {
     let count = pdf_page_count(&pdf);
     assert_eq!(count, 1, "printed invoice must be exactly one A4 page");
 }
+
+// ── PR-176 — tenant logo convention ───────────────────────────────────
+
+/// Walk the PDF's page resources and check whether an `/XObject` map
+/// with an `Image`-subtype entry under `name` is present. The renderer
+/// registers the tenant logo under `Im1` in `crates/invoice-pdf/src/
+/// lib.rs::render_invoice`; this helper proves the operator-dropped
+/// PNG actually reached the PDF's resource dict rather than being
+/// silently swallowed.
+fn pdf_has_image_xobject(path: &Path, name: &str) -> bool {
+    let bytes = fs::read(path).expect("read PDF");
+    let doc = lopdf::Document::load_mem(&bytes).expect("lopdf load_mem");
+    let catalog_id = doc
+        .trailer
+        .get(b"Root")
+        .and_then(|o| match o {
+            Object::Reference(id) => Ok(*id),
+            _ => Err(lopdf::Error::ObjectNotFound),
+        })
+        .expect("catalog reference");
+    let catalog_dict = doc
+        .get_object(catalog_id)
+        .and_then(|o| o.as_dict().map_err(|_| lopdf::Error::ObjectNotFound))
+        .expect("catalog dict");
+    let pages_id = match catalog_dict.get(b"Pages").expect("Pages ref") {
+        Object::Reference(id) => *id,
+        _ => panic!("Pages not a reference"),
+    };
+    let pages_dict = doc
+        .get_object(pages_id)
+        .and_then(|o| o.as_dict().map_err(|_| lopdf::Error::ObjectNotFound))
+        .expect("Pages dict");
+    let resources_obj = pages_dict.get(b"Resources").expect("Resources");
+    let resources_dict = match resources_obj {
+        Object::Reference(id) => doc
+            .get_object(*id)
+            .and_then(|o| o.as_dict().map_err(|_| lopdf::Error::ObjectNotFound))
+            .expect("Resources dict"),
+        Object::Dictionary(d) => d,
+        _ => panic!("Resources unexpected shape"),
+    };
+    let xobject_map = match resources_dict.get(b"XObject") {
+        Ok(Object::Dictionary(d)) => d,
+        Ok(Object::Reference(id)) => doc
+            .get_object(*id)
+            .and_then(|o| o.as_dict().map_err(|_| lopdf::Error::ObjectNotFound))
+            .expect("XObject dict"),
+        _ => return false,
+    };
+    let img_ref = match xobject_map.get(name.as_bytes()) {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let img_id = match img_ref {
+        Object::Reference(id) => *id,
+        _ => return false,
+    };
+    let img = doc.get_object(img_id).expect("XObject object");
+    let stream = match img {
+        Object::Stream(s) => s,
+        _ => return false,
+    };
+    matches!(
+        stream.dict.get(b"Subtype"),
+        Ok(Object::Name(n)) if n == b"Image"
+    )
+}
+
+/// PR-176 — drop a PNG at `<dir>/logo.png` (the same dir the test's
+/// seller.toml lives in) and confirm the rendered PDF carries an Image
+/// XObject under the convention name. Absent → covered by every other
+/// test in this suite (none of them drop a logo and they all rendered
+/// successfully pre-PR-176, so the no-logo branch is the implicit
+/// negative case).
+#[test]
+fn tenant_logo_present_embeds_image_xobject() {
+    let invoice = fixture_ready_invoice(1000, rust_decimal::Decimal::from(1), 2700);
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = fixture_parties();
+    let wired = wire_invoice(
+        "logo-present",
+        &invoice,
+        &series,
+        &parties,
+        Currency::Huf,
+        None,
+    );
+
+    // Drop the fixture PNG next to where `run_print_invoice` writes
+    // the seller.toml override. `run_print_invoice` resolves the
+    // seller-toml override to `<dir>/seller.toml`; the logo lookup
+    // takes the same parent dir per `load_tenant_logo`.
+    let fixture_bytes =
+        fs::read("tests/fixtures/tenant_logo_64.png").expect("read tenant_logo_64.png fixture");
+    fs::write(wired.dir.join("logo.png"), &fixture_bytes).expect("drop logo.png");
+
+    let pdf = run_print_invoice(&wired);
+    assert!(
+        pdf_has_image_xobject(&pdf, "Im1"),
+        "convention-path logo.png must surface as an Image XObject (Im1) \
+         in the rendered PDF — operator-dropped PNG is silently lost otherwise",
+    );
+}
+
+/// PR-176 — when no `logo.png` is dropped at the convention path the
+/// renderer must NOT register an XObject map; the resources dict
+/// matches the pre-PR-176 shape exactly. Pin the absence so a future
+/// "always emit an empty XObject map" refactor doesn't regress the
+/// no-logo byte stability the rest of the suite relies on.
+#[test]
+fn tenant_logo_absent_renders_text_only_header() {
+    let invoice = fixture_ready_invoice(1000, rust_decimal::Decimal::from(1), 2700);
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = fixture_parties();
+    let wired = wire_invoice(
+        "logo-absent",
+        &invoice,
+        &series,
+        &parties,
+        Currency::Huf,
+        None,
+    );
+    // Deliberately do NOT drop a logo.png next to the seller-toml
+    // override. The render must succeed and the resources dict must
+    // not carry an XObject map.
+    let pdf = run_print_invoice(&wired);
+    assert!(
+        !pdf_has_image_xobject(&pdf, "Im1"),
+        "absent logo.png must yield a pre-PR-176-shaped PDF with no XObject map",
+    );
+    // The PDF still renders fully — confirm via the existing
+    // single-page invariant.
+    assert_eq!(pdf_page_count(&pdf), 1);
+}

@@ -104,6 +104,7 @@ fn sample_huf_short() -> InvoiceModel {
             note: None,
         }],
         note: None,
+        tenant_logo: None,
     }
 }
 
@@ -159,6 +160,7 @@ fn sample_eur_long() -> InvoiceModel {
              a számla sorszámát a közlemény mezőben."
                 .to_string(),
         ),
+        tenant_logo: None,
     }
 }
 
