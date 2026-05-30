@@ -2243,6 +2243,87 @@ impl IncomingInvoiceSyncCycleCompletedPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// InvoiceRestoredFromNav (S180)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::InvoiceRestoredFromNav`].
+///
+/// Written by the NAV-as-DR restore wizard
+/// (`POST /api/restore-from-nav-outgoing`) when one OUTGOING invoice
+/// is restored from NAV's `queryInvoiceDigest OUTBOUND` view into the
+/// local `restored_invoice` mirror table after a catastrophic local
+/// DB loss. ONE entry per row inserted; the per-cycle counts
+/// (restored / skipped / errored) ride the HTTP response body, not a
+/// separate audit kind — the wizard is operator-triggered, not a
+/// recurring daemon.
+///
+/// **No `invoice_id` field.** The canonical regulated outgoing
+/// invoices (`invoice` table) carry `invoice_id: String` referencing
+/// `inv_<ULID>`. A restored row's id (`rinv_<ULID>`) references the
+/// `restored_invoice` table, NOT `invoice` — naming the field
+/// distinctly (`restored_invoice_id`) surfaces the difference at
+/// every read site, mirroring S177's `ap_invoice_id` posture.
+///
+/// **Idempotency lookup key.** Re-running the wizard walks the
+/// audit ledger backward for prior `InvoiceRestoredFromNav` entries;
+/// a match on `source_nav_invoice_number` means "we already restored
+/// this NAV invoice in a prior run — skip." This is the single
+/// source of truth for idempotency per the session-180 brief; the
+/// `restored_invoice` table's UNIQUE constraint on
+/// `source_nav_invoice_number` is a defence-in-depth secondary gate.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct InvoiceRestoredFromNavPayload {
+    /// `rinv_<ULID>` — the local `restored_invoice` row's id, NEW
+    /// ULID minted at restore time. NOT an `inv_<ULID>` reference.
+    pub restored_invoice_id: String,
+    /// Operator-decision idempotency key. Mirrors every other audit
+    /// payload's F8 carry-forward shape. Minted fresh per restored
+    /// row; a re-run of the wizard for a row already-restored produces
+    /// no new entry (the audit-ledger walk short-circuits before the
+    /// key is minted).
+    pub idempotency_key: String,
+    /// NAV's `<invoiceNumber>` for this restored row, in the canonical
+    /// `<series>/<seq>` shape (e.g. `"INV-default/00042"`). Used as
+    /// the dedup lookup key on the audit-ledger walk for re-run
+    /// idempotency.
+    pub source_nav_invoice_number: String,
+    /// NAV's `<transactionId>` for the original submission, as the
+    /// digest reports it. Surfaces the NAV-side audit lineage so a
+    /// future forensic reader can correlate the restored row with the
+    /// original `manageInvoice` submission record on NAV.
+    pub source_nav_transaction_id: Option<String>,
+    /// Issue date in canonical `YYYY-MM-DD` form. Verbatim from the
+    /// digest's `<invoiceIssueDate>` element.
+    pub issue_date: String,
+    /// Total NET amount in the invoice's currency, expressed in minor
+    /// units (HUF: whole forints, EUR: cents). Same shape as
+    /// `IncomingInvoiceIngestedPayload`'s integer-minor-units posture.
+    pub total_net_minor: i64,
+    /// Total VAT amount in the invoice's currency, expressed in minor
+    /// units. Same shape as `total_net_minor`.
+    pub total_vat_minor: i64,
+    /// Total GROSS amount in the invoice's currency, expressed in
+    /// minor units. The wizard computes this as `net + vat` from the
+    /// digest's two component fields.
+    pub total_gross_minor: i64,
+    /// ISO 4217 currency code (`"HUF"` / `"EUR"` per the closed vocab
+    /// — pinned by `Currency::iso_code()` upstream).
+    pub currency: String,
+    /// The year window the wizard was invoked for (e.g. `2026`). The
+    /// wizard's date range was `YYYY-01-01..YYYY-12-31` paginated
+    /// by month internally; this field surfaces the operator-facing
+    /// scope on the audit entry so a future reader can re-derive the
+    /// "what was restored in this batch" set.
+    pub restore_year: i32,
+}
+
+impl InvoiceRestoredFromNavPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 

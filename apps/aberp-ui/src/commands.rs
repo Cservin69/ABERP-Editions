@@ -695,6 +695,27 @@ pub async fn sync_incoming_invoices_now(state: State<'_, AppState>) -> Result<Va
     forward_post(&state, "/api/incoming-invoices/sync-now", Value::Null).await
 }
 
+/// S180 / PR-180 — operator-clicked NAV-as-DR restore wizard.
+/// `POST /api/restore-from-nav-outgoing { year }`. Synchronous (walks
+/// 12 months × pagination against NAV); the SPA gates the click on
+/// the "type RESTORE" confirmation. Returns `RestoreSummary` for the
+/// result panel.
+#[tauri::command]
+pub async fn restore_from_nav_outgoing(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/restore-from-nav-outgoing", body).await
+}
+
+/// S180 / PR-180 — list every restored invoice for the tenant. Used
+/// by the wizard's "already-restored" panel + the upcoming
+/// restored-invoice list view.
+#[tauri::command]
+pub async fn list_restored_invoices(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/restored-invoices", true).await
+}
+
 /// PR-45a / session-61 — the SPA's Retry button calls this command
 /// from the "backend boot failed" error pane. Spawns a fresh
 /// `boot_backend` attempt; the SPA continues polling

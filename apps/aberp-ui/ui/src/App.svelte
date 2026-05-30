@@ -67,6 +67,9 @@
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
   import PartnersList from "./routes/PartnersList.svelte";
   import ProductsList from "./routes/ProductsList.svelte";
+  // S180 / PR-180 — NAV-as-DR restore wizard, mounted at
+  // `#/restore-from-nav` under the maintenance area.
+  import RestoreFromNavWizard from "./routes/RestoreFromNavWizard.svelte";
   import SellerConfigWizard from "./routes/SellerConfigWizard.svelte";
   import SetupWizard from "./routes/SetupWizard.svelte";
   import TenantSettings from "./routes/TenantSettings.svelte";
@@ -455,6 +458,8 @@
           <ProductsList />
         {:else if route === "maintenance"}
           <MaintenanceDashboard />
+        {:else if route === "restore-from-nav"}
+          <RestoreFromNavWizard />
         {:else if route === "invoices-new"}
           <!-- PR-87 / session-112 — full-page issuance route. The
                IssueInvoice form was a `<dialog>` modal mounted inside

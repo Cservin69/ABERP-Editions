@@ -655,7 +655,14 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // on the payload (the per-cycle ingestions emit their own
         // `IncomingInvoiceIngested` entries, which themselves carry
         // no NAV bytes in the bundle either).
-        | EventKind::IncomingInvoiceSyncCycleCompleted => None,
+        | EventKind::IncomingInvoiceSyncCycleCompleted
+        // S180 / PR-180 — NAV-as-DR restore event. The restored row
+        // lives in `restored_invoice` (not `invoice`), so this kind
+        // is `system.`-scoped and never sweeps a per-outgoing-invoice
+        // bundle. v1 is digest-only — no verbatim NAV XML rides the
+        // payload; the typed digest fields (invoice_number, totals,
+        // issue_date, currency, transaction_id) live in chain.jsonl.
+        | EventKind::InvoiceRestoredFromNav => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

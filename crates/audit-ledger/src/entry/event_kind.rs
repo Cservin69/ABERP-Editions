@@ -672,6 +672,48 @@ pub enum EventKind {
     /// the per-OUTGOING-invoice export bundle's `invoice.*` glob
     /// MUST NEVER sweep this. F12 four-edit ritual fires once.
     IncomingInvoiceSyncCycleCompleted,
+
+    /// S180 / PR-180 — one outgoing invoice was restored from NAV's
+    /// `queryInvoiceDigest OUTBOUND` view into the local
+    /// `restored_invoice` mirror table. The operator-triggered wizard
+    /// at `POST /api/restore-from-nav-outgoing` writes ONE entry per
+    /// row inserted; there is no per-cycle summary kind because the
+    /// wizard is operator-paced, not a recurring daemon — the
+    /// HTTP response body carries the {restored, skipped, errored}
+    /// counts directly.
+    ///
+    /// Payload (`InvoiceRestoredFromNavPayload`) carries the local
+    /// `restored_invoice.id` (`rinv_<ULID>` — a NEW ULID minted at
+    /// restore time per the S180 brief), the operator-decision
+    /// idempotency key, NAV's `source_nav_invoice_number` (the
+    /// canonical `<series>/<seq>` shape — the lookup key for
+    /// idempotency), NAV's `source_nav_transaction_id` from the
+    /// digest, the `issue_date` (YYYY-MM-DD), totals + currency, and
+    /// the `year` window the wizard was invoked for.
+    ///
+    /// **NOT `invoice.`-prefixed — `system.`-prefixed.** The restored
+    /// row lives in `restored_invoice` (NOT `invoice`) so the
+    /// per-OUTGOING-invoice export bundle's `invoice.*` glob must
+    /// NEVER sweep it. The canonical regulated invoice surface
+    /// (`invoice` table, audit chain `InvoiceDraftCreated → … →
+    /// InvoiceAckStatus(SAVED)`) is the operator's record for
+    /// invoices ISSUED on this tenant; a restored row is a
+    /// RECOVERED VIEW of an invoice NAV already holds, not a
+    /// re-issuance. Treating them identically would corrupt the
+    /// per-invoice export bundle, the audit-chain stuck-precondition
+    /// walker, and the printed-PDF render path.
+    ///
+    /// **v1 is digest-only.** Same conservative posture S178 took
+    /// with `IncomingInvoiceSyncCycleCompleted` — the wizard does
+    /// NOT fan out per-digest `queryInvoiceData` calls. The
+    /// `restored_invoice` row carries the typed fields the digest
+    /// emits (invoice_number, issue_date, totals, currency,
+    /// transaction_id); line-item extraction + customer extraction
+    /// are deferred to v2 along with partner/product extraction per
+    /// the session-180 brief's explicit scope-cap.
+    ///
+    /// F12 four-edit ritual fires once.
+    InvoiceRestoredFromNav,
 }
 
 impl EventKind {
@@ -712,6 +754,7 @@ impl EventKind {
             EventKind::IncomingInvoiceSyncCycleCompleted => {
                 "system.incoming_invoice_sync_cycle_completed"
             }
+            EventKind::InvoiceRestoredFromNav => "system.invoice_restored_from_nav",
         }
     }
 
@@ -763,6 +806,7 @@ impl EventKind {
             "system.incoming_invoice_sync_cycle_completed" => {
                 Ok(EventKind::IncomingInvoiceSyncCycleCompleted)
             }
+            "system.invoice_restored_from_nav" => Ok(EventKind::InvoiceRestoredFromNav),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -808,6 +852,7 @@ mod tests {
             EventKind::IncomingInvoiceIngested,
             EventKind::IncomingInvoiceStatusChanged,
             EventKind::IncomingInvoiceSyncCycleCompleted,
+            EventKind::InvoiceRestoredFromNav,
         ];
         for v in variants {
             let s = v.as_str();
@@ -1344,6 +1389,41 @@ mod tests {
         assert_ne!(
             EventKind::IncomingInvoiceSyncCycleCompleted.as_str(),
             EventKind::IncomingInvoiceStatusChanged.as_str()
+        );
+    }
+
+    /// S180 / PR-180 — NAV-as-DR restore event. `system.`-prefixed so
+    /// the per-OUTGOING-invoice export bundle's `invoice.*` glob NEVER
+    /// sweeps a restored row (a restored row lives in
+    /// `restored_invoice`, NOT `invoice` — it is a recovered VIEW of
+    /// what NAV holds, not a re-issuance on this tenant).
+    #[test]
+    fn s180_invoice_restored_from_nav_uses_system_prefix() {
+        assert_eq!(
+            EventKind::InvoiceRestoredFromNav.as_str(),
+            "system.invoice_restored_from_nav"
+        );
+        assert!(EventKind::InvoiceRestoredFromNav
+            .as_str()
+            .starts_with("system."));
+        assert!(!EventKind::InvoiceRestoredFromNav
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// S180 / PR-180 — distinct discriminator from every prior AP kind
+    /// (restore is an operator-triggered recovery, not an AP-side
+    /// ingestion or status change). Same fork-discipline posture as
+    /// the other `*_is_distinct_from` tests.
+    #[test]
+    fn s180_invoice_restored_from_nav_is_distinct_from_ap_kinds() {
+        assert_ne!(
+            EventKind::InvoiceRestoredFromNav.as_str(),
+            EventKind::IncomingInvoiceIngested.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceRestoredFromNav.as_str(),
+            EventKind::IncomingInvoiceSyncCycleCompleted.as_str()
         );
     }
 }

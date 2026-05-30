@@ -52,6 +52,7 @@ pub mod print_invoice;
 pub mod products;
 pub mod recover_from_nav;
 pub mod request_technical_annulment;
+pub mod restore_from_nav_outgoing;
 pub mod retry_submission;
 pub mod secrets_cache;
 pub mod seller_banks;

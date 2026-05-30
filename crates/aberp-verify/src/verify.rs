@@ -776,7 +776,13 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // S178 / PR-178 — AP-side auto-sync cycle-completion event.
         // Same posture as the other AP-side kinds: `system.`-scoped,
         // no NAV-side XML on the payload (cycle summary only).
-        | EventKind::IncomingInvoiceSyncCycleCompleted => (None, ""),
+        | EventKind::IncomingInvoiceSyncCycleCompleted
+        // S180 / PR-180 — NAV-as-DR restore event. Same posture as the
+        // AP-side kinds: `system.`-scoped, no NAV-side XML on the
+        // payload (v1 is digest-only). A future v2 that calls
+        // queryInvoiceData per row could pin XML bytes on disk; today
+        // the verifier mirrors the bundle writer's no-bytes posture.
+        | EventKind::InvoiceRestoredFromNav => (None, ""),
     };
 
     Ok(NavExtraction {

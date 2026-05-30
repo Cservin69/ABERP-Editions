@@ -1768,3 +1768,41 @@ export async function markIncomingIrrelevant(
 export async function syncIncomingInvoicesNow(): Promise<SyncIncomingNowResponse> {
   return invoke<SyncIncomingNowResponse>("sync_incoming_invoices_now");
 }
+
+// ── S180 / PR-180 — NAV-as-DR restore wizard ────────────────────────
+
+/** Mirror of `restore_from_nav_outgoing::RestoreSummary`. The wizard
+ * renders every field; a backend rename surfaces at `npm run check`. */
+export interface RestoreSummary {
+  year: number;
+  restored: number;
+  skipped: number;
+  errored: number;
+  pages_walked: number;
+  elapsed_ms: number;
+}
+
+/** Mirror of `restore_from_nav_outgoing::RestoredInvoice` — one
+ * row in the local `restored_invoice` table. */
+export interface RestoredInvoice {
+  id: string;
+  source_nav_invoice_number: string;
+  source_nav_transaction_id: string | null;
+  issue_date: string;
+  total_net_minor: number;
+  total_vat_minor: number;
+  total_gross_minor: number;
+  currency: Currency;
+  restore_year: number;
+  created_at: string;
+}
+
+export async function restoreFromNavOutgoing(year: number): Promise<RestoreSummary> {
+  return invoke<RestoreSummary>("restore_from_nav_outgoing", {
+    body: { year },
+  });
+}
+
+export async function listRestoredInvoices(): Promise<RestoredInvoice[]> {
+  return invoke<RestoredInvoice[]>("list_restored_invoices");
+}

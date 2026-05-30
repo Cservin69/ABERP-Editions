@@ -32,6 +32,7 @@
     getSellerInfo,
     listPartners,
     listProducts,
+    listRestoredInvoices,
     listSellerBanks,
     type NavCredentialsStatusResponse,
     type SellerInfoResponse,
@@ -167,6 +168,15 @@
       case "NavCredStatus": {
         const status = await getNavCredentialsStatus();
         return renderNavCredStatus(status);
+      }
+      case "RestoredInvoiceCount": {
+        // S180 / PR-180 — count of rows in the local
+        // `restored_invoice` mirror. "0 restored" reads as "DR not
+        // yet exercised on this tenant" which is the operator's
+        // expected default.
+        const rows = await listRestoredInvoices();
+        const n = rows.length;
+        return n === 1 ? "1 restored invoice" : `${n} restored invoices`;
       }
     }
   }

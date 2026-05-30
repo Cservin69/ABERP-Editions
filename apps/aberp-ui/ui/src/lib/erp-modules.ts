@@ -132,6 +132,9 @@ export const MODULES: ErpModule[] = [
     routes: [
       { id: "tenant", label: "Tenant settings" },
       { id: "nav-credentials", label: "NAV credentials" },
+      // S180 / PR-180 — NAV-as-DR restore wizard. Maintenance-area
+      // route under Settings (rare-touch, load-bearing-when-touched).
+      { id: "restore-from-nav", label: "Restore from NAV" },
     ],
   },
 ];
@@ -264,7 +267,12 @@ export type MaintenanceTileStatusKind =
   | "PartnerCount"
   | "ProductCount"
   | "BankAccountCount"
-  | "NavCredStatus";
+  | "NavCredStatus"
+  // S180 / PR-180 — count of already-restored invoices in the
+  // `restored_invoice` mirror table. The tile's chip surfaces "N
+  // restored rows" so the operator can see at a glance whether
+  // disaster recovery has been used.
+  | "RestoredInvoiceCount";
 
 /** One tile on the maintenance landing dashboard. The dashboard
  * renders the tiles grouped under their sub-area headers (today:
@@ -323,5 +331,17 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Technikai felhasználó és kulcsok",
     description_en: "Technical user & keys",
     statusKind: "NavCredStatus",
+  },
+  // S180 / PR-180 — NAV-as-DR restore wizard tile. Operator-touch
+  // surface for "the local DuckDB is gone — pull our year-of-record
+  // from NAV." Rare-touch, load-bearing-when-touched.
+  {
+    moduleId: "settings",
+    route: "restore-from-nav",
+    label_hu: "Visszaállítás NAV-ból",
+    label_en: "Restore from NAV",
+    description_hu: "Vészhelyzeti adat-visszaállítás",
+    description_en: "Disaster recovery — restore invoice data",
+    statusKind: "RestoredInvoiceCount",
   },
 ];

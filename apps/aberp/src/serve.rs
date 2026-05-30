@@ -120,6 +120,7 @@ use crate::partners::{self, Partner, PartnerInputs, ValidationError as PartnerVa
 use crate::poll_ack;
 use crate::print_invoice;
 use crate::products::{self, Product, ProductInputs, ValidationError as ProductValidationError};
+use crate::restore_from_nav_outgoing as restore_outgoing;
 use crate::secrets_cache::SecretsCache;
 use crate::seller_banks::{self, SellerBankEntry, SellerBanks, SellerBanksError};
 use crate::setup_nav_credentials::{self, NavCredentialInputs, SetupCredentialsError};
@@ -701,6 +702,22 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         })?;
         incoming_invoices::ensure_schema(&conn)
             .context("ensure ap_invoice schema at serve boot")?;
+    }
+
+    // S180 / PR-180 — pin the `restored_invoice` schema at boot, same
+    // posture as `ap_invoice`. The route layer also calls
+    // `ensure_schema` defensively so a fresh DB + first wizard
+    // invocation does not 500.
+    {
+        let _s = tracing::info_span!("serve.ensure_restored_invoice_schema").entered();
+        let conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for restored_invoice boot migration",
+                args.db.display()
+            )
+        })?;
+        restore_outgoing::ensure_schema(&conn)
+            .context("ensure restored_invoice schema at serve boot")?;
     }
 
     // Session 152b — reconcile the audit-ledger mirror against the DB
@@ -1490,6 +1507,19 @@ fn build_router(state: AppState) -> Router {
             "/api/incoming-invoices/sync-now",
             post(handle_sync_incoming_now),
         )
+        // S180 / PR-180 — NAV-as-DR restore wizard. POST { year }
+        // walks NAV's `queryInvoiceDigest OUTBOUND` view for that
+        // year and mirrors each new digest into the local
+        // `restored_invoice` table. Operator-triggered; require_ready
+        // + bearer auth; synchronous (12 months × pagination, may
+        // take several seconds on a populated tenant). GET lists
+        // every restored row for the tenant — used by the wizard
+        // to render the "already-restored" panel.
+        .route(
+            "/api/restore-from-nav-outgoing",
+            post(handle_restore_from_nav_outgoing),
+        )
+        .route("/api/restored-invoices", get(handle_list_restored_invoices))
         // PR-72 / session-94 — multi-bank-account CRUD (PR-B of the
         // multi-bank initiative; ADR-0040 §addendum). Five routes
         // (list + create on the collection; update + delete + flip-
@@ -6671,6 +6701,104 @@ async fn build_ap_sync_inputs(
 fn ap_artifacts_dir(tenant: &str) -> Result<PathBuf> {
     let home = dirs_home_or_loud_fail()?;
     Ok(home.join(".aberp").join(tenant).join("ap-artifacts"))
+}
+
+// ── S180 / PR-180 — NAV-as-DR restore wizard ─────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct RestoreFromNavOutgoingRequest {
+    year: i32,
+}
+
+async fn handle_restore_from_nav_outgoing(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<RestoreFromNavOutgoingRequest>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    // Early year-validation so a 2017 request 400s before the NAV
+    // pipeline boots.
+    if let Err(msg) = restore_outgoing::validate_year(body.year, time::OffsetDateTime::now_utc()) {
+        return (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response();
+    }
+    let inputs = match build_restore_inputs(&state, operator_login, body.year).await {
+        Ok(v) => v,
+        Err(e) => return internal_error("restore_from_nav_outgoing:build_inputs", e),
+    };
+    match restore_outgoing::run(inputs).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(error_body(format!("{e:#}")))).into_response(),
+    }
+}
+
+async fn handle_list_restored_invoices(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match restore_outgoing::list_restored(&state.db_path, state.tenant.as_str()) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => internal_error("list_restored_invoices", e),
+    }
+}
+
+/// Build the `RestoreInputs` for the wizard. Loads NAV credentials
+/// from the keychain, resolves the tenant's 8-digit tax-number head
+/// from seller.toml, picks the compile-time NAV endpoint (same
+/// prod-flag posture as `build_ap_sync_inputs`).
+async fn build_restore_inputs(
+    state: &AppState,
+    operator_login: String,
+    year: i32,
+) -> Result<restore_outgoing::RestoreInputs> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute for restore-from-nav inputs")?;
+    let credentials =
+        NavCredentials::load_from_keychain(state.tenant.as_str()).with_context(|| {
+            format!(
+                "load NAV credentials from OS keychain for tenant `{}` (restore-from-nav)",
+                state.tenant.as_str()
+            )
+        })?;
+    let supplier = supplier_from_seller_toml(state.tenant.as_str()).map_err(|e| {
+        anyhow!(
+            "load supplier identity from seller.toml for restore-from-nav (tenant `{}`): {:?}",
+            state.tenant.as_str(),
+            e
+        )
+    })?;
+    let parsed = nav_xml::parse_hungarian_tax_number(&supplier.tax_number).map_err(|e| {
+        anyhow!(
+            "parse supplier tax number `{}` for restore-from-nav: {:?}",
+            supplier.tax_number,
+            e
+        )
+    })?;
+    let endpoint = build_profile::nav_endpoint();
+    build_profile::assert_endpoint_allowed(endpoint)?;
+    Ok(restore_outgoing::RestoreInputs {
+        db_path: (*state.db_path).clone(),
+        tenant: state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        tax_number_8: parsed.taxpayer_id,
+        endpoint,
+        credentials,
+        year,
+    })
 }
 
 // ── PR-72 / session-94 — multi-bank-account routes ───────────────────

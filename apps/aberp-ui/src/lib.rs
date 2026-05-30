@@ -248,6 +248,11 @@ pub fn run() {
             commands::mark_incoming_outstanding,
             commands::mark_incoming_irrelevant,
             commands::sync_incoming_invoices_now,
+            // S180 / PR-180 — NAV-as-DR restore wizard. Two
+            // commands: trigger the wizard (POST { year }) and list
+            // already-restored rows.
+            commands::restore_from_nav_outgoing,
+            commands::list_restored_invoices,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

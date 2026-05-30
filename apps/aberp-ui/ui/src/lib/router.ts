@@ -31,7 +31,8 @@ export type AppRoute =
   | "nav-credentials"
   | "partners"
   | "products"
-  | "maintenance";
+  | "maintenance"
+  | "restore-from-nav";
 
 /** Default route the SPA falls back to on first paint (or on a hash
  * with an unknown slug). The Invoices list was the only screen
@@ -77,6 +78,8 @@ export function parseRoute(hash: string): AppRoute {
       return "products";
     case "maintenance":
       return "maintenance";
+    case "restore-from-nav":
+      return "restore-from-nav";
     default:
       return DEFAULT_ROUTE;
   }

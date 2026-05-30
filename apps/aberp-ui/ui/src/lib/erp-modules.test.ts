@@ -77,6 +77,8 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   products: "master-data",
   tenant: "settings",
   "nav-credentials": "settings",
+  // S180 / PR-180 — NAV-as-DR restore wizard, settings-grouped.
+  "restore-from-nav": "settings",
 };
 
 // The expected area for each AppRoute. The two-area usage-frequency
@@ -92,6 +94,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   tenant: "maintenance",
   "nav-credentials": "maintenance",
   maintenance: "maintenance",
+  // S180 / PR-180 — NAV-as-DR restore wizard.
+  "restore-from-nav": "maintenance",
 };
 
 // Closed-vocab set of accepted status kinds on a maintenance tile.
@@ -100,7 +104,14 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
 // this set widens alongside — there is no "Other" bucket.
 const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   MaintenanceTileStatusKind
->(["PartnerCount", "ProductCount", "BankAccountCount", "NavCredStatus"]);
+>([
+  "PartnerCount",
+  "ProductCount",
+  "BankAccountCount",
+  "NavCredStatus",
+  // S180 / PR-180 — NAV-as-DR restore wizard tile.
+  "RestoredInvoiceCount",
+]);
 
 // Every area must have a stable bilingual label and at least one
 // module — the chrome's topbar gear/back affordance assumes both.
