@@ -1,0 +1,1497 @@
+//! AP-side (Accounts Payable) incoming-invoice store + status workflow.
+//!
+//! S177 / PR-177 — the BACKEND half of the AP module v1.
+//!
+//! # Scope
+//!
+//! INCOMING invoices are issued BY suppliers TO this tenant. They are
+//! NOT outgoing invoices and they are NOT regulated by NAV's
+//! per-invoice sequence allocator (the tenant did not issue them, did
+//! not burn a sequence slot, has no NAV `<invoiceReference>` chain).
+//! The local mirror exists so the operator can:
+//!
+//!   1. See every supplier invoice in one place (eventually pulled
+//!      from NAV automatically via `queryInvoiceDigest INBOUND` — that
+//!      auto-sync is a SEPARATE follow-on PR; see the deferred-work
+//!      note below).
+//!   2. Annotate each one as `Outstanding` (default) → `Paid` (the
+//!      tenant paid the supplier) → `Outstanding` (operator unwinds)
+//!      OR `Outstanding` → `Irrelevant{reason}` (operator declares
+//!      the invoice not-our-problem with a required justification).
+//!
+//! NAV is the source of truth for the invoice's facts (supplier, dates,
+//! totals); ABERP adds only the local annotation status + the audit
+//! trail of operator decisions.
+//!
+//! # Architecture decisions for THIS PR (S177)
+//!
+//!   - **Schema lives in this binary, not in `aberp-billing`.** The
+//!     billing module owns the outgoing-invoice allocator + the
+//!     regulated NAV state ladder (ADR-0009). Incoming invoices have
+//!     none of that — coupling them to billing would burden the
+//!     regulated path with operator-metadata concerns. Same posture
+//!     `partners` and `products` take (per-tenant operator-managed
+//!     data lives in the binary, not the regulated module).
+//!   - **No foreign keys** per ADR-0019. The `ap_invoice` table is
+//!     keyed by `(supplier_tax_number, nav_invoice_number)` for
+//!     idempotency on ingestion; the audit chain reaches the row by
+//!     ULID-prefixed `apinv_<ULID>` id.
+//!   - **Closed-vocab `IncomingInvoiceStatus`** per CLAUDE.md rule 5
+//!     (deterministic transitions; the operator's choice is the only
+//!     model-side judgment, and even there the wire vocab is a
+//!     three-state enum).
+//!   - **Audit kinds use `system.` prefix**, not `invoice.`, so the
+//!     per-OUTGOING-invoice export bundle's `invoice.*` glob never
+//!     sweeps an AP-side entry. See
+//!     `crates/audit-ledger/src/entry/event_kind.rs::IncomingInvoiceIngested`.
+//!   - **Idempotent ingestion.** Re-ingesting the same supplier's
+//!     same invoice number is a no-op — the `UNIQUE
+//!     (supplier_tax_number, nav_invoice_number)` constraint surfaces
+//!     duplicates loud, and the helper returns the EXISTING row's id
+//!     so the caller can echo it. Matches the operator-twin's mental
+//!     model: NAV will re-emit the same digest on every poll; the
+//!     daemon must not multiply rows.
+//!
+//! # Deferred-work flags
+//!
+//!   - **Auto-sync via `queryInvoiceDigest INBOUND` is a SEPARATE
+//!     PR.** `nav-transport` does not yet provide the digest envelope
+//!     renderer or the digest-list response parser — adding it
+//!     requires NAV-testbed verification of the response shape (per
+//!     the same posture every prior NAV operation took; see
+//!     `render_query_invoice_data_request` for the precedent comment).
+//!     The session-177 brief named the daemon as part of this PR, but
+//!     the conservative call is to land the foundation first so S178's
+//!     UI is unblocked and the daemon can be wired in a dedicated PR
+//!     with its own NAV-testbed verification window. The
+//!     [`ingest_incoming_invoice`] helper below is the exact entry
+//!     point the future daemon will call.
+//!   - **Raw NAV XML storage.** When the caller supplies a raw NAV
+//!     InvoiceData XML, the bytes are written to
+//!     `~/.aberp/<tenant>/ap-artifacts/<apinv_id>.xml` (matching the
+//!     outgoing side's `nav_xml` path posture from PR-18). The audit
+//!     payload carries the SHA-256 hex of those bytes for tamper-
+//!     detection; the raw bytes themselves are NOT in the payload (the
+//!     hash chain stays compact; an inspector can fetch the bytes from
+//!     the well-known path).
+//!   - **NAV XML parsing.** This module DOES NOT parse the NAV
+//!     InvoiceData XML — the caller (the operator's manual ingest, or
+//!     the future daemon) extracts the typed fields and passes them
+//!     in. Building a full NAV InvoiceData parser is out of scope for
+//!     S177 (it's the symmetric counterpart of `nav_xml.rs` on the
+//!     emit side — substantial work that belongs in its own PR with
+//!     fixture-based test coverage).
+
+use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
+use aberp_billing::IdempotencyKey;
+use anyhow::{anyhow, Context, Result};
+use duckdb::{params, Connection};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+use ulid::Ulid;
+
+use crate::audit_payloads::{IncomingInvoiceIngestedPayload, IncomingInvoiceStatusChangedPayload};
+
+// ──────────────────────────────────────────────────────────────────────
+// IncomingInvoiceId — prefixed-ULID newtype (`apinv_<26-char-ULID>`).
+// ──────────────────────────────────────────────────────────────────────
+
+/// ULID newtype rendered as `apinv_<26-char-ULID>` on the wire.
+/// Mirrors `ProductId` / `PartnerId` per ADR-0005 — every entity gets
+/// its own prefixed-ULID newtype so type confusion at a call site is
+/// a compile error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct IncomingInvoiceId(pub Ulid);
+
+impl IncomingInvoiceId {
+    pub fn new() -> Self {
+        Self(Ulid::new())
+    }
+
+    pub fn to_prefixed_string(self) -> String {
+        format!("apinv_{}", self.0)
+    }
+
+    pub fn parse_prefixed(s: &str) -> Result<Self> {
+        let body = s.strip_prefix("apinv_").ok_or_else(|| {
+            anyhow!(
+                "incoming-invoice id `{}` missing `apinv_` prefix per ADR-0005",
+                s
+            )
+        })?;
+        let ulid = Ulid::from_string(body).map_err(|e| {
+            anyhow!(
+                "incoming-invoice id `{}` body is not a valid 26-char ULID: {}",
+                s,
+                e
+            )
+        })?;
+        Ok(Self(ulid))
+    }
+}
+
+impl Default for IncomingInvoiceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// IncomingInvoiceStatus — closed-vocab three-state enum.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Operator-decided status of an AP-side incoming invoice.
+///
+/// Closed vocab per CLAUDE.md rule 5. Transitions allowed by this PR:
+///
+///   - Ingestion default → `Outstanding`.
+///   - `Outstanding` → `Paid` (operator records payment).
+///   - `Outstanding` → `Irrelevant` (operator declares not-our-problem;
+///     reason required).
+///   - `Paid` → `Outstanding` (operator unwinds a prior `Paid` mark).
+///   - `Irrelevant` → `Outstanding` (operator unwinds a prior
+///     `Irrelevant` mark).
+///
+/// `Paid` → `Irrelevant` and vice versa are NOT permitted in v1 — the
+/// route layer rejects them with 400 to surface the conflict per
+/// CLAUDE.md rule 7. The operator who needs that transition can clear
+/// to `Outstanding` first; the audit chain records both steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncomingInvoiceStatus {
+    /// Initial state at ingestion and the canonical "default" status.
+    Outstanding,
+    /// The tenant paid the supplier. The audit chain carries
+    /// who/when/why via `IncomingInvoiceStatusChanged`.
+    Paid,
+    /// Operator declared the invoice not-our-problem (typical reasons:
+    /// duplicate of another supplier's emission, supplier billed wrong
+    /// tenant, test invoice that ended up in production). The audit
+    /// payload's `reason` field is REQUIRED for this transition.
+    Irrelevant,
+}
+
+impl IncomingInvoiceStatus {
+    /// Render in the on-disk + wire form. Paired with
+    /// [`Self::from_storage_str`] as a round-trip-proven pair (unit
+    /// test below).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IncomingInvoiceStatus::Outstanding => "Outstanding",
+            IncomingInvoiceStatus::Paid => "Paid",
+            IncomingInvoiceStatus::Irrelevant => "Irrelevant",
+        }
+    }
+
+    /// Parse the on-disk form back into a status. Errors on unknown
+    /// strings — silent fallback would mask schema drift per
+    /// CLAUDE.md rule 12 (fail loud).
+    pub fn from_storage_str(s: &str) -> Result<Self> {
+        match s {
+            "Outstanding" => Ok(IncomingInvoiceStatus::Outstanding),
+            "Paid" => Ok(IncomingInvoiceStatus::Paid),
+            "Irrelevant" => Ok(IncomingInvoiceStatus::Irrelevant),
+            other => Err(anyhow!(
+                "unknown IncomingInvoiceStatus storage string: `{}` \
+                 (expected `Outstanding` / `Paid` / `Irrelevant`)",
+                other
+            )),
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// IncomingInvoice — read model.
+// ──────────────────────────────────────────────────────────────────────
+
+/// The full row shape served to read-side callers (list + detail).
+///
+/// Mirrors the `ap_invoice` table 1:1 with one transform: the
+/// `local_status` column is a string in the DB and the typed enum on
+/// the wire (serde-renames at the boundary).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncomingInvoice {
+    pub id: String,
+    pub supplier_tax_number: String,
+    pub supplier_name: String,
+    pub supplier_address: Option<String>,
+    pub nav_invoice_number: String,
+    pub issue_date: String,
+    pub delivery_date: Option<String>,
+    pub payment_deadline: Option<String>,
+    pub total_net_minor: i64,
+    pub total_vat_minor: i64,
+    pub total_gross_minor: i64,
+    pub currency: String,
+    /// Closed vocab — `IncomingInvoiceStatus::as_str` output.
+    pub local_status: String,
+    /// `Some(_)` IFF `local_status == "Irrelevant"`. The route layer
+    /// enforces this invariant at write time.
+    pub irrelevant_reason: Option<String>,
+    /// Filesystem path to the raw NAV InvoiceData XML, `None` for
+    /// operator-typed entries with no XML supplied. The audit
+    /// payload's `nav_xml_sha256` is the tamper-detection hash for
+    /// these bytes.
+    pub nav_xml_path: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// IngestionInput — typed input shape for the ingestion entry point.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Inputs to [`ingest_incoming_invoice`]. The caller (manual route
+/// handler or future auto-sync daemon) extracts these fields from the
+/// supplier's NAV InvoiceData XML — this module does NOT parse XML
+/// itself per the architecture decision named in the module docs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IngestionInput {
+    pub supplier_tax_number: String,
+    pub supplier_name: String,
+    pub supplier_address: Option<String>,
+    pub nav_invoice_number: String,
+    pub issue_date: String,
+    pub delivery_date: Option<String>,
+    pub payment_deadline: Option<String>,
+    pub total_net_minor: i64,
+    pub total_vat_minor: i64,
+    pub total_gross_minor: i64,
+    pub currency: String,
+    /// Raw NAV InvoiceData XML bytes, if available. The wire shape
+    /// is base64 (so JSON-safe); the deserializer decodes inline.
+    /// When present, the bytes are written to
+    /// `~/.aberp/<tenant>/ap-artifacts/<id>.xml` and the SHA-256 hex
+    /// lands in the audit payload.
+    #[serde(default, deserialize_with = "deserialize_optional_base64")]
+    pub nav_xml: Option<Vec<u8>>,
+}
+
+fn deserialize_optional_base64<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use base64::Engine;
+    use serde::Deserialize;
+    let opt = Option::<String>::deserialize(deserializer)?;
+    match opt {
+        Some(s) => base64::engine::general_purpose::STANDARD
+            .decode(s.as_bytes())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
+
+/// Outcome of [`ingest_incoming_invoice`].
+#[derive(Debug, Clone)]
+pub enum IngestOutcome {
+    /// A new row was inserted and an audit entry written.
+    Created { id: String },
+    /// The (supplier_tax_number, nav_invoice_number) pair already
+    /// existed; no row was inserted, no audit entry was written. The
+    /// returned id is the EXISTING row's id so the caller can echo it.
+    AlreadyExists { id: String },
+}
+
+/// Outcome of a status transition.
+#[derive(Debug, Clone)]
+pub struct StatusChangeOutcome {
+    pub id: String,
+    pub from_status: String,
+    pub to_status: String,
+    pub reason: Option<String>,
+    pub entries_verified: u64,
+}
+
+/// Typed errors from the status-change path. The route layer maps
+/// each variant to the right HTTP status — same closed-vocab posture
+/// as `MarkPaidError`.
+#[derive(Debug)]
+pub enum StatusChangeError {
+    /// Unknown `ap_invoice_id`. Maps to 404.
+    NotFound,
+    /// Operator asked for a transition the closed graph does not
+    /// allow (e.g., `Paid` → `Irrelevant` directly). Maps to 400.
+    InvalidTransition { from: String, to: String },
+    /// `to_status == "Irrelevant"` but no `reason` supplied or
+    /// reason was whitespace. Maps to 400.
+    ReasonRequiredForIrrelevant,
+    /// Storage / audit-write / chain-verify error. Maps to 500.
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for StatusChangeError {
+    fn from(e: anyhow::Error) -> Self {
+        StatusChangeError::Other(e)
+    }
+}
+
+/// Typed errors from the ingestion path. The route layer maps each
+/// variant to the right HTTP status.
+#[derive(Debug)]
+pub enum IngestError {
+    /// One of the typed input fields failed validation (empty
+    /// supplier_tax_number, malformed issue_date, etc.). Maps to 400.
+    InvalidInput(String),
+    /// Storage / audit-write / chain-verify error. Maps to 500.
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for IngestError {
+    fn from(e: anyhow::Error) -> Self {
+        IngestError::Other(e)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Schema.
+// ──────────────────────────────────────────────────────────────────────
+
+const AP_INVOICE_SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS ap_invoice (
+    id                   VARCHAR NOT NULL PRIMARY KEY,
+    tenant_id            VARCHAR NOT NULL,
+    supplier_tax_number  VARCHAR NOT NULL,
+    supplier_name        VARCHAR NOT NULL,
+    supplier_address     VARCHAR,
+    nav_invoice_number   VARCHAR NOT NULL,
+    issue_date           VARCHAR NOT NULL,
+    delivery_date        VARCHAR,
+    payment_deadline     VARCHAR,
+    total_net_minor      BIGINT  NOT NULL,
+    total_vat_minor      BIGINT  NOT NULL,
+    total_gross_minor    BIGINT  NOT NULL,
+    currency             VARCHAR NOT NULL CHECK (currency IN ('HUF','EUR')),
+    local_status         VARCHAR NOT NULL CHECK (local_status IN ('Outstanding','Paid','Irrelevant')),
+    irrelevant_reason    VARCHAR,
+    nav_xml_path         VARCHAR,
+    created_at           VARCHAR NOT NULL,
+    updated_at           VARCHAR NOT NULL,
+    UNIQUE (tenant_id, supplier_tax_number, nav_invoice_number)
+);
+CREATE INDEX IF NOT EXISTS ap_invoice_tenant_status_idx
+    ON ap_invoice (tenant_id, local_status);
+CREATE INDEX IF NOT EXISTS ap_invoice_tenant_issue_idx
+    ON ap_invoice (tenant_id, issue_date);
+";
+
+/// Idempotent `CREATE TABLE IF NOT EXISTS` for the `ap_invoice` table.
+/// Called at serve boot per the same hot-path posture as
+/// `partners::ensure_schema` and `products::ensure_schema`.
+pub fn ensure_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(AP_INVOICE_SCHEMA_SQL)
+        .context("ensure ap_invoice schema")
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Ingestion.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Ingest a supplier-issued INCOMING invoice into the local mirror.
+///
+/// Idempotent on `(tenant_id, supplier_tax_number, nav_invoice_number)`
+/// — re-ingesting the same supplier's same invoice number returns
+/// `AlreadyExists { id: <existing> }` without inserting a duplicate
+/// and without writing a redundant audit entry. The future auto-sync
+/// daemon depends on this idempotency (NAV will re-emit the same
+/// digest on every poll cycle).
+///
+/// When `input.nav_xml` is `Some(bytes)`, the bytes are written to
+/// `~/.aberp/<tenant>/ap-artifacts/<apinv_id>.xml` and the SHA-256
+/// hex of those bytes is stamped onto the audit payload. The raw
+/// bytes themselves are NOT in the audit payload — the hash chain
+/// stays compact; an inspector can fetch the bytes from the
+/// well-known path.
+pub fn ingest_incoming_invoice(
+    db_path: &Path,
+    tenant: TenantId,
+    binary_hash: audit_ledger::BinaryHash,
+    operator_login: &str,
+    ap_artifacts_dir: &Path,
+    input: IngestionInput,
+) -> std::result::Result<IngestOutcome, IngestError> {
+    validate_ingestion_input(&input)?;
+
+    let mut conn = Connection::open(db_path).with_context(|| {
+        format!(
+            "open tenant DuckDB at {} for ap_invoice ingestion",
+            db_path.display()
+        )
+    })?;
+    ensure_schema(&conn).context("ensure ap_invoice schema (ingestion)")?;
+    audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema (ingestion)")?;
+
+    // Idempotency check FIRST so we never write the artifact file or
+    // the audit entry for a row that already exists.
+    if let Some(existing_id) = find_existing_id(
+        &conn,
+        tenant.as_str(),
+        &input.supplier_tax_number,
+        &input.nav_invoice_number,
+    )? {
+        return Ok(IngestOutcome::AlreadyExists { id: existing_id });
+    }
+
+    // Mint the row id BEFORE writing the artifact so the filename
+    // matches the row id.
+    let id = IncomingInvoiceId::new().to_prefixed_string();
+
+    // Optional NAV XML artifact + its hash.
+    let (nav_xml_path, nav_xml_sha256) = match &input.nav_xml {
+        Some(bytes) => {
+            std::fs::create_dir_all(ap_artifacts_dir).with_context(|| {
+                format!(
+                    "create AP artifacts directory at {}",
+                    ap_artifacts_dir.display()
+                )
+            })?;
+            let path: PathBuf = ap_artifacts_dir.join(format!("{}.xml", id));
+            std::fs::write(&path, bytes)
+                .with_context(|| format!("write AP NAV XML artifact to {}", path.display()))?;
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            let hash = hex::encode(hasher.finalize());
+            (Some(path.to_string_lossy().to_string()), Some(hash))
+        }
+        None => (None, None),
+    };
+
+    let now = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("format ap_invoice timestamp as Rfc3339")?;
+
+    let idempotency_key = IdempotencyKey::new();
+    let session_id = Ulid::new().to_string();
+    let actor = Actor::from_local_cli(session_id, operator_login);
+    let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash);
+
+    // INSERT + audit append in ONE transaction so a crash leaves
+    // neither a row without an audit entry nor an audit entry without
+    // a row. Mirrors the outgoing-invoice billing+audit posture per
+    // ADR-0008 / ADR-0009 §3 step 6.
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (ap_invoice ingest)")?;
+    tx.execute(
+        "INSERT INTO ap_invoice (
+            id, tenant_id, supplier_tax_number, supplier_name, supplier_address,
+            nav_invoice_number, issue_date, delivery_date, payment_deadline,
+            total_net_minor, total_vat_minor, total_gross_minor, currency,
+            local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Outstanding', NULL, ?, ?, ?);",
+        params![
+            &id,
+            tenant.as_str(),
+            &input.supplier_tax_number,
+            &input.supplier_name,
+            input.supplier_address.as_deref(),
+            &input.nav_invoice_number,
+            &input.issue_date,
+            input.delivery_date.as_deref(),
+            input.payment_deadline.as_deref(),
+            input.total_net_minor,
+            input.total_vat_minor,
+            input.total_gross_minor,
+            &input.currency,
+            nav_xml_path.as_deref(),
+            &now,
+            &now,
+        ],
+    )
+    .context("INSERT into ap_invoice")?;
+
+    let payload = IncomingInvoiceIngestedPayload {
+        ap_invoice_id: id.clone(),
+        idempotency_key: idempotency_key.to_canonical_string(),
+        supplier_tax_number: input.supplier_tax_number.clone(),
+        supplier_name: input.supplier_name.clone(),
+        nav_invoice_number: input.nav_invoice_number.clone(),
+        issue_date: input.issue_date.clone(),
+        payment_deadline: input.payment_deadline.clone(),
+        total_gross_minor: input.total_gross_minor,
+        currency: input.currency.clone(),
+        nav_xml_sha256,
+    };
+    audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        EventKind::IncomingInvoiceIngested,
+        payload.to_bytes(),
+        actor,
+        Some(idempotency_key.to_canonical_string()),
+    )
+    .map_err(|e| anyhow!("audit_ledger::append_in_tx IncomingInvoiceIngested: {e}"))?;
+    tx.commit()
+        .context("commit DuckDB transaction (ap_invoice ingest)")?;
+
+    // Mirror sync + chain verify post-commit (same posture as
+    // mark_invoice_paid::mark_paid).
+    drop(conn);
+    let ledger = Ledger::open(db_path, tenant, binary_hash)
+        .context("open audit ledger to verify chain after ap_invoice ingest")?;
+    ledger
+        .verify_chain()
+        .context("audit-ledger chain verification failed AFTER ap_invoice ingest")?;
+    let mirror_path = audit_ledger::mirror_path_for(db_path);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after ap_invoice ingest")?;
+
+    Ok(IngestOutcome::Created { id })
+}
+
+fn validate_ingestion_input(input: &IngestionInput) -> std::result::Result<(), IngestError> {
+    if input.supplier_tax_number.trim().is_empty() {
+        return Err(IngestError::InvalidInput(
+            "supplier_tax_number must be non-empty".into(),
+        ));
+    }
+    if input.supplier_name.trim().is_empty() {
+        return Err(IngestError::InvalidInput(
+            "supplier_name must be non-empty".into(),
+        ));
+    }
+    if input.nav_invoice_number.trim().is_empty() {
+        return Err(IngestError::InvalidInput(
+            "nav_invoice_number must be non-empty".into(),
+        ));
+    }
+    if !is_canonical_iso_date(&input.issue_date) {
+        return Err(IngestError::InvalidInput(format!(
+            "issue_date `{}` is not a valid ISO-8601 YYYY-MM-DD date",
+            input.issue_date
+        )));
+    }
+    if let Some(d) = &input.payment_deadline {
+        if !is_canonical_iso_date(d) {
+            return Err(IngestError::InvalidInput(format!(
+                "payment_deadline `{}` is not a valid ISO-8601 YYYY-MM-DD date",
+                d
+            )));
+        }
+    }
+    if let Some(d) = &input.delivery_date {
+        if !is_canonical_iso_date(d) {
+            return Err(IngestError::InvalidInput(format!(
+                "delivery_date `{}` is not a valid ISO-8601 YYYY-MM-DD date",
+                d
+            )));
+        }
+    }
+    match input.currency.as_str() {
+        "HUF" | "EUR" => {}
+        other => {
+            return Err(IngestError::InvalidInput(format!(
+                "currency `{}` not in closed vocab (HUF | EUR)",
+                other
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn find_existing_id(
+    conn: &Connection,
+    tenant: &str,
+    supplier_tax_number: &str,
+    nav_invoice_number: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM ap_invoice
+          WHERE tenant_id = ? AND supplier_tax_number = ? AND nav_invoice_number = ?
+          LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![tenant, supplier_tax_number, nav_invoice_number])?;
+    if let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        Ok(Some(id))
+    } else {
+        Ok(None)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Reads.
+// ──────────────────────────────────────────────────────────────────────
+
+/// List incoming invoices for the tenant, newest issue_date first.
+///
+/// `status_filter` optionally narrows to one of the three closed-vocab
+/// values; `None` returns every row. Pagination is offset-based per
+/// the SPA list-view's existing posture (`limit` + `offset`).
+pub fn list_incoming(
+    db_path: &Path,
+    tenant: &str,
+    status_filter: Option<IncomingInvoiceStatus>,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<IncomingInvoice>> {
+    let conn = Connection::open(db_path).with_context(|| {
+        format!(
+            "open tenant DuckDB at {} for ap_invoice list",
+            db_path.display()
+        )
+    })?;
+    ensure_schema(&conn).context("ensure ap_invoice schema (list)")?;
+
+    let mut rows = Vec::new();
+    match status_filter {
+        Some(status) => {
+            let mut stmt = conn.prepare(
+                "SELECT id, supplier_tax_number, supplier_name, supplier_address,
+                        nav_invoice_number, issue_date, delivery_date, payment_deadline,
+                        total_net_minor, total_vat_minor, total_gross_minor, currency,
+                        local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
+                   FROM ap_invoice
+                  WHERE tenant_id = ? AND local_status = ?
+                  ORDER BY issue_date DESC, id DESC
+                  LIMIT ? OFFSET ?",
+            )?;
+            let mut q = stmt.query(params![
+                tenant,
+                status.as_str(),
+                limit as i64,
+                offset as i64
+            ])?;
+            while let Some(row) = q.next()? {
+                rows.push(row_to_incoming(row)?);
+            }
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT id, supplier_tax_number, supplier_name, supplier_address,
+                        nav_invoice_number, issue_date, delivery_date, payment_deadline,
+                        total_net_minor, total_vat_minor, total_gross_minor, currency,
+                        local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
+                   FROM ap_invoice
+                  WHERE tenant_id = ?
+                  ORDER BY issue_date DESC, id DESC
+                  LIMIT ? OFFSET ?",
+            )?;
+            let mut q = stmt.query(params![tenant, limit as i64, offset as i64])?;
+            while let Some(row) = q.next()? {
+                rows.push(row_to_incoming(row)?);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// Fetch one incoming invoice by id. `None` if the row does not
+/// exist (the route layer maps to 404).
+pub fn get_incoming(db_path: &Path, tenant: &str, id: &str) -> Result<Option<IncomingInvoice>> {
+    let conn = Connection::open(db_path).with_context(|| {
+        format!(
+            "open tenant DuckDB at {} for ap_invoice get",
+            db_path.display()
+        )
+    })?;
+    ensure_schema(&conn).context("ensure ap_invoice schema (get)")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, supplier_tax_number, supplier_name, supplier_address,
+                nav_invoice_number, issue_date, delivery_date, payment_deadline,
+                total_net_minor, total_vat_minor, total_gross_minor, currency,
+                local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
+           FROM ap_invoice
+          WHERE tenant_id = ? AND id = ?
+          LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![tenant, id])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row_to_incoming(row)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn row_to_incoming(row: &duckdb::Row<'_>) -> Result<IncomingInvoice> {
+    Ok(IncomingInvoice {
+        id: row.get(0)?,
+        supplier_tax_number: row.get(1)?,
+        supplier_name: row.get(2)?,
+        supplier_address: row.get(3)?,
+        nav_invoice_number: row.get(4)?,
+        issue_date: row.get(5)?,
+        delivery_date: row.get(6)?,
+        payment_deadline: row.get(7)?,
+        total_net_minor: row.get(8)?,
+        total_vat_minor: row.get(9)?,
+        total_gross_minor: row.get(10)?,
+        currency: row.get(11)?,
+        local_status: row.get(12)?,
+        irrelevant_reason: row.get(13)?,
+        nav_xml_path: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Status transitions.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Closed graph of allowed transitions. `Paid → Irrelevant` and
+/// `Irrelevant → Paid` are NOT allowed in v1 — operator must clear to
+/// `Outstanding` first. CLAUDE.md rule 7 (surface conflicts, don't
+/// average them): two-step path keeps the audit chain explicit.
+fn transition_allowed(from: IncomingInvoiceStatus, to: IncomingInvoiceStatus) -> bool {
+    use IncomingInvoiceStatus::*;
+    matches!(
+        (from, to),
+        (Outstanding, Paid)
+            | (Outstanding, Irrelevant)
+            | (Paid, Outstanding)
+            | (Irrelevant, Outstanding)
+    )
+}
+
+/// Apply a status change to an existing AP-side invoice row. Writes
+/// the status-changed audit entry under one DuckDB transaction
+/// alongside the column update. The chain is verified + the mirror is
+/// synced post-commit, mirroring [`crate::mark_invoice_paid::mark_paid`].
+pub fn change_status(
+    db_path: &Path,
+    tenant: TenantId,
+    binary_hash: audit_ledger::BinaryHash,
+    operator_login: &str,
+    ap_invoice_id: &str,
+    to_status: IncomingInvoiceStatus,
+    reason: Option<String>,
+) -> std::result::Result<StatusChangeOutcome, StatusChangeError> {
+    let trimmed_reason = reason
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if matches!(to_status, IncomingInvoiceStatus::Irrelevant) && trimmed_reason.is_none() {
+        return Err(StatusChangeError::ReasonRequiredForIrrelevant);
+    }
+
+    let mut conn = Connection::open(db_path).with_context(|| {
+        format!(
+            "open tenant DuckDB at {} for ap_invoice status change",
+            db_path.display()
+        )
+    })?;
+    ensure_schema(&conn).context("ensure ap_invoice schema (status change)")?;
+    audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema (status change)")?;
+
+    let current = read_current_status(&conn, tenant.as_str(), ap_invoice_id)?;
+    let from_status = match current {
+        Some(s) => s,
+        None => return Err(StatusChangeError::NotFound),
+    };
+
+    let from_parsed = IncomingInvoiceStatus::from_storage_str(&from_status)
+        .context("decode ap_invoice.local_status read from DB")?;
+    if !transition_allowed(from_parsed, to_status) {
+        return Err(StatusChangeError::InvalidTransition {
+            from: from_status,
+            to: to_status.as_str().to_string(),
+        });
+    }
+
+    // No-op short-circuit: if from == to, return success without
+    // writing anything. The route layer can echo the unchanged row.
+    if from_parsed == to_status {
+        // Get the verify count for a coherent echo.
+        drop(conn);
+        let ledger = Ledger::open(db_path, tenant, binary_hash)
+            .context("open audit ledger to count entries for status no-op")?;
+        let verified = ledger
+            .verify_chain()
+            .context("verify chain (status no-op)")?;
+        return Ok(StatusChangeOutcome {
+            id: ap_invoice_id.to_string(),
+            from_status: from_parsed.as_str().to_string(),
+            to_status: to_status.as_str().to_string(),
+            reason: trimmed_reason,
+            entries_verified: verified,
+        });
+    }
+
+    let idempotency_key = IdempotencyKey::new();
+    let session_id = Ulid::new().to_string();
+    let actor = Actor::from_local_cli(session_id, operator_login);
+    let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash);
+
+    let now = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("format updated_at as Rfc3339")?;
+
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (ap_invoice status change)")?;
+    // Update local_status + irrelevant_reason atomically.
+    let irrelevant_col_value: Option<&str> =
+        if matches!(to_status, IncomingInvoiceStatus::Irrelevant) {
+            trimmed_reason.as_deref()
+        } else {
+            None
+        };
+    tx.execute(
+        "UPDATE ap_invoice
+            SET local_status = ?, irrelevant_reason = ?, updated_at = ?
+          WHERE tenant_id = ? AND id = ?",
+        params![
+            to_status.as_str(),
+            irrelevant_col_value,
+            &now,
+            tenant.as_str(),
+            ap_invoice_id,
+        ],
+    )
+    .context("UPDATE ap_invoice (status change)")?;
+
+    let payload = IncomingInvoiceStatusChangedPayload {
+        ap_invoice_id: ap_invoice_id.to_string(),
+        idempotency_key: idempotency_key.to_canonical_string(),
+        from_status: from_parsed.as_str().to_string(),
+        to_status: to_status.as_str().to_string(),
+        reason: trimmed_reason.clone(),
+    };
+    audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        EventKind::IncomingInvoiceStatusChanged,
+        payload.to_bytes(),
+        actor,
+        Some(idempotency_key.to_canonical_string()),
+    )
+    .map_err(|e| anyhow!("audit_ledger::append_in_tx IncomingInvoiceStatusChanged: {e}"))?;
+    tx.commit()
+        .context("commit DuckDB transaction (ap_invoice status change)")?;
+
+    drop(conn);
+    let ledger = Ledger::open(db_path, tenant, binary_hash)
+        .context("open audit ledger to verify chain after status change")?;
+    let verified = ledger
+        .verify_chain()
+        .context("audit-ledger chain verification failed AFTER ap_invoice status change")?;
+    let mirror_path = audit_ledger::mirror_path_for(db_path);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after ap_invoice status change")?;
+
+    Ok(StatusChangeOutcome {
+        id: ap_invoice_id.to_string(),
+        from_status: from_parsed.as_str().to_string(),
+        to_status: to_status.as_str().to_string(),
+        reason: trimmed_reason,
+        entries_verified: verified,
+    })
+}
+
+fn read_current_status(
+    conn: &Connection,
+    tenant: &str,
+    ap_invoice_id: &str,
+) -> Result<Option<String>> {
+    let mut stmt =
+        conn.prepare("SELECT local_status FROM ap_invoice WHERE tenant_id = ? AND id = ? LIMIT 1")?;
+    let mut rows = stmt.query(params![tenant, ap_invoice_id])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Helpers.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Strict YYYY-MM-DD validator. Same posture as
+/// `mark_invoice_paid::is_canonical_iso_date` — silent acceptance of
+/// non-canonical date strings would lock the wrong shape into the
+/// audit ledger forever.
+pub(crate) fn is_canonical_iso_date(s: &str) -> bool {
+    let format = time::macros::format_description!("[year]-[month]-[day]");
+    time::Date::parse(s, &format).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aberp_audit_ledger::BinaryHash;
+
+    /// Per-test tempdir under the system temp root. Mirrors the
+    /// pattern in `apps/aberp/tests/seller_banks_round_trip.rs` —
+    /// avoids the `tempfile` dev-dep so the surface stays tight per
+    /// CLAUDE.md rule 2. Each call returns a fresh unique directory;
+    /// callers are responsible for cleanup at drop (deliberately
+    /// best-effort — leaked tempdirs land under `/tmp` and the OS
+    /// reaps them).
+    struct ScopedTempDir(std::path::PathBuf);
+
+    impl ScopedTempDir {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let path =
+                std::env::temp_dir().join(format!("aberp-s177-ap-{label}-{pid}-{nanos}-{seq}"));
+            std::fs::create_dir_all(&path).expect("create scoped tempdir");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScopedTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture_tenant() -> TenantId {
+        TenantId::new("t1".to_string()).unwrap()
+    }
+
+    fn fixture_binary_hash() -> BinaryHash {
+        BinaryHash::from_bytes([0u8; 32])
+    }
+
+    fn fixture_input() -> IngestionInput {
+        IngestionInput {
+            supplier_tax_number: "12345678".into(),
+            supplier_name: "Supplier Kft.".into(),
+            supplier_address: Some("1051 Budapest, Példa utca 1.".into()),
+            nav_invoice_number: "SUP-2026/000001".into(),
+            issue_date: "2026-05-30".into(),
+            delivery_date: Some("2026-05-30".into()),
+            payment_deadline: Some("2026-06-29".into()),
+            total_net_minor: 100_000,
+            total_vat_minor: 27_000,
+            total_gross_minor: 127_000,
+            currency: "HUF".into(),
+            nav_xml: None,
+        }
+    }
+
+    /// Closed-vocab round-trip — adding a variant requires updating
+    /// both as_str + from_storage_str + this hand-listed array.
+    #[test]
+    fn incoming_invoice_status_round_trip_for_every_variant() {
+        let variants = [
+            IncomingInvoiceStatus::Outstanding,
+            IncomingInvoiceStatus::Paid,
+            IncomingInvoiceStatus::Irrelevant,
+        ];
+        for v in variants {
+            let s = v.as_str();
+            let parsed =
+                IncomingInvoiceStatus::from_storage_str(s).unwrap_or_else(|e| panic!("{s} -> {e}"));
+            assert_eq!(parsed, v);
+        }
+    }
+
+    /// Unknown storage strings loud-fail per CLAUDE.md rule 12.
+    #[test]
+    fn incoming_invoice_status_rejects_unknown() {
+        assert!(IncomingInvoiceStatus::from_storage_str("").is_err());
+        assert!(IncomingInvoiceStatus::from_storage_str("paid").is_err());
+        assert!(IncomingInvoiceStatus::from_storage_str("Cancelled").is_err());
+    }
+
+    /// Closed-graph transitions per the module docs.
+    #[test]
+    fn transition_allowed_matches_closed_graph() {
+        use IncomingInvoiceStatus::*;
+        // Allowed.
+        assert!(transition_allowed(Outstanding, Paid));
+        assert!(transition_allowed(Outstanding, Irrelevant));
+        assert!(transition_allowed(Paid, Outstanding));
+        assert!(transition_allowed(Irrelevant, Outstanding));
+        // Forbidden.
+        assert!(!transition_allowed(Paid, Irrelevant));
+        assert!(!transition_allowed(Irrelevant, Paid));
+        // No-op cases — `change_status` short-circuits these without
+        // a write, but `transition_allowed` itself answers "is this
+        // legal" — same-status moves are NOT in the allowed graph
+        // (the no-op short-circuit happens before the check).
+        assert!(!transition_allowed(Outstanding, Outstanding));
+        assert!(!transition_allowed(Paid, Paid));
+        assert!(!transition_allowed(Irrelevant, Irrelevant));
+    }
+
+    /// `IncomingInvoiceId` prefixed-ULID round-trip.
+    #[test]
+    fn incoming_invoice_id_round_trip() {
+        let id = IncomingInvoiceId::new();
+        let s = id.to_prefixed_string();
+        assert!(s.starts_with("apinv_"));
+        let parsed = IncomingInvoiceId::parse_prefixed(&s).unwrap();
+        assert_eq!(parsed, id);
+        assert!(IncomingInvoiceId::parse_prefixed("inv_X").is_err());
+        assert!(IncomingInvoiceId::parse_prefixed("apinv_").is_err());
+        assert!(IncomingInvoiceId::parse_prefixed("apinv_not-a-ulid").is_err());
+    }
+
+    /// Validation rejects empty supplier_tax_number.
+    #[test]
+    fn validate_rejects_empty_supplier_tax() {
+        let mut input = fixture_input();
+        input.supplier_tax_number = "   ".into();
+        let result = validate_ingestion_input(&input);
+        assert!(matches!(result, Err(IngestError::InvalidInput(_))));
+    }
+
+    /// Validation rejects malformed issue_date.
+    #[test]
+    fn validate_rejects_malformed_issue_date() {
+        let mut input = fixture_input();
+        input.issue_date = "2026/05/30".into();
+        let result = validate_ingestion_input(&input);
+        assert!(matches!(result, Err(IngestError::InvalidInput(_))));
+    }
+
+    /// Validation rejects currency outside the closed vocab.
+    #[test]
+    fn validate_rejects_unknown_currency() {
+        let mut input = fixture_input();
+        input.currency = "USD".into();
+        let result = validate_ingestion_input(&input);
+        assert!(matches!(result, Err(IngestError::InvalidInput(_))));
+    }
+
+    /// Ingestion is idempotent — re-ingesting the same supplier's
+    /// same invoice returns AlreadyExists, NOT a duplicate row.
+    #[test]
+    fn ingestion_is_idempotent_on_supplier_and_invoice_number() {
+        let dir = ScopedTempDir::new("idem");
+        let db_path = dir.path().join("tenant.duckdb");
+        let artifacts_dir = dir.path().join("ap-artifacts");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+
+        let first = ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            fixture_input(),
+        )
+        .expect("first ingest");
+        let first_id = match first {
+            IngestOutcome::Created { id } => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let second = ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            fixture_input(),
+        )
+        .expect("second ingest");
+        match second {
+            IngestOutcome::AlreadyExists { id } => assert_eq!(id, first_id),
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+
+        let rows = list_incoming(&db_path, tenant.as_str(), None, 100, 0).unwrap();
+        assert_eq!(rows.len(), 1, "duplicate insert was suppressed by UNIQUE");
+        assert_eq!(rows[0].local_status, "Outstanding");
+    }
+
+    /// Two distinct suppliers OR two distinct invoice numbers can
+    /// coexist — the uniqueness key is the pair.
+    #[test]
+    fn ingestion_allows_distinct_supplier_or_invoice_number() {
+        let dir = ScopedTempDir::new("distinct");
+        let db_path = dir.path().join("tenant.duckdb");
+        let artifacts_dir = dir.path().join("ap-artifacts");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+
+        ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            fixture_input(),
+        )
+        .unwrap();
+
+        let mut second = fixture_input();
+        second.nav_invoice_number = "SUP-2026/000002".into();
+        ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            second,
+        )
+        .unwrap();
+
+        let mut third = fixture_input();
+        third.supplier_tax_number = "87654321".into();
+        ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            third,
+        )
+        .unwrap();
+
+        let rows = list_incoming(&db_path, tenant.as_str(), None, 100, 0).unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    /// Ingestion with raw NAV XML writes the artifact file and
+    /// stamps the SHA-256 hex onto the audit payload.
+    #[test]
+    fn ingestion_persists_nav_xml_artifact_and_hash() {
+        let dir = ScopedTempDir::new("xml-artifact");
+        let db_path = dir.path().join("tenant.duckdb");
+        let artifacts_dir = dir.path().join("ap-artifacts");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+        let xml_bytes = b"<InvoiceData/>".to_vec();
+        let expected_hash = {
+            let mut h = Sha256::new();
+            h.update(&xml_bytes);
+            hex::encode(h.finalize())
+        };
+
+        let mut input = fixture_input();
+        input.nav_xml = Some(xml_bytes.clone());
+        let outcome = ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            input,
+        )
+        .expect("ingest with XML");
+        let id = match outcome {
+            IngestOutcome::Created { id } => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // The artifact file exists with the supplied bytes.
+        let artifact_path = artifacts_dir.join(format!("{}.xml", id));
+        let on_disk = std::fs::read(&artifact_path).expect("read artifact");
+        assert_eq!(on_disk, xml_bytes);
+
+        // The audit entry carries the hash.
+        let ledger = Ledger::open(&db_path, tenant, bh).unwrap();
+        let entries = ledger.entries().unwrap();
+        let ingested = entries
+            .iter()
+            .find(|e| e.kind == EventKind::IncomingInvoiceIngested)
+            .expect("IncomingInvoiceIngested entry");
+        let payload: IncomingInvoiceIngestedPayload =
+            serde_json::from_slice(&ingested.payload).unwrap();
+        assert_eq!(
+            payload.nav_xml_sha256.as_deref(),
+            Some(expected_hash.as_str())
+        );
+    }
+
+    /// Marking `Outstanding → Paid` updates the column and writes a
+    /// status-changed audit entry.
+    #[test]
+    fn mark_paid_transitions_and_audits() {
+        let dir = ScopedTempDir::new("mark-paid");
+        let db_path = dir.path().join("tenant.duckdb");
+        let artifacts_dir = dir.path().join("ap-artifacts");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+
+        let outcome = ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            fixture_input(),
+        )
+        .unwrap();
+        let id = match outcome {
+            IngestOutcome::Created { id } => id,
+            other => panic!("{other:?}"),
+        };
+
+        let result = change_status(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &id,
+            IncomingInvoiceStatus::Paid,
+            None,
+        )
+        .expect("mark paid");
+        assert_eq!(result.from_status, "Outstanding");
+        assert_eq!(result.to_status, "Paid");
+
+        let row = get_incoming(&db_path, tenant.as_str(), &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.local_status, "Paid");
+        assert_eq!(row.irrelevant_reason, None);
+
+        let ledger = Ledger::open(&db_path, tenant, bh).unwrap();
+        let entries = ledger.entries().unwrap();
+        let count = entries
+            .iter()
+            .filter(|e| e.kind == EventKind::IncomingInvoiceStatusChanged)
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    /// Marking `Outstanding → Irrelevant` REQUIRES a reason.
+    #[test]
+    fn mark_irrelevant_requires_reason() {
+        let dir = ScopedTempDir::new("mark-irrelevant");
+        let db_path = dir.path().join("tenant.duckdb");
+        let artifacts_dir = dir.path().join("ap-artifacts");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+
+        let outcome = ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            fixture_input(),
+        )
+        .unwrap();
+        let id = match outcome {
+            IngestOutcome::Created { id } => id,
+            other => panic!("{other:?}"),
+        };
+
+        // Missing reason → 400-shaped error.
+        let result = change_status(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &id,
+            IncomingInvoiceStatus::Irrelevant,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(StatusChangeError::ReasonRequiredForIrrelevant)
+        ));
+
+        // Whitespace-only reason → same error.
+        let result_ws = change_status(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &id,
+            IncomingInvoiceStatus::Irrelevant,
+            Some("    ".into()),
+        );
+        assert!(matches!(
+            result_ws,
+            Err(StatusChangeError::ReasonRequiredForIrrelevant)
+        ));
+
+        // Non-empty reason → succeeds.
+        let result_ok = change_status(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &id,
+            IncomingInvoiceStatus::Irrelevant,
+            Some("duplicate of SUP-2026/000099".into()),
+        )
+        .expect("mark irrelevant with reason");
+        assert_eq!(result_ok.to_status, "Irrelevant");
+        let row = get_incoming(&db_path, tenant.as_str(), &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.local_status, "Irrelevant");
+        assert_eq!(
+            row.irrelevant_reason.as_deref(),
+            Some("duplicate of SUP-2026/000099")
+        );
+    }
+
+    /// `Paid → Irrelevant` is NOT in the closed graph — route layer
+    /// rejects with 400 via `InvalidTransition`.
+    #[test]
+    fn paid_to_irrelevant_is_rejected() {
+        let dir = ScopedTempDir::new("paid-to-irrelevant");
+        let db_path = dir.path().join("tenant.duckdb");
+        let artifacts_dir = dir.path().join("ap-artifacts");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+
+        let outcome = ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            fixture_input(),
+        )
+        .unwrap();
+        let id = match outcome {
+            IngestOutcome::Created { id } => id,
+            other => panic!("{other:?}"),
+        };
+
+        change_status(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &id,
+            IncomingInvoiceStatus::Paid,
+            None,
+        )
+        .unwrap();
+
+        let result = change_status(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &id,
+            IncomingInvoiceStatus::Irrelevant,
+            Some("oops, irrelevant".into()),
+        );
+        assert!(matches!(
+            result,
+            Err(StatusChangeError::InvalidTransition { .. })
+        ));
+    }
+
+    /// Unknown id → NotFound.
+    #[test]
+    fn unknown_id_returns_not_found() {
+        let dir = ScopedTempDir::new("unknown-id");
+        let db_path = dir.path().join("tenant.duckdb");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+
+        // ensure schema before the lookup.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            ensure_schema(&conn).unwrap();
+            audit_ledger::ensure_schema(&conn).unwrap();
+        }
+        let result = change_status(
+            &db_path,
+            tenant,
+            bh,
+            "operator",
+            "apinv_01HRQXYZABCDEFGHJKMNPQRST",
+            IncomingInvoiceStatus::Paid,
+            None,
+        );
+        assert!(matches!(result, Err(StatusChangeError::NotFound)));
+    }
+
+    /// Schema migration is idempotent — calling `ensure_schema`
+    /// twice on the same connection MUST NOT error.
+    #[test]
+    fn ensure_schema_is_idempotent() {
+        let dir = ScopedTempDir::new("schema-idem");
+        let db_path = dir.path().join("tenant.duckdb");
+        let conn = Connection::open(&db_path).unwrap();
+        ensure_schema(&conn).expect("first ensure");
+        ensure_schema(&conn).expect("second ensure (idempotent)");
+        // Sanity: the table exists and is empty.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ap_invoice", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// list_incoming filters by status.
+    #[test]
+    fn list_filters_by_status() {
+        let dir = ScopedTempDir::new("list-filter");
+        let db_path = dir.path().join("tenant.duckdb");
+        let artifacts_dir = dir.path().join("ap-artifacts");
+        let tenant = fixture_tenant();
+        let bh = fixture_binary_hash();
+
+        let outcome_a = ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            fixture_input(),
+        )
+        .unwrap();
+        let id_a = match outcome_a {
+            IngestOutcome::Created { id } => id,
+            other => panic!("{other:?}"),
+        };
+        let mut second = fixture_input();
+        second.nav_invoice_number = "SUP-2026/000002".into();
+        ingest_incoming_invoice(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &artifacts_dir,
+            second,
+        )
+        .unwrap();
+
+        change_status(
+            &db_path,
+            tenant.clone(),
+            bh,
+            "operator",
+            &id_a,
+            IncomingInvoiceStatus::Paid,
+            None,
+        )
+        .unwrap();
+
+        let outstanding = list_incoming(
+            &db_path,
+            tenant.as_str(),
+            Some(IncomingInvoiceStatus::Outstanding),
+            100,
+            0,
+        )
+        .unwrap();
+        assert_eq!(outstanding.len(), 1);
+        assert_eq!(outstanding[0].local_status, "Outstanding");
+
+        let paid = list_incoming(
+            &db_path,
+            tenant.as_str(),
+            Some(IncomingInvoiceStatus::Paid),
+            100,
+            0,
+        )
+        .unwrap();
+        assert_eq!(paid.len(), 1);
+        assert_eq!(paid[0].local_status, "Paid");
+    }
+}

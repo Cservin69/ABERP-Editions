@@ -97,6 +97,7 @@ use crate::binary_hash::BinaryHashHandle;
 use crate::build_profile;
 use crate::cli::ServeArgs;
 use crate::email_invoice::{self, EmailSendError, SendInvoiceEmailInput, SendTrigger};
+use crate::incoming_invoices;
 use crate::invoice_bank_snapshot::load_invoice_bank_snapshot_in_tx;
 use crate::invoice_currency_metadata::{
     load_invoice_currency_metadata_in_tx, InvoiceCurrencyMetadata,
@@ -683,6 +684,22 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             )
         })?;
         products::ensure_schema(&conn).context("ensure products schema at serve boot")?;
+    }
+
+    // S177 / PR-177 — pin the ap_invoice (incoming AP-side mirror)
+    // schema at boot, same posture as products + partners. The route
+    // layer also calls `ensure_schema` defensively so a fresh DB +
+    // first route hit does not 500.
+    {
+        let _s = tracing::info_span!("serve.ensure_ap_invoice_schema").entered();
+        let conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for ap_invoice boot migration",
+                args.db.display()
+            )
+        })?;
+        incoming_invoices::ensure_schema(&conn)
+            .context("ensure ap_invoice schema at serve boot")?;
     }
 
     // Session 152b — reconcile the audit-ledger mirror against the DB
@@ -1361,6 +1378,34 @@ fn build_router(state: AppState) -> Router {
             get(handle_get_product)
                 .put(handle_update_product)
                 .delete(handle_delete_product),
+        )
+        // S177 / PR-177 — AP module v1 BACKEND. Incoming-invoice list +
+        // detail + manual ingestion + three closed-vocab status
+        // transitions. All require_ready + bearer auth. The NAV
+        // auto-sync daemon (queryInvoiceDigest INBOUND fanout) is a
+        // SEPARATE PR — these routes are the foundation S178's UI
+        // consumes and the same entry points the future daemon will
+        // call. See `incoming_invoices.rs` module docs.
+        .route("/api/incoming-invoices", get(handle_list_incoming_invoices))
+        .route(
+            "/api/incoming-invoices/ingest",
+            post(handle_ingest_incoming_invoice),
+        )
+        .route(
+            "/api/incoming-invoices/:id",
+            get(handle_get_incoming_invoice),
+        )
+        .route(
+            "/api/incoming-invoices/:id/mark-paid",
+            post(handle_mark_incoming_paid),
+        )
+        .route(
+            "/api/incoming-invoices/:id/mark-outstanding",
+            post(handle_mark_incoming_outstanding),
+        )
+        .route(
+            "/api/incoming-invoices/:id/mark-irrelevant",
+            post(handle_mark_incoming_irrelevant),
         )
         // PR-72 / session-94 — multi-bank-account CRUD (PR-B of the
         // multi-bank initiative; ADR-0040 §addendum). Five routes
@@ -6137,6 +6182,297 @@ pub fn delete_product_request(
     } else {
         Err(ProductRouteError::NotFound)
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S177 / PR-177 — AP module v1 BACKEND routes.
+// ──────────────────────────────────────────────────────────────────────
+//
+// Six routes over the per-tenant `ap_invoice` table:
+//
+//   - `GET /api/incoming-invoices` — list, optional status filter +
+//     pagination (`limit` + `offset`).
+//   - `GET /api/incoming-invoices/:id` — detail; 404 if unknown.
+//   - `POST /api/incoming-invoices/ingest` — insert a new row from
+//     operator-supplied typed fields (and optional raw NAV InvoiceData
+//     XML). Idempotent on `(supplier_tax_number, nav_invoice_number)`.
+//   - `POST /api/incoming-invoices/:id/mark-paid` — transition to Paid.
+//   - `POST /api/incoming-invoices/:id/mark-outstanding` — reset to
+//     Outstanding (unwinds a prior Paid or Irrelevant mark).
+//   - `POST /api/incoming-invoices/:id/mark-irrelevant` — body
+//     `{ "reason": "..." }` REQUIRED.
+//
+// All six require_ready + bearer auth — incoming-invoice management is
+// a Ready-state feature, not a first-run-setup surface.
+
+/// Query string for `GET /api/incoming-invoices`. All fields optional;
+/// `status` is closed-vocab and rejected loud if unknown
+/// (the route returns 400 — silent acceptance would mask SPA bugs).
+#[derive(Debug, Deserialize)]
+struct ListIncomingInvoicesQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
+    #[serde(default)]
+    offset: Option<u64>,
+}
+
+const DEFAULT_INCOMING_LIST_LIMIT: u64 = 100;
+const MAX_INCOMING_LIST_LIMIT: u64 = 500;
+
+async fn handle_list_incoming_invoices(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<ListIncomingInvoicesQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let status_filter = match query.status.as_deref() {
+        None => None,
+        Some(s) => match incoming_invoices::IncomingInvoiceStatus::from_storage_str(s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!("invalid `status` query parameter: {e}"))),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_INCOMING_LIST_LIMIT)
+        .min(MAX_INCOMING_LIST_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    match incoming_invoices::list_incoming(
+        &state.db_path,
+        state.tenant.as_str(),
+        status_filter,
+        limit,
+        offset,
+    ) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => internal_error("list_incoming_invoices", e),
+    }
+}
+
+async fn handle_get_incoming_invoice(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match incoming_invoices::get_incoming(&state.db_path, state.tenant.as_str(), &id) {
+        Ok(Some(row)) => Json(row).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!("incoming invoice {id} not found"))),
+        )
+            .into_response(),
+        Err(e) => internal_error("get_incoming_invoice", e),
+    }
+}
+
+/// Response body for the ingest route. `created` is `true` when a
+/// new row was inserted; `false` when the (supplier, invoice_number)
+/// pair already existed (idempotent no-op). Either way the `id`
+/// echoes the canonical row id so the caller can navigate to it.
+#[derive(Debug, Serialize)]
+struct IngestIncomingInvoiceResponse {
+    id: String,
+    created: bool,
+}
+
+async fn handle_ingest_incoming_invoice(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(input): Json<incoming_invoices::IngestionInput>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match state.binary_hash.wait() {
+        Ok(h) => h,
+        Err(e) => return internal_error("ingest_incoming_invoice:binary_hash", anyhow!(e)),
+    };
+    let artifacts_dir = match ap_artifacts_dir(state.tenant.as_str()) {
+        Ok(p) => p,
+        Err(e) => return internal_error("ingest_incoming_invoice:artifacts_dir", e),
+    };
+    match incoming_invoices::ingest_incoming_invoice(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        &operator_login,
+        &artifacts_dir,
+        input,
+    ) {
+        Ok(incoming_invoices::IngestOutcome::Created { id }) => (
+            StatusCode::CREATED,
+            Json(IngestIncomingInvoiceResponse { id, created: true }),
+        )
+            .into_response(),
+        Ok(incoming_invoices::IngestOutcome::AlreadyExists { id }) => (
+            StatusCode::OK,
+            Json(IngestIncomingInvoiceResponse { id, created: false }),
+        )
+            .into_response(),
+        Err(incoming_invoices::IngestError::InvalidInput(msg)) => {
+            (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response()
+        }
+        Err(incoming_invoices::IngestError::Other(e)) => {
+            internal_error("ingest_incoming_invoice", e)
+        }
+    }
+}
+
+/// Request body for `POST /api/incoming-invoices/:id/mark-irrelevant`.
+/// The `reason` is REQUIRED (the route returns 400 if absent /
+/// whitespace) per the session-177 brief's load-bearing irrelevant-
+/// reason invariant.
+#[derive(Debug, Deserialize)]
+struct MarkIrrelevantRequest {
+    reason: String,
+}
+
+/// Response body for the three mark-* routes.
+#[derive(Debug, Serialize)]
+struct MarkIncomingStatusResponse {
+    id: String,
+    from_status: String,
+    to_status: String,
+    reason: Option<String>,
+    entries_verified: u64,
+}
+
+async fn handle_mark_incoming_paid(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    mark_incoming_status_inner(
+        state,
+        headers,
+        &id,
+        incoming_invoices::IncomingInvoiceStatus::Paid,
+        None,
+    )
+}
+
+async fn handle_mark_incoming_outstanding(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    mark_incoming_status_inner(
+        state,
+        headers,
+        &id,
+        incoming_invoices::IncomingInvoiceStatus::Outstanding,
+        None,
+    )
+}
+
+async fn handle_mark_incoming_irrelevant(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<MarkIrrelevantRequest>,
+) -> Response {
+    mark_incoming_status_inner(
+        state,
+        headers,
+        &id,
+        incoming_invoices::IncomingInvoiceStatus::Irrelevant,
+        Some(body.reason),
+    )
+}
+
+fn mark_incoming_status_inner(
+    state: AppState,
+    headers: HeaderMap,
+    id: &str,
+    to_status: incoming_invoices::IncomingInvoiceStatus,
+    reason: Option<String>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match state.binary_hash.wait() {
+        Ok(h) => h,
+        Err(e) => return internal_error("mark_incoming_status:binary_hash", anyhow!(e)),
+    };
+    match incoming_invoices::change_status(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        &operator_login,
+        id,
+        to_status,
+        reason,
+    ) {
+        Ok(outcome) => Json(MarkIncomingStatusResponse {
+            id: outcome.id,
+            from_status: outcome.from_status,
+            to_status: outcome.to_status,
+            reason: outcome.reason,
+            entries_verified: outcome.entries_verified,
+        })
+        .into_response(),
+        Err(incoming_invoices::StatusChangeError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!("incoming invoice {id} not found"))),
+        )
+            .into_response(),
+        Err(incoming_invoices::StatusChangeError::InvalidTransition { from, to }) => (
+            StatusCode::BAD_REQUEST,
+            Json(error_body(format!(
+                "transition `{from}` → `{to}` is not allowed; \
+                 clear to Outstanding first if you need to cross between Paid and Irrelevant"
+            ))),
+        )
+            .into_response(),
+        Err(incoming_invoices::StatusChangeError::ReasonRequiredForIrrelevant) => (
+            StatusCode::BAD_REQUEST,
+            Json(error_body(
+                "marking incoming invoice as Irrelevant requires a non-empty `reason`".into(),
+            )),
+        )
+            .into_response(),
+        Err(incoming_invoices::StatusChangeError::Other(e)) => {
+            internal_error("mark_incoming_status", e)
+        }
+    }
+}
+
+/// Per-tenant directory for raw NAV InvoiceData XML artifacts of
+/// INCOMING invoices: `~/.aberp/<tenant>/ap-artifacts/`. Mirrors
+/// `serve_artifacts_dir`'s posture but keyed off the user-home
+/// `~/.aberp/<tenant>/` root (not `~/.aberp/serve/<tenant>/`) so the
+/// AP artifacts sit next to `seller.toml` + the keychain-related
+/// metadata for the tenant.
+fn ap_artifacts_dir(tenant: &str) -> Result<PathBuf> {
+    let home = dirs_home_or_loud_fail()?;
+    Ok(home.join(".aberp").join(tenant).join("ap-artifacts"))
 }
 
 // ── PR-72 / session-94 — multi-bank-account routes ───────────────────

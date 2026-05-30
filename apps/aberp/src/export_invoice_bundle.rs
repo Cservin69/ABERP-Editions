@@ -637,7 +637,18 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // boot-time pre-upgrade safety check detected drift in
         // [seller.smtp] / [seller.numbering]). Also `system.`-scoped,
         // never sweeps a per-invoice bundle; no NAV bytes.
-        | EventKind::UpgradeSnapshotMismatch => None,
+        | EventKind::UpgradeSnapshotMismatch
+        // S177 / PR-177 — AP-side incoming-invoice ingestion + status
+        // change events. The raw NAV InvoiceData XML for incoming
+        // invoices lives at
+        // `~/.aberp/<tenant>/ap-artifacts/<apinv_id>.xml`, NOT in the
+        // audit payload; the payload's `nav_xml_sha256` is the
+        // tamper-detection hash. Both kinds are also `system.`-
+        // prefixed, so the per-OUTGOING-invoice export bundle's
+        // `invoice.*` glob never sweeps them — they are listed here
+        // for exhaustiveness only.
+        | EventKind::IncomingInvoiceIngested
+        | EventKind::IncomingInvoiceStatusChanged => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

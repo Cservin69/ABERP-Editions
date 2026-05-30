@@ -761,7 +761,18 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::FirstProdLaunchAcknowledged
         // S171 — system-lifecycle upgrade-snapshot mismatch; no
         // NAV-side XML. Mirrors the bundle writer's no-bytes arm.
-        | EventKind::UpgradeSnapshotMismatch => (None, ""),
+        | EventKind::UpgradeSnapshotMismatch
+        // S177 / PR-177 — AP-side incoming-invoice events. The raw
+        // NAV InvoiceData XML for incoming invoices (when present) is
+        // stored on the filesystem at
+        // `~/.aberp/<tenant>/ap-artifacts/<apinv_id>.xml`, NOT in the
+        // audit payload. The payload's `nav_xml_sha256` is the
+        // tamper-detection hash; the verifier mirrors the bundle
+        // writer's no-bytes posture for these kinds. They are also
+        // `system.`-prefixed so they never reach a per-outgoing-
+        // invoice export bundle anyway.
+        | EventKind::IncomingInvoiceIngested
+        | EventKind::IncomingInvoiceStatusChanged => (None, ""),
     };
 
     Ok(NavExtraction {

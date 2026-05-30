@@ -2067,6 +2067,124 @@ impl UpgradeSnapshotMismatchPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// IncomingInvoiceIngested (S177)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::IncomingInvoiceIngested`].
+///
+/// Written when an INCOMING (supplier-issued, ABERP-received) invoice
+/// lands in the local AP-side mirror table `ap_invoice`. The audit
+/// entry is the operator-twin's permanent record of "supplier X
+/// invoiced us for Y on date Z, the bytes ABERP ingested are H." The
+/// `nav_xml_sha256` is the SHA-256 of the verbatim NAV InvoiceData
+/// XML the operator (or the future auto-sync daemon) supplied; the
+/// raw bytes live on disk at
+/// `~/.aberp/<tenant>/ap-artifacts/<ap_invoice_id>.xml` per the
+/// session-177 conservative storage decision (matches the outgoing
+/// side's nav_xml path posture from PR-18 / ADR-0031).
+///
+/// `nav_xml_sha256` is `None` when the operator manually entered the
+/// fields without supplying a NAV XML — flagged as such so the
+/// audit-evidence reader can distinguish operator-typed from
+/// NAV-fetched entries without parsing the bundle. The future
+/// auto-sync daemon will always populate it.
+///
+/// **No invoice_id field.** Outgoing-invoice payloads carry
+/// `invoice_id: String` referencing `inv_<ULID>` in this tenant's
+/// own `invoice` table. An incoming invoice's id (`apinv_<ULID>`)
+/// references the AP-side `ap_invoice` table, NOT `invoice` — the
+/// dedicated `ap_invoice_id` field is named distinctly to surface
+/// the difference at every read site.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncomingInvoiceIngestedPayload {
+    /// `apinv_<ULID>` — the local AP-side row's id.
+    pub ap_invoice_id: String,
+    /// Operator-decision idempotency key. Mirrors every other audit
+    /// payload's F8 carry-forward shape.
+    pub idempotency_key: String,
+    /// The supplier's tax number (HU: 8-digit head + check digits).
+    /// Verbatim from the NAV XML or operator input; used as part of
+    /// the `(supplier_tax_number, nav_invoice_number)` uniqueness
+    /// key on the `ap_invoice` table.
+    pub supplier_tax_number: String,
+    /// The supplier's legal name as it appears on the invoice.
+    pub supplier_name: String,
+    /// The supplier's invoice number (e.g., `"INV-2026/001234"`).
+    /// Verbatim from the supplier's emission — the `(tax, number)`
+    /// pair is unique per NAV invariants.
+    pub nav_invoice_number: String,
+    /// Issue date in canonical `YYYY-MM-DD` form.
+    pub issue_date: String,
+    /// Payment-deadline date in canonical `YYYY-MM-DD` form. `None`
+    /// when the supplier's invoice carries no payment deadline (rare
+    /// but legal — e.g., cash-paid-on-receipt invoices).
+    pub payment_deadline: Option<String>,
+    /// Total gross amount in the invoice's currency, expressed in
+    /// minor units (HUF: whole forints, EUR: cents) — same shape
+    /// as `InvoicePaymentRecordedPayload::amount_minor`.
+    pub total_gross_minor: i64,
+    /// ISO 4217 currency code (`"HUF"` / `"EUR"` per the closed
+    /// vocab — pinned by `Currency::iso_code()` upstream).
+    pub currency: String,
+    /// SHA-256 (hex-encoded) of the raw NAV InvoiceData XML this
+    /// ingestion was sourced from. `None` for operator-typed
+    /// entries with no NAV XML supplied.
+    pub nav_xml_sha256: Option<String>,
+}
+
+impl IncomingInvoiceIngestedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// IncomingInvoiceStatusChanged (S177)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::IncomingInvoiceStatusChanged`].
+///
+/// Written when the operator transitions an AP-side incoming invoice
+/// between the closed-vocab `Paid` / `Outstanding` / `Irrelevant`
+/// states. The local `ap_invoice.local_status` column is the
+/// queryable read-side; THIS entry is the hash-chained audit trail
+/// of who decided what when and why.
+///
+/// `reason` is REQUIRED when `to_status == "Irrelevant"` (the route
+/// layer rejects the transition with 400 otherwise) and OPTIONAL on
+/// every other transition. The session-177 brief named the irrelevant
+/// reason as load-bearing — the operator must say why an invoice is
+/// being declared not-our-problem so a future audit can reconstruct
+/// the decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncomingInvoiceStatusChangedPayload {
+    /// `apinv_<ULID>` — the local AP-side row's id.
+    pub ap_invoice_id: String,
+    /// Operator-decision idempotency key — minted fresh per status
+    /// change. Mirrors every other audit payload's F8 carry-forward
+    /// shape.
+    pub idempotency_key: String,
+    /// Prior status string. Closed vocab: `"Paid"` / `"Outstanding"`
+    /// / `"Irrelevant"`. The route layer reads the local column as
+    /// the source of truth for the from-value, so this payload
+    /// records what was committed before the change.
+    pub from_status: String,
+    /// New status string. Same closed vocab as `from_status`.
+    pub to_status: String,
+    /// Operator-supplied free-form reason. REQUIRED when
+    /// `to_status == "Irrelevant"`; OPTIONAL otherwise. Never
+    /// includes secret material — the route layer trims to a
+    /// reasonable length but does not scrub content.
+    pub reason: Option<String>,
+}
+
+impl IncomingInvoiceStatusChangedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -3924,5 +4042,85 @@ mod tests {
             "connection refused",
         );
         assert_eq!(bad.outcome, "failed");
+    }
+
+    /// S177 / PR-177 — `IncomingInvoiceIngestedPayload` round-trips
+    /// through serde_json without data loss. Same posture as the
+    /// existing payload round-trip tests above.
+    #[test]
+    fn incoming_invoice_ingested_round_trip() {
+        let payload = IncomingInvoiceIngestedPayload {
+            ap_invoice_id: "apinv_01HRQXYZABCDEFGHJKMNPQRST".to_string(),
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            supplier_tax_number: "12345678".to_string(),
+            supplier_name: "Supplier Kft.".to_string(),
+            nav_invoice_number: "SUP-2026/000123".to_string(),
+            issue_date: "2026-05-30".to_string(),
+            payment_deadline: Some("2026-06-29".to_string()),
+            total_gross_minor: 125_000,
+            currency: "HUF".to_string(),
+            nav_xml_sha256: Some(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            ),
+        };
+        let bytes = payload.to_bytes();
+        let parsed: IncomingInvoiceIngestedPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+    }
+
+    /// S177 / PR-177 — operator-typed entry (no NAV XML supplied)
+    /// round-trips with `nav_xml_sha256: None`.
+    #[test]
+    fn incoming_invoice_ingested_operator_typed_round_trip() {
+        let payload = IncomingInvoiceIngestedPayload {
+            ap_invoice_id: "apinv_01HRQXYZABCDEFGHJKMNPQRST".to_string(),
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            supplier_tax_number: "98765432".to_string(),
+            supplier_name: "Hand-Entered Beszállító".to_string(),
+            nav_invoice_number: "MANUAL/2026/0001".to_string(),
+            issue_date: "2026-05-30".to_string(),
+            payment_deadline: None,
+            total_gross_minor: 5_000,
+            currency: "HUF".to_string(),
+            nav_xml_sha256: None,
+        };
+        let bytes = payload.to_bytes();
+        let parsed: IncomingInvoiceIngestedPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+    }
+
+    /// S177 / PR-177 — `IncomingInvoiceStatusChangedPayload` round-trips
+    /// for the irrelevant case (reason MUST be `Some`).
+    #[test]
+    fn incoming_invoice_status_changed_irrelevant_round_trip() {
+        let payload = IncomingInvoiceStatusChangedPayload {
+            ap_invoice_id: "apinv_01HRQXYZABCDEFGHJKMNPQRST".to_string(),
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            from_status: "Outstanding".to_string(),
+            to_status: "Irrelevant".to_string(),
+            reason: Some("duplicate of supplier invoice SUP-2026/000122".to_string()),
+        };
+        let bytes = payload.to_bytes();
+        let parsed: IncomingInvoiceStatusChangedPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+    }
+
+    /// S177 / PR-177 — paid + outstanding transitions allow `reason: None`.
+    #[test]
+    fn incoming_invoice_status_changed_paid_round_trip() {
+        let payload = IncomingInvoiceStatusChangedPayload {
+            ap_invoice_id: "apinv_01HRQXYZABCDEFGHJKMNPQRST".to_string(),
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            from_status: "Outstanding".to_string(),
+            to_status: "Paid".to_string(),
+            reason: None,
+        };
+        let bytes = payload.to_bytes();
+        let parsed: IncomingInvoiceStatusChangedPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
     }
 }

@@ -591,6 +591,65 @@ pub enum EventKind {
     /// event, not invoice-scoped, so it carries the `system.` prefix
     /// and never enters a per-invoice export bundle.
     UpgradeSnapshotMismatch,
+
+    /// S177 / PR-177 — an INCOMING (supplier-issued, ABERP-received)
+    /// invoice was ingested into the local AP-side mirror table
+    /// `ap_invoice`. Carries the local AP-side row id
+    /// (`apinv_<ULID>`), the operator-decision idempotency key, the
+    /// supplier's tax number + name, the supplier's invoice number,
+    /// the dates + totals + currency, and an optional pointer to the
+    /// raw NAV InvoiceData XML on disk
+    /// (`~/.aberp/<tenant>/ap-artifacts/<id>.xml`).
+    ///
+    /// **NOT `invoice.`-prefixed.** Outgoing-invoice lifecycle events
+    /// use the `invoice.` prefix so the per-invoice export bundle's
+    /// `invoice.*` glob (ADR-0009 §8) picks them up. An incoming
+    /// invoice is NOT one of this tenant's regulated outgoing
+    /// invoices — it has no `inv_<ULID>` id, no `invoice_id` field on
+    /// the payload — sweeping it into an outgoing invoice's bundle
+    /// would be wrong. The `system.` prefix keeps it out of every
+    /// per-invoice bundle by construction. The downstream
+    /// per-invoice export bundle's exhaustive match (`apps/aberp/src/
+    /// export_invoice_bundle.rs::extract_nav_xml`) and the verifier's
+    /// (`crates/aberp-verify/src/verify.rs`) both classify this kind
+    /// as no-NAV-bytes-in-bundle.
+    ///
+    /// **AP module v1 ships in two parts.** S177 is the BACKEND:
+    /// schema + status workflow + audit events + HTTP routes + a
+    /// manual-ingestion route that takes operator-supplied typed
+    /// fields and an optional raw NAV InvoiceData XML. The NAV
+    /// auto-sync daemon (`queryInvoiceDigest INBOUND` + per-digest
+    /// `queryInvoiceData` fanout + InvoiceData parser) is a SEPARATE
+    /// PR — `queryInvoiceDigest` is not yet in `nav-transport` and
+    /// adding it requires NAV-testbed verification of the digest
+    /// response shape per the same posture
+    /// `render_query_invoice_data_request` documents
+    /// (`crates/nav-transport/src/soap/mod.rs`). The audit kind +
+    /// payload shape ARE the load-bearing surface for the future
+    /// daemon — it will call the same `ingest_incoming_invoice`
+    /// helper and write the same audit entry, so adding the daemon
+    /// later is additive and does not bump the kind. F12 four-edit
+    /// ritual fires once.
+    IncomingInvoiceIngested,
+
+    /// S177 / PR-177 — operator-decided status change on an
+    /// AP-side incoming invoice. Closed-vocab transitions:
+    /// `Outstanding → Paid` (operator records that the supplier was
+    /// paid), `Outstanding → Irrelevant` (operator marks the invoice
+    /// as not-our-problem with a required reason), `Paid →
+    /// Outstanding` and `Irrelevant → Outstanding` (operator unwinds
+    /// a prior status change). The local mirror row's `local_status`
+    /// column is the queryable read-side; THIS entry is the
+    /// hash-chained audit trail of WHO changed WHAT WHEN and WHY.
+    ///
+    /// Payload (`IncomingInvoiceStatusChangedPayload`) carries the
+    /// AP-side row id, the idempotency key, the from/to status
+    /// strings, and the operator's optional free-form `reason` (REQUIRED
+    /// when `to_status == "Irrelevant"`; OPTIONAL otherwise per the
+    /// session-177 brief). Same `system.` prefix posture as
+    /// `IncomingInvoiceIngested` — never sweeps a per-outgoing-invoice
+    /// bundle. F12 four-edit ritual fires once.
+    IncomingInvoiceStatusChanged,
 }
 
 impl EventKind {
@@ -626,6 +685,8 @@ impl EventKind {
             EventKind::InvoiceEmailedSent => "invoice.emailed_sent",
             EventKind::FirstProdLaunchAcknowledged => "system.first_prod_launch_acknowledged",
             EventKind::UpgradeSnapshotMismatch => "system.upgrade_snapshot_mismatch",
+            EventKind::IncomingInvoiceIngested => "system.incoming_invoice_ingested",
+            EventKind::IncomingInvoiceStatusChanged => "system.incoming_invoice_status_changed",
         }
     }
 
@@ -672,6 +733,8 @@ impl EventKind {
             "invoice.emailed_sent" => Ok(EventKind::InvoiceEmailedSent),
             "system.first_prod_launch_acknowledged" => Ok(EventKind::FirstProdLaunchAcknowledged),
             "system.upgrade_snapshot_mismatch" => Ok(EventKind::UpgradeSnapshotMismatch),
+            "system.incoming_invoice_ingested" => Ok(EventKind::IncomingInvoiceIngested),
+            "system.incoming_invoice_status_changed" => Ok(EventKind::IncomingInvoiceStatusChanged),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -714,6 +777,8 @@ mod tests {
             EventKind::InvoiceEmailedSent,
             EventKind::FirstProdLaunchAcknowledged,
             EventKind::UpgradeSnapshotMismatch,
+            EventKind::IncomingInvoiceIngested,
+            EventKind::IncomingInvoiceStatusChanged,
         ];
         for v in variants {
             let s = v.as_str();
@@ -1158,6 +1223,65 @@ mod tests {
         assert_ne!(
             EventKind::InvoiceEmailedSent.as_str(),
             EventKind::InvoiceModificationIssued.as_str()
+        );
+    }
+
+    /// S177 / PR-177 — AP-side incoming-invoice ingestion event. The
+    /// `system.` prefix MUST hold so the per-OUTGOING-invoice export
+    /// bundle's `invoice.*` glob NEVER sweeps it into an outgoing
+    /// invoice's evidence bundle (the AP row has no `inv_<ULID>` —
+    /// such a sweep would be a category error). Inverse of every
+    /// `invoice.`-prefix pin above.
+    #[test]
+    fn s177_incoming_invoice_ingested_kind_uses_system_prefix() {
+        assert_eq!(
+            EventKind::IncomingInvoiceIngested.as_str(),
+            "system.incoming_invoice_ingested"
+        );
+        assert!(EventKind::IncomingInvoiceIngested
+            .as_str()
+            .starts_with("system."));
+        assert!(!EventKind::IncomingInvoiceIngested
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// S177 / PR-177 — AP-side status-change event (paid /
+    /// outstanding / irrelevant transitions). Same `system.` prefix
+    /// invariant as `IncomingInvoiceIngested`.
+    #[test]
+    fn s177_incoming_invoice_status_changed_kind_uses_system_prefix() {
+        assert_eq!(
+            EventKind::IncomingInvoiceStatusChanged.as_str(),
+            "system.incoming_invoice_status_changed"
+        );
+        assert!(EventKind::IncomingInvoiceStatusChanged
+            .as_str()
+            .starts_with("system."));
+        assert!(!EventKind::IncomingInvoiceStatusChanged
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// S177 / PR-177 — the two AP-side kinds MUST be distinct from
+    /// each other and from every outgoing-invoice kind. Same
+    /// fork-discipline posture as
+    /// `pr_92_emailed_sent_is_distinct_from_all_other_kinds`.
+    #[test]
+    fn s177_incoming_invoice_kinds_are_distinct() {
+        assert_ne!(
+            EventKind::IncomingInvoiceIngested.as_str(),
+            EventKind::IncomingInvoiceStatusChanged.as_str()
+        );
+        // Spot-check distinctness from outgoing-invoice kinds with
+        // similar semantic neighbours (payment, draft creation).
+        assert_ne!(
+            EventKind::IncomingInvoiceIngested.as_str(),
+            EventKind::InvoiceDraftCreated.as_str()
+        );
+        assert_ne!(
+            EventKind::IncomingInvoiceStatusChanged.as_str(),
+            EventKind::InvoicePaymentRecorded.as_str()
         );
     }
 }

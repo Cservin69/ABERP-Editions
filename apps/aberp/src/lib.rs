@@ -30,6 +30,7 @@ pub mod drain_submission_queue;
 pub mod email_invoice;
 pub mod export_invoice_bundle;
 pub mod first_launch;
+pub mod incoming_invoices;
 pub mod invoice_bank_snapshot;
 pub mod invoice_currency_metadata;
 pub mod issue_invoice;
