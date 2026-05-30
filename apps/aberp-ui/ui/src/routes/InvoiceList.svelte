@@ -63,6 +63,14 @@
     type SortDir,
     type SortKey,
   } from "../lib/invoice-list";
+  // PR-175 / session-175 — persist sort + filter selection to
+  // localStorage so the operator's view survives a reload / app
+  // restart. Pure helpers in invoice-list-persistence.ts; this file
+  // just reads on mount and writes on every mutation.
+  import {
+    loadInvoiceListPrefs,
+    saveInvoiceListPrefs,
+  } from "../lib/invoice-list-persistence";
   // PR-68 / session-90 — keyboard navigation Tier-1 UX lift.
   // `/` focuses the search box, j/k walk rows, Enter opens the
   // focused row's detail, `g g`/`G` jump to top/bottom, `?` toggles
@@ -93,6 +101,14 @@
   let loadState: "idle" | "loading" | "loaded" | "error" = $state("idle");
   let errorMessage: string | null = $state(null);
 
+  // PR-175 / session-175 — seed both `filter` and `sort` from
+  // `localStorage` so a reload restores the operator's last view.
+  // `loadInvoiceListPrefs` returns the default blob on every failure
+  // path (key absent, malformed JSON, unknown vocab from a future
+  // schema), so the legacy "open filter + lifecycle-natural sort"
+  // posture is the safe fallback in every case.
+  const initialPrefs = loadInvoiceListPrefs();
+
   // PR-94 / session-114 — unified filter spec (needle + state +
   // currency facets). The `needle` field drives the PR-68 `/`-targeted
   // substring search; the `state` and `currency` fields drive the new
@@ -100,7 +116,7 @@
   // on a facet short-circuits the gate. The previous standalone
   // `filterLabel` + `searchNeedle` reactive fields are subsumed here so
   // one object drives every filter surface.
-  let filter: InvoiceFilterSpec = $state({ ...EMPTY_FILTER });
+  let filter: InvoiceFilterSpec = $state({ ...initialPrefs.filter });
 
   // PR-94 / session-114 — sortable-columns state. `key === null` keeps
   // the legacy lifecycle-natural ordering (Unknown → Abandoned, then
@@ -108,10 +124,7 @@
   // null → asc → desc → null (reset). Clicking a different column
   // jumps to (clicked, asc) directly. The renderer shows ▲ / ▼ next
   // to the active column label.
-  let sort: { key: SortKey | null; dir: SortDir } = $state({
-    key: null,
-    dir: "asc",
-  });
+  let sort: { key: SortKey | null; dir: SortDir } = $state({ ...initialPrefs.sort });
 
   // PR-25 / session-29 — selected invoice id drives the detail modal
   // (`null` keeps it closed; a string opens it and triggers the
@@ -538,6 +551,22 @@
     } else if (focusedRowIndex >= visibleRows.length) {
       focusedRowIndex = visibleRows.length - 1;
     }
+  });
+
+  // PR-175 / session-175 — write the operator's current sort + filter
+  // selection to localStorage on every change. Reading `sort` and
+  // `filter` (including their nested fields) makes this `$effect`
+  // re-run on every mutation; `saveInvoiceListPrefs` swallows storage
+  // failures internally so a write throw never breaks interaction.
+  $effect(() => {
+    saveInvoiceListPrefs({
+      sort: { key: sort.key, dir: sort.dir },
+      filter: {
+        needle: filter.needle,
+        state: filter.state,
+        currency: filter.currency,
+      },
+    });
   });
 </script>
 
