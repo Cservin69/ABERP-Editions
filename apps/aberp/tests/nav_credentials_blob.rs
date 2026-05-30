@@ -276,6 +276,9 @@ fn rotation_preserves_other_three_fields() {
                 operator_login: "lg-pre".to_string(),
             },
         )),
+        nav_poll_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            aberp::serve::NAV_POLL_DAEMON_CONCURRENCY,
+        )),
     };
 
     // Rotate password only.

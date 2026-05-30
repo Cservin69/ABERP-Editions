@@ -56,6 +56,9 @@ fn build_state(boot_state: ServeBootState, tenant: &str) -> AppState {
         session_token: Arc::new("test-token".to_string()),
         secrets_cache: aberp::secrets_cache::SecretsCache::empty(),
         boot_state: Arc::new(std::sync::RwLock::new(boot_state)),
+        nav_poll_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            aberp::serve::NAV_POLL_DAEMON_CONCURRENCY,
+        )),
     }
 }
 

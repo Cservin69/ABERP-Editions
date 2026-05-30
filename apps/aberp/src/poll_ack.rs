@@ -72,11 +72,13 @@
 //!     ADR-0009 §5); that path lands when the crash-between-submit-
 //!     and-ack disambiguation case surfaces.
 
-use std::path::Path;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aberp_audit_ledger::{
-    self as audit_ledger, Actor, Entry, EventKind, Ledger, LedgerMeta, TenantId,
+    self as audit_ledger, Actor, BinaryHash, Entry, EventKind, Ledger, LedgerMeta, TenantId,
 };
 use aberp_billing::{self as billing, IdempotencyKey, ReadyInvoice};
 use aberp_nav_transport::{
@@ -85,6 +87,7 @@ use aberp_nav_transport::{
 };
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
+use tokio::sync::Semaphore;
 use ulid::Ulid;
 
 use crate::audit_payloads;
@@ -502,7 +505,7 @@ fn lookup_transaction_id(
 /// ad-hoc string match. A schema mismatch produces a parse error which
 /// we treat as "not the entry we want" (return None) — the caller's
 /// loud-fail on "no entry found" still surfaces the real problem.
-fn extract_transaction_id(entry: &Entry, invoice_id: &str) -> Option<String> {
+pub(crate) fn extract_transaction_id(entry: &Entry, invoice_id: &str) -> Option<String> {
     if entry.kind != EventKind::InvoiceSubmissionResponse {
         return None;
     }
@@ -730,6 +733,250 @@ fn write_ack_audit_entry(
     Ok(())
 }
 
+// ── Session-161 — NAV poll-as-daemon ─────────────────────────────────
+//
+// The bounded `poll_loop` above (ADR-0009 §5, 5 attempts / ~15s) is the
+// OPERATOR-triggered path: the CLI `poll-ack` subcommand and the SPA's
+// manual "Poll" button (`POST /invoices/:id/poll-ack`). It writes one
+// `InvoiceAckStatus` per attempt — bounded evidence, no bloat risk.
+//
+// The AUTOMATIC path (post-issue tail + app-boot recovery) instead runs
+// the indefinite two-phase daemon below. It must survive long-tail NAV
+// processing (minutes → hours) without the operator clicking anything,
+// so it polls until terminal or process shutdown. To keep the audit
+// ledger from growing 1440 rows/day per long-stuck invoice, the daemon
+// writes a SINGLE terminal `InvoiceAckStatus` on resolution — never the
+// intermediate RECEIVED/PROCESSING beats. Intermediate state is implicit:
+// the SPA renders `Submitted ⌛` until a terminal row appears and flips it
+// to ✓ Final / ⚠ Rejected. (There is no `NavPollStopped`/`Stuck` audit
+// variant in this codebase — the "stuck" pictogram is purely the
+// actionable `Submitted` SPA state. The S161 brief's Part E was written
+// against a variant that does not exist; nothing is deprecated.)
+
+/// Phase-1 backoff schedule (seconds). Fast exponential catch for the
+/// common case where NAV resolves within ~2 minutes. After the last
+/// delay the daemon switches to the steady phase-2 cadence.
+const PHASE1_DELAYS_SECS: [u64; 7] = [1, 2, 4, 8, 16, 30, 60];
+
+/// Phase-2 steady daemon cadence (seconds). 1-minute interval per
+/// invoice; well inside NAV's published rate limits even with the
+/// [`Semaphore`] cap saturated (≤ cap polls/min total).
+const PHASE2_INTERVAL_SECS: u64 = 60;
+
+/// Consecutive transient-error cap before the daemon gives up. A
+/// persistent network/NAV outage should not spin a zombie task forever;
+/// after this many *consecutive* retryable errors the daemon exits and
+/// leaves the invoice actionable for a manual poll. Reset to zero by any
+/// successful (non-terminal) poll, so an intermittent network never
+/// trips it.
+const MAX_CONSECUTIVE_DAEMON_ERRORS: u32 = 10;
+
+/// Everything the [`run_nav_poll_daemon`] needs to drive an invoice's
+/// indefinite poll to terminal. Grouped into one struct so the daemon
+/// stays decoupled from `serve::AppState` (the spawn sites in
+/// `serve.rs` build this from the ledger + keychain) and so the spawn
+/// call reads clean.
+pub struct PollDaemonInputs {
+    pub db: PathBuf,
+    pub tenant: TenantId,
+    pub binary_hash: BinaryHash,
+    pub invoice_id: String,
+    pub transaction_id: String,
+    pub tax_number_8: String,
+    pub endpoint: NavEndpoint,
+    pub credentials: NavCredentials,
+    pub actor: Actor,
+}
+
+/// How the two-phase poll schedule ended. `Terminal` carries the NAV
+/// outcome whose `response_xml` becomes the single audit entry the
+/// daemon writes; `GaveUp` carries the operator-visible reason.
+#[derive(Debug)]
+enum PollScheduleResult {
+    Terminal {
+        outcome: QueryTransactionStatusOutcome,
+        polls: u64,
+    },
+    GaveUp {
+        reason: String,
+        polls: u64,
+    },
+}
+
+/// The two-phase poll schedule core. Generic over an async poll closure
+/// so the timer pins (`#[tokio::test(start_paused = true)]`) can inject
+/// a scripted NAV client without a live transport — the closure is the
+/// only seam that touches NAV. Runs phase-1 exponential backoff, then an
+/// unbounded phase-2 1-minute loop, until a terminal status, a
+/// non-retryable error, or the consecutive-retryable-error cap.
+///
+/// Both phases treat a *retryable* error as "transient — keep polling"
+/// (bounded by [`MAX_CONSECUTIVE_DAEMON_ERRORS`]). This is deliberately
+/// MORE tolerant than the bounded `poll_loop`, whose attempt cap means a
+/// transient blip can exhaust it; the daemon has no cap to exhaust, so a
+/// network hiccup must not end it. A *non-retryable* error (e.g. NAV
+/// schema drift surfaced as a parse failure) still ends the daemon
+/// immediately — retrying cannot help, and the invoice stays actionable.
+async fn drive_poll_schedule<F, Fut>(mut poll_once: F) -> PollScheduleResult
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<QueryTransactionStatusOutcome, AttemptError>>,
+{
+    let mut consecutive_errors: u32 = 0;
+    let mut polls: u64 = 0;
+
+    // Classify one poll outcome into either an early return or "keep
+    // going". Factored so phase-1 and phase-2 share identical handling
+    // (and so the consecutive-error reset rule lives in exactly one
+    // place — CLAUDE.md rule 8).
+    macro_rules! handle {
+        ($outcome:expr) => {{
+            polls += 1;
+            match $outcome {
+                Ok(outcome) if outcome.processing_status.is_terminal() => {
+                    return PollScheduleResult::Terminal { outcome, polls };
+                }
+                Ok(_) => {
+                    consecutive_errors = 0;
+                }
+                Err(AttemptError::NonRetryable(diag)) => {
+                    return PollScheduleResult::GaveUp {
+                        reason: format!("non-retryable NAV error: {diag}"),
+                        polls,
+                    };
+                }
+                Err(AttemptError::Retryable(diag)) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= MAX_CONSECUTIVE_DAEMON_ERRORS {
+                        return PollScheduleResult::GaveUp {
+                            reason: format!(
+                                "{MAX_CONSECUTIVE_DAEMON_ERRORS} consecutive retryable \
+                                 errors; last: {diag}"
+                            ),
+                            polls,
+                        };
+                    }
+                }
+            }
+        }};
+    }
+
+    // Phase 1 — fast exponential backoff.
+    for delay in PHASE1_DELAYS_SECS {
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+        handle!(poll_once().await);
+    }
+
+    // Phase 2 — steady daemon. No expiry: runs until terminal, a
+    // non-retryable error, the error cap, or process shutdown (the task
+    // dies with the process; app-boot recovery re-spawns it).
+    loop {
+        tokio::time::sleep(Duration::from_secs(PHASE2_INTERVAL_SECS)).await;
+        handle!(poll_once().await);
+    }
+}
+
+/// Session-161 — spawn-friendly NAV poll daemon. Acquires a concurrency
+/// permit (held for the daemon's whole lifetime — the cap bounds the
+/// number of invoices being actively watched, not just instantaneous
+/// HTTP calls), then drives [`drive_poll_schedule`] to terminal. On a
+/// terminal status it writes ONE `InvoiceAckStatus` audit entry +
+/// verifies the chain + syncs the mirror, exactly as the bounded loop's
+/// final commit would. On give-up it writes nothing and logs loud — the
+/// invoice stays `Submitted` (actionable) for a manual poll.
+///
+/// The future is `Send` (no held tracing span guard across `.await`) so
+/// callers can `tokio::spawn` it directly.
+pub async fn run_nav_poll_daemon(
+    inputs: PollDaemonInputs,
+    semaphore: Arc<Semaphore>,
+) -> Result<()> {
+    let _permit = semaphore
+        .acquire()
+        .await
+        .context("acquire NAV poll daemon concurrency permit")?;
+
+    let transport = NavTransport::new(inputs.endpoint).context("build NAV transport for daemon")?;
+
+    let result = drive_poll_schedule(|| {
+        run_one_attempt(
+            &transport,
+            &inputs.credentials,
+            &inputs.tax_number_8,
+            &inputs.transaction_id,
+        )
+    })
+    .await;
+
+    match result {
+        PollScheduleResult::Terminal { outcome, polls } => {
+            tracing::info!(
+                invoice_id = %inputs.invoice_id,
+                transaction_id = %inputs.transaction_id,
+                polls,
+                status = outcome.processing_status.as_nav_str(),
+                "NAV poll daemon reached terminal status; writing terminal audit entry"
+            );
+            write_daemon_terminal_ack(&inputs, &outcome)
+        }
+        PollScheduleResult::GaveUp { reason, polls } => {
+            tracing::warn!(
+                invoice_id = %inputs.invoice_id,
+                transaction_id = %inputs.transaction_id,
+                polls,
+                reason = %reason,
+                "NAV poll daemon stopped without a terminal status; \
+                 invoice stays Submitted/actionable for a manual poll"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Write the daemon's single terminal `InvoiceAckStatus` entry, then
+/// re-run the same verify-chain + mirror-sync success-criterion gate the
+/// bounded `poll_ack_from_inputs` runs after its loop. Opens its own
+/// DuckDB connection (the daemon owns no `conn`).
+fn write_daemon_terminal_ack(
+    inputs: &PollDaemonInputs,
+    outcome: &QueryTransactionStatusOutcome,
+) -> Result<()> {
+    let mut conn = Connection::open(&inputs.db).with_context(|| {
+        format!(
+            "open tenant DuckDB at {} for daemon terminal write",
+            inputs.db.display()
+        )
+    })?;
+    audit_ledger::ensure_schema(&conn)
+        .context("ensure audit-ledger schema for daemon terminal write")?;
+    let ledger_meta = LedgerMeta::new(inputs.tenant.clone(), inputs.binary_hash);
+    write_ack_audit_entry(
+        &mut conn,
+        &ledger_meta,
+        &inputs.actor,
+        &inputs.invoice_id,
+        &inputs.transaction_id,
+        outcome,
+    )?;
+    drop(conn);
+
+    let ledger = Ledger::open(&inputs.db, inputs.tenant.clone(), inputs.binary_hash)
+        .context("open audit ledger after daemon terminal write")?;
+    let verified = ledger
+        .verify_chain()
+        .context("audit-ledger chain verification failed AFTER daemon terminal write")?;
+    let mirror_path = audit_ledger::mirror_path_for(&inputs.db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror after daemon terminal write")?;
+    tracing::info!(
+        invoice_id = %inputs.invoice_id,
+        entries_verified = verified,
+        "daemon terminal audit entry written + chain verified"
+    );
+    Ok(())
+}
+
 /// Extract the 8-digit base of a Hungarian tax number. Mirror of
 /// `submit_invoice::parse_tax_number_8` — same parser, same loud-fail
 /// shapes. Duplicated here rather than re-exporting because the two
@@ -792,6 +1039,196 @@ mod tests {
         assert!(parse_tax_number_8("1234567").is_err());
         assert!(parse_tax_number_8("1234567X").is_err());
         assert!(parse_tax_number_8("123456789-1-42").is_err());
+    }
+
+    // ── Session-161 — two-phase poll daemon pins ─────────────────────
+    //
+    // These drive [`drive_poll_schedule`] under `start_paused = true`:
+    // tokio auto-advances virtual time whenever the only runnable work
+    // is a pending timer, so the indefinite phase-2 loop completes
+    // deterministically in microseconds while the assertions still see
+    // the real 1/2/4/8/16/30/60 + 60s schedule.
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn ok_outcome(status: ProcessingStatus) -> QueryTransactionStatusOutcome {
+        QueryTransactionStatusOutcome {
+            processing_status: status,
+            request_xml: Vec::new(),
+            response_xml: b"<r/>".to_vec(),
+        }
+    }
+
+    /// Build a scripted poll closure + a virtual-time log. `script(n)`
+    /// returns the result for the n-th (0-based) poll. The returned
+    /// `Vec` (shared) records the virtual seconds-since-start at each
+    /// poll so the schedule itself can be pinned.
+    fn scripted<R>(
+        script: R,
+    ) -> (
+        impl FnMut() -> std::pin::Pin<
+            Box<dyn Future<Output = Result<QueryTransactionStatusOutcome, AttemptError>>>,
+        >,
+        Rc<RefCell<Vec<u64>>>,
+    )
+    where
+        R: Fn(usize) -> Result<QueryTransactionStatusOutcome, AttemptError> + 'static,
+    {
+        let log: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+        let count = Rc::new(RefCell::new(0usize));
+        let start = tokio::time::Instant::now();
+        let script = Rc::new(script);
+        let out_log = log.clone();
+        let closure = move || {
+            let n = {
+                let mut c = count.borrow_mut();
+                let v = *c;
+                *c += 1;
+                v
+            };
+            log.borrow_mut().push(start.elapsed().as_secs());
+            let result = (script)(n);
+            Box::pin(async move { result }) as std::pin::Pin<Box<dyn Future<Output = _>>>
+        };
+        (closure, out_log)
+    }
+
+    /// Phase-1 backoff fires at exactly 1,2,4,8,16,30,60s cumulative
+    /// (→ 1,3,7,15,31,61,121 elapsed), and a terminal status inside
+    /// phase 1 stops the schedule there.
+    #[tokio::test(start_paused = true)]
+    async fn daemon_phase1_backoff_schedule_and_terminal() {
+        // intermediate for the first 6 polls, SAVED on the 7th.
+        let (poll, log) = scripted(|n| {
+            if n >= 6 {
+                Ok(ok_outcome(ProcessingStatus::Saved))
+            } else {
+                Ok(ok_outcome(ProcessingStatus::Processing))
+            }
+        });
+        let result = drive_poll_schedule(poll).await;
+        match result {
+            PollScheduleResult::Terminal { outcome, polls } => {
+                assert_eq!(polls, 7, "terminal SAVED on the 7th poll");
+                assert_eq!(outcome.processing_status, ProcessingStatus::Saved);
+            }
+            other => panic!("expected Terminal, got {other:?}"),
+        }
+        assert_eq!(
+            *log.borrow(),
+            vec![1, 3, 7, 15, 31, 61, 121],
+            "phase-1 cumulative elapsed must follow the 1,2,4,8,16,30,60 schedule"
+        );
+    }
+
+    /// Phase 2 is an unbounded 1-minute loop: the daemon keeps polling
+    /// well past phase 1's 7 attempts and only stops on terminal. Pins
+    /// ≥10 phase-2 polls and the steady 60s cadence.
+    #[tokio::test(start_paused = true)]
+    async fn daemon_phase2_runs_indefinitely_until_terminal() {
+        // SAVED only on the 18th poll → 7 phase-1 + 11 phase-2 polls.
+        let (poll, log) = scripted(|n| {
+            if n >= 17 {
+                Ok(ok_outcome(ProcessingStatus::Saved))
+            } else {
+                Ok(ok_outcome(ProcessingStatus::Processing))
+            }
+        });
+        let result = drive_poll_schedule(poll).await;
+        match result {
+            PollScheduleResult::Terminal { polls, .. } => {
+                assert_eq!(polls, 18);
+                assert!(polls - 7 >= 10, "at least 10 phase-2 polls before terminal");
+            }
+            other => panic!("expected Terminal, got {other:?}"),
+        }
+        // Phase-2 polls (index 7..18) are spaced exactly 60s apart, on
+        // top of phase 1's last poll at 121s: 181, 241, 301, ...
+        let log = log.borrow();
+        for i in 7..log.len() {
+            assert_eq!(
+                log[i] - log[i - 1],
+                PHASE2_INTERVAL_SECS,
+                "phase-2 poll {i} must be 60s after the previous"
+            );
+        }
+    }
+
+    /// A burst of transient (retryable) errors below the consecutive cap
+    /// must NOT kill the daemon — it keeps polling and still reaches
+    /// terminal. The cap counter resets on the next success.
+    #[tokio::test(start_paused = true)]
+    async fn daemon_survives_transient_errors() {
+        // polls 0,1,2 retryable-error; 3 intermediate (resets counter);
+        // 4 SAVED.
+        let (poll, _log) = scripted(|n| match n {
+            0 | 1 | 2 => Err(AttemptError::Retryable(format!("blip {n}"))),
+            3 => Ok(ok_outcome(ProcessingStatus::Processing)),
+            _ => Ok(ok_outcome(ProcessingStatus::Saved)),
+        });
+        let result = drive_poll_schedule(poll).await;
+        match result {
+            PollScheduleResult::Terminal { polls, .. } => assert_eq!(polls, 5),
+            other => panic!("expected Terminal despite transient errors, got {other:?}"),
+        }
+    }
+
+    /// Persistent retryable errors trip the consecutive-error cap and
+    /// the daemon gives up cleanly (no terminal write, no zombie loop)
+    /// after exactly [`MAX_CONSECUTIVE_DAEMON_ERRORS`] polls.
+    #[tokio::test(start_paused = true)]
+    async fn daemon_gives_up_after_consecutive_error_cap() {
+        let (poll, _log) = scripted(|_| Err(AttemptError::Retryable("down".into())));
+        let result = drive_poll_schedule(poll).await;
+        match result {
+            PollScheduleResult::GaveUp { polls, .. } => {
+                assert_eq!(polls, MAX_CONSECUTIVE_DAEMON_ERRORS as u64);
+            }
+            other => panic!("expected GaveUp at the error cap, got {other:?}"),
+        }
+    }
+
+    /// A non-retryable error (e.g. NAV schema drift) ends the daemon
+    /// immediately — retrying cannot help.
+    #[tokio::test(start_paused = true)]
+    async fn daemon_gives_up_immediately_on_non_retryable() {
+        let (poll, _log) = scripted(|_| Err(AttemptError::NonRetryable("schema drift".into())));
+        let result = drive_poll_schedule(poll).await;
+        match result {
+            PollScheduleResult::GaveUp { polls, reason } => {
+                assert_eq!(polls, 1);
+                assert!(reason.contains("non-retryable"), "reason: {reason}");
+            }
+            other => panic!("expected GaveUp on non-retryable, got {other:?}"),
+        }
+    }
+
+    /// Terminal on the very first poll stops cleanly after exactly one
+    /// poll — no further polling, no zombie task.
+    #[tokio::test(start_paused = true)]
+    async fn daemon_terminal_on_first_poll_polls_once() {
+        let calls = Rc::new(RefCell::new(0usize));
+        let result = {
+            let calls = calls.clone();
+            drive_poll_schedule(move || {
+                *calls.borrow_mut() += 1;
+                async move { Ok(ok_outcome(ProcessingStatus::Aborted)) }
+            })
+            .await
+        };
+        match result {
+            PollScheduleResult::Terminal { polls, outcome } => {
+                assert_eq!(polls, 1);
+                assert_eq!(outcome.processing_status, ProcessingStatus::Aborted);
+            }
+            other => panic!("expected Terminal, got {other:?}"),
+        }
+        assert_eq!(
+            *calls.borrow(),
+            1,
+            "exactly one poll for a first-poll terminal"
+        );
     }
 
     /// The transaction-id lookup helper: a payload whose invoice_id

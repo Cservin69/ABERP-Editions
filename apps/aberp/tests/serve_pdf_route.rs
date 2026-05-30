@@ -192,6 +192,9 @@ fn build_state(wired: &WiredInvoice) -> AppState {
         // `serve_setup_nav_credentials_route.rs` for the
         // NeedsSetup-path coverage).
         secrets_cache: aberp::secrets_cache::SecretsCache::empty(),
+        nav_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            aberp::serve::NAV_POLL_DAEMON_CONCURRENCY,
+        )),
         boot_state: Arc::new(std::sync::RwLock::new(
             aberp::serve::ServeBootState::Ready {
                 operator_login: "test-operator".to_string(),

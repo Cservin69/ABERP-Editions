@@ -179,6 +179,9 @@ fn build_state(boot_state: ServeBootState, tenant: &str) -> AppState {
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),
         session_token: Arc::new("test-token".to_string()),
         secrets_cache: aberp::secrets_cache::SecretsCache::empty(),
+        nav_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            aberp::serve::NAV_POLL_DAEMON_CONCURRENCY,
+        )),
         boot_state: Arc::new(std::sync::RwLock::new(boot_state)),
     }
 }

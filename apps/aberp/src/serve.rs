@@ -427,9 +427,13 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         session_token: Arc::new(session_token.clone()),
         boot_state: Arc::new(std::sync::RwLock::new(initial_boot_state)),
         secrets_cache,
+        nav_poll_semaphore: Arc::new(tokio::sync::Semaphore::new(NAV_POLL_DAEMON_CONCURRENCY)),
     };
 
-    // 5. Build the axum router.
+    // 5. Build the axum router. Clone the state first so the app-boot
+    //    NAV poll daemon recovery (spawned inside the runtime below) has
+    //    its own handle after `build_router` consumes `state`.
+    let recovery_state = state.clone();
     let app = build_router(state);
 
     // 6. Build a tokio multi-thread runtime (the serve subcommand is
@@ -499,6 +503,53 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     );
 
     runtime.block_on(async move {
+        // Session-161 — app-boot NAV poll daemon recovery. Scan the
+        // audit ledger for invoices still in `Submitted` (NAV accepted,
+        // no terminal ack yet) and re-spawn an indefinite poll daemon
+        // for each. The audit trail is the truth; the daemon chases it.
+        // Closing ABERP mid-poll and reopening tomorrow resumes the
+        // chase. Best-effort: a scan failure logs and continues — the
+        // operator can still poll manually. Runs BEFORE `serve()` so the
+        // daemons are in flight as soon as the listener accepts.
+        match query_non_terminal_invoices(&recovery_state) {
+            Ok(pending) => {
+                tracing::info!(
+                    count = pending.len(),
+                    "spawning NAV poll daemons for pending invoices"
+                );
+                for invoice_id in pending {
+                    let st = recovery_state.clone();
+                    tokio::spawn(async move {
+                        match build_poll_daemon_inputs(&st, &invoice_id).await {
+                            Ok(inputs) => {
+                                if let Err(e) = poll_ack::run_nav_poll_daemon(
+                                    inputs,
+                                    st.nav_poll_semaphore.clone(),
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        invoice_id = %invoice_id,
+                                        error = ?e,
+                                        "boot-recovery NAV poll daemon failed"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::warn!(
+                                invoice_id = %invoice_id,
+                                error = ?e,
+                                "boot-recovery could not build poll daemon inputs; skipping"
+                            ),
+                        }
+                    });
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = ?e,
+                "boot-recovery NAV poll daemon scan failed; continuing without recovery"
+            ),
+        }
+
         let config = RustlsConfig::from_der(rustls_config.0, rustls_config.1)
             .await
             .context("build axum-server RustlsConfig")?;
@@ -855,7 +906,21 @@ pub struct AppState {
     /// email send, test connection), so the OS keychain is never read
     /// lazily mid-session. See [`SecretsCache`].
     pub secrets_cache: SecretsCache,
+    /// Session-161 — concurrency cap for the indefinite NAV poll
+    /// daemons. Each [`poll_ack::run_nav_poll_daemon`] holds one permit
+    /// for its whole lifetime, so this bounds the number of invoices
+    /// being actively watched (post-issue spawns + app-boot recovery
+    /// spawns combined). At [`NAV_POLL_DAEMON_CONCURRENCY`] permits the
+    /// steady-state poll rate is ≤ that many polls/min — well inside
+    /// NAV's published limits. Excess spawns block on `acquire()` until
+    /// a daemon terminates and frees its slot.
+    pub nav_poll_semaphore: Arc<tokio::sync::Semaphore>,
 }
+
+/// Session-161 — max number of NAV poll daemons polling concurrently.
+/// At the 1-minute phase-2 cadence this caps total NAV poll traffic at
+/// ≤ 50 requests/min even with every slot saturated.
+pub const NAV_POLL_DAEMON_CONCURRENCY: usize = 50;
 
 fn build_router(state: AppState) -> Router {
     Router::new()
@@ -3143,12 +3208,35 @@ async fn handle_issue_invoice(
                 if submit_to_nav_flag {
                     match submit_invoice_request(&task_state, &task_invoice_id).await {
                         Ok(_) => {
-                            if let Err(e) = poll_ack_request(&task_state, &task_invoice_id).await {
-                                tracing::warn!(
+                            // Session-161 — hand off to the indefinite
+                            // two-phase poll daemon instead of the bounded
+                            // ~31s `poll_ack_request`. The daemon runs to
+                            // terminal (or process shutdown); if NAV takes
+                            // minutes-to-hours the pictogram still flips on
+                            // its own with no operator click. Spawned as its
+                            // own task so this post-issue tail returns once
+                            // submit lands rather than living for the
+                            // daemon's whole lifetime.
+                            match build_poll_daemon_inputs(&task_state, &task_invoice_id).await {
+                                Ok(inputs) => {
+                                    let sem = task_state.nav_poll_semaphore.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) =
+                                            poll_ack::run_nav_poll_daemon(inputs, sem).await
+                                        {
+                                            tracing::warn!(
+                                                error = ?e,
+                                                "post-issue NAV poll daemon failed"
+                                            );
+                                        }
+                                    });
+                                }
+                                Err(e) => tracing::warn!(
                                     invoice_id = %task_invoice_id,
                                     error = ?e,
-                                    "post-issue auto-poll failed; pictogram stays actionable"
-                                );
+                                    "post-issue could not build poll daemon inputs; \
+                                     pictogram stays actionable for a manual poll"
+                                ),
                             }
                         }
                         Err(e) => {
@@ -7206,6 +7294,171 @@ fn parse_supplier_tax_number_from_xml(xml: &[u8]) -> Result<String> {
     Ok(id.to_string())
 }
 
+// ── Session-161 — NAV poll daemon orchestration ──────────────────────
+
+/// If `entry` is the `InvoiceDraftCreated` for `invoice_id` and carries
+/// a `nav_xml_path`, return it. Mirrors the `nav_xml_path` parse posture
+/// in [`derive_state_for`] / [`list_invoices`] (a future ADR that
+/// changes how the path is recorded must surface in all three).
+fn draft_nav_xml_path_for(entry: &Entry, invoice_id: &str) -> Option<PathBuf> {
+    if entry.kind != EventKind::InvoiceDraftCreated {
+        return None;
+    }
+    if extract_invoice_id(entry).as_deref() != Some(invoice_id) {
+        return None;
+    }
+    let parsed: audit_payloads::InvoiceDraftCreatedPayload =
+        serde_json::from_slice(&entry.payload).ok()?;
+    parsed.nav_xml_path.map(PathBuf::from)
+}
+
+/// Pure core of [`query_non_terminal_invoices`]: given every audit
+/// entry, return the ids of invoices that are still `Submitted` (NAV
+/// accepted, no terminal ack yet) AND carry a resolvable
+/// `transaction_id`. These are exactly the invoices an app-boot NAV poll
+/// daemon should chase. Factored out (no `AppState`, no ledger I/O) so
+/// the recovery scan is pinned by a plain in-memory-ledger test.
+///
+/// `PendingNavExists` is intentionally excluded: it has no
+/// `InvoiceSubmissionResponse` yet, hence no `transaction_id` to poll
+/// against (the retry-submit drain owns that pre-Response state, not the
+/// poll daemon). `Recovered`/terminal/abandoned states are excluded by
+/// the `Submitted`-only predicate.
+fn non_terminal_invoice_ids_from_entries(entries: &[Entry]) -> Vec<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_invoice: BTreeMap<String, InvoiceTrace> = BTreeMap::new();
+    let mut has_txid: BTreeSet<String> = BTreeSet::new();
+    for entry in entries {
+        if let Some(id) = extract_invoice_id(entry) {
+            by_invoice
+                .entry(id.clone())
+                .or_default()
+                .merge_entry(entry, &id);
+            if poll_ack::extract_transaction_id(entry, &id).is_some() {
+                has_txid.insert(id.clone());
+            }
+        }
+        if let Some(link) = extract_chain_link(entry) {
+            let trace = by_invoice.entry(link.base_invoice_id).or_default();
+            match link.kind {
+                EventKind::InvoiceStornoIssued => trace.is_storno_base = true,
+                EventKind::InvoiceModificationIssued => trace.is_amended_base = true,
+                _ => {}
+            }
+        }
+    }
+    by_invoice
+        .into_iter()
+        .filter(|(id, trace)| {
+            matches!(trace.derive_state(), InvoiceState::Submitted) && has_txid.contains(id)
+        })
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// App-boot recovery scan — open the audit ledger and return the
+/// invoice ids whose NAV state is non-terminal (`Submitted`) and which
+/// have a `transaction_id` to poll against. The caller re-spawns a poll
+/// daemon per id.
+fn query_non_terminal_invoices(state: &AppState) -> Result<Vec<String>> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute for boot-recovery scan")?;
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
+        .context("open audit ledger for boot-recovery scan")?;
+    let entries = ledger
+        .entries()
+        .context("read audit ledger entries for boot-recovery scan")?;
+    Ok(non_terminal_invoice_ids_from_entries(&entries))
+}
+
+/// Build the [`poll_ack::PollDaemonInputs`] for `invoice_id` from the
+/// audit ledger + the on-disk NAV XML + the keychain. Resolves the
+/// `transaction_id` from the latest `InvoiceSubmissionResponse`, the
+/// supplier tax number from the side-stored NAV XML, and a fresh
+/// per-daemon [`Actor`]. Used by BOTH the post-issue handoff and the
+/// app-boot recovery spawn so they share one resolution path.
+async fn build_poll_daemon_inputs(
+    state: &AppState,
+    invoice_id: &str,
+) -> Result<poll_ack::PollDaemonInputs> {
+    let operator_login = match state.boot_state.read() {
+        Ok(guard) => match &*guard {
+            ServeBootState::Ready { operator_login } => operator_login.clone(),
+            other => {
+                return Err(anyhow!(
+                    "build_poll_daemon_inputs called in non-Ready boot state ({}); \
+                     NAV setup must complete first",
+                    other.state_token()
+                ));
+            }
+        },
+        Err(e) => return Err(anyhow!("boot_state RwLock poisoned: {e}")),
+    };
+
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute for poll daemon inputs")?;
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
+        .context("open audit ledger to build poll daemon inputs")?;
+    let entries = ledger
+        .entries()
+        .context("read audit ledger entries to build poll daemon inputs")?;
+
+    let transaction_id = entries
+        .iter()
+        .rev()
+        .find_map(|e| poll_ack::extract_transaction_id(e, invoice_id))
+        .ok_or_else(|| {
+            anyhow!(
+                "invoice {invoice_id}: no InvoiceSubmissionResponse audit entry; \
+                 cannot start NAV poll daemon"
+            )
+        })?;
+    let nav_xml_path = entries
+        .iter()
+        .find_map(|e| draft_nav_xml_path_for(e, invoice_id))
+        .ok_or_else(|| {
+            anyhow!(
+                "invoice {invoice_id}: no nav_xml_path on InvoiceDraftCreated; \
+                 cannot resolve supplier tax number for the poll daemon"
+            )
+        })?;
+    let invoice_xml = std::fs::read(&nav_xml_path).with_context(|| {
+        format!(
+            "read NAV InvoiceData XML from {} for poll daemon inputs",
+            nav_xml_path.display()
+        )
+    })?;
+    let tax_number_8 = parse_supplier_tax_number_from_xml(&invoice_xml)?;
+
+    let credentials =
+        NavCredentials::load_from_keychain(state.tenant.as_str()).with_context(|| {
+            format!(
+                "load NAV credentials from OS keychain for tenant `{}`",
+                state.tenant.as_str()
+            )
+        })?;
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
+
+    Ok(poll_ack::PollDaemonInputs {
+        db: (*state.db_path).clone(),
+        tenant: state.tenant.clone(),
+        binary_hash,
+        invoice_id: invoice_id.to_string(),
+        transaction_id,
+        tax_number_8,
+        // NAV test endpoint only, per the standing boilerplate
+        // (production cutover gated by future ADR-0038); mirrors
+        // `poll_ack_request`.
+        endpoint: NavEndpoint::Test,
+        credentials,
+        actor,
+    })
+}
+
 /// Inspect the request's `Authorization` header against the expected
 /// bearer token. Returns `Some(response)` if the request must be
 /// rejected (no token, malformed token, mismatched token); returns
@@ -8754,6 +9007,116 @@ mod tests {
                 Some(idem.to_canonical_string()),
             )
             .unwrap();
+    }
+
+    /// Session-161 — the app-boot recovery scan returns ONLY invoices
+    /// that are still `Submitted` (NAV accepted, no terminal ack) and
+    /// carry a `transaction_id`. Terminal (Finalized/Rejected),
+    /// Abandoned, Recovered, and draft-only Ready invoices are all
+    /// excluded — a daemon for them would either re-poll a settled
+    /// invoice or have no transaction_id to poll.
+    #[test]
+    fn boot_recovery_scan_returns_only_submitted_with_txid() {
+        let (mut ledger, actor) = fixture_ledger();
+
+        // Submitted: response witnessed, no terminal ack → INCLUDED.
+        let s = IdempotencyKey::new();
+        write_draft(&mut ledger, &actor, "inv_submitted", s);
+        write_submission_response_originally_witnessed(
+            &mut ledger,
+            &actor,
+            "inv_submitted",
+            s,
+            "TX-SUB",
+        );
+
+        // Finalized: response + SAVED ack → excluded (terminal).
+        let f = IdempotencyKey::new();
+        write_draft(&mut ledger, &actor, "inv_finalized", f);
+        write_submission_response_originally_witnessed(
+            &mut ledger,
+            &actor,
+            "inv_finalized",
+            f,
+            "TX-FIN",
+        );
+        write_ack_status(&mut ledger, &actor, "inv_finalized", "TX-FIN", "SAVED");
+
+        // Abandoned: response + operator abandon → excluded.
+        let a = IdempotencyKey::new();
+        write_draft(&mut ledger, &actor, "inv_abandoned", a);
+        write_submission_response_originally_witnessed(
+            &mut ledger,
+            &actor,
+            "inv_abandoned",
+            a,
+            "TX-ABD",
+        );
+        write_marked_abandoned(&mut ledger, &actor, "inv_abandoned", a, "TX-ABD");
+
+        // Recovered: recover-from-nav response (not a fresh manageInvoice
+        // submit) → excluded; the poll daemon only chases fresh
+        // submissions.
+        let r = IdempotencyKey::new();
+        write_draft(&mut ledger, &actor, "inv_recovered", r);
+        write_submission_response_recovered(&mut ledger, &actor, "inv_recovered", r, "TX-REC");
+
+        // Ready: draft only, never submitted → excluded (no txid).
+        let d = IdempotencyKey::new();
+        write_draft(&mut ledger, &actor, "inv_ready", d);
+
+        let entries = ledger.entries().unwrap();
+        let pending = non_terminal_invoice_ids_from_entries(&entries);
+        assert_eq!(
+            pending,
+            vec!["inv_submitted".to_string()],
+            "only the Submitted-with-txid invoice should get a boot-recovery daemon"
+        );
+    }
+
+    /// Session-161 — the NAV poll daemon concurrency cap. Each daemon
+    /// holds one [`tokio::sync::Semaphore`] permit for its lifetime, so
+    /// the number of invoices polling at once never exceeds
+    /// [`NAV_POLL_DAEMON_CONCURRENCY`]. Spawn 60 permit-holders against a
+    /// cap-50 semaphore and assert peak concurrency stays ≤ cap. Pins
+    /// the invariant `run_nav_poll_daemon`'s `acquire()` relies on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nav_poll_daemon_concurrency_is_capped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(NAV_POLL_DAEMON_CONCURRENCY));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..60u32 {
+            let sem = sem.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                // Hold the permit across an await so overlap is real and
+                // observable (mirrors the daemon holding its permit
+                // across the poll loop's sleeps).
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let observed_peak = peak.load(Ordering::SeqCst);
+        assert!(
+            observed_peak <= NAV_POLL_DAEMON_CONCURRENCY,
+            "peak concurrency {observed_peak} exceeded the cap {NAV_POLL_DAEMON_CONCURRENCY}"
+        );
+        assert!(
+            observed_peak > 1,
+            "expected real concurrency (peak {observed_peak}); test would be vacuous otherwise"
+        );
     }
 
     fn write_storno_issued(
