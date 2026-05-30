@@ -753,7 +753,10 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     // rendered Year segment AND (under OnYearChange) the counter's
     // reset-year bucket — by construction they cannot disagree.
     let issue_year = invoice.issue_date.year();
-    let invoice_number = template.render(issue_year, invoice.sequence_number);
+    // S165 — `render_for_build` carries the `TEST-` prefix on dev/test
+    // builds so test-endpoint submissions are visually distinct; prod
+    // builds render unprefixed. The DB counter is unchanged.
+    let invoice_number = template.render_for_build(issue_year, invoice.sequence_number);
 
     let xml = nav_xml::render_invoice_data_with_number(
         &invoice,

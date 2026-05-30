@@ -74,7 +74,7 @@ use aberp_audit_ledger::{Actor, Entry, EventKind, Ledger, TenantId};
 use aberp_billing::{self as billing, BillingStore, Currency, DuckDbBillingStore, ReadyInvoice};
 use aberp_nav_transport::{
     operations::{find_all_technical_validations, TechnicalValidation},
-    NavCredentials, NavEndpoint, NavTransportError,
+    NavCredentials, NavTransportError,
 };
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -94,6 +94,7 @@ use ulid::Ulid;
 use crate::audit_payloads::{self, InvoiceEmailedSentPayload, PaymentMethod};
 use crate::audit_query::PaymentRecord;
 use crate::binary_hash::BinaryHashHandle;
+use crate::build_profile;
 use crate::cli::ServeArgs;
 use crate::email_invoice::{self, EmailSendError, SendInvoiceEmailInput, SendTrigger};
 use crate::invoice_bank_snapshot::load_invoice_bank_snapshot_in_tx;
@@ -170,7 +171,76 @@ fn dirs_home_or_loud_fail() -> Result<PathBuf> {
     ))
 }
 
+/// S165 / deliverable #5 — the hülye-biztos cross-stream guard. A
+/// PRODUCTION build (compiled `--features production`) MUST run as
+/// `tenant=prod`; a DEV build MUST NOT run as `tenant=prod`. Either
+/// mismatch is a loud `exit(1)` with a remediation hint — never a
+/// silent wrong-environment start (CLAUDE.md rule 12). The prod/test
+/// choice is baked in at compile time, so the two streams can never
+/// cross: a dev binary cannot touch real NAV even if launched as prod.
+fn guard_tenant_matches_build(tenant: &str) {
+    if crate::build_profile::IS_PRODUCTION_BUILD && tenant != "prod" {
+        eprintln!(
+            "❌ FATAL: this is a PRODUCTION build but ABERP_TENANT={tenant} (expected 'prod'). \
+             Refusing to start."
+        );
+        eprintln!("   Either: launch with `run/run_prod.sh` (sets ABERP_TENANT=prod), OR");
+        eprintln!("   re-build without --features production for dev use.");
+        std::process::exit(1);
+    }
+    if !crate::build_profile::IS_PRODUCTION_BUILD && tenant == "prod" {
+        eprintln!("❌ FATAL: this is a DEV build but ABERP_TENANT=prod. Refusing to start.");
+        eprintln!("   Either: launch with `run/run_prod.sh` (compiles --features production), OR");
+        eprintln!("   set ABERP_TENANT=test (or another non-prod tenant).");
+        std::process::exit(1);
+    }
+}
+
+/// S165 / deliverable #3 — one-shot boot banner. PRODUCTION builds get a
+/// loud red/yellow REAL-NAV warning; dev builds get a dim one-liner.
+/// Bilingual (HU + EN) per the closed-vocab banner constraint. ANSI
+/// colours are emitted only when stderr is a real terminal so the Tauri
+/// stderr-pump's log ring does not show escape-code garbage.
+fn print_boot_banner(tenant: &str) {
+    use std::io::IsTerminal as _;
+    let color = std::io::stderr().is_terminal();
+    let endpoint = crate::build_profile::nav_endpoint().hostname();
+
+    // ANSI helpers — no-ops when the sink is not a terminal.
+    let red_bold = if color { "\x1b[1;31m" } else { "" };
+    let yellow = if color { "\x1b[33m" } else { "" };
+    let dim = if color { "\x1b[2m" } else { "" };
+    let reset = if color { "\x1b[0m" } else { "" };
+
+    if crate::build_profile::IS_PRODUCTION_BUILD {
+        let rule = "═══════════════════════════════════════════════════════";
+        eprintln!("{red_bold}{rule}{reset}");
+        eprintln!("{red_bold}  ⚠️  PRODUCTION MODE — REAL NAV — REAL EMAILS{reset}");
+        eprintln!("{yellow}      ÉLES ÜZEM — VALÓDI NAV — VALÓDI E-MAILEK{reset}");
+        eprintln!("{red_bold}  tenant={tenant}  endpoint={endpoint}{reset}");
+        eprintln!("{red_bold}{rule}{reset}");
+    } else {
+        eprintln!("{dim}[dev] ABERP — tenant={tenant}  endpoint={endpoint}{reset}");
+        eprintln!("{dim}      [teszt] nincs valódi fiskális hatás / no real fiscal effect{reset}");
+    }
+}
+
 pub fn run(args: &ServeArgs) -> Result<()> {
+    // S165 / deliverable #5 — hülye-biztos cross-stream guard. Runs
+    // FIRST, before the binary-hash thread, keychain, or DB are touched,
+    // so a mismatched launch dies instantly with a remediation hint.
+    // `args.tenant` is the authoritative tenant the server runs as (the
+    // launchers set ABERP_TENANT, aberp-ui forwards it as `--tenant`).
+    // The prod/test choice is COMPILE-TIME (`build_profile`), so a dev
+    // binary physically cannot run as tenant=prod and vice versa.
+    guard_tenant_matches_build(&args.tenant);
+
+    // S165 / deliverable #3 — one-shot boot banner naming the NAV
+    // environment this build talks to. Loud + colourised on a real
+    // terminal so the operator can never confuse a PROD launch for a
+    // dev one. Emitted to stderr (stdout carries the handshake line).
+    print_boot_banner(&args.tenant);
+
     let _span = tracing::info_span!(
         "serve",
         tenant = %args.tenant,
@@ -1941,6 +2011,11 @@ struct HealthResponse {
     ok: bool,
     binary_hash: String,
     nav_xsd_version: &'static str,
+    /// S165 — whether this backend binary was compiled with
+    /// `--features production`. The SPA reads this to drop the `TEST-`
+    /// prefix from the Tenant-Settings invoice-number live preview on a
+    /// production build (so the preview matches what actually emits).
+    is_production_build: bool,
 }
 
 async fn handle_health(State(state): State<AppState>) -> Response {
@@ -1957,6 +2032,7 @@ async fn handle_health(State(state): State<AppState>) -> Response {
             ok: true,
             binary_hash: hex::encode(hash.as_bytes()),
             nav_xsd_version: aberp_nav_xsd_validator::NAV_XSD_VERSION,
+            is_production_build: crate::build_profile::IS_PRODUCTION_BUILD,
         })
         .into_response(),
         Err(e) => (
@@ -3839,9 +3915,12 @@ pub async fn submit_invoice_request(
     // 6. Mint per-request Actor from startup-loaded operator login.
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
 
-    // 7. Dispatch into the library helper. The route surface routes
-    //    only to NAV test per the standing boilerplate (production
-    //    cutover gated by future ADR-0038).
+    // 7. Dispatch into the library helper. S165 — the endpoint is now
+    //    the compile-time build-profile choice (prod build → real NAV,
+    //    dev/test build → NAV test). The defence-in-depth gate refuses a
+    //    prod endpoint from a dev binary no matter what.
+    let endpoint = build_profile::nav_endpoint();
+    build_profile::assert_endpoint_allowed(endpoint).map_err(SubmitRouteError::Other)?;
     submit_invoice::submit_from_inputs(submit_invoice::SubmitFromInputs {
         db: &state.db_path,
         tenant_str: state.tenant.as_str(),
@@ -3849,8 +3928,8 @@ pub async fn submit_invoice_request(
         invoice_xml_origin: nav_xml_path.display().to_string(),
         invoice_xml,
         tax_number_raw: &tax_number_8,
-        nav_endpoint: NavEndpoint::Test,
-        endpoint_audit_label: "test",
+        nav_endpoint: endpoint,
+        endpoint_audit_label: build_profile::nav_endpoint_audit_label(),
         credentials: &credentials,
         actor,
     })
@@ -3958,15 +4037,17 @@ pub async fn poll_ack_request(
     // 4. Mint per-request Actor.
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
 
-    // 5. Dispatch into the library helper. NAV test endpoint only
-    //    per the standing boilerplate (production cutover gated by
-    //    future ADR-0038).
+    // 5. Dispatch into the library helper. S165 — endpoint is the
+    //    compile-time build-profile choice; the gate refuses a prod
+    //    endpoint from a dev binary.
+    let endpoint = build_profile::nav_endpoint();
+    build_profile::assert_endpoint_allowed(endpoint).map_err(SubmitRouteError::Other)?;
     poll_ack::poll_ack_from_inputs(
         &state.db_path,
         state.tenant.as_str(),
         invoice_id,
         &tax_number_8,
-        NavEndpoint::Test,
+        endpoint,
         &credentials,
         actor,
     )
@@ -7474,6 +7555,12 @@ async fn build_poll_daemon_inputs(
         })?;
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login);
 
+    // S165 — endpoint is the compile-time build-profile choice; the
+    // gate refuses a prod endpoint from a dev binary. Mirrors
+    // `poll_ack_request` + `submit_invoice_request`.
+    let endpoint = build_profile::nav_endpoint();
+    build_profile::assert_endpoint_allowed(endpoint)?;
+
     Ok(poll_ack::PollDaemonInputs {
         db: (*state.db_path).clone(),
         tenant: state.tenant.clone(),
@@ -7481,10 +7568,7 @@ async fn build_poll_daemon_inputs(
         invoice_id: invoice_id.to_string(),
         transaction_id,
         tax_number_8,
-        // NAV test endpoint only, per the standing boilerplate
-        // (production cutover gated by future ADR-0038); mirrors
-        // `poll_ack_request`.
-        endpoint: NavEndpoint::Test,
+        endpoint,
         credentials,
         actor,
     })

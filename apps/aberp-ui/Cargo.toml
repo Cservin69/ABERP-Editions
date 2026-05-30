@@ -21,6 +21,17 @@ path = "src/lib.rs"
 name = "aberp-ui"
 path = "src/main.rs"
 
+# S165 / prod-prep PR #1 — accepts `--features production` so
+# `run/run_prod.sh`'s `cargo run --features production --bin aberp-ui`
+# resolves. No-op in the shell binary itself: the prod/test NAV choice
+# is baked into the SEPARATELY-built `aberp serve` binary (which
+# run_prod.sh builds with `--features production`); aberp-ui only
+# spawns that binary. The feature exists here purely so the launcher's
+# unified `--features production` flag is accepted on this package.
+[features]
+default = []
+production = []
+
 [build-dependencies]
 # Tauri 2 build step: parses tauri.conf.json + capabilities/*.json and
 # emits the wire-format the runtime uses. Workspace catalogue pins the

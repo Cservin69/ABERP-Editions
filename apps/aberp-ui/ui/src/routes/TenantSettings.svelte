@@ -60,12 +60,18 @@
     moveSegmentDown,
     moveSegmentUp,
     removeSegment,
-    renderTemplate,
+    renderTemplateForBuild,
     validateTemplate,
     type NumberingSegment,
     type NumberingTemplate,
   } from "../lib/invoice-numbering";
   import { formFromSellerInfo } from "../lib/tenant-settings";
+
+  // S165 — `isProductionBuild` comes from `GET /health` (threaded down
+  // by App.svelte). Default `false` (dev/test) so the preview shows the
+  // `TEST-` prefix until health resolves — the dev-safe default.
+  let { isProductionBuild = false }: { isProductionBuild?: boolean } =
+    $props();
 
   let form: SellerConfigForm = $state({ ...DEFAULT_SELLER_CONFIG_FORM });
   let loading = $state(true);
@@ -150,16 +156,24 @@
     const err = validateTemplate(numbering);
     if (err !== null) return "—";
     const year = new Date().getFullYear();
-    return renderTemplate(numbering, year, numbering.start_value);
+    // S165 — preview the BUILD-rendered shape so it matches what the
+    // backend emits: `TEST-…` on dev/test builds, unprefixed on prod.
+    return renderTemplateForBuild(
+      numbering,
+      year,
+      numbering.start_value,
+      isProductionBuild,
+    );
   });
   let numberingPreviewNextYear = $derived.by(() => {
     const err = validateTemplate(numbering);
     if (err !== null) return null;
     if (numbering.reset_policy !== "on_year_change") return null;
-    return renderTemplate(
+    return renderTemplateForBuild(
       numbering,
       new Date().getFullYear() + 1,
       numbering.start_value,
+      isProductionBuild,
     );
   });
 

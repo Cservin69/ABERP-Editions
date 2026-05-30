@@ -116,6 +116,32 @@ export function renderTemplate(
   return out;
 }
 
+/** S165 — invoice-number build prefix. Mirrors the Rust
+ * `build_profile::INVOICE_NUMBER_TEST_PREFIX`: dev/test builds prepend
+ * `TEST-` (NAV-charset-legal hyphen, never underscore), production
+ * builds prepend nothing. The SPA learns `isProductionBuild` from the
+ * `GET /health` response. */
+export function invoiceNumberBuildPrefix(isProductionBuild: boolean): string {
+  return isProductionBuild ? "" : "TEST-";
+}
+
+/** S165 — render WITH the build prefix applied, mirroring the Rust
+ * `NumberingTemplate::render_for_build`. The Tenant-Settings live
+ * preview uses this so what the operator sees matches what the backend
+ * actually emits onto the NAV wire: `TEST-ABERP/2026/0042` on a dev/test
+ * build, `ABERP/2026/0042` on a production build. */
+export function renderTemplateForBuild(
+  template: NumberingTemplate,
+  year: number,
+  sequence: number,
+  isProductionBuild: boolean,
+): string {
+  return (
+    invoiceNumberBuildPrefix(isProductionBuild) +
+    renderTemplate(template, year, sequence)
+  );
+}
+
 /** Validate a template against the same ADR-0045 §3 invariants the
  * Rust validator enforces. Returns `null` when ok; the first found
  * `NumberingValidationError` otherwise. The SPA save button uses this

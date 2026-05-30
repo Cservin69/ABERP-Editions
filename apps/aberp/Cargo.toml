@@ -22,6 +22,17 @@ path = "src/lib.rs"
 name = "aberp"
 path = "src/main.rs"
 
+# S165 / prod-prep PR #1 — the compile-time production switch. Enabling
+# `production` flips the NAV endpoint to the real `api.onlineszamla`
+# host, lifts the dev-build prod-endpoint refusal gate, drops the
+# `TEST-` invoice-number prefix, and arms the boot banner + tenant
+# guard. COMPILE-TIME on purpose (no env override) so the compiler
+# bakes the prod/test choice into the binary — hülye-biztos per the
+# go-live ceremony. See `src/build_profile.rs`.
+[features]
+default = []
+production = []
+
 [dependencies]
 # Workspace siblings — production deps. `aberp-audit-ledger` is included
 # WITHOUT the `test-support` feature; that feature lives only in dev-

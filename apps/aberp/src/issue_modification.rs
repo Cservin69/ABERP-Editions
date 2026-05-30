@@ -400,9 +400,13 @@ pub fn modification_from_inputs(
     // setup. Base number uses the base's issue year (cross-year
     // modifications must still cite the base by its original year);
     // the modification's own number uses the modification's issue year.
-    let base_invoice_number = template.render(base_issue_year, base_sequence_number);
+    // S165 — both numbers carry the build-profile prefix via
+    // `render_for_build`. The base was emitted under the same build's
+    // prefix at its own issuance, so re-rendering it here with the same
+    // prefix keeps the modification reference byte-identical to the base.
+    let base_invoice_number = template.render_for_build(base_issue_year, base_sequence_number);
     let modification_invoice_number =
-        template.render(modification.issue_date.year(), modification.sequence_number);
+        template.render_for_build(modification.issue_date.year(), modification.sequence_number);
     let modification_reference = ModificationReference {
         base_invoice_number,
         modification_index,

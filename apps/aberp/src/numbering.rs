@@ -177,6 +177,23 @@ impl NumberingTemplate {
         }
         out
     }
+
+    /// S165 — render with the build-profile prefix applied. Dev/test
+    /// builds prepend [`crate::build_profile::INVOICE_NUMBER_TEST_PREFIX`]
+    /// (`TEST-`) so test-endpoint submissions carry a visually distinct,
+    /// NAV-charset-legal number; production builds render unprefixed.
+    /// Purely render-side — the DB sequence counter is untouched, so a
+    /// build switch never resets or skips a number. This is the method
+    /// the live emit sites (`issue_invoice`, `issue_storno`,
+    /// `issue_modification`) call; the bare [`render`](Self::render)
+    /// stays pure for the validator + the unit-test pins.
+    pub fn render_for_build(&self, year: i32, sequence: u64) -> String {
+        format!(
+            "{}{}",
+            crate::build_profile::INVOICE_NUMBER_TEST_PREFIX,
+            self.render(year, sequence)
+        )
+    }
 }
 
 /// Typed validate-time failures per ADR-0045 §3. Every variant is a
@@ -850,14 +867,14 @@ fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
 /// in-flight submission.
 pub fn format_invoice_number(seller_toml_path: &Path, year: i32, sequence: u64) -> String {
     match read_numbering_template(seller_toml_path) {
-        Ok(t) => t.render(year, sequence),
+        Ok(t) => t.render_for_build(year, sequence),
         Err(e) => {
             tracing::warn!(
                 err = %e,
                 path = %seller_toml_path.display(),
                 "could not read invoice-number template; falling back to default INV-default/NNNNN"
             );
-            default_template().render(year, sequence)
+            default_template().render_for_build(year, sequence)
         }
     }
 }
@@ -1252,6 +1269,76 @@ reset_policy = \"weekly\"\n";
         // ensure absent
         let _ = std::fs::remove_file(&tmp);
         let rendered = format_invoice_number(&tmp, 2026, 42);
-        assert_eq!(rendered, "INV-default/00042");
+        // S165 — the emit path now carries the build-profile prefix
+        // (`TEST-` on dev/test builds, empty on production). Compose the
+        // expectation from the const so this pins identically under both
+        // build flavours.
+        assert_eq!(
+            rendered,
+            format!(
+                "{}INV-default/00042",
+                crate::build_profile::INVOICE_NUMBER_TEST_PREFIX
+            )
+        );
+    }
+
+    /// S165 — `render_for_build` carries the build prefix while the bare
+    /// `render` stays clean. On dev/test builds (feature OFF) the emit
+    /// shape is `TEST-ABERP/2026/0042`; on production builds (feature ON)
+    /// it is the unprefixed `ABERP/2026/0042`.
+    #[cfg(not(feature = "production"))]
+    #[test]
+    fn render_for_build_prepends_test_prefix_in_dev_build() {
+        let t = NumberingTemplate {
+            segments: vec![
+                Segment::Literal("ABERP/".to_string()),
+                Segment::Year {
+                    digits: YearDigits::Four,
+                },
+                Segment::Literal("/".to_string()),
+                Segment::Counter { pad_width: 4 },
+            ],
+            reset_policy: ResetPolicy::OnYearChange,
+            start_value: 1,
+        };
+        // The pure render is unprefixed; the build render adds TEST-.
+        assert_eq!(t.render(2026, 42), "ABERP/2026/0042");
+        assert_eq!(t.render_for_build(2026, 42), "TEST-ABERP/2026/0042");
+    }
+
+    #[cfg(feature = "production")]
+    #[test]
+    fn render_for_build_omits_prefix_in_production_build() {
+        let t = NumberingTemplate {
+            segments: vec![
+                Segment::Literal("ABERP/".to_string()),
+                Segment::Year {
+                    digits: YearDigits::Four,
+                },
+                Segment::Literal("/".to_string()),
+                Segment::Counter { pad_width: 4 },
+            ],
+            reset_policy: ResetPolicy::OnYearChange,
+            start_value: 1,
+        };
+        assert_eq!(t.render_for_build(2026, 42), "ABERP/2026/0042");
+    }
+
+    /// S165 — the `TEST-` prefix MUST stay inside the NAV `invoiceNumber`
+    /// XSD charset (`[0-9A-Za-z\-/]`): `TEST-ABERP/2026/0042` is all
+    /// letters + digits + hyphen + slash, so every character passes
+    /// [`is_nav_invoice_number_char`] and the length is well under 50.
+    /// (Hyphen is legal; underscore — empirically rejected by the
+    /// validator — is NOT used.)
+    #[test]
+    fn test_prefix_passes_nav_invoice_number_charset() {
+        let rendered = "TEST-ABERP/2026/0042";
+        assert!(rendered.len() <= NAV_INVOICE_NUMBER_MAX_LEN);
+        for c in rendered.chars() {
+            assert!(
+                is_nav_invoice_number_char(c),
+                "char {c:?} in `{rendered}` is not NAV-invoiceNumber-charset-legal"
+            );
+        }
     }
 }

@@ -23,6 +23,7 @@
 pub mod audit_payloads;
 pub mod audit_query;
 pub mod binary_hash;
+pub mod build_profile;
 pub mod cli;
 pub mod drain_pending_retries;
 pub mod drain_submission_queue;

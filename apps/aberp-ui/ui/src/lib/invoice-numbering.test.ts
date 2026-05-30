@@ -9,14 +9,47 @@ import { describe, expect, test } from "vitest";
 import {
   defaultTemplate,
   errorMessage,
+  invoiceNumberBuildPrefix,
   moveSegmentDown,
   moveSegmentUp,
   removeSegment,
   renderTemplate,
+  renderTemplateForBuild,
   validateTemplate,
   type NumberingSegment,
   type NumberingTemplate,
 } from "./invoice-numbering";
+
+describe("S165 build-profile prefix", () => {
+  // The "feature flag check" is `isProductionBuild`, threaded into the
+  // SPA from `GET /health`. Mock it by passing the boolean directly.
+  const t: NumberingTemplate = {
+    segments: [
+      { kind: "Literal", text: "ABERP/" },
+      { kind: "Year", digits: 4 },
+      { kind: "Literal", text: "/" },
+      { kind: "Counter", pad_width: 4 },
+    ],
+    reset_policy: "on_year_change",
+    start_value: 1,
+  };
+
+  test("dev/test build (feature OFF) prepends TEST-", () => {
+    expect(invoiceNumberBuildPrefix(false)).toBe("TEST-");
+    expect(renderTemplateForBuild(t, 2026, 42, false)).toBe(
+      "TEST-ABERP/2026/0042",
+    );
+  });
+
+  test("production build (feature ON) omits the prefix", () => {
+    expect(invoiceNumberBuildPrefix(true)).toBe("");
+    expect(renderTemplateForBuild(t, 2026, 42, true)).toBe("ABERP/2026/0042");
+    // …and matches the bare pure render exactly.
+    expect(renderTemplateForBuild(t, 2026, 42, true)).toBe(
+      renderTemplate(t, 2026, 42),
+    );
+  });
+});
 
 describe("default template", () => {
   test("renders the pre-PR-89 INV-default/NNNNN shape byte-for-byte", () => {

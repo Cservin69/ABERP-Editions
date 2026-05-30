@@ -399,7 +399,9 @@
           </section>
         {/if}
         {#if route === "tenant"}
-          <TenantSettings />
+          <TenantSettings
+            isProductionBuild={healthInfo?.is_production_build ?? false}
+          />
         {:else if route === "nav-credentials"}
           <NavCredentialsSettings />
         {:else if route === "partners"}

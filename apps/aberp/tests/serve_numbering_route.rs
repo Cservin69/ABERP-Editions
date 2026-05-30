@@ -205,7 +205,16 @@ fn format_invoice_number_default_fallback_matches_pre_pr89() {
     let path = dir.join("seller.toml");
     assert!(!path.exists());
     let rendered = numbering::format_invoice_number(&path, 2026, 42);
-    assert_eq!(rendered, "INV-default/00042");
+    // S165 — the emit path carries the build-profile prefix (`TEST-` on
+    // dev/test builds, empty on production). Compose from the const so
+    // this pins identically under both build flavours.
+    assert_eq!(
+        rendered,
+        format!(
+            "{}INV-default/00042",
+            aberp::build_profile::INVOICE_NUMBER_TEST_PREFIX
+        )
+    );
 }
 
 /// `format_invoice_number` reads the persisted template and renders
@@ -229,8 +238,11 @@ fn format_invoice_number_reads_persisted_template() {
         start_value: 1,
     };
     numbering::write_numbering_section(&path, &template).expect("write template");
+    // S165 — prefix-aware: the emit path prepends `TEST-` on dev/test
+    // builds and nothing on production builds.
+    let prefix = aberp::build_profile::INVOICE_NUMBER_TEST_PREFIX;
     let rendered = numbering::format_invoice_number(&path, 2026, 1);
-    assert_eq!(rendered, "ABERP-2026/000001");
+    assert_eq!(rendered, format!("{prefix}ABERP-2026/000001"));
     let rendered_later = numbering::format_invoice_number(&path, 2027, 1);
-    assert_eq!(rendered_later, "ABERP-2027/000001");
+    assert_eq!(rendered_later, format!("{prefix}ABERP-2027/000001"));
 }

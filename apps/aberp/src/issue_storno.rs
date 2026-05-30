@@ -464,8 +464,13 @@ pub fn storno_from_inputs(
     // the storno is issued in 2026). The STORNO's own number uses the
     // storno's issue year; under OnYearChange that issue year is also
     // the counter's reset-year bucket (agreement by construction).
-    let base_invoice_number = template.render(base_issue_year, base_sequence_number);
-    let storno_invoice_number = template.render(storno.issue_date.year(), storno.sequence_number);
+    // S165 — both numbers carry the build-profile prefix via
+    // `render_for_build`. The base storno-reference must match the
+    // original emit (same build, same prefix); the storno's own number
+    // gets the same prefix.
+    let base_invoice_number = template.render_for_build(base_issue_year, base_sequence_number);
+    let storno_invoice_number =
+        template.render_for_build(storno.issue_date.year(), storno.sequence_number);
     let storno_reference = StornoReference {
         base_invoice_number,
         modification_index,

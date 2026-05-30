@@ -255,9 +255,16 @@ async fn issue_route_huf_happy_path_writes_audit_pair_and_xml() {
         "invoice_id `{}` must be prefixed-ULID",
         summary.invoice_id
     );
+    // S165 — the emit path now prepends the build-profile prefix
+    // (`TEST-` on dev/test builds, empty on production). Compose the
+    // expected stem from the const so this pins under both flavours.
+    let number_stem = format!(
+        "{}INV-default/",
+        aberp::build_profile::INVOICE_NUMBER_TEST_PREFIX
+    );
     assert!(
-        summary.invoice_number.starts_with("INV-default/"),
-        "invoice_number `{}` must carry the series prefix",
+        summary.invoice_number.starts_with(&number_stem),
+        "invoice_number `{}` must carry the build prefix + series stem `{number_stem}`",
         summary.invoice_number
     );
     assert!(

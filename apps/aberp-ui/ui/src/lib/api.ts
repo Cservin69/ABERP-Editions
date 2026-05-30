@@ -367,6 +367,10 @@ export interface HealthResponse {
   ok: boolean;
   binary_hash: string;
   nav_xsd_version: string;
+  /** S165 — `true` when the backend was compiled `--features
+   * production`. Drives the Tenant-Settings invoice-number preview's
+   * `TEST-` prefix (shown on dev/test builds, dropped on production). */
+  is_production_build: boolean;
 }
 
 export async function health(): Promise<HealthResponse> {

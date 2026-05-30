@@ -177,6 +177,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ---------- S165 hülye-biztos guard: this is the DEV launcher ----------------
+# Symmetric counterpart to the Rust `guard_tenant_matches_build` in
+# `apps/aberp/src/serve.rs`: run_desktop.sh builds the DEV (non-production)
+# binary, so tenant=prod is structurally wrong here. Refuse loudly and
+# steer the operator to run_prod.sh. (The compiled-feature half of the
+# guard lives in the Rust binary — a dev build also exits(1) on
+# tenant=prod even if this shell check is bypassed.)
+if [[ "${tenant}" == "prod" ]]; then
+  echo "[fail] run_desktop.sh is the DEV launcher and builds WITHOUT --features production;" >&2
+  echo "       tenant=prod is refused. Use run/run_prod.sh for a real production launch," >&2
+  echo "       or pick a non-prod tenant (e.g. --tenant test)." >&2
+  exit 1
+fi
+
 # ---------- preserve original cwd -------------------------------------------
 readonly ORIGINAL_CWD="$(pwd)"
 
