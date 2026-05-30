@@ -239,6 +239,15 @@ pub fn run() {
             commands::put_smtp_config,
             commands::test_smtp_connection,
             commands::email_invoice_to_buyer,
+            // PR-179 / session-179 — AP module SPA surface (S177/S178
+            // routes). Five thin pass-throughs to the backend's
+            // incoming-invoice routes; consumed by the new
+            // IncomingInvoiceList SPA screen.
+            commands::list_incoming_invoices,
+            commands::mark_incoming_paid,
+            commands::mark_incoming_outstanding,
+            commands::mark_incoming_irrelevant,
+            commands::sync_incoming_invoices_now,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

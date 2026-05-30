@@ -627,6 +627,74 @@ pub async fn email_invoice_to_buyer(
     .await
 }
 
+// ── PR-179 / session-179 — AP module SPA surface ─────────────────────
+//
+// Five `#[tauri::command]` wrappers around the S177/S178 backend
+// routes. The SPA's `IncomingInvoiceList` route consumes these to
+// fetch + manage the AP-side mirror. Wire shapes are documented on
+// the backend handlers in `apps/aberp/src/serve.rs` (`handle_list_
+// incoming_invoices`, `handle_mark_incoming_paid`, etc.) — these
+// commands are pure pass-throughs.
+
+/// `GET /api/incoming-invoices` — returns the AP-side mirror rows.
+/// All filters are server-side closed-vocab; this command does not
+/// surface them today (the SPA filters client-side over the
+/// in-memory list per the AR-side posture).
+#[tauri::command]
+pub async fn list_incoming_invoices(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/incoming-invoices", true).await
+}
+
+/// `POST /api/incoming-invoices/:id/mark-paid` — closed-vocab
+/// transition (`Outstanding` → `Paid`). No body.
+#[tauri::command]
+pub async fn mark_incoming_paid(
+    state: State<'_, AppState>,
+    incoming_id: String,
+) -> Result<Value, String> {
+    validate_invoice_id(&incoming_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/incoming-invoices/{incoming_id}/mark-paid");
+    forward_post(&state, &path, Value::Null).await
+}
+
+/// `POST /api/incoming-invoices/:id/mark-outstanding` — closed-vocab
+/// transition (`Paid` or `Irrelevant` → `Outstanding`). The two-step
+/// rule (no direct `Paid ↔ Irrelevant`) is enforced backend-side;
+/// the SPA must surface the 400 error verbatim when it hits.
+#[tauri::command]
+pub async fn mark_incoming_outstanding(
+    state: State<'_, AppState>,
+    incoming_id: String,
+) -> Result<Value, String> {
+    validate_invoice_id(&incoming_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/incoming-invoices/{incoming_id}/mark-outstanding");
+    forward_post(&state, &path, Value::Null).await
+}
+
+/// `POST /api/incoming-invoices/:id/mark-irrelevant` — closed-vocab
+/// transition (`Outstanding` → `Irrelevant`). Body is
+/// `{ "reason": "<non-empty>" }`; backend loud-fails an empty reason
+/// with HTTP 400 (`ReasonRequiredForIrrelevant`).
+#[tauri::command]
+pub async fn mark_incoming_irrelevant(
+    state: State<'_, AppState>,
+    incoming_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_invoice_id(&incoming_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/incoming-invoices/{incoming_id}/mark-irrelevant");
+    forward_post(&state, &path, body).await
+}
+
+/// `POST /api/incoming-invoices/sync-now` — operator-clicked manual
+/// trigger for the AP digest sweep. Synchronous (blocks the response
+/// until the cycle returns counts), same code path as the cadence
+/// daemon. Returns the typed summary the SPA renders in the toast.
+#[tauri::command]
+pub async fn sync_incoming_invoices_now(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_post(&state, "/api/incoming-invoices/sync-now", Value::Null).await
+}
+
 /// PR-45a / session-61 — the SPA's Retry button calls this command
 /// from the "backend boot failed" error pane. Spawns a fresh
 /// `boot_backend` attempt; the SPA continues polling

@@ -1683,3 +1683,88 @@ export async function testSmtpConnection(
 ): Promise<SmtpTestOutcome> {
   return invoke<SmtpTestOutcome>("test_smtp_connection", { body });
 }
+
+// ── PR-179 / session-179 — AP module SPA surface ────────────────────
+//
+// Mirrors `apps/aberp/src/incoming_invoices.rs::IncomingInvoice` 1:1.
+// Currency rides as `string` not `Currency` because the backend stores
+// the raw column verbatim — the IncomingInvoiceList component coerces
+// it to the closed-vocab union at render time (so a future supplier
+// invoice in GBP renders muted rather than crashing the table).
+export interface IncomingInvoice {
+  id: string;
+  supplier_tax_number: string;
+  supplier_name: string;
+  supplier_address: string | null;
+  nav_invoice_number: string;
+  issue_date: string;
+  delivery_date: string | null;
+  payment_deadline: string | null;
+  total_net_minor: number;
+  total_vat_minor: number;
+  total_gross_minor: number;
+  currency: string;
+  /** Closed-vocab string: `"Outstanding"` | `"Paid"` | `"Irrelevant"`.
+   * A backend that drifts to a fourth label surfaces as the muted
+   * "Unknown" chip per CLAUDE.md rule 12 — visible miss, not a crash. */
+  local_status: string;
+  irrelevant_reason: string | null;
+  nav_xml_path: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Mirrors `serve::MarkIncomingStatusResponse`. */
+export interface MarkIncomingStatusResponse {
+  id: string;
+  from_status: string;
+  to_status: string;
+  reason: string | null;
+  entries_verified: number;
+}
+
+/** Mirrors `serve::SyncIncomingNowResponse`. */
+export interface SyncIncomingNowResponse {
+  /** `"ok"` on a clean cycle; `"error"` on loud-fail. */
+  status: "ok" | "error";
+  ingested_count: number;
+  skipped_count: number;
+  pages_walked: number;
+  elapsed_ms: number;
+  date_from: string;
+  date_to: string;
+  /** `null` on success; verbatim NAV diagnostic on failure. */
+  error: string | null;
+}
+
+export async function listIncomingInvoices(): Promise<IncomingInvoice[]> {
+  return invoke<IncomingInvoice[]>("list_incoming_invoices");
+}
+
+export async function markIncomingPaid(
+  incomingId: string,
+): Promise<MarkIncomingStatusResponse> {
+  return invoke<MarkIncomingStatusResponse>("mark_incoming_paid", { incomingId });
+}
+
+export async function markIncomingOutstanding(
+  incomingId: string,
+): Promise<MarkIncomingStatusResponse> {
+  return invoke<MarkIncomingStatusResponse>("mark_incoming_outstanding", {
+    incomingId,
+  });
+}
+
+export async function markIncomingIrrelevant(
+  incomingId: string,
+  reason: string,
+): Promise<MarkIncomingStatusResponse> {
+  return invoke<MarkIncomingStatusResponse>("mark_incoming_irrelevant", {
+    incomingId,
+    body: { reason },
+  });
+}
+
+export async function syncIncomingInvoicesNow(): Promise<SyncIncomingNowResponse> {
+  return invoke<SyncIncomingNowResponse>("sync_incoming_invoices_now");
+}

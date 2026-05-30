@@ -61,6 +61,7 @@
   import FirstProdLaunchModal from "./routes/FirstProdLaunchModal.svelte";
   import { shouldShowFirstProdLaunchModal } from "./lib/first-prod-launch";
   import InvoiceList from "./routes/InvoiceList.svelte";
+  import IncomingInvoiceList from "./routes/IncomingInvoiceList.svelte";
   import IssueInvoice from "./routes/IssueInvoice.svelte";
   import MaintenanceDashboard from "./routes/MaintenanceDashboard.svelte";
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
@@ -69,6 +70,15 @@
   import SellerConfigWizard from "./routes/SellerConfigWizard.svelte";
   import SetupWizard from "./routes/SetupWizard.svelte";
   import TenantSettings from "./routes/TenantSettings.svelte";
+  // PR-179 / session-179 — Outgoing / Incoming tab persistence on the
+  // Invoices page. The tab is a top-level segmented control inside the
+  // `invoices` route; the selection survives reloads via localStorage
+  // (closed-vocab helper in `./lib/invoice-tab-persistence.ts`).
+  import {
+    loadInvoiceTab,
+    saveInvoiceTab,
+    type InvoiceTab,
+  } from "./lib/invoice-tab-persistence";
 
   // PR-87 / session-112 — sessionStorage key the IssueInvoice route
   // uses to hand the just-issued invoice id back to InvoiceList on
@@ -93,6 +103,19 @@
   // navigate to settings without a session token).
   let route: AppRoute = $state(currentRoute());
   let unsubscribeRoute: (() => void) | null = null;
+
+  // PR-179 / session-179 — Outgoing / Incoming tab state for the
+  // `invoices` route. Outgoing (AR side, daily driver) is the
+  // first-launch default; selection persists in localStorage so the
+  // operator's last view survives a reload. The tab is scoped to the
+  // `invoices` route only — switching to `partners` / `tenant` / etc.
+  // leaves the tab untouched, and returning to `invoices` restores it.
+  let invoicesTab: InvoiceTab = $state(loadInvoiceTab());
+
+  function setInvoicesTab(next: InvoiceTab) {
+    invoicesTab = next;
+    saveInvoiceTab(next);
+  }
 
   // PR-78 / session 101 — the flat NAV_ITEMS table was replaced by
   // the closed-vocab ERP module + AREA registry in
@@ -471,7 +494,41 @@
             />
           </section>
         {:else}
-          <InvoiceList />
+          <!-- PR-179 / session-179 — Outgoing / Incoming tab split on
+               the Invoices page. The two tabs share the same `#/invoices`
+               route (the tiny hash router does not carry sub-params);
+               the tab state is local SPA state, persisted to
+               localStorage so the operator's view survives a reload.
+               Outgoing (AR, daily driver) is default. -->
+          <div class="invoices-tabs" role="tablist" aria-label="Számlák / Invoices">
+            <button
+              type="button"
+              role="tab"
+              class="invoices-tab"
+              class:invoices-tab--active={invoicesTab === "outgoing"}
+              aria-selected={invoicesTab === "outgoing"}
+              onclick={() => setInvoicesTab("outgoing")}
+            >
+              <span class="invoices-tab__label">Kimenő</span>
+              <span class="invoices-tab__sub">Outgoing</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class="invoices-tab"
+              class:invoices-tab--active={invoicesTab === "incoming"}
+              aria-selected={invoicesTab === "incoming"}
+              onclick={() => setInvoicesTab("incoming")}
+            >
+              <span class="invoices-tab__label">Bejövő</span>
+              <span class="invoices-tab__sub">Incoming</span>
+            </button>
+          </div>
+          {#if invoicesTab === "incoming"}
+            <IncomingInvoiceList />
+          {:else}
+            <InvoiceList />
+          {/if}
         {/if}
       </main>
     </div>
@@ -986,5 +1043,58 @@
     50% {
       opacity: 1;
     }
+  }
+
+  /* PR-179 / session-179 — Outgoing / Incoming segmented control sits
+   * above the dense table. Quiet chrome per ADR-0017: no fill, no
+   * accent colour, just a stronger underline on the active tab. The
+   * Hungarian primary label and English secondary label stack so the
+   * tab reads bilingually without doubling the width. */
+  .invoices-tabs {
+    display: flex;
+    gap: var(--space-1);
+    border-bottom: 1px solid var(--color-surface-divider);
+    margin-bottom: var(--space-4);
+  }
+
+  .invoices-tab {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0;
+    background: none;
+    border: none;
+    padding: var(--space-2) var(--space-4);
+    margin-bottom: -1px;
+    border-bottom: 2px solid transparent;
+    color: var(--color-text-secondary);
+    cursor: pointer;
+    font-family: inherit;
+  }
+
+  .invoices-tab:hover {
+    color: var(--color-text-strong);
+  }
+
+  .invoices-tab--active {
+    color: var(--color-text-strong);
+    border-bottom-color: var(--color-text-strong);
+  }
+
+  .invoices-tab__label {
+    font-size: var(--type-size-md);
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+
+  .invoices-tab__sub {
+    font-size: var(--type-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-text-muted);
+  }
+
+  .invoices-tab--active .invoices-tab__sub {
+    color: var(--color-text-secondary);
   }
 </style>
