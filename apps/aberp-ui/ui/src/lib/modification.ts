@@ -168,6 +168,15 @@ export function formFromIssuanceInput(
     // the storno/amendment NAV submission manually via the detail
     // surface.
     submitToNavOnIssue: false,
+    // S160 / ADR-0050 — type-compatibility with IssueInvoiceFormState.
+    // Inherit the base invoice's payment method from its side-stored
+    // issuance input (pre-S160 bases default to "TRANSFER"). The
+    // modification's `composeModificationBody` does NOT thread it onto
+    // the `ModificationInvoiceRequest` wire body (the backend modification
+    // route defaults it to Transfer — full SPA-route inheritance is a
+    // follow-up per ADR-0050 §Consequences); the field is present so the
+    // shared form-state type-checks.
+    paymentMethod: input.paymentMethod ?? "TRANSFER",
   };
 }
 

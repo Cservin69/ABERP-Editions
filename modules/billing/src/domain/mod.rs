@@ -18,11 +18,14 @@
 //! - [`unit_of_measure`] S159 — `NavUnitOfMeasure`, `ProductUnit` (moved
 //!                   down from products so `LineItem` can carry a line's
 //!                   unit to the NAV `<unitOfMeasure>` emit).
+//! - [`payment_method`] S160 — `PaymentMethod`, the per-invoice NAV
+//!                   `<paymentMethod>` closed-vocab snapshot (ADR-0050).
 
 pub mod ids;
 pub mod invoice;
 pub mod invoice_dates;
 pub mod money;
+pub mod payment_method;
 pub mod reservation;
 pub mod series;
 pub mod unit_of_measure;

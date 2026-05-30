@@ -76,6 +76,7 @@
     type MissingSellerConfigError,
   } from "../lib/issue-invoice";
   import { daysBetween } from "../lib/invoice-dates";
+  import { paymentMethodOptions } from "../lib/payment-method";
   import { buyerFieldsFromPartner } from "../lib/partners";
   import { buyerComboboxState } from "../lib/buyer-combobox";
   import { productLineComboboxState } from "../lib/product-combobox";
@@ -1139,6 +1140,23 @@
           ADR-0037 §2.b (with D-1 walk-back).
         </p>
       {/if}
+    </fieldset>
+
+    <!-- S160 / ADR-0050 — Fizetési mód (payment method). Per-invoice
+         snapshot; closed-vocab NAV `paymentMethodType`. Default Átutalás
+         (Transfer); operator overrides per invoice (primarily Készpénz
+         for rare cash payments). "Egyéb" (Other) is NAV's catch-all —
+         there is no free-text companion on the wire, so no extra input. -->
+    <fieldset>
+      <legend>Fizetési mód / Payment method</legend>
+      <label>
+        <span>Fizetési mód / Payment method</span>
+        <select bind:value={form.paymentMethod}>
+          {#each paymentMethodOptions() as option (option.value)}
+            <option value={option.value}>{option.labelHu} ({option.labelEn})</option>
+          {/each}
+        </select>
+      </label>
     </fieldset>
 
     <!-- PR-84 — invoice-date section. Three rules:

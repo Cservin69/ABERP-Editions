@@ -2592,6 +2592,16 @@ pub struct IssueInvoiceRequest {
     /// issuance commit.
     #[serde(default, rename = "submitToNavOnIssue")]
     pub submit_to_nav_on_issue: Option<bool>,
+    /// S160 — operator-selected payment method (Fizetési mód). The SPA's
+    /// IssueInvoice form renders a dropdown defaulted to `TRANSFER`
+    /// (Átutalás). Wire form is the bare NAV token string (`"TRANSFER"`,
+    /// `"CASH"`, …) per `PaymentMethod`'s SCREAMING_SNAKE serde. Optional
+    /// on the wire (`#[serde(default)]` → `Transfer`) so pre-S160 callers
+    /// / integration tests still type-check; threaded into
+    /// `InvoiceInputJson.payment_method` and emitted as `<paymentMethod>`
+    /// (ADR-0050).
+    #[serde(default, rename = "paymentMethod")]
+    pub payment_method: aberp_billing::PaymentMethod,
 }
 
 /// Response body for `POST /invoices/issue`. The SPA reads
@@ -3329,6 +3339,9 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         payment_deadline: request.payment_deadline,
         delivery_date: request.delivery_date,
         delivery_date_override: request.delivery_date_override,
+        // S160 — operator's payment-method dropdown choice (Fizetési mód),
+        // defaulting to `Transfer` when the wire body omits it.
+        payment_method: request.payment_method,
     };
     // PR-47α / session-64 — side-store the InvoiceInputJson alongside
     // the NAV-XML output path so the SPA storno route can reconstruct
@@ -4459,6 +4472,15 @@ pub fn modification_invoice_request(
         payment_deadline: None,
         delivery_date: None,
         delivery_date_override: None,
+        // S160 — the SPA modification route does not surface a payment-
+        // method picker and does not reload the base's side-stored
+        // `input.json` here (same posture as `invoice_note` / dates above,
+        // which also default rather than inherit). Defaults to `Transfer`.
+        // The CLI modification path (`issue_modification::run`) DOES
+        // inherit, because it parses the base's `input.json` (whose
+        // `payment_method` round-trips via `#[serde(default)]`). Full
+        // base-inheritance for the SPA route is a follow-up (see ADR-0050).
+        payment_method: aberp_billing::PaymentMethod::default(),
     };
     let series = request.series.as_deref().unwrap_or(DEFAULT_SERIES_CODE);
 

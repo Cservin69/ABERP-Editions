@@ -36,8 +36,8 @@
 use std::io::Write;
 
 use aberp_billing::{
-    huf_equivalent_round_half_even, Currency, Huf, LineItem, ProductUnit, RateMetadata,
-    ReadyInvoice, SeriesCode,
+    huf_equivalent_round_half_even, Currency, Huf, LineItem, PaymentMethod, ProductUnit,
+    RateMetadata, ReadyInvoice, SeriesCode,
 };
 use anyhow::{anyhow, Context, Result};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
@@ -486,7 +486,19 @@ pub fn render_invoice_data(
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
 ) -> Result<Vec<u8>> {
-    render_invoice_data_with_number(invoice, series_code, parties, currency, rate_metadata, None)
+    // S160 — the thin wrapper keeps its pre-S160 signature (≈40 test call
+    // sites depend on it); it passes the `Transfer` default, byte-identical
+    // to the pre-S160 hardcoded `<paymentMethod>TRANSFER</...>`. Production
+    // callers use the `_with_number` variant to pass the operator's choice.
+    render_invoice_data_with_number(
+        invoice,
+        series_code,
+        parties,
+        currency,
+        rate_metadata,
+        PaymentMethod::Transfer,
+        None,
+    )
 }
 
 /// PR-89 — variant of [`render_invoice_data`] that accepts a
@@ -510,6 +522,7 @@ pub fn render_invoice_data_with_number(
     parties: &NavParties,
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
+    payment_method: PaymentMethod,
     invoice_number_override: Option<&str>,
 ) -> Result<Vec<u8>> {
     ensure_rate_metadata_invariant(currency, rate_metadata)?;
@@ -564,6 +577,7 @@ pub fn render_invoice_data_with_number(
         &payment_date,
         currency,
         rate_metadata,
+        payment_method,
     )?;
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
@@ -650,6 +664,9 @@ pub fn render_storno_data(
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
 ) -> Result<Vec<u8>> {
+    // S160 — thin wrapper passes the `Transfer` default (see
+    // [`render_invoice_data`]). Production storno issuance uses the
+    // `_with_number` variant to inherit the base invoice's payment method.
     render_storno_data_with_number(
         invoice,
         series_code,
@@ -657,6 +674,7 @@ pub fn render_storno_data(
         storno_reference,
         currency,
         rate_metadata,
+        PaymentMethod::Transfer,
         None,
     )
 }
@@ -674,6 +692,7 @@ pub fn render_storno_data_with_number(
     storno_reference: &StornoReference,
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
+    payment_method: PaymentMethod,
     invoice_number_override: Option<&str>,
 ) -> Result<Vec<u8>> {
     // PR-44γ.1 — same C1-wire-side invariant the fresh-issuance renderer
@@ -741,6 +760,7 @@ pub fn render_storno_data_with_number(
         &payment_date,
         currency,
         rate_metadata,
+        payment_method,
     )?;
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
@@ -806,6 +826,9 @@ pub fn render_modification_data(
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
 ) -> Result<Vec<u8>> {
+    // S160 — thin wrapper passes the `Transfer` default (see
+    // [`render_invoice_data`]). Production modification issuance uses the
+    // `_with_number` variant to inherit the base invoice's payment method.
     render_modification_data_with_number(
         invoice,
         series_code,
@@ -813,6 +836,7 @@ pub fn render_modification_data(
         modification_reference,
         currency,
         rate_metadata,
+        PaymentMethod::Transfer,
         None,
     )
 }
@@ -827,6 +851,7 @@ pub fn render_modification_data_with_number(
     modification_reference: &ModificationReference,
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
+    payment_method: PaymentMethod,
     invoice_number_override: Option<&str>,
 ) -> Result<Vec<u8>> {
     // PR-44γ.1 — same C1-wire-side invariant the fresh-issuance renderer
@@ -886,6 +911,7 @@ pub fn render_modification_data_with_number(
         &payment_date,
         currency,
         rate_metadata,
+        payment_method,
     )?;
     w.write_event(Event::End(BytesEnd::new("invoiceHead")))?;
 
@@ -1206,6 +1232,7 @@ fn write_invoice_detail(
     payment_deadline: &str,
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
+    payment_method: PaymentMethod,
 ) -> Result<()> {
     // ADR-0037 §1.b — `<currencyCode>` is the ISO 4217 code; `<exchangeRate>`
     // is the rate at exactly 6 decimal places per the NAV `Online Számla`
@@ -1236,7 +1263,14 @@ fn write_invoice_detail(
     text_element(w, "invoiceDeliveryDate", delivery_date)?;
     text_element(w, "currencyCode", currency.iso_code())?;
     text_element(w, "exchangeRate", &exchange_rate)?;
-    text_element(w, "paymentMethod", "TRANSFER")?;
+    // S160 — operator-selected payment method (Fizetési mód), snapshotted
+    // per invoice (ADR-0050). Pre-S160 the emit hardcoded `TRANSFER`; the
+    // `PaymentMethod::default()` (== `Transfer`) carried by pre-S160
+    // side-stored `input.json` bodies (via `#[serde(default)]`) keeps that
+    // path byte-identical. NAV's `paymentMethodType` is a CLOSED enum with
+    // no free-text companion — there is no `<paymentMethodOwn>` (unlike
+    // `<unitOfMeasureOwn>`), so `Other` ("Egyéb") is the catch-all.
+    text_element(w, "paymentMethod", payment_method.nav_token())?;
     text_element(w, "paymentDate", payment_deadline)?;
     text_element(w, "invoiceAppearance", "ELECTRONIC")?;
     w.write_event(Event::End(BytesEnd::new("invoiceDetail")))?;

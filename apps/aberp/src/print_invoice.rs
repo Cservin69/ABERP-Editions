@@ -1101,6 +1101,13 @@ swift_bic = "OTPVHUHB"
     fn payment_method_display_maps_transfer() {
         assert_eq!(payment_method_display("TRANSFER"), "Átutalás");
         assert_eq!(payment_method_display("CASH"), "Készpénz");
+        // S160 / ADR-0050 — the operator-selectable payment method
+        // (Fizetési mód) now reaches the PDF via the on-disk NAV XML; pin
+        // every closed-vocab token's Hungarian label. `OTHER` → "Egyéb"
+        // is NAV's catch-all (no free-text companion on the wire).
+        assert_eq!(payment_method_display("CARD"), "Bankkártya");
+        assert_eq!(payment_method_display("VOUCHER"), "Utalvány");
+        assert_eq!(payment_method_display("OTHER"), "Egyéb");
         assert_eq!(payment_method_display("UNKNOWN"), "UNKNOWN");
     }
 

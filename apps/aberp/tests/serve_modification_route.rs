@@ -294,6 +294,8 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
             payment_deadline: None,
             delivery_date: None,
             delivery_date_override: None,
+            // S160 — fixture uses the default payment method (Transfer).
+            payment_method: aberp_billing::PaymentMethod::default(),
         },
         &db_path,
         TEST_TENANT,

@@ -52,8 +52,8 @@ use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerM
 use aberp_billing::{
     self as billing, huf_equivalent_round_half_even, AllocateArgs, AllocateOutcome,
     BankAccountSnapshot, BillingStore, Currency, CustomerId, DraftInvoice, DuckDbBillingStore, Huf,
-    IdempotencyKey, InvoiceId, InvoiceSeries, IssueInvoiceCommand, LineItem, ProductUnit,
-    RateMetadata, ResetPolicy, SeriesCode, SeriesId,
+    IdempotencyKey, InvoiceId, InvoiceSeries, IssueInvoiceCommand, LineItem, PaymentMethod,
+    ProductUnit, RateMetadata, ResetPolicy, SeriesCode, SeriesId,
 };
 use aberp_mnb_rates::{MnbError, MnbRate, SOURCE as MNB_SOURCE};
 use aberp_nav_transport::NavCredentials;
@@ -171,6 +171,20 @@ pub struct InvoiceInputJson {
     /// tamper-evident trail records the operator's UI experience.
     #[serde(default, rename = "deliveryDateOverride")]
     pub delivery_date_override: Option<String>,
+    /// S160 — operator-selected payment method (Fizetési mód), a
+    /// per-invoice snapshot (ADR-0050). Wire form is the bare NAV token
+    /// string (`"TRANSFER"`, `"CASH"`, …) — `PaymentMethod`'s
+    /// SCREAMING_SNAKE serde, mirrored by the SPA's
+    /// `payment-method.ts`. `#[serde(default)]` resolves to
+    /// `PaymentMethod::Transfer` for pre-S160 side-stored bodies AND CLI
+    /// callers, preserving the pre-S160 hardcoded `<paymentMethod>TRANSFER`
+    /// emit byte-for-byte. Storno / modification re-emits inherit the base
+    /// invoice's value because they reconstruct this `InvoiceInputJson`
+    /// from the base's side-stored `input.json`. Like the unit-of-measure
+    /// (S159), this is NOT a DuckDB column — the audit-immutable snapshot
+    /// is the on-disk `input.json` + NAV XML.
+    #[serde(default, rename = "paymentMethod")]
+    pub payment_method: PaymentMethod,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -747,6 +761,9 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         &parties,
         currency,
         rate_metadata.as_ref(),
+        // S160 — operator's per-invoice payment method (Fizetési mód),
+        // defaulting to `Transfer` for pre-S160 side-stored bodies.
+        input.payment_method,
         Some(&invoice_number),
     )
     .context("render NAV XML")?;

@@ -477,6 +477,10 @@ pub fn storno_from_inputs(
         &storno_reference,
         chain_currency,
         chain_rate_metadata.as_ref(),
+        // S160 — the storno inherits the base invoice's payment method,
+        // which rides the base's side-stored `input.json` (defaults to
+        // `Transfer` for pre-S160 bases).
+        input.payment_method,
         Some(&storno_invoice_number),
     )
     .context("render NAV storno XML")?;

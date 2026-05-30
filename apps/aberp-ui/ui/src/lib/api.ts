@@ -550,7 +550,30 @@ export interface IssueInvoiceRequest {
    * manually from InvoiceDetail later. Optional on the wire; absent
    * defaults to `true`. */
   submitToNavOnIssue?: boolean | null;
+  /** S160 / ADR-0050 — operator-selected payment method (Fizetési mód).
+   * Closed-vocab NAV `paymentMethodType` mirror; the wire value is the
+   * bare NAV token (`"TRANSFER"`, `"CASH"`, …). Optional on the wire so
+   * pre-S160 callers / CLI still type-check; the backend's
+   * `#[serde(default)]` resolves an absent value to `"TRANSFER"`,
+   * preserving the pre-S160 hardcoded emit. See [`InvoicePaymentMethod`]. */
+  paymentMethod?: InvoicePaymentMethod;
 }
+
+/** S160 / ADR-0050 — per-invoice payment method (Fizetési mód). Mirror
+ * of the Rust `aberp_billing::PaymentMethod` closed-vocab enum, whose
+ * `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]` puts the bare NAV token
+ * on the wire. Distinct from the operational mark-as-paid
+ * [`PaymentMethod`] (PR-70 / ADR-0039) — that records HOW a payment was
+ * received after issuance; THIS is the NAV `<paymentMethod>` snapshot on
+ * the invoice itself. NAV's `paymentMethodType` is closed with NO
+ * free-text companion, so `"OTHER"` (Egyéb) is the catch-all — there is
+ * no `paymentMethodOwn`. The label table lives in `payment-method.ts`. */
+export type InvoicePaymentMethod =
+  | "TRANSFER"
+  | "CASH"
+  | "CARD"
+  | "VOUCHER"
+  | "OTHER";
 
 /** PR-92 / ADR-0047 — wire shape for the per-invoice email send
  * outcome, surfaced on both the issue response (auto-send) and the

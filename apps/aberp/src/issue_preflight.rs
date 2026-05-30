@@ -703,6 +703,8 @@ mod tests {
             // auto-submit-to-NAV toggle. Preflight unit tests do not
             // exercise the NAV submit path.
             submit_to_nav_on_issue: Some(false),
+            // S160 — preflight fixtures use the default payment method.
+            payment_method: aberp_billing::PaymentMethod::default(),
         }
     }
 
@@ -993,6 +995,8 @@ mod tests {
             delivery_date_override: None,
             email_buyer_on_issue: Some(false),
             submit_to_nav_on_issue: Some(false),
+            // S160 — preflight fixtures use the default payment method.
+            payment_method: aberp_billing::PaymentMethod::default(),
         };
         let errs = validate_invoice_preflight(&r);
 

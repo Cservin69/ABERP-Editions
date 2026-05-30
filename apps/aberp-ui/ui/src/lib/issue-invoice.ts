@@ -16,9 +16,11 @@
 import type {
   Currency,
   CustomerVatStatusBody,
+  InvoicePaymentMethod,
   IssueInvoiceRequest,
   ProductUnit,
 } from "./api";
+import { DEFAULT_PAYMENT_METHOD } from "./payment-method";
 import { parseAmountToMinor, parseDecimalQuantity } from "./format";
 import {
   addDays,
@@ -184,6 +186,13 @@ export interface IssueInvoiceFormState {
    * the operator can submit manually later (the typical use case is
    * a draft the operator wants to review more before NAV sees it). */
   submitToNavOnIssue: boolean;
+  /** S160 / ADR-0050 — operator-selected payment method (Fizetési mód).
+   * Bound to a dropdown next to the dates/currency block; seeded to
+   * `TRANSFER` (Átutalás) in `emptyForm` so the default matches the
+   * pre-S160 hardcoded emit. The composer sends it verbatim as
+   * `paymentMethod`; the backend snapshots it on the invoice and emits
+   * `<paymentMethod>{token}</...>`. */
+  paymentMethod: InvoicePaymentMethod;
 }
 
 /** PR-44ζ — sensible defaults for an empty form. The 27% VAT rate is
@@ -242,6 +251,10 @@ export function emptyForm(): IssueInvoiceFormState {
     // is "issue + submit + see SAVED" inside the same minute; opting
     // out is the rare case (drafting before NAV sees it).
     submitToNavOnIssue: true,
+    // S160 / ADR-0050 — default to Átutalás (bank transfer), matching
+    // the pre-S160 hardcoded behaviour. The operator overrides per
+    // invoice (primarily Készpénz for rare cash payments).
+    paymentMethod: DEFAULT_PAYMENT_METHOD,
   };
 }
 
@@ -679,6 +692,10 @@ export function composeIssueInvoiceBody(
     // toggle. Same default-true semantics on both ends; the backend's
     // `submit_to_nav_on_issue.unwrap_or(true)` mirrors `email_buyer`.
     submitToNavOnIssue: form.submitToNavOnIssue,
+    // S160 / ADR-0050 — operator's payment-method dropdown choice, sent
+    // verbatim as the bare NAV token. The backend snapshots it on the
+    // invoice and emits `<paymentMethod>`; absent → `TRANSFER` default.
+    paymentMethod: form.paymentMethod,
   };
 }
 

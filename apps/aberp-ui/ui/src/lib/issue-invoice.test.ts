@@ -104,7 +104,25 @@ describe("composeIssueInvoiceBody", () => {
       // PR-99 Item 4 Part B — default-on submit-to-NAV toggle, same
       // mirror posture as `emailBuyerOnIssue`.
       submitToNavOnIssue: true,
+      // S160 / ADR-0050 — payment method seeds to `TRANSFER` (Átutalás)
+      // in `emptyForm`, matching the pre-S160 hardcoded emit.
+      paymentMethod: "TRANSFER",
     });
+  });
+
+  // S160 / ADR-0050 — the operator's payment-method dropdown choice
+  // rides the wire body verbatim as the bare NAV token. Pins the
+  // form→wire seam for the Fizetési mód selector.
+  it("carries the operator-selected payment method (Készpénz/CASH)", () => {
+    const form = {
+      ...emptyForm(),
+      customerName: "C",
+      customerTaxNumber: "y",
+      paymentMethod: "CASH" as const,
+    };
+    expect(composeIssueInvoiceBody(form).paymentMethod).toBe("CASH");
+    // Default (unchanged form) carries TRANSFER.
+    expect(composeIssueInvoiceBody(emptyForm()).paymentMethod).toBe("TRANSFER");
   });
 
   // S157 — decimal quantity round-trips through the composer. Both `1.5`

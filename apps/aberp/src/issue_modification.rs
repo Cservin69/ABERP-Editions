@@ -415,6 +415,10 @@ pub fn modification_from_inputs(
         &modification_reference,
         chain_currency,
         chain_rate_metadata.as_ref(),
+        // S160 — the modification inherits the base invoice's payment
+        // method, which rides the base's side-stored `input.json`
+        // (defaults to `Transfer` for pre-S160 bases).
+        input.payment_method,
         Some(&modification_invoice_number),
     )
     .context("render NAV modification XML")?;
