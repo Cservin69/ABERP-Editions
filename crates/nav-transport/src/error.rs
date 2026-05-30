@@ -431,4 +431,48 @@ pub enum NavTransportError {
     /// inspector-visible distinction for triage.
     #[error("queryInvoiceCheck retryable error: {code} — {message}")]
     QueryInvoiceCheckRetryable { code: String, message: String },
+
+    // ── 11. queryInvoiceDigest operation (S178 / PR-178) ───────────
+    /// HTTP-layer failure on queryInvoiceDigest (DNS, connection
+    /// reset, TLS handshake). Same shape as
+    /// `QueryInvoiceDataHttp` / `QueryInvoiceCheckHttp`; held distinct
+    /// so the audit trail can distinguish operations without reaching
+    /// for the URL. S178 / PR-178 — paired with the AP-side
+    /// auto-sync daemon in `apps/aberp/src/ap_sync.rs`.
+    #[error("queryInvoiceDigest HTTP call failed: {0}")]
+    QueryInvoiceDigestHttp(#[source] reqwest::Error),
+
+    /// NAV returned a non-success HTTP status to queryInvoiceDigest.
+    /// The body itself is captured by the caller before the parse
+    /// per ADR-0009 §8 — the AP-sync daemon logs it and re-attempts
+    /// on the next cadence tick.
+    #[error("queryInvoiceDigest returned non-success HTTP status: {status}")]
+    QueryInvoiceDigestHttpStatus { status: u16 },
+
+    /// The queryInvoiceDigest response body could not be parsed
+    /// against the expected `<QueryInvoiceDigestResponse>` shape
+    /// (missing `<funcCode>`, missing `<invoiceDigestResult>`,
+    /// malformed XML, unexpected root element, etc.). Loud per
+    /// CLAUDE.md rule 12 — silent coercion of a NAV-side schema
+    /// change to "empty page" would mask drift.
+    #[error("queryInvoiceDigest response parse failed: {0}")]
+    QueryInvoiceDigestResponseParse(String),
+
+    /// NAV responded with a non-retryable application-layer error
+    /// against queryInvoiceDigest (`INVALID_SECURITY_USER`,
+    /// `INVALID_REQUEST_SIGNATURE`, `SCHEMA_VIOLATION`, etc. per
+    /// ADR-0009 §5). The shared classification set is reused.
+    /// The AP-sync daemon logs loud and aborts THIS cycle; the
+    /// next 30-min tick re-attempts.
+    #[error("queryInvoiceDigest non-retryable error: {code} — {message}")]
+    QueryInvoiceDigestNonRetryable { code: String, message: String },
+
+    /// NAV responded with a retryable application-layer error
+    /// against queryInvoiceDigest (`OPERATION_FAILED`, HTTP 504
+    /// per ADR-0009 §5). The AP-sync daemon logs at warn level
+    /// and re-attempts on the next 30-min tick — the daemon is
+    /// low-priority by design (Ervin: "low resource utilization
+    /// low priority database sync") so no per-cycle retry loop.
+    #[error("queryInvoiceDigest retryable error: {code} — {message}")]
+    QueryInvoiceDigestRetryable { code: String, message: String },
 }

@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ap_sync;
 pub mod audit_payloads;
 pub mod audit_query;
 pub mod binary_hash;

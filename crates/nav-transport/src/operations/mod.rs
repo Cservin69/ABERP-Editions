@@ -84,6 +84,7 @@ pub mod manage_annulment;
 pub mod manage_invoice;
 pub mod query_invoice_check;
 pub mod query_invoice_data;
+pub mod query_invoice_digest;
 pub mod query_transaction_status;
 pub mod token_exchange;
 

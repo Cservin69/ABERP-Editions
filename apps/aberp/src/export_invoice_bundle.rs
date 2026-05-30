@@ -648,7 +648,14 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // `invoice.*` glob never sweeps them — they are listed here
         // for exhaustiveness only.
         | EventKind::IncomingInvoiceIngested
-        | EventKind::IncomingInvoiceStatusChanged => None,
+        | EventKind::IncomingInvoiceStatusChanged
+        // S178 / PR-178 — AP-side auto-sync cycle-completion event.
+        // Same posture as the other AP-side kinds: `system.`-scoped,
+        // never sweeps a per-outgoing-invoice bundle; no NAV bytes
+        // on the payload (the per-cycle ingestions emit their own
+        // `IncomingInvoiceIngested` entries, which themselves carry
+        // no NAV bytes in the bundle either).
+        | EventKind::IncomingInvoiceSyncCycleCompleted => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

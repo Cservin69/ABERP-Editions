@@ -650,6 +650,28 @@ pub enum EventKind {
     /// `IncomingInvoiceIngested` — never sweeps a per-outgoing-invoice
     /// bundle. F12 four-edit ritual fires once.
     IncomingInvoiceStatusChanged,
+
+    /// S178 / PR-178 — the AP-side auto-sync daemon completed one
+    /// poll cycle against NAV's `queryInvoiceDigest INBOUND`
+    /// endpoint. ONE entry per cycle (not per ingested digest); the
+    /// per-digest ingestions emit their own
+    /// `IncomingInvoiceIngested` entries via the same
+    /// `ingest_incoming_invoice` helper the manual route uses.
+    ///
+    /// Payload (`IncomingInvoiceSyncCycleCompletedPayload`) carries
+    /// the date window queried (`date_from` / `date_to`), the
+    /// `ingested_count` (number of brand-new rows inserted),
+    /// `skipped_count` (digest rows that already existed in
+    /// `ap_invoice`), `pages_walked`, `elapsed_ms`, the closed-vocab
+    /// `trigger` (`"daemon"` for the cadence tick / boot tick,
+    /// `"manual"` for the operator-clicked /sync-now route), and an
+    /// optional `error` field naming the loud-failure cause when the
+    /// cycle aborted early (NAV rejected the digest call, etc.).
+    ///
+    /// Same `system.` prefix posture as the other AP-side events —
+    /// the per-OUTGOING-invoice export bundle's `invoice.*` glob
+    /// MUST NEVER sweep this. F12 four-edit ritual fires once.
+    IncomingInvoiceSyncCycleCompleted,
 }
 
 impl EventKind {
@@ -687,6 +709,9 @@ impl EventKind {
             EventKind::UpgradeSnapshotMismatch => "system.upgrade_snapshot_mismatch",
             EventKind::IncomingInvoiceIngested => "system.incoming_invoice_ingested",
             EventKind::IncomingInvoiceStatusChanged => "system.incoming_invoice_status_changed",
+            EventKind::IncomingInvoiceSyncCycleCompleted => {
+                "system.incoming_invoice_sync_cycle_completed"
+            }
         }
     }
 
@@ -735,6 +760,9 @@ impl EventKind {
             "system.upgrade_snapshot_mismatch" => Ok(EventKind::UpgradeSnapshotMismatch),
             "system.incoming_invoice_ingested" => Ok(EventKind::IncomingInvoiceIngested),
             "system.incoming_invoice_status_changed" => Ok(EventKind::IncomingInvoiceStatusChanged),
+            "system.incoming_invoice_sync_cycle_completed" => {
+                Ok(EventKind::IncomingInvoiceSyncCycleCompleted)
+            }
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -779,6 +807,7 @@ mod tests {
             EventKind::UpgradeSnapshotMismatch,
             EventKind::IncomingInvoiceIngested,
             EventKind::IncomingInvoiceStatusChanged,
+            EventKind::IncomingInvoiceSyncCycleCompleted,
         ];
         for v in variants {
             let s = v.as_str();
@@ -1282,6 +1311,39 @@ mod tests {
         assert_ne!(
             EventKind::IncomingInvoiceStatusChanged.as_str(),
             EventKind::InvoicePaymentRecorded.as_str()
+        );
+    }
+
+    /// S178 / PR-178 — AP-side auto-sync cycle completion event.
+    /// Same `system.` prefix invariant as the other AP-side kinds —
+    /// must NEVER sweep a per-outgoing-invoice export bundle.
+    #[test]
+    fn s178_incoming_invoice_sync_cycle_completed_uses_system_prefix() {
+        assert_eq!(
+            EventKind::IncomingInvoiceSyncCycleCompleted.as_str(),
+            "system.incoming_invoice_sync_cycle_completed"
+        );
+        assert!(EventKind::IncomingInvoiceSyncCycleCompleted
+            .as_str()
+            .starts_with("system."));
+        assert!(!EventKind::IncomingInvoiceSyncCycleCompleted
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// S178 / PR-178 — distinct discriminator from the two prior AP
+    /// kinds (cycle-completion is a daemon-tick event, not a
+    /// per-invoice ingestion or status change). Same fork-discipline
+    /// posture as `s177_incoming_invoice_kinds_are_distinct`.
+    #[test]
+    fn s178_sync_cycle_completed_is_distinct_from_other_ap_kinds() {
+        assert_ne!(
+            EventKind::IncomingInvoiceSyncCycleCompleted.as_str(),
+            EventKind::IncomingInvoiceIngested.as_str()
+        );
+        assert_ne!(
+            EventKind::IncomingInvoiceSyncCycleCompleted.as_str(),
+            EventKind::IncomingInvoiceStatusChanged.as_str()
         );
     }
 }

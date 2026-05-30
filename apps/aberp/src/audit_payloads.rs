@@ -2185,6 +2185,64 @@ impl IncomingInvoiceStatusChangedPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// IncomingInvoiceSyncCycleCompleted (S178)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::IncomingInvoiceSyncCycleCompleted`].
+///
+/// Written ONCE per AP-side auto-sync cycle by
+/// [`crate::ap_sync`]. The per-digest ingestions emit their own
+/// `IncomingInvoiceIngested` entries via `ingest_incoming_invoice`;
+/// THIS entry is the cadence-level summary so an operator (or a
+/// future ops dashboard) can see "sync ran at T, found N new
+/// invoices, skipped M, took K ms" without walking every per-digest
+/// entry.
+///
+/// `error` is `Some(_)` when the cycle aborted early (NAV rejected
+/// the digest call, transport failure, etc.) — the daemon still
+/// writes one cycle-completion entry on every fire so the audit
+/// trail never has a silent gap. Same loud-fail discipline per
+/// CLAUDE.md rule 12.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncomingInvoiceSyncCycleCompletedPayload {
+    /// Cycle-decision idempotency key — minted fresh per cycle.
+    /// Mirrors every other audit payload's F8 carry-forward shape.
+    pub idempotency_key: String,
+    /// Closed vocab: `"daemon"` (cadence tick + boot tick) /
+    /// `"manual"` (operator-clicked /sync-now route). Surfaces who
+    /// fired the cycle so the timeline reader can distinguish
+    /// scheduled work from operator-driven runs.
+    pub trigger: String,
+    /// `YYYY-MM-DD` lower bound of the issue-date window queried.
+    pub date_from: String,
+    /// `YYYY-MM-DD` upper bound of the issue-date window queried.
+    pub date_to: String,
+    /// Number of brand-new `ap_invoice` rows inserted this cycle.
+    pub ingested_count: u64,
+    /// Number of digest entries skipped because the (supplier_tax,
+    /// invoice_number) pair already existed in `ap_invoice`.
+    pub skipped_count: u64,
+    /// Number of NAV pages walked in this cycle (1 for an empty
+    /// result set; higher when pagination chains).
+    pub pages_walked: u32,
+    /// Wall-clock duration of the cycle in milliseconds. Surfaces
+    /// the "low resource utilization" posture — operator can see
+    /// cycle cost at a glance.
+    pub elapsed_ms: u64,
+    /// `Some(_)` when the cycle aborted early. Carries a single
+    /// human-readable error string (NOT typed enum — the failure
+    /// surface is wide and the daemon's job is to surface the cause
+    /// loud, not classify it). `None` on the success path.
+    pub error: Option<String>,
+}
+
+impl IncomingInvoiceSyncCycleCompletedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -4120,6 +4178,53 @@ mod tests {
         };
         let bytes = payload.to_bytes();
         let parsed: IncomingInvoiceStatusChangedPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+    }
+
+    /// S178 / PR-178 — `IncomingInvoiceSyncCycleCompletedPayload`
+    /// round-trips on the daemon-success path (no error).
+    #[test]
+    fn incoming_invoice_sync_cycle_completed_round_trip_success() {
+        let payload = IncomingInvoiceSyncCycleCompletedPayload {
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            trigger: "daemon".to_string(),
+            date_from: "2026-05-01".to_string(),
+            date_to: "2026-05-30".to_string(),
+            ingested_count: 12,
+            skipped_count: 47,
+            pages_walked: 2,
+            elapsed_ms: 3142,
+            error: None,
+        };
+        let bytes = payload.to_bytes();
+        let parsed: IncomingInvoiceSyncCycleCompletedPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+    }
+
+    /// S178 / PR-178 — `IncomingInvoiceSyncCycleCompletedPayload`
+    /// round-trips on the manual-trigger error path. Error string
+    /// is verbatim (no truncation, no scrub) so the operator sees
+    /// the NAV-side diagnostic loud per CLAUDE.md rule 12.
+    #[test]
+    fn incoming_invoice_sync_cycle_completed_round_trip_error() {
+        let payload = IncomingInvoiceSyncCycleCompletedPayload {
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            trigger: "manual".to_string(),
+            date_from: "2026-05-01".to_string(),
+            date_to: "2026-05-30".to_string(),
+            ingested_count: 0,
+            skipped_count: 0,
+            pages_walked: 0,
+            elapsed_ms: 412,
+            error: Some(
+                "queryInvoiceDigest non-retryable error: INVALID_SECURITY_USER — bad creds"
+                    .to_string(),
+            ),
+        };
+        let bytes = payload.to_bytes();
+        let parsed: IncomingInvoiceSyncCycleCompletedPayload =
             serde_json::from_slice(&bytes).expect("round-trip");
         assert_eq!(parsed, payload);
     }

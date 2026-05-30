@@ -518,7 +518,8 @@ pub fn classify_attempt_failure(err: &NavTransportError) -> (&'static str, Optio
         | NavTransportError::QueryTransactionStatusHttp(_)
         | NavTransportError::ManageAnnulmentHttp(_)
         | NavTransportError::QueryInvoiceDataHttp(_)
-        | NavTransportError::QueryInvoiceCheckHttp(_) => ("transport", None),
+        | NavTransportError::QueryInvoiceCheckHttp(_)
+        | NavTransportError::QueryInvoiceDigestHttp(_) => ("transport", None),
 
         // HTTP-status classes (NAV returned non-2xx). PR-20 /
         // ADR-0033 §5 adds the queryInvoiceCheck variant.
@@ -533,7 +534,8 @@ pub fn classify_attempt_failure(err: &NavTransportError) -> (&'static str, Optio
         | NavTransportError::QueryTransactionStatusHttpStatus { status }
         | NavTransportError::ManageAnnulmentHttpStatus { status }
         | NavTransportError::QueryInvoiceDataHttpStatus { status }
-        | NavTransportError::QueryInvoiceCheckHttpStatus { status } => {
+        | NavTransportError::QueryInvoiceCheckHttpStatus { status }
+        | NavTransportError::QueryInvoiceDigestHttpStatus { status } => {
             ("http_status", Some(status.to_string()))
         }
 
@@ -543,7 +545,8 @@ pub fn classify_attempt_failure(err: &NavTransportError) -> (&'static str, Optio
         | NavTransportError::QueryTransactionStatusNonRetryable { code, .. }
         | NavTransportError::ManageAnnulmentNonRetryable { code, .. }
         | NavTransportError::QueryInvoiceDataNonRetryable { code, .. }
-        | NavTransportError::QueryInvoiceCheckNonRetryable { code, .. } => {
+        | NavTransportError::QueryInvoiceCheckNonRetryable { code, .. }
+        | NavTransportError::QueryInvoiceDigestNonRetryable { code, .. } => {
             ("application", Some(code.clone()))
         }
 
@@ -553,7 +556,8 @@ pub fn classify_attempt_failure(err: &NavTransportError) -> (&'static str, Optio
         | NavTransportError::QueryTransactionStatusRetryable { code, .. }
         | NavTransportError::ManageAnnulmentRetryable { code, .. }
         | NavTransportError::QueryInvoiceDataRetryable { code, .. }
-        | NavTransportError::QueryInvoiceCheckRetryable { code, .. } => {
+        | NavTransportError::QueryInvoiceCheckRetryable { code, .. }
+        | NavTransportError::QueryInvoiceDigestRetryable { code, .. } => {
             ("retryable_application", Some(code.clone()))
         }
 
@@ -564,7 +568,8 @@ pub fn classify_attempt_failure(err: &NavTransportError) -> (&'static str, Optio
         | NavTransportError::QueryTransactionStatusResponseParse(_)
         | NavTransportError::ManageAnnulmentResponseParse(_)
         | NavTransportError::QueryInvoiceDataResponseParse(_)
-        | NavTransportError::QueryInvoiceCheckResponseParse(_) => ("application", None),
+        | NavTransportError::QueryInvoiceCheckResponseParse(_)
+        | NavTransportError::QueryInvoiceDigestResponseParse(_) => ("application", None),
 
         // Application-class token-decoding failures (NAV bytes failed
         // local decrypt / base64 / length checks). These are NAV-side

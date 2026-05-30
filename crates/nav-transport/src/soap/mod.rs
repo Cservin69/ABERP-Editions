@@ -588,6 +588,78 @@ pub fn render_query_invoice_check_request(
     )
 }
 
+/// Render a `<QueryInvoiceDigestRequest>` body, ready for HTTP POST.
+///
+/// S178 / PR-178 consumer — the paginated digest list query used by
+/// the AP-side auto-sync daemon
+/// (`apps/aberp/src/ap_sync.rs`). Non-`manageInvoice` request
+/// signature per ADR-0009 §4 (same plain three-input form as
+/// `queryInvoiceData` / `queryInvoiceCheck`).
+///
+/// XSD-sequence body per NAV v3.0:
+///
+/// ```xml
+///   <page>1</page>
+///   <invoiceDirection>INBOUND</invoiceDirection>
+///   <invoiceQueryParams>
+///     <mandatoryQueryParams>
+///       <invoiceIssueDate>
+///         <dateFrom>2026-05-01</dateFrom>
+///         <dateTo>2026-05-30</dateTo>
+///       </invoiceIssueDate>
+///     </mandatoryQueryParams>
+///   </invoiceQueryParams>
+/// ```
+///
+/// `page` is 1-based per NAV v3.0; the response carries
+/// `<availablePage>` so the caller can iterate. `date_from` /
+/// `date_to` are `YYYY-MM-DD` strings; NAV's per-request cap is 35
+/// days (the AP-sync daemon passes 30 to leave operator margin). The
+/// caller validates the dates' shape before the call — this renderer
+/// embeds them verbatim.
+pub fn render_query_invoice_digest_request(
+    credentials: &NavCredentials,
+    tax_number_8: &str,
+    request_id: &str,
+    request_timestamp: &str,
+    page: u32,
+    invoice_direction: InvoiceDirection,
+    date_from: &str,
+    date_to: &str,
+) -> Result<Vec<u8>, NavTransportError> {
+    let sig_timestamp = parts::signature_timestamp(request_timestamp);
+    let signature = request_signature(request_id, &sig_timestamp, credentials.sign_key_bytes());
+    let page_str = page.to_string();
+    let direction_str = invoice_direction.as_nav_str();
+    render_request(
+        "QueryInvoiceDigestRequest",
+        credentials,
+        tax_number_8,
+        request_id,
+        request_timestamp,
+        &signature,
+        |w| {
+            write_text_in_default_ns(w, "page", &page_str)?;
+            write_text_in_default_ns(w, "invoiceDirection", direction_str)?;
+            w.write_event(Event::Start(BytesStart::new("invoiceQueryParams")))
+                .map_err(envelope_io)?;
+            w.write_event(Event::Start(BytesStart::new("mandatoryQueryParams")))
+                .map_err(envelope_io)?;
+            w.write_event(Event::Start(BytesStart::new("invoiceIssueDate")))
+                .map_err(envelope_io)?;
+            write_text_in_default_ns(w, "dateFrom", date_from)?;
+            write_text_in_default_ns(w, "dateTo", date_to)?;
+            w.write_event(Event::End(BytesEnd::new("invoiceIssueDate")))
+                .map_err(envelope_io)?;
+            w.write_event(Event::End(BytesEnd::new("mandatoryQueryParams")))
+                .map_err(envelope_io)?;
+            w.write_event(Event::End(BytesEnd::new("invoiceQueryParams")))
+                .map_err(envelope_io)?;
+            Ok(())
+        },
+    )
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Internal: shared envelope shell
 // ──────────────────────────────────────────────────────────────────────
@@ -1058,6 +1130,88 @@ mod tests {
             !s.contains("SIGN-KEY-32BYTES-OF-FAKE-MATERIAL"),
             "plaintext sign key leaked into queryInvoiceData envelope: {s}"
         );
+    }
+
+    // ── S178 / PR-178: queryInvoiceDigest envelope tests ──────────
+
+    /// Happy-path: a queryInvoiceDigest envelope carries the required
+    /// common-blocks + the digest-specific `<invoiceQueryParams>` shape.
+    /// Shape-only check; full byte equality is over-spec for a wire
+    /// shape NAV-testbed verifies in production.
+    #[test]
+    fn query_invoice_digest_request_contains_required_blocks() {
+        let xml = render_query_invoice_digest_request(
+            &fixture_credentials(),
+            "12345678",
+            "REQ12345ABCDEFG",
+            "20260520T120000Z",
+            1,
+            InvoiceDirection::Inbound,
+            "2026-05-01",
+            "2026-05-30",
+        )
+        .expect("envelope renders");
+        let s = std::str::from_utf8(&xml).expect("UTF-8");
+
+        assert!(s.contains("<QueryInvoiceDigestRequest"));
+        assert!(s.contains("xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/api\""));
+        assert!(s.contains("xmlns:common=\"http://schemas.nav.gov.hu/NTCA/1.0/common\""));
+
+        assert!(s.contains("<common:requestId>REQ12345ABCDEFG</common:requestId>"));
+        assert!(s.contains("<common:timestamp>20260520T120000Z</common:timestamp>"));
+        assert!(s.contains("<common:login>TECHNICAL_LOGIN</common:login>"));
+        assert!(s.contains("<common:taxNumber>12345678</common:taxNumber>"));
+
+        assert!(s.contains("<page>1</page>"));
+        assert!(s.contains("<invoiceDirection>INBOUND</invoiceDirection>"));
+        assert!(s.contains("<invoiceQueryParams>"));
+        assert!(s.contains("<mandatoryQueryParams>"));
+        assert!(s.contains("<invoiceIssueDate>"));
+        assert!(s.contains("<dateFrom>2026-05-01</dateFrom>"));
+        assert!(s.contains("<dateTo>2026-05-30</dateTo>"));
+
+        // page → invoiceDirection → invoiceQueryParams XSD order.
+        let r_page = s.find("<page>").expect("page present");
+        let r_dir = s
+            .find("<invoiceDirection>")
+            .expect("invoiceDirection present");
+        let r_params = s
+            .find("<invoiceQueryParams>")
+            .expect("invoiceQueryParams present");
+        assert!(
+            r_page < r_dir && r_dir < r_params,
+            "page → invoiceDirection → invoiceQueryParams order required: {s}"
+        );
+
+        assert!(
+            !s.contains("tech-password"),
+            "plaintext password leaked into queryInvoiceDigest envelope: {s}"
+        );
+        assert!(
+            !s.contains("SIGN-KEY-32BYTES-OF-FAKE-MATERIAL"),
+            "plaintext sign key leaked into queryInvoiceDigest envelope: {s}"
+        );
+    }
+
+    /// Outbound direction round-trips for symmetry — the AP-sync daemon
+    /// uses INBOUND but the renderer must accept either per the
+    /// declared `InvoiceDirection` enum surface.
+    #[test]
+    fn query_invoice_digest_request_supports_outbound_direction() {
+        let xml = render_query_invoice_digest_request(
+            &fixture_credentials(),
+            "12345678",
+            "REQ12345ABCDEFG",
+            "20260520T120000Z",
+            2,
+            InvoiceDirection::Outbound,
+            "2026-05-01",
+            "2026-05-30",
+        )
+        .expect("envelope renders");
+        let s = std::str::from_utf8(&xml).expect("UTF-8");
+        assert!(s.contains("<page>2</page>"));
+        assert!(s.contains("<invoiceDirection>OUTBOUND</invoiceDirection>"));
     }
 
     /// `InvoiceDirection::Inbound` round-trips through the

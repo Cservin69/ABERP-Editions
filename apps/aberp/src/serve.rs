@@ -91,6 +91,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
+use crate::ap_sync;
 use crate::audit_payloads::{self, InvoiceEmailedSentPayload, PaymentMethod};
 use crate::audit_query::PaymentRecord;
 use crate::binary_hash::BinaryHashHandle;
@@ -901,6 +902,79 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             ),
         }
 
+        // S178 / PR-178 — AP-side auto-sync daemon. Mirrors the
+        // outgoing-side NAV poll daemon's spawn-and-forget posture;
+        // ticks 30s after boot then every 30 min. Builds its own
+        // `CycleInputs` on every tick (so a mid-run NAV credential
+        // rotation is picked up at the next cadence without a
+        // restart). The closure clones state into the task so the
+        // outer `recovery_state` move is safe.
+        {
+            let st = recovery_state.clone();
+            tokio::spawn(async move {
+                let st = st;
+                ap_sync::run_daemon_forever(move || {
+                    let operator_login = match st.boot_state.read() {
+                        Ok(guard) => match &*guard {
+                            ServeBootState::Ready { operator_login } => operator_login.clone(),
+                            other => {
+                                return Err(anyhow!(
+                                    "AP sync daemon waiting on boot_state ({}); skipping tick",
+                                    other.state_token()
+                                ));
+                            }
+                        },
+                        Err(e) => return Err(anyhow!("boot_state RwLock poisoned: {e}")),
+                    };
+                    // Build a blocking-style call inside a closure
+                    // that returns `Result<CycleInputs>` — the daemon
+                    // helper awaits the daemon-internal work, but the
+                    // input-building itself is synchronous (keychain
+                    // read + seller.toml read + endpoint pick).
+                    let binary_hash = st
+                        .binary_hash
+                        .wait()
+                        .context("await background binary hash for AP sync daemon")?;
+                    let credentials = NavCredentials::load_from_keychain(st.tenant.as_str())
+                        .with_context(|| {
+                            format!(
+                                "load NAV credentials from OS keychain for tenant `{}` (AP sync daemon)",
+                                st.tenant.as_str()
+                            )
+                        })?;
+                    let supplier = supplier_from_seller_toml(st.tenant.as_str()).map_err(|e| {
+                        anyhow!(
+                            "load supplier identity for AP sync daemon (tenant `{}`): {:?}",
+                            st.tenant.as_str(),
+                            e
+                        )
+                    })?;
+                    let parsed = nav_xml::parse_hungarian_tax_number(&supplier.tax_number)
+                        .map_err(|e| {
+                            anyhow!(
+                                "parse supplier tax number `{}` for AP sync daemon: {:?}",
+                                supplier.tax_number,
+                                e
+                            )
+                        })?;
+                    let endpoint = build_profile::nav_endpoint();
+                    build_profile::assert_endpoint_allowed(endpoint)?;
+                    let artifacts_dir = ap_artifacts_dir(st.tenant.as_str())?;
+                    Ok(ap_sync::CycleInputs {
+                        db_path: (*st.db_path).clone(),
+                        tenant: st.tenant.clone(),
+                        binary_hash,
+                        operator_login,
+                        ap_artifacts_dir: artifacts_dir,
+                        tax_number_8: parsed.taxpayer_id,
+                        endpoint,
+                        credentials,
+                    })
+                })
+                .await;
+            });
+        }
+
         let config = RustlsConfig::from_der(rustls_config.0, rustls_config.1)
             .await
             .context("build axum-server RustlsConfig")?;
@@ -1406,6 +1480,15 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/incoming-invoices/:id/mark-irrelevant",
             post(handle_mark_incoming_irrelevant),
+        )
+        // S178 / PR-178 — operator-clicked manual AP sync trigger.
+        // Synchronous (blocks the response until the cycle returns
+        // counts). Same daemon code path as the cadence tick;
+        // emits one `IncomingInvoiceSyncCycleCompleted` audit
+        // entry with `trigger="manual"`.
+        .route(
+            "/api/incoming-invoices/sync-now",
+            post(handle_sync_incoming_now),
         )
         // PR-72 / session-94 — multi-bank-account CRUD (PR-B of the
         // multi-bank initiative; ADR-0040 §addendum). Five routes
@@ -6462,6 +6545,121 @@ fn mark_incoming_status_inner(
             internal_error("mark_incoming_status", e)
         }
     }
+}
+
+/// S178 / PR-178 — operator-clicked manual AP sync trigger.
+/// Synchronous: blocks the response until the digest walk finishes,
+/// then echoes the counts so the SPA can render a toast. Same code
+/// path the daemon's cadence ticks use; the only fork is the
+/// `trigger="manual"` tag on the audit entry.
+#[derive(Debug, Serialize)]
+struct SyncIncomingNowResponse {
+    /// `"ok"` on a successful cycle; `"error"` on loud-failure (the
+    /// audit entry still fires; the SPA renders the error message
+    /// in the toast).
+    status: &'static str,
+    ingested_count: u64,
+    skipped_count: u64,
+    pages_walked: u32,
+    elapsed_ms: u64,
+    date_from: String,
+    date_to: String,
+    /// `Some(_)` IFF the cycle aborted; verbatim NAV-side diagnostic.
+    error: Option<String>,
+}
+
+async fn handle_sync_incoming_now(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let inputs = match build_ap_sync_inputs(&state, operator_login).await {
+        Ok(v) => v,
+        Err(e) => return internal_error("sync_incoming_now:build_inputs", e),
+    };
+    match ap_sync::run_one_cycle(inputs, ap_sync::CycleTrigger::Manual).await {
+        Ok(summary) => Json(SyncIncomingNowResponse {
+            status: "ok",
+            ingested_count: summary.ingested_count,
+            skipped_count: summary.skipped_count,
+            pages_walked: summary.pages_walked,
+            elapsed_ms: summary.elapsed_ms,
+            date_from: summary.date_from,
+            date_to: summary.date_to,
+            error: summary.error,
+        })
+        .into_response(),
+        Err(e) => {
+            // The cycle aborted before its own audit entry could be
+            // built — surface a 502 (NAV-side fault) with the
+            // verbatim error so the SPA shows the cause loud.
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(SyncIncomingNowResponse {
+                    status: "error",
+                    ingested_count: 0,
+                    skipped_count: 0,
+                    pages_walked: 0,
+                    elapsed_ms: 0,
+                    date_from: String::new(),
+                    date_to: String::new(),
+                    error: Some(format!("{e:#}")),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Build the `CycleInputs` for the AP-sync daemon / manual route.
+/// Loads NAV credentials from the keychain, resolves the tenant's
+/// 8-digit tax number head from seller.toml, picks the compile-time
+/// NAV endpoint (same prod-flag posture as the rest of the binary).
+async fn build_ap_sync_inputs(
+    state: &AppState,
+    operator_login: String,
+) -> Result<ap_sync::CycleInputs> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute for AP sync inputs")?;
+    let credentials =
+        NavCredentials::load_from_keychain(state.tenant.as_str()).with_context(|| {
+            format!(
+                "load NAV credentials from OS keychain for tenant `{}` (AP sync)",
+                state.tenant.as_str()
+            )
+        })?;
+    let supplier = supplier_from_seller_toml(state.tenant.as_str()).map_err(|e| {
+        anyhow!(
+            "load supplier identity from seller.toml for AP sync (tenant `{}`): {:?}",
+            state.tenant.as_str(),
+            e
+        )
+    })?;
+    let parsed = nav_xml::parse_hungarian_tax_number(&supplier.tax_number).map_err(|e| {
+        anyhow!(
+            "parse supplier tax number `{}` for AP sync: {:?}",
+            supplier.tax_number,
+            e
+        )
+    })?;
+    let endpoint = build_profile::nav_endpoint();
+    build_profile::assert_endpoint_allowed(endpoint)?;
+    let artifacts_dir = ap_artifacts_dir(state.tenant.as_str())?;
+    Ok(ap_sync::CycleInputs {
+        db_path: (*state.db_path).clone(),
+        tenant: state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        ap_artifacts_dir: artifacts_dir,
+        tax_number_8: parsed.taxpayer_id,
+        endpoint,
+        credentials,
+    })
 }
 
 /// Per-tenant directory for raw NAV InvoiceData XML artifacts of

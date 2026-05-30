@@ -772,7 +772,11 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // `system.`-prefixed so they never reach a per-outgoing-
         // invoice export bundle anyway.
         | EventKind::IncomingInvoiceIngested
-        | EventKind::IncomingInvoiceStatusChanged => (None, ""),
+        | EventKind::IncomingInvoiceStatusChanged
+        // S178 / PR-178 — AP-side auto-sync cycle-completion event.
+        // Same posture as the other AP-side kinds: `system.`-scoped,
+        // no NAV-side XML on the payload (cycle summary only).
+        | EventKind::IncomingInvoiceSyncCycleCompleted => (None, ""),
     };
 
     Ok(NavExtraction {
