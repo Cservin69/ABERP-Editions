@@ -81,6 +81,7 @@
   import { buyerComboboxState } from "../lib/buyer-combobox";
   import { productLineComboboxState } from "../lib/product-combobox";
   import { formatMinorToInput } from "../lib/format";
+  import NotesAutocomplete from "../lib/NotesAutocomplete.svelte";
 
   interface Props {
     /** Invoked with the freshly-issued invoice id when the backend
@@ -1546,13 +1547,14 @@
              reaches the NAV InvoiceData XML. -->
         <label class="line-note">
           <span class="line-note-label">Megjegyzés / Note</span>
-          <textarea
+          <NotesAutocomplete
             bind:value={line.note}
-            rows="1"
-            maxlength="2000"
+            scope="line"
+            rows={1}
+            maxlength={2000}
             placeholder="Optional buyer-facing note for this line"
-            data-testid={`line-${index}-note-input`}
-          ></textarea>
+            testid={`line-${index}-note-input`}
+          />
         </label>
         {#if lineErrors[index]}
           <div class="line-errors" data-testid={`line-${index}-errors`}>
@@ -1611,13 +1613,14 @@
     <fieldset>
       <legend>Megjegyzés / Note</legend>
       <label class="invoice-note">
-        <textarea
+        <NotesAutocomplete
           bind:value={form.invoiceNote}
-          rows="3"
-          maxlength="4000"
+          scope="invoice"
+          rows={3}
+          maxlength={4000}
           placeholder="Optional buyer-facing note for the whole invoice (Hungarian or English, plain text)."
-          data-testid="invoice-note-input"
-        ></textarea>
+          testid="invoice-note-input"
+        />
         <span class="invoice-note-hint">
           Appears on the printed invoice under "MEGJEGYZÉS"; visible to
           the buyer. Not sent to NAV.
@@ -1918,20 +1921,11 @@
     margin-bottom: var(--space-1);
   }
 
-  .line-note textarea {
-    width: 100%;
-    resize: vertical;
-    font-family: inherit;
-    font-size: inherit;
-  }
-
-  /* PR-82 — invoice-level buyer note. Larger textarea, hint below. */
-  .invoice-note textarea {
-    width: 100%;
-    resize: vertical;
-    font-family: inherit;
-    font-size: var(--type-size-2);
-  }
+  /* PR-172 — both note textareas are rendered by NotesAutocomplete,
+   * which carries its own width/resize/font styling. The previous
+   * `.line-note textarea` / `.invoice-note textarea` selectors here
+   * pre-PR-172 no longer match (Svelte CSS does not cross component
+   * boundaries) and have been removed. */
 
   .invoice-note-hint {
     display: block;

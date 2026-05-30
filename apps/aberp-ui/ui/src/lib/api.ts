@@ -1342,6 +1342,27 @@ export async function deletePartner(partnerId: string): Promise<void> {
   await invoke<void>("delete_partner", { partnerId });
 }
 
+// ── PR-172 — buyer-facing notes-history typeahead source ─────────────
+
+/** PR-172 — closed-vocab discriminator for the notes-history scope.
+ * Each scope feeds a distinct textarea: per-line notes, per-invoice
+ * notes, and storno reason. Mirrors the Rust-side
+ * `notes_history::NotesHistoryScope`. Wire form is the lowercase
+ * kebab string; an unknown value would 400 backend-side. */
+export type NotesHistoryScope = "line" | "invoice" | "storno";
+
+/** PR-172 — `GET /api/notes-history?scope=...&limit=...`. Returns the
+ * operator's most-recently-used distinct notes for the requested
+ * scope, ordered newest-first. Empty array on a fresh tenant. The
+ * SPA's NotesAutocomplete component filters the response client-side
+ * by a startsWith prefix match on the textarea content. */
+export async function listNotesHistory(
+  scope: NotesHistoryScope,
+  limit?: number,
+): Promise<string[]> {
+  return invoke<string[]>("list_notes_history", { scope, limit });
+}
+
 // ── PR-91 — products master-data CRUD ────────────────────────────────
 
 /** PR-91 — closed-vocab mirror of NAV v3.0's `unitOfMeasureType` enum

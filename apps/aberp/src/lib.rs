@@ -40,6 +40,7 @@ pub mod mark_abandoned;
 pub mod mark_invoice_paid;
 pub mod mnb_rates_provider;
 pub mod nav_xml;
+pub mod notes_history;
 pub mod numbering;
 pub mod observe_receiver_confirmation;
 pub mod partners;

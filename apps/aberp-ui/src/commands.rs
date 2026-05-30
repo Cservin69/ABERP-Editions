@@ -420,6 +420,25 @@ pub async fn delete_partner(state: State<'_, AppState>, partner_id: String) -> R
     forward_delete(&state, &path).await
 }
 
+// ── PR-172 — notes-history typeahead source ─────────────────────────
+
+/// PR-172 — `GET /api/notes-history?scope=line|invoice|storno`. Used
+/// by the SPA's NotesAutocomplete typeahead on three textareas
+/// (per-line note, per-invoice note, storno reason). `scope` is
+/// required; `limit` is optional and clamped backend-side.
+#[tauri::command]
+pub async fn list_notes_history(
+    state: State<'_, AppState>,
+    scope: String,
+    limit: Option<usize>,
+) -> Result<Value, String> {
+    let mut path = format!("/api/notes-history?scope={}", urlencode(&scope));
+    if let Some(n) = limit {
+        path.push_str(&format!("&limit={n}"));
+    }
+    forward_get(&state, &path, true).await
+}
+
 // ── PR-91 — product CRUD ────────────────────────────────────────────
 
 /// PR-91 — `GET /api/products[?search=]`. The SPA's ProductsList

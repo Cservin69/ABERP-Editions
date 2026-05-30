@@ -1341,6 +1341,12 @@ fn build_router(state: AppState) -> Router {
                 .put(handle_update_partner)
                 .delete(handle_delete_partner),
         )
+        // PR-172 — buyer-facing notes typeahead source. GET-only,
+        // ready+bearer-gated. `?scope=line|invoice|storno` is required.
+        // Returns the most-recent-first deduplicated list of operator-
+        // typed notes for the requested scope. Empty array on a fresh
+        // tenant (no audit history yet).
+        .route("/api/notes-history", get(handle_get_notes_history))
         // PR-91 — products master-data CRUD. Five routes (list + create
         // on the collection; get + update + delete on the resource), all
         // require_ready + bearer auth — products is a Ready-state
@@ -5823,6 +5829,76 @@ pub fn delete_partner_request(
     } else {
         Err(PartnerRouteError::NotFound)
     }
+}
+
+// ── PR-172 — GET /api/notes-history ──────────────────────────────────
+//
+// Buyer-facing notes typeahead source. Three textareas in the SPA
+// (per-line note, per-invoice note, storno reason) feed off this
+// endpoint as the operator types. The scope discriminator routes
+// each typeahead to its own history bucket so the per-line typeahead
+// never surfaces an invoice-level note (and vice versa).
+//
+// The handler is a thin shell around `notes_history::list_notes_history`;
+// the per-tenant ledger walk + dedup + ordering live there.
+
+/// PR-172 — query-string carrier for `GET /api/notes-history`.
+/// `scope` is required and one of `line` / `invoice` / `storno`;
+/// unknown values produce a 400 rather than a silent default.
+/// `limit` is optional and defaults to [`crate::notes_history::DEFAULT_LIMIT`].
+#[derive(Debug, Deserialize)]
+pub struct NotesHistoryQuery {
+    pub scope: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+async fn handle_get_notes_history(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<NotesHistoryQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let scope = match crate::notes_history::NotesHistoryScope::from_storage_str(&query.scope) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(error_body(format!(
+                    "unknown scope {:?}: expected one of \"line\", \"invoice\", \"storno\"",
+                    query.scope
+                ))),
+            )
+                .into_response();
+        }
+    };
+    let limit = query.limit.unwrap_or(crate::notes_history::DEFAULT_LIMIT);
+    match list_notes_history_request(&state, scope, limit) {
+        Ok(notes) => Json(notes).into_response(),
+        Err(e) => internal_error("list_notes_history_request", e),
+    }
+}
+
+/// PR-172 — library helper backing `GET /api/notes-history`. `pub`
+/// so an integration test can hit it without spinning the HTTPS
+/// listener (same posture as `list_partners_request` per A159).
+pub fn list_notes_history_request(
+    state: &AppState,
+    scope: crate::notes_history::NotesHistoryScope,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute")?;
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
+        .context("open audit ledger for notes-history scan")?;
+    crate::notes_history::list_notes_history(&ledger, scope, limit)
 }
 
 // ── PR-91 — products master-data routes ──────────────────────────────

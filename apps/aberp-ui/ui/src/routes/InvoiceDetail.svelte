@@ -213,6 +213,7 @@
   import { bytesAsUtf8Replacer } from "../lib/payload-reviver";
   import InvoiceTimeline from "../lib/InvoiceTimeline.svelte";
   import { timelineFromAuditEntries } from "../lib/invoice-timeline";
+  import NotesAutocomplete from "../lib/NotesAutocomplete.svelte";
 
   interface Props {
     invoiceId: string | null;
@@ -1368,15 +1369,15 @@
               Megjelenik a vevő példányán / Shown on the buyer's copy
             </span>
           </label>
-          <textarea
-            id="storno-reason-input"
-            class="storno-reason-input"
+          <NotesAutocomplete
             bind:value={stornoReason}
-            maxlength="4000"
-            rows="3"
+            scope="storno"
+            inputId="storno-reason-input"
+            maxlength={4000}
+            rows={3}
             placeholder="pl. Téves vevő adatok kerültek a számlára…"
-            data-testid="storno-confirm-reason"
-          ></textarea>
+            testid="storno-confirm-reason"
+          />
           <div class="storno-confirm-actions">
             <button
               type="button"
@@ -2301,20 +2302,11 @@
     color: var(--color-text-muted);
   }
 
-  .storno-reason-input {
-    width: 100%;
-    padding: var(--space-1) var(--space-2);
-    margin: 0 0 var(--space-3) 0;
-    font-family: var(--type-family-body);
-    font-size: var(--type-size-sm);
-    line-height: var(--type-line-normal);
-    border: 1px solid var(--color-surface-divider);
-    border-radius: 2px;
-    background: var(--color-surface-base);
-    color: var(--color-text-primary);
-    resize: vertical;
-    box-sizing: border-box;
-  }
+  /* PR-172 — the storno-reason textarea is rendered by
+   * NotesAutocomplete (scope="storno"), which carries its own
+   * width/border/font styling. The pre-PR-172 `.storno-reason-input`
+   * selector no longer matches a textarea directly in this
+   * component's template; removed to keep `svelte-check` clean. */
 
   /* PR-44ε.UI — inline download-error message. Same `.error` styling
    * as the body-level load-error message; an extra `download-error`

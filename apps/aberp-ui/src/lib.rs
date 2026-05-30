@@ -222,6 +222,7 @@ pub fn run() {
             commands::create_partner,
             commands::update_partner,
             commands::delete_partner,
+            commands::list_notes_history,
             commands::list_products,
             commands::get_product,
             commands::create_product,
