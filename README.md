@@ -67,3 +67,39 @@ Build phase. Workspace scaffold landed in session 5; the supply-chain CI,
 audit-ledger crate, billing module, and the NAV-XML-on-disk binary (commit
 #1's success criterion) land across the rest of session 5's PRs. See
 `adr/README.md` for the design ledger and `git log` for landed commits.
+
+## Production cutover & releases
+
+Dev work happens on `main`. Production releases live on the `prod` branch
+and as annotated `prod-vMAJOR.MINOR.PATCH` tags.
+
+The compile-time `production` Cargo feature is the load-bearing switch:
+
+- **Without** `--features production` (every dev build) — NAV calls
+  route to `api-test.onlineszamla.nav.gov.hu`, invoice numbers are
+  prefixed `TEST-`, and the prod endpoint is structurally unreachable
+  (`assert_endpoint_allowed`).
+- **With** `--features production` — NAV calls route to the real
+  `api.onlineszamla.nav.gov.hu`, the `TEST-` prefix is dropped, and
+  boot-time sanity checks enforce that the binary is running as
+  `tenant=prod` with the documented seller identity.
+
+Release workflow:
+
+```bash
+./run/release.sh prod-v0.1.0   # validates main+clean, fmt, builds with
+                               # --features production, tags locally
+./run/run_prod.sh              # launches the prod binary (Tauri shell)
+```
+
+The full manual cutover procedure — first-time prod branch creation,
+seller.toml template, NAV+SMTP credential setup, smoke-invoice
+checklist, rollback, ongoing update workflow — is documented in
+**[`docs/CUTOVER_RUNBOOK.md`](docs/CUTOVER_RUNBOOK.md)**.
+
+> **The dev-DB-disposable rule reverses at prod cutover.** Once
+> `~/.aberp/prod/aberp.duckdb` holds a single issued invoice, it is
+> the legal record. Every schema change must be forward-compatible
+> from that point onward; the audit ledger is already append-only
+> (ADR-0008). Snapshot the DB before any upgrade — see the runbook
+> Step 9.
