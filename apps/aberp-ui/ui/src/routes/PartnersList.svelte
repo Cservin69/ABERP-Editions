@@ -29,12 +29,21 @@
     nextRowIndex,
     parseHotkey,
   } from "../lib/keyboard-nav";
+  // PR-181 / session-181 — persist the quick-filter needle to
+  // localStorage so an operator's typed filter survives reload.
+  // Seeded synchronously at component init (before first render) so
+  // the rendered list reflects the persisted needle without a flash
+  // of the unfiltered set.
+  import {
+    loadPartnerListPrefs,
+    savePartnerListPrefs,
+  } from "../lib/partner-list-persistence";
   import PartnerForm from "./PartnerForm.svelte";
 
   let rows: Partner[] = $state([]);
   let loadState: "loading" | "loaded" | "error" = $state("loading");
   let loadError: string | null = $state(null);
-  let search: string = $state("");
+  let search: string = $state(loadPartnerListPrefs().filter.needle);
 
   // Modal state: `null` = closed; `"new"` = create-mode;
   // `Partner` = edit-mode pre-filled from that row.
@@ -61,6 +70,14 @@
     } else if (focusedRowIndex >= filtered.length) {
       focusedRowIndex = filtered.length - 1;
     }
+  });
+
+  // PR-181 — persist the needle on every mutation. Cheap (`setItem`
+  // on a 30-byte blob); fire-and-forget on failure (private browsing,
+  // quota). Runs once at mount with the seeded value too, which is
+  // harmless (idempotent write of the same blob the load read).
+  $effect(() => {
+    savePartnerListPrefs({ filter: { needle: search } });
   });
 
   onMount(() => {

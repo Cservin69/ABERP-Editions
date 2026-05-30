@@ -17,13 +17,21 @@
     nextRowIndex,
     parseHotkey,
   } from "../lib/keyboard-nav";
+  // PR-181 / session-181 — persist the quick-filter needle to
+  // localStorage. Seeded synchronously at component init (before
+  // first render) so the rendered list reflects the persisted needle
+  // without a flash of the unfiltered set.
+  import {
+    loadProductListPrefs,
+    saveProductListPrefs,
+  } from "../lib/product-list-persistence";
   import { filterProducts, unitLabel } from "../lib/products";
   import ProductForm from "./ProductForm.svelte";
 
   let rows: Product[] = $state([]);
   let loadState: "loading" | "loaded" | "error" = $state("loading");
   let loadError: string | null = $state(null);
-  let search: string = $state("");
+  let search: string = $state(loadProductListPrefs().filter.needle);
 
   // Modal state: `null` = closed, `"new"` = create-mode, `Product`
   // = edit-mode pre-filled.
@@ -49,6 +57,11 @@
     } else if (focusedRowIndex >= filtered.length) {
       focusedRowIndex = filtered.length - 1;
     }
+  });
+
+  // PR-181 — persist the needle on every mutation.
+  $effect(() => {
+    saveProductListPrefs({ filter: { needle: search } });
   });
 
   onMount(() => {
