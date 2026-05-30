@@ -104,9 +104,7 @@ use std::path::Path;
 use aberp_audit_ledger::{
     self as audit_ledger, Actor, Entry, EventKind, Ledger, LedgerMeta, TenantId,
 };
-use aberp_billing::{
-    self as billing, BillingStore, DuckDbBillingStore, IdempotencyKey, InvoiceSeries, ReadyInvoice,
-};
+use aberp_billing::{self as billing, DuckDbBillingStore, IdempotencyKey, ReadyInvoice};
 use aberp_nav_transport::{
     operations::query_invoice_data::{self, QueryInvoiceDataOutcome},
     soap::InvoiceDirection,
@@ -199,15 +197,26 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
         "annulment-side transactionId + idempotency_key resolved from audit ledger"
     );
 
-    // 4. Load the BASE invoice's billing row + series row to
-    //    construct the NAV-facing invoice number. ADR-0028 §1
-    //    ("Does NOT take --nav-invoice-number"): the operator
-    //    passes only --invoice-id; the orchestrator builds the
-    //    NAV-facing number from billing-store truth, avoiding
-    //    the operator-typo-on-secondary-key class CLAUDE.md
-    //    rule 12 names.
+    // 4. Load the BASE invoice's billing row to construct the
+    //    NAV-facing invoice number. ADR-0028 §1 ("Does NOT take
+    //    --nav-invoice-number"): the operator passes only
+    //    --invoice-id; the orchestrator builds the NAV-facing
+    //    number from billing-store truth, avoiding the
+    //    operator-typo-on-secondary-key class CLAUDE.md rule 12
+    //    names. S173 — number rendered through
+    //    `NumberingTemplate::render_for_build` so dev builds carry
+    //    the build-profile `TEST-` prefix (matching the base's
+    //    original emit) AND any operator-configured template
+    //    (year/literal segments) is honoured. Pre-S173 the format
+    //    was hardcoded `"{series_code}/{seq:05}"`, which silently
+    //    omitted the prefix in dev and ignored custom templates —
+    //    one of the two stale-format gaps S165 flagged.
+    let seller_toml_path = crate::setup_seller_info::seller_toml_path_for_tenant(&args.tenant)
+        .context("resolve seller.toml path for numbering template")?;
+    let template = crate::numbering::read_numbering_template(&seller_toml_path)
+        .context("read [seller.numbering] template from seller.toml")?;
     let (nav_invoice_number, base_sequence_number) =
-        load_base_nav_invoice_number(&args.db, &args.invoice_id)?;
+        load_base_nav_invoice_number(&args.db, &args.invoice_id, &template)?;
     tracing::info!(
         nav_invoice_number = %nav_invoice_number,
         base_sequence_number,
@@ -313,23 +322,31 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
     Ok(())
 }
 
-/// Open the billing store, load the base invoice's row, find its
-/// series row, return the NAV-facing invoice number + sequence
-/// number. ADR-0028 §1 / §8 — same format
-/// `nav_xml::render_invoice_data` uses for every other
-/// `<invoiceNumber>` element ABERP emits.
+/// Open the billing store, load the base invoice's row, and
+/// render the NAV-facing invoice number via the operator-
+/// configured numbering template. Returns the rendered number
+/// + the bare sequence number (the latter is operator-visible
+/// in the summary line).
 ///
-/// The two billing reads are issued sequentially on one
-/// Connection (wrapped/unwrapped through `DuckDbBillingStore`
-/// to use the `find_series_by_id` port). DuckDB's file-locking
-/// discipline handles the concurrent-read safety; the read-side
-/// transactions are short-lived.
-fn load_base_nav_invoice_number(db_path: &Path, invoice_id: &str) -> Result<(String, u64)> {
+/// S173 — pre-S173 this also loaded the `InvoiceSeries` row to
+/// compose `"{series_code}/{seq:05}"` directly. That format
+/// silently dropped (a) the build-profile `TEST-` prefix on dev
+/// builds and (b) any operator-configured template segments
+/// (Year / wider Counter pad / custom literals). The render now
+/// goes through [`crate::numbering::NumberingTemplate::render_for_build`]
+/// using the base invoice's own `issue_date.year()` so a
+/// cross-year observe call still emits the original year — same
+/// posture `issue_storno` / `issue_modification` already use for
+/// the base storno/modification reference.
+fn load_base_nav_invoice_number(
+    db_path: &Path,
+    invoice_id: &str,
+    template: &crate::numbering::NumberingTemplate,
+) -> Result<(String, u64)> {
     let store = DuckDbBillingStore::open(db_path)
         .with_context(|| format!("open billing DuckDB at {}", db_path.display()))?;
     let mut conn = store.into_connection();
 
-    // Load the base invoice's row in a short read tx.
     let base_invoice: ReadyInvoice = {
         let tx = conn
             .transaction()
@@ -347,38 +364,10 @@ fn load_base_nav_invoice_number(db_path: &Path, invoice_id: &str) -> Result<(Str
         tx.commit().context("commit read tx for base invoice")?;
         invoice
     };
-    let base_sequence_number = base_invoice.sequence_number;
-    let base_series_id = base_invoice.series_id;
 
-    // Wrap the Connection back into the store to use the
-    // `find_series_by_id` port. Same shape `issue_storno`'s
-    // pre_tx_setup uses for series lookup.
-    let store = DuckDbBillingStore::from_connection(conn);
-    let series: InvoiceSeries = store
-        .find_series_by_id(base_series_id)
-        .context("billing::find_series_by_id (observe-receiver-confirmation base series)")?
-        .ok_or_else(|| {
-            anyhow!(
-                "base invoice {} references series_id {} which is not present in \
-                 invoice_series — tenant DB appears tampered between invoice insertion \
-                 and observe-receiver-confirmation",
-                invoice_id,
-                base_series_id.to_prefixed_string()
-            )
-        })?;
-
-    // Same format `nav_xml::render_invoice_data` uses:
-    //   "{series_code}/{sequence_number:05}"
-    // The format is the canonical NAV-facing invoice number
-    // shape per ADR-0009 §3 (gap-free numbering within a series
-    // — the series code prefixes; the 5-digit zero-padded
-    // sequence number is the suffix).
-    let nav_invoice_number = format!(
-        "{}/{:05}",
-        series.code.as_str(),
-        base_invoice.sequence_number
-    );
-    Ok((nav_invoice_number, base_sequence_number))
+    let nav_invoice_number =
+        template.render_for_build(base_invoice.issue_date.year(), base_invoice.sequence_number);
+    Ok((nav_invoice_number, base_invoice.sequence_number))
 }
 
 /// Walk the audit ledger and resolve the inputs for the

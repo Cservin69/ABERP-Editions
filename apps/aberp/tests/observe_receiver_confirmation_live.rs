@@ -299,7 +299,19 @@ fn observe_receiver_confirmation_against_api_test_end_to_end() {
         confirmations.len()
     );
 
-    let expected_nav_number = format!("{}/{:05}", series_code, base_seq_for_nav_number);
+    // S173 — the observe path now renders the NAV-facing invoice
+    // number via the operator-configured `NumberingTemplate`
+    // (matching what `issue_invoice` writes to `<invoiceNumber>` at
+    // emit time). The live-test fixture does not seed a custom
+    // seller.toml, so the render goes through `default_template`
+    // (`Literal("INV-default/") + Counter{pad:5}`) — `series_code`
+    // remains the issue-time bucket key but is no longer used to
+    // compose the rendered number. The build-profile prefix flows
+    // in automatically via `render_for_build`.
+    let expected_nav_number = aberp::numbering::default_template().render_for_build(
+        time::OffsetDateTime::now_utc().year(),
+        base_seq_for_nav_number,
+    );
     let payload: InvoiceAnnulmentReceiverConfirmationPayload =
         serde_json::from_slice(&confirmations[0].payload)
             .expect("typed receiver-confirmation payload decode");
