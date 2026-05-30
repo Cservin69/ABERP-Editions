@@ -119,6 +119,27 @@ echo "${c_red}  seller.toml:  ${PROD_SELLER_TOML}${c_rst}" >&2
 echo "${c_red}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c_rst}" >&2
 echo >&2
 
+# ---------- pre-flight: free port 5173 (stale-Vite cleanup) ----------------
+# Defense-in-depth: the S169 release binary embeds the SPA via
+# tauri/custom-protocol and does NOT touch :5173 at runtime. But Ervin
+# may have a leftover `npm run dev` from the 2026-05-30 workaround when
+# the binary still needed Vite. A zombie Vite on :5173 is harmless to
+# the new binary, but it's dangling state worth clearing before launch.
+# lsof ships preinstalled on macOS.
+if lsof -ti :5173 >/dev/null 2>&1; then
+  stale_pid="$(lsof -ti :5173)"
+  echo "${c_yel}[stale] port 5173 in use by pid ${stale_pid} (likely Vite from earlier workaround). Killing.${c_rst}" >&2
+  echo "${c_yel}[ragadt] az 5173-as port pid=${stale_pid} kezeli (valószínűleg régi Vite). Kilövöm.${c_rst}" >&2
+  kill "$stale_pid" 2>/dev/null || true
+  sleep 1
+  if lsof -ti :5173 >/dev/null 2>&1; then
+    echo "${c_red}[fail] port 5173 still in use after kill — investigate manually: lsof -i :5173${c_rst}" >&2
+    echo "${c_red}[hiba] az 5173-as port a kill után is foglalt — nézz utána kézzel: lsof -i :5173${c_rst}" >&2
+    exit 1
+  fi
+  echo "${c_grn}[ ok ] port 5173 freed${c_rst}" >&2
+fi
+
 # ---------- hülye-biztos guard #3: compile + run with production feature ---
 # Build BOTH binaries: the Tauri shell (aberp-ui) is what the operator
 # launches; it spawns the aberp CLI as a subprocess for serve/keychain
