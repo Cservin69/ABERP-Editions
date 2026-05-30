@@ -441,14 +441,16 @@ pub fn modification_from_inputs(
         "NAV modification XML written"
     );
 
-    let invoice_number = format!(
-        "{}/{:05}",
-        series_code.as_str(),
-        modification.sequence_number
-    );
+    // S174 — surface the SAME render that flowed to NAV (line 408-409
+    // above) on the operator-visible summary. Pre-S174 the summary
+    // composed its own `format!("{}/{:05}", ...)` — silently omitting
+    // the dev TEST- prefix and ignoring any operator-configured
+    // numbering template, so the CLI/SPA/PDF display diverged from the
+    // wire. Same one-liner fix S173 applied to the annulment + observe
+    // paths.
     Ok(ModificationIssuedSummary {
         invoice_id: modification.id.to_prefixed_string(),
-        invoice_number,
+        invoice_number: modification_invoice_number,
         modification_index,
         entries_verified: verified,
     })
@@ -1436,6 +1438,36 @@ mod tests {
         assert!(
             msg.contains("no NAV submission response"),
             "inv_A should be NeverSubmitted regardless of inv_B's state: got {msg}"
+        );
+    }
+
+    /// S174 — pin that the operator-visible `ModificationIssuedSummary
+    /// .invoice_number` matches the same `NumberingTemplate::render_for_build`
+    /// shape the NAV-facing `<invoiceNumber>` carries. Pre-S174 the
+    /// summary built its own `format!("{}/{:05}", series, seq)` which
+    /// silently omitted the dev-build TEST- prefix and any operator-
+    /// configured template — so the SPA display + CLI line + PDF
+    /// filename diverged from what NAV got.
+    ///
+    /// The pin is a string-equality assertion at the template layer:
+    /// the production code reuses the SAME `modification_invoice_number`
+    /// local that flows to `render_modification_data_with_number`, so
+    /// if the wire string and the summary string agree at the template
+    /// render-site, they agree end-to-end. Mirrors the S173 pin in
+    /// `request_technical_annulment.rs::base_invoice_number_carries_test_prefix_in_dev_build`.
+    #[test]
+    fn modification_invoice_number_matches_render_for_build_under_test_build() {
+        use crate::build_profile::INVOICE_NUMBER_TEST_PREFIX;
+        use crate::numbering::default_template;
+
+        let template = default_template();
+        let rendered = template.render_for_build(2026, 42);
+        let expected = format!("{INVOICE_NUMBER_TEST_PREFIX}INV-default/00042");
+        assert_eq!(
+            rendered, expected,
+            "modification summary's invoice_number is reused from this exact \
+             render — divergence here means the SPA/CLI/PDF display would diverge \
+             from the NAV-facing <invoiceNumber>"
         );
     }
 }
