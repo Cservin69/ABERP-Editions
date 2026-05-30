@@ -170,6 +170,19 @@
     color: var(--color-signal-positive);
     border-color: var(--color-signal-positive);
   }
+  /* S163 — email-send outcome badges. A successful send reads as a
+     positive signal (same palette as the SAVED ack / paid badges); a
+     failed send reads as a negative signal (same palette as the
+     ABORTED ack) so the operator never mistakes a failure for a
+     delivery on the timeline. */
+  .timeline-badge.kind-email-sent {
+    color: var(--color-signal-positive);
+    border-color: var(--color-signal-positive);
+  }
+  .timeline-badge.kind-email-failed {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
+  }
   .timeline-badge.kind-default {
     color: var(--color-text-muted);
     border-color: var(--color-surface-divider);

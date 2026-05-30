@@ -5,8 +5,9 @@
 //
 // Closed-vocab posture per CLAUDE.md rule 11: the kind switch matches
 // the operator-meaningful EventKind set the detail modal already
-// surfaces (issuance, submission attempt, ack-status, storno, and
-// modification). Every other kind — `InvoiceSequenceReserved`,
+// surfaces (issuance, submission attempt, ack-status, storno,
+// modification, payment recorded, and email-sent — the last forking on
+// its `outcome` field, S163). Every other kind — `InvoiceSequenceReserved`,
 // `InvoiceSubmissionResponse`, `InvoiceRetryRequested`,
 // `InvoiceMarkedAbandoned`, the four annulment kinds,
 // `InvoiceSubmissionAttemptFailed`, `InvoiceCheckPerformed` — falls
@@ -64,6 +65,8 @@ export interface TimelineNode {
    *     `kind-ack-aborted` (⚠), `kind-ack-received` (⇣)
    *   - `kind-storno` (⊘)
    *   - `kind-modified` (✎)
+   *   - `kind-paid` (💰)
+   *   - `kind-email-sent` (✉), `kind-email-failed` (⚠) — S163
    *   - `kind-default` (•) — fallback for unmodelled EventKinds */
   kind_class: string;
   /** Secondary lines rendered under the heading. Today: `actor`
@@ -115,6 +118,36 @@ function readAckStatus(payload: unknown): string | null {
   if (typeof payload !== "object" || payload === null) return null;
   const ack = (payload as { ack_status?: unknown }).ack_status;
   return typeof ack === "string" ? ack : null;
+}
+
+/** S163 — read the `outcome` string off an `InvoiceEmailedSent`
+ * payload. The wire shape is `{ invoice_id, recipient, subject,
+ * outcome, error_class?, error_detail?, auto, attached_xml }` per
+ * `audit_payloads::InvoiceEmailedSentPayload`; `outcome` is the
+ * closed vocab `"succeeded" | "failed"`. Mirrors
+ * `invoice-actions.ts::readEmailOutcome` (the codebase keeps a local
+ * copy per module rather than cross-importing — same posture as
+ * `readAckStatus`). Returns the raw string or `null` if missing /
+ * not a string. */
+function readEmailOutcome(payload: unknown): string | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const outcome = (payload as { outcome?: unknown }).outcome;
+  return typeof outcome === "string" ? outcome : null;
+}
+
+/** S163 — read the operator-readable `error_detail` (already secret-
+ * scrubbed backend-side per `EmailSendError::scrubbed_detail`) off a
+ * FAILED `InvoiceEmailedSent` payload, prefixed by its closed-vocab
+ * `error_class` when present. Returns `null` when neither field is a
+ * string (e.g. a success entry), so the caller simply omits the
+ * detail line. */
+function readEmailFailureDetail(payload: unknown): string | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const p = payload as { error_class?: unknown; error_detail?: unknown };
+  const cls = typeof p.error_class === "string" ? p.error_class : null;
+  const detail = typeof p.error_detail === "string" ? p.error_detail : null;
+  if (cls === null && detail === null) return null;
+  return `${cls ?? "?"}: ${detail ?? "(no detail)"}`;
 }
 
 /** PR-76 — one entry from the `technical_validation_messages` array
@@ -221,6 +254,36 @@ function classify(entry: AuditEntryView): KindMeta {
         kind_class: "kind-paid",
         label: "Payment recorded",
       };
+    case "InvoiceEmailedSent": {
+      // S163 — the email-send event carries a closed-vocab `outcome`
+      // ("succeeded" | "failed") on its payload (PR-92/93). Pre-S163
+      // this kind fell through to the muted `•` default and rendered
+      // the raw "InvoiceEmailedSent" string IDENTICALLY for both
+      // outcomes — so a FAILED send read as "sent" on the timeline
+      // while the action-bar tooltip (PR-99 `emailButtonState`)
+      // correctly said it failed. The audit row's `outcome` field was
+      // truthful all along; only this display label lied. Fork on the
+      // outcome so the narrative matches the data (CLAUDE.md rule 12).
+      const outcome = readEmailOutcome(entry.payload);
+      if (outcome === "succeeded") {
+        return { glyph: "✉", kind_class: "kind-email-sent", label: "Email sent" };
+      }
+      if (outcome === "failed") {
+        return {
+          glyph: "⚠",
+          kind_class: "kind-email-failed",
+          label: "Email send failed",
+        };
+      }
+      // Unknown / missing outcome — surface the raw kind on the muted
+      // dot so a backend wire-shape drift stays operator-visible
+      // rather than masquerading as a successful send.
+      return {
+        glyph: DEFAULT_META.glyph,
+        kind_class: DEFAULT_META.kind_class,
+        label: entry.kind,
+      };
+    }
     default:
       // Unmodelled EventKind — render the raw wire string so the
       // operator can still see WHICH entry it is. The muted `•`
@@ -255,6 +318,14 @@ function bodyLines(entry: AuditEntryView): string[] {
     for (const m of readTechnicalValidationMessages(entry.payload)) {
       lines.push(formatValidationMessage(m));
     }
+  }
+  // S163 — for a FAILED email send, surface the scrubbed error class +
+  // detail as a body line (same "operator sees WHY without digging into
+  // logs" posture as the ack-status validation messages above). Success
+  // entries return null here and add no extra line.
+  if (entry.kind === "InvoiceEmailedSent") {
+    const failure = readEmailFailureDetail(entry.payload);
+    if (failure !== null) lines.push(failure);
   }
   return lines;
 }

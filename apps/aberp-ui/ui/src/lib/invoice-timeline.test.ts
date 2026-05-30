@@ -82,6 +82,64 @@ describe("timelineFromAuditEntries — per-kind glyph + class + label", () => {
   });
 });
 
+// S163 — InvoiceEmailedSent forks on its closed-vocab `outcome`
+// ("succeeded" | "failed"). Pre-S163 this kind fell through to the
+// muted `•` default and rendered the raw "InvoiceEmailedSent" string
+// IDENTICALLY for both outcomes, so a failed send read as "sent" on
+// the timeline. These pins lock the truthful per-outcome labels.
+describe("timelineFromAuditEntries — InvoiceEmailedSent forks per outcome", () => {
+  it("outcome=succeeded → ✉ kind-email-sent 'Email sent'", () => {
+    const [node] = timelineFromAuditEntries([
+      entry(6, "InvoiceEmailedSent", {
+        payload: { outcome: "succeeded", recipient: "a@b.hu" },
+      }),
+    ]);
+    expect(node.glyph).toBe("✉");
+    expect(node.kind_class).toBe("kind-email-sent");
+    expect(node.label_html_safe).toBe("Email sent");
+    // No failure detail line on a success entry.
+    expect(node.body_lines).toEqual(["actor: cli"]);
+  });
+
+  it("outcome=failed → ⚠ kind-email-failed 'Email send failed' + detail line", () => {
+    const [node] = timelineFromAuditEntries([
+      entry(7, "InvoiceEmailedSent", {
+        payload: {
+          outcome: "failed",
+          recipient: "a@b.hu",
+          error_class: "transport",
+          error_detail: "connection refused",
+        },
+      }),
+    ]);
+    expect(node.glyph).toBe("⚠");
+    expect(node.kind_class).toBe("kind-email-failed");
+    expect(node.label_html_safe).toBe("Email send failed");
+    // The scrubbed class + detail surface as a body line (same posture
+    // as InvoiceAckStatus validation messages).
+    expect(node.body_lines).toContain("transport: connection refused");
+  });
+
+  it("failed with missing error fields still renders the failure label (no crash)", () => {
+    const [node] = timelineFromAuditEntries([
+      entry(8, "InvoiceEmailedSent", { payload: { outcome: "failed" } }),
+    ]);
+    expect(node.label_html_safe).toBe("Email send failed");
+    // No detail fields → no extra body line beyond the actor.
+    expect(node.body_lines).toEqual(["actor: cli"]);
+  });
+
+  it("missing/unknown outcome → muted default with the raw kind named loud", () => {
+    const [node] = timelineFromAuditEntries([
+      entry(9, "InvoiceEmailedSent", { payload: { outcome: "weird" } }),
+    ]);
+    expect(node.glyph).toBe("•");
+    expect(node.kind_class).toBe("kind-default");
+    // Surfaced raw rather than masquerading as a successful send.
+    expect(node.label_html_safe).toBe("InvoiceEmailedSent");
+  });
+});
+
 describe("timelineFromAuditEntries — InvoiceAckStatus forks per ack_status", () => {
   it("SAVED → ✓ kind-ack-saved", () => {
     const [node] = timelineFromAuditEntries([
