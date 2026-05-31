@@ -18,14 +18,27 @@
     parseHotkey,
   } from "../lib/keyboard-nav";
   // PR-181 / session-181 — persist the quick-filter needle to
-  // localStorage. Seeded synchronously at component init (before
-  // first render) so the rendered list reflects the persisted needle
-  // without a flash of the unfiltered set.
+  // localStorage. PR-194 / session-194 — extended to persist sort +
+  // Unit + Currency facets. Seeded synchronously at component init
+  // (before first render) so the rendered list reflects persisted
+  // state without a flash of the unsorted / unfiltered set.
   import {
     loadProductListPrefs,
     saveProductListPrefs,
   } from "../lib/product-list-persistence";
-  import { filterProducts, unitLabel } from "../lib/products";
+  import {
+    EMPTY_PRODUCT_FILTER,
+    compareProducts,
+    filterProductsWith,
+    isProductFilterEmpty,
+    unitFacetKey,
+    unitLabel,
+    type CurrencyFacet,
+    type ProductFilterSpec,
+    type ProductSortKey,
+    type UnitFacet,
+  } from "../lib/products";
+  import type { SortDir } from "../lib/list-sort";
   // PR-193 / session-193 — CSV export of the currently-displayed
   // (filtered) product set. Tier-4 "invisible excellence" lift.
   import {
@@ -38,7 +51,16 @@
   let rows: Product[] = $state([]);
   let loadState: "loading" | "loaded" | "error" = $state("loading");
   let loadError: string | null = $state(null);
-  let search: string = $state(loadProductListPrefs().filter.needle);
+
+  // PR-194 / session-194 — seed `filter` + `sort` from `localStorage`
+  // so a reload restores the operator's last view. Default fallback
+  // on every failure path.
+  const initialPrefs = loadProductListPrefs();
+
+  let filter: ProductFilterSpec = $state({ ...initialPrefs.filter });
+  let sort: { key: ProductSortKey | null; dir: SortDir } = $state({
+    ...initialPrefs.sort,
+  });
 
   // Modal state: `null` = closed, `"new"` = create-mode, `Product`
   // = edit-mode pre-filled.
@@ -48,7 +70,50 @@
   let confirmDeleteId: string | null = $state(null);
   let deleteError: string | null = $state(null);
 
-  let filtered = $derived(filterProducts(rows, search));
+  // PR-194 — auto-populated Unit facet vocabulary, derived from the
+  // currently-loaded rows. The dropdown shows "All" + each distinct
+  // unit (operator-visible label, stable `kind:value` key). The set
+  // is rebuilt on every refresh; an `Own:` label that's been deleted
+  // disappears from the dropdown automatically. Order: Hungarian
+  // locale-aware on the visible label so the dropdown reads in
+  // operator-natural order.
+  let unitFacetOptions = $derived.by(() => {
+    const seen = new Map<string, string>();
+    for (const p of rows) {
+      const key = unitFacetKey(p.unit);
+      if (!seen.has(key)) seen.set(key, unitLabel(p.unit));
+    }
+    return Array.from(seen.entries())
+      .map(([key, label]) => ({ key, label }))
+      .sort((a, b) => a.label.localeCompare(b.label, "hu"));
+  });
+
+  // PR-194 — defensive: if the persisted Unit facet does not match any
+  // currently-loaded row, reset to "All" once rows arrive. Without this
+  // the operator sees an "inactive" filter (nothing renders) that the
+  // dropdown can't unwind because the picked value isn't an option.
+  $effect(() => {
+    if (
+      filter.unit !== "All" &&
+      rows.length > 0 &&
+      !unitFacetOptions.some((opt) => opt.key === filter.unit)
+    ) {
+      filter = { ...filter, unit: "All" };
+    }
+  });
+
+  // PR-194 — filter → sort composition. `sort.key === null` keeps the
+  // backend's natural ordering (name ASC from `list_products`); a
+  // non-null key sorts client-side via `compareProducts`. The slice()
+  // defends the in-place Array.prototype.sort from leaking back into
+  // `rows`.
+  let filtered = $derived(
+    sort.key === null
+      ? filterProductsWith(rows, filter)
+      : filterProductsWith(rows, filter)
+          .slice()
+          .sort((a, b) => compareProducts(a, b, sort.key as ProductSortKey, sort.dir)),
+  );
 
   // Keyboard-nav state mirrors PartnersList per PR-68 — `/` focuses
   // the search input, `j`/`k` walk filtered rows, Enter opens the
@@ -67,8 +132,16 @@
   });
 
   // PR-181 — persist the needle on every mutation.
+  // PR-194 — extended to persist sort + Unit + Currency facets.
   $effect(() => {
-    saveProductListPrefs({ filter: { needle: search } });
+    saveProductListPrefs({
+      sort: { key: sort.key, dir: sort.dir },
+      filter: {
+        needle: filter.needle,
+        unit: filter.unit,
+        currency: filter.currency,
+      },
+    });
   });
 
   onMount(() => {
@@ -92,8 +165,11 @@
         return;
       case "blur-or-clear":
         if (event.target === searchInputEl) {
-          if (search.length > 0) search = "";
-          else searchInputEl?.blur();
+          if (filter.needle.length > 0) {
+            filter = { ...filter, needle: "" };
+          } else {
+            searchInputEl?.blur();
+          }
         }
         return;
       case "row-down":
@@ -113,6 +189,16 @@
         focusedRowIndex = filtered.length > 0 ? filtered.length - 1 : -1;
         return;
       case "row-open":
+        // PR-194 — Enter-on-button suppression: when a sort header
+        // (or any other <button>) holds keyboard focus, let the
+        // browser's native click handler fire instead of double-
+        // firing the row-open.
+        if (
+          event.target instanceof HTMLElement &&
+          event.target.tagName === "BUTTON"
+        ) {
+          return;
+        }
         if (focusedRowIndex >= 0 && focusedRowIndex < filtered.length) {
           event.preventDefault();
           openEdit(filtered[focusedRowIndex]);
@@ -175,6 +261,39 @@
     }
   }
 
+  // PR-194 / session-194 — three-click sort cycle. Same posture as
+  // PartnersList::onSortClick / InvoiceList::onSortClick.
+  function onSortClick(key: ProductSortKey) {
+    if (sort.key !== key) {
+      sort = { key, dir: "asc" };
+      return;
+    }
+    if (sort.dir === "asc") {
+      sort = { key, dir: "desc" };
+      return;
+    }
+    sort = { key: null, dir: "asc" };
+  }
+
+  function sortIndicator(key: ProductSortKey): string {
+    if (sort.key !== key) return "";
+    return sort.dir === "asc" ? "▲" : "▼";
+  }
+
+  function ariaSortFor(key: ProductSortKey): "ascending" | "descending" | "none" {
+    if (sort.key !== key) return "none";
+    return sort.dir === "asc" ? "ascending" : "descending";
+  }
+
+  // PR-194 — closed-vocab Currency facet picker values. HUF + EUR
+  // mirror the `Currency` union (ADR-0037 §3); widening to a third
+  // lifts here when `Currency` widens.
+  const CURRENCY_FACET_OPTIONS: readonly { value: CurrencyFacet; label: string }[] = [
+    { value: "All", label: "All" },
+    { value: "HUF", label: "HUF" },
+    { value: "EUR", label: "EUR" },
+  ];
+
   // PR-193 / session-193 — CSV export of the currently-filtered
   // product set. Columns match the screen (Name / Unit / Unit price)
   // with the currency as its own column (the screen renders it next
@@ -218,11 +337,54 @@
       <input
         bind:this={searchInputEl}
         type="search"
-        bind:value={search}
+        value={filter.needle}
+        oninput={(e) =>
+          (filter = {
+            ...filter,
+            needle: (e.currentTarget as HTMLInputElement).value,
+          })}
         placeholder="Filter by name… (press /)"
         autocomplete="off"
         spellcheck="false"
       />
+    </label>
+    <!-- PR-194 / session-194 — Unit facet picker. Auto-populated from
+         the currently-loaded rows. -->
+    <label class="filter">
+      <span class="filter-label">Unit</span>
+      <select
+        value={filter.unit}
+        onchange={(e) =>
+          (filter = {
+            ...filter,
+            unit: (e.currentTarget as HTMLSelectElement).value as UnitFacet,
+          })}
+        aria-label="Filter products by unit"
+        disabled={unitFacetOptions.length === 0}
+      >
+        <option value="All">All</option>
+        {#each unitFacetOptions as option (option.key)}
+          <option value={option.key}>{option.label}</option>
+        {/each}
+      </select>
+    </label>
+    <!-- PR-194 / session-194 — Currency facet picker. Closed-vocab
+         (HUF + EUR per ADR-0037 §3). -->
+    <label class="filter">
+      <span class="filter-label">Currency</span>
+      <select
+        value={filter.currency}
+        onchange={(e) =>
+          (filter = {
+            ...filter,
+            currency: (e.currentTarget as HTMLSelectElement).value as CurrencyFacet,
+          })}
+        aria-label="Filter products by currency"
+      >
+        {#each CURRENCY_FACET_OPTIONS as option (option.value)}
+          <option value={option.value}>{option.label}</option>
+        {/each}
+      </select>
     </label>
     <!-- PR-193 / session-193 — CSV export of the currently-filtered
          rows. Disabled when nothing would be exported. -->
@@ -252,14 +414,72 @@
       </button>
     </div>
   {:else if filtered.length === 0}
-    <p class="page__muted">No product matches the current filter.</p>
+    <p class="page__muted">
+      No product matches the current filter.
+      {#if !isProductFilterEmpty(filter)}
+        <button
+          type="button"
+          class="quiet-button clear-filters"
+          onclick={() => (filter = { ...EMPTY_PRODUCT_FILTER })}
+        >
+          Clear filters
+        </button>
+      {/if}
+    </p>
   {:else}
     <table class="products-table">
       <thead>
         <tr>
-          <th scope="col">Name</th>
-          <th scope="col">Unit</th>
-          <th scope="col" class="num">Unit price</th>
+          <!-- PR-194 / session-194 — sortable headers; same three-cycle
+               pattern as InvoiceList / PartnersList. -->
+          <th scope="col" aria-sort={ariaSortFor("name")}>
+            <button
+              type="button"
+              class="sort-header"
+              onclick={() => onSortClick("name")}
+            >
+              <span>Name</span>
+              <span class="sort-indicator" aria-hidden="true"
+                >{sortIndicator("name")}</span
+              >
+            </button>
+          </th>
+          <th scope="col" aria-sort={ariaSortFor("unit")}>
+            <button
+              type="button"
+              class="sort-header"
+              onclick={() => onSortClick("unit")}
+            >
+              <span>Unit</span>
+              <span class="sort-indicator" aria-hidden="true"
+                >{sortIndicator("unit")}</span
+              >
+            </button>
+          </th>
+          <th scope="col" aria-sort={ariaSortFor("currency")}>
+            <button
+              type="button"
+              class="sort-header"
+              onclick={() => onSortClick("currency")}
+            >
+              <span>Currency</span>
+              <span class="sort-indicator" aria-hidden="true"
+                >{sortIndicator("currency")}</span
+              >
+            </button>
+          </th>
+          <th scope="col" class="num" aria-sort={ariaSortFor("price")}>
+            <button
+              type="button"
+              class="sort-header right"
+              onclick={() => onSortClick("price")}
+            >
+              <span>Unit price</span>
+              <span class="sort-indicator" aria-hidden="true"
+                >{sortIndicator("price")}</span
+              >
+            </button>
+          </th>
           <th scope="col" class="actions-header">
             <span class="visually-hidden">Actions</span>
           </th>
@@ -275,6 +495,7 @@
                 {unitLabel(product.unit)}
               </span>
             </td>
+            <td class="mono">{product.currency}</td>
             <td class="num mono">
               {formatTotal(product.unit_price_minor, product.currency)}
             </td>
@@ -477,6 +698,85 @@
     text-transform: uppercase;
     letter-spacing: 0.06em;
     font-size: var(--type-size-xs);
+  }
+
+  /* PR-194 / session-194 — sortable column header buttons. Mirror of
+   * InvoiceList / PartnersList. */
+  .sort-header {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    text-transform: inherit;
+    letter-spacing: inherit;
+    text-align: inherit;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--space-1);
+  }
+
+  .sort-header.right {
+    justify-content: flex-end;
+    width: 100%;
+  }
+
+  .sort-header:hover,
+  .sort-header:focus-visible {
+    color: var(--color-text-strong);
+  }
+
+  .sort-header:focus-visible {
+    outline: 1px solid var(--color-text-muted);
+    outline-offset: 2px;
+  }
+
+  .sort-indicator {
+    display: inline-block;
+    min-width: 0.75em;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
+  }
+
+  /* PR-194 — Unit + Currency facet chips. */
+  .filter {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-secondary);
+  }
+
+  .filter-label {
+    text-transform: uppercase;
+    font-size: var(--type-size-xs);
+    letter-spacing: 0.06em;
+  }
+
+  .filter select {
+    background: var(--color-surface-raised);
+    color: var(--color-text-strong);
+    border: 1px solid var(--color-surface-divider);
+    padding: var(--space-1) var(--space-2);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+    cursor: pointer;
+  }
+
+  .filter select:hover:not(:disabled) {
+    border-color: var(--color-text-muted);
+  }
+
+  .filter select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .clear-filters {
+    margin-left: var(--space-2);
   }
 
   .products-table td.mono {

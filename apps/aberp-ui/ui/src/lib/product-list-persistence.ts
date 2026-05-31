@@ -1,26 +1,41 @@
 // PR-181 / session-181 — persist the ProductsList's quick-filter
-// needle to `localStorage`. Mirrors `partner-list-persistence.ts`
-// exactly — separate key per the brief (different vocabs once sort
-// + unit/currency facets land, easier to reason about as siblings).
+// needle to `localStorage`. PR-194 / session-194 — extend with sort
+// + Unit + Currency facets (parity with InvoiceList S119 / S175).
+// Backward-compat: a legacy needle-only blob loads cleanly; missing
+// sort + facets fall back to defaults.
 //
-// Scope note (CLAUDE.md rule 3 — surgical changes):
-// ProductsList today has ONLY a needle search input — no sortable
-// column headers, no unit-of-measure / currency facet chips. Per the
-// session-181 brief, this PR does NOT introduce sortability or new
-// facets (out-of-scope UI expansion). The persisted shape carries
-// `filter` alone; when sort columns / facets land later, this helper
-// extends additively.
+// Unit-facet validation note: the closed vocab is NOT compile-time
+// fixed (the operator can create products with arbitrary `Own:<text>`
+// labels). The persistence validator accepts any non-empty string
+// here; the component-level renderer cross-checks against the
+// currently-loaded rows and resets to `"All"` if the persisted unit
+// is not present (otherwise the operator sees an inactive filter
+// they can't clear by inspecting the dropdown).
 //
 // Pinned by `product-list-persistence.test.ts`.
 
+import {
+  LEGAL_CURRENCY_FACETS,
+  LEGAL_PRODUCT_SORT_KEYS,
+  type CurrencyFacet,
+  type ProductFilterSpec,
+  type ProductSortKey,
+  type UnitFacet,
+} from "./products";
+import type { SortDir } from "./list-sort";
+
 export const PRODUCT_LIST_PREFS_KEY = "aberp:product-list:prefs";
 
+const LEGAL_SORT_DIRS: readonly SortDir[] = ["asc", "desc"];
+
 export interface ProductListPrefs {
-  filter: { needle: string };
+  sort: { key: ProductSortKey | null; dir: SortDir };
+  filter: ProductFilterSpec;
 }
 
 export const DEFAULT_PRODUCT_LIST_PREFS: ProductListPrefs = {
-  filter: { needle: "" },
+  sort: { key: null, dir: "asc" },
+  filter: { needle: "", unit: "All", currency: "All" },
 };
 
 export function loadProductListPrefs(
@@ -57,22 +72,68 @@ export function saveProductListPrefs(
 }
 
 function cloneDefault(): ProductListPrefs {
-  return { filter: { ...DEFAULT_PRODUCT_LIST_PREFS.filter } };
+  return {
+    sort: { ...DEFAULT_PRODUCT_LIST_PREFS.sort },
+    filter: { ...DEFAULT_PRODUCT_LIST_PREFS.filter },
+  };
 }
 
 function validatePrefs(parsed: unknown): ProductListPrefs {
   if (parsed === null || typeof parsed !== "object") return cloneDefault();
   const obj = parsed as Record<string, unknown>;
-  return { filter: validateFilter(obj.filter) };
+  return {
+    sort: validateSort(obj.sort),
+    filter: validateFilter(obj.filter),
+  };
 }
 
-function validateFilter(raw: unknown): ProductListPrefs["filter"] {
+function validateSort(raw: unknown): ProductListPrefs["sort"] {
+  if (raw === null || typeof raw !== "object") {
+    return { ...DEFAULT_PRODUCT_LIST_PREFS.sort };
+  }
+  const obj = raw as Record<string, unknown>;
+  const dir = LEGAL_SORT_DIRS.includes(obj.dir as SortDir)
+    ? (obj.dir as SortDir)
+    : "asc";
+  if (obj.key === null) return { key: null, dir };
+  if (
+    typeof obj.key === "string" &&
+    LEGAL_PRODUCT_SORT_KEYS.includes(obj.key as ProductSortKey)
+  ) {
+    return { key: obj.key as ProductSortKey, dir };
+  }
+  return { ...DEFAULT_PRODUCT_LIST_PREFS.sort };
+}
+
+function validateFilter(raw: unknown): ProductFilterSpec {
   if (raw === null || typeof raw !== "object") {
     return { ...DEFAULT_PRODUCT_LIST_PREFS.filter };
   }
   const obj = raw as Record<string, unknown>;
   const needle = typeof obj.needle === "string" ? obj.needle : "";
-  return { needle };
+  const unit = validateUnitFacet(obj.unit);
+  const currency = validateCurrencyFacet(obj.currency);
+  return { needle, unit, currency };
+}
+
+function validateUnitFacet(raw: unknown): UnitFacet {
+  // The Unit facet vocab is open-ended (the `Own:<label>` branch lets
+  // the operator coin arbitrary labels). Accept any non-empty string
+  // here; the component-level renderer resets to `"All"` if the
+  // persisted value matches no current row.
+  if (raw === "All") return "All";
+  if (typeof raw === "string" && raw.length > 0) return raw;
+  return "All";
+}
+
+function validateCurrencyFacet(raw: unknown): CurrencyFacet {
+  if (
+    typeof raw === "string" &&
+    LEGAL_CURRENCY_FACETS.includes(raw as CurrencyFacet)
+  ) {
+    return raw as CurrencyFacet;
+  }
+  return "All";
 }
 
 function localStorageOrNull(): Storage | null {

@@ -12,12 +12,16 @@ import { describe, expect, it } from "vitest";
 
 import type { Partner } from "./api";
 import {
+  EMPTY_PARTNER_FILTER,
   buyerFieldsFromPartner,
+  comparePartners,
   composePartnerInputs,
   emptyPartnerForm,
   filterPartners,
+  filterPartnersWith,
   formFromPartner,
   hungarianCountryAliasToCode,
+  isPartnerFilterEmpty,
   parsePartnerValidationError,
 } from "./partners";
 
@@ -408,5 +412,124 @@ describe("parsePartnerValidationError", () => {
     expect(parsed!.fields[0].field).toBe("legal_name");
     expect(parsed!.fields[0].message).toContain("§169");
     expect(parsed!.fields[0].message).toContain("Buyer name required");
+  });
+});
+
+// ─── PR-194 / session-194 — sortable columns + Kind facet ─────────────
+
+function partner(overrides: Partial<Partner>): Partner {
+  return { ...SAMPLE_PARTNER, ...overrides };
+}
+
+describe("comparePartners — display_name (locale-aware Hungarian)", () => {
+  it("orders Á between A and B per Hungarian collation", () => {
+    const a = partner({ id: "prt_a", display_name: "Anna" });
+    const b = partner({ id: "prt_b", display_name: "Árpád" });
+    const c = partner({ id: "prt_c", display_name: "Béla" });
+    const sorted = [c, b, a]
+      .slice()
+      .sort((x, y) => comparePartners(x, y, "display_name", "asc"));
+    expect(sorted.map((p) => p.display_name)).toEqual(["Anna", "Árpád", "Béla"]);
+  });
+
+  it("descending flips the comparator's result", () => {
+    const a = partner({ id: "prt_a", display_name: "Anna" });
+    const b = partner({ id: "prt_b", display_name: "Béla" });
+    expect(comparePartners(a, b, "display_name", "asc") < 0).toBe(true);
+    expect(comparePartners(a, b, "display_name", "desc") > 0).toBe(true);
+  });
+});
+
+describe("comparePartners — kind (closed-vocab index)", () => {
+  it("orders Customer < Supplier < Both on asc", () => {
+    const c = partner({ id: "prt_c", kind: "Customer" });
+    const s = partner({ id: "prt_s", kind: "Supplier" });
+    const b = partner({ id: "prt_b", kind: "Both" });
+    const sorted = [b, s, c].slice().sort((x, y) => comparePartners(x, y, "kind", "asc"));
+    expect(sorted.map((p) => p.kind)).toEqual(["Customer", "Supplier", "Both"]);
+  });
+});
+
+describe("comparePartners — nullable columns (nulls last)", () => {
+  it("tax_number null sorts AFTER non-null on asc AND desc", () => {
+    const withTax = partner({ id: "prt_a", tax_number: "11111111-1-11" });
+    const noTax = partner({ id: "prt_b", tax_number: null });
+    const asc = [noTax, withTax].slice().sort((x, y) => comparePartners(x, y, "tax_number", "asc"));
+    expect(asc.map((p) => p.id)).toEqual(["prt_a", "prt_b"]);
+    const desc = [noTax, withTax].slice().sort((x, y) => comparePartners(x, y, "tax_number", "desc"));
+    expect(desc.map((p) => p.id)).toEqual(["prt_a", "prt_b"]);
+  });
+
+  it("eu_vat null sorts AFTER non-null on asc AND desc", () => {
+    const a = partner({ id: "prt_a", eu_vat_number: "HU11111111" });
+    const b = partner({ id: "prt_b", eu_vat_number: null });
+    const desc = [b, a].slice().sort((x, y) => comparePartners(x, y, "eu_vat", "desc"));
+    expect(desc.map((p) => p.id)).toEqual(["prt_a", "prt_b"]);
+  });
+
+  it("city null sorts AFTER non-null on asc AND desc", () => {
+    const a = partner({ id: "prt_a", address_city: "Budapest" });
+    const b = partner({ id: "prt_b", address_city: null });
+    const desc = [b, a].slice().sort((x, y) => comparePartners(x, y, "city", "desc"));
+    expect(desc.map((p) => p.id)).toEqual(["prt_a", "prt_b"]);
+  });
+});
+
+describe("comparePartners — tiebreaker (id ascending regardless of dir)", () => {
+  it("two equal display_names tie-break on id ascending in BOTH dirs", () => {
+    const a = partner({ id: "prt_a", display_name: "Same" });
+    const b = partner({ id: "prt_b", display_name: "Same" });
+    const asc = [b, a].slice().sort((x, y) => comparePartners(x, y, "display_name", "asc"));
+    expect(asc.map((p) => p.id)).toEqual(["prt_a", "prt_b"]);
+    const desc = [b, a].slice().sort((x, y) => comparePartners(x, y, "display_name", "desc"));
+    expect(desc.map((p) => p.id)).toEqual(["prt_a", "prt_b"]);
+  });
+});
+
+describe("filterPartnersWith / isPartnerFilterEmpty", () => {
+  it("EMPTY_PARTNER_FILTER passes every row", () => {
+    const rows = [
+      partner({ id: "prt_a", kind: "Customer" }),
+      partner({ id: "prt_b", kind: "Supplier" }),
+    ];
+    expect(filterPartnersWith(rows, EMPTY_PARTNER_FILTER).length).toBe(2);
+    expect(isPartnerFilterEmpty(EMPTY_PARTNER_FILTER)).toBe(true);
+  });
+
+  it("Kind facet AND-composes with the needle", () => {
+    const acme = partner({
+      id: "prt_a",
+      display_name: "ACME",
+      legal_name: "ACME Kft.",
+      kind: "Customer",
+    });
+    const acmeSup = partner({
+      id: "prt_b",
+      display_name: "ACME-Sup",
+      legal_name: "ACME Supplier Kft.",
+      kind: "Supplier",
+    });
+    const other = partner({
+      id: "prt_c",
+      display_name: "BÉLA",
+      legal_name: "BÉLA Kft.",
+      kind: "Customer",
+    });
+    const out = filterPartnersWith([acme, acmeSup, other], {
+      needle: "acme",
+      kind: "Customer",
+    });
+    expect(out.map((p) => p.id)).toEqual(["prt_a"]);
+  });
+
+  it("Kind 'All' short-circuits the facet gate", () => {
+    const a = partner({ id: "prt_a", kind: "Customer" });
+    const b = partner({ id: "prt_b", kind: "Supplier" });
+    const out = filterPartnersWith([a, b], { needle: "", kind: "All" });
+    expect(out.length).toBe(2);
+  });
+
+  it("isPartnerFilterEmpty is false when the kind facet is engaged", () => {
+    expect(isPartnerFilterEmpty({ needle: "", kind: "Customer" })).toBe(false);
   });
 });

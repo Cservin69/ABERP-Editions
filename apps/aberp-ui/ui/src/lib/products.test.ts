@@ -8,13 +8,18 @@ import { describe, expect, it } from "vitest";
 
 import type { NavUnitOfMeasure, Product } from "./api";
 import {
+  EMPTY_PRODUCT_FILTER,
+  compareProducts,
   composeProductInputs,
   emptyProductForm,
   filterProducts,
+  filterProductsWith,
   formFromProduct,
+  isProductFilterEmpty,
   NAV_UNIT_OPTIONS,
   OWN_UNIT_SENTINEL,
   parseProductValidationError,
+  unitFacetKey,
   unitLabel,
 } from "./products";
 
@@ -242,5 +247,143 @@ describe("parseProductValidationError", () => {
   it("returns null for an unrelated error body so the caller falls through", () => {
     expect(parseProductValidationError("plain string")).toBeNull();
     expect(parseProductValidationError('{"error":"something_else"}')).toBeNull();
+  });
+});
+
+// ─── PR-194 / session-194 — sortable columns + Unit/Currency facets ────
+
+function product(overrides: Partial<Product>): Product {
+  return { ...SAMPLE_NAV_PRODUCT, ...overrides };
+}
+
+describe("unitFacetKey", () => {
+  it("encodes Nav variants as `Nav:<TOKEN>`", () => {
+    expect(unitFacetKey({ kind: "Nav", value: "PIECE" })).toBe("Nav:PIECE");
+    expect(unitFacetKey({ kind: "Nav", value: "LITER" })).toBe("Nav:LITER");
+  });
+
+  it("encodes Own variants as `Own:<label>`", () => {
+    expect(unitFacetKey({ kind: "Own", value: "liter@15C" })).toBe("Own:liter@15C");
+  });
+
+  it("keeps Nav and Own with the same label distinguishable", () => {
+    // Nav:LITER and Own:liter would render with similar labels but
+    // MUST stay distinct facets so the filter dropdown groups rows
+    // by their wire-shape origin, not their visible string.
+    expect(unitFacetKey({ kind: "Nav", value: "LITER" })).not.toEqual(
+      unitFacetKey({ kind: "Own", value: "LITER" }),
+    );
+  });
+});
+
+describe("compareProducts — name (locale-aware Hungarian)", () => {
+  it("orders accented characters per Hungarian collation", () => {
+    const a = product({ id: "prd_a", name: "Alma" });
+    const b = product({ id: "prd_b", name: "Árpa" });
+    const c = product({ id: "prd_c", name: "Banán" });
+    const sorted = [c, b, a]
+      .slice()
+      .sort((x, y) => compareProducts(x, y, "name", "asc"));
+    expect(sorted.map((p) => p.name)).toEqual(["Alma", "Árpa", "Banán"]);
+  });
+});
+
+describe("compareProducts — price (numeric)", () => {
+  it("sorts numerically, ascending then descending", () => {
+    const cheap = product({ id: "prd_a", unit_price_minor: 100 });
+    const mid = product({ id: "prd_b", unit_price_minor: 5_000 });
+    const dear = product({ id: "prd_c", unit_price_minor: 1_000_000 });
+    const asc = [dear, cheap, mid]
+      .slice()
+      .sort((x, y) => compareProducts(x, y, "price", "asc"));
+    expect(asc.map((p) => p.unit_price_minor)).toEqual([100, 5_000, 1_000_000]);
+    const desc = [dear, cheap, mid]
+      .slice()
+      .sort((x, y) => compareProducts(x, y, "price", "desc"));
+    expect(desc.map((p) => p.unit_price_minor)).toEqual([1_000_000, 5_000, 100]);
+  });
+});
+
+describe("compareProducts — currency", () => {
+  it("EUR before HUF on asc (alphabetical, locale-aware)", () => {
+    const huf = product({ id: "prd_a", currency: "HUF" });
+    const eur = product({ id: "prd_b", currency: "EUR" });
+    const asc = [huf, eur].slice().sort((x, y) => compareProducts(x, y, "currency", "asc"));
+    expect(asc.map((p) => p.currency)).toEqual(["EUR", "HUF"]);
+  });
+});
+
+describe("compareProducts — unit (locale-aware label)", () => {
+  it("sorts by the operator-visible unit label", () => {
+    const day = product({ id: "prd_a", unit: { kind: "Nav", value: "DAY" } });
+    const hour = product({ id: "prd_b", unit: { kind: "Nav", value: "HOUR" } });
+    const sorted = [day, hour]
+      .slice()
+      .sort((x, y) => compareProducts(x, y, "unit", "asc"));
+    // unitLabel('DAY') === 'nap', unitLabel('HOUR') === 'óra' →
+    // Hungarian collation: nap < óra
+    expect(sorted.map((p) => p.unit.value)).toEqual(["DAY", "HOUR"]);
+  });
+});
+
+describe("compareProducts — tiebreaker (id ascending regardless of dir)", () => {
+  it("two equal prices tie-break on id ascending in BOTH dirs", () => {
+    const a = product({ id: "prd_a", unit_price_minor: 100 });
+    const b = product({ id: "prd_b", unit_price_minor: 100 });
+    const asc = [b, a].slice().sort((x, y) => compareProducts(x, y, "price", "asc"));
+    expect(asc.map((p) => p.id)).toEqual(["prd_a", "prd_b"]);
+    const desc = [b, a].slice().sort((x, y) => compareProducts(x, y, "price", "desc"));
+    expect(desc.map((p) => p.id)).toEqual(["prd_a", "prd_b"]);
+  });
+});
+
+describe("filterProductsWith / isProductFilterEmpty", () => {
+  it("EMPTY_PRODUCT_FILTER passes every row", () => {
+    const rows = [SAMPLE_NAV_PRODUCT, SAMPLE_OWN_PRODUCT];
+    expect(filterProductsWith(rows, EMPTY_PRODUCT_FILTER).length).toBe(2);
+    expect(isProductFilterEmpty(EMPTY_PRODUCT_FILTER)).toBe(true);
+  });
+
+  it("Unit facet AND-composes with currency + needle", () => {
+    const huf_day = product({
+      id: "prd_a",
+      name: "Tanácsadói nap",
+      unit: { kind: "Nav", value: "DAY" },
+      currency: "HUF",
+    });
+    const huf_hour = product({
+      id: "prd_b",
+      name: "Tanácsadói óra",
+      unit: { kind: "Nav", value: "HOUR" },
+      currency: "HUF",
+    });
+    const eur_day = product({
+      id: "prd_c",
+      name: "EUR-os nap",
+      unit: { kind: "Nav", value: "DAY" },
+      currency: "EUR",
+    });
+    const out = filterProductsWith([huf_day, huf_hour, eur_day], {
+      needle: "tan",
+      unit: "Nav:DAY",
+      currency: "HUF",
+    });
+    expect(out.map((p) => p.id)).toEqual(["prd_a"]);
+  });
+
+  it("Currency 'All' + Unit 'All' is a no-op gate", () => {
+    const rows = [SAMPLE_NAV_PRODUCT, SAMPLE_OWN_PRODUCT];
+    const out = filterProductsWith(rows, {
+      needle: "",
+      unit: "All",
+      currency: "All",
+    });
+    expect(out.length).toBe(2);
+  });
+
+  it("isProductFilterEmpty is false when any facet is engaged", () => {
+    expect(isProductFilterEmpty({ needle: "", unit: "Nav:HOUR", currency: "All" })).toBe(false);
+    expect(isProductFilterEmpty({ needle: "", unit: "All", currency: "EUR" })).toBe(false);
+    expect(isProductFilterEmpty({ needle: "x", unit: "All", currency: "All" })).toBe(false);
   });
 });

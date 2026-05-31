@@ -1,7 +1,6 @@
-// PR-181 / session-181 — vitest pins for the product-list filter
-// persistence helpers. Mirror of `partner-list-persistence.test.ts`
-// (separate file because the keys + shapes diverge once sort + facets
-// land in a future PR).
+// PR-181 / session-181 — vitest pins for the product-list persistence
+// helpers. PR-194 / session-194 — extended to cover sort + Unit +
+// Currency facets.
 
 import { describe, expect, it } from "vitest";
 
@@ -67,9 +66,22 @@ describe("product-list-persistence — load defaults", () => {
 });
 
 describe("product-list-persistence — round trip", () => {
-  it("save → load returns matching value", () => {
+  it("save → load returns matching value (PR-194 sort + unit + currency)", () => {
     const storage = makeStorage();
-    const prefs: ProductListPrefs = { filter: { needle: "konzultáció" } };
+    const prefs: ProductListPrefs = {
+      sort: { key: "price", dir: "desc" },
+      filter: { needle: "konzultáció", unit: "Nav:HOUR", currency: "HUF" },
+    };
+    saveProductListPrefs(prefs, storage);
+    expect(loadProductListPrefs(storage)).toEqual(prefs);
+  });
+
+  it("preserves a null sort key (operator reset) across the round trip", () => {
+    const storage = makeStorage();
+    const prefs: ProductListPrefs = {
+      sort: { key: null, dir: "asc" },
+      filter: { needle: "", unit: "All", currency: "EUR" },
+    };
     saveProductListPrefs(prefs, storage);
     expect(loadProductListPrefs(storage)).toEqual(prefs);
   });
@@ -99,15 +111,80 @@ describe("product-list-persistence — closed-vocab discipline", () => {
     expect(loadProductListPrefs(storage)).toEqual(DEFAULT_PRODUCT_LIST_PREFS);
   });
 
-  it("ignores unknown sibling fields (future-PR additive extension)", () => {
-    // Forward-compat: a later PR may persist `sort: {...}` + a
-    // currency/unit facet. A legacy reader still honours the needle.
+  it("discards an unknown sort key and falls back", () => {
     const storage = makeStorage({
       [PRODUCT_LIST_PREFS_KEY]: JSON.stringify({
-        filter: { needle: "Liter@15C", currency: "HUF", unit: "PIECE" },
-        sort: { key: "unit_price", dir: "asc" },
+        sort: { key: "renamed_v2", dir: "asc" },
+        filter: { needle: "", unit: "All", currency: "All" },
       }),
     });
-    expect(loadProductListPrefs(storage).filter.needle).toBe("Liter@15C");
+    expect(loadProductListPrefs(storage).sort).toEqual({ key: null, dir: "asc" });
+  });
+
+  it("discards an unknown sort direction and falls back to asc", () => {
+    const storage = makeStorage({
+      [PRODUCT_LIST_PREFS_KEY]: JSON.stringify({
+        sort: { key: "price", dir: "sideways" },
+        filter: { needle: "", unit: "All", currency: "All" },
+      }),
+    });
+    expect(loadProductListPrefs(storage).sort).toEqual({ key: "price", dir: "asc" });
+  });
+
+  it("discards an unknown currency (widening lag) → All", () => {
+    const storage = makeStorage({
+      [PRODUCT_LIST_PREFS_KEY]: JSON.stringify({
+        sort: { key: null, dir: "asc" },
+        filter: { needle: "", unit: "All", currency: "USD" },
+      }),
+    });
+    expect(loadProductListPrefs(storage).filter.currency).toBe("All");
+  });
+
+  it("accepts an arbitrary Unit facet string verbatim (open-ended vocab)", () => {
+    // The Unit facet vocab is NOT compile-time fixed (the operator
+    // can coin Own:<label> values). The persistence validator accepts
+    // any non-empty string; the component-level renderer resets to
+    // "All" if the persisted value matches no current row.
+    const storage = makeStorage({
+      [PRODUCT_LIST_PREFS_KEY]: JSON.stringify({
+        sort: { key: null, dir: "asc" },
+        filter: { needle: "", unit: "Own:liter@15C", currency: "All" },
+      }),
+    });
+    expect(loadProductListPrefs(storage).filter.unit).toBe("Own:liter@15C");
+  });
+
+  it("backward-compat: a legacy needle-only blob loads cleanly", () => {
+    // PR-181 wrote `{ filter: { needle } }` with no sort + no
+    // unit/currency siblings. PR-194 readers honour the needle and
+    // fall back to defaults for the missing fields.
+    const storage = makeStorage({
+      [PRODUCT_LIST_PREFS_KEY]: JSON.stringify({
+        filter: { needle: "Liter@15C" },
+      }),
+    });
+    const loaded = loadProductListPrefs(storage);
+    expect(loaded.filter.needle).toBe("Liter@15C");
+    expect(loaded.filter.unit).toBe("All");
+    expect(loaded.filter.currency).toBe("All");
+    expect(loaded.sort).toEqual({ key: null, dir: "asc" });
+  });
+
+  it("ignores unknown sibling fields (future-PR additive extension)", () => {
+    const storage = makeStorage({
+      [PRODUCT_LIST_PREFS_KEY]: JSON.stringify({
+        filter: { needle: "Liter@15C", currency: "HUF", unit: "Nav:LITER" },
+        sort: { key: "price", dir: "asc" },
+        unknown_facet: "ignored",
+      }),
+    });
+    const loaded = loadProductListPrefs(storage);
+    expect(loaded.filter).toEqual({
+      needle: "Liter@15C",
+      unit: "Nav:LITER",
+      currency: "HUF",
+    });
+    expect(loaded.sort).toEqual({ key: "price", dir: "asc" });
   });
 });

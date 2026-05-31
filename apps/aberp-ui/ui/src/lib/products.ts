@@ -11,6 +11,7 @@ import type {
   ProductUnit,
 } from "./api";
 import { formatMinorToInput, parseAmountToMinor } from "./format";
+import { applySortDir, localeCompareHu, type SortDir } from "./list-sort";
 
 /** PR-91 — every NAV unitOfMeasure token, paired with a Hungarian +
  * English operator-facing label. Order is roughly by Hungarian
@@ -154,6 +155,141 @@ export function unitLabel(unit: ProductUnit): string {
   const opt = NAV_UNIT_OPTIONS.find((o) => o.token === unit.value);
   return opt?.label_hu ?? unit.value;
 }
+
+// ─── PR-194 / session-194 — sortable columns + unit/currency facets ───
+//
+// S181 closed the needle-persistence gap; S194 lifts the ProductsList
+// to parity with InvoiceList (S119 / S175): clickable column headers
+// for Name / Unit / Currency / Unit price, two new facets (Unit auto-
+// populated from rows + closed-vocab Currency HUF / EUR), and round-
+// trip persistence for both new surfaces. Mirrors the partners.ts /
+// invoice-list.ts posture: pure (a, b, key, dir) → number comparators
+// so the renderer slices+sorts and the ES2019+ stable sort guarantee
+// handles ties on top of the explicit `id` tiebreaker.
+
+/** PR-194 — closed-vocab of sortable columns on ProductsList. */
+export type ProductSortKey = "name" | "unit" | "currency" | "price";
+
+/** PR-194 — Currency facet. `"All"` short-circuits the gate; the two
+ * literal values mirror the closed-vocab `Currency` union (HUF + EUR
+ * per ADR-0037 §3 — widening to a third lifts here). */
+export type CurrencyFacet = "All" | Currency;
+
+/** PR-194 — Unit facet. Stored as a stable `kind:value` key so the
+ * NAV-token + Own-label namespaces don't collide (a Nav `LITER` and
+ * an Own `liter` would render with the same label_hu but stay
+ * distinct facets). `"All"` short-circuits. */
+export type UnitFacet = "All" | string;
+
+/** PR-194 — stable string key for a `ProductUnit`. Format:
+ * `"Nav:<token>"` or `"Own:<free-text>"`. The renderer can split
+ * this back into (kind, value) if it ever needs to; today it stays
+ * opaque on the wire and the dropdown uses `unitLabel` to display
+ * the human-readable form. */
+export function unitFacetKey(unit: ProductUnit): string {
+  return unit.kind === "Nav" ? `Nav:${unit.value}` : `Own:${unit.value}`;
+}
+
+/** PR-194 — quick-filter facet spec. AND-composed: a row must pass
+ * every engaged facet to render. */
+export interface ProductFilterSpec {
+  needle: string;
+  unit: UnitFacet;
+  currency: CurrencyFacet;
+}
+
+/** PR-194 — empty filter (every facet open). */
+export const EMPTY_PRODUCT_FILTER: ProductFilterSpec = {
+  needle: "",
+  unit: "All",
+  currency: "All",
+};
+
+/** PR-194 — `true` iff every facet is open. */
+export function isProductFilterEmpty(spec: ProductFilterSpec): boolean {
+  return (
+    spec.needle.trim().length === 0 &&
+    spec.unit === "All" &&
+    spec.currency === "All"
+  );
+}
+
+/** PR-194 — facet + needle filter. Composes with `filterProducts`
+ * (PR-91) so the existing `/`-search behaviour is unchanged when
+ * only the needle is set. */
+export function filterProductsWith(
+  rows: Product[],
+  spec: ProductFilterSpec,
+): Product[] {
+  const unitGated =
+    spec.unit === "All"
+      ? rows
+      : rows.filter((p) => unitFacetKey(p.unit) === spec.unit);
+  const currencyGated =
+    spec.currency === "All"
+      ? unitGated
+      : unitGated.filter((p) => p.currency === spec.currency);
+  return filterProducts(currencyGated, spec.needle);
+}
+
+function productIdTiebreak(a: Product, b: Product): number {
+  if (a.id < b.id) return -1;
+  if (a.id > b.id) return 1;
+  return 0;
+}
+
+/** PR-194 — pure comparator. Locale-aware on string columns;
+ * numeric on price (minor units of the row's currency — same
+ * mixed-currency caveat as the invoice-list total comparator: a
+ * €1 EUR product (100 cents) sorts between 99 HUF and 101 HUF, so
+ * filter to a single currency before reading the sort meaningfully).
+ * Ties go to `id` ascending. */
+export function compareProducts(
+  a: Product,
+  b: Product,
+  key: ProductSortKey,
+  dir: SortDir,
+): number {
+  const raw = productRawCompare(a, b, key);
+  if (raw !== 0) return applySortDir(raw, dir);
+  return productIdTiebreak(a, b);
+}
+
+function productRawCompare(
+  a: Product,
+  b: Product,
+  key: ProductSortKey,
+): number {
+  switch (key) {
+    case "name":
+      return localeCompareHu(a.name, b.name);
+    case "unit":
+      // Sort by the operator-visible label (Hungarian) so the
+      // column's visual order matches the comparator's order. A
+      // future addition to NAV_UNIT_OPTIONS that renames a label
+      // shifts the sort position transparently.
+      return localeCompareHu(unitLabel(a.unit), unitLabel(b.unit));
+    case "currency":
+      return localeCompareHu(a.currency, b.currency);
+    case "price":
+      return a.unit_price_minor - b.unit_price_minor;
+  }
+}
+
+/** PR-194 — runtime list of legal sort keys. */
+export const LEGAL_PRODUCT_SORT_KEYS: readonly ProductSortKey[] = [
+  "name",
+  "unit",
+  "currency",
+  "price",
+];
+
+/** PR-194 — runtime list of legal Currency facet values. */
+export const LEGAL_CURRENCY_FACETS: readonly CurrencyFacet[] = [
+  "All",
+  "HUF",
+  "EUR",
+];
 
 /** PR-91 — typed 400 validation body parser. Same shape as Partners
  * (the A157 inline-error envelope); the dispatcher accepts the

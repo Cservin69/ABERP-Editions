@@ -1,8 +1,5 @@
-// PR-181 / session-181 — vitest pins for the partner-list filter
-// persistence helpers. Pure-helper coverage (CLAUDE.md rule 9): each
-// pin assigns a load-bearing behaviour to a failure mode the brief
-// named. Storage-injectable so the SPA's no-jsdom vitest setup
-// doesn't have to touch `window.localStorage`.
+// PR-181 / session-181 — vitest pins for the partner-list persistence
+// helpers. PR-194 / session-194 — extended to cover sort + Kind facet.
 
 import { describe, expect, it } from "vitest";
 
@@ -68,9 +65,22 @@ describe("partner-list-persistence — load defaults", () => {
 });
 
 describe("partner-list-persistence — round trip", () => {
-  it("save → load returns matching value", () => {
+  it("save → load returns matching value (PR-194 sort + kind facet)", () => {
     const storage = makeStorage();
-    const prefs: PartnerListPrefs = { filter: { needle: "ACME Kft." } };
+    const prefs: PartnerListPrefs = {
+      sort: { key: "display_name", dir: "desc" },
+      filter: { needle: "ACME Kft.", kind: "Customer" },
+    };
+    savePartnerListPrefs(prefs, storage);
+    expect(loadPartnerListPrefs(storage)).toEqual(prefs);
+  });
+
+  it("preserves a null sort key (operator reset) across the round trip", () => {
+    const storage = makeStorage();
+    const prefs: PartnerListPrefs = {
+      sort: { key: null, dir: "asc" },
+      filter: { needle: "", kind: "All" },
+    };
     savePartnerListPrefs(prefs, storage);
     expect(loadPartnerListPrefs(storage)).toEqual(prefs);
   });
@@ -100,17 +110,77 @@ describe("partner-list-persistence — closed-vocab discipline", () => {
     expect(loadPartnerListPrefs(storage)).toEqual(DEFAULT_PARTNER_LIST_PREFS);
   });
 
-  it("ignores unknown sibling fields (future-PR additive extension)", () => {
-    // Forward-compat: a future PR may persist `sort: { key, dir }` next
-    // to `filter`. A legacy reader that doesn't understand `sort` MUST
-    // still honour the `filter.needle` it does understand.
+  it("discards an unknown sort key (renamed column) and falls back", () => {
+    const storage = makeStorage({
+      [PARTNER_LIST_PREFS_KEY]: JSON.stringify({
+        sort: { key: "renamed_column_v2", dir: "asc" },
+        filter: { needle: "", kind: "All" },
+      }),
+    });
+    const loaded = loadPartnerListPrefs(storage);
+    expect(loaded.sort).toEqual({ key: null, dir: "asc" });
+  });
+
+  it("discards an unknown sort direction and falls back to asc", () => {
+    const storage = makeStorage({
+      [PARTNER_LIST_PREFS_KEY]: JSON.stringify({
+        sort: { key: "kind", dir: "sideways" },
+        filter: { needle: "", kind: "All" },
+      }),
+    });
+    const loaded = loadPartnerListPrefs(storage);
+    expect(loaded.sort).toEqual({ key: "kind", dir: "asc" });
+  });
+
+  it("discards an unknown kind facet (renamed vocab) → All", () => {
+    const storage = makeStorage({
+      [PARTNER_LIST_PREFS_KEY]: JSON.stringify({
+        sort: { key: null, dir: "asc" },
+        filter: { needle: "x", kind: "Vendor" },
+      }),
+    });
+    expect(loadPartnerListPrefs(storage).filter.kind).toBe("All");
+  });
+
+  it("accepts every known kind facet verbatim", () => {
+    for (const kind of ["All", "Customer", "Supplier", "Both"] as const) {
+      const storage = makeStorage({
+        [PARTNER_LIST_PREFS_KEY]: JSON.stringify({
+          sort: { key: null, dir: "asc" },
+          filter: { needle: "", kind },
+        }),
+      });
+      expect(loadPartnerListPrefs(storage).filter.kind).toBe(kind);
+    }
+  });
+
+  it("backward-compat: a legacy needle-only blob loads cleanly", () => {
+    // PR-181 wrote `{ filter: { needle } }` with no sort + no kind
+    // sibling. PR-194 readers must honour the needle and fall back to
+    // defaults for the missing fields — never crash, never drop the
+    // needle.
     const storage = makeStorage({
       [PARTNER_LIST_PREFS_KEY]: JSON.stringify({
         filter: { needle: "BÉLA" },
+      }),
+    });
+    const loaded = loadPartnerListPrefs(storage);
+    expect(loaded.filter.needle).toBe("BÉLA");
+    expect(loaded.filter.kind).toBe("All");
+    expect(loaded.sort).toEqual({ key: null, dir: "asc" });
+  });
+
+  it("ignores unknown sibling fields (future-PR additive extension)", () => {
+    const storage = makeStorage({
+      [PARTNER_LIST_PREFS_KEY]: JSON.stringify({
+        filter: { needle: "BÉLA", kind: "Supplier" },
         sort: { key: "display_name", dir: "desc" },
         unknown_facet: "ignored",
       }),
     });
-    expect(loadPartnerListPrefs(storage).filter.needle).toBe("BÉLA");
+    const loaded = loadPartnerListPrefs(storage);
+    expect(loaded.filter.needle).toBe("BÉLA");
+    expect(loaded.filter.kind).toBe("Supplier");
+    expect(loaded.sort).toEqual({ key: "display_name", dir: "desc" });
   });
 });

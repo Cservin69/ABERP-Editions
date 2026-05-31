@@ -15,6 +15,12 @@ import type {
   PartnerInputs,
   PartnerKind,
 } from "./api";
+import {
+  applySortDir,
+  compareNullishLast,
+  localeCompareHu,
+  type SortDir,
+} from "./list-sort";
 
 /** PR-54 / session-74 — operator-typed form state for the PartnerForm
  * modal. One field per `PartnerInputs` slot; all string-valued so the
@@ -250,6 +256,171 @@ export function filterPartners(rows: Partner[], needle: string): Partner[] {
     );
   });
 }
+
+// ─── PR-194 / session-194 — sortable columns + kind facet ─────────────
+//
+// S181 closed the needle-persistence gap; S194 lifts the PartnersList
+// to parity with InvoiceList (S119 / S175): clickable column headers
+// for Name / Tax number / EU VAT / Kind / City, a closed-vocab Kind
+// facet (All / Customer / Supplier / Both), and round-trip persistence
+// for both new surfaces. Mirrors `invoice-list.ts` posture; comparators
+// are pure (a, b, key, dir) → number so the Svelte renderer can call
+// `rows.slice().sort(...)` and rely on Array.prototype.sort's stable
+// guarantee (ES2019+).
+
+/** PR-194 — closed-vocab of sortable columns on PartnersList. Mirrors
+ * the renderable column set on `PartnersList.svelte`. */
+export type PartnerSortKey =
+  | "display_name"
+  | "tax_number"
+  | "eu_vat"
+  | "kind"
+  | "city";
+
+/** PR-194 — closed-vocab Kind facet. `"All"` short-circuits the gate;
+ * the three literal values mirror `PartnerKind`. */
+export type PartnerKindFacet = "All" | PartnerKind;
+
+/** PR-194 — quick-filter facet spec. `needle` is the substring search
+ * (PR-181); `kind` is the new closed-vocab Kind facet. AND-composed:
+ * a row must pass every engaged facet to render. */
+export interface PartnerFilterSpec {
+  needle: string;
+  kind: PartnerKindFacet;
+}
+
+/** PR-194 — empty filter (every facet open). */
+export const EMPTY_PARTNER_FILTER: PartnerFilterSpec = {
+  needle: "",
+  kind: "All",
+};
+
+/** PR-194 — `true` iff every facet is open. */
+export function isPartnerFilterEmpty(spec: PartnerFilterSpec): boolean {
+  return spec.needle.trim().length === 0 && spec.kind === "All";
+}
+
+/** PR-194 — facet + needle filter for PartnersList. Composes with
+ * `filterPartners` (PR-54) so the existing `/`-search behaviour is
+ * unchanged when only the needle is set; the kind facet ANDs on top. */
+export function filterPartnersWith(
+  rows: Partner[],
+  spec: PartnerFilterSpec,
+): Partner[] {
+  const kindGated =
+    spec.kind === "All" ? rows : rows.filter((p) => p.kind === spec.kind);
+  return filterPartners(kindGated, spec.needle);
+}
+
+/** PR-194 — sort index for the closed-vocab Kind. Customer first
+ * (dominant operator case), then Supplier, then Both. Pinned by
+ * `partners.test.ts`. */
+function partnerKindIndex(kind: PartnerKind): number {
+  switch (kind) {
+    case "Customer":
+      return 0;
+    case "Supplier":
+      return 1;
+    case "Both":
+      return 2;
+  }
+}
+
+/** PR-194 — `id` tiebreaker. Ascending regardless of the user-selected
+ * sort dir so two rows with equal sort values land in a reproducible
+ * order across refreshes (mirror of `invoice-list.ts ::
+ * invoiceIdTiebreak`). */
+function partnerIdTiebreak(a: Partner, b: Partner): number {
+  if (a.id < b.id) return -1;
+  if (a.id > b.id) return 1;
+  return 0;
+}
+
+/** PR-194 — pure comparator. Returns a `(a, b) → number` suitable for
+ * `Array.prototype.sort`. Locale-aware (Hungarian) on string columns
+ * so accented characters land in operator-natural order. Nulls-last
+ * on the nullable columns (tax_number / eu_vat / city) regardless of
+ * direction — mirror of the invoice-list convention. Ties go to the
+ * partner `id` ascending so render order is reproducible. */
+export function comparePartners(
+  a: Partner,
+  b: Partner,
+  key: PartnerSortKey,
+  dir: SortDir,
+): number {
+  const nullCmp = partnerNullsLast(a, b, key);
+  if (nullCmp !== null) {
+    if (nullCmp !== 0) return nullCmp;
+    return partnerIdTiebreak(a, b);
+  }
+  const raw = partnerRawCompare(a, b, key);
+  if (raw !== 0) return applySortDir(raw, dir);
+  return partnerIdTiebreak(a, b);
+}
+
+function partnerNullsLast(
+  a: Partner,
+  b: Partner,
+  key: PartnerSortKey,
+): number | null {
+  switch (key) {
+    case "tax_number":
+      return compareNullishLast(a.tax_number, b.tax_number);
+    case "eu_vat":
+      return compareNullishLast(a.eu_vat_number, b.eu_vat_number);
+    case "city":
+      return compareNullishLast(a.address_city, b.address_city);
+    default:
+      return null;
+  }
+}
+
+function partnerRawCompare(
+  a: Partner,
+  b: Partner,
+  key: PartnerSortKey,
+): number {
+  switch (key) {
+    case "display_name":
+      return localeCompareHu(a.display_name, b.display_name);
+    case "tax_number":
+      // Non-null assertion safe — partnerNullsLast returned non-null
+      // only when both sides have a value.
+      return localeCompareHu(a.tax_number as string, b.tax_number as string);
+    case "eu_vat":
+      return localeCompareHu(
+        a.eu_vat_number as string,
+        b.eu_vat_number as string,
+      );
+    case "kind":
+      return partnerKindIndex(a.kind) - partnerKindIndex(b.kind);
+    case "city":
+      return localeCompareHu(
+        a.address_city as string,
+        b.address_city as string,
+      );
+  }
+}
+
+/** PR-194 — runtime list of legal sort keys (mirrors `PartnerSortKey`).
+ * Persistence validators use this to discard stale keys from a future
+ * rename; kept here next to the union so the two surfaces stay in
+ * sync. */
+export const LEGAL_PARTNER_SORT_KEYS: readonly PartnerSortKey[] = [
+  "display_name",
+  "tax_number",
+  "eu_vat",
+  "kind",
+  "city",
+];
+
+/** PR-194 — runtime list of legal Kind facet values. */
+export const LEGAL_PARTNER_KIND_FACETS: readonly PartnerKindFacet[] = [
+  "All",
+  "Customer",
+  "Supplier",
+  "Both",
+];
 
 /** PR-54 / session-74 — typed 400 validation body parser. Mirrors the
  * shape of `parseSetupSellerInfoErrorBody` (A157): peel the JSON
