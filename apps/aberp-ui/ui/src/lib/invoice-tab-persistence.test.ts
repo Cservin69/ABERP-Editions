@@ -86,6 +86,12 @@ describe("invoice-tab-persistence — save", () => {
     expect(loadInvoiceTab(storage)).toBe("incoming");
   });
 
+  it("round-trips quotes (S211)", () => {
+    const storage = makeStorage();
+    saveInvoiceTab("quotes", storage);
+    expect(loadInvoiceTab(storage)).toBe("quotes");
+  });
+
   it("does not throw when localStorage is unavailable", () => {
     expect(() => saveInvoiceTab("incoming", null)).not.toThrow();
   });

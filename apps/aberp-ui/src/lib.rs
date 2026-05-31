@@ -255,6 +255,11 @@ pub fn run() {
             // already-restored rows.
             commands::restore_from_nav_outgoing,
             commands::list_restored_invoices,
+            // S211 / PR-210 — quote-intake config + queue surface.
+            commands::get_quote_intake_config,
+            commands::put_quote_intake_config,
+            commands::test_quote_intake_connection,
+            commands::list_quote_intake,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

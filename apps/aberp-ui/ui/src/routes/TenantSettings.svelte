@@ -33,10 +33,16 @@
     setupSellerInfo,
     testSmtpConnection,
     updateSellerBank,
+    // S211 / PR-210 — quote-intake config surface.
+    getQuoteIntakeConfig,
+    putQuoteIntakeConfig,
+    testQuoteIntakeConnection,
     type SellerBankResponse,
     type SmtpConfigGetResponse,
     type SmtpSecurity,
     type SmtpTestOutcome,
+    type QuoteIntakeConfigResponse,
+    type QuoteIntakeTestOutcome,
   } from "../lib/api";
   import {
     composeSellerConfigBody,
@@ -150,6 +156,46 @@
   let smtpTesting = $state(false);
   let smtpTestOutcome: SmtpTestOutcome | null = $state(null);
   let smtpTestError: string | null = $state(null);
+
+  // S211 / PR-210 — quote-intake subsection state. The bearer token
+  // is keychain-only (write-only field on this form). The "restart
+  // required" banner shows after a save because the daemon does NOT
+  // hot-reload — change takes effect on the next `aberp serve` boot.
+  // When env vars are providing the live config (`env_override_active`),
+  // the form goes read-only because a save would silently lose to the
+  // env var on next restart.
+  interface QuoteIntakeForm {
+    enabled: boolean;
+    baseUrl: string;
+    pollIntervalSecs: number;
+    token: string;
+  }
+  let quoteIntake: QuoteIntakeForm = $state({
+    enabled: false,
+    baseUrl: "",
+    pollIntervalSecs: 60,
+    token: "",
+  });
+  let quoteIntakeLoading = $state(true);
+  let quoteIntakeLoadError: string | null = $state(null);
+  let quoteIntakeHasToken = $state(false);
+  let quoteIntakeEnvOverride = $state(false);
+  let quoteIntakeLastPoll: QuoteIntakeConfigResponse["last_poll"] = $state(null);
+  let quoteIntakeSubmitting = $state(false);
+  let quoteIntakeSubmitError: string | null = $state(null);
+  let quoteIntakeSaved = $state(false);
+  // Restart-required banner: shown after a successful save IF any of
+  // the daemon-impacting fields changed since the last load (enabled /
+  // base_url / poll_interval — the daemon reads these at boot only).
+  let quoteIntakeRestartRequired = $state(false);
+  // Last-known persisted values (after the most recent load OR save)
+  // so the change-detector can compare before flipping the banner.
+  let quoteIntakeLastKnownEnabled = $state(false);
+  let quoteIntakeLastKnownBaseUrl = $state("");
+  let quoteIntakeLastKnownInterval = $state(60);
+  let quoteIntakeTesting = $state(false);
+  let quoteIntakeTestOutcome: QuoteIntakeTestOutcome | null = $state(null);
+  let quoteIntakeTestError: string | null = $state(null);
   let numberingLiteralDraft = $state("");
   let numberingValidation = $derived(validateTemplate(numbering));
   let numberingPreview = $derived.by(() => {
@@ -182,6 +228,7 @@
     void loadBanks();
     void loadNumbering();
     void loadSmtpConfig();
+    void loadQuoteIntakeConfig();
   });
 
   async function loadSellerInfo() {
@@ -507,6 +554,88 @@
       smtpSubmitError = err instanceof Error ? err.message : String(err);
     } finally {
       smtpSubmitting = false;
+    }
+  }
+
+  // ── S211 / PR-210 — quote-intake subsection handlers ──────────────
+  async function loadQuoteIntakeConfig() {
+    quoteIntakeLoading = true;
+    quoteIntakeLoadError = null;
+    try {
+      const response = await getQuoteIntakeConfig();
+      quoteIntake = {
+        enabled: response.enabled,
+        baseUrl: response.base_url ?? "",
+        pollIntervalSecs: response.poll_interval_secs,
+        token: "",
+      };
+      quoteIntakeHasToken = response.has_token;
+      quoteIntakeEnvOverride = response.env_override_active;
+      quoteIntakeLastPoll = response.last_poll ?? null;
+      quoteIntakeLastKnownEnabled = response.enabled;
+      quoteIntakeLastKnownBaseUrl = response.base_url ?? "";
+      quoteIntakeLastKnownInterval = response.poll_interval_secs;
+      quoteIntakeRestartRequired = false;
+    } catch (err: unknown) {
+      quoteIntakeLoadError = err instanceof Error ? err.message : String(err);
+    } finally {
+      quoteIntakeLoading = false;
+    }
+  }
+
+  async function onTestQuoteIntake() {
+    quoteIntakeTestOutcome = null;
+    quoteIntakeTestError = null;
+    quoteIntakeTesting = true;
+    try {
+      const token = quoteIntake.token.length > 0 ? quoteIntake.token : null;
+      quoteIntakeTestOutcome = await testQuoteIntakeConnection({
+        base_url: quoteIntake.baseUrl.trim(),
+        token,
+      });
+    } catch (err: unknown) {
+      quoteIntakeTestError = err instanceof Error ? err.message : String(err);
+    } finally {
+      quoteIntakeTesting = false;
+    }
+  }
+
+  async function onSaveQuoteIntake(event: Event) {
+    event.preventDefault();
+    quoteIntakeSaved = false;
+    quoteIntakeSubmitError = null;
+    quoteIntakeSubmitting = true;
+    try {
+      const token = quoteIntake.token.length > 0 ? quoteIntake.token : null;
+      const baseUrl =
+        quoteIntake.baseUrl.trim().length > 0
+          ? quoteIntake.baseUrl.trim()
+          : null;
+      const response = await putQuoteIntakeConfig({
+        enabled: quoteIntake.enabled,
+        base_url: baseUrl,
+        poll_interval_secs: quoteIntake.pollIntervalSecs,
+        token,
+      });
+      // Did a daemon-impacting field change since the last persisted
+      // snapshot? If so, surface the restart-required banner.
+      const changed =
+        response.enabled !== quoteIntakeLastKnownEnabled ||
+        (response.base_url ?? "") !== quoteIntakeLastKnownBaseUrl ||
+        response.poll_interval_secs !== quoteIntakeLastKnownInterval ||
+        token !== null;
+      quoteIntakeLastKnownEnabled = response.enabled;
+      quoteIntakeLastKnownBaseUrl = response.base_url ?? "";
+      quoteIntakeLastKnownInterval = response.poll_interval_secs;
+      quoteIntakeHasToken = response.has_token;
+      quoteIntakeLastPoll = response.last_poll ?? null;
+      quoteIntake = { ...quoteIntake, token: "" };
+      quoteIntakeRestartRequired = changed;
+      quoteIntakeSaved = true;
+    } catch (err: unknown) {
+      quoteIntakeSubmitError = err instanceof Error ? err.message : String(err);
+    } finally {
+      quoteIntakeSubmitting = false;
     }
   }
 
@@ -1217,6 +1346,257 @@
       {/if}
     </section>
 
+    <!-- S211 / PR-210 — Quote-intake daemon config. Non-secrets persist
+         to seller.toml's [quote_intake] section (merge-not-replace);
+         the bearer token lives in the OS keychain. Daemon does NOT
+         hot-reload — restart-required banner shows after a save that
+         touches enabled / base_url / poll_interval / token. -->
+    <section
+      class="page__quote-intake"
+      aria-labelledby="quote-intake-title"
+      data-testid="quote-intake-config-section"
+    >
+      <header class="page__banks-head">
+        <h3 id="quote-intake-title" class="page__section">
+          Ajánlatfeladás / Quote Intake
+          <span class="page__section-hint">
+            ABERP-site sister-service poll · S211
+          </span>
+        </h3>
+      </header>
+
+      {#if quoteIntakeLoading}
+        <p class="page__muted">Loading quote-intake config…</p>
+      {:else if quoteIntakeLoadError !== null}
+        <div class="page__error" role="alert">
+          <strong>Could not load quote-intake config.</strong>
+          <p class="page__error-detail">{quoteIntakeLoadError}</p>
+        </div>
+      {:else}
+        <p class="page__muted" style="margin-bottom: var(--space-3);">
+          Az ABERP-site jóváhagyott ajánlatait ide stage-eljük a
+          <code>quote_intake_log</code> táblába. Az operátor utána a
+          Quotes fülön (közeljövőben: pickup gombbal) tudja a számlát
+          létrehozni. A bearer token a macOS kulcskarikán él, soha
+          nem kerül lemezre. / Approved ABERP-site quotes are staged
+          into <code>quote_intake_log</code>; the operator picks them
+          up later from the Quotes tab. The bearer token lives in the
+          macOS keychain — never on disk, never in logs.
+        </p>
+
+        {#if quoteIntakeEnvOverride}
+          <div
+            class="page__warning"
+            role="status"
+            data-testid="quote-intake-env-override"
+          >
+            <strong>Env vars are active.</strong>
+            <p>
+              A daemon a <code>ABERP_QUOTE_INTAKE_*</code> környezeti
+              változókat használja most. A lentebbi konfig csak az
+              újraindítás utáni állapotot fogja érvényesíteni amennyiben
+              a környezeti változók eltűnnek. / The daemon is currently
+              driven by env vars; the form below only takes effect on
+              the next restart if the env vars are unset.
+            </p>
+          </div>
+        {/if}
+
+        <form
+          onsubmit={onSaveQuoteIntake}
+          class="page__form"
+          data-testid="quote-intake-config-form"
+        >
+          <fieldset disabled={quoteIntakeSubmitting} class="page__fieldset">
+            <div class="page__columns">
+              <section class="page__column">
+                <label class="field field--checkbox">
+                  <input
+                    type="checkbox"
+                    bind:checked={quoteIntake.enabled}
+                    data-testid="quote-intake-enabled"
+                  />
+                  <span>
+                    Daemon engedélyezve / Enable daemon at boot
+                  </span>
+                </label>
+
+                <label class="field">
+                  <span class="field__label">Base URL</span>
+                  <input
+                    type="url"
+                    class="field__input"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="http://localhost:3000"
+                    bind:value={quoteIntake.baseUrl}
+                    data-testid="quote-intake-base-url"
+                  />
+                </label>
+
+                <label class="field">
+                  <span class="field__label">Poll interval (sec) · 10–3600</span>
+                  <input
+                    type="number"
+                    class="field__input"
+                    min="10"
+                    max="3600"
+                    bind:value={quoteIntake.pollIntervalSecs}
+                    data-testid="quote-intake-poll-interval"
+                  />
+                </label>
+              </section>
+
+              <section class="page__column">
+                <label class="field">
+                  <span class="field__label">
+                    Bearer token
+                    {#if quoteIntakeHasToken}
+                      <span
+                        class="field__hint"
+                        data-testid="quote-intake-token-set-indicator"
+                      >
+                        ✓ token beállítva · token is set in the keychain
+                      </span>
+                    {:else}
+                      <span
+                        class="field__hint"
+                        data-testid="quote-intake-token-not-set-indicator"
+                      >
+                        ⚠ még nincs beállítva · not yet set
+                      </span>
+                    {/if}
+                  </span>
+                  <input
+                    type="password"
+                    class="field__input"
+                    autocomplete="new-password"
+                    spellcheck="false"
+                    placeholder={quoteIntakeHasToken
+                      ? "leave blank to keep existing token"
+                      : "enter bearer token to save to keychain"}
+                    bind:value={quoteIntake.token}
+                    data-testid="quote-intake-token"
+                  />
+                </label>
+
+                {#if quoteIntakeLastPoll !== null && quoteIntakeLastPoll !== undefined}
+                  <div
+                    class="page__status-panel"
+                    data-testid="quote-intake-last-poll"
+                  >
+                    <strong>Legutóbbi futás / Last poll:</strong>
+                    <div>
+                      <code>{quoteIntakeLastPoll.at}</code>
+                      ({quoteIntakeLastPoll.trigger})
+                    </div>
+                    <div>
+                      fetched={quoteIntakeLastPoll.fetched_count},
+                      created={quoteIntakeLastPoll.created_count},
+                      skipped={quoteIntakeLastPoll.skipped_duplicate_count},
+                      writeback_retried={quoteIntakeLastPoll.writeback_retried_count},
+                      writeback_failed={quoteIntakeLastPoll.writeback_failed_count},
+                      failed={quoteIntakeLastPoll.failed_count}
+                    </div>
+                    {#if quoteIntakeLastPoll.error}
+                      <div class="page__error-detail">
+                        error: {quoteIntakeLastPoll.error}
+                      </div>
+                    {/if}
+                  </div>
+                {:else}
+                  <p class="page__muted">
+                    Még nem futott a daemon (vagy nem találtunk audit
+                    bejegyzést). / No daemon cycle has emitted an audit
+                    entry yet.
+                  </p>
+                {/if}
+              </section>
+            </div>
+
+            {#if quoteIntakeSubmitError !== null}
+              <div class="page__error" role="alert">
+                <strong>Could not save quote-intake config.</strong>
+                <p class="page__error-detail">{quoteIntakeSubmitError}</p>
+              </div>
+            {/if}
+
+            {#if quoteIntakeSaved}
+              <div
+                class="page__saved"
+                role="status"
+                data-testid="quote-intake-config-saved"
+              >Saved.</div>
+            {/if}
+
+            {#if quoteIntakeRestartRequired}
+              <div
+                class="page__warning"
+                role="status"
+                data-testid="quote-intake-restart-required"
+              >
+                <strong>Az ABERP újraindítása szükséges.</strong>
+                <p>
+                  Konfiguráció mentve. Az új beállítások a daemon
+                  következő indulásakor (újraindítás után) lépnek
+                  életbe. / Daemon config saved. Restart ABERP to apply
+                  the change.
+                </p>
+              </div>
+            {/if}
+
+            {#if quoteIntakeTestError !== null}
+              <div
+                class="page__error"
+                role="alert"
+                data-testid="quote-intake-test-error"
+              >
+                <strong>Could not run the quote-intake test.</strong>
+                <p class="page__error-detail">{quoteIntakeTestError}</p>
+              </div>
+            {:else if quoteIntakeTestOutcome !== null}
+              {#if quoteIntakeTestOutcome.outcome === "succeeded"}
+                <div
+                  class="page__saved"
+                  role="status"
+                  data-testid="quote-intake-test-success"
+                >Connection OK — read-only probe (GET /api/quotes?status=approved) succeeded.</div>
+              {:else}
+                <div
+                  class="page__error"
+                  role="alert"
+                  data-testid="quote-intake-test-failure"
+                >
+                  <strong>Connection failed ({quoteIntakeTestOutcome.error_class ?? "other"}).</strong>
+                  {#if quoteIntakeTestOutcome.error_detail}
+                    <p class="page__error-detail">
+                      {quoteIntakeTestOutcome.error_detail}
+                    </p>
+                  {/if}
+                </div>
+              {/if}
+            {/if}
+
+            <div class="page__actions">
+              <button
+                type="button"
+                class="page__secondary"
+                disabled={quoteIntakeTesting || quoteIntakeSubmitting}
+                onclick={onTestQuoteIntake}
+                data-testid="quote-intake-test-connection"
+              >{quoteIntakeTesting ? "Testing…" : "Test connection"}</button>
+              <button
+                type="submit"
+                class="page__submit"
+                disabled={quoteIntakeSubmitting || quoteIntakeTesting}
+                data-testid="quote-intake-config-save"
+              >{quoteIntakeSubmitting ? "Saving…" : "Save"}</button>
+            </div>
+          </fieldset>
+        </form>
+      {/if}
+    </section>
+
     {#if bankModalOpen}
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="bank-modal-title">
         <div class="modal__panel">
@@ -1741,5 +2121,36 @@
     flex-direction: row;
     align-items: center;
     gap: var(--space-2);
+  }
+
+  /* S211 / PR-210 — quote-intake subsection. Re-uses page__error and
+     page__saved tones for consistency; adds a "warning" tone for the
+     env-override notice + restart-required banner (info, not error). */
+  .page__warning {
+    padding: var(--space-2) var(--space-3);
+    border-left: 3px solid var(--color-signal-warning, #c08200);
+    background: var(--color-surface-raised);
+    font-size: var(--type-size-sm);
+    margin-top: var(--space-2);
+  }
+
+  .page__warning p {
+    margin: var(--space-1) 0 0 0;
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-xs);
+  }
+
+  .page__status-panel {
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-surface-raised);
+    border-left: 3px solid var(--color-surface-divider);
+    font-size: var(--type-size-xs);
+    font-family: var(--type-family-mono);
+    margin-top: var(--space-2);
+    word-break: break-word;
+  }
+
+  .page__status-panel div {
+    margin-top: var(--space-1);
   }
 </style>

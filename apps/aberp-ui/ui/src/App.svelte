@@ -62,6 +62,9 @@
   import { shouldShowFirstProdLaunchModal } from "./lib/first-prod-launch";
   import InvoiceList from "./routes/InvoiceList.svelte";
   import IncomingInvoiceList from "./routes/IncomingInvoiceList.svelte";
+  // S211 / PR-210 — Quotes operational tab (third tab under
+  // Invoices, alongside Outgoing / Incoming).
+  import QuotesList from "./routes/QuotesList.svelte";
   import IssueInvoice from "./routes/IssueInvoice.svelte";
   import MaintenanceDashboard from "./routes/MaintenanceDashboard.svelte";
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
@@ -553,9 +556,26 @@
               <span class="invoices-tab__label">Bejövő</span>
               <span class="invoices-tab__sub">Incoming</span>
             </button>
+            <!-- S211 / PR-210 — third tab, quote-intake operator queue.
+                 Adjacent to invoices because the daemon stages prepared
+                 drafts that the operator picks up into invoices. -->
+            <button
+              type="button"
+              role="tab"
+              class="invoices-tab"
+              class:invoices-tab--active={invoicesTab === "quotes"}
+              aria-selected={invoicesTab === "quotes"}
+              onclick={() => setInvoicesTab("quotes")}
+              data-testid="invoices-tab-quotes"
+            >
+              <span class="invoices-tab__label">Ajánlatok</span>
+              <span class="invoices-tab__sub">Quotes</span>
+            </button>
           </div>
           {#if invoicesTab === "incoming"}
             <IncomingInvoiceList />
+          {:else if invoicesTab === "quotes"}
+            <QuotesList />
           {:else}
             <InvoiceList />
           {/if}

@@ -1,19 +1,21 @@
 // PR-179 / session-179 — persist the Outgoing/Incoming tab selection on
-// the Invoices page to `localStorage` so the operator's tab choice
-// survives a reload. Two-value closed vocab, same posture as
-// `invoice-list-persistence.ts` from S175 (storage-injectable so the
-// vitest pin doesn't touch real `window.localStorage`).
+// the Invoices page to `localStorage`. Storage-injectable so the
+// vitest pin doesn't touch real `window.localStorage`.
 //
 // Default on first launch is `outgoing` per the SPA-layout brief: the
-// AR side is the daily driver, the AP side is the secondary surface.
+// AR side is the daily driver.
+//
+// S211 / PR-210 — third value `quotes` added for the quote-intake
+// operator queue. Closed-vocab discard pattern from S175 means a
+// previously-saved unknown value falls back to the default.
 
-export type InvoiceTab = "outgoing" | "incoming";
+export type InvoiceTab = "outgoing" | "incoming" | "quotes";
 
 export const INVOICE_TAB_KEY = "aberp:invoice-tab";
 
 export const DEFAULT_INVOICE_TAB: InvoiceTab = "outgoing";
 
-const LEGAL_TABS: readonly InvoiceTab[] = ["outgoing", "incoming"];
+const LEGAL_TABS: readonly InvoiceTab[] = ["outgoing", "incoming", "quotes"];
 
 export function loadInvoiceTab(
   storage: Pick<Storage, "getItem"> | null = localStorageOrNull(),

@@ -120,6 +120,9 @@ use crate::partners::{self, Partner, PartnerInputs, ValidationError as PartnerVa
 use crate::poll_ack;
 use crate::print_invoice;
 use crate::products::{self, Product, ProductInputs, ValidationError as ProductValidationError};
+use crate::quote_intake_config as quote_intake_config_mod;
+use crate::quote_intake_credentials as quote_intake_credentials_mod;
+use crate::quote_intake_query as quote_intake_query_mod;
 use crate::restore_from_nav_outgoing as restore_outgoing;
 use crate::secrets_cache::SecretsCache;
 use crate::seller_banks::{self, SellerBankEntry, SellerBanks, SellerBanksError};
@@ -995,17 +998,64 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             });
         }
 
-        // S210 / PR-204 — quote-intake daemon. Opt-in via the
-        // `ABERP_QUOTE_INTAKE_ENABLED=true` env var. When disabled the
-        // crate is dormant and this spawn-block is a no-op log line.
-        // When `ENABLED=true` but URL/TOKEN is missing or malformed,
-        // refuse-to-start surface returns the config error loud here
-        // — fail the serve boot rather than spawn a daemon that polls
-        // a wrong URL forever. Per [[trust-code-not-operator]] and
-        // brief §8.
+        // S210 / PR-204 — quote-intake daemon. Opt-in via either the
+        // `ABERP_QUOTE_INTAKE_ENABLED=true` env var (S210, ops escape
+        // hatch) OR the operator-typed `[quote_intake]` section in
+        // seller.toml + a keychain token (S211, SPA-driven). Precedence
+        // is env > toml+keychain > dormant. When the operator changes
+        // the toml config via the SPA the daemon does NOT hot-reload
+        // (S211 conservative-choice) — the change takes effect on the
+        // next `aberp serve` boot.
+        //
+        // Refuse-to-start: `ENABLED=true` (env) OR `enabled=true`
+        // (toml) with missing URL / TOKEN aborts the boot rather than
+        // spawn a daemon that polls a wrong URL forever. Per
+        // [[trust-code-not-operator]] and brief §8.
         {
             let st = recovery_state.clone();
-            match QuoteIntakeConfig::from_env() {
+            let cfg_result: std::result::Result<QuoteIntakeConfig, QuoteIntakeError> =
+                match QuoteIntakeConfig::from_env() {
+                    Ok(c) => Ok(c),
+                    Err(QuoteIntakeError::Disabled) => {
+                        // Env-var path off; try toml + keychain.
+                        let seller_path = setup_seller_info::seller_toml_path_for_tenant(
+                            st.tenant.as_str(),
+                        )
+                        .context("resolve seller.toml path for quote-intake boot")?;
+                        let toml_cfg = crate::quote_intake_config::read_quote_intake_config(
+                            &seller_path,
+                        )
+                        .map_err(|e| anyhow!("read [quote_intake] from seller.toml: {e:#}"))?;
+                        match toml_cfg {
+                            None => Err(QuoteIntakeError::Disabled),
+                            Some(c) if !c.enabled => Err(QuoteIntakeError::Disabled),
+                            Some(c) => {
+                                let base_url = c.base_url.clone().ok_or_else(|| {
+                                    QuoteIntakeError::Config(
+                                        "[quote_intake] enabled=true but base_url is missing"
+                                            .to_string(),
+                                    )
+                                })?;
+                                let token = crate::quote_intake_credentials::read_token(
+                                    st.tenant.as_str(),
+                                )
+                                .map_err(|e| {
+                                    QuoteIntakeError::Config(format!(
+                                        "[quote_intake] enabled=true but keychain token \
+                                         unreadable: {e}"
+                                    ))
+                                })?;
+                                QuoteIntakeConfig::from_toml_and_keychain_parts(
+                                    base_url,
+                                    token,
+                                    c.poll_interval_secs,
+                                )
+                            }
+                        }
+                    }
+                    Err(other) => Err(other),
+                };
+            match cfg_result {
                 Ok(cfg) => {
                     let operator_login = match st.boot_state.read() {
                         Ok(guard) => match &*guard {
@@ -1044,8 +1094,8 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 }
                 Err(QuoteIntakeError::Disabled) => {
                     tracing::info!(
-                        "quote-intake daemon disabled \
-                         (ABERP_QUOTE_INTAKE_ENABLED not 'true'); skipping spawn"
+                        "quote-intake daemon disabled (no env vars and \
+                         [quote_intake].enabled != true); skipping spawn"
                     );
                 }
                 Err(e) => {
@@ -1646,6 +1696,24 @@ fn build_router(state: AppState) -> Router {
             "/api/invoices/:id/email",
             post(handle_email_invoice_to_buyer),
         )
+        // S211 / PR-210 — quote-intake daemon config + queue surface.
+        // GET returns the persisted `[quote_intake]` config + a
+        // `has_token` keychain probe + the latest poll summary; PUT
+        // writes the toml section (merge-not-replace) + optional
+        // token rotation to the keychain; POST /test runs a
+        // read-only `GET /api/quotes?status=approved` against the
+        // configured URL with the stored token (no persistence,
+        // remote-read-only); GET /quotes returns staged
+        // `quote_intake_log` rows for the operator queue.
+        .route(
+            "/api/quote-intake/config",
+            get(handle_get_quote_intake_config).put(handle_put_quote_intake_config),
+        )
+        .route(
+            "/api/quote-intake/test",
+            post(handle_test_quote_intake_connection),
+        )
+        .route("/api/quote-intake/quotes", get(handle_list_quote_intake))
         .with_state(state)
 }
 
@@ -9479,6 +9547,368 @@ fn parse_supplier_tax_number_from_xml(xml: &[u8]) -> Result<String> {
         ));
     }
     Ok(id.to_string())
+}
+
+// ── S211 / PR-210 — Quote-intake config + queue routes ─────────────────
+
+#[derive(Debug, serde::Serialize)]
+struct QuoteIntakeLastPoll {
+    /// RFC3339 timestamp the cycle finished.
+    at: String,
+    /// `"daemon"` or `"manual"` (mirrors `aberp_quote_intake::audit::PollTrigger`).
+    trigger: String,
+    fetched_count: u32,
+    created_count: u32,
+    skipped_duplicate_count: u32,
+    writeback_retried_count: u32,
+    writeback_failed_count: u32,
+    failed_count: u32,
+    elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct QuoteIntakeConfigResponse {
+    enabled: bool,
+    base_url: Option<String>,
+    poll_interval_secs: u64,
+    has_token: bool,
+    /// `true` when env vars override the toml config (the daemon
+    /// followed the env-var path at boot). The SPA hides the save
+    /// button in that case so a save doesn't silently lose to the env
+    /// var on next restart.
+    env_override_active: bool,
+    /// Latest `QuoteIntakePollCompleted` audit entry, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_poll: Option<QuoteIntakeLastPoll>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QuoteIntakeConfigPutWire {
+    enabled: bool,
+    base_url: Option<String>,
+    poll_interval_secs: Option<u64>,
+    /// New bearer token to write to the keychain. Absent / null /
+    /// empty string = leave existing keychain entry untouched.
+    #[serde(default)]
+    token: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QuoteIntakeTestWire {
+    base_url: String,
+    /// Optional new token to test with. When absent, falls back to the
+    /// existing keychain entry — same posture as SMTP test (PR-98).
+    #[serde(default)]
+    token: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct QuoteIntakeTestOutcome {
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_detail: Option<String>,
+}
+
+/// Whether the env-var path is active. Mirrors the precedence in the
+/// boot block: env first; toml+keychain fallback. We only check the
+/// env vars here (no keychain probe), so a "yes" answer is when the
+/// operator has set them — that's the only state where the env path
+/// wins.
+fn quote_intake_env_override_active() -> bool {
+    let enabled = std::env::var("ABERP_QUOTE_INTAKE_ENABLED")
+        .ok()
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return false;
+    }
+    let url = std::env::var("ABERP_QUOTE_INTAKE_URL")
+        .ok()
+        .unwrap_or_default();
+    let token = std::env::var("ABERP_QUOTE_INTAKE_TOKEN")
+        .ok()
+        .unwrap_or_default();
+    !url.trim().is_empty() && !token.trim().is_empty()
+}
+
+async fn handle_get_quote_intake_config(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let path = match setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str()) {
+        Ok(p) => p,
+        Err(e) => return internal_error("resolve seller.toml path", e),
+    };
+    let toml = match quote_intake_config_mod::read_quote_intake_config(&path) {
+        Ok(c) => c,
+        Err(e) => return internal_error("read [quote_intake]", e),
+    };
+    // Probe the keychain ONCE per GET to surface has_token. This
+    // matches the SMTP password_set probe ergonomic (operator sees the
+    // ✓ indicator); the daemon itself holds its own token copy from
+    // boot, so this read is the only post-boot keychain touch — same
+    // operator-action posture as the SMTP "Test connection" probe.
+    let has_token = match quote_intake_credentials_mod::read_token(state.tenant.as_str()) {
+        Ok(_) => true,
+        Err(quote_intake_credentials_mod::QuoteIntakeCredentialsError::Missing { .. }) => false,
+        Err(e) => {
+            tracing::warn!(error = %e, "keychain probe for quote-intake token");
+            false
+        }
+    };
+    let last_poll = match latest_quote_intake_poll(&state) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "read latest QuoteIntakePollCompleted audit entry");
+            None
+        }
+    };
+    let body = QuoteIntakeConfigResponse {
+        enabled: toml.as_ref().map(|c| c.enabled).unwrap_or(false),
+        base_url: toml.as_ref().and_then(|c| c.base_url.clone()),
+        poll_interval_secs: toml
+            .as_ref()
+            .and_then(|c| c.poll_interval_secs)
+            .unwrap_or(quote_intake_config_mod::DEFAULT_POLL_INTERVAL_SECS),
+        has_token,
+        env_override_active: quote_intake_env_override_active(),
+        last_poll,
+    };
+    Json(body).into_response()
+}
+
+async fn handle_put_quote_intake_config(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(wire): Json<QuoteIntakeConfigPutWire>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let cfg = quote_intake_config_mod::QuoteIntakeTomlConfig {
+        enabled: wire.enabled,
+        base_url: wire
+            .base_url
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty()),
+        poll_interval_secs: wire.poll_interval_secs,
+    };
+    if let Err(errs) = cfg.validate() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(errs)).into_response();
+    }
+    let path = match setup_seller_info::seller_toml_path_for_tenant(state.tenant.as_str()) {
+        Ok(p) => p,
+        Err(e) => return internal_error("resolve seller.toml path", e),
+    };
+    if let Err(e) = quote_intake_config_mod::write_quote_intake_section(&path, &cfg) {
+        return internal_error("write [quote_intake]", e);
+    }
+    if let Some(token) = wire.token {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            if let Err(e) = quote_intake_credentials_mod::write_token(state.tenant.as_str(), &token)
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("rotate quote-intake token in keychain: {e}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let has_token = match quote_intake_credentials_mod::read_token(state.tenant.as_str()) {
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    let last_poll = latest_quote_intake_poll(&state).ok().flatten();
+    let body = QuoteIntakeConfigResponse {
+        enabled: cfg.enabled,
+        base_url: cfg.base_url.clone(),
+        poll_interval_secs: cfg
+            .poll_interval_secs
+            .unwrap_or(quote_intake_config_mod::DEFAULT_POLL_INTERVAL_SECS),
+        has_token,
+        env_override_active: quote_intake_env_override_active(),
+        last_poll,
+    };
+    Json(body).into_response()
+}
+
+async fn handle_test_quote_intake_connection(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(wire): Json<QuoteIntakeTestWire>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let base_url = wire.base_url.trim().trim_end_matches('/').to_string();
+    if base_url.is_empty() || !(base_url.starts_with("http://") || base_url.starts_with("https://"))
+    {
+        let outcome = QuoteIntakeTestOutcome {
+            outcome: "failed",
+            error_class: Some("config"),
+            error_detail: Some(format!(
+                "base_url must start with http:// or https:// (got `{base_url}`)"
+            )),
+        };
+        return (StatusCode::OK, Json(outcome)).into_response();
+    }
+    let token = match wire.token.as_deref() {
+        Some(t) if !t.trim().is_empty() => zeroize::Zeroizing::new(t.trim().to_string()),
+        _ => match quote_intake_credentials_mod::read_token(state.tenant.as_str()) {
+            Ok(t) => t,
+            Err(_) => {
+                let outcome = QuoteIntakeTestOutcome {
+                    outcome: "failed",
+                    error_class: Some("auth"),
+                    error_detail: Some(
+                        "no token entered AND no quote-intake token set in the keychain"
+                            .to_string(),
+                    ),
+                };
+                return (StatusCode::OK, Json(outcome)).into_response();
+            }
+        },
+    };
+    // Build a temporary transport + issue a read-only list call
+    // (status=approved, no payload mutation). 10-second timeout is
+    // already baked into the transport — same posture as the daemon
+    // cycle.
+    let test_cfg = match QuoteIntakeConfig::from_toml_and_keychain_parts(
+        base_url.clone(),
+        token,
+        Some(quote_intake_config_mod::DEFAULT_POLL_INTERVAL_SECS),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let outcome = QuoteIntakeTestOutcome {
+                outcome: "failed",
+                error_class: Some("config"),
+                error_detail: Some(format!("{e}")),
+            };
+            return (StatusCode::OK, Json(outcome)).into_response();
+        }
+    };
+    let transport = match aberp_quote_intake::QuoteIntakeTransport::new(&test_cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            let outcome = QuoteIntakeTestOutcome {
+                outcome: "failed",
+                error_class: Some("transport"),
+                error_detail: Some(format!("{e}")),
+            };
+            return (StatusCode::OK, Json(outcome)).into_response();
+        }
+    };
+    match transport.list_approved_quotes().await {
+        Ok(_) => Json(QuoteIntakeTestOutcome {
+            outcome: "succeeded",
+            error_class: None,
+            error_detail: None,
+        })
+        .into_response(),
+        Err(QuoteIntakeError::Unauthorized) => Json(QuoteIntakeTestOutcome {
+            outcome: "failed",
+            error_class: Some("auth"),
+            error_detail: Some("sister service responded 401 Unauthorized".to_string()),
+        })
+        .into_response(),
+        Err(e) => Json(QuoteIntakeTestOutcome {
+            outcome: "failed",
+            error_class: Some("transport"),
+            error_detail: Some(format!("{e}")),
+        })
+        .into_response(),
+    }
+}
+
+async fn handle_list_quote_intake(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let db_path = (*state.db_path).clone();
+    let tenant = state.tenant.as_str().to_string();
+    let rows = match tokio::task::spawn_blocking(move || -> Result<_> {
+        let conn = duckdb::Connection::open(&db_path)
+            .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
+        quote_intake_query_mod::list_quote_intake_rows(&conn, &tenant)
+    })
+    .await
+    {
+        Ok(Ok(rs)) => rs,
+        Ok(Err(e)) => return internal_error("list quote_intake_log", e),
+        Err(e) => {
+            return internal_error("quote_intake list task join", anyhow!("{e}"));
+        }
+    };
+    Json(rows).into_response()
+}
+
+/// Read the most-recent `QuoteIntakePollCompleted` payload from the
+/// audit ledger, decode for the SPA's last-poll status panel. Returns
+/// `Ok(None)` for a freshly-booted tenant whose daemon hasn't yet
+/// emitted (a pure-zero cycle is silent — see crate audit `should_emit`).
+fn latest_quote_intake_poll(state: &AppState) -> Result<Option<QuoteIntakeLastPoll>> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash for quote-intake poll lookup")?;
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
+        .context("open audit ledger for quote-intake poll lookup")?;
+    let entries = ledger
+        .entries()
+        .context("read audit ledger entries for quote-intake poll lookup")?;
+    let mut latest: Option<(time::OffsetDateTime, Entry)> = None;
+    for entry in entries {
+        if entry.kind == EventKind::QuoteIntakePollCompleted {
+            let ts = entry.time_wall;
+            match latest {
+                Some((cur, _)) if cur >= ts => {}
+                _ => latest = Some((ts, entry)),
+            }
+        }
+    }
+    let Some((at, entry)) = latest else {
+        return Ok(None);
+    };
+    let payload: aberp_quote_intake::QuoteIntakePollPayload =
+        serde_json::from_slice(&entry.payload)
+            .context("decode QuoteIntakePollCompleted payload")?;
+    let at_str = at
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    Ok(Some(QuoteIntakeLastPoll {
+        at: at_str,
+        trigger: payload.trigger,
+        fetched_count: payload.fetched_count,
+        created_count: payload.created_count,
+        skipped_duplicate_count: payload.skipped_duplicate_count,
+        writeback_retried_count: payload.writeback_retried_count,
+        writeback_failed_count: payload.writeback_failed_count,
+        failed_count: payload.failed_count,
+        elapsed_ms: payload.elapsed_ms,
+        error: payload.error,
+    }))
 }
 
 // ── Session-161 — NAV poll daemon orchestration ──────────────────────

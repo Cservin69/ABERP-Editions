@@ -257,6 +257,19 @@ pub fn setup_seller_info_to_path(
             "read existing [seller.branding] for preservation across identity write: {e}"
         ))
     })?;
+    // S211 / PR-210 — preserve `[quote_intake]` across the identity
+    // write. Sixth slot of the seller.toml write invariant
+    // (banks/smtp/numbering/branding + this). Without this, an operator
+    // who has configured the quote-intake daemon via the SPA would
+    // lose the section on the next identity edit and the next boot
+    // would silently revert to the env-var path (or to dormant). Same
+    // posture as the five other preservations above.
+    let preserved_quote_intake = crate::quote_intake_config::read_quote_intake_config(path)
+        .map_err(|e| {
+            SetupSellerInfoError::Backend(anyhow!(
+                "read existing [quote_intake] for preservation across identity write: {e}"
+            ))
+        })?;
 
     let mut body = render_seller_toml(inputs);
     if !preserved.entries().is_empty() {
@@ -273,6 +286,9 @@ pub fn setup_seller_info_to_path(
             &mut body,
             &crate::branding_config::to_toml_section(branding),
         );
+    }
+    if let Some(qi) = preserved_quote_intake.as_ref() {
+        append_section(&mut body, &crate::quote_intake_config::to_toml_section(qi));
     }
 
     write_atomic(path, body.as_bytes()).map_err(SetupSellerInfoError::Backend)?;

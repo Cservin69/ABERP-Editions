@@ -1845,3 +1845,93 @@ export async function restoreFromNavOutgoing(
 export async function listRestoredInvoices(): Promise<RestoredInvoice[]> {
   return invoke<RestoredInvoice[]>("list_restored_invoices");
 }
+
+// ── S211 / PR-210 — Quote intake config + queue ─────────────────────
+
+/** Most-recent `QuoteIntakePollCompleted` audit summary, surfaced by the
+ * Tenant Settings status panel. `null` when the daemon has never
+ * emitted (a pure-zero cycle is silent per crate `should_emit`). */
+export interface QuoteIntakeLastPoll {
+  at: string;
+  trigger: string;
+  fetched_count: number;
+  created_count: number;
+  skipped_duplicate_count: number;
+  writeback_retried_count: number;
+  writeback_failed_count: number;
+  failed_count: number;
+  elapsed_ms: number;
+  error?: string | null;
+}
+
+/** `GET /api/quote-intake/config` shape. The bearer token NEVER round-
+ * trips through the SPA — `has_token` is the only signal the operator
+ * sees about its presence. `env_override_active` is `true` when env
+ * vars are providing the live daemon config; the SPA shows the form
+ * read-only in that state because a save would silently lose to the
+ * env var on the next boot. */
+export interface QuoteIntakeConfigResponse {
+  enabled: boolean;
+  base_url: string | null;
+  poll_interval_secs: number;
+  has_token: boolean;
+  env_override_active: boolean;
+  last_poll?: QuoteIntakeLastPoll | null;
+}
+
+/** PUT body — `token` is optional; an empty / absent value leaves the
+ * existing keychain entry untouched. Same posture as the SMTP password
+ * input on the SMTP settings card. */
+export interface QuoteIntakeConfigPutBody {
+  enabled: boolean;
+  base_url: string | null;
+  poll_interval_secs: number | null;
+  token: string | null;
+}
+
+export interface QuoteIntakeTestOutcome {
+  outcome: "succeeded" | "failed";
+  error_class?: string | null;
+  error_detail?: string | null;
+}
+
+export async function getQuoteIntakeConfig(): Promise<QuoteIntakeConfigResponse> {
+  return invoke<QuoteIntakeConfigResponse>("get_quote_intake_config");
+}
+
+export async function putQuoteIntakeConfig(
+  body: QuoteIntakeConfigPutBody,
+): Promise<QuoteIntakeConfigResponse> {
+  return invoke<QuoteIntakeConfigResponse>("put_quote_intake_config", { body });
+}
+
+export async function testQuoteIntakeConnection(body: {
+  base_url: string;
+  token: string | null;
+}): Promise<QuoteIntakeTestOutcome> {
+  return invoke<QuoteIntakeTestOutcome>("test_quote_intake_connection", {
+    body,
+  });
+}
+
+/** Single row of the operator Quotes tab — mirrors the backend
+ * `QuoteIntakeRow`. Lossy summary fields (contact / material /
+ * quantity / notes) may be `null` if the daemon-side raw payload
+ * didn't carry them. */
+export interface QuoteIntakeRow {
+  quote_id: string;
+  invoice_id: string;
+  received_at: string;
+  intake_at: string;
+  status_writeback_at: string | null;
+  contact_name: string | null;
+  contact_email: string | null;
+  contact_company: string | null;
+  material: string | null;
+  quantity: string | null;
+  notes: string | null;
+}
+
+export async function listQuoteIntake(): Promise<QuoteIntakeRow[]> {
+  return invoke<QuoteIntakeRow[]>("list_quote_intake");
+}

@@ -712,6 +712,58 @@ pub async fn download_incoming_xml(
     forward_get_bytes(&state, &path).await
 }
 
+// ── S211 / PR-210 — quote-intake SPA surface ─────────────────────────
+//
+// Four pass-through commands for the new Quote Intake section in
+// Tenant Settings + the operational Quotes tab. The backend stores
+// the bearer token in the OS keychain (never round-trips it via the
+// SPA); non-secrets live in seller.toml [quote_intake]. See the
+// backend handlers in `apps/aberp/src/serve.rs` for wire shapes.
+
+/// `GET /api/quote-intake/config` — returns the persisted config,
+/// `has_token` keychain probe, `env_override_active` flag (the env-var
+/// path overrides the toml/keychain path at boot — when active the SPA
+/// shows the values for read-only inspection only), and the latest
+/// `QuoteIntakePollCompleted` audit summary for the status panel.
+#[tauri::command]
+pub async fn get_quote_intake_config(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quote-intake/config", true).await
+}
+
+/// `PUT /api/quote-intake/config` — writes `[quote_intake]` to
+/// seller.toml (merge-not-replace) and OPTIONALLY rotates the bearer
+/// token in the keychain (when `token` is present and non-empty).
+/// The daemon does NOT hot-reload — restart required to apply changes.
+#[tauri::command]
+pub async fn put_quote_intake_config(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_put(&state, "/api/quote-intake/config", body).await
+}
+
+/// `POST /api/quote-intake/test` — read-only probe of the sister
+/// service. Issues a `GET /api/quotes?status=approved` with the
+/// configured URL + (typed token OR existing keychain entry); reports
+/// the typed outcome WITHOUT persisting anything (no token write,
+/// no remote state mutation).
+#[tauri::command]
+pub async fn test_quote_intake_connection(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/quote-intake/test", body).await
+}
+
+/// `GET /api/quote-intake/quotes` — returns the staged `quote_intake_log`
+/// rows for the operator's Quotes tab. Per-row fields extracted lossy
+/// from the daemon-side raw payload (contact name/email/company,
+/// material, quantity, notes) plus the durable id + timestamps.
+#[tauri::command]
+pub async fn list_quote_intake(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quote-intake/quotes", true).await
+}
+
 /// S180 / PR-180 — operator-clicked NAV-as-DR restore wizard.
 /// `POST /api/restore-from-nav-outgoing { year }`. Synchronous (walks
 /// 12 months × pagination against NAV); the SPA gates the click on
