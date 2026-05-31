@@ -3945,6 +3945,105 @@ async fn handle_issue_invoice(
     }
 }
 
+/// S184 — post-issue tail for STORNO and MODIFICATION chains. Mirrors
+/// the [[post-issue-async]] block in `handle_issue_invoice` (PR-99 /
+/// session-158) verbatim, with two chain-specific seams:
+///
+/// 1. The buyer identity is resolved from the BASE invoice's side-
+///    stored `input.json` (via `resolve_customer_identity` on
+///    `base_invoice_id`) — chain children inherit the buyer from the
+///    base by definition (ADR-0024 §6, ADR-0023 §4 chain inheritance).
+///    The storno / modification's own ULID has no `.input.json` side-
+///    store written, so a direct lookup keyed on the chain child's id
+///    would fail; the chain link's `base_invoice_id` is the recovery
+///    bridge.
+/// 2. The auto-submit + poll daemon target the CHAIN CHILD's invoice
+///    id (the storno / modification has its own NAV XML on disk via
+///    `InvoiceDraftCreated.nav_xml_path`, its own pending sequence
+///    backlog row, and submits as a fresh `manageInvoice` operation
+///    per ADR-0023 §3 / ADR-0024 §3).
+///
+/// Pre-S184 both routes returned the response immediately and the
+/// operator had to click Submit + Email manually. The Issue path had
+/// the auto-tail since PR-99; this closes the chain-paths' gap.
+///
+/// Best-effort fire-and-forget: NAV / SMTP failures are logged and
+/// recorded on the audit ledger; the pictogram stays actionable for a
+/// manual retry from the InvoiceDetail surface (PR-95).
+async fn run_chain_post_issue_tail(
+    state: &AppState,
+    chain_invoice_id: &str,
+    chain_invoice_number: &str,
+    base_invoice_id: &str,
+    operator_login: &str,
+    email_buyer_flag: bool,
+    submit_to_nav_flag: bool,
+) {
+    if email_buyer_flag {
+        // Resolve buyer identity from the BASE's side-stored input.json
+        // (the only place that holds the operator-typed
+        // partner_id+tax_number pair durably for SPA-issued invoices).
+        // Failure is loud-logged but non-fatal — the auto-send writes
+        // an `InvoiceEmailedSent` entry for the MissingRecipient case
+        // so the email-status pictogram surfaces actionable error
+        // state on the storno detail view (per S163).
+        match resolve_customer_identity(state, base_invoice_id) {
+            Ok((partner_id, tax_number)) => {
+                let _ = auto_send_after_issue(
+                    state,
+                    chain_invoice_id,
+                    chain_invoice_number,
+                    partner_id.as_deref(),
+                    &tax_number,
+                    operator_login,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    chain_invoice_id = %chain_invoice_id,
+                    base_invoice_id = %base_invoice_id,
+                    error = ?e,
+                    "post-issue chain auto-email could not resolve buyer identity \
+                     from base's input.json; operator can retry via the manual \
+                     Email button on the chain child's detail view"
+                );
+            }
+        }
+    }
+    if submit_to_nav_flag {
+        match submit_invoice_request(state, chain_invoice_id).await {
+            Ok(_) => match build_poll_daemon_inputs(state, chain_invoice_id).await {
+                Ok(inputs) => {
+                    let sem = state.nav_poll_semaphore.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = poll_ack::run_nav_poll_daemon(inputs, sem).await {
+                            tracing::warn!(
+                                error = ?e,
+                                "post-issue chain NAV poll daemon failed"
+                            );
+                        }
+                    });
+                }
+                Err(e) => tracing::warn!(
+                    chain_invoice_id = %chain_invoice_id,
+                    error = ?e,
+                    "post-issue chain could not build poll daemon inputs; \
+                     pictogram stays actionable for a manual poll"
+                ),
+            },
+            Err(e) => {
+                tracing::warn!(
+                    chain_invoice_id = %chain_invoice_id,
+                    error = ?e,
+                    "post-issue chain auto-submit failed; chain child remains in Ready / \
+                     pre-Submitted state — operator can retry via the manual Submit button"
+                );
+            }
+        }
+    }
+}
+
 /// PR-92 — render the email send for the post-issue auto-send path.
 /// Always writes an audit-ledger `InvoiceEmailedSent` entry (success
 /// OR failure) so the operator-twin record never has gaps. Returns
@@ -4679,6 +4778,26 @@ pub async fn poll_ack_request(
 pub struct StornoInvoiceRequest {
     #[serde(default, rename = "stornoReason")]
     pub storno_reason: Option<String>,
+    /// S184 — operator's per-storno opt-out of the default-on auto-
+    /// email-buyer tail. Mirrors `IssueInvoiceRequest::email_buyer_on_issue`
+    /// shape + posture: optional on the wire so pre-S184 SPA / curl
+    /// callers still type-check; absent → defaults to `true` server-
+    /// side at the `email_buyer_on_storno.unwrap_or(true)` seam in
+    /// `handle_storno_invoice`. Default-on per the same posture as the
+    /// issue path — storno IS the legal-correction mechanism and the
+    /// buyer should receive the corrected paper trail without a second
+    /// operator click.
+    #[serde(default, rename = "emailBuyerOnStorno")]
+    pub email_buyer_on_storno: Option<bool>,
+    /// S184 — operator's per-storno opt-out of the default-on auto-
+    /// submit-to-NAV tail. Mirrors `IssueInvoiceRequest::submit_to_nav_on_issue`
+    /// shape + posture. Default-on so the dominant operator flow
+    /// (storno → submit → SAVED inside the same minute) matches the
+    /// issue path's UX without a second click. Failures are tolerated
+    /// (the storno stays in `Ready`) so a transient NAV outage doesn't
+    /// undo the storno commit.
+    #[serde(default, rename = "submitToNavOnStorno")]
+    pub submit_to_nav_on_storno: Option<bool>,
 }
 
 /// PR-47α / session-64 — wire response body for
@@ -4751,22 +4870,71 @@ async fn handle_storno_invoice(
     // `StornoInvoiceRequest` (all-`None`) covers both shapes.
     body: Option<Json<StornoInvoiceRequest>>,
 ) -> Response {
-    if let Err(resp) = require_ready(&state) {
-        return resp;
-    }
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
     let request = body.map(|Json(r)| r).unwrap_or_default();
+    // S184 — capture the operator's auto-pipeline flags BEFORE the
+    // request moves into `storno_invoice_request`. Same default-on
+    // posture as the issue path (PR-92 / PR-99 Item 4 Part B): absent →
+    // `true`. The SPA's storno confirm panel pre-S184 does not surface
+    // a checkbox, so every storno today triggers the full tail; the
+    // wire field is forward-compat so a future SPA can flip it OFF.
+    let email_buyer_flag = request.email_buyer_on_storno.unwrap_or(true);
+    let submit_to_nav_flag = request.submit_to_nav_on_storno.unwrap_or(true);
+    // S184 — capture the BASE invoice id (this storno's parent) before
+    // the route helper consumes the path. The post-issue email lookup
+    // resolves the buyer identity from the BASE's side-stored
+    // input.json (storno inherits buyer from base by definition; the
+    // storno's own ULID has no input.json — only the base does — and
+    // the chain link `InvoiceStornoIssued.base_invoice_id` is the
+    // operator-visible bridge to recover identity).
+    let base_invoice_id_for_tail = invoice_id.clone();
     match storno_invoice_request(&state, &invoice_id, request) {
-        Ok(summary) => Json(StornoInvoiceResponse {
-            invoice_id: summary.invoice_id,
-            invoice_number: summary.invoice_number,
-            state: InvoiceState::Storno,
-            modification_index: summary.modification_index,
-            entries_verified: summary.entries_verified,
-        })
-        .into_response(),
+        Ok(summary) => {
+            // S184 — post-issue tail mirrors `handle_issue_invoice`'s
+            // [[post-issue-async]] pattern: a detached `tokio::spawn`
+            // runs the default-on auto-email + auto-submit-to-NAV +
+            // bounded poll AFTER the route response returns. The SPA's
+            // InvoiceDetail view live-polls `getInvoice` so each
+            // transition (NAV pictogram, email status) lands on screen
+            // as the audit ledger records it. Best-effort fire-and-
+            // forget: a NAV/SMTP failure is logged and recorded on the
+            // audit ledger; the pictogram stays actionable for a manual
+            // retry from the detail surface. Pre-S184 (PR-47α through
+            // S183) the operator had to click Submit AND Email manually
+            // after every storno — the parallel to the issue path was
+            // never wired; this closes the gap.
+            let task_storno_invoice_id = summary.invoice_id.clone();
+            let task_storno_invoice_number = summary.invoice_number.clone();
+            let task_state = state.clone();
+            let task_login = operator_login.clone();
+            let task_base_invoice_id = base_invoice_id_for_tail;
+            tokio::spawn(async move {
+                run_chain_post_issue_tail(
+                    &task_state,
+                    &task_storno_invoice_id,
+                    &task_storno_invoice_number,
+                    &task_base_invoice_id,
+                    &task_login,
+                    email_buyer_flag,
+                    submit_to_nav_flag,
+                )
+                .await;
+            });
+            Json(StornoInvoiceResponse {
+                invoice_id: summary.invoice_id,
+                invoice_number: summary.invoice_number,
+                state: InvoiceState::Storno,
+                modification_index: summary.modification_index,
+                entries_verified: summary.entries_verified,
+            })
+            .into_response()
+        }
         Err(SubmitRouteError::PreconditionMismatch {
             current_state,
             message,
@@ -4961,6 +5129,16 @@ pub struct ModificationInvoiceRequest {
     pub modification_date: String,
     #[serde(default)]
     pub series: Option<String>,
+    /// S184 — operator's per-modification opt-out of the default-on
+    /// auto-email-buyer tail. Same shape + posture as
+    /// `StornoInvoiceRequest::email_buyer_on_storno`; absent → `true`.
+    #[serde(default, rename = "emailBuyerOnModification")]
+    pub email_buyer_on_modification: Option<bool>,
+    /// S184 — operator's per-modification opt-out of the default-on
+    /// auto-submit-to-NAV tail. Same shape + posture as
+    /// `StornoInvoiceRequest::submit_to_nav_on_storno`; absent → `true`.
+    #[serde(default, rename = "submitToNavOnModification")]
+    pub submit_to_nav_on_modification: Option<bool>,
 }
 
 /// PR-47β / session-65 — wire response body for
@@ -5078,21 +5256,55 @@ async fn handle_modification_invoice(
     AxumPath(invoice_id): AxumPath<String>,
     Json(request): Json<ModificationInvoiceRequest>,
 ) -> Response {
-    if let Err(resp) = require_ready(&state) {
-        return resp;
-    }
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
+    // S184 — capture the operator's auto-pipeline flags BEFORE the
+    // request moves into `modification_invoice_request`. Same default-
+    // on posture as the issue + storno paths: absent → `true`. The
+    // SPA's modification confirm panel pre-S184 does not surface a
+    // checkbox, so every modification today triggers the full tail.
+    let email_buyer_flag = request.email_buyer_on_modification.unwrap_or(true);
+    let submit_to_nav_flag = request.submit_to_nav_on_modification.unwrap_or(true);
+    // S184 — capture the BASE invoice id (this modification's parent)
+    // before the route helper consumes the path. Same chain-identity-
+    // recovery pattern as the storno tail.
+    let base_invoice_id_for_tail = invoice_id.clone();
     match modification_invoice_request(&state, &invoice_id, request) {
-        Ok(summary) => Json(ModificationInvoiceResponse {
-            invoice_id: summary.invoice_id,
-            invoice_number: summary.invoice_number,
-            state: InvoiceState::Amended,
-            modification_index: summary.modification_index,
-            entries_verified: summary.entries_verified,
-        })
-        .into_response(),
+        Ok(summary) => {
+            // S184 — post-issue tail. See `handle_storno_invoice` +
+            // `run_chain_post_issue_tail` doc-comments for the
+            // [[post-issue-async]] parallel.
+            let task_modification_invoice_id = summary.invoice_id.clone();
+            let task_modification_invoice_number = summary.invoice_number.clone();
+            let task_state = state.clone();
+            let task_login = operator_login.clone();
+            let task_base_invoice_id = base_invoice_id_for_tail;
+            tokio::spawn(async move {
+                run_chain_post_issue_tail(
+                    &task_state,
+                    &task_modification_invoice_id,
+                    &task_modification_invoice_number,
+                    &task_base_invoice_id,
+                    &task_login,
+                    email_buyer_flag,
+                    submit_to_nav_flag,
+                )
+                .await;
+            });
+            Json(ModificationInvoiceResponse {
+                invoice_id: summary.invoice_id,
+                invoice_number: summary.invoice_number,
+                state: InvoiceState::Amended,
+                modification_index: summary.modification_index,
+                entries_verified: summary.entries_verified,
+            })
+            .into_response()
+        }
         Err(ModificationRouteError::PreconditionMismatch {
             current_state,
             message,
@@ -8319,6 +8531,22 @@ fn resolve_recipient_email(
 /// identity the email recipient lookup keys on. S164 — partner_id is
 /// the primary key (PrivatePerson buyers carry no tax_number); the
 /// tax_number stays as the legacy fallback for pre-partner-id invoices.
+///
+/// S184 — when called on a chain child (storno / modification id) whose
+/// own side-stored input.json was never written (pre-S184 the issue
+/// path was the only writer of `<ULID>.input.json`; storno + modify
+/// dispatched the chain but never wrote their own sibling file), the
+/// resolver walks the chain up to the BASE invoice via the audit
+/// ledger's `InvoiceStornoIssued.base_invoice_id` /
+/// `InvoiceModificationIssued.base_invoice_id` chain-link and reads
+/// the base's input.json instead. Chain children inherit the buyer
+/// from the base by definition (ADR-0023 §4, ADR-0024 §6) so the
+/// recovered identity is operator-correct. Pre-S184 the manual Email
+/// button on a storno's detail view returned 404 because of this
+/// missing-side-store gap; the auto-email tail in
+/// `run_chain_post_issue_tail` resolves identity from the base id
+/// directly (it has it on hand) but the manual-click handler does not,
+/// so the resolver itself has to bridge.
 fn resolve_customer_identity(
     state: &AppState,
     invoice_id: &str,
@@ -8332,22 +8560,93 @@ fn resolve_customer_identity(
             .map_err(|e| anyhow!("binary hash: {e}"))?,
     )
     .with_context(|| format!("open audit ledger at {}", state.db_path.display()))?;
-    let xml_path = find_draft_xml_path(&ledger, invoice_id)?;
-    let input_json_path = sibling_input_json_path(&xml_path);
-    let body = std::fs::read_to_string(&input_json_path).with_context(|| {
-        format!(
-            "read side-stored input.json at {} for invoice {}",
-            input_json_path.display(),
+    // S184 — walk chain children up to the first ancestor whose
+    // sibling input.json actually exists on disk. Bounded depth: in
+    // practice chain depth is 1 (storno of a base) or 2 (storno of an
+    // amended base), but we cap at 8 as defence against a malformed
+    // ledger ever cycling. Each iteration: read the candidate id's
+    // sibling input.json; if read fails AND a chain-link points at
+    // this id, jump to the chain-link's base_invoice_id and retry.
+    let mut current_id = invoice_id.to_string();
+    let mut last_io_error: Option<anyhow::Error> = None;
+    for _ in 0..8 {
+        let xml_path = find_draft_xml_path(&ledger, &current_id)?;
+        let input_json_path = sibling_input_json_path(&xml_path);
+        match std::fs::read_to_string(&input_json_path) {
+            Ok(body) => {
+                let input: InvoiceInputJson = serde_json::from_str(&body).with_context(|| {
+                    format!(
+                        "parse side-stored input.json at {}",
+                        input_json_path.display()
+                    )
+                })?;
+                return Ok((input.customer.partner_id, input.customer.tax_number));
+            }
+            Err(read_err) => {
+                last_io_error = Some(anyhow!(
+                    "read side-stored input.json at {} for invoice {}: {}",
+                    input_json_path.display(),
+                    current_id,
+                    read_err
+                ));
+                if let Some(base_id) = chain_link_base_for(&ledger, &current_id)? {
+                    current_id = base_id;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    Err(last_io_error.unwrap_or_else(|| {
+        anyhow!(
+            "resolve customer identity for {} exhausted chain-walk \
+             without locating a side-stored input.json",
             invoice_id
         )
-    })?;
-    let input: InvoiceInputJson = serde_json::from_str(&body).with_context(|| {
-        format!(
-            "parse side-stored input.json at {}",
-            input_json_path.display()
-        )
-    })?;
-    Ok((input.customer.partner_id, input.customer.tax_number))
+    }))
+}
+
+/// S184 — given a chain-child invoice id (storno or modification),
+/// return the base invoice id recorded on the most-recent matching
+/// `InvoiceStornoIssued.storno_invoice_id` /
+/// `InvoiceModificationIssued.modification_invoice_id` chain-link
+/// payload. Returns `Ok(None)` when the id is NOT a chain child (it is
+/// itself a base invoice — terminal of the chain walk). `Err` only on
+/// ledger read / payload decode failure.
+fn chain_link_base_for(ledger: &Ledger, invoice_id: &str) -> Result<Option<String>> {
+    let entries = ledger
+        .entries()
+        .context("read audit-ledger entries to walk chain-child → base link (S184)")?;
+    for entry in entries.iter().rev() {
+        match entry.kind {
+            EventKind::InvoiceStornoIssued => {
+                let payload: audit_payloads::InvoiceStornoIssuedPayload =
+                    serde_json::from_slice(&entry.payload).with_context(|| {
+                        format!(
+                            "InvoiceStornoIssued payload (seq {:?}) failed typed decode",
+                            entry.seq
+                        )
+                    })?;
+                if payload.storno_invoice_id == invoice_id {
+                    return Ok(Some(payload.base_invoice_id));
+                }
+            }
+            EventKind::InvoiceModificationIssued => {
+                let payload: audit_payloads::InvoiceModificationIssuedPayload =
+                    serde_json::from_slice(&entry.payload).with_context(|| {
+                        format!(
+                            "InvoiceModificationIssued payload (seq {:?}) failed typed decode",
+                            entry.seq
+                        )
+                    })?;
+                if payload.modification_invoice_id == invoice_id {
+                    return Ok(Some(payload.base_invoice_id));
+                }
+            }
+            _ => continue,
+        }
+    }
+    Ok(None)
 }
 
 fn resolve_invoice_xml_path(state: &AppState, invoice_id: &str) -> Result<PathBuf> {
@@ -11977,5 +12276,345 @@ mod tests {
             Some(3_500_565),
             "EUR case: huf_equivalent_total must serialise as a JSON integer (whole forints per ADR-0009 §1)",
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // S184 — Storno regression pins
+    //
+    // 1. StornoInvoiceRequest's new auto-pipeline flags (email_buyer_on_storno
+    //    + submit_to_nav_on_storno) deserialise as `None` from a pre-S184
+    //    empty body AND as `Some(false)` when the operator explicitly opts
+    //    out — pinned because the handler's `unwrap_or(true)` default-on
+    //    seam silently drops to `false` if the wire token gets renamed.
+    // 2. `resolve_customer_identity` chain-walks via
+    //    `InvoiceStornoIssued.base_invoice_id` to the base's side-stored
+    //    input.json when the storno's own side-store is missing — the
+    //    manual Email button on a storno detail view depends on this
+    //    bridge (pre-S184 the click returned 404 because storno never
+    //    writes its own input.json sibling).
+    // ──────────────────────────────────────────────────────────────────
+
+    /// S184 / Bug 1 pin — `StornoInvoiceRequest`'s auto-pipeline opt-out
+    /// flags ride the wire as `emailBuyerOnStorno` / `submitToNavOnStorno`
+    /// camelCase tokens. The pre-S184 empty body must parse to `None` for
+    /// both, which the handler maps to default-on. A future rename that
+    /// drops the camelCase rename would break the SPA's opt-out path
+    /// silently — pin both shapes.
+    #[test]
+    fn storno_request_flags_default_to_none_then_to_explicit_false() {
+        // Pre-S184 empty body → both flags absent → None → default-on at
+        // the handler seam.
+        let default_body: StornoInvoiceRequest =
+            serde_json::from_str("{}").expect("empty body must parse as default");
+        assert_eq!(default_body.storno_reason, None);
+        assert_eq!(default_body.email_buyer_on_storno, None);
+        assert_eq!(default_body.submit_to_nav_on_storno, None);
+
+        // Explicit operator opt-out — SPA renders the checkbox + sends
+        // `false`. Pin the camelCase rename + the bool round-trip.
+        let opt_out: StornoInvoiceRequest = serde_json::from_str(
+            r#"{
+                "stornoReason": "Téves összeg",
+                "emailBuyerOnStorno": false,
+                "submitToNavOnStorno": false
+            }"#,
+        )
+        .expect("body with explicit opt-out must parse");
+        assert_eq!(opt_out.storno_reason.as_deref(), Some("Téves összeg"));
+        assert_eq!(opt_out.email_buyer_on_storno, Some(false));
+        assert_eq!(opt_out.submit_to_nav_on_storno, Some(false));
+    }
+
+    /// S184 / Bug 1 pin — same shape for `ModificationInvoiceRequest`. The
+    /// SPA's modification form does not surface the toggle today but the
+    /// wire field is forward-compat for a future opt-out checkbox.
+    #[test]
+    fn modification_request_flags_round_trip_via_camelcase_tokens() {
+        let body: ModificationInvoiceRequest = serde_json::from_str(
+            r#"{
+                "customer": {
+                    "vatStatus": "Domestic",
+                    "taxNumber": "12345678-2-13",
+                    "name": "Test Buyer Kft.",
+                    "address": {
+                        "countryCode": "HU",
+                        "postalCode": "1052",
+                        "city": "Budapest",
+                        "street": "Váci utca 19."
+                    }
+                },
+                "lines": [{
+                    "description": "Test",
+                    "quantity": "1",
+                    "unitPrice": 1000,
+                    "vatRatePercent": 27
+                }],
+                "currency": "HUF",
+                "modificationDate": "2026-05-24",
+                "emailBuyerOnModification": false,
+                "submitToNavOnModification": false
+            }"#,
+        )
+        .expect("modification body with explicit opt-out must parse");
+        assert_eq!(body.email_buyer_on_modification, Some(false));
+        assert_eq!(body.submit_to_nav_on_modification, Some(false));
+    }
+
+    /// S184 / Bug 2 pin — `resolve_customer_identity` walks the chain from
+    /// a storno's invoice id UP to the base via `InvoiceStornoIssued.
+    /// base_invoice_id` when the storno's own sibling input.json is
+    /// missing on disk. The base's input.json carries the durable
+    /// `(partner_id, tax_number)` pair — chain children inherit identity
+    /// by definition (ADR-0023 §4).
+    ///
+    /// Pre-S184: `resolve_customer_identity(storno_id)` failed with
+    /// `read side-stored input.json at ... for invoice ...` → the manual
+    /// Email button on a storno's detail view returned 404 → operator
+    /// could not send the storno PDF to the buyer.
+    #[test]
+    fn resolve_customer_identity_chain_walks_storno_to_base_input_json() {
+        const TEST_TENANT: &str = "resolve_chain_walk_test";
+        let test_dir = std::env::temp_dir()
+            .join("aberp-s184-chain-walk")
+            .join(format!("{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&test_dir).expect("create test dir");
+        let db_path = test_dir.join("aberp.duckdb");
+        let issued_dir = test_dir.join("issued");
+        std::fs::create_dir_all(&issued_dir).expect("create issued dir");
+
+        let base_invoice_id = "inv_01TESTBASE0000000000000000";
+        let storno_invoice_id = "inv_01TESTSTORNO00000000000000";
+
+        // Base side-store contains the durable identity pair. Use a
+        // partner_id (S164) plus a tax_number (legacy-fallback ride).
+        let base_xml_path = issued_dir.join("base.xml");
+        std::fs::write(&base_xml_path, b"<?xml version=\"1.0\"?><InvoiceData/>")
+            .expect("write base XML stub");
+        let base_input_json = serde_json::json!({
+            "supplier": {
+                "taxNumber": "24904362-2-41",
+                "name": "Aben Consulting Kft",
+                "address": {
+                    "countryCode": "HU",
+                    "postalCode": "1037",
+                    "city": "Budapest",
+                    "street": "Visszatérő köz 6"
+                }
+            },
+            "customer": {
+                "vatStatus": "Domestic",
+                "partnerId": "ptn_01TESTBUYER000000000000000",
+                "taxNumber": "12345678-2-13",
+                "name": "Test Buyer Kft.",
+                "address": {
+                    "countryCode": "HU",
+                    "postalCode": "1052",
+                    "city": "Budapest",
+                    "street": "Váci utca 19."
+                }
+            },
+            "lines": [{
+                "description": "Test",
+                "quantity": 1,
+                "unitPrice": 1000,
+                "vatRatePercent": 27
+            }],
+            "paymentMethod": "TRANSFER"
+        });
+        std::fs::write(
+            sibling_input_json_path(&base_xml_path),
+            serde_json::to_vec(&base_input_json).expect("encode base input.json"),
+        )
+        .expect("write base input.json");
+
+        // Storno XML lives on disk but NO sibling input.json — pre-S184
+        // posture. This is the on-disk state the bug reproduces.
+        let storno_xml_path = issued_dir.join("storno.xml");
+        std::fs::write(&storno_xml_path, b"<?xml version=\"1.0\"?><InvoiceData/>")
+            .expect("write storno XML stub");
+
+        // Write the audit ledger: InvoiceDraftCreated for base + storno,
+        // and the InvoiceStornoIssued chain-link binding the two.
+        let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
+        let binary_hash = BinaryHash::from_bytes([0u8; 32]);
+        let actor = Actor::from_local_cli("sess".to_string(), "test-user");
+
+        {
+            let mut ledger =
+                Ledger::open(&db_path, tenant.clone(), binary_hash).expect("open ledger");
+            // Base draft.
+            let base_payload = serde_json::json!({
+                "invoice_id": base_invoice_id,
+                "line_count": 1,
+                "idempotency_key": IdempotencyKey::new().to_canonical_string(),
+                "nav_xml_path": base_xml_path.to_string_lossy(),
+            });
+            ledger
+                .append(
+                    EventKind::InvoiceDraftCreated,
+                    serde_json::to_vec(&base_payload).expect("encode base draft"),
+                    actor.clone(),
+                    None,
+                )
+                .expect("append base draft");
+            // Storno draft.
+            let storno_payload = serde_json::json!({
+                "invoice_id": storno_invoice_id,
+                "line_count": 1,
+                "idempotency_key": IdempotencyKey::new().to_canonical_string(),
+                "nav_xml_path": storno_xml_path.to_string_lossy(),
+            });
+            ledger
+                .append(
+                    EventKind::InvoiceDraftCreated,
+                    serde_json::to_vec(&storno_payload).expect("encode storno draft"),
+                    actor.clone(),
+                    None,
+                )
+                .expect("append storno draft");
+            // Chain link.
+            let chain_payload = audit_payloads::InvoiceStornoIssuedPayload::new(
+                storno_invoice_id,
+                42,
+                "rsv_01TESTRESERVATION00000",
+                IdempotencyKey::new(),
+                base_invoice_id,
+                41,
+                1,
+            );
+            ledger
+                .append(
+                    EventKind::InvoiceStornoIssued,
+                    chain_payload.to_bytes(),
+                    actor.clone(),
+                    None,
+                )
+                .expect("append chain link");
+        }
+
+        let state = AppState {
+            db_path: std::sync::Arc::new(db_path),
+            tenant,
+            binary_hash: crate::binary_hash::BinaryHashHandle::from_ready(binary_hash),
+            session_token: std::sync::Arc::new("test-token".to_string()),
+            secrets_cache: crate::secrets_cache::SecretsCache::empty(),
+            nav_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                NAV_POLL_DAEMON_CONCURRENCY,
+            )),
+            boot_state: std::sync::Arc::new(std::sync::RwLock::new(ServeBootState::Ready {
+                operator_login: "test-operator".to_string(),
+            })),
+        };
+
+        let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
+            .expect("S184 chain-walk must recover identity from base's input.json");
+        assert_eq!(
+            partner_id.as_deref(),
+            Some("ptn_01TESTBUYER000000000000000"),
+            "partner_id must round-trip from the BASE's input.json (storno inherits buyer)"
+        );
+        assert_eq!(
+            tax_number, "12345678-2-13",
+            "tax_number must round-trip from the BASE's input.json"
+        );
+
+        let _keep = test_dir; // hold the dir until the assertions land
+    }
+
+    /// S184 / Bug 2 pin — when the input.json is present on the queried
+    /// id itself (the base invoice case), no chain walk happens; the
+    /// resolver returns the base's own identity directly. Defence against
+    /// a regression that always chain-walks (the read path for issue-side
+    /// callers must stay O(audit-walk) NOT 2×O(audit-walk)).
+    #[test]
+    fn resolve_customer_identity_no_chain_walk_when_input_json_present() {
+        const TEST_TENANT: &str = "resolve_no_chain_walk_test";
+        let test_dir = std::env::temp_dir()
+            .join("aberp-s184-no-chain-walk")
+            .join(format!("{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&test_dir).expect("create test dir");
+        let db_path = test_dir.join("aberp.duckdb");
+        let issued_dir = test_dir.join("issued");
+        std::fs::create_dir_all(&issued_dir).expect("create issued dir");
+
+        let invoice_id = "inv_01TESTBASE0000000000000001";
+        let xml_path = issued_dir.join("base.xml");
+        std::fs::write(&xml_path, b"<?xml version=\"1.0\"?><InvoiceData/>")
+            .expect("write XML stub");
+        let input_json = serde_json::json!({
+            "supplier": {
+                "taxNumber": "24904362-2-41",
+                "name": "Aben Consulting Kft",
+                "address": {
+                    "countryCode": "HU",
+                    "postalCode": "1037",
+                    "city": "Budapest",
+                    "street": "Visszatérő köz 6"
+                }
+            },
+            "customer": {
+                "vatStatus": "Domestic",
+                "taxNumber": "98765432-2-13",
+                "name": "Direct Buyer Kft."
+            },
+            "lines": [{
+                "description": "Test",
+                "quantity": 1,
+                "unitPrice": 1000,
+                "vatRatePercent": 27
+            }],
+            "paymentMethod": "TRANSFER"
+        });
+        std::fs::write(
+            sibling_input_json_path(&xml_path),
+            serde_json::to_vec(&input_json).expect("encode input.json"),
+        )
+        .expect("write input.json");
+
+        let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
+        let binary_hash = BinaryHash::from_bytes([0u8; 32]);
+        let actor = Actor::from_local_cli("sess".to_string(), "test-user");
+        {
+            let mut ledger =
+                Ledger::open(&db_path, tenant.clone(), binary_hash).expect("open ledger");
+            let draft_payload = serde_json::json!({
+                "invoice_id": invoice_id,
+                "line_count": 1,
+                "idempotency_key": IdempotencyKey::new().to_canonical_string(),
+                "nav_xml_path": xml_path.to_string_lossy(),
+            });
+            ledger
+                .append(
+                    EventKind::InvoiceDraftCreated,
+                    serde_json::to_vec(&draft_payload).expect("encode draft"),
+                    actor.clone(),
+                    None,
+                )
+                .expect("append draft");
+        }
+
+        let state = AppState {
+            db_path: std::sync::Arc::new(db_path),
+            tenant,
+            binary_hash: crate::binary_hash::BinaryHashHandle::from_ready(binary_hash),
+            session_token: std::sync::Arc::new("test-token".to_string()),
+            secrets_cache: crate::secrets_cache::SecretsCache::empty(),
+            nav_poll_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                NAV_POLL_DAEMON_CONCURRENCY,
+            )),
+            boot_state: std::sync::Arc::new(std::sync::RwLock::new(ServeBootState::Ready {
+                operator_login: "test-operator".to_string(),
+            })),
+        };
+
+        let (partner_id, tax_number) = resolve_customer_identity(&state, invoice_id)
+            .expect("base id with input.json present must resolve directly");
+        assert_eq!(
+            partner_id, None,
+            "the fixture's customer has no partnerId — resolver must NOT fabricate one"
+        );
+        assert_eq!(tax_number, "98765432-2-13");
+
+        let _keep = test_dir;
     }
 }

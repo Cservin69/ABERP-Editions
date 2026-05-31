@@ -126,6 +126,15 @@ fn fixture_request_body(currency: aberp_billing::Currency) -> ModificationInvoic
         currency,
         modification_date: "2026-05-24".to_string(),
         series: None,
+        // S184 — the post-issue tail is FIRE-AND-FORGET; the
+        // precondition pin tests in this file fail BEFORE the spawn
+        // would fire (the modification_invoice_request errors on
+        // precondition before returning Ok). Pass `Some(false)` for
+        // defence in depth — if a future test fixture upgrades to a
+        // happy-path body, the auto-tail will not try to reach SMTP /
+        // NAV from the precondition-test surface.
+        email_buyer_on_modification: Some(false),
+        submit_to_nav_on_modification: Some(false),
     }
 }
 
