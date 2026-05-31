@@ -1646,14 +1646,16 @@ mod tests {
         // mutex defends against. If a future DuckDB upgrade flips
         // this to a UNIQUE violation, the assertion below will
         // fail loudly and the mutex's rationale can be revisited.
-        let second_result =
-            conn2.execute(insert_sql, duckdb::params!["apinv_second"]);
+        let second_result = conn2.execute(insert_sql, duckdb::params!["apinv_second"]);
         assert!(
             second_result.is_ok(),
             "QUIRK: same-process cross-connection INSERT with the same UNIQUE \
              key currently succeeds in DuckDB {}; if this assertion flips, \
              revisit `INGEST_SERIALIZER`'s rationale",
-            second_result.err().map(|e| format!("{e:?}")).unwrap_or_default(),
+            second_result
+                .err()
+                .map(|e| format!("{e:?}"))
+                .unwrap_or_default(),
         );
     }
 
