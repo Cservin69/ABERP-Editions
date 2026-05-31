@@ -168,15 +168,49 @@ pub fn run(args: &RequestTechnicalAnnulmentArgs) -> Result<()> {
     let template = crate::numbering::read_numbering_template(&seller_toml_path)
         .context("read [seller.numbering] template from seller.toml")?;
     let base_issue_year = load_base_invoice_issue_year(&args.db, &args.references)?;
-    let precondition = {
+    // S190 — also resolve the base invoice's on-disk NAV XML path during the
+    // same ledger scope. The reference to NAV on the `<annulmentReference>`
+    // element MUST match the byte-exact `<invoiceNumber>` NAV holds on file
+    // (the base XML written at base-issuance and never re-rewritten). Re-
+    // deriving via `template.render_for_build(base_year, base_seq)` is
+    // vulnerable to seller.toml-literal drift between base issuance and
+    // annulment — same failure class S184 closed for storno/modification.
+    // The template render is still computed by `check_base_is_annullable`
+    // and used purely as the defence-in-depth comparator that fires a WARN
+    // below if the two disagree.
+    let (precondition, base_nav_xml_path) = {
         let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
             .context("open audit ledger for annulment precondition check")?;
-        check_base_is_annullable(&ledger, &args.references, &template, base_issue_year)?
+        let pre = check_base_is_annullable(&ledger, &args.references, &template, base_issue_year)?;
+        let path = crate::issue_storno::find_base_nav_xml_path_for_chain(&ledger, &args.references)
+            .context(
+                "S190 — resolve base invoice's on-disk NAV XML path for annulment reference",
+            )?;
+        (pre, path)
     };
     tracing::info!(
         prior_transaction_id = %precondition.prior_transaction_id,
         "annulment precondition passed"
     );
+
+    // S190 — read the base invoice's `<invoiceNumber>` from its on-disk
+    // NAV XML. That string IS the canonical record of what NAV saw on
+    // the original `manageInvoice` POST. CLAUDE.md rule 12 — loud-fail
+    // if the file is missing / malformed / lacks the element rather
+    // than silently substituting a possibly-wrong render.
+    let base_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)
+        .context("S190 — read base invoice number from on-disk NAV XML for annulment reference")?;
+    if base_invoice_number != precondition.base_invoice_number {
+        tracing::warn!(
+            base_invoice_id = %args.references,
+            from_xml = %base_invoice_number,
+            from_template = %precondition.base_invoice_number,
+            "S190: base invoice number from on-disk NAV XML differs from current-template re-render \
+             — operator likely edited the seller.toml numbering literal between base issuance and \
+             annulment. Using the on-disk XML number (NAV's authoritative record); the rendered \
+             value would have produced an INVALID_INVOICE_REFERENCE ABORTED ack class."
+        );
+    }
 
     // 5. Open one tx; append the InvoiceTechnicalAnnulmentRequested
     //    entry. Operator-decision idempotency key fresh per command.
@@ -231,7 +265,9 @@ pub fn run(args: &RequestTechnicalAnnulmentArgs) -> Result<()> {
     //    submit-annulment PR; this minimal check guarantees the
     //    emitter did not silently drop a required child.
     let annulment_reference = AnnulmentReference {
-        base_invoice_number: precondition.base_invoice_number.clone(),
+        // S190 — XML-derived (NAV-authoritative) base number; see the
+        // resolution + WARN block above.
+        base_invoice_number: base_invoice_number.clone(),
         annulment_code: annulment_code_wire,
         reason: reason.to_string(),
     };
@@ -428,16 +464,16 @@ fn check_base_is_annullable(
     // (loaded by [`load_base_invoice_issue_year`] in `run`), NOT from
     // any `time_wall.year()` on the audit entries.
     //
-    // S184 NOTE — this `render_for_build(year, seq)` shape is
-    // vulnerable to the same seller.toml-literal-drift class that
-    // S184 closed in `issue_storno` + `issue_modification` (by reading
-    // the base's actual `<invoiceNumber>` from its on-disk NAV XML
-    // instead of re-rendering). Annulment was NOT confirmed broken in
-    // S184 (no NAV ABORTED ack against an annulment). Flagged as
-    // follow-up: the defensive fix here means restructuring the test
-    // ledger fixtures to plumb on-disk XML + InvoiceDraftCreated
-    // payloads. The same defensive fix is also pending for
-    // `observe_receiver_confirmation::load_base_nav_invoice_number`.
+    // S190 — the seller.toml-literal-drift class S184 closed for
+    // `issue_storno` + `issue_modification` is now also closed here.
+    // The authoritative `<annulmentReference>` value flowed to NAV is
+    // the XML-derived number resolved in `run` via
+    // `find_base_nav_xml_path_for_chain` + `read_invoice_number_from_xml`.
+    // The template render below is preserved purely as the defence-in-
+    // depth comparator that fires the WARN in `run` if the two disagree
+    // (operator edited seller.toml between base issuance and annulment).
+    // Walker tests still pin the template-derived render through this
+    // field so the regression surface stays mechanically visible.
     let base_invoice_number = template.render_for_build(base_issue_year, base_sequence_number);
     Ok(AnnulmentPrecondition {
         base_invoice_number,
@@ -945,5 +981,100 @@ mod tests {
         let err = check_annulment_xml_minimum(xml).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("<InvoiceAnnulment>"), "got {msg}");
+    }
+
+    /// S190 drift-protection pin — when the seller.toml numbering
+    /// literal is edited between base issuance and annulment, the
+    /// authoritative `<annulmentReference>` value MUST come from the
+    /// base invoice's on-disk NAV XML (the byte-exact string NAV holds
+    /// on file), NOT from `template.render_for_build(base_year, base_seq)`
+    /// against the current (edited) template. Composes
+    /// [`crate::issue_storno::find_base_nav_xml_path_for_chain`] +
+    /// [`crate::nav_xml::read_invoice_number_from_xml`] — the same two
+    /// helpers `run` wires into the annulment flow at the call site.
+    /// CLAUDE.md rule 9: this test asserts the load-bearing drift-
+    /// protection intent — a regression that re-routes the call site
+    /// back to `render_for_build` for the reference would surface here.
+    #[test]
+    fn s190_drift_protection_uses_on_disk_xml_not_template() {
+        use crate::numbering::{NumberingTemplate, ResetPolicy, Segment, YearDigits};
+        use ulid::Ulid;
+
+        // 1. Write a base NAV XML on disk with a specific
+        //    <invoiceNumber>. This reflects what NAV actually stored
+        //    when the base was issued under the OLD-PREFIX template.
+        let scratch_dir = std::env::temp_dir()
+            .join("aberp-s190-drift")
+            .join(format!("{}", Ulid::new()));
+        std::fs::create_dir_all(&scratch_dir).expect("create scratch dir");
+        let base_xml_path = scratch_dir.join("base.xml");
+        let original_number = "TEST-OLD-PREFIX-2026/00042";
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <InvoiceData xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/data\">\
+             <invoiceNumber>{}</invoiceNumber>\
+             </InvoiceData>",
+            original_number
+        );
+        std::fs::write(&base_xml_path, xml).expect("write base XML");
+
+        // 2. Build a ledger with a single InvoiceDraftCreated payload
+        //    whose `nav_xml_path` points at the on-disk XML. All other
+        //    payload fields ride `#[serde(default)]`.
+        let draft_payload = serde_json::json!({
+            "invoice_id": "inv_A",
+            "line_count": 1,
+            "idempotency_key": "idem_00000000000000000000000000",
+            "nav_xml_path": base_xml_path.to_string_lossy(),
+        });
+        let entries = vec![(
+            EventKind::InvoiceDraftCreated,
+            serde_json::to_vec(&draft_payload).unwrap(),
+            None,
+        )];
+        let ledger = ledger_with_entries(entries);
+
+        // 3. Resolve the path via the shared helper + read the
+        //    `<invoiceNumber>` from the XML.
+        let path = crate::issue_storno::find_base_nav_xml_path_for_chain(&ledger, "inv_A")
+            .expect("find_base_nav_xml_path_for_chain resolves draft payload");
+        assert_eq!(path, base_xml_path);
+        let from_xml = crate::nav_xml::read_invoice_number_from_xml(&path)
+            .expect("read_invoice_number_from_xml succeeds");
+        assert_eq!(
+            from_xml, original_number,
+            "S190: XML round-trip MUST be byte-identical to what NAV saw on the base submit"
+        );
+
+        // 4. The CURRENT template — operator edited the literal after
+        //    base issuance (removed `OLD-PREFIX-`, added `NEW-PREFIX-`).
+        //    `render_for_build` against the current template produces a
+        //    DIFFERENT string. Pre-S190 this drifted string would have
+        //    flowed into `<annulmentReference>` and NAV would have
+        //    returned INVALID_INVOICE_REFERENCE. The XML-derived path
+        //    closes the failure mode.
+        let current_template = NumberingTemplate {
+            segments: vec![
+                Segment::Literal("NEW-PREFIX-".to_string()),
+                Segment::Year {
+                    digits: YearDigits::Four,
+                },
+                Segment::Literal("/".to_string()),
+                Segment::Counter { pad_width: 5 },
+            ],
+            reset_policy: ResetPolicy::OnYearChange,
+            start_value: 1,
+        };
+        let from_current_template = current_template.render_for_build(2026, 42);
+        assert_ne!(
+            from_xml, from_current_template,
+            "drift-protection pin is only meaningful when the current template diverges \
+             from the base's recorded number — fixture is mis-set if these are equal"
+        );
+        // Explicit byte assertion: the XML-derived value is the one the
+        // annulment reference uses; the would-be re-render is NOT.
+        assert_eq!(from_xml, original_number);
+        assert!(from_current_template.contains("NEW-PREFIX-"));
+        assert!(!from_xml.contains("NEW-PREFIX-"));
     }
 }

@@ -186,10 +186,24 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
     //    invoice and steers the operator to run
     //    `aberp submit-annulment` first (CLAUDE.md rule 12).
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
-    let inputs = {
+    // S190 — also resolve the base invoice's on-disk NAV XML path
+    // during the same ledger scope. The `<invoiceNumber>` value flowed
+    // to NAV's `queryInvoiceData` MUST match the byte-exact string NAV
+    // holds on file; re-deriving via `template.render_for_build` would
+    // drift under any seller.toml literal edit between base issuance
+    // and the observe call. Same closure as `issue_storno` /
+    // `issue_modification` (S184) and `request_technical_annulment`
+    // (S190). See `load_base_nav_invoice_number` for the WARN
+    // comparator + on-disk XML read.
+    let (inputs, base_nav_xml_path) = {
         let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
             .context("open audit ledger for observe-receiver-confirmation lookup")?;
-        lookup_receiver_confirmation_inputs(&ledger, &args.invoice_id)?
+        let inputs = lookup_receiver_confirmation_inputs(&ledger, &args.invoice_id)?;
+        let path = crate::issue_storno::find_base_nav_xml_path_for_chain(&ledger, &args.invoice_id)
+            .context(
+                "S190 — resolve base invoice's on-disk NAV XML path for observe-receiver-confirmation",
+            )?;
+        (inputs, path)
     };
     tracing::info!(
         annulment_transaction_id = %inputs.annulment_transaction_id,
@@ -209,19 +223,19 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
     //    original emit) AND any operator-configured template
     //    (year/literal segments) is honoured.
     //
-    //    S184 NOTE — this render path is vulnerable to the same
-    //    seller.toml-literal-drift class that S184 closed in
-    //    `issue_storno` + `issue_modification` (by reading the base's
-    //    actual `<invoiceNumber>` from its on-disk NAV XML instead of
-    //    re-rendering). Observer was NOT confirmed broken in S184 (no
-    //    NAV-ABORTED ack against an observe call). Flagged as
-    //    follow-up alongside `request_technical_annulment`.
+    //    S190 — the drift class S184 closed for `issue_storno` +
+    //    `issue_modification` is now also closed here. The authoritative
+    //    `<invoiceNumber>` flowed to `queryInvoiceData` is the XML-derived
+    //    value read from the base invoice's on-disk NAV XML; the template
+    //    render is preserved purely as the defence-in-depth comparator
+    //    that fires a WARN on disagreement (operator edited seller.toml
+    //    between base issuance and the observe call).
     let seller_toml_path = crate::setup_seller_info::seller_toml_path_for_tenant(&args.tenant)
         .context("resolve seller.toml path for numbering template")?;
     let template = crate::numbering::read_numbering_template(&seller_toml_path)
         .context("read [seller.numbering] template from seller.toml")?;
     let (nav_invoice_number, base_sequence_number) =
-        load_base_nav_invoice_number(&args.db, &args.invoice_id, &template)?;
+        load_base_nav_invoice_number(&args.db, &args.invoice_id, &template, &base_nav_xml_path)?;
     tracing::info!(
         nav_invoice_number = %nav_invoice_number,
         base_sequence_number,
@@ -327,27 +341,27 @@ pub fn run(args: &ObserveReceiverConfirmationArgs) -> Result<()> {
     Ok(())
 }
 
-/// Open the billing store, load the base invoice's row, and render the
-/// NAV-facing invoice number via the operator-configured numbering
-/// template. Returns the rendered number + the bare sequence number
-/// (the latter is operator-visible in the summary line).
+/// Open the billing store, load the base invoice's row (for the
+/// operator-visible `base_sequence_number`), and read the NAV-facing
+/// invoice number from the base invoice's on-disk NAV XML. Returns
+/// the XML-derived number + the bare sequence number.
 ///
 /// S173 — pre-S173 this composed `"{series_code}/{seq:05}"` directly.
 /// That format silently dropped (a) the build-profile `TEST-` prefix
 /// on dev builds and (b) any operator-configured template segments.
-/// The render now goes through
-/// [`crate::numbering::NumberingTemplate::render_for_build`] using the
-/// base invoice's own `issue_date.year()` so a cross-year observe call
-/// still emits the original year.
 ///
-/// S184 NOTE — same drift caveat as
-/// `request_technical_annulment::check_base_is_annullable` (see that
-/// function's S184 NOTE). The defensive on-disk-XML read added in S184
-/// for `issue_storno` / `issue_modification` is pending here too.
+/// S190 — the rendered `<invoiceNumber>` now comes from the base's
+/// on-disk NAV XML (written at base-issuance and never re-rewritten),
+/// closing the seller.toml-literal-drift class that S184 closed for
+/// `issue_storno` + `issue_modification`. The template render is kept
+/// purely as the defence-in-depth comparator that fires a WARN on
+/// disagreement. Loud-fail (CLAUDE.md rule 12) if the on-disk XML is
+/// missing or malformed — no silent fallback.
 fn load_base_nav_invoice_number(
     db_path: &Path,
     invoice_id: &str,
     template: &crate::numbering::NumberingTemplate,
+    base_nav_xml_path: &Path,
 ) -> Result<(String, u64)> {
     let store = DuckDbBillingStore::open(db_path)
         .with_context(|| format!("open billing DuckDB at {}", db_path.display()))?;
@@ -371,9 +385,25 @@ fn load_base_nav_invoice_number(
         invoice
     };
 
-    let nav_invoice_number =
+    // S190 — read NAV invoice number from on-disk base XML
+    // (NAV-authoritative). Template render kept as WARN comparator only.
+    let from_xml = crate::nav_xml::read_invoice_number_from_xml(base_nav_xml_path).context(
+        "S190 — read base invoice number from on-disk NAV XML for observe-receiver-confirmation",
+    )?;
+    let from_template =
         template.render_for_build(base_invoice.issue_date.year(), base_invoice.sequence_number);
-    Ok((nav_invoice_number, base_invoice.sequence_number))
+    if from_xml != from_template {
+        tracing::warn!(
+            base_invoice_id = %invoice_id,
+            from_xml = %from_xml,
+            from_template = %from_template,
+            "S190: base invoice number from on-disk NAV XML differs from current-template re-render \
+             — operator likely edited the seller.toml numbering literal between base issuance and \
+             this observe call. Using the on-disk XML number (NAV's authoritative record); the \
+             rendered value would have caused queryInvoiceData to lookup the wrong invoice."
+        );
+    }
+    Ok((from_xml, base_invoice.sequence_number))
 }
 
 /// Walk the audit ledger and resolve the inputs for the
