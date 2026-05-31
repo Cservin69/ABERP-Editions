@@ -285,11 +285,36 @@
   // launch confirmation while `/health` reports it as required. Always
   // false on dev/test builds (the backend reports false there).
   let firstProdLaunchRequired = $derived(shouldShowFirstProdLaunchModal(healthInfo));
+
+  // PR-188 / session 188 — operator-supplied SPA wordmark. If
+  // `static/aberp-logo.png` is present at build time, Vite serves it at
+  // `/aberp-logo.png` and the `<img>` loads; if absent, `onerror` fires
+  // and we fall back to the original text wordmark. No build-time glob
+  // needed — the file lives in `publicDir`, which is outside the module
+  // graph, so runtime detection is the simplest pin. The text wordmark
+  // remains the screen-reader source of truth via the `<img alt>`.
+  let logoFailed = $state(false);
 </script>
 
 <div class="frame">
   <header class="topbar">
-    <h1 class="wordmark">ABERP</h1>
+    <!-- PR-188 / session 188 — operator-supplied SPA wordmark. The
+         `<h1>` is the screen-reader anchor either way; the visual is
+         the operator's logo when present, plain text when absent.
+         Detection is runtime (`<img onerror>`) — see the `logoFailed`
+         declaration in <script>. -->
+    <h1 class="wordmark">
+      {#if logoFailed}
+        ABERP
+      {:else}
+        <img
+          src="/aberp-logo.png"
+          alt="ABERP"
+          class="wordmark__img"
+          onerror={() => (logoFailed = true)}
+        />
+      {/if}
+    </h1>
     {#if viewMode === "ready"}
       <!-- PR-78 / session 101 — area-swap affordance per ADR-0041
            §3. When operating in the daily workflow, a small "⚙
@@ -680,6 +705,18 @@
     font-weight: 600;
     letter-spacing: 0.06em;
     color: var(--color-text-strong);
+  }
+
+  /* PR-188 / session 188 — operator-supplied SPA wordmark image. The
+   * source lives at `apps/aberp-ui/ui/static/aberp-logo.png` (served at
+   * `/aberp-logo.png`); operator's source is 200×144 so 32px tall ≈
+   * 44px wide — fits the topbar without redesign. `display: block`
+   * eliminates the inline baseline gap so the topbar stays roughly the
+   * same height as the text-only fallback. */
+  .wordmark__img {
+    display: block;
+    height: 32px;
+    width: auto;
   }
 
   .status {

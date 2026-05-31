@@ -1,0 +1,10 @@
+# PR-188 / session 188 — Vite `publicDir` for the SPA. Anything dropped
+# here is served at the SPA root (e.g. `aberp-logo.png` → `/aberp-logo.png`).
+# Convention is documented in the README under "Branding the SPA header".
+#
+# The directory MUST exist at build time (Vite reads it during `vite build`),
+# but the actual operator-supplied branding assets are private and MUST NOT
+# land in git. Track this `.gitignore` so the directory survives a clone;
+# ignore everything else.
+*
+!.gitignore

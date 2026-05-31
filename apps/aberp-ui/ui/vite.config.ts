@@ -8,6 +8,12 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 export default defineConfig({
   plugins: [svelte()],
   clearScreen: false,
+  // PR-188 / session 188 — operator-supplied SPA branding lives at
+  // `static/aberp-logo.png` and is served at the SPA root
+  // (`/aberp-logo.png`). We override Vite's default `public/` to
+  // `static/` so the dir name matches the SvelteKit convention the
+  // rest of the app docs use.
+  publicDir: "static",
   server: {
     port: 5173,
     strictPort: true,

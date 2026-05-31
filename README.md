@@ -100,6 +100,21 @@ No `seller.toml` knob, no UI upload yet, no DB column — pure
 filesystem convention. Re-export a different logo at the same path to
 switch.
 
+## Branding the SPA header (optional)
+
+Drop your logo at `apps/aberp-ui/ui/static/aberp-logo.png` *before*
+running `vite build` (or `cargo build --release --features production
+--bin aberp-ui`, which embeds the built SPA). Vite serves the file at
+`/aberp-logo.png`; the topbar wordmark swaps from the text "ABERP" to
+the image automatically. Sized at `height: 32px; width: auto` —
+~200×144 (the original mark) renders at ~44×32. Absent file → text-only
+wordmark, same as pre-PR-188.
+
+Convention only. The directory is tracked via a `.gitignore` that
+ignores everything but itself; the operator's branding asset is private
+and never lands in git. To override on a per-build basis, copy your
+file in and rebuild.
+
 ## Updating an existing prod install
 
 → **[`docs/CUTOVER_RUNBOOK.md` § Step 9](docs/CUTOVER_RUNBOOK.md)**
