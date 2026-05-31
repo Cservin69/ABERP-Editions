@@ -100,6 +100,47 @@ describe("invoice-list-persistence — round trip", () => {
       saveInvoiceListPrefs(DEFAULT_INVOICE_LIST_PREFS, throwingStorage as Storage),
     ).not.toThrow();
   });
+
+  // S192 — operator-visible recovery: after a quota-exceeded throw, a
+  // subsequent load against the SAME storage MUST surface the
+  // previously-persisted blob intact (NOT a half-written corrupted
+  // fragment, NOT the default). The helper's atomic `setItem(key, json)`
+  // posture is exactly the safety property this pin locks: a
+  // throw-on-write either succeeds wholesale or leaves the prior value
+  // alone — there is no partial write to recover from.
+  it("save throw leaves prior persisted value intact for subsequent load", () => {
+    // Prime the storage with a valid, fully-typed prior blob.
+    const storage = makeStorage();
+    const prior: InvoiceListPrefs = {
+      sort: { key: "fiscal_year", dir: "desc" },
+      filter: { needle: "ACME", state: "Finalized", currency: "HUF" },
+    };
+    saveInvoiceListPrefs(prior, storage);
+    expect(loadInvoiceListPrefs(storage)).toEqual(prior);
+
+    // Now attempt a save against a storage stub whose `setItem`
+    // throws (the localStorage-full / private-browsing failure
+    // mode). The shim DELEGATES the `getItem` half to the same
+    // backing map, so the load-side of the contract still sees the
+    // prior good value — modelling the real-browser DOMException
+    // posture where a quota throw leaves the keyed slot untouched.
+    const next: InvoiceListPrefs = {
+      sort: { key: "total", dir: "asc" },
+      filter: { needle: "X", state: "All", currency: "EUR" },
+    };
+    const throwingShim: Storage = {
+      ...storage,
+      setItem(_k: string, _v: string): void {
+        throw new Error("DOMException: quota exceeded");
+      },
+    };
+    expect(() => saveInvoiceListPrefs(next, throwingShim)).not.toThrow();
+
+    // Subsequent load via the ORIGINAL non-throwing storage handle
+    // returns the prior good value — the throw never half-overwrote
+    // the JSON blob with corrupted bytes.
+    expect(loadInvoiceListPrefs(storage)).toEqual(prior);
+  });
 });
 
 describe("invoice-list-persistence — closed-vocab discipline", () => {

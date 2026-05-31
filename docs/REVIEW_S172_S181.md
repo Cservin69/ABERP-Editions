@@ -293,36 +293,134 @@ template configured — confirm none does and it stays 🟡.
 - **S172** — no test for what happens when notes contain a literal `\n`
   (multi-line textarea content). Behavior is well-defined (preserved through
   serde) but pinning it prevents future trim-line-feeds-aggressively regressions.
+  > **ADDRESSED-BY-PR-192.** New test
+  > `multiline_notes_preserve_internal_newlines_through_serde_round_trip` in
+  > `apps/aberp/src/notes_history.rs` writes a draft with `"Line 1\nLine 2"`
+  > and asserts the internal `\n` survives the JSON serialize → store →
+  > deserialize → return-via-`list_notes_history` round trip. The trim path
+  > only touches leading/trailing whitespace; embedded newlines are
+  > load-bearing for buyer-facing multi-line notes (HU bookkeeping uses two-
+  > line "Számla / Megjegyzés" blocks).
 - **S172** — no test for the exact 50-entry limit boundary: if 51 unique notes
   exist and the operator requests `limit=50`, do we get the 50 most-recent
   including the boundary case? Manual reading says yes; pin would lock it.
+  > **ADDRESSED-BY-PR-192.** New test
+  > `limit_boundary_returns_fifty_newest_from_fifty_one_unique_notes` writes
+  > 51 distinct notes (`note-00` … `note-50`) and asserts
+  > `list_notes_history(..., DEFAULT_LIMIT=50)` returns exactly the 50
+  > newest entries in reverse-sequence order (`note-50` → `note-01`,
+  > `note-00` elided).
 - **S174** — `InvoiceLineFields.svelte` is used by Modify but NOT by Issue
   (intentional, documented). No HTML-output snapshot test pins that Modify's
   rendered DOM matches Issue's for the common subset of fields, so a future
   drift won't surface until the operator notices.
+  > **FLAGGED-AND-SKIPPED-BY-PR-192.** The SPA's vitest setup has no jsdom
+  > layer and no `@testing-library/svelte` dev-dep — the existing 23
+  > `*.test.ts` files are pure logic pins, never component-mount snapshots.
+  > Adding HTML-parity coverage requires standing up new SPA test
+  > infrastructure (jsdom + Svelte mount runtime + snapshot tooling), which
+  > the PR-192 brief explicitly excludes ("if any 🟢 item turns out to
+  > require a substantial refactor to make testable, flag and skip").
 - **S175** — no test for a localStorage quota-exceeded write path (the helper
   has the catch + warn, but no test that asserts the catch fires and the
   operator-visible state stays consistent post-throw).
+  > **ADDRESSED-BY-PR-192.** New test
+  > `save_throw_leaves_prior_persisted_value_intact_for_subsequent_load` in
+  > `apps/aberp-ui/ui/src/lib/invoice-list-persistence.test.ts` extends the
+  > existing "no rethrow" pin: it primes the storage with a valid prefs
+  > blob, then attempts a save against a throw-on-`setItem` storage stub,
+  > then re-loads from the original storage and asserts the prior value is
+  > intact (the throw never half-wrote a corrupt JSON fragment over the
+  > prior good blob — the existing helper's atomic `setItem(key, json)`
+  > posture is exactly the safety property this pin locks).
 - **S176** — no test for a PNG with extreme aspect ratio (e.g., 1×10000 strip)
   to confirm the 50×50-pt placement matrix doesn't divide-by-zero or scale to
   invisible.
+  > **ADDRESSED-BY-PR-192.** Two pins land:
+  > (1) `decodes_extreme_aspect_ratio_1xN_strip` synthesises a 1×1024 PNG
+  > (just under the per-axis cap) and confirms `from_png_bytes` returns
+  > `width=1, height=1024, rgb_bytes.len() == 1·1024·3` — no panic, no
+  > divide-by-zero, no truncation.
+  > (2) `place_logo_extreme_aspect_does_not_divide_by_zero_or_scale_below_one_pixel`
+  > tests the placement-matrix path that
+  > `crate::lib::place_logo` runs: extreme 1×N and N×1 logos produce a
+  > finite, non-zero scale factor. The helper's `.max(1)` guard on
+  > `logo.width`/`logo.height` and the `box_side/dim` ratio both stay finite
+  > at the dimension cap — pinned via a small `compute_logo_placement`
+  > extracted helper that mirrors the production formula.
 - **S177** — no test for the race condition between concurrent `find_existing_id` +
   INSERT (the bug flagged above). A unit test with two tokio tasks would catch
   the regression after a fix.
+  > **ADDRESSED-BY-PR-186.** Pinned by
+  > `concurrent_ingest_holds_no_error_one_row_id_consistent` in
+  > `apps/aberp/src/incoming_invoices.rs` — four threads racing on the same
+  > `(tenant, supplier_tax, nav_invoice_number)` triple all succeed (no
+  > 500 from a tamper-detected audit chain), exactly one row exists, and
+  > every caller's returned id equals the surviving row's id. Companion
+  > pin `duckdb_unique_constraint_does_not_fire_across_two_connections_documented_quirk`
+  > documents the DuckDB quirk PR-186 works around. PR-192: noted as
+  > already-done, no new test needed.
 - **S177** — `transition_allowed` is unit-tested, but no integration test at the
   HTTP layer pins that `POST /mark-irrelevant` on a `Paid` row returns a 400
   with `InvalidTransition`. A future route-vs-graph drift would slip through.
+  > **FLAGGED-AND-SKIPPED-BY-PR-192.** The project's documented testing
+  > posture (`apps/aberp/tests/serve_partners_route.rs:23-27`) is that "the
+  > full HTTP status-code mapping (400 / 404 / 200 / 204) is structural —
+  > axum's `(Status, Json(...)).into_response()` builds the response from
+  > the typed value; pinning the response bytes themselves would couple the
+  > test to axum's private response shape per CLAUDE.md rule 2." The
+  > existing `paid_to_irrelevant_is_rejected` test
+  > (`apps/aberp/src/incoming_invoices.rs:1453`) pins the library helper
+  > returning `StatusChangeError::InvalidTransition`; the route's match arm
+  > at `serve.rs:6980-6987` mapping it to `BAD_REQUEST` is structural axum
+  > code. Adding HTTP-layer coverage would introduce a new
+  > `tower::ServiceExt::oneshot` test infrastructure inconsistent with the
+  > project's pattern; the brief excludes "substantial refactor to make
+  > testable."
 - **S178** — no test for the parser's behaviour when NAV returns
   `available_page = 0` with non-empty `<invoiceDigest>` children (malformed but
   not impossible — defensive coverage is cheap).
+  > **ADDRESSED-BY-PR-192.** New test
+  > `parse_digest_page_accepts_available_page_zero_with_non_empty_digests`
+  > in `crates/nav-transport/src/operations/query_invoice_digest.rs` feeds
+  > a `<availablePage>0</availablePage>` response with two `<invoiceDigest>`
+  > children and asserts the parser returns both rows + `available_page=0`
+  > verbatim — no schema-drift loud-fail, no silent row drop. The caller's
+  > `page >= available_page` pagination terminator at `ap_sync.rs:363`
+  > handles the absurd shape correctly (terminates immediately after page 1
+  > since `1 >= 0`).
 - **S178** — no test for `compute_date_window` underflow at the epoch lower
   bound (the `?` on `checked_sub` is unreachable in practice but documented
   as a possible error path).
+  > **ADDRESSED-BY-PR-192.** New test
+  > `compute_date_window_loud_fails_on_underflow_at_date_min` in
+  > `apps/aberp/src/ap_sync.rs` calls `compute_date_window` with
+  > `Date::MIN` as the `now_utc` date. The `?-`propagated underflow
+  > surfaces as the expected `"date underflow computing AP sync window"`
+  > error, pinning the loud-fail contract for the unreachable-in-practice
+  > but documented edge.
 - **S180** — no test for the partial-commit-then-chain-verify-failure recovery
   path. The fix-flow: row + audit committed, chain-verify fails, error
   returned, operator re-runs, second run should detect the prior entry and
   skip. Unit test against a tampered ledger would prove the recovery loop.
+  > **ADDRESSED-BY-PR-192.** New test
+  > `process_digest_re_run_recovers_via_cache_when_prior_commit_landed`
+  > in `apps/aberp/src/restore_from_nav_outgoing.rs` simulates the
+  > recovery flow explicitly: cycle 1 writes row + audit; cycle 2 invokes
+  > `load_already_restored_cache` (which uses `entries()` — NOT
+  > `verify_chain` — so a hypothetical chain-verify failure between cycles
+  > cannot block recovery), then re-runs `process_digest` on the same
+  > digest and asserts `ProcessOutcome::Skipped` with no duplicate row or
+  > audit entry. The companion `load_already_restored_cache_hydrates_from_prior_ledger_entries`
+  > pin shipped with PR-186; this pin distinguishes the recovery scenario
+  > by name and adds the assertion that cache loading is independent of
+  > the chain-verify state.
 - **S180** — no test for NYE-UTC-vs-CET boundary on `validate_year`.
+  > **ADDRESSED-BY-PR-183.** Pinned by
+  > `validate_year_nye_budapest_accepts_local_year` and
+  > `month_window_december_covers_nye_budapest_invoice` in
+  > `apps/aberp/src/restore_from_nav_outgoing.rs`. PR-192: noted as
+  > already-done, no new test needed.
 
 ## 💭 Architectural questions for Ervin
 

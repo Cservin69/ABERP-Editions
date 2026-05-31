@@ -333,6 +333,51 @@ mod tests {
         );
     }
 
+    /// S192 — extreme aspect ratio (1×N strip). PR-182 review's S176
+    /// 🟢 named this as a gap: no test confirmed the decoder + the
+    /// placement-matrix code path stayed sane for a single-pixel-wide
+    /// vertical strip. The PR-185 dimension cap (`MAX_LOGO_DIMENSION`,
+    /// 4096) bounds N; a 1×1024 fixture sits well under that and
+    /// exercises the `chunks_exact(...)` paths for grayscale + the
+    /// `(width as usize).saturating_mul(height as usize)` length-check
+    /// without tripping the cap.
+    ///
+    /// The companion placement-matrix pin lives in
+    /// `crates/invoice-pdf/src/lib.rs` (`place_logo` is module-private);
+    /// this test focuses on the decoder contract: extreme aspect ratios
+    /// decode without panic, divide-by-zero, or buffer-size mismatch.
+    #[test]
+    fn decodes_extreme_aspect_ratio_1xn_strip() {
+        // 1 wide × 1024 tall grayscale strip. The aspect ratio (1:1024)
+        // is two orders of magnitude beyond any sane operator-supplied
+        // logo; this is the defensive surface for a corrupted file
+        // whose header is nonetheless structurally honest.
+        let png = synth_png(1, 1024, png::ColorType::Grayscale, &[128]);
+        let logo = TenantLogo::from_png_bytes(&png).expect("decode 1×1024 strip");
+        assert_eq!(logo.width, 1);
+        assert_eq!(logo.height, 1024);
+        assert_eq!(
+            logo.rgb_bytes.len(),
+            1 * 1024 * 3,
+            "1×1024 grayscale must expand to 3 bytes per pixel"
+        );
+        // Pixel sanity — every byte is the source grayscale value
+        // (no rogue zero-fill from a buffer-size off-by-one).
+        assert!(
+            logo.rgb_bytes.iter().all(|&b| b == 128),
+            "every byte must round-trip the source grayscale value"
+        );
+
+        // The opposite axis — 1024×1 horizontal strip — must also
+        // decode cleanly. Exercises the same expand-grayscale path
+        // but with width/height swapped.
+        let png_h = synth_png(1024, 1, png::ColorType::Grayscale, &[200]);
+        let logo_h = TenantLogo::from_png_bytes(&png_h).expect("decode 1024×1 strip");
+        assert_eq!(logo_h.width, 1024);
+        assert_eq!(logo_h.height, 1);
+        assert_eq!(logo_h.rgb_bytes.len(), 1024 * 1 * 3);
+    }
+
     #[test]
     fn composite_over_white_helper_matches_formula() {
         // Pin a few canonical points so the integer rounding stays

@@ -490,4 +490,87 @@ mod tests {
             vec!["áfa-mentes".to_string(), "ÁFA-mentes".to_string()]
         );
     }
+
+    /// S192 — multi-line notes (textarea content with embedded `\n`)
+    /// MUST round-trip through serde + the dedupe trim path verbatim.
+    /// The HU bookkeeping workflow uses two-line `"Számla\nMegjegyzés"`
+    /// blocks; an over-eager `trim()` that stripped internal newlines
+    /// would silently flatten the typeahead's output to a single line
+    /// and the operator would lose visibility into pre-typed multi-
+    /// line notes. The PR-172 trim path only touches leading/trailing
+    /// whitespace via `str::trim`, but a future "normalise whitespace"
+    /// refactor could regress this — this pin makes the embedded-`\n`
+    /// preservation contract load-bearing.
+    #[test]
+    fn multiline_notes_preserve_internal_newlines_through_serde_round_trip() {
+        let (mut ledger, actor) = fixture_ledger();
+        // Three notes that share leading/trailing whitespace (the trim
+        // path strips this) but carry internal `\n` (the trim path
+        // MUST leave it alone).
+        let note_a = "  Köszönjük\na megrendelést  ";
+        let note_b = "Garancia: 1 év\nHelyszíni átadás";
+        let note_c = "Áthozat\n2. oldal\n3. oldal";
+        write_draft_with_notes(&mut ledger, &actor, "inv_001", Some(note_a), vec![]);
+        write_draft_with_notes(&mut ledger, &actor, "inv_002", Some(note_b), vec![]);
+        write_draft_with_notes(&mut ledger, &actor, "inv_003", Some(note_c), vec![]);
+
+        let out = list_notes_history(&ledger, NotesHistoryScope::Invoice, DEFAULT_LIMIT).unwrap();
+        // Most-recent first; internal newlines preserved; only the
+        // outer whitespace on note_a is trimmed.
+        assert_eq!(
+            out,
+            vec![
+                "Áthozat\n2. oldal\n3. oldal".to_string(),
+                "Garancia: 1 év\nHelyszíni átadás".to_string(),
+                "Köszönjük\na megrendelést".to_string(),
+            ]
+        );
+        // Defence pin: every returned note contains at least one `\n`
+        // (the multi-line shape survived end-to-end).
+        for s in &out {
+            assert!(
+                s.contains('\n'),
+                "embedded newline lost from notes-history scan: {s:?}"
+            );
+        }
+    }
+
+    /// S192 — exact boundary pin on `DEFAULT_LIMIT = 50`. With 51
+    /// unique notes in the ledger, a `limit=50` call MUST return
+    /// exactly 50 entries — the 50 newest in reverse-sequence order
+    /// (`note-50` → `note-01`), with the oldest (`note-00`) elided.
+    /// Pre-PR-172 reading suggested this was correct; pinning closes
+    /// a future off-by-one regression (e.g., a `<` vs `<=` flip in the
+    /// `if out.len() >= limit` guards in `list_notes_history` /
+    /// `try_collect`).
+    #[test]
+    fn limit_boundary_returns_fifty_newest_from_fifty_one_unique_notes() {
+        let (mut ledger, actor) = fixture_ledger();
+        // 51 distinct invoices, each with a unique invoice_note.
+        for i in 0..51 {
+            let note = format!("note-{i:02}");
+            write_draft_with_notes(
+                &mut ledger,
+                &actor,
+                &format!("inv_{i:03}"),
+                Some(&note),
+                vec![],
+            );
+        }
+
+        let out = list_notes_history(&ledger, NotesHistoryScope::Invoice, DEFAULT_LIMIT).unwrap();
+        assert_eq!(
+            out.len(),
+            DEFAULT_LIMIT,
+            "fifty entries (the closed boundary at limit=50)"
+        );
+        // Most-recent first → first element is note-50, last is note-01.
+        assert_eq!(out.first().map(String::as_str), Some("note-50"));
+        assert_eq!(out.last().map(String::as_str), Some("note-01"));
+        // The oldest entry MUST be elided.
+        assert!(
+            !out.iter().any(|s| s == "note-00"),
+            "the 51st-oldest note must be dropped at the limit boundary"
+        );
+    }
 }

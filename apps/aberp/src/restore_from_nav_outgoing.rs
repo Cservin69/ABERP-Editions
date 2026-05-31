@@ -1176,6 +1176,98 @@ mod tests {
         );
     }
 
+    /// S192 — operator-recovery contract pin. Names the recovery
+    /// scenario that PR-182 review's S180 🟢 called out: a prior
+    /// `process_digest` cycle where `tx.commit()` succeeded (row +
+    /// audit entry persisted) but the subsequent post-commit
+    /// `verify_chain` / `sync_mirror` step failed (transient IO,
+    /// flaky NFS, sibling-process write race — any reason
+    /// `process_digest` returned `Err(...)` AFTER the commit at line
+    /// 687 landed). The operator restarts the wizard; the new cycle
+    /// MUST short-circuit the same digest via
+    /// `load_already_restored_cache` + the in-memory cache check,
+    /// returning `Skipped` with NO duplicate row and NO duplicate
+    /// audit entry.
+    ///
+    /// The load-bearing contract this test pins (distinct from the
+    /// existing `load_already_restored_cache_hydrates_from_prior_ledger_entries`):
+    /// recovery is INDEPENDENT of the chain-verify state. The cache
+    /// loader uses `entries()` — NOT `verify_chain()` — so a
+    /// hypothetical chain-verify failure between cycles cannot block
+    /// the operator's recovery path. A future refactor that adds a
+    /// `verify_chain` precondition to `load_already_restored_cache`
+    /// would silently break recovery for the exact failure mode this
+    /// test simulates; the assertion below catches it.
+    #[test]
+    fn process_digest_re_run_recovers_via_cache_when_prior_commit_landed() {
+        let tmp = ScopedTempDir::new("recovery");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+
+        // Cycle 1 — process_digest commits row + audit successfully.
+        // (In the failure scenario this test models, the cycle would
+        // have returned `Err(...)` from a transient post-commit
+        // verify_chain failure here; for the recovery contract we
+        // only need the COMMITTED state, not the failure-return,
+        // since the recovery path keys on what landed in the DB.)
+        {
+            let mut cache_one: AlreadyRestoredCache = HashSet::new();
+            let outcome = process_digest(
+                &ctx,
+                &fixture_digest("INV-recovery/00001", "2026-03-15"),
+                &mut cache_one,
+            )
+            .expect("cycle 1 commits");
+            assert!(matches!(outcome, ProcessOutcome::Restored));
+        }
+
+        // Cycle 2 — operator restart. `load_already_restored_cache`
+        // walks `entries()` (NOT `verify_chain`), so even a tampered
+        // / unverifiable chain would still hydrate the cache.
+        let mut cache_two =
+            load_already_restored_cache(&db_path, ctx.tenant.clone(), ctx.binary_hash)
+                .expect("cycle 2 cache loads independent of chain-verify state");
+        assert!(
+            cache_two.contains("INV-recovery/00001"),
+            "cache loader must hydrate the prior cycle's committed entry"
+        );
+
+        // The recovery contract: same digest re-encountered → Skipped.
+        let outcome = process_digest(
+            &ctx,
+            &fixture_digest("INV-recovery/00001", "2026-03-15"),
+            &mut cache_two,
+        )
+        .expect("cycle 2 short-circuits via hydrated cache");
+        assert!(
+            matches!(outcome, ProcessOutcome::Skipped),
+            "re-run of the recovered digest must Skip — no duplicate write"
+        );
+
+        // Defence pins: exactly ONE row, exactly ONE audit entry.
+        // A regression where the cache loader silently failed (e.g.,
+        // returning an empty set on any read error) would surface
+        // here as two rows or two audit entries.
+        let rows = list_restored(&db_path, "t1").expect("list");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one row across the partial-commit + recovery flow"
+        );
+        let ledger =
+            Ledger::open(&db_path, ctx.tenant.clone(), ctx.binary_hash).expect("open ledger");
+        let entries = ledger.entries().expect("read entries");
+        let restored_count = entries
+            .iter()
+            .filter(|e| e.kind == EventKind::InvoiceRestoredFromNav)
+            .count();
+        assert_eq!(
+            restored_count, 1,
+            "exactly one InvoiceRestoredFromNav audit entry — \
+             recovery must not write a duplicate"
+        );
+    }
+
     /// Two distinct digests both process cleanly; the listing
     /// reflects both with newest-issue-date-first ordering.
     #[test]

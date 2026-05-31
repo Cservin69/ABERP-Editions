@@ -673,6 +673,34 @@ mod tests {
         assert_eq!(from, "2026-04-30");
     }
 
+    /// S192 — `checked_sub` underflow surfaces as a typed loud-fail.
+    /// PR-182 review's S178 🟢 flagged the `?` on
+    /// `today.checked_sub(time::Duration::days(WINDOW_DAYS))` as a
+    /// possible error path unreachable in practice but undocumented.
+    /// At `time::Date::MIN`, subtracting 30 days underflows the
+    /// representable date range, so the helper MUST surface the
+    /// `"date underflow computing AP sync window"` anyhow error
+    /// rather than silently clamping or panicking.
+    ///
+    /// CLAUDE.md rule 12 — loud-fail on unreachable-in-practice paths
+    /// is the load-bearing contract: a future calendar-math refactor
+    /// that swaps `checked_sub` for plain `-` would panic, and pinning
+    /// the typed-error path forces the regressor to look at this test.
+    #[test]
+    fn compute_date_window_loud_fails_on_underflow_at_date_min() {
+        // Build an OffsetDateTime whose `.date()` is exactly Date::MIN
+        // (the lower bound of the `time` crate's representable range).
+        // The 30-day subtraction is guaranteed to underflow.
+        let now =
+            time::PrimitiveDateTime::new(time::Date::MIN, time::Time::from_hms(0, 0, 0).unwrap())
+                .assume_utc();
+        let err = compute_date_window(now).expect_err("Date::MIN - 30 days must underflow");
+        assert!(
+            format!("{err:#}").contains("date underflow"),
+            "underflow must surface as the documented loud-fail message; got: {err:#}"
+        );
+    }
+
     #[test]
     fn cycle_trigger_audit_strings_are_closed_vocab() {
         assert_eq!(CycleTrigger::Daemon.as_audit_str(), "daemon");

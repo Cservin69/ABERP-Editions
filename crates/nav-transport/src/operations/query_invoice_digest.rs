@@ -806,4 +806,73 @@ mod tests {
             NavTransportError::QueryInvoiceDigestResponseParse(_)
         ));
     }
+
+    /// S192 — defensive-tolerance pin against a NAV response that
+    /// carries an `<availablePage>0</availablePage>` AND non-empty
+    /// `<invoiceDigest>` children. The XSD doesn't actually forbid
+    /// this combination (the scalars are independent of digest count),
+    /// and a corrupt-but-structurally-honest response from a NAV bug
+    /// or an upstream proxy could surface this shape. PR-182 review's
+    /// S178 🟢 named this as defensive coverage — silently dropping
+    /// the digests OR loud-failing the whole batch would both be wrong.
+    /// The contract pinned here: surface BOTH the absurd scalar AND
+    /// the digest rows verbatim. The pagination terminator at
+    /// `apps/aberp/src/ap_sync.rs:363` (`if page >= available_page`)
+    /// stops the daemon cleanly after page 1 since `1 >= 0`.
+    #[test]
+    fn parse_digest_page_accepts_available_page_zero_with_non_empty_digests() {
+        // Plain `&str` rather than `br#"..."#` — supplier names carry
+        // accented HU characters (Á/é) which are non-ASCII and cannot
+        // appear in raw byte-string literals. `.as_bytes()` at the
+        // call site keeps the parser surface unchanged.
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<QueryInvoiceDigestResponse xmlns="http://schemas.nav.gov.hu/OSA/3.0/api"
+                            xmlns:common="http://schemas.nav.gov.hu/NTCA/1.0/common">
+  <common:result>
+    <common:funcCode>OK</common:funcCode>
+  </common:result>
+  <invoiceDigestResult>
+    <currentPage>1</currentPage>
+    <availablePage>0</availablePage>
+    <availableLine>2</availableLine>
+    <invoiceDigest>
+      <invoiceNumber>SUP-ABSURD/0001</invoiceNumber>
+      <supplierTaxNumber>12345678</supplierTaxNumber>
+      <supplierName>Példa Kft.</supplierName>
+      <invoiceIssueDate>2026-05-15</invoiceIssueDate>
+      <currency>HUF</currency>
+    </invoiceDigest>
+    <invoiceDigest>
+      <invoiceNumber>SUP-ABSURD/0002</invoiceNumber>
+      <supplierTaxNumber>87654321</supplierTaxNumber>
+      <supplierName>Másik Bt.</supplierName>
+      <invoiceIssueDate>2026-05-16</invoiceIssueDate>
+      <currency>EUR</currency>
+    </invoiceDigest>
+  </invoiceDigestResult>
+</QueryInvoiceDigestResponse>"#
+            .as_bytes();
+        let page = parse_digest_page(body)
+            .expect("availablePage=0 with non-empty digests must parse permissively");
+        // Scalar surfaces verbatim — no silent re-clamping to ≥1.
+        assert_eq!(page.available_page, 0);
+        assert_eq!(page.current_page, 1);
+        assert_eq!(page.available_line, 2);
+        // BOTH digest rows survive — no silent drop on the absurd scalar.
+        assert_eq!(page.digests.len(), 2);
+        assert_eq!(page.digests[0].invoice_number, "SUP-ABSURD/0001");
+        assert_eq!(page.digests[1].invoice_number, "SUP-ABSURD/0002");
+        // The daemon's continuation gate (`page >= available_page`)
+        // terminates on the very first tick when `available_page=0`,
+        // so this absurd shape is effectively a one-page result. Pin
+        // the gate's evaluation here so a future refactor that flips
+        // `>=` to `>` does not silently spin the daemon forever.
+        let current_page: u32 = page.current_page;
+        let available_page: u32 = page.available_page;
+        assert!(
+            current_page >= available_page,
+            "daemon's continuation gate must terminate on availablePage=0; \
+             current_page={current_page}, available_page={available_page}"
+        );
+    }
 }

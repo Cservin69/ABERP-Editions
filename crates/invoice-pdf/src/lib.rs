@@ -1224,4 +1224,112 @@ mod tests {
             );
         }
     }
+
+    /// S192 — extreme-aspect-ratio placement pin. PR-182 review's S176
+    /// 🟢 named the concern: a 1×N (or N×1) PNG must NOT make the
+    /// `place_logo` matrix divide by zero, produce NaN/Inf scale
+    /// factors, or scale the draw rectangle to literal zero pixels.
+    ///
+    /// The math: with `LOGO_BOX_SIDE = 50`, a 1×1024 strip yields
+    /// `scale = min(50/1, 50/1024) = 50/1024 ≈ 0.0488`, so
+    /// `draw_w = 1 · 0.0488 ≈ 0.0488 pt`, `draw_h = 1024 · 0.0488 = 50 pt`.
+    /// Effectively invisible but mathematically well-defined. The
+    /// `.max(1)` guard at line 1006-1007 covers the (impossible-after-
+    /// PR-185-dimension-cap) 0×N degenerate case; pin both legs here so
+    /// a future refactor that drops the guard fails loudly.
+    #[test]
+    fn place_logo_extreme_aspect_does_not_divide_by_zero_or_scale_below_one_pixel() {
+        // Helper: inspect the `cm a b c d e f` operator that
+        // `place_logo` emits and recover (draw_w, draw_h) from
+        // positions (0, 3). The unit-square XObject maps directly into
+        // this rectangle, so non-zero finite values are the contract.
+        fn draw_dims(logo: &TenantLogo) -> (f32, f32) {
+            let mut ops: Vec<Operation> = Vec::new();
+            place_logo(&mut ops, logo, "Im0");
+            let cm = ops
+                .iter()
+                .find(|op| op.operator == "cm")
+                .expect("place_logo must emit a `cm` op");
+            let read = |idx: usize| -> f32 {
+                match cm.operands.get(idx) {
+                    Some(Object::Real(v)) => *v,
+                    other => panic!("cm operand {idx} must be Real, got {other:?}"),
+                }
+            };
+            (read(0), read(3))
+        }
+
+        // 1×1024 strip — tall sliver. draw_h saturates the box,
+        // draw_w shrinks below 1pt but stays positive + finite.
+        let tall = TenantLogo {
+            width: 1,
+            height: 1024,
+            rgb_bytes: vec![0u8; 1 * 1024 * 3],
+        };
+        let (draw_w, draw_h) = draw_dims(&tall);
+        assert!(
+            draw_w.is_finite() && draw_h.is_finite(),
+            "extreme-aspect placement must produce finite scale factors; got ({draw_w}, {draw_h})"
+        );
+        assert!(
+            draw_w > 0.0,
+            "draw_w must be > 0 for a 1×N strip; got {draw_w}"
+        );
+        assert!(
+            draw_h > 0.0,
+            "draw_h must be > 0 for a 1×N strip; got {draw_h}"
+        );
+        let box_side = LOGO_BOX_SIDE as f32;
+        // draw_h saturates the box (the long axis); draw_w fits within.
+        assert!(
+            (draw_h - box_side).abs() < 1e-3,
+            "tall strip must saturate the box vertically; got draw_h={draw_h}, box_side={box_side}"
+        );
+        assert!(
+            draw_w < draw_h,
+            "tall strip must be narrower than tall after aspect-preserving fit; got ({draw_w}, {draw_h})"
+        );
+
+        // 1024×1 strip — wide sliver. Same contract on the swapped
+        // axis: draw_w saturates the box; draw_h shrinks below 1pt
+        // but stays positive + finite.
+        let wide = TenantLogo {
+            width: 1024,
+            height: 1,
+            rgb_bytes: vec![0u8; 1024 * 1 * 3],
+        };
+        let (draw_w_h, draw_h_h) = draw_dims(&wide);
+        assert!(
+            draw_w_h.is_finite() && draw_h_h.is_finite(),
+            "wide-strip placement must produce finite scale factors; got ({draw_w_h}, {draw_h_h})"
+        );
+        assert!(draw_w_h > 0.0 && draw_h_h > 0.0);
+        assert!(
+            (draw_w_h - box_side).abs() < 1e-3,
+            "wide strip must saturate the box horizontally; got draw_w={draw_w_h}"
+        );
+        assert!(draw_h_h < draw_w_h);
+
+        // Degenerate-headers defence: the `.max(1)` guard at the top
+        // of place_logo ensures even a pathological 0×0 logo (which
+        // the PR-185 dimension/decoder caps already rule out at
+        // decode time) does not divide by zero — pin the surviving
+        // contract here so a future refactor that drops the guard
+        // fails loudly.
+        let zero = TenantLogo {
+            width: 0,
+            height: 0,
+            rgb_bytes: Vec::new(),
+        };
+        let (draw_w_z, draw_h_z) = draw_dims(&zero);
+        assert!(
+            draw_w_z.is_finite() && draw_h_z.is_finite(),
+            "0×0 logo must not produce NaN/Inf via the .max(1) guard; got ({draw_w_z}, {draw_h_z})"
+        );
+        assert_eq!(
+            draw_w_z, box_side,
+            "0×0 logo's effective 1×1 (post-`.max(1)`) saturates the box on both axes"
+        );
+        assert_eq!(draw_h_z, box_side);
+    }
 }
