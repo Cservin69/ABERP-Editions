@@ -12,6 +12,7 @@ dependencies = [
  "aberp-mnb-rates",
  "aberp-nav-transport",
  "aberp-nav-xsd-validator",
+ "aberp-quote-intake",
  "aberp-verify",
  "anyhow",
  "async-trait",
@@ -133,6 +134,25 @@ version = "0.0.0"
 dependencies = [
  "quick-xml 0.36.2",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "aberp-quote-intake"
+version = "0.0.0"
+dependencies = [
+ "aberp-audit-ledger",
+ "aberp-billing",
+ "duckdb",
+ "reqwest 0.13.3",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tracing",
+ "ulid",
+ "zeroize",
 ]
 
 [[package]]

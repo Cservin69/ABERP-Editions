@@ -1,0 +1,33 @@
+[package]
+name = "aberp-quote-intake"
+description = "Pulls approved quotes from a sister storefront (ABERP-site) and stages them as pending intake rows for the operator to pick up (S210 / PR-204, Stage 2 entry point per ADR-0056 / [[aberp-versioning-policy]])."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_quote_intake"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zeroize = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+aberp-audit-ledger = { path = "../audit-ledger" }
+aberp-billing = { path = "../../modules/billing" }
+duckdb = { workspace = true }
+time = { workspace = true }
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+zeroize = { workspace = true }

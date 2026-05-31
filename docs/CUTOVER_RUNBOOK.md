@@ -880,6 +880,96 @@ without restoring the bit).
 
 ---
 
+## Step 10 — (Optional, opt-in) Enable the quote-intake daemon (S210 / PR-204)
+
+The quote-intake daemon polls a sister storefront (ABERP-site) for
+**approved quotes** and stages them as pending operator-pickup rows
+in `quote_intake_log`. Disabled by default — set
+`ABERP_QUOTE_INTAKE_ENABLED=true` to opt in.
+
+**S210 ships the backend infrastructure only.** The operator-facing
+SPA queue + tenant-settings UI land in S211; the version bump to
+`PROD_v2.0.0` lands in S212. Until then this step is OPTIONAL and
+operator-pickup of staged rows is via a future SPA route.
+
+### When to enable
+
+- You run a sister storefront (`ABERP-site`) and want approved
+  quotes to flow into ABERP as pre-prepared invoice drafts.
+- You're ready to operate the queue by hand pending S211.
+
+### Configuration
+
+```bash
+# In the prod shell that launches `aberp serve` (e.g. `run_prod.sh`'s env):
+export ABERP_QUOTE_INTAKE_ENABLED=true
+export ABERP_QUOTE_INTAKE_URL=https://aberp-site.example.com   # NO trailing slash
+export ABERP_QUOTE_INTAKE_TOKEN=<matches ABERP-site's ABERP_SITE_ADMIN_TOKEN>
+# Optional — default 60s; clamped to [10, 3600]:
+export ABERP_QUOTE_INTAKE_INTERVAL_SECS=300
+```
+
+**Refuse-to-start contract.** Setting `ENABLED=true` without `URL`
+AND `TOKEN` causes the next `aberp serve` boot to abort loud. That's
+intentional per the trust posture (`[[trust-code-not-operator]]` in
+the auto-memory) — better than silently polling a wrong URL.
+
+### What it writes
+
+- One row per fresh quote into the per-tenant `quote_intake_log`
+  DuckDB table (`quote_id` PRIMARY KEY → idempotent on the same
+  quote).
+- One `system.quote_intake_poll_completed` audit-ledger entry per
+  CYCLE that saw work (fetched > 0, or any failure). No-op cycles
+  are silent in the audit chain; the daemon's `info!` log line still
+  reports them.
+
+### What it does NOT do
+
+- Does NOT touch the canonical `invoice` table. Sequence-burn stays
+  operator-gated.
+- Does NOT log the bearer token.
+- Does NOT copy CAD files into ABERP. Files stay on ABERP-site.
+
+### Verifying it's running
+
+After enabling + relaunching `aberp serve`, look for one of these
+two log lines in the boot output:
+
+- `spawning quote-intake daemon (S210 / PR-204) cadence_secs=…`
+  — daemon is up.
+- `quote-intake daemon disabled (ABERP_QUOTE_INTAKE_ENABLED not 'true'); skipping spawn`
+  — daemon is dormant.
+
+Once running, every cycle emits a single `info!` log line:
+`quote-intake cycle complete fetched=… created=… skipped=… …`.
+
+### Disabling
+
+Unset (or set to anything other than `true`) the
+`ABERP_QUOTE_INTAKE_ENABLED` env and relaunch. The DuckDB table
+stays put; you can drop it manually if no longer needed.
+
+### Dev-only reset recipe (NOT for prod)
+
+Per the `[[dev-db-disposable]]` memory the dev DB is disposable. To
+re-process every approved quote in a dev environment:
+
+```sql
+DROP TABLE quote_intake_log;
+```
+
+The next cycle re-ingests everything; writeback is idempotent on
+the ABERP-site side (`writeQuoteAtomic` always overwrites + appends
+to `status_history`).
+
+**Never run this on a prod tenant.** The prod `quote_intake_log` is
+the audit trail of which quotes the daemon ingested and when; the
+operator-pickup SPA (S211) reads it. Dropping it loses the
+operator's pickup queue.
+
+---
+
 ## Appendix A — File and keychain inventory
 
 What lives where after a successful cutover:
@@ -898,6 +988,7 @@ What lives where after a successful cutover:
 | DuckDB table: `invoice` (+ related billing rows) | issue / storno / modification (ADR-0019) | tenant-lifetime |
 | DuckDB table: `ap_invoice` | AP module mirror (S177); status changes audit-logged via `IncomingInvoiceStatusChanged` (ADR-0054) | tenant-lifetime |
 | DuckDB table: `restored_invoice` | NAV-as-DR restore mirror (S180); segregated from canonical `invoice` table per ADR-0019 no-FK / named-table convention | tenant-lifetime |
+| DuckDB table: `quote_intake_log` | Sister-service quote-intake staging (S210 / PR-204); operator pickup surface lands in S211 | tenant-lifetime |
 | macOS keychain: `aberp.nav.prod` / `nav_credentials_blob` | SPA NAV creds wizard (S133) | tenant-lifetime |
 | macOS keychain: `aberp.smtp.prod` / `smtp_password` | SPA Tenant Settings → SMTP PUT (PR-92) | tenant-lifetime |
 | macOS keychain: `aberp.nav.prod` / `session_token` | serve at boot | per-binary-build |

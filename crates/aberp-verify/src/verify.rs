@@ -782,7 +782,11 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // payload (v1 is digest-only). A future v2 that calls
         // queryInvoiceData per row could pin XML bytes on disk; today
         // the verifier mirrors the bundle writer's no-bytes posture.
-        | EventKind::InvoiceRestoredFromNav => (None, ""),
+        | EventKind::InvoiceRestoredFromNav
+        // S210 / PR-204 — quote-intake daemon cycle event.
+        // `system.`-scoped; the payload is poll telemetry, not NAV
+        // XML bytes. Same no-bytes posture as the other system kinds.
+        | EventKind::QuoteIntakePollCompleted => (None, ""),
     };
 
     Ok(NavExtraction {

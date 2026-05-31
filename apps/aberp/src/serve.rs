@@ -131,6 +131,9 @@ use crate::smtp_config::{self as smtp_config_mod, SmtpConfig, SmtpSecurity};
 use crate::smtp_credentials;
 use crate::submit_invoice;
 use crate::upgrade_snapshot;
+use aberp_quote_intake::{
+    service::QuoteIntakeDeps, QuoteIntakeConfig, QuoteIntakeError, QuoteIntakeService,
+};
 use async_trait::async_trait;
 
 /// Default keychain service-name prefix for the session token (one per
@@ -990,6 +993,65 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 })
                 .await;
             });
+        }
+
+        // S210 / PR-204 — quote-intake daemon. Opt-in via the
+        // `ABERP_QUOTE_INTAKE_ENABLED=true` env var. When disabled the
+        // crate is dormant and this spawn-block is a no-op log line.
+        // When `ENABLED=true` but URL/TOKEN is missing or malformed,
+        // refuse-to-start surface returns the config error loud here
+        // — fail the serve boot rather than spawn a daemon that polls
+        // a wrong URL forever. Per [[trust-code-not-operator]] and
+        // brief §8.
+        {
+            let st = recovery_state.clone();
+            match QuoteIntakeConfig::from_env() {
+                Ok(cfg) => {
+                    let operator_login = match st.boot_state.read() {
+                        Ok(guard) => match &*guard {
+                            ServeBootState::Ready { operator_login } => operator_login.clone(),
+                            _ => "boot".to_string(),
+                        },
+                        Err(_) => "boot".to_string(),
+                    };
+                    let binary_hash = st
+                        .binary_hash
+                        .wait()
+                        .context("await background binary hash for quote-intake daemon")?;
+                    let deps = QuoteIntakeDeps {
+                        db_path: (*st.db_path).clone(),
+                        tenant: st.tenant.clone(),
+                        binary_hash,
+                        operator_login,
+                        default_currency: Currency::Huf,
+                    };
+                    match QuoteIntakeService::new(cfg, deps) {
+                        Ok(service) => {
+                            tracing::info!(
+                                cadence_secs = service.poll_interval().as_secs(),
+                                "spawning quote-intake daemon (S210 / PR-204)"
+                            );
+                            tokio::spawn(async move {
+                                service.run_daemon_forever().await;
+                            });
+                        }
+                        Err(e) => {
+                            return Err(anyhow!(
+                                "quote-intake daemon refused to start: {e:#}"
+                            ));
+                        }
+                    }
+                }
+                Err(QuoteIntakeError::Disabled) => {
+                    tracing::info!(
+                        "quote-intake daemon disabled \
+                         (ABERP_QUOTE_INTAKE_ENABLED not 'true'); skipping spawn"
+                    );
+                }
+                Err(e) => {
+                    return Err(anyhow!("quote-intake config error: {e:#}"));
+                }
+            }
         }
 
         let config = RustlsConfig::from_der(rustls_config.0, rustls_config.1)

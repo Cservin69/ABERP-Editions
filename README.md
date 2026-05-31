@@ -152,6 +152,7 @@ ABERP/
     nav-transport/     ← NAV TLS transport + credentials (ADR-0009 §4, ADR-0020)
     nav-xsd-validator/ ← <InvoiceData> v3.0 runtime invariant check (ADR-0022)
     aberp-verify/      ← external-auditor evidence-bundle verifier
+    aberp-quote-intake/ ← sister-service quote-poll daemon (S210 — Stage 2 entry)
   modules/
     billing/           ← NAV invoice issuing (ADR-0009)
   apps/

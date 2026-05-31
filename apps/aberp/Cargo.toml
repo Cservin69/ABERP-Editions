@@ -63,6 +63,13 @@ async-trait = { workspace = true }
 # the on-disk NAV XML + the per-tenant seller.toml and calls
 # `aberp_invoice_pdf::render_invoice` for the PDF bytes.
 aberp-invoice-pdf = { path = "../../crates/invoice-pdf" }
+# S210 / PR-204 — quote-intake daemon (sister-service poll over a
+# bearer-authed HTTP API, stages approved quotes as pending
+# operator-pickup rows in `quote_intake_log`). Opt-in via the
+# `ABERP_QUOTE_INTAKE_ENABLED=true` env var; when disabled the crate
+# is dormant. Per [[aberp-versioning-policy]] this is the first
+# Stage 2 module landing.
+aberp-quote-intake = { path = "../../crates/aberp-quote-intake" }
 # PR-44γ — decimal arithmetic for the EUR→HUF round-half-even
 # conversion at the CLI boundary (the `aberp-billing` module is the
 # arithmetic owner; the binary needs the type for the

@@ -714,6 +714,36 @@ pub enum EventKind {
     ///
     /// F12 four-edit ritual fires once.
     InvoiceRestoredFromNav,
+
+    /// S210 / PR-204 — the quote-intake daemon (sister-service poll
+    /// over a bearer-authed HTTP API) completed one cycle. ONE
+    /// entry per CYCLE (not per fetched quote); the per-quote
+    /// staging into `quote_intake_log` is the queryable read-side
+    /// for which quotes were ingested when, and the operator pickup
+    /// (S211) emits the canonical `InvoiceDraftCreated` audit row
+    /// when the staged draft is actually issued through the
+    /// allocator.
+    ///
+    /// Payload (`aberp_quote_intake::QuoteIntakePollPayload`)
+    /// carries the idempotency key, cycle trigger (`"daemon"` /
+    /// `"manual"`), counts (`fetched` / `created` /
+    /// `skipped_duplicate` / `writeback_failed` / `failed`),
+    /// `elapsed_ms`, and an optional `error` field when the cycle
+    /// aborted early (transport failure, 401, 503).
+    ///
+    /// Audit-emission policy (per S210 brief §7): the cycle entry
+    /// is written ONLY when something happened — `fetched > 0`,
+    /// `writeback_failed > 0`, OR `error.is_some()`. Pure-zero
+    /// no-op cycles are silent to keep the audit chain from
+    /// drowning in 1/minute "saw 0 quotes" noise. The brief calls
+    /// this out explicitly; the per-cycle log line at `info!` still
+    /// carries the summary for ops visibility.
+    ///
+    /// Same `system.` prefix posture as the other operator-
+    /// triggered background events — the per-OUTGOING-invoice
+    /// export bundle's `invoice.*` glob MUST NEVER sweep this.
+    /// F12 four-edit ritual fires once.
+    QuoteIntakePollCompleted,
 }
 
 impl EventKind {
@@ -755,6 +785,7 @@ impl EventKind {
                 "system.incoming_invoice_sync_cycle_completed"
             }
             EventKind::InvoiceRestoredFromNav => "system.invoice_restored_from_nav",
+            EventKind::QuoteIntakePollCompleted => "system.quote_intake_poll_completed",
         }
     }
 
@@ -807,6 +838,7 @@ impl EventKind {
                 Ok(EventKind::IncomingInvoiceSyncCycleCompleted)
             }
             "system.invoice_restored_from_nav" => Ok(EventKind::InvoiceRestoredFromNav),
+            "system.quote_intake_poll_completed" => Ok(EventKind::QuoteIntakePollCompleted),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -853,6 +885,7 @@ mod tests {
             EventKind::IncomingInvoiceStatusChanged,
             EventKind::IncomingInvoiceSyncCycleCompleted,
             EventKind::InvoiceRestoredFromNav,
+            EventKind::QuoteIntakePollCompleted,
         ];
         for v in variants {
             let s = v.as_str();
@@ -1424,6 +1457,40 @@ mod tests {
         assert_ne!(
             EventKind::InvoiceRestoredFromNav.as_str(),
             EventKind::IncomingInvoiceSyncCycleCompleted.as_str()
+        );
+    }
+
+    /// S210 / PR-204 — quote-intake daemon cycle event. `system.`-
+    /// prefixed so the per-OUTGOING-invoice export bundle's
+    /// `invoice.*` glob NEVER sweeps a quote-intake cycle row (the
+    /// quote-intake daemon is a sister-service poll, NOT an
+    /// invoice-lifecycle event).
+    #[test]
+    fn s210_quote_intake_poll_completed_uses_system_prefix() {
+        assert_eq!(
+            EventKind::QuoteIntakePollCompleted.as_str(),
+            "system.quote_intake_poll_completed"
+        );
+        assert!(EventKind::QuoteIntakePollCompleted
+            .as_str()
+            .starts_with("system."));
+        assert!(!EventKind::QuoteIntakePollCompleted
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// S210 / PR-204 — distinct discriminator from every prior
+    /// background-cycle kind. Same fork-discipline posture as the
+    /// other `*_is_distinct_from` tests.
+    #[test]
+    fn s210_quote_intake_poll_completed_is_distinct() {
+        assert_ne!(
+            EventKind::QuoteIntakePollCompleted.as_str(),
+            EventKind::IncomingInvoiceSyncCycleCompleted.as_str()
+        );
+        assert_ne!(
+            EventKind::QuoteIntakePollCompleted.as_str(),
+            EventKind::InvoiceRestoredFromNav.as_str()
         );
     }
 }

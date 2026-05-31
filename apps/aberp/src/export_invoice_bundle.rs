@@ -662,7 +662,12 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // bundle. v1 is digest-only — no verbatim NAV XML rides the
         // payload; the typed digest fields (invoice_number, totals,
         // issue_date, currency, transaction_id) live in chain.jsonl.
-        | EventKind::InvoiceRestoredFromNav => None,
+        | EventKind::InvoiceRestoredFromNav
+        // S210 / PR-204 — quote-intake daemon cycle completion event.
+        // `system.`-scoped — never sweeps a per-outgoing-invoice
+        // bundle. The payload carries cycle counts + cadence telemetry,
+        // not NAV bytes.
+        | EventKind::QuoteIntakePollCompleted => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
