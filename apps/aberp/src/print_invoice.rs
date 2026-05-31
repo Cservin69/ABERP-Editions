@@ -205,6 +205,16 @@ pub fn render_to_bytes(
     let tenant_logo = load_tenant_logo(&seller_toml_path)
         .with_context(|| format!("load tenant logo for {tenant} (PR-176)"))?;
 
+    // S195 / PR-195 — load the optional brand primary colour from
+    // `[seller.branding] primary_color` in `seller.toml`. Same posture
+    // as the tenant logo: legal-document rendering must never be
+    // blocked by a branding asset, so a malformed hex string downgrades
+    // to a `tracing::warn!` + `None` (the pre-PR-195 ADR-0044 palette
+    // is the silent default). An I/O error on the read still
+    // propagates — that's a real configuration failure the operator
+    // wants to know about, not a branding-asset noise case.
+    let brand_primary_color = load_brand_primary_color(&seller_toml_path)?;
+
     // PR-86 / session-111 — read the per-invoice bank snapshot stamped
     // at issuance (PR-73 / ADR-0040 §addendum-C). For invoices issued
     // after PR-73, this is the regulatory record of WHICH bank
@@ -302,6 +312,10 @@ pub fn render_to_bytes(
         note: invoice_notes.invoice_note,
         // PR-176 — optional tenant-logo for the printed header.
         tenant_logo,
+        // S195 / PR-195 — optional brand colour applied to the title
+        // under-rule, table-header rule, and totals banner. `None`
+        // keeps the pre-PR-195 silver/gold palette byte-for-byte.
+        brand_primary_color,
     };
 
     // 7. Render.
@@ -1242,6 +1256,46 @@ fn load_tenant_logo(seller_toml_path: &Path) -> Result<Option<TenantLogo>> {
                 error = %e,
                 "tenant logo PNG decode failed — falling back to text-only header. \
                  | A címer PNG dekódolása sikertelen — csak szöveges fejléc."
+            );
+            Ok(None)
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S195 / PR-195 — brand primary-colour read
+// ──────────────────────────────────────────────────────────────────────
+
+/// S195 / PR-195 — read the optional `[seller.branding] primary_color`
+/// from `seller.toml`, parse it via
+/// [`crate::branding_config::parse_color_hex`], and return the renderer-
+/// shaped `(f32, f32, f32)` RGB or `None`.
+///
+/// Failure-handling matches [`load_tenant_logo`]'s "legal document must
+/// not be blocked by a branding asset" posture:
+///   - **Missing section** → `Ok(None)` — the default-palette path.
+///   - **Section present, value missing** → `Ok(None)` — same.
+///   - **Malformed hex string** → `tracing::warn!` + `Ok(None)`. The
+///     operator sees the WARN line on the next look at the log and
+///     can fix the file; meanwhile the PDF renders with the pre-PR-195
+///     ADR-0044 palette.
+///   - **I/O failure on the read** → propagated as `Err(...)`. That's a
+///     real configuration problem (file unreadable, permissions
+///     broken) — distinct from "branding asset malformed".
+fn load_brand_primary_color(seller_toml_path: &Path) -> Result<Option<(f32, f32, f32)>> {
+    let cfg = match crate::branding_config::read_branding_config(seller_toml_path)? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    match crate::branding_config::parse_color_hex(&cfg.primary_color) {
+        Some(rgb) => Ok(Some(rgb)),
+        None => {
+            tracing::warn!(
+                seller_toml = %seller_toml_path.display(),
+                primary_color = %cfg.primary_color,
+                "malformed [seller.branding] primary_color — falling back to default palette. \
+                 Expected #RRGGBB or #RRGGBBAA. \
+                 | A márka-szín formátuma érvénytelen — alapértelmezett paletta marad."
             );
             Ok(None)
         }

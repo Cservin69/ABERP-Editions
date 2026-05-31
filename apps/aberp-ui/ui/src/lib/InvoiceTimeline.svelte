@@ -40,7 +40,11 @@
         <div class="timeline-body">
           <div class="timeline-head">
             <span class="timeline-label">{node.label_html_safe}</span>
-            <time class="timeline-time mono" datetime={node.ts_iso}>
+            <time
+              class="timeline-time mono"
+              datetime={node.ts_iso}
+              title={node.ts_absolute}
+            >
               {node.ts_display}
             </time>
           </div>

@@ -59,6 +59,20 @@ pub struct InvoiceModel {
     /// and shifts the title cluster right by the box width + small
     /// gap when present.
     pub tenant_logo: Option<TenantLogo>,
+    /// PR-195 / S195 — optional operator-supplied brand color. When
+    /// `Some`, the renderer substitutes this RGB for the silver
+    /// title under-rule, the silver table-header rule, AND the gold
+    /// totals-banner rule. When `None`, every rule renders in the
+    /// pre-PR-195 ADR-0044 palette byte-for-byte. Convention-based:
+    /// the orchestrator parses `~/.aberp/<tenant>/seller.toml`'s
+    /// `[seller.branding] primary_color` via
+    /// [`aberp::branding_config::parse_color_hex`], passes the
+    /// result through here; a malformed hex string falls back to
+    /// `None` at the orchestrator (legal-document render must never
+    /// be blocked by a branding asset — same posture as PR-185 logo
+    /// handling). Encoded as `(f32, f32, f32)` RGB in 0..=1, matching
+    /// the renderer's internal `Color` alias.
+    pub brand_primary_color: Option<(f32, f32, f32)>,
 }
 
 /// Seller or buyer party data. Bank fields are SELLER-only; for the

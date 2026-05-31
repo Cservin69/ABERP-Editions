@@ -307,11 +307,19 @@ fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel, logo_xobject_name: Option<
     text(ops, "FB", 28, title_x, MARGIN_TOP - 14, "Számla");
     text(ops, "F1", 18, title_x, MARGIN_TOP - 38, &m.invoice_number);
 
-    // Title under-rule — silver. Spans the full printable width whether
-    // a logo is present or not (the rule's role is to separate the
-    // header band from the party block below, NOT to underline the
-    // title cluster). (Gold is reserved for the banner.)
-    silver_rule(ops, MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP - 58);
+    // Title under-rule — structural. Spans the full printable width
+    // whether a logo is present or not (the rule's role is to separate
+    // the header band from the party block below, NOT to underline the
+    // title cluster). Under default (no brand-override) silver-grey
+    // per ADR-0044; S195 — when `m.brand_primary_color` is `Some` the
+    // operator's brand colour substitutes here.
+    structural_rule(
+        ops,
+        MARGIN_LEFT,
+        MARGIN_RIGHT,
+        MARGIN_TOP - 58,
+        m.brand_primary_color,
+    );
 
     // Two-column party block.
     let party_top = MARGIN_TOP - 78;
@@ -357,7 +365,13 @@ fn layout(ops: &mut Vec<Operation>, m: &InvoiceModel, logo_xobject_name: Option<
     // PR-85 — the single gold accent in the document lives here.
     let invoice_gross_minor: i64 = m.lines.iter().map(|l| l.gross_minor).sum();
     let banner_y = dates_top - 44;
-    gold_rule(ops, MARGIN_LEFT, MARGIN_RIGHT, banner_y + 22);
+    accent_rule(
+        ops,
+        MARGIN_LEFT,
+        MARGIN_RIGHT,
+        banner_y + 22,
+        m.brand_primary_color,
+    );
     let banner_label = "FIZETENDŐ BRUTTÓ VÉGÖSSZEG:";
     let banner_amount = format::money(m.currency, invoice_gross_minor);
     text_right_in(
@@ -543,7 +557,16 @@ fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i6
         "BRUTTÓ ÁR",
         MUTED,
     );
-    silver_rule(ops, MARGIN_LEFT, MARGIN_RIGHT, top - 6);
+    // Table-header rule — structural. S195 — brand-overridable
+    // (substitutes the column-header underline so the operator's
+    // brand colour anchors the table cluster).
+    structural_rule(
+        ops,
+        MARGIN_LEFT,
+        MARGIN_RIGHT,
+        top - 6,
+        m.brand_primary_color,
+    );
 
     // Body rows.
     let mut y = top - 22;
@@ -933,15 +956,45 @@ fn text_right_in(
 
 /// Emit a horizontal rule between `(x_left, y)` and `(x_right, y)` in
 /// `SILVER_LINE` colour. Default structural rule across the document
-/// (title under-rule, table header rule, table footer rule).
+/// (table footer rule — the one structural rule that stays silver
+/// even under a brand-override per S195's "preserve visual hierarchy"
+/// posture).
 fn silver_rule(ops: &mut Vec<Operation>, x_left: i64, x_right: i64, y: i64) {
     horizontal_rule(ops, x_left, x_right, y, SILVER_LINE, RULE_WEIGHT_SILVER);
 }
 
+/// S195 / PR-195 — brand-overridable variant of [`silver_rule`].
+/// Used for the title under-rule and the table-header rule, both of
+/// which carry the document's "structural emphasis" role per the
+/// reference template. When `brand` is `Some`, the operator's
+/// `[seller.branding] primary_color` substitutes for the pre-PR-195
+/// silver; `None` is byte-for-byte identical to [`silver_rule`].
+/// Stroke weight stays at `RULE_WEIGHT_SILVER` regardless — only the
+/// colour is brand-substituted, the weight hierarchy (heavier gold
+/// for the totals banner, lighter silver for everything else) is
+/// preserved per ADR-0044.
+fn structural_rule(
+    ops: &mut Vec<Operation>,
+    x_left: i64,
+    x_right: i64,
+    y: i64,
+    brand: Option<Color>,
+) {
+    let color = brand.unwrap_or(SILVER_LINE);
+    horizontal_rule(ops, x_left, x_right, y, color, RULE_WEIGHT_SILVER);
+}
+
 /// Emit a horizontal rule in `GOLD_ACCENT` colour. Used in exactly
 /// one place per ADR-0044: the rule above the totals banner.
-fn gold_rule(ops: &mut Vec<Operation>, x_left: i64, x_right: i64, y: i64) {
-    horizontal_rule(ops, x_left, x_right, y, GOLD_ACCENT, RULE_WEIGHT_GOLD);
+///
+/// S195 / PR-195 — when `brand` is `Some`, the operator's
+/// `[seller.branding] primary_color` substitutes for the gold accent.
+/// The stroke weight stays at `RULE_WEIGHT_GOLD` (heavier than the
+/// structural rules) so the totals banner keeps its visual weight
+/// even when the document's two accent slots collapse to one colour.
+fn accent_rule(ops: &mut Vec<Operation>, x_left: i64, x_right: i64, y: i64, brand: Option<Color>) {
+    let color = brand.unwrap_or(GOLD_ACCENT);
+    horizontal_rule(ops, x_left, x_right, y, color, RULE_WEIGHT_GOLD);
 }
 
 /// Underlying rule emitter — sets stroke colour + stroke weight,
@@ -1331,5 +1384,165 @@ mod tests {
             "0×0 logo's effective 1×1 (post-`.max(1)`) saturates the box on both axes"
         );
         assert_eq!(draw_h_z, box_side);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // S195 / PR-195 — brand primary-colour pins
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Minimal `InvoiceModel` for rule-color pins below — one HUF line,
+    /// no logo, no notes. Lets the per-test `brand_primary_color` setter
+    /// stay as the only varying input across the pin pair.
+    fn pin_model_with_brand(brand: Option<(f32, f32, f32)>) -> InvoiceModel {
+        use rust_decimal::Decimal;
+        use time::macros::date;
+        InvoiceModel {
+            invoice_number: "PIN-2026-1".to_string(),
+            issue_date: date!(2026 - 05 - 31),
+            fulfillment_date: date!(2026 - 05 - 31),
+            payment_due_date: date!(2026 - 06 - 07),
+            payment_method: "Átutalás".to_string(),
+            currency: Currency::Huf,
+            rate_metadata: None,
+            supplier: PartyInfo {
+                name: "Eladó Kft".to_string(),
+                address_lines: vec!["HU".to_string(), "1011 Budapest".to_string()],
+                tax_number: "12345678-2-13".to_string(),
+                bank_account_number: None,
+                iban: None,
+                bank_name: None,
+                swift_bic: None,
+            },
+            customer: PartyInfo {
+                name: "Vevő Kft".to_string(),
+                address_lines: vec!["HU".to_string(), "1052 Budapest".to_string()],
+                tax_number: "87654321-2-13".to_string(),
+                bank_account_number: None,
+                iban: None,
+                bank_name: None,
+                swift_bic: None,
+            },
+            lines: vec![LineItem {
+                description: "Tanácsadás".to_string(),
+                quantity: Decimal::from(1),
+                unit: "db".to_string(),
+                unit_price_minor: 100_000,
+                net_minor: 100_000,
+                vat_rate_percent: 27,
+                vat_minor: 27_000,
+                gross_minor: 127_000,
+                performance_period: None,
+                note: None,
+            }],
+            note: None,
+            tenant_logo: None,
+            brand_primary_color: brand,
+        }
+    }
+
+    /// Recover every `RG` (stroke-color) operand triple emitted into
+    /// `ops` — every `horizontal_rule` call pushes one. The order in
+    /// the returned vec matches the document's top-to-bottom render
+    /// order because `layout()` emits the title under-rule first, then
+    /// the totals banner, then table rules. Test helper for the brand
+    /// substitution pins below.
+    fn stroke_color_triples(ops: &[Operation]) -> Vec<(f32, f32, f32)> {
+        ops.iter()
+            .filter(|op| op.operator == "RG")
+            .map(|op| {
+                let r = match op.operands.first() {
+                    Some(Object::Real(v)) => *v,
+                    _ => f32::NAN,
+                };
+                let g = match op.operands.get(1) {
+                    Some(Object::Real(v)) => *v,
+                    _ => f32::NAN,
+                };
+                let b = match op.operands.get(2) {
+                    Some(Object::Real(v)) => *v,
+                    _ => f32::NAN,
+                };
+                (r, g, b)
+            })
+            .collect()
+    }
+
+    /// S195 — when `brand_primary_color` is `None`, the renderer
+    /// emits the pre-PR-195 palette byte-for-byte: title under-rule
+    /// silver, totals banner gold, table header rule silver, table
+    /// footer rule silver. Zero-impact for every tenant that has not
+    /// opted in to a custom brand colour.
+    #[test]
+    fn brand_primary_none_keeps_default_silver_gold_palette() {
+        let mut ops: Vec<Operation> = Vec::new();
+        layout(&mut ops, &pin_model_with_brand(None), None);
+        let strokes = stroke_color_triples(&ops);
+        assert!(
+            strokes.contains(&SILVER_LINE),
+            "default render must emit at least one SILVER_LINE rule; got {strokes:?}"
+        );
+        assert!(
+            strokes.contains(&GOLD_ACCENT),
+            "default render must emit the GOLD_ACCENT rule above the totals banner; got {strokes:?}"
+        );
+        // Conversely — no arbitrary other RGB should leak in.
+        for s in &strokes {
+            assert!(
+                *s == SILVER_LINE || *s == GOLD_ACCENT,
+                "default render must use only SILVER_LINE / GOLD_ACCENT for rules; got {s:?}"
+            );
+        }
+    }
+
+    /// S195 — when `brand_primary_color` is `Some`, the title under-
+    /// rule, table-header rule, and totals banner all substitute the
+    /// operator's colour. The table FOOTER rule deliberately stays
+    /// SILVER_LINE (preserves visual hierarchy — only the "structural
+    /// emphasis" rules brand-override, not every silver rule).
+    #[test]
+    fn brand_primary_some_substitutes_three_rules_keeps_table_footer_silver() {
+        let brand: (f32, f32, f32) = (0.1, 0.2, 0.3);
+        let mut ops: Vec<Operation> = Vec::new();
+        layout(&mut ops, &pin_model_with_brand(Some(brand)), None);
+        let strokes = stroke_color_triples(&ops);
+        let count = |c: (f32, f32, f32)| strokes.iter().filter(|s| **s == c).count();
+        // Three rules carry the brand colour (title under-rule + table
+        // header rule + totals banner).
+        assert_eq!(
+            count(brand),
+            3,
+            "brand colour must replace exactly THREE structural/accent rules; \
+             got strokes={strokes:?}"
+        );
+        // GOLD_ACCENT disappears entirely under a brand override.
+        assert_eq!(
+            count(GOLD_ACCENT),
+            0,
+            "GOLD_ACCENT must collapse into the brand colour when set; got {strokes:?}"
+        );
+        // SILVER_LINE survives once — the table-footer rule keeps the
+        // structural hierarchy intact even under a brand override.
+        assert_eq!(
+            count(SILVER_LINE),
+            1,
+            "table-footer rule keeps SILVER_LINE under brand override (visual hierarchy); \
+             got {strokes:?}"
+        );
+    }
+
+    /// S195 — defence-in-depth on the `render_invoice` entry point:
+    /// a brand-coloured model still produces well-formed PDF bytes.
+    /// (The earlier pin walks the op stream; this one closes the
+    /// integration loop to surface any PDF-serialization regression a
+    /// new colour code path might trigger.)
+    #[test]
+    fn render_invoice_smoke_with_brand_primary_color() {
+        let bytes = render_invoice(&pin_model_with_brand(Some((0.5, 0.5, 0.5))))
+            .expect("render with brand colour must succeed");
+        assert!(
+            bytes.starts_with(b"%PDF"),
+            "rendered output must be a PDF (starts with %PDF magic); first 16 bytes = {:?}",
+            &bytes[..16.min(bytes.len())]
+        );
     }
 }

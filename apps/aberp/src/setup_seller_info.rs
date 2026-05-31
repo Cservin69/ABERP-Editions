@@ -243,6 +243,20 @@ pub fn setup_seller_info_to_path(
                 "read existing [seller.numbering] for preservation across identity write: {e}"
             ))
         })?;
+    // S195 / PR-195 — preserve `[seller.branding]` across the identity
+    // write, same posture as PR-75 (banks) and PR-170 (smtp + numbering).
+    // The three section-replace writers (banks/smtp/numbering) already
+    // preserve every line outside their own section, so an operator-set
+    // brand colour survives those paths naturally; the identity writer
+    // is the one that re-renders from scratch and would otherwise drop
+    // the section silently. Without this, an Áben-style production
+    // pilot would lose the brand colour on the next identity edit —
+    // exactly the regression Ervin caught in S170.
+    let preserved_branding = crate::branding_config::read_branding_config(path).map_err(|e| {
+        SetupSellerInfoError::Backend(anyhow!(
+            "read existing [seller.branding] for preservation across identity write: {e}"
+        ))
+    })?;
 
     let mut body = render_seller_toml(inputs);
     if !preserved.entries().is_empty() {
@@ -253,6 +267,12 @@ pub fn setup_seller_info_to_path(
     }
     if let Some(template) = preserved_numbering.as_ref() {
         append_section(&mut body, &crate::numbering::to_toml_section(template));
+    }
+    if let Some(branding) = preserved_branding.as_ref() {
+        append_section(
+            &mut body,
+            &crate::branding_config::to_toml_section(branding),
+        );
     }
 
     write_atomic(path, body.as_bytes()).map_err(SetupSellerInfoError::Backend)?;
@@ -1128,6 +1148,78 @@ street = \"Old Street\"
         assert!(
             !after.contains("INV-default"),
             "no default-template prefix leaked into file: {after}"
+        );
+    }
+
+    /// S195 / PR-195 — identity save MUST preserve an existing
+    /// `[seller.branding]` section. Same posture as the smtp + numbering
+    /// preservation pins above; mirror of Ervin's S170 regression
+    /// (PROD_v1.0 → PROD_v1.1 update lost preserved sections), now
+    /// extended to cover the brand-colour slice.
+    #[test]
+    fn identity_save_preserves_branding_section() {
+        let tmp = test_dir("preserves_branding");
+        let path = tmp.join("seller.toml");
+        let pre = "\
+[seller]
+legal_name = \"Old Name\"
+tax_number = \"24904362-2-41\"
+
+[seller.address]
+country_code = \"HU\"
+postal_code = \"1037\"
+city = \"Budapest\"
+street = \"Old Street\"
+
+[seller.branding]
+primary_color = \"#1a2332\"
+";
+        std::fs::write(&path, pre).expect("write pre-condition file");
+
+        let inputs = good_inputs();
+        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+
+        let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
+        assert!(
+            after.contains("[seller.branding]"),
+            "[seller.branding] section lost across identity save: {after}"
+        );
+        let parsed = crate::branding_config::read_branding_config(&path)
+            .expect("re-read branding")
+            .expect("section present");
+        assert_eq!(
+            parsed.primary_color, "#1a2332",
+            "operator's primary_color must survive identity save byte-for-byte"
+        );
+    }
+
+    /// S195 / PR-195 — pin the "no phantom branding section" invariant.
+    /// A tenant that never opted in to a brand colour must not gain
+    /// a vestigial `[seller.branding]` header on identity save.
+    #[test]
+    fn identity_save_does_not_materialise_default_branding_when_section_absent() {
+        let tmp = test_dir("no_phantom_branding");
+        let path = tmp.join("seller.toml");
+        let pre = "\
+[seller]
+legal_name = \"Old Name\"
+tax_number = \"24904362-2-41\"
+
+[seller.address]
+country_code = \"HU\"
+postal_code = \"1037\"
+city = \"Budapest\"
+street = \"Old Street\"
+";
+        std::fs::write(&path, pre).expect("write pre-condition file");
+
+        let inputs = good_inputs();
+        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+
+        let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
+        assert!(
+            !after.contains("[seller.branding]"),
+            "no phantom [seller.branding] section when none existed pre-write: {after}"
         );
     }
 

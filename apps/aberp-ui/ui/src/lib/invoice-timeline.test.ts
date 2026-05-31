@@ -14,9 +14,18 @@ import { describe, expect, it } from "vitest";
 
 import type { AuditEntryView } from "./api";
 import {
+  formatHungarianTimestamp,
   timelineFromAuditEntries,
   type TimelineNode,
 } from "./invoice-timeline";
+
+/** S195 — fixed "now" instant for the per-test relative-time
+ * formatting. UTC 2026-05-31 12:00:00 — chosen one second-of-day
+ * later than the helper's `entry()` factory default so a default
+ * `entry(1)` is exactly "épp most" minus its 1-second seq offset.
+ * Tests that need a specific relative-time bucket compute their
+ * own `occurred_at` from this anchor. */
+const NOW = new Date("2026-05-31T12:00:00Z");
 
 /** Helper — build a minimal `AuditEntryView` for a single test. */
 function entry(
@@ -381,24 +390,148 @@ describe("timelineFromAuditEntries — technicalValidationMessages on ack-status
 describe("timelineFromAuditEntries — node shape", () => {
   it("carries seq as the id and the occurred_at ISO string verbatim", () => {
     // The id is the Svelte #each key. The occurred_at string lands
-    // on both ts_iso (for <time datetime=>) and ts_display (the
-    // operator-facing string) verbatim per the helper's stated
-    // simplicity-first posture — a future locale-aware formatter
-    // can extend ts_display additively without touching call sites.
-    const [node] = timelineFromAuditEntries([
-      entry(42, "InvoiceDraftCreated", {
-        occurred_at: "2026-01-15T09:30:00Z",
-      }),
-    ]);
+    // verbatim on ts_iso (for <time datetime=>) — the machine-
+    // readable channel must never be locale-formatted. ts_display
+    // and ts_absolute are operator-facing Hungarian strings (see
+    // S195 — formatHungarianTimestamp test block below).
+    const [node] = timelineFromAuditEntries(
+      [
+        entry(42, "InvoiceDraftCreated", {
+          occurred_at: "2026-01-15T09:30:00Z",
+        }),
+      ],
+      NOW,
+    );
     expect(node.id).toBe("42");
     expect(node.ts_iso).toBe("2026-01-15T09:30:00Z");
-    expect(node.ts_display).toBe("2026-01-15T09:30:00Z");
+    // 2026-01-15 is > 7 days before NOW (2026-05-31) so ts_display
+    // falls through to the absolute form — equal to ts_absolute.
+    expect(node.ts_absolute).toBe("2026. 01. 15. 10:30");
+    expect(node.ts_display).toBe(node.ts_absolute);
   });
 
   it("returns an empty array for empty input", () => {
     // The Svelte renderer branches on `nodes.length === 0` to show
     // the empty-state copy; the mapper's contract is "in:0 → out:0".
     expect(timelineFromAuditEntries([])).toEqual([]);
+  });
+});
+
+// S195 — Hungarian relative-time formatter pins. The mapper threads the
+// `now` argument down to formatHungarianTimestamp so tests can supply a
+// fixed instant; production code calls the helper without a second arg
+// and the implicit default `new Date()` flows through unchanged.
+describe("formatHungarianTimestamp — Hungarian locale relative-time", () => {
+  it("'épp most' for entries less than 45 seconds old", () => {
+    // The relative-time formatter has no 'just-now' unit; the helper
+    // returns a literal "épp most" string for entries within 45s of
+    // `now`. 30s past matches; 90s past trips the minute bucket.
+    const ts = new Date(NOW.getTime() - 30_000).toISOString();
+    expect(formatHungarianTimestamp(ts, NOW).display).toBe("épp most");
+  });
+
+  it("'X perccel ezelőtt' for entries 1-59 minutes old", () => {
+    // Node's ICU emits the formal Hungarian past-tense form
+    // "X perccel ezelőtt" for the minute bucket (same shape as the
+    // hour and day buckets); pin it.
+    const ts = new Date(NOW.getTime() - 2 * 60_000).toISOString();
+    expect(formatHungarianTimestamp(ts, NOW).display).toBe(
+      "2 perccel ezelőtt",
+    );
+  });
+
+  it("'X órával ezelőtt' for entries 1-23 hours old", () => {
+    // Node's ICU emits the formal "X órával ezelőtt" form (≈ "X hours
+    // ago" — appropriate for an accountant's audit timeline) rather
+    // than the colloquial "X órája"; pinning the ICU surface so a
+    // future runtime swap (Intl-polyfill, alt-CLDR) fails loud per
+    // CLAUDE.md rule 12 instead of silently changing the operator UI.
+    const ts = new Date(NOW.getTime() - 3 * 3_600_000).toISOString();
+    expect(formatHungarianTimestamp(ts, NOW).display).toBe("3 órával ezelőtt");
+  });
+
+  it("'tegnap' (yesterday) via numeric: 'auto' for the 1-day-ago bucket", () => {
+    // numeric: 'auto' is the reason the helper exists rather than
+    // raw HU_RELATIVE.format(-1, 'day') — the Hungarian "tegnap" /
+    // "ma" / "holnap" forms read more crisply than "1 napja" et al.
+    const ts = new Date(NOW.getTime() - 1 * 86_400_000).toISOString();
+    expect(formatHungarianTimestamp(ts, NOW).display).toBe("tegnap");
+  });
+
+  it("'X nappal ezelőtt' for entries 2-6 days old", () => {
+    // Same formal-form choice as the hours bucket — Node's ICU emits
+    // "X nappal ezelőtt" rather than the colloquial "X napja". The
+    // 1-day bucket forks separately via numeric: 'auto' (see the
+    // 'tegnap' pin below).
+    const ts = new Date(NOW.getTime() - 3 * 86_400_000).toISOString();
+    expect(formatHungarianTimestamp(ts, NOW).display).toBe("3 nappal ezelőtt");
+  });
+
+  it("falls through to the absolute date+time once past 7 days", () => {
+    // Eight days ago — relative ("8 napja") starts reading less
+    // crisply than the absolute date for an accountant.
+    const ts = "2026-05-23T10:00:00Z";
+    const out = formatHungarianTimestamp(ts, NOW);
+    // 2026-05-23 10:00 UTC = 12:00 Budapest (CEST is UTC+2 in May).
+    expect(out.display).toBe("2026. 05. 23. 12:00");
+    expect(out.absolute).toBe("2026. 05. 23. 12:00");
+  });
+
+  it("always populates the absolute form in Europe/Budapest, regardless of display bucket", () => {
+    // Within the relative-time window the display ≠ absolute (display
+    // says "2 órája", absolute carries the wall-clock for the hover
+    // tooltip). Pinning here keeps the title-attribute disclosure
+    // contract truthful — the operator hovers the chip and reads the
+    // exact instant.
+    const ts = new Date(NOW.getTime() - 2 * 3_600_000).toISOString();
+    // 2026-05-31 12:00 UTC - 2h = 10:00 UTC = 12:00 Budapest (CEST).
+    const out = formatHungarianTimestamp(ts, NOW);
+    expect(out.display).toBe("2 órával ezelőtt");
+    expect(out.absolute).toBe("2026. 05. 31. 12:00");
+  });
+
+  it("round-trips a malformed occurred_at unchanged (rule 12)", () => {
+    // CLAUDE.md rule 12 — a wire-shape regression that ships a
+    // non-RFC3339 timestamp must NOT crash the renderer and must
+    // NOT silently invent a date. The helper rounds the unparseable
+    // string back through both fields so the operator sees what the
+    // backend sent.
+    const out = formatHungarianTimestamp("not-a-date", NOW);
+    expect(out.display).toBe("not-a-date");
+    expect(out.absolute).toBe("not-a-date");
+  });
+});
+
+describe("timelineFromAuditEntries — `now` arg threads through to ts_display + ts_absolute", () => {
+  it("ts_display is the relative-time string when within the 7-day window", () => {
+    // 2 hours ago, anchored at NOW. The node carries both forms so
+    // the renderer can show the relative chip + hover-disclose the
+    // absolute (InvoiceTimeline.svelte's <time title=>).
+    const occurred = new Date(NOW.getTime() - 2 * 3_600_000).toISOString();
+    const [node] = timelineFromAuditEntries(
+      [entry(1, "InvoiceDraftCreated", { occurred_at: occurred })],
+      NOW,
+    );
+    expect(node.ts_display).toBe("2 órával ezelőtt");
+    expect(node.ts_absolute).toBe("2026. 05. 31. 12:00");
+    expect(node.ts_iso).toBe(occurred);
+  });
+
+  it("defaults `now` to the current wall clock — `ts_iso` stays verbatim regardless", () => {
+    // The implicit `now = new Date()` default is what production
+    // callers (InvoiceDetail.svelte) get. We can't pin the display
+    // bucket without freezing time, but ts_iso is wire-verbatim, so
+    // a default-args call still round-trips occurred_at without
+    // mangling the machine-readable channel.
+    const [node] = timelineFromAuditEntries([
+      entry(1, "InvoiceDraftCreated", {
+        occurred_at: "2026-05-31T11:30:00Z",
+      }),
+    ]);
+    expect(node.ts_iso).toBe("2026-05-31T11:30:00Z");
+    // ts_absolute is timezone-deterministic — Europe/Budapest in May
+    // is CEST (UTC+2), so 11:30 UTC reads as 13:30 local.
+    expect(node.ts_absolute).toBe("2026. 05. 31. 13:30");
   });
 });
 

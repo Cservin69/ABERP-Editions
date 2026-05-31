@@ -48,11 +48,22 @@ export interface TimelineNode {
   /** RFC3339 timestamp verbatim from `entry.occurred_at`. For the
    * `<time datetime=>` machine-readable attribute. */
   ts_iso: string;
-  /** Operator-facing timestamp string. Identical to `ts_iso` for
-   * now — a future formatter (Hungarian locale, relative-time)
-   * can be added additively without touching call sites per
-   * CLAUDE.md rule 3. */
+  /** Operator-facing timestamp string. S195 — Hungarian-locale
+   * relative-time when the entry is within the last week
+   * ("2 órája", "tegnap", "3 napja"), and an absolute Hungarian
+   * date+time ("2026. 05. 30. 14:32") for older entries. Computed
+   * from `now` passed into [`timelineFromAuditEntries`] so the
+   * pure-module contract stays testable. Pre-S195 this was identical
+   * to `ts_iso` (raw RFC3339) and the timeline read as "what's a
+   * Z-suffixed UTC string supposed to mean to an accountant?" */
   ts_display: string;
+  /** Absolute Hungarian-locale timestamp string ("2026. 05. 30.
+   * 14:32"), always rendered in Europe/Budapest. S195 — surfaces
+   * via the `<time title=>` attribute so an operator can hover the
+   * relative-time chip and read the exact instant without dropping
+   * into the raw-table toggle. Identical to `ts_display` when the
+   * entry is older than the 7-day relative-time window. */
+  ts_absolute: string;
   /** Single glyph rendered inside the timeline rail badge. The
    * glyph is the colour-blind-safe categorical signal per
    * ADR-0017 §"Adversarial review #4". */
@@ -330,22 +341,95 @@ function bodyLines(entry: AuditEntryView): string[] {
   return lines;
 }
 
+/** S195 — Intl formatters cached at module load. The relative
+ * formatter uses `numeric: 'auto'` so 0/-1/+1 days render as
+ * "ma" / "tegnap" / "holnap" rather than the numeric "0 napja"
+ * / "1 napja" / "1 nap múlva" forms — closer to how a Hungarian
+ * accountant reads the timeline aloud. The absolute formatter
+ * pins `Europe/Budapest` so the operator-facing string is
+ * deterministic regardless of the browser's host timezone
+ * (operators work in HU local time; printed invoices are stamped
+ * in HU local time; the timeline must agree). */
+const HU_RELATIVE = new Intl.RelativeTimeFormat("hu", { numeric: "auto" });
+const HU_DATE_TIME = new Intl.DateTimeFormat("hu-HU", {
+  timeZone: "Europe/Budapest",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
+/** S195 — split the absolute and relative-time formatting out of
+ * the per-entry mapper so the per-kind classify() can stay focused
+ * on glyph/class/label and a future change to the relative-time
+ * thresholds is one-line. Exported for direct unit-test coverage.
+ *
+ * Cutover thresholds: within the last 45 seconds reads as "épp
+ * most" (Intl has no "just-now" unit), then minute/hour/day picks
+ * the coarsest unit whose magnitude is ≥ 1, then beyond ~7 days
+ * the relative form stops being useful and the display falls
+ * through to the absolute date+time. A malformed `occurred_at`
+ * (rejected by `Date.parse`) round-trips the raw string unchanged
+ * so a wire-shape regression is visible per CLAUDE.md rule 12. */
+export function formatHungarianTimestamp(
+  occurredAt: string,
+  now: Date,
+): { display: string; absolute: string } {
+  const ts = new Date(occurredAt);
+  if (Number.isNaN(ts.getTime())) {
+    return { display: occurredAt, absolute: occurredAt };
+  }
+  const absolute = HU_DATE_TIME.format(ts);
+  const diffMs = ts.getTime() - now.getTime();
+  const diffSec = Math.round(diffMs / 1000);
+  const absSec = Math.abs(diffSec);
+
+  if (absSec < 45) {
+    return { display: "épp most", absolute };
+  }
+  if (absSec < 60 * 60) {
+    const mins = Math.round(diffSec / 60);
+    return { display: HU_RELATIVE.format(mins, "minute"), absolute };
+  }
+  if (absSec < 60 * 60 * 24) {
+    const hours = Math.round(diffSec / 3600);
+    return { display: HU_RELATIVE.format(hours, "hour"), absolute };
+  }
+  if (absSec < 60 * 60 * 24 * 7) {
+    const days = Math.round(diffSec / 86400);
+    return { display: HU_RELATIVE.format(days, "day"), absolute };
+  }
+  // Beyond a week the relative form (`12 napja`, `3 hete`) reads
+  // less crisply than the absolute date — fall through.
+  return { display: absolute, absolute };
+}
+
 /** Map an ordered `AuditEntryView[]` to `TimelineNode[]`. Order is
  * preserved verbatim — the backend's `get_audit_for_invoice`
  * walker emits entries in append-only `seq` order, and the
  * timeline renderer reads top-to-bottom as chronological. Pinned
  * by `preserves chronological order` in
- * `invoice-timeline.test.ts`. */
+ * `invoice-timeline.test.ts`.
+ *
+ * S195 — the optional `now` second argument anchors the
+ * relative-time computation. Production callers (`InvoiceDetail.svelte`)
+ * pass `new Date()`; unit tests pass a fixed instant so the
+ * `ts_display` strings are deterministic. */
 export function timelineFromAuditEntries(
   entries: AuditEntryView[],
+  now: Date = new Date(),
 ): TimelineNode[] {
   return entries.map((entry) => {
     const meta = classify(entry);
+    const ts = formatHungarianTimestamp(entry.occurred_at, now);
     return {
       id: String(entry.seq),
       label_html_safe: meta.label,
       ts_iso: entry.occurred_at,
-      ts_display: entry.occurred_at,
+      ts_display: ts.display,
+      ts_absolute: ts.absolute,
       glyph: meta.glyph,
       kind_class: meta.kind_class,
       body_lines: bodyLines(entry),

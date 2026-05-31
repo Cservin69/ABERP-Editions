@@ -105,6 +105,7 @@ fn sample_huf_short() -> InvoiceModel {
         }],
         note: None,
         tenant_logo: None,
+        brand_primary_color: None,
     }
 }
 
@@ -161,6 +162,7 @@ fn sample_eur_long() -> InvoiceModel {
                 .to_string(),
         ),
         tenant_logo: None,
+        brand_primary_color: None,
     }
 }
 
