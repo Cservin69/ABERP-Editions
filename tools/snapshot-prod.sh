@@ -5,10 +5,31 @@
 # seller.toml write path (S170 type) costs us hand-typed operator
 # state.
 #
-# What it captures:
+# *** TIMING: run this BEFORE `git checkout PROD_vX.Y`, not after. ***
+# A snapshot taken after the upgrade captures post-upgrade state and
+# is useless as a rollback handle for the upgrade itself. See the
+# runbook's Troubleshooting → "Forgot to snapshot before upgrade".
+#
+# What it captures (inventory contract per ADR-0055 — extend this list
+# in the same PR that adds any new tenant-state artifact under
+# `~/.aberp/<tenant>/`):
 #   1. The full tenant directory `~/.aberp/<tenant>/` as a gzipped tar.
-#      That's seller.toml + the DuckDB file + audit log + side-store
-#      invoice directories + the .first-launch-acknowledged touchfile.
+#      The wholesale tar captures every artifact under the tenant
+#      root; the named ones below are the load-bearing pieces that
+#      need an operator-visible mention:
+#       - seller.toml (identity + bank + SMTP + numbering + branding;
+#         four-way write invariant per ADR — preserved across writers)
+#       - aberp.duckdb (the DB file — carries `invoice` + `ap_invoice`
+#         + `restored_invoice` and every related table)
+#       - aberp.audit.log (the audit-ledger mirror file — ADR-0030)
+#       - invoices/<id>/ (per-outgoing-invoice side-store — input.json
+#         + nav_xml + PDF; referenced by audit replay + PDF print)
+#       - ap-artifacts/<apinv-id>.xml (S177 + S197 — per-incoming-
+#         invoice NAV XML side-store fetched by the AP auto-sync
+#         daemon; referenced by the SPA's per-row "XML" download)
+#       - logo.png (optional, PR-176 — operator-supplied tenant logo)
+#       - .first-launch-acknowledged (S166 — first-prod-launch
+#         ceremony touchfile)
 #   2. A pre-upgrade contract file at
 #      `~/.aberp/<tenant>/.upgrade-snapshot.toml` containing the
 #      `[seller.smtp]` + `[seller.numbering]` sections extracted

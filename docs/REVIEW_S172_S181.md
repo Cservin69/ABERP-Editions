@@ -424,6 +424,11 @@ template configured — confirm none does and it stays 🟡.
 
 ## 💭 Architectural questions for Ervin
 
+> **All five items below were closed in S198 / PR-198 (2026-05-31)** — see
+> ADRs 0051-0055. The original questions are preserved verbatim; the
+> ADDRESSED-BY-PR-198 callouts below each name the ADR that pins the
+> decision.
+
 - **S173 year-source divergence.** Is the choice of `Entry.time_wall.year()` in
   annulment a deliberate "audit ledger is the source of truth" call, or an
   oversight from the original CLI-only annulment (where billing-DB access from
@@ -431,16 +436,41 @@ template configured — confirm none does and it stays 🟡.
   to ALSO using `time_wall.year()` from `issue_invoice` etc. for consistency
   (currently they all use `issue_date.year()`). If oversight, fix annulment to
   match the others.
+  > **ADDRESSED-BY-PR-198 / ADR-0051.** Documented retroactively: the
+  > operator-typed `billing.invoice.issue_date.year()` is the source of
+  > truth for every render-call site that emits a NAV reference. The
+  > de facto fix already landed in PR-183 (annulment now reads via
+  > `load_base_invoice_issue_year` + the walker's `time_wall.year()`
+  > capture was deleted). The ADR pins the posture for future render
+  > paths and aligns with ADR-0019's relational-SoT pin. Triggers to
+  > re-evaluate are named in the ADR (none today).
 
 - **S180 + S178 chain-verify cost.** `Ledger::verify_chain` after each insert
   is O(N) over the full chain. A 1000-row restore is O(N²). Should we
   amortize — e.g., one chain verify per page, or per cycle, instead of per
   insert? Or accept that DR + first-cycle ingest are operator-paced "go drink
   coffee" operations and document the expected wait time?
+  > **ADDRESSED-BY-PR-198 / ADR-0052.** Decision: keep per-insert
+  > `verify_chain` (strictest tamper-detection granularity); do NOT
+  > amortize per-page or per-cycle. S186's `load_already_restored_cache`
+  > made the per-digest idempotency O(1), and S191's `spawn_blocking`
+  > kept HTTP responsive during a cycle — those two changes already
+  > addressed the operator-visible pain without weakening the audit
+  > contract. Triggers to revisit (cycle >60s steady-state, restore
+  > >10 min, bulk ingestion becomes recurring) are named in the ADR.
 
 - **S180 RESTORE token.** Should the ceremony move server-side, or is the SPA
   gate the intended layer? If the latter, the route's doc-comment should
   acknowledge that the ceremony is cosmetic from the backend's perspective.
+  > **ADDRESSED-BY-PR-198 / ADR-0053.** Documented retroactively: the
+  > literal `"RESTORE"` token IS server-side enforced. PR-186 made
+  > `confirm_token` a serde-required field on `RestoreFromNavOutgoingRequest`
+  > and equality-checks against `RESTORE_CONFIRMATION_TOKEN: &str = "RESTORE"`
+  > before the year-validation gate fires. The SPA ceremony is the
+  > operator-UX layer; the backend gate is the security contract. Both
+  > layers are load-bearing; neither is cosmetic. Pinned by
+  > `restore_request_serde_requires_confirm_token` +
+  > `restore_confirm_token_literal_is_exact_match_uppercase_restore`.
 
 - **AP module status-change audit shape.** The `IncomingInvoiceStatusChanged`
   payload carries only `ap_invoice_id`, not the
@@ -448,6 +478,16 @@ template configured — confirm none does and it stays 🟡.
   needs cross-tenant traceability without joining against the (mutable)
   `ap_invoice` row, the payload would need extending. Worth deciding now or
   acknowledging the deferred decision.
+  > **ADDRESSED-BY-PR-198 / ADR-0054.** Decision: keep the payload
+  > minimal. `ap_invoice_id` is the durable handle; the dedup tuple
+  > lives in `ap_invoice` (UNIQUE-indexed columns are INSERT-once /
+  > never UPDATEd). Future exports JOIN against the mirror by id —
+  > the canonical pattern the rest of ABERP uses
+  > (`InvoiceDraftCreated.invoice_id` → `invoice.id`). Aligns with
+  > ADR-0019's single-source-of-truth pin (no payload-vs-row drift
+  > risk). Triggers to revisit (cross-tenant audit-only export OR
+  > audit-only AP-DR posture) are named in the ADR; neither exists
+  > today.
 
 - **Runbook & snapshot script coverage of new artifacts.** S177 introduces
   `~/.aberp/<tenant>/ap-artifacts/` and the `ap_invoice` table. S180
@@ -456,6 +496,16 @@ template configured — confirm none does and it stays 🟡.
   snapshot-prod.sh docstring doesn't mention them either. The script
   captures them incidentally (it tars all of `~/.aberp/<tenant>/`), but the
   operator-visible inventory is now incomplete. Worth a one-line doc add.
+  > **ADDRESSED-BY-PR-198 / ADR-0055.** Promoted from one-off doc fix
+  > to ongoing contract: any future PR adding a new on-disk path
+  > under `~/.aberp/<tenant>/`, a new DuckDB table, a new keychain
+  > entry, or a new side-store directory MUST add a row to the runbook's
+  > Appendix A AND extend `tools/snapshot-prod.sh`'s docstring in the
+  > same PR. The existing gaps (S177's `ap-artifacts/` + `ap_invoice`,
+  > S180's `restored_invoice`, S197's per-digest XML files,
+  > `aberp.audit.log`, `.upgrade-snapshot.toml`, `logo.png`) are
+  > closed in this PR. Closed-vocabulary of artifact categories is
+  > pinned in the ADR.
 
 ## ✅ Cross-cuts checked clean
 

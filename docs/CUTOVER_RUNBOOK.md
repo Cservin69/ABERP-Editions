@@ -1,6 +1,10 @@
 # ABERP production cutover runbook
 
-**Last updated:** 2026-05-30 — Session 170 / PR-170 (identity-write
+**Last updated:** 2026-05-31 — Session 198 / PR-198 (troubleshooting
+entries for the PROD_v1.1→v1.3 cutover wrinkles + Appendix A inventory
+extended per ADR-0055 to name `ap-artifacts/`, `ap_invoice`, and
+`restored_invoice`).
+**Prior update:** 2026-05-30 — Session 170 / PR-170 (identity-write
 preserves SMTP + numbering, snapshot-prod.sh, real Áben logo).
 **Audience:** Ervin (sole operator).
 **Language:** EN-primary; HU clarifications inline where they help at the
@@ -475,12 +479,22 @@ fix it by reverting code.
 Routine: dev work continues to land on `main`. When you want a fix or
 feature to reach prod:
 
+> **⚠️ BEFORE, not after.** The snapshot below MUST run BEFORE you run
+> `git checkout PROD_vX.Y` or `./run/run_prod.sh` against the new
+> release. A snapshot taken AFTER the upgrade captures post-upgrade
+> state — it is useless as a rollback handle for the upgrade itself.
+> This is the PROD_v1.1→v1.3 lesson (2026-05-31): the operator who
+> snapshots after upgrade thinks they are protected and is not. If
+> you forgot, see Troubleshooting → "Forgot to snapshot before
+> upgrade" below.
+
 ```bash
-# 1. *** REQUIRED *** snapshot current prod state BEFORE switching
-#    release branches. This is the recovery handle if the new release
-#    has a bug that costs operator state (the S170 prod-update pilot
-#    lost SMTP + numbering this way; PR-170 fixed the write path but
-#    we still snapshot every upgrade defense-in-depth).
+# 1. *** REQUIRED — RUN THIS FIRST, BEFORE ANY git checkout *** 
+#    Snapshot current prod state BEFORE switching release branches.
+#    This is the recovery handle if the new release has a bug that
+#    costs operator state (the S170 prod-update pilot lost SMTP +
+#    numbering this way; PR-170 fixed the write path but we still
+#    snapshot every upgrade defense-in-depth).
 #
 #    The snapshot captures the full ~/.aberp/prod/ tenant directory
 #    (seller.toml + DuckDB + side-store invoices + audit log + first-
@@ -660,6 +674,155 @@ that destroys in-progress dev work from parallel sessions (see memory
 
 Pick the next minor. The script suggests it in the error message.
 
+### Forgot to snapshot before upgrade
+
+**Symptom:** you've already run `git checkout PROD_vX.Y` and
+`./run/run_prod.sh` against the new release before snapshotting.
+
+**Diagnosis:** the snapshot script captures CURRENT state. If you run
+it now, the snapshot is post-upgrade — it cannot serve as a rollback
+handle for the upgrade itself (the bug you'd want to roll back from is
+already in the snapshot). The S171 `.upgrade-snapshot.toml` contract
+defense (boot-time SMTP + numbering drift check) ran at the new
+binary's first boot and either accepted the post-upgrade state or
+refused to start; the boot acceptance is the strongest signal that
+seller.toml is intact.
+
+**What to do:**
+
+1. Run `./tools/snapshot-prod.sh` NOW anyway. It captures the current
+   (post-upgrade) state, which is the best available rollback target
+   for the NEXT upgrade. The current upgrade does not have one.
+2. Verify the SPA renders correctly + a smoke invoice round-trips
+   end-to-end (Step 7 procedure). If something is wrong, you have no
+   automated rollback handle for the upgrade — surface the
+   regression, fix it forward in a `PROD_vX.Y+1`, never `git reset
+   --hard` against a release branch you've already booted against
+   (which would orphan whatever the new binary wrote post-boot).
+3. Internalize the **BEFORE, not after** rule (Step 9). The runbook
+   was updated 2026-05-31 to make the ordering louder; if the wording
+   still didn't bite, surface the gap and we'll sharpen it again.
+
+**Why the bite is sharp:** Hungarian tax law requires retention of
+issued invoices for years. The prod DB is no longer disposable; an
+upgrade-introduced regression that corrupts a write path between the
+old binary and the new one is the worst-class incident. The snapshot
+is the only rollback handle that survives a binary swap.
+
+### Numbering literal drift between an issue and its chain ops
+
+**Symptom:** you issued invoice N, and then edited the numbering
+section of `seller.toml` (or worse — re-typed it via the seller wizard)
+before issuing a storno or modification against N. The chain op fails
+with NAV reference mismatch or local-validation mismatch.
+
+**Diagnosis:** the chain op (storno / modification / annulment)
+renders the base invoice number from the **current** seller.toml
+template, then compares against the **base's stored** number. If the
+template literal drifted (`ABERP/` → `ÁBEN/` say), the renders no
+longer agree and the op refuses.
+
+PR-184 + PR-190 defended the most common failure modes — the storno
+chain re-reads the base's on-disk NAV XML for `<originalInvoiceNumber>`
+instead of re-deriving from the template, and ADR-0051 / PR-198 pins
+that the base year reads from the billing DB row, not the audit-ledger
+wall clock. But the seller.toml template literal itself remains
+operator-editable; a literal change between issue and chain ops will
+still surface as a refusal at the boundary that does the comparison.
+
+**What NOT to do:** do not edit `seller.toml`'s `[seller.numbering]`
+section between an invoice issuance and any chain operation against
+that invoice. The literal is part of the invoice's identity — once
+issued, the literal is frozen for that invoice's chain forever.
+
+**What to do if you already did:** revert the `seller.toml`
+`[seller.numbering]` section to the literal in effect at the base's
+issue time. The base invoice's NAV XML on disk records the literal it
+was issued with (`<invoiceNumber>` field); use that as the source of
+truth. Then re-attempt the chain op.
+
+**Future invariants:** a "freeze the numbering template once an
+invoice has been issued under it" enforcement is named-deferred; the
+trigger is a recurring operator report of this failure mode. Today's
+posture is "operator knows not to do this".
+
+### macOS Dock shows stale app icon after binary swap
+
+**Symptom:** you swapped to a new release branch that ships new
+`apps/aberp-ui/icons/` assets, but the Dock still shows the old icon
+even after relaunching the app.
+
+**Diagnosis:** macOS aggressively caches Dock icons. The new binary
+loads the new icons internally (the window's title-bar icon should
+already show the new asset), but the Dock's cached representation
+lags until the Dock process restarts.
+
+**Fix:**
+
+```bash
+killall Dock
+# Dock restarts immediately; the new icon appears on next app launch.
+```
+
+This is cosmetic; no functional impact. Skip the fix if you don't
+care which icon the Dock shows.
+
+### Cargo lock held by a stale process
+
+**Symptom:** `cargo build` reports `error: failed to acquire packages
+file lock: would block` or `error: waiting for file lock on package
+cache`, and waits indefinitely.
+
+**Diagnosis:** another `cargo` process is holding the
+`~/.cargo/registry/.cargo-lock` or the project's `target/` lock. Most
+common cause: a previous `run_prod.sh` invocation that was
+Ctrl-C'd at the wrong moment and left a zombie `cargo` worker, or a
+parallel session running cargo against the same workspace.
+
+**Fix:**
+
+```bash
+ps aux | grep -E '(cargo|rustc)' | grep -v grep
+# Identify the stale PID(s) — usually the oldest cargo process with
+# no terminal attached. Kill it:
+kill <PID>
+# If it doesn't die in 5 seconds, escalate:
+kill -9 <PID>
+# Then retry the build.
+```
+
+If the lock is in the project's `target/` (not the global registry),
+`rm target/.rustc_info.json` is sometimes enough; if not, `cargo
+clean` and rebuild.
+
+### Shell scripts fail with "Permission denied"
+
+**Symptom:** `./run/run_prod.sh` or `./tools/snapshot-prod.sh` errors
+with `zsh: permission denied: ./run/run_prod.sh` (or equivalent
+bash error). The script is present and readable; it just won't
+execute.
+
+**Diagnosis:** the executable bit got dropped. Common cause: a `chmod
+-R` against the repo for unrelated reasons (e.g., "fix permissions
+after restoring from a non-Unix backup"), or a `git` config that
+strips the executable bit. The S169 `release.sh` and S170
+`snapshot-prod.sh` ship with mode `0755`; any operation that
+re-applies a restrictive umask resets them.
+
+**Fix:**
+
+```bash
+chmod +x run/*.sh tools/*.sh
+# Verify:
+ls -l run/*.sh tools/*.sh
+# Expect the leftmost field to show -rwxr-xr-x (or similar with x bits).
+```
+
+Then retry the script. If the bits keep getting stripped, check `git
+config core.fileMode` — `true` means git respects the file mode bit;
+`false` ignores it (and a `git checkout` could appear to restore
+without restoring the bit).
+
 ---
 
 ## Appendix A — File and keychain inventory
@@ -670,19 +833,36 @@ What lives where after a successful cutover:
 |----------|-------|----------|
 | `~/.aberp/prod/seller.toml` | SPA seller wizard (PR-51) | tenant-lifetime |
 | `~/.aberp/prod/aberp.duckdb` | DuckDB | tenant-lifetime |
-| `~/.aberp/prod/.first-launch-acknowledged` | first-launch ceremony | tenant-lifetime |
-| `~/.aberp/serve/prod/` | TLS cert + key for the loopback listener | regenerated as needed |
+| `~/.aberp/prod/aberp.audit.log` | audit-ledger mirror file (ADR-0030) | tenant-lifetime |
+| `~/.aberp/prod/.first-launch-acknowledged` | first-launch ceremony (S166) | tenant-lifetime |
+| `~/.aberp/prod/.upgrade-snapshot.toml` | `snapshot-prod.sh` (S171 — pre-upgrade SMTP + numbering contract) | per-upgrade |
+| `~/.aberp/prod/logo.png` | operator-supplied tenant logo (PR-176) | tenant-lifetime, optional |
 | `~/.aberp/prod/invoices/<id>/` | side-store per-invoice artifacts (input.json, nav_xml, PDF) | invoice-lifetime |
+| `~/.aberp/prod/ap-artifacts/<apinv-id>.xml` | AP incoming-invoice NAV XML side-store (S177 + S197) | invoice-lifetime |
+| `~/.aberp/serve/prod/` | TLS cert + key for the loopback listener | regenerated as needed |
+| DuckDB table: `invoice` (+ related billing rows) | issue / storno / modification (ADR-0019) | tenant-lifetime |
+| DuckDB table: `ap_invoice` | AP module mirror (S177); status changes audit-logged via `IncomingInvoiceStatusChanged` (ADR-0054) | tenant-lifetime |
+| DuckDB table: `restored_invoice` | NAV-as-DR restore mirror (S180); segregated from canonical `invoice` table per ADR-0019 no-FK / named-table convention | tenant-lifetime |
 | macOS keychain: `aberp.nav.prod` / `nav_credentials_blob` | SPA NAV creds wizard (S133) | tenant-lifetime |
 | macOS keychain: `aberp.smtp.prod` / `smtp_password` | SPA Tenant Settings → SMTP PUT (PR-92) | tenant-lifetime |
 | macOS keychain: `aberp.nav.prod` / `session_token` | serve at boot | per-binary-build |
 
-**Backups:** the DuckDB file IS the database. Snapshot it before any
-upgrade (Step 8/9 instructions). Side-store directories
-(`~/.aberp/prod/invoices/<id>/`) are also load-bearing — `input.json`
-and `nav_xml` are referenced by audit replay and the PDF print path.
-A backup strategy that covers `~/.aberp/prod/` entirely is the
-simplest correct posture.
+> **Inventory contract (ADR-0055):** any future PR that adds a new
+> path under `~/.aberp/<tenant>/`, a new DuckDB table, a new keychain
+> entry, or a new side-store directory MUST add a row to the table
+> above AND extend `tools/snapshot-prod.sh`'s docstring `What it
+> captures:` section in the same PR. The inventory is the operator's
+> mental model; a missing row is a silent recovery gap.
+
+**Backups:** the DuckDB file IS the database (carries `invoice` +
+`ap_invoice` + `restored_invoice` and every related table). Snapshot
+it before any upgrade (Step 8/9 instructions). Side-store directories
+(`~/.aberp/prod/invoices/<id>/` and `~/.aberp/prod/ap-artifacts/`) are
+also load-bearing — `input.json` and the on-disk NAV XML files are
+referenced by audit replay, the PDF print path, and the AP SPA's per-
+row "XML" download button (S197). A backup strategy that covers
+`~/.aberp/prod/` entirely is the simplest correct posture; the
+`tools/snapshot-prod.sh` script implements it.
 
 ---
 
