@@ -6,11 +6,16 @@
 #   1. Refuses to run from the dev checkout (path-substring sentinel —
 #      anything under `/Documents/Claude/Projects/` is considered dev).
 #   2. Validates we're on `main` with a CLEAN working tree.
-#   3. Validates the version arg matches `PROD_vMAJOR.MINOR` (e.g. PROD_v1.0).
-#      Note the case + separator: uppercase PROD, underscore, two dot
+#   3. Validates the version arg matches `PROD_vMAJOR.MINOR` OR
+#      `PROD_vMAJOR.MINOR.PATCH` (e.g. PROD_v1.0, PROD_v1.4.1). Note the
+#      case + separator: uppercase PROD, underscore, dot-separated
 #      numbers. This is intentional — the new release model uses branch
 #      names, not tags, and the uppercase shape makes them visually
-#      distinct from feature branches in `git branch -a`.
+#      distinct from feature branches in `git branch -a`. The optional
+#      patch segment was added in S201 / PR-201 once the versioning
+#      policy (ADR-0056) named patch releases as load-bearing for
+#      bugfix-only bumps within the 1.x invoicing strand. 4+ segments
+#      and pre-release suffixes (e.g. `-rc1`) are rejected.
 #   4. Refuses if the release branch already exists on origin (suggests
 #      the next minor as the conservative next pick).
 #   5. Pushes `origin main:PROD_vX.Y` — the branch IS the release marker.
@@ -38,8 +43,8 @@
 #     fixed pointer to a specific commit, the branch's HEAD is it.
 #
 # USAGE:
-#   ./run/release.sh PROD_v1.0
-#   ./run/release.sh PROD_v1.1
+#   ./run/release.sh PROD_v1.0       # 2-segment (major + minor)
+#   ./run/release.sh PROD_v1.4.1     # 3-segment (major + minor + patch)
 #   ./run/release.sh --help
 #
 # FLAGS:
@@ -61,7 +66,10 @@ if ! bash -n "$0" 2>/dev/null; then
 fi
 
 readonly MAIN_BRANCH="main"
-readonly VERSION_RE='^PROD_v[0-9]+\.[0-9]+$'
+# 2-segment (PROD_v1.5) and 3-segment (PROD_v1.4.1) accepted; 4+ segments
+# and any suffix (pre-release / build metadata / -rc1) rejected. See
+# ADR-0056 for the versioning policy that motivates the optional patch.
+readonly VERSION_RE='^PROD_v[0-9]+\.[0-9]+(\.[0-9]+)?$'
 # Dev-sentinel: any checkout under this path subtree is the dev workspace.
 # release.sh must be invoked from the OPERATOR's prod clone, not the dev
 # clone. See header note (S169 model decouples publish from build).
@@ -113,14 +121,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$version" ]]; then
-  echo "usage: $(basename "$0") <PROD_vMAJOR.MINOR>" >&2
+  echo "usage: $(basename "$0") <PROD_vMAJOR.MINOR[.PATCH]>" >&2
   echo "       $(basename "$0") --help" >&2
   exit 2
 fi
 
 if [[ ! "$version" =~ $VERSION_RE ]]; then
-  die "version '$version' does not match $VERSION_RE — expected e.g. PROD_v1.0
-HU: A '$version' nem felel meg a $VERSION_RE mintának — pl. PROD_v1.0"
+  die "version '$version' does not match $VERSION_RE — expected e.g. PROD_v1.0 or PROD_v1.4.1
+HU: A '$version' nem felel meg a $VERSION_RE mintának — pl. PROD_v1.0 vagy PROD_v1.4.1"
 fi
 
 # ---------- preflight: dev-sentinel ----------------------------------------
@@ -169,12 +177,26 @@ fi
 
 existing_ref="$(git ls-remote --heads origin "$version" 2>/dev/null | awk '{print $1}')"
 if [[ -n "$existing_ref" ]]; then
-  major="$(echo "$version" | sed -E 's/^PROD_v([0-9]+)\.([0-9]+)$/\1/')"
-  minor="$(echo "$version" | sed -E 's/^PROD_v([0-9]+)\.([0-9]+)$/\2/')"
-  next_minor="PROD_v${major}.$((minor + 1))"
+  # Suggest the next bump in the SAME shape the operator typed:
+  # - 2-segment input → suggest next minor (PROD_v1.5 → PROD_v1.6).
+  # - 3-segment input → suggest next patch (PROD_v1.4.1 → PROD_v1.4.2).
+  # The shape choice is intentional per ADR-0056: a 2-segment bump
+  # signals a minor release; a 3-segment bump signals a patch release.
+  # The suggester preserves the operator's intent rather than forcing
+  # a shape switch.
+  major="$(echo "$version" | sed -E 's/^PROD_v([0-9]+)\.([0-9]+)(\.([0-9]+))?$/\1/')"
+  minor="$(echo "$version" | sed -E 's/^PROD_v([0-9]+)\.([0-9]+)(\.([0-9]+))?$/\2/')"
+  patch="$(echo "$version" | sed -E 's/^PROD_v([0-9]+)\.([0-9]+)(\.([0-9]+))?$/\4/')"
+  if [[ -n "$patch" ]]; then
+    next_version="PROD_v${major}.${minor}.$((patch + 1))"
+    shape_label="next patch"
+  else
+    next_version="PROD_v${major}.$((minor + 1))"
+    shape_label="next minor"
+  fi
   die "release branch '$version' already exists on origin at ${existing_ref:0:12}.
-   Pick a new version — next minor would be: $next_minor
-HU: A '$version' release-ág már létezik a távolin. Válassz új verziót, pl.: $next_minor"
+   Pick a new version — $shape_label would be: $next_version
+HU: A '$version' release-ág már létezik a távolin. Válassz új verziót, pl.: $next_version"
 fi
 ok "release branch '$version' is free on origin"
 

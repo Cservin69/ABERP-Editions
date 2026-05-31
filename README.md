@@ -75,7 +75,7 @@ checklist, rollback, and ongoing update workflow:
 → **[`docs/CUTOVER_RUNBOOK.md`](docs/CUTOVER_RUNBOOK.md)**
 
 Short version: each production release is a branch on origin named
-`PROD_vMAJOR.MINOR`. On the prod machine:
+`PROD_vMAJOR.MINOR` or `PROD_vMAJOR.MINOR.PATCH`. On the prod machine:
 
 ```bash
 git clone --branch PROD_v1.0 <origin-url> ABERP-prod
@@ -85,6 +85,10 @@ cd ABERP-prod
 
 `./run/release.sh PROD_v1.0` is the dev-side script that publishes a
 release branch from `main`.
+
+The patch-vs-minor-vs-major rules (when to bump which segment, what
+counts as a "module" for the 2.0 trigger) are pinned in
+[`adr/0056-versioning-policy.md`](adr/0056-versioning-policy.md).
 
 ## Branding the printed invoice (optional)
 

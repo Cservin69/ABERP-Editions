@@ -1,6 +1,10 @@
 # ABERP production cutover runbook
 
-**Last updated:** 2026-05-31 — Session 200 / PR-200 (`upgrade_prod.sh`
+**Last updated:** 2026-05-31 — Session 201 / PR-201 (versioning policy
+landed in ADR-0056; `release.sh` validator extended to accept the
+3-segment `PROD_vX.Y.Z` patch shape; runbook placeholder examples
+switched to `PROD_vX.Y[.Z]`).
+**Prior update:** 2026-05-31 — Session 200 / PR-200 (`upgrade_prod.sh`
 one-command hülye-biztos upgrade + `run_prod.sh` Frankenstein-build
 refusal — see Step 9 rewrite).
 **Prior update:** 2026-05-31 — Session 198 / PR-198 (troubleshooting
@@ -73,7 +77,9 @@ git push origin main               # if any local-only commits remain
    the dev-workspace sentinel guards against running it from the wrong
    clone after cutover.
 2. Refuse unless you're on `main` with a clean tree.
-3. Validate the version matches `PROD_vMAJOR.MINOR` (uppercase, underscore).
+3. Validate the version matches `PROD_vMAJOR.MINOR[.PATCH]` (uppercase,
+   underscore; 2-segment OR 3-segment per ADR-0056). 4+ segments and
+   suffixes (e.g. `-rc1`) are rejected.
 4. Refuse if `PROD_v1.0` already exists on origin.
 5. `git push origin main:refs/heads/PROD_v1.0`.
 6. Print the operator's `git clone --branch …` command for Step 2.
@@ -509,7 +515,8 @@ cd ~/ABERP-prod
 What `upgrade_prod.sh` does, in order (all failures loud-fail with
 bilingual error + recovery hint):
 
-1. Validates the version arg matches `PROD_v<MAJOR>.<MINOR>`.
+1. Validates the version arg matches `PROD_v<MAJOR>.<MINOR>[.<PATCH>]`
+   (2-segment OR 3-segment per ADR-0056).
 2. Refuses if invoked from the dev workspace (path-substring sentinel,
    same as `release.sh`). Opt-out: `ABERP_ALLOW_DEV_WORKSPACE=1`.
 3. Verifies `origin` works + the release branch exists on it
@@ -935,9 +942,9 @@ the reason the runbook bangs the snapshot-the-DB drum at every step.
 
 | Need to... | Command |
 |------------|---------|
-| Publish a release branch (from dev) | `./run/release.sh PROD_vX.Y` |
-| Clone a release on the prod machine | `git clone --branch PROD_vX.Y <origin-url> ABERP-prod` |
-| Upgrade an existing prod install to a new release | `./run/upgrade_prod.sh PROD_vX.Y` |
+| Publish a release branch (from dev) | `./run/release.sh PROD_vX.Y[.Z]` |
+| Clone a release on the prod machine | `git clone --branch PROD_vX.Y[.Z] <origin-url> ABERP-prod` |
+| Upgrade an existing prod install to a new release | `./run/upgrade_prod.sh PROD_vX.Y[.Z]` |
 | Launch the prod app | `./run/run_prod.sh` |
 | Set up / rotate NAV creds | SPA NAV credentials wizard (boot route, S133) |
 | Set up / rotate SMTP creds | SPA → Tenant Settings → SMTP → Test Connection → Save |
