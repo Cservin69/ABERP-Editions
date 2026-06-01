@@ -11,7 +11,7 @@
 
 import type { DetailActionButton } from "./invoice-actions";
 import { buttonsForState } from "./invoice-actions";
-import type { Currency, InvoiceState } from "./api";
+import type { Currency, InvoiceState, RowKind } from "./api";
 import { lifecycleIndex } from "./labels";
 import { filterInvoicesByNeedle, type InvoiceSearchRow } from "./keyboard-nav";
 
@@ -164,7 +164,8 @@ export type SortKey =
   | "series_number"
   | "fiscal_year"
   | "state"
-  | "total";
+  | "total"
+  | "row_kind";
 
 /** PR-94 / session-114 — sort direction. */
 export type SortDir = "asc" | "desc";
@@ -181,6 +182,11 @@ export interface InvoiceSortRow {
   total_gross: number | null;
   buyer_name: string | null;
   currency: Currency;
+  /** PR-213 / S215 — virtual-union discriminator per ADR-0058. Read
+   * by [`compareInvoices`] for the `row_kind` sort key (Own sorts
+   * before ExtNav in ascending order — the operator's primary
+   * concern is canonical rows; mirror rows are read-only context). */
+  row_kind: RowKind;
 }
 
 /** PR-94 / session-114 — pure comparator. Returns a `(a, b) → number`
@@ -327,6 +333,26 @@ function rawCompare<R extends InvoiceSortRow>(
       // Numeric on minor units. Nulls handled upstream.
       return (a.total_gross as number) - (b.total_gross as number);
     }
+    case "row_kind": {
+      // PR-213 / S215 — Own < ExtNav in ascending order. The operator's
+      // primary concern is the canonical AR set; the NAV-mirror rows are
+      // read-only context that should cluster below by default. Within
+      // the same kind the invoice_id tiebreaker takes over (assigned by
+      // the outer `compareInvoices` wrapper).
+      return rowKindIndex(a.row_kind) - rowKindIndex(b.row_kind);
+    }
+  }
+}
+
+/** PR-213 / S215 — ordinal for the closed-vocab `RowKind`. Own < ExtNav
+ * by design (see `compareInvoices`); adding a third variant to
+ * `RowKind` widens both the type and this table together. */
+function rowKindIndex(kind: RowKind): number {
+  switch (kind) {
+    case "Own":
+      return 0;
+    case "ExtNav":
+      return 1;
   }
 }
 
@@ -345,6 +371,11 @@ export interface InvoiceFilterSpec {
   needle: string;
   state: "All" | InvoiceState;
   currency: "All" | Currency;
+  /** PR-213 / S215 — row-kind facet. `"All"` short-circuits the gate
+   * (every row passes); `"Own"` restricts to canonical ABERP-issued
+   * invoices; `"ExtNav"` restricts to NAV-mirror rows from
+   * `restored_invoice`. */
+  row_kind: "All" | RowKind;
 }
 
 /** PR-94 / session-114 — empty filter (every facet open). The
@@ -353,6 +384,7 @@ export const EMPTY_FILTER: InvoiceFilterSpec = {
   needle: "",
   state: "All",
   currency: "All",
+  row_kind: "All",
 };
 
 /** PR-94 / session-114 — `true` iff the spec has every facet open
@@ -362,7 +394,8 @@ export function isFilterEmpty(spec: InvoiceFilterSpec): boolean {
   return (
     spec.needle.trim().length === 0 &&
     spec.state === "All" &&
-    spec.currency === "All"
+    spec.currency === "All" &&
+    spec.row_kind === "All"
   );
 }
 
@@ -383,9 +416,11 @@ export function filterInvoices<R extends InvoiceSortRow & InvoiceSearchRow>(
 ): R[] {
   const stateGate = spec.state === "All";
   const currencyGate = spec.currency === "All";
+  const rowKindGate = spec.row_kind === "All";
   const faceted = rows.filter((r) => {
     if (!stateGate && r.state !== spec.state) return false;
     if (!currencyGate && r.currency !== spec.currency) return false;
+    if (!rowKindGate && r.row_kind !== spec.row_kind) return false;
     return true;
   });
   return filterInvoicesByNeedle(faceted, spec.needle);

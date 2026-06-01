@@ -309,6 +309,7 @@ function row(
     total_gross: 1000,
     buyer_name: null,
     currency: "HUF",
+    row_kind: "Own",
     ...partial,
   };
 }
@@ -623,6 +624,7 @@ describe("filterInvoices — facet gating", () => {
       needle: "",
       state: "Finalized",
       currency: "All",
+      row_kind: "All",
     });
     expect(out.map((r) => r.invoice_id)).toEqual(["01F002", "01E003"]);
   });
@@ -631,6 +633,7 @@ describe("filterInvoices — facet gating", () => {
       needle: "",
       state: "All",
       currency: "EUR",
+      row_kind: "All",
     });
     expect(out.map((r) => r.invoice_id)).toEqual(["01E003"]);
   });
@@ -639,6 +642,7 @@ describe("filterInvoices — facet gating", () => {
       needle: "",
       state: "Finalized",
       currency: "HUF",
+      row_kind: "All",
     });
     // Finalized AND HUF — only 01F002 qualifies (01E003 is Finalized
     // but EUR).
@@ -651,6 +655,7 @@ describe("filterInvoices — facet gating", () => {
       needle: "alpha",
       state: "Finalized",
       currency: "HUF",
+      row_kind: "All",
     });
     expect(noMatch.length).toBe(0);
     // Same needle with All facets surfaces the Alpha row.
@@ -658,6 +663,7 @@ describe("filterInvoices — facet gating", () => {
       needle: "alpha",
       state: "All",
       currency: "All",
+      row_kind: "All",
     });
     expect(match.map((r) => r.invoice_id)).toEqual(["01R001"]);
   });
@@ -667,6 +673,7 @@ describe("filterInvoices — facet gating", () => {
       needle: "2026-000002",
       state: "All",
       currency: "All",
+      row_kind: "All",
     });
     expect(out.map((r) => r.invoice_id)).toEqual(["01F002"]);
   });
@@ -686,6 +693,7 @@ describe("filterInvoices — every currency facet value passes through", () => {
         needle: "",
         state: "All",
         currency: c.currency,
+        row_kind: "All",
       });
       expect(out.map((r) => r.invoice_id)).toEqual(c.expected);
     });
@@ -698,6 +706,7 @@ describe("filterInvoices — needle does not bypass the facets", () => {
       needle: "finalized",
       state: "All",
       currency: "All",
+      row_kind: "All",
     };
     const out = filterInvoices(FIXTURES, spec);
     expect(out.map((r) => r.invoice_id)).toEqual(["01F002", "01E003"]);
@@ -707,6 +716,7 @@ describe("filterInvoices — needle does not bypass the facets", () => {
       needle: "finalized",
       state: "All",
       currency: "EUR",
+      row_kind: "All",
     };
     const out = filterInvoices(FIXTURES, spec);
     expect(out.map((r) => r.invoice_id)).toEqual(["01E003"]);
@@ -719,18 +729,150 @@ describe("isFilterEmpty", () => {
   });
   it("returns true for whitespace-only needle + All facets", () => {
     expect(
-      isFilterEmpty({ needle: "   ", state: "All", currency: "All" }),
+      isFilterEmpty({ needle: "   ", state: "All", currency: "All", row_kind: "All" }),
     ).toBe(true);
   });
   it("returns false when any facet is engaged", () => {
     expect(
-      isFilterEmpty({ needle: "x", state: "All", currency: "All" }),
+      isFilterEmpty({ needle: "x", state: "All", currency: "All", row_kind: "All" }),
     ).toBe(false);
     expect(
-      isFilterEmpty({ needle: "", state: "Finalized", currency: "All" }),
+      isFilterEmpty({ needle: "", state: "Finalized", currency: "All", row_kind: "All" }),
     ).toBe(false);
     expect(
-      isFilterEmpty({ needle: "", state: "All", currency: "EUR" }),
+      isFilterEmpty({ needle: "", state: "All", currency: "EUR", row_kind: "All" }),
     ).toBe(false);
+    // PR-213 / S215 — row_kind facet engages isFilterEmpty's gate too.
+    expect(
+      isFilterEmpty({ needle: "", state: "All", currency: "All", row_kind: "Own" }),
+    ).toBe(false);
+    expect(
+      isFilterEmpty({ needle: "", state: "All", currency: "All", row_kind: "ExtNav" }),
+    ).toBe(false);
+  });
+});
+
+// ── PR-213 / S215 — row_kind sort + filter ─────────────────────────
+//
+// The virtual-union shape per ADR-0058 lives ONLY at the wire-shape +
+// render-component layer; the sort/filter helpers here are the
+// load-bearing client-side machinery. Three properties pinned:
+//   1. compareInvoices on row_kind orders Own before ExtNav ascending.
+//   2. compareInvoices descending flips that order.
+//   3. filterInvoices on row_kind="ExtNav" surfaces only ExtNav rows;
+//      "Own" surfaces only Own rows.
+// A regression that defaults missing row_kind to "Own" silently (or
+// vice versa) would slip past a single-fixture test; the mixed-kind
+// fixture below makes the comparator and the facet gate impossible to
+// hard-code to one constant.
+
+const ROW_KIND_FIXTURES: InvoiceSortRow[] = [
+  frow({
+    invoice_id: "01OWN001",
+    sequence_number: 1,
+    fiscal_year: 2026,
+    state: "Finalized",
+    total_gross: 1000,
+    buyer_name: "Alpha Kft.",
+    currency: "HUF",
+    row_kind: "Own",
+  }),
+  frow({
+    invoice_id: "rinv_NAV0042",
+    sequence_number: 0,
+    fiscal_year: 2026,
+    state: "Unknown",
+    total_gross: 3000,
+    buyer_name: null,
+    currency: "HUF",
+    row_kind: "ExtNav",
+  }),
+  frow({
+    invoice_id: "01OWN002",
+    sequence_number: 2,
+    fiscal_year: 2026,
+    state: "Ready",
+    total_gross: 2000,
+    buyer_name: "Bravo Kft.",
+    currency: "HUF",
+    row_kind: "Own",
+  }),
+  frow({
+    invoice_id: "rinv_NAV0099",
+    sequence_number: 0,
+    fiscal_year: 2026,
+    state: "Unknown",
+    total_gross: 5000,
+    buyer_name: null,
+    currency: "EUR",
+    row_kind: "ExtNav",
+  }),
+];
+
+describe("compareInvoices — row_kind column", () => {
+  it("sorts Own before ExtNav ascending", () => {
+    const rows = [...ROW_KIND_FIXTURES];
+    rows.sort((a, b) => compareInvoices(a, b, "row_kind", "asc"));
+    // Both Own rows cluster first; both ExtNav rows cluster second.
+    // Within each cluster, the invoice_id tiebreaker (ascending) sets
+    // the inner order regardless of the user-selected dir.
+    expect(rows.map((r) => r.invoice_id)).toEqual([
+      "01OWN001",
+      "01OWN002",
+      "rinv_NAV0042",
+      "rinv_NAV0099",
+    ]);
+  });
+  it("sorts ExtNav before Own descending", () => {
+    const rows = [...ROW_KIND_FIXTURES];
+    rows.sort((a, b) => compareInvoices(a, b, "row_kind", "desc"));
+    // ExtNav cluster first; Own cluster second. Within each cluster
+    // the invoice_id tiebreak stays ASCENDING (the tiebreak does NOT
+    // flip with dir — see `compareInvoices — ties + stability`).
+    expect(rows.map((r) => r.invoice_id)).toEqual([
+      "rinv_NAV0042",
+      "rinv_NAV0099",
+      "01OWN001",
+      "01OWN002",
+    ]);
+  });
+});
+
+describe("filterInvoices — row_kind facet", () => {
+  it('row_kind="All" surfaces every row', () => {
+    const out = filterInvoices(ROW_KIND_FIXTURES, {
+      needle: "",
+      state: "All",
+      currency: "All",
+      row_kind: "All",
+    });
+    expect(out.length).toBe(ROW_KIND_FIXTURES.length);
+  });
+  it('row_kind="Own" hides every ExtNav row', () => {
+    const out = filterInvoices(ROW_KIND_FIXTURES, {
+      needle: "",
+      state: "All",
+      currency: "All",
+      row_kind: "Own",
+    });
+    expect(out.map((r) => r.invoice_id)).toEqual(["01OWN001", "01OWN002"]);
+  });
+  it('row_kind="ExtNav" hides every Own row', () => {
+    const out = filterInvoices(ROW_KIND_FIXTURES, {
+      needle: "",
+      state: "All",
+      currency: "All",
+      row_kind: "ExtNav",
+    });
+    expect(out.map((r) => r.invoice_id)).toEqual(["rinv_NAV0042", "rinv_NAV0099"]);
+  });
+  it("row_kind ANDs with currency facet (ExtNav + EUR isolates one row)", () => {
+    const out = filterInvoices(ROW_KIND_FIXTURES, {
+      needle: "",
+      state: "All",
+      currency: "EUR",
+      row_kind: "ExtNav",
+    });
+    expect(out.map((r) => r.invoice_id)).toEqual(["rinv_NAV0099"]);
   });
 });

@@ -49,7 +49,7 @@
     type LabelSignal,
   } from "../lib/labels";
   import { formatInvoiceTotal, filenameForInvoice } from "../lib/format";
-  import type { BankAccountSnapshot, Currency } from "../lib/api";
+  import type { BankAccountSnapshot, Currency, RowKind } from "../lib/api";
   import {
     EMPTY_FILTER,
     buyerColumnDisplay,
@@ -532,6 +532,7 @@
   // never had a total persisted) render as empty cells.
   function exportCsv() {
     const headers = [
+      "Kind",
       "Invoice ID",
       "Invoice number",
       "Partner",
@@ -543,7 +544,15 @@
       "Paid",
     ];
     const rowsOut: unknown[][] = visibleRows.map((row) => {
-      const composedNumber = `${row.fiscal_year}-${String(row.sequence_number).padStart(6, "0")}`;
+      // PR-213 / S215 — ExtNav rows carry the raw NAV invoice number
+      // as their operator-readable identifier; Own rows carry the
+      // composed `YYYY-NNNNNN`. The "Invoice number" CSV column
+      // surfaces whichever applies so the bookkeeper's spreadsheet
+      // can sort across both kinds without re-encoding.
+      const composedNumber =
+        row.row_kind === "ExtNav" && row.source_nav_invoice_number !== null
+          ? row.source_nav_invoice_number
+          : `${row.fiscal_year}-${String(row.sequence_number).padStart(6, "0")}`;
       const partner =
         row.buyer_name === null || row.buyer_name.trim().length === 0
           ? ""
@@ -554,6 +563,7 @@
         totalMajor = row.currency === "EUR" ? signed / 100 : signed;
       }
       return [
+        row.row_kind,
         row.invoice_id,
         composedNumber,
         partner,
@@ -623,6 +633,7 @@
         needle: filter.needle,
         state: filter.state,
         currency: filter.currency,
+        row_kind: filter.row_kind,
       },
     });
   });
@@ -693,6 +704,28 @@
           <option value="EUR">EUR</option>
         </select>
       </label>
+      <!-- PR-213 / S215 — Kind facet. Closed-vocab `RowKind` per
+           ADR-0058. Filter to `Own` to hide every NAV-mirror row;
+           filter to `ExtNav` to see only the elsewhere-issued
+           prefix (operator's YTD reconciliation view). -->
+      <label class="filter">
+        <span class="filter-label">Kind</span>
+        <select
+          value={filter.row_kind}
+          onchange={(e) =>
+            (filter = {
+              ...filter,
+              row_kind: (e.currentTarget as HTMLSelectElement).value as
+                | "All"
+                | RowKind,
+            })}
+          aria-label="Filter invoices by row kind"
+        >
+          <option value="All">All</option>
+          <option value="Own">Own</option>
+          <option value="ExtNav">External (NAV mirror)</option>
+        </select>
+      </label>
       <button
         type="button"
         class="quiet-button"
@@ -731,17 +764,16 @@
   <table class="dense">
     <thead>
       <tr>
-        <!-- PR-94 / session-114 — sortable column headers. Each header
-             is a button that three-cycles asc → desc → reset via
-             `onSortClick`. The ▲/▼ glyph next to the active sort
-             column carries the categorical signal (ADR-0017
-             §"Adversarial review #4"); the column label stays in
-             place. Aria-sort exposes the current direction to
-             assistive tech. -->
+        <!-- PR-213 / S215 — Kind column. Closed-vocab `RowKind` chip
+             (`Own` / `Ext.`) sortable like every other column per
+             ADR-0058. The Invoice id (UUID) column from PR-25 / PR-94
+             is dropped — operators read invoices by `2026-000054`,
+             not by ULID; the UUID is still the `#each` key for Svelte
+             reactivity but is no longer rendered as a column. -->
         <th
           scope="col"
-          class="col-id"
-          aria-sort={sort.key === "invoice_id"
+          class="col-row-kind"
+          aria-sort={sort.key === "row_kind"
             ? sort.dir === "asc"
               ? "ascending"
               : "descending"
@@ -750,10 +782,10 @@
           <button
             type="button"
             class="sort-header"
-            onclick={() => onSortClick("invoice_id")}
+            onclick={() => onSortClick("row_kind")}
           >
-            <span>Invoice id</span>
-            <span class="sort-indicator" aria-hidden="true">{sortIndicator("invoice_id")}</span>
+            <span>Kind</span>
+            <span class="sort-indicator" aria-hidden="true">{sortIndicator("row_kind")}</span>
           </button>
         </th>
         <!-- PR-65 / session-86 — Partner column. Positioned between
@@ -895,15 +927,43 @@
         {@const pictogram = navStatusPictogram(row.state, row.payment !== null)}
         {@const pictogramBusy = busyPictogramRow === row.invoice_id}
         <tr class:row-focused={isKeyboardFocused}>
-          <td class="col-id mono">
+          <!-- PR-213 / S215 — Kind chip + click-to-inspect affordance.
+               The chip carries the `RowKind` categorical signal (glyph
+               + label per ADR-0017 §"Adversarial review #4"); the
+               click on the chip opens the detail modal — replacing the
+               dropped UUID column's click affordance. For ExtNav rows
+               the source NAV invoice number renders as a muted line
+               below the chip so the operator has a readable identity
+               for non-ABERP-issued rows (the digest does not carry a
+               buyer name). -->
+          <td class="col-row-kind">
             <button
               type="button"
               class="id-link"
               onclick={() => (navStack = [row.invoice_id])}
               aria-label={`Open detail for invoice ${row.invoice_id}`}
             >
-              {row.invoice_id}
+              <span
+                class="row-kind-chip"
+                class:kind-own={row.row_kind === "Own"}
+                class:kind-ext-nav={row.row_kind === "ExtNav"}
+                title={row.row_kind === "Own"
+                  ? "Canonical ABERP-issued invoice"
+                  : "External: NAV mirror — issued under our tax number outside ABERP (e.g. Billingo, manual). Read-only."}
+              >
+                <span class="row-kind-glyph" aria-hidden="true"
+                  >{row.row_kind === "Own" ? "●" : "↺"}</span
+                >
+                <span class="row-kind-text"
+                  >{row.row_kind === "Own" ? "Own" : "Ext."}</span
+                >
+              </span>
             </button>
+            {#if row.row_kind === "ExtNav" && row.source_nav_invoice_number !== null}
+              <div class="ext-nav-id mono" title="Raw NAV invoice number">
+                {row.source_nav_invoice_number}
+              </div>
+            {/if}
           </td>
           <td class="col-partner" class:partner-missing={isPartnerMissing}>
             {partnerLabel}
@@ -911,6 +971,15 @@
           <td class="col-num mono">{row.sequence_number}</td>
           <td class="col-num mono">{row.fiscal_year}</td>
           <td class="col-state">
+            <!-- PR-213 / S215 — ExtNav rows have no NAV lifecycle from
+                 our records (`queryInvoiceDigest` doesn't expose ack
+                 status). Render a quiet em-dash placeholder rather than
+                 a misleading "Unknown" pictogram + state chip; the
+                 operator's eye reads "no value to show here" the same
+                 way it reads other empty signal cells. -->
+            {#if row.row_kind === "ExtNav"}
+              <span class="ext-nav-state-placeholder" aria-label="State not applicable for NAV-mirror row">—</span>
+            {:else}
             <!-- PR-95 / session-115 — NAV-status pictogram. 4-state
                  closed vocab; click-to-recheck only on `InFlight`.
                  stopPropagation keeps the row's id-link click
@@ -989,32 +1058,43 @@
                 <span class="state-text">Paid</span>
               </span>
             {/if}
+            {/if}
           </td>
           <td class="col-num mono"
             >{formatInvoiceTotal(row.total_gross, row.currency, row.is_storno)}</td
           >
           <td class="col-actions">
-            <div class="row-actions">
-              {#each actions as action (action)}
-                {@const meta = quickActionMeta(action)}
-                {@const busy =
-                  busyRow !== null &&
-                  busyRow.invoiceId === row.invoice_id &&
-                  busyRow.action === action}
-                <button
-                  type="button"
-                  class="row-action"
-                  class:busy
-                  disabled={busyRow !== null}
-                  onclick={() => dispatchQuickAction(row, action)}
-                  aria-label={`${meta.label} — invoice ${row.invoice_id}`}
-                  title={meta.label}
-                >
-                  <span class="row-action-glyph" aria-hidden="true">{meta.glyph}</span>
-                  <span class="row-action-label">{meta.label.split(" ")[0]}</span>
-                </button>
-              {/each}
-            </div>
+            <!-- PR-213 / S215 — ExtNav rows are read-only by construction:
+                 NAV-mirror rows belong to whoever issued them outside
+                 ABERP. The hard-hide is a component-level invariant per
+                 ADR-0058 (NOT a tooltip warning, NOT operator restraint).
+                 Without this guard a row-click would hit a backend route
+                 that 404s on a non-canonical invoice id (rinv_*) — the
+                 component MUST never present the affordance in the first
+                 place. -->
+            {#if row.row_kind === "Own"}
+              <div class="row-actions">
+                {#each actions as action (action)}
+                  {@const meta = quickActionMeta(action)}
+                  {@const busy =
+                    busyRow !== null &&
+                    busyRow.invoiceId === row.invoice_id &&
+                    busyRow.action === action}
+                  <button
+                    type="button"
+                    class="row-action"
+                    class:busy
+                    disabled={busyRow !== null}
+                    onclick={() => dispatchQuickAction(row, action)}
+                    aria-label={`${meta.label} — invoice ${row.invoice_id}`}
+                    title={meta.label}
+                  >
+                    <span class="row-action-glyph" aria-hidden="true">{meta.glyph}</span>
+                    <span class="row-action-label">{meta.label.split(" ")[0]}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
           </td>
         </tr>
       {/each}
@@ -1316,6 +1396,72 @@
 
   .col-id {
     width: 30ch;
+  }
+
+  /* PR-213 / S215 — Kind column replaces the dropped Invoice id (UUID)
+     column. Width is sized to the chip + the optional ExtNav source-
+     NAV-invoice-number subtitle below it; the chip stays the leftmost
+     row identifier (clickable to open the detail modal, same affordance
+     the dropped UUID cell carried). Quiet aesthetic per ADR-0017 §1-2;
+     the categorical signal is the chip's glyph + label per
+     §"Adversarial review #4". */
+  .col-row-kind {
+    width: 18ch;
+    vertical-align: top;
+  }
+
+  .row-kind-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: 0 var(--space-2);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    line-height: 1.6;
+    letter-spacing: 0.04em;
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 2px;
+    background: var(--color-surface-base);
+    color: var(--color-text-secondary);
+    cursor: pointer;
+  }
+
+  .row-kind-chip.kind-own {
+    color: var(--color-text-strong);
+    border-color: var(--color-text-muted);
+  }
+
+  .row-kind-chip.kind-ext-nav {
+    color: var(--color-text-muted);
+    border-color: var(--color-surface-divider);
+  }
+
+  .row-kind-glyph {
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    line-height: 1;
+  }
+
+  /* PR-213 / S215 — raw NAV invoice number for ExtNav rows. Muted
+     subtitle under the Kind chip; gives the operator the readable
+     identity of a NAV-mirror row without inflating into a separate
+     column. Monospace + tabular so numeric NAV invoice numbers
+     align vertically across rows. */
+  .ext-nav-id {
+    margin-top: var(--space-1);
+    font-family: var(--type-family-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
+  }
+
+  /* PR-213 / S215 — em-dash placeholder for the State column on ExtNav
+     rows. No NAV lifecycle is known from a `queryInvoiceDigest` row;
+     surfacing the muted dash matches the Partner column's missing-
+     buyer-name posture (operator's eye reads "no value" the same way). */
+  .ext-nav-state-placeholder {
+    color: var(--color-text-muted);
+    font-family: var(--type-family-body);
   }
 
   /* PR-25 — invoice-id cell is a clickable inspector affordance.

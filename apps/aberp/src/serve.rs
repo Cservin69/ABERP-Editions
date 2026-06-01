@@ -3101,6 +3101,28 @@ enum InvoiceState {
     Abandoned,
 }
 
+/// PR-213 / S215 — closed-vocab discriminator on the unified
+/// invoices-list wire shape. `Own` rows are canonical ABERP-issued
+/// invoices read out of the `invoice` table (with their full
+/// audit-ledger-derived trace); `ExtNav` rows are the NAV-mirror
+/// rows read out of the `restored_invoice` table (S180 / NAV-as-DR)
+/// — invoices NAV knows were issued under our `supplierTaxNumber`
+/// but that we did NOT issue through ABERP. The SPA reads this
+/// field to (a) render the Kind column, (b) hide every write-back
+/// affordance (Submit / Storno / Pay) on `ExtNav` rows since they
+/// belong to whoever issued them and we can only observe.
+///
+/// Per ADR-0058 the union is a READ-TIME concat — neither table
+/// carries a `row_kind` column; the discriminator lives in this
+/// wire shape and in the SPA's render component only.
+#[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy)]
+enum RowKind {
+    /// Canonical ABERP-issued invoice from the `invoice` table.
+    Own,
+    /// NAV-mirror row from the `restored_invoice` table.
+    ExtNav,
+}
+
 #[derive(Serialize)]
 struct InvoiceListItem {
     invoice_id: String,
@@ -3187,6 +3209,21 @@ struct InvoiceListItem {
     /// field rides on the same shape as the detail response so a
     /// single TS interface drives both surfaces.
     bank_account: Option<BankAccountSnapshotResponse>,
+    /// PR-213 / S215 — discriminator for the virtual union. `Own`
+    /// for `invoice`-table rows; `ExtNav` for `restored_invoice`-
+    /// table rows. See [`RowKind`] for the read-time-only invariant
+    /// per ADR-0058.
+    row_kind: RowKind,
+    /// PR-213 / S215 — `Some(_)` IFF `row_kind == ExtNav`; carries
+    /// the raw NAV-emitted `<invoiceNumber>` from
+    /// `restored_invoice.source_nav_invoice_number`. The SPA
+    /// surfaces this on the ExtNav row as the operator-readable
+    /// identity (since the digest does NOT carry a buyer name and
+    /// the `sequence_number` slot is meaningless for non-ABERP
+    /// invoices). `None` for `Own` rows — those carry their own
+    /// composed `YYYY-NNNNNN` identifier via the existing
+    /// `fiscal_year` + `sequence_number` pair.
+    source_nav_invoice_number: Option<String>,
 }
 
 /// PR-73 / ADR-0040 §addendum — wire-shape mirror of the typed
@@ -10604,9 +10641,71 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
                 .bank_snapshot
                 .clone()
                 .map(BankAccountSnapshotResponse::from_typed),
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
         });
     }
+    // PR-213 / S215 — virtual union with `restored_invoice` (the
+    // S180 NAV-as-DR mirror table). Neither table gets a `row_kind`
+    // column; the union lives only here and on the wire shape per
+    // ADR-0058. `restored_invoice` carries NAV-mirror rows the
+    // tenant did NOT issue through ABERP (Billingo, manual, etc.) —
+    // we can see them via `queryInvoiceDigest OUTBOUND` but cannot
+    // act on them. ExtNav rows synthesize an `InvoiceListItem` with
+    // `state: InvoiceState::Unknown` (we don't have the NAV lifecycle
+    // from a digest), every operational field set to `None`
+    // (`payment` / `bank_account` / `buyer_name` — the digest
+    // doesn't carry buyer info), `sequence_number: 0` (placeholder),
+    // and `fiscal_year` taken from `restore_year`. The `currency`
+    // string is parsed via `Currency::iso_code` round-trip
+    // (`HUF`/`EUR`); the DB-level `CHECK (currency IN ('HUF','EUR'))`
+    // on `restored_invoice` makes any other value a schema bug we
+    // surface loudly per CLAUDE.md rule 12.
+    let restored = restore_outgoing::list_restored(&state.db_path, state.tenant.as_str())
+        .context("read restored_invoice mirror for unified list")?;
+    for ext in restored {
+        items.push(restored_to_list_item(ext)?);
+    }
     Ok(items)
+}
+
+/// PR-213 / S215 — pure mapping from a `restored_invoice` row to the
+/// virtual-union [`InvoiceListItem`] wire shape per ADR-0058. Carries
+/// the entire ExtNav-arm synthesis invariant in one place so the unit
+/// test pin can reach it without a full AppState/ledger build-up.
+///
+/// CLAUDE.md rule 12 — closed-vocab currency is `Currency::iso_code`-
+/// round-tripped; an unknown string loud-fails rather than silently
+/// defaulting (the DuckDB `CHECK (currency IN ('HUF','EUR'))` on
+/// `restored_invoice` makes any other value a schema bug we want to
+/// surface).
+fn restored_to_list_item(ext: restore_outgoing::RestoredInvoice) -> Result<InvoiceListItem> {
+    let currency = match ext.currency.as_str() {
+        "HUF" => Currency::Huf,
+        "EUR" => Currency::Eur,
+        other => {
+            return Err(anyhow!(
+                "restored_invoice.currency `{}` is not in the closed vocab \
+                 (HUF/EUR) — DuckDB CHECK constraint should have rejected it",
+                other
+            ));
+        }
+    };
+    Ok(InvoiceListItem {
+        invoice_id: ext.id,
+        sequence_number: 0,
+        fiscal_year: ext.restore_year,
+        state: InvoiceState::Unknown,
+        total_gross: Some(ext.total_gross_minor),
+        has_chain_children: false,
+        is_storno: false,
+        currency,
+        buyer_name: None,
+        payment: None,
+        bank_account: None,
+        row_kind: RowKind::ExtNav,
+        source_nav_invoice_number: Some(ext.source_nav_invoice_number),
+    })
 }
 
 /// PR-65 / session-86 — best-effort read of the side-stored
@@ -12827,6 +12926,8 @@ mod tests {
             buyer_name: None,
             payment: None,
             bank_account: None,
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
         };
         let v = serde_json::to_value(&with_chain).expect("InvoiceListItem must always serialise");
         assert_eq!(
@@ -12847,6 +12948,8 @@ mod tests {
             buyer_name: None,
             payment: None,
             bank_account: None,
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
         };
         let v =
             serde_json::to_value(&without_chain).expect("InvoiceListItem must always serialise");
@@ -12881,6 +12984,8 @@ mod tests {
             buyer_name: None,
             payment: None,
             bank_account: None,
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
         };
         let v = serde_json::to_value(&storno_list).expect("InvoiceListItem must serialise");
         assert_eq!(
@@ -12934,6 +13039,8 @@ mod tests {
             buyer_name: None,
             payment: None,
             bank_account: None,
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
         };
         let v = serde_json::to_value(&plain).expect("InvoiceListItem must serialise");
         assert_eq!(
@@ -13315,6 +13422,8 @@ mod tests {
             buyer_name: None,
             payment: None,
             bank_account: None,
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
         };
         let v = serde_json::to_value(&huf).expect("InvoiceListItem must always serialise");
         assert_eq!(
@@ -13335,6 +13444,8 @@ mod tests {
             buyer_name: None,
             payment: None,
             bank_account: None,
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
         };
         let v = serde_json::to_value(&eur).expect("InvoiceListItem must always serialise");
         assert_eq!(
@@ -13375,6 +13486,8 @@ mod tests {
             buyer_name: Some("Budapesti Sport-Egyesület Kft.".to_string()),
             payment: None,
             bank_account: None,
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
         };
         let v = serde_json::to_value(&with_name).expect("InvoiceListItem must always serialise");
         assert_eq!(
@@ -13395,6 +13508,8 @@ mod tests {
             buyer_name: None,
             payment: None,
             bank_account: None,
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
         };
         let v = serde_json::to_value(&without_name).expect("InvoiceListItem must always serialise");
         assert!(
@@ -14020,5 +14135,294 @@ mod tests {
                 "the handler's `!=` check must reject `{bad}`"
             );
         }
+    }
+
+    // ── PR-213 / S215 — virtual-union RowKind pins (ADR-0058) ───────
+    //
+    // Three load-bearing properties:
+    //   1. `RowKind` round-trips through serde to the PascalCase
+    //      strings the SPA's TS type union expects (`"Own"`, `"ExtNav"`).
+    //      A drift to snake_case (or kebab) would silently break the
+    //      SPA's `row.row_kind === "ExtNav"` action-hide guard.
+    //   2. `restored_to_list_item` maps a `RestoredInvoice` to an
+    //      `InvoiceListItem` whose `row_kind` is `ExtNav`, whose
+    //      `source_nav_invoice_number` is `Some(_)`, whose every
+    //      operational field is `None`, and whose `state` is
+    //      `Unknown` (digest does not carry NAV lifecycle).
+    //   3. The unknown-currency arm loud-fails rather than silently
+    //      defaulting (CLAUDE.md rule 12).
+    //
+    // A separate union-ordering pin lives on the SPA side
+    // (`invoice-list.test.ts > compareInvoices — row_kind column`) where
+    // the sort comparator runs; that surface is the one the operator
+    // sees.
+
+    #[test]
+    fn row_kind_serialises_as_pascal_case_strings() {
+        let own = serde_json::to_value(RowKind::Own).expect("RowKind must always serialise");
+        assert_eq!(
+            own.as_str(),
+            Some("Own"),
+            "RowKind::Own MUST serialise to the literal string \"Own\" — \
+             the SPA's TS type union (`type RowKind = \"Own\" | \"ExtNav\"`) \
+             reads this verbatim and any drift collapses the action-hide guard",
+        );
+        let ext = serde_json::to_value(RowKind::ExtNav).expect("RowKind must always serialise");
+        assert_eq!(
+            ext.as_str(),
+            Some("ExtNav"),
+            "RowKind::ExtNav MUST serialise to the literal string \"ExtNav\"",
+        );
+    }
+
+    #[test]
+    fn restored_to_list_item_synthesises_ext_nav_row() {
+        let ext = restore_outgoing::RestoredInvoice {
+            id: "rinv_TESTULID".to_string(),
+            source_nav_invoice_number: "BIL-2026-0042".to_string(),
+            source_nav_transaction_id: Some("txn-abc".to_string()),
+            issue_date: "2026-04-15".to_string(),
+            total_net_minor: 100_000,
+            total_vat_minor: 27_000,
+            total_gross_minor: 127_000,
+            currency: "HUF".to_string(),
+            restore_year: 2026,
+            created_at: "2026-04-15T12:00:00Z".to_string(),
+        };
+        let item = restored_to_list_item(ext).expect("HUF restored_invoice must map");
+
+        assert_eq!(item.row_kind, RowKind::ExtNav, "row_kind MUST be ExtNav");
+        assert_eq!(
+            item.source_nav_invoice_number.as_deref(),
+            Some("BIL-2026-0042"),
+            "source_nav_invoice_number MUST carry the raw NAV invoice number",
+        );
+        assert_eq!(item.invoice_id, "rinv_TESTULID");
+        assert_eq!(
+            item.sequence_number, 0,
+            "sequence_number is a placeholder for ExtNav"
+        );
+        assert_eq!(item.fiscal_year, 2026, "fiscal_year is restore_year");
+        assert_eq!(
+            item.state,
+            InvoiceState::Unknown,
+            "ExtNav has no NAV lifecycle from digest"
+        );
+        assert_eq!(item.currency, Currency::Huf);
+        assert_eq!(item.total_gross, Some(127_000));
+        assert!(
+            item.buyer_name.is_none(),
+            "digest does not carry buyer name"
+        );
+        assert!(item.payment.is_none(), "ExtNav has no payment state");
+        assert!(
+            item.bank_account.is_none(),
+            "ExtNav has no bank-account snapshot"
+        );
+        assert!(!item.has_chain_children, "ExtNav has no chain children");
+        assert!(!item.is_storno, "ExtNav has no is_storno flag");
+
+        // EUR arm — the other half of the closed-vocab.
+        let ext_eur = restore_outgoing::RestoredInvoice {
+            id: "rinv_EURTEST".to_string(),
+            source_nav_invoice_number: "EU/2026/001".to_string(),
+            source_nav_transaction_id: None,
+            issue_date: "2026-05-01".to_string(),
+            total_net_minor: 50_000,
+            total_vat_minor: 13_500,
+            total_gross_minor: 63_500,
+            currency: "EUR".to_string(),
+            restore_year: 2026,
+            created_at: "2026-05-01T08:00:00Z".to_string(),
+        };
+        let item_eur = restored_to_list_item(ext_eur).expect("EUR restored_invoice must map");
+        assert_eq!(item_eur.currency, Currency::Eur, "EUR arm carries through");
+    }
+
+    #[test]
+    fn restored_to_list_item_loud_fails_unknown_currency() {
+        let bad = restore_outgoing::RestoredInvoice {
+            id: "rinv_BAD".to_string(),
+            source_nav_invoice_number: "BAD-1".to_string(),
+            source_nav_transaction_id: None,
+            issue_date: "2026-04-15".to_string(),
+            total_net_minor: 0,
+            total_vat_minor: 0,
+            total_gross_minor: 0,
+            // The DB-level CHECK should reject this before it reaches
+            // the mapping function, but defence-in-depth — the mapper
+            // must loud-fail rather than silently default to HUF.
+            currency: "USD".to_string(),
+            restore_year: 2026,
+            created_at: "2026-04-15T00:00:00Z".to_string(),
+        };
+        let err = match restored_to_list_item(bad) {
+            Ok(_) => panic!("USD MUST loud-fail"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("USD") && msg.contains("HUF/EUR"),
+            "error MUST name the offending value AND the closed vocab — got `{msg}`",
+        );
+    }
+
+    #[test]
+    fn invoice_list_item_emits_row_kind_and_source_nav_invoice_number() {
+        // Own arm: row_kind = "Own", source_nav_invoice_number = null.
+        let own = InvoiceListItem {
+            invoice_id: "inv_OWN".to_string(),
+            sequence_number: 1,
+            fiscal_year: 2026,
+            state: InvoiceState::Ready,
+            total_gross: Some(123_456),
+            has_chain_children: false,
+            is_storno: false,
+            currency: Currency::Huf,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
+        };
+        let v = serde_json::to_value(&own).expect("InvoiceListItem must serialise");
+        assert_eq!(
+            v.get("row_kind").and_then(|x| x.as_str()),
+            Some("Own"),
+            "Own row's row_kind MUST serialise as the PascalCase string \"Own\"",
+        );
+        assert!(
+            v.get("source_nav_invoice_number")
+                .map(|x| x.is_null())
+                .unwrap_or(false),
+            "Own row's source_nav_invoice_number MUST serialise as JSON null (not absent)",
+        );
+
+        // ExtNav arm: row_kind = "ExtNav", source_nav_invoice_number = string.
+        let ext = InvoiceListItem {
+            invoice_id: "rinv_EXT".to_string(),
+            sequence_number: 0,
+            fiscal_year: 2026,
+            state: InvoiceState::Unknown,
+            total_gross: Some(127_000),
+            has_chain_children: false,
+            is_storno: false,
+            currency: Currency::Huf,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
+            row_kind: RowKind::ExtNav,
+            source_nav_invoice_number: Some("BIL-2026-001".to_string()),
+        };
+        let v = serde_json::to_value(&ext).expect("InvoiceListItem must serialise");
+        assert_eq!(
+            v.get("row_kind").and_then(|x| x.as_str()),
+            Some("ExtNav"),
+            "ExtNav row's row_kind MUST serialise as the PascalCase string \"ExtNav\"",
+        );
+        assert_eq!(
+            v.get("source_nav_invoice_number").and_then(|x| x.as_str()),
+            Some("BIL-2026-001"),
+            "ExtNav row's source_nav_invoice_number MUST carry the raw NAV invoice number",
+        );
+    }
+
+    /// PR-213 / S215 — end-to-end union test (DuckDB-backed). Mirrors
+    /// the brief's "seed an in-memory or temp DuckDB with 2 rows in
+    /// `invoice` + 2 rows in `restored_invoice`, assert the list query
+    /// returns 4 rows with correct row_kind tagging" ask, scoped to the
+    /// `restored_invoice` half (the Own arm needs the full audit-ledger
+    /// + billing-store harness and is exercised by every
+    /// `list_invoices_*` integration pin elsewhere). Asserts:
+    ///   - `list_restored` reads back exactly what was inserted.
+    ///   - `restored_to_list_item` round-trips each row through the
+    ///     mapping with `row_kind = ExtNav`.
+    ///   - The synthesized items preserve issue_date ordering (the
+    ///     SPA's client-side sort takes over from here).
+    #[test]
+    fn restored_invoice_round_trip_through_union_mapping() {
+        let scratch = std::env::temp_dir().join(format!(
+            "aberp-s215-union-{}-{:?}",
+            ulid::Ulid::new(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let db_path = scratch.join("tenant.duckdb");
+        let tenant = "tenant-test";
+
+        // Seed two rows via the production insert path so the schema +
+        // UNIQUE constraint match what list_invoices reads through.
+        for (idx, (src_num, total)) in [
+            ("BIL-2026-0001", 100_000_i64),
+            ("BIL-2026-0042", 250_000_i64),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let ext = restore_outgoing::RestoredInvoice {
+                id: format!("rinv_TESTROW{idx:02}"),
+                source_nav_invoice_number: src_num.to_string(),
+                source_nav_transaction_id: None,
+                issue_date: format!("2026-04-{:02}", idx + 1),
+                total_net_minor: *total,
+                total_vat_minor: 0,
+                total_gross_minor: *total,
+                currency: "HUF".to_string(),
+                restore_year: 2026,
+                created_at: format!("2026-04-{:02}T00:00:00Z", idx + 1),
+            };
+            // Open + ensure schema + raw INSERT — mirrors the seller-
+            // side write path's posture without depending on the wizard
+            // entry-point (which requires NAV credentials).
+            let conn = Connection::open(&db_path).expect("open temp DuckDB");
+            restore_outgoing::ensure_schema(&conn).expect("ensure schema");
+            conn.execute(
+                "INSERT INTO restored_invoice (
+                    id, tenant_id, source_nav_invoice_number,
+                    source_nav_transaction_id, issue_date,
+                    total_net_minor, total_vat_minor, total_gross_minor,
+                    currency, restore_year, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                duckdb::params![
+                    ext.id,
+                    tenant,
+                    ext.source_nav_invoice_number,
+                    ext.source_nav_transaction_id,
+                    ext.issue_date,
+                    ext.total_net_minor,
+                    ext.total_vat_minor,
+                    ext.total_gross_minor,
+                    ext.currency,
+                    ext.restore_year,
+                    ext.created_at,
+                ],
+            )
+            .expect("INSERT restored_invoice");
+        }
+
+        let restored = restore_outgoing::list_restored(&db_path, tenant).expect("list_restored");
+        assert_eq!(restored.len(), 2, "two rows MUST come back");
+        let synthesized: Vec<InvoiceListItem> = restored
+            .into_iter()
+            .map(restored_to_list_item)
+            .collect::<Result<_>>()
+            .expect("every row must map");
+        assert_eq!(synthesized.len(), 2);
+        for item in &synthesized {
+            assert_eq!(
+                item.row_kind,
+                RowKind::ExtNav,
+                "every synthesized item MUST carry row_kind = ExtNav",
+            );
+            assert!(
+                item.source_nav_invoice_number.is_some(),
+                "every synthesized item MUST carry the source NAV invoice number",
+            );
+            assert_eq!(item.fiscal_year, 2026);
+            assert_eq!(item.currency, Currency::Huf);
+        }
+
+        // Clean up scratch — best-effort.
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

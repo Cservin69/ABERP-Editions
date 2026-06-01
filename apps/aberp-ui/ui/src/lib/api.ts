@@ -112,7 +112,33 @@ export interface InvoiceListItem {
    * not render this field today; it rides on the same wire shape as
    * `InvoiceDetail.bank_account` so a single TS interface drives both. */
   bank_account: BankAccountSnapshot | null;
+  /** PR-213 / S215 — closed-vocab row discriminator for the unified
+   * invoices list per ADR-0058. `"Own"` rows come from the canonical
+   * `invoice` table (full audit-ledger lifecycle, every write-back
+   * affordance applies); `"ExtNav"` rows come from the
+   * `restored_invoice` NAV-mirror table (S180 — invoices NAV says
+   * were issued under our `supplierTaxNumber` but that we did NOT
+   * issue through ABERP, e.g. Billingo or manual). The SPA reads
+   * this strictly to (a) render the Kind column and (b) hide every
+   * write-back action (Submit / Storno / Pay) on ExtNav rows — they
+   * are read-only by construction (we observe them; we do not own
+   * them). Pinned by `invoice_list_item_emits_row_kind` on the
+   * Rust side. */
+  row_kind: RowKind;
+  /** PR-213 / S215 — raw NAV-emitted `<invoiceNumber>` for ExtNav
+   * rows; `null` for Own rows. The SPA surfaces this on the ExtNav
+   * row as the operator-readable identity (the digest does not
+   * carry a buyer name AND the `sequence_number` slot is meaningless
+   * for non-ABERP invoices). For Own rows the operator already has
+   * the composed `${fiscal_year}-${sequence_number}` identifier;
+   * this field stays `null` there. */
+  source_nav_invoice_number: string | null;
 }
+
+/** PR-213 / S215 — closed-vocab row discriminator for the unified
+ * invoices list per ADR-0058. Wire form is the PascalCase string
+ * the Rust `RowKind` serialises to. */
+export type RowKind = "Own" | "ExtNav";
 
 /** Possible derived states from `InvoiceTrace::derive_state` on the
  * backend. Kept in lockstep with that `&'static str` ladder per

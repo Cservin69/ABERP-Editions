@@ -74,7 +74,7 @@ describe("invoice-list-persistence — round trip", () => {
     const storage = makeStorage();
     const prefs: InvoiceListPrefs = {
       sort: { key: "total", dir: "desc" },
-      filter: { needle: "ACME", state: "Finalized", currency: "HUF" },
+      filter: { needle: "ACME", state: "Finalized", currency: "HUF", row_kind: "All" },
     };
     saveInvoiceListPrefs(prefs, storage);
     expect(loadInvoiceListPrefs(storage)).toEqual(prefs);
@@ -84,7 +84,7 @@ describe("invoice-list-persistence — round trip", () => {
     const storage = makeStorage();
     const prefs: InvoiceListPrefs = {
       sort: { key: null, dir: "asc" },
-      filter: { needle: "", state: "All", currency: "EUR" },
+      filter: { needle: "", state: "All", currency: "EUR", row_kind: "All" },
     };
     saveInvoiceListPrefs(prefs, storage);
     expect(loadInvoiceListPrefs(storage)).toEqual(prefs);
@@ -113,7 +113,7 @@ describe("invoice-list-persistence — round trip", () => {
     const storage = makeStorage();
     const prior: InvoiceListPrefs = {
       sort: { key: "fiscal_year", dir: "desc" },
-      filter: { needle: "ACME", state: "Finalized", currency: "HUF" },
+      filter: { needle: "ACME", state: "Finalized", currency: "HUF", row_kind: "All" },
     };
     saveInvoiceListPrefs(prior, storage);
     expect(loadInvoiceListPrefs(storage)).toEqual(prior);
@@ -126,7 +126,7 @@ describe("invoice-list-persistence — round trip", () => {
     // posture where a quota throw leaves the keyed slot untouched.
     const next: InvoiceListPrefs = {
       sort: { key: "total", dir: "asc" },
-      filter: { needle: "X", state: "All", currency: "EUR" },
+      filter: { needle: "X", state: "All", currency: "EUR", row_kind: "All" },
     };
     const throwingShim: Storage = {
       ...storage,
@@ -174,7 +174,12 @@ describe("invoice-list-persistence — closed-vocab discipline", () => {
       }),
     });
     const loaded = loadInvoiceListPrefs(storage);
-    expect(loaded.filter).toEqual({ needle: "x", state: "All", currency: "All" });
+    expect(loaded.filter).toEqual({
+      needle: "x",
+      state: "All",
+      currency: "All",
+      row_kind: "All",
+    });
   });
 
   it("discards an unknown currency (widening lag) → All", () => {
@@ -205,7 +210,12 @@ describe("invoice-list-persistence — closed-vocab discipline", () => {
     });
     const loaded = loadInvoiceListPrefs(storage);
     expect(loaded.sort).toEqual({ key: "fiscal_year", dir: "desc" });
-    expect(loaded.filter).toEqual({ needle: "", state: "All", currency: "All" });
+    expect(loaded.filter).toEqual({
+      needle: "",
+      state: "All",
+      currency: "All",
+      row_kind: "All",
+    });
   });
 
   it("coerces a non-string needle to empty (operator did not type one)", () => {
@@ -216,5 +226,64 @@ describe("invoice-list-persistence — closed-vocab discipline", () => {
       }),
     });
     expect(loadInvoiceListPrefs(storage).filter.needle).toBe("");
+  });
+
+  // PR-213 / S215 — row_kind facet persistence pins. Three branches
+  // per CLAUDE.md rule 9: known-vocab "Own" + "ExtNav" round-trip; an
+  // unknown string discards to "All"; a legacy blob without row_kind
+  // also defaults to "All" so an operator upgrading from pre-S215
+  // persists transparently. The sort-key variant ("row_kind") also
+  // round-trips through `LEGAL_SORT_KEYS`.
+  it("round-trips row_kind facet = Own", () => {
+    const storage = makeStorage();
+    saveInvoiceListPrefs(
+      {
+        sort: { key: null, dir: "asc" },
+        filter: { needle: "", state: "All", currency: "All", row_kind: "Own" },
+      },
+      storage,
+    );
+    expect(loadInvoiceListPrefs(storage).filter.row_kind).toBe("Own");
+  });
+  it("round-trips row_kind facet = ExtNav", () => {
+    const storage = makeStorage();
+    saveInvoiceListPrefs(
+      {
+        sort: { key: null, dir: "asc" },
+        filter: { needle: "", state: "All", currency: "All", row_kind: "ExtNav" },
+      },
+      storage,
+    );
+    expect(loadInvoiceListPrefs(storage).filter.row_kind).toBe("ExtNav");
+  });
+  it("discards an unknown row_kind value back to All", () => {
+    const storage = makeStorage({
+      [INVOICE_LIST_PREFS_KEY]: JSON.stringify({
+        sort: { key: null, dir: "asc" },
+        filter: { needle: "", state: "All", currency: "All", row_kind: "Pending" },
+      }),
+    });
+    expect(loadInvoiceListPrefs(storage).filter.row_kind).toBe("All");
+  });
+  it("defaults row_kind to All for a legacy persisted blob (no facet field)", () => {
+    const storage = makeStorage({
+      [INVOICE_LIST_PREFS_KEY]: JSON.stringify({
+        sort: { key: null, dir: "asc" },
+        filter: { needle: "", state: "All", currency: "All" },
+      }),
+    });
+    expect(loadInvoiceListPrefs(storage).filter.row_kind).toBe("All");
+  });
+  it("round-trips sort.key = row_kind", () => {
+    const storage = makeStorage();
+    saveInvoiceListPrefs(
+      {
+        sort: { key: "row_kind", dir: "desc" },
+        filter: { needle: "", state: "All", currency: "All", row_kind: "All" },
+      },
+      storage,
+    );
+    const loaded = loadInvoiceListPrefs(storage);
+    expect(loaded.sort).toEqual({ key: "row_kind", dir: "desc" });
   });
 });

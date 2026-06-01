@@ -19,7 +19,7 @@
 // currency facet. Stale data falls back to defaults; the operator's
 // first sort click overwrites it cleanly.
 
-import type { Currency, InvoiceState } from "./api";
+import type { Currency, InvoiceState, RowKind } from "./api";
 import { LIFECYCLE_ORDER } from "./labels";
 import { EMPTY_FILTER, type InvoiceFilterSpec, type SortDir, type SortKey } from "./invoice-list";
 
@@ -40,11 +40,14 @@ const LEGAL_SORT_KEYS: readonly SortKey[] = [
   "fiscal_year",
   "state",
   "total",
+  "row_kind",
 ];
 
 const LEGAL_SORT_DIRS: readonly SortDir[] = ["asc", "desc"];
 
 const LEGAL_CURRENCIES: readonly Currency[] = ["HUF", "EUR"];
+
+const LEGAL_ROW_KINDS: readonly RowKind[] = ["Own", "ExtNav"];
 
 /** Persisted shape. `sort.key === null` is the lifecycle-natural
  * fallback the Svelte component already documents as the default;
@@ -164,7 +167,8 @@ function validateFilter(raw: unknown): InvoiceFilterSpec {
   const needle = typeof obj.needle === "string" ? obj.needle : "";
   const state = validateStateFacet(obj.state);
   const currency = validateCurrencyFacet(obj.currency);
-  return { needle, state, currency };
+  const row_kind = validateRowKindFacet(obj.row_kind);
+  return { needle, state, currency, row_kind };
 }
 
 function validateStateFacet(raw: unknown): InvoiceFilterSpec["state"] {
@@ -179,6 +183,14 @@ function validateCurrencyFacet(raw: unknown): InvoiceFilterSpec["currency"] {
   if (raw === "All") return "All";
   if (typeof raw === "string" && LEGAL_CURRENCIES.includes(raw as Currency)) {
     return raw as Currency;
+  }
+  return "All";
+}
+
+function validateRowKindFacet(raw: unknown): InvoiceFilterSpec["row_kind"] {
+  if (raw === "All") return "All";
+  if (typeof raw === "string" && LEGAL_ROW_KINDS.includes(raw as RowKind)) {
+    return raw as RowKind;
   }
   return "All";
 }

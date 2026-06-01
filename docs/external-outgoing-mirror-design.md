@@ -296,4 +296,69 @@ The brief specifies "current-year" as the window. ÁFA reporting is monthly; ten
 
 ---
 
+## Addendum — DECISION (Ervin, 2026-06-01)
+
+**Resolved: UI-only union, no schema change.** Ervin ratified neither §5.1
+(reuse `restored_invoice` + `row_kind` column) nor §5.2 (new
+`external_outgoing_invoice` table). The implementation that landed in
+**PR-213 / ABERP v2.1** is:
+
+- **DB untouched.** Both `invoice` (canonical) and `restored_invoice`
+  (S180 NAV-as-DR mirror) keep their existing schema verbatim — no
+  `row_kind` column anywhere, no migration, no new table.
+- **Read-time virtual union in `list_invoices`.** The handler reads
+  both tables and synthesizes a flat `Vec<InvoiceListItem>` where each
+  row carries a `row_kind: RowKind` (`Own | ExtNav`) discriminator on
+  the wire shape only.
+- **SPA renders the Kind chip + hard-hides every write-back action on
+  ExtNav rows.** Sort / filter on `row_kind` are first-class (same
+  shape as the existing State + Currency facets).
+- **Same PR drops the UUID column from the list view** (operators read
+  invoices by `2026-000054`, not by ULID) and surfaces the source NAV
+  invoice number as a muted subtitle on ExtNav rows.
+
+### Why the read-time union over a schema column
+
+1. **DB-engine portability.** Invariants live in the application layer
+   per the project's "no SQL-specific schema-time enforcement of
+   business rules" lean — DuckDB-specific `CHECK` constraints are kept
+   on closed-vocab columns that already exist (`currency`,
+   `local_status`); we do NOT add new ones for synthesised view shape.
+2. **Surgical blast radius.** Adding a `row_kind` column to
+   `restored_invoice` would have meant a migration, backfill, every
+   read/write site updated, and a new audit-payload field. The
+   UI-layer union is a `Vec::push` loop in `list_invoices` + one new
+   SPA column.
+3. **No phantom canonical write path.** A schema column would have
+   invited "what about a NULL row_kind on legacy rows" / "what about
+   restored_invoice rows that get promoted to canonical" footguns. The
+   read-time discriminator has neither — it's computed fresh from the
+   row's table of origin on every list response.
+4. **Audit ledger unchanged.** No new `EventKind` variant. The
+   `restored_invoice` mirror is already pinned to `system.*` audit
+   kinds; the list-view shape change does not touch the ledger.
+
+### What this addendum supersedes in the body of this document
+
+§5 ("Storage") and §6 ("SPA shape") are **historical context only**.
+Both 5.1 (reuse + `row_kind` column) and 5.2 (new
+`external_outgoing_invoice` table) are rejected in favour of the
+UI-only read-time union above. The risk-assessment table in §7 still
+applies verbatim (mirror writes are still non-canonical; the
+allocator is still untouched).
+
+### Where the invariant lives
+
+- Backend: `apps/aberp/src/serve.rs` — `enum RowKind { Own, ExtNav }`,
+  `fn restored_to_list_item`, and the union loop at the end of
+  `fn list_invoices`.
+- SPA: `apps/aberp-ui/ui/src/routes/InvoiceList.svelte` — `Kind`
+  column + the `{#if row.row_kind === "Own"}` action-cell guard.
+- ADR: `adr/0058-virtual-union-invoices-list.md` records the
+  architectural decision in the standard ADR shape so a future
+  reviewer finds the rationale without digging through this
+  pre-implementation review.
+
+---
+
 **End of document.**
