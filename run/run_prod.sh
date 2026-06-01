@@ -47,7 +47,7 @@ if ! bash -n "$0" 2>/dev/null; then
   exit 2
 fi
 
-readonly REPO_ROOT="/Users/aben/Documents/Claude/Projects/ABERP"
+readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly PROD_TENANT="prod"
 readonly PROD_HOME="${HOME}/.aberp/${PROD_TENANT}"
 readonly PROD_SELLER_TOML="${PROD_HOME}/seller.toml"

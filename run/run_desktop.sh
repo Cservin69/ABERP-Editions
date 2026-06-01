@@ -146,7 +146,7 @@ if ! bash -n "$0" 2>/dev/null; then
 fi
 
 # ---------- config (edit if your launch shape differs) -----------------------
-readonly REPO_ROOT="/Users/aben/Documents/Claude/Projects/ABERP"
+readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly DESKTOP_DIR="${REPO_ROOT}/apps/aberp-ui"
 readonly TAURI_CLI_REL="./ui/node_modules/.bin/tauri"   # relative to DESKTOP_DIR
 readonly TAURI_BIN_NAME="aberp-ui"

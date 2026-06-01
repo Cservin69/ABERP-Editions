@@ -45,7 +45,7 @@
 
 set -uo pipefail
 
-readonly REPO_ROOT="/Users/aben/Documents/Claude/Projects/ABERP"
+readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tenant="default"
 
 # ---------- arg parsing ------------------------------------------------------

@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="/Users/aben/Documents/Claude/Projects/ABERP"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_MESSAGE='bundle: sessions 54..62 + PR-46a.1 fix
 
 Bundles nine pending PRs into one snapshot commit. Per-PR commit messages
