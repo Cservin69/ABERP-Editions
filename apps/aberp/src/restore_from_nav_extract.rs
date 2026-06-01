@@ -412,6 +412,18 @@ pub fn parse_invoice_lines(inner_xml: &[u8], currency: Currency) -> Result<Vec<L
 /// counters increment and surface via `tracing::warn!` — the function
 /// does NOT propagate per-candidate errors so a single bad line cannot
 /// abort the whole invoice's extraction.
+///
+/// PR-216 / S218 — the parsed `customer` block is also written back
+/// IN-ROW onto `restored_invoice` via
+/// [`crate::restore_from_nav_outgoing::update_buyer_fields`] so the
+/// SPA outgoing list's Partner column populates without a JOIN to
+/// `partners`. The buyer-snapshot write is independent of the
+/// partner-master upsert: even if the partner master row already
+/// exists (DOMESTIC tax-number hit) we still mirror the name onto the
+/// restored row. UPDATE failures here surface a `tracing::warn!` and
+/// leave the row's buyer columns NULL — the boot-time backfill
+/// ([`crate::restore_from_nav_outgoing::run_buyer_backfill_once`]) will
+/// retry on the next launch.
 pub fn apply_candidates(
     conn: &Connection,
     tenant: &str,
@@ -421,6 +433,27 @@ pub fn apply_candidates(
     currency: Currency,
 ) -> ExtractionDelta {
     let mut delta = ExtractionDelta::default();
+
+    // PR-216 / S218 — write the buyer snapshot to `restored_invoice`
+    // FIRST, before the partner-master upsert. The two are independent
+    // (this UPDATE only touches the restored row; the partner-master
+    // upsert touches `partners`). Per the docstring the UPDATE
+    // failure path is warn-and-continue.
+    if let Err(e) = crate::restore_from_nav_outgoing::update_buyer_fields(
+        conn,
+        tenant,
+        invoice_number,
+        customer.name.as_deref(),
+        customer.tax_number.as_deref(),
+        Some(customer.vat_status.as_db_str()),
+    ) {
+        tracing::warn!(
+            invoice_number = invoice_number,
+            error = ?e,
+            "S218: restored_invoice buyer-snapshot UPDATE failed; row stays NULL — \
+             boot-time backfill will retry"
+        );
+    }
 
     match upsert_partner(conn, tenant, customer) {
         Ok(PartnerUpsertOutcome::Inserted) => delta.partners_restored = 1,
@@ -1072,7 +1105,10 @@ mod tests {
     fn extract_inner_invoice_data_xml_returns_none_on_absent_per_pr215() {
         let envelope = b"<QueryInvoiceDataResponse></QueryInvoiceDataResponse>";
         let got = extract_inner_invoice_data_xml(envelope).expect("absent must not error");
-        assert!(got.is_none(), "absent <invoiceData> must yield Ok(None); got {got:?}");
+        assert!(
+            got.is_none(),
+            "absent <invoiceData> must yield Ok(None); got {got:?}"
+        );
     }
 
     /// PR-215 / S217 — same as above with the `<invoiceDataResult/>`
@@ -1087,7 +1123,10 @@ mod tests {
             <invoiceDataResult/>\
         </QueryInvoiceDataResponse>";
         let got = extract_inner_invoice_data_xml(envelope).expect("empty wrapper must not error");
-        assert!(got.is_none(), "empty <invoiceDataResult/> must yield Ok(None); got {got:?}");
+        assert!(
+            got.is_none(),
+            "empty <invoiceDataResult/> must yield Ok(None); got {got:?}"
+        );
     }
 
     /// PR-215 / S217 — preserved loud-fail surface: `<invoiceData>`
@@ -1099,8 +1138,8 @@ mod tests {
         let envelope = b"<QueryInvoiceDataResponse>\
             <invoiceDataResult><invoiceData>!!!not-base64!!!</invoiceData></invoiceDataResult>\
         </QueryInvoiceDataResponse>";
-        let err = extract_inner_invoice_data_xml(envelope)
-            .expect_err("invalid base64 must loud-fail");
+        let err =
+            extract_inner_invoice_data_xml(envelope).expect_err("invalid base64 must loud-fail");
         assert!(
             format!("{err:#}").contains("base64-decode <invoiceData>"),
             "loud-fail must name the base64 decode failure; got: {err:#}"
@@ -1115,8 +1154,8 @@ mod tests {
         let envelope = b"<QueryInvoiceDataResponse>\
             <invoiceDataResult><invoiceData>   </invoiceData></invoiceDataResult>\
         </QueryInvoiceDataResponse>";
-        let err = extract_inner_invoice_data_xml(envelope)
-            .expect_err("present-but-empty must loud-fail");
+        let err =
+            extract_inner_invoice_data_xml(envelope).expect_err("present-but-empty must loud-fail");
         assert!(
             format!("{err:#}").contains("empty <invoiceData>"),
             "loud-fail must name the empty-blob case; got: {err:#}"
@@ -1419,5 +1458,245 @@ mod tests {
         assert_eq!(acc.products_errored, 6);
         assert_eq!(acc.products_price_varies, 7);
         assert_eq!(acc.invoice_extraction_errored, 8);
+    }
+
+    // ── PR-216 / S218 — apply_candidates writes back buyer snapshot ─
+
+    /// Seed a `restored_invoice` row, then run `apply_candidates` for
+    /// a matching `source_nav_invoice_number`. The row's buyer columns
+    /// MUST come out populated from the parsed `CustomerCandidate`.
+    /// Pins the cross-module integration: extract.rs writes back into
+    /// the restore_from_nav_outgoing module's table via the public
+    /// `update_buyer_fields` helper. Mirrors the prod fresh-restore
+    /// path exactly.
+    #[test]
+    fn apply_candidates_writes_buyer_snapshot_to_restored_invoice() {
+        use crate::restore_from_nav_outgoing as restore_outgoing;
+        let (tmp, _conn) = open_db("s218-write-back");
+        let db_path = tmp.path().join("aberp.duckdb");
+
+        // Seed a restored_invoice row directly (mirrors the wizard's
+        // process_digest INSERT, but bypasses the audit-ledger
+        // dependency the wizard's full entry-point carries).
+        let conn = Connection::open(&db_path).expect("open");
+        restore_outgoing::ensure_schema(&conn).expect("schema");
+        conn.execute(
+            "INSERT INTO restored_invoice (
+                id, tenant_id, source_nav_invoice_number, source_nav_transaction_id,
+                issue_date, total_net_minor, total_vat_minor, total_gross_minor,
+                currency, restore_year, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            duckdb::params![
+                "rinv_TEST",
+                "t1",
+                "BIL-2026-S218",
+                Option::<&str>::None,
+                "2026-04-15",
+                100_000_i64,
+                27_000_i64,
+                127_000_i64,
+                "HUF",
+                2026_i32,
+                "2026-04-15T00:00:00Z",
+            ],
+        )
+        .expect("seed row");
+
+        // Run apply_candidates. The customer block names a DOMESTIC
+        // buyer; the buyer snapshot UPDATE happens before the
+        // partner-master upsert per the docstring contract.
+        let cust = domestic_candidate("Teszt Kft.", "12345678-2-41");
+        let line = nav_line("Item", NavUnitOfMeasure::Piece, 1000);
+        let _delta = apply_candidates(
+            &conn,
+            "t1",
+            "BIL-2026-S218",
+            &cust,
+            std::slice::from_ref(&line),
+            Currency::Huf,
+        );
+
+        // Read the row back via list_restored — the buyer snapshot
+        // must be populated.
+        let list = restore_outgoing::list_restored(&db_path, "t1").expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].customer_name.as_deref(), Some("Teszt Kft."));
+        assert_eq!(
+            list[0].customer_tax_number.as_deref(),
+            Some("12345678-2-41")
+        );
+        assert_eq!(list[0].customer_vat_status.as_deref(), Some("Domestic"));
+    }
+
+    /// PRIVATE_PERSON write-back path: tax_number stays None on the
+    /// row (NAV's XSD forbids `<customerVatData>` for that vat
+    /// status), but the name + vat_status DO populate.
+    #[test]
+    fn apply_candidates_writes_private_person_without_tax_number() {
+        use crate::restore_from_nav_outgoing as restore_outgoing;
+        let (tmp, _conn) = open_db("s218-pp");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let conn = Connection::open(&db_path).expect("open");
+        restore_outgoing::ensure_schema(&conn).expect("schema");
+        conn.execute(
+            "INSERT INTO restored_invoice (
+                id, tenant_id, source_nav_invoice_number, source_nav_transaction_id,
+                issue_date, total_net_minor, total_vat_minor, total_gross_minor,
+                currency, restore_year, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            duckdb::params![
+                "rinv_PP",
+                "t1",
+                "EU/2026/PP",
+                Option::<&str>::None,
+                "2026-05-01",
+                50_000_i64,
+                13_500_i64,
+                63_500_i64,
+                "EUR",
+                2026_i32,
+                "2026-05-01T00:00:00Z",
+            ],
+        )
+        .expect("seed");
+
+        let cust = private_person_candidate("Kovács Béla", "Árpád út 5.");
+        let _delta = apply_candidates(&conn, "t1", "EU/2026/PP", &cust, &[], Currency::Eur);
+
+        let list = restore_outgoing::list_restored(&db_path, "t1").expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].customer_name.as_deref(), Some("Kovács Béla"));
+        assert_eq!(
+            list[0].customer_tax_number, None,
+            "PRIVATE_PERSON MUST NOT carry a tax number on the snapshot",
+        );
+        assert_eq!(
+            list[0].customer_vat_status.as_deref(),
+            Some("PrivatePerson")
+        );
+    }
+
+    /// End-to-end golden: feed a verbatim NAV inner-XML payload (the
+    /// shape `queryInvoiceData OUTBOUND` returns after base64-decode)
+    /// through `parse_customer_info` + `update_buyer_fields`. Pins the
+    /// HUF arm — mirrors Ervin's prod-imported invoices on 2026-06-01
+    /// that show a missing partner column. A regression in the parser
+    /// or the UPDATE shape surfaces here loud.
+    #[test]
+    fn end_to_end_huf_invoice_xml_populates_partner_column() {
+        use crate::restore_from_nav_outgoing as restore_outgoing;
+        let (tmp, _conn) = open_db("s218-e2e-huf");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let conn = Connection::open(&db_path).expect("open");
+        restore_outgoing::ensure_schema(&conn).expect("schema");
+        conn.execute(
+            "INSERT INTO restored_invoice (
+                id, tenant_id, source_nav_invoice_number, source_nav_transaction_id,
+                issue_date, total_net_minor, total_vat_minor, total_gross_minor,
+                currency, restore_year, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            duckdb::params![
+                "rinv_HUF",
+                "t1",
+                "BIL-2026-0042",
+                Option::<&str>::None,
+                "2026-04-15",
+                100_000_i64,
+                27_000_i64,
+                127_000_i64,
+                "HUF",
+                2026_i32,
+                "2026-04-15T00:00:00Z",
+            ],
+        )
+        .expect("seed HUF row");
+
+        // Inner InvoiceData XML — what queryInvoiceData OUTBOUND
+        // returns after base64-decode for a DOMESTIC buyer.
+        let inner = domestic_invoice_inner_xml(
+            "Áben Consulting Kft.",
+            "24904362",
+            "2",
+            "41",
+            &[("Konzultáció", "HOUR", "25000")],
+        );
+        let customer = parse_customer_info(&inner).expect("parse");
+        let lines = parse_invoice_lines(&inner, Currency::Huf).expect("parse lines");
+        apply_candidates(
+            &conn,
+            "t1",
+            "BIL-2026-0042",
+            &customer,
+            &lines,
+            Currency::Huf,
+        );
+
+        let list = restore_outgoing::list_restored(&db_path, "t1").expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            list[0].customer_name.as_deref(),
+            Some("Áben Consulting Kft."),
+            "HUF golden: <customerName> MUST surface on the wire shape's customer_name"
+        );
+        assert_eq!(
+            list[0].customer_tax_number.as_deref(),
+            Some("24904362-2-41"),
+            "HUF golden: dashed tax number MUST round-trip"
+        );
+    }
+
+    /// End-to-end golden: EUR arm. NAV emits the same `<customerInfo>`
+    /// shape regardless of currency, but the EUR-leg pin proves that
+    /// the apply path does NOT silently key on HUF anywhere in the
+    /// buyer snapshot write-back. The 14 prod rows include both HUF
+    /// and EUR; both must populate.
+    #[test]
+    fn end_to_end_eur_invoice_xml_populates_partner_column() {
+        use crate::restore_from_nav_outgoing as restore_outgoing;
+        let (tmp, _conn) = open_db("s218-e2e-eur");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let conn = Connection::open(&db_path).expect("open");
+        restore_outgoing::ensure_schema(&conn).expect("schema");
+        conn.execute(
+            "INSERT INTO restored_invoice (
+                id, tenant_id, source_nav_invoice_number, source_nav_transaction_id,
+                issue_date, total_net_minor, total_vat_minor, total_gross_minor,
+                currency, restore_year, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            duckdb::params![
+                "rinv_EUR",
+                "t1",
+                "EU/2026/001",
+                Option::<&str>::None,
+                "2026-05-01",
+                50_000_i64,
+                13_500_i64,
+                63_500_i64,
+                "EUR",
+                2026_i32,
+                "2026-05-01T00:00:00Z",
+            ],
+        )
+        .expect("seed EUR row");
+
+        let inner = domestic_invoice_inner_xml(
+            "EU Buyer GmbH",
+            "98765432",
+            "1",
+            "23",
+            &[("Service", "PIECE", "100.00")],
+        );
+        let customer = parse_customer_info(&inner).expect("parse");
+        let lines = parse_invoice_lines(&inner, Currency::Eur).expect("parse lines");
+        apply_candidates(&conn, "t1", "EU/2026/001", &customer, &lines, Currency::Eur);
+
+        let list = restore_outgoing::list_restored(&db_path, "t1").expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].customer_name.as_deref(), Some("EU Buyer GmbH"));
+        assert_eq!(
+            list[0].customer_tax_number.as_deref(),
+            Some("98765432-1-23")
+        );
+        assert_eq!(list[0].customer_vat_status.as_deref(), Some("Domestic"));
     }
 }

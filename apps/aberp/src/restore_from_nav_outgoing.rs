@@ -185,12 +185,36 @@ CREATE INDEX IF NOT EXISTS restored_invoice_tenant_issue_idx
     ON restored_invoice (tenant_id, issue_date);
 ";
 
-/// Idempotent `CREATE TABLE IF NOT EXISTS`. Same boot-time
-/// posture as `incoming_invoices::ensure_schema` /
-/// `partners::ensure_schema`.
+/// PR-216 / S218 — additive migration for the buyer columns. The S180
+/// scoping (digest-only) shipped without a `customerInfo` link; S196
+/// then extracted partners but only into the `partners` master table,
+/// leaving `restored_invoice` rows orphaned from the buyer label the
+/// SPA outgoing list renders. S218 closes the loop by carrying the
+/// buyer label IN-ROW on `restored_invoice` itself — a denormalised
+/// snapshot mirroring how Own rows snapshot their customer in
+/// `<ULID>.input.json` (no FK to `partners`, no JOIN at query time).
+/// Closed-vocab `customer_vat_status` invariant lives in application
+/// code (write through [`update_buyer_fields`], read through
+/// [`list_restored`]'s SELECT) — no CHECK constraint per the
+/// app-layer-migration discipline.
+const RESTORED_INVOICE_PR216_MIGRATION_SQL: &str = "
+ALTER TABLE restored_invoice
+    ADD COLUMN IF NOT EXISTS customer_name        VARCHAR;
+ALTER TABLE restored_invoice
+    ADD COLUMN IF NOT EXISTS customer_tax_number  VARCHAR;
+ALTER TABLE restored_invoice
+    ADD COLUMN IF NOT EXISTS customer_vat_status  VARCHAR;
+";
+
+/// Idempotent `CREATE TABLE IF NOT EXISTS` + PR-216 additive migration
+/// for the buyer columns. Same boot-time posture as
+/// `incoming_invoices::ensure_schema` / `partners::ensure_schema`.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(RESTORED_INVOICE_SCHEMA_SQL)
-        .context("ensure restored_invoice schema")
+        .context("ensure restored_invoice base schema")?;
+    conn.execute_batch(RESTORED_INVOICE_PR216_MIGRATION_SQL)
+        .context("apply PR-216 restored_invoice migration (customer_name/tax_number/vat_status)")?;
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -198,6 +222,15 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
 // ──────────────────────────────────────────────────────────────────────
 
 /// One restored row as it appears on the wire (list response item).
+///
+/// PR-216 / S218 — the three `customer_*` fields are populated either
+/// inline by the S196 fresh-restore extraction path
+/// ([`update_buyer_fields`]) or by the boot-time backfill task
+/// ([`run_buyer_backfill_once`]) for pre-PR-216 rows. Pre-backfill
+/// rows surface `None` on all three; the SPA outgoing list renders the
+/// em-dash placeholder in that case (matching the read-side fallback
+/// `read_buyer_name_from_side_store` takes for missing side-store
+/// files on Own rows).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RestoredInvoice {
     pub id: String,
@@ -210,10 +243,36 @@ pub struct RestoredInvoice {
     pub currency: String,
     pub restore_year: i32,
     pub created_at: String,
+    /// PR-216 / S218 — buyer label snapshot. Mirrors
+    /// `<customerInfo>/<customerName>` on the originally-submitted NAV
+    /// XML. `None` for pre-backfill rows + for any row whose
+    /// queryInvoiceData fetch failed or whose XML omitted the field
+    /// (post-session-154 NAV wire shape suppresses `<customerName>` on
+    /// `PRIVATE_PERSON` buyers per [[reference_nav_gotchas]] §1).
+    #[serde(default)]
+    pub customer_name: Option<String>,
+    /// PR-216 / S218 — canonical Hungarian tax number
+    /// (`xxxxxxxx-y-zz`) for DOMESTIC buyers, `None` for PRIVATE_PERSON
+    /// + OTHER. Not currently rendered by the SPA list (the column
+    /// shows `customer_name` only, matching the Own-row convention)
+    /// but kept on the wire for parity with Own-row partner metadata
+    /// future-proofing.
+    #[serde(default)]
+    pub customer_tax_number: Option<String>,
+    /// PR-216 / S218 — closed-vocab `CustomerVatStatus` rendered as its
+    /// serde string (`"Domestic"` / `"PrivatePerson"` / `"Other"`).
+    /// `None` for pre-backfill rows. Stored as `VARCHAR` rather than
+    /// constrained to a CHECK so a future ADR-0048 extension (e.g. a
+    /// new third-state shape) can land without a schema migration; the
+    /// closed-vocab invariant lives in application code per the
+    /// app-layer-migration discipline.
+    #[serde(default)]
+    pub customer_vat_status: Option<String>,
 }
 
 /// List every restored invoice for the tenant, newest issue_date
-/// first. Used by the wizard's "what's already restored" panel.
+/// first. Used by the wizard's "what's already restored" panel and by
+/// the SPA virtual-union outgoing list per ADR-0058 / S215.
 pub fn list_restored(db_path: &Path, tenant: &str) -> Result<Vec<RestoredInvoice>> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
@@ -221,7 +280,8 @@ pub fn list_restored(db_path: &Path, tenant: &str) -> Result<Vec<RestoredInvoice
     let mut stmt = conn.prepare(
         "SELECT id, source_nav_invoice_number, source_nav_transaction_id, issue_date,
                 total_net_minor, total_vat_minor, total_gross_minor, currency,
-                restore_year, created_at
+                restore_year, created_at,
+                customer_name, customer_tax_number, customer_vat_status
            FROM restored_invoice
           WHERE tenant_id = ?
           ORDER BY issue_date DESC, source_nav_invoice_number DESC;",
@@ -238,6 +298,9 @@ pub fn list_restored(db_path: &Path, tenant: &str) -> Result<Vec<RestoredInvoice
             currency: row.get(7)?,
             restore_year: row.get(8)?,
             created_at: row.get(9)?,
+            customer_name: row.get(10)?,
+            customer_tax_number: row.get(11)?,
+            customer_vat_status: row.get(12)?,
         })
     })?;
     let mut out = Vec::new();
@@ -245,6 +308,109 @@ pub fn list_restored(db_path: &Path, tenant: &str) -> Result<Vec<RestoredInvoice
         out.push(r?);
     }
     Ok(out)
+}
+
+/// PR-216 / S218 — write the parsed buyer fields back to the
+/// `restored_invoice` row identified by `(tenant_id,
+/// source_nav_invoice_number)`. Called from two paths:
+///
+///   1. **Fresh-restore extraction** ([`restore_from_nav_extract::apply_candidates`]):
+///      every freshly-restored invoice that successfully parses its
+///      `<customerInfo>` block writes back here in the same pass that
+///      mints the partner master row.
+///   2. **Boot-time backfill** ([`run_buyer_backfill_once`]): pre-PR-216
+///      rows (and any S196 invoice whose queryInvoiceData fetch failed
+///      mid-cycle) get re-fetched + re-parsed + persisted.
+///
+/// Idempotent: re-writing the same values is a no-op-equivalent
+/// `UPDATE` that DuckDB handles in a single touch. The `WHERE`
+/// matches at most one row by the `UNIQUE (tenant_id,
+/// source_nav_invoice_number)` index, so a wrong-tenant
+/// `source_nav_invoice_number` collision is impossible.
+///
+/// Returns the number of rows affected — `0` means the
+/// `(tenant_id, source_nav_invoice_number)` pair was not found
+/// (caller's defence-in-depth signal that something's wrong; the
+/// fresh-restore path INSERTed the row moments before so we expect
+/// `1`).
+pub fn update_buyer_fields(
+    conn: &Connection,
+    tenant: &str,
+    source_nav_invoice_number: &str,
+    customer_name: Option<&str>,
+    customer_tax_number: Option<&str>,
+    customer_vat_status: Option<&str>,
+) -> Result<usize> {
+    ensure_schema(conn)?;
+    let affected = conn
+        .execute(
+            "UPDATE restored_invoice
+                SET customer_name        = ?,
+                    customer_tax_number  = ?,
+                    customer_vat_status  = ?
+              WHERE tenant_id = ?
+                AND source_nav_invoice_number = ?;",
+            params![
+                customer_name,
+                customer_tax_number,
+                customer_vat_status,
+                tenant,
+                source_nav_invoice_number,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "UPDATE restored_invoice buyer fields for tenant `{tenant}` invoice `{source_nav_invoice_number}`"
+            )
+        })?;
+    Ok(affected)
+}
+
+/// PR-216 / S218 — list the `(id, source_nav_invoice_number, currency)`
+/// triples of restored rows that are MISSING the buyer label snapshot.
+/// Used by the boot-time backfill task to find rows that need a
+/// `queryInvoiceData` fetch. The `customer_name IS NULL` predicate is
+/// the load-bearing sentinel — there is no separate "backfilled" flag,
+/// since a row whose customer is genuinely empty (PRIVATE_PERSON
+/// post-session-154 wire shape with no `<customerName>`) stays NULL
+/// even after a successful backfill attempt; that row will be
+/// re-attempted on every subsequent boot, which is fine (one extra
+/// `queryInvoiceData` call per such row per boot) and lets a future
+/// NAV-side data correction be picked up automatically.
+pub fn list_restored_missing_buyer(
+    db_path: &Path,
+    tenant: &str,
+) -> Result<Vec<RestoredMissingBuyer>> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    ensure_schema(&conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT source_nav_invoice_number
+           FROM restored_invoice
+          WHERE tenant_id = ?
+            AND customer_name IS NULL
+          ORDER BY issue_date DESC, source_nav_invoice_number DESC;",
+    )?;
+    let rows = stmt.query_map(params![tenant], |row| {
+        Ok(RestoredMissingBuyer {
+            source_nav_invoice_number: row.get(0)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// PR-216 / S218 — narrow read-shape for the boot-time backfill task.
+/// The NAV invoice number is the only field per-row backfill needs
+/// (it's the SOAP `invoiceNumber` arg + the `WHERE` predicate on the
+/// final UPDATE); the full `RestoredInvoice` decode would round-trip
+/// 12 columns per candidate for no read benefit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredMissingBuyer {
+    pub source_nav_invoice_number: String,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1039,6 +1205,245 @@ fn process_digest(
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// PR-216 / S218 — boot-time buyer-snapshot backfill.
+// ──────────────────────────────────────────────────────────────────────
+
+/// One backfill cycle's summary. Returned to the caller so the boot
+/// log can surface the headline counts; not currently mirrored on the
+/// wire (the backfill is a hülye-biztos boot-time recovery, not an
+/// operator-paced flow).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BuyerBackfillSummary {
+    /// Rows whose `customer_name` was successfully populated this run.
+    pub backfilled: u64,
+    /// Rows where `queryInvoiceData` returned `funcCode=OK` but the
+    /// XML carried no `<customerName>` (post-session-154 PRIVATE_PERSON
+    /// wire shape per [[reference_nav_gotchas]] §1). The row's
+    /// `customer_vat_status` IS populated; only the name field stays
+    /// NULL because NAV does not republish it. These will be retried
+    /// on every subsequent boot.
+    pub backfilled_without_name: u64,
+    /// Rows where the `queryInvoiceData` fetch or the parse failed.
+    /// Stays NULL on disk; the next boot will retry. Each failure
+    /// surfaces a `tracing::warn!`.
+    pub errored: u64,
+    /// Total rows scanned this run (i.e. `len()` of
+    /// [`list_restored_missing_buyer`] at backfill start).
+    pub scanned: u64,
+}
+
+/// Inputs the boot-time spawn path assembles from `AppState` +
+/// keychain. Mirrors `ap_sync::CycleInputs`'s posture (struct over
+/// positional args) so a future credential-rotation can be threaded
+/// through with one field rather than a signature break.
+pub struct BackfillInputs {
+    pub db_path: PathBuf,
+    pub tenant: TenantId,
+    pub tax_number_8: String,
+    pub endpoint: NavEndpoint,
+    pub credentials: NavCredentials,
+}
+
+/// PR-216 / S218 — one-shot backfill: scan `restored_invoice` rows
+/// with NULL `customer_name`, call `queryInvoiceData OUTBOUND` per
+/// row, parse `<customerInfo>`, write back the buyer snapshot. Each
+/// per-row failure is contained (warn + `errored += 1`); the function
+/// never propagates an error short of an unrecoverable boot-state
+/// failure (DB unreadable, transport build failure).
+///
+/// Cancellation: between every per-row iteration we check
+/// `cancel.is_cancelled()`. A mid-run shutdown drops the remaining
+/// rows; they'll be picked up on the next boot.
+///
+/// Idempotency: the row-marker IS `customer_name IS NULL`, so a
+/// re-run after a successful backfill finds 0 rows. A genuinely-empty
+/// row (PRIVATE_PERSON post-session-154) stays NULL on every boot,
+/// which is fine — one extra `queryInvoiceData` call per such row per
+/// boot. The boot count is bounded by the operator's restart cadence,
+/// not by a daemon tick, so the steady-state cost is negligible.
+pub async fn run_buyer_backfill_once(
+    inputs: BackfillInputs,
+    cancel: tokio_util::sync::CancellationToken,
+) -> BuyerBackfillSummary {
+    // Snapshot the missing-buyer worklist on the blocking pool so the
+    // tokio worker is not held across the DuckDB read. The worklist
+    // is fully consumed (then dropped) before any NAV call — no
+    // long-lived DB handle.
+    let scan_db = inputs.db_path.clone();
+    let scan_tenant = inputs.tenant.as_str().to_string();
+    let worklist = match tokio::task::spawn_blocking(move || {
+        list_restored_missing_buyer(&scan_db, &scan_tenant)
+    })
+    .await
+    {
+        Ok(Ok(list)) => list,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = ?e,
+                "S218: buyer-backfill scan failed; skipping this boot — will retry next launch"
+            );
+            return BuyerBackfillSummary::default();
+        }
+        Err(join_err) => {
+            tracing::warn!(
+                error = ?join_err,
+                "S218: buyer-backfill scan task panicked; skipping this boot"
+            );
+            return BuyerBackfillSummary::default();
+        }
+    };
+
+    let scanned = worklist.len() as u64;
+    if scanned == 0 {
+        tracing::debug!("S218: buyer-backfill scan found 0 rows missing buyer snapshot");
+        return BuyerBackfillSummary::default();
+    }
+    tracing::info!(
+        rows = scanned,
+        "S218: buyer-backfill starting — found {scanned} restored_invoice rows missing buyer snapshot"
+    );
+
+    let transport = match NavTransport::new(inputs.endpoint) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                error = ?e,
+                "S218: buyer-backfill could not build NAV transport; skipping this boot"
+            );
+            return BuyerBackfillSummary {
+                scanned,
+                ..Default::default()
+            };
+        }
+    };
+
+    let mut summary = BuyerBackfillSummary {
+        scanned,
+        ..Default::default()
+    };
+
+    for row in worklist {
+        if cancel.is_cancelled() {
+            tracing::info!(
+                processed = summary.backfilled + summary.backfilled_without_name + summary.errored,
+                remaining = scanned.saturating_sub(
+                    summary.backfilled + summary.backfilled_without_name + summary.errored
+                ),
+                "S218: buyer-backfill cancelled mid-run — remaining rows deferred to next boot"
+            );
+            return summary;
+        }
+        match backfill_one_row(&transport, &inputs, &row).await {
+            Ok(BackfillOutcome::Wrote) => summary.backfilled += 1,
+            Ok(BackfillOutcome::WroteWithoutName) => summary.backfilled_without_name += 1,
+            Err(e) => {
+                tracing::warn!(
+                    source_nav_invoice_number = %row.source_nav_invoice_number,
+                    error = ?e,
+                    "S218: per-row buyer backfill failed; row stays NULL — next boot retries"
+                );
+                summary.errored += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        scanned = summary.scanned,
+        backfilled = summary.backfilled,
+        backfilled_without_name = summary.backfilled_without_name,
+        errored = summary.errored,
+        "S218: buyer-backfill complete"
+    );
+    summary
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackfillOutcome {
+    Wrote,
+    WroteWithoutName,
+}
+
+/// Per-row backfill: queryInvoiceData → extract inner XML → parse
+/// `<customerInfo>` → UPDATE restored_invoice. The synchronous DB +
+/// XML parse path is fenced inside `spawn_blocking` so the tokio
+/// worker is not held across it.
+async fn backfill_one_row(
+    transport: &NavTransport,
+    inputs: &BackfillInputs,
+    row: &RestoredMissingBuyer,
+) -> Result<BackfillOutcome> {
+    let outcome = query_invoice_data::call(
+        transport,
+        &inputs.credentials,
+        &inputs.tax_number_8,
+        &row.source_nav_invoice_number,
+        aberp_nav_transport::soap::InvoiceDirection::Outbound,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "queryInvoiceData OUTBOUND for {} (buyer backfill)",
+            row.source_nav_invoice_number
+        )
+    })?;
+
+    let response_xml = outcome.response_xml;
+    let db_path = inputs.db_path.clone();
+    let tenant = inputs.tenant.as_str().to_string();
+    let source_nav_invoice_number = row.source_nav_invoice_number.clone();
+
+    tokio::task::spawn_blocking(move || -> Result<BackfillOutcome> {
+        let inner =
+            match crate::restore_from_nav_extract::extract_inner_invoice_data_xml(&response_xml)? {
+                Some(bytes) => bytes,
+                None => {
+                    return Err(anyhow!(
+                        "queryInvoiceData OUTBOUND for {source_nav_invoice_number} returned \
+                     funcCode=OK without <invoiceData> — seller's own invoice should \
+                     always carry it; treating as backfill failure"
+                    ));
+                }
+            };
+        let customer = crate::restore_from_nav_extract::parse_customer_info(&inner)
+            .context("parse <customerInfo> for buyer backfill")?;
+
+        let conn = Connection::open(&db_path).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for buyer-backfill UPDATE",
+                db_path.display()
+            )
+        })?;
+        let affected = update_buyer_fields(
+            &conn,
+            &tenant,
+            &source_nav_invoice_number,
+            customer.name.as_deref(),
+            customer.tax_number.as_deref(),
+            Some(customer.vat_status.as_db_str()),
+        )?;
+        if affected == 0 {
+            return Err(anyhow!(
+                "UPDATE for {source_nav_invoice_number} affected 0 rows — \
+                 expected exactly 1 row to match (tenant, source_nav_invoice_number)"
+            ));
+        }
+        if customer
+            .name
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            Ok(BackfillOutcome::WroteWithoutName)
+        } else {
+            Ok(BackfillOutcome::Wrote)
+        }
+    })
+    .await
+    .map_err(|join_err| anyhow!("buyer-backfill blocking task panicked: {join_err}"))?
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Helpers — date math + amount parsing.
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1626,5 +2031,292 @@ mod tests {
         // Newest issue_date first.
         assert_eq!(list[0].source_nav_invoice_number, "INV-default/00011");
         assert_eq!(list[1].source_nav_invoice_number, "INV-default/00010");
+    }
+
+    // ── PR-216 / S218 — buyer-snapshot in-row pins ────────────────────
+
+    /// Fresh-mint a `restored_invoice` (no buyer fields set), then
+    /// `update_buyer_fields` populates them and `list_restored` reads
+    /// them back. Pins the round-trip — schema migration + UPDATE +
+    /// SELECT all agree on column names.
+    #[test]
+    fn update_buyer_fields_round_trips_through_list_restored() {
+        let tmp = ScopedTempDir::new("s218-rt");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let ctx = fixture_context(&db_path, "t1", "test-user", 2026);
+        let mut cache: AlreadyRestoredCache = HashSet::new();
+
+        process_digest(
+            &ctx,
+            &fixture_digest("BIL-2026-0001", "2026-04-15"),
+            &mut cache,
+        )
+        .expect("seed restored row");
+
+        // Pre-update: customer_name MUST be None (the new columns
+        // default to NULL because the INSERT path does not touch them).
+        let pre = list_restored(&db_path, "t1").expect("list pre");
+        assert_eq!(pre.len(), 1);
+        assert!(
+            pre[0].customer_name.is_none(),
+            "fresh INSERT must leave customer_name NULL until backfill / S196 writes it"
+        );
+        assert!(pre[0].customer_tax_number.is_none());
+        assert!(pre[0].customer_vat_status.is_none());
+
+        // Apply the buyer write-back.
+        let conn = Connection::open(&db_path).expect("open");
+        let affected = update_buyer_fields(
+            &conn,
+            "t1",
+            "BIL-2026-0001",
+            Some("Áben Consulting Kft."),
+            Some("24904362-2-41"),
+            Some("Domestic"),
+        )
+        .expect("UPDATE succeeds");
+        assert_eq!(affected, 1, "UPDATE matched exactly the seeded row");
+
+        // Round-trip via list_restored.
+        let post = list_restored(&db_path, "t1").expect("list post");
+        assert_eq!(post.len(), 1);
+        assert_eq!(
+            post[0].customer_name.as_deref(),
+            Some("Áben Consulting Kft."),
+        );
+        assert_eq!(
+            post[0].customer_tax_number.as_deref(),
+            Some("24904362-2-41")
+        );
+        assert_eq!(post[0].customer_vat_status.as_deref(), Some("Domestic"));
+    }
+
+    /// `update_buyer_fields` returns 0 when the
+    /// `(tenant, source_nav_invoice_number)` pair has no match — the
+    /// defence-in-depth signal the backfill path keys on.
+    #[test]
+    fn update_buyer_fields_returns_zero_on_missing_pair() {
+        let tmp = ScopedTempDir::new("s218-miss");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let conn = Connection::open(&db_path).expect("open");
+        ensure_schema(&conn).expect("schema");
+
+        let affected = update_buyer_fields(
+            &conn,
+            "t1",
+            "DOES-NOT-EXIST",
+            Some("Ghost Inc."),
+            None,
+            Some("Domestic"),
+        )
+        .expect("UPDATE returns Ok even when 0 matched");
+        assert_eq!(affected, 0, "no row matches → 0 affected");
+    }
+
+    /// Seed a `restored_invoice` row directly via raw INSERT — no
+    /// audit-ledger chain involvement. The wizard's `process_digest`
+    /// path writes both the row AND a chain entry under one tenant's
+    /// ledger, which is per-file (not per-tenant) — so the wizard
+    /// path cannot mix tenants in one test DB. The PR-216 buyer-write
+    /// surface keys only on `(tenant_id, source_nav_invoice_number)`
+    /// in the `restored_invoice` table, so the audit chain is
+    /// orthogonal to what these pins exercise.
+    fn seed_restored_row_raw(
+        conn: &Connection,
+        tenant: &str,
+        invoice_number: &str,
+        issue_date: &str,
+    ) {
+        ensure_schema(conn).expect("schema");
+        conn.execute(
+            "INSERT INTO restored_invoice (
+                id, tenant_id, source_nav_invoice_number, source_nav_transaction_id,
+                issue_date, total_net_minor, total_vat_minor, total_gross_minor,
+                currency, restore_year, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            params![
+                format!("rinv_{tenant}_{invoice_number}"),
+                tenant,
+                invoice_number,
+                Option::<&str>::None,
+                issue_date,
+                100_000_i64,
+                27_000_i64,
+                127_000_i64,
+                "HUF",
+                2026_i32,
+                format!("{issue_date}T00:00:00Z"),
+            ],
+        )
+        .expect("seed");
+    }
+
+    /// `update_buyer_fields` for a tenant-A row must not touch a
+    /// tenant-B row with the same NAV invoice number. The
+    /// `(tenant_id, source_nav_invoice_number)` predicate carries the
+    /// cross-tenant boundary.
+    #[test]
+    fn update_buyer_fields_is_tenant_scoped() {
+        let tmp = ScopedTempDir::new("s218-tenant");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let conn = Connection::open(&db_path).expect("open");
+        seed_restored_row_raw(&conn, "t1", "BIL-2026-CROSS", "2026-04-15");
+        seed_restored_row_raw(&conn, "t2", "BIL-2026-CROSS", "2026-04-15");
+
+        let affected = update_buyer_fields(
+            &conn,
+            "t1",
+            "BIL-2026-CROSS",
+            Some("Only T1 Customer"),
+            None,
+            Some("PrivatePerson"),
+        )
+        .expect("UPDATE");
+        assert_eq!(affected, 1, "exactly one row affected (tenant-scoped)");
+        drop(conn);
+
+        // t2's row stays untouched.
+        let t2 = list_restored(&db_path, "t2").expect("list t2");
+        assert_eq!(t2.len(), 1);
+        assert!(
+            t2[0].customer_name.is_none(),
+            "t2's row MUST NOT be touched by a t1-scoped UPDATE"
+        );
+
+        let t1 = list_restored(&db_path, "t1").expect("list t1");
+        assert_eq!(t1[0].customer_name.as_deref(), Some("Only T1 Customer"));
+    }
+
+    /// `list_restored_missing_buyer` returns exactly the rows whose
+    /// `customer_name` is NULL — the backfill task's worklist.
+    /// Filled-buyer rows are NOT returned. Cross-tenant rows are NOT
+    /// returned.
+    #[test]
+    fn list_restored_missing_buyer_filters_by_null_and_tenant() {
+        let tmp = ScopedTempDir::new("s218-worklist");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let conn = Connection::open(&db_path).expect("open");
+        // t1: A (will fill), B (stays NULL). t2: C (stays NULL, must
+        // NOT leak into t1's worklist).
+        seed_restored_row_raw(&conn, "t1", "A-001", "2026-01-15");
+        seed_restored_row_raw(&conn, "t1", "B-002", "2026-02-15");
+        seed_restored_row_raw(&conn, "t2", "C-003", "2026-03-15");
+
+        update_buyer_fields(
+            &conn,
+            "t1",
+            "A-001",
+            Some("Filled Co."),
+            Some("12345678-2-41"),
+            Some("Domestic"),
+        )
+        .expect("fill A");
+        drop(conn);
+
+        // t1's worklist: only B-002.
+        let work = list_restored_missing_buyer(&db_path, "t1").expect("list missing t1");
+        assert_eq!(work.len(), 1, "exactly one row remains NULL in t1");
+        assert_eq!(work[0].source_nav_invoice_number, "B-002");
+
+        // t2's worklist: only C-003 (NOT B-002 from t1).
+        let work_t2 = list_restored_missing_buyer(&db_path, "t2").expect("list missing t2");
+        assert_eq!(work_t2.len(), 1);
+        assert_eq!(work_t2[0].source_nav_invoice_number, "C-003");
+    }
+
+    /// Schema migration is idempotent — running `ensure_schema` twice
+    /// is a no-op. Pre-PR-216 tables (without the buyer columns) get
+    /// migrated cleanly; this models the prod-upgrade path Ervin's 14
+    /// rows take.
+    #[test]
+    fn ensure_schema_is_idempotent_and_migrates_pre_pr216_tables() {
+        let tmp = ScopedTempDir::new("s218-migrate");
+        let db_path = tmp.path().join("aberp.duckdb");
+
+        // Step 1: hand-roll the PRE-PR-216 schema (no buyer columns).
+        // This models the prod DB Ervin already ran the wizard against.
+        let conn = Connection::open(&db_path).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE restored_invoice (
+                id                          VARCHAR NOT NULL PRIMARY KEY,
+                tenant_id                   VARCHAR NOT NULL,
+                source_nav_invoice_number   VARCHAR NOT NULL,
+                source_nav_transaction_id   VARCHAR,
+                issue_date                  VARCHAR NOT NULL,
+                total_net_minor             BIGINT  NOT NULL,
+                total_vat_minor             BIGINT  NOT NULL,
+                total_gross_minor           BIGINT  NOT NULL,
+                currency                    VARCHAR NOT NULL CHECK (currency IN ('HUF','EUR')),
+                restore_year                INTEGER NOT NULL,
+                created_at                  VARCHAR NOT NULL,
+                UNIQUE (tenant_id, source_nav_invoice_number)
+            );",
+        )
+        .expect("seed pre-PR-216 schema");
+
+        // Seed a row using the pre-PR-216 INSERT shape (no buyer cols).
+        conn.execute(
+            "INSERT INTO restored_invoice (
+                id, tenant_id, source_nav_invoice_number, source_nav_transaction_id,
+                issue_date, total_net_minor, total_vat_minor, total_gross_minor,
+                currency, restore_year, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            params![
+                "rinv_LEGACY",
+                "t1",
+                "BIL-LEGACY",
+                Option::<&str>::None,
+                "2026-04-15",
+                100_000_i64,
+                27_000_i64,
+                127_000_i64,
+                "HUF",
+                2026_i32,
+                "2026-04-15T00:00:00Z",
+            ],
+        )
+        .expect("seed legacy row");
+
+        // Step 2: apply the PR-216 migration. Must succeed cleanly.
+        ensure_schema(&conn).expect("PR-216 migration on pre-PR-216 table");
+        // Re-run to pin idempotency.
+        ensure_schema(&conn).expect("ensure_schema is idempotent");
+
+        // Step 3: list_restored reads the legacy row with NULL buyer
+        // columns (migration added them as NULLABLE).
+        let list = list_restored(&db_path, "t1").expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].source_nav_invoice_number, "BIL-LEGACY");
+        assert!(
+            list[0].customer_name.is_none(),
+            "legacy row's customer_name MUST be None after migration"
+        );
+
+        // Step 4: backfill via update_buyer_fields succeeds —
+        // proving the new columns are writable post-migration.
+        let affected = update_buyer_fields(
+            &conn,
+            "t1",
+            "BIL-LEGACY",
+            Some("Áben Consulting Kft."),
+            Some("24904362-2-41"),
+            Some("Domestic"),
+        )
+        .expect("UPDATE post-migration");
+        assert_eq!(affected, 1);
+        // Drop the seed connection so list_restored's fresh
+        // `Connection::open` sees the committed UPDATE rather than
+        // racing the seed connection's in-flight write state. DuckDB
+        // auto-commits but a second connection reading from the same
+        // file via a separate `open` was observed to surface NULL for
+        // the just-written column when both connections coexist mid-
+        // test; dropping the writer first is the surgical fix.
+        drop(conn);
+
+        let list_post = list_restored(&db_path, "t1").expect("list post");
+        assert_eq!(
+            list_post[0].customer_name.as_deref(),
+            Some("Áben Consulting Kft.")
+        );
     }
 }

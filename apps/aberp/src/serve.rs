@@ -1048,6 +1048,82 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             coordinator.register("ap-sync", ap_sync_handle);
         }
 
+        // PR-216 / S218 — one-shot buyer-snapshot backfill for
+        // `restored_invoice` rows the S180 wizard mirrored before
+        // PR-216's S196-side write-back landed, OR rows whose S196
+        // `queryInvoiceData` fetch failed mid-cycle (transport
+        // glitch, NAV outage). Scans for rows with NULL customer_name
+        // and re-fetches `queryInvoiceData OUTBOUND` to populate the
+        // buyer label IN-ROW. Trust-code-not-operator: backfill runs
+        // automatically on boot — Ervin's 14 already-imported prod
+        // rows from 2026-06-01 light up without an operator action.
+        //
+        // Spawned on the tokio pool, cancel-aware. Per-row failures
+        // are warn-and-continue; the row stays NULL and the next boot
+        // will retry. Idempotent: a re-run after a successful pass
+        // finds 0 rows and returns immediately. Registered with the
+        // shutdown coordinator so a Tauri close mid-scan exits within
+        // ms.
+        {
+            let st = recovery_state.clone();
+            let backfill_token = coordinator.token.clone();
+            let backfill_handle = tokio::spawn(async move {
+                let inputs = {
+                    let credentials =
+                        match NavCredentials::load_from_keychain(st.tenant.as_str()) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::info!(
+                                    error = ?e,
+                                    "S218: buyer-backfill skipped — no NAV credentials in \
+                                     keychain (first-boot tenant); next launch retries"
+                                );
+                                return;
+                            }
+                        };
+                    let supplier = match supplier_from_seller_toml(st.tenant.as_str()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = ?e,
+                                "S218: buyer-backfill skipped — could not load supplier \
+                                 identity from seller.toml"
+                            );
+                            return;
+                        }
+                    };
+                    let parsed = match nav_xml::parse_hungarian_tax_number(&supplier.tax_number) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = ?e,
+                                "S218: buyer-backfill skipped — could not parse supplier \
+                                 tax number"
+                            );
+                            return;
+                        }
+                    };
+                    let endpoint = build_profile::nav_endpoint();
+                    if let Err(e) = build_profile::assert_endpoint_allowed(endpoint) {
+                        tracing::warn!(
+                            error = ?e,
+                            "S218: buyer-backfill skipped — NAV endpoint not allowed"
+                        );
+                        return;
+                    }
+                    restore_outgoing::BackfillInputs {
+                        db_path: (*st.db_path).clone(),
+                        tenant: st.tenant.clone(),
+                        tax_number_8: parsed.taxpayer_id,
+                        endpoint,
+                        credentials,
+                    }
+                };
+                let _ = restore_outgoing::run_buyer_backfill_once(inputs, backfill_token).await;
+            });
+            coordinator.register("restore-buyer-backfill", backfill_handle);
+        }
+
         // S210 / PR-204 — quote-intake daemon. Opt-in via either the
         // `ABERP_QUOTE_INTAKE_ENABLED=true` env var (S210, ops escape
         // hatch) OR the operator-typed `[quote_intake]` section in
@@ -10691,6 +10767,14 @@ fn restored_to_list_item(ext: restore_outgoing::RestoredInvoice) -> Result<Invoi
             ));
         }
     };
+    // PR-216 / S218 — surface the in-row buyer snapshot
+    // (`customer_name`) on the wire as `buyer_name`, matching the
+    // Own-row convention (`InvoiceListItem.buyer_name = customer.name`
+    // from the side-store `<ULID>.input.json`). Pre-backfill rows
+    // carry NULL → `None`, which the SPA renders as the em-dash; the
+    // 14 prod rows imported on 2026-06-01 sit in this state until the
+    // boot-time backfill task ([`restore_outgoing::run_buyer_backfill_once`])
+    // refills them from `queryInvoiceData`.
     Ok(InvoiceListItem {
         invoice_id: ext.id,
         sequence_number: 0,
@@ -10700,7 +10784,7 @@ fn restored_to_list_item(ext: restore_outgoing::RestoredInvoice) -> Result<Invoi
         has_chain_children: false,
         is_storno: false,
         currency,
-        buyer_name: None,
+        buyer_name: ext.customer_name,
         payment: None,
         bank_account: None,
         row_kind: RowKind::ExtNav,
@@ -14177,6 +14261,7 @@ mod tests {
 
     #[test]
     fn restored_to_list_item_synthesises_ext_nav_row() {
+        // PR-216 / S218 — populated buyer fields flow into the wire shape.
         let ext = restore_outgoing::RestoredInvoice {
             id: "rinv_TESTULID".to_string(),
             source_nav_invoice_number: "BIL-2026-0042".to_string(),
@@ -14188,6 +14273,9 @@ mod tests {
             currency: "HUF".to_string(),
             restore_year: 2026,
             created_at: "2026-04-15T12:00:00Z".to_string(),
+            customer_name: Some("Áben Consulting Kft.".to_string()),
+            customer_tax_number: Some("24904362-2-41".to_string()),
+            customer_vat_status: Some("Domestic".to_string()),
         };
         let item = restored_to_list_item(ext).expect("HUF restored_invoice must map");
 
@@ -14210,9 +14298,10 @@ mod tests {
         );
         assert_eq!(item.currency, Currency::Huf);
         assert_eq!(item.total_gross, Some(127_000));
-        assert!(
-            item.buyer_name.is_none(),
-            "digest does not carry buyer name"
+        assert_eq!(
+            item.buyer_name.as_deref(),
+            Some("Áben Consulting Kft."),
+            "PR-216 / S218 — populated customer_name MUST surface as buyer_name",
         );
         assert!(item.payment.is_none(), "ExtNav has no payment state");
         assert!(
@@ -14222,7 +14311,11 @@ mod tests {
         assert!(!item.has_chain_children, "ExtNav has no chain children");
         assert!(!item.is_storno, "ExtNav has no is_storno flag");
 
-        // EUR arm — the other half of the closed-vocab.
+        // EUR arm — the other half of the closed-vocab. Also pins the
+        // pre-PR-216 path: a row with NULL customer_name (the 14
+        // already-restored prod rows pre-backfill) MUST surface as
+        // `buyer_name: None` so the SPA renders the em-dash, not a
+        // fabricated label.
         let ext_eur = restore_outgoing::RestoredInvoice {
             id: "rinv_EURTEST".to_string(),
             source_nav_invoice_number: "EU/2026/001".to_string(),
@@ -14234,9 +14327,16 @@ mod tests {
             currency: "EUR".to_string(),
             restore_year: 2026,
             created_at: "2026-05-01T08:00:00Z".to_string(),
+            customer_name: None,
+            customer_tax_number: None,
+            customer_vat_status: None,
         };
         let item_eur = restored_to_list_item(ext_eur).expect("EUR restored_invoice must map");
         assert_eq!(item_eur.currency, Currency::Eur, "EUR arm carries through");
+        assert!(
+            item_eur.buyer_name.is_none(),
+            "pre-backfill row with NULL customer_name MUST emit None",
+        );
     }
 
     #[test]
@@ -14255,6 +14355,9 @@ mod tests {
             currency: "USD".to_string(),
             restore_year: 2026,
             created_at: "2026-04-15T00:00:00Z".to_string(),
+            customer_name: None,
+            customer_tax_number: None,
+            customer_vat_status: None,
         };
         let err = match restored_to_list_item(bad) {
             Ok(_) => panic!("USD MUST loud-fail"),
@@ -14370,6 +14473,9 @@ mod tests {
                 currency: "HUF".to_string(),
                 restore_year: 2026,
                 created_at: format!("2026-04-{:02}T00:00:00Z", idx + 1),
+                customer_name: None,
+                customer_tax_number: None,
+                customer_vat_status: None,
             };
             // Open + ensure schema + raw INSERT — mirrors the seller-
             // side write path's posture without depending on the wizard
