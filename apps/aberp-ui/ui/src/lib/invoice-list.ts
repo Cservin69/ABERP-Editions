@@ -344,6 +344,31 @@ function rawCompare<R extends InvoiceSortRow>(
   }
 }
 
+/** S224 / PR-220 — can the operator open the InvoiceDetail modal for
+ * a list row of this kind? `Own` rows live in the canonical `invoice`
+ * table and have a `/api/invoices/:id` GET handler. `ExtNav` rows
+ * live in `restored_invoice` (id prefix `rinv_*`) and have no
+ * detail-fetch endpoint by design — they are NAV-mirror rows for
+ * invoices ABERP did not issue, so there is no PDF, no audit trail,
+ * and no lifecycle to inspect (per PR-213 / S215 architectural
+ * invariant). PR-213 hid the actions-column affordance for ExtNav
+ * but missed two other open-detail paths (chip click in
+ * `InvoiceList.svelte` + `Enter` in the keyboard handler), so a
+ * live operator click 404'd at `/invoices/rinv_…` (Ervin on
+ * v2.1.4). The guard is now a single pure predicate both call
+ * sites consult — adding a third `RowKind` variant widens this
+ * switch alongside the type.
+ *
+ * Pinned by `canOpenDetail_*` cases. */
+export function canOpenDetail(kind: RowKind): boolean {
+  switch (kind) {
+    case "Own":
+      return true;
+    case "ExtNav":
+      return false;
+  }
+}
+
 /** PR-213 / S215 — ordinal for the closed-vocab `RowKind`. Own < ExtNav
  * by design (see `compareInvoices`); adding a third variant to
  * `RowKind` widens both the type and this table together. */

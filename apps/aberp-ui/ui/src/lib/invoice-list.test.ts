@@ -20,6 +20,7 @@ import {
   EMPTY_FILTER,
   PARTNER_COLUMN_EM_DASH,
   buyerColumnDisplay,
+  canOpenDetail,
   compareInvoices,
   filterInvoices,
   isFilterEmpty,
@@ -874,5 +875,23 @@ describe("filterInvoices — row_kind facet", () => {
       row_kind: "ExtNav",
     });
     expect(out.map((r) => r.invoice_id)).toEqual(["rinv_NAV0099"]);
+  });
+});
+
+// ── canOpenDetail ───────────────────────────────────────────────
+//
+// S224 / PR-220 — pin the `canOpenDetail` predicate. The chip-
+// click handler and the keyboard-Enter handler in
+// `InvoiceList.svelte` both consult it; a regression that returns
+// `true` for `ExtNav` re-introduces the v2.1.4 404 alert
+// (`GET /invoices/rinv_…` has no handler, by design). Per
+// CLAUDE.md rule 9 each RowKind variant gets its own assertion
+// so a collapse to a constant cannot pass vacuously.
+describe("canOpenDetail", () => {
+  it("Own rows are openable (canonical invoice has /api/invoices/:id)", () => {
+    expect(canOpenDetail("Own")).toBe(true);
+  });
+  it("ExtNav rows are NOT openable (restored_invoice has no detail GET)", () => {
+    expect(canOpenDetail("ExtNav")).toBe(false);
   });
 });

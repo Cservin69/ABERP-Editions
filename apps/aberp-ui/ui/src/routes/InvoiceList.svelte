@@ -53,6 +53,7 @@
   import {
     EMPTY_FILTER,
     buyerColumnDisplay,
+    canOpenDetail,
     compareInvoices,
     filterInvoices,
     isFilterEmpty,
@@ -349,7 +350,15 @@
         }
         if (focusedRowIndex >= 0 && focusedRowIndex < visibleRows.length) {
           event.preventDefault();
-          navStack = [visibleRows[focusedRowIndex].invoice_id];
+          // S224 / PR-220 — skip ExtNav: `canOpenDetail` matches the
+          // chip-click render guard below (rinv_* has no detail-fetch
+          // handler; an Enter would 404 just like the live click did
+          // on v2.1.4). [[trust-code-not-operator]] — the keyboard
+          // path MUST enforce the same invariant the mouse path does.
+          const focusedRow = visibleRows[focusedRowIndex];
+          if (canOpenDetail(focusedRow.row_kind)) {
+            navStack = [focusedRow.invoice_id];
+          }
         }
         return;
       case "toggle-hints":
@@ -961,36 +970,48 @@
         <tr class:row-focused={isKeyboardFocused}>
           <!-- PR-213 / S215 — Kind chip + click-to-inspect affordance.
                The chip carries the `RowKind` categorical signal (glyph
-               + label per ADR-0017 §"Adversarial review #4"); the
-               click on the chip opens the detail modal — replacing the
+               + label per ADR-0017 §"Adversarial review #4"); on Own
+               rows the click opens the detail modal — replacing the
                dropped UUID column's click affordance. For ExtNav rows
                the source NAV invoice number renders as a muted line
                below the chip so the operator has a readable identity
                for non-ABERP-issued rows (the digest does not carry a
-               buyer name). -->
+               buyer name).
+
+               S224 / PR-220 — ExtNav chips render as static spans, NOT
+               buttons. `restored_invoice` rows (id prefix `rinv_*`)
+               have no `/api/invoices/:id` GET handler — clicking
+               returned a 404 alert in v2.1.4. PR-213 hid the actions-
+               column affordance for the same reason; the chip-click
+               affordance was a sibling oversight that this fix
+               aligns with the established pattern via the pure
+               `canOpenDetail` predicate (so a future third RowKind
+               variant widens both call sites at the type level). -->
           <td class="col-row-kind">
-            <button
-              type="button"
-              class="id-link"
-              onclick={() => (navStack = [row.invoice_id])}
-              aria-label={`Open detail for invoice ${row.invoice_id}`}
-            >
-              <span
-                class="row-kind-chip"
-                class:kind-own={row.row_kind === "Own"}
-                class:kind-ext-nav={row.row_kind === "ExtNav"}
-                title={row.row_kind === "Own"
-                  ? "Canonical ABERP-issued invoice"
-                  : "External: NAV mirror — issued under our tax number outside ABERP (e.g. Billingo, manual). Read-only."}
+            {#if canOpenDetail(row.row_kind)}
+              <button
+                type="button"
+                class="id-link"
+                onclick={() => (navStack = [row.invoice_id])}
+                aria-label={`Open detail for invoice ${row.invoice_id}`}
               >
-                <span class="row-kind-glyph" aria-hidden="true"
-                  >{row.row_kind === "Own" ? "●" : "↺"}</span
+                <span
+                  class="row-kind-chip kind-own"
+                  title="Canonical ABERP-issued invoice"
                 >
-                <span class="row-kind-text"
-                  >{row.row_kind === "Own" ? "Own" : "Ext."}</span
-                >
+                  <span class="row-kind-glyph" aria-hidden="true">●</span>
+                  <span class="row-kind-text">Own</span>
+                </span>
+              </button>
+            {:else}
+              <span
+                class="row-kind-chip kind-ext-nav"
+                title="External: NAV mirror — issued under our tax number outside ABERP (e.g. Billingo, manual). Read-only — no ABERP-issued PDF or audit trail to inspect."
+              >
+                <span class="row-kind-glyph" aria-hidden="true">↺</span>
+                <span class="row-kind-text">Ext.</span>
               </span>
-            </button>
+            {/if}
             {#if row.row_kind === "ExtNav" && row.source_nav_invoice_number !== null}
               <div class="ext-nav-id mono" title="Raw NAV invoice number">
                 {row.source_nav_invoice_number}
