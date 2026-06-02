@@ -120,7 +120,9 @@ use serde::{Deserialize, Serialize};
 use time::{format_description::FormatItem, macros, OffsetDateTime};
 use ulid::Ulid;
 
-use crate::audit_payloads::InvoiceRestoredFromNavPayload;
+use crate::audit_payloads::{
+    InvoiceRestoredFromNavPayload, RestoreBuyerBackfillCycleCompletedPayload,
+};
 use crate::restore_from_nav_extract::{self, ExtractionDelta};
 
 /// Earliest year the wizard accepts. NAV's Online Számla / data-
@@ -206,14 +208,35 @@ ALTER TABLE restored_invoice
     ADD COLUMN IF NOT EXISTS customer_vat_status  VARCHAR;
 ";
 
-/// Idempotent `CREATE TABLE IF NOT EXISTS` + PR-216 additive migration
-/// for the buyer columns. Same boot-time posture as
+/// PR-217 / S220 — additive migration for the operator-paced manual
+/// partner-link column. Per [[aberp-extnav-partner-nav-gap]] the
+/// `queryInvoiceData OUTBOUND` call PR-216 leans on is entitlement-
+/// gated to the original submitter; for invoices submitted via a third
+/// party the row stays without a buyer label after backfill. PR-217
+/// adds an operator-facing affordance to LINK a `partners` row
+/// manually, and `partner_id` is the durable pointer that survives a
+/// `customer_name` rename on the master.
+///
+/// VARCHAR (no FK to `partners.id`) per the
+/// [[no-sql-specific]] discipline — the closed-vocab invariant ("if
+/// non-null, must reference a real partner") lives in application code,
+/// not the schema. Nullable: an unlinked ExtNav row carries NULL,
+/// matching the buyer-fields posture from PR-216.
+const RESTORED_INVOICE_PR217_MIGRATION_SQL: &str = "
+ALTER TABLE restored_invoice
+    ADD COLUMN IF NOT EXISTS partner_id          VARCHAR;
+";
+
+/// Idempotent `CREATE TABLE IF NOT EXISTS` + PR-216 + PR-217 additive
+/// migrations. Same boot-time posture as
 /// `incoming_invoices::ensure_schema` / `partners::ensure_schema`.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(RESTORED_INVOICE_SCHEMA_SQL)
         .context("ensure restored_invoice base schema")?;
     conn.execute_batch(RESTORED_INVOICE_PR216_MIGRATION_SQL)
         .context("apply PR-216 restored_invoice migration (customer_name/tax_number/vat_status)")?;
+    conn.execute_batch(RESTORED_INVOICE_PR217_MIGRATION_SQL)
+        .context("apply PR-217 restored_invoice migration (partner_id)")?;
     Ok(())
 }
 
@@ -268,6 +291,18 @@ pub struct RestoredInvoice {
     /// app-layer-migration discipline.
     #[serde(default)]
     pub customer_vat_status: Option<String>,
+    /// PR-217 / S220 — operator-paced manual partner link, durable
+    /// pointer into the `partners` master. `None` for fresh restored
+    /// rows + for ExtNav rows the operator has not yet linked. When
+    /// `Some(_)`, the `customer_*` fields above were last written from
+    /// this partner's snapshot at link time (the audit ledger carries
+    /// the before/after; the row carries the current state).
+    ///
+    /// Not currently surfaced on the SPA outgoing-list wire shape (the
+    /// list already shows `customer_name`); reserved for the partner-
+    /// picker modal's "currently linked" affordance + future joins.
+    #[serde(default)]
+    pub partner_id: Option<String>,
 }
 
 /// List every restored invoice for the tenant, newest issue_date
@@ -281,7 +316,8 @@ pub fn list_restored(db_path: &Path, tenant: &str) -> Result<Vec<RestoredInvoice
         "SELECT id, source_nav_invoice_number, source_nav_transaction_id, issue_date,
                 total_net_minor, total_vat_minor, total_gross_minor, currency,
                 restore_year, created_at,
-                customer_name, customer_tax_number, customer_vat_status
+                customer_name, customer_tax_number, customer_vat_status,
+                partner_id
            FROM restored_invoice
           WHERE tenant_id = ?
           ORDER BY issue_date DESC, source_nav_invoice_number DESC;",
@@ -301,6 +337,7 @@ pub fn list_restored(db_path: &Path, tenant: &str) -> Result<Vec<RestoredInvoice
             customer_name: row.get(10)?,
             customer_tax_number: row.get(11)?,
             customer_vat_status: row.get(12)?,
+            partner_id: row.get(13)?,
         })
     })?;
     let mut out = Vec::new();
@@ -361,6 +398,123 @@ pub fn update_buyer_fields(
         .with_context(|| {
             format!(
                 "UPDATE restored_invoice buyer fields for tenant `{tenant}` invoice `{source_nav_invoice_number}`"
+            )
+        })?;
+    Ok(affected)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// PR-217 / S220 — operator-paced manual partner link.
+// ──────────────────────────────────────────────────────────────────────
+
+/// PR-217 / S220 — the four denormalized buyer fields that ride
+/// `restored_invoice`, packaged for a get-before-set audit pair.
+///
+/// Returned by [`read_restored_buyer_snapshot`] (used to capture
+/// `*_before` on the manual-link audit entry) and surfaced verbatim on
+/// the manual-link route response so the SPA can refresh the row
+/// without a second list-restored round trip.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoredBuyerSnapshot {
+    pub partner_id: Option<String>,
+    pub customer_name: Option<String>,
+    pub customer_tax_number: Option<String>,
+    pub customer_vat_status: Option<String>,
+}
+
+/// PR-217 / S220 — read the current `(partner_id, customer_*)` snapshot
+/// of a restored row keyed by `(tenant_id, id)` (the `rinv_<ULID>` form
+/// the SPA carries on the wire). Returns `Ok(None)` if the row does
+/// not exist OR belongs to a different tenant; the handler maps both
+/// to 404.
+pub fn read_restored_buyer_snapshot(
+    conn: &Connection,
+    tenant: &str,
+    id: &str,
+) -> Result<Option<RestoredBuyerSnapshot>> {
+    ensure_schema(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT partner_id, customer_name, customer_tax_number, customer_vat_status
+           FROM restored_invoice
+          WHERE tenant_id = ? AND id = ?;",
+    )?;
+    let mut rows = stmt.query_map(params![tenant, id], |row| {
+        Ok(RestoredBuyerSnapshot {
+            partner_id: row.get(0)?,
+            customer_name: row.get(1)?,
+            customer_tax_number: row.get(2)?,
+            customer_vat_status: row.get(3)?,
+        })
+    })?;
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
+}
+
+/// PR-217 / S220 — read `source_nav_invoice_number` for a restored row
+/// keyed by `(tenant_id, id)`. The manual-link audit payload carries
+/// the canonical NAV number alongside the row's `rinv_<ULID>` id; the
+/// list_restored UPDATE path keys on `source_nav_invoice_number` so we
+/// need to look it up off the row's `id`.
+pub fn read_restored_source_number(
+    conn: &Connection,
+    tenant: &str,
+    id: &str,
+) -> Result<Option<String>> {
+    ensure_schema(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT source_nav_invoice_number
+           FROM restored_invoice
+          WHERE tenant_id = ? AND id = ?;",
+    )?;
+    let mut rows = stmt.query_map(params![tenant, id], |row| row.get::<_, String>(0))?;
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
+}
+
+/// PR-217 / S220 — write the four denormalized buyer fields together.
+/// Used by the manual-link path so the partner pointer + the snapshot
+/// always move in lockstep. WHERE keys on `(tenant_id, id)` — the
+/// `rinv_<ULID>` form the SPA carries on the wire — so the route
+/// handler does not need to look up the `source_nav_invoice_number`
+/// just to call [`update_buyer_fields`].
+///
+/// Returns the number of rows affected (`0` means the row was deleted
+/// between the read and the write; the handler surfaces 404 in that
+/// case).
+pub fn update_partner_for_restored(
+    conn: &Connection,
+    tenant: &str,
+    id: &str,
+    partner_id: Option<&str>,
+    customer_name: Option<&str>,
+    customer_tax_number: Option<&str>,
+    customer_vat_status: Option<&str>,
+) -> Result<usize> {
+    ensure_schema(conn)?;
+    let affected = conn
+        .execute(
+            "UPDATE restored_invoice
+                SET partner_id           = ?,
+                    customer_name        = ?,
+                    customer_tax_number  = ?,
+                    customer_vat_status  = ?
+              WHERE tenant_id = ? AND id = ?;",
+            params![
+                partner_id,
+                customer_name,
+                customer_tax_number,
+                customer_vat_status,
+                tenant,
+                id,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "UPDATE restored_invoice partner_id+buyer fields for tenant `{tenant}` id `{id}`"
             )
         })?;
     Ok(affected)
@@ -1209,10 +1363,16 @@ fn process_digest(
 // ──────────────────────────────────────────────────────────────────────
 
 /// One backfill cycle's summary. Returned to the caller so the boot
-/// log can surface the headline counts; not currently mirrored on the
-/// wire (the backfill is a hülye-biztos boot-time recovery, not an
-/// operator-paced flow).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// log can surface the headline counts; PR-217 / S220 also wires this
+/// shape verbatim into the `RestoreBuyerBackfillCycleCompleted` audit
+/// payload so the audit ledger answers "did backfill run, what did
+/// it find" without a log grep.
+///
+/// `Copy` was removed when `first_error_messages` (Vec<String>) was
+/// added in PR-217; the field is a small bounded vec (cap 3) so the
+/// `Clone` cost is negligible and the few callers that consumed it
+/// `Copy`-style are now explicit about ownership.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BuyerBackfillSummary {
     /// Rows whose `customer_name` was successfully populated this run.
     pub backfilled: u64,
@@ -1230,18 +1390,39 @@ pub struct BuyerBackfillSummary {
     /// Total rows scanned this run (i.e. `len()` of
     /// [`list_restored_missing_buyer`] at backfill start).
     pub scanned: u64,
+    /// PR-217 / S220 — first 3 per-row error messages, captured to ride
+    /// the audit payload so the operator can ask "what's failing?"
+    /// without grepping logs. Cap at 3 because the typical failure
+    /// mode is the [[aberp-extnav-partner-nav-gap]] entitlement
+    /// rejection and 14 identical strings add no signal.
+    pub first_error_messages: Vec<String>,
+    /// PR-217 / S220 — wall-clock duration of the cycle, for the
+    /// audit payload + the boot log line.
+    pub elapsed_ms: u64,
+    /// PR-217 / S220 — `Some(_)` when the cycle aborted BEFORE the
+    /// per-row loop ran (worklist scan failed, transport setup
+    /// failed). Surfaced verbatim onto the audit payload's `error`
+    /// field. Per-row errors do NOT promote to cycle-level errors.
+    pub cycle_error: Option<String>,
 }
 
 /// Inputs the boot-time spawn path assembles from `AppState` +
 /// keychain. Mirrors `ap_sync::CycleInputs`'s posture (struct over
 /// positional args) so a future credential-rotation can be threaded
 /// through with one field rather than a signature break.
+///
+/// PR-217 / S220 — added `binary_hash` so the cycle can append an
+/// audit entry (the binary hash rides every `LedgerMeta::new()` call
+/// per `crate::audit_ledger`'s F8 carry-forward shape). The hash is
+/// resolved at the call site (via `BinaryHashHandle::wait()`) so the
+/// backfill task does not need to know about the handle abstraction.
 pub struct BackfillInputs {
     pub db_path: PathBuf,
     pub tenant: TenantId,
     pub tax_number_8: String,
     pub endpoint: NavEndpoint,
     pub credentials: NavCredentials,
+    pub binary_hash: BinaryHash,
 }
 
 /// PR-216 / S218 — one-shot backfill: scan `restored_invoice` rows
@@ -1265,6 +1446,9 @@ pub async fn run_buyer_backfill_once(
     inputs: BackfillInputs,
     cancel: tokio_util::sync::CancellationToken,
 ) -> BuyerBackfillSummary {
+    // PR-217 / S220 — track wall-clock for the audit payload.
+    let started_at = std::time::Instant::now();
+
     // Snapshot the missing-buyer worklist on the blocking pool so the
     // tokio worker is not held across the DuckDB read. The worklist
     // is fully consumed (then dropped) before any NAV call — no
@@ -1282,21 +1466,44 @@ pub async fn run_buyer_backfill_once(
                 error = ?e,
                 "S218: buyer-backfill scan failed; skipping this boot — will retry next launch"
             );
-            return BuyerBackfillSummary::default();
+            let summary = BuyerBackfillSummary {
+                elapsed_ms: started_at.elapsed().as_millis() as u64,
+                cycle_error: Some(format!("worklist scan failed: {e:#}")),
+                ..Default::default()
+            };
+            emit_backfill_cycle_audit(&inputs, &summary);
+            return summary;
         }
         Err(join_err) => {
             tracing::warn!(
                 error = ?join_err,
                 "S218: buyer-backfill scan task panicked; skipping this boot"
             );
-            return BuyerBackfillSummary::default();
+            let summary = BuyerBackfillSummary {
+                elapsed_ms: started_at.elapsed().as_millis() as u64,
+                cycle_error: Some(format!("worklist scan task panicked: {join_err}")),
+                ..Default::default()
+            };
+            emit_backfill_cycle_audit(&inputs, &summary);
+            return summary;
         }
     };
 
     let scanned = worklist.len() as u64;
     if scanned == 0 {
         tracing::debug!("S218: buyer-backfill scan found 0 rows missing buyer snapshot");
-        return BuyerBackfillSummary::default();
+        // PR-217 / S220 — emit the cycle entry on the zero-rows path
+        // too. Per [[trust-code-not-operator]] the silent path was
+        // the original observability bug; a "ran, found nothing" row
+        // is the answer to "did backfill run." Same posture as S178's
+        // `IncomingInvoiceSyncCycleCompleted` (which writes even on
+        // zero-ingest cycles).
+        let summary = BuyerBackfillSummary {
+            elapsed_ms: started_at.elapsed().as_millis() as u64,
+            ..Default::default()
+        };
+        emit_backfill_cycle_audit(&inputs, &summary);
+        return summary;
     }
     tracing::info!(
         rows = scanned,
@@ -1310,10 +1517,14 @@ pub async fn run_buyer_backfill_once(
                 error = ?e,
                 "S218: buyer-backfill could not build NAV transport; skipping this boot"
             );
-            return BuyerBackfillSummary {
+            let summary = BuyerBackfillSummary {
                 scanned,
+                elapsed_ms: started_at.elapsed().as_millis() as u64,
+                cycle_error: Some(format!("NAV transport build failed: {e:#}")),
                 ..Default::default()
             };
+            emit_backfill_cycle_audit(&inputs, &summary);
+            return summary;
         }
     };
 
@@ -1331,6 +1542,8 @@ pub async fn run_buyer_backfill_once(
                 ),
                 "S218: buyer-backfill cancelled mid-run — remaining rows deferred to next boot"
             );
+            summary.elapsed_ms = started_at.elapsed().as_millis() as u64;
+            emit_backfill_cycle_audit(&inputs, &summary);
             return summary;
         }
         match backfill_one_row(&transport, &inputs, &row).await {
@@ -1343,18 +1556,104 @@ pub async fn run_buyer_backfill_once(
                     "S218: per-row buyer backfill failed; row stays NULL — next boot retries"
                 );
                 summary.errored += 1;
+                // PR-217 / S220 — capture first 3 error messages for
+                // the audit payload. The per-row tracing::warn above
+                // is still the operator's primary debugging surface;
+                // these inline strings are the ledger's record of
+                // "what was failing on this cycle" without a log
+                // grep.
+                if summary.first_error_messages.len() < 3 {
+                    summary
+                        .first_error_messages
+                        .push(format!("{}: {e:#}", row.source_nav_invoice_number));
+                }
             }
         }
     }
 
+    summary.elapsed_ms = started_at.elapsed().as_millis() as u64;
     tracing::info!(
         scanned = summary.scanned,
         backfilled = summary.backfilled,
         backfilled_without_name = summary.backfilled_without_name,
         errored = summary.errored,
+        elapsed_ms = summary.elapsed_ms,
         "S218: buyer-backfill complete"
     );
+    emit_backfill_cycle_audit(&inputs, &summary);
     summary
+}
+
+/// PR-217 / S220 — write the cycle-completion audit entry.
+///
+/// Fire-and-forget at the call boundary: a ledger append failure here
+/// is logged at `warn!` but does NOT bubble up to the caller — the
+/// backfill is a boot-time recovery flow and the operator should not
+/// see the app refuse to come up because the audit append failed. The
+/// next boot will write its own cycle entry; the failure-to-append is
+/// the kind of drift `crate::audit_ledger::verify_chain` is supposed
+/// to catch on the next ledger open.
+///
+/// Idempotency-key minting: each cycle is a fresh decision so we mint
+/// a new ULID. Same posture as
+/// `IncomingInvoiceSyncCycleCompletedPayload`'s F8 carry-forward.
+fn emit_backfill_cycle_audit(inputs: &BackfillInputs, summary: &BuyerBackfillSummary) {
+    let payload = RestoreBuyerBackfillCycleCompletedPayload {
+        idempotency_key: Ulid::new().to_string(),
+        trigger: "boot".to_string(),
+        scanned: summary.scanned,
+        backfilled: summary.backfilled,
+        backfilled_without_name: summary.backfilled_without_name,
+        errored: summary.errored,
+        first_error_messages: summary.first_error_messages.clone(),
+        elapsed_ms: summary.elapsed_ms,
+        error: summary.cycle_error.clone(),
+    };
+    if let Err(e) = append_backfill_cycle_entry(inputs, &payload) {
+        tracing::warn!(
+            error = ?e,
+            scanned = summary.scanned,
+            "S220: buyer-backfill cycle-audit append failed — next boot will write its own entry"
+        );
+    }
+}
+
+/// Inner half of [`emit_backfill_cycle_audit`] — splits out the
+/// fallible plumbing so the outer fn can log+swallow uniformly.
+fn append_backfill_cycle_entry(
+    inputs: &BackfillInputs,
+    payload: &RestoreBuyerBackfillCycleCompletedPayload,
+) -> Result<()> {
+    let mut conn = Connection::open(&inputs.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", inputs.db_path.display()))?;
+    audit_ledger::ensure_schema(&conn)
+        .context("ensure audit-ledger schema for backfill cycle audit entry")?;
+    let session_id = Ulid::new().to_string();
+    let actor = Actor::from_local_cli(session_id, inputs.credentials.login());
+    let tx = conn
+        .transaction()
+        .context("begin tx for backfill cycle audit")?;
+    let ledger_meta = audit_ledger::LedgerMeta::new(inputs.tenant.clone(), inputs.binary_hash);
+    let idempotency_key = payload.idempotency_key.clone();
+    audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        EventKind::RestoreBuyerBackfillCycleCompleted,
+        payload.to_bytes(),
+        actor,
+        Some(idempotency_key),
+    )
+    .map_err(|e| anyhow!("audit_ledger::append_in_tx RestoreBuyerBackfillCycleCompleted: {e}"))?;
+    tx.commit()
+        .context("commit DuckDB transaction (backfill cycle audit)")?;
+    drop(conn);
+    let ledger = Ledger::open(&inputs.db_path, inputs.tenant.clone(), inputs.binary_hash)
+        .context("open audit ledger to sync mirror after backfill cycle entry")?;
+    let mirror_path = audit_ledger::mirror_path_for(&inputs.db_path);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after backfill cycle entry")?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2318,5 +2617,249 @@ mod tests {
             list_post[0].customer_name.as_deref(),
             Some("Áben Consulting Kft.")
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // PR-217 / S220 — manual partner-link tests.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// `update_partner_for_restored` writes all FOUR denormalized
+    /// fields together (the partner pointer + 3 buyer snapshot fields).
+    /// The link path mirrors how the manual-link route writes a
+    /// "currently linked" snapshot onto an ExtNav row whose backfill
+    /// found no buyer info.
+    #[test]
+    fn update_partner_for_restored_writes_all_four_fields() {
+        let tmp = ScopedTempDir::new("s220-link");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let conn = Connection::open(&db_path).expect("open");
+        seed_restored_row_raw(&conn, "t1", "BIL-2026-LINK", "2026-04-15");
+
+        let row_id = "rinv_t1_BIL-2026-LINK";
+        let affected = update_partner_for_restored(
+            &conn,
+            "t1",
+            row_id,
+            Some("prt_01ABCDEFGHJKMNPQRSTVWXYZ12"),
+            Some("Áben Consulting Kft."),
+            Some("24904362-2-41"),
+            Some("Domestic"),
+        )
+        .expect("UPDATE");
+        assert_eq!(affected, 1, "exactly one row affected by tenant+id key");
+        drop(conn);
+
+        let list = list_restored(&db_path, "t1").expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            list[0].partner_id.as_deref(),
+            Some("prt_01ABCDEFGHJKMNPQRSTVWXYZ12"),
+            "partner_id is persisted"
+        );
+        assert_eq!(
+            list[0].customer_name.as_deref(),
+            Some("Áben Consulting Kft."),
+            "customer_name is denormalized onto the row"
+        );
+        assert_eq!(
+            list[0].customer_tax_number.as_deref(),
+            Some("24904362-2-41"),
+            "customer_tax_number is denormalized onto the row"
+        );
+        assert_eq!(
+            list[0].customer_vat_status.as_deref(),
+            Some("Domestic"),
+            "customer_vat_status is denormalized onto the row"
+        );
+    }
+
+    /// `update_partner_for_restored` with all-None clears the four
+    /// fields back to NULL — the "clear / no partner" path the SPA
+    /// invokes from the modal's Clear button.
+    #[test]
+    fn update_partner_for_restored_clears_all_four_fields() {
+        let tmp = ScopedTempDir::new("s220-clear");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let conn = Connection::open(&db_path).expect("open");
+        seed_restored_row_raw(&conn, "t1", "BIL-2026-CLEAR", "2026-04-15");
+
+        let row_id = "rinv_t1_BIL-2026-CLEAR";
+        // Step 1: link.
+        update_partner_for_restored(
+            &conn,
+            "t1",
+            row_id,
+            Some("prt_01ABCDEFGHJKMNPQRSTVWXYZ12"),
+            Some("Áben Consulting Kft."),
+            Some("24904362-2-41"),
+            Some("Domestic"),
+        )
+        .expect("link");
+
+        // Step 2: clear.
+        let affected = update_partner_for_restored(&conn, "t1", row_id, None, None, None, None)
+            .expect("clear");
+        assert_eq!(affected, 1);
+        drop(conn);
+
+        let list = list_restored(&db_path, "t1").expect("list");
+        assert_eq!(list.len(), 1);
+        assert!(list[0].partner_id.is_none(), "partner_id cleared to NULL");
+        assert!(
+            list[0].customer_name.is_none(),
+            "customer_name cleared to NULL"
+        );
+        assert!(
+            list[0].customer_tax_number.is_none(),
+            "customer_tax_number cleared to NULL"
+        );
+        assert!(
+            list[0].customer_vat_status.is_none(),
+            "customer_vat_status cleared to NULL"
+        );
+    }
+
+    /// `update_partner_for_restored` is tenant-scoped — a t1-scoped
+    /// write does not touch a t2 row even with the same restored id
+    /// shape. Same posture as `update_buyer_fields_is_tenant_scoped`.
+    #[test]
+    fn update_partner_for_restored_is_tenant_scoped() {
+        let tmp = ScopedTempDir::new("s220-tenant");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let conn = Connection::open(&db_path).expect("open");
+        seed_restored_row_raw(&conn, "t1", "X-1", "2026-04-15");
+        seed_restored_row_raw(&conn, "t2", "X-1", "2026-04-15");
+
+        // Both seeded rows have the same id shape ("rinv_<tenant>_<num>")
+        // — but the WHERE pins on tenant_id AND id.
+        let affected = update_partner_for_restored(
+            &conn,
+            "t1",
+            "rinv_t1_X-1",
+            Some("prt_T1ONLY"),
+            Some("T1 Only Co."),
+            None,
+            Some("PrivatePerson"),
+        )
+        .expect("UPDATE");
+        assert_eq!(affected, 1);
+        drop(conn);
+
+        let t2 = list_restored(&db_path, "t2").expect("list t2");
+        assert_eq!(t2.len(), 1);
+        assert!(
+            t2[0].partner_id.is_none(),
+            "t2's row MUST NOT be touched by a t1-scoped UPDATE"
+        );
+    }
+
+    /// `read_restored_buyer_snapshot` returns `Ok(None)` for an unknown
+    /// row id — the route then maps it to 404. Tenant scoping holds:
+    /// a t2-tenant lookup for a t1-existing row returns None.
+    #[test]
+    fn read_restored_buyer_snapshot_returns_none_on_unknown_or_wrong_tenant() {
+        let tmp = ScopedTempDir::new("s220-snapshot");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let conn = Connection::open(&db_path).expect("open");
+        seed_restored_row_raw(&conn, "t1", "Y-1", "2026-04-15");
+
+        // Unknown id.
+        let absent =
+            read_restored_buyer_snapshot(&conn, "t1", "rinv_does_not_exist").expect("query");
+        assert!(absent.is_none());
+
+        // Right id, wrong tenant.
+        let cross = read_restored_buyer_snapshot(&conn, "t2", "rinv_t1_Y-1").expect("query");
+        assert!(cross.is_none(), "MUST NOT leak across tenants");
+
+        // Right id, right tenant — Some(snapshot).
+        let hit = read_restored_buyer_snapshot(&conn, "t1", "rinv_t1_Y-1").expect("query");
+        let snap = hit.expect("row exists");
+        assert!(snap.partner_id.is_none(), "fresh row has no partner link");
+        assert!(snap.customer_name.is_none(), "fresh row has NULL name");
+    }
+
+    /// `read_restored_source_number` mirrors `read_restored_buyer_snapshot`'s
+    /// tenant-scoped lookup. The audit payload's
+    /// `source_nav_invoice_number` field is sourced from this helper so
+    /// the handler does not have to thread the original digest through.
+    #[test]
+    fn read_restored_source_number_returns_canonical_form() {
+        let tmp = ScopedTempDir::new("s220-source");
+        let db_path = tmp.path().join("aberp.duckdb");
+        let conn = Connection::open(&db_path).expect("open");
+        seed_restored_row_raw(&conn, "t1", "BIL-default/00042", "2026-04-15");
+
+        let num = read_restored_source_number(&conn, "t1", "rinv_t1_BIL-default/00042")
+            .expect("query")
+            .expect("row exists");
+        assert_eq!(num, "BIL-default/00042");
+
+        let absent = read_restored_source_number(&conn, "t1", "rinv_missing").expect("query");
+        assert!(absent.is_none());
+    }
+
+    /// PR-217 / S220 — the partner_id migration is idempotent. Mirrors
+    /// the PR-216 migration test's posture; pins that running
+    /// `ensure_schema` against a fresh DB AND a PR-216-only DB both
+    /// surface the `partner_id` column ready to write.
+    #[test]
+    fn pr217_partner_id_migration_is_idempotent() {
+        let tmp = ScopedTempDir::new("s220-migrate");
+        let db_path = tmp.path().join("aberp.duckdb");
+
+        // Step 1: stand up PR-216 shape (no partner_id) and seed a row.
+        let conn = Connection::open(&db_path).expect("open");
+        conn.execute_batch(RESTORED_INVOICE_SCHEMA_SQL)
+            .expect("base schema");
+        conn.execute_batch(RESTORED_INVOICE_PR216_MIGRATION_SQL)
+            .expect("PR-216 migration");
+        conn.execute(
+            "INSERT INTO restored_invoice (
+                id, tenant_id, source_nav_invoice_number, source_nav_transaction_id,
+                issue_date, total_net_minor, total_vat_minor, total_gross_minor,
+                currency, restore_year, created_at,
+                customer_name, customer_tax_number, customer_vat_status
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            params![
+                "rinv_PR216",
+                "t1",
+                "PR216-001",
+                Option::<&str>::None,
+                "2026-04-15",
+                100_000_i64,
+                27_000_i64,
+                127_000_i64,
+                "HUF",
+                2026_i32,
+                "2026-04-15T00:00:00Z",
+                Option::<&str>::None,
+                Option::<&str>::None,
+                Option::<&str>::None,
+            ],
+        )
+        .expect("seed PR-216 row");
+
+        // Step 2: apply full ensure_schema (PR-217 migration) twice.
+        ensure_schema(&conn).expect("PR-217 migration on PR-216 table");
+        ensure_schema(&conn).expect("ensure_schema is idempotent");
+
+        // Step 3: write partner_id on the legacy row — the new column
+        // is present + writable.
+        let affected = update_partner_for_restored(
+            &conn,
+            "t1",
+            "rinv_PR216",
+            Some("prt_TEST"),
+            Some("Filled In Post-Migration"),
+            Some("12345678-2-41"),
+            Some("Domestic"),
+        )
+        .expect("UPDATE post-migration");
+        assert_eq!(affected, 1);
+        drop(conn);
+
+        let list = list_restored(&db_path, "t1").expect("list");
+        assert_eq!(list[0].partner_id.as_deref(), Some("prt_TEST"));
     }
 }

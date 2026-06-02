@@ -93,6 +93,11 @@
   import { navigateTo } from "../lib/router";
   import InvoiceDetail from "./InvoiceDetail.svelte";
   import ModificationInvoice from "./ModificationInvoice.svelte";
+  // S220 / PR-217 — operator-paced partner picker for ExtNav rows.
+  // NAV does not expose buyer info for invoices submitted via other
+  // software, so the operator needs an affordance to annotate the
+  // row from their own records.
+  import ExtNavPartnerPickerModal from "../lib/ExtNavPartnerPickerModal.svelte";
 
   // PR-87 / session-112 — sessionStorage key the new `#/invoices-new`
   // route stashes the just-issued invoice id under, so that on
@@ -224,6 +229,33 @@
   let hintsVisible: boolean = $state(true);
   let searchInputEl: HTMLInputElement | null = $state(null);
   const parserState = makeHotkeyParserState();
+
+  // S220 / PR-217 — partner-picker modal state. `null` = closed; a
+  // string id opens the modal for the named restored ExtNav row.
+  // Snapshots `buyerName` + `sourceNavInvoiceNumber` at open time so
+  // the modal header can render them without a re-lookup against
+  // `rows`.
+  let pickerRestoredId: string | null = $state(null);
+  let pickerBuyerName: string | null = $state(null);
+  let pickerSourceNum: string | null = $state(null);
+
+  function openPartnerPicker(row: InvoiceListItem) {
+    pickerRestoredId = row.invoice_id;
+    pickerBuyerName = row.buyer_name;
+    pickerSourceNum = row.source_nav_invoice_number;
+  }
+  function closePartnerPicker() {
+    pickerRestoredId = null;
+  }
+  function onPartnerPickerUpdated() {
+    // Refresh the list so the row's `buyer_name` + sort position
+    // reflect the new link. Per [[trust-code-not-operator]] we
+    // refresh the WHOLE list rather than patching the one row
+    // optimistically — the new buyer label can shift the row in
+    // a name-sorted view, and a partial-state SPA after a backend
+    // write is the kind of silent-drift the project refuses.
+    void refresh();
+  }
 
   onMount(() => {
     void refresh();
@@ -966,7 +998,32 @@
             {/if}
           </td>
           <td class="col-partner" class:partner-missing={isPartnerMissing}>
-            {partnerLabel}
+            <!-- S220 / PR-217 — ExtNav rows get a click affordance so
+                 the operator can link a partner manually. NAV does not
+                 expose buyer info for invoices submitted via other
+                 software (Billingo / KBoss / etc.) — the boot-time
+                 backfill is structurally unable to populate
+                 `customer_name` for those rows. Own rows keep the
+                 plain label (their buyer rides the side-store JSON
+                 at issue time and never needs operator annotation). -->
+            {#if row.row_kind === "ExtNav"}
+              <button
+                type="button"
+                class="extnav-partner-link"
+                class:extnav-partner-link-empty={isPartnerMissing}
+                onclick={() => openPartnerPicker(row)}
+                title={isPartnerMissing
+                  ? "NAV nem adja meg a vevő adatait külső szoftverrel kiállított számlákhoz. Kattints partner hozzárendeléséhez. / NAV does not expose buyer info for invoices submitted via other software. Click to link a partner manually."
+                  : "Kattints a partner módosításához vagy törléséhez. / Click to change or clear the linked partner."}
+                aria-label={isPartnerMissing
+                  ? "Link a partner to this externally-submitted invoice"
+                  : `Change linked partner (currently ${partnerLabel})`}
+              >
+                {partnerLabel}
+              </button>
+            {:else}
+              {partnerLabel}
+            {/if}
           </td>
           <td class="col-num mono">{row.sequence_number}</td>
           <td class="col-num mono">{row.fiscal_year}</td>
@@ -1200,6 +1257,17 @@
     }}
   />
 </section>
+
+<!-- S220 / PR-217 — partner-picker modal for ExtNav rows. Mounted at
+     the screen level so the dialog backdrop covers the table; opens
+     when `pickerRestoredId !== null`. -->
+<ExtNavPartnerPickerModal
+  restoredId={pickerRestoredId}
+  currentBuyerName={pickerBuyerName}
+  sourceNavInvoiceNumber={pickerSourceNum}
+  onUpdated={onPartnerPickerUpdated}
+  onClose={closePartnerPicker}
+/>
 
 <style>
   .screen {
@@ -1686,6 +1754,41 @@
 
   .col-partner.partner-missing {
     color: var(--color-text-muted);
+  }
+
+  /* S220 / PR-217 — clickable partner cell on ExtNav rows. The button
+   * is borderless + background-less by default so the cell reads as
+   * a plain label; only the underline-on-hover surfaces the
+   * affordance. Distinct empty-state (em-dash) gets a dotted underline
+   * so its "click me" affordance shows up without an obvious value to
+   * underline. */
+  .extnav-partner-link {
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 0;
+    cursor: pointer;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+  }
+  .extnav-partner-link:hover {
+    text-decoration: underline;
+    color: var(--color-link-hover, var(--color-text-primary));
+  }
+  .extnav-partner-link:focus-visible {
+    outline: 2px solid var(--color-accent, #4a90e2);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+  .extnav-partner-link-empty {
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+    color: var(--color-text-muted);
+  }
+  .extnav-partner-link-empty:hover {
+    color: var(--color-link-hover, var(--color-text-primary));
+    text-decoration: underline;
   }
 
   /* PR-65 / session-86 — Actions column. Quiet per-row buttons with

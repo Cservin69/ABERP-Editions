@@ -758,6 +758,51 @@ pub enum EventKind {
     /// export bundle. The payload carries shutdown telemetry only;
     /// no NAV bytes. F12 four-edit ritual fires once.
     DaemonShutdownCompleted,
+
+    /// S220 / PR-217 — the buyer-backfill cycle completed one pass.
+    /// The boot-time backfill walks restored_invoice rows with a
+    /// NULL `customer_name` and tries to fetch buyer fields via NAV's
+    /// `queryInvoiceData OUTBOUND`. Per [[aberp-extnav-partner-nav-gap]]
+    /// the call is entitlement-gated to the original submitter — for
+    /// invoices issued via Billingo / KBoss / etc. it returns no
+    /// `customerInfo` and the row stays NULL. S218 surfaced this
+    /// silently; this event makes the cycle outcome observable.
+    ///
+    /// Payload (`RestoreBuyerBackfillCycleCompletedPayload`) carries
+    /// `idempotency_key`, closed-vocab `trigger` (`"boot"` today;
+    /// `"manual"` is reserved for a future operator-paced re-run),
+    /// counters (`scanned` / `backfilled` / `backfilled_without_name`
+    /// / `errored`), `first_error_messages` (Vec<String>, cap 3) so
+    /// "why did backfill fail on these rows" is answerable without
+    /// grepping logs, `elapsed_ms`, and an optional `error` when the
+    /// cycle itself aborted early (transport setup, no creds).
+    ///
+    /// Same `system.` prefix posture as the other operator-triggered
+    /// background events — the per-OUTGOING-invoice export bundle's
+    /// `invoice.*` glob MUST NEVER sweep this. F12 four-edit ritual
+    /// fires once.
+    RestoreBuyerBackfillCycleCompleted,
+
+    /// S220 / PR-217 — operator manually linked (or unlinked) a
+    /// partner on a restored ExtNav invoice row. Per [[aberp-extnav-partner-nav-gap]]
+    /// NAV won't expose buyer info for invoices submitted via other
+    /// software; the SPA exposes a partner-picker so the operator can
+    /// annotate ExtNav rows from their own knowledge. This is the
+    /// audit trail for those decisions.
+    ///
+    /// Payload (`ExtNavPartnerManualLinkPayload`) carries the
+    /// `restored_invoice_id`, `source_nav_invoice_number`, the
+    /// `partner_id_before` / `partner_id_after` (Option<String> on
+    /// both — None on "clear", None on "first link"), and the
+    /// denormalized `customer_name_before` / `customer_name_after` so
+    /// the audit trail tells the WHO without joining `partners`
+    /// (which may have been mutated since).
+    ///
+    /// `system.`-prefixed: restored_invoice lives outside the
+    /// canonical `invoice` table, so the per-OUTGOING-invoice export
+    /// bundle's `invoice.*` glob MUST NEVER sweep this (same posture
+    /// as `InvoiceRestoredFromNav`). F12 four-edit ritual fires once.
+    ExtNavPartnerManualLink,
 }
 
 impl EventKind {
@@ -801,6 +846,10 @@ impl EventKind {
             EventKind::InvoiceRestoredFromNav => "system.invoice_restored_from_nav",
             EventKind::QuoteIntakePollCompleted => "system.quote_intake_poll_completed",
             EventKind::DaemonShutdownCompleted => "system.daemon_shutdown_completed",
+            EventKind::RestoreBuyerBackfillCycleCompleted => {
+                "system.restore_buyer_backfill_cycle_completed"
+            }
+            EventKind::ExtNavPartnerManualLink => "system.extnav_partner_manual_link",
         }
     }
 
@@ -855,6 +904,10 @@ impl EventKind {
             "system.invoice_restored_from_nav" => Ok(EventKind::InvoiceRestoredFromNav),
             "system.quote_intake_poll_completed" => Ok(EventKind::QuoteIntakePollCompleted),
             "system.daemon_shutdown_completed" => Ok(EventKind::DaemonShutdownCompleted),
+            "system.restore_buyer_backfill_cycle_completed" => {
+                Ok(EventKind::RestoreBuyerBackfillCycleCompleted)
+            }
+            "system.extnav_partner_manual_link" => Ok(EventKind::ExtNavPartnerManualLink),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -903,6 +956,8 @@ mod tests {
             EventKind::InvoiceRestoredFromNav,
             EventKind::QuoteIntakePollCompleted,
             EventKind::DaemonShutdownCompleted,
+            EventKind::RestoreBuyerBackfillCycleCompleted,
+            EventKind::ExtNavPartnerManualLink,
         ];
         for v in variants {
             let s = v.as_str();
@@ -1507,6 +1562,70 @@ mod tests {
         );
         assert_ne!(
             EventKind::QuoteIntakePollCompleted.as_str(),
+            EventKind::InvoiceRestoredFromNav.as_str()
+        );
+    }
+
+    /// S220 / PR-217 — the buyer-backfill cycle kind is a
+    /// background-cycle event with the same `system.` prefix posture
+    /// as `IncomingInvoiceSyncCycleCompleted` / `QuoteIntakePollCompleted`.
+    /// MUST NOT carry an `invoice.` prefix or the per-OUTGOING-invoice
+    /// export bundle's `invoice.*` glob would sweep a cycle row into
+    /// an evidence bundle that's supposed to carry per-invoice
+    /// regulated entries only.
+    #[test]
+    fn s220_restore_buyer_backfill_cycle_uses_system_prefix() {
+        assert_eq!(
+            EventKind::RestoreBuyerBackfillCycleCompleted.as_str(),
+            "system.restore_buyer_backfill_cycle_completed"
+        );
+        assert!(EventKind::RestoreBuyerBackfillCycleCompleted
+            .as_str()
+            .starts_with("system."));
+        assert!(!EventKind::RestoreBuyerBackfillCycleCompleted
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// S220 / PR-217 — the ExtNav manual-link kind is operator-paced
+    /// metadata on a restored row, NOT a canonical invoice lifecycle
+    /// event. Same `system.` prefix posture as `InvoiceRestoredFromNav`.
+    /// MUST NOT carry an `invoice.` prefix or the per-OUTGOING-invoice
+    /// export bundle's `invoice.*` glob would sweep an annotation
+    /// against a restored row into the wrong export bundle.
+    #[test]
+    fn s220_extnav_partner_manual_link_uses_system_prefix() {
+        assert_eq!(
+            EventKind::ExtNavPartnerManualLink.as_str(),
+            "system.extnav_partner_manual_link"
+        );
+        assert!(EventKind::ExtNavPartnerManualLink
+            .as_str()
+            .starts_with("system."));
+        assert!(!EventKind::ExtNavPartnerManualLink
+            .as_str()
+            .starts_with("invoice."));
+    }
+
+    /// S220 / PR-217 — the two new kinds must be distinct from every
+    /// prior cycle/restoration kind. Same fork-discipline posture as
+    /// the other `*_is_distinct_from` tests.
+    #[test]
+    fn s220_kinds_are_distinct() {
+        assert_ne!(
+            EventKind::RestoreBuyerBackfillCycleCompleted.as_str(),
+            EventKind::ExtNavPartnerManualLink.as_str()
+        );
+        assert_ne!(
+            EventKind::RestoreBuyerBackfillCycleCompleted.as_str(),
+            EventKind::IncomingInvoiceSyncCycleCompleted.as_str()
+        );
+        assert_ne!(
+            EventKind::RestoreBuyerBackfillCycleCompleted.as_str(),
+            EventKind::QuoteIntakePollCompleted.as_str()
+        );
+        assert_ne!(
+            EventKind::ExtNavPartnerManualLink.as_str(),
             EventKind::InvoiceRestoredFromNav.as_str()
         );
     }

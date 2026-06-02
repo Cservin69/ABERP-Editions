@@ -1872,6 +1872,37 @@ export async function listRestoredInvoices(): Promise<RestoredInvoice[]> {
   return invoke<RestoredInvoice[]>("list_restored_invoices");
 }
 
+/** S220 / PR-217 — `POST /api/restored-invoices/:id/partner`.
+ *
+ * Operator-paced manual partner link on a restored ExtNav row. Per
+ * [[aberp-extnav-partner-nav-gap]] NAV does not expose buyer info for
+ * invoices submitted via other software, so the backfill cannot
+ * populate `customer_name` for those rows; the SPA partner-picker
+ * modal calls this to annotate from the operator's own records.
+ *
+ * Pass `partnerId === null` to clear an existing link (the row falls
+ * back to NULL `customer_name` and renders as the em-dash again).
+ *
+ * Returns the post-write denormalized snapshot so the caller can
+ * refresh the row inline without a second list-restored round trip.
+ */
+export interface RestoredPartnerSnapshot {
+  partner_id: string | null;
+  customer_name: string | null;
+  customer_tax_number: string | null;
+  customer_vat_status: string | null;
+}
+
+export async function setRestoredPartner(
+  restoredId: string,
+  partnerId: string | null,
+): Promise<RestoredPartnerSnapshot> {
+  return invoke<RestoredPartnerSnapshot>("set_restored_partner", {
+    restoredId,
+    body: { partner_id: partnerId },
+  });
+}
+
 // ── S211 / PR-210 — Quote intake config + queue ─────────────────────
 
 /** Most-recent `QuoteIntakePollCompleted` audit summary, surfaced by the

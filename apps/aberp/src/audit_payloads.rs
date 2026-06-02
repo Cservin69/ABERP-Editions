@@ -2394,6 +2394,142 @@ impl DaemonShutdownCompletedPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// RestoreBuyerBackfillCycleCompleted (S220 / PR-217)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::RestoreBuyerBackfillCycleCompleted`].
+///
+/// Written ONCE per buyer-backfill cycle by
+/// [`crate::restore_from_nav_outgoing::run_buyer_backfill_once`]. The
+/// backfill walks every `restored_invoice` row with NULL `customer_name`
+/// and tries to fetch buyer fields via NAV's `queryInvoiceData OUTBOUND`.
+///
+/// Per [[aberp-extnav-partner-nav-gap]] the OUTBOUND call is entitlement-
+/// gated to the original submitter; for invoices issued via a third
+/// party (Billingo / KBoss / etc.) NAV returns no `customerInfo` and the
+/// row stays NULL after the call succeeds. S218 surfaced this silently
+/// — `customer_name` simply remained NULL with no audit trace; an
+/// operator had to grep logs to learn "did backfill even run." This
+/// event closes that gap.
+///
+/// `error` is `Some(_)` when the cycle aborted early at the cycle level
+/// (NAV transport setup failed, no credentials available, etc.). Per-row
+/// errors do NOT promote to cycle-level errors — they ride
+/// `first_error_messages` (cap 3) and the `errored` counter so the
+/// timeline reader sees "scanned 14, backfilled 0, errored 14" without
+/// 14 separate audit entries. Same loud-fail discipline per CLAUDE.md
+/// rule 12.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoreBuyerBackfillCycleCompletedPayload {
+    /// Cycle-decision idempotency key — minted fresh per cycle.
+    /// Mirrors every other audit payload's F8 carry-forward shape.
+    pub idempotency_key: String,
+    /// Closed vocab: `"boot"` (the boot-time backfill spawn in
+    /// `serve::run`); `"manual"` reserved for a future operator-paced
+    /// re-run route. Surfaces who fired the cycle.
+    pub trigger: String,
+    /// Number of `restored_invoice` rows the cycle picked up to
+    /// process (rows with NULL `customer_name` and not yet skipped).
+    pub scanned: u64,
+    /// Number of rows where the cycle wrote `customer_name` from
+    /// NAV's `customerInfo`. The happy path.
+    pub backfilled: u64,
+    /// Number of rows where NAV returned `customerInfo` but the
+    /// buyer-info shape forced PRIVATE_PERSON anonymisation; the
+    /// row was UPDATEd with NULL `customer_name` + `customer_tax_number`
+    /// and a `customer_vat_status` of `"PRIVATE_PERSON"`. Distinct
+    /// from `backfilled` so the cycle outcome can distinguish "we
+    /// learned this is a private person" from "we learned the buyer
+    /// name."
+    pub backfilled_without_name: u64,
+    /// Number of rows where the per-row call failed (transport,
+    /// NAV error response, parsing failure, UPDATE failure). The
+    /// row keeps its NULL `customer_name` and will be re-tried on
+    /// the next cycle.
+    pub errored: u64,
+    /// First N per-row error messages (cap 3). Surfaces a
+    /// representative sample so the operator can ask "what's breaking
+    /// these rows?" without grepping logs; capped because the typical
+    /// failure mode is uniform (NAV's entitlement gate) and 14
+    /// identical strings add no signal. Empty when `errored == 0`.
+    pub first_error_messages: Vec<String>,
+    /// Wall-clock duration of the cycle in milliseconds.
+    pub elapsed_ms: u64,
+    /// `Some(_)` when the CYCLE aborted before the per-row loop
+    /// started (transport setup, no creds, worklist load failed).
+    /// Per-row errors do NOT bubble up here. `None` on the success
+    /// path even when every row errored.
+    pub error: Option<String>,
+}
+
+impl RestoreBuyerBackfillCycleCompletedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ExtNavPartnerManualLink (S220 / PR-217)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::ExtNavPartnerManualLink`].
+///
+/// Written ONCE per operator decision against
+/// `POST /api/restored-invoices/:id/partner`. The operator picks a
+/// partner (or "clear") for a restored ExtNav row; the route writes the
+/// 4 denormalized fields (`partner_id` / `customer_name` /
+/// `customer_tax_number` / `customer_vat_status`) and emits this entry
+/// so the audit trail tells the WHO + WHAT-CHANGED for every manual
+/// annotation.
+///
+/// Why before/after fields are NOT computed via the audit-ledger walk:
+/// the timeline reader for restored rows uses the simple denormalized
+/// fields on `restored_invoice` for display; the audit entry stands
+/// alone as the only forensic record of how those fields came to hold
+/// their current value (the per-row digest carries no buyer info per
+/// [[aberp-extnav-partner-nav-gap]]). Carrying the before/after
+/// inline means the timeline reader can answer "what was the partner
+/// before this change" without joining `partners` (which may have been
+/// renamed since) or replaying the chain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExtNavPartnerManualLinkPayload {
+    /// Per-decision idempotency key — minted fresh per operator click.
+    /// Mirrors every other audit payload's F8 carry-forward shape.
+    pub idempotency_key: String,
+    /// `rinv_<ULID>` — the local `restored_invoice` row the operator
+    /// edited. Same shape as [`InvoiceRestoredFromNavPayload`].
+    pub restored_invoice_id: String,
+    /// NAV's `<series>/<seq>` for the row, denormalized onto the audit
+    /// entry so a future reader can correlate without joining
+    /// `restored_invoice` (which may have been wiped + re-restored).
+    pub source_nav_invoice_number: String,
+    /// Closed vocab: `"link"` when `partner_id_after.is_some()`,
+    /// `"clear"` when `partner_id_after.is_none()`. Surfaces the
+    /// operator's intent at a glance for timeline UIs that group by
+    /// action kind.
+    pub action: String,
+    /// `prt_<ULID>` partner id that the row pointed at BEFORE this
+    /// decision. `None` if no partner was linked (the typical first-
+    /// link case from a freshly restored row).
+    pub partner_id_before: Option<String>,
+    /// `prt_<ULID>` partner id the row points at AFTER this decision.
+    /// `None` on a `"clear"` action.
+    pub partner_id_after: Option<String>,
+    /// Denormalized `customer_name` BEFORE this decision. None on a
+    /// fresh row; Some when re-linking an already-annotated row.
+    pub customer_name_before: Option<String>,
+    /// Denormalized `customer_name` AFTER this decision. None on a
+    /// `"clear"` action; Some(<partner.display_name>) on `"link"`.
+    pub customer_name_after: Option<String>,
+}
+
+impl ExtNavPartnerManualLinkPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -4422,6 +4558,150 @@ mod tests {
         };
         let bytes = payload.to_bytes();
         let parsed: IncomingInvoiceSyncCycleCompletedPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+    }
+
+    /// PR-217 / S220 — `RestoreBuyerBackfillCycleCompletedPayload`
+    /// round-trips on the happy path. `first_error_messages` is empty
+    /// when `errored == 0`; same posture as the cycle-summary shape
+    /// shared with `IncomingInvoiceSyncCycleCompletedPayload`.
+    #[test]
+    fn restore_buyer_backfill_cycle_completed_round_trip_happy() {
+        let payload = RestoreBuyerBackfillCycleCompletedPayload {
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            trigger: "boot".to_string(),
+            scanned: 5,
+            backfilled: 4,
+            backfilled_without_name: 1,
+            errored: 0,
+            first_error_messages: vec![],
+            elapsed_ms: 812,
+            error: None,
+        };
+        let bytes = payload.to_bytes();
+        let parsed: RestoreBuyerBackfillCycleCompletedPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+    }
+
+    /// PR-217 / S220 — `first_error_messages` carry verbatim error
+    /// strings. Cap at 3 is a CALLER discipline
+    /// (`run_buyer_backfill_once`), not enforced by the payload
+    /// itself; the round-trip test pins that a long vec still
+    /// serializes cleanly so a future bug that exceeds the cap does
+    /// not corrupt the chain.
+    #[test]
+    fn restore_buyer_backfill_cycle_completed_round_trip_with_errors() {
+        let payload = RestoreBuyerBackfillCycleCompletedPayload {
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            trigger: "boot".to_string(),
+            scanned: 14,
+            backfilled: 0,
+            backfilled_without_name: 0,
+            errored: 14,
+            first_error_messages: vec![
+                "BIL-2026-001: queryInvoiceData returned no customerInfo".to_string(),
+                "BIL-2026-002: queryInvoiceData returned no customerInfo".to_string(),
+                "BIL-2026-003: queryInvoiceData returned no customerInfo".to_string(),
+            ],
+            elapsed_ms: 4200,
+            error: None,
+        };
+        let bytes = payload.to_bytes();
+        let parsed: RestoreBuyerBackfillCycleCompletedPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+        assert_eq!(parsed.first_error_messages.len(), 3, "cap is 3 by caller");
+    }
+
+    /// PR-217 / S220 — cycle-level abort (transport setup failure)
+    /// rides `error`. Per-row errors do NOT bubble up to this field;
+    /// when both paths happen on the same cycle the audit reader
+    /// distinguishes them.
+    #[test]
+    fn restore_buyer_backfill_cycle_completed_round_trip_cycle_abort() {
+        let payload = RestoreBuyerBackfillCycleCompletedPayload {
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            trigger: "boot".to_string(),
+            scanned: 0,
+            backfilled: 0,
+            backfilled_without_name: 0,
+            errored: 0,
+            first_error_messages: vec![],
+            elapsed_ms: 12,
+            error: Some("NAV transport build failed: no credentials in keychain".to_string()),
+        };
+        let bytes = payload.to_bytes();
+        let parsed: RestoreBuyerBackfillCycleCompletedPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+    }
+
+    /// PR-217 / S220 — `ExtNavPartnerManualLinkPayload` round-trips
+    /// on the LINK action. `partner_id_before`/`customer_name_before`
+    /// are `None` for the typical first-link case from a freshly
+    /// restored row whose backfill could not fill the buyer fields.
+    #[test]
+    fn extnav_partner_manual_link_round_trip_link() {
+        let payload = ExtNavPartnerManualLinkPayload {
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            restored_invoice_id: "rinv_01ABCDEFGHJKMNPQRSTVWXYZ12".to_string(),
+            source_nav_invoice_number: "BIL-2026/00042".to_string(),
+            action: "link".to_string(),
+            partner_id_before: None,
+            partner_id_after: Some("prt_01ABCDEFGHJKMNPQRSTVWXYZ34".to_string()),
+            customer_name_before: None,
+            customer_name_after: Some("Áben Consulting Kft.".to_string()),
+        };
+        let bytes = payload.to_bytes();
+        let parsed: ExtNavPartnerManualLinkPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+        assert_eq!(parsed.action, "link");
+    }
+
+    /// PR-217 / S220 — `ExtNavPartnerManualLinkPayload` round-trips
+    /// on the CLEAR action. `*_after` are `None`; `*_before` carry
+    /// the previously-linked partner so a future audit reader can
+    /// reconstruct "operator linked Áben Consulting Kft. then
+    /// reconsidered and unlinked" without joining `partners`.
+    #[test]
+    fn extnav_partner_manual_link_round_trip_clear() {
+        let payload = ExtNavPartnerManualLinkPayload {
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            restored_invoice_id: "rinv_01ABCDEFGHJKMNPQRSTVWXYZ12".to_string(),
+            source_nav_invoice_number: "BIL-2026/00042".to_string(),
+            action: "clear".to_string(),
+            partner_id_before: Some("prt_01ABCDEFGHJKMNPQRSTVWXYZ34".to_string()),
+            partner_id_after: None,
+            customer_name_before: Some("Áben Consulting Kft.".to_string()),
+            customer_name_after: None,
+        };
+        let bytes = payload.to_bytes();
+        let parsed: ExtNavPartnerManualLinkPayload =
+            serde_json::from_slice(&bytes).expect("round-trip");
+        assert_eq!(parsed, payload);
+        assert_eq!(parsed.action, "clear");
+    }
+
+    /// PR-217 / S220 — `ExtNavPartnerManualLinkPayload` round-trips
+    /// on a RE-LINK (operator switching from partner A to partner B).
+    /// All four `*_before` / `*_after` are `Some(_)`; action is `"link"`.
+    #[test]
+    fn extnav_partner_manual_link_round_trip_relink() {
+        let payload = ExtNavPartnerManualLinkPayload {
+            idempotency_key: IdempotencyKey::new().to_canonical_string(),
+            restored_invoice_id: "rinv_01ABCDEFGHJKMNPQRSTVWXYZ12".to_string(),
+            source_nav_invoice_number: "BIL-2026/00042".to_string(),
+            action: "link".to_string(),
+            partner_id_before: Some("prt_FIRSTPARTNERIDxxxxxxxxxxxx".to_string()),
+            partner_id_after: Some("prt_SECONDPARTNERIDxxxxxxxxxxx".to_string()),
+            customer_name_before: Some("First Pick Co.".to_string()),
+            customer_name_after: Some("Corrected Buyer Kft.".to_string()),
+        };
+        let bytes = payload.to_bytes();
+        let parsed: ExtNavPartnerManualLinkPayload =
             serde_json::from_slice(&bytes).expect("round-trip");
         assert_eq!(parsed, payload);
     }

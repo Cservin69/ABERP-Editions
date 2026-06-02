@@ -671,7 +671,16 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // S213 / PR-209 — graceful-shutdown coordinator event.
         // `system.`-scoped — process-lifecycle telemetry never
         // belongs in a per-invoice export bundle.
-        | EventKind::DaemonShutdownCompleted => None,
+        | EventKind::DaemonShutdownCompleted
+        // S220 / PR-217 — buyer-backfill cycle completion event.
+        // `system.`-scoped — recovery cadence telemetry against
+        // `restored_invoice`, not a per-OUTGOING-invoice surface.
+        | EventKind::RestoreBuyerBackfillCycleCompleted
+        // S220 / PR-217 — operator-paced manual partner link on a
+        // restored ExtNav row. The restored row lives in
+        // `restored_invoice` (not `invoice`); annotations against
+        // it never belong in a per-OUTGOING-invoice export bundle.
+        | EventKind::ExtNavPartnerManualLink => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

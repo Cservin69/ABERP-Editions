@@ -318,6 +318,10 @@ pub fn run() {
             // already-restored rows.
             commands::restore_from_nav_outgoing,
             commands::list_restored_invoices,
+            // S220 / PR-217 — operator-paced manual partner link on
+            // a restored ExtNav row (NAV doesn't expose buyer info
+            // for invoices submitted via other software).
+            commands::set_restored_partner,
             // S211 / PR-210 — quote-intake config + queue surface.
             commands::get_quote_intake_config,
             commands::put_quote_intake_config,

@@ -1111,12 +1111,29 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                         );
                         return;
                     }
+                    // PR-217 / S220 — resolve the binary hash so the
+                    // cycle-completion audit entry can be appended.
+                    // `wait()` blocks at most until the background
+                    // hash-of-self task completes; on the boot path
+                    // it has been running since `serve::run`'s start
+                    // and is typically already resolved.
+                    let binary_hash = match st.binary_hash.wait() {
+                        Ok(h) => h,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = ?e,
+                                "S218: buyer-backfill skipped — binary hash not available"
+                            );
+                            return;
+                        }
+                    };
                     restore_outgoing::BackfillInputs {
                         db_path: (*st.db_path).clone(),
                         tenant: st.tenant.clone(),
                         tax_number_8: parsed.taxpayer_id,
                         endpoint,
                         credentials,
+                        binary_hash,
                     }
                 };
                 let _ = restore_outgoing::run_buyer_backfill_once(inputs, backfill_token).await;
@@ -1861,6 +1878,17 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/invoices/:id/mark-paid",
             post(handle_mark_invoice_paid),
+        )
+        // PR-217 / S220 — operator-paced manual partner link on a
+        // restored ExtNav row. Per [[aberp-extnav-partner-nav-gap]] NAV
+        // does not expose buyer info for invoices submitted via other
+        // software, so [`restore_outgoing::run_buyer_backfill_once`] is
+        // structurally unable to populate `customer_name` for those
+        // rows. The SPA exposes a partner-picker for these so the
+        // operator can annotate from their own records.
+        .route(
+            "/api/restored-invoices/:id/partner",
+            post(handle_set_restored_partner),
         )
         .route("/audit/:invoice_id", get(handle_get_audit))
         // PR-46α / session-62 — first-run setup route. Accepts the
@@ -6465,6 +6493,266 @@ async fn handle_mark_invoice_paid(
         }
         Err(MarkPaidRouteError::Other(e)) => internal_error("mark_paid_request", e),
     }
+}
+
+/// PR-217 / S220 — request body for `POST /api/restored-invoices/:id/partner`.
+///
+/// `partner_id: None` is the explicit "clear / no partner" path —
+/// distinct from absent-field (serde rejects unknown JSON shapes via
+/// the strict route layer, but a missing key in this struct would
+/// deserialize to `None` and be indistinguishable from an explicit
+/// null). The SPA always sends an explicit `null` or `string` for
+/// clarity.
+#[derive(Debug, Deserialize)]
+pub struct SetRestoredPartnerRequest {
+    /// `prt_<ULID>` partner pointer to link, or `null` to clear an
+    /// existing link. The handler validates that a non-null id resolves
+    /// to a live partner row before writing.
+    pub partner_id: Option<String>,
+}
+
+/// PR-217 / S220 — response body for the manual-link route. Echoes the
+/// post-write denormalized buyer snapshot so the SPA can refresh the
+/// row without a second list-restored fetch.
+#[derive(Debug, Serialize)]
+pub struct SetRestoredPartnerResponse {
+    pub partner_id: Option<String>,
+    pub customer_name: Option<String>,
+    pub customer_tax_number: Option<String>,
+    pub customer_vat_status: Option<String>,
+}
+
+/// PR-217 / S220 — typed errors for the manual-link route.
+#[derive(Debug)]
+enum SetRestoredPartnerError {
+    RestoredNotFound(String),
+    PartnerNotFound(String),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for SetRestoredPartnerError {
+    fn from(e: anyhow::Error) -> Self {
+        SetRestoredPartnerError::Other(e)
+    }
+}
+
+/// PR-217 / S220 — operator-paced manual partner link on a restored
+/// ExtNav row. Per [[aberp-extnav-partner-nav-gap]] NAV does not expose
+/// buyer info for invoices submitted via other software; this route is
+/// the operator's escape hatch for those rows.
+///
+/// **State transitions**:
+///   - `partner_id: Some(id)` → fetch partner, denormalize
+///     `customer_name`/`customer_tax_number`/`customer_vat_status`
+///     onto the row, write `partner_id` pointer, emit audit
+///     `ExtNavPartnerManualLink` (action `"link"`).
+///   - `partner_id: None` → clear all four fields, emit audit
+///     (action `"clear"`).
+///
+/// **HTTP status codes**:
+///   - `200 OK` + [`SetRestoredPartnerResponse`] on success.
+///   - `404 Not Found` — restored row id is unknown OR belongs to a
+///     different tenant OR the target partner_id is unknown.
+///   - `503 Service Unavailable` — backend not in `Ready` state.
+///   - `500 Internal Server Error` — DB / audit-ledger error.
+async fn handle_set_restored_partner(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(restored_id): AxumPath<String>,
+    Json(body): Json<SetRestoredPartnerRequest>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let restored_id_for_task = restored_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        set_restored_partner_request(&state_for_task, &restored_id_for_task, body)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "set_restored_partner_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(snapshot) => Json(SetRestoredPartnerResponse {
+            partner_id: snapshot.partner_id,
+            customer_name: snapshot.customer_name,
+            customer_tax_number: snapshot.customer_tax_number,
+            customer_vat_status: snapshot.customer_vat_status,
+        })
+        .into_response(),
+        Err(SetRestoredPartnerError::RestoredNotFound(msg)) => {
+            (StatusCode::NOT_FOUND, Json(error_body(msg))).into_response()
+        }
+        Err(SetRestoredPartnerError::PartnerNotFound(msg)) => {
+            (StatusCode::NOT_FOUND, Json(error_body(msg))).into_response()
+        }
+        Err(SetRestoredPartnerError::Other(e)) => internal_error("set_restored_partner_request", e),
+    }
+}
+
+/// PR-217 / S220 — sync implementation of the manual-link route. Runs
+/// inside `spawn_blocking`. Holds ONE DB transaction across:
+///   1. `read_restored_buyer_snapshot` — capture `*_before`.
+///   2. `read_restored_source_number` — needed for the audit payload.
+///   3. Resolve target partner snapshot (or `None` for clear).
+///   4. `update_partner_for_restored` — write 4 denorm fields.
+///   5. `audit_ledger::append_in_tx` — `ExtNavPartnerManualLink`.
+/// All-or-nothing per the audit-ledger discipline (a write that
+/// commits without its audit entry is the silent-omission failure
+/// mode CLAUDE.md rule 12 names).
+fn set_restored_partner_request(
+    state: &AppState,
+    restored_id: &str,
+    body: SetRestoredPartnerRequest,
+) -> std::result::Result<restore_outgoing::RestoredBuyerSnapshot, SetRestoredPartnerError> {
+    let operator_login = match state.boot_state.read() {
+        Ok(guard) => match &*guard {
+            ServeBootState::Ready { operator_login } => operator_login.clone(),
+            ServeBootState::NeedsSetup | ServeBootState::NeedsSellerConfig { .. } => {
+                return Err(SetRestoredPartnerError::Other(anyhow!(
+                    "set_restored_partner_request called outside Ready state"
+                )));
+            }
+        },
+        Err(e) => {
+            return Err(SetRestoredPartnerError::Other(anyhow!(
+                "boot_state RwLock poisoned: {e}"
+            )));
+        }
+    };
+
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| SetRestoredPartnerError::Other(anyhow!("await binary hash: {e}")))?;
+    let tenant = state.tenant.clone();
+    let db_path = state.db_path.as_ref().clone();
+
+    let mut conn = duckdb::Connection::open(&db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    aberp_audit_ledger::ensure_schema(&conn)
+        .context("ensure audit-ledger schema for ExtNavPartnerManualLink")?;
+    partners::ensure_schema(&conn).context("ensure partners schema for ExtNavPartnerManualLink")?;
+
+    let before = match restore_outgoing::read_restored_buyer_snapshot(
+        &conn,
+        tenant.as_str(),
+        restored_id,
+    )? {
+        Some(s) => s,
+        None => {
+            return Err(SetRestoredPartnerError::RestoredNotFound(format!(
+                "no restored_invoice row matches id `{restored_id}` for this tenant"
+            )));
+        }
+    };
+    let source_nav_invoice_number =
+        restore_outgoing::read_restored_source_number(&conn, tenant.as_str(), restored_id)?
+            .ok_or_else(|| {
+                SetRestoredPartnerError::RestoredNotFound(format!(
+                    "no restored_invoice row matches id `{restored_id}` for this tenant"
+                ))
+            })?;
+
+    // Resolve the target partner snapshot (None on a clear action).
+    let after = match body.partner_id.as_deref().map(str::trim) {
+        Some(pid) if !pid.is_empty() => {
+            let partner = match partners::get_partner(&conn, tenant.as_str(), pid)? {
+                Some(p) => p,
+                None => {
+                    return Err(SetRestoredPartnerError::PartnerNotFound(format!(
+                        "no partner row matches id `{pid}` for this tenant"
+                    )));
+                }
+            };
+            // Snapshot the partner's denormalized fields onto the
+            // restored row. Mirrors how the side-store `<ULID>.input.json`
+            // path captures buyer info at issue time — the row carries
+            // a frozen view; a later partner rename does not retroactively
+            // change the audit-trail view.
+            restore_outgoing::RestoredBuyerSnapshot {
+                partner_id: Some(partner.id.clone()),
+                customer_name: Some(partner.display_name.clone()),
+                customer_tax_number: partner.tax_number.clone(),
+                customer_vat_status: Some(partner.customer_vat_status.as_db_str().to_string()),
+            }
+        }
+        _ => restore_outgoing::RestoredBuyerSnapshot {
+            partner_id: None,
+            customer_name: None,
+            customer_tax_number: None,
+            customer_vat_status: None,
+        },
+    };
+
+    let action = if after.partner_id.is_some() {
+        "link"
+    } else {
+        "clear"
+    };
+    let idempotency_key = Ulid::new().to_string();
+    let payload = audit_payloads::ExtNavPartnerManualLinkPayload {
+        idempotency_key: idempotency_key.clone(),
+        restored_invoice_id: restored_id.to_string(),
+        source_nav_invoice_number,
+        action: action.to_string(),
+        partner_id_before: before.partner_id.clone(),
+        partner_id_after: after.partner_id.clone(),
+        customer_name_before: before.customer_name.clone(),
+        customer_name_after: after.customer_name.clone(),
+    };
+
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (ExtNavPartnerManualLink)")?;
+    let affected = restore_outgoing::update_partner_for_restored(
+        &tx,
+        tenant.as_str(),
+        restored_id,
+        after.partner_id.as_deref(),
+        after.customer_name.as_deref(),
+        after.customer_tax_number.as_deref(),
+        after.customer_vat_status.as_deref(),
+    )?;
+    if affected != 1 {
+        return Err(SetRestoredPartnerError::RestoredNotFound(format!(
+            "restored_invoice row `{restored_id}` disappeared between read and write"
+        )));
+    }
+    let session_id = Ulid::new().to_string();
+    let actor = Actor::from_local_cli(session_id, &operator_login);
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(tenant.clone(), binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        EventKind::ExtNavPartnerManualLink,
+        payload.to_bytes(),
+        actor,
+        Some(idempotency_key),
+    )
+    .map_err(|e| anyhow!("audit_ledger::append_in_tx ExtNavPartnerManualLink: {e}"))?;
+    tx.commit()
+        .context("commit DuckDB transaction (ExtNavPartnerManualLink)")?;
+    drop(conn);
+
+    let ledger = Ledger::open(&db_path, tenant.clone(), binary_hash)
+        .context("open audit ledger to sync mirror after manual-link entry")?;
+    let mirror_path = aberp_audit_ledger::mirror_path_for(&db_path);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file after manual-link entry")?;
+
+    Ok(after)
 }
 
 /// PR-70 / ADR-0039 — typed error returned by [`mark_paid_request`].
@@ -14276,6 +14564,7 @@ mod tests {
             customer_name: Some("Áben Consulting Kft.".to_string()),
             customer_tax_number: Some("24904362-2-41".to_string()),
             customer_vat_status: Some("Domestic".to_string()),
+            partner_id: None,
         };
         let item = restored_to_list_item(ext).expect("HUF restored_invoice must map");
 
@@ -14330,6 +14619,7 @@ mod tests {
             customer_name: None,
             customer_tax_number: None,
             customer_vat_status: None,
+            partner_id: None,
         };
         let item_eur = restored_to_list_item(ext_eur).expect("EUR restored_invoice must map");
         assert_eq!(item_eur.currency, Currency::Eur, "EUR arm carries through");
@@ -14358,6 +14648,7 @@ mod tests {
             customer_name: None,
             customer_tax_number: None,
             customer_vat_status: None,
+            partner_id: None,
         };
         let err = match restored_to_list_item(bad) {
             Ok(_) => panic!("USD MUST loud-fail"),
@@ -14476,6 +14767,7 @@ mod tests {
                 customer_name: None,
                 customer_tax_number: None,
                 customer_vat_status: None,
+                partner_id: None,
             };
             // Open + ensure schema + raw INSERT — mirrors the seller-
             // side write path's posture without depending on the wizard

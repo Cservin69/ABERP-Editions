@@ -790,7 +790,16 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // S213 / PR-209 — graceful-shutdown coordinator's per-shutdown
         // event. `system.`-scoped; the payload names registered
         // daemons + their clean/timeout outcome, not NAV bytes.
-        | EventKind::DaemonShutdownCompleted => (None, ""),
+        | EventKind::DaemonShutdownCompleted
+        // S220 / PR-217 — buyer-backfill cycle event. `system.`-scoped;
+        // the payload carries cycle counters, not NAV bytes (the
+        // per-row NAV bytes ride the row's NULL→filled customer_name
+        // delta, observed via list_restored).
+        | EventKind::RestoreBuyerBackfillCycleCompleted
+        // S220 / PR-217 — operator-paced manual partner link on a
+        // restored row. `system.`-scoped; the payload is an
+        // operator-decision record, no NAV bytes.
+        | EventKind::ExtNavPartnerManualLink => (None, ""),
     };
 
     Ok(NavExtraction {

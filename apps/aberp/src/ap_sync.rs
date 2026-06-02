@@ -1693,8 +1693,15 @@ mod tests {
             <result><funcCode>OK</funcCode></result>\
             <invoiceDataResult/>\
         </QueryInvoiceDataResponse>";
-        persist_xml_for_row(response_xml, &db_path, "t1", &artifacts_dir, id, "SUP-2026/000001")
-            .expect("empty <invoiceDataResult/> must NOT loud-fail per PR-215");
+        persist_xml_for_row(
+            response_xml,
+            &db_path,
+            "t1",
+            &artifacts_dir,
+            id,
+            "SUP-2026/000001",
+        )
+        .expect("empty <invoiceDataResult/> must NOT loud-fail per PR-215");
 
         let capture_path = artifacts_dir.join(".failed").join(format!("{}.xml", id));
         assert!(
@@ -1732,11 +1739,21 @@ mod tests {
         // NO <invoiceDataResult> and NO <invoiceData>. Real NAV bytes.
         let response_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><ns2:QueryInvoiceDataResponse xmlns="http://schemas.nav.gov.hu/NTCA/1.0/common" xmlns:ns2="http://schemas.nav.gov.hu/OSA/3.0/api" xmlns:ns3="http://schemas.nav.gov.hu/OSA/3.0/base" xmlns:ns4="http://schemas.nav.gov.hu/OSA/3.0/data"><header><requestId>REQ00000000000000000000000000</requestId><timestamp>2026-06-01T00:00:00Z</timestamp><requestVersion>3.0</requestVersion><headerVersion>1.0</headerVersion></header><result><funcCode>OK</funcCode></result><ns2:software><ns2:softwareId>ABERP-000000000001</ns2:softwareId><ns2:softwareName>ABERP</ns2:softwareName><ns2:softwareOperation>LOCAL_SOFTWARE</ns2:softwareOperation><ns2:softwareMainVersion>0.0.0</ns2:softwareMainVersion><ns2:softwareDevName>Ervin Aben</ns2:softwareDevName><ns2:softwareDevContact>ervin@aben.ch</ns2:softwareDevContact></ns2:software></ns2:QueryInvoiceDataResponse>"#;
 
-        persist_xml_for_row(response_xml, &db_path, "t1", &artifacts_dir, id, "SUP-2026/000001")
-            .expect("Shape A (NTCA-default) with no <invoiceData> must NOT loud-fail per PR-215");
+        persist_xml_for_row(
+            response_xml,
+            &db_path,
+            "t1",
+            &artifacts_dir,
+            id,
+            "SUP-2026/000001",
+        )
+        .expect("Shape A (NTCA-default) with no <invoiceData> must NOT loud-fail per PR-215");
 
         let capture_path = artifacts_dir.join(".failed").join(format!("{}.xml", id));
-        assert!(!capture_path.exists(), "no .failed/ capture for Shape A no-data response");
+        assert!(
+            !capture_path.exists(),
+            "no .failed/ capture for Shape A no-data response"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1773,11 +1790,21 @@ mod tests {
         // prefix to OSA so they were unprefixed there).
         let response_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><QueryInvoiceDataResponse xmlns="http://schemas.nav.gov.hu/OSA/3.0/api" xmlns:ns2="http://schemas.nav.gov.hu/NTCA/1.0/common" xmlns:ns3="http://schemas.nav.gov.hu/OSA/3.0/base" xmlns:ns4="http://schemas.nav.gov.hu/OSA/3.0/data"><ns2:header><ns2:requestId>REQ00000000000000000000000000</ns2:requestId><ns2:timestamp>2026-06-01T00:00:00Z</ns2:timestamp><ns2:requestVersion>3.0</ns2:requestVersion><ns2:headerVersion>1.0</ns2:headerVersion></ns2:header><ns2:result><ns2:funcCode>OK</ns2:funcCode></ns2:result><software><softwareId>ABERP-000000000001</softwareId><softwareName>ABERP</softwareName><softwareOperation>LOCAL_SOFTWARE</softwareOperation><softwareMainVersion>0.0.0</softwareMainVersion><softwareDevName>Ervin Aben</softwareDevName><softwareDevContact>ervin@aben.ch</softwareDevContact></software></QueryInvoiceDataResponse>"#;
 
-        persist_xml_for_row(response_xml, &db_path, "t1", &artifacts_dir, id, "SUP-2026/000001")
-            .expect("Shape B (OSA/api-default) with no <invoiceData> must NOT loud-fail per PR-215");
+        persist_xml_for_row(
+            response_xml,
+            &db_path,
+            "t1",
+            &artifacts_dir,
+            id,
+            "SUP-2026/000001",
+        )
+        .expect("Shape B (OSA/api-default) with no <invoiceData> must NOT loud-fail per PR-215");
 
         let capture_path = artifacts_dir.join(".failed").join(format!("{}.xml", id));
-        assert!(!capture_path.exists(), "no .failed/ capture for Shape B no-data response");
+        assert!(
+            !capture_path.exists(),
+            "no .failed/ capture for Shape B no-data response"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

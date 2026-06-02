@@ -785,6 +785,29 @@ pub async fn list_restored_invoices(state: State<'_, AppState>) -> Result<Value,
     forward_get(&state, "/api/restored-invoices", true).await
 }
 
+/// S220 / PR-217 — operator-paced manual partner link on a restored
+/// ExtNav row. Per [[aberp-extnav-partner-nav-gap]] NAV does not expose
+/// buyer info for invoices submitted via other software; this command
+/// is the operator's escape hatch for annotating those rows with the
+/// partner from their own records.
+///
+/// Body shape: `{ partner_id: string | null }`. `null` clears any
+/// previous link.
+///
+/// Returns the post-write denormalized snapshot
+/// (`partner_id` + `customer_*`) so the SPA can refresh the row inline
+/// without a second list-restored round trip.
+#[tauri::command]
+pub async fn set_restored_partner(
+    state: State<'_, AppState>,
+    restored_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_invoice_id(&restored_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/restored-invoices/{restored_id}/partner");
+    forward_post(&state, &path, body).await
+}
+
 /// PR-45a / session-61 — the SPA's Retry button calls this command
 /// from the "backend boot failed" error pane. Spawns a fresh
 /// `boot_backend` attempt; the SPA continues polling
