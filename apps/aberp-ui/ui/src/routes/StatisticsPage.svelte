@@ -147,14 +147,16 @@
         {/if}
         {#if r.deltas.yoy !== null}
           <p class="stats__delta">
-            YoY HUF {formatPctChange(r.deltas.yoy.revenue_pct_huf)} ·
-            EUR {formatPctChange(r.deltas.yoy.revenue_pct_eur)}
+            <span class="stats__delta-label">YoY</span>
+            HUF <span class="delta" class:up={(r.deltas.yoy.revenue_pct_huf ?? 0) > 0} class:down={(r.deltas.yoy.revenue_pct_huf ?? 0) < 0}>{formatPctChange(r.deltas.yoy.revenue_pct_huf)}</span>
+            · EUR <span class="delta" class:up={(r.deltas.yoy.revenue_pct_eur ?? 0) > 0} class:down={(r.deltas.yoy.revenue_pct_eur ?? 0) < 0}>{formatPctChange(r.deltas.yoy.revenue_pct_eur)}</span>
           </p>
         {/if}
         {#if r.deltas.mom !== null}
           <p class="stats__delta">
-            MoM HUF {formatPctChange(r.deltas.mom.revenue_pct_huf)} ·
-            EUR {formatPctChange(r.deltas.mom.revenue_pct_eur)}
+            <span class="stats__delta-label">MoM</span>
+            HUF <span class="delta" class:up={(r.deltas.mom.revenue_pct_huf ?? 0) > 0} class:down={(r.deltas.mom.revenue_pct_huf ?? 0) < 0}>{formatPctChange(r.deltas.mom.revenue_pct_huf)}</span>
+            · EUR <span class="delta" class:up={(r.deltas.mom.revenue_pct_eur ?? 0) > 0} class:down={(r.deltas.mom.revenue_pct_eur ?? 0) < 0}>{formatPctChange(r.deltas.mom.revenue_pct_eur)}</span>
           </p>
         {/if}
       </article>
@@ -175,8 +177,9 @@
         {/if}
         {#if r.deltas.yoy !== null}
           <p class="stats__delta">
-            YoY HUF {formatPctChange(r.deltas.yoy.expenses_pct_huf)} ·
-            EUR {formatPctChange(r.deltas.yoy.expenses_pct_eur)}
+            <span class="stats__delta-label">YoY</span>
+            HUF <span class="delta" class:up={(r.deltas.yoy.expenses_pct_huf ?? 0) > 0} class:down={(r.deltas.yoy.expenses_pct_huf ?? 0) < 0}>{formatPctChange(r.deltas.yoy.expenses_pct_huf)}</span>
+            · EUR <span class="delta" class:up={(r.deltas.yoy.expenses_pct_eur ?? 0) > 0} class:down={(r.deltas.yoy.expenses_pct_eur ?? 0) < 0}>{formatPctChange(r.deltas.yoy.expenses_pct_eur)}</span>
           </p>
         {/if}
       </article>
@@ -356,14 +359,14 @@
     <section class="stats__hygiene" aria-label="Hygiene flags">
       <h3>Hygiene</h3>
       <ul>
-        <li>Pending drafts (outgoing): <strong>{r.hygiene.outgoing_pending_count}</strong></li>
-        <li>Rejected by NAV: <strong>{r.hygiene.outgoing_rejected_count}</strong></li>
-        <li>Abandoned: <strong>{r.hygiene.outgoing_abandoned_count}</strong></li>
-        <li>Restored rows with no partner link: <strong>{r.hygiene.restored_no_partner_count}</strong></li>
-        <li>Outstanding receivables past deadline: <strong>{r.hygiene.outstanding_past_deadline_count}</strong></li>
-        <li>Outstanding payables past deadline: <strong>{r.hygiene.payable_past_deadline_count}</strong></li>
-        <li>Storno chain entries in period: <strong>{r.hygiene.storno_chain_count}</strong></li>
-        <li>Modification chain entries in period: <strong>{r.hygiene.modification_chain_count}</strong></li>
+        <li class:flag-nonzero={r.hygiene.outgoing_pending_count > 0}>Pending drafts (outgoing): <strong>{r.hygiene.outgoing_pending_count}</strong></li>
+        <li class:flag-nonzero={r.hygiene.outgoing_rejected_count > 0}>Rejected by NAV: <strong>{r.hygiene.outgoing_rejected_count}</strong></li>
+        <li class:flag-nonzero={r.hygiene.outgoing_abandoned_count > 0}>Abandoned: <strong>{r.hygiene.outgoing_abandoned_count}</strong></li>
+        <li class:flag-nonzero={r.hygiene.restored_no_partner_count > 0}>Restored rows with no partner link: <strong>{r.hygiene.restored_no_partner_count}</strong></li>
+        <li class:flag-nonzero={r.hygiene.outstanding_past_deadline_count > 0}>Outstanding receivables past deadline: <strong>{r.hygiene.outstanding_past_deadline_count}</strong></li>
+        <li class:flag-nonzero={r.hygiene.payable_past_deadline_count > 0}>Outstanding payables past deadline: <strong>{r.hygiene.payable_past_deadline_count}</strong></li>
+        <li class:flag-nonzero={r.hygiene.storno_chain_count > 0}>Storno chain entries in period: <strong>{r.hygiene.storno_chain_count}</strong></li>
+        <li class:flag-nonzero={r.hygiene.modification_chain_count > 0}>Modification chain entries in period: <strong>{r.hygiene.modification_chain_count}</strong></li>
       </ul>
     </section>
 
@@ -392,186 +395,325 @@
 </section>
 
 <style>
+  /* S226 / PR-222 — dark-theme colour polish. Every colour resolves to a
+   * tokens.css variable (ADR-0017); the prior revision referenced
+   * undefined names (--color-surface / --color-line / --color-muted),
+   * so the light-mode hex fallbacks rendered: near-white body text on a
+   * white card = washed-out values. No functional changes. */
   .stats {
-    padding: 1.25rem 1.5rem;
+    padding: var(--space-4) var(--space-5);
     display: flex;
     flex-direction: column;
-    gap: 1rem;
+    gap: var(--space-4);
   }
   .stats__head {
     display: flex;
     justify-content: space-between;
     align-items: center;
     flex-wrap: wrap;
-    gap: 0.75rem;
+    gap: var(--space-3);
   }
   .stats__head h2 {
     margin: 0;
-    font-size: 1.25rem;
+    font-size: var(--type-size-xl);
+    font-weight: 600;
+    color: var(--color-text-strong);
   }
   .stats__controls {
     display: flex;
     align-items: center;
-    gap: 1rem;
+    gap: var(--space-4);
   }
   .stats__basis {
     display: inline-flex;
-    border: 1px solid var(--color-line, #cccccc);
-    border-radius: 4px;
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 3px;
     overflow: hidden;
   }
   .stats__basis-btn {
-    padding: 0.25rem 0.6rem;
-    background: transparent;
+    padding: var(--space-1) var(--space-3);
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
     border: 0;
     cursor: pointer;
-    font: inherit;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    transition: color var(--motion-fade-in);
+  }
+  .stats__basis-btn:hover {
+    color: var(--color-text-strong);
   }
   .stats__basis-btn.active {
-    background: var(--color-surface-active, #e7e7e7);
+    background: var(--color-surface-sunken);
+    color: var(--color-text-strong);
     font-weight: 600;
   }
   .stats__period {
     display: inline-flex;
     align-items: center;
-    gap: 0.4rem;
-    font-size: 0.875rem;
+    gap: var(--space-2);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-secondary);
+  }
+  .stats__period select {
+    background: var(--color-surface-raised);
+    color: var(--color-text-primary);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 3px;
+    padding: var(--space-1) var(--space-2);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+    cursor: pointer;
+  }
+  .stats__period select:hover {
+    border-color: var(--color-text-muted);
   }
   .stats__meta {
-    color: var(--color-muted, #666666);
-    font-size: 0.85rem;
+    color: var(--color-text-muted);
+    font-size: var(--type-size-sm);
     display: flex;
-    gap: 1rem;
+    gap: var(--space-4);
     flex-wrap: wrap;
+    margin: 0;
   }
+  .stats__meta strong {
+    color: var(--color-text-secondary);
+    font-weight: 600;
+  }
+
+  /* Card grid — gap + padding aligned with the list views. */
   .stats__cards {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 0.75rem;
+    gap: var(--space-3);
   }
   .stats__card {
-    border: 1px solid var(--color-line, #cccccc);
-    border-radius: 6px;
-    padding: 0.75rem;
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    padding: var(--space-3);
     display: flex;
     flex-direction: column;
-    gap: 0.4rem;
-    background: var(--color-surface, #ffffff);
+    gap: var(--space-2);
+    background: var(--color-surface-raised);
+    transition: border-color var(--motion-fade-in);
+  }
+  .stats__card:hover {
+    border-color: var(--color-text-muted);
   }
   .stats__card h3 {
-    margin: 0 0 0.25rem;
-    font-size: 0.95rem;
+    margin: 0 0 var(--space-1);
+    font-size: var(--type-size-sm);
+    font-weight: 600;
+    color: var(--color-text-secondary);
   }
+
+  /* Value row: dim currency/dimension label · strong tabular value ·
+   * muted count. The value carries the eye (ADR-0017 §3). */
   .stats__row {
     display: flex;
-    justify-content: space-between;
-    gap: 0.5rem;
+    gap: var(--space-2);
     align-items: baseline;
     margin: 0;
   }
+  .stats__row > span:first-child {
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-sm);
+  }
   .stats__row .num {
+    margin-left: auto;
+    font-family: var(--type-family-mono);
     font-variant-numeric: tabular-nums;
     font-weight: 600;
+    font-size: var(--type-size-lg);
+    color: var(--color-text-strong);
   }
   .stats__row .muted {
-    color: var(--color-muted, #666666);
-    font-size: 0.8rem;
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
   }
   .stats__detail {
-    color: var(--color-muted, #666666);
-    font-size: 0.8rem;
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
+    font-family: var(--type-family-mono);
     margin: 0;
   }
+
+  /* MoM / YoY deltas — signed, coloured, with a direction arrow. */
   .stats__delta {
-    color: var(--color-muted, #666666);
-    font-size: 0.8rem;
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-xs);
     margin: 0;
   }
+  .stats__delta-label {
+    color: var(--color-text-muted);
+    letter-spacing: 0.04em;
+    margin-right: var(--space-1);
+  }
+  .delta {
+    font-family: var(--type-family-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--color-text-muted);
+  }
+  .delta.up {
+    color: var(--color-signal-positive);
+  }
+  .delta.up::before {
+    content: "▲ ";
+  }
+  .delta.down {
+    color: var(--color-signal-negative);
+  }
+  .delta.down::before {
+    content: "▼ ";
+  }
+
   .stats__empty {
-    color: var(--color-muted, #666666);
+    color: var(--color-text-muted);
     font-style: italic;
+    text-align: center;
     margin: 0;
+    padding: var(--space-3);
   }
-  .stats__breakdown {
-    border: 1px solid var(--color-line, #cccccc);
-    border-radius: 6px;
-    padding: 0.75rem;
-    background: var(--color-surface, #ffffff);
+
+  .stats__breakdown,
+  .stats__hygiene,
+  .stats__annual,
+  .stats__top article {
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    padding: var(--space-3);
+    background: var(--color-surface-raised);
   }
-  .stats__breakdown h3 {
-    margin: 0 0 0.5rem;
-    font-size: 0.95rem;
+  .stats__breakdown h3,
+  .stats__hygiene h3,
+  .stats__annual h3,
+  .stats__top h3 {
+    margin: 0 0 var(--space-2);
+    font-size: var(--type-size-sm);
+    font-weight: 600;
+    color: var(--color-text-secondary);
   }
   .stats__table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 0.875rem;
+    font-size: var(--type-size-md);
+    background: var(--color-surface-sunken);
+  }
+  .stats__table th {
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
   .stats__table th,
   .stats__table td {
-    padding: 0.25rem 0.5rem;
-    border-bottom: 1px solid var(--color-line, #cccccc);
+    padding: var(--space-1) var(--space-2);
+    border-bottom: 1px solid var(--color-surface-divider);
     text-align: left;
+  }
+  .stats__table td {
+    color: var(--color-text-primary);
   }
   .stats__table .num {
     text-align: right;
+    font-family: var(--type-family-mono);
     font-variant-numeric: tabular-nums;
+    color: var(--color-text-strong);
   }
+  .stats__table th.num {
+    color: var(--color-text-muted);
+  }
+
   .stats__top {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-    gap: 0.75rem;
-  }
-  .stats__top article {
-    border: 1px solid var(--color-line, #cccccc);
-    border-radius: 6px;
-    padding: 0.75rem;
-    background: var(--color-surface, #ffffff);
-  }
-  .stats__top h3 {
-    margin: 0 0 0.5rem;
-    font-size: 0.95rem;
+    gap: var(--space-3);
   }
   .stats__top ol {
     margin: 0;
-    padding-left: 1.25rem;
+    padding-left: var(--space-5);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
   }
-  .stats__hygiene {
-    border: 1px solid var(--color-line, #cccccc);
-    border-radius: 6px;
-    padding: 0.75rem;
-    background: var(--color-surface, #ffffff);
+  .stats__top li {
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-sm);
   }
-  .stats__hygiene h3 {
-    margin: 0 0 0.5rem;
-    font-size: 0.95rem;
+  .stats__top strong {
+    font-family: var(--type-family-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--color-text-strong);
   }
+  .stats__top .muted {
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
+  }
+
+  /* Hygiene flags — a leading dot reflects zero (OK, calm green) vs
+   * non-zero (needs attention, amber). The count itself goes amber
+   * when non-zero so the eye lands on the rows that need action. */
   .stats__hygiene ul {
     margin: 0;
-    padding-left: 1.25rem;
+    padding-left: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
   }
-  .stats__annual {
-    border: 1px solid var(--color-line, #cccccc);
-    border-radius: 6px;
-    padding: 0.75rem;
-    background: var(--color-surface, #ffffff);
+  .stats__hygiene li {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-sm);
   }
-  .stats__annual h3 {
-    margin: 0 0 0.5rem;
-    font-size: 0.95rem;
+  .stats__hygiene li::before {
+    content: "";
+    flex: 0 0 auto;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--color-signal-positive);
+    opacity: 0.45;
+    transform: translateY(-1px);
   }
+  .stats__hygiene li.flag-nonzero::before {
+    background: var(--color-signal-warning);
+    opacity: 1;
+  }
+  .stats__hygiene strong {
+    margin-left: auto;
+    font-family: var(--type-family-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--color-text-strong);
+  }
+  .stats__hygiene li.flag-nonzero strong {
+    color: var(--color-signal-warning);
+  }
+
   .stats__deferred {
-    margin-top: 0.5rem;
-    color: var(--color-muted, #666666);
-    font-size: 0.85rem;
+    margin-top: var(--space-2);
+    color: var(--color-text-muted);
+    font-size: var(--type-size-sm);
+  }
+  .stats__deferred summary {
+    cursor: pointer;
+    color: var(--color-text-secondary);
   }
   .stats__loading {
-    color: var(--color-muted, #666666);
+    color: var(--color-text-secondary);
+    font-style: italic;
   }
   .stats__error {
-    border: 1px solid var(--color-signal-negative, #c66060);
-    border-radius: 6px;
-    padding: 0.75rem;
-    background: #fdf1f1;
+    border: 1px solid var(--color-signal-negative);
+    border-radius: 4px;
+    padding: var(--space-3);
+    background: var(--color-surface-sunken);
+    color: var(--color-text-primary);
+  }
+  .stats__error strong {
+    color: var(--color-signal-negative);
   }
 </style>

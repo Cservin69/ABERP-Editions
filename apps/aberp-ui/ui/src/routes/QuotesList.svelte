@@ -196,6 +196,13 @@
 </section>
 
 <style>
+  /* S226 / PR-222 — dark-theme colour polish. Same root cause as
+   * StatisticsPage: this page (S211b/PR-210) referenced undefined token
+   * names (--color-muted / --color-border / --color-surface[-alt] /
+   * --text-* / --font-mono / --color-error*) and a handful of light-mode
+   * hex literals, so it rendered washed-out on the dark theme. Every
+   * colour now resolves to a tokens.css variable (ADR-0017); no new
+   * tokens; no functional change. */
   .quotes-page {
     display: flex;
     flex-direction: column;
@@ -212,18 +219,19 @@
   }
 
   .quotes-page__title {
-    font-size: var(--text-lg);
+    font-size: var(--type-size-lg);
     font-weight: 600;
     margin: 0;
+    color: var(--color-text-strong);
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
   }
 
   .quotes-page__hint {
-    font-size: var(--text-sm);
+    font-size: var(--type-size-sm);
     font-weight: 400;
-    color: var(--color-muted);
+    color: var(--color-text-muted);
   }
 
   .quotes-page__actions {
@@ -233,11 +241,18 @@
 
   .quotes-page__refresh {
     padding: var(--space-2) var(--space-3);
-    border: 1px solid var(--color-border);
-    background: var(--color-surface);
-    border-radius: var(--radius-sm);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border-radius: 3px;
     cursor: pointer;
-    font-size: var(--text-sm);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    transition: color var(--motion-fade-in);
+  }
+
+  .quotes-page__refresh:hover:not(:disabled) {
+    color: var(--color-text-strong);
   }
 
   .quotes-page__refresh:disabled {
@@ -246,29 +261,35 @@
   }
 
   .quotes-page__muted {
-    color: var(--color-muted);
+    color: var(--color-text-muted);
     font-style: italic;
   }
 
   .quotes-page__error {
     padding: var(--space-3);
-    background: var(--color-error-bg, #fee);
-    border: 1px solid var(--color-error, #c00);
-    border-radius: var(--radius-sm);
-    color: var(--color-error, #c00);
+    background: var(--color-surface-sunken);
+    border: 1px solid var(--color-signal-negative);
+    border-radius: 3px;
+    color: var(--color-text-primary);
+  }
+
+  .quotes-page__error strong {
+    color: var(--color-signal-negative);
   }
 
   .quotes-page__error-detail {
     margin-top: var(--space-1);
-    font-size: var(--text-sm);
-    font-family: var(--font-mono, monospace);
+    font-size: var(--type-size-sm);
+    font-family: var(--type-family-mono);
+    color: var(--color-text-muted);
   }
 
   .quotes-page__empty {
     padding: var(--space-4);
-    background: var(--color-surface-alt, #f7f7f7);
-    border-radius: var(--radius-sm);
-    color: var(--color-muted);
+    background: var(--color-surface-raised);
+    border: 1px dashed var(--color-surface-divider);
+    border-radius: 3px;
+    color: var(--color-text-secondary);
   }
 
   .quotes-page__empty p + p {
@@ -278,49 +299,71 @@
   .quotes-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: var(--text-sm);
+    font-size: var(--type-size-sm);
+    background: var(--color-surface-sunken);
   }
 
   .quotes-table th,
   .quotes-table td {
     padding: var(--space-2) var(--space-3);
     text-align: left;
-    border-bottom: 1px solid var(--color-border);
+    border-bottom: 1px solid var(--color-surface-divider);
     vertical-align: top;
   }
 
+  .quotes-table td {
+    color: var(--color-text-primary);
+  }
+
   .quotes-table th {
-    background: var(--color-surface-alt, #f7f7f7);
+    background: var(--color-surface-raised);
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
     font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .quotes-table tbody tr:hover {
+    background: var(--color-surface-raised);
   }
 
   .quotes-table__num {
     text-align: right;
+    font-family: var(--type-family-mono);
     font-variant-numeric: tabular-nums;
+    color: var(--color-text-strong);
+  }
+
+  .quotes-table th.quotes-table__num {
+    color: var(--color-text-muted);
   }
 
   .quotes-table__qid {
-    font-family: var(--font-mono, monospace);
-    font-size: var(--text-xs);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    color: var(--color-text-secondary);
   }
 
   .quotes-table__contact-name {
     font-weight: 600;
+    color: var(--color-text-strong);
   }
 
   .quotes-table__contact-company {
-    font-size: var(--text-xs);
-    color: var(--color-muted);
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
   }
 
   .quotes-table__contact-email {
-    font-size: var(--text-xs);
-    font-family: var(--font-mono, monospace);
+    font-size: var(--type-size-xs);
+    font-family: var(--type-family-mono);
+    color: var(--color-text-secondary);
   }
 
   .quotes-table__notes {
-    font-size: var(--text-xs);
-    color: var(--color-muted);
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
     max-width: 22rem;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -328,30 +371,35 @@
   }
 
   .quotes-table__muted {
-    color: var(--color-muted);
+    color: var(--color-text-muted);
   }
 
+  /* Status chips — categorical signal (ADR-0017 §"the 20%"): a coloured
+   * label + matching hairline on a raised surface, no light fills. */
   .quotes-chip {
     display: inline-block;
     padding: 2px 8px;
     border-radius: 999px;
-    font-size: var(--text-xs);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-xs);
     font-weight: 500;
     white-space: nowrap;
   }
 
   .quotes-chip--pending {
-    background: #fff4d6;
-    color: #7a5a00;
+    color: var(--color-signal-warning);
+    border-color: var(--color-signal-warning);
   }
 
   .quotes-chip--done {
-    background: #d8f5e6;
-    color: #0b5a2b;
+    color: var(--color-signal-positive);
+    border-color: var(--color-signal-positive);
   }
 
   .quotes-chip--attention {
-    background: #fce4d6;
-    color: #8a2a00;
+    color: var(--color-signal-warning);
+    border-color: var(--color-signal-warning);
   }
 </style>
