@@ -6,6 +6,13 @@
 #                              event vocabulary + Adapter trait + AdapterRegistry
 #                              + audit-ledger integration. No real hardware code;
 #                              Phase β lands the first adapter (likely barcode).
+#   crates/aberp-inventory   - Stage 3 Phase γ Inventory module v1 (S231 /
+#                              PR-227, ADR-0061). Append-only stock_movements
+#                              ledger + denormalised stock_qty cache on
+#                              products + virtual low-stock view. Audit kind
+#                              `mes.stock_movement_recorded`; ships
+#                              `rebuild-stock-cache` binary as the recovery
+#                              path when cache drifts from ledger.
 #   crates/audit-ledger      - tamper-evident hash-chained audit ledger (ADR-0008).
 #   crates/aberp-verify      - bundle verifier CLI (ADR-0035, PR-22) — re-verifies
 #                              a per-invoice export bundle from its own bytes alone;
@@ -51,6 +58,7 @@ members = [
     "crates/aberp-verify",
     "crates/aberp-quote-intake",
     "crates/aberp-mes",
+    "crates/aberp-inventory",
     "crates/invoice-pdf",
     "crates/mnb-rates",
     "crates/nav-transport",

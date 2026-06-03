@@ -697,6 +697,25 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         products::ensure_schema(&conn).context("ensure products schema at serve boot")?;
     }
 
+    // S231 / PR-227 / ADR-0061 — pin the inventory schema at boot
+    // (extends products with stock_qty/min_stock/bin_location/
+    // last_movement_at cache columns + creates the stock_movements
+    // append-only ledger). Same idempotent ALTER ADD COLUMN IF NOT
+    // EXISTS / CREATE TABLE IF NOT EXISTS posture as products /
+    // ap_invoice / restored_invoice — re-runs on migrated DBs cost
+    // nothing. MUST run AFTER the products migration above because
+    // the ALTER targets that table.
+    {
+        let _s = tracing::info_span!("serve.ensure_inventory_schema").entered();
+        let conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for inventory boot migration",
+                args.db.display()
+            )
+        })?;
+        aberp_inventory::ensure_schema(&conn).context("ensure inventory schema at serve boot")?;
+    }
+
     // S177 / PR-177 — pin the ap_invoice (incoming AP-side mirror)
     // schema at boot, same posture as products + partners. The route
     // layer also calls `ensure_schema` defensively so a fresh DB +
@@ -2010,6 +2029,23 @@ fn build_router(state: AppState) -> Router {
             get(handle_get_product)
                 .put(handle_update_product)
                 .delete(handle_delete_product),
+        )
+        // S231 / PR-227 / ADR-0061 — Stage 3 Phase γ Inventory v1.
+        // GET lists the per-product `stock_movements` ledger
+        // (descending by at_iso8601, paginated). POST appends one
+        // operator-typed manual adjustment movement (reason +
+        // qty_delta + optional notes). Both require_ready + bearer
+        // auth; POST DoS-bounded by an explicit Json size cap +
+        // closed-vocab reason validation per [[trust-code-not-operator]].
+        // The dashboard's low-stock click-through reads
+        // `GET /api/products/low-stock` (separate route below).
+        .route(
+            "/api/products/:id/stock-movements",
+            get(handle_list_stock_movements).post(handle_create_stock_movement),
+        )
+        .route(
+            "/api/products/low-stock",
+            get(handle_list_low_stock_products),
         )
         // S177 / PR-177 — AP module v1 BACKEND. Incoming-invoice list +
         // detail + manual ingestion + three closed-vocab status
@@ -7434,6 +7470,43 @@ fn product_not_found_response() -> Response {
 
 // ── GET /api/products ────────────────────────────────────────────────
 
+/// S231 / PR-227 / ADR-0061 §6 — wire shape for the products list +
+/// detail responses. Wraps [`products::Product`] with the inventory
+/// cache fields per ADR-0061 §3. The chip in the SPA reads
+/// `is_low_stock` straight off the wire rather than recomputing
+/// client-side per CLAUDE.md rule 5.
+#[derive(Serialize, Debug)]
+pub struct ProductWithInventory {
+    #[serde(flatten)]
+    pub product: Product,
+    pub stock_qty: rust_decimal::Decimal,
+    pub min_stock: rust_decimal::Decimal,
+    pub bin_location: Option<String>,
+    pub last_movement_at: Option<String>,
+    pub is_low_stock: bool,
+}
+
+fn product_with_inventory(
+    product: Product,
+    fields: Option<aberp_inventory::InventoryFields>,
+) -> ProductWithInventory {
+    let f = fields.unwrap_or(aberp_inventory::InventoryFields {
+        stock_qty: rust_decimal::Decimal::ZERO,
+        min_stock: rust_decimal::Decimal::ZERO,
+        bin_location: None,
+        last_movement_at: None,
+        is_low_stock: false,
+    });
+    ProductWithInventory {
+        product,
+        stock_qty: f.stock_qty,
+        min_stock: f.min_stock,
+        bin_location: f.bin_location,
+        last_movement_at: f.last_movement_at,
+        is_low_stock: f.is_low_stock,
+    }
+}
+
 async fn handle_list_products(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -7448,7 +7521,7 @@ async fn handle_list_products(
     let state_for_task = state.clone();
     let search = query.search;
     let result = tokio::task::spawn_blocking(move || {
-        list_products_request(&state_for_task, search.as_deref())
+        list_products_with_inventory_request(&state_for_task, search.as_deref())
     })
     .await;
     let outcome = match result {
@@ -7480,6 +7553,29 @@ pub fn list_products_request(
     Ok(items)
 }
 
+/// S231 / PR-227 — list-products helper that merges inventory cache
+/// fields into each row for the HTTP response. The pre-existing
+/// [`list_products_request`] retains its `Vec<Product>` shape so the
+/// PR-91 unit tests in `tests/serve_products_route.rs` continue to
+/// exercise the unmodified product surface.
+pub fn list_products_with_inventory_request(
+    state: &AppState,
+    search: Option<&str>,
+) -> std::result::Result<Vec<ProductWithInventory>, ProductRouteError> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let items = products::list_products(&conn, state.tenant.as_str(), search)?;
+    let fields = aberp_inventory::inventory_fields_for_tenant(&conn, state.tenant.as_str())
+        .map_err(ProductRouteError::Other)?;
+    Ok(items
+        .into_iter()
+        .map(|p| {
+            let f = fields.get(&p.id).cloned();
+            product_with_inventory(p, f)
+        })
+        .collect())
+}
+
 // ── GET /api/products/:id ────────────────────────────────────────────
 
 async fn handle_get_product(
@@ -7493,7 +7589,7 @@ async fn handle_get_product(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
-    match get_product_request(&state, &id) {
+    match get_product_with_inventory_request(&state, &id) {
         Ok(p) => Json(p).into_response(),
         Err(ProductRouteError::NotFound) => product_not_found_response(),
         Err(ProductRouteError::Other(e)) => internal_error("get_product_request", e),
@@ -7514,6 +7610,26 @@ pub fn get_product_request(
         Some(p) => Ok(p),
         None => Err(ProductRouteError::NotFound),
     }
+}
+
+/// S231 / PR-227 — get-product helper that merges inventory cache
+/// fields for the HTTP detail response. The pre-existing
+/// [`get_product_request`] retains its bare-`Product` shape so the
+/// PR-91 unit tests in `tests/serve_products_route.rs` continue to
+/// exercise the unmodified product surface.
+pub fn get_product_with_inventory_request(
+    state: &AppState,
+    id: &str,
+) -> std::result::Result<ProductWithInventory, ProductRouteError> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let product = match products::get_product(&conn, state.tenant.as_str(), id)? {
+        Some(p) => p,
+        None => return Err(ProductRouteError::NotFound),
+    };
+    let fields = aberp_inventory::inventory_fields_for_product(&conn, state.tenant.as_str(), id)
+        .map_err(ProductRouteError::Other)?;
+    Ok(product_with_inventory(product, fields))
 }
 
 // ── POST /api/products ───────────────────────────────────────────────
@@ -7664,6 +7780,355 @@ pub fn delete_product_request(
     } else {
         Err(ProductRouteError::NotFound)
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S231 / PR-227 / ADR-0061 — Stage 3 Phase γ Inventory v1 routes.
+// ──────────────────────────────────────────────────────────────────────
+//
+// Three routes that surface the per-tenant `stock_movements` ledger
+// + the virtual low-stock view. All require_ready + bearer auth.
+//
+//   - `GET  /api/products/:id/stock-movements?limit=&offset=` — list
+//     the per-product ledger (descending by at_iso8601, paginated).
+//   - `POST /api/products/:id/stock-movements` — append one manual
+//     operator-typed adjustment (reason + qty_delta + notes; the
+//     route layer hard-codes reason ∈ {Receipt, Adjustment, Scrap}
+//     to keep operator-typed movements out of the upstream-only
+//     vocab — BomConsumption / WoCompletion / Dispatch land via
+//     ADR-0062/0063/0064 handlers, NEVER via this form).
+//   - `GET  /api/products/low-stock` — virtual view per ADR-0061 §3:
+//     products where `stock_qty < min_stock`. Powers the dashboard
+//     chip's click-through.
+//
+// Per [[trust-code-not-operator]] the POST body is size-capped at the
+// axum-default 2 MB JSON limit (no inventory payload approaches even
+// 1 KB, so the default refuses oversized writes loudly). The
+// reason-sign matrix per ADR-0061 §5 is enforced inside
+// `aberp_inventory::record_movement`; a wrong-sign POST returns 400
+// with a structured `WrongSignForReason` body.
+
+/// Inputs for POST /api/products/:id/stock-movements. The SPA form
+/// per ADR-0061 §6 collects qty_delta + reason + notes and supplies
+/// the idempotency_key as a client-side ULID — same posture as the
+/// invoice payment + mark-paid routes.
+#[derive(Debug, Deserialize)]
+pub struct CreateStockMovementInputs {
+    pub qty_delta: String,
+    pub reason: String,
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListStockMovementsQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+const STOCK_MOVEMENTS_DEFAULT_LIMIT: u32 = 100;
+const STOCK_MOVEMENTS_MAX_LIMIT: u32 = 500;
+
+#[derive(Debug)]
+pub enum StockMovementRouteError {
+    BadInput(String),
+    NotFound,
+    Conflict(String),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for StockMovementRouteError {
+    fn from(e: anyhow::Error) -> Self {
+        StockMovementRouteError::Other(e)
+    }
+}
+
+fn map_inventory_err(e: aberp_inventory::InventoryError) -> StockMovementRouteError {
+    use aberp_inventory::InventoryError as IE;
+    match e {
+        IE::WrongSignForReason {
+            reason,
+            required,
+            got,
+        } => StockMovementRouteError::BadInput(format!(
+            "reason {reason} requires sign {required:?}, got qty_delta={got}"
+        )),
+        IE::DuplicateIdempotencyKey(k) => {
+            StockMovementRouteError::Conflict(format!("duplicate idempotency_key {k}"))
+        }
+        IE::ProductNotFound(_) => StockMovementRouteError::NotFound,
+        IE::Storage(e) => StockMovementRouteError::Other(e),
+    }
+}
+
+async fn handle_list_stock_movements(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<ListStockMovementsQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let limit = query
+        .limit
+        .unwrap_or(STOCK_MOVEMENTS_DEFAULT_LIMIT)
+        .min(STOCK_MOVEMENTS_MAX_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        list_stock_movements_request(&state_for_task, &id_for_task, limit, offset)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "list_stock_movements_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(items) => Json(items).into_response(),
+        Err(StockMovementRouteError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body("product not found".to_string())),
+        )
+            .into_response(),
+        Err(StockMovementRouteError::BadInput(msg)) => {
+            (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response()
+        }
+        Err(StockMovementRouteError::Conflict(msg)) => {
+            (StatusCode::CONFLICT, Json(error_body(msg))).into_response()
+        }
+        Err(StockMovementRouteError::Other(e)) => internal_error("list_stock_movements_request", e),
+    }
+}
+
+pub fn list_stock_movements_request(
+    state: &AppState,
+    product_id: &str,
+    limit: u32,
+    offset: u32,
+) -> std::result::Result<Vec<aberp_inventory::StockMovement>, StockMovementRouteError> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // Defensive 404 — the SPA path always opens the product detail
+    // page first, but a direct curl that names an unknown product
+    // should not silently return an empty list.
+    if products::get_product(&conn, state.tenant.as_str(), product_id)?.is_none() {
+        return Err(StockMovementRouteError::NotFound);
+    }
+    let rows = aberp_inventory::list_movements_for_product(
+        &conn,
+        state.tenant.as_str(),
+        product_id,
+        limit,
+        offset,
+    )?;
+    Ok(rows)
+}
+
+async fn handle_create_stock_movement(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<CreateStockMovementInputs>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        create_stock_movement_request(&state_for_task, &id_for_task, &operator_login, &inputs)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "create_stock_movement_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(movement) => (StatusCode::CREATED, Json(movement)).into_response(),
+        Err(StockMovementRouteError::BadInput(msg)) => {
+            (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response()
+        }
+        Err(StockMovementRouteError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body("product not found".to_string())),
+        )
+            .into_response(),
+        Err(StockMovementRouteError::Conflict(msg)) => {
+            (StatusCode::CONFLICT, Json(error_body(msg))).into_response()
+        }
+        Err(StockMovementRouteError::Other(e)) => {
+            internal_error("create_stock_movement_request", e)
+        }
+    }
+}
+
+pub fn create_stock_movement_request(
+    state: &AppState,
+    product_id: &str,
+    operator_login: &str,
+    inputs: &CreateStockMovementInputs,
+) -> std::result::Result<aberp_inventory::StockMovement, StockMovementRouteError> {
+    use std::str::FromStr;
+
+    // Parse the wire shape first — reject malformed input with a
+    // 400 BEFORE opening the DB.
+    let qty_delta = rust_decimal::Decimal::from_str(inputs.qty_delta.trim()).map_err(|_| {
+        StockMovementRouteError::BadInput(format!(
+            "qty_delta must be a decimal, got {:?}",
+            inputs.qty_delta
+        ))
+    })?;
+    let reason = aberp_inventory::MovementReason::from_storage_str(inputs.reason.trim())
+        .map_err(|e| StockMovementRouteError::BadInput(format!("{e}: {:?}", inputs.reason)))?;
+
+    // ADR-0061 §6 — the SPA form is operator-typed manual movements
+    // only. Upstream-only reasons (BomConsumption / WoCompletion /
+    // Dispatch) land via ADR-0062/0063/0064 handlers, NEVER via the
+    // form. Refuse them at the route boundary so a curl that supplies
+    // `reason=bom_consumption` does not bypass the upstream pipeline.
+    use aberp_inventory::MovementReason as MR;
+    let manual_allowed = matches!(reason, MR::Receipt | MR::Adjustment | MR::Scrap);
+    if !manual_allowed {
+        return Err(StockMovementRouteError::BadInput(format!(
+            "reason {reason:?} is upstream-only — manual adjustments accept Receipt | Adjustment | Scrap (per ADR-0061 §6)",
+            reason = reason.as_str()
+        )));
+    }
+
+    if inputs.idempotency_key.trim().is_empty() {
+        return Err(StockMovementRouteError::BadInput(
+            "idempotency_key is required".to_string(),
+        ));
+    }
+    // Defence-in-depth size cap on the optional operator-typed notes
+    // per [[trust-code-not-operator]] — the axum Json limit already
+    // bounds the whole body; this cap surfaces an explicit message if
+    // the SPA ever ships an unbounded text field.
+    if let Some(n) = inputs.notes.as_ref() {
+        if n.len() > 1024 {
+            return Err(StockMovementRouteError::BadInput(
+                "notes must be ≤ 1024 bytes".to_string(),
+            ));
+        }
+    }
+
+    let mut conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+
+    // 404 if the product is unknown — caught here before opening the
+    // tx so we do not waste a transaction on a typo'd id.
+    if products::get_product(&conn, state.tenant.as_str(), product_id)?.is_none() {
+        return Err(StockMovementRouteError::NotFound);
+    }
+
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| StockMovementRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+
+    let tx = conn
+        .transaction()
+        .context("begin stock-movement transaction")?;
+    let ctx = aberp_inventory::RecordMovementContext {
+        tenant: state.tenant.as_str(),
+        actor: aberp_inventory::ActorKind::SpaOperator {
+            operator_login: operator_login.to_string(),
+        },
+        ledger_meta: &ledger_meta,
+        ledger_actor,
+    };
+    let movement = aberp_inventory::record_movement(
+        &tx,
+        &ctx,
+        aberp_inventory::RecordMovementInputs {
+            product_id: product_id.to_string(),
+            qty_delta,
+            reason,
+            ref_kind: aberp_inventory::MovementRefKind::Manual,
+            ref_id: None,
+            notes: inputs.notes.clone(),
+            idempotency_key: inputs.idempotency_key.trim().to_string(),
+        },
+    )
+    .map_err(map_inventory_err)?;
+    tx.commit().context("commit stock-movement transaction")?;
+
+    // Mirror the audit-ledger sidecar so the per-tenant
+    // `<db>.audit.log` stays in step with the DB row, same posture
+    // every other audit-emitting route uses (PR-209 / S213 graceful
+    // shutdown writer, S177 / PR-177 AP-side ingestion writer).
+    let mirror_path = aberp_audit_ledger::mirror_path_for(&state.db_path);
+    if let Ok(ledger) = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash) {
+        // Best-effort sync — the canonical row already landed in the
+        // DB tx above. A mirror failure should not poison the
+        // operator's response; the next write (or boot) will heal it
+        // per ADR-0030 §6's bootstrap-from-DB posture.
+        if let Err(e) = ledger.sync_mirror(&mirror_path) {
+            tracing::warn!(error = ?e, "stock-movement mirror sync failed; will heal on next write");
+        }
+    }
+
+    Ok(movement)
+}
+
+async fn handle_list_low_stock_products(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || list_low_stock_products_request(&state_for_task)).await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "list_low_stock_products_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => internal_error("list_low_stock_products_request", e),
+    }
+}
+
+pub fn list_low_stock_products_request(
+    state: &AppState,
+) -> anyhow::Result<Vec<aberp_inventory::LowStockRow>> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    aberp_inventory::low_stock_products(&conn, state.tenant.as_str())
 }
 
 // ──────────────────────────────────────────────────────────────────────

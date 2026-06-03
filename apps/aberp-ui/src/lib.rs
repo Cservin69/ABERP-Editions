@@ -291,6 +291,10 @@ pub fn run() {
             commands::create_product,
             commands::update_product,
             commands::delete_product,
+            // S231 / PR-227 / ADR-0061 — Stage 3 Phase γ Inventory v1.
+            commands::list_stock_movements,
+            commands::create_stock_movement,
+            commands::list_low_stock_products,
             commands::list_seller_banks,
             commands::create_seller_bank,
             commands::update_seller_bank,

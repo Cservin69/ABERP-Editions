@@ -1443,7 +1443,16 @@ export type ProductUnit =
   | { kind: "Own"; value: string };
 
 /** PR-91 — single product row. Snake_case JSON mirrors
- * `aberp::products::Product`. */
+ * `aberp::products::Product`.
+ *
+ * S231 / PR-227 / ADR-0061 — the GET /api/products and
+ * GET /api/products/:id responses now include the optional inventory
+ * cache fields per ADR-0061 §6. They are OPTIONAL on the TS side so
+ * the create/update responses (which do not carry inventory data
+ * yet) continue to type-check; the products-list and product-detail
+ * consumers always receive them populated from the backend. The
+ * dashboard chip reads `is_low_stock` straight off the wire per
+ * CLAUDE.md rule 5 (the SPA does not duplicate the rule logic). */
 export interface Product {
   /** Prefixed-ULID `prd_<26-char-ULID>`. */
   id: string;
@@ -1458,6 +1467,16 @@ export interface Product {
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  /** S231 / PR-227 — Decimal-as-string per ADR-0061 §1. */
+  stock_qty?: string;
+  /** S231 / PR-227 — Decimal-as-string per ADR-0061 §1. */
+  min_stock?: string;
+  /** S231 / PR-227 — free-text v1; multi-cell deferred. */
+  bin_location?: string | null;
+  /** S231 / PR-227 — RFC3339 UTC of the most recent movement. */
+  last_movement_at?: string | null;
+  /** S231 / PR-227 — derived `stock_qty < min_stock` per ADR-0061 §3. */
+  is_low_stock?: boolean;
 }
 
 /** PR-91 — request body for `POST /api/products` + `PUT /api/products/:id`. */
@@ -1498,6 +1517,97 @@ export async function updateProduct(
  * `deletePartner` per A182 — historical references stay resolvable). */
 export async function deleteProduct(productId: string): Promise<void> {
   await invoke<void>("delete_product", { productId });
+}
+
+// ── S231 / PR-227 / ADR-0061 — Stage 3 Phase γ Inventory v1 ─────────
+
+/** S231 — closed-vocab reason on `stock_movements`. Mirror of
+ * `aberp_inventory::MovementReason` (snake_case storage strings per
+ * ADR-0061 §2). */
+export type StockMovementReason =
+  | "receipt"
+  | "bom_consumption"
+  | "wo_completion"
+  | "adjustment"
+  | "dispatch"
+  | "scrap";
+
+/** S231 — closed-vocab ref-kind on `stock_movements`. Mirror of
+ * `aberp_inventory::MovementRefKind`. */
+export type StockMovementRefKind =
+  | "work_order"
+  | "qa_inspection"
+  | "dispatch"
+  | "invoice"
+  | "manual";
+
+/** S231 — one row from `stock_movements`. Snake_case mirror of
+ * `aberp_inventory::StockMovement`. `qty_delta` is Decimal-as-string
+ * per ADR-0061 §1 so JS clients do not lose precision. */
+export interface StockMovement {
+  movement_id: string;
+  product_id: string;
+  qty_delta: string;
+  reason: StockMovementReason;
+  ref_kind: StockMovementRefKind | null;
+  ref_id: string | null;
+  at_iso8601: string;
+  operator: string;
+  idempotency_key: string;
+  notes: string | null;
+}
+
+/** S231 — POST /api/products/:id/stock-movements body. The SPA form
+ * collects qty_delta + reason + notes and mints the idempotency_key
+ * client-side per the F8 pattern. */
+export interface CreateStockMovementInputs {
+  qty_delta: string;
+  reason: StockMovementReason;
+  idempotency_key: string;
+  notes?: string;
+}
+
+/** S231 — one row from GET /api/products/low-stock per ADR-0061 §3
+ * virtual view. */
+export interface LowStockRow {
+  product_id: string;
+  name: string;
+  stock_qty: string;
+  min_stock: string;
+  bin_location: string | null;
+}
+
+/** S231 — `GET /api/products/:id/stock-movements?limit=&offset=`.
+ * Pagination caps at 500 on the backend per
+ * [[trust-code-not-operator]]; 100 is the default page size. */
+export async function listStockMovements(
+  productId: string,
+  limit?: number,
+  offset?: number,
+): Promise<StockMovement[]> {
+  return invoke<StockMovement[]>("list_stock_movements", {
+    productId,
+    limit,
+    offset,
+  });
+}
+
+/** S231 — `POST /api/products/:id/stock-movements`. The route layer
+ * enforces the reason-sign matrix + the manual-form closed vocab
+ * (Receipt / Adjustment / Scrap only) per ADR-0061 §6. A wrong-sign
+ * POST surfaces as a 400 with a structured body. */
+export async function createStockMovement(
+  productId: string,
+  body: CreateStockMovementInputs,
+): Promise<StockMovement> {
+  return invoke<StockMovement>("create_stock_movement", { productId, body });
+}
+
+/** S231 — `GET /api/products/low-stock`. ADR-0061 §3 virtual view —
+ * products where the cached `stock_qty < min_stock`. Ordered by
+ * deficit (most critical first). */
+export async function listLowStockProducts(): Promise<LowStockRow[]> {
+  return invoke<LowStockRow[]>("list_low_stock_products", {});
 }
 
 // ── PR-72 / session-94 — multi-bank-account routes (PR-B) ─────────────

@@ -688,7 +688,14 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // outgoing invoice. The per-OUTGOING-invoice bundle's
         // `invoice.*` glob excludes them anyway; the exhaustive match
         // requires acknowledgement here.
-        | EventKind::MesAdapterEvent => None,
+        | EventKind::MesAdapterEvent
+        // S231 / PR-227 / ADR-0061 — inventory stock-movement event.
+        // Same `mes.*` prefix family as MesAdapterEvent (Stage 3
+        // modules share the prefix per ADR-0061 §4); stock movements
+        // belong to products + work orders + dispatches, never to an
+        // outgoing invoice. The bundle's `invoice.*` glob excludes
+        // them anyway; this arm exists for exhaustiveness only.
+        | EventKind::StockMovementRecorded => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

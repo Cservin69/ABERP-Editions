@@ -30,6 +30,7 @@
   import {
     getNavCredentialsStatus,
     getSellerInfo,
+    listLowStockProducts,
     listPartners,
     listProducts,
     listRestoredInvoices,
@@ -150,9 +151,26 @@
         return n === 1 ? "1 saved partner" : `${n} saved partners`;
       }
       case "ProductCount": {
-        const rows = await listProducts();
+        // S231 / PR-227 / ADR-0061 §6 — augment the product count
+        // chip with a low-stock badge when ≥1 product is below min.
+        // The dashboard reads the cached count from the virtual view
+        // (one extra round-trip per dashboard load; tiny). On a
+        // tenant with zero low-stock the chip looks identical to
+        // pre-S231; the badge only surfaces when there is something
+        // to act on, per [[hulye-biztos]] (do not show false-positive
+        // alarms).
+        const [rows, lowStock] = await Promise.all([
+          listProducts(),
+          listLowStockProducts().catch(() => [] as never[]),
+        ]);
         const n = rows.length;
-        return n === 1 ? "1 saved product" : `${n} saved products`;
+        const base = n === 1 ? "1 saved product" : `${n} saved products`;
+        if (lowStock.length === 0) return base;
+        const suffix =
+          lowStock.length === 1
+            ? "1 below min stock"
+            : `${lowStock.length} below min stock`;
+        return `${base} — ⚠ ${suffix}`;
       }
       case "BankAccountCount": {
         // Two independent reads — the seller-info legal_name + the

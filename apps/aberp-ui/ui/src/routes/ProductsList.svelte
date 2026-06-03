@@ -47,8 +47,14 @@
     downloadCsv,
   } from "../lib/csv-export";
   import ProductForm from "./ProductForm.svelte";
+  // S231 / PR-227 / ADR-0061 — Stage 3 Phase γ Inventory v1 detail.
+  import ProductDetail from "./ProductDetail.svelte";
+  import { formatQty } from "../lib/stock-movements";
 
   let rows: Product[] = $state([]);
+  // S231 — id of the product whose Stock Detail modal is open; null
+  // when closed. Modal mount/unmount is driven by `{#if}`-on-this.
+  let detailProductId: string | null = $state(null);
   let loadState: "loading" | "loaded" | "error" = $state("loading");
   let loadError: string | null = $state(null);
 
@@ -480,6 +486,15 @@
               >
             </button>
           </th>
+          <!-- S231 / PR-227 / ADR-0061 §6 — Stock column.
+               Non-sortable in v1 (the existing PR-194 sort matrix
+               does not include a Stock key; sorting by stock joins
+               the sort-key vocab when an operator asks). The cell
+               renders the cached `stock_qty` + a low-stock chip when
+               the cache says so. -->
+          <th scope="col" class="num">
+            <span>Stock</span>
+          </th>
           <th scope="col" class="actions-header">
             <span class="visually-hidden">Actions</span>
           </th>
@@ -498,6 +513,17 @@
             <td class="mono">{product.currency}</td>
             <td class="num mono">
               {formatTotal(product.unit_price_minor, product.currency)}
+            </td>
+            <td class="num mono">
+              {formatQty(product.stock_qty ?? "0")}
+              {#if product.is_low_stock}
+                <span
+                  class="stock-chip stock-chip--low"
+                  aria-label="Stock below minimum"
+                  title="Below min stock ({formatQty(product.min_stock ?? '0')})"
+                  >Low</span
+                >
+              {/if}
             </td>
             <td class="actions">
               {#if confirmDeleteId === product.id}
@@ -528,6 +554,14 @@
                   {/if}
                 </div>
               {:else}
+                <button
+                  type="button"
+                  class="quiet-button"
+                  onclick={() => (detailProductId = product.id)}
+                  title="View stock movements + post manual adjustment"
+                >
+                  Stock
+                </button>
                 <button
                   type="button"
                   class="quiet-button"
@@ -563,6 +597,19 @@
     product={modalState === "new" ? null : modalState}
     onSaved={onSaved}
     onClose={closeModal}
+  />
+{/if}
+
+<!-- S231 / PR-227 — Stock-movements detail modal. Closing refreshes
+     the product list so the per-row cached `stock_qty` reflects any
+     movements posted while the modal was open. -->
+{#if detailProductId !== null}
+  <ProductDetail
+    productId={detailProductId}
+    onClose={() => {
+      detailProductId = null;
+      void loadProducts();
+    }}
   />
 {/if}
 
@@ -835,6 +882,23 @@
   .unit-chip[data-kind="Own"] {
     border-color: var(--color-signal-muted);
     border-style: dashed;
+  }
+
+  /* S231 / PR-227 / ADR-0061 — low-stock chip. Categorical signal
+   * (no numeric badge per ADR-0017); the cell's mono number carries
+   * the actual stock value. The chip is the loud "below min" cue. */
+  .stock-chip {
+    display: inline-block;
+    margin-left: var(--space-2);
+    padding: 0 var(--space-2);
+    border-radius: 12px;
+    font-size: var(--type-size-xs);
+    font-weight: 600;
+  }
+  .stock-chip--low {
+    background: var(--color-signal-negative-bg, #fdecec);
+    color: var(--color-signal-negative, #b00020);
+    border: 1px solid var(--color-signal-negative, #b00020);
   }
 
   .confirm {

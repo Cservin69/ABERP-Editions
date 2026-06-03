@@ -78,6 +78,12 @@ aberp-quote-intake = { path = "../../crates/aberp-quote-intake" }
 # touched in PR-225 — that's filed for a follow-up PR per the
 # [[seller-toml-write-invariant]] family preservation discipline).
 aberp-mes = { path = "../../crates/aberp-mes" }
+# S231 / PR-227 — Stage 3 Phase γ Inventory module v1 (ADR-0061). The
+# binary owns the boot-time schema-ensure call on the per-tenant DuckDB
+# + the products-list payload extension + the two new stock-movement
+# routes (GET ledger + POST manual adjustment). Same path-dep posture
+# as the sibling Stage 3 crate.
+aberp-inventory = { path = "../../crates/aberp-inventory" }
 # PR-44γ — decimal arithmetic for the EUR→HUF round-half-even
 # conversion at the CLI boundary (the `aberp-billing` module is the
 # arithmetic owner; the binary needs the type for the

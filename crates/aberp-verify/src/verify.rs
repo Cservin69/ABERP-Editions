@@ -808,7 +808,14 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // invoice export bundle in the first place (the bundle
         // writer's `invoice.*` glob excludes them), but the
         // exhaustive match still requires acknowledgement here.
-        | EventKind::MesAdapterEvent => (None, ""),
+        | EventKind::MesAdapterEvent
+        // S231 / PR-227 / ADR-0061 — inventory stock-movement event.
+        // Same `mes.*` prefix family as MesAdapterEvent (Stage 3
+        // modules share the prefix per ADR-0061 §4); payload carries
+        // typed inventory deltas, no NAV bytes. Excluded from the
+        // per-OUTGOING-invoice bundle by the `invoice.*` glob; this
+        // arm exists for exhaustiveness only.
+        | EventKind::StockMovementRecorded => (None, ""),
     };
 
     Ok(NavExtraction {

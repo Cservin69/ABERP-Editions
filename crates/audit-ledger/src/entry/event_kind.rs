@@ -843,6 +843,33 @@ pub enum EventKind {
     ///
     /// F12 four-edit ritual fires once.
     MesAdapterEvent,
+
+    /// S231 / PR-227 / ADR-0061 — one row was appended to
+    /// `stock_movements` (the inventory module's append-only ledger).
+    /// Per ADR-0061 §4 stock movements are **regulated state**, not
+    /// adapter telemetry, so they emit a distinct EventKind rather than
+    /// riding on [`EventKind::MesAdapterEvent`] (which is subject to
+    /// broadcast lossiness per ADR-0060 §"Consequences" #4 — losing a
+    /// stock movement means the cache drifts and inventory is wrong).
+    ///
+    /// Payload (`aberp_inventory::StockMovementRecordedPayload`)
+    /// carries the `movement_id` (`mvt_<ULID>`), `product_id`
+    /// (`prd_<ULID>`), `qty_delta` (Decimal as string — same
+    /// posture as [[decimal-quantity-s157]]), the closed-vocab
+    /// `MovementReason`, an optional `MovementRefKind` + `ref_id`
+    /// (NULL for manual operator adjustments — see ADR-0061 §2),
+    /// the operator attribution string, and the F8 idempotency key.
+    ///
+    /// **`mes.` prefix** per ADR-0061 §4: Stage 3 modules (Inventory,
+    /// Work Orders, QA, Dispatch) share the `mes.*` prefix family
+    /// alongside [`EventKind::MesAdapterEvent`]. The per-OUTGOING-
+    /// invoice export bundle's `invoice.*` glob (ADR-0009 §8)
+    /// excludes these by construction; the exhaustive match in
+    /// `extract_nav_xml` (verify.rs + export_invoice_bundle.rs)
+    /// requires acknowledgement on the no-NAV-bytes arm.
+    ///
+    /// F12 four-edit ritual fires once.
+    StockMovementRecorded,
 }
 
 impl EventKind {
@@ -891,6 +918,7 @@ impl EventKind {
             }
             EventKind::ExtNavPartnerManualLink => "system.extnav_partner_manual_link",
             EventKind::MesAdapterEvent => "mes.adapter_event",
+            EventKind::StockMovementRecorded => "mes.stock_movement_recorded",
         }
     }
 
@@ -950,6 +978,7 @@ impl EventKind {
             }
             "system.extnav_partner_manual_link" => Ok(EventKind::ExtNavPartnerManualLink),
             "mes.adapter_event" => Ok(EventKind::MesAdapterEvent),
+            "mes.stock_movement_recorded" => Ok(EventKind::StockMovementRecorded),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1001,6 +1030,7 @@ mod tests {
             EventKind::RestoreBuyerBackfillCycleCompleted,
             EventKind::ExtNavPartnerManualLink,
             EventKind::MesAdapterEvent,
+            EventKind::StockMovementRecorded,
         ];
         for v in variants {
             let s = v.as_str();
@@ -1706,6 +1736,70 @@ mod tests {
         );
         assert_ne!(
             EventKind::MesAdapterEvent.as_str(),
+            EventKind::InvoicePaymentRecorded.as_str()
+        );
+    }
+
+    /// S231 / PR-227 / ADR-0061 — the inventory-side stock-movement
+    /// event kind. **Same `mes.*` prefix family as `MesAdapterEvent`**
+    /// per ADR-0061 §4: Stage 3 modules (Inventory, Work Orders, QA,
+    /// Dispatch) all live under `mes.*` so the per-OUTGOING-invoice
+    /// export bundle's `invoice.*` glob never sweeps them, and so the
+    /// `system.*` consumers (per-OUTGOING-invoice export bundle's
+    /// exclusion glob, the AP-side query helpers) do not get
+    /// accidentally swept by Stage 3 traffic. MUST NOT start with
+    /// `invoice.` (would be silently swept into per-outgoing-invoice
+    /// bundles, a category error — stock movements have no
+    /// `inv_<ULID>` to belong to) and MUST NOT start with `system.`
+    /// (would force every existing `system.*` consumer to learn the
+    /// difference between "AP sync cycle completed" and "5 units of
+    /// part X were consumed by WO Y").
+    #[test]
+    fn s231_stock_movement_recorded_uses_mes_prefix() {
+        assert_eq!(
+            EventKind::StockMovementRecorded.as_str(),
+            "mes.stock_movement_recorded"
+        );
+        assert!(EventKind::StockMovementRecorded
+            .as_str()
+            .starts_with("mes."));
+        assert!(!EventKind::StockMovementRecorded
+            .as_str()
+            .starts_with("invoice."));
+        assert!(!EventKind::StockMovementRecorded
+            .as_str()
+            .starts_with("system."));
+    }
+
+    /// S231 / PR-227 / ADR-0061 — the stock-movement kind MUST be
+    /// distinct from `MesAdapterEvent` (adapter telemetry vs regulated
+    /// inventory state — different lossiness posture per ADR-0061 §4)
+    /// AND from every prior cycle/observation kind. Same fork-discipline
+    /// posture as `s228_mes_adapter_event_is_distinct`.
+    #[test]
+    fn s231_stock_movement_recorded_is_distinct() {
+        // Distinct from the sibling mes.* kind — broadcast-lossy telemetry
+        // vs lossy-must-not regulated state per ADR-0061 §4.
+        assert_ne!(
+            EventKind::StockMovementRecorded.as_str(),
+            EventKind::MesAdapterEvent.as_str()
+        );
+        // Distinct from system.* background cycle kinds.
+        assert_ne!(
+            EventKind::StockMovementRecorded.as_str(),
+            EventKind::IncomingInvoiceSyncCycleCompleted.as_str()
+        );
+        assert_ne!(
+            EventKind::StockMovementRecorded.as_str(),
+            EventKind::QuoteIntakePollCompleted.as_str()
+        );
+        // Distinct from invoice.* lifecycle kinds.
+        assert_ne!(
+            EventKind::StockMovementRecorded.as_str(),
+            EventKind::InvoiceDraftCreated.as_str()
+        );
+        assert_ne!(
+            EventKind::StockMovementRecorded.as_str(),
             EventKind::InvoicePaymentRecorded.as_str()
         );
     }

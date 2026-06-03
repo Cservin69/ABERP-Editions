@@ -1,0 +1,61 @@
+[package]
+name = "aberp-inventory"
+description = "ABERP Stage 3 Inventory module v1 (S231 / PR-227 / ADR-0061) — append-only stock_movements ledger + denormalised stock_qty cache on products, virtual low-stock view. Source of truth is the ledger; the cache is recomputed in-tx after every write and reconstructable via the rebuild-stock-cache binary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_inventory"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rebuild-stock-cache"
+path = "src/bin/rebuild_stock_cache.rs"
+
+[dependencies]
+# Append-only ledger entries write through aberp-audit-ledger's
+# cross-crate transactional surface (append_in_tx). Per ADR-0061 §4 the
+# inventory module emits one `mes.stock_movement_recorded` ledger entry
+# per movement in the same DuckDB transaction as the stock_movements
+# INSERT + the products cache UPDATE.
+aberp-audit-ledger = { path = "../audit-ledger" }
+
+# DuckDB Transaction is the type signature of record_movement; same
+# posture as aberp-mes and aberp-quote-intake.
+duckdb = { workspace = true }
+
+# Decimal qty_delta per ADR-0061 §"DECIMAL(18,6) for qty_delta" —
+# matches [[decimal-quantity-s157]]'s invoice-line precedent.
+rust_decimal = { workspace = true }
+
+# Serde for the StockMovementRecordedPayload wire shape + closed-vocab
+# enum (MovementReason / MovementRefKind) round-trip. Same posture as
+# every other `system.*` / `mes.*` payload.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Typed errors at the crate boundary; binary boundary uses anyhow.
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# RFC3339 stamps for the at + last_movement_at columns. Workspace pin
+# (no chrono).
+time = { workspace = true }
+
+# ULID for movement_id (`mvt_<ULID>` per ADR-0061 §1) and for the
+# audit-ledger F8 idempotency key.
+ulid = { workspace = true }
+
+# Loud diagnostic logging — repository surface uses tracing only when
+# the in-tx cache rebuild is invoked from the route layer; the
+# stand-alone `rebuild-stock-cache` binary uses stdout/stderr directly.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# No extra dev-deps yet; the in-process DuckDB driving uses the
+# `duckdb` crate already in [dependencies] above.

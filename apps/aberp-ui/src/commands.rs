@@ -495,6 +495,54 @@ pub async fn delete_product(state: State<'_, AppState>, product_id: String) -> R
     forward_delete(&state, &path).await
 }
 
+// ── S231 / PR-227 / ADR-0061 — Inventory v1 SPA bridge ──────────────
+
+/// S231 — `GET /api/products/:id/stock-movements?limit=&offset=`. The
+/// ProductDetail Stock-movements tab reads here. Pagination params
+/// are forwarded transparently; the backend caps `limit` at 500
+/// per [[trust-code-not-operator]].
+#[tauri::command]
+pub async fn list_stock_movements(
+    state: State<'_, AppState>,
+    product_id: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Value, String> {
+    validate_product_id(&product_id).map_err(|e| format!("{e:#}"))?;
+    let mut path = format!("/api/products/{product_id}/stock-movements?");
+    if let Some(n) = limit {
+        path.push_str(&format!("limit={n}&"));
+    }
+    if let Some(n) = offset {
+        path.push_str(&format!("offset={n}"));
+    }
+    forward_get(&state, &path, true).await
+}
+
+/// S231 — `POST /api/products/:id/stock-movements`. The manual
+/// adjustment form on ProductDetail submits one
+/// `{ qty_delta, reason, idempotency_key, notes? }` row here. The
+/// route layer enforces the reason-sign matrix + the
+/// "Receipt | Adjustment | Scrap only" closed vocab per ADR-0061 §6.
+#[tauri::command]
+pub async fn create_stock_movement(
+    state: State<'_, AppState>,
+    product_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_product_id(&product_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/products/{product_id}/stock-movements");
+    forward_post(&state, &path, body).await
+}
+
+/// S231 — `GET /api/products/low-stock`. The dashboard's "N products
+/// below min stock" chip + the products-list red-badge filter both
+/// read here. ADR-0061 §3's virtual view; no parameters.
+#[tauri::command]
+pub async fn list_low_stock_products(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/products/low-stock", true).await
+}
+
 /// PR-72 / session-94 — `GET /api/seller/banks`. Used by the SPA's
 /// Tenant Settings page (bank-accounts subsection) + the
 /// SellerConfigWizard's multi-row block to render the current
