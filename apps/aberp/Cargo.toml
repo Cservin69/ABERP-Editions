@@ -89,6 +89,10 @@ aberp-inventory = { path = "../../crates/aberp-inventory" }
 # detail / transition routes + the BOM author route. Same posture as
 # the inventory sibling.
 aberp-work-orders = { path = "../../crates/aberp-work-orders" }
+# S233 / PR-229 — Stage 3 Phase γ QA queue v1 (ADR-0063). The binary
+# owns the boot-time schema-ensure call + the QA list / detail /
+# decision routes + the per-routing-op Complete transition route.
+aberp-qa = { path = "../../crates/aberp-qa" }
 # PR-44γ — decimal arithmetic for the EUR→HUF round-half-even
 # conversion at the CLI boundary (the `aberp-billing` module is the
 # arithmetic owner; the binary needs the type for the

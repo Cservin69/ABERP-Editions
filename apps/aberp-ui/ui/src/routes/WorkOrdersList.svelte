@@ -24,10 +24,14 @@
   import {
     createWorkOrder,
     getWorkOrder,
+    listQaInspections,
     listWorkOrders,
+    transitionRoutingOp,
     transitionWorkOrder,
     listProducts,
     type Product,
+    type QaInspection,
+    type RoutingOp,
     type WorkOrder,
     type WorkOrderDetailResponse,
     type WorkOrderState,
@@ -56,6 +60,11 @@
   let detailLoading = $state(false);
   let actionError: string | null = $state(null);
   let warningsToShow: string[] = $state([]);
+  // S233 / PR-229 — per-op live QA inspections, keyed by routing_op_id.
+  // Populated alongside `detail` so the per-op chip renders without a
+  // re-fetch storm.
+  let qaByOp: Record<string, QaInspection | null> = $state({});
+  let opBusyId: string | null = $state(null);
 
   // Create-WO modal state.
   let showCreateForm = $state(false);
@@ -90,11 +99,62 @@
     warningsToShow = [];
     try {
       detail = await getWorkOrder(woId);
+      // S233 / PR-229 — fetch live QA inspections for the WO. We list
+      // all inspections then index by routing_op_id (live = the row
+      // where `superseded_by IS NULL`). The list call is bounded;
+      // for v1 a WO has ≤200 ops × ≤N inspections = manageable.
+      const allQa = await listQaInspections(null);
+      const live: Record<string, QaInspection | null> = {};
+      for (const op of detail.routing_ops) {
+        live[op.routing_op_id] = null;
+      }
+      for (const qa of allQa) {
+        if (qa.wo_id !== detail.work_order.wo_id) continue;
+        if (qa.superseded_by !== null) continue;
+        live[qa.routing_op_id] = qa;
+      }
+      qaByOp = live;
     } catch (e) {
       detailError = String(e);
       detail = null;
+      qaByOp = {};
     } finally {
       detailLoading = false;
+    }
+  }
+
+  async function completeOp(op: RoutingOp): Promise<void> {
+    if (detail === null) return;
+    actionError = null;
+    opBusyId = op.routing_op_id;
+    try {
+      await transitionRoutingOp(detail.work_order.wo_id, op.routing_op_id, {
+        action: "complete",
+        idempotency_key: mintIdempotencyKey(
+          `op-complete-${op.routing_op_id}`,
+        ),
+      });
+      await openDetail(detail.work_order.wo_id);
+    } catch (e) {
+      actionError = String(e);
+    } finally {
+      opBusyId = null;
+    }
+  }
+
+  function qaChipLabel(qa: QaInspection | null): string {
+    if (qa === null) return "—";
+    switch (qa.state) {
+      case "pending":
+        return "QA: függő";
+      case "passed":
+        return "QA: ✓";
+      case "failed":
+        return "QA: ✗";
+      case "reworking":
+        return "QA: ↻";
+      case "disposed":
+        return "QA: selejt";
     }
   }
 
@@ -346,7 +406,15 @@
         <h4>Műveletek / Routing operations</h4>
         <table>
           <thead>
-            <tr><th>#</th><th>Név / Name</th><th>Idő (perc)</th><th>Költség (HUF)</th><th>Állapot / State</th></tr>
+            <tr>
+              <th>#</th>
+              <th>Név / Name</th>
+              <th>Idő (perc)</th>
+              <th>Költség (HUF)</th>
+              <th>Állapot / State</th>
+              <th>QA</th>
+              <th>Műveletek / Actions</th>
+            </tr>
           </thead>
           <tbody>
             {#each detail.routing_ops as op}
@@ -356,6 +424,29 @@
                 <td>{op.est_time_min ?? "—"}</td>
                 <td>{op.est_cost_huf ?? "—"}</td>
                 <td>{op.state}</td>
+                <td>
+                  <span class="wo-qa-chip wo-qa-chip--{qaByOp[op.routing_op_id]?.state ?? 'none'}">
+                    {qaChipLabel(qaByOp[op.routing_op_id] ?? null)}
+                  </span>
+                </td>
+                <td>
+                  {#if op.state === "active"}
+                    <button
+                      type="button"
+                      class="wo-op-complete"
+                      onclick={() => completeOp(op)}
+                      disabled={opBusyId === op.routing_op_id}
+                    >
+                      ✓ Kész / Complete
+                    </button>
+                  {:else if op.state === "completed"}
+                    <span class="wo-op-done">
+                      {op.completed_at ? "✓ " + op.completed_at : "✓"}
+                    </span>
+                  {:else}
+                    <span class="wo-op-pending">—</span>
+                  {/if}
+                </td>
               </tr>
             {/each}
           </tbody>
@@ -718,6 +809,72 @@
     border-bottom: 1px solid var(--color-surface-divider);
     text-align: left;
     color: var(--color-text-primary);
+  }
+
+  /* S233 / PR-229 — per-op QA chip + Complete button. Same dark-token
+     vocabulary as the wo-table chrome above. */
+  .wo-qa-chip {
+    display: inline-block;
+    padding: 2px var(--space-2);
+    border-radius: 3px;
+    font-size: var(--type-size-xs);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+  }
+
+  .wo-qa-chip--none {
+    color: var(--color-text-muted);
+  }
+
+  .wo-qa-chip--pending {
+    border-color: var(--color-signal-warning);
+    color: var(--color-text-strong);
+  }
+
+  .wo-qa-chip--passed {
+    background: var(--color-signal-positive);
+    color: var(--color-surface-base);
+    border-color: var(--color-signal-positive);
+    font-weight: 500;
+  }
+
+  .wo-qa-chip--failed,
+  .wo-qa-chip--disposed {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
+  }
+
+  .wo-qa-chip--reworking {
+    color: var(--color-signal-warning);
+    border-color: var(--color-signal-warning);
+  }
+
+  .wo-op-complete {
+    background: var(--color-signal-positive);
+    color: var(--color-surface-base);
+    border: 1px solid var(--color-signal-positive);
+    padding: 2px var(--space-2);
+    font-size: var(--type-size-xs);
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: 500;
+  }
+
+  .wo-op-complete:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .wo-op-done {
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-xs);
+    font-family: var(--type-family-mono);
+  }
+
+  .wo-op-pending {
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
   }
 
   /* Modal — mirrors PartnerForm.svelte's dialog frame. */

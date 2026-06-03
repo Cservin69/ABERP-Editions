@@ -146,6 +146,34 @@ pub enum WoAction {
     Resume,
 }
 
+/// S233 / PR-229 — the per-routing-op verb. Closed vocab so the route
+/// layer can round-trip a `{ "action": "complete" }` body
+/// unambiguously. v1 has just `Complete`; future widening (per-op
+/// `Skip` per ADR-0062 §2's table) extends here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingOpAction {
+    /// Active → Completed. Cascades the next op (by sequence) Pending
+    /// → Active per ADR-0062 §2; auto-creates a Pending qa_inspection
+    /// per ADR-0063 §2.
+    Complete,
+}
+
+impl RoutingOpAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RoutingOpAction::Complete => "complete",
+        }
+    }
+
+    pub fn from_storage_str(s: &str) -> Result<Self, &'static str> {
+        match s {
+            "complete" => Ok(RoutingOpAction::Complete),
+            _ => Err("unknown RoutingOpAction storage string"),
+        }
+    }
+}
+
 impl WoAction {
     pub fn as_str(&self) -> &'static str {
         match self {

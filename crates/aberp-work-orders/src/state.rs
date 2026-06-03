@@ -14,7 +14,7 @@
 
 use thiserror::Error;
 
-use crate::types::{WoAction, WorkOrderState};
+use crate::types::{RoutingOpAction, RoutingOpState, WoAction, WorkOrderState};
 
 /// Errors raised by [`next_state`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -68,6 +68,44 @@ pub fn next_state(
         | (S::OnHold, A::Cancel) => Ok(S::Cancelled),
         // Every other (state, action) pair is an illegal edge.
         (from, action) => Err(WoStateError::IllegalTransition { from, action }),
+    }
+}
+
+/// S233 / PR-229 — illegal per-op transition. Surface at the route
+/// layer as 400, same as [`WoStateError::IllegalTransition`].
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RoutingOpStateError {
+    #[error("illegal routing-op transition: {from:?} cannot {action:?}")]
+    IllegalTransition {
+        from: RoutingOpState,
+        action: RoutingOpAction,
+    },
+}
+
+/// S233 / PR-229 — pure per-routing-op transition function. The
+/// cascade itself (next op Pending → Active when this one flips
+/// to Completed) lives in
+/// [`crate::repository::transition_routing_op`]; this function
+/// just gates the per-op edge.
+///
+/// Lifecycle (re-stated per ADR-0062 §2 + S233 brief Part A):
+///
+/// ```text
+/// Pending → Active → Completed   (Skipped is reserved; no v1 button drives it)
+/// ```
+///
+/// `Active → Completed` is the only operator-driven edge today. The
+/// `Pending → Active` step is cascade-driven (not operator-driven) by
+/// the WO Release handler and by the per-op Complete cascade.
+pub fn next_routing_op_state(
+    current: RoutingOpState,
+    action: RoutingOpAction,
+) -> Result<RoutingOpState, RoutingOpStateError> {
+    use RoutingOpAction as A;
+    use RoutingOpState as S;
+    match (current, action) {
+        (S::Active, A::Complete) => Ok(S::Completed),
+        (from, action) => Err(RoutingOpStateError::IllegalTransition { from, action }),
     }
 }
 
@@ -152,6 +190,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// S233 / PR-229 — `next_routing_op_state` pure function.
+    #[test]
+    fn routing_op_cascade_complete_from_active_yields_completed() {
+        let got = next_routing_op_state(RoutingOpState::Active, RoutingOpAction::Complete).unwrap();
+        assert_eq!(got, RoutingOpState::Completed);
+    }
+
+    #[test]
+    fn routing_op_cascade_complete_from_pending_is_refused() {
+        let err =
+            next_routing_op_state(RoutingOpState::Pending, RoutingOpAction::Complete).unwrap_err();
+        assert!(matches!(err, RoutingOpStateError::IllegalTransition { .. }));
+    }
+
+    #[test]
+    fn routing_op_cascade_complete_from_completed_is_refused() {
+        let err = next_routing_op_state(RoutingOpState::Completed, RoutingOpAction::Complete)
+            .unwrap_err();
+        assert!(matches!(err, RoutingOpStateError::IllegalTransition { .. }));
     }
 
     /// Specifically: Created → Completed is the most obvious illegal

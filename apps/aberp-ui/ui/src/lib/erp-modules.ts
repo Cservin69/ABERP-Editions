@@ -131,15 +131,19 @@ export const MODULES: ErpModule[] = [
   },
   // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Production module
   // (Work Orders v1). Operational area — the daily-driver shop-floor
-  // workflow. Future routes (QA queue per ADR-0063, Dispatch per
-  // ADR-0064) extend this module additively.
+  // workflow. S233 / PR-229 / ADR-0063 added the QA queue route
+  // alongside Work orders; future Dispatch (ADR-0064) extends this
+  // module additively.
   {
     id: "production",
     area: "operational",
     label_hu: "Gyártás",
     label_en: "Production",
     glyph: "⚙",
-    routes: [{ id: "work-orders", label: "Work orders" }],
+    routes: [
+      { id: "work-orders", label: "Work orders" },
+      { id: "qa", label: "QA queue" },
+    ],
   },
   {
     id: "master-data",

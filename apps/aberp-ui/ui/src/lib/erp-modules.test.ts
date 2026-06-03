@@ -82,6 +82,8 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   products: "master-data",
   // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Production module.
   "work-orders": "production",
+  // S233 / PR-229 / ADR-0063 — QA queue route lives in the same module.
+  qa: "production",
   tenant: "settings",
   "nav-credentials": "settings",
   // S180 / PR-180 — NAV-as-DR restore wizard, settings-grouped.
@@ -101,8 +103,9 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   partners: "maintenance",
   products: "maintenance",
   // S232 / PR-228 / ADR-0062 — Production is operational (daily-driver
-  // shop-floor workflow). Future QA/Dispatch routes extend.
+  // shop-floor workflow). S233 added QA queue alongside.
   "work-orders": "operational",
+  qa: "operational",
   tenant: "maintenance",
   "nav-credentials": "maintenance",
   maintenance: "maintenance",

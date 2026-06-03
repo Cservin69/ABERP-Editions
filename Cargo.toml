@@ -70,6 +70,7 @@ members = [
     "crates/aberp-mes",
     "crates/aberp-inventory",
     "crates/aberp-work-orders",
+    "crates/aberp-qa",
     "crates/invoice-pdf",
     "crates/mnb-rates",
     "crates/nav-transport",

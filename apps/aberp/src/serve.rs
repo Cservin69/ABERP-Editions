@@ -733,6 +733,22 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             .context("ensure work-orders schema at serve boot")?;
     }
 
+    // S233 / PR-229 / ADR-0063 — pin the QA-queue schema at boot
+    // (creates qa_inspections table). Same idempotent posture as the
+    // work-orders migration above. MUST run AFTER the work-orders
+    // migration because the QA module references routing-op ids
+    // (no FK is declared per [[no-sql-specific]]).
+    {
+        let _s = tracing::info_span!("serve.ensure_qa_schema").entered();
+        let conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for qa boot migration",
+                args.db.display()
+            )
+        })?;
+        aberp_qa::ensure_schema(&conn).context("ensure qa schema at serve boot")?;
+    }
+
     // S177 / PR-177 — pin the ap_invoice (incoming AP-side mirror)
     // schema at boot, same posture as products + partners. The route
     // layer also calls `ensure_schema` defensively so a fresh DB +
@@ -2085,9 +2101,27 @@ fn build_router(state: AppState) -> Router {
             "/api/work-orders/:id/transitions",
             post(handle_transition_work_order),
         )
+        // S233 / PR-229 Part A — per-routing-op Complete button (the
+        // Active op only; cascade advances the next op + auto-creates
+        // a Pending QA inspection).
+        .route(
+            "/api/work-orders/:id/routing-ops/:op_id/transitions",
+            post(handle_transition_routing_op),
+        )
         .route(
             "/api/products/:id/bom",
             get(handle_get_product_bom).post(handle_put_product_bom),
+        )
+        // S233 / PR-229 / ADR-0063 — Stage 3 Phase γ QA queue v1.
+        // GET lists tenant QA inspections (optional `?state=` filter +
+        // pagination — defaults to all states); detail GET; decisions
+        // POST is the SAME handler future adapter events call per
+        // ADR-0063 §3.
+        .route("/api/qa-inspections", get(handle_list_qa_inspections))
+        .route("/api/qa-inspections/:id", get(handle_get_qa_inspection))
+        .route(
+            "/api/qa-inspections/:id/decisions",
+            post(handle_decide_qa_inspection),
         )
         // S177 / PR-177 — AP module v1 BACKEND. Incoming-invoice list +
         // detail + manual ingestion + three closed-vocab status
@@ -8233,6 +8267,10 @@ fn map_wo_err(e: aberp_work_orders::WorkOrderError) -> WorkOrderRouteError {
             WorkOrderRouteError::BadInput(format!("cannot release: product {p} has no active BOM"))
         }
         WE::WorkOrderNotFound(_) => WorkOrderRouteError::NotFound,
+        WE::RoutingOpNotFound(_) => WorkOrderRouteError::NotFound,
+        WE::WoCompletionBlockedByQa(msg) => {
+            WorkOrderRouteError::BadInput(format!("WO completion blocked by QA gate: {msg}"))
+        }
         WE::ProductNotFound(p) => WorkOrderRouteError::BadInput(format!("product {p} not found")),
         WE::DuplicateIdempotencyKey(k) => {
             WorkOrderRouteError::Conflict(format!("duplicate idempotency_key {k}"))
@@ -8780,6 +8818,399 @@ pub fn put_product_bom_request(
             .map_err(map_wo_err)?;
     tx.commit().context("commit BOM replace transaction")?;
     Ok(out)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S233 / PR-229 Part A — per-routing-op Complete handler. Mirrors the
+// WO transition handler; the SPA POSTs to it from the per-op Complete
+// button on WorkOrderDetail when the op state is Active.
+// ──────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct TransitionRoutingOpBody {
+    pub action: String,
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub source_event_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransitionRoutingOpResponse {
+    pub routing_op: aberp_work_orders::RoutingOp,
+    /// `Some` when the cascade advanced the next op Pending → Active.
+    pub next_op_activated: Option<aberp_work_orders::RoutingOp>,
+    /// The auto-created Pending QA inspection id (ADR-0063 §2).
+    pub qa_inspection_id: String,
+}
+
+async fn handle_transition_routing_op(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath((wo_id, op_id)): AxumPath<(String, String)>,
+    Json(body): Json<TransitionRoutingOpBody>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let wo_for_task = wo_id.clone();
+    let op_for_task = op_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        transition_routing_op_request(
+            &state_for_task,
+            &wo_for_task,
+            &op_for_task,
+            &operator_login,
+            body,
+        )
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "transition_routing_op_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => wo_route_error_response(e),
+    }
+}
+
+pub fn transition_routing_op_request(
+    state: &AppState,
+    _wo_id: &str,
+    op_id: &str,
+    operator_login: &str,
+    body: TransitionRoutingOpBody,
+) -> std::result::Result<TransitionRoutingOpResponse, WorkOrderRouteError> {
+    let action = aberp_work_orders::RoutingOpAction::from_storage_str(body.action.trim())
+        .map_err(|e| WorkOrderRouteError::BadInput(format!("{e}: {:?}", body.action)))?;
+
+    // SPA route MUST pass source_event_id = None per ADR-0062 invariant 7.
+    if body.source_event_id.is_some() {
+        return Err(WorkOrderRouteError::BadInput(
+            "source_event_id is not accepted from the SPA route — adapter event handlers only \
+             (ADR-0062 invariant 7)"
+                .to_string(),
+        ));
+    }
+
+    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!(
+            "open tenant DuckDB at {}: {e}",
+            state.db_path.display()
+        ))
+    })?;
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+
+    let tx = conn
+        .transaction()
+        .context("begin routing-op transition transaction")?;
+    let ctx = aberp_work_orders::WoWriteContext {
+        tenant: state.tenant.as_str(),
+        actor: aberp_inventory::ActorKind::SpaOperator {
+            operator_login: operator_login.to_string(),
+        },
+        ledger_meta: &ledger_meta,
+        ledger_actor,
+    };
+    let inputs = aberp_work_orders::RoutingOpTransitionInputs {
+        action,
+        source_event_id: None,
+        idempotency_key: body.idempotency_key,
+    };
+    let outcome =
+        aberp_work_orders::transition_routing_op(&tx, &ctx, op_id, inputs).map_err(map_wo_err)?;
+    tx.commit()
+        .context("commit routing-op transition transaction")?;
+    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    Ok(TransitionRoutingOpResponse {
+        routing_op: outcome.routing_op,
+        next_op_activated: outcome.next_op_activated,
+        qa_inspection_id: outcome.qa_inspection_id,
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S233 / PR-229 / ADR-0063 — QA queue v1 HTTP routes.
+// ──────────────────────────────────────────────────────────────────────
+//
+// Three routes:
+//
+//   - `GET  /api/qa-inspections[?state=&limit=&offset=]` — list.
+//   - `GET  /api/qa-inspections/:id` — detail.
+//   - `POST /api/qa-inspections/:id/decisions` — Pass / Fail /
+//     Rework / Dispose (closed-vocab `decision` body field).
+//
+// All require_ready + bearer auth. DoS bound on `limit` per
+// [[trust-code-not-operator]].
+
+#[derive(Debug, Deserialize)]
+pub struct ListQaInspectionsQuery {
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+const QA_LIST_DEFAULT_LIMIT: u32 = 100;
+const QA_LIST_MAX_LIMIT: u32 = 500;
+
+fn map_qa_err(e: aberp_qa::QaError) -> WorkOrderRouteError {
+    use aberp_qa::QaError as Q;
+    match e {
+        Q::IllegalTransition(msg) => WorkOrderRouteError::BadInput(msg),
+        Q::InspectionNotFound(_) => WorkOrderRouteError::NotFound,
+        Q::AlreadySuperseded(s) => {
+            WorkOrderRouteError::Conflict(format!("QA inspection {s} has been superseded"))
+        }
+        Q::InspectionAlreadyLive(s) => {
+            WorkOrderRouteError::Conflict(format!("QA inspection already live for {s}"))
+        }
+        Q::StateRaced { expected, actual } => WorkOrderRouteError::Conflict(format!(
+            "QA state raced: expected from={:?}, found={:?}",
+            expected, actual
+        )),
+        Q::DuplicateIdempotencyKey(k) => {
+            WorkOrderRouteError::Conflict(format!("duplicate idempotency_key {k}"))
+        }
+        Q::Validation(msg) => WorkOrderRouteError::BadInput(msg),
+        Q::Storage(e) => WorkOrderRouteError::Other(e),
+    }
+}
+
+async fn handle_list_qa_inspections(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<ListQaInspectionsQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_filter = match query.state.as_deref() {
+        None => None,
+        Some(s) => match aberp_qa::QaState::from_storage_str(s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!("invalid `state`: {e}"))),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let limit = query
+        .limit
+        .unwrap_or(QA_LIST_DEFAULT_LIMIT)
+        .min(QA_LIST_MAX_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        list_qa_inspections_request(&state_for_task, state_filter, limit, offset)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "list_qa_inspections_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => internal_error("list_qa_inspections_request", e),
+    }
+}
+
+pub fn list_qa_inspections_request(
+    state: &AppState,
+    state_filter: Option<aberp_qa::QaState>,
+    limit: u32,
+    offset: u32,
+) -> anyhow::Result<Vec<aberp_qa::QaInspection>> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    aberp_qa::list_qa_inspections(&conn, state.tenant.as_str(), state_filter, limit, offset)
+}
+
+async fn handle_get_qa_inspection(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        get_qa_inspection_request(&state_for_task, &id_for_task)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "get_qa_inspection_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(Some(inspection)) => Json(inspection).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!("QA inspection {id} not found"))),
+        )
+            .into_response(),
+        Err(e) => internal_error("get_qa_inspection_request", e),
+    }
+}
+
+pub fn get_qa_inspection_request(
+    state: &AppState,
+    qa_id: &str,
+) -> anyhow::Result<Option<aberp_qa::QaInspection>> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    aberp_qa::get_qa_inspection(&conn, state.tenant.as_str(), qa_id)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DecideQaInspectionBody {
+    /// Closed vocab — `pass` / `fail` / `rework` / `dispose`.
+    pub decision: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub measurement: Option<String>,
+    /// MUST be supplied explicitly per ADR-0062 invariant 7 / ADR-0063
+    /// §3 — `None` from SPA, `Some(ULID)` from adapter handlers.
+    #[serde(default)]
+    pub source_event_id: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DecideQaInspectionResponse {
+    pub inspection: aberp_qa::QaInspection,
+    pub superseded_qa_id: Option<String>,
+    pub rework_flipped_routing_op_back_to_active: bool,
+    pub disposed_emitted_scrap_movement: bool,
+}
+
+async fn handle_decide_qa_inspection(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<DecideQaInspectionBody>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        decide_qa_inspection_request(&state_for_task, &id_for_task, &operator_login, body)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "decide_qa_inspection_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => wo_route_error_response(e),
+    }
+}
+
+pub fn decide_qa_inspection_request(
+    state: &AppState,
+    qa_id: &str,
+    operator_login: &str,
+    body: DecideQaInspectionBody,
+) -> std::result::Result<DecideQaInspectionResponse, WorkOrderRouteError> {
+    let decision = aberp_qa::QaDecision::from_storage_str(body.decision.trim())
+        .map_err(|e| WorkOrderRouteError::BadInput(format!("{e}: {:?}", body.decision)))?;
+    if body.source_event_id.is_some() {
+        return Err(WorkOrderRouteError::BadInput(
+            "source_event_id is not accepted from the SPA route — adapter event handlers only \
+             (ADR-0062 invariant 7 / ADR-0063 §3)"
+                .to_string(),
+        ));
+    }
+
+    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!(
+            "open tenant DuckDB at {}: {e}",
+            state.db_path.display()
+        ))
+    })?;
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+
+    let tx = conn.transaction().context("begin QA decide transaction")?;
+    let ctx = aberp_qa::QaWriteContext {
+        tenant: state.tenant.as_str(),
+        actor: aberp_inventory::ActorKind::SpaOperator {
+            operator_login: operator_login.to_string(),
+        },
+        ledger_meta: &ledger_meta,
+        ledger_actor,
+    };
+    let inputs = aberp_qa::DecideQaInputs {
+        decision,
+        reason: body.reason,
+        measurement: body.measurement,
+        source_event_id: None,
+        idempotency_key: body.idempotency_key,
+    };
+    let outcome = aberp_qa::decide_qa(&tx, &ctx, qa_id, inputs).map_err(map_qa_err)?;
+    tx.commit().context("commit QA decide transaction")?;
+    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    Ok(DecideQaInspectionResponse {
+        inspection: outcome.inspection,
+        superseded_qa_id: outcome.superseded_qa_id,
+        rework_flipped_routing_op_back_to_active: outcome.rework_flipped_routing_op_back_to_active,
+        disposed_emitted_scrap_movement: outcome.disposed_emitted_scrap_movement,
+    })
 }
 
 /// Best-effort audit-mirror sync after a successful write transaction.

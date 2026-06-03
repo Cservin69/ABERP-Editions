@@ -28,6 +28,15 @@ aberp-audit-ledger = { path = "../audit-ledger" }
 # RecordMovementInputs).
 aberp-inventory = { path = "../aberp-inventory" }
 
+# S233 / PR-229 / ADR-0063 — when a routing-op transitions to
+# Completed the QA crate auto-creates a Pending `qa_inspections` row
+# in the same tx; when the WO Complete handler runs it gates on
+# `all_live_inspections_passed_for_wo`. Same posture aberp-work-orders
+# uses with aberp-inventory: cross-crate write that rides the caller-
+# owned transaction. No cycle — aberp-qa does NOT depend on
+# aberp-work-orders (it reads `routings` / `work_orders` directly).
+aberp-qa = { path = "../aberp-qa" }
+
 # DuckDB Transaction is the type signature of every write path; same
 # posture aberp-inventory uses.
 duckdb = { workspace = true }
@@ -59,3 +68,8 @@ ulid = { workspace = true }
 
 # Diagnostic logging at the route layer.
 tracing = { workspace = true }
+
+# Note: aberp-qa is already a regular [dependency] above. Tests
+# (`tests/work_order_round_trip.rs`) call `aberp_qa::ensure_schema` +
+# the cascade-triggered QA inspection flow needs aberp-qa types
+# transitively; the existing dep is sufficient — no dev-dep needed.

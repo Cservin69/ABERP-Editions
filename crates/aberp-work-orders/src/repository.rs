@@ -30,10 +30,12 @@ use ulid::Ulid;
 
 use aberp_audit_ledger::{append_in_tx, Actor, EventKind, LedgerMeta};
 
-use crate::audit::{WorkOrderCreatedPayload, WorkOrderStateChangedPayload};
+use crate::audit::{
+    RoutingOpStateChangedPayload, WorkOrderCreatedPayload, WorkOrderStateChangedPayload,
+};
 use crate::error::WorkOrderError;
-use crate::state::next_state;
-use crate::types::{RoutingOpState, WoAction, WorkOrderState};
+use crate::state::{next_routing_op_state, next_state};
+use crate::types::{RoutingOpAction, RoutingOpState, WoAction, WorkOrderState};
 
 // ── Schema ─────────────────────────────────────────────────────────
 
@@ -554,6 +556,23 @@ pub fn transition_work_order(
     let next = next_state(current_state, inputs.action)
         .map_err(|e| WorkOrderError::IllegalTransition(format!("{e}")))?;
 
+    // S233 / PR-229 — WO Complete gate per ADR-0063 §7 + invariant #6.
+    // Refused BEFORE the WO row is mutated so a 400-gated Complete
+    // leaves the WO state untouched; the operator sees a structured
+    // error pointing at the blocking op(s).
+    if matches!(inputs.action, WoAction::Complete) {
+        let gate_ok = aberp_qa::all_live_inspections_passed_for_wo(tx, ctx.tenant, wo_id)
+            .map_err(|e| WorkOrderError::Storage(anyhow!("QA gate check: {e}")))?;
+        if !gate_ok {
+            // Compose a human-readable blocking-op-list for the
+            // error body. We surface op-name + current QA state (or
+            // "no QA inspection yet" when the op hasn't completed).
+            let blockers = blocking_qa_op_names(tx, ctx.tenant, wo_id)
+                .map_err(|e| WorkOrderError::Storage(anyhow!("blocking ops list: {e}")))?;
+            return Err(WorkOrderError::WoCompletionBlockedByQa(blockers));
+        }
+    }
+
     let mut warnings: Vec<String> = Vec::new();
 
     // ── Action-specific side effects ────────────────────────────
@@ -604,6 +623,17 @@ pub fn transition_work_order(
                     }
                 }
             }
+
+            // S233 / PR-229 Part A — flip the FIRST routing-op (by
+            // sequence) Pending → Active. Subsequent ops stay Pending;
+            // the cascade in `transition_routing_op` advances them.
+            // Emits one RoutingOpStateChanged audit. Note: the brief
+            // names "sequence=0" but the existing create_work_order
+            // path uses 1-based sequencing (line ~406). Read whatever
+            // is the lowest-sequence Pending op so the cascade aligns
+            // with on-disk reality. Flagged in PR-229 body — the
+            // brief's "sequence=0" is a documentation inconsistency.
+            cascade_first_pending_op_to_active(tx, ctx, wo_id, &inputs.idempotency_key)?;
         }
         WoAction::Complete => {
             // Emit one positive WoCompletion movement for the
@@ -1062,4 +1092,464 @@ fn now_rfc3339() -> anyhow::Result<String> {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|e| anyhow!("format Rfc3339: {e}"))
+}
+
+// ── Routing-op cascade + transition (S233 / PR-229 Part A) ─────────
+
+/// Read a single routing-op row by id, scoped to the tenant. `None`
+/// for unknown ids.
+pub fn read_routing_op(
+    conn: &Connection,
+    tenant: &str,
+    routing_op_id: &str,
+) -> anyhow::Result<Option<RoutingOp>> {
+    let row = conn
+        .query_row(
+            "SELECT routing_op_id, wo_id, sequence, op_name,
+                    est_time_min, CAST(est_cost_huf AS VARCHAR),
+                    state, started_at, completed_at
+             FROM routings
+             WHERE tenant_id = ? AND routing_op_id = ? LIMIT 1;",
+            params![tenant, routing_op_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i32>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(anyhow!("SELECT routings by id: {other}")),
+        })?;
+    match row {
+        None => Ok(None),
+        Some((
+            routing_op_id,
+            wo_id,
+            sequence,
+            op_name,
+            est_time_min,
+            est_cost_huf_str,
+            state_str,
+            started_at,
+            completed_at,
+        )) => {
+            let est_cost_huf = match est_cost_huf_str {
+                None => None,
+                Some(s) => {
+                    Some(Decimal::from_str(&s).with_context(|| format!("parse est_cost {s:?}"))?)
+                }
+            };
+            Ok(Some(RoutingOp {
+                routing_op_id,
+                wo_id,
+                sequence,
+                op_name,
+                est_time_min,
+                est_cost_huf,
+                state: RoutingOpState::from_storage_str(&state_str)
+                    .map_err(|e| anyhow!("{e}: {state_str:?}"))?,
+                started_at,
+                completed_at,
+            }))
+        }
+    }
+}
+
+/// Inputs to [`transition_routing_op`].
+#[derive(Debug, Clone)]
+pub struct RoutingOpTransitionInputs {
+    pub action: RoutingOpAction,
+    /// `None` for SPA-button-driven transitions; `Some(ULID)` for
+    /// adapter-driven transitions per ADR-0062 invariant 7 (same
+    /// posture as `TransitionInputs.source_event_id`).
+    pub source_event_id: Option<String>,
+    pub idempotency_key: String,
+}
+
+/// Outcome of [`transition_routing_op`].
+#[derive(Debug, Clone)]
+pub struct RoutingOpTransitionOutcome {
+    /// The routing-op row after the transition.
+    pub routing_op: RoutingOp,
+    /// If the cascade advanced the NEXT op Pending → Active, this is
+    /// the freshly-activated op. `None` when this was the last op
+    /// in the WO's routing.
+    pub next_op_activated: Option<RoutingOp>,
+    /// The auto-created Pending QA inspection id for the op that
+    /// just transitioned to Completed (ADR-0063 §2). Always populated
+    /// on Complete; the SPA can deep-link to it from the
+    /// post-transition response.
+    pub qa_inspection_id: String,
+}
+
+/// Transition a routing-op per ADR-0062 §2 + S233 Part A.
+///
+/// v1 the only action is `Complete` (Active → Completed). The handler:
+///   1. Validates current state + refuses illegal edges.
+///   2. Updates the row, stamps `completed_at`.
+///   3. Emits `RoutingOpStateChanged` audit (this op's transition).
+///   4. Auto-creates a Pending `qa_inspections` row via aberp-qa
+///      (ADR-0063 §2 + invariant #1).
+///   5. Cascades the NEXT op (by sequence) Pending → Active if any
+///      remain; emits its RoutingOpStateChanged audit too.
+///
+/// `WO` state is NOT auto-flipped to Completed even when the last op
+/// passes — per ADR-0063 §"Open questions" #9 the auto-complete is
+/// deferred. The operator clicks the WO Complete button; the
+/// QA-gate in `transition_work_order(Complete)` enforces eligibility.
+pub fn transition_routing_op(
+    tx: &Transaction<'_>,
+    ctx: &WoWriteContext<'_>,
+    routing_op_id: &str,
+    inputs: RoutingOpTransitionInputs,
+) -> Result<RoutingOpTransitionOutcome, WorkOrderError> {
+    if inputs.idempotency_key.trim().is_empty() {
+        return Err(WorkOrderError::Validation(
+            "idempotency_key must be non-empty".to_string(),
+        ));
+    }
+
+    // Read current row inside the tx.
+    let row: Option<(String, i32, String, String)> = tx
+        .query_row(
+            "SELECT state, sequence, wo_id, op_name FROM routings
+             WHERE tenant_id = ? AND routing_op_id = ? LIMIT 1;",
+            params![ctx.tenant, routing_op_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(anyhow!("read routings for transition: {other}")),
+        })?;
+    let (current_state_str, sequence, wo_id, _op_name) =
+        row.ok_or_else(|| WorkOrderError::RoutingOpNotFound(routing_op_id.to_string()))?;
+    let current_state = RoutingOpState::from_storage_str(&current_state_str)
+        .map_err(|e| WorkOrderError::Storage(anyhow!("{e}: {current_state_str:?}")))?;
+
+    let new_state = next_routing_op_state(current_state, inputs.action)
+        .map_err(|e| WorkOrderError::IllegalTransition(format!("{e}")))?;
+
+    let now = now_rfc3339()?;
+
+    // 1. Update THIS op's row.
+    tx.execute(
+        "UPDATE routings SET state = ?, completed_at = COALESCE(completed_at, ?)
+         WHERE tenant_id = ? AND routing_op_id = ?;",
+        params![new_state.as_str(), &now, ctx.tenant, routing_op_id],
+    )
+    .map_err(|e| WorkOrderError::Storage(anyhow!("UPDATE routings: {e}")))?;
+
+    // 2. Emit RoutingOpStateChanged audit for THIS op.
+    let actor_str = ctx.actor.as_operator_string();
+    emit_routing_op_state_changed_audit(
+        tx,
+        ctx,
+        routing_op_id,
+        &wo_id,
+        current_state,
+        new_state,
+        &actor_str,
+        &inputs.idempotency_key,
+    )?;
+
+    // 3. Auto-create Pending QA inspection (ADR-0063 §2 + invariant #1).
+    //    Same tx so the inspection appears the moment the op flips.
+    let qa_ctx = aberp_qa::QaWriteContext {
+        tenant: ctx.tenant,
+        actor: ctx.actor.clone(),
+        ledger_meta: ctx.ledger_meta,
+        ledger_actor: ctx.ledger_actor.clone(),
+    };
+    let qa_inspection = aberp_qa::auto_create_inspection_for_op_completion(
+        tx,
+        &qa_ctx,
+        aberp_qa::AutoCreateInspectionInputs {
+            wo_id: &wo_id,
+            routing_op_id,
+            idempotency_key: format!("{}:qa-create", inputs.idempotency_key),
+        },
+    )
+    .map_err(map_qa_err_into_wo)?;
+
+    // 4. Cascade: find the next-sequence Pending op and flip Active.
+    let next_pending: Option<(String, i32)> = tx
+        .query_row(
+            "SELECT routing_op_id, sequence FROM routings
+             WHERE tenant_id = ? AND wo_id = ? AND state = 'pending' AND sequence > ?
+             ORDER BY sequence ASC, routing_op_id ASC
+             LIMIT 1;",
+            params![ctx.tenant, &wo_id, sequence],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?)),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(anyhow!("read next-pending op for cascade: {other}")),
+        })?;
+
+    let next_op_activated = if let Some((next_id, _next_seq)) = next_pending {
+        tx.execute(
+            "UPDATE routings SET state = 'active', started_at = COALESCE(started_at, ?)
+             WHERE tenant_id = ? AND routing_op_id = ?;",
+            params![&now, ctx.tenant, &next_id],
+        )
+        .map_err(|e| WorkOrderError::Storage(anyhow!("UPDATE cascade-next routings: {e}")))?;
+        emit_routing_op_state_changed_audit(
+            tx,
+            ctx,
+            &next_id,
+            &wo_id,
+            RoutingOpState::Pending,
+            RoutingOpState::Active,
+            &actor_str,
+            &format!("{}:cascade", inputs.idempotency_key),
+        )?;
+        // Read back the next op for the outcome.
+        read_routing_op_in_tx(tx, ctx.tenant, &next_id)?
+    } else {
+        None
+    };
+
+    let updated = read_routing_op_in_tx(tx, ctx.tenant, routing_op_id)?
+        .ok_or_else(|| WorkOrderError::RoutingOpNotFound(routing_op_id.to_string()))?;
+
+    // Suppress the unused source_event_id binding warning in v1 —
+    // the RoutingOpStateChanged payload does not carry it today
+    // (the audit timeline links via the WO-level entry). Reserved
+    // for a future widening per ADR-0062 invariant 7.
+    let _ = inputs.source_event_id;
+
+    Ok(RoutingOpTransitionOutcome {
+        routing_op: updated,
+        next_op_activated,
+        qa_inspection_id: qa_inspection.qa_id,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_routing_op_state_changed_audit(
+    tx: &Transaction<'_>,
+    ctx: &WoWriteContext<'_>,
+    routing_op_id: &str,
+    wo_id: &str,
+    from_state: RoutingOpState,
+    to_state: RoutingOpState,
+    actor_str: &str,
+    idempotency_key: &str,
+) -> Result<(), WorkOrderError> {
+    let payload = RoutingOpStateChangedPayload {
+        routing_op_id: routing_op_id.to_string(),
+        wo_id: wo_id.to_string(),
+        from_state,
+        to_state,
+        actor: actor_str.to_string(),
+        idempotency_key: idempotency_key.to_string(),
+    };
+    append_in_tx(
+        tx,
+        ctx.ledger_meta,
+        EventKind::RoutingOpStateChanged,
+        payload.to_bytes(),
+        ctx.ledger_actor.clone(),
+        Some(idempotency_key.to_string()),
+    )
+    .map_err(|e| WorkOrderError::Storage(anyhow!("audit append RoutingOpStateChanged: {e}")))?;
+    Ok(())
+}
+
+/// Called from the Release arm of [`transition_work_order`]. Finds
+/// the lowest-sequence Pending op for the WO and flips it Active.
+/// Idempotent — if NO Pending op exists (re-Release? structurally
+/// impossible per ADR-0062 §2, but defence-in-depth) this is a no-op.
+fn cascade_first_pending_op_to_active(
+    tx: &Transaction<'_>,
+    ctx: &WoWriteContext<'_>,
+    wo_id: &str,
+    idempotency_key: &str,
+) -> Result<(), WorkOrderError> {
+    let first_pending: Option<String> = tx
+        .query_row(
+            "SELECT routing_op_id FROM routings
+             WHERE tenant_id = ? AND wo_id = ? AND state = 'pending'
+             ORDER BY sequence ASC, routing_op_id ASC
+             LIMIT 1;",
+            params![ctx.tenant, wo_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(anyhow!(
+                "read first-pending op for Release cascade: {other}"
+            )),
+        })?;
+    let Some(first_id) = first_pending else {
+        return Ok(());
+    };
+    let now = now_rfc3339()?;
+    tx.execute(
+        "UPDATE routings SET state = 'active', started_at = COALESCE(started_at, ?)
+         WHERE tenant_id = ? AND routing_op_id = ?;",
+        params![&now, ctx.tenant, &first_id],
+    )
+    .map_err(|e| {
+        WorkOrderError::Storage(anyhow!("UPDATE first-pending op (release cascade): {e}"))
+    })?;
+    let actor_str = ctx.actor.as_operator_string();
+    emit_routing_op_state_changed_audit(
+        tx,
+        ctx,
+        &first_id,
+        wo_id,
+        RoutingOpState::Pending,
+        RoutingOpState::Active,
+        &actor_str,
+        &format!("{}:release-cascade", idempotency_key),
+    )?;
+    Ok(())
+}
+
+fn read_routing_op_in_tx(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    routing_op_id: &str,
+) -> Result<Option<RoutingOp>, WorkOrderError> {
+    let row = tx
+        .query_row(
+            "SELECT routing_op_id, wo_id, sequence, op_name,
+                    est_time_min, CAST(est_cost_huf AS VARCHAR),
+                    state, started_at, completed_at
+             FROM routings
+             WHERE tenant_id = ? AND routing_op_id = ? LIMIT 1;",
+            params![tenant, routing_op_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i32>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(WorkOrderError::Storage(anyhow!(
+                "read routings in-tx: {other}"
+            ))),
+        })?;
+    match row {
+        None => Ok(None),
+        Some((
+            routing_op_id,
+            wo_id,
+            sequence,
+            op_name,
+            est_time_min,
+            est_cost_huf_str,
+            state_str,
+            started_at,
+            completed_at,
+        )) => {
+            let est_cost_huf = match est_cost_huf_str {
+                None => None,
+                Some(s) => Some(
+                    Decimal::from_str(&s)
+                        .map_err(|e| WorkOrderError::Storage(anyhow!("parse est_cost: {e}")))?,
+                ),
+            };
+            Ok(Some(RoutingOp {
+                routing_op_id,
+                wo_id,
+                sequence,
+                op_name,
+                est_time_min,
+                est_cost_huf,
+                state: RoutingOpState::from_storage_str(&state_str)
+                    .map_err(|e| WorkOrderError::Storage(anyhow!("{e}: {state_str:?}")))?,
+                started_at,
+                completed_at,
+            }))
+        }
+    }
+}
+
+fn map_qa_err_into_wo(e: aberp_qa::QaError) -> WorkOrderError {
+    use aberp_qa::QaError as Q;
+    match e {
+        Q::IllegalTransition(s) => WorkOrderError::IllegalTransition(s),
+        Q::InspectionNotFound(s) => WorkOrderError::Validation(format!("QA: {s}")),
+        Q::AlreadySuperseded(s) => {
+            WorkOrderError::Validation(format!("QA inspection {s} superseded"))
+        }
+        Q::InspectionAlreadyLive(s) => WorkOrderError::Validation(format!("QA: {s}")),
+        Q::StateRaced { expected, actual } => WorkOrderError::Validation(format!(
+            "QA raced: expected from={expected:?}, found={actual:?}"
+        )),
+        Q::DuplicateIdempotencyKey(k) => WorkOrderError::DuplicateIdempotencyKey(k),
+        Q::Validation(msg) => WorkOrderError::Validation(format!("QA: {msg}")),
+        Q::Storage(err) => WorkOrderError::Storage(err),
+    }
+}
+
+/// Compose a human-readable blocking-op-list for the
+/// `WoCompletionBlockedByQa` error body. Walks `routings` for the
+/// WO and pairs each with its live `qa_inspections.state` (or
+/// "no QA inspection yet" when no live row exists).
+fn blocking_qa_op_names(tx: &Transaction<'_>, tenant: &str, wo_id: &str) -> anyhow::Result<String> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT r.op_name, r.sequence,
+                    (SELECT state FROM qa_inspections q
+                     WHERE q.tenant_id = r.tenant_id
+                       AND q.routing_op_id = r.routing_op_id
+                       AND q.superseded_by IS NULL
+                     ORDER BY q.created_at DESC, q.qa_id DESC
+                     LIMIT 1)
+             FROM routings r
+             WHERE r.tenant_id = ? AND r.wo_id = ?
+             ORDER BY r.sequence ASC;",
+        )
+        .context("prepare blocking-ops SELECT")?;
+    let rows = stmt
+        .query_map(params![tenant, wo_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i32>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .context("query blocking ops")?;
+    let mut blockers = Vec::new();
+    for r in rows {
+        let (op_name, seq, qa_state) = r.context("read blocking-ops row")?;
+        let live = qa_state.as_deref().unwrap_or("no inspection");
+        if live != "passed" {
+            blockers.push(format!("#{seq} {op_name} ({live})"));
+        }
+    }
+    Ok(blockers.join(", "))
 }

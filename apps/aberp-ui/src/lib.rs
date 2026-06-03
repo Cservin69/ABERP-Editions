@@ -302,6 +302,12 @@ pub fn run() {
             commands::transition_work_order,
             commands::get_product_bom,
             commands::put_product_bom,
+            // S233 / PR-229 Part A — per-routing-op Complete cascade.
+            commands::transition_routing_op,
+            // S233 / PR-229 / ADR-0063 — Stage 3 Phase γ QA queue v1.
+            commands::list_qa_inspections,
+            commands::get_qa_inspection,
+            commands::decide_qa_inspection,
             commands::list_seller_banks,
             commands::create_seller_bank,
             commands::update_seller_bank,

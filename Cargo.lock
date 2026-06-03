@@ -14,6 +14,7 @@ dependencies = [
  "aberp-mnb-rates",
  "aberp-nav-transport",
  "aberp-nav-xsd-validator",
+ "aberp-qa",
  "aberp-quote-intake",
  "aberp-verify",
  "aberp-work-orders",
@@ -174,6 +175,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "aberp-qa"
+version = "0.0.0"
+dependencies = [
+ "aberp-audit-ledger",
+ "aberp-inventory",
+ "aberp-work-orders",
+ "anyhow",
+ "duckdb",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "time",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "aberp-quote-intake"
 version = "0.0.0"
 dependencies = [
@@ -236,6 +255,7 @@ version = "0.0.0"
 dependencies = [
  "aberp-audit-ledger",
  "aberp-inventory",
+ "aberp-qa",
  "anyhow",
  "duckdb",
  "rust_decimal",

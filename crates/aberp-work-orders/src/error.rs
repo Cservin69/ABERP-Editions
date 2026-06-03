@@ -57,6 +57,20 @@ pub enum WorkOrderError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    /// The routing-op id does not exist in the tenant. Route
+    /// layer → 404.
+    #[error("routing op {0} not found")]
+    RoutingOpNotFound(String),
+
+    /// S233 / PR-229 — the WO Complete gate (ADR-0063 §7 + invariant
+    /// #6) refused: at least one routing-op has no live `qa_inspections`
+    /// row in state `Passed`. Carries a human-readable list of
+    /// blocking op names so the SPA can render a helpful tooltip.
+    /// Route layer maps to 400 — same status as IllegalTransition;
+    /// the message body distinguishes.
+    #[error("WO completion blocked by QA gate: {0}")]
+    WoCompletionBlockedByQa(String),
+
     /// DB-layer error from DuckDB or the audit-ledger write.
     /// Route layer maps to 500.
     #[error("storage error: {0}")]

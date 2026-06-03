@@ -916,6 +916,37 @@ pub enum EventKind {
     ///
     /// F12 four-edit ritual fires once.
     RoutingOpStateChanged,
+
+    /// S233 / PR-229 / ADR-0063 — one Pending `qa_inspections` row was
+    /// auto-created when a routing-op transitioned to `Completed`. ONE
+    /// entry per inspection at create time; carries `qa_id`, `wo_id`,
+    /// `routing_op_id`, the `actor` (operator login or `adapter:<name>`
+    /// or `system` per [[s232-work-order-cascade]]'s `ActorKind` pattern),
+    /// and the F8 idempotency key.
+    ///
+    /// `mes.` prefix per ADR-0063 §5. Stage 3 modules (Inventory, Work
+    /// Orders, QA, Dispatch) share the family — keeps the per-OUTGOING-
+    /// invoice export bundle's `invoice.*` glob narrow and `system.*`
+    /// consumers untouched.
+    ///
+    /// F12 four-edit ritual fires once.
+    QaInspectionCreated,
+
+    /// S233 / PR-229 / ADR-0063 — an operator (or adapter) decided on a
+    /// QA inspection: Pass / Fail / Rework / Dispose. ONE entry per
+    /// decision call. Carries `qa_id`, `from_state`, `to_state`,
+    /// optional `reason` + `measurement`, the `actor`, the optional
+    /// `source_event_id` (cross-references the upstream adapter event
+    /// ULID — `None` for SPA-button-driven decisions, `Some(_)` for
+    /// adapter-driven decisions per ADR-0063 §3), the optional
+    /// `superseded_qa_id` (set when the decision created a NEW row +
+    /// superseded a prior cross-actor row per ADR-0063 §4), and the
+    /// F8 idempotency key.
+    ///
+    /// `mes.` prefix per ADR-0063 §5.
+    ///
+    /// F12 four-edit ritual fires once.
+    QaInspectionDecided,
 }
 
 impl EventKind {
@@ -968,6 +999,8 @@ impl EventKind {
             EventKind::WorkOrderCreated => "mes.work_order_created",
             EventKind::WorkOrderStateChanged => "mes.work_order_state_changed",
             EventKind::RoutingOpStateChanged => "mes.routing_op_state_changed",
+            EventKind::QaInspectionCreated => "mes.qa_inspection_created",
+            EventKind::QaInspectionDecided => "mes.qa_inspection_decided",
         }
     }
 
@@ -1031,6 +1064,8 @@ impl EventKind {
             "mes.work_order_created" => Ok(EventKind::WorkOrderCreated),
             "mes.work_order_state_changed" => Ok(EventKind::WorkOrderStateChanged),
             "mes.routing_op_state_changed" => Ok(EventKind::RoutingOpStateChanged),
+            "mes.qa_inspection_created" => Ok(EventKind::QaInspectionCreated),
+            "mes.qa_inspection_decided" => Ok(EventKind::QaInspectionDecided),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1086,6 +1121,8 @@ mod tests {
             EventKind::WorkOrderCreated,
             EventKind::WorkOrderStateChanged,
             EventKind::RoutingOpStateChanged,
+            EventKind::QaInspectionCreated,
+            EventKind::QaInspectionDecided,
         ];
         for v in variants {
             let s = v.as_str();
@@ -1916,6 +1953,56 @@ mod tests {
         for new_k in new_kinds {
             assert_ne!(new_k, EventKind::MesAdapterEvent.as_str());
             assert_ne!(new_k, EventKind::StockMovementRecorded.as_str());
+        }
+    }
+
+    /// S233 / PR-229 / ADR-0063 — the two QA-queue kinds use the `mes.*`
+    /// prefix family alongside the Inventory/WO kinds. MUST NOT start
+    /// with `invoice.` or `system.` so the per-OUTGOING-invoice export
+    /// bundle's `invoice.*` glob never sweeps QA traffic and existing
+    /// `system.*` consumers stay narrow.
+    #[test]
+    fn s230_qa_kinds_use_mes_prefix() {
+        for k in [
+            EventKind::QaInspectionCreated,
+            EventKind::QaInspectionDecided,
+        ] {
+            let s = k.as_str();
+            assert!(s.starts_with("mes."), "{s} must start with mes.");
+            assert!(
+                !s.starts_with("invoice."),
+                "{s} must not start with invoice."
+            );
+            assert!(!s.starts_with("system."), "{s} must not start with system.");
+        }
+        // Exact storage strings per ADR-0063 §5 table.
+        assert_eq!(
+            EventKind::QaInspectionCreated.as_str(),
+            "mes.qa_inspection_created"
+        );
+        assert_eq!(
+            EventKind::QaInspectionDecided.as_str(),
+            "mes.qa_inspection_decided"
+        );
+    }
+
+    /// S233 / PR-229 / ADR-0063 — the two QA-queue kinds are distinct
+    /// from each other and from every prior `mes.*` kind. Catches a
+    /// future refactor accidentally collapsing two `mes.*` kinds onto
+    /// one storage string.
+    #[test]
+    fn s230_qa_kinds_are_distinct() {
+        let qa = [
+            EventKind::QaInspectionCreated.as_str(),
+            EventKind::QaInspectionDecided.as_str(),
+        ];
+        assert_ne!(qa[0], qa[1]);
+        for k in qa {
+            assert_ne!(k, EventKind::MesAdapterEvent.as_str());
+            assert_ne!(k, EventKind::StockMovementRecorded.as_str());
+            assert_ne!(k, EventKind::WorkOrderCreated.as_str());
+            assert_ne!(k, EventKind::WorkOrderStateChanged.as_str());
+            assert_ne!(k, EventKind::RoutingOpStateChanged.as_str());
         }
     }
 

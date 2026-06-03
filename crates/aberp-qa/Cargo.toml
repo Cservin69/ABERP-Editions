@@ -1,0 +1,56 @@
+[package]
+name = "aberp-qa"
+description = "ABERP Stage 3 Phase γ QA queue v1 (S233 / PR-229 / ADR-0063) — qa_inspections table auto-created on routing-op Completed, manual Pass/Fail/Rework/Dispose decisions, cross-actor supersede pattern, Disposed emits a Scrap stock_movement."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_qa"
+path = "src/lib.rs"
+
+[dependencies]
+# Audit-ledger F8 cross-crate writer per ADR-0063 §5 — every
+# auto-create + every decision emits one audit entry inside the
+# caller-owned transaction. Same posture as aberp-inventory /
+# aberp-work-orders.
+aberp-audit-ledger = { path = "../audit-ledger" }
+
+# ADR-0063 §6 — `Disposed` emits one `Scrap` stock_movement via the
+# inventory module's existing `record_movement` surface. Also reuses
+# `ActorKind` so the QA decide_qa signature matches the
+# `aberp_work_orders::WoWriteContext` pattern.
+aberp-inventory = { path = "../aberp-inventory" }
+
+# Read `routings.state` directly via SQL (no aberp-work-orders dep —
+# that would create a cycle, work-orders depends on aberp-qa for the
+# auto-create-on-op-completion path per ADR-0063 §2).
+duckdb = { workspace = true }
+
+rust_decimal = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# RFC3339 stamps for created_at / decided_at.
+time = { workspace = true }
+
+# ULID for qa_id (`qa_<ULID>`).
+ulid = { workspace = true }
+
+# Diagnostic logging.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Integration tests for the cascade + WO-Complete-gate paths drive
+# aberp-work-orders' handlers; that crate depends on aberp-qa via its
+# own [dependencies], so this dev-dep is one-way (no Cargo cycle —
+# dev-deps don't propagate). Used ONLY in `tests/qa_round_trip.rs`.
+aberp-work-orders = { path = "../aberp-work-orders" }

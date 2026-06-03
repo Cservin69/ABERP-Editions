@@ -825,7 +825,14 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // this arm exists for exhaustiveness only.
         | EventKind::WorkOrderCreated
         | EventKind::WorkOrderStateChanged
-        | EventKind::RoutingOpStateChanged => (None, ""),
+        | EventKind::RoutingOpStateChanged
+        // S233 / PR-229 / ADR-0063 — QA-queue events. `mes.*` family
+        // per ADR-0063 §5; QA inspections belong to routing-ops on
+        // work orders, never to an outgoing invoice. Excluded from
+        // the per-OUTGOING-invoice bundle by the `invoice.*` glob;
+        // this arm exists for exhaustiveness only.
+        | EventKind::QaInspectionCreated
+        | EventKind::QaInspectionDecided => (None, ""),
     };
 
     Ok(NavExtraction {

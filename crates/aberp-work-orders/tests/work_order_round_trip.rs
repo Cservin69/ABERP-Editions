@@ -20,9 +20,10 @@ use aberp_inventory::{
 };
 use aberp_work_orders::{
     create_work_order, ensure_schema as ensure_wo_schema, list_active_bom_for_product,
-    list_routing_ops_for_wo, read_work_order, replace_bom_for_product, transition_work_order,
-    BomLineInput, CreateWorkOrderInputs, RoutingOpInput, TransitionInputs, WoAction,
-    WoWriteContext, WorkOrderError, WorkOrderState,
+    list_routing_ops_for_wo, read_work_order, replace_bom_for_product, transition_routing_op,
+    transition_work_order, BomLineInput, CreateWorkOrderInputs, RoutingOpAction, RoutingOpInput,
+    RoutingOpTransitionInputs, TransitionInputs, WoAction, WoWriteContext, WorkOrderError,
+    WorkOrderState,
 };
 use duckdb::Connection;
 
@@ -49,6 +50,11 @@ fn setup_db() -> Connection {
     ensure_inventory_schema(&conn).unwrap();
     ensure_audit_schema(&conn).unwrap();
     ensure_wo_schema(&conn).unwrap();
+    // S233 / PR-229 — the WO Complete handler now gates on QA per
+    // ADR-0063 §7 + invariant #6. The gate reads `qa_inspections`
+    // directly so the schema must be ensured for any test that
+    // exercises Complete.
+    aberp_qa::ensure_schema(&conn).unwrap();
     conn
 }
 
@@ -214,6 +220,52 @@ fn happy_path_create_release_start_complete_writes_all_expected_movements_and_au
     tx.commit().unwrap();
     assert_eq!(outcome.wo.state, WorkOrderState::InProgress);
     assert!(outcome.wo.started_at.is_some());
+
+    // S233 / PR-229 — per-op cascade + Pass each QA inspection before
+    // WO Complete. The gate per ADR-0063 §7 + invariant #6 refuses
+    // the Complete unless every routing-op has a live Passed
+    // qa_inspections row.
+    let qa_ctx = aberp_qa::QaWriteContext {
+        tenant: TEST_TENANT,
+        actor: aberp_inventory::ActorKind::SpaOperator {
+            operator_login: "ervin".to_string(),
+        },
+        ledger_meta: &meta,
+        ledger_actor: aberp_audit_ledger::Actor::from_local_cli(
+            "test-session".to_string(),
+            "ervin",
+        ),
+    };
+    for (i, op) in ops.iter().enumerate() {
+        let tx = conn.transaction().unwrap();
+        let r = transition_routing_op(
+            &tx,
+            &ctx_for(&meta, "ervin"),
+            &op.routing_op_id,
+            RoutingOpTransitionInputs {
+                action: RoutingOpAction::Complete,
+                source_event_id: None,
+                idempotency_key: format!("op-complete-{i}"),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let tx = conn.transaction().unwrap();
+        aberp_qa::decide_qa(
+            &tx,
+            &qa_ctx,
+            &r.qa_inspection_id,
+            aberp_qa::DecideQaInputs {
+                decision: aberp_qa::QaDecision::Pass,
+                reason: None,
+                measurement: None,
+                source_event_id: None,
+                idempotency_key: format!("qa-pass-{i}"),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
 
     // Complete.
     let tx = conn.transaction().unwrap();

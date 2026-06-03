@@ -1781,6 +1781,114 @@ export async function putProductBom(
   return invoke<BomLine[]>("put_product_bom", { productId, body });
 }
 
+// ── S233 / PR-229 / ADR-0063 — Stage 3 Phase γ QA queue v1 ──────────
+
+/** S233 — closed-vocab inspection state per ADR-0063 §1. Snake_case
+ * storage strings match `aberp_qa::QaState::as_str`. */
+export type QaState =
+  | "pending"
+  | "passed"
+  | "failed"
+  | "reworking"
+  | "disposed";
+
+/** S233 — closed-vocab decision verb per ADR-0063 §3. */
+export type QaDecision = "pass" | "fail" | "rework" | "dispose";
+
+/** S233 — one row from `qa_inspections`. Snake_case JSON mirror of
+ * `aberp_qa::QaInspection`. */
+export interface QaInspection {
+  qa_id: string;
+  wo_id: string;
+  routing_op_id: string;
+  state: QaState;
+  decided_at: string | null;
+  decided_by: string | null;
+  reason: string | null;
+  measurement: string | null;
+  source_event_id: string | null;
+  created_at: string;
+  superseded_by: string | null;
+}
+
+/** S233 — `POST /api/qa-inspections/:id/decisions` body. */
+export interface DecideQaInspectionBody {
+  decision: QaDecision;
+  reason?: string | null;
+  measurement?: string | null;
+  idempotency_key: string;
+}
+
+/** S233 — `POST /api/qa-inspections/:id/decisions` response. */
+export interface DecideQaInspectionResponse {
+  inspection: QaInspection;
+  superseded_qa_id: string | null;
+  rework_flipped_routing_op_back_to_active: boolean;
+  disposed_emitted_scrap_movement: boolean;
+}
+
+/** S233 — `GET /api/qa-inspections[?state=&limit=&offset=]`. */
+export async function listQaInspections(
+  stateFilter?: QaState | null,
+  limit?: number,
+  offset?: number,
+): Promise<QaInspection[]> {
+  return invoke<QaInspection[]>("list_qa_inspections", {
+    stateFilter: stateFilter ?? null,
+    limit: limit ?? null,
+    offset: offset ?? null,
+  });
+}
+
+/** S233 — `GET /api/qa-inspections/:id`. */
+export async function getQaInspection(qaId: string): Promise<QaInspection> {
+  return invoke<QaInspection>("get_qa_inspection", { qaId });
+}
+
+/** S233 — `POST /api/qa-inspections/:id/decisions`. */
+export async function decideQaInspection(
+  qaId: string,
+  body: DecideQaInspectionBody,
+): Promise<DecideQaInspectionResponse> {
+  return invoke<DecideQaInspectionResponse>("decide_qa_inspection", {
+    qaId,
+    body,
+  });
+}
+
+// ── S233 / PR-229 Part A — per-routing-op Complete cascade ──────────
+
+/** S233 — closed-vocab per-op action; v1 just `complete`. */
+export type RoutingOpAction = "complete";
+
+/** S233 — `POST /api/work-orders/:wo_id/routing-ops/:op_id/transitions`
+ * body. */
+export interface TransitionRoutingOpBody {
+  action: RoutingOpAction;
+  idempotency_key: string;
+}
+
+/** S233 — `POST .../routing-ops/:op_id/transitions` response. */
+export interface TransitionRoutingOpResponse {
+  routing_op: RoutingOp;
+  next_op_activated: RoutingOp | null;
+  /** The auto-created Pending QA inspection id (ADR-0063 §2). */
+  qa_inspection_id: string;
+}
+
+/** S233 — `POST /api/work-orders/:wo_id/routing-ops/:op_id/transitions`. */
+export async function transitionRoutingOp(
+  woId: string,
+  opId: string,
+  body: TransitionRoutingOpBody,
+): Promise<TransitionRoutingOpResponse> {
+  return invoke<TransitionRoutingOpResponse>("transition_routing_op", {
+    woId,
+    opId,
+    body,
+  });
+}
+
 // ── PR-72 / session-94 — multi-bank-account routes (PR-B) ─────────────
 
 /** PR-72 / session-94 — closed-vocab currency on a bank-account row.

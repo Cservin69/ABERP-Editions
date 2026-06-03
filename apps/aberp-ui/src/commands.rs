@@ -629,6 +629,71 @@ pub async fn put_product_bom(
     forward_post(&state, &path, body).await
 }
 
+// ── S233 / PR-229 — Per-routing-op Complete cascade + QA queue ──────
+
+/// S233 — `POST /api/work-orders/:wo_id/routing-ops/:op_id/transitions`.
+/// The Active op's Complete button POSTs `{ action: "complete",
+/// idempotency_key }`. Response carries the updated op + the auto-
+/// activated next op (if any) + the auto-created QA inspection id.
+#[tauri::command]
+pub async fn transition_routing_op(
+    state: State<'_, AppState>,
+    wo_id: String,
+    op_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_wo_id(&wo_id).map_err(|e| format!("{e:#}"))?;
+    validate_qa_or_routing_op_id(&op_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/work-orders/{wo_id}/routing-ops/{op_id}/transitions");
+    forward_post(&state, &path, body).await
+}
+
+/// S233 — `GET /api/qa-inspections[?state=&limit=&offset=]`. The QA
+/// queue tab reads here. `state` is a closed-vocab `QaState` storage
+/// string (pending/passed/failed/reworking/disposed).
+#[tauri::command]
+pub async fn list_qa_inspections(
+    state: State<'_, AppState>,
+    state_filter: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Value, String> {
+    let mut path = String::from("/api/qa-inspections?");
+    if let Some(s) = state_filter {
+        path.push_str(&format!("state={s}&"));
+    }
+    if let Some(n) = limit {
+        path.push_str(&format!("limit={n}&"));
+    }
+    if let Some(n) = offset {
+        path.push_str(&format!("offset={n}"));
+    }
+    forward_get(&state, &path, true).await
+}
+
+/// S233 — `GET /api/qa-inspections/:id`.
+#[tauri::command]
+pub async fn get_qa_inspection(state: State<'_, AppState>, qa_id: String) -> Result<Value, String> {
+    validate_qa_or_routing_op_id(&qa_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/qa-inspections/{qa_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// S233 — `POST /api/qa-inspections/:id/decisions`. Body shape:
+/// `{ decision: "pass" | "fail" | "rework" | "dispose", reason?,
+/// measurement?, idempotency_key }`. The SPA NEVER supplies
+/// `source_event_id` — adapter event handlers only (ADR-0063 §3).
+#[tauri::command]
+pub async fn decide_qa_inspection(
+    state: State<'_, AppState>,
+    qa_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_qa_or_routing_op_id(&qa_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/qa-inspections/{qa_id}/decisions");
+    forward_post(&state, &path, body).await
+}
+
 /// PR-72 / session-94 — `GET /api/seller/banks`. Used by the SPA's
 /// Tenant Settings page (bank-accounts subsection) + the
 /// SellerConfigWizard's multi-row block to render the current
@@ -1385,6 +1450,26 @@ fn validate_wo_id(s: &str) -> anyhow::Result<()> {
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
         anyhow::bail!("wo_id `{s}` contains characters outside [A-Za-z0-9_-]");
+    }
+    Ok(())
+}
+
+/// S233 / PR-229 — defence-in-depth validator for `qa_<ULID>` and
+/// `rop_<ULID>` ids on the QA / routing-op routes. Same ASCII-safe
+/// charset as `validate_wo_id`; both id shapes ride a single
+/// validator since the constraints are identical.
+fn validate_qa_or_routing_op_id(s: &str) -> anyhow::Result<()> {
+    if s.is_empty() {
+        anyhow::bail!("id is empty");
+    }
+    if s.len() > 64 {
+        anyhow::bail!("id length {} exceeds 64", s.len());
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!("id `{s}` contains characters outside [A-Za-z0-9_-]");
     }
     Ok(())
 }
