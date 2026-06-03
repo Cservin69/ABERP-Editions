@@ -749,6 +749,24 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         aberp_qa::ensure_schema(&conn).context("ensure qa schema at serve boot")?;
     }
 
+    // S234 / PR-230 — pin the dispatches schema at boot, same posture
+    // as the other Stage 3 Phase γ siblings (inventory / work-orders /
+    // qa). The route layer also calls `ensure_schema` defensively so a
+    // fresh DB + first route hit does not 500. No FK to `work_orders`
+    // / `partners` / `invoice` per [[no-sql-specific]] — the
+    // application-level eligibility gate in `aberp_dispatch::create_dispatch`
+    // is the authoritative check.
+    {
+        let _s = tracing::info_span!("serve.ensure_dispatch_schema").entered();
+        let conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for dispatch boot migration",
+                args.db.display()
+            )
+        })?;
+        aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema at serve boot")?;
+    }
+
     // S177 / PR-177 — pin the ap_invoice (incoming AP-side mirror)
     // schema at boot, same posture as products + partners. The route
     // layer also calls `ensure_schema` defensively so a fresh DB +
@@ -2123,6 +2141,28 @@ fn build_router(state: AppState) -> Router {
             "/api/qa-inspections/:id/decisions",
             post(handle_decide_qa_inspection),
         )
+        // S234 / PR-230 / ADR-0064 — Stage 3 Phase γ Dispatch board v1.
+        // GET lists tenant dispatches (optional `?state=` filter +
+        // pagination — defaults to all states); detail GET; eligible-WO
+        // read for the SPA's "Ready to dispatch" panel; create POST
+        // refuses ineligible WO + duplicate-for-WO loud per ADR-0064 §2;
+        // mark-shipped POST is the atomic transition (stock movement +
+        // injected invoice spawn + audit) per ADR-0064 §4 + §5; cancel
+        // POST is valid only from Drafted.
+        .route(
+            "/api/dispatches",
+            get(handle_list_dispatches).post(handle_create_dispatch),
+        )
+        .route(
+            "/api/dispatches/eligible-work-orders",
+            get(handle_list_eligible_work_orders),
+        )
+        .route("/api/dispatches/:id", get(handle_get_dispatch))
+        .route(
+            "/api/dispatches/:id/ship",
+            post(handle_mark_dispatch_shipped),
+        )
+        .route("/api/dispatches/:id/cancel", post(handle_cancel_dispatch))
         // S177 / PR-177 — AP module v1 BACKEND. Incoming-invoice list +
         // detail + manual ingestion + three closed-vocab status
         // transitions. All require_ready + bearer auth. The NAV
@@ -9211,6 +9251,513 @@ pub fn decide_qa_inspection_request(
         rework_flipped_routing_op_back_to_active: outcome.rework_flipped_routing_op_back_to_active,
         disposed_emitted_scrap_movement: outcome.disposed_emitted_scrap_movement,
     })
+}
+
+// ───────────────────────────────────────────────────────────────────
+// S234 / PR-230 / ADR-0064 — Dispatch board v1 routes.
+//
+// Six routes:
+//
+//   - `GET  /api/dispatches[?state=&limit=&offset=]` — list.
+//   - `GET  /api/dispatches/:id` — detail.
+//   - `GET  /api/dispatches/eligible-work-orders[?limit=]` — read-only
+//     view of Completed WOs that have no prior dispatch row.
+//   - `POST /api/dispatches` — create a Drafted dispatch against a
+//     Completed WO + a partner. Refuses ineligible WO + duplicate
+//     dispatch loud per ADR-0064 §2.
+//   - `POST /api/dispatches/:id/ship` — atomic transition per
+//     ADR-0064 §4 + §5 + invariant #1: state flip + Dispatch
+//     stock_movement + injected invoice spawn + DispatchShipped audit,
+//     all in one tx. v1 wires `NoopInvoiceSpawner` per the PR-230
+//     body's [[pushback-as-method]] divergence; PR-230b will wire the
+//     real sync billing extraction.
+//   - `POST /api/dispatches/:id/cancel` — Drafted → Cancelled only.
+//
+// All require_ready + bearer auth. DoS bound on `limit` per
+// [[trust-code-not-operator]].
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ListDispatchesQuery {
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+const DISPATCH_LIST_DEFAULT_LIMIT: u32 = 100;
+
+#[derive(Debug, Deserialize)]
+pub struct ListEligibleWorkOrdersQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+const ELIGIBLE_WO_DEFAULT_LIMIT: u32 = 100;
+
+#[derive(Debug, Deserialize)]
+pub struct CreateDispatchBody {
+    pub wo_id: String,
+    pub partner_id: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MarkDispatchShippedBody {
+    /// Closed-vocab `CarrierKind` storage string (`magyar_posta`,
+    /// `gls`, `dpd`, `foxpost`, `self_delivery`, `customer_pickup`,
+    /// `other`).
+    pub carrier_kind: String,
+    #[serde(default)]
+    pub tracking_number: Option<String>,
+    /// Optional explicit RFC3339 timestamp; absent → server stamps
+    /// `now()` per ADR-0064 §7.
+    #[serde(default)]
+    pub shipped_at: Option<String>,
+    pub idempotency_key: String,
+}
+
+fn map_dispatch_err(e: aberp_dispatch::DispatchError) -> WorkOrderRouteError {
+    use aberp_dispatch::DispatchError as D;
+    match e {
+        D::IllegalTransition(msg) => WorkOrderRouteError::BadInput(msg),
+        D::DispatchNotFound(_) => WorkOrderRouteError::NotFound,
+        D::WorkOrderNotEligible { wo_id, state } => WorkOrderRouteError::BadInput(format!(
+            "work order {wo_id} is not eligible for dispatch (state={state})"
+        )),
+        D::WorkOrderAlreadyDispatched { wo_id, dsp_id } => WorkOrderRouteError::BadInput(format!(
+            "work order {wo_id} already has a dispatch (dsp_id={dsp_id})"
+        )),
+        D::WorkOrderNotFound(_) | D::PartnerNotFound(_) => WorkOrderRouteError::NotFound,
+        D::DuplicateIdempotencyKey(k) => {
+            WorkOrderRouteError::Conflict(format!("duplicate idempotency_key {k}"))
+        }
+        D::Validation(msg) => WorkOrderRouteError::BadInput(msg),
+        D::InvoiceSpawnFailed(msg) => {
+            WorkOrderRouteError::Other(anyhow!("invoice spawn failed: {msg}"))
+        }
+        D::Storage(e) => WorkOrderRouteError::Other(e),
+    }
+}
+
+async fn handle_list_dispatches(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<ListDispatchesQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_filter = match query.state.as_deref() {
+        None => None,
+        Some(s) => match aberp_dispatch::DispatchState::from_storage_str(s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!("invalid `state`: {e}"))),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let limit = query
+        .limit
+        .unwrap_or(DISPATCH_LIST_DEFAULT_LIMIT)
+        .min(aberp_dispatch::MAX_DISPATCH_LIST_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        list_dispatches_request(&state_for_task, state_filter, limit, offset)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "list_dispatches_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => internal_error("list_dispatches_request", e),
+    }
+}
+
+pub fn list_dispatches_request(
+    state: &AppState,
+    state_filter: Option<aberp_dispatch::DispatchState>,
+    limit: u32,
+    offset: u32,
+) -> anyhow::Result<Vec<aberp_dispatch::Dispatch>> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema (defensive)")?;
+    aberp_dispatch::list_dispatches(&conn, state.tenant.as_str(), state_filter, limit, offset)
+}
+
+async fn handle_get_dispatch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || get_dispatch_request(&state_for_task, &id_for_task))
+            .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "get_dispatch_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(Some(dispatch)) => Json(dispatch).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!("dispatch {id} not found"))),
+        )
+            .into_response(),
+        Err(e) => internal_error("get_dispatch_request", e),
+    }
+}
+
+pub fn get_dispatch_request(
+    state: &AppState,
+    dsp_id: &str,
+) -> anyhow::Result<Option<aberp_dispatch::Dispatch>> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema (defensive)")?;
+    aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
+}
+
+async fn handle_list_eligible_work_orders(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<ListEligibleWorkOrdersQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let limit = query
+        .limit
+        .unwrap_or(ELIGIBLE_WO_DEFAULT_LIMIT)
+        .min(aberp_dispatch::MAX_ELIGIBLE_WO_LIMIT);
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        list_eligible_work_orders_request(&state_for_task, limit)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "list_eligible_work_orders_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => internal_error("list_eligible_work_orders_request", e),
+    }
+}
+
+pub fn list_eligible_work_orders_request(
+    state: &AppState,
+    limit: u32,
+) -> anyhow::Result<Vec<aberp_dispatch::EligibleWorkOrder>> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema (defensive)")?;
+    aberp_dispatch::list_eligible_work_orders(&conn, state.tenant.as_str(), limit)
+}
+
+async fn handle_create_dispatch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<CreateDispatchBody>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        create_dispatch_request(&state_for_task, &operator_login, body)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "create_dispatch_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(dispatch) => Json(dispatch).into_response(),
+        Err(e) => wo_route_error_response(e),
+    }
+}
+
+pub fn create_dispatch_request(
+    state: &AppState,
+    operator_login: &str,
+    body: CreateDispatchBody,
+) -> std::result::Result<aberp_dispatch::Dispatch, WorkOrderRouteError> {
+    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!(
+            "open tenant DuckDB at {}: {e}",
+            state.db_path.display()
+        ))
+    })?;
+    aberp_dispatch::ensure_schema(&conn)
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+
+    let tx = conn
+        .transaction()
+        .context("begin create_dispatch transaction")
+        .map_err(WorkOrderRouteError::Other)?;
+    let ctx = aberp_dispatch::DispatchWriteContext {
+        tenant: state.tenant.as_str(),
+        actor: aberp_inventory::ActorKind::SpaOperator {
+            operator_login: operator_login.to_string(),
+        },
+        ledger_meta: &ledger_meta,
+        ledger_actor,
+    };
+    let outcome = aberp_dispatch::create_dispatch(
+        &tx,
+        &ctx,
+        aberp_dispatch::CreateDispatchInputs {
+            wo_id: body.wo_id,
+            partner_id: body.partner_id,
+            notes: body.notes,
+            idempotency_key: body.idempotency_key,
+        },
+    )
+    .map_err(map_dispatch_err)?;
+    tx.commit()
+        .context("commit create_dispatch transaction")
+        .map_err(WorkOrderRouteError::Other)?;
+    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    Ok(outcome)
+}
+
+async fn handle_mark_dispatch_shipped(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<MarkDispatchShippedBody>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        mark_dispatch_shipped_request(&state_for_task, &id_for_task, &operator_login, body)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "mark_dispatch_shipped_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => wo_route_error_response(e),
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct MarkDispatchShippedResponse {
+    pub dispatch: aberp_dispatch::Dispatch,
+    /// `Some(invoice_id)` when the injected spawner returned a draft
+    /// id; `None` for the v1 [[NoopInvoiceSpawner]] posture. The SPA
+    /// renders a click-through to the existing IssueInvoice form when
+    /// `None` per the PR-230 body's [[pushback-as-method]] divergence
+    /// from ADR-0064 §5.
+    pub spawned_invoice_id: Option<String>,
+    pub stock_movement_id: String,
+}
+
+pub fn mark_dispatch_shipped_request(
+    state: &AppState,
+    dsp_id: &str,
+    operator_login: &str,
+    body: MarkDispatchShippedBody,
+) -> std::result::Result<MarkDispatchShippedResponse, WorkOrderRouteError> {
+    // ADR-0064 §"Invariants pinned" #8 — closed-vocab gate at the
+    // wire boundary. Free text is refused loud.
+    let carrier_kind = aberp_dispatch::CarrierKind::from_storage_str(body.carrier_kind.trim())
+        .map_err(|e| WorkOrderRouteError::BadInput(format!("{e}: {:?}", body.carrier_kind)))?;
+    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!(
+            "open tenant DuckDB at {}: {e}",
+            state.db_path.display()
+        ))
+    })?;
+    aberp_dispatch::ensure_schema(&conn)
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+
+    let tx = conn
+        .transaction()
+        .context("begin mark_shipped transaction")
+        .map_err(WorkOrderRouteError::Other)?;
+    let ctx = aberp_dispatch::DispatchWriteContext {
+        tenant: state.tenant.as_str(),
+        actor: aberp_inventory::ActorKind::SpaOperator {
+            operator_login: operator_login.to_string(),
+        },
+        ledger_meta: &ledger_meta,
+        ledger_actor,
+    };
+    let outcome = aberp_dispatch::mark_shipped(
+        &tx,
+        &ctx,
+        dsp_id,
+        aberp_dispatch::MarkShippedInputs {
+            carrier_kind,
+            tracking_number: body.tracking_number,
+            shipped_at: body.shipped_at,
+            idempotency_key: body.idempotency_key,
+        },
+        // v1 production spawner per the PR-230 body's pushback. PR-230b
+        // swaps this for the real sync billing extraction.
+        &aberp_dispatch::NoopInvoiceSpawner,
+    )
+    .map_err(map_dispatch_err)?;
+    tx.commit()
+        .context("commit mark_shipped transaction")
+        .map_err(WorkOrderRouteError::Other)?;
+    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    Ok(MarkDispatchShippedResponse {
+        dispatch: outcome.dispatch,
+        spawned_invoice_id: outcome.spawned_invoice_id,
+        stock_movement_id: outcome.stock_movement_id,
+    })
+}
+
+async fn handle_cancel_dispatch(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        cancel_dispatch_request(&state_for_task, &id_for_task, &operator_login)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "cancel_dispatch_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(dispatch) => Json(dispatch).into_response(),
+        Err(e) => wo_route_error_response(e),
+    }
+}
+
+pub fn cancel_dispatch_request(
+    state: &AppState,
+    dsp_id: &str,
+    operator_login: &str,
+) -> std::result::Result<aberp_dispatch::Dispatch, WorkOrderRouteError> {
+    let mut conn = Connection::open(&*state.db_path).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!(
+            "open tenant DuckDB at {}: {e}",
+            state.db_path.display()
+        ))
+    })?;
+    aberp_dispatch::ensure_schema(&conn)
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+
+    let tx = conn
+        .transaction()
+        .context("begin cancel_dispatch transaction")
+        .map_err(WorkOrderRouteError::Other)?;
+    let ctx = aberp_dispatch::DispatchWriteContext {
+        tenant: state.tenant.as_str(),
+        actor: aberp_inventory::ActorKind::SpaOperator {
+            operator_login: operator_login.to_string(),
+        },
+        ledger_meta: &ledger_meta,
+        ledger_actor,
+    };
+    let outcome = aberp_dispatch::cancel_dispatch(&tx, &ctx, dsp_id).map_err(map_dispatch_err)?;
+    tx.commit()
+        .context("commit cancel_dispatch transaction")
+        .map_err(WorkOrderRouteError::Other)?;
+    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    Ok(outcome)
 }
 
 /// Best-effort audit-mirror sync after a successful write transaction.

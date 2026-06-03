@@ -694,6 +694,84 @@ pub async fn decide_qa_inspection(
     forward_post(&state, &path, body).await
 }
 
+// ── S234 / PR-230 / ADR-0064 — Stage 3 Phase γ Dispatch board v1 ────
+
+/// S234 — `GET /api/dispatches[?state=&limit=&offset=]`. The Dispatch
+/// board tab reads here. `state` is closed-vocab `DispatchState`
+/// storage string (drafted/shipped/cancelled).
+#[tauri::command]
+pub async fn list_dispatches(
+    state: State<'_, AppState>,
+    state_filter: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Value, String> {
+    let mut path = String::from("/api/dispatches?");
+    if let Some(s) = state_filter {
+        path.push_str(&format!("state={s}&"));
+    }
+    if let Some(n) = limit {
+        path.push_str(&format!("limit={n}&"));
+    }
+    if let Some(n) = offset {
+        path.push_str(&format!("offset={n}"));
+    }
+    forward_get(&state, &path, true).await
+}
+
+/// S234 — `GET /api/dispatches/:id`.
+#[tauri::command]
+pub async fn get_dispatch(state: State<'_, AppState>, dsp_id: String) -> Result<Value, String> {
+    validate_qa_or_routing_op_id(&dsp_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/dispatches/{dsp_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// S234 — `GET /api/dispatches/eligible-work-orders[?limit=]`. The
+/// SPA's "Ready to dispatch" panel reads here.
+#[tauri::command]
+pub async fn list_eligible_work_orders(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+) -> Result<Value, String> {
+    let mut path = String::from("/api/dispatches/eligible-work-orders?");
+    if let Some(n) = limit {
+        path.push_str(&format!("limit={n}"));
+    }
+    forward_get(&state, &path, true).await
+}
+
+/// S234 — `POST /api/dispatches`. Body shape: `{ wo_id, partner_id,
+/// notes?, idempotency_key }`. Refuses ineligible WO + duplicate-for-WO
+/// loud per ADR-0064 §2.
+#[tauri::command]
+pub async fn create_dispatch(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/dispatches", body).await
+}
+
+/// S234 — `POST /api/dispatches/:id/ship`. Body shape: `{ carrier_kind,
+/// tracking_number?, shipped_at?, idempotency_key }`. Atomic per
+/// ADR-0064 §4 + §5 + invariant #1.
+#[tauri::command]
+pub async fn mark_dispatch_shipped(
+    state: State<'_, AppState>,
+    dsp_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_qa_or_routing_op_id(&dsp_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/dispatches/{dsp_id}/ship");
+    forward_post(&state, &path, body).await
+}
+
+/// S234 — `POST /api/dispatches/:id/cancel`. Body is empty (the cancel
+/// action carries no operator-typed data per ADR-0064 §7).
+#[tauri::command]
+pub async fn cancel_dispatch(state: State<'_, AppState>, dsp_id: String) -> Result<Value, String> {
+    validate_qa_or_routing_op_id(&dsp_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/dispatches/{dsp_id}/cancel");
+    forward_post(&state, &path, serde_json::json!({})).await
+}
+
 /// PR-72 / session-94 — `GET /api/seller/banks`. Used by the SPA's
 /// Tenant Settings page (bank-accounts subsection) + the
 /// SellerConfigWizard's multi-row block to render the current

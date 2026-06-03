@@ -93,6 +93,14 @@ aberp-work-orders = { path = "../../crates/aberp-work-orders" }
 # owns the boot-time schema-ensure call + the QA list / detail /
 # decision routes + the per-routing-op Complete transition route.
 aberp-qa = { path = "../../crates/aberp-qa" }
+# S234 / PR-230 — Stage 3 Phase γ Dispatch board v1 (ADR-0064). The
+# binary owns the boot-time schema-ensure call + the dispatch list /
+# detail / create / mark-shipped / cancel routes + the eligible-WO
+# read route. Closes the Stage 3 → Stage 1 loop. v1 production wires
+# the `NoopInvoiceSpawner` per the PR-230 body's [[pushback-as-method]]
+# divergence from ADR-0064 §5; PR-230b will land the sync billing
+# extraction + the real spawner.
+aberp-dispatch = { path = "../../crates/aberp-dispatch" }
 # PR-44γ — decimal arithmetic for the EUR→HUF round-half-even
 # conversion at the CLI boundary (the `aberp-billing` module is the
 # arithmetic owner; the binary needs the type for the

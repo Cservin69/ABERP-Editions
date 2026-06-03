@@ -71,6 +71,7 @@ members = [
     "crates/aberp-inventory",
     "crates/aberp-work-orders",
     "crates/aberp-qa",
+    "crates/aberp-dispatch",
     "crates/invoice-pdf",
     "crates/mnb-rates",
     "crates/nav-transport",

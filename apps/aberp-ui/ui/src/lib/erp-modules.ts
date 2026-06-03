@@ -132,8 +132,10 @@ export const MODULES: ErpModule[] = [
   // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Production module
   // (Work Orders v1). Operational area — the daily-driver shop-floor
   // workflow. S233 / PR-229 / ADR-0063 added the QA queue route
-  // alongside Work orders; future Dispatch (ADR-0064) extends this
-  // module additively.
+  // alongside Work orders; S234 / PR-230 / ADR-0064 adds Dispatch
+  // (closes the Stage 3 → Stage 1 loop). All four sub-routes hang
+  // off the same Production module; the operator's mental model is
+  // "production workflow" not "four separate apps."
   {
     id: "production",
     area: "operational",
@@ -143,6 +145,7 @@ export const MODULES: ErpModule[] = [
     routes: [
       { id: "work-orders", label: "Work orders" },
       { id: "qa", label: "QA queue" },
+      { id: "dispatch", label: "Dispatch" },
     ],
   },
   {

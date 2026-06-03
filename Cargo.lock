@@ -8,6 +8,7 @@ version = "0.0.0"
 dependencies = [
  "aberp-audit-ledger",
  "aberp-billing",
+ "aberp-dispatch",
  "aberp-inventory",
  "aberp-invoice-pdf",
  "aberp-mes",
@@ -73,6 +74,25 @@ dependencies = [
 name = "aberp-billing"
 version = "0.0.0"
 dependencies = [
+ "duckdb",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "time",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
+name = "aberp-dispatch"
+version = "0.0.0"
+dependencies = [
+ "aberp-audit-ledger",
+ "aberp-inventory",
+ "aberp-qa",
+ "aberp-work-orders",
+ "anyhow",
  "duckdb",
  "rust_decimal",
  "serde",

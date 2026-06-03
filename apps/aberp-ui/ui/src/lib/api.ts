@@ -1856,6 +1856,124 @@ export async function decideQaInspection(
   });
 }
 
+// ── S234 / PR-230 / ADR-0064 — Stage 3 Phase γ Dispatch board v1 ────
+
+/** S234 — closed-vocab dispatch state per ADR-0064 §1. Snake_case
+ * storage strings match `aberp_dispatch::DispatchState::as_str`. */
+export type DispatchState = "drafted" | "shipped" | "cancelled";
+
+/** S234 — closed-vocab carrier per ADR-0064 §1. Snake_case storage
+ * strings match `aberp_dispatch::CarrierKind::as_str`. New carriers
+ * go in by enum extension; free text is refused at the wire boundary
+ * per ADR-0064 §"Invariants pinned" #8. */
+export type CarrierKind =
+  | "self_delivery"
+  | "customer_pickup"
+  | "magyar_posta"
+  | "gls"
+  | "dpd"
+  | "foxpost"
+  | "other";
+
+/** S234 — one row from `dispatches`. Snake_case JSON mirror of
+ * `aberp_dispatch::Dispatch`. */
+export interface Dispatch {
+  dsp_id: string;
+  wo_id: string;
+  partner_id: string;
+  state: DispatchState;
+  created_at: string;
+  shipped_at: string | null;
+  cancelled_at: string | null;
+  carrier_kind: CarrierKind | null;
+  tracking_number: string | null;
+  spawned_invoice_id: string | null;
+  notes: string | null;
+}
+
+/** S234 — one row from the eligible-WO read view per ADR-0064 §2. */
+export interface EligibleWorkOrder {
+  wo_id: string;
+  wo_number: string;
+  product_id: string;
+  qty_target: string;
+  completed_at: string;
+}
+
+/** S234 — `POST /api/dispatches` body. */
+export interface CreateDispatchBody {
+  wo_id: string;
+  partner_id: string;
+  notes?: string | null;
+  idempotency_key: string;
+}
+
+/** S234 — `POST /api/dispatches/:id/ship` body. */
+export interface MarkDispatchShippedBody {
+  carrier_kind: CarrierKind;
+  tracking_number?: string | null;
+  shipped_at?: string | null;
+  idempotency_key: string;
+}
+
+/** S234 — `POST /api/dispatches/:id/ship` response. */
+export interface MarkDispatchShippedResponse {
+  dispatch: Dispatch;
+  /** `Some(invoice_id)` when the injected spawner produced a draft;
+   * `null` for the v1 NoopInvoiceSpawner posture pending PR-230b. */
+  spawned_invoice_id: string | null;
+  stock_movement_id: string;
+}
+
+/** S234 — `GET /api/dispatches[?state=&limit=&offset=]`. */
+export async function listDispatches(
+  stateFilter?: DispatchState | null,
+  limit?: number,
+  offset?: number,
+): Promise<Dispatch[]> {
+  return invoke<Dispatch[]>("list_dispatches", {
+    stateFilter: stateFilter ?? null,
+    limit: limit ?? null,
+    offset: offset ?? null,
+  });
+}
+
+/** S234 — `GET /api/dispatches/:id`. */
+export async function getDispatch(dspId: string): Promise<Dispatch> {
+  return invoke<Dispatch>("get_dispatch", { dspId });
+}
+
+/** S234 — `GET /api/dispatches/eligible-work-orders[?limit=]`. */
+export async function listEligibleWorkOrders(
+  limit?: number,
+): Promise<EligibleWorkOrder[]> {
+  return invoke<EligibleWorkOrder[]>("list_eligible_work_orders", {
+    limit: limit ?? null,
+  });
+}
+
+/** S234 — `POST /api/dispatches`. */
+export async function createDispatch(body: CreateDispatchBody): Promise<Dispatch> {
+  return invoke<Dispatch>("create_dispatch", { body });
+}
+
+/** S234 — `POST /api/dispatches/:id/ship`. Atomic per ADR-0064 §4 +
+ * §5 + invariant #1. */
+export async function markDispatchShipped(
+  dspId: string,
+  body: MarkDispatchShippedBody,
+): Promise<MarkDispatchShippedResponse> {
+  return invoke<MarkDispatchShippedResponse>("mark_dispatch_shipped", {
+    dspId,
+    body,
+  });
+}
+
+/** S234 — `POST /api/dispatches/:id/cancel`. Valid only from Drafted. */
+export async function cancelDispatch(dspId: string): Promise<Dispatch> {
+  return invoke<Dispatch>("cancel_dispatch", { dspId });
+}
+
 // ── S233 / PR-229 Part A — per-routing-op Complete cascade ──────────
 
 /** S233 — closed-vocab per-op action; v1 just `complete`. */

@@ -74,6 +74,9 @@
   import WorkOrdersList from "./routes/WorkOrdersList.svelte";
   // S233 / PR-229 / ADR-0063 — Stage 3 Phase γ QA queue v1 SPA tab.
   import QaList from "./routes/QaList.svelte";
+  // S234 / PR-230 / ADR-0064 — Stage 3 Phase γ Dispatch board v1 SPA
+  // tab. Closes the Stage 3 → Stage 1 loop.
+  import DispatchList from "./routes/DispatchList.svelte";
   // S180 / PR-180 — NAV-as-DR restore wizard, mounted at
   // `#/restore-from-nav` under the maintenance area.
   import RestoreFromNavWizard from "./routes/RestoreFromNavWizard.svelte";
@@ -522,6 +525,8 @@
           <WorkOrdersList />
         {:else if route === "qa"}
           <QaList />
+        {:else if route === "dispatch"}
+          <DispatchList />
         {:else if route === "statistics"}
           <StatisticsPage />
         {:else if route === "maintenance"}

@@ -947,6 +947,45 @@ pub enum EventKind {
     ///
     /// F12 four-edit ritual fires once.
     QaInspectionDecided,
+
+    /// S234 / PR-230 / ADR-0064 — one Drafted `dispatches` row was
+    /// created by an operator (or future adapter) against a Completed
+    /// work order. ONE entry per dispatch at create time; carries
+    /// `dsp_id`, `wo_id`, `partner_id`, the `actor` (operator login or
+    /// `adapter:<name>` or `system` per [[s232-work-order-cascade]]'s
+    /// `ActorKind` pattern), and the F8 idempotency key.
+    ///
+    /// `mes.` prefix per ADR-0064 §6 — Stage 3 modules (Inventory, Work
+    /// Orders, QA, Dispatch) share the family. Keeps the per-OUTGOING-
+    /// invoice export bundle's `invoice.*` glob narrow and `system.*`
+    /// consumers untouched.
+    ///
+    /// F12 four-edit ritual fires once.
+    DispatchCreated,
+
+    /// S234 / PR-230 / ADR-0064 — a Drafted dispatch was flipped to
+    /// Shipped. ONE entry per `mark_shipped` call. Carries `dsp_id`,
+    /// `wo_id`, `partner_id`, the operator-picked `carrier_kind`
+    /// (closed-vocab `CarrierKind`), the optional `tracking_number`,
+    /// `shipped_at`, the optional `spawned_invoice_id` (Some(_) when
+    /// the injected `InvoiceSpawner` produced a draft in the same tx;
+    /// None for the v1 [[NoopInvoiceSpawner]] posture pending PR-230b's
+    /// sync billing extraction), the `actor`, and the F8 idempotency
+    /// key.
+    ///
+    /// Per ADR-0064 §5 + §"Invariants pinned" #1 this entry lands in
+    /// the SAME transaction as the dispatch state flip, the
+    /// `stock_movements` row, and the `spawned_invoice_id` UPDATE. The
+    /// audit-trail walks both ways: from dispatch to invoice via this
+    /// payload's `spawned_invoice_id`; from the invoice draft's own
+    /// `InvoiceDraftCreated` entry back to the dispatch via the
+    /// invoice idempotency-key suffix (`derive_from(dispatch.dsp_id,
+    /// "spawn_invoice")`).
+    ///
+    /// `mes.` prefix per ADR-0064 §6.
+    ///
+    /// F12 four-edit ritual fires once.
+    DispatchShipped,
 }
 
 impl EventKind {
@@ -1001,6 +1040,8 @@ impl EventKind {
             EventKind::RoutingOpStateChanged => "mes.routing_op_state_changed",
             EventKind::QaInspectionCreated => "mes.qa_inspection_created",
             EventKind::QaInspectionDecided => "mes.qa_inspection_decided",
+            EventKind::DispatchCreated => "mes.dispatch_created",
+            EventKind::DispatchShipped => "mes.dispatch_shipped",
         }
     }
 
@@ -1066,6 +1107,8 @@ impl EventKind {
             "mes.routing_op_state_changed" => Ok(EventKind::RoutingOpStateChanged),
             "mes.qa_inspection_created" => Ok(EventKind::QaInspectionCreated),
             "mes.qa_inspection_decided" => Ok(EventKind::QaInspectionDecided),
+            "mes.dispatch_created" => Ok(EventKind::DispatchCreated),
+            "mes.dispatch_shipped" => Ok(EventKind::DispatchShipped),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1123,6 +1166,8 @@ mod tests {
             EventKind::RoutingOpStateChanged,
             EventKind::QaInspectionCreated,
             EventKind::QaInspectionDecided,
+            EventKind::DispatchCreated,
+            EventKind::DispatchShipped,
         ];
         for v in variants {
             let s = v.as_str();
@@ -2003,6 +2048,49 @@ mod tests {
             assert_ne!(k, EventKind::WorkOrderCreated.as_str());
             assert_ne!(k, EventKind::WorkOrderStateChanged.as_str());
             assert_ne!(k, EventKind::RoutingOpStateChanged.as_str());
+        }
+    }
+
+    /// S234 / PR-230 / ADR-0064 — the two Dispatch-board kinds use the
+    /// `mes.*` prefix family alongside the Inventory / WO / QA kinds.
+    /// MUST NOT start with `invoice.` or `system.` so the per-OUTGOING-
+    /// invoice export bundle's `invoice.*` glob never sweeps dispatch
+    /// traffic and existing `system.*` consumers stay narrow.
+    #[test]
+    fn s234_dispatch_kinds_use_mes_prefix() {
+        for k in [EventKind::DispatchCreated, EventKind::DispatchShipped] {
+            let s = k.as_str();
+            assert!(s.starts_with("mes."), "{s} must start with mes.");
+            assert!(
+                !s.starts_with("invoice."),
+                "{s} must not start with invoice."
+            );
+            assert!(!s.starts_with("system."), "{s} must not start with system.");
+        }
+        // Exact storage strings per ADR-0064 §6 table.
+        assert_eq!(EventKind::DispatchCreated.as_str(), "mes.dispatch_created");
+        assert_eq!(EventKind::DispatchShipped.as_str(), "mes.dispatch_shipped");
+    }
+
+    /// S234 / PR-230 / ADR-0064 — the two Dispatch-board kinds are
+    /// distinct from each other and from every prior `mes.*` kind.
+    /// Catches a future refactor accidentally collapsing two `mes.*`
+    /// kinds onto one storage string.
+    #[test]
+    fn s234_dispatch_kinds_are_distinct() {
+        let dsp = [
+            EventKind::DispatchCreated.as_str(),
+            EventKind::DispatchShipped.as_str(),
+        ];
+        assert_ne!(dsp[0], dsp[1]);
+        for k in dsp {
+            assert_ne!(k, EventKind::MesAdapterEvent.as_str());
+            assert_ne!(k, EventKind::StockMovementRecorded.as_str());
+            assert_ne!(k, EventKind::WorkOrderCreated.as_str());
+            assert_ne!(k, EventKind::WorkOrderStateChanged.as_str());
+            assert_ne!(k, EventKind::RoutingOpStateChanged.as_str());
+            assert_ne!(k, EventKind::QaInspectionCreated.as_str());
+            assert_ne!(k, EventKind::QaInspectionDecided.as_str());
         }
     }
 

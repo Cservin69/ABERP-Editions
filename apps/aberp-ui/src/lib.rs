@@ -308,6 +308,13 @@ pub fn run() {
             commands::list_qa_inspections,
             commands::get_qa_inspection,
             commands::decide_qa_inspection,
+            // S234 / PR-230 / ADR-0064 — Stage 3 Phase γ Dispatch board v1.
+            commands::list_dispatches,
+            commands::get_dispatch,
+            commands::list_eligible_work_orders,
+            commands::create_dispatch,
+            commands::mark_dispatch_shipped,
+            commands::cancel_dispatch,
             commands::list_seller_banks,
             commands::create_seller_bank,
             commands::update_seller_bank,

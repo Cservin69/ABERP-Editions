@@ -84,6 +84,9 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   "work-orders": "production",
   // S233 / PR-229 / ADR-0063 — QA queue route lives in the same module.
   qa: "production",
+  // S234 / PR-230 / ADR-0064 — Dispatch board lives in the same module
+  // (closes the Stage 3 → Stage 1 loop).
+  dispatch: "production",
   tenant: "settings",
   "nav-credentials": "settings",
   // S180 / PR-180 — NAV-as-DR restore wizard, settings-grouped.
@@ -106,6 +109,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   // shop-floor workflow). S233 added QA queue alongside.
   "work-orders": "operational",
   qa: "operational",
+  // S234 / PR-230 / ADR-0064 — Dispatch board (operational).
+  dispatch: "operational",
   tenant: "maintenance",
   "nav-credentials": "maintenance",
   maintenance: "maintenance",

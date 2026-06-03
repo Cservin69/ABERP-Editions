@@ -1,0 +1,62 @@
+[package]
+name = "aberp-dispatch"
+description = "ABERP Stage 3 Phase γ Dispatch board v1 (S234 / PR-230 / ADR-0064) — one-dispatch-per-completed-WO, closed-vocab CarrierKind, Mark-Shipped emits one Dispatch stock_movement and (via injected spawner) the Stage 1 invoice draft — all in the caller-owned transaction. Closes the Stage 3 → Stage 1 loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_dispatch"
+path = "src/lib.rs"
+
+[dependencies]
+# Audit-ledger F8 cross-crate writer per ADR-0064 §6 — both
+# `create_dispatch` and `mark_shipped` emit one audit entry inside the
+# caller-owned transaction. Same posture as aberp-inventory /
+# aberp-work-orders / aberp-qa.
+aberp-audit-ledger = { path = "../audit-ledger" }
+
+# ADR-0064 §4 — `mark_shipped` emits one `Dispatch` stock_movement via
+# the inventory module's existing `record_movement` surface. Also reuses
+# `ActorKind` so the dispatch handler signatures match the
+# `aberp_work_orders::WoWriteContext` / `aberp_qa::QaWriteContext`
+# pattern. Same posture as aberp-qa's inventory dep.
+aberp-inventory = { path = "../aberp-inventory" }
+
+# Read `work_orders.state` + `work_orders.product_id` + `work_orders.qty_target`
+# directly via SQL inside the supplied transaction. NO dep on
+# aberp-work-orders to avoid a cycle (work-orders depends on aberp-qa
+# which depends on the inventory crate; future evolutions may have
+# work-orders → dispatch hooks, so the dep is one-way: dispatch reads
+# the WO table contract directly). Same posture aberp-qa uses.
+duckdb = { workspace = true }
+
+rust_decimal = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# RFC3339 stamps for created_at / shipped_at.
+time = { workspace = true }
+
+# ULID for dsp_id (`dsp_<ULID>`).
+ulid = { workspace = true }
+
+# Diagnostic logging.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Round-trip tests exercise WO creation through the real WO crate so the
+# eligibility gate (WO state=Completed AND no prior dispatch) reflects
+# the actual production schema, not a hand-rolled fake. Dev-dep only so
+# the production dep graph stays one-way (dispatch reads WO via SQL).
+aberp-work-orders = { path = "../aberp-work-orders" }
+aberp-qa = { path = "../aberp-qa" }
+aberp-audit-ledger = { path = "../audit-ledger", features = ["test-support"] }

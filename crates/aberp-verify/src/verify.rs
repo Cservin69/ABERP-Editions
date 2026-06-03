@@ -832,7 +832,16 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // the per-OUTGOING-invoice bundle by the `invoice.*` glob;
         // this arm exists for exhaustiveness only.
         | EventKind::QaInspectionCreated
-        | EventKind::QaInspectionDecided => (None, ""),
+        | EventKind::QaInspectionDecided
+        // S234 / PR-230 / ADR-0064 — Dispatch-board events. `mes.*`
+        // family per ADR-0064 §6; dispatches belong to work orders on
+        // the manufacturing side, never to an outgoing invoice. The
+        // `spawned_invoice_id` field on `DispatchShipped` points AT a
+        // Stage 1 invoice draft but does NOT carry NAV bytes itself.
+        // Excluded from the per-OUTGOING-invoice bundle by the
+        // `invoice.*` glob; this arm exists for exhaustiveness only.
+        | EventKind::DispatchCreated
+        | EventKind::DispatchShipped => (None, ""),
     };
 
     Ok(NavExtraction {
