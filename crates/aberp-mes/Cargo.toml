@@ -1,0 +1,52 @@
+[package]
+name = "aberp-mes"
+description = "Stage 3 manufacturing-execution adapter framework — canonical event vocabulary + Adapter trait + AdapterRegistry + audit-ledger integration (PR-224 / ADR-0060, Phase α). No real hardware code lands here; Phase β picks the first adapter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_mes"
+path = "src/lib.rs"
+
+[dependencies]
+# Trait machinery — async-fn-in-trait that stays dyn-compatible per
+# ADR-0060 §"Why #[async_trait] rather than native AFIT". Same crate
+# every other ABERP async trait uses.
+async-trait = { workspace = true }
+
+# Async runtime — broadcast channel for per-adapter event fan-out per
+# ADR-0006 §"Event bus" Phase 1 + ADR-0060 §"Why broadcast over mpsc".
+tokio = { workspace = true }
+
+# Error machinery — same crate every other ABERP crate uses.
+thiserror = { workspace = true }
+
+# Canonical-event serialization — JSON for the audit-ledger payload bytes
+# (matches QuoteIntakePollPayload posture per S210 / PR-204).
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Audit-ledger writer surface — append_in_tx + EventKind::MesAdapterEvent
+# per ADR-0060 §"Audit-ledger integration".
+aberp-audit-ledger = { path = "../audit-ledger" }
+
+# DuckDB Transaction is the type signature of write_mes_adapter_event —
+# regular (not dev-only) dep because the audit-ledger writer surface
+# rides the caller's `&Transaction<'_>` per ADR-0008 §"Storage". Same
+# posture as `aberp-quote-intake::audit::write_poll_audit_entry`.
+duckdb = { workspace = true }
+
+[dev-dependencies]
+# tokio test utilities — turn-on the test-util feature to drive paused
+# clocks in lifecycle tests.
+tokio = { workspace = true, features = ["test-util"] }
+
+# time / ulid — needed by the audit-ledger integration test that
+# constructs an Entry through the same surface aberp-quote-intake uses.
+time = { workspace = true }
+ulid = { workspace = true }

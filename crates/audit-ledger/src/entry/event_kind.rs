@@ -803,6 +803,46 @@ pub enum EventKind {
     /// bundle's `invoice.*` glob MUST NEVER sweep this (same posture
     /// as `InvoiceRestoredFromNav`). F12 four-edit ritual fires once.
     ExtNavPartnerManualLink,
+
+    /// S228 / PR-224 / ADR-0060 — a `CanonicalEvent` emitted by a
+    /// registered Stage 3 adapter (manufacturing execution: CNC /
+    /// robot / Renishaw / barcode / laser) was recorded into the
+    /// audit ledger. ONE kind for ALL canonical event subtypes per
+    /// ADR-0060 §"One EventKind for all MES events is too coarse —
+    /// how does the operator filter the audit ledger?" — the
+    /// payload's `event.type` discriminator (visible via
+    /// `json_extract`) is the SPA / SQL filter handle.
+    ///
+    /// **New prefix family `mes.`** — a third prefix alongside
+    /// `invoice.*` (per outgoing-invoice surface) and `system.*`
+    /// (everything else system-lifecycle). Future Stage 3 sub-surfaces
+    /// (e.g. an adapter-registered event distinct from
+    /// per-event-recording) stay under `mes.*`. Rationale per
+    /// ADR-0060 §"Storage prefix `mes.`": segregation keeps each
+    /// existing prefix consumer's glob narrow; `system.*` consumers
+    /// (per-OUTGOING-invoice export bundle's exclusion glob, the
+    /// AP-side query helpers) don't get accidentally swept by Stage 3
+    /// traffic.
+    ///
+    /// Payload (`aberp_mes::MesAdapterEventPayload` in the
+    /// `aberp-mes` crate) carries the emitting adapter's `name`, the
+    /// operator-decision idempotency key, and the typed
+    /// `CanonicalEvent` (one of six initial variants: `PartMoved` /
+    /// `MachineStateChanged` / `QualityResultReceived` /
+    /// `ScanReceived` / `WorkOrderStateChanged` / `RobotTaskQueued`).
+    /// Future canonical event variants extend `CanonicalEvent`
+    /// without touching this `EventKind` — the audit-ledger crate
+    /// stays small.
+    ///
+    /// **Phase α scope-cap.** Phase α (PR-224) defines this variant
+    /// and the payload contract; the runtime task that subscribes to
+    /// the per-adapter broadcast streams and actually writes ledger
+    /// entries lands in Phase β alongside the first real adapter
+    /// implementation. The audit-ledger surface is the load-bearing
+    /// pin — adding the runtime later is additive.
+    ///
+    /// F12 four-edit ritual fires once.
+    MesAdapterEvent,
 }
 
 impl EventKind {
@@ -850,6 +890,7 @@ impl EventKind {
                 "system.restore_buyer_backfill_cycle_completed"
             }
             EventKind::ExtNavPartnerManualLink => "system.extnav_partner_manual_link",
+            EventKind::MesAdapterEvent => "mes.adapter_event",
         }
     }
 
@@ -908,6 +949,7 @@ impl EventKind {
                 Ok(EventKind::RestoreBuyerBackfillCycleCompleted)
             }
             "system.extnav_partner_manual_link" => Ok(EventKind::ExtNavPartnerManualLink),
+            "mes.adapter_event" => Ok(EventKind::MesAdapterEvent),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -958,6 +1000,7 @@ mod tests {
             EventKind::DaemonShutdownCompleted,
             EventKind::RestoreBuyerBackfillCycleCompleted,
             EventKind::ExtNavPartnerManualLink,
+            EventKind::MesAdapterEvent,
         ];
         for v in variants {
             let s = v.as_str();
@@ -1605,6 +1648,66 @@ mod tests {
         assert!(!EventKind::ExtNavPartnerManualLink
             .as_str()
             .starts_with("invoice."));
+    }
+
+    /// S228 / PR-224 / ADR-0060 — the Stage 3 manufacturing-execution
+    /// event kind. **New prefix family `mes.`** per ADR-0060 §"Storage
+    /// prefix `mes.`": a third prefix alongside `invoice.*` (per
+    /// outgoing-invoice surface) and `system.*` (everything else
+    /// system-lifecycle). MUST NOT start with `invoice.` (would be
+    /// silently swept into per-OUTGOING-invoice export bundles, which
+    /// is a category error — Stage 3 events have no `inv_<ULID>` to
+    /// belong to) and MUST NOT start with `system.` (would force every
+    /// existing `system.*` consumer to learn the difference between
+    /// "AP sync cycle completed" and "robot arm reported position").
+    /// Future Stage 3 sub-surfaces (e.g. an adapter-registered event
+    /// distinct from per-event-recording) stay under `mes.*` so the
+    /// segregation holds.
+    #[test]
+    fn s228_mes_adapter_event_uses_mes_prefix() {
+        assert_eq!(EventKind::MesAdapterEvent.as_str(), "mes.adapter_event");
+        assert!(EventKind::MesAdapterEvent.as_str().starts_with("mes."));
+        assert!(!EventKind::MesAdapterEvent.as_str().starts_with("invoice."));
+        assert!(!EventKind::MesAdapterEvent.as_str().starts_with("system."));
+    }
+
+    /// S228 / PR-224 / ADR-0060 — the MES adapter-event kind MUST be
+    /// distinct from every prior cycle/observation/operator-decision
+    /// kind. Same fork-discipline posture as
+    /// `s210_quote_intake_poll_completed_is_distinct` /
+    /// `s180_invoice_restored_from_nav_is_distinct_from_ap_kinds`.
+    /// One MesAdapterEvent vs. an existing `system.*` kind would
+    /// collapse two semantically distinct event families into one
+    /// classifier — exactly the failure mode the prefix-fork
+    /// discipline guards against.
+    #[test]
+    fn s228_mes_adapter_event_is_distinct() {
+        assert_ne!(
+            EventKind::MesAdapterEvent.as_str(),
+            EventKind::QuoteIntakePollCompleted.as_str()
+        );
+        assert_ne!(
+            EventKind::MesAdapterEvent.as_str(),
+            EventKind::IncomingInvoiceSyncCycleCompleted.as_str()
+        );
+        assert_ne!(
+            EventKind::MesAdapterEvent.as_str(),
+            EventKind::DaemonShutdownCompleted.as_str()
+        );
+        assert_ne!(
+            EventKind::MesAdapterEvent.as_str(),
+            EventKind::InvoiceRestoredFromNav.as_str()
+        );
+        // And distinct from every invoice-prefixed kind too — Stage 3
+        // events have no invoice surface to collapse onto.
+        assert_ne!(
+            EventKind::MesAdapterEvent.as_str(),
+            EventKind::InvoiceDraftCreated.as_str()
+        );
+        assert_ne!(
+            EventKind::MesAdapterEvent.as_str(),
+            EventKind::InvoicePaymentRecorded.as_str()
+        );
     }
 
     /// S220 / PR-217 — the two new kinds must be distinct from every

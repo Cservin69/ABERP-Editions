@@ -1,6 +1,11 @@
 # ABERP workspace.
 #
 # Members:
+#   crates/aberp-mes         - Stage 3 manufacturing adapter framework
+#                              (ADR-0059, PR-224). Phase α skeleton — canonical
+#                              event vocabulary + Adapter trait + AdapterRegistry
+#                              + audit-ledger integration. No real hardware code;
+#                              Phase β lands the first adapter (likely barcode).
 #   crates/audit-ledger      - tamper-evident hash-chained audit ledger (ADR-0008).
 #   crates/aberp-verify      - bundle verifier CLI (ADR-0035, PR-22) — re-verifies
 #                              a per-invoice export bundle from its own bytes alone;
@@ -45,6 +50,7 @@ members = [
     "crates/audit-ledger",
     "crates/aberp-verify",
     "crates/aberp-quote-intake",
+    "crates/aberp-mes",
     "crates/invoice-pdf",
     "crates/mnb-rates",
     "crates/nav-transport",

@@ -680,7 +680,15 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // restored ExtNav row. The restored row lives in
         // `restored_invoice` (not `invoice`); annotations against
         // it never belong in a per-OUTGOING-invoice export bundle.
-        | EventKind::ExtNavPartnerManualLink => None,
+        | EventKind::ExtNavPartnerManualLink
+        // S228 / PR-224 / ADR-0060 — Stage 3 manufacturing-execution
+        // adapter event. `mes.`-prefixed (a third prefix family
+        // alongside `invoice.*` and `system.*`); shop-floor events
+        // belong to machines / parts / work orders, never to an
+        // outgoing invoice. The per-OUTGOING-invoice bundle's
+        // `invoice.*` glob excludes them anyway; the exhaustive match
+        // requires acknowledgement here.
+        | EventKind::MesAdapterEvent => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

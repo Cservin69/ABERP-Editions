@@ -1,7 +1,30 @@
 # Stage 3 manufacturing integration — research package
 
-**Status**: preparatory research. **Not** an architecture decision, **not** a roadmap commitment.
-**Authored**: 2026-06-02. **Audience**: future-Ervin and future-Dispatch sessions doing Stage 3 work.
+**Status**: preparatory research. The Phase α framework decision **has** since
+landed — see [ADR-0060](../../../adr/0060-stage3-manufacturing-adapter-framework.md)
+(PR-224 / S228, 2026-06-03) — but the per-protocol / per-vendor surveys in
+this package remain pre-commitment research until a real adapter for that
+vendor ships. **Authored**: 2026-06-02 (framework-α update: 2026-06-03).
+**Audience**: future-Ervin and future-Dispatch sessions doing Stage 3 work.
+
+## Framework α landed (2026-06-03)
+
+PR-224 / S228 shipped the framework skeleton: the `crates/aberp-mes/` crate
+with the canonical event vocabulary (`PartMoved`, `MachineStateChanged`,
+`QualityResultReceived`, `ScanReceived`, `WorkOrderStateChanged`,
+`RobotTaskQueued`), the `Adapter` trait, the `AdapterRegistry`, the
+`NoopAdapter` reference impl, and the audit-ledger integration
+(`EventKind::MesAdapterEvent`, storage string `mes.adapter_event` — a third
+prefix family alongside `invoice.*` and `system.*`). **No real hardware
+adapter** lives there yet — `NoopAdapter` is the only impl. Phase β picks the
+first real adapter; the README's standing recommendation of "barcode scanner
+first" still stands.
+
+The architectural decision behind that framework is
+[ADR-0060](../../../adr/0060-stage3-manufacturing-adapter-framework.md).
+Read it before any Phase β work — the trait shape, the canonical vocabulary,
+and the audit-ledger prefix family are now load-bearing contracts, not
+research starting points.
 
 ## Why this exists
 

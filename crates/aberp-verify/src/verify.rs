@@ -799,7 +799,16 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // S220 / PR-217 — operator-paced manual partner link on a
         // restored row. `system.`-scoped; the payload is an
         // operator-decision record, no NAV bytes.
-        | EventKind::ExtNavPartnerManualLink => (None, ""),
+        | EventKind::ExtNavPartnerManualLink
+        // S228 / PR-224 / ADR-0060 — Stage 3 manufacturing-execution
+        // adapter event. `mes.`-prefixed (not invoice / not system —
+        // a third prefix family); the payload carries the canonical
+        // event subtype + adapter name, no NAV bytes. The `mes.*`
+        // prefix means these entries never enter a per-outgoing-
+        // invoice export bundle in the first place (the bundle
+        // writer's `invoice.*` glob excludes them), but the
+        // exhaustive match still requires acknowledgement here.
+        | EventKind::MesAdapterEvent => (None, ""),
     };
 
     Ok(NavExtraction {

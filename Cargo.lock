@@ -93,6 +93,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aberp-mes"
+version = "0.0.0"
+dependencies = [
+ "aberp-audit-ledger",
+ "async-trait",
+ "duckdb",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
 name = "aberp-mnb-rates"
 version = "0.0.0"
 dependencies = [
