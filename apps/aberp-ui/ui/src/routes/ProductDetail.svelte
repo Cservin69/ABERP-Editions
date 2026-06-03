@@ -521,10 +521,10 @@
     max-height: 90vh;
     overflow-y: auto;
     padding: var(--space-4);
-    border: none;
+    border: 1px solid var(--color-surface-divider);
     border-radius: var(--radius-md, 8px);
-    background: var(--color-surface, white);
-    color: var(--color-text-strong, #111);
+    background: var(--color-surface-base);
+    color: var(--color-text-primary);
   }
 
   .product-detail__head {
@@ -551,7 +551,7 @@
   }
 
   .product-detail__error {
-    color: var(--color-danger, #b00020);
+    color: var(--color-signal-negative);
     font-size: var(--type-size-sm, 0.9rem);
   }
 
@@ -582,9 +582,9 @@
     margin-left: var(--space-2);
   }
   .chip--low-stock {
-    background: var(--color-danger-bg, #fdecec);
-    color: var(--color-danger, #b00020);
-    border: 1px solid var(--color-danger, #b00020);
+    background: var(--color-surface-raised);
+    color: var(--color-signal-negative);
+    border: 1px solid var(--color-signal-negative);
   }
 
   .movement-form {
@@ -611,10 +611,11 @@
   .movement-form__field input,
   .movement-form__field select {
     padding: 6px 8px;
-    border: 1px solid var(--color-border, #ccc);
+    border: 1px solid var(--color-surface-divider);
     border-radius: 4px;
-    background: var(--color-surface, white);
-    color: var(--color-text-strong, #111);
+    background: var(--color-surface-base);
+    color: var(--color-text-strong);
+    font-family: var(--type-family-mono);
   }
   .movement-form__actions {
     grid-column: 1 / -1;
@@ -630,8 +631,15 @@
   .ledger-table th,
   .ledger-table td {
     padding: 6px 8px;
-    border-bottom: 1px solid var(--color-border, #eee);
+    border-bottom: 1px solid var(--color-surface-divider);
     text-align: left;
+  }
+  .ledger-table thead th {
+    color: var(--color-text-secondary);
+    font-weight: 500;
+  }
+  .ledger-table tbody td {
+    color: var(--color-text-primary);
   }
   .ledger-table th.num,
   .ledger-table td.num {
@@ -641,15 +649,16 @@
     font-family: var(--type-family-mono, monospace);
   }
   .negative {
-    color: var(--color-danger, #b00020);
+    color: var(--color-signal-negative);
   }
   .page__primary {
     padding: 8px 14px;
     border-radius: 4px;
-    background: var(--color-primary, #1769aa);
-    color: var(--color-on-primary, white);
+    background: var(--color-signal-positive);
+    color: var(--color-surface-base);
     border: none;
     cursor: pointer;
+    font-weight: 500;
   }
   .page__primary:disabled {
     opacity: 0.5;
@@ -657,10 +666,14 @@
   }
   .quiet-button {
     padding: 6px 10px;
-    background: transparent;
-    border: 1px solid var(--color-border, #ccc);
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-surface-divider);
     border-radius: 4px;
     cursor: pointer;
+  }
+  .quiet-button:hover {
+    color: var(--color-text-strong);
   }
 
   /* S232 / PR-228 follow-up — tab segmented control. Same visual
@@ -669,7 +682,7 @@
     display: flex;
     gap: 4px;
     margin: var(--space-3) 0 var(--space-3) 0;
-    border-bottom: 1px solid var(--color-border, #ccc);
+    border-bottom: 1px solid var(--color-surface-divider);
   }
   .product-detail__tab {
     display: flex;
@@ -680,18 +693,21 @@
     border: none;
     border-bottom: 2px solid transparent;
     cursor: pointer;
-    color: var(--color-text-secondary, #666);
+    color: var(--color-text-secondary);
+  }
+  .product-detail__tab:hover {
+    color: var(--color-text-strong);
   }
   .product-detail__tab--active {
-    border-bottom-color: var(--color-primary, #1769aa);
-    color: var(--color-text-strong, #111);
+    border-bottom-color: var(--color-signal-positive);
+    color: var(--color-text-strong);
   }
   .product-detail__tab-label {
     font-weight: 600;
   }
   .product-detail__tab-sub {
     font-size: 0.75rem;
-    color: var(--color-text-secondary, #666);
+    color: var(--color-text-secondary);
   }
 
   /* S232 — BOM editor form layout. */
@@ -730,10 +746,11 @@
   .bom-form__field input,
   .bom-form__field select {
     padding: 6px 8px;
-    border: 1px solid var(--color-border, #ccc);
+    border: 1px solid var(--color-surface-divider);
     border-radius: 4px;
-    background: var(--color-surface, white);
-    color: var(--color-text-strong, #111);
+    background: var(--color-surface-base);
+    color: var(--color-text-strong);
+    font-family: var(--type-family-mono);
   }
   .bom-form__remove {
     align-self: flex-end;

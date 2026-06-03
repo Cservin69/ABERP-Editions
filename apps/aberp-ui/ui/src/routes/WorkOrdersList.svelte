@@ -455,146 +455,420 @@
 </section>
 
 <style>
+  /* S232b / PR-228b — dark-theme polish. Tokens only; no hardcoded
+     hex. Reference surfaces: PartnerForm.svelte (modal precedent),
+     IncomingInvoiceList.svelte (facets + dense table). */
+
   .wo-page {
-    padding: 1rem;
+    padding: var(--space-4);
+    color: var(--color-text-primary);
   }
+
   .wo-head {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     justify-content: space-between;
-    margin-bottom: 0.5rem;
+    gap: var(--space-3);
+    margin-bottom: var(--space-3);
   }
-  .wo-head-actions button + button {
-    margin-left: 0.5rem;
+
+  .wo-head h2 {
+    margin: 0;
+    font-size: var(--type-size-lg);
+    font-weight: 500;
+    color: var(--color-text-strong);
   }
+
+  .wo-head-actions {
+    display: flex;
+    gap: var(--space-2);
+  }
+
+  .wo-head-actions button {
+    background: var(--color-surface-raised);
+    color: var(--color-text-strong);
+    border: 1px solid var(--color-surface-divider);
+    padding: var(--space-1) var(--space-3);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .wo-head-actions button:hover {
+    border-color: var(--color-text-muted);
+  }
+
+  /* Facet row — mirrors IncomingInvoiceList chip pattern. */
   .wo-facets {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.25rem;
-    margin-bottom: 0.75rem;
+    gap: var(--space-2);
+    margin-bottom: var(--space-3);
   }
+
   .wo-facet {
-    padding: 0.25rem 0.5rem;
-    border: 1px solid #ccc;
-    background: #fafafa;
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-surface-divider);
+    padding: var(--space-1) var(--space-3);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    border-radius: 4px;
     cursor: pointer;
   }
-  .wo-facet--active {
-    background: #e8f4ff;
-    border-color: #2b6cb0;
+
+  .wo-facet:hover {
+    color: var(--color-text-strong);
   }
+
+  .wo-facet--active {
+    color: var(--color-text-strong);
+    border-color: var(--color-text-muted);
+  }
+
   .wo-facet__hu {
     display: block;
     font-weight: 600;
   }
+
   .wo-facet__en {
     display: block;
-    font-size: 0.75rem;
-    color: #666;
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
   }
+
+  /* Dense list table — mirrors `table.dense` from IncomingInvoiceList. */
   .wo-table {
     width: 100%;
     border-collapse: collapse;
+    font-size: var(--type-size-md);
+    background: var(--color-surface-sunken);
   }
-  .wo-table th,
-  .wo-table td {
+
+  .wo-table thead th {
     text-align: left;
-    padding: 0.25rem 0.5rem;
-    border-bottom: 1px solid #eee;
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--color-surface-divider);
+    color: var(--color-text-secondary);
+    font-weight: 500;
   }
+
+  .wo-table tbody td {
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--color-surface-divider);
+    color: var(--color-text-primary);
+  }
+
+  .wo-table tbody tr:hover {
+    background: var(--color-surface-raised);
+  }
+
+  .wo-table tbody button {
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-surface-divider);
+    padding: var(--space-1) var(--space-2);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .wo-table tbody button:hover {
+    color: var(--color-text-strong);
+  }
+
   .wo-error {
-    color: #c00;
+    color: var(--color-signal-negative);
+    font-size: var(--type-size-sm);
   }
+
   .wo-empty {
-    color: #666;
+    color: var(--color-text-muted);
+    padding: var(--space-5);
+    border: 1px dashed var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    text-align: center;
+    border-radius: 4px;
   }
+
+  /* Detail aside — sits below the list. */
   .wo-detail {
-    margin-top: 1rem;
-    padding: 1rem;
-    border: 1px solid #ddd;
-    background: #fcfcfc;
+    margin-top: var(--space-4);
+    padding: var(--space-4);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    color: var(--color-text-primary);
+    border-radius: 4px;
   }
+
   .wo-detail header {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
+    gap: var(--space-3);
+    margin-bottom: var(--space-3);
   }
+
+  .wo-detail header h3 {
+    margin: 0;
+    font-size: var(--type-size-lg);
+    font-weight: 500;
+    color: var(--color-text-strong);
+  }
+
+  .wo-detail header button {
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-surface-divider);
+    padding: var(--space-1) var(--space-3);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .wo-detail header button:hover {
+    color: var(--color-text-strong);
+  }
+
   .wo-detail dl {
     display: grid;
     grid-template-columns: max-content 1fr;
-    gap: 0.25rem 1rem;
+    gap: var(--space-1) var(--space-4);
+    margin: 0 0 var(--space-3) 0;
   }
+
   .wo-detail dt {
-    color: #666;
+    color: var(--color-text-secondary);
+    font-size: var(--type-size-sm);
   }
+
+  .wo-detail dd {
+    margin: 0;
+    color: var(--color-text-strong);
+    font-size: var(--type-size-sm);
+  }
+
   .wo-actions {
-    margin: 0.5rem 0;
+    margin: var(--space-3) 0;
     display: flex;
-    gap: 0.5rem;
+    gap: var(--space-2);
   }
+
+  .wo-actions button {
+    background: var(--color-surface-base);
+    color: var(--color-text-strong);
+    border: 1px solid var(--color-surface-divider);
+    padding: var(--space-1) var(--space-4);
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .wo-actions button:hover {
+    border-color: var(--color-text-muted);
+  }
+
   .wo-warnings {
-    background: #fff4e5;
-    border: 1px solid #f0c14b;
-    padding: 0.5rem;
-    margin: 0.5rem 0;
+    background: var(--color-surface-raised);
+    border-left: 3px solid var(--color-signal-warning);
+    padding: var(--space-2) var(--space-3);
+    margin: var(--space-2) 0;
+    color: var(--color-text-primary);
+    list-style: none;
+    font-size: var(--type-size-sm);
   }
+
   .wo-routing,
   .wo-bom {
-    margin-top: 1rem;
+    margin-top: var(--space-4);
   }
+
+  .wo-routing h4,
+  .wo-bom h4 {
+    margin: 0 0 var(--space-2) 0;
+    font-size: var(--type-size-sm);
+    font-weight: 600;
+    color: var(--color-text-strong);
+  }
+
   .wo-routing table,
   .wo-bom table {
     width: 100%;
     border-collapse: collapse;
+    background: var(--color-surface-sunken);
+    font-size: var(--type-size-sm);
   }
+
   .wo-routing th,
-  .wo-routing td,
-  .wo-bom th,
-  .wo-bom td {
-    padding: 0.25rem 0.5rem;
-    border-bottom: 1px solid #eee;
+  .wo-bom th {
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--color-surface-divider);
     text-align: left;
+    color: var(--color-text-secondary);
+    font-weight: 500;
   }
+
+  .wo-routing td,
+  .wo-bom td {
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--color-surface-divider);
+    text-align: left;
+    color: var(--color-text-primary);
+  }
+
+  /* Modal — mirrors PartnerForm.svelte's dialog frame. */
   .wo-modal {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.4);
+    background: rgba(0, 0, 0, 0.5);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 1000;
   }
+
   .wo-modal__body {
-    background: #fff;
-    padding: 1.5rem;
+    background: var(--color-surface-base);
+    color: var(--color-text-primary);
+    border: 1px solid var(--color-surface-divider);
+    padding: var(--space-4) var(--space-5);
     border-radius: 4px;
     max-width: 600px;
     width: 90%;
     max-height: 80vh;
     overflow-y: auto;
+    animation: aberp-fade-in var(--motion-fade-in) both;
   }
+
+  .wo-modal__body h3 {
+    margin: 0 0 var(--space-3) 0;
+    font-size: var(--type-size-lg);
+    font-weight: 500;
+    color: var(--color-text-strong);
+  }
+
+  .wo-modal__body h4 {
+    margin: var(--space-3) 0 var(--space-2) 0;
+    font-size: var(--type-size-sm);
+    font-weight: 600;
+    color: var(--color-text-strong);
+    border-bottom: 1px solid var(--color-surface-divider);
+    padding-bottom: var(--space-1);
+  }
+
   .wo-modal__body label {
-    display: block;
-    margin-bottom: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin-bottom: var(--space-2);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-primary);
   }
+
+  /* Native form controls — browsers default these to system theme, so
+     explicit dark styling is required (see [[spa-dark-theme-default]]). */
   .wo-modal__body label input,
   .wo-modal__body label select,
   .wo-modal__body label textarea {
     display: block;
     width: 100%;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    background: var(--color-surface-base);
+    color: var(--color-text-strong);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
   }
+
+  .wo-modal__body label textarea {
+    font-family: var(--type-family-body);
+    min-height: 4em;
+    resize: vertical;
+  }
+
   .wo-op-row {
     display: flex;
-    gap: 0.25rem;
-    margin-bottom: 0.25rem;
+    gap: var(--space-2);
+    margin-bottom: var(--space-1);
   }
+
   .wo-op-row input {
     flex: 1;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    background: var(--color-surface-base);
+    color: var(--color-text-strong);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
   }
+
+  .wo-op-row button {
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-surface-divider);
+    padding: var(--space-1) var(--space-3);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .wo-op-row button:hover {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
+  }
+
+  .wo-modal__body > button {
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-surface-divider);
+    padding: var(--space-1) var(--space-3);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: var(--type-size-sm);
+  }
+
+  .wo-modal__body > button:hover {
+    color: var(--color-text-strong);
+  }
+
   .wo-modal__actions {
-    margin-top: 1rem;
+    margin-top: var(--space-4);
     display: flex;
     justify-content: flex-end;
-    gap: 0.5rem;
+    gap: var(--space-2);
+  }
+
+  /* Cancel = quiet, Save = primary (signal-positive). Order in DOM
+     is Cancel then Save, so :last-child = Save. */
+  .wo-modal__actions button {
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-surface-divider);
+    padding: var(--space-2) var(--space-4);
+    border-radius: 4px;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    cursor: pointer;
+  }
+
+  .wo-modal__actions button:hover:not(:disabled) {
+    color: var(--color-text-strong);
+  }
+
+  .wo-modal__actions button:last-child {
+    background: var(--color-signal-positive);
+    color: var(--color-surface-base);
+    border-color: var(--color-signal-positive);
+    font-weight: 500;
+  }
+
+  .wo-modal__actions button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 </style>
