@@ -719,7 +719,18 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // NAV bytes itself. The bundle's `invoice.*` glob excludes
         // them anyway; these arms exist for exhaustiveness only.
         | EventKind::DispatchCreated
-        | EventKind::DispatchShipped => None,
+        | EventKind::DispatchShipped
+        // S236 / PR-230b — pre-allocation invoice-draft staging event.
+        // Payload is keyed by `drf_<ULID>` (a draft id) not
+        // `inv_<ULID>`, so the per-OUTGOING-invoice export bundle's
+        // `invoice.*` glob never sweeps a staged-then-deleted draft
+        // into an invoice's evidence bundle. On promotion the operator's
+        // Issue click runs the existing `issue_invoice` pipeline which
+        // fires `InvoiceSequenceReserved` + `InvoiceDraftCreated` against
+        // the freshly minted `inv_*` id — those are the entries the
+        // bundle includes; the prior `InvoiceStaged` row belongs to the
+        // `drf_*` id and stays outside the bundle. No NAV bytes carried.
+        | EventKind::InvoiceStaged => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

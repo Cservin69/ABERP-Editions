@@ -841,7 +841,16 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // Excluded from the per-OUTGOING-invoice bundle by the
         // `invoice.*` glob; this arm exists for exhaustiveness only.
         | EventKind::DispatchCreated
-        | EventKind::DispatchShipped => (None, ""),
+        | EventKind::DispatchShipped
+        // S236 / PR-230b — pre-allocation invoice-draft staging event.
+        // Payload is keyed by a `drf_<ULID>` id, not an `inv_<ULID>`;
+        // staged-then-deleted drafts never get a NAV-bound invoice id
+        // and so never reach a per-OUTGOING-invoice bundle. On promotion
+        // the operator's Issue click fires the canonical
+        // `InvoiceSequenceReserved` + `InvoiceDraftCreated` pair against
+        // the freshly minted `inv_*`. Mirror of the bundle writer's
+        // posture in `export_invoice_bundle::extract_nav_xml`.
+        | EventKind::InvoiceStaged => (None, ""),
     };
 
     Ok(NavExtraction {

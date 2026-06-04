@@ -104,6 +104,7 @@ use crate::invoice_bank_snapshot::load_invoice_bank_snapshot_in_tx;
 use crate::invoice_currency_metadata::{
     load_invoice_currency_metadata_in_tx, InvoiceCurrencyMetadata,
 };
+use crate::invoice_draft;
 use crate::issue_invoice::{self, InvoiceInputJson};
 use crate::issue_modification;
 use crate::issue_preflight::{
@@ -766,6 +767,23 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             )
         })?;
         aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema at serve boot")?;
+    }
+
+    // S236 / PR-230b — pin the `invoice_draft` schema at boot. Mirrors
+    // the dispatch / WO / QA boot posture above. The route layer also
+    // calls `ensure_schema` defensively so a fresh DB + first route hit
+    // does not 500. The table backs the new `InvoiceState::Draft` SPA
+    // surface; the BillingInvoiceSpawner writes here on
+    // dispatches→Shipped.
+    {
+        let _s = tracing::info_span!("serve.ensure_invoice_draft_schema").entered();
+        let conn = Connection::open(&args.db).with_context(|| {
+            format!(
+                "open tenant DuckDB at {} for invoice_draft boot migration",
+                args.db.display()
+            )
+        })?;
+        invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema at serve boot")?;
     }
 
     // S177 / PR-177 — pin the ap_invoice (incoming AP-side mirror)
@@ -2164,6 +2182,19 @@ fn build_router(state: AppState) -> Router {
             post(handle_mark_dispatch_shipped),
         )
         .route("/api/dispatches/:id/cancel", post(handle_cancel_dispatch))
+        // S236 / PR-230b — pre-allocation invoice-draft routes. The
+        // BillingInvoiceSpawner creates rows here on dispatches→Shipped;
+        // these routes let the SPA list, inspect, and delete drafts.
+        // Promotion to a Ready invoice rides the existing IssueInvoice
+        // form path (the SPA pre-fills the form from a GET to
+        // /api/invoice-drafts/:id, then DELETEs the draft after the
+        // invoice creation succeeds; cross-pipeline atomic promote is
+        // deferred to a future PR per the PR-230b scope-reduction).
+        .route("/api/invoice-drafts", get(handle_list_invoice_drafts))
+        .route(
+            "/api/invoice-drafts/:id",
+            get(handle_get_invoice_draft).delete(handle_delete_invoice_draft),
+        )
         // S177 / PR-177 — AP module v1 BACKEND. Incoming-invoice list +
         // detail + manual ingestion + three closed-vocab status
         // transitions. All require_ready + bearer auth. The NAV
@@ -3411,6 +3442,17 @@ fn record_upgrade_snapshot_mismatch_audit(
 /// against literal variants via `assert_eq!`).
 #[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy)]
 enum InvoiceState {
+    /// S236 / PR-230b — pre-allocation Draft state for `invoice_draft`
+    /// rows. Has no `sequence_number` (the gap-free allocator hasn't
+    /// run yet); can be freely edited / deleted without breaking
+    /// ADR-0009 §169. Set ONLY on rows synthesised from
+    /// `invoice_draft` in `list_invoices`; the audit-derived
+    /// `derive_state` ladder NEVER returns this variant because drafts
+    /// live in their own table and have no `InvoiceDraftCreated`
+    /// audit entry pointing at an `inv_<ULID>` id. On operator Issue
+    /// click the draft becomes a regular `invoice` row in `Ready`
+    /// state via the existing `issue_invoice` allocator.
+    Draft,
     Unknown,
     Ready,
     Pending,
@@ -9652,6 +9694,11 @@ pub fn mark_dispatch_shipped_request(
     })?;
     aberp_dispatch::ensure_schema(&conn)
         .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
+    // PR-230b / S236 — defensive `ensure_schema` for the new
+    // `invoice_draft` table the BillingInvoiceSpawner writes into. Same
+    // posture as the dispatch / WO / QA tables above.
+    crate::invoice_draft::ensure_schema(&conn)
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure invoice_draft schema: {e}")))?;
     let binary_hash = state
         .binary_hash
         .wait()
@@ -9669,6 +9716,16 @@ pub fn mark_dispatch_shipped_request(
             operator_login: operator_login.to_string(),
         },
         ledger_meta: &ledger_meta,
+        ledger_actor: ledger_actor.clone(),
+    };
+    // PR-230b / S236 — real spawner. Replaces `NoopInvoiceSpawner` from
+    // PR-230. Inserts an `invoice_draft` row + emits one
+    // `InvoiceStaged` audit entry in the SAME transaction as the
+    // dispatch state flip per ADR-0064 §"Invariants pinned" #6.
+    let spawner = crate::invoice_draft::BillingInvoiceSpawner {
+        tenant: state.tenant.as_str().to_string(),
+        actor: operator_login.to_string(),
+        ledger_meta: &ledger_meta,
         ledger_actor,
     };
     let outcome = aberp_dispatch::mark_shipped(
@@ -9681,9 +9738,7 @@ pub fn mark_dispatch_shipped_request(
             shipped_at: body.shipped_at,
             idempotency_key: body.idempotency_key,
         },
-        // v1 production spawner per the PR-230 body's pushback. PR-230b
-        // swaps this for the real sync billing extraction.
-        &aberp_dispatch::NoopInvoiceSpawner,
+        &spawner,
     )
     .map_err(map_dispatch_err)?;
     tx.commit()
@@ -9768,6 +9823,136 @@ pub fn cancel_dispatch_request(
         .map_err(WorkOrderRouteError::Other)?;
     sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
     Ok(outcome)
+}
+
+// ── S236 / PR-230b — invoice-draft routes ──────────────────────────
+
+async fn handle_list_invoice_drafts(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || list_invoice_drafts_request(&state_for_task)).await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "list_invoice_drafts_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => internal_error("list_invoice_drafts_request", e),
+    }
+}
+
+pub fn list_invoice_drafts_request(state: &AppState) -> Result<Vec<invoice_draft::InvoiceDraft>> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema (defensive)")?;
+    invoice_draft::list_drafts(&conn, state.tenant.as_str())
+}
+
+async fn handle_get_invoice_draft(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        get_invoice_draft_request(&state_for_task, &id_for_task)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "get_invoice_draft_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(Some(draft)) => Json(draft).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!("invoice draft {id} not found"))),
+        )
+            .into_response(),
+        Err(e) => internal_error("get_invoice_draft_request", e),
+    }
+}
+
+pub fn get_invoice_draft_request(
+    state: &AppState,
+    drf_id: &str,
+) -> Result<Option<invoice_draft::InvoiceDraft>> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema (defensive)")?;
+    invoice_draft::read_draft(&conn, state.tenant.as_str(), drf_id)
+}
+
+async fn handle_delete_invoice_draft(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let id_for_task = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        delete_invoice_draft_request(&state_for_task, &id_for_task)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "delete_invoice_draft_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!("invoice draft {id} not found"))),
+        )
+            .into_response(),
+        Err(e) => internal_error("delete_invoice_draft_request", e),
+    }
+}
+
+pub fn delete_invoice_draft_request(state: &AppState, drf_id: &str) -> Result<bool> {
+    let mut conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema (defensive)")?;
+    let tx = conn
+        .transaction()
+        .context("begin delete_invoice_draft transaction")?;
+    let deleted = invoice_draft::delete_draft_in_tx(&tx, state.tenant.as_str(), drf_id)?;
+    tx.commit().context("commit delete_invoice_draft tx")?;
+    Ok(deleted)
 }
 
 /// Best-effort audit-mirror sync after a successful write transaction.
@@ -13490,6 +13675,18 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
     for ext in restored {
         items.push(restored_to_list_item(ext)?);
     }
+    // S236 / PR-230b — third row source: `invoice_draft`. Drafts have
+    // no allocated sequence (gap-free allocator hasn't run); they
+    // surface in the unified list as `InvoiceState::Draft` with
+    // `RowKind::Own` (they're our drafts) and `sequence_number: 0`
+    // placeholder. The SPA renders them with a distinct chip and
+    // disables NAV submit + PDF affordances; the operator's Issue
+    // click promotes them through the existing allocator.
+    let drafts = invoice_draft::list_drafts(&conn, state.tenant.as_str())
+        .context("read invoice_draft mirror for unified list")?;
+    for d in drafts {
+        items.push(draft_to_list_item(d, &mut conn, state.tenant.as_str())?);
+    }
     Ok(items)
 }
 
@@ -13537,6 +13734,45 @@ fn restored_to_list_item(ext: restore_outgoing::RestoredInvoice) -> Result<Invoi
         bank_account: None,
         row_kind: RowKind::ExtNav,
         source_nav_invoice_number: Some(ext.source_nav_invoice_number),
+    })
+}
+
+/// S236 / PR-230b — pure mapping from an `invoice_draft` row to the
+/// virtual-union [`InvoiceListItem`] wire shape. Drafts have NO
+/// allocated sequence (gap-free allocator hasn't run) and NO computed
+/// total (the draft only carries the bridge data — partner_id +
+/// product_id + qty); the SPA renders a placeholder for both. Buyer
+/// name is best-effort looked up on the partner master since the
+/// draft row stores only `partner_id`.
+///
+/// Closed-vocab `state: InvoiceState::Draft`. `RowKind::Own` because
+/// drafts are ABERP-staged (vs. NAV-mirror ExtNav rows from S180).
+/// `currency: Currency::Huf` placeholder — the draft v1 doesn't carry
+/// a currency choice; the operator's Issue click resolves it from the
+/// partner's saved defaults (the existing IssueInvoice form chooses).
+fn draft_to_list_item(
+    draft: invoice_draft::InvoiceDraft,
+    conn: &mut Connection,
+    tenant: &str,
+) -> Result<InvoiceListItem> {
+    let buyer_name = partners::get_partner(conn, tenant, &draft.partner_id)
+        .ok()
+        .flatten()
+        .map(|p| p.legal_name);
+    Ok(InvoiceListItem {
+        invoice_id: draft.drf_id,
+        sequence_number: 0,
+        fiscal_year: 0,
+        state: InvoiceState::Draft,
+        total_gross: None,
+        has_chain_children: false,
+        is_storno: false,
+        currency: Currency::Huf,
+        buyer_name,
+        payment: None,
+        bank_account: None,
+        row_kind: RowKind::Own,
+        source_nav_invoice_number: None,
     })
 }
 
@@ -15692,7 +15928,11 @@ mod tests {
     /// constant) cannot hide behind a single matching assertion.
     #[test]
     fn invoice_state_wire_shape_pins_pascalcase_strings() {
-        let cases: [(InvoiceState, &str); 11] = [
+        let cases: [(InvoiceState, &str); 12] = [
+            // S236 / PR-230b — pre-allocation Draft state. Wire form
+            // matches the variant name; the SPA's labels.ts table MUST
+            // carry a `Draft` entry to render the chip.
+            (InvoiceState::Draft, "Draft"),
             (InvoiceState::Unknown, "Unknown"),
             (InvoiceState::Ready, "Ready"),
             (InvoiceState::Pending, "Pending"),

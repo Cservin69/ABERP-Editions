@@ -132,14 +132,17 @@ describe("ackLabelMeta", () => {
   });
 });
 
-// The eleven derive_state labels per ADR-0036 §2. Mirrored verbatim
-// here so the test pins the wire literals as well as the count — a
-// drift in `InvoiceState` (rename, add, drop) that is NOT reflected
-// here fails the LABELS / LIFECYCLE_ORDER set-equality cases below,
-// AND a drift here that is NOT reflected in `LABELS` fails the
-// `Record<InvoiceState, ...>` type check at `npm run check`. Two-way
-// pin per A128, mirror of the `ACK_STATUS_LITERALS` constant above.
+// The twelve derive_state labels per ADR-0036 §2 + S236's pre-allocation
+// `Draft`. Mirrored verbatim here so the test pins the wire literals as
+// well as the count — a drift in `InvoiceState` (rename, add, drop)
+// that is NOT reflected here fails the LABELS / LIFECYCLE_ORDER
+// set-equality cases below, AND a drift here that is NOT reflected in
+// `LABELS` fails the `Record<InvoiceState, ...>` type check at
+// `npm run check`. Two-way pin per A128, mirror of the
+// `ACK_STATUS_LITERALS` constant above.
 const INVOICE_STATE_LITERALS: readonly InvoiceState[] = [
+  // S236 / PR-230b — pre-allocation Draft state.
+  "Draft",
   "Unknown",
   "Ready",
   "Pending",

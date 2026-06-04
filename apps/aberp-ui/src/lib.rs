@@ -355,6 +355,13 @@ pub fn run() {
             commands::get_financial_report,
             // S235 / PR-231 — Workshop / Műhely operator dashboard.
             commands::get_workshop_dashboard,
+            // S236 / PR-230b — pre-allocation invoice-draft surface.
+            // Replaces the PR-230 NoopInvoiceSpawner deferred-spawn
+            // posture with a real `BillingInvoiceSpawner` that writes
+            // to a sibling `invoice_draft` table.
+            commands::list_invoice_drafts,
+            commands::get_invoice_draft,
+            commands::delete_invoice_draft,
         ])
         .on_window_event(handle_window_event)
         .run(tauri::generate_context!())

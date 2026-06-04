@@ -986,6 +986,37 @@ pub enum EventKind {
     ///
     /// F12 four-edit ritual fires once.
     DispatchShipped,
+
+    /// S236 / PR-230b — a pre-allocation invoice draft was staged.
+    /// Distinct from `InvoiceDraftCreated`: this variant fires when
+    /// a draft row is inserted into `invoice_draft` (no
+    /// `sequence_number` allocated, no slot burned per ADR-0009 §169);
+    /// `InvoiceDraftCreated` continues to fire when the regulated
+    /// `invoice` row is inserted via `allocate_in_tx` (sequence
+    /// reserved, the Draft → Ready transition in the existing
+    /// allocator).
+    ///
+    /// Carries `draft_id` (`drf_<ULID>`), `tenant_id`, `partner_id`,
+    /// the operator/adapter `actor` string, the F8 idempotency key,
+    /// and optionally the `source_dispatch_id` so a future audit walk
+    /// can reconstruct "this draft was spawned by dispatch dsp_X
+    /// against partner ptr_Y on behalf of WO wo_Z". The chain
+    /// continues at promotion time via the operator-issued
+    /// `InvoiceSequenceReserved` + `InvoiceDraftCreated` pair, which
+    /// references the draft id in their idempotency key suffix
+    /// (`derive_from(draft.drf_id, "issue")`).
+    ///
+    /// `invoice.` prefix family because the entry is keyed by a
+    /// `drf_<ULID>` id; the per-invoice export bundle filters by the
+    /// promoted invoice's `inv_<ULID>` id and so does NOT sweep
+    /// staged-then-deleted drafts. The Stage 3 dispatch tx fires
+    /// this entry alongside `mes.dispatch_shipped` — the prefix
+    /// difference is deliberate: `dispatch_shipped` is the operator's
+    /// physical-shipping audit row, `invoice.staged` is the billing
+    /// strand's pre-allocation audit row.
+    ///
+    /// F12 four-edit ritual fires once.
+    InvoiceStaged,
 }
 
 impl EventKind {
@@ -1042,6 +1073,7 @@ impl EventKind {
             EventKind::QaInspectionDecided => "mes.qa_inspection_decided",
             EventKind::DispatchCreated => "mes.dispatch_created",
             EventKind::DispatchShipped => "mes.dispatch_shipped",
+            EventKind::InvoiceStaged => "invoice.staged",
         }
     }
 
@@ -1109,6 +1141,7 @@ impl EventKind {
             "mes.qa_inspection_decided" => Ok(EventKind::QaInspectionDecided),
             "mes.dispatch_created" => Ok(EventKind::DispatchCreated),
             "mes.dispatch_shipped" => Ok(EventKind::DispatchShipped),
+            "invoice.staged" => Ok(EventKind::InvoiceStaged),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1168,6 +1201,7 @@ mod tests {
             EventKind::QaInspectionDecided,
             EventKind::DispatchCreated,
             EventKind::DispatchShipped,
+            EventKind::InvoiceStaged,
         ];
         for v in variants {
             let s = v.as_str();
@@ -2092,6 +2126,54 @@ mod tests {
             assert_ne!(k, EventKind::QaInspectionCreated.as_str());
             assert_ne!(k, EventKind::QaInspectionDecided.as_str());
         }
+    }
+
+    /// S236 / PR-230b — `InvoiceStaged` uses the `invoice.` prefix
+    /// even though it is fired from the Stage 3 dispatch transaction.
+    /// Rationale per ADR-0064 §6 + the variant's docs: the entry
+    /// represents the billing strand's pre-allocation state for a
+    /// future invoice; it lives in the same prefix family as
+    /// `InvoiceDraftCreated` / `InvoiceSequenceReserved` so an
+    /// audit-walker following an invoice's chain finds the staging
+    /// row alongside the allocation row. The per-OUTGOING-invoice
+    /// export bundle's `invoice.*` glob does NOT pollute because the
+    /// staging payload is keyed by `drf_<ULID>` not `inv_<ULID>`;
+    /// staged-then-deleted drafts never get an invoice id and so
+    /// never match an export filter.
+    #[test]
+    fn s236_invoice_staged_uses_invoice_prefix() {
+        assert_eq!(EventKind::InvoiceStaged.as_str(), "invoice.staged");
+        assert!(EventKind::InvoiceStaged.as_str().starts_with("invoice."));
+        assert!(!EventKind::InvoiceStaged.as_str().starts_with("mes."));
+        assert!(!EventKind::InvoiceStaged.as_str().starts_with("system."));
+    }
+
+    /// S236 / PR-230b — `InvoiceStaged` MUST be distinct from
+    /// `InvoiceDraftCreated` (which fires when `allocate_in_tx` burns
+    /// a sequence slot per ADR-0009 §3); the two storage strings are
+    /// the load-bearing discriminator at audit-walk time between
+    /// "draft staged, no slot burned" and "Ready row inserted with
+    /// allocated sequence". Same fork-discipline posture as
+    /// `s228_mes_adapter_event_is_distinct` /
+    /// `s234_dispatch_kinds_are_distinct`.
+    #[test]
+    fn s236_invoice_staged_is_distinct() {
+        assert_ne!(
+            EventKind::InvoiceStaged.as_str(),
+            EventKind::InvoiceDraftCreated.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceStaged.as_str(),
+            EventKind::InvoiceSequenceReserved.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceStaged.as_str(),
+            EventKind::DispatchShipped.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceStaged.as_str(),
+            EventKind::DispatchCreated.as_str()
+        );
     }
 
     /// S220 / PR-217 — the two new kinds must be distinct from every

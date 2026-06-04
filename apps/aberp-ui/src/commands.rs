@@ -772,6 +772,39 @@ pub async fn cancel_dispatch(state: State<'_, AppState>, dsp_id: String) -> Resu
     forward_post(&state, &path, serde_json::json!({})).await
 }
 
+/// S236 / PR-230b — `GET /api/invoice-drafts`. The SPA's unified
+/// invoice list reads here on init (alongside `list_invoices`); the
+/// route exposes the new third row source.
+#[tauri::command]
+pub async fn list_invoice_drafts(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/invoice-drafts", true).await
+}
+
+/// S236 / PR-230b — `GET /api/invoice-drafts/:id`. Used by the SPA's
+/// draft prefill flow + dispatch-detail click-through.
+#[tauri::command]
+pub async fn get_invoice_draft(
+    state: State<'_, AppState>,
+    drf_id: String,
+) -> Result<Value, String> {
+    validate_qa_or_routing_op_id(&drf_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/invoice-drafts/{drf_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// S236 / PR-230b — `DELETE /api/invoice-drafts/:id`. No-op idempotent
+/// on absent rows (the backend returns 404 silently mapped to
+/// `Ok(())`); the inline quick-action on Draft list rows calls here.
+#[tauri::command]
+pub async fn delete_invoice_draft(
+    state: State<'_, AppState>,
+    drf_id: String,
+) -> Result<(), String> {
+    validate_qa_or_routing_op_id(&drf_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/invoice-drafts/{drf_id}");
+    forward_delete(&state, &path).await
+}
+
 /// PR-72 / session-94 — `GET /api/seller/banks`. Used by the SPA's
 /// Tenant Settings page (bank-accounts subsection) + the
 /// SellerConfigWizard's multi-row block to render the current

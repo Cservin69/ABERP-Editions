@@ -154,6 +154,14 @@ export function buttonsForState(
       // state per ADR-0047 §2; e.g. resending a stornoed invoice's
       // PDF to a buyer for their records).
       return ["Email", "Download"];
+    case "Draft":
+      // S236 / PR-230b — pre-allocation Draft has no NAV number and
+      // no PDF; the regular invoice detail page does not load drafts.
+      // The InvoiceList renders an inline Delete quick-action for
+      // Draft rows; this empty arm suppresses the detail-modal buttons
+      // for any code path that did reach `buttonsForState` with a
+      // Draft (defence-in-depth).
+      return [];
   }
 }
 

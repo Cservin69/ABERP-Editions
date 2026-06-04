@@ -174,10 +174,14 @@ pub trait InvoiceSpawner {
     ) -> anyhow::Result<Option<String>>;
 }
 
-/// v1 production [`InvoiceSpawner`] — returns `Ok(None)`. The SPA's
-/// dispatch detail surfaces a click-through that pre-fills the
-/// existing IssueInvoice form per the PR-230 body's "v1 cut"
-/// rationale. PR-230b lands the real spawner.
+/// No-op [`InvoiceSpawner`] — returns `Ok(None)`. PR-230 wired this
+/// as the production default; PR-230b / S236 moved production to the
+/// real `BillingInvoiceSpawner` in `apps/aberp/src/invoice_draft.rs`
+/// (writes one `invoice_draft` row + one `InvoiceStaged` audit entry
+/// per dispatch ship). The type is retained because the dispatch
+/// crate's own round-trip tests use it for the "no-spawn-recorded"
+/// arm of the trait (a downstream consumer wanting deferred-spawn
+/// semantics can also still reach for it).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopInvoiceSpawner;
 

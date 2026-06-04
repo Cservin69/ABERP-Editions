@@ -47,12 +47,22 @@ export interface LabelMeta {
   tooltip: string;
 }
 
-/** The full eleven-label table. The `Record<InvoiceState, LabelMeta>`
+/** The full twelve-label table. The `Record<InvoiceState, LabelMeta>`
  * shape is the load-bearing TS-level enforcement: if `InvoiceState`
  * adds a member (new ADR extends the ladder) and this table is not
  * updated in lockstep, `npm run check` fails on the missing key per
  * ADR-0036 §10's four-edit obligation at the Svelte side. */
 export const LABELS: Record<InvoiceState, LabelMeta> = {
+  // S236 / PR-230b — pre-allocation Draft. Visible in the SPA list
+  // for `invoice_draft` rows; the operator's Issue click promotes
+  // the draft to a Ready invoice via the existing IssueInvoice
+  // allocator. NAV submit + PDF disabled while in this state.
+  Draft: {
+    signal: "warning",
+    icon: "✎",
+    tooltip:
+      "Draft staged from a dispatch (or future manual flow). No NAV number allocated. Operator must Issue (allocates sequence) or Delete.",
+  },
   Unknown: {
     signal: "muted",
     icon: "?",
@@ -125,6 +135,12 @@ export const LABELS: Record<InvoiceState, LabelMeta> = {
  * lifecycle-natural over alphabetical — mirrors the operator's
  * mental model. */
 export const LIFECYCLE_ORDER = [
+  // S236 / PR-230b — `Draft` precedes `Unknown` because a Draft is
+  // pre-allocation (operator hasn't pressed Issue yet); `Unknown` is
+  // "we have no idea, possibly orphaned audit entries." Same
+  // mental-model lean as Stage 3 → Stage 1 hand-off (the draft is the
+  // earliest state we observe).
+  "Draft",
   "Unknown",
   "Ready",
   "Pending",

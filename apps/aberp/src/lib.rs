@@ -35,6 +35,11 @@ pub mod first_launch;
 pub mod incoming_invoices;
 pub mod invoice_bank_snapshot;
 pub mod invoice_currency_metadata;
+// S236 / PR-230b — pre-allocation Draft state. New `invoice_draft`
+// table + `BillingInvoiceSpawner` replaces `NoopInvoiceSpawner` from
+// PR-230. Closes the Stage 3 → Stage 1 hand-off without burning a
+// gap-free sequence slot per ADR-0009 §169.
+pub mod invoice_draft;
 pub mod issue_invoice;
 pub mod issue_modification;
 pub mod issue_preflight;

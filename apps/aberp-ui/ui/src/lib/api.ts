@@ -148,6 +148,11 @@ export type RowKind = "Own" | "ExtNav";
  * helper in `./labels.ts` falls back to a muted "?" pill so the
  * silent miss is visible per CLAUDE.md rule 12. */
 export type InvoiceState =
+  // S236 / PR-230b — pre-allocation Draft state for `invoice_draft`
+  // rows. Surfaced by the unified list when `RowKind::Own` rows come
+  // from the new third source. Renders with the Draft chip from
+  // labels.ts; NAV submit + PDF affordances disabled.
+  | "Draft"
   | "Unknown"
   | "Ready"
   | "Pending"
@@ -423,6 +428,34 @@ export async function acknowledgeFirstProdLaunch(): Promise<AcknowledgeFirstProd
 
 export async function listInvoices(): Promise<InvoiceListItem[]> {
   return invoke<InvoiceListItem[]>("list_invoices");
+}
+
+/** S236 / PR-230b — pre-allocation invoice-draft wire shape. Mirrors
+ * `apps/aberp/src/invoice_draft.rs::InvoiceDraft`. Surfaced in the
+ * unified list as `state: "Draft"` and exposed standalone for the
+ * detail / delete actions. */
+export interface InvoiceDraftView {
+  drf_id: string;
+  tenant_id: string;
+  partner_id: string;
+  source_dispatch_id: string | null;
+  source_wo_id: string | null;
+  product_id: string;
+  qty: string;
+  notes: string | null;
+  created_at: string;
+}
+
+export async function listInvoiceDrafts(): Promise<InvoiceDraftView[]> {
+  return invoke<InvoiceDraftView[]>("list_invoice_drafts");
+}
+
+export async function getInvoiceDraft(drfId: string): Promise<InvoiceDraftView> {
+  return invoke<InvoiceDraftView>("get_invoice_draft", { drfId });
+}
+
+export async function deleteInvoiceDraft(drfId: string): Promise<void> {
+  return invoke<void>("delete_invoice_draft", { drfId });
 }
 
 export async function getInvoice(invoiceId: string): Promise<InvoiceDetail> {
