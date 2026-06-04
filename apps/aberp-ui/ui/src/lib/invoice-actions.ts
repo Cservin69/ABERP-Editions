@@ -54,7 +54,14 @@ export type DetailActionButton =
   // → terminal). The auto-send-after-issue path is independent —
   // this button is operator-on-demand (e.g., to resend after the
   // operator updated the buyer's email).
-  | "Email";
+  | "Email"
+  // S239 / PR-233 — pre-allocation draft delete. The detail-modal
+  // does NOT render a header button for this (drafts open in
+  // IssueInvoice for completion, not in the regular detail page),
+  // but the row-level quick-action surfaces it on the InvoiceList.
+  // Keeping `Delete` in the shared vocab makes the row-quick-action
+  // gate's `Extract<DetailActionButton, ...>` typecheck mechanical.
+  | "Delete";
 
 /** Per-state action-button visibility table. Returned in operator-
  * reading order (left-to-right on the modal header); the renderer
@@ -157,11 +164,14 @@ export function buttonsForState(
     case "Draft":
       // S236 / PR-230b — pre-allocation Draft has no NAV number and
       // no PDF; the regular invoice detail page does not load drafts.
-      // The InvoiceList renders an inline Delete quick-action for
-      // Draft rows; this empty arm suppresses the detail-modal buttons
-      // for any code path that did reach `buttonsForState` with a
-      // Draft (defence-in-depth).
-      return [];
+      // S239 / PR-233 — surface the Delete affordance for Draft rows
+      // so the operator can dismiss a dispatch-spawned draft (e.g.,
+      // canceled order) without going through the IssueInvoice flow.
+      // The deletion cascades the dispatch's `spawned_invoice_id`
+      // pointer in one tx per the S237 §🔴 #1 fix; the
+      // confirmation modal explains the consequence per
+      // [[hulye-biztos]].
+      return ["Delete"];
   }
 }
 
@@ -270,6 +280,23 @@ export function detailActionMeta(button: DetailActionButton): DetailActionMeta {
         label_en: "Email to buyer",
         tooltip_hu:
           "Elküldi a számla PDF-jét a vevő e-mail címére az SMTP beállítások szerint. A küldés sikeréről audit napló készül.",
+      };
+    case "Delete":
+      // S239 / PR-233 — pre-allocation draft delete. The detail-modal
+      // does not actually render this button today (drafts open in
+      // IssueInvoice, not in the regular detail page), but the
+      // closed-vocab `DetailActionButton` requires an exhaustive arm
+      // so the metadata is here for future-proofing + so the
+      // InvoiceList row-quick-action's metadata composition can stay
+      // mechanical. Group is "Operational" — the same group as Pay
+      // (destructive operator decision against the row's life).
+      return {
+        group: "Operational",
+        glyph: "🗑",
+        label_hu: "Piszkozat törlése",
+        label_en: "Delete draft",
+        tooltip_hu:
+          "Véglegesen törli a piszkozatot. Ha kiszállításhoz kapcsolódott, a kiszállítás “spawn link”-je egy tranzakcióban megszűnik.",
       };
   }
 }

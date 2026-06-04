@@ -56,11 +56,17 @@
 //!   `InvoiceDraftCreated` pair fires from `issue_invoice::run`. The
 //!   chain back to the draft rides the idempotency-key suffix
 //!   convention.
-//! - On operator delete `InvoiceDraftDeleted` does NOT fire in v1 —
-//!   the audit-walk is happy without it; the existence of
-//!   `InvoiceStaged` without a matching downstream is the "deleted"
-//!   signal. If a future audit need surfaces, that's an additive
-//!   F12 ritual.
+//! - On operator delete `InvoiceDraftDeleted` fires once (S239 / PR-233
+//!   per the S237 §🟡 #13 finding). Carries `draft_id`,
+//!   `source_dispatch_id` (Some(_) when the draft was spawned by a
+//!   dispatch — the matching `dispatches.spawned_invoice_id` is NULLed
+//!   in the SAME transaction per the S237 §🔴 #1 fix), `partner_id`,
+//!   `actor`, and the F8 idempotency key. The pre-S239 posture
+//!   (`InvoiceStaged`-without-downstream as the "deleted" signal) was
+//!   ambiguous: it could not distinguish "draft still pending operator
+//!   issue" from "draft deleted." `InvoiceDraftDeleted` makes the
+//!   deletion explicit so forensic "who deleted which draft when"
+//!   queries are answerable from the chain alone.
 
 use anyhow::{anyhow, Context, Result};
 use duckdb::{params, Connection, Transaction};
@@ -148,6 +154,29 @@ pub struct InvoiceStagedPayload {
 impl InvoiceStagedPayload {
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("JSON serialization of InvoiceStagedPayload cannot fail")
+    }
+}
+
+/// S239 / PR-233 — `invoice.draft_deleted` payload. Mirrors
+/// [`InvoiceStagedPayload`]'s shape so a future audit-walker can
+/// pair the create + delete entries on `draft_id` and the chain
+/// to source dispatch / WO survives the deletion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceDraftDeletedPayload {
+    pub draft_id: String,
+    pub tenant_id: String,
+    pub partner_id: String,
+    pub source_dispatch_id: Option<String>,
+    pub source_wo_id: Option<String>,
+    pub actor: String,
+    pub idempotency_key: String,
+    pub deleted_at: String,
+}
+
+impl InvoiceDraftDeletedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self)
+            .expect("JSON serialization of InvoiceDraftDeletedPayload cannot fail")
     }
 }
 
@@ -316,16 +345,152 @@ pub fn list_drafts(conn: &Connection, tenant: &str) -> Result<Vec<InvoiceDraft>>
         .context("collect list_drafts")
 }
 
-/// Delete one draft by id within the tenant. Returns `true` iff a row
-/// was actually deleted. No audit row is written in v1 (see module docs).
-pub fn delete_draft_in_tx(tx: &Transaction<'_>, tenant: &str, drf_id: &str) -> Result<bool> {
+/// S239 / PR-233 inputs to [`delete_draft_in_tx`].
+///
+/// The caller supplies the audit attribution + ledger context so the
+/// delete can emit `InvoiceDraftDeleted` (S237 §🟡 #13 audit gap fix)
+/// in the same transaction as the row removal + dispatch-pointer
+/// NULL (S237 §🔴 #1 orphan-pointer fix).
+#[derive(Debug, Clone)]
+pub struct DeleteDraftInputs {
+    pub tenant: String,
+    pub drf_id: String,
+    /// Free-text operator/adapter identity persisted in the audit
+    /// payload's `actor` field — same posture as
+    /// [`CreateDraftInputs::actor`].
+    pub actor: String,
+}
+
+/// Outcome of [`delete_draft_in_tx`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteDraftOutcome {
+    /// `false` iff the row was not present at all (idempotent
+    /// concurrent-delete safety per the S239 test
+    /// `concurrent_delete_idempotent`). Caller maps to 404.
+    pub deleted: bool,
+    /// Number of `dispatches` rows whose `spawned_invoice_id`
+    /// pointer was cleared. `0` for a standalone draft (no source
+    /// dispatch) or a dispatch row whose pointer was already NULL;
+    /// `> 0` otherwise. Advisory — the invariant "no dispatch row
+    /// points at `drf_id` after this call" holds for any non-Err
+    /// outcome regardless of the count.
+    pub dispatch_pointers_cleared: usize,
+}
+
+/// Delete one draft by id within the tenant + clear any
+/// `dispatches.spawned_invoice_id` pointer at the draft + emit one
+/// `InvoiceDraftDeleted` audit entry — all in the supplied
+/// transaction.
+///
+/// # Why all three happen in one tx
+///
+/// S237 §🔴 #1 named the orphan-pointer hole: pre-S239 the DELETE
+/// ran alone, so a Shipped dispatch's `spawned_invoice_id =
+/// drf_<ULID>` survived past the row's removal and the SPA
+/// click-through 404'd. The fix is a transactional cascade — either
+/// all three writes commit (row gone, pointer NULL, audit
+/// recorded) or none do (operator sees the error, no torn state).
+///
+/// # Idempotency
+///
+/// Returns `Ok(DeleteDraftOutcome { deleted: false, .. })` when the
+/// `drf_id` row is absent. No audit entry fires in that case —
+/// "delete a nothing" is a no-op, not a state-change worth
+/// recording. The route layer maps `deleted: false` to 404 per the
+/// S237 brief's `concurrent_delete_idempotent` expectation. The
+/// audit-entry's idempotency key (`draft_delete:<drf_id>`) gates
+/// double-emission on RETRIED deletes against the SAME drf_id
+/// within a single transaction window (audit-ledger F8 invariant).
+pub fn delete_draft_in_tx(
+    tx: &Transaction<'_>,
+    ledger_meta: &LedgerMeta,
+    ledger_actor: Actor,
+    inputs: DeleteDraftInputs,
+) -> Result<DeleteDraftOutcome> {
+    if inputs.drf_id.trim().is_empty() {
+        return Err(anyhow!("drf_id must be non-empty"));
+    }
+    if inputs.tenant.trim().is_empty() {
+        return Err(anyhow!("tenant must be non-empty"));
+    }
+
+    // Read the row first so the audit payload carries the durable
+    // partner_id / source_dispatch_id / source_wo_id even after the
+    // DELETE removes the row. A SELECT-then-DELETE inside the same
+    // tx is race-free against any concurrent writer because the tx
+    // holds a write lock on the rows it touches.
+    let prior_row = tx
+        .query_row(
+            "SELECT partner_id, source_dispatch_id, source_wo_id
+             FROM invoice_draft
+             WHERE tenant_id = ? AND drf_id = ?
+             LIMIT 1;",
+            params![&inputs.tenant, &inputs.drf_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .ok();
+
+    let Some((partner_id, source_dispatch_id, source_wo_id)) = prior_row else {
+        return Ok(DeleteDraftOutcome {
+            deleted: false,
+            dispatch_pointers_cleared: 0,
+        });
+    };
+
+    // NULL any dispatch row pointing at this draft BEFORE the DELETE
+    // so a `FOREIGN KEY`-like reasoning chain inspector sees the
+    // pointer clear precede the target removal. (DuckDB doesn't
+    // enforce the FK by construction per [[no-sql-specific]]; the
+    // ordering is purely readability.)
+    let dispatch_pointers_cleared =
+        aberp_dispatch::null_spawned_invoice_id_in_tx(tx, &inputs.tenant, &inputs.drf_id)
+            .context("NULL dispatches.spawned_invoice_id in delete_draft_in_tx")?;
+
     let n = tx
         .execute(
             "DELETE FROM invoice_draft WHERE tenant_id = ? AND drf_id = ?;",
-            params![tenant, drf_id],
+            params![&inputs.tenant, &inputs.drf_id],
         )
         .context("DELETE invoice_draft")?;
-    Ok(n > 0)
+    debug_assert!(
+        n > 0,
+        "row vanished between SELECT and DELETE in the same tx — DuckDB invariant violated"
+    );
+
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format invoice_draft.deleted_at as RFC3339")?;
+    let idempotency_key = format!("draft_delete:{}", inputs.drf_id);
+    let payload = InvoiceDraftDeletedPayload {
+        draft_id: inputs.drf_id.clone(),
+        tenant_id: inputs.tenant.clone(),
+        partner_id,
+        source_dispatch_id,
+        source_wo_id,
+        actor: inputs.actor.clone(),
+        idempotency_key: idempotency_key.clone(),
+        deleted_at: now,
+    };
+    append_in_tx(
+        tx,
+        ledger_meta,
+        EventKind::InvoiceDraftDeleted,
+        payload.to_bytes(),
+        ledger_actor,
+        Some(idempotency_key),
+    )
+    .context("audit append InvoiceDraftDeleted")?;
+
+    Ok(DeleteDraftOutcome {
+        deleted: true,
+        dispatch_pointers_cleared,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -453,8 +618,13 @@ mod tests {
     }
 
     #[test]
-    fn delete_draft_removes_row_without_audit() {
+    fn delete_draft_removes_row_and_emits_audit() {
         let mut conn = open_conn();
+        // S239 / PR-233 — even a standalone-draft delete touches the
+        // `dispatches` table (NULL-pointer cascade with zero matches).
+        // The real route handler defensively ensures this schema; the
+        // unit test mirrors that posture.
+        ensure_minimal_dispatch_schema(&conn);
         let tx = conn.transaction().unwrap();
         let draft = create_draft_in_tx(
             &tx,
@@ -476,9 +646,22 @@ mod tests {
         tx.commit().unwrap();
 
         let tx2 = conn.transaction().unwrap();
-        let deleted = delete_draft_in_tx(&tx2, "test-tenant", &draft.drf_id).unwrap();
+        let outcome = delete_draft_in_tx(
+            &tx2,
+            &ledger_meta(),
+            actor(),
+            DeleteDraftInputs {
+                tenant: "test-tenant".to_string(),
+                drf_id: draft.drf_id.clone(),
+                actor: "operator-A".to_string(),
+            },
+        )
+        .unwrap();
         tx2.commit().unwrap();
-        assert!(deleted);
+        assert!(outcome.deleted);
+        // Standalone draft (no source_dispatch_id) — no dispatch
+        // pointers to clear.
+        assert_eq!(outcome.dispatch_pointers_cleared, 0);
         assert!(read_draft(&conn, "test-tenant", &draft.drf_id)
             .unwrap()
             .is_none());
@@ -642,6 +825,407 @@ mod tests {
         assert!(
             err.is_err(),
             "BillingInvoiceSpawner must loud-fail on duplicate idempotency key (got {err:?})"
+        );
+    }
+
+    // ── S239 / PR-233 — delete-cascade tests ─────────────────────────
+
+    /// Minimal `dispatches` schema fixture for the cascade tests.
+    /// Mirrors only the columns `null_spawned_invoice_id_in_tx` touches
+    /// (`tenant_id`, `dsp_id`, `spawned_invoice_id`) so the test stays
+    /// independent of the full aberp-dispatch migration; the test
+    /// shape is pinned by `aberp_dispatch::ensure_schema` in the
+    /// integration cross-crate tests on the dispatch crate.
+    ///
+    /// We deliberately use a fresh `CREATE TABLE` here rather than
+    /// `aberp_dispatch::ensure_schema` so the unit-test crate does
+    /// not depend on the runtime migration; the dispatch-crate's own
+    /// schema test guards the column set.
+    fn ensure_minimal_dispatch_schema(conn: &Connection) {
+        // The full schema would carry many more columns; the cascade
+        // touches only `spawned_invoice_id`. Aligning with the real
+        // schema's column names + nullability so the helper's SQL
+        // matches verbatim against either schema.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS dispatches (
+                dsp_id              VARCHAR NOT NULL PRIMARY KEY,
+                tenant_id           VARCHAR NOT NULL,
+                spawned_invoice_id  VARCHAR
+            );",
+        )
+        .expect("create minimal dispatches schema");
+    }
+
+    fn insert_dispatch_pointing_at(conn: &Connection, dsp_id: &str, drf_id: &str) {
+        conn.execute(
+            "INSERT INTO dispatches (dsp_id, tenant_id, spawned_invoice_id)
+             VALUES (?, ?, ?);",
+            params![dsp_id, "test-tenant", drf_id],
+        )
+        .expect("insert dispatch row");
+    }
+
+    fn read_dispatch_pointer(conn: &Connection, dsp_id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT spawned_invoice_id FROM dispatches
+             WHERE tenant_id = ? AND dsp_id = ? LIMIT 1;",
+            params!["test-tenant", dsp_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .expect("read dispatch row")
+    }
+
+    /// 🔴 S237 #1 — when a draft was spawned by a dispatch and the
+    /// operator deletes the draft, the dispatch's `spawned_invoice_id`
+    /// pointer MUST be NULLed in the same tx so the SPA's
+    /// click-through never reaches a 404 arm.
+    #[test]
+    fn delete_draft_with_source_dispatch_nulls_pointer() {
+        let mut conn = open_conn();
+        ensure_minimal_dispatch_schema(&conn);
+
+        let tx = conn.transaction().unwrap();
+        let draft = create_draft_in_tx(
+            &tx,
+            &ledger_meta(),
+            actor(),
+            CreateDraftInputs {
+                tenant: "test-tenant".to_string(),
+                partner_id: "ptr_X".to_string(),
+                source_dispatch_id: Some("dsp_X".to_string()),
+                source_wo_id: Some("wo_X".to_string()),
+                product_id: "prd_X".to_string(),
+                qty: Decimal::ONE,
+                notes: None,
+                actor: "a".to_string(),
+                idempotency_key: "idem-create".to_string(),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        insert_dispatch_pointing_at(&conn, "dsp_X", &draft.drf_id);
+
+        let tx2 = conn.transaction().unwrap();
+        let outcome = delete_draft_in_tx(
+            &tx2,
+            &ledger_meta(),
+            actor(),
+            DeleteDraftInputs {
+                tenant: "test-tenant".to_string(),
+                drf_id: draft.drf_id.clone(),
+                actor: "operator-A".to_string(),
+            },
+        )
+        .unwrap();
+        tx2.commit().unwrap();
+
+        assert!(outcome.deleted);
+        assert_eq!(outcome.dispatch_pointers_cleared, 1);
+        assert_eq!(read_dispatch_pointer(&conn, "dsp_X"), None);
+        assert!(read_draft(&conn, "test-tenant", &draft.drf_id)
+            .unwrap()
+            .is_none());
+    }
+
+    /// 🟡 S237 #13 — the `InvoiceDraftDeleted` audit entry MUST fire
+    /// in the same tx as the DELETE so a forensic walker can see
+    /// "who deleted which draft when," and its payload MUST carry the
+    /// `source_dispatch_id` so the chain back to the originating
+    /// dispatch survives the row's removal.
+    #[test]
+    fn delete_draft_emits_audit_with_source_dispatch_id() {
+        let mut conn = open_conn();
+        ensure_minimal_dispatch_schema(&conn);
+
+        let tx = conn.transaction().unwrap();
+        let draft = create_draft_in_tx(
+            &tx,
+            &ledger_meta(),
+            actor(),
+            CreateDraftInputs {
+                tenant: "test-tenant".to_string(),
+                partner_id: "ptr_DELETE".to_string(),
+                source_dispatch_id: Some("dsp_DELETE".to_string()),
+                source_wo_id: Some("wo_DELETE".to_string()),
+                product_id: "prd_DELETE".to_string(),
+                qty: Decimal::from_str("2.5").unwrap(),
+                notes: None,
+                actor: "a".to_string(),
+                idempotency_key: "idem-c".to_string(),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        insert_dispatch_pointing_at(&conn, "dsp_DELETE", &draft.drf_id);
+
+        let tx2 = conn.transaction().unwrap();
+        delete_draft_in_tx(
+            &tx2,
+            &ledger_meta(),
+            actor(),
+            DeleteDraftInputs {
+                tenant: "test-tenant".to_string(),
+                drf_id: draft.drf_id.clone(),
+                actor: "operator-B".to_string(),
+            },
+        )
+        .unwrap();
+        tx2.commit().unwrap();
+
+        // Query the audit-ledger storage table directly — same
+        // posture as the verify-bundle integration tests that walk
+        // chain.jsonl through `audit_ledger`'s row-shape.
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload FROM audit_ledger
+                 WHERE kind = 'invoice.draft_deleted'
+                 ORDER BY seq DESC LIMIT 1;",
+            )
+            .expect("prepare audit query");
+        let payload_bytes: Vec<u8> = stmt
+            .query_row([], |row| row.get::<_, Vec<u8>>(0))
+            .expect("audit row exists");
+        let payload: InvoiceDraftDeletedPayload =
+            serde_json::from_slice(&payload_bytes).expect("audit payload decodes");
+        assert_eq!(payload.draft_id, draft.drf_id);
+        assert_eq!(payload.partner_id, "ptr_DELETE");
+        assert_eq!(payload.source_dispatch_id, Some("dsp_DELETE".to_string()));
+        assert_eq!(payload.source_wo_id, Some("wo_DELETE".to_string()));
+        assert_eq!(payload.actor, "operator-B");
+        assert_eq!(
+            payload.idempotency_key,
+            format!("draft_delete:{}", draft.drf_id)
+        );
+    }
+
+    /// Round-trip for the new payload shape — same posture as
+    /// `invoice_staged_payload_round_trip`. Pins the wire form so a
+    /// future contributor adding a field surfaces the breakage at
+    /// `cargo test` not at runtime.
+    #[test]
+    fn invoice_draft_deleted_payload_round_trip() {
+        let p = InvoiceDraftDeletedPayload {
+            draft_id: "drf_X".to_string(),
+            tenant_id: "t".to_string(),
+            partner_id: "ptr_X".to_string(),
+            source_dispatch_id: Some("dsp_X".to_string()),
+            source_wo_id: Some("wo_X".to_string()),
+            actor: "a".to_string(),
+            idempotency_key: "draft_delete:drf_X".to_string(),
+            deleted_at: "2026-06-04T10:00:00Z".to_string(),
+        };
+        let back: InvoiceDraftDeletedPayload = serde_json::from_slice(&p.to_bytes()).unwrap();
+        assert_eq!(back, p);
+
+        // `None` source ids serialise as JSON null (same posture as
+        // `invoice_staged_payload_none_serializes_as_null_not_omitted`).
+        let p_none = InvoiceDraftDeletedPayload {
+            draft_id: "drf_Y".to_string(),
+            tenant_id: "t".to_string(),
+            partner_id: "ptr_Y".to_string(),
+            source_dispatch_id: None,
+            source_wo_id: None,
+            actor: "a".to_string(),
+            idempotency_key: "draft_delete:drf_Y".to_string(),
+            deleted_at: "2026-06-04T10:00:00Z".to_string(),
+        };
+        let v: serde_json::Value = serde_json::from_slice(&p_none.to_bytes()).unwrap();
+        assert!(v["source_dispatch_id"].is_null());
+        assert!(v["source_wo_id"].is_null());
+    }
+
+    /// Standalone draft (no `source_dispatch_id`) — the cascade MUST
+    /// be a no-op against the `dispatches` table. Verifies the
+    /// SELECT-on-pointer is correctly scoped so a freshly-restored
+    /// dispatch row whose `spawned_invoice_id` happens to be the same
+    /// ULID by accident does NOT get touched (drf_<ULID> collision
+    /// is impossible by construction, but the test pins the SQL
+    /// predicate's tenant scoping anyway).
+    #[test]
+    fn delete_draft_without_source_dispatch_no_dispatch_touch() {
+        let mut conn = open_conn();
+        ensure_minimal_dispatch_schema(&conn);
+
+        // Insert a dispatch that points at SOMEONE ELSE's draft.
+        // Cascade MUST leave it alone.
+        insert_dispatch_pointing_at(&conn, "dsp_OTHER", "drf_someoneelse");
+
+        let tx = conn.transaction().unwrap();
+        let draft = create_draft_in_tx(
+            &tx,
+            &ledger_meta(),
+            actor(),
+            CreateDraftInputs {
+                tenant: "test-tenant".to_string(),
+                partner_id: "ptr_X".to_string(),
+                source_dispatch_id: None,
+                source_wo_id: None,
+                product_id: "prd_X".to_string(),
+                qty: Decimal::ONE,
+                notes: None,
+                actor: "a".to_string(),
+                idempotency_key: "idem-standalone".to_string(),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let tx2 = conn.transaction().unwrap();
+        let outcome = delete_draft_in_tx(
+            &tx2,
+            &ledger_meta(),
+            actor(),
+            DeleteDraftInputs {
+                tenant: "test-tenant".to_string(),
+                drf_id: draft.drf_id.clone(),
+                actor: "operator-A".to_string(),
+            },
+        )
+        .unwrap();
+        tx2.commit().unwrap();
+
+        assert!(outcome.deleted);
+        assert_eq!(outcome.dispatch_pointers_cleared, 0);
+        // The dispatch pointing at someone else's draft is untouched.
+        assert_eq!(
+            read_dispatch_pointer(&conn, "dsp_OTHER"),
+            Some("drf_someoneelse".to_string())
+        );
+    }
+
+    /// Calling delete twice on the same draft → second call returns
+    /// `deleted: false` (caller maps to 404), NOT a 500. Pins the
+    /// S237 brief's `concurrent_delete_idempotent` expectation.
+    #[test]
+    fn concurrent_delete_idempotent() {
+        let mut conn = open_conn();
+        ensure_minimal_dispatch_schema(&conn);
+
+        let tx = conn.transaction().unwrap();
+        let draft = create_draft_in_tx(
+            &tx,
+            &ledger_meta(),
+            actor(),
+            CreateDraftInputs {
+                tenant: "test-tenant".to_string(),
+                partner_id: "ptr_X".to_string(),
+                source_dispatch_id: None,
+                source_wo_id: None,
+                product_id: "prd_X".to_string(),
+                qty: Decimal::ONE,
+                notes: None,
+                actor: "a".to_string(),
+                idempotency_key: "idem-concurrent".to_string(),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // First delete — succeeds.
+        let tx2 = conn.transaction().unwrap();
+        let first = delete_draft_in_tx(
+            &tx2,
+            &ledger_meta(),
+            actor(),
+            DeleteDraftInputs {
+                tenant: "test-tenant".to_string(),
+                drf_id: draft.drf_id.clone(),
+                actor: "operator-A".to_string(),
+            },
+        )
+        .unwrap();
+        tx2.commit().unwrap();
+        assert!(first.deleted);
+
+        // Second delete — returns deleted: false, NOT an Err.
+        let tx3 = conn.transaction().unwrap();
+        let second = delete_draft_in_tx(
+            &tx3,
+            &ledger_meta(),
+            actor(),
+            DeleteDraftInputs {
+                tenant: "test-tenant".to_string(),
+                drf_id: draft.drf_id.clone(),
+                actor: "operator-A".to_string(),
+            },
+        )
+        .unwrap();
+        tx3.commit().unwrap();
+        assert!(!second.deleted);
+        assert_eq!(second.dispatch_pointers_cleared, 0);
+    }
+
+    /// If the audit-emit step fails, the entire tx MUST roll back:
+    /// the draft row remains AND the dispatch pointer is restored.
+    /// Closes the "torn-write" failure mode named in the S239 brief's
+    /// `delete_draft_rollback_on_audit_failure` expectation.
+    ///
+    /// We force the audit append to fail by DROPping the
+    /// `audit_ledger` table after schema setup — the next
+    /// `append_in_tx` call's `read_head` SELECT hits a "table does
+    /// not exist" error. The DROP happens outside the test tx so
+    /// it is visible to the test tx's read.
+    #[test]
+    fn delete_draft_rollback_on_audit_failure() {
+        let mut conn = open_conn();
+        ensure_minimal_dispatch_schema(&conn);
+
+        let tx = conn.transaction().unwrap();
+        let draft = create_draft_in_tx(
+            &tx,
+            &ledger_meta(),
+            actor(),
+            CreateDraftInputs {
+                tenant: "test-tenant".to_string(),
+                partner_id: "ptr_X".to_string(),
+                source_dispatch_id: Some("dsp_X".to_string()),
+                source_wo_id: Some("wo_X".to_string()),
+                product_id: "prd_X".to_string(),
+                qty: Decimal::ONE,
+                notes: None,
+                actor: "a".to_string(),
+                idempotency_key: "idem-create".to_string(),
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        insert_dispatch_pointing_at(&conn, "dsp_X", &draft.drf_id);
+
+        // Force audit-emit failure — drop the audit_ledger table so
+        // the next append_in_tx hits a missing-table error mid-cascade.
+        conn.execute_batch("DROP TABLE audit_ledger;")
+            .expect("drop audit_ledger");
+
+        // Now the real delete_draft_in_tx must fail at audit append
+        // AND the tx must roll back — row + pointer survive.
+        let tx2 = conn.transaction().unwrap();
+        let err = delete_draft_in_tx(
+            &tx2,
+            &ledger_meta(),
+            actor(),
+            DeleteDraftInputs {
+                tenant: "test-tenant".to_string(),
+                drf_id: draft.drf_id.clone(),
+                actor: "operator-A".to_string(),
+            },
+        );
+        assert!(
+            err.is_err(),
+            "audit-table-gone must surface as Err (got {err:?})"
+        );
+        // Caller drops the tx without committing — DuckDB rolls back
+        // automatically on Drop.
+        drop(tx2);
+
+        // Draft row STILL present (rollback worked).
+        assert!(read_draft(&conn, "test-tenant", &draft.drf_id)
+            .unwrap()
+            .is_some());
+        // Dispatch pointer STILL pointing at the draft (rollback
+        // worked).
+        assert_eq!(
+            read_dispatch_pointer(&conn, "dsp_X"),
+            Some(draft.drf_id.clone())
         );
     }
 }

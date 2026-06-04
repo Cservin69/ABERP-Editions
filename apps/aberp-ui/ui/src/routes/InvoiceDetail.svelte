@@ -995,6 +995,12 @@
         return "Letöltés…";
       case "Email":
         return "Email küldése…";
+      case "Delete":
+        // S239 / PR-233 — the detail-modal never renders Delete (it's
+        // surfaced as a row quick-action on the InvoiceList); the
+        // exhaustive arm exists so the closed-vocab switch stays
+        // type-complete. The string is unreachable at runtime.
+        return "Törlés folyamatban…";
     }
   }
 

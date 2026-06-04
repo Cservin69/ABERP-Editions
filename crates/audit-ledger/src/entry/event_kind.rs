@@ -1017,6 +1017,34 @@ pub enum EventKind {
     ///
     /// F12 four-edit ritual fires once.
     InvoiceStaged,
+
+    /// S239 / PR-233 — a pre-allocation invoice draft was deleted by
+    /// the operator. Distinct from `InvoiceStaged` (which fires at
+    /// creation) and from `InvoiceMarkedAbandoned` (which fires for an
+    /// already-allocated `invoice` row stuck in an in-flight NAV state
+    /// per PR-8 / ADR-0009 §"Operator unblock"). The deletion event
+    /// closes the audit gap S237 §🟡 #13 surfaced: a draft can be
+    /// removed from `invoice_draft` but pre-PR-233 the audit ledger
+    /// recorded nothing — `InvoiceStaged`-without-downstream was the
+    /// only "deleted" signal, which is insufficient for forensic
+    /// "who deleted which draft when" queries.
+    ///
+    /// Carries `draft_id` (`drf_<ULID>`), `tenant_id`, `partner_id`,
+    /// the optional `source_dispatch_id` (Some(_) when the deleted
+    /// draft was spawned by a dispatch — the `dispatches.spawned_invoice_id`
+    /// pointer is NULLed in the same transaction per the S237 §🔴 #1
+    /// fix), the `actor` string, and the F8 idempotency key
+    /// (`draft_delete:<drf_id>` — unique by construction since a
+    /// `drf_<ULID>` can be deleted at most once).
+    ///
+    /// `invoice.` prefix family because the entry is keyed by a
+    /// `drf_<ULID>` id; same per-OUTGOING-invoice export bundle
+    /// exclusion rationale as `InvoiceStaged` (drafts have no
+    /// `inv_<ULID>` so the bundle's id-filter never matches a draft
+    /// deletion row).
+    ///
+    /// F12 four-edit ritual fires once.
+    InvoiceDraftDeleted,
 }
 
 impl EventKind {
@@ -1074,6 +1102,7 @@ impl EventKind {
             EventKind::DispatchCreated => "mes.dispatch_created",
             EventKind::DispatchShipped => "mes.dispatch_shipped",
             EventKind::InvoiceStaged => "invoice.staged",
+            EventKind::InvoiceDraftDeleted => "invoice.draft_deleted",
         }
     }
 
@@ -1142,6 +1171,7 @@ impl EventKind {
             "mes.dispatch_created" => Ok(EventKind::DispatchCreated),
             "mes.dispatch_shipped" => Ok(EventKind::DispatchShipped),
             "invoice.staged" => Ok(EventKind::InvoiceStaged),
+            "invoice.draft_deleted" => Ok(EventKind::InvoiceDraftDeleted),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1202,6 +1232,7 @@ mod tests {
             EventKind::DispatchCreated,
             EventKind::DispatchShipped,
             EventKind::InvoiceStaged,
+            EventKind::InvoiceDraftDeleted,
         ];
         for v in variants {
             let s = v.as_str();
@@ -2173,6 +2204,60 @@ mod tests {
         assert_ne!(
             EventKind::InvoiceStaged.as_str(),
             EventKind::DispatchCreated.as_str()
+        );
+    }
+
+    /// S239 / PR-233 — `InvoiceDraftDeleted` uses the `invoice.`
+    /// prefix family for the same rationale as `InvoiceStaged`: the
+    /// entry is keyed by a `drf_<ULID>` (a pre-allocation draft id),
+    /// not an `inv_<ULID>`, so the per-OUTGOING-invoice export bundle's
+    /// `invoice.*` glob never sweeps a draft-deletion row into a
+    /// downstream invoice's evidence bundle. The deletion event closes
+    /// the audit-trail gap S237 §🟡 #13 named.
+    #[test]
+    fn s239_invoice_draft_deleted_uses_invoice_prefix() {
+        assert_eq!(
+            EventKind::InvoiceDraftDeleted.as_str(),
+            "invoice.draft_deleted"
+        );
+        assert!(EventKind::InvoiceDraftDeleted
+            .as_str()
+            .starts_with("invoice."));
+        assert!(!EventKind::InvoiceDraftDeleted.as_str().starts_with("mes."));
+        assert!(!EventKind::InvoiceDraftDeleted
+            .as_str()
+            .starts_with("system."));
+    }
+
+    /// S239 / PR-233 — `InvoiceDraftDeleted` MUST be distinct from
+    /// every prior kind in the draft / invoice lifecycle, especially
+    /// `InvoiceStaged` (the create-side companion), `InvoiceMarkedAbandoned`
+    /// (semantically close — both signal "this invoice will not
+    /// complete the chain" — but applies to ALLOCATED invoices stuck
+    /// in NAV, not pre-allocation drafts), and the storno/modify
+    /// chain entries. Same fork-discipline posture as
+    /// `s236_invoice_staged_is_distinct` / `pr_13_annulment_kinds_are_distinct_from_invoice_kinds`.
+    #[test]
+    fn s239_invoice_draft_deleted_is_distinct() {
+        assert_ne!(
+            EventKind::InvoiceDraftDeleted.as_str(),
+            EventKind::InvoiceStaged.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceDraftDeleted.as_str(),
+            EventKind::InvoiceMarkedAbandoned.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceDraftDeleted.as_str(),
+            EventKind::InvoiceDraftCreated.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceDraftDeleted.as_str(),
+            EventKind::InvoiceStornoIssued.as_str()
+        );
+        assert_ne!(
+            EventKind::InvoiceDraftDeleted.as_str(),
+            EventKind::DispatchShipped.as_str()
         );
     }
 

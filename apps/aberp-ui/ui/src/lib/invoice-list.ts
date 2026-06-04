@@ -60,7 +60,7 @@ export function buyerColumnDisplay(name: string | null): string {
  * the surface area the brief explicitly named. */
 export type RowQuickAction = Extract<
   DetailActionButton,
-  "Download" | "Submit" | "Storno" | "Pay"
+  "Download" | "Submit" | "Storno" | "Pay" | "Delete"
 >;
 
 /** PR-65 / session-86 — filter the detail-modal button table down
@@ -105,6 +105,11 @@ export function quickActionsForState(
   if (detail.includes("Submit") && state === "Ready") out.push("Submit");
   if (detail.includes("Pay")) out.push("Pay");
   if (detail.includes("Storno")) out.push("Storno");
+  // S239 / PR-233 — surface the Delete row affordance on Draft rows.
+  // Mirror of the `buttonsForState("Draft")` arm; the InvoiceList
+  // gates the click on a confirmation modal that names any source
+  // dispatch per [[hulye-biztos]].
+  if (detail.includes("Delete")) out.push("Delete");
   return out;
 }
 
@@ -129,6 +134,8 @@ export function quickActionMeta(action: RowQuickAction): QuickActionMeta {
       return { glyph: "💰", label: "Mark as paid" };
     case "Storno":
       return { glyph: "⊘", label: "Cancel (storno)" };
+    case "Delete":
+      return { glyph: "🗑", label: "Delete draft" };
   }
 }
 

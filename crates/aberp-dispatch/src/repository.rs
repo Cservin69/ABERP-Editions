@@ -599,6 +599,43 @@ pub fn cancel_dispatch(
     Ok(live)
 }
 
+// ── Spawned-invoice-id cleanup ─────────────────────────────────────
+
+/// S239 / PR-233 — NULL the `spawned_invoice_id` column on every
+/// dispatch row that currently points at the given `drf_<ULID>`.
+///
+/// Called from the invoice-draft delete path inside the same
+/// transaction as the `DELETE FROM invoice_draft` so the orphan
+/// pointer S237 §🔴 #1 named cannot exist by construction: either
+/// both writes commit (draft gone, dispatch pointer NULL) or both
+/// roll back (draft + pointer unchanged).
+///
+/// Returns the number of dispatch rows that had their pointer
+/// cleared (`0` when the deleted draft was never pointed at — i.e.,
+/// a standalone draft with no source dispatch, or a draft whose
+/// dispatch was already cancelled / had its pointer manually
+/// detached). The caller treats the count as advisory; the
+/// invariant is "no dispatch row points at `drf_id` after this
+/// call returns Ok," and that holds for any non-Err outcome
+/// regardless of the count.
+///
+/// Tenant-scoped so a cross-tenant `drf_<ULID>` collision (which
+/// the ULID space rules out by construction, but [[trust-code-not-operator]]
+/// belt-and-braces) could not affect a sibling tenant's dispatch
+/// rows.
+pub fn null_spawned_invoice_id_in_tx(
+    tx: &Transaction<'_>,
+    tenant: &str,
+    drf_id: &str,
+) -> anyhow::Result<usize> {
+    tx.execute(
+        "UPDATE dispatches SET spawned_invoice_id = NULL
+         WHERE tenant_id = ? AND spawned_invoice_id = ?;",
+        params![tenant, drf_id],
+    )
+    .context("UPDATE dispatches SET spawned_invoice_id = NULL")
+}
+
 // ── Reads ──────────────────────────────────────────────────────────
 
 /// List dispatches in the tenant, optionally filtering by state.

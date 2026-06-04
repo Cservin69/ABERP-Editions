@@ -9911,16 +9911,17 @@ async fn handle_delete_invoice_draft(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    if let Err(resp) = require_ready(&state) {
-        return resp;
-    }
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
     let state_for_task = state.clone();
     let id_for_task = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        delete_invoice_draft_request(&state_for_task, &id_for_task)
+        delete_invoice_draft_request(&state_for_task, &operator_login, &id_for_task)
     })
     .await;
     let outcome = match result {
@@ -9933,8 +9934,8 @@ async fn handle_delete_invoice_draft(
         }
     };
     match outcome {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (
+        Ok(o) if o.deleted => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => (
             StatusCode::NOT_FOUND,
             Json(error_body(format!("invoice draft {id} not found"))),
         )
@@ -9943,16 +9944,43 @@ async fn handle_delete_invoice_draft(
     }
 }
 
-pub fn delete_invoice_draft_request(state: &AppState, drf_id: &str) -> Result<bool> {
+pub fn delete_invoice_draft_request(
+    state: &AppState,
+    operator_login: &str,
+    drf_id: &str,
+) -> Result<invoice_draft::DeleteDraftOutcome> {
     let mut conn = Connection::open(&*state.db_path)
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema (defensive)")?;
+    // S239 / PR-233 — defensive `ensure_schema` for the `dispatches`
+    // table so the in-tx UPDATE of `spawned_invoice_id` doesn't fail
+    // on a fresh tenant whose dispatch-board boot-time migration
+    // hasn't been observed yet.
+    aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema (defensive)")?;
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("binary hash unavailable")?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
     let tx = conn
         .transaction()
         .context("begin delete_invoice_draft transaction")?;
-    let deleted = invoice_draft::delete_draft_in_tx(&tx, state.tenant.as_str(), drf_id)?;
+    let outcome = invoice_draft::delete_draft_in_tx(
+        &tx,
+        &ledger_meta,
+        ledger_actor,
+        invoice_draft::DeleteDraftInputs {
+            tenant: state.tenant.as_str().to_string(),
+            drf_id: drf_id.to_string(),
+            actor: operator_login.to_string(),
+        },
+    )?;
     tx.commit().context("commit delete_invoice_draft tx")?;
-    Ok(deleted)
+    if outcome.deleted {
+        sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    }
+    Ok(outcome)
 }
 
 /// Best-effort audit-mirror sync after a successful write transaction.

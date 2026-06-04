@@ -850,7 +850,13 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // `InvoiceSequenceReserved` + `InvoiceDraftCreated` pair against
         // the freshly minted `inv_*`. Mirror of the bundle writer's
         // posture in `export_invoice_bundle::extract_nav_xml`.
-        | EventKind::InvoiceStaged => (None, ""),
+        | EventKind::InvoiceStaged
+        // S239 / PR-233 — pre-allocation invoice-draft DELETION event.
+        // Same prefix-family + bundle-exclusion rationale as
+        // `InvoiceStaged`: payload is keyed by `drf_<ULID>` not
+        // `inv_<ULID>`, so the per-OUTGOING-invoice bundle's id-filter
+        // never matches a draft-deletion row. No NAV bytes carried.
+        | EventKind::InvoiceDraftDeleted => (None, ""),
     };
 
     Ok(NavExtraction {

@@ -125,6 +125,13 @@ const TABLE: Expected[] = [
   // (which itself will 404 — the SPA still shows the buttons so the
   // failure is visible per CLAUDE.md rule 12).
   { state: "Unknown", buttons: ["Email", "Download"] },
+  // S236 / S239 — pre-allocation Draft. No NAV number, no PDF, no
+  // sequence slot burned; the row's only legal operator affordance
+  // is Delete (cascades the dispatch's spawn-link pointer in one tx
+  // per S237 §🔴 #1). PR-233 surfaces this through the
+  // ConfirmActionModal so the consequence is named before the
+  // destructive action fires.
+  { state: "Draft", buttons: ["Delete"] },
 ];
 
 describe("buttonsForState", () => {
@@ -181,12 +188,16 @@ describe("buttonsForState", () => {
     );
   });
 
-  it("Download button is present on every state", () => {
-    // The printed PDF exists from the moment the draft is created
-    // (A155). The download button stays available across the entire
-    // lifecycle; a regression that hid it on a non-Ready state would
-    // strand the operator without the operator-deliverable artifact.
+  it("Download button is present on every allocated state", () => {
+    // The printed PDF exists from the moment a `Ready+` row is
+    // allocated (A155). The download button stays available across
+    // the entire allocated lifecycle; a regression that hid it on a
+    // non-Ready allocated state would strand the operator without
+    // the operator-deliverable artifact. The pre-allocation Draft
+    // state is the exception — no PDF exists yet — and is
+    // explicitly skipped here.
     for (const { state, buttons } of TABLE) {
+      if (state === "Draft") continue;
       expect(
         buttons.includes("Download"),
         `state=${state} must include Download`,
@@ -200,11 +211,12 @@ describe("buttonsForState", () => {
     // switch (there is none — TypeScript catches the missing arm at
     // npm run check), but the runtime helper would throw at the
     // exhaustiveness boundary. This pin asserts the test table
-    // covers the eleven labels per ADR-0036 §2.
+    // covers every InvoiceState label (eleven post-S236 + Draft = twelve).
     const stateNames = TABLE.map((row) => row.state).sort();
     const expected: InvoiceState[] = [
       "Abandoned",
       "Amended",
+      "Draft",
       "Finalized",
       "Pending",
       "PendingNavExists",
@@ -249,13 +261,16 @@ describe("buttonsForState", () => {
 
   // ── PR-92 / ADR-0047 — Email button pins ──────────────────────────
 
-  it("Email button is present on every state", () => {
-    // PR-92 — the PDF exists from the moment the draft is created
-    // (A155), so the SMTP send button is available at any point in
-    // the lifecycle. Even terminal states (Rejected / Storno /
-    // Abandoned) keep the button so the operator can resend the
-    // original to a buyer who lost the email.
+  it("Email button is present on every allocated state", () => {
+    // PR-92 — the PDF exists from the moment an `inv_*` row is
+    // allocated (A155), so the SMTP send button is available at any
+    // point in the allocated lifecycle. Even terminal states
+    // (Rejected / Storno / Abandoned) keep the button so the
+    // operator can resend the original to a buyer who lost the
+    // email. The pre-allocation Draft state is the exception (no
+    // PDF yet, no email-able artifact) and is explicitly skipped.
     for (const { state, buttons } of TABLE) {
+      if (state === "Draft") continue;
       expect(
         buttons.includes("Email"),
         `state=${state} must include Email`,
@@ -414,6 +429,7 @@ describe("buttonsForState", () => {
       "Storno",
       "Amended",
       "Abandoned",
+      "Draft",
     ];
     for (const state of nonFinalized) {
       expect(buttonsForState(state, false).includes("Pay")).toBe(false);

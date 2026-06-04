@@ -119,6 +119,10 @@ const QUICK_ACTION_TABLE: QuickActionExpectation[] = [
   // Unknown — no entries; Download still surfaced (it will 404,
   // operator-visible per CLAUDE.md rule 12).
   { state: "Unknown", actions: ["Download"] },
+  // S236 / S239 — pre-allocation Draft rows surface only the
+  // S239 Delete quick-action (cascades the dispatch's
+  // spawned_invoice_id pointer per S237 §🔴 #1).
+  { state: "Draft", actions: ["Delete"] },
 ];
 
 describe("quickActionsForState", () => {
@@ -150,12 +154,15 @@ describe("quickActionsForState", () => {
     expect(statesWithStorno).toEqual(["Finalized"]);
   });
 
-  it("Download quick-action is present on every state", () => {
-    // A155 / PR-44ε.UI: the printed PDF exists from the moment the
-    // draft is created. Hiding the row-level download for any
-    // lifecycle state would strand the operator without the
-    // operator-deliverable artifact at scan time.
+  it("Download quick-action is present on every allocated state", () => {
+    // A155 / PR-44ε.UI: the printed PDF exists from the moment an
+    // `inv_*` row is allocated. Hiding the row-level download for
+    // any allocated lifecycle state would strand the operator
+    // without the operator-deliverable artifact at scan time. The
+    // pre-allocation Draft state has no PDF yet and is explicitly
+    // skipped here.
     for (const { state, actions } of QUICK_ACTION_TABLE) {
+      if (state === "Draft") continue;
       expect(
         actions.includes("Download"),
         `state=${state} must include Download`,
@@ -202,6 +209,7 @@ describe("quickActionsForState", () => {
     const expected: InvoiceState[] = [
       "Abandoned",
       "Amended",
+      "Draft",
       "Finalized",
       "Pending",
       "PendingNavExists",
@@ -253,6 +261,7 @@ describe("quickActionsForState", () => {
       "Storno",
       "Amended",
       "Abandoned",
+      "Draft",
     ];
     for (const state of nonFinalized) {
       expect(quickActionsForState(state, false).includes("Pay")).toBe(false);
@@ -286,6 +295,11 @@ describe("quickActionMeta", () => {
     expect(quickActionMeta("Pay")).toEqual({
       glyph: "💰",
       label: "Mark as paid",
+    });
+    // S239 / PR-233 — the pre-allocation draft Delete action.
+    expect(quickActionMeta("Delete")).toEqual({
+      glyph: "🗑",
+      label: "Delete draft",
     });
   });
 });

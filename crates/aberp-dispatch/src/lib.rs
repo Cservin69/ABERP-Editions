@@ -85,9 +85,10 @@ pub use error::DispatchError;
 pub use repository::{
     cancel_dispatch, count_dispatches_by_state, count_dispatches_shipped_today,
     count_eligible_work_orders, create_dispatch, ensure_schema, get_dispatch, list_dispatches,
-    list_eligible_work_orders, mark_shipped, CreateDispatchInputs, Dispatch, DispatchStateCounts,
-    DispatchWriteContext, EligibleWorkOrder, InvoiceSpawner, MarkShippedInputs, MarkShippedOutcome,
-    NoopInvoiceSpawner, MAX_DISPATCH_LIST_LIMIT, MAX_ELIGIBLE_WO_LIMIT,
+    list_eligible_work_orders, mark_shipped, null_spawned_invoice_id_in_tx, CreateDispatchInputs,
+    Dispatch, DispatchStateCounts, DispatchWriteContext, EligibleWorkOrder, InvoiceSpawner,
+    MarkShippedInputs, MarkShippedOutcome, NoopInvoiceSpawner, MAX_DISPATCH_LIST_LIMIT,
+    MAX_ELIGIBLE_WO_LIMIT,
 };
 pub use state::{next_dispatch_state, DispatchAction, DispatchStateError};
 pub use types::{CarrierKind, DispatchState};

@@ -105,6 +105,16 @@
   // software, so the operator needs an affordance to annotate the
   // row from their own records.
   import ExtNavPartnerPickerModal from "../lib/ExtNavPartnerPickerModal.svelte";
+  // S239 / PR-233 — shared dark-themed confirmation modal for the
+  // Draft-delete flow. Replaces `window.confirm` per [[hulye-biztos]]
+  // + [[spa-dark-theme-default]] + the S237 §🟡 #3 finding.
+  import ConfirmActionModal from "../lib/ConfirmActionModal.svelte";
+  import {
+    composeDraftDeleteCopy,
+    loadDraftForDeleteConfirm,
+    performDraftDelete,
+    type DraftDeleteCopy,
+  } from "../lib/draft-delete";
 
   // PR-87 / session-112 — sessionStorage key the new `#/invoices-new`
   // route stashes the just-issued invoice id under, so that on
@@ -236,6 +246,16 @@
   let hintsVisible: boolean = $state(true);
   let searchInputEl: HTMLInputElement | null = $state(null);
   const parserState = makeHotkeyParserState();
+
+  // S239 / PR-233 — Draft-delete confirmation modal state. `null`
+  // keeps the modal closed; a populated object opens it with copy
+  // composed against the draft's `source_dispatch_id`. `busy` flips
+  // true while the API DELETE is in-flight to gate double-clicks.
+  let draftDeleteContext: {
+    drfId: string;
+    copy: DraftDeleteCopy;
+    busy: boolean;
+  } | null = $state(null);
 
   // S220 / PR-217 — partner-picker modal state. `null` = closed; a
   // string id opens the modal for the named restored ExtNav row.
@@ -581,6 +601,63 @@
       case "Storno":
         void triggerRowStorno(row);
         return;
+      case "Delete":
+        // S239 / PR-233 — Draft delete. Fetch the draft so we know
+        // whether to surface the dispatch-link consequence in the
+        // modal copy, THEN open the modal. The actual DELETE fires
+        // only on operator confirm — the gate's whole point is to
+        // surface the consequence per [[hulye-biztos]].
+        void openDraftDeleteModal(row);
+        return;
+    }
+  }
+
+  // S239 / PR-233 — Draft-delete flow handlers.
+  async function openDraftDeleteModal(row: InvoiceListItem) {
+    // Mark the row busy so a second click can't queue another
+    // open while the draft lookup is in flight.
+    busyRow = { invoiceId: row.invoice_id, action: "Delete" };
+    actionError = null;
+    try {
+      const draft = await loadDraftForDeleteConfirm(row.invoice_id);
+      draftDeleteContext = {
+        drfId: row.invoice_id,
+        copy: composeDraftDeleteCopy(draft.source_dispatch_id),
+        busy: false,
+      };
+    } catch (err: unknown) {
+      actionError = {
+        invoiceId: row.invoice_id,
+        action: "Delete",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      busyRow = null;
+    }
+  }
+
+  function cancelDraftDelete() {
+    draftDeleteContext = null;
+  }
+
+  async function confirmDraftDelete() {
+    if (draftDeleteContext === null) return;
+    const drfId = draftDeleteContext.drfId;
+    draftDeleteContext = { ...draftDeleteContext, busy: true };
+    try {
+      await performDraftDelete(drfId);
+      draftDeleteContext = null;
+      // [[trust-code-not-operator]] — refresh the whole list so the
+      // deleted draft disappears AND any concurrent sibling writes
+      // surface. Mirror of the partner-picker post-update posture.
+      void refresh();
+    } catch (err: unknown) {
+      actionError = {
+        invoiceId: drfId,
+        action: "Delete",
+        message: err instanceof Error ? err.message : String(err),
+      };
+      draftDeleteContext = null;
     }
   }
 
@@ -1348,6 +1425,23 @@
   onUpdated={onPartnerPickerUpdated}
   onClose={closePartnerPicker}
 />
+
+<!-- S239 / PR-233 — Draft-delete confirmation modal. Opens when
+     `draftDeleteContext !== null`; carries the dispatch-link
+     consequence sentence per [[hulye-biztos]] when the draft was
+     spawned by a dispatch. -->
+{#if draftDeleteContext !== null}
+  <ConfirmActionModal
+    title={draftDeleteContext.copy.title}
+    body={draftDeleteContext.copy.body}
+    consequence={draftDeleteContext.copy.consequence}
+    confirmLabel={draftDeleteContext.copy.confirmLabel}
+    cancelLabel={draftDeleteContext.copy.cancelLabel}
+    busy={draftDeleteContext.busy}
+    onConfirm={confirmDraftDelete}
+    onCancel={cancelDraftDelete}
+  />
+{/if}
 
 <style>
   .screen {

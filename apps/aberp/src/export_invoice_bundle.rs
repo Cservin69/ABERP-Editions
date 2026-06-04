@@ -730,7 +730,14 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // the freshly minted `inv_*` id — those are the entries the
         // bundle includes; the prior `InvoiceStaged` row belongs to the
         // `drf_*` id and stays outside the bundle. No NAV bytes carried.
-        | EventKind::InvoiceStaged => None,
+        | EventKind::InvoiceStaged
+        // S239 / PR-233 — pre-allocation invoice-draft DELETION event.
+        // Same `drf_<ULID>` keying + bundle-exclusion rationale as
+        // `InvoiceStaged`: a deleted draft never receives a downstream
+        // `inv_<ULID>`, so the per-OUTGOING-invoice bundle's id-filter
+        // never matches the row. No NAV bytes (operator deletion is a
+        // purely local event with no NAV-side correspondent).
+        | EventKind::InvoiceDraftDeleted => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
