@@ -66,6 +66,17 @@ ulid = { workspace = true }
 # drops. Same posture as every other ABERP daemon.
 tracing = { workspace = true }
 
+# PR-240 / S247 — HTTP client for the MTConnect adapter's `/current`
+# poll. Same workspace pin (rustls + gzip) every other ABERP HTTP
+# caller uses (nav-transport, mnb-rates, aberp-quote-intake).
+reqwest = { workspace = true }
+
+# PR-240 / S247 — streaming XML parser for the MTConnect Streams 1.7
+# `/current` response. Same workspace pin as nav-transport / mnb-rates
+# / nav-xsd-validator; per ADR-0021 §A8 quick-xml is the project's
+# XML toolkit.
+quick-xml = { workspace = true }
+
 [dev-dependencies]
 # tokio test utilities — turn-on the test-util feature to drive paused
 # clocks in lifecycle tests, plus net/sync/io for the TCP listener

@@ -139,6 +139,8 @@ dependencies = [
  "aberp-audit-ledger",
  "async-trait",
  "duckdb",
+ "quick-xml 0.36.2",
+ "reqwest 0.13.3",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
