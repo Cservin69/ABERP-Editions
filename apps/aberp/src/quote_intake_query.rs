@@ -35,6 +35,11 @@ pub struct QuoteIntakeRow {
     pub material: Option<String>,
     pub quantity: Option<String>,
     pub notes: Option<String>,
+    /// S255 / PR-244 — `Some(<drf_id>)` when the operator already
+    /// clicked "Create draft invoice" on this row. The SPA renders
+    /// the "→ Draft" link instead of the pickup button when set.
+    /// `None` for never-picked-up quotes.
+    pub picked_up_drf_id: Option<String>,
 }
 
 /// List staged quote-intake rows for a tenant, ordered by intake time
@@ -47,9 +52,15 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Vec<
     // on a tenant that has only configured the daemon (but never had
     // it spawn).
     conn.execute_batch(SCHEMA_BACKSTOP)?;
+    // S255 / PR-244 — additive `picked_up_drf_id` column. Same
+    // backstop posture as the base schema above: a fresh tenant DB
+    // (or a pre-S255 boot followed by SPA load) gets the column
+    // lazily.
+    conn.execute_batch(S255_MIGRATION_BACKSTOP)?;
     let mut stmt = conn.prepare(
         "SELECT quote_id, invoice_id, received_at, intake_at,
-                status_writeback_at, raw_payload, prepared_draft
+                status_writeback_at, raw_payload, prepared_draft,
+                picked_up_drf_id
            FROM quote_intake_log
           WHERE tenant_id = ?1
           ORDER BY intake_at DESC
@@ -65,6 +76,7 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Vec<
         let status_writeback_at: Option<String> = row.get(4).ok();
         let raw_payload: String = row.get(5).unwrap_or_default();
         let prepared_draft: String = row.get(6).unwrap_or_default();
+        let picked_up_drf_id: Option<String> = row.get(7).ok().flatten();
 
         let summary = extract_row_summary(&raw_payload, &prepared_draft);
         out.push(QuoteIntakeRow {
@@ -79,6 +91,7 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Vec<
             material: summary.material,
             quantity: summary.quantity,
             notes: summary.notes,
+            picked_up_drf_id,
         });
     }
     Ok(out)
@@ -98,6 +111,15 @@ CREATE TABLE IF NOT EXISTS quote_intake_log (
     raw_payload           VARCHAR NOT NULL,
     prepared_draft        VARCHAR NOT NULL
 );
+";
+
+/// S255 / PR-244 — additive `picked_up_drf_id` column. Mirrors
+/// the daemon-write side's `log_table::S255_MIGRATION_SQL`; the
+/// route-side mirror runs the ALTER lazily on every list call so a
+/// fresh tenant whose daemon never spawned still gets the column.
+const S255_MIGRATION_BACKSTOP: &str = "
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS picked_up_drf_id VARCHAR;
 ";
 
 #[derive(Debug, Default)]

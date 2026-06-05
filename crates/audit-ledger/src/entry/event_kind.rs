@@ -1045,6 +1045,33 @@ pub enum EventKind {
     ///
     /// F12 four-edit ritual fires once.
     InvoiceDraftDeleted,
+
+    /// S255 / PR-244 — operator clicked "Create draft invoice" on a
+    /// quote staged by [[quote-intake-crate-s210]]. Distinct from
+    /// `InvoiceStaged` (which also fires from `create_draft_in_tx` in
+    /// the same transaction): this is the QUOTE-side event whose
+    /// payload anchors the pickup chain at the `quote_id` key so the
+    /// idempotency walk + the "→ Draft #N" SPA link can answer "has
+    /// this quote been picked up yet?" without joining on the
+    /// `invoice_draft` table. `InvoiceStaged` answers "what does this
+    /// draft contain"; `InvoicePickedUpFromQuote` answers "which quote
+    /// became this draft."
+    ///
+    /// Carries `quote_id`, `draft_id` (`drf_<ULID>`), `tenant_id`,
+    /// `partner_id`, `partner_created` (`true` iff the resolver minted
+    /// a fresh `prt_<ULID>` because no existing partner matched on
+    /// legal_name+address), the `actor` string, and the F8 idempotency
+    /// key (`quote_pickup:<quote_id>` — unique per quote, regardless
+    /// of how many drafts a re-pickup after S239 delete produces; the
+    /// per-pickup uniqueness rides on a `:retry<N>` suffix the route
+    /// appends when the prior draft is gone).
+    ///
+    /// `invoice.` prefix family. The audit walker keys the dedup on
+    /// `quote_id` because that is the durable identifier; `draft_id`
+    /// is the consequence, not the cause.
+    ///
+    /// F12 four-edit ritual fires once.
+    InvoicePickedUpFromQuote,
 }
 
 impl EventKind {
@@ -1103,6 +1130,7 @@ impl EventKind {
             EventKind::DispatchShipped => "mes.dispatch_shipped",
             EventKind::InvoiceStaged => "invoice.staged",
             EventKind::InvoiceDraftDeleted => "invoice.draft_deleted",
+            EventKind::InvoicePickedUpFromQuote => "invoice.picked_up_from_quote",
         }
     }
 
@@ -1172,6 +1200,7 @@ impl EventKind {
             "mes.dispatch_shipped" => Ok(EventKind::DispatchShipped),
             "invoice.staged" => Ok(EventKind::InvoiceStaged),
             "invoice.draft_deleted" => Ok(EventKind::InvoiceDraftDeleted),
+            "invoice.picked_up_from_quote" => Ok(EventKind::InvoicePickedUpFromQuote),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1233,6 +1262,7 @@ mod tests {
             EventKind::DispatchShipped,
             EventKind::InvoiceStaged,
             EventKind::InvoiceDraftDeleted,
+            EventKind::InvoicePickedUpFromQuote,
         ];
         for v in variants {
             let s = v.as_str();

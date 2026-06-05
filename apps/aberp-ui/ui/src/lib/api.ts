@@ -452,6 +452,9 @@ export interface InvoiceDraftView {
   partner_id: string;
   source_dispatch_id: string | null;
   source_wo_id: string | null;
+  /** S255 / PR-244 — `Some(<quote_id>)` for a draft minted by the
+   * quote-pickup route; `null` for the dispatch-spawn path. */
+  source_quote_id: string | null;
   product_id: string;
   qty: string;
   notes: string | null;
@@ -2539,10 +2542,32 @@ export interface QuoteIntakeRow {
   material: string | null;
   quantity: string | null;
   notes: string | null;
+  /** S255 / PR-244 — `null` while the operator has not picked up the
+   * quote; `drf_<ULID>` once a draft has been minted. The list view
+   * renders the pickup button when null and the "→ Draft" link when
+   * populated. */
+  picked_up_drf_id: string | null;
 }
 
 export async function listQuoteIntake(): Promise<QuoteIntakeRow[]> {
   return invoke<QuoteIntakeRow[]>("list_quote_intake");
+}
+
+/** S255 / PR-244 — outcome of POST `/api/quotes/{quote_id}/pickup-as-draft`.
+ * The SPA navigates to `#/invoices` after pickup; `partner_created`
+ * drives the optional ConfirmActionModal warning copy (and is shown
+ * inline on the row label once the list refreshes). */
+export interface PickupQuoteOutcome {
+  drf_id: string;
+  partner_id: string;
+  partner_created: boolean;
+  /** `true` iff the call short-circuited the idempotency walk — the
+   * quote was already picked up and the prior draft still exists. */
+  was_existing: boolean;
+}
+
+export async function pickupQuoteAsDraft(quoteId: string): Promise<PickupQuoteOutcome> {
+  return invoke<PickupQuoteOutcome>("pickup_quote_as_draft", { quoteId });
 }
 
 // ── S225 / PR-221 — Financial statistics dashboard ──────────────────

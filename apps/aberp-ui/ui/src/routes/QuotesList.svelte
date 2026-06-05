@@ -19,7 +19,11 @@
   //     draft JSON; the operator-clicked pickup creates the row).
 
   import { onMount } from "svelte";
-  import { listQuoteIntake, type QuoteIntakeRow } from "../lib/api";
+  import {
+    listQuoteIntake,
+    pickupQuoteAsDraft,
+    type QuoteIntakeRow,
+  } from "../lib/api";
   import { formatInvoiceDate } from "../lib/format";
 
   type LoadState = "idle" | "loading" | "ready" | "error";
@@ -27,6 +31,11 @@
   let loadState: LoadState = $state("idle");
   let errorMessage = $state<string | null>(null);
   let rows: QuoteIntakeRow[] = $state([]);
+  // S255 / PR-244 — per-row pickup state. `null` keys reset to
+  // "idle" on every refresh so a half-done click in the previous
+  // list doesn't leave a spinner visible after a refresh.
+  let pickupBusyQuoteId = $state<string | null>(null);
+  let pickupError = $state<string | null>(null);
 
   onMount(() => {
     void refresh();
@@ -47,6 +56,48 @@
   function shortQuoteId(id: string): string {
     if (id.length <= 12) return id;
     return `${id.slice(0, 6)}…${id.slice(-4)}`;
+  }
+
+  function shortDraftId(id: string): string {
+    // `drf_<26-char-ULID>` — show the prefix + last 4 so the operator
+    // can tell two side-by-side drafts apart without copying the
+    // full ULID.
+    if (id.length <= 10) return id;
+    return `${id.slice(0, 4)}…${id.slice(-4)}`;
+  }
+
+  // S255 / PR-244 — operator click handler. Calls the backend, then
+  // navigates to the Invoices tab (where the new Draft row surfaces
+  // under the [[aberp-invoice-draft-state]] chip). On idempotent
+  // re-click of an already-picked-up quote, the backend returns the
+  // same drf_id (200) and we still navigate.
+  async function pickupQuote(row: QuoteIntakeRow): Promise<void> {
+    pickupBusyQuoteId = row.quote_id;
+    pickupError = null;
+    try {
+      const outcome = await pickupQuoteAsDraft(row.quote_id);
+      // Mutate the in-memory row immediately so the operator sees the
+      // "→ Draft" link without waiting for the refresh round-trip.
+      // The next refresh() (manual or otherwise) will reconcile.
+      const idx = rows.findIndex((r) => r.quote_id === row.quote_id);
+      if (idx >= 0) {
+        rows[idx] = { ...rows[idx], picked_up_drf_id: outcome.drf_id };
+      }
+      // Route the operator to the Invoices tab to see the new Draft.
+      window.location.hash = "#/invoices";
+    } catch (e) {
+      pickupError =
+        e instanceof Error ? e.message : String(e);
+    } finally {
+      pickupBusyQuoteId = null;
+    }
+  }
+
+  function openDraftFromPickup(): void {
+    // The drafts-by-list view lives at #/invoices; the new Draft row
+    // shows up with state=Draft. (A future PR can wire #/invoices/drafts/<id>
+    // for a direct deep-link once the draft-detail SPA route lands.)
+    window.location.hash = "#/invoices";
   }
 
   function writebackLabel(ts: string | null): {
@@ -97,6 +148,13 @@
       </button>
     </div>
   </header>
+
+  {#if pickupError !== null}
+    <div class="quotes-page__error" role="alert" data-testid="quotes-pickup-error">
+      <strong>Nem sikerült a piszkozatot létrehozni / Failed to create draft.</strong>
+      <p class="quotes-page__error-detail">{pickupError}</p>
+    </div>
+  {/if}
 
   {#if loadState === "loading" && rows.length === 0}
     <p class="quotes-page__muted">Betöltés… / Loading quotes…</p>
@@ -182,11 +240,31 @@
               >{wb.hu}</span>
             </td>
             <td>
-              <span
-                class="quotes-chip quotes-chip--attention"
-                data-testid="quotes-attention-chip"
-                title="Operator pickup creates the draft invoice (S212)"
-              >Operátori beavatkozás szükséges</span>
+              {#if row.picked_up_drf_id}
+                <button
+                  type="button"
+                  class="quotes-row__draft-link"
+                  data-testid="quotes-row-draft-link"
+                  data-drf-id={row.picked_up_drf_id}
+                  onclick={openDraftFromPickup}
+                  title={`Draft: ${row.picked_up_drf_id}`}
+                >
+                  → Draft {shortDraftId(row.picked_up_drf_id)}
+                </button>
+              {:else}
+                <button
+                  type="button"
+                  class="quotes-row__pickup"
+                  data-testid="quotes-row-pickup-btn"
+                  disabled={pickupBusyQuoteId === row.quote_id}
+                  onclick={() => void pickupQuote(row)}
+                  title="Create a draft invoice from this quote (S255)"
+                >
+                  {pickupBusyQuoteId === row.quote_id
+                    ? "Létrehozás…"
+                    : "Számla létrehozása / Create draft invoice"}
+                </button>
+              {/if}
             </td>
           </tr>
         {/each}
@@ -401,5 +479,48 @@
   .quotes-chip--attention {
     color: var(--color-signal-warning);
     border-color: var(--color-signal-warning);
+  }
+
+  /* S255 / PR-244 — pickup affordances. Match the dark-theme button
+   * pattern from `.quotes-page__refresh` so the row-action stays
+   * consistent with the page header's refresh button.
+   * [[spa-dark-theme-default]] applies. */
+  .quotes-row__pickup {
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    color: var(--color-text-strong);
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    transition: color var(--motion-fade-in);
+  }
+
+  .quotes-row__pickup:hover:not(:disabled) {
+    color: var(--color-signal-positive);
+    border-color: var(--color-signal-positive);
+  }
+
+  .quotes-row__pickup:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .quotes-row__draft-link {
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--color-signal-positive);
+    background: var(--color-surface-raised);
+    color: var(--color-signal-positive);
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    transition: color var(--motion-fade-in);
+  }
+
+  .quotes-row__draft-link:hover {
+    color: var(--color-text-strong);
+    border-color: var(--color-text-strong);
   }
 </style>

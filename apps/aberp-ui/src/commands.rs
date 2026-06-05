@@ -1074,6 +1074,21 @@ pub async fn list_quote_intake(state: State<'_, AppState>) -> Result<Value, Stri
     forward_get(&state, "/api/quote-intake/quotes", true).await
 }
 
+/// S255 / PR-244 — operator-clicked pickup. `POST /api/quotes/{quote_id}/pickup-as-draft`
+/// mints an `invoice_draft` referencing the quote + emits the
+/// `InvoicePickedUpFromQuote` audit row. Returns the `PickupQuoteOutcome`
+/// shape ({drf_id, partner_id, partner_created, was_existing}) the SPA's
+/// QuotesList uses to navigate to the new draft and surface the
+/// new-partner notice.
+#[tauri::command]
+pub async fn pickup_quote_as_draft(
+    state: State<'_, AppState>,
+    quote_id: String,
+) -> Result<Value, String> {
+    let path = format!("/api/quotes/{quote_id}/pickup-as-draft");
+    forward_post(&state, &path, Value::Null).await
+}
+
 /// S180 / PR-180 — operator-clicked NAV-as-DR restore wizard.
 /// `POST /api/restore-from-nav-outgoing { year }`. Synchronous (walks
 /// 12 months × pagination against NAV); the SPA gates the click on

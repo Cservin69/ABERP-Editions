@@ -737,7 +737,13 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // `inv_<ULID>`, so the per-OUTGOING-invoice bundle's id-filter
         // never matches the row. No NAV bytes (operator deletion is a
         // purely local event with no NAV-side correspondent).
-        | EventKind::InvoiceDraftDeleted => None,
+        | EventKind::InvoiceDraftDeleted
+        // S255 / PR-244 — operator quote pickup. Same `drf_<ULID>`
+        // keying as `InvoiceStaged` (the payload's `draft_id`); the
+        // per-OUTGOING-invoice bundle never matches because there is
+        // no `inv_<ULID>` until the operator's Issue click promotes
+        // the draft. No NAV bytes.
+        | EventKind::InvoicePickedUpFromQuote => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

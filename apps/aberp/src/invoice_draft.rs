@@ -100,12 +100,31 @@ CREATE INDEX IF NOT EXISTS invoice_draft_tenant_created_idx
     ON invoice_draft (tenant_id, created_at);
 ";
 
+/// S255 / PR-244 — additive migration adding `source_quote_id` for the
+/// new quote-pickup path. Same `ADD COLUMN IF NOT EXISTS` posture as
+/// the PR-97 partners migration: idempotent on a post-S255 boot, fills
+/// pre-S255 rows with `NULL` (which already matches their semantic —
+/// they were dispatch-spawned, not quote-picked-up).
+///
+/// Deliberately NOT a UNIQUE constraint per [[no-sql-specific]] — the
+/// idempotency gate lives at the quote-pickup route (audit-ledger F8
+/// + `quote_intake_log.picked_up_drf_id` writeback), so the DB does
+/// not need to enforce single-pickup-per-quote at the row level. A
+/// re-pickup after S239 delete must mint a fresh draft for the same
+/// quote_id, which a UNIQUE constraint would block.
+const INVOICE_DRAFT_S255_MIGRATION_SQL: &str = "
+ALTER TABLE invoice_draft
+    ADD COLUMN IF NOT EXISTS source_quote_id VARCHAR;
+";
+
 /// Idempotent `CREATE TABLE IF NOT EXISTS` for the `invoice_draft`
 /// table. Same boot-time posture as `incoming_invoices::ensure_schema`
 /// / `restore_from_nav_outgoing::ensure_schema`.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(INVOICE_DRAFT_SCHEMA_SQL)
-        .context("ensure invoice_draft schema")
+        .context("ensure invoice_draft schema")?;
+    conn.execute_batch(INVOICE_DRAFT_S255_MIGRATION_SQL)
+        .context("apply S255 invoice_draft migration (source_quote_id)")
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -122,6 +141,13 @@ pub struct InvoiceDraft {
     pub partner_id: String,
     pub source_dispatch_id: Option<String>,
     pub source_wo_id: Option<String>,
+    /// S255 / PR-244 — quote-pickup bridge field. `Some(<quote_id>)`
+    /// for a draft minted by the quote-intake pickup route; `None`
+    /// for the dispatch-spawn path. Mirrors the `source_dispatch_id`
+    /// / `source_wo_id` discriminator pattern (no generic
+    /// `source_kind` enum — explicit columns scale to two sources,
+    /// and a parallel column makes the SPA's audit-walk pin direct).
+    pub source_quote_id: Option<String>,
     pub product_id: String,
     /// Decimal-as-string for the wire form; matches the
     /// `aberp_inventory` / `aberp_work_orders` convention.
@@ -144,6 +170,12 @@ pub struct InvoiceStagedPayload {
     pub partner_id: String,
     pub source_dispatch_id: Option<String>,
     pub source_wo_id: Option<String>,
+    /// S255 / PR-244 — `Some(<quote_id>)` when minted by the
+    /// quote-pickup route. `serde` emits JSON `null` for `None` so
+    /// the audit-walker can tell apart "pre-S255 row, never had the
+    /// field" from "S255-aware row, source is dispatch not quote"
+    /// (the latter serialises explicitly as `null`).
+    pub source_quote_id: Option<String>,
     pub product_id: String,
     /// Decimal-as-string.
     pub qty: String,
@@ -168,6 +200,11 @@ pub struct InvoiceDraftDeletedPayload {
     pub partner_id: String,
     pub source_dispatch_id: Option<String>,
     pub source_wo_id: Option<String>,
+    /// S255 / PR-244 — surfaces the quote-pickup chain across the
+    /// delete event so a forensic walker can pair "this quote was
+    /// picked up, then the operator deleted the draft" without
+    /// joining on `quote_intake_log`.
+    pub source_quote_id: Option<String>,
     pub actor: String,
     pub idempotency_key: String,
     pub deleted_at: String,
@@ -194,6 +231,12 @@ pub struct CreateDraftInputs {
     pub partner_id: String,
     pub source_dispatch_id: Option<String>,
     pub source_wo_id: Option<String>,
+    /// S255 / PR-244 — `Some(<quote_id>)` from the quote-pickup
+    /// route; the dispatch-spawn path leaves this `None`. Adding it
+    /// to the existing `CreateDraftInputs` (rather than introducing a
+    /// second constructor) keeps the audit-emit branch single per
+    /// CLAUDE.md rule 7 (surface conflicts, don't average them).
+    pub source_quote_id: Option<String>,
     pub product_id: String,
     pub qty: Decimal,
     pub notes: Option<String>,
@@ -232,15 +275,16 @@ pub fn create_draft_in_tx(
     tx.execute(
         "INSERT INTO invoice_draft (
             drf_id, tenant_id, partner_id,
-            source_dispatch_id, source_wo_id,
+            source_dispatch_id, source_wo_id, source_quote_id,
             product_id, qty, notes, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
         params![
             &drf_id,
             &inputs.tenant,
             &inputs.partner_id,
             inputs.source_dispatch_id.as_deref(),
             inputs.source_wo_id.as_deref(),
+            inputs.source_quote_id.as_deref(),
             &inputs.product_id,
             &qty_str,
             inputs.notes.as_deref(),
@@ -255,6 +299,7 @@ pub fn create_draft_in_tx(
         partner_id: inputs.partner_id.clone(),
         source_dispatch_id: inputs.source_dispatch_id.clone(),
         source_wo_id: inputs.source_wo_id.clone(),
+        source_quote_id: inputs.source_quote_id.clone(),
         product_id: inputs.product_id.clone(),
         qty: qty_str.clone(),
         actor: inputs.actor.clone(),
@@ -276,6 +321,7 @@ pub fn create_draft_in_tx(
         partner_id: inputs.partner_id,
         source_dispatch_id: inputs.source_dispatch_id,
         source_wo_id: inputs.source_wo_id,
+        source_quote_id: inputs.source_quote_id,
         product_id: inputs.product_id,
         qty: qty_str,
         notes: inputs.notes,
@@ -288,7 +334,7 @@ pub fn read_draft(conn: &Connection, tenant: &str, drf_id: &str) -> Result<Optio
     let mut stmt = conn
         .prepare(
             "SELECT drf_id, tenant_id, partner_id, source_dispatch_id, source_wo_id,
-                    product_id, qty, notes, created_at
+                    source_quote_id, product_id, qty, notes, created_at
              FROM invoice_draft
              WHERE tenant_id = ? AND drf_id = ?
              LIMIT 1;",
@@ -302,10 +348,11 @@ pub fn read_draft(conn: &Connection, tenant: &str, drf_id: &str) -> Result<Optio
                 partner_id: row.get(2)?,
                 source_dispatch_id: row.get(3)?,
                 source_wo_id: row.get(4)?,
-                product_id: row.get(5)?,
-                qty: row.get(6)?,
-                notes: row.get(7)?,
-                created_at: row.get(8)?,
+                source_quote_id: row.get(5)?,
+                product_id: row.get(6)?,
+                qty: row.get(7)?,
+                notes: row.get(8)?,
+                created_at: row.get(9)?,
             })
         })
         .context("query read_draft")?;
@@ -320,7 +367,7 @@ pub fn list_drafts(conn: &Connection, tenant: &str) -> Result<Vec<InvoiceDraft>>
     let mut stmt = conn
         .prepare(
             "SELECT drf_id, tenant_id, partner_id, source_dispatch_id, source_wo_id,
-                    product_id, qty, notes, created_at
+                    source_quote_id, product_id, qty, notes, created_at
              FROM invoice_draft
              WHERE tenant_id = ?
              ORDER BY created_at DESC;",
@@ -334,15 +381,61 @@ pub fn list_drafts(conn: &Connection, tenant: &str) -> Result<Vec<InvoiceDraft>>
                 partner_id: row.get(2)?,
                 source_dispatch_id: row.get(3)?,
                 source_wo_id: row.get(4)?,
-                product_id: row.get(5)?,
-                qty: row.get(6)?,
-                notes: row.get(7)?,
-                created_at: row.get(8)?,
+                source_quote_id: row.get(5)?,
+                product_id: row.get(6)?,
+                qty: row.get(7)?,
+                notes: row.get(8)?,
+                created_at: row.get(9)?,
             })
         })
         .context("query list_drafts")?;
     rows.collect::<duckdb::Result<Vec<_>>>()
         .context("collect list_drafts")
+}
+
+/// S255 / PR-244 — find a draft by `source_quote_id` for the
+/// quote-pickup idempotency walk. Returns `Ok(None)` if no draft
+/// references the quote (operator never picked it up, or a prior
+/// pickup's draft was deleted via S239). At most one row matches by
+/// construction: the pickup route checks-and-writes inside the same
+/// audit-ledger F8 gate, so a successful retry under the same
+/// `quote_pickup:<quote_id>` key returns the existing draft rather
+/// than minting a second one.
+pub fn find_draft_by_source_quote_id(
+    conn: &Connection,
+    tenant: &str,
+    quote_id: &str,
+) -> Result<Option<InvoiceDraft>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT drf_id, tenant_id, partner_id, source_dispatch_id, source_wo_id,
+                    source_quote_id, product_id, qty, notes, created_at
+             FROM invoice_draft
+             WHERE tenant_id = ? AND source_quote_id = ?
+             ORDER BY created_at DESC
+             LIMIT 1;",
+        )
+        .context("prepare find_draft_by_source_quote_id")?;
+    let mut rows = stmt
+        .query_map(params![tenant, quote_id], |row| {
+            Ok(InvoiceDraft {
+                drf_id: row.get(0)?,
+                tenant_id: row.get(1)?,
+                partner_id: row.get(2)?,
+                source_dispatch_id: row.get(3)?,
+                source_wo_id: row.get(4)?,
+                source_quote_id: row.get(5)?,
+                product_id: row.get(6)?,
+                qty: row.get(7)?,
+                notes: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })
+        .context("query find_draft_by_source_quote_id")?;
+    match rows.next() {
+        Some(r) => Ok(Some(r.context("decode invoice_draft row")?)),
+        None => Ok(None),
+    }
 }
 
 /// S239 / PR-233 inputs to [`delete_draft_in_tx`].
@@ -421,7 +514,7 @@ pub fn delete_draft_in_tx(
     // holds a write lock on the rows it touches.
     let prior_row = tx
         .query_row(
-            "SELECT partner_id, source_dispatch_id, source_wo_id
+            "SELECT partner_id, source_dispatch_id, source_wo_id, source_quote_id
              FROM invoice_draft
              WHERE tenant_id = ? AND drf_id = ?
              LIMIT 1;",
@@ -431,12 +524,13 @@ pub fn delete_draft_in_tx(
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             },
         )
         .ok();
 
-    let Some((partner_id, source_dispatch_id, source_wo_id)) = prior_row else {
+    let Some((partner_id, source_dispatch_id, source_wo_id, source_quote_id)) = prior_row else {
         return Ok(DeleteDraftOutcome {
             deleted: false,
             dispatch_pointers_cleared: 0,
@@ -473,6 +567,7 @@ pub fn delete_draft_in_tx(
         partner_id,
         source_dispatch_id,
         source_wo_id,
+        source_quote_id,
         actor: inputs.actor.clone(),
         idempotency_key: idempotency_key.clone(),
         deleted_at: now,
@@ -543,6 +638,7 @@ impl<'a> InvoiceSpawner for BillingInvoiceSpawner<'a> {
                 partner_id: dispatch.partner_id.clone(),
                 source_dispatch_id: Some(dispatch.dsp_id.clone()),
                 source_wo_id: Some(dispatch.wo_id.clone()),
+                source_quote_id: None,
                 product_id: wo_product_id.to_string(),
                 qty: wo_qty_target,
                 notes: dispatch.notes.clone(),
@@ -598,6 +694,7 @@ mod tests {
                 partner_id: "ptr_TESTPARTNER000000000000".to_string(),
                 source_dispatch_id: Some("dsp_TESTDISPATCH00000000000".to_string()),
                 source_wo_id: Some("wo_TESTWORKORDER0000000000".to_string()),
+                source_quote_id: None,
                 product_id: "prd_TESTPRODUCT00000000000".to_string(),
                 qty: Decimal::from_str("3.5").unwrap(),
                 notes: Some("test note".to_string()),
@@ -635,6 +732,7 @@ mod tests {
                 partner_id: "ptr_X".to_string(),
                 source_dispatch_id: None,
                 source_wo_id: None,
+                source_quote_id: None,
                 product_id: "prd_X".to_string(),
                 qty: Decimal::ONE,
                 notes: None,
@@ -680,6 +778,7 @@ mod tests {
                 partner_id: "ptr_X".to_string(),
                 source_dispatch_id: None,
                 source_wo_id: None,
+                source_quote_id: None,
                 product_id: "prd_X".to_string(),
                 qty: Decimal::ONE,
                 notes: None,
@@ -698,6 +797,7 @@ mod tests {
             partner_id: "ptr_X".to_string(),
             source_dispatch_id: Some("dsp_X".to_string()),
             source_wo_id: Some("wo_X".to_string()),
+            source_quote_id: None,
             product_id: "prd_X".to_string(),
             qty: "1".to_string(),
             actor: "a".to_string(),
@@ -719,6 +819,7 @@ mod tests {
             partner_id: "ptr_X".to_string(),
             source_dispatch_id: None,
             source_wo_id: None,
+            source_quote_id: None,
             product_id: "prd_X".to_string(),
             qty: "1".to_string(),
             actor: "a".to_string(),
@@ -894,6 +995,7 @@ mod tests {
                 partner_id: "ptr_X".to_string(),
                 source_dispatch_id: Some("dsp_X".to_string()),
                 source_wo_id: Some("wo_X".to_string()),
+                source_quote_id: None,
                 product_id: "prd_X".to_string(),
                 qty: Decimal::ONE,
                 notes: None,
@@ -947,6 +1049,7 @@ mod tests {
                 partner_id: "ptr_DELETE".to_string(),
                 source_dispatch_id: Some("dsp_DELETE".to_string()),
                 source_wo_id: Some("wo_DELETE".to_string()),
+                source_quote_id: None,
                 product_id: "prd_DELETE".to_string(),
                 qty: Decimal::from_str("2.5").unwrap(),
                 notes: None,
@@ -1010,6 +1113,7 @@ mod tests {
             partner_id: "ptr_X".to_string(),
             source_dispatch_id: Some("dsp_X".to_string()),
             source_wo_id: Some("wo_X".to_string()),
+            source_quote_id: None,
             actor: "a".to_string(),
             idempotency_key: "draft_delete:drf_X".to_string(),
             deleted_at: "2026-06-04T10:00:00Z".to_string(),
@@ -1025,6 +1129,7 @@ mod tests {
             partner_id: "ptr_Y".to_string(),
             source_dispatch_id: None,
             source_wo_id: None,
+            source_quote_id: None,
             actor: "a".to_string(),
             idempotency_key: "draft_delete:drf_Y".to_string(),
             deleted_at: "2026-06-04T10:00:00Z".to_string(),
@@ -1060,6 +1165,7 @@ mod tests {
                 partner_id: "ptr_X".to_string(),
                 source_dispatch_id: None,
                 source_wo_id: None,
+                source_quote_id: None,
                 product_id: "prd_X".to_string(),
                 qty: Decimal::ONE,
                 notes: None,
@@ -1111,6 +1217,7 @@ mod tests {
                 partner_id: "ptr_X".to_string(),
                 source_dispatch_id: None,
                 source_wo_id: None,
+                source_quote_id: None,
                 product_id: "prd_X".to_string(),
                 qty: Decimal::ONE,
                 notes: None,
@@ -1180,6 +1287,7 @@ mod tests {
                 partner_id: "ptr_X".to_string(),
                 source_dispatch_id: Some("dsp_X".to_string()),
                 source_wo_id: Some("wo_X".to_string()),
+                source_quote_id: None,
                 product_id: "prd_X".to_string(),
                 qty: Decimal::ONE,
                 notes: None,

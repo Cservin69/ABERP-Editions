@@ -13,7 +13,14 @@ use crate::error::QuoteIntakeError;
 
 pub fn ensure_schema(conn: &Connection) -> Result<(), QuoteIntakeError> {
     conn.execute_batch(SCHEMA_SQL)
-        .map_err(|e| QuoteIntakeError::Storage(format!("ensure quote_intake_log schema: {e}")))
+        .map_err(|e| QuoteIntakeError::Storage(format!("ensure quote_intake_log schema: {e}")))?;
+    // S255 / PR-244 — additive migration for the operator-pickup
+    // landing column. Idempotent on a post-S255 boot; fills pre-S255
+    // rows with NULL (operator never picked them up — equivalent to
+    // the post-S255 "fresh row" state).
+    conn.execute_batch(S255_MIGRATION_SQL).map_err(|e| {
+        QuoteIntakeError::Storage(format!("apply S255 quote_intake_log migration: {e}"))
+    })
 }
 
 const SCHEMA_SQL: &str = "
@@ -29,6 +36,20 @@ CREATE TABLE IF NOT EXISTS quote_intake_log (
 );
 CREATE INDEX IF NOT EXISTS quote_intake_log_pending_writeback_idx
     ON quote_intake_log (tenant_id, status_writeback_at);
+";
+
+/// S255 / PR-244 — `picked_up_drf_id` records the `drf_<ULID>` of the
+/// invoice_draft minted when the operator clicked "Create draft
+/// invoice" on this quote. NULL means "operator has not picked up
+/// this quote yet" — the SPA renders the pickup button; a non-NULL
+/// renders the "→ Draft #N" link instead. A re-pickup after S239
+/// deletes the prior draft is allowed: the route writes the new
+/// `drf_<ULID>` here, overwriting the now-orphaned id. (Idempotency
+/// within a single pickup attempt rides on the audit-ledger F8 gate;
+/// this column is the operator-facing tag, not the dedup key.)
+const S255_MIGRATION_SQL: &str = "
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS picked_up_drf_id VARCHAR;
 ";
 
 pub fn already_intook(
@@ -105,6 +126,80 @@ pub fn mark_writeback_complete(
         params![when_iso, quote_id, tenant_id],
     )
     .map_err(|e| QuoteIntakeError::Storage(format!("update writeback timestamp: {e}")))?;
+    Ok(())
+}
+
+/// S255 / PR-244 — fetch the raw row needed by the operator-pickup
+/// route: the prepared-draft JSON, the contact slice (for the SPA's
+/// "creating new partner" confirm modal copy), and the existing
+/// `picked_up_drf_id` (which the route's idempotency walk reads).
+///
+/// Returns `Ok(None)` if no row matches the `(tenant, quote_id)` —
+/// the route maps this to 404.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickupSourceRow {
+    pub raw_payload: String,
+    pub prepared_draft: String,
+    pub picked_up_drf_id: Option<String>,
+}
+
+pub fn read_for_pickup(
+    conn: &Connection,
+    tenant_id: &str,
+    quote_id: &str,
+) -> Result<Option<PickupSourceRow>, QuoteIntakeError> {
+    ensure_schema(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT raw_payload, prepared_draft, picked_up_drf_id
+               FROM quote_intake_log
+              WHERE quote_id = ?1 AND tenant_id = ?2
+              LIMIT 1",
+        )
+        .map_err(|e| QuoteIntakeError::Storage(format!("prepare read_for_pickup: {e}")))?;
+    let mut rows = stmt
+        .query(params![quote_id, tenant_id])
+        .map_err(|e| QuoteIntakeError::Storage(format!("query read_for_pickup: {e}")))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|e| QuoteIntakeError::Storage(format!("read read_for_pickup row: {e}")))?
+    else {
+        return Ok(None);
+    };
+    let raw_payload: String = row
+        .get(0)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get raw_payload col: {e}")))?;
+    let prepared_draft: String = row
+        .get(1)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get prepared_draft col: {e}")))?;
+    let picked_up_drf_id: Option<String> = row
+        .get(2)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get picked_up_drf_id col: {e}")))?;
+    Ok(Some(PickupSourceRow {
+        raw_payload,
+        prepared_draft,
+        picked_up_drf_id,
+    }))
+}
+
+/// S255 / PR-244 — record the operator-minted `drf_<ULID>` on the
+/// quote_intake_log row. Overwrites any prior value: a re-pickup
+/// after S239 delete is intentional and the column tracks the LATEST
+/// pickup, not the historical pickups (the audit ledger does that).
+pub fn set_picked_up_drf_id(
+    conn: &Connection,
+    tenant_id: &str,
+    quote_id: &str,
+    drf_id: &str,
+) -> Result<(), QuoteIntakeError> {
+    ensure_schema(conn)?;
+    conn.execute(
+        "UPDATE quote_intake_log
+            SET picked_up_drf_id = ?1
+          WHERE quote_id = ?2 AND tenant_id = ?3",
+        params![drf_id, quote_id, tenant_id],
+    )
+    .map_err(|e| QuoteIntakeError::Storage(format!("update picked_up_drf_id: {e}")))?;
     Ok(())
 }
 

@@ -63,6 +63,10 @@ pub mod products;
 pub mod quote_intake_config;
 pub mod quote_intake_credentials;
 pub mod quote_intake_query;
+// S255 / PR-244 — operator-clicked "Create draft invoice" on a staged
+// quote_intake_log row. Mints an `invoice_draft` row with
+// `source_quote_id` set + emits `InvoicePickedUpFromQuote`.
+pub mod quote_pickup;
 pub mod recover_from_nav;
 pub mod reports;
 pub mod request_technical_annulment;

@@ -856,7 +856,11 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // `InvoiceStaged`: payload is keyed by `drf_<ULID>` not
         // `inv_<ULID>`, so the per-OUTGOING-invoice bundle's id-filter
         // never matches a draft-deletion row. No NAV bytes carried.
-        | EventKind::InvoiceDraftDeleted => (None, ""),
+        | EventKind::InvoiceDraftDeleted
+        // S255 / PR-244 — quote-pickup event. Same `drf_<ULID>` keying
+        // (the payload references the staged draft); bundle excludes
+        // by the standard `inv_<ULID>` id-filter. No NAV bytes.
+        | EventKind::InvoicePickedUpFromQuote => (None, ""),
     };
 
     Ok(NavExtraction {

@@ -351,6 +351,9 @@ pub fn run() {
             commands::put_quote_intake_config,
             commands::test_quote_intake_connection,
             commands::list_quote_intake,
+            // S255 / PR-244 — operator-clicked quote pickup. Mints
+            // an `invoice_draft` with `source_quote_id` set.
+            commands::pickup_quote_as_draft,
             // S225 / PR-221 — financial-statistics dashboard endpoint.
             commands::get_financial_report,
             // S235 / PR-231 — Workshop / Műhely operator dashboard.

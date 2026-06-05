@@ -125,6 +125,7 @@ use crate::products::{self, Product, ProductInputs, ValidationError as ProductVa
 use crate::quote_intake_config as quote_intake_config_mod;
 use crate::quote_intake_credentials as quote_intake_credentials_mod;
 use crate::quote_intake_query as quote_intake_query_mod;
+use crate::quote_pickup;
 use crate::reports;
 use crate::restore_from_nav_outgoing as restore_outgoing;
 use crate::secrets_cache::SecretsCache;
@@ -2360,6 +2361,14 @@ fn build_router(state: AppState) -> Router {
             post(handle_test_quote_intake_connection),
         )
         .route("/api/quote-intake/quotes", get(handle_list_quote_intake))
+        // S255 / PR-244 — operator-clicked pickup. POST mints a Draft
+        // referencing the quote; the SPA navigates to the Invoices tab
+        // where the new row surfaces under the [[aberp-invoice-draft-state]]
+        // chip.
+        .route(
+            "/api/quotes/:quote_id/pickup-as-draft",
+            post(handle_pickup_quote_as_draft),
+        )
         .with_state(state)
 }
 
@@ -13760,6 +13769,103 @@ async fn handle_list_quote_intake(headers: HeaderMap, State(state): State<AppSta
         }
     };
     Json(rows).into_response()
+}
+
+/// S255 / PR-244 — operator clicked "Create draft invoice" on a quote
+/// row. Mints an `invoice_draft` with `source_quote_id` set + emits
+/// `InvoicePickedUpFromQuote`. Returns 200 with the new (or existing
+/// idempotent) `drf_id` + `partner_id` + flags so the SPA can route
+/// the user to the InvoiceList and surface the new-partner notice.
+///
+/// Idempotent at the route boundary: a duplicate POST against an
+/// already-picked-up quote returns the same `drf_id` (200, not 409).
+async fn handle_pickup_quote_as_draft(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(quote_id): AxumPath<String>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let quote_id_for_task = quote_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        pickup_quote_as_draft_request(&state_for_task, &operator_login, &quote_id_for_task)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "pickup_quote_as_draft_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(o) => (StatusCode::OK, Json(o)).into_response(),
+        Err(e) => {
+            // Distinguish 404 (quote not staged) from 500. The pickup
+            // module emits "not staged" text in the missing-quote
+            // branch — match on the substring to avoid threading a
+            // typed error enum through the route boundary just for
+            // this one status.
+            let msg = format!("{e:#}");
+            if msg.contains("not staged in quote_intake_log") {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(error_body(format!("quote {quote_id} not staged"))),
+                )
+                    .into_response();
+            }
+            internal_error("pickup_quote_as_draft_request", e)
+        }
+    }
+}
+
+pub fn pickup_quote_as_draft_request(
+    state: &AppState,
+    operator_login: &str,
+    quote_id: &str,
+) -> Result<quote_pickup::PickupQuoteOutcome> {
+    let mut conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("binary hash unavailable")?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+
+    // Compute retry counter via an audit-walk so the F8 anchor stays
+    // fresh on a re-pickup after S239 delete. Open a separate Ledger
+    // handle for the read — the route's tx hasn't started yet so
+    // there's no contention.
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
+        .context("open ledger for pickup retry-count walk")?;
+    let prior = quote_pickup::count_prior_pickups(&ledger, quote_id)
+        .context("count prior InvoicePickedUpFromQuote entries")?;
+    let idempotency_key = quote_pickup::pickup_idempotency_key(quote_id, prior);
+
+    let outcome = quote_pickup::pickup_quote_as_draft(
+        &mut conn,
+        &ledger_meta,
+        ledger_actor,
+        quote_pickup::PickupQuoteInputs {
+            tenant: state.tenant.as_str().to_string(),
+            quote_id: quote_id.to_string(),
+            actor: operator_login.to_string(),
+            idempotency_key,
+        },
+    )?;
+    if !outcome.was_existing {
+        sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+    }
+    Ok(outcome)
 }
 
 /// Read the most-recent `QuoteIntakePollCompleted` payload from the
