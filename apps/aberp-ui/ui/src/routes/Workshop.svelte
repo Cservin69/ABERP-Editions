@@ -457,9 +457,9 @@
         <!-- S246 / PR-239 — recent WO rows underneath the bucket grid.
              5-row cap per the density brief; empty-state hidden so the
              tile shape stays stable when a fresh tenant has no WOs. -->
-        {#if b.work_order_rows.length > 0}
+        {#if (b.work_order_rows ?? []).length > 0}
           <ul class="ws-rows" data-testid="wo-row-list">
-            {#each b.work_order_rows as row (row.wo_id)}
+            {#each b.work_order_rows ?? [] as row (row.wo_id)}
               <li class="ws-row" data-testid={`wo-row-${row.wo_id}`}>
                 <span class="ws-row__primary">{row.wo_number}</span>
                 <span class="ws-row__secondary">{row.product_name}</span>
@@ -529,9 +529,9 @@
           {/each}
         </p>
         <!-- S246 / PR-239 — Pending QA list (up to 7 oldest-first). -->
-        {#if b.pending_qa_rows.length > 0}
+        {#if (b.pending_qa_rows ?? []).length > 0}
           <ul class="ws-rows" data-testid="qa-row-list">
-            {#each b.pending_qa_rows as row (row.qa_id)}
+            {#each b.pending_qa_rows ?? [] as row (row.qa_id)}
               <li class="ws-row" data-testid={`qa-row-${row.qa_id}`}>
                 <span class="ws-row__primary">{row.wo_number}</span>
                 <span class="ws-row__secondary">{row.op_name}</span>
@@ -616,13 +616,13 @@
              Pending Drafted dispatches (2 cap). Each sub-list has its
              own header so the operator distinguishes "ready to dispatch"
              from "drafted, awaiting ship." -->
-        {#if b.eligible_dispatch_rows.length > 0}
+        {#if (b.eligible_dispatch_rows ?? []).length > 0}
           <div class="ws-rows-group">
             <h4 class="ws-rows-group__title">
               {lang === "hu" ? "Indítható" : "Eligible"}
             </h4>
             <ul class="ws-rows" data-testid="eligible-dispatch-row-list">
-              {#each b.eligible_dispatch_rows as row (row.wo_id)}
+              {#each b.eligible_dispatch_rows ?? [] as row (row.wo_id)}
                 <li
                   class="ws-row"
                   data-testid={`eligible-dispatch-row-${row.wo_id}`}
@@ -644,13 +644,13 @@
             </ul>
           </div>
         {/if}
-        {#if b.pending_dispatch_rows.length > 0}
+        {#if (b.pending_dispatch_rows ?? []).length > 0}
           <div class="ws-rows-group">
             <h4 class="ws-rows-group__title">
               {lang === "hu" ? "Tervezet" : "Pending"}
             </h4>
             <ul class="ws-rows" data-testid="pending-dispatch-row-list">
-              {#each b.pending_dispatch_rows as row (row.dsp_id)}
+              {#each b.pending_dispatch_rows ?? [] as row (row.dsp_id)}
                 <li
                   class="ws-row"
                   data-testid={`pending-dispatch-row-${row.dsp_id}`}
@@ -763,9 +763,9 @@
         <!-- S246 / PR-239 — list of below-min product rows (up to 10).
              Each row reads "name — qty/min — bin" so the operator scans
              the actual items without leaving the dashboard. -->
-        {#if b.low_stock_rows.length > 0}
+        {#if (b.low_stock_rows ?? []).length > 0}
           <ul class="ws-rows" data-testid="low-stock-row-list">
-            {#each b.low_stock_rows as row (row.product_id)}
+            {#each b.low_stock_rows ?? [] as row (row.product_id)}
               <li class="ws-row" data-testid={`low-stock-row-${row.product_id}`}>
                 <span class="ws-row__primary">{row.name}</span>
                 <span class="ws-row__qty ws-row__qty--warn">
@@ -837,9 +837,9 @@
              Backend caps at 5 + emits `today_invoice_total`; the footer
              renders "+N more" when the cap truncates so the operator
              knows there's overflow rather than reading "only 5 today." -->
-        {#if b.today_invoice_rows.length > 0}
+        {#if (b.today_invoice_rows ?? []).length > 0}
           <ul class="ws-rows" data-testid="today-invoice-row-list">
-            {#each b.today_invoice_rows as row (row.invoice_id)}
+            {#each b.today_invoice_rows ?? [] as row (row.invoice_id)}
               <li class="ws-row" data-testid={`today-invoice-row-${row.invoice_id}`}>
                 <span class="ws-row__primary">
                   {row.buyer_name === ""
@@ -857,11 +857,11 @@
               </li>
             {/each}
           </ul>
-          {#if b.today_invoice_total > b.today_invoice_rows.length}
+          {#if (b.today_invoice_total ?? 0) > (b.today_invoice_rows ?? []).length}
             <p class="ws-rows-more" data-testid="today-invoice-overflow">
               {lang === "hu"
-                ? `+${b.today_invoice_total - b.today_invoice_rows.length} további`
-                : `+${b.today_invoice_total - b.today_invoice_rows.length} more`}
+                ? `+${(b.today_invoice_total ?? 0) - (b.today_invoice_rows ?? []).length} további`
+                : `+${(b.today_invoice_total ?? 0) - (b.today_invoice_rows ?? []).length} more`}
             </p>
           {/if}
         {/if}

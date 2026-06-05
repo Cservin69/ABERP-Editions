@@ -2850,15 +2850,21 @@ export interface WorkshopDashboard {
   adapters: AdapterStatusSnapshot[];
   snapshot_at_iso8601: string;
   // S246 / PR-239 — density rows below each aggregate tile.
-  work_order_rows: WorkOrderRow[];
-  low_stock_rows: LowStockItemRow[];
-  pending_qa_rows: PendingQaRow[];
-  eligible_dispatch_rows: EligibleDispatchRow[];
-  pending_dispatch_rows: PendingDispatchRow[];
-  today_invoice_rows: TodayInvoiceRow[];
+  // PR-242 / S250 finding 5 — every new field is OPTIONAL on the wire
+  // so a mid-upgrade backend (pre-v2.10.1) that omits these keys does
+  // NOT crash the entire Workshop page with `Cannot read properties of
+  // undefined (reading 'length')`. `getWorkshopDashboard` normalises
+  // missing keys to `[]` / `0` at the API boundary; use-site `?? []`
+  // guards remain as defense-in-depth.
+  work_order_rows?: WorkOrderRow[];
+  low_stock_rows?: LowStockItemRow[];
+  pending_qa_rows?: PendingQaRow[];
+  eligible_dispatch_rows?: EligibleDispatchRow[];
+  pending_dispatch_rows?: PendingDispatchRow[];
+  today_invoice_rows?: TodayInvoiceRow[];
   /** Untruncated count of issued-today invoices. The SPA renders a
    *  "+N more" footer when this exceeds `today_invoice_rows.length`. */
-  today_invoice_total: number;
+  today_invoice_total?: number;
 }
 
 /** Fetch the Workshop dashboard bundle. No params — the whole tile
@@ -2876,7 +2882,41 @@ export interface WorkshopDashboard {
  * — they would land in the same chunk regardless. */
 export async function getWorkshopDashboard(): Promise<WorkshopDashboard> {
   if (isDemoMode()) {
-    return getMockDashboard();
+    return normalizeWorkshopDashboard(await getMockDashboard());
   }
-  return invoke<WorkshopDashboard>("get_workshop_dashboard");
+  const payload = await invoke<WorkshopDashboard>("get_workshop_dashboard");
+  return normalizeWorkshopDashboard(payload);
 }
+
+/** PR-242 / S250 finding 5 — normalise the S246 density-row arrays at
+ *  the API boundary. A mid-upgrade backend (pre-v2.10.1) responds
+ *  without these keys; `Array.isArray` guards the case where the
+ *  payload carries a non-array (e.g. JSON `null`) for any of them.
+ *  `today_invoice_total` defaults to 0 by the same rule. Use sites in
+ *  `Workshop.svelte` keep their own `?? []` guards for defense-in-
+ *  depth — the boundary is the canonical fix; the use-site guards
+ *  survive a future caller that bypasses this function. */
+function normalizeWorkshopDashboard(p: WorkshopDashboard): WorkshopDashboard {
+  return {
+    ...p,
+    work_order_rows: Array.isArray(p.work_order_rows) ? p.work_order_rows : [],
+    low_stock_rows: Array.isArray(p.low_stock_rows) ? p.low_stock_rows : [],
+    pending_qa_rows: Array.isArray(p.pending_qa_rows) ? p.pending_qa_rows : [],
+    eligible_dispatch_rows: Array.isArray(p.eligible_dispatch_rows)
+      ? p.eligible_dispatch_rows
+      : [],
+    pending_dispatch_rows: Array.isArray(p.pending_dispatch_rows)
+      ? p.pending_dispatch_rows
+      : [],
+    today_invoice_rows: Array.isArray(p.today_invoice_rows) ? p.today_invoice_rows : [],
+    today_invoice_total:
+      typeof p.today_invoice_total === "number" && Number.isFinite(p.today_invoice_total)
+        ? p.today_invoice_total
+        : 0,
+  };
+}
+
+// Exported solely so the vitest pin in `workshop-dashboard-safe-degrade`
+// can call into the normaliser without standing up the Tauri invoke
+// shim. Per CLAUDE.md rule 12 — the normaliser is the public contract.
+export const __testHelpers = { normalizeWorkshopDashboard };

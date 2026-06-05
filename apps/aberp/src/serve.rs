@@ -9319,7 +9319,14 @@ pub fn decide_qa_inspection_request(
         .wait()
         .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
     let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
-    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    // PR-242 / S250 finding 2 — mint ONE session ULID at route entry and
+    // reuse it across both the QA-decide actor and the cascading WO
+    // auto-complete actor. Both audit rows now share a session_id so an
+    // operator-action forensic walker can join "this click" by that
+    // column. Per CLAUDE.md rule 12 — the audit ledger must not lie
+    // about whether two writes happened in one tx.
+    let session_id = Ulid::new().to_string();
+    let ledger_actor = Actor::from_local_cli(session_id.clone(), operator_login);
 
     let tx = conn.transaction().context("begin QA decide transaction")?;
     let ctx = aberp_qa::QaWriteContext {
@@ -9328,7 +9335,7 @@ pub fn decide_qa_inspection_request(
             operator_login: operator_login.to_string(),
         },
         ledger_meta: &ledger_meta,
-        ledger_actor,
+        ledger_actor: ledger_actor.clone(),
     };
     let idempotency_seed = body.idempotency_key.clone();
     let inputs = aberp_qa::DecideQaInputs {
@@ -9354,7 +9361,7 @@ pub fn decide_qa_inspection_request(
                 operator_login: operator_login.to_string(),
             },
             ledger_meta: &ledger_meta,
-            ledger_actor: Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+            ledger_actor,
         };
         aberp_work_orders::try_auto_complete_wo(
             &tx,
