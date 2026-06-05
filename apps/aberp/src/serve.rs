@@ -10836,6 +10836,12 @@ const DASHBOARD_RECENT_ACTIVITY_LIMIT: u32 = 10;
 /// Closed-vocab response for `GET /api/workshop/dashboard`. Every
 /// nested object is fully populated even when the underlying counts
 /// are zero so the SPA renders a fixed-shape tile grid.
+///
+/// S246 / PR-239 — wall-TV density pass. Each aggregate tile gains a
+/// list of underlying items below the existing quick-focus number so
+/// the operator can read both the at-a-glance number (far) and the
+/// actual items (close). All six new vecs are capped at the brief's
+/// per-tile limits so the JSON payload stays bounded.
 #[derive(Debug, Serialize)]
 struct WorkshopDashboard {
     work_orders: aberp_work_orders::WorkOrderStateCounts,
@@ -10848,6 +10854,30 @@ struct WorkshopDashboard {
     /// RFC3339 UTC instant the dashboard bundle was assembled. SPA
     /// uses it as the "last refreshed" marker.
     snapshot_at_iso8601: String,
+    /// S246 / PR-239 — 5 most-recently-created WOs (any state) for the
+    /// list below the WO state-buckets grid. Field naming diverges
+    /// from the brief's `top_work_orders` so the wire-shape stays
+    /// English-stable (no plural collisions with the count-shaped
+    /// `work_orders` field).
+    work_order_rows: Vec<WorkOrderRow>,
+    /// Up to 10 below-min products for the list below the low-stock
+    /// big-number tile. Ordered same as
+    /// `aberp_inventory::low_stock_products` (most-critical first).
+    low_stock_rows: Vec<LowStockItemRow>,
+    /// Up to 7 Pending QA inspections (oldest first per the QA-queue
+    /// ADR-0063 §8 sort) for the list below the QA quick-focus.
+    pending_qa_rows: Vec<PendingQaRow>,
+    /// Up to 5 Completed WOs without a Dispatch row (the Eligible
+    /// list — same predicate as the existing eligible count). Older
+    /// first per ADR-0064.
+    eligible_dispatch_rows: Vec<EligibleDispatchRow>,
+    /// Up to 2 most-recent Drafted dispatches. Newest first.
+    pending_dispatch_rows: Vec<PendingDispatchRow>,
+    /// Up to 5 issued-today invoices. Sequence-number descending.
+    today_invoice_rows: Vec<TodayInvoiceRow>,
+    /// Total count of issued-today invoices BEFORE truncation. Powers
+    /// the "+N more" footer when `today_invoice_rows.len() < total`.
+    today_invoice_total: u32,
 }
 
 /// One adapter's live snapshot for the Workshop dashboard tile
@@ -10926,6 +10956,128 @@ struct RecentActivityEntry {
     seq: u64,
 }
 
+// ── S246 / PR-239 — wall-TV density row shapes ──────────────────────
+//
+// Each tile that exposed a quick-focus aggregate (WO state buckets,
+// low-stock count, QA pending count, Dispatch counters, Today
+// invoice headline) gains a list of underlying items below the
+// number. The row shapes here mirror what the SPA tile needs — no
+// more (CLAUDE.md rule 2). WO and Dispatch rows surface `product_name`
+// rather than `partner` because WorkOrder has no partner_id (the
+// partner enters at Dispatch-create time per ADR-0064); the brief's
+// "WO number, partner" framing is corrected to "WO number, product"
+// as a pushback. Drafted-dispatch rows do carry partner_id and
+// surface its display_name.
+
+const DASHBOARD_WORK_ORDER_ROWS_LIMIT: u32 = 5;
+const DASHBOARD_LOW_STOCK_ROWS_LIMIT: usize = 10;
+const DASHBOARD_PENDING_QA_ROWS_LIMIT: u32 = 7;
+const DASHBOARD_ELIGIBLE_DISPATCH_ROWS_LIMIT: u32 = 5;
+const DASHBOARD_PENDING_DISPATCH_ROWS_LIMIT: u32 = 2;
+const DASHBOARD_TODAY_INVOICE_ROWS_LIMIT: usize = 5;
+
+#[derive(Debug, Serialize)]
+struct WorkOrderRow {
+    wo_id: String,
+    wo_number: String,
+    /// Product name resolved off `products.name` via the WO's
+    /// `product_id`; empty when the product was soft-deleted (operator
+    /// will see an em-dash placeholder).
+    product_name: String,
+    /// `WorkOrderState`'s snake_case wire form (`"in_progress"` etc.) —
+    /// drives the SPA's existing WO state-chip mapping.
+    state: aberp_work_orders::WorkOrderState,
+    /// RFC3339 timestamp of the most recent state transition for the
+    /// row. Falls back through the WO column ladder
+    /// `released_at → started_at → completed_at → cancelled_at`
+    /// (newest non-NULL wins), then `created_at` as the floor. SPA
+    /// renders this through `fmtRelativeTime` so an idle WO reads
+    /// "released 12 órával ezelőtt" not "created 6 napja".
+    touched_at_iso8601: String,
+    /// `qty_target` as a wire-stable Decimal-as-string so the SPA
+    /// formatter is the single source of truth (mirrors the
+    /// `EligibleWorkOrder.qty_target` posture).
+    qty_target: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LowStockItemRow {
+    product_id: String,
+    name: String,
+    /// Current cached on-hand qty.
+    stock_qty: String,
+    /// Configured `min_stock` threshold.
+    min_stock: String,
+    /// Bin location string (free-form). Empty when unset.
+    bin_location: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PendingQaRow {
+    qa_id: String,
+    wo_id: String,
+    /// Operator-visible WO number (`WO-2026-0042`) resolved via the
+    /// `work_orders` row. Empty if the WO has been hard-deleted (a
+    /// regulatory soft-delete leaves the row intact).
+    wo_number: String,
+    routing_op_id: String,
+    /// Operator-visible op name (`Marás`, `Festés`, …) resolved via
+    /// the `routings` row. Empty if the op has been hard-deleted.
+    op_name: String,
+    /// `created_at` of the inspection row. SPA renders through
+    /// `fmtRelativeTime`.
+    created_at_iso8601: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EligibleDispatchRow {
+    wo_id: String,
+    wo_number: String,
+    product_name: String,
+    qty_target: String,
+    /// WO `completed_at` (when the WO finished — the moment it became
+    /// dispatchable). Empty when missing (defensive — `completed`-
+    /// state WOs always have it set per ADR-0062).
+    completed_at_iso8601: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PendingDispatchRow {
+    dsp_id: String,
+    wo_id: String,
+    wo_number: String,
+    /// Partner `display_name` resolved via `get_partner`. Empty when
+    /// the partner was soft-deleted (the operator sees the dispatch
+    /// without an attached name — a hint that the partner link needs
+    /// repair).
+    partner_name: String,
+    /// `created_at` of the dispatch row.
+    created_at_iso8601: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TodayInvoiceRow {
+    invoice_id: String,
+    /// Operator-visible sequence (the issuance number). 0 for rows
+    /// that have not been allocated a sequence yet — but `Draft` rows
+    /// are excluded from the today-invoice list upstream so this
+    /// never reaches the wire in practice.
+    sequence_number: u64,
+    fiscal_year: i32,
+    /// `"HUF"` / `"EUR"` (existing `Currency` enum serde shape).
+    currency: Currency,
+    /// `Some(_)` once the invoice has lines — same shape as the
+    /// existing `InvoiceListItem.total_gross`. `None` for a
+    /// regulatory-only row that has not yet acquired its first line.
+    total_gross_minor: Option<i64>,
+    /// Buyer label from the side-store input.json (empty when the
+    /// side-store is missing — CLI-issued or pre-PR-47α invoices).
+    buyer_name: String,
+    /// `YYYY-MM-DD` issue date — equal to today's date for every row
+    /// surfaced here by construction.
+    issue_date: String,
+}
+
 async fn handle_workshop_dashboard(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(resp) = require_ready(&state) {
         return resp;
@@ -11001,6 +11153,24 @@ fn compute_workshop_dashboard(
         reports::compute_financial_report(&state.db_path, state.tenant.clone(), binary_hash, req)
             .context("compute today's financial snapshot for dashboard tile")?;
 
+    // S246 / PR-239 — per-tile row lists. Each helper reads a small
+    // capped slice off the existing repository queries + joins the
+    // partner / product master records when the tile needs a name.
+    // All six writes here are read-only and tenant-scoped through the
+    // same `tenant_str` the count queries above already used.
+    let work_order_rows = build_work_order_rows(&conn, tenant_str)
+        .context("read recent work orders for dashboard tile")?;
+    let low_stock_rows = build_low_stock_rows(&conn, tenant_str)
+        .context("read low-stock items for dashboard tile")?;
+    let pending_qa_rows = build_pending_qa_rows(&conn, tenant_str)
+        .context("read pending QA inspections for dashboard tile")?;
+    let eligible_dispatch_rows = build_eligible_dispatch_rows(&conn, tenant_str)
+        .context("read eligible WOs for dashboard tile")?;
+    let pending_dispatch_rows = build_pending_dispatch_rows(&conn, tenant_str)
+        .context("read pending dispatches for dashboard tile")?;
+    let (today_invoice_rows, today_invoice_total) = build_today_invoice_rows(state, &today_iso)
+        .context("read today invoices for dashboard tile")?;
+
     let snapshot_at_iso8601 = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
@@ -11037,7 +11207,232 @@ fn compute_workshop_dashboard(
             .collect(),
         adapters: snapshot_adapter_registry(&state.adapter_registry),
         snapshot_at_iso8601,
+        work_order_rows,
+        low_stock_rows,
+        pending_qa_rows,
+        eligible_dispatch_rows,
+        pending_dispatch_rows,
+        today_invoice_rows,
+        today_invoice_total,
     })
+}
+
+/// S246 / PR-239 — 5 most-recently-created WOs (any state) for the
+/// list below the WO state-buckets grid. Uses the existing
+/// `list_work_orders` reader (already ordered `created_at DESC,
+/// wo_id DESC`) and joins each row's `product_id` to the product
+/// master to surface a human-readable product name. Touched-at is
+/// derived from the column ladder so an idle WO reads correctly.
+fn build_work_order_rows(conn: &Connection, tenant: &str) -> anyhow::Result<Vec<WorkOrderRow>> {
+    let rows =
+        aberp_work_orders::list_work_orders(conn, tenant, None, DASHBOARD_WORK_ORDER_ROWS_LIMIT, 0)
+            .context("list work orders for dashboard row tile")?;
+    let mut out = Vec::with_capacity(rows.len());
+    for wo in rows {
+        let product_name = products::get_product(conn, tenant, &wo.product_id)
+            .ok()
+            .flatten()
+            .map(|p| p.name)
+            .unwrap_or_default();
+        let touched_at_iso8601 = wo_touched_at(&wo);
+        out.push(WorkOrderRow {
+            wo_id: wo.wo_id,
+            wo_number: wo.wo_number,
+            product_name,
+            state: wo.state,
+            touched_at_iso8601,
+            qty_target: wo.qty_target.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Most-recent non-NULL transition timestamp for a WO; falls back
+/// through the column ladder `cancelled_at → completed_at →
+/// started_at → released_at → created_at`. The fallback floor is
+/// `created_at` (always non-empty per the repository schema), so the
+/// returned string is never empty.
+fn wo_touched_at(wo: &aberp_work_orders::WorkOrder) -> String {
+    if let Some(s) = wo.cancelled_at.as_deref() {
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    if let Some(s) = wo.completed_at.as_deref() {
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    if let Some(s) = wo.started_at.as_deref() {
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    if let Some(s) = wo.released_at.as_deref() {
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    wo.created_at.clone()
+}
+
+/// Up to 10 below-min product rows for the dashboard list. Reuses
+/// the existing `low_stock_products` reader (most-critical first per
+/// ADR-0061 §3) and truncates.
+fn build_low_stock_rows(conn: &Connection, tenant: &str) -> anyhow::Result<Vec<LowStockItemRow>> {
+    let rows = aberp_inventory::low_stock_products(conn, tenant)
+        .context("list low-stock products for dashboard row tile")?;
+    Ok(rows
+        .into_iter()
+        .take(DASHBOARD_LOW_STOCK_ROWS_LIMIT)
+        .map(|r| LowStockItemRow {
+            product_id: r.product_id,
+            name: r.name,
+            stock_qty: r.stock_qty.to_string(),
+            min_stock: r.min_stock.to_string(),
+            bin_location: r.bin_location.unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// Up to 7 Pending QA inspections for the dashboard list. Reuses
+/// `list_qa_inspections` (oldest first per ADR-0063 §8) and joins
+/// each row's WO + routing-op for operator-visible labels.
+fn build_pending_qa_rows(conn: &Connection, tenant: &str) -> anyhow::Result<Vec<PendingQaRow>> {
+    let rows = aberp_qa::list_qa_inspections(
+        conn,
+        tenant,
+        Some(aberp_qa::QaState::Pending),
+        DASHBOARD_PENDING_QA_ROWS_LIMIT,
+        0,
+    )
+    .context("list QA inspections for dashboard row tile")?;
+    let mut out = Vec::with_capacity(rows.len());
+    for q in rows {
+        let wo_number = aberp_work_orders::read_work_order(conn, tenant, &q.wo_id)
+            .ok()
+            .flatten()
+            .map(|wo| wo.wo_number)
+            .unwrap_or_default();
+        let op_name = aberp_work_orders::read_routing_op(conn, tenant, &q.routing_op_id)
+            .ok()
+            .flatten()
+            .map(|op| op.op_name)
+            .unwrap_or_default();
+        out.push(PendingQaRow {
+            qa_id: q.qa_id,
+            wo_id: q.wo_id,
+            wo_number,
+            routing_op_id: q.routing_op_id,
+            op_name,
+            created_at_iso8601: q.created_at,
+        });
+    }
+    Ok(out)
+}
+
+/// Up to 5 Eligible WO rows for the dashboard list. Reuses
+/// `list_eligible_work_orders` and joins each row's product name.
+fn build_eligible_dispatch_rows(
+    conn: &Connection,
+    tenant: &str,
+) -> anyhow::Result<Vec<EligibleDispatchRow>> {
+    let rows = aberp_dispatch::list_eligible_work_orders(
+        conn,
+        tenant,
+        DASHBOARD_ELIGIBLE_DISPATCH_ROWS_LIMIT,
+    )
+    .context("list eligible WOs for dashboard row tile")?;
+    let mut out = Vec::with_capacity(rows.len());
+    for e in rows {
+        let product_name = products::get_product(conn, tenant, &e.product_id)
+            .ok()
+            .flatten()
+            .map(|p| p.name)
+            .unwrap_or_default();
+        out.push(EligibleDispatchRow {
+            wo_id: e.wo_id,
+            wo_number: e.wo_number,
+            product_name,
+            qty_target: e.qty_target,
+            completed_at_iso8601: e.completed_at,
+        });
+    }
+    Ok(out)
+}
+
+/// Up to 2 most-recent Drafted dispatch rows. Reuses
+/// `list_dispatches` (newest first per ADR-0064 §7) and joins
+/// each row's WO number + partner display_name.
+fn build_pending_dispatch_rows(
+    conn: &Connection,
+    tenant: &str,
+) -> anyhow::Result<Vec<PendingDispatchRow>> {
+    let rows = aberp_dispatch::list_dispatches(
+        conn,
+        tenant,
+        Some(aberp_dispatch::DispatchState::Drafted),
+        DASHBOARD_PENDING_DISPATCH_ROWS_LIMIT,
+        0,
+    )
+    .context("list pending dispatches for dashboard row tile")?;
+    let mut out = Vec::with_capacity(rows.len());
+    for d in rows {
+        let wo_number = aberp_work_orders::read_work_order(conn, tenant, &d.wo_id)
+            .ok()
+            .flatten()
+            .map(|wo| wo.wo_number)
+            .unwrap_or_default();
+        let partner_name = partners::get_partner(conn, tenant, &d.partner_id)
+            .ok()
+            .flatten()
+            .map(|p| p.display_name)
+            .unwrap_or_default();
+        out.push(PendingDispatchRow {
+            dsp_id: d.dsp_id,
+            wo_id: d.wo_id,
+            wo_number,
+            partner_name,
+            created_at_iso8601: d.created_at,
+        });
+    }
+    Ok(out)
+}
+
+/// Up to 5 issued-today invoices for the dashboard list, plus the
+/// untruncated total count for the "+N more" footer. Reuses
+/// `list_invoices(state)` — the canonical audit-ledger-derived view
+/// the SPA's Outgoing tab already reads — and filters to rows whose
+/// `issue_date` matches today's YYYY-MM-DD AND whose state is not
+/// `Draft` (drafts have no sequence number yet). Newest-by-sequence
+/// first so the most-recent issuance heads the list.
+fn build_today_invoice_rows(
+    state: &AppState,
+    today_iso: &str,
+) -> anyhow::Result<(Vec<TodayInvoiceRow>, u32)> {
+    let items = list_invoices(state).context("list invoices for dashboard today tile")?;
+    let mut today_items: Vec<&InvoiceListItem> = items
+        .iter()
+        .filter(|it| {
+            !matches!(it.state, InvoiceState::Draft) && it.issue_date.as_deref() == Some(today_iso)
+        })
+        .collect();
+    today_items.sort_by_key(|it| std::cmp::Reverse(it.sequence_number));
+    let total = u32::try_from(today_items.len()).unwrap_or(u32::MAX);
+    let rows: Vec<TodayInvoiceRow> = today_items
+        .into_iter()
+        .take(DASHBOARD_TODAY_INVOICE_ROWS_LIMIT)
+        .map(|it| TodayInvoiceRow {
+            invoice_id: it.invoice_id.clone(),
+            sequence_number: it.sequence_number,
+            fiscal_year: it.fiscal_year,
+            currency: it.currency,
+            total_gross_minor: it.total_gross,
+            buyer_name: it.buyer_name.clone().unwrap_or_default(),
+            issue_date: it.issue_date.clone().unwrap_or_default(),
+        })
+        .collect();
+    Ok((rows, total))
 }
 
 /// S240 / PR-234 — live registry probe for the Workshop dashboard.
@@ -17855,5 +18250,72 @@ mod tests {
             assert_eq!(row.port, 0);
             assert_eq!(row.status, "healthy");
         }
+    }
+
+    /// S246 / PR-239 — `wo_touched_at` picks the most recent non-NULL
+    /// state-transition stamp. The fallback ladder is
+    /// `cancelled_at → completed_at → started_at → released_at →
+    /// created_at`. The function returns `created_at` as the floor;
+    /// a WO with only `created_at` set surfaces that string verbatim.
+    /// Pinned because the fallback ladder is the kind of column-priority
+    /// logic that quietly mis-orders if a future ALTER adds a column
+    /// without revisiting it here.
+    #[test]
+    fn wo_touched_at_picks_most_recent_transition() {
+        use aberp_work_orders::{WorkOrder, WorkOrderState};
+        use rust_decimal::Decimal;
+
+        let base = WorkOrder {
+            wo_id: "wo_TEST".to_string(),
+            wo_number: "WO-2026-0001".to_string(),
+            product_id: "prod_TEST".to_string(),
+            qty_target: Decimal::new(1, 0),
+            state: WorkOrderState::Created,
+            created_at: "2026-06-01T08:00:00Z".to_string(),
+            released_at: None,
+            started_at: None,
+            completed_at: None,
+            cancelled_at: None,
+            hold_reason: None,
+            notes: None,
+        };
+
+        // 1. Only created_at set — that's the floor.
+        assert_eq!(wo_touched_at(&base), "2026-06-01T08:00:00Z");
+
+        // 2. Released — released_at wins.
+        let mut wo = base.clone();
+        wo.released_at = Some("2026-06-01T09:00:00Z".to_string());
+        assert_eq!(wo_touched_at(&wo), "2026-06-01T09:00:00Z");
+
+        // 3. In progress — started_at wins over released_at.
+        let mut wo = base.clone();
+        wo.released_at = Some("2026-06-01T09:00:00Z".to_string());
+        wo.started_at = Some("2026-06-01T10:00:00Z".to_string());
+        assert_eq!(wo_touched_at(&wo), "2026-06-01T10:00:00Z");
+
+        // 4. Completed — completed_at wins over started_at.
+        let mut wo = base.clone();
+        wo.released_at = Some("2026-06-01T09:00:00Z".to_string());
+        wo.started_at = Some("2026-06-01T10:00:00Z".to_string());
+        wo.completed_at = Some("2026-06-01T11:00:00Z".to_string());
+        assert_eq!(wo_touched_at(&wo), "2026-06-01T11:00:00Z");
+
+        // 5. Cancelled — cancelled_at trumps every other stamp (a
+        //    Cancel transition is terminal and wins even if a stray
+        //    completed_at lives on the row from an earlier path).
+        let mut wo = base.clone();
+        wo.completed_at = Some("2026-06-01T11:00:00Z".to_string());
+        wo.cancelled_at = Some("2026-06-01T12:00:00Z".to_string());
+        assert_eq!(wo_touched_at(&wo), "2026-06-01T12:00:00Z");
+
+        // 6. Defensive — an empty string in an Option<String> slot
+        //    is treated as absent so a future migration that
+        //    backfills "" rather than NULL doesn't surface a blank
+        //    "touched at" on the row.
+        let mut wo = base.clone();
+        wo.released_at = Some(String::new());
+        wo.started_at = Some("2026-06-01T10:00:00Z".to_string());
+        assert_eq!(wo_touched_at(&wo), "2026-06-01T10:00:00Z");
     }
 }

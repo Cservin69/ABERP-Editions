@@ -18,7 +18,13 @@
 
 import type {
   AdapterStatusSnapshot,
+  EligibleDispatchRow,
+  LowStockItemRow,
+  PendingDispatchRow,
+  PendingQaRow,
   RecentActivityEntry,
+  TodayInvoiceRow,
+  WorkOrderRow,
   WorkshopDashboard,
 } from "./api";
 
@@ -66,6 +72,16 @@ export function getMockDashboard(
     recent_activity: buildRecentActivity(now),
     adapters: buildAdapters(),
     snapshot_at_iso8601: now.toISOString(),
+    // S246 / PR-239 — density rows. Counts/cadence per the brief
+    // (5 WOs, 3 low-stock, 7 QA, 4 eligible + 2 pending dispatch,
+    // 5 invoice rows + 8 total so the "+3 more" footer surfaces).
+    work_order_rows: buildWorkOrderRows(now),
+    low_stock_rows: buildLowStockRows(),
+    pending_qa_rows: buildPendingQaRows(now),
+    eligible_dispatch_rows: buildEligibleDispatchRows(now),
+    pending_dispatch_rows: buildPendingDispatchRows(now),
+    today_invoice_rows: buildTodayInvoiceRows(now),
+    today_invoice_total: 8,
   };
 }
 
@@ -180,6 +196,216 @@ export const MOCK_SPOTLIGHT_TILES: readonly string[] = [
   "tile-today",
   "tile-recent-activity",
 ];
+
+// ── Density rows (S246 / PR-239) ────────────────────────────────
+//
+// Each tile gains a list of underlying items below the existing
+// quick-focus number. The mock data here mirrors the shape the
+// real backend payload carries (see `serve.rs::WorkshopDashboard`
+// row structs) so the SPA renders identically against either source.
+
+/** 5 mock WO rows spanning the WO state vocab — released, in_progress,
+ *  on_hold, completed, and one created. Touched-at offsets span the
+ *  last ~6 hours so the `fmtRelativeTime` formatter exercises both
+ *  the minute and hour branches. Product names map to the brief's
+ *  generic CNC-part vocab. */
+function buildWorkOrderRows(now: Date): WorkOrderRow[] {
+  const base = now.getTime();
+  const HR = 60 * MIN_MS;
+  return [
+    {
+      wo_id: "wo_mock_00428",
+      wo_number: "WO-2026-00428",
+      product_name: "Manifold T4",
+      state: "in_progress",
+      touched_at_iso8601: new Date(base - 18 * MIN_MS).toISOString(),
+      qty_target: "12",
+    },
+    {
+      wo_id: "wo_mock_00431",
+      wo_number: "WO-2026-00431",
+      product_name: "Tartó 240mm",
+      state: "released",
+      touched_at_iso8601: new Date(base - 1.4 * HR).toISOString(),
+      qty_target: "24",
+    },
+    {
+      wo_id: "wo_mock_00429",
+      wo_number: "WO-2026-00429",
+      product_name: "Burkolat 12-A",
+      state: "on_hold",
+      touched_at_iso8601: new Date(base - 2.7 * HR).toISOString(),
+      qty_target: "6",
+    },
+    {
+      wo_id: "wo_mock_00426",
+      wo_number: "WO-2026-00426",
+      product_name: "Manifold T4",
+      state: "completed",
+      touched_at_iso8601: new Date(base - 4.1 * HR).toISOString(),
+      qty_target: "8",
+    },
+    {
+      wo_id: "wo_mock_00432",
+      wo_number: "WO-2026-00432",
+      product_name: "Csapágy 80B",
+      state: "created",
+      touched_at_iso8601: new Date(base - 5.8 * HR).toISOString(),
+      qty_target: "40",
+    },
+  ];
+}
+
+/** 3 mock below-min product rows with bin codes following the
+ *  brief's `A-12-3`-style three-segment alpha-numeric grid. */
+function buildLowStockRows(): LowStockItemRow[] {
+  return [
+    {
+      product_id: "prod_mock_brkt_240",
+      name: "Tartó 240mm",
+      stock_qty: "4",
+      min_stock: "20",
+      bin_location: "A-12-3",
+    },
+    {
+      product_id: "prod_mock_mfld_t4",
+      name: "Manifold T4",
+      stock_qty: "2",
+      min_stock: "8",
+      bin_location: "B-04-1",
+    },
+    {
+      product_id: "prod_mock_hsg_12a",
+      name: "Burkolat 12-A",
+      stock_qty: "1",
+      min_stock: "5",
+      bin_location: "C-09-2",
+    },
+  ];
+}
+
+/** 7 mock Pending QA inspections — oldest first per ADR-0063 §8 so
+ *  the list reads "longest waiting at the top." Operator-visible op
+ *  names use HU manufacturing vocab (`Marás`, `Festés`, …). */
+function buildPendingQaRows(now: Date): PendingQaRow[] {
+  const base = now.getTime();
+  const HR = 60 * MIN_MS;
+  // [minutesAgo, woNumber, opName]
+  const script: Array<[number, string, string]> = [
+    [4.2 * 60, "WO-2026-00410", "Marás"],
+    [3.6 * 60, "WO-2026-00412", "Esztergálás"],
+    [2.8 * 60, "WO-2026-00415", "Festés"],
+    [2.1 * 60, "WO-2026-00418", "Csiszolás"],
+    [1.5 * 60, "WO-2026-00422", "Marás"],
+    [38, "WO-2026-00425", "Festés"],
+    [12, "WO-2026-00428", "Mérés"],
+  ];
+  return script.map(([minsAgo, woNumber, opName], i) => ({
+    qa_id: `qa_mock_${1000 + i}`,
+    wo_id: `wo_mock_${woNumber.slice(-5)}`,
+    wo_number: woNumber,
+    routing_op_id: `rop_mock_${1000 + i}`,
+    op_name: opName,
+    created_at_iso8601: new Date(base - minsAgo * MIN_MS).toISOString(),
+  }));
+}
+
+/** 4 mock Eligible WO rows — Completed WOs without a dispatch row.
+ *  Oldest first so the longest-waiting heads the list. */
+function buildEligibleDispatchRows(now: Date): EligibleDispatchRow[] {
+  const base = now.getTime();
+  const HR = 60 * MIN_MS;
+  const script: Array<[number, string, string, string]> = [
+    [7.8 * HR, "WO-2026-00401", "Tartó 240mm", "16"],
+    [5.4 * HR, "WO-2026-00405", "Manifold T4", "10"],
+    [3.2 * HR, "WO-2026-00409", "Csapágy 80B", "24"],
+    [1.6 * HR, "WO-2026-00417", "Burkolat 12-A", "6"],
+  ];
+  return script.map(([msAgo, woNumber, productName, qty]) => ({
+    wo_id: `wo_mock_${woNumber.slice(-5)}`,
+    wo_number: woNumber,
+    product_name: productName,
+    qty_target: qty,
+    completed_at_iso8601: new Date(base - msAgo).toISOString(),
+  }));
+}
+
+/** 2 mock Drafted dispatches with neutral-Hungarian-industry partner
+ *  names from the brief's canonical fake set. Newest first. */
+function buildPendingDispatchRows(now: Date): PendingDispatchRow[] {
+  const base = now.getTime();
+  const HR = 60 * MIN_MS;
+  return [
+    {
+      dsp_id: "dsp_mock_0007",
+      wo_id: "wo_mock_00420",
+      wo_number: "WO-2026-00420",
+      partner_name: "Acme Manufacturing Kft.",
+      created_at_iso8601: new Date(base - 0.5 * HR).toISOString(),
+    },
+    {
+      dsp_id: "dsp_mock_0006",
+      wo_id: "wo_mock_00414",
+      wo_number: "WO-2026-00414",
+      partner_name: "Stellar Industries Zrt.",
+      created_at_iso8601: new Date(base - 2.4 * HR).toISOString(),
+    },
+  ];
+}
+
+/** 5 mock issued-today invoices spanning HUF + EUR, with HU+EU
+ *  partner names. The parent payload's `today_invoice_total` is 8
+ *  so the SPA renders "+3 more" below the 5 surfaced rows. */
+function buildTodayInvoiceRows(now: Date): TodayInvoiceRow[] {
+  const today = formatIsoDate(now);
+  return [
+    {
+      invoice_id: "inv_mock_2026_0428",
+      sequence_number: 428,
+      fiscal_year: 2026,
+      currency: "HUF",
+      total_gross_minor: 87_500_000,
+      buyer_name: "Acme Manufacturing Kft.",
+      issue_date: today,
+    },
+    {
+      invoice_id: "inv_mock_2026_0427",
+      sequence_number: 427,
+      fiscal_year: 2026,
+      currency: "HUF",
+      total_gross_minor: 142_300_000,
+      buyer_name: "Northstar Co.",
+      issue_date: today,
+    },
+    {
+      invoice_id: "inv_mock_2026_0426",
+      sequence_number: 426,
+      fiscal_year: 2026,
+      currency: "EUR",
+      total_gross_minor: 685_000,
+      buyer_name: "Stellar Industries GmbH",
+      issue_date: today,
+    },
+    {
+      invoice_id: "inv_mock_2026_0425",
+      sequence_number: 425,
+      fiscal_year: 2026,
+      currency: "HUF",
+      total_gross_minor: 56_840_000,
+      buyer_name: "Magyar Gépgyár Zrt.",
+      issue_date: today,
+    },
+    {
+      invoice_id: "inv_mock_2026_0424",
+      sequence_number: 424,
+      fiscal_year: 2026,
+      currency: "EUR",
+      total_gross_minor: 560_000,
+      buyer_name: "Stellar Industries GmbH",
+      issue_date: today,
+    },
+  ];
+}
 
 // ── Helpers ─────────────────────────────────────────────────────
 

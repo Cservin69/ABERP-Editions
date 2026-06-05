@@ -35,6 +35,7 @@
     type WorkshopDashboard,
     type WorkOrderStateCounts,
     type QaStateCounts,
+    type WorkOrderRow,
   } from "../lib/api";
   import { navigateTo } from "../lib/router";
   import {
@@ -303,6 +304,32 @@
     if (!demoMode) return "false";
     return MOCK_SPOTLIGHT_TILES[spotlightIdx] === testid ? "true" : "false";
   }
+
+  // ── S246 / PR-239 — wall-TV density helpers ────────────────────
+  //
+  // Maps the WO-state snake_case wire form onto the same HU/EN
+  // label table the buckets-grid uses, so a row chip ("Folyamatban")
+  // reads identically to its counterpart in the bucket above. The
+  // mapping is the inverse of WO_STATE_LABELS' `key`-as-snake_case
+  // assumption — when the brief widens the WO vocab, both surfaces
+  // diverge at the same diff site.
+  function woStateLabel(state: WorkOrderRow["state"]): string {
+    const found = WO_STATE_LABELS.find((l) => l.key === state);
+    if (found === undefined) return state;
+    return lang === "hu" ? found.hu : found.en;
+  }
+
+  /** Format an HUF/EUR minor-unit total for the today-invoice row
+   *  list. Mirrors `fmtMinorWithLang` but takes a `null`-tolerant
+   *  input — the backend posture is `total_gross_minor: number | null`
+   *  for rows without any lines yet. */
+  function fmtRowMoney(
+    minor: number | null,
+    currency: "HUF" | "EUR",
+  ): string {
+    if (minor === null) return "—";
+    return fmtMinor(minor, currency, lang);
+  }
 </script>
 
 <section
@@ -427,6 +454,29 @@
             </li>
           {/each}
         </ul>
+        <!-- S246 / PR-239 — recent WO rows underneath the bucket grid.
+             5-row cap per the density brief; empty-state hidden so the
+             tile shape stays stable when a fresh tenant has no WOs. -->
+        {#if b.work_order_rows.length > 0}
+          <ul class="ws-rows" data-testid="wo-row-list">
+            {#each b.work_order_rows as row (row.wo_id)}
+              <li class="ws-row" data-testid={`wo-row-${row.wo_id}`}>
+                <span class="ws-row__primary">{row.wo_number}</span>
+                <span class="ws-row__secondary">{row.product_name}</span>
+                <span class={`ws-row__chip ws-row__chip--${row.state}`}>
+                  {woStateLabel(row.state)}
+                </span>
+                <time
+                  class="ws-row__time"
+                  datetime={row.touched_at_iso8601}
+                  title={row.touched_at_iso8601}
+                >
+                  {fmtRelativeTime(row.touched_at_iso8601)}
+                </time>
+              </li>
+            {/each}
+          </ul>
+        {/if}
       </article>
 
       <!-- QA backlog — middle-row left, narrower. -->
@@ -478,6 +528,24 @@
               >{/if}
           {/each}
         </p>
+        <!-- S246 / PR-239 — Pending QA list (up to 7 oldest-first). -->
+        {#if b.pending_qa_rows.length > 0}
+          <ul class="ws-rows" data-testid="qa-row-list">
+            {#each b.pending_qa_rows as row (row.qa_id)}
+              <li class="ws-row" data-testid={`qa-row-${row.qa_id}`}>
+                <span class="ws-row__primary">{row.wo_number}</span>
+                <span class="ws-row__secondary">{row.op_name}</span>
+                <time
+                  class="ws-row__time"
+                  datetime={row.created_at_iso8601}
+                  title={row.created_at_iso8601}
+                >
+                  {fmtRelativeTime(row.created_at_iso8601)}
+                </time>
+              </li>
+            {/each}
+          </ul>
+        {/if}
       </article>
 
       <!-- Dispatch board — middle-row right, takes the remaining
@@ -543,6 +611,64 @@
             </button>
           </li>
         </ul>
+        <!-- S246 / PR-239 — Dispatch density rows.
+             Two sub-lists below the counters: Eligible WOs (5 cap) and
+             Pending Drafted dispatches (2 cap). Each sub-list has its
+             own header so the operator distinguishes "ready to dispatch"
+             from "drafted, awaiting ship." -->
+        {#if b.eligible_dispatch_rows.length > 0}
+          <div class="ws-rows-group">
+            <h4 class="ws-rows-group__title">
+              {lang === "hu" ? "Indítható" : "Eligible"}
+            </h4>
+            <ul class="ws-rows" data-testid="eligible-dispatch-row-list">
+              {#each b.eligible_dispatch_rows as row (row.wo_id)}
+                <li
+                  class="ws-row"
+                  data-testid={`eligible-dispatch-row-${row.wo_id}`}
+                >
+                  <span class="ws-row__primary">{row.wo_number}</span>
+                  <span class="ws-row__secondary">{row.product_name}</span>
+                  <span class="ws-row__qty">
+                    {row.qty_target}
+                  </span>
+                  <time
+                    class="ws-row__time"
+                    datetime={row.completed_at_iso8601}
+                    title={row.completed_at_iso8601}
+                  >
+                    {fmtRelativeTime(row.completed_at_iso8601)}
+                  </time>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
+        {#if b.pending_dispatch_rows.length > 0}
+          <div class="ws-rows-group">
+            <h4 class="ws-rows-group__title">
+              {lang === "hu" ? "Tervezet" : "Pending"}
+            </h4>
+            <ul class="ws-rows" data-testid="pending-dispatch-row-list">
+              {#each b.pending_dispatch_rows as row (row.dsp_id)}
+                <li
+                  class="ws-row"
+                  data-testid={`pending-dispatch-row-${row.dsp_id}`}
+                >
+                  <span class="ws-row__primary">{row.wo_number}</span>
+                  <span class="ws-row__secondary">{row.partner_name}</span>
+                  <time
+                    class="ws-row__time"
+                    datetime={row.created_at_iso8601}
+                    title={row.created_at_iso8601}
+                  >
+                    {fmtRelativeTime(row.created_at_iso8601)}
+                  </time>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
       </article>
 
       <!-- Bottom-row trio — Adapters, Low Stock, Today. Three equal-
@@ -634,6 +760,30 @@
               : "products below minimum"}
           </span>
         </button>
+        <!-- S246 / PR-239 — list of below-min product rows (up to 10).
+             Each row reads "name — qty/min — bin" so the operator scans
+             the actual items without leaving the dashboard. -->
+        {#if b.low_stock_rows.length > 0}
+          <ul class="ws-rows" data-testid="low-stock-row-list">
+            {#each b.low_stock_rows as row (row.product_id)}
+              <li class="ws-row" data-testid={`low-stock-row-${row.product_id}`}>
+                <span class="ws-row__primary">{row.name}</span>
+                <span class="ws-row__qty ws-row__qty--warn">
+                  {row.stock_qty}
+                  <span class="ws-row__qty-sep" aria-hidden="true">/</span>
+                  {row.min_stock}
+                </span>
+                <span class="ws-row__secondary">
+                  {row.bin_location === ""
+                    ? lang === "hu"
+                      ? "nincs hely"
+                      : "no bin"
+                    : row.bin_location}
+                </span>
+              </li>
+            {/each}
+          </ul>
+        {/if}
       </article>
 
       <!-- Today snapshot — bottom row right. -->
@@ -683,6 +833,38 @@
             </li>
           {/if}
         </ul>
+        <!-- S246 / PR-239 — issued-today invoice rows (up to 5).
+             Backend caps at 5 + emits `today_invoice_total`; the footer
+             renders "+N more" when the cap truncates so the operator
+             knows there's overflow rather than reading "only 5 today." -->
+        {#if b.today_invoice_rows.length > 0}
+          <ul class="ws-rows" data-testid="today-invoice-row-list">
+            {#each b.today_invoice_rows as row (row.invoice_id)}
+              <li class="ws-row" data-testid={`today-invoice-row-${row.invoice_id}`}>
+                <span class="ws-row__primary">
+                  {row.buyer_name === ""
+                    ? lang === "hu"
+                      ? "ismeretlen vevő"
+                      : "unknown buyer"
+                    : row.buyer_name}
+                </span>
+                <span class="ws-row__qty">
+                  {fmtRowMoney(row.total_gross_minor, row.currency)}
+                </span>
+                <span class="ws-row__secondary">
+                  {row.sequence_number}/{row.fiscal_year}
+                </span>
+              </li>
+            {/each}
+          </ul>
+          {#if b.today_invoice_total > b.today_invoice_rows.length}
+            <p class="ws-rows-more" data-testid="today-invoice-overflow">
+              {lang === "hu"
+                ? `+${b.today_invoice_total - b.today_invoice_rows.length} további`
+                : `+${b.today_invoice_total - b.today_invoice_rows.length} more`}
+            </p>
+          {/if}
+        {/if}
       </article>
 
       <!-- Recent activity — full-height right rail. -->
@@ -1050,6 +1232,146 @@
     color: var(--color-text-muted);
     font-size: var(--type-size-sm);
     font-style: italic;
+  }
+
+  /* ── S246 / PR-239 — density rows ──────────────────────────────
+     Row styling mirrors the existing `.ws-adapter` (surface-raised
+     pill on the sunken tile background) so the operator's eye
+     reads "list-of-items below the aggregate" without a visual
+     break. Dark tokens only per [[spa-dark-theme-default]]. */
+
+  .ws-rows {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .ws-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    padding: var(--space-1) var(--space-2);
+    font-size: var(--type-size-xs);
+    min-width: 0;
+  }
+
+  /* Primary cell — the row's identifying label (WO number,
+     product name, buyer name). Mono so a long-running TV view
+     reads the digits at a constant width. */
+  .ws-row__primary {
+    color: var(--color-text-strong);
+    font-family: var(--type-family-mono);
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Secondary cell — context label (product on a WO row, op name
+     on a QA row, bin location on a low-stock row). Subdued so the
+     primary cell stays the focal point. */
+  .ws-row__secondary {
+    color: var(--color-text-secondary);
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Right-aligned timestamp cell. Mono for the same constant-width
+     reason. Muted because absolute time is rarely the actionable
+     signal on a wall TV. */
+  .ws-row__time {
+    color: var(--color-text-muted);
+    font-family: var(--type-family-mono);
+    margin-left: auto;
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  /* Quantity / money cell. Same mono treatment as the primary
+     cell; warning variant for the low-stock "qty/min" pair so the
+     undersupply reads at a glance. */
+  .ws-row__qty {
+    color: var(--color-text-strong);
+    font-family: var(--type-family-mono);
+    flex: 0 0 auto;
+    margin-left: auto;
+    white-space: nowrap;
+  }
+
+  .ws-row__qty--warn {
+    color: var(--color-signal-warning);
+  }
+
+  .ws-row__qty-sep {
+    color: var(--color-text-muted);
+    margin: 0 2px;
+  }
+
+  /* WO-state chip on a row. Color inherits from the existing
+     signal vocab so a row chip matches the bucket-grid color
+     intent without re-stating tokens. `created` + `released`
+     read as neutral; `in_progress` is positive; `on_hold` warns;
+     terminal states fade. */
+  .ws-row__chip {
+    font-size: var(--type-size-xs);
+    padding: 0 var(--space-2);
+    border-radius: 999px;
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-base);
+    color: var(--color-text-secondary);
+    flex: 0 0 auto;
+  }
+
+  .ws-row__chip--in_progress {
+    color: var(--color-signal-positive);
+  }
+
+  .ws-row__chip--on_hold {
+    color: var(--color-signal-warning);
+  }
+
+  .ws-row__chip--completed,
+  .ws-row__chip--cancelled {
+    color: var(--color-text-muted);
+  }
+
+  /* Dispatch tile holds two sub-lists (Eligible + Pending) and
+     wants each titled. Title styling is minimal — secondary text
+     + xs size — so the visual weight stays on the rows below. */
+  .ws-rows-group {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .ws-rows-group__title {
+    margin: 0;
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  /* "+N more" footer on the Today tile when the row list truncates.
+     Muted, italic, no border so it reads as overflow signal, not
+     as another row. */
+  .ws-rows-more {
+    margin: 0;
+    color: var(--color-text-muted);
+    font-size: var(--type-size-xs);
+    font-style: italic;
+    text-align: right;
   }
 
   .ws-adapter-list {

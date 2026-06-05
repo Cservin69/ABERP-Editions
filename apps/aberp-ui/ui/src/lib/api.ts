@@ -2766,6 +2766,80 @@ export interface AdapterStatusSnapshot {
   port: number;
 }
 
+// S246 / PR-239 — wall-TV density rows. Each tile that previously
+// surfaced only an aggregate count now also lists the underlying
+// items. Field naming on the parent payload uses the `_rows` suffix
+// where the count-shaped field already owned the plural slot
+// (`work_orders`, `low_stock_products`); on tiles with no naming
+// collision (`pending_qa`, `eligible_dispatch`, `pending_dispatch`,
+// `today_invoice`) the suffix is dropped from the brief's draft
+// names — every parent-level field reads `_rows` to keep the wire
+// shape consistent. Mirrors `serve.rs::WorkshopDashboard`.
+export interface WorkOrderRow {
+  wo_id: string;
+  wo_number: string;
+  product_name: string;
+  /** snake_case `WorkOrderState` — the SPA's existing chip mapping
+   * matches on these strings. */
+  state:
+    | "created"
+    | "released"
+    | "in_progress"
+    | "completed"
+    | "cancelled"
+    | "on_hold";
+  /** RFC3339 — newest non-NULL transition timestamp; `created_at`
+   *  floor. Render via `fmtRelativeTime`. */
+  touched_at_iso8601: string;
+  /** Decimal-as-string. */
+  qty_target: string;
+}
+
+export interface LowStockItemRow {
+  product_id: string;
+  name: string;
+  stock_qty: string;
+  min_stock: string;
+  bin_location: string;
+}
+
+export interface PendingQaRow {
+  qa_id: string;
+  wo_id: string;
+  wo_number: string;
+  routing_op_id: string;
+  op_name: string;
+  created_at_iso8601: string;
+}
+
+export interface EligibleDispatchRow {
+  wo_id: string;
+  wo_number: string;
+  product_name: string;
+  qty_target: string;
+  completed_at_iso8601: string;
+}
+
+export interface PendingDispatchRow {
+  dsp_id: string;
+  wo_id: string;
+  wo_number: string;
+  partner_name: string;
+  created_at_iso8601: string;
+}
+
+export interface TodayInvoiceRow {
+  invoice_id: string;
+  sequence_number: number;
+  fiscal_year: number;
+  currency: "HUF" | "EUR";
+  /** Same `total_gross` semantics as the InvoiceList row — null when
+   *  the row has no lines yet. */
+  total_gross_minor: number | null;
+  buyer_name: string;
+  issue_date: string;
+}
+
 export interface WorkshopDashboard {
   work_orders: WorkOrderStateCounts;
   low_stock_products: LowStockCount;
@@ -2775,6 +2849,16 @@ export interface WorkshopDashboard {
   recent_activity: RecentActivityEntry[];
   adapters: AdapterStatusSnapshot[];
   snapshot_at_iso8601: string;
+  // S246 / PR-239 — density rows below each aggregate tile.
+  work_order_rows: WorkOrderRow[];
+  low_stock_rows: LowStockItemRow[];
+  pending_qa_rows: PendingQaRow[];
+  eligible_dispatch_rows: EligibleDispatchRow[];
+  pending_dispatch_rows: PendingDispatchRow[];
+  today_invoice_rows: TodayInvoiceRow[];
+  /** Untruncated count of issued-today invoices. The SPA renders a
+   *  "+N more" footer when this exceeds `today_invoice_rows.length`. */
+  today_invoice_total: number;
 }
 
 /** Fetch the Workshop dashboard bundle. No params — the whole tile
