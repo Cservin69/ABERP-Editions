@@ -42,6 +42,7 @@ const LEGAL_SORT_KEYS: readonly SortKey[] = [
   "state",
   "total",
   "row_kind",
+  "issue_date",
 ];
 
 const LEGAL_SORT_DIRS: readonly SortDir[] = ["asc", "desc"];

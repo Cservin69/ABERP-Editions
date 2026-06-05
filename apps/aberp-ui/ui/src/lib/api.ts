@@ -136,6 +136,15 @@ export interface InvoiceListItem {
    * the composed `${fiscal_year}-${sequence_number}` identifier;
    * this field stays `null` there. */
   source_nav_invoice_number: string | null;
+  /** S242 / PR-236 — canonical ISO-8601 `YYYY-MM-DD` issue date
+   * (Hungarian `Kelt` / "Issued"), surfaced on the Outgoing tab's
+   * "Issued" column. `null` ONLY for Draft rows (S236 — pre-issuance
+   * `invoice_draft` entries that have no issue date by construction);
+   * Own non-drafts and ExtNav rows always carry a date. The SPA's
+   * column renderer treats `null` as an empty cell, NOT an em-dash
+   * placeholder, per the PR-236 brief. Pinned by
+   * `invoice_list_item_emits_issue_date` on the Rust side. */
+  issue_date: string | null;
 }
 
 /** PR-213 / S215 — closed-vocab row discriminator for the unified

@@ -187,116 +187,126 @@
 </dialog>
 
 <style>
+  /* S242 / PR-236 — dark-theme token migration. Pre-PR-236 this
+   * modal used `var(--surface, white)` / `var(--text, #222)` legacy
+   * fallbacks; per [[spa-dark-theme-default]] those tokens are NOT
+   * defined and the modal rendered bright-white against the warm-
+   * charcoal chrome. Migrated to `tokens.css` (ADR-0017) following
+   * the canonical `PartnerForm.svelte` modal pattern. */
   .extnav-partner-picker::backdrop {
-    background: rgba(0, 0, 0, 0.4);
+    background: rgba(0, 0, 0, 0.5);
   }
 
   .extnav-partner-picker {
-    border: none;
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-base);
+    color: var(--color-text-primary);
     border-radius: 8px;
     padding: 0;
     max-width: 480px;
     width: 90vw;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
   }
 
   .picker-frame {
     display: flex;
     flex-direction: column;
-    gap: 1rem;
-    padding: 1.25rem;
-    background: var(--surface, white);
-    color: var(--text, #222);
+    gap: var(--space-3);
+    padding: var(--space-4) var(--space-5);
+    animation: aberp-fade-in var(--motion-fade-in) both;
   }
 
   .picker-header {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
-    border-bottom: 1px solid var(--rule, #e6e6e6);
-    padding-bottom: 0.75rem;
+    gap: var(--space-2);
+    border-bottom: 1px solid var(--color-surface-divider);
+    padding-bottom: var(--space-3);
   }
 
   .picker-title {
     margin: 0;
-    font-size: 1.1rem;
-    font-weight: 600;
+    font-size: var(--type-size-lg);
+    font-weight: 500;
+    color: var(--color-text-strong);
   }
 
   .picker-subtitle {
     margin: 0;
-    font-size: 0.85rem;
-    color: var(--text-muted, #666);
-    line-height: 1.4;
+    font-size: var(--type-size-sm);
+    color: var(--color-text-secondary);
+    line-height: var(--type-line-normal);
   }
 
   .picker-subtitle-en {
     font-style: italic;
-    color: var(--text-muted-2, #888);
+    color: var(--color-text-muted);
   }
 
   .picker-source {
-    margin: 0.25rem 0 0 0;
-    font-size: 0.8rem;
-    color: var(--text-muted, #666);
+    margin: var(--space-1) 0 0 0;
+    font-size: var(--type-size-xs);
+    color: var(--color-text-secondary);
+    font-family: var(--type-family-mono);
   }
 
   .picker-current {
-    margin: 0.25rem 0 0 0;
-    font-size: 0.9rem;
+    margin: var(--space-1) 0 0 0;
+    font-size: var(--type-size-sm);
   }
 
   .picker-current-label {
-    color: var(--text-muted, #666);
-    margin-right: 0.25rem;
+    color: var(--color-text-muted);
+    margin-right: var(--space-1);
   }
 
   .picker-current-value {
+    color: var(--color-text-strong);
     font-weight: 500;
   }
 
   .picker-body {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: var(--space-2);
   }
 
   .picker-search-label {
-    font-size: 0.85rem;
+    font-size: var(--type-size-sm);
+    color: var(--color-text-primary);
     font-weight: 500;
   }
 
   .picker-error {
-    color: var(--danger, #b00020);
-    font-size: 0.85rem;
-    margin: 0.5rem 0 0 0;
+    color: var(--color-signal-negative);
+    font-size: var(--type-size-sm);
+    font-family: var(--type-family-mono);
+    margin: var(--space-2) 0 0 0;
   }
 
   .picker-footer {
     display: flex;
     justify-content: flex-end;
-    gap: 0.5rem;
-    border-top: 1px solid var(--rule, #e6e6e6);
-    padding-top: 0.75rem;
+    gap: var(--space-2);
+    border-top: 1px solid var(--color-surface-divider);
+    padding-top: var(--space-3);
   }
 
   .picker-clear,
   .picker-cancel {
-    padding: 0.4rem 0.85rem;
+    padding: var(--space-2) var(--space-4);
     border-radius: 4px;
-    border: 1px solid var(--rule, #ccc);
-    background: var(--surface, white);
-    color: var(--text, #222);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
     cursor: pointer;
-    font-size: 0.9rem;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
   }
 
-  .picker-clear:hover:not(:disabled) {
-    background: var(--surface-hover, #fafafa);
-  }
-
+  .picker-clear:hover:not(:disabled),
   .picker-cancel:hover:not(:disabled) {
-    background: var(--surface-hover, #fafafa);
+    color: var(--color-text-strong);
   }
 
   .picker-clear:disabled,

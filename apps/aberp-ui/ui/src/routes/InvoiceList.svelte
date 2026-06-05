@@ -48,7 +48,11 @@
     lifecycleIndex,
     type LabelSignal,
   } from "../lib/labels";
-  import { formatInvoiceTotal, filenameForInvoice } from "../lib/format";
+  import {
+    formatInvoiceTotal,
+    formatInvoiceDate,
+    filenameForInvoice,
+  } from "../lib/format";
   import type { BankAccountSnapshot, Currency, RowKind } from "../lib/api";
   import {
     EMPTY_FILTER,
@@ -715,6 +719,10 @@
       "Partner",
       "Series #",
       "Fiscal year",
+      // S242 / PR-236 — same column position as the table render
+      // (between Fiscal year and State) so the spreadsheet column
+      // order mirrors what the operator sees on screen.
+      "Issued",
       "State",
       "Total gross",
       "Currency",
@@ -746,6 +754,11 @@
         partner,
         row.sequence_number,
         row.fiscal_year,
+        // S242 / PR-236 — raw canonical ISO `YYYY-MM-DD` is the
+        // spreadsheet-friendly form (sorts + filters as a date in
+        // Excel/Sheets without re-parsing the HU `YYYY. MM. DD.`
+        // display form). Empty cell for Draft rows.
+        row.issue_date ?? "",
         row.state,
         totalMajor,
         row.currency,
@@ -1023,6 +1036,31 @@
             <span class="sort-indicator" aria-hidden="true">{sortIndicator("fiscal_year")}</span>
           </button>
         </th>
+        <!-- S242 / PR-236 — Issued (Kelt) column. Sourced from
+             `InvoiceListItem.issue_date` (canonical `YYYY-MM-DD`);
+             rendered via `formatInvoiceDate` for the HU
+             `YYYY. MM. DD.` display. Draft rows (S236) carry `null`
+             and render as an empty cell — NOT an em-dash placeholder,
+             per the PR brief. Sortable; nulls cluster at the bottom
+             regardless of dir, same posture as partner + total. -->
+        <th
+          scope="col"
+          class="col-num"
+          aria-sort={sort.key === "issue_date"
+            ? sort.dir === "asc"
+              ? "ascending"
+              : "descending"
+            : "none"}
+        >
+          <button
+            type="button"
+            class="sort-header right"
+            onclick={() => onSortClick("issue_date")}
+          >
+            <span>Issued</span>
+            <span class="sort-indicator" aria-hidden="true">{sortIndicator("issue_date")}</span>
+          </button>
+        </th>
         <th
           scope="col"
           class="col-state"
@@ -1070,7 +1108,7 @@
     <tbody>
       {#if loadState === "loaded" && visibleRows.length === 0}
         <tr class="empty">
-          <td colspan="7">
+          <td colspan="8">
             {#if rows.length === 0}
               No invoices on this tenant yet. Issue one with
               <code>aberp issue-invoice</code> and reload.
@@ -1184,6 +1222,12 @@
           </td>
           <td class="col-num mono">{row.sequence_number}</td>
           <td class="col-num mono">{row.fiscal_year}</td>
+          <!-- S242 / PR-236 — Issued column body. Empty cell on `null`
+               (Draft rows from S236 have no issue date by
+               construction); `formatInvoiceDate` reformats the
+               canonical `YYYY-MM-DD` into the HU `YYYY. MM. DD.`
+               display form used on the printed PDF. -->
+          <td class="col-num mono">{row.issue_date === null ? "" : formatInvoiceDate(row.issue_date)}</td>
           <td class="col-state">
             <!-- PR-213 / S215 — ExtNav rows have no NAV lifecycle from
                  our records (`queryInvoiceDigest` doesn't expose ack

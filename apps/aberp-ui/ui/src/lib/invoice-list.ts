@@ -164,10 +164,12 @@ export function quickActionMeta(action: RowQuickAction): QuickActionMeta {
  * sort by. Mirrors the renderable column set on `InvoiceList.svelte`
  * (invoice_id, invoice_number = fiscal_year + sequence_number,
  * partner = buyer_name, series_number = sequence_number, fiscal_year,
- * state, total = total_gross). No date column exists on the list-row
- * wire shape today (date columns are detail-modal-only); when one
- * lands as an addition to `InvoiceListItem`, lift it here as a new
- * key + a switch arm in [`compareInvoices`]. */
+ * state, total = total_gross).
+ *
+ * S242 / PR-236 — `issue_date` lifted onto the list-row wire shape so
+ * the Outgoing tab can render + sort by the "Issued" column. The
+ * column carries the canonical `YYYY-MM-DD` string; lex compare on the
+ * fixed-width ISO form is the same as chronological compare. */
 export type SortKey =
   | "invoice_id"
   | "invoice_number"
@@ -176,7 +178,8 @@ export type SortKey =
   | "fiscal_year"
   | "state"
   | "total"
-  | "row_kind";
+  | "row_kind"
+  | "issue_date";
 
 /** PR-94 / session-114 — sort direction. */
 export type SortDir = "asc" | "desc";
@@ -198,6 +201,11 @@ export interface InvoiceSortRow {
    * before ExtNav in ascending order — the operator's primary
    * concern is canonical rows; mirror rows are read-only context). */
   row_kind: RowKind;
+  /** S242 / PR-236 — canonical `YYYY-MM-DD` issue date for the
+   * Outgoing-tab "Issued" column. `null` for Draft rows (S236);
+   * `nullsLastCompare` clusters those at the bottom regardless of
+   * sort direction, same posture as the partner + total columns. */
+  issue_date: string | null;
 }
 
 /** PR-94 / session-114 — pure comparator. Returns a `(a, b) → number`
@@ -293,6 +301,16 @@ function nullsLastCompare<R extends InvoiceSortRow>(
       if (b.total_gross === null) return -1;
       return null;
     }
+    case "issue_date": {
+      // S242 / PR-236 — Draft rows (S236) have no issue date. Cluster
+      // them at the bottom regardless of dir, same posture as
+      // `partner` / `total`. Drafts are a small minority of rows; the
+      // operator scanning by date wants the dated rows grouped first.
+      if (a.issue_date === null && b.issue_date === null) return 0;
+      if (a.issue_date === null) return 1;
+      if (b.issue_date === null) return -1;
+      return null;
+    }
     default:
       return null;
   }
@@ -351,6 +369,20 @@ function rawCompare<R extends InvoiceSortRow>(
       // the same kind the invoice_id tiebreaker takes over (assigned by
       // the outer `compareInvoices` wrapper).
       return rowKindIndex(a.row_kind) - rowKindIndex(b.row_kind);
+    }
+    case "issue_date": {
+      // S242 / PR-236 — lex compare on the canonical fixed-width
+      // ISO-8601 `YYYY-MM-DD` string. Year-first + zero-padded month
+      // + zero-padded day means lex order == chronological order; no
+      // Date.parse needed (`new Date()` would silently re-interpret
+      // ambiguous inputs per local timezone).
+      // The non-null assertion is safe — `nullsLastCompare` already
+      // returned non-null only when BOTH sides have a date.
+      const ad = a.issue_date as string;
+      const bd = b.issue_date as string;
+      if (ad < bd) return -1;
+      if (ad > bd) return 1;
+      return 0;
     }
   }
 }

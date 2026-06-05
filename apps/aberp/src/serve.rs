@@ -3605,6 +3605,25 @@ struct InvoiceListItem {
     /// composed `YYYY-NNNNNN` identifier via the existing
     /// `fiscal_year` + `sequence_number` pair.
     source_nav_invoice_number: Option<String>,
+    /// S242 / PR-236 — canonical ISO-8601 `YYYY-MM-DD` issue date
+    /// (Hungarian `Kelt` / "Issued"). Sourced per row kind:
+    ///   - `Own` non-draft → `ready_invoice.issue_date` formatted as
+    ///     `YYYY-MM-DD` (mirrors the detail-modal field; both come
+    ///     from the same DB column).
+    ///   - `ExtNav` → `restored_invoice.issue_date` (NOT NULL — the
+    ///     NAV `queryInvoiceDigest` always carries `<invoiceIssueDate>`,
+    ///     and `process_digest_loud_fails_on_missing_issue_date`
+    ///     rejects rows without one).
+    ///   - `Own` draft → `None` (drafts have no issue date by
+    ///     construction; the SPA renders an empty cell, NOT an em-dash
+    ///     placeholder).
+    ///
+    /// The SPA's "Issued" / "Kelt" column on the Outgoing tab reads
+    /// this field strictly; a fallback / `--` shim is intentionally
+    /// avoided per CLAUDE.md rule 12 (fail loud, not silent — a `null`
+    /// on a non-draft Own row would surface as the empty cell and
+    /// indicate a real backend wiring gap).
+    issue_date: Option<String>,
 }
 
 /// PR-73 / ADR-0040 §addendum — wire-shape mirror of the typed
@@ -13732,6 +13751,12 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
     let mut items: Vec<InvoiceListItem> = Vec::new();
     let mut conn = Connection::open(&*state.db_path)
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    // S242 / PR-236 — same `YYYY-MM-DD` format the detail-modal
+    // path emits (`get_invoice_detail` uses an identical descriptor);
+    // both surfaces feed the SPA's `formatInvoiceDate` HU display
+    // form. Declared once outside the loop so the per-row format()
+    // call reuses the descriptor.
+    let date_fmt = ::time::macros::format_description!("[year]-[month]-[day]");
     for (id, trace) in by_invoice {
         let row = match read_invoice_row(&mut conn, &id)? {
             Some(row) => row,
@@ -13741,6 +13766,7 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
             .get(&id)
             .and_then(|p| read_buyer_name_from_side_store(p));
         let payment = trace.payment.clone().map(PaymentRecordSummary::from);
+        let issue_date = row.ready_invoice.issue_date.date().format(date_fmt).ok();
         items.push(InvoiceListItem {
             invoice_id: id,
             sequence_number: row.ready_invoice.sequence_number,
@@ -13760,6 +13786,7 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
                 .map(BankAccountSnapshotResponse::from_typed),
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
+            issue_date,
         });
     }
     // PR-213 / S215 — virtual union with `restored_invoice` (the
@@ -13842,6 +13869,10 @@ fn restored_to_list_item(ext: restore_outgoing::RestoredInvoice) -> Result<Invoi
         bank_account: None,
         row_kind: RowKind::ExtNav,
         source_nav_invoice_number: Some(ext.source_nav_invoice_number),
+        // S242 / PR-236 — restored_invoice.issue_date is the NAV-emitted
+        // `<invoiceIssueDate>` (NOT NULL by schema + `process_digest`
+        // loud-fails when absent), already in `YYYY-MM-DD` form.
+        issue_date: Some(ext.issue_date),
     })
 }
 
@@ -13881,6 +13912,11 @@ fn draft_to_list_item(
         bank_account: None,
         row_kind: RowKind::Own,
         source_nav_invoice_number: None,
+        // S242 / PR-236 — drafts have NO issue date by construction;
+        // the SPA renders an empty cell (NOT an em-dash placeholder
+        // per the PR brief) so the Outgoing column reflects "not yet
+        // issued" without inventing a sentinel.
+        issue_date: None,
     })
 }
 
@@ -16108,6 +16144,7 @@ mod tests {
             bank_account: None,
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
+            issue_date: None,
         };
         let v = serde_json::to_value(&with_chain).expect("InvoiceListItem must always serialise");
         assert_eq!(
@@ -16130,6 +16167,7 @@ mod tests {
             bank_account: None,
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
+            issue_date: None,
         };
         let v =
             serde_json::to_value(&without_chain).expect("InvoiceListItem must always serialise");
@@ -16166,6 +16204,7 @@ mod tests {
             bank_account: None,
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
+            issue_date: None,
         };
         let v = serde_json::to_value(&storno_list).expect("InvoiceListItem must serialise");
         assert_eq!(
@@ -16221,6 +16260,7 @@ mod tests {
             bank_account: None,
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
+            issue_date: None,
         };
         let v = serde_json::to_value(&plain).expect("InvoiceListItem must serialise");
         assert_eq!(
@@ -16604,6 +16644,7 @@ mod tests {
             bank_account: None,
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
+            issue_date: None,
         };
         let v = serde_json::to_value(&huf).expect("InvoiceListItem must always serialise");
         assert_eq!(
@@ -16626,6 +16667,7 @@ mod tests {
             bank_account: None,
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
+            issue_date: None,
         };
         let v = serde_json::to_value(&eur).expect("InvoiceListItem must always serialise");
         assert_eq!(
@@ -16668,6 +16710,7 @@ mod tests {
             bank_account: None,
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
+            issue_date: None,
         };
         let v = serde_json::to_value(&with_name).expect("InvoiceListItem must always serialise");
         assert_eq!(
@@ -16690,6 +16733,7 @@ mod tests {
             bank_account: None,
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
+            issue_date: None,
         };
         let v = serde_json::to_value(&without_name).expect("InvoiceListItem must always serialise");
         assert!(
@@ -17492,6 +17536,7 @@ mod tests {
             bank_account: None,
             row_kind: RowKind::Own,
             source_nav_invoice_number: None,
+            issue_date: None,
         };
         let v = serde_json::to_value(&own).expect("InvoiceListItem must serialise");
         assert_eq!(
@@ -17521,6 +17566,7 @@ mod tests {
             bank_account: None,
             row_kind: RowKind::ExtNav,
             source_nav_invoice_number: Some("BIL-2026-001".to_string()),
+            issue_date: Some("2026-04-15".to_string()),
         };
         let v = serde_json::to_value(&ext).expect("InvoiceListItem must serialise");
         assert_eq!(
@@ -17532,6 +17578,72 @@ mod tests {
             v.get("source_nav_invoice_number").and_then(|x| x.as_str()),
             Some("BIL-2026-001"),
             "ExtNav row's source_nav_invoice_number MUST carry the raw NAV invoice number",
+        );
+    }
+
+    /// S242 / PR-236 — `InvoiceListItem` MUST carry a typed
+    /// `issue_date: Option<String>` field on the JSON wire shape. The
+    /// SPA's Outgoing-tab "Kelt / Issued" column reads this field
+    /// strictly (the TS interface in `apps/aberp-ui/ui/src/lib/api.ts`
+    /// types it as `string | null`); a silent field rename, removal,
+    /// or shape change would collapse the operator-visible date
+    /// column.
+    ///
+    /// CLAUDE.md rule 9: BOTH the `Some` (issued invoice — Own
+    /// non-draft or ExtNav) AND `None` (draft — pre-issuance Own row
+    /// per S236) branches are covered so a regression that hard-codes
+    /// the field to one value cannot pass both assertions vacuously.
+    /// The `None` case asserts JSON `null`, not key-absent — a future
+    /// serde `skip_serializing_if` regression would surface here.
+    #[test]
+    fn invoice_list_item_emits_issue_date() {
+        let with_date = InvoiceListItem {
+            invoice_id: "inv_DATED".to_string(),
+            sequence_number: 1,
+            fiscal_year: 2026,
+            state: InvoiceState::Finalized,
+            total_gross: Some(127_000),
+            has_chain_children: false,
+            is_storno: false,
+            currency: Currency::Huf,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
+            issue_date: Some("2026-04-15".to_string()),
+        };
+        let v = serde_json::to_value(&with_date).expect("InvoiceListItem must serialise");
+        assert_eq!(
+            v.get("issue_date").and_then(|x| x.as_str()),
+            Some("2026-04-15"),
+            "issue_date MUST serialise as the canonical YYYY-MM-DD string when Some",
+        );
+
+        // Draft arm (S236) — drafts have no issue date; `None` MUST
+        // serialise as JSON null (not key-absent) so the SPA's strict
+        // `string | null` read renders an empty cell rather than
+        // crashing on an undefined field.
+        let draft = InvoiceListItem {
+            invoice_id: "drf_NEW".to_string(),
+            sequence_number: 0,
+            fiscal_year: 0,
+            state: InvoiceState::Draft,
+            total_gross: None,
+            has_chain_children: false,
+            is_storno: false,
+            currency: Currency::Huf,
+            buyer_name: None,
+            payment: None,
+            bank_account: None,
+            row_kind: RowKind::Own,
+            source_nav_invoice_number: None,
+            issue_date: None,
+        };
+        let v = serde_json::to_value(&draft).expect("InvoiceListItem must serialise");
+        assert!(
+            v.get("issue_date").map(|x| x.is_null()).unwrap_or(false),
+            "issue_date MUST serialise as JSON null when None (not absent) — the SPA reads `string | null` strictly",
         );
     }
 

@@ -237,6 +237,7 @@ function frow(
     bank_account: null,
     row_kind: overrides.row_kind ?? "Own",
     source_nav_invoice_number: overrides.source_nav_invoice_number ?? null,
+    issue_date: overrides.issue_date ?? null,
     ...overrides,
   };
 }

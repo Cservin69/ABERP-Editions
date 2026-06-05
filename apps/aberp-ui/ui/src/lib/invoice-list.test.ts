@@ -325,6 +325,7 @@ function row(
     buyer_name: null,
     currency: "HUF",
     row_kind: "Own",
+    issue_date: null,
     ...partial,
   };
 }
@@ -549,6 +550,45 @@ describe("compareInvoices — ties + stability", () => {
   });
 });
 
+describe("compareInvoices — issue_date column (S242 / PR-236)", () => {
+  it("sorts ascending by ISO date lex order (== chronological)", () => {
+    const rows = [
+      row({ invoice_id: "C", issue_date: "2026-05-01" }),
+      row({ invoice_id: "A", issue_date: "2026-04-15" }),
+      row({ invoice_id: "B", issue_date: "2026-04-30" }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "issue_date", "asc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["A", "B", "C"]);
+  });
+  it("descending reverses chronological order", () => {
+    const rows = [
+      row({ invoice_id: "C", issue_date: "2026-05-01" }),
+      row({ invoice_id: "A", issue_date: "2026-04-15" }),
+      row({ invoice_id: "B", issue_date: "2026-04-30" }),
+    ];
+    rows.sort((a, b) => compareInvoices(a, b, "issue_date", "desc"));
+    expect(rows.map((r) => r.invoice_id)).toEqual(["C", "B", "A"]);
+  });
+  it("clusters null (Draft) rows AFTER dated rows in both directions", () => {
+    // S236 — Draft rows have no issue date. Same posture as the
+    // partner + total columns: meaningful values group at the top,
+    // sentinel cluster sinks regardless of dir.
+    const rowsAsc = [
+      row({ invoice_id: "Z", issue_date: null }),
+      row({ invoice_id: "A", issue_date: "2026-04-15" }),
+    ];
+    rowsAsc.sort((a, b) => compareInvoices(a, b, "issue_date", "asc"));
+    expect(rowsAsc.map((r) => r.invoice_id)).toEqual(["A", "Z"]);
+    const rowsDesc = [
+      row({ invoice_id: "Z", issue_date: null }),
+      row({ invoice_id: "A", issue_date: "2026-04-15" }),
+      row({ invoice_id: "B", issue_date: "2026-05-01" }),
+    ];
+    rowsDesc.sort((a, b) => compareInvoices(a, b, "issue_date", "desc"));
+    expect(rowsDesc.map((r) => r.invoice_id)).toEqual(["B", "A", "Z"]);
+  });
+});
+
 describe("compareInvoices — coverage", () => {
   it("covers every SortKey vocab member", () => {
     // Exhaustiveness counter-pin: a future SortKey member must add a
@@ -563,6 +603,7 @@ describe("compareInvoices — coverage", () => {
       "fiscal_year",
       "state",
       "total",
+      "issue_date",
     ];
     const sample = [
       row({ invoice_id: "A" }),

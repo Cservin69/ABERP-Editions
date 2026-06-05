@@ -286,4 +286,21 @@ describe("invoice-list-persistence — closed-vocab discipline", () => {
     const loaded = loadInvoiceListPrefs(storage);
     expect(loaded.sort).toEqual({ key: "row_kind", dir: "desc" });
   });
+  // S242 / PR-236 — the new `issue_date` sort key MUST round-trip
+  // through `LEGAL_SORT_KEYS`. Catches a regression where the column
+  // is added to `SortKey` but missed in the persistence allow-list
+  // (silently demoting the operator's view to the lifecycle default
+  // on the next reload).
+  it("round-trips sort.key = issue_date", () => {
+    const storage = makeStorage();
+    saveInvoiceListPrefs(
+      {
+        sort: { key: "issue_date", dir: "desc" },
+        filter: { needle: "", state: "All", currency: "All", row_kind: "All" },
+      },
+      storage,
+    );
+    const loaded = loadInvoiceListPrefs(storage);
+    expect(loaded.sort).toEqual({ key: "issue_date", dir: "desc" });
+  });
 });
