@@ -41,6 +41,15 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), QuoteIntakeError> {
     // EVE addendum 2's stale-stock-banner spec).
     conn.execute_batch(S271_MIGRATION_SQL).map_err(|e| {
         QuoteIntakeError::Storage(format!("apply S271 quote_intake_log migration: {e}"))
+    })?;
+    // S272 / PR-261 — additive DEAL-saga columns. The DEAL saga writes
+    // all four in a single tx (deal_issued_at + deal_sales_order_id +
+    // deal_work_order_id + refresh_acked_at). All four are nullable; the
+    // single-use invariant lives in the app layer (CAS on
+    // `deal_issued_at IS NULL`), per [[no-sql-specific]]. No SQL DEFAULT
+    // for the same DuckDB-clobber reason pinned in S271.
+    conn.execute_batch(S272_MIGRATION_SQL).map_err(|e| {
+        QuoteIntakeError::Storage(format!("apply S272 quote_intake_log migration: {e}"))
     })
 }
 
@@ -131,6 +140,44 @@ ALTER TABLE quote_intake_log
     ADD COLUMN IF NOT EXISTS stock_status_at_accept VARCHAR;
 ALTER TABLE quote_intake_log
     ADD COLUMN IF NOT EXISTS stock_alert BOOLEAN;
+";
+
+/// S272 / PR-261 — DEAL-saga additive columns. Per ADR-0067 the saga is
+/// a single DB transaction that writes all four in one go and emits
+/// three audit entries (`QuoteDealIssued`, `QuoteSalesOrderCreated`,
+/// `QuoteWorkOrderCreated`).
+///
+/// - `deal_issued_at TIMESTAMP` — set to `now_utc()` when the saga
+///   commits. The single-use invariant rides this column: a `WHERE
+///   deal_issued_at IS NULL` CAS ensures replay returns 409
+///   `deal_already_issued` per EVE addendum 3.
+/// - `deal_sales_order_id VARCHAR` — `so_<ULID>` placeholder. The full
+///   SO module is not built yet (named-deferred — see brief pushback
+///   #1); this PR mints the id + emits the audit so the future SO
+///   module's backfill can adopt these rows.
+/// - `deal_work_order_id VARCHAR` — `wo_<ULID>` placeholder. The
+///   PR-228 `aberp-work-orders` crate requires `product_id` + at least
+///   one routing op, neither of which lives on the quote intake row
+///   yet. This PR mints a placeholder + emits the audit; the real WO
+///   wire-up follows when the auto-quoting engine plumbs through
+///   product+routing.
+/// - `refresh_acked_at TIMESTAMP` — set to `now_utc()` ONLY when the
+///   saga path consumed an operator REFRESH token (EVE addendum 2 UI
+///   half). Stays NULL on a no-stock-alert saga so the audit-walk can
+///   prove whether the operator acknowledged the stock change.
+///
+/// NO SQL DEFAULTs — DuckDB's `ALTER ... ADD COLUMN IF NOT EXISTS ...
+/// DEFAULT V` re-applies the default on every replay, which would
+/// clobber the single-use marker. Same trap as S271's `stock_alert`.
+const S272_MIGRATION_SQL: &str = "
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS deal_issued_at TIMESTAMP;
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS deal_sales_order_id VARCHAR;
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS deal_work_order_id VARCHAR;
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS refresh_acked_at TIMESTAMP;
 ";
 
 pub fn already_intook(
@@ -585,6 +632,106 @@ pub fn claim_for_pickup_in_tx(
     Ok(n)
 }
 
+/// S272 / PR-261 — what the DEAL saga reads off the row before deciding
+/// whether to mint SO/WO ids. Carries every column the saga's
+/// precondition checks consult AND the row's intake state (so the saga
+/// can refuse to deal an `error`-state or `irrelevant`-state row). Per
+/// `[[no-sql-specific]]` the closed-vocab `intake_state` is enforced in
+/// the app layer; the row's stored `intake_state` may be NULL on a
+/// pre-S256 install, so the helper coerces NULL → `STATE_STAGED`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DealSourceRow {
+    pub intake_state: String,
+    pub stock_alert: bool,
+    pub deal_issued_at: Option<String>,
+}
+
+pub fn read_for_deal(
+    conn: &Connection,
+    tenant_id: &str,
+    quote_id: &str,
+) -> Result<Option<DealSourceRow>, QuoteIntakeError> {
+    ensure_schema(conn)?;
+    // DuckDB's TIMESTAMP rust binding can't auto-decode into
+    // `Option<String>`; CAST to VARCHAR so the row reader is uniform
+    // with the other VARCHAR columns. The ISO/RFC3339 round-trip we
+    // need (UI + audit walks) survives the cast.
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(intake_state, ?3), stock_alert,
+                    CAST(deal_issued_at AS VARCHAR)
+               FROM quote_intake_log
+              WHERE quote_id = ?1 AND tenant_id = ?2
+              LIMIT 1",
+        )
+        .map_err(|e| QuoteIntakeError::Storage(format!("prepare read_for_deal: {e}")))?;
+    let mut rows = stmt
+        .query(params![quote_id, tenant_id, STATE_STAGED])
+        .map_err(|e| QuoteIntakeError::Storage(format!("query read_for_deal: {e}")))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|e| QuoteIntakeError::Storage(format!("read read_for_deal row: {e}")))?
+    else {
+        return Ok(None);
+    };
+    let intake_state: String = row
+        .get(0)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get intake_state: {e}")))?;
+    let stock_alert_raw: Option<bool> = row
+        .get(1)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get stock_alert: {e}")))?;
+    let deal_issued_at: Option<String> = row
+        .get(2)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get deal_issued_at: {e}")))?;
+    Ok(Some(DealSourceRow {
+        intake_state,
+        stock_alert: stock_alert_raw.unwrap_or(false),
+        deal_issued_at,
+    }))
+}
+
+/// S272 / PR-261 — write the four DEAL columns inside the saga's tx.
+/// The CAS guard is `WHERE deal_issued_at IS NULL` so a replay (the
+/// EVE-addendum-3 single-use invariant) updates zero rows and the
+/// caller can map that to a 409 `deal_already_issued`. Returns the
+/// rows-updated count: `1` on a successful DEAL, `0` on a replay
+/// against an already-dealt row (the saga's tx then rolls back its
+/// audit appends and returns the 409).
+///
+/// `refresh_acked_at` is `Some` ONLY when the saga consumed an
+/// operator REFRESH token; on a no-stock-alert saga it stays NULL so
+/// the audit walk can prove acknowledgement.
+pub fn mark_deal_issued_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    tenant_id: &str,
+    quote_id: &str,
+    sales_order_id: &str,
+    work_order_id: &str,
+    issued_at: &str,
+    refresh_acked_at: Option<&str>,
+) -> Result<usize, QuoteIntakeError> {
+    let n = tx
+        .execute(
+            "UPDATE quote_intake_log
+                SET deal_issued_at = ?1,
+                    deal_sales_order_id = ?2,
+                    deal_work_order_id = ?3,
+                    refresh_acked_at = ?4
+              WHERE quote_id = ?5 AND tenant_id = ?6
+                AND deal_issued_at IS NULL",
+            params![
+                issued_at,
+                sales_order_id,
+                work_order_id,
+                refresh_acked_at,
+                quote_id,
+                tenant_id,
+            ],
+        )
+        .map_err(|e| QuoteIntakeError::Storage(format!("CAS mark_deal_issued: {e}")))?;
+    Ok(n)
+}
+
 pub fn list_pending_writebacks(
     conn: &Connection,
     tenant_id: &str,
@@ -896,6 +1043,130 @@ mod tests {
             )
             .unwrap();
         assert!(alert, "stock_alert remains TRUE after the no-op flips");
+    }
+
+    // ── S272 / PR-261 — DEAL-saga columns + read/CAS helpers ─────────
+
+    /// The four S272 columns survive `ensure_schema` round-trips and
+    /// start NULL on a fresh INSERT (no SQL DEFAULT — same DuckDB
+    /// clobber trap as S271's `stock_alert`).
+    #[test]
+    fn s272_deal_columns_present_after_ensure_schema() {
+        let conn = open_mem();
+        ensure_schema(&conn).unwrap();
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), "{}", "{}").unwrap();
+        let (issued, so, wo, ack): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT CAST(deal_issued_at AS VARCHAR),
+                        deal_sales_order_id,
+                        deal_work_order_id,
+                        CAST(refresh_acked_at AS VARCHAR)
+                   FROM quote_intake_log
+                  WHERE quote_id = 'q1' AND tenant_id = 't'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(issued, None, "deal_issued_at NULL on fresh INSERT");
+        assert_eq!(so, None);
+        assert_eq!(wo, None);
+        assert_eq!(ack, None);
+        // Re-ensure must stay idempotent (no double-add panic, no
+        // DEFAULT clobber of any prior write).
+        ensure_schema(&conn).unwrap();
+        ensure_schema(&conn).unwrap();
+    }
+
+    /// `read_for_deal` surfaces the three precondition columns the
+    /// saga consults: intake_state (coerced NULL → staged), stock_alert
+    /// (coerced NULL → false), and deal_issued_at.
+    #[test]
+    fn s272_read_for_deal_surfaces_preconditions() {
+        let conn = open_mem();
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), "{}", "{}").unwrap();
+        let row = read_for_deal(&conn, "t", "q1").unwrap().unwrap();
+        assert_eq!(row.intake_state, STATE_STAGED);
+        assert!(!row.stock_alert);
+        assert_eq!(row.deal_issued_at, None);
+
+        // Flip stock_alert TRUE; the helper must surface it.
+        assert!(flip_stock_alert_to_true(&conn, "t", "q1").unwrap());
+        let row = read_for_deal(&conn, "t", "q1").unwrap().unwrap();
+        assert!(row.stock_alert);
+
+        // Tenant + quote_id mismatch → None.
+        assert!(read_for_deal(&conn, "t", "q-other").unwrap().is_none());
+        assert!(read_for_deal(&conn, "t-wrong", "q1").unwrap().is_none());
+
+        // `irrelevant` intake_state round-trips through the COALESCE.
+        mark_irrelevant(&conn, "t", "q1").unwrap();
+        let row = read_for_deal(&conn, "t", "q1").unwrap().unwrap();
+        assert_eq!(row.intake_state, STATE_IRRELEVANT);
+    }
+
+    /// CAS pin — `mark_deal_issued_in_tx` returns 1 on first call (the
+    /// row's `deal_issued_at IS NULL`) and 0 on every replay (sticky).
+    /// This is the EVE-addendum-3 single-use guard: a second saga call
+    /// against the same row gets 0 rows-updated, the saga rolls back,
+    /// and the route maps that to 409 `deal_already_issued`.
+    #[test]
+    fn s272_mark_deal_issued_is_single_use_via_cas() {
+        let mut conn = open_mem();
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), "{}", "{}").unwrap();
+        let tx = conn.transaction().unwrap();
+        let won = mark_deal_issued_in_tx(
+            &tx,
+            "t",
+            "q1",
+            "so_ABC",
+            "wo_XYZ",
+            "2026-06-06T12:00:00Z",
+            Some("2026-06-06T11:59:00Z"),
+        )
+        .unwrap();
+        assert_eq!(won, 1, "first DEAL call wins the CAS");
+        tx.commit().unwrap();
+
+        // Replay: deal_issued_at is no longer NULL, CAS rejects.
+        let tx = conn.transaction().unwrap();
+        let lost = mark_deal_issued_in_tx(
+            &tx,
+            "t",
+            "q1",
+            "so_REPLAY",
+            "wo_REPLAY",
+            "2026-06-06T12:30:00Z",
+            None,
+        )
+        .unwrap();
+        assert_eq!(lost, 0, "replay against a dealt row loses the CAS");
+        tx.commit().unwrap();
+
+        // The original SO + WO ids remain intact (the replay CAS guarded
+        // against a clobber).
+        let (so, wo): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT deal_sales_order_id, deal_work_order_id
+                   FROM quote_intake_log
+                  WHERE quote_id = 'q1' AND tenant_id = 't'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(so.as_deref(), Some("so_ABC"));
+        assert_eq!(wo.as_deref(), Some("wo_XYZ"));
+
+        // `read_for_deal` now reports the dealt-at timestamp.
+        let row = read_for_deal(&conn, "t", "q1").unwrap().unwrap();
+        assert!(
+            row.deal_issued_at.is_some(),
+            "deal_issued_at carries through read_for_deal after CAS"
+        );
     }
 
     #[test]

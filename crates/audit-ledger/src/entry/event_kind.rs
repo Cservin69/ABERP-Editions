@@ -1313,6 +1313,64 @@ pub enum EventKind {
     /// Payload: `serde_json::Value` (aberp binary `serve`).
     /// F12 four-edit ritual fires once.
     QuoteStockAlertTriggered,
+
+    /// S272 / PR-261 — DEAL saga top-level event, written ONCE per
+    /// committed DEAL on a `quote_intake_log` row. Anchors the saga
+    /// chain (`QuoteSalesOrderCreated` + `QuoteWorkOrderCreated` ride
+    /// the same DB transaction so the audit trail is atomic). The
+    /// row's `deal_issued_at` column flipped `NULL → Some(ts)` in this
+    /// tx — see `apps/aberp/src/quote_deal.rs` and the CAS guard in
+    /// `aberp_quote_intake::log_table::mark_deal_issued_in_tx`.
+    ///
+    /// Carries `quote_id`, `tenant_id`, `sales_order_id`,
+    /// `work_order_id`, `deal_token` (the first 8 chars of `quote_id`
+    /// the operator typed — kept verbatim for forensic walks),
+    /// `refresh_acknowledged` (a bool surfacing whether the operator
+    /// consumed an EVE-addendum-2 REFRESH token), `actor`, and
+    /// `idempotency_key`. The saga refuses to deal an already-dealt
+    /// row (CAS returns 0 rows-updated → 409 `deal_already_issued`),
+    /// so re-running the saga on a sticky-TRUE `deal_issued_at` does
+    /// NOT re-emit this kind.
+    ///
+    /// `quote.*` prefix family alongside catalogue, tunables, and
+    /// `QuoteStockAlertTriggered`; not invoice-scoped, never NAV
+    /// bytes, never swept by the per-OUTGOING-invoice bundle.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    QuoteDealIssued,
+
+    /// S272 / PR-261 — Sales Order placeholder minted by the DEAL
+    /// saga in the same tx as [`EventKind::QuoteDealIssued`]. Per
+    /// brief pushback #1 the full SO module is named-deferred (no SO
+    /// table, no SO CRUD surface); the saga emits this kind so the
+    /// audit trail records the `so_<ULID>` against the quote, and a
+    /// future SO module's backfill can adopt these audit entries as
+    /// its retroactive source of truth.
+    ///
+    /// Carries `quote_id`, `sales_order_id` (the `so_<ULID>` minted
+    /// in-tx), `tenant_id`, and `actor`.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    QuoteSalesOrderCreated,
+
+    /// S272 / PR-261 — Work Order placeholder minted by the DEAL saga
+    /// in the same tx as [`EventKind::QuoteDealIssued`]. The
+    /// `aberp-work-orders` crate (PR-228) requires `product_id` plus
+    /// at least one routing op; the quote intake row carries neither
+    /// at this stage of the auto-quoting pipeline, so the saga mints
+    /// a `wo_<ULID>` placeholder + emits this kind without inserting
+    /// a `work_orders` row. A future cut that plumbs CAD-extracted
+    /// product+routing into the quote pipeline can adopt these
+    /// placeholders into real WOs.
+    ///
+    /// Carries `quote_id`, `work_order_id` (the `wo_<ULID>` minted
+    /// in-tx), `tenant_id`, and `actor`.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    QuoteWorkOrderCreated,
 }
 
 impl EventKind {
@@ -1387,6 +1445,9 @@ impl EventKind {
             EventKind::ParametersChanged => "quote.parameters_changed",
             EventKind::StockAdjustmentsChanged => "quote.stock_adjustments_changed",
             EventKind::QuoteStockAlertTriggered => "quote.stock_alert_triggered",
+            EventKind::QuoteDealIssued => "quote.deal_issued",
+            EventKind::QuoteSalesOrderCreated => "quote.sales_order_created",
+            EventKind::QuoteWorkOrderCreated => "quote.work_order_created",
         }
     }
 
@@ -1472,6 +1533,9 @@ impl EventKind {
             "quote.parameters_changed" => Ok(EventKind::ParametersChanged),
             "quote.stock_adjustments_changed" => Ok(EventKind::StockAdjustmentsChanged),
             "quote.stock_alert_triggered" => Ok(EventKind::QuoteStockAlertTriggered),
+            "quote.deal_issued" => Ok(EventKind::QuoteDealIssued),
+            "quote.sales_order_created" => Ok(EventKind::QuoteSalesOrderCreated),
+            "quote.work_order_created" => Ok(EventKind::QuoteWorkOrderCreated),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1549,6 +1613,9 @@ mod tests {
             EventKind::ParametersChanged,
             EventKind::StockAdjustmentsChanged,
             EventKind::QuoteStockAlertTriggered,
+            EventKind::QuoteDealIssued,
+            EventKind::QuoteSalesOrderCreated,
+            EventKind::QuoteWorkOrderCreated,
         ];
         for v in variants {
             let s = v.as_str();

@@ -387,6 +387,11 @@ pub fn run() {
             commands::quote_intake_notifications,
             commands::quote_intake_retry_parse,
             commands::quote_intake_mark_irrelevant,
+            // S272 / PR-261 — DEAL saga (ADR-0067). Single-tx mint of
+            // SO/WO placeholder ids + 3 audit entries; replay-protected
+            // CAS; EVE addendum 2 (REFRESH ack) + addendum 3 (BIG/RED
+            // single-use DEAL token) gates enforced server-side.
+            commands::quote_intake_deal,
             // S225 / PR-221 — financial-statistics dashboard endpoint.
             commands::get_financial_report,
             // S235 / PR-231 — Workshop / Műhely operator dashboard.

@@ -785,7 +785,14 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // (`quote.*`). Operator-display recompute outcome carried as a
         // JSON snapshot; no NAV bytes; never sweeps a per-OUTGOING-
         // invoice bundle (the `invoice.*` glob excludes `quote.*`).
-        | EventKind::QuoteStockAlertTriggered => None,
+        | EventKind::QuoteStockAlertTriggered
+        // S272 / PR-261 — DEAL-saga kinds (`quote.*`). Three-entry
+        // saga ride a single tx: top-level `QuoteDealIssued` + the
+        // SO/WO placeholder kinds. Quote-scoped operator action; no
+        // NAV bytes; never swept by the per-OUTGOING-invoice bundle.
+        | EventKind::QuoteDealIssued
+        | EventKind::QuoteSalesOrderCreated
+        | EventKind::QuoteWorkOrderCreated => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

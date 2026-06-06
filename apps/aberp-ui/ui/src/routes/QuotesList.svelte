@@ -20,6 +20,8 @@
 
   import { onMount } from "svelte";
   import {
+    DealSagaError,
+    dealQuote,
     listQuoteIntake,
     markQuoteIntakeIrrelevant,
     pickupQuoteAsDraft,
@@ -27,6 +29,7 @@
     type QuoteIntakeRow,
   } from "../lib/api";
   import { formatInvoiceDate } from "../lib/format";
+  import QuoteDealGate from "./QuoteDealGate.svelte";
 
   type LoadState = "idle" | "loading" | "ready" | "error";
 
@@ -41,6 +44,11 @@
   // S256 / PR-245 — per-row recovery state for error (dead-letter) rows.
   let recoverBusyQuoteId = $state<string | null>(null);
   let recoverError = $state<string | null>(null);
+  // S272 / PR-261 — per-row DEAL saga state. The error map is per-row
+  // so a 409 on row A does NOT clear row B's prior error toast (each
+  // QuoteDealGate component owns its own toast surface).
+  let dealBusyQuoteId = $state<string | null>(null);
+  let dealErrors = $state<Record<string, { code: string; message: string } | null>>({});
 
   onMount(() => {
     void refresh();
@@ -125,6 +133,38 @@
       recoverError = e instanceof Error ? e.message : String(e);
     } finally {
       recoverBusyQuoteId = null;
+    }
+  }
+
+  // S272 / PR-261 — DEAL saga submit. Per-row handler invoked by the
+  // QuoteDealGate child once both the REFRESH (if `stock_alert=true`)
+  // and DEAL-token gates are satisfied. On 200 the SPA mutates the row
+  // in place so the DEAL UI disappears and the post-deal SO/WO chips
+  // surface; on 409 the per-row error toast renders.
+  async function submitDeal(
+    row: QuoteIntakeRow,
+    payload: { deal_token: string; refresh_ack: string | null },
+  ): Promise<void> {
+    dealBusyQuoteId = row.quote_id;
+    dealErrors = { ...dealErrors, [row.quote_id]: null };
+    try {
+      const outcome = await dealQuote(row.quote_id, payload);
+      const idx = rows.findIndex((r) => r.quote_id === row.quote_id);
+      if (idx >= 0) {
+        rows[idx] = {
+          ...rows[idx],
+          deal_issued_at: outcome.deal_issued_at,
+          deal_sales_order_id: outcome.sales_order_id,
+          deal_work_order_id: outcome.work_order_id,
+        };
+      }
+    } catch (e) {
+      const err = e instanceof DealSagaError
+        ? { code: e.code, message: e.message }
+        : { code: "unknown", message: e instanceof Error ? e.message : String(e) };
+      dealErrors = { ...dealErrors, [row.quote_id]: err };
+    } finally {
+      dealBusyQuoteId = null;
     }
   }
 
@@ -417,6 +457,30 @@
                   data-testid="quotes-row-dismissed"
                   title="Marked irrelevant by an operator"
                 >Elvetve / Dismissed</span>
+              {:else if row.deal_issued_at}
+                <!-- S272 / PR-261 — post-DEAL state: SO + WO placeholder
+                     chips. The SO module backfill will adopt the
+                     `so_<ULID>` once it exists; until then this is a
+                     static label, not a deep-link. -->
+                <div
+                  class="quotes-row__deal-done"
+                  data-testid="quotes-row-deal-done"
+                  title={`DEAL issued ${row.deal_issued_at}`}
+                >
+                  <span class="quotes-chip quotes-chip--done">✓ DEAL</span>
+                  {#if row.deal_sales_order_id}
+                    <code
+                      class="quotes-row__deal-id"
+                      data-testid="quotes-row-deal-so-id"
+                    >SO {row.deal_sales_order_id.slice(-6)}</code>
+                  {/if}
+                  {#if row.deal_work_order_id}
+                    <code
+                      class="quotes-row__deal-id"
+                      data-testid="quotes-row-deal-wo-id"
+                    >WO {row.deal_work_order_id.slice(-6)}</code>
+                  {/if}
+                </div>
               {:else if row.picked_up_drf_id}
                 <button
                   type="button"
@@ -428,6 +492,17 @@
                 >
                   → Draft {shortDraftId(row.picked_up_drf_id)}
                 </button>
+                <!-- S272 — DEAL is a separate operator action from
+                     pickup; surface it even when a draft was already
+                     created (the saga commits SO/WO placeholders that
+                     the future SO module will adopt). -->
+                <QuoteDealGate
+                  quoteId={row.quote_id}
+                  stockAlert={row.stock_alert}
+                  submitting={dealBusyQuoteId === row.quote_id}
+                  error={dealErrors[row.quote_id] ?? null}
+                  onSubmit={(payload) => void submitDeal(row, payload)}
+                />
               {:else}
                 <button
                   type="button"
@@ -441,6 +516,18 @@
                     ? "Létrehozás…"
                     : "Számla létrehozása / Create draft invoice"}
                 </button>
+                <!-- S272 / PR-261 — DEAL gate (EVE addenda 2 UI + 3).
+                     REFRESH precondition + BIG/RED single-use token.
+                     Shown alongside pickup so the operator can DEAL
+                     without minting a draft first (the saga is its
+                     own ADR-0067 unit). -->
+                <QuoteDealGate
+                  quoteId={row.quote_id}
+                  stockAlert={row.stock_alert}
+                  submitting={dealBusyQuoteId === row.quote_id}
+                  error={dealErrors[row.quote_id] ?? null}
+                  onSubmit={(payload) => void submitDeal(row, payload)}
+                />
               {/if}
             </td>
           </tr>
@@ -808,5 +895,26 @@
     font-family: var(--type-family-mono);
     font-size: var(--type-size-xs);
     color: var(--color-text-strong);
+  }
+
+  /* S272 / PR-261 — post-DEAL row affordance. SO + WO placeholder chips
+   * displayed in the Action column once the saga has committed. The
+   * `--color-signal-positive` chip + the mono SO/WO id labels match
+   * the post-pickup `quotes-row__draft-link` shape, so the row visually
+   * shifts from "pending action" → "complete + traceable". */
+  .quotes-row__deal-done {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    align-items: center;
+  }
+
+  .quotes-row__deal-id {
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
+    background: var(--color-surface-raised);
+    padding: 1px 6px;
+    border-radius: 2px;
   }
 </style>

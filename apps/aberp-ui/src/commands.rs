@@ -1286,6 +1286,25 @@ pub async fn quote_intake_mark_irrelevant(
     forward_post(&state, &path, Value::Null).await
 }
 
+/// S272 / PR-261 — DEAL saga (ADR-0067). `POST /api/quote-intake/{quote_id}/deal`
+/// with body `{ deal_token, refresh_ack? }`. Backend mints SO/WO
+/// placeholder ids + emits three audit entries in a single tx; 409s
+/// carry a machine code (`stock_alert_refresh_required` /
+/// `deal_token_mismatch` / `deal_already_issued` / `not_actionable`)
+/// the SPA toast routes on. The SPA gates the click on the typed
+/// REFRESH token + the BIG/RED single-use DEAL token; this command is
+/// the server-side gate (defense-in-depth per
+/// [[trust-code-not-operator]]).
+#[tauri::command]
+pub async fn quote_intake_deal(
+    state: State<'_, AppState>,
+    quote_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-intake/{quote_id}/deal");
+    forward_post(&state, &path, body).await
+}
+
 /// S180 / PR-180 — operator-clicked NAV-as-DR restore wizard.
 /// `POST /api/restore-from-nav-outgoing { year }`. Synchronous (walks
 /// 12 months × pagination against NAV); the SPA gates the click on

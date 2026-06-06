@@ -909,7 +909,14 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // XML bytes. Same posture as the S266/S267 kinds above —
         // operator-display recompute outcome, never sweeps a per-
         // OUTGOING-invoice bundle.
-        | EventKind::QuoteStockAlertTriggered => (None, ""),
+        | EventKind::QuoteStockAlertTriggered
+        // S272 / PR-261 — DEAL-saga kinds (`quote.*`). The three ride
+        // a single tx — top-level `QuoteDealIssued` + the SO/WO
+        // placeholder kinds. Quote-scoped operator action; no NAV
+        // bytes; never swept by the per-OUTGOING-invoice bundle.
+        | EventKind::QuoteDealIssued
+        | EventKind::QuoteSalesOrderCreated
+        | EventKind::QuoteWorkOrderCreated => (None, ""),
     };
 
     Ok(NavExtraction {

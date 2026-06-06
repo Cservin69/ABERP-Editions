@@ -2622,6 +2622,13 @@ fn build_router(state: AppState) -> Router {
             "/api/quotes/:quote_id/pickup-as-draft",
             post(handle_pickup_quote_as_draft),
         )
+        // S272 / PR-261 — DEAL saga (ADR-0067). POST mints SO/WO
+        // placeholder ids + 3 audit entries in a single DB tx.
+        // EVE addendum 2 enforces typed REFRESH ack when `stock_alert`
+        // is TRUE; addendum 3 enforces the BIG/RED single-use DEAL
+        // token (first 8 chars of quote_id). Replay → 409
+        // `deal_already_issued`.
+        .route("/api/quote-intake/:quote_id/deal", post(handle_deal_saga))
         .with_state(state)
 }
 
@@ -16131,6 +16138,148 @@ async fn handle_quote_intake_mark_irrelevant(
         Ok(Err(e)) => internal_error("quote-intake mark-irrelevant", e),
         Err(e) => internal_error("quote-intake mark-irrelevant join", anyhow!("{e}")),
     }
+}
+
+// ── S272 / PR-261 — DEAL saga route ──────────────────────────────────
+
+/// Inbound JSON body for `POST /api/quote-intake/:quote_id/deal`. The
+/// SPA submits `deal_token` (the BIG/RED single-use input) and
+/// `refresh_ack` (the typed REFRESH token, present only when the row's
+/// `stock_alert` is TRUE). The server-side gate is defense-in-depth —
+/// the SPA already disables the DEAL button until both fields are
+/// satisfied, but this route validates again per
+/// [[trust-code-not-operator]].
+#[derive(Debug, serde::Deserialize)]
+struct DealSagaRequest {
+    deal_token: String,
+    refresh_ack: Option<String>,
+}
+
+/// 409 response body shape — `code` is the machine code the SPA toast
+/// routes on, `message` the operator-readable fallback copy. Mirrors
+/// the storno-route shape (`{code, message}`) so the SPA's error
+/// handler treats both uniformly.
+#[derive(Debug, serde::Serialize)]
+struct DealSagaErrorBody {
+    code: &'static str,
+    message: String,
+}
+
+/// `POST /api/quote-intake/:quote_id/deal` — operator clicked DEAL on
+/// a quote intake row. Delegates to [`crate::quote_deal::run_deal_saga`]
+/// inside a blocking task (DuckDB writes are sync) and translates the
+/// typed [`crate::quote_deal::DealSagaError`] into the right 4xx
+/// machine code.
+async fn handle_deal_saga(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(quote_id): AxumPath<String>,
+    Json(body): Json<DealSagaRequest>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let quote_id_for_task = quote_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        run_deal_saga_request(
+            &state_for_task,
+            &operator_login,
+            &quote_id_for_task,
+            body.deal_token,
+            body.refresh_ack,
+        )
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "run_deal_saga_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(o) => (StatusCode::OK, Json(o)).into_response(),
+        Err(e) => {
+            // Downcast to the typed saga error so we map to the right
+            // 4xx machine code; an opaque `anyhow::Error` falls through
+            // to 500. This is the bouncer that turns ADR-0067's
+            // closed-vocab failure modes into HTTP without leaking
+            // anyhow chains to the SPA.
+            if let Some(saga) = e.downcast_ref::<crate::quote_deal::DealSagaError>() {
+                use crate::quote_deal::DealSagaError;
+                let (status, code, msg) = match saga {
+                    DealSagaError::NotStaged { .. } => (
+                        StatusCode::NOT_FOUND,
+                        saga.machine_code(),
+                        format!("quote {quote_id} not staged"),
+                    ),
+                    DealSagaError::NotActionable { state, .. } => (
+                        StatusCode::CONFLICT,
+                        saga.machine_code(),
+                        format!("quote {quote_id} intake_state is {state:?}; only staged rows can be dealt"),
+                    ),
+                    DealSagaError::DealAlreadyIssued { .. } => (
+                        StatusCode::CONFLICT,
+                        saga.machine_code(),
+                        format!("quote {quote_id} has already been dealt"),
+                    ),
+                    DealSagaError::StockAlertRefreshRequired { .. } => (
+                        StatusCode::CONFLICT,
+                        saga.machine_code(),
+                        "stock_alert active — type REFRESH to acknowledge first".to_string(),
+                    ),
+                    DealSagaError::DealTokenMismatch { .. } => (
+                        StatusCode::CONFLICT,
+                        saga.machine_code(),
+                        "DEAL token does not match — copy from the reference column".to_string(),
+                    ),
+                };
+                return (status, Json(DealSagaErrorBody { code, message: msg })).into_response();
+            }
+            internal_error("run_deal_saga_request", e)
+        }
+    }
+}
+
+/// Sync wrapper invoked inside the blocking task: opens the DuckDB
+/// connection, builds the ledger meta + actor, and runs the saga.
+/// Surfaces the saga's typed `DealSagaError` (boxed inside the
+/// `anyhow::Error`) so the HTTP layer can downcast.
+pub fn run_deal_saga_request(
+    state: &AppState,
+    operator_login: &str,
+    quote_id: &str,
+    deal_token: String,
+    refresh_ack: Option<String>,
+) -> Result<crate::quote_deal::DealSagaOutcome> {
+    let mut conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("binary hash unavailable")?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+
+    crate::quote_deal::run_deal_saga(
+        &mut conn,
+        &ledger_meta,
+        ledger_actor,
+        crate::quote_deal::DealSagaInputs {
+            tenant: state.tenant.as_str().to_string(),
+            quote_id: quote_id.to_string(),
+            actor: operator_login.to_string(),
+            deal_token,
+            refresh_ack,
+        },
+    )
 }
 
 // ── Session-161 — NAV poll daemon orchestration ──────────────────────

@@ -3013,6 +3013,15 @@ export interface QuoteIntakeRow {
    * operator's REFRESH token (S272+) untriggers it. The SPA renders a
    * loud RED badge + a detail-view banner when TRUE. */
   stock_alert: boolean;
+  // ── S272 / PR-261 — DEAL-saga projection ───────────────────────────
+  /** ISO-8601 timestamp set by the DEAL saga's CAS. `null` until the
+   * operator commits a DEAL; non-null hides the DEAL UI per row. */
+  deal_issued_at: string | null;
+  /** `so_<ULID>` placeholder minted by the DEAL saga. Surfaces the
+   * post-deal "→ Sales Order" link affordance. */
+  deal_sales_order_id: string | null;
+  /** `wo_<ULID>` placeholder minted by the DEAL saga. */
+  deal_work_order_id: string | null;
 }
 
 export async function listQuoteIntake(): Promise<QuoteIntakeRow[]> {
@@ -3072,6 +3081,81 @@ export interface PickupQuoteOutcome {
 
 export async function pickupQuoteAsDraft(quoteId: string): Promise<PickupQuoteOutcome> {
   return invoke<PickupQuoteOutcome>("pickup_quote_as_draft", { quoteId });
+}
+
+/** S272 / PR-261 — DEAL saga outcome (ADR-0067).
+ * `so_<ULID>` + `wo_<ULID>` are placeholders the future SO + WO
+ * modules will adopt; for this PR they live only in the audit ledger.
+ * `refresh_acknowledged` is `true` iff the saga consumed an EVE-
+ * addendum-2 REFRESH token (the row had `stock_alert = TRUE`). */
+export interface DealSagaOutcome {
+  sales_order_id: string;
+  work_order_id: string;
+  deal_issued_at: string;
+  refresh_acknowledged: boolean;
+}
+
+/** Closed-vocab machine codes the SPA's 409 toast routes on. The
+ * backend returns `{code, message}` in the 409 body; the SPA parses
+ * the wrapped error string to extract the code. Any other code (or a
+ * parse failure) falls through to a generic operator-readable copy. */
+export type DealSagaErrorCode =
+  | "stock_alert_refresh_required"
+  | "deal_token_mismatch"
+  | "deal_already_issued"
+  | "not_actionable"
+  | "not_staged";
+
+/** Typed wrapper carrying the parsed machine code so the SPA toast
+ * can pick the right copy without substring matches on the raw error
+ * text. */
+export class DealSagaError extends Error {
+  readonly code: DealSagaErrorCode | "unknown";
+  readonly status: number;
+
+  constructor(code: DealSagaErrorCode | "unknown", status: number, message: string) {
+    super(message);
+    this.code = code;
+    this.status = status;
+    this.name = "DealSagaError";
+  }
+}
+
+/** S272 / PR-261 — submit a DEAL. The bilingual gate is operator-
+ * facing; the server-side gate (this call) is defense-in-depth per
+ * [[trust-code-not-operator]]. On 409, the returned promise rejects
+ * with a `DealSagaError` carrying the typed `code` so the caller can
+ * branch on it for the toast copy. */
+export async function dealQuote(
+  quoteId: string,
+  body: { deal_token: string; refresh_ack: string | null },
+): Promise<DealSagaOutcome> {
+  try {
+    return await invoke<DealSagaOutcome>("quote_intake_deal", {
+      quoteId,
+      body,
+    });
+  } catch (e) {
+    // `forward_post` wraps non-2xx as a string of the form
+    // `backend returned 409 ...: {"code":"...","message":"..."}`.
+    // Parse it lossy: any failure falls through to an `unknown`
+    // typed error.
+    const raw = e instanceof Error ? e.message : String(e);
+    const status = raw.match(/backend returned (\d{3})/);
+    const statusCode = status ? Number(status[1]) : 0;
+    const bodyMatch = raw.match(/:\s*(\{.*\})\s*$/);
+    if (bodyMatch) {
+      try {
+        const parsed = JSON.parse(bodyMatch[1]) as { code?: string; message?: string };
+        const code = (parsed.code ?? "unknown") as DealSagaErrorCode | "unknown";
+        throw new DealSagaError(code, statusCode, parsed.message ?? raw);
+      } catch (parseErr) {
+        if (parseErr instanceof DealSagaError) throw parseErr;
+        // Fall through to unknown.
+      }
+    }
+    throw new DealSagaError("unknown", statusCode, raw);
+  }
 }
 
 // ── S225 / PR-221 — Financial statistics dashboard ──────────────────

@@ -72,6 +72,12 @@ pub mod quote_intake_query;
 // quote_intake_log row. Mints an `invoice_draft` row with
 // `source_quote_id` set + emits `InvoicePickedUpFromQuote`.
 pub mod quote_pickup;
+// S272 / PR-261 — DEAL saga (ADR-0067). Operator clicks DEAL on a quote
+// intake row → single-tx mint of SO/WO placeholder ids + 3 audit
+// entries. Replay-protected via a CAS on `deal_issued_at IS NULL`.
+// Enforces EVE addendum 2 (REFRESH-typed ack when `stock_alert`) and
+// addendum 3 (BIG/RED/single-use DEAL token, validated server-side).
+pub mod quote_deal;
 // S271 / PR-260 — pure `stock_alert` recompute (EVE addendum 2). Used by
 // the SPA Quotes list route to mark accepted quotes whose material has
 // downgraded since acceptance. Sticky: only operator REFRESH (S272+)

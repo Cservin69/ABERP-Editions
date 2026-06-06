@@ -85,6 +85,19 @@ pub struct QuoteIntakeRow {
     /// operator's REFRESH token (S272+) untriggers it. NULL coerced
     /// to FALSE.
     pub stock_alert: bool,
+    // ── S272 / PR-261 — DEAL-saga projection ───────────────────────────
+    /// `Some(<iso-ts>)` once the operator submitted a valid DEAL token
+    /// (with REFRESH ack if `stock_alert` was TRUE) and the saga
+    /// committed. The SPA renders a "DEAL issued" chip + the SO/WO ids
+    /// instead of the DEAL gate when set. Single-use: the saga's CAS
+    /// guarantees this column flips NULL → `Some` exactly once.
+    pub deal_issued_at: Option<String>,
+    /// `so_<ULID>` placeholder minted by the DEAL saga. Surfaced to the
+    /// SPA for the post-deal "→ Sales Order" link affordance.
+    pub deal_sales_order_id: Option<String>,
+    /// `wo_<ULID>` placeholder minted by the DEAL saga. Surfaced to the
+    /// SPA for the post-deal "→ Work Order" link affordance.
+    pub deal_work_order_id: Option<String>,
 }
 
 /// S271 / PR-260 — one row whose `stock_alert` transitioned FALSE → TRUE
@@ -143,6 +156,10 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Quot
     // log_table.rs gotcha note for why (DuckDB clobbers DEFAULT-bearing
     // columns on every replay).
     conn.execute_batch(S271_MIGRATION_BACKSTOP)?;
+    // S272 / PR-261 — additive DEAL-saga columns. Same lazy-backstop
+    // posture as S255–S271 — a tenant whose daemon never spawned still
+    // gets the columns the moment the SPA opens the Quotes tab.
+    conn.execute_batch(S272_MIGRATION_BACKSTOP)?;
 
     // Build the (grade → current stock_status) lookup ONCE for the whole
     // tenant. The recompute pass is per-row but the catalogue read is
@@ -156,7 +173,9 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Quot
                 COALESCE(intake_state, 'staged'), intake_error,
                 customer_email, material_grade, quantity,
                 total_price_eur, valid_until, stock_status_at_accept,
-                stock_alert
+                stock_alert,
+                CAST(deal_issued_at AS VARCHAR),
+                deal_sales_order_id, deal_work_order_id
            FROM quote_intake_log
           WHERE tenant_id = ?1
           ORDER BY intake_at DESC
@@ -185,6 +204,9 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Quot
         let valid_until: Option<String> = row.get(14).ok().flatten();
         let stock_status_at_accept: Option<String> = row.get(15).ok().flatten();
         let stored_alert_db: Option<bool> = row.get(16).ok().flatten();
+        let deal_issued_at: Option<String> = row.get(17).ok().flatten();
+        let deal_sales_order_id: Option<String> = row.get(18).ok().flatten();
+        let deal_work_order_id: Option<String> = row.get(19).ok().flatten();
 
         // S271 — recompute alert. Sticky on TRUE; downgrades trigger.
         let stored_alert = coerce_stock_alert(stored_alert_db);
@@ -242,6 +264,9 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Quot
             valid_until,
             stock_status_at_accept,
             stock_alert,
+            deal_issued_at,
+            deal_sales_order_id,
+            deal_work_order_id,
         });
     }
     Ok(QuoteIntakeListing {
@@ -342,6 +367,21 @@ ALTER TABLE quote_intake_log
     ADD COLUMN IF NOT EXISTS stock_status_at_accept VARCHAR;
 ALTER TABLE quote_intake_log
     ADD COLUMN IF NOT EXISTS stock_alert BOOLEAN;
+";
+
+/// S272 / PR-261 — additive DEAL-saga columns. Mirrors the daemon-write
+/// side's `log_table::S272_MIGRATION_SQL`. NO SQL DEFAULTs (same DuckDB
+/// DEFAULT-on-replay clobber trap pinned in S271's `stock_alert`); the
+/// single-use invariant rides the app-layer CAS on `deal_issued_at IS NULL`.
+const S272_MIGRATION_BACKSTOP: &str = "
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS deal_issued_at TIMESTAMP;
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS deal_sales_order_id VARCHAR;
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS deal_work_order_id VARCHAR;
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS refresh_acked_at TIMESTAMP;
 ";
 
 #[derive(Debug, Default)]
