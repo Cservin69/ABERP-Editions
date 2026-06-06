@@ -13,6 +13,18 @@
 **/*.rs.bk
 *.pdb
 
+# --- Python (S269 aberp-cad-extract) ------------------------
+# The CAD extractor crate ships in `python/aberp-cad-extract/`.
+# Build artefacts, venvs, and pytest caches stay local.
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
 # --- Node / Svelte / Tauri frontend -------------------------
 node_modules/
 dist/

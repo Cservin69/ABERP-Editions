@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aberp-cad-extract"
+version = "0.0.0"
+description = "S269 / PR-258 — Python CAD extractor skeleton. STEP/STL → FeatureGraph JSON for crates/aberp-quote-engine (S268). STL-only v1; STEP stubbed for the OCCT-backed S270 line."
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Áben Consulting KFT." }]
+dependencies = [
+    "pydantic>=2.5,<3.0",
+    "numpy>=1.26,<3.0",
+    "numpy-stl>=3.1,<4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9.0",
+]
+
+[project.scripts]
+aberp-cad-extract = "aberp_cad_extract.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["aberp_cad_extract*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["aberp_cad_extract/tests"]
+addopts = "-ra -q"

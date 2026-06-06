@@ -27,6 +27,14 @@ pub enum FeatureType {
     /// Threaded hole or external thread.
     Thread,
     /// 5-axis-only undercut (B-axis or C-axis access).
+    ///
+    /// Explicit rename: serde's `snake_case` rule breaks the camel-
+    /// case around the digit and produces `undercut5_axis`, which
+    /// disagrees with the DB string `undercut_5axis` (see
+    /// [`FeatureType::as_db_str`]) AND with the S269 Python
+    /// extractor's emitted JSON. Aligned here; surfaced by the
+    /// S269 cross-language compat test.
+    #[serde(rename = "undercut_5axis")]
     Undercut5Axis,
     /// Wall thinner than the operator-tunable thin-wall threshold.
     ThinWall,

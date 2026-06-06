@@ -26,6 +26,13 @@ serde = { workspace = true }
 # except the binary boundary).
 thiserror = { workspace = true }
 
+# Dev-only: the cross-language compat test (S269/PR-258) deserializes
+# a Python-emitted FeatureGraph JSON fixture. Not a runtime dep —
+# the engine itself still takes a plain Rust struct (parsing is the
+# wrapper's job per lib.rs).
+[dev-dependencies]
+serde_json = { workspace = true }
+
 # PR-235 / S241 — inherit workspace lint config.
 [lints]
 workspace = true

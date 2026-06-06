@@ -1,0 +1,24 @@
+{
+  "_schema_version": 1,
+  "bounding_box_mm": [
+    50.0,
+    30.0,
+    20.0
+  ],
+  "volume_mm3": 25000.0,
+  "material_grade": "6061-T6",
+  "features": [
+    {
+      "feature_type": "hole",
+      "count": 4,
+      "representative_size_mm": 6.0
+    },
+    {
+      "feature_type": "pocket",
+      "count": 1,
+      "representative_size_mm": 20.0
+    }
+  ],
+  "requires_5_axis": false,
+  "thin_wall_present": false
+}

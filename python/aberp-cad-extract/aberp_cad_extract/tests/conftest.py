@@ -1,0 +1,110 @@
+"""Shared pytest fixtures.
+
+Synthetic STL meshes are written on-the-fly so the test suite has no
+binary fixtures in-tree (CLAUDE.md rule 11 — match conventions; the
+Rust side keeps its fixtures minimal too).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+from stl import mesh as stl_mesh
+
+
+def _cube_mesh(side_mm: float) -> stl_mesh.Mesh:
+    """Axis-aligned closed cube centered on the origin."""
+    h = side_mm / 2.0
+    verts = np.array(
+        [
+            [-h, -h, -h],
+            [+h, -h, -h],
+            [+h, +h, -h],
+            [-h, +h, -h],
+            [-h, -h, +h],
+            [+h, -h, +h],
+            [+h, +h, +h],
+            [-h, +h, +h],
+        ]
+    )
+    faces = np.array(
+        [
+            [0, 3, 1], [1, 3, 2],  # bottom
+            [4, 5, 7], [5, 6, 7],  # top
+            [0, 1, 5], [0, 5, 4],  # front
+            [2, 3, 7], [2, 7, 6],  # back
+            [1, 2, 6], [1, 6, 5],  # right
+            [0, 4, 7], [0, 7, 3],  # left
+        ]
+    )
+    cube = stl_mesh.Mesh(np.zeros(faces.shape[0], dtype=stl_mesh.Mesh.dtype))
+    for i, f in enumerate(faces):
+        for j in range(3):
+            cube.vectors[i][j] = verts[f[j], :]
+    return cube
+
+
+def _plate_mesh(x_mm: float, y_mm: float, z_mm: float) -> stl_mesh.Mesh:
+    """Axis-aligned closed box with arbitrary extents."""
+    hx, hy, hz = x_mm / 2.0, y_mm / 2.0, z_mm / 2.0
+    verts = np.array(
+        [
+            [-hx, -hy, -hz],
+            [+hx, -hy, -hz],
+            [+hx, +hy, -hz],
+            [-hx, +hy, -hz],
+            [-hx, -hy, +hz],
+            [+hx, -hy, +hz],
+            [+hx, +hy, +hz],
+            [-hx, +hy, +hz],
+        ]
+    )
+    faces = np.array(
+        [
+            [0, 3, 1], [1, 3, 2],
+            [4, 5, 7], [5, 6, 7],
+            [0, 1, 5], [0, 5, 4],
+            [2, 3, 7], [2, 7, 6],
+            [1, 2, 6], [1, 6, 5],
+            [0, 4, 7], [0, 7, 3],
+        ]
+    )
+    box = stl_mesh.Mesh(np.zeros(faces.shape[0], dtype=stl_mesh.Mesh.dtype))
+    for i, f in enumerate(faces):
+        for j in range(3):
+            box.vectors[i][j] = verts[f[j], :]
+    return box
+
+
+@pytest.fixture
+def cube_stl_path(tmp_path: Path) -> Path:
+    """20 mm cube saved as binary STL."""
+    cube = _cube_mesh(20.0)
+    path = tmp_path / "cube.stl"
+    cube.save(str(path))
+    return path
+
+
+@pytest.fixture
+def thin_plate_stl_path(tmp_path: Path) -> Path:
+    """100 × 50 × 0.8 mm plate — thin-wall trigger."""
+    plate = _plate_mesh(100.0, 50.0, 0.8)
+    path = tmp_path / "plate.stl"
+    plate.save(str(path))
+    return path
+
+
+@pytest.fixture
+def long_thin_concave_proxy_path(tmp_path: Path) -> Path:
+    """1000 × 100 × 100 mm box that nominally hits the 5-axis aspect-ratio gate.
+
+    Solid cube fills its bounding box completely (fill_ratio=1.0) so
+    the conservative heuristic returns False — confirming we don't
+    falsely route a long-but-solid bar to 5-axis.
+    """
+    plate = _plate_mesh(1000.0, 100.0, 100.0)
+    path = tmp_path / "bar.stl"
+    plate.save(str(path))
+    return path
