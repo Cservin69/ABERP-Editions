@@ -217,6 +217,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aberp-quote-engine"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "aberp-quote-intake"
 version = "0.0.0"
 dependencies = [

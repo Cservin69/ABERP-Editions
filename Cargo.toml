@@ -68,6 +68,7 @@ members = [
     "crates/aberp-verify",
     "crates/aberp-quote-intake",
     "crates/aberp-mes",
+    "crates/aberp-quote-engine",
     "crates/aberp-inventory",
     "crates/aberp-work-orders",
     "crates/aberp-qa",

@@ -1,0 +1,31 @@
+[package]
+name = "aberp-quote-engine"
+description = "S268 / PR-257 — pure-function quote scoring crate for the auto-quoting strand (design doc §10, ADR-0066). Takes a FeatureGraph + catalogue snapshot + tunable parameters → QuoteBreakdown. No I/O, no clock, no RNG, no async, no global state. Deterministic and idempotent: same inputs ⇒ byte-identical reasoning_log + breakdown."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_quote_engine"
+path = "src/lib.rs"
+
+[dependencies]
+# `serde` only for the JSON-deserializable FeatureGraph stub the
+# subprocess wrapper (S270) will hand to the engine. `derive` only —
+# we never pull `serde_json` because parsing is the wrapper's job, not
+# the engine's. The engine takes a plain Rust struct.
+serde = { workspace = true }
+
+# Typed error variants for the engine's failure modes
+# (MaterialNotInCatalogue, ToleranceNotInTable, …). Mirrors the rest
+# of the workspace's library-crate posture (`thiserror` everywhere
+# except the binary boundary).
+thiserror = { workspace = true }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true
