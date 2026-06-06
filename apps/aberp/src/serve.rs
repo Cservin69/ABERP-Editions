@@ -2316,6 +2316,14 @@ fn build_router(state: AppState) -> Router {
             "/api/quoting-stock-adjustments/:id",
             put(handle_update_stock_adjustment).delete(handle_delete_stock_adjustment),
         )
+        // S273 / PR-262 / ADR-0069 — material-side inventory balances
+        // (on_hand / reserved / committed / consumed). Read-only in v1;
+        // writes happen via the DEAL saga (committed) and the future
+        // workshop-completion hook (consumed). Operator-facing GET only.
+        .route(
+            "/api/inventory-balances",
+            get(handle_list_inventory_balances),
+        )
         // PR-172 — buyer-facing notes typeahead source. GET-only,
         // ready+bearer-gated. `?scope=line|invoice|storno` is required.
         // Returns the most-recent-first deduplicated list of operator-
@@ -16140,6 +16148,44 @@ async fn handle_quote_intake_mark_irrelevant(
     }
 }
 
+// ── S273 / PR-262 — Inventory Balances read route ────────────────────
+
+/// `GET /api/inventory-balances` — read-only list of `(material_grade,
+/// on_hand, reserved, committed, consumed, available, uom, last_updated)`
+/// for the operator's tenant. Used by the SPA `#/inventory-balances`
+/// view + by the DEAL toast's after-state lookup. Ready + bearer.
+async fn handle_list_inventory_balances(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<Vec<crate::material_inventory::Balance>> {
+            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            crate::material_inventory::list_balances_for_tenant(
+                &conn,
+                state_for_task.tenant.as_str(),
+            )
+        })
+        .await;
+    match result {
+        Ok(Ok(balances)) => Json(serde_json::json!({ "balances": balances })).into_response(),
+        Ok(Err(e)) => internal_error("list_inventory_balances", e),
+        Err(join_err) => internal_error(
+            "list_inventory_balances:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
 // ── S272 / PR-261 — DEAL saga route ──────────────────────────────────
 
 /// Inbound JSON body for `POST /api/quote-intake/:quote_id/deal`. The
@@ -16239,6 +16285,23 @@ async fn handle_deal_saga(
                         StatusCode::CONFLICT,
                         saga.machine_code(),
                         "DEAL token does not match — copy from the reference column".to_string(),
+                    ),
+                    // S273 / PR-262 / ADR-0069 — material-side capacity
+                    // check failed. The numbers reach the SPA so the
+                    // operator sees exactly why the DEAL was refused.
+                    DealSagaError::InsufficientMaterial {
+                        material_grade,
+                        requested,
+                        on_hand,
+                        already_reserved,
+                        already_committed,
+                        ..
+                    } => (
+                        StatusCode::CONFLICT,
+                        saga.machine_code(),
+                        format!(
+                            "insufficient material {material_grade}: requested {requested}, on hand {on_hand}, already reserved {already_reserved}, already committed {already_committed}. Open Inventory Balances to fix on_hand_qty, then retry."
+                        ),
                     ),
                 };
                 return (status, Json(DealSagaErrorBody { code, message: msg })).into_response();

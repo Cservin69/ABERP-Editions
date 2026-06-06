@@ -1371,6 +1371,71 @@ pub enum EventKind {
     /// Payload: `serde_json::Value` (aberp binary `serve`).
     /// F12 four-edit ritual fires once.
     QuoteWorkOrderCreated,
+
+    /// S273 / PR-262 / ADR-0069 — material moved into `reserved` state
+    /// (soft commit). Reserved for the future "indicative quote →
+    /// reserve" hook the storefront will trigger when an operator marks
+    /// a quote as "high-confidence"; not emitted by any handler today
+    /// (the DEAL saga commits directly to `committed`, not via a
+    /// `reserved` intermediate). The kind is defined now so the
+    /// `inventory.*` prefix family lands as one F12 ritual + one schema
+    /// audit, rather than being trickled in across multiple PRs.
+    ///
+    /// Carries `material_grade`, `tenant_id`, `qty`, `reservation_id`
+    /// (the `res_<ULID>`), `quote_id`, `actor`.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    MaterialReserved,
+
+    /// S273 / PR-262 / ADR-0069 — material moved into `committed` state
+    /// (hard commit). Emitted by the DEAL saga inside its single tx (the
+    /// fourth audit entry alongside `QuoteDealIssued` +
+    /// `QuoteSalesOrderCreated` + `QuoteWorkOrderCreated`); represents
+    /// the customer-paying transition where `committed_qty` increments
+    /// on `inventory_balances` and a new `inventory_reservations` row
+    /// lands with `state = 'committed'`.
+    ///
+    /// Carries `material_grade`, `tenant_id`, `qty`, `reservation_id`
+    /// (the `res_<ULID>`), `quote_id`, `actor`, the on-hand /
+    /// reserved / committed snapshot AFTER the increment (so a
+    /// forensic walk can prove the invariant held), and `idempotency_key`
+    /// (`quote_deal:<quote_id>:material`).
+    ///
+    /// `inventory.*` prefix family — distinct from `quote.*` (catalogue,
+    /// tunables, saga) and `mes.*` (product-side stock_movements). Never
+    /// invoice-scoped; never swept by the per-OUTGOING-invoice bundle.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    MaterialCommitted,
+
+    /// S273 / PR-262 / ADR-0069 — material moved into `consumed` state
+    /// (physically used in production). Reserved for the future workshop-
+    /// completion hook the Stage 3 Production module will fire when a
+    /// Work Order Completes and the material is physically off the
+    /// shelf. Not emitted by any handler today.
+    ///
+    /// Carries `material_grade`, `tenant_id`, `qty`, `reservation_id`,
+    /// `quote_id`, `actor`.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    MaterialConsumed,
+
+    /// S273 / PR-262 / ADR-0069 — reservation released (back to the
+    /// sale-able pool). Reserved for the future "quote rejected" /
+    /// "DEAL rolled back" hook — the operator-driven path that
+    /// decrements `reserved_qty` or `committed_qty` and flips the
+    /// reservation row's `state` to `released`. Not emitted by any
+    /// handler today.
+    ///
+    /// Carries `material_grade`, `tenant_id`, `qty`, `reservation_id`,
+    /// `quote_id`, `actor`, `reason` (operator-typed text).
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    MaterialReleased,
 }
 
 impl EventKind {
@@ -1448,6 +1513,10 @@ impl EventKind {
             EventKind::QuoteDealIssued => "quote.deal_issued",
             EventKind::QuoteSalesOrderCreated => "quote.sales_order_created",
             EventKind::QuoteWorkOrderCreated => "quote.work_order_created",
+            EventKind::MaterialReserved => "inventory.material_reserved",
+            EventKind::MaterialCommitted => "inventory.material_committed",
+            EventKind::MaterialConsumed => "inventory.material_consumed",
+            EventKind::MaterialReleased => "inventory.material_released",
         }
     }
 
@@ -1536,6 +1605,10 @@ impl EventKind {
             "quote.deal_issued" => Ok(EventKind::QuoteDealIssued),
             "quote.sales_order_created" => Ok(EventKind::QuoteSalesOrderCreated),
             "quote.work_order_created" => Ok(EventKind::QuoteWorkOrderCreated),
+            "inventory.material_reserved" => Ok(EventKind::MaterialReserved),
+            "inventory.material_committed" => Ok(EventKind::MaterialCommitted),
+            "inventory.material_consumed" => Ok(EventKind::MaterialConsumed),
+            "inventory.material_released" => Ok(EventKind::MaterialReleased),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1616,6 +1689,10 @@ mod tests {
             EventKind::QuoteDealIssued,
             EventKind::QuoteSalesOrderCreated,
             EventKind::QuoteWorkOrderCreated,
+            EventKind::MaterialReserved,
+            EventKind::MaterialCommitted,
+            EventKind::MaterialConsumed,
+            EventKind::MaterialReleased,
         ];
         for v in variants {
             let s = v.as_str();
@@ -2970,6 +3047,76 @@ mod tests {
                 alert, neighbour,
                 "{alert} must be distinct from quote.* neighbour {neighbour}"
             );
+        }
+    }
+
+    /// S273 / PR-262 / ADR-0069 — the four material-state-machine kinds
+    /// open a NEW `inventory.*` prefix family, distinct from:
+    ///
+    ///   * `quote.*` (catalogue, tunables, DEAL saga) — quote-strand
+    ///     concerns; material balances are downstream of a DEAL but are
+    ///     a separate domain (an inventory adjustment is not a quote
+    ///     event).
+    ///   * `mes.*` (product-side `stock_movements`) — those track
+    ///     finished-goods + WIP; material balances track raw stock
+    ///     keyed on `quoting_materials.grade`. Different table, different
+    ///     state machine, different audit family.
+    ///   * `invoice.*` / `system.*` — same per-OUTGOING-invoice bundle
+    ///     glob trap as the S266/S267/S271 pins above. A misprefix would
+    ///     either sweep material-commit traffic into an invoice's
+    ///     evidence bundle (S166-style) or fork the inventory history
+    ///     across two prefixes (S267-style).
+    ///
+    /// Loud-fail pin so a future contributor renaming `inventory.*` →
+    /// `quote.*` (a tempting collapse — the DEAL saga emits BOTH) is
+    /// caught at test time, not when a forensic walk reads two
+    /// prefixes for one history.
+    #[test]
+    fn s273_material_state_kinds_use_inventory_prefix() {
+        let cases: [(EventKind, &str); 4] = [
+            (EventKind::MaterialReserved, "inventory.material_reserved"),
+            (EventKind::MaterialCommitted, "inventory.material_committed"),
+            (EventKind::MaterialConsumed, "inventory.material_consumed"),
+            (EventKind::MaterialReleased, "inventory.material_released"),
+        ];
+        for (k, expected) in cases {
+            assert_eq!(k.as_str(), expected);
+            let s = k.as_str();
+            assert!(
+                s.starts_with("inventory."),
+                "{s} must start with inventory."
+            );
+            assert!(!s.starts_with("quote."), "{s} must not start with quote.");
+            assert!(
+                !s.starts_with("invoice."),
+                "{s} must not start with invoice."
+            );
+            assert!(!s.starts_with("system."), "{s} must not start with system.");
+            assert!(!s.starts_with("mes."), "{s} must not start with mes.");
+        }
+    }
+
+    /// S273 / PR-262 / ADR-0069 — the four new storage strings are
+    /// pairwise-distinct AND distinct from `mes.stock_movement_recorded`
+    /// (the closest neighbour conceptually — also stock-tracking, but
+    /// product-side, not material-side). A collision would mis-route a
+    /// material commit into the product-stock-movement history bucket.
+    #[test]
+    fn s273_material_state_kinds_are_distinct() {
+        let new = [
+            EventKind::MaterialReserved.as_str(),
+            EventKind::MaterialCommitted.as_str(),
+            EventKind::MaterialConsumed.as_str(),
+            EventKind::MaterialReleased.as_str(),
+        ];
+        for i in 0..new.len() {
+            for j in (i + 1)..new.len() {
+                assert_ne!(new[i], new[j], "{} collides with {}", new[i], new[j]);
+            }
+        }
+        for k in new {
+            assert_ne!(k, EventKind::StockMovementRecorded.as_str());
+            assert_ne!(k, EventKind::QuoteDealIssued.as_str());
         }
     }
 }

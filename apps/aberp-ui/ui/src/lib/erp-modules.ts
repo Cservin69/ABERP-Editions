@@ -217,6 +217,11 @@ export const MODULES: ErpModule[] = [
       { id: "quoting-tolerance-multipliers", label: "Tolerance multipliers" },
       { id: "quoting-parameters", label: "Global parameters" },
       { id: "quoting-stock-adjustments", label: "Stock adjustments" },
+      // S273 / PR-262 / ADR-0069 — material-side balances feed the DEAL
+      // saga's `committed_qty +=` check. Read-only operator view in v1;
+      // sits beside the engine tunables because the operator visits
+      // both when prepping a new material grade for quoting.
+      { id: "inventory-balances", label: "Inventory balances" },
     ],
   },
 ];
@@ -368,7 +373,14 @@ export type MaintenanceTileStatusKind =
   | "ComplexityRuleCount"
   | "ToleranceMultiplierCount"
   | "ParametersStatus"
-  | "StockAdjustmentCount";
+  | "StockAdjustmentCount"
+  // S273 / PR-262 / ADR-0069 — material-side inventory balances. The
+  // tile's chip surfaces "N grades" — the count of `(tenant,
+  // material_grade)` rows the operator has seeded balances for. Zero
+  // is the most common state for a fresh tenant; the first DEAL auto-
+  // upserts a row, after which the operator visits to set
+  // `on_hand_qty`.
+  | "InventoryBalanceCount";
 
 /** One tile on the maintenance landing dashboard. The dashboard
  * renders the tiles grouped under their sub-area headers (today:
@@ -501,5 +513,19 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Anyag × készletállapot árszorzó",
     description_en: "Material × stock-status price tweak",
     statusKind: "StockAdjustmentCount",
+  },
+  // S273 / PR-262 / ADR-0069 — material-side balances tile. Read-only
+  // operator surface that surfaces the DEAL saga's `committed_qty`
+  // ledger; sits beside the four engine tunables so the operator's
+  // mental model is "tune the engine + see the material side as one
+  // sub-area."
+  {
+    moduleId: "quoting",
+    route: "inventory-balances",
+    label_hu: "Anyagkészlet",
+    label_en: "Inventory balances",
+    description_hu: "On-hand / reserved / committed anyagminőség szerint",
+    description_en: "On-hand / reserved / committed per material grade",
+    statusKind: "InventoryBalanceCount",
   },
 ];

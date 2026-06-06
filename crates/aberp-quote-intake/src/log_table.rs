@@ -639,11 +639,30 @@ pub fn claim_for_pickup_in_tx(
 /// `[[no-sql-specific]]` the closed-vocab `intake_state` is enforced in
 /// the app layer; the row's stored `intake_state` may be NULL on a
 /// pre-S256 install, so the helper coerces NULL → `STATE_STAGED`.
+///
+/// S273 / PR-262 widens the row with `material_grade` + `quantity` so
+/// the saga can hand them to `apps/aberp/src/material_inventory.rs` for
+/// the in-tx `committed_qty +=` write. Both columns are nullable in the
+/// schema (S271 added them without DEFAULTs); a `None` here means the
+/// row pre-dates the storefront's auto-quoting projection write, in
+/// which case the material-commit branch of the saga is skipped (per
+/// ADR-0069 / brief pushback — graceful fallback so all S272-era rows
+/// still deal; no material commit happens until the storefront pipeline
+/// populates the columns).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DealSourceRow {
     pub intake_state: String,
     pub stock_alert: bool,
     pub deal_issued_at: Option<String>,
+    /// S273 — material grade the quote was priced against (S271 column).
+    /// `None` on pre-storefront rows; the saga skips the material commit.
+    pub material_grade: Option<String>,
+    /// S273 — quantity requested (S271 column). The saga uses this as
+    /// the `inventory_reservations.qty` value for v1 (units, NOT volume —
+    /// the units→mm³→kg conversion needs the CAD-extract `FeatureGraph`
+    /// volume + the catalogue density, neither of which is plumbed yet).
+    /// `None` on pre-storefront rows.
+    pub quantity: Option<i64>,
 }
 
 pub fn read_for_deal(
@@ -659,7 +678,8 @@ pub fn read_for_deal(
     let mut stmt = conn
         .prepare(
             "SELECT COALESCE(intake_state, ?3), stock_alert,
-                    CAST(deal_issued_at AS VARCHAR)
+                    CAST(deal_issued_at AS VARCHAR),
+                    material_grade, quantity
                FROM quote_intake_log
               WHERE quote_id = ?1 AND tenant_id = ?2
               LIMIT 1",
@@ -683,10 +703,18 @@ pub fn read_for_deal(
     let deal_issued_at: Option<String> = row
         .get(2)
         .map_err(|e| QuoteIntakeError::Storage(format!("get deal_issued_at: {e}")))?;
+    let material_grade: Option<String> = row
+        .get(3)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get material_grade: {e}")))?;
+    let quantity: Option<i64> = row
+        .get(4)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get quantity: {e}")))?;
     Ok(Some(DealSourceRow {
         intake_state,
         stock_alert: stock_alert_raw.unwrap_or(false),
         deal_issued_at,
+        material_grade,
+        quantity,
     }))
 }
 
@@ -1084,7 +1112,9 @@ mod tests {
 
     /// `read_for_deal` surfaces the three precondition columns the
     /// saga consults: intake_state (coerced NULL → staged), stock_alert
-    /// (coerced NULL → false), and deal_issued_at.
+    /// (coerced NULL → false), and deal_issued_at. S273 widens to five
+    /// columns; `material_grade` + `quantity` are NULL on a fresh INSERT
+    /// (the storefront's S271 projection writer fills them later).
     #[test]
     fn s272_read_for_deal_surfaces_preconditions() {
         let conn = open_mem();
@@ -1093,6 +1123,9 @@ mod tests {
         assert_eq!(row.intake_state, STATE_STAGED);
         assert!(!row.stock_alert);
         assert_eq!(row.deal_issued_at, None);
+        // S273 — pre-storefront row has no material_grade / quantity.
+        assert_eq!(row.material_grade, None);
+        assert_eq!(row.quantity, None);
 
         // Flip stock_alert TRUE; the helper must surface it.
         assert!(flip_stock_alert_to_true(&conn, "t", "q1").unwrap());
@@ -1107,6 +1140,25 @@ mod tests {
         mark_irrelevant(&conn, "t", "q1").unwrap();
         let row = read_for_deal(&conn, "t", "q1").unwrap().unwrap();
         assert_eq!(row.intake_state, STATE_IRRELEVANT);
+    }
+
+    /// S273 / PR-262 — once the storefront's S271 projection writer has
+    /// populated `material_grade` + `quantity`, `read_for_deal` surfaces
+    /// them so the saga can hand them to the material-commit branch.
+    #[test]
+    fn s273_read_for_deal_surfaces_material_grade_and_quantity() {
+        let conn = open_mem();
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), "{}", "{}").unwrap();
+        conn.execute(
+            "UPDATE quote_intake_log
+                SET material_grade = ?1, quantity = ?2
+              WHERE quote_id = ?3 AND tenant_id = ?4",
+            params!["6061-T6", 12i64, "q1", "t"],
+        )
+        .unwrap();
+        let row = read_for_deal(&conn, "t", "q1").unwrap().unwrap();
+        assert_eq!(row.material_grade.as_deref(), Some("6061-T6"));
+        assert_eq!(row.quantity, Some(12));
     }
 
     /// CAS pin — `mark_deal_issued_in_tx` returns 1 on first call (the

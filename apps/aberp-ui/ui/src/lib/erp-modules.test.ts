@@ -65,6 +65,8 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "quoting-tolerance-multipliers",
   "quoting-parameters",
   "quoting-stock-adjustments",
+  // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
+  "inventory-balances",
 ];
 
 // PR-79 / session 102 — closed set of AREA-landing routes. These are
@@ -115,6 +117,11 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   "quoting-tolerance-multipliers": "quoting",
   "quoting-parameters": "quoting",
   "quoting-stock-adjustments": "quoting",
+  // S273 / PR-262 / ADR-0069 — material-side Inventory Balances; lives
+  // under Quoting because the operator visits it when prepping a new
+  // grade (the DEAL saga's auto-upsert lands the row at zeros until
+  // the operator sets on_hand_qty here).
+  "inventory-balances": "quoting",
 };
 
 // The expected area for each AppRoute. The two-area usage-frequency
@@ -151,6 +158,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   "quoting-tolerance-multipliers": "maintenance",
   "quoting-parameters": "maintenance",
   "quoting-stock-adjustments": "maintenance",
+  // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
+  "inventory-balances": "maintenance",
 };
 
 // Closed-vocab set of accepted status kinds on a maintenance tile.
@@ -175,6 +184,8 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   "ToleranceMultiplierCount",
   "ParametersStatus",
   "StockAdjustmentCount",
+  // S273 / PR-262 / ADR-0069 — material-side balances tile.
+  "InventoryBalanceCount",
 ]);
 
 // Every area must have a stable bilingual label and at least one

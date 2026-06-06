@@ -916,7 +916,18 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // bytes; never swept by the per-OUTGOING-invoice bundle.
         | EventKind::QuoteDealIssued
         | EventKind::QuoteSalesOrderCreated
-        | EventKind::QuoteWorkOrderCreated => (None, ""),
+        | EventKind::QuoteWorkOrderCreated
+        // S273 / PR-262 / ADR-0069 — material-state-machine kinds
+        // (`inventory.*`). The DEAL saga emits `MaterialCommitted`
+        // alongside the three `quote.*` siblings; the other three are
+        // defined for future handlers (storefront indicative-quote
+        // hook, workshop Work-Order-Complete hook, operator reservation
+        // cancel). All inventory-strand operator/system actions; no
+        // NAV bytes; never swept by the per-OUTGOING-invoice bundle.
+        | EventKind::MaterialReserved
+        | EventKind::MaterialCommitted
+        | EventKind::MaterialConsumed
+        | EventKind::MaterialReleased => (None, ""),
     };
 
     Ok(NavExtraction {

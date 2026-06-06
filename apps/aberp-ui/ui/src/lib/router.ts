@@ -47,7 +47,12 @@ export type AppRoute =
   | "quoting-complexity-rules"
   | "quoting-tolerance-multipliers"
   | "quoting-parameters"
-  | "quoting-stock-adjustments";
+  | "quoting-stock-adjustments"
+  // S273 / PR-262 / ADR-0069 — material-side inventory balances. Lives
+  // under the maintenance area's Quoting sub-nav alongside the
+  // tunables (operators reach it when they need to bump on_hand_qty
+  // after a material delivery).
+  | "inventory-balances";
 
 /** Default route the SPA falls back to on first paint (or on a hash
  * with an unknown slug). The Invoices list was the only screen
@@ -117,6 +122,8 @@ export function parseRoute(hash: string): AppRoute {
       return "quoting-parameters";
     case "quoting-stock-adjustments":
       return "quoting-stock-adjustments";
+    case "inventory-balances":
+      return "inventory-balances";
     default:
       return DEFAULT_ROUTE;
   }

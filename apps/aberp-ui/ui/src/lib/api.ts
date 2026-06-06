@@ -1795,6 +1795,38 @@ export async function deleteStockAdjustment(id: number): Promise<void> {
   await invoke<void>("delete_stock_adjustment", { id });
 }
 
+// ── S273 / PR-262 / ADR-0069 — material-side Inventory Balances ──────
+
+/** S273 — one row of `inventory_balances`, plus a derived
+ *  `available_qty = on_hand_qty - reserved_qty - committed_qty` the
+ *  server computes for the SPA to render red-on-negative. v1: no
+ *  reservation timeout, no reverse transitions; `qty` is QUOTE
+ *  quantity (units, NOT kg) until the CAD-extract pipeline plumbs
+ *  through volume → density → mass. */
+export interface InventoryBalance {
+  tenant_id: string;
+  material_grade: string;
+  on_hand_qty: number;
+  reserved_qty: number;
+  committed_qty: number;
+  consumed_qty: number;
+  available_qty: number;
+  unit_of_measure: string;
+  last_updated: string;
+}
+
+export interface InventoryBalancesResult {
+  balances: InventoryBalance[];
+}
+
+/** S273 — `GET /api/inventory-balances`. Read-only list scoped to the
+ *  operator's tenant. The DEAL saga writes through the server-side
+ *  `commit_material_in_tx`; there is no SPA-driven write surface in
+ *  v1 (a future Edit form would land here). */
+export async function listInventoryBalances(): Promise<InventoryBalancesResult> {
+  return invoke<InventoryBalancesResult>("list_inventory_balances");
+}
+
 // ── PR-172 — buyer-facing notes-history typeahead source ─────────────
 
 /** PR-172 — closed-vocab discriminator for the notes-history scope.

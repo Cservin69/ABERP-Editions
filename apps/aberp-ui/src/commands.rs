@@ -585,6 +585,18 @@ pub async fn delete_stock_adjustment(state: State<'_, AppState>, id: i64) -> Res
     forward_delete(&state, &path).await
 }
 
+// ── S273 / PR-262 / ADR-0069 — Inventory Balances (material-side) ───
+
+/// `GET /api/inventory-balances` — list every `(material_grade, on_hand,
+/// reserved, committed, consumed, available, uom, last_updated)` row
+/// for the operator's tenant. Read-only in v1; writes happen inside
+/// the DEAL saga (`committed +=`) and the future workshop-completion
+/// hook (`consumed +=`).
+#[tauri::command]
+pub async fn list_inventory_balances(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/inventory-balances", true).await
+}
+
 // ── PR-172 — notes-history typeahead source ─────────────────────────
 
 /// PR-172 — `GET /api/notes-history?scope=line|invoice|storno`. Used

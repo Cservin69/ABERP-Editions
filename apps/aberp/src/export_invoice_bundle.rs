@@ -792,7 +792,18 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // NAV bytes; never swept by the per-OUTGOING-invoice bundle.
         | EventKind::QuoteDealIssued
         | EventKind::QuoteSalesOrderCreated
-        | EventKind::QuoteWorkOrderCreated => None,
+        | EventKind::QuoteWorkOrderCreated
+        // S273 / PR-262 / ADR-0069 — material-state-machine kinds
+        // (`inventory.*`). The DEAL saga emits `MaterialCommitted`
+        // alongside its three `quote.*` siblings inside one tx; the
+        // other three are defined for future handlers. None carry NAV
+        // bytes; none should ever sweep into a per-OUTGOING-invoice
+        // bundle (the bundle filter is keyed on `invoice.*`, not the
+        // `inventory.*` family).
+        | EventKind::MaterialReserved
+        | EventKind::MaterialCommitted
+        | EventKind::MaterialConsumed
+        | EventKind::MaterialReleased => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

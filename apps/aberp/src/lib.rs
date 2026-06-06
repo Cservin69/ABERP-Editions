@@ -47,6 +47,11 @@ pub mod issue_preflight;
 pub mod issue_storno;
 pub mod mark_abandoned;
 pub mod mark_invoice_paid;
+// S273 / PR-262 / ADR-0069 — material-side inventory balances +
+// reservations. The DEAL saga writes through here to increment
+// `committed_qty` on `inventory_balances` and insert a paired
+// `inventory_reservations` row in the same tx.
+pub mod material_inventory;
 // S229 / PR-225 — Stage 3 manufacturing-adapter framework boot wiring.
 // Reads `ABERP_BARCODE_SCANNER_*` env vars and spawns the barcode
 // scanner adapter + per-adapter ledger-writer task. Default-off.

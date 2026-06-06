@@ -308,6 +308,8 @@ pub fn run() {
             commands::create_stock_adjustment,
             commands::update_stock_adjustment,
             commands::delete_stock_adjustment,
+            // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
+            commands::list_inventory_balances,
             commands::list_notes_history,
             commands::list_products,
             commands::get_product,

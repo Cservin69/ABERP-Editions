@@ -1,11 +1,12 @@
 //! S272 / PR-261 — DEAL saga on a `quote_intake_log` row.
+//! S273 / PR-262 — extended with the material-commit branch (ADR-0069).
 //!
 //! # What this module does
 //!
 //! Operator clicks DEAL on a quote intake row → this saga validates
 //! preconditions, mints two placeholder ids (sales-order +
 //! work-order), writes them onto the row inside a single DB
-//! transaction, and emits three audit entries:
+//! transaction, and emits THREE-OR-FOUR audit entries:
 //!
 //!   1. [`EventKind::QuoteDealIssued`] — top-level saga marker.
 //!   2. [`EventKind::QuoteSalesOrderCreated`] — SO-side placeholder
@@ -13,9 +14,16 @@
 //!   3. [`EventKind::QuoteWorkOrderCreated`] — WO-side placeholder
 //!      (PR-228 WO crate needs `product_id` + routing ops that the
 //!      quote intake row does not yet carry).
+//!   4. [`EventKind::MaterialCommitted`] — material-side commit (S273,
+//!      ADR-0069). Emitted ONLY when the row carries both
+//!      `material_grade` AND `quantity` (the storefront's S271
+//!      projection columns). On a pre-storefront row (either column
+//!      NULL) the material branch is skipped silently — the saga still
+//!      mints SO/WO + emits the three other audit entries.
 //!
-//! All three entries + the column writes share ONE [`Transaction`] per
-//! ADR-0067: any step failing rolls back the whole saga.
+//! All entries + the column writes + the `inventory_balances` /
+//! `inventory_reservations` writes share ONE [`Transaction`] per
+//! ADR-0067 / ADR-0069: any step failing rolls back the whole saga.
 //!
 //! # Single-use invariant (EVE addendum 3)
 //!
@@ -50,6 +58,10 @@ use ulid::Ulid;
 use aberp_audit_ledger::{append_in_tx, Actor, EventKind, LedgerMeta};
 use aberp_quote_intake::log_table;
 
+use crate::material_inventory::{
+    self, MaterialCommitOutcome, MaterialCommittedPayload, MaterialInventoryError,
+};
+
 /// Literal token the operator must type into the REFRESH input when the
 /// row's `stock_alert` column is TRUE. Case-sensitive per
 /// [[hulye-biztos]]; the SPA input is NOT auto-uppercased so
@@ -67,7 +79,7 @@ pub const QUOTE_DEAL_TOKEN_LEN: usize = 8;
 /// toast (see `apps/aberp-ui/ui/src/routes/QuotesList.svelte`). The
 /// pure module returns these; the route layer (`serve.rs`) does the
 /// HTTP translation per [[trust-code-not-operator]].
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq)]
 pub enum DealSagaError {
     /// The quote intake row does not exist for `(tenant, quote_id)`.
     /// Route maps to 404.
@@ -92,6 +104,21 @@ pub enum DealSagaError {
     /// `deal_token_mismatch`.
     #[error("quote {quote_id} DEAL token mismatch")]
     DealTokenMismatch { quote_id: String },
+    /// S273 / PR-262 / ADR-0069 — material-side capacity check failed:
+    /// `on_hand_qty < reserved_qty + committed_qty + requested_qty`.
+    /// The wrapped numbers reach the SPA's 409 toast so the operator
+    /// can see exactly why the DEAL was refused and fix the
+    /// `on_hand_qty` in the Inventory Balances view. Route maps to 409
+    /// `insufficient_material`.
+    #[error("quote {quote_id} material {material_grade}: insufficient (requested {requested}, on_hand {on_hand}, already reserved {already_reserved}, already committed {already_committed})")]
+    InsufficientMaterial {
+        quote_id: String,
+        material_grade: String,
+        requested: f64,
+        on_hand: f64,
+        already_reserved: f64,
+        already_committed: f64,
+    },
 }
 
 impl DealSagaError {
@@ -104,6 +131,7 @@ impl DealSagaError {
             DealSagaError::DealAlreadyIssued { .. } => "deal_already_issued",
             DealSagaError::StockAlertRefreshRequired { .. } => "stock_alert_refresh_required",
             DealSagaError::DealTokenMismatch { .. } => "deal_token_mismatch",
+            DealSagaError::InsufficientMaterial { .. } => "insufficient_material",
         }
     }
 }
@@ -140,7 +168,7 @@ pub struct DealSagaInputs {
 
 /// Outcome of a successful DEAL saga. Surfaced verbatim on the route's
 /// 200 JSON body so the SPA can render the post-deal affordances.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DealSagaOutcome {
     /// `so_<ULID>` placeholder for the future Sales Order module.
     pub sales_order_id: String,
@@ -151,6 +179,13 @@ pub struct DealSagaOutcome {
     /// `true` iff the saga consumed a REFRESH token (i.e. the row had
     /// `stock_alert = TRUE` at saga time).
     pub refresh_acknowledged: bool,
+    /// S273 — material-commit outcome when the row carried
+    /// `material_grade` + `quantity`. `None` on pre-storefront rows
+    /// (the saga's material branch was skipped silently per ADR-0069 /
+    /// brief pushback). The SPA reads this to decide whether to show
+    /// the post-DEAL "12 kg of 6061-T6 committed" toast.
+    #[serde(default)]
+    pub material_commit: Option<MaterialCommitOutcome>,
 }
 
 /// JSON payload for the top-level [`EventKind::QuoteDealIssued`] entry.
@@ -382,10 +417,96 @@ pub fn run_deal_saga(
         ledger_meta,
         EventKind::QuoteWorkOrderCreated,
         wo_payload.to_bytes(),
-        ledger_actor,
+        ledger_actor.clone(),
         Some(format!("{idempotency_key}:wo")),
     )
     .context("audit append QuoteWorkOrderCreated")?;
+
+    // ── S273 / PR-262 / ADR-0069 — material commit branch ─────────────
+    //
+    // Skip silently when EITHER `material_grade` or `quantity` is None —
+    // the row pre-dates the storefront's S271 projection writer. The
+    // saga still mints SO/WO + emits three audit entries; the inventory
+    // side just stays untouched. This is the graceful-fallback path the
+    // brief pushback names (#1): all S272-era rows continue to deal
+    // without forcing the storefront pipeline to back-fill historical
+    // intake rows.
+    //
+    // When BOTH are populated, the commit branch:
+    //   (a) increments `committed_qty` on `inventory_balances`,
+    //   (b) inserts the `inventory_reservations` row in `committed`
+    //       state,
+    //   (c) emits `inventory.material_committed` inside the SAME tx
+    //       (the fourth audit entry alongside the three above).
+    //
+    // Any failure here rolls back the whole saga: the SO/WO id mints,
+    // the `deal_issued_at` flip, the three sibling audit entries — all
+    // gone. The next operator click sees the row as still un-dealt and
+    // can retry once the operator fixes `on_hand_qty` in the Inventory
+    // Balances view.
+    let material_commit: Option<MaterialCommitOutcome> =
+        match (row.material_grade.as_deref(), row.quantity) {
+            (Some(grade), Some(qty_units)) if !grade.is_empty() && qty_units > 0 => {
+                let qty = qty_units as f64;
+                let commit_outcome = material_inventory::commit_material_in_tx(
+                    &tx,
+                    &inputs.tenant,
+                    &inputs.quote_id,
+                    grade,
+                    qty,
+                )
+                .map_err(|e| {
+                    // Lift the typed inventory error into the saga's
+                    // typed error vocabulary so the route layer can
+                    // downcast to one DealSagaError union — keeps the
+                    // 409 routing single-surface in serve.rs.
+                    if let Some(inv) = e.downcast_ref::<MaterialInventoryError>() {
+                        match inv {
+                            MaterialInventoryError::InsufficientMaterial {
+                                material_grade,
+                                requested,
+                                on_hand,
+                                already_reserved,
+                                already_committed,
+                            } => anyhow!(DealSagaError::InsufficientMaterial {
+                                quote_id: inputs.quote_id.clone(),
+                                material_grade: material_grade.clone(),
+                                requested: *requested,
+                                on_hand: *on_hand,
+                                already_reserved: *already_reserved,
+                                already_committed: *already_committed,
+                            }),
+                        }
+                    } else {
+                        e.context("DEAL saga material commit")
+                    }
+                })?;
+
+                let material_idempotency_key = format!("{idempotency_key}:material");
+                let mat_payload = MaterialCommittedPayload {
+                    quote_id: inputs.quote_id.clone(),
+                    tenant_id: inputs.tenant.clone(),
+                    material_grade: grade.to_string(),
+                    qty,
+                    reservation_id: commit_outcome.reservation_id.clone(),
+                    actor: inputs.actor.clone(),
+                    idempotency_key: material_idempotency_key.clone(),
+                    created_at: now_iso.clone(),
+                    balance_after_on_hand: commit_outcome.balance_after.on_hand_qty,
+                    balance_after_reserved: commit_outcome.balance_after.reserved_qty,
+                    balance_after_committed: commit_outcome.balance_after.committed_qty,
+                    balance_after_consumed: commit_outcome.balance_after.consumed_qty,
+                };
+                material_inventory::append_material_committed_in_tx(
+                    &tx,
+                    ledger_meta,
+                    ledger_actor,
+                    &mat_payload,
+                )?;
+                Some(commit_outcome)
+            }
+            _ => None,
+        };
 
     tx.commit().context("commit DEAL saga tx")?;
 
@@ -394,6 +515,7 @@ pub fn run_deal_saga(
         work_order_id,
         deal_issued_at: now_iso,
         refresh_acknowledged: row.stock_alert,
+        material_commit,
     })
 }
 
@@ -456,6 +578,28 @@ mod tests {
         assert_eq!(expected_deal_token("12345"), "12345");
         assert_eq!(expected_deal_token("12345678"), "12345678");
         assert_eq!(expected_deal_token("123456789"), "12345678");
+    }
+
+    fn set_material_and_quantity(conn: &Connection, quote_id: &str, grade: &str, qty: i64) {
+        conn.execute(
+            "UPDATE quote_intake_log
+                SET material_grade = ?1, quantity = ?2
+              WHERE quote_id = ?3 AND tenant_id = 'test-tenant'",
+            duckdb::params![grade, qty, quote_id],
+        )
+        .unwrap();
+    }
+
+    fn seed_balance(conn: &Connection, grade: &str, on_hand: f64) {
+        crate::material_inventory::ensure_schema(conn).unwrap();
+        conn.execute(
+            "INSERT INTO inventory_balances (
+                tenant_id, material_grade, on_hand_qty, reserved_qty,
+                committed_qty, consumed_qty, unit_of_measure, last_updated
+             ) VALUES ('test-tenant', ?1, ?2, 0, 0, 0, 'kg', '2026-06-06T00:00:00Z')",
+            duckdb::params![grade, on_hand],
+        )
+        .unwrap();
     }
 
     /// Happy path on a stock-OK row: no REFRESH needed, the correct
@@ -780,5 +924,291 @@ mod tests {
             deal_idempotency_key("0226e154-..."),
             "quote_deal:0226e154-..."
         );
+    }
+
+    // ── S273 / PR-262 / ADR-0069 — material-commit branch ────────────
+
+    /// A row with NO `material_grade` (the pre-storefront default) goes
+    /// through the saga unchanged: SO/WO mint, three audit entries,
+    /// `material_commit = None`. The brief's pushback #1 graceful
+    /// fallback — all S272-era rows still deal.
+    #[test]
+    fn s273_saga_skips_material_commit_when_material_grade_missing() {
+        let mut conn = open_conn();
+        let quote_id = full_uuid_quote_id();
+        stage_quote(&conn, quote_id);
+        let meta = ledger_meta();
+        let outcome = run_deal_saga(
+            &mut conn,
+            &meta,
+            actor(),
+            DealSagaInputs {
+                tenant: "test-tenant".into(),
+                quote_id: quote_id.into(),
+                actor: "operator-A".into(),
+                deal_token: "0226e154".into(),
+                refresh_ack: None,
+            },
+        )
+        .unwrap();
+        assert!(outcome.material_commit.is_none());
+
+        // Audit count: THREE entries, not four — material branch skipped.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'inventory.material_committed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Empty-string `material_grade` is treated like NULL (defense
+    /// against a storefront writer that pushed "" for a missing field).
+    /// The saga skips the material branch silently.
+    #[test]
+    fn s273_saga_skips_material_commit_when_material_grade_empty_string() {
+        let mut conn = open_conn();
+        let quote_id = full_uuid_quote_id();
+        stage_quote(&conn, quote_id);
+        set_material_and_quantity(&conn, quote_id, "", 5);
+        let meta = ledger_meta();
+        let outcome = run_deal_saga(
+            &mut conn,
+            &meta,
+            actor(),
+            DealSagaInputs {
+                tenant: "test-tenant".into(),
+                quote_id: quote_id.into(),
+                actor: "operator-A".into(),
+                deal_token: "0226e154".into(),
+                refresh_ack: None,
+            },
+        )
+        .unwrap();
+        assert!(outcome.material_commit.is_none());
+    }
+
+    /// `quantity = 0` is a defensive skip path: a quote with zero units
+    /// has nothing to reserve. We skip rather than 409 — the SO/WO
+    /// placeholder branch still runs, just no material commit.
+    #[test]
+    fn s273_saga_skips_material_commit_when_quantity_is_zero() {
+        let mut conn = open_conn();
+        let quote_id = full_uuid_quote_id();
+        stage_quote(&conn, quote_id);
+        set_material_and_quantity(&conn, quote_id, "6061-T6", 0);
+        let meta = ledger_meta();
+        let outcome = run_deal_saga(
+            &mut conn,
+            &meta,
+            actor(),
+            DealSagaInputs {
+                tenant: "test-tenant".into(),
+                quote_id: quote_id.into(),
+                actor: "operator-A".into(),
+                deal_token: "0226e154".into(),
+                refresh_ack: None,
+            },
+        )
+        .unwrap();
+        assert!(outcome.material_commit.is_none());
+    }
+
+    /// Happy path WITH material commit: row carries `material_grade` +
+    /// `quantity`, balance has enough on_hand → saga commits SO/WO +
+    /// material, emits FOUR audit entries, and `material_commit`
+    /// surfaces the after-state numbers.
+    #[test]
+    fn s273_saga_happy_path_with_material_commit() {
+        let mut conn = open_conn();
+        let quote_id = full_uuid_quote_id();
+        stage_quote(&conn, quote_id);
+        set_material_and_quantity(&conn, quote_id, "6061-T6", 12);
+        seed_balance(&conn, "6061-T6", 100.0);
+        let meta = ledger_meta();
+        let outcome = run_deal_saga(
+            &mut conn,
+            &meta,
+            actor(),
+            DealSagaInputs {
+                tenant: "test-tenant".into(),
+                quote_id: quote_id.into(),
+                actor: "operator-A".into(),
+                deal_token: "0226e154".into(),
+                refresh_ack: None,
+            },
+        )
+        .unwrap();
+        let mc = outcome.material_commit.expect("material commit landed");
+        assert_eq!(mc.material_grade, "6061-T6");
+        assert_eq!(mc.qty, 12.0);
+        assert!(mc.reservation_id.starts_with("res_"));
+        assert_eq!(mc.balance_after.committed_qty, 12.0);
+        assert_eq!(mc.balance_after.available_qty, 88.0);
+
+        // Four kinds, each exactly once.
+        for kind in [
+            "quote.deal_issued",
+            "quote.sales_order_created",
+            "quote.work_order_created",
+            "inventory.material_committed",
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_ledger WHERE kind = ?1",
+                    duckdb::params![kind],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "expected one {kind} entry, got {n}");
+        }
+
+        // The inventory_reservations row landed inside the same tx.
+        let (state, qty): (String, f64) = conn
+            .query_row(
+                "SELECT state, qty FROM inventory_reservations
+                  WHERE quote_id = ?1 AND tenant_id = 'test-tenant'",
+                duckdb::params![quote_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "committed");
+        assert_eq!(qty, 12.0);
+    }
+
+    /// Insufficient material rolls back the WHOLE saga: SO/WO ids do
+    /// not get minted on the row, `deal_issued_at` stays NULL, and zero
+    /// audit entries land. The next operator click sees the row as
+    /// un-dealt and can retry once `on_hand_qty` is fixed.
+    #[test]
+    fn s273_saga_insufficient_material_rolls_back_everything() {
+        let mut conn = open_conn();
+        let quote_id = full_uuid_quote_id();
+        stage_quote(&conn, quote_id);
+        set_material_and_quantity(&conn, quote_id, "Inconel 718", 50);
+        seed_balance(&conn, "Inconel 718", 10.0); // requested 50 > available 10
+        let meta = ledger_meta();
+        let err = run_deal_saga(
+            &mut conn,
+            &meta,
+            actor(),
+            DealSagaInputs {
+                tenant: "test-tenant".into(),
+                quote_id: quote_id.into(),
+                actor: "operator-A".into(),
+                deal_token: "0226e154".into(),
+                refresh_ack: None,
+            },
+        )
+        .unwrap_err();
+        let saga = err.downcast::<DealSagaError>().expect("typed saga error");
+        assert_eq!(saga.machine_code(), "insufficient_material");
+        match saga {
+            DealSagaError::InsufficientMaterial {
+                material_grade,
+                requested,
+                on_hand,
+                ..
+            } => {
+                assert_eq!(material_grade, "Inconel 718");
+                assert_eq!(requested, 50.0);
+                assert_eq!(on_hand, 10.0);
+            }
+            other => panic!("wrong error variant: {other:?}"),
+        }
+
+        // Row stays un-dealt — every saga write was rolled back.
+        let row = quote_log::read_for_deal(&conn, "test-tenant", quote_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.deal_issued_at, None);
+
+        // Zero audit entries.
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_ledger
+                  WHERE kind IN (
+                    'quote.deal_issued','quote.sales_order_created',
+                    'quote.work_order_created','inventory.material_committed'
+                  )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 0);
+
+        // `inventory_balances` was upserted at zeros, then the rollback
+        // erased the upsert — so the row should NOT be present.
+        let bal_n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM inventory_balances
+                  WHERE tenant_id = 'test-tenant' AND material_grade = 'Inconel 718'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Either 0 (rollback wiped the upsert) or 1 with on_hand=10 (we
+        // pre-seeded it). It was pre-seeded, so it must be 1 with the
+        // ORIGINAL on_hand = 10 untouched.
+        assert_eq!(bal_n, 1);
+        let bal = crate::material_inventory::read_balance(&conn, "test-tenant", "Inconel 718")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bal.on_hand_qty, 10.0);
+        assert_eq!(bal.committed_qty, 0.0, "rollback restored committed_qty");
+    }
+
+    /// Insufficient-material error surfaces a distinct machine code
+    /// from the other DEAL failure modes — pinned so the SPA's toast
+    /// router doesn't conflate this with `deal_token_mismatch` or
+    /// `not_actionable`.
+    #[test]
+    fn s273_insufficient_material_machine_code_is_distinct() {
+        let codes = [
+            DealSagaError::NotStaged {
+                tenant: "t".into(),
+                quote_id: "q".into(),
+            }
+            .machine_code(),
+            DealSagaError::NotActionable {
+                quote_id: "q".into(),
+                state: "irrelevant".into(),
+            }
+            .machine_code(),
+            DealSagaError::DealAlreadyIssued {
+                quote_id: "q".into(),
+            }
+            .machine_code(),
+            DealSagaError::StockAlertRefreshRequired {
+                quote_id: "q".into(),
+            }
+            .machine_code(),
+            DealSagaError::DealTokenMismatch {
+                quote_id: "q".into(),
+            }
+            .machine_code(),
+            DealSagaError::InsufficientMaterial {
+                quote_id: "q".into(),
+                material_grade: "6061-T6".into(),
+                requested: 12.0,
+                on_hand: 0.0,
+                already_reserved: 0.0,
+                already_committed: 0.0,
+            }
+            .machine_code(),
+        ];
+        // Every code is unique.
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(
+                    codes[i], codes[j],
+                    "{} collides with {}",
+                    codes[i], codes[j]
+                );
+            }
+        }
+        assert!(codes.contains(&"insufficient_material"));
     }
 }

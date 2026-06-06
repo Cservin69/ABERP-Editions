@@ -33,6 +33,7 @@
     getSellerInfo,
     listAdapters,
     listComplexityRules,
+    listInventoryBalances,
     listLowStockProducts,
     listPartners,
     listQuotingMaterials,
@@ -248,6 +249,15 @@
         const res = await listStockAdjustments();
         const n = res.adjustments.length;
         return n === 1 ? "1 adjustment" : `${n} adjustments`;
+      }
+      case "InventoryBalanceCount": {
+        // S273 / PR-262 / ADR-0069 — count of `(tenant,
+        // material_grade)` balance rows. Zero is expected on a fresh
+        // tenant; the first DEAL auto-upserts a row at zero, then the
+        // operator visits the page to set `on_hand_qty`.
+        const res = await listInventoryBalances();
+        const n = res.balances.length;
+        return n === 1 ? "1 grade" : `${n} grades`;
       }
     }
   }
