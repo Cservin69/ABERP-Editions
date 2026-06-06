@@ -72,6 +72,11 @@ pub mod quote_intake_query;
 // quote_intake_log row. Mints an `invoice_draft` row with
 // `source_quote_id` set + emits `InvoicePickedUpFromQuote`.
 pub mod quote_pickup;
+// S271 / PR-260 — pure `stock_alert` recompute (EVE addendum 2). Used by
+// the SPA Quotes list route to mark accepted quotes whose material has
+// downgraded since acceptance. Sticky: only operator REFRESH (S272+)
+// untriggers an alert.
+pub mod quote_stock_alert;
 pub mod quoting_materials;
 // S267 / PR-256 — four tunable tables feeding the future
 // `aberp-quote-engine`: complexity rules, tolerance multipliers, the

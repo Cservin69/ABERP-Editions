@@ -2989,6 +2989,30 @@ export interface QuoteIntakeRow {
   intake_state: "staged" | "error" | "irrelevant";
   /** S256 / PR-245 — mapping-failure message on an `error` row. */
   intake_error: string | null;
+  // ── S271 / PR-260 — auto-quoting projection columns ────────────────
+  /** Customer email pushed by the storefront's auto-quoting pipeline
+   * (separate repo). NULL on every row until the storefront-side PR
+   * ships its `priced → accepted` writer. */
+  customer_email: string | null;
+  /** Closed-vocab material grade (matches the `quoting_materials.grade`
+   * operator catalogue PK). Drives the local `stock_alert` recompute. */
+  material_grade: string | null;
+  /** Storefront-supplied integer quantity (the typed-column form of the
+   * legacy `quantity` blob field above; the auto-quote engine reads
+   * this one). */
+  quantity_canonical: number | null;
+  /** Total price the storefront engine computed at acceptance, in EUR. */
+  total_price_eur: number | null;
+  /** Quote validity expiry, as ISO `YYYY-MM-DD`. */
+  valid_until: string | null;
+  /** EVE addendum 2 snapshot — the material's `stock_status` at the
+   * moment the quote transitioned `priced → accepted` storefront-side. */
+  stock_status_at_accept: string | null;
+  /** EVE addendum 2 stale-stock guard — TRUE iff the material has
+   * downgraded since `stock_status_at_accept`. Sticky: only the
+   * operator's REFRESH token (S272+) untriggers it. The SPA renders a
+   * loud RED badge + a detail-view banner when TRUE. */
+  stock_alert: boolean;
 }
 
 export async function listQuoteIntake(): Promise<QuoteIntakeRow[]> {

@@ -159,6 +159,31 @@
     // common "yyyy-MM-dd" + "yyyy-MM-ddTHH:mm:ssZ" cases.
     return formatInvoiceDate(ts);
   }
+
+  // S271 / PR-260 — EVE addendum 2 stale-stock guard. The recompute
+  // happens server-side in `list_quote_intake_rows` (sticky downgrade
+  // detection against `quoting_materials`); the SPA renders the loud
+  // RED badge + the page-level banner. Closed-vocab discard: any row
+  // whose `stock_alert` is neither `true` nor `false` (defensive
+  // against API drift) is treated as `false`.
+  let alertedCount = $derived(
+    rows.filter((r) => r.stock_alert === true).length,
+  );
+  let alertedQuoteIds = $derived(
+    rows
+      .filter((r) => r.stock_alert === true)
+      .map((r) => r.quote_id)
+      .slice(0, 5),
+  );
+
+  function formatPriceEur(amount: number | null): string {
+    if (amount === null || !Number.isFinite(amount)) return "—";
+    // EUR with a NBSP between value and unit (per PR-249 PDF posture).
+    return new Intl.NumberFormat("hu-HU", {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 2,
+    }).format(amount) + " €";
+  }
 </script>
 
 <section class="quotes-page" data-testid="quotes-list-section">
@@ -198,6 +223,33 @@
     </div>
   {/if}
 
+  <!-- S271 / PR-260 — EVE addendum 2 stale-stock banner. Loud, top-of-
+       page, RED. Surfaces the sticky `stock_alert` flag the backend
+       recompute pass set when the material's stock_status downgraded
+       since `stock_status_at_accept`. The DEAL gate (typed REFRESH
+       token) lives in S272/PR-261; this PR ships the data half. -->
+  {#if alertedCount > 0}
+    <aside
+      class="quotes-page__stock-alert"
+      role="alert"
+      data-testid="quotes-stock-alert-banner"
+    >
+      <strong class="quotes-page__stock-alert-head">
+        ⚠️ {alertedCount} ajánlatnál megváltozott az anyag készletállapota a kiajánlás óta
+        / {alertedCount} {alertedCount === 1 ? "quote has" : "quotes have"} a changed stock status since acceptance
+      </strong>
+      <p class="quotes-page__stock-alert-body">
+        REFRESH kötelező a DEAL előtt — a frissített token-mező S272-ben érkezik.
+        / REFRESH required before DEAL — typed-token gate ships in S272/PR-261.
+      </p>
+      {#if alertedQuoteIds.length > 0}
+        <p class="quotes-page__stock-alert-ids" data-testid="quotes-stock-alert-ids">
+          {alertedQuoteIds.map((id) => shortQuoteId(id)).join(", ")}{alertedCount > alertedQuoteIds.length ? `, +${alertedCount - alertedQuoteIds.length}…` : ""}
+        </p>
+      {/if}
+    </aside>
+  {/if}
+
   {#if loadState === "loading" && rows.length === 0}
     <p class="quotes-page__muted">Betöltés… / Loading quotes…</p>
   {:else if loadState === "error"}
@@ -228,6 +280,9 @@
           <th scope="col">Vevő / Contact</th>
           <th scope="col">Anyag / Material</th>
           <th scope="col" class="quotes-table__num">Db / Qty</th>
+          <!-- S271 / PR-260 — auto-quote total + EVE-addendum-2 stale-stock chip. -->
+          <th scope="col" class="quotes-table__num">Ár (EUR) / Price</th>
+          <th scope="col">Készlet / Stock</th>
           <th scope="col">Visszajelzés / Writeback</th>
           <th scope="col">Művelet / Action</th>
         </tr>
@@ -239,7 +294,9 @@
             data-testid="quotes-row"
             data-quote-id={row.quote_id}
             data-state={row.intake_state}
+            data-stock-alert={row.stock_alert ? "true" : "false"}
             class:quotes-row--error={row.intake_state === "error"}
+            class:quotes-row--stock-alert={row.stock_alert === true}
           >
             <td>{fmt(row.received_at)}</td>
             <td>{fmt(row.intake_at)}</td>
@@ -259,13 +316,21 @@
               {/if}
               {#if row.contact_email}
                 <div class="quotes-table__contact-email">{row.contact_email}</div>
+              {:else if row.customer_email}
+                <!-- S271: storefront-pushed typed email column. Falls
+                     back when the raw payload didn't carry one. -->
+                <div class="quotes-table__contact-email">{row.customer_email}</div>
               {/if}
-              {#if !row.contact_name && !row.contact_email && !row.contact_company}
+              {#if !row.contact_name && !row.contact_email && !row.customer_email && !row.contact_company}
                 <span class="quotes-table__muted">—</span>
               {/if}
             </td>
             <td>
-              {#if row.material}
+              {#if row.material_grade}
+                <!-- S271: typed closed-vocab grade takes precedence over
+                     the raw-payload `material` blob. -->
+                <div class="quotes-table__material-grade">{row.material_grade}</div>
+              {:else if row.material}
                 <div>{row.material}</div>
               {:else}
                 <span class="quotes-table__muted">—</span>
@@ -278,7 +343,31 @@
                 >{row.notes}</div>
               {/if}
             </td>
-            <td class="quotes-table__num">{row.quantity ?? "—"}</td>
+            <td class="quotes-table__num">{row.quantity_canonical ?? row.quantity ?? "—"}</td>
+            <td class="quotes-table__num">{formatPriceEur(row.total_price_eur)}</td>
+            <td>
+              {#if row.stock_alert === true}
+                <!-- S271 / EVE addendum 2 — loud RED badge. Sticky:
+                     persists across page reloads until operator REFRESH
+                     (S272/PR-261). Title carries the snapshot vs current
+                     so the operator can see WHY without opening detail. -->
+                <span
+                  class="quotes-chip quotes-chip--stock-alert"
+                  data-testid="quotes-row-stock-alert"
+                  title={row.stock_status_at_accept
+                    ? `Acceptált: ${row.stock_status_at_accept}`
+                    : "Stock changed since acceptance"}
+                >⚠ Stock change</span>
+              {:else if row.stock_status_at_accept}
+                <span
+                  class="quotes-chip quotes-chip--stock-ok"
+                  data-testid="quotes-row-stock-ok"
+                  title={`Accepted at ${row.stock_status_at_accept}`}
+                >OK</span>
+              {:else}
+                <span class="quotes-table__muted">—</span>
+              {/if}
+            </td>
             <td>
               <span
                 class="quotes-chip quotes-chip--{wb.tone}"
@@ -652,5 +741,72 @@
   .quotes-row__dismiss:disabled {
     opacity: 0.6;
     cursor: not-allowed;
+  }
+
+  /* S271 / PR-260 — EVE addendum 2 stale-stock surface.
+   *
+   * The data-side half of "the banner is NOT optional" per the brief:
+   * a top-of-page red panel + a per-row red badge + a red left
+   * hairline on every affected row. All `--color-signal-negative`
+   * (the dark-theme RED token from ADR-0017) so the page-level
+   * eyeball-test reads danger immediately.
+   *
+   * The typed REFRESH-token gate lives in S272/PR-261; here we ship the
+   * visual surface so the operator knows the DEAL is gated before they
+   * try to act on the row.
+   */
+  .quotes-page__stock-alert {
+    padding: var(--space-3);
+    border: 1px solid var(--color-signal-negative);
+    border-left: 4px solid var(--color-signal-negative);
+    background: var(--color-surface-sunken);
+    border-radius: 3px;
+    color: var(--color-text-strong);
+  }
+
+  .quotes-page__stock-alert-head {
+    color: var(--color-signal-negative);
+    display: block;
+    font-size: var(--type-size-sm);
+  }
+
+  .quotes-page__stock-alert-body {
+    margin-top: var(--space-1);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-secondary);
+  }
+
+  .quotes-page__stock-alert-ids {
+    margin-top: var(--space-1);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
+  }
+
+  /* Per-row RED hairline for stock_alert=true. Visually mirrors the
+   * `quotes-row--error` warning hairline (S256) but uses
+   * --color-signal-negative instead of --color-signal-warning so
+   * stale-stock is unmistakable from a parser dead-letter. */
+  .quotes-row--stock-alert td:first-child {
+    border-left: 3px solid var(--color-signal-negative);
+  }
+
+  /* Per-row RED badge. Same chip shape as `.quotes-chip--pending`
+   * but with --color-signal-negative as the foreground + border. */
+  .quotes-chip--stock-alert {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
+    font-weight: 600;
+  }
+
+  .quotes-chip--stock-ok {
+    color: var(--color-signal-positive);
+    border-color: var(--color-signal-positive);
+  }
+
+  .quotes-table__material-grade {
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    color: var(--color-text-strong);
   }
 </style>

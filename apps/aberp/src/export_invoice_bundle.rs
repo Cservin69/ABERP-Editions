@@ -780,7 +780,12 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::ComplexityRulesChanged
         | EventKind::ToleranceMultipliersChanged
         | EventKind::ParametersChanged
-        | EventKind::StockAdjustmentsChanged => None,
+        | EventKind::StockAdjustmentsChanged
+        // S271 / PR-260 — EVE addendum 2 stale-stock guard
+        // (`quote.*`). Operator-display recompute outcome carried as a
+        // JSON snapshot; no NAV bytes; never sweeps a per-OUTGOING-
+        // invoice bundle (the `invoice.*` glob excludes `quote.*`).
+        | EventKind::QuoteStockAlertTriggered => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

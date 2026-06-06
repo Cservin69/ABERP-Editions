@@ -30,6 +30,17 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), QuoteIntakeError> {
     // `staged` (every prior row was a successful stage).
     conn.execute_batch(S256_MIGRATION_SQL).map_err(|e| {
         QuoteIntakeError::Storage(format!("apply S256 quote_intake_log migration: {e}"))
+    })?;
+    // S271 / PR-260 — additive auto-quoting projection columns. The
+    // storefront's pipeline (separate SvelteKit repo, abenerp.com) pushes
+    // these per quote as its state machine advances; ABERP-side they are
+    // strictly READ-ONLY (this PR ships the schema + the
+    // `stock_alert` recompute; the storefront PR that POPULATES the
+    // values is tracked separately). All new columns default to NULL
+    // except `stock_alert` (closed-vocab boolean, FALSE by default per
+    // EVE addendum 2's stale-stock-banner spec).
+    conn.execute_batch(S271_MIGRATION_SQL).map_err(|e| {
+        QuoteIntakeError::Storage(format!("apply S271 quote_intake_log migration: {e}"))
     })
 }
 
@@ -78,6 +89,48 @@ ALTER TABLE quote_intake_log
     ADD COLUMN IF NOT EXISTS intake_state VARCHAR DEFAULT 'staged';
 ALTER TABLE quote_intake_log
     ADD COLUMN IF NOT EXISTS intake_error VARCHAR;
+";
+
+/// S271 / PR-260 — auto-quoting projection columns. Populated by the
+/// storefront pipeline (separate repo) when a quote transitions
+/// `priced → accepted`; ABERP-side this PR ships the schema + the
+/// app-layer `stock_alert` recompute. All seven columns are additive +
+/// nullable. NONE carries a SQL `DEFAULT`.
+///
+/// **DuckDB gotcha pinned by S271 testing** (worth a `[[no-sql-specific]]`
+/// memory): `ALTER TABLE ... ADD COLUMN IF NOT EXISTS col TYPE DEFAULT V`
+/// **silently re-applies the DEFAULT V on every replay of the
+/// statement**. The `IF NOT EXISTS` correctly guards the column-add,
+/// but DuckDB then re-applies the default to existing rows, clobbering
+/// any data the app has written since the first migration run. Since
+/// `ensure_schema` is called at the top of EVERY writer in this file,
+/// a DEFAULT-bearing column would be reset to its default on every
+/// `set_*` / `mark_*` call against any other row in the table. We
+/// therefore omit DEFAULTs entirely; `stock_alert` is a nullable
+/// `BOOLEAN` and the app layer coerces NULL → `false` on read
+/// (`coerce_stock_alert` in `quote_stock_alert.rs`). New writes use
+/// the explicit `flip_stock_alert_to_true` setter; INSERTs leave the
+/// column NULL until the first recompute pass writes TRUE.
+///
+/// Trade-off flagged in the PR body: until the storefront PR ships,
+/// every column is NULL on every existing row and the `stock_alert`
+/// recompute is a no-op (no snapshot to compare against). The schema
+/// scaffolding lands first so the storefront PR is purely a producer.
+const S271_MIGRATION_SQL: &str = "
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS customer_email VARCHAR;
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS material_grade VARCHAR;
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS quantity INTEGER;
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS total_price_eur DOUBLE;
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS valid_until DATE;
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS stock_status_at_accept VARCHAR;
+ALTER TABLE quote_intake_log
+    ADD COLUMN IF NOT EXISTS stock_alert BOOLEAN;
 ";
 
 pub fn already_intook(
@@ -236,6 +289,58 @@ pub fn mark_irrelevant(
         )
         .map_err(|e| QuoteIntakeError::Storage(format!("mark-irrelevant update: {e}")))?;
     Ok(n)
+}
+
+/// S271 / PR-260 — persist a `stock_alert = TRUE` flip on a quote row.
+/// Returns `true` iff THIS call performed the transition (the row's
+/// stored value was FALSE or NULL before this call and is TRUE after).
+/// A repeat call on an already-flipped row returns `false` (sticky); a
+/// call against a non-existent row also returns `false`.
+///
+/// The audit-emit caller (the SPA list route in `serve.rs`) uses the
+/// returned bool as its only-once trigger: exactly one
+/// `QuoteStockAlertTriggered` audit entry per row that newly transitions
+/// to TRUE.
+///
+/// Why read-then-write instead of `UPDATE ... WHERE`: DuckDB's UPDATE
+/// rowcount reflects the predicate-matched count without surfacing
+/// whether the SET actually altered the column — a guarded UPDATE on a
+/// no-op row still reports `1`. A separate SELECT pin makes the
+/// transition observable in app code without depending on
+/// rows-affected semantics, per [[no-sql-specific]].
+pub fn flip_stock_alert_to_true(
+    conn: &Connection,
+    tenant_id: &str,
+    quote_id: &str,
+) -> Result<bool, QuoteIntakeError> {
+    ensure_schema(conn)?;
+    let stored: Option<Option<bool>> = conn
+        .query_row(
+            "SELECT stock_alert FROM quote_intake_log
+              WHERE quote_id = ?1 AND tenant_id = ?2",
+            params![quote_id, tenant_id],
+            |r| r.get::<_, Option<bool>>(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            duckdb::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+        .map_err(|e| QuoteIntakeError::Storage(format!("read stock_alert: {e}")))?;
+    let Some(stored) = stored else {
+        return Ok(false); // no matching row → nothing to flip
+    };
+    if stored.unwrap_or(false) {
+        return Ok(false); // sticky
+    }
+    conn.execute(
+        "UPDATE quote_intake_log
+            SET stock_alert = TRUE
+          WHERE quote_id = ?1 AND tenant_id = ?2",
+        params![quote_id, tenant_id],
+    )
+    .map_err(|e| QuoteIntakeError::Storage(format!("flip stock_alert to TRUE: {e}")))?;
+    Ok(true)
 }
 
 /// S256 / PR-245 — the SPA sidebar/tab badge count: un-picked-up quotes
@@ -681,6 +786,116 @@ mod tests {
         assert_eq!(stale, 0, "a stale expected-prior loses the race");
         let row = read_for_pickup(&conn, "t", "q").unwrap().unwrap();
         assert_eq!(row.picked_up_drf_id.as_deref(), Some("drf_NEW"));
+    }
+
+    // ── S271 / PR-260 — auto-quoting projection columns + stock_alert ─
+
+    /// `ensure_schema` runs ALTER ... ADD COLUMN IF NOT EXISTS for each
+    /// of the seven auto-quoting projection columns. A fresh DB MUST
+    /// expose them via `INSERT ... SELECT` round-trip; a re-ensure call
+    /// MUST stay idempotent (no double-add panic).
+    #[test]
+    fn s271_projection_columns_present_after_ensure_schema() {
+        let conn = open_mem();
+        ensure_schema(&conn).unwrap();
+        // Insert a row that uses every new column, including the
+        // NOT-NULL stock_alert (taking the DEFAULT FALSE on the schema).
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), "{}", "{}").unwrap();
+        conn.execute(
+            "UPDATE quote_intake_log
+                SET customer_email = ?1,
+                    material_grade = ?2,
+                    quantity = ?3,
+                    total_price_eur = ?4,
+                    valid_until = DATE '2026-09-01',
+                    stock_status_at_accept = ?5
+              WHERE quote_id = ?6 AND tenant_id = ?7",
+            params![
+                "buyer@test",
+                "6061-T6",
+                7i64,
+                12345.67_f64,
+                "in_stock",
+                "q1",
+                "t"
+            ],
+        )
+        .unwrap();
+        // Confirm round-trip via SELECT. `stock_alert` carries no SQL
+        // DEFAULT (per the DuckDB gotcha pinned above), so a fresh
+        // INSERT that doesn't touch the column leaves it NULL.
+        let (email, grade, qty, price, snap, alert): (
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<f64>,
+            Option<String>,
+            Option<bool>,
+        ) = conn
+            .query_row(
+                "SELECT customer_email, material_grade, quantity, total_price_eur,
+                        stock_status_at_accept, stock_alert
+                   FROM quote_intake_log
+                  WHERE quote_id = 'q1' AND tenant_id = 't'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(email.as_deref(), Some("buyer@test"));
+        assert_eq!(grade.as_deref(), Some("6061-T6"));
+        assert_eq!(qty, Some(7));
+        assert_eq!(price, Some(12345.67));
+        assert_eq!(snap.as_deref(), Some("in_stock"));
+        assert_eq!(alert, None, "stock_alert is NULL on a fresh INSERT");
+        // Re-ensure must not panic / double-add.
+        ensure_schema(&conn).unwrap();
+        ensure_schema(&conn).unwrap();
+    }
+
+    /// `flip_stock_alert_to_true` returns `true` on the first transition
+    /// and `false` on every subsequent call — sticky.
+    ///
+    /// CRITICAL: this also pins the DuckDB DEFAULT-on-replay clobber
+    /// trap. An earlier version of this PR added the column with
+    /// `DEFAULT FALSE`; every `ensure_schema` replay (each writer
+    /// re-runs it at the top per [[no-sql-specific]]'s
+    /// migration-idempotency posture) then reset the column to FALSE,
+    /// wiping any prior sticky TRUE write. Solution: omit the SQL
+    /// DEFAULT entirely; treat NULL as FALSE in the app layer. This
+    /// test catches a future re-introduction of the DEFAULT — the
+    /// repeated `flip` call would re-fire as `true` instead of
+    /// reporting the no-op.
+    #[test]
+    fn s271_flip_stock_alert_is_idempotent_and_sticky() {
+        let conn = open_mem();
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), "{}", "{}").unwrap();
+        // First flip: stored is FALSE → returns true (the transition).
+        assert!(flip_stock_alert_to_true(&conn, "t", "q1").unwrap());
+        // Second flip: stored is TRUE → returns false (sticky).
+        assert!(!flip_stock_alert_to_true(&conn, "t", "q1").unwrap());
+        // Quote-id mismatch: no row → returns false.
+        assert!(!flip_stock_alert_to_true(&conn, "t", "q-other").unwrap());
+        // Tenant mismatch: no row for this (tenant, quote_id) → false.
+        assert!(!flip_stock_alert_to_true(&conn, "t-wrong", "q1").unwrap());
+        // The stored value remains TRUE after the no-op flips.
+        let alert: bool = conn
+            .query_row(
+                "SELECT stock_alert FROM quote_intake_log
+                  WHERE quote_id = 'q1' AND tenant_id = 't'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(alert, "stock_alert remains TRUE after the no-op flips");
     }
 
     #[test]

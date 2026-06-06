@@ -902,7 +902,14 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::ComplexityRulesChanged
         | EventKind::ToleranceMultipliersChanged
         | EventKind::ParametersChanged
-        | EventKind::StockAdjustmentsChanged => (None, ""),
+        | EventKind::StockAdjustmentsChanged
+        // S271 / PR-260 — EVE addendum 2 stale-stock guard
+        // (`quote.*`). Carries the quote_id + the snapshot/current
+        // stock_status strings the SPA list route observed; no NAV
+        // XML bytes. Same posture as the S266/S267 kinds above —
+        // operator-display recompute outcome, never sweeps a per-
+        // OUTGOING-invoice bundle.
+        | EventKind::QuoteStockAlertTriggered => (None, ""),
     };
 
     Ok(NavExtraction {

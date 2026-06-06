@@ -1283,6 +1283,36 @@ pub enum EventKind {
     /// Payload: `serde_json::Value` (aberp binary `serve`).
     /// F12 four-edit ritual fires once.
     StockAdjustmentsChanged,
+
+    /// S271 / PR-260 — EVE addendum 2 stale-stock guard. The SPA Quotes
+    /// list route's recompute pass detected that the material on an
+    /// accepted quote has DOWNGRADED stock_status since the quote's
+    /// `stock_status_at_accept` snapshot, and the row's persisted
+    /// `stock_alert` column transitioned `FALSE → TRUE` in this call.
+    /// One entry per transition; sticky — only the operator's REFRESH
+    /// token (S272+/PR-261) untriggers the column AND emits a separate
+    /// (not-yet-defined) acknowledgement event later.
+    ///
+    /// Carries the `quote_id`, the `material_grade` PK, the
+    /// closed-vocab `snapshot_status` (the value of
+    /// `quote_intake_log.stock_status_at_accept` at the moment of
+    /// acceptance), and the closed-vocab `current_status` (the live
+    /// `quoting_materials.stock_status` for the grade at the moment of
+    /// detection). A future operator looking at the audit trail can
+    /// reconstruct the WHY of an alert without re-deriving from
+    /// catalogue history.
+    ///
+    /// `quote.*` prefix family alongside the S266/S267 catalogue +
+    /// tunables kinds; not invoice-scoped, never carries NAV bytes,
+    /// never sweeps a per-OUTGOING-invoice bundle. The audit emit
+    /// fires from the SPA list route (`handle_list_quote_intake` in
+    /// `apps/aberp/src/serve.rs`), which makes the alert recoverable
+    /// from the ledger even if the SPA is closed before the operator
+    /// sees the banner.
+    ///
+    /// Payload: `serde_json::Value` (aberp binary `serve`).
+    /// F12 four-edit ritual fires once.
+    QuoteStockAlertTriggered,
 }
 
 impl EventKind {
@@ -1356,6 +1386,7 @@ impl EventKind {
             EventKind::ToleranceMultipliersChanged => "quote.tolerance_multipliers_changed",
             EventKind::ParametersChanged => "quote.parameters_changed",
             EventKind::StockAdjustmentsChanged => "quote.stock_adjustments_changed",
+            EventKind::QuoteStockAlertTriggered => "quote.stock_alert_triggered",
         }
     }
 
@@ -1440,6 +1471,7 @@ impl EventKind {
             "quote.tolerance_multipliers_changed" => Ok(EventKind::ToleranceMultipliersChanged),
             "quote.parameters_changed" => Ok(EventKind::ParametersChanged),
             "quote.stock_adjustments_changed" => Ok(EventKind::StockAdjustmentsChanged),
+            "quote.stock_alert_triggered" => Ok(EventKind::QuoteStockAlertTriggered),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1516,6 +1548,7 @@ mod tests {
             EventKind::ToleranceMultipliersChanged,
             EventKind::ParametersChanged,
             EventKind::StockAdjustmentsChanged,
+            EventKind::QuoteStockAlertTriggered,
         ];
         for v in variants {
             let s = v.as_str();
@@ -2826,6 +2859,50 @@ mod tests {
         for k in new {
             assert_ne!(k, EventKind::MaterialCatalogueChanged.as_str());
             assert_ne!(k, EventKind::MaterialCataloguePushed.as_str());
+        }
+    }
+
+    /// S271 / PR-260 — `QuoteStockAlertTriggered` extends the `quote.*`
+    /// prefix family the S266/S267 kinds opened (EVE addendum 2 stale-
+    /// stock guard, design doc Appendix A). It is NOT invoice-scoped, so
+    /// the on-disk string MUST carry `quote.` and NOT `invoice.` /
+    /// `system.` / `mes.` — same loud-fail rationale as the S266 + S267
+    /// pins above (a misprefix would either silently sweep the entry
+    /// into a per-OUTGOING-invoice bundle or split the
+    /// auto-quoting-strand history across two prefixes).
+    #[test]
+    fn s271_stock_alert_kind_uses_quote_prefix() {
+        let k = EventKind::QuoteStockAlertTriggered;
+        assert_eq!(k.as_str(), "quote.stock_alert_triggered");
+        let s = k.as_str();
+        assert!(s.starts_with("quote."), "{s} must start with quote.");
+        assert!(
+            !s.starts_with("invoice."),
+            "{s} must not start with invoice."
+        );
+        assert!(!s.starts_with("system."), "{s} must not start with system.");
+        assert!(!s.starts_with("mes."), "{s} must not start with mes.");
+    }
+
+    /// S271 / PR-260 — `QuoteStockAlertTriggered` must be distinct from
+    /// every other auto-quoting-strand `quote.*` kind (S266 catalogue
+    /// + S267 tunables). A collision would mis-route an EVE-addendum-2
+    /// stale-stock event into a catalogue-CRUD bucket on parse.
+    #[test]
+    fn s271_stock_alert_kind_is_distinct_from_other_quote_kinds() {
+        let alert = EventKind::QuoteStockAlertTriggered.as_str();
+        for neighbour in [
+            EventKind::MaterialCatalogueChanged.as_str(),
+            EventKind::MaterialCataloguePushed.as_str(),
+            EventKind::ComplexityRulesChanged.as_str(),
+            EventKind::ToleranceMultipliersChanged.as_str(),
+            EventKind::ParametersChanged.as_str(),
+            EventKind::StockAdjustmentsChanged.as_str(),
+        ] {
+            assert_ne!(
+                alert, neighbour,
+                "{alert} must be distinct from quote.* neighbour {neighbour}"
+            );
         }
     }
 }

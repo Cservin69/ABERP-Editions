@@ -15608,18 +15608,66 @@ async fn handle_test_quote_intake_connection(
 }
 
 async fn handle_list_quote_intake(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    if let Err(resp) = require_ready(&state) {
-        return resp;
-    }
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
+    // S271 / PR-260 — the list route runs the EVE-addendum-2 stock_alert
+    // recompute pass per row + emits one `QuoteStockAlertTriggered`
+    // audit entry per row whose `stock_alert` transitioned FALSE → TRUE
+    // this call. The binary hash + tenant + operator login feed the
+    // ledger entry's actor + meta.
+    let binary_hash = match state.binary_hash.wait() {
+        Ok(h) => h,
+        Err(e) => return internal_error("handle_list_quote_intake:binary_hash", anyhow!(e)),
+    };
     let db_path = (*state.db_path).clone();
-    let tenant = state.tenant.as_str().to_string();
+    let tenant_id_string = state.tenant.as_str().to_string();
+    let tenant_for_ledger = state.tenant.clone();
     let rows = match tokio::task::spawn_blocking(move || -> Result<_> {
         let conn = duckdb::Connection::open(&db_path)
             .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
-        quote_intake_query_mod::list_quote_intake_rows(&conn, &tenant)
+        let listing = quote_intake_query_mod::list_quote_intake_rows(&conn, &tenant_id_string)?;
+        // Emit one audit entry per newly-triggered alert. The recompute
+        // pass already persisted the `stock_alert = TRUE` flip in the
+        // same conn, so the audit emit is the operator-visible record
+        // that the transition happened and WHY. Re-running this route
+        // does NOT re-emit (sticky persistence + the `flip_*` writer's
+        // `Ok(false)` return on no-ops).
+        if !listing.newly_triggered_alerts.is_empty() {
+            aberp_audit_ledger::ensure_schema(&conn)
+                .context("ensure audit ledger schema for stock_alert emit")?;
+            let mut ledger =
+                aberp_audit_ledger::Ledger::open(&db_path, tenant_for_ledger, binary_hash)
+                    .context("open audit ledger for QuoteStockAlertTriggered")?;
+            for alert in &listing.newly_triggered_alerts {
+                let payload = serde_json::json!({
+                    "quote_id": alert.quote_id,
+                    "material_grade": alert.material_grade,
+                    "snapshot_status": alert.snapshot_status,
+                    "current_status": alert.current_status,
+                    "idempotency_key": ulid::Ulid::new().to_string(),
+                });
+                let bytes = serde_json::to_vec(&payload)
+                    .context("serialize QuoteStockAlertTriggered payload")?;
+                let actor = aberp_audit_ledger::Actor::from_local_cli(
+                    ulid::Ulid::new().to_string(),
+                    &operator_login,
+                );
+                ledger
+                    .append(
+                        aberp_audit_ledger::EventKind::QuoteStockAlertTriggered,
+                        bytes,
+                        actor,
+                        None,
+                    )
+                    .context("append QuoteStockAlertTriggered audit entry")?;
+            }
+        }
+        Ok(listing.rows)
     })
     .await
     {
