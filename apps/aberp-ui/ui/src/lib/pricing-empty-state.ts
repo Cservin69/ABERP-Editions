@@ -16,19 +16,30 @@ export type EmptyStateKind =
   | "rows"
   /** rows.length === 0, daemon active, no pending submissions. GREEN. */
   | "active"
+  /** S286 / PR-268 — rows.length === 0, resolver returned `not_resolved`,
+   *  AND a `.venv.disabled-*` sibling exists (operator manually disabled
+   *  the daemon, e.g. Ervin's `mv .venv .venv.disabled-pending-hotfix`).
+   *  Distinct from `venv_missing` so the operator sees their own
+   *  mitigation surfaced — not a confusing "venv missing" hint. AMBER
+   *  (informational; the operator MEANT for the daemon to be dormant). */
+  | "venv_disabled_by_operator"
   /** rows.length === 0, resolver returned `not_resolved`. RED. */
   | "venv_missing"
   /** rows.length === 0, resolver succeeded but `daemon_spawned === false`
    *  (boot-block construction error). AMBER. */
   | "spawn_errored";
 
-/** Pure four-branch classifier. The Svelte template renders off this. */
+/** Pure five-branch classifier. The Svelte template renders off this. */
 export function classifyEmptyState(
   rowCount: number,
   status: PipelinePythonStatus | null,
 ): EmptyStateKind {
   if (rowCount > 0) return "rows";
-  if (status?.resolution_kind === "not_resolved") return "venv_missing";
+  if (status?.resolution_kind === "not_resolved") {
+    // S286 / PR-268 — distinguish operator-disabled from missing-install.
+    if (status.operator_disabled_path) return "venv_disabled_by_operator";
+    return "venv_missing";
+  }
   if (status && !status.daemon_spawned) return "spawn_errored";
   return "active";
 }

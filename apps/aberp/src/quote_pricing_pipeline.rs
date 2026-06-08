@@ -1707,6 +1707,16 @@ pub struct PipelinePythonStatus {
     /// `NotResolved`. Lets the SPA distinguish "venv missing" (red)
     /// from "venv resolved but spawn errored" (amber).
     pub daemon_spawned: bool,
+    /// **S286 / PR-268**: when the operator manually moved the canonical
+    /// venv to a `.disabled-*`-suffixed sibling to stop the daemon (e.g.
+    /// Ervin's `mv .venv .venv.disabled-pending-hotfix` after the
+    /// PROD_v2.27.2 crash), the resolver detects the sibling and reports
+    /// its absolute path here. The SPA renders a distinct copy
+    /// ("disabled by operator pending hotfix") instead of the generic
+    /// "venv missing" RED card — so the operator knows the dormant
+    /// state is THEIR doing, not a missing install. `None` when no such
+    /// sibling exists.
+    pub operator_disabled_path: Option<String>,
 }
 
 /// Shared dormant handle. Mirrors [`crate::catalogue_push::CataloguePushHandle`]
@@ -1749,6 +1759,32 @@ pub fn canonical_venv_python(aberp_root: &Path) -> PathBuf {
         .join(".venv")
         .join("bin")
         .join("python")
+}
+
+/// **S286 / PR-268** — detect an operator-disabled venv sibling.
+///
+/// Ervin's manual mitigation for the PROD_v2.27.2 crash was
+/// `mv .venv .venv.disabled-pending-hotfix`. The resolver still
+/// classifies this as `NotResolved` (the canonical path doesn't exist).
+/// Without a distinct signal, the SPA RED card says "venv missing" which
+/// is misleading — the operator KNOWS the venv was disabled by them.
+///
+/// This helper scans the canonical venv's parent dir for a sibling whose
+/// name starts with `.venv.disabled` and returns its absolute path. It
+/// runs ONCE per daemon boot (boundary-level discovery, like
+/// `resolve_pipeline_python`), so the disk-scan cost is irrelevant.
+/// Returns `None` if no sibling matches or the parent dir is unreadable.
+pub fn detect_operator_disabled_venv(aberp_root: &Path) -> Option<PathBuf> {
+    let parent = aberp_root.join("python").join("aberp-cad-extract");
+    let entries = std::fs::read_dir(&parent).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(".venv.disabled") && entry.path().is_dir() {
+            return Some(entry.path());
+        }
+    }
+    None
 }
 
 /// Alt-layout (project-root venv). Tried after the canonical path.
@@ -1847,11 +1883,14 @@ pub fn resolve_pipeline_python(aberp_root: &Path) -> PythonResolution {
 }
 
 /// Render a `PipelinePythonStatus` snapshot from a `PythonResolution`
-/// + the daemon's intended cadence. `daemon_spawned` is left false here;
-/// serve.rs flips it true on a successful `tokio::spawn`.
+/// + the daemon's intended cadence + the operator-disabled-venv sibling
+/// (`None` if not detected; see [`detect_operator_disabled_venv`]).
+/// `daemon_spawned` is left false here; serve.rs flips it true on a
+/// successful `tokio::spawn`.
 pub fn status_from_resolution(
     resolution: &PythonResolution,
     poll_cadence_secs: Option<u64>,
+    operator_disabled_path: Option<PathBuf>,
 ) -> PipelinePythonStatus {
     let (resolved_path, canonical_path) = match resolution {
         PythonResolution::EnvOverride { path }
@@ -1867,6 +1906,15 @@ pub fn status_from_resolution(
     // env_override is trusted-but-unverified; the other three resolved
     // arms had their module-importable check confirmed in the resolver.
     let module_importable = !matches!(resolution, PythonResolution::NotResolved { .. });
+    // S286 / PR-268 — only carry the disabled-sibling hint when the
+    // resolver said `NotResolved`. A resolved daemon shouldn't surface a
+    // "operator disabled" hint even if a stale `.venv.disabled-*` exists
+    // alongside; the resolver already picked the working one.
+    let operator_disabled_path = if matches!(resolution, PythonResolution::NotResolved { .. }) {
+        operator_disabled_path.map(|p| p.to_string_lossy().into_owned())
+    } else {
+        None
+    };
     PipelinePythonStatus {
         resolution_kind: resolution.as_kind_str().to_string(),
         resolved_path,
@@ -1877,6 +1925,7 @@ pub fn status_from_resolution(
             .then_some(poll_cadence_secs)
             .flatten(),
         daemon_spawned: false,
+        operator_disabled_path,
     }
 }
 
@@ -2128,7 +2177,7 @@ mod tests {
         let r = PythonResolution::ProjectVenv {
             path: PathBuf::from("/a/b/python"),
         };
-        let s = status_from_resolution(&r, Some(60));
+        let s = status_from_resolution(&r, Some(60), None);
         assert_eq!(s.resolution_kind, "project_venv");
         assert_eq!(s.resolved_path.as_deref(), Some("/a/b/python"));
         assert_eq!(s.canonical_path, None);
@@ -2148,7 +2197,7 @@ mod tests {
         let r = PythonResolution::EnvOverride {
             path: PathBuf::from("/explicit/python"),
         };
-        let s = status_from_resolution(&r, Some(60));
+        let s = status_from_resolution(&r, Some(60), None);
         assert_eq!(s.resolution_kind, "env_override");
         assert!(s.module_importable);
     }
@@ -2158,7 +2207,7 @@ mod tests {
         let r = PythonResolution::NotResolved {
             canonical_path: PathBuf::from("/missing/canonical"),
         };
-        let s = status_from_resolution(&r, Some(60));
+        let s = status_from_resolution(&r, Some(60), None);
         assert_eq!(s.resolution_kind, "not_resolved");
         assert_eq!(s.resolved_path, None);
         assert_eq!(s.canonical_path.as_deref(), Some("/missing/canonical"));
@@ -2181,8 +2230,9 @@ mod tests {
         let r = PythonResolution::SystemPython {
             path: PathBuf::from("/usr/local/bin/python3"),
         };
-        let mut s = status_from_resolution(&r, Some(60));
+        let mut s = status_from_resolution(&r, Some(60), None);
         s.daemon_spawned = true;
+        assert_eq!(s.operator_disabled_path, None);
         h.record(s.clone());
         let out = h.snapshot();
         assert_eq!(out.resolution_kind, "system_python");
@@ -2253,6 +2303,66 @@ mod tests {
         // through into the ledger.
         let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("oops\r\nfake\0bytes"));
         assert_eq!(panic_payload_to_string(payload), "oopsfakebytes");
+    }
+
+    /// S286 / PR-268 — operator-disabled venv detection. When the
+    /// operator manually moves the canonical venv aside (Ervin's
+    /// `mv .venv .venv.disabled-pending-hotfix` after PROD_v2.27.2), the
+    /// resolver still returns `NotResolved` (the canonical path is
+    /// missing) but the disabled-sibling is detected so the SPA can
+    /// render a distinct "disabled by operator" hint.
+    #[test]
+    fn detect_operator_disabled_venv_finds_renamed_sibling() {
+        let mut root = std::env::temp_dir();
+        root.push(format!("aberp-s286-disabled-{}", Ulid::new()));
+        let cad_dir = root.join("python").join("aberp-cad-extract");
+        std::fs::create_dir_all(&cad_dir).expect("mkdir cad_dir");
+        let disabled = cad_dir.join(".venv.disabled-pending-hotfix");
+        std::fs::create_dir(&disabled).expect("create disabled sibling");
+        // Detect should find the renamed sibling.
+        let found = detect_operator_disabled_venv(&root);
+        assert_eq!(found, Some(disabled));
+        // No disabled sibling → returns None.
+        std::fs::remove_dir_all(root.join("python")).expect("clean");
+        let cad_dir = root.join("python").join("aberp-cad-extract");
+        std::fs::create_dir_all(&cad_dir).expect("re-mkdir");
+        assert_eq!(detect_operator_disabled_venv(&root), None);
+        // Different `.disabled-*` suffix is also caught (the hotfix uses
+        // a specific suffix but the detector accepts any).
+        let other = cad_dir.join(".venv.disabled-by-operator");
+        std::fs::create_dir(&other).expect("create alt sibling");
+        assert_eq!(detect_operator_disabled_venv(&root), Some(other));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// S286 / PR-268 — only a `NotResolved` outcome carries the
+    /// `operator_disabled_path` hint. A resolved daemon shouldn't surface
+    /// the disabled sibling even if it exists (the resolver picked the
+    /// working venv; the renamed one is irrelevant).
+    #[test]
+    fn status_from_resolution_clears_operator_disabled_for_resolved_outcomes() {
+        let r = PythonResolution::ProjectVenv {
+            path: PathBuf::from("/working/python"),
+        };
+        let s = status_from_resolution(
+            &r,
+            Some(60),
+            Some(PathBuf::from("/stale/.venv.disabled-something")),
+        );
+        assert_eq!(s.operator_disabled_path, None);
+        // NotResolved carries it through.
+        let nr = PythonResolution::NotResolved {
+            canonical_path: PathBuf::from("/missing"),
+        };
+        let s = status_from_resolution(
+            &nr,
+            Some(60),
+            Some(PathBuf::from("/disabled/.venv.disabled-pending-hotfix")),
+        );
+        assert_eq!(
+            s.operator_disabled_path.as_deref(),
+            Some("/disabled/.venv.disabled-pending-hotfix")
+        );
     }
 
     /// Round-trip the daemon-panic audit into a stdlib-tmp DuckDB. Pins

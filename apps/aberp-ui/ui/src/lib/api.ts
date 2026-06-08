@@ -3183,6 +3183,15 @@ export interface PipelinePythonStatus {
   /** RFC-3339 wall-clock of the most recent daemon-panic audit row, or
    * `null` when no panics have fired in the window. */
   last_panic_at: string | null;
+  /** S286 / PR-268 — when the operator manually moved the canonical venv
+   * to a `.venv.disabled-*`-suffixed sibling (e.g. Ervin's
+   * `mv .venv .venv.disabled-pending-hotfix` after the PROD_v2.27.2
+   * crash), this carries the absolute path of that sibling so the SPA
+   * can render a distinct "disabled by operator" hint instead of the
+   * generic "venv missing" RED card. `null` when no such sibling exists.
+   * Set ONLY on `resolution_kind === "not_resolved"`; resolved daemons
+   * see `null` even if a stale `.venv.disabled-*` is alongside. */
+  operator_disabled_path: string | null;
 }
 
 /** S282 / PR-267 — fetch the pricing-pipeline daemon status. */

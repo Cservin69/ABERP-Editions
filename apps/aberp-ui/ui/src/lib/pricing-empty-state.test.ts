@@ -12,6 +12,7 @@ function resolved(daemonSpawned: boolean): PipelinePythonStatus {
     daemon_spawned: daemonSpawned,
     recent_panic_count: 0,
     last_panic_at: null,
+    operator_disabled_path: null,
   };
 }
 
@@ -25,6 +26,15 @@ function notResolved(): PipelinePythonStatus {
     daemon_spawned: false,
     recent_panic_count: 0,
     last_panic_at: null,
+    operator_disabled_path: null,
+  };
+}
+
+function notResolvedOperatorDisabled(): PipelinePythonStatus {
+  return {
+    ...notResolved(),
+    operator_disabled_path:
+      "/repo/python/aberp-cad-extract/.venv.disabled-pending-hotfix",
   };
 }
 
@@ -65,5 +75,42 @@ describe("classifyEmptyState — S282 / PR-267 empty-state forks", () => {
       daemon_spawned: true,
     };
     expect(classifyEmptyState(0, oddly)).toBe("venv_missing");
+  });
+
+  // ── S286 / PR-268 — operator-disabled venv hint ─────────────────────
+
+  it("operator_disabled_path + not_resolved → 'venv_disabled_by_operator'", () => {
+    // Ervin's `mv .venv .venv.disabled-pending-hotfix` scenario after
+    // the PROD_v2.27.2 crash. The SPA shows AMBER copy referencing the
+    // sibling, not the generic "venv missing" RED card.
+    expect(classifyEmptyState(0, notResolvedOperatorDisabled())).toBe(
+      "venv_disabled_by_operator",
+    );
+  });
+
+  it("operator_disabled_path is ignored when resolution_kind is resolved", () => {
+    // A resolved daemon with a stale `.venv.disabled-*` sibling should
+    // still classify as 'active' — the working venv won. The backend
+    // helper `status_from_resolution` already clears
+    // `operator_disabled_path` for resolved arms; this pin guards
+    // against a future refactor that drops that clear-step.
+    const stale: PipelinePythonStatus = {
+      ...resolved(true),
+      operator_disabled_path: "/stale/.venv.disabled-something",
+    };
+    expect(classifyEmptyState(0, stale)).toBe("active");
+  });
+
+  it("operator_disabled wins over spawn_errored when both somehow apply", () => {
+    // Defence-in-depth: not_resolved + daemon_spawned=true shouldn't
+    // happen, but if it does AND operator_disabled_path is set, the
+    // operator-disabled copy wins (it's more specific and reflects the
+    // operator's actual action). Mirrors the venv_missing precedence
+    // pin above.
+    const oddly: PipelinePythonStatus = {
+      ...notResolvedOperatorDisabled(),
+      daemon_spawned: true,
+    };
+    expect(classifyEmptyState(0, oddly)).toBe("venv_disabled_by_operator");
   });
 });

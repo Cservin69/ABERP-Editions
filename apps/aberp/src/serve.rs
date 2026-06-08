@@ -1480,10 +1480,18 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
                     let resolution =
                         crate::quote_pricing_pipeline::resolve_pipeline_python(&aberp_root);
+                    // S286 / PR-268 — detect operator-disabled venv
+                    // siblings (Ervin's `.venv.disabled-pending-hotfix`
+                    // mitigation after PROD_v2.27.2). Feeds the SPA hint
+                    // so a manually-disabled daemon shows distinct copy
+                    // from a missing-install RED card.
+                    let operator_disabled =
+                        crate::quote_pricing_pipeline::detect_operator_disabled_venv(&aberp_root);
                     const PIPELINE_POLL_SECS: u64 = 60;
                     let mut status = crate::quote_pricing_pipeline::status_from_resolution(
                         &resolution,
                         Some(PIPELINE_POLL_SECS),
+                        operator_disabled,
                     );
                     // Audit emit ONCE per daemon spawn — the durable
                     // `[[trust-code-not-operator]]` guarantee. Best-effort:

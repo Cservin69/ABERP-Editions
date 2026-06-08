@@ -164,11 +164,28 @@ CREATE TABLE IF NOT EXISTS quote_pricing_jobs (
     error_reason          VARCHAR,
     attempt_n             INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS quote_pricing_jobs_tenant_state_idx
-    ON quote_pricing_jobs (tenant_id, state);
+-- S286 / PR-268 — explicitly drop the (tenant_id, state) secondary
+-- index that S279 ship-cut introduced. The PROD_v2.27.2 crash stack
+-- (`RowGroupCollection::RemoveFromIndexes` inside
+-- `UndoBuffer::RevertCommit` after a PK \"duplicate key\" inside the
+-- INSERT-side of UPDATE's MVCC-lowering) matches a known class of
+-- DuckDB issue: UPDATE on a column that participates in a SECONDARY
+-- index, on a table that also has a PRIMARY KEY, can fire spurious PK
+-- constraint violations during commit. Since `state` IS part of the
+-- index AND is what every daemon `set_state` UPDATE touches, the
+-- index is the most likely trigger. Dropping it is purely subtractive:
+-- `next_actionable_job` falls back to a full-tenant scan on a sub-1k-
+-- row table, which costs microseconds in v1. The index can be added
+-- back via a future ADR if the row population ever justifies it.
+DROP INDEX IF EXISTS quote_pricing_jobs_tenant_state_idx;
 ";
 
 /// Idempotent — call at every writer entry.
+///
+/// **S286 / PR-268 caveat**: existing prod DBs from PROD_v2.27.[012]
+/// carry the orphan `quote_pricing_jobs_tenant_state_idx` index. The
+/// embedded `DROP INDEX IF EXISTS` in `SCHEMA_SQL` cleans it up on the
+/// first call after upgrade — the daemon's startup is the first call.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_SQL)
         .with_context(|| "ensure quote_pricing_jobs schema")
@@ -1021,6 +1038,123 @@ mod tests {
         // The first failure's reason must NOT be overwritten by the second.
         let rows = list_jobs(&conn, "T").expect("list");
         assert_eq!(rows[0].error_reason.as_deref(), Some("boom"));
+    }
+
+    /// S286 / PR-268 — forensic regression. Reproduces the exact PROD_v2.27.2
+    /// crash sequence Ervin captured at 2026-06-08T13:28:38.984Z:
+    ///
+    ///   * Row `c1cf32ed-72b6-4708-8abb-6359d27f042b` enqueued at `Fetched`
+    ///     (storefront submission with `material_preference: "unknown"`).
+    ///   * Daemon iteration picks the row up via `next_actionable_job`.
+    ///   * `set_state(Extracting)` is called → DuckDB UPDATE → C++ FATAL
+    ///     inside the INSERT-side of UPDATE's MVCC-lowering →
+    ///     `libc++abi: terminating`.
+    ///
+    /// With PR-268's two-pronged fix (SELECT-first guard + secondary-index
+    /// drop), this transition completes cleanly. The test is dual-purpose:
+    /// it pins the API contract (`Applied` outcome on a real state change)
+    /// AND names the specific prod ULID + the data-shape quirks that may
+    /// have contributed (the `material_grade = "unknown"` storefront data-
+    /// quality miss).
+    ///
+    /// **Test cannot reproduce the C++ FATAL on a fresh local DB** — the
+    /// DuckDB bug requires accumulated index state from prior abnormal
+    /// terminations to fire. This test pins the LOGIC + the schema change;
+    /// confidence on prod comes from the index drop being purely
+    /// subtractive.
+    #[test]
+    fn s286_regression_prod_row_c1cf32ed_fetched_to_extracting() {
+        let conn = open_mem();
+        let prod_quote_id = "c1cf32ed-72b6-4708-8abb-6359d27f042b";
+        let prod_tenant = "T"; // single-tenant prod (per ADR-0002)
+                               // Insert mirrors the storefront submission shape Ervin captured:
+                               // ervin@aben.ch, material="unknown", qty=1.
+        let inserted = insert_fetched_job(
+            &conn,
+            prod_quote_id,
+            prod_tenant,
+            "ervin@aben.ch",
+            "ervin csenger",
+            "unknown",
+            1,
+            "submission.stl",
+            "/var/aberp/quote-artifacts/c1cf32ed-.../submission.stl",
+            fixed_ts(),
+        )
+        .expect("enqueue at Fetched");
+        assert!(inserted);
+        // Verify pre-condition: row landed at Fetched (1st daemon call).
+        let rows = list_jobs(&conn, prod_tenant).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, JobState::Fetched);
+        // The crashing call: 2nd daemon iteration's `advance_extract` → set_state(Extracting).
+        // SELECT-first sees state=Fetched != Extracting → runs UPDATE.
+        // With the secondary index dropped, this no longer FATALs.
+        let outcome = set_state(
+            &conn,
+            prod_quote_id,
+            prod_tenant,
+            JobState::Extracting,
+            fixed_ts(),
+        )
+        .expect("Fetched→Extracting transition");
+        assert_eq!(
+            outcome,
+            TransitionOutcome::Applied,
+            "PROD_v2.27.2 crashing transition must now Apply, not FATAL"
+        );
+        let rows = list_jobs(&conn, prod_tenant).expect("list after");
+        assert_eq!(rows[0].state, JobState::Extracting);
+    }
+
+    /// S286 / PR-268 — schema migration pin: the secondary index drop is
+    /// idempotent. Calling `ensure_schema` on a DB that already has the
+    /// index dropped, AND on a fresh DB, must both succeed without error.
+    #[test]
+    fn s286_secondary_index_drop_is_idempotent() {
+        let conn = open_mem();
+        // Fresh DB — first ensure_schema runs DROP INDEX IF EXISTS (no-op
+        // since the index was never created in this code revision).
+        ensure_schema(&conn).expect("first ensure");
+        ensure_schema(&conn).expect("second ensure");
+        ensure_schema(&conn).expect("third ensure");
+    }
+
+    /// S286 / PR-268 — even on a DB that PRE-EXISTING-LY carries the
+    /// (tenant_id, state) secondary index from PROD_v2.27.[012], the
+    /// `ensure_schema` migration drops it cleanly. Manually re-create the
+    /// index to simulate that prod state, then re-run ensure_schema, then
+    /// confirm the index is gone.
+    #[test]
+    fn s286_secondary_index_drop_migrates_from_prior_schema() {
+        let conn = open_mem();
+        // Simulate the pre-PR-268 schema: create the index by hand.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS quote_pricing_jobs_tenant_state_idx
+                ON quote_pricing_jobs (tenant_id, state);",
+        )
+        .expect("pre-PR-268 index create");
+        // Re-running ensure_schema must DROP it.
+        ensure_schema(&conn).expect("post-migration ensure");
+        // Confirm the index is absent via DuckDB's information_schema-
+        // equivalent. The catalog name varies across DuckDB versions, but
+        // `pragma_show('quote_pricing_jobs')` returns column metadata
+        // (not index info). Instead, attempt to re-CREATE the index with
+        // a contradictory column set — if the original index were still
+        // there, this would error out; if it's gone, the second CREATE
+        // succeeds. (Pragmatic — DuckDB does not expose a portable
+        // `SHOW INDEXES` we can rely on across versions.)
+        let res = conn.execute_batch(
+            "CREATE INDEX quote_pricing_jobs_tenant_state_idx
+                ON quote_pricing_jobs (state);",
+        );
+        // Either the index was dropped (this CREATE succeeds) or DuckDB
+        // returns the pre-existing-index error. The first is the
+        // happy path; the second would mean our DROP didn't take.
+        assert!(
+            res.is_ok(),
+            "secondary index should be dropped before this CREATE; got {res:?}"
+        );
     }
 
     /// Boot-time count helper used by `serve.rs` to log the existing-row

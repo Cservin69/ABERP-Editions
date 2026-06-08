@@ -153,6 +153,25 @@
     <p class="pricing-jobs__hint">Betöltés… / Loading…</p>
   {:else if loadState === "error"}
     <p class="pricing-jobs__err">{errorMessage ?? "Hiba / Error"}</p>
+  {:else if classifyEmptyState(rows.length, pipelineStatus) === "venv_disabled_by_operator"}
+    <!-- S286 / PR-268 — AMBER card: venv manually moved aside by the
+         operator (e.g. Ervin's `mv .venv .venv.disabled-pending-hotfix`
+         mitigation after the PROD_v2.27.2 crash). Distinct from
+         "venv missing" so the operator sees their own action surfaced. -->
+    <div class="pricing-jobs__warn" data-testid="pricing-jobs-empty-operator-disabled">
+      <p>
+        <strong>Daemon dormant — venv was renamed by operator /
+          Daemon szünetel — a venv-et az üzemeltető átnevezte.</strong>
+      </p>
+      <p>
+        Renamed to / Átnevezve:
+        <code>{pipelineStatus?.operator_disabled_path ?? "?"}</code>
+      </p>
+      <p>
+        Rename back to <code>.venv</code> when the hotfix is in place. /
+        Nevezd vissza <code>.venv</code>-re, ha a javítás megérkezett.
+      </p>
+    </div>
   {:else if classifyEmptyState(rows.length, pipelineStatus) === "venv_missing"}
     <!-- S282 / PR-267 — RED card: venv not provisioned. Operator-actionable. -->
     <div class="pricing-jobs__err" data-testid="pricing-jobs-empty-not-resolved">
