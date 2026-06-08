@@ -119,6 +119,30 @@ The bearer token is NOT in the discovery file — the file points at
 the keychain entry by name. The storefront launcher reads the keychain
 directly so the plaintext never lands on disk.
 
+## Supported CAD formats
+
+As of PR-273 (S292) the auto-quote pipeline accepts both `.stl` and
+`.step`/`.stp` files end-to-end:
+
+| Format    | Backend                                  | Notes                                          |
+|-----------|------------------------------------------|------------------------------------------------|
+| `.stl`    | `numpy-stl` (always installed)           | Triangle-soup; volume via signed-tetrahedra    |
+| `.step`   | `cadquery-ocp` (optional `[step]` extra) | OCCT BREP; volume via `VolumeProperties_s`     |
+| `.stp`    | same as `.step`                          | Same loader, alternate extension               |
+
+The `[step]` extra is installed by `run/dev-test.sh` (and the
+production installer). If the daemon is run in an environment without
+cadquery-ocp the STEP path surfaces "STEP extraction not yet
+implemented in this build" — the Rust-side FailureKind classifier
+maps this to `Permanent` and the operator gets a clear SPA badge
+asking them to run `pip install -e '.[step]'` in the
+`python/aberp-cad-extract/.venv` before retry.
+
+Multi-solid STEP files (assemblies) are rejected with a clear
+"STEP file contains an assembly with N solids" error — same Permanent
+verdict. Customers must trim assemblies to a single part at upload
+time. IGES files remain unsupported.
+
 ## Non-goals
 
 - **Cloudflare Tunnel**: out of scope here — that's a separate runbook

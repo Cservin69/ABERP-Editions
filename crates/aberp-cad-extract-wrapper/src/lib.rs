@@ -38,9 +38,9 @@
 //! - **Portability.** No Python ABI lock; a Python minor-version
 //!   upgrade on the operator's machine does not force a rebuild of
 //!   the Rust workspace.
-//! - **Process isolation.** OCCT crashes (which S270+ will introduce
-//!   when STEP support lands) do not take down the ABERP daemon. The
-//!   wrapper surfaces a [`ExtractError::NonZeroExit`] and the daemon
+//! - **Process isolation.** OCCT crashes (PR-273 wired STEP support
+//!   through cadquery-ocp) do not take down the ABERP daemon. The
+//!   wrapper surfaces an [`ExtractError::NonZeroExit`] and the daemon
 //!   moves on.
 //! - **Latency budget.** Spawn cost is ~50–100 ms; the operator-
 //!   click-to-quote flow targets 1–2 seconds, so the cold-start tax
@@ -245,10 +245,12 @@ impl CadExtractor {
 #[derive(Debug, Clone)]
 pub struct ExtractRequest {
     /// Absolute or working-dir-relative path to the input CAD file.
-    /// `.stl` is the only supported extension in v1; `.step`/`.stp`
-    /// are stubbed by the Python side and surface as
-    /// [`ExtractError::NonZeroExit`] with `"STEP"` in the stderr until
-    /// S270+ wires OCCT.
+    /// Both `.stl` and `.step`/`.stp` are supported as of PR-273. STEP
+    /// requires the Python `[step]` extra (cadquery-ocp); when that
+    /// extra is absent the Python extractor exits with a "not yet
+    /// implemented in this build" message that surfaces as
+    /// [`ExtractError::NonZeroExit`] and classifies Permanent on the
+    /// daemon side.
     pub input_path: PathBuf,
     /// Material grade as it appears in `quoting_materials.grade` —
     /// e.g. `6061-T6`.
@@ -295,10 +297,11 @@ pub enum ExtractError {
     Timeout(Duration),
 
     /// The subprocess exited non-zero for a reason that is not module-
-    /// not-found — a Python-side `ValueError` for an unknown
-    /// extension, a `NotImplementedError` for the STEP-stub path, or
-    /// any future runtime crash. `stderr` carries the Python-side
-    /// structured error JSON the CLI writes per `cli.py`.
+    /// not-found — a Python-side `ValueError` for an unknown extension
+    /// or a malformed STEP file, a `NotImplementedError` for the
+    /// "OCP not installed in this build" path, or any future runtime
+    /// crash. `stderr` carries the Python-side structured error JSON
+    /// the CLI writes per `cli.py`.
     #[error("subprocess exited with code {code:?}: {stderr}")]
     NonZeroExit {
         /// Exit code, or `None` if the child was killed by signal.

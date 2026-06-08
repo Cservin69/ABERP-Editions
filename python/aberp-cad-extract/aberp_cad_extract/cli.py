@@ -1,12 +1,13 @@
 """Command-line entry point.
 
-Usage: ``python -m aberp_cad_extract <input.stl> --material-grade <grade>``
+Usage:
+    ``python -m aberp_cad_extract <input.stl|input.step> --material-grade <grade>``
 
 Stdout: FeatureGraph JSON on success. Stderr: structured error JSON
 on failure. Exit 0 success, 2 user-input error, 1 internal error.
-The Rust subprocess wrapper (S270) parses both stdout JSON and
-stderr error-JSON; matching the contract here means the wrapper can
-ship without re-tuning.
+The Rust subprocess wrapper parses both stdout JSON and stderr
+error-JSON; matching the contract here means the wrapper can ship
+without re-tuning.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ def _route(path: Path, material_grade: str):
     if suffix in (".step", ".stp"):
         return extract_step(path, material_grade)
     raise ValueError(
-        f"Unsupported file extension '{suffix}'. v1 supports: .stl"
+        f"Unsupported file extension '{suffix}'. Supported: .stl, .step, .stp"
     )
 
 

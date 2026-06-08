@@ -1282,10 +1282,13 @@ fn backoff_duration(idx: usize, cadence: Duration) -> Duration {
 ///
 /// Rules (in evaluation order):
 ///
-/// - **stage="extract"** + reason contains `"not yet implemented"` →
-///   `Permanent`. The STEP-extractor stub (S269) returns this verbatim
-///   for any non-STL submission; nothing the daemon can do without an
-///   OCCT lift (S270+).
+/// - reason contains `"not yet implemented"` → `Permanent`. PR-273
+///   wired the OCCT-backed STEP extractor, but the Python `[step]`
+///   extra is opt-in: in an environment without cadquery-ocp the
+///   extractor still raises NotImplementedError. Operator must run
+///   `pip install -e '.[step]'` in the aberp-cad-extract venv before
+///   retry. Retains the prior c1cf32-forensic classification for the
+///   historical S269 stub message verbatim (same substring).
 /// - reason contains `"is not in the catalogue"` →
 ///   `Permanent`. Matches [`aberp_quote_engine::QuoteError::
 ///   MaterialNotInCatalogue`]'s `Display`. Operator must add the grade
@@ -1306,6 +1309,12 @@ fn backoff_duration(idx: usize, cadence: Duration) -> Duration {
 ///   `"CAD file not found"` → `Permanent`. Storefront data-quality miss
 ///   (S289 caught one variant; the storefront persistence still has
 ///   gaps in the corner-case path).
+/// - **stage="extract"** + reason contains `"step file"` → `Permanent`.
+///   PR-273 added the OCCT-backed STEP extractor; v1 only handles
+///   single-part STEP so multi-solid assemblies and unreadable STEP
+///   files both surface with "STEP file ..." in the message. Operator
+///   must trim the assembly to a single part (or re-export) — retry
+///   without that change won't help.
 /// - **stage="post"** + reason contains `"HTTP 401"` OR `"HTTP 403"` →
 ///   `Permanent`. Auth — operator must rotate the storefront token via
 ///   Settings → Storefront credentials.
@@ -1342,6 +1351,13 @@ pub fn classify_failure(stage: &str, reason: &str) -> FailureKind {
         return FailureKind::Permanent;
     }
     if stage == "extract" && r.contains("input cad file not found") {
+        return FailureKind::Permanent;
+    }
+    // PR-273 — STEP extractor surfaces shape/parse errors with "STEP
+    // file ..." in the message (assembly with N solids, no solid
+    // body, could not be parsed). All are data-quality issues the
+    // operator must fix at upload time; auto-retry is wasted cycles.
+    if stage == "extract" && r.contains("step file") {
         return FailureKind::Permanent;
     }
     // POST-back classification — split on HTTP status family + transport
@@ -2626,6 +2642,70 @@ mod tests {
     fn s290_classify_material_not_in_catalogue_is_permanent() {
         let reason = "material grade `unknown` is not in the catalogue snapshot";
         assert_eq!(classify_failure("price", reason), FailureKind::Permanent);
+    }
+
+    // ── PR-273 — STEP extractor data-quality rules ────────────────────
+
+    /// PR-273: STEP extractor rejects assemblies with the exact
+    /// `Display` shape `ExtractError::NonZeroExit` produces around the
+    /// Python-side ValueError. The "step file" substring must trip the
+    /// new classifier rule → Permanent.
+    #[test]
+    fn pr273_classify_step_assembly_rejection_is_permanent() {
+        let reason = "subprocess exited with code Some(2): \
+            ValueError: STEP file contains an assembly with 3 solids; \
+            only single-part STEP is supported in v1";
+        assert_eq!(
+            classify_failure("extract", reason),
+            FailureKind::Permanent,
+            "STEP assembly rejection must classify Permanent — operator must \
+             trim the file before retry"
+        );
+    }
+
+    /// PR-273: STEP file with no transferable solid body (rare but
+    /// reachable when a customer uploads a STEP file that only contains
+    /// surfaces / sheets / wireframes).
+    #[test]
+    fn pr273_classify_step_no_solid_body_is_permanent() {
+        let reason = "subprocess exited with code Some(2): \
+            ValueError: STEP file contains no solid body; only solid-part \
+            STEP is supported in v1";
+        assert_eq!(classify_failure("extract", reason), FailureKind::Permanent);
+    }
+
+    /// PR-273: malformed STEP file that OCCT cannot parse.
+    #[test]
+    fn pr273_classify_step_parse_failure_is_permanent() {
+        let reason = "subprocess exited with code Some(2): \
+            ValueError: STEP file could not be parsed (OCCT ReadFile status=3)";
+        assert_eq!(classify_failure("extract", reason), FailureKind::Permanent);
+    }
+
+    /// PR-273: case-insensitive — `STEP` and `step` both match. The
+    /// classifier lowercases the reason before matching, so the
+    /// uppercase `STEP file` we emit from Python lands on the lowercase
+    /// substring rule.
+    #[test]
+    fn pr273_classify_step_rule_is_case_insensitive() {
+        let upper = "ValueError: STEP file contains an assembly with 2 solids";
+        let lower = "valueerror: step file contains an assembly with 2 solids";
+        assert_eq!(classify_failure("extract", upper), FailureKind::Permanent);
+        assert_eq!(classify_failure("extract", lower), FailureKind::Permanent);
+    }
+
+    /// PR-273: the "step file" rule is scoped to the extract stage.
+    /// Other stages defaulting to Unknown on the same substring is the
+    /// honest verdict — a "step file" mention at the post stage would
+    /// be surprising and we don't want to misclassify based on it.
+    #[test]
+    fn pr273_classify_step_rule_is_extract_stage_only() {
+        let reason = "ValueError: STEP file contains an assembly with 2 solids";
+        // extract → Permanent
+        assert_eq!(classify_failure("extract", reason), FailureKind::Permanent);
+        // other stages → Unknown
+        assert_eq!(classify_failure("price", reason), FailureKind::Unknown);
+        assert_eq!(classify_failure("render", reason), FailureKind::Unknown);
     }
 
     #[test]

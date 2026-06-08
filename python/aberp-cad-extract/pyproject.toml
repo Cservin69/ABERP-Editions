@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aberp-cad-extract"
-version = "0.0.0"
-description = "S269 / PR-258 — Python CAD extractor skeleton. STEP/STL → FeatureGraph JSON for crates/aberp-quote-engine (S268). STL-only v1; STEP stubbed for the OCCT-backed S270 line."
+version = "0.1.0"
+description = "Python CAD extractor — STEP/STL → FeatureGraph JSON for crates/aberp-quote-engine. v0.1 (S292/PR-273) adds OCCT-backed STEP via cadquery-ocp; STL kept on numpy-stl."
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 authors = [{ name = "Áben Consulting KFT." }]
@@ -16,6 +16,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Optional. The OCP wheel is ~63 MB; we don't force it on every dev
+# environment. Production installs (and CI) MUST install with
+# `pip install -e '.[step]'` so STEP submissions extract cleanly
+# instead of falling through to the NotImplementedError stub path.
+# vtk is a runtime dylib dependency of OCP (libvtkWrappingPythonCore);
+# cadquery-ocp-proxy is the import-shim companion the wheel requires.
+step = [
+    "cadquery-ocp>=7.9,<8.0",
+    "cadquery-ocp-proxy>=7.9,<8.0",
+    "vtk>=9.0,<10.0",
+]
 dev = [
     "pytest>=8.0,<9.0",
 ]

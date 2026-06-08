@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from aberp_cad_extract.extractors.stl import extract_stl
-from aberp_cad_extract.extractors.step import extract_step
 from aberp_cad_extract.feature_graph import FeatureGraph
 
 
@@ -56,8 +55,3 @@ def test_canonical_dict_uses_wire_field_names(cube_stl_path: Path):
     assert isinstance(out["thin_wall_present"], bool)
 
 
-def test_step_extractor_raises_not_implemented(tmp_path: Path):
-    fake = tmp_path / "part.step"
-    fake.write_bytes(b"")
-    with pytest.raises(NotImplementedError, match="STEP"):
-        extract_step(fake, material_grade="6061-T6")
