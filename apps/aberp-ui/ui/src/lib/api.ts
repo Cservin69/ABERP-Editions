@@ -3144,6 +3144,43 @@ export async function retryQuotePricingJob(
   return invoke("retry_quote_pricing_job", { quoteId });
 }
 
+/** S282 / PR-267 — pricing-pipeline daemon status. Read-only mirror of
+ * the boot-time Python-venv resolution outcome. Drives the SPA empty-
+ * state copy on `PricingJobsList` so an operator never wonders why the
+ * pipeline appears silent — the SPA tells them either:
+ *   - the daemon is active and polling every Ns; or
+ *   - the venv isn't present (RED card with provisioning hint); or
+ *   - the venv resolved but daemon spawn errored (AMBER card). */
+export interface PipelinePythonStatus {
+  /** Closed vocab: `env_override | project_venv | alt_venv |
+   * system_python | not_resolved`. Empty string on the default-handle
+   * snapshot before boot recorded a value (shouldn't happen in
+   * practice — boot writes BEFORE the SPA serves a request). */
+  resolution_kind: string;
+  /** Absolute path of the resolved interpreter, or `null` when
+   * `resolution_kind === "not_resolved"`. */
+  resolved_path: string | null;
+  /** Did the resolver re-check `python -c "import aberp_cad_extract"`?
+   * Always `true` for the three auto-discovery arms; trusted-but-
+   * unverified for `env_override`; `false` for `not_resolved`. */
+  module_importable: boolean;
+  /** On `not_resolved`, the canonical path the operator should aim
+   * for — verbatim into the RED card so they can copy/paste it. */
+  canonical_path: string | null;
+  /** On a resolved spawn, the daemon's configured poll cadence in
+   * seconds. `null` on `not_resolved`. */
+  poll_cadence_secs: number | null;
+  /** Did `tokio::spawn` actually fire? Lets the SPA distinguish
+   * RED (`resolved=false → daemon_spawned=false`) from AMBER
+   * (`resolved=true → daemon_spawned=false`, e.g. construction error). */
+  daemon_spawned: boolean;
+}
+
+/** S282 / PR-267 — fetch the pricing-pipeline daemon status. */
+export async function fetchQuotePipelineStatus(): Promise<PipelinePythonStatus> {
+  return invoke("quote_pipeline_status");
+}
+
 /** S281 / PR-266 — one row of the email-relay queue (ADR-0007). Read-only
  * operator inspector projection — the drain daemon is the only writer. */
 export interface EmailRelayQueueRow {

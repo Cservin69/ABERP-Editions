@@ -822,7 +822,12 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // OUTGOING-invoice bundle by glob.
         | EventKind::EmailRelayQueued
         | EventKind::EmailRelaySent
-        | EventKind::EmailRelayFailed => None,
+        | EventKind::EmailRelayFailed
+        // S282 / PR-267 — pipeline-python-resolve kind (`quote.*`).
+        // Pricing-daemon spawn telemetry; carries resolution_kind +
+        // resolved_path + module_importable, never NAV XML bytes.
+        // Never sweeps a per-OUTGOING-invoice export bundle.
+        | EventKind::PipelinePythonResolved => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

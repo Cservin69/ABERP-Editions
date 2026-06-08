@@ -395,6 +395,10 @@ pub fn run() {
             // it has done.
             commands::list_quote_pricing_jobs,
             commands::retry_quote_pricing_job,
+            // S282 / PR-267 — pricing-pipeline daemon status. Drives
+            // the empty-state copy on `PricingJobsList` (active vs
+            // RED venv-missing vs AMBER spawn-errored).
+            commands::quote_pipeline_status,
             // S272 / PR-261 — DEAL saga (ADR-0067). Single-tx mint of
             // SO/WO placeholder ids + 3 audit entries; replay-protected
             // CAS; EVE addendum 2 (REFRESH ack) + addendum 3 (BIG/RED

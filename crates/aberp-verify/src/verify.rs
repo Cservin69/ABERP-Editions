@@ -948,7 +948,12 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // this arm exists for exhaustiveness only.
         | EventKind::EmailRelayQueued
         | EventKind::EmailRelaySent
-        | EventKind::EmailRelayFailed => (None, ""),
+        | EventKind::EmailRelayFailed
+        // S282 / PR-267 — pipeline-python-resolve kind (`quote.*`).
+        // Daemon-spawn telemetry; payload carries resolution_kind /
+        // resolved_path / module_importable, never NAV XML bytes.
+        // Never sweeps a per-OUTGOING-invoice bundle.
+        | EventKind::PipelinePythonResolved => (None, ""),
     };
 
     Ok(NavExtraction {

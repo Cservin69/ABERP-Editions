@@ -1600,6 +1600,29 @@ pub enum EventKind {
     ///
     /// `email.*` prefix family.
     EmailRelayFailed,
+
+    /// S282 / PR-267 — pricing-pipeline daemon resolved (or failed to
+    /// resolve) its Python interpreter at spawn time. Emitted ONCE per
+    /// daemon spawn — the audit-trail "code can never silently be wrong
+    /// about the venv" guarantee per [[trust-code-not-operator]]. A
+    /// forensic walker can answer "did this install ever come up with a
+    /// working pipeline, and which fallback layer did it land on?"
+    /// without combing through logs.
+    ///
+    /// Carries `resolution_kind` (closed-vocab string — `"env_override"
+    /// | "project_venv" | "alt_venv" | "system_python" | "not_resolved"`,
+    /// matching the [`PythonResolution`] enum), `resolved_path` (the
+    /// absolute path the daemon will exec, or `null` on `not_resolved`),
+    /// and `module_importable` (true iff `python -c "import
+    /// aberp_cad_extract"` exited 0 at resolve time).
+    ///
+    /// `quote.*` prefix family (same family as the other pricing-
+    /// pipeline kinds — keeps a forensic query for "everything the
+    /// pricing daemon did on this install" inside a single prefix).
+    ///
+    /// Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    PipelinePythonResolved,
 }
 
 impl EventKind {
@@ -1690,6 +1713,7 @@ impl EventKind {
             EventKind::EmailRelayQueued => "email.relay_queued",
             EventKind::EmailRelaySent => "email.relay_sent",
             EventKind::EmailRelayFailed => "email.relay_failed",
+            EventKind::PipelinePythonResolved => "quote.pipeline_python_resolved",
         }
     }
 
@@ -1791,6 +1815,7 @@ impl EventKind {
             "email.relay_queued" => Ok(EventKind::EmailRelayQueued),
             "email.relay_sent" => Ok(EventKind::EmailRelaySent),
             "email.relay_failed" => Ok(EventKind::EmailRelayFailed),
+            "quote.pipeline_python_resolved" => Ok(EventKind::PipelinePythonResolved),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1884,6 +1909,7 @@ mod tests {
             EventKind::EmailRelayQueued,
             EventKind::EmailRelaySent,
             EventKind::EmailRelayFailed,
+            EventKind::PipelinePythonResolved,
         ];
         for v in variants {
             let s = v.as_str();
@@ -3432,6 +3458,54 @@ mod tests {
         }
         for k in new {
             assert_ne!(k, EventKind::InvoiceEmailedSent.as_str());
+        }
+    }
+
+    /// S282 / PR-267 — the new pipeline-python-resolve kind lives in the
+    /// `quote.*` family alongside its S279 pricing siblings (one prefix
+    /// per forensic query "everything the pricing daemon did"). Single-
+    /// dot shape, not the brief's `quote.pipeline.*` two-dot shape;
+    /// matches the codebase convention.
+    #[test]
+    fn s282_pipeline_python_resolved_uses_quote_prefix() {
+        let s = EventKind::PipelinePythonResolved.as_str();
+        assert_eq!(s, "quote.pipeline_python_resolved");
+        assert!(s.starts_with("quote."), "{s} must start with quote.");
+        assert!(
+            !s.starts_with("invoice."),
+            "{s} must not start with invoice."
+        );
+        assert!(!s.starts_with("system."), "{s} must not start with system.");
+        assert!(!s.starts_with("mes."), "{s} must not start with mes.");
+        assert!(
+            !s.starts_with("inventory."),
+            "{s} must not start with inventory."
+        );
+        assert!(!s.starts_with("email."), "{s} must not start with email.");
+    }
+
+    /// S282 / PR-267 — pipeline-python-resolve is distinct from every
+    /// S279 pricing sibling. A collision would mis-route a venv-resolve
+    /// row into one of the per-job state buckets (`Fetched`/`Extracted`/
+    /// `Failed` etc.) on parse — silently muting the audit-trail
+    /// `[[trust-code-not-operator]]` guarantee the kind was added for.
+    #[test]
+    fn s282_pipeline_python_resolved_is_distinct() {
+        let s = EventKind::PipelinePythonResolved.as_str();
+        for sibling in [
+            EventKind::QuotePricingFetched,
+            EventKind::QuotePricingExtracted,
+            EventKind::QuotePricingPriced,
+            EventKind::QuotePricingRendered,
+            EventKind::QuotePricingPosted,
+            EventKind::QuotePricingFailed,
+        ] {
+            assert_ne!(
+                s,
+                sibling.as_str(),
+                "{s} collides with {}",
+                sibling.as_str()
+            );
         }
     }
 }

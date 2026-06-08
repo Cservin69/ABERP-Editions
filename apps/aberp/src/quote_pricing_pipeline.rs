@@ -37,8 +37,9 @@
 //! it up. Single-responsibility per daemon — easier to reason about
 //! cadences, audit emit, and shutdown semantics.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -1314,6 +1315,346 @@ struct QuotePricingFailedPayload {
     idempotency_key: String,
 }
 
+// ── S282 / PR-267 — Python venv auto-discovery ────────────────────────
+//
+// The S279 cut shipped opt-in via the `ABERP_QUOTE_PIPELINE_PYTHON` env
+// var. That violates [[trust-code-not-operator]] — an operator who
+// hasn't memorised the env-var name has a silently-dormant daemon with
+// no SPA signal of why. PR-267 inverts the default: code discovers the
+// venv. The env var stays as an explicit override for devs/CI/debugging,
+// but no operator ever needs to type it on a fresh install.
+//
+// The resolver runs ONCE per daemon spawn (at serve.rs boot). Its
+// outcome lands in three places:
+// 1. `PipelinePythonResolution` returned to the spawn site (which builds
+//    `PricingPipelineConfig.python_bin` from `.resolved_path()`).
+// 2. A `quote.pipeline_python_resolved` audit row written ONCE per spawn,
+//    so a forensic walker can answer "what venv did this install
+//    actually use?" without combing through stderr.
+// 3. The shared `Arc<PythonResolutionHandle>` in `AppState`, which the
+//    SPA `PricingJobsList` reads via the new
+//    `GET /api/quote-pipeline/status` route to differentiate the
+//    empty-state copy (dormant / active / errored).
+
+/// Outcome of the layered Python-venv discovery. Closed-vocab — the
+/// `as_kind_str` rendering is the audit-row storage form and is part
+/// of the on-disk contract.
+#[derive(Debug, Clone)]
+pub enum PythonResolution {
+    /// `ABERP_QUOTE_PIPELINE_PYTHON` env var set AND points at an existing
+    /// file. Module-importable was NOT re-checked (env-var overrides are
+    /// "the operator knows what they're doing"); a broken explicit
+    /// override surfaces as a runtime extract failure, not at boot.
+    EnvOverride { path: PathBuf },
+    /// `<aberp_root>/python/aberp-cad-extract/.venv/bin/python` exists
+    /// AND `aberp_cad_extract` is importable from it. The canonical
+    /// post-`upgrade_prod.sh` layout.
+    ProjectVenv { path: PathBuf },
+    /// `<aberp_root>/.venv/bin/python` exists AND `aberp_cad_extract` is
+    /// importable from it. Honors the "project-root venv" layout some
+    /// devs prefer for IDE wiring.
+    AltVenv { path: PathBuf },
+    /// `python3` is on the system PATH AND has `aberp_cad_extract` in
+    /// site-packages (e.g. pipx/global install). `path` is the absolute
+    /// path resolved via `sys.executable`; never the literal `python3`.
+    SystemPython { path: PathBuf },
+    /// None of the four layers matched. `canonical_path` is the path
+    /// the provisioning step in `upgrade_prod.sh` would create; the SPA
+    /// surfaces it verbatim alongside the "run upgrade_prod.sh" hint
+    /// so the operator can copy/paste.
+    NotResolved { canonical_path: PathBuf },
+}
+
+impl PythonResolution {
+    /// Closed-vocab storage string for the audit payload. Distinct from
+    /// the human-readable `Display` impl — the audit form is the on-disk
+    /// contract and must NOT drift (round-trip pinned in tests).
+    pub fn as_kind_str(&self) -> &'static str {
+        match self {
+            PythonResolution::EnvOverride { .. } => "env_override",
+            PythonResolution::ProjectVenv { .. } => "project_venv",
+            PythonResolution::AltVenv { .. } => "alt_venv",
+            PythonResolution::SystemPython { .. } => "system_python",
+            PythonResolution::NotResolved { .. } => "not_resolved",
+        }
+    }
+
+    /// The python binary the daemon should exec, or `None` on
+    /// `NotResolved` (caller MUST NOT spawn the daemon).
+    pub fn resolved_path(&self) -> Option<&Path> {
+        match self {
+            PythonResolution::EnvOverride { path }
+            | PythonResolution::ProjectVenv { path }
+            | PythonResolution::AltVenv { path }
+            | PythonResolution::SystemPython { path } => Some(path),
+            PythonResolution::NotResolved { .. } => None,
+        }
+    }
+
+    /// True iff the daemon should spawn. The serve.rs boot block keys
+    /// on this; on false, the SPA empty-state shows the RED card.
+    pub fn is_resolved(&self) -> bool {
+        self.resolved_path().is_some()
+    }
+}
+
+/// Per-resolution metadata for the SPA + audit payload. Held in the
+/// shared `PythonResolutionHandle`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PipelinePythonStatus {
+    /// Closed-vocab — matches [`PythonResolution::as_kind_str`].
+    pub resolution_kind: String,
+    /// Absolute path of the resolved interpreter, or `None` on
+    /// `NotResolved`.
+    pub resolved_path: Option<String>,
+    /// Did `python -c "import aberp_cad_extract"` exit 0? Always true
+    /// for the three auto-discovery variants (we re-check during
+    /// resolution); meaningful-but-unverified for `env_override`
+    /// (operator-asserted); false for `not_resolved`.
+    pub module_importable: bool,
+    /// On `NotResolved`, the canonical path the operator should aim
+    /// for. Verbatim into the SPA RED card so they can copy/paste.
+    pub canonical_path: Option<String>,
+    /// On a resolved spawn, the daemon's configured poll cadence in
+    /// seconds (60 in v1). The SPA folds it into the empty-state
+    /// "polling every Ns" copy. `None` on `NotResolved`.
+    pub poll_cadence_secs: Option<u64>,
+    /// Did the daemon actually start? Set true after `tokio::spawn`
+    /// in serve.rs; stays false when the resolver returned
+    /// `NotResolved`. Lets the SPA distinguish "venv missing" (red)
+    /// from "venv resolved but spawn errored" (amber).
+    pub daemon_spawned: bool,
+}
+
+/// Shared dormant handle. Mirrors [`crate::catalogue_push::CataloguePushHandle`]
+/// — created at AppState construction with `dormant()`, written once at
+/// daemon-spawn time by serve.rs, read by the new
+/// `GET /api/quote-pipeline/status` route.
+#[derive(Debug, Default)]
+pub struct PythonResolutionHandle {
+    status: Mutex<PipelinePythonStatus>,
+}
+
+impl PythonResolutionHandle {
+    pub fn dormant() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Record the resolver outcome. Called ONCE per `aberp serve` boot.
+    /// Subsequent calls are not expected; if one fires (e.g. a hot-
+    /// reload that doesn't exist today), it overwrites — the latest
+    /// is the truth.
+    pub fn record(&self, status: PipelinePythonStatus) {
+        if let Ok(mut s) = self.status.lock() {
+            *s = status;
+        }
+    }
+
+    /// Read for the SPA status route.
+    pub fn snapshot(&self) -> PipelinePythonStatus {
+        self.status.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+/// Canonical post-provisioning venv layout. Centralized so the resolver
+/// (runtime) and the `upgrade_prod.sh` provisioner (build-time) stay in
+/// lock-step.
+pub fn canonical_venv_python(aberp_root: &Path) -> PathBuf {
+    aberp_root
+        .join("python")
+        .join("aberp-cad-extract")
+        .join(".venv")
+        .join("bin")
+        .join("python")
+}
+
+/// Alt-layout (project-root venv). Tried after the canonical path.
+fn alt_venv_python(aberp_root: &Path) -> PathBuf {
+    aberp_root.join(".venv").join("bin").join("python")
+}
+
+/// Probe whether a python binary has `aberp_cad_extract` importable.
+/// Costs one `python -c "import aberp_cad_extract"` subprocess (~50-100ms).
+/// Runs at boot only — never on a hot path. Stderr is suppressed so a
+/// missing-module ImportError doesn't leak into the operator's stderr.
+pub fn check_module_importable(python: &Path) -> bool {
+    Command::new(python)
+        .args(["-c", "import aberp_cad_extract"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Ask `python3` (resolved via PATH) what its absolute path is. Used
+/// only for the `SystemPython` arm so the audit row records the actual
+/// interpreter, not the literal string `"python3"`. Returns `None` if
+/// `python3` isn't on PATH or the probe errored.
+fn system_python_absolute_path() -> Option<PathBuf> {
+    let out = Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+/// Layered fallback that picks the python binary the daemon should
+/// exec. Order:
+///
+/// 1. `ABERP_QUOTE_PIPELINE_PYTHON` env var (explicit override —
+///    devs/CI/debugging). Module-importable is NOT re-checked; the
+///    override is trusted.
+/// 2. `<aberp_root>/python/aberp-cad-extract/.venv/bin/python` — the
+///    canonical post-`upgrade_prod.sh` layout. Module-importable is
+///    re-checked.
+/// 3. `<aberp_root>/.venv/bin/python` — alt project-root layout.
+///    Re-checked.
+/// 4. System `python3` IFF `aberp_cad_extract` is importable from it
+///    (pipx / global install). Re-checked.
+/// 5. `NotResolved` — caller must NOT spawn; SPA shows RED.
+///
+/// Boundary-level discovery — runs ONCE per `aberp serve` boot. The
+/// resolved path is then stable for the lifetime of the process. No
+/// retry, no hot-reload.
+pub fn resolve_pipeline_python(aberp_root: &Path) -> PythonResolution {
+    // 1. Env-var override
+    if let Ok(s) = std::env::var("ABERP_QUOTE_PIPELINE_PYTHON") {
+        let p = PathBuf::from(&s);
+        if p.is_file() {
+            return PythonResolution::EnvOverride { path: p };
+        }
+        tracing::warn!(
+            env_value = %s,
+            "ABERP_QUOTE_PIPELINE_PYTHON points at a missing file; falling through to auto-discovery"
+        );
+    }
+
+    // 2. Canonical project venv
+    let canonical = canonical_venv_python(aberp_root);
+    if canonical.is_file() && check_module_importable(&canonical) {
+        return PythonResolution::ProjectVenv { path: canonical };
+    }
+
+    // 3. Alt project-root venv
+    let alt = alt_venv_python(aberp_root);
+    if alt.is_file() && check_module_importable(&alt) {
+        return PythonResolution::AltVenv { path: alt };
+    }
+
+    // 4. System python3 IFF the module is already there
+    if let Some(sys_py) = system_python_absolute_path() {
+        if check_module_importable(&sys_py) {
+            return PythonResolution::SystemPython { path: sys_py };
+        }
+    }
+
+    PythonResolution::NotResolved {
+        canonical_path: canonical,
+    }
+}
+
+/// Render a `PipelinePythonStatus` snapshot from a `PythonResolution`
+/// + the daemon's intended cadence. `daemon_spawned` is left false here;
+/// serve.rs flips it true on a successful `tokio::spawn`.
+pub fn status_from_resolution(
+    resolution: &PythonResolution,
+    poll_cadence_secs: Option<u64>,
+) -> PipelinePythonStatus {
+    let (resolved_path, canonical_path) = match resolution {
+        PythonResolution::EnvOverride { path }
+        | PythonResolution::ProjectVenv { path }
+        | PythonResolution::AltVenv { path }
+        | PythonResolution::SystemPython { path } => {
+            (Some(path.to_string_lossy().into_owned()), None)
+        }
+        PythonResolution::NotResolved { canonical_path } => {
+            (None, Some(canonical_path.to_string_lossy().into_owned()))
+        }
+    };
+    // env_override is trusted-but-unverified; the other three resolved
+    // arms had their module-importable check confirmed in the resolver.
+    let module_importable = !matches!(resolution, PythonResolution::NotResolved { .. });
+    PipelinePythonStatus {
+        resolution_kind: resolution.as_kind_str().to_string(),
+        resolved_path,
+        module_importable,
+        canonical_path,
+        poll_cadence_secs: resolution
+            .is_resolved()
+            .then_some(poll_cadence_secs)
+            .flatten(),
+        daemon_spawned: false,
+    }
+}
+
+// Audit payload for `quote.pipeline_python_resolved`. Emitted ONCE per
+// daemon-spawn by serve.rs (see `emit_python_resolved_audit`).
+#[derive(Debug, Serialize)]
+struct PipelinePythonResolvedPayload {
+    tenant_id: String,
+    resolution_kind: String,
+    resolved_path: Option<String>,
+    module_importable: bool,
+    canonical_path: Option<String>,
+    actor: String,
+    idempotency_key: String,
+}
+
+/// Append the `quote.pipeline_python_resolved` audit row. Idempotency
+/// key is `<tenant>:<resolution_kind>:<resolved_path>` so re-spawns
+/// after a restart re-fire (a new attempt deserves a new row) but a
+/// double-call inside the same spawn-window is a no-op via the audit-
+/// ledger's UNIQUE defence.
+pub fn emit_python_resolved_audit(
+    db_path: &Path,
+    tenant_id: &str,
+    binary_hash: BinaryHash,
+    login: &str,
+    status: &PipelinePythonStatus,
+) -> Result<()> {
+    let mut conn =
+        duckdb::Connection::open(db_path).context("open DB for python-resolved audit")?;
+    audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
+    let tx = conn.transaction().context("open python-resolved tx")?;
+    let meta = LedgerMeta::new(TenantId::new(tenant_id).context("tenant id")?, binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), login);
+    let key_path = status.resolved_path.clone().unwrap_or_default();
+    let payload = PipelinePythonResolvedPayload {
+        tenant_id: tenant_id.to_string(),
+        resolution_kind: status.resolution_kind.clone(),
+        resolved_path: status.resolved_path.clone(),
+        module_importable: status.module_importable,
+        canonical_path: status.canonical_path.clone(),
+        actor: "system".to_string(),
+        idempotency_key: format!(
+            "quote_pipeline_python_resolved:{tenant_id}:{}:{key_path}",
+            status.resolution_kind
+        ),
+    };
+    let bytes = serde_json::to_vec(&payload).context("encode python-resolved payload")?;
+    append_in_tx(
+        &tx,
+        &meta,
+        EventKind::PipelinePythonResolved,
+        bytes,
+        actor,
+        Some(payload.idempotency_key.clone()),
+    )
+    .context("append PipelinePythonResolved")?;
+    tx.commit().context("commit python-resolved")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1428,5 +1769,157 @@ mod tests {
         // Need to construct a local Material; instead test the parse
         // helper directly to keep the surface narrow.
         assert!(parse_stock_status("not_a_status").is_err());
+    }
+
+    // ── S282 / PR-267 — Python venv auto-discovery ────────────────────
+
+    #[test]
+    fn python_resolution_kind_strings_are_closed_vocab() {
+        // The audit-row + SPA contract: every variant has a stable,
+        // distinct lowercase-snake string. A future contributor who
+        // adds an arm without updating `as_kind_str` will be caught
+        // by the empty-state classifier in the SPA (which keys on
+        // exactly `"not_resolved"`).
+        let env = PythonResolution::EnvOverride {
+            path: PathBuf::from("/bin/sh"),
+        };
+        let proj = PythonResolution::ProjectVenv {
+            path: PathBuf::from("/repo/python/aberp-cad-extract/.venv/bin/python"),
+        };
+        let alt = PythonResolution::AltVenv {
+            path: PathBuf::from("/repo/.venv/bin/python"),
+        };
+        let sys = PythonResolution::SystemPython {
+            path: PathBuf::from("/usr/bin/python3"),
+        };
+        let nope = PythonResolution::NotResolved {
+            canonical_path: PathBuf::from("/repo/python/aberp-cad-extract/.venv/bin/python"),
+        };
+        assert_eq!(env.as_kind_str(), "env_override");
+        assert_eq!(proj.as_kind_str(), "project_venv");
+        assert_eq!(alt.as_kind_str(), "alt_venv");
+        assert_eq!(sys.as_kind_str(), "system_python");
+        assert_eq!(nope.as_kind_str(), "not_resolved");
+        // Pairwise-distinct — a collision would mis-route the SPA
+        // empty-state classifier (e.g. RED card on a healthy install).
+        let all = [
+            env.as_kind_str(),
+            proj.as_kind_str(),
+            alt.as_kind_str(),
+            sys.as_kind_str(),
+            nope.as_kind_str(),
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn python_resolution_resolved_path_is_some_for_resolved_arms() {
+        let env = PythonResolution::EnvOverride {
+            path: PathBuf::from("/a"),
+        };
+        assert_eq!(env.resolved_path(), Some(Path::new("/a")));
+        assert!(env.is_resolved());
+        let nope = PythonResolution::NotResolved {
+            canonical_path: PathBuf::from("/b"),
+        };
+        assert_eq!(nope.resolved_path(), None);
+        assert!(!nope.is_resolved());
+    }
+
+    #[test]
+    fn canonical_venv_python_lands_under_project_layout() {
+        let root = Path::new("/Users/op/ABERP");
+        let p = canonical_venv_python(root);
+        assert_eq!(
+            p,
+            PathBuf::from("/Users/op/ABERP/python/aberp-cad-extract/.venv/bin/python")
+        );
+    }
+
+    #[test]
+    fn status_from_resolution_renders_resolved_path_and_cadence() {
+        let r = PythonResolution::ProjectVenv {
+            path: PathBuf::from("/a/b/python"),
+        };
+        let s = status_from_resolution(&r, Some(60));
+        assert_eq!(s.resolution_kind, "project_venv");
+        assert_eq!(s.resolved_path.as_deref(), Some("/a/b/python"));
+        assert_eq!(s.canonical_path, None);
+        assert!(s.module_importable);
+        assert_eq!(s.poll_cadence_secs, Some(60));
+        // daemon_spawned is the BOOT-block's job, not the helper's.
+        assert!(!s.daemon_spawned);
+    }
+
+    #[test]
+    fn status_from_resolution_env_override_is_trusted_but_unverified() {
+        // `env_override` is operator-asserted; the resolver does NOT
+        // re-check `aberp_cad_extract` is importable. The audit row
+        // reflects that posture by reporting `module_importable: true`
+        // (operator's claim) — runtime extract failures then surface
+        // the broken override as a pricing-job audit row, not at boot.
+        let r = PythonResolution::EnvOverride {
+            path: PathBuf::from("/explicit/python"),
+        };
+        let s = status_from_resolution(&r, Some(60));
+        assert_eq!(s.resolution_kind, "env_override");
+        assert!(s.module_importable);
+    }
+
+    #[test]
+    fn status_from_resolution_not_resolved_clears_path_and_cadence() {
+        let r = PythonResolution::NotResolved {
+            canonical_path: PathBuf::from("/missing/canonical"),
+        };
+        let s = status_from_resolution(&r, Some(60));
+        assert_eq!(s.resolution_kind, "not_resolved");
+        assert_eq!(s.resolved_path, None);
+        assert_eq!(s.canonical_path.as_deref(), Some("/missing/canonical"));
+        assert!(!s.module_importable);
+        // Cadence is meaningless on a dormant daemon — clear it so the
+        // SPA's "polling every Ns" copy doesn't render.
+        assert_eq!(s.poll_cadence_secs, None);
+        assert!(!s.daemon_spawned);
+    }
+
+    #[test]
+    fn python_resolution_handle_dormant_default_then_record_roundtrip() {
+        let h = PythonResolutionHandle::dormant();
+        // Dormant snapshot = default — no resolution recorded yet.
+        let empty = h.snapshot();
+        assert_eq!(empty.resolution_kind, "");
+        assert_eq!(empty.resolved_path, None);
+        assert!(!empty.daemon_spawned);
+
+        let r = PythonResolution::SystemPython {
+            path: PathBuf::from("/usr/local/bin/python3"),
+        };
+        let mut s = status_from_resolution(&r, Some(60));
+        s.daemon_spawned = true;
+        h.record(s.clone());
+        let out = h.snapshot();
+        assert_eq!(out.resolution_kind, "system_python");
+        assert_eq!(out.resolved_path.as_deref(), Some("/usr/local/bin/python3"));
+        assert!(out.daemon_spawned);
+        assert_eq!(out.poll_cadence_secs, Some(60));
+    }
+
+    #[test]
+    fn check_module_importable_rejects_a_non_python_binary() {
+        // `/bin/sh` is universally present on macOS + Linux dev/test
+        // hosts. It accepts the `-c <script>` flag (so the subprocess
+        // launches) but `import aberp_cad_extract` is not a shell
+        // statement; it should exit non-zero. This is the FAIL path
+        // — guarantees we don't silently classify any-binary-with-
+        // exec-bit as a working Python.
+        let sh = PathBuf::from("/bin/sh");
+        if !sh.exists() {
+            return; // unsupported host — skip
+        }
+        assert!(!check_module_importable(&sh));
     }
 }

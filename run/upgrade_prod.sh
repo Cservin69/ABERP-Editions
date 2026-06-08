@@ -323,6 +323,78 @@ if [[ "$local_head" != "$remote_head" ]]; then
 fi
 ok "verified: on ${version}, clean tree, HEAD=${local_head:0:12} matches origin"
 
+# ---------- step 3b: provision the auto-quoting Python venv ------------------
+# S282 / PR-267 — honor [[trust-code-not-operator]]: the operator should
+# never need to remember to set `ABERP_QUOTE_PIPELINE_PYTHON` or run
+# `python -m venv` by hand to enable the pricing pipeline. This step is
+# idempotent — if the venv already exists AND has `aberp_cad_extract`
+# importable, it's a 100ms no-op. First time on a fresh checkout it
+# creates the venv + `pip install -e`s the local package. Failure here
+# is logged but does NOT block the upgrade (operator can retry); the
+# backend resolver will surface the missing venv as a RED card on the
+# Pricing tab.
+provision_pipeline_venv() {
+  local venv_dir="${REPO_ROOT}/python/aberp-cad-extract/.venv"
+  local venv_python="${venv_dir}/bin/python"
+  local pkg_dir="${REPO_ROOT}/python/aberp-cad-extract"
+
+  if [[ ! -d "$pkg_dir" ]]; then
+    warn "auto-quoting Python package missing at ${pkg_dir} — skipping venv provisioning"
+    warn "auto-árazás Python csomag hiányzik — kihagyás"
+    return 0
+  fi
+
+  if [[ -x "$venv_python" ]] && "$venv_python" -c "import aberp_cad_extract" >/dev/null 2>&1; then
+    info "pipeline venv OK at ${venv_dir} — no-op"
+    return 0
+  fi
+
+  echo
+  info "provisioning auto-quoting Python venv at ${venv_dir} ..."
+  info "auto-árazás Python venv telepítése a ${venv_dir} útvonalon ..."
+
+  # The user may have a half-built venv (e.g. python upgrade left behind
+  # a broken symlink). Recreate from scratch — idempotent + cheap.
+  if [[ -d "$venv_dir" ]] && [[ ! -x "$venv_python" ]]; then
+    warn "removing stale venv directory: ${venv_dir}"
+    rm -rf "$venv_dir" || {
+      warn "could not remove stale venv — skipping provisioning (operator can retry by hand)"
+      return 0
+    }
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 not found on PATH — cannot provision the pipeline venv"
+    warn "python3 nincs a PATH-on — a venv nem telepíthető"
+    warn "Install Python 3.11+ then re-run this script."
+    return 0
+  fi
+
+  if ! python3 -m venv "$venv_dir" >/dev/null 2>&1; then
+    warn "python3 -m venv failed — pipeline daemon will surface as 'dormant' in the SPA"
+    warn "python3 -m venv hibára futott — a SPA Pricing fülön RED kártyával jelzi"
+    return 0
+  fi
+
+  if ! "$venv_python" -m pip install --quiet --upgrade pip >/dev/null 2>&1; then
+    warn "pip --upgrade failed — continuing with the venv's bundled pip"
+  fi
+
+  if ! "$venv_python" -m pip install --quiet -e "$pkg_dir"; then
+    warn "pip install -e ${pkg_dir} failed — pipeline daemon will be dormant"
+    warn "pip install -e hibára futott — a daemon szünetel"
+    return 0
+  fi
+
+  if "$venv_python" -c "import aberp_cad_extract" >/dev/null 2>&1; then
+    ok "pipeline venv provisioned at ${venv_dir}"
+  else
+    warn "venv created but aberp_cad_extract still not importable — investigate by hand"
+  fi
+}
+
+provision_pipeline_venv
+
 # ---------- step 4: exec into run_prod.sh -----------------------------------
 echo
 echo "${c_grn}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c_rst}" >&2

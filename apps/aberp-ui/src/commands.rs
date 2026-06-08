@@ -1319,6 +1319,15 @@ pub async fn retry_quote_pricing_job(
     forward_post(&state, &path, Value::Null).await
 }
 
+/// S282 / PR-267 — read the pricing-pipeline daemon status (Python-venv
+/// resolution outcome + poll cadence + spawned flag). Drives the SPA's
+/// `PricingJobsList` empty-state copy: GREEN active vs RED venv-missing
+/// vs AMBER resolved-but-spawn-errored.
+#[tauri::command]
+pub async fn quote_pipeline_status(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quote-pipeline/status", true).await
+}
+
 /// S272 / PR-261 — DEAL saga (ADR-0067). `POST /api/quote-intake/{quote_id}/deal`
 /// with body `{ deal_token, refresh_ack? }`. Backend mints SO/WO
 /// placeholder ids + emits three audit entries in a single tx; 409s

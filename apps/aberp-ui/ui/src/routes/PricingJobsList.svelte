@@ -11,11 +11,14 @@
 
   import { onMount } from "svelte";
   import {
+    fetchQuotePipelineStatus,
     listQuotePricingJobs,
     retryQuotePricingJob,
+    type PipelinePythonStatus,
     type PricingJobRow,
   } from "../lib/api";
   import { formatInvoiceDate } from "../lib/format";
+  import { classifyEmptyState } from "../lib/pricing-empty-state";
 
   type LoadState = "idle" | "loading" | "ready" | "error";
 
@@ -24,6 +27,10 @@
   let rows: PricingJobRow[] = $state([]);
   let retryBusyQuoteId = $state<string | null>(null);
   let retryError = $state<string | null>(null);
+  // S282 / PR-267 — pipeline daemon status. Fetched in parallel with the
+  // jobs list so the empty-state copy can differentiate dormant /
+  // active / errored. Null until first fetch returns.
+  let pipelineStatus = $state<PipelinePythonStatus | null>(null);
 
   onMount(() => {
     void refresh();
@@ -33,7 +40,12 @@
     loadState = "loading";
     errorMessage = null;
     try {
-      rows = await listQuotePricingJobs();
+      const [r, s] = await Promise.all([
+        listQuotePricingJobs(),
+        fetchQuotePipelineStatus().catch(() => null),
+      ]);
+      rows = r;
+      pipelineStatus = s;
       loadState = "ready";
     } catch (e) {
       errorMessage = e instanceof Error ? e.message : String(e);
@@ -116,9 +128,44 @@
     <p class="pricing-jobs__hint">Betöltés… / Loading…</p>
   {:else if loadState === "error"}
     <p class="pricing-jobs__err">{errorMessage ?? "Hiba / Error"}</p>
+  {:else if classifyEmptyState(rows.length, pipelineStatus) === "venv_missing"}
+    <!-- S282 / PR-267 — RED card: venv not provisioned. Operator-actionable. -->
+    <div class="pricing-jobs__err" data-testid="pricing-jobs-empty-not-resolved">
+      <p>
+        <strong>Daemon dormant — Python venv not detected /
+          Daemon szünetel — Python venv nem található.</strong>
+      </p>
+      <p>
+        Expected at / Várt útvonal:
+        <code>{pipelineStatus?.canonical_path ?? "?"}</code>
+      </p>
+      <p>
+        Run / Futtasd:
+        <code>./run/upgrade_prod.sh</code>
+        to provision / a venv telepítéséhez.
+      </p>
+    </div>
+  {:else if classifyEmptyState(rows.length, pipelineStatus) === "spawn_errored"}
+    <!-- S282 / PR-267 — AMBER card: venv resolved but daemon spawn errored. -->
+    <div class="pricing-jobs__warn" data-testid="pricing-jobs-empty-spawn-errored">
+      <p>
+        <strong>Daemon failed to start / Daemon nem indult el.</strong>
+      </p>
+      <p>
+        Resolved at / Megtalálva: <code>{pipelineStatus?.resolved_path ?? "?"}</code>
+      </p>
+      <p>See backend logs for detail / Részletekért lásd a backend logokat.</p>
+    </div>
   {:else if rows.length === 0}
-    <p class="pricing-jobs__hint">
-      Nincs aktív árazási feladat. / No pricing jobs in flight.
+    <!-- S282 / PR-267 — GREEN card: active, polling, no pending work. -->
+    <p class="pricing-jobs__hint" data-testid="pricing-jobs-empty-active">
+      {#if pipelineStatus?.poll_cadence_secs}
+        Daemon aktív — {pipelineStatus.poll_cadence_secs} másodpercenként lekérdez. /
+        Daemon active — polling every {pipelineStatus.poll_cadence_secs}s.
+        Nincs függő ajánlat a storefronton. / No pending submissions on storefront.
+      {:else}
+        Nincs aktív árazási feladat. / No pricing jobs in flight.
+      {/if}
     </p>
   {:else}
     {#if retryError}
@@ -225,6 +272,15 @@
   .pricing-jobs__err {
     border-color: var(--color-danger, #f87171);
     color: var(--color-danger, #f87171);
+  }
+  /* S282 / PR-267 — AMBER card for resolved-but-spawn-errored state.
+     Distinct from RED so the operator can tell "missing" from "broken". */
+  .pricing-jobs__warn {
+    padding: 12px;
+    border: 1px solid var(--color-warn, #f59e0b);
+    border-radius: 6px;
+    background: var(--color-surface, #1f2937);
+    color: var(--color-warn, #f59e0b);
   }
   .pricing-jobs__tbl {
     width: 100%;

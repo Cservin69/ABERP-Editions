@@ -980,6 +980,8 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         restore_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         catalogue_push: crate::catalogue_push::CataloguePushHandle::dormant(),
         email_relay_rate_limiter: Arc::new(crate::email_relay::RateLimiter::new()),
+        pipeline_python_resolution: crate::quote_pricing_pipeline::PythonResolutionHandle::dormant(
+        ),
     };
 
     // 5. Build the axum router. Clone the state first so the app-boot
@@ -1463,65 +1465,123 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                         }
                     }
 
-                    // S279 / PR-265 — spawn the pricing pipeline daemon onto
-                    // the SAME storefront surface. Polls `?status=received`,
-                    // walks each row through extract → price → render → post.
-                    // Only spawns when the operator has typed an
-                    // `ABERP_QUOTE_PIPELINE_PYTHON` env var (the absolute path
-                    // to the `aberp-cad-extract` venv's python3). Without it
-                    // the daemon would crash on its first extract attempt;
-                    // honest dormant-by-default posture matches the existing
-                    // intake-daemon's `enabled=true` opt-in shape.
-                    if let Ok(python_bin) = std::env::var("ABERP_QUOTE_PIPELINE_PYTHON") {
-                        let artifact_dir = std::env::var("ABERP_QUOTE_PIPELINE_ARTIFACT_DIR")
+                    // S279 / PR-265 (env-var opt-in) → S282 / PR-267
+                    // (auto-discovery). Resolve the Python interpreter the
+                    // daemon will exec via the [[trust-code-not-operator]]
+                    // layered fallback: env-var override → canonical venv →
+                    // alt-root venv → system-python-with-module. The audit
+                    // row fires unconditionally so a forensic walker can
+                    // answer "what venv did this install actually use?"
+                    // The SPA `GET /api/quote-pipeline/status` route reads
+                    // the dormant handle to differentiate the
+                    // `PricingJobsList` empty-state copy (active / RED
+                    // venv-missing / AMBER spawn-errored).
+                    let aberp_root = std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let resolution =
+                        crate::quote_pricing_pipeline::resolve_pipeline_python(&aberp_root);
+                    const PIPELINE_POLL_SECS: u64 = 60;
+                    let mut status = crate::quote_pricing_pipeline::status_from_resolution(
+                        &resolution,
+                        Some(PIPELINE_POLL_SECS),
+                    );
+                    // Audit emit ONCE per daemon spawn — the durable
+                    // `[[trust-code-not-operator]]` guarantee. Best-effort:
+                    // an audit-emit failure logs but does NOT block daemon
+                    // spawn (the resolved daemon is still safe to run; the
+                    // missing audit row is operator-visible via the SPA
+                    // status snapshot).
+                    if let Err(e) = crate::quote_pricing_pipeline::emit_python_resolved_audit(
+                        st.db_path.as_path(),
+                        st.tenant.as_str(),
+                        binary_hash,
+                        &pipeline_operator_login,
+                        &status,
+                    ) {
+                        tracing::warn!(
+                            error = %e,
+                            "quote.pipeline_python_resolved audit emit failed (non-fatal)"
+                        );
+                    }
+                    match &resolution {
+                        crate::quote_pricing_pipeline::PythonResolution::NotResolved {
+                            canonical_path,
+                        } => {
+                            tracing::info!(
+                                expected_venv = %canonical_path.display(),
+                                "quote-pricing-pipeline daemon dormant — \
+                                 Python venv not detected. Run ./run/upgrade_prod.sh \
+                                 to provision."
+                            );
+                            // status.daemon_spawned stays false; SPA shows RED.
+                            st.pipeline_python_resolution.record(status);
+                        }
+                        resolved => {
+                            let python_bin = resolved
+                                .resolved_path()
+                                .expect("resolved arm always has a path")
+                                .to_path_buf();
+                            let artifact_dir = std::env::var(
+                                "ABERP_QUOTE_PIPELINE_ARTIFACT_DIR",
+                            )
                             .map(std::path::PathBuf::from)
                             .unwrap_or_else(|_| {
                                 std::path::PathBuf::from("./quote-artifacts")
                             });
-                        let pipeline_cfg = crate::quote_pricing_pipeline::PricingPipelineConfig {
-                            base_url: catalogue_base_url,
-                            bearer_token: catalogue_bearer,
-                            poll_interval: std::time::Duration::from_secs(60),
-                            artifact_dir,
-                            python_bin: std::path::PathBuf::from(python_bin),
-                            default_tolerance:
-                                aberp_quote_engine::ToleranceRange::Standard,
-                        };
-                        let pipeline_deps = crate::quote_pricing_pipeline::PricingPipelineDeps {
-                            db_path: (*st.db_path).clone(),
-                            tenant: st.tenant.clone(),
-                            binary_hash,
-                            operator_login: pipeline_operator_login,
-                        };
-                        match crate::quote_pricing_pipeline::PricingPipelineService::new(
-                            pipeline_cfg,
-                            pipeline_deps,
-                        ) {
-                            Ok(service) => {
-                                tracing::info!(
-                                    "spawning quote-pricing-pipeline daemon (S279 / PR-265)"
-                                );
-                                let pipeline_token = coordinator.token.clone();
-                                let pipeline_handle = tokio::spawn(async move {
-                                    service.run_daemon_forever(pipeline_token).await;
-                                });
-                                coordinator.register(
-                                    "quote-pricing-pipeline",
-                                    pipeline_handle,
-                                );
-                            }
-                            Err(e) => {
-                                return Err(anyhow!(
-                                    "quote-pricing-pipeline daemon refused to start: {e:#}"
-                                ));
+                            let pipeline_cfg =
+                                crate::quote_pricing_pipeline::PricingPipelineConfig {
+                                    base_url: catalogue_base_url,
+                                    bearer_token: catalogue_bearer,
+                                    poll_interval: std::time::Duration::from_secs(
+                                        PIPELINE_POLL_SECS,
+                                    ),
+                                    artifact_dir,
+                                    python_bin,
+                                    default_tolerance:
+                                        aberp_quote_engine::ToleranceRange::Standard,
+                                };
+                            let pipeline_deps =
+                                crate::quote_pricing_pipeline::PricingPipelineDeps {
+                                    db_path: (*st.db_path).clone(),
+                                    tenant: st.tenant.clone(),
+                                    binary_hash,
+                                    operator_login: pipeline_operator_login,
+                                };
+                            match crate::quote_pricing_pipeline::PricingPipelineService::new(
+                                pipeline_cfg,
+                                pipeline_deps,
+                            ) {
+                                Ok(service) => {
+                                    tracing::info!(
+                                        resolution_kind = %status.resolution_kind,
+                                        resolved_path =
+                                            status.resolved_path.as_deref().unwrap_or("?"),
+                                        "spawning quote-pricing-pipeline daemon \
+                                         (S279 / PR-265, resolver S282 / PR-267)"
+                                    );
+                                    let pipeline_token = coordinator.token.clone();
+                                    let pipeline_handle = tokio::spawn(async move {
+                                        service.run_daemon_forever(pipeline_token).await;
+                                    });
+                                    coordinator.register(
+                                        "quote-pricing-pipeline",
+                                        pipeline_handle,
+                                    );
+                                    status.daemon_spawned = true;
+                                    st.pipeline_python_resolution.record(status);
+                                }
+                                Err(e) => {
+                                    // Resolved-but-spawn-errored → AMBER in SPA.
+                                    // Don't kill boot — the rest of ABERP is fine.
+                                    tracing::warn!(
+                                        error = %e,
+                                        "quote-pricing-pipeline daemon construction failed \
+                                         after successful resolution"
+                                    );
+                                    st.pipeline_python_resolution.record(status);
+                                }
                             }
                         }
-                    } else {
-                        tracing::info!(
-                            "quote-pricing-pipeline daemon dormant \
-                             (set ABERP_QUOTE_PIPELINE_PYTHON to an absolute \
-                             path to the aberp-cad-extract venv's python3 to enable)"
-                        );
                     }
                 }
                 Err(QuoteIntakeError::Disabled) => {
@@ -2277,6 +2337,14 @@ pub struct AppState {
     /// requests but resets on every `aberp serve` restart (an operator
     /// restart is itself rare enough that bucket drift is a non-issue).
     pub email_relay_rate_limiter: Arc<crate::email_relay::RateLimiter>,
+    /// S282 / PR-267 — shared status surface for the pricing-pipeline
+    /// daemon's Python-venv resolution. Created dormant at boot. The
+    /// boot block runs `resolve_pipeline_python` ONCE, records the
+    /// outcome here, and only spawns the daemon when resolved. The SPA
+    /// `GET /api/quote-pipeline/status` route reads `.snapshot()` to
+    /// drive the `PricingJobsList` empty-state copy (active vs RED-
+    /// venv-missing vs AMBER-spawn-errored).
+    pub pipeline_python_resolution: Arc<crate::quote_pricing_pipeline::PythonResolutionHandle>,
 }
 
 /// Session-161 — max number of NAV poll daemons polling concurrently.
@@ -2740,6 +2808,15 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/quote-pricing-jobs/:quote_id/retry",
             post(handle_retry_quote_pricing_job),
+        )
+        // S282 / PR-267 — pricing-pipeline daemon status. Reads the
+        // dormant handle that was filled in at boot by the layered
+        // Python-venv resolver. Drives the `PricingJobsList` empty-
+        // state copy: GREEN "polling every Ns" vs RED "venv missing"
+        // vs AMBER "venv resolved but daemon errored at spawn".
+        .route(
+            "/api/quote-pipeline/status",
+            get(handle_quote_pipeline_status),
         )
         // S256 / PR-245 — one polled endpoint feeding the sidebar badge
         // (un-picked count, DB truth) + the arrival toast (live arrivals
@@ -16179,6 +16256,24 @@ async fn handle_retry_quote_pricing_job(
     (axum::http::StatusCode::OK, axum::Json(body)).into_response()
 }
 
+/// S282 / PR-267 — pricing-pipeline daemon status. Read-only mirror of
+/// the `PipelinePythonStatus` recorded at boot. Drives the
+/// `PricingJobsList` empty-state copy: GREEN "polling every Ns" vs RED
+/// "venv missing" vs AMBER "venv resolved but daemon spawn errored".
+async fn handle_quote_pipeline_status(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let snapshot = state.pipeline_python_resolution.snapshot();
+    (axum::http::StatusCode::OK, axum::Json(snapshot)).into_response()
+}
+
 #[derive(Debug, serde::Serialize)]
 struct QuoteArrival {
     quote_id: String,
@@ -20952,6 +21047,8 @@ mod tests {
             restore_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_push: crate::catalogue_push::CataloguePushHandle::dormant(),
             email_relay_rate_limiter: std::sync::Arc::new(crate::email_relay::RateLimiter::new()),
+            pipeline_python_resolution:
+                crate::quote_pricing_pipeline::PythonResolutionHandle::dormant(),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
@@ -21067,6 +21164,8 @@ mod tests {
             restore_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_push: crate::catalogue_push::CataloguePushHandle::dormant(),
             email_relay_rate_limiter: std::sync::Arc::new(crate::email_relay::RateLimiter::new()),
+            pipeline_python_resolution:
+                crate::quote_pricing_pipeline::PythonResolutionHandle::dormant(),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, invoice_id)
@@ -21827,6 +21926,8 @@ mod tests {
             restore_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalogue_push: crate::catalogue_push::CataloguePushHandle::dormant(),
             email_relay_rate_limiter: std::sync::Arc::new(crate::email_relay::RateLimiter::new()),
+            pipeline_python_resolution:
+                crate::quote_pricing_pipeline::PythonResolutionHandle::dormant(),
         }
     }
 

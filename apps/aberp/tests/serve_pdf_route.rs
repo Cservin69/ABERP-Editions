@@ -210,6 +210,8 @@ fn build_state(wired: &WiredInvoice) -> AppState {
         restore_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         catalogue_push: aberp::catalogue_push::CataloguePushHandle::dormant(),
         email_relay_rate_limiter: std::sync::Arc::new(aberp::email_relay::RateLimiter::new()),
+        pipeline_python_resolution: aberp::quote_pricing_pipeline::PythonResolutionHandle::dormant(
+        ),
     }
 }
 
