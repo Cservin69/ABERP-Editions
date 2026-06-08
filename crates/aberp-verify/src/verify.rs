@@ -953,7 +953,12 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // Daemon-spawn telemetry; payload carries resolution_kind /
         // resolved_path / module_importable, never NAV XML bytes.
         // Never sweeps a per-OUTGOING-invoice bundle.
-        | EventKind::PipelinePythonResolved => (None, ""),
+        | EventKind::PipelinePythonResolved
+        // S286 / PR-268 — pricing-daemon-panicked kind (`quote.*`).
+        // Supervisor-recovery telemetry; payload carries panic_msg /
+        // restart_count / last_known_quote_id, never NAV XML bytes.
+        // Never sweeps a per-OUTGOING-invoice bundle.
+        | EventKind::QuotePricingDaemonPanicked => (None, ""),
     };
 
     Ok(NavExtraction {

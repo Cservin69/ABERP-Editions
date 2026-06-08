@@ -1623,6 +1623,35 @@ pub enum EventKind {
     /// Payload: `serde_json::Value`.
     /// F12 four-edit ritual fires once.
     PipelinePythonResolved,
+
+    /// S286 / PR-268 — pricing-pipeline daemon supervisor caught a Rust-side
+    /// panic during a `poll_once` iteration. The supervisor restarted the
+    /// daemon (after a 30s back-off) so the rest of ABERP stays alive; this
+    /// audit row is the durable forensic record of the recovery.
+    ///
+    /// Carries `panic_msg` (sanitized — CR/LF/NUL stripped, truncated to 1000
+    /// chars; the raw panic payload is whatever `std::panic::set_hook` would
+    /// have printed), `restart_count_since_boot` (so a forensic walker can
+    /// see "how many times has this daemon restarted in this process
+    /// lifetime"), `last_known_quote_id` (the row the daemon was advancing
+    /// when it panicked, `null` if not available), and `idempotency_key`
+    /// (`quote_pricing_daemon_panicked:<ULID>` — every panic is a fresh row,
+    /// so each restart gets its own ULID rather than colliding).
+    ///
+    /// Caveat — a *C++-level* `libc++abi` termination (e.g. DuckDB FATAL
+    /// exception) bypasses Rust's panic machinery entirely and CANNOT be
+    /// caught by this supervisor; the process exits. This kind covers the
+    /// Rust-panic path only. Defence-in-depth against the C++ class is the
+    /// SELECT-first pattern in [`crate::quote_pricing_jobs`] —
+    /// [[trust-code-not-operator]].
+    ///
+    /// `quote.*` prefix family (same family as the other pricing-pipeline
+    /// kinds — keeps the forensic-query glob "everything the pricing
+    /// pipeline did" inside one prefix).
+    ///
+    /// Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricingDaemonPanicked,
 }
 
 impl EventKind {
@@ -1714,6 +1743,7 @@ impl EventKind {
             EventKind::EmailRelaySent => "email.relay_sent",
             EventKind::EmailRelayFailed => "email.relay_failed",
             EventKind::PipelinePythonResolved => "quote.pipeline_python_resolved",
+            EventKind::QuotePricingDaemonPanicked => "quote.pricing_daemon_panicked",
         }
     }
 
@@ -1816,6 +1846,7 @@ impl EventKind {
             "email.relay_sent" => Ok(EventKind::EmailRelaySent),
             "email.relay_failed" => Ok(EventKind::EmailRelayFailed),
             "quote.pipeline_python_resolved" => Ok(EventKind::PipelinePythonResolved),
+            "quote.pricing_daemon_panicked" => Ok(EventKind::QuotePricingDaemonPanicked),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1910,6 +1941,7 @@ mod tests {
             EventKind::EmailRelaySent,
             EventKind::EmailRelayFailed,
             EventKind::PipelinePythonResolved,
+            EventKind::QuotePricingDaemonPanicked,
         ];
         for v in variants {
             let s = v.as_str();
@@ -3499,6 +3531,55 @@ mod tests {
             EventKind::QuotePricingRendered,
             EventKind::QuotePricingPosted,
             EventKind::QuotePricingFailed,
+        ] {
+            assert_ne!(
+                s,
+                sibling.as_str(),
+                "{s} collides with {}",
+                sibling.as_str()
+            );
+        }
+    }
+
+    /// S286 / PR-268 — the new daemon-panic kind lives in the `quote.*`
+    /// family alongside the six S279 pricing-pipeline siblings. The brief's
+    /// hotfix posture: "everything the pricing pipeline did, including the
+    /// supervisor catching a panic" fits one forensic-glob query.
+    #[test]
+    fn s286_pricing_daemon_panicked_uses_quote_prefix() {
+        let s = EventKind::QuotePricingDaemonPanicked.as_str();
+        assert_eq!(s, "quote.pricing_daemon_panicked");
+        assert!(s.starts_with("quote."), "{s} must start with quote.");
+        assert!(
+            !s.starts_with("invoice."),
+            "{s} must not start with invoice."
+        );
+        assert!(!s.starts_with("system."), "{s} must not start with system.");
+        assert!(!s.starts_with("mes."), "{s} must not start with mes.");
+        assert!(
+            !s.starts_with("inventory."),
+            "{s} must not start with inventory."
+        );
+        assert!(!s.starts_with("email."), "{s} must not start with email.");
+    }
+
+    /// S286 / PR-268 — daemon-panicked is distinct from every S279 pricing
+    /// sibling AND from the S282 pipeline-python-resolved kind. A collision
+    /// would mis-route a panic-recovery row into one of the per-job state
+    /// buckets, silently muting the panic banner the SPA renders on
+    /// `recent_panic_count > 0` — the exact failure mode CLAUDE.md rule 12
+    /// names.
+    #[test]
+    fn s286_pricing_daemon_panicked_is_distinct() {
+        let s = EventKind::QuotePricingDaemonPanicked.as_str();
+        for sibling in [
+            EventKind::QuotePricingFetched,
+            EventKind::QuotePricingExtracted,
+            EventKind::QuotePricingPriced,
+            EventKind::QuotePricingRendered,
+            EventKind::QuotePricingPosted,
+            EventKind::QuotePricingFailed,
+            EventKind::PipelinePythonResolved,
         ] {
             assert_ne!(
                 s,

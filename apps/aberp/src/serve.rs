@@ -1552,16 +1552,60 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                 pipeline_deps,
                             ) {
                                 Ok(service) => {
+                                    // S286 / PR-268 hotfix — log the
+                                    // existing-row population at boot so
+                                    // the operator can see what's in
+                                    // `quote_pricing_jobs` before any
+                                    // poll-cycle runs. Per the post-
+                                    // mortem of PROD_v2.27.2: a pre-
+                                    // existing row was racing the daemon
+                                    // into a DuckDB FATAL.
+                                    let count_db_path = (*st.db_path).clone();
+                                    let count_tenant = st.tenant.as_str().to_string();
+                                    let count_res =
+                                        tokio::task::spawn_blocking(move || -> Result<u64> {
+                                            let conn =
+                                                duckdb::Connection::open(&count_db_path)
+                                                    .context("open DB for boot row count")?;
+                                            crate::quote_pricing_jobs::count_jobs(
+                                                &conn,
+                                                &count_tenant,
+                                            )
+                                        })
+                                        .await;
+                                    match count_res {
+                                        Ok(Ok(n)) => tracing::info!(
+                                            existing_row_count = n,
+                                            "quote_pricing_jobs boot snapshot (S286/PR-268)"
+                                        ),
+                                        Ok(Err(e)) => tracing::warn!(
+                                            error = %e,
+                                            "quote_pricing_jobs boot row-count failed (non-fatal)"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "boot row-count spawn_blocking join failed"
+                                        ),
+                                    }
                                     tracing::info!(
                                         resolution_kind = %status.resolution_kind,
                                         resolved_path =
                                             status.resolved_path.as_deref().unwrap_or("?"),
                                         "spawning quote-pricing-pipeline daemon \
-                                         (S279 / PR-265, resolver S282 / PR-267)"
+                                         (S279 / PR-265, resolver S282 / PR-267, \
+                                          supervisor S286 / PR-268)"
                                     );
                                     let pipeline_token = coordinator.token.clone();
                                     let pipeline_handle = tokio::spawn(async move {
-                                        service.run_daemon_forever(pipeline_token).await;
+                                        // S286 / PR-268 — wrapped in panic-
+                                        // recovery supervisor so a Rust-side
+                                        // panic doesn't take down the host
+                                        // process. C++-level libc++abi
+                                        // terminations from DuckDB still
+                                        // can't be caught — those are
+                                        // defended by the SELECT-first
+                                        // pattern in quote_pricing_jobs.
+                                        service.run_daemon_supervised(pipeline_token).await;
                                     });
                                     coordinator.register(
                                         "quote-pricing-pipeline",
@@ -16271,7 +16315,103 @@ async fn handle_quote_pipeline_status(
         return resp;
     }
     let snapshot = state.pipeline_python_resolution.snapshot();
-    (axum::http::StatusCode::OK, axum::Json(snapshot)).into_response()
+    // S286 / PR-268 — daemon-health fold-in. Walk the audit ledger for
+    // `quote.pricing_daemon_panicked` rows in the last 10 minutes; if any
+    // fired, the SPA renders an AMBER banner directing the operator to the
+    // ledger. Best-effort: if the ledger walk errors, the status response
+    // still returns the existing Python-resolver snapshot — partial-truth
+    // beats a 500 for an operator-facing health endpoint.
+    let db_path = (*state.db_path).clone();
+    let panic_telemetry = tokio::task::spawn_blocking(move || -> Result<DaemonPanicTelemetry> {
+        let conn = duckdb::Connection::open(&db_path).context("open DB for daemon-panic count")?;
+        count_recent_daemon_panics(&conn, 10)
+    })
+    .await
+    .unwrap_or_else(|join| Err(anyhow!("daemon-panic spawn_blocking join: {join}")))
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "daemon-panic count failed (non-fatal)");
+        DaemonPanicTelemetry::default()
+    });
+    let body = QuotePipelineStatusBody {
+        resolution_kind: snapshot.resolution_kind,
+        resolved_path: snapshot.resolved_path,
+        module_importable: snapshot.module_importable,
+        canonical_path: snapshot.canonical_path,
+        poll_cadence_secs: snapshot.poll_cadence_secs,
+        daemon_spawned: snapshot.daemon_spawned,
+        recent_panic_count: panic_telemetry.recent_panic_count,
+        last_panic_at: panic_telemetry.last_panic_at,
+    };
+    (axum::http::StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// S286 / PR-268 — derived telemetry over the last N minutes of audit-
+/// ledger rows. Empty default when the ledger walk errors so the status
+/// response remains truthful (no panic info) rather than 500-ing the
+/// whole SPA.
+#[derive(Debug, Default, Clone)]
+struct DaemonPanicTelemetry {
+    recent_panic_count: u32,
+    last_panic_at: Option<String>,
+}
+
+/// S286 / PR-268 — count `quote.pricing_daemon_panicked` rows in the last
+/// `window_minutes` minutes; also return the wall-clock of the most recent
+/// one (RFC-3339). Scans the ledger via `kind` (indexed by the DuckDB
+/// query planner via the sequence scan; with v1 ledger sizes — sub-100k
+/// rows on a production install — this is sub-1ms and runs at most once
+/// per SPA refresh).
+fn count_recent_daemon_panics(
+    conn: &duckdb::Connection,
+    window_minutes: i64,
+) -> Result<DaemonPanicTelemetry> {
+    use aberp_audit_ledger::ensure_schema as audit_ensure_schema;
+    use time::OffsetDateTime;
+    audit_ensure_schema(conn).context("ensure audit-ledger schema")?;
+    let cutoff = OffsetDateTime::now_utc() - time::Duration::minutes(window_minutes);
+    let cutoff_str = cutoff
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format cutoff for panic count")?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT COUNT(*), MAX(time_wall) FROM audit_ledger
+                WHERE kind = ? AND time_wall >= ?",
+        )
+        .context("prepare daemon-panic count")?;
+    let row = stmt
+        .query_row(
+            duckdb::params!["quote.pricing_daemon_panicked", cutoff_str],
+            |r| {
+                let n: Option<i64> = r.get(0).ok();
+                let ts: Option<String> = r.get(1).ok();
+                Ok((n.unwrap_or(0), ts))
+            },
+        )
+        .context("query daemon-panic count")?;
+    Ok(DaemonPanicTelemetry {
+        recent_panic_count: row.0.max(0) as u32,
+        last_panic_at: row.1,
+    })
+}
+
+/// S286 / PR-268 — `GET /api/quote-pipeline/status` body shape. Superset
+/// of `PipelinePythonStatus` (S282 / PR-267 fields) plus the panic
+/// telemetry. The SPA type in `apps/aberp-ui/ui/src/lib/api.ts` mirrors
+/// this exactly.
+#[derive(Debug, serde::Serialize)]
+struct QuotePipelineStatusBody {
+    resolution_kind: String,
+    resolved_path: Option<String>,
+    module_importable: bool,
+    canonical_path: Option<String>,
+    poll_cadence_secs: Option<u64>,
+    daemon_spawned: bool,
+    /// S286 / PR-268 — count of `quote.pricing_daemon_panicked` audit
+    /// rows in the last 10 minutes. Drives the AMBER SPA banner.
+    recent_panic_count: u32,
+    /// RFC-3339 timestamp of the most recent daemon-panic audit row, or
+    /// `None` if there are no panic rows in the window.
+    last_panic_at: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]

@@ -124,6 +124,31 @@
     >Frissítés / Refresh</button>
   </header>
 
+  {#if pipelineStatus && pipelineStatus.recent_panic_count > 0}
+    <!-- S286 / PR-268 — AMBER daemon-health banner. Persists above the
+         table when the supervisor caught any Rust-side panics in the
+         last 10 minutes; the audit ledger has the durable forensic
+         detail. Renders regardless of rows.length so the operator sees
+         it even while the daemon is mid-cycle and the table populated. -->
+    <div class="pricing-jobs__warn" data-testid="pricing-jobs-daemon-panic-banner">
+      <p>
+        <strong>Daemon recovered from {pipelineStatus.recent_panic_count}
+          {pipelineStatus.recent_panic_count === 1 ? "panic" : "panics"} in the last 10 minutes /
+          Daemon
+          {pipelineStatus.recent_panic_count === 1 ? "egy" : pipelineStatus.recent_panic_count}
+          összeomlásból tért magához az elmúlt 10 percben.</strong>
+      </p>
+      {#if pipelineStatus.last_panic_at}
+        <p>
+          Utolsó / Last: <code>{pipelineStatus.last_panic_at}</code>
+        </p>
+      {/if}
+      <p>
+        Lásd az audit naplóban: <code>quote.pricing_daemon_panicked</code> /
+        See the audit ledger.
+      </p>
+    </div>
+  {/if}
   {#if loadState === "loading" && rows.length === 0}
     <p class="pricing-jobs__hint">Betöltés… / Loading…</p>
   {:else if loadState === "error"}

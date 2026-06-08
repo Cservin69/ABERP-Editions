@@ -10,6 +10,8 @@ function resolved(daemonSpawned: boolean): PipelinePythonStatus {
     canonical_path: null,
     poll_cadence_secs: 60,
     daemon_spawned: daemonSpawned,
+    recent_panic_count: 0,
+    last_panic_at: null,
   };
 }
 
@@ -21,6 +23,8 @@ function notResolved(): PipelinePythonStatus {
     canonical_path: "/repo/python/aberp-cad-extract/.venv/bin/python",
     poll_cadence_secs: null,
     daemon_spawned: false,
+    recent_panic_count: 0,
+    last_panic_at: null,
   };
 }
 

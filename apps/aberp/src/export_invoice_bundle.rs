@@ -827,7 +827,12 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // Pricing-daemon spawn telemetry; carries resolution_kind +
         // resolved_path + module_importable, never NAV XML bytes.
         // Never sweeps a per-OUTGOING-invoice export bundle.
-        | EventKind::PipelinePythonResolved => None,
+        | EventKind::PipelinePythonResolved
+        // S286 / PR-268 — pricing-daemon-panicked kind (`quote.*`).
+        // Supervisor-recovery telemetry; carries panic_msg +
+        // restart_count + last_known_quote_id, never NAV XML bytes.
+        // Never sweeps a per-OUTGOING-invoice export bundle.
+        | EventKind::QuotePricingDaemonPanicked => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

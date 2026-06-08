@@ -434,13 +434,26 @@ impl PricingPipelineService {
             let mut conn = duckdb::Connection::open(&db_path).context("open DB for extract")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
-            jobs::set_state(
+            // S286 hotfix: NotFound aborts this step, AlreadyInState
+            // continues (the prior cycle marked us Extracting; safe to
+            // re-run the extract because the audit emit is keyed on the
+            // post-extract feature_graph_hash, not the pre-extract mark).
+            match jobs::set_state(
                 &conn,
                 &quote_id,
                 &tenant_id_string,
                 JobState::Extracting,
                 OffsetDateTime::now_utc(),
-            )?;
+            )? {
+                jobs::TransitionOutcome::NotFound => {
+                    tracing::warn!(
+                        quote_id = %quote_id,
+                        "pricing-pipeline row vanished before extract; skipping"
+                    );
+                    return Ok(StepOutcome::Advanced);
+                }
+                jobs::TransitionOutcome::AlreadyInState | jobs::TransitionOutcome::Applied => {}
+            }
             let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
             let extractor = CadExtractor::new().with_python_bin(python_bin);
             let req = ExtractRequest {
@@ -455,7 +468,7 @@ impl PricingPipelineService {
                     let hash_str = format!("blake3:{}", hash.to_hex());
                     let json =
                         String::from_utf8(canonical).context("FeatureGraph json was not utf8")?;
-                    jobs::set_extracted(
+                    let set_outcome = jobs::set_extracted(
                         &mut conn,
                         &quote_id,
                         &tenant_id_string,
@@ -463,6 +476,16 @@ impl PricingPipelineService {
                         &json,
                         OffsetDateTime::now_utc(),
                     )?;
+                    if !matches!(set_outcome, jobs::TransitionOutcome::Applied) {
+                        // Already-at-Pricing (prior cycle won the race) or
+                        // NotFound — skip audit emit so we don't double-fire.
+                        tracing::info!(
+                            quote_id = %quote_id,
+                            outcome = ?set_outcome,
+                            "set_extracted no-op; skipping audit emit"
+                        );
+                        return Ok(StepOutcome::Advanced);
+                    }
                     let tx = conn.transaction().context("open extract-audit tx")?;
                     let meta = LedgerMeta::new(
                         TenantId::new(&tenant_id_string).context("tenant id")?,
@@ -572,7 +595,7 @@ impl PricingPipelineService {
             ) {
                 Ok(breakdown) => {
                     let json = serde_json::to_string(&breakdown).context("encode breakdown")?;
-                    jobs::set_priced(
+                    let set_outcome = jobs::set_priced(
                         &mut conn,
                         &quote_id,
                         &tenant_id_string,
@@ -580,6 +603,14 @@ impl PricingPipelineService {
                         breakdown.total_price,
                         OffsetDateTime::now_utc(),
                     )?;
+                    if !matches!(set_outcome, jobs::TransitionOutcome::Applied) {
+                        tracing::info!(
+                            quote_id = %quote_id,
+                            outcome = ?set_outcome,
+                            "set_priced no-op; skipping audit emit"
+                        );
+                        return Ok(StepOutcome::Advanced);
+                    }
                     let tx = conn.transaction().context("open priced-audit tx")?;
                     let meta = LedgerMeta::new(
                         TenantId::new(&tenant_id_string).context("tenant id")?,
@@ -688,7 +719,7 @@ impl PricingPipelineService {
                     std::fs::write(&pdf_path, &bytes).context("write priced.pdf")?;
                     let pdf_path_str = pdf_path.to_string_lossy().into_owned();
                     let pdf_size = bytes.len() as u64;
-                    jobs::set_rendered(
+                    let set_outcome = jobs::set_rendered(
                         &mut conn,
                         &quote_id,
                         &tenant_id_string,
@@ -696,6 +727,14 @@ impl PricingPipelineService {
                         &valid_until,
                         OffsetDateTime::now_utc(),
                     )?;
+                    if !matches!(set_outcome, jobs::TransitionOutcome::Applied) {
+                        tracing::info!(
+                            quote_id = %quote_id,
+                            outcome = ?set_outcome,
+                            "set_rendered no-op; skipping audit emit"
+                        );
+                        return Ok(StepOutcome::Advanced);
+                    }
                     let tx = conn.transaction().context("open rendered-audit tx")?;
                     let meta = LedgerMeta::new(
                         TenantId::new(&tenant_id_string).context("tenant id")?,
@@ -806,13 +845,25 @@ impl PricingPipelineService {
             jobs::ensure_schema(&conn).context("jobs schema")?;
             match post_result {
                 Ok(PostResult { outcome, .. }) => {
-                    jobs::set_state(
+                    let set_outcome = jobs::set_state(
                         &conn,
                         &quote_id_persist,
                         &tenant_id_string,
                         JobState::Posted,
                         OffsetDateTime::now_utc(),
                     )?;
+                    if !matches!(set_outcome, jobs::TransitionOutcome::Applied) {
+                        // Already-Posted (prior cycle's storefront-replay
+                        // landed) or NotFound. The storefront has the PDF;
+                        // skip audit emit to avoid double-firing.
+                        tracing::info!(
+                            quote_id = %quote_id_persist,
+                            outcome = ?set_outcome,
+                            "set_state(Posted) no-op; skipping audit emit"
+                        );
+                        let _ = post_outcome_state;
+                        return Ok(StepOutcome::Posted);
+                    }
                     let tx = conn.transaction().context("open posted-audit tx")?;
                     let meta = LedgerMeta::new(
                         TenantId::new(&tenant_id_string).context("tenant id")?,
@@ -926,9 +977,22 @@ impl PricingPipelineService {
     /// other ABERP daemons settle (matches the intake-daemon posture).
     /// On a cycle error, backs off 5s → 15s → 60s → cadence (matching
     /// the intake-daemon's S256 backoff). Exit on cancel via tokio::select.
+    ///
+    /// **S286 / PR-268**: prefer [`Self::run_daemon_supervised`] over this
+    /// at the boot site. This entry point stays for cancellation
+    /// integration tests (where panic-recovery would confuse the
+    /// assertion); production spawns the supervised wrapper.
     pub async fn run_daemon_forever(self, cancel: CancellationToken) {
-        let cadence = self.config.poll_interval;
         let service = Arc::new(self);
+        service.poll_loop(cancel).await;
+    }
+
+    /// Inner loop body. Shared by [`Self::run_daemon_forever`] (cancellation
+    /// tests) and [`Self::run_daemon_supervised`] (production). Takes
+    /// `Arc<Self>` so the supervisor can re-await a fresh tokio spawn after
+    /// a panic without re-constructing the service.
+    async fn poll_loop(self: Arc<Self>, cancel: CancellationToken) {
+        let cadence = self.config.poll_interval;
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
@@ -938,8 +1002,7 @@ impl PricingPipelineService {
             if cancel.is_cancelled() {
                 return;
             }
-            let s = service.clone();
-            let summary = s.poll_once().await;
+            let summary = self.poll_once().await;
             tracing::info!(
                 fetched = summary.fetched_from_storefront,
                 enqueued = summary.enqueued,
@@ -964,6 +1027,216 @@ impl PricingPipelineService {
             }
         }
     }
+
+    /// S286 / PR-268 hotfix supervisor. Runs [`Self::poll_loop`] inside a
+    /// tokio task whose `JoinHandle` we await; if the task panics
+    /// (Rust-side panic — NOT a C++ `libc++abi` termination, which kills
+    /// the process before this code runs), we:
+    ///
+    /// 1. Extract the panic message from the payload.
+    /// 2. Emit a `quote.pricing_daemon_panicked` audit row (best-effort —
+    ///    if the audit emit itself errors, we log and continue rather
+    ///    than infinite-looping).
+    /// 3. Sleep 30s (or 5min if 5+ panics within the last 10 minutes —
+    ///    runaway-safety).
+    /// 4. Re-spawn the loop.
+    ///
+    /// The PROD_v2.27.2 panic that motivated this hotfix was a *C++*
+    /// FATAL inside DuckDB; this supervisor can't catch it directly. The
+    /// SELECT-first defence in [`crate::quote_pricing_jobs::set_state`]
+    /// avoids triggering that FATAL path. This supervisor is the
+    /// defence-in-depth: any future Rust-side panic is recovered here
+    /// rather than aborting the host process.
+    pub async fn run_daemon_supervised(self, cancel: CancellationToken) {
+        let service = Arc::new(self);
+        let mut panic_window: std::collections::VecDeque<Instant> =
+            std::collections::VecDeque::new();
+        let mut restart_count: u32 = 0;
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let s = service.clone();
+            let inner_cancel = cancel.clone();
+            let handle = tokio::spawn(async move {
+                s.poll_loop(inner_cancel).await;
+            });
+            match handle.await {
+                Ok(()) => return,
+                Err(join_err) if join_err.is_cancelled() => return,
+                Err(join_err) => {
+                    restart_count = restart_count.saturating_add(1);
+                    let panic_msg = if join_err.is_panic() {
+                        panic_payload_to_string(join_err.into_panic())
+                    } else {
+                        // Shouldn't happen — JoinError with neither
+                        // is_cancelled nor is_panic is currently
+                        // unreachable in stable tokio. Defensive: render
+                        // it as a string.
+                        format!("daemon join failed (non-panic): {join_err}")
+                    };
+                    tracing::error!(
+                        panic_msg = %panic_msg,
+                        restart_count = restart_count,
+                        "pricing-pipeline daemon panicked; supervisor recovering"
+                    );
+                    // Best-effort audit emit. A failure here logs but does
+                    // NOT block the restart — the daemon staying up is more
+                    // important than the durable forensic row in this case.
+                    let svc = service.clone();
+                    let panic_msg_for_audit = panic_msg.clone();
+                    if let Err(e) = spawn_blocking(move || {
+                        emit_daemon_panicked_audit(
+                            &svc.deps,
+                            &panic_msg_for_audit,
+                            restart_count,
+                            None,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|join| Err(anyhow!("audit spawn join: {join}")))
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "quote.pricing_daemon_panicked audit emit failed (non-fatal)"
+                        );
+                    }
+
+                    // Trim the panic-window to the last 10 minutes.
+                    let now = Instant::now();
+                    while let Some(front) = panic_window.front().copied() {
+                        if now.duration_since(front) > PANIC_WINDOW {
+                            panic_window.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    panic_window.push_back(now);
+                    let sleep_dur = if panic_window.len() >= PANIC_BURST_THRESHOLD {
+                        PANIC_LONG_BACKOFF
+                    } else {
+                        PANIC_SHORT_BACKOFF
+                    };
+                    tracing::warn!(
+                        sleep_secs = sleep_dur.as_secs(),
+                        recent_panic_count = panic_window.len(),
+                        "pricing-pipeline supervisor sleeping before restart"
+                    );
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(sleep_dur) => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── S286 / PR-268 supervisor knobs ────────────────────────────────────
+
+/// Rolling window for the runaway-loop guard. Five panics inside this
+/// span tips the supervisor into the long-backoff branch.
+const PANIC_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// Five consecutive panics inside [`PANIC_WINDOW`] → switch to the long
+/// backoff. Picked so a transient-but-recurring bug (one panic per
+/// poll-cycle) still gets multiple-minutes between restart attempts
+/// rather than tight-looping.
+const PANIC_BURST_THRESHOLD: usize = 5;
+
+/// Default supervisor sleep before re-spawning the daemon loop.
+const PANIC_SHORT_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Escalated supervisor sleep when [`PANIC_BURST_THRESHOLD`] panics
+/// have fired inside [`PANIC_WINDOW`]. The brief: "if the daemon panics,
+/// something's seriously wrong; don't tight-loop." Five minutes gives
+/// the operator a chance to see the AMBER SPA banner.
+const PANIC_LONG_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// Extract a human-readable string from a `Box<dyn Any + Send>` panic
+/// payload. Standard idiom — strings/Strings are the two payloads stdlib
+/// emits; anything else we render as a placeholder. Sanitized before the
+/// audit emit (CR/LF/NUL stripped, truncated to 1000 chars).
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    let raw = if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    };
+    sanitize_panic_msg(&raw)
+}
+
+/// Sanitization rules match `quote_pricing_jobs::sanitize_reason` — strip
+/// CR/LF/NUL so the panic message can't leak into a log line as a forged
+/// extra line, and truncate to 1000 chars so a 100MB-allocated-vec panic
+/// payload doesn't bloat the audit ledger.
+fn sanitize_panic_msg(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !matches!(*c, '\r' | '\n' | '\0'))
+        .collect();
+    if cleaned.chars().count() <= 1000 {
+        cleaned
+    } else {
+        cleaned.chars().take(1000).collect()
+    }
+}
+
+/// S286 / PR-268 — emit `quote.pricing_daemon_panicked`. Opens a fresh
+/// DuckDB connection (the supervisor runs after a panic that may have
+/// poisoned the inner task's connections), ensures the audit schema, and
+/// appends one row with a fresh ULID-keyed idempotency. Returns Err on
+/// any failure so the supervisor can log it without crashing.
+pub(crate) fn emit_daemon_panicked_audit(
+    deps: &PricingPipelineDeps,
+    panic_msg: &str,
+    restart_count_since_boot: u32,
+    last_known_quote_id: Option<String>,
+) -> Result<()> {
+    let mut conn =
+        duckdb::Connection::open(&deps.db_path).context("open DB for daemon-panic audit")?;
+    audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
+    let tx = conn.transaction().context("open daemon-panic tx")?;
+    let meta = LedgerMeta::new(
+        TenantId::new(deps.tenant.as_str()).context("tenant id")?,
+        deps.binary_hash,
+    );
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), &deps.operator_login);
+    // Every panic gets a fresh ULID-keyed idempotency suffix — restart_count
+    // would collide on the rare two-process race during a quick relaunch.
+    let idempotency_key = format!("quote_pricing_daemon_panicked:{}", Ulid::new());
+    let payload = QuotePricingDaemonPanickedPayload {
+        tenant_id: deps.tenant.as_str().to_string(),
+        panic_msg: panic_msg.to_string(),
+        restart_count_since_boot,
+        last_known_quote_id,
+        actor: "system".to_string(),
+        idempotency_key: idempotency_key.clone(),
+    };
+    let bytes = serde_json::to_vec(&payload).context("encode daemon-panic payload")?;
+    append_in_tx(
+        &tx,
+        &meta,
+        EventKind::QuotePricingDaemonPanicked,
+        bytes,
+        actor,
+        Some(idempotency_key),
+    )
+    .context("append QuotePricingDaemonPanicked")?;
+    tx.commit().context("commit daemon-panic")?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct QuotePricingDaemonPanickedPayload {
+    tenant_id: String,
+    panic_msg: String,
+    restart_count_since_boot: u32,
+    last_known_quote_id: Option<String>,
+    actor: String,
+    idempotency_key: String,
 }
 
 /// Result of one state-machine step.
@@ -1017,7 +1290,7 @@ fn emit_failure(
     reason: &str,
     attempt_n: u32,
 ) -> Result<()> {
-    jobs::set_failed(
+    let set_outcome = jobs::set_failed(
         conn,
         quote_id,
         tenant_id,
@@ -1025,6 +1298,16 @@ fn emit_failure(
         reason,
         OffsetDateTime::now_utc(),
     )?;
+    if !matches!(set_outcome, jobs::TransitionOutcome::Applied) {
+        // Already-Failed (prior cycle landed) or NotFound. Skip audit emit
+        // to keep one row per terminal-failure transition.
+        tracing::info!(
+            quote_id = %quote_id,
+            outcome = ?set_outcome,
+            "set_failed no-op; skipping audit emit"
+        );
+        return Ok(());
+    }
     let tx = conn.transaction().context("open failed-audit tx")?;
     let meta = LedgerMeta::new(TenantId::new(tenant_id).context("tenant id")?, binary_hash);
     let actor = Actor::from_local_cli(Ulid::new().to_string(), login);
@@ -1921,5 +2204,90 @@ mod tests {
             return; // unsupported host — skip
         }
         assert!(!check_module_importable(&sh));
+    }
+
+    // ── S286 / PR-268 — supervisor pins ───────────────────────────────
+
+    #[test]
+    fn sanitize_panic_msg_strips_control_chars_and_truncates() {
+        let s = "boom\r\nfollowup\0tail";
+        assert_eq!(sanitize_panic_msg(s), "boomfollowuptail");
+        let long: String = "a".repeat(2000);
+        let cleaned = sanitize_panic_msg(&long);
+        assert_eq!(cleaned.chars().count(), 1000);
+    }
+
+    #[test]
+    fn panic_payload_to_string_extracts_static_str() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        // `Box<&'static str>` is the typical `panic!("boom")` shape.
+        let s = panic_payload_to_string(payload);
+        assert_eq!(s, "boom");
+    }
+
+    #[test]
+    fn panic_payload_to_string_extracts_owned_string() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("formatted"));
+        // `Box<String>` is the typical `panic!("{}", x)` shape (after a
+        // `format!`-style invocation; the std lib boxes a String).
+        let s = panic_payload_to_string(payload);
+        assert_eq!(s, "formatted");
+    }
+
+    #[test]
+    fn panic_payload_to_string_handles_non_string_payload() {
+        // `panic_any(42i32)` would box an i32; our extractor must NOT
+        // panic on it. The exact placeholder text is part of the audit
+        // payload contract, so this pin doubles as a no-drift guard.
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        assert_eq!(
+            panic_payload_to_string(payload),
+            "<non-string panic payload>"
+        );
+    }
+
+    #[test]
+    fn panic_payload_sanitization_applies_to_both_branches() {
+        // CR/LF/NUL stripping happens BEFORE the audit row is encoded;
+        // a forged extra line in the panic message must not bleed
+        // through into the ledger.
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("oops\r\nfake\0bytes"));
+        assert_eq!(panic_payload_to_string(payload), "oopsfakebytes");
+    }
+
+    /// Round-trip the daemon-panic audit into a stdlib-tmp DuckDB. Pins
+    /// the helper's schema-ensure + tx-commit shape so a future refactor
+    /// of `emit_daemon_panicked_audit` doesn't silently swallow appends.
+    /// Stdlib-tmp (no `tempfile` dep — see Cargo.toml) so this test stays
+    /// self-contained for the S286 hotfix surface.
+    #[test]
+    fn emit_daemon_panicked_audit_writes_one_row() {
+        use aberp_audit_ledger::{recent_entries, BinaryHash, TenantId};
+        let mut db_path = std::env::temp_dir();
+        db_path.push(format!("aberp-s286-panic-{}.duckdb", Ulid::new()));
+        // Best-effort: clean up a prior leftover from a flaky run.
+        let _ = std::fs::remove_file(&db_path);
+        let deps = PricingPipelineDeps {
+            db_path: db_path.clone(),
+            tenant: TenantId::new("T").expect("tid"),
+            binary_hash: BinaryHash::from_bytes([0u8; 32]),
+            operator_login: "ervin".to_string(),
+        };
+        emit_daemon_panicked_audit(&deps, "boom", 1, Some("q-1".to_string())).expect("emit");
+        emit_daemon_panicked_audit(&deps, "second", 2, None).expect("emit2");
+        let conn = duckdb::Connection::open(&db_path).expect("reopen");
+        let entries = recent_entries(&conn, 10).expect("recent");
+        // Two panic rows in seq-DESC order: "second" is newest.
+        assert_eq!(entries.len(), 2);
+        for e in &entries {
+            assert_eq!(e.kind.as_str(), "quote.pricing_daemon_panicked");
+        }
+        let newest_payload: serde_json::Value =
+            serde_json::from_slice(&entries[0].payload).expect("decode");
+        assert_eq!(newest_payload["panic_msg"], "second");
+        assert_eq!(newest_payload["restart_count_since_boot"], 2);
+        assert!(newest_payload["last_known_quote_id"].is_null());
+        drop(conn);
+        let _ = std::fs::remove_file(&db_path);
     }
 }

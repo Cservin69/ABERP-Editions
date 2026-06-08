@@ -3174,6 +3174,15 @@ export interface PipelinePythonStatus {
    * RED (`resolved=false → daemon_spawned=false`) from AMBER
    * (`resolved=true → daemon_spawned=false`, e.g. construction error). */
   daemon_spawned: boolean;
+  /** S286 / PR-268 — count of `quote.pricing_daemon_panicked` audit rows
+   * in the last 10 minutes. The supervisor in `quote_pricing_pipeline.rs`
+   * catches Rust-side panics and emits one of these per recovery; if any
+   * fired in the window the SPA shows an AMBER banner directing the
+   * operator to the audit ledger. `0` is the steady-state. */
+  recent_panic_count: number;
+  /** RFC-3339 wall-clock of the most recent daemon-panic audit row, or
+   * `null` when no panics have fired in the window. */
+  last_panic_at: string | null;
 }
 
 /** S282 / PR-267 — fetch the pricing-pipeline daemon status. */
