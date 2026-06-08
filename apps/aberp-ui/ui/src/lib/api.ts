@@ -3141,6 +3141,11 @@ export interface PricingJobRow {
   error_stage: string | null;
   error_reason: string | null;
   attempt_n: number;
+  /** S290 / PR-271 — classifier verdict for Failed rows. Closed vocab:
+   * `transient | permanent | unknown`. `null` on non-Failed rows AND on
+   * legacy PROD_v2.27.[0-5] Failed rows that pre-date the classifier
+   * (treated as `unknown` by the SPA badge — operator decides). */
+  failure_kind: string | null;
 }
 
 interface PricingJobsResponse {

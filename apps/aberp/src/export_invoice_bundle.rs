@@ -837,7 +837,12 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // (`quote.*`). Boot-time schema-migration record; carries
         // tenant_id + index_name + dropped_at, never NAV XML bytes.
         // Never sweeps a per-OUTGOING-invoice export bundle.
-        | EventKind::QuotePricingJobsIndexMigrated => None,
+        | EventKind::QuotePricingJobsIndexMigrated
+        // S290 / PR-271 — failure-classifier verdict kind (`quote.*`).
+        // Companion to QuotePricingFailed; carries failure_kind verdict
+        // + last_error + attempt_n, never NAV XML bytes. Never sweeps a
+        // per-OUTGOING-invoice export bundle.
+        | EventKind::QuotePricingFailureClassified => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

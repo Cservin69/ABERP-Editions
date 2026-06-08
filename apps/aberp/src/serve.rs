@@ -16483,6 +16483,11 @@ fn quote_intake_auth_paused(state: &AppState) -> Result<bool> {
 /// S279 / PR-265 — wire shape for the `/api/quote-pricing-jobs` list.
 /// Read-only operator view; the daemon is the only writer. Closed-vocab
 /// `state` matches [`crate::quote_pricing_jobs::JobState`] storage strings.
+///
+/// **S290 / PR-271**: extended with `failure_kind` (closed-vocab
+/// `transient`/`permanent`/`unknown`, `None` on non-Failed rows AND on
+/// pre-PR-271 Failed rows). Drives the SPA badge that tells the operator
+/// whether clicking Retry has any chance of succeeding.
 #[derive(Debug, serde::Serialize)]
 struct PricingJobView {
     quote_id: String,
@@ -16498,6 +16503,10 @@ struct PricingJobView {
     error_stage: Option<String>,
     error_reason: Option<String>,
     attempt_n: u32,
+    /// S290 / PR-271 — classifier verdict. Closed-vocab string;
+    /// `None` on non-Failed rows + on legacy PROD_v2.27.[0-5] Failed
+    /// rows that pre-date the classifier.
+    failure_kind: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -16544,6 +16553,7 @@ async fn handle_list_quote_pricing_jobs(
                 error_stage: r.error_stage,
                 error_reason: r.error_reason,
                 attempt_n: r.attempt_n,
+                failure_kind: r.failure_kind.map(|k| k.as_str().to_string()),
             })
             .collect(),
     };

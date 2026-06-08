@@ -963,7 +963,12 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // (`quote.*`). Boot-time migration record; payload carries
         // tenant_id / index_name / dropped_at, never NAV XML bytes.
         // Never sweeps a per-OUTGOING-invoice bundle.
-        | EventKind::QuotePricingJobsIndexMigrated => (None, ""),
+        | EventKind::QuotePricingJobsIndexMigrated
+        // S290 / PR-271 — failure-classifier verdict kind (`quote.*`).
+        // Companion to QuotePricingFailed; payload carries failure_kind /
+        // last_error / attempt_n, never NAV XML bytes. Never sweeps a
+        // per-OUTGOING-invoice bundle.
+        | EventKind::QuotePricingFailureClassified => (None, ""),
     };
 
     Ok(NavExtraction {

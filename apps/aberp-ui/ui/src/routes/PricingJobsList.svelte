@@ -19,6 +19,7 @@
   } from "../lib/api";
   import { formatInvoiceDate } from "../lib/format";
   import { classifyEmptyState } from "../lib/pricing-empty-state";
+  import { failureKindBadge } from "../lib/pricing-failure-kind";
 
   type LoadState = "idle" | "loading" | "ready" | "error";
 
@@ -91,6 +92,10 @@
         return state;
     }
   }
+
+  // S290 / PR-271 — failure-kind badge rendering is extracted to
+  // `lib/pricing-failure-kind.ts` so the four-branch logic can be
+  // vitest-pinned without component-render tooling. Imported above.
 
   async function onRetry(quoteId: string): Promise<void> {
     retryBusyQuoteId = quoteId;
@@ -261,6 +266,16 @@
             <td>
               {#if row.state === "failed"}
                 <div class="pricing-jobs__err-stage">{row.error_stage ?? ""}</div>
+                {#if failureKindBadge(row.failure_kind)}
+                  {@const badge = failureKindBadge(row.failure_kind)!}
+                  <div class="pricing-jobs__kind-row">
+                    <span
+                      class={badge.className}
+                      data-testid={`pricing-jobs-kind-${row.quote_id}`}
+                      data-failure-kind={row.failure_kind ?? "null"}
+                    >{badge.label}</span>
+                  </div>
+                {/if}
                 <div class="pricing-jobs__muted">{row.error_reason ?? ""}</div>
               {:else}
                 —
@@ -349,6 +364,11 @@
   .pricing-jobs__err-stage {
     font-weight: 600;
     color: var(--color-danger, #f87171);
+  }
+  /* S290 / PR-271 — gives the failure-kind badge breathing room above
+     the (often long) error_reason line. */
+  .pricing-jobs__kind-row {
+    margin: 4px 0;
   }
   .pricing-jobs__attempt {
     margin-left: 6px;

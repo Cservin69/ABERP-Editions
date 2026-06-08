@@ -63,7 +63,7 @@ use aberp_quote_engine::{
 };
 use aberp_quote_pdf::QuoteInputs;
 
-use crate::quote_pricing_jobs::{self as jobs, JobState, PricingJobRow};
+use crate::quote_pricing_jobs::{self as jobs, FailureKind, JobState, PricingJobRow};
 
 /// What every pricing-pipeline cycle reports back. Used for the SPA
 /// "last cycle" indicator + the daemon's log line.
@@ -1276,9 +1276,102 @@ fn backoff_duration(idx: usize, cadence: Duration) -> Duration {
     }
 }
 
+/// S290 / PR-271 — classify a per-stage failure into a daemon-actionable
+/// verdict. Pure function — no I/O, no DB, no clock. Runs ONCE per
+/// failure transition just before `set_failed`.
+///
+/// Rules (in evaluation order):
+///
+/// - **stage="extract"** + reason contains `"not yet implemented"` →
+///   `Permanent`. The STEP-extractor stub (S269) returns this verbatim
+///   for any non-STL submission; nothing the daemon can do without an
+///   OCCT lift (S270+).
+/// - reason contains `"is not in the catalogue"` →
+///   `Permanent`. Matches [`aberp_quote_engine::QuoteError::
+///   MaterialNotInCatalogue`]'s `Display`. Operator must add the grade
+///   to the catalogue (Material Catalogue SPA) before retry.
+/// - reason contains `"_schema_version mismatch"` OR
+///   `"feature-graph schema version"` → `Permanent`. Matches both
+///   [`aberp_cad_extract_wrapper::ExtractError::SchemaVersionMismatch`]
+///   and [`aberp_quote_engine::QuoteError::UnsupportedSchemaVersion`]'s
+///   `Display`. A code-build mismatch — retry won't help until the
+///   binary is upgraded.
+/// - reason contains `"below configured floor"` →
+///   `Permanent`. Matches [`aberp_quote_engine::QuoteError::
+///   MarginFloorViolation`]. Documented pushback in the brief —
+///   technically retryable if the operator adjusts the margin profile,
+///   but that IS an operator action, so the Retry-click is the right
+///   trigger.
+/// - **stage="extract"** + reason contains `"cad file missing"` OR
+///   `"CAD file not found"` → `Permanent`. Storefront data-quality miss
+///   (S289 caught one variant; the storefront persistence still has
+///   gaps in the corner-case path).
+/// - **stage="post"** + reason contains `"HTTP 401"` OR `"HTTP 403"` →
+///   `Permanent`. Auth — operator must rotate the storefront token via
+///   Settings → Storefront credentials.
+/// - **stage="post"** + reason contains `"HTTP 4"` (any other 4xx) →
+///   `Permanent`. Storefront-side validation rejected the writeback;
+///   retry without change won't help.
+/// - **stage="post"** + reason contains `"HTTP 5"` (any 5xx) OR
+///   `"timeout"` OR `"connection"` OR `"dns"` → `Transient`. Storefront
+///   blip; the next cycle's retry has a real chance of succeeding.
+/// - Default → `Unknown`. Surfaces with a capped auto-retry policy
+///   per the daemon scheduler; better than silent permanent-loop on a
+///   future error shape we haven't classified yet.
+///
+/// Stays case-INSENSITIVE on the reason match by lowercasing both
+/// sides (matchings use lowercase literals); the engine + wrapper
+/// `Display` strings already use lowercase but defence-in-depth saves
+/// a future regression.
+pub fn classify_failure(stage: &str, reason: &str) -> FailureKind {
+    let r = reason.to_ascii_lowercase();
+    // Permanent: extractor stubs / not-yet-implemented / bad input.
+    if r.contains("not yet implemented") {
+        return FailureKind::Permanent;
+    }
+    if r.contains("is not in the catalogue") {
+        return FailureKind::Permanent;
+    }
+    if r.contains("_schema_version mismatch") || r.contains("feature-graph schema version") {
+        return FailureKind::Permanent;
+    }
+    if r.contains("below configured floor") {
+        return FailureKind::Permanent;
+    }
+    if stage == "extract" && (r.contains("cad file missing") || r.contains("cad file not found")) {
+        return FailureKind::Permanent;
+    }
+    if stage == "extract" && r.contains("input cad file not found") {
+        return FailureKind::Permanent;
+    }
+    // POST-back classification — split on HTTP status family + transport
+    // failure shape.
+    if stage == "post" {
+        if r.contains("http 401") || r.contains("http 403") {
+            return FailureKind::Permanent;
+        }
+        // The post_priced_writeback `Display` shape is `priced-writeback
+        // HTTP <code> body=...`. Match "http 4" then disambiguate from
+        // 5xx below.
+        if r.contains("http 4") {
+            return FailureKind::Permanent;
+        }
+        if r.contains("http 5")
+            || r.contains("timeout")
+            || r.contains("timed out")
+            || r.contains("connection")
+            || r.contains("dns")
+        {
+            return FailureKind::Transient;
+        }
+    }
+    FailureKind::Unknown
+}
+
 /// Best-effort failure path used by every state-machine arm. Writes
-/// the `Failed` row + emits `QuotePricingFailed`. Tracing is
-/// downstream of the audit row (the audit is the durable record).
+/// the `Failed` row + emits `QuotePricingFailed` and (S290) the
+/// `QuotePricingFailureClassified` companion. Tracing is downstream of
+/// the audit row (the audit is the durable record).
 #[allow(clippy::too_many_arguments)]
 fn emit_failure(
     conn: &mut duckdb::Connection,
@@ -1290,12 +1383,14 @@ fn emit_failure(
     reason: &str,
     attempt_n: u32,
 ) -> Result<()> {
+    let failure_kind = classify_failure(stage, reason);
     let set_outcome = jobs::set_failed(
         conn,
         quote_id,
         tenant_id,
         stage,
         reason,
+        failure_kind,
         OffsetDateTime::now_utc(),
     )?;
     if !matches!(set_outcome, jobs::TransitionOutcome::Applied) {
@@ -1330,6 +1425,32 @@ fn emit_failure(
         Some(payload.idempotency_key.clone()),
     )
     .context("append QuotePricingFailed")?;
+    // S290 / PR-271 — companion classifier-verdict row. Inside the same
+    // tx so the (failed + classified) pair commit atomically: a forensic
+    // walker never sees one without the other. Fresh ULID actor so the
+    // pair is distinguishable in the audit list (same suffix shape as
+    // the failed row).
+    let classified_actor = Actor::from_local_cli(Ulid::new().to_string(), login);
+    let classified_payload = QuotePricingFailureClassifiedPayload {
+        quote_id: quote_id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        failure_kind: failure_kind.as_str().to_string(),
+        last_error: reason.chars().take(1000).collect(),
+        attempt_n,
+        actor: "system".to_string(),
+        idempotency_key: format!("quote_pricing_failure_classified:{quote_id}:{attempt_n}"),
+    };
+    let classified_bytes =
+        serde_json::to_vec(&classified_payload).context("encode classified payload")?;
+    append_in_tx(
+        &tx,
+        &meta,
+        EventKind::QuotePricingFailureClassified,
+        classified_bytes,
+        classified_actor,
+        Some(classified_payload.idempotency_key.clone()),
+    )
+    .context("append QuotePricingFailureClassified")?;
     tx.commit().context("commit failed-audit")?;
     Ok(())
 }
@@ -1593,6 +1714,26 @@ struct QuotePricingFailedPayload {
     tenant_id: String,
     stage: String,
     reason: String,
+    attempt_n: u32,
+    actor: String,
+    idempotency_key: String,
+}
+
+/// S290 / PR-271 — payload for `quote.pricing_failure_classified`. Rides
+/// alongside every `QuotePricingFailed` emit; the classifier verdict
+/// (`transient`/`permanent`/`unknown`) drives the SPA badge + the
+/// daemon's "should I auto-retry?" decision.
+#[derive(Debug, Serialize)]
+struct QuotePricingFailureClassifiedPayload {
+    quote_id: String,
+    tenant_id: String,
+    /// Closed-vocab: `transient` / `permanent` / `unknown`.
+    failure_kind: String,
+    /// The free-text reason that fed the classifier — truncated to 1000
+    /// chars, CR/LF/NUL already stripped by [`jobs::sanitize_reason`]
+    /// before this payload is built. Carries the exact string the
+    /// operator sees in the SPA's Error column for cross-referencing.
+    last_error: String,
     attempt_n: u32,
     actor: String,
     idempotency_key: String,
@@ -2456,5 +2597,246 @@ mod tests {
         assert!(newest_payload["last_known_quote_id"].is_null());
         drop(conn);
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // ── S290 / PR-271 — failure classifier pins ───────────────────────
+
+    /// The motivating prod row: storefront accepted a STEP file (legacy
+    /// data, before the storefront content-sniff lands), extractor stubs
+    /// out with NotImplementedError. EVERY retry hits the same error.
+    /// Classifier must report Permanent so the SPA badge tells the
+    /// operator not to bother clicking Retry.
+    #[test]
+    fn s290_classify_step_extractor_stub_is_permanent() {
+        // The exact `Display` shape the wrapper emits when the Python
+        // CLI exits 2 with the STEP stub message — verbatim from
+        // `python/aberp-cad-extract/aberp_cad_extract/extractors/step.py`
+        // + the wrapper's `ExtractError::NonZeroExit` Display.
+        let reason = "subprocess exited with code Some(2): \
+            NotImplementedError: STEP extraction not yet implemented in v1; \
+            please supply STL. Slated for S270 alongside the Rust subprocess wrapper.";
+        assert_eq!(
+            classify_failure("extract", reason),
+            FailureKind::Permanent,
+            "STEP-stub failures must be Permanent — auto-retry is wasted cycles"
+        );
+    }
+
+    #[test]
+    fn s290_classify_material_not_in_catalogue_is_permanent() {
+        let reason = "material grade `unknown` is not in the catalogue snapshot";
+        assert_eq!(classify_failure("price", reason), FailureKind::Permanent);
+    }
+
+    #[test]
+    fn s290_classify_schema_version_mismatch_is_permanent() {
+        // Wrapper-side mismatch.
+        assert_eq!(
+            classify_failure(
+                "extract",
+                "FeatureGraph _schema_version mismatch: expected 1, got 2"
+            ),
+            FailureKind::Permanent
+        );
+        // Engine-side mismatch (defence-in-depth — same verdict).
+        assert_eq!(
+            classify_failure(
+                "price",
+                "feature-graph schema version 2 is not understood by engine (supports 1)"
+            ),
+            FailureKind::Permanent
+        );
+    }
+
+    #[test]
+    fn s290_classify_margin_floor_violation_is_permanent() {
+        let reason = "computed margin 0.0500 below configured floor 0.1500 \
+            (total_price=10.0000)";
+        assert_eq!(classify_failure("price", reason), FailureKind::Permanent);
+    }
+
+    #[test]
+    fn s290_classify_post_4xx_is_permanent() {
+        assert_eq!(
+            classify_failure(
+                "post",
+                "priced-writeback HTTP 401 Unauthorized body=invalid token"
+            ),
+            FailureKind::Permanent
+        );
+        assert_eq!(
+            classify_failure(
+                "post",
+                "priced-writeback HTTP 403 Forbidden body=missing scope"
+            ),
+            FailureKind::Permanent
+        );
+        // Validation 4xx — operator review needed.
+        assert_eq!(
+            classify_failure(
+                "post",
+                "priced-writeback HTTP 422 Unprocessable body=schema mismatch"
+            ),
+            FailureKind::Permanent
+        );
+    }
+
+    #[test]
+    fn s290_classify_post_5xx_and_transport_are_transient() {
+        assert_eq!(
+            classify_failure(
+                "post",
+                "priced-writeback HTTP 503 Service Unavailable body=down"
+            ),
+            FailureKind::Transient
+        );
+        assert_eq!(
+            classify_failure("post", "operation timed out after 30s"),
+            FailureKind::Transient
+        );
+        assert_eq!(
+            classify_failure("post", "connection reset by peer"),
+            FailureKind::Transient
+        );
+    }
+
+    #[test]
+    fn s290_classify_unknown_default_is_unknown() {
+        // A future error shape the classifier doesn't recognise → Unknown.
+        // The daemon's auto-retry cap then frees the operator from
+        // forever-loops on unknown failures (CLAUDE.md rule 12 — fail loud).
+        assert_eq!(
+            classify_failure("render", "PDF font missing"),
+            FailureKind::Unknown
+        );
+        assert_eq!(
+            classify_failure("extract", "subprocess spawn failed: out of memory"),
+            FailureKind::Unknown
+        );
+    }
+
+    #[test]
+    fn s290_classify_post_transient_keywords_dont_leak_to_other_stages() {
+        // "timeout" appearing in a non-post stage shouldn't classify as
+        // Transient — the post-stage transport rules are stage-scoped.
+        // Default to Unknown so the operator's auto-retry cap kicks in.
+        assert_eq!(
+            classify_failure("render", "rendering timeout after 30s"),
+            FailureKind::Unknown
+        );
+    }
+
+    /// S290 / PR-271 — forensic c1cf32 end-to-end pin. Replays the exact
+    /// shape of Ervin's 2026-06-08 evening test:
+    ///
+    ///   * Storefront submitted a STEP CAD (legacy data, before the
+    ///     storefront content-sniff lands).
+    ///   * Daemon enqueued `c1cf32ed-72b6-4708-8abb-6359d27f042b` at
+    ///     `Fetched`, with `material_grade = "unknown"`.
+    ///   * Extractor subprocess exited non-zero with the STEP-stub
+    ///     `NotImplementedError` message.
+    ///   * emit_failure ran: classify_failure returned `Permanent`;
+    ///     `set_failed` wrote `state=Failed`, `failure_kind=permanent`.
+    ///   * Daemon's next sweep MUST NOT re-enqueue the row.
+    ///
+    /// Pins three invariants in one test:
+    /// 1. The classifier verdict for the literal STEP-stub error string.
+    /// 2. The DB roundtrip: `set_failed` writes the verdict; `list_jobs`
+    ///    reads it back.
+    /// 3. `next_actionable_job` does NOT pick the row up (the daemon's
+    ///    auto-retry skip — operator's Retry click is the only route).
+    #[test]
+    fn s290_c1cf32_step_stub_lands_permanent_and_is_not_reenqueued() {
+        use crate::quote_pricing_jobs::{
+            insert_fetched_job, list_jobs, next_actionable_job, set_failed, set_state, FailureKind,
+            JobState,
+        };
+
+        let mut conn = duckdb::Connection::open_in_memory().expect("open mem");
+        crate::quote_pricing_jobs::ensure_schema(&conn).expect("schema");
+
+        let prod_qid = "c1cf32ed-72b6-4708-8abb-6359d27f042b";
+        let tenant = "T";
+        let now = OffsetDateTime::from_unix_timestamp(1_750_000_000).expect("ts");
+
+        // Step 1 — enqueue the prod-shaped row at Fetched.
+        let inserted = insert_fetched_job(
+            &conn,
+            prod_qid,
+            tenant,
+            "ervin@aben.ch",
+            "ervin csenger",
+            "unknown",
+            1,
+            "submission.step",
+            "/var/aberp/quote-artifacts/c1cf32ed-.../submission.step",
+            now,
+        )
+        .expect("enqueue at Fetched");
+        assert!(inserted);
+
+        // Step 2 — daemon picks up the row → advance_extract sets
+        // Extracting → extractor subprocess returns the STEP stub
+        // `NotImplementedError`. The reason string is the exact `Display`
+        // shape `ExtractError::NonZeroExit` produces.
+        set_state(&conn, prod_qid, tenant, JobState::Extracting, now).expect("Extracting");
+        let extract_err = "subprocess exited with code Some(2): \
+            NotImplementedError: STEP extraction not yet implemented in v1; \
+            please supply STL. Slated for S270 alongside the Rust subprocess wrapper.";
+
+        // Step 3 — classifier verdict.
+        let verdict = classify_failure("extract", extract_err);
+        assert_eq!(
+            verdict,
+            FailureKind::Permanent,
+            "STEP-stub must classify as Permanent"
+        );
+
+        // Step 4 — set_failed writes both Failed AND the verdict.
+        let outcome = set_failed(
+            &mut conn,
+            prod_qid,
+            tenant,
+            "extract",
+            extract_err,
+            verdict,
+            now,
+        )
+        .expect("set_failed");
+        assert_eq!(
+            outcome,
+            crate::quote_pricing_jobs::TransitionOutcome::Applied
+        );
+
+        // Step 5 — DB roundtrip pins the persisted verdict.
+        let rows = list_jobs(&conn, tenant).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, JobState::Failed);
+        assert_eq!(
+            rows[0].failure_kind,
+            Some(FailureKind::Permanent),
+            "persisted verdict must match classifier"
+        );
+
+        // Step 6 — the load-bearing pin: daemon's next sweep does NOT
+        // re-enqueue the row. The operator's audit-visible Retry click
+        // is the only route back to Fetched.
+        let next = next_actionable_job(&conn, tenant).expect("next");
+        assert!(
+            next.is_none(),
+            "next_actionable_job must NOT pick up a Permanent Failed row \
+             (got {next:?}). The auto-retry-5× symptom from 2026-06-08 \
+             evening must not recur."
+        );
+
+        // Belt + braces — even after several cycles, the row stays Failed.
+        for _ in 0..3 {
+            assert!(next_actionable_job(&conn, tenant)
+                .expect("next-loop")
+                .is_none());
+        }
+        let rows = list_jobs(&conn, tenant).expect("list-after-loop");
+        assert_eq!(rows[0].state, JobState::Failed);
+        assert_eq!(rows[0].failure_kind, Some(FailureKind::Permanent));
     }
 }

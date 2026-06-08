@@ -1684,6 +1684,39 @@ pub enum EventKind {
     /// Payload: `serde_json::Value`.
     /// F12 four-edit ritual fires once.
     QuotePricingJobsIndexMigrated,
+
+    /// S290 / PR-271 — companion to [`Self::QuotePricingFailed`]; records the
+    /// classifier's verdict (Transient / Permanent / Unknown) for the same
+    /// failure transition. Lets the operator audit-ledger-walk all Permanent
+    /// failures for review without parsing free-text `reason` strings.
+    ///
+    /// Emitted alongside `QuotePricingFailed` from the pipeline's failure
+    /// path; one row per per-attempt failure. The `Failed` audit row carries
+    /// the (stage, reason, attempt_n) triple; this row carries the classified
+    /// `failure_kind` so the daemon's "should I auto-retry?" decision is
+    /// itself auditable.
+    ///
+    /// Why a separate kind rather than extending the failed-payload — the
+    /// classification is a *daemon decision*, not part of the stage-failure
+    /// fact; folding the kind into the `Failed` payload would conflate
+    /// "what broke" with "what we decided to do about it" and break the
+    /// per-kind forensic glob ("show me every classification decision the
+    /// daemon ever made").
+    ///
+    /// Carries `quote_id`, `tenant_id`, `failure_kind` (closed-vocab
+    /// `transient`/`permanent`/`unknown`), `last_error`, `attempt_n`,
+    /// `actor` (`"system"`), `idempotency_key`
+    /// (`quote_pricing_failure_classified:<quote_id>:<attempt_n>` — one
+    /// row per (quote, attempt) pair; subsequent re-failures collide at the
+    /// audit-ledger's UNIQUE defence, matching the `QuotePricingFailed`
+    /// idempotency posture).
+    ///
+    /// `quote.*` prefix family (keeps the forensic-glob "everything the
+    /// pricing pipeline did" intact).
+    ///
+    /// Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricingFailureClassified,
 }
 
 impl EventKind {
@@ -1777,6 +1810,7 @@ impl EventKind {
             EventKind::PipelinePythonResolved => "quote.pipeline_python_resolved",
             EventKind::QuotePricingDaemonPanicked => "quote.pricing_daemon_panicked",
             EventKind::QuotePricingJobsIndexMigrated => "quote.pricing_jobs_index_migrated",
+            EventKind::QuotePricingFailureClassified => "quote.pricing_failure_classified",
         }
     }
 
@@ -1881,6 +1915,7 @@ impl EventKind {
             "quote.pipeline_python_resolved" => Ok(EventKind::PipelinePythonResolved),
             "quote.pricing_daemon_panicked" => Ok(EventKind::QuotePricingDaemonPanicked),
             "quote.pricing_jobs_index_migrated" => Ok(EventKind::QuotePricingJobsIndexMigrated),
+            "quote.pricing_failure_classified" => Ok(EventKind::QuotePricingFailureClassified),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -1977,6 +2012,7 @@ mod tests {
             EventKind::PipelinePythonResolved,
             EventKind::QuotePricingDaemonPanicked,
             EventKind::QuotePricingJobsIndexMigrated,
+            EventKind::QuotePricingFailureClassified,
         ];
         for v in variants {
             let s = v.as_str();
@@ -3665,6 +3701,56 @@ mod tests {
             EventKind::QuotePricingFailed,
             EventKind::PipelinePythonResolved,
             EventKind::QuotePricingDaemonPanicked,
+        ] {
+            assert_ne!(
+                s,
+                sibling.as_str(),
+                "{s} collides with {}",
+                sibling.as_str()
+            );
+        }
+    }
+
+    /// S290 / PR-271 — the classifier-verdict kind sits in the `quote.*`
+    /// family alongside its pricing-pipeline siblings. A forensic walker
+    /// grepping `quote.*` for "everything the pricing pipeline did on this
+    /// install" must surface the classifier's verdict next to the failure
+    /// it explains.
+    #[test]
+    fn s290_pricing_failure_classified_uses_quote_prefix() {
+        let s = EventKind::QuotePricingFailureClassified.as_str();
+        assert_eq!(s, "quote.pricing_failure_classified");
+        assert!(s.starts_with("quote."), "{s} must start with quote.");
+        assert!(
+            !s.starts_with("invoice."),
+            "{s} must not start with invoice."
+        );
+        assert!(!s.starts_with("system."), "{s} must not start with system.");
+        assert!(!s.starts_with("mes."), "{s} must not start with mes.");
+        assert!(
+            !s.starts_with("inventory."),
+            "{s} must not start with inventory."
+        );
+        assert!(!s.starts_with("email."), "{s} must not start with email.");
+    }
+
+    /// S290 / PR-271 — classifier-verdict kind is distinct from every
+    /// pricing-pipeline sibling. A collision would mis-route the verdict
+    /// row into a per-job stage bucket and silently mute the operator-
+    /// visible "operator retry required" badge.
+    #[test]
+    fn s290_pricing_failure_classified_is_distinct() {
+        let s = EventKind::QuotePricingFailureClassified.as_str();
+        for sibling in [
+            EventKind::QuotePricingFetched,
+            EventKind::QuotePricingExtracted,
+            EventKind::QuotePricingPriced,
+            EventKind::QuotePricingRendered,
+            EventKind::QuotePricingPosted,
+            EventKind::QuotePricingFailed,
+            EventKind::PipelinePythonResolved,
+            EventKind::QuotePricingDaemonPanicked,
+            EventKind::QuotePricingJobsIndexMigrated,
         ] {
             assert_ne!(
                 s,

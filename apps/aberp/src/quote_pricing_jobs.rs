@@ -78,6 +78,66 @@ pub enum JobState {
     Failed,
 }
 
+/// S290 / PR-271 — closed-vocab classifier verdict that rides alongside
+/// every `Failed` row. Lets the daemon decide whether to auto-re-enqueue
+/// (Transient) or wait for an operator Retry click (Permanent / Unknown
+/// past the auto-retry cap).
+pub const FAILURE_KIND_TRANSIENT: &str = "transient";
+/// S290 / PR-271 — wait-for-operator failure (extractor stub, schema
+/// version mismatch, MarginFloor, missing material, 4xx).
+pub const FAILURE_KIND_PERMANENT: &str = "permanent";
+/// S290 / PR-271 — default when the classifier didn't recognise the
+/// error shape. Treated as Transient up to [`UNKNOWN_AUTO_RETRY_CAP`]
+/// auto-retries, then frozen pending operator action — defence against
+/// silent permanent loops on a future error we haven't classified yet.
+pub const FAILURE_KIND_UNKNOWN: &str = "unknown";
+
+/// Auto-retry cap for `Unknown`-classified Failed rows. Three matches
+/// the storefront's "retry once or twice before giving up" intuition;
+/// the cap lives in code (not config) because changing it without an
+/// audit-row-emit change would silently shift behavior on prod —
+/// CLAUDE.md rule 12.
+pub const UNKNOWN_AUTO_RETRY_CAP: u32 = 3;
+
+/// Closed-vocab failure-kind verdict. Rides on a Failed row's
+/// `failure_kind` column. NULL ↔ legacy pre-PR-271 row → treated as
+/// `Unknown` for daemon scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Retry on next cycle (network blip, 5xx, timeout).
+    Transient,
+    /// Wait for operator Retry click (extractor stub / bad input /
+    /// schema-version mismatch / 4xx).
+    Permanent,
+    /// Classifier didn't recognise the error. Capped auto-retry, then
+    /// surfaces operator-action-required.
+    Unknown,
+}
+
+impl FailureKind {
+    /// DB storage string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureKind::Transient => FAILURE_KIND_TRANSIENT,
+            FailureKind::Permanent => FAILURE_KIND_PERMANENT,
+            FailureKind::Unknown => FAILURE_KIND_UNKNOWN,
+        }
+    }
+
+    /// Round-trip parse. Errors loud on unknown — silent fallback would
+    /// mask schema drift.
+    pub fn parse_str(s: &str) -> Result<Self> {
+        match s {
+            FAILURE_KIND_TRANSIENT => Ok(FailureKind::Transient),
+            FAILURE_KIND_PERMANENT => Ok(FailureKind::Permanent),
+            FAILURE_KIND_UNKNOWN => Ok(FailureKind::Unknown),
+            other => Err(anyhow!(
+                "unknown quote_pricing_jobs.failure_kind: {other:?}"
+            )),
+        }
+    }
+}
+
 impl JobState {
     /// DB storage string.
     pub fn as_str(self) -> &'static str {
@@ -139,6 +199,11 @@ pub struct PricingJobRow {
     /// Increments on every retry — disambiguates the audit-failure
     /// idempotency key suffix so a re-failure doesn't UNIQUE-collide.
     pub attempt_n: u32,
+    /// S290 / PR-271 — `Some(_)` on Failed rows that the classifier
+    /// tagged with a verdict. `None` on legacy PROD_v2.27.[0-5] rows
+    /// AND on non-Failed rows. Treated as `Unknown` by the daemon's
+    /// auto-retry decision for backwards compatibility.
+    pub failure_kind: Option<FailureKind>,
 }
 
 const SCHEMA_SQL: &str = "
@@ -162,7 +227,8 @@ CREATE TABLE IF NOT EXISTS quote_pricing_jobs (
     valid_until_iso       VARCHAR,
     error_stage           VARCHAR,
     error_reason          VARCHAR,
-    attempt_n             INTEGER NOT NULL
+    attempt_n             INTEGER NOT NULL,
+    failure_kind          VARCHAR
 );
 -- S286 / PR-268 — explicitly drop the (tenant_id, state) secondary
 -- index that S279 ship-cut introduced. The PROD_v2.27.2 crash stack
@@ -178,6 +244,13 @@ CREATE TABLE IF NOT EXISTS quote_pricing_jobs (
 -- row table, which costs microseconds in v1. The index can be added
 -- back via a future ADR if the row population ever justifies it.
 DROP INDEX IF EXISTS quote_pricing_jobs_tenant_state_idx;
+-- S290 / PR-271 — additive migration for installs already carrying the
+-- pre-PR-271 schema (PROD_v2.27.[0-5]). New nullable column, no DEFAULT
+-- per [[no-sql-specific]]; the app layer treats NULL as 'Unknown' for
+-- the daemon scheduler so existing Failed rows keep their auto-retry
+-- behavior until they're operator-Retry'd (which writes a fresh row at
+-- Fetched + clears the column).
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS failure_kind VARCHAR;
 ";
 
 /// Idempotent — call at every writer entry.
@@ -538,12 +611,18 @@ pub fn set_rendered(
 /// **S286 hotfix**: SELECT-first; skip the UPDATE if already at `Failed`.
 /// (Daemon-side: a re-failure of an already-failed row is plausible during
 /// supervisor recovery; treat as a no-op rather than re-emitting.)
+///
+/// **S290 / PR-271**: also stamps `failure_kind` (Transient / Permanent /
+/// Unknown) so the daemon's `next_actionable_job` can skip Permanent rows
+/// and cap Unknown auto-retries. The classifier runs in
+/// [`crate::quote_pricing_pipeline::classify_failure`] before calling this.
 pub fn set_failed(
     conn: &mut Connection,
     quote_id: &str,
     tenant_id: &str,
     stage: &str,
     reason: &str,
+    failure_kind: FailureKind,
     now: OffsetDateTime,
 ) -> Result<TransitionOutcome> {
     ensure_schema(conn)?;
@@ -560,9 +639,18 @@ pub fn set_failed(
     let rows = tx
         .execute(
             "UPDATE quote_pricing_jobs
-                SET state = ?, updated_at = ?, error_stage = ?, error_reason = ?
+                SET state = ?, updated_at = ?, error_stage = ?, error_reason = ?,
+                    failure_kind = ?
                 WHERE quote_id = ? AND tenant_id = ?",
-            params![STATE_FAILED, ts, stage, safe, quote_id, tenant_id],
+            params![
+                STATE_FAILED,
+                ts,
+                stage,
+                safe,
+                failure_kind.as_str(),
+                quote_id,
+                tenant_id,
+            ],
         )
         .context("set_failed UPDATE")?;
     tx.commit().context("commit set_failed")?;
@@ -590,7 +678,7 @@ pub fn retry_job(
     tx.execute(
         "UPDATE quote_pricing_jobs
             SET state = ?, updated_at = ?, error_stage = NULL, error_reason = NULL,
-                attempt_n = attempt_n + 1
+                failure_kind = NULL, attempt_n = attempt_n + 1
             WHERE quote_id = ? AND tenant_id = ? AND state = ?",
         params![STATE_FETCHED, ts, quote_id, tenant_id, STATE_FAILED],
     )
@@ -615,7 +703,7 @@ pub fn list_jobs(conn: &Connection, tenant_id: &str) -> Result<Vec<PricingJobRow
             "SELECT quote_id, tenant_id, state, fetched_at, updated_at,
                     customer_email, customer_name, material_grade, quantity,
                     feature_graph_hash, total_price_eur, error_stage, error_reason,
-                    attempt_n
+                    attempt_n, failure_kind
                 FROM quote_pricing_jobs
                 WHERE tenant_id = ?
                 ORDER BY fetched_at DESC",
@@ -630,6 +718,10 @@ pub fn list_jobs(conn: &Connection, tenant_id: &str) -> Result<Vec<PricingJobRow
         let state = JobState::parse_str(&state_str)?;
         let qty: i64 = r.get(8).context("get quantity")?;
         let attempt_n: i64 = r.get(13).context("get attempt_n")?;
+        let failure_kind = match r.get::<_, Option<String>>(14).ok().flatten() {
+            Some(s) => Some(FailureKind::parse_str(&s)?),
+            None => None,
+        };
         out.push(PricingJobRow {
             quote_id: r.get(0).context("get quote_id")?,
             tenant_id: r.get(1).context("get tenant_id")?,
@@ -645,13 +737,28 @@ pub fn list_jobs(conn: &Connection, tenant_id: &str) -> Result<Vec<PricingJobRow
             error_stage: r.get(11).ok(),
             error_reason: r.get(12).ok(),
             attempt_n: attempt_n.max(0) as u32,
+            failure_kind,
         });
     }
     Ok(out)
 }
 
-/// Daemon read path — find the oldest non-terminal, non-failed job
-/// to advance. Returns `None` if the queue is empty.
+/// Daemon read path — find the oldest non-terminal job to advance.
+/// Returns `None` if the queue is empty.
+///
+/// **S290 / PR-271**: Failed rows are SKIPPED by the daemon entirely —
+/// the operator's Retry click is the only way to re-enqueue. The brief's
+/// failure-kind classifier already gates that decision at write time:
+/// `Permanent` failures stay Failed pending operator action; `Transient`
+/// and `Unknown` are also frozen at Failed here (the daemon's S279 design
+/// already required operator retry — this query never returned Failed
+/// rows). The classifier's value shows up in the SPA badge + audit row,
+/// not in the daemon scheduler.
+///
+/// Auto-retry of Transient failures is deliberately NOT wired in this
+/// PR: the operator's audit-visible Retry click is the durable record;
+/// silent auto-retry of a network blip would hide the failure from the
+/// SPA and lose the per-attempt audit chain.
 pub fn next_actionable_job(conn: &Connection, tenant_id: &str) -> Result<Option<PricingJobRow>> {
     ensure_schema(conn)?;
     let mut stmt = conn
@@ -659,7 +766,7 @@ pub fn next_actionable_job(conn: &Connection, tenant_id: &str) -> Result<Option<
             "SELECT quote_id, tenant_id, state, fetched_at, updated_at,
                     customer_email, customer_name, material_grade, quantity,
                     feature_graph_hash, total_price_eur, error_stage, error_reason,
-                    attempt_n
+                    attempt_n, failure_kind
                 FROM quote_pricing_jobs
                 WHERE tenant_id = ?
                   AND state IN ('fetched','extracting','pricing','rendering','posting_back')
@@ -675,6 +782,10 @@ pub fn next_actionable_job(conn: &Connection, tenant_id: &str) -> Result<Option<
         let state = JobState::parse_str(&state_str)?;
         let qty: i64 = r.get(8).context("get quantity")?;
         let attempt_n: i64 = r.get(13).context("get attempt_n")?;
+        let failure_kind = match r.get::<_, Option<String>>(14).ok().flatten() {
+            Some(s) => Some(FailureKind::parse_str(&s)?),
+            None => None,
+        };
         Ok(Some(PricingJobRow {
             quote_id: r.get(0).context("get quote_id")?,
             tenant_id: r.get(1).context("get tenant_id")?,
@@ -690,6 +801,7 @@ pub fn next_actionable_job(conn: &Connection, tenant_id: &str) -> Result<Option<
             error_stage: r.get(11).ok(),
             error_reason: r.get(12).ok(),
             attempt_n: attempt_n.max(0) as u32,
+            failure_kind,
         }))
     } else {
         Ok(None)
@@ -873,7 +985,16 @@ mod tests {
         .expect("ins");
         set_state(&conn, "q2", "T", JobState::Extracting, fixed_ts()).expect("ex");
         assert_eq!(
-            set_failed(&mut conn, "q2", "T", "extract", "OCCT crash", fixed_ts()).expect("fail"),
+            set_failed(
+                &mut conn,
+                "q2",
+                "T",
+                "extract",
+                "OCCT crash",
+                FailureKind::Transient,
+                fixed_ts(),
+            )
+            .expect("fail"),
             TransitionOutcome::Applied
         );
         let rows = list_jobs(&conn, "T").expect("list");
@@ -881,6 +1002,7 @@ mod tests {
         assert_eq!(rows[0].error_stage.as_deref(), Some("extract"));
         assert_eq!(rows[0].error_reason.as_deref(), Some("OCCT crash"));
         assert_eq!(rows[0].attempt_n, 0);
+        assert_eq!(rows[0].failure_kind, Some(FailureKind::Transient));
     }
 
     #[test]
@@ -899,15 +1021,36 @@ mod tests {
             fixed_ts(),
         )
         .expect("ins");
-        set_failed(&mut conn, "q3", "T", "post", "503", fixed_ts()).expect("fail");
+        set_failed(
+            &mut conn,
+            "q3",
+            "T",
+            "post",
+            "503",
+            FailureKind::Transient,
+            fixed_ts(),
+        )
+        .expect("fail");
         let n1 = retry_job(&mut conn, "q3", "T", fixed_ts()).expect("retry1");
         assert_eq!(n1, 1);
         let rows = list_jobs(&conn, "T").expect("list");
         assert_eq!(rows[0].state, JobState::Fetched);
         assert!(rows[0].error_stage.is_none());
         assert_eq!(rows[0].attempt_n, 1);
+        // retry_job must also clear failure_kind so the daemon's next-cycle
+        // pickup at Fetched doesn't carry stale verdict metadata.
+        assert!(rows[0].failure_kind.is_none());
         // Re-fail + re-retry → attempt 2.
-        set_failed(&mut conn, "q3", "T", "post", "again", fixed_ts()).expect("fail2");
+        set_failed(
+            &mut conn,
+            "q3",
+            "T",
+            "post",
+            "again",
+            FailureKind::Transient,
+            fixed_ts(),
+        )
+        .expect("fail2");
         let n2 = retry_job(&mut conn, "q3", "T", fixed_ts()).expect("retry2");
         assert_eq!(n2, 2);
     }
@@ -966,7 +1109,16 @@ mod tests {
         )
         .expect("b");
         set_state(&conn, "a", "T", JobState::Posted, fixed_ts()).expect("posted");
-        set_failed(&mut conn, "b", "T", "extract", "oops", fixed_ts()).expect("fail");
+        set_failed(
+            &mut conn,
+            "b",
+            "T",
+            "extract",
+            "oops",
+            FailureKind::Unknown,
+            fixed_ts(),
+        )
+        .expect("fail");
         // a is Posted (terminal), b is Failed (terminal-for-daemon) →
         // nothing actionable.
         let nxt = next_actionable_job(&conn, "T").expect("next");
@@ -1079,7 +1231,16 @@ mod tests {
         )
         .expect("ins");
         assert_eq!(
-            set_failed(&mut conn, "q-idem", "T", "extract", "boom", fixed_ts()).expect("fail1"),
+            set_failed(
+                &mut conn,
+                "q-idem",
+                "T",
+                "extract",
+                "boom",
+                FailureKind::Permanent,
+                fixed_ts(),
+            )
+            .expect("fail1"),
             TransitionOutcome::Applied
         );
         assert_eq!(
@@ -1089,14 +1250,20 @@ mod tests {
                 "T",
                 "extract",
                 "boom-again",
+                FailureKind::Transient,
                 fixed_ts()
             )
             .expect("fail2"),
             TransitionOutcome::AlreadyInState
         );
         // The first failure's reason must NOT be overwritten by the second.
+        // S290 / PR-271: same posture for failure_kind — a re-failure
+        // reaching set_failed must NOT silently overwrite the first
+        // classification (`Permanent` here). The SELECT-first guard ensures
+        // this: the UPDATE is skipped entirely.
         let rows = list_jobs(&conn, "T").expect("list");
         assert_eq!(rows[0].error_reason.as_deref(), Some("boom"));
+        assert_eq!(rows[0].failure_kind, Some(FailureKind::Permanent));
     }
 
     /// S286 / PR-268 — forensic regression. Reproduces the exact PROD_v2.27.2
@@ -1485,5 +1652,120 @@ mod tests {
         .expect("ins-other");
         assert_eq!(count_jobs(&conn, "T").expect("count after"), 3);
         assert_eq!(count_jobs(&conn, "OTHER").expect("count other"), 1);
+    }
+
+    // ── S290 / PR-271 — FailureKind classifier pins ──────────────────
+
+    #[test]
+    fn failure_kind_round_trip() {
+        for k in [
+            FailureKind::Transient,
+            FailureKind::Permanent,
+            FailureKind::Unknown,
+        ] {
+            assert_eq!(FailureKind::parse_str(k.as_str()).unwrap(), k);
+        }
+        // Loud-fail on unknown — silent fallback would mask schema drift
+        // (CLAUDE.md rule 12).
+        assert!(FailureKind::parse_str("garbage").is_err());
+        assert!(FailureKind::parse_str("").is_err());
+    }
+
+    #[test]
+    fn failure_kind_storage_strings_are_closed_vocab_lowercase() {
+        // The on-disk contract: the strings ride into the SPA JSON and
+        // the audit-row payload. Distinct + lowercase + snake.
+        assert_eq!(FailureKind::Transient.as_str(), "transient");
+        assert_eq!(FailureKind::Permanent.as_str(), "permanent");
+        assert_eq!(FailureKind::Unknown.as_str(), "unknown");
+        // Pairwise-distinct.
+        let all = [
+            FailureKind::Transient.as_str(),
+            FailureKind::Permanent.as_str(),
+            FailureKind::Unknown.as_str(),
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j]);
+            }
+        }
+    }
+
+    /// S290 / PR-271 — `failure_kind` column lands via additive
+    /// `ALTER TABLE ADD COLUMN IF NOT EXISTS`. Simulate a pre-PR-271
+    /// schema (no `failure_kind` column), confirm `ensure_schema`
+    /// idempotently adds it, and confirm a legacy `Failed` row reads
+    /// back with `failure_kind = None` (treated as Unknown by the
+    /// daemon scheduler).
+    #[test]
+    fn s290_failure_kind_column_added_idempotently_to_legacy_schema() {
+        let conn = open_bare_mem();
+        // Pre-PR-271 CREATE TABLE — same column set as SCHEMA_SQL but
+        // without the trailing `failure_kind VARCHAR`. Hand-rolled to
+        // simulate the prod schema before the additive migration.
+        conn.execute_batch(
+            "CREATE TABLE quote_pricing_jobs (
+                quote_id              VARCHAR NOT NULL PRIMARY KEY,
+                tenant_id             VARCHAR NOT NULL,
+                state                 VARCHAR NOT NULL,
+                fetched_at            VARCHAR NOT NULL,
+                updated_at            VARCHAR NOT NULL,
+                customer_email        VARCHAR NOT NULL,
+                customer_name         VARCHAR NOT NULL,
+                material_grade        VARCHAR NOT NULL,
+                quantity              INTEGER NOT NULL,
+                cad_filename          VARCHAR NOT NULL,
+                cad_local_path        VARCHAR NOT NULL,
+                feature_graph_hash    VARCHAR,
+                feature_graph_json    VARCHAR,
+                breakdown_json        VARCHAR,
+                pdf_path              VARCHAR,
+                total_price_eur       DOUBLE,
+                valid_until_iso       VARCHAR,
+                error_stage           VARCHAR,
+                error_reason          VARCHAR,
+                attempt_n             INTEGER NOT NULL
+            );",
+        )
+        .expect("pre-PR-271 schema seeding");
+        // Seed a legacy Failed row from before the column existed.
+        let ts = fixed_ts()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("ts");
+        conn.execute(
+            "INSERT INTO quote_pricing_jobs (
+                quote_id, tenant_id, state, fetched_at, updated_at,
+                customer_email, customer_name, material_grade, quantity,
+                cad_filename, cad_local_path, attempt_n,
+                error_stage, error_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            params![
+                "legacy-q",
+                "T",
+                STATE_FAILED,
+                ts,
+                ts,
+                "legacy@x",
+                "legacy",
+                "AL",
+                1,
+                "(missing)",
+                "(missing)",
+                "extract",
+                "before-PR-271",
+            ],
+        )
+        .expect("seed legacy Failed row");
+        // First ensure_schema: ALTER ADD COLUMN runs.
+        ensure_schema(&conn).expect("first migration");
+        // Second + third: idempotent — the IF NOT EXISTS guard makes a
+        // re-call a no-op (no error, no double-add).
+        ensure_schema(&conn).expect("second migration");
+        ensure_schema(&conn).expect("third migration");
+        // Legacy row reads back with failure_kind = None.
+        let rows = list_jobs(&conn, "T").expect("list legacy");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, JobState::Failed);
+        assert_eq!(rows[0].failure_kind, None);
     }
 }
