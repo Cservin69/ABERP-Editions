@@ -852,7 +852,12 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::EmailOutboxFetched
         | EventKind::EmailOutboxClaimed
         | EventKind::EmailOutboxSent
-        | EventKind::EmailOutboxFailed => None,
+        | EventKind::EmailOutboxFailed
+        // S325 / PR-25 — customer-PDF re-render audit family. App-layer
+        // JSON payloads, never NAV XML bytes.
+        | EventKind::QuotePdfRerenderEnqueued
+        | EventKind::QuotePdfRerendered
+        | EventKind::QuotePdfRerenderFailed => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

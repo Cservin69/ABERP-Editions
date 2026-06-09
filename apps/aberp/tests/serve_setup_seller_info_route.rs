@@ -73,6 +73,7 @@ fn build_state(boot_state: ServeBootState, tenant: &str) -> AppState {
         ),
         storefront_credential: aberp::storefront_credential::StorefrontCredentialHandle::dormant(),
         email_outbox_daemon: aberp::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(),
+        quote_pdf_rerender_queue: aberp::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
     }
 }
 

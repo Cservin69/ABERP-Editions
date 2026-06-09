@@ -111,6 +111,11 @@ pub mod quote_pricing_jobs;
 // (`aberp-cad-extract-wrapper` extract / `aberp-quote-engine` price /
 // `aberp-quote-pdf` render) + the storefront priced-writeback POST.
 pub mod quote_pricing_pipeline;
+// S325 / PR-25 — EVE addendum-2 customer-facing stock-alert banner
+// producer: in-memory re-render queue + the daemon that drains it and
+// re-POSTs `priced.pdf` with `stock_alert:true` to the storefront.
+pub mod quote_pdf_rerender_daemon;
+pub mod quote_pdf_rerender_queue;
 pub mod quoting_materials;
 // S267 / PR-256 — four tunable tables feeding the future
 // `aberp-quote-engine`: complexity rules, tolerance multipliers, the

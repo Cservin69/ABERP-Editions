@@ -942,6 +942,9 @@ impl PricingPipelineService {
             valid_until_iso,
             breakdown_json,
             pdf_bytes,
+            // First priced-writeback is always pre-acceptance — the
+            // stock-alert overlay only flips on the S325 re-render path.
+            false,
         )?;
         let resp = self
             .client
@@ -1608,6 +1611,7 @@ pub(crate) fn build_priced_multipart(
     valid_until_iso: &str,
     breakdown_json: &str,
     pdf_bytes: &[u8],
+    stock_alert: bool,
 ) -> Result<Vec<u8>> {
     let breakdown_value: serde_json::Value = serde_json::from_str(breakdown_json)
         .with_context(|| format!("re-parse breakdown_json: {breakdown_json}"))?;
@@ -1617,13 +1621,13 @@ pub(crate) fn build_priced_multipart(
         "feature_graph_hash": feature_graph_hash,
         "extractor_version": aberp_cad_extract_wrapper::WRAPPER_VERSION,
         "engine_version": engine::ENGINE_VERSION,
-        // Always false on the first (and today the only) priced-writeback:
-        // the EVE addendum-2 downgrade is detected post-acceptance, after
-        // this POST has already landed. Flipping it true for the customer
-        // needs a re-render + re-post path that the storefront `/priced`
-        // endpoint currently rejects as an idempotent no-op. See
+        // First priced-writeback (`advance_post`) passes `false`: the EVE
+        // addendum-2 downgrade is detected post-acceptance, after this POST
+        // has landed. The S325 re-render daemon passes `true` on a same-hash
+        // re-post, which the S323 storefront `/priced` relax now overwrites +
+        // flips (was an idempotent no-op pre-S323). See
         // docs/findings/s318-customer-pdf-stock-banner.md.
-        "stock_alert": false,
+        "stock_alert": stock_alert,
     });
     let meta_bytes = serde_json::to_vec(&meta).context("encode meta JSON")?;
 
@@ -2275,6 +2279,7 @@ mod tests {
             "2026-07-06",
             "{\"k\":1}",
             b"%PDF-1.5 fakebody",
+            false,
         )
         .expect("build");
         let s = String::from_utf8_lossy(&body).to_string();
@@ -2302,6 +2307,7 @@ mod tests {
             "2026-07-06",
             "{\"total\":42.0}",
             b"x",
+            false,
         )
         .expect("build");
         let s = String::from_utf8_lossy(&body).to_string();
@@ -2319,8 +2325,8 @@ mod tests {
 
     #[test]
     fn priced_multipart_stamps_extractor_and_engine_versions() {
-        let body =
-            build_priced_multipart("b", "blake3:1", "2026-07-06", "{}", b"x").expect("build");
+        let body = build_priced_multipart("b", "blake3:1", "2026-07-06", "{}", b"x", false)
+            .expect("build");
         let s = String::from_utf8_lossy(&body).to_string();
         assert!(
             s.contains("\"extractor_version\":"),
@@ -2328,6 +2334,20 @@ mod tests {
         );
         assert!(s.contains("\"engine_version\":"), "missing engine_version");
         assert!(s.contains("\"stock_alert\":false"), "missing stock_alert");
+    }
+
+    /// S325 / PR-25 — the re-render path passes `stock_alert: true`; the
+    /// meta must carry the flipped flag so the S323 storefront `/priced`
+    /// relax overwrites the stored PDF + flips the customer-side flag.
+    #[test]
+    fn priced_multipart_carries_stock_alert_true_for_rerender() {
+        let body =
+            build_priced_multipart("b", "blake3:1", "2026-07-06", "{}", b"x", true).expect("build");
+        let s = String::from_utf8_lossy(&body).to_string();
+        assert!(
+            s.contains("\"stock_alert\":true"),
+            "re-render meta must carry stock_alert:true, body: {s}"
+        );
     }
 
     #[test]

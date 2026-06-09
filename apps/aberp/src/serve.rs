@@ -1014,6 +1014,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         ),
         storefront_credential: crate::storefront_credential::StorefrontCredentialHandle::dormant(),
         email_outbox_daemon: crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(),
+        quote_pdf_rerender_queue: crate::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
     };
 
     // 5. Build the axum router. Clone the state first so the app-boot
@@ -1982,6 +1983,54 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             );
         }
 
+        // S325 / PR-25 — spawn the customer-PDF re-render daemon (EVE
+        // addendum-2). Drains the in-memory `quote_pdf_rerender_queue`
+        // (fed read-side by `handle_list_quote_intake` on a FALSE→TRUE
+        // stock_alert flip) and re-POSTs `priced.pdf` with the stock-alert
+        // banner to the storefront `/priced` (relaxed S323-side to accept
+        // a same-hash, stock_alert:true re-post). Shares the S289
+        // storefront-credential SPOC, so an operator URL change takes
+        // effect on the next cycle. Kill switch:
+        // `ABERP_PDF_RERENDER_DISABLED=1`.
+        if crate::quote_pdf_rerender_daemon::is_disabled() {
+            tracing::info!(
+                env = crate::quote_pdf_rerender_daemon::POLL_DISABLE_ENV,
+                "pdf-rerender daemon disabled by env (S325 / PR-25)"
+            );
+        } else {
+            let rr_operator_login = match recovery_state.boot_state.read() {
+                Ok(guard) => match &*guard {
+                    ServeBootState::Ready { operator_login } => operator_login.clone(),
+                    ServeBootState::NeedsSellerConfig { operator_login } => operator_login.clone(),
+                    _ => "boot".to_string(),
+                },
+                Err(_) => "boot".to_string(),
+            };
+            let rr_binary_hash = recovery_state
+                .binary_hash
+                .wait()
+                .context("await background binary hash for pdf-rerender daemon")?;
+            let rr_poll_interval = crate::quote_pdf_rerender_daemon::resolve_poll_interval();
+            let rr_deps = crate::quote_pdf_rerender_daemon::QuotePdfRerenderDaemonDeps {
+                db_path: (*recovery_state.db_path).clone(),
+                tenant: recovery_state.tenant.clone(),
+                binary_hash: rr_binary_hash,
+                operator_login: rr_operator_login,
+                storefront_credential: recovery_state.storefront_credential.clone(),
+                queue: recovery_state.quote_pdf_rerender_queue.clone(),
+                poll_interval: rr_poll_interval,
+            };
+            let rr_token = coordinator.token.clone();
+            let rr_handle = tokio::spawn(async move {
+                crate::quote_pdf_rerender_daemon::run_supervised(rr_deps, rr_token).await;
+            });
+            coordinator.register("pdf-rerender", rr_handle);
+            tracing::info!(
+                poll_interval_secs = rr_poll_interval.as_secs(),
+                "spawned pdf-rerender daemon (S325 / PR-25)"
+            );
+        }
+
         let config = RustlsConfig::from_der(rustls_config.0, rustls_config.1)
             .await
             .context("build axum-server RustlsConfig")?;
@@ -2658,6 +2707,16 @@ pub struct AppState {
     /// pattern) — restarts after a panic do not reset the operator-
     /// facing counters.
     pub email_outbox_daemon: Arc<crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle>,
+    /// S325 / PR-25 — shared, restart-tolerant in-memory queue of
+    /// quote-ids whose customer-facing `priced.pdf` needs re-rendering
+    /// with the EVE addendum-2 stock-alert banner. The read-side
+    /// `handle_list_quote_intake` seam enqueues on a confirmed FALSE→TRUE
+    /// `stock_alert` flip; the `quote_pdf_rerender_daemon` drains it every
+    /// cycle and re-POSTs to the storefront `/priced`. In-memory (no DB
+    /// table): loss-on-restart is tolerated because the read-side
+    /// recompute re-detects undrained transitions on the next operator
+    /// view. See [`crate::quote_pdf_rerender_queue`].
+    pub quote_pdf_rerender_queue: Arc<crate::quote_pdf_rerender_queue::QuotePdfRerenderQueue>,
 }
 
 /// Session-161 — max number of NAV poll daemons polling concurrently.
@@ -16408,66 +16467,33 @@ async fn handle_list_quote_intake(headers: HeaderMap, State(state): State<AppSta
     let db_path = (*state.db_path).clone();
     let tenant_id_string = state.tenant.as_str().to_string();
     let tenant_for_ledger = state.tenant.clone();
+    // S325 / PR-25 — the read-side seam pushes any FALSE→TRUE stock_alert
+    // transition into the in-memory PDF re-render queue so the
+    // `quote_pdf_rerender_daemon` re-renders + re-POSTs `priced.pdf` with
+    // the customer-facing stock-alert banner. Cloned before the blocking
+    // task so the enqueue does not block the list response.
+    let rerender_queue = state.quote_pdf_rerender_queue.clone();
     let rows = match tokio::task::spawn_blocking(move || -> Result<_> {
         let mut conn = duckdb::Connection::open(&db_path)
             .with_context(|| format!("open tenant DB at {}", db_path.display()))?;
         let listing = quote_intake_query_mod::list_quote_intake_rows(&conn, &tenant_id_string)?;
         // S275 / PR-264 / F2 + F16 — persist + audit one entry per
         // newly-triggered alert via `flip_and_audit_in_tx`. The flip
-        // (guarded UPDATE) and the audit append (with an
-        // idempotency_key per quote-id transition) share ONE tx; either
-        // both land or neither does. Replaces the prior pattern of a
-        // separate `Ledger::open` after the conn-level flip — that
-        // could leave a sticky-true row without an audit explaining
-        // why, and was vulnerable to a transient retry emitting two
-        // audit entries for one transition.
-        if !listing.newly_triggered_alerts.is_empty() {
-            aberp_audit_ledger::ensure_schema(&conn)
-                .context("ensure audit ledger schema for stock_alert emit")?;
-            let ledger_meta =
-                aberp_audit_ledger::LedgerMeta::new(tenant_for_ledger.clone(), binary_hash);
-            for alert in &listing.newly_triggered_alerts {
-                let payload = serde_json::json!({
-                    "quote_id": alert.quote_id,
-                    "material_grade": alert.material_grade,
-                    "snapshot_status": alert.snapshot_status,
-                    "current_status": alert.current_status,
-                });
-                let bytes = serde_json::to_vec(&payload)
-                    .context("serialize QuoteStockAlertTriggered payload")?;
-                let actor = aberp_audit_ledger::Actor::from_local_cli(
-                    ulid::Ulid::new().to_string(),
-                    &operator_login,
-                );
-                // Per-(quote, transition) idempotency key: a transient
-                // retry of THIS route cannot land two audit entries
-                // for the same row's flip (the audit-ledger UNIQUE
-                // constraint on idempotency_key would reject the dup).
-                let idempotency_key = format!("stock_alert_triggered:{}", alert.quote_id);
-                let tx = conn
-                    .transaction()
-                    .context("begin tx for QuoteStockAlertTriggered flip+audit")?;
-                let flipped = aberp_quote_intake::log_table::flip_and_audit_in_tx(
-                    &tx,
-                    tenant_for_ledger.as_str(),
-                    &alert.quote_id,
-                    &ledger_meta,
-                    bytes,
-                    actor,
-                    idempotency_key,
-                )
-                .context("flip+audit in tx")?;
-                if flipped {
-                    tx.commit().context("commit stock_alert flip+audit tx")?;
-                } else {
-                    // Lost the race (another process already flipped
-                    // the row) — drop the tx so the audit append does
-                    // not land. No-op for the operator; the winning
-                    // tx emitted the audit.
-                    drop(tx);
-                }
-            }
-        }
+        // (guarded UPDATE) and the `QuoteStockAlertTriggered` audit append
+        // share ONE tx; either both land or neither does.
+        // S325 / PR-25 — the same tx now also appends
+        // `QuotePdfRerenderEnqueued` and (post-commit) pushes the quote
+        // into `rerender_queue`. Extracted into
+        // `persist_alerts_and_enqueue_rerender` so the detection→enqueue
+        // path is unit-testable without an HTTP server.
+        quote_intake_query_mod::persist_alerts_and_enqueue_rerender(
+            &mut conn,
+            &tenant_for_ledger,
+            binary_hash,
+            &operator_login,
+            &listing.newly_triggered_alerts,
+            &rerender_queue,
+        )?;
         Ok(listing.rows)
     })
     .await
@@ -21746,6 +21772,7 @@ mod tests {
                 crate::storefront_credential::StorefrontCredentialHandle::dormant(),
             email_outbox_daemon: crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(
             ),
+            quote_pdf_rerender_queue: crate::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
@@ -21867,6 +21894,7 @@ mod tests {
                 crate::storefront_credential::StorefrontCredentialHandle::dormant(),
             email_outbox_daemon: crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(
             ),
+            quote_pdf_rerender_queue: crate::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, invoice_id)
@@ -22633,6 +22661,7 @@ mod tests {
                 crate::storefront_credential::StorefrontCredentialHandle::dormant(),
             email_outbox_daemon: crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(
             ),
+            quote_pdf_rerender_queue: crate::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
         }
     }
 

@@ -16,9 +16,10 @@
 
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use duckdb::{params, Connection};
 
+use crate::quote_pdf_rerender_queue::QuotePdfRerenderQueue;
 use crate::quote_stock_alert::{coerce_stock_alert, recompute_stock_alert};
 
 /// Row mirror for the SPA Quotes tab. The `*_summary` fields are
@@ -285,6 +286,109 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Quot
         rows: out,
         newly_triggered_alerts: pending_alerts,
     })
+}
+
+/// S325 / PR-25 — persist each newly-triggered `stock_alert` transition
+/// AND schedule the customer-facing PDF re-render.
+///
+/// For every entry in `alerts` this runs ONE tx that:
+/// 1. flips `quote_intake_log.stock_alert` FALSE → TRUE under the guarded
+///    CAS UPDATE (`flip_and_audit_in_tx`) + appends the
+///    `QuoteStockAlertTriggered` audit row (existing S275 behaviour);
+/// 2. on a confirmed flip (this call won the race), appends the new
+///    `QuotePdfRerenderEnqueued` audit row IN THE SAME TX, so the customer
+///    flag flip and the re-render intent are atomic — either both land or
+///    neither.
+/// After the tx commits, the quote-id is pushed into the in-memory
+/// `rerender_queue` (AFTER commit, so a rolled-back flip never leaves a
+/// phantom queue entry). The [`crate::quote_pdf_rerender_daemon`] drains
+/// the queue and re-renders + re-POSTs `priced.pdf` with the stock-alert
+/// banner (S318 capability) on the next cycle.
+///
+/// Extracted from the `handle_list_quote_intake` route so the read-side
+/// detection → enqueue path is unit-testable without standing up an HTTP
+/// server. Returns the quote-ids actually enqueued (a confirmed flip that
+/// won the race); a lost race or a `None`/empty `alerts` returns an empty
+/// vec.
+pub fn persist_alerts_and_enqueue_rerender(
+    conn: &mut Connection,
+    tenant: &aberp_audit_ledger::TenantId,
+    binary_hash: aberp_audit_ledger::BinaryHash,
+    operator_login: &str,
+    alerts: &[StockAlertTriggered],
+    rerender_queue: &QuotePdfRerenderQueue,
+) -> Result<Vec<String>> {
+    if alerts.is_empty() {
+        return Ok(Vec::new());
+    }
+    aberp_audit_ledger::ensure_schema(conn)
+        .context("ensure audit ledger schema for stock_alert + rerender emit")?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(tenant.clone(), binary_hash);
+    let mut enqueued: Vec<String> = Vec::new();
+    for alert in alerts {
+        let payload = serde_json::json!({
+            "quote_id": alert.quote_id,
+            "material_grade": alert.material_grade,
+            "snapshot_status": alert.snapshot_status,
+            "current_status": alert.current_status,
+        });
+        let bytes =
+            serde_json::to_vec(&payload).context("serialize QuoteStockAlertTriggered payload")?;
+        let actor = aberp_audit_ledger::Actor::from_local_cli(
+            ulid::Ulid::new().to_string(),
+            operator_login,
+        );
+        // Per-(quote, transition) idempotency key: a transient retry of
+        // the list route cannot land two audit entries for one flip.
+        let idempotency_key = format!("stock_alert_triggered:{}", alert.quote_id);
+        let tx = conn
+            .transaction()
+            .context("begin tx for stock_alert flip + rerender enqueue")?;
+        let flipped = aberp_quote_intake::log_table::flip_and_audit_in_tx(
+            &tx,
+            tenant.as_str(),
+            &alert.quote_id,
+            &ledger_meta,
+            bytes,
+            actor,
+            idempotency_key,
+        )
+        .context("flip + QuoteStockAlertTriggered audit in tx")?;
+        if !flipped {
+            // Lost the race — another process already flipped the row.
+            // Drop the tx so neither audit row lands; the winner enqueued.
+            drop(tx);
+            continue;
+        }
+        // The flip landed. Record the re-render intent in the SAME tx.
+        let rr_payload = serde_json::json!({
+            "quote_id": alert.quote_id,
+            "material_grade": alert.material_grade,
+            "snapshot_status": alert.snapshot_status,
+            "current_status": alert.current_status,
+        });
+        let rr_bytes = serde_json::to_vec(&rr_payload)
+            .context("serialize QuotePdfRerenderEnqueued payload")?;
+        let rr_actor = aberp_audit_ledger::Actor::from_local_cli(
+            ulid::Ulid::new().to_string(),
+            operator_login,
+        );
+        aberp_audit_ledger::append_in_tx(
+            &tx,
+            &ledger_meta,
+            aberp_audit_ledger::EventKind::QuotePdfRerenderEnqueued,
+            rr_bytes,
+            rr_actor,
+            Some(format!("pdf_rerender_enqueued:{}", alert.quote_id)),
+        )
+        .context("append QuotePdfRerenderEnqueued in tx")?;
+        tx.commit()
+            .context("commit stock_alert flip + rerender-enqueue tx")?;
+        // Enqueue AFTER commit — never hold an id whose flip rolled back.
+        rerender_queue.enqueue(&alert.quote_id);
+        enqueued.push(alert.quote_id.clone());
+    }
+    Ok(enqueued)
 }
 
 /// Look up the current `stock_status` of every `quoting_materials` row
@@ -915,5 +1019,110 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].contact_name.is_none());
         assert!(rows[0].material.is_none());
+    }
+
+    // ── S325 / PR-25 — read-side PDF re-render enqueue ────────────────
+
+    fn test_tenant() -> aberp_audit_ledger::TenantId {
+        aberp_audit_ledger::TenantId::new("t1").unwrap()
+    }
+
+    fn audit_count(conn: &Connection, kind: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM audit_ledger WHERE kind = ?1",
+            params![kind],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A FALSE → TRUE stock_alert transition, once persisted, enqueues the
+    /// quote-id into the PDF re-render queue AND emits exactly one
+    /// `quote.pdf_rerender_enqueued` audit row alongside the existing
+    /// `quote.stock_alert_triggered` row.
+    #[test]
+    fn s325_recompute_false_to_true_enqueues_pdf_rerender() {
+        let mut conn = open_mem();
+        seed_material(&conn, "t1", "6061-T6", "in_stock");
+        insert_accepted_quote(&conn, "t1", "q-alpha", "6061-T6", "in_stock");
+
+        // Catalogue downgrades → recompute detects the transition.
+        conn.execute(
+            "UPDATE quoting_materials SET stock_status = 'source_1_2d'
+              WHERE grade = '6061-T6' AND tenant_id = 't1'",
+            [],
+        )
+        .unwrap();
+        let listing = list_quote_intake_rows(&conn, "t1").unwrap();
+        assert_eq!(listing.newly_triggered_alerts.len(), 1);
+
+        let queue = QuotePdfRerenderQueue::new();
+        let enqueued = persist_alerts_and_enqueue_rerender(
+            &mut conn,
+            &test_tenant(),
+            aberp_audit_ledger::BinaryHash::from_bytes([0u8; 32]),
+            "op",
+            &listing.newly_triggered_alerts,
+            &queue,
+        )
+        .unwrap();
+
+        assert_eq!(enqueued, vec!["q-alpha".to_string()]);
+        assert!(queue.contains("q-alpha"), "quote enqueued for re-render");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(audit_count(&conn, "quote.stock_alert_triggered"), 1);
+        assert_eq!(audit_count(&conn, "quote.pdf_rerender_enqueued"), 1);
+
+        // The flip persisted, so a second list pass sees sticky-TRUE and
+        // emits NO new transition → nothing further to enqueue.
+        let listing2 = list_quote_intake_rows(&conn, "t1").unwrap();
+        assert!(listing2.newly_triggered_alerts.is_empty());
+        assert!(listing2.rows[0].stock_alert);
+    }
+
+    /// Idempotency: re-running the persist with the SAME alerts after the
+    /// flip already landed does NOT double-enqueue (the CAS UPDATE matches
+    /// zero rows on the second call → lost-race branch) AND the queue's
+    /// HashSet collapses a duplicate id to one. No second post can result.
+    #[test]
+    fn s325_recompute_idempotent_enqueue_no_double_post() {
+        let mut conn = open_mem();
+        seed_material(&conn, "t1", "6061-T6", "in_stock");
+        insert_accepted_quote(&conn, "t1", "q-beta", "6061-T6", "in_stock");
+        conn.execute(
+            "UPDATE quoting_materials SET stock_status = 'special_order'
+              WHERE grade = '6061-T6' AND tenant_id = 't1'",
+            [],
+        )
+        .unwrap();
+        let alerts = list_quote_intake_rows(&conn, "t1")
+            .unwrap()
+            .newly_triggered_alerts;
+        assert_eq!(alerts.len(), 1);
+
+        let queue = QuotePdfRerenderQueue::new();
+        let tenant = test_tenant();
+        let bh = aberp_audit_ledger::BinaryHash::from_bytes([0u8; 32]);
+
+        // First persist: flips + enqueues.
+        let first =
+            persist_alerts_and_enqueue_rerender(&mut conn, &tenant, bh, "op", &alerts, &queue)
+                .unwrap();
+        assert_eq!(first.len(), 1);
+        // Second persist with the SAME (now stale) alert: the row is
+        // already TRUE so the guarded UPDATE matches 0 rows → no enqueue,
+        // no second audit row.
+        let second =
+            persist_alerts_and_enqueue_rerender(&mut conn, &tenant, bh, "op", &alerts, &queue)
+                .unwrap();
+        assert!(second.is_empty(), "stale re-persist must not re-enqueue");
+        assert_eq!(queue.len(), 1, "queue holds a single entry for the id");
+        assert_eq!(audit_count(&conn, "quote.pdf_rerender_enqueued"), 1);
+
+        // Belt-and-suspenders: even a direct double-enqueue of the same
+        // id collapses to one (HashSet idempotency).
+        queue.enqueue("q-beta");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.drain().len(), 1, "single post on drain");
     }
 }

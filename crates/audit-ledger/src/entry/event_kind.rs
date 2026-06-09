@@ -1810,6 +1810,49 @@ pub enum EventKind {
     ///
     /// `quote.*` prefix family.
     EmailOutboxFailed,
+
+    /// S325 / PR-25 — EVE addendum-2 customer-PDF re-render ENQUEUED.
+    /// Fires read-side when the operator's Quotes-tab load observes a
+    /// `quote_intake_log.stock_alert` FALSE → TRUE transition and the
+    /// quote-id is pushed into the in-memory
+    /// [`crate::quote_pdf_rerender_queue`] (one row per confirmed flip —
+    /// the queue's HashSet idempotency + the sticky-TRUE recompute mean a
+    /// second operator view does NOT re-enqueue, so this never
+    /// double-fires for one transition).
+    ///
+    /// Carries `quote_id`, `material_grade`, `snapshot_status` (the
+    /// stock-status the customer accepted under), `current_status` (the
+    /// degraded live catalogue status that tripped the alert).
+    ///
+    /// `quote.*` prefix family.
+    QuotePdfRerenderEnqueued,
+
+    /// S325 / PR-25 — terminal success: the re-render daemon re-rendered
+    /// `priced.pdf` with the stock-alert band and the storefront `/priced`
+    /// re-post returned a success shape (`{rerendered:true}`,
+    /// `{idempotent:true}`, or a `409` treated as already-flipped). The
+    /// customer now sees the addendum-2 banner.
+    ///
+    /// Carries `quote_id`, `feature_graph_hash` (unchanged — the geometry
+    /// did not move, only the stock overlay), `outcome` (closed-vocab
+    /// `"rerendered" | "idempotent" | "already_flipped_409"`),
+    /// `pdf_byte_size`.
+    ///
+    /// `quote.*` prefix family.
+    QuotePdfRerendered,
+
+    /// S325 / PR-25 — the re-render daemon could not deliver the
+    /// re-rendered PDF. Carries `quote_id`, `failure_kind` (closed-vocab
+    /// `"transient" | "permanent" | "unknown"`, mirroring
+    /// [`crate::quote_pricing_jobs::FailureKind`]), `error_class`
+    /// (short token: `"http_5xx" | "http_4xx" | "transport" |
+    /// "artifacts_missing" | "render" | "other"`) and `error_detail`
+    /// (scrubbed cause string, ≤ 1000 chars). Transient failures are
+    /// re-enqueued for the next cycle; permanent/unknown drop out of the
+    /// queue (fail-loud, not silent) so the operator sees the audit row.
+    ///
+    /// `quote.*` prefix family.
+    QuotePdfRerenderFailed,
 }
 
 impl EventKind {
@@ -1908,6 +1951,9 @@ impl EventKind {
             EventKind::EmailOutboxClaimed => "quote.email_outbox_claimed",
             EventKind::EmailOutboxSent => "quote.email_outbox_sent",
             EventKind::EmailOutboxFailed => "quote.email_outbox_failed",
+            EventKind::QuotePdfRerenderEnqueued => "quote.pdf_rerender_enqueued",
+            EventKind::QuotePdfRerendered => "quote.pdf_rerendered",
+            EventKind::QuotePdfRerenderFailed => "quote.pdf_rerender_failed",
         }
     }
 
@@ -2017,6 +2063,9 @@ impl EventKind {
             "quote.email_outbox_claimed" => Ok(EventKind::EmailOutboxClaimed),
             "quote.email_outbox_sent" => Ok(EventKind::EmailOutboxSent),
             "quote.email_outbox_failed" => Ok(EventKind::EmailOutboxFailed),
+            "quote.pdf_rerender_enqueued" => Ok(EventKind::QuotePdfRerenderEnqueued),
+            "quote.pdf_rerendered" => Ok(EventKind::QuotePdfRerendered),
+            "quote.pdf_rerender_failed" => Ok(EventKind::QuotePdfRerenderFailed),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2118,6 +2167,9 @@ mod tests {
             EventKind::EmailOutboxClaimed,
             EventKind::EmailOutboxSent,
             EventKind::EmailOutboxFailed,
+            EventKind::QuotePdfRerenderEnqueued,
+            EventKind::QuotePdfRerendered,
+            EventKind::QuotePdfRerenderFailed,
         ];
         for v in variants {
             let s = v.as_str();
@@ -3941,6 +3993,79 @@ mod tests {
             ] {
                 assert_ne!(
                     k,
+                    sibling.as_str(),
+                    "{k} collides with sibling {}",
+                    sibling.as_str()
+                );
+            }
+        }
+    }
+
+    /// S325 / PR-25 — F12 prefix ritual for the three PDF-re-render kinds.
+    /// Customer-facing PDF re-render is a `quote.*` surface (it rides the
+    /// same auto-quoting strand as the pricing pipeline), so the on-disk
+    /// strings MUST carry the `quote.` prefix and nothing else.
+    #[test]
+    fn s325_pdf_rerender_kinds_use_quote_prefix() {
+        let cases: [(EventKind, &str); 3] = [
+            (
+                EventKind::QuotePdfRerenderEnqueued,
+                "quote.pdf_rerender_enqueued",
+            ),
+            (EventKind::QuotePdfRerendered, "quote.pdf_rerendered"),
+            (
+                EventKind::QuotePdfRerenderFailed,
+                "quote.pdf_rerender_failed",
+            ),
+        ];
+        for (k, expected) in cases {
+            let s = k.as_str();
+            assert_eq!(s, expected);
+            assert!(s.starts_with("quote."), "{s} must start with quote.");
+            assert!(!s.starts_with("invoice."), "{s} must not start invoice.");
+            assert!(!s.starts_with("system."), "{s} must not start system.");
+            assert!(!s.starts_with("mes."), "{s} must not start mes.");
+            assert!(!s.starts_with("inventory."), "{s} must not start inv.");
+            assert!(!s.starts_with("email."), "{s} must not start email.");
+        }
+    }
+
+    /// S325 / PR-25 — the three re-render kinds round-trip
+    /// `as_str` → `from_storage_str` and are pairwise-distinct AND
+    /// distinct from every pricing-pipeline + email-outbox sibling. A
+    /// collision would mis-bucket a re-render audit row into a pricing
+    /// stage and silently mute the customer-delivery trail (CLAUDE.md
+    /// rule 12 — fail loud).
+    #[test]
+    fn s325_pdf_rerender_kinds_distinct_and_round_trip() {
+        let new = [
+            EventKind::QuotePdfRerenderEnqueued,
+            EventKind::QuotePdfRerendered,
+            EventKind::QuotePdfRerenderFailed,
+        ];
+        for v in &new {
+            assert_eq!(
+                &EventKind::from_storage_str(v.as_str()).expect("round-trip"),
+                v
+            );
+        }
+        let strs: Vec<&str> = new.iter().map(EventKind::as_str).collect();
+        for i in 0..strs.len() {
+            for j in (i + 1)..strs.len() {
+                assert_ne!(strs[i], strs[j], "{} collides with {}", strs[i], strs[j]);
+            }
+        }
+        for k in &strs {
+            for sibling in [
+                EventKind::QuotePricingRendered,
+                EventKind::QuotePricingPosted,
+                EventKind::QuotePricingFailed,
+                EventKind::QuoteStockAlertTriggered,
+                EventKind::EmailOutboxSent,
+                EventKind::EmailOutboxFailed,
+            ] {
+                assert_ne!(
+                    *k,
                     sibling.as_str(),
                     "{k} collides with sibling {}",
                     sibling.as_str()

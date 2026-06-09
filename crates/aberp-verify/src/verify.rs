@@ -979,7 +979,13 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::EmailOutboxFetched
         | EventKind::EmailOutboxClaimed
         | EventKind::EmailOutboxSent
-        | EventKind::EmailOutboxFailed => (None, ""),
+        | EventKind::EmailOutboxFailed
+        // S325 / PR-25 — customer-PDF re-render audit family. App-layer
+        // JSON payloads (quote_id / feature_graph_hash / outcome /
+        // failure_kind), never NAV XML bytes. Exhaustiveness arm only.
+        | EventKind::QuotePdfRerenderEnqueued
+        | EventKind::QuotePdfRerendered
+        | EventKind::QuotePdfRerenderFailed => (None, ""),
     };
 
     Ok(NavExtraction {

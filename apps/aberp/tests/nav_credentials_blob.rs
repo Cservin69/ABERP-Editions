@@ -293,6 +293,7 @@ fn rotation_preserves_other_three_fields() {
         ),
         storefront_credential: aberp::storefront_credential::StorefrontCredentialHandle::dormant(),
         email_outbox_daemon: aberp::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(),
+        quote_pdf_rerender_queue: aberp::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
     };
 
     // Rotate password only.
