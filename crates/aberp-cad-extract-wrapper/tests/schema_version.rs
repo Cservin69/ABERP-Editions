@@ -78,13 +78,16 @@ fn python_with_pythonpath(tmp: &Path, real_python: &Path) -> PathBuf {
     )
     .unwrap();
     // Linux ETXTBSY race — flushing + closing the writer fd before
-    // exec keeps the kernel from refusing the spawn (S303). The same
-    // pattern appears in `tests/error_paths.rs`; keep both copies in
-    // sync if the shim shape ever changes.
+    // exec is necessary but not sufficient (rust-lang/rust#114554); a
+    // short sleep between chmod and exec makes the test deterministic
+    // on GitHub Actions. The same pattern appears in
+    // `tests/error_paths.rs`; keep both copies in sync if the shim
+    // shape ever changes.
     s.sync_all().unwrap();
     drop(s);
     let mut perm = fs::metadata(&shim).unwrap().permissions();
     perm.set_mode(0o755);
     fs::set_permissions(&shim, perm).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
     shim
 }

@@ -127,15 +127,19 @@ fn timeout_kills_child_and_returns_timeout() {
         test_python_bin().display(),
     )
     .unwrap();
-    // `sync_all` + drop before exec: Linux returns ETXTBSY (os error 26)
-    // when a freshly-written file is exec'd while the writer fd is still
-    // open. macOS never trips this. S303 found the race flakes on the
-    // GitHub Actions ubuntu runner. fsync + close clears it deterministically.
+    // `sync_all` + drop + sleep before exec: Linux returns ETXTBSY
+    // (os error 26) when a freshly-written file is exec'd while the
+    // writer fd is still open OR while the kernel hasn't fully
+    // released the inode's writer reference. macOS never trips this.
+    // `sync_all` alone is insufficient (rust-lang/rust#114554 — fork+exec
+    // races vs. recent close); a short sleep makes the test deterministic
+    // on the GitHub Actions ubuntu runner.
     s.sync_all().unwrap();
     drop(s);
     let mut perm = fs::metadata(&shim).unwrap().permissions();
     perm.set_mode(0o755);
     fs::set_permissions(&shim, perm).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
 
     let extractor = CadExtractor::new()
         .with_python_bin(&shim)
@@ -262,5 +266,6 @@ fn python_with_pythonpath(tmp: &Path, real_python: &Path) -> PathBuf {
     let mut perm = fs::metadata(&shim).unwrap().permissions();
     perm.set_mode(0o755);
     fs::set_permissions(&shim, perm).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
     shim
 }
