@@ -1092,9 +1092,20 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialise the four env-mutating tests in this module — cargo's
+    /// default parallel runner would otherwise race two `set_var` /
+    /// `remove_var` calls on the same key and the slower thread's read
+    /// would see the other thread's write. S311 / PR-278's CI run hit
+    /// this race on `resolve_poll_interval_defaults_when_unset` (env
+    /// set by `_clamps_out_of_range`). A single process-wide Mutex is
+    /// the smallest fix that does not pull in `serial_test`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn resolve_poll_interval_defaults_when_unset() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var(POLL_INTERVAL_ENV);
         assert_eq!(
             resolve_poll_interval(),
@@ -1104,6 +1115,7 @@ mod tests {
 
     #[test]
     fn resolve_poll_interval_clamps_out_of_range() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var(POLL_INTERVAL_ENV, "0");
         assert_eq!(
             resolve_poll_interval(),
@@ -1126,12 +1138,14 @@ mod tests {
 
     #[test]
     fn is_disabled_false_by_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var(POLL_DISABLE_ENV);
         assert!(!is_disabled());
     }
 
     #[test]
     fn is_disabled_true_for_canonical_values() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         for v in ["1", "true", "TRUE", "True"] {
             std::env::set_var(POLL_DISABLE_ENV, v);
             assert!(is_disabled(), "expected disabled=true for {v}");
