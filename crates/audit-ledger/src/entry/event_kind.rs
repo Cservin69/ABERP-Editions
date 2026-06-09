@@ -1727,16 +1727,22 @@ pub enum EventKind {
     /// of the SPA's `last_poll_ts` indicator.
     ///
     /// Polling cadence is 5s by default
-    /// (`email_outbox_poll_daemon::POLL_TICK_SECS_DEFAULT`). A cycle
-    /// that errored on the GET does NOT fire this event — only
-    /// successful fetches land here so the audit row is a positive
-    /// "cycle completed" signal, not a polluted-with-transient-failures
-    /// heartbeat.
+    /// (`email_outbox_poll_daemon::POLL_TICK_SECS_DEFAULT`).
+    ///
+    /// **S311 / F13 + F18 widening.** Pre-S311 only successful cycles
+    /// landed here. The S309 review found that left silent-401 token-
+    /// rotation gaps invisible in the audit ledger — the SPA's volatile
+    /// `last_error_detail` was the only signal. Now: every cycle attempt
+    /// fires this event. Successful cycles carry `fetched_count: N`
+    /// with `error_class`/`error_detail` absent on the wire; errored
+    /// cycles carry `fetched_count: 0` with `error_class` (`"auth_failed"
+    /// | "network" | "decode" | "other"`) and a scrubbed `error_detail`.
     ///
     /// Carries `fetched_count`, `since_cursor` (the ISO timestamp
-    /// passed as `?since=`, or `null` on first fetch), and `cycle_at`
+    /// passed as `?since=`, or `null` on first fetch), `cycle_at`
     /// (ISO-8601 UTC of the cycle wall-clock; the cycle's own forensic
-    /// timestamp, distinct from the audit-ledger insertion timestamp).
+    /// timestamp, distinct from the audit-ledger insertion timestamp),
+    /// and the two optional error fields above.
     ///
     /// `quote.*` prefix family — same family as the pricing-pipeline
     /// kinds so a forensic walker grepping `quote.*` on a prod ledger

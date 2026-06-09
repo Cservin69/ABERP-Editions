@@ -2767,19 +2767,39 @@ impl EmailRelayAuditPayload {
 /// Per-cycle payload for [`crate::email_outbox_poll_daemon`]. Emitted
 /// once per successful `GET /api/internal/email-queue` against the
 /// storefront. NOT emitted on a cycle that errored on the GET — that
-/// would pollute the heartbeat into a transient-failure log; the SPA
-/// status panel's `last_error_*` fields surface the failure path.
-///
 /// Carries `fetched_count` (entries the storefront returned this
-/// cycle), `since_cursor` (the ISO timestamp the daemon passed as
-/// `?since=`, `null` on the boot-time first fetch), and `cycle_at`
-/// (ISO-8601 UTC of the cycle wall-clock, distinct from the audit-
-/// ledger insertion `created_at`).
+/// cycle, or `0` on an errored cycle), `since_cursor` (the ISO
+/// timestamp the daemon passed as `?since=`, `null` on the boot-time
+/// first fetch), and `cycle_at` (ISO-8601 UTC of the cycle wall-clock,
+/// distinct from the audit-ledger insertion `created_at`).
+///
+/// ## S311 / F13 + F18 widening
+///
+/// Pre-S311 this payload only carried success: cycles that errored on
+/// the GET did NOT emit an audit row. The S309 review found that this
+/// left silent-401 token-rotation gaps invisible in the audit ledger
+/// (the SPA `last_error_detail` is volatile; the ledger is durable).
+/// The two optional `error_class` + `error_detail` fields close the
+/// gap: on an errored cycle the daemon still emits this payload, with
+/// `fetched_count: 0` and the error fields populated. A forensic
+/// walker can now grep `quote.email_outbox_fetched` for every cycle
+/// attempt and branch on `error_class`. Success cycles leave both
+/// fields `null` (serde skips them on the wire).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmailOutboxFetchedPayload {
     pub fetched_count: u32,
     pub since_cursor: Option<String>,
     pub cycle_at: String,
+    /// Closed-vocab on the wire: `"auth_failed" | "network" | "decode"
+    /// | "other"`. `None` on a success cycle. The vocab is intentionally
+    /// short — a forensic walker branches on a handful of values; the
+    /// scrubbed cause string lives in `error_detail`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error_class: Option<String>,
+    /// Scrubbed-of-secrets cause string (≤ 1000 chars). `None` on a
+    /// success cycle.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error_detail: Option<String>,
 }
 
 impl EmailOutboxFetchedPayload {
@@ -2788,6 +2808,27 @@ impl EmailOutboxFetchedPayload {
             fetched_count,
             since_cursor: since_cursor.map(|s| s.to_string()),
             cycle_at: cycle_at.to_string(),
+            error_class: None,
+            error_detail: None,
+        }
+    }
+    /// Constructor for an errored cycle (S311 / F13 + F18). The
+    /// `fetched_count` is always `0` and the error fields are populated;
+    /// `since_cursor` is the cursor the daemon WOULD have passed had
+    /// the GET succeeded, so a forensic walker can correlate the failed
+    /// cycle to the surrounding successful ones.
+    pub fn errored(
+        since_cursor: Option<String>,
+        cycle_at: &str,
+        error_class: &str,
+        error_detail: &str,
+    ) -> Self {
+        Self {
+            fetched_count: 0,
+            since_cursor: since_cursor.map(|s| s.to_string()),
+            cycle_at: cycle_at.to_string(),
+            error_class: Some(error_class.to_string()),
+            error_detail: Some(error_detail.to_string()),
         }
     }
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -5272,6 +5313,41 @@ mod tests {
         let back: EmailOutboxFetchedPayload = serde_json::from_slice(&bytes).expect("decode");
         assert_eq!(back, p);
         assert!(back.since_cursor.is_none());
+    }
+
+    /// S311 / F13 + F18 — errored-cycle constructor must round-trip the
+    /// error_class + error_detail fields. The success constructor must
+    /// leave both fields absent on the wire (so legacy parsers + grep
+    /// `"error_class"` cleanly distinguish success vs error rows).
+    #[test]
+    fn email_outbox_fetched_payload_errored_round_trips() {
+        let p = EmailOutboxFetchedPayload::errored(
+            Some("2026-06-09T12:00:00Z".to_string()),
+            "2026-06-09T12:00:05Z",
+            "auth_failed",
+            "HTTP 401: Bearer token rejected",
+        );
+        let bytes = p.to_bytes();
+        let back: EmailOutboxFetchedPayload = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(back, p);
+        assert_eq!(back.fetched_count, 0);
+        assert_eq!(back.error_class.as_deref(), Some("auth_failed"));
+        assert!(back.error_detail.as_deref().unwrap().contains("401"));
+
+        // The success constructor leaves the error fields absent on the
+        // wire (skip_serializing_if). Pin so a future contributor who
+        // strips the attribute can't silently leak `"error_class": null`
+        // into every success row.
+        let success = EmailOutboxFetchedPayload::new(2, None, "2026-06-09T12:00:00Z");
+        let success_blob = String::from_utf8(success.to_bytes()).expect("UTF-8");
+        assert!(
+            !success_blob.contains("error_class"),
+            "success payload must not carry error_class on the wire; got {success_blob}"
+        );
+        assert!(
+            !success_blob.contains("error_detail"),
+            "success payload must not carry error_detail on the wire; got {success_blob}"
+        );
     }
 
     #[test]

@@ -314,6 +314,19 @@ impl EmailOutboxDaemonHandle {
             g.last_panic_msg = None;
         }
     }
+
+    /// Test seam — drop the `last_seen_iso` cursor so the next cycle
+    /// behaves as if booted fresh. The S311 stale-recovery integration
+    /// test uses this between cycles so the recovered wedge is
+    /// re-fetched even though its `queued_at` predates cycle 1's
+    /// cursor (in production a real recovered entry would carry its
+    /// original `queued_at`, so this seam pins test-only state, not a
+    /// runtime knob). NOT exposed on the SPA or on any HTTP route.
+    pub fn reset_last_seen_for_test(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.last_seen_iso = None;
+        }
+    }
 }
 
 /// Snapshot the SPA + tests consume. `Serialize` so the status route
@@ -492,7 +505,15 @@ pub async fn poll_once(deps: &EmailOutboxPollDaemonDeps, client: &reqwest::Clien
         Ok(es) => es,
         Err(e) => {
             let detail = scrub_for_audit(&format!("storefront list: {e:#}"));
-            tracing::warn!(error = %detail, "email-outbox fetch failed");
+            let error_class = classify_fetch_error(&e);
+            // S311 / F13 + F18 — emit an audit row on errored cycles too.
+            // Pre-S311 only success cycles fired EmailOutboxFetched, which
+            // left silent-401 token-rotation gaps invisible in the audit
+            // ledger (SPA `last_error_detail` is volatile; the ledger is
+            // durable). Now: every cycle attempt fires the same EventKind
+            // with `fetched_count: 0` and the error fields populated.
+            tracing::warn!(error = %detail, error_class, "email-outbox fetch failed");
+            emit_fetched_error_audit(deps, since.clone(), &cycle_at, error_class, &detail).await;
             let mut outcome = CycleOutcome {
                 cycle_at,
                 ..Default::default()
@@ -599,11 +620,19 @@ async fn handle_one_entry_inner(
                 tracing::warn!(
                     entry_id = %entry.id,
                     error = %detail,
-                    "email-outbox SMTP succeeded but writeback /sent failed; will retry"
+                    "email-outbox SMTP succeeded but writeback /sent failed; storefront stale-claim sweep will recover after CLAIM_TTL"
                 );
-                // NO terminal audit fires — the storefront entry stays
-                // in claimed/ and we'll observe it again. The duplicate-
-                // send risk is acceptable per ADR-0009 Consequences §3.
+                // NO terminal audit fires. The storefront's S311 / PR-12
+                // stale-claim sweep (`recoverStaleClaimed` inside
+                // `listQueued`, ABERP-site/src/lib/server/email-outbox.ts)
+                // atomically renames any claimed/<id>.json whose
+                // claimed_at is older than CLAIM_TTL (default 600s) back
+                // to queued/, so a daemon cycle past that TTL window
+                // sees the entry as queued and re-claims+re-sends.
+                // Duplicate-send risk is acceptable per ADR-0009
+                // Consequences §3 — the storefront sweep is the single
+                // recovery surface, not an operator runbook step
+                // (closes S309 F1).
                 Ok(EntryOutcome::WritebackSentFailed)
             }
         },
@@ -629,8 +658,14 @@ async fn handle_one_entry_inner(
                         entry_id = %entry.id,
                         smtp_error = %error_detail,
                         writeback_error = %wb_detail,
-                        "email-outbox SMTP failed AND writeback /failed errored; will retry"
+                        "email-outbox SMTP failed AND writeback /failed errored; storefront stale-claim sweep will recover after CLAIM_TTL"
                     );
+                    // Same recovery surface as the WritebackSentFailed
+                    // arm above — storefront sweep auto-recovers the
+                    // wedged claim past CLAIM_TTL (S311 F1). NO terminal
+                    // audit fires; the next cycle past TTL gets a clean
+                    // re-claim and either reaches a terminal Sent or
+                    // a terminal Failed with the same `error_class`.
                     Ok(EntryOutcome::WritebackFailedErrored)
                 }
             }
@@ -676,6 +711,29 @@ fn classify_send_error(e: &anyhow::Error) -> &'static str {
         "writeback"
     } else {
         "smtp_transport"
+    }
+}
+
+/// S311 / F18 — classify the GET error so the audit row's `error_class`
+/// names the failure family the operator must act on. The detection is
+/// substring-based because `fetch_queue` wraps the underlying reqwest
+/// error in `anyhow::Context` and formats with `:#}` (full cause chain);
+/// the storefront's `HTTP 401:` prefix is unambiguous.
+fn classify_fetch_error(e: &anyhow::Error) -> &'static str {
+    let s = e.to_string();
+    if s.contains("HTTP 401") {
+        // Most likely: ABERP_SITE_ADMIN_TOKEN rotated storefront-side
+        // without updating the keychain entry that feeds the SPOC. The
+        // operator sees a cycle-by-cycle audit row instead of silence.
+        "auth_failed"
+    } else if s.contains("decode response") {
+        "decode"
+    } else if s.contains("HTTP ") {
+        // Any other non-2xx (403/404/5xx).
+        "other"
+    } else {
+        // Network / DNS / TLS / timeout — reqwest's underlying error.
+        "network"
     }
 }
 
@@ -880,6 +938,25 @@ async fn emit_fetched_audit(
     cycle_at: &str,
 ) {
     let payload = EmailOutboxFetchedPayload::new(fetched_count, since_cursor, cycle_at);
+    write_audit(deps, EventKind::EmailOutboxFetched, payload.to_bytes()).await;
+}
+
+/// S311 / F13 + F18 — emit `EmailOutboxFetched` on an errored cycle with
+/// `fetched_count: 0` and the error fields populated. Closes the silent-
+/// 401 gap (operator rotating `ABERP_SITE_ADMIN_TOKEN` storefront-side
+/// without updating the ABERP keychain entry used to see zero ledger
+/// rows during the gap — indistinguishable from "daemon was never
+/// spawned" or "no quotes in flight"). Now the gap shows up as a row
+/// every cycle with `error_class: "auth_failed"`.
+async fn emit_fetched_error_audit(
+    deps: &EmailOutboxPollDaemonDeps,
+    since_cursor: Option<String>,
+    cycle_at: &str,
+    error_class: &str,
+    error_detail: &str,
+) {
+    let payload =
+        EmailOutboxFetchedPayload::errored(since_cursor, cycle_at, error_class, error_detail);
     write_audit(deps, EventKind::EmailOutboxFetched, payload.to_bytes()).await;
 }
 
@@ -1122,6 +1199,43 @@ mod tests {
                 "b@x.com".to_string(),
                 "c@x.com".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn classify_fetch_error_buckets_known_families() {
+        // S311 / F18 — token-rotation 401 must surface as auth_failed so
+        // the operator-facing audit row points at the right knob.
+        assert_eq!(
+            classify_fetch_error(&anyhow!(
+                "storefront GET email-queue: HTTP 401: unauthorized"
+            )),
+            "auth_failed"
+        );
+        // 5xx and 4xx-other go to "other" — still louder than silence.
+        assert_eq!(
+            classify_fetch_error(&anyhow!(
+                "storefront GET email-queue: HTTP 503: service unavailable"
+            )),
+            "other"
+        );
+        assert_eq!(
+            classify_fetch_error(&anyhow!("storefront GET email-queue: HTTP 404: not found")),
+            "other"
+        );
+        // Decode failures (JSON shape regression on the storefront side).
+        assert_eq!(
+            classify_fetch_error(&anyhow!("decode response from http://...: expected `]`")),
+            "decode"
+        );
+        // Network family — anything else, including reqwest TLS errors.
+        assert_eq!(
+            classify_fetch_error(&anyhow!("connection refused after 30s")),
+            "network"
+        );
+        assert_eq!(
+            classify_fetch_error(&anyhow!("dns lookup failed")),
+            "network"
         );
     }
 
