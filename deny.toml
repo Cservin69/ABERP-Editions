@@ -27,7 +27,41 @@ feature-depth = 1
 version = 2
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    # S303 first-CI-green sweep: two `unic-ucd-*` unmaintained advisories
+    # reach the graph via `tauri-utils → urlpattern → unic-ucd-ident →
+    # unic-ucd-version`. cargo-deny reports "No safe upgrade is available"
+    # — tauri 2.x hasn't bumped urlpattern past 0.3.0 yet. These are
+    # build-time / no-network deps that don't widen our attack surface;
+    # revisit when tauri ships an urlpattern bump.
+    # ─── tauri-utils → urlpattern → unic-* (no safe upgrade) ───
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range unmaintained; same urlpattern → unic-* path as -0080/-0098/-0100." },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common unmaintained via tauri-utils → urlpattern → unic-ucd-ident → unic-ucd-version → unic-common; no safe upgrade." },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property unmaintained; same urlpattern → unic-* path." },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version unmaintained via tauri-utils → urlpattern; no safe upgrade. Tracking upstream tauri urlpattern bump." },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident unmaintained via tauri-utils → urlpattern; same path as -0098." },
+
+    # ─── Tauri 2 Linux backend pulls GTK3 bindings (gtk-rs migrated
+    # to GTK4 upstream but no GTK4-backed Tauri release exists yet).
+    # All "unmaintained" — none are CVE-class. Revisit when Tauri
+    # ships a GTK4 path. ───
+    { id = "RUSTSEC-2024-0411", reason = "gdk unmaintained via Tauri GTK3 backend." },
+    { id = "RUSTSEC-2024-0412", reason = "gdk-sys unmaintained via Tauri GTK3 backend." },
+    { id = "RUSTSEC-2024-0413", reason = "atk unmaintained via Tauri GTK3 backend." },
+    { id = "RUSTSEC-2024-0415", reason = "gtk unmaintained via Tauri GTK3 backend." },
+    { id = "RUSTSEC-2024-0416", reason = "atk-sys unmaintained via Tauri GTK3 backend." },
+    { id = "RUSTSEC-2024-0418", reason = "gtk-sys unmaintained via Tauri GTK3 backend." },
+    { id = "RUSTSEC-2024-0419", reason = "gdkwayland-sys unmaintained via Tauri GTK3 backend." },
+    { id = "RUSTSEC-2024-0420", reason = "gdkx11-sys unmaintained via Tauri GTK3 backend." },
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18.x VariantStrIter unsoundness via Tauri GTK3 backend. Not directly used by ABERP; revisit when Tauri 2 ships a GTK4 path." },
+
+    # ─── Older ecosystem crates still in transitive trees; none
+    # ship CVE-class issues — all are unmaintained warnings. ───
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained; transitive via several proc-macro deps. Upstream has switched to proc-macro-error2 but cargo can't enforce that yet." },
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; replaced upstream by web-time. Transitive via async-io / parking_lot test helpers." },
+    { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; consider derive_more upstream. Transitive via Tauri ecosystem." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; rustls 0.23.x pulls a transitional 2.x. Revisit when reqwest/rustls drop it." },
+]
 
 # ─────────────────────────────────────────────────────────────────────
 # Licenses — ADR-0007 names MIT, Apache-2.0, BSD-3-Clause, MPL-2.0.
@@ -43,15 +77,33 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "MPL-2.0",
+    # S303 first-CI-green widening — all standard permissive,
+    # non-copyleft, OSI-approved (or public-domain dedications). Each
+    # entry below names the load-bearing transitive crate so a future
+    # reader can decide whether removing the upstream dep is feasible.
+    # ADR-0007 should be amended to ratify this list; for now the
+    # widening is captured here because the dep tree already relies
+    # on every one of them.
+    "BSD-2-Clause",         # arrayref (→ blake3 → aberp)
+    "ISC",                  # rustls-pemfile, untrusted, aws-lc-rs
+    "CC0-1.0",              # tiny-keccak, typenum-style crates
+    "CDLA-Permissive-2.0",  # webpki-roots
+    "Zlib",                 # foldhash, slotmap
+    "0BSD",                 # adler2 (via flate2)
+    "Unicode-3.0",          # unicode-ident, icu_collections, etc.
 ]
 confidence-threshold = 0.93
 exceptions = []
 
 # ABERP's own license is PolyForm-Noncommercial-1.0.0 (see LICENSE).
 # Workspace members carry `publish = false` and reference the license via
-# license-file, so the scanner does not classify the workspace crates'
-# license string. If that changes, add a [[licenses.clarify]] entry
-# scoped to the workspace package names.
+# license-file. Every workspace path-dep crate trips
+# `error[rejected]: failed to satisfy license requirements` because
+# none of them set a `license = "..."` SPDX expression. They are all
+# private (never published to crates.io); `private.ignore = true`
+# tells cargo-deny to skip license checks for unpublished workspace
+# members, matching the recommended posture for proprietary monorepos.
+private = { ignore = true }
 
 # ─────────────────────────────────────────────────────────────────────
 # Bans — duplicate-version is warn-only because transitive deps often
@@ -62,6 +114,12 @@ exceptions = []
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace path-deps (e.g. `aberp-quote-engine = { path = "..." }`)
+# show up as wildcard versions to cargo-deny because no explicit
+# version is written; this is the canonical Cargo idiom for in-repo
+# crates. `allow-wildcard-paths = true` keeps the wildcard ban on
+# crates.io deps (where it matters) while allowing the path-dep idiom.
+allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"

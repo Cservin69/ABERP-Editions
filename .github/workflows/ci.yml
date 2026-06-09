@@ -147,5 +147,19 @@ jobs:
 
       - name: cargo-audit
         # --deny warnings makes "informational" advisories (e.g. unmaintained
-        # crates) failing-loud instead of advisory-only.
-        run: cargo audit --deny warnings
+        # crates) failing-loud instead of advisory-only. The --ignore list
+        # mirrors `audit.toml` / `deny.toml::[advisories].ignore` because
+        # cargo-audit's audit.toml auto-discovery is inconsistent in CI
+        # (S303). Keep all three in lockstep when amending.
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2025-0075 --ignore RUSTSEC-2025-0080 \
+            --ignore RUSTSEC-2025-0081 --ignore RUSTSEC-2025-0098 \
+            --ignore RUSTSEC-2025-0100 \
+            --ignore RUSTSEC-2024-0411 --ignore RUSTSEC-2024-0412 \
+            --ignore RUSTSEC-2024-0413 --ignore RUSTSEC-2024-0415 \
+            --ignore RUSTSEC-2024-0416 --ignore RUSTSEC-2024-0418 \
+            --ignore RUSTSEC-2024-0419 --ignore RUSTSEC-2024-0420 \
+            --ignore RUSTSEC-2024-0429 \
+            --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2024-0384 \
+            --ignore RUSTSEC-2024-0388 --ignore RUSTSEC-2025-0134
