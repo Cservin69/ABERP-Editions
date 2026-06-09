@@ -134,8 +134,12 @@ mod tests {
         // We can't pin the hash value without re-hashing the test
         // binary, but we can confirm the background path returns a
         // 32-byte hash within a reasonable budget. The test binary is
-        // small; this should resolve in well under 5s even on a cold
-        // cache.
+        // small; this should resolve in well under 5s on Apple Silicon
+        // dev hardware. The 120s upper bound is a watchdog tuned for
+        // GitHub Actions ubuntu-latest, where SHA-256-ing a debug
+        // workspace binary on a virtualised disk has been observed at
+        // ~37s (S303). The bound exists to catch a real hang/deadlock,
+        // not to assert perf.
         let handle = BinaryHashHandle::start_background();
         let started = std::time::Instant::now();
         let result = handle.wait();
@@ -143,7 +147,7 @@ mod tests {
         let h = result.expect("background compute over test binary must succeed");
         assert_eq!(h.as_bytes().len(), 32);
         assert!(
-            elapsed < std::time::Duration::from_secs(30),
+            elapsed < std::time::Duration::from_secs(120),
             "background compute over test binary took {:?}",
             elapsed
         );
