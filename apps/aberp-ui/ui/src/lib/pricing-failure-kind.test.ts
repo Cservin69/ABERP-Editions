@@ -59,4 +59,76 @@ describe("failureKindBadge", () => {
     expect(permanent).not.toBe(unknown);
     expect(transient).not.toBe(unknown);
   });
+
+  // ── PR-274 / S297 F6 — MarginFloor badge copy split ────────────────
+
+  it("returns 'Operator review required' for permanent + MarginFloor reason", () => {
+    // The engine's `QuoteError::MarginFloorViolation` Display contains
+    // "below configured floor". Retry alone won't fix it — the operator
+    // must edit Quoting Parameters first, so the badge copy MUST tell
+    // them that, not the generic "Operator retry required".
+    const reason =
+      "computed margin 0.0500 below configured floor 0.1500 (total_price=10.0000)";
+    const b = failureKindBadge("permanent", reason);
+    expect(b).not.toBeNull();
+    expect(b!.className).toBe("chip chip--err");
+    expect(b!.label).toContain("Operator review required");
+    expect(b!.label).toContain("Operátor felülvizsgálat szükséges");
+    // NOT the generic copy — that would re-introduce the misdirection
+    // S296 F6 named.
+    expect(b!.label).not.toContain("Operator retry required");
+  });
+
+  it("returns 'Operator retry required' for permanent + non-MarginFloor reason", () => {
+    // STEP-assembly rejection is Permanent but the operator action IS
+    // a retry-after-re-upload, so the generic copy is correct here.
+    const reason =
+      "subprocess exited with code Some(2): ValueError: STEP file contains an assembly with 3 solids";
+    const b = failureKindBadge("permanent", reason);
+    expect(b).not.toBeNull();
+    expect(b!.label).toContain("Operator retry required");
+    expect(b!.label).not.toContain("Operator review required");
+  });
+
+  it("MarginFloor copy is case-insensitive on the error reason", () => {
+    // The Rust classifier lowercases before matching; the SPA mirrors
+    // that so an uppercase reason from any future engine version still
+    // lands on the review-required copy.
+    const upper =
+      "Computed Margin 0.0500 BELOW CONFIGURED FLOOR 0.1500 (total_price=10.0000)";
+    const b = failureKindBadge("permanent", upper);
+    expect(b).not.toBeNull();
+    expect(b!.label).toContain("Operator review required");
+  });
+
+  it("returns generic permanent copy when error reason is omitted", () => {
+    // Backwards-compatible single-arg form — callers without the raw
+    // reason still get a sensible (if conservative) badge.
+    const b = failureKindBadge("permanent");
+    expect(b).not.toBeNull();
+    expect(b!.label).toContain("Operator retry required");
+  });
+
+  it("returns generic permanent copy when error reason is null", () => {
+    // Legacy rows + rows with a missing reason field both fall back
+    // to the generic copy rather than misclassifying as MarginFloor.
+    const b = failureKindBadge("permanent", null);
+    expect(b).not.toBeNull();
+    expect(b!.label).toContain("Operator retry required");
+  });
+
+  it("MarginFloor copy does not change Transient or Unknown verdicts", () => {
+    // Defence-in-depth — the reason hint must only re-route the
+    // Permanent verdict; Transient + Unknown stay independent of
+    // reason text so cross-talk can't shift the className.
+    const reason =
+      "computed margin 0.0500 below configured floor 0.1500 (total_price=10.0000)";
+    expect(failureKindBadge("transient", reason)!.className).toBe(
+      "chip chip--running",
+    );
+    expect(failureKindBadge("unknown", reason)!.className).toBe(
+      "chip chip--queued",
+    );
+    expect(failureKindBadge(null, reason)!.label).toContain("Unknown");
+  });
 });

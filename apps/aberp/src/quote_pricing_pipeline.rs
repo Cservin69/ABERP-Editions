@@ -1315,6 +1315,13 @@ fn backoff_duration(idx: usize, cadence: Duration) -> Duration {
 ///   files both surface with "STEP file ..." in the message. Operator
 ///   must trim the assembly to a single part (or re-export) — retry
 ///   without that change won't help.
+/// - **stage="extract"** + reason contains `"unsupported file extension"`
+///   → `Permanent`. PR-274 (S297 F1) closes the storefront-vs-extractor
+///   whitelist mismatch: the storefront accepts 11 CAD formats but the
+///   Python dispatcher (`cli.py::_route`) only routes `.stl`/`.step`/`.stp`.
+///   Anything else (`.iges`, `.dxf`, `.sldprt`, …) raises `ValueError`
+///   with the literal "Unsupported file extension". Retry can never help
+///   — the customer must re-upload in a supported format.
 /// - **stage="post"** + reason contains `"HTTP 401"` OR `"HTTP 403"` →
 ///   `Permanent`. Auth — operator must rotate the storefront token via
 ///   Settings → Storefront credentials.
@@ -1358,6 +1365,15 @@ pub fn classify_failure(stage: &str, reason: &str) -> FailureKind {
     // body, could not be parsed). All are data-quality issues the
     // operator must fix at upload time; auto-retry is wasted cycles.
     if stage == "extract" && r.contains("step file") {
+        return FailureKind::Permanent;
+    }
+    // PR-274 / S297 F1 — storefront whitelist (11 extensions) is wider
+    // than the dispatcher's route table (3 extensions). For any
+    // unsupported format the CLI raises `ValueError("Unsupported file
+    // extension '.iges'. Supported: .stl, .step, .stp")` and the
+    // wrapper bubbles that verbatim into the reason. Retry can never
+    // help — the customer must re-upload in a supported format.
+    if stage == "extract" && r.contains("unsupported file extension") {
         return FailureKind::Permanent;
     }
     // POST-back classification — split on HTTP status family + transport
@@ -2706,6 +2722,47 @@ mod tests {
         // other stages → Unknown
         assert_eq!(classify_failure("price", reason), FailureKind::Unknown);
         assert_eq!(classify_failure("render", reason), FailureKind::Unknown);
+    }
+
+    // ── PR-274 / S297 F1 — storefront-vs-extractor whitelist mismatch ─
+
+    /// PR-274 / S297 F1: the storefront accepts `.iges`, `.dxf`,
+    /// `.sldprt`, `.obj`, etc., but the Python CLI dispatcher only routes
+    /// `.stl`/`.step`/`.stp`. Anything else raises `ValueError` with the
+    /// literal "Unsupported file extension '.iges'…" string. Without
+    /// this rule the classifier fell through to `Unknown`, so the SPA
+    /// badge gave the operator no signal that Retry was futile.
+    #[test]
+    fn pr274_classify_unsupported_extension_is_permanent() {
+        let reason = "subprocess exited with code Some(2): \
+            ValueError: Unsupported file extension '.iges'. \
+            Supported: .stl, .step, .stp";
+        assert_eq!(
+            classify_failure("extract", reason),
+            FailureKind::Permanent,
+            "unsupported-extension failures must classify Permanent — \
+             customer must re-upload, retry can never help"
+        );
+    }
+
+    /// PR-274 / S297 F1: case-insensitive — uppercase / mixed-case
+    /// "Unsupported File Extension" must still hit the rule.
+    #[test]
+    fn pr274_classify_unsupported_extension_is_case_insensitive() {
+        let upper = "ValueError: Unsupported File Extension '.DXF'. \
+            Supported: .stl, .step, .stp";
+        assert_eq!(classify_failure("extract", upper), FailureKind::Permanent);
+    }
+
+    /// PR-274 / S297 F1: the rule is scoped to the extract stage so a
+    /// hypothetical future Display string mentioning "unsupported file
+    /// extension" at another stage doesn't silently get reclassified.
+    #[test]
+    fn pr274_classify_unsupported_extension_rule_is_extract_stage_only() {
+        let reason = "ValueError: Unsupported file extension '.iges'";
+        assert_eq!(classify_failure("extract", reason), FailureKind::Permanent);
+        assert_eq!(classify_failure("price", reason), FailureKind::Unknown);
+        assert_eq!(classify_failure("post", reason), FailureKind::Unknown);
     }
 
     #[test]

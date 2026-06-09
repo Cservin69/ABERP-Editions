@@ -16177,6 +16177,17 @@ async fn handle_put_quote_intake_config(
             match quote_intake_credentials_mod::read_token(state.tenant.as_str()) {
                 Ok(bearer) => {
                     state.storefront_credential.set(url.to_string(), bearer);
+                    // PR-274 / S297 F30 — re-fire the dev-mode prod-URL
+                    // warning after a runtime URL flip. The boot-time
+                    // emit (serve.rs:1504) caught the stale-toml-on-boot
+                    // case; this catches the operator-typed-prod-URL-
+                    // post-boot case. Without this, an `ABERP_DEV_MODE=1`
+                    // dev session that PUTs `base_url=https://abenerp.com`
+                    // would have the catalogue-push daemon silently
+                    // hammer prod on the next cycle — same failure shape
+                    // S289 was written to close, just shifted from "boot
+                    // with stale URL" to "PUT to prod URL mid-session".
+                    crate::storefront_credential::emit_dev_mode_prod_url_warning(url);
                 }
                 Err(_) => {
                     // Bearer not in keychain → daemon should stay

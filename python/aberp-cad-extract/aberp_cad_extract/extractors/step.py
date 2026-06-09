@@ -44,6 +44,7 @@ try:
     from OCP.BRepGProp import BRepGProp
     from OCP.GProp import GProp_GProps
     from OCP.IFSelect import IFSelect_ReturnStatus
+    from OCP.Interface import Interface_Static
     from OCP.STEPControl import STEPControl_Reader
     from OCP.TopAbs import TopAbs_SOLID
     from OCP.TopExp import TopExp_Explorer
@@ -84,8 +85,23 @@ def _load_step_shape(path_str: str):
     Returns the consolidated ``TopoDS_Shape`` (a compound when the
     file contains multiple solids). Raises ``ValueError`` with a
     classifier-recognisable message on any OCCT-side failure.
+
+    PR-274 / S297 F2: force the read-side unit conversion target to
+    millimetres BEFORE ``ReadFile`` so that any STEP file declaring a
+    non-MM ``LENGTH_UNIT`` (``METRE``, ``CENTI METRE``, ``INCH``, …)
+    is normalised on import. OCCT's documented default IS ``"MM"``,
+    but `OCP`'s Python bindings do not guarantee that default — a
+    customer file declaring ``LENGTH_UNIT('METRE')`` could otherwise
+    read a 20 mm cube back as a 0.020 mm cube, silently produce a
+    near-zero priced quote, and ship to the customer (CLAUDE.md rule
+    12 — fail loud, the silent-wrong-value class is the most
+    expensive).
     """
     with _silence_stdout_fd():
+        # Defensive normalisation — set every read; OCCT keeps the
+        # value as global state and a future reader call could otherwise
+        # inherit a different value from elsewhere in the process.
+        Interface_Static.SetCVal_s("xstep.cascade.unit", "MM")
         reader = STEPControl_Reader()
         status = reader.ReadFile(path_str)
         if status != IFSelect_ReturnStatus.IFSelect_RetDone:

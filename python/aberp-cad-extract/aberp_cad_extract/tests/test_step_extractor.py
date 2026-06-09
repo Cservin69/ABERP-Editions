@@ -82,3 +82,70 @@ def test_missing_file_surfaces_as_value_error(tmp_path: Path):
     # OCCT's ReadFile returns a non-RetDone status for missing files;
     # the wrapper surfaces it with "could not be parsed".
     assert "could not be parsed" in msg
+
+
+# ── PR-274 / S297 F2 — STEP unit-of-measure normalisation ────────────
+
+
+def _flip_length_unit(src: Path, dst: Path, new_prefix: str) -> None:
+    """Hand-edit a STEP file's ``SI_UNIT(.MILLI.,.METRE.)`` declaration.
+
+    Replaces the first ``SI_UNIT(.MILLI.,.METRE.)`` site with
+    ``SI_UNIT(.<new_prefix>.,.METRE.)`` (or with a bare ``$`` for the
+    "no prefix" METRE form). Geometry coords stay untouched so we
+    exercise the conversion path: the file declares a non-MM unit but
+    the numeric coords are unchanged, and OCCT must convert them on
+    import per ``xstep.cascade.unit``.
+    """
+    content = src.read_bytes().decode("latin-1")
+    old = "SI_UNIT(.MILLI.,.METRE.)"
+    assert old in content, "fixture format drifted — expected SI_UNIT(.MILLI.,.METRE.)"
+    if new_prefix == "":  # bare METRE
+        new = "SI_UNIT($,.METRE.)"
+    else:
+        new = f"SI_UNIT(.{new_prefix}.,.METRE.)"
+    # Replace only the first SI_UNIT (the LENGTH_UNIT site, line ~409
+    # in the fixture). The radian / steradian unit decls use `$` prefix
+    # so they're untouched by this replace.
+    content = content.replace(old, new, 1)
+    dst.write_bytes(content.encode("latin-1"))
+
+
+def test_step_unit_centi_metre_normalises_to_mm(tmp_path: Path, step_cube_path: Path):
+    """Hand-edit the unit cube to declare CENTI METRE; OCCT must scale.
+
+    The 20 mm cube fixture has coords ±10 (in mm); flipping the
+    LENGTH_UNIT to CENTI METRE without changing coords means OCCT
+    should now interpret those ±10 as ±10 cm = ±100 mm — bbox extent
+    200 mm. If our ``Interface_Static.SetCVal_s("xstep.cascade.unit",
+    "MM")`` ever stops working — or OCCT/OCP changes its default — the
+    file would read back at ±10 mm (extent 20) and this test fails
+    loud. The c1cf32 forensic case S290 was written to surface depends
+    on this not silently re-opening as a wrong-units quote (review
+    F2).
+    """
+    cm_path = tmp_path / "unit_cube_centi_metre.step"
+    _flip_length_unit(step_cube_path, cm_path, "CENTI")
+    fg = extract_step(cm_path, material_grade="6061-T6")
+    bx, by, bz = fg.bounding_box_mm
+    # 10 cm = 100 mm; coords ±10 in the file → extent 200 mm.
+    assert bx == pytest.approx(200.0, abs=1e-2), f"x extent={bx}, file declared CENTI METRE"
+    assert by == pytest.approx(200.0, abs=1e-2)
+    assert bz == pytest.approx(200.0, abs=1e-2)
+    # Volume 200^3 = 8,000,000 mm^3.
+    assert fg.volume_mm3 == pytest.approx(8_000_000.0, rel=1e-3)
+
+
+def test_step_cascade_unit_pinned_to_mm_after_extract(step_cube_path: Path):
+    """Invariant pin: the unit-conversion parameter equals "MM" after a read.
+
+    Direct check of the OCCT global-state knob ``extract_step`` sets.
+    If a refactor ever removes or mis-names the ``SetCVal_s`` call —
+    or a future ``Interface_Static`` API rename slips through — this
+    pin fails immediately rather than waiting for the (rarer) METRE
+    fixture round-trip to misbehave.
+    """
+    from OCP.Interface import Interface_Static  # noqa: E402  — gated by importorskip above
+
+    extract_step(step_cube_path, material_grade="6061-T6")
+    assert Interface_Static.CVal_s("xstep.cascade.unit") == "MM"

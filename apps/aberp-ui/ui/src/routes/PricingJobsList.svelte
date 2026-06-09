@@ -266,8 +266,8 @@
             <td>
               {#if row.state === "failed"}
                 <div class="pricing-jobs__err-stage">{row.error_stage ?? ""}</div>
-                {#if failureKindBadge(row.failure_kind)}
-                  {@const badge = failureKindBadge(row.failure_kind)!}
+                {#if failureKindBadge(row.failure_kind, row.error_reason)}
+                  {@const badge = failureKindBadge(row.failure_kind, row.error_reason)!}
                   <div class="pricing-jobs__kind-row">
                     <span
                       class={badge.className}
