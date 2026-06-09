@@ -127,6 +127,11 @@ fn timeout_kills_child_and_returns_timeout() {
         test_python_bin().display(),
     )
     .unwrap();
+    // `sync_all` + drop before exec: Linux returns ETXTBSY (os error 26)
+    // when a freshly-written file is exec'd while the writer fd is still
+    // open. macOS never trips this. S303 found the race flakes on the
+    // GitHub Actions ubuntu runner. fsync + close clears it deterministically.
+    s.sync_all().unwrap();
     drop(s);
     let mut perm = fs::metadata(&shim).unwrap().permissions();
     perm.set_mode(0o755);
@@ -250,6 +255,9 @@ fn python_with_pythonpath(tmp: &Path, real_python: &Path) -> PathBuf {
         real_python.display(),
     )
     .unwrap();
+    // Linux ETXTBSY race — see comment above the same pattern in the
+    // timeout test.
+    s.sync_all().unwrap();
     drop(s);
     let mut perm = fs::metadata(&shim).unwrap().permissions();
     perm.set_mode(0o755);

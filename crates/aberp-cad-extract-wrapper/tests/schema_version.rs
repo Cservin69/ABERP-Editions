@@ -77,6 +77,11 @@ fn python_with_pythonpath(tmp: &Path, real_python: &Path) -> PathBuf {
         real_python.display(),
     )
     .unwrap();
+    // Linux ETXTBSY race — flushing + closing the writer fd before
+    // exec keeps the kernel from refusing the spawn (S303). The same
+    // pattern appears in `tests/error_paths.rs`; keep both copies in
+    // sync if the shim shape ever changes.
+    s.sync_all().unwrap();
     drop(s);
     let mut perm = fs::metadata(&shim).unwrap().permissions();
     perm.set_mode(0o755);
