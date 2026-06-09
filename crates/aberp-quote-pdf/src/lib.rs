@@ -50,6 +50,17 @@ pub use aberp_quote_engine::{FeatureGraph, QuoteBreakdown, ToleranceRange};
 /// Crate version stamp — used in the PDF footer.
 pub const QUOTE_PDF_RENDERER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// EVE addendum 2 — Hungarian stock-status banner line (primary, the
+/// customer market is HU). Mirrors the storefront customer HTML banner
+/// at `q/[id]/+page.svelte` so the PDF and the web view say the same
+/// thing. Double-acute `ő` is WinAnsi-substituted by [`winansi_bytes`].
+pub const STOCK_ALERT_BANNER_HU: &str =
+    "Készletállapot megváltozott — a DEAL frissíti az árképzést";
+/// EVE addendum 2 — English stock-status banner line (secondary), the
+/// exact wording the S318 brief pins.
+pub const STOCK_ALERT_BANNER_EN: &str =
+    "Stock status changed since this quote was issued — DEAL will refresh pricing";
+
 /// A4 page width in PDF points.
 const PAGE_WIDTH: i64 = 595;
 /// A4 page height in PDF points.
@@ -94,6 +105,17 @@ pub struct QuoteInputs<'a> {
     /// "tight-tolerance surcharge applied" line: that line only shows
     /// when `thin_wall_present && target_tolerance >= Tight`.
     pub target_tolerance: ToleranceRange,
+    /// EVE addendum 2 (customer-facing half). When `true`, the renderer
+    /// draws a red stock-status band at the top of the page (see
+    /// [`STOCK_ALERT_BANNER_HU`] / [`STOCK_ALERT_BANNER_EN`]). Defaults
+    /// to `false`; the sticky downgrade that flips it is detected in the
+    /// `quote_intake_log` subsystem (`recompute_stock_alert`), NOT here.
+    ///
+    /// The banner string is baked into this crate as a literal — the
+    /// same posture as the addendum-1 "Routing: 5-axis machine" lines —
+    /// rather than caller-provided, because the PDF crate carries no
+    /// i18n parameterisation and the customer market is single-locale.
+    pub stock_alert: bool,
 }
 
 /// Failure taxonomy for [`render`]. The PDF emit is straight-line
@@ -214,6 +236,24 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
     y -= 24;
     push_rule(&mut ops, MARGIN_LEFT, MARGIN_RIGHT, y);
     y -= 18;
+
+    // ── Stock-alert band (EVE addendum 2, customer-facing) ─────────
+    //
+    // Drawn at the TOP of the page (before the customer/pricing blocks)
+    // so a stock-status downgrade is the first thing the customer sees.
+    // Red rules above + below with bold red text match the addendum-1
+    // band's visual weight using the existing primitives. Bilingual
+    // (HU primary / EN secondary) to mirror the storefront HTML banner.
+    if inputs.stock_alert {
+        push_rule_red(&mut ops, MARGIN_LEFT, MARGIN_RIGHT, y + 6);
+        y -= 4;
+        push_text_red(&mut ops, MARGIN_LEFT, y, "F2", 11, STOCK_ALERT_BANNER_HU);
+        y -= 14;
+        push_text_red(&mut ops, MARGIN_LEFT, y, "F1", 10, STOCK_ALERT_BANNER_EN);
+        y -= 10;
+        push_rule_red(&mut ops, MARGIN_LEFT, MARGIN_RIGHT, y);
+        y -= 18;
+    }
 
     // ── Customer block ─────────────────────────────────────────────
     push_text(&mut ops, MARGIN_LEFT, y, "F2", 12, "CUSTOMER");
@@ -410,6 +450,37 @@ fn push_text(ops: &mut Vec<Operation>, x: i64, y: i64, font_key: &str, size: i64
     ops.push(Operation::new("ET", vec![]));
 }
 
+/// Red-fill text run — same shape as [`push_text`] but sets the
+/// nonstroking colour to the danger red before the text object and
+/// resets to black after, so later runs stay black. The crate had no
+/// prior fill-colour token (rules use a stroking grey); this danger red
+/// (`0.75, 0.0, 0.0`) is introduced for the addendum-2 stock band and
+/// matches the spirit of the storefront's `--color-danger` banner.
+fn push_text_red(ops: &mut Vec<Operation>, x: i64, y: i64, font_key: &str, size: i64, s: &str) {
+    ops.push(Operation::new(
+        "rg",
+        vec![0.75.into(), 0.0.into(), 0.0.into()],
+    ));
+    push_text(ops, x, y, font_key, size, s);
+    ops.push(Operation::new(
+        "rg",
+        vec![0.0.into(), 0.0.into(), 0.0.into()],
+    ));
+}
+
+/// Horizontal rule in the danger red, used to bracket the stock-alert
+/// band. Mirrors [`push_rule`] but with a 1pt red stroke for weight.
+fn push_rule_red(ops: &mut Vec<Operation>, x0: i64, x1: i64, y: i64) {
+    ops.push(Operation::new(
+        "RG",
+        vec![0.75.into(), 0.0.into(), 0.0.into()],
+    ));
+    ops.push(Operation::new("w", vec![1.0.into()]));
+    ops.push(Operation::new("m", vec![x0.into(), y.into()]));
+    ops.push(Operation::new("l", vec![x1.into(), y.into()]));
+    ops.push(Operation::new("S", vec![]));
+}
+
 /// Key-value row: left-aligned label + value indented to a fixed
 /// column. Keeps the part-summary block aligned for skimmability.
 fn push_kv(ops: &mut Vec<Operation>, x: i64, y: i64, label: &str, value: &str) {
@@ -505,9 +576,11 @@ fn winansi_byte_for_char(c: char) -> u8 {
         '\u{0151}' => 0xF6, // ő → ö
         '\u{0170}' => 0xDC, // Ű → Ü
         '\u{0171}' => 0xFC, // ű → ü
-        // WinAnsi supplement: only the EUR sign matters for the v1
-        // surface; rest fall through to '?'.
+        // WinAnsi supplement: only the EUR sign and em dash matter for
+        // the v1 surface; rest fall through to '?'.
         '\u{20AC}' => 0x80, // €
+        '\u{2014}' => 0x97, // — em dash (CP1252 0x97); used by the
+        // stock-alert banner and the footer "Indicative quote —" line.
         c if (c as u32) >= 0xA0 && (c as u32) <= 0xFF => c as u8,
         _ => b'?',
     }
@@ -535,6 +608,7 @@ mod tests {
             feature_graph: graph,
             breakdown,
             target_tolerance: ToleranceRange::Standard,
+            stock_alert: false,
         }
     }
 
@@ -637,6 +711,39 @@ mod tests {
         assert!(
             text.contains("Thin walls present"),
             "thin-wall line MUST appear at Tight tolerance: {text}"
+        );
+    }
+
+    /// EVE addendum 2 (customer-facing half) — when `stock_alert=true`
+    /// the customer-visible stock-status banner MUST appear on the PDF.
+    /// The EN line is asserted because it is pure-ASCII and survives
+    /// `pdf_extract` cleanly; the HU line renders alongside it.
+    #[test]
+    fn s318_addendum2_banner_renders_when_stock_alert_true() {
+        let g = fake_graph(false, false);
+        let b = fake_breakdown();
+        let mut inputs = sample_inputs(&g, &b);
+        inputs.stock_alert = true;
+        let bytes = render(&inputs).expect("render");
+        let text = pdf_extract::extract_text_from_mem(&bytes).expect("extract");
+        assert!(
+            text.contains("Stock status changed since this quote was issued"),
+            "addendum-2 stock banner missing when stock_alert=true: {text}"
+        );
+    }
+
+    /// EVE addendum 2 back-compat — the default (`stock_alert=false`,
+    /// what every existing caller produces) MUST NOT render the banner.
+    #[test]
+    fn s318_addendum2_no_banner_when_stock_alert_false() {
+        let g = fake_graph(false, false);
+        let b = fake_breakdown();
+        let inputs = sample_inputs(&g, &b); // stock_alert defaults false
+        let bytes = render(&inputs).expect("render");
+        let text = pdf_extract::extract_text_from_mem(&bytes).expect("extract");
+        assert!(
+            !text.contains("Stock status changed"),
+            "stock banner must NOT appear at stock_alert=false: {text}"
         );
     }
 

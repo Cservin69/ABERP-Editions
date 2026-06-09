@@ -710,6 +710,14 @@ impl PricingPipelineService {
                 feature_graph: &graph,
                 breakdown: &breakdown,
                 target_tolerance: target_tol,
+                // First-render is always pre-acceptance, so the EVE
+                // addendum-2 stock downgrade cannot have happened yet —
+                // `stock_alert` is necessarily false here. The banner is
+                // only reached via a post-acceptance re-render+re-post,
+                // which is BLOCKED storefront-side today (the `/priced`
+                // endpoint no-ops a same-hash re-post). Tracked in
+                // docs/findings/s318-customer-pdf-stock-banner.md.
+                stock_alert: false,
             };
             match aberp_quote_pdf::render(&inputs) {
                 Ok(bytes) => {
@@ -1609,6 +1617,12 @@ pub(crate) fn build_priced_multipart(
         "feature_graph_hash": feature_graph_hash,
         "extractor_version": aberp_cad_extract_wrapper::WRAPPER_VERSION,
         "engine_version": engine::ENGINE_VERSION,
+        // Always false on the first (and today the only) priced-writeback:
+        // the EVE addendum-2 downgrade is detected post-acceptance, after
+        // this POST has already landed. Flipping it true for the customer
+        // needs a re-render + re-post path that the storefront `/priced`
+        // endpoint currently rejects as an idempotent no-op. See
+        // docs/findings/s318-customer-pdf-stock-banner.md.
         "stock_alert": false,
     });
     let meta_bytes = serde_json::to_vec(&meta).context("encode meta JSON")?;
