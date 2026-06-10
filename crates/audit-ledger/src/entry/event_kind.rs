@@ -1853,6 +1853,33 @@ pub enum EventKind {
     ///
     /// `quote.*` prefix family.
     QuotePdfRerenderFailed,
+
+    /// S341 / PR-36 — the `audit_ledger` table's on-disk ART secondary
+    /// index (`UNIQUE(seq)` / `UNIQUE(id)`) was rebuilt from a verified-
+    /// intact image of its own rows, to recover from the DuckDB
+    /// `FixedSizeAllocator` / `Prefix::New` corruption diagnosed in S332.
+    /// The `aberp audit-rebuild` subcommand reads every row in `seq`
+    /// order, asserts the in-memory hash chain verifies (the rows are
+    /// intact; only the index is corrupt), then DROPs + CREATEs the table
+    /// with the SAME schema (UNIQUE(seq)/UNIQUE(id) preserved per S332's
+    /// "never a constraint drop" rule) and re-inserts the rows verbatim —
+    /// regenerating a clean ART. THIS entry is appended as the LAST row of
+    /// that same rebuild transaction so the ledger carries permanent proof
+    /// the rebuild happened.
+    ///
+    /// Payload (`AuditLedgerRebuiltPayload` in the binary's
+    /// `audit_payloads.rs`) carries `rows_before`, `rows_after`,
+    /// `seq_max_before`, `seq_max_after`, `chain_verified`, and `took_ms`.
+    /// `rows_after == rows_before + 1` (this marker) and
+    /// `seq_max_after == seq_max_before + 1` on a clean rebuild.
+    ///
+    /// **New prefix family `audit.`** — a meta-event about the ledger
+    /// itself, distinct from `invoice.*` / `system.*` / `mes.*` /
+    /// `quote.*` / `inventory.*` / `email.*`. The per-OUTGOING-invoice
+    /// export bundle's `invoice.*` glob (ADR-0009 §8) MUST NEVER sweep it.
+    ///
+    /// F12 four-edit ritual fires once.
+    AuditLedgerRebuilt,
 }
 
 impl EventKind {
@@ -1954,6 +1981,7 @@ impl EventKind {
             EventKind::QuotePdfRerenderEnqueued => "quote.pdf_rerender_enqueued",
             EventKind::QuotePdfRerendered => "quote.pdf_rerendered",
             EventKind::QuotePdfRerenderFailed => "quote.pdf_rerender_failed",
+            EventKind::AuditLedgerRebuilt => "audit.ledger_rebuilt",
         }
     }
 
@@ -2066,6 +2094,7 @@ impl EventKind {
             "quote.pdf_rerender_enqueued" => Ok(EventKind::QuotePdfRerenderEnqueued),
             "quote.pdf_rerendered" => Ok(EventKind::QuotePdfRerendered),
             "quote.pdf_rerender_failed" => Ok(EventKind::QuotePdfRerenderFailed),
+            "audit.ledger_rebuilt" => Ok(EventKind::AuditLedgerRebuilt),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2170,6 +2199,7 @@ mod tests {
             EventKind::QuotePdfRerenderEnqueued,
             EventKind::QuotePdfRerendered,
             EventKind::QuotePdfRerenderFailed,
+            EventKind::AuditLedgerRebuilt,
         ];
         for v in variants {
             let s = v.as_str();

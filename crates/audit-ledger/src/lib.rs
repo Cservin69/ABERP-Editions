@@ -48,7 +48,8 @@ pub use mirror::{
     RecoveryAction,
 };
 pub use storage::{
-    append_in_tx, ensure_schema, recent_entries, Ledger, LedgerMeta, LedgerVerifyError,
+    append_in_tx, ensure_schema, rebuild_table_in_tx, recent_entries, Ledger, LedgerMeta,
+    LedgerVerifyError,
 };
 
 // PR-22 / ADR-0035 §8 — additive `pub use` re-exports of the chain

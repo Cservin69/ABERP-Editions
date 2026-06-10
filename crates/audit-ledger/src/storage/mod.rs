@@ -109,6 +109,30 @@ impl Ledger {
         Self::initialise(conn, tenant_id, binary_hash)
     }
 
+    /// Open an existing `Ledger` file in READ-ONLY mode. Unlike
+    /// [`Ledger::open`] this does NOT run `ensure_schema` (a read-only
+    /// connection cannot `CREATE`), so the `audit_ledger` table MUST
+    /// already exist — the caller gets a loud DuckDB error on the first
+    /// query otherwise.
+    ///
+    /// Added for the S341 ART-rebuild path: the row dump + chain verify
+    /// must not write a single byte (so `--dry-run` is a guaranteed
+    /// no-op and leaves the file mtime untouched). The read path is also
+    /// safe against the corrupt ART — the S332 crash is on INSERT, not
+    /// SELECT.
+    pub fn open_read_only(
+        path: impl AsRef<Path>,
+        tenant_id: TenantId,
+        binary_hash: BinaryHash,
+    ) -> Result<Self, AppendError> {
+        let config = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
+        let conn = Connection::open_with_flags(path, config)?;
+        Ok(Self {
+            conn,
+            meta: LedgerMeta::new(tenant_id, binary_hash),
+        })
+    }
+
     fn initialise(
         conn: Connection,
         tenant_id: TenantId,
@@ -274,13 +298,35 @@ pub fn append_in_tx(
     };
     entry.entry_hash = compute_entry_hash(&entry);
 
+    // One body of insert logic — shared with the verbatim rebuild path
+    // ([`insert_entry_verbatim`]) so the column/parameter mapping lives
+    // in exactly one place (CLAUDE.md rule 8). Here `entry` carries the
+    // freshly-computed seq/prev_hash/entry_hash; the verbatim path passes
+    // an `Entry` decoded straight off disk.
+    insert_entry_verbatim(tx, &entry)?;
+    Ok(entry.id)
+}
+
+/// Insert an [`Entry`] into `audit_ledger` exactly as given — no field
+/// is recomputed. Every column (`seq`, `prev_hash`, `entry_hash`,
+/// `time_*`, `payload`, …) is written from the entry's own values, so
+/// round-tripping a row through [`row_to_entry`] → `insert_entry_verbatim`
+/// reproduces it byte-for-byte and the hash chain is preserved.
+///
+/// This is the workhorse of the S341 ART-rebuild path
+/// ([`rebuild_table_in_tx`]): re-inserting the decoded rows into a
+/// freshly-`CREATE`d table regenerates a clean ART index without
+/// altering the tamper-evident chain. It is NOT an append API — it does
+/// not compute `seq`/`prev_hash`, so callers outside the rebuild path
+/// must use [`append_in_tx`].
+fn insert_entry_verbatim(tx: &duckdb::Transaction<'_>, entry: &Entry) -> Result<(), AppendError> {
     let inserted = tx.execute(
         schema::INSERT,
         params![
             entry.id.to_prefixed_string(),
             entry.seq.as_u64() as i64,
             entry.prev_hash.as_bytes().as_slice(),
-            time_wall.format(&Rfc3339)?,
+            entry.time_wall.format(&Rfc3339)?,
             entry.time_mono as i64,
             entry.actor.to_storage_json(),
             entry.binary_hash.as_bytes().as_slice(),
@@ -297,7 +343,54 @@ pub fn append_in_tx(
             seq: entry.seq.as_u64(),
         });
     }
-    Ok(entry.id)
+    Ok(())
+}
+
+/// Drop and recreate the `audit_ledger` table inside the caller-owned
+/// transaction, re-inserting `entries` verbatim in the given order.
+///
+/// This is the surgical core of the S341 / PR-36 ART rebuild. The
+/// DuckDB on-disk ART secondary index (`UNIQUE(seq)` / `UNIQUE(id)`)
+/// can land in a corrupt state where every subsequent insert panics in
+/// `FixedSizeAllocator::New` → `Prefix::New` (S332). The rows themselves
+/// are intact; only the index image is bad. Dropping the table destroys
+/// the corrupt ART; recreating it with the IDENTICAL schema
+/// ([`schema::CREATE_TABLE`] — `UNIQUE(seq)` / `UNIQUE(id)` PRESERVED,
+/// never dropped, per S332 §8.3) and re-inserting the decoded rows
+/// rebuilds the ART from a clean image.
+///
+/// # Caller contract
+///
+/// - `entries` MUST be the full ledger in `seq` order and MUST already
+///   have passed [`verify_chain`] — this function does NOT re-verify; it
+///   writes whatever it is given. The binary's `audit_rebuild` path
+///   verifies before AND after.
+/// - The caller owns the transaction and is responsible for `commit()`.
+///   On any error the `Transaction`'s `Drop` rolls back, leaving the
+///   original (corrupt-index but data-intact) table untouched.
+/// - After this returns, the caller typically appends one
+///   `AuditLedgerRebuilt` marker via [`append_in_tx`] (which reads the
+///   now-rebuilt head inside the same tx) and then commits.
+///
+/// DuckDB executes DDL transactionally, so the `DROP` + `CREATE` +
+/// re-`INSERT` either all land at `commit` or none do.
+pub fn rebuild_table_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    entries: &[Entry],
+) -> Result<(), AppendError> {
+    // DROP destroys the corrupt ART; CREATE rebuilds the schema with the
+    // SAME inline UNIQUE(seq)/UNIQUE(id) constraints (a fresh, empty ART).
+    tx.execute_batch("DROP TABLE IF EXISTS audit_ledger;")?;
+    tx.execute_batch(schema::CREATE_TABLE)?;
+
+    // Re-insert every row verbatim, in seq order, regenerating the ART
+    // entry by entry. Each row's stored seq/prev_hash/entry_hash are
+    // written unchanged, so the chain that verified going in still
+    // verifies coming out.
+    for entry in entries {
+        insert_entry_verbatim(tx, entry)?;
+    }
+    Ok(())
 }
 
 /// Read the chain head (highest seq) inside the borrowed transaction.

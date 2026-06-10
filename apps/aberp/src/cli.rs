@@ -619,6 +619,60 @@ pub enum Command {
     /// permit clobbering an existing `--out` file. Same posture as
     /// `export-invoice-bundle`.
     PrintInvoice(PrintInvoiceArgs),
+
+    /// Rebuild the `audit_ledger` table's on-disk ART secondary index
+    /// (`UNIQUE(seq)` / `UNIQUE(id)`) by dumping every row, verifying the
+    /// hash chain, dropping the table to destroy the corrupt ART,
+    /// recreating it with the IDENTICAL schema, and re-inserting the rows
+    /// verbatim (S341 / PR-36). Recovery for the DuckDB
+    /// `FixedSizeAllocator` / `Prefix::New` crash diagnosed in S332,
+    /// where every audit-bearing commit panics inside DuckDB's ART.
+    ///
+    /// **The chain is NEVER relaxed.** `UNIQUE(seq)` / `UNIQUE(id)` are
+    /// preserved byte-for-byte (S332 §8.3: "never a constraint drop").
+    /// The rebuild verifies `verify_chain` BEFORE the rebuild (proving
+    /// the rows are intact and only the index is corrupt) and AFTER
+    /// (proving the rebuild preserved the chain). A pre- or post-verify
+    /// failure ABORTS with rollback — the original file is untouched.
+    ///
+    /// **Pre-flight.** Stop `aberp serve` first — the rebuild refuses to
+    /// run while a serve process holds the tenant DB, and DuckDB's
+    /// single-writer lock is the backstop. A timestamped
+    /// `.pre-rebuild-<ts>.bak` copy is taken unless `--no-backup`.
+    ///
+    /// `--dry-run` reads + verifies + probes ART health on a throwaway
+    /// copy and prints the plan WITHOUT mutating the DB. See
+    /// `docs/runbooks/s341-audit-ledger-rebuild.md`.
+    AuditRebuild(AuditRebuildArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct AuditRebuildArgs {
+    /// Tenant identifier — drives the audit-ledger genesis hash AND the
+    /// default DB path `~/.aberp/<tenant>/aberp.duckdb`. Required: a
+    /// destructive rebuild of the crown-jewel ledger must name its
+    /// target explicitly (no silent `default`).
+    #[arg(long)]
+    pub tenant: String,
+
+    /// Path to the tenant DuckDB file. Defaults to
+    /// `~/.aberp/<tenant>/aberp.duckdb` (the canonical prod location)
+    /// when omitted. Overridable for non-standard layouts and tests.
+    #[arg(long)]
+    pub db: Option<PathBuf>,
+
+    /// Read + verify + probe only; print the plan and exit WITHOUT
+    /// touching the DB. The probe copies the DB to a throwaway file and
+    /// attempts one audit append against it, so it reports "ART healthy"
+    /// vs "ART corrupt" without risking the real ledger.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Skip the timestamped `.pre-rebuild-<ts>.bak` copy taken before the
+    /// in-place rebuild. Dangerous — the backup is the only recovery path
+    /// if the rebuild aborts mid-flight. Default `false` (always back up).
+    #[arg(long, default_value_t = false)]
+    pub no_backup: bool,
 }
 
 #[derive(Debug, Parser)]
