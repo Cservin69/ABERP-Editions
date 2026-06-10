@@ -2011,6 +2011,27 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 .wait()
                 .context("await background binary hash for pdf-rerender daemon")?;
             let rr_poll_interval = crate::quote_pdf_rerender_daemon::resolve_poll_interval();
+            // S329 / 🔴4 — the in-memory queue starts empty every boot; a
+            // crash mid-drain loses the batch. Replay every
+            // `QuotePdfRerenderEnqueued` audit row that never reached a
+            // terminal back into the queue before the daemon spawns.
+            // Best-effort: a recovery error is logged, not fatal — the
+            // daemon still serves new transitions.
+            match crate::quote_pdf_rerender_daemon::recover_unfinished_rerenders(
+                &recovery_state.db_path,
+                &recovery_state.tenant,
+                &recovery_state.quote_pdf_rerender_queue,
+            ) {
+                Ok(n) if n > 0 => tracing::info!(
+                    recovered = n,
+                    "pdf-rerender boot recovery re-enqueued unfinished re-render intents (S329)"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "pdf-rerender boot recovery failed; new transitions still served (S329)"
+                ),
+            }
             let rr_deps = crate::quote_pdf_rerender_daemon::QuotePdfRerenderDaemonDeps {
                 db_path: (*recovery_state.db_path).clone(),
                 tenant: recovery_state.tenant.clone(),

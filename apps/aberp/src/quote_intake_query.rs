@@ -160,6 +160,17 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Quot
     // gets the columns the moment the SPA opens the Quotes tab.
     conn.execute_batch(S272_MIGRATION_BACKSTOP)?;
 
+    // S329 / 🔴1 — arm the stock-alert trigger in production. The
+    // `stock_status_at_accept` baseline (and the closed-vocab
+    // `material_grade` the recompute keys on) had NO production writer:
+    // every prior writer lived inside `#[cfg(test)]`, so in prod the
+    // column was always NULL → `recompute_stock_alert` always returned
+    // FALSE → the whole S318/S323/S325 customer-banner arc was dead.
+    // Project both from the authoritative `quote_pricing_jobs` row (same
+    // `quote_id`) at the moment the operator first observes the
+    // already-accepted, fully-priced quote. See `project_accept_snapshot`.
+    project_accept_snapshot(conn, tenant_id)?;
+
     // Build the (grade → current stock_status) lookup ONCE for the whole
     // tenant. The recompute pass is per-row but the catalogue read is
     // O(catalogue_size); pulling it once amortises across all 500 rows.
@@ -422,6 +433,63 @@ fn read_current_stock_status_by_grade(
         map.insert(grade, stock_status);
     }
     Ok(map)
+}
+
+/// S329 / 🔴1 — the production writer for `stock_status_at_accept` (and
+/// the closed-vocab `material_grade`) on `quote_intake_log`.
+///
+/// # Why this is the seam
+///
+/// A `quote_intake_log` row exists only because the quote-intake daemon
+/// fetched the quote from the storefront's *approved* feed — i.e. the
+/// customer has already accepted. The closed-vocab `material_grade` the
+/// recompute keys on is not in the intake payload (which carries only the
+/// free-text `material_preference`); it lives on the auto-quote pipeline's
+/// `quote_pricing_jobs` row, keyed on the SAME `quote_id`, where it was
+/// validated against the catalogue before the priced PDF was posted. So
+/// the only place both the grade AND the live catalogue are reachable is
+/// here, ABERP-side, on the operator's Quotes-tab read.
+///
+/// For every row still missing its snapshot, join the matching `posted`
+/// pricing job and the catalogue, then write `material_grade` +
+/// `stock_status_at_accept = <current stock_status>` in one guarded,
+/// write-once UPDATE (`stock_status_at_accept IS NULL`). Gating on
+/// `state = 'posted'` guarantees the re-render artifacts already exist, so
+/// a later FALSE→TRUE flip cannot enqueue a quote the daemon would then
+/// fail as `artifacts_missing`.
+///
+/// Best-effort: a fresh tenant with no `quote_pricing_jobs` table yet
+/// simply has nothing to project (the recompute stays a no-op).
+fn project_accept_snapshot(conn: &Connection, tenant_id: &str) -> Result<()> {
+    // Guard the no-table case (a tenant that staged intake rows via the
+    // daemon but never ran the auto-quote pipeline) the same way
+    // `read_current_stock_status_by_grade` guards the catalogue: detect
+    // the missing table via prepare-and-recover rather than a schema
+    // create, so the read path never mutates the pricing-jobs schema.
+    let mut stmt = match conn.prepare(
+        "UPDATE quote_intake_log
+            SET material_grade = j.material_grade,
+                stock_status_at_accept = m.stock_status
+           FROM quote_pricing_jobs j, quoting_materials m
+          WHERE quote_intake_log.tenant_id = ?1
+            AND quote_intake_log.stock_status_at_accept IS NULL
+            AND j.tenant_id = quote_intake_log.tenant_id
+            AND j.quote_id = quote_intake_log.quote_id
+            AND j.state = 'posted'
+            AND m.tenant_id = quote_intake_log.tenant_id
+            AND m.grade = j.material_grade",
+    ) {
+        Ok(s) => s,
+        Err(duckdb::Error::DuckDBFailure(_, Some(msg)))
+            if msg.contains("does not exist") || msg.contains("Table") =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    stmt.execute(params![tenant_id])
+        .context("project stock_status_at_accept snapshot from quote_pricing_jobs")?;
+    Ok(())
 }
 
 /// Match the daemon's `log_table::SCHEMA_SQL`. Kept in sync by the
@@ -1078,6 +1146,138 @@ mod tests {
         let listing2 = list_quote_intake_rows(&conn, "t1").unwrap();
         assert!(listing2.newly_triggered_alerts.is_empty());
         assert!(listing2.rows[0].stock_alert);
+    }
+
+    /// Seed a `posted` `quote_pricing_jobs` row carrying the closed-vocab
+    /// `material_grade` — the authoritative source the S329 🔴1 projection
+    /// reads to arm the stock-alert trigger.
+    fn seed_posted_pricing_job(conn: &Connection, tenant: &str, quote_id: &str, grade: &str) {
+        crate::quote_pricing_jobs::ensure_schema(conn).unwrap();
+        conn.execute(
+            "INSERT INTO quote_pricing_jobs (
+                quote_id, tenant_id, state, fetched_at, updated_at,
+                customer_email, customer_name, material_grade, quantity,
+                cad_filename, cad_local_path, feature_graph_hash,
+                feature_graph_json, breakdown_json, pdf_path,
+                total_price_eur, valid_until_iso, attempt_n
+             ) VALUES (?1, ?2, 'posted', 'now', 'now',
+                'c@example.com', 'Cust', ?3, 5,
+                'part.stl', '/tmp/part.stl', 'blake3:abc',
+                '{}', '{}', '/tmp/priced.pdf', 21.0, '2026-07-06', 0)",
+            params![quote_id, tenant, grade],
+        )
+        .unwrap();
+    }
+
+    /// S329 / 🔴1 — the production writer for `stock_status_at_accept`.
+    /// Before this fix every writer lived inside `#[cfg(test)]`, so the
+    /// column was always NULL in prod and the customer-banner arc was dead.
+    ///
+    /// Phase 1 — a staged intake row (no `material_grade`, no snapshot) +
+    /// a matching `posted` pricing job + an `in_stock` catalogue: the
+    /// list-route projection MUST populate `material_grade` and snapshot
+    /// `stock_status_at_accept = 'in_stock'` (write-once).
+    ///
+    /// Phase 2 — the snapshot now armed, a catalogue downgrade MUST drive
+    /// `recompute_stock_alert` to a real FALSE→TRUE flip end-to-end —
+    /// proving the arc fires, not just that one column is written.
+    #[test]
+    fn s329_stock_status_at_accept_snapshot_persisted_on_approval() {
+        let conn = open_mem();
+        seed_material(&conn, "t1", "6061-T6", "in_stock");
+        // A plain staged intake row: NO material_grade, NO snapshot. This
+        // is exactly the prod shape — the intake daemon writes only the
+        // base columns.
+        insert_test_row(
+            &conn,
+            "t1",
+            "q-acc",
+            "2026-01-01T00:00:00Z",
+            "{}",
+            "{}",
+            None,
+        );
+        seed_posted_pricing_job(&conn, "t1", "q-acc", "6061-T6");
+
+        // First list pass runs the projection.
+        let listing0 = list_quote_intake_rows(&conn, "t1").unwrap();
+        assert_eq!(listing0.rows.len(), 1);
+        assert_eq!(
+            listing0.rows[0].material_grade.as_deref(),
+            Some("6061-T6"),
+            "material_grade projected from the posted pricing job"
+        );
+        assert_eq!(
+            listing0.rows[0].stock_status_at_accept.as_deref(),
+            Some("in_stock"),
+            "stock_status_at_accept snapshotted from the live catalogue"
+        );
+        assert!(!listing0.rows[0].stock_alert, "no downgrade yet → no alert");
+        assert!(listing0.newly_triggered_alerts.is_empty());
+
+        // The snapshot is write-once: a catalogue change does NOT move it.
+        conn.execute(
+            "UPDATE quoting_materials SET stock_status = 'source_1_2d'
+              WHERE grade = '6061-T6' AND tenant_id = 't1'",
+            [],
+        )
+        .unwrap();
+
+        // Phase 2 — the armed trigger now flips FALSE→TRUE end-to-end.
+        let listing1 = list_quote_intake_rows(&conn, "t1").unwrap();
+        assert_eq!(
+            listing1.rows[0].stock_status_at_accept.as_deref(),
+            Some("in_stock"),
+            "snapshot is write-once: still the at-accept value"
+        );
+        assert!(
+            listing1.rows[0].stock_alert,
+            "downgrade vs the snapshot arms the customer banner"
+        );
+        assert_eq!(listing1.newly_triggered_alerts.len(), 1);
+        assert_eq!(
+            listing1.newly_triggered_alerts[0].snapshot_status,
+            "in_stock"
+        );
+        assert_eq!(
+            listing1.newly_triggered_alerts[0].current_status,
+            "source_1_2d"
+        );
+    }
+
+    /// A pricing job that has NOT reached `posted` (artifacts not yet
+    /// rendered) must NOT arm the snapshot — otherwise a flip could
+    /// enqueue a re-render the daemon would fail as `artifacts_missing`.
+    #[test]
+    fn s329_snapshot_skips_pricing_jobs_before_posted() {
+        let conn = open_mem();
+        seed_material(&conn, "t1", "6061-T6", "in_stock");
+        insert_test_row(
+            &conn,
+            "t1",
+            "q-early",
+            "2026-01-01T00:00:00Z",
+            "{}",
+            "{}",
+            None,
+        );
+        crate::quote_pricing_jobs::ensure_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO quote_pricing_jobs (
+                quote_id, tenant_id, state, fetched_at, updated_at,
+                customer_email, customer_name, material_grade, quantity,
+                cad_filename, cad_local_path, attempt_n
+             ) VALUES ('q-early', 't1', 'pricing', 'now', 'now',
+                'c@example.com', 'Cust', '6061-T6', 5,
+                'part.stl', '/tmp/part.stl', 0)",
+            [],
+        )
+        .unwrap();
+        let listing = list_quote_intake_rows(&conn, "t1").unwrap();
+        assert!(
+            listing.rows[0].stock_status_at_accept.is_none(),
+            "pre-posted job does not arm the snapshot"
+        );
     }
 
     /// Idempotency: re-running the persist with the SAME alerts after the

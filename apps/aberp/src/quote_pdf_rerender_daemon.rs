@@ -36,8 +36,10 @@
 //!   re-enqueued for the next cycle.
 //! - storefront `4xx` (except `409`) → **Permanent**: dropped from the
 //!   queue, audit row emitted.
-//! - storefront `409` → treated as **success** (already flipped /
-//!   terminal — re-queueing cannot help, and it is not an error).
+//! - storefront `409` with an `idempotent:true` / `rerendered:true` body →
+//!   **success** (already flipped / just flipped). Any other `409` reason
+//!   (different-hash conflict, terminal state) or an unparseable body →
+//!   **Permanent** (S329 🔴3 — never record a non-delivery as success).
 //! - artifacts missing / render failure → **Permanent**.
 //! - unexpected status (`1xx`/`3xx`) → **Unknown**: dropped + audited
 //!   (no hot-loop), per the conservative no-silent-retry posture.
@@ -126,6 +128,90 @@ pub fn is_disabled() -> bool {
             t == "1" || t.eq_ignore_ascii_case("true")
         })
         .unwrap_or(false)
+}
+
+// ── Boot recovery ─────────────────────────────────────────────────────
+
+/// S329 / 🔴4 — replay unfinished re-render intents at boot.
+///
+/// The in-memory queue starts empty every boot, and `poll_once` drains
+/// the whole set atomically into a local `Vec` before processing entries
+/// sequentially (each with a 30s HTTP timeout). A panic / SIGTERM /
+/// restart anywhere in that window loses every drained-but-unprocessed
+/// id, and the read side cannot re-detect because `stock_alert` is now
+/// sticky-TRUE. The durable signal already exists but was never replayed:
+/// `persist_alerts_and_enqueue_rerender` writes a `QuotePdfRerenderEnqueued`
+/// audit row in the same tx as the flip.
+///
+/// On boot, scan the ledger for every `quote.pdf_rerender_enqueued` whose
+/// quote_id has NOT since reached a terminal — a `quote.pdf_rerendered`
+/// (delivered) or a `quote.pdf_rerender_failed` the daemon classified
+/// `permanent` (operator-retry-only) — and re-enqueue it. A `transient`
+/// or `unknown` failed row is deliberately NOT terminal: the in-memory
+/// re-enqueue it implies was also lost on the crash, so the banner is
+/// still undelivered and must be recovered. Returns the count re-enqueued.
+pub fn recover_unfinished_rerenders(
+    db_path: &std::path::Path,
+    tenant: &TenantId,
+    queue: &QuotePdfRerenderQueue,
+) -> Result<usize> {
+    let conn = Connection::open(db_path).with_context(|| {
+        format!(
+            "open tenant DB for pdf-rerender boot recovery at {}",
+            db_path.display()
+        )
+    })?;
+    aberp_audit_ledger::ensure_schema(&conn)
+        .context("ensure audit schema for pdf-rerender boot recovery")?;
+    let mut stmt = conn.prepare(
+        "SELECT kind, payload FROM audit_ledger
+          WHERE tenant_id = ?1
+            AND kind IN ('quote.pdf_rerender_enqueued',
+                         'quote.pdf_rerendered',
+                         'quote.pdf_rerender_failed')
+          ORDER BY seq ASC",
+    )?;
+    let mut rows = stmt.query(params![tenant.as_str()])?;
+    // Replay the per-quote event stream in seq order: an enqueue makes a
+    // quote outstanding; a terminal clears it. The final residue is the
+    // set of quotes whose last word was "enqueued" (or a non-permanent
+    // failure) with no delivery after.
+    let mut outstanding: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(row) = rows.next()? {
+        let kind: String = row.get(0)?;
+        let payload: Vec<u8> = row.get(1)?;
+        let value: serde_json::Value = match serde_json::from_slice(&payload) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let quote_id = match value.get("quote_id").and_then(|q| q.as_str()) {
+            Some(q) => q.to_string(),
+            None => continue,
+        };
+        match kind.as_str() {
+            "quote.pdf_rerender_enqueued" => {
+                outstanding.insert(quote_id);
+            }
+            "quote.pdf_rerendered" => {
+                outstanding.remove(&quote_id);
+            }
+            "quote.pdf_rerender_failed" => {
+                let permanent =
+                    value.get("failure_kind").and_then(|k| k.as_str()) == Some("permanent");
+                if permanent {
+                    outstanding.remove(&quote_id);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut recovered = 0usize;
+    for quote_id in &outstanding {
+        if queue.enqueue(quote_id) {
+            recovered += 1;
+        }
+    }
+    Ok(recovered)
 }
 
 // ── Re-post transport (pluggable for tests) ───────────────────────────
@@ -248,11 +334,30 @@ pub fn classify_repost(status: u16, body: &str) -> RepostOutcome {
                 }
             }
         }
-        // Same geometry/pricing already present, or terminal-state — the
-        // storefront has nothing to overwrite. Not an error.
-        409 => RepostOutcome::Success {
-            label: "already_flipped_409",
-        },
+        // S329 / 🔴3 — a 409 is NOT uniformly benign. The storefront
+        // returns 409 for three distinct cases; only the already-flipped
+        // ones are success. Treating all 409s as Success (the S325 bug)
+        // recorded genuine non-delivery (`terminal_or_committed`,
+        // `already_priced_with_different_hash`) as `quote.pdf_rerendered`
+        // — a CLAUDE.md #12 "fail-loud" violation that silently dropped
+        // the customer's banner. Now: a body asserting `idempotent:true`
+        // or `rerendered:true` is a legitimate already-flipped/just-flipped
+        // 409 → Success; ANY other reason (different-hash conflict,
+        // terminal state) OR an unparseable body → Permanent (operator
+        // must reconcile; never claim a delivery that did not happen).
+        409 => {
+            let benign = body.contains("\"idempotent\":true")
+                || body.contains("\"idempotent\": true")
+                || body.contains("\"rerendered\":true")
+                || body.contains("\"rerendered\": true");
+            if benign {
+                RepostOutcome::Success {
+                    label: "already_flipped_409",
+                }
+            } else {
+                RepostOutcome::Permanent
+            }
+        }
         500..=599 => RepostOutcome::Transient,
         400..=499 => RepostOutcome::Permanent,
         _ => RepostOutcome::Unknown,
@@ -797,11 +902,31 @@ mod tests {
                 label: "idempotent"
             }
         );
+        // S329 / 🔴3 — a benign 409 (body asserts the flip already
+        // happened) is success; every other 409 reason is Permanent.
         assert_eq!(
-            classify_repost(409, "already_priced"),
+            classify_repost(409, "{\"status\":\"approved\",\"idempotent\":true}"),
             RepostOutcome::Success {
                 label: "already_flipped_409"
             }
+        );
+        assert_eq!(
+            classify_repost(409, "{\"rerendered\": true}"),
+            RepostOutcome::Success {
+                label: "already_flipped_409"
+            }
+        );
+        assert_eq!(
+            classify_repost(409, "{\"error\":\"already_priced_with_different_hash\"}"),
+            RepostOutcome::Permanent
+        );
+        assert_eq!(
+            classify_repost(409, "{\"error\":\"terminal_or_committed\"}"),
+            RepostOutcome::Permanent
+        );
+        assert_eq!(
+            classify_repost(409, "<garbage unparseable body>"),
+            RepostOutcome::Permanent
         );
         assert_eq!(classify_repost(503, ""), RepostOutcome::Transient);
         assert_eq!(classify_repost(500, ""), RepostOutcome::Transient);
@@ -1007,8 +1132,10 @@ mod tests {
         assert_ne!(std::fs::read(&pdf).unwrap(), b"%PDF-old-no-banner");
     }
 
+    /// S329 / 🔴3 — a benign 409 (the storefront reports the flip already
+    /// landed) IS success: the customer PDF carries the banner.
     #[tokio::test]
-    async fn s325_pdf_rerender_409_treated_as_success_already_flipped() {
+    async fn s329_pdf_rerender_benign_409_idempotent_is_success() {
         let dir = ScratchDir::new("X");
         let db = dir.db();
         let pdf = dir.pdf();
@@ -1019,15 +1146,48 @@ mod tests {
         let deps = test_deps(db.clone(), queue.clone());
         let reposter = FakeReposter {
             status: 409,
-            body: "already_priced_with_different_hash".to_string(),
+            body: "{\"status\":\"approved\",\"idempotent\":true}".to_string(),
             calls: Arc::new(Mutex::new(Vec::new())),
         };
 
         poll_once(&deps, &reposter).await;
 
-        assert!(queue.is_empty(), "409 is terminal-success, queue drained");
+        assert!(queue.is_empty(), "benign 409 is success, queue drained");
         assert_eq!(audit_count(&db, "quote.pdf_rerendered"), 1);
         assert_eq!(audit_count(&db, "quote.pdf_rerender_failed"), 0);
+    }
+
+    /// S329 / 🔴3 — a non-benign 409 (`already_priced_with_different_hash`
+    /// or `terminal_or_committed`) is a REAL non-delivery. The S325 bug
+    /// classified every 409 as success and emitted `quote.pdf_rerendered`
+    /// while the customer PDF was never overwritten. It must instead be
+    /// Permanent: drop + a `quote.pdf_rerender_failed` audit row, NEVER a
+    /// success row (CLAUDE.md #12 fail-loud).
+    #[tokio::test]
+    async fn s329_daemon_classifies_unknown_409_as_permanent_not_success() {
+        let dir = ScratchDir::new("X");
+        let db = dir.db();
+        let pdf = dir.pdf();
+        seed_posted_job(&db, "t1", "q-1", pdf.to_str().unwrap());
+
+        let queue = QuotePdfRerenderQueue::new();
+        queue.enqueue("q-1");
+        let deps = test_deps(db.clone(), queue.clone());
+        let reposter = FakeReposter {
+            status: 409,
+            body: "{\"error\":\"already_priced_with_different_hash\"}".to_string(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        poll_once(&deps, &reposter).await;
+
+        assert!(queue.is_empty(), "permanent 409 dropped, not re-queued");
+        assert_eq!(
+            audit_count(&db, "quote.pdf_rerendered"),
+            0,
+            "non-delivery must NOT be recorded as a success"
+        );
+        assert_eq!(audit_count(&db, "quote.pdf_rerender_failed"), 1);
     }
 
     #[tokio::test]
@@ -1118,6 +1278,96 @@ mod tests {
             "missing artifacts is permanent (no hot-loop requeue)"
         );
         assert_eq!(audit_count(&db, "quote.pdf_rerender_failed"), 1);
+    }
+
+    /// Append one re-render audit row directly, mirroring what the
+    /// enqueue seam / daemon emit. `failure_kind` is set only for
+    /// `QuotePdfRerenderFailed`.
+    fn append_rr_event(
+        db_path: &std::path::Path,
+        tenant: &str,
+        kind: EventKind,
+        quote_id: &str,
+        failure_kind: Option<&str>,
+    ) {
+        let mut conn = Connection::open(db_path).unwrap();
+        aberp_audit_ledger::ensure_schema(&conn).unwrap();
+        let mut payload = serde_json::json!({ "quote_id": quote_id });
+        if let Some(fk) = failure_kind {
+            payload["failure_kind"] = serde_json::Value::String(fk.to_string());
+        }
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let tx = conn.transaction().unwrap();
+        let meta = LedgerMeta::new(
+            TenantId::new(tenant).unwrap(),
+            BinaryHash::from_bytes([0u8; 32]),
+        );
+        let actor = Actor::from_local_cli(Ulid::new().to_string(), "test");
+        append_in_tx(&tx, &meta, kind, bytes, actor, None).unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// S329 / 🔴4 — boot recovery replays enqueued intents that never
+    /// reached a terminal. q1 was delivered (`rerendered`), q2 failed
+    /// `permanent` — both are done. q3 failed `transient` (the in-memory
+    /// re-enqueue was lost on crash) and q4 was enqueued with nothing
+    /// after — both are still undelivered and MUST be re-enqueued.
+    #[tokio::test]
+    async fn s329_boot_replays_unfinished_rerender_enqueued_audit_entries() {
+        let dir = ScratchDir::new("recover");
+        let db = dir.db();
+        for qid in ["q1", "q2", "q3", "q4"] {
+            append_rr_event(&db, "t1", EventKind::QuotePdfRerenderEnqueued, qid, None);
+        }
+        append_rr_event(&db, "t1", EventKind::QuotePdfRerendered, "q1", None);
+        append_rr_event(
+            &db,
+            "t1",
+            EventKind::QuotePdfRerenderFailed,
+            "q2",
+            Some("permanent"),
+        );
+        append_rr_event(
+            &db,
+            "t1",
+            EventKind::QuotePdfRerenderFailed,
+            "q3",
+            Some("transient"),
+        );
+
+        let queue = QuotePdfRerenderQueue::new();
+        let recovered =
+            recover_unfinished_rerenders(&db, &TenantId::new("t1").unwrap(), &queue).unwrap();
+
+        assert_eq!(recovered, 2, "only q3 (transient) + q4 (no terminal)");
+        assert!(!queue.contains("q1"), "delivered quote not replayed");
+        assert!(
+            !queue.contains("q2"),
+            "permanently-failed quote not replayed"
+        );
+        assert!(queue.contains("q3"), "transient-failed quote replayed");
+        assert!(queue.contains("q4"), "never-finished quote replayed");
+    }
+
+    /// A re-enqueue-after-delivery (downgrade → deliver → second downgrade
+    /// → enqueue again) leaves the quote outstanding: the LAST event wins.
+    #[tokio::test]
+    async fn s329_boot_recovery_last_event_wins_per_quote() {
+        let dir = ScratchDir::new("recover-seq");
+        let db = dir.db();
+        append_rr_event(&db, "t1", EventKind::QuotePdfRerenderEnqueued, "q5", None);
+        append_rr_event(&db, "t1", EventKind::QuotePdfRerendered, "q5", None);
+        // A later, distinct downgrade re-enqueues the same quote.
+        append_rr_event(&db, "t1", EventKind::QuotePdfRerenderEnqueued, "q5", None);
+
+        let queue = QuotePdfRerenderQueue::new();
+        let recovered =
+            recover_unfinished_rerenders(&db, &TenantId::new("t1").unwrap(), &queue).unwrap();
+        assert_eq!(recovered, 1);
+        assert!(
+            queue.contains("q5"),
+            "re-enqueue after delivery is outstanding"
+        );
     }
 
     #[tokio::test]
