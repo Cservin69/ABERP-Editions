@@ -48,6 +48,26 @@
 //! calls `handle.set(...)` after a successful save, so the very next
 //! cycle (operator-triggered or cadence) sees the new value. A dormant
 //! handle ⇒ skip the cycle (record a `dormant` outcome and back off).
+//!
+//! ## S339 / PR-24 — the storefront origin shared secret
+//!
+//! The storefront's global guard (`hooks.server.ts`) rejects any request
+//! lacking an `X-CloudFront-Secret` header that matches its
+//! `CLOUDFRONT_SHARED_SECRET` with `403 "forbidden: missing origin
+//! signature"`. The name says "signature" but it is a **static
+//! shared-secret header compare**, NOT an HMAC (no signing / canonical
+//! string / timestamp — verified S339 cross-repo). CloudFront injects
+//! the header on origin requests, but its behaviours are per-path, so a
+//! direct/origin hit to `/api/catalogue/materials` can arrive without it
+//! and 403 → the daemon's `unexpected_status` outcome (403 ≠ 401).
+//!
+//! When the optional origin secret is provisioned
+//! ([`crate::storefront_origin_secret`]) the push attaches the header
+//! itself; when it is absent (the common case) the push is byte-for-byte
+//! what it was pre-S339 and relies on CloudFront injecting it. The
+//! bearer is unchanged — it is the SAME shared [`StorefrontCredentialHandle`]
+//! the (working) email-outbox daemon uses, so the bearer half of the
+//! storefront's dual-gate (`requireAdminAuth`, 401) was never the gap.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,6 +80,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
+use zeroize::Zeroizing;
 
 use aberp_audit_ledger::{append_in_tx, Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
 
@@ -70,6 +91,9 @@ pub const PUSH_CADENCE_SECS: u64 = 900;
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 const BOOT_DELAY_SECS: u64 = 30;
 const CATALOGUE_PATH: &str = "/api/catalogue/materials";
+/// S339 / PR-24 — the storefront's CloudFront→origin shared-secret
+/// header. Sent only when the optional origin secret is provisioned.
+const ORIGIN_SECRET_HEADER: &str = "X-CloudFront-Secret";
 
 // ── Shared handle (lives in AppState; the on-write trigger + status) ─────
 
@@ -212,6 +236,13 @@ pub struct CataloguePushDeps {
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
+    /// S339 / PR-24 — optional storefront origin shared secret
+    /// (`X-CloudFront-Secret`). Resolved ONCE at boot
+    /// ([`crate::storefront_origin_secret::resolve`]). `None` (the
+    /// default) ⇒ no header, pre-S339 behaviour. Deploy-infra credential,
+    /// not operator-SPA-editable, so it does NOT live in the
+    /// hot-reloadable [`StorefrontCredentialHandle`].
+    pub origin_secret: Option<Zeroizing<String>>,
 }
 
 pub struct CataloguePushService {
@@ -367,15 +398,19 @@ impl CataloguePushService {
         let url = format!("{}{CATALOGUE_PATH}", credential.base_url);
         let auth = format!("Bearer {}", &*credential.bearer);
 
-        let outcome = match self
+        // S339 / PR-24 — satisfy the storefront's CloudFront→origin
+        // shared-secret gate when provisioned. Additive: a `None`
+        // secret sends exactly the pre-S339 headers.
+        let mut request = self
             .client
             .put(&url)
             .header(AUTHORIZATION, auth)
-            .header(CONTENT_TYPE, "application/json")
-            .json(&body)
-            .send()
-            .await
-        {
+            .header(CONTENT_TYPE, "application/json");
+        if let Some(secret) = &self.deps.origin_secret {
+            request = request.header(ORIGIN_SECRET_HEADER, secret.as_str());
+        }
+
+        let outcome = match request.json(&body).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -545,5 +580,13 @@ mod tests {
         let s = scrub("error sending request with Bearer abc.def.ghi");
         assert!(s.contains("Bearer <redacted>"));
         assert!(!s.contains("abc.def.ghi"));
+    }
+
+    #[test]
+    fn origin_secret_header_name_is_the_storefront_contract() {
+        // Pin the header name verbatim — the storefront's
+        // `hooks.server.ts` reads `x-cloudfront-secret` (case-insensitive
+        // HTTP header match). A silent rename here re-opens the 403.
+        assert_eq!(ORIGIN_SECRET_HEADER, "X-CloudFront-Secret");
     }
 }

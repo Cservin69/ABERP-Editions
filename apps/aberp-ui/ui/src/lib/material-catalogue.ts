@@ -3,7 +3,11 @@
 // comparator. Kept out of the .svelte component so it is unit-testable
 // without a DOM (mirrors lib/invoice-list.ts + lib/adapter-format.ts).
 
-import type { QuotingMaterial, StockStatus } from "./api";
+import type {
+  CataloguePushStatus,
+  QuotingMaterial,
+  StockStatus,
+} from "./api";
 
 /** Display order of the closed-vocab stock status (kept in sync with the
  * Rust `StockStatus::ALL`). */
@@ -127,4 +131,68 @@ export function sortMaterials(
   const key = sort.key;
   out.sort((a, b) => compareMaterials(a, b, key, sort.dir));
   return out;
+}
+
+// ── Catalogue push-status truth (S339 / PR-24) ───────────────────────
+//
+// The Maintenance dashboard's Material-catalogue tile used to show only
+// the grade COUNT — silent about whether the storefront push actually
+// works. When the push fails every cycle (the S338/S339 pilot blocker)
+// the operator saw a healthy-looking count and no hint of the outage.
+// This derives an honest one-line suffix from the live
+// `CataloguePushStatus` (same struct the Rust daemon records each
+// cycle). `nowMs` is injected so the 30-minute freshness window is
+// deterministically testable.
+
+/** Tone for the push-status suffix — drives the chip colour upstream. */
+export type PushStatusTone = "positive" | "warning" | "muted";
+
+export interface PushStatusSuffix {
+  text: string;
+  tone: PushStatusTone;
+}
+
+const PUSH_FRESH_WINDOW_MS = 30 * 60 * 1000;
+
+/** Derive the operator-facing push-status suffix from the live status.
+ *
+ * - success within 30 min → `Pushed to storefront ✓` (positive)
+ * - paused on a 401 (rotated bearer) → re-paste prompt (warning)
+ * - any non-success outcome → `Push failing — see operator log ⚠` (warning)
+ * - dormant (storefront not configured) → muted, non-alarming
+ * - never attempted / stale success → `Pending push` (muted)
+ */
+export function renderPushStatusSuffix(
+  status: CataloguePushStatus,
+  nowMs: number,
+): PushStatusSuffix {
+  // A rotated bearer is its own actionable state regardless of outcome.
+  if (status.paused) {
+    return {
+      text: "Push paused — re-paste bearer ⚠",
+      tone: "warning",
+    };
+  }
+  const outcome = status.last_outcome;
+  if (outcome === null) {
+    return { text: "Pending push", tone: "muted" };
+  }
+  if (outcome === "dormant") {
+    // Not an error: the operator simply hasn't configured the storefront.
+    return { text: "Storefront not configured", tone: "muted" };
+  }
+  if (outcome === "ok") {
+    const at = status.last_attempt_at ? Date.parse(status.last_attempt_at) : NaN;
+    const fresh = Number.isFinite(at) && nowMs - at <= PUSH_FRESH_WINDOW_MS;
+    if (fresh) {
+      return { text: "Pushed to storefront ✓", tone: "positive" };
+    }
+    // A stale success means the daemon hasn't run recently (e.g. just
+    // booted, backing off, or idle) — honest "pending" rather than a
+    // green tick we can't currently vouch for.
+    return { text: "Pending push", tone: "muted" };
+  }
+  // transport / unexpected_status / unauthorized (non-paused) — the
+  // push is actively failing. Point the operator at the log.
+  return { text: "Push failing — see operator log ⚠", tone: "warning" };
 }

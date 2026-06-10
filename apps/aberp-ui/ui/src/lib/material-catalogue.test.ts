@@ -1,8 +1,9 @@
 import { describe, expect, test, vi } from "vitest";
 
-import type { QuotingMaterial } from "./api";
+import type { CataloguePushStatus, QuotingMaterial } from "./api";
 import {
   compareMaterials,
+  renderPushStatusSuffix,
   sortMaterials,
   STOCK_STATUS_ORDER,
   stockStatusLabel,
@@ -124,5 +125,89 @@ describe("compareMaterials / sortMaterials", () => {
         "asc",
       ),
     ).toBeLessThan(0);
+  });
+});
+
+describe("renderPushStatusSuffix (S339)", () => {
+  const NOW = Date.parse("2026-06-10T12:00:00.000Z");
+
+  function status(over: Partial<CataloguePushStatus>): CataloguePushStatus {
+    return {
+      running: true,
+      paused: false,
+      last_attempt_at: null,
+      last_outcome: null,
+      last_pushed_count: null,
+      last_detail: null,
+      ...over,
+    };
+  }
+
+  test("fresh success → positive ✓", () => {
+    const r = renderPushStatusSuffix(
+      status({
+        last_outcome: "ok",
+        last_attempt_at: "2026-06-10T11:45:00.000Z", // 15 min ago
+        last_pushed_count: 12,
+      }),
+      NOW,
+    );
+    expect(r.tone).toBe("positive");
+    expect(r.text).toContain("✓");
+  });
+
+  test("stale success (>30 min) → muted pending, not a green tick", () => {
+    const r = renderPushStatusSuffix(
+      status({
+        last_outcome: "ok",
+        last_attempt_at: "2026-06-10T11:00:00.000Z", // 60 min ago
+      }),
+      NOW,
+    );
+    expect(r.tone).toBe("muted");
+    expect(r.text).not.toContain("✓");
+  });
+
+  test("unexpected_status (the prod 403/400 shape) → warning failing", () => {
+    const r = renderPushStatusSuffix(
+      status({
+        last_outcome: "unexpected_status",
+        last_attempt_at: "2026-06-10T11:59:00.000Z",
+        last_detail: "HTTP 403",
+      }),
+      NOW,
+    );
+    expect(r.tone).toBe("warning");
+    expect(r.text).toContain("⚠");
+    expect(r.text.toLowerCase()).toContain("failing");
+  });
+
+  test("transport error → warning failing", () => {
+    const r = renderPushStatusSuffix(
+      status({ last_outcome: "transport", last_attempt_at: NOW.toString() }),
+      NOW,
+    );
+    expect(r.tone).toBe("warning");
+  });
+
+  test("paused on 401 → warning re-paste prompt, overrides outcome", () => {
+    const r = renderPushStatusSuffix(
+      status({ paused: true, last_outcome: "unauthorized" }),
+      NOW,
+    );
+    expect(r.tone).toBe("warning");
+    expect(r.text.toLowerCase()).toContain("re-paste");
+  });
+
+  test("dormant → muted, non-alarming", () => {
+    const r = renderPushStatusSuffix(status({ last_outcome: "dormant" }), NOW);
+    expect(r.tone).toBe("muted");
+    expect(r.text.toLowerCase()).toContain("not configured");
+  });
+
+  test("never attempted (null outcome) → muted pending", () => {
+    const r = renderPushStatusSuffix(status({ last_outcome: null }), NOW);
+    expect(r.tone).toBe("muted");
+    expect(r.text.toLowerCase()).toContain("pending");
   });
 });

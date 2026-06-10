@@ -1512,11 +1512,29 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     // S279 / PR-265 — capture another snapshot for the
                     // pricing-pipeline daemon spawn below.
                     let pipeline_operator_login = operator_login.clone();
+                    // S339 / PR-24 — resolve the optional storefront
+                    // origin shared secret ONCE here (env override →
+                    // keychain → None). When present the catalogue push
+                    // attaches `X-CloudFront-Secret` so a direct/origin
+                    // hit that CloudFront did not cover stops 403-ing.
+                    // `None` is the common case and preserves pre-S339
+                    // behaviour. One-shot INFO names the state so the
+                    // boot stream is honest about whether the header is
+                    // in play (no silent behaviour — [[trust-code-not-operator]]).
+                    let origin_secret =
+                        crate::storefront_origin_secret::resolve(st.tenant.as_str());
+                    tracing::info!(
+                        origin_secret_present = origin_secret.is_some(),
+                        "catalogue-push origin-secret resolution (S339): \
+                         present ⇒ X-CloudFront-Secret sent; absent ⇒ \
+                         relying on CloudFront header injection"
+                    );
                     let push_deps = crate::catalogue_push::CataloguePushDeps {
                         db_path: (*st.db_path).clone(),
                         tenant: st.tenant.clone(),
                         binary_hash,
                         operator_login: operator_login.clone(),
+                        origin_secret,
                     };
                     let push_handle = st.catalogue_push.clone();
                     let push_credential = st.storefront_credential.clone();

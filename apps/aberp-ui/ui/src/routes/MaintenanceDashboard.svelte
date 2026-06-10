@@ -54,6 +54,7 @@
     type MaintenanceTile,
   } from "../lib/erp-modules";
   import { navigateTo, routeHash } from "../lib/router";
+  import { renderPushStatusSuffix } from "../lib/material-catalogue";
 
   // Per-tile load state — a discriminated union the chrome branches
   // on per render. We keep `value` typed loose-string here; each
@@ -216,9 +217,15 @@
         // S266 / PR-255 — count of material grades in the auto-quoting
         // catalogue. Seeded with a handful of common grades on first
         // boot, so a fresh tenant shows that seed count, not 0.
+        // S339 / PR-24 — append the live storefront push status so the
+        // tile stops lying about catalogue delivery (the count read
+        // green even while every push 403'd). Derived from the same
+        // `push_status` the daemon records each cycle.
         const res = await listQuotingMaterials();
         const n = res.materials.length;
-        return n === 1 ? "1 material" : `${n} materials`;
+        const base = n === 1 ? "1 material" : `${n} materials`;
+        const push = renderPushStatusSuffix(res.push_status, Date.now());
+        return `${base} · ${push.text}`;
       }
       case "ComplexityRuleCount": {
         // S267 / PR-256 — count of complexity rules. Seeded empty on
