@@ -35,7 +35,11 @@ use ulid::Ulid;
 fn meta() -> (LedgerMeta, TenantId, BinaryHash) {
     let tenant = TenantId::new("s335-coherence").expect("tenant");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
-    (LedgerMeta::new(tenant.clone(), binary_hash), tenant, binary_hash)
+    (
+        LedgerMeta::new(tenant.clone(), binary_hash),
+        tenant,
+        binary_hash,
+    )
 }
 
 fn scratch(name: &str) -> std::path::PathBuf {

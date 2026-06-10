@@ -117,10 +117,7 @@ fn handle(mode: QueueMode, method: &str, path: &str, authorization: Option<&str>
     if method == "GET" && path_no_query == "/api/internal/email-queue" {
         let entries = match mode {
             QueueMode::Empty => String::new(),
-            QueueMode::Entries(n) => (0..n)
-                .map(canned_entry)
-                .collect::<Vec<_>>()
-                .join(","),
+            QueueMode::Entries(n) => (0..n).map(canned_entry).collect::<Vec<_>>().join(","),
         };
         return resp(200, &format!(r#"{{"entries":[{entries}]}}"#));
     }
@@ -257,7 +254,10 @@ async fn s335_email_outbox_idle_cycle_does_not_emit_fetched_audit() {
     // The single heartbeat row is the idle shape: fetched_count 0, no error.
     assert_eq!(fetched[0]["fetched_count"], serde_json::json!(0));
     assert!(
-        fetched[0].get("error_class").map(|v| v.is_null()).unwrap_or(true),
+        fetched[0]
+            .get("error_class")
+            .map(|v| v.is_null())
+            .unwrap_or(true),
         "heartbeat must not carry an error_class"
     );
     let _ = std::fs::remove_file(&db_path);

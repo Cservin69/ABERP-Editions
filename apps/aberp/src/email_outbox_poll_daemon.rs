@@ -1169,7 +1169,11 @@ fn iso8601(dt: OffsetDateTime) -> String {
 /// prior emit this boot — is always due, so a freshly-booted idle daemon
 /// leaves exactly one liveness row immediately rather than going dark for
 /// the first [`HEARTBEAT_INTERVAL`].
-fn heartbeat_due(last_emit: Option<OffsetDateTime>, now: OffsetDateTime, interval: Duration) -> bool {
+fn heartbeat_due(
+    last_emit: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+    interval: Duration,
+) -> bool {
     match last_emit {
         None => true,
         // Compare in whole milliseconds: `now - prev` is a `time::Duration`
@@ -1515,11 +1519,7 @@ mod tests {
             "60s < 5min must NOT be due"
         );
         assert!(
-            !heartbeat_due(
-                Some(base),
-                base + Duration::from_secs(5 * 60 - 1),
-                interval
-            ),
+            !heartbeat_due(Some(base), base + Duration::from_secs(5 * 60 - 1), interval),
             "just under 5min must NOT be due"
         );
         // At/after the interval: due again.
