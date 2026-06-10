@@ -108,7 +108,9 @@ pub struct CataloguePushStatus {
     /// restart. Sticky until next boot.
     pub paused: bool,
     pub last_attempt_at: Option<String>,
-    /// `ok` / `unauthorized` / `transport` / `unexpected_status`.
+    /// `ok` / `unauthorized` / `dormant` / `transport` /
+    /// `rejected_<code>` (4xx) / `transient_<code>` (5xx) /
+    /// `unexpected_status` (genuinely-weird 1xx/3xx).
     pub last_outcome: Option<String>,
     pub last_pushed_count: Option<i64>,
     pub last_detail: Option<String>,
@@ -157,7 +159,7 @@ impl CataloguePushHandle {
     fn record(&self, attempt_at: String, outcome: &PushOutcome) {
         if let Ok(mut s) = self.status.lock() {
             s.last_attempt_at = Some(attempt_at);
-            s.last_outcome = Some(outcome.label().to_string());
+            s.last_outcome = Some(outcome.label());
             s.last_pushed_count = outcome.pushed_count();
             s.last_detail = outcome.detail();
             if matches!(outcome, PushOutcome::Unauthorized) {
@@ -184,7 +186,27 @@ pub enum PushOutcome {
         count: i64,
     },
     Unauthorized,
+    /// S342 / PR-37 — a 4xx (other than 401): the storefront REJECTED the
+    /// snapshot (e.g. a contract-drift `400 "display_name is required"`).
+    /// Carries the HTTP code + a scrubbed body excerpt so the operator
+    /// sees the reason in the audit row / Maintenance card without
+    /// curl-debugging prod. Labelled `rejected_<code>`.
+    Rejected {
+        status: u16,
+        body: String,
+    },
+    /// S342 / PR-37 — a 5xx: server-side error on the storefront/origin.
+    /// The daemon will retry on backoff, so this is non-terminal.
+    /// Labelled `transient_<code>`.
+    ServerError {
+        status: u16,
+        body: String,
+    },
     Transport(String),
+    /// A status that is neither 2xx, 401, 4xx, nor 5xx — i.e. a
+    /// genuinely-weird 1xx/3xx. Should essentially never happen against a
+    /// JSON API; kept as an honest catch-all rather than silently folding
+    /// it into a rejection class.
     UnexpectedStatus(u16),
     /// S289 / PR-270 — the storefront credential handle was empty when
     /// the cycle started (operator hadn't configured the storefront, or
@@ -194,13 +216,18 @@ pub enum PushOutcome {
 }
 
 impl PushOutcome {
-    pub fn label(&self) -> &'static str {
+    /// Operator-facing + audit outcome string. Dynamic for the HTTP-status
+    /// classes (`rejected_400`, `transient_503`) so the code travels into
+    /// the audit row and the Maintenance card without a second field.
+    pub fn label(&self) -> String {
         match self {
-            PushOutcome::Ok { .. } => "ok",
-            PushOutcome::Unauthorized => "unauthorized",
-            PushOutcome::Transport(_) => "transport",
-            PushOutcome::UnexpectedStatus(_) => "unexpected_status",
-            PushOutcome::Dormant => "dormant",
+            PushOutcome::Ok { .. } => "ok".to_string(),
+            PushOutcome::Unauthorized => "unauthorized".to_string(),
+            PushOutcome::Rejected { status, .. } => format!("rejected_{status}"),
+            PushOutcome::ServerError { status, .. } => format!("transient_{status}"),
+            PushOutcome::Transport(_) => "transport".to_string(),
+            PushOutcome::UnexpectedStatus(_) => "unexpected_status".to_string(),
+            PushOutcome::Dormant => "dormant".to_string(),
         }
     }
     fn is_ok(&self) -> bool {
@@ -212,12 +239,75 @@ impl PushOutcome {
             _ => None,
         }
     }
+    /// Human-readable one-liner for the SPA `last_detail`. Carries the
+    /// rejection body excerpt so the catalogue page shows *why* (e.g.
+    /// "HTTP 400: display_name is required").
     fn detail(&self) -> Option<String> {
         match self {
             PushOutcome::Ok { .. } | PushOutcome::Unauthorized | PushOutcome::Dormant => None,
             PushOutcome::Transport(s) => Some(s.clone()),
+            PushOutcome::Rejected { status, body } | PushOutcome::ServerError { status, body } => {
+                if body.is_empty() {
+                    Some(format!("HTTP {status}"))
+                } else {
+                    Some(format!("HTTP {status}: {body}"))
+                }
+            }
             PushOutcome::UnexpectedStatus(c) => Some(format!("HTTP {c}")),
         }
+    }
+    /// Structured HTTP status for the audit payload (`None` for
+    /// transport/dormant, which never reached an HTTP response).
+    fn http_status(&self) -> Option<u16> {
+        match self {
+            PushOutcome::Unauthorized => Some(401),
+            PushOutcome::Rejected { status, .. }
+            | PushOutcome::ServerError { status, .. }
+            | PushOutcome::UnexpectedStatus(status) => Some(*status),
+            PushOutcome::Ok { .. } | PushOutcome::Transport(_) | PushOutcome::Dormant => None,
+        }
+    }
+    /// Scrubbed response-body excerpt for the audit payload (only the
+    /// rejection classes carry one).
+    fn response_excerpt(&self) -> Option<String> {
+        match self {
+            PushOutcome::Rejected { body, .. } | PushOutcome::ServerError { body, .. }
+                if !body.is_empty() =>
+            {
+                Some(body.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// First `RESPONSE_EXCERPT_MAX` chars of a (bearer-scrubbed, trimmed)
+/// response body. Bounds the audit payload + status struct so a verbose
+/// HTML error page can't bloat the ledger.
+const RESPONSE_EXCERPT_MAX: usize = 200;
+
+fn response_excerpt(body: &str) -> String {
+    scrub(body.trim())
+        .chars()
+        .take(RESPONSE_EXCERPT_MAX)
+        .collect()
+}
+
+/// Pure status classifier (S342 / PR-37). Maps a non-2xx HTTP code +
+/// response-body excerpt to the right [`PushOutcome`]. Pure so it is
+/// unit-testable without a mock server; `push_once` only adds the actual
+/// network I/O (reading the body) around it.
+///
+/// - `401` → [`PushOutcome::Unauthorized`] (pauses the daemon; body dropped)
+/// - other `4xx` → [`PushOutcome::Rejected`] (`rejected_<code>`)
+/// - `5xx` → [`PushOutcome::ServerError`] (`transient_<code>`, retried)
+/// - anything else (`1xx`/`3xx`) → [`PushOutcome::UnexpectedStatus`]
+fn classify_status(status: u16, body: String) -> PushOutcome {
+    match status {
+        401 => PushOutcome::Unauthorized,
+        400..=499 => PushOutcome::Rejected { status, body },
+        500..=599 => PushOutcome::ServerError { status, body },
+        _ => PushOutcome::UnexpectedStatus(status),
     }
 }
 
@@ -330,7 +420,7 @@ impl CataloguePushService {
                 backoff_idx = backoff_idx.saturating_add(1);
                 tracing::warn!(
                     backoff_secs = d.as_secs(),
-                    outcome = outcome.label(),
+                    outcome = outcome.label().as_str(),
                     "catalogue push failed; backing off"
                 );
                 d
@@ -412,13 +502,16 @@ impl CataloguePushService {
 
         let outcome = match request.json(&body).send().await {
             Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
+                let status = resp.status().as_u16();
+                if (200..300).contains(&status) {
                     PushOutcome::Ok { count }
-                } else if status.as_u16() == 401 {
-                    PushOutcome::Unauthorized
                 } else {
-                    PushOutcome::UnexpectedStatus(status.as_u16())
+                    // S342 / PR-37 — read the body on any non-2xx so the
+                    // operator sees the storefront's rejection reason
+                    // (e.g. "display_name is required") in the audit row
+                    // and Maintenance card without curl-debugging prod.
+                    let resp_body = resp.text().await.unwrap_or_default();
+                    classify_status(status, response_excerpt(&resp_body))
                 }
             }
             Err(e) => PushOutcome::Transport(scrub(&e.to_string())),
@@ -450,6 +543,11 @@ impl CataloguePushService {
                 "outcome": outcome.label(),
                 "pushed_count": outcome.pushed_count(),
                 "detail": outcome.detail(),
+                // S342 / PR-37 — structured rejection diagnostics so the
+                // audit row carries the HTTP code + body excerpt, not just
+                // an opaque "unexpected_status".
+                "http_status": outcome.http_status(),
+                "response_excerpt": outcome.response_excerpt(),
                 "idempotency_key": Ulid::new().to_string(),
             });
             let bytes = serde_json::to_vec(&payload).context("serialize push payload")?;
@@ -522,18 +620,109 @@ mod tests {
         assert_eq!(PushOutcome::Ok { count: 3 }.pushed_count(), Some(3));
         assert_eq!(PushOutcome::Unauthorized.label(), "unauthorized");
         assert_eq!(PushOutcome::Transport("dns".into()).label(), "transport");
+        // S342 / PR-37 — the HTTP-status classes carry the code in the label.
         assert_eq!(
-            PushOutcome::UnexpectedStatus(503).label(),
+            PushOutcome::Rejected {
+                status: 400,
+                body: String::new()
+            }
+            .label(),
+            "rejected_400"
+        );
+        assert_eq!(
+            PushOutcome::ServerError {
+                status: 503,
+                body: String::new()
+            }
+            .label(),
+            "transient_503"
+        );
+        // UnexpectedStatus is now reserved for genuinely-weird 1xx/3xx.
+        assert_eq!(
+            PushOutcome::UnexpectedStatus(302).label(),
             "unexpected_status"
         );
         assert_eq!(
-            PushOutcome::UnexpectedStatus(503).detail(),
-            Some("HTTP 503".to_string())
+            PushOutcome::UnexpectedStatus(302).detail(),
+            Some("HTTP 302".to_string())
         );
         // S289 / PR-270 — dormant is a distinct, non-alarming outcome.
         assert_eq!(PushOutcome::Dormant.label(), "dormant");
         assert!(PushOutcome::Dormant.detail().is_none());
         assert!(PushOutcome::Dormant.pushed_count().is_none());
+    }
+
+    #[test]
+    fn classify_status_maps_each_http_class() {
+        // 401 stays the special pause case (body dropped).
+        assert_eq!(
+            classify_status(401, "ignored".to_string()),
+            PushOutcome::Unauthorized
+        );
+        // Other 4xx → Rejected, carrying the code + body excerpt.
+        assert_eq!(
+            classify_status(400, "display_name is required".to_string()),
+            PushOutcome::Rejected {
+                status: 400,
+                body: "display_name is required".to_string()
+            }
+        );
+        assert_eq!(
+            classify_status(403, "forbidden".to_string()),
+            PushOutcome::Rejected {
+                status: 403,
+                body: "forbidden".to_string()
+            }
+        );
+        // 5xx → ServerError (transient, will retry).
+        assert_eq!(
+            classify_status(503, "upstream down".to_string()),
+            PushOutcome::ServerError {
+                status: 503,
+                body: "upstream down".to_string()
+            }
+        );
+        // Genuinely weird (3xx) → UnexpectedStatus.
+        assert_eq!(
+            classify_status(302, String::new()),
+            PushOutcome::UnexpectedStatus(302)
+        );
+    }
+
+    #[test]
+    fn rejected_outcome_surfaces_status_and_excerpt() {
+        let o = PushOutcome::Rejected {
+            status: 400,
+            body: "materials[0]: display_name is required".to_string(),
+        };
+        assert_eq!(o.http_status(), Some(400));
+        assert_eq!(
+            o.response_excerpt(),
+            Some("materials[0]: display_name is required".to_string())
+        );
+        assert_eq!(
+            o.detail(),
+            Some("HTTP 400: materials[0]: display_name is required".to_string())
+        );
+        // The transient (5xx) class carries the same structured fields.
+        let s = PushOutcome::ServerError {
+            status: 503,
+            body: "upstream".to_string(),
+        };
+        assert_eq!(s.http_status(), Some(503));
+        assert_eq!(s.response_excerpt(), Some("upstream".to_string()));
+    }
+
+    #[test]
+    fn response_excerpt_scrubs_bearer_and_bounds_length() {
+        let bearer = response_excerpt("leak Bearer abc.def.ghi");
+        assert!(bearer.contains("Bearer <redacted>"));
+        assert!(!bearer.contains("abc.def.ghi"));
+        let long = "x".repeat(500);
+        assert_eq!(
+            response_excerpt(&long).chars().count(),
+            RESPONSE_EXCERPT_MAX
+        );
     }
 
     #[test]

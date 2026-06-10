@@ -182,6 +182,35 @@ describe("renderPushStatusSuffix (S339)", () => {
     expect(r.text.toLowerCase()).toContain("failing");
   });
 
+  test("rejected_400 (S342) → warning naming the HTTP code", () => {
+    const r = renderPushStatusSuffix(
+      status({
+        last_outcome: "rejected_400",
+        last_attempt_at: "2026-06-10T11:59:00.000Z",
+        last_detail: "HTTP 400: materials[0]: display_name is required",
+      }),
+      NOW,
+    );
+    expect(r.tone).toBe("warning");
+    expect(r.text).toContain("⚠");
+    expect(r.text.toLowerCase()).toContain("rejected");
+    expect(r.text).toContain("400");
+  });
+
+  test("transient_503 (S342) → warning, retrying", () => {
+    const r = renderPushStatusSuffix(
+      status({
+        last_outcome: "transient_503",
+        last_attempt_at: "2026-06-10T11:59:00.000Z",
+        last_detail: "HTTP 503: upstream unavailable",
+      }),
+      NOW,
+    );
+    expect(r.tone).toBe("warning");
+    expect(r.text).toContain("503");
+    expect(r.text.toLowerCase()).toContain("retry");
+  });
+
   test("transport error → warning failing", () => {
     const r = renderPushStatusSuffix(
       status({ last_outcome: "transport", last_attempt_at: NOW.toString() }),

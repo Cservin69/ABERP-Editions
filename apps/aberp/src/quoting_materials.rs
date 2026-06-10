@@ -1003,6 +1003,122 @@ mod tests {
         }
     }
 
+    // ── S342 / PR-37 — display_name presence + full-row contract pin ─────
+
+    #[test]
+    fn s342_catalogue_push_snapshot_includes_display_name() {
+        // The S339 prod symptom was a 400 "display_name is required". This
+        // pins that the snapshot ABERP builds carries a NON-EMPTY
+        // display_name per row (the field has shipped since S266; this guards
+        // it against a future projection that drops or empties it).
+        let mut c = conn();
+        let m = meta();
+        create_material(&mut c, &m, "ervin", TENANT, &valid_inputs("6061-T6")).expect("create");
+        let rows = list_public(&c, TENANT).expect("public projection");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.grade, "6061-T6");
+        assert!(
+            !row.display_name.trim().is_empty(),
+            "every pushed row must carry a non-empty display_name (the storefront 400s without it)"
+        );
+        // …and it survives serialization under the wire key `display_name`.
+        // The daemon PUTs `{ "materials": [ <PublicMaterial>, … ] }`.
+        let json = serde_json::to_string(&serde_json::json!({ "materials": rows }))
+            .expect("serialize snapshot");
+        assert!(
+            json.contains("\"display_name\":\"Display 6061-T6\""),
+            "serialized snapshot must carry the display_name field verbatim; got {json}"
+        );
+    }
+
+    /// S342 / PR-37 — cross-repo contract pin (mirrors S338's grade pin, but
+    /// for the WHOLE row). The storefront's `validateMaterialRow` in
+    /// `src/lib/server/catalogue-store.ts` rejects the entire push (400) if
+    /// any field is missing/malformed. This mirrors those rules and asserts
+    /// every row ABERP would PUT satisfies them — so a projection drift
+    /// (e.g. dropping display_name) fails HERE, not as a silent prod 400.
+    ///
+    /// Keep in lockstep with `catalogue-store.ts`:
+    ///   grade: non-empty, ≤64, GRADE_RE
+    ///   display_name: non-empty (trimmed), ≤200, no CR/LF/NUL
+    ///   stock_status: in the closed enum
+    ///   lead_time_default_days: integer in [0, 365]
+    fn row_satisfies_storefront_contract(m: &PublicMaterial) -> Result<(), String> {
+        // Mirror of STOCK_STATUSES in catalogue-store.ts.
+        const STOREFRONT_STOCK_STATUSES: [&str; 5] = [
+            "in_stock",
+            "source_1_2d",
+            "source_3_7d",
+            "source_2_4w",
+            "special_order",
+        ];
+        if m.grade.is_empty() || m.grade.len() > 64 {
+            return Err(format!("grade length out of [1,64]: {:?}", m.grade));
+        }
+        if !grade_satisfies_storefront_contract(&m.grade) {
+            return Err(format!("grade fails GRADE_RE: {:?}", m.grade));
+        }
+        if m.display_name.trim().is_empty() || m.display_name.len() > 200 {
+            return Err(format!("display_name out of [1,200]: {:?}", m.display_name));
+        }
+        if m.display_name.contains(['\r', '\n', '\0']) {
+            return Err(format!("display_name has CR/LF/NUL: {:?}", m.display_name));
+        }
+        if !STOREFRONT_STOCK_STATUSES.contains(&m.stock_status.as_str()) {
+            return Err(format!(
+                "stock_status not in closed enum: {:?}",
+                m.stock_status
+            ));
+        }
+        if !(0..=365).contains(&m.lead_time_default_days) {
+            return Err(format!(
+                "lead_time_default_days out of [0,365]: {}",
+                m.lead_time_default_days
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn s342_snapshot_satisfies_storefront_validate_material_row() {
+        // The seeded catalogue (real hyphenated/digit grades — 6061-T6,
+        // 304, Ti-6Al-4V, …) plus one operator-typed grade not in the seed
+        // must all pass the storefront's per-row validation.
+        let mut c = conn();
+        seed_if_empty(&mut c, TENANT).expect("seed");
+        create_material(
+            &mut c,
+            &meta(),
+            "ervin",
+            TENANT,
+            &valid_inputs("Custom-Alloy 42"),
+        )
+        .expect("create");
+        let rows = list_public(&c, TENANT).expect("public projection");
+        assert!(!rows.is_empty(), "snapshot must not be empty");
+        for m in &rows {
+            row_satisfies_storefront_contract(m)
+                .unwrap_or_else(|e| panic!("row would be 400'd by the storefront: {e}"));
+        }
+    }
+
+    #[test]
+    fn s342_contract_pin_catches_a_dropped_display_name() {
+        // Prove the pin actually fails on the prod symptom (an empty
+        // display_name) — a guard that can't fail is worthless (CLAUDE.md #9).
+        let bad = PublicMaterial {
+            grade: "6061-T6".to_string(),
+            display_name: "   ".to_string(),
+            stock_status: "in_stock".to_string(),
+            lead_time_default_days: 7,
+        };
+        assert!(
+            row_satisfies_storefront_contract(&bad).is_err(),
+            "an empty display_name must fail the contract pin (it is the prod 400)"
+        );
+    }
+
     fn count_catalogue_audit(conn: &Connection) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'quote.material_catalogue_changed';",

@@ -192,6 +192,25 @@ export function renderPushStatusSuffix(
     // green tick we can't currently vouch for.
     return { text: "Pending push", tone: "muted" };
   }
+  // S342 / PR-37 — the daemon now carries the HTTP code in the outcome
+  // string (`rejected_<code>` for 4xx, `transient_<code>` for 5xx) so the
+  // tile names *what* failed instead of a generic "failing". The full
+  // reason (e.g. "display_name is required") is in `last_detail`, shown on
+  // the Material-catalogue page.
+  if (outcome.startsWith("rejected_")) {
+    const code = outcome.slice("rejected_".length);
+    return {
+      text: `Push rejected by storefront (HTTP ${code}) — see detail ⚠`,
+      tone: "warning",
+    };
+  }
+  if (outcome.startsWith("transient_")) {
+    const code = outcome.slice("transient_".length);
+    return {
+      text: `Storefront error (HTTP ${code}) — retrying ⚠`,
+      tone: "warning",
+    };
+  }
   // transport / unexpected_status / unauthorized (non-paused) — the
   // push is actively failing. Point the operator at the log.
   return { text: "Push failing — see operator log ⚠", tone: "warning" };

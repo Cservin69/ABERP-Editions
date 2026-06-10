@@ -25,9 +25,14 @@
 //!   (same source as the working email-outbox daemon).
 //! - `s339_catalogue_push_returns_success_against_test_storefront` — a
 //!   2xx from the mock yields `PushOutcome::Ok` and an `ok` audit row.
-//! - `s339_catalogue_push_audit_records_http_400_when_storefront_rejects`
-//!   — a 400 yields `UnexpectedStatus(400)` and an `unexpected_status`
-//!   audit row (the prod symptom shape; 400 ≠ 401 ⇒ not `unauthorized`).
+//! - `s342_catalogue_push_classifies_400_as_rejected_with_body` — a 400
+//!   yields `Rejected { 400, body }` and a `rejected_400` audit row whose
+//!   payload carries `http_status` + the storefront's body excerpt (the
+//!   prod symptom shape; 400 ≠ 401 ⇒ not `unauthorized`). S342 replaced
+//!   the old opaque `UnexpectedStatus(400)` / `unexpected_status`.
+//! - `s342_catalogue_push_classifies_5xx_as_transient` — a 5xx yields
+//!   `ServerError` and a `transient_<code>` audit row (retryable, distinct
+//!   from a 4xx contract rejection).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -193,14 +198,20 @@ fn scratch_db_path(suffix: &str) -> PathBuf {
 
 /// Build a service pointed at `addr` with the given bearer + optional
 /// origin secret, run a single `push_once`, and return (outcome, the
-/// mock's recorded PUT, the audit kinds+outcomes).
+/// mock's recorded PUT, the audit kinds+outcomes, the decoded
+/// `MaterialCataloguePushed` payloads).
 async fn run_push(
     suffix: &str,
     addr: SocketAddr,
     state: &Arc<MockState>,
     bearer: &str,
     origin_secret: Option<&str>,
-) -> (PushOutcome, RecordedRequest, Vec<(String, String)>) {
+) -> (
+    PushOutcome,
+    RecordedRequest,
+    Vec<(String, String)>,
+    Vec<serde_json::Value>,
+) {
     let db_path = scratch_db_path(suffix);
     {
         let conn = Connection::open(&db_path).expect("open scratch DB");
@@ -231,8 +242,31 @@ async fn run_push(
             .expect("mock recorded a PUT request")
     };
     let audit = read_audit_kind_outcomes(&db_path);
+    let payloads = read_push_payloads(&db_path);
     let _ = std::fs::remove_file(&db_path);
-    (outcome, put, audit)
+    (outcome, put, audit, payloads)
+}
+
+/// The decoded `MaterialCataloguePushed` payloads, oldest first — for
+/// asserting the S342 structured diagnostics (`http_status`,
+/// `response_excerpt`) the audit row now carries.
+fn read_push_payloads(db_path: &PathBuf) -> Vec<serde_json::Value> {
+    let conn = Connection::open(db_path).expect("open DB");
+    aberp_audit_ledger::ensure_schema(&conn).expect("ensure schema");
+    let mut stmt = conn
+        .prepare("SELECT kind, payload FROM audit_ledger ORDER BY seq ASC")
+        .expect("prepare payload read");
+    let rows = stmt
+        .query_map([], |r| {
+            let kind: String = r.get(0)?;
+            let payload: Vec<u8> = r.get(1)?;
+            Ok((kind, payload))
+        })
+        .expect("query payloads");
+    rows.filter_map(|r| r.ok())
+        .filter(|(kind, _)| kind == PUSHED_KIND)
+        .filter_map(|(_, payload)| serde_json::from_slice::<serde_json::Value>(&payload).ok())
+        .collect()
 }
 
 /// `(kind, outcome)` for every audit row, oldest first. `outcome` is the
@@ -273,7 +307,7 @@ async fn s339_catalogue_push_signs_request_with_origin_signature() {
         response_body: r#"{"received_count":0}"#.to_string(),
     });
     let addr = spawn_mock(state.clone()).await;
-    let (_outcome, put, _audit) = run_push(
+    let (_outcome, put, _audit, _payloads) = run_push(
         "origin-sig",
         addr,
         &state,
@@ -301,7 +335,8 @@ async fn s339_catalogue_push_omits_origin_header_when_unprovisioned() {
         response_body: r#"{"received_count":0}"#.to_string(),
     });
     let addr = spawn_mock(state.clone()).await;
-    let (_outcome, put, _audit) = run_push("no-origin", addr, &state, "t0k3n", None).await;
+    let (_outcome, put, _audit, _payloads) =
+        run_push("no-origin", addr, &state, "t0k3n", None).await;
 
     assert!(
         put.header("x-cloudfront-secret").is_none(),
@@ -319,7 +354,7 @@ async fn s339_catalogue_push_uses_storefront_credential_handle_bearer() {
         response_body: r#"{"received_count":0}"#.to_string(),
     });
     let addr = spawn_mock(state.clone()).await;
-    let (_outcome, put, _audit) =
+    let (_outcome, put, _audit, _payloads) =
         run_push("bearer", addr, &state, "the-shared-handle-token", None).await;
 
     assert_eq!(
@@ -338,7 +373,7 @@ async fn s339_catalogue_push_returns_success_against_test_storefront() {
         response_body: r#"{"received_count":0}"#.to_string(),
     });
     let addr = spawn_mock(state.clone()).await;
-    let (outcome, _put, audit) =
+    let (outcome, _put, audit, _payloads) =
         run_push("success", addr, &state, "t0k3n", Some("origin-secret")).await;
 
     assert!(
@@ -358,31 +393,92 @@ async fn s339_catalogue_push_returns_success_against_test_storefront() {
     );
 }
 
+/// S342 / PR-37 — a 400 must classify as `Rejected { 400, body }` (NOT
+/// the old opaque `UnexpectedStatus`), and the audit row must carry the
+/// `rejected_400` outcome plus the storefront's body excerpt so the
+/// operator sees *why* without curl-debugging prod.
 #[tokio::test]
-async fn s339_catalogue_push_audit_records_http_400_when_storefront_rejects() {
+async fn s342_catalogue_push_classifies_400_as_rejected_with_body() {
     let state = Arc::new(MockState {
         requests: Mutex::new(Vec::new()),
+        // The exact prod symptom shape the brief curled.
         response_status: 400,
-        response_body: r#"{"error":"materials[0]: grade is required"}"#.to_string(),
+        response_body: r#"{"error":"materials[0]: display_name is required"}"#.to_string(),
     });
     let addr = spawn_mock(state.clone()).await;
-    let (outcome, _put, audit) = run_push("reject400", addr, &state, "t0k3n", None).await;
+    let (outcome, _put, audit, payloads) = run_push("reject400", addr, &state, "t0k3n", None).await;
 
-    assert_eq!(
-        outcome,
-        PushOutcome::UnexpectedStatus(400),
-        "a 400 must classify as UnexpectedStatus(400) — NOT Unauthorized (that is reserved \
-         for 401); got {outcome:?}"
-    );
+    match &outcome {
+        PushOutcome::Rejected { status, body } => {
+            assert_eq!(*status, 400, "a 400 must carry the HTTP code through");
+            assert!(
+                body.contains("display_name is required"),
+                "the body excerpt must carry the storefront's reason; got {body:?}"
+            );
+        }
+        other => panic!("a 400 must classify as Rejected — NOT Unauthorized (401) or the old opaque UnexpectedStatus; got {other:?}"),
+    }
+
     let pushed: Vec<&(String, String)> = audit.iter().filter(|(k, _)| k == PUSHED_KIND).collect();
     assert_eq!(
         pushed.len(),
         1,
-        "the failure path must still write an audit row; saw {audit:?}"
+        "the failure path must still write exactly one audit row; saw {audit:?}"
     );
     assert_eq!(
-        pushed[0].1, "unexpected_status",
-        "a 400 rejection must record outcome=unexpected_status (the prod symptom shape); \
-         saw {audit:?}"
+        pushed[0].1, "rejected_400",
+        "a 400 must record outcome=rejected_400 (carries the code, not the old opaque \
+         unexpected_status); saw {audit:?}"
     );
+
+    // The structured diagnostics the S342 audit payload now carries.
+    let p = payloads.last().expect("a push payload");
+    assert_eq!(
+        p.get("http_status").and_then(|v| v.as_u64()),
+        Some(400),
+        "audit payload must carry http_status=400; payload was {p}"
+    );
+    let excerpt = p
+        .get("response_excerpt")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        excerpt.contains("display_name is required"),
+        "audit payload response_excerpt must carry the rejection reason; payload was {p}"
+    );
+}
+
+/// S342 / PR-37 — a 5xx is server-side and retryable: it must classify as
+/// `ServerError` and record `transient_<code>`, distinct from a 4xx
+/// `rejected_<code>` (which is a contract problem the operator must fix).
+#[tokio::test]
+async fn s342_catalogue_push_classifies_5xx_as_transient() {
+    for status in [500u16, 503u16] {
+        let state = Arc::new(MockState {
+            requests: Mutex::new(Vec::new()),
+            response_status: status,
+            response_body: r#"{"error":"upstream unavailable"}"#.to_string(),
+        });
+        let addr = spawn_mock(state.clone()).await;
+        let (outcome, _put, audit, payloads) =
+            run_push(&format!("transient{status}"), addr, &state, "t0k3n", None).await;
+
+        match &outcome {
+            PushOutcome::ServerError { status: s, .. } => assert_eq!(*s, status),
+            other => panic!("a {status} must classify as ServerError (transient); got {other:?}"),
+        }
+        let pushed: Vec<&(String, String)> =
+            audit.iter().filter(|(k, _)| k == PUSHED_KIND).collect();
+        assert_eq!(
+            pushed[0].1,
+            format!("transient_{status}"),
+            "a {status} must record outcome=transient_{status}; saw {audit:?}"
+        );
+        let p = payloads.last().expect("a push payload");
+        assert_eq!(
+            p.get("http_status").and_then(|v| v.as_u64()),
+            Some(status as u64),
+            "audit payload must carry http_status={status}; payload was {p}"
+        );
+    }
 }
