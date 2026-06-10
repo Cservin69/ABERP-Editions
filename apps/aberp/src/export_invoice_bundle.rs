@@ -857,11 +857,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // JSON payloads, never NAV XML bytes.
         | EventKind::QuotePdfRerenderEnqueued
         | EventKind::QuotePdfRerendered
-        | EventKind::QuotePdfRerenderFailed
-        // S341 / PR-36 — `audit.ledger_rebuilt` meta-event. JSON payload
-        // (rebuild counts), never NAV XML bytes; `audit.`-not-`invoice.*`
-        // so it never sweeps a per-OUTGOING-invoice export bundle by glob.
-        | EventKind::AuditLedgerRebuilt => None,
+        | EventKind::QuotePdfRerenderFailed => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

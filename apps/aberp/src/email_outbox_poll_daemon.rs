@@ -64,7 +64,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use duckdb::Connection;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -72,7 +71,7 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 use zeroize::Zeroizing;
 
-use aberp_audit_ledger::{append_in_tx, Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
 use lettre::{
     message::{header::ContentType, Attachment, MultiPart, SinglePart},
     AsyncTransport, Message,
@@ -1119,22 +1118,27 @@ async fn write_audit(deps: &EmailOutboxPollDaemonDeps, kind: EventKind, bytes: V
     // open reads current disk state and computes the correct next seq.
     //
     // The ART-pressure fix is therefore to write LESS OFTEN (the S335 idle
-    // throttle in `poll_once`), NOT to persist the connection. Do not
-    // "optimize" this into a held connection without first making ALL
-    // audit writers share a single serialized connection.
+    // throttle in `poll_once`), NOT to persist the connection.
+    //
+    // S341 — this now routes through `audit_ledger::append_reopen`, which
+    // keeps the exact reopen-per-write semantics above (fresh `Connection`
+    // + `ensure_schema` + append + commit) AND holds the crate's
+    // process-wide `AUDIT_APPEND_LOCK` across the read-head→insert→commit
+    // window. That lock is the in-process fork-prevention that replaced
+    // the dropped `UNIQUE(seq)` ART (duckdb#23046 / S332): two daemons in
+    // this process can no longer read the same head and append a duplicate
+    // `seq`. `ensure_schema` (inside `append_reopen`) also runs the
+    // transparent boot migration off the legacy UNIQUE-ART schema.
     let db_path = deps.db_path.clone();
     let tenant = deps.tenant.clone();
     let binary_hash = deps.binary_hash;
     let login = deps.operator_login.clone();
     let kind_label = kind.as_str();
     let res = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = Connection::open(&db_path).context("open DB for email-outbox audit")?;
-        aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
-        let tx = conn.transaction().context("begin email-outbox audit tx")?;
         let meta = LedgerMeta::new(tenant, binary_hash);
         let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
-        append_in_tx(&tx, &meta, kind, bytes, actor, None).context("append email-outbox audit")?;
-        tx.commit().context("commit email-outbox audit")?;
+        aberp_audit_ledger::append_reopen(&db_path, &meta, kind, bytes, actor, None)
+            .context("append email-outbox audit (serialized reopen-per-write)")?;
         Ok(())
     })
     .await;

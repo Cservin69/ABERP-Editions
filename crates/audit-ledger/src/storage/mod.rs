@@ -36,6 +36,7 @@
 pub mod schema;
 
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use duckdb::{params, Connection};
@@ -47,6 +48,55 @@ use crate::chain::compute::{compute_entry_hash, next_prev_hash, next_seq};
 use crate::chain::verify::verify_chain;
 use crate::entry::{Actor, BinaryHash, Entry, EntryHash, EntryId, EventKind, Sequence, TenantId};
 use crate::error::{AppendError, VerifyError};
+
+/// Process-wide serializer for the full audit-write critical section
+/// (`begin tx → read head → insert → commit`).
+///
+/// # Why an app-level lock replaced `UNIQUE(seq)`
+///
+/// The `audit_ledger` schema used to carry inline `UNIQUE(seq)` /
+/// `UNIQUE(id)` constraints. Those are the ONLY ART (Adaptive Radix
+/// Tree) indexes the table had — and DuckDB 1.5.x corrupts the on-disk
+/// ART of a file-backed database on insert (upstream
+/// `duckdb/duckdb#23046`, "ART index constraint enforcement corrupts the
+/// heap on file-backed", introduced in 1.5.0, still open in the latest
+/// 1.5.3). That corruption is what made every audit-bearing commit panic
+/// in `FixedSizeAllocator::New → Prefix::New` (S332). Dropping the
+/// `UNIQUE` constraints removes the ART entirely — the corruption class
+/// cannot occur because there is no secondary index to corrupt.
+///
+/// The constraint was, in any case, NOT the cross-writer fork guard it
+/// looked like: ABERP's own S186/PR-186 finding
+/// (`apps/aberp/src/incoming_invoices.rs`) established that "DuckDB's
+/// UNIQUE constraint does NOT fire across two `Connection::open` handles
+/// in the same process". So `UNIQUE(seq)` never prevented a concurrent
+/// in-process fork — and an empirical probe in S341 confirmed two
+/// concurrent `Connection::open` handles coexist with no exclusive lock.
+///
+/// Integrity is therefore enforced at two layers, neither of them the
+/// ART:
+///   1. **Detection** — the tamper-evident hash chain ([`verify_chain`])
+///      catches any duplicate / reordered / forked `seq` loudly.
+///   2. **Prevention (in-process)** — this `Mutex` serializes the whole
+///      read-head→insert→commit window so two in-process writers cannot
+///      read the same head and both append `seq = head + 1`. Each write
+///      re-reads the committed head under the lock (NOT a cached
+///      counter, which would go stale across processes — the exact
+///      hazard S335 documented for persistent connections).
+///
+/// Cross-PROCESS writers (a CLI subcommand racing `aberp serve`) are
+/// outside this lock's reach; they are backstopped by the hash chain's
+/// detection, the same as before this change (`UNIQUE` never covered
+/// them either). A single serialized audit-writer actor across the whole
+/// process tree remains the documented future hardening (S335 §3.4).
+static AUDIT_APPEND_LOCK: Mutex<()> = Mutex::new(());
+
+/// Separate lock serializing the one-time boot migration that drops the
+/// legacy `UNIQUE`-ART schema (see [`migrate_drop_unique_art_if_present`]).
+/// Distinct from [`AUDIT_APPEND_LOCK`] so the migration (which runs
+/// inside `ensure_schema`, before the append lock is taken) cannot
+/// deadlock against an in-flight append.
+static AUDIT_MIGRATION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Per-tenant invariants the append path needs but the borrowed
 /// [`duckdb::Transaction`] cannot supply on its own. Constructed once
@@ -109,30 +159,6 @@ impl Ledger {
         Self::initialise(conn, tenant_id, binary_hash)
     }
 
-    /// Open an existing `Ledger` file in READ-ONLY mode. Unlike
-    /// [`Ledger::open`] this does NOT run `ensure_schema` (a read-only
-    /// connection cannot `CREATE`), so the `audit_ledger` table MUST
-    /// already exist — the caller gets a loud DuckDB error on the first
-    /// query otherwise.
-    ///
-    /// Added for the S341 ART-rebuild path: the row dump + chain verify
-    /// must not write a single byte (so `--dry-run` is a guaranteed
-    /// no-op and leaves the file mtime untouched). The read path is also
-    /// safe against the corrupt ART — the S332 crash is on INSERT, not
-    /// SELECT.
-    pub fn open_read_only(
-        path: impl AsRef<Path>,
-        tenant_id: TenantId,
-        binary_hash: BinaryHash,
-    ) -> Result<Self, AppendError> {
-        let config = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
-        let conn = Connection::open_with_flags(path, config)?;
-        Ok(Self {
-            conn,
-            meta: LedgerMeta::new(tenant_id, binary_hash),
-        })
-    }
-
     fn initialise(
         conn: Connection,
         tenant_id: TenantId,
@@ -157,6 +183,11 @@ impl Ledger {
     /// The binary path in `apps/aberp/src/issue_invoice.rs` does **not**
     /// use this method; it drives [`append_in_tx`] directly under a tx
     /// shared with `aberp-billing` so ADR-0008 §Storage holds.
+    ///
+    /// Holds [`AUDIT_APPEND_LOCK`] across the whole read-head → insert →
+    /// commit window so concurrent in-process appends cannot read the
+    /// same head and fork the chain (the prevention layer that replaced
+    /// the dropped `UNIQUE(seq)` ART — see [`AUDIT_APPEND_LOCK`]).
     pub fn append(
         &mut self,
         kind: EventKind,
@@ -164,6 +195,9 @@ impl Ledger {
         actor: Actor,
         idempotency_key: Option<String>,
     ) -> Result<EntryId, AppendError> {
+        let _guard = AUDIT_APPEND_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tx = self.conn.transaction()?;
         let id = append_in_tx(&tx, &self.meta, kind, payload, actor, idempotency_key)?;
         tx.commit()?;
@@ -226,14 +260,179 @@ impl Ledger {
 // `ensure_schema` is idempotent and is called before opening the tx.
 // ──────────────────────────────────────────────────────────────────────
 
-/// Create the `audit_ledger` table if it does not yet exist. Idempotent.
-/// Callers expecting to drive transactional appends through
-/// [`append_in_tx`] must invoke this against the [`Connection`] before
-/// opening their transaction; DuckDB DDL inside a multi-statement tx is
-/// not the path PR-6 wants to defend.
+/// Create the `audit_ledger` table if it does not yet exist, then run
+/// the transparent boot migration that drops the legacy `UNIQUE`-ART
+/// schema if it is still present. Idempotent.
+///
+/// Every audit entry point (the binary's boot, each CLI subcommand, the
+/// reopen-per-write daemons) calls `ensure_schema` before appending, so
+/// folding the migration in here makes the recovery automatic and
+/// operator-action-free regardless of which path reaches the corrupt DB
+/// first. After the one-time migration the detection query is a cheap
+/// metadata read that returns "no UNIQUE" and the function is a no-op.
 pub fn ensure_schema(conn: &Connection) -> Result<(), AppendError> {
     conn.execute_batch(schema::CREATE_TABLE)?;
+    migrate_drop_unique_art_if_present(conn)?;
     Ok(())
+}
+
+/// Transparent, one-time migration off the legacy `audit_ledger` schema
+/// that carried inline `UNIQUE(seq)` / `UNIQUE(id)` constraints — the
+/// only ART indexes on the table, and the ones DuckDB 1.5.x corrupts on
+/// file-backed inserts (`duckdb/duckdb#23046`, S332). The migration
+/// rebuilds the table WITHOUT those constraints, which both eliminates
+/// the corruption class going forward AND repairs an already-corrupt ART
+/// (the `DROP TABLE` discards the bad index; the rows are read back
+/// intact because the crash is on INSERT, not SELECT — S332 §5).
+///
+/// Steps (no operator action, runs at boot / first append after upgrade):
+///   1. Detect — `duckdb_constraints()` reports any `UNIQUE` on
+///      `audit_ledger`? If none, return immediately (the post-migration
+///      steady state).
+///   2. Serialize via [`AUDIT_MIGRATION_LOCK`] + re-check (another
+///      in-process caller may have just migrated).
+///   3. Dump every row in `seq` order and `verify_chain` them — PROVE
+///      the rows are intact (only the index was corrupt). A broken chain
+///      ABORTS loud: that is data tampering, not index corruption, and a
+///      rebuild would faithfully re-index a tampered chain.
+///   4. In one transaction: `DROP TABLE` (discards the corrupt ART) +
+///      `CREATE TABLE` (new no-`UNIQUE` schema) + re-insert every row
+///      verbatim (same `seq`/`prev_hash`/`entry_hash` bytes). Commit.
+///   5. Re-`verify_chain` the rebuilt table as the safety gate.
+///
+/// The rebuild preserves the rows byte-for-byte, so the chain that
+/// verified going in verifies coming out and NO audit row is added — the
+/// migration leaves no trace in the ledger content (provenance is the
+/// `tracing::warn!` below). It is a pure structural recovery.
+fn migrate_drop_unique_art_if_present(conn: &Connection) -> Result<(), AppendError> {
+    if !audit_ledger_has_unique_constraints(conn)? {
+        return Ok(());
+    }
+
+    let _guard = AUDIT_MIGRATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Re-check under the lock: a concurrent in-process caller may have
+    // migrated between our detect and our lock acquisition.
+    if !audit_ledger_has_unique_constraints(conn)? {
+        return Ok(());
+    }
+
+    // 1. Dump every row in seq order (SELECT is safe against the corrupt
+    //    ART — the S332 crash is on INSERT only).
+    let entries = read_all_entries(conn)?;
+
+    // 2. Prove the rows are intact. Single tenant per file (ADR-0002), so
+    //    every row carries the same tenant_id; derive it from the head.
+    if let Some(first) = entries.first() {
+        verify_chain(&first.tenant_id, entries.iter()).map_err(|e| {
+            AppendError::Migration(format!(
+                "refusing to migrate audit_ledger off the UNIQUE-ART schema: the dumped rows do \
+                 NOT verify ({e}). This is data tampering, not index corruption — a structural \
+                 rebuild would faithfully re-index a tampered chain. Aborting; investigate the \
+                 ledger file."
+            ))
+        })?;
+    }
+
+    // 3. Rebuild without the UNIQUE constraints, in one transaction.
+    //    Manual BEGIN/COMMIT keeps this on the `&Connection` ensure_schema
+    //    received (no `&mut` ripple through every ensure_schema caller);
+    //    DuckDB executes the DROP+CREATE+INSERTs transactionally, so a
+    //    failure ROLLBACKs and leaves the original table untouched.
+    conn.execute_batch("BEGIN TRANSACTION;")?;
+    if let Err(e) = rebuild_table(conn, &entries) {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(e);
+    }
+    conn.execute_batch("COMMIT;")?;
+
+    // 4. Safety gate — the rebuilt table must still verify.
+    if let Some(first) = entries.first() {
+        let rebuilt = read_all_entries(conn)?;
+        verify_chain(&first.tenant_id, rebuilt.iter()).map_err(|e| {
+            AppendError::Migration(format!(
+                "post-migration verify FAILED ({e}) — the audit_ledger rebuild did not preserve \
+                 the chain. This must never happen."
+            ))
+        })?;
+    }
+
+    tracing::warn!(
+        rows = entries.len(),
+        "migrated audit_ledger off the legacy UNIQUE-ART schema (duckdb#23046 / S332): dropped \
+         UNIQUE(seq)/UNIQUE(id), rebuilt without a secondary index; hash chain verified intact"
+    );
+    Ok(())
+}
+
+/// `true` iff `audit_ledger` still carries any `UNIQUE` constraint (the
+/// legacy ART schema). Reads `duckdb_constraints()` — a metadata query
+/// that does not touch the ART insert path, so it is safe even when the
+/// on-disk ART is corrupt.
+fn audit_ledger_has_unique_constraints(conn: &Connection) -> Result<bool, AppendError> {
+    let mut stmt = conn.prepare(
+        "SELECT count(*) FROM duckdb_constraints() \
+         WHERE table_name = 'audit_ledger' AND constraint_type = 'UNIQUE'",
+    )?;
+    let n: i64 = stmt.query_row([], |r| r.get(0))?;
+    Ok(n > 0)
+}
+
+/// Read every entry in `seq` order off a borrowed [`Connection`] (the
+/// migration path owns a `&Connection`, not a [`Ledger`]). Mirrors
+/// [`Ledger::entries`].
+fn read_all_entries(conn: &Connection) -> Result<Vec<Entry>, AppendError> {
+    let mut stmt = conn.prepare(schema::SELECT_ALL)?;
+    let rows = stmt.query_map([], row_to_entry)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Serialized reopen-per-write append: open a fresh [`Connection`] (so
+/// the head read sees the current on-disk state — the coherence
+/// mechanism every ABERP daemon relies on, S335), ensure the schema /
+/// run the boot migration, then append + commit under
+/// [`AUDIT_APPEND_LOCK`].
+///
+/// This is the safe replacement for the hand-rolled
+/// `Connection::open` + `ensure_schema` + `append_in_tx` + `commit`
+/// pattern the high-frequency daemons used: identical reopen-per-write
+/// semantics, plus the process-wide append lock so two in-process
+/// writers cannot read the same head and fork the chain now that the
+/// `UNIQUE(seq)` ART is gone. The lock is taken AFTER `ensure_schema`
+/// (which has its own [`AUDIT_MIGRATION_LOCK`]) to avoid re-entrancy.
+pub fn append_reopen(
+    db_path: &Path,
+    meta: &LedgerMeta,
+    kind: EventKind,
+    payload: Vec<u8>,
+    actor: Actor,
+    idempotency_key: Option<String>,
+) -> Result<EntryId, AppendError> {
+    // Hold the lock across the WHOLE open → ensure_schema → append →
+    // commit → close window, not just the append. Two reasons:
+    //   1. Fork prevention — a concurrent in-process writer must not read
+    //      the same committed head and append a duplicate `seq` (the role
+    //      the dropped `UNIQUE(seq)` ART nominally played).
+    //   2. DuckDB stability — independent `Connection::open` handles
+    //      touching the same file concurrently can trip a DuckDB-internal
+    //      assertion (observed: `RLEScanState`). Serializing the whole
+    //      reopen-per-write keeps the in-process audit path single-writer.
+    // `ensure_schema` (called here) takes its own `AUDIT_MIGRATION_LOCK`,
+    // never this one, so there is no re-entrant deadlock.
+    let _guard = AUDIT_APPEND_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut conn = Connection::open(db_path)?;
+    ensure_schema(&conn)?;
+    let tx = conn.transaction()?;
+    let id = append_in_tx(&tx, meta, kind, payload, actor, idempotency_key)?;
+    tx.commit()?;
+    Ok(id)
 }
 
 /// Read the most-recent `limit` entries in descending seq order
@@ -313,14 +512,14 @@ pub fn append_in_tx(
 /// round-tripping a row through [`row_to_entry`] → `insert_entry_verbatim`
 /// reproduces it byte-for-byte and the hash chain is preserved.
 ///
-/// This is the workhorse of the S341 ART-rebuild path
-/// ([`rebuild_table_in_tx`]): re-inserting the decoded rows into a
-/// freshly-`CREATE`d table regenerates a clean ART index without
-/// altering the tamper-evident chain. It is NOT an append API — it does
-/// not compute `seq`/`prev_hash`, so callers outside the rebuild path
-/// must use [`append_in_tx`].
-fn insert_entry_verbatim(tx: &duckdb::Transaction<'_>, entry: &Entry) -> Result<(), AppendError> {
-    let inserted = tx.execute(
+/// Shared by [`append_in_tx`] (which passes a freshly-computed entry)
+/// and the S341 boot migration ([`rebuild_table_in_tx`], which passes
+/// rows decoded straight off disk to re-seat them in the new no-`UNIQUE`
+/// table without altering the tamper-evident chain). It is NOT an append
+/// API — it does not compute `seq`/`prev_hash`, so callers outside the
+/// migration path must use [`append_in_tx`].
+fn insert_entry_verbatim(conn: &Connection, entry: &Entry) -> Result<(), AppendError> {
+    let inserted = conn.execute(
         schema::INSERT,
         params![
             entry.id.to_prefixed_string(),
@@ -346,49 +545,26 @@ fn insert_entry_verbatim(tx: &duckdb::Transaction<'_>, entry: &Entry) -> Result<
     Ok(())
 }
 
-/// Drop and recreate the `audit_ledger` table inside the caller-owned
-/// transaction, re-inserting `entries` verbatim in the given order.
+/// Drop and recreate the `audit_ledger` table, re-inserting `entries`
+/// verbatim in the given order. The caller wraps this in a transaction
+/// (the migration's manual `BEGIN`/`COMMIT`).
 ///
-/// This is the surgical core of the S341 / PR-36 ART rebuild. The
-/// DuckDB on-disk ART secondary index (`UNIQUE(seq)` / `UNIQUE(id)`)
-/// can land in a corrupt state where every subsequent insert panics in
-/// `FixedSizeAllocator::New` → `Prefix::New` (S332). The rows themselves
-/// are intact; only the index image is bad. Dropping the table destroys
-/// the corrupt ART; recreating it with the IDENTICAL schema
-/// ([`schema::CREATE_TABLE`] — `UNIQUE(seq)` / `UNIQUE(id)` PRESERVED,
-/// never dropped, per S332 §8.3) and re-inserting the decoded rows
-/// rebuilds the ART from a clean image.
+/// The structural core of [`migrate_drop_unique_art_if_present`].
+/// `DROP TABLE` discards the legacy table (and its corrupt ART, if any);
+/// `CREATE TABLE` recreates it from [`schema::CREATE_TABLE`] — the NEW,
+/// no-`UNIQUE` schema, so the rebuilt table has NO secondary index and
+/// cannot re-enter the `duckdb#23046` corruption class. The decoded rows
+/// are re-inserted verbatim (same `seq`/`prev_hash`/`entry_hash` bytes),
+/// so the hash chain is preserved exactly.
 ///
-/// # Caller contract
-///
-/// - `entries` MUST be the full ledger in `seq` order and MUST already
-///   have passed [`verify_chain`] — this function does NOT re-verify; it
-///   writes whatever it is given. The binary's `audit_rebuild` path
-///   verifies before AND after.
-/// - The caller owns the transaction and is responsible for `commit()`.
-///   On any error the `Transaction`'s `Drop` rolls back, leaving the
-///   original (corrupt-index but data-intact) table untouched.
-/// - After this returns, the caller typically appends one
-///   `AuditLedgerRebuilt` marker via [`append_in_tx`] (which reads the
-///   now-rebuilt head inside the same tx) and then commits.
-///
-/// DuckDB executes DDL transactionally, so the `DROP` + `CREATE` +
-/// re-`INSERT` either all land at `commit` or none do.
-pub fn rebuild_table_in_tx(
-    tx: &duckdb::Transaction<'_>,
-    entries: &[Entry],
-) -> Result<(), AppendError> {
-    // DROP destroys the corrupt ART; CREATE rebuilds the schema with the
-    // SAME inline UNIQUE(seq)/UNIQUE(id) constraints (a fresh, empty ART).
-    tx.execute_batch("DROP TABLE IF EXISTS audit_ledger;")?;
-    tx.execute_batch(schema::CREATE_TABLE)?;
-
-    // Re-insert every row verbatim, in seq order, regenerating the ART
-    // entry by entry. Each row's stored seq/prev_hash/entry_hash are
-    // written unchanged, so the chain that verified going in still
-    // verifies coming out.
+/// `entries` MUST be the full ledger in `seq` order and SHOULD already
+/// have passed [`verify_chain`] — this does NOT re-verify; it writes
+/// whatever it is given. The migration verifies before AND after.
+fn rebuild_table(conn: &Connection, entries: &[Entry]) -> Result<(), AppendError> {
+    conn.execute_batch("DROP TABLE IF EXISTS audit_ledger;")?;
+    conn.execute_batch(schema::CREATE_TABLE)?;
     for entry in entries {
-        insert_entry_verbatim(tx, entry)?;
+        insert_entry_verbatim(conn, entry)?;
     }
     Ok(())
 }
@@ -504,4 +680,153 @@ fn duckdb_decode_err_owned(msg: String) -> duckdb::Error {
         duckdb::types::Type::Text,
         Box::<dyn std::error::Error + Send + Sync>::from(msg),
     )
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// The legacy schema this migration exists to retire: identical to
+    /// the current [`schema::CREATE_TABLE`] except for the two inline
+    /// `UNIQUE` constraints (the ART indexes duckdb#23046 corrupts).
+    const OLD_DDL_WITH_UNIQUE: &str = "
+CREATE TABLE IF NOT EXISTS audit_ledger (
+    id              VARCHAR     NOT NULL,
+    seq             BIGINT      NOT NULL CHECK (seq >= 1),
+    prev_hash       BLOB        NOT NULL,
+    time_wall       VARCHAR     NOT NULL,
+    time_mono       BIGINT      NOT NULL CHECK (time_mono >= 0),
+    actor           VARCHAR     NOT NULL,
+    binary_hash     BLOB        NOT NULL,
+    tenant_id       VARCHAR     NOT NULL,
+    kind            VARCHAR     NOT NULL,
+    payload         BLOB        NOT NULL,
+    idempotency_key VARCHAR,
+    entry_hash      BLOB        NOT NULL,
+    UNIQUE (seq),
+    UNIQUE (id)
+);
+";
+
+    fn tenant() -> TenantId {
+        TenantId::new("mig-test".to_string()).unwrap()
+    }
+    fn meta() -> LedgerMeta {
+        LedgerMeta::new(tenant(), BinaryHash::from_bytes([9u8; 32]))
+    }
+    fn actor() -> Actor {
+        Actor::from_local_cli("01H0000000000000000000000Z".to_string(), "t")
+    }
+
+    /// Seed an in-memory DB carrying the OLD (UNIQUE-ART) schema with `n`
+    /// valid-chain rows written through the normal append path.
+    fn seed_old_schema(n: usize) -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_DDL_WITH_UNIQUE).unwrap();
+        let m = meta();
+        for i in 0..n {
+            let tx = conn.transaction().unwrap();
+            append_in_tx(
+                &tx,
+                &m,
+                EventKind::Test,
+                format!("{{\"i\":{i}}}").into_bytes(),
+                actor(),
+                None,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn fresh_schema_has_no_unique_constraints() {
+        // The new CREATE_TABLE must carry NO UNIQUE (no ART → no
+        // duckdb#23046 corruption class).
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        assert!(
+            !audit_ledger_has_unique_constraints(&conn).unwrap(),
+            "fresh audit_ledger must have no UNIQUE constraints"
+        );
+    }
+
+    #[test]
+    fn migration_detects_and_rebuilds_off_unique_schema() {
+        let conn = seed_old_schema(10);
+        assert!(
+            audit_ledger_has_unique_constraints(&conn).unwrap(),
+            "seeded DB must start on the legacy UNIQUE schema"
+        );
+
+        migrate_drop_unique_art_if_present(&conn).unwrap();
+
+        // No UNIQUE constraints remain; all rows preserved; chain intact.
+        assert!(!audit_ledger_has_unique_constraints(&conn).unwrap());
+        let rows = read_all_entries(&conn).unwrap();
+        assert_eq!(rows.len(), 10, "all rows preserved across migration");
+        let seqs: Vec<u64> = rows.iter().map(|e| e.seq.as_u64()).collect();
+        assert_eq!(seqs, (1..=10).collect::<Vec<_>>(), "seq dense + monotonic");
+        assert_eq!(
+            verify_chain(&tenant(), rows.iter()).unwrap(),
+            10,
+            "hash chain verifies after migration"
+        );
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let conn = seed_old_schema(5);
+        migrate_drop_unique_art_if_present(&conn).unwrap();
+        // Second call is a fast no-op (no UNIQUE left to detect).
+        migrate_drop_unique_art_if_present(&conn).unwrap();
+        assert!(!audit_ledger_has_unique_constraints(&conn).unwrap());
+        assert_eq!(read_all_entries(&conn).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn ensure_schema_runs_the_migration() {
+        // The transparent path: a caller that only calls ensure_schema
+        // (the daemons, mark_abandoned, etc.) gets migrated automatically.
+        let conn = seed_old_schema(4);
+        assert!(audit_ledger_has_unique_constraints(&conn).unwrap());
+        ensure_schema(&conn).unwrap();
+        assert!(!audit_ledger_has_unique_constraints(&conn).unwrap());
+        assert_eq!(
+            verify_chain(&tenant(), read_all_entries(&conn).unwrap().iter()).unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn migration_aborts_on_tampered_chain() {
+        // If the dumped rows do NOT verify, the data — not just the index
+        // — is suspect; the migration must refuse rather than faithfully
+        // re-index a tampered chain (CLAUDE.md rule 12).
+        let conn = seed_old_schema(6);
+        // Tamper: overwrite a payload in place so the entry_hash no longer
+        // matches the canonical encoding.
+        conn.execute(
+            "UPDATE audit_ledger SET payload = ? WHERE seq = 3",
+            params![b"tampered".as_slice()],
+        )
+        .unwrap();
+
+        let err = migrate_drop_unique_art_if_present(&conn)
+            .expect_err("migration must refuse a tampered chain");
+        assert!(matches!(err, AppendError::Migration(_)), "got {err:?}");
+        // The table is untouched (still on the old schema, still 6 rows) —
+        // the rebuild ran inside a transaction that never committed.
+        assert!(audit_ledger_has_unique_constraints(&conn).unwrap());
+        assert_eq!(read_all_entries(&conn).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn migration_on_empty_legacy_table_is_safe() {
+        let conn = seed_old_schema(0);
+        migrate_drop_unique_art_if_present(&conn).unwrap();
+        assert!(!audit_ledger_has_unique_constraints(&conn).unwrap());
+        assert_eq!(read_all_entries(&conn).unwrap().len(), 0);
+    }
 }

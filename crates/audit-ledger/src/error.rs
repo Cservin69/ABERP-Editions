@@ -19,11 +19,23 @@ pub enum AppendError {
     #[error("invalid tenant id (empty or contains a null byte)")]
     InvalidTenantId,
 
-    /// An attempt to append produced a sequence that already exists. The
-    /// `UNIQUE(seq)` index in DuckDB is the structural enforcement; this
-    /// variant surfaces it loudly.
+    /// An insert affected a row count other than 1. Historically this
+    /// surfaced the inline `UNIQUE(seq)` index rejecting a duplicate;
+    /// since S341 dropped that ART index (duckdb#23046 / S332), it is a
+    /// defensive catch for an unexpected affected-row count. Duplicate
+    /// `seq` is now prevented in-process by `AUDIT_APPEND_LOCK` and
+    /// detected globally by the hash chain (`verify_chain`).
     #[error("sequence conflict at seq={seq}")]
     SequenceConflict { seq: u64 },
+
+    /// The transparent boot migration that drops the legacy `UNIQUE`-ART
+    /// schema (S341) refused or failed — e.g. the dumped rows did not
+    /// verify (data tampering, not index corruption), or the rebuilt
+    /// table failed its post-migration chain check. Loud-fail per
+    /// CLAUDE.md rule 12: a migration that cannot prove integrity must
+    /// never silently proceed.
+    #[error("audit-ledger schema migration failed: {0}")]
+    Migration(String),
 
     /// A wall-clock formatter or parser failed. RFC3339 formatting of a
     /// valid `OffsetDateTime` cannot fail in practice, so this surfaces

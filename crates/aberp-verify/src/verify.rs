@@ -985,10 +985,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // failure_kind), never NAV XML bytes. Exhaustiveness arm only.
         | EventKind::QuotePdfRerenderEnqueued
         | EventKind::QuotePdfRerendered
-        | EventKind::QuotePdfRerenderFailed
-        // S341 / PR-36 — `audit.ledger_rebuilt` meta-event. JSON payload
-        // (rebuild counts), never NAV XML bytes. Exhaustiveness arm only.
-        | EventKind::AuditLedgerRebuilt => (None, ""),
+        | EventKind::QuotePdfRerenderFailed => (None, ""),
     };
 
     Ok(NavExtraction {

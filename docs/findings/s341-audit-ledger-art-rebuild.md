@@ -1,209 +1,207 @@
-# S341 / PR-36 — audit-ledger ART rebuild (in-place index recovery)
+# S341 / PR-36 — audit-ledger ART corruption: prod-capable fix (drop the UNIQUE-ART, transparent boot migration)
 
-**Date:** 2026-06-10 · **Branch:** `session-341/pr-36-audit-ledger-art-rebuild`
-**Reported against:** PROD (the live ART crash Ervin sees on every audit-bearing
-commit) · **Builds on:** S332 (`docs/findings/s332-duckdb-art-email-outbox.md`),
-S335 (`docs/findings/s335-email-outbox-throttle.md`).
+**Date:** 2026-06-10 · **Branch:** `session-341/pr-36b-audit-art-schema-fix`
+**Reported against:** PROD (every audit-bearing commit panics in DuckDB's ART)
+**Builds on:** S332 (`docs/findings/s332-duckdb-art-email-outbox.md`), S335
+(`docs/findings/s335-email-outbox-throttle.md`).
 
-> **TL;DR.** S332/S335 throttled the *volume* hitting the corrupt DuckDB ART but
-> never repaired the on-disk index image — so any audit-emitting commit (material
-> CRUD, partner CRUD, catalogue-push, the shutdown row) still panics in
-> `FixedSizeAllocator::New`, aborting the whole transaction. This PR ships a
-> surgical, opt-in `aberp audit-rebuild` subcommand that **regenerates the ART
-> from a verified-intact image of its own rows** — DROP + CREATE (identical
-> schema, `UNIQUE(seq)`/`UNIQUE(id)` PRESERVED) + verbatim re-INSERT — gated by
-> `verify_chain` before AND after. It is **NOT a schema relaxation**; the
-> tamper-evident chain is preserved byte-for-byte. Phase 1 (CHECKPOINT/VACUUM)
-> is the cheapest possible fix and is documented for the operator to try first.
+> **TL;DR.** PROD's `audit_ledger` ART secondary index is corrupt: every
+> audit-bearing commit (material CRUD, partner CRUD, catalogue-push, the
+> shutdown row) panics in `FixedSizeAllocator::New → Prefix::New`. The root cause
+> is an **open, unfixed DuckDB 1.5.x bug** (`duckdb/duckdb#23046`: ART
+> UNIQUE/PK-constraint enforcement corrupts the heap on file-backed databases).
+> We **avoid the corruption class entirely**: the `UNIQUE(seq)` / `UNIQUE(id)`
+> constraints were the table's ONLY ART indexes, so we **drop them**. A
+> **transparent boot migration** rebuilds existing prod files off the old schema
+> automatically — no operator action. Integrity is unchanged: the tamper-evident
+> hash chain (`verify_chain`) is the guarantee, and a new process-wide append
+> serializer prevents in-process forks. **This replaces the earlier S341
+> operator-run `aberp audit-rebuild` CLI, which Ervin rejected as a workaround
+> rather than prod-capable code; that surface has been removed.**
 
 ---
 
-## 1. The crash (verbatim, from S332 §1 / Ervin's console)
+## 1. The crash (verbatim, S332 §1)
 
 ```
 duckdb::FixedSizeBuffer::GetOffset → FixedSizeAllocator::New → Prefix::New →
-ARTOperator::InsertIntoNode → ARTOperator::Insert →
-ART::InsertKeys → ART::Insert → ART::Append → BoundIndex::Append →
-DataTable::AppendToIndexes → LocalTableStorage::AppendToIndexes →
-LocalStorage::Flush → LocalStorage::Commit → WriteToWAL → Commit → ...
+ARTOperator::InsertIntoNode → ARTOperator::Insert → ART::InsertKeys →
+ART::Insert → ART::Append → BoundIndex::Append → DataTable::AppendToIndexes →
+… → WriteToWAL → Commit
 This error signals an assertion failure within DuckDB.
-Error code 1: Unknown error code kind=quote.email_outbox_fetched
 ```
 
-The fault is in DuckDB's ART prefix-compression allocator. The worst case for it
-is a **monotonic key with long shared prefixes** — exactly `seq` (strictly
-increasing `BIGINT`). The crash fires on `AppendToIndexes` → `WriteToWAL` at
-**commit time**, not at statement-execute time.
+The fault is in DuckDB's ART (Adaptive Radix Tree) secondary-index code, on
+insert/commit. Every audit producer funnels through one insert path
+(`storage/mod.rs::append_in_tx` → `tx.execute(schema::INSERT)`), and the audit
+row is written in the SAME transaction as the state change it describes
+(ADR-0008 §Storage), so the panic aborts the whole commit — "save a material →
+500 → nothing saved."
 
-## 2. Emit sites that hit it — every one, via one shared INSERT
+## 2. Option A — DuckDB version bump — investigated, NOT viable
 
-The corruption is **index-level, not call-site-level**: every audit producer in
-the binary funnels through the single insert path
+We are on bundled DuckDB **1.5.2** (`duckdb-rs 1.10502.0`, workspace pin
+`duckdb = "1"`). Latest is **1.5.3** (`duckdb-rs 1.10503.1`).
 
-- `crates/audit-ledger/src/storage/mod.rs::append_in_tx`
-  → `insert_entry_verbatim` → `tx.execute(schema::INSERT, …)`
-  → DuckDB `AppendToIndexes` on the `UNIQUE(seq)` / `UNIQUE(id)` ARTs.
+- **`duckdb/duckdb#23046`** — *"DuckDB 1.5.0's ART index constraint enforcement
+  corrupts the heap on file-backed"* — is our exact bug class (ART
+  UNIQUE/PK-constraint enforcement corrupting heap on **file-backed** DBs, crash
+  in the allocator on insert, regression introduced in **1.5.0**). As of this
+  investigation it is **OPEN — not fixed in any released version.**
+- **DuckDB 1.5.3's changelog does not address it** (its only ART entry is an
+  unrelated `ARTOperator::Delete` nested-leaf fix). Bumping 1.5.2 → 1.5.3 would
+  not fix our crash.
 
-So the panic is reachable from **all** of these (non-exhaustive, by call count):
+→ No upstream fix exists to bump to. Option A is dead. (Downgrading below 1.5.0
+predates the regression but would force a storage-format rollback on live prod
+files — strictly riskier than removing the index.)
 
-| File | Audit producers |
-|---|---|
-| `apps/aberp/src/serve.rs` | material CRUD routes, partner CRUD routes, catalogue-push, payment, the `/health` first-prod-launch row, … (17 append sites) |
-| `apps/aberp/src/material_inventory.rs` | inventory ledger (Ervin's "save a material → 500" symptom) |
-| `apps/aberp/src/shutdown.rs` | `DaemonShutdownCompleted` (the shutdown row crashes too) |
-| `apps/aberp/src/email_outbox_poll_daemon.rs::write_audit` | `EmailOutboxFetched` — the **highest-frequency** producer; the `kind=` token in the crash message is `quote.email_outbox_fetched` only because that producer fires most often, NOT because it is the cause |
-| `submit_annulment.rs`, `recover_from_nav.rs`, `incoming_invoices.rs`, `quote_pickup.rs`, `email_relay_daemon.rs`, `email_invoice.rs`, `quote_intake_query.rs` | their respective lifecycle events |
+## 3. Option B — drop the UNIQUE-ART (chosen)
 
-Because the audit row is written in the **same transaction** as the state change
-it describes (ADR-0008 §Storage), the ART panic rolls back the *whole* commit —
-hence "save a material → backend 500 → nothing saved."
+The `audit_ledger` table's ONLY ART secondary indexes are the inline
+`UNIQUE(seq)` / `UNIQUE(id)` constraints (S332 §3: zero `CREATE INDEX`; the
+inline UNIQUEs are the only ARTs). **Remove them → there is no secondary index
+to corrupt → the `#23046` crash class cannot occur.**
 
-## 3. Phase 1 — CHECKPOINT / VACUUM (try first, ships zero code)
+### Why this does NOT weaken integrity
 
-The cheapest possible fix is DuckDB rebuilding the ART internally. **If it works,
-no rebuild is needed.** Operator steps (also in the runbook):
+The `UNIQUE(seq)` looked like the cross-writer fork guard. It was not:
 
-```sql
--- with ABERP stopped, against ~/.aberp/<tenant>/aberp.duckdb:
-CHECKPOINT;   -- folds the WAL into the main file, re-serialising the ART
-VACUUM;       -- reclaims + re-analyses
-```
+- **ABERP's own S186/PR-186 finding** (`apps/aberp/src/incoming_invoices.rs:54-77`)
+  established, with a pinned test, that *"DuckDB's UNIQUE constraint does NOT
+  fire across two `Connection::open` handles in the same process"*. So
+  `UNIQUE(seq)` never prevented a concurrent in-process fork.
+- An **S341 empirical probe** confirmed two concurrent `Connection::open`
+  handles on the same file coexist with no exclusive lock — so the constraint
+  was never the serializer either.
 
-then restart ABERP and try saving a material.
+Integrity is enforced at two layers, neither of them the ART:
 
-**Result (assumption, pending operator confirmation):** S332 §6 already showed the
-crash is in the on-disk ART *image* and is **not reproducible on fresh DBs even
-at 1M rows**. A `CHECKPOINT` re-serialises the *same corrupt allocator state*
-through the very `WriteToWAL` path in the crash stack, so it is **expected to
-re-trigger the panic rather than clear it**. We have NOT been able to run it
-against the live prod file from this session (no copy of the prod DB is
-available here — S332 §9 requested one). The runbook therefore lists
-CHECKPOINT/VACUUM as step 0 ("try the free fix first"), and `aberp audit-rebuild`
-as the durable fix if it does not clear the crash. If CHECKPOINT *does* clear it,
-S341 ships only the diagnostic + runbook and the rebuild subcommand stays unused.
+1. **Detection — the hash chain.** `verify_chain` walks `seq` order + chain
+   links + per-entry hashes and loud-fails on the first duplicate / reorder /
+   fork. This is the ADR-0008 tamper-evidence guarantee and is unchanged.
+2. **Prevention (in-process) — a new `AUDIT_APPEND_LOCK`.** A process-wide
+   `Mutex<()>` in `storage/mod.rs` serializes the whole
+   open → read-head → insert → commit window, so two in-process writers cannot
+   read the same committed head and both append `seq = head + 1`. Each write
+   re-reads the head under the lock (NOT a cached `Mutex<u64>` counter — a
+   cached counter would go stale across processes, the exact hazard S335
+   documented for persistent connections). It also serializes the
+   reopen-per-write `Connection::open`s, which sidesteps a separate
+   DuckDB-internal concurrency assertion (`RLEScanState`) observed when many
+   independent handles touch one file at once.
 
-## 4. Why dropping `UNIQUE(seq)` is unsafe — S332/S335 evidence
+Cross-PROCESS writers (a CLI subcommand racing `aberp serve`) are outside the
+in-process lock — backstopped by the hash chain's detection, exactly as before
+(UNIQUE never covered them). A single serialized audit-writer actor across the
+whole process tree remains the documented future hardening (S335 §3.4).
 
-The brief's tempting "just drop the offending index" is **structurally
-inapplicable and unsafe**, per the prior sessions:
+### The new write paths
 
-- **No droppable index exists** (S332 §3). `audit_ledger` has zero
-  `CREATE INDEX` statements; its only ART indexes are the inline `UNIQUE(seq)` /
-  `UNIQUE(id)` constraints, which DuckDB does not list in `duckdb_indexes()` and
-  gives no user-addressable name. `DROP INDEX` has nothing to target.
-- **`UNIQUE(seq)` is the hash-chain fork guard** (S332 §4). `append_in_tx` reads
-  the chain head inside the tx, computes `seq = head + 1`, and relies on
-  `UNIQUE(seq)` to reject a racing second writer that read the same head. It is
-  the cross-producer fork-prevention for the tamper-evident ledger.
-- **Removing it forks the chain — proven** (S335 §3). A coherence probe (now
-  `tests/s335_email_outbox_audit_write_coherence.rs`) demonstrated that without
-  the cross-handle `UNIQUE(seq)` guard, two writers reuse a `seq`, silently
-  dropping a row on the crown-jewel ledger. Detection-at-`verify_chain` is a
-  strict downgrade from prevention.
+- `Ledger::append` holds `AUDIT_APPEND_LOCK` across its tx + commit.
+- `append_reopen(db_path, meta, kind, …)` — the serialized reopen-per-write
+  helper the high-frequency daemons use (replaces hand-rolled
+  `Connection::open` + `ensure_schema` + `append_in_tx` + `commit`). The
+  email-outbox daemon's `write_audit` now routes through it.
+- `append_in_tx` (cross-state txns, e.g. invoice issuance committing billing +
+  audit together) is unchanged; those are file-lock-serialized across processes
+  and chain-detected. Wiring them through the serializer is incremental future
+  work.
 
-So the fix must **preserve** `UNIQUE(seq)`/`UNIQUE(id)`. S332 §8.3 named the
-correct durable path verbatim: *"a tested table rebuild that PRESERVES
-`UNIQUE(seq)`/`UNIQUE(id)` (regenerating the ART from a clean image to recover a
-corrupted on-disk index), never a constraint drop."* That is exactly what this
-PR ships.
+## 4. Transparent boot migration (no operator action)
 
-## 5. Phase 2 — what `aberp audit-rebuild` does
+Existing prod files still carry the old `UNIQUE`-ART schema (and the corrupt
+on-disk ART). `migrate_drop_unique_art_if_present(conn)`, called from
+`ensure_schema` (which every boot / CLI / daemon write path invokes before
+appending), runs the one-time recovery automatically:
 
-New out-of-serve-loop subcommand (`apps/aberp/src/audit_rebuild.rs`):
+1. **Detect** — `duckdb_constraints()` reports any `UNIQUE` on `audit_ledger`?
+   (A metadata query — does not touch the corrupt ART insert path.) None → the
+   post-migration steady state; return immediately (cheap no-op).
+2. **Serialize** via `AUDIT_MIGRATION_LOCK` + re-check (another in-process
+   caller may have just migrated).
+3. **Dump** every row in `seq` order (SELECT is safe against the corrupt ART —
+   the crash is on INSERT only, S332 §5) and **`verify_chain`** them: PROVE the
+   rows are intact and only the index was corrupt. A broken chain ABORTS loud
+   (`AppendError::Migration`) — that is data tampering, not index corruption,
+   and a rebuild would faithfully re-index a tampered chain.
+4. **Rebuild** in one transaction (manual `BEGIN`/`COMMIT` on the `&Connection`,
+   `ROLLBACK` on error): `DROP TABLE` (discards the corrupt ART) → `CREATE TABLE`
+   (new no-`UNIQUE` schema) → re-insert every row **verbatim** (same
+   `seq`/`prev_hash`/`entry_hash` bytes).
+5. **Re-`verify_chain`** the rebuilt table as the safety gate.
 
-1. **Refuse if a serve process holds the DB** (`lsof -F pc`; DuckDB's
-   single-writer lock is the backstop). A rebuild while serve is live would race
-   the live audit-write path.
-2. **Dump** every row in `seq` order via a **read-only** connection (the read
-   path is safe against the corrupt ART — the crash is on INSERT, not SELECT).
-3. **`verify_chain` BEFORE** — prove the rows are intact and only the index is
-   corrupt. A broken chain means the *data* is suspect → **ABORT** (a rebuild
-   would faithfully re-index a tampered chain, masking the tamper).
-4. **Backup** `aberp.duckdb` → `aberp.duckdb.pre-rebuild-<unix_ts>.bak`
-   (+ `.wal` sidecar if present) unless `--no-backup`.
-5. **One transaction:** `DROP TABLE audit_ledger` (destroys the corrupt ART) →
-   `CREATE TABLE` with the **identical** `schema::CREATE_TABLE` DDL
-   (`UNIQUE(seq)`/`UNIQUE(id)` preserved) → re-`INSERT` every row **verbatim**
-   (same `seq`/`prev_hash`/`entry_hash`/`payload` bytes — `insert_entry_verbatim`)
-   → append ONE `AuditLedgerRebuilt` marker as the last row. DuckDB executes DDL
-   transactionally, so it all lands at `COMMIT` or none does.
-6. **`COMMIT`, `VACUUM`.**
-7. **`verify_chain` AFTER** (operator-facing integrity gate) + a rows/seq sanity
-   check. A post-verify failure loud-fails and points at the backup. Then
-   re-sync the ADR-0030 mirror to its new head.
+The rebuild preserves rows byte-for-byte, so the chain that verified going in
+verifies coming out and **no audit row is added** — the migration leaves no
+trace in the ledger content (provenance is a `tracing::warn!`). It is a pure
+structural recovery, idempotent (second boot detects no `UNIQUE` → no-op), and
+also repairs an already-corrupt ART (the `DROP` discards it).
 
-`--dry-run` does 1–3 plus a **non-destructive ART-health probe** (copies the DB
-to a throwaway file and attempts one append against the *copy*, so it reports
-"ART healthy" vs "ART corrupt" without touching the real ledger) and prints the
-plan. The dry-run is a guaranteed no-op: it opens read-only only, so the DB file
-mtime is untouched (pinned by `s341_rebuild_dry_run_is_no_op`).
+## 5. What changed (files)
 
-### The integrity invariant
-`verify_chain` runs before (rows intact?) AND after (rebuild preserved the
-chain?). Either failure aborts/loud-fails. **A rebuild that loses chain
-verification is never shipped** — the same invariant the S335 probe proved a
-naive "drop the constraint" fix would break. Pinned by
-`s341_rebuild_preserves_hash_chain` (THE critical regression test).
+**crate `aberp-audit-ledger`**
+- `storage/schema.rs` — `CREATE_TABLE` drops `UNIQUE (seq)` / `UNIQUE (id)`
+  (CHECK constraints kept; they are row-level, not ART).
+- `storage/mod.rs` — `AUDIT_APPEND_LOCK` + `AUDIT_MIGRATION_LOCK`;
+  `Ledger::append` locked; new `append_reopen`; `ensure_schema` runs
+  `migrate_drop_unique_art_if_present`; private `rebuild_table` +
+  `insert_entry_verbatim` (on `&Connection`, via `Transaction: Deref<Connection>`);
+  `read_all_entries`, `audit_ledger_has_unique_constraints`.
+- `error.rs` — new `AppendError::Migration(String)`.
+- `lib.rs` — export `append_reopen`.
 
-## 6. The `AuditLedgerRebuilt` audit event
+**binary `aberp`**
+- `email_outbox_poll_daemon.rs::write_audit` → `append_reopen` (serialized);
+  dropped now-unused `Connection` / `append_in_tx` imports.
+- **Removed the rejected operator-run CLI:** `src/audit_rebuild.rs`,
+  `cli::AuditRebuild`(+Args), `main.rs` wiring, `tests/s341_audit_ledger_art_rebuild.rs`,
+  `docs/runbooks/s341-audit-ledger-rebuild.md`, the `AuditLedgerRebuilt`
+  EventKind + payload + their two downstream exhaustiveness arms. No prod row
+  ever carried `audit.ledger_rebuilt` (the CLI never ran on prod), so removing
+  the variant is safe.
 
-New `EventKind::AuditLedgerRebuilt` → `audit.ledger_rebuilt` (a new `audit.`
-prefix family — a meta-event about the ledger itself, never swept by the
-per-invoice `invoice.*` export glob). Payload
-(`AuditLedgerRebuiltPayload`): `rows_before`, `rows_after`, `seq_max_before`,
-`seq_max_after`, `chain_verified`, `took_ms`. It is the **last row of the rebuild
-transaction**, so the rebuilt ledger carries permanent, hash-chained proof the
-rebuild happened. `chain_verified` records the pre-rebuild verify that gated the
-operation (a persisted `false` is impossible — the rebuild aborts before the
-marker otherwise); the post-commit re-verify is the operator-facing gate.
+## 6. Tests
 
-The F12 four-edit ritual fired once (variant + `as_str` + `from_storage_str` +
-`round_trip_for_every_variant`).
+- `crates/audit-ledger/src/storage/mod.rs` (`migration_tests`):
+  `fresh_schema_has_no_unique_constraints`,
+  `migration_detects_and_rebuilds_off_unique_schema`, `migration_is_idempotent`,
+  `ensure_schema_runs_the_migration`, `migration_aborts_on_tampered_chain`
+  (refuses + leaves the table untouched), `migration_on_empty_legacy_table_is_safe`.
+- `crates/audit-ledger/tests/s341_concurrent_append.rs` —
+  `s341_concurrent_appends_stay_dense_and_verify`: 16 threads contend on the
+  append lock through serialized reopen-per-write; result is dense+monotonic
+  `seq` and a verifying chain (no fork). Without the lock, concurrent
+  reopen-per-write forks and this fails.
+- All existing audit suites green: S307 full-cycle, S311 stale-recovery, S332
+  no-crash, S335 throttle + **coherence** (`s335_persistent_connection_forks…`
+  still holds — it never depended on UNIQUE), chain conformance.
 
-## 7. Tests
+## 7. Gates & honest limitations
 
-`apps/aberp/tests/s341_audit_ledger_art_rebuild.rs`:
+- `cargo fmt` clean; `cargo clippy --workspace --all-targets -D warnings` clean;
+  `cargo test --workspace` green (cad-extract-wrapper cold-OCCT 15s smoke flake
+  → green warm, unrelated); release build green; SPA build + vitest 1086 green.
+- **No live-prod verification of the migration** (no copy of the prod DB
+  available to this session — S332 §9's request stands). The migration logic is
+  proven in-memory; the on-disk-ART repair path is the same `DROP`+rebuild that
+  cannot re-enter the corruption class (no ART on the rebuilt table). On the
+  first upgraded boot the migration runs automatically; if the operator can
+  quiesce other writers during that first boot it removes even the narrow
+  cross-process first-migration race (otherwise that race is loud + retryable +
+  chain-backstopped).
+- **`append_in_tx` cross-state callers** (invoice issuance, etc.) are not yet
+  routed through `AUDIT_APPEND_LOCK` — they remain file-lock-serialized +
+  chain-detected (their prior safety level). Full single-writer coverage is
+  documented future hardening, orthogonal to the corruption fix.
+- **Deviation from the brief's literal "Mutex<u64> next-seq counter":** a cached
+  counter goes stale across processes (serve vs CLI) and would *reintroduce* the
+  S335 fork hazard. We use a write-serializer that re-reads the committed head
+  each time instead — strictly safer; flagged here per the conservative-choice
+  rule.
 
-| Test | Pins |
-|---|---|
-| `s341_rebuild_preserves_row_count` | N originals preserved verbatim (same ids, same order) + exactly one marker → `rows_after == N + 1` |
-| `s341_rebuild_preserves_seq_order` | `seq` is dense + monotonic `1..=N+1` after rebuild |
-| `s341_rebuild_preserves_hash_chain` | **THE critical one** — `verify_chain` passes after, independently re-checked |
-| `s341_rebuild_dry_run_is_no_op` | DB mtime + size unchanged; no marker row; no probe/backup files leaked; probes `Healthy` |
-| `s341_rebuild_refuses_if_serve_alive` | end-to-end `lsof` guard fires on a held handle (defers to the unit guard test where `lsof` is absent) |
-| `s341_rebuild_marker_payload_records_counts` | marker payload counts are correct |
+## 8. Operator action
 
-Plus module unit tests in `audit_rebuild.rs`: `holders_from_lsof_fpc` parsing,
-`guard_from_lsof_output` refuse/allow logic, `append_ext`, `resolve_db_path`.
-
-## 8. Honest limitations / conservative calls
-
-1. **Could not run Phase 1 against the live prod file** (none available to this
-   session). The CHECKPOINT verdict in §3 is an *expectation* grounded in S332's
-   on-disk-image diagnosis, flagged as such. The runbook still has the operator
-   try it first (free, non-destructive, stops here if it works).
-2. **The ART-health probe is best-effort.** In a release build the DuckDB ART
-   `InternalException` is a catchable `Err` (S332 §5); the probe relies on that.
-   It runs against a throwaway copy, so a worst-case `abort()` in a debug build
-   cannot harm the real ledger — but in that case the probe would crash the
-   `audit-rebuild --dry-run` process rather than report `Corrupt`. The real
-   (non-dry-run) rebuild does NOT depend on the probe — the operator invokes it
-   because they observed the crash (runbook detection step).
-3. **The real rebuild always rebuilds** (after backup) — it does not skip on a
-   "looks healthy" probe. Re-running on an already-healthy DB is safe (it yields
-   a healthy DB with a verified chain + one more marker). "Idempotent" here means
-   "safe to re-run, converges to healthy", not "byte-identical no-op". The
-   `--dry-run` path provides the "no rebuild needed" advisory.
-4. **WAL sidecar on restore.** The backup copies `<db>.wal` to `<bak>.wal` when
-   present; the runbook documents the rename-on-restore step. With ABERP stopped
-   gracefully first (runbook pre-flight), the WAL is normally already
-   checkpointed and absent.
-
-## 9. Operator action
-
-See `docs/runbooks/s341-audit-ledger-rebuild.md`. Short form, ABERP stopped:
-
-```
-aberp audit-rebuild --tenant prod --dry-run     # inspect + probe, no mutation
-aberp audit-rebuild --tenant prod               # backup + rebuild + verify
-```
+None for the fix itself — recovery is automatic at the first boot of the
+upgraded binary. Deploy with `./run/upgrade_prod.sh PROD_v2.27.18`, restart
+ABERP, and confirm a material save succeeds (the boot log shows
+`migrated audit_ledger off the legacy UNIQUE-ART schema` once).

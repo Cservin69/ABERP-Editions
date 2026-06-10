@@ -48,7 +48,7 @@ pub use mirror::{
     RecoveryAction,
 };
 pub use storage::{
-    append_in_tx, ensure_schema, rebuild_table_in_tx, recent_entries, Ledger, LedgerMeta,
+    append_in_tx, append_reopen, ensure_schema, recent_entries, Ledger, LedgerMeta,
     LedgerVerifyError,
 };
 

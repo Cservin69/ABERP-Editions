@@ -1,8 +1,28 @@
 //! DuckDB schema for the audit-ledger table.
 //!
 //! Single table, one row per entry. Per ADR-0019, no foreign keys.
-//! `UNIQUE(seq)` and `UNIQUE(id)` are the integrity invariants;
 //! `CHECK(seq >= 1)` rejects garbage at the schema boundary.
+//!
+//! # No `UNIQUE` constraints (S341 — duckdb#23046 / S332)
+//!
+//! This table used to carry inline `UNIQUE(seq)` / `UNIQUE(id)`
+//! constraints. Those were the ONLY ART (Adaptive Radix Tree) secondary
+//! indexes on the table, and DuckDB 1.5.x corrupts the on-disk ART of a
+//! file-backed database on insert (upstream `duckdb/duckdb#23046`,
+//! introduced in 1.5.0, still open in the latest 1.5.3) — the
+//! `FixedSizeAllocator::New → Prefix::New` panic that made every
+//! audit-bearing commit abort (S332). They have been DROPPED: with no
+//! secondary index, the corruption class cannot occur.
+//!
+//! This does NOT weaken integrity. The `UNIQUE` was never the
+//! cross-writer fork guard it appeared to be — ABERP's own S186/PR-186
+//! finding established that DuckDB's `UNIQUE` does not fire across
+//! `Connection::open` handles. Integrity is enforced by (1) the
+//! tamper-evident hash chain (`verify_chain`) which DETECTS any
+//! duplicate/reordered/forked `seq`, and (2) the process-wide
+//! `AUDIT_APPEND_LOCK` (`storage/mod.rs`) which PREVENTS in-process
+//! forks. Existing prod files are migrated off the old schema
+//! transparently at boot by `migrate_drop_unique_art_if_present`.
 //!
 //! Per ADR-0008 §"Storage", the ledger "lives in its own DuckDB table
 //! inside the tenant database" — i.e. one `audit_ledger` table per
@@ -32,9 +52,7 @@ CREATE TABLE IF NOT EXISTS audit_ledger (
     kind            VARCHAR     NOT NULL,
     payload         BLOB        NOT NULL,
     idempotency_key VARCHAR,
-    entry_hash      BLOB        NOT NULL,
-    UNIQUE (seq),
-    UNIQUE (id)
+    entry_hash      BLOB        NOT NULL
 );
 ";
 

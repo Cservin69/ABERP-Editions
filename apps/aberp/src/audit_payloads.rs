@@ -2963,73 +2963,6 @@ impl EmailOutboxEntryAuditPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// AuditLedgerRebuilt (S341 / PR-36)
-// ──────────────────────────────────────────────────────────────────────
-
-/// Payload for [`aberp_audit_ledger::EventKind::AuditLedgerRebuilt`].
-///
-/// Written as the LAST row of the `aberp audit-rebuild` transaction (see
-/// `apps/aberp/src/audit_rebuild.rs`), so the rebuilt ledger carries
-/// permanent, hash-chained proof that the on-disk ART secondary index
-/// was regenerated from a verified-intact image of its own rows (S332
-/// `FixedSizeAllocator` corruption recovery).
-///
-/// All counts describe the rebuild itself:
-/// - `rows_before` — rows read off disk before the rebuild (the N
-///   verbatim rows).
-/// - `rows_after` — rows present after the rebuild, INCLUDING this
-///   marker. On a clean rebuild `rows_after == rows_before + 1`.
-/// - `seq_max_before` / `seq_max_after` — MAX(seq) before/after; the
-///   marker takes `seq_max_before + 1`.
-/// - `chain_verified` — the pre-rebuild `verify_chain` result over the
-///   dumped rows. This marker is written INSIDE the rebuild transaction
-///   (before commit), so it necessarily records the verification that
-///   GATED the rebuild: the rows were intact and only the on-disk index
-///   was corrupt. It is always `true` when the marker exists, because a
-///   `false` pre-verify aborts the rebuild before this row is reached —
-///   a persisted `false` is therefore impossible. The independent
-///   POST-commit re-verification is the operator-facing gate
-///   (`audit_rebuild` loud-fails if it does not pass) and is reported on
-///   the CLI, not stored here.
-/// - `took_ms` — wall-clock of the rebuild transaction up to this row.
-///
-/// `audit.`-prefixed (a meta-event about the ledger) — never sweeps a
-/// per-OUTGOING-invoice export bundle's `invoice.*` glob.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditLedgerRebuiltPayload {
-    pub rows_before: u64,
-    pub rows_after: u64,
-    pub seq_max_before: u64,
-    pub seq_max_after: u64,
-    pub chain_verified: bool,
-    pub took_ms: u64,
-}
-
-impl AuditLedgerRebuiltPayload {
-    pub fn new(
-        rows_before: u64,
-        rows_after: u64,
-        seq_max_before: u64,
-        seq_max_after: u64,
-        chain_verified: bool,
-        took_ms: u64,
-    ) -> Self {
-        Self {
-            rows_before,
-            rows_after,
-            seq_max_before,
-            seq_max_after,
-            chain_verified,
-            took_ms,
-        }
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────
 // Tests — round-trip every payload through serde_json
 // ──────────────────────────────────────────────────────────────────────
 
@@ -3093,22 +3026,6 @@ mod tests {
             voided_at: None,
         }
     }
-
-    #[test]
-    fn audit_ledger_rebuilt_round_trip() {
-        // S341 / PR-36 — the rebuild-marker payload must round-trip
-        // every count field. If serde drops one, the audit-evidence of
-        // a rebuild loses its provenance.
-        let original = AuditLedgerRebuiltPayload::new(41234, 41235, 41234, 41235, true, 1843);
-        let bytes = original.to_bytes();
-        let decoded: AuditLedgerRebuiltPayload =
-            serde_json::from_slice(&bytes).expect("decode must succeed");
-        assert_eq!(decoded, original);
-        assert_eq!(decoded.rows_after, decoded.rows_before + 1);
-        assert_eq!(decoded.seq_max_after, decoded.seq_max_before + 1);
-        assert!(decoded.chain_verified);
-    }
-
     #[test]
     fn sequence_reserved_round_trip() {
         let invoice = fixture_invoice();
