@@ -1015,6 +1015,9 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         storefront_credential: crate::storefront_credential::StorefrontCredentialHandle::dormant(),
         email_outbox_daemon: crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(),
         quote_pdf_rerender_queue: crate::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
+        // S344 / PR-38 — digital-identity provider. Mock-only today; the
+        // INFO/WARN boot lines fire inside the helper.
+        digital_id: build_digital_id_provider(),
     };
 
     // 5. Build the axum router. Clone the state first so the app-boot
@@ -2756,6 +2759,56 @@ pub struct AppState {
     /// recompute re-detects undrained transitions on the next operator
     /// view. See [`crate::quote_pdf_rerender_queue`].
     pub quote_pdf_rerender_queue: Arc<crate::quote_pdf_rerender_queue::QuotePdfRerenderQueue>,
+    /// S344 / PR-38 — process-wide digital-identity provider (the swap-point
+    /// for the defense-aerospace pivot, `[[defense-aerospace-pivot]]`).
+    /// Constructed once at boot by [`build_digital_id_provider`]; today the
+    /// only backend is the deterministic, NON-PRODUCTION mock. Held as a
+    /// trait object so a real backend (HU eID, US DoD CAC, …) swaps in
+    /// without touching every consumer. Future audit-emit sites (S346) will
+    /// consult this for the operator identity that authorised each event.
+    pub digital_id: Arc<dyn aberp_digital_id::DigitalIdProvider>,
+}
+
+/// S344 / PR-38 — construct the process-wide [`DigitalIdProvider`] at boot.
+///
+/// Today the only implemented backend is the deterministic, NON-PRODUCTION
+/// [`aberp_digital_id::MockProvider`]. The `ABERP_DIGITAL_ID_PROVIDER` env
+/// var is the FUTURE swap point: real backends (HU eID, US DoD CAC, Qatar
+/// MFA, …) register here per `[[defense-aerospace-pivot]]`. Any value other
+/// than `mock` (or unset) currently logs a WARN and falls back to the mock,
+/// so a half-configured deployment is loud, never silently unsigned.
+///
+/// Emits one INFO line naming the resolved provider + operator. The mock's
+/// own constructor additionally emits the "MOCK — NOT FOR PRODUCTION USE"
+/// WARN, so the mock can never ship silently.
+fn build_digital_id_provider() -> Arc<dyn aberp_digital_id::DigitalIdProvider> {
+    let requested =
+        std::env::var("ABERP_DIGITAL_ID_PROVIDER").unwrap_or_else(|_| "mock".to_string());
+    if requested != "mock" {
+        tracing::warn!(
+            requested = %requested,
+            "ABERP_DIGITAL_ID_PROVIDER requested a non-mock backend, but only \
+             `mock` is implemented (S344). Falling back to the mock provider; \
+             real backends land in a later session."
+        );
+    }
+    let provider: Arc<dyn aberp_digital_id::DigitalIdProvider> =
+        Arc::new(aberp_digital_id::MockProvider::new());
+    match provider.current_operator() {
+        Ok(op) => tracing::info!(
+            provider = provider.name(),
+            operator_id = %op.id,
+            "DigitalIdProvider configured: provider={}, operator={} ({})",
+            provider.name(),
+            op.display_name,
+            op.id,
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "DigitalIdProvider configured but current_operator() failed at boot"
+        ),
+    }
+    provider
 }
 
 /// Session-161 — max number of NAV poll daemons polling concurrently.
@@ -19289,6 +19342,33 @@ mod tests {
     use aberp_billing::IdempotencyKey;
 
     // ──────────────────────────────────────────────────────────────
+    // S344 / PR-38 — digital-identity provider boot wiring
+    // ──────────────────────────────────────────────────────────────
+
+    /// Boot constructs the mock provider by default (no env override). The
+    /// helper is the production construction site (`AppState.digital_id`),
+    /// so asserting on it pins the default-backend invariant: a fresh boot
+    /// is always backed by `mock` with the stable mock operator until a real
+    /// backend is implemented.
+    #[test]
+    fn s344_boot_constructs_mock_provider_by_default() {
+        // Guard against a stray env var from a sibling test in the same
+        // single-threaded run.
+        std::env::remove_var("ABERP_DIGITAL_ID_PROVIDER");
+        let provider = build_digital_id_provider();
+        assert_eq!(provider.name(), "mock");
+        let op = provider
+            .current_operator()
+            .expect("mock provider always has a current operator");
+        assert_eq!(op.id, aberp_digital_id::MOCK_OPERATOR_ID);
+        assert_eq!(op.issuer, "mock");
+        // The provider round-trips sign/verify — the boot wiring hands a
+        // functioning backend to AppState, not a stub that errors on use.
+        let sig = provider.sign(b"boot-smoke").expect("sign");
+        assert!(provider.verify(b"boot-smoke", &sig).expect("verify"));
+    }
+
+    // ──────────────────────────────────────────────────────────────
     // S166 / prod-prep PR #2 — boot sanity check (sanity_check_environment)
     // ──────────────────────────────────────────────────────────────
 
@@ -21812,6 +21892,7 @@ mod tests {
             email_outbox_daemon: crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(
             ),
             quote_pdf_rerender_queue: crate::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
+            digital_id: Arc::new(aberp_digital_id::MockProvider::new()),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, storno_invoice_id)
@@ -21934,6 +22015,7 @@ mod tests {
             email_outbox_daemon: crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(
             ),
             quote_pdf_rerender_queue: crate::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
+            digital_id: Arc::new(aberp_digital_id::MockProvider::new()),
         };
 
         let (partner_id, tax_number) = resolve_customer_identity(&state, invoice_id)
@@ -22701,6 +22783,7 @@ mod tests {
             email_outbox_daemon: crate::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(
             ),
             quote_pdf_rerender_queue: crate::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
+            digital_id: Arc::new(aberp_digital_id::MockProvider::new()),
         }
     }
 

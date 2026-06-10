@@ -9,6 +9,7 @@ dependencies = [
  "aberp-audit-ledger",
  "aberp-billing",
  "aberp-cad-extract-wrapper",
+ "aberp-digital-id",
  "aberp-dispatch",
  "aberp-inventory",
  "aberp-invoice-pdf",
@@ -99,6 +100,17 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "aberp-digital-id"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

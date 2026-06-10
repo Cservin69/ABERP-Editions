@@ -39,6 +39,10 @@ production = []
 # dependencies (below) so the production binary cannot reach
 # `Actor::test_only`. Closes fortnightly review F15.
 aberp-audit-ledger = { path = "../../crates/audit-ledger" }
+# S344 / PR-38 — DigitalIdProvider swap-point. Boot constructs the mock
+# (the only backend today) into `AppState.digital_id`; real backends slot
+# in behind the trait in later sessions. See `[[defense-aerospace-pivot]]`.
+aberp-digital-id = { path = "../../crates/aberp-digital-id" }
 aberp-billing = { path = "../../modules/billing" }
 aberp-nav-transport = { path = "../../crates/nav-transport" }
 # PR-9-0: runtime <InvoiceData> v3.0 invariant check per ADR-0022. Three

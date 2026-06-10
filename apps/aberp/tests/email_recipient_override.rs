@@ -80,6 +80,7 @@ fn build_state(db_path: PathBuf) -> AppState {
         storefront_credential: aberp::storefront_credential::StorefrontCredentialHandle::dormant(),
         email_outbox_daemon: aberp::email_outbox_poll_daemon::EmailOutboxDaemonHandle::dormant(),
         quote_pdf_rerender_queue: aberp::quote_pdf_rerender_queue::QuotePdfRerenderQueue::new(),
+        digital_id: std::sync::Arc::new(aberp_digital_id::MockProvider::new()),
     }
 }
 

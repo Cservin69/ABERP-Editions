@@ -1,0 +1,44 @@
+[package]
+name = "aberp-digital-id"
+description = "S344 / PR-38 — DigitalIdProvider abstraction layer (trait) + Mock implementation for the defense-aerospace pivot (ADR-0070). Every audit-emitting operation must eventually carry the operator's digital identity; this crate is the swap-point boundary. The Mock signs with a hand-rolled HMAC-SHA256 over a hardcoded TEST key — NOT real cryptography, NOT for production. Real backends (HU eID, US DoD CAC, Qatar MFA, …) are future work and slot in behind the same trait."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_digital_id"
+path = "src/lib.rs"
+
+[dependencies]
+# `serde` derive only — `DigitalId` and `Signature` are serialized into
+# audit payloads downstream (S346). No `serde_json` runtime dep: this
+# crate never parses, it only defines the types.
+serde = { workspace = true }
+
+# The Mock's "signature" is a hand-rolled HMAC-SHA256 built on `sha2`
+# (already the audit-ledger's hash primitive). Deliberately NO `hmac`
+# crate: keeping the mock's crypto in-tree and hand-rolled makes the
+# "this is NOT real crypto" boundary unmistakable and avoids a new
+# supply-chain edge for a throwaway test backend.
+sha2 = { workspace = true }
+
+# Typed provider errors — mirrors the workspace library-crate posture
+# (`thiserror` everywhere except the binary boundary).
+thiserror = { workspace = true }
+
+# The Mock emits a WARN on construction so it can never silently ship
+# to production.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `s344_mock_provider_logs_warning_on_construction` captures the WARN
+# line via a `fmt` subscriber writing into an in-memory buffer.
+tracing-subscriber = { workspace = true }
+
+# PR-235 / S241 — inherit workspace lint config.
+[lints]
+workspace = true

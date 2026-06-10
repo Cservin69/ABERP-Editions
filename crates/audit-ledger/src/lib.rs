@@ -39,6 +39,7 @@ mod chain;
 mod entry;
 mod error;
 mod mirror;
+mod signer;
 mod storage;
 
 pub use entry::{Actor, BinaryHash, Entry, EntryHash, EntryId, EventKind, Sequence, TenantId};
@@ -47,6 +48,9 @@ pub use mirror::{
     ensure_consistent_with_db, mirror_path_for, read_mirror_entries, sync_mirror, MirrorEntry,
     RecoveryAction,
 };
+// S344 / PR-38 — OPTIONAL digital-identity attestation for future audit
+// payloads (foundation only; no event populates it yet). See [`signer`].
+pub use signer::{DigitalIdRef, Signed};
 pub use storage::{
     append_in_tx, append_reopen, ensure_schema, recent_entries, Ledger, LedgerMeta,
     LedgerVerifyError,
