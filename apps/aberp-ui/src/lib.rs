@@ -400,6 +400,8 @@ pub fn run() {
             // per-row audit trail.
             commands::get_quote_pricing_job,
             commands::get_quote_pricing_job_audit,
+            // S352 / PR-41 — operator-facing PDF view/download.
+            commands::download_quote_pricing_job_pdf,
             commands::retry_quote_pricing_job,
             // S350 / PR-39 (U5) — operator material-grade override.
             commands::edit_quote_pricing_job_material,

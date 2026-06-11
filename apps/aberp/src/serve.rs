@@ -3299,6 +3299,16 @@ fn build_router(state: AppState) -> Router {
             "/api/quote-pricing-jobs/:quote_id/audit",
             get(handle_get_quote_pricing_job_audit),
         )
+        // S352 / PR-41 — operator-facing PDF view/download. Streams the
+        // rendered `priced.pdf` bytes for the row inline (the SPA opens
+        // or downloads via a Bearer-authenticated fetch → blob). The
+        // server filesystem path is never leaked; the URL is keyed on
+        // the quote id only. 404 when the row is foreign-tenant, not yet
+        // rendered, or its on-disk artifact has gone missing.
+        .route(
+            "/api/quote-pricing-jobs/:quote_id/pdf",
+            get(handle_get_quote_pricing_job_pdf),
+        )
         .route(
             "/api/quote-pricing-jobs/:quote_id/retry",
             post(handle_retry_quote_pricing_job),
@@ -17082,6 +17092,142 @@ async fn handle_get_quote_pricing_job_detail(
     (axum::http::StatusCode::OK, axum::Json(view)).into_response()
 }
 
+/// S352 / PR-41 — discriminator outcome for serving a rendered pricing-
+/// job PDF. The route maps each arm to an HTTP response; keeping the
+/// fs+DB logic in one `pub` library helper lets the integration test pin
+/// the 404-vs-200 discrimination without spinning the HTTPS listener
+/// (same posture as `get_invoice_pdf` / `serve_pdf_route.rs`).
+pub enum PricingJobPdfOutcome {
+    /// No row for `(tenant, quote_id)` — foreign-tenant rows are
+    /// invisible (404, never 403), same convention as the detail route.
+    NotFound,
+    /// Row exists but the daemon has not rendered a PDF yet (`pdf_path`
+    /// is NULL) → 404 `{ error: "PdfNotRendered" }`.
+    NotRendered,
+    /// `pdf_path` is set but the file is gone on disk (artifact dir
+    /// wiped / moved) → 404 `{ error: "PdfFileMissing" }`, an operator-
+    /// actionable "re-render the quote" signal rather than an opaque 500.
+    FileMissing,
+    /// The rendered PDF bytes, read verbatim off disk.
+    Found(Vec<u8>),
+}
+
+/// S352 / PR-41 — read the rendered PDF for one pricing job, tenant-
+/// scoped. Reuses [`quote_pricing_jobs::get_job_detail`] for the row +
+/// `pdf_path` lookup, then reads the file. A missing file maps to
+/// [`PricingJobPdfOutcome::FileMissing`] (not an `Err`) so the route
+/// returns an actionable 404; any other IO error propagates as `Err`
+/// → 500.
+pub fn read_pricing_job_pdf(
+    conn: &duckdb::Connection,
+    quote_id: &str,
+    tenant_id: &str,
+) -> Result<PricingJobPdfOutcome> {
+    let Some(detail) = crate::quote_pricing_jobs::get_job_detail(conn, quote_id, tenant_id)? else {
+        return Ok(PricingJobPdfOutcome::NotFound);
+    };
+    let Some(pdf_path) = detail.pdf_path else {
+        return Ok(PricingJobPdfOutcome::NotRendered);
+    };
+    match std::fs::read(&pdf_path) {
+        Ok(bytes) => Ok(PricingJobPdfOutcome::Found(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                quote_id = %quote_id,
+                "pricing-job pdf_path set but file missing on disk; serving 404 PdfFileMissing"
+            );
+            Ok(PricingJobPdfOutcome::FileMissing)
+        }
+        Err(e) => Err(anyhow::Error::new(e).context(format!("read rendered pdf at {pdf_path}"))),
+    }
+}
+
+/// S352 / PR-41 — `Content-Disposition` filename for the rendered quote
+/// PDF. Operator-facing, keyed on the quote ref (never the fs path).
+/// Pinned by `pricing_job_pdf_filename_carries_ref`.
+pub fn pricing_job_pdf_filename(quote_id: &str) -> String {
+    format!("quote-{quote_id}.pdf")
+}
+
+/// S352 / PR-41 — `GET /api/quote-pricing-jobs/:quote_id/pdf`. Bearer-
+/// gated + tenant-scoped like the detail/audit/retry siblings. Streams
+/// the rendered PDF bytes inline (`Content-Disposition: inline` — the
+/// SPA decides view-vs-download); 404 for foreign-tenant / not-yet-
+/// rendered / file-missing; 400 on a malformed quote id. The server
+/// filesystem path is NEVER surfaced (S349 deferred note) — the only
+/// handle the operator gets is this quote-id-keyed URL.
+///
+/// No `quote.pdf_viewed` audit event is emitted: a read-only view is not
+/// a state mutation, and a new EventKind would pull in the full F12
+/// ritual (exhaustive arm tests in `aberp-verify` + `export_invoice_
+/// bundle`) for negligible value. Flagged in the S352 report.
+async fn handle_get_quote_pricing_job_pdf(
+    AxumPath(quote_id): AxumPath<String>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if !is_quote_id_shape(&quote_id) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid quote_id"})),
+        )
+            .into_response();
+    }
+    let db_path = (*state.db_path).clone();
+    let tenant_id = state.tenant.as_str().to_string();
+    let qid = quote_id.clone();
+    let outcome = match tokio::task::spawn_blocking(move || -> Result<PricingJobPdfOutcome> {
+        let conn = duckdb::Connection::open(&db_path).context("open DB")?;
+        read_pricing_job_pdf(&conn, &qid, &tenant_id)
+    })
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return internal_error("get_quote_pricing_job_pdf", e),
+        Err(e) => return internal_error("get_quote_pricing_job_pdf:join", anyhow!(e)),
+    };
+    match outcome {
+        PricingJobPdfOutcome::NotFound => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(error_body(format!(
+                "no pricing job found with quote_id {quote_id}"
+            ))),
+        )
+            .into_response(),
+        PricingJobPdfOutcome::NotRendered => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(error_body("PdfNotRendered".to_string())),
+        )
+            .into_response(),
+        PricingJobPdfOutcome::FileMissing => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(error_body("PdfFileMissing".to_string())),
+        )
+            .into_response(),
+        PricingJobPdfOutcome::Found(bytes) => {
+            let filename = pricing_job_pdf_filename(&quote_id);
+            let disposition = format!("inline; filename=\"{filename}\"");
+            (
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        "application/pdf".to_string(),
+                    ),
+                    (axum::http::header::CONTENT_DISPOSITION, disposition),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+    }
+}
+
 /// S350 / PR-39 (U5) — inbound body for the operator material-grade
 /// override. Only `material_grade` is editable from this panel (customer
 /// email + manual price overrides are explicitly out of scope per the
@@ -20362,6 +20508,22 @@ mod tests {
         assert_eq!(
             pdf_filename_for_invoice("S2026-000001"),
             "invoice_S2026-000001.pdf",
+        );
+    }
+
+    /// S352 / PR-41 — the rendered-quote PDF download filename carries
+    /// the quote ref verbatim (so the operator's saved file is keyed on
+    /// the quote, not on an opaque fs path). Two distinct refs prove the
+    /// ref is interpolated, not a constant.
+    #[test]
+    fn pricing_job_pdf_filename_carries_ref() {
+        assert_eq!(
+            pricing_job_pdf_filename("550e8400-e29b-41d4-a716-446655440000"),
+            "quote-550e8400-e29b-41d4-a716-446655440000.pdf",
+        );
+        assert_eq!(
+            pricing_job_pdf_filename("00000000-0000-0000-0000-000000000001"),
+            "quote-00000000-0000-0000-0000-000000000001.pdf",
         );
     }
 

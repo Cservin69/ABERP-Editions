@@ -14,6 +14,7 @@
   // (in-memory Svelte state, never browser storage).
 
   import {
+    downloadQuotePricingJobPdf,
     editQuotePricingJobMaterial,
     getQuotePricingJob,
     getQuotePricingJobAudit,
@@ -23,6 +24,11 @@
     type AuditEntryView,
     type PricingJobDetail,
   } from "../lib/api";
+  import {
+    runQuotePdfAction,
+    type QuotePdfAction,
+    type QuotePdfDeps,
+  } from "../lib/pricing-job-pdf";
   import { formatInvoiceDate } from "../lib/format";
   import { failureKindBadge } from "../lib/pricing-failure-kind";
   import { writebackOutcomeBadge } from "../lib/pricing-failure-kind";
@@ -157,6 +163,50 @@
       retryError = e instanceof Error ? e.message : String(e);
     } finally {
       retryBusy = false;
+    }
+  }
+
+  // S352 / PR-41 — View/Download the rendered quote PDF. The browser
+  // can't set `<a href>` to an authenticated endpoint (it wouldn't send
+  // the Bearer), so we fetch the bytes via the Tauri command seam (which
+  // injects the Bearer), wrap them in a `Blob`, and open/download the
+  // object URL. Logic lives in `runQuotePdfAction` (pure, unit-tested);
+  // the real browser seams are supplied here.
+  let pdfBusy = $state(false);
+  let pdfError = $state<string | null>(null);
+
+  const pdfDeps: QuotePdfDeps = {
+    download: (id) => downloadQuotePricingJobPdf(id),
+    createObjectURL: (blob) => URL.createObjectURL(blob),
+    openInNewTab: (url) => {
+      window.open(url, "_blank", "noopener,noreferrer");
+    },
+    triggerDownload: (url, filename) => {
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+    },
+    // Revoke after a delay so a new tab / save dialog has consumed the
+    // URL. The PDF is loaded into the tab synchronously on open, so the
+    // delayed revoke is cleanup, not correctness.
+    scheduleRevoke: (url) => {
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    },
+  };
+
+  async function onPdfAction(action: QuotePdfAction): Promise<void> {
+    if (!quoteId) return;
+    pdfBusy = true;
+    pdfError = null;
+    try {
+      await runQuotePdfAction(pdfDeps, quoteId, action);
+    } catch (e) {
+      pdfError = e instanceof Error ? e.message : String(e);
+    } finally {
+      pdfBusy = false;
     }
   }
 
@@ -451,10 +501,39 @@
             <dd>
               {#if detail.pdf_available}
                 <span class="chip chip--ok">Elkészült / Rendered</span>
+                <!-- S352 / PR-41 — View/Download the rendered PDF.
+                     Authenticated fetch → blob → open/download (the
+                     Bearer can't ride an `<a href>`). -->
+                <span class="qjd__pdf-actions">
+                  <button
+                    type="button"
+                    class="btn btn--secondary"
+                    disabled={pdfBusy}
+                    onclick={() => void onPdfAction("view")}
+                    data-testid="pricing-job-pdf-view-btn"
+                    >Megnyitás / View</button
+                  >
+                  <button
+                    type="button"
+                    class="btn btn--secondary"
+                    disabled={pdfBusy}
+                    onclick={() => void onPdfAction("download")}
+                    data-testid="pricing-job-pdf-download-btn"
+                    >Letöltés / Download</button
+                  >
+                </span>
               {:else}
                 <span class="qjd__muted">— nincs / none</span>
               {/if}
             </dd>
+            {#if pdfError}
+              <dt></dt>
+              <dd>
+                <p class="qjd__err" data-testid="pricing-job-pdf-error">
+                  {pdfError}
+                </p>
+              </dd>
+            {/if}
             {#if detail.valid_until_iso}
               <dt>Érvényes / Valid until</dt>
               <dd>{detail.valid_until_iso}</dd>
@@ -851,6 +930,14 @@
     display: flex;
     gap: 8px;
     align-items: center;
+    flex-wrap: wrap;
+  }
+  /* S352 / PR-41 — View/Download buttons sit inline next to the
+     "Rendered" chip; wrap on narrow panels. */
+  .qjd__pdf-actions {
+    display: inline-flex;
+    gap: 6px;
+    margin-left: 8px;
     flex-wrap: wrap;
   }
   .qjd__matselect {

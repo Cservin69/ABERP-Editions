@@ -1360,6 +1360,22 @@ pub async fn get_quote_pricing_job_audit(
     forward_get(&state, &path, true).await
 }
 
+/// S352 / PR-41 — stream the rendered quote PDF bytes for the operator
+/// panel's View/Download buttons. `GET /api/quote-pricing-jobs/{quote_id}
+/// /pdf`. Binary (`application/pdf`), so it rides `forward_get_bytes`
+/// (Bearer-authenticated) and crosses to the SPA as a `Vec<u8>` the SPA
+/// re-wraps in a `Blob`. A 404 (`PdfNotRendered` / `PdfFileMissing` /
+/// missing row) surfaces as an `Err(String)` carrying the backend body
+/// so the panel can render it inline.
+#[tauri::command]
+pub async fn download_quote_pricing_job_pdf(
+    state: State<'_, AppState>,
+    quote_id: String,
+) -> Result<Vec<u8>, String> {
+    let path = format!("/api/quote-pricing-jobs/{quote_id}/pdf");
+    forward_get_bytes(&state, &path).await
+}
+
 /// S279 / PR-265 — re-enqueue a Failed job at Fetched. Bumps the row's
 /// attempt counter so the next QuotePricingFailed audit row's
 /// idempotency key doesn't UNIQUE-collide with the prior failure.

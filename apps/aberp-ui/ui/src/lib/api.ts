@@ -3321,6 +3321,28 @@ export async function getQuotePricingJob(
   return invoke<PricingJobDetail>("get_quote_pricing_job", { quoteId });
 }
 
+/** S352 / PR-41 — download the rendered quote PDF as a `Blob` for the
+ * detail panel's View/Download buttons. The backend Tauri command
+ * (`download_quote_pricing_job_pdf`) wraps the loopback
+ * `GET /api/quote-pricing-jobs/<id>/pdf` route which streams
+ * `application/pdf` bytes from the on-disk `priced.pdf`. The bytes
+ * cross the Tauri boundary as a `Vec<u8>` (Tauri's default
+ * `Array<number>`), re-wrapped here into a `Uint8Array` for the `Blob`.
+ *
+ * The Bearer is injected by the command seam — never in the URL. The
+ * caller uses `URL.createObjectURL` + `window.open` (View) or a
+ * synthetic `<a download>` click (Download), revoking the blob URL
+ * after use. A 404 (`PdfNotRendered` / `PdfFileMissing` / missing row)
+ * rejects with the backend message; the panel renders it inline. */
+export async function downloadQuotePricingJobPdf(
+  quoteId: string,
+): Promise<Blob> {
+  const bytes = await invoke<number[]>("download_quote_pricing_job_pdf", {
+    quoteId,
+  });
+  return new Blob([new Uint8Array(bytes)], { type: "application/pdf" });
+}
+
 /** S349 / PR-40 (U1) — paginated per-row audit trail. `events` are
  * newest-first; `total` is the full quote-scoped count. Mirrors
  * `serve::PricingJobAuditResponse`. */
