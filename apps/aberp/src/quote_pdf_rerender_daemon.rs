@@ -271,8 +271,13 @@ impl PricedReposter for HttpReposter {
         breakdown_json: &str,
         pdf_bytes: &[u8],
     ) -> Result<RepostResponse> {
-        let base = snap.base_url.trim_end_matches('/');
-        let url = format!("{base}/api/quotes/{quote_id}/priced");
+        // S351 — share the trailing-slash-safe builder with the pricing
+        // pipeline so every storefront writeback site trims identically.
+        let url = crate::quote_pricing_pipeline::resolved_writeback_url(
+            &snap.base_url,
+            quote_id,
+            "priced",
+        );
         let boundary = format!("aberp-rr-{}", Ulid::new());
         let body = build_priced_multipart(
             &boundary,
@@ -933,6 +938,71 @@ mod tests {
         assert_eq!(classify_repost(400, ""), RepostOutcome::Permanent);
         assert_eq!(classify_repost(404, ""), RepostOutcome::Permanent);
         assert_eq!(classify_repost(301, ""), RepostOutcome::Unknown);
+    }
+
+    // ── S351 — trailing-slash-safe writeback URL ─────────────────────
+
+    /// Path-capturing TCP mock: replies via a oneshot with the request-line
+    /// path the real `HttpReposter` actually hit, then a clean 200 so the
+    /// repost resolves. A trailing slash in the stored base_url must NOT
+    /// produce a `//api/…` double-slash path (the production incident).
+    async fn s351_spawn_path_capturing_mock(
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16 * 1024];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                let _ = tx.send(path);
+                let body = r#"{"rerendered":true}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test]
+    async fn s351_pdf_rerender_resolves_url_correctly() {
+        let (addr, rx) = s351_spawn_path_capturing_mock().await;
+        // Operator typed a trailing slash — the incident's root cause.
+        let snap = StorefrontCredentialSnapshot {
+            base_url: format!("http://{addr}/"),
+            bearer: zeroize::Zeroizing::new("bearer-X".to_string()),
+        };
+        let reposter = HttpReposter::new().expect("client");
+        let resp = reposter
+            .repost(
+                &snap,
+                "00000000-0000-0000-0000-000000000003",
+                "hash-abc",
+                "2026-07-01",
+                "{}",
+                b"%PDF-1.4 fake",
+            )
+            .await
+            .expect("repost must not transport-error");
+        assert_eq!(resp.status, 200, "body {}", resp.body);
+        let path = rx.await.expect("mock captured a request path");
+        assert_eq!(
+            path,
+            "/api/quotes/00000000-0000-0000-0000-000000000003/priced"
+        );
     }
 
     // ── daemon round-trip ────────────────────────────────────────────

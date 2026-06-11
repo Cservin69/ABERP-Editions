@@ -407,7 +407,7 @@ impl PricingPipelineService {
     }
 
     async fn writeback_quoting_status(&self, quote_id: &str, notes: &str) -> Result<()> {
-        let url = format!("{}/api/quotes/{}/status", self.config.base_url, quote_id);
+        let url = resolved_writeback_url(&self.config.base_url, quote_id, "status");
         let body = serde_json::json!({ "status": "quoting", "notes": notes });
         let resp = self
             .client
@@ -1062,7 +1062,7 @@ impl PricingPipelineService {
         breakdown_json: &str,
         pdf_bytes: &[u8],
     ) -> Result<WritebackOutcome> {
-        let url = format!("{}/api/quotes/{}/priced", self.config.base_url, quote_id);
+        let url = resolved_writeback_url(&self.config.base_url, quote_id, "priced");
         let boundary = format!("aberp-mp-{}", Ulid::new());
         let body = build_priced_multipart(
             &boundary,
@@ -1653,6 +1653,18 @@ impl WritebackOutcome {
         }
         s
     }
+}
+
+/// S351 — PURE storefront writeback URL builder. The operator-stored
+/// `base_url` may carry a trailing `/`; left raw it produces a `//api/…`
+/// double-slash path that CloudFront's `/api/*` behavior does NOT match,
+/// so the request hits the S3 SPA fallback and returns HTML (the S347
+/// classifier then correctly labels it `routing_misconfigured`). Trimming
+/// here makes that misroute impossible regardless of what the operator
+/// typed. Trims only the formatted URL — never the stored config value.
+pub(crate) fn resolved_writeback_url(base: &str, quote_id: &str, suffix: &str) -> String {
+    let base = base.trim_end_matches('/');
+    format!("{base}/api/quotes/{quote_id}/{suffix}")
 }
 
 /// S347 / PR-39 (F1) — PURE response classifier. The F1 fix lives here:
@@ -4013,6 +4025,120 @@ mod tests {
             "got {o:?}"
         );
         assert!(o.is_success());
+    }
+
+    // ── S351 — trailing-slash-safe writeback URL builder ──────────────────
+
+    #[test]
+    fn s351_resolved_writeback_url_strips_single_trailing_slash() {
+        assert_eq!(
+            resolved_writeback_url("https://abenerp.com/", "X", "priced"),
+            "https://abenerp.com/api/quotes/X/priced"
+        );
+    }
+
+    #[test]
+    fn s351_resolved_writeback_url_strips_multiple_trailing_slashes() {
+        assert_eq!(
+            resolved_writeback_url("https://abenerp.com///", "X", "priced"),
+            "https://abenerp.com/api/quotes/X/priced"
+        );
+    }
+
+    #[test]
+    fn s351_resolved_writeback_url_handles_no_slash() {
+        assert_eq!(
+            resolved_writeback_url("https://abenerp.com", "X", "priced"),
+            "https://abenerp.com/api/quotes/X/priced"
+        );
+    }
+
+    #[test]
+    fn s351_resolved_writeback_url_handles_paths() {
+        // Subpath bases keep their interior slash — only the trailing one is
+        // trimmed, so the `/api/*` segment still resolves under the subpath.
+        assert_eq!(
+            resolved_writeback_url("https://abenerp.com/sub/", "X", "priced"),
+            "https://abenerp.com/sub/api/quotes/X/priced"
+        );
+    }
+
+    /// Path-capturing mock: replies via a oneshot with the request-line path
+    /// the client actually hit, then a clean 200 JSON so the writeback
+    /// resolves to Success. This is the production-incident assertion — a
+    /// trailing slash in the stored base_url must NOT yield a `//api/…` path.
+    async fn s351_spawn_path_capturing_mock(
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16 * 1024];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                let _ = tx.send(path);
+                let _ = sock
+                    .write_all(
+                        s347_http_canned("200 OK", "application/json", r#"{"status":"quoted"}"#)
+                            .as_bytes(),
+                    )
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (addr, rx)
+    }
+
+    fn s351_service_with_trailing_slash(addr: &std::net::SocketAddr) -> PricingPipelineService {
+        let mut svc = s347_writeback_service(addr);
+        // Operator typed a trailing slash — the incident's root cause.
+        svc.config.base_url = format!("http://{addr}/");
+        svc
+    }
+
+    #[tokio::test]
+    async fn s351_priced_pipeline_resolves_url_correctly() {
+        let (addr, rx) = s351_spawn_path_capturing_mock().await;
+        let svc = s351_service_with_trailing_slash(&addr);
+        let o = svc
+            .post_priced_writeback(
+                "00000000-0000-0000-0000-000000000001",
+                "hash-abc",
+                "2026-07-01",
+                "{}",
+                b"%PDF-1.4 fake",
+            )
+            .await
+            .expect("post_priced_writeback must not internal-error");
+        assert!(o.is_success(), "got {o:?}");
+        let path = rx.await.expect("mock captured a request path");
+        assert_eq!(
+            path,
+            "/api/quotes/00000000-0000-0000-0000-000000000001/priced"
+        );
+    }
+
+    #[tokio::test]
+    async fn s351_status_writeback_resolves_url_correctly() {
+        let (addr, rx) = s351_spawn_path_capturing_mock().await;
+        let svc = s351_service_with_trailing_slash(&addr);
+        svc.writeback_quoting_status("00000000-0000-0000-0000-000000000002", "note")
+            .await
+            .expect("status writeback must succeed");
+        let path = rx.await.expect("mock captured a request path");
+        assert_eq!(
+            path,
+            "/api/quotes/00000000-0000-0000-0000-000000000002/status"
+        );
     }
 
     // ── S348 / PR-39 (F1) — list-poll Content-Type gate ───────────────────
