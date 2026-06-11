@@ -43,6 +43,12 @@ aberp-audit-ledger = { path = "../../crates/audit-ledger" }
 # (the only backend today) into `AppState.digital_id`; real backends slot
 # in behind the trait in later sessions. See `[[defense-aerospace-pivot]]`.
 aberp-digital-id = { path = "../../crates/aberp-digital-id" }
+# S355 / PR-43 — defense-grade compliance subsystems (export-control, CUI,
+# lot/heat, AVL, NIST 800-171; ADR-0071). Wired as a regular dep so later
+# sessions can construct its types at firing sites; S355 itself adds only the
+# `personnel.*` audit EventKinds (ADR-0073) and does not yet fire them. See
+# `[[defense-aerospace-pivot]]`.
+aberp-compliance = { path = "../../crates/aberp-compliance" }
 aberp-billing = { path = "../../modules/billing" }
 aberp-nav-transport = { path = "../../crates/nav-transport" }
 # PR-9-0: runtime <InvoiceData> v3.0 invariant check per ADR-0022. Three

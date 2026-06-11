@@ -1000,7 +1000,17 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // S354 / PR-42 — operator accept-on-behalf. App-layer JSON
         // payload (quote_id / channel / note / operator_user_id /
         // outcome tag), never NAV XML bytes. Exhaustiveness arm only.
-        | EventKind::QuotePricingOperatorAccepted => (None, ""),
+        | EventKind::QuotePricingOperatorAccepted
+        // S355 / PR-43 — personnel.* access-trail family (ADR-0073).
+        // Defense-grade identity / signature / access-decision rows;
+        // app-layer JSON payloads (operator_id / resource_kind /
+        // signature_algorithm / …), never NAV XML bytes. `personnel.*`-not-
+        // `invoice.*` posture; never sweeps a per-OUTGOING-invoice bundle.
+        // Exhaustiveness arm only.
+        | EventKind::PersonnelIdRegistered
+        | EventKind::PersonnelSignatureApplied
+        | EventKind::PersonnelAccessGranted
+        | EventKind::PersonnelAccessDenied => (None, ""),
     };
 
     Ok(NavExtraction {

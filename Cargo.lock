@@ -9,6 +9,7 @@ dependencies = [
  "aberp-audit-ledger",
  "aberp-billing",
  "aberp-cad-extract-wrapper",
+ "aberp-compliance",
  "aberp-digital-id",
  "aberp-dispatch",
  "aberp-inventory",

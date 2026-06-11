@@ -869,7 +869,15 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::QuotePricingMaterialEdited
         // S354 / PR-42 — operator accept-on-behalf. App-layer JSON
         // payload (channel / note / outcome tag), never NAV XML bytes.
-        | EventKind::QuotePricingOperatorAccepted => None,
+        | EventKind::QuotePricingOperatorAccepted
+        // S355 / PR-43 — personnel.* access-trail family (ADR-0073).
+        // Defense-grade identity / signature / access-decision rows; app-layer
+        // JSON payloads, never NAV XML bytes. `personnel.*`-not-`invoice.*`
+        // posture; never sweeps a per-OUTGOING-invoice export bundle by glob.
+        | EventKind::PersonnelIdRegistered
+        | EventKind::PersonnelSignatureApplied
+        | EventKind::PersonnelAccessGranted
+        | EventKind::PersonnelAccessDenied => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1522,6 +1530,36 @@ mod tests {
         let entries = ledger.entries().unwrap();
         let nav = extract_nav_xml(&entries[0]).unwrap();
         assert!(nav.is_none(), "non-NAV-bearing kinds produce no nav/ file");
+    }
+
+    /// S355 / PR-43 (ADR-0073) — the four `personnel.*` access-trail kinds
+    /// carry app-layer JSON payloads, never NAV XML, so `extract_nav_xml`
+    /// MUST return `None` for each. The Rust exhaustiveness check already
+    /// forces the new variants into the no-NAV-bytes arm at compile time;
+    /// this is the belt-and-braces runtime pin that the no-NAV-bytes verdict
+    /// actually holds, so a personnel row never produces a `nav/` file in a
+    /// per-OUTGOING-invoice export bundle.
+    #[test]
+    fn extract_nav_xml_returns_none_for_personnel_kinds() {
+        for kind in [
+            EventKind::PersonnelIdRegistered,
+            EventKind::PersonnelSignatureApplied,
+            EventKind::PersonnelAccessGranted,
+            EventKind::PersonnelAccessDenied,
+        ] {
+            let (mut ledger, actor, _bh) = fixture_ledger();
+            ledger
+                .append(
+                    kind.clone(),
+                    br#"{"operator_id":"mock-op-001"}"#.to_vec(),
+                    actor,
+                    None,
+                )
+                .unwrap();
+            let entries = ledger.entries().unwrap();
+            let nav = extract_nav_xml(&entries[0]).unwrap();
+            assert!(nav.is_none(), "{} must produce no nav/ file", kind.as_str());
+        }
     }
 
     /// ADR-0029 §3: `chain.jsonl` carries one JSON object per

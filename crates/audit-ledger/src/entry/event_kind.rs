@@ -1951,6 +1951,88 @@ pub enum EventKind {
     ///
     /// `quote.*` prefix family.
     QuotePdfRerenderFailed,
+
+    /// S355 / PR-43 (ADR-0073) — a digital identity was registered for an
+    /// operator. FIRST member of the new `personnel.*` prefix family — the
+    /// defense-grade access-trail strand of the aerospace pivot
+    /// (`[[defense-aerospace-pivot]]`). Pairs with the S344
+    /// [`aberp_digital_id::DigitalIdProvider`] seam: when a provider mints an
+    /// operator's `DigitalId`, this is the audit-of-record that the identity
+    /// now exists on this install (the Part-11 / DFARS "who can act" anchor).
+    ///
+    /// Payload (`serde_json::Value`): `operator_id` (the provider-issued
+    /// identity id), `provider_name` (which backend issued it — `mock` today,
+    /// a real CAC / eID backend later), `registered_at_ms` (epoch-ms stamp of
+    /// registration).
+    ///
+    /// `personnel.*` prefix family — NOT `invoice.*` / `system.*` / `mes.*` /
+    /// `quote.*` / `inventory.*` / `email.*`. A new prefix keeps the access-
+    /// trail surface segregated so a forensic walker can glob `personnel.*`
+    /// for "every identity / signature / access decision on this install"
+    /// without sweeping fiscal, manufacturing, or quoting traffic — and the
+    /// per-OUTGOING-invoice export bundle's `invoice.*` glob (ADR-0009 §8)
+    /// never sweeps a personnel row by construction.
+    ///
+    /// S355 ships the kind only; firing sites land in S356+. F12 four-edit
+    /// ritual fires once for the four sibling kinds.
+    PersonnelIdRegistered,
+
+    /// S355 / PR-43 (ADR-0073) — an electronic signature was applied to a
+    /// record under a registered digital identity. The Part-11 §11.50
+    /// signature-manifestation anchor: a durable, hash-chained record that
+    /// operator X signed record Y with algorithm Z at time T. Distinct from
+    /// the S344 `Signed<T>` audit-payload wrapper (which carries the signer
+    /// reference INLINE on an arbitrary event) — this kind is the standalone
+    /// "a signature ceremony happened" landmark a forensic walker can glob.
+    ///
+    /// Payload (`serde_json::Value`): `operator_id` (signer identity),
+    /// `signed_record_kind` (what KIND of record was signed — e.g. an
+    /// invoice / work-order / inspection discriminator), `signed_record_id`
+    /// (the signed record's id), `signature_algorithm` (the load-bearing
+    /// algorithm tag — `mock-hmac-sha256` today, a real `ecdsa-p256` /
+    /// CAC-PKCS7 later; a verifier checks it before recomputing), and
+    /// `signed_at_ms` (epoch-ms stamp bound into the signature).
+    ///
+    /// `personnel.*` prefix family — same segregation rationale as
+    /// [`Self::PersonnelIdRegistered`].
+    PersonnelSignatureApplied,
+
+    /// S355 / PR-43 (ADR-0073) — access to a CUI-marked or export-controlled
+    /// resource was GRANTED to an operator. The affirmative half of the
+    /// access-control audit pair: NIST SP 800-171 AC-3.1.1 ("limit system
+    /// access to authorized users") demands a durable record of WHO was let
+    /// into WHAT and WHY. Without this row a defense-grade access trail can
+    /// only show denials, not the (more sensitive) grants.
+    ///
+    /// Payload (`serde_json::Value`): `operator_id` (who was granted access),
+    /// `resource_kind` (the controlled-resource discriminator — e.g. a CUI
+    /// document / export-controlled drawing class), `resource_id` (the
+    /// specific resource), `granted_by` (the authorizing operator / role —
+    /// the two-person-integrity anchor), and `reason` (the operator-supplied
+    /// justification — required so a grant is never unexplained).
+    ///
+    /// `personnel.*` prefix family — same segregation rationale as
+    /// [`Self::PersonnelIdRegistered`].
+    PersonnelAccessGranted,
+
+    /// S355 / PR-43 (ADR-0073) — access to a CUI-marked or export-controlled
+    /// resource was DENIED to an operator. The negative half of the
+    /// access-control audit pair (NIST SP 800-171 AC-3.1.1 / AU-3.3.1).
+    /// Recording denials loud is the CLAUDE.md rule-12 posture applied to
+    /// access control: a silently-swallowed denial (e.g. a foreign-person
+    /// export-screening block) is the worst-class failure for a defense
+    /// access trail — the audit row makes "we refused, and here's why"
+    /// permanent and reviewable.
+    ///
+    /// Payload (`serde_json::Value`): `operator_id` (who was denied),
+    /// `resource_kind` (the controlled-resource discriminator), `resource_id`
+    /// (the specific resource), and `denied_reason` (the closed-vocab /
+    /// operator-readable cause — e.g. `export_screening_failed`,
+    /// `insufficient_clearance`, `cui_not_authorized`).
+    ///
+    /// `personnel.*` prefix family — same segregation rationale as
+    /// [`Self::PersonnelIdRegistered`].
+    PersonnelAccessDenied,
 }
 
 impl EventKind {
@@ -2056,6 +2138,10 @@ impl EventKind {
             EventKind::QuotePdfRerenderEnqueued => "quote.pdf_rerender_enqueued",
             EventKind::QuotePdfRerendered => "quote.pdf_rerendered",
             EventKind::QuotePdfRerenderFailed => "quote.pdf_rerender_failed",
+            EventKind::PersonnelIdRegistered => "personnel.id_registered",
+            EventKind::PersonnelSignatureApplied => "personnel.signature_applied",
+            EventKind::PersonnelAccessGranted => "personnel.access_granted",
+            EventKind::PersonnelAccessDenied => "personnel.access_denied",
         }
     }
 
@@ -2172,6 +2258,10 @@ impl EventKind {
             "quote.pdf_rerender_enqueued" => Ok(EventKind::QuotePdfRerenderEnqueued),
             "quote.pdf_rerendered" => Ok(EventKind::QuotePdfRerendered),
             "quote.pdf_rerender_failed" => Ok(EventKind::QuotePdfRerenderFailed),
+            "personnel.id_registered" => Ok(EventKind::PersonnelIdRegistered),
+            "personnel.signature_applied" => Ok(EventKind::PersonnelSignatureApplied),
+            "personnel.access_granted" => Ok(EventKind::PersonnelAccessGranted),
+            "personnel.access_denied" => Ok(EventKind::PersonnelAccessDenied),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2280,6 +2370,10 @@ mod tests {
             EventKind::QuotePdfRerenderEnqueued,
             EventKind::QuotePdfRerendered,
             EventKind::QuotePdfRerenderFailed,
+            EventKind::PersonnelIdRegistered,
+            EventKind::PersonnelSignatureApplied,
+            EventKind::PersonnelAccessGranted,
+            EventKind::PersonnelAccessDenied,
         ];
         for v in variants {
             let s = v.as_str();
@@ -4321,5 +4415,217 @@ mod tests {
                 sibling.as_str()
             );
         }
+    }
+
+    // ── S355 / PR-43 (ADR-0073) — personnel.* access-trail family ──────────
+    //
+    // Four kinds open the new `personnel.*` prefix family: identity
+    // registration, e-signature application, and the access grant/deny pair.
+    // Per the brief each variant gets a focused round-trip test, each payload
+    // shape is pinned by a serialization test, the family shares one
+    // prefix-and-distinctness test, and a no-NAV-bytes pin lives with the
+    // exhaustive-match consumers (`aberp-verify`, `export_invoice_bundle`).
+
+    #[test]
+    fn s355_personnel_id_registered_round_trips() {
+        let k = EventKind::PersonnelIdRegistered;
+        let s = k.as_str();
+        assert_eq!(s, "personnel.id_registered");
+        assert!(
+            s.starts_with("personnel."),
+            "{s} must start with personnel."
+        );
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    #[test]
+    fn s355_personnel_signature_applied_round_trips() {
+        let k = EventKind::PersonnelSignatureApplied;
+        let s = k.as_str();
+        assert_eq!(s, "personnel.signature_applied");
+        assert!(
+            s.starts_with("personnel."),
+            "{s} must start with personnel."
+        );
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    #[test]
+    fn s355_personnel_access_granted_round_trips() {
+        let k = EventKind::PersonnelAccessGranted;
+        let s = k.as_str();
+        assert_eq!(s, "personnel.access_granted");
+        assert!(
+            s.starts_with("personnel."),
+            "{s} must start with personnel."
+        );
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    #[test]
+    fn s355_personnel_access_denied_round_trips() {
+        let k = EventKind::PersonnelAccessDenied;
+        let s = k.as_str();
+        assert_eq!(s, "personnel.access_denied");
+        assert!(
+            s.starts_with("personnel."),
+            "{s} must start with personnel."
+        );
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    /// S355 — the four `personnel.*` kinds share the new prefix family, carry
+    /// NO other prefix, and are pairwise-distinct AND distinct from a sample
+    /// of every other prefix family. A collision (or a wrong prefix) would
+    /// either mis-bucket an access-trail row into a fiscal / manufacturing /
+    /// quoting bucket OR let the per-OUTGOING-invoice export bundle's
+    /// `invoice.*` glob sweep a personnel row — both are the silent-omission
+    /// failure mode CLAUDE.md rule 12 names.
+    #[test]
+    fn s355_personnel_kinds_use_personnel_prefix_and_are_distinct() {
+        let new = [
+            EventKind::PersonnelIdRegistered,
+            EventKind::PersonnelSignatureApplied,
+            EventKind::PersonnelAccessGranted,
+            EventKind::PersonnelAccessDenied,
+        ];
+        for k in &new {
+            let s = k.as_str();
+            assert!(
+                s.starts_with("personnel."),
+                "{s} must start with personnel."
+            );
+            for foreign in [
+                "invoice.",
+                "system.",
+                "mes.",
+                "quote.",
+                "inventory.",
+                "email.",
+            ] {
+                assert!(!s.starts_with(foreign), "{s} must not start with {foreign}");
+            }
+        }
+        // Pairwise distinct within the family.
+        let strs: Vec<&str> = new.iter().map(EventKind::as_str).collect();
+        for i in 0..strs.len() {
+            for j in (i + 1)..strs.len() {
+                assert_ne!(strs[i], strs[j], "{} collides with {}", strs[i], strs[j]);
+            }
+        }
+        // Distinct from a sample sibling per other prefix family.
+        for k in &strs {
+            for sibling in [
+                EventKind::InvoiceDraftCreated,
+                EventKind::FirstProdLaunchAcknowledged,
+                EventKind::MesAdapterEvent,
+                EventKind::QuotePricingOperatorAccepted,
+                EventKind::MaterialReserved,
+                EventKind::EmailRelaySent,
+            ] {
+                assert_ne!(
+                    *k,
+                    sibling.as_str(),
+                    "{k} collides with foreign-family {}",
+                    sibling.as_str()
+                );
+            }
+        }
+    }
+
+    /// S355 — pin the documented `personnel.id_registered` payload shape so a
+    /// future firing site (S356+) has a stable contract. The kind stores a
+    /// free-form `serde_json::Value` (same posture as every recent `quote.*`
+    /// kind); this asserts the documented fields are present with the
+    /// documented JSON types after a serialize → parse round-trip.
+    #[test]
+    fn s355_personnel_id_registered_payload_serializes() {
+        let payload = serde_json::json!({
+            "operator_id": "mock-op-001",
+            "provider_name": "mock",
+            "registered_at_ms": 1_750_000_000_000_i64,
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["operator_id"].is_string());
+        assert!(parsed["provider_name"].is_string());
+        assert!(parsed["registered_at_ms"].is_i64());
+    }
+
+    /// S355 — pin the documented `personnel.signature_applied` payload shape.
+    /// The `signature_algorithm` tag is load-bearing (a verifier checks it
+    /// before recomputing), so the test asserts it is carried as a string.
+    #[test]
+    fn s355_personnel_signature_applied_payload_serializes() {
+        let payload = serde_json::json!({
+            "operator_id": "mock-op-001",
+            "signed_record_kind": "invoice",
+            "signed_record_id": "inv_01HZ",
+            "signature_algorithm": "mock-hmac-sha256",
+            "signed_at_ms": 1_750_000_000_000_i64,
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["operator_id"].is_string());
+        assert!(parsed["signed_record_kind"].is_string());
+        assert!(parsed["signed_record_id"].is_string());
+        assert!(parsed["signature_algorithm"].is_string());
+        assert!(parsed["signed_at_ms"].is_i64());
+    }
+
+    /// S355 — pin the documented `personnel.access_granted` payload shape.
+    /// `granted_by` (the authorizing operator) and `reason` are the
+    /// two-person-integrity + justification anchors and must both survive.
+    #[test]
+    fn s355_personnel_access_granted_payload_serializes() {
+        let payload = serde_json::json!({
+            "operator_id": "mock-op-001",
+            "resource_kind": "cui_document",
+            "resource_id": "doc_01HZ",
+            "granted_by": "supervisor-007",
+            "reason": "assigned to contract line 3",
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["operator_id"].is_string());
+        assert!(parsed["resource_kind"].is_string());
+        assert!(parsed["resource_id"].is_string());
+        assert!(parsed["granted_by"].is_string());
+        assert!(parsed["reason"].is_string());
+    }
+
+    /// S355 — pin the documented `personnel.access_denied` payload shape.
+    /// `denied_reason` is the loud-fail justification (CLAUDE.md rule 12) and
+    /// must be carried on every denial.
+    #[test]
+    fn s355_personnel_access_denied_payload_serializes() {
+        let payload = serde_json::json!({
+            "operator_id": "mock-op-001",
+            "resource_kind": "export_controlled_drawing",
+            "resource_id": "dwg_01HZ",
+            "denied_reason": "export_screening_failed",
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["operator_id"].is_string());
+        assert!(parsed["resource_kind"].is_string());
+        assert!(parsed["resource_id"].is_string());
+        assert!(parsed["denied_reason"].is_string());
     }
 }
