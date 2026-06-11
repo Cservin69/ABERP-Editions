@@ -1033,7 +1033,15 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // Exhaustiveness arm only.
         | EventKind::ExportClassificationSet
         | EventKind::ExportAccessCheck
-        | EventKind::ExportShipmentLogged => (None, ""),
+        | EventKind::ExportShipmentLogged
+        // S360 / PR-47 — cui.* Controlled-Unclassified-Information family
+        // (ADR-0077). Marking-applied record + access-event decision; app-layer
+        // JSON payloads (entity_kind / cui_marking_str / decision / …), never
+        // NAV XML bytes, and never the controlled content itself. `cui.*`-not-
+        // `invoice.*` posture; never sweeps a per-OUTGOING-invoice bundle.
+        // Exhaustiveness arm only.
+        | EventKind::CuiMarkingApplied
+        | EventKind::CuiAccessEvent => (None, ""),
     };
 
     Ok(NavExtraction {

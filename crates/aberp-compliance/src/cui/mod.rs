@@ -8,6 +8,11 @@
 //!
 //! S345 ships the enums + marking helpers only. Wiring a marking onto a
 //! record and enforcing handling rules lands later.
+//!
+//! S360 (ADR-0077) extends the marking helpers with [`DisseminationControl`]
+//! and [`CuiMarking::to_banner_str`] so the `cui.marking_applied` audit payload
+//! can carry the full DoD banner — base marking plus the limited-dissemination
+//! segment (`CUI//CTI//NOFORN`).
 
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +84,38 @@ impl CuiCategory {
     }
 }
 
+/// A limited-dissemination control marking — the trailing `//<DISSEM>` segment
+/// of a DoD banner (`CUI//CTI//NOFORN`). These constrain *who* may receive the
+/// artifact, orthogonal to the category that says *what kind* of CUI it is.
+///
+/// A deliberate starter subset of the registry's limited-dissemination
+/// controls, not the full set — S360+ extend it as real flowdowns demand
+/// specific controls (mirrors the [`CuiCategory`] starter-subset posture).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisseminationControl {
+    /// No foreign nationals (no dissemination to non-U.S. persons).
+    NoForn,
+    /// Federal employees and contractors.
+    FedCon,
+    /// No dissemination to contractors.
+    NoCon,
+    /// Dissemination list controlled — to those on an explicit list only.
+    DlOnly,
+}
+
+impl DisseminationControl {
+    /// The banner abbreviation as it appears in the trailing `//` segment, e.g.
+    /// `NOFORN`, `FEDCON`, `NOCON`, `DL ONLY`.
+    pub fn abbreviation(self) -> &'static str {
+        match self {
+            DisseminationControl::NoForn => "NOFORN",
+            DisseminationControl::FedCon => "FEDCON",
+            DisseminationControl::NoCon => "NOCON",
+            DisseminationControl::DlOnly => "DL ONLY",
+        }
+    }
+}
+
 impl CuiMarking {
     /// `true` only for the [`CuiMarking::Cui`] band — controlled but
     /// unclassified.
@@ -106,6 +143,30 @@ impl CuiMarking {
             CuiMarking::Secret => "SECRET".to_string(),
             CuiMarking::TopSecret => "TOP SECRET".to_string(),
         }
+    }
+
+    /// The full DoD banner per 32 CFR Part 2002: the base marking from
+    /// [`Self::display_marking`] followed by a trailing limited-dissemination
+    /// segment when any controls are supplied —
+    /// `<MARKING>//<DISSEM1>/<DISSEM2>` (e.g. `CUI//CTI//NOFORN`,
+    /// `CUI//PRVCY//FEDCON/NOFORN`). With no dissemination controls this is
+    /// exactly [`Self::display_marking`], so an empty slice is the honest
+    /// "category banner, no further limits" form.
+    ///
+    /// This is the string the `cui.marking_applied` audit payload's
+    /// `cui_marking_str` carries — rendered from typed values so a free-text
+    /// banner can never reach the ledger.
+    pub fn to_banner_str(&self, dissemination: &[DisseminationControl]) -> String {
+        let base = self.display_marking();
+        if dissemination.is_empty() {
+            return base;
+        }
+        let dissem = dissemination
+            .iter()
+            .map(|d| d.abbreviation())
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("{base}//{dissem}")
     }
 }
 

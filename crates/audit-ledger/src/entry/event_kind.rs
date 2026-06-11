@@ -2226,6 +2226,58 @@ pub enum EventKind {
     /// `export.*` prefix family — same segregation rationale as
     /// [`Self::ExportClassificationSet`].
     ExportShipmentLogged,
+
+    /// S360 / PR-47 (ADR-0077) — a CUI marking banner was applied to a
+    /// document / drawing / spec. FIRST member of the new `cui.*` prefix
+    /// family — the eleventh — the Controlled-Unclassified-Information strand
+    /// of the aerospace pivot (`[[defense-aerospace-pivot]]`). This is the
+    /// 32 CFR Part 2002 *marking record* anchor: a durable, hash-chained note
+    /// that artifact A now carries a determined CUI/classification banner.
+    ///
+    /// The `cui_marking_str` value is the rendered DoD banner the firing site
+    /// (later session) produces through
+    /// [`aberp_compliance::cui::CuiMarking::to_banner_str`] — a typed marking
+    /// renders the string, so a free-text banner can never reach the ledger.
+    ///
+    /// Payload (`serde_json::Value`): `entity_kind` (what was marked — e.g.
+    /// `"drawing"` / `"spec"` / `"document"`), `entity_id` (the artifact key),
+    /// `cui_marking_str` (the rendered banner, e.g. `"CUI//CTI//NOFORN"`),
+    /// `applied_by_operator_id` (who applied it — the accountability anchor),
+    /// and `applied_at_ms` (epoch-ms stamp).
+    ///
+    /// `cui.*` prefix family — NOT `invoice.*` / `system.*` / `mes.*` /
+    /// `quote.*` / `inventory.*` / `email.*` / `personnel.*` / `material.*` /
+    /// `part.*` / `export.*`. A new prefix keeps the CUI-handling surface
+    /// globbable on its own (`cui.*` = "every marking / access on this
+    /// install") without sweeping fiscal, manufacturing, quoting, access-trail,
+    /// material-traceability, per-unit-serialization, or export-control
+    /// traffic — and the per-OUTGOING-invoice export bundle's `invoice.*` glob
+    /// (ADR-0009 §8) never sweeps a CUI row by construction.
+    ///
+    /// No PII at rest: the payload records WHICH artifact was marked and WHO
+    /// marked it (operator id — an opaque accountability handle), never the
+    /// controlled content itself. S360 ships the kind only; firing sites land
+    /// in a later session (no document workflow exists yet). F12 four-edit
+    /// ritual fires once for the two sibling `cui.*` kinds.
+    CuiMarkingApplied,
+
+    /// S360 / PR-47 (ADR-0077) — access to a CUI-marked artifact was checked.
+    /// The *decision* counterpart to [`Self::CuiMarkingApplied`]: a durable
+    /// record that operator O requested CUI artifact A and was granted or
+    /// denied. CUI's "lawful government purpose" basic-handling rule
+    /// (32 CFR § 2002.4) makes the access-decision trail load-bearing — an
+    /// improper disclosure of CUI is a reportable event — so every check is
+    /// recorded, not just the denials (the `personnel.access_*` /
+    /// `export.access_check` posture specialised to a CUI-marked artifact).
+    ///
+    /// Payload (`serde_json::Value`): `entity_kind` (artifact kind), `entity_id`
+    /// (artifact key), `requesting_operator_id` (who asked), `decision`
+    /// (`"granted"` / `"denied"`), `reason` (the rule that drove the verdict),
+    /// and `accessed_at_ms` (epoch-ms stamp).
+    ///
+    /// `cui.*` prefix family — same segregation rationale as
+    /// [`Self::CuiMarkingApplied`].
+    CuiAccessEvent,
 }
 
 impl EventKind {
@@ -2342,6 +2394,8 @@ impl EventKind {
             EventKind::ExportClassificationSet => "export.classification_set",
             EventKind::ExportAccessCheck => "export.access_check",
             EventKind::ExportShipmentLogged => "export.shipment_logged",
+            EventKind::CuiMarkingApplied => "cui.marking_applied",
+            EventKind::CuiAccessEvent => "cui.access_event",
         }
     }
 
@@ -2469,6 +2523,8 @@ impl EventKind {
             "export.classification_set" => Ok(EventKind::ExportClassificationSet),
             "export.access_check" => Ok(EventKind::ExportAccessCheck),
             "export.shipment_logged" => Ok(EventKind::ExportShipmentLogged),
+            "cui.marking_applied" => Ok(EventKind::CuiMarkingApplied),
+            "cui.access_event" => Ok(EventKind::CuiAccessEvent),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2588,6 +2644,8 @@ mod tests {
             EventKind::ExportClassificationSet,
             EventKind::ExportAccessCheck,
             EventKind::ExportShipmentLogged,
+            EventKind::CuiMarkingApplied,
+            EventKind::CuiAccessEvent,
         ];
         for v in variants {
             let s = v.as_str();
@@ -5321,5 +5379,148 @@ mod tests {
         assert!(parsed["ecn_or_authorization"].is_string());
         assert!(parsed["shipped_at_ms"].is_i64());
         assert!(parsed["shipped_by_operator_id"].is_string());
+    }
+
+    // ── S360 / PR-47 (ADR-0077) — cui.* Controlled-Unclassified-Information ──
+    //
+    // Two kinds open the new `cui.*` prefix family (the eleventh): the
+    // marking-applied RECORD event and the access-event DECISION event. Per the
+    // brief each variant gets a focused round-trip test, each payload shape is
+    // pinned by a serialization test, the family shares one prefix-and-
+    // distinctness test, and a no-NAV-bytes pin lives with the exhaustive-match
+    // consumer (`export_invoice_bundle`).
+
+    #[test]
+    fn s360_cui_marking_applied_round_trips() {
+        let k = EventKind::CuiMarkingApplied;
+        let s = k.as_str();
+        assert_eq!(s, "cui.marking_applied");
+        assert!(s.starts_with("cui."), "{s} must start with cui.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    #[test]
+    fn s360_cui_access_event_round_trips() {
+        let k = EventKind::CuiAccessEvent;
+        let s = k.as_str();
+        assert_eq!(s, "cui.access_event");
+        assert!(s.starts_with("cui."), "{s} must start with cui.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    /// S360 — the two `cui.*` kinds share the new prefix family, carry NO other
+    /// prefix, and are distinct from each other AND from a sample of every other
+    /// prefix family. A collision (or a wrong prefix) would either mis-bucket a
+    /// CUI row into a fiscal / manufacturing / quoting / access-trail /
+    /// material-traceability / serialization / export-control bucket OR let the
+    /// per-OUTGOING-invoice export bundle's `invoice.*` glob sweep a CUI row —
+    /// both are the silent-omission failure mode CLAUDE.md rule 12 names.
+    #[test]
+    fn s360_cui_kinds_use_cui_prefix_and_are_distinct() {
+        let new = [EventKind::CuiMarkingApplied, EventKind::CuiAccessEvent];
+        for k in &new {
+            let s = k.as_str();
+            assert!(s.starts_with("cui."), "{s} must start with cui.");
+            for foreign in [
+                "invoice.",
+                "system.",
+                "mes.",
+                "quote.",
+                "inventory.",
+                "email.",
+                "personnel.",
+                "material.",
+                "part.",
+                "export.",
+            ] {
+                assert!(!s.starts_with(foreign), "{s} must not start with {foreign}");
+            }
+        }
+        // Distinct within the family.
+        let strs: Vec<&str> = new.iter().map(EventKind::as_str).collect();
+        for i in 0..strs.len() {
+            for j in (i + 1)..strs.len() {
+                assert_ne!(strs[i], strs[j], "{} collides with {}", strs[i], strs[j]);
+            }
+        }
+        // Distinct from a sample sibling per other prefix family.
+        for k in &strs {
+            for sibling in [
+                EventKind::InvoiceDraftCreated,
+                EventKind::FirstProdLaunchAcknowledged,
+                EventKind::MesAdapterEvent,
+                EventKind::QuotePricingOperatorAccepted,
+                EventKind::MaterialCatalogueChanged,
+                EventKind::MaterialReserved,
+                EventKind::EmailRelaySent,
+                EventKind::PersonnelIdRegistered,
+                EventKind::MaterialCertAttached,
+                EventKind::PartSerialAssigned,
+                EventKind::ExportClassificationSet,
+            ] {
+                assert_ne!(
+                    *k,
+                    sibling.as_str(),
+                    "{k} collides with foreign-family {}",
+                    sibling.as_str()
+                );
+            }
+        }
+    }
+
+    /// S360 — pin the documented `cui.marking_applied` payload shape so a future
+    /// firing site has a stable contract. The kind stores a free-form
+    /// `serde_json::Value` (same posture as the `export.*` / `part.*` kinds);
+    /// this asserts the documented fields are present with the documented JSON
+    /// types after a serialize → parse round-trip. `cui_marking_str` is the
+    /// rendered DoD banner — the controlled content itself is never carried
+    /// (no PII / no classified body at rest).
+    #[test]
+    fn s360_cui_marking_applied_payload_serializes() {
+        let payload = serde_json::json!({
+            "entity_kind": "drawing",
+            "entity_id": "DWG-7781-A",
+            "cui_marking_str": "CUI//CTI//NOFORN",
+            "applied_by_operator_id": "mock-op-001",
+            "applied_at_ms": 1_750_000_000_000_i64,
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["entity_kind"].is_string());
+        assert!(parsed["entity_id"].is_string());
+        assert!(parsed["cui_marking_str"].is_string());
+        assert!(parsed["applied_by_operator_id"].is_string());
+        assert!(parsed["applied_at_ms"].is_i64());
+    }
+
+    /// S360 — pin the documented `cui.access_event` payload shape. `decision`
+    /// must survive as the `"granted"` / `"denied"` string the firing site
+    /// writes.
+    #[test]
+    fn s360_cui_access_event_payload_serializes() {
+        let payload = serde_json::json!({
+            "entity_kind": "spec",
+            "entity_id": "SPEC-3001",
+            "requesting_operator_id": "mock-op-002",
+            "decision": "denied",
+            "reason": "no lawful government purpose on file (32 CFR 2002.4)",
+            "accessed_at_ms": 1_750_000_000_000_i64,
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["entity_kind"].is_string());
+        assert!(parsed["entity_id"].is_string());
+        assert!(parsed["requesting_operator_id"].is_string());
+        assert_eq!(parsed["decision"], "denied");
+        assert!(parsed["reason"].is_string());
+        assert!(parsed["accessed_at_ms"].is_i64());
     }
 }

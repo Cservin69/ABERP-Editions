@@ -897,7 +897,14 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // bundle by glob.
         | EventKind::ExportClassificationSet
         | EventKind::ExportAccessCheck
-        | EventKind::ExportShipmentLogged => None,
+        | EventKind::ExportShipmentLogged
+        // S360 / PR-47 — cui.* Controlled-Unclassified-Information family
+        // (ADR-0077). Marking-applied record + access-event decision; app-layer
+        // JSON payloads, never NAV XML bytes, and never the controlled content
+        // itself. `cui.*`-not-`invoice.*` posture; never sweeps a per-OUTGOING-
+        // invoice export bundle by glob.
+        | EventKind::CuiMarkingApplied
+        | EventKind::CuiAccessEvent => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1649,6 +1656,31 @@ mod tests {
             EventKind::ExportAccessCheck,
             EventKind::ExportShipmentLogged,
         ] {
+            let (mut ledger, actor, _bh) = fixture_ledger();
+            ledger
+                .append(
+                    kind.clone(),
+                    br#"{"entity_id":"DWG-7781-A"}"#.to_vec(),
+                    actor,
+                    None,
+                )
+                .unwrap();
+            let entries = ledger.entries().unwrap();
+            let nav = extract_nav_xml(&entries[0]).unwrap();
+            assert!(nav.is_none(), "{} must produce no nav/ file", kind.as_str());
+        }
+    }
+
+    /// S360 / PR-47 (ADR-0077) — the two `cui.*` Controlled-Unclassified-
+    /// Information kinds carry app-layer JSON payloads, never NAV XML, so
+    /// `extract_nav_xml` MUST return `None` for each. The Rust exhaustiveness
+    /// check already forces the new variants into the no-NAV-bytes arm at
+    /// compile time; this is the belt-and-braces runtime pin that the verdict
+    /// actually holds, so a CUI marking/access row never produces a `nav/` file
+    /// in a per-OUTGOING-invoice export bundle.
+    #[test]
+    fn extract_nav_xml_returns_none_for_cui_kinds() {
+        for kind in [EventKind::CuiMarkingApplied, EventKind::CuiAccessEvent] {
             let (mut ledger, actor, _bh) = fixture_ledger();
             ledger
                 .append(

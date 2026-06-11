@@ -1,6 +1,6 @@
 //! Unit tests for the S345 CUI marking vocabulary.
 
-use super::{CuiCategory, CuiMarking};
+use super::{CuiCategory, CuiMarking, DisseminationControl};
 
 #[test]
 fn s345_cui_is_cui_only_for_cui_variant() {
@@ -91,4 +91,67 @@ fn s345_cui_marking_roundtrip() {
         let back: CuiMarking = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(m, back);
     }
+}
+
+// ── S360 (ADR-0077) — DisseminationControl + to_banner_str ──────────────────
+
+#[test]
+fn s360_dissemination_control_abbreviations_are_all_distinct() {
+    let controls = [
+        DisseminationControl::NoForn,
+        DisseminationControl::FedCon,
+        DisseminationControl::NoCon,
+        DisseminationControl::DlOnly,
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for c in controls {
+        assert!(
+            seen.insert(c.abbreviation()),
+            "duplicate abbreviation {:?}",
+            c.abbreviation()
+        );
+    }
+    assert_eq!(seen.len(), 4, "expected 4 distinct starter controls");
+}
+
+#[test]
+fn s360_dissemination_control_roundtrip() {
+    let c = DisseminationControl::NoForn;
+    let json = serde_json::to_string(&c).expect("serialize");
+    let back: DisseminationControl = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(c, back);
+}
+
+#[test]
+fn s360_to_banner_str_with_no_dissemination_equals_display_marking() {
+    // With no controls the banner is exactly display_marking — the honest
+    // "category banner, no further limits" form.
+    for m in [
+        CuiMarking::Unclassified,
+        CuiMarking::Cui(CuiCategory::Cti),
+        CuiMarking::Secret,
+    ] {
+        assert_eq!(m.to_banner_str(&[]), m.display_marking());
+    }
+}
+
+#[test]
+fn s360_to_banner_str_appends_single_dissemination_segment() {
+    assert_eq!(
+        CuiMarking::Cui(CuiCategory::Cti).to_banner_str(&[DisseminationControl::NoForn]),
+        "CUI//CTI//NOFORN"
+    );
+    assert_eq!(
+        CuiMarking::Secret.to_banner_str(&[DisseminationControl::NoForn]),
+        "SECRET//NOFORN"
+    );
+}
+
+#[test]
+fn s360_to_banner_str_joins_multiple_controls_with_slash() {
+    assert_eq!(
+        CuiMarking::Cui(CuiCategory::Prvcy)
+            .to_banner_str(&[DisseminationControl::FedCon, DisseminationControl::NoForn]),
+        "CUI//PRVCY//FEDCON/NOFORN"
+    );
 }

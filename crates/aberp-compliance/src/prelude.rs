@@ -8,7 +8,7 @@
 pub use crate::avl::{
     ApprovedSupplierEntry, DpasRating, ExportScreeningStatus, PartnerRef, QualLevel,
 };
-pub use crate::cui::{CuiCategory, CuiMarking};
+pub use crate::cui::{CuiCategory, CuiMarking, DisseminationControl};
 pub use crate::export_control::{
     Classifiable, ExportClassification, ExportControlError, ExportControlProvider, Jurisdiction,
     MockExportControlProvider, PartyRef, ScreeningResult,
