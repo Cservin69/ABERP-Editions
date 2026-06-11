@@ -131,4 +131,51 @@ describe("failureKindBadge", () => {
     );
     expect(failureKindBadge(null, reason)!.label).toContain("Unknown");
   });
+
+  // ── S347 / PR-39 (F1+F2) — granular priced-writeback verdicts ──────
+
+  it("swaps the generic chip for the granular routing-misconfig label", () => {
+    // THE incident: a 200 text/html (CDN routing the API path to the SPA
+    // origin). The reason is now `writeback:routing_misconfigured …`; the
+    // operator must see "Routing misconfigured", never "Ismeretlen".
+    const reason =
+      "writeback:routing_misconfigured 🛑 Útvonal-hiba / Routing misconfigured — CloudFront route missing; http_status=200; content_type=text/html; body=<!doctype html>";
+    const b = failureKindBadge("permanent", reason);
+    expect(b).not.toBeNull();
+    expect(b!.className).toBe("chip chip--err");
+    expect(b!.label).toContain("Routing misconfigured");
+    expect(b!.label).toContain("Útvonal-hiba");
+    expect(b!.label).not.toContain("Ismeretlen");
+    expect(b!.label).not.toContain("Operator retry required");
+  });
+
+  it("maps each writeback tag to its bilingual label + retryable className", () => {
+    const cases: Array<[string, string, string]> = [
+      ["unauthorized", "Unauthorized", "chip chip--err"],
+      ["forbidden", "Forbidden", "chip chip--err"],
+      ["non_json_response", "Non-JSON response", "chip chip--err"],
+      ["malformed_app_response", "Malformed app response", "chip chip--err"],
+      ["app_rejected", "Storefront rejected", "chip chip--err"],
+      ["app_errored", "Storefront server error", "chip chip--running"],
+      ["timeout", "Timeout", "chip chip--running"],
+      ["transport_error", "Transport error", "chip chip--running"],
+    ];
+    for (const [tag, label, className] of cases) {
+      // Use the verdict's own failure_kind so the test exercises the
+      // real call shape (transient tags arrive as "transient", etc.).
+      const kind = className.includes("running") ? "transient" : "permanent";
+      const b = failureKindBadge(kind, `writeback:${tag} something`);
+      expect(b, tag).not.toBeNull();
+      expect(b!.label, tag).toContain(label);
+      expect(b!.className, tag).toBe(className);
+    }
+  });
+
+  it("falls through to the generic chip for an unrecognised writeback tag", () => {
+    // Defence-in-depth — a future Rust variant the SPA doesn't know yet
+    // must not blank the chip; fall back to the coarse failure_kind copy.
+    const b = failureKindBadge("permanent", "writeback:brand_new_variant x");
+    expect(b).not.toBeNull();
+    expect(b!.label).toContain("Operator retry required");
+  });
 });

@@ -63,6 +63,7 @@ use aberp_quote_engine::{
 };
 use aberp_quote_pdf::QuoteInputs;
 
+use crate::catalogue_push::response_excerpt;
 use crate::quote_pricing_jobs::{self as jobs, FailureKind, JobState, PricingJobRow};
 
 /// What every pricing-pipeline cycle reports back. Used for the SPA
@@ -839,7 +840,6 @@ impl PricingPipelineService {
             )
             .await;
 
-        let post_outcome_state = post_result.as_ref().map(|r| r.outcome).ok();
         let db_path = self.deps.db_path.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
@@ -851,58 +851,14 @@ impl PricingPipelineService {
             let mut conn = duckdb::Connection::open(&db_path).context("open DB for post-finish")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
-            match post_result {
-                Ok(PostResult { outcome, .. }) => {
-                    let set_outcome = jobs::set_state(
-                        &conn,
-                        &quote_id_persist,
-                        &tenant_id_string,
-                        JobState::Posted,
-                        OffsetDateTime::now_utc(),
-                    )?;
-                    if !matches!(set_outcome, jobs::TransitionOutcome::Applied) {
-                        // Already-Posted (prior cycle's storefront-replay
-                        // landed) or NotFound. The storefront has the PDF;
-                        // skip audit emit to avoid double-firing.
-                        tracing::info!(
-                            quote_id = %quote_id_persist,
-                            outcome = ?set_outcome,
-                            "set_state(Posted) no-op; skipping audit emit"
-                        );
-                        let _ = post_outcome_state;
-                        return Ok(StepOutcome::Posted);
-                    }
-                    let tx = conn.transaction().context("open posted-audit tx")?;
-                    let meta = LedgerMeta::new(
-                        TenantId::new(&tenant_id_string).context("tenant id")?,
-                        binary_hash,
-                    );
-                    let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
-                    let payload = QuotePricingPostedPayload {
-                        quote_id: quote_id_persist.clone(),
-                        tenant_id: tenant_id_string.clone(),
-                        feature_graph_hash: hash.clone(),
-                        idempotent: matches!(outcome, PostOutcome::Idempotent),
-                        valid_until_iso: valid_until.clone(),
-                        actor: "system".to_string(),
-                        idempotency_key: format!("quote_pricing_posted:{quote_id_persist}"),
-                    };
-                    let bytes_payload = serde_json::to_vec(&payload).context("encode posted")?;
-                    append_in_tx(
-                        &tx,
-                        &meta,
-                        EventKind::QuotePricingPosted,
-                        bytes_payload,
-                        actor,
-                        Some(payload.idempotency_key.clone()),
-                    )
-                    .context("append posted")?;
-                    tx.commit().context("commit posted-audit")?;
-                    let _ = post_outcome_state;
-                    Ok(StepOutcome::Posted)
-                }
+
+            // An internal pre-send error (multipart build / bearer header)
+            // never reached the wire — there's no transport verdict to
+            // record. Fail the job through the generic path and stop.
+            let outcome = match post_result {
+                Ok(o) => o,
                 Err(e) => {
-                    let reason = e.to_string();
+                    let reason = format!("post pre-send error: {e:#}");
                     emit_failure(
                         &mut conn,
                         &tenant_id_string,
@@ -913,8 +869,85 @@ impl PricingPipelineService {
                         &reason,
                         attempt_n,
                     )?;
-                    Ok(StepOutcome::Failed)
+                    return Ok(StepOutcome::Failed);
                 }
+            };
+
+            // S347 / PR-39 — record the granular transport verdict for EVERY
+            // attempt (success + failure), before mutating job state, so the
+            // forensic walker sees the full priced-writeback delivery trail.
+            emit_priced_writeback_outcome(
+                &mut conn,
+                &tenant_id_string,
+                binary_hash,
+                &login,
+                &quote_id_persist,
+                &outcome,
+                attempt_n,
+            )?;
+
+            if let WritebackOutcome::Success { idempotent } = outcome {
+                let set_outcome = jobs::set_state(
+                    &conn,
+                    &quote_id_persist,
+                    &tenant_id_string,
+                    JobState::Posted,
+                    OffsetDateTime::now_utc(),
+                )?;
+                if !matches!(set_outcome, jobs::TransitionOutcome::Applied) {
+                    // Already-Posted (prior cycle's storefront-replay
+                    // landed) or NotFound. The storefront has the PDF;
+                    // skip the posted-audit emit to avoid double-firing.
+                    tracing::info!(
+                        quote_id = %quote_id_persist,
+                        outcome = ?set_outcome,
+                        "set_state(Posted) no-op; skipping audit emit"
+                    );
+                    return Ok(StepOutcome::Posted);
+                }
+                let tx = conn.transaction().context("open posted-audit tx")?;
+                let meta = LedgerMeta::new(
+                    TenantId::new(&tenant_id_string).context("tenant id")?,
+                    binary_hash,
+                );
+                let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+                let payload = QuotePricingPostedPayload {
+                    quote_id: quote_id_persist.clone(),
+                    tenant_id: tenant_id_string.clone(),
+                    feature_graph_hash: hash.clone(),
+                    idempotent,
+                    valid_until_iso: valid_until.clone(),
+                    actor: "system".to_string(),
+                    idempotency_key: format!("quote_pricing_posted:{quote_id_persist}"),
+                };
+                let bytes_payload = serde_json::to_vec(&payload).context("encode posted")?;
+                append_in_tx(
+                    &tx,
+                    &meta,
+                    EventKind::QuotePricingPosted,
+                    bytes_payload,
+                    actor,
+                    Some(payload.idempotency_key.clone()),
+                )
+                .context("append posted")?;
+                tx.commit().context("commit posted-audit")?;
+                Ok(StepOutcome::Posted)
+            } else {
+                // Typed failure — the reason embeds the stable `writeback:`
+                // tag so `classify_failure` maps it by-variant (never the
+                // old `? Ismeretlen / Unknown` catch-all).
+                let reason = outcome.failure_reason();
+                emit_failure(
+                    &mut conn,
+                    &tenant_id_string,
+                    binary_hash,
+                    &login,
+                    &quote_id_persist,
+                    "post",
+                    &reason,
+                    attempt_n,
+                )?;
+                Ok(StepOutcome::Failed)
             }
         })
         .await
@@ -926,6 +959,16 @@ impl PricingPipelineService {
     /// per ADR-0004's contract. Hand-rolled rather than feature-
     /// flagging reqwest's `multipart` to avoid bloating the global
     /// HTTP-client feature surface for this one caller.
+    /// S347 / PR-39 (F1+F2) — returns a typed [`WritebackOutcome`] instead
+    /// of a stringly `Result`. The old code parsed `resp.text()` as JSON
+    /// unconditionally, so a 200 `text/html` (the CDN serving the SPA shell
+    /// instead of the API — the 2026-06-11 incident) logged
+    /// `parse priced-writeback ok JSON: <!doctype html>…` and fell through
+    /// to the `? Ismeretlen / Unknown` bucket. Now every response is
+    /// classified by status + Content-Type at the source; a transport-vs-app
+    /// verdict travels back to the caller. `Err` is reserved for the
+    /// internal pre-send failures (multipart build / bearer header) that are
+    /// config bugs, not a writeback verdict.
     async fn post_priced_writeback(
         &self,
         quote_id: &str,
@@ -933,7 +976,7 @@ impl PricingPipelineService {
         valid_until_iso: &str,
         breakdown_json: &str,
         pdf_bytes: &[u8],
-    ) -> Result<PostResult> {
+    ) -> Result<WritebackOutcome> {
         let url = format!("{}/api/quotes/{}/priced", self.config.base_url, quote_id);
         let boundary = format!("aberp-mp-{}", Ulid::new());
         let body = build_priced_multipart(
@@ -946,7 +989,7 @@ impl PricingPipelineService {
             // stock-alert overlay only flips on the S325 re-render path.
             false,
         )?;
-        let resp = self
+        let resp = match self
             .client
             .post(&url)
             .header("Authorization", self.bearer_header()?)
@@ -957,23 +1000,31 @@ impl PricingPipelineService {
             .body(body)
             .send()
             .await
-            .with_context(|| format!("POST {url}"))?;
-        let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("priced-writeback HTTP {status} body={body_text}"));
-        }
-        // 200 path: distinguish idempotent replay via JSON shape per
-        // ADR-0004 — `{status:"quoted", idempotent:true}` vs the
-        // fresh `{status:"quoted"}` shape.
-        let parsed: PricedWritebackOk = serde_json::from_str(&body_text)
-            .with_context(|| format!("parse priced-writeback ok JSON: {body_text}"))?;
-        let outcome = if parsed.idempotent.unwrap_or(false) {
-            PostOutcome::Idempotent
-        } else {
-            PostOutcome::Fresh
+        {
+            Ok(r) => r,
+            // No HTTP response at all — connection refused / DNS / TLS /
+            // timeout. Classify the reqwest error, never bubble it as an
+            // opaque `?`.
+            Err(e) => return Ok(classify_send_error(&e)),
         };
-        Ok(PostResult { outcome })
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        // F8 — a mid-body connection drop is itself a transport failure, not
+        // an empty-body app response. Surface it as such rather than
+        // `unwrap_or_default()`-ing into a misleading parse error.
+        let body_text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => return Ok(classify_send_error(&e)),
+        };
+        Ok(classify_writeback_response(
+            status,
+            content_type.as_deref(),
+            &body_text,
+        ))
     }
 
     fn bearer_header(&self) -> Result<reqwest::header::HeaderValue> {
@@ -1258,22 +1309,377 @@ enum StepOutcome {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PostOutcome {
-    Fresh,
-    Idempotent,
-}
-
-#[derive(Debug, Clone)]
-struct PostResult {
-    outcome: PostOutcome,
-}
-
+/// The contract shape of a 200 priced-writeback response per ADR-0004:
+/// `{status:"quoted"}` (fresh) or `{status:"quoted", idempotent:true}`
+/// (replay). `status` is REQUIRED — its absence is how
+/// [`classify_writeback_response`] tells a malformed app response (e.g.
+/// `{"unexpected":"shape"}`) from a real one.
 #[derive(Debug, Deserialize)]
 struct PricedWritebackOk {
-    #[allow(dead_code)]
     status: Option<String>,
     idempotent: Option<bool>,
+}
+
+/// S347 / PR-39 (F1 + F2) — typed transport-vs-app verdict for ONE
+/// priced-writeback POST. Replaces the old stringly `Result` that parsed
+/// HTML bodies as JSON and dumped every unrecognised shape into the
+/// `? Ismeretlen / Unknown` bucket. Each variant maps to a non-`Unknown`
+/// [`FailureKind`] and a bilingual operator label, so a misroute can never
+/// masquerade as anything else (audit F1/F2, 2026-06-11 incident).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WritebackOutcome {
+    /// 2xx + `application/json` + the required `{status}` field present.
+    Success { idempotent: bool },
+    /// 200 + `text/html` — the CDN routed the API path to the SPA origin
+    /// and returned the index shell. THE incident shape.
+    RoutingMisconfigured {
+        http_status: u16,
+        content_type: String,
+        body_excerpt: String,
+    },
+    /// 401 — bearer / origin-secret mismatch.
+    Unauthorized {
+        http_status: u16,
+        body_excerpt: String,
+    },
+    /// 403 — origin secret or bearer rejected.
+    Forbidden {
+        http_status: u16,
+        body_excerpt: String,
+    },
+    /// Any other status whose Content-Type is not `application/json`.
+    NonJsonResponse {
+        http_status: u16,
+        content_type: String,
+        body_excerpt: String,
+    },
+    /// 2xx + `application/json` but missing the required `{status}` field.
+    MalformedAppResponse {
+        http_status: u16,
+        body_excerpt: String,
+    },
+    /// 4xx (non-401/403) with a JSON body — the app rejected the writeback.
+    AppRejected {
+        http_status: u16,
+        body_excerpt: String,
+    },
+    /// 5xx with a JSON body — storefront server error. Retryable.
+    AppErrored {
+        http_status: u16,
+        body_excerpt: String,
+    },
+    /// Request timed out before a response. Retryable.
+    Timeout,
+    /// Connection refused / DNS / TLS / body-read drop — no HTTP response.
+    /// Retryable.
+    TransportError { kind: String },
+}
+
+impl WritebackOutcome {
+    /// Stable closed-vocab storage token (audit payload + the
+    /// `writeback:<tag>` reason prefix [`classify_failure`] matches on).
+    pub fn tag(&self) -> &'static str {
+        match self {
+            WritebackOutcome::Success { .. } => "success",
+            WritebackOutcome::RoutingMisconfigured { .. } => "routing_misconfigured",
+            WritebackOutcome::Unauthorized { .. } => "unauthorized",
+            WritebackOutcome::Forbidden { .. } => "forbidden",
+            WritebackOutcome::NonJsonResponse { .. } => "non_json_response",
+            WritebackOutcome::MalformedAppResponse { .. } => "malformed_app_response",
+            WritebackOutcome::AppRejected { .. } => "app_rejected",
+            WritebackOutcome::AppErrored { .. } => "app_errored",
+            WritebackOutcome::Timeout => "timeout",
+            WritebackOutcome::TransportError { .. } => "transport_error",
+        }
+    }
+
+    /// THE single source of truth mapping a tag → coarse [`FailureKind`].
+    /// `None` for `success` and any unrecognised tag. Both the instance
+    /// methods AND [`classify_failure`]'s post-stage arm consult this, so
+    /// the by-variant classification can't drift from the by-reason one.
+    pub fn failure_kind_for_tag(tag: &str) -> Option<FailureKind> {
+        match tag {
+            // Server-side / network blips — the next cycle has a real shot.
+            "app_errored" | "timeout" | "transport_error" => Some(FailureKind::Transient),
+            // Config / routing / contract — retry alone never helps; an
+            // operator must fix routing, rotate a secret, or chase the
+            // storefront contract.
+            "routing_misconfigured"
+            | "unauthorized"
+            | "forbidden"
+            | "non_json_response"
+            | "malformed_app_response"
+            | "app_rejected" => Some(FailureKind::Permanent),
+            _ => None,
+        }
+    }
+
+    /// Coarse verdict for the `failure_kind` column. Only meaningful for
+    /// non-`Success` outcomes (Success is not a failure).
+    pub fn failure_kind(&self) -> FailureKind {
+        Self::failure_kind_for_tag(self.tag()).unwrap_or(FailureKind::Permanent)
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self, WritebackOutcome::Success { .. })
+    }
+
+    /// Whether the next daemon cycle should bother retrying.
+    pub fn retryable(&self) -> bool {
+        matches!(
+            Self::failure_kind_for_tag(self.tag()),
+            Some(FailureKind::Transient)
+        )
+    }
+
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            WritebackOutcome::RoutingMisconfigured { http_status, .. }
+            | WritebackOutcome::Unauthorized { http_status, .. }
+            | WritebackOutcome::Forbidden { http_status, .. }
+            | WritebackOutcome::NonJsonResponse { http_status, .. }
+            | WritebackOutcome::MalformedAppResponse { http_status, .. }
+            | WritebackOutcome::AppRejected { http_status, .. }
+            | WritebackOutcome::AppErrored { http_status, .. } => Some(*http_status),
+            WritebackOutcome::Success { .. }
+            | WritebackOutcome::Timeout
+            | WritebackOutcome::TransportError { .. } => None,
+        }
+    }
+
+    /// The response Content-Type when it is part of the verdict. The two
+    /// non-JSON variants carry the actual header; the JSON-path variants
+    /// are `application/json` by construction; auth + transport verdicts
+    /// don't constrain it.
+    pub fn content_type(&self) -> Option<String> {
+        match self {
+            WritebackOutcome::RoutingMisconfigured { content_type, .. }
+            | WritebackOutcome::NonJsonResponse { content_type, .. } => Some(content_type.clone()),
+            WritebackOutcome::Success { .. }
+            | WritebackOutcome::MalformedAppResponse { .. }
+            | WritebackOutcome::AppRejected { .. }
+            | WritebackOutcome::AppErrored { .. } => Some("application/json".to_string()),
+            WritebackOutcome::Unauthorized { .. }
+            | WritebackOutcome::Forbidden { .. }
+            | WritebackOutcome::Timeout
+            | WritebackOutcome::TransportError { .. } => None,
+        }
+    }
+
+    pub fn body_excerpt(&self) -> Option<&str> {
+        match self {
+            WritebackOutcome::RoutingMisconfigured { body_excerpt, .. }
+            | WritebackOutcome::Unauthorized { body_excerpt, .. }
+            | WritebackOutcome::Forbidden { body_excerpt, .. }
+            | WritebackOutcome::NonJsonResponse { body_excerpt, .. }
+            | WritebackOutcome::MalformedAppResponse { body_excerpt, .. }
+            | WritebackOutcome::AppRejected { body_excerpt, .. }
+            | WritebackOutcome::AppErrored { body_excerpt, .. } => Some(body_excerpt.as_str()),
+            WritebackOutcome::TransportError { kind } => Some(kind.as_str()),
+            WritebackOutcome::Success { .. } | WritebackOutcome::Timeout => None,
+        }
+    }
+
+    /// Bilingual operator label (HU) — mirrors the SPA chip vocab in
+    /// `pricing-failure-kind.ts`.
+    pub fn label_hu(&self) -> &'static str {
+        match self {
+            WritebackOutcome::Success { .. } => "✓ Sikeres",
+            WritebackOutcome::RoutingMisconfigured { .. } => "🛑 Útvonal-hiba",
+            WritebackOutcome::Unauthorized { .. } => "🛑 Hitelesítési hiba",
+            WritebackOutcome::Forbidden { .. } => "🛑 Hozzáférés megtagadva",
+            WritebackOutcome::NonJsonResponse { .. } => "🛑 Nem-JSON válasz",
+            WritebackOutcome::MalformedAppResponse { .. } => "🛑 Hibás válasz-szerkezet",
+            WritebackOutcome::AppRejected { .. } => "🛑 Storefront elutasította",
+            WritebackOutcome::AppErrored { .. } => "↻ Storefront szerverhiba",
+            WritebackOutcome::Timeout => "↻ Időtúllépés",
+            WritebackOutcome::TransportError { .. } => "↻ Hálózati hiba",
+        }
+    }
+
+    /// Bilingual operator label (EN).
+    pub fn label_en(&self) -> &'static str {
+        match self {
+            WritebackOutcome::Success { .. } => "Success",
+            WritebackOutcome::RoutingMisconfigured { .. } => "Routing misconfigured",
+            WritebackOutcome::Unauthorized { .. } => "Unauthorized",
+            WritebackOutcome::Forbidden { .. } => "Forbidden",
+            WritebackOutcome::NonJsonResponse { .. } => "Non-JSON response",
+            WritebackOutcome::MalformedAppResponse { .. } => "Malformed app response",
+            WritebackOutcome::AppRejected { .. } => "Storefront rejected",
+            WritebackOutcome::AppErrored { .. } => "Storefront server error",
+            WritebackOutcome::Timeout => "Timeout",
+            WritebackOutcome::TransportError { .. } => "Transport error",
+        }
+    }
+
+    /// The actual next action the operator should take.
+    pub fn operator_hint(&self) -> &'static str {
+        match self {
+            WritebackOutcome::Success { .. } => "",
+            WritebackOutcome::RoutingMisconfigured { .. } => {
+                "CloudFront route missing or behavior precedence wrong — the storefront returned \
+                 the SPA shell (HTML) instead of the priced API; fix the CDN routing"
+            }
+            WritebackOutcome::Unauthorized { .. } => {
+                "X-CloudFront-Secret or Bearer mismatch; check ADR-0009 secret rotation"
+            }
+            WritebackOutcome::Forbidden { .. } => {
+                "origin secret or Bearer rejected (403); check ADR-0009 secret rotation order"
+            }
+            WritebackOutcome::NonJsonResponse { .. } => {
+                "storefront returned non-JSON; routing or middleware misconfigured"
+            }
+            WritebackOutcome::MalformedAppResponse { .. } => {
+                "200 JSON without the expected {status} shape; storefront contract drift"
+            }
+            WritebackOutcome::AppRejected { .. } => {
+                "storefront rejected the writeback (4xx); inspect the body excerpt"
+            }
+            WritebackOutcome::AppErrored { .. } => "storefront 5xx — retryable on the next cycle",
+            WritebackOutcome::Timeout => "writeback timed out — retryable on the next cycle",
+            WritebackOutcome::TransportError { .. } => {
+                "connection / DNS / TLS failure — retryable on the next cycle"
+            }
+        }
+    }
+
+    /// The `error_reason` string persisted on the Failed row. Prefixed with
+    /// the stable `writeback:<tag>` token so [`classify_failure`] maps it
+    /// by-variant and the SPA can swap in the granular bilingual chip.
+    pub fn failure_reason(&self) -> String {
+        let mut s = format!(
+            "writeback:{} {} / {} — {}",
+            self.tag(),
+            self.label_hu(),
+            self.label_en(),
+            self.operator_hint()
+        );
+        if let Some(code) = self.http_status() {
+            s.push_str(&format!("; http_status={code}"));
+        }
+        if let Some(ct) = self.content_type() {
+            s.push_str(&format!("; content_type={ct}"));
+        }
+        if let Some(body) = self.body_excerpt() {
+            if !body.is_empty() {
+                s.push_str(&format!("; body={body}"));
+            }
+        }
+        s
+    }
+}
+
+/// S347 / PR-39 (F1) — PURE response classifier. The F1 fix lives here:
+/// the Content-Type gate runs BEFORE any JSON parse, so an HTML (or any
+/// non-`application/json`) body is NEVER parsed as "ok". No I/O — directly
+/// unit-testable. Auth verdicts (401/403) take precedence over the
+/// Content-Type gate because they are actionable as auth regardless of the
+/// body the CDN attached.
+fn classify_writeback_response(
+    status: u16,
+    content_type: Option<&str>,
+    body: &str,
+) -> WritebackOutcome {
+    let excerpt = response_excerpt(body);
+    // Normalise: drop the `; charset=…` parameter, trim, lowercase.
+    let ct_norm = content_type.map(|c| {
+        c.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    });
+    let is_json = ct_norm.as_deref() == Some("application/json");
+
+    match status {
+        401 => {
+            return WritebackOutcome::Unauthorized {
+                http_status: status,
+                body_excerpt: excerpt,
+            }
+        }
+        403 => {
+            return WritebackOutcome::Forbidden {
+                http_status: status,
+                body_excerpt: excerpt,
+            }
+        }
+        _ => {}
+    }
+
+    if !is_json {
+        let ct = ct_norm.unwrap_or_default();
+        if status == 200 && ct.starts_with("text/html") {
+            return WritebackOutcome::RoutingMisconfigured {
+                http_status: status,
+                content_type: ct,
+                body_excerpt: excerpt,
+            };
+        }
+        return WritebackOutcome::NonJsonResponse {
+            http_status: status,
+            content_type: ct,
+            body_excerpt: excerpt,
+        };
+    }
+
+    // application/json from here down.
+    match status {
+        200..=299 => match serde_json::from_str::<PricedWritebackOk>(body) {
+            // `status` REQUIRED — `{"unexpected":"shape"}` parses into
+            // PricedWritebackOk{status:None,..} (both fields optional), so
+            // presence of `status` is the real malformed-vs-ok signal.
+            Ok(parsed) if parsed.status.is_some() => WritebackOutcome::Success {
+                idempotent: parsed.idempotent.unwrap_or(false),
+            },
+            _ => WritebackOutcome::MalformedAppResponse {
+                http_status: status,
+                body_excerpt: excerpt,
+            },
+        },
+        400..=499 => WritebackOutcome::AppRejected {
+            http_status: status,
+            body_excerpt: excerpt,
+        },
+        500..=599 => WritebackOutcome::AppErrored {
+            http_status: status,
+            body_excerpt: excerpt,
+        },
+        // Genuinely weird 1xx/3xx with a JSON body — not a contract we
+        // expect; malformed rather than silently "ok".
+        _ => WritebackOutcome::MalformedAppResponse {
+            http_status: status,
+            body_excerpt: excerpt,
+        },
+    }
+}
+
+/// S347 / PR-39 — map a reqwest send/body-read error (no usable HTTP
+/// response) to a typed verdict. `is_timeout()` → [`WritebackOutcome::
+/// Timeout`]; everything else (connect / DNS / TLS / body drop) →
+/// [`WritebackOutcome::TransportError`]. The Display is run through
+/// `response_excerpt` to bearer-scrub + bound it.
+fn classify_send_error(e: &reqwest::Error) -> WritebackOutcome {
+    if e.is_timeout() {
+        return WritebackOutcome::Timeout;
+    }
+    WritebackOutcome::TransportError {
+        kind: response_excerpt(&e.to_string()),
+    }
+}
+
+/// S347 / PR-39 — extract the `writeback:<tag>` token a typed failure
+/// reason is prefixed with, and resolve it to a [`FailureKind`]. `None`
+/// for legacy pre-S347 reasons (no prefix) — the caller falls back to the
+/// historical string matching. `reason_lower` is already lowercased by
+/// [`classify_failure`].
+fn writeback_failure_kind_from_reason(reason_lower: &str) -> Option<FailureKind> {
+    let tag = reason_lower
+        .strip_prefix("writeback:")?
+        .split(|c: char| c.is_whitespace())
+        .next()?;
+    WritebackOutcome::failure_kind_for_tag(tag)
 }
 
 /// 5s/15s/60s/cadence backoff schedule — mirrors the intake-daemon
@@ -1390,6 +1796,14 @@ pub fn classify_failure(stage: &str, reason: &str) -> FailureKind {
     // POST-back classification — split on HTTP status family + transport
     // failure shape.
     if stage == "post" {
+        // S347 / PR-39 (F2) — typed writeback verdicts embed a stable
+        // `writeback:<tag>` token. Classify on the token, NOT on incidental
+        // reqwest Display wording (the old `"connection"`/`"dns"` substrings
+        // were one reqwest upgrade away from misclassifying). The legacy
+        // string fallback below stays for pre-S347 Failed rows on disk.
+        if let Some(kind) = writeback_failure_kind_from_reason(&r) {
+            return kind;
+        }
         if r.contains("http 401") || r.contains("http 403") {
             return FailureKind::Permanent;
         }
@@ -1495,6 +1909,51 @@ fn emit_failure(
     )
     .context("append QuotePricingFailureClassified")?;
     tx.commit().context("commit failed-audit")?;
+    Ok(())
+}
+
+/// S347 / PR-39 (F1+F2) — emit the per-attempt `quote.priced_writeback_outcome`
+/// audit row carrying the granular transport-vs-app verdict
+/// (variant + http_status + content_type + body_excerpt + retryable). Fires
+/// on EVERY writeback attempt (success too); the idempotency key
+/// (`quote_priced_writeback_outcome:<quote_id>:<attempt_n>`) keeps it to one
+/// row per (quote, attempt). Own tx — independent of the success/failure
+/// job-state transition that follows.
+fn emit_priced_writeback_outcome(
+    conn: &mut duckdb::Connection,
+    tenant_id: &str,
+    binary_hash: BinaryHash,
+    login: &str,
+    quote_id: &str,
+    outcome: &WritebackOutcome,
+    attempt_n: u32,
+) -> Result<()> {
+    let tx = conn.transaction().context("open writeback-outcome tx")?;
+    let meta = LedgerMeta::new(TenantId::new(tenant_id).context("tenant id")?, binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), login);
+    let payload = QuotePricedWritebackOutcomePayload {
+        quote_id: quote_id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        outcome: outcome.tag().to_string(),
+        http_status: outcome.http_status(),
+        content_type: outcome.content_type(),
+        body_excerpt: outcome.body_excerpt().map(|s| s.to_string()),
+        retryable: outcome.retryable(),
+        attempt_n,
+        actor: "system".to_string(),
+        idempotency_key: format!("quote_priced_writeback_outcome:{quote_id}:{attempt_n}"),
+    };
+    let bytes = serde_json::to_vec(&payload).context("encode writeback-outcome payload")?;
+    append_in_tx(
+        &tx,
+        &meta,
+        EventKind::QuotePricedWritebackOutcome,
+        bytes,
+        actor,
+        Some(payload.idempotency_key.clone()),
+    )
+    .context("append QuotePricedWritebackOutcome")?;
+    tx.commit().context("commit writeback-outcome")?;
     Ok(())
 }
 
@@ -1784,6 +2243,33 @@ struct QuotePricingFailureClassifiedPayload {
     /// before this payload is built. Carries the exact string the
     /// operator sees in the SPA's Error column for cross-referencing.
     last_error: String,
+    attempt_n: u32,
+    actor: String,
+    idempotency_key: String,
+}
+
+/// S347 / PR-39 (F1+F2) — payload for `quote.priced_writeback_outcome`.
+/// One row per writeback attempt; carries the granular transport-vs-app
+/// verdict so a forensic walker can tell a CDN misroute from an auth
+/// failure from a real 5xx without parsing the free-text `reason`.
+#[derive(Debug, Serialize)]
+struct QuotePricedWritebackOutcomePayload {
+    quote_id: String,
+    tenant_id: String,
+    /// Closed-vocab tag from [`WritebackOutcome::tag`] — `success`,
+    /// `routing_misconfigured`, `unauthorized`, `non_json_response`,
+    /// `app_errored`, `timeout`, …
+    outcome: String,
+    /// HTTP status when a response was received; `null` for transport
+    /// failures (timeout / connection) that never reached one.
+    http_status: Option<u16>,
+    /// Response Content-Type when it's part of the verdict; `null` for
+    /// auth + transport outcomes.
+    content_type: Option<String>,
+    /// Bearer-scrubbed, ≤200-char body excerpt; `null` for success/timeout.
+    body_excerpt: Option<String>,
+    /// Whether the daemon should bother retrying (Transient-class verdicts).
+    retryable: bool,
     attempt_n: u32,
     actor: String,
     idempotency_key: String,
@@ -3009,5 +3495,370 @@ mod tests {
         let rows = list_jobs(&conn, tenant).expect("list-after-loop");
         assert_eq!(rows[0].state, JobState::Failed);
         assert_eq!(rows[0].failure_kind, Some(FailureKind::Permanent));
+    }
+
+    // ── S347 / PR-39 (F1+F2) — priced-writeback transport verdict ─────
+    //
+    // The 2026-06-11 incident: the storefront priced-writeback POST got a
+    // 200 `text/html` (CDN routing the API path to the SPA origin), the
+    // client parsed it as JSON, logged `parse priced-writeback ok JSON:
+    // <!doctype html>…`, and the failure landed in `? Ismeretlen / Unknown`.
+    // These pins prove the Content-Type gate refuses HTML and every failure
+    // mode resolves to a typed, non-`Unknown` verdict.
+
+    /// PURE classifier — the F1 Content-Type gate. HTML 200 must be
+    /// `RoutingMisconfigured`, never parsed-as-ok.
+    #[test]
+    fn s347_classify_html_200_is_routing_misconfigured_not_ok() {
+        let o = classify_writeback_response(
+            200,
+            Some("text/html; charset=utf-8"),
+            "<!doctype html><html>spa shell</html>",
+        );
+        assert!(
+            matches!(o, WritebackOutcome::RoutingMisconfigured { .. }),
+            "got {o:?}"
+        );
+        assert!(!o.is_success(), "HTML 200 must NEVER be treated as ok");
+        assert_eq!(o.failure_kind(), FailureKind::Permanent);
+    }
+
+    #[test]
+    fn s347_classify_content_type_case_insensitive_and_ignores_charset() {
+        let o = classify_writeback_response(
+            200,
+            Some("APPLICATION/JSON; charset=UTF-8"),
+            r#"{"status":"quoted"}"#,
+        );
+        assert!(matches!(o, WritebackOutcome::Success { .. }), "got {o:?}");
+    }
+
+    #[test]
+    fn s347_classify_404_html_is_non_json_not_app_rejected() {
+        let o = classify_writeback_response(404, Some("text/html"), "<html>not found</html>");
+        assert!(
+            matches!(o, WritebackOutcome::NonJsonResponse { .. }),
+            "got {o:?}"
+        );
+    }
+
+    #[test]
+    fn s347_classify_missing_content_type_is_non_json() {
+        // No explicit `application/json` → F1 refuses to trust the body.
+        let o = classify_writeback_response(200, None, r#"{"status":"quoted"}"#);
+        assert!(
+            matches!(o, WritebackOutcome::NonJsonResponse { .. }),
+            "got {o:?}"
+        );
+    }
+
+    #[test]
+    fn s347_classify_401_403_take_precedence_over_content_type() {
+        let u = classify_writeback_response(401, Some("application/json"), r#"{"message":"no"}"#);
+        assert!(
+            matches!(u, WritebackOutcome::Unauthorized { .. }),
+            "got {u:?}"
+        );
+        // Even with an HTML body (CloudFront 403 page), auth wins.
+        let f = classify_writeback_response(403, Some("text/html"), "<html>forbidden</html>");
+        assert!(matches!(f, WritebackOutcome::Forbidden { .. }), "got {f:?}");
+    }
+
+    #[test]
+    fn s347_classify_json_status_families() {
+        assert!(matches!(
+            classify_writeback_response(400, Some("application/json"), r#"{"e":"bad"}"#),
+            WritebackOutcome::AppRejected { .. }
+        ));
+        assert!(matches!(
+            classify_writeback_response(500, Some("application/json"), r#"{"error":"db down"}"#),
+            WritebackOutcome::AppErrored { .. }
+        ));
+        // 200 JSON without the required `status` field → malformed.
+        assert!(matches!(
+            classify_writeback_response(200, Some("application/json"), r#"{"unexpected":"shape"}"#),
+            WritebackOutcome::MalformedAppResponse { .. }
+        ));
+        // 200 JSON with `status` → success; `idempotent` flag honoured.
+        assert!(matches!(
+            classify_writeback_response(200, Some("application/json"), r#"{"status":"quoted"}"#),
+            WritebackOutcome::Success { idempotent: false }
+        ));
+        assert!(matches!(
+            classify_writeback_response(
+                200,
+                Some("application/json"),
+                r#"{"status":"quoted","idempotent":true}"#
+            ),
+            WritebackOutcome::Success { idempotent: true }
+        ));
+    }
+
+    /// F2 — the core invariant: EVERY failure variant resolves to a
+    /// non-`Unknown` FailureKind, and the by-reason classifier
+    /// (`classify_failure`) agrees with the by-variant one. This is what
+    /// kills the `? Ismeretlen / Unknown` catch-all for the post stage.
+    #[test]
+    fn s347_every_writeback_failure_maps_to_non_unknown_kind() {
+        let variants = [
+            WritebackOutcome::RoutingMisconfigured {
+                http_status: 200,
+                content_type: "text/html".to_string(),
+                body_excerpt: "<!doctype html>".to_string(),
+            },
+            WritebackOutcome::Unauthorized {
+                http_status: 401,
+                body_excerpt: "no".to_string(),
+            },
+            WritebackOutcome::Forbidden {
+                http_status: 403,
+                body_excerpt: "no".to_string(),
+            },
+            WritebackOutcome::NonJsonResponse {
+                http_status: 404,
+                content_type: "text/plain".to_string(),
+                body_excerpt: "x".to_string(),
+            },
+            WritebackOutcome::MalformedAppResponse {
+                http_status: 200,
+                body_excerpt: "{}".to_string(),
+            },
+            WritebackOutcome::AppRejected {
+                http_status: 422,
+                body_excerpt: "x".to_string(),
+            },
+            WritebackOutcome::AppErrored {
+                http_status: 500,
+                body_excerpt: "x".to_string(),
+            },
+            WritebackOutcome::Timeout,
+            WritebackOutcome::TransportError {
+                kind: "connection refused".to_string(),
+            },
+        ];
+        for v in &variants {
+            let reason = v.failure_reason();
+            let kind = classify_failure("post", &reason);
+            assert_ne!(
+                kind,
+                FailureKind::Unknown,
+                "variant {} fell into Unknown via reason {reason:?}",
+                v.tag()
+            );
+            assert_eq!(
+                kind,
+                v.failure_kind(),
+                "by-reason classify must match by-variant for {}",
+                v.tag()
+            );
+        }
+    }
+
+    #[test]
+    fn s347_retryable_split_matches_transient_class() {
+        assert!(WritebackOutcome::AppErrored {
+            http_status: 503,
+            body_excerpt: "x".to_string()
+        }
+        .retryable());
+        assert!(WritebackOutcome::Timeout.retryable());
+        assert!(WritebackOutcome::TransportError {
+            kind: "dns".to_string()
+        }
+        .retryable());
+        assert!(!WritebackOutcome::RoutingMisconfigured {
+            http_status: 200,
+            content_type: "text/html".to_string(),
+            body_excerpt: "x".to_string()
+        }
+        .retryable());
+        assert!(!WritebackOutcome::Unauthorized {
+            http_status: 401,
+            body_excerpt: "x".to_string()
+        }
+        .retryable());
+    }
+
+    #[test]
+    fn s347_failure_reason_carries_tag_status_and_excerpt() {
+        let o = WritebackOutcome::RoutingMisconfigured {
+            http_status: 200,
+            content_type: "text/html".to_string(),
+            body_excerpt: "<!doctype html>".to_string(),
+        };
+        let r = o.failure_reason();
+        assert!(r.starts_with("writeback:routing_misconfigured "), "{r}");
+        assert!(r.contains("http_status=200"), "{r}");
+        assert!(r.contains("content_type=text/html"), "{r}");
+        assert!(r.contains("body=<!doctype html>"), "{r}");
+        // Never the word "ok" for an HTML response (the incident log line).
+        assert!(!r.to_lowercase().contains(" ok "), "{r}");
+    }
+
+    // ── e2e: drive a real reqwest client at a hand-rolled TCP mock ─────
+
+    fn s347_http_canned(status_line: &str, content_type: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// `Some(raw)` → write the canned response after draining the request;
+    /// `None` → accept the socket and never reply (drives the client into
+    /// its short timeout). The accept loop lives until the test exits.
+    async fn s347_spawn_writeback_mock(response: Option<String>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let _ = sock.read(&mut buf).await;
+                    match response {
+                        Some(r) => {
+                            let _ = sock.write_all(r.as_bytes()).await;
+                            let _ = sock.shutdown().await;
+                        }
+                        None => {
+                            // Hold the connection past the client timeout.
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn s347_writeback_service(addr: &std::net::SocketAddr) -> PricingPipelineService {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(400))
+            .build()
+            .expect("client");
+        PricingPipelineService {
+            config: PricingPipelineConfig {
+                base_url: format!("http://{addr}"),
+                bearer_token: Zeroizing::new("t0k3n".to_string()),
+                poll_interval: Duration::from_secs(60),
+                artifact_dir: std::env::temp_dir(),
+                python_bin: PathBuf::from("/usr/bin/python3"),
+                default_tolerance: ToleranceRange::Standard,
+            },
+            deps: PricingPipelineDeps {
+                db_path: std::env::temp_dir().join("aberp-s347-unused.duckdb"),
+                tenant: TenantId::new("T").expect("tid"),
+                binary_hash: BinaryHash::from_bytes([0u8; 32]),
+                operator_login: "ervin".to_string(),
+            },
+            client,
+        }
+    }
+
+    async fn s347_run_writeback(addr: &std::net::SocketAddr) -> WritebackOutcome {
+        s347_writeback_service(addr)
+            .post_priced_writeback(
+                "00000000-0000-0000-0000-000000000001",
+                "hash-abc",
+                "2026-07-01",
+                "{}",
+                b"%PDF-1.4 fake",
+            )
+            .await
+            .expect("post_priced_writeback must not internal-error")
+    }
+
+    #[tokio::test]
+    async fn s347_e2e_html_200_is_routing_misconfigured_not_ok() {
+        let addr = s347_spawn_writeback_mock(Some(s347_http_canned(
+            "200 OK",
+            "text/html; charset=utf-8",
+            "<!doctype html><html>spa shell</html>",
+        )))
+        .await;
+        let o = s347_run_writeback(&addr).await;
+        assert!(
+            matches!(o, WritebackOutcome::RoutingMisconfigured { .. }),
+            "HTML 200 must classify as routing-misconfig, got {o:?}"
+        );
+        assert!(!o.is_success());
+    }
+
+    #[tokio::test]
+    async fn s347_e2e_401_json_is_unauthorized() {
+        let addr = s347_spawn_writeback_mock(Some(s347_http_canned(
+            "401 Unauthorized",
+            "application/json",
+            r#"{"message":"Unauthorized"}"#,
+        )))
+        .await;
+        let o = s347_run_writeback(&addr).await;
+        assert!(
+            matches!(o, WritebackOutcome::Unauthorized { .. }),
+            "got {o:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s347_e2e_500_json_is_app_errored_and_retryable() {
+        let addr = s347_spawn_writeback_mock(Some(s347_http_canned(
+            "500 Internal Server Error",
+            "application/json",
+            r#"{"error":"db down"}"#,
+        )))
+        .await;
+        let o = s347_run_writeback(&addr).await;
+        assert!(
+            matches!(o, WritebackOutcome::AppErrored { .. }),
+            "got {o:?}"
+        );
+        assert!(o.retryable());
+        assert_eq!(o.failure_kind(), FailureKind::Transient);
+    }
+
+    #[tokio::test]
+    async fn s347_e2e_200_json_missing_status_is_malformed() {
+        let addr = s347_spawn_writeback_mock(Some(s347_http_canned(
+            "200 OK",
+            "application/json",
+            r#"{"unexpected":"shape"}"#,
+        )))
+        .await;
+        let o = s347_run_writeback(&addr).await;
+        assert!(
+            matches!(o, WritebackOutcome::MalformedAppResponse { .. }),
+            "got {o:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s347_e2e_timeout_is_timeout() {
+        let addr = s347_spawn_writeback_mock(None).await;
+        let o = s347_run_writeback(&addr).await;
+        assert!(matches!(o, WritebackOutcome::Timeout), "got {o:?}");
+        assert!(o.retryable());
+    }
+
+    #[tokio::test]
+    async fn s347_e2e_200_valid_is_success() {
+        let addr = s347_spawn_writeback_mock(Some(s347_http_canned(
+            "200 OK",
+            "application/json",
+            r#"{"status":"quoted"}"#,
+        )))
+        .await;
+        let o = s347_run_writeback(&addr).await;
+        assert!(
+            matches!(o, WritebackOutcome::Success { idempotent: false }),
+            "got {o:?}"
+        );
+        assert!(o.is_success());
     }
 }

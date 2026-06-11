@@ -40,6 +40,67 @@ function isMarginFloorReason(errorReason: string | null | undefined): boolean {
   return errorReason.toLowerCase().includes(MARGIN_FLOOR_HINT);
 }
 
+// S347 / PR-39 (F1+F2) — granular priced-writeback transport verdicts.
+// The Rust `WritebackOutcome` prefixes every post-stage failure reason
+// with a stable `writeback:<tag>` token (see
+// `apps/aberp/src/quote_pricing_pipeline.rs`). When the SPA sees that
+// token it swaps the coarse `transient`/`permanent` chip for the precise
+// bilingual operator copy — so a CDN misroute reads "Routing
+// misconfigured", not the old `? Ismeretlen / Unknown`. Labels mirror
+// `WritebackOutcome::label_hu` / `label_en`; the className mirrors the
+// retryable split (`chip--running` = retryable, `chip--err` = operator
+// must act). Keep this map in sync with the Rust enum.
+const WRITEBACK_BADGES: Record<string, FailureKindBadge> = {
+  routing_misconfigured: {
+    label: "🛑 Útvonal-hiba / Routing misconfigured",
+    className: "chip chip--err",
+  },
+  unauthorized: {
+    label: "🛑 Hitelesítési hiba / Unauthorized",
+    className: "chip chip--err",
+  },
+  forbidden: {
+    label: "🛑 Hozzáférés megtagadva / Forbidden",
+    className: "chip chip--err",
+  },
+  non_json_response: {
+    label: "🛑 Nem-JSON válasz / Non-JSON response",
+    className: "chip chip--err",
+  },
+  malformed_app_response: {
+    label: "🛑 Hibás válasz-szerkezet / Malformed app response",
+    className: "chip chip--err",
+  },
+  app_rejected: {
+    label: "🛑 Storefront elutasította / Storefront rejected",
+    className: "chip chip--err",
+  },
+  app_errored: {
+    label: "↻ Storefront szerverhiba / Storefront server error",
+    className: "chip chip--running",
+  },
+  timeout: {
+    label: "↻ Időtúllépés / Timeout",
+    className: "chip chip--running",
+  },
+  transport_error: {
+    label: "↻ Hálózati hiba / Transport error",
+    className: "chip chip--running",
+  },
+};
+
+/** Pull the `writeback:<tag>` token out of an error reason and resolve it
+ *  to the granular badge. `null` when the reason is not a typed
+ *  priced-writeback verdict (legacy rows, non-post-stage failures). */
+function writebackBadge(
+  errorReason: string | null | undefined,
+): FailureKindBadge | null {
+  if (!errorReason) return null;
+  const match = /(?:^|\s)writeback:([a-z_]+)/.exec(errorReason.toLowerCase());
+  if (!match) return null;
+  return WRITEBACK_BADGES[match[1]] ?? null;
+}
+
 /** Closed-vocab classifier. `null` (legacy PROD_v2.27.[0-5] Failed rows)
  *  and the explicit `"unknown"` verdict share the same neutral badge.
  *
@@ -51,6 +112,13 @@ export function failureKindBadge(
   failureKind: string | null,
   errorReason?: string | null,
 ): FailureKindBadge | null {
+  // S347 / PR-39 — a typed priced-writeback verdict wins over the coarse
+  // failure_kind chip: the operator needs "Routing misconfigured", not the
+  // generic "Operator retry required". Non-writeback reasons (engine
+  // permanent failures, etc.) fall through to the switch below unchanged.
+  const writeback = writebackBadge(errorReason);
+  if (writeback) return writeback;
+
   switch (failureKind) {
     case "permanent":
       if (isMarginFloorReason(errorReason)) {

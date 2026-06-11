@@ -985,7 +985,11 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // failure_kind), never NAV XML bytes. Exhaustiveness arm only.
         | EventKind::QuotePdfRerenderEnqueued
         | EventKind::QuotePdfRerendered
-        | EventKind::QuotePdfRerenderFailed => (None, ""),
+        | EventKind::QuotePdfRerenderFailed
+        // S347 / PR-39 — priced-writeback transport verdict. App-layer JSON
+        // payload (quote_id / outcome tag / http_status / content_type /
+        // body_excerpt), never NAV XML bytes. Exhaustiveness arm only.
+        | EventKind::QuotePricedWritebackOutcome => (None, ""),
     };
 
     Ok(NavExtraction {

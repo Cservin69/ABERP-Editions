@@ -857,7 +857,10 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // JSON payloads, never NAV XML bytes.
         | EventKind::QuotePdfRerenderEnqueued
         | EventKind::QuotePdfRerendered
-        | EventKind::QuotePdfRerenderFailed => None,
+        | EventKind::QuotePdfRerenderFailed
+        // S347 / PR-39 — priced-writeback transport verdict. App-layer JSON
+        // payload, never NAV XML bytes.
+        | EventKind::QuotePricedWritebackOutcome => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce

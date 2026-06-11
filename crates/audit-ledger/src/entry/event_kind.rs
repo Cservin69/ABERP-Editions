@@ -1718,6 +1718,29 @@ pub enum EventKind {
     /// F12 four-edit ritual fires once.
     QuotePricingFailureClassified,
 
+    /// S347 / PR-39 (F1+F2) — the per-attempt transport-vs-app verdict for a
+    /// single priced-writeback POST against the storefront. Distinct from
+    /// [`Self::QuotePricingFailed`]/[`Self::QuotePricingFailureClassified`]
+    /// (which are job-level, coarse `transient`/`permanent`/`unknown`): this
+    /// row carries the *granular* outcome — `routing_misconfigured`,
+    /// `unauthorized`, `non_json_response`, `app_errored`, `timeout`, … —
+    /// plus the structured `http_status` + `content_type` + `body_excerpt`
+    /// so an operator can tell a CDN misroute (HTML-as-JSON, the 2026-06-11
+    /// incident) from an auth failure from a real 5xx without parsing the
+    /// free-text reason. Emitted on EVERY writeback attempt (success too)
+    /// so the forensic walker sees the full delivery history.
+    ///
+    /// Carries `quote_id`, `tenant_id`, `outcome` (closed-vocab tag),
+    /// `http_status` (nullable — transport failures never reached a
+    /// response), `content_type` (nullable), `body_excerpt` (nullable,
+    /// bearer-scrubbed, ≤200 chars), `retryable`, `attempt_n`, `actor`
+    /// (`"system"`), `idempotency_key`
+    /// (`quote_priced_writeback_outcome:<quote_id>:<attempt_n>`).
+    ///
+    /// `quote.*` prefix family. Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricedWritebackOutcome,
+
     /// S307 / PR-276 — one entry per email-outbox poll cycle. Fires
     /// once per successful `GET /api/internal/email-queue` against the
     /// storefront, regardless of whether the cycle returned 0 entries
@@ -1947,6 +1970,7 @@ impl EventKind {
             EventKind::QuotePricingDaemonPanicked => "quote.pricing_daemon_panicked",
             EventKind::QuotePricingJobsIndexMigrated => "quote.pricing_jobs_index_migrated",
             EventKind::QuotePricingFailureClassified => "quote.pricing_failure_classified",
+            EventKind::QuotePricedWritebackOutcome => "quote.priced_writeback_outcome",
             EventKind::EmailOutboxFetched => "quote.email_outbox_fetched",
             EventKind::EmailOutboxClaimed => "quote.email_outbox_claimed",
             EventKind::EmailOutboxSent => "quote.email_outbox_sent",
@@ -2059,6 +2083,7 @@ impl EventKind {
             "quote.pricing_daemon_panicked" => Ok(EventKind::QuotePricingDaemonPanicked),
             "quote.pricing_jobs_index_migrated" => Ok(EventKind::QuotePricingJobsIndexMigrated),
             "quote.pricing_failure_classified" => Ok(EventKind::QuotePricingFailureClassified),
+            "quote.priced_writeback_outcome" => Ok(EventKind::QuotePricedWritebackOutcome),
             "quote.email_outbox_fetched" => Ok(EventKind::EmailOutboxFetched),
             "quote.email_outbox_claimed" => Ok(EventKind::EmailOutboxClaimed),
             "quote.email_outbox_sent" => Ok(EventKind::EmailOutboxSent),
@@ -2163,6 +2188,7 @@ mod tests {
             EventKind::QuotePricingDaemonPanicked,
             EventKind::QuotePricingJobsIndexMigrated,
             EventKind::QuotePricingFailureClassified,
+            EventKind::QuotePricedWritebackOutcome,
             EventKind::EmailOutboxFetched,
             EventKind::EmailOutboxClaimed,
             EventKind::EmailOutboxSent,
@@ -4071,6 +4097,36 @@ mod tests {
                     sibling.as_str()
                 );
             }
+        }
+    }
+
+    /// S347 / PR-39 (F1+F2) — F12 ritual for the priced-writeback-outcome
+    /// kind: round-trips, carries the `quote.` prefix, and is distinct from
+    /// every pricing sibling so a granular transport verdict can never be
+    /// mis-bucketed as a coarse job-failure row (CLAUDE.md rule 12).
+    #[test]
+    fn s347_priced_writeback_outcome_kind_round_trips_and_is_distinct() {
+        let k = EventKind::QuotePricedWritebackOutcome;
+        let s = k.as_str();
+        assert_eq!(s, "quote.priced_writeback_outcome");
+        assert!(s.starts_with("quote."), "{s} must start with quote.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+        for sibling in [
+            EventKind::QuotePricingPosted,
+            EventKind::QuotePricingFailed,
+            EventKind::QuotePricingFailureClassified,
+            EventKind::QuotePricingRendered,
+        ] {
+            assert_ne!(
+                s,
+                sibling.as_str(),
+                "{s} collides with {}",
+                sibling.as_str()
+            );
         }
     }
 }

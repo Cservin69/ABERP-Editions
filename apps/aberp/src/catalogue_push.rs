@@ -286,7 +286,10 @@ impl PushOutcome {
 /// HTML error page can't bloat the ledger.
 const RESPONSE_EXCERPT_MAX: usize = 200;
 
-fn response_excerpt(body: &str) -> String {
+// S347 / PR-39 — `pub(crate)` so the priced-writeback classifier
+// (`quote_pricing_pipeline`) reuses the same bearer-scrubbed, 200-char
+// bound rather than duplicating the helper (CLAUDE.md #8).
+pub(crate) fn response_excerpt(body: &str) -> String {
     scrub(body.trim())
         .chars()
         .take(RESPONSE_EXCERPT_MAX)
