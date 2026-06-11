@@ -2033,6 +2033,66 @@ pub enum EventKind {
     /// `personnel.*` prefix family — same segregation rationale as
     /// [`Self::PersonnelIdRegistered`].
     PersonnelAccessDenied,
+
+    /// S357 / PR-44 (ADR-0074) — a material certificate (mill cert / 3.1
+    /// CoC / Certificate of Analysis / heat-treatment cert) was attached to
+    /// a `quoting_materials` catalogue row. FIRST member of the new
+    /// `material.*` prefix family — the material-traceability strand of the
+    /// aerospace pivot (`[[defense-aerospace-pivot]]`). This is the AS9100D
+    /// §7.5.9 "control of monitoring and measuring equipment" / §8.5.2
+    /// identification-and-traceability *record* anchor: a durable,
+    /// hash-chained note that a cert document now backs this grade.
+    ///
+    /// Deliberately a RECORD event (a cert was filed), NOT a state
+    /// transition — see ADR-0074 for why it is split from
+    /// [`Self::MaterialHeatLotAssigned`]. A grade may accrue many certs over
+    /// its life; each attach is its own append-only landmark.
+    ///
+    /// Payload (`serde_json::Value`): `material_id` (the `quoting_materials`
+    /// grade / row key the cert backs), `cert_kind` (the certificate-class
+    /// discriminator — e.g. `mill_cert` / `cofa` / `heat_treatment`),
+    /// `cert_url` (where the cert document is retained), `attached_at_ms`
+    /// (epoch-ms stamp of the attach), `attached_by_operator_id` (who filed
+    /// it — the accountability anchor), and an optional `lot_id` (the
+    /// specific lot the cert covers, when the attach is lot-scoped rather
+    /// than grade-wide).
+    ///
+    /// `material.*` prefix family — NOT `invoice.*` / `system.*` / `mes.*` /
+    /// `quote.*` / `inventory.*` / `email.*` / `personnel.*`. A new prefix
+    /// keeps the traceability surface globbable on its own
+    /// (`material.*` = "every cert / lot-heat assignment on this install")
+    /// without sweeping fiscal, manufacturing, quoting, or access-trail
+    /// traffic — and the per-OUTGOING-invoice export bundle's `invoice.*`
+    /// glob (ADR-0009 §8) never sweeps a material-traceability row by
+    /// construction.
+    ///
+    /// S357 ships the kind only; firing sites land in a later session. F12
+    /// four-edit ritual fires once for the two sibling `material.*` kinds.
+    MaterialCertAttached,
+
+    /// S357 / PR-44 (ADR-0074) — a lot + heat was assigned to a material
+    /// instance for traceability. The DFARS 252.225-7008-style "specialty
+    /// metals" / AS9100D §8.5.2 traceability *state transition*: this
+    /// material instance is now bound to mill heat H of lot L (optionally
+    /// from a named supplier). Distinct from [`Self::MaterialCertAttached`]
+    /// (which merely files a document) — this kind records the load-bearing
+    /// identity binding a part's traceability chain resolves through.
+    ///
+    /// Carries the validated identity types from
+    /// [`aberp_compliance::lot_heat`] (`LotId` / `HeatId`); the firing site
+    /// (later session) constructs them, so an invalid lot/heat string can
+    /// never reach the ledger.
+    ///
+    /// Payload (`serde_json::Value`): `material_id` (the `quoting_materials`
+    /// grade / row key), `lot_id` (validated `LotId` string), `heat_id`
+    /// (validated `HeatId` string), an optional `source_supplier` (the AVL
+    /// supplier the lot was sourced from, when known), `assigned_at_ms`
+    /// (epoch-ms stamp), and `assigned_by_operator_id` (who made the
+    /// binding).
+    ///
+    /// `material.*` prefix family — same segregation rationale as
+    /// [`Self::MaterialCertAttached`].
+    MaterialHeatLotAssigned,
 }
 
 impl EventKind {
@@ -2142,6 +2202,8 @@ impl EventKind {
             EventKind::PersonnelSignatureApplied => "personnel.signature_applied",
             EventKind::PersonnelAccessGranted => "personnel.access_granted",
             EventKind::PersonnelAccessDenied => "personnel.access_denied",
+            EventKind::MaterialCertAttached => "material.cert_attached",
+            EventKind::MaterialHeatLotAssigned => "material.heat_lot_assigned",
         }
     }
 
@@ -2262,6 +2324,8 @@ impl EventKind {
             "personnel.signature_applied" => Ok(EventKind::PersonnelSignatureApplied),
             "personnel.access_granted" => Ok(EventKind::PersonnelAccessGranted),
             "personnel.access_denied" => Ok(EventKind::PersonnelAccessDenied),
+            "material.cert_attached" => Ok(EventKind::MaterialCertAttached),
+            "material.heat_lot_assigned" => Ok(EventKind::MaterialHeatLotAssigned),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2374,6 +2438,8 @@ mod tests {
             EventKind::PersonnelSignatureApplied,
             EventKind::PersonnelAccessGranted,
             EventKind::PersonnelAccessDenied,
+            EventKind::MaterialCertAttached,
+            EventKind::MaterialHeatLotAssigned,
         ];
         for v in variants {
             let s = v.as_str();
@@ -4627,5 +4693,152 @@ mod tests {
         assert!(parsed["resource_kind"].is_string());
         assert!(parsed["resource_id"].is_string());
         assert!(parsed["denied_reason"].is_string());
+    }
+
+    // ── S357 / PR-44 (ADR-0074) — material.* traceability family ───────────
+    //
+    // Two kinds open the new `material.*` prefix family: the cert-attach
+    // RECORD event and the heat/lot-assign STATE TRANSITION. Per the brief
+    // each variant gets a focused round-trip test, each payload shape is
+    // pinned by a serialization test, the family shares one
+    // prefix-and-distinctness test, and a no-NAV-bytes pin lives with the
+    // exhaustive-match consumers (`aberp-verify`, `export_invoice_bundle`).
+
+    #[test]
+    fn s357_material_cert_attached_round_trips() {
+        let k = EventKind::MaterialCertAttached;
+        let s = k.as_str();
+        assert_eq!(s, "material.cert_attached");
+        assert!(s.starts_with("material."), "{s} must start with material.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    #[test]
+    fn s357_material_heat_lot_assigned_round_trips() {
+        let k = EventKind::MaterialHeatLotAssigned;
+        let s = k.as_str();
+        assert_eq!(s, "material.heat_lot_assigned");
+        assert!(s.starts_with("material."), "{s} must start with material.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    /// S357 — the two `material.*` kinds share the new prefix family, carry
+    /// NO other prefix, and are distinct from each other AND from a sample of
+    /// every other prefix family. A collision (or a wrong prefix) would
+    /// either mis-bucket a traceability row into a fiscal / manufacturing /
+    /// quoting / access-trail bucket OR let the per-OUTGOING-invoice export
+    /// bundle's `invoice.*` glob sweep a material-traceability row — both are
+    /// the silent-omission failure mode CLAUDE.md rule 12 names.
+    #[test]
+    fn s357_material_kinds_use_material_prefix_and_are_distinct() {
+        let new = [
+            EventKind::MaterialCertAttached,
+            EventKind::MaterialHeatLotAssigned,
+        ];
+        for k in &new {
+            let s = k.as_str();
+            assert!(s.starts_with("material."), "{s} must start with material.");
+            for foreign in [
+                "invoice.",
+                "system.",
+                "mes.",
+                "quote.",
+                "inventory.",
+                "email.",
+                "personnel.",
+            ] {
+                assert!(!s.starts_with(foreign), "{s} must not start with {foreign}");
+            }
+        }
+        // Distinct within the family.
+        assert_ne!(
+            new[0].as_str(),
+            new[1].as_str(),
+            "{} collides with {}",
+            new[0].as_str(),
+            new[1].as_str()
+        );
+        // Distinct from a sample sibling per other prefix family — including
+        // the `Material*`-named-but-not-`material.*`-prefixed kinds, which
+        // live under `quote.*` (catalogue) and `inventory.*` (reservation).
+        let strs: Vec<&str> = new.iter().map(EventKind::as_str).collect();
+        for k in &strs {
+            for sibling in [
+                EventKind::InvoiceDraftCreated,
+                EventKind::FirstProdLaunchAcknowledged,
+                EventKind::MesAdapterEvent,
+                EventKind::QuotePricingOperatorAccepted,
+                EventKind::MaterialCatalogueChanged,
+                EventKind::MaterialReserved,
+                EventKind::EmailRelaySent,
+                EventKind::PersonnelIdRegistered,
+            ] {
+                assert_ne!(
+                    *k,
+                    sibling.as_str(),
+                    "{k} collides with foreign-family {}",
+                    sibling.as_str()
+                );
+            }
+        }
+    }
+
+    /// S357 — pin the documented `material.cert_attached` payload shape so a
+    /// future firing site has a stable contract. The kind stores a free-form
+    /// `serde_json::Value` (same posture as the `personnel.*` and recent
+    /// `quote.*` kinds); this asserts the documented fields are present with
+    /// the documented JSON types after a serialize → parse round-trip. The
+    /// optional `lot_id` is exercised so the lot-scoped attach is pinned too.
+    #[test]
+    fn s357_material_cert_attached_payload_serializes() {
+        let payload = serde_json::json!({
+            "material_id": "6061-T6",
+            "cert_kind": "mill_cert",
+            "cert_url": "https://certs.example/coc/abc123.pdf",
+            "attached_at_ms": 1_750_000_000_000_i64,
+            "attached_by_operator_id": "mock-op-001",
+            "lot_id": "LOT-2026-0042",
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["material_id"].is_string());
+        assert!(parsed["cert_kind"].is_string());
+        assert!(parsed["cert_url"].is_string());
+        assert!(parsed["attached_at_ms"].is_i64());
+        assert!(parsed["attached_by_operator_id"].is_string());
+        assert!(parsed["lot_id"].is_string());
+    }
+
+    /// S357 — pin the documented `material.heat_lot_assigned` payload shape.
+    /// `lot_id` + `heat_id` are the load-bearing traceability anchors (the
+    /// firing site validates them through `aberp_compliance::lot_heat`
+    /// before they reach the ledger) and must both survive as strings;
+    /// `source_supplier` is optional.
+    #[test]
+    fn s357_material_heat_lot_assigned_payload_serializes() {
+        let payload = serde_json::json!({
+            "material_id": "Ti-6Al-4V",
+            "lot_id": "LOT-2026-0042",
+            "heat_id": "HEAT-9F3A",
+            "source_supplier": "ACME-METALS-AVL-007",
+            "assigned_at_ms": 1_750_000_000_000_i64,
+            "assigned_by_operator_id": "mock-op-001",
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["material_id"].is_string());
+        assert!(parsed["lot_id"].is_string());
+        assert!(parsed["heat_id"].is_string());
+        assert!(parsed["source_supplier"].is_string());
+        assert!(parsed["assigned_at_ms"].is_i64());
+        assert!(parsed["assigned_by_operator_id"].is_string());
     }
 }

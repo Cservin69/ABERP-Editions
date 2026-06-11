@@ -68,6 +68,41 @@ CREATE TABLE IF NOT EXISTS quoting_materials (
 );
 ";
 
+/// S357 / PR-44 (ADR-0074) — additive material-traceability columns, the
+/// data-model half of the `material.*` audit family. All four are nullable
+/// and carry NO SQL `DEFAULT` — see the DuckDB DEFAULT-on-replay trap pinned
+/// on [`QUOTING_MATERIALS_SCHEMA_SQL`] (and the same evidence trail on
+/// `aberp_quote_intake::log_table::S271_MIGRATION_SQL`): `ALTER TABLE … ADD
+/// COLUMN IF NOT EXISTS … DEFAULT V` re-applies `V` on every replay, and
+/// `ensure_schema` runs at the top of every writer, so a DEFAULT-bearing
+/// column would be clobbered on every unrelated `set_*` call. NULL is the
+/// "not yet captured" sentinel; the future firing site (later session)
+/// coerces / interprets NULL in the app layer.
+///
+/// - `current_lot_id VARCHAR` — the material instance's current lot, written
+///   by the `material.heat_lot_assigned` firing site. Validated against the
+///   `[A-Za-z0-9-]` ≤32 [`aberp_compliance::lot_heat::LotId`] format at the
+///   write boundary (NOT a DB CHECK, per [[no-sql-specific]]).
+/// - `current_heat_id VARCHAR` — the mill heat the current lot was poured
+///   from; same [`aberp_compliance::lot_heat::HeatId`] validation at write.
+/// - `cert_url VARCHAR` — where the last attached material certificate is
+///   retained, mirrored from the `material.cert_attached` payload.
+/// - `cert_attached_at VARCHAR` — RFC3339 stamp of the last cert attach.
+///   VARCHAR (not a SQL `TIMESTAMP`) to match this table's `updated_at`
+///   convention (module doc §"Timestamps are stored as RFC3339 VARCHAR");
+///   keeping one timestamp representation per table beats matching the
+///   brief's loose "timestamp" wording. Flagged in the PR report.
+const S357_MIGRATION_SQL: &str = "
+ALTER TABLE quoting_materials
+    ADD COLUMN IF NOT EXISTS current_lot_id VARCHAR;
+ALTER TABLE quoting_materials
+    ADD COLUMN IF NOT EXISTS current_heat_id VARCHAR;
+ALTER TABLE quoting_materials
+    ADD COLUMN IF NOT EXISTS cert_url VARCHAR;
+ALTER TABLE quoting_materials
+    ADD COLUMN IF NOT EXISTS cert_attached_at VARCHAR;
+";
+
 // ── Closed-vocab stock status ───────────────────────────────────────────
 
 /// Sourcing posture for a grade. Closed-vocab, snake_case on the wire and
@@ -286,6 +321,11 @@ fn check_non_negative(errors: &mut Vec<ValidationError>, field: &'static str, v:
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(QUOTING_MATERIALS_SCHEMA_SQL)
         .context("ensure quoting_materials schema")?;
+    // S357 / PR-44 — additive material-traceability columns. Idempotent on a
+    // post-S357 boot (each ALTER is `IF NOT EXISTS`); fills pre-S357 rows
+    // with NULL (no lot/heat/cert captured yet — the "not yet traced" state).
+    conn.execute_batch(S357_MIGRATION_SQL)
+        .context("apply S357 quoting_materials traceability migration")?;
     Ok(())
 }
 
@@ -1126,5 +1166,125 @@ mod tests {
             |r| r.get(0),
         )
         .expect("count audit")
+    }
+
+    /// S357 / PR-44 (ADR-0074) — the additive traceability migration is
+    /// idempotent: `ensure_schema` (which runs `S357_MIGRATION_SQL` after the
+    /// `CREATE TABLE IF NOT EXISTS`) may be called any number of times without
+    /// error, and — critically — a value written to one of the new columns
+    /// SURVIVES a subsequent `ensure_schema` call. The survival assertion is
+    /// the real teeth: it proves the columns carry NO SQL `DEFAULT`, so the
+    /// DuckDB DEFAULT-on-replay trap (which would clobber the value on every
+    /// unrelated writer's `ensure_schema` call) does not fire. A "no error"
+    /// check alone could pass while the trap silently reset the data.
+    #[test]
+    fn s357_traceability_migration_is_idempotent_and_does_not_clobber() {
+        let mut c = conn();
+        // conn() already ran ensure_schema once; running it again must be a
+        // no-op (idempotent — the four ALTERs are `IF NOT EXISTS`).
+        ensure_schema(&c).expect("second ensure_schema is a no-op");
+
+        // Seed a row, then directly populate the new columns (no firing site
+        // exists yet — this stands in for the future writer).
+        seed_if_empty(&mut c, TENANT).expect("seed");
+        let grade: String = c
+            .query_row("SELECT grade FROM quoting_materials LIMIT 1;", [], |r| {
+                r.get(0)
+            })
+            .expect("read a seeded grade");
+        c.execute(
+            "UPDATE quoting_materials
+             SET current_lot_id = 'LOT-2026-0042',
+                 current_heat_id = 'HEAT-9F3A',
+                 cert_url = 'https://certs.example/coc/abc123.pdf',
+                 cert_attached_at = '2026-06-11T10:00:00Z'
+             WHERE grade = ?;",
+            params![grade],
+        )
+        .expect("populate traceability columns");
+
+        // Replay the migration twice more — the DEFAULT-on-replay trap, if it
+        // existed, would clobber the values here.
+        ensure_schema(&c).expect("third ensure_schema");
+        ensure_schema(&c).expect("fourth ensure_schema");
+
+        let (lot, heat, url, at): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = c
+            .query_row(
+                "SELECT current_lot_id, current_heat_id, cert_url, cert_attached_at
+                 FROM quoting_materials WHERE grade = ?;",
+                params![grade],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("read back traceability columns");
+        assert_eq!(lot.as_deref(), Some("LOT-2026-0042"), "lot clobbered");
+        assert_eq!(heat.as_deref(), Some("HEAT-9F3A"), "heat clobbered");
+        assert_eq!(
+            url.as_deref(),
+            Some("https://certs.example/coc/abc123.pdf"),
+            "cert_url clobbered"
+        );
+        assert_eq!(
+            at.as_deref(),
+            Some("2026-06-11T10:00:00Z"),
+            "cert_attached_at clobbered"
+        );
+
+        // A pre-S357 row (one never touched by the writer) reads NULL on all
+        // four new columns — the documented "not yet traced" sentinel.
+        let null_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM quoting_materials
+                 WHERE grade <> ?
+                   AND current_lot_id IS NULL
+                   AND current_heat_id IS NULL
+                   AND cert_url IS NULL
+                   AND cert_attached_at IS NULL;",
+                params![grade],
+                |r| r.get(0),
+            )
+            .expect("count untouched rows");
+        assert!(
+            null_count > 0,
+            "untouched rows must read NULL on the new traceability columns"
+        );
+    }
+
+    /// S357 / PR-44 (ADR-0074) — the `current_lot_id` / `current_heat_id`
+    /// columns are validated against the `aberp-compliance` newtype format at
+    /// the (future) write boundary, NOT a DB CHECK (per [[no-sql-specific]]).
+    /// This pins that the newtypes the firing site will use accept the
+    /// documented well-formed ids and reject the malformed ones — so a value
+    /// that lands in `current_lot_id` is always `[A-Za-z0-9-]` ≤32. (No
+    /// production writer exists yet; this asserts the validation contract the
+    /// writer inherits.)
+    #[test]
+    fn s357_lot_and_heat_ids_validate_via_compliance_newtypes() {
+        use aberp_compliance::lot_heat::{HeatId, LotId};
+
+        // Well-formed ids round-trip through the validated newtypes.
+        let lot = LotId::new("LOT-2026-0042").expect("valid lot id");
+        let heat = HeatId::new("HEAT-9F3A").expect("valid heat id");
+        assert_eq!(lot.as_str(), "LOT-2026-0042");
+        assert_eq!(heat.as_str(), "HEAT-9F3A");
+
+        // Malformed ids are rejected, so they can never reach the column.
+        assert!(LotId::new("").is_err(), "empty lot id must reject");
+        assert!(
+            LotId::new("LOT 0042").is_err(),
+            "whitespace lot id must reject"
+        );
+        assert!(
+            HeatId::new("HEAT_9F3A").is_err(),
+            "underscore heat id must reject"
+        );
+        assert!(
+            HeatId::new("H".repeat(33)).is_err(),
+            "over-length heat id must reject"
+        );
     }
 }

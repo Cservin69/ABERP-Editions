@@ -1010,7 +1010,14 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::PersonnelIdRegistered
         | EventKind::PersonnelSignatureApplied
         | EventKind::PersonnelAccessGranted
-        | EventKind::PersonnelAccessDenied => (None, ""),
+        | EventKind::PersonnelAccessDenied
+        // S357 / PR-44 — material.* traceability family (ADR-0074).
+        // Cert-attach record + heat/lot-assign state transition; app-layer
+        // JSON payloads (material_id / cert_kind / lot_id / heat_id / …),
+        // never NAV XML bytes. `material.*`-not-`invoice.*` posture; never
+        // sweeps a per-OUTGOING-invoice bundle. Exhaustiveness arm only.
+        | EventKind::MaterialCertAttached
+        | EventKind::MaterialHeatLotAssigned => (None, ""),
     };
 
     Ok(NavExtraction {
