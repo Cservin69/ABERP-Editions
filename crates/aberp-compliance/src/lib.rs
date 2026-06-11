@@ -21,7 +21,8 @@
 //! slots in behind later (mock-first, per `[[mock-everything-principle]]`):
 //!
 //! - [`export_control`] — [`ExportControlProvider`] trait + classification /
-//!   screening types + [`MockExportControlProvider`].
+//!   screening types + [`Jurisdiction`] (ITAR / EAR / EAR99 / NOT_CONTROLLED /
+//!   UNKNOWN regime axis, S359) + [`MockExportControlProvider`].
 //! - [`cui`] — [`CuiMarking`] / [`CuiCategory`] + marking helpers.
 //! - [`lot_heat`] — validated [`LotId`] / [`HeatId`] newtypes +
 //!   [`MaterialTraceabilitySeed`].
@@ -36,6 +37,7 @@
 //! reference these types, the e-signature ceremony, the SPA surfaces.
 //!
 //! [`ExportControlProvider`]: export_control::ExportControlProvider
+//! [`Jurisdiction`]: export_control::Jurisdiction
 //! [`MockExportControlProvider`]: export_control::MockExportControlProvider
 //! [`CuiMarking`]: cui::CuiMarking
 //! [`CuiCategory`]: cui::CuiCategory

@@ -889,7 +889,15 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // payloads, never NAV XML bytes. `part.*`-not-`invoice.*` posture;
         // never sweeps a per-OUTGOING-invoice export bundle by glob.
         | EventKind::PartSerialAssigned
-        | EventKind::PartUidMarked => None,
+        | EventKind::PartUidMarked
+        // S359 / PR-46 — export.* export-control family (ADR-0076).
+        // Classification record + access-check decision + shipment-logged
+        // export; app-layer JSON payloads, never NAV XML bytes. `export.*`-not-
+        // `invoice.*` posture; never sweeps a per-OUTGOING-invoice export
+        // bundle by glob.
+        | EventKind::ExportClassificationSet
+        | EventKind::ExportAccessCheck
+        | EventKind::ExportShipmentLogged => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1617,6 +1625,35 @@ mod tests {
                 .append(
                     kind.clone(),
                     br#"{"part_id":"PRT-7781"}"#.to_vec(),
+                    actor,
+                    None,
+                )
+                .unwrap();
+            let entries = ledger.entries().unwrap();
+            let nav = extract_nav_xml(&entries[0]).unwrap();
+            assert!(nav.is_none(), "{} must produce no nav/ file", kind.as_str());
+        }
+    }
+
+    /// S359 / PR-46 (ADR-0076) — the three `export.*` export-control kinds
+    /// carry app-layer JSON payloads, never NAV XML, so `extract_nav_xml` MUST
+    /// return `None` for each. The Rust exhaustiveness check already forces the
+    /// new variants into the no-NAV-bytes arm at compile time; this is the
+    /// belt-and-braces runtime pin that the verdict actually holds, so an
+    /// export-control row never produces a `nav/` file in a per-OUTGOING-invoice
+    /// export bundle.
+    #[test]
+    fn extract_nav_xml_returns_none_for_export_kinds() {
+        for kind in [
+            EventKind::ExportClassificationSet,
+            EventKind::ExportAccessCheck,
+            EventKind::ExportShipmentLogged,
+        ] {
+            let (mut ledger, actor, _bh) = fixture_ledger();
+            ledger
+                .append(
+                    kind.clone(),
+                    br#"{"entity_id":"DWG-7781-A"}"#.to_vec(),
                     actor,
                     None,
                 )

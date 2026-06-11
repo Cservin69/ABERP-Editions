@@ -45,6 +45,76 @@ pub enum ExportClassification {
     Pending,
 }
 
+/// The export-control **jurisdiction** (regulatory regime) an item falls
+/// under — a distinct axis from [`ExportClassification`].
+///
+/// `ExportClassification` answers *"what is the code?"* (an ECCN string, a USML
+/// category string, or the bare EAR99 catch-all). `Jurisdiction` answers *"which
+/// body of law governs it?"* — the question the `export.classification_set`
+/// audit event's `jurisdiction` field records. The two overlap only at EAR99
+/// (which is both a classification and, trivially, an EAR-jurisdiction item), so
+/// they are modelled separately rather than crammed into one enum: an
+/// `ExportClassification::ITAR` variant would be a category error (ITAR is the
+/// regime; the USML category is its classification).
+///
+/// S359 adds this typed enum so the audit firing site (later session) renders
+/// the `jurisdiction` payload string through [`Jurisdiction::as_str`] — a
+/// free-text regime can never reach the ledger. The storage strings are the
+/// UPPER_SNAKE tokens the brief / ADR-0076 pin: `ITAR` / `EAR` / `EAR99` /
+/// `NOT_CONTROLLED` / `UNKNOWN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Jurisdiction {
+    /// International Traffic in Arms Regulations (22 CFR §§ 120-130) — the item
+    /// is on the United States Munitions List, controlled by the State
+    /// Department's DDTC.
+    Itar,
+    /// Export Administration Regulations (15 CFR §§ 730-774) — the item is on
+    /// the Commerce Control List, controlled by Commerce's BIS, and carries an
+    /// ECCN.
+    Ear,
+    /// EAR99 — subject to the EAR but **not** listed on the CCL. The catch-all
+    /// for most commercial items; usually exportable without a licence (subject
+    /// to embargo / denied-party screening).
+    Ear99,
+    /// Determined to be neither ITAR- nor EAR-controlled (e.g. published / public-
+    /// domain information, EAR § 734.7). A *positive* determination, distinct
+    /// from [`Self::Unknown`].
+    NotControlled,
+    /// No determination has been made yet — the conservative default the mock
+    /// boundary surfaces until a real classification service answers.
+    Unknown,
+}
+
+impl Jurisdiction {
+    /// Render in the on-disk / audit-payload form. Paired with
+    /// [`Jurisdiction::from_storage_str`] as a round-trip-proven pair (the unit
+    /// test below checks `from_storage_str(V.as_str()) == Ok(V)` for every
+    /// variant), mirroring the audit-ledger `EventKind` round-trip discipline.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Jurisdiction::Itar => "ITAR",
+            Jurisdiction::Ear => "EAR",
+            Jurisdiction::Ear99 => "EAR99",
+            Jurisdiction::NotControlled => "NOT_CONTROLLED",
+            Jurisdiction::Unknown => "UNKNOWN",
+        }
+    }
+
+    /// Parse the on-disk / audit-payload form back into a `Jurisdiction`.
+    /// Errors on unknown strings — silent fallback would mask schema drift
+    /// (CLAUDE.md rule 12, "fail loud").
+    pub fn from_storage_str(s: &str) -> Result<Self, &'static str> {
+        match s {
+            "ITAR" => Ok(Jurisdiction::Itar),
+            "EAR" => Ok(Jurisdiction::Ear),
+            "EAR99" => Ok(Jurisdiction::Ear99),
+            "NOT_CONTROLLED" => Ok(Jurisdiction::NotControlled),
+            "UNKNOWN" => Ok(Jurisdiction::Unknown),
+            _ => Err("unknown Jurisdiction storage string"),
+        }
+    }
+}
+
 /// An item that can be submitted for export classification.
 ///
 /// The provider keys on a short, stable descriptor (part number, commodity
@@ -112,4 +182,70 @@ pub trait ExportControlProvider: Send + Sync {
 
     /// Screen a party against the denied-party lists.
     fn screen_party(&self, party: &PartyRef) -> Result<ScreeningResult, ExportControlError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S359 — round-trip every `Jurisdiction` variant through the storage form,
+    /// mirroring the audit-ledger `EventKind` discipline. A future contributor
+    /// who adds a variant + `as_str` arm but forgets `from_storage_str` fails
+    /// here, not against a production audit row.
+    #[test]
+    fn s359_jurisdiction_round_trips_every_variant() {
+        for j in [
+            Jurisdiction::Itar,
+            Jurisdiction::Ear,
+            Jurisdiction::Ear99,
+            Jurisdiction::NotControlled,
+            Jurisdiction::Unknown,
+        ] {
+            let s = j.as_str();
+            assert_eq!(
+                Jurisdiction::from_storage_str(s).expect("round-trip"),
+                j,
+                "round-trip mismatch for {s}"
+            );
+        }
+    }
+
+    /// S359 — pin the exact UPPER_SNAKE tokens the brief / ADR-0076 / the
+    /// `export.classification_set` payload `jurisdiction` field depend on.
+    #[test]
+    fn s359_jurisdiction_storage_tokens_are_pinned() {
+        assert_eq!(Jurisdiction::Itar.as_str(), "ITAR");
+        assert_eq!(Jurisdiction::Ear.as_str(), "EAR");
+        assert_eq!(Jurisdiction::Ear99.as_str(), "EAR99");
+        assert_eq!(Jurisdiction::NotControlled.as_str(), "NOT_CONTROLLED");
+        assert_eq!(Jurisdiction::Unknown.as_str(), "UNKNOWN");
+    }
+
+    /// S359 — unknown strings must fail loud, never silently fall through to a
+    /// default regime (a mis-parse to `NotControlled` would be the worst-class
+    /// silent-omission bug for an export-control field).
+    #[test]
+    fn s359_jurisdiction_rejects_unknown() {
+        assert!(Jurisdiction::from_storage_str("ear").is_err());
+        assert!(Jurisdiction::from_storage_str("").is_err());
+        assert!(Jurisdiction::from_storage_str("DUAL_USE").is_err());
+    }
+
+    /// S359 — `Jurisdiction` also survives a serde JSON round-trip (it derives
+    /// `Serialize`/`Deserialize` for callers that embed it in typed structs;
+    /// the audit payload uses the `as_str` form, but the derive must stay sound).
+    #[test]
+    fn s359_jurisdiction_serde_round_trips() {
+        for j in [
+            Jurisdiction::Itar,
+            Jurisdiction::Ear,
+            Jurisdiction::Ear99,
+            Jurisdiction::NotControlled,
+            Jurisdiction::Unknown,
+        ] {
+            let json = serde_json::to_string(&j).expect("serialize");
+            let back: Jurisdiction = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(j, back);
+        }
+    }
 }

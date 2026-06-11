@@ -2151,6 +2151,81 @@ pub enum EventKind {
     /// `part.*` prefix family — same segregation rationale as
     /// [`Self::PartSerialAssigned`].
     PartUidMarked,
+
+    /// S359 / PR-46 (ADR-0076) — a drawing / spec / technical document was
+    /// export-classified. FIRST member of the new `export.*` prefix family —
+    /// the tenth — the export-control strand of the aerospace pivot
+    /// (`[[defense-aerospace-pivot]]`). This is the ITAR (22 CFR §§ 120-130) /
+    /// EAR (15 CFR §§ 730-774) jurisdiction *record* anchor: a durable,
+    /// hash-chained note that artifact A now carries a determined
+    /// classification + jurisdiction.
+    ///
+    /// The `jurisdiction` value is one of the
+    /// [`aberp_compliance::export_control::Jurisdiction`] regimes
+    /// (`ITAR` / `EAR` / `EAR99` / `NOT_CONTROLLED` / `UNKNOWN`); the firing
+    /// site (later session) renders it through that typed enum so a free-text
+    /// regime can never reach the ledger. Mis-classification is a felony, so
+    /// the determination itself comes from a licensed classification service —
+    /// never inferred here (the `MockExportControlProvider` answers
+    /// `NotClassified` until a real customer demands real backends, per
+    /// `[[mock-everything-principle]]`).
+    ///
+    /// Payload (`serde_json::Value`): `entity_kind` (what was classified — e.g.
+    /// `"drawing"` / `"spec"` / `"document"`), `entity_id` (the artifact key),
+    /// `eccn` (optional — the EAR Commerce-Control-List number when EAR-listed),
+    /// `usml_category` (optional — the USML category when ITAR-controlled),
+    /// `jurisdiction` (the regime string), `classified_by_operator_id` (who made
+    /// the determination — the accountability anchor), and `classified_at_ms`
+    /// (epoch-ms stamp).
+    ///
+    /// `export.*` prefix family — NOT `invoice.*` / `system.*` / `mes.*` /
+    /// `quote.*` / `inventory.*` / `email.*` / `personnel.*` / `material.*` /
+    /// `part.*`. A new prefix keeps the export-control surface globbable on its
+    /// own (`export.*` = "every classification / access-check / shipment on this
+    /// install") without sweeping fiscal, manufacturing, quoting, access-trail,
+    /// material-traceability, or per-unit-serialization traffic — and the
+    /// per-OUTGOING-invoice export bundle's `invoice.*` glob (ADR-0009 §8) never
+    /// sweeps an export-control row by construction.
+    ///
+    /// S359 ships the kind only; firing sites land in a later session (no
+    /// drawing/spec workflow exists yet). F12 four-edit ritual fires once for
+    /// the three sibling `export.*` kinds.
+    ExportClassificationSet,
+
+    /// S359 / PR-46 (ADR-0076) — access to an export-controlled artifact was
+    /// checked. The *decision* counterpart to
+    /// [`Self::ExportClassificationSet`]: a durable record that operator O
+    /// requested artifact A and was granted or denied. ITAR's "U.S. persons
+    /// only" deemed-export rule (22 CFR § 120.62) makes the access-decision
+    /// trail load-bearing — a foreign-person access to ITAR technical data is
+    /// itself an export — so every check is recorded, not just the denials.
+    ///
+    /// Payload (`serde_json::Value`): `entity_kind` (artifact kind), `entity_id`
+    /// (artifact key), `requesting_operator_id` (who asked), `decision`
+    /// (`"granted"` / `"denied"`), `reason` (the rule that drove the verdict),
+    /// and `checked_at_ms` (epoch-ms stamp).
+    ///
+    /// `export.*` prefix family — same segregation rationale as
+    /// [`Self::ExportClassificationSet`].
+    ExportAccessCheck,
+
+    /// S359 / PR-46 (ADR-0076) — an export-controlled shipment left. The
+    /// *physical-export* event of the family: a durable record that controlled
+    /// goods crossed to a recipient party / country under a stated
+    /// authorization. The shipment record is the artifact a BIS / DDTC auditor
+    /// resolves an export's lawfulness through (was a licence / exception
+    /// cited; was the destination embargoed).
+    ///
+    /// Payload (`serde_json::Value`): `shipment_id` (the shipment key),
+    /// `exporter_party_id` (the exporter of record), `recipient_party_id` (the
+    /// consignee), `recipient_country` (ISO 3166-1 alpha-2 destination),
+    /// `ecn_or_authorization` (optional — the licence / licence-exception / ECCN
+    /// cited), `shipped_at_ms` (epoch-ms stamp), and `shipped_by_operator_id`
+    /// (who released the shipment).
+    ///
+    /// `export.*` prefix family — same segregation rationale as
+    /// [`Self::ExportClassificationSet`].
+    ExportShipmentLogged,
 }
 
 impl EventKind {
@@ -2264,6 +2339,9 @@ impl EventKind {
             EventKind::MaterialHeatLotAssigned => "material.heat_lot_assigned",
             EventKind::PartSerialAssigned => "part.serial_assigned",
             EventKind::PartUidMarked => "part.uid_marked",
+            EventKind::ExportClassificationSet => "export.classification_set",
+            EventKind::ExportAccessCheck => "export.access_check",
+            EventKind::ExportShipmentLogged => "export.shipment_logged",
         }
     }
 
@@ -2388,6 +2466,9 @@ impl EventKind {
             "material.heat_lot_assigned" => Ok(EventKind::MaterialHeatLotAssigned),
             "part.serial_assigned" => Ok(EventKind::PartSerialAssigned),
             "part.uid_marked" => Ok(EventKind::PartUidMarked),
+            "export.classification_set" => Ok(EventKind::ExportClassificationSet),
+            "export.access_check" => Ok(EventKind::ExportAccessCheck),
+            "export.shipment_logged" => Ok(EventKind::ExportShipmentLogged),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2504,6 +2585,9 @@ mod tests {
             EventKind::MaterialHeatLotAssigned,
             EventKind::PartSerialAssigned,
             EventKind::PartUidMarked,
+            EventKind::ExportClassificationSet,
+            EventKind::ExportAccessCheck,
+            EventKind::ExportShipmentLogged,
         ];
         for v in variants {
             let s = v.as_str();
@@ -5049,5 +5133,193 @@ mod tests {
         assert!(parsed["mil_std_130_compliant"].is_boolean());
         assert!(parsed["marked_at_ms"].is_i64());
         assert!(parsed["marked_by_operator_id"].is_string());
+    }
+
+    // ── S359 / PR-46 (ADR-0076) — export.* export-control family ────────────
+    //
+    // Three kinds open the new `export.*` prefix family (the tenth): the
+    // classification RECORD event, the access-check DECISION event, and the
+    // shipment-logged PHYSICAL-EXPORT event. Per the brief each variant gets a
+    // focused round-trip test, each payload shape is pinned by a serialization
+    // test, the family shares one prefix-and-distinctness test, and a no-NAV-
+    // bytes pin lives with the exhaustive-match consumer (`export_invoice_bundle`).
+
+    #[test]
+    fn s359_export_classification_set_round_trips() {
+        let k = EventKind::ExportClassificationSet;
+        let s = k.as_str();
+        assert_eq!(s, "export.classification_set");
+        assert!(s.starts_with("export."), "{s} must start with export.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    #[test]
+    fn s359_export_access_check_round_trips() {
+        let k = EventKind::ExportAccessCheck;
+        let s = k.as_str();
+        assert_eq!(s, "export.access_check");
+        assert!(s.starts_with("export."), "{s} must start with export.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    #[test]
+    fn s359_export_shipment_logged_round_trips() {
+        let k = EventKind::ExportShipmentLogged;
+        let s = k.as_str();
+        assert_eq!(s, "export.shipment_logged");
+        assert!(s.starts_with("export."), "{s} must start with export.");
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+    }
+
+    /// S359 — the three `export.*` kinds share the new prefix family, carry NO
+    /// other prefix, and are distinct from each other AND from a sample of
+    /// every other prefix family. A collision (or a wrong prefix) would either
+    /// mis-bucket an export-control row into a fiscal / manufacturing / quoting
+    /// / access-trail / material-traceability / serialization bucket OR let the
+    /// per-OUTGOING-invoice export bundle's `invoice.*` glob sweep an export-
+    /// control row — both are the silent-omission failure mode CLAUDE.md rule
+    /// 12 names.
+    #[test]
+    fn s359_export_kinds_use_export_prefix_and_are_distinct() {
+        let new = [
+            EventKind::ExportClassificationSet,
+            EventKind::ExportAccessCheck,
+            EventKind::ExportShipmentLogged,
+        ];
+        for k in &new {
+            let s = k.as_str();
+            assert!(s.starts_with("export."), "{s} must start with export.");
+            for foreign in [
+                "invoice.",
+                "system.",
+                "mes.",
+                "quote.",
+                "inventory.",
+                "email.",
+                "personnel.",
+                "material.",
+                "part.",
+            ] {
+                assert!(!s.starts_with(foreign), "{s} must not start with {foreign}");
+            }
+        }
+        // Distinct within the family.
+        let strs: Vec<&str> = new.iter().map(EventKind::as_str).collect();
+        for i in 0..strs.len() {
+            for j in (i + 1)..strs.len() {
+                assert_ne!(strs[i], strs[j], "{} collides with {}", strs[i], strs[j]);
+            }
+        }
+        // Distinct from a sample sibling per other prefix family.
+        for k in &strs {
+            for sibling in [
+                EventKind::InvoiceDraftCreated,
+                EventKind::FirstProdLaunchAcknowledged,
+                EventKind::MesAdapterEvent,
+                EventKind::QuotePricingOperatorAccepted,
+                EventKind::MaterialCatalogueChanged,
+                EventKind::MaterialReserved,
+                EventKind::EmailRelaySent,
+                EventKind::PersonnelIdRegistered,
+                EventKind::MaterialCertAttached,
+                EventKind::PartSerialAssigned,
+            ] {
+                assert_ne!(
+                    *k,
+                    sibling.as_str(),
+                    "{k} collides with foreign-family {}",
+                    sibling.as_str()
+                );
+            }
+        }
+    }
+
+    /// S359 — pin the documented `export.classification_set` payload shape so a
+    /// future firing site has a stable contract. The kind stores a free-form
+    /// `serde_json::Value` (same posture as the `part.*` / `material.*` kinds);
+    /// this asserts the documented fields are present with the documented JSON
+    /// types after a serialize → parse round-trip. The optional `eccn` /
+    /// `usml_category` are exercised so the EAR-listed / ITAR-controlled shapes
+    /// are pinned too.
+    #[test]
+    fn s359_export_classification_set_payload_serializes() {
+        let payload = serde_json::json!({
+            "entity_kind": "drawing",
+            "entity_id": "DWG-7781-A",
+            "eccn": "7A994",
+            "usml_category": "VIII(h)",
+            "jurisdiction": "ITAR",
+            "classified_by_operator_id": "mock-op-001",
+            "classified_at_ms": 1_750_000_000_000_i64,
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["entity_kind"].is_string());
+        assert!(parsed["entity_id"].is_string());
+        assert!(parsed["eccn"].is_string());
+        assert!(parsed["usml_category"].is_string());
+        assert!(parsed["jurisdiction"].is_string());
+        assert!(parsed["classified_by_operator_id"].is_string());
+        assert!(parsed["classified_at_ms"].is_i64());
+    }
+
+    /// S359 — pin the documented `export.access_check` payload shape. `decision`
+    /// must survive as the `"granted"` / `"denied"` string the firing site
+    /// writes.
+    #[test]
+    fn s359_export_access_check_payload_serializes() {
+        let payload = serde_json::json!({
+            "entity_kind": "spec",
+            "entity_id": "SPEC-3001",
+            "requesting_operator_id": "mock-op-002",
+            "decision": "denied",
+            "reason": "requester not a U.S. person (ITAR 22 CFR 120.62)",
+            "checked_at_ms": 1_750_000_000_000_i64,
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["entity_kind"].is_string());
+        assert!(parsed["entity_id"].is_string());
+        assert!(parsed["requesting_operator_id"].is_string());
+        assert_eq!(parsed["decision"], "denied");
+        assert!(parsed["reason"].is_string());
+        assert!(parsed["checked_at_ms"].is_i64());
+    }
+
+    /// S359 — pin the documented `export.shipment_logged` payload shape. The
+    /// optional `ecn_or_authorization` (the cited licence / exception / ECCN) is
+    /// exercised so the authorized-export shape is pinned.
+    #[test]
+    fn s359_export_shipment_logged_payload_serializes() {
+        let payload = serde_json::json!({
+            "shipment_id": "SHP-2026-0042",
+            "exporter_party_id": "PTY-EXPORTER-1",
+            "recipient_party_id": "PTY-CONSIGNEE-9",
+            "recipient_country": "DE",
+            "ecn_or_authorization": "License Exception STA",
+            "shipped_at_ms": 1_750_000_000_000_i64,
+            "shipped_by_operator_id": "mock-op-003",
+        });
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert!(parsed["shipment_id"].is_string());
+        assert!(parsed["exporter_party_id"].is_string());
+        assert!(parsed["recipient_party_id"].is_string());
+        assert!(parsed["recipient_country"].is_string());
+        assert!(parsed["ecn_or_authorization"].is_string());
+        assert!(parsed["shipped_at_ms"].is_i64());
+        assert!(parsed["shipped_by_operator_id"].is_string());
     }
 }

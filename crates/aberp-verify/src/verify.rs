@@ -1024,7 +1024,16 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // never NAV XML bytes. `part.*`-not-`invoice.*` posture; never sweeps a
         // per-OUTGOING-invoice bundle. Exhaustiveness arm only.
         | EventKind::PartSerialAssigned
-        | EventKind::PartUidMarked => (None, ""),
+        | EventKind::PartUidMarked
+        // S359 / PR-46 — export.* export-control family (ADR-0076).
+        // Classification record + access-check decision + shipment-logged
+        // export; app-layer JSON payloads (entity_kind / jurisdiction / eccn /
+        // decision / shipment_id / …), never NAV XML bytes. `export.*`-not-
+        // `invoice.*` posture; never sweeps a per-OUTGOING-invoice bundle.
+        // Exhaustiveness arm only.
+        | EventKind::ExportClassificationSet
+        | EventKind::ExportAccessCheck
+        | EventKind::ExportShipmentLogged => (None, ""),
     };
 
     Ok(NavExtraction {

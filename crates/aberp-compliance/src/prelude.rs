@@ -10,7 +10,7 @@ pub use crate::avl::{
 };
 pub use crate::cui::{CuiCategory, CuiMarking};
 pub use crate::export_control::{
-    Classifiable, ExportClassification, ExportControlError, ExportControlProvider,
+    Classifiable, ExportClassification, ExportControlError, ExportControlProvider, Jurisdiction,
     MockExportControlProvider, PartyRef, ScreeningResult,
 };
 pub use crate::lot_heat::{HeatId, LotId, MaterialTraceabilitySeed, TraceabilityError, MAX_ID_LEN};
