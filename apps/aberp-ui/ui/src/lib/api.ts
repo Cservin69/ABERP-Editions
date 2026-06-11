@@ -3166,6 +3166,97 @@ export async function retryQuotePricingJob(
   return invoke("retry_quote_pricing_job", { quoteId });
 }
 
+/** S350 / PR-39 (U5) — success body of the operator material-grade
+ * override. Mirrors `serve::PatchPricingJobMaterialResponse`. */
+export interface MaterialEditOutcome {
+  quote_id: string;
+  old_grade: string;
+  new_grade: string;
+  /** The JobState the row was in when the operator applied the edit. */
+  previous_state: string;
+  new_attempt_n: number;
+}
+
+/** S350 / PR-39 (U5) — closed-vocab machine codes the SPA inline error
+ * routes on. The backend returns `{ error, ... }`; the SPA parses the
+ * wrapped error string to extract the code + status (same lossy parse
+ * as `DealSagaError`). */
+export type MaterialEditErrorCode =
+  | "MaterialNotInCatalogue"
+  | "JobNotEditable"
+  | "EmptyMaterialGrade";
+
+/** Typed wrapper carrying the parsed machine code + status so the panel
+ * can pick the right inline copy without re-matching the raw text.
+ * `availableCount` is populated only for `MaterialNotInCatalogue`. */
+export class MaterialEditError extends Error {
+  readonly code: MaterialEditErrorCode | "unknown";
+  readonly status: number;
+  readonly availableCount: number | null;
+
+  constructor(
+    code: MaterialEditErrorCode | "unknown",
+    status: number,
+    message: string,
+    availableCount: number | null = null,
+  ) {
+    super(message);
+    this.code = code;
+    this.status = status;
+    this.availableCount = availableCount;
+    this.name = "MaterialEditError";
+  }
+}
+
+/** S350 / PR-39 (U5) — apply an operator material-grade override.
+ * `PATCH /api/quote-pricing-jobs/:quote_id`. On 400/409 the promise
+ * rejects with a `MaterialEditError` carrying the typed `code` so the
+ * panel can branch (catalogue-miss under the select vs terminal-state
+ * refusal). On success the row is reset to Fetched (re-pricing) and the
+ * caller refreshes from the detail endpoint. */
+export async function editQuotePricingJobMaterial(
+  quoteId: string,
+  materialGrade: string,
+): Promise<MaterialEditOutcome> {
+  try {
+    return await invoke<MaterialEditOutcome>("edit_quote_pricing_job_material", {
+      quoteId,
+      materialGrade,
+    });
+  } catch (e) {
+    throw parseMaterialEditError(e);
+  }
+}
+
+/** S350 / PR-39 (U5) — lossy parse of `forward_patch`'s wrapped non-2xx
+ * string (`backend returned 400 ...: {"error":"...","available_count":N}`)
+ * into a typed `MaterialEditError`. Exported for the unit test; any
+ * parse failure falls through to an `unknown`-coded error carrying the
+ * raw text. */
+export function parseMaterialEditError(e: unknown): MaterialEditError {
+  if (e instanceof MaterialEditError) return e;
+  const raw = e instanceof Error ? e.message : String(e);
+  const statusMatch = raw.match(/backend returned (\d{3})/);
+  const status = statusMatch ? Number(statusMatch[1]) : 0;
+  const bodyMatch = raw.match(/:\s*(\{.*\})\s*$/);
+  if (bodyMatch) {
+    try {
+      const parsed = JSON.parse(bodyMatch[1]) as {
+        error?: string;
+        available_count?: number;
+        message?: string;
+      };
+      const code = (parsed.error ?? "unknown") as MaterialEditErrorCode | "unknown";
+      const availableCount =
+        typeof parsed.available_count === "number" ? parsed.available_count : null;
+      return new MaterialEditError(code, status, parsed.message ?? raw, availableCount);
+    } catch {
+      // Fall through to unknown.
+    }
+  }
+  return new MaterialEditError("unknown", status, raw);
+}
+
 /** S349 / PR-40 (U1) — the priced breakdown sub-object on a job detail.
  * Mirrors `aberp_quote_engine::QuoteBreakdown`. Every field is optional
  * on the wire so a future engine-schema change can't break the panel

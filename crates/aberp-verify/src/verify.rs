@@ -992,7 +992,11 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::QuotePricedWritebackOutcome
         // S348 / PR-39 — list-poll transport verdict. Same app-layer JSON
         // shape minus quote_id; never NAV XML bytes. Exhaustiveness arm only.
-        | EventKind::QuotePollOutcome => (None, ""),
+        | EventKind::QuotePollOutcome
+        // S350 / PR-39 — operator material-grade edit. App-layer JSON
+        // payload (quote_id / old_grade / new_grade / previous_state /
+        // operator_user_id), never NAV XML bytes. Exhaustiveness arm only.
+        | EventKind::QuotePricingMaterialEdited => (None, ""),
     };
 
     Ok(NavExtraction {

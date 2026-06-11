@@ -14,9 +14,12 @@
   // (in-memory Svelte state, never browser storage).
 
   import {
+    editQuotePricingJobMaterial,
     getQuotePricingJob,
     getQuotePricingJobAudit,
+    listQuotingMaterials,
     retryQuotePricingJob,
+    MaterialEditError,
     type AuditEntryView,
     type PricingJobDetail,
   } from "../lib/api";
@@ -29,6 +32,12 @@
     latestWritebackOutcome,
     timelineNodes,
   } from "../lib/pricing-job-detail";
+  import {
+    isMaterialEditable,
+    materialEditInlineCopy,
+    materialOptions,
+    type MaterialOption,
+  } from "../lib/pricing-material-edit";
 
   interface Props {
     /** Storefront quote id of the row to inspect; `null` keeps the
@@ -58,6 +67,15 @@
   let retryError = $state<string | null>(null);
   let expandedSeqs = $state<Set<number>>(new Set());
 
+  // S350 / PR-39 (U5) — operator material-grade override state.
+  let editingMaterial = $state(false);
+  let materialDraft = $state("");
+  let materialOpts = $state<MaterialOption[]>([]);
+  let materialOptsLoading = $state(false);
+  let materialSaveBusy = $state(false);
+  let materialEditError = $state<string | null>(null);
+  let materialToast = $state<string | null>(null);
+
   const AUDIT_PAGE = 50;
 
   // Derived sections — all read off the one audit page we fetch.
@@ -73,6 +91,8 @@
       if (!dialogEl.open) dialogEl.showModal();
       expandedSeqs = new Set();
       retryError = null;
+      cancelMaterialEdit();
+      materialToast = null;
       void load(quoteId);
     } else {
       if (dialogEl.open) dialogEl.close();
@@ -137,6 +157,57 @@
       retryError = e instanceof Error ? e.message : String(e);
     } finally {
       retryBusy = false;
+    }
+  }
+
+  // S350 / PR-39 (U5) — open the inline material editor: load the
+  // catalogue (same snapshot the storefront /quote dropdown uses) and
+  // seed the draft with the current grade.
+  async function startMaterialEdit(): Promise<void> {
+    if (!detail) return;
+    editingMaterial = true;
+    materialEditError = null;
+    materialToast = null;
+    materialDraft = detail.material_grade;
+    materialOptsLoading = true;
+    try {
+      const result = await listQuotingMaterials();
+      materialOpts = materialOptions(result.materials);
+    } catch (e) {
+      materialEditError = e instanceof Error ? e.message : String(e);
+    } finally {
+      materialOptsLoading = false;
+    }
+  }
+
+  function cancelMaterialEdit() {
+    editingMaterial = false;
+    materialEditError = null;
+    materialDraft = "";
+  }
+
+  async function saveMaterialEdit(): Promise<void> {
+    if (!quoteId || !detail) return;
+    materialSaveBusy = true;
+    materialEditError = null;
+    try {
+      await editQuotePricingJobMaterial(quoteId, materialDraft);
+      editingMaterial = false;
+      materialToast =
+        "Anyag frissítve, újraárazás… / Material updated, re-pricing…";
+      // Pull the parent list (state moved back to Fetched, ×N bumped)
+      // and refresh this panel from the detail endpoint.
+      onRetried();
+      await load(quoteId);
+    } catch (e) {
+      materialEditError =
+        e instanceof MaterialEditError
+          ? materialEditInlineCopy(e)
+          : e instanceof Error
+            ? e.message
+            : String(e);
+    } finally {
+      materialSaveBusy = false;
     }
   }
 
@@ -273,6 +344,12 @@
         </p>
       {/if}
 
+      {#if materialToast}
+        <p class="qjd__toast" data-testid="pricing-job-material-toast">
+          {materialToast}
+        </p>
+      {/if}
+
       <div class="qjd__body">
         <!-- Submission -->
         <section class="qjd__sec">
@@ -306,7 +383,66 @@
             <dt>CAD fájl / file</dt>
             <dd>{detail.cad_filename}</dd>
             <dt>Anyag / Material</dt>
-            <dd>{detail.material_grade}</dd>
+            <dd>
+              {#if editingMaterial}
+                <div class="qjd__matedit" data-testid="pricing-job-material-edit">
+                  <select
+                    class="qjd__matselect"
+                    bind:value={materialDraft}
+                    disabled={materialOptsLoading || materialSaveBusy}
+                    data-testid="pricing-job-material-select"
+                  >
+                    {#if materialOptsLoading}
+                      <option value={materialDraft}>Betöltés… / Loading…</option>
+                    {:else}
+                      {#each materialOpts as opt (opt.value)}
+                        <option value={opt.value}>{opt.label}</option>
+                      {/each}
+                    {/if}
+                  </select>
+                  <div class="qjd__matedit-actions">
+                    <button
+                      type="button"
+                      class="btn btn--secondary"
+                      onclick={() => void saveMaterialEdit()}
+                      disabled={materialSaveBusy || materialOptsLoading}
+                      data-testid="pricing-job-material-save"
+                      >{materialSaveBusy
+                        ? "Mentés… / Saving…"
+                        : "Mentés / Save"}</button
+                    >
+                    <button
+                      type="button"
+                      class="qjd__close"
+                      onclick={cancelMaterialEdit}
+                      disabled={materialSaveBusy}
+                      aria-label="Mégse / Cancel"
+                      data-testid="pricing-job-material-cancel">✕</button
+                    >
+                  </div>
+                </div>
+                {#if materialEditError}
+                  <p
+                    class="qjd__err qjd__matedit-err"
+                    data-testid="pricing-job-material-error"
+                  >
+                    {materialEditError}
+                  </p>
+                {/if}
+              {:else}
+                <span class="qjd__matval">{detail.material_grade}</span>
+                {#if isMaterialEditable(detail.state)}
+                  <button
+                    type="button"
+                    class="qjd__matpencil"
+                    onclick={() => void startMaterialEdit()}
+                    aria-label="Anyag szerkesztése / Edit material"
+                    title="Anyag szerkesztése / Edit material"
+                    data-testid="pricing-job-material-edit-btn">✎</button
+                  >
+                {/if}
+              {/if}
+            </dd>
             <dt>Db / Qty</dt>
             <dd>{detail.quantity}</dd>
             <dt>Pénznem / Currency</dt>
@@ -691,6 +827,56 @@
     font-weight: 600;
     color: var(--color-danger, #f87171);
     margin-bottom: 4px;
+  }
+  /* S350 / PR-39 (U5) — material inline edit. */
+  .qjd__matval {
+    margin-right: 6px;
+  }
+  .qjd__matpencil {
+    background: transparent;
+    border: 1px solid var(--color-border, #374151);
+    color: var(--color-text-muted, #9ca3af);
+    border-radius: 6px;
+    width: 24px;
+    height: 24px;
+    line-height: 1;
+    cursor: pointer;
+    font-size: 12px;
+    vertical-align: middle;
+  }
+  .qjd__matpencil:hover {
+    color: var(--color-text, #e5e7eb);
+  }
+  .qjd__matedit {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .qjd__matselect {
+    background: var(--color-bg, #111827);
+    color: var(--color-text, #e5e7eb);
+    border: 1px solid var(--color-border, #374151);
+    border-radius: 6px;
+    padding: 4px 6px;
+    font-size: 13px;
+    max-width: 100%;
+  }
+  .qjd__matedit-actions {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .qjd__matedit-err {
+    padding: 6px 0 0;
+    font-size: 12px;
+  }
+  .qjd__toast {
+    margin: 0;
+    padding: 8px 16px;
+    color: #bbf7d0;
+    background: #064e3b;
+    font-size: 13px;
   }
   .qjd__timeline,
   .qjd__log {

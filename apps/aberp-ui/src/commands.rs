@@ -1372,6 +1372,29 @@ pub async fn retry_quote_pricing_job(
     forward_post(&state, &path, Value::Null).await
 }
 
+/// S350 / PR-39 (U5) — operator material-grade override.
+/// `PATCH /api/quote-pricing-jobs/{quote_id}` with body
+/// `{ material_grade }`. The backend validates the grade against the
+/// catalogue (400 `MaterialNotInCatalogue`), refuses a terminal/in-flight
+/// row (409 `JobNotEditable`), else rewrites the grade, resets the row to
+/// Fetched (re-enters pricing), bumps `attempt_n`, and emits the
+/// `quote.material_grade_edited` audit row. The SPA branches on the
+/// wrapped error string to render the right inline message.
+#[tauri::command]
+pub async fn edit_quote_pricing_job_material(
+    state: State<'_, AppState>,
+    quote_id: String,
+    material_grade: String,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-pricing-jobs/{quote_id}");
+    forward_patch(
+        &state,
+        &path,
+        serde_json::json!({ "material_grade": material_grade }),
+    )
+    .await
+}
+
 /// S282 / PR-267 — read the pricing-pipeline daemon status (Python-venv
 /// resolution outcome + poll cadence + spawned flag). Drives the SPA's
 /// `PricingJobsList` empty-state copy: GREEN active vs RED venv-missing
@@ -1745,6 +1768,57 @@ async fn forward_put(
         .send()
         .await
         .with_context(|| format!("HTTPS PUT {url}"))
+        .map_err(|e| format!("{e:#}"))?;
+
+    let status = resp.status();
+    let response_body = resp
+        .text()
+        .await
+        .with_context(|| format!("read body of {url}"))
+        .map_err(|e| format!("{e:#}"))?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "backend returned {status} for {path}: {response_body}"
+        ));
+    }
+    let value: Value = serde_json::from_str(&response_body)
+        .with_context(|| format!("parse JSON body of {url}: `{response_body}`"))
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(value)
+}
+
+/// S350 / PR-39 (U5) — PATCH sibling of [`forward_put`]. Used by the
+/// operator material-grade override (`PATCH /api/quote-pricing-jobs/
+/// :quote_id`). Same body+error shape as PUT/POST; only the HTTP method
+/// differs (PATCH for a partial single-field edit). The non-2xx arm
+/// surfaces the backend's typed `{ error, ... }` body verbatim in the
+/// wrapped string so the SPA can branch on `MaterialNotInCatalogue`
+/// (400) vs `JobNotEditable` (409).
+async fn forward_patch(
+    state: &State<'_, AppState>,
+    path: &str,
+    body: Value,
+) -> Result<Value, String> {
+    let (url, token, client) = {
+        let guard = state.backend.lock().await;
+        let backend = guard
+            .as_ref()
+            .ok_or_else(|| "backend not ready yet — wait a moment and retry".to_string())?;
+        (
+            format!("{}{}", backend.url, path),
+            backend.session_token.clone(),
+            backend.client.clone(),
+        )
+    };
+
+    let resp = client
+        .patch(&url)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("HTTPS PATCH {url}"))
         .map_err(|e| format!("{e:#}"))?;
 
     let status = resp.status();

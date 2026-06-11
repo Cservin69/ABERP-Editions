@@ -3284,9 +3284,13 @@ fn build_router(state: AppState) -> Router {
         // S349 / PR-40 (U1) — row-click detail panel. Full single-row
         // artifacts (breakdown + FeatureGraph + CAD filename + PDF
         // presence) keyed on the storefront quote id.
+        //
+        // S350 / PR-39 (U5) — PATCH on the same path is the operator
+        // material-grade override: body `{ material_grade }`, validated
+        // against the catalogue, resets the row to Fetched + audits.
         .route(
             "/api/quote-pricing-jobs/:quote_id",
-            get(handle_get_quote_pricing_job_detail),
+            get(handle_get_quote_pricing_job_detail).patch(handle_patch_quote_pricing_job_material),
         )
         // S349 / PR-40 (U1) — paginated per-row audit trail feeding the
         // detail panel's status timeline + last-writeback-outcome +
@@ -17078,6 +17082,244 @@ async fn handle_get_quote_pricing_job_detail(
     (axum::http::StatusCode::OK, axum::Json(view)).into_response()
 }
 
+/// S350 / PR-39 (U5) — inbound body for the operator material-grade
+/// override. Only `material_grade` is editable from this panel (customer
+/// email + manual price overrides are explicitly out of scope per the
+/// S350 brief).
+#[derive(Debug, serde::Deserialize)]
+struct PatchPricingJobMaterialRequest {
+    material_grade: String,
+}
+
+/// S350 / PR-39 (U5) — success body. Echoes the prior + new grade and
+/// the post-bump attempt counter so the SPA toast can confirm the change
+/// and the row refresh shows the `×N` badge move.
+#[derive(Debug, serde::Serialize)]
+pub struct PatchPricingJobMaterialResponse {
+    pub quote_id: String,
+    pub old_grade: String,
+    pub new_grade: String,
+    /// The JobState the row was in when the operator applied the edit
+    /// (audit-payload `previous_state`).
+    pub previous_state: String,
+    pub new_attempt_n: u32,
+}
+
+/// S350 / PR-39 (U5) — typed library-helper error for the material-grade
+/// override, mapped to an HTTP status by the handler. `pub` so the
+/// integration test can assert the variant without spinning the HTTPS
+/// listener (same posture as [`PartnerRouteError`]).
+#[derive(Debug)]
+pub enum MaterialEditRequestError {
+    /// `material_grade` empty / whitespace after trim — 400.
+    EmptyGrade,
+    /// Grade not present in the `quoting_materials` catalogue snapshot —
+    /// 400 `{ error: "MaterialNotInCatalogue", available_count: N }`.
+    /// Nothing is mutated and no audit row is written.
+    NotInCatalogue { available_count: usize },
+    /// No row for (tenant, quote_id) — 404 (per the existing wrong-tenant
+    /// convention: foreign-tenant rows are invisible, never 403).
+    NotFound,
+    /// Row exists but its current state forbids an edit — 409. Carries
+    /// the offending state's wire string for the operator copy.
+    NotEditable { state: String },
+    /// Unexpected internal failure — 500.
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for MaterialEditRequestError {
+    fn from(e: anyhow::Error) -> Self {
+        MaterialEditRequestError::Other(e)
+    }
+}
+
+/// S350 / PR-39 (U5) — `PATCH /api/quote-pricing-jobs/:quote_id` with
+/// body `{ material_grade }`. The operator half of F4: an operator who
+/// clarified the material by phone applies it here without the customer
+/// re-submitting through the storefront. Bearer + Ready gated like the
+/// list/detail/retry siblings; 400 on a malformed quote id or a grade
+/// outside the catalogue; 404 when no row matches; 409 when the row's
+/// state forbids an edit.
+async fn handle_patch_quote_pricing_job_material(
+    AxumPath(quote_id): AxumPath<String>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<PatchPricingJobMaterialRequest>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if !is_quote_id_shape(&quote_id) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid quote_id"})),
+        )
+            .into_response();
+    }
+    let state_for_task = state.clone();
+    let qid = quote_id.clone();
+    let grade = body.material_grade.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        amend_pricing_job_material_request(&state_for_task, &qid, &grade, &operator_login)
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "amend_pricing_job_material_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+    match outcome {
+        Ok(resp) => (axum::http::StatusCode::OK, axum::Json(resp)).into_response(),
+        Err(MaterialEditRequestError::EmptyGrade) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "EmptyMaterialGrade"})),
+        )
+            .into_response(),
+        Err(MaterialEditRequestError::NotInCatalogue { available_count }) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "MaterialNotInCatalogue",
+                "available_count": available_count,
+            })),
+        )
+            .into_response(),
+        Err(MaterialEditRequestError::NotFound) => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(error_body(format!(
+                "no pricing job found with quote_id {quote_id}"
+            ))),
+        )
+            .into_response(),
+        Err(MaterialEditRequestError::NotEditable { state: job_state }) => (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "error": "JobNotEditable",
+                "state": job_state,
+                "message": format!(
+                    "a row in state `{job_state}` cannot be material-edited \
+                     (editable only while Fetched / Posting back / Failed)"
+                ),
+            })),
+        )
+            .into_response(),
+        Err(MaterialEditRequestError::Other(e)) => {
+            internal_error("amend_pricing_job_material_request", e)
+        }
+    }
+}
+
+/// S350 / PR-39 (U5) — library helper backing the PATCH route. `pub` so
+/// the integration test can hit it without the HTTPS listener. Validates
+/// the grade against the catalogue snapshot, applies the state-guarded
+/// override + the `quote.material_grade_edited` audit row in ONE
+/// transaction (mutation and its audit-of-record are atomic), and
+/// returns the echo body. Sync (DuckDB writes are blocking) — the
+/// handler wraps it in `spawn_blocking`.
+pub fn amend_pricing_job_material_request(
+    state: &AppState,
+    quote_id: &str,
+    new_grade: &str,
+    operator_login: &str,
+) -> std::result::Result<PatchPricingJobMaterialResponse, MaterialEditRequestError> {
+    let trimmed = new_grade.trim();
+    if trimmed.is_empty() {
+        return Err(MaterialEditRequestError::EmptyGrade);
+    }
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute")?;
+    let mut conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tenant = state.tenant.as_str().to_string();
+
+    // 1. Catalogue membership — refuse a grade outside the snapshot
+    //    BEFORE any mutation (400 + available_count). Validation against
+    //    `quoting_materials` is the same snapshot the storefront /quote
+    //    dropdown is fed from (S277), so the operator picks the same
+    //    grades a customer would.
+    let materials = crate::quoting_materials::list_materials(&conn, &tenant)
+        .context("list quoting_materials for catalogue validation")?;
+    if !materials.iter().any(|m| m.grade == trimmed) {
+        return Err(MaterialEditRequestError::NotInCatalogue {
+            available_count: materials.len(),
+        });
+    }
+
+    // 2. State-guarded mutation + audit row in ONE transaction.
+    crate::quote_pricing_jobs::ensure_schema(&conn).context("ensure quote_pricing_jobs schema")?;
+    aberp_audit_ledger::ensure_schema(&conn)
+        .context("ensure audit-ledger schema for material-edit audit")?;
+    let now = time::OffsetDateTime::now_utc();
+    let tx = conn
+        .transaction()
+        .context("open material-edit transaction")?;
+    let outcome =
+        crate::quote_pricing_jobs::amend_material_grade_in_tx(&tx, quote_id, &tenant, trimmed, now)
+            .context("amend_material_grade_in_tx")?;
+    let (old_grade, previous_state, new_attempt_n) = match outcome {
+        crate::quote_pricing_jobs::MaterialEditOutcome::Applied {
+            old_grade,
+            previous_state,
+            new_attempt_n,
+        } => (old_grade, previous_state, new_attempt_n),
+        crate::quote_pricing_jobs::MaterialEditOutcome::NotFound => {
+            // Nothing written; drop the tx without committing.
+            return Err(MaterialEditRequestError::NotFound);
+        }
+        crate::quote_pricing_jobs::MaterialEditOutcome::NotEditable { state: job_state } => {
+            return Err(MaterialEditRequestError::NotEditable {
+                state: job_state.as_str().to_string(),
+            });
+        }
+    };
+    let previous_state_str = previous_state.as_str().to_string();
+
+    // F12 audit-of-record — rides the SAME tx as the UPDATE so the row
+    // change and its ledger entry commit atomically.
+    let idempotency_key = format!("quote_material_grade_edited:{quote_id}:{new_attempt_n}");
+    let payload = serde_json::json!({
+        "quote_id": quote_id,
+        "tenant_id": tenant,
+        "old_grade": old_grade,
+        "new_grade": trimmed,
+        "previous_state": previous_state_str,
+        "attempt_n": new_attempt_n,
+        "operator_user_id": operator_login,
+        "actor": operator_login,
+        "idempotency_key": idempotency_key,
+    });
+    let bytes = serde_json::to_vec(&payload).context("encode material-edit audit payload")?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        EventKind::QuotePricingMaterialEdited,
+        bytes,
+        actor,
+        Some(idempotency_key),
+    )
+    .context("append QuotePricingMaterialEdited")?;
+    tx.commit().context("commit material-edit transaction")?;
+
+    Ok(PatchPricingJobMaterialResponse {
+        quote_id: quote_id.to_string(),
+        old_grade,
+        new_grade: trimmed.to_string(),
+        previous_state: previous_state_str,
+        new_attempt_n,
+    })
+}
+
 /// S349 / PR-40 (U1) — query params for the per-row audit page. Both
 /// optional; the handler clamps `limit` to [`AUDIT_PAGE_MAX`] and
 /// defaults to [`AUDIT_PAGE_DEFAULT`].
@@ -23282,6 +23524,35 @@ mod tests {
         // Path-traversal / injection chars.
         assert!(!is_quote_id_shape("../../etc/passwd-aaaaaaaaaaaaaaaaaaaa"));
         assert!(!is_quote_id_shape("123e4567-e89b-12d3-a456-42661417400'"));
+    }
+
+    /// S350 / PR-39 (U5) — the PATCH material handler gates on the
+    /// shared `check_bearer_rejection` (first lines of
+    /// `handle_patch_quote_pricing_job_material`, identical to every
+    /// other Ready route). Pin that gate's 401 behaviour so a refactor
+    /// that drops the bearer check on the new route surfaces loud.
+    #[test]
+    fn s350_check_bearer_rejection_401s_missing_and_wrong_token() {
+        let expected = "right-token";
+        // Missing Authorization header → 401.
+        let none = HeaderMap::new();
+        let r = check_bearer_rejection(&none, expected).expect("missing bearer must reject");
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        // Wrong token → 401.
+        let mut wrong = HeaderMap::new();
+        wrong.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer not-the-token".parse().unwrap(),
+        );
+        let r = check_bearer_rejection(&wrong, expected).expect("wrong bearer must reject");
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        // Correct token → no rejection.
+        let mut ok = HeaderMap::new();
+        ok.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {expected}").parse().unwrap(),
+        );
+        assert!(check_bearer_rejection(&ok, expected).is_none());
     }
 
     #[test]

@@ -1762,6 +1762,29 @@ pub enum EventKind {
     /// F12 four-edit ritual fires once.
     QuotePollOutcome,
 
+    /// S350 / PR-39 (U5) — operator inline-edit of a pricing job's
+    /// `material_grade`. Closes the F4/U5 dead-end: a row stuck
+    /// `Permanent` on `material grade ... is not in the catalogue
+    /// snapshot` (default form material `unknown`, legacy grades) had
+    /// NO code-level remedy short of the customer re-submitting through
+    /// the storefront. When an operator clarifies the grade by phone,
+    /// this is the audit-of-record for applying it: the row's grade is
+    /// rewritten to a catalogue grade, the job reset to `Fetched`
+    /// (re-enters pricing), and `attempt_n` bumped.
+    ///
+    /// Carries `quote_id`, `tenant_id`, `old_grade`, `new_grade`,
+    /// `previous_state` (the JobState the row was in when the operator
+    /// edited it), `attempt_n` (post-bump), `operator_user_id` (the
+    /// Bearer-subject operator login — who applied the override), `actor`
+    /// (the same login, for the ledger actor field), `idempotency_key`
+    /// (`quote_material_grade_edited:<quote_id>:<attempt_n>` — the bumped
+    /// attempt disambiguates repeat edits the way `QuotePricingFailed`'s
+    /// suffix does).
+    ///
+    /// `quote.*` prefix family. Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricingMaterialEdited,
+
     /// S307 / PR-276 — one entry per email-outbox poll cycle. Fires
     /// once per successful `GET /api/internal/email-queue` against the
     /// storefront, regardless of whether the cycle returned 0 entries
@@ -1992,6 +2015,7 @@ impl EventKind {
             EventKind::QuotePricingJobsIndexMigrated => "quote.pricing_jobs_index_migrated",
             EventKind::QuotePricingFailureClassified => "quote.pricing_failure_classified",
             EventKind::QuotePricedWritebackOutcome => "quote.priced_writeback_outcome",
+            EventKind::QuotePricingMaterialEdited => "quote.material_grade_edited",
             EventKind::QuotePollOutcome => "quote.poll_outcome",
             EventKind::EmailOutboxFetched => "quote.email_outbox_fetched",
             EventKind::EmailOutboxClaimed => "quote.email_outbox_claimed",
@@ -2106,6 +2130,7 @@ impl EventKind {
             "quote.pricing_jobs_index_migrated" => Ok(EventKind::QuotePricingJobsIndexMigrated),
             "quote.pricing_failure_classified" => Ok(EventKind::QuotePricingFailureClassified),
             "quote.priced_writeback_outcome" => Ok(EventKind::QuotePricedWritebackOutcome),
+            "quote.material_grade_edited" => Ok(EventKind::QuotePricingMaterialEdited),
             "quote.poll_outcome" => Ok(EventKind::QuotePollOutcome),
             "quote.email_outbox_fetched" => Ok(EventKind::EmailOutboxFetched),
             "quote.email_outbox_claimed" => Ok(EventKind::EmailOutboxClaimed),
@@ -2213,6 +2238,7 @@ mod tests {
             EventKind::QuotePricingFailureClassified,
             EventKind::QuotePricedWritebackOutcome,
             EventKind::QuotePollOutcome,
+            EventKind::QuotePricingMaterialEdited,
             EventKind::EmailOutboxFetched,
             EventKind::EmailOutboxClaimed,
             EventKind::EmailOutboxSent,
@@ -4176,6 +4202,45 @@ mod tests {
             EventKind::QuotePricingFailed,
             EventKind::QuotePricingFailureClassified,
             EventKind::QuotePricingRendered,
+        ] {
+            assert_ne!(
+                s,
+                sibling.as_str(),
+                "{s} collides with {}",
+                sibling.as_str()
+            );
+        }
+    }
+
+    /// S350 / PR-39 (U5) — operator material-grade edit kind round-trips
+    /// and is distinct from every pricing-pipeline sibling. The on-disk
+    /// string is `quote.material_grade_edited` (operator-readable when a
+    /// forensic walker greps `quote.*` for "who changed what on this
+    /// row"); a collision with a per-stage kind would mis-route the
+    /// override into the wrong bucket and hide who applied a phone-
+    /// clarified material grade.
+    #[test]
+    fn s350_material_edited_kind_round_trips_and_is_distinct() {
+        let k = EventKind::QuotePricingMaterialEdited;
+        let s = k.as_str();
+        assert_eq!(s, "quote.material_grade_edited");
+        assert!(s.starts_with("quote."), "{s} must start with quote.");
+        assert!(
+            !s.starts_with("invoice."),
+            "{s} must not start with invoice."
+        );
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+        for sibling in [
+            EventKind::QuotePricingFetched,
+            EventKind::QuotePricingPosted,
+            EventKind::QuotePricingFailed,
+            EventKind::QuotePricingFailureClassified,
+            EventKind::QuotePricedWritebackOutcome,
+            EventKind::QuotePollOutcome,
         ] {
             assert_ne!(
                 s,

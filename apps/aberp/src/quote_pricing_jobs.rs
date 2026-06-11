@@ -170,6 +170,21 @@ impl JobState {
             other => Err(anyhow!("unknown quote_pricing_jobs.state: {other:?}")),
         }
     }
+
+    /// S350 / PR-39 (U5) — may an operator inline-edit this row's
+    /// `material_grade`? Editable while `Fetched` / `PostingBack` /
+    /// `Failed`; refused mid-pipeline (`Extracting` / `Pricing` /
+    /// `Rendering` — editing would race the daemon's in-flight stage
+    /// transition) and once `Posted` (terminal: the storefront already
+    /// holds the priced result, so a re-priced row would 409 on the new
+    /// `feature_graph_hash`, F12). The serve-layer handler maps a
+    /// non-editable row to 409.
+    pub fn material_editable(self) -> bool {
+        matches!(
+            self,
+            JobState::Fetched | JobState::PostingBack | JobState::Failed
+        )
+    }
 }
 
 /// One row of `quote_pricing_jobs`. Read-only projection used by the
@@ -693,6 +708,123 @@ pub fn retry_job(
         .context("read attempt_n")?;
     tx.commit().context("commit retry_job")?;
     Ok(new_n as u32)
+}
+
+/// S350 / PR-39 (U5) — outcome of an operator material-grade override.
+/// The serve-layer handler maps each variant to an HTTP status: `Applied`
+/// → 200, `NotFound` → 404, `NotEditable` → 409.
+#[derive(Debug, Clone)]
+pub enum MaterialEditOutcome {
+    /// Grade rewritten, row reset to `Fetched`, `attempt_n` bumped.
+    /// Carries the prior grade + state for the audit payload.
+    Applied {
+        old_grade: String,
+        previous_state: JobState,
+        new_attempt_n: u32,
+    },
+    /// No row for (tenant, quote_id) — 404.
+    NotFound,
+    /// Row exists but its current state forbids an edit — 409. Carries
+    /// the offending state so the operator copy can name it.
+    NotEditable { state: JobState },
+}
+
+/// S350 / PR-39 (U5) — operator material-grade override, the tx-owned
+/// core. State-guarded: reads the row's current state + grade inside the
+/// caller's transaction (one consistent snapshot — no TOCTOU against a
+/// concurrent daemon transition), refuses (without mutating) when the
+/// state is not [`JobState::material_editable`], otherwise rewrites
+/// `material_grade`, resets the row to `Fetched` (re-enters the pricing
+/// pipeline — the daemon's next sweep re-extracts/prices/renders/posts
+/// with the new grade; S347/S348 own the writeback-retry path), bumps
+/// `attempt_n`, and clears the error columns (the prior failure is
+/// preserved in the audit ledger, not the row).
+///
+/// **Does NOT commit** — the serve-layer caller appends the
+/// `quote.material_grade_edited` audit row in the SAME transaction and
+/// commits both together (mutation + its audit-of-record are atomic).
+/// **Catalogue membership is NOT validated here** — the caller validates
+/// `new_grade` against `quoting_materials` first (400 + `available_count`
+/// on a miss) so this fn owns only the DB transition + the editable-state
+/// invariant. Tenant-scoped like every other writer. Caller guarantees
+/// [`ensure_schema`] has run.
+pub fn amend_material_grade_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    quote_id: &str,
+    tenant_id: &str,
+    new_grade: &str,
+    now: OffsetDateTime,
+) -> Result<MaterialEditOutcome> {
+    let current: Option<(String, String)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT state, material_grade FROM quote_pricing_jobs
+                    WHERE quote_id = ? AND tenant_id = ?",
+            )
+            .context("prepare amend_material_grade read")?;
+        let mut rows = stmt
+            .query(params![quote_id, tenant_id])
+            .context("execute amend_material_grade read")?;
+        match rows.next().context("step amend_material_grade read")? {
+            Some(r) => Some((
+                r.get(0).context("get state")?,
+                r.get(1).context("get material_grade")?,
+            )),
+            None => None,
+        }
+    };
+    let Some((state_str, old_grade)) = current else {
+        return Ok(MaterialEditOutcome::NotFound);
+    };
+    let state = JobState::parse_str(&state_str)?;
+    if !state.material_editable() {
+        return Ok(MaterialEditOutcome::NotEditable { state });
+    }
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format updated_at")?;
+    tx.execute(
+        "UPDATE quote_pricing_jobs
+            SET material_grade = ?, state = ?, updated_at = ?,
+                error_stage = NULL, error_reason = NULL, failure_kind = NULL,
+                attempt_n = attempt_n + 1
+            WHERE quote_id = ? AND tenant_id = ?",
+        params![new_grade, STATE_FETCHED, ts, quote_id, tenant_id],
+    )
+    .context("amend_material_grade UPDATE")?;
+    let new_n: i64 = tx
+        .query_row(
+            "SELECT attempt_n FROM quote_pricing_jobs
+                WHERE quote_id = ? AND tenant_id = ?",
+            params![quote_id, tenant_id],
+            |r| r.get(0),
+        )
+        .context("read attempt_n after amend")?;
+    Ok(MaterialEditOutcome::Applied {
+        old_grade,
+        previous_state: state,
+        new_attempt_n: new_n.max(0) as u32,
+    })
+}
+
+/// S350 / PR-39 (U5) — `&mut Connection` wrapper over
+/// [`amend_material_grade_in_tx`] for unit tests + any non-audit caller:
+/// runs [`ensure_schema`], opens a tx, applies the edit, and commits
+/// (a no-op commit on the NotFound / NotEditable paths, which wrote
+/// nothing). The serve handler does NOT use this — it needs the
+/// in-tx variant so the audit row rides the same transaction.
+pub fn amend_material_grade(
+    conn: &mut Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    new_grade: &str,
+    now: OffsetDateTime,
+) -> Result<MaterialEditOutcome> {
+    ensure_schema(conn)?;
+    let tx = conn.transaction().context("open amend_material_grade tx")?;
+    let outcome = amend_material_grade_in_tx(&tx, quote_id, tenant_id, new_grade, now)?;
+    tx.commit().context("commit amend_material_grade")?;
+    Ok(outcome)
 }
 
 /// SPA + daemon read path. Returns rows newest-first.
@@ -1988,5 +2120,161 @@ mod tests {
                 .is_none(),
             "tenant isolation: a foreign tenant sees no row"
         );
+    }
+
+    // ── S350 / PR-39 (U5) — operator material-grade override ─────────
+
+    #[test]
+    fn s350_material_editable_only_fetched_posting_back_failed() {
+        assert!(JobState::Fetched.material_editable());
+        assert!(JobState::PostingBack.material_editable());
+        assert!(JobState::Failed.material_editable());
+        assert!(!JobState::Extracting.material_editable());
+        assert!(!JobState::Pricing.material_editable());
+        assert!(!JobState::Rendering.material_editable());
+        assert!(
+            !JobState::Posted.material_editable(),
+            "Posted is terminal — a re-priced grade would 409 on the new hash"
+        );
+    }
+
+    /// Happy path: a Failed row gets its grade rewritten → reset to
+    /// Fetched, attempt bumped, error fields cleared; the outcome
+    /// carries the prior grade + state for the audit payload.
+    #[test]
+    fn s350_amend_resets_to_fetched_bumps_attempt_clears_error() {
+        let mut conn = open_mem();
+        insert_fetched_job(
+            &conn,
+            "qe1",
+            "T",
+            "e@x",
+            "Eve",
+            "unknown",
+            4,
+            "part.step",
+            "/tmp/part.step",
+            fixed_ts(),
+        )
+        .expect("insert");
+        set_failed(
+            &mut conn,
+            "qe1",
+            "T",
+            "pricing",
+            "material grade `unknown` is not in the catalogue snapshot",
+            FailureKind::Permanent,
+            fixed_ts(),
+        )
+        .expect("fail it");
+
+        let outcome =
+            amend_material_grade(&mut conn, "qe1", "T", "AL_6061_T6", fixed_ts()).expect("amend");
+        match outcome {
+            MaterialEditOutcome::Applied {
+                old_grade,
+                previous_state,
+                new_attempt_n,
+            } => {
+                assert_eq!(old_grade, "unknown");
+                assert_eq!(previous_state, JobState::Failed);
+                assert_eq!(new_attempt_n, 1, "attempt bumped 0 → 1");
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+
+        let d = get_job_detail(&conn, "qe1", "T")
+            .expect("query")
+            .expect("row");
+        assert_eq!(d.row.state, JobState::Fetched, "re-enters pricing");
+        assert_eq!(d.row.material_grade, "AL_6061_T6");
+        assert_eq!(d.row.attempt_n, 1);
+        assert!(d.row.error_stage.is_none(), "error cleared on edit");
+        assert!(d.row.error_reason.is_none());
+        assert!(d.row.failure_kind.is_none());
+    }
+
+    #[test]
+    fn s350_amend_missing_row_is_not_found() {
+        let mut conn = open_mem();
+        let outcome = amend_material_grade(&mut conn, "no-such", "T", "AL_6061_T6", fixed_ts())
+            .expect("amend");
+        assert!(matches!(outcome, MaterialEditOutcome::NotFound));
+    }
+
+    #[test]
+    fn s350_amend_refuses_posted_row_without_mutating() {
+        let mut conn = open_mem();
+        insert_fetched_job(
+            &conn,
+            "qe2",
+            "T",
+            "e@x",
+            "Eve",
+            "AL_6061_T6",
+            1,
+            "p.stl",
+            "/tmp/p.stl",
+            fixed_ts(),
+        )
+        .expect("insert");
+        // Drive to Posted.
+        set_state(&conn, "qe2", "T", JobState::Extracting, fixed_ts()).expect("ex");
+        set_extracted(&mut conn, "qe2", "T", "blake3:x", "{}", fixed_ts()).expect("extract");
+        set_priced(&mut conn, "qe2", "T", "{}", 10.0, fixed_ts()).expect("price");
+        set_rendered(
+            &mut conn,
+            "qe2",
+            "T",
+            "/tmp/x.pdf",
+            "2026-07-06",
+            fixed_ts(),
+        )
+        .expect("render");
+        set_state(&conn, "qe2", "T", JobState::Posted, fixed_ts()).expect("post");
+
+        let outcome =
+            amend_material_grade(&mut conn, "qe2", "T", "SS_304", fixed_ts()).expect("amend");
+        assert!(
+            matches!(
+                outcome,
+                MaterialEditOutcome::NotEditable {
+                    state: JobState::Posted
+                }
+            ),
+            "Posted row must refuse the edit"
+        );
+        // Row unchanged — still Posted with the original grade.
+        let d = get_job_detail(&conn, "qe2", "T")
+            .expect("query")
+            .expect("row");
+        assert_eq!(d.row.state, JobState::Posted);
+        assert_eq!(d.row.material_grade, "AL_6061_T6");
+    }
+
+    #[test]
+    fn s350_amend_is_tenant_scoped() {
+        let mut conn = open_mem();
+        insert_fetched_job(
+            &conn,
+            "qe3",
+            "T",
+            "e@x",
+            "Eve",
+            "unknown",
+            1,
+            "p.stl",
+            "/tmp/p.stl",
+            fixed_ts(),
+        )
+        .expect("insert");
+        // A foreign tenant sees no row → NotFound, never touches T's row.
+        let outcome = amend_material_grade(&mut conn, "qe3", "OTHER", "AL_6061_T6", fixed_ts())
+            .expect("amend");
+        assert!(matches!(outcome, MaterialEditOutcome::NotFound));
+        let d = get_job_detail(&conn, "qe3", "T")
+            .expect("query")
+            .expect("row");
+        assert_eq!(d.row.material_grade, "unknown", "T's row untouched");
     }
 }
