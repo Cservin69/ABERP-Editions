@@ -3166,6 +3166,93 @@ export async function retryQuotePricingJob(
   return invoke("retry_quote_pricing_job", { quoteId });
 }
 
+/** S349 / PR-40 (U1) — the priced breakdown sub-object on a job detail.
+ * Mirrors `aberp_quote_engine::QuoteBreakdown`. Every field is optional
+ * on the wire so a future engine-schema change can't break the panel
+ * render — the detail panel only shows the fields it recognises. */
+export interface PricingBreakdownView {
+  material_cost?: number;
+  labor_cost?: number;
+  setup_cost?: number;
+  overhead?: number;
+  margin?: number;
+  total_price?: number;
+  machining_minutes?: number;
+  inspection_minutes?: number;
+  route_to_5_axis?: boolean;
+  engine_version?: string;
+  reasoning_log?: string[];
+}
+
+/** S349 / PR-40 (U1) — the extracted FeatureGraph sub-object on a job
+ * detail. Mirrors `aberp_quote_engine::FeatureGraph`. Optional fields
+ * for the same forward-compat reason as `PricingBreakdownView`. */
+export interface FeatureGraphView {
+  _schema_version?: number;
+  bounding_box_mm?: [number, number, number];
+  volume_mm3?: number;
+  material_grade?: string;
+  features?: Array<{
+    feature_type: string;
+    count: number;
+    representative_size_mm: number;
+  }>;
+  requires_5_axis?: boolean;
+  thin_wall_present?: boolean;
+}
+
+/** S349 / PR-40 (U1) — full detail for one pricing job. Superset of
+ * `PricingJobRow` with the artifact fields the list omits. Mirrors
+ * `serve::PricingJobDetailView`. */
+export interface PricingJobDetail extends PricingJobRow {
+  /** Customer-uploaded CAD filename. The server fs path is not exposed. */
+  cad_filename: string;
+  /** Parsed pricing breakdown, or `null` before the row reached Pricing
+   * (also `null` on a corrupt column — the panel shows a placeholder
+   * keyed on the current state in both cases). */
+  breakdown: PricingBreakdownView | null;
+  /** Parsed FeatureGraph, or `null` before Extracting completed. */
+  feature_graph: FeatureGraphView | null;
+  /** Whether a rendered PDF exists for this row. No download route in
+   * v1 — the panel renders a presence chip. */
+  pdf_available: boolean;
+  valid_until_iso: string | null;
+  /** Always `"EUR"` in v1 (storefront + engine are EUR-denominated). */
+  currency: string;
+}
+
+/** S349 / PR-40 (U1) — fetch the full detail for one pricing job.
+ * Throws (rejected promise) on 404 / backend error; the panel renders
+ * the message inline. */
+export async function getQuotePricingJob(
+  quoteId: string,
+): Promise<PricingJobDetail> {
+  return invoke<PricingJobDetail>("get_quote_pricing_job", { quoteId });
+}
+
+/** S349 / PR-40 (U1) — paginated per-row audit trail. `events` are
+ * newest-first; `total` is the full quote-scoped count. Mirrors
+ * `serve::PricingJobAuditResponse`. */
+export interface PricingJobAuditPage {
+  events: AuditEntryView[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** S349 / PR-40 (U1) — fetch a page of the per-row audit trail. */
+export async function getQuotePricingJobAudit(
+  quoteId: string,
+  limit?: number,
+  offset?: number,
+): Promise<PricingJobAuditPage> {
+  return invoke<PricingJobAuditPage>("get_quote_pricing_job_audit", {
+    quoteId,
+    limit,
+    offset,
+  });
+}
+
 /** S282 / PR-267 — pricing-pipeline daemon status. Read-only mirror of
  * the boot-time Python-venv resolution outcome. Drives the SPA empty-
  * state copy on `PricingJobsList` so an operator never wonders why the

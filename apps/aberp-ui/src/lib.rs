@@ -396,6 +396,10 @@ pub fn run() {
             // is the only writer; this command pair just surfaces what
             // it has done.
             commands::list_quote_pricing_jobs,
+            // S349 / PR-40 (U1) — row-click detail panel + its paginated
+            // per-row audit trail.
+            commands::get_quote_pricing_job,
+            commands::get_quote_pricing_job_audit,
             commands::retry_quote_pricing_job,
             // S282 / PR-267 — pricing-pipeline daemon status. Drives
             // the empty-state copy on `PricingJobsList` (active vs

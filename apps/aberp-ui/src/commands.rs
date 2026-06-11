@@ -1322,6 +1322,44 @@ pub async fn list_quote_pricing_jobs(state: State<'_, AppState>) -> Result<Value
     forward_get(&state, "/api/quote-pricing-jobs", true).await
 }
 
+/// S349 / PR-40 (U1) — full single-row detail for the operator panel.
+/// `GET /api/quote-pricing-jobs/{quote_id}`. Carries the pricing
+/// breakdown, FeatureGraph, CAD filename, PDF presence + the list-row
+/// fields. 404 surfaces as an `Err(String)` the SPA renders inline.
+#[tauri::command]
+pub async fn get_quote_pricing_job(
+    state: State<'_, AppState>,
+    quote_id: String,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-pricing-jobs/{quote_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// S349 / PR-40 (U1) — paginated per-row audit trail feeding the detail
+/// panel's status timeline + last-writeback-outcome + raw-events
+/// sections. `GET /api/quote-pricing-jobs/{quote_id}/audit?limit&offset`.
+#[tauri::command]
+pub async fn get_quote_pricing_job_audit(
+    state: State<'_, AppState>,
+    quote_id: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Value, String> {
+    let mut path = format!("/api/quote-pricing-jobs/{quote_id}/audit");
+    let mut params: Vec<String> = Vec::new();
+    if let Some(l) = limit {
+        params.push(format!("limit={l}"));
+    }
+    if let Some(o) = offset {
+        params.push(format!("offset={o}"));
+    }
+    if !params.is_empty() {
+        path.push('?');
+        path.push_str(&params.join("&"));
+    }
+    forward_get(&state, &path, true).await
+}
+
 /// S279 / PR-265 — re-enqueue a Failed job at Fetched. Bumps the row's
 /// attempt counter so the next QuotePricingFailed audit row's
 /// idempotency key doesn't UNIQUE-collide with the prior failure.

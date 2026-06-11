@@ -3281,6 +3281,20 @@ fn build_router(state: AppState) -> Router {
             "/api/quote-pricing-jobs",
             get(handle_list_quote_pricing_jobs),
         )
+        // S349 / PR-40 (U1) — row-click detail panel. Full single-row
+        // artifacts (breakdown + FeatureGraph + CAD filename + PDF
+        // presence) keyed on the storefront quote id.
+        .route(
+            "/api/quote-pricing-jobs/:quote_id",
+            get(handle_get_quote_pricing_job_detail),
+        )
+        // S349 / PR-40 (U1) — paginated per-row audit trail feeding the
+        // detail panel's status timeline + last-writeback-outcome +
+        // raw-events sections.
+        .route(
+            "/api/quote-pricing-jobs/:quote_id/audit",
+            get(handle_get_quote_pricing_job_audit),
+        )
         .route(
             "/api/quote-pricing-jobs/:quote_id/retry",
             post(handle_retry_quote_pricing_job),
@@ -16896,9 +16910,7 @@ async fn handle_retry_quote_pricing_job(
     // Defence-in-depth on the quote id — only allow the storefront UUID
     // shape that the daemon enqueues. Stops a path-traversal attempt
     // from poisoning the DuckDB `WHERE` clause via the URL segment.
-    let uuid_re =
-        quote_id.len() == 36 && quote_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
-    if !uuid_re {
+    if !is_quote_id_shape(&quote_id) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({"error": "invalid quote_id"})),
@@ -16924,6 +16936,295 @@ async fn handle_retry_quote_pricing_job(
         new_attempt_n: new_n,
     };
     (axum::http::StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// S349 / PR-40 (U1) — wire shape for `GET /api/quote-pricing-jobs/:quote_id`,
+/// the operator detail panel. Superset of [`PricingJobView`] (every list
+/// column) plus the artifact fields the list deliberately omits.
+///
+/// What is NOT here, and why:
+/// - **CAD download / thumbnail** — only `cad_filename` is surfaced.
+///   `cad_local_path` is a server-fs path; v1 has no authenticated
+///   artifact-download route (deferred, flagged in the S349 report).
+/// - **PDF bytes** — `pdf_available` is a presence boolean; same reason.
+/// - **Structured writeback outcome (http_status / content_type /
+///   body_excerpt / retryable)** — those live in the
+///   `quote.priced_writeback_outcome` audit events, which the panel
+///   fetches from the sibling `/audit` endpoint. The SPA derives the
+///   "last writeback outcome" section from there rather than this view
+///   carrying a second ledger walk (delete-the-part, CLAUDE.md #13).
+/// - **Status transitions** — likewise derived from the audit events;
+///   the row keeps only the current state (audit U20).
+#[derive(Debug, serde::Serialize)]
+struct PricingJobDetailView {
+    quote_id: String,
+    state: String,
+    fetched_at: String,
+    updated_at: String,
+    customer_email: String,
+    customer_name: String,
+    material_grade: String,
+    quantity: u32,
+    feature_graph_hash: Option<String>,
+    total_price_eur: Option<f64>,
+    error_stage: Option<String>,
+    error_reason: Option<String>,
+    attempt_n: u32,
+    failure_kind: Option<String>,
+    /// Customer-uploaded CAD filename (e.g. `bracket.step`). The local
+    /// fs path is intentionally not exposed.
+    cad_filename: String,
+    /// Parsed pricing breakdown (the `aberp_quote_engine::QuoteBreakdown`
+    /// JSON). `null` when the row never reached Pricing — the SPA shows
+    /// a "breakdown not available" placeholder keyed on the current
+    /// state. `null` also on the (DB-tamper-only) un-parseable case so a
+    /// corrupt column never 500s the panel (CLAUDE.md #12 — the row's
+    /// state + error fields still tell the operator what happened).
+    breakdown: Option<serde_json::Value>,
+    /// Parsed FeatureGraph (`_schema_version`, `volume_mm3`,
+    /// `bounding_box_mm`, `features[]`, …). `null` before Extracting
+    /// completed. Same parse-failure posture as `breakdown`.
+    feature_graph: Option<serde_json::Value>,
+    /// Whether a rendered PDF exists on disk for this row. No download
+    /// route in v1 (flagged); the panel renders a presence chip.
+    pdf_available: bool,
+    valid_until_iso: Option<String>,
+    /// Fixed `EUR` — the storefront + engine are EUR-denominated
+    /// throughout (audit U13). Surfaced so the SPA currency label is
+    /// not a client-side literal; HUF/NAV conversion is an invoice-step
+    /// concern.
+    currency: &'static str,
+}
+
+/// S349 / PR-40 (U1) — `GET /api/quote-pricing-jobs/:quote_id`. Bearer-
+/// gated like the list/retry siblings. 404 when no row matches the
+/// (tenant, quote_id); 400 on a malformed quote id. Feeds the
+/// row-click detail panel.
+async fn handle_get_quote_pricing_job_detail(
+    AxumPath(quote_id): AxumPath<String>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if !is_quote_id_shape(&quote_id) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid quote_id"})),
+        )
+            .into_response();
+    }
+    let db_path = (*state.db_path).clone();
+    let tenant_id = state.tenant.as_str().to_string();
+    let qid = quote_id.clone();
+    let detail = match tokio::task::spawn_blocking(
+        move || -> Result<Option<crate::quote_pricing_jobs::JobDetail>> {
+            let conn = duckdb::Connection::open(&db_path).context("open DB")?;
+            crate::quote_pricing_jobs::get_job_detail(&conn, &qid, &tenant_id)
+        },
+    )
+    .await
+    {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => return internal_error("get_quote_pricing_job_detail", e),
+        Err(e) => return internal_error("get_quote_pricing_job_detail:join", anyhow!(e)),
+    };
+    let Some(d) = detail else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(error_body(format!(
+                "no pricing job found with quote_id {quote_id}"
+            ))),
+        )
+            .into_response();
+    };
+    // Parse-failure → None: a corrupt artifact column (DB tamper only —
+    // the daemon always writes valid serde JSON) renders as "not
+    // available" rather than 500-ing the operator's panel.
+    let breakdown = d
+        .breakdown_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let feature_graph = d
+        .feature_graph_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let view = PricingJobDetailView {
+        quote_id: d.row.quote_id,
+        state: d.row.state.as_str().to_string(),
+        fetched_at: d.row.fetched_at,
+        updated_at: d.row.updated_at,
+        customer_email: d.row.customer_email,
+        customer_name: d.row.customer_name,
+        material_grade: d.row.material_grade,
+        quantity: d.row.quantity,
+        feature_graph_hash: d.row.feature_graph_hash,
+        total_price_eur: d.row.total_price_eur,
+        error_stage: d.row.error_stage,
+        error_reason: d.row.error_reason,
+        attempt_n: d.row.attempt_n,
+        failure_kind: d.row.failure_kind.map(|k| k.as_str().to_string()),
+        cad_filename: d.cad_filename,
+        breakdown,
+        feature_graph,
+        pdf_available: d.pdf_path.is_some(),
+        valid_until_iso: d.valid_until_iso,
+        currency: "EUR",
+    };
+    (axum::http::StatusCode::OK, axum::Json(view)).into_response()
+}
+
+/// S349 / PR-40 (U1) — query params for the per-row audit page. Both
+/// optional; the handler clamps `limit` to [`AUDIT_PAGE_MAX`] and
+/// defaults to [`AUDIT_PAGE_DEFAULT`].
+#[derive(Debug, serde::Deserialize)]
+struct PricingJobAuditQuery {
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+const AUDIT_PAGE_DEFAULT: u32 = 50;
+const AUDIT_PAGE_MAX: u32 = 200;
+
+/// S349 / PR-40 (U1) — paginated audit-events body for one pricing job.
+/// `events` are newest-first (descending ledger seq). `total` is the
+/// full count of quote-scoped entries (so the SPA can render "showing
+/// 50 of 213").
+#[derive(serde::Serialize)]
+struct PricingJobAuditResponse {
+    events: Vec<AuditEntryView>,
+    total: usize,
+    limit: u32,
+    offset: u32,
+}
+
+/// S349 / PR-40 (U1) — `GET /api/quote-pricing-jobs/:quote_id/audit`.
+/// The hash-chain ledger entries whose typed payload carries this
+/// `quote_id`, newest-first + paginated. Separate from the detail
+/// endpoint so a long-lived row's audit trail never bloats the panel's
+/// initial render (audit U15). Mirrors the invoice `/audit/:id`
+/// pattern, keyed on `quote_id` instead of `invoice_id`.
+async fn handle_get_quote_pricing_job_audit(
+    AxumPath(quote_id): AxumPath<String>,
+    Query(q): Query<PricingJobAuditQuery>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if !is_quote_id_shape(&quote_id) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid quote_id"})),
+        )
+            .into_response();
+    }
+    let limit = q
+        .limit
+        .unwrap_or(AUDIT_PAGE_DEFAULT)
+        .clamp(1, AUDIT_PAGE_MAX);
+    let offset = q.offset.unwrap_or(0);
+    let state_for_task = state.clone();
+    let qid = quote_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        get_audit_for_quote(&state_for_task, &qid, limit, offset)
+    })
+    .await;
+    match result {
+        Ok(Ok((events, total))) => axum::Json(PricingJobAuditResponse {
+            events,
+            total,
+            limit,
+            offset,
+        })
+        .into_response(),
+        Ok(Err(e)) => internal_error("get_audit_for_quote", e),
+        Err(join_err) => internal_error(
+            "get_audit_for_quote:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+/// S349 / PR-40 (U1) — storefront-UUID shape guard, shared by the
+/// detail + audit + retry routes. Stops a path-traversal segment from
+/// reaching the DuckDB `WHERE` / the ledger walk. (Same check the retry
+/// handler open-coded since S279; lifted to a named fn now three routes
+/// share it.)
+fn is_quote_id_shape(quote_id: &str) -> bool {
+    quote_id.len() == 36 && quote_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// S349 / PR-40 (U1) — walk the audit ledger for entries whose typed
+/// payload carries `quote_id`, return them newest-first + paginated
+/// plus the unpaginated total. Mirrors [`get_audit_for_invoice`] but
+/// keyed on the quote id and with a page window.
+fn get_audit_for_quote(
+    state: &AppState,
+    quote_id: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<(Vec<AuditEntryView>, usize)> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute")?;
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
+        .context("open audit ledger for quote audit")?;
+    let entries = ledger.entries().context("read audit ledger entries")?;
+    let (page, total) = paginate_quote_audit_entries(&entries, quote_id, limit, offset);
+    let views = page.into_iter().map(audit_view_of).collect();
+    Ok((views, total))
+}
+
+/// S349 / PR-40 (U1) — pure filter + newest-first + page over a ledger
+/// entry slice. Returns the page (borrowed) + the unpaginated total of
+/// quote-scoped entries. Extracted from [`get_audit_for_quote`] so the
+/// filtering/ordering/pagination is vitest-free unit-testable against a
+/// fixture ledger (the handler half needs a full `AppState`).
+fn paginate_quote_audit_entries<'a>(
+    entries: &'a [Entry],
+    quote_id: &str,
+    limit: u32,
+    offset: u32,
+) -> (Vec<&'a Entry>, usize) {
+    // Filter to this quote's entries (ascending ledger seq), then
+    // reverse for newest-first before paginating.
+    let mut matching: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| extract_quote_id(e).as_deref() == Some(quote_id))
+        .collect();
+    matching.reverse();
+    let total = matching.len();
+    let page = matching
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    (page, total)
+}
+
+/// S349 / PR-40 (U1) — sibling of [`extract_invoice_id`] for the
+/// quote-scoped audit walk. Every `quote.pricing_*` /
+/// `quote.priced_writeback_outcome` payload carries a `quote_id: String`
+/// field; a payload without it (e.g. the list-scoped
+/// `quote.poll_outcome`) simply never matches. Permissive parse — a
+/// payload that fails to decode is skipped, never panics the view.
+fn extract_quote_id(entry: &Entry) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Probe {
+        quote_id: String,
+    }
+    let probe: Probe = serde_json::from_slice(&entry.payload).ok()?;
+    Some(probe.quote_id)
 }
 
 /// S282 / PR-267 — pricing-pipeline daemon status. Read-only mirror of
@@ -22944,5 +23245,112 @@ mod tests {
         std::env::set_var("ABERP_HTTPS_PORT", "  18443  ");
         assert_eq!(resolve_listener_port(0), 18443);
         std::env::remove_var("ABERP_HTTPS_PORT");
+    }
+
+    // ── S349 / PR-40 (U1) — pricing-job detail + audit route helpers ──
+
+    /// Append a quote-scoped pricing event carrying `quote_id` in its
+    /// payload (the shape `extract_quote_id` probes). `suffix` keeps the
+    /// idempotency key unique so multiple events don't dedup-collide.
+    fn write_quote_event(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        kind: EventKind,
+        quote_id: &str,
+        suffix: u32,
+    ) {
+        let payload = serde_json::json!({
+            "quote_id": quote_id,
+            "tenant_id": "t1",
+        });
+        ledger
+            .append(
+                kind,
+                serde_json::to_vec(&payload).unwrap(),
+                actor.clone(),
+                Some(format!("evt:{quote_id}:{suffix}")),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn s349_is_quote_id_shape_accepts_uuid_rejects_garbage() {
+        assert!(is_quote_id_shape("123e4567-e89b-12d3-a456-426614174000"));
+        // Wrong length.
+        assert!(!is_quote_id_shape("123e4567"));
+        assert!(!is_quote_id_shape(""));
+        // Path-traversal / injection chars.
+        assert!(!is_quote_id_shape("../../etc/passwd-aaaaaaaaaaaaaaaaaaaa"));
+        assert!(!is_quote_id_shape("123e4567-e89b-12d3-a456-42661417400'"));
+    }
+
+    #[test]
+    fn s349_extract_quote_id_probes_payload() {
+        let (mut ledger, actor) = fixture_ledger();
+        write_quote_event(
+            &mut ledger,
+            &actor,
+            EventKind::QuotePricingFetched,
+            "q-aaa",
+            0,
+        );
+        // An invoice draft carries `invoice_id`, NOT `quote_id`.
+        write_draft(&mut ledger, &actor, "inv_X", IdempotencyKey::new());
+        let entries = ledger.entries().unwrap();
+        let quote_ids: Vec<Option<String>> = entries.iter().map(extract_quote_id).collect();
+        assert!(quote_ids.contains(&Some("q-aaa".to_string())));
+        // The invoice entry has no quote_id → None, never mis-attributed.
+        assert!(quote_ids.iter().any(|q| q.is_none()));
+    }
+
+    #[test]
+    fn s349_paginate_quote_audit_filters_orders_and_pages() {
+        let (mut ledger, actor) = fixture_ledger();
+        // qX gets three lifecycle events (insertion order = seq asc).
+        write_quote_event(&mut ledger, &actor, EventKind::QuotePricingFetched, "qX", 0);
+        write_quote_event(
+            &mut ledger,
+            &actor,
+            EventKind::QuotePricingExtracted,
+            "qX",
+            1,
+        );
+        write_quote_event(&mut ledger, &actor, EventKind::QuotePricingPosted, "qX", 2);
+        // qY gets two — must never leak into qX's page.
+        write_quote_event(&mut ledger, &actor, EventKind::QuotePricingFetched, "qY", 0);
+        write_quote_event(&mut ledger, &actor, EventKind::QuotePricingFailed, "qY", 1);
+        let entries = ledger.entries().unwrap();
+
+        // Full page: filtered to qX, total = 3, newest-first.
+        let (page, total) = paginate_quote_audit_entries(&entries, "qX", 50, 0);
+        assert_eq!(total, 3, "only qX's three events counted");
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0].kind, EventKind::QuotePricingPosted, "newest first");
+        assert_eq!(page[1].kind, EventKind::QuotePricingExtracted);
+        assert_eq!(page[2].kind, EventKind::QuotePricingFetched);
+
+        // Pagination: limit 2 / offset 0 → newest two.
+        let (page, total) = paginate_quote_audit_entries(&entries, "qX", 2, 0);
+        assert_eq!(total, 3, "total is the unpaginated count");
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].kind, EventKind::QuotePricingPosted);
+        assert_eq!(page[1].kind, EventKind::QuotePricingExtracted);
+
+        // Next page: offset 2 → the oldest remaining one.
+        let (page, total) = paginate_quote_audit_entries(&entries, "qX", 2, 2);
+        assert_eq!(total, 3);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].kind, EventKind::QuotePricingFetched);
+
+        // Offset past the end → empty page, total still truthful.
+        let (page, total) = paginate_quote_audit_entries(&entries, "qX", 2, 99);
+        assert_eq!(total, 3);
+        assert!(page.is_empty());
+
+        // Unknown quote → empty, total 0 (the route maps to an empty
+        // events array, NOT a 404 — a row with no audit yet is valid).
+        let (page, total) = paginate_quote_audit_entries(&entries, "qZ", 50, 0);
+        assert_eq!(total, 0);
+        assert!(page.is_empty());
     }
 }

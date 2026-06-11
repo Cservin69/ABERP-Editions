@@ -848,6 +848,90 @@ pub struct JobArtifacts {
     pub pdf_path: Option<String>,
 }
 
+/// S349 / PR-40 (U1) — full single-row read for the operator detail
+/// panel. One SELECT that carries everything the list row has
+/// ([`PricingJobRow`]) plus the artifact columns the list deliberately
+/// omits (FeatureGraph JSON, pricing breakdown JSON, CAD filename, PDF
+/// path, valid-until). Returns `None` when no row matches so the route
+/// handler can map it to a 404 (rather than `get_job_artifacts`'s
+/// `Err`, which is the daemon's "this should exist mid-pipeline" path).
+///
+/// `cad_local_path` / `pdf_path` are server-filesystem paths and are
+/// NOT surfaced to the SPA — the wire view exposes only the filename
+/// and presence booleans (no fs-layout leak, no unauthenticated
+/// download URL in v1). See `serve::PricingJobDetailView`.
+#[derive(Debug, Clone)]
+pub struct JobDetail {
+    pub row: PricingJobRow,
+    pub cad_filename: String,
+    pub feature_graph_json: Option<String>,
+    pub breakdown_json: Option<String>,
+    pub pdf_path: Option<String>,
+    pub valid_until_iso: Option<String>,
+}
+
+/// S349 / PR-40 (U1) — read one job row + its artifacts for the detail
+/// panel. Tenant-scoped like every other reader. `Ok(None)` on a
+/// missing row (→ 404 at the route).
+pub fn get_job_detail(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+) -> Result<Option<JobDetail>> {
+    ensure_schema(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT quote_id, tenant_id, state, fetched_at, updated_at,
+                    customer_email, customer_name, material_grade, quantity,
+                    feature_graph_hash, total_price_eur, error_stage, error_reason,
+                    attempt_n, failure_kind,
+                    cad_filename, feature_graph_json, breakdown_json, pdf_path,
+                    valid_until_iso
+                FROM quote_pricing_jobs
+                WHERE quote_id = ? AND tenant_id = ?",
+        )
+        .context("prepare get_job_detail")?;
+    let mut rows = stmt
+        .query(params![quote_id, tenant_id])
+        .context("execute get_job_detail")?;
+    let Some(r) = rows.next().context("step get_job_detail")? else {
+        return Ok(None);
+    };
+    let state_str: String = r.get(2).context("get state")?;
+    let state = JobState::parse_str(&state_str)?;
+    let qty: i64 = r.get(8).context("get quantity")?;
+    let attempt_n: i64 = r.get(13).context("get attempt_n")?;
+    let failure_kind = match r.get::<_, Option<String>>(14).ok().flatten() {
+        Some(s) => Some(FailureKind::parse_str(&s)?),
+        None => None,
+    };
+    let row = PricingJobRow {
+        quote_id: r.get(0).context("get quote_id")?,
+        tenant_id: r.get(1).context("get tenant_id")?,
+        state,
+        fetched_at: r.get(3).context("get fetched_at")?,
+        updated_at: r.get(4).context("get updated_at")?,
+        customer_email: r.get(5).context("get customer_email")?,
+        customer_name: r.get(6).context("get customer_name")?,
+        material_grade: r.get(7).context("get material_grade")?,
+        quantity: qty.max(0) as u32,
+        feature_graph_hash: r.get(9).ok(),
+        total_price_eur: r.get(10).ok(),
+        error_stage: r.get(11).ok(),
+        error_reason: r.get(12).ok(),
+        attempt_n: attempt_n.max(0) as u32,
+        failure_kind,
+    };
+    Ok(Some(JobDetail {
+        row,
+        cad_filename: r.get(15).context("get cad_filename")?,
+        feature_graph_json: r.get(16).ok(),
+        breakdown_json: r.get(17).ok(),
+        pdf_path: r.get(18).ok(),
+        valid_until_iso: r.get(19).ok(),
+    }))
+}
+
 /// Trim CR/LF/NUL out of a free-text error reason and truncate to
 /// 1000 chars. The reason rides into the SPA error column +
 /// audit-payload `reason` field; we never want header-injection chars
@@ -1767,5 +1851,142 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, JobState::Failed);
         assert_eq!(rows[0].failure_kind, None);
+    }
+
+    // ── S349 / PR-40 (U1) — get_job_detail ──────────────────────────
+
+    #[test]
+    fn s349_get_job_detail_missing_row_is_none() {
+        let conn = open_mem();
+        let got = get_job_detail(&conn, "no-such-quote", "T").expect("query");
+        assert!(got.is_none(), "missing row must be None (→ 404 at route)");
+    }
+
+    #[test]
+    fn s349_get_job_detail_carries_row_plus_artifacts() {
+        let mut conn = open_mem();
+        insert_fetched_job(
+            &conn,
+            "qd1",
+            "T",
+            "alice@example.com",
+            "Alice",
+            "AL_6061_T6",
+            7,
+            "bracket.step",
+            "/tmp/qd1/bracket.step",
+            fixed_ts(),
+        )
+        .expect("insert");
+        set_state(&conn, "qd1", "T", JobState::Extracting, fixed_ts()).expect("ex");
+        set_extracted(
+            &mut conn,
+            "qd1",
+            "T",
+            "blake3:beef",
+            "{\"_schema_version\":1,\"volume_mm3\":1000.0}",
+            fixed_ts(),
+        )
+        .expect("extracted");
+        set_priced(
+            &mut conn,
+            "qd1",
+            "T",
+            "{\"total_price\":42.5,\"material_cost\":10.0}",
+            42.5,
+            fixed_ts(),
+        )
+        .expect("priced");
+        set_rendered(
+            &mut conn,
+            "qd1",
+            "T",
+            "/tmp/qd1/priced.pdf",
+            "2026-07-06",
+            fixed_ts(),
+        )
+        .expect("rendered");
+
+        let d = get_job_detail(&conn, "qd1", "T")
+            .expect("query")
+            .expect("row present");
+        // Row fields surface unchanged.
+        assert_eq!(d.row.quote_id, "qd1");
+        assert_eq!(d.row.customer_name, "Alice");
+        assert_eq!(d.row.material_grade, "AL_6061_T6");
+        assert_eq!(d.row.quantity, 7);
+        assert_eq!(d.row.total_price_eur, Some(42.5));
+        assert_eq!(d.row.state, JobState::PostingBack);
+        // Artifact columns the list omits.
+        assert_eq!(d.cad_filename, "bracket.step");
+        assert_eq!(d.valid_until_iso.as_deref(), Some("2026-07-06"));
+        assert!(d.pdf_path.is_some(), "pdf_path set after render");
+        assert!(
+            d.breakdown_json.as_deref().unwrap().contains("total_price"),
+            "breakdown JSON carried"
+        );
+        assert!(
+            d.feature_graph_json
+                .as_deref()
+                .unwrap()
+                .contains("volume_mm3"),
+            "FeatureGraph JSON carried"
+        );
+    }
+
+    #[test]
+    fn s349_get_job_detail_null_artifacts_on_early_row() {
+        // Adversarial: a row that never reached Pricing has null
+        // breakdown/featuregraph/pdf — get_job_detail must return Some
+        // with those as None (the route renders a "not available"
+        // placeholder, NOT a 500 or a blank section).
+        let conn = open_mem();
+        insert_fetched_job(
+            &conn,
+            "qd2",
+            "T",
+            "b@x",
+            "Bob",
+            "unknown",
+            1,
+            "part.iges",
+            "/tmp/qd2/part.iges",
+            fixed_ts(),
+        )
+        .expect("insert");
+        let d = get_job_detail(&conn, "qd2", "T")
+            .expect("query")
+            .expect("row present");
+        assert_eq!(d.row.state, JobState::Fetched);
+        assert_eq!(d.cad_filename, "part.iges");
+        assert!(d.breakdown_json.is_none(), "no breakdown before pricing");
+        assert!(d.feature_graph_json.is_none(), "no graph before extract");
+        assert!(d.pdf_path.is_none(), "no PDF before render");
+        assert!(d.valid_until_iso.is_none());
+    }
+
+    #[test]
+    fn s349_get_job_detail_is_tenant_scoped() {
+        let conn = open_mem();
+        insert_fetched_job(
+            &conn,
+            "qd3",
+            "T",
+            "c@x",
+            "Cara",
+            "AL",
+            1,
+            "p.stl",
+            "/tmp/p.stl",
+            fixed_ts(),
+        )
+        .expect("insert");
+        // Same quote_id, different tenant → no leak.
+        assert!(
+            get_job_detail(&conn, "qd3", "OTHER")
+                .expect("query")
+                .is_none(),
+            "tenant isolation: a foreign tenant sees no row"
+        );
     }
 }

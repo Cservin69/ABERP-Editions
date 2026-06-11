@@ -20,6 +20,7 @@
   import { formatInvoiceDate } from "../lib/format";
   import { classifyEmptyState } from "../lib/pricing-empty-state";
   import { failureKindBadge } from "../lib/pricing-failure-kind";
+  import PricingJobDetail from "./PricingJobDetail.svelte";
 
   type LoadState = "idle" | "loading" | "ready" | "error";
 
@@ -28,6 +29,11 @@
   let rows: PricingJobRow[] = $state([]);
   let retryBusyQuoteId = $state<string | null>(null);
   let retryError = $state<string | null>(null);
+  // S349 / PR-40 (U1) — selected row drives the detail panel. `null`
+  // keeps it closed; a row click sets the quote_id. In-memory Svelte
+  // state (never browser storage); the panel closes on Esc / backdrop /
+  // X / tab-change (route unmount) per its native-<dialog> semantics.
+  let selectedQuoteId = $state<string | null>(null);
   // S282 / PR-267 — pipeline daemon status. Fetched in parallel with the
   // jobs list so the empty-state copy can differentiate dormant /
   // active / errored. Null until first fetch returns.
@@ -238,7 +244,20 @@
       </thead>
       <tbody>
         {#each rows as row (row.quote_id)}
-          <tr data-testid={`pricing-jobs-row-${row.quote_id}`}>
+          <tr
+            data-testid={`pricing-jobs-row-${row.quote_id}`}
+            class="pricing-jobs__row"
+            tabindex="0"
+            role="button"
+            aria-label={`Részletek / Details ${row.quote_id}`}
+            onclick={() => (selectedQuoteId = row.quote_id)}
+            onkeydown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                selectedQuoteId = row.quote_id;
+              }
+            }}
+          >
             <td>
               <code title={row.quote_id}>{shortQuoteId(row.quote_id)}</code>
               {#if row.attempt_n > 0}
@@ -287,7 +306,10 @@
                 <button
                   type="button"
                   class="btn btn--secondary"
-                  onclick={() => void onRetry(row.quote_id)}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    void onRetry(row.quote_id);
+                  }}
                   disabled={retryBusyQuoteId === row.quote_id}
                   data-testid={`pricing-jobs-retry-${row.quote_id}`}
                 >
@@ -302,6 +324,15 @@
       </tbody>
     </table>
   {/if}
+
+  <!-- S349 / PR-40 (U1) — row-detail panel. Mounted once; the
+       `quoteId` prop toggling between a string and `null` opens/closes
+       the native <dialog>. -->
+  <PricingJobDetail
+    quoteId={selectedQuoteId}
+    onClose={() => (selectedQuoteId = null)}
+    onRetried={() => void refresh()}
+  />
 </section>
 
 <style>
@@ -356,6 +387,17 @@
   .pricing-jobs__tbl th {
     font-weight: 600;
     color: var(--color-text-muted, #9ca3af);
+  }
+  /* S349 / PR-40 (U1) — clickable rows open the detail panel. */
+  .pricing-jobs__row {
+    cursor: pointer;
+  }
+  .pricing-jobs__row:hover {
+    background: var(--color-surface-2, #243042);
+  }
+  .pricing-jobs__row:focus-visible {
+    outline: 2px solid var(--color-accent, #60a5fa);
+    outline-offset: -2px;
   }
   .pricing-jobs__muted {
     color: var(--color-text-muted, #9ca3af);

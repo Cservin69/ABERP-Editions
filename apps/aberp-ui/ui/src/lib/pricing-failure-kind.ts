@@ -89,6 +89,21 @@ const WRITEBACK_BADGES: Record<string, FailureKindBadge> = {
   },
 };
 
+/** S349 / PR-40 (U1) — resolve a `quote.priced_writeback_outcome`
+ *  closed-vocab `outcome` tag (as stored in the audit payload) to its
+ *  bilingual badge. Reuses [`WRITEBACK_BADGES`] for the failure tags and
+ *  adds the `success` case the failure-only error-reason path never
+ *  sees. Used by the detail panel's "Last writeback outcome" section to
+ *  render the structured verdict (the table cell uses `failureKindBadge`
+ *  off the free-text reason instead). An unrecognised tag from a future
+ *  backend surfaces verbatim rather than being dropped (CLAUDE.md #12). */
+export function writebackOutcomeBadge(outcome: string): FailureKindBadge {
+  if (outcome === "success") {
+    return { label: "✓ Sikeres / Success", className: "chip chip--ok" };
+  }
+  return WRITEBACK_BADGES[outcome] ?? { label: outcome, className: "chip" };
+}
+
 /** Pull the `writeback:<tag>` token out of an error reason and resolve it
  *  to the granular badge. `null` when the reason is not a typed
  *  priced-writeback verdict (legacy rows, non-post-stage failures). */
