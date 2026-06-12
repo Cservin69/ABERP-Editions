@@ -1427,17 +1427,20 @@ fn write_line_modification_reference(
 /// its `<lineNumber>`. `None` (plain new invoice) emits a NORMAL line with
 /// no reference (ADR-0049 §NAV emit).
 ///
-/// S369 — `line_number_offset` shifts both `<lineNumber>` and the
-/// chain-body `<lineNumberReference>` so they CONTINUE PAST the base
-/// invoice's line numbers. For initial issuance it is `0` (lines number
-/// `1..=n`). For storno / modification chain children it is the base
-/// invoice's line count, so a CREATE operation never reuses a line
-/// number NAV already recorded on the base — NAV's
-/// `INVOICE_LINE_ALREADY_EXISTS` business rule ABORTs the submit
-/// otherwise (prod incident, S370 root cause). The safety property lives
-/// here, NOT in caller discipline: every chain body routes through this
-/// one writer, so a future chain emitter cannot silently emit colliding
-/// line numbers.
+/// `line_number_offset` shifts ONLY the chain-body `<lineNumberReference>`
+/// so it points PAST the base invoice's line numbers — it does NOT touch
+/// `<lineNumber>`. `<lineNumber>` is always document-local: 1-based and
+/// monotonic within EACH invoice (`1..=n`), per NAV's
+/// `LINE_NUMBER_NOT_SEQUENTIAL` business rule (S372 prod incident — S369
+/// over-shifted `<lineNumber>` too, ABORTing the submit). For initial
+/// issuance the offset is `0` (reference equals line number). For storno /
+/// modification chain children it is the base invoice's line count, so a
+/// CREATE operation's `<lineNumberReference>` never reuses a line number
+/// NAV already recorded on the base — NAV's `INVOICE_LINE_ALREADY_EXISTS`
+/// business rule ABORTs the submit otherwise (prod incident, S370 root
+/// cause). The safety property lives here, NOT in caller discipline: every
+/// chain body routes through this one writer, so a future chain emitter
+/// cannot silently emit a colliding `<lineNumberReference>`.
 fn write_lines(
     w: &mut Writer<&mut Vec<u8>>,
     lines: &[LineItem],
@@ -1449,13 +1452,20 @@ fn write_lines(
     w.write_event(Event::Start(BytesStart::new("invoiceLines")))?;
     text_element(w, "mergedItemIndicator", "false")?;
     for (ordinal, line) in lines.iter().enumerate() {
-        let line_number = (line_number_offset + ordinal + 1) as u32;
+        // `<lineNumber>` is the DOCUMENT-LOCAL position — always 1-based and
+        // monotonic WITHIN this invoice (`1..=n`), NEVER shifted; NAV's
+        // LINE_NUMBER_NOT_SEQUENTIAL business rule ABORTs the submit otherwise
+        // (S372 prod incident). Only the chain-body `<lineNumberReference>`
+        // carries `line_number_offset` so it points PAST the base invoice's
+        // line numbers.
+        let line_number = (ordinal + 1) as u32;
+        let line_number_reference = (line_number_offset + ordinal + 1) as u32;
         w.write_event(Event::Start(BytesStart::new("line")))?;
         text_element(w, "lineNumber", &line_number.to_string())?;
         // <lineModificationReference> — chain-body-only (storno / modify).
         // Positioned after <lineNumber> per NAV LineType ordering.
         if let Some(op) = line_operation {
-            write_line_modification_reference(w, line_number, op)?;
+            write_line_modification_reference(w, line_number_reference, op)?;
         }
         text_element(w, "lineExpressionIndicator", "false")?;
         text_element(w, "lineDescription", &line.description)?;

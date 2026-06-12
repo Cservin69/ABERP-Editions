@@ -507,11 +507,13 @@ fn modification_line_operation_is_create_across_input_variations() {
         .expect("multi-line modification with CREATE ops must pass the v3.0 invariant check");
 }
 
-/// S369 headline pin (modification leg). Modification of a 2-line base:
-/// the full-replace CREATE lines MUST continue past the base — the first
-/// line references 3 (base_line_count 2 + 0 + 1), NOT 1, which would
-/// collide with the base's recorded line 1 and trip NAV's
-/// INVOICE_LINE_ALREADY_EXISTS (S370 prod incident).
+/// S369/S372 headline pin (modification leg). Modification of a 2-line
+/// base: the full-replace CREATE lines' `<lineNumberReference>` MUST
+/// continue past the base — the first references 3 (base_line_count 2 + 0
+/// + 1), NOT 1, which would collide with the base's recorded line 1 and
+/// trip NAV's INVOICE_LINE_ALREADY_EXISTS (S370 prod incident). Their own
+/// `<lineNumber>` stays document-local 1 (S372: only the reference carries
+/// the offset; NAV LINE_NUMBER_NOT_SEQUENTIAL otherwise).
 #[test]
 fn modification_line_number_reference_continues_past_two_line_base() {
     let mut modification = build_minimal_modification_invoice();
@@ -555,8 +557,9 @@ fn modification_line_number_reference_continues_past_two_line_base() {
          (NAV INVOICE_LINE_ALREADY_EXISTS); body:\n{body}"
     );
     assert!(
-        body.contains("<lineNumber>3</lineNumber>"),
-        "modification <lineNumber> must continue past the base too (3); body:\n{body}"
+        body.contains("<lineNumber>1</lineNumber>"),
+        "modification <lineNumber> stays document-local 1 — only the \
+         reference carries the offset (S372 LINE_NUMBER_NOT_SEQUENTIAL); body:\n{body}"
     );
 
     validate_invoice_data(&xml)

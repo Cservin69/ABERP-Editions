@@ -713,11 +713,13 @@ fn storno_line_operation_is_create_across_input_variations() {
 // S369 — lineNumberReference offset (NAV INVOICE_LINE_ALREADY_EXISTS).
 //
 // A storno's CREATE lines add NEW lines to NAV's virtual consolidated
-// invoice; their <lineNumber> / <lineNumberReference> MUST continue past
-// the base's line numbers or NAV ABORTs the submit with
-// `INVOICE_LINE_ALREADY_EXISTS` (prod incident, S370 root cause). The
-// offset lives in `StornoReference::base_line_count`, read from the
-// base's on-disk XML by `count_invoice_lines_from_xml` at issuance time.
+// invoice; their <lineNumberReference> MUST continue past the base's line
+// numbers or NAV ABORTs the submit with `INVOICE_LINE_ALREADY_EXISTS`
+// (prod incident, S370 root cause). Their own <lineNumber> stays
+// document-local 1..=n (S372: only the reference carries the offset; NAV
+// LINE_NUMBER_NOT_SEQUENTIAL otherwise). The offset lives in
+// `StornoReference::base_line_count`, read from the base's on-disk XML by
+// `count_invoice_lines_from_xml` at issuance time.
 // ──────────────────────────────────────────────────────────────────────
 
 /// Build a storno fixture with `n` lines (positive in-memory; the
@@ -737,11 +739,12 @@ fn build_storno_invoice_with_lines(n: usize) -> ReadyInvoice {
     invoice
 }
 
-/// S369 headline pin. Storno of a 3-line base: the three storno lines
-/// MUST number 4, 5, 6 (base_line_count 3 + ordinal + 1) on BOTH
-/// `<lineNumber>` and `<lineNumberReference>` — NOT 1, 2, 3, which would
-/// collide with the base's recorded lines and trip NAV's
-/// INVOICE_LINE_ALREADY_EXISTS.
+/// S369/S372 headline pin. Storno of a 3-line base: the three storno
+/// lines' `<lineNumberReference>` MUST be 4, 5, 6 (base_line_count 3 +
+/// ordinal + 1) — NOT 1, 2, 3, which would collide with the base's
+/// recorded lines and trip NAV's INVOICE_LINE_ALREADY_EXISTS. Their
+/// `<lineNumber>` stays document-local 1, 2, 3 (S372: only the reference
+/// carries the offset; NAV LINE_NUMBER_NOT_SEQUENTIAL otherwise).
 #[test]
 fn storno_line_number_reference_continues_past_three_line_base() {
     let storno = build_storno_invoice_with_lines(3);
@@ -767,14 +770,15 @@ fn storno_line_number_reference_continues_past_three_line_base() {
             && body.contains("<lineNumberReference>6</lineNumberReference>"),
         "storno lines 2 and 3 must reference 5 and 6; body:\n{body}"
     );
-    // The <lineNumber> elements continue past the base too (the offset
-    // shifts both — NAV's consolidated invoice numbers chain lines
-    // sequentially after the base).
+    // The <lineNumber> elements stay DOCUMENT-LOCAL: 1, 2, 3 — only the
+    // <lineNumberReference> carries the chain offset. NAV requires each
+    // invoice's own <lineNumber> sequence to start at 1 and be monotonic
+    // (LINE_NUMBER_NOT_SEQUENTIAL, S372 prod incident — S369 over-shifted).
     assert!(
-        body.contains("<lineNumber>4</lineNumber>")
-            && body.contains("<lineNumber>5</lineNumber>")
-            && body.contains("<lineNumber>6</lineNumber>"),
-        "storno <lineNumber> elements must be 4, 5, 6; body:\n{body}"
+        body.contains("<lineNumber>1</lineNumber>")
+            && body.contains("<lineNumber>2</lineNumber>")
+            && body.contains("<lineNumber>3</lineNumber>"),
+        "storno <lineNumber> elements must be document-local 1, 2, 3; body:\n{body}"
     );
     // Regression guard: NONE of the base's line numbers (1, 2, 3) may
     // reappear as a CREATE-line reference.
@@ -836,4 +840,105 @@ fn storno_line_offset_round_trips_through_on_disk_base_count() {
     );
 
     let _ = std::fs::remove_file(&path);
+}
+
+/// S372 regression. Storno of a SINGLE-line base (the live prod incident,
+/// DEV TEST-ABERP/2026/0042): the one storno line's `<lineNumber>` MUST be
+/// document-local `1` while its `<lineNumberReference>` is `2`. S369's bug
+/// shifted BOTH to `2`, tripping NAV's LINE_NUMBER_NOT_SEQUENTIAL.
+#[test]
+fn storno_single_line_base_keeps_document_local_line_number() {
+    let storno = build_storno_invoice_with_lines(1);
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let reference = StornoReference {
+        base_invoice_number: "INV-default/00001".to_string(),
+        modification_index: 1,
+        base_line_count: 1,
+    };
+    let xml =
+        nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
+            .expect("1-line storno renders");
+    let body = std::str::from_utf8(&xml).unwrap();
+
+    assert!(
+        body.contains("<lineNumber>1</lineNumber>"),
+        "storno of a 1-line base must keep <lineNumber>1; body:\n{body}"
+    );
+    assert!(
+        body.contains("<lineNumberReference>2</lineNumberReference>"),
+        "storno of a 1-line base must reference base line 2; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<lineNumber>2</lineNumber>"),
+        "S372 regression — <lineNumber> must NOT be shifted to 2 \
+         (NAV LINE_NUMBER_NOT_SEQUENTIAL); body:\n{body}"
+    );
+
+    validate_invoice_data(&xml).expect("1-line storno must pass the v3.0 invariant check");
+}
+
+/// S372 regression. The storno's OWN line count drives `<lineNumber>`; the
+/// base's count drives `<lineNumberReference>`. A 2-line storno against a
+/// 3-line base must emit `<lineNumber>` `[1, 2]` and `<lineNumberReference>`
+/// `[4, 5]` — the two axes are independent.
+#[test]
+fn storno_line_number_and_reference_are_independent_axes() {
+    let storno = build_storno_invoice_with_lines(2);
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let reference = StornoReference {
+        base_invoice_number: "INV-default/00001".to_string(),
+        modification_index: 1,
+        base_line_count: 3,
+    };
+    let xml =
+        nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
+            .expect("2-line storno against 3-line base renders");
+    let body = std::str::from_utf8(&xml).unwrap();
+
+    // Document-local line numbers: 1, 2 (NOT shifted by the base count).
+    assert!(
+        body.contains("<lineNumber>1</lineNumber>") && body.contains("<lineNumber>2</lineNumber>"),
+        "<lineNumber> must be document-local 1, 2; body:\n{body}"
+    );
+    // References continue past the 3-line base: 4, 5.
+    assert!(
+        body.contains("<lineNumberReference>4</lineNumberReference>")
+            && body.contains("<lineNumberReference>5</lineNumberReference>"),
+        "<lineNumberReference> must continue past the base as 4, 5; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<lineNumber>4</lineNumber>")
+            && !body.contains("<lineNumber>5</lineNumber>"),
+        "S372 regression — <lineNumber> must NOT carry the base offset; body:\n{body}"
+    );
+
+    validate_invoice_data(&xml).expect("2-line storno must pass the v3.0 invariant check");
+}
+
+/// S372 regression guard for the offset=0 case. Plain initial issuance
+/// (no chain) numbers its lines document-local 1..=n. This pins that the
+/// `<lineNumber>` derivation never silently regrows the chain offset.
+#[test]
+fn initial_issuance_numbers_lines_document_local() {
+    let invoice = build_storno_invoice_with_lines(2);
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("2-line initial issuance renders");
+    let body = std::str::from_utf8(&xml).unwrap();
+
+    assert!(
+        body.contains("<lineNumber>1</lineNumber>") && body.contains("<lineNumber>2</lineNumber>"),
+        "initial issuance must number lines 1, 2; body:\n{body}"
+    );
+    // Plain issuance carries NO <lineModificationReference>, so no
+    // <lineNumberReference> element at all.
+    assert!(
+        !body.contains("<lineNumberReference>"),
+        "plain initial issuance must not emit any <lineNumberReference>; body:\n{body}"
+    );
+
+    validate_invoice_data(&xml).expect("initial issuance must pass the v3.0 invariant check");
 }
