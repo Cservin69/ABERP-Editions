@@ -838,6 +838,15 @@
       // `Finalized` → `Storno` (the `is_storno_base` arm of
       // derive_state's priority ladder, ADR-0036 §3) AND the
       // `chain_children` list grows.
+      //
+      // S369 — the parent reload payload now carries each chain child's
+      // own `state` + `last_ack_status` (derived fresh server-side per
+      // `get_invoice_detail` call). So a later reload of the PARENT
+      // surfaces a NAV-rejected storno (Rejected / ABORTED — the
+      // INVOICE_LINE_ALREADY_EXISTS failure) on the chain-children row
+      // without a separate child fetch. The child's state reads
+      // Pending/Ready immediately after issuance and flips to Rejected
+      // once NAV's ABORTED ack lands.
       await load(detail.invoice_id);
       stornoReason = "";
       mutationState = { kind: "idle" };
@@ -1658,6 +1667,7 @@
         <ul class="chain-children-list">
           {#each detail.chain_children as child (child.invoice_id)}
             {@const childMeta = labelMeta(child.kind)}
+            {@const childStateMeta = labelMeta(child.state)}
             <li class="mono">
               <span class="chain-index-prefix">#{child.modification_index}</span>
               <span
@@ -1667,6 +1677,33 @@
                 <span class="state-icon" aria-hidden="true">{childMeta.icon}</span>
                 <span class="state-text">{child.kind}</span>
               </span>
+              <!-- S369 / S370 — the child's own lifecycle state chip.
+                   Surfaces a NAV-rejected storno (Rejected / ABORTED,
+                   the INVOICE_LINE_ALREADY_EXISTS failure) on the base's
+                   detail view, which before S369 showed only the kind
+                   chip above. Same labelMeta dispatch + state-pill
+                   styling as the meta-grid state chip. -->
+              <span
+                class="state-pill {signalClass(childStateMeta.signal)}"
+                title={childStateMeta.tooltip}
+              >
+                <span class="state-icon" aria-hidden="true"
+                  >{childStateMeta.icon}</span
+                >
+                <span class="state-text">{child.state}</span>
+              </span>
+              {#if child.last_ack_status !== null}
+                {@const childAckMeta = ackLabelMeta(child.last_ack_status)}
+                <span
+                  class="state-pill {signalClass(childAckMeta.signal)}"
+                  title={childAckMeta.tooltip}
+                >
+                  <span class="state-icon" aria-hidden="true"
+                    >{childAckMeta.icon}</span
+                  >
+                  <span class="state-text">{child.last_ack_status}</span>
+                </span>
+              {/if}
               <span class="chain-arrow" aria-hidden="true">→</span>
               <button
                 type="button"

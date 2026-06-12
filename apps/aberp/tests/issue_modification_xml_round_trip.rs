@@ -94,6 +94,10 @@ fn minimal_modification_reference() -> ModificationReference {
         base_invoice_number: "INV-default/00001".to_string(),
         modification_index: 1,
         modification_issue_date: "2026-05-21".to_string(),
+        // S369 — the minimal fixture full-replaces a single-line base,
+        // so base_line_count = 1 and the modification's CREATE line
+        // numbers at base_line_count + 1 = 2.
+        base_line_count: 1,
     }
 }
 
@@ -145,6 +149,7 @@ fn modification_xml_carries_invoice_reference_and_modification_issue_date() {
         base_invoice_number: "INV-default/00001".to_string(),
         modification_index: 3, // pin a non-1 index to defend against literal-1 elision
         modification_issue_date: "2026-05-21".to_string(),
+        base_line_count: 1, // S369 — single-line base
     };
     let xml = nav_xml::render_modification_data(
         &modification,
@@ -259,9 +264,20 @@ fn modification_xml_carries_line_modification_reference() {
         "modification line MUST carry <lineModificationReference> \
          (NAV LINE_MODIFICATION_EXPECTED); body:\n{body}"
     );
+    // S369 — lineNumberReference CONTINUES PAST the base's line count.
+    // The minimal fixture's base carries 1 line (base_line_count = 1),
+    // so the modification's CREATE line numbers at 1 + 0 + 1 = 2. The
+    // pre-S369 emit reused `1`, colliding with base line 1 → NAV
+    // INVOICE_LINE_ALREADY_EXISTS (S370 prod incident).
     assert!(
-        body.contains("<lineNumberReference>1</lineNumberReference>"),
-        "lineNumberReference must be the original line position (1); body:\n{body}"
+        body.contains("<lineNumberReference>2</lineNumberReference>"),
+        "lineNumberReference must continue past the base's line count \
+         (base_line_count 1 → first modification line 2); body:\n{body}"
+    );
+    assert!(
+        !body.contains("<lineNumberReference>1</lineNumberReference>"),
+        "S369 regression guard — must NOT reuse base line number 1 \
+         (NAV INVOICE_LINE_ALREADY_EXISTS); body:\n{body}"
     );
     assert!(
         body.contains("<lineOperation>CREATE</lineOperation>"),
@@ -294,6 +310,7 @@ fn modification_xml_invoice_number_is_the_modifications_own_seq() {
         base_invoice_number: "INV-default/00007".to_string(), // base's
         modification_index: 1,
         modification_issue_date: "2026-05-21".to_string(),
+        base_line_count: 1, // S369 — single-line base
     };
     let xml = nav_xml::render_modification_data(
         &modification,
@@ -405,6 +422,7 @@ fn modification_xml_original_invoice_number_round_trips_verbatim() {
             base_invoice_number: (*original_number).to_string(),
             modification_index: 1,
             modification_issue_date: "2026-05-21".to_string(),
+            base_line_count: 1, // S369 — single-line base
         };
         let xml = nav_xml::render_modification_data(
             &modification,
@@ -487,4 +505,60 @@ fn modification_line_operation_is_create_across_input_variations() {
     );
     validate_invoice_data(&xml)
         .expect("multi-line modification with CREATE ops must pass the v3.0 invariant check");
+}
+
+/// S369 headline pin (modification leg). Modification of a 2-line base:
+/// the full-replace CREATE lines MUST continue past the base — the first
+/// line references 3 (base_line_count 2 + 0 + 1), NOT 1, which would
+/// collide with the base's recorded line 1 and trip NAV's
+/// INVOICE_LINE_ALREADY_EXISTS (S370 prod incident).
+#[test]
+fn modification_line_number_reference_continues_past_two_line_base() {
+    let mut modification = build_minimal_modification_invoice();
+    // A single appended/corrected line is enough to pin the offset; the
+    // base's count, not the modification's, drives the continuation.
+    modification.lines = vec![LineItem {
+        description: "Corrected line".to_string(),
+        quantity: rust_decimal::Decimal::from(1),
+        unit_price: Huf(1200),
+        vat_rate_basis_points: 2700,
+        note: None,
+        unit: None,
+    }];
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let reference = ModificationReference {
+        base_invoice_number: "INV-default/00001".to_string(),
+        modification_index: 1,
+        modification_issue_date: "2026-05-21".to_string(),
+        base_line_count: 2,
+    };
+    let xml = nav_xml::render_modification_data(
+        &modification,
+        &series,
+        &parties,
+        &reference,
+        Currency::Huf,
+        None,
+    )
+    .expect("modification of 2-line base renders");
+    let body = std::str::from_utf8(&xml).unwrap();
+
+    assert!(
+        body.contains("<lineNumberReference>3</lineNumberReference>"),
+        "modification's appended line of a 2-line base must reference line 3; body:\n{body}"
+    );
+    assert!(
+        !body.contains("<lineNumberReference>1</lineNumberReference>")
+            && !body.contains("<lineNumberReference>2</lineNumberReference>"),
+        "S369 regression guard — must NOT reuse base line 1 or 2 \
+         (NAV INVOICE_LINE_ALREADY_EXISTS); body:\n{body}"
+    );
+    assert!(
+        body.contains("<lineNumber>3</lineNumber>"),
+        "modification <lineNumber> must continue past the base too (3); body:\n{body}"
+    );
+
+    validate_invoice_data(&xml)
+        .expect("offset modification must still pass the v3.0 invariant check");
 }

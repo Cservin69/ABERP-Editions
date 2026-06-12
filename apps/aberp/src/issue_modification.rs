@@ -426,12 +426,17 @@ pub fn modification_from_inputs(
     let _base_issue_year = base_issue_year;
     let _base_sequence_number = base_sequence_number;
     let base_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)?;
+    // S369 — read the BASE's line count from the same on-disk XML so the
+    // modification's full-replace CREATE lines continue PAST the base's
+    // line numbers (NAV INVOICE_LINE_ALREADY_EXISTS, S370).
+    let base_line_count = crate::nav_xml::count_invoice_lines_from_xml(&base_nav_xml_path)?;
     let modification_invoice_number =
         template.render_for_build(modification.issue_date.year(), modification.sequence_number);
     let modification_reference = ModificationReference {
         base_invoice_number,
         modification_index,
         modification_issue_date: modification_date.to_string(),
+        base_line_count,
     };
     let xml = nav_xml::render_modification_data_with_number(
         &modification,

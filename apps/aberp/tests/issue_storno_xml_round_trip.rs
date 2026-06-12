@@ -92,6 +92,10 @@ fn minimal_storno_reference() -> StornoReference {
     StornoReference {
         base_invoice_number: "INV-default/00001".to_string(),
         modification_index: 1,
+        // S369 — the minimal storno fixture is a 1:1 storno of a
+        // single-line base, so the base carries 1 line. The storno's
+        // CREATE line therefore numbers at base_line_count + 1 = 2.
+        base_line_count: 1,
     }
 }
 
@@ -134,6 +138,7 @@ fn storno_xml_carries_invoice_reference_block() {
     let reference = StornoReference {
         base_invoice_number: "INV-default/00001".to_string(),
         modification_index: 3, // pin a non-1 index to defend against literal 1 elision
+        base_line_count: 1,    // S369 — single-line base
     };
     let xml =
         nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
@@ -214,6 +219,7 @@ fn storno_xml_invoice_number_is_the_stornos_own_seq() {
     let reference = StornoReference {
         base_invoice_number: "INV-default/00007".to_string(), // base's
         modification_index: 1,
+        base_line_count: 1, // S369 — single-line base
     };
     let xml =
         nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
@@ -257,9 +263,21 @@ fn storno_xml_carries_line_modification_reference_after_line_number() {
         "storno line MUST carry <lineModificationReference> \
          (NAV LINE_MODIFICATION_EXPECTED); body:\n{body}"
     );
+    // S369 — lineNumberReference CONTINUES PAST the base's line count.
+    // The minimal fixture's base carries 1 line (base_line_count = 1),
+    // so the storno's single CREATE line numbers at 1 + 0 + 1 = 2. The
+    // pre-S369 emit reused `1` here, colliding with base line 1 → NAV
+    // INVOICE_LINE_ALREADY_EXISTS (S370 prod incident). This assertion
+    // pins the corrected, collision-free continuation.
     assert!(
-        body.contains("<lineNumberReference>1</lineNumberReference>"),
-        "lineNumberReference must be the original line position (1); body:\n{body}"
+        body.contains("<lineNumberReference>2</lineNumberReference>"),
+        "lineNumberReference must continue past the base's line count \
+         (base_line_count 1 → first storno line 2); body:\n{body}"
+    );
+    assert!(
+        !body.contains("<lineNumberReference>1</lineNumberReference>"),
+        "S369 regression guard — must NOT reuse base line number 1 \
+         (NAV INVOICE_LINE_ALREADY_EXISTS); body:\n{body}"
     );
     assert!(
         body.contains("<lineOperation>CREATE</lineOperation>"),
@@ -453,6 +471,7 @@ fn storno_xml_original_invoice_number_round_trips_verbatim() {
         let reference = StornoReference {
             base_invoice_number: (*original_number).to_string(),
             modification_index: 1,
+            base_line_count: 1, // S369 — single-line base
         };
         let xml = nav_xml::render_storno_data(
             &storno,
@@ -688,4 +707,133 @@ fn storno_line_operation_is_create_across_input_variations() {
     // The validator round-trip for the multi-line variation.
     validate_invoice_data(&xml2)
         .expect("multi-line storno with CREATE ops must pass the v3.0 invariant check");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S369 — lineNumberReference offset (NAV INVOICE_LINE_ALREADY_EXISTS).
+//
+// A storno's CREATE lines add NEW lines to NAV's virtual consolidated
+// invoice; their <lineNumber> / <lineNumberReference> MUST continue past
+// the base's line numbers or NAV ABORTs the submit with
+// `INVOICE_LINE_ALREADY_EXISTS` (prod incident, S370 root cause). The
+// offset lives in `StornoReference::base_line_count`, read from the
+// base's on-disk XML by `count_invoice_lines_from_xml` at issuance time.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Build a storno fixture with `n` lines (positive in-memory; the
+/// emitter negates). Description `L{i}` keeps each line distinguishable.
+fn build_storno_invoice_with_lines(n: usize) -> ReadyInvoice {
+    let mut invoice = build_minimal_storno_invoice();
+    invoice.lines = (1..=n)
+        .map(|i| LineItem {
+            description: format!("L{i}"),
+            quantity: rust_decimal::Decimal::from(1),
+            unit_price: Huf(1000),
+            vat_rate_basis_points: 2700,
+            note: None,
+            unit: None,
+        })
+        .collect();
+    invoice
+}
+
+/// S369 headline pin. Storno of a 3-line base: the three storno lines
+/// MUST number 4, 5, 6 (base_line_count 3 + ordinal + 1) on BOTH
+/// `<lineNumber>` and `<lineNumberReference>` — NOT 1, 2, 3, which would
+/// collide with the base's recorded lines and trip NAV's
+/// INVOICE_LINE_ALREADY_EXISTS.
+#[test]
+fn storno_line_number_reference_continues_past_three_line_base() {
+    let storno = build_storno_invoice_with_lines(3);
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let reference = StornoReference {
+        base_invoice_number: "INV-default/00001".to_string(),
+        modification_index: 1,
+        base_line_count: 3,
+    };
+    let xml =
+        nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
+            .expect("3-line storno renders");
+    let body = std::str::from_utf8(&xml).unwrap();
+
+    // First storno line continues at 4, NOT 1.
+    assert!(
+        body.contains("<lineNumberReference>4</lineNumberReference>"),
+        "first storno line of a 3-line base must reference line 4; body:\n{body}"
+    );
+    assert!(
+        body.contains("<lineNumberReference>5</lineNumberReference>")
+            && body.contains("<lineNumberReference>6</lineNumberReference>"),
+        "storno lines 2 and 3 must reference 5 and 6; body:\n{body}"
+    );
+    // The <lineNumber> elements continue past the base too (the offset
+    // shifts both — NAV's consolidated invoice numbers chain lines
+    // sequentially after the base).
+    assert!(
+        body.contains("<lineNumber>4</lineNumber>")
+            && body.contains("<lineNumber>5</lineNumber>")
+            && body.contains("<lineNumber>6</lineNumber>"),
+        "storno <lineNumber> elements must be 4, 5, 6; body:\n{body}"
+    );
+    // Regression guard: NONE of the base's line numbers (1, 2, 3) may
+    // reappear as a CREATE-line reference.
+    for collide in ["1", "2", "3"] {
+        let needle = format!("<lineNumberReference>{collide}</lineNumberReference>");
+        assert!(
+            !body.contains(&needle),
+            "storno of a 3-line base must NOT reuse base line {collide} \
+             (NAV INVOICE_LINE_ALREADY_EXISTS); body:\n{body}"
+        );
+    }
+
+    validate_invoice_data(&xml)
+        .expect("offset 3-line storno must still pass the v3.0 invariant check");
+}
+
+/// S369 round-trip pin: the OFFSET threads through the real prod path —
+/// base XML on disk → `count_invoice_lines_from_xml` → storno emit. A
+/// 3-line base is rendered, written to disk, its line count read back
+/// (XML→count, the same call `issue_storno.rs` makes), then fed as the
+/// storno's `base_line_count`; the storno's first CREATE line MUST
+/// reference base_count + 1 = 4. This is the XML→struct→XML round-trip
+/// for the line-offset invariant.
+#[test]
+fn storno_line_offset_round_trips_through_on_disk_base_count() {
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+
+    // Render a 3-line BASE invoice (plain issuance) and write it to disk.
+    let base = build_storno_invoice_with_lines(3);
+    let base_xml = nav_xml::render_invoice_data(&base, &series, &parties, Currency::Huf, None)
+        .expect("3-line base renders");
+    let path = std::env::temp_dir().join(format!(
+        "aberp_s369_storno_roundtrip_{}.xml",
+        std::process::id()
+    ));
+    nav_xml::write_to_path(&path, &base_xml).expect("write base XML to temp");
+
+    // XML → struct: read the base's line count back from disk, the exact
+    // call the storno issuance path makes.
+    let base_line_count =
+        nav_xml::count_invoice_lines_from_xml(&path).expect("count base lines from disk");
+    assert_eq!(base_line_count, 3, "base XML must report 3 lines");
+
+    // struct → XML: the storno continues past the parsed count.
+    let storno = build_storno_invoice_with_lines(3);
+    let reference = StornoReference {
+        base_invoice_number: "INV-default/00001".to_string(),
+        modification_index: 1,
+        base_line_count,
+    };
+    let storno_xml =
+        nav_xml::render_storno_data(&storno, &series, &parties, &reference, Currency::Huf, None)
+            .expect("storno renders against parsed base count");
+    let body = std::str::from_utf8(&storno_xml).unwrap();
+    assert!(
+        body.contains("<lineNumberReference>4</lineNumberReference>"),
+        "storno's first CREATE line must reference base_count + 1 = 4; body:\n{body}"
+    );
+
+    let _ = std::fs::remove_file(&path);
 }

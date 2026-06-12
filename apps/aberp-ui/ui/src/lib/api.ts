@@ -243,6 +243,21 @@ export interface ChainChildView {
    * reads the wire shape strictly via this typed field so a
    * backend drift surfaces at `npm run check`. */
   modification_index: number;
+  /** S369 / S370 — the chain CHILD's own derived lifecycle state.
+   * Before S369 the chain-children list rendered only the kind chip,
+   * so a NAV-rejected storno (the `INVOICE_LINE_ALREADY_EXISTS`
+   * failure this fix addresses) was invisible on the base's detail
+   * view. The renderer now mounts a state chip per child row using
+   * the same `labelMeta` dispatch as the meta-grid state chip. Pinned
+   * by `invoice_detail_chain_children_carry_child_state` on the Rust
+   * side. */
+  state: InvoiceState;
+  /** S369 / S370 — the chain child's latest NAV ack, same typed wire
+   * form as `InvoiceDetail.last_ack_status`. `"ABORTED"` is the value
+   * that surfaces a NAV-rejected storno; `null` when the child has no
+   * ack yet. The renderer shows it as an ack chip alongside the kind
+   * + state chips. */
+  last_ack_status: AckStatus | null;
 }
 
 /** PR-32 / session-36 — typed kind discriminator for chain-children

@@ -498,11 +498,17 @@ pub fn storno_from_inputs(
     // base_sequence_number for ADR-0023 §3 denormalization).
     let _base_issue_year = base_issue_year;
     let base_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)?;
+    // S369 — read the BASE's line count from the same on-disk XML so the
+    // storno's CREATE lines continue PAST the base's line numbers (NAV
+    // INVOICE_LINE_ALREADY_EXISTS, S370). On-disk read mirrors the
+    // base_invoice_number S184 discipline — immune to in-memory row drift.
+    let base_line_count = crate::nav_xml::count_invoice_lines_from_xml(&base_nav_xml_path)?;
     let storno_invoice_number =
         template.render_for_build(storno.issue_date.year(), storno.sequence_number);
     let storno_reference = StornoReference {
         base_invoice_number,
         modification_index,
+        base_line_count,
     };
     let xml = nav_xml::render_storno_data_with_number(
         &storno,

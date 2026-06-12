@@ -382,6 +382,19 @@ pub struct StornoReference {
     /// `<modificationIndex>` allocated by the chain walker per
     /// ADR-0023 §4 — starts at 1, increments per chain entry.
     pub modification_index: u32,
+    /// S369 — number of `<line>` elements in the BASE invoice. The
+    /// storno's CREATE-mode lines must carry `<lineNumberReference>`
+    /// values that CONTINUE PAST the base's line numbers (the storno
+    /// adds new negative lines to NAV's virtual consolidated invoice).
+    /// Without this offset the storno's first line reuses
+    /// `lineNumberReference=1`, colliding with base line 1 — NAV ABORTs
+    /// the submit with business rule `INVOICE_LINE_ALREADY_EXISTS`
+    /// (observed in prod, root-caused by S370). The caller reads this
+    /// from the base's on-disk NAV XML via
+    /// [`count_invoice_lines_from_xml`] — the canonical record of what
+    /// NAV holds on file — the same on-disk-read discipline
+    /// `base_invoice_number` uses (S184).
+    pub base_line_count: usize,
 }
 
 /// Modification chain-link reference data for
@@ -411,6 +424,14 @@ pub struct ModificationReference {
     /// (validated at the CLI boundary per
     /// `apps/aberp/src/issue_modification.rs` step 2).
     pub modification_issue_date: String,
+    /// S369 — number of `<line>` elements in the BASE invoice. The
+    /// modification's full-replace lines are CREATE operations that
+    /// must continue PAST the base's line numbers in NAV's virtual
+    /// consolidated invoice; reusing `lineNumberReference=1` collides
+    /// with base line 1 and NAV ABORTs with `INVOICE_LINE_ALREADY_EXISTS`.
+    /// Same offset + on-disk-read discipline as
+    /// [`StornoReference::base_line_count`] (S370 / S369).
+    pub base_line_count: usize,
 }
 
 const NAV_NS_DATA: &str = "http://schemas.nav.gov.hu/OSA/3.0/data";
@@ -583,7 +604,8 @@ pub fn render_invoice_data_with_number(
 
     // <invoiceLines> — plain new invoice: NORMAL lines, no
     // <lineModificationReference> (no <invoiceReference> at the head).
-    write_lines(&mut w, &invoice.lines, currency, rate_metadata, None)?;
+    // S369 — initial issuance numbers lines from 1 (offset 0).
+    write_lines(&mut w, &invoice.lines, currency, rate_metadata, None, 0)?;
 
     // <invoiceSummary>
     write_summary(&mut w, &invoice.lines, currency, rate_metadata)?;
@@ -770,15 +792,19 @@ pub fn render_storno_data_with_number(
     let negated_lines: Vec<LineItem> = invoice.lines.iter().map(negate_line).collect();
     // Storno carries <invoiceReference>, so every line MUST carry a
     // <lineModificationReference> (ADR-0049 §NAV emit / NAV
-    // LINE_MODIFICATION_EXPECTED). lineNumberReference is 1:1 with the
-    // base line position; lineOperation is CREATE per NAV's INVALID_
-    // LINE_OPERATION business rule (S184) — see `CHAIN_LINE_OPERATION`.
+    // LINE_MODIFICATION_EXPECTED). lineOperation is CREATE per NAV's
+    // INVALID_LINE_OPERATION business rule (S184) — see
+    // `CHAIN_LINE_OPERATION`. S369 — lineNumberReference CONTINUES PAST
+    // the base's line count (`base_line_count` offset) so the CREATE
+    // lines do not collide with the base's recorded line numbers
+    // (NAV INVOICE_LINE_ALREADY_EXISTS, S370 prod incident).
     write_lines(
         &mut w,
         &negated_lines,
         currency,
         rate_metadata,
         Some(CHAIN_LINE_OPERATION),
+        storno_reference.base_line_count,
     )?;
     write_summary(&mut w, &negated_lines, currency, rate_metadata)?;
 
@@ -920,13 +946,17 @@ pub fn render_modification_data_with_number(
     // carry the new effective values. The modification carries
     // <invoiceReference>, so every line MUST carry a
     // <lineModificationReference> (ADR-0049 §NAV emit) — same
-    // LINE_MODIFICATION_EXPECTED gap the storno emitter had.
+    // LINE_MODIFICATION_EXPECTED gap the storno emitter had. S369 —
+    // the full-replace CREATE lines continue PAST the base's line
+    // count (`base_line_count` offset) so they do not collide with
+    // the base's recorded line numbers (NAV INVOICE_LINE_ALREADY_EXISTS).
     write_lines(
         &mut w,
         &invoice.lines,
         currency,
         rate_metadata,
         Some(CHAIN_LINE_OPERATION),
+        modification_reference.base_line_count,
     )?;
     write_summary(&mut w, &invoice.lines, currency, rate_metadata)?;
 
@@ -1396,17 +1426,30 @@ fn write_line_modification_reference(
 /// when set, every `<line>` carries a `<lineModificationReference>` after
 /// its `<lineNumber>`. `None` (plain new invoice) emits a NORMAL line with
 /// no reference (ADR-0049 §NAV emit).
+///
+/// S369 — `line_number_offset` shifts both `<lineNumber>` and the
+/// chain-body `<lineNumberReference>` so they CONTINUE PAST the base
+/// invoice's line numbers. For initial issuance it is `0` (lines number
+/// `1..=n`). For storno / modification chain children it is the base
+/// invoice's line count, so a CREATE operation never reuses a line
+/// number NAV already recorded on the base — NAV's
+/// `INVOICE_LINE_ALREADY_EXISTS` business rule ABORTs the submit
+/// otherwise (prod incident, S370 root cause). The safety property lives
+/// here, NOT in caller discipline: every chain body routes through this
+/// one writer, so a future chain emitter cannot silently emit colliding
+/// line numbers.
 fn write_lines(
     w: &mut Writer<&mut Vec<u8>>,
     lines: &[LineItem],
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
     line_operation: Option<&str>,
+    line_number_offset: usize,
 ) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("invoiceLines")))?;
     text_element(w, "mergedItemIndicator", "false")?;
     for (ordinal, line) in lines.iter().enumerate() {
-        let line_number = (ordinal + 1) as u32;
+        let line_number = (line_number_offset + ordinal + 1) as u32;
         w.write_event(Event::Start(BytesStart::new("line")))?;
         text_element(w, "lineNumber", &line_number.to_string())?;
         // <lineModificationReference> — chain-body-only (storno / modify).
@@ -1740,6 +1783,62 @@ pub fn read_invoice_number_from_xml(path: &std::path::Path) -> Result<String> {
     }
 }
 
+/// S369 — count the `<line>` elements in a base invoice's on-disk NAV
+/// XML. The chain emitters offset their CREATE-mode
+/// `<lineNumberReference>` values past this count so a storno /
+/// modification never reuses a line number NAV already recorded on the
+/// base (NAV business rule `INVOICE_LINE_ALREADY_EXISTS`, S370 prod
+/// incident). Reading the count from the base's on-disk XML — the
+/// canonical record of what NAV holds — mirrors the
+/// [`read_invoice_number_from_xml`] S184 discipline: re-deriving from
+/// the in-memory base row would drift if the row's line set were edited
+/// between base issuance and chain emission.
+///
+/// Counts `<line>` START events by exact local name (`line`), which is
+/// distinct from every sibling element (`lineNumber`, `lineDescription`,
+/// `lineNumberReference`, …) so the count is the invoice's line count
+/// even though those siblings share the `line` prefix. Tolerates the
+/// default-namespace declaration the same way the number reader does.
+/// Loud-fails when the file cannot be read or the XML is malformed; a
+/// well-formed body with zero `<line>` elements returns `0` (the XSD
+/// validator already rejects a zero-line invoice upstream, so a `0`
+/// here means a tampered base XML — the caller's chain emit then offsets
+/// by 0, which is the conservative no-collision-protection fallback and
+/// still flagged loud by NAV if it actually collides).
+pub fn count_invoice_lines_from_xml(path: &std::path::Path) -> Result<usize> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "read base NAV XML at {} to count <line> elements for chain line offset (S369)",
+            path.display()
+        )
+    })?;
+    let xml = std::str::from_utf8(&bytes).with_context(|| {
+        format!(
+            "base NAV XML at {} is not valid UTF-8 (S369)",
+            path.display()
+        )
+    })?;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut count: usize = 0;
+    loop {
+        match reader.read_event().with_context(|| {
+            format!(
+                "parse base NAV XML at {} while counting <line> elements (S369)",
+                path.display()
+            )
+        })? {
+            quick_xml::events::Event::Start(e) => {
+                if e.name().local_name().as_ref() == b"line" {
+                    count += 1;
+                }
+            }
+            quick_xml::events::Event::Eof => return Ok(count),
+            _ => {}
+        }
+    }
+}
+
 /// Write the rendered XML to a file path.
 pub fn write_to_path(path: &std::path::Path, xml: &[u8]) -> Result<()> {
     let mut file = std::fs::File::create(path)
@@ -2023,6 +2122,48 @@ mod tests {
         assert!(
             msg.contains("xxxxxxxx-y-zz"),
             "must show the expected shape: {msg}"
+        );
+    }
+
+    /// S369 — `count_invoice_lines_from_xml` counts `<line>` elements
+    /// (NOT the `lineNumber` / `lineNumberReference` siblings that share
+    /// the `line` prefix), tolerating the default-namespace declaration.
+    /// This is the prod read path the chain emitters use to compute the
+    /// CREATE-line offset that avoids NAV's INVOICE_LINE_ALREADY_EXISTS.
+    #[test]
+    fn count_invoice_lines_from_xml_counts_line_elements_only() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<InvoiceData xmlns="http://schemas.nav.gov.hu/OSA/3.0/data">
+  <invoiceMain><invoice><invoiceLines>
+    <line>
+      <lineNumber>1</lineNumber>
+      <lineModificationReference><lineNumberReference>1</lineNumberReference></lineModificationReference>
+    </line>
+    <line><lineNumber>2</lineNumber></line>
+    <line><lineNumber>3</lineNumber></line>
+  </invoiceLines></invoice></invoiceMain>
+</InvoiceData>"#;
+        let path =
+            std::env::temp_dir().join(format!("aberp_s369_count_lines_{}.xml", std::process::id()));
+        std::fs::write(&path, xml).expect("write temp base XML");
+        let count = count_invoice_lines_from_xml(&path).expect("count lines");
+        // Three `<line>` elements — the four `lineNumber` / one
+        // `lineNumberReference` siblings must NOT inflate the count.
+        assert_eq!(count, 3, "must count only the three <line> elements");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// S369 — a missing base XML file loud-fails (the chain emitter must
+    /// not silently offset by 0 because it could not read the base).
+    #[test]
+    fn count_invoice_lines_from_xml_loud_fails_on_missing_file() {
+        let path = std::env::temp_dir().join("aberp_s369_count_lines_missing_NOPE.xml");
+        let _ = std::fs::remove_file(&path);
+        let err = count_invoice_lines_from_xml(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("read base NAV XML"),
+            "must name the read failure: {msg}"
         );
     }
 }

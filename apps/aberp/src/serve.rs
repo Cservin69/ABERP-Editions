@@ -4854,6 +4854,24 @@ struct ChainChildView {
     /// the detail-modal chain-children list per Option W. Pinned by
     /// `invoice_detail_emits_chain_children`.
     modification_index: u32,
+    /// S369 / S370 — the chain CHILD's own derived lifecycle state,
+    /// computed from the child invoice's audit lineage (a fresh
+    /// `InvoiceTrace` walked over the same ledger entries). Before
+    /// S369 the chain-children list rendered ONLY the kind chip, so a
+    /// REJECTED / ABORTED storno (the exact failure NAV returns for
+    /// `INVOICE_LINE_ALREADY_EXISTS`) was invisible on the base's
+    /// detail view — the operator saw "Storno → inv_X" with no signal
+    /// the cancellation had failed at NAV. The SPA renders this as a
+    /// state chip alongside the kind chip. Pinned by
+    /// `invoice_detail_chain_children_carry_child_state`.
+    state: InvoiceState,
+    /// S369 / S370 — the chain child's latest NAV ack
+    /// (`InvoiceAckStatus`), same typed wire form as the detail-level
+    /// `last_ack_status`. `Some(Aborted)` is the value that surfaces a
+    /// NAV-rejected storno on the base's chain-children row; `None`
+    /// when the child has no ack yet. Pinned by
+    /// `invoice_detail_chain_children_carry_child_state`.
+    last_ack_status: Option<AckStatus>,
 }
 
 /// PR-32 / session-36 — typed kind discriminator for chain-children
@@ -19277,6 +19295,45 @@ fn read_buyer_name_from_side_store(nav_xml_path: &std::path::Path) -> Option<Str
     }
 }
 
+/// S369 / S370 — derive a chain child's own lifecycle state + latest
+/// NAV ack from already-loaded ledger entries. Mirrors the
+/// `get_invoice_detail` / `derive_state_for` trace walk for ONE child id
+/// (no extra DB open — re-uses the caller's `entries` slice). Used to
+/// surface a NAV-rejected storno / modification (the `ABORTED` ack NAV
+/// returns for `INVOICE_LINE_ALREADY_EXISTS`) on the BASE's
+/// chain-children list, which before S369 rendered only the kind chip
+/// and so hid the failure. The chain-link flips mirror `derive_state_for`
+/// so a child that is itself a chain base (e.g. a storno later modified)
+/// derives its own terminal state correctly.
+fn derive_chain_child_state(
+    entries: &[Entry],
+    child_id: &str,
+) -> (InvoiceState, Option<AckStatus>) {
+    let mut trace = InvoiceTrace::default();
+    for entry in entries {
+        if let Some(id) = extract_invoice_id(entry) {
+            if id == child_id {
+                trace.merge_entry(entry, child_id);
+            }
+        }
+        if let Some(link) = extract_chain_link(entry) {
+            if link.base_invoice_id == child_id {
+                match link.kind {
+                    EventKind::InvoiceStornoIssued => trace.is_storno_base = true,
+                    EventKind::InvoiceModificationIssued => trace.is_amended_base = true,
+                    _ => {}
+                }
+            } else if link.kind == EventKind::InvoiceStornoIssued
+                && link.child_invoice_id == child_id
+            {
+                trace.is_storno_self = true;
+            }
+        }
+    }
+    let last_ack = trace.last_ack_status.as_deref().and_then(parse_ack_status);
+    (trace.derive_state(), last_ack)
+}
+
 fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<InvoiceDetailResponse>> {
     let binary_hash = state
         .binary_hash
@@ -19320,18 +19377,32 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
                 match link.kind {
                     EventKind::InvoiceStornoIssued => {
                         trace.is_storno_base = true;
+                        // S369 — compute the storno child's own state +
+                        // ack so the base's chain-children row surfaces a
+                        // NAV-rejected storno (ABORTED ack), not just the
+                        // kind chip.
+                        let child_id = link.child_invoice_id;
+                        let (child_state, child_ack) =
+                            derive_chain_child_state(&entries, &child_id);
                         chain_children.push(ChainChildView {
                             kind: ChainChildKind::Storno,
-                            invoice_id: link.child_invoice_id,
+                            invoice_id: child_id,
                             modification_index: link.modification_index,
+                            state: child_state,
+                            last_ack_status: child_ack,
                         });
                     }
                     EventKind::InvoiceModificationIssued => {
                         trace.is_amended_base = true;
+                        let child_id = link.child_invoice_id;
+                        let (child_state, child_ack) =
+                            derive_chain_child_state(&entries, &child_id);
                         chain_children.push(ChainChildView {
                             kind: ChainChildKind::Amended,
-                            invoice_id: link.child_invoice_id,
+                            invoice_id: child_id,
                             modification_index: link.modification_index,
+                            state: child_state,
+                            last_ack_status: child_ack,
                         });
                     }
                     _ => {}
@@ -22256,11 +22327,20 @@ mod tests {
                     kind: ChainChildKind::Amended,
                     invoice_id: "inv_MOD".to_string(),
                     modification_index: 3,
+                    // S369 — a successfully-finalized modification child.
+                    state: InvoiceState::Finalized,
+                    last_ack_status: Some(AckStatus::Saved),
                 },
                 ChainChildView {
                     kind: ChainChildKind::Storno,
                     invoice_id: "inv_STORNO".to_string(),
                     modification_index: 7,
+                    // S369 headline case — a NAV-REJECTED storno child
+                    // (the INVOICE_LINE_ALREADY_EXISTS failure this PR
+                    // fixes). Distinct state + ack from the Amended row
+                    // per CLAUDE.md rule 9.
+                    state: InvoiceState::Rejected,
+                    last_ack_status: Some(AckStatus::Aborted),
                 },
             ],
             last_ack_status: None,
@@ -22315,6 +22395,31 @@ mod tests {
             arr[1].get("modification_index").and_then(|x| x.as_u64()),
             Some(7),
             "chain child modification_index must serialise verbatim as a JSON number (Storno row, distinct non-1 value)",
+        );
+
+        // S369 — the per-child state + ack fields surface a NAV-rejected
+        // chain child on the base's detail view. Distinct values per row
+        // (Finalized/SAVED vs Rejected/ABORTED) per CLAUDE.md rule 9 so a
+        // regression collapsing all children to one value cannot hide.
+        assert_eq!(
+            arr[0].get("state").and_then(|x| x.as_str()),
+            Some("Finalized"),
+            "Amended child state must serialise as PascalCase `Finalized`",
+        );
+        assert_eq!(
+            arr[0].get("last_ack_status").and_then(|x| x.as_str()),
+            Some("SAVED"),
+            "Amended child last_ack_status must serialise as UPPERCASE `SAVED`",
+        );
+        assert_eq!(
+            arr[1].get("state").and_then(|x| x.as_str()),
+            Some("Rejected"),
+            "Storno child state must serialise as PascalCase `Rejected` (S369 — NAV-rejected storno visible)",
+        );
+        assert_eq!(
+            arr[1].get("last_ack_status").and_then(|x| x.as_str()),
+            Some("ABORTED"),
+            "Storno child last_ack_status must serialise as UPPERCASE `ABORTED` (S369 — the INVOICE_LINE_ALREADY_EXISTS failure)",
         );
     }
 

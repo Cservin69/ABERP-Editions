@@ -116,6 +116,7 @@ fn build_storno_reference() -> StornoReference {
     StornoReference {
         base_invoice_number: "INV-default/00001".to_string(),
         modification_index: 1,
+        base_line_count: 1, // S369 — single-line base fixture
     }
 }
 
@@ -124,6 +125,7 @@ fn build_modification_reference() -> ModificationReference {
         base_invoice_number: "INV-default/00001".to_string(),
         modification_index: 1,
         modification_issue_date: "2026-05-22".to_string(),
+        base_line_count: 1, // S369 — single-line base fixture
     }
 }
 
