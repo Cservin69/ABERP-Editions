@@ -292,6 +292,12 @@ impl PricedReposter for HttpReposter {
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", snap.bearer.as_str()))
+            // S377 — same SvelteKit CSRF gate as the priced-writeback path;
+            // share the pipeline's origin derivation so both sites match.
+            .header(
+                "Origin",
+                crate::quote_pricing_pipeline::origin_from_base_url(&snap.base_url),
+            )
             .header(
                 "Content-Type",
                 format!("multipart/form-data; boundary={boundary}"),
@@ -1002,6 +1008,70 @@ mod tests {
         assert_eq!(
             path,
             "/api/quotes/00000000-0000-0000-0000-000000000003/priced"
+        );
+    }
+
+    // ── S377 — Origin header on the re-render repost ─────────────────
+
+    /// Request-capturing TCP mock: sends the FULL raw request back over the
+    /// oneshot, then a clean 200 so the repost resolves.
+    async fn s377_spawn_request_capturing_mock(
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16 * 1024];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let _ = tx.send(req);
+                let body = r#"{"rerendered":true}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test]
+    async fn s377_repost_sends_origin_header() {
+        let (addr, rx) = s377_spawn_request_capturing_mock().await;
+        // Trailing slash — Origin must still resolve slash-free, matching the
+        // pipeline's shared derivation.
+        let snap = StorefrontCredentialSnapshot {
+            base_url: format!("http://{addr}/"),
+            bearer: zeroize::Zeroizing::new("bearer-X".to_string()),
+        };
+        let reposter = HttpReposter::new().expect("client");
+        let resp = reposter
+            .repost(
+                &snap,
+                "00000000-0000-0000-0000-000000000004",
+                "hash-abc",
+                "2026-07-01",
+                "{}",
+                b"%PDF-1.4 fake",
+            )
+            .await
+            .expect("repost must not transport-error");
+        assert_eq!(resp.status, 200, "body {}", resp.body);
+        let req = rx.await.expect("mock captured a request");
+        let origin = req
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("origin:"))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string());
+        assert_eq!(
+            origin.as_deref(),
+            Some(format!("http://{addr}").as_str()),
+            "re-render repost must carry the same slash-free Origin header"
         );
     }
 

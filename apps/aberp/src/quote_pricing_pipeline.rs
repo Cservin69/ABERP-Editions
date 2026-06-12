@@ -1078,6 +1078,9 @@ impl PricingPipelineService {
             .client
             .post(&url)
             .header("Authorization", self.bearer_header()?)
+            // S377 — required by SvelteKit's CSRF gate for multipart POSTs;
+            // without it the storefront 403s before any handler runs.
+            .header("Origin", origin_from_base_url(&self.config.base_url))
             .header(
                 "Content-Type",
                 format!("multipart/form-data; boundary={boundary}"),
@@ -1427,7 +1430,8 @@ pub enum WritebackOutcome {
         http_status: u16,
         body_excerpt: String,
     },
-    /// 403 — origin secret or bearer rejected.
+    /// 403 — SvelteKit CSRF gate (missing/wrong `Origin` header) or the
+    /// storefront's origin secret rejected. (Bearer failures are 401.)
     Forbidden {
         http_status: u16,
         body_excerpt: String,
@@ -1617,7 +1621,10 @@ impl WritebackOutcome {
                 "X-CloudFront-Secret or Bearer mismatch; check ADR-0009 secret rotation"
             }
             WritebackOutcome::Forbidden { .. } => {
-                "origin secret or Bearer rejected (403); check ADR-0009 secret rotation order"
+                "403 — két ok / two causes: (1) SvelteKit CSRF — hiányzó vagy rossz Origin fejléc / \
+                 missing or wrong Origin header; (2) a storefront origin-titok elutasítva / origin \
+                 secret rejected (ADR-0009 rotation order). Bearer-hiba 401, nem ide tartozik / \
+                 Bearer failures are 401, not this."
             }
             WritebackOutcome::NonJsonResponse { .. } => {
                 "storefront returned non-JSON; routing or middleware misconfigured"
@@ -1672,6 +1679,33 @@ impl WritebackOutcome {
 pub(crate) fn resolved_writeback_url(base: &str, quote_id: &str, suffix: &str) -> String {
     let base = base.trim_end_matches('/');
     format!("{base}/api/quotes/{quote_id}/{suffix}")
+}
+
+/// S377 — PURE `Origin` header value for storefront writebacks. SvelteKit
+/// 2.61.x's CSRF gate (`respond.js`) deterministically `403`s every
+/// `multipart/form-data` POST whose `Origin` header is absent or does not
+/// match the app's own origin; reqwest never sends `Origin` on its own, so
+/// every priced writeback failed in prod (S376). The storefront's own
+/// origin IS the `base_url` scheme+authority, so we derive it from there:
+/// trim to `scheme://host[:port]`, dropping any path / query / trailing
+/// slash (Origin is host-only by spec — a path would itself fail the gate).
+/// Shared by the pricing pipeline and the S325 re-render daemon so both
+/// writeback sites send an identical, correct header. PURE — unit-testable.
+pub(crate) fn origin_from_base_url(base: &str) -> String {
+    let base = base.trim();
+    match base.find("://") {
+        Some(scheme_end) => {
+            let after_scheme = scheme_end + 3;
+            let authority_end = base[after_scheme..]
+                .find('/')
+                .map(|i| after_scheme + i)
+                .unwrap_or(base.len());
+            base[..authority_end].to_string()
+        }
+        // No scheme — return the host-ish input minus any trailing slash;
+        // a malformed origin still beats a missing one for the CSRF gate.
+        None => base.trim_end_matches('/').to_string(),
+    }
 }
 
 /// S347 / PR-39 (F1) — PURE response classifier. The F1 fix lives here:
@@ -4101,6 +4135,46 @@ mod tests {
         );
     }
 
+    // ── S377 — Origin header derivation (SvelteKit CSRF gate) ─────────────
+
+    #[test]
+    fn s377_origin_from_base_url_plain() {
+        assert_eq!(
+            origin_from_base_url("https://abenerp.com"),
+            "https://abenerp.com"
+        );
+    }
+
+    #[test]
+    fn s377_origin_from_base_url_strips_trailing_slash() {
+        // The S351 incident input — a trailing slash must NOT leak into Origin
+        // (an Origin with a path/slash itself fails the CSRF gate).
+        assert_eq!(
+            origin_from_base_url("https://abenerp.com/"),
+            "https://abenerp.com"
+        );
+    }
+
+    #[test]
+    fn s377_origin_from_base_url_drops_path_and_query() {
+        assert_eq!(
+            origin_from_base_url("https://abenerp.com/sub/path?x=1"),
+            "https://abenerp.com"
+        );
+    }
+
+    #[test]
+    fn s377_origin_from_base_url_keeps_port() {
+        assert_eq!(
+            origin_from_base_url("http://127.0.0.1:54321/"),
+            "http://127.0.0.1:54321"
+        );
+        assert_eq!(
+            origin_from_base_url("http://127.0.0.1:54321"),
+            "http://127.0.0.1:54321"
+        );
+    }
+
     /// Path-capturing mock: replies via a oneshot with the request-line path
     /// the client actually hit, then a clean 200 JSON so the writeback
     /// resolves to Success. This is the production-incident assertion — a
@@ -4176,6 +4250,106 @@ mod tests {
         assert_eq!(
             path,
             "/api/quotes/00000000-0000-0000-0000-000000000002/status"
+        );
+    }
+
+    // ── S377 — Origin header on the priced writeback ──────────────────────
+
+    /// Request-capturing mock: sends the FULL raw request (headers included)
+    /// back over the oneshot, then a clean 200 JSON so the writeback resolves.
+    async fn s377_spawn_request_capturing_mock(
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16 * 1024];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let _ = tx.send(req);
+                let _ = sock
+                    .write_all(
+                        s347_http_canned("200 OK", "application/json", r#"{"status":"quoted"}"#)
+                            .as_bytes(),
+                    )
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (addr, rx)
+    }
+
+    /// Extract the `Origin` header value from a captured raw request.
+    fn s377_origin_header(req: &str) -> Option<String> {
+        req.lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("origin:"))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string())
+    }
+
+    #[tokio::test]
+    async fn s377_priced_writeback_sends_origin_header() {
+        let (addr, rx) = s377_spawn_request_capturing_mock().await;
+        // No trailing slash — Origin must equal the base scheme://authority.
+        let svc = s347_writeback_service(&addr);
+        let o = svc
+            .post_priced_writeback(
+                "00000000-0000-0000-0000-000000000010",
+                "hash-abc",
+                "2026-07-01",
+                "{}",
+                b"%PDF-1.4 fake",
+            )
+            .await
+            .expect("post_priced_writeback must not internal-error");
+        assert!(o.is_success(), "got {o:?}");
+        let req = rx.await.expect("mock captured a request");
+        assert_eq!(
+            s377_origin_header(&req).as_deref(),
+            Some(format!("http://{addr}").as_str()),
+            "priced writeback must carry an Origin matching the storefront"
+        );
+    }
+
+    #[tokio::test]
+    async fn s377_trailing_slash_base_url_origin_has_no_slash() {
+        let (addr, rx) = s377_spawn_request_capturing_mock().await;
+        // Operator typed a trailing slash — Origin must still be slash-free.
+        let svc = s351_service_with_trailing_slash(&addr);
+        let o = svc
+            .post_priced_writeback(
+                "00000000-0000-0000-0000-000000000011",
+                "hash-abc",
+                "2026-07-01",
+                "{}",
+                b"%PDF-1.4 fake",
+            )
+            .await
+            .expect("post_priced_writeback must not internal-error");
+        assert!(o.is_success(), "got {o:?}");
+        let req = rx.await.expect("mock captured a request");
+        assert_eq!(
+            s377_origin_header(&req).as_deref(),
+            Some(format!("http://{addr}").as_str()),
+            "trailing slash in base_url must NOT leak into Origin"
+        );
+    }
+
+    #[test]
+    fn s377_forbidden_hint_names_csrf() {
+        // The reworded 403 hint must name the CSRF/Origin cause, not just
+        // "origin secret or Bearer" (Bearer failures are 401, not 403).
+        let o = WritebackOutcome::Forbidden {
+            http_status: 403,
+            body_excerpt: "forbidden".to_string(),
+        };
+        let hint = o.operator_hint();
+        assert!(
+            hint.contains("CSRF") && hint.contains("Origin"),
+            "403 hint must name SvelteKit CSRF + Origin; got {hint:?}"
         );
     }
 
