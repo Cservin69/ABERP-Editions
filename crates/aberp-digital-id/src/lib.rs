@@ -23,7 +23,14 @@
 //! - [`DigitalIdProvider`] — the swap-point trait.
 //! - [`MockProvider`] — a deterministic test backend.
 //!
-//! Out of scope (future work): real providers, audit `EventKind`s that
+//! S363 / PR-50 (ADR-0080) adds a SECOND deterministic, non-production
+//! backend — [`UsDodCacProvider`] — purely to prove the trait abstracts: it
+//! has a different signing persona (a certificate-bound digest, not a keyed
+//! HMAC), session-based `current_operator()` (no card → no operator), and
+//! cert-chain-membership verification (not MAC equality). It is still a stub;
+//! real signing primitives stay un-wired until a real customer demands them.
+//!
+//! Out of scope (future work): real crypto backends, audit `EventKind`s that
 //! populate the signer field (S346), electronic-signature ceremony UI.
 //!
 //! # ⚠️ The Mock is NOT production crypto
@@ -36,11 +43,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+mod cac;
 mod identity;
 mod mock;
 mod provider;
 mod signature;
 
+pub use cac::{UsDodCacProvider, CAC_ALGORITHM, CAC_DEFAULT_EDIPI, CAC_ISSUER};
 pub use identity::DigitalId;
 pub use mock::{MockProvider, MOCK_ALGORITHM, MOCK_OPERATOR_ID, MOCK_TEST_KEY};
 pub use provider::{DigitalIdProvider, ProviderError};

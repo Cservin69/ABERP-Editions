@@ -2770,30 +2770,39 @@ pub struct AppState {
 }
 
 /// S344 / PR-38 — construct the process-wide [`DigitalIdProvider`] at boot.
+/// Extended S363 / PR-50 with a second (still NON-PRODUCTION) backend.
 ///
-/// Today the only implemented backend is the deterministic, NON-PRODUCTION
-/// [`aberp_digital_id::MockProvider`]. The `ABERP_DIGITAL_ID_PROVIDER` env
-/// var is the FUTURE swap point: real backends (HU eID, US DoD CAC, Qatar
-/// MFA, …) register here per `[[defense-aerospace-pivot]]`. Any value other
-/// than `mock` (or unset) currently logs a WARN and falls back to the mock,
-/// so a half-configured deployment is loud, never silently unsigned.
+/// The `ABERP_DIGITAL_ID_PROVIDER` env var selects the backend; it is the
+/// swap point real backends (HU eID, Qatar MFA, …) register at per
+/// `[[defense-aerospace-pivot]]`. Implemented arms today:
 ///
-/// Emits one INFO line naming the resolved provider + operator. The mock's
-/// own constructor additionally emits the "MOCK — NOT FOR PRODUCTION USE"
-/// WARN, so the mock can never ship silently.
+/// - `mock` (default, and the fallback for any unknown value) — the S344
+///   deterministic [`aberp_digital_id::MockProvider`].
+/// - `us-dod-cac` — the S363 deterministic [`aberp_digital_id::UsDodCacProvider`]
+///   STUB (ADR-0080), added to prove the trait abstracts across a different
+///   signing / session / verification shape. NOT real crypto.
+///
+/// Both backends are explicitly non-production and WARN on construction, so
+/// neither can ship silently. An unknown value logs a WARN and falls back to
+/// `mock`, so a half-configured deployment is loud, never silently unsigned.
+///
+/// Emits one INFO line naming the resolved provider + operator.
 fn build_digital_id_provider() -> Arc<dyn aberp_digital_id::DigitalIdProvider> {
     let requested =
         std::env::var("ABERP_DIGITAL_ID_PROVIDER").unwrap_or_else(|_| "mock".to_string());
-    if requested != "mock" {
-        tracing::warn!(
-            requested = %requested,
-            "ABERP_DIGITAL_ID_PROVIDER requested a non-mock backend, but only \
-             `mock` is implemented (S344). Falling back to the mock provider; \
-             real backends land in a later session."
-        );
-    }
-    let provider: Arc<dyn aberp_digital_id::DigitalIdProvider> =
-        Arc::new(aberp_digital_id::MockProvider::new());
+    let provider: Arc<dyn aberp_digital_id::DigitalIdProvider> = match requested.as_str() {
+        "mock" => Arc::new(aberp_digital_id::MockProvider::new()),
+        "us-dod-cac" => Arc::new(aberp_digital_id::UsDodCacProvider::new()),
+        unknown => {
+            tracing::warn!(
+                requested = %unknown,
+                "ABERP_DIGITAL_ID_PROVIDER requested an unknown backend; \
+                 implemented backends are `mock` and `us-dod-cac`. Falling \
+                 back to the mock provider."
+            );
+            Arc::new(aberp_digital_id::MockProvider::new())
+        }
+    };
     match provider.current_operator() {
         Ok(op) => tracing::info!(
             provider = provider.name(),
@@ -20523,6 +20532,40 @@ mod tests {
         // functioning backend to AppState, not a stub that errors on use.
         let sig = provider.sign(b"boot-smoke").expect("sign");
         assert!(provider.verify(b"boot-smoke", &sig).expect("verify"));
+    }
+
+    /// S363 / PR-50 — the env-var swap point dispatches to the second backend
+    /// with ZERO callsite change: `ABERP_DIGITAL_ID_PROVIDER=us-dod-cac` boots
+    /// the CAC stub. This is the whole point of the trait — provider identity
+    /// is observable via `name()`, and the same `Arc<dyn>` flows into AppState
+    /// regardless of which concrete backend was selected.
+    #[test]
+    fn s363_boot_constructs_cac_provider_when_env_set() {
+        std::env::set_var("ABERP_DIGITAL_ID_PROVIDER", "us-dod-cac");
+        let provider = build_digital_id_provider();
+        // Always restore the env so single-threaded siblings see a clean slate.
+        std::env::remove_var("ABERP_DIGITAL_ID_PROVIDER");
+
+        assert_eq!(provider.name(), aberp_digital_id::CAC_ISSUER);
+        let op = provider
+            .current_operator()
+            .expect("the default CAC stub has a card inserted");
+        assert_eq!(op.issuer, "us-dod-cac");
+        // Sign/verify round-trips under the CAC backend's own algorithm — the
+        // boot wiring hands AppState a functioning second backend.
+        let sig = provider.sign(b"boot-smoke").expect("sign");
+        assert_eq!(sig.algorithm, aberp_digital_id::CAC_ALGORITHM);
+        assert!(provider.verify(b"boot-smoke", &sig).expect("verify"));
+    }
+
+    /// S363 / PR-50 — an unknown backend value is loud and falls back to the
+    /// mock, never silently unsigned.
+    #[test]
+    fn s363_boot_unknown_provider_falls_back_to_mock() {
+        std::env::set_var("ABERP_DIGITAL_ID_PROVIDER", "qatar-mfa-not-yet-built");
+        let provider = build_digital_id_provider();
+        std::env::remove_var("ABERP_DIGITAL_ID_PROVIDER");
+        assert_eq!(provider.name(), "mock");
     }
 
     // ──────────────────────────────────────────────────────────────
