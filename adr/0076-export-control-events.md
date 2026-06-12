@@ -25,9 +25,9 @@ Two distinct bodies of U.S. law govern exports:
 
 | EventKind | storage string | fires when | payload |
 | --- | --- | --- | --- |
-| `ExportClassificationSet` | `export.classification_set` | a drawing / spec / document is export-classified | `{entity_kind, entity_id, eccn?, usml_category?, jurisdiction, classified_by_operator_id, classified_at_ms}` |
-| `ExportAccessCheck` | `export.access_check` | access to an export-controlled artifact is checked | `{entity_kind, entity_id, requesting_operator_id, decision, reason, checked_at_ms}` |
-| `ExportShipmentLogged` | `export.shipment_logged` | an export-controlled shipment leaves | `{shipment_id, exporter_party_id, recipient_party_id, recipient_country, ecn_or_authorization?, shipped_at_ms, shipped_by_operator_id}` |
+| `ExportClassificationSet` | `export.classification_set` | a drawing / spec / document is export-classified | `{entity_kind, entity_id, eccn?, usml_category?, jurisdiction, operator_user_id, classified_at_ms}` |
+| `ExportAccessCheck` | `export.access_check` | access to an export-controlled artifact is checked | `{entity_kind, entity_id, operator_user_id, decision, reason, checked_at_ms}` |
+| `ExportShipmentLogged` | `export.shipment_logged` | an export-controlled shipment leaves | `{shipment_id, exporter_party_id, recipient_party_id, recipient_country, ecn_or_authorization?, shipped_at_ms, operator_user_id}` |
 
 ### 2. Why three kinds (classification / access / shipment) and not one
 

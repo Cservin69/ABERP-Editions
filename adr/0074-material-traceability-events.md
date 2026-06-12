@@ -27,8 +27,8 @@ The ADR-0008 audit ledger is the right home for both. What it lacked is the **ty
 
 | EventKind | storage string | fires when | payload |
 | --- | --- | --- | --- |
-| `MaterialCertAttached` | `material.cert_attached` | a material certificate is attached to a `quoting_materials` row | `{material_id, cert_kind, cert_url, attached_at_ms, attached_by_operator_id, lot_id?}` |
-| `MaterialHeatLotAssigned` | `material.heat_lot_assigned` | a lot/heat is assigned to a material instance | `{material_id, lot_id, heat_id, source_supplier?, assigned_at_ms, assigned_by_operator_id}` |
+| `MaterialCertAttached` | `material.cert_attached` | a material certificate is attached to a `quoting_materials` row | `{material_id, cert_kind, cert_url, attached_at_ms, operator_user_id, lot_id?}` |
+| `MaterialHeatLotAssigned` | `material.heat_lot_assigned` | a lot/heat is assigned to a material instance | `{material_id, lot_id, heat_id, source_supplier?, assigned_at_ms, operator_user_id}` |
 
 ### 2. Why `cert_attached` (record) is split from `heat_lot_assigned` (state transition)
 
@@ -62,6 +62,8 @@ The audit ledger records the *history* of cert/lot/heat facts; the `quoting_mate
 NULL is the "not yet captured / not yet traced" sentinel; the future firing site interprets it in the app layer.
 
 **No SQL `DEFAULT`, no DB CHECK.** Per `[[no-sql-specific]]` the lot/heat format validation lives in Rust (the `aberp-compliance` newtypes at the write boundary), never a DuckDB CHECK. And — pinned by the existing `quoting_materials` schema doc and the `aberp_quote_intake::log_table::S271_MIGRATION_SQL` evidence trail — the columns carry **no `DEFAULT`**: DuckDB re-applies an `ALTER … ADD COLUMN IF NOT EXISTS … DEFAULT V` default on *every replay* of the statement, and `ensure_schema` runs at the top of every writer, so a DEFAULT-bearing column would be clobbered on every unrelated write. The migration is `ADD COLUMN IF NOT EXISTS … <type>` with no default; NULL is the implicit fill for pre-S357 rows. Idempotency (and the no-clobber guarantee) is pinned by a test that runs `ensure_schema` four times and asserts a written value survives.
+
+> **Standing rule (S367 — review F3):** no production writer for `current_lot_id` / `current_heat_id` exists yet (all writes today are `#[cfg(test)]`). When the firing site lands, the ONLY path to those columns must route through `aberp_compliance::lot_heat::{LotId, HeatId}::new` (which reject on malformed input), with a write-rejection test (malformed lot id → 400, row unchanged) — a compliance column may only be written via its `aberp_compliance` type. The newtypes exist; nothing structurally forces the future writer through them until this rule is honoured at that boundary.
 
 **`cert_attached_at` is `VARCHAR` (RFC3339), not a SQL `TIMESTAMP`.** This matches `quoting_materials`' own `updated_at` convention (the table's module doc: "Timestamps are stored as RFC3339 VARCHAR … not a SQL TIMESTAMP"). Keeping one timestamp representation per table beats matching the S357 brief's loose word "timestamp" with a fork. Flagged in the PR report as a deliberate deviation from the brief wording.
 

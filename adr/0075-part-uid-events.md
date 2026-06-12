@@ -12,8 +12,10 @@ The aerospace/defense gap analysis (S330) named the structural must-builds for t
 
 DoD 5000.64 and MIL-STD-130N require that serially-managed items carry a globally-unique, machine-readable Item Unique Identifier (the "UII" / UID) physically marked on the item (a 2D Data Matrix), so a part's pedigree can be resolved for the life of the item. MIL-STD-130N defines the UII as a concatenation of a small set of data elements in one of two valid **constructs**:
 
-1. **Construct 1** — Issuing Agency Code (IAC) + Enterprise Identifier (EID) + Original Part Number + Serial Number. The serial is unique *within the part number* for that enterprise.
-2. **Construct 2** — IAC + EID + Serial Number. The serial is unique across *all* parts the enterprise produces.
+1. **Construct 1** — Issuing Agency Code (IAC) + Enterprise Identifier (EID) + Serial Number (no part number). The serial is unique across *all* items the enterprise produces.
+2. **Construct 2** — IAC + EID + Original Part Number + Serial Number. The serial is unique *within the part number* for that enterprise.
+
+> **Correction (S367, 2026-06-12 — review F5):** S358 originally defined these two constructs in reverse (Construct 1 carried the part number; Construct 2 was serial-only). That is backwards against MIL-STD-130N and the DoD *Guide to Uniquely Identifying Items*, where Construct #1 is the serial-only form and Construct #2 adds the original part number. No firing site or ledger row existed, so S367 swapped the struct contents, `to_iri()` renderings, and every pinned test in the same commit. The §3 examples below reflect the corrected mapping.
 
 The IAC (per ISO/IEC 15459) names the registration authority that guarantees the EID's uniqueness; for a DoD contractor the EID is typically a CAGE code or DUNS number, each reachable through its registered IAC.
 
@@ -27,8 +29,8 @@ ABERP's commercial core has no notion of an individual, serialized part instance
 
 | EventKind | storage string | fires when | payload |
 | --- | --- | --- | --- |
-| `PartSerialAssigned` | `part.serial_assigned` | a serial number is assigned to a part | `{part_id, serial_number, assigned_at_ms, assigned_by_operator_id, related_invoice_id?, related_work_order_id?}` |
-| `PartUidMarked` | `part.uid_marked` | the MIL-STD-130N UID is physically marked on the part | `{part_id, uid_iri, uid_construct_code, mil_std_130_compliant, marked_at_ms, marked_by_operator_id}` |
+| `PartSerialAssigned` | `part.serial_assigned` | a serial number is assigned to a part | `{part_id, serial_number, assigned_at_ms, operator_user_id, related_invoice_id?, related_work_order_id?}` |
+| `PartUidMarked` | `part.uid_marked` | the MIL-STD-130N UID is physically marked on the part | `{part_id, uid_iri, uid_construct_code, mil_std_130_compliant, marked_at_ms, operator_user_id}` |
 
 ### 2. Why `serial_assigned` (record) is split from `uid_marked` (state transition)
 
@@ -46,8 +48,8 @@ Keeping them separate lets a forensic walker answer "show me every serial ever a
 
 The `uid` module renders the UII as the straight concatenation of its construct's data elements:
 
-- **Construct 1:** `IAC + EID + Original Part Number + Serial` → e.g. `D` + `0LH12` + `BRACKET-7781` + `SN-0001` = `D0LH12BRACKET-7781SN-0001`.
-- **Construct 2:** `IAC + EID + Serial` → e.g. `D0LH12SN-0001`.
+- **Construct 1:** `IAC + EID + Serial` → e.g. `D0LH12SN-0001`.
+- **Construct 2:** `IAC + EID + Original Part Number + Serial` → e.g. `D` + `0LH12` + `BRACKET-7781` + `SN-0001` = `D0LH12BRACKET-7781SN-0001`.
 
 `validate_iac` checks the IAC's *format* (non-empty, ≤ 2 uppercase-alphanumeric chars — the ISO/IEC 15459 shape); whether a code is currently *registered* is an external-registry question out of scope here. The EID / part number / serial use the same `[A-Za-z0-9-]`, length-bounded gate as the S345 `lot_heat` ids — the explicit instruction was to reuse that defensive newtype pattern. Each construct's `new()` validates every component, so an `Iuid` cannot exist in an invalid state; the firing site reads `mil_std_130_compliant` as the boolean verdict that the mark satisfied the standard's format gate.
 

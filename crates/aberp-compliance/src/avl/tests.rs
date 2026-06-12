@@ -1,10 +1,21 @@
 //! Unit tests for the S345 AVL / DPAS types.
 
-use super::{ApprovedSupplierEntry, DpasRating, ExportScreeningStatus, PartnerRef, QualLevel};
+use super::{
+    ApprovedSupplierEntry, DpasPriority, DpasRating, ExportScreeningStatus, PartnerRef,
+    ProgramSymbolError, QualLevel,
+};
 
 #[test]
-fn s345_dpas_rating_defaults_to_none() {
-    assert_eq!(DpasRating::default(), DpasRating::None);
+fn s367_unrated_supplier_is_dpas_none() {
+    // F13: "unrated commercial order" is the absence of a rating, not a variant.
+    let entry = ApprovedSupplierEntry {
+        partner_id: PartnerRef("p".to_string()),
+        qualification_level: QualLevel::Bid,
+        dpas: None,
+        screening: ExportScreeningStatus::default(),
+        last_audit_at_ms: None,
+    };
+    assert!(entry.dpas.is_none());
 }
 
 #[test]
@@ -33,7 +44,7 @@ fn s345_avl_entry_construction_and_roundtrip() {
     let entry = ApprovedSupplierEntry {
         partner_id: PartnerRef("partner-4711".to_string()),
         qualification_level: QualLevel::Approved,
-        dpas: DpasRating::DxC1,
+        dpas: Some(DpasRating::new(DpasPriority::Dx, "A1").expect("valid rating")),
         screening: ExportScreeningStatus::Clear,
         last_audit_at_ms: Some(1_700_000_000_000),
     };
@@ -50,20 +61,24 @@ fn s345_avl_entry_unaudited_defaults() {
     let entry = ApprovedSupplierEntry {
         partner_id: PartnerRef("partner-new".to_string()),
         qualification_level: QualLevel::Bid,
-        dpas: DpasRating::default(),
+        dpas: None,
         screening: ExportScreeningStatus::default(),
         last_audit_at_ms: None,
     };
     assert!(entry.qualification_level.can_bid());
     assert!(!entry.qualification_level.can_deliver());
-    assert_eq!(entry.dpas, DpasRating::None);
+    assert!(entry.dpas.is_none());
     assert_eq!(entry.screening, ExportScreeningStatus::NotScreened);
     assert!(entry.last_audit_at_ms.is_none());
 }
 
 #[test]
 fn s345_dpas_rating_roundtrip() {
-    for r in [DpasRating::None, DpasRating::DoC1, DpasRating::DxC1] {
+    for r in [
+        DpasRating::new(DpasPriority::Do, "A1").unwrap(),
+        DpasRating::new(DpasPriority::Dx, "A7").unwrap(),
+        DpasRating::new(DpasPriority::Do, "C1").unwrap(),
+    ] {
         let json = serde_json::to_string(&r).expect("serialize");
         let back: DpasRating = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(r, back);
@@ -74,17 +89,22 @@ fn s345_dpas_rating_roundtrip() {
 //
 // The partners `dpas_rating` / `export_screening_status` columns and the
 // `supplier.*` audit payloads store the canonical `as_str` form; the firing
-// site (later session) validates an inbound string through `from_storage_str`
-// before it reaches the column / ledger. These pin that the `as_str` ⇄
-// `from_storage_str` pair round-trips every variant and rejects garbage, so a
+// site (later session) validates an inbound string through `parse` /
+// `from_storage_str` before it reaches the column / ledger. These pin that the
+// `as_str` ⇄ `parse` pair round-trips real ratings and rejects garbage, so a
 // malformed value can never reach storage.
 
 #[test]
 fn s361_dpas_rating_storage_str_round_trips_every_variant() {
-    for r in [DpasRating::None, DpasRating::DoC1, DpasRating::DxC1] {
+    for r in [
+        DpasRating::new(DpasPriority::Do, "A1").unwrap(),
+        DpasRating::new(DpasPriority::Dx, "A7").unwrap(),
+        DpasRating::new(DpasPriority::Do, "C1").unwrap(),
+        DpasRating::new(DpasPriority::Dx, "F1").unwrap(),
+    ] {
         let s = r.as_str();
         assert_eq!(
-            DpasRating::from_storage_str(s).expect("round-trip"),
+            DpasRating::parse(&s).expect("round-trip"),
             r,
             "round-trip mismatch for {s}"
         );
@@ -93,13 +113,33 @@ fn s361_dpas_rating_storage_str_round_trips_every_variant() {
 
 #[test]
 fn s361_dpas_rating_storage_tokens_are_pinned_and_reject_unknown() {
-    assert_eq!(DpasRating::None.as_str(), "NONE");
-    assert_eq!(DpasRating::DoC1.as_str(), "DO-C1");
-    assert_eq!(DpasRating::DxC1.as_str(), "DX-C1");
-    // Unknown / wrong-case strings fail loud — never a silent default.
-    assert!(DpasRating::from_storage_str("").is_err());
-    assert!(DpasRating::from_storage_str("do-c1").is_err());
-    assert!(DpasRating::from_storage_str("DX").is_err());
+    // 15 CFR 700.12 form: <DO|DX>-<program symbol> (e.g. the regulation's own
+    // worked example DO-A1).
+    assert_eq!(
+        DpasRating::new(DpasPriority::Do, "A1").unwrap().as_str(),
+        "DO-A1"
+    );
+    assert_eq!(
+        DpasRating::new(DpasPriority::Dx, "A7").unwrap().as_str(),
+        "DX-A7"
+    );
+    // Unknown / wrong-case / out-of-range strings fail loud — never a silent
+    // default.
+    assert!(DpasRating::parse("").is_err());
+    assert!(DpasRating::parse("do-a1").is_err()); // lowercase priority
+    assert!(DpasRating::parse("DX").is_err()); // no program symbol
+    assert!(DpasRating::parse("DO-G1").is_err()); // letter out of A-F
+    assert!(DpasRating::parse("DO-A0").is_err()); // digit out of 1-9
+    assert!(DpasRating::parse("DO-A12").is_err()); // too long
+    assert!(matches!(
+        DpasRating::parse("DZ-A1"),
+        Err(ProgramSymbolError::BadPriority(_))
+    ));
+    assert!(matches!(DpasRating::validate_program_symbol("A1"), Ok(())));
+    assert!(matches!(
+        DpasRating::validate_program_symbol("ZZ"),
+        Err(ProgramSymbolError::BadSymbol(_))
+    ));
 }
 
 #[test]

@@ -22,10 +22,10 @@ ABERP already has the right home for durable, tamper-evident people-facts: the A
 
 | EventKind | storage string | fires when | payload |
 | --- | --- | --- | --- |
-| `PersonnelIdRegistered` | `personnel.id_registered` | a `DigitalIdProvider` mints an operator identity | `{operator_id, provider_name, registered_at_ms}` |
-| `PersonnelSignatureApplied` | `personnel.signature_applied` | an e-signature is applied to a record | `{operator_id, signed_record_kind, signed_record_id, signature_algorithm, signed_at_ms}` |
-| `PersonnelAccessGranted` | `personnel.access_granted` | CUI / export-controlled access is granted | `{operator_id, resource_kind, resource_id, granted_by, reason}` |
-| `PersonnelAccessDenied` | `personnel.access_denied` | such access is denied | `{operator_id, resource_kind, resource_id, denied_reason}` |
+| `PersonnelIdRegistered` | `personnel.id_registered` | a `DigitalIdProvider` mints an operator identity | `{operator_user_id, provider_name, registered_at_ms}` |
+| `PersonnelSignatureApplied` | `personnel.signature_applied` | an e-signature is applied to a record | `{operator_user_id, signed_record_kind, signed_record_id, signature_algorithm, signed_at_ms}` |
+| `PersonnelAccessGranted` | `personnel.access_granted` | CUI / export-controlled access is granted | `{operator_user_id, resource_kind, resource_id, granted_by, reason}` |
+| `PersonnelAccessDenied` | `personnel.access_denied` | such access is denied | `{operator_user_id, resource_kind, resource_id, denied_reason}` |
 
 The grant/deny **pair** is deliberate: recording only denials (the easy, defensive half) would leave the more sensitive fact — who was *let in* to controlled data, and on whose authority — untracked. `granted_by` is the two-person-integrity anchor; `reason` / `denied_reason` are the loud-fail justifications (CLAUDE.md rule 12 — a silently-swallowed access decision is the worst-class failure for an access trail).
 
@@ -52,3 +52,7 @@ ADR-0071 left `aberp-compliance` a workspace member but deliberately NOT a dep o
 **Negative / deferred.** Nothing fires these kinds yet — the access trail is an empty contract until S356+ wires the firing sites (which themselves wait on the controlled resources — CUI documents, export-controlled drawings — existing in code). The payloads are untyped `serde_json::Value`; a future session may promote them to typed structs in `audit_payloads.rs` once a firing site fixes the shape. The e-signature *ceremony* (re-authentication on signing, certificate revocation checking) remains future work per ADR-0070.
 
 **Future work (not S355):** firing sites for all four kinds (S356+); typed payload structs once a firing site stabilizes the shape; the access-control resource model (what a "CUI document" / "export-controlled drawing" is in ABERP's data model); wiring `aberp-compliance` types into the `resource_kind` / `denied_reason` vocabularies.
+
+## §6 — Correction (S367, 2026-06-12 — review F1)
+
+The four payloads above originally named the acting-operator field `operator_id`. S366 found that across ADR-0073…0079 ten different spellings had accumulated (`operator_id`, `signed_by_operator_id`, `marked_by_operator_id`, `assigned_by_operator_id`, `classified_by_operator_id`, `requesting_operator_id`, `shipped_by_operator_id`, `applied_by_operator_id`, `set_by_operator_id`, `screened_by_operator_id`, `reporter_operator_id`) while the two families that actually fire (S350 `QuotePricingMaterialEdited`, S354 `QuotePricingOperatorAccepted` in `apps/aberp::serve`) used **`operator_user_id`** — the Bearer-subject operator login. Since no compliance firing site existed yet, S367 canonicalized every compliance payload's acting-operator key to **`operator_user_id`** and pinned it in the per-EventKind serialization tests. The standing rule lives in the `aberp_compliance::prelude` "Identity-key canonicalization" doc note: new compliance EventKinds reuse `operator_user_id`; the distinct `granted_by` authorizing-party field on the access-grant kinds is a *different concept* (the supervisor who authorized, not the acting subject) and is deliberately left as-is.

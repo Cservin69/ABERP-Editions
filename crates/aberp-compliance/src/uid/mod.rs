@@ -7,11 +7,19 @@
 //! concatenated reference string (an "IRI" — item reference identifier in the
 //! IUID registry sense). MIL-STD-130N defines two valid UII *constructs*:
 //!
-//! - **Construct 1** — Issuing Agency Code + Enterprise Identifier + Original
+//! - **Construct 1** — Issuing Agency Code + Enterprise Identifier + Serial
+//!   Number (NO part number). The serial is unique across *all* items that
+//!   enterprise produces.
+//! - **Construct 2** — Issuing Agency Code + Enterprise Identifier + Original
 //!   Part Number + Serial Number. The serial is unique *within the part number*
 //!   for that enterprise.
-//! - **Construct 2** — Issuing Agency Code + Enterprise Identifier + Serial
-//!   Number. The serial is unique across *all* parts that enterprise produces.
+//!
+//! Source: MIL-STD-130N and the DoD *Guide to Uniquely Identifying Items* (the
+//! IUID "UII constructs" appendix) — Construct #1 is the serial-only form (used
+//! when the enterprise guarantees serial uniqueness across all of its items);
+//! Construct #2 adds the original part number (used when the serial is unique
+//! only within a part number). S366 review F5 corrected the S358 swap: the two
+//! constructs had been defined in reverse against the standard.
 //!
 //! The Issuing Agency Code (IAC, per ISO/IEC 15459) names the registration
 //! authority that guarantees the Enterprise Identifier's uniqueness — for a
@@ -128,23 +136,77 @@ pub fn validate_iac(s: &str) -> Result<(), UidError> {
 }
 
 /// A validated MIL-STD-130N **Construct 1** UII: Issuing Agency Code +
-/// Enterprise Identifier + Original Part Number + Serial Number.
+/// Enterprise Identifier + Serial Number (NO part number).
 ///
 /// Construct via [`IuidConstruct1::new`]; the inner fields are private so the
 /// type cannot exist in an invalid state through the constructor path. The
-/// serial is unique within the part number for the enterprise.
+/// serial is unique across *all* items the enterprise produces (no part number
+/// participates in the UII), per the DoD IUID Guide's Construct #1 definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IuidConstruct1 {
+    iac: String,
+    eid: String,
+    serial: String,
+}
+
+impl IuidConstruct1 {
+    /// Validate every component and wrap. The IAC is checked by
+    /// [`validate_iac`]; the enterprise id and serial by the shared UID-field
+    /// rules.
+    pub fn new(
+        iac: impl Into<String>,
+        eid: impl Into<String>,
+        serial: impl Into<String>,
+    ) -> Result<Self, UidError> {
+        let iac = iac.into();
+        let eid = eid.into();
+        let serial = serial.into();
+        validate_iac(&iac)?;
+        validate_field("eid", &eid)?;
+        validate_field("serial", &serial)?;
+        Ok(Self { iac, eid, serial })
+    }
+
+    /// The Issuing Agency Code.
+    pub fn iac(&self) -> &str {
+        &self.iac
+    }
+
+    /// The Enterprise Identifier (CAGE / DUNS / manufacturer id).
+    pub fn eid(&self) -> &str {
+        &self.eid
+    }
+
+    /// The serial number (unique across all items of the enterprise).
+    pub fn serial(&self) -> &str {
+        &self.serial
+    }
+
+    /// Render the UII as its concatenated reference string:
+    /// `IAC + EID + Serial`.
+    pub fn to_iri(&self) -> String {
+        format!("{}{}{}", self.iac, self.eid, self.serial)
+    }
+}
+
+/// A validated MIL-STD-130N **Construct 2** UII: Issuing Agency Code +
+/// Enterprise Identifier + Original Part Number + Serial Number.
+///
+/// Same defensive pattern as [`IuidConstruct1`]. The serial is unique *within
+/// the part number* for the enterprise (the part number participates in the
+/// UII), per the DoD IUID Guide's Construct #2 definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IuidConstruct2 {
     iac: String,
     eid: String,
     original_part_number: String,
     serial: String,
 }
 
-impl IuidConstruct1 {
-    /// Validate every component and wrap. The IAC is checked by
-    /// [`validate_iac`]; the enterprise id, part number, and serial by the
-    /// shared UID-field rules.
+impl IuidConstruct2 {
+    /// Validate every component and wrap. See [`IuidConstruct1::new`] for the
+    /// per-field rules; this construct additionally validates the original part
+    /// number.
     pub fn new(
         iac: impl Into<String>,
         eid: impl Into<String>,
@@ -197,65 +259,13 @@ impl IuidConstruct1 {
     }
 }
 
-/// A validated MIL-STD-130N **Construct 2** UII: Issuing Agency Code +
-/// Enterprise Identifier + Serial Number.
-///
-/// Same defensive pattern as [`IuidConstruct1`]. The serial is unique across
-/// *all* parts the enterprise produces (no part number participates in the
-/// UII), so a part number is not part of this construct.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IuidConstruct2 {
-    iac: String,
-    eid: String,
-    serial: String,
-}
-
-impl IuidConstruct2 {
-    /// Validate every component and wrap. See [`IuidConstruct1::new`] for the
-    /// per-field rules.
-    pub fn new(
-        iac: impl Into<String>,
-        eid: impl Into<String>,
-        serial: impl Into<String>,
-    ) -> Result<Self, UidError> {
-        let iac = iac.into();
-        let eid = eid.into();
-        let serial = serial.into();
-        validate_iac(&iac)?;
-        validate_field("eid", &eid)?;
-        validate_field("serial", &serial)?;
-        Ok(Self { iac, eid, serial })
-    }
-
-    /// The Issuing Agency Code.
-    pub fn iac(&self) -> &str {
-        &self.iac
-    }
-
-    /// The Enterprise Identifier (CAGE / DUNS / manufacturer id).
-    pub fn eid(&self) -> &str {
-        &self.eid
-    }
-
-    /// The serial number (unique across all parts of the enterprise).
-    pub fn serial(&self) -> &str {
-        &self.serial
-    }
-
-    /// Render the UII as its concatenated reference string:
-    /// `IAC + EID + Serial`.
-    pub fn to_iri(&self) -> String {
-        format!("{}{}{}", self.iac, self.eid, self.serial)
-    }
-}
-
 /// A validated MIL-STD-130N Item Unique Identifier in one of its two valid
 /// constructs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Iuid {
-    /// IAC + EID + Original Part Number + Serial.
+    /// IAC + EID + Serial (no part number).
     Construct1(IuidConstruct1),
-    /// IAC + EID + Serial.
+    /// IAC + EID + Original Part Number + Serial.
     Construct2(IuidConstruct2),
 }
 

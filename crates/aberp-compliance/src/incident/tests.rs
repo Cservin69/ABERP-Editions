@@ -93,10 +93,24 @@ fn s362_detection_source_tokens_match_brief_vocab_and_reject_unknown() {
 #[test]
 fn s362_dod_72h_report_due_is_exactly_72h_after_detection() {
     let detected_at_ms = 1_750_000_000_000_i64;
-    let due = dod_72h_report_due_at_ms(detected_at_ms);
+    // A CDI-affecting incident triggers the deadline.
+    let due = dod_72h_report_due_at_ms(detected_at_ms, true, false).expect("CDI triggers deadline");
     assert_eq!(due - detected_at_ms, DFARS_72H_REPORT_WINDOW_MS);
     // 72 h in ms, spelled out independently of the constant.
     assert_eq!(due - detected_at_ms, 259_200_000);
+}
+
+#[test]
+fn s367_dod_72h_trigger_covers_both_cdi_and_ocs() {
+    // F16: 252.204-7012(c)(1)(i) triggers on CDI-affecting OR operationally-
+    // critical-support-affecting. Either alone arms the 72-hour clock; both
+    // together do; neither leaves no deadline.
+    let t = 1_750_000_000_000_i64;
+    let due = t + DFARS_72H_REPORT_WINDOW_MS;
+    assert_eq!(dod_72h_report_due_at_ms(t, true, false), Some(due)); // CDI only
+    assert_eq!(dod_72h_report_due_at_ms(t, false, true), Some(due)); // OCS only
+    assert_eq!(dod_72h_report_due_at_ms(t, true, true), Some(due)); // both
+    assert_eq!(dod_72h_report_due_at_ms(t, false, false), None); // neither
 }
 
 #[test]

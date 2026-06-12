@@ -1960,7 +1960,7 @@ pub enum EventKind {
     /// operator's `DigitalId`, this is the audit-of-record that the identity
     /// now exists on this install (the Part-11 / DFARS "who can act" anchor).
     ///
-    /// Payload (`serde_json::Value`): `operator_id` (the provider-issued
+    /// Payload (`serde_json::Value`): `operator_user_id` (the provider-issued
     /// identity id), `provider_name` (which backend issued it — `mock` today,
     /// a real CAC / eID backend later), `registered_at_ms` (epoch-ms stamp of
     /// registration).
@@ -1985,7 +1985,7 @@ pub enum EventKind {
     /// reference INLINE on an arbitrary event) — this kind is the standalone
     /// "a signature ceremony happened" landmark a forensic walker can glob.
     ///
-    /// Payload (`serde_json::Value`): `operator_id` (signer identity),
+    /// Payload (`serde_json::Value`): `operator_user_id` (signer identity),
     /// `signed_record_kind` (what KIND of record was signed — e.g. an
     /// invoice / work-order / inspection discriminator), `signed_record_id`
     /// (the signed record's id), `signature_algorithm` (the load-bearing
@@ -2004,7 +2004,7 @@ pub enum EventKind {
     /// into WHAT and WHY. Without this row a defense-grade access trail can
     /// only show denials, not the (more sensitive) grants.
     ///
-    /// Payload (`serde_json::Value`): `operator_id` (who was granted access),
+    /// Payload (`serde_json::Value`): `operator_user_id` (who was granted access),
     /// `resource_kind` (the controlled-resource discriminator — e.g. a CUI
     /// document / export-controlled drawing class), `resource_id` (the
     /// specific resource), `granted_by` (the authorizing operator / role —
@@ -2024,7 +2024,7 @@ pub enum EventKind {
     /// access trail — the audit row makes "we refused, and here's why"
     /// permanent and reviewable.
     ///
-    /// Payload (`serde_json::Value`): `operator_id` (who was denied),
+    /// Payload (`serde_json::Value`): `operator_user_id` (who was denied),
     /// `resource_kind` (the controlled-resource discriminator), `resource_id`
     /// (the specific resource), and `denied_reason` (the closed-vocab /
     /// operator-readable cause — e.g. `export_screening_failed`,
@@ -2052,7 +2052,7 @@ pub enum EventKind {
     /// grade / row key the cert backs), `cert_kind` (the certificate-class
     /// discriminator — e.g. `mill_cert` / `cofa` / `heat_treatment`),
     /// `cert_url` (where the cert document is retained), `attached_at_ms`
-    /// (epoch-ms stamp of the attach), `attached_by_operator_id` (who filed
+    /// (epoch-ms stamp of the attach), `operator_user_id` (who filed
     /// it — the accountability anchor), and an optional `lot_id` (the
     /// specific lot the cert covers, when the attach is lot-scoped rather
     /// than grade-wide).
@@ -2087,7 +2087,7 @@ pub enum EventKind {
     /// grade / row key), `lot_id` (validated `LotId` string), `heat_id`
     /// (validated `HeatId` string), an optional `source_supplier` (the AVL
     /// supplier the lot was sourced from, when known), `assigned_at_ms`
-    /// (epoch-ms stamp), and `assigned_by_operator_id` (who made the
+    /// (epoch-ms stamp), and `operator_user_id` (who made the
     /// binding).
     ///
     /// `material.*` prefix family — same segregation rationale as
@@ -2109,7 +2109,7 @@ pub enum EventKind {
     ///
     /// Payload (`serde_json::Value`): `part_id` (the part instance key the
     /// serial belongs to), `serial_number` (the assigned serial), `assigned_at_ms`
-    /// (epoch-ms stamp of the assignment), `assigned_by_operator_id` (who made
+    /// (epoch-ms stamp of the assignment), `operator_user_id` (who made
     /// the assignment — the accountability anchor), and optional
     /// `related_invoice_id` / `related_work_order_id` (the fiscal / production
     /// document the serialization was triggered by, when known).
@@ -2145,7 +2145,7 @@ pub enum EventKind {
     /// `uid_iri` (the rendered MIL-STD-130N IRI), `uid_construct_code` (the
     /// construct discriminator — e.g. `construct_1` / `construct_2`),
     /// `mil_std_130_compliant` (bool — whether the mark passed the standard's
-    /// format gate), `marked_at_ms` (epoch-ms stamp), and `marked_by_operator_id`
+    /// format gate), `marked_at_ms` (epoch-ms stamp), and `operator_user_id`
     /// (who marked it).
     ///
     /// `part.*` prefix family — same segregation rationale as
@@ -2174,7 +2174,7 @@ pub enum EventKind {
     /// `"drawing"` / `"spec"` / `"document"`), `entity_id` (the artifact key),
     /// `eccn` (optional — the EAR Commerce-Control-List number when EAR-listed),
     /// `usml_category` (optional — the USML category when ITAR-controlled),
-    /// `jurisdiction` (the regime string), `classified_by_operator_id` (who made
+    /// `jurisdiction` (the regime string), `operator_user_id` (who made
     /// the determination — the accountability anchor), and `classified_at_ms`
     /// (epoch-ms stamp).
     ///
@@ -2201,7 +2201,7 @@ pub enum EventKind {
     /// itself an export — so every check is recorded, not just the denials.
     ///
     /// Payload (`serde_json::Value`): `entity_kind` (artifact kind), `entity_id`
-    /// (artifact key), `requesting_operator_id` (who asked), `decision`
+    /// (artifact key), `operator_user_id` (who asked), `decision`
     /// (`"granted"` / `"denied"`), `reason` (the rule that drove the verdict),
     /// and `checked_at_ms` (epoch-ms stamp).
     ///
@@ -2220,7 +2220,7 @@ pub enum EventKind {
     /// `exporter_party_id` (the exporter of record), `recipient_party_id` (the
     /// consignee), `recipient_country` (ISO 3166-1 alpha-2 destination),
     /// `ecn_or_authorization` (optional — the licence / licence-exception / ECCN
-    /// cited), `shipped_at_ms` (epoch-ms stamp), and `shipped_by_operator_id`
+    /// cited), `shipped_at_ms` (epoch-ms stamp), and `operator_user_id`
     /// (who released the shipment).
     ///
     /// `export.*` prefix family — same segregation rationale as
@@ -2241,8 +2241,9 @@ pub enum EventKind {
     ///
     /// Payload (`serde_json::Value`): `entity_kind` (what was marked — e.g.
     /// `"drawing"` / `"spec"` / `"document"`), `entity_id` (the artifact key),
-    /// `cui_marking_str` (the rendered banner, e.g. `"CUI//CTI//NOFORN"`),
-    /// `applied_by_operator_id` (who applied it — the accountability anchor),
+    /// `cui_marking_str` (the rendered banner, e.g. `"CUI//SP-CTI//NOFORN"` —
+    /// CTI is a CUI Specified category, so the banner carries the `SP-` prefix),
+    /// `operator_user_id` (who applied it — the accountability anchor),
     /// and `applied_at_ms` (epoch-ms stamp).
     ///
     /// `cui.*` prefix family — NOT `invoice.*` / `system.*` / `mes.*` /
@@ -2271,7 +2272,7 @@ pub enum EventKind {
     /// `export.access_check` posture specialised to a CUI-marked artifact).
     ///
     /// Payload (`serde_json::Value`): `entity_kind` (artifact kind), `entity_id`
-    /// (artifact key), `requesting_operator_id` (who asked), `decision`
+    /// (artifact key), `operator_user_id` (who asked), `decision`
     /// (`"granted"` / `"denied"`), `reason` (the rule that drove the verdict),
     /// and `accessed_at_ms` (epoch-ms stamp).
     ///
@@ -2294,9 +2295,10 @@ pub enum EventKind {
     /// reach the ledger.
     ///
     /// Payload (`serde_json::Value`): `partner_id` (the AVL supplier this
-    /// rating attaches to), `dpas_rating` (the rendered rating, e.g.
-    /// `"DX-C1"` / `"DO-C1"` / `"NONE"`), `set_by_operator_id` (who assigned
-    /// it — the accountability anchor), and `set_at_ms` (epoch-ms stamp).
+    /// rating attaches to), `dpas_rating` (the rendered 15 CFR 700.12 rating,
+    /// e.g. `"DO-A1"` / `"DX-A7"`; an unrated supplier is recorded by omitting
+    /// the field, not a sentinel string), `operator_user_id` (who assigned it —
+    /// the accountability anchor), and `set_at_ms` (epoch-ms stamp).
     ///
     /// `supplier.*` prefix family — NOT `invoice.*` / `system.*` / `mes.*` /
     /// `quote.*` / `inventory.*` / `email.*` / `personnel.*` / `material.*` /
@@ -2330,7 +2332,7 @@ pub enum EventKind {
     /// [`aberp_compliance::avl::ExportScreeningStatus`] outcome vocab),
     /// `screening_source` (which list / service answered — e.g.
     /// `"mock-bis-csl"`), `screened_at_ms` (epoch-ms stamp),
-    /// `screened_by_operator_id` (who ran it), and an optional `hit_details`
+    /// `operator_user_id` (who ran it), and an optional `hit_details`
     /// (the list / reason string, present only on a hit / inconclusive — never
     /// on a clear).
     ///
@@ -2353,20 +2355,23 @@ pub enum EventKind {
     /// obligation was triggered and tracked.
     ///
     /// Payload (`serde_json::Value`): `detected_at_ms` (epoch-ms discovery stamp
-    /// — the 72-hour clock's start), `reporter_operator_id` (who logged it — an
+    /// — the 72-hour clock's start), `operator_user_id` (who logged it — an
     /// opaque accountability handle, never PII), `severity` (the rendered
     /// [`aberp_compliance::incident::IncidentSeverity::as_str`] form —
     /// `"informational"` / `"low"` / `"medium"` / `"high"` / `"critical"`),
     /// `scope_description` (a free-text scope summary — NOT raw log dumps, per
     /// the no-PII / no-controlled-content-at-rest posture), `cdi_affected`
     /// (bool — Controlled Defense Information per DFARS), `cui_affected` (bool —
-    /// CUI per 32 CFR Part 2002), `exfiltration_suspected` (bool),
+    /// CUI per 32 CFR Part 2002), `ocs_affected` (bool — the incident affects
+    /// the contractor's ability to perform requirements designated
+    /// **operationally critical support** per 252.204-7012(c)(1)(i)(B)),
+    /// `exfiltration_suspected` (bool),
     /// `affected_systems` (a string array of system identifiers),
     /// `detection_source` (the rendered
     /// [`aberp_compliance::incident::DetectionSource::as_str`] form — `"siem"` /
     /// `"user_report"` / `"vendor_notification"` / `"audit"` / `"other"`), an
     /// optional `mitigation_notes`, and an optional `dod_72h_report_due_at_ms`
-    /// (present when `cdi_affected` is true — `detected_at_ms` + 72h, the DFARS
+    /// (present when `cdi_affected` **or** `ocs_affected` is true — `detected_at_ms` + 72h, the DFARS
     /// reporting deadline, computed by
     /// [`aberp_compliance::incident::dod_72h_report_due_at_ms`]).
     ///
@@ -2382,7 +2387,7 @@ pub enum EventKind {
     ///
     /// No PII / no controlled content at rest: the payload records a
     /// `scope_description` summary (not raw log dumps), an opaque
-    /// `reporter_operator_id` (not PII), and system *identifiers* (not their
+    /// `operator_user_id` (not PII), and system *identifiers* (not their
     /// contents). S362 ships the kind only; the SPRS report submission, the SIEM
     /// integration, the incident-entry UI, and the 72-hour deadline alerting all
     /// land in later sessions (mock-first, no firing site exists yet). F12
@@ -5120,13 +5125,13 @@ mod tests {
     #[test]
     fn s355_personnel_id_registered_payload_serializes() {
         let payload = serde_json::json!({
-            "operator_id": "mock-op-001",
+            "operator_user_id": "mock-op-001",
             "provider_name": "mock",
             "registered_at_ms": 1_750_000_000_000_i64,
         });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
-        assert!(parsed["operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert!(parsed["provider_name"].is_string());
         assert!(parsed["registered_at_ms"].is_i64());
     }
@@ -5137,7 +5142,7 @@ mod tests {
     #[test]
     fn s355_personnel_signature_applied_payload_serializes() {
         let payload = serde_json::json!({
-            "operator_id": "mock-op-001",
+            "operator_user_id": "mock-op-001",
             "signed_record_kind": "invoice",
             "signed_record_id": "inv_01HZ",
             "signature_algorithm": "mock-hmac-sha256",
@@ -5145,7 +5150,7 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
-        assert!(parsed["operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert!(parsed["signed_record_kind"].is_string());
         assert!(parsed["signed_record_id"].is_string());
         assert!(parsed["signature_algorithm"].is_string());
@@ -5158,7 +5163,7 @@ mod tests {
     #[test]
     fn s355_personnel_access_granted_payload_serializes() {
         let payload = serde_json::json!({
-            "operator_id": "mock-op-001",
+            "operator_user_id": "mock-op-001",
             "resource_kind": "cui_document",
             "resource_id": "doc_01HZ",
             "granted_by": "supervisor-007",
@@ -5166,7 +5171,7 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
-        assert!(parsed["operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert!(parsed["resource_kind"].is_string());
         assert!(parsed["resource_id"].is_string());
         assert!(parsed["granted_by"].is_string());
@@ -5179,14 +5184,14 @@ mod tests {
     #[test]
     fn s355_personnel_access_denied_payload_serializes() {
         let payload = serde_json::json!({
-            "operator_id": "mock-op-001",
+            "operator_user_id": "mock-op-001",
             "resource_kind": "export_controlled_drawing",
             "resource_id": "dwg_01HZ",
             "denied_reason": "export_screening_failed",
         });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
-        assert!(parsed["operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert!(parsed["resource_kind"].is_string());
         assert!(parsed["resource_id"].is_string());
         assert!(parsed["denied_reason"].is_string());
@@ -5301,7 +5306,7 @@ mod tests {
             "cert_kind": "mill_cert",
             "cert_url": "https://certs.example/coc/abc123.pdf",
             "attached_at_ms": 1_750_000_000_000_i64,
-            "attached_by_operator_id": "mock-op-001",
+            "operator_user_id": "mock-op-001",
             "lot_id": "LOT-2026-0042",
         });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
@@ -5310,7 +5315,7 @@ mod tests {
         assert!(parsed["cert_kind"].is_string());
         assert!(parsed["cert_url"].is_string());
         assert!(parsed["attached_at_ms"].is_i64());
-        assert!(parsed["attached_by_operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert!(parsed["lot_id"].is_string());
     }
 
@@ -5327,7 +5332,7 @@ mod tests {
             "heat_id": "HEAT-9F3A",
             "source_supplier": "ACME-METALS-AVL-007",
             "assigned_at_ms": 1_750_000_000_000_i64,
-            "assigned_by_operator_id": "mock-op-001",
+            "operator_user_id": "mock-op-001",
         });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
@@ -5336,7 +5341,7 @@ mod tests {
         assert!(parsed["heat_id"].is_string());
         assert!(parsed["source_supplier"].is_string());
         assert!(parsed["assigned_at_ms"].is_i64());
-        assert!(parsed["assigned_by_operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
     }
 
     // ── S358 / PR-45 (ADR-0075) — part.* per-unit serialization family ──────
@@ -5445,7 +5450,7 @@ mod tests {
             "part_id": "PRT-7781",
             "serial_number": "SN-0001",
             "assigned_at_ms": 1_750_000_000_000_i64,
-            "assigned_by_operator_id": "mock-op-001",
+            "operator_user_id": "mock-op-001",
             "related_invoice_id": "INV-2026-0042",
             "related_work_order_id": "WO-2026-0099",
         });
@@ -5454,7 +5459,7 @@ mod tests {
         assert!(parsed["part_id"].is_string());
         assert!(parsed["serial_number"].is_string());
         assert!(parsed["assigned_at_ms"].is_i64());
-        assert!(parsed["assigned_by_operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert!(parsed["related_invoice_id"].is_string());
         assert!(parsed["related_work_order_id"].is_string());
     }
@@ -5472,7 +5477,7 @@ mod tests {
             "uid_construct_code": "construct_1",
             "mil_std_130_compliant": true,
             "marked_at_ms": 1_750_000_000_000_i64,
-            "marked_by_operator_id": "mock-op-001",
+            "operator_user_id": "mock-op-001",
         });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
@@ -5481,7 +5486,7 @@ mod tests {
         assert!(parsed["uid_construct_code"].is_string());
         assert!(parsed["mil_std_130_compliant"].is_boolean());
         assert!(parsed["marked_at_ms"].is_i64());
-        assert!(parsed["marked_by_operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
     }
 
     // ── S359 / PR-46 (ADR-0076) — export.* export-control family ────────────
@@ -5610,7 +5615,7 @@ mod tests {
             "eccn": "7A994",
             "usml_category": "VIII(h)",
             "jurisdiction": "ITAR",
-            "classified_by_operator_id": "mock-op-001",
+            "operator_user_id": "mock-op-001",
             "classified_at_ms": 1_750_000_000_000_i64,
         });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
@@ -5620,7 +5625,7 @@ mod tests {
         assert!(parsed["eccn"].is_string());
         assert!(parsed["usml_category"].is_string());
         assert!(parsed["jurisdiction"].is_string());
-        assert!(parsed["classified_by_operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert!(parsed["classified_at_ms"].is_i64());
     }
 
@@ -5632,7 +5637,7 @@ mod tests {
         let payload = serde_json::json!({
             "entity_kind": "spec",
             "entity_id": "SPEC-3001",
-            "requesting_operator_id": "mock-op-002",
+            "operator_user_id": "mock-op-002",
             "decision": "denied",
             "reason": "requester not a U.S. person (ITAR 22 CFR 120.62)",
             "checked_at_ms": 1_750_000_000_000_i64,
@@ -5641,7 +5646,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
         assert!(parsed["entity_kind"].is_string());
         assert!(parsed["entity_id"].is_string());
-        assert!(parsed["requesting_operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert_eq!(parsed["decision"], "denied");
         assert!(parsed["reason"].is_string());
         assert!(parsed["checked_at_ms"].is_i64());
@@ -5659,7 +5664,7 @@ mod tests {
             "recipient_country": "DE",
             "ecn_or_authorization": "License Exception STA",
             "shipped_at_ms": 1_750_000_000_000_i64,
-            "shipped_by_operator_id": "mock-op-003",
+            "operator_user_id": "mock-op-003",
         });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
@@ -5669,7 +5674,7 @@ mod tests {
         assert!(parsed["recipient_country"].is_string());
         assert!(parsed["ecn_or_authorization"].is_string());
         assert!(parsed["shipped_at_ms"].is_i64());
-        assert!(parsed["shipped_by_operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
     }
 
     // ── S360 / PR-47 (ADR-0077) — cui.* Controlled-Unclassified-Information ──
@@ -5779,8 +5784,8 @@ mod tests {
         let payload = serde_json::json!({
             "entity_kind": "drawing",
             "entity_id": "DWG-7781-A",
-            "cui_marking_str": "CUI//CTI//NOFORN",
-            "applied_by_operator_id": "mock-op-001",
+            "cui_marking_str": "CUI//SP-CTI//NOFORN",
+            "operator_user_id": "mock-op-001",
             "applied_at_ms": 1_750_000_000_000_i64,
         });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
@@ -5788,7 +5793,7 @@ mod tests {
         assert!(parsed["entity_kind"].is_string());
         assert!(parsed["entity_id"].is_string());
         assert!(parsed["cui_marking_str"].is_string());
-        assert!(parsed["applied_by_operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert!(parsed["applied_at_ms"].is_i64());
     }
 
@@ -5800,7 +5805,7 @@ mod tests {
         let payload = serde_json::json!({
             "entity_kind": "spec",
             "entity_id": "SPEC-3001",
-            "requesting_operator_id": "mock-op-002",
+            "operator_user_id": "mock-op-002",
             "decision": "denied",
             "reason": "no lawful government purpose on file (32 CFR 2002.4)",
             "accessed_at_ms": 1_750_000_000_000_i64,
@@ -5809,7 +5814,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
         assert!(parsed["entity_kind"].is_string());
         assert!(parsed["entity_id"].is_string());
-        assert!(parsed["requesting_operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert_eq!(parsed["decision"], "denied");
         assert!(parsed["reason"].is_string());
         assert!(parsed["accessed_at_ms"].is_i64());
@@ -5925,15 +5930,15 @@ mod tests {
     fn s361_supplier_dpas_priority_set_payload_serializes() {
         let payload = serde_json::json!({
             "partner_id": "partner-4711",
-            "dpas_rating": "DX-C1",
-            "set_by_operator_id": "mock-op-001",
+            "dpas_rating": "DX-A7",
+            "operator_user_id": "mock-op-001",
             "set_at_ms": 1_750_000_000_000_i64,
         });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
         assert!(parsed["partner_id"].is_string());
         assert!(parsed["dpas_rating"].is_string());
-        assert!(parsed["set_by_operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert!(parsed["set_at_ms"].is_i64());
     }
 
@@ -5948,7 +5953,7 @@ mod tests {
             "screening_result": "hit",
             "screening_source": "mock-bis-csl",
             "screened_at_ms": 1_750_000_000_000_i64,
-            "screened_by_operator_id": "mock-op-002",
+            "operator_user_id": "mock-op-002",
             "hit_details": "BIS Entity List partial-name match (manual review)",
         });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
@@ -5957,7 +5962,7 @@ mod tests {
         assert_eq!(parsed["screening_result"], "hit");
         assert!(parsed["screening_source"].is_string());
         assert!(parsed["screened_at_ms"].is_i64());
-        assert!(parsed["screened_by_operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert!(parsed["hit_details"].is_string());
     }
 
@@ -6048,10 +6053,11 @@ mod tests {
         let detected_at_ms = 1_750_000_000_000_i64;
         let payload = serde_json::json!({
             "detected_at_ms": detected_at_ms,
-            "reporter_operator_id": "mock-op-007",
+            "operator_user_id": "mock-op-007",
             "severity": "high",
             "scope_description": "Anomalous outbound traffic from CAD workstation segment",
             "cdi_affected": true,
+            "ocs_affected": false,
             "cui_affected": true,
             "exfiltration_suspected": false,
             "affected_systems": ["cad-ws-04", "file-srv-02"],
@@ -6062,10 +6068,11 @@ mod tests {
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
         assert!(parsed["detected_at_ms"].is_i64());
-        assert!(parsed["reporter_operator_id"].is_string());
+        assert!(parsed["operator_user_id"].is_string());
         assert_eq!(parsed["severity"], "high");
         assert!(parsed["scope_description"].is_string());
         assert_eq!(parsed["cdi_affected"], true);
+        assert_eq!(parsed["ocs_affected"], false);
         assert_eq!(parsed["cui_affected"], true);
         assert_eq!(parsed["exfiltration_suspected"], false);
         assert!(parsed["affected_systems"].is_array());

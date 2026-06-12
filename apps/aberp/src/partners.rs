@@ -603,14 +603,19 @@ UPDATE partners
 /// NULL in the app layer.
 ///
 /// - `dpas_rating VARCHAR` — the DPAS priority the supplier is approved to
-///   service, written by the `supplier.dpas_priority_set` firing site.
-///   Validated against the [`aberp_compliance::avl::DpasRating`] `as_str`
-///   format (`NONE` / `DO-C1` / `DX-C1`) at the write boundary, NOT a DB CHECK
-///   (per [[no-sql-specific]]).
+///   service, written by the `supplier.dpas_priority_set` firing site (later
+///   session — no production writer exists yet). The future write boundary MUST
+///   route the value through [`aberp_compliance::avl::DpasRating::parse`] (15
+///   CFR 700.12 form `<DO|DX>-<program symbol>`, e.g. `DO-A1`), NOT a DB CHECK
+///   (per [[no-sql-specific]]); unrated suppliers store NULL. (S366 review F13:
+///   the rating model was remodelled in S367 from the old closed `DO-C1` /
+///   `DX-C1` enum.)
 /// - `eccn VARCHAR` — the supplier's product Export Control Classification
-///   Number (EAR / Commerce Control List), free-form: an ECCN is a structured
-///   but open vocabulary (`7A994`, `EAR99`, …) the classification service
-///   determines, never validated by a closed enum here.
+///   Number (EAR / Commerce Control List). An ECCN is a structured but open
+///   vocabulary (`7A994`, `EAR99`, …) the classification service determines; the
+///   future write boundary validates its *shape* through
+///   [`aberp_compliance::export_control::validate_eccn`] (a 5-char
+///   `[0-9][A-E][0-9]{3}` code or the literal `EAR99`), never a closed enum.
 /// - `export_screening_status VARCHAR` — the stored denial-list screening
 ///   outcome, validated against the
 ///   [`aberp_compliance::avl::ExportScreeningStatus`] `as_str` vocab
@@ -1756,7 +1761,7 @@ mod tests {
     /// silently reset the data. Mirrors the S357 `quoting_materials` pattern.
     #[test]
     fn s361_avl_migration_is_idempotent_and_does_not_clobber() {
-        use aberp_compliance::avl::{DpasRating, ExportScreeningStatus};
+        use aberp_compliance::avl::{DpasPriority, DpasRating, ExportScreeningStatus};
 
         let conn = Connection::open_in_memory().expect("in-memory DuckDB");
         // First ensure_schema runs the migration once.
@@ -1777,7 +1782,7 @@ mod tests {
                  export_screened_at = ?
              WHERE tenant_id = ? AND id = ?;",
             params![
-                DpasRating::DxC1.as_str(),
+                DpasRating::new(DpasPriority::Dx, "A1").unwrap().as_str(),
                 "7A994",
                 ExportScreeningStatus::Hit.as_str(),
                 "2026-06-12T10:00:00Z",
@@ -1805,7 +1810,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .expect("read back AVL columns");
-        assert_eq!(dpas.as_deref(), Some("DX-C1"), "dpas_rating clobbered");
+        assert_eq!(dpas.as_deref(), Some("DX-A1"), "dpas_rating clobbered");
         assert_eq!(eccn.as_deref(), Some("7A994"), "eccn clobbered");
         assert_eq!(
             status.as_deref(),
@@ -1820,8 +1825,8 @@ mod tests {
         // The stored strings round-trip back through the validated newtypes —
         // proving the column only ever holds well-formed values.
         assert_eq!(
-            DpasRating::from_storage_str(&dpas.unwrap()).expect("valid dpas"),
-            DpasRating::DxC1
+            DpasRating::parse(&dpas.unwrap()).expect("valid dpas"),
+            DpasRating::new(DpasPriority::Dx, "A1").unwrap()
         );
         assert_eq!(
             ExportScreeningStatus::from_storage_str(&status.unwrap()).expect("valid status"),

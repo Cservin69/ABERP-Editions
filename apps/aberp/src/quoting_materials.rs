@@ -80,11 +80,15 @@ CREATE TABLE IF NOT EXISTS quoting_materials (
 /// coerces / interprets NULL in the app layer.
 ///
 /// - `current_lot_id VARCHAR` — the material instance's current lot, written
-///   by the `material.heat_lot_assigned` firing site. Validated against the
-///   `[A-Za-z0-9-]` ≤32 [`aberp_compliance::lot_heat::LotId`] format at the
-///   write boundary (NOT a DB CHECK, per [[no-sql-specific]]).
+///   by the `material.heat_lot_assigned` firing site (later session — no
+///   production writer exists yet). The future write boundary MUST route the
+///   value through [`aberp_compliance::lot_heat::LotId::new`] (`[A-Za-z0-9-]`
+///   ≤32), rejecting on error (NOT a DB CHECK, per [[no-sql-specific]]); a
+///   compliance column may only be written via its `aberp_compliance` type
+///   (S366 review F3).
 /// - `current_heat_id VARCHAR` — the mill heat the current lot was poured
-///   from; same [`aberp_compliance::lot_heat::HeatId`] validation at write.
+///   from; same [`aberp_compliance::lot_heat::HeatId::new`] validation at the
+///   future write boundary.
 /// - `cert_url VARCHAR` — where the last attached material certificate is
 ///   retained, mirrored from the `material.cert_attached` payload.
 /// - `cert_attached_at VARCHAR` — RFC3339 stamp of the last cert attach.

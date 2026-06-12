@@ -25,8 +25,8 @@ The aerospace/defense gap analysis (S330) named CUI handling as a structural req
 
 | EventKind | storage string | fires when | payload |
 | --- | --- | --- | --- |
-| `CuiMarkingApplied` | `cui.marking_applied` | a CUI banner is applied to a document / drawing / spec | `{entity_kind, entity_id, cui_marking_str, applied_by_operator_id, applied_at_ms}` |
-| `CuiAccessEvent` | `cui.access_event` | access to a CUI-marked artifact is checked | `{entity_kind, entity_id, requesting_operator_id, decision, reason, accessed_at_ms}` |
+| `CuiMarkingApplied` | `cui.marking_applied` | a CUI banner is applied to a document / drawing / spec | `{entity_kind, entity_id, cui_marking_str, operator_user_id, applied_at_ms}` |
+| `CuiAccessEvent` | `cui.access_event` | access to a CUI-marked artifact is checked | `{entity_kind, entity_id, operator_user_id, decision, reason, accessed_at_ms}` |
 
 ### 2. Why two kinds (marking / access) and not one
 
@@ -39,7 +39,7 @@ A single `cui.event` kind with a `type` discriminator was rejected for the same 
 
 ### 3. No PII / no controlled content at rest
 
-The audit ledger is the durable, hash-chained, forever-retained record. CUI banners frequently sit on artifacts whose *content* is itself controlled (export-controlled technical data, privacy records). So the payloads deliberately record only **which** artifact (`entity_id`, an opaque key) and **who** acted (`*_operator_id`, an opaque accountability handle) and the **banner string** — never the controlled body, never a name or other PII. The marking record proves a marking happened; resolving the artifact's content is a separate, access-gated lookup. This keeps the ledger itself from becoming a CUI spillage vector (CLAUDE.md #12 — fail loud, never silently widen what is stored).
+The audit ledger is the durable, hash-chained, forever-retained record. CUI banners frequently sit on artifacts whose *content* is itself controlled (export-controlled technical data, privacy records). So the payloads deliberately record only **which** artifact (`entity_id`, an opaque key) and **who** acted (`operator_user_id`, an opaque accountability handle) and the **banner string** — never the controlled body, never a name or other PII. The marking record proves a marking happened; resolving the artifact's content is a separate, access-gated lookup. This keeps the ledger itself from becoming a CUI spillage vector (CLAUDE.md #12 — fail loud, never silently widen what is stored).
 
 ### 4. The `DisseminationControl` enum + `to_banner_str` — completing the DoD banner
 
@@ -48,7 +48,9 @@ S345's `display_marking` renders the base marking (`UNCLASSIFIED`, `CUI//CTI`, `
 - **`DisseminationControl`** — a small `Copy` enum, a deliberate starter subset (`NOFORN` / `FEDCON` / `NOCON` / `DL ONLY`) mirroring the `CuiCategory` starter-subset posture, each with an `abbreviation()`. These are an *orthogonal axis* to the category: the category says *what kind* of CUI it is, the dissemination control says *who may receive it*.
 - **`CuiMarking::to_banner_str(&self, dissemination: &[DisseminationControl])`** — the full banner: `display_marking()` plus a trailing `//<DISSEM1>/<DISSEM2>` segment when controls are supplied. With an empty slice it is exactly `display_marking()`, so the no-further-limits form falls out for free. This is the string the `cui.marking_applied` payload's `cui_marking_str` carries — rendered from typed values so a free-text banner can never reach the ledger (the same discipline ADR-0076 §3 applied to `Jurisdiction`).
 
-`display_marking` is left untouched (its tests pin the base-marking contract); `to_banner_str` is purely additive and is the payload-facing helper the brief named. Modelling multiple categories in one banner (`CUI//SP-PROPIN//SP-PRVCY`) is **not** done — `CuiMarking::Cui` holds a single category, and a multi-category artifact is not representable in code yet; promoting `Cui` to a category set is deferred to a firing site that actually needs it (CLAUDE.md #2 / #13 — no speculative bloat).
+`to_banner_str` is purely additive and is the payload-facing helper the brief named. Modelling multiple categories in one banner (`CUI//SP-PROPIN//SP-PRVCY`) is **not** done — `CuiMarking::Cui` holds a single category, and a multi-category artifact is not representable in code yet; promoting `Cui` to a category set is deferred to a firing site that actually needs it (CLAUDE.md #2 / #13 — no speculative bloat).
+
+> **Correction (S367, 2026-06-12 — review F10):** S360 originally rendered every category as `CUI//<ABBREV>`, dropping the **`SP-` Specified prefix**. The DoD CUI Registry (and the DoD CUI Marking Handbook / 32 CFR 2002.20) distinguishes **CUI Basic** from **CUI Specified**: a Specified category is governed by a law / regulation / government-wide policy prescribing specific controls, and its banner takes the `SP-` prefix — `CUI//SP-CTI`, not `CUI//CTI`. Of the starter `CuiCategory` subset, **CTI** (Controlled Technical Information; DoDI 5230.24 / DFARS) and **EXPT** (Export Controlled; ITAR / EAR) are Specified. S367 added `CuiCategory::is_specified()` and made `display_marking` (hence `to_banner_str`) prepend `SP-` for Specified categories; the remaining categories are treated as CUI Basic until a registry row demands otherwise. The §4 examples above (`CUI//CTI//NOFORN`) reflect the pre-correction abbreviation form for a Basic-style category; a Specified category now renders `CUI//SP-CTI//NOFORN`. No firing site or ledger row existed, so the change rewrote zero rows.
 
 ### 5. A new `cui.*` prefix family (the eleventh)
 

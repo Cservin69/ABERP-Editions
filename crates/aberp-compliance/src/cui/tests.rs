@@ -31,18 +31,45 @@ fn s345_cui_display_marking_unclassified_and_classified() {
 
 #[test]
 fn s345_cui_display_marking_renders_cui_banner_with_abbrev() {
+    // CTI and EXPT are CUI Specified — banner carries the SP- prefix (F10).
     assert_eq!(
         CuiMarking::Cui(CuiCategory::Cti).display_marking(),
-        "CUI//CTI"
+        "CUI//SP-CTI"
     );
+    // PRVCY is CUI Basic — no SP- prefix.
     assert_eq!(
         CuiMarking::Cui(CuiCategory::Prvcy).display_marking(),
         "CUI//PRVCY"
     );
     assert_eq!(
         CuiMarking::Cui(CuiCategory::Expt).display_marking(),
-        "CUI//EXPT"
+        "CUI//SP-EXPT"
     );
+}
+
+#[test]
+fn s367_cui_specified_categories_carry_sp_prefix() {
+    // F10: CUI Specified categories take the SP- banner prefix; CUI Basic do not.
+    assert!(CuiCategory::Cti.is_specified());
+    assert!(CuiCategory::Expt.is_specified());
+    // Conservative subset — the rest are treated as CUI Basic.
+    for basic in [
+        CuiCategory::Prvcy,
+        CuiCategory::Crit,
+        CuiCategory::Lei,
+        CuiCategory::Ifg,
+        CuiCategory::Inf,
+        CuiCategory::Isvi,
+        CuiCategory::Proc,
+        CuiCategory::Prop,
+    ] {
+        assert!(!basic.is_specified(), "{basic:?} should be CUI Basic");
+        // A Basic category's banner must NOT carry SP-.
+        assert!(
+            !CuiMarking::Cui(basic).display_marking().contains("SP-"),
+            "{basic:?} banner must not carry SP-"
+        );
+    }
 }
 
 #[test]
@@ -139,7 +166,7 @@ fn s360_to_banner_str_with_no_dissemination_equals_display_marking() {
 fn s360_to_banner_str_appends_single_dissemination_segment() {
     assert_eq!(
         CuiMarking::Cui(CuiCategory::Cti).to_banner_str(&[DisseminationControl::NoForn]),
-        "CUI//CTI//NOFORN"
+        "CUI//SP-CTI//NOFORN"
     );
     assert_eq!(
         CuiMarking::Secret.to_banner_str(&[DisseminationControl::NoForn]),

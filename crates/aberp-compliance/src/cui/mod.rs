@@ -12,7 +12,8 @@
 //! S360 (ADR-0077) extends the marking helpers with [`DisseminationControl`]
 //! and [`CuiMarking::to_banner_str`] so the `cui.marking_applied` audit payload
 //! can carry the full DoD banner — base marking plus the limited-dissemination
-//! segment (`CUI//CTI//NOFORN`).
+//! segment (`CUI//SP-CTI//NOFORN` for a CUI Specified category like CTI;
+//! `CUI//PRVCY//NOFORN` for a CUI Basic one).
 
 use serde::{Deserialize, Serialize};
 
@@ -65,9 +66,10 @@ pub enum CuiCategory {
 }
 
 impl CuiCategory {
-    /// The banner abbreviation as it appears after the `CUI//` control marking,
-    /// e.g. `CUI//SP-EXPT`-style index groupings collapse here to the registry
-    /// abbreviation (`CTI`, `PRVCY`, `EXPT`, …).
+    /// The bare registry abbreviation (`CTI`, `PRVCY`, `EXPT`, …) — the category
+    /// code WITHOUT the `SP-` Specified prefix. The banner-rendering path
+    /// ([`CuiMarking::display_marking`]) prepends `SP-` for [`Self::is_specified`]
+    /// categories; this returns the code alone.
     pub fn abbreviation(self) -> &'static str {
         match self {
             CuiCategory::Cti => "CTI",
@@ -81,6 +83,23 @@ impl CuiCategory {
             CuiCategory::Proc => "PROC",
             CuiCategory::Prop => "PROP",
         }
+    }
+
+    /// `true` if this is a CUI **Specified** category (vs CUI Basic) per the DoD
+    /// CUI Registry. A Specified category is governed by a law / regulation /
+    /// government-wide policy that prescribes specific controls beyond CUI
+    /// Basic, and its banner marking takes the `SP-` prefix — `CUI//SP-CTI`,
+    /// not `CUI//CTI` (DoD CUI Marking Handbook; 32 CFR 2002.20).
+    ///
+    /// Conservative subset: only the categories confirmed Specified against the
+    /// registry are flagged — `Cti` (Controlled Technical Information; DoDI
+    /// 5230.24 / DFARS) and `Expt` (Export Controlled; ITAR / EAR). The
+    /// remainder are treated as CUI Basic until a registry row demands
+    /// otherwise (S360 starter-subset posture — extend as real flowdowns
+    /// require). S366 review F10 corrected the prior behaviour, which dropped
+    /// the `SP-` prefix for every category.
+    pub fn is_specified(self) -> bool {
+        matches!(self, CuiCategory::Cti | CuiCategory::Expt)
     }
 }
 
@@ -133,12 +152,20 @@ impl CuiMarking {
     }
 
     /// The banner marking string per DoD marking conventions:
-    /// `UNCLASSIFIED`, `CUI//<ABBREV>`, `CONFIDENTIAL`, `SECRET`,
-    /// `TOP SECRET`.
+    /// `UNCLASSIFIED`, `CUI//<ABBREV>` (or `CUI//SP-<ABBREV>` for a CUI
+    /// Specified category), `CONFIDENTIAL`, `SECRET`, `TOP SECRET`.
+    ///
+    /// The `SP-` prefix on Specified categories ([`CuiCategory::is_specified`])
+    /// is load-bearing: `CUI//SP-CTI` and `CUI//CTI` are different markings to a
+    /// DoD recipient, and this string can be printed verbatim onto a CDRL
+    /// deliverable's banner.
     pub fn display_marking(&self) -> String {
         match self {
             CuiMarking::Unclassified => "UNCLASSIFIED".to_string(),
-            CuiMarking::Cui(cat) => format!("CUI//{}", cat.abbreviation()),
+            CuiMarking::Cui(cat) => {
+                let prefix = if cat.is_specified() { "SP-" } else { "" };
+                format!("CUI//{prefix}{}", cat.abbreviation())
+            }
             CuiMarking::Confidential => "CONFIDENTIAL".to_string(),
             CuiMarking::Secret => "SECRET".to_string(),
             CuiMarking::TopSecret => "TOP SECRET".to_string(),
@@ -146,9 +173,10 @@ impl CuiMarking {
     }
 
     /// The full DoD banner per 32 CFR Part 2002: the base marking from
-    /// [`Self::display_marking`] followed by a trailing limited-dissemination
+    /// [`Self::display_marking`] (which carries the `SP-` prefix for CUI
+    /// Specified categories) followed by a trailing limited-dissemination
     /// segment when any controls are supplied —
-    /// `<MARKING>//<DISSEM1>/<DISSEM2>` (e.g. `CUI//CTI//NOFORN`,
+    /// `<MARKING>//<DISSEM1>/<DISSEM2>` (e.g. `CUI//SP-CTI//NOFORN`,
     /// `CUI//PRVCY//FEDCON/NOFORN`). With no dissemination controls this is
     /// exactly [`Self::display_marking`], so an empty slice is the honest
     /// "category banner, no further limits" form.

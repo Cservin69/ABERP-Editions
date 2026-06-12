@@ -20,7 +20,7 @@ ABERP's audit ledger (ADR-0008) is the tamper-evident hash chain that already ca
 
 | EventKind | storage string | fires when | payload |
 | --- | --- | --- | --- |
-| `IncidentCyberDetected` | `incident.cyber_detected` | a cyber incident affecting (or potentially affecting) a covered system is detected | `{detected_at_ms, reporter_operator_id, severity, scope_description, cdi_affected, cui_affected, exfiltration_suspected, affected_systems, detection_source, mitigation_notes?, dod_72h_report_due_at_ms?}` |
+| `IncidentCyberDetected` | `incident.cyber_detected` | a cyber incident affecting (or potentially affecting) a covered system is detected | `{detected_at_ms, operator_user_id, severity, scope_description, cdi_affected, ocs_affected, cui_affected, exfiltration_suspected, affected_systems, detection_source, mitigation_notes?, dod_72h_report_due_at_ms?}` |
 
 ### 2. Why one kind (detection) and not a detect/report/close lifecycle
 
@@ -31,14 +31,14 @@ DFARS 252.204-7012(c)(1) is the *detection-and-report* obligation; the durable, 
 The payload carries enough to evidence the reporting obligation was triggered and tracked, and **nothing that would itself be a leak**:
 
 - `detected_at_ms` — the epoch-ms discovery stamp, the 72-hour clock's start.
-- `reporter_operator_id` — an **opaque accountability handle**, never PII (same posture as every `personnel.*` / `supplier.*` operator id).
+- `operator_user_id` — an **opaque accountability handle**, never PII (same posture as every `personnel.*` / `supplier.*` operator id; the canonical operator-identity key — see the S367 / F1 correction at the foot of this ADR).
 - `severity` — the rendered `IncidentSeverity::as_str` string (`informational` / `low` / `medium` / `high` / `critical`).
 - `scope_description` — a **free-text scope summary**, NOT raw log dumps. The ledger records *what was affected at a summary level*, not the forensic evidence itself; the actual logs / packet captures live in the incident-response system, not the audit chain. This is the same no-controlled-content-at-rest posture ADR-0077 takes for CUI (the `cui.*` payload never carries the controlled content).
-- `cdi_affected` / `cui_affected` / `exfiltration_suspected` — booleans. `cdi_affected` is the DFARS trigger; `cui_affected` references 32 CFR Part 2002 (ADR-0077's domain).
+- `cdi_affected` / `ocs_affected` / `cui_affected` / `exfiltration_suspected` — booleans. `cdi_affected` **and** `ocs_affected` are the **two halves** of the DFARS 252.204-7012(c)(1)(i) trigger: CDI affected (A) OR operationally critical support affected (B). `cui_affected` references 32 CFR Part 2002 (ADR-0077's domain).
 - `affected_systems` — a string array of system **identifiers**, not their contents.
 - `detection_source` — the rendered `DetectionSource::as_str` string (`siem` / `user_report` / `vendor_notification` / `audit` / `other`).
 - `mitigation_notes?` — optional free-text.
-- `dod_72h_report_due_at_ms?` — optional; present **only when `cdi_affected` is true** (the clause's trigger), computed by `dod_72h_report_due_at_ms(detected_at_ms)`. Storing the deadline in the row makes the reporting obligation self-evident to a forensic walker without re-deriving it.
+- `dod_72h_report_due_at_ms?` — optional; present when `cdi_affected` **or** `ocs_affected` is true (either half of the clause's trigger), computed by `dod_72h_report_due_at_ms(detected_at_ms, cdi_affected, ocs_affected)` which returns `Some(deadline)` on a trigger and `None` otherwise. Storing the deadline in the row makes the reporting obligation self-evident to a forensic walker without re-deriving it.
 
 ### 4. The `incident` compliance module — closed vocabularies + deadline arithmetic
 
@@ -69,3 +69,8 @@ Same call as ADR-0073 §3 / ADR-0076 §6 / ADR-0077 §6 / ADR-0078 §7: every re
 **Negative / deferred.** Nothing fires this kind yet — the cyber-incident surface is an empty contract until a firing site lands (which itself waits on an incident-entry surface existing in code). The payload is an untyped `serde_json::Value`; a future session may promote it to a typed struct once a firing site fixes the shape. There is no incident-entry UI, no SPRS submission path, no SIEM integration, and no automated 72-hour deadline alerting. The `dod_72h_report_due_at_ms` field is computed but nothing *acts* on the deadline yet (the alerting cron is future work). Only the detection kind exists — no `report_submitted` / `incident_closed` lifecycle kinds.
 
 **Future work (not S362):** the firing site for the detection kind; the incident-entry surface (log a detected incident); an `IncidentDetectionProvider` trait + mock for the SIEM swap-point; the SPRS / DIBNet report-submission path (mock-first); automated 72-hour deadline alerting (a cron that surfaces incidents approaching the DFARS deadline); the `report_submitted` / `incident_closed` lifecycle kinds once those workflows exist; promoting the `incident.cyber_detected` payload to a typed struct once a firing site fixes the shape.
+
+## §5 — Corrections (S367, 2026-06-12)
+
+- **Review F16 — OCS half of the trigger was missing.** S362 stamped `dod_72h_report_due_at_ms` only when `cdi_affected` was true, and the payload had no operationally-critical-support flag. DFARS 252.204-7012(c)(1)(i) triggers rapid reporting on a cyber incident affecting CDI **(A) OR** the contractor's ability to perform requirements designated **operationally critical support (B)**. S367 added the `ocs_affected: bool` payload field and changed `dod_72h_report_due_at_ms(detected_at_ms, cdi_affected, ocs_affected) -> Option<i64>` to return the deadline when *either* trigger fires. No firing site or ledger row existed, so the contract was widened freely.
+- **Review F1 — operator-identity key canonicalized.** This ADR's payload originally named the operator field `reporter_operator_id`. S366 found ten different operator-identity spellings across ADR-0073…0079; S367 canonicalized them all to **`operator_user_id`** (the Bearer-subject convention already used by the two firing families in `apps/aberp::serve`). See the `aberp_compliance::prelude` "Identity-key canonicalization" note for the standing rule.

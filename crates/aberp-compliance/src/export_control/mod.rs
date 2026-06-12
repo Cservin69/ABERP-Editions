@@ -115,6 +115,44 @@ impl Jurisdiction {
     }
 }
 
+/// Failure mode of [`validate_eccn`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "ECCN must be a 5-char Commerce Control List code [0-9][A-E][0-9][0-9][0-9] \
+     (e.g. \"7A994\") or the literal \"EAR99\", got {0:?}"
+)]
+pub struct EccnError(pub String);
+
+/// Validate the *shape* of an Export Control Classification Number (ECCN).
+///
+/// A CCL ECCN is five characters: a CCL category digit `0-9`, a product-group
+/// letter `A-E`, then a three-digit number (`7A994`, `3A001`, …). `EAR99` — the
+/// EAR catch-all — is accepted as the one non-CCL literal. This checks format
+/// only; whether a given code is *current* on the Commerce Control List is an
+/// external-registry question out of scope here (the classification service
+/// answers that — mis-classification is a felony, never inferred). Fail loud
+/// (CLAUDE.md rule 12) so a malformed code never reaches the `eccn` column.
+///
+/// S366 review F14: the future AVL write boundary routes the `partners.eccn`
+/// value through this gate (no production writer exists yet).
+pub fn validate_eccn(s: &str) -> Result<(), EccnError> {
+    if s == "EAR99" {
+        return Ok(());
+    }
+    let b = s.as_bytes();
+    if b.len() == 5
+        && b[0].is_ascii_digit()
+        && (b'A'..=b'E').contains(&b[1])
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && b[4].is_ascii_digit()
+    {
+        Ok(())
+    } else {
+        Err(EccnError(s.to_string()))
+    }
+}
+
 /// An item that can be submitted for export classification.
 ///
 /// The provider keys on a short, stable descriptor (part number, commodity
@@ -229,6 +267,25 @@ mod tests {
         assert!(Jurisdiction::from_storage_str("ear").is_err());
         assert!(Jurisdiction::from_storage_str("").is_err());
         assert!(Jurisdiction::from_storage_str("DUAL_USE").is_err());
+    }
+
+    /// S367 (review F14) — `validate_eccn` accepts the CCL shape + the `EAR99`
+    /// literal and rejects everything else, so a malformed code never reaches
+    /// the future `partners.eccn` write boundary.
+    #[test]
+    fn s367_validate_eccn_accepts_ccl_shape_and_ear99() {
+        for ok in ["7A994", "3A001", "0A000", "9E991", "EAR99"] {
+            assert!(validate_eccn(ok).is_ok(), "{ok} should be valid");
+        }
+        for bad in [
+            "", "EAR99 ", "ear99", "7A99", "7A9941", "7F994", "AA994", "7A99X", "7a994",
+        ] {
+            assert_eq!(
+                validate_eccn(bad),
+                Err(EccnError(bad.to_string())),
+                "{bad} should be rejected"
+            );
+        }
     }
 
     /// S359 — `Jurisdiction` also survives a serde JSON round-trip (it derives

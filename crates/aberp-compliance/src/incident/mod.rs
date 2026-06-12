@@ -132,20 +132,36 @@ impl DetectionSource {
     }
 }
 
-/// Compute the DFARS 252.204-7012(c)(1) 72-hour reporting deadline.
+/// Compute the DFARS 252.204-7012(c)(1) 72-hour reporting deadline, if the
+/// incident triggers one.
 ///
-/// Given the epoch-ms discovery stamp, returns `detected_at_ms +
-/// [`DFARS_72H_REPORT_WINDOW_MS`]` — the instant by which a CDI-affecting
-/// incident must be reported to the DoD. The firing site (later session)
-/// populates the `incident.cyber_detected` payload's optional
-/// `dod_72h_report_due_at_ms` with this value **only when `cdi_affected` is
-/// true** (the clause's trigger); this function is the single place the window
-/// is added, so the deadline is computed one way everywhere.
+/// Per **252.204-7012(c)(1)(i)**, a rapid report is required when a discovered
+/// cyber incident affects **(A)** covered defense information (CDI) on a covered
+/// contractor information system, **OR (B)** the contractor's ability to
+/// perform requirements designated as **operationally critical support (OCS)**.
+/// Returns `Some(detected_at_ms + [`DFARS_72H_REPORT_WINDOW_MS`])` — the instant
+/// by which the report is due — when *either* trigger fires, and `None` when
+/// neither does (no reporting deadline attaches). The firing site (later
+/// session) stamps the `incident.cyber_detected` payload's optional
+/// `dod_72h_report_due_at_ms` with this value; this function is the single place
+/// the window is added, so the deadline is computed one way everywhere.
+///
+/// S366 review F16 widened the trigger: the prior helper keyed only on
+/// `cdi_affected`, so an OCS-only incident — half of the clause's trigger — got
+/// no deadline stamp.
 ///
 /// Pure arithmetic — no `Date::now()`. The caller supplies the detection stamp;
 /// the deadline derives deterministically from it.
-pub fn dod_72h_report_due_at_ms(detected_at_ms: i64) -> i64 {
-    detected_at_ms + DFARS_72H_REPORT_WINDOW_MS
+pub fn dod_72h_report_due_at_ms(
+    detected_at_ms: i64,
+    cdi_affected: bool,
+    ocs_affected: bool,
+) -> Option<i64> {
+    if cdi_affected || ocs_affected {
+        Some(detected_at_ms + DFARS_72H_REPORT_WINDOW_MS)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
