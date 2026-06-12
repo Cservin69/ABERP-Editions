@@ -929,7 +929,9 @@ mod from_connection_tests {
         // sync_mirror must also work off the reused handle (the second
         // post-commit call the issue / storno path makes).
         let mirror = path.with_extension("mirror.jsonl");
-        let synced = ledger.sync_mirror(&mirror).expect("sync mirror off reused handle");
+        let synced = ledger
+            .sync_mirror(&mirror)
+            .expect("sync mirror off reused handle");
         assert_eq!(synced, 3, "mirror sync must report all three entries");
 
         drop(ledger);

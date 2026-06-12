@@ -23,6 +23,7 @@
 //! five mutating tables empty (billing + audit) plus a clean
 //! `verify_chain` — not just "no panic propagated".
 
+use aberp::nav_xml;
 use aberp_audit_ledger::{
     self as audit_ledger, Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId,
 };
@@ -195,6 +196,171 @@ fn drop_without_commit_rolls_back_billing_and_audit() {
     let verified = ledger.verify_chain().expect("verify_chain Ok");
     assert_eq!(verified, 0, "verify_chain should report 0 entries");
 
+    let _ = std::fs::remove_file(&path);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Test 1b/1c — S375 render-fault BEFORE commit rolls back (atomicity)
+//
+// S375 moved the NAV-XML render+XSD-validate+write step from AFTER the
+// commit to BEFORE it (inside `run_single_tx`'s `render_and_write`
+// closure). Pre-S375 a render/write failure left a committed
+// invoice/storno row + audit draft with NO XML on disk — a phantom
+// "Ready" row whose Submit was broken. These tests pin the new
+// contract: a render/write `Err` arriving before `tx.commit()` rolls
+// back BOTH the billing allocation and the audit appends, exactly like
+// the drop/panic tests above (the render `Err` IS just an early
+// drop-without-commit).
+//
+// They replicate the in-tx call sequence rather than calling the
+// crate-private `run_single_tx` directly — the same approach Test 1/2
+// take. The write fault is real: `write_to_path` targets a directory,
+// so `File::create` fails the way an out-of-space / permission / XSD
+// failure would.
+// ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn render_fault_before_commit_rolls_back_invoice_issuance() {
+    let path = temp_db_path("render-fault-invoice");
+    let (mut conn, series) = pre_tx_setup(&path);
+
+    // A real directory — `write_to_path` (File::create) cannot create a
+    // file AT a directory path, so it returns Err. This stands in for
+    // the render/XSD-validate/disk-write failure the S375 closure runs
+    // before commit.
+    let fault_dir = path.with_extension("faultdir");
+    std::fs::create_dir_all(&fault_dir).expect("create fault dir");
+
+    {
+        let tx = conn.transaction().expect("begin tx");
+        let _outcome = billing::allocate_in_tx(
+            &tx,
+            build_allocate_args(series.id),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("allocate_in_tx Ok");
+        // The issue path's Fresh-branch shape: two audit appends.
+        audit_ledger::append_in_tx(
+            &tx,
+            &ledger_meta(),
+            EventKind::InvoiceSequenceReserved,
+            b"{\"k\":\"seq\"}".to_vec(),
+            Actor::test_only(),
+            Some("idem-render-inv".to_string()),
+        )
+        .expect("append InvoiceSequenceReserved Ok");
+        audit_ledger::append_in_tx(
+            &tx,
+            &ledger_meta(),
+            EventKind::InvoiceDraftCreated,
+            b"{\"k\":\"draft\"}".to_vec(),
+            Actor::test_only(),
+            Some("idem-render-inv".to_string()),
+        )
+        .expect("append InvoiceDraftCreated Ok");
+
+        // S375 — the in-tx render+write step. Its Err makes
+        // `run_single_tx` return BEFORE `tx.commit()`; here we emulate
+        // that by NOT committing after the fault.
+        let render_result = nav_xml::write_to_path(&fault_dir, b"<InvoiceData/>");
+        assert!(
+            render_result.is_err(),
+            "fault injection: writing XML to a directory path must fail"
+        );
+        // No tx.commit(): tx drops → rollback of allocate + both appends.
+    }
+    drop(conn);
+
+    let (seq_state, reservations, invoices, lines, audit) = row_counts(&path);
+    assert_eq!(seq_state, 0, "seq_state empty after render-fault rollback");
+    assert_eq!(
+        reservations, 0,
+        "reservation empty after render-fault rollback"
+    );
+    assert_eq!(invoices, 0, "invoice empty after render-fault rollback");
+    assert_eq!(lines, 0, "invoice_line empty after render-fault rollback");
+    assert_eq!(
+        audit, 0,
+        "audit_ledger empty after render-fault rollback — no committed-but-XML-less row"
+    );
+
+    let ledger = Ledger::open(&path, tenant(), TEST_BINARY_HASH).expect("re-open ledger");
+    assert_eq!(ledger.verify_chain().expect("verify_chain Ok"), 0);
+
+    let _ = std::fs::remove_dir_all(&fault_dir);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn render_fault_before_commit_rolls_back_storno_issuance() {
+    let path = temp_db_path("render-fault-storno");
+    let (mut conn, series) = pre_tx_setup(&path);
+
+    let fault_dir = path.with_extension("faultdir");
+    std::fs::create_dir_all(&fault_dir).expect("create fault dir");
+
+    {
+        let tx = conn.transaction().expect("begin tx");
+        let _outcome = billing::allocate_in_tx(
+            &tx,
+            build_allocate_args(series.id),
+            OffsetDateTime::now_utc(),
+        )
+        .expect("allocate_in_tx Ok");
+        // The storno path's Fresh-branch shape: THREE audit appends
+        // (Reserved + DraftCreated + StornoIssued).
+        for (kind, k) in [
+            (EventKind::InvoiceSequenceReserved, "seq"),
+            (EventKind::InvoiceDraftCreated, "draft"),
+            (EventKind::InvoiceStornoIssued, "storno"),
+        ] {
+            audit_ledger::append_in_tx(
+                &tx,
+                &ledger_meta(),
+                kind,
+                format!("{{\"k\":\"{k}\"}}").into_bytes(),
+                Actor::test_only(),
+                Some("idem-render-storno".to_string()),
+            )
+            .expect("append Ok");
+        }
+
+        // S375 — render+write fault before commit.
+        let render_result = nav_xml::write_to_path(&fault_dir, b"<InvoiceData/>");
+        assert!(
+            render_result.is_err(),
+            "fault injection: writing storno XML to a directory path must fail"
+        );
+        // No tx.commit(): tx drops → rollback of allocate + all three appends.
+    }
+    drop(conn);
+
+    let (seq_state, reservations, invoices, lines, audit) = row_counts(&path);
+    assert_eq!(
+        seq_state, 0,
+        "seq_state empty after storno render-fault rollback"
+    );
+    assert_eq!(
+        reservations, 0,
+        "reservation empty after storno render-fault rollback"
+    );
+    assert_eq!(
+        invoices, 0,
+        "invoice empty after storno render-fault rollback"
+    );
+    assert_eq!(
+        lines, 0,
+        "invoice_line empty after storno render-fault rollback"
+    );
+    assert_eq!(
+        audit, 0,
+        "audit_ledger empty after storno render-fault rollback — no committed chain-link without XML"
+    );
+
+    let ledger = Ledger::open(&path, tenant(), TEST_BINARY_HASH).expect("re-open ledger");
+    assert_eq!(ledger.verify_chain().expect("verify_chain Ok"), 0);
+
+    let _ = std::fs::remove_dir_all(&fault_dir);
     let _ = std::fs::remove_file(&path);
 }
 
