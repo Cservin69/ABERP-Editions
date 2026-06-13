@@ -123,13 +123,13 @@ fn storno_emitter_minimal_invoice_passes_validator() {
     }
 }
 
-/// The storno XML body MUST carry the `<invoiceReference>` block —
-/// it is the chain-link element that `submit_invoice::detect_operation_from_xml`
-/// keys on (CLAUDE.md rule 5 — code answers, not LLM). If a future
-/// refactor accidentally drops `<invoiceReference>` from the emitter,
-/// `submit-invoice` would default to `InvoiceOperation::Create` and
-/// NAV would reject the storno at the wire. This test pins the
-/// detector's coupling to the emitter's structural choice.
+/// The storno XML body MUST carry the `<invoiceReference>` block — NAV
+/// v3.0 requires it on every STORNO/MODIFY chain invoice (rule 18,
+/// `INVOICE_REFERENCE_EXPECTED`), and a CREATE body must NOT carry it.
+/// (S381/F1 — the wire operation is no longer sniffed from the body; it
+/// is derived from the audit ledger by
+/// `submission_queue::operation_for_invoice`. This test still pins the
+/// structural element the NAV contract requires on a storno body.)
 #[test]
 fn storno_xml_carries_invoice_reference_block() {
     let storno = build_minimal_storno_invoice();

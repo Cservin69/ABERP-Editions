@@ -15,9 +15,10 @@
 //!
 //!   - The XML emitter is [`nav_xml::render_modification_data`] —
 //!     full-replace body (NOT negated like STORNO), with an
-//!     `<invoiceReference>` block carrying `<modificationIssueDate>`
-//!     (ADR-0024 §3 — the discriminator
-//!     `submit_invoice::detect_operation_from_xml` keys on).
+//!     `<invoiceReference>` block byte-identical to STORNO's (S381/F1 —
+//!     the v2.0-only `<modificationIssueDate>` was removed; the wire
+//!     operation is derived from the audit ledger by
+//!     `submission_queue::operation_for_invoice`, not from the body).
 //!
 //!   - The chain-index allocator walks BOTH `InvoiceStornoIssued` AND
 //!     `InvoiceModificationIssued` payloads against the same base

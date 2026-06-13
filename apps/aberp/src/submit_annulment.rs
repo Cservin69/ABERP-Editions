@@ -76,10 +76,10 @@
 //!     retryable errors loud; an automatic retry loop (mirror of
 //!     PR-8's `retry-submission`) is the named-trigger surface
 //!     per ADR-0026 §5.
-//!   - It does NOT extend `submit_invoice::detect_operation_from_xml`.
-//!     The annulment body never reaches `submit-invoice`; the
-//!     detector remains three-way (Create / Modify / Storno) per
-//!     ADR-0024 §3.
+//!   - It does NOT touch the NAV operation classifier. The annulment
+//!     body never reaches `submit-invoice`; the operation set remains
+//!     three-way (Create / Modify / Storno), now derived from the audit
+//!     ledger by `submission_queue::operation_for_invoice` (S381/F1).
 //!   - It does NOT mint a fresh operator-decision idempotency key.
 //!     The annulment-request's key (from PR-12's
 //!     `InvoiceTechnicalAnnulmentRequested` entry) flows through to
