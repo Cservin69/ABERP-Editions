@@ -6282,6 +6282,29 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         )
     })?;
     let series = request.series.as_deref().unwrap_or(DEFAULT_SERIES_CODE);
+    // S392 — dev/test NAV invoice-number pre-flight (None on production
+    // builds). The probe owns freshly-loaded NAV credentials; on prod or a
+    // keychain miss we proceed without it (the pre-flight is a convenience,
+    // never a gate on issuance). This is the SPA path the operator hit the
+    // INVOICE_NUMBER_NOT_UNIQUE collision on.
+    let nav_probe: Option<Box<dyn crate::nav_number_probe::NavInvoiceNumberProbe>> =
+        if crate::build_profile::IS_PRODUCTION_BUILD {
+            None
+        } else {
+            match NavCredentials::load_from_keychain(state.tenant.as_str()) {
+                Ok(creds) => {
+                    crate::nav_number_probe::build_issue_probe(creds, &input.supplier.tax_number)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        "S392 NAV number pre-flight skipped (no NAV credentials); \
+                         issuance proceeds without it"
+                    );
+                    None
+                }
+            }
+        };
     issue_invoice::issue_from_parsed(
         input,
         &state.db_path,
@@ -6291,6 +6314,7 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         xml_path,
         actor,
         provider,
+        nav_probe.as_deref(),
         // PR-73 / ADR-0040 §addendum — the route handler resolved the
         // operator's `bank_account_id` (or per-currency default) via
         // `resolve_bank_snapshot` BEFORE invoking this helper and

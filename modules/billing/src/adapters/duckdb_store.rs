@@ -386,6 +386,69 @@ impl DuckDbBillingStore {
     }
 }
 
+/// S392 — resolve the `(series_id_str, fiscal_year)` bucket key for an
+/// invoice issued in `issue_year`. Reads `reset_policy` from the series
+/// row so the counter buckets identically whether reached via
+/// [`allocate_in_tx`] (which then advances the counter) or
+/// [`peek_next_number`] (read-only). Loud-fails when the series is absent
+/// (callers ensure it upstream). Takes `&Connection` so both a borrowed
+/// `Transaction` (via `Deref`) and a bare `Connection` can call it.
+fn resolve_bucket(
+    conn: &Connection,
+    series_id: SeriesId,
+    issue_year: i32,
+) -> Result<(String, i32), BillingError> {
+    let series = {
+        let mut stmt = conn.prepare(
+            "SELECT id, code, reset_policy, fiscal_year, created_at
+             FROM invoice_series WHERE id = ?;",
+        )?;
+        let mut rows = stmt.query_map([series_id.to_prefixed_string()], row_to_series)?;
+        match rows.next() {
+            Some(r) => r?,
+            None => return Err(BillingError::SeriesNotFound(series_id.to_prefixed_string())),
+        }
+    };
+    // PR-90 / ADR-0045 §2: `AnnualOnFiscalYear` keys the bucket on the
+    // invoice's immutable issue-date year (NOT wall-clock); `Never` keeps
+    // fiscal_year=0 (continuous bucket, byte-identical for legacy rows).
+    let fiscal_year = match series.reset_policy {
+        ResetPolicy::Never => 0,
+        ResetPolicy::AnnualOnFiscalYear => issue_year,
+    };
+    Ok((series.id.to_prefixed_string(), fiscal_year))
+}
+
+/// S392 — read the next sequence number [`allocate_in_tx`] would assign
+/// for the `(series, issue_year)` bucket WITHOUT advancing it. Returns
+/// the stored `next_number`, or `start_value.max(1)` when the bucket has
+/// no state row yet (mirrors the seed branch in `allocate_in_tx`).
+///
+/// The binary's NAV pre-flight (`apps/aberp` `issue_from_parsed`) calls
+/// this to learn which candidate numbers to existence-check against NAV
+/// (`queryInvoiceCheck`) BEFORE the allocator transaction opens; the
+/// first NAV-clear number is then threaded back as
+/// [`AllocateArgs::sequence_floor`]. Read-only: takes `&Connection` and
+/// issues a single `SELECT`, so it composes with the pre-tx Connection
+/// the caller already holds.
+pub fn peek_next_number(
+    conn: &Connection,
+    series_id: SeriesId,
+    issue_year: i32,
+    start_value: u64,
+) -> Result<u64, BillingError> {
+    let (series_id_str, fiscal_year) = resolve_bucket(conn, series_id, issue_year)?;
+    let mut stmt = conn.prepare(
+        "SELECT next_number FROM invoice_sequence_state
+         WHERE series_id = ? AND fiscal_year = ?;",
+    )?;
+    let mut rows = stmt.query_map(params![&series_id_str, fiscal_year], |r| r.get::<_, i64>(0))?;
+    match rows.next() {
+        Some(r) => Ok(r? as u64),
+        None => Ok(start_value.max(1)),
+    }
+}
+
 /// Run the ADR-0009 §3 "Allocate (atomic)" sequence inside a borrowed
 /// [`duckdb::Transaction`]. Caller owns commit/rollback.
 ///
@@ -456,37 +519,9 @@ pub fn allocate_in_tx(
         });
     }
 
-    // ── Resolve series + fiscal_year.
-    //
-    // PR-90 / ADR-0045 §2 lifts the pre-PR-90 `AnnualResetUnimplemented`
-    // gate: `AnnualOnFiscalYear` keys the bucket on the invoice's
-    // immutable issue-date year (NOT wall-clock — `args.draft.issue_date`
-    // is the same `OffsetDateTime` the caller stamps onto the invoice
-    // row, so the rendered Year segment and the counter's reset-year
-    // agree by construction). The per-`(series_id, fiscal_year)` keying
-    // on `invoice_sequence_state` was already in place from PR-4, so the
-    // new year naturally takes the INSERT branch below and seeds at
-    // `args.start_value`. `Never` keeps fiscal_year=0 (continuous bucket,
-    // pre-PR-90 behaviour, byte-identical for legacy INV-default rows).
-    let series = {
-        let mut stmt = tx.prepare(
-            "SELECT id, code, reset_policy, fiscal_year, created_at
-             FROM invoice_series WHERE id = ?;",
-        )?;
-        let mut rows = stmt.query_map([args.series_id.to_prefixed_string()], row_to_series)?;
-        match rows.next() {
-            Some(r) => r?,
-            None => {
-                return Err(BillingError::SeriesNotFound(
-                    args.series_id.to_prefixed_string(),
-                ))
-            }
-        }
-    };
-    let fiscal_year: i32 = match series.reset_policy {
-        ResetPolicy::Never => 0,
-        ResetPolicy::AnnualOnFiscalYear => args.draft.issue_date.year(),
-    };
+    // ── Resolve series + fiscal_year (S392 — shared with `peek_next_number`).
+    let (series_id_str, fiscal_year) =
+        resolve_bucket(tx, args.series_id, args.draft.issue_date.year())?;
 
     // ── ADR-0009 §3 step 1+3: read next_number (creating the row at
     //    `args.start_value` if absent), then UPDATE to advance.
@@ -496,9 +531,8 @@ pub fn allocate_in_tx(
     // subsequent allocations into the same bucket read + advance the
     // stored `next_number`, preserving the §169 gap-free invariant
     // within each `(series_id, fiscal_year)` bucket.
-    let series_id_str = series.id.to_prefixed_string();
     let now_str = now.format(&Rfc3339)?;
-    let allocated: u64 = {
+    let next_number: u64 = {
         let mut stmt = tx.prepare(
             "SELECT next_number FROM invoice_sequence_state
              WHERE series_id = ? AND fiscal_year = ?;",
@@ -510,7 +544,7 @@ pub fn allocate_in_tx(
             None => {
                 // First allocation for this series/fiscal_year — seed
                 // the state row at `start_value` (we are about to burn
-                // `start_value` and advance to `start_value + 1` below).
+                // a number and advance below).
                 let seed = args.start_value.max(1);
                 tx.execute(
                     "INSERT INTO invoice_sequence_state
@@ -523,11 +557,30 @@ pub fn allocate_in_tx(
         }
     };
 
+    // S392 — honour the NAV pre-flight floor: reserve `max(next_number,
+    // floor)` so a fresh local sequence skips past any number NAV's
+    // shared TEST endpoint already holds (the binary computes `floor` via
+    // `queryInvoiceCheck`). `None` (production + the no-skip case) keeps
+    // `allocated == next_number`, byte-identical to the pre-S392 path.
+    let allocated: u64 = match args.sequence_floor {
+        Some(floor) if floor > next_number => floor,
+        _ => next_number,
+    };
+
+    // Advance the stored counter to `allocated + 1`. Equivalent to the
+    // pre-S392 `next_number + 1` when no floor jump occurred; when the
+    // floor jumped past `next_number`, the skipped range is burned (left
+    // as deliberate gaps — those numbers were issued in a prior cycle).
     tx.execute(
         "UPDATE invoice_sequence_state
-         SET next_number = next_number + 1, updated_at = ?
+         SET next_number = ?, updated_at = ?
          WHERE series_id = ? AND fiscal_year = ?;",
-        params![&now_str, &series_id_str, fiscal_year],
+        params![
+            (allocated + 1) as i64,
+            &now_str,
+            &series_id_str,
+            fiscal_year
+        ],
     )?;
 
     // ── ADR-0009 §3 step 4: insert the reservation.
@@ -710,7 +763,7 @@ pub fn allocate_in_tx(
     };
     let reservation = SequenceReservation {
         id: reservation_id,
-        series_id: series.id,
+        series_id: args.series_id,
         fiscal_year,
         number: allocated,
         invoice_id: invoice.id,

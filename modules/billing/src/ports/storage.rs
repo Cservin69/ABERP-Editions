@@ -99,6 +99,21 @@ pub struct AllocateArgs {
     /// year is a fresh bucket and re-applies `start_value`; for `Never`
     /// the seed applies once and the counter runs continuous forever.
     pub start_value: u64,
+    /// S392 — minimum sequence number the allocator may reserve. `None`
+    /// preserves the pre-S392 behaviour (reserve the stored
+    /// `next_number`). `Some(floor)` forces the allocated number up to
+    /// `max(next_number, floor)`, "burning" the skipped range by jumping
+    /// `next_number` past it. The binary's NAV pre-flight
+    /// (`apps/aberp` `issue_from_parsed`) computes `floor` as the first
+    /// `queryInvoiceCheck`-clear number so a fresh local sequence does
+    /// not collide with a number NAV's shared TEST endpoint already holds
+    /// from a prior DEV cycle (root cause of `INVOICE_NUMBER_NOT_UNIQUE`
+    /// after a local DB reset). The skipped numbers leave deliberate gaps
+    /// in the local sequence — they were already issued upstream — so the
+    /// gap-free invariant (ADR-0009 §3) is intentionally relaxed here.
+    /// Set only on dev/test builds; the binary passes `None` in
+    /// production, where numbers are strictly monotonic.
+    pub sequence_floor: Option<u64>,
 }
 
 /// Outcome of an `allocate_and_insert` call. The fresh and replay

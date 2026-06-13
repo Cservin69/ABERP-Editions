@@ -56,8 +56,11 @@ use aberp_billing::{
     ProductUnit, RateMetadata, ResetPolicy, SeriesCode, SeriesId,
 };
 use aberp_mnb_rates::{MnbError, MnbRate, SOURCE as MNB_SOURCE};
+use aberp_nav_transport::operations::query_invoice_check::QueryInvoiceCheckOutcome;
 use aberp_nav_transport::NavCredentials;
 use anyhow::{anyhow, Context, Result};
+
+use crate::nav_number_probe::{NavInvoiceNumberProbe, SkippedNavNumber};
 use async_trait::async_trait;
 use duckdb::{params, Connection};
 use rust_decimal::Decimal;
@@ -411,6 +414,13 @@ pub async fn run_with_provider<P: MnbRatesProvider + ?Sized>(
             "NAV credentials loaded; actor derived for this CLI invocation"
         );
 
+        // S392 — build the dev/test NAV number pre-flight probe (returns
+        // `None` on production builds). Consumes `credentials`; `actor`
+        // already captured the login above. The supplier tax number is
+        // read off the parsed input before it is moved into the pipeline.
+        let nav_probe =
+            crate::nav_number_probe::build_issue_probe(credentials, &input.supplier.tax_number);
+
         let summary = issue_from_parsed(
             input,
             &args.db,
@@ -420,6 +430,7 @@ pub async fn run_with_provider<P: MnbRatesProvider + ?Sized>(
             args.out.clone(),
             actor,
             provider,
+            nav_probe.as_deref(),
             // PR-73 — CLI invocation does not exercise the bank picker
             // (the SPA route is the only surface that resolves the
             // `bank_account_id`). CLI-issued rows persist NULL across
@@ -486,6 +497,13 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     nav_xml_out: std::path::PathBuf,
     actor: Actor,
     provider: &P,
+    // S392 — optional NAV `queryInvoiceCheck` pre-flight. `Some(_)` on
+    // dev/test builds (built by the caller from the operator's NAV
+    // credentials); `None` on production builds and for callers without
+    // credentials (CLI/SPA paths supply it, the modification-route test
+    // passes `None`). When present, the allocator's reserved number is
+    // forced past any sequence NAV's shared TEST endpoint already holds.
+    nav_probe: Option<&dyn NavInvoiceNumberProbe>,
     bank_snapshot: Option<aberp_billing::BankAccountSnapshot>,
 ) -> Result<IssuedInvoiceSummary> {
     if input.lines.is_empty() {
@@ -621,6 +639,45 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         Some(fetch_and_stamp_rate(provider, currency, issue_date.date(), &command.lines).await?)
     };
 
+    // S392 — NAV invoice-number pre-flight. After a local DB reset the
+    // sequence counter restarts at `start_value`, but NAV's shared TEST
+    // endpoint still holds every number a prior DEV cycle submitted, so a
+    // fresh local seq collides → INVOICE_NUMBER_NOT_UNIQUE at submit.
+    // Probe `queryInvoiceCheck` for each candidate and skip the ones NAV
+    // already holds, so the reservation below commits only on a NAV-clear
+    // number. Runs HERE — before the allocator tx opens — so the DuckDB
+    // write-lock is never held across NAV network I/O and no `block_on` is
+    // nested in this async path. `None` (production / no credentials)
+    // skips the probe entirely (zero NAV calls). See `crate::nav_number_probe`.
+    let (sequence_floor, nav_number_skips) = match nav_probe {
+        Some(probe) => {
+            let start_seq = billing::peek_next_number(
+                &conn,
+                series.id,
+                issue_date.year(),
+                template.start_value,
+            )
+            .context("peek next sequence number for NAV pre-flight (S392)")?;
+            let clear = crate::nav_number_probe::resolve_clear_sequence(
+                Some(probe),
+                &template,
+                issue_date.year(),
+                start_seq,
+                crate::nav_number_probe::MAX_NAV_NUMBER_SKIPS,
+            )
+            .await?;
+            // Only force a floor when we actually skipped — otherwise leave
+            // it `None` so the allocator path is byte-identical to pre-S392.
+            let floor = if clear.skipped.is_empty() {
+                None
+            } else {
+                Some(clear.floor)
+            };
+            (floor, clear.skipped)
+        }
+        None => (None, Vec::new()),
+    };
+
     let allocate_args = AllocateArgs {
         series_id: series.id,
         draft,
@@ -652,6 +709,10 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         // sequence at e.g. 1247) the first invoice of the bucket
         // begins at that value.
         start_value: template.start_value,
+        // S392 — NAV pre-flight floor (first `queryInvoiceCheck`-clear
+        // number) computed above; `None` when probing is disabled or no
+        // number was skipped, preserving the pre-S392 allocator path.
+        sequence_floor,
     };
 
     // S375 — build the NAV-XML render+validate+write step as a closure
@@ -799,6 +860,10 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         // id (when present on the wire body) for the counter
         // increment that drives the PartnerForm field-selective lock.
         input.customer.partner_id.clone(),
+        // S392 — numbers the NAV pre-flight skipped; recorded in-tx as
+        // `InvoiceCheckPerformed(outcome="exists")` audit entries hanging
+        // off this issuance (empty when nothing was skipped).
+        nav_number_skips,
         render_and_write,
     )?;
 
@@ -1012,6 +1077,13 @@ fn run_single_tx<F>(
     // partner read AND so a rolled-back issuance doesn't leave a
     // stale counter. `None` for one-off buyers + CLI callers.
     customer_partner_id: Option<String>,
+    // S392 — sequence numbers the NAV pre-flight skipped because NAV's
+    // shared TEST endpoint already held them. Each becomes an
+    // `InvoiceCheckPerformed(outcome="exists")` audit entry written in
+    // THIS tx (Fresh path only) so a rolled-back issuance unwinds the
+    // skip records alongside the reservation. Empty on production / when
+    // nothing was skipped.
+    nav_number_skips: Vec<SkippedNavNumber>,
     // S375 — NAV-XML render+validate+write step, run inside the tx
     // AFTER the appends and BEFORE commit so issuance is atomic (a
     // render/write failure rolls back the allocation + audit appends).
@@ -1046,6 +1118,39 @@ where
         // ADR-0005 (PR-6.1 F8). Stable across crate versions; the
         // `Debug` derive that PR-5 used was not.
         let idem_str = idempotency_key.to_canonical_string();
+
+        // S392 — record one `InvoiceCheckPerformed(outcome="exists")`
+        // entry per number the NAV pre-flight skipped, BEFORE the
+        // sequence-reserved entry (chronologically the checks preceded the
+        // reservation). Reuses the existing queryInvoiceCheck audit kind —
+        // each skip IS a positive existence check — so no new EventKind /
+        // NAV-leak-gate ritual is needed. The entry hangs off THIS
+        // invoice's id (the issuance that burned the numbers); its
+        // `nav_invoice_number` carries the SKIPPED number + NAV's verbatim
+        // response so the operator can see exactly which numbers were
+        // burned in the audit panel.
+        for skip in &nav_number_skips {
+            let skip_payload = audit_payloads::InvoiceCheckPerformedPayload::new_for_outcome(
+                &invoice.id.to_prefixed_string(),
+                idempotency_key,
+                crate::build_profile::nav_endpoint_audit_label(),
+                &skip.nav_invoice_number,
+                QueryInvoiceCheckOutcome::Exists.as_audit_str(),
+                skip.request_xml.clone(),
+                skip.response_xml.clone(),
+            );
+            audit_ledger::append_in_tx(
+                &tx,
+                ledger_meta,
+                EventKind::InvoiceCheckPerformed,
+                skip_payload.to_bytes(),
+                actor.clone(),
+                Some(idem_str.clone()),
+            )
+            .context(
+                "audit_ledger::append_in_tx InvoiceCheckPerformed (S392 NAV pre-flight skip)",
+            )?;
+        }
 
         // Typed payloads serialized via `serde_json::to_vec` per
         // PR-6.1 F9. `format!`-built JSON would have to be hand-

@@ -104,6 +104,7 @@ fn allocate_at(series_id: SeriesId, issue_date: OffsetDateTime, start_value: u64
         invoice_note: None,
         email_recipient_override: None,
         start_value,
+        sequence_floor: None,
     }
 }
 

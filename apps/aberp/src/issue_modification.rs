@@ -340,6 +340,10 @@ pub fn modification_from_inputs(
         // INSERT, so a modification landing in an existing bucket is
         // unaffected.
         start_value: template.start_value,
+        // S392 — the NAV `queryInvoiceCheck` pre-flight gates the issue
+        // path only; modification chains are out of scope here, so no
+        // floor is forced (numbers advance from the stored counter).
+        sequence_floor: None,
     };
 
     // S375 — read the BASE invoice's NAV-side identity from its on-disk

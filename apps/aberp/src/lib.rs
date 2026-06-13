@@ -76,6 +76,7 @@ pub mod mes_boot;
 pub mod mes_adapters_config;
 pub mod mes_manager;
 pub mod mnb_rates_provider;
+pub mod nav_number_probe;
 pub mod nav_xml;
 pub mod notes_history;
 pub mod numbering;

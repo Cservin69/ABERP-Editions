@@ -338,6 +338,8 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
         xml_out,
         Actor::from_local_cli("sess".to_string(), "test-user"),
         &NeverProvider,
+        // S392 — base fixture does not exercise the NAV number pre-flight.
+        None,
         None,
     )
     .await

@@ -117,6 +117,7 @@ fn build_allocate_args(series_id: SeriesId) -> AllocateArgs {
         invoice_note: None,
         email_recipient_override: None,
         start_value: 1,
+        sequence_floor: None,
     }
 }
 

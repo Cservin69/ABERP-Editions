@@ -262,6 +262,7 @@ where
             // The binary's three issuance surfaces read the template's
             // `[seller.numbering].start_value` and thread it explicitly.
             start_value: 1,
+            sequence_floor: None,
         },
         issue_date,
     )?;

@@ -263,6 +263,7 @@ fn line_note_round_trips_through_allocate_and_load() {
                 invoice_note: Some("PR-82 round-trip global note".to_string()),
                 email_recipient_override: None,
                 start_value: 1,
+                sequence_floor: None,
             },
             OffsetDateTime::now_utc(),
         )
