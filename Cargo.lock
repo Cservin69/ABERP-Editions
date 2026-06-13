@@ -32,6 +32,7 @@ dependencies = [
  "blake3",
  "clap",
  "duckdb",
+ "fs2",
  "hex",
  "keyring",
  "lettre",

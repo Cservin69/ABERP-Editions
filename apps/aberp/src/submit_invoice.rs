@@ -78,7 +78,9 @@
 
 use std::path::Path;
 
-use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
+use aberp_audit_ledger::{
+    self as audit_ledger, Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId,
+};
 use aberp_billing::{self as billing, IdempotencyKey, ReadyInvoice};
 use aberp_nav_transport::{
     operations::{manage_invoice, token_exchange, TechnicalValidation},
@@ -242,6 +244,19 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
                 technical_validations.len()
             ))
         }
+        Err(SubmitFromInputsError::SubmissionInProgress { invoice_id }) => {
+            // S390/E — another process is already submitting this exact
+            // invoice. Refuse rather than double-POST; the operator can
+            // re-run once the other submission finishes.
+            eprintln!(
+                "submit-invoice SKIPPED for invoice {invoice_id}: a NAV submission for it is \
+                 already in progress in another process (cross-process submission lock held). \
+                 Re-run once it completes."
+            );
+            Err(anyhow!(
+                "submission already in progress for {invoice_id} (cross-process lock held)"
+            ))
+        }
         Err(SubmitFromInputsError::Other(e)) => Err(e),
     }
 }
@@ -321,6 +336,14 @@ pub enum SubmitFromInputsError {
         technical_validations: Vec<TechnicalValidation>,
         body_preview: String,
     },
+    /// S390/E — another process already holds the cross-process
+    /// submission lock for this invoice (a concurrent `aberp serve`
+    /// click, drain, or retry is mid-POST). No wire send happened; the
+    /// invoice state is unchanged and the caller should refuse (serve →
+    /// 409) or skip rather than double-POST.
+    SubmissionInProgress {
+        invoice_id: String,
+    },
     Other(anyhow::Error),
 }
 
@@ -349,6 +372,11 @@ impl std::fmt::Display for SubmitFromInputsError {
                  (fault_code={fault_code:?}, fault_message={fault_message:?}, \
                  technical_validations={technical_validations:?}) \
                  body_preview=`{body_preview}`"
+            ),
+            SubmitFromInputsError::SubmissionInProgress { invoice_id } => write!(
+                f,
+                "a NAV submission for {invoice_id} is already in progress in another process \
+                 (cross-process submission lock held); not double-submitting"
             ),
             SubmitFromInputsError::Other(e) => write!(f, "{e:#}"),
         }
@@ -411,6 +439,26 @@ pub async fn submit_from_inputs(
         .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", tenant_str))
         .map_err(SubmitFromInputsError::Other)?;
     let tax_number_8 = parse_tax_number_8(tax_number_raw).map_err(SubmitFromInputsError::Other)?;
+
+    // S390/E — acquire the CROSS-PROCESS submission lock BEFORE any NAV
+    // work and hold it across the wire send. This serialises submissions
+    // of the same invoice across SEPARATE processes (a manual `aberp
+    // submit-invoice`, a drain, or a concurrent `aberp serve` click) the
+    // way S378's in-process gate serialises them within `serve`. Held
+    // (`None` = another process is mid-POST) → refuse with
+    // `SubmissionInProgress` rather than double-POST (NAV
+    // INVOICE_NUMBER_NOT_UNIQUE). The guard drops at function return,
+    // releasing the lock.
+    let _submission_lock = match crate::submission_lock::try_acquire(db, tenant_str, invoice_id_str)
+        .map_err(SubmitFromInputsError::Other)?
+    {
+        Some(guard) => guard,
+        None => {
+            return Err(SubmitFromInputsError::SubmissionInProgress {
+                invoice_id: invoice_id_str.to_string(),
+            })
+        }
+    };
 
     // 3a. PR-9-0 / ADR-0022: validate on-disk XML BEFORE any NAV call.
     aberp_nav_xsd_validator::validate_invoice_data(&invoice_xml)
@@ -517,12 +565,17 @@ pub async fn submit_from_inputs(
     )
     .map_err(SubmitFromInputsError::Other)?;
     {
-        let ledger_tx1 = Ledger::open(db, tenant.clone(), binary_hash_bytes)
-            .context("open audit ledger after TX1 commit")
-            .map_err(SubmitFromInputsError::Other)?;
+        // S388 — sync the mirror through the ALREADY-OPEN `conn` (the
+        // same handle `write_attempt_audit` just committed TX1 on) via
+        // the free `audit_ledger::sync_mirror`, NOT a fresh
+        // `Ledger::open` (a `Connection::open(path)` that re-triggers
+        // DuckDB 1.5.x's LoadCheckpoint/ReadIndex replay → the
+        // checkpoint/ART corruption family, duckdb#23046, S332). The
+        // post-attempt mirror sync mid-flow keeps the same crash-window
+        // closure S375/S381 applied on the issue/storno/modification
+        // paths. `conn` stays alive for the wire send + TX2.
         let mirror_path = audit_ledger::mirror_path_for(db);
-        ledger_tx1
-            .sync_mirror(&mirror_path)
+        audit_ledger::sync_mirror(&conn, &ledger_meta, &mirror_path)
             .context("sync audit-ledger mirror file after TX1 Attempt commit")
             .map_err(SubmitFromInputsError::Other)?;
     }
@@ -549,20 +602,13 @@ pub async fn submit_from_inputs(
                 send_outcome.response_xml,
             )
             .map_err(SubmitFromInputsError::Other)?;
-            drop(conn);
-            let ledger = Ledger::open(db, tenant, binary_hash_bytes)
-                .context("open audit ledger after TX2 Response commit")
-                .map_err(SubmitFromInputsError::Other)?;
-            let verified = ledger
-                .verify_chain()
-                .context("audit-ledger chain verification failed AFTER submission")
+            // S388 — reuse the post-commit `conn` for verify+sync (no
+            // `drop(conn); Ledger::open(db, …)` re-open). See
+            // [`verify_chain_and_sync_reusing_conn`].
+            let verified = verify_chain_and_sync_reusing_conn(conn, tenant, binary_hash_bytes, db)
+                .context("post-submission verify+sync (Response)")
                 .map_err(SubmitFromInputsError::Other)?;
             tracing::info!(entries_verified = verified, "audit chain verified");
-            let mirror_path = audit_ledger::mirror_path_for(db);
-            ledger
-                .sync_mirror(&mirror_path)
-                .context("sync audit-ledger mirror file after TX2 Response commit")
-                .map_err(SubmitFromInputsError::Other)?;
             let submitted = ready_invoice.into_submitted(send_outcome.transaction_id.clone());
             Ok(SubmitInvoiceOutcome {
                 invoice_id: submitted.id.to_prefixed_string(),
@@ -588,18 +634,9 @@ pub async fn submit_from_inputs(
                 response_xml,
             )
             .map_err(SubmitFromInputsError::Other)?;
-            drop(conn);
-            let ledger = Ledger::open(db, tenant, binary_hash_bytes)
-                .context("open audit ledger after TX2 AttemptFailed commit")
-                .map_err(SubmitFromInputsError::Other)?;
-            let verified = ledger
-                .verify_chain()
-                .context("audit-ledger chain verification failed AFTER AttemptFailed")
-                .map_err(SubmitFromInputsError::Other)?;
-            let mirror_path = audit_ledger::mirror_path_for(db);
-            ledger
-                .sync_mirror(&mirror_path)
-                .context("sync audit-ledger mirror file after TX2 AttemptFailed commit")
+            // S388 — same post-commit conn reuse as the success arm.
+            let verified = verify_chain_and_sync_reusing_conn(conn, tenant, binary_hash_bytes, db)
+                .context("post-submission verify+sync (AttemptFailed)")
                 .map_err(SubmitFromInputsError::Other)?;
             tracing::error!(
                 invoice_id = %ready_invoice.id.to_prefixed_string(),
@@ -615,6 +652,41 @@ pub async fn submit_from_inputs(
             })
         }
     }
+}
+
+/// S388 — post-commit chain verification + mirror sync that REUSES the
+/// already-open `Connection` instead of re-opening the file.
+///
+/// Both TX2 arms (Response success and AttemptFailed) need the identical
+/// `verify_chain` + `sync_mirror` after their audit append commits. The
+/// pre-S388 code did `drop(conn); Ledger::open(db, …)` in each arm — a
+/// fresh `Connection::open(path)` that re-runs DuckDB 1.5.x's
+/// LoadCheckpoint/ReadIndex replay, which can trip the checkpoint/ART
+/// corruption assertion on a heavy ledger (duckdb#23046, S332). This
+/// mirrors the S375 issue/storno fix and the S381 modification.rs:444
+/// port: `Ledger::from_connection` wraps the live handle so the file is
+/// never re-opened, making that assertion unreachable. Consumes `conn`
+/// (the function's tail — nothing uses it after).
+///
+/// Returns the verified entry count. Extracted as one helper so the
+/// "reuse, never re-open" invariant is testable WITHOUT a live NAV wire
+/// send (the success path is otherwise reachable only behind
+/// `ABERP_NAV_LIVE_TEST`).
+fn verify_chain_and_sync_reusing_conn(
+    conn: Connection,
+    tenant: TenantId,
+    binary_hash: BinaryHash,
+    db: &std::path::Path,
+) -> Result<u64> {
+    let ledger = Ledger::from_connection(conn, tenant, binary_hash);
+    let verified = ledger
+        .verify_chain()
+        .context("audit-ledger chain verification failed AFTER commit (reusing conn)")?;
+    let mirror_path = audit_ledger::mirror_path_for(db);
+    ledger
+        .sync_mirror(&mirror_path)
+        .context("sync audit-ledger mirror file AFTER commit (reusing conn)")?;
+    Ok(verified)
 }
 
 /// PR-19 / ADR-0032 §1: the NAV prepare-for-attempt-audit bundle. Holds
@@ -952,4 +1024,74 @@ mod tests {
     // operation is now derived from the audit ledger by
     // `submission_queue::operation_for_invoice`; its classification is
     // unit-tested there.
+
+    /// Per-test unique on-disk path under the system temp root — avoids
+    /// the `tempfile` dev-dep (CLAUDE.md #2), mirrors the
+    /// `incoming_invoices::tests::ScopedTempDir` naming pattern.
+    fn unique_temp_db(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("aberp-s388-{tag}-{pid}-{nanos}-{seq}.duckdb"))
+    }
+
+    /// S388 — the post-commit verify+sync helper REUSES the connection
+    /// handed to it and never re-opens the DB file. Seed a heavy on-disk
+    /// ledger, hand the helper a live `Connection` on that file, and
+    /// assert it (a) verifies the full chain (returning the entry count)
+    /// and (b) writes the mirror — all without a `Ledger::open`/
+    /// `Connection::open` re-open inside the helper. This is the
+    /// CI-runnable stand-in for the otherwise live-only happy path: the
+    /// production TX2 arms call this exact helper with their already-open
+    /// post-commit conn.
+    #[test]
+    fn verify_chain_and_sync_reusing_conn_reuses_handle_on_heavy_ledger() {
+        let db = unique_temp_db("reuse");
+        let tenant = TenantId::new("t-s388".to_string()).unwrap();
+        let bh = BinaryHash::from_bytes([7u8; 32]);
+        let actor = Actor::from_local_cli("sess-s388".to_string(), "test-user");
+
+        // Seed a heavy ledger (the depth that historically tripped the
+        // re-open ART/checkpoint replay crash, S332/duckdb#23046).
+        const N: usize = 64;
+        {
+            let mut ledger = Ledger::open(&db, tenant.clone(), bh).expect("open ledger to seed");
+            for i in 0..N {
+                let payload = serde_json::to_vec(&serde_json::json!({ "n": i })).unwrap();
+                ledger
+                    .append(
+                        EventKind::InvoiceSubmissionAttempt,
+                        payload,
+                        actor.clone(),
+                        None,
+                    )
+                    .expect("append seed entry");
+            }
+        } // ledger drops → its Connection closes, entries committed.
+
+        // Open a FRESH connection (this stands in for submit's own
+        // post-commit `conn`) and hand it to the helper, which must NOT
+        // re-open the file.
+        let conn = Connection::open(&db).expect("open post-commit conn");
+        let verified = verify_chain_and_sync_reusing_conn(conn, tenant, bh, &db)
+            .expect("verify+sync must succeed reusing the conn");
+        assert_eq!(verified, N as u64, "all seeded entries must verify");
+
+        // The mirror was written through the reused connection.
+        let mirror_path = audit_ledger::mirror_path_for(&db);
+        assert!(
+            mirror_path.exists(),
+            "mirror file must be synced at {}",
+            mirror_path.display()
+        );
+
+        // Cleanup (best-effort).
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(&mirror_path);
+    }
 }

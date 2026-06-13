@@ -221,6 +221,25 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
         ));
     }
 
+    // S390/E — acquire the cross-process submission lock for this
+    // invoice BEFORE any NAV work and hold it across the manageInvoice
+    // re-POST. retry-submission is a separate process from `aberp serve`,
+    // so a concurrent operator Submit click (serialised only in-process
+    // by S378's gate) could otherwise double-POST the same invoice. Held
+    // → loud-bail; the operator re-runs once the other submission lands.
+    let _submission_lock =
+        match crate::submission_lock::try_acquire(&args.db, &args.tenant, &args.invoice_id)? {
+            Some(guard) => guard,
+            None => {
+                return Err(anyhow!(
+                    "a NAV submission for {} is already in progress in another process \
+                     (cross-process submission lock held); retry-submission aborted to avoid \
+                     a duplicate manageInvoice POST. Re-run once the other submission completes.",
+                    args.invoice_id
+                ))
+            }
+        };
+
     // 2. Load NAV credentials BEFORE touching the DB.
     let credentials = NavCredentials::load_from_keychain(&args.tenant)
         .context("load NAV credentials from OS keychain")?;

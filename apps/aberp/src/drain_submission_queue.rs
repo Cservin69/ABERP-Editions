@@ -178,10 +178,53 @@ pub fn run(args: &DrainSubmissionQueueArgs) -> Result<()> {
     };
     let mut ok_count: usize = 0;
     let mut application_error_count: usize = 0;
+    // S390/E — invoices skipped because another process already holds
+    // the cross-process submission lock for them (a concurrent `aberp
+    // serve` click or another drain). Counted separately from errors:
+    // a locked row is being handled elsewhere, NOT a failure.
+    let mut skipped_in_progress: usize = 0;
     let mut transport_error: Option<String> = None;
     let mut stop_index: Option<usize> = None;
 
     for (idx, invoice) in pending.iter().take(limit).enumerate() {
+        // S390/E — hold the cross-process submission lock across this
+        // invoice's prepare+POST so a concurrent process (serve click /
+        // retry / another drain) cannot double-submit it. `None` =
+        // already in progress elsewhere → skip this row. Held for the
+        // whole iteration; dropped before the next invoice.
+        let _invoice_lock = match crate::submission_lock::try_acquire(
+            &args.db,
+            &args.tenant,
+            &invoice.invoice_id,
+        ) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                skipped_in_progress += 1;
+                tracing::warn!(
+                    invoice_id = %invoice.invoice_id,
+                    "drain-submission-queue: submission already in progress in another \
+                     process; skipping this invoice"
+                );
+                eprintln!(
+                    "drain-submission-queue: invoice {} SKIPPED \
+                         (submission in progress in another process)",
+                    invoice.invoice_id
+                );
+                continue;
+            }
+            Err(e) => {
+                application_error_count += 1;
+                tracing::error!(
+                    invoice_id = %invoice.invoice_id,
+                    "drain-submission-queue: submission-lock error; continuing. {e:#}"
+                );
+                eprintln!(
+                    "drain-submission-queue: invoice {} lock error (continuing): {e:#}",
+                    invoice.invoice_id
+                );
+                continue;
+            }
+        };
         let outcome = drive_one_invoice(
             invoice,
             &override_map,
@@ -238,11 +281,12 @@ pub fn run(args: &DrainSubmissionQueueArgs) -> Result<()> {
     //    surfaced and any short-circuit is named.
     println!(
         "drain-submission-queue: drained {} of {} pending invoices \
-         (application errors: {}, transport error: {}, max-invoices: {}). \
-         Stopped early: {}.",
+         (application errors: {}, skipped-in-progress: {}, transport error: {}, \
+         max-invoices: {}). Stopped early: {}.",
         ok_count,
         pending_count,
         application_error_count,
+        skipped_in_progress,
         transport_error.as_deref().unwrap_or("none"),
         if args.max_invoices == 0 {
             "unbounded".to_string()

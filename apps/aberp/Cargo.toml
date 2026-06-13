@@ -156,6 +156,11 @@ ulid = { workspace = true }
 # ADR-0008 §Storage. PR-6 close-out.
 duckdb = { workspace = true }
 
+# S390/E — cross-process advisory file locks (flock / LockFileEx) for the
+# per-invoice NAV-submission lock (`submission_lock.rs`). Same workspace
+# `fs2` the audit-ledger mirror writer uses.
+fs2 = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

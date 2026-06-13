@@ -226,11 +226,49 @@ pub fn run(args: &DrainPendingRetriesArgs) -> Result<()> {
     };
     let mut ok_count: usize = 0;
     let mut skipped_exists_count: usize = 0;
+    // S390/E — invoices skipped because another process holds the
+    // cross-process submission lock for them (a concurrent serve click /
+    // submit / drain). Distinct from `skipped_exists_count` (Layer-2
+    // found it already at NAV).
+    let mut skipped_in_progress: usize = 0;
     let mut application_error_count: usize = 0;
     let mut transport_error: Option<String> = None;
     let mut stop_index: Option<usize> = None;
 
     for (idx, retry) in pending.iter().take(limit).enumerate() {
+        // S390/E — hold the cross-process submission lock across this
+        // invoice's Layer-2 check + re-POST so a concurrent process
+        // cannot double-submit it. `None` = in progress elsewhere → skip.
+        let _invoice_lock =
+            match crate::submission_lock::try_acquire(&args.db, &args.tenant, &retry.invoice_id) {
+                Ok(Some(guard)) => guard,
+                Ok(None) => {
+                    skipped_in_progress += 1;
+                    tracing::warn!(
+                        invoice_id = %retry.invoice_id,
+                        "drain-pending-retries: submission already in progress in another \
+                         process; skipping this invoice"
+                    );
+                    eprintln!(
+                        "drain-pending-retries: invoice {} SKIPPED \
+                         (submission in progress in another process)",
+                        retry.invoice_id
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    application_error_count += 1;
+                    tracing::error!(
+                        invoice_id = %retry.invoice_id,
+                        "drain-pending-retries: submission-lock error; continuing. {e:#}"
+                    );
+                    eprintln!(
+                        "drain-pending-retries: invoice {} lock error (continuing): {e:#}",
+                        retry.invoice_id
+                    );
+                    continue;
+                }
+            };
         let outcome = drive_one_retry(
             retry,
             &args.db,
@@ -292,12 +330,13 @@ pub fn run(args: &DrainPendingRetriesArgs) -> Result<()> {
     //    surfaced and any short-circuit is named.
     println!(
         "drain-pending-retries: retried {} of {} state-2 invoices \
-         (skipped NAV-side Exists: {}, application errors: {}, \
+         (skipped NAV-side Exists: {}, skipped-in-progress: {}, application errors: {}, \
          transport error: {}, max-invoices: {}). \
          Stopped early: {}.",
         ok_count,
         pending_count,
         skipped_exists_count,
+        skipped_in_progress,
         application_error_count,
         transport_error.as_deref().unwrap_or("none"),
         if args.max_invoices == 0 {

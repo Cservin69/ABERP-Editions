@@ -33,11 +33,9 @@
 //! by inspection. PR-5 does NOT run an XSD validator; that lands when the
 //! XSD-validator crate is picked per ADR-0021 §Items deferred.
 
-use std::io::Write;
-
 use aberp_billing::{
-    huf_equivalent_round_half_even, Currency, Huf, LineItem, PaymentMethod, ProductUnit,
-    RateMetadata, ReadyInvoice, SeriesCode,
+    huf_equivalent_round_half_even, Currency, Huf, LineItem, NavUnitOfMeasure, PaymentMethod,
+    ProductUnit, RateMetadata, ReadyInvoice, SeriesCode,
 };
 use anyhow::{anyhow, Context, Result};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
@@ -382,18 +380,24 @@ pub struct StornoReference {
     /// `<modificationIndex>` allocated by the chain walker per
     /// ADR-0023 §4 — starts at 1, increments per chain entry.
     pub modification_index: u32,
-    /// S369 — number of `<line>` elements in the BASE invoice. The
-    /// storno's CREATE-mode lines must carry `<lineNumberReference>`
-    /// values that CONTINUE PAST the base's line numbers (the storno
-    /// adds new negative lines to NAV's virtual consolidated invoice).
-    /// Without this offset the storno's first line reuses
-    /// `lineNumberReference=1`, colliding with base line 1 — NAV ABORTs
-    /// the submit with business rule `INVOICE_LINE_ALREADY_EXISTS`
-    /// (observed in prod, root-caused by S370). The caller reads this
-    /// from the base's on-disk NAV XML via
-    /// [`count_invoice_lines_from_xml`] — the canonical record of what
-    /// NAV holds on file — the same on-disk-read discipline
-    /// `base_invoice_number` uses (S184).
+    /// S369/S384 — the `<lineNumberReference>` OFFSET for the storno's
+    /// CREATE-mode reversal lines: the count of ALL lines NAV already
+    /// holds on this chain (the base PLUS every SAVED prior
+    /// modification). The reversal lines continue PAST this offset so
+    /// they never reuse a line number NAV already recorded on the base OR
+    /// a prior modification — NAV ABORTs with `INVOICE_LINE_ALREADY_EXISTS`
+    /// otherwise (observed in prod, S370).
+    ///
+    /// Pre-S384 this was just the BASE's line count (a base-only storno
+    /// reverses only the base). S384/F5 generalised it: a storno reverses
+    /// base + every saved modification, so the offset is the total prior
+    /// chain line count == the number of reversal lines. The renderer
+    /// loud-checks `base_line_count == reversal_source_lines.len()`.
+    ///
+    /// The caller folds this from each chain member's on-disk NAV XML via
+    /// [`count_invoice_lines_from_xml`] / [`read_invoice_lines_from_xml`]
+    /// — the canonical record of what NAV holds on file — the same
+    /// on-disk-read discipline `base_invoice_number` uses (S184).
     pub base_line_count: usize,
 }
 
@@ -690,6 +694,11 @@ pub fn render_storno_data(
     // S160 — thin wrapper passes the `Transfer` default (see
     // [`render_invoice_data`]). Production storno issuance uses the
     // `_with_number` variant to inherit the base invoice's payment method.
+    //
+    // S384/F5 — base-only reversal: the reversal source IS the storno's
+    // own (base-derived) lines. The chain-aware fold (base + saved
+    // modifications) lives in `issue_storno`, which calls the
+    // `_with_number` variant directly.
     render_storno_data_with_number(
         invoice,
         series_code,
@@ -699,6 +708,7 @@ pub fn render_storno_data(
         rate_metadata,
         PaymentMethod::Transfer,
         None,
+        &invoice.lines,
     )
 }
 
@@ -717,6 +727,17 @@ pub fn render_storno_data_with_number(
     rate_metadata: Option<&RateMetadata>,
     payment_method: PaymentMethod,
     invoice_number_override: Option<&str>,
+    // S384/F5 — the FULL set of prior chain lines this storno must
+    // reverse: the base's lines PLUS every SAVED prior modification's
+    // lines (un-negated; this renderer negates them). For a base-only
+    // storno (no saved modifications) the caller passes `&invoice.lines`,
+    // which is byte-identical to the pre-S384 behaviour. The caller
+    // (`issue_storno`) folds these from each chain member's on-disk NAV
+    // XML via `read_invoice_lines_from_xml`. `storno_reference.
+    // base_line_count` MUST equal this slice's length (it is the
+    // `<lineNumberReference>` offset that points the reversal lines past
+    // ALL prior chain lines).
+    reversal_source_lines: &[LineItem],
 ) -> Result<Vec<u8>> {
     // PR-44γ.1 — same C1-wire-side invariant the fresh-issuance renderer
     // enforces: a non-HUF storno without inherited rate metadata is a
@@ -791,15 +812,23 @@ pub fn render_storno_data_with_number(
     // parallel Vec with negated quantity (S381/F3 — NAV spec §2.5.1
     // negates quantities, not unit price); net/vat/gross cascade through
     // `LineItem::net_total` etc. unchanged.
-    let negated_lines: Vec<LineItem> = invoice.lines.iter().map(negate_line).collect();
+    //
+    // S384/F5 — the reversal set is `reversal_source_lines` (base lines
+    // PLUS every SAVED prior modification's lines), NOT just
+    // `invoice.lines`. A MODIFY-then-STORNO chain otherwise leaves the
+    // modification's net un-reversed → NAV's
+    // `INCONSISTENT_MODIFICATION_DATA_*_NOT_ZERO*` WARN class.
+    let negated_lines: Vec<LineItem> = reversal_source_lines.iter().map(negate_line).collect();
     // Storno carries <invoiceReference>, so every line MUST carry a
     // <lineModificationReference> (ADR-0049 §NAV emit / NAV
     // LINE_MODIFICATION_EXPECTED). lineOperation is CREATE per NAV's
     // INVALID_LINE_OPERATION business rule (S184) — see
-    // `CHAIN_LINE_OPERATION`. S369 — lineNumberReference CONTINUES PAST
-    // the base's line count (`base_line_count` offset) so the CREATE
-    // lines do not collide with the base's recorded line numbers
-    // (NAV INVOICE_LINE_ALREADY_EXISTS, S370 prod incident).
+    // `CHAIN_LINE_OPERATION`. S369/S384 — lineNumberReference CONTINUES
+    // PAST every prior chain line (`base_line_count` == total prior
+    // line count == `negated_lines.len()`) so the CREATE lines do not
+    // collide with any line number NAV already recorded on the base OR a
+    // prior modification (NAV INVOICE_LINE_ALREADY_EXISTS, S370 prod
+    // incident).
     write_lines(
         &mut w,
         &negated_lines,
@@ -1898,6 +1927,324 @@ pub fn read_invoice_delivery_date_from_xml(path: &std::path::Path) -> Result<Str
     }
 }
 
+/// S390/D — read the base invoice's `<paymentDate>` from its on-disk NAV
+/// XML so a storno can copy it rather than stamping the storno's own
+/// issue date. Parallel to [`read_invoice_delivery_date_from_xml`]
+/// (S381/F2): a storno that moves the payment date to the cancelling
+/// invoice's issue date asserts a payment deadline NAV never saw on the
+/// base. Copying the base's `<paymentDate>` keeps the storno's
+/// `<invoiceDetail>` a faithful mirror of the base record (the storno is
+/// a 1:1 reversal — every detail field NAV holds on the base should
+/// reappear unchanged on the cancellation).
+///
+/// Returns the canonical `YYYY-MM-DD` string verbatim (same on-disk
+/// canonical-record discipline as [`read_invoice_number_from_xml`]).
+/// Matches the FIRST `<paymentDate>` (the base body carries exactly
+/// one). Loud-fails when the file cannot be read, the XML is malformed,
+/// or no `<paymentDate>` element appears (a tampered/foreign base XML).
+///
+/// A separate parallel function (NOT a generic dates reader) per the
+/// brief's conservative choice — the two callers read independently and
+/// fold each into its own `with_context` chain, so coupling them into
+/// one multi-return parser would buy nothing but a wider blast radius.
+pub fn read_invoice_payment_date_from_xml(path: &std::path::Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "read base NAV XML at {} to extract <paymentDate> for storno (S390/D)",
+            path.display()
+        )
+    })?;
+    let xml = std::str::from_utf8(&bytes).with_context(|| {
+        format!(
+            "base NAV XML at {} is not valid UTF-8 (S390/D)",
+            path.display()
+        )
+    })?;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    loop {
+        match reader.read_event().with_context(|| {
+            format!(
+                "parse base NAV XML at {} while seeking <paymentDate> (S390/D)",
+                path.display()
+            )
+        })? {
+            quick_xml::events::Event::Start(e)
+                if e.name().local_name().as_ref() == b"paymentDate" =>
+            {
+                let text = reader
+                    .read_text(e.to_end().name())
+                    .with_context(|| {
+                        format!(
+                            "read text of <paymentDate> in base NAV XML at {} (S390/D)",
+                            path.display()
+                        )
+                    })?
+                    .into_owned();
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return Err(anyhow!(
+                        "base NAV XML at {} has an empty <paymentDate> element (S390/D)",
+                        path.display()
+                    ));
+                }
+                return Ok(trimmed.to_string());
+            }
+            quick_xml::events::Event::Eof => {
+                return Err(anyhow!(
+                    "base NAV XML at {} has no <paymentDate> element \
+                     (file is tampered, empty, or not a NAV InvoiceData body) (S390/D)",
+                    path.display()
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// S384/F5 — reconstruct the `LineItem`s from an on-disk NAV
+/// `<InvoiceData>` body so a STORNO can reverse the lines of every SAVED
+/// prior modification in the chain (not just the base's).
+///
+/// Why this is needed: a chain modification is emitted as a full-replace
+/// body whose lines are CREATE operations continuing PAST the base's
+/// line numbers (S369). In NAV's data warehouse each chain body's lines
+/// are fresh fact rows (see `CHAIN_LINE_OPERATION`), so after `base +
+/// MODIFY` NAV holds base lines AND the modification's lines. A storno
+/// that reverses only the base leaves the modification's net un-zeroed →
+/// NAV's `INCONSISTENT_MODIFICATION_DATA_*_NOT_ZERO*` WARN class. The
+/// storno must therefore reverse base + every SAVED modification's
+/// lines; `issue_storno` folds this function's output across the chain.
+///
+/// Round-trips the [`write_lines`] emit exactly: the reconstructed
+/// `unit_price` / `quantity` / `vat_rate_basis_points` re-derive the
+/// same `net_total` / `vat_amount` / `gross_total` the original body
+/// carried (the emit recomputes them from these three fields), so a
+/// `negate_line` over the result yields a byte-exact reversal.
+///
+/// Field reconstruction per `<line>`:
+/// - `description` ← `<lineDescription>`
+/// - `quantity` ← `<quantity>` (decimal)
+/// - `unit_price` ← `<unitPrice>` — minor units inferred from format:
+///   a value with a `.` is two-decimal native cents (EUR) → `×100`; an
+///   integer is whole forints (HUF). This is unambiguous because
+///   `format_native_amount` emits a `.` iff the currency is non-HUF.
+/// - `vat_rate_basis_points` ← `<lineVatRate><vatPercentage>` (a NAV
+///   fraction, `0.27` = 27%) `×10000`.
+/// - `unit` ← `<unitOfMeasure>` (+ `<unitOfMeasureOwn>` when `OWN`).
+/// - `note` ← always `None` — per-line notes never reach the NAV XML
+///   (ADR-0042 never-leak invariant), and the reversal does not need
+///   them.
+///
+/// Loud-fails (CLAUDE.md #12) on unreadable file, malformed XML, or a
+/// `<line>` missing any amount-bearing field — a silent default would
+/// ship a wrong reversal quantity that NAV cannot detect.
+pub fn read_invoice_lines_from_xml(path: &std::path::Path) -> Result<Vec<LineItem>> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "read chain-member NAV XML at {} to extract <line> items for storno reversal (S384/F5)",
+            path.display()
+        )
+    })?;
+    let xml = std::str::from_utf8(&bytes).with_context(|| {
+        format!(
+            "chain-member NAV XML at {} is not valid UTF-8 (S384/F5)",
+            path.display()
+        )
+    })?;
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut out: Vec<LineItem> = Vec::new();
+    let mut cur: Option<XmlLineAcc> = None;
+
+    loop {
+        let ev = reader.read_event().with_context(|| {
+            format!(
+                "parse chain-member NAV XML at {} while extracting <line> items (S384/F5)",
+                path.display()
+            )
+        })?;
+        match ev {
+            Event::Start(e) if e.name().local_name().as_ref() == b"line" => {
+                cur = Some(XmlLineAcc::default());
+            }
+            Event::Start(e) if cur.is_some() => {
+                let local = e.name().local_name();
+                let field: Option<&mut Option<String>> = match local.as_ref() {
+                    b"lineDescription" => cur.as_mut().map(|a| &mut a.description),
+                    b"quantity" => cur.as_mut().map(|a| &mut a.quantity),
+                    b"unitOfMeasure" => cur.as_mut().map(|a| &mut a.unit_of_measure),
+                    b"unitOfMeasureOwn" => cur.as_mut().map(|a| &mut a.unit_of_measure_own),
+                    b"unitPrice" => cur.as_mut().map(|a| &mut a.unit_price),
+                    // `<vatPercentage>` appears inside `<lineVatRate>`
+                    // only while we are inside a `<line>` (the summary
+                    // `<vatRate>` block is outside any `<line>`), so
+                    // capturing it unconditionally here is safe.
+                    b"vatPercentage" => cur.as_mut().map(|a| &mut a.vat_percentage),
+                    _ => None,
+                };
+                if let Some(slot) = field {
+                    let end = e.to_end().into_owned();
+                    let text = reader
+                        .read_text(end.name())
+                        .with_context(|| {
+                            format!(
+                                "read text of <{}> in chain-member NAV XML at {} (S384/F5)",
+                                String::from_utf8_lossy(local.as_ref()),
+                                path.display()
+                            )
+                        })?
+                        .into_owned();
+                    *slot = Some(text.trim().to_string());
+                }
+            }
+            Event::End(e) if e.name().local_name().as_ref() == b"line" => {
+                let acc = cur.take().ok_or_else(|| {
+                    anyhow!(
+                        "</line> without a matching <line> in {} (S384/F5)",
+                        path.display()
+                    )
+                })?;
+                out.push(line_item_from_acc(&acc, path)?);
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(out)
+}
+
+/// Per-`<line>` leaf-string accumulator for [`read_invoice_lines_from_xml`].
+/// Fields fill as their leaf elements are seen between `<line>` and
+/// `</line>`; [`line_item_from_acc`] then validates + converts them.
+#[derive(Default)]
+struct XmlLineAcc {
+    description: Option<String>,
+    quantity: Option<String>,
+    unit_of_measure: Option<String>,
+    unit_of_measure_own: Option<String>,
+    unit_price: Option<String>,
+    vat_percentage: Option<String>,
+}
+
+/// Build a [`LineItem`] from the leaf strings captured for one `<line>`.
+/// Separate fn so [`read_invoice_lines_from_xml`]'s event loop stays
+/// readable. Returns a named error per missing/malformed field.
+fn line_item_from_acc(acc: &XmlLineAcc, path: &std::path::Path) -> Result<LineItem> {
+    let description = acc.description.clone().ok_or_else(|| {
+        anyhow!(
+            "<line> missing <lineDescription> in {} (S384/F5)",
+            path.display()
+        )
+    })?;
+
+    let quantity_str = acc
+        .quantity
+        .as_deref()
+        .ok_or_else(|| anyhow!("<line> missing <quantity> in {} (S384/F5)", path.display()))?;
+    let quantity = Decimal::from_str_exact(quantity_str).with_context(|| {
+        format!(
+            "parse <quantity> '{quantity_str}' as decimal in {} (S384/F5)",
+            path.display()
+        )
+    })?;
+
+    let unit_price_str = acc
+        .unit_price
+        .as_deref()
+        .ok_or_else(|| anyhow!("<line> missing <unitPrice> in {} (S384/F5)", path.display()))?;
+    let unit_price = Huf(parse_native_minor_units(unit_price_str).with_context(|| {
+        format!(
+            "parse <unitPrice> '{unit_price_str}' as native minor units in {} (S384/F5)",
+            path.display()
+        )
+    })?);
+
+    let vat_str = acc.vat_percentage.as_deref().ok_or_else(|| {
+        anyhow!(
+            "<line> missing <vatPercentage> in {} (S384/F5)",
+            path.display()
+        )
+    })?;
+    let vat_rate_basis_points =
+        parse_vat_percentage_to_basis_points(vat_str).with_context(|| {
+            format!(
+                "parse <vatPercentage> '{vat_str}' to basis points in {} (S384/F5)",
+                path.display()
+            )
+        })?;
+
+    let unit = match acc.unit_of_measure.as_deref() {
+        Some("OWN") => acc.unit_of_measure_own.clone().map(ProductUnit::Own),
+        Some(token) => NavUnitOfMeasure::from_nav_token(token).map(ProductUnit::Nav),
+        None => None,
+    };
+
+    Ok(LineItem {
+        description,
+        quantity,
+        unit_price,
+        vat_rate_basis_points,
+        // ADR-0042 — per-line notes are never in the NAV XML, so a
+        // chain-member reversal carries none.
+        note: None,
+        unit,
+    })
+}
+
+/// Parse a `format_native_amount` output back to its i64 minor units.
+/// A value containing `.` is two-decimal native cents (EUR branch) →
+/// integer-part×100 + fractional (padded to 2). An integer is whole
+/// forints (HUF branch). This is the exact inverse of
+/// [`format_native_amount`]; the `.` is present iff the source currency
+/// was non-HUF, so the format alone disambiguates without a currency arg.
+fn parse_native_minor_units(s: &str) -> Result<i64> {
+    let s = s.trim();
+    let (neg, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let magnitude: i64 = if let Some((int_part, frac_part)) = digits.split_once('.') {
+        if frac_part.len() > 2 {
+            return Err(anyhow!(
+                "native amount '{s}' has more than two decimal places (S384/F5)"
+            ));
+        }
+        let int_units: i64 = int_part
+            .parse()
+            .with_context(|| format!("parse integer part of native amount '{s}'"))?;
+        // Pad the fractional part to exactly two digits ("5" → "50").
+        let frac_padded = format!("{frac_part:0<2}");
+        let frac_units: i64 = frac_padded
+            .parse()
+            .with_context(|| format!("parse fractional part of native amount '{s}'"))?;
+        int_units
+            .checked_mul(100)
+            .and_then(|v| v.checked_add(frac_units))
+            .ok_or_else(|| anyhow!("native amount '{s}' overflows i64 (S384/F5)"))?
+    } else {
+        digits
+            .parse()
+            .with_context(|| format!("parse integer native amount '{s}'"))?
+    };
+    Ok(if neg { -magnitude } else { magnitude })
+}
+
+/// Parse NAV's `<vatPercentage>` (a fraction string, `0.27` = 27%) into
+/// the `vat_rate_basis_points` integer (2700). Inverse of
+/// [`write_line_vat_rate`]'s `bp as f64 / 10000.0` formatting.
+fn parse_vat_percentage_to_basis_points(s: &str) -> Result<u16> {
+    use rust_decimal::prelude::ToPrimitive;
+    let frac = Decimal::from_str_exact(s.trim())
+        .with_context(|| format!("parse vatPercentage '{s}' as decimal"))?;
+    let bp = (frac * Decimal::from(10000)).round();
+    bp.to_u16()
+        .ok_or_else(|| anyhow!("vatPercentage '{s}' is out of basis-point range (S384/F5)"))
+}
+
 /// Write the rendered XML to a file path **atomically** (S382/F4).
 ///
 /// Writes to a same-directory `.<name>.tmp.<pid>-<nanos>-<seq>`, fsyncs
@@ -1915,60 +2262,15 @@ pub fn read_invoice_delivery_date_from_xml(path: &std::path::Path) -> Result<Str
 /// through this one helper (`issue_invoice`, `issue_storno`,
 /// `issue_modification`, `request_technical_annulment`), so the
 /// atomicity guarantee lands at all four sites at once.
+///
+/// S385 — the crash-safe write/fsync/rename body was lifted verbatim
+/// into `crate::fs::write_atomic` so the quote-PDF re-render daemon
+/// (which had a naive `std::fs::write`) shares the exact same sequence.
+/// This function stays as the NAV-XML-named entry point — the four chain
+/// emit sites keep calling `write_to_path` unchanged — and forwards to
+/// the shared helper.
 pub fn write_to_path(path: &std::path::Path, xml: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| anyhow!("NAV XML output path `{}` has no parent dir", path.display()))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow!("NAV XML output path `{}` has no file name", path.display()))?
-        .to_string_lossy();
-
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(
-        ".{file_name}.tmp.{}-{nanos}-{seq}",
-        std::process::id()
-    ));
-
-    let write_result = (|| -> Result<()> {
-        let mut file = std::fs::File::create(&tmp_path)
-            .with_context(|| format!("create temp XML file at {}", tmp_path.display()))?;
-        file.write_all(xml)
-            .with_context(|| format!("write XML to temp file {}", tmp_path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("fsync temp XML file {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, path).with_context(|| {
-            format!(
-                "atomically rename {} -> {}",
-                tmp_path.display(),
-                path.display()
-            )
-        })?;
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        // Best-effort: do not litter the issued-XML dir with a stale
-        // tempfile when the write or rename failed.
-        let _ = std::fs::remove_file(&tmp_path);
-        return write_result;
-    }
-
-    // Fsync the parent directory so the rename metadata is durable
-    // across a power loss (otherwise it lives only in the dir's page
-    // cache). Best-effort — a dir that cannot be opened/fsynced does not
-    // invalidate the already-renamed, already-fsync'd file.
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
-    Ok(())
+    crate::fs::write_atomic(path, xml)
 }
 
 #[cfg(test)]

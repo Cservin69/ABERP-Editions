@@ -6825,6 +6825,21 @@ pub async fn submit_invoice_request(
             technical_validations,
             body_preview,
         },
+        // S390/E — another PROCESS (a CLI drain / retry / second app
+        // instance) holds the cross-process submission lock for this
+        // invoice. Mirror the in-process dedupe gate's 409 verdict: the
+        // submission is in progress elsewhere, so refuse rather than
+        // double-POST. (The in-process gate, S378, handles same-process
+        // races; this is its cross-process twin.)
+        submit_invoice::SubmitFromInputsError::SubmissionInProgress { invoice_id } => {
+            SubmitRouteError::PreconditionMismatch {
+                current_state: "SubmissionInProgress".to_string(),
+                message: format!(
+                    "a NAV submission for {invoice_id} is already in progress in another \
+                     process; not double-submitting"
+                ),
+            }
+        }
         submit_invoice::SubmitFromInputsError::Other(inner) => SubmitRouteError::Other(inner),
     })
 }

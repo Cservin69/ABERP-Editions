@@ -292,11 +292,19 @@ pub fn storno_from_inputs(
     //    edits between base issuance and storno would otherwise drift
     //    `template.render_for_build(base_year, base_seq)` away from NAV's
     //    record → INVALID_INVOICE_REFERENCE ABORTED ack.
-    let base_nav_xml_path = {
+    let (base_nav_xml_path, saved_prior_modification_lines) = {
         let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
             .context("open audit ledger for storno precondition check")?;
         check_base_is_finalized(&ledger, references)?;
-        find_base_nav_xml_path_for_chain(&ledger, references)?
+        let base_path = find_base_nav_xml_path_for_chain(&ledger, references)?;
+        // S384/F5 — fold the lines of every SAVED prior modification in
+        // the chain so the storno reverses base + saved-mod lines (not
+        // just the base). Resolved PRE-tx off the same read-only ledger
+        // handle that gives the base path — mirrors the S375 discipline
+        // of reading all chain inputs before the write tx so the render
+        // closure (which has no tx handle) has everything it needs.
+        let saved_mod_lines = saved_prior_modification_lines_for_chain(&ledger, references)?;
+        (base_path, saved_mod_lines)
         // ledger drops here, releasing the DuckDB read connection
     };
 
@@ -343,18 +351,37 @@ pub fn storno_from_inputs(
             base_nav_xml_path.display()
         )
     })?;
-    // PR-84 — `payment_deadline` keeps the pre-PR-84 behaviour
-    // (mirrors the storno's own issue date); nothing falls due on a
-    // cancellation and the WARN F2 closes is delivery-date-scoped only.
-    // The storno UX does not yet surface operator-supplied date pickers.
-    let default_calendar_date = issue_date.date();
+    // S390/D — the storno's `<paymentDate>` MUST equal the base
+    // invoice's payment date, NOT the storno's own issue date. This is
+    // the payment-date counterpart of the S381/F2 delivery-date fix:
+    // pre-PR-84 the storno mirrored its own issue date into `paymentDate`
+    // (`payment_deadline = issue_date.date()`), so the cancellation
+    // asserted a payment deadline NAV never recorded on the base. The
+    // storno is a 1:1 reversal — every `<invoiceDetail>` field NAV holds
+    // on the base reappears unchanged on the cancellation. Read it from
+    // the base's on-disk NAV XML (same canonical-record discipline as
+    // `base_delivery_date` / `base_invoice_number` above). The storno UX
+    // does not yet surface operator-supplied date pickers.
+    let base_payment_date_str =
+        crate::nav_xml::read_invoice_payment_date_from_xml(&base_nav_xml_path)?;
+    let base_payment_date = time::Date::parse(
+        &base_payment_date_str,
+        time::macros::format_description!("[year]-[month]-[day]"),
+    )
+    .with_context(|| {
+        format!(
+            "parse base paymentDate '{base_payment_date_str}' \
+             (read from {}) as YYYY-MM-DD for storno (S390/D)",
+            base_nav_xml_path.display()
+        )
+    })?;
     let draft = DraftInvoice {
         id: InvoiceId::new(),
         series_id: series.id,
         customer_id: command.customer_id,
         lines: command.lines,
         issue_date,
-        payment_deadline: default_calendar_date,
+        payment_deadline: base_payment_date,
         delivery_date: base_delivery_date,
     };
     // PR-44γ.1 — currency + rate_metadata are placeholders here; the
@@ -416,11 +443,14 @@ pub fn storno_from_inputs(
     // bails if the XML is missing / malformed / lacks the element)
     // rather than silently substituting a possibly-wrong render.
     let base_invoice_number = crate::nav_xml::read_invoice_number_from_xml(&base_nav_xml_path)?;
-    // S369 — read the BASE's line count from the same on-disk XML so the
-    // storno's CREATE lines continue PAST the base's line numbers (NAV
-    // INVOICE_LINE_ALREADY_EXISTS, S370). On-disk read mirrors the
-    // base_invoice_number S184 discipline — immune to in-memory row drift.
-    let base_line_count = crate::nav_xml::count_invoice_lines_from_xml(&base_nav_xml_path)?;
+    // S369/S384 — the storno's `<lineNumberReference>` offset is the TOTAL
+    // prior chain line count (base + every saved modification), which is
+    // exactly the number of reversal lines the render closure builds
+    // (`storno.lines` + the folded `saved_prior_modification_lines`). It
+    // is therefore computed INSIDE the closure as `reversal.len()` rather
+    // than from a standalone `count_invoice_lines_from_xml(base)` (which
+    // counted only the base) — that pre-S384 single-source read is now
+    // superseded by the 1:1 reversal-line count.
 
     // S375 — build the storno's <InvoiceData> render+validate+write as a
     // closure that `run_single_tx` runs INSIDE the tx, AFTER the three
@@ -487,10 +517,18 @@ pub fn storno_from_inputs(
           -> Result<String> {
         let storno_invoice_number =
             template.render_for_build(storno.issue_date.year(), storno.sequence_number);
+        // S384/F5 — reverse base lines PLUS every SAVED prior
+        // modification's lines. The storno's own `ReadyInvoice` carries
+        // the base lines; append the folded saved-modification lines.
+        // The offset (`base_line_count`) is the total prior chain line
+        // count == this combined length, so the reversal lines'
+        // `<lineNumberReference>` continue past everything NAV holds.
+        let mut reversal_source_lines = storno.lines.clone();
+        reversal_source_lines.extend(saved_prior_modification_lines.iter().cloned());
         let storno_reference = StornoReference {
             base_invoice_number,
             modification_index,
-            base_line_count,
+            base_line_count: reversal_source_lines.len(),
         };
         let xml = nav_xml::render_storno_data_with_number(
             storno,
@@ -504,6 +542,8 @@ pub fn storno_from_inputs(
             // (defaults to `Transfer` for pre-S160 bases).
             render_payment_method,
             Some(&storno_invoice_number),
+            // S384/F5 — base + saved-modification lines to reverse.
+            &reversal_source_lines,
         )
         .context("render NAV storno XML")?;
         aberp_nav_xsd_validator::validate_invoice_data(&xml).context(
@@ -1272,6 +1312,89 @@ pub(crate) fn saved_chain_member_ids_in_tx(
     Ok(saved)
 }
 
+/// S384/F5 — fold the `LineItem`s of every SAVED prior modification in
+/// the chain rooted at `base_invoice_id`, in `modificationIndex` order.
+///
+/// A storno reverses base + every SAVED modification's lines: each chain
+/// modification was emitted as a full-replace body whose lines are CREATE
+/// fact rows NAV adds to the consolidated chain (it does NOT replace the
+/// base's rows — see `nav_xml::CHAIN_LINE_OPERATION`). A storno that
+/// reverses only the base leaves a saved modification's net un-zeroed →
+/// NAV's `INCONSISTENT_MODIFICATION_DATA_*_NOT_ZERO*` WARN class. ABORTED
+/// modifications never registered at NAV, so their lines are EXCLUDED —
+/// the SAVED filter is the SAME rule `next_modification_index_in_tx`
+/// applies via [`saved_chain_member_ids_in_tx`]; it is recomputed here
+/// off `ledger.entries()` (not a tx) because the storno render closure
+/// resolves its chain inputs PRE-tx, mirroring the base path/identity
+/// reads (S375).
+///
+/// Each saved modification's on-disk NAV XML path is resolved the same
+/// way the base's is — [`find_base_nav_xml_path_for_chain`] walks
+/// `InvoiceDraftCreated` for ANY invoice id, and a modification is itself
+/// an invoice with its own draft entry carrying `nav_xml_path`.
+pub(crate) fn saved_prior_modification_lines_for_chain(
+    ledger: &Ledger,
+    base_invoice_id: &str,
+) -> Result<Vec<LineItem>> {
+    let entries = ledger.entries().context(
+        "read audit ledger entries to fold SAVED prior-modification lines for storno (S384/F5)",
+    )?;
+
+    // 1. SAVED-confirmed invoice ids (NAV terminal-positive DONE state).
+    let mut saved: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in &entries {
+        if entry.kind != EventKind::InvoiceAckStatus {
+            continue;
+        }
+        let payload: audit_payloads::InvoiceAckStatusPayload =
+            serde_json::from_slice(&entry.payload).map_err(|e| {
+                anyhow!(
+                    "InvoiceAckStatus audit payload (seq {}) failed typed decode: {e} \
+                     — audit ledger appears tampered or schema-drifted (S384/F5)",
+                    entry.seq.as_u64()
+                )
+            })?;
+        if payload.ack_status == "SAVED" {
+            saved.insert(payload.invoice_id);
+        }
+    }
+
+    // 2. SAVED modifications against THIS base, in modificationIndex order
+    //    (deterministic fold so the reversal line order is stable).
+    let mut members: Vec<(u32, String)> = Vec::new();
+    for entry in &entries {
+        if entry.kind != EventKind::InvoiceModificationIssued {
+            continue;
+        }
+        let payload: audit_payloads::InvoiceModificationIssuedPayload =
+            serde_json::from_slice(&entry.payload).map_err(|e| {
+                anyhow!(
+                    "InvoiceModificationIssued audit payload (seq {}) failed typed decode: {e} \
+                     — audit ledger appears tampered or schema-drifted (S384/F5)",
+                    entry.seq.as_u64()
+                )
+            })?;
+        if payload.base_invoice_id == base_invoice_id
+            && saved.contains(&payload.modification_invoice_id)
+        {
+            members.push((payload.modification_index, payload.modification_invoice_id));
+        }
+    }
+    members.sort_by_key(|(idx, _)| *idx);
+
+    // 3. Read each saved modification's lines off its on-disk NAV XML.
+    let mut lines: Vec<LineItem> = Vec::new();
+    for (_idx, mod_invoice_id) in members {
+        let path =
+            find_base_nav_xml_path_for_chain(ledger, &mod_invoice_id).with_context(|| {
+                format!("resolve nav_xml_path for SAVED modification {mod_invoice_id} (S384/F5)")
+            })?;
+        let mod_lines = crate::nav_xml::read_invoice_lines_from_xml(&path)?;
+        lines.extend(mod_lines);
+    }
+    Ok(lines)
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Storno command construction — same shape as issue_invoice
 // ──────────────────────────────────────────────────────────────────────
@@ -1916,5 +2039,152 @@ mod tests {
             "nav_xml_path": nav_xml_path,
         });
         serde_json::to_vec(&payload).expect("encode draft payload")
+    }
+
+    /// Minimal NAV-XML body carrying exactly one `<line>` with the
+    /// fields `read_invoice_lines_from_xml` parses. Used by the S384/F5
+    /// chain-fold selection test so it can write distinct on-disk
+    /// modification bodies without constructing a full `ReadyInvoice`.
+    /// (`read_invoice_lines_from_xml`'s byte-exact round-trip against the
+    /// real emitter is pinned separately in the integration test file.)
+    fn minimal_one_line_xml(description: &str, quantity: &str, unit_price: &str) -> String {
+        format!(
+            "<InvoiceData>\
+               <invoiceLines>\
+                 <line>\
+                   <lineNumber>1</lineNumber>\
+                   <lineDescription>{description}</lineDescription>\
+                   <quantity>{quantity}</quantity>\
+                   <unitOfMeasure>PIECE</unitOfMeasure>\
+                   <unitPrice>{unit_price}</unitPrice>\
+                   <lineAmountsNormal>\
+                     <lineVatRate><vatPercentage>0.27</vatPercentage></lineVatRate>\
+                   </lineAmountsNormal>\
+                 </line>\
+               </invoiceLines>\
+             </InvoiceData>"
+        )
+    }
+
+    /// S384/F5 headline — `saved_prior_modification_lines_for_chain`
+    /// folds the lines of a SAVED prior modification into the storno's
+    /// reversal set but EXCLUDES an ABORTED one. This is the data-
+    /// selection heart of the chain-aware storno: only what NAV actually
+    /// holds (base + SAVED modifications) is reversed; an ABORTED
+    /// modification never registered at NAV, so reversing its lines would
+    /// itself trip the inconsistency WARN.
+    #[test]
+    fn saved_prior_modification_lines_folds_saved_excludes_aborted() {
+        use ulid::Ulid;
+
+        let scratch = std::env::temp_dir().join(format!("aberp-s384-fold-{}", Ulid::new()));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let mod_saved_path = scratch.join("mod_saved.xml");
+        let mod_aborted_path = scratch.join("mod_aborted.xml");
+        std::fs::write(
+            &mod_saved_path,
+            minimal_one_line_xml("MOD-SAVED-LINE", "2", "500"),
+        )
+        .unwrap();
+        std::fs::write(
+            &mod_aborted_path,
+            minimal_one_line_xml("MOD-ABORTED-LINE", "9", "999"),
+        )
+        .unwrap();
+
+        let tenant = TenantId::new("t-s384".to_string()).unwrap();
+        let bh = BinaryHash::from_bytes([3u8; 32]);
+        let actor = Actor::from_local_cli("sess-s384".to_string(), "test-user");
+        let mut ledger = Ledger::open_in_memory(tenant, bh).unwrap();
+
+        // Draft entries (resolve each modification's on-disk nav_xml_path).
+        ledger
+            .append(
+                EventKind::InvoiceDraftCreated,
+                draft_payload_literal_id("inv_mod_saved", mod_saved_path.to_str().unwrap()),
+                actor.clone(),
+                None,
+            )
+            .unwrap();
+        ledger
+            .append(
+                EventKind::InvoiceDraftCreated,
+                draft_payload_literal_id("inv_mod_aborted", mod_aborted_path.to_str().unwrap()),
+                actor.clone(),
+                None,
+            )
+            .unwrap();
+
+        // Chain-link entries: both modifications target inv_BASE.
+        for (mod_id, idx) in [("inv_mod_saved", 1u32), ("inv_mod_aborted", 2u32)] {
+            let payload = audit_payloads::InvoiceModificationIssuedPayload::new(
+                mod_id,
+                200 + idx as u64,
+                &format!("rsv_{mod_id}"),
+                IdempotencyKey::new(),
+                "inv_BASE",
+                42,
+                idx,
+                "2025-01-01",
+            );
+            ledger
+                .append(
+                    EventKind::InvoiceModificationIssued,
+                    payload.to_bytes(),
+                    actor.clone(),
+                    None,
+                )
+                .unwrap();
+        }
+
+        // ACKs: SAVED for the first, ABORTED for the second.
+        for (mod_id, ack) in [("inv_mod_saved", "SAVED"), ("inv_mod_aborted", "ABORTED")] {
+            let ack_payload = audit_payloads::InvoiceAckStatusPayload::new(
+                mod_id,
+                &format!("txn_{mod_id}"),
+                ack,
+                Vec::new(),
+            );
+            ledger
+                .append(
+                    EventKind::InvoiceAckStatus,
+                    ack_payload.to_bytes(),
+                    actor.clone(),
+                    None,
+                )
+                .unwrap();
+        }
+
+        let folded =
+            saved_prior_modification_lines_for_chain(&ledger, "inv_BASE").expect("fold succeeds");
+
+        assert_eq!(
+            folded.len(),
+            1,
+            "only the SAVED modification's line(s) must be folded, got {folded:?}"
+        );
+        assert_eq!(folded[0].description, "MOD-SAVED-LINE");
+        assert_eq!(folded[0].quantity, rust_decimal::Decimal::from(2));
+        assert_eq!(folded[0].unit_price, Huf(500));
+        assert_eq!(folded[0].vat_rate_basis_points, 2700);
+        assert!(
+            folded.iter().all(|l| l.description != "MOD-ABORTED-LINE"),
+            "the ABORTED modification's line must NOT be folded (S384/F5)"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// S384/F5 — a base with NO saved modifications folds to an empty
+    /// reversal extension, so the storno reverses only the base (the
+    /// pre-S384 base-only behaviour is preserved exactly).
+    #[test]
+    fn saved_prior_modification_lines_empty_when_no_saved_modifications() {
+        let tenant = TenantId::new("t-s384b".to_string()).unwrap();
+        let bh = BinaryHash::from_bytes([4u8; 32]);
+        let ledger = Ledger::open_in_memory(tenant, bh).unwrap();
+        let folded = saved_prior_modification_lines_for_chain(&ledger, "inv_BASE")
+            .expect("empty chain folds to empty");
+        assert!(folded.is_empty());
     }
 }

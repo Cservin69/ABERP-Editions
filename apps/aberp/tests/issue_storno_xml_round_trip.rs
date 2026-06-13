@@ -25,7 +25,8 @@ use aberp::nav_xml::{
     SupplierInfo,
 };
 use aberp_billing::{
-    Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
+    Currency, CustomerId, Huf, InvoiceId, LineItem, NavUnitOfMeasure, PaymentMethod, ProductUnit,
+    ReadyInvoice, SeriesCode, SeriesId,
 };
 use aberp_nav_xsd_validator::{validate_invoice_data, NAV_XSD_VERSION};
 use time::OffsetDateTime;
@@ -646,6 +647,76 @@ fn read_invoice_delivery_date_from_xml_loud_fails_on_missing_element() {
     );
 }
 
+/// S390/D — `read_invoice_payment_date_from_xml` round-trips the base's
+/// `<paymentDate>` so a storno can copy it instead of stamping the
+/// storno's own issue date. Payment-date counterpart of the S381/F2
+/// delivery-date round-trip. Render a base invoice with a known,
+/// NON-today payment date, write it, and read it back byte-identical.
+#[test]
+fn read_invoice_payment_date_from_xml_round_trips() {
+    use ulid::Ulid;
+
+    let scratch_dir = std::env::temp_dir()
+        .join("aberp-s390-d-payment-roundtrip")
+        .join(format!("{}", Ulid::new()));
+    std::fs::create_dir_all(&scratch_dir).expect("create scratch dir");
+
+    // A fixed payment date distinct from both today AND the delivery
+    // date so a "stamp today" OR a "copy delivery date" regression
+    // cannot coincidentally pass.
+    let payment = time::Date::from_calendar_date(2025, time::Month::April, 30).unwrap();
+    let delivery = time::Date::from_calendar_date(2025, time::Month::March, 14).unwrap();
+    let mut invoice = build_minimal_storno_invoice();
+    invoice.payment_deadline = payment;
+    invoice.delivery_date = delivery;
+
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("base invoice renders");
+
+    let path = scratch_dir.join(format!("{}.xml", Ulid::new()));
+    std::fs::write(&path, &xml).expect("write xml");
+
+    let read_back =
+        nav_xml::read_invoice_payment_date_from_xml(&path).expect("read paymentDate back");
+    assert_eq!(
+        read_back, "2025-04-30",
+        "storno must be able to copy the base's paymentDate verbatim (S390/D)"
+    );
+    // Defends against the "copy delivery date" mistake specifically.
+    assert_ne!(
+        read_back, "2025-03-14",
+        "paymentDate must come from <paymentDate>, NOT <invoiceDeliveryDate> (S390/D)"
+    );
+}
+
+/// S390/D — the helper MUST fail loud when the base XML lacks a
+/// `<paymentDate>` (tampered / foreign body) rather than silently
+/// substituting a date. CLAUDE.md rule 12.
+#[test]
+fn read_invoice_payment_date_from_xml_loud_fails_on_missing_element() {
+    use ulid::Ulid;
+
+    let scratch_dir = std::env::temp_dir()
+        .join("aberp-s390-d-payment-missing")
+        .join(format!("{}", Ulid::new()));
+    std::fs::create_dir_all(&scratch_dir).expect("create scratch dir");
+    let path = scratch_dir.join("no-payment.xml");
+    std::fs::write(
+        &path,
+        b"<InvoiceData><invoiceNumber>X/00001</invoiceNumber></InvoiceData>",
+    )
+    .expect("write xml");
+
+    let err = nav_xml::read_invoice_payment_date_from_xml(&path).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("paymentDate"),
+        "missing-element error must name the element: {msg}"
+    );
+}
+
 /// S184 — `read_invoice_number_from_xml` MUST fail loud (not return an
 /// empty string or a fallback) when the file is missing, empty, or
 /// lacks the `<invoiceNumber>` element. CLAUDE.md rule 12. A silent
@@ -1009,4 +1080,220 @@ fn initial_issuance_numbers_lines_document_local() {
     );
 
     validate_invoice_data(&xml).expect("initial issuance must pass the v3.0 invariant check");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S384/F5 — chain-aware storno: line extractor round-trip + render fold.
+// ──────────────────────────────────────────────────────────────────────
+
+/// S384/F5 — `read_invoice_lines_from_xml` reconstructs lines byte-
+/// faithfully: render a multi-line HUF invoice, parse the lines back,
+/// RE-RENDER from the parsed lines, and assert the two `<invoiceLines>`
+/// blocks are byte-identical. The re-render equality is the strongest
+/// fidelity check — it proves a storno built from folded chain-member
+/// lines emits exactly what NAV recorded (so the negation is exact),
+/// independent of the None-unit↔`PIECE` struct nuance (both emit PIECE).
+#[test]
+fn read_invoice_lines_from_xml_round_trips_through_re_render() {
+    use ulid::Ulid;
+
+    let scratch = std::env::temp_dir().join(format!("aberp-s384-lineroundtrip-{}", Ulid::new()));
+    std::fs::create_dir_all(&scratch).expect("create scratch dir");
+
+    let mut invoice = build_minimal_storno_invoice();
+    invoice.lines = vec![
+        LineItem {
+            description: "Plain line, no unit".to_string(),
+            quantity: rust_decimal::Decimal::from(3),
+            unit_price: Huf(1234),
+            vat_rate_basis_points: 2700,
+            note: None,
+            unit: None,
+        },
+        LineItem {
+            description: "Fractional qty, NAV unit".to_string(),
+            quantity: rust_decimal::Decimal::new(15, 1), // 1.5
+            unit_price: Huf(800),
+            vat_rate_basis_points: 500, // 5%
+            note: None,
+            unit: Some(ProductUnit::Nav(NavUnitOfMeasure::Day)),
+        },
+        LineItem {
+            description: "Own unit line".to_string(),
+            quantity: rust_decimal::Decimal::from(2),
+            unit_price: Huf(50),
+            vat_rate_basis_points: 0,
+            note: None,
+            unit: Some(ProductUnit::Own("liter@15C".to_string())),
+        },
+    ];
+
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("base renders");
+    let path = scratch.join(format!("{}.xml", Ulid::new()));
+    std::fs::write(&path, &xml).expect("write xml");
+
+    let parsed = nav_xml::read_invoice_lines_from_xml(&path).expect("parse lines back");
+    assert_eq!(parsed.len(), 3, "all three lines must be recovered");
+
+    // Wire-relevant fields recovered exactly.
+    assert_eq!(parsed[0].description, "Plain line, no unit");
+    assert_eq!(parsed[0].quantity, rust_decimal::Decimal::from(3));
+    assert_eq!(parsed[0].unit_price, Huf(1234));
+    assert_eq!(parsed[0].vat_rate_basis_points, 2700);
+    assert_eq!(parsed[1].quantity, rust_decimal::Decimal::new(15, 1));
+    assert_eq!(parsed[1].vat_rate_basis_points, 500);
+    assert_eq!(
+        parsed[1].unit,
+        Some(ProductUnit::Nav(NavUnitOfMeasure::Day))
+    );
+    assert_eq!(
+        parsed[2].unit,
+        Some(ProductUnit::Own("liter@15C".to_string()))
+    );
+
+    // Strongest check: re-render from the parsed lines reproduces the
+    // SAME XML byte-for-byte (a storno reverses these exact bytes).
+    let mut re = build_minimal_storno_invoice();
+    re.lines = parsed;
+    let re_xml = nav_xml::render_invoice_data(&re, &series, &parties, Currency::Huf, None)
+        .expect("re-render from parsed lines");
+    let extract_lines = |b: &[u8]| {
+        let s = std::str::from_utf8(b).unwrap().to_string();
+        let start = s.find("<invoiceLines>").unwrap();
+        let end = s.find("</invoiceLines>").unwrap();
+        s[start..end].to_string()
+    };
+    assert_eq!(
+        extract_lines(&xml),
+        extract_lines(&re_xml),
+        "parsed → re-rendered <invoiceLines> must be byte-identical (S384/F5)"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// S384/F5 — the EUR `<unitPrice>` two-decimal form parses back to native
+/// cents (the decimal branch of `parse_native_minor_units`). `10.50` →
+/// 1050 cents, `0.05` → 5 cents. (HUF integers are covered by the
+/// round-trip test above against the real emitter.)
+#[test]
+fn read_invoice_lines_from_xml_parses_eur_unit_price_to_cents() {
+    use ulid::Ulid;
+
+    let scratch = std::env::temp_dir().join(format!("aberp-s384-eur-{}", Ulid::new()));
+    std::fs::create_dir_all(&scratch).expect("create scratch dir");
+    let path = scratch.join("eur.xml");
+    // Minimal body with EUR-format (two-decimal) unitPrice values.
+    let body = "<InvoiceData><invoiceLines>\
+        <line><lineNumber>1</lineNumber><lineDescription>A</lineDescription>\
+        <quantity>1</quantity><unitOfMeasure>PIECE</unitOfMeasure>\
+        <unitPrice>10.50</unitPrice><lineAmountsNormal>\
+        <lineVatRate><vatPercentage>0.27</vatPercentage></lineVatRate></lineAmountsNormal></line>\
+        <line><lineNumber>2</lineNumber><lineDescription>B</lineDescription>\
+        <quantity>1</quantity><unitOfMeasure>PIECE</unitOfMeasure>\
+        <unitPrice>0.05</unitPrice><lineAmountsNormal>\
+        <lineVatRate><vatPercentage>0.27</vatPercentage></lineVatRate></lineAmountsNormal></line>\
+        </invoiceLines></InvoiceData>";
+    std::fs::write(&path, body).unwrap();
+
+    let parsed = nav_xml::read_invoice_lines_from_xml(&path).expect("parse EUR lines");
+    assert_eq!(parsed[0].unit_price, Huf(1050), "10.50 EUR → 1050 cents");
+    assert_eq!(parsed[1].unit_price, Huf(5), "0.05 EUR → 5 cents");
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// S384/F5 — the render-side fold: a storno whose `reversal_source_lines`
+/// is base + saved-modification lines reverses ALL of them, with
+/// `<lineNumberReference>` continuing past the total prior chain line
+/// count. Here base has 1 line and a saved modification contributes 2,
+/// so the storno emits 3 reversal lines referencing 4, 5, 6 (offset 3).
+#[test]
+fn storno_render_reverses_base_plus_saved_modification_lines() {
+    let invoice = build_minimal_storno_invoice(); // 1 base line
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+
+    // base line + two folded saved-modification lines = 3 reversal lines.
+    let mut reversal = invoice.lines.clone();
+    reversal.push(LineItem {
+        description: "SAVED-MOD-LINE-1".to_string(),
+        quantity: rust_decimal::Decimal::from(4),
+        unit_price: Huf(250),
+        vat_rate_basis_points: 2700,
+        note: None,
+        unit: None,
+    });
+    reversal.push(LineItem {
+        description: "SAVED-MOD-LINE-2".to_string(),
+        quantity: rust_decimal::Decimal::from(7),
+        unit_price: Huf(100),
+        vat_rate_basis_points: 2700,
+        note: None,
+        unit: None,
+    });
+
+    let reference = StornoReference {
+        base_invoice_number: "INV-default/00001".to_string(),
+        modification_index: 2,
+        base_line_count: reversal.len(), // total prior chain line count
+    };
+    let xml = nav_xml::render_storno_data_with_number(
+        &invoice,
+        &series,
+        &parties,
+        &reference,
+        Currency::Huf,
+        None,
+        PaymentMethod::Transfer,
+        Some("INV-default/00010"),
+        &reversal,
+    )
+    .expect("chain-aware storno renders");
+    let body = std::str::from_utf8(&xml).unwrap();
+
+    // All three reversal lines present (base + both saved-mod lines).
+    assert!(
+        body.contains("Cancellation of widget"),
+        "base line reversed"
+    );
+    assert!(
+        body.contains("SAVED-MOD-LINE-1"),
+        "saved mod line 1 reversed"
+    );
+    assert!(
+        body.contains("SAVED-MOD-LINE-2"),
+        "saved mod line 2 reversed"
+    );
+
+    // Offset = 3 (total prior chain lines): references continue at 4,5,6,
+    // and NONE collide with prior chain line numbers 1,2,3.
+    for r in ["4", "5", "6"] {
+        assert!(
+            body.contains(&format!("<lineNumberReference>{r}</lineNumberReference>")),
+            "reversal line must reference {r} (offset 3); body:\n{body}"
+        );
+    }
+    for collide in ["1", "2", "3"] {
+        assert!(
+            !body.contains(&format!(
+                "<lineNumberReference>{collide}</lineNumberReference>"
+            )),
+            "reversal must NOT reuse prior chain line {collide} (NAV INVOICE_LINE_ALREADY_EXISTS)"
+        );
+    }
+    // Quantities negated (reversal): -4 and -7 appear.
+    assert!(
+        body.contains("<quantity>-4</quantity>"),
+        "mod line 1 qty negated"
+    );
+    assert!(
+        body.contains("<quantity>-7</quantity>"),
+        "mod line 2 qty negated"
+    );
+
+    validate_invoice_data(&xml).expect("chain-aware storno must pass the v3.0 invariant check");
 }

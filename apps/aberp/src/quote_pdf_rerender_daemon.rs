@@ -500,7 +500,15 @@ fn prepare_rerender(
     // Best-effort overwrite the stored artifact so the on-disk PDF matches
     // what the customer now sees. A write failure does NOT abort the
     // re-post — the bytes still travel in the multipart.
-    if let Err(e) = std::fs::write(&pdf_path, &pdf_bytes) {
+    //
+    // S385 — write ATOMICALLY (temp + fsync + rename) via the shared
+    // `crate::fs::write_atomic`. The naive `std::fs::write` truncated the
+    // file in place, so the SPA's PDF-download reader
+    // (`serve::read_pricing_job_pdf`, S352) could catch a torn prefix mid
+    // re-render and hand the operator a corrupt PDF. The atomic rename
+    // means a concurrent reader sees either the whole old PDF or the
+    // whole new one.
+    if let Err(e) = crate::fs::write_atomic(&pdf_path, &pdf_bytes) {
         tracing::warn!(quote_id, pdf_path, error = %e, "pdf-rerender: failed to overwrite on-disk priced.pdf (re-post still proceeds)");
     }
 
