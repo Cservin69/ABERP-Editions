@@ -377,6 +377,23 @@ lto = "thin"
 codegen-units = 1
 debug = "line-tables-only"
 
+# S393 — keep the debug/test target-dir footprint within the CI runner's
+# free disk. The bundled libduckdb 1.5.3 amalgamation plus every
+# `--all-targets` test binary carrying FULL debuginfo (the dev/test
+# default) overflowed ubuntu-latest's disk — the `Test (--locked)` step
+# died twice with `No space left on device` (rustc-LLVM IO failure) on
+# the S393 bump, the same disk-full class that flaked S357/S360/S362
+# transiently and turned persistent once 1.5.3's object files grew.
+# `[profile.release]` already ships `line-tables-only` (above); applying
+# the same to dev keeps panic/backtrace line numbers — what we actually
+# debug from — while shedding the bulk of the debuginfo. (`test` inherits
+# `dev`.) The bundled C++ we never step into drops debuginfo entirely.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package.libduckdb-sys]
+debug = false
+
 # PR-235 / S241 — workspace-wide clippy hygiene. Each member crate opts
 # in via `[lints] workspace = true`. The five `allow`s below are
 # deliberate; everything else is the clippy default (warn).
