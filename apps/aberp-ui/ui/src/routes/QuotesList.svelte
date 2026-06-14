@@ -513,12 +513,6 @@
                     Elvetés / Dismiss
                   </button>
                 </div>
-              {:else if row.intake_state === "irrelevant"}
-                <span
-                  class="quotes-chip"
-                  data-testid="quotes-row-dismissed"
-                  title="Marked irrelevant by an operator"
-                >Elvetve / Dismissed</span>
               {:else if row.deal_issued_at}
                 <!-- S272 / PR-261 — post-DEAL state: SO + WO placeholder
                      chips. The SO module backfill will adopt the

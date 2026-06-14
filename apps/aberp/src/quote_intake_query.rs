@@ -176,6 +176,21 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Quot
     // O(catalogue_size); pulling it once amortises across all 500 rows.
     let current_stock_by_grade = read_current_stock_status_by_grade(conn, tenant_id)?;
 
+    // S413 — exclude TERMINAL intake states from the operator's actionable
+    // Quotes queue. `refused` (S403 operator REFUSE-with-reason) and
+    // `irrelevant` (operator Dismiss of a parse-error / dead-letter row)
+    // are both final dispositions on which no further operator action is
+    // possible — the refuse handler itself blocks ("only staged rows can be
+    // refused"). They previously stayed in the listing; a `refused` row in
+    // particular had no SPA branch and rendered with the full staged
+    // action set, inviting a click that always 409'd. Filtering them in the
+    // query (the [[trust-code-not-operator]] defence — code, not operator
+    // memory) is the one-click final disposition: the row leaves the queue
+    // and never comes back. The closed vocab lives in
+    // `aberp_quote_intake::log_table::{STATE_REFUSED, STATE_IRRELEVANT}`;
+    // matched here as literals to mirror the `next_actionable_job`
+    // convention in `quote_pricing_jobs`. `staged` (actionable), `error`
+    // (retry-parse / dismiss actionable) and DEAL'd rows stay visible.
     let mut stmt = conn.prepare(
         "SELECT quote_id, invoice_id, received_at, intake_at,
                 status_writeback_at, raw_payload, prepared_draft,
@@ -188,6 +203,7 @@ pub fn list_quote_intake_rows(conn: &Connection, tenant_id: &str) -> Result<Quot
                 deal_sales_order_id, deal_work_order_id
            FROM quote_intake_log
           WHERE tenant_id = ?1
+            AND COALESCE(intake_state, 'staged') NOT IN ('refused', 'irrelevant')
           ORDER BY intake_at DESC
           LIMIT 500",
     )?;
@@ -685,6 +701,50 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].quote_id, "q-b");
         assert_eq!(rows[1].quote_id, "q-a");
+    }
+
+    /// S413 — TERMINAL intake states (`refused` = S403 operator
+    /// REFUSE-with-reason, `irrelevant` = operator Dismiss) drop out of the
+    /// actionable Quotes queue; `staged` (actionable) and `error`
+    /// (retry-parse / dismiss actionable) stay. Defends the operator from a
+    /// no-op click on a row that can take no further action.
+    #[test]
+    fn list_excludes_terminal_refused_and_irrelevant_states() {
+        let conn = open_mem();
+        for (qid, at) in [
+            ("q-staged", "2026-01-05T00:00:00Z"),
+            ("q-error", "2026-01-04T00:00:00Z"),
+            ("q-refused", "2026-01-03T00:00:00Z"),
+            ("q-irrelevant", "2026-01-02T00:00:00Z"),
+        ] {
+            insert_test_row(&conn, "t1", qid, at, "{}", "{}", None);
+        }
+        // The S256 `intake_state` column lands lazily inside
+        // `list_quote_intake_rows`; apply the backstop now so the UPDATE
+        // below can reference it (mirrors the S256 test setup).
+        conn.execute_batch(S256_MIGRATION_BACKSTOP).unwrap();
+        // Flip the two terminal rows + the error row to their states.
+        for (qid, state) in [
+            ("q-error", "error"),
+            ("q-refused", "refused"),
+            ("q-irrelevant", "irrelevant"),
+        ] {
+            conn.execute(
+                "UPDATE quote_intake_log SET intake_state = ?1 WHERE quote_id = ?2",
+                params![state, qid],
+            )
+            .unwrap();
+        }
+        let rows = list_quote_intake_rows(&conn, "t1").unwrap().rows;
+        let ids: std::collections::HashSet<_> = rows.iter().map(|r| r.quote_id.as_str()).collect();
+        assert!(ids.contains("q-staged"), "staged is actionable");
+        assert!(ids.contains("q-error"), "error is retry/dismiss actionable");
+        assert!(!ids.contains("q-refused"), "refused is terminal → filtered");
+        assert!(
+            !ids.contains("q-irrelevant"),
+            "irrelevant is terminal → filtered"
+        );
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]

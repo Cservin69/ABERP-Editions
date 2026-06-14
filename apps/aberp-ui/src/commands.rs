@@ -1426,25 +1426,6 @@ pub async fn edit_quote_pricing_job_material(
     .await
 }
 
-/// S354 / PR-42 (U16) — operator accept-on-behalf.
-/// `POST /api/quote-pricing-jobs/{quote_id}/accept` with body
-/// `{ channel, note, customer_confirmation_path? }`. The backend validates
-/// the body + state (acceptable only from `Posted`, 409 otherwise / when
-/// already accepted), signs an HMAC over the bound fields, POSTs
-/// `operator_accepted` to the storefront, and emits the local
-/// `quote.operator_accepted` audit. 200 on a synced accept; 502 (carrying
-/// the classified writeback outcome) when the storefront sync failed —
-/// the SPA branches on the wrapped error string for the inline message.
-#[tauri::command]
-pub async fn accept_quote_pricing_job(
-    state: State<'_, AppState>,
-    quote_id: String,
-    body: Value,
-) -> Result<Value, String> {
-    let path = format!("/api/quote-pricing-jobs/{quote_id}/accept");
-    forward_post(&state, &path, body).await
-}
-
 /// S282 / PR-267 — read the pricing-pipeline daemon status (Python-venv
 /// resolution outcome + poll cadence + spawned flag). Drives the SPA's
 /// `PricingJobsList` empty-state copy: GREEN active vs RED venv-missing

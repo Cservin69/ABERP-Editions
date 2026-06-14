@@ -14,26 +14,20 @@
   // (in-memory Svelte state, never browser storage).
 
   import {
-    acceptQuotePricingJob,
     downloadQuotePricingJobPdf,
     editQuotePricingJobMaterial,
     getQuotePricingJob,
     getQuotePricingJobAudit,
     listQuotingMaterials,
     retryQuotePricingJob,
-    AcceptQuoteError,
     MaterialEditError,
     type AuditEntryView,
     type PricingJobDetail,
   } from "../lib/api";
-  import {
-    ACCEPT_CHANNEL_OPTIONS,
-    acceptErrorInlineCopy,
-    hasOperatorAccepted,
-    isAcceptable,
-    validateAcceptForm,
-    type AcceptChannel,
-  } from "../lib/pricing-operator-accept";
+  // S416 — the operator accept-on-behalf form (imports from the removed
+  // `../lib/pricing-operator-accept`) is gone: the customer accepts via the
+  // Accept button in their quote e-mail, so an operator-side Accept was
+  // redundant and bypassed the customer.
   import {
     runQuotePdfAction,
     type QuotePdfAction,
@@ -94,15 +88,6 @@
   let materialEditError = $state<string | null>(null);
   let materialToast = $state<string | null>(null);
 
-  // S354 / PR-42 (U16) — operator accept-on-behalf state.
-  let acceptOpen = $state(false);
-  let acceptChannel = $state<AcceptChannel | "">("");
-  let acceptNote = $state("");
-  let acceptPath = $state("");
-  let acceptBusy = $state(false);
-  let acceptError = $state<string | null>(null);
-  let acceptToast = $state<string | null>(null);
-
   const AUDIT_PAGE = 50;
 
   // Derived sections — all read off the one audit page we fetch.
@@ -110,10 +95,6 @@
   const writeback = $derived(latestWritebackOutcome(auditEvents));
   const priceRows = $derived(breakdownRows(detail?.breakdown ?? null));
   const reasoningLog = $derived(reasoningLogLines(detail?.breakdown ?? null));
-  // The Accept button shows only on a Posted (priced + delivered) row that
-  // has not already been operator-accepted (the backend 409 is the safety
-  // net; this just hides the affordance once synced).
-  const alreadyAccepted = $derived(hasOperatorAccepted(auditEvents));
 
   // Open on a non-null quoteId; close + reset on null. Guard the
   // double-open InvalidStateError per the InvoiceDetail precedent.
@@ -125,8 +106,6 @@
       retryError = null;
       cancelMaterialEdit();
       materialToast = null;
-      cancelAccept();
-      acceptToast = null;
       void load(quoteId);
     } else {
       // Close the inline PDF viewer first so its `close` handler revokes
@@ -325,62 +304,9 @@
     }
   }
 
-  // S354 / PR-42 (U16) — open the inline accept-on-behalf form.
-  function startAccept(): void {
-    acceptOpen = true;
-    acceptError = null;
-    acceptToast = null;
-    acceptChannel = "";
-    acceptNote = "";
-    acceptPath = "";
-  }
-
-  function cancelAccept(): void {
-    acceptOpen = false;
-    acceptError = null;
-    acceptChannel = "";
-    acceptNote = "";
-    acceptPath = "";
-  }
-
-  async function saveAccept(): Promise<void> {
-    if (!quoteId || !detail) return;
-    const validationError = validateAcceptForm({
-      channel: acceptChannel,
-      note: acceptNote,
-    });
-    if (validationError) {
-      acceptError = validationError;
-      return;
-    }
-    acceptBusy = true;
-    acceptError = null;
-    try {
-      const path = acceptPath.trim();
-      await acceptQuotePricingJob(quoteId, {
-        // `channel` is non-"" here (validated above).
-        channel: acceptChannel as AcceptChannel,
-        note: acceptNote.trim(),
-        customer_confirmation_path: path.length > 0 ? path : undefined,
-      });
-      acceptOpen = false;
-      acceptToast =
-        "Elfogadás rögzítve. / Acceptance recorded.";
-      // Refresh the parent list + this panel (the audit timeline now
-      // carries the operator-accept event; the Accept button hides).
-      onRetried();
-      await load(quoteId);
-    } catch (e) {
-      acceptError =
-        e instanceof AcceptQuoteError
-          ? acceptErrorInlineCopy(e)
-          : e instanceof Error
-            ? e.message
-            : String(e);
-    } finally {
-      acceptBusy = false;
-    }
-  }
+  // S416 — the inline operator accept-on-behalf form (startAccept /
+  // cancelAccept / saveAccept) was removed; the customer accepts via the
+  // Accept button in their quote e-mail.
 
   function stateLabel(state: string): string {
     switch (state) {
@@ -525,12 +451,6 @@
       {#if materialToast}
         <p class="qjd__toast" data-testid="pricing-job-material-toast">
           {materialToast}
-        </p>
-      {/if}
-
-      {#if acceptToast}
-        <p class="qjd__toast" data-testid="pricing-job-accept-toast">
-          {acceptToast}
         </p>
       {/if}
 
@@ -911,100 +831,21 @@
         </section>
       </div>
 
-      <!-- Footer: Retry (Failed rows) + Accept on behalf (Posted rows) -->
-      {#if detail.state === "failed" || (isAcceptable(detail.state) && !alreadyAccepted)}
+      <!-- Footer: Retry (Failed rows). S416 — the operator
+           accept-on-behalf affordance was removed; the customer accepts
+           via the Accept button in their quote e-mail. -->
+      {#if detail.state === "failed"}
         <footer class="qjd__footer">
-          {#if detail.state === "failed"}
-            <button
-              type="button"
-              class="btn btn--secondary"
-              onclick={() => void onRetry()}
-              disabled={retryBusy}
-              data-testid="pricing-job-detail-retry"
-              >{retryBusy
-                ? "Újrapróbálás… / Retrying…"
-                : "Újra / Retry"}</button
-            >
-          {/if}
-
-          <!-- S354 / PR-42 (U16) — operator accept-on-behalf. Visible on a
-               Posted (priced + delivered) row that has not already been
-               operator-accepted. -->
-          {#if isAcceptable(detail.state) && !alreadyAccepted}
-            {#if !acceptOpen}
-              <button
-                type="button"
-                class="btn btn--secondary"
-                onclick={startAccept}
-                data-testid="pricing-job-accept-btn"
-                >Elfogadás / Accept</button
-              >
-            {:else}
-              <div class="qjd__accept" data-testid="pricing-job-accept-form">
-                <label class="qjd__accept-row">
-                  <span>Csatorna / Channel</span>
-                  <select
-                    class="qjd__matselect"
-                    bind:value={acceptChannel}
-                    disabled={acceptBusy}
-                    data-testid="pricing-job-accept-channel"
-                  >
-                    <option value="" disabled>— Válassz / Pick —</option>
-                    {#each ACCEPT_CHANNEL_OPTIONS as opt (opt.value)}
-                      <option value={opt.value}>{opt.label}</option>
-                    {/each}
-                  </select>
-                </label>
-                <label class="qjd__accept-row">
-                  <span>Megjegyzés / Note</span>
-                  <textarea
-                    class="qjd__accept-note"
-                    rows="2"
-                    bind:value={acceptNote}
-                    disabled={acceptBusy}
-                    placeholder="Mit mondott az ügyfél, mikor? / What did the customer say, when?"
-                    data-testid="pricing-job-accept-note"
-                  ></textarea>
-                </label>
-                <label class="qjd__accept-row">
-                  <span>Visszaigazolás útvonal / Confirmation path (opcionális / optional)</span>
-                  <input
-                    type="text"
-                    class="qjd__matselect"
-                    bind:value={acceptPath}
-                    disabled={acceptBusy}
-                    placeholder="/path/to/confirmation.png"
-                    data-testid="pricing-job-accept-path"
-                  />
-                </label>
-                <div class="qjd__matedit-actions">
-                  <button
-                    type="button"
-                    class="btn btn--secondary"
-                    onclick={() => void saveAccept()}
-                    disabled={acceptBusy}
-                    data-testid="pricing-job-accept-save"
-                    >{acceptBusy
-                      ? "Mentés… / Saving…"
-                      : "Elfogadás rögzítése / Record accept"}</button
-                  >
-                  <button
-                    type="button"
-                    class="qjd__close"
-                    onclick={cancelAccept}
-                    disabled={acceptBusy}
-                    aria-label="Mégse / Cancel"
-                    data-testid="pricing-job-accept-cancel">✕</button
-                  >
-                </div>
-                {#if acceptError}
-                  <p class="qjd__err" data-testid="pricing-job-accept-error">
-                    {acceptError}
-                  </p>
-                {/if}
-              </div>
-            {/if}
-          {/if}
+          <button
+            type="button"
+            class="btn btn--secondary"
+            onclick={() => void onRetry()}
+            disabled={retryBusy}
+            data-testid="pricing-job-detail-retry"
+            >{retryBusy
+              ? "Újrapróbálás… / Retrying…"
+              : "Újra / Retry"}</button
+          >
         </footer>
       {/if}
     {/if}
@@ -1268,33 +1109,8 @@
     padding: 6px 0 0;
     font-size: 12px;
   }
-  /* S354 / PR-42 (U16) — inline accept-on-behalf form. Stacks the
-     channel select, the note, and the optional path; the action row
-     reuses `.qjd__matedit-actions`. */
-  .qjd__accept {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    width: 100%;
-  }
-  .qjd__accept-row {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    font-size: 12px;
-    color: var(--color-text-muted, #9ca3af);
-  }
-  .qjd__accept-note {
-    background: var(--color-bg, #111827);
-    color: var(--color-text, #e5e7eb);
-    border: 1px solid var(--color-border, #374151);
-    border-radius: 6px;
-    padding: 6px 8px;
-    font-size: 13px;
-    font-family: inherit;
-    resize: vertical;
-    max-width: 100%;
-  }
+  /* S416 — the inline accept-on-behalf form CSS (.qjd__accept*) was
+     removed along with the operator Accept affordance. */
   .qjd__toast {
     margin: 0;
     padding: 8px 16px;

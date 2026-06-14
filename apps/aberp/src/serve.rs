@@ -3329,16 +3329,12 @@ fn build_router(state: AppState) -> Router {
             "/api/quote-pricing-jobs/:quote_id/retry",
             post(handle_retry_quote_pricing_job),
         )
-        // S354 / PR-42 (U16) — operator accept-on-behalf. POSTs a
-        // Bearer + HMAC-signed `operator_accepted` to the storefront
-        // (the customer accepted off-channel — phone / e-mail / in
-        // person) and records the local `quote.operator_accepted`
-        // audit-of-record. Closes the U16 dead-end where phone/e-mail
-        // acceptance had no path to DEAL.
-        .route(
-            "/api/quote-pricing-jobs/:quote_id/accept",
-            post(handle_accept_quote_pricing_job),
-        )
+        // S416 — the operator accept-on-behalf route (S354 / PR-42 / U16)
+        // was REMOVED: it was redundant (the customer accepts via the
+        // Accept button in their quote e-mail) and a footgun (an operator
+        // click pre-bypassed the customer). The `quote.operator_accepted`
+        // EventKind variant is RETAINED in the audit vocabulary for
+        // back-compat with any historical ledger entries.
         // S282 / PR-267 — pricing-pipeline daemon status. Reads the
         // dormant handle that was filled in at boot by the layered
         // Python-venv resolver. Drives the `PricingJobsList` empty-
@@ -18074,10 +18070,15 @@ pub fn delete_pricing_job_request(
     aberp_audit_ledger::ensure_schema(&conn)
         .context("ensure audit-ledger schema for failure-delete audit")?;
     let tx = conn.transaction().context("open delete transaction")?;
-    let outcome = crate::quote_pricing_jobs::delete_failed_job_in_tx(&tx, quote_id, &tenant)
-        .context("delete_failed_job_in_tx")?;
+    let outcome = crate::quote_pricing_jobs::delete_failed_job_in_tx(
+        &tx,
+        quote_id,
+        &tenant,
+        time::OffsetDateTime::now_utc(),
+    )
+    .context("delete_failed_job_in_tx")?;
     let (attempt_n, error_stage, error_reason, failure_kind) = match outcome {
-        crate::quote_pricing_jobs::DeleteJobOutcome::Deleted {
+        crate::quote_pricing_jobs::DeleteJobOutcome::Archived {
             attempt_n,
             error_stage,
             error_reason,
@@ -18094,11 +18095,11 @@ pub fn delete_pricing_job_request(
         }
     };
 
-    // F12 audit-of-record — rides the SAME tx as the DELETE so the row
-    // removal and its ledger entry commit atomically. `previous_state` is
-    // always `failed` (the only deletable state); the terminal failure
-    // context is preserved so a forensic walker sees WHY the deleted row
-    // had failed even though the row itself is gone.
+    // F12 audit-of-record — rides the SAME tx as the archive UPDATE so the
+    // row disposition and its ledger entry commit atomically. S414: the
+    // row is flipped to `archived` (not hard-deleted), but `previous_state`
+    // is always `failed` (the only deletable state); the terminal failure
+    // context is preserved so a forensic walker sees WHY the row had failed.
     let idempotency_key = format!("quote_pricing_failure_deleted:{quote_id}");
     let payload = serde_json::json!({
         "quote_id": quote_id,
@@ -18132,119 +18133,13 @@ pub fn delete_pricing_job_request(
     })
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// S354 / PR-42 (U16) — operator accept-on-behalf
-// ─────────────────────────────────────────────────────────────────────
-
-/// Request body for `POST /api/quote-pricing-jobs/:quote_id/accept`.
-#[derive(Debug, serde::Deserialize)]
-struct AcceptQuotePricingJobRequest {
-    /// Off-channel acceptance medium. Closed vocab (validated against
-    /// [`crate::operator_accept::ACCEPT_CHANNELS`]): `phone` / `email` /
-    /// `in_person` / `other`.
-    channel: String,
-    /// Operator free-text note (required) — what the customer said / when.
-    note: String,
-    /// Optional operator-supplied path to a CC screenshot / scanned
-    /// confirmation. Recorded verbatim in the audit; the backend does
-    /// NOT ingest the file's bytes (there is no upload surface — this is
-    /// a reference/path for the audit trail only).
-    #[serde(default)]
-    customer_confirmation_path: Option<String>,
-}
-
-/// 200 body when the storefront writeback succeeded.
-#[derive(Debug, serde::Serialize)]
-struct AcceptQuotePricingJobResponse {
-    quote_id: String,
-    accepted_at_ms: i64,
-    /// Always `"accepted"` — the operator commitment + storefront sync.
-    status: &'static str,
-    /// The `WritebackOutcome` tag — always `"success"` on this 200 path.
-    outcome: &'static str,
-}
-
-/// Max operator note length (chars). Mirrors the storefront's `NOTES_MAX`
-/// so a too-long note fails fast at ABERP instead of round-tripping into
-/// a storefront 400.
-const ACCEPT_NOTE_MAX: usize = 2000;
-/// Max confirmation-path length (chars).
-const ACCEPT_PATH_MAX: usize = 1024;
-
-/// S354 / PR-42 (U16) — local pre-flight verdict for an accept attempt,
-/// computed against the tenant DB BEFORE any storefront round-trip.
-#[derive(Debug)]
-pub enum AcceptPrecheck {
-    /// Row is `Posted` (priced + written back, storefront `quoted`) and
-    /// not already operator-accepted — clear to attempt.
-    Ready,
-    /// No row for (tenant, quote_id). Foreign-tenant rows are invisible
-    /// (404, never 403) — same convention as the detail route.
-    NotFound,
-    /// Row exists but is not in the acceptable `Posted` state.
-    NotAcceptable { state: String },
-    /// A prior operator-accept already SUCCEEDED at the storefront
-    /// (a `quote.operator_accepted` ledger entry with `outcome=="success"`).
-    /// A failed-writeback accept leaves a non-success entry that does NOT
-    /// block a retry.
-    AlreadyAccepted,
-}
-
-/// S354 / PR-42 (U16) — the local pre-flight. `pub` so the integration
-/// test pins the state / tenant / idempotency discrimination without the
-/// HTTPS listener (same posture as `amend_pricing_job_material_request`).
-/// Sync (DuckDB reads are blocking) — the handler wraps it in
-/// `spawn_blocking`.
-pub fn accept_quote_precheck(
-    state: &AppState,
-    quote_id: &str,
-    tenant: &str,
-) -> Result<AcceptPrecheck> {
-    let binary_hash = state
-        .binary_hash
-        .wait()
-        .context("await background binary hash compute")?;
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    let Some(detail) = crate::quote_pricing_jobs::get_job_detail(&conn, quote_id, tenant)? else {
-        return Ok(AcceptPrecheck::NotFound);
-    };
-    if detail.row.state != crate::quote_pricing_jobs::JobState::Posted {
-        return Ok(AcceptPrecheck::NotAcceptable {
-            state: detail.row.state.as_str().to_string(),
-        });
-    }
-    // Already-accepted guard: a prior SUCCESSFUL operator-accept is the
-    // only thing that blocks a fresh attempt. Scan the ledger for a
-    // `quote.operator_accepted` entry on this quote whose payload
-    // `outcome == "success"`.
-    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger for accept idempotency")?;
-    #[derive(serde::Deserialize)]
-    struct AcceptProbe {
-        quote_id: String,
-        outcome: String,
-    }
-    let already = ledger
-        .entries()
-        .context("read audit ledger entries")?
-        .iter()
-        .any(|e| {
-            e.kind == EventKind::QuotePricingOperatorAccepted
-                && serde_json::from_slice::<AcceptProbe>(&e.payload)
-                    .map(|p| p.quote_id == quote_id && p.outcome == "success")
-                    .unwrap_or(false)
-        });
-    if already {
-        return Ok(AcceptPrecheck::AlreadyAccepted);
-    }
-    Ok(AcceptPrecheck::Ready)
-}
-
-/// S354 / PR-42 (U16) — POST the signed operator-accept to the storefront
-/// `status` endpoint and classify the response with the SAME
-/// transport-vs-app gate as the priced-writeback (CLAUDE.md #8/#13 — one
-/// classifier, no drift). `pub` for the e2e mock-server test.
+/// Body-agnostic POST to the storefront `status` endpoint that classifies
+/// the response with the SAME transport-vs-app gate as the priced-writeback
+/// (CLAUDE.md #8/#13 — one classifier, no drift). The S354 operator-accept
+/// caller was removed in S416; the surviving caller is the S403 REFUSE
+/// saga's best-effort `{ status: "rejected", notes }` writeback. `pub` for
+/// the e2e mock-server test. (Name retained to avoid churn at the call
+/// site; it is now a generic status POST, not accept-specific.)
 pub async fn post_operator_accept(
     base_url: &str,
     quote_id: &str,
@@ -18287,307 +18182,6 @@ pub async fn post_operator_accept(
         Err(e) => return classify_send_error(&e),
     };
     classify_writeback_response(status, content_type.as_deref(), &body_text)
-}
-
-/// S354 / PR-42 (U16) — the local audit-of-record for an operator-accept
-/// attempt. Emitted REGARDLESS of writeback success: a `success` outcome
-/// is the committed accept; a failure outcome records the attempt + its
-/// classified reason so a forensic walker (and the SPA detail timeline)
-/// sees both. `pub` so the integration test pins the payload shape
-/// without the HTTPS listener. Sync — the handler wraps it in
-/// `spawn_blocking`.
-#[allow(clippy::too_many_arguments)]
-pub fn record_operator_accept_audit(
-    state: &AppState,
-    quote_id: &str,
-    channel: &str,
-    note: &str,
-    operator_login: &str,
-    accepted_at_ms: i64,
-    customer_confirmation_path: Option<&str>,
-    outcome: &crate::quote_pricing_pipeline::WritebackOutcome,
-) -> Result<()> {
-    let binary_hash = state
-        .binary_hash
-        .wait()
-        .context("await background binary hash compute")?;
-    let mut conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    aberp_audit_ledger::ensure_schema(&conn)
-        .context("ensure audit-ledger schema for operator-accept audit")?;
-    let tenant = state.tenant.as_str().to_string();
-    let tx = conn
-        .transaction()
-        .context("open operator-accept audit transaction")?;
-    // Per-attempt key: the epoch-ms stamp disambiguates a retried accept
-    // (a failed attempt + its retry must NOT collide at the ledger
-    // UNIQUE) the way the per-stage `attempt_n` suffix does elsewhere.
-    let idempotency_key = format!("quote_operator_accepted:{quote_id}:{accepted_at_ms}");
-    let payload = serde_json::json!({
-        "quote_id": quote_id,
-        "tenant_id": tenant,
-        "channel": channel,
-        "note": note,
-        "operator_user_id": operator_login,
-        "accepted_at_ms": accepted_at_ms,
-        "customer_confirmation_path": customer_confirmation_path,
-        "outcome": outcome.tag(),
-        "retry_available": !outcome.is_success(),
-        "writeback_http_status": outcome.http_status(),
-        "writeback_body_excerpt": outcome.body_excerpt(),
-        "actor": operator_login,
-        "idempotency_key": idempotency_key,
-    });
-    let bytes = serde_json::to_vec(&payload).context("encode operator-accept audit payload")?;
-    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
-    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
-    aberp_audit_ledger::append_in_tx(
-        &tx,
-        &ledger_meta,
-        EventKind::QuotePricingOperatorAccepted,
-        bytes,
-        actor,
-        Some(idempotency_key),
-    )
-    .context("append QuotePricingOperatorAccepted")?;
-    tx.commit()
-        .context("commit operator-accept audit transaction")?;
-    Ok(())
-}
-
-/// S354 / PR-42 (U16) — `POST /api/quote-pricing-jobs/:quote_id/accept`.
-/// Operator marks a quote accepted on the customer's behalf (off-channel
-/// phone / e-mail / in-person acceptance). Bearer + Ready gated like its
-/// siblings. Flow: validate body → local pre-flight (state `Posted`, not
-/// already accepted) → sign an HMAC over the bound fields with the
-/// storefront Bearer secret → POST `operator_accepted` to the storefront
-/// → emit the local `quote.operator_accepted` audit (always) → 200 on a
-/// synced accept, 502 with the classified outcome when the writeback
-/// failed (the local commitment is still recorded; the operator may
-/// retry).
-async fn handle_accept_quote_pricing_job(
-    AxumPath(quote_id): AxumPath<String>,
-    headers: HeaderMap,
-    State(state): State<AppState>,
-    Json(body): Json<AcceptQuotePricingJobRequest>,
-) -> Response {
-    let operator_login = match require_ready(&state) {
-        Ok(login) => login,
-        Err(resp) => return resp,
-    };
-    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
-        return resp;
-    }
-    if !is_quote_id_shape(&quote_id) {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({"error": "invalid quote_id"})),
-        )
-            .into_response();
-    }
-
-    // Cheap body validation (no I/O) before touching the DB.
-    if !crate::operator_accept::is_valid_channel(&body.channel) {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({
-                "error": "InvalidChannel",
-                "allowed": crate::operator_accept::ACCEPT_CHANNELS,
-            })),
-        )
-            .into_response();
-    }
-    let note = body.note.trim().to_string();
-    if note.is_empty() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({"error": "EmptyNote"})),
-        )
-            .into_response();
-    }
-    if note.chars().count() > ACCEPT_NOTE_MAX {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({"error": "NoteTooLong", "max": ACCEPT_NOTE_MAX})),
-        )
-            .into_response();
-    }
-    if note.contains(['\r', '\n', '\u{0}']) {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({"error": "NoteHasControlChars"})),
-        )
-            .into_response();
-    }
-    let confirmation_path = body
-        .customer_confirmation_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    if let Some(p) = &confirmation_path {
-        if p.chars().count() > ACCEPT_PATH_MAX || p.contains(['\r', '\n', '\u{0}']) {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({"error": "InvalidConfirmationPath"})),
-            )
-                .into_response();
-        }
-    }
-
-    // 1. Local pre-flight (blocking DB).
-    let state_for_pre = state.clone();
-    let qid_pre = quote_id.clone();
-    let tenant_pre = state.tenant.as_str().to_string();
-    let precheck = match tokio::task::spawn_blocking(move || {
-        accept_quote_precheck(&state_for_pre, &qid_pre, &tenant_pre)
-    })
-    .await
-    {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => return internal_error("accept_quote_precheck", e),
-        Err(j) => {
-            return internal_error(
-                "accept_quote_precheck:join",
-                anyhow!("blocking task panicked: {j}"),
-            )
-        }
-    };
-    match precheck {
-        AcceptPrecheck::Ready => {}
-        AcceptPrecheck::NotFound => {
-            return (
-                axum::http::StatusCode::NOT_FOUND,
-                axum::Json(error_body(format!(
-                    "no pricing job found with quote_id {quote_id}"
-                ))),
-            )
-                .into_response()
-        }
-        AcceptPrecheck::NotAcceptable { state: s } => {
-            return (
-                axum::http::StatusCode::CONFLICT,
-                axum::Json(serde_json::json!({
-                    "error": "JobNotAcceptable",
-                    "state": s,
-                    "message": format!(
-                        "a row in state `{s}` cannot be operator-accepted \
-                         (acceptable only once Posted — priced and delivered \
-                         to the storefront)"
-                    ),
-                })),
-            )
-                .into_response()
-        }
-        AcceptPrecheck::AlreadyAccepted => {
-            return (
-                axum::http::StatusCode::CONFLICT,
-                axum::Json(serde_json::json!({"error": "JobAlreadyAccepted"})),
-            )
-                .into_response()
-        }
-    }
-
-    // 2. Storefront credential snapshot (the Bearer is the HMAC key).
-    let Some(cred) = state.storefront_credential.snapshot() else {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({
-                "error": "StorefrontNotConfigured",
-                "message": "No storefront credential configured — set Base URL \
-                            and paste the bearer in Settings → Quote Intake.",
-            })),
-        )
-            .into_response();
-    };
-
-    // 3. Sign + POST + classify.
-    let accepted_at_ms =
-        (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
-    let signature = crate::operator_accept::operator_accept_hmac_hex(
-        cred.bearer.as_bytes(),
-        &quote_id,
-        &body.channel,
-        accepted_at_ms,
-        &operator_login,
-    );
-    let post_body = serde_json::json!({
-        "status": "operator_accepted",
-        "channel": body.channel,
-        "note": note,
-        "operator_user_id": operator_login,
-        "accepted_at_ms": accepted_at_ms,
-        "hmac_signature": signature,
-    });
-    let outcome = post_operator_accept(&cred.base_url, &quote_id, &cred.bearer, &post_body).await;
-
-    // 4. Emit the local audit-of-record REGARDLESS of writeback success.
-    let state_for_audit = state.clone();
-    let qid_audit = quote_id.clone();
-    let channel_audit = body.channel.clone();
-    let note_audit = note.clone();
-    let op_audit = operator_login.clone();
-    let path_audit = confirmation_path.clone();
-    let outcome_audit = outcome.clone();
-    let audit_res = tokio::task::spawn_blocking(move || {
-        record_operator_accept_audit(
-            &state_for_audit,
-            &qid_audit,
-            &channel_audit,
-            &note_audit,
-            &op_audit,
-            accepted_at_ms,
-            path_audit.as_deref(),
-            &outcome_audit,
-        )
-    })
-    .await
-    .unwrap_or_else(|j| Err(anyhow!("operator-accept audit task panicked: {j}")));
-    if let Err(e) = audit_res {
-        // The accept attempt was made; failing to AUDIT it is a hard
-        // server error — never silently drop the commitment record
-        // (CLAUDE.md #12).
-        return internal_error("record_operator_accept_audit", e);
-    }
-
-    tracing::info!(
-        target: "operator_accept",
-        quote_id = %quote_id,
-        channel = %body.channel,
-        outcome = outcome.tag(),
-        "operator accept-on-behalf writeback"
-    );
-
-    if outcome.is_success() {
-        (
-            axum::http::StatusCode::OK,
-            axum::Json(AcceptQuotePricingJobResponse {
-                quote_id,
-                accepted_at_ms,
-                status: "accepted",
-                outcome: "success",
-            }),
-        )
-            .into_response()
-    } else {
-        // The local commitment is recorded; the storefront sync failed.
-        // 502 (the downstream gateway rejected/erred) carrying the typed
-        // outcome so the SPA shows the operator-actionable reason. The
-        // operator may re-attempt (the storefront state was not
-        // advanced) → `retry_available: true`.
-        (
-            axum::http::StatusCode::BAD_GATEWAY,
-            axum::Json(serde_json::json!({
-                "error": "WritebackFailed",
-                "outcome": outcome.tag(),
-                "retry_available": true,
-                "http_status": outcome.http_status(),
-                "body_excerpt": outcome.body_excerpt(),
-                "accepted_at_ms": accepted_at_ms,
-            })),
-        )
-            .into_response()
-    }
 }
 
 /// S349 / PR-40 (U1) — query params for the per-row audit page. Both

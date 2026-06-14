@@ -57,6 +57,17 @@ pub const STATE_POSTED: &str = "posted";
 /// Any stage failure lands here. Operator can retry from the SPA,
 /// which re-enqueues at `Fetched`.
 pub const STATE_FAILED: &str = "failed";
+/// S414/S414b — terminal "operator dispositioned this row out of the
+/// queue" state. The operator's Delete click flips a `Failed` row here
+/// (it does NOT hard-delete — see [`archive_failed_job_in_tx`]). Keeping
+/// the row (same `quote_id` PK) is what stops the daemon re-pulling the
+/// quote from the storefront `?status=received` listing and re-inserting
+/// it every poll cycle: `insert_fetched_job` / `insert_failed_enqueue_job`
+/// both `ON CONFLICT (quote_id) DO NOTHING`, so an archived row makes the
+/// re-enqueue a silent no-op (closes the S414b "permanent-Failed re-WARN
+/// every cycle" loop). Filtered out of the operator panel by [`list_jobs`]
+/// and never picked up by [`next_actionable_job`].
+pub const STATE_ARCHIVED: &str = "archived";
 
 /// Closed-vocab `state` value the pricing pipeline tracks for each
 /// row. Wire shape on insert + read is the lowercase string above.
@@ -76,6 +87,10 @@ pub enum JobState {
     Posted,
     /// Terminal failure (operator can retry).
     Failed,
+    /// S414/S414b — terminal, operator-dispositioned (Delete click). The
+    /// row stays in the table so the daemon's `ON CONFLICT` re-enqueue
+    /// guard keeps skipping the quote_id; hidden from the operator panel.
+    Archived,
 }
 
 /// S290 / PR-271 — closed-vocab classifier verdict that rides alongside
@@ -149,6 +164,7 @@ impl JobState {
             JobState::PostingBack => STATE_POSTING_BACK,
             JobState::Posted => STATE_POSTED,
             JobState::Failed => STATE_FAILED,
+            JobState::Archived => STATE_ARCHIVED,
         }
     }
 
@@ -167,6 +183,7 @@ impl JobState {
             STATE_POSTING_BACK => Ok(JobState::PostingBack),
             STATE_POSTED => Ok(JobState::Posted),
             STATE_FAILED => Ok(JobState::Failed),
+            STATE_ARCHIVED => Ok(JobState::Archived),
             other => Err(anyhow!("unknown quote_pricing_jobs.state: {other:?}")),
         }
     }
@@ -883,15 +900,18 @@ pub fn amend_material_grade_in_tx(
     })
 }
 
-/// S391/F — outcome of an operator delete of a Failed pricing-job row.
-/// The serve-layer handler maps each variant to an HTTP status: `Deleted`
-/// → 200, `NotFound` → 404, `NotDeletable` → 409.
+/// S391/F + S414 — outcome of an operator Delete of a Failed pricing-job
+/// row. The serve-layer handler maps each variant to an HTTP status:
+/// `Archived` → 200, `NotFound` → 404, `NotDeletable` → 409.
 #[derive(Debug, Clone)]
 pub enum DeleteJobOutcome {
-    /// Row removed. Carries the terminal failure context for the audit
-    /// payload (the row is gone, so the audit ledger is the only surviving
-    /// record of why it had failed).
-    Deleted {
+    /// S414 — row flipped to `archived` (NOT hard-deleted). Carries the
+    /// terminal failure context for the audit payload. Archiving rather
+    /// than DELETEing keeps the `quote_id` row present so the daemon's
+    /// `ON CONFLICT` re-enqueue guard keeps skipping the quote_id instead
+    /// of re-pulling + re-inserting it (and re-`warn!`-ing) every poll
+    /// cycle — see [`STATE_ARCHIVED`].
+    Archived {
         attempt_n: u32,
         error_stage: Option<String>,
         error_reason: Option<String>,
@@ -901,28 +921,40 @@ pub enum DeleteJobOutcome {
     NotFound,
     /// Row exists but its current state is not `Failed` — 409. Carries the
     /// offending state so the operator copy can name it. Conservative: an
-    /// in-flight (or Posted) row is never deleted out from under the
+    /// in-flight (or Posted) row is never archived out from under the
     /// daemon.
     NotDeletable { state: JobState },
 }
 
-/// S391/F — operator delete of a permanently-Failed pricing-job row, the
-/// tx-owned core. State-guarded: reads the row's current state + terminal
-/// failure context inside the caller's transaction (one consistent
-/// snapshot — no TOCTOU against a concurrent daemon transition), refuses
-/// (without mutating) when the state is not [`JobState::Failed`], otherwise
-/// DELETEs the row and returns its prior `attempt_n` + error columns for
-/// the audit payload.
+/// S391/F + S414 — operator Delete of a permanently-Failed pricing-job
+/// row, the tx-owned core. State-guarded: reads the row's current state +
+/// terminal failure context inside the caller's transaction (one
+/// consistent snapshot — no TOCTOU against a concurrent daemon
+/// transition), refuses (without mutating) when the state is not
+/// [`JobState::Failed`], otherwise flips the row to [`STATE_ARCHIVED`]
+/// (S414 — soft-delete, NOT a hard DELETE) and returns its `attempt_n` +
+/// error columns for the audit payload.
+///
+/// **Why archive, not DELETE (S414/S414b):** a hard DELETE removed the
+/// `quote_id` row, so on the next 60-90s poll the daemon re-pulled the
+/// quote from the storefront `?status=received` listing, re-inserted it
+/// (no PK conflict — the row was gone), and `warn!`-ed the
+/// "no CAD file ... operator Retry required" line again. The phantom row
+/// "crept back" on refresh and re-WARNed every cycle. Keeping the row as
+/// `archived` makes `insert_fetched_job` / `insert_failed_enqueue_job`'s
+/// `ON CONFLICT (quote_id) DO NOTHING` a no-op, so the re-enqueue is
+/// silent and the panel stays clear — one-click final disposition.
 ///
 /// **Does NOT commit** — the serve-layer caller appends the
 /// `quote.pricing_failure_deleted` audit row in the SAME transaction and
-/// commits both together (the deletion and its audit-of-record are
+/// commits both together (the archive and its audit-of-record are
 /// atomic). Tenant-scoped like every other writer. Caller guarantees
 /// [`ensure_schema`] has run.
 pub fn delete_failed_job_in_tx(
     tx: &duckdb::Transaction<'_>,
     quote_id: &str,
     tenant_id: &str,
+    now: OffsetDateTime,
 ) -> Result<DeleteJobOutcome> {
     let current: Option<(String, i64, Option<String>, Option<String>, Option<String>)> = {
         let mut stmt = tx
@@ -953,12 +985,23 @@ pub fn delete_failed_job_in_tx(
     if state != JobState::Failed {
         return Ok(DeleteJobOutcome::NotDeletable { state });
     }
+    // S414 — soft-delete: flip `failed` → `archived` rather than DELETE, so
+    // the `quote_id` row survives and the daemon's `ON CONFLICT` re-enqueue
+    // guard keeps skipping it (no re-pull, no re-`warn!`). The `state =
+    // 'failed'` predicate makes this a real value change (never a no-op
+    // UPDATE-to-same-value — the S286 DuckDB-FATAL class is avoided), and
+    // the (tenant_id, state) secondary index was dropped in S286 so the
+    // UPDATE-on-`state` is index-safe.
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format archived_at")?;
     tx.execute(
-        "DELETE FROM quote_pricing_jobs WHERE quote_id = ? AND tenant_id = ? AND state = ?",
-        params![quote_id, tenant_id, STATE_FAILED],
+        "UPDATE quote_pricing_jobs SET state = ?, updated_at = ?
+            WHERE quote_id = ? AND tenant_id = ? AND state = ?",
+        params![STATE_ARCHIVED, ts, quote_id, tenant_id, STATE_FAILED],
     )
-    .context("delete_failed_job DELETE")?;
-    Ok(DeleteJobOutcome::Deleted {
+    .context("archive_failed_job UPDATE")?;
+    Ok(DeleteJobOutcome::Archived {
         attempt_n: attempt_n.max(0) as u32,
         error_stage,
         error_reason,
@@ -994,12 +1037,16 @@ pub fn list_jobs(conn: &Connection, tenant_id: &str) -> Result<Vec<PricingJobRow
             // S401 — customer_company appended LAST (ordinal 15) so every
             // existing column ordinal stays put; the read below picks it up
             // at .get(15).
+            // S414 — `archived` rows are operator-dispositioned terminal
+            // rows kept only to anchor the daemon's `ON CONFLICT`
+            // re-enqueue guard; they are excluded from the operator panel.
             "SELECT quote_id, tenant_id, state, fetched_at, updated_at,
                     customer_email, customer_name, material_grade, quantity,
                     feature_graph_hash, total_price_eur, error_stage, error_reason,
                     attempt_n, failure_kind, customer_company
                 FROM quote_pricing_jobs
                 WHERE tenant_id = ?
+                  AND state != 'archived'
                 ORDER BY fetched_at DESC",
         )
         .context("prepare list_jobs")?;
@@ -2668,5 +2715,127 @@ mod tests {
             .expect("query")
             .expect("row");
         assert_eq!(d.row.material_grade, "unknown", "T's row untouched");
+    }
+
+    /// S414/S414b — operator Delete of a Failed row ARCHIVES it (does not
+    /// hard-delete), so: (a) it drops out of the operator panel
+    /// (`list_jobs`), (b) the row survives in the table as `archived`, and
+    /// (c) a subsequent daemon re-enqueue of the SAME quote_id is a silent
+    /// `ON CONFLICT` no-op — the regression test for the "phantom CAD-less
+    /// quote re-WARNs every poll cycle" loop. A hard DELETE would have let
+    /// `insert_failed_enqueue_job` return `true` again, re-`warn!`-ing.
+    #[test]
+    fn s414_delete_archives_failed_row_and_blocks_re_enqueue() {
+        let mut conn = open_mem();
+        // Permanent-Failed enqueue row (the S379 no-CAD shape).
+        assert!(insert_failed_enqueue_job(
+            &conn,
+            "qzz",
+            "T",
+            "z@x",
+            "Zoe",
+            "",
+            "AL_6061_T6",
+            1,
+            "enqueue",
+            "no CAD file on listing",
+            FailureKind::Permanent,
+            fixed_ts(),
+        )
+        .expect("insert failed"));
+        assert_eq!(list_jobs(&conn, "T").expect("list").len(), 1);
+
+        // Operator Delete → archive (tx-owned core).
+        let tx = conn.transaction().expect("tx");
+        let outcome = delete_failed_job_in_tx(&tx, "qzz", "T", fixed_ts()).expect("archive");
+        assert!(matches!(outcome, DeleteJobOutcome::Archived { .. }));
+        tx.commit().expect("commit");
+
+        // (a) gone from the operator panel.
+        assert!(
+            list_jobs(&conn, "T").expect("list2").is_empty(),
+            "archived row must not appear in the operator panel"
+        );
+        // (b) row survives as `archived`.
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM quote_pricing_jobs WHERE quote_id = 'qzz'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row still present");
+        assert_eq!(state, STATE_ARCHIVED);
+        // (c) the daemon's next-cycle re-enqueue of the same quote_id is a
+        // silent no-op — NO re-`warn!`, NO crept-back row.
+        let re_enqueued = insert_failed_enqueue_job(
+            &conn,
+            "qzz",
+            "T",
+            "z@x",
+            "Zoe",
+            "",
+            "AL_6061_T6",
+            1,
+            "enqueue",
+            "no CAD file on listing",
+            FailureKind::Permanent,
+            fixed_ts(),
+        )
+        .expect("re-enqueue");
+        assert!(
+            !re_enqueued,
+            "ON CONFLICT must skip the archived row (no re-WARN loop)"
+        );
+        // Still archived (not flipped back to failed by the no-op insert).
+        let state2: String = conn
+            .query_row(
+                "SELECT state FROM quote_pricing_jobs WHERE quote_id = 'qzz'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("row still present");
+        assert_eq!(state2, STATE_ARCHIVED);
+    }
+
+    /// S414 — the archive is state-guarded exactly like the old delete:
+    /// 409 (`NotDeletable`) for a non-Failed row, 404 (`NotFound`) for an
+    /// absent one. An in-flight / Posted row is never archived out from
+    /// under the daemon.
+    #[test]
+    fn s414_delete_refuses_non_failed_and_missing() {
+        let mut conn = open_mem();
+        insert_fetched_job(
+            &conn,
+            "qf",
+            "T",
+            "f@x",
+            "Fred",
+            "",
+            "AL_6061_T6",
+            1,
+            "p.stl",
+            "/tmp/p.stl",
+            fixed_ts(),
+        )
+        .expect("insert");
+
+        let tx = conn.transaction().expect("tx");
+        // Fetched row → NotDeletable, no mutation.
+        let outcome = delete_failed_job_in_tx(&tx, "qf", "T", fixed_ts()).expect("guarded");
+        assert!(matches!(
+            outcome,
+            DeleteJobOutcome::NotDeletable {
+                state: JobState::Fetched
+            }
+        ));
+        // Absent quote → NotFound.
+        let missing = delete_failed_job_in_tx(&tx, "nope", "T", fixed_ts()).expect("missing");
+        assert!(matches!(missing, DeleteJobOutcome::NotFound));
+        tx.commit().expect("commit");
+
+        // The Fetched row is untouched (still visible + still Fetched).
+        let rows = list_jobs(&conn, "T").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, JobState::Fetched);
     }
 }

@@ -407,8 +407,6 @@ pub fn run() {
             commands::delete_quote_pricing_job,
             // S350 / PR-39 (U5) — operator material-grade override.
             commands::edit_quote_pricing_job_material,
-            // S354 / PR-42 (U16) — operator accept-on-behalf.
-            commands::accept_quote_pricing_job,
             // S282 / PR-267 — pricing-pipeline daemon status. Drives
             // the empty-state copy on `PricingJobsList` (active vs
             // RED venv-missing vs AMBER spawn-errored).

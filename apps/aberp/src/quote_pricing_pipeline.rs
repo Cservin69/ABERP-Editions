@@ -597,8 +597,10 @@ impl PricingPipelineService {
             JobState::Rendering => self.advance_render(row).await,
             JobState::PostingBack => self.advance_post(row).await,
             // Terminal states should never appear from
-            // next_actionable_job; if they do something is wrong.
-            JobState::Posted | JobState::Failed => Ok(StepOutcome::Advanced),
+            // next_actionable_job (it filters to the in-flight states, and
+            // S414's `archived` is excluded there too); if one does,
+            // treat it as a no-op advance rather than panicking.
+            JobState::Posted | JobState::Failed | JobState::Archived => Ok(StepOutcome::Advanced),
         }
     }
 

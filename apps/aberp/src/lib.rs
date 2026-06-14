@@ -116,9 +116,6 @@ pub mod quote_stock_alert;
 // this table tracks `received → quoted` storefront-side state-flips
 // the ABERP-driven pricing daemon walks rows through.
 pub mod quote_pricing_jobs;
-// S354 / PR-42 (U16) — operator accept-on-behalf crypto + channel
-// validation (pure, no I/O). Backs `POST /api/quote-pricing-jobs/:id/accept`.
-pub mod operator_accept;
 // S279 / PR-265 — orchestration glue around the three crates
 // (`aberp-cad-extract-wrapper` extract / `aberp-quote-engine` price /
 // `aberp-quote-pdf` render) + the storefront priced-writeback POST.
