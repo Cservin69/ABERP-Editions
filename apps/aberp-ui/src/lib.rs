@@ -423,6 +423,10 @@ pub fn run() {
             // CAS; EVE addendum 2 (REFRESH ack) + addendum 3 (BIG/RED
             // single-use DEAL token) gates enforced server-side.
             commands::quote_intake_deal,
+            // S403 — operator REFUSE-with-reason (the DEAL step's
+            // negative counterpart). Validated + audited + customer-
+            // notified server-side.
+            commands::quote_intake_refuse,
             // S225 / PR-221 — financial-statistics dashboard endpoint.
             commands::get_financial_report,
             // S235 / PR-231 — Workshop / Műhely operator dashboard.

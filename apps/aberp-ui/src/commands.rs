@@ -1480,6 +1480,24 @@ pub async fn quote_intake_deal(
     forward_post(&state, &path, body).await
 }
 
+/// S403 — operator REFUSE-with-reason. `POST
+/// /api/quote-intake/:quote_id/refuse { reason }`. Flips the intake row
+/// to `refused`, audits, queues the bilingual customer e-mail, and
+/// best-effort writes back the storefront `rejected` status. 400 on a
+/// missing / short reason (`invalid_reason`); 404 `not_staged`; 409
+/// `not_actionable` / `deal_already_issued`. The SPA modal validates the
+/// reason too, but this command is the server-side gate per
+/// [[trust-code-not-operator]].
+#[tauri::command]
+pub async fn quote_intake_refuse(
+    state: State<'_, AppState>,
+    quote_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-intake/{quote_id}/refuse");
+    forward_post(&state, &path, body).await
+}
+
 /// S180 / PR-180 — operator-clicked NAV-as-DR restore wizard.
 /// `POST /api/restore-from-nav-outgoing { year }`. Synchronous (walks
 /// 12 months × pagination against NAV); the SPA gates the click on

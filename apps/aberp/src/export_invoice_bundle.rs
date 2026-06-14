@@ -874,6 +874,9 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // S354 / PR-42 — operator accept-on-behalf. App-layer JSON
         // payload (channel / note / outcome tag), never NAV XML bytes.
         | EventKind::QuotePricingOperatorAccepted
+        // S403 — operator REFUSE-with-reason. App-layer JSON payload
+        // (quote_id / reason / operator_user_id), never NAV XML bytes.
+        | EventKind::QuoteOperatorRefused
         // S355 / PR-43 — personnel.* access-trail family (ADR-0073).
         // Defense-grade identity / signature / access-decision rows; app-layer
         // JSON payloads, never NAV XML bytes. `personnel.*`-not-`invoice.*`
@@ -958,7 +961,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 105,
+        EventKind::ALL_KINDS_COUNT == 106,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

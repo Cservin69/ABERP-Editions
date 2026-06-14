@@ -99,6 +99,13 @@ pub mod quote_pickup;
 // Enforces EVE addendum 2 (REFRESH-typed ack when `stock_alert`) and
 // addendum 3 (BIG/RED/single-use DEAL token, validated server-side).
 pub mod quote_deal;
+// S403 — operator REFUSE-with-reason saga (the DEAL step's negative
+// counterpart). CAS-flips the intake row to `refused`, audits
+// `quote.operator_refused`, and atomically queues the bilingual customer
+// notification e-mail. No draft invoice is staged. The route layer
+// (`serve.rs`) validates the reason + best-effort writes back the
+// storefront `rejected` status.
+pub mod quote_refuse;
 // S271 / PR-260 — pure `stock_alert` recompute (EVE addendum 2). Used by
 // the SPA Quotes list route to mark accepted quotes whose material has
 // downgraded since acceptance. Sticky: only operator REFRESH (S272+)

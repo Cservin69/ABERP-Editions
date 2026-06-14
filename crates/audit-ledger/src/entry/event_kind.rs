@@ -1837,6 +1837,29 @@ pub enum EventKind {
     /// F12 four-edit ritual fires once.
     QuotePricingOperatorAccepted,
 
+    /// S403 — operator REFUSE-with-reason. The audit-of-record for an
+    /// operator declining to fulfil an accepted auto-quote (the DEAL
+    /// step's negative counterpart: when stock / production capacity
+    /// can't satisfy the order). Distinct from `QuoteDealIssued` (the
+    /// positive path) and from the customer-owned typed-ACCEPT. Refusing
+    /// flips the local `quote_intake_log.intake_state` to `refused`
+    /// (CAS-guarded, single-use), queues the bilingual customer
+    /// notification e-mail in the same tx (atomic per
+    /// [[hulye-biztos]]), and best-effort writes back the storefront
+    /// `rejected` status. NO draft invoice is staged or issued.
+    ///
+    /// Carries `quote_id`, `tenant_id`, `reason` (operator free text,
+    /// ≥5 chars, validated server-side per [[trust-code-not-operator]]),
+    /// `operator_user_id` (the Bearer-subject operator who refused),
+    /// `refused_at` (RFC3339), `customer_email_present` (bool — whether
+    /// a recipient resolved for the notification e-mail; logged loud so
+    /// a missing address surfaces per CLAUDE.md #12), `actor`,
+    /// `idempotency_key` (`quote_operator_refused:<quote_id>`).
+    ///
+    /// `quote.*` prefix family. Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuoteOperatorRefused,
+
     /// S307 / PR-276 — one entry per email-outbox poll cycle. Fires
     /// once per successful `GET /api/internal/email-queue` against the
     /// storefront, regardless of whether the cycle returned 0 entries
@@ -2531,6 +2554,7 @@ impl EventKind {
             EventKind::QuotePricingMaterialEdited => "quote.material_grade_edited",
             EventKind::QuotePricingFailureDeleted => "quote.pricing_failure_deleted",
             EventKind::QuotePricingOperatorAccepted => "quote.operator_accepted",
+            EventKind::QuoteOperatorRefused => "quote.operator_refused",
             EventKind::QuotePollOutcome => "quote.poll_outcome",
             EventKind::EmailOutboxFetched => "quote.email_outbox_fetched",
             EventKind::EmailOutboxClaimed => "quote.email_outbox_claimed",
@@ -2665,6 +2689,7 @@ impl EventKind {
             "quote.material_grade_edited" => Ok(EventKind::QuotePricingMaterialEdited),
             "quote.pricing_failure_deleted" => Ok(EventKind::QuotePricingFailureDeleted),
             "quote.operator_accepted" => Ok(EventKind::QuotePricingOperatorAccepted),
+            "quote.operator_refused" => Ok(EventKind::QuoteOperatorRefused),
             "quote.poll_outcome" => Ok(EventKind::QuotePollOutcome),
             "quote.email_outbox_fetched" => Ok(EventKind::EmailOutboxFetched),
             "quote.email_outbox_claimed" => Ok(EventKind::EmailOutboxClaimed),
@@ -2787,6 +2812,7 @@ impl EventKind {
         EventKind::QuotePricingMaterialEdited,
         EventKind::QuotePricingFailureDeleted,
         EventKind::QuotePricingOperatorAccepted,
+        EventKind::QuoteOperatorRefused,
         EventKind::QuotePollOutcome,
         EventKind::EmailOutboxFetched,
         EventKind::EmailOutboxClaimed,
@@ -2918,6 +2944,7 @@ mod tests {
             EventKind::QuotePricingMaterialEdited,
             EventKind::QuotePricingFailureDeleted,
             EventKind::QuotePricingOperatorAccepted,
+            EventKind::QuoteOperatorRefused,
             EventKind::EmailOutboxFetched,
             EventKind::EmailOutboxClaimed,
             EventKind::EmailOutboxSent,
@@ -2975,7 +3002,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            105,
+            106,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -5023,6 +5050,40 @@ mod tests {
             EventKind::QuotePricingMaterialEdited,
             EventKind::QuotePricedWritebackOutcome,
             EventKind::QuotePollOutcome,
+        ] {
+            assert_ne!(
+                s,
+                sibling.as_str(),
+                "{s} collides with {}",
+                sibling.as_str()
+            );
+        }
+    }
+
+    /// S403 — operator REFUSE-with-reason. Storage string is
+    /// `quote.operator_refused`, the negative counterpart to
+    /// `quote.operator_accepted`. A collision with the accept kind or any
+    /// `quote.deal_*` kind would mis-route the refusal (hiding WHY an
+    /// accepted order was turned down), so pin distinctness explicitly.
+    #[test]
+    fn s403_operator_refused_kind_round_trips_and_is_distinct() {
+        let k = EventKind::QuoteOperatorRefused;
+        let s = k.as_str();
+        assert_eq!(s, "quote.operator_refused");
+        assert!(s.starts_with("quote."), "{s} must start with quote.");
+        assert!(
+            !s.starts_with("invoice."),
+            "{s} must not start with invoice."
+        );
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+        for sibling in [
+            EventKind::QuotePricingOperatorAccepted,
+            EventKind::QuoteDealIssued,
+            EventKind::QuotePricingFailed,
         ] {
             assert_ne!(
                 s,

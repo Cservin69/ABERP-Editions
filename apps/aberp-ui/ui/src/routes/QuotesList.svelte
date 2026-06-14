@@ -25,10 +25,13 @@
     listQuoteIntake,
     markQuoteIntakeIrrelevant,
     pickupQuoteAsDraft,
+    refuseQuote,
+    RefuseQuoteError,
     retryParseQuoteIntake,
     type QuoteIntakeRow,
   } from "../lib/api";
   import { formatInvoiceDate } from "../lib/format";
+  import { validateRefuseReason } from "../lib/refuse-reason";
   import QuoteDealGate from "./QuoteDealGate.svelte";
 
   type LoadState = "idle" | "loading" | "ready" | "error";
@@ -49,6 +52,15 @@
   // QuoteDealGate component owns its own toast surface).
   let dealBusyQuoteId = $state<string | null>(null);
   let dealErrors = $state<Record<string, { code: string; message: string } | null>>({});
+  // S403 — operator REFUSE-with-reason modal state. `refuseTarget` is the
+  // quote_id being refused (null = modal closed); one page-level modal
+  // serves every row. `refuseValidation` is the inline (client) gate;
+  // `refuseError` is the server's rejection.
+  let refuseTarget = $state<string | null>(null);
+  let refuseReason = $state("");
+  let refuseBusy = $state(false);
+  let refuseValidation = $state<string | null>(null);
+  let refuseError = $state<string | null>(null);
 
   onMount(() => {
     void refresh();
@@ -169,6 +181,52 @@
       dealErrors = { ...dealErrors, [row.quote_id]: err };
     } finally {
       dealBusyQuoteId = null;
+    }
+  }
+
+  // S403 — open / close the refuse modal. Opening resets the prior
+  // reason + error so a second row's modal never shows the first's text.
+  function openRefuse(quoteId: string): void {
+    refuseTarget = quoteId;
+    refuseReason = "";
+    refuseValidation = null;
+    refuseError = null;
+  }
+
+  function closeRefuse(): void {
+    refuseTarget = null;
+    refuseReason = "";
+    refuseValidation = null;
+    refuseError = null;
+  }
+
+  // S403 — submit the refusal. Client-validates the reason first (the
+  // server re-validates per [[trust-code-not-operator]]); on 200 the row
+  // flips to `refused` server-side and drops out of the actionable queue
+  // on refresh.
+  async function submitRefuse(): Promise<void> {
+    if (refuseTarget === null) return;
+    const validation = validateRefuseReason(refuseReason);
+    if (validation !== null) {
+      refuseValidation = validation;
+      return;
+    }
+    refuseBusy = true;
+    refuseValidation = null;
+    refuseError = null;
+    try {
+      await refuseQuote(refuseTarget, { reason: refuseReason.trim() });
+      closeRefuse();
+      await refresh();
+    } catch (e) {
+      refuseError =
+        e instanceof RefuseQuoteError
+          ? e.message
+          : e instanceof Error
+            ? e.message
+            : String(e);
+    } finally {
+      refuseBusy = false;
     }
   }
 
@@ -522,6 +580,18 @@
                   error={dealErrors[row.quote_id] ?? null}
                   onSubmit={(payload) => void submitDeal(row, payload)}
                 />
+                <!-- S403 — DEAL's negative counterpart. Operator can't
+                     fulfil (stock / capacity) → refuse with a reason; the
+                     customer is e-mailed + the portal shows "Refused". -->
+                <button
+                  type="button"
+                  class="quotes-row__refuse"
+                  data-testid="quotes-row-refuse-btn"
+                  onclick={() => openRefuse(row.quote_id)}
+                  title="Decline this order with a reason — notifies the customer (S403)"
+                >
+                  Visszautasítás / Refuse
+                </button>
               {:else}
                 <button
                   type="button"
@@ -547,12 +617,91 @@
                   error={dealErrors[row.quote_id] ?? null}
                   onSubmit={(payload) => void submitDeal(row, payload)}
                 />
+                <!-- S403 — DEAL's negative counterpart. Operator can't
+                     fulfil (stock / capacity) → refuse with a reason; the
+                     customer is e-mailed + the portal shows "Refused". -->
+                <button
+                  type="button"
+                  class="quotes-row__refuse"
+                  data-testid="quotes-row-refuse-btn"
+                  onclick={() => openRefuse(row.quote_id)}
+                  title="Decline this order with a reason — notifies the customer (S403)"
+                >
+                  Visszautasítás / Refuse
+                </button>
               {/if}
             </td>
           </tr>
         {/each}
       </tbody>
     </table>
+  {/if}
+
+  <!-- S403 — operator REFUSE-with-reason modal. One page-level instance
+       serves every row (keyed by `refuseTarget`). Required reason field
+       (≥5 chars, client-validated + server-enforced); on submit the
+       quote is refused, the customer e-mailed, and the storefront
+       `rejected` status written back. [[spa-dark-theme-default]]. -->
+  {#if refuseTarget !== null}
+    <div class="refuse-modal__backdrop">
+      <div
+        class="refuse-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="refuse-modal-title"
+        data-testid="refuse-modal"
+      >
+        <h3 class="refuse-modal__title" id="refuse-modal-title">
+          Ajánlat visszautasítása / Refuse quote
+        </h3>
+        <p class="refuse-modal__hint">
+          Az ügyfél e-mailben értesül az indokról. Számla NEM készül.
+          / The customer is e-mailed the reason. No invoice is created.
+        </p>
+        <label class="refuse-modal__label" for="refuse-reason">
+          Indok / Reason
+        </label>
+        <textarea
+          id="refuse-reason"
+          class="refuse-modal__textarea"
+          data-testid="refuse-reason-input"
+          rows="4"
+          bind:value={refuseReason}
+          disabled={refuseBusy}
+          placeholder="Pl. anyaghiány, kapacitáshiány… / e.g. out of stock, no capacity…"
+        ></textarea>
+        {#if refuseValidation !== null}
+          <p class="refuse-modal__validation" role="alert" data-testid="refuse-validation">
+            {refuseValidation}
+          </p>
+        {/if}
+        {#if refuseError !== null}
+          <p class="refuse-modal__error" role="alert" data-testid="refuse-error">
+            {refuseError}
+          </p>
+        {/if}
+        <div class="refuse-modal__actions">
+          <button
+            type="button"
+            class="refuse-modal__cancel"
+            data-testid="refuse-cancel-btn"
+            disabled={refuseBusy}
+            onclick={closeRefuse}
+          >
+            Mégse / Cancel
+          </button>
+          <button
+            type="button"
+            class="refuse-modal__submit"
+            data-testid="refuse-submit-btn"
+            disabled={refuseBusy}
+            onclick={() => void submitRefuse()}
+          >
+            {refuseBusy ? "Küldés… / Sending…" : "Visszautasítás / Refuse"}
+          </button>
+        </div>
+      </div>
+    </div>
   {/if}
 </section>
 
@@ -945,5 +1094,141 @@
     background: var(--color-surface-raised);
     padding: 1px 6px;
     border-radius: 2px;
+  }
+
+  /* S403 — REFUSE affordance. Sits next to the DEAL gate as its negative
+   * counterpart, so it reads in the RED signal colour (the decline
+   * action) but stays quiet until hovered — DEAL is the primary path. */
+  .quotes-row__refuse {
+    margin-top: var(--space-1);
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    transition: color var(--motion-fade-in);
+  }
+
+  .quotes-row__refuse:hover {
+    color: var(--color-signal-negative);
+    border-color: var(--color-signal-negative);
+  }
+
+  /* S403 — refuse modal. Centred dialog over a dimmed backdrop; all
+   * colours resolve to dark-theme tokens ([[spa-dark-theme-default]]). */
+  .refuse-modal__backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: var(--space-3);
+  }
+
+  .refuse-modal {
+    width: 100%;
+    max-width: 32rem;
+    background: var(--color-surface-sunken);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    padding: var(--space-4);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  }
+
+  .refuse-modal__title {
+    margin: 0 0 var(--space-1);
+    font-size: var(--type-size-md);
+    font-weight: 600;
+    color: var(--color-text-strong);
+  }
+
+  .refuse-modal__hint {
+    margin: 0 0 var(--space-3);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-muted);
+  }
+
+  .refuse-modal__label {
+    display: block;
+    margin-bottom: var(--space-1);
+    font-size: var(--type-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-text-muted);
+  }
+
+  .refuse-modal__textarea {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    padding: var(--space-2);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    color: var(--color-text-primary);
+    border-radius: 3px;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+  }
+
+  .refuse-modal__textarea:focus {
+    outline: none;
+    border-color: var(--color-text-secondary);
+  }
+
+  .refuse-modal__validation,
+  .refuse-modal__error {
+    margin: var(--space-2) 0 0;
+    font-size: var(--type-size-sm);
+    color: var(--color-signal-negative);
+  }
+
+  .refuse-modal__actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+  }
+
+  .refuse-modal__cancel {
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+  }
+
+  .refuse-modal__cancel:hover:not(:disabled) {
+    color: var(--color-text-strong);
+  }
+
+  .refuse-modal__submit {
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--color-signal-negative);
+    background: var(--color-surface-raised);
+    color: var(--color-signal-negative);
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+    font-weight: 600;
+  }
+
+  .refuse-modal__submit:hover:not(:disabled) {
+    background: var(--color-signal-negative);
+    color: var(--color-surface-sunken);
+  }
+
+  .refuse-modal__cancel:disabled,
+  .refuse-modal__submit:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 </style>

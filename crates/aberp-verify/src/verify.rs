@@ -1005,6 +1005,10 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // payload (quote_id / channel / note / operator_user_id /
         // outcome tag), never NAV XML bytes. Exhaustiveness arm only.
         | EventKind::QuotePricingOperatorAccepted
+        // S403 — operator REFUSE-with-reason. App-layer JSON payload
+        // (quote_id / reason / operator_user_id / refused_at), never
+        // NAV XML bytes. Exhaustiveness arm only.
+        | EventKind::QuoteOperatorRefused
         // S355 / PR-43 — personnel.* access-trail family (ADR-0073).
         // Defense-grade identity / signature / access-decision rows;
         // app-layer JSON payloads (operator_id / resource_kind /
@@ -1087,7 +1091,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 105,
+        EventKind::ALL_KINDS_COUNT == 106,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

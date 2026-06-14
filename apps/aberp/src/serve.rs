@@ -3390,6 +3390,16 @@ fn build_router(state: AppState) -> Router {
         // token (first 8 chars of quote_id). Replay → 409
         // `deal_already_issued`.
         .route("/api/quote-intake/:quote_id/deal", post(handle_deal_saga))
+        // S403 — operator REFUSE-with-reason. The DEAL step's negative
+        // counterpart: when stock / capacity can't satisfy an accepted
+        // auto-quote, the operator refuses with a reason. POST flips the
+        // intake row to `refused`, audits `quote.operator_refused`,
+        // queues the bilingual customer e-mail (same tx), and best-effort
+        // writes back the storefront `rejected` status. NO draft invoice.
+        .route(
+            "/api/quote-intake/:quote_id/refuse",
+            post(handle_refuse_quote),
+        )
         // S281 / PR-266 — storefront email-relay (ADR-0007). The
         // storefront POSTs `/api/internal/send-email` with the
         // dedicated email-relay bearer; ABERP validates + persists +
@@ -19325,6 +19335,219 @@ pub fn run_deal_saga_request(
     )
 }
 
+// ── S403 — operator REFUSE-with-reason route ─────────────────────────
+
+/// Inbound JSON body for `POST /api/quote-intake/:quote_id/refuse`. The
+/// SPA submits the operator's free-text `reason`. Validated server-side
+/// (≥5 chars after trim, ≤2000, no control chars) per
+/// [[trust-code-not-operator]] — the SPA modal also validates, but the
+/// route is the source of truth and 400s a missing / short / unsafe
+/// reason regardless of what the SPA sent.
+#[derive(Debug, serde::Deserialize)]
+struct RefuseQuoteRequest {
+    reason: String,
+}
+
+/// Upper bound on the reason text. Matches the storefront's `notes` cap
+/// so the `rejected`-status writeback never exceeds what the portal
+/// accepts.
+const REFUSE_REASON_MAX_CHARS: usize = 2000;
+
+/// Validate + normalize the operator reason. Returns the trimmed reason
+/// on success, or an operator-readable rejection message. Control chars
+/// (incl. CR/LF/NUL) are refused so the reason is safe both as the
+/// storefront `notes` (which rejects header-injection bytes) and as an
+/// e-mail subject/body line. Pure — unit-tested.
+fn validate_refuse_reason(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let n = trimmed.chars().count();
+    if n < crate::quote_refuse::REASON_MIN_CHARS {
+        return Err(format!(
+            "a refusal reason of at least {} characters is required",
+            crate::quote_refuse::REASON_MIN_CHARS
+        ));
+    }
+    if n > REFUSE_REASON_MAX_CHARS {
+        return Err(format!(
+            "refusal reason too long (max {REFUSE_REASON_MAX_CHARS} characters)"
+        ));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("refusal reason must be a single line (no control characters)".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// `POST /api/quote-intake/:quote_id/refuse` — operator declines to
+/// fulfil an accepted auto-quote. Validates the reason, runs the refuse
+/// saga (state flip + audit + customer e-mail, atomic) in a blocking
+/// task, then best-effort writes the storefront `rejected` status so the
+/// customer portal reflects the refusal. Returns 200 even when the
+/// storefront sync fails — the local refusal + customer e-mail are the
+/// committed source of truth; `storefront_synced` surfaces the sync
+/// result loud per CLAUDE.md #12.
+async fn handle_refuse_quote(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(quote_id): AxumPath<String>,
+    Json(body): Json<RefuseQuoteRequest>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+
+    let reason = match validate_refuse_reason(&body.reason) {
+        Ok(r) => r,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(DealSagaErrorBody {
+                    code: "invalid_reason",
+                    message: msg,
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let state_for_task = state.clone();
+    let quote_id_for_task = quote_id.clone();
+    let reason_for_task = reason.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        run_refuse_saga_request(
+            &state_for_task,
+            &operator_login,
+            &quote_id_for_task,
+            reason_for_task,
+        )
+    })
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "run_refuse_saga_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
+    };
+
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            if let Some(refuse) = e.downcast_ref::<crate::quote_refuse::RefuseError>() {
+                use crate::quote_refuse::RefuseError;
+                let (status, msg) = match refuse {
+                    RefuseError::NotStaged { .. } => (
+                        StatusCode::NOT_FOUND,
+                        format!("quote {quote_id} not staged"),
+                    ),
+                    RefuseError::NotActionable { state: s, .. } => (
+                        StatusCode::CONFLICT,
+                        format!(
+                            "quote {quote_id} intake_state is {s:?}; only staged rows can be refused"
+                        ),
+                    ),
+                    RefuseError::AlreadyDealt { .. } => (
+                        StatusCode::CONFLICT,
+                        format!("quote {quote_id} has already been dealt and cannot be refused"),
+                    ),
+                };
+                return (
+                    status,
+                    Json(DealSagaErrorBody {
+                        code: refuse.machine_code(),
+                        message: msg,
+                    }),
+                )
+                    .into_response();
+            }
+            return internal_error("run_refuse_saga_request", e);
+        }
+    };
+
+    // Best-effort storefront writeback of the `rejected` status + reason
+    // so the customer portal (/q/{id}) reflects the refusal. The local
+    // refusal + customer e-mail are already committed; a failed sync is
+    // surfaced (not fatal) so the operator/daemon can reconcile.
+    let storefront_synced = match state.storefront_credential.snapshot() {
+        Some(cred) => {
+            // `post_operator_accept` is the body-agnostic POST to the
+            // storefront `/status` endpoint (it just classifies the
+            // response); here we send the `rejected` status + reason.
+            let post_body = serde_json::json!({
+                "status": "rejected",
+                "notes": reason,
+            });
+            let wb =
+                post_operator_accept(&cred.base_url, &quote_id, &cred.bearer, &post_body).await;
+            if !wb.is_success() {
+                tracing::warn!(
+                    target: "quote_refuse",
+                    quote_id = %quote_id,
+                    outcome = wb.tag(),
+                    "refuse: storefront `rejected` writeback failed (local refusal + e-mail committed)"
+                );
+            }
+            wb.is_success()
+        }
+        None => {
+            tracing::warn!(
+                target: "quote_refuse",
+                quote_id = %quote_id,
+                "refuse: no storefront credential — portal status not updated (e-mail still queued)"
+            );
+            false
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "refused_at": outcome.refused_at,
+            "customer_email_notified": outcome.email_queued,
+            "storefront_synced": storefront_synced,
+        })),
+    )
+        .into_response()
+}
+
+/// Sync wrapper invoked inside the blocking task: opens the DuckDB
+/// connection, builds the ledger meta + actor, and runs the refuse saga.
+/// Surfaces the saga's typed [`crate::quote_refuse::RefuseError`] (boxed
+/// inside the `anyhow::Error`) so the HTTP layer can downcast.
+pub fn run_refuse_saga_request(
+    state: &AppState,
+    operator_login: &str,
+    quote_id: &str,
+    reason: String,
+) -> Result<crate::quote_refuse::RefuseOutcome> {
+    let mut conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("binary hash unavailable")?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let ledger_actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+
+    crate::quote_refuse::run_refuse_saga(
+        &mut conn,
+        &ledger_meta,
+        ledger_actor,
+        crate::quote_refuse::RefuseSagaInputs {
+            tenant: state.tenant.as_str().to_string(),
+            quote_id: quote_id.to_string(),
+            reason,
+            actor: operator_login.to_string(),
+        },
+    )
+}
+
 // ── Session-161 — NAV poll daemon orchestration ──────────────────────
 
 /// If `entry` is the `InvoiceDraftCreated` for `invoice_id` and carries
@@ -25280,6 +25503,48 @@ mod tests {
         assert_eq!(
             mark_paid_eligibility(false, Some(-50_000)),
             MarkPaidEligibility::Negative(-50_000),
+        );
+    }
+
+    // ── S403 — refuse-reason validation (server-side gate) ────────────
+
+    #[test]
+    fn validate_refuse_reason_rejects_short_and_empty() {
+        // [[trust-code-not-operator]] — the server gates regardless of the
+        // SPA. Under the 5-char floor (after trim) is a 400.
+        assert!(validate_refuse_reason("").is_err());
+        assert!(validate_refuse_reason("   ").is_err());
+        assert!(validate_refuse_reason("no").is_err());
+        assert!(
+            validate_refuse_reason("  ok  ").is_err(),
+            "2 chars after trim"
+        );
+    }
+
+    #[test]
+    fn validate_refuse_reason_accepts_and_trims() {
+        assert_eq!(
+            validate_refuse_reason("  stock shortfall  ").unwrap(),
+            "stock shortfall"
+        );
+        // Exactly at the floor.
+        assert_eq!(validate_refuse_reason("abcde").unwrap(), "abcde");
+    }
+
+    #[test]
+    fn validate_refuse_reason_rejects_control_chars_and_overlong() {
+        // CR/LF/NUL would break the storefront `notes` header-injection
+        // gate and the e-mail subject line.
+        assert!(validate_refuse_reason("line1\nline2").is_err());
+        assert!(validate_refuse_reason("a\rb cd").is_err());
+        assert!(validate_refuse_reason("ab\0cde").is_err());
+        let overlong = "x".repeat(REFUSE_REASON_MAX_CHARS + 1);
+        assert!(validate_refuse_reason(&overlong).is_err());
+        // Right at the cap is fine.
+        let at_cap = "y".repeat(REFUSE_REASON_MAX_CHARS);
+        assert_eq!(
+            validate_refuse_reason(&at_cap).unwrap().len(),
+            REFUSE_REASON_MAX_CHARS
         );
     }
 }

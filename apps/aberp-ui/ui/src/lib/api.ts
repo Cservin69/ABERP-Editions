@@ -3749,6 +3749,76 @@ export async function dealQuote(
   }
 }
 
+// ── S403 — operator REFUSE-with-reason ──────────────────────────────
+
+/** 200 body of a successful refusal. `customer_email_notified` is true
+ * when the bilingual customer e-mail was queued; `storefront_synced` is
+ * true when the `rejected` status reached the customer portal (a false
+ * value is non-fatal — the refusal + e-mail are committed regardless). */
+export interface RefuseQuoteOutcome {
+  refused_at: string;
+  customer_email_notified: boolean;
+  storefront_synced: boolean;
+}
+
+/** Machine codes the refuse route emits. `invalid_reason` is the 400
+ * (missing / short / unsafe reason — server-side gate); the rest mirror
+ * the DEAL saga's 404/409 codes. */
+export type RefuseQuoteErrorCode =
+  | "invalid_reason"
+  | "not_staged"
+  | "not_actionable"
+  | "deal_already_issued";
+
+/** Typed wrapper carrying the parsed machine code + operator-readable
+ * message so the SPA modal can render the failure inline. */
+export class RefuseQuoteError extends Error {
+  readonly code: RefuseQuoteErrorCode | "unknown";
+  readonly status: number;
+
+  constructor(code: RefuseQuoteErrorCode | "unknown", status: number, message: string) {
+    super(message);
+    this.code = code;
+    this.status = status;
+    this.name = "RefuseQuoteError";
+  }
+}
+
+/** S403 — submit an operator refusal. The bilingual reason is the
+ * operator's free text; the server-side validation (this call) is the
+ * source of truth per [[trust-code-not-operator]]. On 4xx the returned
+ * promise rejects with a `RefuseQuoteError` carrying the typed `code`. */
+export async function refuseQuote(
+  quoteId: string,
+  body: { reason: string },
+): Promise<RefuseQuoteOutcome> {
+  try {
+    return await invoke<RefuseQuoteOutcome>("quote_intake_refuse", {
+      quoteId,
+      body,
+    });
+  } catch (e) {
+    // `forward_post` wraps non-2xx as `backend returned <status> ...:
+    // {"code":"...","message":"..."}`. Parse lossy; any failure falls
+    // through to an `unknown` typed error.
+    const raw = e instanceof Error ? e.message : String(e);
+    const status = raw.match(/backend returned (\d{3})/);
+    const statusCode = status ? Number(status[1]) : 0;
+    const bodyMatch = raw.match(/:\s*(\{.*\})\s*$/);
+    if (bodyMatch) {
+      try {
+        const parsed = JSON.parse(bodyMatch[1]) as { code?: string; message?: string };
+        const code = (parsed.code ?? "unknown") as RefuseQuoteErrorCode | "unknown";
+        throw new RefuseQuoteError(code, statusCode, parsed.message ?? raw);
+      } catch (parseErr) {
+        if (parseErr instanceof RefuseQuoteError) throw parseErr;
+        // Fall through to unknown.
+      }
+    }
+    throw new RefuseQuoteError("unknown", statusCode, raw);
+  }
+}
+
 // ── S225 / PR-221 — Financial statistics dashboard ──────────────────
 
 /** One per-currency aggregate (HUF cents-equivalent, EUR cents).

@@ -59,6 +59,16 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), QuoteIntakeError> {
 pub const STATE_STAGED: &str = "staged";
 pub const STATE_ERROR: &str = "error";
 pub const STATE_IRRELEVANT: &str = "irrelevant";
+/// S403 — terminal state set by the operator REFUSE-with-reason action.
+/// The row was actionable (`staged`, not yet DEAL'd) but the operator
+/// declined to fulfil it (stock / capacity). A `refused` row drops out
+/// of the actionable queue (`count_unpicked` / `list_unpicked_quote_ids`
+/// both filter `staged` only) exactly like `irrelevant`, but is distinct
+/// so a forensic walk can tell an operator refusal apart from a dismissed
+/// dead-letter. The reason text is NOT stored on the row — it lives in
+/// the `quote.operator_refused` audit entry, the queued customer e-mail,
+/// and the storefront `rejected` status writeback.
+pub const STATE_REFUSED: &str = "refused";
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS quote_intake_log (
@@ -844,6 +854,91 @@ pub fn mark_deal_issued_in_tx(
     Ok(n)
 }
 
+/// S403 — source row for the operator REFUSE-with-reason saga. Carries
+/// just enough to (a) gate the refusal on the same actionable
+/// precondition the DEAL saga uses (`staged` + not-yet-dealt) and (b)
+/// resolve the customer notification recipient. `customer_email` is the
+/// S271 storefront-pushed typed column (NULL on pre-storefront rows);
+/// `raw_payload` is the authoritative submission JSON the saga falls
+/// back to (its `contact.email` is non-empty by intake-mapping
+/// guarantee).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefuseSourceRow {
+    pub intake_state: String,
+    pub deal_issued_at: Option<String>,
+    pub customer_email: Option<String>,
+    pub raw_payload: String,
+}
+
+pub fn read_for_refuse(
+    conn: &Connection,
+    tenant_id: &str,
+    quote_id: &str,
+) -> Result<Option<RefuseSourceRow>, QuoteIntakeError> {
+    ensure_schema(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(intake_state, ?3),
+                    CAST(deal_issued_at AS VARCHAR),
+                    customer_email, raw_payload
+               FROM quote_intake_log
+              WHERE quote_id = ?1 AND tenant_id = ?2
+              LIMIT 1",
+        )
+        .map_err(|e| QuoteIntakeError::Storage(format!("prepare read_for_refuse: {e}")))?;
+    let mut rows = stmt
+        .query(params![quote_id, tenant_id, STATE_STAGED])
+        .map_err(|e| QuoteIntakeError::Storage(format!("query read_for_refuse: {e}")))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|e| QuoteIntakeError::Storage(format!("read read_for_refuse row: {e}")))?
+    else {
+        return Ok(None);
+    };
+    let intake_state: String = row
+        .get(0)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get intake_state: {e}")))?;
+    let deal_issued_at: Option<String> = row
+        .get(1)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get deal_issued_at: {e}")))?;
+    let customer_email: Option<String> = row
+        .get(2)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get customer_email: {e}")))?;
+    let raw_payload: String = row
+        .get(3)
+        .map_err(|e| QuoteIntakeError::Storage(format!("get raw_payload: {e}")))?;
+    Ok(Some(RefuseSourceRow {
+        intake_state,
+        deal_issued_at,
+        customer_email,
+        raw_payload,
+    }))
+}
+
+/// S403 — CAS flip to `refused` inside the refuse saga's tx. Mirrors
+/// `mark_deal_issued_in_tx`'s single-use posture: the
+/// `COALESCE(intake_state, 'staged') = 'staged' AND deal_issued_at IS
+/// NULL` guard means a replay (or a row that was DEAL'd / dismissed /
+/// already-refused between pre-flight and the CAS) updates zero rows, so
+/// the saga can map `0` to the right 409. Returns the rows-updated count.
+pub fn mark_refused_in_tx(
+    tx: &duckdb::Transaction<'_>,
+    tenant_id: &str,
+    quote_id: &str,
+) -> Result<usize, QuoteIntakeError> {
+    let n = tx
+        .execute(
+            "UPDATE quote_intake_log
+                SET intake_state = ?1
+              WHERE quote_id = ?2 AND tenant_id = ?3
+                AND COALESCE(intake_state, ?4) = ?4
+                AND deal_issued_at IS NULL",
+            params![STATE_REFUSED, quote_id, tenant_id, STATE_STAGED],
+        )
+        .map_err(|e| QuoteIntakeError::Storage(format!("CAS mark_refused: {e}")))?;
+    Ok(n)
+}
+
 pub fn list_pending_writebacks(
     conn: &Connection,
     tenant_id: &str,
@@ -1322,6 +1417,73 @@ mod tests {
             row.deal_issued_at.is_some(),
             "deal_issued_at carries through read_for_deal after CAS"
         );
+    }
+
+    // ── S403 — operator REFUSE-with-reason helpers ────────────────────
+
+    /// `read_for_refuse` surfaces the staged state + the storefront-pushed
+    /// `customer_email` + the raw payload the saga falls back to for the
+    /// notification recipient. Missing → None (404-shaped).
+    #[test]
+    fn s403_read_for_refuse_returns_state_email_and_payload() {
+        let conn = open_mem();
+        assert!(read_for_refuse(&conn, "t", "missing").unwrap().is_none());
+
+        let raw = "{\"contact\":{\"email\":\"buyer@example.com\"}}";
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), raw, "{}").unwrap();
+        // Storefront projection pushed the typed email column.
+        conn.execute(
+            "UPDATE quote_intake_log SET customer_email = ?1 WHERE quote_id = 'q1'",
+            params!["buyer@example.com"],
+        )
+        .unwrap();
+
+        let row = read_for_refuse(&conn, "t", "q1").unwrap().unwrap();
+        assert_eq!(row.intake_state, STATE_STAGED);
+        assert!(row.deal_issued_at.is_none());
+        assert_eq!(row.customer_email.as_deref(), Some("buyer@example.com"));
+        assert_eq!(row.raw_payload, raw);
+    }
+
+    /// CAS pin — `mark_refused_in_tx` flips a `staged` row exactly once.
+    /// A replay (now `refused`), an already-DEAL'd row, and a dismissed
+    /// (`irrelevant`) row all lose the CAS (0 rows), so the saga maps that
+    /// to the right 409 instead of double-refusing / refusing a dealt row.
+    #[test]
+    fn s403_mark_refused_is_single_use_and_blocks_dealt_rows() {
+        let mut conn = open_mem();
+        insert_intake(&conn, "t", "q1", "inv_A", "r", now(), "{}", "{}").unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let won = mark_refused_in_tx(&tx, "t", "q1").unwrap();
+        assert_eq!(won, 1, "first refuse wins the CAS");
+        tx.commit().unwrap();
+        assert_eq!(
+            read_for_refuse(&conn, "t", "q1")
+                .unwrap()
+                .unwrap()
+                .intake_state,
+            STATE_REFUSED
+        );
+
+        // Replay against an already-refused row → 0.
+        let tx = conn.transaction().unwrap();
+        assert_eq!(mark_refused_in_tx(&tx, "t", "q1").unwrap(), 0);
+        tx.commit().unwrap();
+
+        // A DEAL'd row cannot be refused (deal_issued_at IS NOT NULL).
+        insert_intake(&conn, "t", "q2", "inv_B", "r", now(), "{}", "{}").unwrap();
+        let tx = conn.transaction().unwrap();
+        mark_deal_issued_in_tx(&tx, "t", "q2", "so_X", "wo_Y", "2026-06-14T00:00:00Z", None)
+            .unwrap();
+        tx.commit().unwrap();
+        let tx = conn.transaction().unwrap();
+        assert_eq!(
+            mark_refused_in_tx(&tx, "t", "q2").unwrap(),
+            0,
+            "a DEAL'd row is not refusable"
+        );
+        tx.commit().unwrap();
     }
 
     // ── S275 / PR-264 / F2 + F10 + F16 — guarded UPDATE + flip+audit
