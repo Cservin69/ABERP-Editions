@@ -61,14 +61,17 @@
     type SellerBankResponse,
   } from "../lib/api";
   import {
+    applyProductPick,
     cannotIssueDueToBank,
     composeIssueInvoiceBody,
     deliveryDateOverrideFor,
     emptyForm,
     emptyLine,
+    lineCurrencyMismatchWarning,
     parseInvoicePreflightErrors,
     parseMissingSellerConfigError,
     paymentDeadlineFromOffset,
+    resolveBankForCurrency,
     targetForFieldPath,
     type InvoicePreflightErrorBody,
     type InvoicePreflightErrorItem,
@@ -296,40 +299,20 @@
     });
   }
 
-  /** PR-100 — operator clicked / Enter-selected a saved product row
-   * on `lineIndex`'s dropdown. Autofills `description` + `unitPriceInput`
-   * (the unit-price input is parsed at compose time per PR-88; we
-   * write the formatted major-units string the operator would have
-   * typed). Currency mismatch is captured on the line so the inline
-   * warning surfaces; the operator decides to switch the invoice
-   * currency, edit the price, or pick a different product.
+  /** PR-100 / S406 — operator clicked / Enter-selected a saved product
+   * row on `lineIndex`'s dropdown. Autofills `description` +
+   * `unitPriceInput` + `unit`, and AUTO-FLIPS the invoice currency to
+   * the product's default currency (Ervin's brief — fewer clicks: the
+   * operator no longer has to change the currency by hand). The bank
+   * picker re-defaults to the new currency's bank via the currency-
+   * change `$effect` below. Both the currency and the bank stay
+   * operator-overwritable; an override away from the product's
+   * currency surfaces the derived mismatch chip on the line.
    *
-   * After autofill, the operator can still edit any field. Editing
-   * does not auto-unbind a "from product X" link — there is no such
-   * binding in v1 (the autofill is convenience, not a reference). */
+   * The transform lives in the pure `applyProductPick` helper so vitest
+   * can pin the flip without mounting this component. */
   function pickProduct(lineIndex: number, product: Product) {
-    const updatedLines = form.lines.map((line, i) => {
-      if (i !== lineIndex) return line;
-      return {
-        ...line,
-        description: product.name,
-        // PR-88 — format the minor-unit count into the operator-
-        // editable input string. Format using the PRODUCT's currency
-        // so the displayed value matches the product's saved price
-        // even when the invoice currency differs; the warning below
-        // surfaces the mismatch so the operator can't silently
-        // miscount cents-vs-forints.
-        unitPriceInput: formatMinorToInput(product.unit_price_minor, product.currency),
-        productCurrencyAtPick:
-          product.currency !== form.currency ? product.currency : null,
-        // S159 — stamp the picked product's unit of measure onto the
-        // line so `composeIssueInvoiceBody` carries it to the backend's
-        // NAV `<unitOfMeasure>` emit. Re-picking overwrites it; a
-        // one-off freetext line keeps its `null` (PIECE fallback).
-        unit: product.unit,
-      };
-    });
-    form = { ...form, lines: updatedLines };
+    form = applyProductPick(form, lineIndex, product);
     productDropdownOpenLineIndex = null;
     productHighlight = -1;
   }
@@ -396,65 +379,28 @@
     }
   }
 
-  /** PR-100 — operator dismissed the currency-mismatch chip on a line.
-   * Clears the per-line warning state without touching the autofilled
-   * price (the operator can leave the autofilled value if they intend
-   * to type it under a different currency, or edit it themselves). */
-  function dismissCurrencyMismatch(lineIndex: number) {
-    form = {
-      ...form,
-      lines: form.lines.map((line, i) =>
-        i === lineIndex ? { ...line, productCurrencyAtPick: null } : line,
-      ),
-    };
-  }
-
-  /** PR-100 — when the form's currency changes, any per-line warnings
-   * whose product currency now MATCHES the invoice currency are
-   * resolved silently. The remaining warnings stay visible so the
-   * operator still sees the mismatch on lines that didn't get fixed.
-   * Effect-driven (rather than baked into the currency select's
-   * onchange) so paths that mutate `form.currency` elsewhere — e.g.
-   * a future ADR-0037 widening — don't bypass the reconciliation. */
-  $effect(() => {
-    const invoiceCurrency = form.currency;
-    const next = form.lines.map((line) => {
-      if (
-        line.productCurrencyAtPick !== null &&
-        line.productCurrencyAtPick !== undefined &&
-        line.productCurrencyAtPick === invoiceCurrency
-      ) {
-        return { ...line, productCurrencyAtPick: null };
-      }
-      return line;
-    });
-    if (next.some((l, i) => l !== form.lines[i])) {
-      form = { ...form, lines: next };
-    }
-  });
-
-  // When the currency changes, re-default the picker to that
-  // currency's `is_default` entry. If no entry exists for the new
-  // currency, blank the selection — the no-default-for-currency
-  // affordance below renders the link-to-Tenant-Settings hint.
+  // S406 — when the invoice currency changes (operator dropdown OR the
+  // `applyProductPick` auto-flip), re-default the bank picker to that
+  // currency's `is_default` entry, preserving an operator's explicit
+  // pick for the same currency. No entry for the currency → blank the
+  // selection (the no-default-for-currency affordance below renders
+  // the link-to-Tenant-Settings hint). The decision lives in the pure
+  // `resolveBankForCurrency` helper (vitest-pinned); this effect is the
+  // SOLE writer of `form.bankAccountId` on a currency change so the
+  // bank-defaulting rule has exactly one home.
   $effect(() => {
     // Touch form.currency so the effect re-runs on change (svelte 5
     // tracks the reads inside the effect closure — referencing the
     // field here is enough; no local binding required).
     form.currency;
     if (!sellerBanksLoaded) return;
-    const fresh = defaultBankForCurrency;
-    if (fresh) {
-      // Only re-default when the operator hasn't picked an entry for
-      // this currency (or picked one whose currency changed away).
-      const current = sellerBanks.find((b) => b.id === form.bankAccountId);
-      if (current === undefined || current.currency !== form.currency) {
-        form = { ...form, bankAccountId: fresh.id };
-      }
-    } else {
-      // No entry for this currency — blank the picker; the inline
-      // affordance below renders the missing-bank hint.
-      form = { ...form, bankAccountId: null };
+    const resolved = resolveBankForCurrency(
+      sellerBanks,
+      form.currency,
+      form.bankAccountId,
+    );
+    if (resolved !== form.bankAccountId) {
+      form = { ...form, bankAccountId: resolved };
     }
   });
 
@@ -1571,37 +1517,44 @@
             {/each}
           </div>
         {/if}
-        <!-- PR-100 — currency-mismatch warning. Surfaced when the
-             operator picked a product whose currency differs from the
-             invoice currency. The autofill copies the product's price
-             verbatim (no silent conversion); the operator decides
-             whether to switch the invoice currency, edit the price,
-             pick a different product, or dismiss the warning. The
-             chip clears automatically when the invoice currency
-             becomes a match (reactive via $effect). -->
-        {#if line.productCurrencyAtPick && line.productCurrencyAtPick !== form.currency}
+        <!-- PR-100 / S406 — currency-mismatch warning. Picking a
+             product auto-flips the invoice currency to match, so at
+             pick time there is no mismatch. This chip surfaces only
+             when the operator OVERRIDES the invoice currency away from
+             a line's product default. It is DERIVED from the wire shape
+             (the line's stamped product currency + the seller-bank
+             list — [[trust-code-not-operator]]), names the seller bank
+             for the product's currency that "may not apply," and clears
+             itself the moment the operator re-aligns the currency or
+             re-picks. No dismiss button: the mismatch is a real state,
+             not an operator-acknowledgeable snapshot. -->
+        {@const mismatch = lineCurrencyMismatchWarning({
+          productCurrency: line.productCurrency,
+          invoiceCurrency: form.currency,
+          productName: line.description,
+          banks: sellerBanks,
+        })}
+        {#if mismatch}
           <p
             class="line-currency-mismatch"
             role="alert"
             data-testid={`line-${index}-currency-mismatch`}
           >
             <span class="inline-error-hu">
-              ⚠ A termék pénzneme {line.productCurrencyAtPick}, de a számla
-              {form.currency} pénznemű — kérjük ellenőrizze az árat.
+              ⚠ A(z) „{mismatch.productName}” termék alap pénzneme
+              {mismatch.productCurrency}, de a számla {mismatch.invoiceCurrency}
+              pénznemű{#if mismatch.productCurrencyBankName} — a(z)
+                {mismatch.productCurrencyBankName} ({mismatch.productCurrency})
+                bankszámla nem biztos, hogy érvényes{/if} — kérjük ellenőrizze
+              az árat.
             </span>
             <span class="inline-error-en">
-              Product currency is {line.productCurrencyAtPick} but the invoice
-              is in {form.currency} — please verify the price.
+              Product “{mismatch.productName}” is normally
+              {mismatch.productCurrency}, invoice is {mismatch.invoiceCurrency}{#if mismatch.productCurrencyBankName}
+                — bank {mismatch.productCurrencyBankName}
+                ({mismatch.productCurrency}) may not apply{/if} — please verify
+              the price.
             </span>
-            <button
-              type="button"
-              class="quiet-button line-currency-mismatch__dismiss"
-              onclick={() => dismissCurrencyMismatch(index)}
-              data-testid={`line-${index}-currency-mismatch-dismiss`}
-              aria-label="Dismiss currency mismatch warning"
-            >
-              × Bezár / Dismiss
-            </button>
           </p>
         {/if}
       {/each}
@@ -2211,9 +2164,10 @@
     font-style: italic;
   }
 
-  /* PR-100 — currency mismatch chip. Same visual weight as the
-   * inline preflight errors above but with a softer dismiss button
-   * (operator action, not a server-side error). */
+  /* PR-100 / S406 — currency mismatch chip. Same visual weight as the
+   * inline preflight errors above. S406 dropped the dismiss button —
+   * the warning is a derived, code-truthful state, not an operator-
+   * acknowledgeable snapshot. */
   .line-currency-mismatch {
     display: flex;
     flex-direction: column;
@@ -2225,13 +2179,6 @@
     border-left: 3px solid var(--color-signal-warning, var(--color-text-muted));
     border-radius: var(--radius-md, 6px);
     font-family: var(--type-family-mono);
-    font-size: var(--type-size-xs);
-  }
-
-  .line-currency-mismatch__dismiss {
-    align-self: flex-start;
-    margin-top: var(--space-1);
-    padding: 0 var(--space-2);
     font-size: var(--type-size-xs);
   }
 </style>

@@ -4,7 +4,7 @@
   // Today this component is consumed by `ModificationInvoice.svelte`
   // ONLY. The `IssueInvoice.svelte` line markup carries hardened
   // PR-100 / S159 wiring (saved-product combobox dropdown around the
-  // description input + `productCurrencyAtPick` chip + per-line
+  // description input + S406 product-currency mismatch chip + per-line
   // `NotesAutocomplete`) that intentionally does NOT migrate in this
   // PR — Issue's `.line` div is the operator-facing entry point for
   // the regulatory issuance path and any refactor that bundles those

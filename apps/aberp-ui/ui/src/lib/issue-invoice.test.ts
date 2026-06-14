@@ -15,16 +15,21 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  applyProductPick,
   cannotIssueDueToBank,
   composeIssueInvoiceBody,
   deliveryDateOverrideFor,
   emptyForm,
+  lineCurrencyMismatchWarning,
   parseInvoicePreflightErrors,
   parseMissingSellerConfigError,
   paymentDeadlineFromOffset,
+  resolveBankForCurrency,
   targetForFieldPath,
   type InvoicePreflightErrorKind,
+  type IssueInvoiceFormState,
 } from "./issue-invoice";
+import type { Product, SellerBankResponse } from "./api";
 
 describe("composeIssueInvoiceBody", () => {
   it("reshapes HUF form state into the wire body verbatim", () => {
@@ -1216,5 +1221,250 @@ describe("composeIssueInvoiceBody — PR-84 invoice-date fields", () => {
     const body = composeIssueInvoiceBody(form);
     expect(body).not.toHaveProperty("invoiceDate");
     expect(body).not.toHaveProperty("issueDate");
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// S406 — product-pick currency auto-flip + derived mismatch warning
+//
+// Ervin's brief (2026-06-14): picking a product whose default currency
+// differs from the invoice currency should AUTO-FLIP the invoice
+// currency (and the bank picker) to the product's default, both still
+// operator-overwritable; an override away from a line's product default
+// then surfaces a code-derived warning chip. These pins live entirely
+// on the pure helpers so the flip + warning are verified without
+// mounting IssueInvoice.svelte.
+// ──────────────────────────────────────────────────────────────────────
+
+function makeProduct(overrides: Partial<Product> = {}): Product {
+  return {
+    id: "prd_0000000000000000000000EUR",
+    name: "Konzultáció",
+    unit: { kind: "Nav", value: "HOUR" },
+    currency: "EUR",
+    // 340,50 EUR = 34050 cents.
+    unit_price_minor: 34050,
+    created_at: "2026-06-14T00:00:00Z",
+    updated_at: "2026-06-14T00:00:00Z",
+    deleted_at: null,
+    ...overrides,
+  };
+}
+
+const HUF_BANK: SellerBankResponse = {
+  id: "bnk_huf_0000000000000000000001",
+  currency: "HUF",
+  account_number: "12345678-12345678-12345678",
+  bank_name: "OTP-HUF",
+  swift_bic: "OTPVHUHB",
+  is_default: true,
+};
+
+const EUR_BANK: SellerBankResponse = {
+  id: "bnk_eur_0000000000000000000002",
+  currency: "EUR",
+  account_number: "HU42117730161111101800000000",
+  bank_name: "UNICREDIT-EUR",
+  swift_bic: "BACXHUHB",
+  is_default: true,
+};
+
+const BANKS: SellerBankResponse[] = [HUF_BANK, EUR_BANK];
+
+describe("applyProductPick — auto-flip currency on product selection", () => {
+  it("flips the invoice currency to the product's default (EUR product, HUF invoice)", () => {
+    const form = { ...emptyForm(), currency: "HUF" as const };
+    expect(form.currency).toBe("HUF");
+
+    const next = applyProductPick(form, 0, makeProduct({ currency: "EUR" }));
+
+    // Currency flipped to the product's default.
+    expect(next.currency).toBe("EUR");
+    // Line autofilled: description, price (formatted in EUR), unit, stamp.
+    expect(next.lines[0].description).toBe("Konzultáció");
+    expect(next.lines[0].unitPriceInput).toBe("340.50");
+    expect(next.lines[0].productCurrency).toBe("EUR");
+    expect(next.lines[0].unit).toEqual({ kind: "Nav", value: "HOUR" });
+  });
+
+  it("is idempotent when the product currency already matches", () => {
+    const form = { ...emptyForm(), currency: "HUF" as const };
+    const next = applyProductPick(
+      form,
+      0,
+      makeProduct({ currency: "HUF", unit_price_minor: 340000, name: "Acél" }),
+    );
+    expect(next.currency).toBe("HUF");
+    expect(next.lines[0].productCurrency).toBe("HUF");
+    expect(next.lines[0].unitPriceInput).toBe("340000");
+  });
+
+  it("only touches the picked line; sibling lines are untouched", () => {
+    const form = {
+      ...emptyForm(),
+      currency: "HUF" as const,
+      lines: [
+        { ...emptyForm().lines[0], description: "Existing", unitPriceInput: "100" },
+        { ...emptyForm().lines[0] },
+      ],
+    };
+    const next = applyProductPick(form, 1, makeProduct({ currency: "EUR" }));
+    expect(next.lines[0].description).toBe("Existing");
+    expect(next.lines[0].unitPriceInput).toBe("100");
+    expect(next.lines[1].description).toBe("Konzultáció");
+  });
+});
+
+describe("resolveBankForCurrency — bank picker re-defaults with the flip", () => {
+  it("flips to the EUR default bank when the invoice flips to EUR", () => {
+    // Operator had the HUF default bank; picking a EUR product flips the
+    // currency, and the bank picker re-defaults to the EUR bank.
+    const resolved = resolveBankForCurrency(BANKS, "EUR", HUF_BANK.id);
+    expect(resolved).toBe(EUR_BANK.id);
+  });
+
+  it("flips back to the HUF default bank on a HUF override", () => {
+    const resolved = resolveBankForCurrency(BANKS, "HUF", EUR_BANK.id);
+    expect(resolved).toBe(HUF_BANK.id);
+  });
+
+  it("preserves an operator's explicit pick that already matches the currency", () => {
+    // A second EUR account the operator chose by hand; resolving for EUR
+    // must NOT yank it back to the default.
+    const secondEur: SellerBankResponse = {
+      ...EUR_BANK,
+      id: "bnk_eur_0000000000000000000003",
+      bank_name: "REVOLUT-EUR",
+      is_default: false,
+    };
+    const banks = [HUF_BANK, EUR_BANK, secondEur];
+    const resolved = resolveBankForCurrency(banks, "EUR", secondEur.id);
+    expect(resolved).toBe(secondEur.id);
+  });
+
+  it("returns null when no bank is configured for the currency", () => {
+    // HUF-only tenant flips to EUR: no EUR bank → blank the picker (the
+    // form renders the no-bank-for-currency affordance + blocks Submit).
+    const resolved = resolveBankForCurrency([HUF_BANK], "EUR", HUF_BANK.id);
+    expect(resolved).toBeNull();
+  });
+});
+
+describe("lineCurrencyMismatchWarning — code-derived override warning", () => {
+  it("returns null at pick time (currency was flipped to match)", () => {
+    // After applyProductPick the invoice currency equals the product's,
+    // so the line shows no warning.
+    expect(
+      lineCurrencyMismatchWarning({
+        productCurrency: "EUR",
+        invoiceCurrency: "EUR",
+        productName: "Konzultáció",
+        banks: BANKS,
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null for a one-off line (no product picked)", () => {
+    expect(
+      lineCurrencyMismatchWarning({
+        productCurrency: null,
+        invoiceCurrency: "HUF",
+        productName: "",
+        banks: BANKS,
+      }),
+    ).toBeNull();
+    expect(
+      lineCurrencyMismatchWarning({
+        productCurrency: undefined,
+        invoiceCurrency: "HUF",
+        productName: "",
+        banks: BANKS,
+      }),
+    ).toBeNull();
+  });
+
+  it("warns + names the product-currency bank when the operator overrides to HUF", () => {
+    // The override path: operator flips the EUR-product invoice back to
+    // HUF. The chip names the product, both currencies, and the EUR bank
+    // that "may not apply." Derived from the wire shape — never operator
+    // memory ([[trust-code-not-operator]]).
+    const warn = lineCurrencyMismatchWarning({
+      productCurrency: "EUR",
+      invoiceCurrency: "HUF",
+      productName: "Konzultáció",
+      banks: BANKS,
+    });
+    expect(warn).not.toBeNull();
+    expect(warn!.productName).toBe("Konzultáció");
+    expect(warn!.productCurrency).toBe("EUR");
+    expect(warn!.invoiceCurrency).toBe("HUF");
+    expect(warn!.productCurrencyBankName).toBe("UNICREDIT-EUR");
+  });
+
+  it("warns with a null bank name when no bank exists for the product currency", () => {
+    const warn = lineCurrencyMismatchWarning({
+      productCurrency: "EUR",
+      invoiceCurrency: "HUF",
+      productName: "Konzultáció",
+      banks: [HUF_BANK], // no EUR bank configured
+    });
+    expect(warn).not.toBeNull();
+    expect(warn!.productCurrencyBankName).toBeNull();
+  });
+});
+
+describe("S406 journey — pick EUR product, override to HUF, compose", () => {
+  it("flips on pick, re-defaults the bank, then warns on override and issues with the override currency", () => {
+    // 1. Operator starts on a HUF invoice with the HUF default bank.
+    let form: IssueInvoiceFormState = {
+      ...emptyForm(),
+      customerName: "Vevő Kft.",
+      customerTaxNumber: "87654321-2-13",
+      currency: "HUF",
+      bankAccountId: HUF_BANK.id,
+    };
+
+    // 2. Picks a EUR product → currency + bank flip to EUR; no warning.
+    form = applyProductPick(form, 0, makeProduct({ currency: "EUR" }));
+    form = {
+      ...form,
+      bankAccountId: resolveBankForCurrency(BANKS, form.currency, form.bankAccountId),
+    };
+    expect(form.currency).toBe("EUR");
+    expect(form.bankAccountId).toBe(EUR_BANK.id);
+    expect(
+      lineCurrencyMismatchWarning({
+        productCurrency: form.lines[0].productCurrency,
+        invoiceCurrency: form.currency,
+        productName: form.lines[0].description,
+        banks: BANKS,
+      }),
+    ).toBeNull();
+
+    // 3. Operator overrides the currency back to HUF (overwritable). The
+    //    bank re-defaults to HUF and the mismatch chip now fires.
+    form = { ...form, currency: "HUF" as const };
+    form = {
+      ...form,
+      bankAccountId: resolveBankForCurrency(BANKS, form.currency, form.bankAccountId),
+    };
+    expect(form.bankAccountId).toBe(HUF_BANK.id);
+    const warn = lineCurrencyMismatchWarning({
+      productCurrency: form.lines[0].productCurrency,
+      invoiceCurrency: form.currency,
+      productName: form.lines[0].description,
+      banks: BANKS,
+    });
+    expect(warn).not.toBeNull();
+    expect(warn!.productCurrencyBankName).toBe("UNICREDIT-EUR");
+
+    // 4. The invoice still composes cleanly with the override currency —
+    //    the warning is advisory, not a hard block (the price the
+    //    operator left under HUF rides verbatim per PR-88 semantics).
+    const body = composeIssueInvoiceBody(form);
+    expect(body.currency).toBe("HUF");
+    expect(body.bankAccountId).toBe(HUF_BANK.id);
+    expect(body.lines[0].description).toBe("Konzultáció");
+    expect(body.lines[0].unit).toEqual({ kind: "Nav", value: "HOUR" });
   });
 });

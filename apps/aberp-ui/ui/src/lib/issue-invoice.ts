@@ -18,10 +18,16 @@ import type {
   CustomerVatStatusBody,
   InvoicePaymentMethod,
   IssueInvoiceRequest,
+  Product,
   ProductUnit,
+  SellerBankResponse,
 } from "./api";
 import { DEFAULT_PAYMENT_METHOD } from "./payment-method";
-import { parseAmountToMinor, parseDecimalQuantity } from "./format";
+import {
+  formatMinorToInput,
+  parseAmountToMinor,
+  parseDecimalQuantity,
+} from "./format";
 import {
   addDays,
   comfortZone,
@@ -67,19 +73,24 @@ export interface LineFormState {
    * `null` on the wire so the backend sees a clean "no note"
    * signal. Recipient-facing only — NEVER reaches the NAV XML. */
   note: string;
-  /** PR-100 — UI-only state that records the currency of the product
-   * the operator most-recently picked for this line. Set by
-   * `pickProduct()` in IssueInvoice.svelte; cleared when the operator
-   * picks a different product, when the form's currency changes to
-   * match (the mismatch is resolved), or when the operator dismisses
-   * the warning. `null` for one-off lines (operator typed a free-text
-   * description) and for autofills where the product's currency
-   * already matches the invoice. The composer does NOT read this
-   * field — it never reaches the wire body. Travelling on the line
-   * (rather than a sibling `Record<number, …>` on the component)
-   * keeps the per-line warning state correct across add/remove-line
-   * shuffles. */
-  productCurrencyAtPick?: Currency | null;
+  /** PR-100 / S406 — UI-only state that records the default currency
+   * of the product the operator most-recently picked for this line.
+   * Set by `applyProductPick()`; `null` for one-off lines (operator
+   * typed a free-text description, no product picked). The composer
+   * does NOT read this field — it never reaches the wire body.
+   *
+   * S406 — this is now a PERSISTENT stamp of the picked product's
+   * currency, NOT a transient mismatch snapshot. Picking a product
+   * auto-flips the invoice currency to the product's default
+   * ([`applyProductPick`]) so there is no mismatch at pick time; the
+   * stamp only earns a warning later, if the operator overrides the
+   * invoice currency away from it. The per-line warning is therefore
+   * DERIVED ([`lineCurrencyMismatchWarning`]) from this stamp vs the
+   * current invoice currency — code-derived, never an operator-cleared
+   * snapshot. Travelling on the line (rather than a sibling
+   * `Record<number, …>` on the component) keeps the warning correct
+   * across add/remove-line shuffles. */
+  productCurrency?: Currency | null;
   /** S159 — the unit of measure stamped by `pickProduct()` from the
    * picked product's `unit`. `null`/absent for one-off freetext lines
    * (operator typed a description without picking a product); the
@@ -290,10 +301,139 @@ export function emptyLine(): LineFormState {
     vatRatePercent: 27,
     // PR-82 — per-line note seeds blank; operator opt-in.
     note: "",
-    // PR-100 — no product picked yet on a fresh line.
-    productCurrencyAtPick: null,
+    // PR-100 / S406 — no product picked yet on a fresh line.
+    productCurrency: null,
     // S159 — no unit until a product is picked; null → PIECE fallback.
     unit: null,
+  };
+}
+
+/** S406 — apply a saved-product pick to one line of the form, and
+ * AUTO-FLIP the invoice currency to the product's default currency.
+ *
+ * Ervin's brief (2026-06-14): "When choosing the product it should
+ * flip currency and Default bank account but would still remain
+ * overwritable." Picking a EUR product while the invoice is HUF
+ * flips the invoice to EUR (and the bank picker re-defaults to the
+ * EUR bank via [`resolveBankForCurrency`] — driven by the component's
+ * currency-change effect, NOT here, so the bank-defaulting rule lives
+ * in exactly one place). Fewer clicks: the operator no longer has to
+ * change the currency by hand after picking a product whose price is
+ * quoted in another currency.
+ *
+ * Pure — returns a fresh form; no side effects. The unit-price input
+ * is formatted in the PRODUCT's currency (which, post-flip, equals the
+ * invoice currency) so the displayed value matches the product's
+ * saved price. `productCurrency` is stamped on the line so a later
+ * operator override of the invoice currency surfaces the derived
+ * mismatch warning ([`lineCurrencyMismatchWarning`]).
+ *
+ * The flip is a SUGGESTION: both the currency dropdown and the bank
+ * picker remain operator-overwritable after the pick. */
+export function applyProductPick(
+  form: IssueInvoiceFormState,
+  lineIndex: number,
+  product: Product,
+): IssueInvoiceFormState {
+  const lines = form.lines.map((line, i) => {
+    if (i !== lineIndex) return line;
+    return {
+      ...line,
+      description: product.name,
+      // Format using the product's currency — post-flip this equals
+      // the invoice currency, so the operator sees the saved price
+      // verbatim (no silent conversion).
+      unitPriceInput: formatMinorToInput(
+        product.unit_price_minor,
+        product.currency,
+      ),
+      // S406 — persistent stamp of the picked product's currency (was
+      // PR-100's transient mismatch snapshot). Drives the derived
+      // warning if the operator later overrides the invoice currency.
+      productCurrency: product.currency,
+      // S159 — stamp the unit of measure for the NAV `<unitOfMeasure>` emit.
+      unit: product.unit,
+    };
+  });
+  // S406 — auto-flip the invoice currency to the product's default.
+  // Idempotent when they already match.
+  return { ...form, currency: product.currency, lines };
+}
+
+/** S406 — resolve which seller-bank id the form should hold for a
+ * given invoice currency, preserving an operator's explicit pick.
+ *
+ * Returns the `is_default` bank for `currency` when the operator has
+ * not already chosen a bank in that currency (current pick is unknown
+ * or belongs to a different currency); returns the operator's current
+ * pick unchanged when it already matches the currency; returns `null`
+ * when no bank is configured for the currency (the form then renders
+ * the "no bank for currency" affordance + blocks Submit via
+ * [`cannotIssueDueToBank`]).
+ *
+ * Pure — so vitest can pin the auto-flip's bank half without mounting
+ * the component. The component's currency-change effect folds reactive
+ * state through this and is the SOLE writer of `form.bankAccountId` on
+ * a currency change (whether the change came from the dropdown or from
+ * [`applyProductPick`]'s auto-flip). */
+export function resolveBankForCurrency(
+  banks: SellerBankResponse[],
+  currency: Currency,
+  currentBankId: string | null,
+): string | null {
+  const defaultForCurrency =
+    banks.find((b) => b.currency === currency && b.is_default) ?? null;
+  if (defaultForCurrency === null) return null;
+  const current = banks.find((b) => b.id === currentBankId);
+  if (current === undefined || current.currency !== currency) {
+    return defaultForCurrency.id;
+  }
+  return currentBankId;
+}
+
+/** S406 — derived per-line currency-mismatch warning. Returns the data
+ * for the warning chip when this line was autofilled from a product
+ * whose default currency differs from the CURRENT invoice currency
+ * (i.e. the operator overrode the auto-flipped currency); returns
+ * `null` otherwise (one-off line, or product currency matches).
+ *
+ * [[trust-code-not-operator]] — the warning is derived from the wire
+ * shape (the line's stamped `productCurrency` + the seller-bank list),
+ * never from operator memory or a dismissable snapshot. The named
+ * bank is the default seller bank for the PRODUCT's currency — the one
+ * that "may not apply" because the invoice now bills in a different
+ * currency. `null` `productCurrencyBankName` when no bank is
+ * configured for the product's currency. */
+export interface LineCurrencyMismatch {
+  productName: string;
+  productCurrency: Currency;
+  invoiceCurrency: Currency;
+  /** `bank_name` of the default seller bank for the PRODUCT's
+   * currency, or `null` if none is configured. */
+  productCurrencyBankName: string | null;
+}
+
+export function lineCurrencyMismatchWarning(args: {
+  productCurrency: Currency | null | undefined;
+  invoiceCurrency: Currency;
+  productName: string;
+  banks: SellerBankResponse[];
+}): LineCurrencyMismatch | null {
+  const { productCurrency, invoiceCurrency, productName, banks } = args;
+  if (
+    productCurrency === null ||
+    productCurrency === undefined ||
+    productCurrency === invoiceCurrency
+  ) {
+    return null;
+  }
+  const bankForProductCurrency =
+    banks.find((b) => b.currency === productCurrency && b.is_default) ?? null;
+  return {
+    productName,
+    productCurrency,
+    invoiceCurrency,
+    productCurrencyBankName: bankForProductCurrency?.bank_name ?? null,
   };
 }
 
