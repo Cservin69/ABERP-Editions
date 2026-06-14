@@ -141,13 +141,33 @@ CREATE TABLE IF NOT EXISTS outbound_email_queue (
     recipient_hash         VARCHAR NOT NULL,
     byte_size              BIGINT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS outbound_email_queue_state_idx
-    ON outbound_email_queue (state);
-CREATE INDEX IF NOT EXISTS outbound_email_queue_submitter_idx
-    ON outbound_email_queue (submitter);
+-- S409 — drop the two secondary indexes. `outbound_email_queue_state_idx`
+-- ON (state) is the PROD bug trigger: `state` is UPDATEd on EVERY
+-- transition (Queued -> Sending -> Sent/Failed) and DuckDB's ART
+-- secondary-index maintenance on an UPDATEd column, over a table that
+-- also carries a PRIMARY KEY, can fire `Invalid Input Error: Failed to
+-- delete all rows from index. Only deleted 0 out of 1 rows.` mid-
+-- `mark_sent` (observed in PROD 2026-06-14 after the S403 refuse feature
+-- raised relay volume). Same DuckDB issue class S286/PR-268 fixed on
+-- `quote_pricing_jobs`. `outbound_email_queue_submitter_idx` ON
+-- (submitter) is unused — nothing filters / sorts by submitter — so it
+-- is pure dead weight (rule 13). Both drops are subtractive: the queue
+-- drains to near-empty continuously and every read is a tiny result set,
+-- so a full scan of a sub-1k-row table costs microseconds. One-time
+-- idempotent migration for installs carrying the indexes from
+-- PROD_v2.27.* (<= .61); `DROP INDEX IF EXISTS` no-ops on fresh DBs and
+-- on re-runs.
+DROP INDEX IF EXISTS outbound_email_queue_state_idx;
+DROP INDEX IF EXISTS outbound_email_queue_submitter_idx;
 ";
 
 /// Idempotent — call at every writer / reader entry.
+///
+/// **S409 caveat**: existing prod DBs from PROD_v2.27.* (<= .61) carry the
+/// orphan `outbound_email_queue_state_idx` (and dead
+/// `outbound_email_queue_submitter_idx`) secondary indexes. The embedded
+/// `DROP INDEX IF EXISTS` in `SCHEMA_SQL` removes them on the first call
+/// after upgrade — the daemon's startup is the first call.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_SQL)
         .with_context(|| "ensure outbound_email_queue schema")
@@ -305,6 +325,43 @@ pub fn requeue_for_retry(conn: &Connection, id: &str, last_error: &str) -> Resul
         ));
     }
     Ok(())
+}
+
+/// S409 — operator-visible note stamped into `last_error` when a row is
+/// reconciled out of an orphaned `Sending` state at daemon startup.
+pub const RECONCILE_NOTE: &str =
+    "reconciled at daemon startup: orphaned in Sending after an incomplete state \
+     transition; SMTP send had already been attempted — marked Sent WITHOUT \
+     re-sending to avoid duplicate delivery (S409)";
+
+/// S409 — reconcile rows orphaned in `Sending`.
+///
+/// At daemon startup the drain loop has claimed nothing yet, so any row
+/// still in `Sending` is the residue of a PRIOR process whose terminal
+/// transition (`mark_sent` / `mark_failed`) did not complete — e.g. the
+/// DuckDB secondary-index `UPDATE` failure this PR removes. The SMTP send
+/// for such a row had ALREADY been attempted by the daemon's `send_one`,
+/// so we walk it forward to terminal `Sent` and NEVER back to `Queued`:
+/// re-queuing would re-send, and the customer must never receive a
+/// duplicate ([[hulye-biztos]]). The reconcile note is stamped into
+/// `last_error` so the state is operator-visible ([[fail-loud]]). Returns
+/// the count of rows reconciled so the caller can log loudly.
+///
+/// Idempotent: a second call (no rows in `Sending`) returns `Ok(0)`.
+pub fn reconcile_orphaned_sending(conn: &Connection, now: OffsetDateTime) -> Result<u64> {
+    ensure_schema(conn)?;
+    let sent_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format reconcile sent_at")?;
+    let n = conn
+        .execute(
+            "UPDATE outbound_email_queue
+             SET state = ?, sent_at = COALESCE(sent_at, ?), last_error = ?
+             WHERE state = ?",
+            params![STATE_SENT, sent_at, RECONCILE_NOTE, STATE_SENDING],
+        )
+        .context("reconcile orphaned Sending rows")?;
+    Ok(n as u64)
 }
 
 /// Read the oldest `Queued` row by `created_at` ascending. The daemon
@@ -752,6 +809,218 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].id, "a");
         assert_eq!(all.len(), 2);
+    }
+
+    /// S409 — count user indexes by name via DuckDB's `duckdb_indexes()`
+    /// system table function (same probe `quote_pricing_jobs` uses).
+    fn index_count(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = ?",
+            params![name],
+            |r| r.get(0),
+        )
+        .expect("query duckdb_indexes")
+    }
+
+    /// S409 — a fresh DB carries NEITHER secondary index (the bug-trigger
+    /// `state` index nor the dead `submitter` index): `SCHEMA_SQL` no
+    /// longer creates them, and the embedded `DROP INDEX IF EXISTS` no-ops.
+    #[test]
+    fn s409_fresh_db_has_no_secondary_indexes() {
+        let conn = open_in_memory();
+        assert_eq!(index_count(&conn, "outbound_email_queue_state_idx"), 0);
+        assert_eq!(index_count(&conn, "outbound_email_queue_submitter_idx"), 0);
+    }
+
+    /// S409 — an installed DB that PRE-EXISTINGLY carries the secondary
+    /// indexes from PROD_v2.27.* (<= .61) is migrated clean: hand-create
+    /// the indexes to simulate the prod schema, then `ensure_schema`
+    /// drops them. This is the load-bearing regression — without the
+    /// `DROP INDEX IF EXISTS`, the next `mark_sent` UPDATE on `state`
+    /// would FATAL with "Failed to delete all rows from index".
+    #[test]
+    fn s409_drop_migrates_from_prior_schema() {
+        let conn = open_in_memory();
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS outbound_email_queue_state_idx
+                 ON outbound_email_queue (state);
+             CREATE INDEX IF NOT EXISTS outbound_email_queue_submitter_idx
+                 ON outbound_email_queue (submitter);",
+        )
+        .expect("simulate prior-version indexes");
+        assert_eq!(index_count(&conn, "outbound_email_queue_state_idx"), 1);
+        // Re-running ensure_schema must DROP both.
+        ensure_schema(&conn).expect("post-migration ensure");
+        assert_eq!(index_count(&conn, "outbound_email_queue_state_idx"), 0);
+        assert_eq!(index_count(&conn, "outbound_email_queue_submitter_idx"), 0);
+    }
+
+    /// S409 — the schema migration is idempotent: repeated `ensure_schema`
+    /// on a fresh DB and on an already-migrated DB both succeed.
+    #[test]
+    fn s409_ensure_schema_idempotent() {
+        let conn = Connection::open_in_memory().expect("open");
+        ensure_schema(&conn).expect("first");
+        ensure_schema(&conn).expect("second");
+        ensure_schema(&conn).expect("third");
+    }
+
+    /// S409 — the PROD scenario: a row claimed to `Sending` whose
+    /// `mark_sent` never landed (orphaned by the index bug) is walked
+    /// forward to `Sent` at startup — NOT re-queued. `sent_at` is stamped
+    /// and the operator-visible reconcile note lands in `last_error`.
+    #[test]
+    fn s409_reconcile_walks_orphaned_sending_to_sent() {
+        let conn = open_in_memory();
+        let now = OffsetDateTime::now_utc();
+        insert_queued(
+            &conn,
+            "r1",
+            "storefront",
+            "[\"a@b.c\"]",
+            None,
+            "S",
+            "B",
+            None,
+            None,
+            "h",
+            1,
+            now,
+        )
+        .unwrap();
+        let claimed = claim_next_queued(&conn, now).unwrap().unwrap();
+        assert_eq!(claimed.state, QueueState::Sending);
+        // Simulate the bug: SMTP succeeded but mark_sent never ran.
+        let n = reconcile_orphaned_sending(&conn, now).expect("reconcile");
+        assert_eq!(n, 1, "the one orphaned Sending row is reconciled");
+        let r = read_row(&conn, "r1").unwrap().unwrap();
+        assert_eq!(r.state, QueueState::Sent, "walked forward, not back");
+        assert!(r.sent_at.is_some(), "sent_at stamped");
+        assert_eq!(r.last_error.as_deref(), Some(RECONCILE_NOTE));
+    }
+
+    /// S409 — [[hulye-biztos]] the load-bearing safety pin: after
+    /// reconcile, the row is `Sent`, so `claim_next_queued` returns
+    /// `None` — there is NO path that re-sends it. If a future refactor
+    /// reconciled a Sending row back to `Queued`, this test fails (the
+    /// claim would hand the row back to the SMTP send → duplicate email).
+    #[test]
+    fn s409_reconcile_never_resends() {
+        let conn = open_in_memory();
+        let now = OffsetDateTime::now_utc();
+        insert_queued(
+            &conn,
+            "r1",
+            "storefront",
+            "[\"a@b.c\"]",
+            None,
+            "S",
+            "B",
+            None,
+            None,
+            "h",
+            1,
+            now,
+        )
+        .unwrap();
+        claim_next_queued(&conn, now).unwrap().unwrap(); // -> Sending
+        reconcile_orphaned_sending(&conn, now).unwrap();
+        assert!(
+            claim_next_queued(&conn, now).unwrap().is_none(),
+            "a reconciled row must never be re-claimable for sending"
+        );
+    }
+
+    /// S409 — reconcile is surgical: it touches ONLY `Sending` rows. A
+    /// `Queued` row (not yet attempted) must be left for the drain, an
+    /// already-`Sent` row untouched, a `Failed` row untouched. Intent
+    /// pin (rule 9): a reconcile that grabbed `Queued` would re-send
+    /// nothing yet but would skip the real SMTP attempt — silent loss.
+    #[test]
+    fn s409_reconcile_ignores_non_sending_states() {
+        let conn = open_in_memory();
+        let now = OffsetDateTime::now_utc();
+        // q stays Queued. s -> Sent. f -> Failed. Drive s/f deterministically
+        // by id (a raw setup UPDATE to Sending, then the public terminal
+        // transition) rather than via claim, whose oldest-first order is
+        // unspecified when created_at ties.
+        for id in ["q", "s", "f"] {
+            insert_queued(
+                &conn,
+                id,
+                "storefront",
+                "[\"a@x\"]",
+                None,
+                "S",
+                "B",
+                None,
+                None,
+                "h",
+                1,
+                now,
+            )
+            .unwrap();
+        }
+        for id in ["s", "f"] {
+            conn.execute(
+                "UPDATE outbound_email_queue SET state = ? WHERE id = ?",
+                params![STATE_SENDING, id],
+            )
+            .unwrap();
+        }
+        mark_sent(&conn, "s", now).unwrap();
+        mark_failed(&conn, "f", "boom").unwrap();
+
+        let n = reconcile_orphaned_sending(&conn, now).expect("reconcile");
+        assert_eq!(n, 0, "no Sending rows present -> nothing reconciled");
+        assert_eq!(
+            read_row(&conn, "q").unwrap().unwrap().state,
+            QueueState::Queued
+        );
+        assert_eq!(
+            read_row(&conn, "s").unwrap().unwrap().state,
+            QueueState::Sent
+        );
+        assert_eq!(
+            read_row(&conn, "f").unwrap().unwrap().state,
+            QueueState::Failed
+        );
+    }
+
+    /// S409 — regression for the index bug itself: drive many full
+    /// Queued -> Sending -> Sent cycles. Pre-fix, the `state` secondary
+    /// index made `mark_sent`'s UPDATE liable to FATAL; post-fix (index
+    /// dropped) every cycle completes. A tight loop surfaces the failure
+    /// the brief asked us to reproduce.
+    #[test]
+    fn s409_repeated_state_transitions_do_not_fail() {
+        let conn = open_in_memory();
+        let now = OffsetDateTime::now_utc();
+        for i in 0..50 {
+            let id = format!("row-{i}");
+            insert_queued(
+                &conn,
+                &id,
+                "storefront",
+                "[\"a@b.c\"]",
+                None,
+                "S",
+                "B",
+                None,
+                None,
+                "h",
+                1,
+                now,
+            )
+            .unwrap();
+            let claimed = claim_next_queued(&conn, now).unwrap().unwrap();
+            assert_eq!(claimed.state, QueueState::Sending);
+            mark_sent(&conn, &claimed.id, now).unwrap();
+            assert_eq!(
+                read_row(&conn, &id).unwrap().unwrap().state,
+                QueueState::Sent
+            );
+        }
     }
 
     #[test]

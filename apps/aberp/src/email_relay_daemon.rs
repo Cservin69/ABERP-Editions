@@ -41,7 +41,8 @@ use lettre::{
 
 use crate::audit_payloads::EmailRelayAuditPayload;
 use crate::email_relay_queue::{
-    self, claim_next_queued, mark_failed, mark_sent, read_row, requeue_for_retry, OutboundEmailRow,
+    self, claim_next_queued, mark_failed, mark_sent, read_row, reconcile_orphaned_sending,
+    requeue_for_retry, OutboundEmailRow,
 };
 use crate::secrets_cache::SecretsCache;
 use crate::smtp_config::{self, SmtpConfig, SmtpSecurity};
@@ -73,6 +74,23 @@ pub struct EmailRelayDaemonDeps {
 /// per [[graceful-shutdown-s213]].
 pub async fn run_drain_loop(deps: EmailRelayDaemonDeps, cancel: CancellationToken) {
     tracing::info!("email-relay drain daemon started");
+
+    // S409 — heal rows orphaned in `Sending` by a previous process whose
+    // terminal transition didn't land (the DuckDB secondary-index UPDATE
+    // failure this PR removes). Runs ONCE, before any claim — so every
+    // `Sending` row at this point is definitively orphaned, not mid-flight.
+    // At-most-once: walked to `Sent`, never re-sent (no duplicate reaches
+    // the customer, per [[hulye-biztos]]).
+    match reconcile_startup(&deps).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            reconciled = n,
+            "email-relay startup reconcile: walked orphaned Sending rows to Sent \
+             without re-sending (see each row's last_error for the reason)"
+        ),
+        Err(e) => tracing::error!(error = ?e, "email-relay startup reconcile failed"),
+    }
+
     let tick = Duration::from_secs(DRAIN_TICK_SECS);
     loop {
         if cancel.is_cancelled() {
@@ -209,6 +227,25 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
             Ok(true)
         }
     }
+}
+
+/// S409 — one-shot startup reconcile of rows orphaned in `Sending`.
+/// Opens its own short-lived connection (mirrors the per-op connection
+/// posture of [`process_one_row`]). Returns the count reconciled.
+async fn reconcile_startup(deps: &EmailRelayDaemonDeps) -> Result<u64> {
+    let db_path = deps.db_path.clone();
+    let now = time::OffsetDateTime::now_utc();
+    tokio::task::spawn_blocking(move || -> Result<u64> {
+        let conn = Connection::open(&db_path).with_context(|| {
+            format!(
+                "open DuckDB at {} for email-relay startup reconcile",
+                db_path.display()
+            )
+        })?;
+        reconcile_orphaned_sending(&conn, now)
+    })
+    .await
+    .context("join reconcile task")?
 }
 
 /// Compose + send one queued row via SMTP. Returns `Ok(())` on
