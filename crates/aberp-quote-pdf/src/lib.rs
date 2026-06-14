@@ -25,7 +25,18 @@
 //! Addendum-1 visibility band: "Routing: 5-axis machine" if
 //! `requires_5_axis`, "Thin walls present (tight-tolerance surcharge
 //! applied)" if `thin_wall_present && target_tolerance>=Tight`. Footer
-//! with valid_until + extractor/engine versions + EUR-only money.
+//! with the Áben Consulting identity block + extractor/engine versions
+//! + EUR-only money.
+//!
+//! ## Visual style (S396)
+//!
+//! Brought to printed-invoice parity: the `invoice-pdf` ADR-0044
+//! silver/gold palette is ported verbatim ([`INK`] body, [`MUTED`]
+//! section labels, [`SILVER_LINE`] structural rules, ONE [`GOLD_ACCENT`]
+//! rule above the TOTAL) plus the invoice's footer identity grammar
+//! (legal name + ADÓSZÁM). The goal: an operator forwarding this quote
+//! to a customer sees the same refined surface as the invoice — no
+//! "looks half-done" gap between the two client-facing documents.
 //!
 //! ## Pushback against the brief
 //!
@@ -68,6 +79,45 @@ const PAGE_HEIGHT: i64 = 842;
 const MARGIN_LEFT: i64 = 56;
 const MARGIN_RIGHT: i64 = PAGE_WIDTH - 56;
 const MARGIN_TOP: i64 = PAGE_HEIGHT - 56;
+
+// ─── S396 — invoice-parity palette (ADR-0044 silver / gold) ────────────
+//
+// Ported verbatim from `invoice-pdf`'s ADR-0044 brand decision so an
+// operator who forwards this indicative quote to a customer sees the
+// same refined surface as the printed invoice: warm ink body, soft
+// silver structural rules, and ONE restrained gold accent (the rule
+// above the TOTAL line). Named once here so a future brand tweak is a
+// one-line edit, exactly as the invoice crate does. Pre-S396 the quote
+// rendered pure-black text on a default-grey rule — dev-tool plain; this
+// brings it to client-facing parity (CLAUDE.md rule 11: match the
+// reference's conventions, don't fork a new look).
+
+/// RGB triple in 0..=1, encoded for `lopdf`'s `Object::Real` (f32).
+type Color = (f32, f32, f32);
+
+/// Body ink — warm near-black. Every customer name, value, body line.
+const INK: Color = (0.13, 0.13, 0.15);
+/// Section labels (CUSTOMER, PART SUMMARY, …). Refined silver-grey.
+const MUTED: Color = (0.46, 0.47, 0.51);
+/// Structural rules — header under-rule, footer rule. Soft warm silver;
+/// identical to the crate's pre-S396 rule grey (the value was already
+/// invoice-silver, so the rules are byte-stable on colour).
+const SILVER_LINE: Color = (0.72, 0.72, 0.74);
+/// The ONE gold accent per ADR-0044's restraint rule: the rule above
+/// the TOTAL (EUR) line. Mirrors the invoice's totals-banner accent.
+const GOLD_ACCENT: Color = (0.72, 0.54, 0.12);
+/// Danger red for the stock-alert band (pre-S396 literal, retained).
+const DANGER_RED: Color = (0.75, 0.0, 0.0);
+
+/// Footer identity — single-tenant. Áben Consulting is the only issuer
+/// of these indicative quotes, so the legal name + tax number are baked
+/// as literals here (the same posture as the banner/addendum literals
+/// this crate already carries; the pure renderer has no app-config
+/// access). Both values are the documented prod identity owned by
+/// `apps/aberp/src/build_profile.rs::expected_tenant_identity` and must
+/// stay in sync with it. Mirrors the invoice's ELADÓ name + ADÓSZÁM.
+const SELLER_LEGAL_NAME: &str = "Áben Consulting KFT.";
+const SELLER_TAX_NUMBER: &str = "24904362-2-41";
 
 /// What the renderer needs to produce one indicative quote PDF.
 #[derive(Debug, Clone)]
@@ -207,30 +257,38 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
     let mut y = MARGIN_TOP;
 
     // ── Header band ────────────────────────────────────────────────
-    push_text(
+    //
+    // Title in warm ink at invoice-title weight; meta lines (ref +
+    // validity) in MUTED below it; a silver structural under-rule
+    // separates the header from the body — the same header grammar as
+    // the printed invoice ("Számla" + number + under-rule).
+    push_text_c(
         &mut ops,
         MARGIN_LEFT,
         y,
         "F2",
-        22,
+        26,
+        INK,
         "ABERP — Indicative Quote",
     );
-    y -= 22;
-    push_text(
+    y -= 26;
+    push_text_c(
         &mut ops,
         MARGIN_LEFT,
         y,
         "F1",
-        10,
+        9,
+        MUTED,
         &format!("Quote ref: {}", inputs.quote_id),
     );
     y -= 14;
-    push_text(
+    push_text_c(
         &mut ops,
         MARGIN_LEFT,
         y,
         "F1",
-        10,
+        9,
+        MUTED,
         &format!("Valid until: {}", inputs.valid_until_iso),
     );
     y -= 24;
@@ -256,7 +314,7 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
     }
 
     // ── Customer block ─────────────────────────────────────────────
-    push_text(&mut ops, MARGIN_LEFT, y, "F2", 12, "CUSTOMER");
+    push_text_c(&mut ops, MARGIN_LEFT, y, "F2", 12, MUTED, "CUSTOMER");
     y -= 16;
     push_text(&mut ops, MARGIN_LEFT, y, "F1", 11, inputs.customer_name);
     y -= 14;
@@ -268,7 +326,7 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
     y -= 24;
 
     // ── Part summary ───────────────────────────────────────────────
-    push_text(&mut ops, MARGIN_LEFT, y, "F2", 12, "PART SUMMARY");
+    push_text_c(&mut ops, MARGIN_LEFT, y, "F2", 12, MUTED, "PART SUMMARY");
     y -= 16;
     let fg = inputs.feature_graph;
     push_kv(
@@ -352,7 +410,7 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
     }
 
     // ── Price-breakdown table ──────────────────────────────────────
-    push_text(&mut ops, MARGIN_LEFT, y, "F2", 12, "PRICE BREAKDOWN");
+    push_text_c(&mut ops, MARGIN_LEFT, y, "F2", 12, MUTED, "PRICE BREAKDOWN");
     y -= 16;
     let b = inputs.breakdown;
     push_money_row(&mut ops, y, "Material", b.material_cost);
@@ -365,12 +423,23 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
     y -= 14;
     push_money_row(&mut ops, y, "Margin", b.margin);
     y -= 16;
-    push_rule(&mut ops, MARGIN_LEFT, MARGIN_RIGHT, y + 6);
+    // The single gold accent (ADR-0044 restraint) — the rule above the
+    // TOTAL, exactly as the invoice golds the line above its totals
+    // banner. Every other rule in this document stays silver.
+    push_rule_gold(&mut ops, MARGIN_LEFT, MARGIN_RIGHT, y + 6);
     push_money_row_bold(&mut ops, y, "TOTAL (EUR)", b.total_price);
     y -= 28;
 
     // ── Reasoning log (top 5) ──────────────────────────────────────
-    push_text(&mut ops, MARGIN_LEFT, y, "F2", 12, "HOW WE PRICED THIS");
+    push_text_c(
+        &mut ops,
+        MARGIN_LEFT,
+        y,
+        "F2",
+        12,
+        MUTED,
+        "HOW WE PRICED THIS",
+    );
     y -= 16;
     let show_n = b.reasoning_log.len().min(5);
     for line in b.reasoning_log.iter().take(show_n) {
@@ -379,12 +448,13 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
         y -= 12;
     }
     if b.reasoning_log.len() > 5 {
-        push_text(
+        push_text_c(
             &mut ops,
             MARGIN_LEFT,
             y,
             "F1",
             9,
+            MUTED,
             &format!(
                 "... {} further line(s) on the operator's breakdown",
                 b.reasoning_log.len() - 5
@@ -396,7 +466,7 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
 
     // ── Customer notes (if any) ────────────────────────────────────
     if !inputs.notes.is_empty() {
-        push_text(&mut ops, MARGIN_LEFT, y, "F2", 12, "YOUR NOTES");
+        push_text_c(&mut ops, MARGIN_LEFT, y, "F2", 12, MUTED, "YOUR NOTES");
         y -= 16;
         for chunk in wrap_chunks(inputs.notes, 96) {
             push_text(&mut ops, MARGIN_LEFT, y, "F1", 9, &chunk);
@@ -408,38 +478,74 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
     }
 
     // ── Footer ─────────────────────────────────────────────────────
+    //
+    // Áben Consulting identity block above a silver rule, then the
+    // version + non-binding disclaimer in MUTED. Mirrors the invoice's
+    // footer grammar (seller identity + attestation line) so a forwarded
+    // quote carries the same legal-identity weight as the printed
+    // invoice. Legal name in ink (the brand reads strongest), tax number
+    // alongside it like the invoice's ELADÓ ADÓSZÁM.
     let footer_y = 64;
+    push_text_c(
+        &mut ops,
+        MARGIN_LEFT,
+        footer_y + 30,
+        "F2",
+        9,
+        INK,
+        &format!("{}  ·  Adószám: {}", SELLER_LEGAL_NAME, SELLER_TAX_NUMBER),
+    );
     push_rule(&mut ops, MARGIN_LEFT, MARGIN_RIGHT, footer_y + 24);
-    push_text(
+    push_text_c(
         &mut ops,
         MARGIN_LEFT,
         footer_y + 8,
         "F1",
         8,
+        MUTED,
         &format!(
             "Indicative quote — prices in EUR. Engine: {} | Extractor: {} | Renderer: {}",
             inputs.engine_version, inputs.extractor_version, QUOTE_PDF_RENDERER_VERSION
         ),
     );
-    push_text(
+    push_text_c(
         &mut ops,
         MARGIN_LEFT,
         footer_y - 4,
         "F1",
         8,
+        MUTED,
         "This is a non-binding indicative quote. Final pricing confirmed on order acceptance.",
     );
 
     ops
 }
 
-/// Push a single text run at `(x, y)` with font `font_key` (`F1` or
-/// `F2`) at `size`.
-fn push_text(ops: &mut Vec<Operation>, x: i64, y: i64, font_key: &str, size: i64, s: &str) {
+/// Push a single text run at `(x, y)` in `color` with font `font_key`
+/// (`F1` / `F2`) at `size`. The `rg` (non-stroking / fill) op is set
+/// per run, so every run is self-contained — no colour state bleeds
+/// into the next run, and rule strokes (`RG`) stay independent.
+fn push_text_c(
+    ops: &mut Vec<Operation>,
+    x: i64,
+    y: i64,
+    font_key: &str,
+    size: i64,
+    color: Color,
+    s: &str,
+) {
     ops.push(Operation::new("BT", vec![]));
     ops.push(Operation::new(
         "Tf",
         vec![Object::Name(font_key.as_bytes().to_vec()), size.into()],
+    ));
+    ops.push(Operation::new(
+        "rg",
+        vec![
+            Object::Real(color.0),
+            Object::Real(color.1),
+            Object::Real(color.2),
+        ],
     ));
     ops.push(Operation::new("Td", vec![x.into(), y.into()]));
     let bytes = winansi_bytes(s);
@@ -450,42 +556,31 @@ fn push_text(ops: &mut Vec<Operation>, x: i64, y: i64, font_key: &str, size: i64
     ops.push(Operation::new("ET", vec![]));
 }
 
-/// Red-fill text run — same shape as [`push_text`] but sets the
-/// nonstroking colour to the danger red before the text object and
-/// resets to black after, so later runs stay black. The crate had no
-/// prior fill-colour token (rules use a stroking grey); this danger red
-/// (`0.75, 0.0, 0.0`) is introduced for the addendum-2 stock band and
-/// matches the spirit of the storefront's `--color-danger` banner.
+/// Ink-coloured text run — the body-text default. Convenience wrapper
+/// over [`push_text_c`] with [`INK`].
+fn push_text(ops: &mut Vec<Operation>, x: i64, y: i64, font_key: &str, size: i64, s: &str) {
+    push_text_c(ops, x, y, font_key, size, INK, s);
+}
+
+/// Danger-red text run for the stock-alert band. Thin wrapper over
+/// [`push_text_c`] with [`DANGER_RED`]; since every run sets its own
+/// fill, no manual reset-to-black is needed afterwards.
 fn push_text_red(ops: &mut Vec<Operation>, x: i64, y: i64, font_key: &str, size: i64, s: &str) {
-    ops.push(Operation::new(
-        "rg",
-        vec![0.75.into(), 0.0.into(), 0.0.into()],
-    ));
-    push_text(ops, x, y, font_key, size, s);
-    ops.push(Operation::new(
-        "rg",
-        vec![0.0.into(), 0.0.into(), 0.0.into()],
-    ));
+    push_text_c(ops, x, y, font_key, size, DANGER_RED, s);
 }
 
 /// Horizontal rule in the danger red, used to bracket the stock-alert
-/// band. Mirrors [`push_rule`] but with a 1pt red stroke for weight.
+/// band. 1pt red stroke for weight.
 fn push_rule_red(ops: &mut Vec<Operation>, x0: i64, x1: i64, y: i64) {
-    ops.push(Operation::new(
-        "RG",
-        vec![0.75.into(), 0.0.into(), 0.0.into()],
-    ));
-    ops.push(Operation::new("w", vec![1.0.into()]));
-    ops.push(Operation::new("m", vec![x0.into(), y.into()]));
-    ops.push(Operation::new("l", vec![x1.into(), y.into()]));
-    ops.push(Operation::new("S", vec![]));
+    push_rule_c(ops, x0, x1, y, DANGER_RED, 1.0);
 }
 
-/// Key-value row: left-aligned label + value indented to a fixed
-/// column. Keeps the part-summary block aligned for skimmability.
+/// Key-value row: MUTED label + INK value indented to a fixed column.
+/// Matches the invoice's label-in-grey / value-in-ink pairing so the
+/// part-summary block reads with the same hierarchy.
 fn push_kv(ops: &mut Vec<Operation>, x: i64, y: i64, label: &str, value: &str) {
-    push_text(ops, x, y, "F1", 10, label);
-    push_text(ops, x + 160, y, "F1", 10, value);
+    push_text_c(ops, x, y, "F1", 10, MUTED, label);
+    push_text_c(ops, x + 160, y, "F1", 10, INK, value);
 }
 
 /// Money row — label on the left, value right-aligned at the right
@@ -498,7 +593,7 @@ fn push_money_row(ops: &mut Vec<Operation>, y: i64, label: &str, amount: f64) {
 }
 
 /// Bold money row — same shape as `push_money_row` but bold (F2),
-/// used for the TOTAL line under the rule.
+/// used for the TOTAL line under the gold rule.
 fn push_money_row_bold(ops: &mut Vec<Operation>, y: i64, label: &str, amount: f64) {
     push_text(ops, MARGIN_LEFT, y, "F2", 12, label);
     let s = format!("{:.2} EUR", amount);
@@ -508,6 +603,7 @@ fn push_money_row_bold(ops: &mut Vec<Operation>, y: i64, label: &str, amount: f6
 /// Approximate right-align: shift left by `≈ 0.55 * size * len`
 /// chars before placing. Good enough for the totals column at v1
 /// (only one bold line at size 12, six regular lines at size 10).
+/// Always ink — the money column is body data.
 fn push_text_right(ops: &mut Vec<Operation>, x_right: i64, y: i64, font: &str, size: i64, s: &str) {
     let bytes = winansi_bytes(s);
     let approx_width = (bytes.len() as i64 * size * 55) / 100;
@@ -515,14 +611,32 @@ fn push_text_right(ops: &mut Vec<Operation>, x_right: i64, y: i64, font: &str, s
     push_text(ops, x, y, font, size, s);
 }
 
-/// Horizontal rule at y, full content-area width. 0.5pt soft grey
-/// per design-doc §13 aesthetic.
+/// Structural horizontal rule at y, full content-area width. 0.5pt
+/// soft silver ([`SILVER_LINE`]) — the document's default rule weight,
+/// matching the invoice's structural rules.
 fn push_rule(ops: &mut Vec<Operation>, x0: i64, x1: i64, y: i64) {
+    push_rule_c(ops, x0, x1, y, SILVER_LINE, 0.5);
+}
+
+/// The ONE gold accent rule (above the TOTAL line), per ADR-0044's
+/// restraint. Slightly heavier stroke (0.85pt) than the silver rules so
+/// the accent reads as deliberate — mirrors the invoice's gold weight.
+fn push_rule_gold(ops: &mut Vec<Operation>, x0: i64, x1: i64, y: i64) {
+    push_rule_c(ops, x0, x1, y, GOLD_ACCENT, 0.85);
+}
+
+/// Underlying rule emitter — sets stroke colour (`RG`) + weight (`w`),
+/// moves to `(x0, y)`, lines to `(x1, y)`, strokes (`S`).
+fn push_rule_c(ops: &mut Vec<Operation>, x0: i64, x1: i64, y: i64, color: Color, weight: f32) {
     ops.push(Operation::new(
         "RG",
-        vec![0.72.into(), 0.72.into(), 0.74.into()],
+        vec![
+            Object::Real(color.0),
+            Object::Real(color.1),
+            Object::Real(color.2),
+        ],
     ));
-    ops.push(Operation::new("w", vec![0.5.into()]));
+    ops.push(Operation::new("w", vec![Object::Real(weight)]));
     ops.push(Operation::new("m", vec![x0.into(), y.into()]));
     ops.push(Operation::new("l", vec![x1.into(), y.into()]));
     ops.push(Operation::new("S", vec![]));
@@ -782,5 +896,112 @@ mod tests {
         }
         let joined = chunks.join(" ");
         assert_eq!(joined, s);
+    }
+
+    /// S396 customer-journey e2e — the polish pass MUST NOT drop any
+    /// customer-facing surface. Render a fully-populated quote (company +
+    /// notes + multi-line reasoning) and assert every load-bearing
+    /// section's text still extracts. This is the regression gate: a
+    /// future style edit that accidentally deletes a section fires here,
+    /// not on a customer's screen (CLAUDE.md rule 9 — fails when the
+    /// intent regresses, not just the bytes).
+    #[test]
+    fn s396_all_customer_facing_sections_present_after_polish() {
+        let g = fake_graph(true, true);
+        let b = fake_breakdown();
+        let mut inputs = sample_inputs(&g, &b);
+        inputs.customer_name = "Példa Ügyfél";
+        inputs.customer_company = "Acme Manufacturing Ltd.";
+        inputs.customer_email = "buyer@acme.example";
+        inputs.notes = "Please prioritise lead time over cost.";
+        inputs.target_tolerance = ToleranceRange::Tight;
+        let bytes = render(&inputs).expect("render");
+        let text = pdf_extract::extract_text_from_mem(&bytes).expect("extract");
+
+        // Header + meta.
+        assert!(text.contains("Indicative Quote"), "title: {text}");
+        assert!(text.contains(inputs.quote_id), "quote ref: {text}");
+        assert!(text.contains("2026-07-06"), "valid until: {text}");
+        // Section headers.
+        for section in [
+            "CUSTOMER",
+            "PART SUMMARY",
+            "PRICE BREAKDOWN",
+            "HOW WE PRICED THIS",
+            "YOUR NOTES",
+        ] {
+            assert!(text.contains(section), "missing section {section}: {text}");
+        }
+        // Customer block (company + email are ASCII-safe to assert).
+        assert!(text.contains("Acme Manufacturing Ltd."), "company: {text}");
+        assert!(text.contains("buyer@acme.example"), "email: {text}");
+        // Part summary + addenda + breakdown + total.
+        assert!(text.contains("AL_6061_T6"), "material grade: {text}");
+        assert!(text.contains("5-axis"), "addendum 5-axis: {text}");
+        assert!(
+            text.contains("Thin walls present"),
+            "addendum thin-wall: {text}"
+        );
+        assert!(text.contains("TOTAL (EUR)"), "total label: {text}");
+        assert!(text.contains("21.00 EUR"), "total amount: {text}");
+        // Notes body.
+        assert!(text.contains("prioritise lead time"), "notes body: {text}");
+        // Footer identity block (ASCII-safe substrings per the
+        // stock-banner test's pdf_extract precedent).
+        assert!(
+            text.contains("Consulting KFT."),
+            "footer legal name: {text}"
+        );
+        assert!(
+            text.contains(SELLER_TAX_NUMBER),
+            "footer tax number: {text}"
+        );
+        // Disclaimer survives the footer restructure.
+        assert!(
+            text.contains("non-binding indicative quote"),
+            "disclaimer: {text}"
+        );
+    }
+
+    /// S396 sanity smoke — the branded render is non-trivial and at least
+    /// as large as the pre-polish output (the polish only ADDS ops:
+    /// per-run fill colours + the footer identity line). Byte length, not
+    /// a pixel compare, per the visual-validation-live-only posture. The
+    /// crate emits uncompressed PDF, so 2000 is a comfortable floor for a
+    /// branded single-page quote.
+    #[test]
+    fn s396_branded_render_byte_length_sanity() {
+        let g = fake_graph(false, false);
+        let b = fake_breakdown();
+        let inputs = sample_inputs(&g, &b);
+        let bytes = render(&inputs).expect("render");
+        assert!(
+            bytes.len() > 2000,
+            "branded quote PDF unexpectedly small: {} bytes",
+            bytes.len()
+        );
+    }
+
+    /// S396 palette pin — the silver/gold values are the brand decision
+    /// (ADR-0044), ported from `invoice-pdf`. A "let me just nudge the
+    /// gold" drift away from invoice parity fails here loudly. Mirrors
+    /// the invoice crate's `palette_constants_match_brand_decision`.
+    #[test]
+    fn s396_palette_matches_invoice_brand_decision() {
+        assert_eq!(INK, (0.13, 0.13, 0.15));
+        assert_eq!(MUTED, (0.46, 0.47, 0.51));
+        assert_eq!(SILVER_LINE, (0.72, 0.72, 0.74));
+        assert_eq!(GOLD_ACCENT, (0.72, 0.54, 0.12));
+    }
+
+    /// S396 footer identity pin — the baked legal name + tax number must
+    /// match the documented prod identity owned by
+    /// `apps/aberp/src/build_profile.rs::expected_tenant_identity`. If
+    /// that source of truth changes, this pin forces this literal to be
+    /// updated in lockstep (the pure crate can't import it).
+    #[test]
+    fn s396_footer_identity_matches_prod_tenant() {
+        assert_eq!(SELLER_LEGAL_NAME, "Áben Consulting KFT.");
+        assert_eq!(SELLER_TAX_NUMBER, "24904362-2-41");
     }
 }
