@@ -18,10 +18,11 @@
 //!
 //! ## Layout (storefront design doc §13)
 //!
-//! Single-page A4. Header band with ABERP wordmark + "Indicative
+//! A4, paginated. Header band with ABERP wordmark + "Indicative
 //! Quote". Customer block. Part summary (material grade, qty, bbox,
 //! volume). Price-breakdown table (material / labor / setup /
-//! overhead / margin / TOTAL). Top-5 reasoning_log lines.
+//! overhead / margin / TOTAL). The FULL reasoning_log (S404 — every
+//! line, flowing onto continuation pages, never truncated).
 //! Addendum-1 visibility band: "Routing: 5-axis machine" if
 //! `requires_5_axis`, "Thin walls present (tight-tolerance surcharge
 //! applied)" if `thin_wall_present && target_tolerance>=Tight`. Footer
@@ -79,6 +80,11 @@ const PAGE_HEIGHT: i64 = 842;
 const MARGIN_LEFT: i64 = 56;
 const MARGIN_RIGHT: i64 = PAGE_WIDTH - 56;
 const MARGIN_TOP: i64 = PAGE_HEIGHT - 56;
+/// S404 — flowing-content floor. The footer identity block occupies up
+/// to `footer_y + 30 = 94`; any body line drawn at or below this `y`
+/// would collide with it, so the reasoning log / notes page-break here.
+/// A line just above the floor still has clear air above the footer.
+const CONTENT_BOTTOM: i64 = 120;
 
 // ─── S396 — invoice-parity palette (ADR-0044 silver / gold) ────────────
 //
@@ -148,8 +154,9 @@ pub struct QuoteInputs<'a> {
     /// `requires_5_axis`, `thin_wall_present` for the customer-visible
     /// surfaces; addendum-1 visibility is driven from these flags.
     pub feature_graph: &'a FeatureGraph,
-    /// What the engine returned. Every monetary line is rendered.
-    /// Top 5 `reasoning_log` lines surface under "How we priced this."
+    /// What the engine returned. Every monetary line is rendered, and
+    /// (S404) every `reasoning_log` line surfaces in full under "How we
+    /// priced this." — flowing onto continuation pages, never truncated.
     pub breakdown: &'a QuoteBreakdown,
     /// What the engine was called with. Required for addendum-1's
     /// "tight-tolerance surcharge applied" line: that line only shows
@@ -208,34 +215,42 @@ pub fn render(inputs: &QuoteInputs<'_>) -> Result<Vec<u8>, QuotePdfError> {
         },
     });
 
-    let ops = build_content(inputs);
+    // S404 — `build_content` returns one operation stream per page. The
+    // fixed header→breakdown content lives on page 1; a long reasoning
+    // log (and notes) flow onto continuation pages rather than being
+    // truncated. All pages share the one font `Resources` dictionary.
+    let page_streams = build_content(inputs);
+    let mut kids: Vec<Object> = Vec::with_capacity(page_streams.len());
+    for ops in page_streams {
+        let content = Content { operations: ops };
+        let content_stream = Stream::new(
+            dictionary! {},
+            content
+                .encode()
+                .map_err(|e| QuotePdfError::LopdfSave(format!("encode content: {e}")))?,
+        );
+        let content_id = doc.add_object(content_stream);
 
-    let content = Content { operations: ops };
-    let content_stream = Stream::new(
-        dictionary! {},
-        content
-            .encode()
-            .map_err(|e| QuotePdfError::LopdfSave(format!("encode content: {e}")))?,
-    );
-    let content_id = doc.add_object(content_stream);
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(PAGE_WIDTH),
+                Object::Integer(PAGE_HEIGHT),
+            ],
+            "Resources" => resources_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
 
-    let page_id = doc.add_object(dictionary! {
-        "Type" => "Page",
-        "Parent" => pages_id,
-        "Contents" => content_id,
-        "MediaBox" => vec![
-            Object::Integer(0),
-            Object::Integer(0),
-            Object::Integer(PAGE_WIDTH),
-            Object::Integer(PAGE_HEIGHT),
-        ],
-        "Resources" => resources_id,
-    });
-
+    let page_count = kids.len() as i64;
     let pages = dictionary! {
         "Type" => "Pages",
-        "Kids" => vec![Object::Reference(page_id)],
-        "Count" => 1,
+        "Kids" => kids,
+        "Count" => page_count,
     };
     doc.objects.insert(pages_id, Object::Dictionary(pages));
 
@@ -251,8 +266,16 @@ pub fn render(inputs: &QuoteInputs<'_>) -> Result<Vec<u8>, QuotePdfError> {
     Ok(out)
 }
 
-/// Walk the page top-to-bottom building the content stream.
-fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
+/// Walk the document top-to-bottom building one content stream per page.
+///
+/// S404 — returns `Vec<Vec<Operation>>` (one entry per page). The fixed
+/// header→price-breakdown content always fits on page 1; the FULL
+/// reasoning log and the customer notes flow onto continuation pages via
+/// [`page_break`] when `y` drops to [`CONTENT_BOTTOM`]. Nothing is
+/// truncated — the operator and the customer see every line the engine
+/// produced (CLAUDE.md rule 12 / hulye-biztos).
+fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Vec<Operation>> {
+    let mut pages: Vec<Vec<Operation>> = Vec::new();
     let mut ops: Vec<Operation> = Vec::with_capacity(128);
     let mut y = MARGIN_TOP;
 
@@ -430,7 +453,15 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
     push_money_row_bold(&mut ops, y, "TOTAL (EUR)", b.total_price);
     y -= 28;
 
-    // ── Reasoning log (top 5) ──────────────────────────────────────
+    // ── Reasoning log (FULL — every line, no cap) ──────────────────
+    //
+    // S404 — the operator complaint: this block used to print the top 5
+    // lines then "... N further line(s) on the operator's breakdown",
+    // hiding the rest of the pricing logic. Now EVERY line renders;
+    // overflow flows onto continuation pages. Long lines wrap (96 chars
+    // at font 9 fits the content width) rather than truncate, so nothing
+    // the engine reasoned is dropped (hulye-biztos — no tribal knowledge,
+    // operator and customer see exactly what the engine computed).
     push_text_c(
         &mut ops,
         MARGIN_LEFT,
@@ -441,53 +472,87 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
         "HOW WE PRICED THIS",
     );
     y -= 16;
-    let show_n = b.reasoning_log.len().min(5);
-    for line in b.reasoning_log.iter().take(show_n) {
-        let truncated = truncate(line, 110);
-        push_text(&mut ops, MARGIN_LEFT, y, "F1", 9, &truncated);
-        y -= 12;
-    }
-    if b.reasoning_log.len() > 5 {
-        push_text_c(
-            &mut ops,
-            MARGIN_LEFT,
-            y,
-            "F1",
-            9,
-            MUTED,
-            &format!(
-                "... {} further line(s) on the operator's breakdown",
-                b.reasoning_log.len() - 5
-            ),
-        );
-        y -= 12;
+    for line in b.reasoning_log.iter() {
+        // A reasoning line may wrap to several rows; keep all rows of a
+        // line together with the page-break check applied per row.
+        for chunk in wrap_chunks(line, 96) {
+            if y < CONTENT_BOTTOM {
+                y = page_break(&mut pages, &mut ops, inputs);
+                push_text_c(
+                    &mut ops,
+                    MARGIN_LEFT,
+                    y,
+                    "F2",
+                    12,
+                    MUTED,
+                    "HOW WE PRICED THIS (cont.)",
+                );
+                y -= 16;
+            }
+            push_text(&mut ops, MARGIN_LEFT, y, "F1", 9, &chunk);
+            y -= 12;
+        }
     }
     y -= 10;
 
     // ── Customer notes (if any) ────────────────────────────────────
     if !inputs.notes.is_empty() {
+        // Page-break before the section header if the reasoning log left
+        // no room, so "YOUR NOTES" never collides with the footer.
+        if y < CONTENT_BOTTOM + 28 {
+            y = page_break(&mut pages, &mut ops, inputs);
+        }
         push_text_c(&mut ops, MARGIN_LEFT, y, "F2", 12, MUTED, "YOUR NOTES");
         y -= 16;
         for chunk in wrap_chunks(inputs.notes, 96) {
+            if y < CONTENT_BOTTOM {
+                y = page_break(&mut pages, &mut ops, inputs);
+                push_text_c(
+                    &mut ops,
+                    MARGIN_LEFT,
+                    y,
+                    "F2",
+                    12,
+                    MUTED,
+                    "YOUR NOTES (cont.)",
+                );
+                y -= 16;
+            }
             push_text(&mut ops, MARGIN_LEFT, y, "F1", 9, &chunk);
             y -= 12;
-            if y < 120 {
-                break;
-            }
         }
     }
 
-    // ── Footer ─────────────────────────────────────────────────────
-    //
-    // Áben Consulting identity block above a silver rule, then the
-    // version + non-binding disclaimer in MUTED. Mirrors the invoice's
-    // footer grammar (seller identity + attestation line) so a forwarded
-    // quote carries the same legal-identity weight as the printed
-    // invoice. Legal name in ink (the brand reads strongest), tax number
-    // alongside it like the invoice's ELADÓ ADÓSZÁM.
+    // ── Footer on the final page ───────────────────────────────────
+    push_footer(&mut ops, inputs);
+    pages.push(ops);
+    pages
+}
+
+/// Finalize the current page (stamp its footer), hand it to `pages`, and
+/// return the fresh top-of-page `y` for a continuation page. S404 — the
+/// single seam through which the reasoning log / notes overflow, so the
+/// footer is stamped consistently on every page including the last.
+fn page_break(
+    pages: &mut Vec<Vec<Operation>>,
+    ops: &mut Vec<Operation>,
+    inputs: &QuoteInputs<'_>,
+) -> i64 {
+    push_footer(ops, inputs);
+    pages.push(std::mem::take(ops));
+    MARGIN_TOP
+}
+
+/// Áben Consulting identity block above a silver rule, then the version +
+/// non-binding disclaimer in MUTED. Mirrors the invoice's footer grammar
+/// (seller identity + attestation line) so a forwarded quote carries the
+/// same legal-identity weight as the printed invoice. Legal name in ink
+/// (the brand reads strongest), tax number alongside it like the
+/// invoice's ELADÓ ADÓSZÁM. S404 — stamped on every page by `page_break`.
+fn push_footer(ops: &mut Vec<Operation>, inputs: &QuoteInputs<'_>) {
     let footer_y = 64;
     push_text_c(
-        &mut ops,
+        ops,
         MARGIN_LEFT,
         footer_y + 30,
         "F2",
@@ -495,9 +560,9 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
         INK,
         &format!("{}  ·  Adószám: {}", SELLER_LEGAL_NAME, SELLER_TAX_NUMBER),
     );
-    push_rule(&mut ops, MARGIN_LEFT, MARGIN_RIGHT, footer_y + 24);
+    push_rule(ops, MARGIN_LEFT, MARGIN_RIGHT, footer_y + 24);
     push_text_c(
-        &mut ops,
+        ops,
         MARGIN_LEFT,
         footer_y + 8,
         "F1",
@@ -509,7 +574,7 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
         ),
     );
     push_text_c(
-        &mut ops,
+        ops,
         MARGIN_LEFT,
         footer_y - 4,
         "F1",
@@ -517,8 +582,6 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Operation> {
         MUTED,
         "This is a non-binding indicative quote. Final pricing confirmed on order acceptance.",
     );
-
-    ops
 }
 
 /// Push a single text run at `(x, y)` in `color` with font `font_key`
@@ -640,18 +703,6 @@ fn push_rule_c(ops: &mut Vec<Operation>, x0: i64, x1: i64, y: i64, color: Color,
     ops.push(Operation::new("m", vec![x0.into(), y.into()]));
     ops.push(Operation::new("l", vec![x1.into(), y.into()]));
     ops.push(Operation::new("S", vec![]));
-}
-
-/// Truncate a string by char count, appending `...` if cut. Avoids
-/// splitting WinAnsi multi-byte sequences mid-rune.
-fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max_chars.saturating_sub(3)).collect();
-        out.push_str("...");
-        out
-    }
 }
 
 /// Chunk a long string into ≤ `width` char rows by word boundary
@@ -1003,5 +1054,102 @@ mod tests {
     fn s396_footer_identity_matches_prod_tenant() {
         assert_eq!(SELLER_LEGAL_NAME, "Áben Consulting KFT.");
         assert_eq!(SELLER_TAX_NUMBER, "24904362-2-41");
+    }
+
+    /// S404 — build a breakdown whose reasoning_log has `n` ASCII-marked
+    /// lines so each is individually assertable in the extracted text.
+    fn breakdown_with_reasoning(n: usize) -> QuoteBreakdown {
+        let mut b = fake_breakdown();
+        b.reasoning_log = (0..n)
+            .map(|i| format!("RLINE_{i}_MARK pricing step number {i}"))
+            .collect();
+        b
+    }
+
+    fn page_count(bytes: &[u8]) -> usize {
+        let doc = lopdf::Document::load_mem(bytes).expect("load pdf");
+        doc.get_pages().len()
+    }
+
+    /// S404 core regression — the old renderer printed the top 5 lines
+    /// then "... N further line(s) on the operator's breakdown". That
+    /// truncation MUST be gone: every reasoning line renders, and the
+    /// "further line(s)" tail string is never emitted. Asserts the FIRST,
+    /// a MIDDLE, and the LAST marker all extract (rule 9 — fails the
+    /// moment a cap is reintroduced, not just on a byte nudge).
+    #[test]
+    fn s404_full_reasoning_log_rendered_no_truncation() {
+        let g = fake_graph(false, false);
+        for n in [3usize, 12, 50, 100] {
+            let b = breakdown_with_reasoning(n);
+            let inputs = sample_inputs(&g, &b);
+            let bytes = render(&inputs).expect("render");
+            let text = pdf_extract::extract_text_from_mem(&bytes).expect("extract");
+            assert!(
+                !text.contains("further line"),
+                "n={n}: truncation tail must be gone: {text}"
+            );
+            for i in [0usize, n / 2, n - 1] {
+                assert!(
+                    text.contains(&format!("RLINE_{i}_MARK")),
+                    "n={n}: reasoning line {i} missing from PDF"
+                );
+            }
+        }
+    }
+
+    /// S404 — a long reasoning log spills onto continuation pages rather
+    /// than overrunning the footer. 100 lines must produce >1 page; a
+    /// short log stays single-page (no gratuitous blank pages).
+    #[test]
+    fn s404_long_reasoning_log_paginates() {
+        let g = fake_graph(false, false);
+
+        let short = breakdown_with_reasoning(3);
+        let short_inputs = sample_inputs(&g, &short);
+        assert_eq!(
+            page_count(&render(&short_inputs).expect("render")),
+            1,
+            "a 3-line log must stay single-page"
+        );
+
+        let long = breakdown_with_reasoning(100);
+        let long_inputs = sample_inputs(&g, &long);
+        assert!(
+            page_count(&render(&long_inputs).expect("render")) > 1,
+            "a 100-line reasoning log must span multiple pages"
+        );
+    }
+
+    /// S404 — every page carries the footer identity block (so a printed
+    /// continuation page is still legally attributable). The seller tax
+    /// number must appear once per page.
+    #[test]
+    fn s404_footer_on_every_page() {
+        let g = fake_graph(false, false);
+        let b = breakdown_with_reasoning(100);
+        let inputs = sample_inputs(&g, &b);
+        let bytes = render(&inputs).expect("render");
+        let pages = page_count(&bytes);
+        assert!(pages > 1, "expected multipage for this test");
+        let text = pdf_extract::extract_text_from_mem(&bytes).expect("extract");
+        let footers = text.matches(SELLER_TAX_NUMBER).count();
+        assert_eq!(
+            footers, pages,
+            "footer tax number must appear once per page ({pages} pages, {footers} footers)"
+        );
+    }
+
+    /// S404 — render stays byte-deterministic with the multi-page path.
+    /// The pagination loop must not introduce any clock/RNG/iteration
+    /// nondeterminism (load-bearing for the writeback idempotency key).
+    #[test]
+    fn s404_multipage_render_is_deterministic() {
+        let g = fake_graph(false, false);
+        let b = breakdown_with_reasoning(80);
+        let inputs = sample_inputs(&g, &b);
+        let a = render(&inputs).expect("a");
+        let b2 = render(&inputs).expect("b");
+        assert_eq!(a, b2, "multi-page render must be byte-deterministic");
     }
 }

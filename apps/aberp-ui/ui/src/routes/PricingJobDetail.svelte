@@ -47,6 +47,7 @@
     auditKindLabel,
     breakdownRows,
     latestWritebackOutcome,
+    reasoningLogLines,
     timelineNodes,
   } from "../lib/pricing-job-detail";
   import {
@@ -108,6 +109,7 @@
   const timeline = $derived(timelineNodes(auditEvents));
   const writeback = $derived(latestWritebackOutcome(auditEvents));
   const priceRows = $derived(breakdownRows(detail?.breakdown ?? null));
+  const reasoningLog = $derived(reasoningLogLines(detail?.breakdown ?? null));
   // The Accept button shows only on a Posted (priced + delivered) row that
   // has not already been operator-accepted (the backend 409 is the safety
   // net; this just hides the affordance once synced).
@@ -695,11 +697,16 @@
                 {/each}
               </tbody>
             </table>
-            {#if detail.breakdown?.reasoning_log && detail.breakdown.reasoning_log.length > 0}
-              <details class="qjd__details">
-                <summary>Indoklás / Reasoning log</summary>
-                <ol class="qjd__log">
-                  {#each detail.breakdown.reasoning_log as line, i (i)}
+            {#if reasoningLog.length > 0}
+              <!-- S404: expanded by default — the operator sees the FULL
+                   pricing logic, no "N more…" hiding. Still collapsible
+                   for density, but every line the engine produced is
+                   present (matches the un-truncated PDF). -->
+              <details class="qjd__details" open>
+                <summary>Indoklás / Reasoning log ({reasoningLog.length})</summary
+                >
+                <ol class="qjd__log" data-testid="pricing-job-reasoning-log">
+                  {#each reasoningLog as line, i (i)}
                     <li>{line}</li>
                   {/each}
                 </ol>

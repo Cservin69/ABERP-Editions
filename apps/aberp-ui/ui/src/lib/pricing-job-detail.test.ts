@@ -12,6 +12,7 @@ import {
   auditKindLabel,
   breakdownRows,
   latestWritebackOutcome,
+  reasoningLogLines,
   timelineNodes,
   WRITEBACK_OUTCOME_KIND,
 } from "./pricing-job-detail";
@@ -159,6 +160,31 @@ describe("breakdownRows", () => {
     // Pricing has breakdown === null. The panel renders a "not
     // available" placeholder when this is empty — never a blank table.
     expect(breakdownRows(null)).toEqual([]);
+  });
+});
+
+describe("reasoningLogLines", () => {
+  // S404 — the operator (and the customer PDF) must see EVERY reasoning
+  // line, never a top-N cap. These pins fire if anyone reintroduces a
+  // `.slice(...)` on the log (the exact regression the old PDF had).
+  for (const n of [3, 12, 50, 100]) {
+    it(`returns all ${n} lines, uncapped and in order`, () => {
+      const log = Array.from({ length: n }, (_, i) => `step ${i}`);
+      const bd: PricingBreakdownView = { total_price: 1, reasoning_log: log };
+      const out = reasoningLogLines(bd);
+      expect(out).toHaveLength(n);
+      expect(out).toEqual(log);
+      expect(out[0]).toBe("step 0");
+      expect(out[n - 1]).toBe(`step ${n - 1}`);
+    });
+  }
+
+  it("returns [] for a null breakdown (graceful, no crash)", () => {
+    expect(reasoningLogLines(null)).toEqual([]);
+  });
+
+  it("returns [] when the breakdown has no reasoning_log field", () => {
+    expect(reasoningLogLines({ total_price: 45 })).toEqual([]);
   });
 });
 

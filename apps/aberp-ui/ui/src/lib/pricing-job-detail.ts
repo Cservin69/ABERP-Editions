@@ -155,3 +155,16 @@ export function breakdownRows(
   }
   return out;
 }
+
+/** S404 — the engine's `reasoning_log` ("how we priced this"), in full.
+ *  The operator (and the customer-facing PDF) must see EVERY line the
+ *  engine produced — no top-N cap, no "N more…" tail. This helper is the
+ *  single seam the component renders from, so a future accidental
+ *  `.slice(0, 5)` cap is a one-line regression caught by vitest rather
+ *  than silently hidden from the operator (hulye-biztos). Returns `[]`
+ *  for a null/absent breakdown or empty log. */
+export function reasoningLogLines(
+  breakdown: PricingBreakdownView | null,
+): string[] {
+  return breakdown?.reasoning_log ?? [];
+}
