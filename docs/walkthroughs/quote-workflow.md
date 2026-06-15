@@ -1,6 +1,7 @@
 # Walkthrough — storefront → ABERP quote workflow (operator guide)
 
-**Date:** 2026-06-12 · **Release:** PROD_v2.27.39 (S368) · **Audience:** operator
+**Date:** 2026-06-12 (operator-flow refreshed 2026-06-15, S421) · **Release:**
+PROD_v2.27.66 · **Audience:** operator
 
 This is the end-to-end operator guide for the auto-quoting workflow: a customer
 requests a quote on the storefront, ABERP prices it automatically, the priced
@@ -49,8 +50,11 @@ PDF, and POSTs it back to the storefront (`POST /api/quotes/{id}/priced`). The
 storefront flips the quote to `quoted` and emails the customer a link with a
 signed DEAL token. The customer accepts by typing `ACCEPT` on the signed page;
 the storefront flips the quote to `approved`. ABERP's intake daemon picks up the
-`approved` quote, the operator clears the DEAL gate, and the quote is converted
-into a draft invoice in ABERP.
+`approved` quote, stages a draft invoice, and writes the customer-facing status
+back to `processing` (S398 — *not* `invoiced`; the draft is pre-DEAL and not a
+fiscal invoice). The operator then either clears the **DEAL** gate — converting
+the quote into a draft invoice in ABERP — or **Refuses** it with a reason (S403)
+if stock/capacity cannot fulfil it.
 
 The operator watches the in-flight pricing on the **Auto-quoting pipeline** tab
 (`PricingJobsList.svelte`) and works the accepted quotes on the **Quotes** tab
@@ -287,10 +291,14 @@ audit ledger), and the operator actions:
 - **✎ material edit** — override the material grade
   (`PATCH /api/quote-pricing-jobs/:id`). Catalogue-validated; on save the row
   resets to `Fetched` and re-prices. Records `quote.material_grade_edited`.
-- **Accept (operator-on-behalf)** — record an off-channel acceptance (phone /
-  email / in person). Shown only on a `Posted` row not already accepted. Records
-  `quote.operator_accepted`; the storefront flips to `approved`. The backend 409s
-  a double-accept (the SPA gate is convenience, the 409 is the safety).
+
+There is **no operator Accept-on-behalf** action on this panel. Acceptance is
+customer-driven: the customer accepts from the signed DEAL link in their priced
+quote e-mail (§5.5). The earlier S354 operator-side Accept button was **removed
+in S413/S416** — it bypassed the customer and duplicated the storefront's
+signed-link accept, so the only path to `approved` is now the customer's own
+click. (The `quote.operator_accepted` audit variant still exists in the ledger
+enum because persisted variants can't be deleted, but nothing emits it.)
 
 ### 5.4 — [ABERP SPA] Retry a Failed row
 
@@ -308,11 +316,20 @@ customer opens the link and types `ACCEPT`. If the stock state changed since the
 quote was issued, the page forces a `REFRESH` acknowledgement before the DEAL
 gate opens. On accept, the storefront flips the quote to `approved`.
 
-### 5.6 — [ABERP SPA] Pick up the approved quote → draft invoice
+### 5.6 — [ABERP SPA] Pick up the approved quote → DEAL or Refuse
 
 The accepted quote moves out of the Auto-quoting pipeline tab. ABERP's intake
 daemon (polling `status=approved`) stages it into the **Quotes** tab
-(`QuotesList.svelte`). There:
+(`QuotesList.svelte`). At staging the daemon writes the storefront status back to
+`processing` (S398), so the customer portal shows **"Feldolgozás alatt / In
+progress"** — *not* "Számlázva / Invoiced": a staged draft is pre-DEAL and not a
+fiscal invoice. The storefront state machine only permits `approved → processing`,
+so a stale build that still wrote `invoiced` here would be rejected, not silently
+mislabel.
+
+From the Quotes tab the operator takes **one** of two actions on the row:
+
+**DEAL — accept and convert to a draft invoice:**
 
 1. Each row carries a **DEAL gate** (`QuoteDealGate.svelte`). The expected DEAL
    token is the quote id's first 8 characters. Type it into the gate. If a stock
@@ -324,6 +341,17 @@ daemon (polling `status=approved`) stages it into the **Quotes** tab
    `deal_already_issued`).
 3. From the draft invoice, proceed through ABERP's normal invoicing
    (Számla / IssueInvoice) flow.
+
+**Refuse — decline with a reason (S403):**
+
+If stock or capacity cannot fulfil an accepted quote, click **Elutasítás /
+Refuse** on the row and enter a reason (`POST /api/quote-intake/:id/refuse`). The
+refuse saga is atomic: it flips the intake row to `refused` (dropping it out of
+the actionable queue), audits `quote.operator_refused`, and e-mails the customer
+the reason — all in one transaction. It then best-effort writes the storefront
+status to `rejected`; the local refusal + customer e-mail are the committed
+source of truth, so the call returns `200` even if that storefront sync fails,
+surfacing the sync result loud (`storefront_synced`) rather than hiding it.
 
 ---
 
