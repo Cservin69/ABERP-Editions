@@ -292,6 +292,13 @@ pub fn run() {
             commands::create_partner,
             commands::update_partner,
             commands::delete_partner,
+            // S427 — quoting_machines master data + lead-time override.
+            commands::list_machines,
+            commands::get_machine,
+            commands::create_machine,
+            commands::update_machine,
+            commands::archive_machine,
+            commands::override_quote_lead_time,
             // S257 / PR-246 — Settings → Adapters CRUD.
             commands::list_adapters,
             commands::create_adapter,

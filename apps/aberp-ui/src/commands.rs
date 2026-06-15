@@ -510,6 +510,64 @@ pub async fn delete_partner(state: State<'_, AppState>, partner_id: String) -> R
     forward_delete(&state, &path).await
 }
 
+// ── S427 — quoting_machines master data + lead-time override ──────────
+//
+// Mirrors the partner CRUD bridge. `machine_id` is the server-minted
+// `qcm_<ULID>`; reuse [`validate_partner_id`] for its generic id-shape
+// check (`[A-Za-z0-9_-]`, ≤ 64) before it reaches the path.
+
+/// `GET /api/machines` — the Machines master-data list (active rows).
+#[tauri::command]
+pub async fn list_machines(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/machines", true).await
+}
+
+/// `GET /api/machines/:id` — single machine for the edit form.
+#[tauri::command]
+pub async fn get_machine(state: State<'_, AppState>, machine_id: String) -> Result<Value, String> {
+    validate_partner_id(&machine_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/machines/{machine_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// `POST /api/machines` — create from the form inputs.
+#[tauri::command]
+pub async fn create_machine(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/machines", body).await
+}
+
+/// `PUT /api/machines/:id` — update.
+#[tauri::command]
+pub async fn update_machine(
+    state: State<'_, AppState>,
+    machine_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_partner_id(&machine_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/machines/{machine_id}");
+    forward_put(&state, &path, body).await
+}
+
+/// `DELETE /api/machines/:id` — archive (soft). Returns `null` on 204.
+#[tauri::command]
+pub async fn archive_machine(state: State<'_, AppState>, machine_id: String) -> Result<(), String> {
+    validate_partner_id(&machine_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/machines/{machine_id}");
+    forward_delete(&state, &path).await
+}
+
+/// `POST /api/quote-pricing-jobs/:quote_id/lead-time-override` — set or
+/// clear (`override_days: null`) the operator lead-time override.
+#[tauri::command]
+pub async fn override_quote_lead_time(
+    state: State<'_, AppState>,
+    quote_id: String,
+    body: Value,
+) -> Result<(), String> {
+    let path = format!("/api/quote-pricing-jobs/{quote_id}/lead-time-override");
+    forward_post(&state, &path, body).await.map(|_| ())
+}
+
 // ── S257 / PR-246 — Settings → Adapters CRUD ─────────────────────────
 
 /// `GET /api/adapters` — list persisted adapters joined with live

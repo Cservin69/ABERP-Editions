@@ -1594,6 +1594,101 @@ export async function deletePartner(partnerId: string): Promise<void> {
   await invoke<void>("delete_partner", { partnerId });
 }
 
+// ── S427 — Master Data → Machines CRUD ───────────────────────────────
+
+/** S427 — closed-vocab machine family. PascalCase-free db-strings that
+ * mirror `aberp::machines::MachineFamily`'s serde rename (no
+ * `rename_all`; each variant carries an explicit kebab/abbrev rename).
+ * The SPA's TS-strict consumption catches a backend drift at
+ * `npm run check`. */
+export type MachineFamily =
+  | "3-axis-mill"
+  | "5-axis-mill"
+  | "wire-EDM"
+  | "sinker-EDM"
+  | "lathe"
+  | "grinder"
+  | "additive"
+  | "other";
+
+/** S427 — single quoting-machine row. Snake_case JSON mirrors
+ * `aberp::machines::QuotingMachine`'s `#[derive(Serialize)]`. The
+ * envelope is a fixed `[x, y, z]` triple in millimetres.
+ * `archived_at` is non-null only for soft-deleted rows; the list
+ * endpoint hides them by default. */
+export interface QuotingMachine {
+  /** Prefixed-ULID `qcm_<26-char-ULID>`. */
+  id: string;
+  name: string;
+  family: MachineFamily;
+  max_envelope_xyz_mm: [number, number, number];
+  daily_hours_avail: number;
+  buffer_pct: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+}
+
+/** S427 — request body for `POST /api/machines` + `PUT
+ * /api/machines/:id`. Mirror of `aberp::machines::MachineInputs`.
+ * Backend defaults when omitted: `daily_hours_avail=16`,
+ * `buffer_pct=20`, `enabled=true`. */
+export interface MachineInputs {
+  name: string;
+  family: MachineFamily;
+  max_envelope_xyz_mm: [number, number, number];
+  daily_hours_avail: number;
+  buffer_pct: number;
+  enabled: boolean;
+}
+
+/** S427 — `GET /api/machines`. Full list of active (non-archived)
+ * machines. */
+export async function listMachines(): Promise<QuotingMachine[]> {
+  return invoke<QuotingMachine[]>("list_machines");
+}
+
+/** S427 — `GET /api/machines/:id`. */
+export async function getMachine(machineId: string): Promise<QuotingMachine> {
+  return invoke<QuotingMachine>("get_machine", { machineId });
+}
+
+/** S427 — `POST /api/machines`. */
+export async function createMachine(
+  body: MachineInputs,
+): Promise<QuotingMachine> {
+  return invoke<QuotingMachine>("create_machine", { body });
+}
+
+/** S427 — `PUT /api/machines/:id`. */
+export async function updateMachine(
+  machineId: string,
+  body: MachineInputs,
+): Promise<QuotingMachine> {
+  return invoke<QuotingMachine>("update_machine", { machineId, body });
+}
+
+/** S427 — `DELETE /api/machines/:id`. Soft-delete (archive); the row
+ * stays in the DB. */
+export async function archiveMachine(machineId: string): Promise<void> {
+  await invoke<void>("archive_machine", { machineId });
+}
+
+/** S427 — `PUT /api/quote-pricing-jobs/:quote_id/lead-time-override`.
+ * Set or clear the operator's lead-time override. `overrideDays`
+ * null clears the override (effective lead-time falls back to the
+ * engine-computed value). */
+export async function overrideQuoteLeadTime(
+  quoteId: string,
+  overrideDays: number | null,
+): Promise<void> {
+  await invoke<void>("override_quote_lead_time", {
+    quoteId,
+    body: { override_days: overrideDays },
+  });
+}
+
 // ── S257 / PR-246 — Settings → Adapters CRUD ─────────────────────────
 
 /** Closed-vocab MES adapter kinds. Wire strings match each adapter's
@@ -3513,6 +3608,12 @@ export interface PricingJobDetail extends PricingJobRow {
   valid_until_iso: string | null;
   /** Always `"EUR"` in v1 (storefront + engine are EUR-denominated). */
   currency: string;
+  /** S427 — engine-computed lead time in days, or `null` before the
+   * row has been priced. */
+  lead_time_days: number | null;
+  /** S427 — operator lead-time override in days, or `null` when no
+   * override is set. Effective lead-time = override ?? computed. */
+  lead_time_override_days: number | null;
 }
 
 /** S349 / PR-40 (U1) — fetch the full detail for one pricing job.

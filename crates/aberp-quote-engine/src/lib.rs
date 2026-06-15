@@ -102,12 +102,17 @@
 #![warn(missing_docs)]
 
 mod breakdown;
+mod capacity;
 mod catalogue;
 mod engine;
 mod error;
 mod feature_graph;
 
 pub use breakdown::QuoteBreakdown;
+pub use capacity::{
+    lead_time_days, LeadTimeEstimate, MachineCapacity, MachineFamily, FALLBACK_BUFFER_PCT,
+    FALLBACK_DAILY_HOURS,
+};
 pub use catalogue::{
     ComplexityRule, Material, QuotingParameters, StockAdjustment, StockStatus, ToleranceMultiplier,
 };

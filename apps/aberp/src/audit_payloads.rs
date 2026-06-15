@@ -5563,3 +5563,89 @@ impl SnapshotPrunedPayload {
         serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// S427 — quoting_machines master data + capacity-aware lead-time.
+// `mes.*` (machine CRUD) + `quote.*` (lead-time) family payloads. App-
+// layer JSON only, never NAV XML bytes.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::MachineCreated`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MachineCreatedPayload {
+    pub machine_id: String,
+    pub name: String,
+    /// `quoting_machines.family` storage string (e.g. `3-axis-mill`).
+    pub family: String,
+    pub daily_hours_avail: f64,
+    pub buffer_pct: f64,
+}
+
+impl MachineCreatedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::MachineEdited`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MachineEditedPayload {
+    pub machine_id: String,
+    pub name: String,
+    pub family: String,
+    pub daily_hours_avail: f64,
+    pub buffer_pct: f64,
+    pub enabled: bool,
+}
+
+impl MachineEditedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::MachineArchived`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineArchivedPayload {
+    pub machine_id: String,
+    pub archived_at: String,
+}
+
+impl MachineArchivedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::QuoteLeadTimeOverridden`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuoteLeadTimeOverriddenPayload {
+    pub quote_id: String,
+    /// The engine-computed lead-time the operator is overriding, if one
+    /// had been computed (NULL pre-pricing).
+    pub computed_days: Option<u32>,
+    /// The operator's chosen value. `None` clears a prior override and
+    /// reverts to the computed value.
+    pub override_days: Option<u32>,
+}
+
+impl QuoteLeadTimeOverriddenPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::QuotingMachinesEmptyFallback`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuotingMachinesEmptyFallbackPayload {
+    pub fallback_daily_hours: f64,
+    pub fallback_buffer_pct: f64,
+    /// RFC-3339 UTC timestamp the fallback was first hit this server run.
+    pub observed_at: String,
+}
+
+impl QuotingMachinesEmptyFallbackPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}

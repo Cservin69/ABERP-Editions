@@ -493,6 +493,12 @@ fn prepare_rerender(
         target_tolerance: ToleranceRange::Standard,
         // The whole point of the re-render.
         stock_alert: true,
+        // S427 — effective lead-time (override ?? computed), same source
+        // as `advance_render` so the re-render differs only by the band.
+        lead_time_days: crate::quote_pricing_jobs::get_effective_lead_time_days(
+            &conn, quote_id, tenant_id,
+        )
+        .map_err(PrepareError::Db)?,
     };
     let pdf_bytes = aberp_quote_pdf::render(&inputs)
         .map_err(|e| PrepareError::Render(anyhow!("render priced.pdf: {e}")))?;

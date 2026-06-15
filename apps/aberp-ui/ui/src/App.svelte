@@ -77,6 +77,7 @@
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
   import PartnersList from "./routes/PartnersList.svelte";
   import ProductsList from "./routes/ProductsList.svelte";
+  import MachinesList from "./routes/MachinesList.svelte";
   // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Work Orders v1.
   import WorkOrdersList from "./routes/WorkOrdersList.svelte";
   // S233 / PR-229 / ADR-0063 — Stage 3 Phase γ QA queue v1 SPA tab.
@@ -660,6 +661,8 @@
           <PartnersList />
         {:else if route === "products"}
           <ProductsList />
+        {:else if route === "machines"}
+          <MachinesList />
         {:else if route === "work-orders"}
           <WorkOrdersList />
         {:else if route === "qa"}

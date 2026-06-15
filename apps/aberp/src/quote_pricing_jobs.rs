@@ -295,6 +295,13 @@ ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS failure_kind VARCHAR;
 -- renders a placeholder) until they're re-fetched/retried, which writes
 -- the buyer's company from the storefront listing.
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS customer_company VARCHAR;
+-- S427 — capacity-aware lead-time. `lead_time_days` is the engine-
+-- computed estimate stamped at pricing; `lead_time_override_days` is the
+-- operator's manual override (NULL = use the computed value). Both
+-- nullable, no DEFAULT per [[no-sql-specific]]; existing rows read back
+-- NULL until re-priced / overridden.
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS lead_time_days INTEGER;
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS lead_time_override_days INTEGER;
 ";
 
 /// Idempotent — call at every writer entry.
@@ -1212,6 +1219,10 @@ pub struct JobDetail {
     pub breakdown_json: Option<String>,
     pub pdf_path: Option<String>,
     pub valid_until_iso: Option<String>,
+    /// S427 — engine-computed lead-time (calendar days), NULL pre-pricing.
+    pub lead_time_days: Option<u32>,
+    /// S427 — operator override (calendar days), NULL = use computed.
+    pub lead_time_override_days: Option<u32>,
 }
 
 /// S349 / PR-40 (U1) — read one job row + its artifacts for the detail
@@ -1232,7 +1243,8 @@ pub fn get_job_detail(
                     feature_graph_hash, total_price_eur, error_stage, error_reason,
                     attempt_n, failure_kind,
                     cad_filename, feature_graph_json, breakdown_json, pdf_path,
-                    valid_until_iso, customer_company
+                    valid_until_iso, customer_company,
+                    lead_time_days, lead_time_override_days
                 FROM quote_pricing_jobs
                 WHERE quote_id = ? AND tenant_id = ?",
         )
@@ -1276,7 +1288,149 @@ pub fn get_job_detail(
         breakdown_json: r.get(17).ok(),
         pdf_path: r.get(18).ok(),
         valid_until_iso: r.get(19).ok(),
+        lead_time_days: r
+            .get::<_, Option<i64>>(21)
+            .ok()
+            .flatten()
+            .map(|v| v.max(0) as u32),
+        lead_time_override_days: r
+            .get::<_, Option<i64>>(22)
+            .ok()
+            .flatten()
+            .map(|v| v.max(0) as u32),
     }))
+}
+
+/// S427 — the effective lead-time for a job: the operator override if
+/// set, else the engine-computed value, else `None` (not yet priced).
+/// This is what the customer-facing PDF banner renders.
+pub fn get_effective_lead_time_days(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+) -> Result<Option<u32>> {
+    ensure_schema(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT lead_time_override_days, lead_time_days FROM quote_pricing_jobs \
+             WHERE quote_id = ? AND tenant_id = ?",
+        )
+        .context("prepare get_effective_lead_time")?;
+    let mut rows = stmt.query(params![quote_id, tenant_id])?;
+    let Some(r) = rows.next()? else {
+        return Ok(None);
+    };
+    let override_days: Option<i64> = r.get(0).ok();
+    let computed: Option<i64> = r.get(1).ok();
+    Ok(override_days.or(computed).map(|v| v.max(0) as u32))
+}
+
+/// S427 — stamp the engine-computed lead-time (calendar days) on a job
+/// row. Separate from [`set_priced`] so the high-traffic state-flip path
+/// keeps its signature and call sites; this is a small targeted UPDATE
+/// run right after pricing succeeds.
+pub fn set_computed_lead_time(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    days: u32,
+) -> Result<()> {
+    ensure_schema(conn)?;
+    conn.execute(
+        "UPDATE quote_pricing_jobs SET lead_time_days = ? WHERE quote_id = ? AND tenant_id = ?",
+        params![days as i64, quote_id, tenant_id],
+    )
+    .context("set_computed_lead_time UPDATE")?;
+    Ok(())
+}
+
+/// S427 — set or clear the operator's manual lead-time override. `None`
+/// clears it (reverts to the computed value). Returns `false` if no such
+/// row exists (→ 404 at the route).
+pub fn set_lead_time_override(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    override_days: Option<u32>,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    ensure_schema(conn)?;
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format override updated_at")?;
+    let changed = conn
+        .execute(
+            "UPDATE quote_pricing_jobs SET lead_time_override_days = ?, updated_at = ? \
+             WHERE quote_id = ? AND tenant_id = ?",
+            params![override_days.map(|d| d as i64), ts, quote_id, tenant_id],
+        )
+        .context("set_lead_time_override UPDATE")?;
+    Ok(changed > 0)
+}
+
+/// S427 — sum committed/pending machining hours by machine family across
+/// the shop, for the capacity-aware lead-time model. The authoritative
+/// shop-load ledger is THIS table: a quote that the customer accepted
+/// (now a work order) stays in `Posted` (the state machine has no
+/// `accepted` state), so summing `Posted` priced jobs in the window
+/// captures BOTH open-WO load and still-pending posted quotes in one
+/// honest query — the `work_orders` table carries neither machining
+/// hours nor a machine family, so it cannot supply this.
+///
+/// `since_rfc3339` is the 30-day cutoff (Rfc3339 string compares
+/// chronologically because all timestamps are UTC `…Z`). `exclude` skips
+/// the quote currently being priced. Family comes from each row's stored
+/// `route_to_5_axis` (3-axis vs 5-axis — the only signal the extractor
+/// produces today).
+///
+/// `machining_minutes` in the breakdown is **per part**, so each job's
+/// shop-time footprint is `machining_minutes × quantity` — the batch
+/// occupies the machine for every part, not just one.
+pub fn sum_posted_machining_hours_by_family(
+    conn: &Connection,
+    tenant_id: &str,
+    since_rfc3339: &str,
+    exclude_quote_id: &str,
+) -> Result<std::collections::BTreeMap<aberp_quote_engine::MachineFamily, f64>> {
+    use aberp_quote_engine::MachineFamily;
+    ensure_schema(conn)?;
+
+    #[derive(serde::Deserialize)]
+    struct LoadRow {
+        #[serde(default)]
+        machining_minutes: f64,
+        #[serde(default)]
+        route_to_5_axis: bool,
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT breakdown_json, quantity FROM quote_pricing_jobs \
+             WHERE tenant_id = ? AND state = ? AND breakdown_json IS NOT NULL \
+               AND quote_id != ? AND fetched_at >= ?",
+        )
+        .context("prepare sum_posted_machining_hours")?;
+    let rows = stmt
+        .query_map(
+            params![tenant_id, STATE_POSTED, exclude_quote_id, since_rfc3339],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .context("query sum_posted_machining_hours")?;
+
+    let mut out: std::collections::BTreeMap<MachineFamily, f64> = std::collections::BTreeMap::new();
+    for r in rows {
+        let (json, qty) = r?;
+        let Some(json) = json else { continue };
+        let Ok(lr) = serde_json::from_str::<LoadRow>(&json) else {
+            // A breakdown we can't parse contributes nothing rather than
+            // crashing pricing; the row is still counted in nothing.
+            continue;
+        };
+        let hours = (lr.machining_minutes / 60.0 * (qty.max(0) as f64)).max(0.0);
+        *out.entry(MachineFamily::for_route(lr.route_to_5_axis))
+            .or_insert(0.0) += hours;
+    }
+    Ok(out)
 }
 
 /// Trim CR/LF/NUL out of a free-text error reason and truncate to

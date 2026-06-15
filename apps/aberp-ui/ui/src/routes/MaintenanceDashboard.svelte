@@ -36,6 +36,7 @@
     listEmailRelayQueue,
     listInventoryBalances,
     listLowStockProducts,
+    listMachines,
     listPartners,
     listQuotingMaterials,
     listProducts,
@@ -180,6 +181,14 @@
             ? "1 below min stock"
             : `${lowStock.length} below min stock`;
         return `${base} — ⚠ ${suffix}`;
+      }
+      case "MachineCount": {
+        // S427 — count of active (non-archived) quoting machines. A
+        // fresh tenant may seed a couple of common families, so the
+        // count reflects whatever the operator has registered.
+        const rows = await listMachines();
+        const n = rows.length;
+        return n === 1 ? "1 machine" : `${n} machines`;
       }
       case "BankAccountCount": {
         // Two independent reads — the seller-info legal_name + the

@@ -50,6 +50,8 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "statistics",
   "partners",
   "products",
+  // S427 — quoting-machine master data.
+  "machines",
   "work-orders",
   "qa",
   "dispatch",
@@ -96,6 +98,8 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   statistics: "statistics",
   partners: "master-data",
   products: "master-data",
+  // S427 — quoting-machine master data.
+  machines: "master-data",
   // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Production module.
   "work-orders": "production",
   // S233 / PR-229 / ADR-0063 — QA queue route lives in the same module.
@@ -145,6 +149,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   statistics: "operational",
   partners: "maintenance",
   products: "maintenance",
+  // S427 — quoting-machine master data (maintenance area).
+  machines: "maintenance",
   // S232 / PR-228 / ADR-0062 — Production is operational (daily-driver
   // shop-floor workflow). S233 added QA queue alongside.
   "work-orders": "operational",
@@ -188,6 +194,8 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
 >([
   "PartnerCount",
   "ProductCount",
+  // S427 — quoting-machine master data tile.
+  "MachineCount",
   "BankAccountCount",
   "NavCredStatus",
   // S180 / PR-180 — NAV-as-DR restore wizard tile.

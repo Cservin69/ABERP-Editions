@@ -2483,6 +2483,38 @@ pub enum EventKind {
     /// (`SnapshotPrunedPayload`) carries the pruned seqs and the retained
     /// count. `snapshot.*` family.
     SnapshotPruned,
+
+    /// S427 — a `quoting_machines` master-data row was created. Payload
+    /// (`MachineCreatedPayload`) carries the machine id, name, family,
+    /// and capacity knobs. `mes.*` prefix family (shop-floor master
+    /// data, alongside the work-order kinds); app-layer JSON only,
+    /// never NAV-scoped.
+    MachineCreated,
+
+    /// S427 — a `quoting_machines` row was edited. Payload
+    /// (`MachineEditedPayload`) carries the machine id and the new field
+    /// values. `mes.*` family.
+    MachineEdited,
+
+    /// S427 — a `quoting_machines` row was archived (soft-delete; no
+    /// hard delete). Payload (`MachineArchivedPayload`) carries the
+    /// machine id. `mes.*` family.
+    MachineArchived,
+
+    /// S427 — an operator overrode the engine-computed lead-time on a
+    /// quote. Payload (`QuoteLeadTimeOverriddenPayload`) carries the
+    /// quote id, the computed days, and the override days. `quote.*`
+    /// family (operator decision, alongside the refuse/accept kinds);
+    /// app-layer JSON only.
+    QuoteLeadTimeOverridden,
+
+    /// S427 — the lead-time model fell back to the virtual machine-shop
+    /// because `quoting_machines` was empty. Emitted once per server
+    /// start so the operator knows to fill in real machines. Payload
+    /// (`QuotingMachinesEmptyFallbackPayload`) carries the fallback
+    /// hours/buffer. `quote.*` family (pricing-engine operational event,
+    /// alongside the daemon kinds); app-layer JSON only.
+    QuotingMachinesEmptyFallback,
 }
 
 impl EventKind {
@@ -2611,6 +2643,11 @@ impl EventKind {
             EventKind::SnapshotValidationFailed => "snapshot.validation_failed",
             EventKind::SnapshotRestored => "snapshot.restored",
             EventKind::SnapshotPruned => "snapshot.pruned",
+            EventKind::MachineCreated => "mes.machine_created",
+            EventKind::MachineEdited => "mes.machine_edited",
+            EventKind::MachineArchived => "mes.machine_archived",
+            EventKind::QuoteLeadTimeOverridden => "quote.lead_time_overridden",
+            EventKind::QuotingMachinesEmptyFallback => "quote.machines_empty_fallback",
         }
     }
 
@@ -2750,6 +2787,11 @@ impl EventKind {
             "snapshot.validation_failed" => Ok(EventKind::SnapshotValidationFailed),
             "snapshot.restored" => Ok(EventKind::SnapshotRestored),
             "snapshot.pruned" => Ok(EventKind::SnapshotPruned),
+            "mes.machine_created" => Ok(EventKind::MachineCreated),
+            "mes.machine_edited" => Ok(EventKind::MachineEdited),
+            "mes.machine_archived" => Ok(EventKind::MachineArchived),
+            "quote.lead_time_overridden" => Ok(EventKind::QuoteLeadTimeOverridden),
+            "quote.machines_empty_fallback" => Ok(EventKind::QuotingMachinesEmptyFallback),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2877,6 +2919,11 @@ impl EventKind {
         EventKind::SnapshotValidationFailed,
         EventKind::SnapshotRestored,
         EventKind::SnapshotPruned,
+        EventKind::MachineCreated,
+        EventKind::MachineEdited,
+        EventKind::MachineArchived,
+        EventKind::QuoteLeadTimeOverridden,
+        EventKind::QuotingMachinesEmptyFallback,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -3012,6 +3059,11 @@ mod tests {
             EventKind::SnapshotValidationFailed,
             EventKind::SnapshotRestored,
             EventKind::SnapshotPruned,
+            EventKind::MachineCreated,
+            EventKind::MachineEdited,
+            EventKind::MachineArchived,
+            EventKind::QuoteLeadTimeOverridden,
+            EventKind::QuotingMachinesEmptyFallback,
         ];
         for v in &variants {
             let s = v.as_str();
@@ -3045,7 +3097,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            110,
+            115,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \

@@ -939,7 +939,17 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::SnapshotCreated
         | EventKind::SnapshotValidationFailed
         | EventKind::SnapshotRestored
-        | EventKind::SnapshotPruned => None,
+        | EventKind::SnapshotPruned
+        // S427 — mes.* machine master-data + quote.* lead-time family.
+        // Machine id / name / family / capacity knobs, quote id + day
+        // counts, fallback hours; app-layer JSON payloads, never NAV XML
+        // bytes. Master-data / pricing-ops rows, never swept by a
+        // per-OUTGOING-invoice export bundle by glob.
+        | EventKind::MachineCreated
+        | EventKind::MachineEdited
+        | EventKind::MachineArchived
+        | EventKind::QuoteLeadTimeOverridden
+        | EventKind::QuotingMachinesEmptyFallback => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -969,7 +979,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 110,
+        EventKind::ALL_KINDS_COUNT == 115,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

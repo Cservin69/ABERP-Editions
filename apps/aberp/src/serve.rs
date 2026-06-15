@@ -72,7 +72,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aberp_audit_ledger::{
-    compute_entry_hash, Actor, Entry, EventKind, Ledger, LedgerVerifyError, TenantId, VerifyError,
+    compute_entry_hash, Actor, BinaryHash, Entry, EventKind, Ledger, LedgerVerifyError, TenantId,
+    VerifyError,
 };
 use aberp_billing::{self as billing, BillingStore, Currency, DuckDbBillingStore, ReadyInvoice};
 use aberp_nav_transport::{
@@ -2989,6 +2990,19 @@ fn build_router(state: AppState) -> Router {
                 .put(handle_update_partner)
                 .delete(handle_delete_partner),
         )
+        // S427 — quoting_machines master data. List + create on the
+        // collection; get + update + archive (soft, no hard delete) on
+        // the resource. Ready-only + bearer-gated; emits mes.machine_*.
+        .route(
+            "/api/machines",
+            get(handle_list_machines).post(handle_create_machine),
+        )
+        .route(
+            "/api/machines/:id",
+            get(handle_get_machine)
+                .put(handle_update_machine)
+                .delete(handle_archive_machine),
+        )
         // S257 / PR-246 — Settings → Adapters CRUD. List + create on the
         // collection; update (hot restart) + delete on the resource.
         // Ready-only + bearer-gated; the `:id` is the server-minted
@@ -3396,6 +3410,13 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/quote-pricing-jobs/:quote_id/retry",
             post(handle_retry_quote_pricing_job),
+        )
+        // S427 — operator override of the engine-computed lead-time.
+        // POST a `{ "override_days": N | null }` body; null clears the
+        // override (reverts to computed). Emits quote.lead_time_overridden.
+        .route(
+            "/api/quote-pricing-jobs/:quote_id/lead-time-override",
+            post(handle_override_quote_lead_time),
         )
         // S416 — the operator accept-on-behalf route (S354 / PR-42 / U16)
         // was REMOVED: it was redundant (the customer accepts via the
@@ -8986,6 +9007,434 @@ pub fn delete_partner_request(
         Ok(())
     } else {
         Err(PartnerRouteError::NotFound)
+    }
+}
+
+// ── S427 — quoting_machines master data + lead-time override ──────────
+//
+// Mirrors the partner CRUD surface (Ready-only + bearer-gated; pub
+// library helpers so integration tests skip the HTTPS listener). Unlike
+// partners, machine mutations fire audit (`mes.machine_*`) and the
+// override fires `quote.lead_time_overridden`, so the create/update/
+// archive/override helpers take the resolved `operator_login` +
+// `binary_hash` (same posture as `put_seller_numbering_request`).
+
+/// Route-level error for the machine + lead-time endpoints.
+#[derive(Debug)]
+pub enum MachineRouteError {
+    Validation(Vec<crate::quoting_machines::ValidationError>),
+    NotFound,
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for MachineRouteError {
+    fn from(e: anyhow::Error) -> Self {
+        MachineRouteError::Other(e)
+    }
+}
+
+#[derive(Serialize)]
+struct MachineValidationBody {
+    error: &'static str,
+    fields: Vec<crate::quoting_machines::ValidationError>,
+}
+
+fn machine_validation_response(errors: Vec<crate::quoting_machines::ValidationError>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(MachineValidationBody {
+            error: "validation_failed",
+            fields: errors,
+        }),
+    )
+        .into_response()
+}
+
+fn machine_not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(error_body("machine not found".to_string())),
+    )
+        .into_response()
+}
+
+/// Resolve the background-computed binary hash for an audit-bearing
+/// mutation. A hash that is somehow still unresolved is a 500 (the audit
+/// chain cannot be written without it) rather than a silent skip.
+fn resolve_binary_hash(state: &AppState) -> std::result::Result<BinaryHash, Response> {
+    state.binary_hash.wait().map_err(|e| {
+        internal_error(
+            "binary_hash:wait",
+            anyhow!("binary hash unavailable for audit write: {e}"),
+        )
+    })
+}
+
+// GET /api/machines
+async fn handle_list_machines(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || list_machines_request(&state_for_task)).await;
+    match result {
+        Ok(Ok(machines)) => Json(machines).into_response(),
+        Ok(Err(e)) => machine_other_or_internal("list_machines_request", e),
+        Err(join_err) => internal_error(
+            "list_machines_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn list_machines_request(
+    state: &AppState,
+) -> std::result::Result<Vec<crate::quoting_machines::QuotingMachine>, MachineRouteError> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    Ok(crate::quoting_machines::list_machines(
+        &conn,
+        state.tenant.as_str(),
+    )?)
+}
+
+// GET /api/machines/:id
+async fn handle_get_machine(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    match get_machine_request(&state, &id) {
+        Ok(m) => Json(m).into_response(),
+        Err(MachineRouteError::NotFound) => machine_not_found_response(),
+        Err(e) => machine_other_or_internal("get_machine_request", e),
+    }
+}
+
+pub fn get_machine_request(
+    state: &AppState,
+    id: &str,
+) -> std::result::Result<crate::quoting_machines::QuotingMachine, MachineRouteError> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    match crate::quoting_machines::get_machine(&conn, state.tenant.as_str(), id)? {
+        Some(m) => Ok(m),
+        None => Err(MachineRouteError::NotFound),
+    }
+}
+
+// POST /api/machines
+async fn handle_create_machine(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<crate::quoting_machines::MachineInputs>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        create_machine_request(&state_for_task, &inputs, &operator_login, binary_hash)
+    })
+    .await;
+    match result {
+        Ok(Ok(m)) => (StatusCode::CREATED, Json(m)).into_response(),
+        Ok(Err(MachineRouteError::Validation(errs))) => machine_validation_response(errs),
+        Ok(Err(e)) => machine_other_or_internal("create_machine_request", e),
+        Err(join_err) => internal_error(
+            "create_machine_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn create_machine_request(
+    state: &AppState,
+    inputs: &crate::quoting_machines::MachineInputs,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<crate::quoting_machines::QuotingMachine, MachineRouteError> {
+    if let Err(errors) = crate::quoting_machines::validate_machine_inputs(inputs) {
+        return Err(MachineRouteError::Validation(errors));
+    }
+    // Scope the write connection so it is dropped before the audit append
+    // opens its own connection — DuckDB rejects a second writer to the
+    // same file while the first is still held.
+    let machine = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        crate::quoting_machines::create_machine(&conn, state.tenant.as_str(), inputs)?
+    };
+    let payload = crate::audit_payloads::MachineCreatedPayload {
+        machine_id: machine.id.clone(),
+        name: machine.name.clone(),
+        family: machine.family.clone(),
+        daily_hours_avail: machine.daily_hours_avail,
+        buffer_pct: machine.buffer_pct,
+    };
+    crate::quoting_machines::append_machine_event(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        EventKind::MachineCreated,
+        payload.to_bytes(),
+    )?;
+    Ok(machine)
+}
+
+// PUT /api/machines/:id
+async fn handle_update_machine(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<crate::quoting_machines::MachineInputs>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        update_machine_request(&state_for_task, &id, &inputs, &operator_login, binary_hash)
+    })
+    .await;
+    match result {
+        Ok(Ok(m)) => Json(m).into_response(),
+        Ok(Err(MachineRouteError::Validation(errs))) => machine_validation_response(errs),
+        Ok(Err(MachineRouteError::NotFound)) => machine_not_found_response(),
+        Ok(Err(e)) => machine_other_or_internal("update_machine_request", e),
+        Err(join_err) => internal_error(
+            "update_machine_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn update_machine_request(
+    state: &AppState,
+    id: &str,
+    inputs: &crate::quoting_machines::MachineInputs,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<crate::quoting_machines::QuotingMachine, MachineRouteError> {
+    if let Err(errors) = crate::quoting_machines::validate_machine_inputs(inputs) {
+        return Err(MachineRouteError::Validation(errors));
+    }
+    // Scope the write connection (see `create_machine_request`).
+    let machine = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        match crate::quoting_machines::update_machine(&conn, state.tenant.as_str(), id, inputs)? {
+            Some(m) => m,
+            None => return Err(MachineRouteError::NotFound),
+        }
+    };
+    let payload = crate::audit_payloads::MachineEditedPayload {
+        machine_id: machine.id.clone(),
+        name: machine.name.clone(),
+        family: machine.family.clone(),
+        daily_hours_avail: machine.daily_hours_avail,
+        buffer_pct: machine.buffer_pct,
+        enabled: machine.enabled,
+    };
+    crate::quoting_machines::append_machine_event(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        EventKind::MachineEdited,
+        payload.to_bytes(),
+    )?;
+    Ok(machine)
+}
+
+// DELETE /api/machines/:id — archive (soft).
+async fn handle_archive_machine(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        archive_machine_request(&state_for_task, &id, &operator_login, binary_hash)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(MachineRouteError::NotFound)) => machine_not_found_response(),
+        Ok(Err(e)) => machine_other_or_internal("archive_machine_request", e),
+        Err(join_err) => internal_error(
+            "archive_machine_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn archive_machine_request(
+    state: &AppState,
+    id: &str,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<(), MachineRouteError> {
+    // Scope the write connection (see `create_machine_request`).
+    let archived_at = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        match crate::quoting_machines::archive_machine(&conn, state.tenant.as_str(), id)? {
+            Some(ts) => ts,
+            None => return Err(MachineRouteError::NotFound),
+        }
+    };
+    let payload = crate::audit_payloads::MachineArchivedPayload {
+        machine_id: id.to_string(),
+        archived_at,
+    };
+    crate::quoting_machines::append_machine_event(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        EventKind::MachineArchived,
+        payload.to_bytes(),
+    )?;
+    Ok(())
+}
+
+/// Body for `POST /api/quote-pricing-jobs/:quote_id/lead-time-override`.
+#[derive(Debug, Deserialize)]
+pub struct LeadTimeOverrideBody {
+    /// `null` clears the override (reverts to the computed value).
+    #[serde(default)]
+    pub override_days: Option<u32>,
+}
+
+async fn handle_override_quote_lead_time(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(quote_id): AxumPath<String>,
+    Json(body): Json<LeadTimeOverrideBody>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        override_lead_time_request(
+            &state_for_task,
+            &quote_id,
+            body.override_days,
+            &operator_login,
+            binary_hash,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(Err(MachineRouteError::NotFound)) => machine_not_found_response(),
+        Ok(Err(e)) => machine_other_or_internal("override_lead_time_request", e),
+        Err(join_err) => internal_error(
+            "override_lead_time_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn override_lead_time_request(
+    state: &AppState,
+    quote_id: &str,
+    override_days: Option<u32>,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<(), MachineRouteError> {
+    // Scope the write connection (see `create_machine_request`); capture
+    // the computed value for the audit payload BEFORE writing.
+    let computed_days = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let Some(detail) =
+            crate::quote_pricing_jobs::get_job_detail(&conn, quote_id, state.tenant.as_str())?
+        else {
+            return Err(MachineRouteError::NotFound);
+        };
+        let applied = crate::quote_pricing_jobs::set_lead_time_override(
+            &conn,
+            quote_id,
+            state.tenant.as_str(),
+            override_days,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        if !applied {
+            return Err(MachineRouteError::NotFound);
+        }
+        detail.lead_time_days
+    };
+    let payload = crate::audit_payloads::QuoteLeadTimeOverriddenPayload {
+        quote_id: quote_id.to_string(),
+        computed_days,
+        override_days,
+    };
+    crate::quoting_machines::append_machine_event(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        EventKind::QuoteLeadTimeOverridden,
+        payload.to_bytes(),
+    )?;
+    Ok(())
+}
+
+/// Collapse a non-validation [`MachineRouteError`] to a 500 (the
+/// validation + not-found arms are handled at each call site).
+fn machine_other_or_internal(ctx: &'static str, e: MachineRouteError) -> Response {
+    match e {
+        MachineRouteError::Other(e) => internal_error(ctx, e),
+        MachineRouteError::NotFound => machine_not_found_response(),
+        MachineRouteError::Validation(errs) => machine_validation_response(errs),
     }
 }
 
@@ -17555,6 +18004,10 @@ struct PricingJobDetailView {
     /// not a client-side literal; HUF/NAV conversion is an invoice-step
     /// concern.
     currency: &'static str,
+    /// S427 — engine-computed lead-time (calendar days); `null` pre-pricing.
+    lead_time_days: Option<u32>,
+    /// S427 — operator override (calendar days); `null` = use computed.
+    lead_time_override_days: Option<u32>,
 }
 
 /// S349 / PR-40 (U1) — `GET /api/quote-pricing-jobs/:quote_id`. Bearer-
@@ -17636,6 +18089,8 @@ async fn handle_get_quote_pricing_job_detail(
         pdf_available: d.pdf_path.is_some(),
         valid_until_iso: d.valid_until_iso,
         currency: "EUR",
+        lead_time_days: d.lead_time_days,
+        lead_time_override_days: d.lead_time_override_days,
     };
     (axum::http::StatusCode::OK, axum::Json(view)).into_response()
 }

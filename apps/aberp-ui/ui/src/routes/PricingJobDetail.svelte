@@ -19,11 +19,17 @@
     getQuotePricingJob,
     getQuotePricingJobAudit,
     listQuotingMaterials,
+    overrideQuoteLeadTime,
     retryQuotePricingJob,
     MaterialEditError,
     type AuditEntryView,
     type PricingJobDetail,
   } from "../lib/api";
+  // S427 — lead-time chip colour + effective-value helper (pure).
+  import {
+    effectiveLeadTime,
+    leadTimeChipClass,
+  } from "../lib/machines";
   // S416 — the operator accept-on-behalf form (imports from the removed
   // `../lib/pricing-operator-accept`) is gone: the customer accepts via the
   // Accept button in their quote e-mail, so an operator-side Accept was
@@ -88,6 +94,11 @@
   let materialEditError = $state<string | null>(null);
   let materialToast = $state<string | null>(null);
 
+  // S427 — operator lead-time override state.
+  let leadTimeDraft = $state("");
+  let leadTimeBusy = $state(false);
+  let leadTimeError = $state<string | null>(null);
+
   const AUDIT_PAGE = 50;
 
   // Derived sections — all read off the one audit page we fetch.
@@ -95,6 +106,14 @@
   const writeback = $derived(latestWritebackOutcome(auditEvents));
   const priceRows = $derived(breakdownRows(detail?.breakdown ?? null));
   const reasoningLog = $derived(reasoningLogLines(detail?.breakdown ?? null));
+
+  // S427 — effective lead-time: override wins over engine-computed.
+  const effLeadTime = $derived(
+    effectiveLeadTime(
+      detail?.lead_time_days ?? null,
+      detail?.lead_time_override_days ?? null,
+    ),
+  );
 
   // Open on a non-null quoteId; close + reset on null. Guard the
   // double-open InvalidStateError per the InvoiceDetail precedent.
@@ -136,6 +155,13 @@
       detail = d;
       auditEvents = page.events;
       auditTotal = page.total;
+      // S427 — seed the override input with the current override (blank
+      // when none is set, so the operator types a fresh value).
+      leadTimeDraft =
+        d.lead_time_override_days !== null
+          ? String(d.lead_time_override_days)
+          : "";
+      leadTimeError = null;
       loadState = "ready";
     } catch (e) {
       errorMessage = e instanceof Error ? e.message : String(e);
@@ -304,6 +330,51 @@
     }
   }
 
+  // S427 — save the operator lead-time override. An empty draft is
+  // refused inline (use "Clear override" to remove an override); a
+  // non-numeric value is likewise refused before the round-trip.
+  async function saveLeadTimeOverride(): Promise<void> {
+    if (!quoteId) return;
+    const trimmed = leadTimeDraft.trim();
+    if (trimmed.length === 0) {
+      leadTimeError =
+        "Adjon meg egy napszámot, vagy törölje a felülírást. / Enter a day count, or clear the override.";
+      return;
+    }
+    const days = Number(trimmed);
+    if (!Number.isFinite(days) || days < 0) {
+      leadTimeError =
+        "Érvénytelen napszám. / Invalid day count.";
+      return;
+    }
+    leadTimeBusy = true;
+    leadTimeError = null;
+    try {
+      await overrideQuoteLeadTime(quoteId, days);
+      await load(quoteId);
+    } catch (e) {
+      leadTimeError = e instanceof Error ? e.message : String(e);
+    } finally {
+      leadTimeBusy = false;
+    }
+  }
+
+  // S427 — clear the override (sends null); effective lead-time falls
+  // back to the engine-computed value.
+  async function clearLeadTimeOverride(): Promise<void> {
+    if (!quoteId) return;
+    leadTimeBusy = true;
+    leadTimeError = null;
+    try {
+      await overrideQuoteLeadTime(quoteId, null);
+      await load(quoteId);
+    } catch (e) {
+      leadTimeError = e instanceof Error ? e.message : String(e);
+    } finally {
+      leadTimeBusy = false;
+    }
+  }
+
   // S416 — the inline operator accept-on-behalf form (startAccept /
   // cancelAccept / saveAccept) was removed; the customer accepts via the
   // Accept button in their quote e-mail.
@@ -420,6 +491,19 @@
             <span class={stateChipClass(detail.state)}>
               {stateLabel(detail.state)}
             </span>
+            <!-- S427 — lead-time chip (effective = override ?? computed),
+                 coloured ok/warning/err by day count. -->
+            {#if effLeadTime !== null}
+              <span
+                class={leadTimeChipClass(effLeadTime)}
+                data-testid="pricing-job-lead-time-chip"
+                >Lead time: {effLeadTime} days</span
+              >
+            {:else}
+              <span class="chip" data-testid="pricing-job-lead-time-chip"
+                >Lead time: —</span
+              >
+            {/if}
             {#if detail.attempt_n > 0}
               <span class="qjd__muted">×{detail.attempt_n}</span>
             {/if}
@@ -601,6 +685,71 @@
               <dd>{detail.valid_until_iso}</dd>
             {/if}
           </dl>
+        </section>
+
+        <!-- S427 — Lead time + operator override. -->
+        <section class="qjd__sec">
+          <h4>Átfutási idő / Lead time</h4>
+          <dl class="qjd__dl">
+            <dt>Motor / Engine</dt>
+            <dd>
+              {#if detail.lead_time_days !== null}
+                {detail.lead_time_days} nap / days
+              {:else}
+                — nincs / none
+              {/if}
+            </dd>
+            <dt>Felülírás / Override</dt>
+            <dd>
+              {#if detail.lead_time_override_days !== null}
+                {detail.lead_time_override_days} nap / days
+              {:else}
+                — nincs / none
+              {/if}
+            </dd>
+            <dt>Tényleges / Effective</dt>
+            <dd data-testid="pricing-job-lead-time-effective">
+              {#if effLeadTime !== null}
+                {effLeadTime} nap / days
+              {:else}
+                —
+              {/if}
+            </dd>
+          </dl>
+          <div class="qjd__leadtime-edit" data-testid="pricing-job-lead-time-edit">
+            <input
+              type="number"
+              min="0"
+              step="1"
+              class="qjd__matselect"
+              bind:value={leadTimeDraft}
+              disabled={leadTimeBusy}
+              placeholder="napok / days"
+              aria-label="Lead-time override in days"
+              data-testid="pricing-job-lead-time-input"
+            />
+            <button
+              type="button"
+              class="btn btn--secondary"
+              onclick={() => void saveLeadTimeOverride()}
+              disabled={leadTimeBusy}
+              data-testid="pricing-job-lead-time-save"
+              >{leadTimeBusy ? "Mentés… / Saving…" : "Mentés / Save"}</button
+            >
+            <button
+              type="button"
+              class="btn btn--secondary"
+              onclick={() => void clearLeadTimeOverride()}
+              disabled={leadTimeBusy || detail.lead_time_override_days === null}
+              data-testid="pricing-job-lead-time-clear"
+              >Felülírás törlése / Clear override</button
+            >
+          </div>
+          {#if leadTimeError}
+            <p class="qjd__err qjd__matedit-err" data-testid="pricing-job-lead-time-error">
+              {leadTimeError}
+            </p>
+          {/if}
         </section>
 
         <!-- Pricing breakdown -->
@@ -1216,5 +1365,21 @@
   .chip--running {
     background: #78350f;
     color: #fed7aa;
+  }
+  /* S427 — amber lead-time chip for the 8..21 day band. */
+  .chip--warning {
+    background: #78350f;
+    color: #fed7aa;
+  }
+  /* S427 — lead-time override control row. */
+  .qjd__leadtime-edit {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-top: 8px;
+  }
+  .qjd__leadtime-edit input {
+    width: 120px;
   }
 </style>

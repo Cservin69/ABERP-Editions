@@ -32,6 +32,9 @@ export type AppRoute =
   | "nav-credentials"
   | "partners"
   | "products"
+  // S427 — quoting-machine master data (Master Data area, alongside
+  // partners + products).
+  | "machines"
   | "work-orders"
   | "qa"
   | "dispatch"
@@ -113,6 +116,8 @@ export function parseRoute(hash: string): AppRoute {
       return "partners";
     case "products":
       return "products";
+    case "machines":
+      return "machines";
     case "work-orders":
       return "work-orders";
     case "qa":

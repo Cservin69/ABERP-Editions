@@ -794,6 +794,87 @@ impl PricingPipelineService {
                         );
                         return Ok(StepOutcome::Advanced);
                     }
+
+                    // S427 — capacity-aware lead-time. Computed after the
+                    // price commits; the row is now `Rendering`, so the
+                    // 30-day `Posted` shop-load sum correctly excludes it.
+                    {
+                        use std::sync::atomic::{AtomicBool, Ordering};
+                        // Once-per-server-start guard for the empty-machine
+                        // fallback notice (re-arms on each process restart).
+                        static EMPTY_FALLBACK_EMITTED: AtomicBool = AtomicBool::new(false);
+
+                        let now = OffsetDateTime::now_utc();
+                        let since = (now - time::Duration::days(30))
+                            .format(&Rfc3339)
+                            .context("format lead-time window")?;
+                        let machines = crate::quoting_machines::list_enabled_capacities(
+                            &conn,
+                            &tenant_id_string,
+                        )
+                        .context("load machine capacities")?;
+                        let existing = jobs::sum_posted_machining_hours_by_family(
+                            &conn,
+                            &tenant_id_string,
+                            &since,
+                            &quote_id,
+                        )?;
+                        let mut new_hours = std::collections::BTreeMap::new();
+                        // machining_minutes is per part; the batch occupies
+                        // the machine for all `qty` parts.
+                        let proj_h = (breakdown.machining_minutes / 60.0 * (qty as f64)).max(0.0);
+                        if proj_h > 0.0 {
+                            new_hours.insert(
+                                aberp_quote_engine::MachineFamily::for_route(
+                                    breakdown.route_to_5_axis,
+                                ),
+                                proj_h,
+                            );
+                        }
+                        let est =
+                            aberp_quote_engine::lead_time_days(&machines, &existing, &new_hours);
+                        jobs::set_computed_lead_time(
+                            &conn,
+                            &quote_id,
+                            &tenant_id_string,
+                            est.days,
+                        )?;
+
+                        if est.used_fallback
+                            && EMPTY_FALLBACK_EMITTED
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                        {
+                            let tx = conn.transaction().context("open empty-fallback audit tx")?;
+                            let meta = LedgerMeta::new(
+                                TenantId::new(&tenant_id_string).context("tenant id")?,
+                                binary_hash,
+                            );
+                            let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+                            let payload =
+                                crate::audit_payloads::QuotingMachinesEmptyFallbackPayload {
+                                    fallback_daily_hours: aberp_quote_engine::FALLBACK_DAILY_HOURS,
+                                    fallback_buffer_pct: aberp_quote_engine::FALLBACK_BUFFER_PCT,
+                                    observed_at: now
+                                        .format(&Rfc3339)
+                                        .context("format observed_at")?,
+                                };
+                            // No idempotency key: we WANT it to re-emit on
+                            // each fresh server start (the atomic gates
+                            // within a run).
+                            append_in_tx(
+                                &tx,
+                                &meta,
+                                EventKind::QuotingMachinesEmptyFallback,
+                                payload.to_bytes(),
+                                actor,
+                                None,
+                            )
+                            .context("append empty-fallback")?;
+                            tx.commit().context("commit empty-fallback")?;
+                        }
+                    }
+
                     let tx = conn.transaction().context("open priced-audit tx")?;
                     let meta = LedgerMeta::new(
                         TenantId::new(&tenant_id_string).context("tenant id")?,
@@ -905,6 +986,12 @@ impl PricingPipelineService {
                 // endpoint no-ops a same-hash re-post). Tracked in
                 // docs/findings/s318-customer-pdf-stock-banner.md.
                 stock_alert: false,
+                // S427 — effective lead-time (override ?? computed).
+                lead_time_days: jobs::get_effective_lead_time_days(
+                    &conn,
+                    &quote_id,
+                    &tenant_id_string,
+                )?,
             };
             match aberp_quote_pdf::render(&inputs) {
                 Ok(bytes) => {

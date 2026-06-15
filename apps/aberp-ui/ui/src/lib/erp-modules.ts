@@ -210,6 +210,9 @@ export const MODULES: ErpModule[] = [
     routes: [
       { id: "partners", label: "Partners" },
       { id: "products", label: "Products" },
+      // S427 — quoting-machine master data (name, family, envelope,
+      // capacity). Lives beside partners + products in Master Data.
+      { id: "machines", label: "Machines" },
     ],
   },
   {
@@ -400,6 +403,8 @@ export function defaultRouteForArea(area: ErpArea): AppRoute | null {
 export type MaintenanceTileStatusKind =
   | "PartnerCount"
   | "ProductCount"
+  // S427 — count of active (non-archived) quoting machines.
+  | "MachineCount"
   | "BankAccountCount"
   | "NavCredStatus"
   // S180 / PR-180 — count of already-restored invoices in the
@@ -473,6 +478,16 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Katalógus: név, mértékegység, ár",
     description_en: "Catalog: name, unit of measure, price",
     statusKind: "ProductCount",
+  },
+  // S427 — quoting-machine master data tile.
+  {
+    moduleId: "master-data",
+    route: "machines",
+    label_hu: "Gépek",
+    label_en: "Machines",
+    description_hu: "Géppark: család, befoglaló méret, kapacitás",
+    description_en: "Machine park: family, envelope, capacity",
+    statusKind: "MachineCount",
   },
   {
     moduleId: "settings",

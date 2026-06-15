@@ -186,6 +186,12 @@ pub struct QuoteInputs<'a> {
     /// rather than caller-provided, because the PDF crate carries no
     /// i18n parameterisation and the customer market is single-locale.
     pub stock_alert: bool,
+    /// S427 — capacity-aware estimated lead-time in calendar days. The
+    /// effective value (operator override or engine-computed) the caller
+    /// resolved. `None` ⇒ the banner is omitted (pre-pricing or no
+    /// machining hours). Surfaced as a customer-facing banner near the
+    /// header so the lead-time is visible before the price.
+    pub lead_time_days: Option<u32>,
 }
 
 /// Failure taxonomy for [`render`]. The PDF emit is straight-line
@@ -347,6 +353,34 @@ fn build_content(inputs: &QuoteInputs<'_>) -> Vec<Vec<Operation>> {
         y -= 10;
         push_rule_red(&mut ops, MARGIN_LEFT, MARGIN_RIGHT, y);
         y -= 18;
+    }
+
+    // ── Lead-time banner (S427) ────────────────────────────────────
+    //
+    // Capacity-aware estimated lead-time, shown before the price so the
+    // customer sees the delivery horizon up front. Bilingual (HU primary
+    // / EN secondary), same MUTED-under-INK posture as the EXW note.
+    if let Some(days) = inputs.lead_time_days {
+        push_text_c(
+            &mut ops,
+            MARGIN_LEFT,
+            y,
+            "F2",
+            11,
+            INK,
+            &format!("Becsült átfutási idő: {days} naptári nap"),
+        );
+        y -= 14;
+        push_text_c(
+            &mut ops,
+            MARGIN_LEFT,
+            y,
+            "F1",
+            9,
+            MUTED,
+            &format!("Estimated lead time: {days} calendar days"),
+        );
+        y -= 22;
     }
 
     // ── Customer block ─────────────────────────────────────────────
@@ -798,6 +832,7 @@ mod tests {
             breakdown,
             target_tolerance: ToleranceRange::Standard,
             stock_alert: false,
+            lead_time_days: None,
         }
     }
 
@@ -862,6 +897,31 @@ mod tests {
         assert!(text.contains("2026-07-06"));
         assert!(text.contains("21.00 EUR"));
         assert!(text.contains("AL_6061_T6"));
+    }
+
+    /// S427 — the lead-time banner appears with the effective day count
+    /// when `lead_time_days` is set, and is omitted when `None`.
+    #[test]
+    fn lead_time_banner_appears_only_when_set() {
+        let g = fake_graph(false, false);
+        let b = fake_breakdown();
+
+        let mut with = sample_inputs(&g, &b);
+        with.lead_time_days = Some(9);
+        let text =
+            pdf_extract::extract_text_from_mem(&render(&with).expect("render")).expect("extract");
+        assert!(
+            text.contains("Estimated lead time: 9 calendar days"),
+            "lead-time banner missing: {text}"
+        );
+
+        let without = sample_inputs(&g, &b); // lead_time_days: None
+        let text2 = pdf_extract::extract_text_from_mem(&render(&without).expect("render"))
+            .expect("extract");
+        assert!(
+            !text2.contains("Estimated lead time"),
+            "banner should be omitted when None: {text2}"
+        );
     }
 
     /// EVE addendum 1 — when `requires_5_axis=true` the customer-visible
