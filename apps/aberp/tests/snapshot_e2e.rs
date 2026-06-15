@@ -84,7 +84,11 @@ fn seed(db: &Path, n_invoice: usize, n_audit: usize) {
 /// All event kinds currently in the DB's ledger, in seq order.
 fn ledger_kinds(db: &Path) -> Vec<EventKind> {
     let l = Ledger::open(db, tid(), bh()).unwrap();
-    l.entries().unwrap().iter().map(|e| e.kind.clone()).collect()
+    l.entries()
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect()
 }
 
 fn count_kind(db: &Path, kind: EventKind) -> usize {
