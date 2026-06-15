@@ -1069,7 +1069,15 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // actor), never NAV XML bytes. `system.*`-not-`invoice.*` posture; a
         // config-lifecycle row, never swept by a per-OUTGOING-invoice bundle.
         // Exhaustiveness arm only.
-        | EventKind::NumberingTemplateChanged => (None, ""),
+        | EventKind::NumberingTemplateChanged
+        // S426 / ADR-0082 — snapshot.* DB-snapshot operations family. Seq /
+        // timestamp / source-SHA-256 / counts; app-layer JSON payloads, never
+        // NAV XML bytes. `snapshot.*`-not-`invoice.*` posture; never sweeps a
+        // per-OUTGOING-invoice bundle. Exhaustiveness arm only.
+        | EventKind::SnapshotCreated
+        | EventKind::SnapshotValidationFailed
+        | EventKind::SnapshotRestored
+        | EventKind::SnapshotPruned => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1091,7 +1099,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 106,
+        EventKind::ALL_KINDS_COUNT == 110,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

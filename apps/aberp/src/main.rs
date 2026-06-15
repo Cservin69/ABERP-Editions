@@ -44,8 +44,11 @@ fn main() -> Result<()> {
         cli::Command::DrainPendingRetries(a) => drain_pending_retries::run(&a),
         cli::Command::RecoverFromNav(a) => recover_from_nav::run(&a),
         cli::Command::PrintInvoice(a) => print_invoice::run(&a),
-        cli::Command::Snapshot(a) => snapshot::run_snapshot(&a),
-        cli::Command::RestoreSnapshot(a) => snapshot::run_restore(&a),
+        cli::Command::Snapshot(cmd) => match cmd {
+            cli::SnapshotCommand::Now(a) => snapshot::run_now(&a),
+            cli::SnapshotCommand::List(a) => snapshot::run_list(&a),
+            cli::SnapshotCommand::Restore(a) => snapshot::run_restore(&a),
+        },
     }
 }
 

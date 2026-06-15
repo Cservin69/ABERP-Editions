@@ -22,6 +22,7 @@ dependencies = [
  "aberp-quote-engine",
  "aberp-quote-intake",
  "aberp-quote-pdf",
+ "aberp-snapshot",
  "aberp-verify",
  "aberp-work-orders",
  "anyhow",

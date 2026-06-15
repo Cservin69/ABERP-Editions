@@ -931,7 +931,15 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // actor), never NAV XML bytes. `system.*`-not-`invoice.*` posture; a
         // config-lifecycle row, never swept by a per-OUTGOING-invoice export
         // bundle by glob.
-        | EventKind::NumberingTemplateChanged => None,
+        | EventKind::NumberingTemplateChanged
+        // S426 / ADR-0082 — snapshot.* DB-snapshot operations family. Seq /
+        // timestamp / source-SHA-256 / counts; app-layer JSON payloads, never
+        // NAV XML bytes. `snapshot.*`-not-`invoice.*` posture; a system/ops
+        // row, never swept by a per-OUTGOING-invoice export bundle by glob.
+        | EventKind::SnapshotCreated
+        | EventKind::SnapshotValidationFailed
+        | EventKind::SnapshotRestored
+        | EventKind::SnapshotPruned => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -961,7 +969,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 106,
+        EventKind::ALL_KINDS_COUNT == 110,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

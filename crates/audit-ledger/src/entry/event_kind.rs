@@ -2457,6 +2457,32 @@ pub enum EventKind {
     /// bytes (app-layer JSON only). F12 four-edit ritual fires for this
     /// single kind.
     NumberingTemplateChanged,
+
+    /// S426 / ADR-0082 — a validated logical DuckDB snapshot was taken
+    /// (`EXPORT DATABASE` → import-validate → finalize). Payload
+    /// (`SnapshotCreatedPayload`) carries the seq, UTC timestamp, source-DB
+    /// SHA-256, byte size, and the smoke counts. `snapshot.*` prefix
+    /// family — a system/operations event, never NAV-scoped, app-layer
+    /// JSON only (no NAV XML bytes), so it never enters a per-invoice
+    /// export bundle.
+    SnapshotCreated,
+
+    /// S426 / ADR-0082 — a snapshot failed its built-in validation
+    /// (re-import + smoke + hash-chain verify). Payload
+    /// (`SnapshotValidationFailedPayload`) carries the seq and the failure
+    /// reason. The last-good snapshot is preserved. `snapshot.*` family.
+    SnapshotValidationFailed,
+
+    /// S426 / ADR-0082 — a database was restored from a snapshot via
+    /// `IMPORT DATABASE`. Payload (`SnapshotRestoredPayload`) carries the
+    /// source snapshot seq and the restore target path. `snapshot.*`
+    /// family.
+    SnapshotRestored,
+
+    /// S426 / ADR-0082 — retention pruned one or more snapshots. Payload
+    /// (`SnapshotPrunedPayload`) carries the pruned seqs and the retained
+    /// count. `snapshot.*` family.
+    SnapshotPruned,
 }
 
 impl EventKind {
@@ -2581,6 +2607,10 @@ impl EventKind {
             EventKind::SupplierExportScreened => "supplier.export_screened",
             EventKind::IncidentCyberDetected => "incident.cyber_detected",
             EventKind::NumberingTemplateChanged => "system.numbering_template_changed",
+            EventKind::SnapshotCreated => "snapshot.created",
+            EventKind::SnapshotValidationFailed => "snapshot.validation_failed",
+            EventKind::SnapshotRestored => "snapshot.restored",
+            EventKind::SnapshotPruned => "snapshot.pruned",
         }
     }
 
@@ -2716,6 +2746,10 @@ impl EventKind {
             "supplier.export_screened" => Ok(EventKind::SupplierExportScreened),
             "incident.cyber_detected" => Ok(EventKind::IncidentCyberDetected),
             "system.numbering_template_changed" => Ok(EventKind::NumberingTemplateChanged),
+            "snapshot.created" => Ok(EventKind::SnapshotCreated),
+            "snapshot.validation_failed" => Ok(EventKind::SnapshotValidationFailed),
+            "snapshot.restored" => Ok(EventKind::SnapshotRestored),
+            "snapshot.pruned" => Ok(EventKind::SnapshotPruned),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2839,6 +2873,10 @@ impl EventKind {
         EventKind::SupplierExportScreened,
         EventKind::IncidentCyberDetected,
         EventKind::NumberingTemplateChanged,
+        EventKind::SnapshotCreated,
+        EventKind::SnapshotValidationFailed,
+        EventKind::SnapshotRestored,
+        EventKind::SnapshotPruned,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -2970,6 +3008,10 @@ mod tests {
             EventKind::SupplierExportScreened,
             EventKind::IncidentCyberDetected,
             EventKind::NumberingTemplateChanged,
+            EventKind::SnapshotCreated,
+            EventKind::SnapshotValidationFailed,
+            EventKind::SnapshotRestored,
+            EventKind::SnapshotPruned,
         ];
         for v in &variants {
             let s = v.as_str();

@@ -620,35 +620,36 @@ pub enum Command {
     /// `export-invoice-bundle`.
     PrintInvoice(PrintInvoiceArgs),
 
-    /// Take a manual, validated snapshot of the tenant DuckDB — the
-    /// operator panic button before a risky op (e.g. the one-way
-    /// DuckDB 1.5.3 storage upgrade, or a DEV test that could leave the
-    /// DB degraded). S393.
+    /// Periodic, validated, logical DuckDB snapshots (S426 / ADR-0082).
     ///
-    /// Copies the DB (main file + WAL) to a timestamped file under
-    /// `~/Documents/ABERP-snapshots/` (OUTSIDE the repo and OUTSIDE
-    /// `~/.aberp/`), folds the WAL into the copy via a checkpoint, then
-    /// validates the copy read-only with
-    /// `PRAGMA verify_external_invariants`. A snapshot that fails
-    /// validation exits non-zero — surfacing a degrading live DB at
-    /// snapshot time rather than at restore time.
-    ///
-    /// Best taken with `aberp serve` stopped (a quiescent DB snapshots
-    /// cleanly); a live, mid-write DB may copy torn, in which case the
-    /// post-copy validation fails loud rather than producing an
-    /// unrestorable snapshot.
-    Snapshot(SnapshotArgs),
+    /// Subcommands: `now` (take one snapshot), `list` (seq/timestamp/
+    /// size/validation/age), `restore` (rebuild a DB from a snapshot).
+    /// Snapshots use `EXPORT DATABASE` (logical Parquet) — corruption-free
+    /// by construction, unlike S393's file copy which would copy an ART
+    /// corruption. `aberp serve` also takes these automatically every 4h.
+    #[command(subcommand)]
+    Snapshot(SnapshotCommand),
+}
 
-    /// Restore a tenant DuckDB from a snapshot taken by `aberp
-    /// snapshot`. S393.
+/// `aberp snapshot <now|list|restore>` (S426 / ADR-0082).
+#[derive(Debug, Subcommand)]
+pub enum SnapshotCommand {
+    /// Take one managed, validated snapshot immediately and apply
+    /// retention. Safe to run while `aberp serve` is up (in-process
+    /// DuckDB instance sharing) or stopped.
+    Now(SnapshotNowArgs),
+
+    /// List managed snapshots (seq / UTC timestamp / size / validation
+    /// status / age), newest first.
+    List(SnapshotListArgs),
+
+    /// Rebuild a database from a snapshot via `IMPORT DATABASE`.
     ///
-    /// **Refuses** to overwrite a database a live `aberp serve` still
-    /// holds (detected via DuckDB's own exclusive file lock) — stop the
-    /// server first. Also refuses to restore from a snapshot that does
-    /// not pass `PRAGMA verify_external_invariants`, so a corrupt
-    /// snapshot never clobbers a working DB. On success the snapshot's
-    /// bytes are atomically swapped into the destination DB.
-    RestoreSnapshot(RestoreSnapshotArgs),
+    /// **Refuses** unless `--confirm` is passed AND `--to` is NOT under
+    /// any live `~/.aberp/` tenant home — a fat-fingered restore can never
+    /// clobber the live prod DB. Recover prod by restoring to a side path,
+    /// stopping serve, then swapping the file in.
+    Restore(SnapshotRestoreArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -1513,46 +1514,67 @@ pub struct PrintInvoiceArgs {
     pub seller_toml: Option<PathBuf>,
 }
 
-/// `aberp snapshot` — take a manual, validated snapshot of the tenant
-/// DuckDB (S393, the operator panic button).
+/// `aberp snapshot now` — take one managed, validated snapshot (S426).
 #[derive(Debug, Parser)]
-pub struct SnapshotArgs {
-    /// Path to the tenant DuckDB file to snapshot. Same default +
-    /// override shape as every other `--db` flag on this CLI; prod runs
-    /// pass `~/.aberp/prod/aberp.duckdb` (per `run/run_prod.sh`).
+pub struct SnapshotNowArgs {
+    /// Path to the tenant DuckDB to snapshot. Prod runs pass
+    /// `~/.aberp/prod/aberp.duckdb` (per `run/run_prod.sh`).
     #[arg(long, default_value = "./aberp.duckdb")]
     pub db: PathBuf,
 
-    /// Tenant identifier — used to name the default snapshot file
-    /// (`<tenant>-<UTC-ts>.duckdb`). Does NOT load NAV credentials; this
-    /// command never calls NAV.
+    /// Tenant identifier — names the per-tenant snapshot store
+    /// (`~/Documents/ABERP-snapshots/<tenant>/`).
     #[arg(long, default_value = "default")]
     pub tenant: String,
 
-    /// Destination snapshot path. When unset, defaults to
-    /// `~/Documents/ABERP-snapshots/<tenant>-<UTC-ts>.duckdb` (the dir
-    /// is created if missing; it lives OUTSIDE the repo and OUTSIDE
-    /// `~/.aberp/`).
+    /// Override the snapshot store directory. When unset, defaults to
+    /// `~/Documents/ABERP-snapshots/<tenant>/` (OUTSIDE the repo and
+    /// OUTSIDE `~/.aberp/`).
     #[arg(long)]
-    pub out: Option<PathBuf>,
+    pub store: Option<PathBuf>,
 }
 
-/// `aberp restore-snapshot` — restore a tenant DuckDB from a snapshot
-/// (S393). Refuses if `aberp serve` is running on the destination DB.
+/// `aberp snapshot list` — list managed snapshots (S426).
 #[derive(Debug, Parser)]
-pub struct RestoreSnapshotArgs {
-    /// Path to the tenant DuckDB file to restore INTO (overwritten).
-    /// Same default + override shape as every other `--db` flag.
-    #[arg(long, default_value = "./aberp.duckdb")]
-    pub db: PathBuf,
-
-    /// Tenant identifier (for symmetry with `aberp snapshot` and the
-    /// rest of the CLI). Not otherwise load-bearing for the restore.
+pub struct SnapshotListArgs {
+    /// Tenant identifier — selects the per-tenant snapshot store.
     #[arg(long, default_value = "default")]
     pub tenant: String,
 
-    /// Snapshot file to restore from — a file produced by `aberp
-    /// snapshot`. Required; validated read-only before any overwrite.
+    /// Override the snapshot store directory (default per-tenant).
     #[arg(long)]
-    pub from: PathBuf,
+    pub store: Option<PathBuf>,
+}
+
+/// `aberp snapshot restore <seq|ts> --to <path> --confirm` — guarded
+/// restore via `IMPORT DATABASE` (S426 / ADR-0082).
+#[derive(Debug, Parser)]
+pub struct SnapshotRestoreArgs {
+    /// Which snapshot to restore — a seq (`42`), a full directory name
+    /// (`snap-42-20260615-143000`), or a unique timestamp substring.
+    pub selector: String,
+
+    /// Target path to rebuild the database INTO. Must NOT be under any
+    /// live `~/.aberp/` tenant home — restore to a side path, then swap.
+    #[arg(long)]
+    pub to: PathBuf,
+
+    /// Acknowledge that this writes a database at `--to`. Required; the
+    /// safety guard refuses without it (`[[trust-code-not-operator]]`).
+    #[arg(long)]
+    pub confirm: bool,
+
+    /// Tenant identifier — selects the per-tenant snapshot store and is
+    /// recorded on the `snapshot.restored` audit event.
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Live DB whose audit ledger records the restore event (default
+    /// `./aberp.duckdb`; prod passes `~/.aberp/prod/aberp.duckdb`).
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Override the snapshot store directory (default per-tenant).
+    #[arg(long)]
+    pub store: Option<PathBuf>,
 }

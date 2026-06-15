@@ -5450,4 +5450,116 @@ mod tests {
         assert_eq!(sent.outcome, "sent");
         assert_eq!(failed.outcome, "failed");
     }
+
+    #[test]
+    fn snapshot_payloads_round_trip_json() {
+        let created = SnapshotCreatedPayload {
+            seq: 7,
+            created_at: "2026-06-15T14:30:00Z".into(),
+            source_db_sha256: "abc123".into(),
+            byte_size: 4096,
+            invoice_count: 12,
+            audit_count: 340,
+            chain_len: 340,
+            store_dir: "/Users/x/Documents/ABERP-snapshots/prod".into(),
+        };
+        let blob = created.to_bytes();
+        let back: serde_json::Value = serde_json::from_slice(&blob).unwrap();
+        assert_eq!(back["seq"], 7);
+        assert_eq!(back["audit_count"], 340);
+
+        let failed = SnapshotValidationFailedPayload {
+            seq: 8,
+            created_at: "2026-06-15T18:30:00Z".into(),
+            error: "hash-chain verification failed".into(),
+        };
+        assert!(!failed.to_bytes().is_empty());
+
+        let restored = SnapshotRestoredPayload {
+            seq: 7,
+            snapshot_dir: "/snaps/snap-7".into(),
+            target: "/tmp/recovery/aberp.duckdb".into(),
+            restored_at: "2026-06-15T19:00:00Z".into(),
+        };
+        assert!(serde_json::from_slice::<serde_json::Value>(&restored.to_bytes()).is_ok());
+
+        let pruned = SnapshotPrunedPayload {
+            pruned_seqs: vec![1, 2, 3],
+            retained_count: 24,
+            ran_at: "2026-06-15T19:05:00Z".into(),
+        };
+        let v: serde_json::Value = serde_json::from_slice(&pruned.to_bytes()).unwrap();
+        assert_eq!(v["retained_count"], 24);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// S426 / ADR-0082 — snapshot.* DB-snapshot operation payloads.
+//
+// App-layer JSON only (seq / timestamp / SHA-256 / counts / paths); never
+// NAV XML bytes. Each carries the data the operator UI + audit screen need
+// to render the event without re-reading the snapshot store.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::SnapshotCreated`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotCreatedPayload {
+    pub seq: u64,
+    /// RFC-3339 UTC timestamp the snapshot was taken.
+    pub created_at: String,
+    pub source_db_sha256: String,
+    pub byte_size: u64,
+    pub invoice_count: i64,
+    pub audit_count: i64,
+    pub chain_len: u64,
+    pub store_dir: String,
+}
+
+impl SnapshotCreatedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::SnapshotValidationFailed`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotValidationFailedPayload {
+    pub seq: u64,
+    pub created_at: String,
+    pub error: String,
+}
+
+impl SnapshotValidationFailedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::SnapshotRestored`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotRestoredPayload {
+    pub seq: u64,
+    pub snapshot_dir: String,
+    pub target: String,
+    pub restored_at: String,
+}
+
+impl SnapshotRestoredPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::SnapshotPruned`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotPrunedPayload {
+    pub pruned_seqs: Vec<u64>,
+    pub retained_count: usize,
+    pub ran_at: String,
+}
+
+impl SnapshotPrunedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
 }

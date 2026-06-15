@@ -1,759 +1,494 @@
-//! S393 — manual snapshot / restore CLI (the operator panic button).
+//! S426 / ADR-0082 — periodic, validated, logical DuckDB snapshot system.
 //!
-//! ## Why this exists
+//! This module is the `apps/aberp` glue around the [`aberp_snapshot`] crate:
+//! it resolves the per-tenant snapshot store, takes/validates/prunes
+//! snapshots, and **emits the audit events** (`snapshot.created`,
+//! `snapshot.validation_failed`, `snapshot.restored`, `snapshot.pruned`)
+//! that the crate deliberately does not emit (the crate is decoupled from
+//! the ledger). The same shared helpers back three callers:
 //!
-//! DuckDB's on-disk storage upgrade is **one-way**: once the 1.5.3
-//! binary opens a 1.5.2 database read-write, the file is rewritten in
-//! the newer storage format and the older binary can no longer read it.
-//! S393 bumps the bundled engine to libduckdb 1.5.3 to escape a NEW
-//! 1.5.2 read-path assertion (`dict_offset <= ... FetchStringFromDict`,
-//! `string_uncompressed.hpp:247`). Before any such irreversible op — or
-//! before any risky DEV test that could leave the DB degraded — the
-//! operator wants a cheap, validated, off-to-the-side copy they can
-//! roll back to.
+//!   - the `aberp snapshot {now,list,restore}` CLI (this file's `run_*`),
+//!   - the periodic daemon spawned by `aberp serve` ([`run_supervised`]),
+//!   - the operator-UI HTTP endpoints in `serve.rs`.
 //!
-//! This module is that panic button. Two operations, both file-level:
+//! ## Why this replaced S393's file-copy panic button
 //!
-//!   - [`take_snapshot`] — copy the live DB (main file + WAL) to a
-//!     timestamped file OUTSIDE the repo and OUTSIDE `~/.aberp/`, fold
-//!     the WAL into the copy via a checkpoint, then validate the copy
-//!     read-only with `PRAGMA verify_external_invariants`. A snapshot
-//!     that fails validation is reported loudly and the command exits
-//!     non-zero, so a *degrading live DB* is surfaced at snapshot time
-//!     rather than discovered at restore time ([[fail-loud]]).
-//!
-//!   - [`restore_snapshot`] — refuse to overwrite a DB that a live
-//!     `aberp serve` still holds (detected via DuckDB's own exclusive
-//!     file lock — the same lock serve takes when it opens the DB), and
-//!     otherwise atomically swap the snapshot into place.
-//!
-//! ## What is intentionally NOT here (deferred — separate snapshot
-//! session)
-//!
-//! Periodic snapshot daemon, retention policy (rolling 24h/7d/1m/1y),
-//! cloud/S3 sync, storefront DR, encryption-at-rest. Tonight is the
-//! manual panic button only (CLAUDE.md #2/#13).
-//!
-//! ## Storage location
-//!
-//! Snapshots default to `~/Documents/ABERP-snapshots/` — OUTSIDE the
-//! repo (never committed) and OUTSIDE `~/.aberp/` (so a `rm -rf
-//! ~/.aberp/<tenant>` reset, or a restore, never touches the rollback
-//! copies). The dir is created on first snapshot.
-//!
-//! ## Consistency posture ([[trust-code-not-operator]])
-//!
-//! The validation is in code, not operator inspection. Ideally the
-//! operator stops `aberp serve` before snapshotting so the copy is a
-//! quiescent checkpoint; if they snapshot a live, mid-write DB the
-//! main-file/WAL pair can be copied torn, and the post-copy checkpoint
-//! + `verify_external_invariants` is what catches that — the command
-//! fails rather than silently producing an unrestorable snapshot.
+//! S393 copied the live `*.duckdb` file. The 2026-06-11 ART corruption is
+//! internal to that file, so a copy copies the corruption. ADR-0082 switches
+//! to `EXPORT DATABASE` (logical Parquet), which is corruption-free by
+//! construction. The S393 `aberp snapshot` / `aberp restore-snapshot`
+//! commands are gone; this is `aberp snapshot now` / `aberp snapshot
+//! restore`.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use duckdb::{AccessMode, Config, Connection};
+use anyhow::{Context, Result};
+use time::OffsetDateTime;
+use tokio_util::sync::CancellationToken;
 
-use crate::cli::{RestoreSnapshotArgs, SnapshotArgs};
-use crate::fs::write_atomic;
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_snapshot::{
+    default_store_dir, ensure_restore_allowed, find_snapshot, list_snapshots, plan_retention,
+    prune, restore_into, take_snapshot, RetentionPolicy, SnapshotRecord,
+};
 
-/// DuckDB names the write-ahead log by appending `.wal` to the FULL db
-/// filename (so `aberp.duckdb` → `aberp.duckdb.wal`). This is NOT
-/// `Path::with_extension`, which would replace `.duckdb`.
-fn wal_sibling(db: &Path) -> PathBuf {
-    let mut os = db.as_os_str().to_owned();
-    os.push(".wal");
-    PathBuf::from(os)
-}
+use crate::audit_payloads::{
+    SnapshotCreatedPayload, SnapshotPrunedPayload, SnapshotRestoredPayload,
+    SnapshotValidationFailedPayload,
+};
+use crate::cli::{SnapshotListArgs, SnapshotNowArgs, SnapshotRestoreArgs};
 
-/// Atomically copy `src` to `dst` via the shared S390 atomic writer
-/// (temp → fsync → rename → fsync-dir). Reads the whole source into
-/// memory — fine for the tenant DBs this serves (DEV/operator scale);
-/// a future streaming copy would only matter for very large DBs.
-fn copy_atomic(src: &Path, dst: &Path) -> Result<()> {
-    let bytes = std::fs::read(src)
-        .with_context(|| format!("read source file {} for snapshot copy", src.display()))?;
-    write_atomic(dst, &bytes)
-}
+/// Default snapshot cadence: every 4 hours (ADR-0082). Overridable via
+/// `ABERP_SNAPSHOT_INTERVAL_SECS`.
+const DEFAULT_INTERVAL_SECS: u64 = 4 * 60 * 60;
+/// Delay before the first snapshot after boot, so a snapshot never slows
+/// `aberp serve` startup.
+const BOOT_DELAY_SECS: u64 = 60;
 
-/// Take a validated snapshot of the DuckDB at `db_path` into
-/// `dest_path`.
-///
-/// Steps:
-/// 1. Copy the main DB file → `dest_path` and, if present, its WAL →
-///    `dest_path`'s WAL sibling (atomic writes, so a concurrent reader
-///    of the destination never sees a torn file).
-/// 2. Open the **copy** read-write once and `CHECKPOINT` — this replays
-///    any copied WAL into the main file and folds it in, leaving a
-///    single self-contained snapshot file with no outstanding WAL. The
-///    copy is mutated, never the source.
-/// 3. Re-open the copy **read-only** and run
-///    `PRAGMA verify_external_invariants`. Any reported corruption (rows
-///    or a thrown error) fails the snapshot — see [`validate_snapshot`].
-///
-/// On success `dest_path` is a clean, checkpoint-consistent,
-/// freshly-validated DuckDB file (in 1.5.3 storage format).
-pub fn take_snapshot(db_path: &Path, dest_path: &Path) -> Result<()> {
-    if !db_path.exists() {
-        bail!(
-            "source database {} does not exist — nothing to snapshot",
-            db_path.display()
-        );
-    }
-    if let Some(parent) = dest_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create snapshot destination dir {}", parent.display()))?;
-    }
-
-    // 1. Copy main + WAL (if any) to the destination pair.
-    copy_atomic(db_path, dest_path)?;
-    let src_wal = wal_sibling(db_path);
-    let dst_wal = wal_sibling(dest_path);
-    if src_wal.exists() {
-        copy_atomic(&src_wal, &dst_wal)?;
-    } else if dst_wal.exists() {
-        // A stale WAL beside a same-named prior snapshot would corrupt
-        // the new main on replay — clear it so the pair is clean.
-        std::fs::remove_file(&dst_wal)
-            .with_context(|| format!("remove stale snapshot WAL {}", dst_wal.display()))?;
-    }
-
-    // 2. Fold the copied WAL into the copy, mutating only the snapshot
-    //    (never the source DB). After this the snapshot is a single file
-    //    with no outstanding WAL. S410 / [[no-sql-specific]] — the
-    //    engine-specific WAL fold is behind the `StorageEngine` port.
-    STORAGE_ENGINE.fold_wal(dest_path)?;
-
-    // 3. Validate read-only — loud-fail on any corruption signal.
-    validate_snapshot(dest_path)?;
-    Ok(())
-}
-
-/// Restore `snapshot_path` over `db_path`, refusing if a live process
-/// (e.g. `aberp serve`) still holds the destination DB.
-///
-/// Order of checks ([[fail-loud]], least-destructive first):
-/// 1. The snapshot itself must pass `verify_external_invariants` — we
-///    never clobber a (possibly fine) live DB with a corrupt snapshot.
-/// 2. The destination must NOT be held open by a live process — probed
-///    via DuckDB's own exclusive file lock (the lock serve takes). If
-///    held, refuse and instruct the operator to stop the server.
-/// 3. Atomically swap the snapshot's bytes into `db_path` and clear any
-///    stale destination WAL (the snapshot is checkpoint-folded, so a
-///    leftover WAL from the old DB would corrupt the restored main).
-pub fn restore_snapshot(snapshot_path: &Path, db_path: &Path) -> Result<()> {
-    if !snapshot_path.exists() {
-        bail!(
-            "snapshot file {} does not exist — nothing to restore from",
-            snapshot_path.display()
-        );
-    }
-
-    // 1. Refuse to restore from a corrupt snapshot.
-    validate_snapshot(snapshot_path)
-        .with_context(|| format!("snapshot {} failed validation", snapshot_path.display()))?;
-
-    // 2. Refuse if a live process holds the destination DB.
-    if db_held_by_live_process(db_path)? {
-        bail!(
-            "refusing to restore over {} — a process (most likely `aberp serve`) \
-             still holds the database lock.\n\
-             Magyarul: állítsd le az ABERP szervert, mielőtt visszaállítasz.\n\
-             Stop the server first, then re-run this command.",
-            db_path.display()
-        );
-    }
-
-    // 3. Swap the snapshot in and clear any stale destination WAL. The
-    //    destination dir may not exist yet (restoring into a fresh DB
-    //    location), so create it before the atomic write.
-    if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create restore destination dir {}", parent.display()))?;
-    }
-    copy_atomic(snapshot_path, db_path)?;
-    let snap_wal = wal_sibling(snapshot_path);
-    let dst_wal = wal_sibling(db_path);
-    if snap_wal.exists() {
-        copy_atomic(&snap_wal, &dst_wal)?;
-    } else if dst_wal.exists() {
-        std::fs::remove_file(&dst_wal)
-            .with_context(|| format!("remove stale destination WAL {}", dst_wal.display()))?;
-    }
-    Ok(())
-}
-
-/// Classify a DuckDB open error: `true` iff it is a cross-process
-/// exclusive-lock conflict (the signal that `aberp serve` — or another
-/// CLI process — holds the DB), `false` for any other error (corruption,
-/// permissions, …) which must NOT block a restore. Matched on DuckDB's
-/// lock-conflict message: "Could not set lock on file ...: Conflicting
-/// lock is held in ... by PID ...".
-fn is_lock_conflict_message(msg: &str) -> bool {
-    let m = msg.to_lowercase();
-    m.contains("could not set lock") || m.contains("conflicting lock")
-}
-
-/// Probe whether `db_path` is held open by a live process.
-///
-/// Mechanism: attempt a **read-write** DuckDB open. `aberp serve` holds
-/// an exclusive file lock on the DB while running, so a second
-/// read-write open fails with a lock-conflict error. We match ONLY the
-/// lock-conflict signal — any OTHER open error (e.g. the DB is itself
-/// corrupt) is reported as "not live-held", because refusing to restore
-/// over a corrupt DB would defeat the whole panic-button purpose.
-///
-/// A non-existent `db_path` is trivially not held (fresh restore
-/// target). A successful probe-open is closed immediately before the
-/// caller overwrites the file.
-fn db_held_by_live_process(db_path: &Path) -> Result<bool> {
-    if !db_path.exists() {
-        return Ok(false);
-    }
-    match Connection::open(db_path) {
-        Ok(conn) => {
-            // We acquired the lock → no live holder. Release it at once.
-            drop(conn);
-            Ok(false)
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if is_lock_conflict_message(&msg) {
-                Ok(true)
-            } else {
-                // Not a lock conflict — the DB is broken in some other
-                // way. That is exactly when an operator restores, so do
-                // NOT block on it; let the restore proceed.
-                tracing::warn!(
-                    db = %db_path.display(),
-                    error = %e,
-                    "destination DB open failed with a non-lock error; treating as NOT \
-                     live-held so the restore can overwrite it"
-                );
-                Ok(false)
-            }
-        }
-    }
-}
-
-/// Validate `snapshot_path`: `Ok(())` when the file is a structurally
-/// valid store whose external (index/storage) invariants hold; `Err`
-/// otherwise. S410 / [[no-sql-specific]] — the engine-specific integrity
-/// check is behind the [`StorageEngine`] port (see [`DuckDbEngine`]);
-/// business code calls this wrapper, never `duckdb::Connection`.
-pub fn validate_snapshot(snapshot_path: &Path) -> Result<()> {
-    STORAGE_ENGINE.verify_integrity(snapshot_path)
-}
+/// Env var that disables the periodic daemon entirely (the manual CLI +
+/// HTTP "snapshot now" still work).
+pub const POLL_DISABLE_ENV: &str = "ABERP_SNAPSHOT_DISABLE";
 
 // ──────────────────────────────────────────────────────────────────────
-// Storage engine port (S410 / [[no-sql-specific]])
+// Configuration resolution
 // ──────────────────────────────────────────────────────────────────────
 
-/// Engine-specific storage maintenance that the snapshot/restore
-/// subsystem needs. A snapshot tool is inherently tied to the on-disk
-/// file format, so this coupling is *acceptable* — but it is quarantined
-/// behind this port so it is the ONLY place that knows the engine.
-/// Business code calls the trait, never `duckdb::Connection` directly; a
-/// future Postgres/SQLite engine supplies its own impl (`pg_dump` /
-/// `pg_verify`, or a no-op) without touching the snapshot orchestration
-/// in [`take_snapshot`] / [`validate_snapshot`].
-trait StorageEngine {
-    /// Fold any outstanding write-ahead log of the store at `path` into
-    /// the single data file, leaving no side WAL.
-    fn fold_wal(&self, path: &Path) -> Result<()>;
-
-    /// Deep integrity check of the store at `path`. `Ok(())` = clean (or
-    /// the check is unavailable in this build — basic openability already
-    /// validated); `Err` = corruption.
-    fn verify_integrity(&self, path: &Path) -> Result<()>;
-}
-
-/// The only [`StorageEngine`] today. DuckDB-specific operations
-/// (`CHECKPOINT`, `PRAGMA verify_external_invariants`) live here and
-/// nowhere else in business code.
-struct DuckDbEngine;
-
-/// The process-wide storage engine. Swapping engines is a one-line change
-/// here once a second [`StorageEngine`] impl exists.
-const STORAGE_ENGINE: DuckDbEngine = DuckDbEngine;
-
-impl StorageEngine for DuckDbEngine {
-    fn fold_wal(&self, path: &Path) -> Result<()> {
-        {
-            let conn = Connection::open(path).with_context(|| {
-                format!(
-                    "open snapshot copy {} read-write to fold WAL",
-                    path.display()
-                )
-            })?;
-            conn.execute_batch("CHECKPOINT;")
-                .with_context(|| format!("checkpoint snapshot copy {}", path.display()))?;
-        }
-        // Best-effort: a clean checkpoint leaves the WAL empty/removed;
-        // drop any lingering empty WAL so the snapshot is a lone file.
-        let wal = wal_sibling(path);
-        if wal.exists() {
-            let _ = std::fs::remove_file(&wal);
-        }
-        Ok(())
-    }
-
-    fn verify_integrity(&self, path: &Path) -> Result<()> {
-        // The read-only open alone already rejects a torn/garbage file
-        // (bad magic, truncated header). `verify_external_invariants` is
-        // the stronger ART/storage consistency check on top. If a given
-        // engine build does not expose that pragma we DON'T fail over a
-        // missing diagnostic — the read-only open still proved basic
-        // validity — but we log a warning so the gap is visible.
-        let config = Config::default()
-            .access_mode(AccessMode::ReadOnly)
-            .context("build read-only DuckDB config for snapshot validation")?;
-        let conn = Connection::open_with_flags(path, config).with_context(|| {
-            format!(
-                "open snapshot {} read-only for validation (a torn/corrupt file fails here)",
-                path.display()
-            )
-        })?;
-
-        let mut stmt = match conn.prepare("PRAGMA verify_external_invariants") {
-            Ok(s) => s,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.to_lowercase().contains("verify_external_invariants") {
-                    tracing::warn!(
-                        snapshot = %path.display(),
-                        error = %msg,
-                        "PRAGMA verify_external_invariants unavailable; relying on the \
-                         read-only open as the validity check"
-                    );
-                    return Ok(());
-                }
-                return Err(anyhow!(
-                    "snapshot {} is corrupt: verify_external_invariants failed to prepare: {msg}",
-                    path.display()
-                ));
-            }
-        };
-
-        // The pragma throws on corruption (surfaced at query/step) and/or
-        // returns offending rows. Treat EITHER as corruption.
-        let row_count = (|| -> Result<usize> {
-            let mut rows = stmt.query([])?;
-            let mut n = 0usize;
-            while rows.next()?.is_some() {
-                n += 1;
-            }
-            Ok(n)
-        })();
-
-        match row_count {
-            Ok(0) => Ok(()),
-            Ok(n) => Err(anyhow!(
-                "snapshot {} is corrupt: verify_external_invariants reported {n} \
-                 invariant violation row(s)",
-                path.display()
-            )),
-            Err(e) => Err(anyhow!(
-                "snapshot {} is corrupt: verify_external_invariants raised an error: {e}",
-                path.display()
-            )),
-        }
+/// Resolve the snapshot store directory: an explicit `--store` wins,
+/// otherwise the per-tenant default `~/Documents/ABERP-snapshots/<tenant>`.
+pub fn resolve_store(tenant: &str, explicit: Option<&Path>) -> Result<PathBuf> {
+    match explicit {
+        Some(p) => Ok(p.to_path_buf()),
+        None => default_store_dir(tenant).context("resolve default snapshot store dir"),
     }
 }
 
-/// Resolve `~/Documents/ABERP-snapshots/`. Uses HOME / USERPROFILE the
-/// same way `runtime_discovery::runtime_file_path` does (no `dirs`
-/// dep), keeping the snapshot store OUTSIDE the repo and OUTSIDE
-/// `~/.aberp/`.
-fn default_snapshot_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
+/// Read the retention policy from the environment, falling back to the
+/// ADR-0082 defaults. Overridable so an operator can widen/narrow retention
+/// without a rebuild (`[[trust-code-not-operator]]` — the knob is explicit,
+/// not buried).
+pub fn policy_from_env() -> RetentionPolicy {
+    let d = RetentionPolicy::default();
+    RetentionPolicy {
+        keep_last: env_usize("ABERP_SNAPSHOT_KEEP_LAST", d.keep_last),
+        daily_days: env_i64("ABERP_SNAPSHOT_DAILY_DAYS", d.daily_days),
+        weekly_weeks: env_i64("ABERP_SNAPSHOT_WEEKLY_WEEKS", d.weekly_weeks),
+    }
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
         .ok()
-        .filter(|h| !h.is_empty())
-        .or_else(|| std::env::var("USERPROFILE").ok().filter(|p| !p.is_empty()))
-        .ok_or_else(|| {
-            anyhow!(
-                "neither HOME nor USERPROFILE is set — cannot locate ~/Documents/ABERP-snapshots"
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64(key: &str, default: i64) -> i64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Snapshot cadence from `ABERP_SNAPSHOT_INTERVAL_SECS` (default 4h). A
+/// value of 0 or an unparseable value falls back to the default.
+pub fn interval_from_env() -> Duration {
+    let secs = std::env::var("ABERP_SNAPSHOT_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_INTERVAL_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Open a [`Ledger`] against the live DB to append a snapshot audit event.
+fn open_ledger(db_path: &Path, tenant: &TenantId, binary_hash: BinaryHash) -> Result<Ledger> {
+    Ledger::open(db_path, tenant.clone(), binary_hash)
+        .map_err(|e| anyhow::anyhow!("open audit ledger for snapshot event: {e}"))
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Shared operations (CLI + daemon + HTTP all call these)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Take one validated snapshot and emit the appropriate audit event
+/// (`SnapshotCreated` on success, `SnapshotValidationFailed` if the
+/// snapshot was produced but failed its built-in validation — in which case
+/// the invalid snapshot is kept on disk and the last-good is preserved by
+/// retention). Returns the finalized record either way.
+pub fn take_and_emit(
+    db_path: &Path,
+    store_dir: &Path,
+    tenant: &TenantId,
+    binary_hash: BinaryHash,
+    actor: Actor,
+) -> Result<SnapshotRecord> {
+    let now = OffsetDateTime::now_utc();
+    let rec = take_snapshot(db_path, store_dir, tenant.as_str(), now)
+        .with_context(|| format!("take snapshot of {}", db_path.display()))?;
+
+    let created_at = rfc3339(rec.meta.created_at);
+    let mut ledger = open_ledger(db_path, tenant, binary_hash)?;
+    if rec.meta.valid {
+        let payload = SnapshotCreatedPayload {
+            seq: rec.meta.seq,
+            created_at,
+            source_db_sha256: rec.meta.source_db_sha256.clone(),
+            byte_size: rec.meta.byte_size,
+            invoice_count: rec.meta.invoice_count,
+            audit_count: rec.meta.audit_count,
+            chain_len: rec.meta.chain_len,
+            store_dir: store_dir.display().to_string(),
+        };
+        ledger
+            .append(EventKind::SnapshotCreated, payload.to_bytes(), actor, None)
+            .map_err(|e| anyhow::anyhow!("append SnapshotCreated: {e}"))?;
+        tracing::info!(
+            seq = rec.meta.seq,
+            audit = rec.meta.audit_count,
+            invoices = rec.meta.invoice_count,
+            "snapshot created and validated"
+        );
+    } else {
+        let payload = SnapshotValidationFailedPayload {
+            seq: rec.meta.seq,
+            created_at,
+            error: rec
+                .meta
+                .validation_error
+                .clone()
+                .unwrap_or_else(|| "unknown validation failure".to_string()),
+        };
+        ledger
+            .append(
+                EventKind::SnapshotValidationFailed,
+                payload.to_bytes(),
+                actor,
+                None,
             )
-        })?;
-    Ok(PathBuf::from(home)
-        .join("Documents")
-        .join("ABERP-snapshots"))
+            .map_err(|e| anyhow::anyhow!("append SnapshotValidationFailed: {e}"))?;
+        tracing::error!(
+            seq = rec.meta.seq,
+            error = rec.meta.validation_error.as_deref().unwrap_or("?"),
+            "snapshot FAILED validation — kept and marked invalid; last-good preserved"
+        );
+    }
+    Ok(rec)
 }
 
-/// Build the default snapshot output path
-/// `~/Documents/ABERP-snapshots/<tenant>-<UTC-ts>.duckdb`.
-fn default_out_path(tenant: &str, now: time::OffsetDateTime) -> Result<PathBuf> {
-    use time::macros::format_description;
-    const TS: &[time::format_description::FormatItem<'_>] =
-        format_description!("[year][month][day]-[hour][minute][second]");
-    let ts = now.format(TS).context("format snapshot timestamp")?;
-    // Sanitise the tenant so it can never escape the snapshot dir.
-    let safe_tenant: String = tenant
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    Ok(default_snapshot_dir()?.join(format!("{safe_tenant}-{ts}.duckdb")))
+/// Apply retention to the store and emit `SnapshotPruned` if anything was
+/// removed. Returns the pruned seqs.
+pub fn retention_and_emit(
+    db_path: &Path,
+    store_dir: &Path,
+    tenant: &TenantId,
+    binary_hash: BinaryHash,
+    actor: Actor,
+    policy: &RetentionPolicy,
+) -> Result<Vec<u64>> {
+    let records = list_snapshots(store_dir).context("list snapshots for retention")?;
+    let plan = plan_retention(&records, policy, OffsetDateTime::now_utc());
+    if plan.prune.is_empty() {
+        return Ok(Vec::new());
+    }
+    let removed = prune(&records, &plan).context("prune snapshots")?;
+    if !removed.is_empty() {
+        let payload = SnapshotPrunedPayload {
+            pruned_seqs: removed.clone(),
+            retained_count: plan.keep.len(),
+            ran_at: rfc3339(OffsetDateTime::now_utc()),
+        };
+        let mut ledger = open_ledger(db_path, tenant, binary_hash)?;
+        ledger
+            .append(EventKind::SnapshotPruned, payload.to_bytes(), actor, None)
+            .map_err(|e| anyhow::anyhow!("append SnapshotPruned: {e}"))?;
+        tracing::info!(pruned = ?removed, retained = plan.keep.len(), "snapshot retention applied");
+    }
+    Ok(removed)
 }
 
-/// CLI entry point for `aberp snapshot`.
-pub fn run_snapshot(args: &SnapshotArgs) -> Result<()> {
-    let out = match &args.out {
-        Some(p) => p.clone(),
-        None => default_out_path(&args.tenant, time::OffsetDateTime::now_utc())?,
+/// One full daemon cycle: take + validate + emit, then retention + emit.
+/// Retention failure does not discard the snapshot just taken.
+pub fn run_cycle(
+    db_path: &Path,
+    store_dir: &Path,
+    tenant: &TenantId,
+    binary_hash: BinaryHash,
+    actor: Actor,
+    policy: &RetentionPolicy,
+) -> Result<SnapshotRecord> {
+    let rec = take_and_emit(db_path, store_dir, tenant, binary_hash.clone(), actor.clone())?;
+    if let Err(e) = retention_and_emit(db_path, store_dir, tenant, binary_hash, actor, policy) {
+        // A retention hiccup must not fail the cycle — the fresh snapshot is
+        // the valuable output; stale extras are harmless.
+        tracing::warn!(error = %e, "snapshot retention failed this cycle (snapshot itself is fine)");
+    }
+    Ok(rec)
+}
+
+/// Restore a snapshot into `target`, emitting `SnapshotRestored`. The guard
+/// ([`ensure_restore_allowed`]) MUST already have passed — callers run it
+/// first so a refusal never even finds the snapshot.
+pub fn restore_and_emit(
+    db_path_for_audit: &Path,
+    store_dir: &Path,
+    selector: &str,
+    target: &Path,
+    tenant: &TenantId,
+    binary_hash: BinaryHash,
+    actor: Actor,
+) -> Result<SnapshotRecord> {
+    let rec = find_snapshot(store_dir, selector)
+        .map_err(|e| anyhow::anyhow!("find snapshot '{selector}': {e}"))?;
+    restore_into(&rec.dir, target, tenant.as_str())
+        .map_err(|e| anyhow::anyhow!("restore snapshot '{selector}': {e}"))?;
+
+    let payload = SnapshotRestoredPayload {
+        seq: rec.meta.seq,
+        snapshot_dir: rec.dir.display().to_string(),
+        target: target.display().to_string(),
+        restored_at: rfc3339(OffsetDateTime::now_utc()),
     };
-    tracing::info!(
-        tenant = %args.tenant,
-        db = %args.db.display(),
-        out = %out.display(),
-        "taking snapshot"
-    );
-    take_snapshot(&args.db, &out)?;
-    // Operator-facing success line on stdout (tracing goes to stderr).
+    // The audit row records the restore against the live DB's ledger (NOT
+    // the freshly-restored side-DB), so the operator's main timeline shows
+    // that a restore happened.
+    let mut ledger = open_ledger(db_path_for_audit, tenant, binary_hash)?;
+    ledger
+        .append(EventKind::SnapshotRestored, payload.to_bytes(), actor, None)
+        .map_err(|e| anyhow::anyhow!("append SnapshotRestored: {e}"))?;
+    tracing::info!(seq = rec.meta.seq, target = %target.display(), "snapshot restored");
+    Ok(rec)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// CLI entry points
+// ──────────────────────────────────────────────────────────────────────
+
+/// `aberp snapshot now` — take one managed, validated snapshot immediately
+/// and apply retention.
+pub fn run_now(args: &SnapshotNowArgs) -> Result<()> {
+    let tenant = tenant_id(&args.tenant)?;
+    let store_dir = resolve_store(&args.tenant, args.store.as_deref())?;
+    let binary_hash = crate::binary_hash::compute().context("compute binary hash")?;
+    let actor = cli_actor("system:snapshot-cli");
+    let policy = policy_from_env();
+
+    let rec = run_cycle(&args.db, &store_dir, &tenant, binary_hash, actor, &policy)?;
+    if rec.meta.valid {
+        println!(
+            "Snapshot #{} written and validated → {}\n  invoices={}  audit_rows={}  chain={}  size={}",
+            rec.meta.seq,
+            rec.dir.display(),
+            rec.meta.invoice_count,
+            rec.meta.audit_count,
+            rec.meta.chain_len,
+            human_size(rec.meta.byte_size),
+        );
+    } else {
+        println!(
+            "Snapshot #{} FAILED validation (kept for inspection) → {}\n  reason: {}",
+            rec.meta.seq,
+            rec.dir.display(),
+            rec.meta.validation_error.as_deref().unwrap_or("?"),
+        );
+    }
+    Ok(())
+}
+
+/// `aberp snapshot list` — show seq / timestamp / size / validation / age.
+pub fn run_list(args: &SnapshotListArgs) -> Result<()> {
+    let store_dir = resolve_store(&args.tenant, args.store.as_deref())?;
+    let records = list_snapshots(&store_dir).context("list snapshots")?;
+    if records.is_empty() {
+        println!("No snapshots in {}", store_dir.display());
+        return Ok(());
+    }
+    let now = OffsetDateTime::now_utc();
+    println!("Snapshots in {} (newest first):", store_dir.display());
     println!(
-        "Snapshot written and validated: {}\n(source DB: {})",
-        out.display(),
-        args.db.display()
+        "  {:>5}  {:<20}  {:>9}  {:<8}  {:<10}",
+        "SEQ", "TIMESTAMP (UTC)", "SIZE", "STATUS", "AGE"
+    );
+    for r in &records {
+        println!(
+            "  {:>5}  {:<20}  {:>9}  {:<8}  {:<10}",
+            r.meta.seq,
+            rfc3339(r.meta.created_at),
+            human_size(r.meta.byte_size),
+            if r.meta.valid { "valid" } else { "INVALID" },
+            human_age(r.age(now)),
+        );
+    }
+    Ok(())
+}
+
+/// `aberp snapshot restore <seq|ts> --to <path> --confirm` — guarded
+/// restore. Refuses without `--confirm` or onto any live `~/.aberp` DB,
+/// BEFORE touching the store (`[[trust-code-not-operator]]`).
+pub fn run_restore(args: &SnapshotRestoreArgs) -> Result<()> {
+    // Guard first — the safety lives in the binary, not the operator.
+    ensure_restore_allowed(&args.to, args.confirm).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let tenant = tenant_id(&args.tenant)?;
+    let store_dir = resolve_store(&args.tenant, args.store.as_deref())?;
+    let binary_hash = crate::binary_hash::compute().context("compute binary hash")?;
+    let actor = cli_actor("system:snapshot-cli");
+
+    let rec = restore_and_emit(
+        &args.db,
+        &store_dir,
+        &args.selector,
+        &args.to,
+        &tenant,
+        binary_hash,
+        actor,
+    )?;
+    println!(
+        "Restored snapshot #{} → {}\n(verify it, then stop `aberp serve` and swap it into place if this is a prod recovery)",
+        rec.meta.seq,
+        args.to.display()
     );
     Ok(())
 }
 
-/// CLI entry point for `aberp restore-snapshot`.
-pub fn run_restore(args: &RestoreSnapshotArgs) -> Result<()> {
+// ──────────────────────────────────────────────────────────────────────
+// Periodic daemon (spawned by `aberp serve`)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Everything the snapshot daemon needs, captured at boot.
+pub struct SnapshotDaemonDeps {
+    pub db_path: PathBuf,
+    pub tenant: TenantId,
+    pub binary_hash: BinaryHash,
+    pub store_dir: PathBuf,
+    pub interval: Duration,
+    pub policy: RetentionPolicy,
+}
+
+/// `true` if the periodic daemon is disabled by env. The manual CLI/HTTP
+/// "snapshot now" path is unaffected.
+pub fn is_disabled() -> bool {
+    std::env::var(POLL_DISABLE_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Supervised periodic snapshot loop. Sleeps `BOOT_DELAY_SECS` after boot,
+/// then snapshots every `interval`. Each cycle runs on a blocking thread
+/// (DuckDB EXPORT/IMPORT is blocking) and logs-but-survives any error — a
+/// snapshot failure never takes down `aberp serve`.
+pub async fn run_supervised(deps: SnapshotDaemonDeps, cancel: CancellationToken) {
     tracing::info!(
-        tenant = %args.tenant,
-        db = %args.db.display(),
-        from = %args.from.display(),
-        "restoring snapshot"
+        interval_secs = deps.interval.as_secs(),
+        store = %deps.store_dir.display(),
+        "snapshot daemon started (S426 / ADR-0082)"
     );
-    restore_snapshot(&args.from, &args.db)?;
-    println!(
-        "Restored {} from snapshot {}",
-        args.db.display(),
-        args.from.display()
-    );
-    Ok(())
+    tokio::select! {
+        _ = cancel.cancelled() => return,
+        _ = tokio::time::sleep(Duration::from_secs(BOOT_DELAY_SECS)) => {}
+    }
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let db = deps.db_path.clone();
+        let store = deps.store_dir.clone();
+        let tenant = deps.tenant.clone();
+        let bh = deps.binary_hash.clone();
+        let policy = deps.policy;
+        let actor = cli_actor("system:snapshot-daemon");
+        let outcome =
+            tokio::task::spawn_blocking(move || run_cycle(&db, &store, &tenant, bh, actor, &policy))
+                .await;
+        match outcome {
+            Ok(Ok(_rec)) => {}
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "snapshot cycle failed; daemon continues")
+            }
+            Err(join) => {
+                tracing::error!(error = %join, "snapshot cycle task panicked; daemon continues")
+            }
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(deps.interval) => {}
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Small helpers
+// ──────────────────────────────────────────────────────────────────────
+
+fn tenant_id(tenant: &str) -> Result<TenantId> {
+    TenantId::new(tenant.to_string()).with_context(|| format!("invalid tenant id {tenant:?}"))
+}
+
+fn cli_actor(login: &str) -> Actor {
+    use ulid::Ulid;
+    Actor::from_local_cli(Ulid::new().to_string(), login)
+}
+
+/// Format an `OffsetDateTime` as RFC-3339 (UTC, e.g. `2026-06-15T14:30:00Z`).
+pub fn rfc3339(dt: OffsetDateTime) -> String {
+    dt.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| dt.unix_timestamp().to_string())
+}
+
+/// Human-readable byte size (KiB/MiB/GiB).
+pub fn human_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Coarse human age ("3h", "2d", "5w").
+pub fn human_age(d: time::Duration) -> String {
+    let secs = d.whole_seconds().max(0);
+    if secs >= 7 * 86400 {
+        format!("{}w", secs / (7 * 86400))
+    } else if secs >= 86400 {
+        format!("{}d", secs / 86400)
+    } else if secs >= 3600 {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Per-test tempdir under the system temp root — mirrors the
-    /// `fs::tests::ScopedTempDir` pattern (no `tempfile` dev-dep, per
-    /// CLAUDE.md #2/#11).
-    struct ScopedTempDir(PathBuf);
-
-    impl ScopedTempDir {
-        fn new(label: &str) -> Self {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "aberp-s393-snap-{label}-{}-{nanos}-{seq}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&path).expect("create scoped tempdir");
-            Self(path)
-        }
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for ScopedTempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// Build a small populated DuckDB at `path` and return the row
-    /// payload we expect to survive a snapshot round-trip.
-    fn seed_db(path: &Path) -> Vec<(i64, String)> {
-        let conn = Connection::open(path).expect("open db");
-        conn.execute_batch(
-            "CREATE TABLE t (id BIGINT, name VARCHAR);
-             INSERT INTO t VALUES (1, 'alpha'), (2, 'béta'), (3, 'gamma');",
-        )
-        .expect("seed");
-        // Close so the WAL is checkpointed into the main file.
-        drop(conn);
-        vec![(1, "alpha".into()), (2, "béta".into()), (3, "gamma".into())]
-    }
-
-    fn read_rows(path: &Path) -> Vec<(i64, String)> {
-        let config = Config::default().access_mode(AccessMode::ReadOnly).unwrap();
-        let conn = Connection::open_with_flags(path, config).expect("reopen ro");
-        let mut stmt = conn.prepare("SELECT id, name FROM t ORDER BY id").unwrap();
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-            .unwrap();
-        rows.map(|r| r.unwrap()).collect()
+    #[test]
+    fn human_size_scales() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2048), "2.0 KiB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
     }
 
     #[test]
-    fn take_snapshot_round_trips_data() {
-        let dir = ScopedTempDir::new("roundtrip");
-        let db = dir.path().join("aberp.duckdb");
-        let expected = seed_db(&db);
-
-        let snap = dir.path().join("snap.duckdb");
-        take_snapshot(&db, &snap).expect("snapshot ok");
-        assert!(snap.exists(), "snapshot file must exist");
-
-        // Reopen the snapshot read-only — same data.
-        assert_eq!(read_rows(&snap), expected);
-        // The folded snapshot carries no outstanding WAL sibling.
-        assert!(
-            !wal_sibling(&snap).exists(),
-            "checkpoint-folded snapshot must have no WAL sibling"
-        );
+    fn human_age_buckets() {
+        assert_eq!(human_age(time::Duration::seconds(45)), "45s");
+        assert_eq!(human_age(time::Duration::hours(3)), "3h");
+        assert_eq!(human_age(time::Duration::days(2)), "2d");
+        assert_eq!(human_age(time::Duration::days(14)), "2w");
     }
 
     #[test]
-    fn take_snapshot_includes_uncheckpointed_wal_writes() {
-        let dir = ScopedTempDir::new("walfold");
-        let db = dir.path().join("aberp.duckdb");
-
-        // Open, write, and DO NOT checkpoint — leave rows in the WAL by
-        // keeping a connection that we drop without an explicit
-        // checkpoint is not enough (close checkpoints). Instead disable
-        // the auto-checkpoint so the WAL survives the close.
-        {
-            let conn = Connection::open(&db).unwrap();
-            conn.execute_batch(
-                "PRAGMA disable_checkpoint_on_shutdown;
-                 SET wal_autocheckpoint = '1TB';
-                 CREATE TABLE t (id BIGINT, name VARCHAR);
-                 INSERT INTO t VALUES (7, 'wal-only');",
-            )
-            .unwrap();
-            drop(conn);
-        }
-        // Sanity: a WAL file is present beside the source (the write
-        // never made it into the main file).
-        // (Not asserted hard — engine may still fold on close; the real
-        //  assertion is that the snapshot captures the row regardless.)
-
-        let snap = dir.path().join("snap.duckdb");
-        take_snapshot(&db, &snap).expect("snapshot ok");
-        assert_eq!(read_rows(&snap), vec![(7, "wal-only".to_string())]);
-    }
-
-    #[test]
-    fn validate_snapshot_passes_on_fresh_snapshot() {
-        let dir = ScopedTempDir::new("validate");
-        let db = dir.path().join("aberp.duckdb");
-        seed_db(&db);
-        let snap = dir.path().join("snap.duckdb");
-        take_snapshot(&db, &snap).unwrap();
-        // verify_external_invariants must pass on a freshly-taken,
-        // checkpoint-folded snapshot.
-        validate_snapshot(&snap).expect("fresh snapshot validates clean");
-    }
-
-    #[test]
-    fn validate_snapshot_rejects_garbage_file() {
-        let dir = ScopedTempDir::new("garbage");
-        let bogus = dir.path().join("not-a-db.duckdb");
-        std::fs::write(&bogus, b"this is not a duckdb file at all").unwrap();
-        assert!(
-            validate_snapshot(&bogus).is_err(),
-            "a non-DuckDB file must fail validation"
-        );
-    }
-
-    /// Deterministic, OS-independent guard for the lock-error
-    /// classifier — the part of the live-DB probe that could silently
-    /// regress (e.g. a DuckDB message reword). The real cross-process
-    /// refusal is exercised by `restore_refuses_when_db_is_live_lock_held`.
-    #[test]
-    fn lock_conflict_classifier_matches_duckdb_message_only() {
-        assert!(is_lock_conflict_message(
-            "IO Error: Could not set lock on file \"/x/aberp.duckdb\": \
-             Conflicting lock is held in /usr/bin/aberp (PID 4242)"
-        ));
-        assert!(is_lock_conflict_message("Conflicting lock is held"));
-        // A NON-lock error (corruption / missing file) must NOT be read
-        // as live-held — restoring over a broken DB is the whole point.
-        assert!(!is_lock_conflict_message(
-            "IO Error: Could not read from file: checksum mismatch"
-        ));
-        assert!(!is_lock_conflict_message("Catalog Error: Table not found"));
-    }
-
-    /// Hidden subprocess entry point. When `ABERP_S393_HOLD_DB` is set
-    /// (only by the parent test below), this opens that DB read-write —
-    /// taking DuckDB's CROSS-PROCESS exclusive lock, exactly like a live
-    /// `aberp serve` — signals readiness, and holds the lock until a
-    /// release file appears (bounded at ~30s as an orphan guard). In a
-    /// normal `cargo test` run the env var is absent, so this is an
-    /// instant no-op.
-    ///
-    /// Why a subprocess: DuckDB shares ONE database instance across
-    /// connections within a single process, so an in-process second
-    /// open never hits the file lock. Only a separate OS process
-    /// reproduces the serve-vs-CLI contention the probe must detect.
-    #[test]
-    fn zz_subprocess_db_lock_holder() {
-        let db = match std::env::var("ABERP_S393_HOLD_DB") {
-            Ok(p) if !p.is_empty() => p,
-            _ => return, // normal run: no-op
-        };
-        let ready = std::env::var("ABERP_S393_READY_FILE").expect("ready file env");
-        let release = std::env::var("ABERP_S393_RELEASE_FILE").expect("release file env");
-        let _conn = Connection::open(&db).expect("subprocess holds db open like serve");
-        std::fs::write(&ready, b"1").expect("signal ready");
-        for _ in 0..3000 {
-            if Path::new(&release).exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    fn restore_refuses_when_db_is_live_lock_held() {
-        let dir = ScopedTempDir::new("livelock");
-        let db = dir.path().join("aberp.duckdb");
-        seed_db(&db);
-        let snap = dir.path().join("snap.duckdb");
-        take_snapshot(&db, &snap).unwrap();
-
-        // Spawn a REAL separate process that holds the DB lock (re-exec
-        // this test binary filtered to the hidden holder test).
-        let ready = dir.path().join("ready");
-        let release = dir.path().join("release");
-        let exe = std::env::current_exe().expect("current test exe");
-        let mut child = std::process::Command::new(exe)
-            .args([
-                "--exact",
-                "snapshot::tests::zz_subprocess_db_lock_holder",
-                "--nocapture",
-            ])
-            .env("ABERP_S393_HOLD_DB", &db)
-            .env("ABERP_S393_READY_FILE", &ready)
-            .env("ABERP_S393_RELEASE_FILE", &release)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn lock-holder subprocess");
-
-        // Wait until the child actually holds the lock.
-        let mut held = false;
-        for _ in 0..1000 {
-            if ready.exists() {
-                held = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(held, "lock-holder subprocess never signalled readiness");
-
-        // The restore must refuse while the live process holds the DB.
-        let result = restore_snapshot(&snap, &db);
-
-        // Release the child regardless of the assertion outcome.
-        let _ = std::fs::write(&release, b"1");
-        let _ = child.wait();
-
-        let err = result.expect_err("restore must refuse while the DB is lock-held");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("refusing to restore") && msg.to_lowercase().contains("lock"),
-            "refusal must name the lock conflict: {msg}"
-        );
-
-        // Once the holder has exited, the restore succeeds.
-        restore_snapshot(&snap, &db).expect("restore succeeds once serve stops");
-        assert_eq!(read_rows(&db), seed_db_expected());
-    }
-
-    fn seed_db_expected() -> Vec<(i64, String)> {
-        vec![(1, "alpha".into()), (2, "béta".into()), (3, "gamma".into())]
-    }
-
-    #[test]
-    fn restore_round_trips_after_db_mutated() {
-        let dir = ScopedTempDir::new("restore-rt");
-        let db = dir.path().join("aberp.duckdb");
-        seed_db(&db);
-        let snap = dir.path().join("snap.duckdb");
-        take_snapshot(&db, &snap).unwrap();
-
-        // Mutate the live DB AFTER the snapshot.
-        {
-            let conn = Connection::open(&db).unwrap();
-            conn.execute_batch("DELETE FROM t; INSERT INTO t VALUES (99, 'mutated');")
-                .unwrap();
-        }
-        assert_eq!(read_rows(&db), vec![(99, "mutated".to_string())]);
-
-        // Restore rolls the DB back to the snapshot contents.
-        restore_snapshot(&snap, &db).expect("restore ok");
-        assert_eq!(read_rows(&db), seed_db_expected());
-    }
-
-    #[test]
-    fn restore_into_nonexistent_target_succeeds() {
-        let dir = ScopedTempDir::new("fresh-target");
-        let src = dir.path().join("aberp.duckdb");
-        seed_db(&src);
-        let snap = dir.path().join("snap.duckdb");
-        take_snapshot(&src, &snap).unwrap();
-
-        // Restore into a path that does not yet exist (fresh DB dir).
-        let fresh = dir.path().join("restored").join("aberp.duckdb");
-        restore_snapshot(&snap, &fresh).expect("restore into fresh target");
-        assert_eq!(read_rows(&fresh), seed_db_expected());
-    }
-
-    #[test]
-    fn default_out_path_is_under_documents_snapshots() {
-        // HOME swap is process-global; this test only reads env, it
-        // does not write files, so a transient set/restore is safe
-        // enough for the path-shape assertion.
-        let prior = std::env::var("HOME").ok();
-        let tmp = std::env::temp_dir().join(format!("aberp-s393-home-{}", std::process::id()));
-        std::env::set_var("HOME", &tmp);
-        let now = time::macros::datetime!(2026-06-13 21:30:05 UTC);
-        let p = default_out_path("prod", now).unwrap();
-        assert_eq!(
-            p,
-            tmp.join("Documents")
-                .join("ABERP-snapshots")
-                .join("prod-20260613-213005.duckdb")
-        );
-        match prior {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-
-    #[test]
-    fn default_out_path_sanitises_exotic_tenant() {
-        let now = time::macros::datetime!(2026-06-13 00:00:00 UTC);
-        let p = default_out_path("../../etc", now).unwrap();
-        let name = p.file_name().unwrap().to_string_lossy();
-        assert!(!name.contains('/'), "tenant must not escape dir: {name}");
-        assert!(name.starts_with(".._.._etc-"), "sanitised: {name}");
-    }
-
-    #[test]
-    fn wal_sibling_appends_not_replaces_extension() {
-        assert_eq!(
-            wal_sibling(Path::new("/x/aberp.duckdb")),
-            PathBuf::from("/x/aberp.duckdb.wal")
-        );
+    fn rfc3339_is_z_suffixed() {
+        let dt = time::macros::datetime!(2026-06-15 14:30:00 UTC);
+        assert_eq!(rfc3339(dt), "2026-06-15T14:30:00Z");
     }
 }

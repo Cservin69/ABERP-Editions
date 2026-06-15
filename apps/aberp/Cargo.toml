@@ -39,6 +39,8 @@ production = []
 # dependencies (below) so the production binary cannot reach
 # `Actor::test_only`. Closes fortnightly review F15.
 aberp-audit-ledger = { path = "../../crates/audit-ledger" }
+# S426 / ADR-0082 — periodic validated logical DuckDB snapshot subsystem.
+aberp-snapshot = { path = "../../crates/aberp-snapshot" }
 # S344 / PR-38 — DigitalIdProvider swap-point. Boot constructs the mock
 # (the only backend today) into `AppState.digital_id`; real backends slot
 # in behind the trait in later sessions. See `[[defense-aerospace-pivot]]`.
