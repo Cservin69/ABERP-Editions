@@ -351,12 +351,20 @@ ok "verified: on ${version}, clean tree, HEAD=${local_head:0:12} matches origin"
 # S282 / PR-267 — honor [[trust-code-not-operator]]: the operator should
 # never need to remember to set `ABERP_QUOTE_PIPELINE_PYTHON` or run
 # `python -m venv` by hand to enable the pricing pipeline. This step is
-# idempotent — if the venv already exists AND has `aberp_cad_extract`
-# importable, it's a 100ms no-op. First time on a fresh checkout it
-# creates the venv + `pip install -e`s the local package. Failure here
-# is logged but does NOT block the upgrade (operator can retry); the
-# backend resolver will surface the missing venv as a RED card on the
-# Pricing tab.
+# idempotent — if the venv already exists AND can import BOTH
+# `aberp_cad_extract` (STL) AND `OCP` (the STEP backend), it's a 100ms
+# no-op. First time on a fresh checkout it creates the venv + installs the
+# local package WITH the `[step]` extra. Failure here is logged but does
+# NOT block the upgrade (operator can retry); the backend resolver will
+# surface the missing venv as a RED card on the Pricing tab.
+#
+# S422 — this inline copy previously installed `pip install -e .` (base
+# only) and verified only `import aberp_cad_extract`. A prod box provisioned
+# solely by this script could extract STL but FAILED every STEP upload
+# silently. It now mirrors run/provision_pipeline_venv.sh's `[step]`/OCP
+# contract; the two are a deliberate, cross-referenced near-duplicate (see
+# that file's header for why they are kept separate). Re-running this on a
+# pre-S422 box detects the missing OCP and re-installs with `[step]`.
 provision_pipeline_venv() {
   local venv_dir="${REPO_ROOT}/python/aberp-cad-extract/.venv"
   local venv_python="${venv_dir}/bin/python"
@@ -368,8 +376,12 @@ provision_pipeline_venv() {
     return 0
   fi
 
-  if [[ -x "$venv_python" ]] && "$venv_python" -c "import aberp_cad_extract" >/dev/null 2>&1; then
-    info "pipeline venv OK at ${venv_dir} — no-op"
+  # No-op only if BOTH the base module AND the OCP STEP backend import.
+  # A base-only venv (pre-S422, or built without `[step]`) must fall through
+  # and get `.[step]` added — otherwise STEP uploads silently fail.
+  if [[ -x "$venv_python" ]] \
+    && "$venv_python" -c "import aberp_cad_extract, OCP" >/dev/null 2>&1; then
+    info "pipeline venv OK at ${venv_dir} (module + OCP) — no-op"
     return 0
   fi
 
@@ -404,16 +416,20 @@ provision_pipeline_venv() {
     warn "pip --upgrade failed — continuing with the venv's bundled pip"
   fi
 
-  if ! "$venv_python" -m pip install --quiet -e "$pkg_dir"; then
-    warn "pip install -e ${pkg_dir} failed — pipeline daemon will be dormant"
+  # Install WITH the `[step]` extra (the ~63 MB OCP wheel): the pyproject
+  # mandates "Production installs (and CI) MUST install with `.[step]`" so
+  # STEP submissions extract cleanly instead of hitting the
+  # NotImplementedError stub path. Without it STEP uploads fail in prod.
+  if ! "$venv_python" -m pip install --quiet -e "${pkg_dir}[step]"; then
+    warn "pip install -e ${pkg_dir}[step] failed — pipeline daemon will be dormant"
     warn "pip install -e hibára futott — a daemon szünetel"
     return 0
   fi
 
-  if "$venv_python" -c "import aberp_cad_extract" >/dev/null 2>&1; then
-    ok "pipeline venv provisioned at ${venv_dir}"
+  if "$venv_python" -c "import aberp_cad_extract, OCP" >/dev/null 2>&1; then
+    ok "pipeline venv provisioned at ${venv_dir} (module + OCP)"
   else
-    warn "venv created but aberp_cad_extract still not importable — investigate by hand"
+    warn "venv created but aberp_cad_extract / OCP still not importable — investigate by hand"
   fi
 }
 
