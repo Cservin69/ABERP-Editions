@@ -124,6 +124,8 @@ pub mod quote_pricing_jobs;
 // `aberp-quote-pdf` render) + the storefront priced-writeback POST.
 pub mod quote_calibration;
 pub mod quote_pricing_pipeline;
+// S430 / ADR-0083 — AES-256-GCM CAD-blob encryption-at-rest + read-audit.
+pub mod cad_blob;
 // S325 / PR-25 — EVE addendum-2 customer-facing stock-alert banner
 // producer: in-memory re-render queue + the daemon that drains it and
 // re-POSTs `priced.pdf` with `stock_alert:true` to the storefront.

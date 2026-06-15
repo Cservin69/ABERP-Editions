@@ -158,6 +158,13 @@ quick-xml = { version = "0.36", features = ["serialize"] }
 sha2 = "0.10"
 sha3 = "0.10"
 aes = "0.8"
+# S430 / ADR-0083 — AES-256-GCM AEAD for CAD-blob encryption-at-rest.
+# Distinct from the raw `aes` block above (that one is NAV's protocol-
+# imposed AES-128/ECB token cipher); GCM gives authenticated encryption
+# so a flipped ciphertext bit fails decryption loudly (tamper-evident).
+# `getrandom` feature pulls the OS CSPRNG used to mint the per-blob 96-
+# bit nonce and the 256-bit key. License: MIT/Apache-2.0 dual (RustCrypto).
+aes-gcm = { version = "0.10", features = ["getrandom"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 # S279 / PR-265 — blake3 for the priced-writeback idempotency key. The

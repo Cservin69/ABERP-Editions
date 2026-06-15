@@ -2594,6 +2594,27 @@ pub enum EventKind {
     /// (`QuoteCalibrationCoefficientShiftedPayload`) carries the family and
     /// the previous vs new coefficient. `quote.*` family; app-layer JSON only.
     QuoteCalibrationCoefficientShifted,
+
+    /// S430 / ADR-0083 — a fresh AES-256-GCM CAD-blob encryption key was
+    /// minted and stored in the OS keychain on first boot (the keychain
+    /// item was absent). Payload (`CadBlobKeyProvisionedPayload`) carries
+    /// the tenant id and the key algorithm. `cad.*` family; app-layer JSON
+    /// only — never NAV XML.
+    CadBlobKeyProvisioned,
+
+    /// S430 / ADR-0083 — a CAD blob was fetched (operator preview, quote-
+    /// engine reprice, customer download, or system revalidate). Payload
+    /// (`CadBlobReadPayload`) carries the blob id, requester, and purpose.
+    /// Reads from the same requester for the same blob within 60s are
+    /// debounced (no second row). `cad.*` family; app-layer JSON only.
+    CadBlobRead,
+
+    /// S430 / ADR-0083 — a CAD blob with no encryption magic header
+    /// (legacy plaintext, written before S430) was read. Surfaced so a
+    /// future migration sweep can find + re-encrypt these blobs. Payload
+    /// (`CadBlobLegacyPlaintextReadPayload`) carries the blob id and
+    /// requester. `cad.*` family; app-layer JSON only.
+    CadBlobLegacyPlaintextRead,
 }
 
 impl EventKind {
@@ -2741,6 +2762,9 @@ impl EventKind {
             EventKind::QuoteCalibrationCoefficientShifted => {
                 "quote.calibration_coefficient_shifted"
             }
+            EventKind::CadBlobKeyProvisioned => "cad.blob_key_provisioned",
+            EventKind::CadBlobRead => "cad.blob_read",
+            EventKind::CadBlobLegacyPlaintextRead => "cad.blob_legacy_plaintext_read",
         }
     }
 
@@ -2899,6 +2923,9 @@ impl EventKind {
             "quote.calibration_coefficient_shifted" => {
                 Ok(EventKind::QuoteCalibrationCoefficientShifted)
             }
+            "cad.blob_key_provisioned" => Ok(EventKind::CadBlobKeyProvisioned),
+            "cad.blob_read" => Ok(EventKind::CadBlobRead),
+            "cad.blob_legacy_plaintext_read" => Ok(EventKind::CadBlobLegacyPlaintextRead),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -3043,6 +3070,9 @@ impl EventKind {
         EventKind::QuoteCalibrationSampleSkipped,
         EventKind::QuoteCalibrationApplied,
         EventKind::QuoteCalibrationCoefficientShifted,
+        EventKind::CadBlobKeyProvisioned,
+        EventKind::CadBlobRead,
+        EventKind::CadBlobLegacyPlaintextRead,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -3195,6 +3225,9 @@ mod tests {
             EventKind::QuoteCalibrationSampleSkipped,
             EventKind::QuoteCalibrationApplied,
             EventKind::QuoteCalibrationCoefficientShifted,
+            EventKind::CadBlobKeyProvisioned,
+            EventKind::CadBlobRead,
+            EventKind::CadBlobLegacyPlaintextRead,
         ];
         for v in &variants {
             let s = v.as_str();
@@ -3228,7 +3261,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            127,
+            130,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \

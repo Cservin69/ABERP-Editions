@@ -51,6 +51,7 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 use zeroize::Zeroizing;
 
+use crate::cad_blob::{CadBlobCtx, DecryptedTempFile, ReadPurpose};
 use aberp_audit_ledger::{
     append_in_tx, ensure_schema as audit_ensure_schema, Actor, BinaryHash, EventKind, LedgerMeta,
     TenantId,
@@ -142,6 +143,10 @@ pub struct PricingPipelineService {
     config: PricingPipelineConfig,
     deps: PricingPipelineDeps,
     client: reqwest::Client,
+    /// S430 / ADR-0083 — CAD-blob key + read-audit debounce. The write
+    /// path encrypts downloaded CADs with `cad_blob.key`; the extract
+    /// read path decrypts + emits `CadBlobRead` (debounced).
+    cad_blob: CadBlobCtx,
 }
 
 impl std::fmt::Debug for PricingPipelineService {
@@ -155,7 +160,11 @@ impl std::fmt::Debug for PricingPipelineService {
 }
 
 impl PricingPipelineService {
-    pub fn new(config: PricingPipelineConfig, deps: PricingPipelineDeps) -> Result<Self> {
+    pub fn new(
+        config: PricingPipelineConfig,
+        deps: PricingPipelineDeps,
+        cad_blob: CadBlobCtx,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -164,6 +173,7 @@ impl PricingPipelineService {
             config,
             deps,
             client,
+            cad_blob,
         })
     }
 
@@ -329,7 +339,14 @@ impl PricingPipelineService {
             return Err(anyhow!("CAD download {file_url} returned HTTP {s}"));
         }
         let body = resp.bytes().await.context("read CAD body")?;
-        std::fs::write(&dest_path, &body)
+        // S430 / ADR-0083 — encrypt at rest. New downloads never land in
+        // the clear; the on-disk file is `MAGIC || nonce || ciphertext`.
+        let encrypted = self
+            .cad_blob
+            .key
+            .encrypt(&body)
+            .context("encrypt downloaded CAD blob")?;
+        std::fs::write(&dest_path, &encrypted)
             .with_context(|| format!("write {}", dest_path.display()))?;
 
         let material_grade = quote.request.material_preference.clone();
@@ -612,6 +629,10 @@ impl PricingPipelineService {
         let python_bin = self.config.python_bin.clone();
         let quote_id = row.quote_id.clone();
         let material_grade = row.material_grade.clone();
+        let attempt_n = row.attempt_n;
+        // S430 — clone the CAD-blob ctx (key + debounce) into the blocking
+        // task so the read can decrypt + emit the read-audit.
+        let cad_blob = self.cad_blob.clone();
 
         let outcome = spawn_blocking(move || -> Result<StepOutcome> {
             let mut conn = duckdb::Connection::open(&db_path).context("open DB for extract")?;
@@ -638,9 +659,63 @@ impl PricingPipelineService {
                 jobs::TransitionOutcome::AlreadyInState | jobs::TransitionOutcome::Applied => {}
             }
             let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
+            // S430 / ADR-0083 — the on-disk CAD is encrypted at rest, but
+            // the Python extractor reads a file PATH (not bytes), so we
+            // decrypt to a short-lived sibling temp file deleted on drop.
+            let on_disk = std::fs::read(&arts.cad_local_path)
+                .with_context(|| format!("read CAD blob {}", arts.cad_local_path))?;
+            let opened = match cad_blob.key.open(&on_disk) {
+                Ok(o) => o,
+                Err(e) => {
+                    // Tampered blob / wrong key: a customer-visible failure,
+                    // not a daemon crash. Mark the job Failed (the SPA shows
+                    // a red error chip with the reason) and move on.
+                    emit_failure(
+                        &mut conn,
+                        &tenant_id_string,
+                        binary_hash,
+                        &login,
+                        &quote_id,
+                        "decrypt",
+                        &format!("CAD blob decryption failed: {e}"),
+                        attempt_n,
+                    )?;
+                    return Ok(StepOutcome::Failed);
+                }
+            };
+            // The daemon reads on behalf of the quote engine to (re-)price.
+            let requester = login.clone();
+            if opened.was_legacy_plaintext {
+                crate::cad_blob::emit_legacy_plaintext_read(
+                    &mut conn,
+                    &tenant_id_string,
+                    binary_hash,
+                    &login,
+                    &quote_id,
+                    &requester,
+                )?;
+            }
+            if cad_blob
+                .debounce
+                .should_emit(&requester, &quote_id, Instant::now())
+            {
+                crate::cad_blob::emit_blob_read(
+                    &mut conn,
+                    &tenant_id_string,
+                    binary_hash,
+                    &login,
+                    &quote_id,
+                    &requester,
+                    ReadPurpose::Reprice,
+                )?;
+            }
+            let temp = DecryptedTempFile::write_beside(
+                Path::new(&arts.cad_local_path),
+                &opened.plaintext,
+            )?;
             let extractor = CadExtractor::new().with_python_bin(python_bin);
             let req = ExtractRequest {
-                input_path: PathBuf::from(&arts.cad_local_path),
+                input_path: temp.path().to_path_buf(),
                 material_grade: material_grade.clone(),
             };
             match extractor.extract(&req) {
@@ -4484,6 +4559,7 @@ mod tests {
                 operator_login: "ervin".to_string(),
             },
             client,
+            cad_blob: CadBlobCtx::with_test_key(),
         }
     }
 
@@ -4966,6 +5042,7 @@ mod tests {
                 operator_login: "ervin".to_string(),
             },
             client,
+            cad_blob: CadBlobCtx::with_test_key(),
         }
     }
 
@@ -5091,6 +5168,7 @@ mod tests {
                 operator_login: "ervin".to_string(),
             },
             client,
+            cad_blob: CadBlobCtx::with_test_key(),
         }
     }
 
@@ -5187,6 +5265,240 @@ mod tests {
             "cycle 2 must not append another audit pair (only cycle 1's failed+classified)"
         );
 
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── S430 / ADR-0083 — CAD-blob encryption-at-rest + read-audit ──
+    //
+    // These drive the REAL pipeline write (`enqueue_one`) + read
+    // (`advance_one_step` → `advance_extract`) paths. They are
+    // python-free: decryption is byte-agnostic (we decrypt our own
+    // ciphertext), and a garbage "CAD" fails at the `extract` stage —
+    // never the `decrypt` stage — so the assertions hold whether or not
+    // a venv python is present.
+
+    /// Loop mock that serves the CAD file download (200 + the supplied
+    /// bytes for any `/files/` GET) and 200 for the status writeback POST.
+    async fn s430_spawn_cad_mock(cad_bytes: Vec<u8>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let cad = cad_bytes.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let resp: Vec<u8> = if req.contains("/files/") {
+                        let mut r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                             Content-Length: {}\r\n\r\n",
+                            cad.len()
+                        )
+                        .into_bytes();
+                        r.extend_from_slice(&cad);
+                        r
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 2\r\n\r\n{}"
+                            .to_vec()
+                    };
+                    let _ = sock.write_all(&resp).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn s430_service(
+        addr: &std::net::SocketAddr,
+        db_path: std::path::PathBuf,
+        artifact_dir: std::path::PathBuf,
+    ) -> PricingPipelineService {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(800))
+            .build()
+            .expect("client");
+        PricingPipelineService {
+            config: PricingPipelineConfig {
+                base_url: format!("http://{addr}"),
+                bearer_token: Zeroizing::new("t0k3n".to_string()),
+                poll_interval: Duration::from_secs(60),
+                artifact_dir,
+                python_bin: PathBuf::from("/usr/bin/python3"),
+                default_tolerance: ToleranceRange::Standard,
+            },
+            deps: PricingPipelineDeps {
+                db_path,
+                tenant: TenantId::new("T").expect("tid"),
+                binary_hash: BinaryHash::from_bytes([0u8; 32]),
+                operator_login: "ervin".to_string(),
+            },
+            client,
+            cad_blob: CadBlobCtx::with_test_key(),
+        }
+    }
+
+    fn s430_quote(qid: &str, filename: &str) -> StorefrontQuote {
+        StorefrontQuote {
+            id: qid.to_string(),
+            contact: StorefrontContact {
+                name: "Buyer".to_string(),
+                email: "buyer@example.com".to_string(),
+                company: "ACME".to_string(),
+            },
+            request: StorefrontRequest {
+                material_preference: "AL_6061_T6".to_string(),
+                quantity: Some(3),
+            },
+            files: vec![StorefrontFile {
+                filename: filename.to_string(),
+            }],
+        }
+    }
+
+    fn s430_temp(prefix: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("aberp-s430-{prefix}-{}", Ulid::new()));
+        p
+    }
+
+    fn s430_read_state(db: &std::path::Path, qid: &str) -> (String, Option<String>) {
+        let conn = duckdb::Connection::open(db).expect("reopen db");
+        conn.query_row(
+            "SELECT state, error_stage FROM quote_pricing_jobs WHERE quote_id = ?",
+            [qid],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .expect("job row")
+    }
+
+    fn s430_count_kind(db: &std::path::Path, kind: &str) -> usize {
+        let conn = duckdb::Connection::open(db).expect("reopen db");
+        aberp_audit_ledger::recent_entries(&conn, 200)
+            .expect("recent")
+            .iter()
+            .filter(|e| e.kind.as_str() == kind)
+            .count()
+    }
+
+    /// Brief §2 — a NEW write lands ENCRYPTED at rest: the on-disk blob
+    /// carries the magic header and decrypts back to the exact bytes the
+    /// storefront served (length + content preserved).
+    #[tokio::test]
+    async fn s430_enqueue_writes_encrypted_blob_at_rest() {
+        let plaintext = b"solid part\n  the customer's proprietary geometry\nendsolid".to_vec();
+        let addr = s430_spawn_cad_mock(plaintext.clone()).await;
+        let db = s430_temp("enc.duckdb");
+        let artifacts = s430_temp("art");
+        let qid = "00000000-0000-0000-0000-0000000000aa";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+
+        let inserted = svc.enqueue_one(s430_quote(qid, "part.stl")).await.unwrap();
+        assert!(inserted, "first enqueue inserts a Fetched row");
+
+        let on_disk = std::fs::read(artifacts.join(qid).join("part.stl")).expect("blob on disk");
+        // Encrypted at rest: magic header present, NOT the plaintext.
+        assert_eq!(
+            &on_disk[..crate::cad_blob::MAGIC.len()],
+            crate::cad_blob::MAGIC,
+            "on-disk CAD must start with the encryption magic header"
+        );
+        assert_ne!(
+            on_disk, plaintext,
+            "on-disk bytes must not be the plaintext"
+        );
+        // Decrypts back to the original (the [7u8;32] test key).
+        let key = crate::cad_blob::CadBlobKey::from_bytes([7u8; 32]);
+        let opened = key.open(&on_disk).expect("decrypt");
+        assert!(!opened.was_legacy_plaintext);
+        assert_eq!(opened.plaintext, plaintext, "decrypted bytes round-trip");
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Brief §5 — tamper-and-detect: corrupting the stored ciphertext
+    /// drives the extract step to FAIL with `error_stage = "decrypt"`,
+    /// which the operator SPA renders as a red error chip (the panel
+    /// already renders Failed rows' stage + reason — no new SPA surface).
+    #[tokio::test]
+    async fn s430_tampered_blob_fails_extract_with_decrypt_stage() {
+        let addr = s430_spawn_cad_mock(b"solid x endsolid".to_vec()).await;
+        let db = s430_temp("tamper.duckdb");
+        let artifacts = s430_temp("art");
+        let qid = "00000000-0000-0000-0000-0000000000bb";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        svc.enqueue_one(s430_quote(qid, "part.stl")).await.unwrap();
+
+        // Flip a byte in the stored ciphertext body (past magic + nonce).
+        let blob_path = artifacts.join(qid).join("part.stl");
+        let mut bytes = std::fs::read(&blob_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&blob_path, &bytes).unwrap();
+
+        let row = svc
+            .next_actionable_blocking()
+            .await
+            .unwrap()
+            .expect("a Fetched row is actionable");
+        let outcome = svc.advance_one_step(row).await.unwrap();
+        assert!(
+            matches!(outcome, StepOutcome::Failed),
+            "tampered blob must Fail the step, got {outcome:?}"
+        );
+        let (state, stage) = s430_read_state(&db, qid);
+        assert_eq!(state, "failed");
+        assert_eq!(
+            stage.as_deref(),
+            Some("decrypt"),
+            "tamper must be attributed to the decrypt stage"
+        );
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Brief §3/§5 (customer-journey) — a VALID encrypted blob decrypts
+    /// successfully (the read gets PAST the decrypt stage) and the read
+    /// is audited exactly once with `cad.blob_read`. We assert the read
+    /// is NOT attributed to `decrypt` (decryption worked); whether the
+    /// downstream extract then succeeds or fails is python-dependent and
+    /// out of scope here.
+    #[tokio::test]
+    async fn s430_valid_encrypted_blob_decrypts_and_read_is_audited() {
+        let addr = s430_spawn_cad_mock(b"solid x\nendsolid".to_vec()).await;
+        let db = s430_temp("read.duckdb");
+        let artifacts = s430_temp("art");
+        let qid = "00000000-0000-0000-0000-0000000000cc";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        svc.enqueue_one(s430_quote(qid, "part.stl")).await.unwrap();
+
+        let row = svc.next_actionable_blocking().await.unwrap().unwrap();
+        let _ = svc.advance_one_step(row).await.unwrap();
+
+        // The read fired exactly once (debounce is single-read here).
+        assert_eq!(
+            s430_count_kind(&db, "cad.blob_read"),
+            1,
+            "exactly one CadBlobRead per fetch"
+        );
+        // Decrypt succeeded → the failure (if any, no python) is NOT decrypt.
+        let (_state, stage) = s430_read_state(&db, qid);
+        assert_ne!(
+            stage.as_deref(),
+            Some("decrypt"),
+            "a valid encrypted blob must decrypt cleanly"
+        );
+
+        let _ = std::fs::remove_dir_all(&artifacts);
         let _ = std::fs::remove_file(&db);
     }
 }

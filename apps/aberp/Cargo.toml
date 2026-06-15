@@ -96,6 +96,10 @@ aberp-quote-pdf = { path = "../../crates/aberp-quote-pdf" }
 # extracted FeatureGraph; same hash ⇒ same priced PDF ⇒ storefront 200
 # idempotent replay.
 blake3 = { workspace = true }
+# S430 / ADR-0083 — AES-256-GCM AEAD for the CAD-blob-at-rest cipher
+# (`crate::cad_blob`). New writes land encrypted; reads decrypt-to-temp
+# before the Python extractor (which reads a file path) runs.
+aes-gcm = { workspace = true }
 # S229 / PR-225 — Stage 3 manufacturing-execution adapter framework
 # (ADR-0060 Phase β). The binary owns the boot-time `AdapterRegistry`
 # + per-adapter ledger-writer spawn. The first real adapter shipped

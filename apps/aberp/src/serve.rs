@@ -1701,10 +1701,52 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                     binary_hash,
                                     operator_login: pipeline_operator_login.clone(),
                                 };
-                            match crate::quote_pricing_pipeline::PricingPipelineService::new(
-                                pipeline_cfg,
-                                pipeline_deps,
-                            ) {
+                            // S430 / ADR-0083 — load (or mint on first
+                            // boot) the tenant's AES-256-GCM CAD-blob key
+                            // from the OS keychain. A freshly-minted key
+                            // emits CadBlobKeyProvisioned. Keychain read +
+                            // the one-shot audit write go through
+                            // spawn_blocking. A provisioning error folds
+                            // into the same graceful Err arm as a
+                            // service-construction error (AMBER, boot
+                            // survives) — we never fall back to writing
+                            // CAD blobs in the clear.
+                            let cad_blob_ctx_result = {
+                                let cad_tenant = st.tenant.as_str().to_string();
+                                let cad_db_path = (*st.db_path).clone();
+                                let cad_login = pipeline_operator_login.clone();
+                                tokio::task::spawn_blocking(
+                                    move || -> Result<crate::cad_blob::CadBlobCtx> {
+                                        let (key, prov) =
+                                            crate::cad_blob::load_or_provision_key(&cad_tenant)?;
+                                        if prov == crate::cad_blob::KeyProvision::Minted {
+                                            let mut conn =
+                                                duckdb::Connection::open(&cad_db_path).context(
+                                                    "open DB for cad-blob-key provision audit",
+                                                )?;
+                                            aberp_audit_ledger::ensure_schema(&conn)
+                                                .context("ensure audit schema for cad-blob key")?;
+                                            crate::cad_blob::emit_key_provisioned(
+                                                &mut conn,
+                                                &cad_tenant,
+                                                binary_hash,
+                                                &cad_login,
+                                            )?;
+                                        }
+                                        Ok(crate::cad_blob::CadBlobCtx::new(key))
+                                    },
+                                )
+                                .await
+                                .context("cad-blob-key provision join")
+                                .and_then(|r| r)
+                            };
+                            match cad_blob_ctx_result.and_then(|cad_blob_ctx| {
+                                crate::quote_pricing_pipeline::PricingPipelineService::new(
+                                    pipeline_cfg,
+                                    pipeline_deps,
+                                    cad_blob_ctx,
+                                )
+                            }) {
                                 Ok(service) => {
                                     // S288 / PR-269 — boot-time migration:
                                     // detect + drop the orphan
