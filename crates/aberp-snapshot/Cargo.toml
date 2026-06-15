@@ -1,0 +1,36 @@
+[package]
+name = "aberp-snapshot"
+description = "Periodic, validated, logical DuckDB snapshot + retention + restore (ADR-0081)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Library crate: typed errors via `thiserror` per ADR-0021 Part A (no
+# `anyhow` in libs). The snapshot mechanism is inherently DuckDB-specific
+# (EXPORT/IMPORT DATABASE) so `duckdb` is a direct dep; `aberp-audit-ledger`
+# is used read-only to re-verify the hash chain inside a snapshot during
+# validation (ADR-0008 / ADR-0081 §Validation).
+[dependencies]
+aberp-audit-ledger = { path = "../audit-ledger" }
+duckdb = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+
+# Integration tests open real DuckDB files, seed an audit chain (needs
+# `Actor::test_only` from the `test-support` feature), and read rows back.
+[dev-dependencies]
+aberp-audit-ledger = { path = "../audit-ledger", features = ["test-support"] }
+duckdb = { workspace = true }
+time = { workspace = true }
+
+[lints]
+workspace = true

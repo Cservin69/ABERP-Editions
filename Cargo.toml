@@ -65,6 +65,7 @@
 resolver = "2"
 members = [
     "crates/audit-ledger",
+    "crates/aberp-snapshot",
     "crates/aberp-digital-id",
     "crates/aberp-compliance",
     "crates/aberp-verify",
