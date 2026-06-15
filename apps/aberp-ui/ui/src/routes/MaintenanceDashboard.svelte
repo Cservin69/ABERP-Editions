@@ -37,6 +37,7 @@
     listInventoryBalances,
     listLowStockProducts,
     listMachines,
+    listMarginProfiles,
     listPartners,
     listQuotingMaterials,
     listProducts,
@@ -189,6 +190,12 @@
         const rows = await listMachines();
         const n = rows.length;
         return n === 1 ? "1 machine" : `${n} machines`;
+      }
+      case "MarginProfileCount": {
+        // S428 — count of active (non-archived) margin profiles.
+        const rows = await listMarginProfiles();
+        const n = rows.length;
+        return n === 1 ? "1 profile" : `${n} profiles`;
       }
       case "BankAccountCount": {
         // Two independent reads — the seller-info legal_name + the

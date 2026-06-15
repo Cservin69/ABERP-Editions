@@ -3003,6 +3003,18 @@ fn build_router(state: AppState) -> Router {
                 .put(handle_update_machine)
                 .delete(handle_archive_machine),
         )
+        // S428 — customer-type margin profiles CRUD. Ready-only +
+        // bearer-gated; emits quote.margin_profile_*.
+        .route(
+            "/api/margin-profiles",
+            get(handle_list_margin_profiles).post(handle_create_margin_profile),
+        )
+        .route(
+            "/api/margin-profiles/:id",
+            get(handle_get_margin_profile)
+                .put(handle_update_margin_profile)
+                .delete(handle_archive_margin_profile),
+        )
         // S257 / PR-246 — Settings → Adapters CRUD. List + create on the
         // collection; update (hot restart) + delete on the resource.
         // Ready-only + bearer-gated; the `:id` is the server-minted
@@ -3417,6 +3429,19 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/quote-pricing-jobs/:quote_id/lead-time-override",
             post(handle_override_quote_lead_time),
+        )
+        // S428 — assign/clear the buyer partner (drives the margin profile)
+        // and re-price; emits quote.using_global_margin / margin_below_floor.
+        .route(
+            "/api/quote-pricing-jobs/:quote_id/buyer-partner",
+            post(handle_set_quote_buyer_partner),
+        )
+        // S428 — operator margin override (markup %) + re-price. A
+        // below-floor override needs `confirm_below_floor: true`; emits
+        // quote.margin_overridden (+ margin_floor_overridden on confirm).
+        .route(
+            "/api/quote-pricing-jobs/:quote_id/margin-override",
+            post(handle_override_quote_margin),
         )
         // S416 — the operator accept-on-behalf route (S354 / PR-42 / U16)
         // was REMOVED: it was redundant (the customer accepts via the
@@ -8917,16 +8942,24 @@ async fn handle_update_partner(
     AxumPath(id): AxumPath<String>,
     Json(inputs): Json<PartnerInputs>,
 ) -> Response {
-    if let Err(resp) = require_ready(&state) {
-        return resp;
-    }
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
+    // S428 — a customer_type change fires an audit row, so the binary
+    // hash must be resolvable (mirrors the machine-CRUD posture).
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
     let state_for_task = state.clone();
-    let result =
-        tokio::task::spawn_blocking(move || update_partner_request(&state_for_task, &id, &inputs))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        update_partner_request(&state_for_task, &id, &inputs, &operator_login, binary_hash)
+    })
+    .await;
     let outcome = match result {
         Ok(r) => r,
         Err(join_err) => {
@@ -8948,16 +8981,48 @@ pub fn update_partner_request(
     state: &AppState,
     id: &str,
     inputs: &PartnerInputs,
+    operator_login: &str,
+    binary_hash: BinaryHash,
 ) -> std::result::Result<Partner, PartnerRouteError> {
     if let Err(errors) = partners::validate_partner_inputs(inputs) {
         return Err(PartnerRouteError::Validation(errors));
     }
-    let conn = Connection::open(&*state.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
-    match partners::update_partner(&conn, state.tenant.as_str(), id, inputs)? {
-        Some(p) => Ok(p),
-        None => Err(PartnerRouteError::NotFound),
+    // S428 — capture the old customer_type before the write so we can
+    // detect a change and fire `PartnerCustomerTypeChanged`. The write
+    // connection is scoped/dropped before the audit append opens its own
+    // ledger connection (the S427 single-writer-lock posture).
+    let (partner, old_customer_type) = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let old_customer_type =
+            partners::get_partner(&conn, state.tenant.as_str(), id)?.map(|p| p.customer_type);
+        let updated = match partners::update_partner(&conn, state.tenant.as_str(), id, inputs)? {
+            Some(p) => p,
+            None => return Err(PartnerRouteError::NotFound),
+        };
+        (updated, old_customer_type)
+    };
+
+    if old_customer_type != Some(partner.customer_type) {
+        let payload = crate::audit_payloads::PartnerCustomerTypeChangedPayload {
+            partner_id: partner.id.clone(),
+            old_customer_type: old_customer_type
+                .map(|t| t.as_db_str().to_string())
+                .unwrap_or_else(|| "unset".to_string()),
+            new_customer_type: partner.customer_type.as_db_str().to_string(),
+        };
+        let tenant = TenantId::new(state.tenant.as_str())
+            .with_context(|| format!("tenant id {}", state.tenant.as_str()))?;
+        crate::quoting_machines::append_machine_event(
+            &state.db_path,
+            tenant,
+            binary_hash,
+            operator_login,
+            EventKind::PartnerCustomerTypeChanged,
+            payload.to_bytes(),
+        )?;
     }
+    Ok(partner)
 }
 
 // ── DELETE /api/partners/:id ─────────────────────────────────────────
@@ -9336,6 +9401,335 @@ pub fn archive_machine_request(
     Ok(())
 }
 
+// ── S428 — margin-profile routes ───────────────────────────────────────
+
+/// Route-level error for the margin-profile endpoints.
+#[derive(Debug)]
+pub enum MarginProfileRouteError {
+    Validation(Vec<crate::margin_profiles::ValidationError>),
+    NotFound,
+    /// An active profile already exists for that customer type (409).
+    DuplicateActiveType,
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for MarginProfileRouteError {
+    fn from(e: anyhow::Error) -> Self {
+        MarginProfileRouteError::Other(e)
+    }
+}
+
+#[derive(Serialize)]
+struct MarginProfileValidationBody {
+    error: &'static str,
+    fields: Vec<crate::margin_profiles::ValidationError>,
+}
+
+fn margin_profile_validation_response(
+    errors: Vec<crate::margin_profiles::ValidationError>,
+) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(MarginProfileValidationBody {
+            error: "validation_failed",
+            fields: errors,
+        }),
+    )
+        .into_response()
+}
+
+fn margin_profile_duplicate_response() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(error_body(
+            "an active margin profile already exists for that customer type".to_string(),
+        )),
+    )
+        .into_response()
+}
+
+fn margin_profile_not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(error_body("margin profile not found".to_string())),
+    )
+        .into_response()
+}
+
+fn margin_profile_error_response(e: MarginProfileRouteError) -> Response {
+    match e {
+        MarginProfileRouteError::Validation(errs) => margin_profile_validation_response(errs),
+        MarginProfileRouteError::DuplicateActiveType => margin_profile_duplicate_response(),
+        MarginProfileRouteError::NotFound => margin_profile_not_found_response(),
+        MarginProfileRouteError::Other(e) => internal_error("margin_profile_request", e),
+    }
+}
+
+// GET /api/margin-profiles
+async fn handle_list_margin_profiles(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || list_margin_profiles_request(&state_for_task)).await;
+    match result {
+        Ok(Ok(profiles)) => Json(profiles).into_response(),
+        Ok(Err(e)) => margin_profile_error_response(e),
+        Err(join_err) => internal_error(
+            "list_margin_profiles_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn list_margin_profiles_request(
+    state: &AppState,
+) -> std::result::Result<Vec<crate::margin_profiles::MarginProfile>, MarginProfileRouteError> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    Ok(crate::margin_profiles::list_profiles(
+        &conn,
+        state.tenant.as_str(),
+    )?)
+}
+
+// GET /api/margin-profiles/:id
+async fn handle_get_margin_profile(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let conn = match Connection::open(&*state.db_path) {
+        Ok(c) => c,
+        Err(e) => return internal_error("get_margin_profile:open", e.into()),
+    };
+    match crate::margin_profiles::get_profile(&conn, state.tenant.as_str(), &id) {
+        Ok(Some(p)) => Json(p).into_response(),
+        Ok(None) => margin_profile_not_found_response(),
+        Err(e) => internal_error("get_margin_profile", e),
+    }
+}
+
+// POST /api/margin-profiles
+async fn handle_create_margin_profile(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<crate::margin_profiles::MarginProfileInputs>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        create_margin_profile_request(&state_for_task, &inputs, &operator_login, binary_hash)
+    })
+    .await;
+    match result {
+        Ok(Ok(p)) => (StatusCode::CREATED, Json(p)).into_response(),
+        Ok(Err(e)) => margin_profile_error_response(e),
+        Err(join_err) => internal_error(
+            "create_margin_profile_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn create_margin_profile_request(
+    state: &AppState,
+    inputs: &crate::margin_profiles::MarginProfileInputs,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<crate::margin_profiles::MarginProfile, MarginProfileRouteError> {
+    if let Err(errors) = crate::margin_profiles::validate_profile_inputs(inputs) {
+        return Err(MarginProfileRouteError::Validation(errors));
+    }
+    // Scope the write connection so it is dropped before the audit append
+    // opens its own ledger connection (S427 single-writer-lock posture).
+    let profile = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        match crate::margin_profiles::create_profile(&conn, state.tenant.as_str(), inputs)? {
+            crate::margin_profiles::CreateOutcome::Created(p) => p,
+            crate::margin_profiles::CreateOutcome::DuplicateActiveType => {
+                return Err(MarginProfileRouteError::DuplicateActiveType)
+            }
+        }
+    };
+    let payload = crate::audit_payloads::MarginProfileCreatedPayload {
+        profile_id: profile.id.clone(),
+        name: profile.name.clone(),
+        customer_type: profile.customer_type.clone(),
+        gross_margin_pct: profile.gross_margin_pct,
+        min_margin_pct: profile.min_margin_pct,
+    };
+    crate::quoting_machines::append_machine_event(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        EventKind::MarginProfileCreated,
+        payload.to_bytes(),
+    )?;
+    Ok(profile)
+}
+
+// PUT /api/margin-profiles/:id
+async fn handle_update_margin_profile(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<crate::margin_profiles::MarginProfileInputs>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        update_margin_profile_request(&state_for_task, &id, &inputs, &operator_login, binary_hash)
+    })
+    .await;
+    match result {
+        Ok(Ok(p)) => Json(p).into_response(),
+        Ok(Err(e)) => margin_profile_error_response(e),
+        Err(join_err) => internal_error(
+            "update_margin_profile_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn update_margin_profile_request(
+    state: &AppState,
+    id: &str,
+    inputs: &crate::margin_profiles::MarginProfileInputs,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<crate::margin_profiles::MarginProfile, MarginProfileRouteError> {
+    if let Err(errors) = crate::margin_profiles::validate_profile_inputs(inputs) {
+        return Err(MarginProfileRouteError::Validation(errors));
+    }
+    let profile = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        match crate::margin_profiles::update_profile(&conn, state.tenant.as_str(), id, inputs)? {
+            crate::margin_profiles::UpdateOutcome::Updated(p) => p,
+            crate::margin_profiles::UpdateOutcome::NotFound => {
+                return Err(MarginProfileRouteError::NotFound)
+            }
+            crate::margin_profiles::UpdateOutcome::DuplicateActiveType => {
+                return Err(MarginProfileRouteError::DuplicateActiveType)
+            }
+        }
+    };
+    let payload = crate::audit_payloads::MarginProfileEditedPayload {
+        profile_id: profile.id.clone(),
+        name: profile.name.clone(),
+        customer_type: profile.customer_type.clone(),
+        gross_margin_pct: profile.gross_margin_pct,
+        min_margin_pct: profile.min_margin_pct,
+        enabled: profile.enabled,
+    };
+    crate::quoting_machines::append_machine_event(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        EventKind::MarginProfileEdited,
+        payload.to_bytes(),
+    )?;
+    Ok(profile)
+}
+
+// DELETE /api/margin-profiles/:id — archive (soft).
+async fn handle_archive_margin_profile(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        archive_margin_profile_request(&state_for_task, &id, &operator_login, binary_hash)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => margin_profile_error_response(e),
+        Err(join_err) => internal_error(
+            "archive_margin_profile_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn archive_margin_profile_request(
+    state: &AppState,
+    id: &str,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<(), MarginProfileRouteError> {
+    let archived_at = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        match crate::margin_profiles::archive_profile(&conn, state.tenant.as_str(), id)? {
+            Some(ts) => ts,
+            None => return Err(MarginProfileRouteError::NotFound),
+        }
+    };
+    let payload = crate::audit_payloads::MarginProfileArchivedPayload {
+        profile_id: id.to_string(),
+        archived_at,
+    };
+    crate::quoting_machines::append_machine_event(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        EventKind::MarginProfileArchived,
+        payload.to_bytes(),
+    )?;
+    Ok(())
+}
+
 /// Body for `POST /api/quote-pricing-jobs/:quote_id/lead-time-override`.
 #[derive(Debug, Deserialize)]
 pub struct LeadTimeOverrideBody {
@@ -9425,6 +9819,337 @@ pub fn override_lead_time_request(
         EventKind::QuoteLeadTimeOverridden,
         payload.to_bytes(),
     )?;
+    Ok(())
+}
+
+// ── S428 — per-quote margin controls (buyer-partner assign + override) ──
+
+/// Body for `POST /api/quote-pricing-jobs/:quote_id/buyer-partner`.
+#[derive(Debug, Deserialize)]
+pub struct BuyerPartnerBody {
+    /// `null` clears the assignment (reverts to global margin).
+    #[serde(default)]
+    pub partner_id: Option<String>,
+}
+
+/// Body for `POST /api/quote-pricing-jobs/:quote_id/margin-override`.
+#[derive(Debug, Deserialize)]
+pub struct MarginOverrideBody {
+    /// `null` clears the override (reverts to profile/global default).
+    #[serde(default)]
+    pub margin_pct: Option<f64>,
+    /// Set `true` to proceed when the override falls below the floor.
+    #[serde(default)]
+    pub confirm_below_floor: bool,
+    /// The operator's justification, required when confirming below-floor.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Route error for the per-quote margin endpoints.
+#[derive(Debug)]
+pub enum QuoteMarginError {
+    NotFound,
+    Invalid(String),
+    /// The override is below the floor and was not confirmed (409).
+    BelowFloorNeedsConfirm {
+        realized_pct: f64,
+        floor_pct: f64,
+    },
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for QuoteMarginError {
+    fn from(e: anyhow::Error) -> Self {
+        QuoteMarginError::Other(e)
+    }
+}
+
+fn quote_margin_error_response(e: QuoteMarginError) -> Response {
+    match e {
+        QuoteMarginError::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(error_body("quote pricing job not found".to_string())),
+        )
+            .into_response(),
+        QuoteMarginError::Invalid(msg) => {
+            (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response()
+        }
+        QuoteMarginError::BelowFloorNeedsConfirm {
+            realized_pct,
+            floor_pct,
+        } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "below_margin_floor",
+                "realized_pct": realized_pct,
+                "floor_pct": floor_pct,
+            })),
+        )
+            .into_response(),
+        QuoteMarginError::Other(e) => internal_error("quote_margin_request", e),
+    }
+}
+
+async fn handle_set_quote_buyer_partner(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(quote_id): AxumPath<String>,
+    Json(body): Json<BuyerPartnerBody>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        set_quote_buyer_partner_request(
+            &state_for_task,
+            &quote_id,
+            body,
+            &operator_login,
+            binary_hash,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(Err(e)) => quote_margin_error_response(e),
+        Err(join_err) => internal_error(
+            "set_quote_buyer_partner:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn set_quote_buyer_partner_request(
+    state: &AppState,
+    quote_id: &str,
+    body: BuyerPartnerBody,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<(), QuoteMarginError> {
+    let tenant = state.tenant.as_str();
+    // Scope the write connection (S427 single-writer-lock posture).
+    let reprice = {
+        let conn = Connection::open(&*state.db_path)
+            .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+        let stored_override =
+            match crate::quote_pricing_jobs::get_job_detail(&conn, quote_id, tenant)? {
+                Some(d) => d.margin_override_pct,
+                None => return Err(QuoteMarginError::NotFound),
+            };
+        let applied = crate::quote_pricing_jobs::set_buyer_partner(
+            &conn,
+            quote_id,
+            tenant,
+            body.partner_id.as_deref(),
+            time::OffsetDateTime::now_utc(),
+        )?;
+        if !applied {
+            return Err(QuoteMarginError::NotFound);
+        }
+        // Re-price with the new buyer (reads buyer_partner_id from the row).
+        let outcome =
+            crate::quote_pricing_pipeline::reprice_quote(&conn, tenant, quote_id, stored_override)?;
+        if let Some(ref o) = outcome {
+            crate::quote_pricing_jobs::set_margin_result(
+                &conn,
+                quote_id,
+                tenant,
+                &o.breakdown_json,
+                o.total_price,
+                o.below_floor,
+                o.floor_pct,
+                time::OffsetDateTime::now_utc(),
+            )?;
+        }
+        outcome
+    };
+    emit_reprice_provenance(
+        state,
+        quote_id,
+        operator_login,
+        binary_hash,
+        reprice.as_ref(),
+    )?;
+    Ok(())
+}
+
+async fn handle_override_quote_margin(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(quote_id): AxumPath<String>,
+    Json(body): Json<MarginOverrideBody>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        override_quote_margin_request(
+            &state_for_task,
+            &quote_id,
+            body,
+            &operator_login,
+            binary_hash,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(Err(e)) => quote_margin_error_response(e),
+        Err(join_err) => internal_error(
+            "override_quote_margin:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+pub fn override_quote_margin_request(
+    state: &AppState,
+    quote_id: &str,
+    body: MarginOverrideBody,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<(), QuoteMarginError> {
+    let tenant = state.tenant.as_str();
+    if let Some(pct) = body.margin_pct {
+        if !(pct.is_finite() && (0.0..=10.0).contains(&pct)) {
+            return Err(QuoteMarginError::Invalid(
+                "margin_pct must be a finite fraction in [0, 10]".to_string(),
+            ));
+        }
+    }
+    // Re-price with the candidate override FIRST (no persistence yet) so a
+    // below-floor override can be refused before it takes effect.
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let Some(outcome) =
+        crate::quote_pricing_pipeline::reprice_quote(&conn, tenant, quote_id, body.margin_pct)?
+    else {
+        return Err(QuoteMarginError::NotFound);
+    };
+    // An operator-CHOSEN override that breaches the floor needs explicit
+    // confirmation ([[trust-code-not-operator]]: the DEAL block still
+    // applies regardless — this gate only governs saving the low margin).
+    if body.margin_pct.is_some() && outcome.below_floor && !body.confirm_below_floor {
+        return Err(QuoteMarginError::BelowFloorNeedsConfirm {
+            realized_pct: outcome.realized_margin_pct,
+            floor_pct: outcome.floor_pct.unwrap_or(0.0),
+        });
+    }
+    let now = time::OffsetDateTime::now_utc();
+    let applied = crate::quote_pricing_jobs::set_margin_override(
+        &conn,
+        quote_id,
+        tenant,
+        body.margin_pct,
+        now,
+    )?;
+    if !applied {
+        return Err(QuoteMarginError::NotFound);
+    }
+    crate::quote_pricing_jobs::set_margin_result(
+        &conn,
+        quote_id,
+        tenant,
+        &outcome.breakdown_json,
+        outcome.total_price,
+        outcome.below_floor,
+        outcome.floor_pct,
+        now,
+    )?;
+    drop(conn);
+
+    // Audit: the override itself, plus the floor-breach acknowledgement.
+    let payload = crate::audit_payloads::QuoteMarginOverriddenPayload {
+        quote_id: quote_id.to_string(),
+        override_margin_pct: body.margin_pct,
+    };
+    crate::quoting_machines::append_machine_event(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        operator_login,
+        EventKind::QuoteMarginOverridden,
+        payload.to_bytes(),
+    )?;
+    if body.margin_pct.is_some() && outcome.below_floor && body.confirm_below_floor {
+        let payload = crate::audit_payloads::QuoteMarginFloorOverriddenPayload {
+            quote_id: quote_id.to_string(),
+            override_margin_pct: body.margin_pct.unwrap_or(0.0),
+            floor_pct: outcome.floor_pct.unwrap_or(0.0),
+            reason: body.reason.unwrap_or_default(),
+        };
+        crate::quoting_machines::append_machine_event(
+            &state.db_path,
+            state.tenant.clone(),
+            binary_hash,
+            operator_login,
+            EventKind::QuoteMarginFloorOverridden,
+            payload.to_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Emit the margin-provenance events (global-margin / below-floor) after a
+/// re-price triggered by a buyer-partner change. Mirrors the daemon's
+/// first-pricing emission so an operator-assigned buyer leaves the same
+/// trail. `None` outcome (un-extracted job) emits nothing.
+fn emit_reprice_provenance(
+    state: &AppState,
+    quote_id: &str,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+    outcome: Option<&crate::quote_pricing_pipeline::RepriceOutcome>,
+) -> std::result::Result<(), QuoteMarginError> {
+    let Some(o) = outcome else { return Ok(()) };
+    if matches!(o.source, crate::quote_margin::MarginSource::Global) {
+        let payload = crate::audit_payloads::QuoteUsingGlobalMarginPayload {
+            quote_id: quote_id.to_string(),
+            global_margin_base: o.applied_margin_base,
+        };
+        crate::quoting_machines::append_machine_event(
+            &state.db_path,
+            state.tenant.clone(),
+            binary_hash,
+            operator_login,
+            EventKind::QuoteUsingGlobalMargin,
+            payload.to_bytes(),
+        )?;
+    }
+    if o.below_floor {
+        let payload = crate::audit_payloads::QuoteMarginBelowFloorPayload {
+            quote_id: quote_id.to_string(),
+            realized_margin_pct: o.realized_margin_pct,
+            floor_pct: o.floor_pct.unwrap_or(0.0),
+        };
+        crate::quoting_machines::append_machine_event(
+            &state.db_path,
+            state.tenant.clone(),
+            binary_hash,
+            operator_login,
+            EventKind::QuoteMarginBelowFloor,
+            payload.to_bytes(),
+        )?;
+    }
     Ok(())
 }
 
@@ -18008,6 +18733,16 @@ struct PricingJobDetailView {
     lead_time_days: Option<u32>,
     /// S427 — operator override (calendar days); `null` = use computed.
     lead_time_override_days: Option<u32>,
+    /// S428 — buyer partner whose customer_type drives the margin profile.
+    buyer_partner_id: Option<String>,
+    /// S428 — operator margin markup override (fraction); `null` = default.
+    margin_override_pct: Option<f64>,
+    /// S428 — `true` when priced below the effective floor (red banner +
+    /// hard DEAL block).
+    margin_below_floor: bool,
+    /// S428 — the effective floor measured against (fraction); `null` on
+    /// the global path / pre-pricing.
+    margin_floor_pct: Option<f64>,
 }
 
 /// S349 / PR-40 (U1) — `GET /api/quote-pricing-jobs/:quote_id`. Bearer-
@@ -18091,6 +18826,10 @@ async fn handle_get_quote_pricing_job_detail(
         currency: "EUR",
         lead_time_days: d.lead_time_days,
         lead_time_override_days: d.lead_time_override_days,
+        buyer_partner_id: d.buyer_partner_id,
+        margin_override_pct: d.margin_override_pct,
+        margin_below_floor: d.margin_below_floor,
+        margin_floor_pct: d.margin_floor_pct,
     };
     (axum::http::StatusCode::OK, axum::Json(view)).into_response()
 }
@@ -19409,6 +20148,11 @@ async fn handle_deal_saga(
                         format!(
                             "quote validity expired on {valid_until} (today is {today}). Reissue or extend the quote and retry."
                         ),
+                    ),
+                    DealSagaError::BelowMarginFloor { .. } => (
+                        StatusCode::CONFLICT,
+                        saga.machine_code(),
+                        "this quote is priced below the minimum margin floor; DEAL is blocked. Raise the margin (or fix the profile) and re-price first.".to_string(),
                     ),
                 };
                 return (status, Json(DealSagaErrorBody { code, message: msg })).into_response();

@@ -137,6 +137,54 @@ impl PartnerKind {
     }
 }
 
+/// S428 — closed-vocab customer segment that drives the margin profile (hence
+/// the auto-quote price). `Unset` is the back-compat default: every pre-S428
+/// partner backfills to it (the migration writes 'unset' for NULL), and a
+/// quote for an `Unset` buyer uses the global default margin. The db-strings
+/// MUST match `margin_profiles.customer_type` so the engine resolution can
+/// join the two — invariant in code, not a SQL FK ([[no-sql-specific]]).
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub enum CustomerType {
+    Industrial,
+    Defense,
+    Aerospace,
+    Research,
+    PrototypeShop,
+    Oem,
+    Consumer,
+    #[default]
+    Unset,
+}
+
+impl CustomerType {
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            CustomerType::Industrial => "industrial",
+            CustomerType::Defense => "defense",
+            CustomerType::Aerospace => "aerospace",
+            CustomerType::Research => "research",
+            CustomerType::PrototypeShop => "prototype_shop",
+            CustomerType::Oem => "oem",
+            CustomerType::Consumer => "consumer",
+            CustomerType::Unset => "unset",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "industrial" => Some(CustomerType::Industrial),
+            "defense" => Some(CustomerType::Defense),
+            "aerospace" => Some(CustomerType::Aerospace),
+            "research" => Some(CustomerType::Research),
+            "prototype_shop" => Some(CustomerType::PrototypeShop),
+            "oem" => Some(CustomerType::Oem),
+            "consumer" => Some(CustomerType::Consumer),
+            "unset" => Some(CustomerType::Unset),
+            _ => None,
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Partner — domain + wire shape.
 //
@@ -164,6 +212,11 @@ pub struct Partner {
     /// with a v2 hint; if a wire body still carries `Other` the
     /// preflight loud-fails).
     pub customer_vat_status: CustomerVatStatus,
+    /// S428 — closed-vocab customer segment driving the margin profile.
+    /// Pre-S428 rows backfill to `Unset` (the migration writes 'unset'
+    /// for NULL). Changing it is the one partner mutation that fires an
+    /// audit row (`PartnerCustomerTypeChanged`).
+    pub customer_type: CustomerType,
     /// PR-97 / ADR-0048 — nullable for non-Domestic statuses.
     /// `Domestic` requires `Some(_)` matching `xxxxxxxx-y-zz`;
     /// `PrivatePerson` requires `None` (or empty-trimmed); `Other`
@@ -214,6 +267,10 @@ pub struct PartnerInputs {
     /// [`crate::issue_invoice::CustomerJson::vat_status`].
     #[serde(default)]
     pub customer_vat_status: CustomerVatStatus,
+    /// S428 — defaults to `Unset` when omitted on the wire so pre-S428
+    /// callers and existing integration tests still type-check.
+    #[serde(default)]
+    pub customer_type: CustomerType,
     /// PR-97 / ADR-0048 — nullable for non-Domestic statuses. The
     /// partner-form validator (`validate_partner_inputs`) enforces the
     /// per-status invariant (required-when-Domestic,
@@ -641,6 +698,20 @@ ALTER TABLE partners
     ADD COLUMN IF NOT EXISTS export_screened_at VARCHAR;
 ";
 
+/// S428 — additive `customer_type` column. Same DuckDB-DEFAULT-on-replay
+/// trap the PR-97 migration documents: `ADD COLUMN IF NOT EXISTS … DEFAULT V`
+/// re-applies `V` on every `ensure_schema` (which runs at the top of every
+/// writer), so the column is added unconstrained and a follow-on UPDATE
+/// backfills NULL → 'unset'. The closed-vocab invariant lives in
+/// [`CustomerType::from_db_str`] at the app layer ([[no-sql-specific]]).
+const PARTNERS_S428_CUSTOMER_TYPE_MIGRATION_SQL: &str = "
+ALTER TABLE partners
+    ADD COLUMN IF NOT EXISTS customer_type VARCHAR;
+UPDATE partners
+    SET customer_type = 'unset'
+    WHERE customer_type IS NULL;
+";
+
 /// Idempotent `CREATE TABLE IF NOT EXISTS` + PR-97 additive migration
 /// for the partners table. Callers (HTTP route handlers, tests) hit
 /// this on every entry so a fresh tenant DB picks up the schema lazily
@@ -659,6 +730,10 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     // DPAS rating / not yet screened — the "not yet on the AVL" state).
     conn.execute_batch(PARTNERS_S361_AVL_MIGRATION_SQL)
         .context("apply S361 partners AVL migration (dpas/eccn/screening)")?;
+    // S428 — additive `customer_type` column. Idempotent on a post-S428
+    // boot (ALTER is IF NOT EXISTS); fills pre-S428 rows with 'unset'.
+    conn.execute_batch(PARTNERS_S428_CUSTOMER_TYPE_MIGRATION_SQL)
+        .context("apply S428 partners customer_type migration")?;
     Ok(())
 }
 
@@ -679,6 +754,7 @@ fn inputs_to_normalized(inputs: &PartnerInputs) -> NormalizedInputs {
         legal_name: inputs.legal_name.trim().to_string(),
         kind: inputs.kind,
         customer_vat_status: inputs.customer_vat_status,
+        customer_type: inputs.customer_type,
         // PR-97 / ADR-0048 — `tax_number` is `Option<String>`. The
         // normaliser trims; for PrivatePerson the field is stored as
         // `None` even if the input arrived as an empty-trimmed string.
@@ -724,6 +800,7 @@ struct NormalizedInputs {
     legal_name: String,
     kind: PartnerKind,
     customer_vat_status: CustomerVatStatus,
+    customer_type: CustomerType,
     tax_number: Option<String>,
     eu_vat_number: Option<String>,
     address_street: Option<String>,
@@ -750,8 +827,9 @@ pub fn create_partner(conn: &Connection, tenant: &str, inputs: &PartnerInputs) -
             id, tenant_id, display_name, legal_name, kind, tax_number,
             eu_vat_number, address_street, address_postal_code, address_city,
             address_country, bank_account, contact_email, contact_phone,
-            customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL);",
+            customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at,
+            customer_type
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?);",
         params![
             &id,
             tenant,
@@ -770,6 +848,7 @@ pub fn create_partner(conn: &Connection, tenant: &str, inputs: &PartnerInputs) -
             normalized.customer_vat_status.as_db_str(),
             &now,
             &now,
+            normalized.customer_type.as_db_str(),
         ],
     )
     .context("INSERT into partners")?;
@@ -780,6 +859,7 @@ pub fn create_partner(conn: &Connection, tenant: &str, inputs: &PartnerInputs) -
         legal_name: normalized.legal_name,
         kind: normalized.kind,
         customer_vat_status: normalized.customer_vat_status,
+        customer_type: normalized.customer_type,
         tax_number: normalized.tax_number,
         eu_vat_number: normalized.eu_vat_number,
         address_street: normalized.address_street,
@@ -806,7 +886,8 @@ pub fn get_partner(conn: &Connection, tenant: &str, id: &str) -> Result<Option<P
         "SELECT id, display_name, legal_name, kind, tax_number,
                 eu_vat_number, address_street, address_postal_code, address_city,
                 address_country, bank_account, contact_email, contact_phone,
-                customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at
+                customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at,
+                customer_type
          FROM partners
          WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL;",
     )?;
@@ -833,7 +914,8 @@ pub fn find_partner_by_tax_number(
         "SELECT id, display_name, legal_name, kind, tax_number,
                 eu_vat_number, address_street, address_postal_code, address_city,
                 address_country, bank_account, contact_email, contact_phone,
-                customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at
+                customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at,
+                customer_type
          FROM partners
          WHERE tenant_id = ? AND tax_number = ? AND deleted_at IS NULL
          LIMIT 1;",
@@ -874,7 +956,8 @@ pub fn find_partner_by_name_and_address(
         "SELECT id, display_name, legal_name, kind, tax_number,
                 eu_vat_number, address_street, address_postal_code, address_city,
                 address_country, bank_account, contact_email, contact_phone,
-                customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at
+                customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at,
+                customer_type
          FROM partners
          WHERE tenant_id = ?
            AND deleted_at IS NULL
@@ -921,7 +1004,8 @@ pub fn list_partners(
                 "SELECT id, display_name, legal_name, kind, tax_number,
                         eu_vat_number, address_street, address_postal_code, address_city,
                         address_country, bank_account, contact_email, contact_phone,
-                        customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at
+                        customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at,
+                        customer_type
                  FROM partners
                  WHERE tenant_id = ?
                    AND deleted_at IS NULL
@@ -938,7 +1022,8 @@ pub fn list_partners(
                 "SELECT id, display_name, legal_name, kind, tax_number,
                         eu_vat_number, address_street, address_postal_code, address_city,
                         address_country, bank_account, contact_email, contact_phone,
-                        customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at
+                        customer_vat_status, issued_invoice_count, created_at, updated_at, deleted_at,
+                        customer_type
                  FROM partners
                  WHERE tenant_id = ? AND deleted_at IS NULL
                  ORDER BY display_name ASC;",
@@ -1004,6 +1089,7 @@ pub fn update_partner(
             contact_email       = ?,
             contact_phone       = ?,
             customer_vat_status = ?,
+            customer_type       = ?,
             updated_at          = ?
          WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL;",
         params![
@@ -1020,6 +1106,7 @@ pub fn update_partner(
             normalized.contact_email.as_deref(),
             normalized.contact_phone.as_deref(),
             normalized.customer_vat_status.as_db_str(),
+            normalized.customer_type.as_db_str(),
             &now,
             tenant,
             id,
@@ -1106,6 +1193,9 @@ fn row_to_partner(row: &duckdb::Row<'_>) -> duckdb::Result<Result<Partner>> {
     let created_at: String = row.get(15)?;
     let updated_at: String = row.get(16)?;
     let deleted_at: Option<String> = row.get(17)?;
+    // S428 — `customer_type` is ordinal-LAST (additive column). Pre-S428
+    // rows backfill to 'unset' via the migration UPDATE.
+    let customer_type_str: String = row.get(18)?;
 
     let kind = match PartnerKind::from_db_str(&kind_str) {
         Some(k) => k,
@@ -1126,6 +1216,16 @@ fn row_to_partner(row: &duckdb::Row<'_>) -> duckdb::Result<Result<Partner>> {
             )));
         }
     };
+    let customer_type = match CustomerType::from_db_str(&customer_type_str) {
+        Some(t) => t,
+        None => {
+            return Ok(Err(anyhow::anyhow!(
+                "partners.customer_type has unexpected value `{}` (expected one of \
+                 industrial|defense|aerospace|research|prototype_shop|oem|consumer|unset)",
+                customer_type_str
+            )));
+        }
+    };
 
     Ok(Ok(Partner {
         id,
@@ -1133,6 +1233,7 @@ fn row_to_partner(row: &duckdb::Row<'_>) -> duckdb::Result<Result<Partner>> {
         legal_name,
         kind,
         customer_vat_status,
+        customer_type,
         tax_number,
         eu_vat_number,
         address_street,
@@ -1258,6 +1359,7 @@ mod tests {
             legal_name: "BSCE Kft.".to_string(),
             kind: PartnerKind::Customer,
             customer_vat_status: CustomerVatStatus::Domestic,
+            customer_type: CustomerType::Unset,
             tax_number: Some("12345678-1-42".to_string()),
             eu_vat_number: None,
             address_street: None,

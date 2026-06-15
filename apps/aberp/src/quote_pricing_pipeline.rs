@@ -764,7 +764,38 @@ impl PricingPipelineService {
             let engine_complexity = convert_complexity(&complexity);
             let engine_tolerance = convert_tolerance(&tolerance);
             let engine_stock_adjustments = convert_stock_adjustments(&stock_adjustments);
-            let engine_params = convert_parameters(&params);
+            let mut engine_params = convert_parameters(&params);
+
+            // S428 — resolve the customer-type margin policy: the buyer
+            // partner's customer_type → active profile (or operator
+            // override) overrides the global markup + floor. The engine
+            // stays pure; we only swap the knobs we feed it.
+            let (buyer_partner_id, margin_override_pct) =
+                match jobs::get_job_detail(&conn, &quote_id, &tenant_id_string)? {
+                    Some(d) => (d.buyer_partner_id, d.margin_override_pct),
+                    None => (None, None),
+                };
+            let customer_type = crate::quote_margin::customer_type_for_partner(
+                &conn,
+                &tenant_id_string,
+                buyer_partner_id.as_deref(),
+            )?;
+            let profile = if customer_type == crate::partners::CustomerType::Unset {
+                None
+            } else {
+                crate::margin_profiles::active_profile_for_customer_type(
+                    &conn,
+                    &tenant_id_string,
+                    customer_type,
+                )?
+            };
+            let margin_policy = crate::quote_margin::MarginPolicy::resolve(
+                profile.as_ref(),
+                margin_override_pct,
+                engine_params.profit_margin_base,
+                engine_params.min_margin,
+            );
+            margin_policy.apply(&mut engine_params);
 
             match engine::quote(
                 &graph,
@@ -794,6 +825,27 @@ impl PricingPipelineService {
                         );
                         return Ok(StepOutcome::Advanced);
                     }
+
+                    // S428 — record the margin-floor verdict alongside the
+                    // priced breakdown so the operator banner + the DEAL
+                    // saga's hard block read one source of truth.
+                    let below_floor =
+                        margin_policy.is_below_floor(breakdown.margin, breakdown.total_price);
+                    let stored_floor_pct = if margin_policy.pipeline_enforced {
+                        Some(margin_policy.floor_pct)
+                    } else {
+                        None
+                    };
+                    jobs::set_margin_result(
+                        &conn,
+                        &quote_id,
+                        &tenant_id_string,
+                        &json,
+                        breakdown.total_price,
+                        below_floor,
+                        stored_floor_pct,
+                        OffsetDateTime::now_utc(),
+                    )?;
 
                     // S427 — capacity-aware lead-time. Computed after the
                     // price commits; the row is now `Rendering`, so the
@@ -905,6 +957,47 @@ impl PricingPipelineService {
                         Some(payload.idempotency_key.clone()),
                     )
                     .context("append priced")?;
+
+                    // S428 — margin-policy provenance + floor breach.
+                    if matches!(
+                        margin_policy.source,
+                        crate::quote_margin::MarginSource::Global
+                    ) {
+                        let payload = crate::audit_payloads::QuoteUsingGlobalMarginPayload {
+                            quote_id: quote_id.clone(),
+                            global_margin_base: margin_policy.applied_margin_base,
+                        };
+                        append_in_tx(
+                            &tx,
+                            &meta,
+                            EventKind::QuoteUsingGlobalMargin,
+                            payload.to_bytes(),
+                            Actor::from_local_cli(Ulid::new().to_string(), &login),
+                            Some(format!("quote_using_global_margin:{quote_id}")),
+                        )
+                        .context("append using-global-margin")?;
+                    }
+                    if below_floor {
+                        let payload = crate::audit_payloads::QuoteMarginBelowFloorPayload {
+                            quote_id: quote_id.clone(),
+                            realized_margin_pct:
+                                crate::quote_margin::MarginPolicy::realized_margin_pct(
+                                    breakdown.margin,
+                                    breakdown.total_price,
+                                ),
+                            floor_pct: margin_policy.floor_pct,
+                        };
+                        append_in_tx(
+                            &tx,
+                            &meta,
+                            EventKind::QuoteMarginBelowFloor,
+                            payload.to_bytes(),
+                            Actor::from_local_cli(Ulid::new().to_string(), &login),
+                            Some(format!("quote_margin_below_floor:{quote_id}")),
+                        )
+                        .context("append margin-below-floor")?;
+                    }
+
                     tx.commit().context("commit priced-audit")?;
                     Ok(StepOutcome::Advanced)
                 }
@@ -2486,6 +2579,113 @@ fn convert_parameters(local: &crate::quoting_tunables::QuotingParameters) -> Quo
         setup_base_min: local.setup_base_min,
         setup_5axis_min: local.setup_5axis_min,
     }
+}
+
+/// S428 — outcome of an operator-triggered re-price (buyer-partner assign
+/// or margin override). Pure data; the caller persists + audits.
+#[derive(Debug, Clone)]
+pub struct RepriceOutcome {
+    pub breakdown_json: String,
+    pub total_price: f64,
+    pub below_floor: bool,
+    /// The effective floor (profile or global) when the pipeline enforces
+    /// it; `None` on the global path.
+    pub floor_pct: Option<f64>,
+    pub realized_margin_pct: f64,
+    pub source: crate::quote_margin::MarginSource,
+    pub applied_margin_base: f64,
+    pub profile_id: Option<String>,
+}
+
+/// S428 — re-run the pricing engine for an already-extracted job with a
+/// (possibly new) operator margin override, applying the buyer partner's
+/// margin profile. Returns `Ok(None)` when the job is missing or has no
+/// feature graph yet (nothing to re-price). Does NOT persist or audit —
+/// the serve handler decides whether to commit (e.g. a below-floor
+/// override needs explicit confirmation first).
+///
+/// Re-prices at [`ToleranceRange::Standard`] — the same default the daemon
+/// config carries for first pricing; the tolerance is not stored per-job.
+pub fn reprice_quote(
+    conn: &duckdb::Connection,
+    tenant: &str,
+    quote_id: &str,
+    override_pct: Option<f64>,
+) -> Result<Option<RepriceOutcome>> {
+    jobs::ensure_schema(conn)?;
+    let Some(detail) = jobs::get_job_detail(conn, quote_id, tenant)? else {
+        return Ok(None);
+    };
+    let Some(graph_json) = detail.feature_graph_json else {
+        return Ok(None);
+    };
+    let graph: FeatureGraph =
+        serde_json::from_str(&graph_json).context("decode FeatureGraph for reprice")?;
+    let qty = detail.row.quantity.max(1);
+
+    let materials = crate::quoting_materials::list_materials(conn, tenant)?;
+    let complexity = crate::quoting_tunables::list_complexity_rules(conn, tenant)?;
+    let tolerance = crate::quoting_tunables::list_tolerance_multipliers(conn, tenant)?;
+    let stock_adjustments = crate::quoting_tunables::list_stock_adjustments(conn, tenant)?;
+    let params = crate::quoting_tunables::get_parameters(conn, tenant)?;
+
+    let engine_materials = convert_materials(&materials)?;
+    let engine_complexity = convert_complexity(&complexity);
+    let engine_tolerance = convert_tolerance(&tolerance);
+    let engine_stock_adjustments = convert_stock_adjustments(&stock_adjustments);
+    let mut engine_params = convert_parameters(&params);
+
+    let customer_type = crate::quote_margin::customer_type_for_partner(
+        conn,
+        tenant,
+        detail.buyer_partner_id.as_deref(),
+    )?;
+    let profile = if customer_type == crate::partners::CustomerType::Unset {
+        None
+    } else {
+        crate::margin_profiles::active_profile_for_customer_type(conn, tenant, customer_type)?
+    };
+    let policy = crate::quote_margin::MarginPolicy::resolve(
+        profile.as_ref(),
+        override_pct,
+        engine_params.profit_margin_base,
+        engine_params.min_margin,
+    );
+    policy.apply(&mut engine_params);
+
+    let breakdown = engine::quote(
+        &graph,
+        &engine_materials,
+        &engine_complexity,
+        &engine_tolerance,
+        &engine_stock_adjustments,
+        &engine_params,
+        qty,
+        ToleranceRange::Standard,
+    )
+    .map_err(|e| anyhow!("reprice engine error: {e:?}"))?;
+
+    let below_floor = policy.is_below_floor(breakdown.margin, breakdown.total_price);
+    let realized = crate::quote_margin::MarginPolicy::realized_margin_pct(
+        breakdown.margin,
+        breakdown.total_price,
+    );
+    let floor_pct = if policy.pipeline_enforced {
+        Some(policy.floor_pct)
+    } else {
+        None
+    };
+    let breakdown_json = serde_json::to_string(&breakdown).context("encode reprice breakdown")?;
+    Ok(Some(RepriceOutcome {
+        breakdown_json,
+        total_price: breakdown.total_price,
+        below_floor,
+        floor_pct,
+        realized_margin_pct: realized,
+        source: policy.source,
+        applied_margin_base: policy.applied_margin_base,
+        profile_id: policy.profile_id,
+    }))
 }
 
 /// Build the multipart body per ADR-0004 §"Wire shape". Two parts:

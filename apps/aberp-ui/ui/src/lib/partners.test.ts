@@ -33,6 +33,7 @@ const SAMPLE_PARTNER: Partner = {
   // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic posture
   // for legacy test fixtures.
   customer_vat_status: "Domestic",
+  customer_type: "unset",
   tax_number: "12345678-1-42",
   eu_vat_number: "HU12345678",
   address_street: "Fő utca 1.",

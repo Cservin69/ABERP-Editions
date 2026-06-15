@@ -18,6 +18,7 @@
   import { createPartner, updatePartner, type Partner } from "../lib/api";
   import {
     composePartnerInputs,
+    CUSTOMER_TYPE_OPTIONS,
     emptyPartnerForm,
     formFromPartner,
     parsePartnerValidationError,
@@ -246,6 +247,20 @@
               <option value="Customer">Customer</option>
               <option value="Supplier">Supplier</option>
               <option value="Both">Both</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span class="field__label">
+              Customer type
+              <span class="field__hint">
+                drives the margin profile applied to auto-quotes
+              </span>
+            </span>
+            <select bind:value={form.customerType}>
+              {#each CUSTOMER_TYPE_OPTIONS as opt (opt.value)}
+                <option value={opt.value}>{opt.label}</option>
+              {/each}
             </select>
           </label>
 

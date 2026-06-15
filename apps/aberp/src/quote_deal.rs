@@ -129,6 +129,13 @@ pub enum DealSagaError {
         valid_until: String,
         today: String,
     },
+    /// S428 — the quote priced below its effective margin floor
+    /// (`quote_pricing_jobs.margin_below_floor`). A hard, code-enforced
+    /// block ([[trust-code-not-operator]]): the operator cannot DEAL a
+    /// money-losing job, even after confirming the override. Route maps to
+    /// 409 `below_margin_floor`.
+    #[error("quote {quote_id} is below the margin floor; DEAL refused")]
+    BelowMarginFloor { quote_id: String },
 }
 
 impl DealSagaError {
@@ -143,6 +150,7 @@ impl DealSagaError {
             DealSagaError::DealTokenMismatch { .. } => "deal_token_mismatch",
             DealSagaError::InsufficientMaterial { .. } => "insufficient_material",
             DealSagaError::QuoteExpired { .. } => "quote_expired",
+            DealSagaError::BelowMarginFloor { .. } => "below_margin_floor",
         }
     }
 }
@@ -339,6 +347,18 @@ pub fn run_deal_saga(
     // on the common replay path.
     if row.deal_issued_at.is_some() {
         return Err(anyhow!(DealSagaError::DealAlreadyIssued {
+            quote_id: inputs.quote_id.clone(),
+        }));
+    }
+
+    // S428 — hard margin-floor block. A quote flagged below its effective
+    // floor in `quote_pricing_jobs` cannot be dealt, regardless of operator
+    // confirmation on the override ([[trust-code-not-operator]]). Absent /
+    // NULL flag (manual quotes, pre-S428 rows) ⇒ not blocked.
+    if crate::quote_pricing_jobs::margin_below_floor(conn, &inputs.quote_id, &inputs.tenant)
+        .map_err(|e| anyhow!("read margin_below_floor for DEAL: {e}"))?
+    {
+        return Err(anyhow!(DealSagaError::BelowMarginFloor {
             quote_id: inputs.quote_id.clone(),
         }));
     }

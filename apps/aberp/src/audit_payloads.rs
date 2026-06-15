@@ -5649,3 +5649,133 @@ impl QuotingMachinesEmptyFallbackPayload {
         serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
     }
 }
+
+// ── S428 — customer-type margin profiles ────────────────────────────────
+// App-layer JSON payloads only (never NAV XML bytes). Partner customer_type
+// change is the single audited partner mutation (carries pricing weight);
+// margin-profile CRUD + per-quote margin events round out the family.
+
+/// Payload for [`aberp_audit_ledger::EventKind::PartnerCustomerTypeChanged`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PartnerCustomerTypeChangedPayload {
+    pub partner_id: String,
+    /// Previous customer-type db-string (e.g. "unset").
+    pub old_customer_type: String,
+    /// New customer-type db-string.
+    pub new_customer_type: String,
+}
+
+impl PartnerCustomerTypeChangedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::MarginProfileCreated`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MarginProfileCreatedPayload {
+    pub profile_id: String,
+    pub name: String,
+    pub customer_type: String,
+    pub gross_margin_pct: f64,
+    pub min_margin_pct: f64,
+}
+
+impl MarginProfileCreatedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::MarginProfileEdited`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MarginProfileEditedPayload {
+    pub profile_id: String,
+    pub name: String,
+    pub customer_type: String,
+    pub gross_margin_pct: f64,
+    pub min_margin_pct: f64,
+    pub enabled: bool,
+}
+
+impl MarginProfileEditedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::MarginProfileArchived`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MarginProfileArchivedPayload {
+    pub profile_id: String,
+    pub archived_at: String,
+}
+
+impl MarginProfileArchivedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::QuoteMarginBelowFloor`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteMarginBelowFloorPayload {
+    pub quote_id: String,
+    /// Realized margin as a fraction of total price (margin / total_price).
+    pub realized_margin_pct: f64,
+    /// The effective floor that was violated (profile or global min margin).
+    pub floor_pct: f64,
+}
+
+impl QuoteMarginBelowFloorPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::QuoteUsingGlobalMargin`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteUsingGlobalMarginPayload {
+    pub quote_id: String,
+    /// The global default margin (profit_margin_base) that was applied.
+    pub global_margin_base: f64,
+}
+
+impl QuoteUsingGlobalMarginPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::QuoteMarginOverridden`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteMarginOverriddenPayload {
+    pub quote_id: String,
+    /// The operator's chosen margin (profit_margin_base). `None` clears a
+    /// prior override and reverts to the profile/global default.
+    pub override_margin_pct: Option<f64>,
+}
+
+impl QuoteMarginOverriddenPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// Payload for [`aberp_audit_ledger::EventKind::QuoteMarginFloorOverridden`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteMarginFloorOverriddenPayload {
+    pub quote_id: String,
+    /// The below-floor margin the operator chose to proceed with.
+    pub override_margin_pct: f64,
+    /// The floor that was knowingly breached.
+    pub floor_pct: f64,
+    /// The operator's free-text justification (the confirmation reason).
+    pub reason: String,
+}
+
+impl QuoteMarginFloorOverriddenPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}

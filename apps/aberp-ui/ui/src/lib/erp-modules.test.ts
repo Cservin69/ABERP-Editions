@@ -151,6 +151,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   products: "maintenance",
   // S427 — quoting-machine master data (maintenance area).
   machines: "maintenance",
+  // S428 — customer-type margin profiles (maintenance area).
+  "margin-profiles": "maintenance",
   // S232 / PR-228 / ADR-0062 — Production is operational (daily-driver
   // shop-floor workflow). S233 added QA queue alongside.
   "work-orders": "operational",
@@ -196,6 +198,8 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   "ProductCount",
   // S427 — quoting-machine master data tile.
   "MachineCount",
+  // S428 — customer-type margin profiles tile.
+  "MarginProfileCount",
   "BankAccountCount",
   "NavCredStatus",
   // S180 / PR-180 — NAV-as-DR restore wizard tile.

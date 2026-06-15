@@ -10,11 +10,34 @@
 // Pinned by `partners.test.ts`.
 
 import type {
+  CustomerType,
   CustomerVatStatusBody,
   Partner,
   PartnerInputs,
   PartnerKind,
 } from "./api";
+
+/** S428 — closed-vocab customer-type options + bilingual labels for the
+ * PartnerForm dropdown. Order: business segments first, `unset` last (the
+ * default). Pinned by `partners.test.ts`. */
+export const CUSTOMER_TYPE_OPTIONS: ReadonlyArray<{
+  value: CustomerType;
+  label: string;
+}> = [
+  { value: "industrial", label: "Industrial / Ipari" },
+  { value: "defense", label: "Defense / Védelmi" },
+  { value: "aerospace", label: "Aerospace / Légiipari" },
+  { value: "research", label: "Research / Kutatás" },
+  { value: "prototype_shop", label: "Prototype shop / Prototípus" },
+  { value: "oem", label: "OEM" },
+  { value: "consumer", label: "Consumer / Fogyasztói" },
+  { value: "unset", label: "Unset / Nincs megadva" },
+];
+
+/** S428 — human label for a customer type, or the raw string if unknown. */
+export function customerTypeLabel(value: CustomerType | string): string {
+  return CUSTOMER_TYPE_OPTIONS.find((o) => o.value === value)?.label ?? value;
+}
 import {
   applySortDir,
   compareNullishLast,
@@ -36,6 +59,8 @@ export interface PartnerFormState {
   legalName: string;
   kind: PartnerKind;
   customerVatStatus: CustomerVatStatusBody;
+  /** S428 — closed-vocab customer segment driving the margin profile. */
+  customerType: CustomerType;
   taxNumber: string;
   euVatNumber: string;
   addressStreet: string;
@@ -61,6 +86,9 @@ export function emptyPartnerForm(): PartnerFormState {
     // backfilled the same value via the migration; the dominant
     // operator case is a Hungarian-business buyer.
     customerVatStatus: "Domestic",
+    // S428 — defaults to `unset`; the operator picks a segment to drive
+    // the margin profile.
+    customerType: "unset",
     taxNumber: "",
     euVatNumber: "",
     addressStreet: "",
@@ -83,6 +111,7 @@ export function formFromPartner(partner: Partner): PartnerFormState {
     legalName: partner.legal_name,
     kind: partner.kind,
     customerVatStatus: partner.customer_vat_status,
+    customerType: partner.customer_type,
     // PR-97 / ADR-0048 — nullable on the wire (PrivatePerson rows
     // store NULL). Collapse to empty string so the DOM input bind
     // value stays typed-as-string.
@@ -113,6 +142,7 @@ export function composePartnerInputs(
     legal_name: form.legalName.trim(),
     kind: form.kind,
     customer_vat_status: form.customerVatStatus,
+    customer_type: form.customerType,
     // PR-97 / ADR-0048 — nullable. PrivatePerson rows store NULL; the
     // form's disabled input renders "" which collapses to null here so
     // the backend column sees the absence verbatim. Domestic rows

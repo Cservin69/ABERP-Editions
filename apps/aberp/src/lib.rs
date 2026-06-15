@@ -74,6 +74,7 @@ pub mod material_inventory;
 pub mod mes_boot;
 // S257 / PR-246 — `[[mes.adapters]]` seller.toml slot (7th preservation
 // section) + operator-managed adapter lifecycle (Settings → Adapters).
+pub mod margin_profiles;
 pub mod mes_adapters_config;
 pub mod mes_manager;
 pub mod mnb_rates_provider;
@@ -90,6 +91,7 @@ pub mod products;
 pub mod quote_intake_config;
 pub mod quote_intake_credentials;
 pub mod quote_intake_query;
+pub mod quote_margin;
 // S255 / PR-244 — operator-clicked "Create draft invoice" on a staged
 // quote_intake_log row. Mints an `invoice_draft` row with
 // `source_quote_id` set + emits `InvoicePickedUpFromQuote`.

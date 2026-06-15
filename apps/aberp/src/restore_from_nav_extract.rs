@@ -594,6 +594,7 @@ fn customer_to_partner_inputs(customer: &CustomerCandidate) -> Result<PartnerInp
         legal_name,
         kind: PartnerKind::Customer,
         customer_vat_status: customer.vat_status,
+        customer_type: crate::partners::CustomerType::Unset,
         tax_number: customer.tax_number.clone(),
         eu_vat_number: None,
         address_street: customer.address_street.clone(),

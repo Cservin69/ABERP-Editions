@@ -1087,7 +1087,20 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::MachineEdited
         | EventKind::MachineArchived
         | EventKind::QuoteLeadTimeOverridden
-        | EventKind::QuotingMachinesEmptyFallback => (None, ""),
+        | EventKind::QuotingMachinesEmptyFallback
+        // S428 — partner.customer_type + quote.* margin-profile / margin
+        // family. Partner id + customer type, profile id + margin knobs,
+        // quote id + realized/floor margin %; app-layer JSON payloads,
+        // never NAV XML bytes. Master-data / pricing-ops rows, never sweep
+        // a per-OUTGOING-invoice bundle. Exhaustiveness arm only.
+        | EventKind::PartnerCustomerTypeChanged
+        | EventKind::MarginProfileCreated
+        | EventKind::MarginProfileEdited
+        | EventKind::MarginProfileArchived
+        | EventKind::QuoteMarginBelowFloor
+        | EventKind::QuoteUsingGlobalMargin
+        | EventKind::QuoteMarginOverridden
+        | EventKind::QuoteMarginFloorOverridden => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1109,7 +1122,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 115,
+        EventKind::ALL_KINDS_COUNT == 123,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

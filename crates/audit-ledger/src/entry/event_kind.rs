@@ -2515,6 +2515,58 @@ pub enum EventKind {
     /// hours/buffer. `quote.*` family (pricing-engine operational event,
     /// alongside the daemon kinds); app-layer JSON only.
     QuotingMachinesEmptyFallback,
+
+    /// S428 — an operator changed a partner's `customer_type`. The ONLY
+    /// partner mutation that fires an audit row: customer_type drives the
+    /// margin profile (hence the price), so it carries pricing weight that
+    /// the rest of partner CRUD (ADR-0008 no-audit posture) does not.
+    /// Payload (`PartnerCustomerTypeChangedPayload`) carries the partner id
+    /// and old/new type. `partner.*` family; app-layer JSON only.
+    PartnerCustomerTypeChanged,
+
+    /// S428 — a customer-type margin profile was created. Payload
+    /// (`MarginProfileCreatedPayload`) carries the profile id, customer
+    /// type, and the target/floor margins. `quote.*` family (quoting master
+    /// data, alongside the tunables kinds); app-layer JSON only.
+    MarginProfileCreated,
+
+    /// S428 — a margin profile's fields were edited. Payload
+    /// (`MarginProfileEditedPayload`) carries the profile id and the new
+    /// values. `quote.*` family; app-layer JSON only.
+    MarginProfileEdited,
+
+    /// S428 — a margin profile was archived (soft-delete, never a hard
+    /// delete). Payload (`MarginProfileArchivedPayload`) carries the
+    /// profile id and the archive timestamp. `quote.*` family; app-layer
+    /// JSON only.
+    MarginProfileArchived,
+
+    /// S428 — a quote priced (or re-priced) below the effective
+    /// min-margin floor. Operator-facing block: the DEAL saga refuses
+    /// while this holds. Payload (`QuoteMarginBelowFloorPayload`) carries
+    /// the quote id, realized margin %, and floor %. `quote.*` family;
+    /// app-layer JSON only.
+    QuoteMarginBelowFloor,
+
+    /// S428 — a quote was priced with the global default margin because no
+    /// active profile matched the buyer's customer type (or the buyer was
+    /// `unset` / unassigned). Lets us later see which quotes were NOT
+    /// profile-driven. Payload (`QuoteUsingGlobalMarginPayload`) carries
+    /// the quote id and the global margin used. `quote.*` family; app-layer
+    /// JSON only.
+    QuoteUsingGlobalMargin,
+
+    /// S428 — an operator manually overrode the margin on a quote. Payload
+    /// (`QuoteMarginOverriddenPayload`) carries the quote id and the new
+    /// margin %. `quote.*` family (operator decision); app-layer JSON only.
+    QuoteMarginOverridden,
+
+    /// S428 — an operator overrode a margin that fell below the floor, via
+    /// the explicit "below min margin — proceed?" confirmation. Payload
+    /// (`QuoteMarginFloorOverriddenPayload`) carries the quote id, margin
+    /// %, floor %, and the operator's reason. `quote.*` family; app-layer
+    /// JSON only.
+    QuoteMarginFloorOverridden,
 }
 
 impl EventKind {
@@ -2648,6 +2700,14 @@ impl EventKind {
             EventKind::MachineArchived => "mes.machine_archived",
             EventKind::QuoteLeadTimeOverridden => "quote.lead_time_overridden",
             EventKind::QuotingMachinesEmptyFallback => "quote.machines_empty_fallback",
+            EventKind::PartnerCustomerTypeChanged => "partner.customer_type_changed",
+            EventKind::MarginProfileCreated => "quote.margin_profile_created",
+            EventKind::MarginProfileEdited => "quote.margin_profile_edited",
+            EventKind::MarginProfileArchived => "quote.margin_profile_archived",
+            EventKind::QuoteMarginBelowFloor => "quote.margin_below_floor",
+            EventKind::QuoteUsingGlobalMargin => "quote.using_global_margin",
+            EventKind::QuoteMarginOverridden => "quote.margin_overridden",
+            EventKind::QuoteMarginFloorOverridden => "quote.margin_floor_overridden",
         }
     }
 
@@ -2792,6 +2852,14 @@ impl EventKind {
             "mes.machine_archived" => Ok(EventKind::MachineArchived),
             "quote.lead_time_overridden" => Ok(EventKind::QuoteLeadTimeOverridden),
             "quote.machines_empty_fallback" => Ok(EventKind::QuotingMachinesEmptyFallback),
+            "partner.customer_type_changed" => Ok(EventKind::PartnerCustomerTypeChanged),
+            "quote.margin_profile_created" => Ok(EventKind::MarginProfileCreated),
+            "quote.margin_profile_edited" => Ok(EventKind::MarginProfileEdited),
+            "quote.margin_profile_archived" => Ok(EventKind::MarginProfileArchived),
+            "quote.margin_below_floor" => Ok(EventKind::QuoteMarginBelowFloor),
+            "quote.using_global_margin" => Ok(EventKind::QuoteUsingGlobalMargin),
+            "quote.margin_overridden" => Ok(EventKind::QuoteMarginOverridden),
+            "quote.margin_floor_overridden" => Ok(EventKind::QuoteMarginFloorOverridden),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -2924,6 +2992,14 @@ impl EventKind {
         EventKind::MachineArchived,
         EventKind::QuoteLeadTimeOverridden,
         EventKind::QuotingMachinesEmptyFallback,
+        EventKind::PartnerCustomerTypeChanged,
+        EventKind::MarginProfileCreated,
+        EventKind::MarginProfileEdited,
+        EventKind::MarginProfileArchived,
+        EventKind::QuoteMarginBelowFloor,
+        EventKind::QuoteUsingGlobalMargin,
+        EventKind::QuoteMarginOverridden,
+        EventKind::QuoteMarginFloorOverridden,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -3064,6 +3140,14 @@ mod tests {
             EventKind::MachineArchived,
             EventKind::QuoteLeadTimeOverridden,
             EventKind::QuotingMachinesEmptyFallback,
+            EventKind::PartnerCustomerTypeChanged,
+            EventKind::MarginProfileCreated,
+            EventKind::MarginProfileEdited,
+            EventKind::MarginProfileArchived,
+            EventKind::QuoteMarginBelowFloor,
+            EventKind::QuoteUsingGlobalMargin,
+            EventKind::QuoteMarginOverridden,
+            EventKind::QuoteMarginFloorOverridden,
         ];
         for v in &variants {
             let s = v.as_str();
@@ -3097,7 +3181,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            115,
+            123,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \

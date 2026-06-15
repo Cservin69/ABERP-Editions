@@ -299,6 +299,14 @@ pub fn run() {
             commands::update_machine,
             commands::archive_machine,
             commands::override_quote_lead_time,
+            // S428 — margin profiles + per-quote margin controls.
+            commands::list_margin_profiles,
+            commands::get_margin_profile,
+            commands::create_margin_profile,
+            commands::update_margin_profile,
+            commands::archive_margin_profile,
+            commands::set_quote_buyer_partner,
+            commands::override_quote_margin,
             // S257 / PR-246 — Settings → Adapters CRUD.
             commands::list_adapters,
             commands::create_adapter,

@@ -78,6 +78,7 @@
   import PartnersList from "./routes/PartnersList.svelte";
   import ProductsList from "./routes/ProductsList.svelte";
   import MachinesList from "./routes/MachinesList.svelte";
+  import MarginProfilesList from "./routes/MarginProfilesList.svelte";
   // S232 / PR-228 / ADR-0062 — Stage 3 Phase γ Work Orders v1.
   import WorkOrdersList from "./routes/WorkOrdersList.svelte";
   // S233 / PR-229 / ADR-0063 — Stage 3 Phase γ QA queue v1 SPA tab.
@@ -663,6 +664,8 @@
           <ProductsList />
         {:else if route === "machines"}
           <MachinesList />
+        {:else if route === "margin-profiles"}
+          <MarginProfilesList />
         {:else if route === "work-orders"}
           <WorkOrdersList />
         {:else if route === "qa"}

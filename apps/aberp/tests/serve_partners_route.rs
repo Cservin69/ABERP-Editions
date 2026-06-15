@@ -33,7 +33,7 @@ use aberp_audit_ledger::{BinaryHash, TenantId};
 use ulid::Ulid;
 
 use aberp::nav_xml::CustomerVatStatus;
-use aberp::partners::{PartnerInputs, PartnerKind};
+use aberp::partners::{CustomerType, PartnerInputs, PartnerKind};
 use aberp::serve::{self, AppState, PartnerRouteError};
 
 const TEST_TENANT: &str = "serve_partners_route_test";
@@ -93,6 +93,7 @@ fn minimal_valid_inputs(display: &str) -> PartnerInputs {
         kind: PartnerKind::Customer,
         // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
         customer_vat_status: CustomerVatStatus::Domestic,
+        customer_type: CustomerType::Unset,
         tax_number: Some("12345678-1-42".to_string()),
         eu_vat_number: Some("HU12345678".to_string()),
         address_street: Some("Fő utca 1.".to_string()),
@@ -162,6 +163,7 @@ fn partners_create_rejects_invalid_inputs_with_structured_errors() {
         kind: PartnerKind::Both,
         // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
         customer_vat_status: CustomerVatStatus::Domestic,
+        customer_type: CustomerType::Unset,
         tax_number: Some("not-a-tax-number".to_string()),
         eu_vat_number: None,
         address_street: None,
@@ -266,8 +268,14 @@ fn partners_update_persists_mutated_field_and_bumps_updated_at() {
         display_name: "Renamed".to_string(),
         ..minimal_valid_inputs("Original")
     };
-    let updated = serve::update_partner_request(&state, &created.id, &mutated_inputs)
-        .expect("update must succeed");
+    let updated = serve::update_partner_request(
+        &state,
+        &created.id,
+        &mutated_inputs,
+        "test-operator",
+        BinaryHash::from_bytes([0u8; 32]),
+    )
+    .expect("update must succeed");
 
     assert_eq!(updated.id, created.id, "id must stay stable across update");
     assert_eq!(updated.display_name, "Renamed", "mutation must persist");
@@ -282,7 +290,13 @@ fn partners_update_persists_mutated_field_and_bumps_updated_at() {
 
     // Update on unknown id surfaces as NotFound (404 at HTTP).
     let unknown_id = format!("prt_{}", Ulid::new());
-    match serve::update_partner_request(&state, &unknown_id, &mutated_inputs) {
+    match serve::update_partner_request(
+        &state,
+        &unknown_id,
+        &mutated_inputs,
+        "test-operator",
+        BinaryHash::from_bytes([0u8; 32]),
+    ) {
         Err(PartnerRouteError::NotFound) => {}
         other => panic!("expected NotFound for unknown id, got {other:?}"),
     }

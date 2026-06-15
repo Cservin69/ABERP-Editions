@@ -20,11 +20,16 @@
     getQuotePricingJobAudit,
     listQuotingMaterials,
     overrideQuoteLeadTime,
+    overrideQuoteMargin,
+    setQuoteBuyerPartner,
     retryQuotePricingJob,
     MaterialEditError,
     type AuditEntryView,
+    type Partner,
     type PricingJobDetail,
   } from "../lib/api";
+  import { formatPercent } from "../lib/margin-profiles";
+  import PartnerTypeahead from "../lib/PartnerTypeahead.svelte";
   // S427 — lead-time chip colour + effective-value helper (pure).
   import {
     effectiveLeadTime,
@@ -99,6 +104,19 @@
   let leadTimeBusy = $state(false);
   let leadTimeError = $state<string | null>(null);
 
+  // S428 — operator margin override + buyer-partner state.
+  let marginDraft = $state(""); // percent string, e.g. "30"
+  let marginBusy = $state(false);
+  let marginError = $state<string | null>(null);
+  let buyerSearch = $state("");
+  let buyerBusy = $state(false);
+  let buyerError = $state<string | null>(null);
+  // Below-floor confirmation modal: holds the pending percent + reason.
+  let floorConfirm = $state<{ realizedPct: number; floorPct: number } | null>(
+    null,
+  );
+  let floorReason = $state("");
+
   const AUDIT_PAGE = 50;
 
   // Derived sections — all read off the one audit page we fetch.
@@ -162,6 +180,15 @@
           ? String(d.lead_time_override_days)
           : "";
       leadTimeError = null;
+      // S428 — seed the margin override input (as a percent string) +
+      // reset the per-quote margin control state.
+      marginDraft =
+        d.margin_override_pct !== null ? String(d.margin_override_pct * 100) : "";
+      marginError = null;
+      buyerError = null;
+      buyerSearch = "";
+      floorConfirm = null;
+      floorReason = "";
       loadState = "ready";
     } catch (e) {
       errorMessage = e instanceof Error ? e.message : String(e);
@@ -373,6 +400,120 @@
     } finally {
       leadTimeBusy = false;
     }
+  }
+
+  // S428 — assign a buyer partner (drives the margin profile) + re-price.
+  async function pickBuyerPartner(partner: Partner): Promise<void> {
+    if (!quoteId) return;
+    buyerBusy = true;
+    buyerError = null;
+    try {
+      await setQuoteBuyerPartner(quoteId, partner.id);
+      buyerSearch = "";
+      await load(quoteId);
+    } catch (e) {
+      buyerError = e instanceof Error ? e.message : String(e);
+    } finally {
+      buyerBusy = false;
+    }
+  }
+
+  async function clearBuyerPartner(): Promise<void> {
+    if (!quoteId) return;
+    buyerBusy = true;
+    buyerError = null;
+    try {
+      await setQuoteBuyerPartner(quoteId, null);
+      await load(quoteId);
+    } catch (e) {
+      buyerError = e instanceof Error ? e.message : String(e);
+    } finally {
+      buyerBusy = false;
+    }
+  }
+
+  // S428 — extract the `below_margin_floor` 409 payload (realized + floor)
+  // from the Tauri-wrapped error string so the confirm modal can show the
+  // numbers. Returns null for any other error shape.
+  function parseFloorConflict(
+    raw: string,
+  ): { realizedPct: number; floorPct: number } | null {
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start < 0 || end <= start) return null;
+    try {
+      const obj = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
+      if (obj.error !== "below_margin_floor") return null;
+      const realized = obj.realized_pct;
+      const floor = obj.floor_pct;
+      if (typeof realized !== "number" || typeof floor !== "number") return null;
+      return { realizedPct: realized, floorPct: floor };
+    } catch {
+      return null;
+    }
+  }
+
+  // S428 — apply the margin override. `confirm` proceeds past a below-floor
+  // guard (with the operator's reason). On an unconfirmed below-floor 409,
+  // surfaces the confirm modal instead of an error.
+  async function applyMarginOverride(
+    pct: number | null,
+    confirm: boolean,
+  ): Promise<void> {
+    if (!quoteId) return;
+    marginBusy = true;
+    marginError = null;
+    try {
+      await overrideQuoteMargin(
+        quoteId,
+        pct,
+        confirm,
+        confirm ? floorReason.trim() : null,
+      );
+      floorConfirm = null;
+      floorReason = "";
+      await load(quoteId);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const conflict = parseFloorConflict(msg);
+      if (conflict !== null && !confirm) {
+        floorConfirm = conflict;
+      } else {
+        marginError = msg;
+      }
+    } finally {
+      marginBusy = false;
+    }
+  }
+
+  function saveMarginOverride(): void {
+    const trimmed = marginDraft.trim();
+    if (trimmed.length === 0) {
+      marginError = "Adj meg egy árrés százalékot. / Enter a margin percent.";
+      return;
+    }
+    const pct = Number(trimmed);
+    if (!Number.isFinite(pct) || pct < 0) {
+      marginError = "Érvénytelen árrés. / Invalid margin percent.";
+      return;
+    }
+    void applyMarginOverride(pct / 100, false);
+  }
+
+  function clearMarginOverride(): void {
+    void applyMarginOverride(null, false);
+  }
+
+  function confirmFloorOverride(): void {
+    const trimmed = marginDraft.trim();
+    const pct = Number(trimmed);
+    if (!Number.isFinite(pct)) return;
+    void applyMarginOverride(pct / 100, true);
+  }
+
+  function cancelFloorOverride(): void {
+    floorConfirm = null;
+    floorReason = "";
   }
 
   // S416 — the inline operator accept-on-behalf form (startAccept /
@@ -749,6 +890,161 @@
             <p class="qjd__err qjd__matedit-err" data-testid="pricing-job-lead-time-error">
               {leadTimeError}
             </p>
+          {/if}
+        </section>
+
+        <!-- S428 — Margin profile + operator override. -->
+        <section class="qjd__sec">
+          <h4>Árrés / Margin</h4>
+
+          {#if detail.margin_below_floor}
+            <div
+              class="qjd__floor-banner"
+              role="alert"
+              data-testid="pricing-job-margin-floor-banner"
+            >
+              <strong>⚠ Árrés a minimum alatt / Margin below floor.</strong>
+              {#if detail.margin_floor_pct !== null}
+                A minimum árrés {formatPercent(detail.margin_floor_pct)}; ezt a
+                quote-ot nem lehet DEAL-elni. / The minimum margin is
+                {formatPercent(detail.margin_floor_pct)}; this quote cannot be
+                dealt.
+              {:else}
+                Ezt a quote-ot nem lehet DEAL-elni. / This quote cannot be dealt.
+              {/if}
+            </div>
+          {/if}
+
+          <dl class="qjd__dl">
+            <dt>Vevő partner / Buyer partner</dt>
+            <dd>
+              {#if detail.buyer_partner_id !== null}
+                <code>{detail.buyer_partner_id}</code>
+              {:else}
+                — nincs hozzárendelve / unassigned (global default)
+              {/if}
+            </dd>
+            <dt>Felülírás / Override</dt>
+            <dd>
+              {#if detail.margin_override_pct !== null}
+                {formatPercent(detail.margin_override_pct)}
+              {:else}
+                — nincs / none
+              {/if}
+            </dd>
+            <dt>Minimum / Floor</dt>
+            <dd>
+              {#if detail.margin_floor_pct !== null}
+                {formatPercent(detail.margin_floor_pct)}
+              {:else}
+                — globális / global
+              {/if}
+            </dd>
+          </dl>
+
+          <div class="qjd__buyer-edit">
+            <span class="qjd__field-label">
+              Vevő hozzárendelése / Assign buyer
+            </span>
+            <PartnerTypeahead
+              bind:value={buyerSearch}
+              onSelect={(p) => void pickBuyerPartner(p)}
+              placeholder="Partner neve… / Buyer name…"
+              ariaLabel="Assign buyer partner"
+            />
+            <button
+              type="button"
+              class="btn btn--secondary"
+              onclick={() => void clearBuyerPartner()}
+              disabled={buyerBusy || detail.buyer_partner_id === null}
+              data-testid="pricing-job-buyer-clear"
+              >Hozzárendelés törlése / Clear buyer</button
+            >
+          </div>
+          {#if buyerError}
+            <p class="qjd__err" data-testid="pricing-job-buyer-error">
+              {buyerError}
+            </p>
+          {/if}
+
+          <div class="qjd__leadtime-edit" data-testid="pricing-job-margin-edit">
+            <input
+              type="number"
+              min="0"
+              step="any"
+              class="qjd__matselect"
+              bind:value={marginDraft}
+              disabled={marginBusy}
+              placeholder="árrés % / margin %"
+              aria-label="Margin override percent"
+              data-testid="pricing-job-margin-input"
+            />
+            <button
+              type="button"
+              class="btn btn--secondary"
+              onclick={saveMarginOverride}
+              disabled={marginBusy}
+              data-testid="pricing-job-margin-save"
+              >{marginBusy ? "Mentés… / Saving…" : "Mentés / Save"}</button
+            >
+            <button
+              type="button"
+              class="btn btn--secondary"
+              onclick={clearMarginOverride}
+              disabled={marginBusy || detail.margin_override_pct === null}
+              data-testid="pricing-job-margin-clear"
+              >Felülírás törlése / Clear override</button
+            >
+          </div>
+          {#if marginError}
+            <p class="qjd__err" data-testid="pricing-job-margin-error">
+              {marginError}
+            </p>
+          {/if}
+
+          {#if floorConfirm !== null}
+            <div
+              class="qjd__floor-confirm"
+              role="dialog"
+              aria-label="Below min margin — proceed?"
+              data-testid="pricing-job-margin-floor-confirm"
+            >
+              <p class="qjd__floor-confirm-text">
+                <strong>Minimum árrés alatt — folytatja? / Below min margin —
+                  proceed?</strong><br />
+                Tényleges / Realized: {formatPercent(floorConfirm.realizedPct)},
+                minimum / floor: {formatPercent(floorConfirm.floorPct)}. A DEAL
+                ettől még tiltott marad. / DEAL stays blocked regardless.
+              </p>
+              <label class="qjd__field-label" for="floor-reason">
+                Indok / Reason
+              </label>
+              <input
+                id="floor-reason"
+                type="text"
+                class="qjd__matselect"
+                bind:value={floorReason}
+                disabled={marginBusy}
+                placeholder="miért / why"
+                data-testid="pricing-job-margin-floor-reason"
+              />
+              <div class="qjd__floor-confirm-actions">
+                <button
+                  type="button"
+                  class="btn btn--secondary"
+                  onclick={cancelFloorOverride}
+                  disabled={marginBusy}>Mégse / Cancel</button
+                >
+                <button
+                  type="button"
+                  class="btn btn--danger"
+                  onclick={confirmFloorOverride}
+                  disabled={marginBusy || floorReason.trim().length === 0}
+                  data-testid="pricing-job-margin-floor-proceed"
+                  >Folytatás / Proceed</button
+                >
+              </div>
+            </div>
           {/if}
         </section>
 
@@ -1381,5 +1677,51 @@
   }
   .qjd__leadtime-edit input {
     width: 120px;
+  }
+
+  /* S428 — margin-floor banner + buyer/override controls. */
+  .qjd__floor-banner {
+    margin: 8px 0;
+    padding: var(--space-2) var(--space-3);
+    border-left: 3px solid var(--color-signal-negative);
+    background: var(--color-surface-raised);
+    color: var(--color-text-primary);
+    font-size: var(--type-size-sm);
+    line-height: 1.4;
+  }
+  .qjd__floor-banner strong {
+    color: var(--color-signal-negative);
+  }
+  .qjd__buyer-edit {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .qjd__field-label {
+    font-size: var(--type-size-xs);
+    color: var(--color-text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .qjd__floor-confirm {
+    margin-top: 8px;
+    padding: var(--space-3);
+    border: 1px solid var(--color-signal-negative);
+    background: var(--color-surface-raised);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .qjd__floor-confirm-text {
+    margin: 0;
+    font-size: var(--type-size-sm);
+    color: var(--color-text-primary);
+    line-height: 1.4;
+  }
+  .qjd__floor-confirm-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
   }
 </style>

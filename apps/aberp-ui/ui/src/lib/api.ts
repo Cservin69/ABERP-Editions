@@ -1483,6 +1483,19 @@ export async function rotateNavCredential(
  * TS-strict consumption catches a backend drift at `npm run check`. */
 export type PartnerKind = "Customer" | "Supplier" | "Both";
 
+/** S428 — closed-vocab customer segment driving the margin profile.
+ * Mirrors `aberp::partners::CustomerType`'s db-strings; `"unset"` is the
+ * back-compat default. */
+export type CustomerType =
+  | "industrial"
+  | "defense"
+  | "aerospace"
+  | "research"
+  | "prototype_shop"
+  | "oem"
+  | "consumer"
+  | "unset";
+
 /** PR-54 / session-74 — single partner row. Snake_case JSON shape
  * mirrors `aberp::partners::Partner`'s `#[derive(Serialize)]` (no
  * `rename_all` directive on the Rust struct). `eu_vat_number` and the
@@ -1502,6 +1515,8 @@ export interface Partner {
    * validation gate. `Other` is named in the closed vocab but
    * v1-deferred per ADR-0048 §7. */
   customer_vat_status: CustomerVatStatusBody;
+  /** S428 — closed-vocab customer segment driving the margin profile. */
+  customer_type: CustomerType;
   /** PR-97 / ADR-0048 — nullable for non-Domestic statuses. */
   tax_number: string | null;
   eu_vat_number: string | null;
@@ -1531,6 +1546,8 @@ export interface PartnerInputs {
    * form's three-option radio binds to this field; backend serde
    * defaults to `"Domestic"` when absent for pre-PR-97 callers. */
   customer_vat_status: CustomerVatStatusBody;
+  /** S428 — closed-vocab customer segment driving the margin profile. */
+  customer_type: CustomerType;
   /** PR-97 / ADR-0048 — nullable for non-Domestic statuses. */
   tax_number: string | null;
   eu_vat_number: string | null;
@@ -1686,6 +1703,100 @@ export async function overrideQuoteLeadTime(
   await invoke<void>("override_quote_lead_time", {
     quoteId,
     body: { override_days: overrideDays },
+  });
+}
+
+// ── S428 — margin profiles master data + per-quote margin controls ───
+
+/** S428 — one margin-profile row. Mirrors `aberp::margin_profiles::
+ * MarginProfile`'s `#[derive(Serialize)]`. Percentages are wire fractions
+ * (0.35 = 35%). */
+export interface MarginProfile {
+  /** `mp_<26-char-ULID>`. */
+  id: string;
+  name: string;
+  customer_type: CustomerType;
+  gross_margin_pct: number;
+  min_margin_pct: number;
+  notes: string | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+}
+
+/** S428 — request body for create/update. Mirrors
+ * `aberp::margin_profiles::MarginProfileInputs`. */
+export interface MarginProfileInputs {
+  name: string;
+  customer_type: CustomerType;
+  gross_margin_pct: number;
+  min_margin_pct: number;
+  notes: string | null;
+  enabled: boolean;
+}
+
+/** S428 — `GET /api/margin-profiles` (active rows). */
+export async function listMarginProfiles(): Promise<MarginProfile[]> {
+  return invoke<MarginProfile[]>("list_margin_profiles");
+}
+
+/** S428 — `GET /api/margin-profiles/:id`. */
+export async function getMarginProfile(
+  profileId: string,
+): Promise<MarginProfile> {
+  return invoke<MarginProfile>("get_margin_profile", { profileId });
+}
+
+/** S428 — `POST /api/margin-profiles`. */
+export async function createMarginProfile(
+  body: MarginProfileInputs,
+): Promise<MarginProfile> {
+  return invoke<MarginProfile>("create_margin_profile", { body });
+}
+
+/** S428 — `PUT /api/margin-profiles/:id`. */
+export async function updateMarginProfile(
+  profileId: string,
+  body: MarginProfileInputs,
+): Promise<MarginProfile> {
+  return invoke<MarginProfile>("update_margin_profile", { profileId, body });
+}
+
+/** S428 — `DELETE /api/margin-profiles/:id`. Soft-delete (archive). */
+export async function archiveMarginProfile(profileId: string): Promise<void> {
+  await invoke<void>("archive_margin_profile", { profileId });
+}
+
+/** S428 — `POST /api/quote-pricing-jobs/:quote_id/buyer-partner`. Assign
+ * (or clear, `partnerId: null`) the buyer partner; re-prices the job. */
+export async function setQuoteBuyerPartner(
+  quoteId: string,
+  partnerId: string | null,
+): Promise<void> {
+  await invoke<unknown>("set_quote_buyer_partner", {
+    quoteId,
+    body: { partner_id: partnerId },
+  });
+}
+
+/** S428 — `POST /api/quote-pricing-jobs/:quote_id/margin-override`. Set or
+ * clear (`marginPct: null`) the operator override; re-prices. A below-floor
+ * override needs `confirmBelowFloor: true` + a `reason`; otherwise the call
+ * rejects with a `below_margin_floor` 409 (the caller shows the modal). */
+export async function overrideQuoteMargin(
+  quoteId: string,
+  marginPct: number | null,
+  confirmBelowFloor = false,
+  reason: string | null = null,
+): Promise<void> {
+  await invoke<unknown>("override_quote_margin", {
+    quoteId,
+    body: {
+      margin_pct: marginPct,
+      confirm_below_floor: confirmBelowFloor,
+      reason,
+    },
   });
 }
 
@@ -3614,6 +3725,17 @@ export interface PricingJobDetail extends PricingJobRow {
   /** S427 — operator lead-time override in days, or `null` when no
    * override is set. Effective lead-time = override ?? computed. */
   lead_time_override_days: number | null;
+  /** S428 — buyer partner whose customer_type drives the margin profile. */
+  buyer_partner_id: string | null;
+  /** S428 — operator margin markup override (fraction, e.g. 0.30), or
+   * `null` when the profile/global default applies. */
+  margin_override_pct: number | null;
+  /** S428 — `true` when the priced margin is below the effective floor
+   * (red banner + DEAL is blocked). */
+  margin_below_floor: boolean;
+  /** S428 — the effective floor (fraction) the margin was measured
+   * against, or `null` on the global path / pre-pricing. */
+  margin_floor_pct: number | null;
 }
 
 /** S349 / PR-40 (U1) — fetch the full detail for one pricing job.

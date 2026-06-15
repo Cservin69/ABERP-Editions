@@ -568,6 +568,86 @@ pub async fn override_quote_lead_time(
     forward_post(&state, &path, body).await.map(|_| ())
 }
 
+// ── S428 — margin profiles master data + per-quote margin controls ───
+//
+// Mirrors the machine CRUD bridge. `profile_id` is the server-minted
+// `mp_<ULID>`; reuse [`validate_partner_id`] for its generic id-shape check.
+
+/// `GET /api/margin-profiles` — the Margin Profiles master-data list.
+#[tauri::command]
+pub async fn list_margin_profiles(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/margin-profiles", true).await
+}
+
+/// `GET /api/margin-profiles/:id` — single profile for the edit form.
+#[tauri::command]
+pub async fn get_margin_profile(
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> Result<Value, String> {
+    validate_partner_id(&profile_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/margin-profiles/{profile_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// `POST /api/margin-profiles` — create from the form inputs.
+#[tauri::command]
+pub async fn create_margin_profile(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/margin-profiles", body).await
+}
+
+/// `PUT /api/margin-profiles/:id` — update.
+#[tauri::command]
+pub async fn update_margin_profile(
+    state: State<'_, AppState>,
+    profile_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_partner_id(&profile_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/margin-profiles/{profile_id}");
+    forward_put(&state, &path, body).await
+}
+
+/// `DELETE /api/margin-profiles/:id` — archive (soft). Returns `null` on 204.
+#[tauri::command]
+pub async fn archive_margin_profile(
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> Result<(), String> {
+    validate_partner_id(&profile_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/margin-profiles/{profile_id}");
+    forward_delete(&state, &path).await
+}
+
+/// `POST /api/quote-pricing-jobs/:quote_id/buyer-partner` — assign (or
+/// clear, `partner_id: null`) the buyer partner whose customer_type drives
+/// the margin profile; re-prices the job.
+#[tauri::command]
+pub async fn set_quote_buyer_partner(
+    state: State<'_, AppState>,
+    quote_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-pricing-jobs/{quote_id}/buyer-partner");
+    forward_post(&state, &path, body).await
+}
+
+/// `POST /api/quote-pricing-jobs/:quote_id/margin-override` — set or clear
+/// (`margin_pct: null`) the operator margin override; re-prices the job. A
+/// below-floor override without `confirm_below_floor: true` returns 409.
+#[tauri::command]
+pub async fn override_quote_margin(
+    state: State<'_, AppState>,
+    quote_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-pricing-jobs/{quote_id}/margin-override");
+    forward_post(&state, &path, body).await
+}
+
 // ── S257 / PR-246 — Settings → Adapters CRUD ─────────────────────────
 
 /// `GET /api/adapters` — list persisted adapters joined with live

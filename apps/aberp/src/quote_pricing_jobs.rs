@@ -302,6 +302,17 @@ ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS customer_company VARCHAR
 -- NULL until re-priced / overridden.
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS lead_time_days INTEGER;
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS lead_time_override_days INTEGER;
+-- S428 — customer-type margin profiles. `buyer_partner_id` links the job
+-- to the partner whose customer_type drives the profile; `margin_override_pct`
+-- is the operator's manual markup override (NULL = profile/global default);
+-- `margin_below_floor` flags a quote priced under the effective floor (the
+-- DEAL saga reads it as a hard block); `margin_floor_pct` is that effective
+-- floor (for the operator banner). All nullable, no DEFAULT per
+-- [[no-sql-specific]]; existing rows read back NULL until re-priced.
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS buyer_partner_id VARCHAR;
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS margin_override_pct DOUBLE;
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS margin_below_floor BOOLEAN;
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS margin_floor_pct DOUBLE;
 ";
 
 /// Idempotent — call at every writer entry.
@@ -1223,6 +1234,16 @@ pub struct JobDetail {
     pub lead_time_days: Option<u32>,
     /// S427 — operator override (calendar days), NULL = use computed.
     pub lead_time_override_days: Option<u32>,
+    /// S428 — buyer partner whose customer_type drives the margin profile.
+    pub buyer_partner_id: Option<String>,
+    /// S428 — operator margin markup override, NULL = profile/global default.
+    pub margin_override_pct: Option<f64>,
+    /// S428 — `true` when the priced margin is below the effective floor
+    /// (coerced from NULL → false for pre-S428 rows).
+    pub margin_below_floor: bool,
+    /// S428 — the effective floor the quote was measured against (for the
+    /// operator banner), NULL pre-pricing / on the global path.
+    pub margin_floor_pct: Option<f64>,
 }
 
 /// S349 / PR-40 (U1) — read one job row + its artifacts for the detail
@@ -1244,7 +1265,8 @@ pub fn get_job_detail(
                     attempt_n, failure_kind,
                     cad_filename, feature_graph_json, breakdown_json, pdf_path,
                     valid_until_iso, customer_company,
-                    lead_time_days, lead_time_override_days
+                    lead_time_days, lead_time_override_days,
+                    buyer_partner_id, margin_override_pct, margin_below_floor, margin_floor_pct
                 FROM quote_pricing_jobs
                 WHERE quote_id = ? AND tenant_id = ?",
         )
@@ -1298,6 +1320,10 @@ pub fn get_job_detail(
             .ok()
             .flatten()
             .map(|v| v.max(0) as u32),
+        buyer_partner_id: r.get::<_, Option<String>>(23).ok().flatten(),
+        margin_override_pct: r.get::<_, Option<f64>>(24).ok().flatten(),
+        margin_below_floor: r.get::<_, Option<bool>>(25).ok().flatten().unwrap_or(false),
+        margin_floor_pct: r.get::<_, Option<f64>>(26).ok().flatten(),
     }))
 }
 
@@ -1366,6 +1392,107 @@ pub fn set_lead_time_override(
         )
         .context("set_lead_time_override UPDATE")?;
     Ok(changed > 0)
+}
+
+/// S428 — set or clear (`None`) the buyer partner whose customer_type
+/// drives the margin profile. Returns `false` if no such row exists.
+pub fn set_buyer_partner(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    buyer_partner_id: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    ensure_schema(conn)?;
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format buyer_partner updated_at")?;
+    let changed = conn
+        .execute(
+            "UPDATE quote_pricing_jobs SET buyer_partner_id = ?, updated_at = ? \
+             WHERE quote_id = ? AND tenant_id = ?",
+            params![buyer_partner_id, ts, quote_id, tenant_id],
+        )
+        .context("set_buyer_partner UPDATE")?;
+    Ok(changed > 0)
+}
+
+/// S428 — set or clear (`None`) the operator's manual margin override.
+/// Returns `false` if no such row exists.
+pub fn set_margin_override(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    margin_override_pct: Option<f64>,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    ensure_schema(conn)?;
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format margin_override updated_at")?;
+    let changed = conn
+        .execute(
+            "UPDATE quote_pricing_jobs SET margin_override_pct = ?, updated_at = ? \
+             WHERE quote_id = ? AND tenant_id = ?",
+            params![margin_override_pct, ts, quote_id, tenant_id],
+        )
+        .context("set_margin_override UPDATE")?;
+    Ok(changed > 0)
+}
+
+/// S428 — persist a re-priced breakdown + its margin-floor verdict. Used by
+/// the buyer-partner and margin-override re-price endpoints (the daemon's
+/// first pricing uses [`set_priced`] + this in the same pass).
+pub fn set_margin_result(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    breakdown_json: &str,
+    total_price_eur: f64,
+    margin_below_floor: bool,
+    margin_floor_pct: Option<f64>,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    ensure_schema(conn)?;
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format margin_result updated_at")?;
+    let changed = conn
+        .execute(
+            "UPDATE quote_pricing_jobs SET breakdown_json = ?, total_price_eur = ?, \
+             margin_below_floor = ?, margin_floor_pct = ?, updated_at = ? \
+             WHERE quote_id = ? AND tenant_id = ?",
+            params![
+                breakdown_json,
+                total_price_eur,
+                margin_below_floor,
+                margin_floor_pct,
+                ts,
+                quote_id,
+                tenant_id
+            ],
+        )
+        .context("set_margin_result UPDATE")?;
+    Ok(changed > 0)
+}
+
+/// S428 — is this quote flagged below the margin floor? Read by the DEAL
+/// saga as a hard precondition ([[trust-code-not-operator]]). Returns
+/// `false` when the row is absent or the column is NULL (pre-S428 / global
+/// path) — the floor block only fires on an explicit `true`.
+pub fn margin_below_floor(conn: &Connection, quote_id: &str, tenant_id: &str) -> Result<bool> {
+    ensure_schema(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT margin_below_floor FROM quote_pricing_jobs \
+             WHERE quote_id = ? AND tenant_id = ?",
+        )
+        .context("prepare margin_below_floor")?;
+    let mut rows = stmt.query(params![quote_id, tenant_id])?;
+    let Some(r) = rows.next()? else {
+        return Ok(false);
+    };
+    Ok(r.get::<_, Option<bool>>(0).ok().flatten().unwrap_or(false))
 }
 
 /// S427 — sum committed/pending machining hours by machine family across

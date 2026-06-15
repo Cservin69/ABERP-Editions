@@ -213,6 +213,8 @@ export const MODULES: ErpModule[] = [
       // S427 — quoting-machine master data (name, family, envelope,
       // capacity). Lives beside partners + products in Master Data.
       { id: "machines", label: "Machines" },
+      // S428 — customer-type margin profiles.
+      { id: "margin-profiles", label: "Margin profiles" },
     ],
   },
   {
@@ -405,6 +407,8 @@ export type MaintenanceTileStatusKind =
   | "ProductCount"
   // S427 — count of active (non-archived) quoting machines.
   | "MachineCount"
+  // S428 — count of active (non-archived) margin profiles.
+  | "MarginProfileCount"
   | "BankAccountCount"
   | "NavCredStatus"
   // S180 / PR-180 — count of already-restored invoices in the
@@ -488,6 +492,16 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Géppark: család, befoglaló méret, kapacitás",
     description_en: "Machine park: family, envelope, capacity",
     statusKind: "MachineCount",
+  },
+  // S428 — customer-type margin profiles tile.
+  {
+    moduleId: "master-data",
+    route: "margin-profiles",
+    label_hu: "Árrés profilok",
+    label_en: "Margin profiles",
+    description_hu: "Vevőtípusonkénti cél- és minimum árrés",
+    description_en: "Target + floor margin per customer type",
+    statusKind: "MarginProfileCount",
   },
   {
     moduleId: "settings",
