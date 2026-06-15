@@ -69,6 +69,8 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "inventory-balances",
   // S281 / PR-266 — storefront email-relay queue inspector.
   "email-relay-queue",
+  // S424 / session-424 — cross-domain audit-activity log.
+  "audit-events",
 ];
 
 // PR-79 / session 102 — closed set of AREA-landing routes. These are
@@ -126,6 +128,9 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   "inventory-balances": "quoting",
   // S281 / PR-266 — storefront email-relay queue inspector.
   "email-relay-queue": "email-relay",
+  // S424 / session-424 — cross-domain audit-activity log (own module,
+  // operational area).
+  "audit-events": "audit",
 };
 
 // The expected area for each AppRoute. The two-area usage-frequency
@@ -166,6 +171,9 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   "inventory-balances": "maintenance",
   // S281 / PR-266 — storefront email-relay queue inspector.
   "email-relay-queue": "maintenance",
+  // S424 / session-424 — audit-activity log (operational, daily-useful
+  // forensic tool).
+  "audit-events": "operational",
 };
 
 // Closed-vocab set of accepted status kinds on a maintenance tile.
@@ -352,7 +360,14 @@ describe("modulesInArea + defaultRouteForArea", () => {
     const mt = modulesInArea("maintenance");
     // S232 / PR-228 — "production" (Stage 3 Phase γ Work Orders) joins
     // the operational area after statistics per the registry order.
-    expect(op.map((m) => m.id)).toEqual(["invoicing", "statistics", "production"]);
+    // S424 / session-424 — "audit" joins the operational area after
+    // production per the registry order.
+    expect(op.map((m) => m.id)).toEqual([
+      "invoicing",
+      "statistics",
+      "production",
+      "audit",
+    ]);
     // S267 / PR-256 — new `quoting` module joins maintenance after Settings.
     // S281 / PR-266 — new `email-relay` module joins after Quoting.
     expect(mt.map((m) => m.id)).toEqual([

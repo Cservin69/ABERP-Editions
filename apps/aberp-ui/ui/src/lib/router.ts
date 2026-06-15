@@ -57,7 +57,13 @@ export type AppRoute =
   // queue (ADR-0007). Read-only list of `outbound_email_queue` rows
   // with state filters (queued/sending/sent/failed). Lives under the
   // maintenance area alongside the other operational queues.
-  | "email-relay-queue";
+  | "email-relay-queue"
+  // S424 / session-424 — cross-domain audit-events screen. The general,
+  // filterable view of the WHOLE ledger ("all operator activity, any
+  // domain, paginated + filtered"). Operational area (a daily-useful
+  // forensic tool — "what happened to quote X / what did I do today" in
+  // one click, [[hulye-biztos]]), distinct from the per-invoice timeline.
+  | "audit-events";
 
 /** Default route the SPA falls back to on first paint (or on a hash
  * with an unknown slug). The Invoices list was the only screen
@@ -131,6 +137,8 @@ export function parseRoute(hash: string): AppRoute {
       return "inventory-balances";
     case "email-relay-queue":
       return "email-relay-queue";
+    case "audit-events":
+      return "audit-events";
     default:
       return DEFAULT_ROUTE;
   }

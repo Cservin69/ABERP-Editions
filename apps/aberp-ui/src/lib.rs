@@ -265,6 +265,9 @@ pub fn run() {
             commands::list_invoices,
             commands::get_invoice,
             commands::get_audit,
+            // S424 / session-424 — cross-domain audit-events screen.
+            commands::list_audit_events,
+            commands::get_audit_event,
             commands::download_invoice_pdf,
             commands::issue_invoice,
             commands::submit_invoice_to_nav,

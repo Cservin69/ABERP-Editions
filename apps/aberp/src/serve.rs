@@ -71,7 +71,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aberp_audit_ledger::{Actor, Entry, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{
+    compute_entry_hash, Actor, Entry, EventKind, Ledger, LedgerVerifyError, TenantId, VerifyError,
+};
 use aberp_billing::{self as billing, BillingStore, Currency, DuckDbBillingStore, ReadyInvoice};
 use aberp_nav_transport::{
     operations::{find_all_technical_validations, TechnicalValidation},
@@ -2877,6 +2879,14 @@ fn build_router(state: AppState) -> Router {
             post(handle_set_restored_partner),
         )
         .route("/audit/:invoice_id", get(handle_get_audit))
+        // S424 / session-424 — cross-domain audit-events screen. The
+        // general, filterable view of the WHOLE ledger (any domain,
+        // paginated), generalising `/audit/:invoice_id` (one invoice's
+        // chain). List rows omit payloads (NAV XML blobs are MBs — the
+        // design report §3.3); the full single entry is fetched lazily
+        // on row-expand via `/api/audit-events/:seq`.
+        .route("/api/audit-events", get(handle_audit_events))
+        .route("/api/audit-events/:seq", get(handle_audit_event_detail))
         // PR-46α / session-62 — first-run setup route. Accepts the
         // four NAV credential artifacts and writes them to the OS
         // keychain. In `NeedsSetup` mode it bypasses bearer-auth (the
@@ -20539,6 +20549,505 @@ fn extract_invoice_id(entry: &Entry) -> Option<String> {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// S424 / session-424 — cross-domain audit-events screen
+//
+// `GET /api/audit-events` is the general, filterable view of the WHOLE
+// ledger — it generalises `/audit/:invoice_id` (one invoice's chain)
+// into "all operator activity, any domain, paginated + filtered". The
+// audit-screen design report (docs/findings/audit-screen-design-2026-06-15.md)
+// is authoritative; this is its §3 wire shape.
+//
+// Load-bearing constraints (design §2.1 + risk #1, [[no-sql-specific]]):
+//   * NO new DB index. The ledger has no secondary index (S341 dropped
+//     UNIQUE(seq) — duckdb#23046; S410 dropped CHECKs). Every read is a
+//     full seq-order scan; filter/sort/paginate happen HERE in Rust.
+//   * List rows OMIT payloads. Several payloads embed base64 NAV XML
+//     (tens of KB each); a 50-row page of them would be multiple MB. The
+//     row carries a one-line `summary` + `subject`; the full payload is
+//     fetched lazily on row-expand via `/api/audit-events/:seq`.
+//   * Per-row `hash_ok` (invariant 3, independently checkable via
+//     `compute_entry_hash`) + a whole-ledger `verified` verdict (one
+//     `verify_chain()` per request). The SPA renders rows at/after a
+//     divergence as ✗ regardless of `hash_ok`.
+//
+// Deliberate rule-13 trim from the design's §3.2/§3.3: `before_seq` +
+// `prev_cursor` are dropped. The SPA paginates newest-first and appends
+// older rows via `next_cursor` — there is no backward-pagination
+// consumer, so the speculative surface is deleted rather than shipped.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Heartbeat kinds excluded from the audit-events list by default. The
+/// storefront-poll heartbeat fires at the daemon cadence and would bury
+/// every operator-meaningful entry; the dashboard recent-activity tile
+/// already filters these. `?heartbeats=true` opts back in (design §4.5).
+fn is_heartbeat_kind(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::QuoteIntakePollAttempted | EventKind::QuoteIntakePollCompleted
+    )
+}
+
+/// Query params for `GET /api/audit-events`. All optional + defaulted;
+/// the SPA omits absent facets so axum's scalar `Query` decode never
+/// sees an empty value to misparse.
+#[derive(Debug, Deserialize)]
+pub struct AuditEventsQuery {
+    /// Inclusive calendar-day lower bound (YYYY-MM-DD or any ISO-8601
+    /// prefix; compared on the entry's RFC3339 wall-clock DATE).
+    pub from: Option<String>,
+    /// Inclusive calendar-day upper bound.
+    pub to: Option<String>,
+    /// Comma-joined `EventKind::as_str()` values, e.g.
+    /// `invoice.payment_recorded,quote.operator_refused`.
+    pub kinds: Option<String>,
+    /// Comma-joined domain PREFIXES (the `as_str` segment before the
+    /// first `.`), e.g. `invoice,quote`. The SPA's domain chips map to
+    /// prefix sets (the compliance chip → 7 prefixes) — this is the
+    /// chip's server-authoritative filter so `total_matched` is correct
+    /// and pagination is meaningful (design §4.5).
+    pub domains: Option<String>,
+    /// Substring match across every subject-ish payload id (own id AND
+    /// chain-base id — see `audit_summary::subject_matches`).
+    pub subject: Option<String>,
+    /// Substring match on `actor.user_id` (the operator identity).
+    pub operator: Option<String>,
+    /// Free-text needle across kind + actor + summary + subject + the
+    /// payload JSON text.
+    pub q: Option<String>,
+    /// `"seq"` (default) | `"occurred_at"`.
+    pub sort: Option<String>,
+    /// `"desc"` (default) | `"asc"`.
+    pub dir: Option<String>,
+    /// Forward cursor: return rows positioned AFTER this seq in the
+    /// active sort order.
+    pub after_seq: Option<u64>,
+    /// Page size, default 50, clamped 1..=200.
+    pub limit: Option<u32>,
+    /// Include the storefront-poll heartbeat kinds (default false).
+    pub heartbeats: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditEventsResponse {
+    events: Vec<AuditEventRow>,
+    page: PageInfo,
+    chain: ChainStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditEventRow {
+    /// `aud_<ULID>`.
+    id: String,
+    seq: u64,
+    /// `EventKind::as_str()` — the domain-prefixed wire string the SPA
+    /// chips key on.
+    kind: String,
+    /// RFC3339 wall-clock.
+    occurred_at: String,
+    /// `actor.user_id`.
+    actor: String,
+    /// Resolved subject id (invoice_id / quote_id / …) for the Subject
+    /// column; `None` for subjectless system entries.
+    subject: Option<String>,
+    /// ONE-LINE kind-aware summary (NOT the full payload). Empty when no
+    /// verified summariser exists — the SPA renders the kind label.
+    summary: String,
+    /// Per-entry integrity: `compute_entry_hash(entry) == entry_hash`.
+    hash_ok: bool,
+    /// Whether a non-empty payload exists to drill into.
+    has_payload: bool,
+    /// 64-char hex chain anchors for the expanded row.
+    prev_hash_hex: String,
+    entry_hash_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PageInfo {
+    returned: u32,
+    /// Seq to pass as `after_seq` for the next (older) page; `None` on
+    /// the last page.
+    next_cursor: Option<u64>,
+    /// Count of rows matching the filters (the full scan is in hand).
+    total_matched: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChainStatus {
+    /// Whole chain genesis..head intact?
+    verified: bool,
+    head_seq: u64,
+    /// `Some(seq)` + `reason` when `verify_chain` failed.
+    first_divergence_seq: Option<u64>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditEventDetailView {
+    seq: u64,
+    kind: String,
+    occurred_at: String,
+    actor: String,
+    subject: Option<String>,
+    hash_ok: bool,
+    prev_hash_hex: String,
+    entry_hash_hex: String,
+    /// The FULL typed payload as raw JSON — fetched lazily on row-expand.
+    /// The SPA redacts sensitive fields client-side before render
+    /// (Ervin 2026-06-15: redact-by-default + per-use show-raw confirm).
+    payload: serde_json::Value,
+}
+
+/// Map a `verify_chain` failure to `(first_divergence_seq, reason)`.
+fn verify_error_divergence(e: &LedgerVerifyError) -> (Option<u64>, String) {
+    match e {
+        LedgerVerifyError::Read(inner) => (None, format!("failed to read ledger: {inner}")),
+        LedgerVerifyError::Chain(VerifyError::OutOfOrder { found, .. }) => {
+            (Some(*found), e.to_string())
+        }
+        LedgerVerifyError::Chain(VerifyError::ChainBroken { seq }) => (Some(*seq), e.to_string()),
+        LedgerVerifyError::Chain(VerifyError::TamperedAt { seq }) => (Some(*seq), e.to_string()),
+    }
+}
+
+/// RFC3339 wall-clock string for an entry; falls back to the time-crate
+/// `Display` if formatting fails (never observed — the storage layer
+/// already round-trips RFC3339).
+fn entry_rfc3339(entry: &Entry) -> String {
+    entry
+        .time_wall
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| entry.time_wall.to_string())
+}
+
+/// Calendar-day (YYYY-MM-DD) of an entry, for the `from`/`to` bounds.
+fn entry_date(entry: &Entry) -> String {
+    entry_rfc3339(entry).chars().take(10).collect()
+}
+
+/// Free-text `q` predicate: needle (already lowercased) against kind +
+/// actor + summary + subject + the payload JSON text. The payload-text
+/// arm is the design's named haystack (§3.2) — it finds a recipient
+/// email or NAV transaction id that the one-line summary omits. Lossy
+/// UTF-8 over the bytes; acceptable full-scan cost for small per-tenant
+/// ledgers (design risk #4).
+fn entry_matches_freetext(entry: &Entry, needle_lower: &str) -> bool {
+    if entry.kind.as_str().to_lowercase().contains(needle_lower) {
+        return true;
+    }
+    if entry.actor.user_id.to_lowercase().contains(needle_lower) {
+        return true;
+    }
+    if crate::audit_summary::summary_of(entry)
+        .to_lowercase()
+        .contains(needle_lower)
+    {
+        return true;
+    }
+    if let Some(subject) = crate::audit_summary::subject_of(entry) {
+        if subject.to_lowercase().contains(needle_lower) {
+            return true;
+        }
+    }
+    String::from_utf8_lossy(&entry.payload)
+        .to_lowercase()
+        .contains(needle_lower)
+}
+
+/// Project one entry into a list row (payload OMITTED — design §3.3).
+fn audit_event_row_of(entry: &Entry) -> AuditEventRow {
+    AuditEventRow {
+        id: entry.id.to_prefixed_string(),
+        seq: entry.seq.as_u64(),
+        kind: entry.kind.as_str().to_string(),
+        occurred_at: entry_rfc3339(entry),
+        actor: entry.actor.user_id.clone(),
+        subject: crate::audit_summary::subject_of(entry),
+        summary: crate::audit_summary::summary_of(entry),
+        hash_ok: compute_entry_hash(entry) == entry.entry_hash,
+        has_payload: !entry.payload.is_empty(),
+        prev_hash_hex: hex::encode(entry.prev_hash.as_bytes()),
+        entry_hash_hex: hex::encode(entry.entry_hash.as_bytes()),
+    }
+}
+
+/// Open the ledger, scan + verify, then filter / sort / paginate in Rust
+/// (no index — [[no-sql-specific]]). Whole-chain verify runs once per
+/// request (O(N), N small); per-row `hash_ok` is the independently
+/// checkable invariant 3.
+fn audit_events_request(state: &AppState, query: &AuditEventsQuery) -> Result<AuditEventsResponse> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute")?;
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
+        .context("open audit ledger for audit-events")?;
+    let entries = ledger.entries().context("read audit ledger entries")?;
+
+    // ── Whole-chain verdict (design §3.4). head_seq is the max seq. ──
+    let head_seq = entries.last().map(|e| e.seq.as_u64()).unwrap_or(0);
+    let chain = match ledger.verify_chain() {
+        Ok(_) => ChainStatus {
+            verified: true,
+            head_seq,
+            first_divergence_seq: None,
+            reason: None,
+        },
+        Err(e) => {
+            let (first_divergence_seq, reason) = verify_error_divergence(&e);
+            ChainStatus {
+                verified: false,
+                head_seq,
+                first_divergence_seq,
+                reason: Some(reason),
+            }
+        }
+    };
+
+    Ok(build_audit_events_response(&entries, query, chain))
+}
+
+/// Pure filter / sort / paginate / row-projection over an entry slice +
+/// a precomputed [`ChainStatus`]. Split out of `audit_events_request` so
+/// the load-bearing logic is unit-testable without an `AppState` or an
+/// open `Ledger` (CLAUDE.md rule 9 — the filter/sort/paginate matrix is
+/// pinned directly, not through a heavy serve harness).
+fn build_audit_events_response(
+    entries: &[Entry],
+    query: &AuditEventsQuery,
+    chain: ChainStatus,
+) -> AuditEventsResponse {
+    // ── Pre-compute the filter needles once (not per-entry). ──
+    let include_heartbeats = query.heartbeats.unwrap_or(false);
+    let csv_set = |o: &Option<String>| -> Option<std::collections::HashSet<String>> {
+        o.as_ref().map(|s| {
+            s.split(',')
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect()
+        })
+    };
+    let kinds_filter = csv_set(&query.kinds);
+    let domains_filter = csv_set(&query.domains);
+    let trimmed_lower = |o: &Option<String>| -> Option<String> {
+        o.as_ref()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+    };
+    let operator_needle = trimmed_lower(&query.operator);
+    let subject_needle = trimmed_lower(&query.subject);
+    let q_needle = trimmed_lower(&query.q);
+    let day_bound = |o: &Option<String>| -> Option<String> {
+        o.as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(10).collect::<String>())
+    };
+    let from_date = day_bound(&query.from);
+    let to_date = day_bound(&query.to);
+
+    // ── Filter (full scan in Rust). ──
+    let mut matched: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| {
+            if !include_heartbeats && is_heartbeat_kind(&e.kind) {
+                return false;
+            }
+            if let Some(kinds) = &kinds_filter {
+                if !kinds.contains(e.kind.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(domains) = &domains_filter {
+                let prefix = e.kind.as_str().split('.').next().unwrap_or("");
+                if !domains.contains(prefix) {
+                    return false;
+                }
+            }
+            if let Some(op) = &operator_needle {
+                if !e.actor.user_id.to_lowercase().contains(op.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(subj) = &subject_needle {
+                if !crate::audit_summary::subject_matches(e, subj) {
+                    return false;
+                }
+            }
+            if from_date.is_some() || to_date.is_some() {
+                let date = entry_date(e);
+                if let Some(f) = &from_date {
+                    if date.as_str() < f.as_str() {
+                        return false;
+                    }
+                }
+                if let Some(t) = &to_date {
+                    if date.as_str() > t.as_str() {
+                        return false;
+                    }
+                }
+            }
+            if let Some(needle) = &q_needle {
+                if !entry_matches_freetext(e, needle) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    let total_matched = matched.len() as u32;
+
+    // ── Sort (seq | occurred_at; default seq). Tie-break on seq so the
+    //    order is deterministic across refreshes (CLAUDE.md rule 12). ──
+    let descending = query.dir.as_deref().map(|d| d != "asc").unwrap_or(true);
+    match query.sort.as_deref() {
+        Some("occurred_at") => {
+            matched.sort_by(|a, b| a.time_wall.cmp(&b.time_wall).then(a.seq.cmp(&b.seq)))
+        }
+        _ => matched.sort_by_key(|a| a.seq),
+    }
+    if descending {
+        matched.reverse();
+    }
+
+    // ── Seq-cursor pagination (forward only). Position-based so it is
+    //    correct for either sort order given a stable filter set; if the
+    //    cursor row was filtered out between pages it restarts from the
+    //    top (safe — no skip/dup within a stable filter). ──
+    let limit = query.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let start = match query.after_seq {
+        Some(cursor) => matched
+            .iter()
+            .position(|e| e.seq.as_u64() == cursor)
+            .map(|i| i + 1)
+            .unwrap_or(0),
+        None => 0,
+    };
+    let remaining = &matched[start.min(matched.len())..];
+    let page: Vec<&Entry> = remaining.iter().take(limit).copied().collect();
+    let returned = page.len() as u32;
+    let next_cursor = if remaining.len() > page.len() {
+        page.last().map(|e| e.seq.as_u64())
+    } else {
+        None
+    };
+
+    let events = page.iter().map(|e| audit_event_row_of(e)).collect();
+
+    AuditEventsResponse {
+        events,
+        page: PageInfo {
+            returned,
+            next_cursor,
+            total_matched,
+        },
+        chain,
+    }
+}
+
+/// `GET /api/audit-events/:seq` — the single FULL entry (payload
+/// included) for the row-expand drill-down. Returns `Ok(None)` → 404
+/// when no entry carries that seq.
+fn audit_event_detail_request(state: &AppState, seq: u64) -> Result<Option<AuditEventDetailView>> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute")?;
+    let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
+        .context("open audit ledger for audit-event detail")?;
+    let entries = ledger.entries().context("read audit ledger entries")?;
+    let entry = match entries.iter().find(|e| e.seq.as_u64() == seq) {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    // Full typed payload as raw JSON; a malformed payload (DB tampering)
+    // falls back to Null rather than panicking (CLAUDE.md rule 12).
+    let mut payload = serde_json::from_slice::<serde_json::Value>(&entry.payload)
+        .unwrap_or(serde_json::Value::Null);
+    // Parity with `audit_view_of`: graft the parsed NAV technical-
+    // validation messages onto an InvoiceAckStatus payload.
+    if entry.kind == EventKind::InvoiceAckStatus {
+        if let Some(messages) = parse_ack_technical_validations(&payload) {
+            if let serde_json::Value::Object(ref mut map) = payload {
+                map.insert(
+                    "technical_validation_messages".to_string(),
+                    serde_json::json!(messages
+                        .into_iter()
+                        .map(TechnicalValidationBody::from)
+                        .collect::<Vec<_>>()),
+                );
+            }
+        }
+    }
+    Ok(Some(AuditEventDetailView {
+        seq: entry.seq.as_u64(),
+        kind: entry.kind.as_str().to_string(),
+        occurred_at: entry_rfc3339(entry),
+        actor: entry.actor.user_id.clone(),
+        subject: crate::audit_summary::subject_of(entry),
+        hash_ok: compute_entry_hash(entry) == entry.entry_hash,
+        prev_hash_hex: hex::encode(entry.prev_hash.as_bytes()),
+        entry_hash_hex: hex::encode(entry.entry_hash.as_bytes()),
+        payload,
+    }))
+}
+
+/// `GET /api/audit-events` handler — auth-gated, blocking scan offloaded.
+async fn handle_audit_events(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(query): Query<AuditEventsQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || audit_events_request(&state_for_task, &query)).await;
+    match result {
+        Ok(Ok(resp)) => Json(resp).into_response(),
+        Ok(Err(e)) => internal_error("audit_events_request", e),
+        Err(join_err) => internal_error(
+            "audit_events_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+/// `GET /api/audit-events/:seq` handler — single full entry for expand.
+async fn handle_audit_event_detail(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(seq): AxumPath<u64>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || audit_event_detail_request(&state_for_task, seq)).await;
+    match result {
+        Ok(Ok(Some(view))) => Json(view).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body(format!("no audit ledger entry at seq {seq}"))),
+        )
+            .into_response(),
+        Ok(Err(e)) => internal_error("audit_event_detail_request", e),
+        Err(join_err) => internal_error(
+            "audit_event_detail_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // S281 / PR-266 — Email-relay handlers (ADR-0007)
 // ──────────────────────────────────────────────────────────────────────
 
@@ -25147,5 +25656,384 @@ mod tests {
             validate_refuse_reason(&at_cap).unwrap().len(),
             REFUSE_REASON_MAX_CHARS
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // S424 / session-424 — audit-events screen: filter / sort /
+    // paginate / per-row hash_ok / whole-chain verdict / payload-omit.
+    // Exercises the pure `build_audit_events_response` over a real
+    // in-memory ledger (real hashes → hash_ok true + chain verified)
+    // and a synthetic 500-event ledger for the cursor walk.
+    // ──────────────────────────────────────────────────────────────
+
+    fn audit_query_default() -> AuditEventsQuery {
+        AuditEventsQuery {
+            from: None,
+            to: None,
+            kinds: None,
+            domains: None,
+            subject: None,
+            operator: None,
+            q: None,
+            sort: None,
+            dir: None,
+            after_seq: None,
+            limit: None,
+            heartbeats: None,
+        }
+    }
+
+    fn append_json(
+        ledger: &mut Ledger,
+        actor: &Actor,
+        kind: EventKind,
+        payload: serde_json::Value,
+    ) {
+        ledger
+            .append(
+                kind,
+                serde_json::to_vec(&payload).unwrap(),
+                actor.clone(),
+                None,
+            )
+            .unwrap();
+    }
+
+    fn entries_and_chain(ledger: &Ledger) -> (Vec<Entry>, ChainStatus) {
+        let entries = ledger.entries().unwrap();
+        let head_seq = entries.last().map(|e| e.seq.as_u64()).unwrap_or(0);
+        let chain = match ledger.verify_chain() {
+            Ok(_) => ChainStatus {
+                verified: true,
+                head_seq,
+                first_divergence_seq: None,
+                reason: None,
+            },
+            Err(e) => {
+                let (first_divergence_seq, reason) = verify_error_divergence(&e);
+                ChainStatus {
+                    verified: false,
+                    head_seq,
+                    first_divergence_seq,
+                    reason: Some(reason),
+                }
+            }
+        };
+        (entries, chain)
+    }
+
+    /// Seed a small mixed-domain ledger (6 non-heartbeat entries).
+    fn seed_mixed(ledger: &mut Ledger, actor: &Actor) {
+        append_json(
+            ledger,
+            actor,
+            EventKind::InvoiceDraftCreated,
+            serde_json::json!({"invoice_id":"INV-1","line_count":2}),
+        );
+        append_json(
+            ledger,
+            actor,
+            EventKind::InvoicePaymentRecorded,
+            serde_json::json!({"invoice_id":"INV-1","amount_minor":12345,"currency":"EUR","method":"BankTransfer"}),
+        );
+        append_json(
+            ledger,
+            actor,
+            EventKind::QuotePricingFetched,
+            serde_json::json!({"quote_id":"qpj_7","material_grade":"S235","quantity":5}),
+        );
+        append_json(
+            ledger,
+            actor,
+            EventKind::QuoteOperatorRefused,
+            serde_json::json!({"quote_id":"qpj_7","reason":"no stock"}),
+        );
+        append_json(
+            ledger,
+            actor,
+            EventKind::EmailRelaySent,
+            serde_json::json!({"queue_row_id":"q1","recipient":"a@b.hu"}),
+        );
+        append_json(
+            ledger,
+            actor,
+            EventKind::InvoiceStornoIssued,
+            serde_json::json!({"storno_invoice_id":"INV-1S","base_invoice_id":"INV-1","modification_index":1}),
+        );
+    }
+
+    #[test]
+    fn audit_events_filter_by_domain_quote() {
+        let (mut ledger, actor) = fixture_ledger();
+        seed_mixed(&mut ledger, &actor);
+        let (entries, chain) = entries_and_chain(&ledger);
+        let mut q = audit_query_default();
+        q.domains = Some("quote".to_string());
+        let resp = build_audit_events_response(&entries, &q, chain);
+        assert_eq!(resp.events.len(), 2);
+        assert_eq!(resp.page.total_matched, 2);
+        assert!(resp.events.iter().all(|e| e.kind.starts_with("quote.")));
+    }
+
+    #[test]
+    fn audit_events_filter_by_kind_exact() {
+        let (mut ledger, actor) = fixture_ledger();
+        seed_mixed(&mut ledger, &actor);
+        let (entries, chain) = entries_and_chain(&ledger);
+        let mut q = audit_query_default();
+        q.kinds = Some("invoice.payment_recorded".to_string());
+        let resp = build_audit_events_response(&entries, &q, chain);
+        assert_eq!(resp.events.len(), 1);
+        assert_eq!(resp.events[0].kind, "invoice.payment_recorded");
+        // Summary is the verified one-liner (not the raw payload).
+        assert!(resp.events[0].summary.contains("BankTransfer"));
+    }
+
+    #[test]
+    fn audit_events_filter_by_operator() {
+        let (mut ledger, _seed_actor) = fixture_ledger();
+        let alice = Actor::from_local_cli("s".to_string(), "alice");
+        let bob = Actor::from_local_cli("s".to_string(), "bob");
+        append_json(
+            &mut ledger,
+            &alice,
+            EventKind::InvoiceDraftCreated,
+            serde_json::json!({"invoice_id":"INV-A"}),
+        );
+        append_json(
+            &mut ledger,
+            &bob,
+            EventKind::InvoiceDraftCreated,
+            serde_json::json!({"invoice_id":"INV-B"}),
+        );
+        let (entries, chain) = entries_and_chain(&ledger);
+        let mut q = audit_query_default();
+        q.operator = Some("alice".to_string());
+        let resp = build_audit_events_response(&entries, &q, chain);
+        assert_eq!(resp.events.len(), 1);
+        assert_eq!(resp.events[0].actor, "alice");
+    }
+
+    #[test]
+    fn audit_events_subject_matches_base_invoice_on_storno() {
+        // [[hulye-biztos]] — searching INV-1 lands the draft, the
+        // payment, AND the storno (whose base_invoice_id is INV-1, even
+        // though its own id is INV-1S).
+        let (mut ledger, actor) = fixture_ledger();
+        seed_mixed(&mut ledger, &actor);
+        let (entries, chain) = entries_and_chain(&ledger);
+        let mut q = audit_query_default();
+        q.subject = Some("INV-1".to_string());
+        let resp = build_audit_events_response(&entries, &q, chain);
+        let kinds: Vec<&str> = resp.events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(resp.events.len(), 3);
+        assert!(kinds.contains(&"invoice.draft_created"));
+        assert!(kinds.contains(&"invoice.payment_recorded"));
+        assert!(kinds.contains(&"invoice.storno_issued"));
+    }
+
+    #[test]
+    fn audit_events_freetext_q_matches_summary_and_payload() {
+        let (mut ledger, actor) = fixture_ledger();
+        seed_mixed(&mut ledger, &actor);
+        let (entries, chain) = entries_and_chain(&ledger);
+        // "no stock" lives in the operator_refused summary.
+        let mut q1 = audit_query_default();
+        q1.q = Some("no stock".to_string());
+        let r1 = build_audit_events_response(&entries, &q1, chain.clone());
+        assert_eq!(r1.events.len(), 1);
+        assert_eq!(r1.events[0].kind, "quote.operator_refused");
+        // "a@b.hu" lives only in the email payload JSON (not the summary).
+        let mut q2 = audit_query_default();
+        q2.q = Some("a@b.hu".to_string());
+        let r2 = build_audit_events_response(&entries, &q2, chain);
+        assert_eq!(r2.events.len(), 1);
+        assert_eq!(r2.events[0].kind, "email.relay_sent");
+    }
+
+    #[test]
+    fn audit_events_heartbeats_excluded_by_default_included_on_flag() {
+        let (mut ledger, actor) = fixture_ledger();
+        append_json(
+            &mut ledger,
+            &actor,
+            EventKind::InvoiceDraftCreated,
+            serde_json::json!({"invoice_id":"INV-1"}),
+        );
+        append_json(
+            &mut ledger,
+            &actor,
+            EventKind::QuoteIntakePollAttempted,
+            serde_json::json!({"heartbeat":true}),
+        );
+        let (entries, chain) = entries_and_chain(&ledger);
+        let r_default =
+            build_audit_events_response(&entries, &audit_query_default(), chain.clone());
+        assert_eq!(r_default.events.len(), 1);
+        assert_eq!(r_default.events[0].kind, "invoice.draft_created");
+        let mut q = audit_query_default();
+        q.heartbeats = Some(true);
+        let r_all = build_audit_events_response(&entries, &q, chain);
+        assert_eq!(r_all.events.len(), 2);
+    }
+
+    #[test]
+    fn audit_events_date_bounds_filter_by_calendar_day() {
+        let (mut ledger, actor) = fixture_ledger();
+        seed_mixed(&mut ledger, &actor);
+        let (entries, chain) = entries_and_chain(&ledger);
+        // Entries are stamped "now". A far-future lower bound excludes
+        // everything; a far-past lower bound includes everything.
+        let mut q_future = audit_query_default();
+        q_future.from = Some("2999-01-01".to_string());
+        assert_eq!(
+            build_audit_events_response(&entries, &q_future, chain.clone())
+                .events
+                .len(),
+            0
+        );
+        let mut q_past = audit_query_default();
+        q_past.from = Some("2000-01-01".to_string());
+        assert_eq!(
+            build_audit_events_response(&entries, &q_past, chain.clone())
+                .events
+                .len(),
+            6
+        );
+        let mut q_to = audit_query_default();
+        q_to.to = Some("2000-01-01".to_string());
+        assert_eq!(
+            build_audit_events_response(&entries, &q_to, chain)
+                .events
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn audit_events_hash_ok_and_chain_verified_for_real_ledger() {
+        let (mut ledger, actor) = fixture_ledger();
+        seed_mixed(&mut ledger, &actor);
+        let (entries, chain) = entries_and_chain(&ledger);
+        let resp = build_audit_events_response(&entries, &audit_query_default(), chain);
+        assert!(resp.chain.verified);
+        assert_eq!(resp.chain.head_seq, 6);
+        assert!(resp.chain.first_divergence_seq.is_none());
+        assert!(resp.events.iter().all(|e| e.hash_ok));
+        // Hash anchors are 64-char hex (32-byte SHA-256).
+        assert!(resp.events.iter().all(|e| e.entry_hash_hex.len() == 64));
+    }
+
+    #[test]
+    fn audit_event_row_omits_payload_carries_summary_and_anchors() {
+        let (mut ledger, actor) = fixture_ledger();
+        seed_mixed(&mut ledger, &actor);
+        let (entries, chain) = entries_and_chain(&ledger);
+        let resp = build_audit_events_response(&entries, &audit_query_default(), chain);
+        let v = serde_json::to_value(&resp.events[0]).unwrap();
+        // The list row MUST NOT carry the payload (NAV XML blobs are MBs).
+        assert!(v.get("payload").is_none(), "list row must omit payload");
+        assert!(v.get("has_payload").is_some());
+        assert!(v.get("summary").is_some());
+        assert!(v.get("prev_hash_hex").is_some());
+        assert!(v.get("entry_hash_hex").is_some());
+    }
+
+    #[test]
+    fn audit_event_row_hash_ok_false_on_tamper() {
+        // A row whose stored entry_hash does not match the recomputed
+        // hash → hash_ok false (invariant 3, independently checkable).
+        let entry = Entry {
+            id: aberp_audit_ledger::EntryId::new(),
+            seq: aberp_audit_ledger::Sequence::FIRST,
+            prev_hash: aberp_audit_ledger::EntryHash::from_bytes([0u8; 32]),
+            time_wall: time::OffsetDateTime::UNIX_EPOCH,
+            time_mono: 0,
+            actor: Actor::from_local_cli("s".to_string(), "u"),
+            binary_hash: BinaryHash::from_bytes([0u8; 32]),
+            tenant_id: TenantId::new("t").unwrap(),
+            kind: EventKind::InvoiceDraftCreated,
+            payload: serde_json::to_vec(&serde_json::json!({"invoice_id":"INV-1"})).unwrap(),
+            idempotency_key: None,
+            entry_hash: aberp_audit_ledger::EntryHash::from_bytes([9u8; 32]),
+        };
+        let row = audit_event_row_of(&entry);
+        assert!(!row.hash_ok);
+        assert_eq!(row.kind, "invoice.draft_created");
+        assert_eq!(row.subject.as_deref(), Some("INV-1"));
+    }
+
+    #[test]
+    fn audit_events_sort_seq_default_desc_and_asc() {
+        let (mut ledger, actor) = fixture_ledger();
+        seed_mixed(&mut ledger, &actor);
+        let (entries, chain) = entries_and_chain(&ledger);
+        let desc = build_audit_events_response(&entries, &audit_query_default(), chain.clone());
+        // Default = newest first.
+        assert_eq!(desc.events.first().unwrap().seq, 6);
+        assert_eq!(desc.events.last().unwrap().seq, 1);
+        let mut q = audit_query_default();
+        q.dir = Some("asc".to_string());
+        let asc = build_audit_events_response(&entries, &q, chain);
+        assert_eq!(asc.events.first().unwrap().seq, 1);
+        assert_eq!(asc.events.last().unwrap().seq, 6);
+    }
+
+    #[test]
+    fn audit_events_pagination_covers_all_without_dup_or_gap() {
+        let (mut ledger, actor) = fixture_ledger();
+        for i in 0..500u32 {
+            append_json(
+                &mut ledger,
+                &actor,
+                EventKind::InvoiceDraftCreated,
+                serde_json::json!({"invoice_id": format!("INV-{i}"), "line_count": i}),
+            );
+        }
+        let (entries, chain) = entries_and_chain(&ledger);
+        let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut cursor: Option<u64> = None;
+        let mut pages = 0;
+        loop {
+            let mut q = audit_query_default();
+            q.limit = Some(50);
+            q.after_seq = cursor;
+            let resp = build_audit_events_response(&entries, &q, chain.clone());
+            assert_eq!(resp.page.total_matched, 500);
+            assert!(resp.events.len() <= 50);
+            for ev in &resp.events {
+                assert!(seen.insert(ev.seq), "duplicate seq {} across pages", ev.seq);
+            }
+            pages += 1;
+            assert!(pages <= 20, "pagination did not terminate");
+            match resp.page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 500);
+        assert_eq!(*seen.iter().next().unwrap(), 1);
+        assert_eq!(*seen.iter().next_back().unwrap(), 500);
+        assert_eq!(pages, 10);
+    }
+
+    #[test]
+    fn verify_error_divergence_maps_every_variant() {
+        let (s1, r1) =
+            verify_error_divergence(&LedgerVerifyError::Chain(VerifyError::TamperedAt {
+                seq: 5,
+            }));
+        assert_eq!(s1, Some(5));
+        assert!(r1.contains('5'));
+        let (s2, _) = verify_error_divergence(&LedgerVerifyError::Chain(VerifyError::OutOfOrder {
+            expected: 3,
+            found: 7,
+        }));
+        assert_eq!(s2, Some(7));
+        let (s3, _) =
+            verify_error_divergence(&LedgerVerifyError::Chain(VerifyError::ChainBroken {
+                seq: 9,
+            }));
+        assert_eq!(s3, Some(9));
     }
 }

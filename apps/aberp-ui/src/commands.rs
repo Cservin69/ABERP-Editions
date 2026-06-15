@@ -59,6 +59,69 @@ pub async fn get_audit(state: State<'_, AppState>, invoice_id: String) -> Result
     forward_get(&state, &path, true).await
 }
 
+/// S424 / session-424 — `GET /api/audit-events` (the cross-domain audit
+/// screen). Every filter facet is an optional query param assembled here;
+/// an absent / blank facet is omitted so the backend's scalar `Query`
+/// decode never sees an empty value. The backend does the index-free
+/// scan + filter + sort + paginate ([[no-sql-specific]]).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn list_audit_events(
+    state: State<'_, AppState>,
+    from: Option<String>,
+    to: Option<String>,
+    kinds: Option<String>,
+    domains: Option<String>,
+    subject: Option<String>,
+    operator: Option<String>,
+    q: Option<String>,
+    sort: Option<String>,
+    dir: Option<String>,
+    after_seq: Option<u64>,
+    limit: Option<u32>,
+    heartbeats: Option<bool>,
+) -> Result<Value, String> {
+    let mut params: Vec<String> = Vec::new();
+    let mut push_str = |k: &str, v: &Option<String>| {
+        if let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            params.push(format!("{k}={}", urlencode(s)));
+        }
+    };
+    push_str("from", &from);
+    push_str("to", &to);
+    push_str("kinds", &kinds);
+    push_str("domains", &domains);
+    push_str("subject", &subject);
+    push_str("operator", &operator);
+    push_str("q", &q);
+    push_str("sort", &sort);
+    push_str("dir", &dir);
+    if let Some(n) = after_seq {
+        params.push(format!("after_seq={n}"));
+    }
+    if let Some(n) = limit {
+        params.push(format!("limit={n}"));
+    }
+    if let Some(b) = heartbeats {
+        params.push(format!("heartbeats={b}"));
+    }
+    let path = if params.is_empty() {
+        "/api/audit-events".to_string()
+    } else {
+        format!("/api/audit-events?{}", params.join("&"))
+    };
+    forward_get(&state, &path, true).await
+}
+
+/// S424 — `GET /api/audit-events/:seq` — the single FULL entry (payload
+/// included) for the row-expand drill-down. The SPA redacts sensitive
+/// payload fields client-side before render.
+#[tauri::command]
+pub async fn get_audit_event(state: State<'_, AppState>, seq: u64) -> Result<Value, String> {
+    let path = format!("/api/audit-events/{seq}");
+    forward_get(&state, &path, true).await
+}
+
 /// PR-44ε.UI / session-58 — `GET /invoices/<id>/pdf`; returns the
 /// raw PDF bytes for the SPA's "Download PDF" button on the invoice
 /// detail modal. Unlike the other commands here, the response body

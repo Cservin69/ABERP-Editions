@@ -41,6 +41,10 @@ export type ErpModuleId =
   | "invoicing"
   | "statistics"
   | "production"
+  // S424 / session-424 — cross-domain audit-activity log. Operational
+  // area (daily-useful forensic tool); its single route is the whole-
+  // ledger filterable view.
+  | "audit"
   | "master-data"
   | "settings"
   // S267 / PR-256 — auto-quoting engine tunables. Maintenance-area
@@ -168,6 +172,19 @@ export const MODULES: ErpModule[] = [
       { id: "qa", label: "QA queue" },
       { id: "dispatch", label: "Dispatch" },
     ],
+  },
+  // S424 / session-424 — audit-activity log. Operational area, after
+  // Production. A daily-useful forensic surface ("what happened to quote
+  // X / what did I do today", [[hulye-biztos]]) — the general,
+  // cross-domain, filterable view of the whole tamper-evident ledger,
+  // distinct from the per-invoice timeline in the invoice detail.
+  {
+    id: "audit",
+    area: "operational",
+    label_hu: "Napló",
+    label_en: "Audit log",
+    glyph: "⛓",
+    routes: [{ id: "audit-events", label: "Tevékenységi napló / Activity log" }],
   },
   {
     id: "master-data",

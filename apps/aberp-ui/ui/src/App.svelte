@@ -68,6 +68,8 @@
   // S279 / PR-265 — pricing-pipeline operator surface (Fetched →
   // Extracting → Pricing → Rendering → PostingBack → Posted / Failed).
   import PricingJobsList from "./routes/PricingJobsList.svelte";
+  // S424 / session-424 — cross-domain audit-activity log.
+  import AuditEvents from "./routes/AuditEvents.svelte";
   import IssueInvoice from "./routes/IssueInvoice.svelte";
   import MaintenanceDashboard from "./routes/MaintenanceDashboard.svelte";
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
@@ -686,6 +688,8 @@
           <InventoryBalancesList />
         {:else if route === "email-relay-queue"}
           <EmailRelayQueueList />
+        {:else if route === "audit-events"}
+          <AuditEvents />
         {:else if route === "invoices-new"}
           <!-- PR-87 / session-112 — full-page issuance route. The
                IssueInvoice form was a `<dialog>` modal mounted inside

@@ -15,6 +15,10 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { isDemoMode } from "./workshop-demo-mode";
 import { getMockDashboard } from "./workshop-mock-data";
+// S424 — the audit-events list row shape is owned by the pure helper
+// module (it's what the sort/filter helpers operate on); api.ts reuses
+// it for the wire response type so the row is defined once.
+import type { AuditEventRow } from "./audit-events-list";
 
 /** PR-44ε / session-53 — typed wire mirror for the `aberp_billing::Currency`
  * enum per ADR-0037 §3. Two variants today (HUF + EUR); third-currency
@@ -504,6 +508,92 @@ export async function getInvoice(invoiceId: string): Promise<InvoiceDetail> {
 
 export async function getAudit(invoiceId: string): Promise<AuditEntryView[]> {
   return invoke<AuditEntryView[]>("get_audit", { invoiceId });
+}
+
+// ── S424 / session-424 — cross-domain audit-events screen ──────────────
+
+/** Whole-ledger chain verdict (design §3.4). `verified` is the
+ * genesis..head tamper-evidence; `first_divergence_seq` + `reason`
+ * locate the first bad entry when it fails. */
+export interface AuditChainStatus {
+  verified: boolean;
+  head_seq: number;
+  first_divergence_seq: number | null;
+  reason: string | null;
+}
+
+/** Pagination envelope. `next_cursor` is the seq to pass as `afterSeq`
+ * for the next (older) page; `null` on the last page. */
+export interface AuditPageInfo {
+  returned: number;
+  next_cursor: number | null;
+  total_matched: number;
+}
+
+export interface AuditEventsResponse {
+  events: AuditEventRow[];
+  page: AuditPageInfo;
+  chain: AuditChainStatus;
+}
+
+/** A single FULL audit entry (payload included) for the row-expand
+ * drill-down — `serve::AuditEventDetailView`. The SPA redacts the
+ * payload client-side before render. */
+export interface AuditEventDetail {
+  seq: number;
+  kind: string;
+  occurred_at: string;
+  actor: string;
+  subject: string | null;
+  hash_ok: boolean;
+  prev_hash_hex: string;
+  entry_hash_hex: string;
+  payload: unknown;
+}
+
+/** Query facets for [`listAuditEvents`]. All optional; the bridge
+ * command omits absent params. */
+export interface AuditEventsQuery {
+  from?: string;
+  to?: string;
+  /** Comma-joined `EventKind::as_str()` values. */
+  kinds?: string;
+  /** Comma-joined domain prefixes (the chip's server-side filter). */
+  domains?: string;
+  subject?: string;
+  operator?: string;
+  q?: string;
+  sort?: "seq" | "occurred_at";
+  dir?: "asc" | "desc";
+  afterSeq?: number;
+  limit?: number;
+  heartbeats?: boolean;
+}
+
+/** `GET /api/audit-events` — the filterable, paginated cross-domain
+ * ledger view. List rows omit payloads (NAV XML blobs are MBs). */
+export async function listAuditEvents(
+  query: AuditEventsQuery = {},
+): Promise<AuditEventsResponse> {
+  return invoke<AuditEventsResponse>("list_audit_events", {
+    from: query.from,
+    to: query.to,
+    kinds: query.kinds,
+    domains: query.domains,
+    subject: query.subject,
+    operator: query.operator,
+    q: query.q,
+    sort: query.sort,
+    dir: query.dir,
+    afterSeq: query.afterSeq,
+    limit: query.limit,
+    heartbeats: query.heartbeats,
+  });
+}
+
+/** `GET /api/audit-events/:seq` — the single FULL entry for row-expand. */
+export async function getAuditEvent(seq: number): Promise<AuditEventDetail> {
+  return invoke<AuditEventDetail>("get_audit_event", { seq });
 }
 
 /** PR-44ε.UI / session-58 — download the printed-invoice PDF as a
