@@ -10,6 +10,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// Path to the Python interpreter the test suite uses. Resolved in the
 /// same order as the daemon's `resolve_pipeline_python`
@@ -18,14 +19,28 @@ use std::path::{Path, PathBuf};
 /// to export anything:
 ///
 /// 1. `ABERP_TEST_PYTHON` if set — explicit override (CI uses this, set
-///    to `sys.executable` of the venv it `pip install -e`s).
+///    to `sys.executable` of the venv it `pip install -e`s). Trusted but
+///    unverified, exactly like the daemon's `ABERP_QUOTE_PIPELINE_PYTHON`
+///    env arm — the operator who sets it owns its correctness.
 /// 2. canonical venv `<repo>/python/aberp-cad-extract/.venv/bin/python`
 ///    — the documented per-checkout dev venv (gitignored, so each
-///    worktree/checkout has its own).
-/// 3. alt project-root venv `<repo>/.venv/bin/python`.
+///    worktree/checkout has its own). Selected only if it EXISTS **and**
+///    can `import aberp_cad_extract` — see [`module_importable`].
+/// 3. alt project-root venv `<repo>/.venv/bin/python` — same exists +
+///    importable gate.
 /// 4. `python3` on PATH — last resort. If the module isn't installed
 ///    there the test fails downstream with a clear ImportError
 ///    (CLAUDE.md rule 12: fail loud, never silently skip).
+///
+/// The exists **AND** importable gate at steps 2/3 is the parity fix
+/// (S421, from the S420 review): a canonical venv that exists but lacks
+/// the module — a partial/stale `pip install`, or a symlink to a broken
+/// venv — must NOT win over a working alt/system python the way a
+/// file-exists-only check let it. The daemon gates each candidate on
+/// `is_file() && check_module_importable(..)`; the harness now does too,
+/// so a broken-but-present canonical falls through here exactly as it
+/// does in prod, instead of producing a false test failure prod would
+/// never hit.
 ///
 /// We do NOT `#[ignore]` these tests — de-gating is forbidden
 /// ([[all-gates-must-pass]]). Auto-discovery makes them pass when a
@@ -34,21 +49,47 @@ pub fn test_python_bin() -> PathBuf {
     if let Ok(p) = std::env::var("ABERP_TEST_PYTHON") {
         return PathBuf::from(p);
     }
-    let repo_root = repo_root();
+    resolve_test_python(&repo_root())
+}
+
+/// Steps 2–4 of [`test_python_bin`], factored out with `repo_root` as a
+/// parameter so the broken-canonical fallthrough is unit-testable
+/// without touching the real checkout (mirrors the daemon's
+/// `resolve_pipeline_python(aberp_root: &Path)` shape). The `python3`
+/// last resort is returned unconditionally — if it lacks the module the
+/// caller fails loud with an ImportError (rule 12), which is the
+/// intended "no venv anywhere" signal.
+pub fn resolve_test_python(repo_root: &Path) -> PathBuf {
     let canonical = repo_root
         .join("python")
         .join("aberp-cad-extract")
         .join(".venv")
         .join("bin")
         .join("python");
-    if canonical.is_file() {
+    if canonical.is_file() && module_importable(&canonical) {
         return canonical;
     }
     let alt = repo_root.join(".venv").join("bin").join("python");
-    if alt.is_file() {
+    if alt.is_file() && module_importable(&alt) {
         return alt;
     }
     PathBuf::from("python3")
+}
+
+/// Mirror of the daemon's `check_module_importable`
+/// (`quote_pricing_pipeline.rs`): spawn `python -c "import
+/// aberp_cad_extract"` and treat a zero exit as importable. A candidate
+/// that cannot launch (not executable / not a real python) or whose
+/// import fails yields `false`, so the resolver falls through to the
+/// next candidate rather than selecting a dead interpreter.
+fn module_importable(python: &Path) -> bool {
+    Command::new(python)
+        .args(["-c", "import aberp_cad_extract"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Repo root = two levels above this crate's manifest dir
