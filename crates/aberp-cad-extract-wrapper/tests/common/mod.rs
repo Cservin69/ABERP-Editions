@@ -11,18 +11,55 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Path to the Python interpreter the test suite uses. Pulled from
-/// `ABERP_TEST_PYTHON` if set, else `python3` on PATH.
+/// Path to the Python interpreter the test suite uses. Resolved in the
+/// same order as the daemon's `resolve_pipeline_python`
+/// (`apps/aberp/src/quote_pricing_pipeline.rs`), so a developer with a
+/// normally set-up checkout gets passing CAD-smoke tests WITHOUT having
+/// to export anything:
 ///
-/// The CI lane sets the env var to point at the venv created by
-/// `pip install -e python/aberp-cad-extract`. Locally a developer can
-/// either source the venv (`source .venv-cad-extract/bin/activate`) so
-/// `python3` resolves there, or export `ABERP_TEST_PYTHON=<path>`.
+/// 1. `ABERP_TEST_PYTHON` if set — explicit override (CI uses this, set
+///    to `sys.executable` of the venv it `pip install -e`s).
+/// 2. canonical venv `<repo>/python/aberp-cad-extract/.venv/bin/python`
+///    — the documented per-checkout dev venv (gitignored, so each
+///    worktree/checkout has its own).
+/// 3. alt project-root venv `<repo>/.venv/bin/python`.
+/// 4. `python3` on PATH — last resort. If the module isn't installed
+///    there the test fails downstream with a clear ImportError
+///    (CLAUDE.md rule 12: fail loud, never silently skip).
+///
+/// We do NOT `#[ignore]` these tests — de-gating is forbidden
+/// ([[all-gates-must-pass]]). Auto-discovery makes them pass when a
+/// venv exists; they still fail loud when no python has the module.
 pub fn test_python_bin() -> PathBuf {
     if let Ok(p) = std::env::var("ABERP_TEST_PYTHON") {
         return PathBuf::from(p);
     }
+    let repo_root = repo_root();
+    let canonical = repo_root
+        .join("python")
+        .join("aberp-cad-extract")
+        .join(".venv")
+        .join("bin")
+        .join("python");
+    if canonical.is_file() {
+        return canonical;
+    }
+    let alt = repo_root.join(".venv").join("bin").join("python");
+    if alt.is_file() {
+        return alt;
+    }
     PathBuf::from("python3")
+}
+
+/// Repo root = two levels above this crate's manifest dir
+/// (`<repo>/crates/aberp-cad-extract-wrapper`). Used only to locate the
+/// dev venv; falls back to `.` if the layout is ever unexpected.
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Write a 20 mm cube as a binary STL to `path`. Matches the
