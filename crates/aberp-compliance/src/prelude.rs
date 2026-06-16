@@ -33,7 +33,10 @@ pub use crate::export_control::{
 pub use crate::incident::{
     dod_72h_report_due_at_ms, DetectionSource, IncidentSeverity, DFARS_72H_REPORT_WINDOW_MS,
 };
-pub use crate::lot_heat::{HeatId, LotId, MaterialTraceabilitySeed, TraceabilityError, MAX_ID_LEN};
+pub use crate::lot_heat::{
+    validate_mtr_url, HeatId, LotId, MaterialTraceabilitySeed, MtrUrlError, TraceabilityError,
+    MAX_ID_LEN, MAX_MTR_URL_LEN,
+};
 pub use crate::uid::{
     validate_iac, Iuid, IuidConstruct1, IuidConstruct2, UidError, MAX_IAC_LEN, MAX_UID_FIELD_LEN,
 };

@@ -193,6 +193,9 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   snapshots: "operational",
   // S429 — closed-loop calibration (operational, read-only).
   calibration: "operational",
+  // S432 — material traceability (operational, operator chain-of-custody
+  // lookup; no dashboard tile).
+  "material-traceability": "operational",
 };
 
 // Closed-vocab set of accepted status kinds on a maintenance tile.
@@ -389,6 +392,7 @@ describe("modulesInArea + defaultRouteForArea", () => {
     // production per the registry order.
     // S426 / ADR-0082 — "snapshots" joins after audit.
     // S429 — "calibration" joins after snapshots.
+    // S432 — "material-traceability" joins after calibration.
     expect(op.map((m) => m.id)).toEqual([
       "invoicing",
       "statistics",
@@ -396,6 +400,7 @@ describe("modulesInArea + defaultRouteForArea", () => {
       "audit",
       "snapshots",
       "calibration",
+      "material-traceability",
     ]);
     // S267 / PR-256 — new `quoting` module joins maintenance after Settings.
     // S281 / PR-266 — new `email-relay` module joins after Quoting.

@@ -3215,6 +3215,15 @@ fn build_router(state: AppState) -> Router {
             "/api/inventory-balances",
             get(handle_list_inventory_balances),
         )
+        // S432 (ADR-0085) — heat-lot assignment + material traceability view.
+        .route(
+            "/api/inventory-balances/:grade/heat-lot",
+            post(handle_assign_heat_lot),
+        )
+        .route(
+            "/api/material-traceability",
+            get(handle_material_traceability),
+        )
         // PR-172 — buyer-facing notes typeahead source. GET-only,
         // ready+bearer-gated. `?scope=line|invoice|storno` is required.
         // Returns the most-recent-first deduplicated list of operator-
@@ -13246,6 +13255,15 @@ pub fn transition_work_order_request(
     let action = aberp_work_orders::WoAction::from_storage_str(body.action.trim())
         .map_err(|e| WorkOrderRouteError::BadInput(format!("{e}: {:?}", body.action)))?;
 
+    // S432 (ADR-0085) — heat-lot chain-of-custody gate. A defense/aerospace WO
+    // (resolved via source_quote_id → buyer partner customer_type) cannot
+    // `Start` until its material has a heat lot assigned. [[trust-code-not-operator]]
+    // — the refusal is here, not operator discipline. Non-defense WOs and WOs
+    // with no quote/partner link are unaffected.
+    if action == aberp_work_orders::WoAction::Start {
+        enforce_heat_lot_gate_for_start(state, wo_id, operator_login)?;
+    }
+
     let mut conn = Connection::open(&*state.db_path).map_err(|e| {
         WorkOrderRouteError::Other(anyhow!(
             "open tenant DuckDB at {}: {e}",
@@ -13324,6 +13342,132 @@ pub fn transition_work_order_request(
         work_order: outcome.wo,
         warnings: outcome.warnings,
     })
+}
+
+/// S432 (ADR-0085) — outcome of the heat-lot WO-start gate resolution.
+#[derive(Debug, PartialEq)]
+pub enum HeatLotGate {
+    /// Start may proceed: not defense/aerospace, no quote/partner link, or the
+    /// material already carries a heat lot.
+    Pass,
+    /// Start refused: a defense/aerospace WO whose material has no heat lot.
+    Blocked {
+        material_grade: String,
+        source_quote_id: String,
+        customer_type: String,
+    },
+}
+
+/// Pure resolver: walk WO → `source_quote_id` → quote (material_grade +
+/// buyer_partner_id) → partner.customer_type, and if defense/aerospace, require
+/// a non-empty heat lot on the material's `inventory_balances` row. Read-only;
+/// no audit, no I/O beyond the supplied conn — unit-testable end to end.
+pub fn resolve_heat_lot_gate(
+    conn: &Connection,
+    tenant: &str,
+    wo: &aberp_work_orders::WorkOrder,
+) -> anyhow::Result<HeatLotGate> {
+    let Some(quote_id) = wo.source_quote_id.as_deref() else {
+        return Ok(HeatLotGate::Pass); // operator-authored WO, no quote link
+    };
+    let Some(job) = crate::quote_pricing_jobs::get_job_detail(conn, quote_id, tenant)? else {
+        return Ok(HeatLotGate::Pass); // quote row gone — nothing to gate on
+    };
+    let Some(partner_id) = job.buyer_partner_id.as_deref() else {
+        return Ok(HeatLotGate::Pass); // no buyer assigned → no customer_type
+    };
+    let Some(partner) = crate::partners::get_partner(conn, tenant, partner_id)? else {
+        return Ok(HeatLotGate::Pass);
+    };
+    use crate::partners::CustomerType;
+    if !matches!(
+        partner.customer_type,
+        CustomerType::Defense | CustomerType::Aerospace
+    ) {
+        return Ok(HeatLotGate::Pass); // commercial path unaffected
+    }
+
+    // Defense/aerospace: the material MUST carry a heat lot.
+    let has_heat = crate::material_inventory::read_balance(conn, tenant, &job.row.material_grade)?
+        .and_then(|b| b.heat_lot_number)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if has_heat {
+        Ok(HeatLotGate::Pass)
+    } else {
+        Ok(HeatLotGate::Blocked {
+            material_grade: job.row.material_grade,
+            source_quote_id: quote_id.to_string(),
+            customer_type: partner.customer_type.as_db_str().to_string(),
+        })
+    }
+}
+
+/// Enforce the heat-lot gate at the WO `Start` route. On block, emits one
+/// `material.wo_blocked_no_heat_lot` audit entry (via its own `Ledger`, after
+/// the read conn is dropped) and returns a 409 with the operator message. A
+/// missing WO is NOT blocked here — the normal transition path 404s it.
+fn enforce_heat_lot_gate_for_start(
+    state: &AppState,
+    wo_id: &str,
+    operator_login: &str,
+) -> std::result::Result<(), WorkOrderRouteError> {
+    let gate = {
+        let conn = Connection::open(&*state.db_path).map_err(|e| {
+            WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for heat-lot gate: {e}"))
+        })?;
+        let Some(wo) = aberp_work_orders::read_work_order(&conn, state.tenant.as_str(), wo_id)
+            .map_err(map_wo_err)?
+        else {
+            return Ok(()); // missing WO → defer to the normal 404 path
+        };
+        resolve_heat_lot_gate(&conn, state.tenant.as_str(), &wo)
+            .map_err(WorkOrderRouteError::Other)?
+    };
+
+    let HeatLotGate::Blocked {
+        material_grade,
+        source_quote_id,
+        customer_type,
+    } = gate
+    else {
+        return Ok(());
+    };
+
+    // Audit the refusal (best-effort-loud: a ledger failure surfaces as 500
+    // rather than letting the WO slip through unblocked).
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let payload = serde_json::json!({
+        "work_order_id": wo_id,
+        "material_id": material_grade,
+        "source_quote_id": source_quote_id,
+        "customer_type": customer_type,
+        "operator_user_id": operator_login,
+        "blocked_at": time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+    });
+    let mut ledger = aberp_audit_ledger::Ledger::open(
+        state.db_path.as_path(),
+        state.tenant.clone(),
+        binary_hash,
+    )
+    .map_err(|e| WorkOrderRouteError::Other(anyhow!("open ledger for wo-block audit: {e}")))?;
+    ledger
+        .append(
+            aberp_audit_ledger::EventKind::MaterialWoBlockedNoHeatLot,
+            serde_json::to_vec(&payload).expect("serialize wo-blocked payload"),
+            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+            None,
+        )
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("append wo-block audit: {e}")))?;
+
+    Err(WorkOrderRouteError::Conflict(format!(
+        "Material {material_grade} requires heat lot before defense/aerospace WO start"
+    )))
 }
 
 /// GET /api/products/:id/bom — list active BOM rows.
@@ -20774,6 +20918,189 @@ async fn handle_list_inventory_balances(
         Ok(Err(e)) => internal_error("list_inventory_balances", e),
         Err(join_err) => internal_error(
             "list_inventory_balances:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ── S432 (ADR-0085) — heat-lot assignment + material traceability ─────
+
+/// POST body for `/api/inventory-balances/:grade/heat-lot`. [[hulye-biztos]] —
+/// one form, one save: a required heat lot + an optional `file://` MTR URL.
+#[derive(Debug, serde::Deserialize)]
+struct AssignHeatLotBody {
+    heat_lot_number: String,
+    #[serde(default)]
+    mill_test_report_url: Option<String>,
+}
+
+/// `POST /api/inventory-balances/:grade/heat-lot` — bind a supplier heat lot to
+/// a material grade's stock row + fire the audit trail. 400 on invalid input,
+/// 404 when the grade has no balance row.
+async fn handle_assign_heat_lot(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(grade): AxumPath<String>,
+    Json(body): Json<AssignHeatLotBody>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<crate::material_inventory::HeatLotAssignment> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+            let assignment = {
+                let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                    format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+                })?;
+                crate::material_inventory::assign_heat_lot(
+                    &conn,
+                    state_for_task.tenant.as_str(),
+                    &grade,
+                    &body.heat_lot_number,
+                    body.mill_test_report_url.as_deref().unwrap_or(""),
+                    &operator_login,
+                )?
+                // conn dropped here — Ledger opens its own writer next.
+            };
+            crate::material_inventory::append_heat_lot_events(
+                &state_for_task.db_path,
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &assignment,
+            )?;
+            sync_audit_mirror_best_effort(
+                &state_for_task.db_path,
+                state_for_task.tenant.clone(),
+                binary_hash,
+            );
+            Ok(assignment)
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(assignment)) => Json(assignment).into_response(),
+        Ok(Err(e)) => match e.downcast::<crate::material_inventory::HeatLotError>() {
+            Ok(crate::material_inventory::HeatLotError::MaterialNotFound(g)) => (
+                StatusCode::NOT_FOUND,
+                Json(error_body(format!("material grade {g} has no stock row"))),
+            )
+                .into_response(),
+            Ok(typed) => {
+                (StatusCode::BAD_REQUEST, Json(error_body(typed.to_string()))).into_response()
+            }
+            Err(other) => internal_error("assign_heat_lot", other),
+        },
+        Err(join_err) => internal_error(
+            "assign_heat_lot:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+/// Query string for `GET /api/material-traceability` — exactly one of
+/// `material_id` / `heat_lot`.
+#[derive(Debug, serde::Deserialize)]
+struct MaterialTraceabilityQuery {
+    #[serde(default)]
+    material_id: Option<String>,
+    #[serde(default)]
+    heat_lot: Option<String>,
+}
+
+/// `GET /api/material-traceability?material_id=|heat_lot=` — assemble the
+/// chain-of-custody report + fire `material.traceability_viewed`.
+async fn handle_material_traceability(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(q): Query<MaterialTraceabilityQuery>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    use crate::material_traceability::TraceQueryKind;
+    let (kind, value) = match (
+        q.material_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        q.heat_lot
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    ) {
+        (Some(m), _) => (TraceQueryKind::MaterialId, m.to_string()),
+        (None, Some(h)) => (TraceQueryKind::HeatLot, h.to_string()),
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(error_body(
+                    "supply material_id or heat_lot query parameter".to_string(),
+                )),
+            )
+                .into_response()
+        }
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<crate::material_traceability::TraceReport> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+            let report = {
+                let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                    format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+                })?;
+                crate::material_traceability::trace(
+                    &conn,
+                    state_for_task.tenant.as_str(),
+                    kind,
+                    &value,
+                )?
+            };
+            // Audit the read (who inspected the chain, when).
+            let payload = serde_json::json!({
+                "query_kind": kind.as_str(),
+                "query_value": value,
+                "material_id": report.material_id,
+                "operator_user_id": operator_login,
+                "viewed_at": time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+            });
+            let mut ledger = aberp_audit_ledger::Ledger::open(
+                state_for_task.db_path.as_path(),
+                state_for_task.tenant.clone(),
+                binary_hash,
+            )?;
+            ledger.append(
+                aberp_audit_ledger::EventKind::MaterialTraceabilityViewed,
+                serde_json::to_vec(&payload).expect("serialize traceability-viewed payload"),
+                Actor::from_local_cli(Ulid::new().to_string(), &operator_login),
+                None,
+            )?;
+            Ok(report)
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(e)) => internal_error("material_traceability", e),
+        Err(join_err) => internal_error(
+            "material_traceability:join",
             anyhow!("blocking task panicked: {join_err}"),
         ),
     }

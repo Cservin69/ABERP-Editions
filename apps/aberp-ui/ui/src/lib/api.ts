@@ -2339,10 +2339,55 @@ export interface InventoryBalance {
   available_qty: number;
   unit_of_measure: string;
   last_updated: string;
+  // S432 — material-traceability heat-lot assignment. All four are
+  // nullable: a balance row exists from its first DEAL upsert, but a
+  // heat lot is only stamped once an operator assigns one.
+  heat_lot_number: string | null;
+  mill_test_report_url: string | null;
+  heat_assigned_at_utc: string | null;
+  heat_assigned_by_operator: string | null;
 }
 
 export interface InventoryBalancesResult {
   balances: InventoryBalance[];
+}
+
+/** S432 — response body of `POST /api/inventory-balances/:grade/heat-lot`.
+ * Mirrors the backend `HeatLotAssignment`. */
+export interface HeatLotAssignment {
+  material_grade: string;
+  heat_lot_number: string;
+  mill_test_report_url: string | null;
+  heat_assigned_at_utc: string;
+  heat_assigned_by_operator: string;
+}
+
+/** S432 — one quote reference in a trace report. */
+export interface TraceQuoteRef {
+  quote_id: string;
+  state: string;
+}
+
+/** S432 — one work-order reference in a trace report. */
+export interface TraceWorkOrderRef {
+  wo_id: string;
+  wo_number: string;
+  state: string;
+  source_quote_id: string | null;
+}
+
+/** S432 — `GET /api/material-traceability` report. Chain-of-custody for a
+ * material id or a heat lot: the balance row, the quotes/work-orders that
+ * touched it, and an invoices placeholder (not tracked yet). */
+export interface MaterialTraceReport {
+  query_kind: "material_id" | "heat_lot";
+  query_value: string;
+  material_id: string | null;
+  material: InventoryBalance | null;
+  quotes: TraceQuoteRef[];
+  work_orders: TraceWorkOrderRef[];
+  invoices: string[];
+  invoices_note: string;
 }
 
 /** S273 — `GET /api/inventory-balances`. Read-only list scoped to the
@@ -2351,6 +2396,36 @@ export interface InventoryBalancesResult {
  *  v1 (a future Edit form would land here). */
 export async function listInventoryBalances(): Promise<InventoryBalancesResult> {
   return invoke<InventoryBalancesResult>("list_inventory_balances");
+}
+
+/** S432 — `POST /api/inventory-balances/:grade/heat-lot`. Stamp (or
+ * re-stamp) the heat lot + optional mill-test-report URL on a grade's
+ * balance row. `millTestReportUrl` is `null` when the operator leaves it
+ * blank. Backend 400 on an invalid lot/url, 404 when the grade has no
+ * stock row. */
+export async function assignHeatLot(
+  grade: string,
+  heatLotNumber: string,
+  millTestReportUrl: string | null,
+): Promise<HeatLotAssignment> {
+  return invoke<HeatLotAssignment>("assign_heat_lot", {
+    grade,
+    heatLotNumber,
+    millTestReportUrl,
+  });
+}
+
+/** S432 — `GET /api/material-traceability?material_id=…|heat_lot=…`. The
+ * operator-facing chain-of-custody lookup; pass exactly one of the two
+ * keys (the other stays `null`). */
+export async function materialTraceability(params: {
+  materialId?: string;
+  heatLot?: string;
+}): Promise<MaterialTraceReport> {
+  return invoke<MaterialTraceReport>("material_traceability", {
+    materialId: params.materialId ?? null,
+    heatLot: params.heatLot ?? null,
+  });
 }
 
 // ── PR-172 — buyer-facing notes-history typeahead source ─────────────

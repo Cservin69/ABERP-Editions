@@ -104,7 +104,10 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{append_in_tx, Actor, EventKind, LedgerMeta};
+use aberp_audit_ledger::{
+    append_in_tx, Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId,
+};
+use aberp_compliance::lot_heat::{validate_mtr_url, LotId};
 
 /// `kg` is the default UoM for material-side balances. The catalogue
 /// quotes cost in `cost_per_kg_eur` + density in `g_cm3`; mass (kg) is
@@ -254,6 +257,20 @@ CREATE TABLE IF NOT EXISTS inventory_reservations (
 -- treating it as `units`.
 ALTER TABLE inventory_reservations
     ADD COLUMN IF NOT EXISTS qty_unit_kind VARCHAR;
+-- S432 (ADR-0085) — heat-lot traceability columns on the per-grade balance
+-- row. All NULLABLE for back-compat: existing rows are NOT backfilled (a
+-- missing heat lot is the signal the defense WO-start gate reads). A future
+-- ALTER must NOT add a SQL DEFAULT (same DuckDB replay-clobber trap as the
+-- qty_unit_kind note above). The app layer treats a NULL/empty heat_lot_number
+-- as 'no heat lot assigned'.
+ALTER TABLE inventory_balances
+    ADD COLUMN IF NOT EXISTS heat_lot_number VARCHAR;
+ALTER TABLE inventory_balances
+    ADD COLUMN IF NOT EXISTS mill_test_report_url VARCHAR;
+ALTER TABLE inventory_balances
+    ADD COLUMN IF NOT EXISTS heat_assigned_at_utc VARCHAR;
+ALTER TABLE inventory_balances
+    ADD COLUMN IF NOT EXISTS heat_assigned_by_operator VARCHAR;
 ";
 
 /// Idempotent `CREATE TABLE IF NOT EXISTS` for both tables. Called at
@@ -296,9 +313,20 @@ pub struct Balance {
     /// invariant breach immediately (would only happen if someone
     /// bypassed `commit_material_in_tx` — defense-in-depth render).
     pub available_qty: f64,
+    /// S432 (ADR-0085) — supplier-issued heat lot bound to this grade's
+    /// stock, or `None` until an operator assigns one. The chain-of-custody
+    /// anchor the defense/aerospace WO-start gate reads.
+    pub heat_lot_number: Option<String>,
+    /// S432 — `file://` URL of the Mill Test Report (3.1 cert), when uploaded.
+    pub mill_test_report_url: Option<String>,
+    /// S432 — RFC-3339 stamp of the heat-lot assignment.
+    pub heat_assigned_at_utc: Option<String>,
+    /// S432 — operator login who bound the heat lot (accountability anchor).
+    pub heat_assigned_by_operator: Option<String>,
 }
 
 impl Balance {
+    #[allow(clippy::too_many_arguments)]
     fn from_columns(
         tenant_id: String,
         material_grade: String,
@@ -308,6 +336,10 @@ impl Balance {
         consumed_qty: f64,
         unit_of_measure: String,
         last_updated: String,
+        heat_lot_number: Option<String>,
+        mill_test_report_url: Option<String>,
+        heat_assigned_at_utc: Option<String>,
+        heat_assigned_by_operator: Option<String>,
     ) -> Self {
         let available_qty = on_hand_qty - reserved_qty - committed_qty;
         Self {
@@ -320,6 +352,10 @@ impl Balance {
             unit_of_measure,
             last_updated,
             available_qty,
+            heat_lot_number,
+            mill_test_report_url,
+            heat_assigned_at_utc,
+            heat_assigned_by_operator,
         }
     }
 }
@@ -333,7 +369,9 @@ pub fn list_balances_for_tenant(conn: &Connection, tenant: &str) -> Result<Vec<B
     let mut stmt = conn
         .prepare(
             "SELECT material_grade, on_hand_qty, reserved_qty, committed_qty,
-                    consumed_qty, unit_of_measure, last_updated
+                    consumed_qty, unit_of_measure, last_updated,
+                    heat_lot_number, mill_test_report_url,
+                    heat_assigned_at_utc, heat_assigned_by_operator
                FROM inventory_balances
               WHERE tenant_id = ?1
               ORDER BY material_grade",
@@ -350,6 +388,10 @@ pub fn list_balances_for_tenant(conn: &Connection, tenant: &str) -> Result<Vec<B
                 r.get::<_, f64>(4)?,
                 r.get::<_, String>(5)?,
                 r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<String>>(10)?,
             ))
         })
         .context("query list_balances_for_tenant")?;
@@ -374,7 +416,9 @@ where
     let mut stmt = runner
         .prepare_raw(
             "SELECT on_hand_qty, reserved_qty, committed_qty,
-                    consumed_qty, unit_of_measure, last_updated
+                    consumed_qty, unit_of_measure, last_updated,
+                    heat_lot_number, mill_test_report_url,
+                    heat_assigned_at_utc, heat_assigned_by_operator
                FROM inventory_balances
               WHERE tenant_id = ?1 AND material_grade = ?2
               LIMIT 1",
@@ -395,6 +439,14 @@ where
         row.get::<_, f64>(3).context("get consumed_qty")?,
         row.get::<_, String>(4).context("get unit_of_measure")?,
         row.get::<_, String>(5).context("get last_updated")?,
+        row.get::<_, Option<String>>(6)
+            .context("get heat_lot_number")?,
+        row.get::<_, Option<String>>(7)
+            .context("get mill_test_report_url")?,
+        row.get::<_, Option<String>>(8)
+            .context("get heat_assigned_at_utc")?,
+        row.get::<_, Option<String>>(9)
+            .context("get heat_assigned_by_operator")?,
     )))
 }
 
@@ -650,12 +702,188 @@ pub fn append_material_committed_in_tx(
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// S432 (ADR-0085) — heat-lot traceability assignment.
+//
+// An operator binds a supplier-issued heat lot (+ optional Mill Test Report
+// `file://` URL) to a material grade's stock row. This is the chain-of-custody
+// anchor the defense/aerospace WO-start gate in `serve.rs` reads.
+//
+// Vocab note: this fires the EXISTING `material.heat_lot_assigned` EventKind
+// (S357 / ADR-0074 shipped the kind never-fired). The S357 doc-comment sketched
+// a `lot_id` + `heat_id` payload split; S432's operator surface is one
+// supplier-issued `heat_lot_number` string (validated via the same
+// `aberp_compliance::lot_heat::LotId` rules), so the emitted payload follows the
+// S432 brief shape `{material_id, heat_lot_number, mtr_url, assigned_by,
+// assigned_at}`. Divergence flagged in ADR-0085 (same posture as S431's reuse of
+// `supplier.export_screened`).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Typed failure modes for [`assign_heat_lot`]. Wrapped in `anyhow` at the
+/// write site; the route layer downcasts to map 400 / 404 (same posture as
+/// [`MaterialInventoryError`]).
+#[derive(Debug, Error, PartialEq)]
+pub enum HeatLotError {
+    /// `heat_lot_number` failed [`LotId`] validation (empty / too long / bad
+    /// char).
+    #[error("heat lot number invalid: {0}")]
+    InvalidHeatLot(String),
+    /// `mtr_url` was non-empty but not a `file://` URL (or too long).
+    #[error("MTR url invalid: {0}")]
+    InvalidMtrUrl(String),
+    /// No `inventory_balances` row for the grade — the operator picked a
+    /// material with no stock row yet. Fix path: seed the balance first.
+    #[error("material grade {0} has no inventory balance row to assign a heat lot to")]
+    MaterialNotFound(String),
+}
+
+impl HeatLotError {
+    /// Closed-vocab machine code for the route 4xx body.
+    pub fn machine_code(&self) -> &'static str {
+        match self {
+            HeatLotError::InvalidHeatLot(_) => "invalid_heat_lot",
+            HeatLotError::InvalidMtrUrl(_) => "invalid_mtr_url",
+            HeatLotError::MaterialNotFound(_) => "material_not_found",
+        }
+    }
+}
+
+/// Outcome of a successful heat-lot assignment — the canonical (validated,
+/// trimmed) values written to the row, returned so the route layer can build
+/// the audit payload + success response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeatLotAssignment {
+    pub material_grade: String,
+    pub heat_lot_number: String,
+    pub mill_test_report_url: Option<String>,
+    pub heat_assigned_at_utc: String,
+    pub heat_assigned_by_operator: String,
+}
+
+/// Bind a heat lot (+ optional MTR `file://` URL) to a material grade's stock
+/// row. Validates both inputs ([[hulye-biztos]] — one form, one save), then
+/// UPDATEs the four S432 columns. The row MUST already exist (the operator
+/// assigns from a row on the stock screen); a missing row is
+/// [`HeatLotError::MaterialNotFound`], NOT a silent upsert.
+///
+/// Audit emission is OUTSIDE this function (route layer, via
+/// [`append_heat_lot_events`]) so the DB write half stays unit-testable without
+/// a ledger — same split as `avl_vendors::append_vendor_event`.
+pub fn assign_heat_lot(
+    conn: &Connection,
+    tenant: &str,
+    material_grade: &str,
+    heat_lot_number: &str,
+    mtr_url: &str,
+    operator_login: &str,
+) -> Result<HeatLotAssignment> {
+    ensure_schema(conn)?;
+
+    let lot = LotId::new(heat_lot_number.trim())
+        .map_err(|e| anyhow::Error::new(HeatLotError::InvalidHeatLot(e.to_string())))?;
+    let mtr = validate_mtr_url(mtr_url)
+        .map_err(|e| anyhow::Error::new(HeatLotError::InvalidMtrUrl(e.to_string())))?;
+
+    let now_iso = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .context("format now for heat-lot assignment")?;
+
+    let n = conn
+        .execute(
+            "UPDATE inventory_balances
+                SET heat_lot_number = ?1,
+                    mill_test_report_url = ?2,
+                    heat_assigned_at_utc = ?3,
+                    heat_assigned_by_operator = ?4,
+                    last_updated = ?3
+              WHERE tenant_id = ?5 AND material_grade = ?6",
+            params![
+                lot.as_str(),
+                mtr.as_deref(),
+                &now_iso,
+                operator_login,
+                tenant,
+                material_grade,
+            ],
+        )
+        .context("UPDATE inventory_balances heat-lot columns")?;
+    if n == 0 {
+        return Err(anyhow::Error::new(HeatLotError::MaterialNotFound(
+            material_grade.to_string(),
+        )));
+    }
+    if n != 1 {
+        anyhow::bail!("heat-lot UPDATE touched {n} rows (expected 1) for {material_grade}");
+    }
+
+    Ok(HeatLotAssignment {
+        material_grade: material_grade.to_string(),
+        heat_lot_number: lot.as_str().to_string(),
+        mill_test_report_url: mtr,
+        heat_assigned_at_utc: now_iso,
+        heat_assigned_by_operator: operator_login.to_string(),
+    })
+}
+
+/// Append the heat-lot audit trail: one `material.heat_lot_assigned` always,
+/// plus one `material.mtr_uploaded` when an MTR URL was recorded. Mirrors
+/// `avl_vendors::append_vendor_event` (opens its own `Ledger` after the write
+/// conn is dropped — DuckDB rejects a second writer). Returns the count of
+/// entries appended so a caller / test can assert the MTR branch fired.
+pub fn append_heat_lot_events(
+    db_path: &std::path::Path,
+    tenant: TenantId,
+    binary_hash: BinaryHash,
+    assignment: &HeatLotAssignment,
+) -> Result<usize> {
+    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
+        .context("open audit ledger to record heat-lot assignment")?;
+    let operator = assignment.heat_assigned_by_operator.clone();
+
+    let assigned_payload = serde_json::json!({
+        "material_id": assignment.material_grade,
+        "heat_lot_number": assignment.heat_lot_number,
+        "mtr_url": assignment.mill_test_report_url,
+        "assigned_by": operator,
+        "assigned_at": assignment.heat_assigned_at_utc,
+        "operator_user_id": operator,
+    });
+    ledger
+        .append(
+            EventKind::MaterialHeatLotAssigned,
+            serde_json::to_vec(&assigned_payload).expect("serialize heat-lot payload"),
+            Actor::from_local_cli(Ulid::new().to_string(), &operator),
+            None,
+        )
+        .context("append material.heat_lot_assigned")?;
+    let mut appended = 1;
+
+    if let Some(mtr) = assignment.mill_test_report_url.as_deref() {
+        let mtr_payload = serde_json::json!({
+            "material_id": assignment.material_grade,
+            "heat_lot_number": assignment.heat_lot_number,
+            "mtr_url": mtr,
+            "operator_user_id": operator,
+            "recorded_at": assignment.heat_assigned_at_utc,
+        });
+        ledger
+            .append(
+                EventKind::MaterialMtrUploaded,
+                serde_json::to_vec(&mtr_payload).expect("serialize mtr payload"),
+                Actor::from_local_cli(Ulid::new().to_string(), &operator),
+                None,
+            )
+            .context("append material.mtr_uploaded")?;
+        appended += 1;
+    }
+
+    Ok(appended)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aberp_audit_ledger::{
-        ensure_schema as audit_ensure_schema, BinaryHash, LedgerMeta, TenantId,
-    };
+    use aberp_audit_ledger::ensure_schema as audit_ensure_schema;
 
     fn open_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
@@ -1033,5 +1261,161 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    // ── S432 (ADR-0085) — heat-lot assignment ───────────────────────────────
+
+    fn seed_balance(conn: &Connection, grade: &str) {
+        conn.execute(
+            "INSERT INTO inventory_balances (
+                tenant_id, material_grade, on_hand_qty, reserved_qty,
+                committed_qty, consumed_qty, unit_of_measure, last_updated
+             ) VALUES ('t', ?1, 100.0, 0, 0, 0, 'kg', '2026-06-06T00:00:00Z')",
+            params![grade],
+        )
+        .unwrap();
+    }
+
+    /// Happy path: assigning a heat lot stamps all four columns + the read-back
+    /// balance surfaces them. [[hulye-biztos]] — one validated save.
+    #[test]
+    fn assign_heat_lot_stamps_columns_and_read_back_shows_them() {
+        let conn = open_conn();
+        seed_balance(&conn, "Ti-6Al-4V");
+        let out = assign_heat_lot(
+            &conn,
+            "t",
+            "Ti-6Al-4V",
+            "  HEAT-9F3A  ",
+            "file:///certs/h.pdf",
+            "op-001",
+        )
+        .unwrap();
+        assert_eq!(out.heat_lot_number, "HEAT-9F3A"); // trimmed
+        assert_eq!(
+            out.mill_test_report_url.as_deref(),
+            Some("file:///certs/h.pdf")
+        );
+        assert_eq!(out.heat_assigned_by_operator, "op-001");
+
+        let bal = read_balance(&conn, "t", "Ti-6Al-4V").unwrap().unwrap();
+        assert_eq!(bal.heat_lot_number.as_deref(), Some("HEAT-9F3A"));
+        assert_eq!(
+            bal.mill_test_report_url.as_deref(),
+            Some("file:///certs/h.pdf")
+        );
+        assert!(bal.heat_assigned_at_utc.is_some());
+        assert_eq!(bal.heat_assigned_by_operator.as_deref(), Some("op-001"));
+    }
+
+    /// Empty MTR is allowed (the cert may lag the heat binding) — None stored.
+    #[test]
+    fn assign_heat_lot_allows_empty_mtr() {
+        let conn = open_conn();
+        seed_balance(&conn, "304");
+        let out = assign_heat_lot(&conn, "t", "304", "LOT-1", "", "op").unwrap();
+        assert_eq!(out.mill_test_report_url, None);
+    }
+
+    #[test]
+    fn assign_heat_lot_rejects_invalid_heat_lot() {
+        let conn = open_conn();
+        seed_balance(&conn, "304");
+        let err = assign_heat_lot(&conn, "t", "304", "BAD LOT!", "", "op").unwrap_err();
+        assert_eq!(
+            err.downcast::<HeatLotError>().unwrap().machine_code(),
+            "invalid_heat_lot"
+        );
+    }
+
+    #[test]
+    fn assign_heat_lot_rejects_non_file_mtr() {
+        let conn = open_conn();
+        seed_balance(&conn, "304");
+        let err = assign_heat_lot(&conn, "t", "304", "LOT-1", "https://x/y.pdf", "op").unwrap_err();
+        assert_eq!(
+            err.downcast::<HeatLotError>().unwrap().machine_code(),
+            "invalid_mtr_url"
+        );
+    }
+
+    #[test]
+    fn assign_heat_lot_missing_material_is_not_found() {
+        let conn = open_conn();
+        let err = assign_heat_lot(&conn, "t", "NOPE", "LOT-1", "", "op").unwrap_err();
+        let typed = err.downcast::<HeatLotError>().unwrap();
+        assert_eq!(typed.machine_code(), "material_not_found");
+    }
+
+    /// Audit: a no-MTR assignment fires exactly one
+    /// `material.heat_lot_assigned`; an assignment WITH an MTR fires that plus
+    /// one `material.mtr_uploaded`.
+    #[test]
+    fn append_heat_lot_events_fires_one_without_mtr_two_with() {
+        let dir = std::env::temp_dir()
+            .join("aberp-heat-lot-test")
+            .join(Ulid::new().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("aberp.duckdb");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            audit_ensure_schema(&conn).unwrap();
+            ensure_schema(&conn).unwrap();
+            seed_balance_at(&conn, "t", "Ti-6Al-4V");
+        }
+        let tenant = TenantId::new("t").unwrap();
+        let hash = BinaryHash::from_bytes([0u8; 32]);
+
+        // No MTR → 1 event.
+        let a1 = HeatLotAssignment {
+            material_grade: "Ti-6Al-4V".into(),
+            heat_lot_number: "HEAT-1".into(),
+            mill_test_report_url: None,
+            heat_assigned_at_utc: "2026-06-16T00:00:00Z".into(),
+            heat_assigned_by_operator: "op".into(),
+        };
+        assert_eq!(
+            append_heat_lot_events(&db_path, tenant.clone(), hash, &a1).unwrap(),
+            1
+        );
+
+        // With MTR → 2 events.
+        let a2 = HeatLotAssignment {
+            mill_test_report_url: Some("file:///c.pdf".into()),
+            ..a1.clone()
+        };
+        assert_eq!(
+            append_heat_lot_events(&db_path, tenant, hash, &a2).unwrap(),
+            2
+        );
+
+        let conn = Connection::open(&db_path).unwrap();
+        let assigned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'material.heat_lot_assigned'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mtr: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'material.mtr_uploaded'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(assigned, 2);
+        assert_eq!(mtr, 1);
+    }
+
+    fn seed_balance_at(conn: &Connection, tenant: &str, grade: &str) {
+        conn.execute(
+            "INSERT INTO inventory_balances (
+                tenant_id, material_grade, on_hand_qty, reserved_qty,
+                committed_qty, consumed_qty, unit_of_measure, last_updated
+             ) VALUES (?1, ?2, 100.0, 0, 0, 0, 'kg', '2026-06-06T00:00:00Z')",
+            params![tenant, grade],
+        )
+        .unwrap();
     }
 }

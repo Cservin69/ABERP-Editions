@@ -51,6 +51,9 @@ export type ErpModuleId =
   // S429 — closed-loop calibration. Operational area; read-only per-family
   // coefficient + samples + skips ([[trust-code-not-operator]]).
   | "calibration"
+  // S432 — material traceability. Operational area; operator chain-of-
+  // custody lookup by material id / heat lot (no dashboard tile).
+  | "material-traceability"
   | "master-data"
   | "settings"
   // S267 / PR-256 — auto-quoting engine tunables. Maintenance-area
@@ -213,6 +216,23 @@ export const MODULES: ErpModule[] = [
     label_en: "Calibration",
     glyph: "🎯",
     routes: [{ id: "calibration", label: "Árazási kalibráció / Pricing calibration" }],
+  },
+  // S432 — material traceability. Operational area, after calibration. An
+  // operator chain-of-custody lookup ("what touched this heat lot / this
+  // material id" — quotes, work orders, invoices placeholder). No
+  // dashboard tile (operational modules don't carry one).
+  {
+    id: "material-traceability",
+    area: "operational",
+    label_hu: "Anyagkövethetőség",
+    label_en: "Material traceability",
+    glyph: "🧬",
+    routes: [
+      {
+        id: "material-traceability",
+        label: "Anyagkövethetőség / Material traceability",
+      },
+    ],
   },
   {
     id: "master-data",

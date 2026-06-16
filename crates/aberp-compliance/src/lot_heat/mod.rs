@@ -60,6 +60,53 @@ fn validate(raw: &str) -> Result<(), TraceabilityError> {
     Ok(())
 }
 
+/// Maximum length of a Mill Test Report (MTR) URL, in characters. Generous —
+/// `file://` paths can be long, but a multi-KB blob is a paste accident.
+pub const MAX_MTR_URL_LEN: usize = 512;
+
+/// Validation failure for a Mill Test Report URL.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MtrUrlError {
+    /// Exceeded [`MAX_MTR_URL_LEN`] characters.
+    #[error("MTR url is {len} chars, exceeds the {MAX_MTR_URL_LEN}-char limit")]
+    TooLong {
+        /// The offending length.
+        len: usize,
+    },
+    /// A non-empty value that did not start with `file://`. S432 v1 retains MTR
+    /// documents on the local filesystem only; remote URLs are a later slice.
+    #[error("MTR url must start with file:// (got {got:?})")]
+    NotFileScheme {
+        /// The first 32 chars of the offending value, for the operator toast.
+        got: String,
+    },
+}
+
+/// Validate an optional Mill Test Report URL per the S432 firing-site rule:
+/// empty/whitespace is allowed (the MTR may lag the heat-lot binding), but a
+/// non-empty value MUST start with `file://`. Returns the trimmed value (or
+/// `None` when empty) so the caller stores a canonical form.
+///
+/// Pure — no I/O. The path is NOT checked for existence (the file may be on an
+/// operator workstation the server cannot see); this gate only constrains the
+/// scheme + length so a forged remote URL can never reach the ledger.
+pub fn validate_mtr_url(raw: &str) -> Result<Option<String>, MtrUrlError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let len = trimmed.chars().count();
+    if len > MAX_MTR_URL_LEN {
+        return Err(MtrUrlError::TooLong { len });
+    }
+    if !trimmed.starts_with("file://") {
+        return Err(MtrUrlError::NotFileScheme {
+            got: trimmed.chars().take(32).collect(),
+        });
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 /// A validated material lot identifier.
 ///
 /// Construct via [`LotId::new`]; the inner string is private so a `LotId`

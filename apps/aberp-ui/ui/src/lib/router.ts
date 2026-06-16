@@ -78,7 +78,11 @@ export type AppRoute =
   // S429 — read-only closed-loop calibration page. Per-family coefficient +
   // recent samples chart + recent skips. Computed, never operator-tuned
   // ([[trust-code-not-operator]]).
-  | "calibration";
+  | "calibration"
+  // S432 — material-traceability chain-of-custody report. Operational
+  // area; operator lookup by material id / heat lot (quotes, work orders,
+  // invoices placeholder).
+  | "material-traceability";
 
 /** Default route the SPA falls back to on first paint (or on a hash
  * with an unknown slug). The Invoices list was the only screen
@@ -164,6 +168,8 @@ export function parseRoute(hash: string): AppRoute {
       return "snapshots";
     case "calibration":
       return "calibration";
+    case "material-traceability":
+      return "material-traceability";
     default:
       return DEFAULT_ROUTE;
   }

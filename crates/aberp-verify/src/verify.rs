@@ -1026,6 +1026,10 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // sweeps a per-OUTGOING-invoice bundle. Exhaustiveness arm only.
         | EventKind::MaterialCertAttached
         | EventKind::MaterialHeatLotAssigned
+        // S432 (ADR-0085) — heat-lot traceability firing-site kinds.
+        | EventKind::MaterialWoBlockedNoHeatLot
+        | EventKind::MaterialMtrUploaded
+        | EventKind::MaterialTraceabilityViewed
         // S358 / PR-45 — part.* per-unit serialization family (ADR-0075).
         // Serial-assign record + UID-mark state transition; app-layer JSON
         // payloads (part_id / serial_number / uid_iri / uid_construct_code / …),
@@ -1141,7 +1145,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 135,
+        EventKind::ALL_KINDS_COUNT == 138,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1556,6 +1560,9 @@ mod tests {
         assert_family_no_nav(&[
             EventKind::MaterialCertAttached,
             EventKind::MaterialHeatLotAssigned,
+            EventKind::MaterialWoBlockedNoHeatLot,
+            EventKind::MaterialMtrUploaded,
+            EventKind::MaterialTraceabilityViewed,
         ]);
     }
 

@@ -48,6 +48,8 @@ const SUBJECT_KEYS: &[&str] = &[
     "adapter_id",
     "vendor_id",
     "partner_id",
+    // S432 — material traceability events key on the grade as `material_id`.
+    "material_id",
     "nav_invoice_number",
 ];
 

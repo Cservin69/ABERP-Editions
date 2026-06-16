@@ -26,12 +26,23 @@
     listInventoryBalances,
     type InventoryBalance,
   } from "../lib/api";
+  import AssignHeatLotModal from "./AssignHeatLotModal.svelte";
 
   type LoadState = "idle" | "loading" | "ready" | "error";
 
   let loadState = $state<LoadState>("idle");
   let errorMessage = $state<string | null>(null);
   let rows = $state<InventoryBalance[]>([]);
+
+  // S432 — the balance row currently being heat-lot-stamped (modal open
+  // when non-null). The parent remounts the modal per row by keying on
+  // material_grade.
+  let assigning = $state<InventoryBalance | null>(null);
+
+  function onAssigned(): void {
+    assigning = null;
+    void refresh();
+  }
 
   onMount(() => {
     void refresh();
@@ -124,7 +135,9 @@
             <th class="ib-table__th ib-table__th--num">Consumed</th>
             <th class="ib-table__th ib-table__th--num">Available</th>
             <th class="ib-table__th ib-table__th--text">UoM</th>
+            <th class="ib-table__th ib-table__th--text">Heat lot</th>
             <th class="ib-table__th ib-table__th--text">Last updated</th>
+            <th class="ib-table__th ib-table__th--text"></th>
           </tr>
         </thead>
         <tbody>
@@ -162,10 +175,33 @@
               <td class="ib-table__td ib-table__td--text">
                 {r.unit_of_measure}
               </td>
+              <td class="ib-table__td ib-table__td--text">
+                {#if r.heat_lot_number}
+                  <span
+                    class="ib-chip ib-chip--ok"
+                    title={r.mill_test_report_url
+                      ? `MTR: ${r.mill_test_report_url}`
+                      : "no MTR"}
+                  >
+                    {r.heat_lot_number}
+                  </span>
+                {:else}
+                  <span class="ib-chip__hint">no heat lot</span>
+                {/if}
+              </td>
               <td
                 class="ib-table__td ib-table__td--text ib-table__td--muted"
               >
                 {fmtTs(r.last_updated)}
+              </td>
+              <td class="ib-table__td ib-table__td--text">
+                <button
+                  type="button"
+                  class="ib-row-action"
+                  onclick={() => (assigning = r)}
+                >
+                  Assign heat lot
+                </button>
               </td>
             </tr>
           {/each}
@@ -174,6 +210,16 @@
     </div>
   {/if}
 </section>
+
+{#if assigning !== null}
+  {#key assigning.material_grade}
+    <AssignHeatLotModal
+      balance={assigning}
+      onAssigned={onAssigned}
+      onClose={() => (assigning = null)}
+    />
+  {/key}
+{/if}
 
 <style>
   .ib-page {
@@ -297,5 +343,37 @@
   .ib-table__td--breach {
     color: var(--color-signal-negative);
     font-weight: 700;
+  }
+  .ib-chip {
+    display: inline-block;
+    padding: 1px var(--space-2);
+    border-radius: 999px;
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    border: 1px solid transparent;
+  }
+  .ib-chip--ok {
+    color: var(--color-signal-positive);
+    background: color-mix(in srgb, var(--color-signal-positive) 12%, transparent);
+    border-color: color-mix(in srgb, var(--color-signal-positive) 40%, transparent);
+  }
+  .ib-chip__hint {
+    color: var(--color-text-muted);
+    font-style: italic;
+    font-size: var(--type-size-xs);
+  }
+  .ib-row-action {
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-raised);
+    color: var(--color-text-secondary);
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-xs);
+    white-space: nowrap;
+  }
+  .ib-row-action:hover {
+    color: var(--color-text-strong);
   }
 </style>

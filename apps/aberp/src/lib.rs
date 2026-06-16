@@ -69,6 +69,8 @@ pub mod mark_invoice_paid;
 // `committed_qty` on `inventory_balances` and insert a paired
 // `inventory_reservations` row in the same tx.
 pub mod material_inventory;
+// S432 (ADR-0085) — heat-lot chain-of-custody traceability report.
+pub mod material_traceability;
 // S229 / PR-225 — Stage 3 manufacturing-adapter framework boot wiring.
 // Reads `ABERP_BARCODE_SCANNER_*` env vars and spawns the barcode
 // scanner adapter + per-adapter ledger-writer task. Default-off.

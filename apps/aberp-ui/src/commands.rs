@@ -919,6 +919,53 @@ pub async fn list_inventory_balances(state: State<'_, AppState>) -> Result<Value
     forward_get(&state, "/api/inventory-balances", true).await
 }
 
+/// S432 — `POST /api/inventory-balances/:grade/heat-lot` — stamp the heat
+/// lot (+ optional mill-test-report URL) on a grade's balance row. The
+/// grade is URL-encoded into the path (a grade may carry a space, e.g.
+/// "Inconel 718"). The backend re-validates the lot/url authoritatively.
+#[tauri::command]
+pub async fn assign_heat_lot(
+    state: State<'_, AppState>,
+    grade: String,
+    heat_lot_number: String,
+    mill_test_report_url: Option<String>,
+) -> Result<Value, String> {
+    let path = format!("/api/inventory-balances/{}/heat-lot", urlencode(&grade));
+    let body = serde_json::json!({
+        "heat_lot_number": heat_lot_number,
+        "mill_test_report_url": mill_test_report_url,
+    });
+    forward_post(&state, &path, body).await
+}
+
+/// S432 — `GET /api/material-traceability?material_id=…|heat_lot=…` — the
+/// operator-facing chain-of-custody report. Exactly one of the two params
+/// is `Some`; its value is URL-encoded into the query string.
+#[tauri::command]
+pub async fn material_traceability(
+    state: State<'_, AppState>,
+    material_id: Option<String>,
+    heat_lot: Option<String>,
+) -> Result<Value, String> {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(s) = material_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        params.push(format!("material_id={}", urlencode(s)));
+    }
+    if let Some(s) = heat_lot.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(format!("heat_lot={}", urlencode(s)));
+    }
+    let path = if params.is_empty() {
+        "/api/material-traceability".to_string()
+    } else {
+        format!("/api/material-traceability?{}", params.join("&"))
+    };
+    forward_get(&state, &path, true).await
+}
+
 // ── PR-172 — notes-history typeahead source ─────────────────────────
 
 /// PR-172 — `GET /api/notes-history?scope=line|invoice|storno`. Used

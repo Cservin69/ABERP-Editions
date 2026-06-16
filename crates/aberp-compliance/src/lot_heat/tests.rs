@@ -1,6 +1,44 @@
 //! Unit tests for the S345 lot/heat traceability seed types.
 
-use super::{HeatId, LotId, MaterialTraceabilitySeed, TraceabilityError, MAX_ID_LEN};
+use super::{
+    validate_mtr_url, HeatId, LotId, MaterialTraceabilitySeed, MtrUrlError, TraceabilityError,
+    MAX_ID_LEN, MAX_MTR_URL_LEN,
+};
+
+// ── S432 (ADR-0085) — MTR URL validation ────────────────────────────────────
+
+#[test]
+fn s432_mtr_url_empty_is_none() {
+    assert_eq!(validate_mtr_url(""), Ok(None));
+    assert_eq!(validate_mtr_url("   "), Ok(None));
+}
+
+#[test]
+fn s432_mtr_url_file_scheme_accepted_and_trimmed() {
+    assert_eq!(
+        validate_mtr_url("  file:///certs/heat-9f3a.pdf  "),
+        Ok(Some("file:///certs/heat-9f3a.pdf".to_string()))
+    );
+}
+
+#[test]
+fn s432_mtr_url_rejects_non_file_scheme() {
+    assert_eq!(
+        validate_mtr_url("https://certs.example/x.pdf"),
+        Err(MtrUrlError::NotFileScheme {
+            got: "https://certs.example/x.pdf".to_string(),
+        })
+    );
+}
+
+#[test]
+fn s432_mtr_url_rejects_too_long() {
+    let long = format!("file://{}", "a".repeat(MAX_MTR_URL_LEN));
+    assert!(matches!(
+        validate_mtr_url(&long),
+        Err(MtrUrlError::TooLong { .. })
+    ));
+}
 
 #[test]
 fn s345_lot_id_accepts_alphanumeric_and_dash() {

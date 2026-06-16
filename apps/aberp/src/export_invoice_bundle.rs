@@ -891,6 +891,11 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // posture; never sweeps a per-OUTGOING-invoice export bundle by glob.
         | EventKind::MaterialCertAttached
         | EventKind::MaterialHeatLotAssigned
+        // S432 (ADR-0085) — heat-lot traceability firing-site kinds, same
+        // `material.*` JSON-payload posture; never NAV XML bytes.
+        | EventKind::MaterialWoBlockedNoHeatLot
+        | EventKind::MaterialMtrUploaded
+        | EventKind::MaterialTraceabilityViewed
         // S358 / PR-45 — part.* per-unit serialization family (ADR-0075).
         // Serial-assign record + UID-mark state transition; app-layer JSON
         // payloads, never NAV XML bytes. `part.*`-not-`invoice.*` posture;
@@ -1011,7 +1016,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 135,
+        EventKind::ALL_KINDS_COUNT == 138,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

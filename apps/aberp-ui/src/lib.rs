@@ -344,6 +344,9 @@ pub fn run() {
             commands::delete_stock_adjustment,
             // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
             commands::list_inventory_balances,
+            // S432 — heat-lot assignment + material traceability report.
+            commands::assign_heat_lot,
+            commands::material_traceability,
             commands::list_notes_history,
             commands::list_products,
             commands::get_product,

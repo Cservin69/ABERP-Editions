@@ -2139,6 +2139,38 @@ pub enum EventKind {
     /// [`Self::MaterialCertAttached`].
     MaterialHeatLotAssigned,
 
+    /// S432 (ADR-0085) — a Work Order start was REFUSED because it consumes a
+    /// material with no heat lot assigned AND its originating quote's buyer is a
+    /// defense/aerospace customer ([`CustomerType::Defense`]/`Aerospace`). The
+    /// [[trust-code-not-operator]] gate at the WO `Start` transition: the
+    /// material's chain-of-custody must be established before defense production
+    /// can begin. The non-defense path is unaffected (no block, no event).
+    ///
+    /// Payload (`serde_json::Value`): `work_order_id`, `material_id` (the
+    /// blocked grade), `source_quote_id`, `customer_type`, `operator_user_id`,
+    /// `blocked_at_ms`. `material.*` family — keeps the traceability surface
+    /// globbable; app-layer JSON, never NAV XML bytes.
+    MaterialWoBlockedNoHeatLot,
+
+    /// S432 (ADR-0085) — a Mill Test Report (MTR / 3.1 cert) URL was recorded
+    /// against a material grade's heat lot. Future-proof for the operator-
+    /// uploaded MTR field; the firing site stamps the `file://` URL the
+    /// operator supplies alongside the heat-lot assignment when present.
+    ///
+    /// Payload (`serde_json::Value`): `material_id`, `heat_lot_number`,
+    /// `mtr_url`, `operator_user_id`, `recorded_at_ms`. `material.*` family.
+    MaterialMtrUploaded,
+
+    /// S432 (ADR-0085) — an operator queried the Material Traceability view for
+    /// a `material_id` or `heat_lot_number`. Recorded so a compliance audit can
+    /// prove WHO inspected a part's chain-of-custody and WHEN (AS9100D §8.5.2
+    /// record-of-access). A read event, not a state transition.
+    ///
+    /// Payload (`serde_json::Value`): `query_kind` (`material_id`/`heat_lot`),
+    /// `query_value`, `material_id` (resolved, when found), `operator_user_id`,
+    /// `viewed_at_ms`. `material.*` family.
+    MaterialTraceabilityViewed,
+
     /// S358 / PR-45 (ADR-0075) — a serial number was assigned to an
     /// individual part. FIRST member of the new `part.*` prefix family — the
     /// per-unit serialization strand of the aerospace pivot
@@ -2782,6 +2814,9 @@ impl EventKind {
             EventKind::PersonnelAccessDenied => "personnel.access_denied",
             EventKind::MaterialCertAttached => "material.cert_attached",
             EventKind::MaterialHeatLotAssigned => "material.heat_lot_assigned",
+            EventKind::MaterialWoBlockedNoHeatLot => "material.wo_blocked_no_heat_lot",
+            EventKind::MaterialMtrUploaded => "material.mtr_uploaded",
+            EventKind::MaterialTraceabilityViewed => "material.traceability_viewed",
             EventKind::PartSerialAssigned => "part.serial_assigned",
             EventKind::PartUidMarked => "part.uid_marked",
             EventKind::ExportClassificationSet => "export.classification_set",
@@ -2948,6 +2983,9 @@ impl EventKind {
             "personnel.access_denied" => Ok(EventKind::PersonnelAccessDenied),
             "material.cert_attached" => Ok(EventKind::MaterialCertAttached),
             "material.heat_lot_assigned" => Ok(EventKind::MaterialHeatLotAssigned),
+            "material.wo_blocked_no_heat_lot" => Ok(EventKind::MaterialWoBlockedNoHeatLot),
+            "material.mtr_uploaded" => Ok(EventKind::MaterialMtrUploaded),
+            "material.traceability_viewed" => Ok(EventKind::MaterialTraceabilityViewed),
             "part.serial_assigned" => Ok(EventKind::PartSerialAssigned),
             "part.uid_marked" => Ok(EventKind::PartUidMarked),
             "export.classification_set" => Ok(EventKind::ExportClassificationSet),
@@ -3102,6 +3140,9 @@ impl EventKind {
         EventKind::PersonnelAccessDenied,
         EventKind::MaterialCertAttached,
         EventKind::MaterialHeatLotAssigned,
+        EventKind::MaterialWoBlockedNoHeatLot,
+        EventKind::MaterialMtrUploaded,
+        EventKind::MaterialTraceabilityViewed,
         EventKind::PartSerialAssigned,
         EventKind::PartUidMarked,
         EventKind::ExportClassificationSet,
@@ -3262,6 +3303,9 @@ mod tests {
             EventKind::PersonnelAccessDenied,
             EventKind::MaterialCertAttached,
             EventKind::MaterialHeatLotAssigned,
+            EventKind::MaterialWoBlockedNoHeatLot,
+            EventKind::MaterialMtrUploaded,
+            EventKind::MaterialTraceabilityViewed,
             EventKind::PartSerialAssigned,
             EventKind::PartUidMarked,
             EventKind::ExportClassificationSet,
@@ -3335,7 +3379,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            135,
+            138,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -5784,6 +5828,41 @@ mod tests {
         assert!(parsed["source_supplier"].is_string());
         assert!(parsed["assigned_at_ms"].is_i64());
         assert!(parsed["operator_user_id"].is_string());
+    }
+
+    /// S432 (ADR-0085) — the three heat-lot traceability firing-site kinds
+    /// round-trip through their storage strings, carry the `material.*` prefix,
+    /// and are distinct from each other + the two S357 seed kinds. A wrong
+    /// prefix would mis-bucket a traceability/compliance row out of the
+    /// `material.*` glob.
+    #[test]
+    fn s432_heat_lot_traceability_kinds_round_trip_and_use_material_prefix() {
+        let new = [
+            (
+                EventKind::MaterialWoBlockedNoHeatLot,
+                "material.wo_blocked_no_heat_lot",
+            ),
+            (EventKind::MaterialMtrUploaded, "material.mtr_uploaded"),
+            (
+                EventKind::MaterialTraceabilityViewed,
+                "material.traceability_viewed",
+            ),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (k, expected) in new {
+            let s = k.as_str();
+            assert_eq!(s, expected, "as_str mismatch for {k:?}");
+            assert!(s.starts_with("material."), "{s} must start with material.");
+            assert_eq!(
+                EventKind::from_storage_str(s).expect("round-trip"),
+                k,
+                "round-trip mismatch for {s}"
+            );
+            assert!(seen.insert(s), "duplicate storage string {s}");
+        }
+        // Distinct from the two S357 seed kinds.
+        assert!(seen.insert(EventKind::MaterialCertAttached.as_str()));
+        assert!(seen.insert(EventKind::MaterialHeatLotAssigned.as_str()));
     }
 
     // ── S358 / PR-45 (ADR-0075) — part.* per-unit serialization family ──────
