@@ -3704,6 +3704,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/capas/:id/review", post(handle_review_capa))
         .route("/api/capas/:id/close", post(handle_close_capa))
         .route("/api/quality-alert", get(handle_quality_alert))
+        // S440 (ADR-0068) — purchase orders. List + create (AVL-gated) +
+        // detail + transition (issue/cancel/close) + receive. Fires the po.*
+        // family; receiving auto-creates NCRs (S439) on failed inspection.
+        .route(
+            "/api/purchase-orders",
+            get(handle_list_pos).post(handle_create_po),
+        )
+        .route("/api/purchase-orders/:id", get(handle_get_po))
+        .route(
+            "/api/purchase-orders/:id/transition",
+            post(handle_transition_po),
+        )
+        .route("/api/purchase-orders/:id/receive", post(handle_receive_po))
         // PR-172 — buyer-facing notes typeahead source. GET-only,
         // ready+bearer-gated. `?scope=line|invoice|storno` is required.
         // Returns the most-recent-first deduplicated list of operator-
@@ -23322,6 +23335,230 @@ async fn handle_quality_alert(headers: HeaderMap, State(state): State<AppState>)
         .into_response(),
         Ok(Err(e)) => internal_error("quality_alert", e),
         Err(j) => internal_error("quality_alert:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+// ── S440 (ADR-0068) — purchase-order routes ─────────────────────────
+
+/// Map a [`crate::purchasing::PoError`] to an HTTP response.
+fn po_error_response(err: crate::purchasing::PoError) -> Response {
+    use crate::purchasing::PoError as PE;
+    let msg = err.to_string();
+    match err {
+        PE::NotFound(_) => (StatusCode::NOT_FOUND, Json(error_body(msg))).into_response(),
+        PE::Invalid(_) => (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response(),
+        PE::IllegalTransition(_) | PE::BlockedByVendorStatus { .. } => {
+            (StatusCode::CONFLICT, Json(error_body(msg))).into_response()
+        }
+        PE::Other(e) => internal_error("purchasing_route", e),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PoListQuery {
+    state: Option<String>,
+    vendor_partner_id: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+async fn handle_list_pos(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(q): Query<PoListQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let mut filter = crate::purchasing::PoFilter {
+        vendor_partner_id: q.vendor_partner_id,
+        from: q.from,
+        to: q.to,
+        ..Default::default()
+    };
+    if let Some(s) = q.state.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match crate::purchasing::PoState::from_db_str(s) {
+            Some(v) => filter.state = Some(v),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!("unknown state {s}"))),
+                )
+                    .into_response()
+            }
+        }
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<Vec<crate::purchasing::PurchaseOrder>> {
+            let conn = Connection::open(&*state_for_task.db_path)?;
+            crate::purchasing::list_pos(&conn, state_for_task.tenant.as_str(), &filter)
+        })
+        .await;
+    match result {
+        Ok(Ok(pos)) => Json(serde_json::json!({ "purchase_orders": pos })).into_response(),
+        Ok(Err(e)) => internal_error("list_pos", e),
+        Err(j) => internal_error("list_pos:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+async fn handle_create_po(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<crate::purchasing::NewPo>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<crate::purchasing::PurchaseOrder, crate::purchasing::PoError> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| crate::purchasing::PoError::Other(anyhow!("binary hash: {e}")))?;
+            crate::purchasing::create_po(
+                state_for_task.db_path.as_path(),
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &operator,
+                body,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(po)) => (StatusCode::CREATED, Json(po)).into_response(),
+        Ok(Err(e)) => po_error_response(e),
+        Err(j) => internal_error("create_po:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+async fn handle_get_po(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<Option<crate::purchasing::PoDetail>> {
+            let conn = Connection::open(&*state_for_task.db_path)?;
+            crate::purchasing::get_po_detail(&conn, state_for_task.tenant.as_str(), &id)
+        })
+        .await;
+    match result {
+        Ok(Ok(Some(detail))) => Json(detail).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body("purchase order not found".to_string())),
+        )
+            .into_response(),
+        Ok(Err(e)) => internal_error("get_po", e),
+        Err(j) => internal_error("get_po:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TransitionPoBody {
+    to_state: String,
+    #[serde(default)]
+    approved_by_operator: Option<String>,
+}
+
+async fn handle_transition_po(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<TransitionPoBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let Some(to) = crate::purchasing::PoState::from_db_str(body.to_state.trim()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body(format!("unknown state {}", body.to_state))),
+        )
+            .into_response();
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<crate::purchasing::PurchaseOrder, crate::purchasing::PoError> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| crate::purchasing::PoError::Other(anyhow!("binary hash: {e}")))?;
+            crate::purchasing::transition_po(
+                state_for_task.db_path.as_path(),
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &operator,
+                &id,
+                to,
+                body.approved_by_operator.as_deref(),
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(po)) => Json(po).into_response(),
+        Ok(Err(e)) => po_error_response(e),
+        Err(j) => internal_error("transition_po:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+async fn handle_receive_po(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<crate::purchasing::NewReceipt>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<crate::purchasing::PurchaseOrder, crate::purchasing::PoError> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| crate::purchasing::PoError::Other(anyhow!("binary hash: {e}")))?;
+            crate::purchasing::record_receipt(
+                state_for_task.db_path.as_path(),
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &operator,
+                &id,
+                body,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(po)) => Json(po).into_response(),
+        Ok(Err(e)) => po_error_response(e),
+        Err(j) => internal_error("receive_po:join", anyhow!("blocking task panicked: {j}")),
     }
 }
 

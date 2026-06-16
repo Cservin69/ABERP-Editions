@@ -75,6 +75,7 @@
   import Calibration from "./routes/Calibration.svelte";
   import MaterialTraceability from "./routes/MaterialTraceability.svelte";
   import Quality from "./routes/Quality.svelte";
+  import Purchasing from "./routes/Purchasing.svelte";
   import IssueInvoice from "./routes/IssueInvoice.svelte";
   import MaintenanceDashboard from "./routes/MaintenanceDashboard.svelte";
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
@@ -743,6 +744,8 @@
           <MaterialTraceability />
         {:else if route === "quality-ncrs"}
           <Quality />
+        {:else if route === "purchase-orders"}
+          <Purchasing />
         {:else if route === "invoices-new"}
           <!-- PR-87 / session-112 — full-page issuance route. The
                IssueInvoice form was a `<dialog>` modal mounted inside

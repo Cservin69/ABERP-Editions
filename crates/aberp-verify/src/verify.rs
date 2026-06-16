@@ -1155,7 +1155,19 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::CapaCreated
         | EventKind::CapaApproved
         | EventKind::CapaEffectivenessReviewed
-        | EventKind::CapaClosed => (None, ""),
+        | EventKind::CapaClosed
+        // S440 (ADR-0068) — po.* purchase-order rows carry app-layer JSON
+        // (po_id / po_number / line + receipt data), never NAV XML bytes.
+        // Exhaustiveness arm only.
+        | EventKind::PoCreated
+        | EventKind::PoLineAdded
+        | EventKind::PoIssued
+        | EventKind::PoReceiptRecorded
+        | EventKind::PoPartiallyReceived
+        | EventKind::PoReceived
+        | EventKind::PoClosed
+        | EventKind::PoCancelled
+        | EventKind::PoIncomingInspectionFailed => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1177,7 +1189,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 159,
+        EventKind::ALL_KINDS_COUNT == 168,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1620,6 +1632,21 @@ mod tests {
             EventKind::CapaApproved,
             EventKind::CapaEffectivenessReviewed,
             EventKind::CapaClosed,
+        ]);
+    }
+
+    #[test]
+    fn purchase_order_no_nav_bytes() {
+        assert_family_no_nav(&[
+            EventKind::PoCreated,
+            EventKind::PoLineAdded,
+            EventKind::PoIssued,
+            EventKind::PoReceiptRecorded,
+            EventKind::PoPartiallyReceived,
+            EventKind::PoReceived,
+            EventKind::PoClosed,
+            EventKind::PoCancelled,
+            EventKind::PoIncomingInspectionFailed,
         ]);
     }
 

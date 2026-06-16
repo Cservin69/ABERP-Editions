@@ -2884,6 +2884,85 @@ pub enum EventKind {
     /// Payload (`serde_json::Value`): `capa_id`, `ncr_id`, `actual_close_date`,
     /// `operator_user_id`. `capa.*` family.
     CapaClosed,
+
+    /// S440 (ADR-0068) — a purchase order was created (state `Draft`). FIRST
+    /// member of the new `po.*` prefix family — the procurement strand of the
+    /// defense pivot. The AVL gate ([[trust-code-not-operator]]) runs at create
+    /// time: a `Suspended`/`Revoked` vendor is refused before this fires (see
+    /// [`Self::PoBlockedByVendorStatus`]); a `Pending`/`Conditional` vendor is
+    /// allowed and its status snapshotted onto the PO.
+    ///
+    /// Payload (`serde_json::Value`): `po_id`, `po_number`, `vendor_partner_id`,
+    /// `currency`, `subtotal_minor`, `vat_minor`, `total_minor`,
+    /// `vendor_avl_status` (the snapshot — `none` when the vendor is unlisted),
+    /// `line_count`, `operator_user_id`, `created_at_utc`. `po.*` family.
+    PoCreated,
+
+    /// S440 (ADR-0068) — a line was added to a purchase order at create time.
+    /// One per line (so a forensic walker can reconstruct the PO without the
+    /// row). `po.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `po_id`, `pol_id`, `product_id`,
+    /// `description`, `quantity`, `unit_price_minor`, `line_total_minor`,
+    /// `expected_heat_lot_required`, `operator_user_id`. `po.*` family.
+    PoLineAdded,
+
+    /// S440 (ADR-0068) — a PO was issued to the vendor (`Draft → IssuedToVendor`).
+    /// Requires an `approved_by_operator` ([[trust-code-not-operator]]); the AVL
+    /// status is re-checked at issue time, so a `Pending`/`Suspended`/`Revoked`
+    /// vendor blocks the issue even if the PO was created while eligible.
+    ///
+    /// Payload (`serde_json::Value`): `po_id`, `po_number`, `vendor_partner_id`,
+    /// `approved_by_operator`, `issued_at_utc`. `po.*` family.
+    PoIssued,
+
+    /// S440 (ADR-0068) — a delivery receipt was recorded against a PO. Carries
+    /// the vendor delivery-note number + the per-line received quantities. Always
+    /// fires once per receive action; the resulting state transition fires its
+    /// own [`Self::PoPartiallyReceived`] / [`Self::PoReceived`].
+    ///
+    /// Payload (`serde_json::Value`): `po_id`, `po_number`,
+    /// `delivery_note_number`, `received_line_count`, `any_inspection_failed`,
+    /// `received_by_operator`, `received_at_utc`. `po.*` family.
+    PoReceiptRecorded,
+
+    /// S440 (ADR-0068) — a receipt left a PO partially received (some lines have
+    /// received > 0 but not all are fully received). `po.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `po_id`, `po_number`, `operator_user_id`,
+    /// `changed_at_utc`. `po.*` family.
+    PoPartiallyReceived,
+
+    /// S440 (ADR-0068) — a receipt completed a PO (every line fully received);
+    /// state advanced to `Received`. `po.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `po_id`, `po_number`, `operator_user_id`,
+    /// `changed_at_utc`. `po.*` family.
+    PoReceived,
+
+    /// S440 (ADR-0068) — a fully-received PO was closed (`Received → Closed`,
+    /// terminal). `po.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `po_id`, `po_number`, `operator_user_id`,
+    /// `closed_at_utc`. `po.*` family.
+    PoClosed,
+
+    /// S440 (ADR-0068) — a PO was cancelled (`Draft`/`IssuedToVendor`/
+    /// `PartiallyReceived → Cancelled`). `po.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `po_id`, `po_number`, `from_state`,
+    /// `operator_user_id`, `cancelled_at_utc`. `po.*` family.
+    PoCancelled,
+
+    /// S440 (ADR-0068) — an incoming-inspection FAIL on a received PO line
+    /// auto-created an NCR (S439), wiring receiving into the quality system
+    /// ([[trust-code-not-operator]] — the operator cannot receive a failed line
+    /// without an NCR). `po.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `po_id`, `po_number`, `pol_id`,
+    /// `vendor_partner_id`, `ncr_id`, `inspection_notes`, `operator_user_id`,
+    /// `at_utc`. `po.*` family.
+    PoIncomingInspectionFailed,
 }
 
 impl EventKind {
@@ -3063,6 +3142,15 @@ impl EventKind {
             EventKind::CapaApproved => "capa.approved",
             EventKind::CapaEffectivenessReviewed => "capa.effectiveness_reviewed",
             EventKind::CapaClosed => "capa.closed",
+            EventKind::PoCreated => "po.created",
+            EventKind::PoLineAdded => "po.line_added",
+            EventKind::PoIssued => "po.issued",
+            EventKind::PoReceiptRecorded => "po.receipt_recorded",
+            EventKind::PoPartiallyReceived => "po.partially_received",
+            EventKind::PoReceived => "po.received",
+            EventKind::PoClosed => "po.closed",
+            EventKind::PoCancelled => "po.cancelled",
+            EventKind::PoIncomingInspectionFailed => "po.incoming_inspection_failed",
         }
     }
 
@@ -3253,6 +3341,15 @@ impl EventKind {
             "capa.approved" => Ok(EventKind::CapaApproved),
             "capa.effectiveness_reviewed" => Ok(EventKind::CapaEffectivenessReviewed),
             "capa.closed" => Ok(EventKind::CapaClosed),
+            "po.created" => Ok(EventKind::PoCreated),
+            "po.line_added" => Ok(EventKind::PoLineAdded),
+            "po.issued" => Ok(EventKind::PoIssued),
+            "po.receipt_recorded" => Ok(EventKind::PoReceiptRecorded),
+            "po.partially_received" => Ok(EventKind::PoPartiallyReceived),
+            "po.received" => Ok(EventKind::PoReceived),
+            "po.closed" => Ok(EventKind::PoClosed),
+            "po.cancelled" => Ok(EventKind::PoCancelled),
+            "po.incoming_inspection_failed" => Ok(EventKind::PoIncomingInspectionFailed),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -3429,6 +3526,15 @@ impl EventKind {
         EventKind::CapaApproved,
         EventKind::CapaEffectivenessReviewed,
         EventKind::CapaClosed,
+        EventKind::PoCreated,
+        EventKind::PoLineAdded,
+        EventKind::PoIssued,
+        EventKind::PoReceiptRecorded,
+        EventKind::PoPartiallyReceived,
+        EventKind::PoReceived,
+        EventKind::PoClosed,
+        EventKind::PoCancelled,
+        EventKind::PoIncomingInspectionFailed,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -3613,6 +3719,15 @@ mod tests {
             EventKind::CapaApproved,
             EventKind::CapaEffectivenessReviewed,
             EventKind::CapaClosed,
+            EventKind::PoCreated,
+            EventKind::PoLineAdded,
+            EventKind::PoIssued,
+            EventKind::PoReceiptRecorded,
+            EventKind::PoPartiallyReceived,
+            EventKind::PoReceived,
+            EventKind::PoClosed,
+            EventKind::PoCancelled,
+            EventKind::PoIncomingInspectionFailed,
         ];
         for v in &variants {
             let s = v.as_str();
@@ -3646,7 +3761,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            159,
+            168,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -6197,6 +6312,47 @@ mod tests {
             assert!(seen.insert(s), "duplicate storage string {s}");
         }
         assert_eq!(seen.len(), 9, "nine distinct quality kinds");
+    }
+
+    /// S440 (ADR-0068) — the nine purchase-order kinds round-trip, carry the new
+    /// `po.*` prefix, and are distinct from one another. `PoBlockedByVendorStatus`
+    /// stays `supplier.*` (S431) — the PO surface keeps the AVL-gate kind where it
+    /// has always lived; the nine procurement-lifecycle kinds get the new family.
+    #[test]
+    fn s440_purchase_order_kinds_round_trip_and_use_po_prefix() {
+        let new = [
+            (EventKind::PoCreated, "po.created"),
+            (EventKind::PoLineAdded, "po.line_added"),
+            (EventKind::PoIssued, "po.issued"),
+            (EventKind::PoReceiptRecorded, "po.receipt_recorded"),
+            (EventKind::PoPartiallyReceived, "po.partially_received"),
+            (EventKind::PoReceived, "po.received"),
+            (EventKind::PoClosed, "po.closed"),
+            (EventKind::PoCancelled, "po.cancelled"),
+            (
+                EventKind::PoIncomingInspectionFailed,
+                "po.incoming_inspection_failed",
+            ),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (k, expected) in new {
+            let s = k.as_str();
+            assert_eq!(s, expected, "as_str mismatch for {k:?}");
+            assert!(s.starts_with("po."), "{s} must start with po.");
+            // Must NOT collide with the `supplier.po_blocked_by_vendor_status`
+            // AVL-gate kind (different prefix family).
+            assert!(
+                !s.starts_with("supplier."),
+                "{s} must not be in the supplier.* family"
+            );
+            assert_eq!(
+                EventKind::from_storage_str(s).expect("round-trip"),
+                k,
+                "round-trip mismatch for {s}"
+            );
+            assert!(seen.insert(s), "duplicate storage string {s}");
+        }
+        assert_eq!(seen.len(), 9, "nine distinct purchase-order kinds");
     }
 
     // ── S358 / PR-45 (ADR-0075) — part.* per-unit serialization family ──────

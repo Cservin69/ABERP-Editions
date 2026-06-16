@@ -58,6 +58,9 @@ export type ErpModuleId =
   // non-conformance reports + corrective/preventive actions + open-NCR
   // shipment gate. Single route (the NCR list with in-page detail).
   | "quality"
+  // S440 — procurement (purchase orders). Operational area; AVL-gated PO
+  // create + receiving that auto-creates NCRs on failed inspection.
+  | "purchasing"
   | "master-data"
   | "settings"
   // S267 / PR-256 — auto-quoting engine tunables. Maintenance-area
@@ -249,6 +252,16 @@ export const MODULES: ErpModule[] = [
     label_en: "Quality",
     glyph: "✅",
     routes: [{ id: "quality-ncrs", label: "NCR-ek / NCRs" }],
+  },
+  // S440 (ADR-0068) — procurement: purchase orders. Operational area, after
+  // Quality. AVL-gated create + receiving (auto-NCR on failed inspection).
+  {
+    id: "purchasing",
+    area: "operational",
+    label_hu: "Beszerzés",
+    label_en: "Purchasing",
+    glyph: "🛒",
+    routes: [{ id: "purchase-orders", label: "Megrendelések / POs" }],
   },
   {
     id: "master-data",

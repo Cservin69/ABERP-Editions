@@ -5086,3 +5086,164 @@ export async function toggleTenantNav(
 export async function setHideDemo(hide: boolean): Promise<TenantListResponse> {
   return invoke<TenantListResponse>("set_hide_demo", { body: { hide } });
 }
+
+// ── S440 (ADR-0068) — purchase orders ────────────────────────────────
+
+/** S440 — PO lifecycle state. Mirrors `aberp::purchasing::PoState`. */
+export type PoState =
+  | "draft"
+  | "issued_to_vendor"
+  | "partially_received"
+  | "received"
+  | "closed"
+  | "cancelled";
+
+/** S440 — one purchase-order header. Mirrors
+ * `aberp::purchasing::PurchaseOrder`. Money is integer minor units; the
+ * `currency` is a free ISO-4217 token (not the NAV fiscal Currency enum). */
+export interface PurchaseOrder {
+  po_id: string;
+  po_number: string;
+  vendor_partner_id: string;
+  currency: string;
+  subtotal_minor: number;
+  vat_rate_pct: number;
+  vat_minor: number;
+  total_minor: number;
+  state: PoState;
+  /** AVL status snapshot at create (`null` = vendor unlisted). Drives the
+   * Conditional yellow chip. */
+  vendor_avl_status: ApprovedStatus | null;
+  issued_at_utc: string | null;
+  expected_delivery_utc: string | null;
+  notes: string;
+  requested_by_operator: string;
+  approved_by_operator: string | null;
+  approved_at_utc: string | null;
+  created_at_utc: string;
+}
+
+/** S440 — one PO line. Mirrors `aberp::purchasing::PoLine`. */
+export interface PoLine {
+  pol_id: string;
+  po_id: string;
+  product_id: string | null;
+  description: string;
+  quantity: number;
+  unit_price_minor: number;
+  currency: string;
+  line_total_minor: number;
+  expected_heat_lot_required: boolean;
+  received_quantity: number;
+}
+
+/** S440 — one receipt row. Mirrors `aberp::purchasing::PoReceiptLine`. */
+export interface PoReceiptLine {
+  por_id: string;
+  po_id: string;
+  pol_id: string;
+  received_at_utc: string;
+  received_by_operator: string;
+  delivery_note_number: string;
+  received_quantity: number;
+  inspection_pass: boolean;
+  inspection_notes: string;
+  heat_lot_assigned: string | null;
+  ncr_id: string | null;
+}
+
+/** S440 — PO detail: header + lines + receipts. */
+export interface PoDetail extends PurchaseOrder {
+  lines: PoLine[];
+  receipts: PoReceiptLine[];
+}
+
+/** S440 — one line in a create-PO request. */
+export interface NewPoLineInput {
+  product_id?: string | null;
+  description: string;
+  quantity: number;
+  unit_price_minor: number;
+  expected_heat_lot_required: boolean;
+}
+
+/** S440 — create-PO request body. */
+export interface NewPoInput {
+  vendor_partner_id: string;
+  currency: string;
+  vat_rate_pct: number;
+  expected_delivery_utc?: string | null;
+  notes: string;
+  lines: NewPoLineInput[];
+}
+
+/** S440 — one line in a receive request. */
+export interface ReceiptLineInput {
+  pol_id: string;
+  received_quantity: number;
+  inspection_pass: boolean;
+  inspection_notes: string;
+  heat_lot?: string | null;
+}
+
+/** S440 — receive request body. */
+export interface NewReceiptInput {
+  delivery_note_number: string;
+  lines: ReceiptLineInput[];
+}
+
+/** S440 — `GET /api/purchase-orders` (optionally filtered). */
+export async function listPurchaseOrders(filters?: {
+  state?: PoState;
+  vendorPartnerId?: string;
+  from?: string;
+  to?: string;
+}): Promise<PurchaseOrder[]> {
+  const res = await invoke<{ purchase_orders: PurchaseOrder[] }>(
+    "list_purchase_orders",
+    {
+      stateFilter: filters?.state ?? null,
+      vendorPartnerId: filters?.vendorPartnerId ?? null,
+      from: filters?.from ?? null,
+      to: filters?.to ?? null,
+    },
+  );
+  return res.purchase_orders;
+}
+
+/** S440 — `POST /api/purchase-orders`. A blocked AVL vendor throws the
+ * forwarder's 409 error string. */
+export async function createPurchaseOrder(
+  body: NewPoInput,
+): Promise<PurchaseOrder> {
+  return invoke<PurchaseOrder>("create_purchase_order", { body });
+}
+
+/** S440 — `GET /api/purchase-orders/:id` (detail). */
+export async function getPurchaseOrder(poId: string): Promise<PoDetail> {
+  return invoke<PoDetail>("get_purchase_order", { poId });
+}
+
+/** S440 — `POST /api/purchase-orders/:id/transition`. `approvedByOperator`
+ * is required (non-null) when issuing. */
+export async function transitionPurchaseOrder(
+  poId: string,
+  toState: PoState,
+  approvedByOperator?: string,
+): Promise<PurchaseOrder> {
+  return invoke<PurchaseOrder>("transition_purchase_order", {
+    poId,
+    body: {
+      to_state: toState,
+      approved_by_operator: approvedByOperator ?? null,
+    },
+  });
+}
+
+/** S440 — `POST /api/purchase-orders/:id/receive`. */
+export async function receivePurchaseOrder(
+  poId: string,
+  body: NewReceiptInput,
+): Promise<PurchaseOrder> {
+  return invoke<PurchaseOrder>("receive_purchase_order", { poId, body });
+}

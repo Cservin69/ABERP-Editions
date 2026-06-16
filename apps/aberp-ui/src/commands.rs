@@ -1386,6 +1386,82 @@ pub async fn quality_alert(state: State<'_, AppState>) -> Result<Value, String> 
     forward_get(&state, "/api/quality-alert", true).await
 }
 
+/// S440 — `GET /api/purchase-orders` (PO list). Optional filter facets are
+/// URL-encoded; an absent/blank facet is omitted. The backend scans in Rust.
+#[tauri::command]
+pub async fn list_purchase_orders(
+    state: State<'_, AppState>,
+    state_filter: Option<String>,
+    vendor_partner_id: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<Value, String> {
+    let mut params: Vec<String> = Vec::new();
+    let mut push = |k: &str, v: &Option<String>| {
+        if let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            params.push(format!("{k}={}", urlencode(s)));
+        }
+    };
+    push("state", &state_filter);
+    push("vendor_partner_id", &vendor_partner_id);
+    push("from", &from);
+    push("to", &to);
+    let path = if params.is_empty() {
+        "/api/purchase-orders".to_string()
+    } else {
+        format!("/api/purchase-orders?{}", params.join("&"))
+    };
+    forward_get(&state, &path, true).await
+}
+
+/// S440 — `POST /api/purchase-orders` (create PO). Body carries vendor +
+/// currency + vat + lines. A blocked AVL vendor surfaces as a 409.
+#[tauri::command]
+pub async fn create_purchase_order(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/purchase-orders", body).await
+}
+
+/// S440 — `GET /api/purchase-orders/:id` (detail: lines + receipt history).
+#[tauri::command]
+pub async fn get_purchase_order(
+    state: State<'_, AppState>,
+    po_id: String,
+) -> Result<Value, String> {
+    validate_quality_id(&po_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/purchase-orders/{po_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// S440 — `POST /api/purchase-orders/:id/transition`. Body:
+/// `{ to_state, approved_by_operator? }` (the approver is required when issuing).
+#[tauri::command]
+pub async fn transition_purchase_order(
+    state: State<'_, AppState>,
+    po_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_quality_id(&po_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/purchase-orders/{po_id}/transition");
+    forward_post(&state, &path, body).await
+}
+
+/// S440 — `POST /api/purchase-orders/:id/receive`. Body:
+/// `{ delivery_note_number, lines: [{ pol_id, received_quantity, inspection_pass,
+/// inspection_notes?, heat_lot? }] }`.
+#[tauri::command]
+pub async fn receive_purchase_order(
+    state: State<'_, AppState>,
+    po_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_quality_id(&po_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/purchase-orders/{po_id}/receive");
+    forward_post(&state, &path, body).await
+}
+
 /// S232 — `GET /api/products/:id/bom`. Read the active BOM lines for
 /// a product. The Product detail page's BOM tab reads here.
 #[tauri::command]

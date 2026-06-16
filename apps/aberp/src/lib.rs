@@ -95,6 +95,7 @@ pub mod poll_ack;
 pub mod poll_annulment_ack;
 pub mod print_invoice;
 pub mod products;
+pub mod purchasing;
 pub mod quote_intake_config;
 pub mod quote_intake_credentials;
 pub mod quote_intake_query;

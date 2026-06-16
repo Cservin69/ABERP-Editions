@@ -1,6 +1,6 @@
 # ADR-0068 — Vendor-PO spend authorization: per-PO ceiling + rolling daily cap, operator gate above, lightweight intent record (no purchasing module in v1)
 
-- **Status:** Proposed
+- **Status:** Partially superseded — S440 / ADR-0091 delivers the operator-driven purchasing/PO module this ADR deferred in v1; the autonomous-firing spend ceiling (per-PO + rolling daily cap on DEAL-saga auto-POs) decided below remains future work that would layer onto `aberp::purchasing::create_po`.
 - **Date:** 2026-06-06
 - **Deciders:** Ervin (via S265 auto-quoting ground-zero brief)
 - **Supersedes:** none.

@@ -1014,7 +1014,19 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::CapaCreated
         | EventKind::CapaApproved
         | EventKind::CapaEffectivenessReviewed
-        | EventKind::CapaClosed => None,
+        | EventKind::CapaClosed
+        // S440 (ADR-0068) — po.* purchase-order rows: app-layer JSON, never NAV
+        // XML. Procurement lifecycle, never swept by a per-OUTGOING-invoice
+        // export bundle glob.
+        | EventKind::PoCreated
+        | EventKind::PoLineAdded
+        | EventKind::PoIssued
+        | EventKind::PoReceiptRecorded
+        | EventKind::PoPartiallyReceived
+        | EventKind::PoReceived
+        | EventKind::PoClosed
+        | EventKind::PoCancelled
+        | EventKind::PoIncomingInspectionFailed => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1044,7 +1056,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 159,
+        EventKind::ALL_KINDS_COUNT == 168,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1795,6 +1807,37 @@ mod tests {
                 .append(
                     kind.clone(),
                     br#"{"ncr_id":"ncr_01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#.to_vec(),
+                    actor,
+                    None,
+                )
+                .unwrap();
+            let entries = ledger.entries().unwrap();
+            let nav = extract_nav_xml(&entries[0]).unwrap();
+            assert!(nav.is_none(), "{} must produce no nav/ file", kind.as_str());
+        }
+    }
+
+    /// S440 (ADR-0068) — the nine `po.*` purchase-order kinds carry app-layer
+    /// JSON payloads, never NAV XML, so `extract_nav_xml` MUST return `None` for
+    /// each. Belt-and-braces runtime pin alongside the compile-time arm.
+    #[test]
+    fn extract_nav_xml_returns_none_for_purchase_order_kinds() {
+        for kind in [
+            EventKind::PoCreated,
+            EventKind::PoLineAdded,
+            EventKind::PoIssued,
+            EventKind::PoReceiptRecorded,
+            EventKind::PoPartiallyReceived,
+            EventKind::PoReceived,
+            EventKind::PoClosed,
+            EventKind::PoCancelled,
+            EventKind::PoIncomingInspectionFailed,
+        ] {
+            let (mut ledger, actor, _bh) = fixture_ledger();
+            ledger
+                .append(
+                    kind.clone(),
+                    br#"{"po_id":"po_01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#.to_vec(),
                     actor,
                     None,
                 )

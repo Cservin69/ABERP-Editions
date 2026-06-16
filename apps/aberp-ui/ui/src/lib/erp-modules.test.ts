@@ -202,6 +202,8 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   "material-traceability": "operational",
   // S439 — defense quality management (NCR + CAPA), operational area.
   "quality-ncrs": "operational",
+  // S440 — procurement / purchase orders, operational area.
+  "purchase-orders": "operational",
   // S433 — multi-tenant admin (maintenance area, under Settings).
   tenants: "maintenance",
 };
@@ -404,6 +406,7 @@ describe("modulesInArea + defaultRouteForArea", () => {
     // S429 — "calibration" joins after snapshots.
     // S432 — "material-traceability" joins after calibration.
     // S439 — "quality" joins after material-traceability.
+    // S440 — "purchasing" joins after quality.
     expect(op.map((m) => m.id)).toEqual([
       "invoicing",
       "statistics",
@@ -413,6 +416,7 @@ describe("modulesInArea + defaultRouteForArea", () => {
       "calibration",
       "material-traceability",
       "quality",
+      "purchasing",
     ]);
     // S267 / PR-256 — new `quoting` module joins maintenance after Settings.
     // S281 / PR-266 — new `email-relay` module joins after Quoting.

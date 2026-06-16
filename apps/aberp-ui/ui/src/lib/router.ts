@@ -86,6 +86,9 @@ export type AppRoute =
   // S439 — defense quality management. Operational area; NCR list with
   // in-page detail (transitions, linked CAPAs) + create + state transitions.
   | "quality-ncrs"
+  // S440 — procurement. Operational area; PO list + create (AVL-gated) +
+  // in-page detail + receiving (auto-NCR on failed inspection).
+  | "purchase-orders"
   // S433 — multi-tenant admin (Settings area). List every tenant from
   // tenants.toml + add / switch (restart-based) / archive / restore.
   // Distinct from the singular `tenant` route, which is the running
@@ -180,6 +183,8 @@ export function parseRoute(hash: string): AppRoute {
       return "material-traceability";
     case "quality-ncrs":
       return "quality-ncrs";
+    case "purchase-orders":
+      return "purchase-orders";
     case "tenants":
       return "tenants";
     default:
