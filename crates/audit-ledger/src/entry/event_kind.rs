@@ -2739,6 +2739,38 @@ pub enum EventKind {
     /// carries the demo slug + display name. `tenant.*` family; app-layer
     /// JSON only — never NAV XML.
     TenantDemoSeeded,
+
+    /// S434 — an operator flipped a tenant's `nav_enabled` flag (the
+    /// "NAV synchron" toggle) from the Tenants admin screen. Fired in the
+    /// running tenant's ledger. Payload (`TenantNavToggledPayload`)
+    /// carries the slug + old/new boolean + operator login. `tenant.*`
+    /// family; app-layer JSON only — never NAV XML.
+    TenantNavToggled,
+
+    /// S434 — a NAV-disabled tenant booted straight to Ready, skipping the
+    /// §169 seller-identity gate (the seller tax number is optional in
+    /// NAV-off mode). Fired once per boot into the running tenant's
+    /// ledger so operations can see which tenants run without NAV.
+    /// Payload (`TenantSellerSetupOptionalPayload`) carries the slug.
+    /// `tenant.*` family; app-layer JSON only.
+    TenantSellerSetupOptional,
+
+    /// S434 — seller identity saved; records the region/NAV mode the
+    /// tax-number validator ran under (HU §169 shape vs opaque
+    /// international). Fired once on seller-info save into the running
+    /// tenant's ledger. Payload (`TenantSellerRegionConfiguredPayload`)
+    /// carries the country code + nav_enabled + operator login.
+    /// `tenant.*` family; app-layer JSON only.
+    TenantSellerRegionConfigured,
+
+    /// S434 — an invoice was issued under a NAV-disabled tenant, so it is
+    /// stored LOCAL ONLY (PDF + ledger, never submitted to NAV). Fired
+    /// once per such invoice into the tenant's ledger; the
+    /// `derive_state` ladder reads it to render the `LocalOnly` typestate.
+    /// Payload (`InvoiceLocalOnlyEmittedPayload`) carries the invoice id +
+    /// operator login. `invoice.*` family; app-layer JSON only — never
+    /// NAV XML (the whole point is that no NAV XML was sent).
+    InvoiceLocalOnlyEmitted,
 }
 
 impl EventKind {
@@ -2903,6 +2935,10 @@ impl EventKind {
             EventKind::TenantArchived => "tenant.archived",
             EventKind::TenantRestored => "tenant.restored",
             EventKind::TenantDemoSeeded => "tenant.demo_seeded",
+            EventKind::TenantNavToggled => "tenant.nav_toggled",
+            EventKind::TenantSellerSetupOptional => "tenant.seller_setup_optional",
+            EventKind::TenantSellerRegionConfigured => "tenant.seller_region_configured",
+            EventKind::InvoiceLocalOnlyEmitted => "invoice.local_only_emitted",
         }
     }
 
@@ -3078,6 +3114,10 @@ impl EventKind {
             "tenant.archived" => Ok(EventKind::TenantArchived),
             "tenant.restored" => Ok(EventKind::TenantRestored),
             "tenant.demo_seeded" => Ok(EventKind::TenantDemoSeeded),
+            "tenant.nav_toggled" => Ok(EventKind::TenantNavToggled),
+            "tenant.seller_setup_optional" => Ok(EventKind::TenantSellerSetupOptional),
+            "tenant.seller_region_configured" => Ok(EventKind::TenantSellerRegionConfigured),
+            "invoice.local_only_emitted" => Ok(EventKind::InvoiceLocalOnlyEmitted),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -3239,6 +3279,10 @@ impl EventKind {
         EventKind::TenantArchived,
         EventKind::TenantRestored,
         EventKind::TenantDemoSeeded,
+        EventKind::TenantNavToggled,
+        EventKind::TenantSellerSetupOptional,
+        EventKind::TenantSellerRegionConfigured,
+        EventKind::InvoiceLocalOnlyEmitted,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -3408,6 +3452,10 @@ mod tests {
             EventKind::TenantArchived,
             EventKind::TenantRestored,
             EventKind::TenantDemoSeeded,
+            EventKind::TenantNavToggled,
+            EventKind::TenantSellerSetupOptional,
+            EventKind::TenantSellerRegionConfigured,
+            EventKind::InvoiceLocalOnlyEmitted,
         ];
         for v in &variants {
             let s = v.as_str();
@@ -3441,7 +3489,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            144,
+            148,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \

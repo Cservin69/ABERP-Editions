@@ -137,9 +137,43 @@ impl std::error::Error for SetupSellerInfoError {}
 pub fn setup_seller_info_from_inputs(
     tenant: &str,
     inputs: &SellerInfoInputs,
+    nav_enabled: bool,
 ) -> std::result::Result<SellerInfoInputs, SetupSellerInfoError> {
     let path = seller_toml_path_for_tenant(tenant).map_err(SetupSellerInfoError::Backend)?;
-    setup_seller_info_to_path(&path, inputs)
+    setup_seller_info_to_path(&path, inputs, nav_enabled)
+}
+
+/// S434 — region-aware tax-number validation. The validator is selected
+/// by the tenant's NAV-synchron mode, NOT a speculative N-country map:
+/// Hungarian NAV is the only regime ABERP submits to, so it is the only
+/// regime with a real shape check. When NAV is ON the seller MUST be a
+/// §169 Hungarian taxpayer, so the `xxxxxxxx-y-zz` ADÓSZÁM shape is
+/// enforced (unchanged from the pre-S434 path). When NAV is OFF
+/// (international operators) the tax number is OPTIONAL and stored opaque
+/// — we never validate a format we never submit. Returns `Some(FieldError)`
+/// on rejection, `None` when accepted.
+///
+/// (Rule 13: deliberately a two-arm switch on `nav_enabled`, not a
+/// country-code dispatch table with one populated entry — see the session
+/// report. The seller's country still rides on `address_country_code`;
+/// the NAV-mode flag is the actual discriminator.)
+fn validate_seller_tax_number(nav_enabled: bool, tax: &str) -> Option<FieldError> {
+    if !nav_enabled {
+        // International / NAV-off: optional + opaque. Empty is fine; any
+        // non-empty string is stored verbatim with no shape check.
+        return None;
+    }
+    match parse_hungarian_tax_number(tax) {
+        Ok(_) => None,
+        Err(e @ SupplierConfigError::MissingTaxNumber) => Some(FieldError {
+            field: "taxNumber",
+            message: e.to_string(),
+        }),
+        Err(e @ SupplierConfigError::MalformedTaxNumber { .. }) => Some(FieldError {
+            field: "taxNumber",
+            message: e.to_string(),
+        }),
+    }
 }
 
 /// PR-51 / session-71 — path-explicit sibling of
@@ -153,6 +187,7 @@ pub fn setup_seller_info_from_inputs(
 pub fn setup_seller_info_to_path(
     path: &Path,
     inputs: &SellerInfoInputs,
+    nav_enabled: bool,
 ) -> std::result::Result<SellerInfoInputs, SetupSellerInfoError> {
     // PR-170 defense-in-depth: snapshot the prior seller.toml body
     // before we touch it. Best-effort — see seller_toml_backup module
@@ -167,16 +202,10 @@ pub fn setup_seller_info_to_path(
         "Legal name is required",
         &mut errors,
     );
-    match parse_hungarian_tax_number(&inputs.tax_number) {
-        Ok(_) => {}
-        Err(SupplierConfigError::MissingTaxNumber) => errors.push(FieldError {
-            field: "taxNumber",
-            message: SupplierConfigError::MissingTaxNumber.to_string(),
-        }),
-        Err(e @ SupplierConfigError::MalformedTaxNumber { .. }) => errors.push(FieldError {
-            field: "taxNumber",
-            message: e.to_string(),
-        }),
+    // S434 — region-aware: HU §169 shape when NAV on, optional+opaque
+    // when NAV off.
+    if let Some(fe) = validate_seller_tax_number(nav_enabled, &inputs.tax_number) {
+        errors.push(fe);
     }
     require_nonblank(
         "addressCountryCode",
@@ -756,7 +785,7 @@ city = "Budapest"
     fn validation_rejects_blank_legal_name() {
         let mut inputs = good_inputs();
         inputs.legal_name = "   ".to_string();
-        let err = setup_seller_info_from_inputs("t-validation", &inputs)
+        let err = setup_seller_info_from_inputs("t-validation", &inputs, true)
             .expect_err("blank legal name must fail");
         match err {
             SetupSellerInfoError::Validation(fields) => {
@@ -773,7 +802,7 @@ city = "Budapest"
     fn validation_rejects_malformed_tax_number() {
         let mut inputs = good_inputs();
         inputs.tax_number = "24904362".to_string(); // bare 8-digit, missing dashes
-        let err = setup_seller_info_from_inputs("t-validation", &inputs)
+        let err = setup_seller_info_from_inputs("t-validation", &inputs, true)
             .expect_err("malformed tax must fail");
         match err {
             SetupSellerInfoError::Validation(fields) => {
@@ -791,6 +820,36 @@ city = "Budapest"
         }
     }
 
+    /// S434 — region dispatch: NAV-ON (HU) rejects an empty tax number
+    /// (§169 requires the ADÓSZÁM); NAV-OFF (international) accepts it.
+    #[test]
+    fn region_dispatch_hu_rejects_empty_tax_intl_accepts() {
+        // HU / NAV-on → empty tax is a hard taxNumber error.
+        assert!(validate_seller_tax_number(true, "").is_some());
+        // International / NAV-off → empty tax accepted (optional).
+        assert!(validate_seller_tax_number(false, "").is_none());
+        // International / NAV-off → a non-HU-shaped string is opaque-OK.
+        assert!(validate_seller_tax_number(false, "ZA-4880101999").is_none());
+        // HU / NAV-on → a valid ADÓSZÁM passes.
+        assert!(validate_seller_tax_number(true, "24904362-2-41").is_none());
+        // HU / NAV-on → a malformed ADÓSZÁM is rejected.
+        assert!(validate_seller_tax_number(true, "24904362").is_some());
+    }
+
+    /// S434 — end-to-end through the writer: an international (NAV-off)
+    /// tenant saves seller info with NO tax number and the file is written.
+    #[test]
+    fn intl_seller_save_accepts_empty_tax_number() {
+        let tmp = test_dir("intl_no_tax");
+        let path = tmp.join("seller.toml");
+        let mut inputs = good_inputs();
+        inputs.tax_number = String::new();
+        inputs.address_country_code = "ZA".to_string();
+        setup_seller_info_to_path(&path, &inputs, /* nav_enabled */ false)
+            .expect("international save with empty tax must succeed");
+        assert!(path.exists(), "seller.toml written for NAV-off tenant");
+    }
+
     #[test]
     fn validation_collects_all_errors_at_once() {
         // Blank legal_name + missing tax + blank city all surface in
@@ -799,7 +858,7 @@ city = "Budapest"
         inputs.legal_name = String::new();
         inputs.tax_number = String::new();
         inputs.address_city = "   ".to_string();
-        let err = setup_seller_info_from_inputs("t-validation", &inputs)
+        let err = setup_seller_info_from_inputs("t-validation", &inputs, true)
             .expect_err("multi-field invalid must fail");
         match err {
             SetupSellerInfoError::Validation(fields) => {
@@ -873,7 +932,7 @@ default        = true
             swift_bic: None,
         };
 
-        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+        setup_seller_info_to_path(&path, &inputs, true).expect("identity save");
 
         let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
         // Identity edited:
@@ -952,7 +1011,7 @@ attach_xml = true
             swift_bic: None,
         };
 
-        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+        setup_seller_info_to_path(&path, &inputs, true).expect("identity save");
 
         // Re-parse via the SMTP module's own reader — round-trip MUST
         // recover the original SmtpConfig byte-for-byte at the value
@@ -1021,7 +1080,7 @@ start_value = 1
             swift_bic: None,
         };
 
-        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+        setup_seller_info_to_path(&path, &inputs, true).expect("identity save");
 
         let template =
             crate::numbering::read_numbering_template(&path).expect("re-read numbering template");
@@ -1105,7 +1164,7 @@ start_value = 1
             swift_bic: None,
         };
 
-        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+        setup_seller_info_to_path(&path, &inputs, true).expect("identity save");
 
         let banks = crate::seller_banks::read_seller_banks(&path).expect("re-read banks");
         assert_eq!(banks.entries().len(), 2, "both bank entries must survive");
@@ -1133,7 +1192,7 @@ start_value = 1
         std::fs::write(&path, pre_body).expect("write pre-condition file");
 
         let inputs = good_inputs();
-        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+        setup_seller_info_to_path(&path, &inputs, true).expect("identity save");
 
         let backups: Vec<_> = std::fs::read_dir(&tmp)
             .unwrap()
@@ -1177,7 +1236,7 @@ street = \"Old Street\"
         std::fs::write(&path, pre).expect("write pre-condition file");
 
         let inputs = good_inputs();
-        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+        setup_seller_info_to_path(&path, &inputs, true).expect("identity save");
 
         let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
         assert!(
@@ -1216,7 +1275,7 @@ primary_color = \"#1a2332\"
         std::fs::write(&path, pre).expect("write pre-condition file");
 
         let inputs = good_inputs();
-        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+        setup_seller_info_to_path(&path, &inputs, true).expect("identity save");
 
         let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
         assert!(
@@ -1261,7 +1320,7 @@ port = 30004
         std::fs::write(&path, pre).expect("write pre-condition file");
 
         let inputs = good_inputs();
-        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+        setup_seller_info_to_path(&path, &inputs, true).expect("identity save");
 
         let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
         assert!(
@@ -1296,7 +1355,7 @@ city = \"Budapest\"
 street = \"Old Street\"
 ";
         std::fs::write(&path, pre).expect("write pre-condition file");
-        setup_seller_info_to_path(&path, &good_inputs()).expect("identity save");
+        setup_seller_info_to_path(&path, &good_inputs(), true).expect("identity save");
         let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
         assert!(
             !after.contains("[[mes.adapters]]"),
@@ -1325,7 +1384,7 @@ street = \"Old Street\"
         std::fs::write(&path, pre).expect("write pre-condition file");
 
         let inputs = good_inputs();
-        setup_seller_info_to_path(&path, &inputs).expect("identity save");
+        setup_seller_info_to_path(&path, &inputs, true).expect("identity save");
 
         let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
         assert!(
@@ -1346,7 +1405,7 @@ street = \"Old Street\"
         assert!(!path.exists());
 
         let inputs = good_inputs();
-        setup_seller_info_to_path(&path, &inputs).expect("first-run identity save");
+        setup_seller_info_to_path(&path, &inputs, true).expect("first-run identity save");
 
         let after = std::fs::read_to_string(&path).expect("re-read seller.toml");
         assert!(

@@ -186,6 +186,7 @@ fn build_state(wired: &WiredInvoice) -> AppState {
     AppState {
         db_path: Arc::new(wired.db_path.clone()),
         tenant,
+        nav_enabled: true,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),
         session_token: Arc::new("test-token".to_string()),
         // PR-46α / session-62 — Ready boot state (see

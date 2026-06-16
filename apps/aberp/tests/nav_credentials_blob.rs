@@ -268,6 +268,7 @@ fn rotation_preserves_other_three_fields() {
     let state = aberp::serve::AppState {
         db_path: Arc::new(std::env::temp_dir().join(format!("aberp-blob-{}.duckdb", Ulid::new()))),
         tenant: tenant_id,
+        nav_enabled: true,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),
         session_token: Arc::new("test-token".to_string()),
         secrets_cache: aberp::secrets_cache::SecretsCache::empty(),

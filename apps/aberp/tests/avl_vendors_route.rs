@@ -34,6 +34,7 @@ fn build_state(db_path: PathBuf) -> AppState {
     AppState {
         db_path: Arc::new(db_path),
         tenant,
+        nav_enabled: true,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(TEST_HASH),
         session_token: Arc::new("test-token".to_string()),
         secrets_cache: aberp::secrets_cache::SecretsCache::empty(),

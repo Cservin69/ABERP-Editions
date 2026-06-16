@@ -126,6 +126,16 @@ export const LABELS: Record<InvoiceState, LabelMeta> = {
     tooltip:
       "Operator marked the invoice as abandoned (terminal-by-operator-decision).",
   },
+  // S434 — issued under a NAV-disabled tenant: PDF + audit trail, but the
+  // invoice was never submitted to NAV (no NAV to submit to). Muted, not a
+  // warning/error — for an international operator this is the normal,
+  // expected terminal state.
+  LocalOnly: {
+    signal: "muted",
+    icon: "⬡",
+    tooltip:
+      "LOCAL ONLY (no NAV) — issued under a NAV-disabled tenant. PDF + audit trail exist; the invoice was never submitted to NAV.",
+  },
 };
 
 /** Lifecycle-natural display order per ADR-0036 §3's priority
@@ -152,6 +162,9 @@ export const LIFECYCLE_ORDER = [
   "Storno",
   "Amended",
   "Abandoned",
+  // S434 — terminal NAV-off state; placed last alongside the other
+  // terminals.
+  "LocalOnly",
 ] as const satisfies readonly InvoiceState[];
 
 // ─── Module-load invariants (CLAUDE.md rule 12 — fail loud) ──────────

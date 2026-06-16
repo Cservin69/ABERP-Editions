@@ -34,6 +34,20 @@ export function buttonStateFor(row: TenantRow, rows: TenantRow[]): TenantButtonS
   };
 }
 
+/** S434 — the rows to show in the default view. When the operator has set
+ * `hideDemo` AND a real (Active, non-demo) tenant exists, the bundled demo
+ * is hidden from the list (it stays unarchivable — just out of the way).
+ * The running tenant is NEVER hidden, even if it is the demo, so the
+ * operator can always see + manage what they're currently in. */
+export function visibleTenants(
+  rows: TenantRow[],
+  hideDemo: boolean,
+  hasRealTenant: boolean,
+): TenantRow[] {
+  if (!hideDemo || !hasRealTenant) return rows;
+  return rows.filter((r) => r.state !== "demo" || r.running);
+}
+
 /** Display order: the running tenant first, then Active, then Demo, then
  * Archived — each group alphabetised by slug. Stable + deterministic so
  * the list doesn't jump around between refreshes. */

@@ -993,7 +993,12 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::TenantSwitched
         | EventKind::TenantArchived
         | EventKind::TenantRestored
-        | EventKind::TenantDemoSeeded => None,
+        | EventKind::TenantDemoSeeded
+        // S434 — NAV-off tenant/invoice rows: app-layer JSON, never NAV XML.
+        | EventKind::TenantNavToggled
+        | EventKind::TenantSellerSetupOptional
+        | EventKind::TenantSellerRegionConfigured
+        | EventKind::InvoiceLocalOnlyEmitted => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1023,7 +1028,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 144,
+        EventKind::ALL_KINDS_COUNT == 148,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

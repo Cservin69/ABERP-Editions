@@ -150,6 +150,7 @@ fn build_state_for(tenant: &str, db_path: PathBuf) -> AppState {
     AppState {
         db_path: Arc::new(db_path),
         tenant: tenant_id,
+        nav_enabled: true,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),
         session_token: Arc::new("test-token".to_string()),
         secrets_cache: aberp::secrets_cache::SecretsCache::empty(),
@@ -232,8 +233,8 @@ fn supplier_from_seller_toml_happy_path() {
     let path = dir.join("seller.toml");
     write_fixture_seller_toml_at(&path);
 
-    let supplier =
-        aberp::serve::supplier_from_seller_toml_path(&path).expect("happy path must read fixture");
+    let supplier = aberp::serve::supplier_from_seller_toml_path(&path, true)
+        .expect("happy path must read fixture");
     assert_eq!(supplier.tax_number, "12345678-1-42");
     assert_eq!(supplier.name, "ABERP Supplier Kft.");
     assert_eq!(supplier.address.country_code, "HU");
@@ -248,7 +249,7 @@ fn supplier_from_seller_toml_missing_file_maps_to_missing_tax_number() {
     let dir = test_dir("missing");
     let path = dir.join("seller.toml"); // not written
 
-    let err = aberp::serve::supplier_from_seller_toml_path(&path)
+    let err = aberp::serve::supplier_from_seller_toml_path(&path, true)
         .expect_err("missing file must surface as a typed error");
     match err {
         aberp::nav_xml::SupplierConfigError::MissingTaxNumber => {}
@@ -280,12 +281,48 @@ street = "Fő utca 1."
     )
     .expect("write");
 
-    let err = aberp::serve::supplier_from_seller_toml_path(&path)
+    let err = aberp::serve::supplier_from_seller_toml_path(&path, true)
         .expect_err("malformed tax number must surface as typed error");
     match err {
         aberp::nav_xml::SupplierConfigError::MalformedTaxNumber { .. } => {}
         other => panic!("expected MalformedTaxNumber, got {other:?}"),
     }
+}
+
+/// S434 — NAV-OFF (international) tenant: a non-HU-shaped supplier tax
+/// number is accepted opaque, so an international operator can issue
+/// invoices. The same fixture under NAV-on (`true`) surfaces
+/// `MalformedTaxNumber`.
+#[test]
+fn supplier_from_seller_toml_nav_off_accepts_non_hu_tax() {
+    let dir = test_dir("nav_off_supplier");
+    let path = dir.join("seller.toml");
+    std::fs::write(
+        &path,
+        r#"[seller]
+legal_name = "Karoo Metals (Pty) Ltd"
+tax_number = "ZA-4880101999"
+[seller.address]
+country_code = "ZA"
+postal_code = "8001"
+city = "Cape Town"
+street = "12 Long Street"
+"#,
+    )
+    .expect("write");
+
+    // NAV-off → opaque tax accepted.
+    let supplier = aberp::serve::supplier_from_seller_toml_path(&path, false)
+        .expect("NAV-off must accept a non-HU supplier tax");
+    assert_eq!(supplier.tax_number, "ZA-4880101999");
+    assert_eq!(supplier.address.country_code, "ZA");
+    // NAV-on → the same opaque tax is rejected (HU §169 shape).
+    let err = aberp::serve::supplier_from_seller_toml_path(&path, true)
+        .expect_err("NAV-on must still enforce the HU shape");
+    assert!(matches!(
+        err,
+        aberp::nav_xml::SupplierConfigError::MalformedTaxNumber { .. }
+    ));
 }
 
 // ──────────────────────────────────────────────────────────────────────

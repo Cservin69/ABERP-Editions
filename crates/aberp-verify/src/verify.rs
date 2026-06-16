@@ -1129,7 +1129,12 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::TenantSwitched
         | EventKind::TenantArchived
         | EventKind::TenantRestored
-        | EventKind::TenantDemoSeeded => (None, ""),
+        | EventKind::TenantDemoSeeded
+        // S434 — NAV-off tenant/invoice rows: app-layer JSON, never NAV XML.
+        | EventKind::TenantNavToggled
+        | EventKind::TenantSellerSetupOptional
+        | EventKind::TenantSellerRegionConfigured
+        | EventKind::InvoiceLocalOnlyEmitted => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1151,7 +1156,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 144,
+        EventKind::ALL_KINDS_COUNT == 148,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

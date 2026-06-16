@@ -22,10 +22,12 @@
     createTenant,
     listTenants,
     restoreTenant,
+    setHideDemo,
     switchTenant,
+    toggleTenantNav,
     type TenantRow,
   } from "../lib/api";
-  import { buttonStateFor, orderTenants } from "../lib/tenants-list";
+  import { buttonStateFor, orderTenants, visibleTenants } from "../lib/tenants-list";
 
   type LoadState = "loading" | "ready" | "error";
 
@@ -34,6 +36,9 @@
   let rows = $state<TenantRow[]>([]);
   let busySlug = $state<string | null>(null);
   let switching = $state<string | null>(null);
+  // S434 — operator hide-demo preference + whether a real tenant exists.
+  let hideDemo = $state(false);
+  let hasRealTenant = $state(false);
 
   // Add-tenant inline form.
   let showAdd = $state(false);
@@ -41,7 +46,7 @@
   let newDisplayName = $state("");
   let addError = $state<string | null>(null);
 
-  let ordered = $derived(orderTenants(rows));
+  let ordered = $derived(orderTenants(visibleTenants(rows, hideDemo, hasRealTenant)));
   let canSubmitAdd = $derived(
     newSlug.trim().length > 0 && newDisplayName.trim().length > 0 && busySlug === null,
   );
@@ -52,6 +57,8 @@
     try {
       const resp = await listTenants();
       rows = resp.tenants;
+      hideDemo = resp.hide_demo;
+      hasRealTenant = resp.has_real_tenant;
       loadState = "ready";
     } catch (e) {
       errorMessage = e instanceof Error ? e.message : String(e);
@@ -135,6 +142,50 @@
       errorMessage = e instanceof Error ? e.message : String(e);
     } finally {
       busySlug = null;
+    }
+  }
+
+  // S434 — flip a tenant's NAV-synchron toggle. Takes effect on that
+  // tenant's next boot (the backend reads nav_enabled at boot); we confirm
+  // so the operator understands they're turning Hungarian NAV on/off.
+  async function onToggleNav(row: TenantRow): Promise<void> {
+    const next = !row.nav_enabled;
+    const verb = next ? "ENABLE" : "DISABLE";
+    if (
+      !confirm(
+        `${verb} NAV synchronization for ${row.display_name} (${row.slug})?\n\n` +
+          (next
+            ? "Invoices will be submitted to the Hungarian NAV. The tenant must complete NAV credentials + §169 seller setup."
+            : "Invoices will be stored LOCAL ONLY (PDF + audit, no NAV). For operators outside Hungary.") +
+          `\n\nTakes effect on ${row.slug}'s next boot.`,
+      )
+    ) {
+      return;
+    }
+    busySlug = row.slug;
+    errorMessage = null;
+    try {
+      const resp = await toggleTenantNav(row.slug, next);
+      rows = resp.tenants;
+      hideDemo = resp.hide_demo;
+      hasRealTenant = resp.has_real_tenant;
+    } catch (e) {
+      errorMessage = e instanceof Error ? e.message : String(e);
+    } finally {
+      busySlug = null;
+    }
+  }
+
+  // S434 — toggle the hide-demo preference.
+  async function onToggleHideDemo(): Promise<void> {
+    const next = !hideDemo;
+    try {
+      const resp = await setHideDemo(next);
+      rows = resp.tenants;
+      hideDemo = resp.hide_demo;
+      hasRealTenant = resp.has_real_tenant;
+    } catch (e) {
+      errorMessage = e instanceof Error ? e.message : String(e);
     }
   }
 </script>
@@ -227,12 +278,23 @@
         {errorMessage}
       </div>
     {/if}
+    {#if hasRealTenant}
+      <label class="tn-hidedemo">
+        <input
+          type="checkbox"
+          checked={hideDemo}
+          onchange={() => void onToggleHideDemo()}
+        />
+        Hide the demo tenant from this list
+      </label>
+    {/if}
     <table class="tn-table">
       <thead>
         <tr>
           <th class="tn-th">Tenant</th>
           <th class="tn-th">Slug</th>
           <th class="tn-th">State</th>
+          <th class="tn-th">NAV sync</th>
           <th class="tn-th">Created</th>
           <th class="tn-th tn-th--actions">Actions</th>
         </tr>
@@ -259,6 +321,28 @@
               >
                 {row.state === "demo" ? "DEMO" : row.state}
               </span>
+              {#if !row.nav_enabled}
+                <span class="tn-chip tn-chip--local" title="NAV synchronization disabled — invoices are stored local-only">
+                  LOCAL ONLY
+                </span>
+              {/if}
+            </td>
+            <td class="tn-td">
+              <button
+                class="tn-toggle"
+                class:tn-toggle--on={row.nav_enabled}
+                type="button"
+                role="switch"
+                aria-checked={row.nav_enabled}
+                disabled={busySlug !== null || switching !== null}
+                title={row.nav_enabled
+                  ? "NAV ON — invoices submit to Hungarian NAV. Click to disable."
+                  : "NAV OFF — invoices stored local-only. Click to enable."}
+                onclick={() => void onToggleNav(row)}
+              >
+                <span class="tn-toggle__knob"></span>
+                <span class="tn-toggle__label">{row.nav_enabled ? "ON" : "OFF"}</span>
+              </button>
             </td>
             <td class="tn-td">{fmtDate(row.created_at)}</td>
             <td class="tn-td tn-td--actions">
@@ -453,6 +537,50 @@
     color: var(--color-signal-warning, var(--color-text-strong));
     border-color: var(--color-signal-warning, var(--color-text-strong));
     letter-spacing: 0.06em;
+  }
+  /* S434 — LOCAL ONLY (NAV-off) badge + the NAV-sync toggle + hide-demo. */
+  .tn-chip--local {
+    margin-left: var(--space-2);
+    color: var(--color-signal-divergence, var(--color-text-secondary));
+    border-color: var(--color-signal-divergence, var(--color-surface-divider));
+    letter-spacing: 0.06em;
+  }
+  .tn-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--color-surface-divider);
+    background: var(--color-surface-sunken, var(--color-surface-base));
+    color: var(--color-text-muted);
+    border-radius: 999px;
+    cursor: pointer;
+    font-family: var(--type-family-body);
+    font-size: var(--type-size-sm);
+  }
+  .tn-toggle:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .tn-toggle__knob {
+    width: 0.6rem;
+    height: 0.6rem;
+    border-radius: 999px;
+    background: var(--color-text-muted);
+  }
+  .tn-toggle--on {
+    color: var(--color-signal-positive, var(--color-text-strong));
+    border-color: var(--color-signal-positive, var(--color-text-strong));
+  }
+  .tn-toggle--on .tn-toggle__knob {
+    background: var(--color-signal-positive, var(--color-text-strong));
+  }
+  .tn-hidedemo {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-secondary);
   }
   .tn-btn {
     padding: var(--space-1) var(--space-3);

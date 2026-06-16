@@ -271,6 +271,11 @@ pub struct SubmitInvoiceOutcome {
     pub sequence_number: u64,
     pub transaction_id: String,
     pub entries_verified: u64,
+    /// S434 — `true` when the "submission" was the NAV-off short-circuit
+    /// (no NAV wire send; an `InvoiceLocalOnlyEmitted` row was written
+    /// instead). The serve route maps it to the `LocalOnly` typestate; the
+    /// normal NAV path leaves it `false`.
+    pub local_only: bool,
 }
 
 /// PR-44η / session-60 — bundled input shape for
@@ -615,6 +620,7 @@ pub async fn submit_from_inputs(
                 sequence_number: submitted.sequence_number,
                 transaction_id: submitted.nav_transaction_id,
                 entries_verified: verified,
+                local_only: false,
             })
         }
         Err(wire_err) => {

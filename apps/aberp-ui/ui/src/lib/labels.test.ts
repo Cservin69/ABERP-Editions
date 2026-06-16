@@ -154,6 +154,8 @@ const INVOICE_STATE_LITERALS: readonly InvoiceState[] = [
   "Storno",
   "Amended",
   "Abandoned",
+  // S434 — NAV-off terminal state.
+  "LocalOnly",
 ] as const;
 
 describe("LABELS", () => {

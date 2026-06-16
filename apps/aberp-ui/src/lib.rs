@@ -323,6 +323,8 @@ pub fn run() {
             commands::switch_tenant,
             commands::archive_tenant,
             commands::restore_tenant,
+            commands::toggle_tenant_nav,
+            commands::set_hide_demo,
             // S257 / PR-246 — Settings → Adapters CRUD.
             commands::list_adapters,
             commands::create_adapter,

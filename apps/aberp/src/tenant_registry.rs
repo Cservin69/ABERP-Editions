@@ -94,6 +94,18 @@ pub struct TenantEntry {
     pub state: TenantState,
     /// RFC3339 UTC creation stamp.
     pub created_at: String,
+    /// S434 — the per-tenant "NAV synchron" switch. `true` (default) runs
+    /// the Hungarian NAV pipeline: the boot path loads NAV credentials,
+    /// the §169 seller gate is enforced, invoices submit to NAV. `false`
+    /// (international operators) skips NAV entirely — boot goes straight
+    /// to Ready, seller tax is optional, invoices are stored LOCAL ONLY.
+    ///
+    /// BACKWARD COMPAT: a `tenants.toml` row written before S434 carries
+    /// no `nav_enabled` key; [`PartialEntry::finish`] defaults the MISSING
+    /// field to `true` so existing single-tenant HU installs keep their
+    /// current NAV behaviour. Only the bundled demo tenant defaults
+    /// `false` (see [`TenantRegistry::add_demo`]).
+    pub nav_enabled: bool,
 }
 
 /// Typed errors for the state-transition invariants. Routes map these to
@@ -122,6 +134,12 @@ pub enum TenantRegistryError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TenantRegistry {
     pub tenants: Vec<TenantEntry>,
+    /// S434 — operator preference: once a real (Active, non-demo) tenant
+    /// exists the operator can hide the bundled demo from the default
+    /// Tenants view (the demo stays unarchivable per the S433 invariant —
+    /// just hidden). Stored as a top-level `hide_demo = true` line at the
+    /// head of `tenants.toml`; absent → `false`.
+    pub hide_demo: bool,
 }
 
 /// Validate a tenant slug. Restricted to `[A-Za-z0-9_-]{1,64}` so it is
@@ -207,6 +225,10 @@ impl TenantRegistry {
             created_at: now
                 .format(&Rfc3339)
                 .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
+            // New operator tenants default to NAV-on (HU §169). The
+            // operator flips it off from the Tenants screen for an
+            // international tenant.
+            nav_enabled: true,
         };
         self.tenants.push(entry.clone());
         Ok(entry)
@@ -225,9 +247,40 @@ impl TenantRegistry {
             created_at: now
                 .format(&Rfc3339)
                 .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
+            // S434 — demo is the NAV-off sandbox: an international operator
+            // can drive it end-to-end without any Hungarian NAV setup.
+            nav_enabled: false,
         };
         self.tenants.push(entry.clone());
         Ok(entry)
+    }
+
+    /// S434 — flip a tenant's `nav_enabled` flag. Returns the PRIOR value
+    /// (for the `TenantNavToggled` audit's old/new pair). Errors if the
+    /// slug is absent. A no-op flip (new == old) still succeeds and
+    /// returns `old`; the caller decides whether to skip the audit.
+    pub fn set_nav_enabled(
+        &mut self,
+        slug: &str,
+        enabled: bool,
+    ) -> Result<bool, TenantRegistryError> {
+        let t = self
+            .tenants
+            .iter_mut()
+            .find(|t| t.slug == slug)
+            .ok_or_else(|| TenantRegistryError::NotFound(slug.to_string()))?;
+        let old = t.nav_enabled;
+        t.nav_enabled = enabled;
+        Ok(old)
+    }
+
+    /// S434 — does the registry hold at least one real (Active, non-demo)
+    /// tenant? Gates the operator's "hide demo" preference: hiding demo is
+    /// only meaningful once a real tenant exists to fall back to.
+    pub fn has_real_tenant(&self) -> bool {
+        self.tenants
+            .iter()
+            .any(|t| t.state == TenantState::Active && t.slug != DEMO_SLUG)
     }
 
     /// Soft-delete a tenant. Refuses the two unsafe cases in code:
@@ -283,12 +336,21 @@ impl TenantRegistry {
             "# ABERP tenant registry — managed by the Tenants admin screen (S433).\n\
              # Do not hand-edit while ABERP is running.\n",
         );
+        // S434 — top-level operator preference, written before any
+        // [[tenant]] block. Omitted when false so an unchanged registry
+        // stays byte-identical to the S433 form (the parser defaults it).
+        if self.hide_demo {
+            out.push_str("hide_demo = true\n");
+        }
         for t in &self.tenants {
             out.push_str("\n[[tenant]]\n");
             out.push_str(&format!("slug = {}\n", quote(&t.slug)));
             out.push_str(&format!("display_name = {}\n", quote(&t.display_name)));
             out.push_str(&format!("state = {}\n", quote(t.state.as_token())));
             out.push_str(&format!("created_at = {}\n", quote(&t.created_at)));
+            // S434 — bare bool token (no quotes): a fixed-vocab `true`/
+            // `false` the line walker parses without the string unquoter.
+            out.push_str(&format!("nav_enabled = {}\n", t.nav_enabled));
         }
         out
     }
@@ -298,6 +360,7 @@ impl TenantRegistry {
     /// loud (rule 12) rather than defaulting silently.
     pub fn parse_toml(body: &str) -> Result<Self> {
         let mut tenants: Vec<TenantEntry> = Vec::new();
+        let mut hide_demo = false;
         let mut cur: Option<PartialEntry> = None;
         for (lineno, raw) in body.lines().enumerate() {
             let line = raw.trim();
@@ -311,23 +374,55 @@ impl TenantRegistry {
                 cur = Some(PartialEntry::default());
                 continue;
             }
-            let (key, val) = line.split_once('=').ok_or_else(|| {
+            let (key, val_raw) = line.split_once('=').ok_or_else(|| {
                 anyhow!(
                     "tenants.toml line {} not `key = value`: {line:?}",
                     lineno + 1
                 )
             })?;
             let key = key.trim();
-            let val = unquote(val.trim())
-                .with_context(|| format!("tenants.toml line {} value", lineno + 1))?;
+            let val_raw = val_raw.trim();
+            // S434 — top-level (pre-`[[tenant]]`) operator-preference keys
+            // carry bare values, not quoted strings.
+            if cur.is_none() {
+                match key {
+                    "hide_demo" => {
+                        hide_demo = parse_bool(val_raw).with_context(|| {
+                            format!("tenants.toml line {} hide_demo", lineno + 1)
+                        })?;
+                        continue;
+                    }
+                    other => {
+                        return Err(anyhow!(
+                            "tenants.toml unknown top-level key {other:?} at line {} \
+                             (before any [[tenant]])",
+                            lineno + 1
+                        ))
+                    }
+                }
+            }
             let p = cur
                 .as_mut()
                 .ok_or_else(|| anyhow!("tenants.toml line {} before any [[tenant]]", lineno + 1))?;
             match key {
-                "slug" => p.slug = Some(val),
-                "display_name" => p.display_name = Some(val),
-                "state" => p.state = Some(val),
-                "created_at" => p.created_at = Some(val),
+                // S434 — bare bool, not a quoted string.
+                "nav_enabled" => {
+                    p.nav_enabled =
+                        Some(parse_bool(val_raw).with_context(|| {
+                            format!("tenants.toml line {} nav_enabled", lineno + 1)
+                        })?)
+                }
+                "slug" | "display_name" | "state" | "created_at" => {
+                    let val = unquote(val_raw)
+                        .with_context(|| format!("tenants.toml line {} value", lineno + 1))?;
+                    match key {
+                        "slug" => p.slug = Some(val),
+                        "display_name" => p.display_name = Some(val),
+                        "state" => p.state = Some(val),
+                        "created_at" => p.created_at = Some(val),
+                        _ => unreachable!(),
+                    }
+                }
                 other => {
                     return Err(anyhow!(
                         "tenants.toml unknown key {other:?} at line {}",
@@ -339,7 +434,7 @@ impl TenantRegistry {
         if let Some(p) = cur.take() {
             tenants.push(p.finish(body.lines().count())?);
         }
-        Ok(TenantRegistry { tenants })
+        Ok(TenantRegistry { tenants, hide_demo })
     }
 
     /// Read the registry from `path`. A missing file is an empty registry
@@ -367,6 +462,7 @@ struct PartialEntry {
     display_name: Option<String>,
     state: Option<String>,
     created_at: Option<String>,
+    nav_enabled: Option<bool>,
 }
 
 impl PartialEntry {
@@ -390,7 +486,21 @@ impl PartialEntry {
             display_name,
             state,
             created_at,
+            // S434 BACKWARD COMPAT: this is the ONE field that defaults
+            // instead of erroring loud — a pre-S434 row has no
+            // `nav_enabled` key and MUST keep its current NAV-on behaviour.
+            nav_enabled: self.nav_enabled.unwrap_or(true),
         })
+    }
+}
+
+/// S434 — parse the fixed `true`/`false` vocabulary written by
+/// [`TenantRegistry::to_toml`]. Loud on anything else (rule 12).
+fn parse_bool(s: &str) -> Result<bool> {
+    match s {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(anyhow!("expected `true` or `false`, got {other:?}")),
     }
 }
 
@@ -493,6 +603,31 @@ pub fn is_fresh_install_default() -> Result<bool> {
 
 pub fn read_registry() -> Result<TenantRegistry> {
     TenantRegistry::read_from(&registry_path()?)
+}
+
+/// S434 — resolve a tenant's NAV-synchron mode for the BOOT decision,
+/// read straight from `tenants.toml`. This is the [[trust-code-not-operator]]
+/// chokepoint the boot path, the NAV daemons, and `submit_invoice` all
+/// consult — not operator discipline.
+///
+/// Resolution order:
+/// 1. A registry row for `slug` → its `nav_enabled` (a pre-S434 row with
+///    no key parses as `true`).
+/// 2. No row + `slug == "demo"` → `false`. The demo tenant is NAV-off by
+///    definition; on a fresh install its registry row is written slightly
+///    later in boot (`bootstrap_demo_tenant`), but the boot-state decision
+///    at the keychain step must already know demo skips NAV.
+/// 3. No row, any other slug → `true`. An existing single-tenant HU
+///    install that predates the registry keeps its NAV-on behaviour.
+///
+/// A read/parse error is logged by the caller; this returns `true`
+/// (fail-safe toward the existing NAV behaviour) on `Err`.
+pub fn tenant_nav_enabled(slug: &str) -> Result<bool> {
+    let reg = read_registry()?;
+    Ok(match reg.find(slug) {
+        Some(entry) => entry.nav_enabled,
+        None => slug != DEMO_SLUG,
+    })
 }
 
 pub fn write_registry(reg: &TenantRegistry) -> Result<()> {
@@ -780,6 +915,97 @@ mod tests {
         let p = dir.as_path().join("next_tenant");
         write_next_tenant_hint_at(&p, "   ").unwrap();
         assert_eq!(consume_next_tenant_hint_at(&p).unwrap(), None);
+    }
+
+    #[test]
+    fn nav_enabled_round_trips_and_defaults() {
+        // add() → nav-on; add_demo() → nav-off; both survive a TOML
+        // round-trip byte-for-byte at the value level.
+        let mut r = TenantRegistry::default();
+        r.add("hu", "HU Co", dt("2026-06-16T00:00:00Z")).unwrap();
+        r.add_demo(dt("2026-06-16T00:00:00Z")).unwrap();
+        assert!(r.find("hu").unwrap().nav_enabled);
+        assert!(!r.find("demo").unwrap().nav_enabled);
+        let back = TenantRegistry::parse_toml(&r.to_toml()).unwrap();
+        assert_eq!(r, back);
+        assert!(back.find("hu").unwrap().nav_enabled);
+        assert!(!back.find("demo").unwrap().nav_enabled);
+    }
+
+    #[test]
+    fn pre_s434_row_without_nav_enabled_defaults_true() {
+        // BACKWARD COMPAT: a tenants.toml written by S433 (no nav_enabled
+        // key) must parse with nav_enabled = true so existing HU installs
+        // keep NAV on.
+        let legacy = "\
+# old registry
+[[tenant]]
+slug = \"prod\"
+display_name = \"Prod\"
+state = \"active\"
+created_at = \"2026-06-16T00:00:00Z\"
+";
+        let reg = TenantRegistry::parse_toml(legacy).unwrap();
+        assert!(
+            reg.find("prod").unwrap().nav_enabled,
+            "missing nav_enabled must default to true (backward compat)"
+        );
+    }
+
+    #[test]
+    fn set_nav_enabled_returns_prior_and_flips() {
+        let mut r = sample();
+        // prod starts NAV-on; flip off, prior reported true.
+        assert!(r.set_nav_enabled("prod", false).unwrap());
+        assert!(!r.find("prod").unwrap().nav_enabled);
+        // Flip back on, prior reported false.
+        assert!(!r.set_nav_enabled("prod", true).unwrap());
+        assert!(r.find("prod").unwrap().nav_enabled);
+        // Unknown slug errors.
+        assert_eq!(
+            r.set_nav_enabled("ghost", false),
+            Err(TenantRegistryError::NotFound("ghost".into()))
+        );
+    }
+
+    #[test]
+    fn hide_demo_round_trips_and_gates_on_real_tenant() {
+        let mut r = TenantRegistry::default();
+        r.add_demo(dt("2026-06-16T00:00:00Z")).unwrap();
+        // Only demo present → no real tenant.
+        assert!(!r.has_real_tenant());
+        r.add("acme", "ACME", dt("2026-06-16T01:00:00Z")).unwrap();
+        assert!(r.has_real_tenant());
+        // hide_demo default false; set + round-trip.
+        assert!(!r.hide_demo);
+        r.hide_demo = true;
+        let back = TenantRegistry::parse_toml(&r.to_toml()).unwrap();
+        assert_eq!(r, back);
+        assert!(back.hide_demo);
+        // Default (false) omits the line entirely → stays S433-shaped.
+        let mut r2 = sample();
+        r2.hide_demo = false;
+        assert!(
+            !r2.to_toml().contains("hide_demo"),
+            "false hide_demo must not be serialised"
+        );
+    }
+
+    #[test]
+    fn tenant_nav_enabled_resolution_rule() {
+        // Mirrors `tenant_nav_enabled`'s no-row arm (which reads from disk):
+        // an absent demo slug resolves OFF, any other absent slug resolves
+        // ON, and a present row uses its own flag.
+        let resolve = |reg: &TenantRegistry, slug: &str| match reg.find(slug) {
+            Some(e) => e.nav_enabled,
+            None => slug != DEMO_SLUG,
+        };
+        let mut reg = TenantRegistry::default();
+        assert!(!resolve(&reg, DEMO_SLUG), "absent demo → NAV off");
+        assert!(resolve(&reg, "prod"), "absent non-demo → NAV on");
+        // A present demo row carries its own (off) flag.
+        reg.add_demo(dt("2026-06-16T00:00:00Z")).unwrap();
+        assert!(!resolve(&reg, DEMO_SLUG));
     }
 
     #[test]

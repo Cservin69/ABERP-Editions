@@ -6067,3 +6067,66 @@ impl TenantDemoSeededPayload {
         serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
     }
 }
+
+/// S434 — payload for [`aberp_audit_ledger::EventKind::TenantNavToggled`].
+/// Records an operator flipping the per-tenant NAV-synchron toggle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantNavToggledPayload {
+    pub slug: String,
+    pub old_enabled: bool,
+    pub new_enabled: bool,
+    pub operator_login: String,
+}
+
+impl TenantNavToggledPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// S434 — payload for
+/// [`aberp_audit_ledger::EventKind::TenantSellerSetupOptional`]. Fired at
+/// boot when a NAV-disabled tenant comes up Ready without the §169
+/// seller-identity gate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantSellerSetupOptionalPayload {
+    pub slug: String,
+}
+
+impl TenantSellerSetupOptionalPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// S434 — payload for
+/// [`aberp_audit_ledger::EventKind::TenantSellerRegionConfigured`]. Fired
+/// once on seller-info save; records which tax-number validator ran.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TenantSellerRegionConfiguredPayload {
+    pub country_code: String,
+    pub nav_enabled: bool,
+    pub operator_login: String,
+}
+
+impl TenantSellerRegionConfiguredPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+/// S434 — payload for
+/// [`aberp_audit_ledger::EventKind::InvoiceLocalOnlyEmitted`]. Fired once
+/// per invoice issued under a NAV-disabled tenant (stored local-only,
+/// never submitted to NAV).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvoiceLocalOnlyEmittedPayload {
+    pub invoice_id: String,
+    pub operator_login: String,
+}
+
+impl InvoiceLocalOnlyEmittedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}

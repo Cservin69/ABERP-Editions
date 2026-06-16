@@ -776,6 +776,26 @@ pub async fn restore_tenant(state: State<'_, AppState>, slug: String) -> Result<
     forward_post(&state, &path, Value::Null).await
 }
 
+/// S434 — `POST /api/tenants/:slug/toggle-nav` — flip a tenant's
+/// NAV-synchron flag. Body is `{ "enabled": bool }`. Takes effect on that
+/// tenant's next boot.
+#[tauri::command]
+pub async fn toggle_tenant_nav(
+    state: State<'_, AppState>,
+    slug: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/tenants/{slug}/toggle-nav");
+    forward_post(&state, &path, body).await
+}
+
+/// S434 — `POST /api/tenants/hide-demo` — set the operator's "hide demo
+/// from the default view" preference. Body is `{ "hide": bool }`.
+#[tauri::command]
+pub async fn set_hide_demo(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/tenants/hide-demo", body).await
+}
+
 // ── S257 / PR-246 — Settings → Adapters CRUD ─────────────────────────
 
 /// `GET /api/adapters` — list persisted adapters joined with live

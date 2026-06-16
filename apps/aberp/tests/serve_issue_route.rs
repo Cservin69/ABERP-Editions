@@ -63,6 +63,7 @@ fn build_state(db_path: PathBuf) -> AppState {
     AppState {
         db_path: Arc::new(db_path),
         tenant,
+        nav_enabled: true,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),
         session_token: Arc::new("test-token".to_string()),
         // PR-46α / session-62 — `operator_login` moved inside the

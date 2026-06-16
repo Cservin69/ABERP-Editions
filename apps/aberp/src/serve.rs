@@ -232,6 +232,13 @@ fn dirs_home_or_loud_fail() -> Result<PathBuf> {
 /// silent wrong-environment start (CLAUDE.md rule 12). The prod/test
 /// choice is baked in at compile time, so the two streams can never
 /// cross: a dev binary cannot touch real NAV even if launched as prod.
+/// S434 — synthetic operator-login marker for a NAV-disabled tenant's
+/// `Ready` boot state. There is no NAV technical-user login to read from
+/// the keychain (the keychain is never touched in NAV-off mode), so this
+/// constant stands in as the `Actor` login for the international
+/// operator's mutations. Distinct, greppable, and obviously non-NAV.
+pub const NAV_DISABLED_LOGIN: &str = "nav-disabled";
+
 fn guard_tenant_matches_build(tenant: &str) {
     if crate::build_profile::IS_PRODUCTION_BUILD && tenant != "prod" {
         eprintln!(
@@ -531,6 +538,103 @@ fn bootstrap_demo_tenant(binary_hash: &BinaryHashHandle) -> Result<()> {
         .map_err(|e| anyhow!("seed demo tenant: {e}"))?;
     reg.write_to(&path)?;
     tracing::info!("seeded bundled demo tenant into tenants.toml registry");
+
+    // S434 — populate the demo with a little sample data so an
+    // international operator's first boot lands in a *used-looking*
+    // system, not an empty one. Best-effort: a seed hiccup must never
+    // block boot ([[hulye-biztos]]). The demo DB is migrated here (it is
+    // a separate DB from whatever tenant booted), then seeded idempotently.
+    if let Err(e) = seed_demo_sample_data(&db) {
+        tracing::warn!(error = ?e, "could not seed demo sample partners/products (boot continues)");
+    }
+    Ok(())
+}
+
+/// S434 — idempotently seed the demo tenant's DB with a handful of
+/// partners + products. Migrates the partner/product schemas first (the
+/// demo DB is provisioned fresh and, unless the binary booted AS demo,
+/// the main boot migration never touched it). No-op once any partner
+/// exists, so re-running on an already-seeded demo costs nothing.
+///
+/// Sample partners use `PrivatePerson` VAT status: the demo is the
+/// NAV-off international sandbox, so the HU §169 ADÓSZÁM requirement that
+/// `Domestic` status carries does not apply (and `Other` is v1-deferred).
+///
+/// NOTE: the brief's "1 closed sample LocalOnly invoice" is deliberately
+/// NOT seeded here — issuing a real invoice needs the full pipeline
+/// (seller.toml identity + MNB rates provider + gap-free numbering + NAV
+/// XML render), disproportionate to a boot-time seed. The operator (and
+/// the customer-journey E2E gate) issues a LocalOnly invoice through the
+/// real route, which is the authentic demonstration. See session report.
+fn seed_demo_sample_data(db: &std::path::Path) -> Result<()> {
+    use crate::nav_xml::CustomerVatStatus;
+    use crate::partners::{self, PartnerInputs, PartnerKind};
+    use crate::products::{self, ProductInputs, ProductUnit};
+    use aberp_billing::Currency;
+
+    let conn = Connection::open(db)
+        .with_context(|| format!("open demo DuckDB at {} for sample-data seed", db.display()))?;
+    partners::ensure_schema(&conn).context("ensure partners schema on demo DB")?;
+    products::ensure_schema(&conn).context("ensure products schema on demo DB")?;
+
+    // Idempotency: only seed an empty partner table.
+    let existing = partners::list_partners(&conn, crate::tenant_registry::DEMO_SLUG, None)
+        .context("list demo partners for idempotency check")?;
+    if !existing.is_empty() {
+        return Ok(());
+    }
+
+    let partner = |display: &str, legal: &str, kind: PartnerKind| PartnerInputs {
+        display_name: display.to_string(),
+        legal_name: legal.to_string(),
+        kind,
+        customer_vat_status: CustomerVatStatus::PrivatePerson,
+        customer_type: Default::default(),
+        tax_number: None,
+        eu_vat_number: None,
+        address_street: None,
+        address_postal_code: None,
+        address_city: None,
+        address_country: Some("ZA".to_string()),
+        bank_account: None,
+        contact_email: None,
+        contact_phone: None,
+    };
+    for p in [
+        partner(
+            "Sample Customer Ltd",
+            "Sample Customer Ltd",
+            PartnerKind::Customer,
+        ),
+        partner(
+            "Acme Tooling Supplies",
+            "Acme Tooling Supplies",
+            PartnerKind::Supplier,
+        ),
+        partner(
+            "Karoo Metals",
+            "Karoo Metals (Pty) Ltd",
+            PartnerKind::Supplier,
+        ),
+    ] {
+        partners::create_partner(&conn, crate::tenant_registry::DEMO_SLUG, &p)
+            .with_context(|| format!("seed demo partner {}", p.display_name))?;
+    }
+
+    let product = |name: &str, unit: &str, price: i64| ProductInputs {
+        name: name.to_string(),
+        unit: ProductUnit::Own(unit.to_string()),
+        currency: Currency::Eur,
+        unit_price_minor: price,
+    };
+    for pr in [
+        product("CNC Machining — per hour", "hour", 9_000),
+        product("Aluminium bracket", "pcs", 1_250),
+    ] {
+        products::create_product(&conn, crate::tenant_registry::DEMO_SLUG, &pr)
+            .with_context(|| format!("seed demo product {}", pr.name))?;
+    }
+    tracing::info!("seeded demo sample data (3 partners + 2 products)");
     Ok(())
 }
 
@@ -543,6 +647,7 @@ fn record_tenant_boot(
     binary_hash: &BinaryHashHandle,
     tenant: &TenantId,
     fresh_install: bool,
+    nav_enabled: bool,
 ) {
     if let Err(e) = ensure_boot_tenant_registered(&args.tenant) {
         tracing::warn!(
@@ -553,6 +658,31 @@ fn record_tenant_boot(
     if fresh_install {
         if let Err(e) = bootstrap_demo_tenant(binary_hash) {
             tracing::warn!(error = ?e, "could not seed bundled demo tenant on fresh install");
+        }
+    }
+    // S434 — record that this tenant booted Ready WITHOUT the §169 seller
+    // gate (NAV-off). One row per boot into the running tenant's own
+    // ledger so operations can see which tenants run NAV-disabled.
+    if !nav_enabled {
+        match binary_hash.wait() {
+            Ok(bh) => {
+                let payload = audit_payloads::TenantSellerSetupOptionalPayload {
+                    slug: args.tenant.clone(),
+                };
+                if let Err(e) = crate::tenant_registry::emit_tenant_event(
+                    &args.db,
+                    tenant.clone(),
+                    bh,
+                    NAV_DISABLED_LOGIN,
+                    EventKind::TenantSellerSetupOptional,
+                    payload.to_bytes(),
+                ) {
+                    tracing::warn!(error = ?e, "could not record TenantSellerSetupOptional audit");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "binary hash unavailable; skipping TenantSellerSetupOptional audit")
+            }
         }
     }
     let Some(from) = switched_from else {
@@ -601,6 +731,24 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // an install already in flight carries a tenant DB → not fresh → no
     // demo injection.
     let fresh_install = crate::tenant_registry::is_fresh_install_default().unwrap_or(false);
+
+    // S434 — resolve the running tenant's NAV-synchron mode ONCE here, the
+    // single switch every NAV chokepoint below reads ([[trust-code-not-operator]]):
+    // the boot-state derivation (skip keychain + §169 gate → Ready), the
+    // NAV daemon spawns (skip), and `submit_invoice` (store LOCAL ONLY).
+    // A read/parse error falls back to NAV-on (preserves existing HU
+    // behaviour). Demo + international tenants resolve `false`.
+    let nav_enabled = match crate::tenant_registry::tenant_nav_enabled(&args.tenant) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = ?e,
+                tenant = %args.tenant,
+                "could not resolve tenant nav_enabled from registry; defaulting NAV ON"
+            );
+            true
+        }
+    };
 
     // S165 / deliverable #5 — hülye-biztos cross-stream guard. Runs
     // FIRST, before the binary-hash thread, keychain, or DB are touched,
@@ -696,7 +844,21 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         "boot step: reading NAV credentials blob from OS keychain (may prompt for keychain access; \
          legacy 4-item migration on first launch after PR-57)"
     );
-    let initial_boot_state = {
+    // S434 — NAV-off tenants skip the entire keychain + §169 gate and boot
+    // straight to Ready under a synthetic "nav-disabled" login marker. No
+    // NAV credentials are loaded (none exist), the seller-identity gate is
+    // optional (handled at seller-save time), and the SPA — seeing a Ready
+    // handshake — mounts the dashboard, never the setup wizard.
+    let initial_boot_state = if !nav_enabled {
+        tracing::info!(
+            tenant = %args.tenant,
+            "boot step: NAV synchron OFF for this tenant — skipping keychain + §169 seller gate, \
+             booting straight to Ready"
+        );
+        ServeBootState::Ready {
+            operator_login: NAV_DISABLED_LOGIN.to_string(),
+        }
+    } else {
         let _s = tracing::info_span!("serve.nav_credentials").entered();
         match NavCredentials::load_from_keychain(&args.tenant) {
             Ok(creds) => {
@@ -1147,6 +1309,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         &binary_hash_handle,
         &tenant,
         fresh_install,
+        nav_enabled,
     );
 
     // 2. Resolve / generate the loopback cert + key.
@@ -1212,6 +1375,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     let state = AppState {
         db_path: Arc::new(args.db.clone()),
         tenant,
+        nav_enabled,
         binary_hash: binary_hash_handle,
         session_token: Arc::new(session_token.clone()),
         boot_state: Arc::new(std::sync::RwLock::new(initial_boot_state)),
@@ -1383,6 +1547,13 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // The wrapper exits as soon as its fan-out completes (the
         // children outlive it — that's fine, the token reaches them
         // directly).
+        //
+        // S434 — both NAV daemons (this boot-recovery poll + the AP-sync
+        // below) are gated on the tenant's NAV-synchron mode. A NAV-off
+        // tenant has no NAV credentials, so spawning either would just log
+        // recurring keychain errors forever ([[trust-code-not-operator]]:
+        // skip at the spawn, not per-tick). No spawn = no error spam.
+        if recovery_state.nav_enabled {
         let recovery_token = coordinator.token.clone();
         let recovery_for_task = recovery_state.clone();
         let recovery_handle = tokio::spawn(async move {
@@ -1510,6 +1681,12 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 .await;
             });
             coordinator.register("ap-sync", ap_sync_handle);
+        }
+        } else {
+            tracing::info!(
+                tenant = %recovery_state.tenant.as_str(),
+                "NAV synchron OFF for this tenant — not spawning NAV poll-recovery or AP-sync daemons"
+            );
         }
 
         // PR-216 / S218 — one-shot buyer-snapshot backfill for
@@ -2989,6 +3166,13 @@ fn derive_initial_boot_state_with_seller_check(
 pub struct AppState {
     pub db_path: Arc<PathBuf>,
     pub tenant: TenantId,
+    /// S434 — the running tenant's NAV-synchron mode, resolved once at
+    /// boot from `tenants.toml` (`tenant_registry::tenant_nav_enabled`).
+    /// `false` (international / demo) means: no NAV daemons were spawned,
+    /// `submit_invoice` stores invoices LOCAL ONLY, and the §169 seller
+    /// gate was skipped at boot. The [[trust-code-not-operator]] switch
+    /// every NAV chokepoint reads.
+    pub nav_enabled: bool,
     /// PR-45a / session-61 — handle to the background-computed binary
     /// hash. Reading a debug `aberp` binary off cold disk + hashing it
     /// took ~7.5s in `aberp serve`'s synchronous boot path, which
@@ -3353,6 +3537,13 @@ fn build_router(state: AppState) -> Router {
         .route("/api/tenants/:slug/switch", post(handle_switch_tenant))
         .route("/api/tenants/:slug/archive", post(handle_archive_tenant))
         .route("/api/tenants/:slug/restore", post(handle_restore_tenant))
+        // S434 — flip a tenant's NAV-synchron toggle + the operator's
+        // hide-demo preference.
+        .route(
+            "/api/tenants/:slug/toggle-nav",
+            post(handle_toggle_tenant_nav),
+        )
+        .route("/api/tenants/hide-demo", post(handle_set_hide_demo))
         // S257 / PR-246 — Settings → Adapters CRUD. List + create on the
         // collection; update (hot restart) + delete on the resource.
         // Ready-only + bearer-gated; the `:id` is the server-minted
@@ -3909,10 +4100,13 @@ fn needs_seller_config_response() -> Response {
 struct TenantView {
     slug: String,
     display_name: String,
-    /// `"active"` | `"archived"`.
+    /// `"active"` | `"archived"` | `"demo"`.
     state: String,
     created_at: String,
     running: bool,
+    /// S434 — the per-tenant NAV-synchron flag. The SPA renders the toggle
+    /// + the "LOCAL ONLY" badge from this.
+    nav_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3921,6 +4115,12 @@ struct TenantListResponse {
     /// Slug of the currently-running tenant (the switch/archive guards
     /// key off this; the SPA renders the running indicator from it).
     running_slug: String,
+    /// S434 — operator preference: hide the bundled demo from the default
+    /// view once a real tenant exists.
+    hide_demo: bool,
+    /// S434 — does a real (Active, non-demo) tenant exist? Gates whether
+    /// the SPA offers/honours the "hide demo" filter.
+    has_real_tenant: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3963,11 +4163,14 @@ fn build_tenant_list(
             state: t.state.as_token().to_string(),
             created_at: t.created_at.clone(),
             running: t.slug == running_slug,
+            nav_enabled: t.nav_enabled,
         })
         .collect();
     TenantListResponse {
         tenants,
         running_slug: running_slug.to_string(),
+        hide_demo: reg.hide_demo,
+        has_real_tenant: reg.has_real_tenant(),
     }
 }
 
@@ -4264,6 +4467,126 @@ fn transition_tenant_request(
     )
     .context("record tenant state-transition audit")?;
     Ok(build_tenant_list(&reg, &running))
+}
+
+#[derive(Debug, Deserialize)]
+struct ToggleTenantNavRequest {
+    enabled: bool,
+}
+
+// POST /api/tenants/:slug/toggle-nav — flip a tenant's NAV-synchron flag.
+// S434: the [[hulye-biztos]] single switch that puts a tenant into (or out
+// of) NAV-off mode. Takes effect on that tenant's NEXT boot (the boot path
+// reads nav_enabled from the registry); the running tenant's daemons /
+// submit chokepoint already captured `state.nav_enabled` at its own boot.
+async fn handle_toggle_tenant_nav(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    Json(req): Json<ToggleTenantNavRequest>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        toggle_tenant_nav_request(
+            &state_for_task,
+            &slug,
+            req.enabled,
+            &operator_login,
+            binary_hash,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(list)) => Json(list).into_response(),
+        Ok(Err(e)) => tenant_error("toggle_tenant_nav", e),
+        Err(join_err) => internal_error(
+            "toggle_tenant_nav:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+fn toggle_tenant_nav_request(
+    state: &AppState,
+    slug: &str,
+    enabled: bool,
+    operator_login: &str,
+    binary_hash: BinaryHash,
+) -> std::result::Result<TenantListResponse, TenantRouteError> {
+    let running = state.tenant.as_str().to_string();
+    let path = crate::tenant_registry::registry_path()?;
+    let mut reg = crate::tenant_registry::TenantRegistry::read_from(&path)?;
+    let old = reg.set_nav_enabled(slug, enabled)?;
+    reg.write_to(&path)?;
+    // Audit only a real change (a no-op flip writes no row). Recorded in
+    // the running operator's tenant ledger (this is an admin action).
+    if old != enabled {
+        let payload = audit_payloads::TenantNavToggledPayload {
+            slug: slug.to_string(),
+            old_enabled: old,
+            new_enabled: enabled,
+            operator_login: operator_login.to_string(),
+        };
+        crate::tenant_registry::emit_tenant_event(
+            &state.db_path,
+            state.tenant.clone(),
+            binary_hash,
+            operator_login,
+            EventKind::TenantNavToggled,
+            payload.to_bytes(),
+        )
+        .context("record TenantNavToggled")?;
+    }
+    Ok(build_tenant_list(&reg, &running))
+}
+
+#[derive(Debug, Deserialize)]
+struct SetHideDemoRequest {
+    hide: bool,
+}
+
+// POST /api/tenants/hide-demo — set the operator's "hide demo from the
+// default view" preference. S434: demo stays unarchivable (S433 invariant);
+// this only hides it from the list once a real tenant exists.
+async fn handle_set_hide_demo(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<SetHideDemoRequest>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let running = state.tenant.as_str().to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<TenantListResponse> {
+        let path = crate::tenant_registry::registry_path()?;
+        let mut reg = crate::tenant_registry::TenantRegistry::read_from(&path)?;
+        reg.hide_demo = req.hide;
+        reg.write_to(&path)?;
+        Ok(build_tenant_list(&reg, &running))
+    })
+    .await;
+    match result {
+        Ok(Ok(list)) => Json(list).into_response(),
+        Ok(Err(e)) => internal_error("set_hide_demo", e),
+        Err(join_err) => internal_error(
+            "set_hide_demo:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
 }
 
 /// Map a [`TenantRouteError`] to its HTTP response. The registry
@@ -4664,9 +4987,15 @@ pub fn setup_seller_info_request(
     inputs: &SellerInfoInputs,
     path_override: Option<&std::path::Path>,
 ) -> std::result::Result<(), SetupSellerRouteError> {
+    // S434 — region-aware tax validation: NAV-on enforces the HU §169
+    // ADÓSZÁM shape; NAV-off accepts an optional opaque tax number.
     let result = match path_override {
-        Some(p) => setup_seller_info::setup_seller_info_to_path(p, inputs),
-        None => setup_seller_info::setup_seller_info_from_inputs(state.tenant.as_str(), inputs),
+        Some(p) => setup_seller_info::setup_seller_info_to_path(p, inputs, state.nav_enabled),
+        None => setup_seller_info::setup_seller_info_from_inputs(
+            state.tenant.as_str(),
+            inputs,
+            state.nav_enabled,
+        ),
     };
     match result {
         Ok(_echo) => {}
@@ -4703,12 +5032,36 @@ pub fn setup_seller_info_request(
             )));
         }
     };
-    *guard = ServeBootState::Ready { operator_login };
+    *guard = ServeBootState::Ready {
+        operator_login: operator_login.clone(),
+    };
+    drop(guard);
 
     tracing::info!(
         tenant = %state.tenant.as_str(),
         "seller-info populated via setup route; boot state transitioned to Ready"
     );
+
+    // S434 — record the region/NAV mode the tax validator ran under. One
+    // row per successful seller-info save into the running tenant's
+    // ledger. Best-effort: an audit hiccup must not undo a committed save.
+    if let Ok(bh) = state.binary_hash.wait() {
+        let payload = audit_payloads::TenantSellerRegionConfiguredPayload {
+            country_code: inputs.address_country_code.trim().to_string(),
+            nav_enabled: state.nav_enabled,
+            operator_login: operator_login.clone(),
+        };
+        if let Err(e) = crate::tenant_registry::emit_tenant_event(
+            &state.db_path,
+            state.tenant.clone(),
+            bh,
+            &operator_login,
+            EventKind::TenantSellerRegionConfigured,
+            payload.to_bytes(),
+        ) {
+            tracing::warn!(error = ?e, "could not record TenantSellerRegionConfigured audit");
+        }
+    }
 
     Ok(())
 }
@@ -5379,6 +5732,12 @@ enum InvoiceState {
     Storno,
     Amended,
     Abandoned,
+    /// S434 — issued under a NAV-disabled tenant: the invoice has a PDF +
+    /// audit trail but was never submitted to NAV (no NAV to submit to).
+    /// Terminal from ABERP's side; derived from an
+    /// `InvoiceLocalOnlyEmitted` ledger entry. The SPA renders a
+    /// "LOCAL ONLY (no NAV)" badge.
+    LocalOnly,
 }
 
 /// PR-213 / S215 — closed-vocab discriminator on the unified
@@ -6358,7 +6717,11 @@ pub fn supplier_from_seller_toml(
 ) -> std::result::Result<issue_invoice::SupplierJson, SupplierConfigError> {
     let path = setup_seller_info::seller_toml_path_for_tenant(tenant)
         .map_err(|_| SupplierConfigError::MissingTaxNumber)?;
-    supplier_from_seller_toml_path(&path)
+    // S434 — resolve the tenant's NAV mode so the HU §169 supplier-tax
+    // shape check is skipped for a NAV-off (international) tenant. A
+    // registry read error falls back to NAV-on (preserves HU validation).
+    let nav_enabled = crate::tenant_registry::tenant_nav_enabled(tenant).unwrap_or(true);
+    supplier_from_seller_toml_path(&path, nav_enabled)
 }
 
 /// PR-53 / session-73 — path-explicit sibling of
@@ -6366,8 +6729,16 @@ pub fn supplier_from_seller_toml(
 /// (which can't safely mutate HOME under cargo's parallel test
 /// runner) per the session-58 `get_invoice_pdf(seller_toml_override)`
 /// precedent.
+///
+/// S434 — `nav_enabled` gates the HU supplier-tax validation: a NAV-off
+/// tenant's seller tax is opaque (international format / not submitted to
+/// NAV), so the `xxxxxxxx-y-zz` shape check is skipped. The identity must
+/// still carry a (non-empty) tax_number — the international operator enters
+/// their local registration number; it rides into the (never-sent) NAV XML
+/// + the PDF verbatim.
 pub fn supplier_from_seller_toml_path(
     path: &std::path::Path,
+    nav_enabled: bool,
 ) -> std::result::Result<issue_invoice::SupplierJson, SupplierConfigError> {
     let identity: SellerIdentity = setup_seller_info::read_seller_identity(path)
         .map_err(|_| SupplierConfigError::MissingTaxNumber)?
@@ -6382,8 +6753,11 @@ pub fn supplier_from_seller_toml_path(
     };
     // Re-validate the persisted tax-number shape — a hand-edited
     // seller.toml could carry a malformed value the wizard never
-    // wrote (the file is operator-editable after the wizard run).
-    nav_xml::validate_supplier_info(&supplier_info)?;
+    // wrote (the file is operator-editable after the wizard run). S434:
+    // only for NAV-on tenants (HU §169); a NAV-off tenant's tax is opaque.
+    if nav_enabled {
+        nav_xml::validate_supplier_info(&supplier_info)?;
+    }
     Ok(issue_invoice::SupplierJson {
         tax_number: identity.tax_number,
         name: identity.legal_name,
@@ -7306,7 +7680,13 @@ async fn handle_submit_invoice(
         Ok(outcome) => Json(SubmitInvoiceResponse {
             invoice_id: outcome.invoice_id,
             transaction_id: outcome.transaction_id,
-            state: InvoiceState::Submitted,
+            // S434 — NAV-off issuance lands LocalOnly; the normal NAV wire
+            // path lands Submitted.
+            state: if outcome.local_only {
+                InvoiceState::LocalOnly
+            } else {
+                InvoiceState::Submitted
+            },
             entries_verified: outcome.entries_verified,
         })
         .into_response(),
@@ -7522,7 +7902,12 @@ fn submission_dedupe_message(state: InvoiceState, transaction_id: Option<&str>) 
         | InvoiceState::Draft
         | InvoiceState::Storno
         | InvoiceState::Amended
-        | InvoiceState::Abandoned => Some(format!(
+        | InvoiceState::Abandoned
+        // S434 — LocalOnly is terminal from ABERP's side (NAV-off). It
+        // never reaches this dedupe gate on a NAV-on tenant; the arm
+        // exists for exhaustiveness + the NAV-off idempotency short-circuit
+        // in `submit_invoice_request` handles the real path.
+        | InvoiceState::LocalOnly => Some(format!(
             "POST /invoices/.../submit requires state `Ready`; current state is \
              `{state:?}`. Re-fetch the invoice detail and retry."
         )),
@@ -7567,6 +7952,44 @@ fn submission_gate(tenant: &str, invoice_id: &str) -> Arc<tokio::sync::Mutex<()>
         .entry(key)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+/// S434 — append one `InvoiceLocalOnlyEmitted` row into the tenant's
+/// ledger, marking an invoice issued under a NAV-disabled tenant as
+/// stored local-only. Mirrors the `tenant_registry::emit_tenant_event`
+/// open-by-path + append discipline. The cross-invoice contamination
+/// guard lives in `InvoiceTrace::merge_entry` (it matches the payload's
+/// `invoice_id`).
+fn emit_invoice_local_only(
+    state: &AppState,
+    invoice_id: &str,
+    operator_login: &str,
+) -> std::result::Result<(), SubmitRouteError> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash for local-only emit")?;
+    let mut ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
+        .context("open audit ledger to record InvoiceLocalOnlyEmitted")?;
+    let payload = audit_payloads::InvoiceLocalOnlyEmittedPayload {
+        invoice_id: invoice_id.to_string(),
+        operator_login: operator_login.to_string(),
+    };
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    ledger
+        .append(
+            EventKind::InvoiceLocalOnlyEmitted,
+            payload.to_bytes(),
+            actor,
+            None,
+        )
+        .context("append InvoiceLocalOnlyEmitted audit entry")?;
+    tracing::info!(
+        invoice_id = %invoice_id,
+        tenant = %state.tenant.as_str(),
+        "invoice marked LOCAL ONLY (NAV synchron disabled for this tenant)"
+    );
+    Ok(())
 }
 
 /// PR-44η / session-60 — library helper that wires
@@ -7623,6 +8046,43 @@ pub async fn submit_invoice_request(
     //    409 Conflict naming the existing status (and NAV transactionId
     //    when known) per `submission_dedupe_message`.
     let derived = derive_state_for(state, invoice_id)?;
+
+    // S434 — NAV-off chokepoint. A NAV-disabled tenant never POSTs to
+    // NAV: instead the invoice is recorded LOCAL ONLY (one
+    // `InvoiceLocalOnlyEmitted` ledger row → `derive_state` returns
+    // `LocalOnly`). Idempotent: a re-submit of an already-LocalOnly
+    // invoice short-circuits without a second row. The PDF + audit trail
+    // are produced by the normal issuance path; only the NAV wire send is
+    // skipped. ([[trust-code-not-operator]] — read at the chokepoint.)
+    if !state.nav_enabled {
+        if derived.state == InvoiceState::LocalOnly {
+            return Ok(submit_invoice::SubmitInvoiceOutcome {
+                invoice_id: invoice_id.to_string(),
+                sequence_number: 0,
+                transaction_id: String::new(),
+                entries_verified: 0,
+                local_only: true,
+            });
+        }
+        if derived.state != InvoiceState::Ready {
+            return Err(SubmitRouteError::PreconditionMismatch {
+                current_state: format!("{:?}", derived.state),
+                message: format!(
+                    "invoice {invoice_id} cannot be marked local-only from state {:?}",
+                    derived.state
+                ),
+            });
+        }
+        emit_invoice_local_only(state, invoice_id, &operator_login)?;
+        return Ok(submit_invoice::SubmitInvoiceOutcome {
+            invoice_id: invoice_id.to_string(),
+            sequence_number: 0,
+            transaction_id: String::new(),
+            entries_verified: 0,
+            local_only: true,
+        });
+    }
+
     if let Some(message) =
         submission_dedupe_message(derived.state, derived.transaction_id.as_deref())
     {
@@ -23186,6 +23646,10 @@ struct InvoiceTrace {
     /// is operational metadata, separate from the NAV regulatory
     /// ladder per ADR-0039 §3.
     payment: Option<PaymentRecord>,
+    /// S434 — an `InvoiceLocalOnlyEmitted` entry exists for this invoice
+    /// (issued under a NAV-disabled tenant; never submitted to NAV). Set
+    /// via `merge_entry`; read by `derive_state` to return `LocalOnly`.
+    has_local_only: bool,
 }
 
 impl InvoiceTrace {
@@ -23260,6 +23724,19 @@ impl InvoiceTrace {
             EventKind::InvoiceMarkedAbandoned => {
                 self.has_marked_abandoned = true;
             }
+            EventKind::InvoiceLocalOnlyEmitted => {
+                // S434 — same per-invoice contamination guard as the NAV
+                // ladder entries: only flag this trace if the payload's
+                // invoice_id matches the one being derived.
+                if let Ok(parsed) = serde_json::from_slice::<
+                    audit_payloads::InvoiceLocalOnlyEmittedPayload,
+                >(&entry.payload)
+                {
+                    if parsed.invoice_id == invoice_id {
+                        self.has_local_only = true;
+                    }
+                }
+            }
             EventKind::InvoicePaymentRecorded => {
                 // PR-70 / ADR-0039 §2 — capture the operator-facing
                 // payment fields onto the trace. Walk is in seq
@@ -23327,6 +23804,14 @@ impl InvoiceTrace {
         }
         if self.is_amended_base {
             return InvoiceState::Amended;
+        }
+        // S434 — LOCAL ONLY: issued under a NAV-disabled tenant. Sits
+        // below the operator-decision (Abandoned) and chain-link
+        // (Storno/Amended) terminals — a local-only invoice can still be
+        // stornoed/amended/abandoned — but ABOVE the NAV ladder, which
+        // never fires for it (no Attempt/Response/ack rows exist).
+        if self.has_local_only {
+            return InvoiceState::LocalOnly;
         }
         // 4-5. Terminal-by-NAV from the ack status.
         match self.last_ack_status.as_deref() {
@@ -24675,6 +25160,37 @@ mod tests {
     use super::*;
     use aberp_audit_ledger::{Actor, BinaryHash, Ledger, TenantId};
     use aberp_billing::IdempotencyKey;
+
+    /// S434 — the demo sample-data seed migrates the demo DB and inserts 3
+    /// partners + 2 products, idempotently (a second run is a no-op).
+    #[test]
+    fn demo_sample_data_seed_is_populated_and_idempotent() {
+        let dir = std::env::temp_dir()
+            .join("aberp-demo-seed-test")
+            .join(ulid::Ulid::new().to_string());
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let db = dir.join("aberp.duckdb");
+
+        seed_demo_sample_data(&db).expect("first seed");
+        let conn = Connection::open(&db).expect("open demo db");
+        let partners =
+            crate::partners::list_partners(&conn, crate::tenant_registry::DEMO_SLUG, None)
+                .expect("list partners");
+        let products =
+            crate::products::list_products(&conn, crate::tenant_registry::DEMO_SLUG, None)
+                .expect("list products");
+        assert_eq!(partners.len(), 3, "demo seeds 3 partners");
+        assert_eq!(products.len(), 2, "demo seeds 2 products");
+        drop(conn);
+
+        // Second run must NOT duplicate.
+        seed_demo_sample_data(&db).expect("second seed (idempotent)");
+        let conn = Connection::open(&db).expect("reopen demo db");
+        let partners2 =
+            crate::partners::list_partners(&conn, crate::tenant_registry::DEMO_SLUG, None)
+                .expect("list partners again");
+        assert_eq!(partners2.len(), 3, "re-seed must not duplicate partners");
+    }
 
     // ──────────────────────────────────────────────────────────────
     // S344 / PR-38 — digital-identity provider boot wiring
@@ -27483,6 +27999,7 @@ mod tests {
         let state = AppState {
             db_path: std::sync::Arc::new(db_path),
             tenant,
+            nav_enabled: true,
             binary_hash: crate::binary_hash::BinaryHashHandle::from_ready(binary_hash),
             session_token: std::sync::Arc::new("test-token".to_string()),
             secrets_cache: crate::secrets_cache::SecretsCache::empty(),
@@ -27606,6 +28123,7 @@ mod tests {
         let state = AppState {
             db_path: std::sync::Arc::new(db_path),
             tenant,
+            nav_enabled: true,
             binary_hash: crate::binary_hash::BinaryHashHandle::from_ready(binary_hash),
             session_token: std::sync::Arc::new("test-token".to_string()),
             secrets_cache: crate::secrets_cache::SecretsCache::empty(),
@@ -28374,6 +28892,7 @@ mod tests {
         AppState {
             db_path: std::sync::Arc::new(db_path),
             tenant: TenantId::new(tenant.to_string()).expect("tenant id"),
+            nav_enabled: true,
             binary_hash: crate::binary_hash::BinaryHashHandle::from_ready(BinaryHash::from_bytes(
                 [0u8; 32],
             )),

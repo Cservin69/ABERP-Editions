@@ -6,7 +6,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { TenantRow } from "./api";
-import { buttonStateFor, orderTenants } from "./tenants-list";
+import { buttonStateFor, orderTenants, visibleTenants } from "./tenants-list";
 
 // Three tenants: one running (prod), one other Active (test), one
 // Archived (old). This is the brief's SPA fixture.
@@ -17,6 +17,7 @@ const ROWS: TenantRow[] = [
     state: "active",
     created_at: "2026-06-16T04:46:00Z",
     running: true,
+    nav_enabled: true,
   },
   {
     slug: "test",
@@ -24,6 +25,7 @@ const ROWS: TenantRow[] = [
     state: "active",
     created_at: "2026-06-16T04:47:00Z",
     running: false,
+    nav_enabled: true,
   },
   {
     slug: "old",
@@ -31,6 +33,7 @@ const ROWS: TenantRow[] = [
     state: "archived",
     created_at: "2026-01-01T00:00:00Z",
     running: false,
+    nav_enabled: true,
   },
 ];
 
@@ -71,6 +74,7 @@ describe("buttonStateFor", () => {
         state: "demo",
         created_at: "2026-06-16T00:00:00Z",
         running: false,
+        nav_enabled: false,
       },
     ];
     const demo = withDemo[withDemo.length - 1];
@@ -100,5 +104,44 @@ describe("orderTenants", () => {
     const before = ROWS.map((r) => r.slug);
     orderTenants(ROWS);
     expect(ROWS.map((r) => r.slug)).toEqual(before);
+  });
+});
+
+describe("visibleTenants (S434 hide-demo)", () => {
+  const withDemo: TenantRow[] = [
+    ...ROWS,
+    {
+      slug: "demo",
+      display_name: "Demo Tenant",
+      state: "demo",
+      created_at: "2026-06-16T00:00:00Z",
+      running: false,
+      nav_enabled: false,
+    },
+  ];
+
+  it("shows demo when hide_demo is off", () => {
+    const slugs = visibleTenants(withDemo, false, true).map((r) => r.slug);
+    expect(slugs).toContain("demo");
+  });
+
+  it("hides demo when hide_demo on AND a real tenant exists", () => {
+    const slugs = visibleTenants(withDemo, true, true).map((r) => r.slug);
+    expect(slugs).not.toContain("demo");
+    expect(slugs).toContain("prod");
+  });
+
+  it("never hides demo when no real tenant exists (fresh install)", () => {
+    const demoOnly: TenantRow[] = [withDemo[withDemo.length - 1]];
+    const slugs = visibleTenants(demoOnly, true, false).map((r) => r.slug);
+    expect(slugs).toContain("demo");
+  });
+
+  it("never hides the demo when it is the running tenant", () => {
+    const runningDemo = withDemo.map((r) =>
+      r.slug === "demo" ? { ...r, running: true } : { ...r, running: false },
+    );
+    const slugs = visibleTenants(runningDemo, true, true).map((r) => r.slug);
+    expect(slugs).toContain("demo");
   });
 });

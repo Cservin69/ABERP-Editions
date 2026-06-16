@@ -193,7 +193,10 @@ export type InvoiceState =
   | "Rejected"
   | "Storno"
   | "Amended"
-  | "Abandoned";
+  | "Abandoned"
+  // S434 — issued under a NAV-disabled tenant: PDF + audit trail, but
+  // never submitted to NAV. Renders the "LOCAL ONLY (no NAV)" badge.
+  | "LocalOnly";
 
 /** One audit-ledger entry — shape mirrors `serve::AuditEntryView`. */
 export interface AuditEntryView {
@@ -4772,6 +4775,9 @@ export interface TenantRow {
   created_at: string;
   /** True for the tenant this binary booted with. */
   running: boolean;
+  /** S434 — per-tenant NAV-synchron flag. `false` → "LOCAL ONLY" badge +
+   * the toggle reads "off". */
+  nav_enabled: boolean;
 }
 
 /** S433 — `GET /api/tenants` response. Mirrors
@@ -4779,6 +4785,11 @@ export interface TenantRow {
 export interface TenantListResponse {
   tenants: TenantRow[];
   running_slug: string;
+  /** S434 — operator preference: hide demo from the default view. */
+  hide_demo: boolean;
+  /** S434 — a real (Active, non-demo) tenant exists; gates the hide-demo
+   * filter. */
+  has_real_tenant: boolean;
 }
 
 /** S433 — `GET /api/tenants`. */
@@ -4811,4 +4822,23 @@ export async function archiveTenant(slug: string): Promise<TenantListResponse> {
 /** S433 — `POST /api/tenants/:slug/restore`. Returns the refreshed list. */
 export async function restoreTenant(slug: string): Promise<TenantListResponse> {
   return invoke<TenantListResponse>("restore_tenant", { slug });
+}
+
+/** S434 — `POST /api/tenants/:slug/toggle-nav`. Flip a tenant's
+ * NAV-synchron flag (takes effect on that tenant's next boot). Returns
+ * the refreshed list. */
+export async function toggleTenantNav(
+  slug: string,
+  enabled: boolean,
+): Promise<TenantListResponse> {
+  return invoke<TenantListResponse>("toggle_tenant_nav", {
+    slug,
+    body: { enabled },
+  });
+}
+
+/** S434 — `POST /api/tenants/hide-demo`. Set the operator's hide-demo
+ * preference. Returns the refreshed list. */
+export async function setHideDemo(hide: boolean): Promise<TenantListResponse> {
+  return invoke<TenantListResponse>("set_hide_demo", { body: { hide } });
 }

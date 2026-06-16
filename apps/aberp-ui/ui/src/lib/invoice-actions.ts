@@ -167,6 +167,11 @@ export function buttonsForState(
     case "Storno":
     case "Abandoned":
     case "Unknown":
+    // S434 — LocalOnly (NAV-off issuance) is terminal: the PDF exists, so
+    // download + email stay available, but there is no Submit/Storno/
+    // Modification (those are NAV-chain operations a NAV-off tenant has no
+    // path for).
+    case "LocalOnly":
       // Terminal / read-only states: download (and email — operator
       // may resend an issued invoice's PDF regardless of NAV terminal
       // state per ADR-0047 §2; e.g. resending a stornoed invoice's
