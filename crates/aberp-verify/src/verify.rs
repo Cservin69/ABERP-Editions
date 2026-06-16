@@ -1140,7 +1140,22 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::TenantNavToggled
         | EventKind::TenantSellerSetupOptional
         | EventKind::TenantSellerRegionConfigured
-        | EventKind::InvoiceLocalOnlyEmitted => (None, ""),
+        | EventKind::InvoiceLocalOnlyEmitted
+        // S439 (ADR-0090) — ncr.* / capa.* quality-management family. NCR
+        // lifecycle + escalation + open-NCR shipment block + CAPA lifecycle;
+        // app-layer JSON payloads (ncr_id / severity / state tokens / capa_id /
+        // verdict / …), never NAV XML bytes. `ncr.*`/`capa.*`-not-`invoice.*`
+        // posture; never sweeps a per-OUTGOING-invoice bundle. Exhaustiveness
+        // arm only.
+        | EventKind::NcrCreated
+        | EventKind::NcrStateChanged
+        | EventKind::NcrEscalated
+        | EventKind::NcrClosed
+        | EventKind::WoBlockedByOpenNcr
+        | EventKind::CapaCreated
+        | EventKind::CapaApproved
+        | EventKind::CapaEffectivenessReviewed
+        | EventKind::CapaClosed => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1162,7 +1177,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 150,
+        EventKind::ALL_KINDS_COUNT == 159,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1590,6 +1605,21 @@ mod tests {
             EventKind::PartUidMarked,
             EventKind::WoBlockedNoPartUid,
             EventKind::PartTraceabilityViewed,
+        ]);
+    }
+
+    #[test]
+    fn quality_no_nav_bytes() {
+        assert_family_no_nav(&[
+            EventKind::NcrCreated,
+            EventKind::NcrStateChanged,
+            EventKind::NcrEscalated,
+            EventKind::NcrClosed,
+            EventKind::WoBlockedByOpenNcr,
+            EventKind::CapaCreated,
+            EventKind::CapaApproved,
+            EventKind::CapaEffectivenessReviewed,
+            EventKind::CapaClosed,
         ]);
     }
 

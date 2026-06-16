@@ -2797,6 +2797,93 @@ pub enum EventKind {
     /// operator login. `invoice.*` family; app-layer JSON only — never
     /// NAV XML (the whole point is that no NAV XML was sent).
     InvoiceLocalOnlyEmitted,
+
+    /// S439 (ADR-0090) — a Non-Conformance Report was opened. FIRST member of
+    /// the new `ncr.*` prefix family — the quality-management strand of the
+    /// aerospace pivot (`[[defense-aerospace-pivot]]`, AS9100 §10.2 / IATF 16949
+    /// §10.2). A durable, hash-chained note that part/process P failed
+    /// inspection: WHAT failed, WHO found it, WHEN, and the affected part UIDs.
+    ///
+    /// Payload (`serde_json::Value`): `ncr_id`, `severity`
+    /// (`critical`/`major`/`minor`), `category`, `discovered_by_operator`,
+    /// `discovered_at_utc`, `affected_part_uids`, `affected_wo_ids`,
+    /// `operator_user_id`. `ncr.*` family — app-layer JSON, never NAV XML bytes.
+    NcrCreated,
+
+    /// S439 (ADR-0090) — an NCR moved between lifecycle states (Open →
+    /// Contained → UnderInvestigation → CorrectionApplied → Closed, or →
+    /// Escalated). The state-transition record; the `ncr_transitions` log row's
+    /// audit counterpart. Distinct from [`Self::NcrEscalated`] (the timer-driven
+    /// escalation) and [`Self::NcrClosed`] (the terminal close), which fire
+    /// alongside this for those specific edges.
+    ///
+    /// Payload (`serde_json::Value`): `ncr_id`, `from_state`, `to_state`,
+    /// `operator_user_id`, `note`, `changed_at`. `ncr.*` family.
+    NcrStateChanged,
+
+    /// S439 (ADR-0090) — a `Critical`-severity NCR that was not closed within
+    /// the escalation window auto-escalated. The [[trust-code-not-operator]]
+    /// timer: the boot scan (not operator discipline) flips the state and fires
+    /// this so a forensic walker can prove the SLA breach was surfaced.
+    ///
+    /// Payload (`serde_json::Value`): `ncr_id`, `severity`, `discovered_at_utc`,
+    /// `escalated_at`, `hours_elapsed`, `operator_user_id`. `ncr.*` family.
+    NcrEscalated,
+
+    /// S439 (ADR-0090) — an NCR reached the terminal `Closed` state. Closing is
+    /// gated in code on a linked CAPA that is approved AND effectiveness-Verified
+    /// ([[trust-code-not-operator]]): a defect is not "closed" until the fix was
+    /// signed off and proven effective.
+    ///
+    /// Payload (`serde_json::Value`): `ncr_id`, `closed_by_operator`,
+    /// `closed_at_utc`, `capa_id`. `ncr.*` family.
+    NcrClosed,
+
+    /// S439 (ADR-0090) — a dispatch Shipment was REFUSED because the Work Order
+    /// it ships has a unit whose `part_uid` is referenced by an `Open` or
+    /// `Contained` NCR, AND the dispatch's customer is defense/aerospace. The
+    /// quality safety-net gate at the dispatch `Shipped` transition (extends the
+    /// S438 part-UID gate): don't ship parts with known unresolved issues. The
+    /// non-defense path is unaffected (no block, no event).
+    ///
+    /// Payload (`serde_json::Value`): `work_order_id`, `dispatch_id`,
+    /// `partner_id`, `customer_type`, `blocking_ncr_ids`, `operator_user_id`,
+    /// `blocked_at`. `ncr.*` family — app-layer JSON, never NAV XML bytes.
+    WoBlockedByOpenNcr,
+
+    /// S439 (ADR-0090) — a Corrective And Preventive Action was created for a
+    /// parent NCR. FIRST member of the new `capa.*` prefix family. Records the
+    /// corrective + preventive plan, the responsible operator, and the target
+    /// close date.
+    ///
+    /// Payload (`serde_json::Value`): `capa_id`, `ncr_id`,
+    /// `responsible_operator`, `target_close_date`, `operator_user_id`,
+    /// `created_at_utc`. `capa.*` family.
+    CapaCreated,
+
+    /// S439 (ADR-0090) — a CAPA's corrective/preventive plan was approved by an
+    /// operator (the accountability anchor for the sign-off). Distinct from the
+    /// effectiveness review, which happens later once the action has had time to
+    /// take effect.
+    ///
+    /// Payload (`serde_json::Value`): `capa_id`, `ncr_id`,
+    /// `approved_by_operator`, `approved_at_utc`. `capa.*` family.
+    CapaApproved,
+
+    /// S439 (ADR-0090) — an operator reviewed whether a CAPA was effective and
+    /// recorded a verdict (`Verified` / `NotEffective` / `Pending`) with a
+    /// comment. The closed-loop quality check: did the fix actually hold?
+    ///
+    /// Payload (`serde_json::Value`): `capa_id`, `ncr_id`, `verdict`, `comment`,
+    /// `effectiveness_review_at_utc`, `operator_user_id`. `capa.*` family.
+    CapaEffectivenessReviewed,
+
+    /// S439 (ADR-0090) — a CAPA reached its terminal closed state, stamping the
+    /// actual close date. `capa.*` family.
+    ///
+    /// Payload (`serde_json::Value`): `capa_id`, `ncr_id`, `actual_close_date`,
+    /// `operator_user_id`. `capa.*` family.
+    CapaClosed,
 }
 
 impl EventKind {
@@ -2967,6 +3054,15 @@ impl EventKind {
             EventKind::TenantSellerSetupOptional => "tenant.seller_setup_optional",
             EventKind::TenantSellerRegionConfigured => "tenant.seller_region_configured",
             EventKind::InvoiceLocalOnlyEmitted => "invoice.local_only_emitted",
+            EventKind::NcrCreated => "ncr.created",
+            EventKind::NcrStateChanged => "ncr.state_changed",
+            EventKind::NcrEscalated => "ncr.escalated",
+            EventKind::NcrClosed => "ncr.closed",
+            EventKind::WoBlockedByOpenNcr => "ncr.wo_blocked_by_open_ncr",
+            EventKind::CapaCreated => "capa.created",
+            EventKind::CapaApproved => "capa.approved",
+            EventKind::CapaEffectivenessReviewed => "capa.effectiveness_reviewed",
+            EventKind::CapaClosed => "capa.closed",
         }
     }
 
@@ -3148,6 +3244,15 @@ impl EventKind {
             "tenant.seller_setup_optional" => Ok(EventKind::TenantSellerSetupOptional),
             "tenant.seller_region_configured" => Ok(EventKind::TenantSellerRegionConfigured),
             "invoice.local_only_emitted" => Ok(EventKind::InvoiceLocalOnlyEmitted),
+            "ncr.created" => Ok(EventKind::NcrCreated),
+            "ncr.state_changed" => Ok(EventKind::NcrStateChanged),
+            "ncr.escalated" => Ok(EventKind::NcrEscalated),
+            "ncr.closed" => Ok(EventKind::NcrClosed),
+            "ncr.wo_blocked_by_open_ncr" => Ok(EventKind::WoBlockedByOpenNcr),
+            "capa.created" => Ok(EventKind::CapaCreated),
+            "capa.approved" => Ok(EventKind::CapaApproved),
+            "capa.effectiveness_reviewed" => Ok(EventKind::CapaEffectivenessReviewed),
+            "capa.closed" => Ok(EventKind::CapaClosed),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -3315,6 +3420,15 @@ impl EventKind {
         EventKind::TenantSellerSetupOptional,
         EventKind::TenantSellerRegionConfigured,
         EventKind::InvoiceLocalOnlyEmitted,
+        EventKind::NcrCreated,
+        EventKind::NcrStateChanged,
+        EventKind::NcrEscalated,
+        EventKind::NcrClosed,
+        EventKind::WoBlockedByOpenNcr,
+        EventKind::CapaCreated,
+        EventKind::CapaApproved,
+        EventKind::CapaEffectivenessReviewed,
+        EventKind::CapaClosed,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -3490,6 +3604,15 @@ mod tests {
             EventKind::TenantSellerSetupOptional,
             EventKind::TenantSellerRegionConfigured,
             EventKind::InvoiceLocalOnlyEmitted,
+            EventKind::NcrCreated,
+            EventKind::NcrStateChanged,
+            EventKind::NcrEscalated,
+            EventKind::NcrClosed,
+            EventKind::WoBlockedByOpenNcr,
+            EventKind::CapaCreated,
+            EventKind::CapaApproved,
+            EventKind::CapaEffectivenessReviewed,
+            EventKind::CapaClosed,
         ];
         for v in &variants {
             let s = v.as_str();
@@ -3523,7 +3646,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            150,
+            159,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -6036,6 +6159,44 @@ mod tests {
         // Distinct from the two S358 seed kinds this session FIRES.
         assert!(seen.insert(EventKind::PartSerialAssigned.as_str()));
         assert!(seen.insert(EventKind::PartUidMarked.as_str()));
+    }
+
+    /// S439 (ADR-0090) — the nine NCR/CAPA quality kinds round-trip, carry the
+    /// `ncr.*` / `capa.*` prefixes, and are distinct from one another.
+    #[test]
+    fn s439_quality_kinds_round_trip_and_use_ncr_capa_prefix() {
+        let new = [
+            (EventKind::NcrCreated, "ncr.created", "ncr."),
+            (EventKind::NcrStateChanged, "ncr.state_changed", "ncr."),
+            (EventKind::NcrEscalated, "ncr.escalated", "ncr."),
+            (EventKind::NcrClosed, "ncr.closed", "ncr."),
+            (
+                EventKind::WoBlockedByOpenNcr,
+                "ncr.wo_blocked_by_open_ncr",
+                "ncr.",
+            ),
+            (EventKind::CapaCreated, "capa.created", "capa."),
+            (EventKind::CapaApproved, "capa.approved", "capa."),
+            (
+                EventKind::CapaEffectivenessReviewed,
+                "capa.effectiveness_reviewed",
+                "capa.",
+            ),
+            (EventKind::CapaClosed, "capa.closed", "capa."),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (k, expected, prefix) in new {
+            let s = k.as_str();
+            assert_eq!(s, expected, "as_str mismatch for {k:?}");
+            assert!(s.starts_with(prefix), "{s} must start with {prefix}");
+            assert_eq!(
+                EventKind::from_storage_str(s).expect("round-trip"),
+                k,
+                "round-trip mismatch for {s}"
+            );
+            assert!(seen.insert(s), "duplicate storage string {s}");
+        }
+        assert_eq!(seen.len(), 9, "nine distinct quality kinds");
     }
 
     // ── S358 / PR-45 (ADR-0075) — part.* per-unit serialization family ──────

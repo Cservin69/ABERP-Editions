@@ -2485,6 +2485,175 @@ export async function partTraceability(params: {
   });
 }
 
+// ── S439 (ADR-0090) — Quality: NCR + CAPA ────────────────────────────
+
+/** S439 — non-conformance severity tier. Mirrors `aberp::quality::NcrSeverity`. */
+export type NcrSeverity = "critical" | "major" | "minor";
+
+/** S439 — non-conformance category. Mirrors `aberp::quality::NcrCategory`. */
+export type NcrCategory =
+  | "material"
+  | "workmanship"
+  | "documentation"
+  | "equipment_failure"
+  | "operator_error"
+  | "supplier_issue"
+  | "other";
+
+/** S439 — NCR lifecycle state. Mirrors `aberp::quality::NcrState`. */
+export type NcrState =
+  | "open"
+  | "contained"
+  | "under_investigation"
+  | "correction_applied"
+  | "closed"
+  | "escalated";
+
+/** S439 — CAPA effectiveness verdict. Mirrors `aberp::quality::CapaVerdict`. */
+export type CapaVerdict = "verified" | "not_effective" | "pending";
+
+/** S439 — one NCR record. Snake_case mirrors `aberp::quality::Ncr`. */
+export interface Ncr {
+  ncr_id: string;
+  discovered_at_utc: string;
+  discovered_by_operator: string;
+  severity: NcrSeverity;
+  category: NcrCategory;
+  description: string;
+  affected_part_uids: string[];
+  affected_wo_ids: string[];
+  affected_heat_lots: string[];
+  photos: string[];
+  state: NcrState;
+  closed_at_utc: string | null;
+  closed_by_operator: string | null;
+}
+
+/** S439 — one append-only NCR state-transition log row. */
+export interface NcrTransition {
+  seq: number;
+  from_state: string;
+  to_state: string;
+  operator: string;
+  at_utc: string;
+  note: string;
+}
+
+/** S439 — one CAPA record linked to a parent NCR. */
+export interface Capa {
+  capa_id: string;
+  ncr_id: string;
+  corrective_action_text: string;
+  preventive_action_text: string;
+  responsible_operator: string;
+  target_close_date: string;
+  actual_close_date: string | null;
+  effectiveness_review_at_utc: string | null;
+  effectiveness_verdict: CapaVerdict;
+  effectiveness_comment: string | null;
+  approved_by_operator: string | null;
+  approved_at_utc: string | null;
+  created_at_utc: string;
+  created_by_operator: string;
+}
+
+/** S439 — NCR detail: the NCR (flattened) + its transition log + linked CAPAs. */
+export interface NcrDetail extends Ncr {
+  transitions: NcrTransition[];
+  capas: Capa[];
+}
+
+/** S439 — one base64-encoded operator photo upload (no `data:` URI prefix). */
+export interface PhotoUpload {
+  filename: string;
+  data_base64: string;
+}
+
+/** S439 — `GET /api/ncrs` (filterable NCR list, scanned + filtered server-side). */
+export async function listNcrs(params: {
+  stateFilter?: string;
+  severity?: string;
+  from?: string;
+  to?: string;
+  partUid?: string;
+}): Promise<{ ncrs: Ncr[] }> {
+  return invoke<{ ncrs: Ncr[] }>("list_ncrs", {
+    stateFilter: params.stateFilter ?? null,
+    severity: params.severity ?? null,
+    from: params.from ?? null,
+    to: params.to ?? null,
+    partUid: params.partUid ?? null,
+  });
+}
+
+/** S439 — `POST /api/ncrs` (create NCR; photos are base64, prefix stripped). */
+export async function createNcr(body: {
+  severity: NcrSeverity;
+  category: NcrCategory;
+  description: string;
+  affected_part_uids: string[];
+  affected_wo_ids: string[];
+  affected_heat_lots: string[];
+  photos: PhotoUpload[];
+}): Promise<Ncr> {
+  return invoke<Ncr>("create_ncr", { body });
+}
+
+/** S439 — `GET /api/ncrs/:id` (detail: transitions + linked CAPAs). */
+export async function getNcr(ncrId: string): Promise<NcrDetail> {
+  return invoke<NcrDetail>("get_ncr", { ncrId });
+}
+
+/** S439 — `POST /api/ncrs/:id/transition` (operator state change / escalate). */
+export async function transitionNcr(
+  ncrId: string,
+  body: { to_state: NcrState; note?: string },
+): Promise<Ncr> {
+  return invoke<Ncr>("transition_ncr", { ncrId, body });
+}
+
+/** S439 — `POST /api/ncrs/:id/capas` (create a CAPA for an NCR). */
+export async function createCapa(
+  ncrId: string,
+  body: {
+    corrective_action_text: string;
+    preventive_action_text: string;
+    responsible_operator: string;
+    target_close_date: string;
+  },
+): Promise<Capa> {
+  return invoke<Capa>("create_capa", { ncrId, body });
+}
+
+/** S439 — `POST /api/capas/:id/approve`. */
+export async function approveCapa(capaId: string): Promise<Capa> {
+  return invoke<Capa>("approve_capa", { capaId });
+}
+
+/** S439 — `POST /api/capas/:id/review` (effectiveness verdict + comment). */
+export async function reviewCapa(
+  capaId: string,
+  body: { verdict: CapaVerdict; comment?: string },
+): Promise<Capa> {
+  return invoke<Capa>("review_capa", { capaId, body });
+}
+
+/** S439 — `POST /api/capas/:id/close` (stamp actual close date). */
+export async function closeCapa(capaId: string): Promise<Capa> {
+  return invoke<Capa>("close_capa", { capaId });
+}
+
+/** S439 — `GET /api/quality-alert` (dashboard banner counts). */
+export async function qualityAlert(): Promise<{
+  open_count: number;
+  escalated_count: number;
+}> {
+  return invoke<{ open_count: number; escalated_count: number }>(
+    "quality_alert",
+    {},
+  );
+}
+
 // ── PR-172 — buyer-facing notes-history typeahead source ─────────────
 
 /** PR-172 — closed-vocab discriminator for the notes-history scope.

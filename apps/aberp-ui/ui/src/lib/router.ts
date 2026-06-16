@@ -83,6 +83,9 @@ export type AppRoute =
   // area; operator lookup by material id / heat lot (quotes, work orders,
   // invoices placeholder).
   | "material-traceability"
+  // S439 — defense quality management. Operational area; NCR list with
+  // in-page detail (transitions, linked CAPAs) + create + state transitions.
+  | "quality-ncrs"
   // S433 — multi-tenant admin (Settings area). List every tenant from
   // tenants.toml + add / switch (restart-based) / archive / restore.
   // Distinct from the singular `tenant` route, which is the running
@@ -175,6 +178,8 @@ export function parseRoute(hash: string): AppRoute {
       return "calibration";
     case "material-traceability":
       return "material-traceability";
+    case "quality-ncrs":
+      return "quality-ncrs";
     case "tenants":
       return "tenants";
     default:

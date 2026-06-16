@@ -74,6 +74,7 @@
   import Snapshots from "./routes/Snapshots.svelte";
   import Calibration from "./routes/Calibration.svelte";
   import MaterialTraceability from "./routes/MaterialTraceability.svelte";
+  import Quality from "./routes/Quality.svelte";
   import IssueInvoice from "./routes/IssueInvoice.svelte";
   import MaintenanceDashboard from "./routes/MaintenanceDashboard.svelte";
   import NavCredentialsSettings from "./routes/NavCredentialsSettings.svelte";
@@ -134,7 +135,7 @@
   // S256 / PR-245 — quote-arrival surfacing: sidebar/tab badge (DB-truth
   // un-picked count) + in-app toast (live arrivals past the catch-up
   // boundary) + optional native notification + chime.
-  import { getQuoteIntakeNotifications } from "./lib/api";
+  import { getQuoteIntakeNotifications, qualityAlert } from "./lib/api";
   import QuoteArrivalToast from "./lib/QuoteArrivalToast.svelte";
   import {
     arrivalToastMessage,
@@ -266,8 +267,22 @@
   // reload.
   const NOTIFY_POLL_MS = 20_000;
 
+  // S439 — dashboard escalation banner. How many Critical NCRs auto-escalated
+  // (not closed within 24h). Non-fatal; never blocks the app.
+  let escalatedNcrCount = $state(0);
+
+  async function loadQualityAlert() {
+    try {
+      const alert = await qualityAlert();
+      escalatedNcrCount = alert.escalated_count;
+    } catch {
+      // ignore — a quality-alert failure must never break the shell.
+    }
+  }
+
   onMount(() => {
     void pollBoot();
+    void loadQualityAlert();
     // 300ms cadence: fast enough that the loading-pane log line
     // looks like it's updating in near-real-time during cold boot,
     // slow enough that we're not hammering Tauri with invokes.
@@ -646,6 +661,19 @@
         </ul>
       </nav>
       <main class="main">
+        {#if escalatedNcrCount > 0}
+          <section class="banner banner--escalated" role="alert">
+            <strong>
+              {escalatedNcrCount} kritikus NCR eszkalálva / {escalatedNcrCount}
+              critical NCR(s) escalated
+            </strong>
+            <p class="banner-detail">
+              Egy kritikus nem-megfelelőség 24 órán belül nem zárult le. /
+              A critical non-conformance was not closed within 24h. Open
+              Minőség / Quality to resolve.
+            </p>
+          </section>
+        {/if}
         {#if healthState === "error"}
           <section class="banner" role="alert">
             <strong>Backend is not responding.</strong>
@@ -713,6 +741,8 @@
           <Calibration />
         {:else if route === "material-traceability"}
           <MaterialTraceability />
+        {:else if route === "quality-ncrs"}
+          <Quality />
         {:else if route === "invoices-new"}
           <!-- PR-87 / session-112 — full-page issuance route. The
                IssueInvoice form was a `<dialog>` modal mounted inside
@@ -1237,6 +1267,10 @@
     background: var(--color-surface-raised);
     color: var(--color-text-primary);
     font-size: var(--type-size-sm);
+  }
+
+  .banner--escalated strong {
+    color: var(--color-signal-negative);
   }
 
   .banner-detail {

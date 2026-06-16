@@ -1002,7 +1002,19 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::TenantNavToggled
         | EventKind::TenantSellerSetupOptional
         | EventKind::TenantSellerRegionConfigured
-        | EventKind::InvoiceLocalOnlyEmitted => None,
+        | EventKind::InvoiceLocalOnlyEmitted
+        // S439 (ADR-0090) — ncr.* / capa.* quality-management rows: app-layer
+        // JSON, never NAV XML. `ncr.*`/`capa.*`-not-`invoice.*` posture; never
+        // swept by a per-OUTGOING-invoice export bundle glob.
+        | EventKind::NcrCreated
+        | EventKind::NcrStateChanged
+        | EventKind::NcrEscalated
+        | EventKind::NcrClosed
+        | EventKind::WoBlockedByOpenNcr
+        | EventKind::CapaCreated
+        | EventKind::CapaApproved
+        | EventKind::CapaEffectivenessReviewed
+        | EventKind::CapaClosed => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1032,7 +1044,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 150,
+        EventKind::ALL_KINDS_COUNT == 159,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1751,6 +1763,38 @@ mod tests {
                 .append(
                     kind.clone(),
                     br#"{"part_id":"PRT-7781"}"#.to_vec(),
+                    actor,
+                    None,
+                )
+                .unwrap();
+            let entries = ledger.entries().unwrap();
+            let nav = extract_nav_xml(&entries[0]).unwrap();
+            assert!(nav.is_none(), "{} must produce no nav/ file", kind.as_str());
+        }
+    }
+
+    /// S439 (ADR-0090) — the nine `ncr.*` / `capa.*` quality kinds carry
+    /// app-layer JSON payloads, never NAV XML, so `extract_nav_xml` MUST return
+    /// `None` for each. Belt-and-braces runtime pin alongside the compile-time
+    /// exhaustiveness arm.
+    #[test]
+    fn extract_nav_xml_returns_none_for_quality_kinds() {
+        for kind in [
+            EventKind::NcrCreated,
+            EventKind::NcrStateChanged,
+            EventKind::NcrEscalated,
+            EventKind::NcrClosed,
+            EventKind::WoBlockedByOpenNcr,
+            EventKind::CapaCreated,
+            EventKind::CapaApproved,
+            EventKind::CapaEffectivenessReviewed,
+            EventKind::CapaClosed,
+        ] {
+            let (mut ledger, actor, _bh) = fixture_ledger();
+            ledger
+                .append(
+                    kind.clone(),
+                    br#"{"ncr_id":"ncr_01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#.to_vec(),
                     actor,
                     None,
                 )

@@ -2432,6 +2432,56 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             }
         }
 
+        // S439 (ADR-0090) — NCR escalation. One-shot at boot: auto-escalate
+        // every `Critical` NCR not closed within the 24h window
+        // ([[trust-code-not-operator]]). Non-fatal — a quality scan must never
+        // block boot ([[hulye-biztos]]); errors are logged, not `?`-ed.
+        {
+            let operator_login = match recovery_state.boot_state.read() {
+                Ok(guard) => match &*guard {
+                    ServeBootState::Ready { operator_login } => operator_login.clone(),
+                    ServeBootState::NeedsSellerConfig { operator_login } => operator_login.clone(),
+                    _ => "boot".to_string(),
+                },
+                Err(_) => "boot".to_string(),
+            };
+            match recovery_state.binary_hash.wait() {
+                Ok(binary_hash) => {
+                    let db_path = (*recovery_state.db_path).clone();
+                    let tenant = recovery_state.tenant.clone();
+                    let scan = tokio::task::spawn_blocking(move || {
+                        crate::quality::escalate_overdue_ncrs(
+                            &db_path,
+                            tenant,
+                            binary_hash,
+                            &operator_login,
+                            time::OffsetDateTime::now_utc(),
+                        )
+                    })
+                    .await;
+                    match scan {
+                        Ok(Ok(n)) if n > 0 => tracing::warn!(
+                            escalated = n,
+                            "S439: {n} Critical NCR(s) auto-escalated — ncr.escalated fired"
+                        ),
+                        Ok(Ok(_)) => tracing::info!("S439: no NCRs overdue for escalation"),
+                        Ok(Err(e)) => tracing::error!(
+                            error = ?e,
+                            "S439: NCR escalation scan failed (non-fatal)"
+                        ),
+                        Err(join_err) => tracing::error!(
+                            error = %join_err,
+                            "S439: NCR escalation scan panicked (non-fatal)"
+                        ),
+                    }
+                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "S439: binary hash unavailable for NCR escalation scan (non-fatal)"
+                ),
+            }
+        }
+
         // S307 / PR-276 — spawn the email-outbox poll daemon (ADR-0009).
         // Polls the storefront's `/api/internal/email-queue` outbound and
         // delivers via the same SMTP creds the S281 drain uses. The kill
@@ -3643,6 +3693,17 @@ pub fn build_router(state: AppState) -> Router {
         // reverse: customer_id → all part UIDs shipped). Fires
         // part.traceability_viewed. Lives under the Material Traceability tab.
         .route("/api/part-traceability", get(handle_part_traceability))
+        // S439 (ADR-0090) — Quality module: NCR + CAPA workflow. NCR list /
+        // create / detail / state-transition; CAPA create / approve / review /
+        // close; dashboard alert counts. Fires the ncr.* / capa.* family.
+        .route("/api/ncrs", get(handle_list_ncrs).post(handle_create_ncr))
+        .route("/api/ncrs/:id", get(handle_get_ncr))
+        .route("/api/ncrs/:id/transition", post(handle_transition_ncr))
+        .route("/api/ncrs/:id/capas", post(handle_create_capa))
+        .route("/api/capas/:id/approve", post(handle_approve_capa))
+        .route("/api/capas/:id/review", post(handle_review_capa))
+        .route("/api/capas/:id/close", post(handle_close_capa))
+        .route("/api/quality-alert", get(handle_quality_alert))
         // PR-172 — buyer-facing notes typeahead source. GET-only,
         // ready+bearer-gated. `?scope=line|invoice|storno` is required.
         // Returns the most-recent-first deduplicated list of operator-
@@ -14722,6 +14783,133 @@ fn enforce_part_uid_gate_for_shipment(
     )))
 }
 
+/// S439 (ADR-0090) — outcome of the open-NCR shipment gate resolution.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OpenNcrGate {
+    /// Shipment may proceed: not defense/aero, no WO part, or no open NCR.
+    Pass,
+    /// Shipment refused: a defense/aerospace dispatch whose WO has a unit
+    /// referenced by an `Open`/`Contained` NCR.
+    Blocked {
+        work_order_id: String,
+        customer_type: String,
+        blocking_ncr_ids: Vec<String>,
+    },
+}
+
+/// Pure resolver mirroring [`resolve_part_uid_gate`]: a dispatch's customer
+/// (`partner_id`) → `customer_type`, and if defense/aerospace, refuse when any
+/// of the WO's marked part UIDs is referenced by an `Open`/`Contained` NCR.
+/// Read-only; no audit, no I/O beyond the supplied conn — unit-testable.
+pub fn resolve_open_ncr_gate(
+    conn: &Connection,
+    tenant: &str,
+    dispatch: &aberp_dispatch::Dispatch,
+) -> anyhow::Result<OpenNcrGate> {
+    let Some(partner) = crate::partners::get_partner(conn, tenant, &dispatch.partner_id)? else {
+        return Ok(OpenNcrGate::Pass); // unknown partner → nothing to gate on
+    };
+    use crate::partners::CustomerType;
+    if !matches!(
+        partner.customer_type,
+        CustomerType::Defense | CustomerType::Aerospace
+    ) {
+        return Ok(OpenNcrGate::Pass); // commercial path unaffected
+    }
+    let part_uids: Vec<String> =
+        crate::part_marking::list_part_marks(conn, tenant, &dispatch.wo_id)?
+            .into_iter()
+            .map(|m| m.part_uid)
+            .collect();
+    if part_uids.is_empty() {
+        return Ok(OpenNcrGate::Pass);
+    }
+    let ncrs = crate::quality::list_ncrs(conn, tenant, &crate::quality::NcrFilter::default())?;
+    let blocking = crate::quality::open_ncr_ids_blocking_part_uids(&ncrs, &part_uids);
+    if blocking.is_empty() {
+        Ok(OpenNcrGate::Pass)
+    } else {
+        Ok(OpenNcrGate::Blocked {
+            work_order_id: dispatch.wo_id.clone(),
+            customer_type: partner.customer_type.as_db_str().to_string(),
+            blocking_ncr_ids: blocking,
+        })
+    }
+}
+
+/// S439 (ADR-0090) — enforce the open-NCR shipment gate at the dispatch-ship
+/// route (extends the S438 part-UID gate). On block, emits one
+/// `ncr.wo_blocked_by_open_ncr` audit entry (own `Ledger`, after the read conn
+/// drops) and returns a 409 naming the blocking NCR(s). The non-defense path and
+/// the missing-dispatch path are unaffected.
+fn enforce_open_ncr_gate_for_shipment(
+    state: &AppState,
+    dsp_id: &str,
+    operator_login: &str,
+) -> std::result::Result<(), WorkOrderRouteError> {
+    let (gate, partner_id) = {
+        let conn = Connection::open(&*state.db_path).map_err(|e| {
+            WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for open-NCR gate: {e}"))
+        })?;
+        aberp_dispatch::ensure_schema(&conn)
+            .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
+        let Some(dispatch) = aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
+            .map_err(WorkOrderRouteError::Other)?
+        else {
+            return Ok(()); // missing dispatch → defer to the normal 404 path
+        };
+        let gate = resolve_open_ncr_gate(&conn, state.tenant.as_str(), &dispatch)
+            .map_err(WorkOrderRouteError::Other)?;
+        (gate, dispatch.partner_id)
+    };
+
+    let OpenNcrGate::Blocked {
+        work_order_id,
+        customer_type,
+        blocking_ncr_ids,
+    } = gate
+    else {
+        return Ok(());
+    };
+
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let payload = serde_json::json!({
+        "work_order_id": work_order_id,
+        "dispatch_id": dsp_id,
+        "partner_id": partner_id,
+        "customer_type": customer_type,
+        "blocking_ncr_ids": blocking_ncr_ids,
+        "operator_user_id": operator_login,
+        "blocked_at": time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+    });
+    let mut ledger = aberp_audit_ledger::Ledger::open(
+        state.db_path.as_path(),
+        state.tenant.clone(),
+        binary_hash,
+    )
+    .map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("open ledger for open-NCR-block audit: {e}"))
+    })?;
+    ledger
+        .append(
+            aberp_audit_ledger::EventKind::WoBlockedByOpenNcr,
+            serde_json::to_vec(&payload).expect("serialize open-ncr-blocked payload"),
+            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+            None,
+        )
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("append open-NCR-block audit: {e}")))?;
+
+    Err(WorkOrderRouteError::Conflict(format!(
+        "Shipment blocked: work order has open NCR(s) {} — resolve or escalate first",
+        blocking_ncr_ids.join(", ")
+    )))
+}
+
 /// GET /api/products/:id/bom — list active BOM rows.
 async fn handle_get_product_bom(
     headers: HeaderMap,
@@ -15712,6 +15900,11 @@ pub fn mark_dispatch_shipped_request(
     // its WO bears a part UID. [[trust-code-not-operator]] — the refusal is
     // here, not operator discipline. Non-defense dispatches are unaffected.
     enforce_part_uid_gate_for_shipment(state, dsp_id, operator_login)?;
+
+    // S439 (ADR-0090) — open-NCR shipment gate. A defense/aerospace WO with a
+    // unit referenced by an Open/Contained NCR cannot ship until the NCR is
+    // resolved or escalated. [[trust-code-not-operator]]; non-defense unaffected.
+    enforce_open_ncr_gate_for_shipment(state, dsp_id, operator_login)?;
 
     let mut conn = Connection::open(&*state.db_path).map_err(|e| {
         WorkOrderRouteError::Other(anyhow!(
@@ -22672,6 +22865,463 @@ async fn handle_part_traceability(
             "part_traceability:join",
             anyhow!("blocking task panicked: {join_err}"),
         ),
+    }
+}
+
+// ── S439 (ADR-0090) — Quality (NCR / CAPA) routes ────────────────────
+
+/// Map a [`crate::quality::QualityError`] to an HTTP response.
+fn quality_error_response(err: crate::quality::QualityError) -> Response {
+    use crate::quality::QualityError as QE;
+    let msg = err.to_string();
+    match err {
+        QE::NcrNotFound(_) | QE::CapaNotFound(_) => {
+            (StatusCode::NOT_FOUND, Json(error_body(msg))).into_response()
+        }
+        QE::Invalid(_) => (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response(),
+        QE::IllegalTransition(_) => (StatusCode::CONFLICT, Json(error_body(msg))).into_response(),
+        QE::Other(e) => internal_error("quality_route", e),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NcrListQuery {
+    state: Option<String>,
+    severity: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    part_uid: Option<String>,
+}
+
+async fn handle_list_ncrs(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(q): Query<NcrListQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let mut filter = crate::quality::NcrFilter {
+        from: q.from,
+        to: q.to,
+        part_uid: q.part_uid,
+        ..Default::default()
+    };
+    if let Some(s) = q.state.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match crate::quality::NcrState::from_db_str(s) {
+            Some(v) => filter.state = Some(v),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!("unknown state {s}"))),
+                )
+                    .into_response()
+            }
+        }
+    }
+    if let Some(s) = q
+        .severity
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match crate::quality::NcrSeverity::from_db_str(s) {
+            Some(v) => filter.severity = Some(v),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!("unknown severity {s}"))),
+                )
+                    .into_response()
+            }
+        }
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<crate::quality::Ncr>> {
+        let conn = Connection::open(&*state_for_task.db_path)?;
+        crate::quality::list_ncrs(&conn, state_for_task.tenant.as_str(), &filter)
+    })
+    .await;
+    match result {
+        Ok(Ok(ncrs)) => Json(serde_json::json!({ "ncrs": ncrs })).into_response(),
+        Ok(Err(e)) => internal_error("list_ncrs", e),
+        Err(j) => internal_error("list_ncrs:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateNcrBody {
+    severity: String,
+    category: String,
+    description: String,
+    #[serde(default)]
+    affected_part_uids: Vec<String>,
+    #[serde(default)]
+    affected_wo_ids: Vec<String>,
+    #[serde(default)]
+    affected_heat_lots: Vec<String>,
+    #[serde(default)]
+    photos: Vec<crate::quality::PhotoUpload>,
+}
+
+async fn handle_create_ncr(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<CreateNcrBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let Some(severity) = crate::quality::NcrSeverity::from_db_str(body.severity.trim()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body(format!("unknown severity {}", body.severity))),
+        )
+            .into_response();
+    };
+    let Some(category) = crate::quality::NcrCategory::from_db_str(body.category.trim()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body(format!("unknown category {}", body.category))),
+        )
+            .into_response();
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<crate::quality::Ncr, crate::quality::QualityError> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
+            crate::quality::create_ncr(
+                state_for_task.db_path.as_path(),
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &operator,
+                crate::quality::NewNcr {
+                    severity,
+                    category,
+                    description: body.description,
+                    affected_part_uids: body.affected_part_uids,
+                    affected_wo_ids: body.affected_wo_ids,
+                    affected_heat_lots: body.affected_heat_lots,
+                    photos: body.photos,
+                },
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(ncr)) => (StatusCode::CREATED, Json(ncr)).into_response(),
+        Ok(Err(e)) => quality_error_response(e),
+        Err(j) => internal_error("create_ncr:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+async fn handle_get_ncr(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<Option<crate::quality::NcrDetail>> {
+            let conn = Connection::open(&*state_for_task.db_path)?;
+            crate::quality::get_ncr_detail(&conn, state_for_task.tenant.as_str(), &id)
+        })
+        .await;
+    match result {
+        Ok(Ok(Some(detail))) => Json(detail).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body("NCR not found".to_string())),
+        )
+            .into_response(),
+        Ok(Err(e)) => internal_error("get_ncr", e),
+        Err(j) => internal_error("get_ncr:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TransitionNcrBody {
+    to_state: String,
+    #[serde(default)]
+    note: String,
+}
+
+async fn handle_transition_ncr(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<TransitionNcrBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let Some(to) = crate::quality::NcrState::from_db_str(body.to_state.trim()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body(format!("unknown state {}", body.to_state))),
+        )
+            .into_response();
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<crate::quality::Ncr, crate::quality::QualityError> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
+            crate::quality::transition_ncr(
+                state_for_task.db_path.as_path(),
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &operator,
+                &id,
+                to,
+                &body.note,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(ncr)) => Json(ncr).into_response(),
+        Ok(Err(e)) => quality_error_response(e),
+        Err(j) => internal_error(
+            "transition_ncr:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateCapaBody {
+    corrective_action_text: String,
+    preventive_action_text: String,
+    #[serde(default)]
+    responsible_operator: String,
+    #[serde(default)]
+    target_close_date: String,
+}
+
+async fn handle_create_capa(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(ncr_id): AxumPath<String>,
+    Json(body): Json<CreateCapaBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<crate::quality::Capa, crate::quality::QualityError> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
+            crate::quality::create_capa(
+                state_for_task.db_path.as_path(),
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &operator,
+                crate::quality::NewCapa {
+                    ncr_id,
+                    corrective_action_text: body.corrective_action_text,
+                    preventive_action_text: body.preventive_action_text,
+                    responsible_operator: body.responsible_operator,
+                    target_close_date: body.target_close_date,
+                },
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(capa)) => (StatusCode::CREATED, Json(capa)).into_response(),
+        Ok(Err(e)) => quality_error_response(e),
+        Err(j) => internal_error("create_capa:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+async fn handle_approve_capa(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<crate::quality::Capa, crate::quality::QualityError> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
+            crate::quality::approve_capa(
+                state_for_task.db_path.as_path(),
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &operator,
+                &id,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(capa)) => Json(capa).into_response(),
+        Ok(Err(e)) => quality_error_response(e),
+        Err(j) => internal_error("approve_capa:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReviewCapaBody {
+    verdict: String,
+    #[serde(default)]
+    comment: String,
+}
+
+async fn handle_review_capa(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<ReviewCapaBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let Some(verdict) = crate::quality::CapaVerdict::from_db_str(body.verdict.trim()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body(format!("unknown verdict {}", body.verdict))),
+        )
+            .into_response();
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<crate::quality::Capa, crate::quality::QualityError> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
+            crate::quality::review_capa_effectiveness(
+                state_for_task.db_path.as_path(),
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &operator,
+                &id,
+                verdict,
+                &body.comment,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(capa)) => Json(capa).into_response(),
+        Ok(Err(e)) => quality_error_response(e),
+        Err(j) => internal_error("review_capa:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+async fn handle_close_capa(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<crate::quality::Capa, crate::quality::QualityError> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
+            crate::quality::close_capa(
+                state_for_task.db_path.as_path(),
+                state_for_task.tenant.clone(),
+                binary_hash,
+                &operator,
+                &id,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(capa)) => Json(capa).into_response(),
+        Ok(Err(e)) => quality_error_response(e),
+        Err(j) => internal_error("close_capa:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+/// `GET /api/quality-alert` — lightweight counts for the dashboard banner:
+/// how many NCRs are open (non-terminal) and how many have escalated.
+async fn handle_quality_alert(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
+        let conn = Connection::open(&*state_for_task.db_path)?;
+        let ncrs = crate::quality::list_ncrs(
+            &conn,
+            state_for_task.tenant.as_str(),
+            &crate::quality::NcrFilter::default(),
+        )?;
+        let escalated = ncrs
+            .iter()
+            .filter(|n| n.state == crate::quality::NcrState::Escalated)
+            .count();
+        let open = ncrs.iter().filter(|n| !n.state.is_terminal()).count();
+        Ok((open, escalated))
+    })
+    .await;
+    match result {
+        Ok(Ok((open, escalated))) => Json(serde_json::json!({
+            "open_count": open,
+            "escalated_count": escalated,
+        }))
+        .into_response(),
+        Ok(Err(e)) => internal_error("quality_alert", e),
+        Err(j) => internal_error("quality_alert:join", anyhow!("blocking task panicked: {j}")),
     }
 }
 

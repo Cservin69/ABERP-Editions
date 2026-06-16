@@ -73,6 +73,8 @@ pub mod material_inventory;
 pub mod material_traceability;
 // S438 (ADR-0089) — per-unit part UID / serial marking + Part UID Lookup.
 pub mod part_marking;
+// S439 (ADR-0090) — defense quality management: NCR + CAPA workflow.
+pub mod quality;
 // S229 / PR-225 — Stage 3 manufacturing-adapter framework boot wiring.
 // Reads `ABERP_BARCODE_SCANNER_*` env vars and spawns the barcode
 // scanner adapter + per-adapter ledger-writer task. Default-off.

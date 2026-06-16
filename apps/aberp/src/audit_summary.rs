@@ -52,6 +52,9 @@ const SUBJECT_KEYS: &[&str] = &[
     "material_id",
     // S438 — part-UID marking + Part UID Lookup events key on the IUID.
     "part_uid",
+    // S439 — NCR / CAPA quality events key on the report / action id.
+    "ncr_id",
+    "capa_id",
     "nav_invoice_number",
 ];
 

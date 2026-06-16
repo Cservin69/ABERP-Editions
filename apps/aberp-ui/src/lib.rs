@@ -358,6 +358,16 @@ pub fn run() {
             // S438 (ADR-0089) — per-unit part-UID marking + Part UID Lookup.
             commands::mark_parts,
             commands::part_traceability,
+            // S439 (ADR-0090) — Quality: NCR + CAPA workflow.
+            commands::list_ncrs,
+            commands::create_ncr,
+            commands::get_ncr,
+            commands::transition_ncr,
+            commands::create_capa,
+            commands::approve_capa,
+            commands::review_capa,
+            commands::close_capa,
+            commands::quality_alert,
             commands::list_notes_history,
             commands::list_products,
             commands::get_product,

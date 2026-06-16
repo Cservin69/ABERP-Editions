@@ -54,6 +54,10 @@ export type ErpModuleId =
   // S432 — material traceability. Operational area; operator chain-of-
   // custody lookup by material id / heat lot (no dashboard tile).
   | "material-traceability"
+  // S439 — defense quality management (NCR + CAPA). Operational area;
+  // non-conformance reports + corrective/preventive actions + open-NCR
+  // shipment gate. Single route (the NCR list with in-page detail).
+  | "quality"
   | "master-data"
   | "settings"
   // S267 / PR-256 — auto-quoting engine tunables. Maintenance-area
@@ -233,6 +237,18 @@ export const MODULES: ErpModule[] = [
         label: "Anyagkövethetőség / Material traceability",
       },
     ],
+  },
+  // S439 — defense quality management (NCR + CAPA). Operational area, after
+  // material traceability. Closes the quality loop: every marked part has a
+  // traceable history of quality events. No dashboard tile (operational); the
+  // dashboard surfaces an escalation banner instead.
+  {
+    id: "quality",
+    area: "operational",
+    label_hu: "Minőség",
+    label_en: "Quality",
+    glyph: "✅",
+    routes: [{ id: "quality-ncrs", label: "NCR-ek / NCRs" }],
   },
   {
     id: "master-data",

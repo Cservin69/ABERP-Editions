@@ -1263,6 +1263,129 @@ pub async fn part_traceability(
     forward_get(&state, &path, true).await
 }
 
+// ── S439 (ADR-0090) — Quality: NCR + CAPA commands ───────────────────
+
+/// S439 — defence-in-depth validator for `ncr_<ULID>` / `capa_<ULID>` ids on
+/// the quality routes. Same ASCII-safe charset as `validate_wo_id`.
+fn validate_quality_id(s: &str) -> anyhow::Result<()> {
+    if s.is_empty() {
+        anyhow::bail!("id is empty");
+    }
+    if s.len() > 64 {
+        anyhow::bail!("id length {} exceeds 64", s.len());
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!("id `{s}` contains characters outside [A-Za-z0-9_-]");
+    }
+    Ok(())
+}
+
+/// S439 — `GET /api/ncrs` (NCR list). Optional filter facets are URL-encoded
+/// here; an absent/blank facet is omitted. The backend scans + filters in Rust.
+#[tauri::command]
+pub async fn list_ncrs(
+    state: State<'_, AppState>,
+    state_filter: Option<String>,
+    severity: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    part_uid: Option<String>,
+) -> Result<Value, String> {
+    let mut params: Vec<String> = Vec::new();
+    let mut push = |k: &str, v: &Option<String>| {
+        if let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            params.push(format!("{k}={}", urlencode(s)));
+        }
+    };
+    push("state", &state_filter);
+    push("severity", &severity);
+    push("from", &from);
+    push("to", &to);
+    push("part_uid", &part_uid);
+    let path = if params.is_empty() {
+        "/api/ncrs".to_string()
+    } else {
+        format!("/api/ncrs?{}", params.join("&"))
+    };
+    forward_get(&state, &path, true).await
+}
+
+/// S439 — `POST /api/ncrs` (create NCR). Body carries severity + category +
+/// description + affected arrays + optional base64 photos.
+#[tauri::command]
+pub async fn create_ncr(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/ncrs", body).await
+}
+
+/// S439 — `GET /api/ncrs/:id` (NCR detail: transitions + linked CAPAs).
+#[tauri::command]
+pub async fn get_ncr(state: State<'_, AppState>, ncr_id: String) -> Result<Value, String> {
+    validate_quality_id(&ncr_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/ncrs/{ncr_id}");
+    forward_get(&state, &path, true).await
+}
+
+/// S439 — `POST /api/ncrs/:id/transition`. Body: `{ to_state, note? }`.
+#[tauri::command]
+pub async fn transition_ncr(
+    state: State<'_, AppState>,
+    ncr_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_quality_id(&ncr_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/ncrs/{ncr_id}/transition");
+    forward_post(&state, &path, body).await
+}
+
+/// S439 — `POST /api/ncrs/:id/capas` (create CAPA for an NCR).
+#[tauri::command]
+pub async fn create_capa(
+    state: State<'_, AppState>,
+    ncr_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_quality_id(&ncr_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/ncrs/{ncr_id}/capas");
+    forward_post(&state, &path, body).await
+}
+
+/// S439 — `POST /api/capas/:id/approve`.
+#[tauri::command]
+pub async fn approve_capa(state: State<'_, AppState>, capa_id: String) -> Result<Value, String> {
+    validate_quality_id(&capa_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/capas/{capa_id}/approve");
+    forward_post(&state, &path, Value::Null).await
+}
+
+/// S439 — `POST /api/capas/:id/review`. Body: `{ verdict, comment? }`.
+#[tauri::command]
+pub async fn review_capa(
+    state: State<'_, AppState>,
+    capa_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_quality_id(&capa_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/capas/{capa_id}/review");
+    forward_post(&state, &path, body).await
+}
+
+/// S439 — `POST /api/capas/:id/close`.
+#[tauri::command]
+pub async fn close_capa(state: State<'_, AppState>, capa_id: String) -> Result<Value, String> {
+    validate_quality_id(&capa_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/capas/{capa_id}/close");
+    forward_post(&state, &path, Value::Null).await
+}
+
+/// S439 — `GET /api/quality-alert` (dashboard banner counts).
+#[tauri::command]
+pub async fn quality_alert(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quality-alert", true).await
+}
+
 /// S232 — `GET /api/products/:id/bom`. Read the active BOM lines for
 /// a product. The Product detail page's BOM tab reads here.
 #[tauri::command]
