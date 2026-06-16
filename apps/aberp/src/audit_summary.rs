@@ -50,6 +50,8 @@ const SUBJECT_KEYS: &[&str] = &[
     "partner_id",
     // S432 — material traceability events key on the grade as `material_id`.
     "material_id",
+    // S438 — part-UID marking + Part UID Lookup events key on the IUID.
+    "part_uid",
     "nav_invoice_number",
 ];
 

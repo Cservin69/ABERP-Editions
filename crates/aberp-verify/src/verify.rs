@@ -1037,6 +1037,12 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // per-OUTGOING-invoice bundle. Exhaustiveness arm only.
         | EventKind::PartSerialAssigned
         | EventKind::PartUidMarked
+        // S438 (ADR-0089) — part.* per-unit UID-marking firing-site kinds:
+        // shipment refusal when units are unmarked + the Part UID Lookup
+        // record-of-access. Same `part.*` JSON-payload posture; never NAV XML
+        // bytes. Exhaustiveness arm only.
+        | EventKind::WoBlockedNoPartUid
+        | EventKind::PartTraceabilityViewed
         // S359 / PR-46 — export.* export-control family (ADR-0076).
         // Classification record + access-check decision + shipment-logged
         // export; app-layer JSON payloads (entity_kind / jurisdiction / eccn /
@@ -1156,7 +1162,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 148,
+        EventKind::ALL_KINDS_COUNT == 150,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1579,7 +1585,12 @@ mod tests {
 
     #[test]
     fn part_no_nav_bytes() {
-        assert_family_no_nav(&[EventKind::PartSerialAssigned, EventKind::PartUidMarked]);
+        assert_family_no_nav(&[
+            EventKind::PartSerialAssigned,
+            EventKind::PartUidMarked,
+            EventKind::WoBlockedNoPartUid,
+            EventKind::PartTraceabilityViewed,
+        ]);
     }
 
     #[test]

@@ -902,6 +902,10 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // never sweeps a per-OUTGOING-invoice export bundle by glob.
         | EventKind::PartSerialAssigned
         | EventKind::PartUidMarked
+        // S438 (ADR-0089) — part.* per-unit UID-marking firing-site kinds, same
+        // `part.*` JSON-payload posture; never NAV XML bytes.
+        | EventKind::WoBlockedNoPartUid
+        | EventKind::PartTraceabilityViewed
         // S359 / PR-46 — export.* export-control family (ADR-0076).
         // Classification record + access-check decision + shipment-logged
         // export; app-layer JSON payloads, never NAV XML bytes. `export.*`-not-
@@ -1028,7 +1032,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 148,
+        EventKind::ALL_KINDS_COUNT == 150,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1736,7 +1740,12 @@ mod tests {
     /// export bundle.
     #[test]
     fn extract_nav_xml_returns_none_for_part_kinds() {
-        for kind in [EventKind::PartSerialAssigned, EventKind::PartUidMarked] {
+        for kind in [
+            EventKind::PartSerialAssigned,
+            EventKind::PartUidMarked,
+            EventKind::WoBlockedNoPartUid,
+            EventKind::PartTraceabilityViewed,
+        ] {
             let (mut ledger, actor, _bh) = fixture_ledger();
             ledger
                 .append(

@@ -1220,6 +1220,49 @@ pub async fn transition_work_order(
     forward_post(&state, &path, body).await
 }
 
+/// S438 — `POST /api/work-orders/:id/mark-parts`. The Mark Parts modal on a
+/// Completed defense/aerospace WO POSTs `{ serials: [".." | ""] }` (one
+/// optional serial per unit). The part UID + DataMatrix payload are minted
+/// server-side. Response carries the recorded `part_marks`.
+#[tauri::command]
+pub async fn mark_parts(
+    state: State<'_, AppState>,
+    wo_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    validate_wo_id(&wo_id).map_err(|e| format!("{e:#}"))?;
+    let path = format!("/api/work-orders/{wo_id}/mark-parts");
+    forward_post(&state, &path, body).await
+}
+
+/// S438 — `GET /api/part-traceability?part_uid=…|customer_id=…`. The Part UID
+/// Lookup section of the Material Traceability tab reads here. Exactly one of
+/// the two params is `Some`; its value is URL-encoded into the query string.
+#[tauri::command]
+pub async fn part_traceability(
+    state: State<'_, AppState>,
+    part_uid: Option<String>,
+    customer_id: Option<String>,
+) -> Result<Value, String> {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(s) = part_uid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(format!("part_uid={}", urlencode(s)));
+    }
+    if let Some(s) = customer_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        params.push(format!("customer_id={}", urlencode(s)));
+    }
+    let path = if params.is_empty() {
+        "/api/part-traceability".to_string()
+    } else {
+        format!("/api/part-traceability?{}", params.join("&"))
+    };
+    forward_get(&state, &path, true).await
+}
+
 /// S232 — `GET /api/products/:id/bom`. Read the active BOM lines for
 /// a product. The Product detail page's BOM tab reads here.
 #[tauri::command]

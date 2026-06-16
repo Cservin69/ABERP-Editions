@@ -355,6 +355,9 @@ pub fn run() {
             // S432 — heat-lot assignment + material traceability report.
             commands::assign_heat_lot,
             commands::material_traceability,
+            // S438 (ADR-0089) — per-unit part-UID marking + Part UID Lookup.
+            commands::mark_parts,
+            commands::part_traceability,
             commands::list_notes_history,
             commands::list_products,
             commands::get_product,

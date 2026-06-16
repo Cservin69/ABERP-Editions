@@ -8,7 +8,9 @@
 
   import {
     materialTraceability,
+    partTraceability,
     type MaterialTraceReport,
+    type PartTraceReport,
   } from "../lib/api";
 
   type Mode = "material_id" | "heat_lot";
@@ -21,6 +23,40 @@
   let report = $state<MaterialTraceReport | null>(null);
 
   let canTrace = $derived(needle.trim().length > 0 && loadState !== "loading");
+
+  // S438 — Part UID Lookup (forward: part_uid → chain; reverse: customer_id →
+  // all part UIDs shipped). Its own search state, sharing the page's styles.
+  type PartMode = "part_uid" | "customer";
+  let partMode = $state<PartMode>("part_uid");
+  let partNeedle = $state("");
+  let partLoadState = $state<LoadState>("idle");
+  let partError = $state<string | null>(null);
+  let partReport = $state<PartTraceReport | null>(null);
+
+  let canTracePart = $derived(
+    partNeedle.trim().length > 0 && partLoadState !== "loading",
+  );
+
+  async function tracePart(): Promise<void> {
+    const value = partNeedle.trim();
+    if (value.length === 0) return;
+    partLoadState = "loading";
+    partError = null;
+    try {
+      const params =
+        partMode === "part_uid" ? { partUid: value } : { customerId: value };
+      partReport = await partTraceability(params);
+      partLoadState = "ready";
+    } catch (e) {
+      partError = e instanceof Error ? e.message : String(e);
+      partLoadState = "error";
+    }
+  }
+
+  function onPartSubmit(event: Event): void {
+    event.preventDefault();
+    void tracePart();
+  }
 
   function dash(s: string | null | undefined): string {
     return s && s.trim().length > 0 ? s : "—";
@@ -193,6 +229,94 @@
       </section>
     </div>
   {/if}
+
+  <!-- S438 — Part UID Lookup (forward + reverse), under the same tab. -->
+  <header class="mt-subhead">
+    <h2 class="mt-subhead__title">Alkatrész UID keresés / Part UID Lookup</h2>
+    <span class="mt-page__hint">
+      Part UID alapján a teljes lánc, vagy ügyfél alapján minden kiszállított
+      alkatrész. / By part UID the full chain, or by customer every shipped
+      part UID.
+    </span>
+  </header>
+
+  <form class="mt-search" onsubmit={onPartSubmit}>
+    <div class="mt-search__modes" role="radiogroup" aria-label="Part lookup mode">
+      <label class="mt-radio">
+        <input
+          type="radio"
+          name="mt-part-mode"
+          value="part_uid"
+          checked={partMode === "part_uid"}
+          onchange={() => (partMode = "part_uid")}
+        />
+        <span>By part UID</span>
+      </label>
+      <label class="mt-radio">
+        <input
+          type="radio"
+          name="mt-part-mode"
+          value="customer"
+          checked={partMode === "customer"}
+          onchange={() => (partMode = "customer")}
+        />
+        <span>By customer</span>
+      </label>
+    </div>
+    <input
+      class="mt-search__input"
+      type="text"
+      bind:value={partNeedle}
+      data-testid="part-trace-input"
+      placeholder={partMode === "part_uid" ? "dp-… part UID" : "customer partner id"}
+      autocomplete="off"
+    />
+    <button type="submit" class="mt-search__btn" disabled={!canTracePart}>
+      {partLoadState === "loading" ? "Trace…" : "Trace / Lekérdez"}
+    </button>
+  </form>
+
+  {#if partLoadState === "error"}
+    <div class="mt-error" role="alert">
+      <strong>Lekérdezés sikertelen. / Trace failed.</strong>
+      <p>{partError}</p>
+    </div>
+  {:else if partLoadState === "ready" && partReport !== null}
+    <section class="mt-block">
+      <h2 class="mt-block__title">Parts / Alkatrészek</h2>
+      {#if partReport.parts.length === 0}
+        <p class="mt-empty">
+          Nincs találat. / No part found for
+          <strong>{partReport.query_value}</strong>.
+        </p>
+      {:else}
+        <table class="mt-table">
+          <thead>
+            <tr>
+              <th class="mt-table__th">Part UID</th>
+              <th class="mt-table__th">Serial</th>
+              <th class="mt-table__th">Heat lot</th>
+              <th class="mt-table__th">WO</th>
+              <th class="mt-table__th">Quote</th>
+              <th class="mt-table__th">Customer</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each partReport.parts as p (p.part_uid)}
+              <tr class="mt-table__row">
+                <td class="mt-table__td mt-table__td--mono">{p.part_uid}</td>
+                <td class="mt-table__td">{p.serial_number}</td>
+                <td class="mt-table__td mt-table__td--mono">{dash(p.heat_lot_reference)}</td>
+                <td class="mt-table__td mt-table__td--mono">{p.wo_number}</td>
+                <td class="mt-table__td mt-table__td--mono">{dash(p.source_quote_id)}</td>
+                <td class="mt-table__td">{dash(p.customer_name)}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+    </section>
+  {/if}
 </section>
 
 <style>
@@ -222,6 +346,21 @@
     font-size: var(--type-size-sm);
     font-weight: 400;
     color: var(--color-text-muted);
+  }
+  /* S438 — Part UID Lookup subheader divider. */
+  .mt-subhead {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin-top: var(--space-4);
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--color-surface-divider);
+  }
+  .mt-subhead__title {
+    margin: 0;
+    font-size: var(--type-size-md, var(--type-size-sm));
+    font-weight: 600;
+    color: var(--color-text-strong);
   }
   .mt-search {
     display: flex;

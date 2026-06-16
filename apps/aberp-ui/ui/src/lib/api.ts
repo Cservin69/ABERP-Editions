@@ -2431,6 +2431,60 @@ export async function materialTraceability(params: {
   });
 }
 
+/** S438 — one traced part with its production + customer chain resolved. */
+export interface PartTraceRow {
+  part_uid: string;
+  serial_number: string;
+  data_matrix_payload: string;
+  heat_lot_reference: string | null;
+  wo_id: string;
+  wo_number: string;
+  wo_state: string;
+  source_quote_id: string | null;
+  customer_partner_id: string | null;
+  customer_name: string | null;
+}
+
+/** S438 — `GET /api/part-traceability` report. One row for a forward
+ * (part_uid) trace, many for a reverse (customer_id) trace. */
+export interface PartTraceReport {
+  query_kind: "part_uid" | "customer";
+  query_value: string;
+  found: boolean;
+  parts: PartTraceRow[];
+}
+
+/** S438 — `POST /api/work-orders/:id/mark-parts` response. */
+export interface MarkPartsResponse {
+  part_marks: PartMark[];
+}
+
+/** S438 — `POST /api/work-orders/:id/mark-parts`. One optional serial per
+ * unit (blank → server auto-derives). Part UID + DataMatrix are minted
+ * server-side. Backend 409 if the WO is not Completed / not defense-aero /
+ * already marked. */
+export async function markParts(
+  woId: string,
+  serials: string[],
+): Promise<MarkPartsResponse> {
+  return invoke<MarkPartsResponse>("mark_parts", {
+    woId,
+    body: { serials },
+  });
+}
+
+/** S438 — `GET /api/part-traceability?part_uid=…|customer_id=…`. The Part
+ * UID Lookup; pass exactly one of the two keys (the other stays `null`). */
+export async function partTraceability(params: {
+  partUid?: string;
+  customerId?: string;
+}): Promise<PartTraceReport> {
+  return invoke<PartTraceReport>("part_traceability", {
+    partUid: params.partUid ?? null,
+    customerId: params.customerId ?? null,
+  });
+}
+
 // ── PR-172 — buyer-facing notes-history typeahead source ─────────────
 
 /** PR-172 — closed-vocab discriminator for the notes-history scope.
@@ -2753,6 +2807,27 @@ export interface WorkOrderDetailResponse {
   work_order: WorkOrder;
   routing_ops: RoutingOp[];
   bom: BomLine[];
+  /** S438 — per-unit part marks recorded for this WO (empty until marked). */
+  part_marks: PartMark[];
+  /** S438 — true when the customer is defense/aerospace (Mark parts + gate). */
+  part_marking_required: boolean;
+  /** S438 — how many discrete units the WO qty_target represents. */
+  part_units_expected: number;
+  /** S438 — resolved customer segment ("defense"/"aerospace"/…), when one. */
+  customer_type: string | null;
+}
+
+/** S438 — one marked unit on a WO. The part UID + DataMatrix payload are
+ * minted server-side; the serial is operator-typed or auto-derived. */
+export interface PartMark {
+  wo_id: string;
+  unit_index: number;
+  part_uid: string;
+  serial_number: string;
+  data_matrix_payload: string;
+  heat_lot_reference: string | null;
+  marked_at_utc: string;
+  marked_by_operator: string;
 }
 
 /** S232 — POST /api/work-orders/:id/transitions body. */

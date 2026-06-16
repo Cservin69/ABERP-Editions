@@ -37,6 +37,7 @@
     type WorkOrderState,
     type WoAction,
   } from "../lib/api";
+  import MarkPartsModal from "./MarkPartsModal.svelte";
 
   const STATE_FACETS: { state: WorkOrderState | null; hu: string; en: string }[] =
     [
@@ -65,6 +66,14 @@
   // re-fetch storm.
   let qaByOp: Record<string, QaInspection | null> = $state({});
   let opBusyId: string | null = $state(null);
+
+  // S438 — Mark-parts modal state.
+  let showMarkModal = $state(false);
+
+  async function onPartsMarked(): Promise<void> {
+    showMarkModal = false;
+    if (detail !== null) await openDetail(detail.work_order.wo_id);
+  }
 
   // Create-WO modal state.
   let showCreateForm = $state(false);
@@ -402,6 +411,42 @@
         {/each}
       </div>
 
+      {#if detail.part_marking_required}
+        <section class="wo-parts" data-testid="wo-parts">
+          <h4>
+            Alkatrész-UID / Part UID
+            <span class="wo-parts__badge">{detail.customer_type}</span>
+          </h4>
+          <p class="wo-parts__count">
+            {detail.part_marks.length} / {detail.part_units_expected} jelölve / marked
+          </p>
+          {#if detail.part_marks.length > 0}
+            <ul class="wo-parts__chips">
+              {#each detail.part_marks as m (m.part_uid)}
+                <li
+                  class="wo-parts__chip"
+                  title={`serial ${m.serial_number} · DM ${m.data_matrix_payload}`}
+                >
+                  {m.part_uid}
+                </li>
+              {/each}
+            </ul>
+          {:else}
+            <span class="wo-parts__hint">no parts marked</span>
+          {/if}
+          {#if detail.work_order.state === "completed" && detail.part_marks.length < detail.part_units_expected}
+            <button
+              type="button"
+              class="wo-parts__mark"
+              data-testid="mark-parts-button"
+              onclick={() => (showMarkModal = true)}
+            >
+              Alkatrészek jelölése / Mark parts
+            </button>
+          {/if}
+        </section>
+      {/if}
+
       <section class="wo-routing">
         <h4>Műveletek / Routing operations</h4>
         <table>
@@ -476,6 +521,15 @@
     <p>Loading detail…</p>
   {:else if detailError !== null}
     <p class="wo-error">Detail load failed: {detailError}</p>
+  {/if}
+
+  {#if showMarkModal && detail !== null}
+    <MarkPartsModal
+      woId={detail.work_order.wo_id}
+      expectedUnits={detail.part_units_expected}
+      onMarked={onPartsMarked}
+      onClose={() => (showMarkModal = false)}
+    />
   {/if}
 
   {#if showCreateForm}
@@ -771,6 +825,78 @@
     color: var(--color-text-primary);
     list-style: none;
     font-size: var(--type-size-sm);
+  }
+
+  /* S438 — part-UID marking section. */
+  .wo-parts {
+    margin: var(--space-3) 0;
+    padding: var(--space-3);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 4px;
+    background: var(--color-surface-raised);
+  }
+
+  .wo-parts h4 {
+    margin: 0 0 var(--space-2) 0;
+    font-size: var(--type-size-sm);
+    color: var(--color-text-strong);
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .wo-parts__badge {
+    font-size: var(--type-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-signal-positive);
+    border: 1px solid var(--color-signal-positive);
+    border-radius: 4px;
+    padding: 0 var(--space-1);
+  }
+
+  .wo-parts__count {
+    margin: 0 0 var(--space-2) 0;
+    font-size: var(--type-size-xs);
+    color: var(--color-text-secondary);
+  }
+
+  .wo-parts__chips {
+    list-style: none;
+    margin: 0 0 var(--space-2) 0;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+  }
+
+  .wo-parts__chip {
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    padding: 0 var(--space-2);
+    border-radius: 4px;
+    color: var(--color-signal-positive);
+    background: color-mix(in srgb, var(--color-signal-positive) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--color-signal-positive) 40%, transparent);
+  }
+
+  .wo-parts__hint {
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
+    font-style: italic;
+  }
+
+  .wo-parts__mark {
+    display: block;
+    margin-top: var(--space-2);
+    background: var(--color-signal-positive, var(--color-text-strong));
+    color: var(--color-surface-base, white);
+    border: 0;
+    border-radius: 4px;
+    padding: var(--space-1) var(--space-4);
+    font-size: var(--type-size-sm);
+    font-weight: 500;
+    cursor: pointer;
   }
 
   .wo-routing,

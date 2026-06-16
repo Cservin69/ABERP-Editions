@@ -3639,6 +3639,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/material-traceability",
             get(handle_material_traceability),
         )
+        // S438 (ADR-0089) — Part UID Lookup (forward: part_uid → chain;
+        // reverse: customer_id → all part UIDs shipped). Fires
+        // part.traceability_viewed. Lives under the Material Traceability tab.
+        .route("/api/part-traceability", get(handle_part_traceability))
         // PR-172 — buyer-facing notes typeahead source. GET-only,
         // ready+bearer-gated. `?scope=line|invoice|storno` is required.
         // Returns the most-recent-first deduplicated list of operator-
@@ -3698,6 +3702,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/work-orders/:id/transitions",
             post(handle_transition_work_order),
         )
+        // S438 (ADR-0089) — per-unit part-UID marking for a Completed
+        // defense/aerospace WO. Mints `dp-`-prefixed UIDs, records serials +
+        // DataMatrix payloads, fires part.serial_assigned + part.uid_marked.
+        .route("/api/work-orders/:id/mark-parts", post(handle_mark_parts))
         // S233 / PR-229 Part A — per-routing-op Complete button (the
         // Active op only; cascade advances the next op + auto-creates
         // a Pending QA inspection).
@@ -14188,6 +14196,15 @@ pub struct WorkOrderDetailResponse {
     pub work_order: aberp_work_orders::WorkOrder,
     pub routing_ops: Vec<aberp_work_orders::RoutingOp>,
     pub bom: Vec<aberp_work_orders::BomLine>,
+    /// S438 — the per-unit part marks recorded for this WO (empty until marked).
+    pub part_marks: Vec<crate::part_marking::PartMark>,
+    /// S438 — true when the WO's customer is defense/aerospace, so the SPA
+    /// surfaces the "Mark parts" action + the shipment gate applies.
+    pub part_marking_required: bool,
+    /// S438 — how many discrete units the WO `qty_target` represents.
+    pub part_units_expected: u32,
+    /// S438 — the resolved customer segment (`defense`/`aerospace`/…), when one.
+    pub customer_type: Option<String>,
 }
 
 async fn handle_get_work_order_detail(
@@ -14246,11 +14263,44 @@ pub fn get_work_order_detail_request(
         state.tenant.as_str(),
         &wo.product_id,
     )?;
+    // S438 — part-UID marking surface for the WO detail page.
+    let part_marks = crate::part_marking::list_part_marks(&conn, state.tenant.as_str(), wo_id)?;
+    let part_units_expected = crate::part_marking::qty_to_units(wo.qty_target);
+    let customer_type = resolve_wo_customer_type(&conn, state.tenant.as_str(), &wo)?;
+    use crate::partners::CustomerType;
+    let part_marking_required = matches!(
+        customer_type,
+        Some(CustomerType::Defense | CustomerType::Aerospace)
+    );
     Ok(Some(WorkOrderDetailResponse {
         work_order: wo,
         routing_ops,
         bom,
+        part_marks,
+        part_marking_required,
+        part_units_expected,
+        customer_type: customer_type.map(|c| c.as_db_str().to_string()),
     }))
+}
+
+/// S438 — resolve a WO's customer segment via its originating quote's buyer
+/// partner (same chain as [`resolve_heat_lot_gate`]). `None` for operator-
+/// authored WOs with no quote/partner link.
+pub fn resolve_wo_customer_type(
+    conn: &Connection,
+    tenant: &str,
+    wo: &aberp_work_orders::WorkOrder,
+) -> anyhow::Result<Option<crate::partners::CustomerType>> {
+    let Some(qid) = wo.source_quote_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(job) = crate::quote_pricing_jobs::get_job_detail(conn, qid, tenant)? else {
+        return Ok(None);
+    };
+    let Some(pid) = job.buyer_partner_id.as_deref() else {
+        return Ok(None);
+    };
+    Ok(crate::partners::get_partner(conn, tenant, pid)?.map(|p| p.customer_type))
 }
 
 /// POST body for `/api/work-orders/:id/transitions`. The route layer
@@ -14542,6 +14592,133 @@ fn enforce_heat_lot_gate_for_start(
 
     Err(WorkOrderRouteError::Conflict(format!(
         "Material {material_grade} requires heat lot before defense/aerospace WO start"
+    )))
+}
+
+/// S438 (ADR-0089) — outcome of the part-UID shipment gate resolution.
+#[derive(Debug, PartialEq)]
+pub enum PartUidGate {
+    /// Shipment may proceed: not defense/aerospace, no WO, or every unit marked.
+    Pass,
+    /// Shipment refused: a defense/aerospace dispatch whose WO has unmarked units.
+    Blocked {
+        work_order_id: String,
+        qty_target: u32,
+        marked_count: u32,
+        customer_type: String,
+    },
+}
+
+/// Pure resolver: a dispatch's customer (`partner_id`) → `customer_type`, and if
+/// defense/aerospace, require the WO's marked-part count to reach its
+/// `qty_target`. Read-only; no audit, no I/O beyond the supplied conn —
+/// unit-testable end to end.
+pub fn resolve_part_uid_gate(
+    conn: &Connection,
+    tenant: &str,
+    dispatch: &aberp_dispatch::Dispatch,
+) -> anyhow::Result<PartUidGate> {
+    let Some(partner) = crate::partners::get_partner(conn, tenant, &dispatch.partner_id)? else {
+        return Ok(PartUidGate::Pass); // unknown partner → nothing to gate on
+    };
+    use crate::partners::CustomerType;
+    if !matches!(
+        partner.customer_type,
+        CustomerType::Defense | CustomerType::Aerospace
+    ) {
+        return Ok(PartUidGate::Pass); // commercial path unaffected
+    }
+    let Some(wo) = aberp_work_orders::read_work_order(conn, tenant, &dispatch.wo_id)? else {
+        return Ok(PartUidGate::Pass); // WO gone → defer to dispatch crate's checks
+    };
+    let qty_target = crate::part_marking::qty_to_units(wo.qty_target);
+    let marked_count = crate::part_marking::count_part_marks(conn, tenant, &dispatch.wo_id)?;
+    if marked_count >= qty_target {
+        Ok(PartUidGate::Pass)
+    } else {
+        Ok(PartUidGate::Blocked {
+            work_order_id: wo.wo_id,
+            qty_target,
+            marked_count,
+            customer_type: partner.customer_type.as_db_str().to_string(),
+        })
+    }
+}
+
+/// Enforce the part-UID gate at the dispatch-ship route. On block, emits one
+/// `part.wo_blocked_no_uid` audit entry (own `Ledger`, after the read conn is
+/// dropped) and returns a 409 naming the first unmarked unit. A missing
+/// dispatch is NOT blocked here — the normal mark_shipped path 404s it.
+fn enforce_part_uid_gate_for_shipment(
+    state: &AppState,
+    dsp_id: &str,
+    operator_login: &str,
+) -> std::result::Result<(), WorkOrderRouteError> {
+    let (gate, partner_id) = {
+        let conn = Connection::open(&*state.db_path).map_err(|e| {
+            WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for part-UID gate: {e}"))
+        })?;
+        aberp_dispatch::ensure_schema(&conn)
+            .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
+        let Some(dispatch) = aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
+            .map_err(WorkOrderRouteError::Other)?
+        else {
+            return Ok(()); // missing dispatch → defer to the normal 404 path
+        };
+        let gate = resolve_part_uid_gate(&conn, state.tenant.as_str(), &dispatch)
+            .map_err(WorkOrderRouteError::Other)?;
+        (gate, dispatch.partner_id)
+    };
+
+    let PartUidGate::Blocked {
+        work_order_id,
+        qty_target,
+        marked_count,
+        customer_type,
+    } = gate
+    else {
+        return Ok(());
+    };
+
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let missing_count = qty_target.saturating_sub(marked_count);
+    let payload = serde_json::json!({
+        "work_order_id": work_order_id,
+        "dispatch_id": dsp_id,
+        "partner_id": partner_id,
+        "customer_type": customer_type,
+        "qty_target": qty_target,
+        "marked_count": marked_count,
+        "missing_count": missing_count,
+        "operator_user_id": operator_login,
+        "blocked_at": time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+    });
+    let mut ledger = aberp_audit_ledger::Ledger::open(
+        state.db_path.as_path(),
+        state.tenant.clone(),
+        binary_hash,
+    )
+    .map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("open ledger for part-uid-block audit: {e}"))
+    })?;
+    ledger
+        .append(
+            aberp_audit_ledger::EventKind::WoBlockedNoPartUid,
+            serde_json::to_vec(&payload).expect("serialize part-uid-blocked payload"),
+            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+            None,
+        )
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("append part-uid-block audit: {e}")))?;
+
+    // Name the first unmarked unit (1-based) so the operator knows where to look.
+    let first_missing = marked_count + 1;
+    Err(WorkOrderRouteError::Conflict(format!(
+        "Part {first_missing} requires UID before Shipment ({marked_count}/{qty_target} marked)"
     )))
 }
 
@@ -15529,6 +15706,13 @@ pub fn mark_dispatch_shipped_request(
     // wire boundary. Free text is refused loud.
     let carrier_kind = aberp_dispatch::CarrierKind::from_storage_str(body.carrier_kind.trim())
         .map_err(|e| WorkOrderRouteError::BadInput(format!("{e}: {:?}", body.carrier_kind)))?;
+
+    // S438 (ADR-0089) — part-UID shipment gate. A defense/aerospace dispatch
+    // (resolved via partner_id → customer_type) cannot ship until every unit of
+    // its WO bears a part UID. [[trust-code-not-operator]] — the refusal is
+    // here, not operator discipline. Non-defense dispatches are unaffected.
+    enforce_part_uid_gate_for_shipment(state, dsp_id, operator_login)?;
+
     let mut conn = Connection::open(&*state.db_path).map_err(|e| {
         WorkOrderRouteError::Other(anyhow!(
             "open tenant DuckDB at {}: {e}",
@@ -22176,6 +22360,316 @@ async fn handle_material_traceability(
         Ok(Err(e)) => internal_error("material_traceability", e),
         Err(join_err) => internal_error(
             "material_traceability:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ── S438 (ADR-0089) — part-UID marking + Part UID Lookup routes ──────
+
+/// POST body for `/api/work-orders/:id/mark-parts`. The operator supplies an
+/// optional serial per unit (blank → server auto-derives `<wo_id>-<index>`).
+/// The part UID + DataMatrix payload are minted server-side ([[hulye-biztos]] —
+/// the operator never types a UID).
+#[derive(Debug, serde::Deserialize)]
+struct MarkPartsBody {
+    #[serde(default)]
+    serials: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MarkPartsResponse {
+    pub part_marks: Vec<crate::part_marking::PartMark>,
+}
+
+async fn handle_mark_parts(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<MarkPartsBody>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        mark_parts_request(&state_for_task, &id, &operator_login, body)
+    })
+    .await;
+    match result {
+        Ok(Ok(resp)) => Json(resp).into_response(),
+        Ok(Err(e)) => wo_route_error_response(e),
+        Err(join_err) => internal_error(
+            "mark_parts_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+fn mark_parts_request(
+    state: &AppState,
+    wo_id: &str,
+    operator_login: &str,
+    body: MarkPartsBody,
+) -> std::result::Result<MarkPartsResponse, WorkOrderRouteError> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+
+    let (marks, marked_at, heat_lot) = {
+        let conn = Connection::open(&*state.db_path).map_err(|e| {
+            WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for mark-parts: {e}"))
+        })?;
+        crate::part_marking::ensure_schema(&conn).map_err(WorkOrderRouteError::Other)?;
+
+        let Some(wo) = aberp_work_orders::read_work_order(&conn, state.tenant.as_str(), wo_id)
+            .map_err(map_wo_err)?
+        else {
+            return Err(WorkOrderRouteError::NotFound);
+        };
+        // [[trust-code-not-operator]] — only a Completed WO can be marked, and
+        // only for a defense/aerospace customer (the shipment gate's scope).
+        if wo.state != aberp_work_orders::WorkOrderState::Completed {
+            return Err(WorkOrderRouteError::Conflict(
+                "work order must be Completed before marking parts".to_string(),
+            ));
+        }
+        use crate::partners::CustomerType;
+        if !matches!(
+            resolve_wo_customer_type(&conn, state.tenant.as_str(), &wo)
+                .map_err(WorkOrderRouteError::Other)?,
+            Some(CustomerType::Defense | CustomerType::Aerospace)
+        ) {
+            return Err(WorkOrderRouteError::Conflict(
+                "part marking applies to defense/aerospace work orders only".to_string(),
+            ));
+        }
+
+        let expected = crate::part_marking::qty_to_units(wo.qty_target);
+        if expected == 0 {
+            return Err(WorkOrderRouteError::BadInput(
+                "work order qty_target is zero — nothing to mark".to_string(),
+            ));
+        }
+        if body.serials.len() > expected as usize {
+            return Err(WorkOrderRouteError::BadInput(format!(
+                "supplied {} serials for {expected} units",
+                body.serials.len()
+            )));
+        }
+        if crate::part_marking::count_part_marks(&conn, state.tenant.as_str(), wo_id)
+            .map_err(WorkOrderRouteError::Other)?
+            > 0
+        {
+            return Err(WorkOrderRouteError::Conflict(
+                "work order is already marked".to_string(),
+            ));
+        }
+
+        // Heat lot consumed = the originating quote's grade balance (S432),
+        // snapshotted onto every mark for the DataMatrix material-chain tail.
+        let heat_lot = resolve_wo_heat_lot(&conn, state.tenant.as_str(), &wo)
+            .map_err(WorkOrderRouteError::Other)?;
+
+        let marked_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+
+        let mut marks = Vec::with_capacity(expected as usize);
+        for i in 1..=expected {
+            let typed = body
+                .serials
+                .get((i - 1) as usize)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            let serial = match typed {
+                Some(s) => {
+                    crate::part_marking::validate_serial(s).map_err(|e| {
+                        WorkOrderRouteError::BadInput(format!("unit {i} serial: {e}"))
+                    })?;
+                    s.to_string()
+                }
+                None => crate::part_marking::auto_serial(wo_id, i),
+            };
+            let part_uid = crate::part_marking::generate_part_uid();
+            let data_matrix_payload =
+                crate::part_marking::data_matrix_payload(&part_uid, &serial, heat_lot.as_deref());
+            marks.push(crate::part_marking::PartMark {
+                wo_id: wo_id.to_string(),
+                unit_index: i,
+                part_uid,
+                serial_number: serial,
+                data_matrix_payload,
+                heat_lot_reference: heat_lot.clone(),
+                marked_at_utc: marked_at.clone(),
+                marked_by_operator: operator_login.to_string(),
+            });
+        }
+
+        crate::part_marking::record_part_marks(&conn, state.tenant.as_str(), wo_id, &marks)
+            .map_err(map_part_mark_err)?;
+        (marks, marked_at, heat_lot)
+        // conn dropped here — Ledger opens its own writer next.
+    };
+
+    crate::part_marking::append_mark_events(
+        &state.db_path,
+        state.tenant.clone(),
+        binary_hash,
+        wo_id,
+        operator_login,
+        &marked_at,
+        heat_lot.as_deref(),
+        &marks,
+    )
+    .map_err(WorkOrderRouteError::Other)?;
+    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
+
+    Ok(MarkPartsResponse { part_marks: marks })
+}
+
+/// Resolve the heat lot consumed by a WO via its originating quote's grade
+/// (S432 chain). `None` for WOs with no quote/grade/heat-lot link.
+fn resolve_wo_heat_lot(
+    conn: &Connection,
+    tenant: &str,
+    wo: &aberp_work_orders::WorkOrder,
+) -> anyhow::Result<Option<String>> {
+    let Some(qid) = wo.source_quote_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(job) = crate::quote_pricing_jobs::get_job_detail(conn, qid, tenant)? else {
+        return Ok(None);
+    };
+    Ok(
+        crate::material_inventory::read_balance(conn, tenant, &job.row.material_grade)?
+            .and_then(|b| b.heat_lot_number)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    )
+}
+
+fn map_part_mark_err(e: crate::part_marking::PartMarkError) -> WorkOrderRouteError {
+    use crate::part_marking::PartMarkError as PE;
+    match e {
+        PE::AlreadyMarked { wo_id, n } => WorkOrderRouteError::Conflict(format!(
+            "work order {wo_id} is already marked ({n} units)"
+        )),
+        PE::Invalid { unit_index, reason } => {
+            WorkOrderRouteError::BadInput(format!("unit {unit_index}: {reason}"))
+        }
+        PE::Other(e) => WorkOrderRouteError::Other(e),
+    }
+}
+
+/// Query string for `GET /api/part-traceability` — exactly one of
+/// `part_uid` (forward) / `customer_id` (reverse).
+#[derive(Debug, serde::Deserialize)]
+struct PartTraceabilityQuery {
+    #[serde(default)]
+    part_uid: Option<String>,
+    #[serde(default)]
+    customer_id: Option<String>,
+}
+
+/// `GET /api/part-traceability?part_uid=|customer_id=` — Part UID Lookup +
+/// fire `part.traceability_viewed`.
+async fn handle_part_traceability(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(q): Query<PartTraceabilityQuery>,
+) -> Response {
+    let operator_login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    use crate::part_marking::PartTraceQueryKind;
+    let (kind, value) = match (
+        q.part_uid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        q.customer_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    ) {
+        (Some(p), _) => (PartTraceQueryKind::PartUid, p.to_string()),
+        (None, Some(c)) => (PartTraceQueryKind::Customer, c.to_string()),
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(error_body(
+                    "supply part_uid or customer_id query parameter".to_string(),
+                )),
+            )
+                .into_response()
+        }
+    };
+    let state_for_task = state.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<crate::part_marking::PartTraceReport> {
+            let binary_hash = state_for_task
+                .binary_hash
+                .wait()
+                .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+            let report = {
+                let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                    format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+                })?;
+                match kind {
+                    PartTraceQueryKind::PartUid => crate::part_marking::trace_part_uid(
+                        &conn,
+                        state_for_task.tenant.as_str(),
+                        &value,
+                    )?,
+                    PartTraceQueryKind::Customer => crate::part_marking::trace_customer(
+                        &conn,
+                        state_for_task.tenant.as_str(),
+                        &value,
+                    )?,
+                }
+            };
+            let payload = serde_json::json!({
+                "query_kind": kind.as_str(),
+                "query_value": value,
+                "part_uid": match kind {
+                    PartTraceQueryKind::PartUid => Some(value.clone()),
+                    PartTraceQueryKind::Customer => None,
+                },
+                "found": report.found,
+                "operator_user_id": operator_login,
+                "viewed_at": time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+            });
+            let mut ledger = aberp_audit_ledger::Ledger::open(
+                state_for_task.db_path.as_path(),
+                state_for_task.tenant.clone(),
+                binary_hash,
+            )?;
+            ledger.append(
+                aberp_audit_ledger::EventKind::PartTraceabilityViewed,
+                serde_json::to_vec(&payload).expect("serialize part-traceability-viewed payload"),
+                Actor::from_local_cli(Ulid::new().to_string(), &operator_login),
+                None,
+            )?;
+            Ok(report)
+        })
+        .await;
+    match result {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(e)) => internal_error("part_traceability", e),
+        Err(join_err) => internal_error(
+            "part_traceability:join",
             anyhow!("blocking task panicked: {join_err}"),
         ),
     }

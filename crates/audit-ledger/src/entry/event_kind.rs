@@ -2229,6 +2229,32 @@ pub enum EventKind {
     /// [`Self::PartSerialAssigned`].
     PartUidMarked,
 
+    /// S438 (ADR-0089) — a dispatch Shipment was REFUSED because the Work Order
+    /// it ships has unmarked units (fewer per-unit part UIDs recorded than the
+    /// WO's `qty_target`) AND the dispatch's customer is a defense/aerospace
+    /// partner ([`CustomerType::Defense`]/`Aerospace`). The
+    /// [[trust-code-not-operator]] gate at the dispatch `Shipped` transition:
+    /// every shipped unit must bear a marked, traceable IUID before a defense
+    /// part can leave. The non-defense path is unaffected (no block, no event).
+    ///
+    /// Payload (`serde_json::Value`): `work_order_id`, `dispatch_id`,
+    /// `partner_id`, `customer_type`, `qty_target`, `marked_count`,
+    /// `missing_count`, `operator_user_id`, `blocked_at`. `part.*` family —
+    /// app-layer JSON, never NAV XML bytes.
+    WoBlockedNoPartUid,
+
+    /// S438 (ADR-0089) — an operator queried the Part UID Lookup view for a
+    /// `part_uid` (forward trace → WO + heat lot + quote + customer) or a
+    /// `customer_id` (reverse trace → all part UIDs shipped to that partner).
+    /// Recorded so a compliance audit can prove WHO inspected a part's pedigree
+    /// and WHEN (DoD-IUID / AS9100D §8.5.2 record-of-access). A read event, not
+    /// a state transition.
+    ///
+    /// Payload (`serde_json::Value`): `query_kind` (`part_uid`/`customer`),
+    /// `query_value`, `resolved` (bool — whether the query matched),
+    /// `operator_user_id`, `viewed_at`. `part.*` family.
+    PartTraceabilityViewed,
+
     /// S359 / PR-46 (ADR-0076) — a drawing / spec / technical document was
     /// export-classified. FIRST member of the new `export.*` prefix family —
     /// the tenth — the export-control strand of the aerospace pivot
@@ -2889,6 +2915,8 @@ impl EventKind {
             EventKind::MaterialTraceabilityViewed => "material.traceability_viewed",
             EventKind::PartSerialAssigned => "part.serial_assigned",
             EventKind::PartUidMarked => "part.uid_marked",
+            EventKind::WoBlockedNoPartUid => "part.wo_blocked_no_uid",
+            EventKind::PartTraceabilityViewed => "part.traceability_viewed",
             EventKind::ExportClassificationSet => "export.classification_set",
             EventKind::ExportAccessCheck => "export.access_check",
             EventKind::ExportShipmentLogged => "export.shipment_logged",
@@ -3068,6 +3096,8 @@ impl EventKind {
             "material.traceability_viewed" => Ok(EventKind::MaterialTraceabilityViewed),
             "part.serial_assigned" => Ok(EventKind::PartSerialAssigned),
             "part.uid_marked" => Ok(EventKind::PartUidMarked),
+            "part.wo_blocked_no_uid" => Ok(EventKind::WoBlockedNoPartUid),
+            "part.traceability_viewed" => Ok(EventKind::PartTraceabilityViewed),
             "export.classification_set" => Ok(EventKind::ExportClassificationSet),
             "export.access_check" => Ok(EventKind::ExportAccessCheck),
             "export.shipment_logged" => Ok(EventKind::ExportShipmentLogged),
@@ -3235,6 +3265,8 @@ impl EventKind {
         EventKind::MaterialTraceabilityViewed,
         EventKind::PartSerialAssigned,
         EventKind::PartUidMarked,
+        EventKind::WoBlockedNoPartUid,
+        EventKind::PartTraceabilityViewed,
         EventKind::ExportClassificationSet,
         EventKind::ExportAccessCheck,
         EventKind::ExportShipmentLogged,
@@ -3408,6 +3440,8 @@ mod tests {
             EventKind::MaterialTraceabilityViewed,
             EventKind::PartSerialAssigned,
             EventKind::PartUidMarked,
+            EventKind::WoBlockedNoPartUid,
+            EventKind::PartTraceabilityViewed,
             EventKind::ExportClassificationSet,
             EventKind::ExportAccessCheck,
             EventKind::ExportShipmentLogged,
@@ -3489,7 +3523,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            148,
+            150,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -5973,6 +6007,35 @@ mod tests {
         // Distinct from the two S357 seed kinds.
         assert!(seen.insert(EventKind::MaterialCertAttached.as_str()));
         assert!(seen.insert(EventKind::MaterialHeatLotAssigned.as_str()));
+    }
+
+    /// S438 (ADR-0089) — the two part-UID-marking firing-site kinds round-trip,
+    /// carry the `part.*` prefix, and are distinct from each other + the two
+    /// S358 seed kinds (`part.serial_assigned` / `part.uid_marked`).
+    #[test]
+    fn s438_part_uid_marking_kinds_round_trip_and_use_part_prefix() {
+        let new = [
+            (EventKind::WoBlockedNoPartUid, "part.wo_blocked_no_uid"),
+            (
+                EventKind::PartTraceabilityViewed,
+                "part.traceability_viewed",
+            ),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (k, expected) in new {
+            let s = k.as_str();
+            assert_eq!(s, expected, "as_str mismatch for {k:?}");
+            assert!(s.starts_with("part."), "{s} must start with part.");
+            assert_eq!(
+                EventKind::from_storage_str(s).expect("round-trip"),
+                k,
+                "round-trip mismatch for {s}"
+            );
+            assert!(seen.insert(s), "duplicate storage string {s}");
+        }
+        // Distinct from the two S358 seed kinds this session FIRES.
+        assert!(seen.insert(EventKind::PartSerialAssigned.as_str()));
+        assert!(seen.insert(EventKind::PartUidMarked.as_str()));
     }
 
     // ── S358 / PR-45 (ADR-0075) — part.* per-unit serialization family ──────
