@@ -124,6 +124,34 @@ Things not decided here that this ADR depends on, with the ADR number that will 
 - [ADR-0068 — Vendor-PO spend authorization](0068-vendor-po-spend-authorization.md) — *S265 / PR-254 (2026-06-06). **Proposed.** Gates autonomous procurement in the DEAL saga. Two ceilings in `quoting_parameters`: `max_auto_po_eur` (per-PO) AND `auto_po_daily_cap_eur` (rolling-24h cumulative, computed from `po.vendor_po_fired` audit entries — no side counter to drift). Under BOTH → autonomous fire (`vendor_pos` row + supplier email over the SMTP SPOC, ADR-0047 + [[aberp-smtp-spoc]]) → `po.vendor_po_fired`. Over either → `po.auto_threshold_exceeded` + the ADR-0067 pause-seam (single-token operator gate). **No purchasing/supplier module** (ADR-0061 defers it) — v1's `vendor_pos` is a lightweight intent record (`fired`/`cancelled`, supplier operator-typed), receiving is a manual `Receipt` movement; full procurement deferred. Two new EventKinds `po.*`. **Implementation is post-S275** — ADR is the standing spec the saga's PO seam slots into. Open questions: PO→receipt auto-link, supplier master, per-role spend authority, PO currency/FX.*
 - [ADR-0069 — Material reservation states](0069-material-reservation-states.md) — *S265 / PR-254 (2026-06-06). **Proposed. Files ADR-0061 Open Question #2** (the reservation model ADR-0061 deferred until "the first work-order-queue feature that needs allocated-not-consumed" — the DEAL saga is that feature). A **second append-only ledger `stock_reservations`**, parallel to `stock_movements` — because a reservation is NOT a stock movement (reserved material is still physically on-shelf; `stock_qty` unchanged). New derived quantity **available-to-promise ATP = `stock_qty` − SUM(open reservations)**, re-summed at write time (concurrency-safe like ADR-0061's `stock_qty`); the DEAL saga checks ATP, not raw stock. **Four-state lifecycle** `on_hand → reserved → committed → consumed` (+ `{reserved,committed} → cancelled`); `committed` collapses into `consumed` in v1's single-operator shop but is modeled so a future pick flow has a home. **ADR-0062 WO-Release becomes reservation-aware**: a DEAL-originated WO consumes its reservation, a manual WO consumes blind (additive fallback). Two new EventKinds under the inventory `mes.*` family (`mes.stock_reserved` / `mes.stock_reservation_consumed`). **Implementation is S274.** Open questions: stale-reservation cleanup tooling, reservation TTL, `StockReservationCancelled` kind, ATP cache, multi-bin reservations.*
 
+<!-- Catch-up index entries for ADR-0070 .. ADR-0092 (the defense-pivot and
+edition-split work). Titles are authoritative; see each ADR file for the full
+record. Backfilled 2026-06-17. -->
+
+- [ADR-0070 — Digital-ID provider](0070-digital-id-provider.md) — pluggable operator-identity signer scaffold (the `aberp-digital-id` crate); first defense-pivot identity ADR.
+- [ADR-0071 — Compliance crate scaffold](0071-compliance-crate-scaffold.md) — `aberp-compliance` crate housing the lot/heat, export-control, and CUI newtypes the later defense ADRs build on.
+- [ADR-0072 — Operator accept-on-behalf](0072-operator-accept-on-behalf.md) — recorded delegation: who accepted an action on whose behalf.
+- [ADR-0073 — Personnel audit events](0073-personnel-audit-events.md) — `personnel.*` audit-event family.
+- [ADR-0074 — Material-traceability events](0074-material-traceability-events.md) — `material.*` audit family (`cert_attached` / `heat_lot_assigned`); first use of the compliance lot/heat newtypes (S357).
+- [ADR-0075 — Part-UID events](0075-part-uid-events.md) — `part.*` audit family + MIL-STD-130N IUID model (S358).
+- [ADR-0076 — Export-control events](0076-export-control-events.md) — `export.*` audit family (ITAR / EAR screening trail).
+- [ADR-0077 — CUI events](0077-cui-events.md) — controlled-unclassified-information handling audit family.
+- [ADR-0078 — AVL supplier events](0078-avl-supplier-events.md) — `supplier.*` audit family for the approved-vendor-list workflow.
+- [ADR-0079 — Incident events](0079-incident-events.md) — incident-reporting audit family.
+- [ADR-0080 — Second digital-ID provider](0080-second-digital-id-provider.md) — second pluggable identity provider behind the ADR-0070 signer trait.
+- [ADR-0081 — `aberp-verify` coverage hardening](0081-aberp-verify-coverage-hardening.md) — widens what the standalone evidence-bundle verifier re-checks (S364).
+- [ADR-0082 — DB snapshot system](0082-db-snapshot-system.md) — periodic validated logical DuckDB snapshots (EXPORT DATABASE), `aberp snapshot {now,list,restore}`; replaces the S393 file-copy CLI (S426).
+- [ADR-0083 — CAD encryption at rest](0083-cad-encryption-at-rest.md) — AES-256-GCM encrypt-at-rest for CAD blobs + `cad.*` read-audit trail, decrypt-to-temp for the extractor (S430).
+- [ADR-0084 — AVL firing sites](0084-avl-firing-sites.md) — `avl_vendors` table + CRUD + PO-eligibility gate + boot overdue scan; `supplier.*` firing sites (S431).
+- [ADR-0085 — Heat-lot traceability](0085-heat-lot-traceability.md) — heat-lot assign UI + defense WO-start gate (no heat lot → block) + chain-of-custody view (S432).
+- [ADR-0086 — DÁP eAzonosítás identity flow](0086-dap-eazonositas-identity-flow.md) — Hungarian government digital-ID operator-identity flow; trait + mock impl, real provider pending (S441).
+- [ADR-0087 — Timestamp-anchored audit chain](0087-timestamp-anchored-audit-chain.md) — NETLOCK qualified-timestamp anchoring of ledger entries; trait + mock, real TSA pending (S441).
+- [ADR-0088 — Unattended-write service identity](0088-unattended-write-service-identity.md) — ed25519 session key signing for unattended/daemon writes to the ledger (S441).
+- [ADR-0089 — Part-UID marking](0089-part-uid-marking.md) — per-unit `dp-<ULID>` mint + DataMatrix payload + shipment gate (defense/aero unmarked → block) + fwd/rev trace (S438).
+- [ADR-0090 — NCR / CAPA quality workflow](0090-ncr-capa-quality-workflow.md) — non-conformance + corrective-action state machines, open-NCR shipment gate, 24h Critical escalation (S439).
+- [ADR-0091 — Purchasing / purchase-order module](0091-purchasing-purchase-order-module.md) — AVL-gated POs (create + issue), receiving-failure → auto-NCR, heat-lot capture on defense lines; supersedes ADR-0068's deferred purchasing scope (S440).
+- [ADR-0092 — On-machine probe ingestion → QC](0092-on-machine-probe-ingestion-to-qc.md) — DMG MORI (MTConnect) / Renishaw probe → QC inspections → auto-NCR; manual entry ships, probe sources stubbed (S442 / S443).
+
 ### Deferred (not yet filed — tracked so they don't fall through)
 
 The remaining items below are **deferred to build phase per ADR-0021 §Items deferred to build phase**. Each is filed as a just-in-time ADR when the named trigger fires; soft assertion in advance is forbidden (CLAUDE.md rule 12).

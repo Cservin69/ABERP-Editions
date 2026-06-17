@@ -27,13 +27,14 @@ hash-chained ledger you can inspect and verify.
 
 ## Two editions
 
-| | **Portable** | **Full (HU production)** |
+| | **Portable** | **Defense (HU production)** |
 |---|---|---|
-| For | Anyone, anywhere — evaluating, or running outside Hungary | Hungarian manufacturing shops, especially defense / aerospace |
+| Latest | `PROD_Portable_v0.1.2` (2026-06-16) | `PROD_Defense_v0.2.1` (2026-06-16) |
+| For | Anyone, anywhere — evaluating, or running outside Hungary | Hungarian manufacturing shops with NAV obligations + defense / aerospace compliance needs |
 | Tax filing | **Off by default** — invoices stay local (LocalOnly) | Live NAV Online Számla 3.0 e-invoicing |
-| First boot | Demo company pre-seeded — data to explore immediately | Your own seller profile + NAV credentials |
+| First boot | Demo company pre-seeded — data to explore immediately | Your own seller profile + real NAV credentials |
 | Build | Dev profile — structurally cannot reach the live NAV endpoint | `--features production` — the real-money build |
-| Install | `./run/upgrade_portable.sh` | `./run/upgrade_prod.sh` (see [runbook](docs/CUTOVER_RUNBOOK.md)) |
+| Install | `./run/upgrade_portable.sh` | `./run/upgrade_defense.sh` |
 
 **Portable** is the path most newcomers want. It is the same application —
 quoting, manufacturing, the audit ledger, all of it — with the Hungarian
@@ -41,10 +42,20 @@ NAV submission turned off per tenant. You can enter tax numbers for your
 own country (they are stored as opaque strings for now; country-specific
 tax modules are on the [roadmap](#roadmap)).
 
-**Full (HU production)** adds live NAV Online Számla 3.0 invoicing plus the
-defense/aerospace capabilities: approved-vendor screening, lot/heat
-material traceability, and the production build that talks to the real NAV
-endpoint. It is what Hungarian shops run for real money.
+**Defense (HU production)** adds live NAV Online Számla 3.0 invoicing plus
+the defense/aerospace compliance stack: approved-vendor screening,
+purchase orders gated on that AVL, lot/heat material traceability, per-unit
+part UID marking, an NCR/CAPA quality workflow with shipment gates, QC
+inspection plans, and the production build that talks to the real NAV
+endpoint. It is what Hungarian shops with real NAV submission obligations
+run for real money.
+
+> **The legacy unified `PROD_v2.27.76` line is frozen.** Up to that tag,
+> Portable and Defense shipped as one build. New work now lands on the two
+> dedicated lines above — Portable for everyone, Defense for HU production
+> — so each edition gets a launcher and an upgrade path scoped to it.
+> Existing `PROD_v2.27.76` installs keep working; there is just no
+> `PROD_v2.27.77`.
 
 ---
 
@@ -99,34 +110,101 @@ your runtime data lives under `~/.aberp/<tenant>/`.
 
 ---
 
+## Quick start — Defense (HU production)
+
+**For Hungarian operators with real NAV credentials and live NAV
+submission obligations.** This builds with `--features production`, talks
+to the real NAV Online Számla endpoint, and files invoices for real. Don't
+run it unless that's what you want — Portable above is the safe sandbox.
+
+```bash
+git clone https://github.com/Cservin69/ABERP.git ABERP-Defense
+cd ABERP-Defense
+git fetch origin --tags
+./run/upgrade_defense.sh PROD_Defense_v0.2.1
+```
+
+`upgrade_defense.sh` mirrors the Portable upgrade — confirm the release,
+snapshot existing tenant data, reset cleanly, provision the CAD Python
+environment, build, launch — but it is the real-money path: it **requires**
+a tenant and seller profile, forces a mandatory snapshot (no skip), and
+launches into the production build with the **"DEFENSE MODE: AVL + heat/lot
++ DÁP-ready"** banner. Set up your NAV + SMTP credentials first (see
+[recipe 7](#7-set-up-nav-creds--smtp-on-a-fresh-box-új-gépen-alapbeállítás)
+and the [runbook](docs/CUTOVER_RUNBOOK.md)).
+
+---
+
 ## What it does
 
-Organized the way an operator actually works:
+Organized the way an operator actually works. Tags mark where a feature
+lives: **[both]** ships in Portable and Defense, **[Defense]** is part of
+the HU-production compliance stack.
 
-- **Quoting (CAD-aware).** Drop in an STL or STEP file → it extracts the
-  geometry → estimates machining time → applies the margin profile for that
-  customer type → shows a lead-time chip (green / yellow / red) → renders a
-  customer-ready PDF. Quotes that would price below the margin floor are
-  refused outright, not silently shipped.
-- **Invoicing.** Hungarian shops file directly to **NAV Online Számla 3.0**
-  (issue, credit-note/storno, modification, with XSD validation and status
-  polling). Everyone else runs **LocalOnly** — full invoices, no tax-office
-  submission.
-- **Master data.** Partners, products, and machines, each with audited
-  edits and an archive-don't-delete policy.
-- **Approved Vendor List.** Vendor CRUD with screening and approval
-  categories (ITAR, EAR99, Aerospace, Defense, Nuclear), plus a
+**Quote → price → win the job**
+
+- **Quoting (CAD-aware)** *[both]*. Drop in an STL or STEP file → it
+  extracts the geometry → estimates machining time → applies the margin
+  profile for that customer type → shows a lead-time chip (green / yellow /
+  red) → renders a customer-ready PDF. Quotes that would price below the
+  margin floor are refused outright, not silently shipped.
+
+**Procure → make → inspect → ship**
+
+- **Approved Vendor List** *[Defense]*. Vendor CRUD with screening and
+  approval categories (ITAR, EAR99, Aerospace, Defense, Nuclear), plus a
   purchase-order eligibility gate so unscreened vendors can't slip through.
-- **Material traceability.** Record heat-lot numbers and MTR (mill test
-  report) URLs against inventory; for defense quotes the system refuses to
-  start a work order until the heat lot is assigned — a chain-of-custody
-  view shows the trail.
-- **Audit ledger.** Every state change lands in a hash-chained, append-only
-  ledger with an operator-visible screen (filter, sort, per-row hash check,
-  whole-chain verdict). Sensitive payloads are redacted by default. A
-  snapshot system and AES-256-GCM-encrypted CAD storage back it up.
-- **Multi-tenant.** Run several companies from one install, switch between
-  them, toggle NAV per tenant. A bundled demo tenant seeds fresh installs.
+- **Purchasing / purchase orders** *[Defense]*. Raise POs against the AVL
+  (suspended or revoked vendors are blocked at create and issue); receiving
+  a failed inspection auto-raises an NCR; defense lines require a heat lot
+  captured at receipt.
+- **Material traceability** *[Defense]*. Record heat-lot numbers and MTR
+  (mill test report) URLs against inventory; for defense quotes the system
+  refuses to start a work order until the heat lot is assigned — a
+  chain-of-custody view shows the trail.
+- **QC inspection plans** *[Defense]*. Record manual inspection results
+  against a plan; the verdict math is calibration-stale-aware and grades by
+  tolerance tier (1× / 2× the limit), auto-raising an NCR on the failing
+  tier. The calibration-staleness window is per-tenant configurable.
+- **Per-unit Part UID marking** *[Defense]*. Mint a per-unit UID and a
+  DataMatrix payload for each part; the system **refuses to mark a defense
+  shipment until every unit carries its UID**, with forward/reverse trace.
+- **NCR / CAPA quality workflow** *[Defense]*. Non-conformance reports and
+  corrective actions with a closed state machine; an open NCR **blocks the
+  shipment**, and a Critical NCR escalates if not actioned within 24 hours.
+
+**File the invoice**
+
+- **Invoicing** *[both]*. Hungarian shops file directly to **NAV Online
+  Számla 3.0** (issue, credit-note/storno, modification, with XSD
+  validation and status polling). Everyone else runs **LocalOnly** — full
+  invoices, no tax-office submission.
+
+**Run the shop**
+
+- **Master data** *[both]*. Partners, products, and machines, each with
+  audited edits and an archive-don't-delete policy.
+- **Multi-tenant + demo + NAV-off toggle** *[both]*. Run several companies
+  from one install, switch between them, and flip NAV on or off per tenant.
+  A bundled demo tenant seeds fresh installs so the first launch already
+  has data to click through — this is what makes Portable boot straight
+  into a populated dashboard.
+
+**Prove what happened**
+
+- **Audit ledger + audit screen** *[both]*. Every state change lands in a
+  hash-chained, append-only ledger with an operator-visible screen (filter,
+  sort, per-row hash check, whole-chain verdict). Sensitive payloads are
+  redacted by default.
+- **Snapshot system** *[both]*. Periodic, *validated* DuckDB snapshots
+  (logical exports, smoke-tested on the way out) plus AES-256-GCM-encrypted
+  CAD storage back the ledger up — a real rollback path, not a hopeful file
+  copy.
+- **Audit-chain DÁP / QES signing — coming soon** *[Defense]*. The
+  scaffolding to anchor each ledger entry to a Hungarian government digital
+  identity (DÁP eAzonosítás) and a NETLOCK qualified timestamp has landed
+  on `main`, but is **not yet shippable**: the real DÁP and NETLOCK
+  integrations are still pending (see [roadmap](#roadmap)).
 
 ---
 
@@ -154,14 +232,18 @@ A few things under the hood that engineers tend to enjoy:
 
 ## Status
 
-- **Current Portable stable: `PROD_Portable_v0.1.2`** — the edition the
-  Quick Start above installs. Dev-profile build, NAV off, demo tenant
-  seeded. `./run/upgrade_portable.sh PROD_Portable_v0.1.2`.
-- **Current HU production stable: `PROD_v2.27.76`** — the full build with
-  live NAV and the defense/aerospace capabilities, in production with real
-  money and live filings flowing through it.
-  `./run/upgrade_prod.sh PROD_v2.27.76` (see the
-  [runbook](docs/CUTOVER_RUNBOOK.md)).
+- **Current Portable stable: `PROD_Portable_v0.1.2`** (cut 2026-06-16) —
+  the edition the Quick Start above installs. Dev-profile build, NAV off,
+  demo tenant seeded. `./run/upgrade_portable.sh PROD_Portable_v0.1.2`.
+- **Current Defense stable: `PROD_Defense_v0.2.1`** (cut 2026-06-16) — the
+  HU-production build with live NAV plus the defense/aerospace compliance
+  stack (AVL, purchasing, heat/lot, part UID, NCR/CAPA, QC inspection).
+  `./run/upgrade_defense.sh PROD_Defense_v0.2.1`.
+- **Legacy unified `PROD_v2.27.76` — frozen.** The last release before the
+  Portable / Defense split. Still installable via
+  `./run/upgrade_prod.sh PROD_v2.27.76` for existing operators (see the
+  [runbook](docs/CUTOVER_RUNBOOK.md)), but no longer the path forward — new
+  releases ship on the two lines above.
 
 The test NAV path is the default for any build that does not pass
 `--features production`; the production NAV endpoint is structurally
@@ -170,7 +252,7 @@ safe to hand to anyone.
 
 ---
 
-## Full (HU production) install
+## Defense (HU production) install
 
 The complete procedure — first-time prod branch, `seller.toml` template,
 NAV + SMTP credentials, smoke-invoice checklist, rollback, and the ongoing
@@ -181,17 +263,17 @@ update workflow — lives in:
 Short version, on the prod machine:
 
 ```bash
-git clone --branch PROD_v2.27.76 https://github.com/Cservin69/ABERP.git ABERP-prod
-cd ABERP-prod
-./run/run_prod.sh   # builds with --features production, launches the shell
+git clone --branch PROD_Defense_v0.2.1 https://github.com/Cservin69/ABERP.git ABERP-Defense
+cd ABERP-Defense
+./run/run_defense.sh   # builds with --features production, launches the shell
 ```
 
-To upgrade an existing prod install, snapshot first (DuckDB storage
+To upgrade an existing Defense install, snapshot first (DuckDB storage
 upgrades are one-way), then:
 
 ```bash
-git fetch origin && git reset --hard origin/PROD_v2.27.76 && \
-  ./run/upgrade_prod.sh PROD_v2.27.76
+git fetch origin && git reset --hard origin/PROD_Defense_v0.2.1 && \
+  ./run/upgrade_defense.sh PROD_Defense_v0.2.1
 ```
 
 The versioning rules (when to bump patch vs minor vs major) are pinned in
@@ -203,15 +285,17 @@ The versioning rules (when to bump patch vs minor vs major) are pinned in
 
 Honest about what isn't built yet:
 
-- **Defense DÁP integration (HU)** — operator identity backed by the
-  Hungarian government digital ID (DÁP) and qualified electronic
-  signatures. The `aberp-digital-id` crate scaffolds a pluggable signer; a
-  real provider is not yet wired.
-- **Part UID / serial producers** — per-part serial-number generation for
-  full unit-level traceability.
-- **Full procurement** — vendor purchase orders and receiving. Accounts
-  payable today mirrors supplier invoices and marks them; PO-matching and
-  payment workflows are not built.
+- **Real DÁP / QES audit-chain signing (HU)** — the structural floor has
+  landed: traits for the DÁP transport and a timestamp authority, an
+  ed25519 session key, three signature columns on the ledger, and a
+  per-tenant `dap_enabled` toggle (default off). What is still mocked: the
+  real **DÁP eAzonosítás** operator-identity flow and the **NETLOCK
+  qualified-timestamp** integration. Until those are wired, the chain
+  signs with mocks and is not shippable as a compliance feature.
+- **On-machine probe ingestion (real machine)** — the QC inspection
+  workflow ships today with manual result entry; the **DMG MORI** (MTConnect)
+  and **Renishaw** probe sources that would feed inspection values
+  automatically are designed and stubbed, not yet talking to real hardware.
 - **International tax modules** — Portable currently stores foreign tax
   numbers as opaque strings. Country-specific tax/e-invoicing modules are
   future work.
@@ -259,7 +343,8 @@ ABERP/
     aberp/             ← the Rust backend (HTTPS+JSON localhost service)
     aberp-ui/          ← Tauri 2 shell + Svelte 5 SPA (ADR-0004)
   run/                 ← launcher scripts (run_portable / upgrade_portable /
-                         run_prod / upgrade_prod / release)
+                         run_defense / upgrade_defense / run_prod /
+                         upgrade_prod / release)
   tools/               ← operational scripts (snapshot, icons)
 ```
 
@@ -291,9 +376,14 @@ Built in Hungary by Ervin Aben. Issues and pull requests:
 
 ## Operator runbook — hülye-biztos cookbook
 
-Field-tested commands. Copy whichever recipe you need. For the Portable
-edition, swap `upgrade_prod.sh` → `upgrade_portable.sh`, `run_prod.sh` →
-`run_portable.sh`, and `<VERSION>` → a `PROD_Portable_v*` tag.
+Field-tested commands, written against the legacy `run_prod.sh` /
+`upgrade_prod.sh` launcher names with a `<VERSION>` placeholder. Swap for
+your edition:
+
+- **Portable** — `*_portable.sh` and a `PROD_Portable_v*` tag
+  (`PROD_Portable_v0.1.2` is current).
+- **Defense** — `*_defense.sh` and a `PROD_Defense_v*` tag
+  (`PROD_Defense_v0.2.1` is current).
 
 ### 1. Upgrade to a new release (Frissítés új verzióra)
 
@@ -343,8 +433,8 @@ Sanity-check before any `git reset --hard origin/<VERSION>`.
 
 ```bash
 git ls-remote https://github.com/Cservin69/ABERP.git \
-  refs/heads/main refs/heads/PROD_v2.27.76 \
-  refs/tags/PROD_v2.27.76
+  refs/heads/main refs/heads/PROD_Defense_v0.2.1 \
+  refs/tags/PROD_Defense_v0.2.1
 ```
 
 ### 6. DuckDB snapshot / restore — the panic button (DuckDB pillanatkép)
@@ -374,7 +464,7 @@ working DB with a broken one.
 
 ### 7. Set up NAV creds + SMTP on a fresh box (Új gépen alapbeállítás)
 
-For the **Full (HU production)** edition, after cloning and before the
+For the **Defense (HU production)** edition, after cloning and before the
 first prod launch. (Portable needs none of this — NAV is off.)
 
 ```bash
