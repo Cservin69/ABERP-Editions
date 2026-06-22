@@ -127,3 +127,6 @@ CLAUDE.md
 # this dir (configurable via ABERP_QUOTE_PIPELINE_ARTIFACT_DIR).
 # Per-tenant local cache, never part of the repo's history.
 quote-artifacts/
+
+# Local-only working doc — keep out of the repo (per owner decision)
+docs/EIC_DUALUSE_BRIEFING_HANDOFF.md
