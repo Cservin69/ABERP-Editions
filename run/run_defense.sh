@@ -11,11 +11,13 @@
 #     + lot/heat traceability + DÁP-ready). The real-money / real-NAV
 #     warning is identical in weight to run_prod.sh — this is not a softer
 #     mode, it is prod-money-real with defense compliance bolted on.
-#   - Default tenant is `prod` but is OVERRIDABLE via ABERP_TENANT=<name>
-#     (run_prod.sh hard-forces prod). A defense operator may run a
-#     dedicated prod-class tenant; the boot-time guard_tenant_matches_build
-#     is still the authority — a `--features production` binary refuses a
-#     non-prod tenant regardless of what this launcher sets.
+#   - Default tenant is `defense` (OVERRIDABLE via ABERP_TENANT=<name>),
+#     and the DB root is the edition-locked ~/.aberp-defense/<tenant>/ —
+#     provably disjoint from prod's frozen ~/.aberp/ root (ADR-0093 §5). The
+#     boot-time guard_tenant_matches_build is the authority: BOTH editions
+#     refuse the frozen prod line's reserved `prod` tenant, and the data
+#     root is compile-time edition-locked, so this build physically cannot
+#     open prod's database whatever this launcher sets.
 #   - The Frankenstein-build refusal accepts an origin/PROD_Defense_v* tip
 #     OR an origin/PROD_v* tip: during the transition a Defense build can
 #     still deploy a classic prod release tag.
@@ -48,12 +50,13 @@ fi
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ---------- tenant resolution: prod by default, env-overridable ------------
-# Defaults to tenant=prod (matches run_prod.sh) but lets a defense operator
-# point at a dedicated prod-class tenant via ABERP_TENANT. The binary is a
-# `--features production` build, so guard_tenant_matches_build refuses any
-# non-prod tenant at boot — this default is convenience, not the gate.
-readonly DEFENSE_TENANT="${ABERP_TENANT:-prod}"
-readonly DEFENSE_HOME="${HOME}/.aberp/${DEFENSE_TENANT}"
+# Defaults to tenant=defense but lets a defense operator point at another
+# tenant via ABERP_TENANT. The DB root is the edition-locked
+# ~/.aberp-defense/<tenant>/ (ADR-0093). The binary refuses the reserved
+# `prod` tenant at boot (guard_tenant_matches_build) and is compile-time
+# bound to ~/.aberp-defense/ — it cannot open prod's frozen database.
+readonly DEFENSE_TENANT="${ABERP_TENANT:-defense}"
+readonly DEFENSE_HOME="${HOME}/.aberp-defense/${DEFENSE_TENANT}"
 readonly DEFENSE_SELLER_TOML="${DEFENSE_HOME}/seller.toml"
 readonly DEFENSE_FIRST_LAUNCH_TOUCHFILE="${DEFENSE_HOME}/.first-launch-acknowledged"
 readonly DEFENSE_DB="${DEFENSE_HOME}/aberp.duckdb"

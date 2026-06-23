@@ -105,7 +105,7 @@ print_help() {
 
 # ---------- arg parsing -----------------------------------------------------
 version=""
-tenant="prod"
+tenant="defense"
 positional=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -147,7 +147,7 @@ readonly SCRIPT_PATH="$script_path"
 readonly REPO_ROOT="$(cd "$SCRIPT_PATH/.." && pwd -P)"
 
 readonly TENANT="$tenant"
-readonly TENANT_DIR="${HOME}/.aberp/${TENANT}"
+readonly TENANT_DIR="${HOME}/.aberp-defense/${TENANT}"
 readonly TENANT_SELLER_TOML="${TENANT_DIR}/seller.toml"
 
 echo

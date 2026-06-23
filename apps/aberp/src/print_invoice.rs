@@ -1126,7 +1126,7 @@ fn resolve_seller_toml_path(explicit_override: Option<&Path>, tenant: &str) -> R
     let home = std::env::var("HOME")
         .map_err(|_| anyhow!("HOME environment variable not set; pass --seller-toml <PATH>"))?;
     Ok(PathBuf::from(home)
-        .join(".aberp")
+        .join(crate::build_profile::edition_data_dirname())
         .join(tenant)
         .join("seller.toml"))
 }

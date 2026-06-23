@@ -382,7 +382,7 @@ pub fn seller_toml_path_for_tenant(tenant: &str) -> Result<PathBuf> {
         anyhow!("HOME environment variable not set; cannot resolve seller.toml path")
     })?;
     Ok(PathBuf::from(home)
-        .join(".aberp")
+        .join(crate::build_profile::edition_data_dirname())
         .join(tenant)
         .join("seller.toml"))
 }

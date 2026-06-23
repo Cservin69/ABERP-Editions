@@ -650,13 +650,63 @@ fn unquote(s: &str) -> Result<String> {
 
 // ── Path resolution ──────────────────────────────────────────────────
 
-/// `~/.aberp`. Errors if `$HOME` is unset — mirrors the `HOME` discipline
-/// in `setup_seller_info::seller_toml_path_for_tenant` (the workspace has
-/// no `dirs` dependency).
+/// Resolve the user home (`$HOME`, then `%USERPROFILE%`). The workspace
+/// takes no `dirs` dependency (CLAUDE.md rule 11); this mirrors
+/// `serve::dirs_home_or_loud_fail`'s posture so every per-tenant resolver
+/// shares one home discipline.
+fn home_dir() -> Result<PathBuf> {
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() {
+            return Ok(PathBuf::from(h));
+        }
+    }
+    if let Ok(h) = std::env::var("USERPROFILE") {
+        if !h.is_empty() {
+            return Ok(PathBuf::from(h));
+        }
+    }
+    Err(anyhow!(
+        "neither HOME nor USERPROFILE is set; cannot resolve the edition data root (~/{})",
+        crate::build_profile::edition_data_dirname()
+    ))
+}
+
+/// `~/.aberp-<edition>` — the edition-locked data root (ADR-0093 §5).
+/// `Portable` → `~/.aberp-portable`, `Defense` → `~/.aberp-defense`; NEVER
+/// the frozen prod line's `~/.aberp`. The edition segment is a COMPILE-TIME
+/// constant ([`crate::build_profile::edition_data_dirname`]), so no env var
+/// or launcher string can repoint a build at another edition's — or prod's —
+/// root (FOUNDATION §5: path derived, not user-supplied). Errors if neither
+/// `$HOME` nor `%USERPROFILE%` is set.
 pub fn aberp_root() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .map_err(|_| anyhow!("HOME environment variable not set; cannot resolve ~/.aberp"))?;
-    Ok(PathBuf::from(home).join(".aberp"))
+    Ok(home_dir()?.join(crate::build_profile::edition_data_dirname()))
+}
+
+/// ADR-0093 — refuse any DB / data path that resolves into a FOREIGN
+/// edition's root: the frozen prod line's `~/.aberp/`, or the sibling
+/// edition's `~/.aberp-<other>/`. The own edition's root and ordinary dev
+/// paths (`./aberp.duckdb`, a temp dir) are allowed. This is the runtime
+/// backstop behind the compile-time root binding: even a hand-set `--db` /
+/// `ABERP_DB` pointing at prod's database is refused, so the build
+/// physically cannot open another edition's DB (ADR-0093 — "physically
+/// refuses ... even via env/misconfig").
+pub fn ensure_db_path_isolated(path: &Path) -> Result<()> {
+    for comp in path.components() {
+        if let std::path::Component::Normal(name) = comp {
+            for foreign in crate::build_profile::foreign_data_dirnames() {
+                if name == std::ffi::OsStr::new(foreign) {
+                    return Err(anyhow!(
+                        "ADR-0093 edition isolation: the {} edition refuses path {} — it resolves                          into the foreign data root '{}'. Each edition opens only its own ~/{}                          root, never prod's ~/.aberp/ or the sibling edition's.",
+                        crate::build_profile::edition_label(),
+                        path.display(),
+                        foreign,
+                        crate::build_profile::edition_data_dirname(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn registry_path() -> Result<PathBuf> {
@@ -671,7 +721,12 @@ pub fn next_tenant_hint_path() -> Result<PathBuf> {
 /// here; this is also what `run_prod.sh` sets `ABERP_DB` to, so deriving
 /// the path from the slug on switch matches the existing layout exactly.
 pub fn tenant_db_path(slug: &str) -> Result<PathBuf> {
-    Ok(aberp_root()?.join(slug).join(TENANT_DB_FILENAME))
+    let db = aberp_root()?.join(slug).join(TENANT_DB_FILENAME);
+    // Derived from the compile-time edition root, so this can never be a
+    // foreign root — assert it anyway so the invariant is enforced at the
+    // chokepoint rather than merely trusted (ADR-0093).
+    ensure_db_path_isolated(&db)?;
+    Ok(db)
 }
 
 /// S433 — a fresh install is one with NO `tenants.toml` AND no existing

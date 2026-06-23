@@ -61,7 +61,10 @@ pub fn runtime_file_path(tenant: &str) -> Result<PathBuf> {
             "neither HOME nor USERPROFILE is set — cannot locate ~/.aberp/<tenant>/runtime.json"
         ));
     };
-    Ok(home.join(".aberp").join(tenant).join("runtime.json"))
+    Ok(home
+        .join(crate::build_profile::edition_data_dirname())
+        .join(tenant)
+        .join("runtime.json"))
 }
 
 /// Inputs for [`write`]. Owned strings keep the call site free of
@@ -226,7 +229,12 @@ mod tests {
     fn runtime_path_under_home_dot_aberp_tenant() {
         with_temp_home(|home, tenant| {
             let p = runtime_file_path(tenant).unwrap();
-            assert_eq!(p, home.join(".aberp").join(tenant).join("runtime.json"));
+            assert_eq!(
+                p,
+                home.join(crate::build_profile::edition_data_dirname())
+                    .join(tenant)
+                    .join("runtime.json")
+            );
         });
     }
 
@@ -235,7 +243,12 @@ mod tests {
         with_temp_home(|home, tenant| {
             let path = write(&sample(tenant)).expect("write ok");
             assert!(path.exists());
-            assert_eq!(path, home.join(".aberp").join(tenant).join("runtime.json"));
+            assert_eq!(
+                path,
+                home.join(crate::build_profile::edition_data_dirname())
+                    .join(tenant)
+                    .join("runtime.json")
+            );
             let tmp = path.with_extension("json.tmp");
             assert!(!tmp.exists(), "tmp sibling lingered: {tmp:?}");
         });

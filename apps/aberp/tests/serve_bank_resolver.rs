@@ -152,7 +152,9 @@ fn fixture_request(currency: Currency, bank_account_id: Option<String>) -> Issue
 /// `supplier_from_seller_toml`) plus a multi-bank `[[seller.banks]]`
 /// block. Two HUF banks (one default), one EUR bank (default).
 fn write_seller_toml_two_huf_one_eur(home_dir: &std::path::Path) {
-    let tenant_dir = home_dir.join(".aberp").join(TEST_TENANT);
+    let tenant_dir = home_dir
+        .join(aberp::build_profile::edition_data_dirname())
+        .join(TEST_TENANT);
     std::fs::create_dir_all(&tenant_dir).expect("create tenant dir");
     let body = r#"[seller]
 legal_name = "Bank Resolver Test Kft."
@@ -194,7 +196,9 @@ default        = true
 /// the comment block above for the HOME-race rationale.
 #[allow(dead_code)]
 fn write_seller_toml_huf_only(home_dir: &std::path::Path) {
-    let tenant_dir = home_dir.join(".aberp").join(TEST_TENANT);
+    let tenant_dir = home_dir
+        .join(aberp::build_profile::edition_data_dirname())
+        .join(TEST_TENANT);
     std::fs::create_dir_all(&tenant_dir).expect("create tenant dir");
     let body = r#"[seller]
 legal_name = "Bank Resolver Test Kft."
@@ -290,7 +294,10 @@ fn resolve_bank_snapshot_falls_back_to_per_currency_default() {
     // (Direct unit test against the resolver lives in serve.rs's
     // own #[cfg(test)] module; this integration pin exercises the
     // disk-read path.)
-    let path = dir.join(".aberp").join(TEST_TENANT).join("seller.toml");
+    let path = dir
+        .join(aberp::build_profile::edition_data_dirname())
+        .join(TEST_TENANT)
+        .join("seller.toml");
     let banks = aberp::seller_banks::read_seller_banks(&path).expect("read banks");
     let default_huf = banks
         .default_bank_for(Currency::Huf)

@@ -48,7 +48,7 @@ readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # is a dev-profile build, so guard_tenant_matches_build allows it — only
 # tenant=prod would be refused (that is run_prod.sh's job).
 readonly PORTABLE_TENANT="${ABERP_TENANT:-demo}"
-readonly PORTABLE_HOME="${HOME}/.aberp/${PORTABLE_TENANT}"
+readonly PORTABLE_HOME="${HOME}/.aberp-portable/${PORTABLE_TENANT}"
 readonly PORTABLE_SELLER_TOML="${PORTABLE_HOME}/seller.toml"
 readonly PORTABLE_DB="${PORTABLE_HOME}/aberp.duckdb"
 

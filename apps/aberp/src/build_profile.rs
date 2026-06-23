@@ -106,6 +106,107 @@ pub fn assert_endpoint_allowed(endpoint: NavEndpoint) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── ADR-0093 — compile-time Edition identity + edition-locked data root ──
+//
+// The saw-off (ADR-0093 §"Build-locked binding") binds each edition to its
+// OWN on-disk data root at COMPILE time, exactly as the `production` feature
+// binds the NAV endpoint above: there is no env-var or launcher-string
+// override (FOUNDATION §5 — the path is *derived*, never user-supplied). A
+// build therefore physically cannot resolve another edition's root, and —
+// critically — the sawed-off editions tree can never resolve the frozen prod
+// line's `~/.aberp/` root at all: it uses sibling `~/.aberp-<edition>/` roots
+// that are provably disjoint from `~/.aberp/prod/`.
+
+/// The product-line edition a binary is compiled as. The frozen Prod line
+/// lives in a *different* repository (ADR-0093 §6); this sawed-off tree only
+/// ever compiles as [`Edition::Defense`] (`--features production`) or
+/// [`Edition::Portable`] (the default). `Prod` is named for totality of the
+/// forbidden-root logic, but the compile-time assertion below proves this
+/// tree never *binds* it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edition {
+    /// Frozen unified prod line — NOT built from this repo. Its data root
+    /// `~/.aberp/` (tenant `~/.aberp/prod/`) is the one the editions must
+    /// never resolve or open.
+    #[allow(dead_code)] // intentionally never constructed in the editions tree
+    Prod,
+    /// Defense / aerospace line — the `--features production` build.
+    Defense,
+    /// Portable / NAV-off line — the default (non-production) build.
+    Portable,
+}
+
+/// The edition THIS binary was compiled as. Derived from the same
+/// compile-time `production` feature that drives [`IS_PRODUCTION_BUILD`]:
+/// `--features production` ⇒ [`Edition::Defense`], otherwise
+/// [`Edition::Portable`]. There is deliberately no `Prod` arm.
+pub const EDITION: Edition = if IS_PRODUCTION_BUILD {
+    Edition::Defense
+} else {
+    Edition::Portable
+};
+
+/// Compile-time proof that the sawed-off editions tree never binds the
+/// frozen prod edition. If a future edit ever wired `EDITION` to
+/// `Edition::Prod`, the build would FAIL here rather than silently let a
+/// binary resolve `~/.aberp/` (ADR-0093: "prod is untouchable by
+/// construction").
+const _: () = assert!(!matches!(EDITION, Edition::Prod));
+
+/// `$HOME`-relative data-root dir name for the frozen prod line. The
+/// editions must NEVER resolve or open anything under this.
+pub const PROD_DATA_DIRNAME: &str = ".aberp";
+/// `$HOME`-relative data-root dir name for the Defense edition.
+pub const DEFENSE_DATA_DIRNAME: &str = ".aberp-defense";
+/// `$HOME`-relative data-root dir name for the Portable edition.
+pub const PORTABLE_DATA_DIRNAME: &str = ".aberp-portable";
+
+/// The `$HOME`-relative data-root dir name for a given edition — the single
+/// source of truth every per-tenant path resolver joins under `$HOME`
+/// (`tenant_registry::aberp_root` and friends). `const fn` so it is usable
+/// in const context and trivially inlined.
+pub const fn data_dirname(edition: Edition) -> &'static str {
+    match edition {
+        Edition::Prod => PROD_DATA_DIRNAME,
+        Edition::Defense => DEFENSE_DATA_DIRNAME,
+        Edition::Portable => PORTABLE_DATA_DIRNAME,
+    }
+}
+
+/// This binary's edition-locked data-root dir name. Compile-time constant —
+/// `.aberp-defense` or `.aberp-portable`, NEVER `.aberp`.
+pub const EDITION_DATA_DIRNAME: &str = data_dirname(EDITION);
+
+/// Ergonomic accessor for [`EDITION_DATA_DIRNAME`] — the segment every
+/// per-tenant path resolver joins under `$HOME` (ADR-0093 §5).
+pub const fn edition_data_dirname() -> &'static str {
+    EDITION_DATA_DIRNAME
+}
+
+/// Human-facing edition label for guard / diagnostic messages.
+pub const fn edition_label() -> &'static str {
+    match EDITION {
+        Edition::Prod => "Prod",
+        Edition::Defense => "Defense",
+        Edition::Portable => "Portable",
+    }
+}
+
+/// The data-root dir names this build must REFUSE to resolve or open —
+/// every edition's root except its own. For the editions tree this ALWAYS
+/// includes the frozen prod root (`.aberp`) plus the sibling edition's root,
+/// so a build can never cross into prod's or the other edition's database
+/// (ADR-0093 — "physically refuses").
+pub const fn foreign_data_dirnames() -> [&'static str; 2] {
+    match EDITION {
+        Edition::Portable => [PROD_DATA_DIRNAME, DEFENSE_DATA_DIRNAME],
+        Edition::Defense => [PROD_DATA_DIRNAME, PORTABLE_DATA_DIRNAME],
+        // Unreachable in the editions tree (see the compile-time assert
+        // above); present for match totality, no wildcard.
+        Edition::Prod => [DEFENSE_DATA_DIRNAME, PORTABLE_DATA_DIRNAME],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +258,51 @@ mod tests {
         // The gate is LIFTED on a production build.
         assert!(assert_endpoint_allowed(NavEndpoint::Production).is_ok());
         assert!(assert_endpoint_allowed(NavEndpoint::Test).is_ok());
+    }
+
+    // ── ADR-0093 — edition binding pins ──────────────────────────────
+    // The edition is compile-time, so each build flavour pins its own
+    // arm: the default (feature off) build is Portable; `--features
+    // production` is Defense. Both assert they NEVER bind prod's root.
+
+    #[test]
+    fn editions_tree_never_binds_prod_edition() {
+        // Total over Edition, and proves the sawed-off invariant: the
+        // running build is never the frozen prod edition.
+        assert_ne!(EDITION, Edition::Prod);
+        // Dirname mapping is the single source of truth.
+        assert_eq!(data_dirname(Edition::Prod), ".aberp");
+        assert_eq!(data_dirname(Edition::Defense), ".aberp-defense");
+        assert_eq!(data_dirname(Edition::Portable), ".aberp-portable");
+        // This build's own root is never prod's, and prod's root is
+        // ALWAYS in the forbidden set.
+        assert_ne!(edition_data_dirname(), PROD_DATA_DIRNAME);
+        assert!(foreign_data_dirnames().contains(&PROD_DATA_DIRNAME));
+        // The own root is never listed as foreign.
+        assert!(!foreign_data_dirnames().contains(&edition_data_dirname()));
+    }
+
+    #[cfg(not(feature = "production"))]
+    #[test]
+    fn portable_build_binds_portable_root() {
+        assert_eq!(EDITION, Edition::Portable);
+        assert_eq!(edition_data_dirname(), ".aberp-portable");
+        assert_eq!(edition_label(), "Portable");
+        // Both prod AND the sibling Defense root are foreign (refused).
+        assert!(foreign_data_dirnames().contains(&PROD_DATA_DIRNAME));
+        assert!(foreign_data_dirnames().contains(&DEFENSE_DATA_DIRNAME));
+        assert!(!foreign_data_dirnames().contains(&PORTABLE_DATA_DIRNAME));
+    }
+
+    #[cfg(feature = "production")]
+    #[test]
+    fn defense_build_binds_defense_root() {
+        assert_eq!(EDITION, Edition::Defense);
+        assert_eq!(edition_data_dirname(), ".aberp-defense");
+        assert_eq!(edition_label(), "Defense");
+        // Both prod AND the sibling Portable root are foreign (refused).
+        assert!(foreign_data_dirnames().contains(&PROD_DATA_DIRNAME));
+        assert!(foreign_data_dirnames().contains(&PORTABLE_DATA_DIRNAME));
+        assert!(!foreign_data_dirnames().contains(&DEFENSE_DATA_DIRNAME));
     }
 }
