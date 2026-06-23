@@ -65,7 +65,7 @@ git -C <original-ABERP> rev-parse 'origin/PROD_v2.27.76^{tree}'
    snapshot/restore; and **reconcile safety** — boot no longer silently
    truncates a mirror AHEAD of the DB (it preserves the ahead mirror + refuses
    so a lost-commit isn't erased). Cut-gate CHECK 4 added (ENFORCED). ✅ **(this chunk)**
-4. **Cut-gate / CI hardening** — full ADR-0002 DB-isolation enforcement.
+4. **Cut-gate / CI hardening** — full ADR-0002 DB-isolation enforcement. ✅ **(this chunk)**
 5. **Publish** — create GitHub repo(s), push (auth-gated; stop on PAT
    failure), confirm original repo frozen at `v2.27.76`.
 
@@ -141,3 +141,154 @@ cargo test -p aberp --test edition_snapshot_isolation              # resolve_sto
 
 The code is complete and committed; do not treat the deferred bundled-DuckDB
 build/tests as green until that run is clean on the Mac.
+
+**Chunk 4 gating note (2026-06-23).** Chunk 4 is the cut-gate / CI hardening
+step — it makes chunks 1–3's deferred build/test/isolation gate run *for real*
+on a full-toolchain runner, and extends the bash cut-gate with three new
+invariants (each with a negative probe). **No application code changed.**
+**Verified green in-session (sandbox-runnable):** `bash -n` on
+`tools/cut_gate_db_isolation.sh` and the new `tools/cut_gate_negative_probes.sh`;
+the cut-gate (now CHECK 1–7) PASSES on the clean tree; the negative-probe
+harness is **8/8** (clean copy passes; every CHECK 1–7 goes red when its
+invariant is violated); both `.github/workflows/*.yml` parse
+(`yaml.safe_load`) and every `run:` block passes `bash -n` for BOTH arms
+(empty and `--features production` substitution). **NOT run here (honest —
+authored + statically validated only):** the GitHub Actions run itself — the
+full `cargo build/clippy/test --workspace` (both arms), the bundled-DuckDB
+crash-injection + edition-isolation integration tests, and the `aberp-ui`
+Tauri link — same constraints as chunks 2–3 (bundled DuckDB is one ~8-min C++
+unit; the sandbox kills work at ~45 s boundaries, 4 GB no-swap; `aberp-ui`
+needs webkit2gtk). The CI is therefore **authored + statically validated; its
+first real run happens on GitHub Actions / Ervin's Mac.** Do not call the CI
+"passing" until that first runner job is green.
+
+> **Prod-untouched provenance note (2026-06-23).** The content anchor is the
+> **tree-hash** `2d612811…`, which `PROD_v2.27.76^{tree}` resolves to in the
+> prod repo — re-verified **unchanged** this chunk (and `~/.aberp/` is out of
+> reach of the sandbox). The commit SHA recorded in the baseline table
+> (`f7519b4…`) is the tag's commit in the canonical/GitHub repo; the local
+> working copy of prod was observed carrying the same `PROD_v2.27.76` tag on a
+> *different commit object* (`079db9c…`) with the **identical tree**
+> (`2d612811…`). Content identity (the tree) is the load-bearing proof of
+> "byte-for-byte untouched", and it holds. Flagged for chunk 5 to reconcile
+> the commit-object label when it confirms the frozen tag on GitHub.
+
+## What CI enforces now (chunk 4) — and for which arms
+
+On every push / PR to `main`, on a full Rust+Tauri runner, `ci.yml` runs a
+two-cell matrix — **Portable** (default features) and **Defense**
+(`--features production`). Each arm runs, in order:
+
+| Gate | Portable | Defense |
+|---|---|---|
+| ADR-0093 DB-isolation cut-gate (CHECK 1–7) + negative probes — **fail-fast** | ✅ | ✅ |
+| `cargo fmt --all -- --check` | ✅ | ✅ |
+| `cargo build --workspace --locked --all-targets` | ✅ default | ✅ `--features production` |
+| `cargo test --workspace --locked` | ✅ default | ✅ `--features production` |
+| Named integration tests (below) | ✅ | ✅ (aberp-pkg tests get `--features production`) |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | ✅ default | ✅ `--features production` |
+| `cargo deny check` + `cargo audit` (arm-independent) | ✅ once | — |
+
+Named integration tests (the bundled-DuckDB / wiring tests the sandbox could
+not run, per the chunk-3 handoff): `aberp --test edition_db_isolation`,
+`aberp --test edition_snapshot_isolation`,
+`aberp-snapshot --test crash_safe_checkpoint_tests`,
+`aberp-snapshot --test edition_isolation_tests`, and
+`aberp-audit-ledger ensure_consistent_refuses_and_preserves_when_mirror_ahead_of_db`.
+The `production` feature lives only on `aberp`/`aberp-ui`, so the `aberp`
+binary tests take `--features production` on the Defense arm while the
+edition-agnostic crate tests run featureless.
+
+`cut-gate.yml` runs the same CHECK 1–7 cut-gate + negative probes as a
+standalone, toolchain-free job (seconds), so the isolation mandate is gated
+fast and independently of the 8-minute build.
+
+The three cut-gate CHECKs added this chunk (each defended by a negative probe
+in `tools/cut_gate_negative_probes.sh`):
+
+- **CHECK 5** — the durable checkpoint is *build-aside + atomic `rename(2)` +
+  fsync(file & parent dir)*, **never an in-place rewrite** of the live DB
+  (ADR-0082). Probe: swap the `rename` for an in-place `copy` → gate fails.
+- **CHECK 6** — no editions **binary** source resolves prod's *bare* snapshot
+  store `~/Documents/ABERP-snapshots/` (the `default_store_dir` resolver or
+  the bare component); editions use `ABERP-snapshots-<edition>` (ADR-0093 §5).
+  Generalizes CHECK 4d from `snapshot.rs` to the whole binary. Probe: plant a
+  `default_store_dir(` call under `apps/aberp/src` → gate fails.
+- **CHECK 7** — edition launchers bind a **single, matching** root; arms don't
+  cross (a `--features production` launcher binds `.aberp-defense`, never the
+  sibling/prod root). Catches what CHECK 3b cannot — a rogue/mismatched
+  launcher. Probe: a new launcher that builds `--features production` but binds
+  `.aberp-portable` → gate fails.
+
+Toolchain: `dtolnay/rust-toolchain@stable`, matching the repo's
+`rust-toolchain.toml` channel pin (ADR-0001/0021). **Flagged:** *not*
+hard-pinned to 1.96 — the repo deliberately pins the stable *channel*, not a
+version, and the MSRV floor lives in each `Cargo.toml`'s `rust-version`. If a
+future stable bump adds a clippy lint, `-D warnings` can newly fail; that is
+the repo's accepted, documented trade.
+
+## Documented Mac-side / runner-only steps (NOT faked in CI)
+
+- **The first real CI run.** Everything above is authored + statically
+  validated in-sandbox; it has never executed. Its first green is on GitHub
+  Actions (or the Mac mirroring `ci.yml`).
+- **The packaged Tauri *bundle / installer*.** CI builds and tests the
+  `aberp-ui` Rust crate (webkit2gtk-linked) on Linux for both arms, but the
+  shippable installer (`tauri build` → `.dmg` on macOS, `.AppImage`/`.deb` on
+  Linux) is a release-packaging step run Mac-side via `run/release.sh`. CI
+  proves the code compiles/links/tests; it does not produce the signed
+  installer.
+
+## Required status check (chunk 5 wiring)
+
+The cut-gate is intended to be a **required status check** on the editions
+GitHub repo so the ADR-0093/0002 DB-isolation mandate cannot be merged away.
+Once chunk 5 has created + pushed the repo (auth-gated), wire branch
+protection on `main`:
+
+- **UI (authoritative):** Settings → Branches → Add branch protection rule →
+  pattern `main` → *Require status checks to pass before merging* → select
+  **`ADR-0093 DB-isolation cut-gate`** (the `cut-gate.yml` job name); optionally
+  also require **`portable · build + lint + test`** and
+  **`defense · build + lint + test`** (the `ci.yml` matrix jobs). Enable
+  *Require branches to be up to date before merging*.
+- **API (`gh`, JSON body — the reliable form):**
+
+      gh api -X PUT repos/<owner>/<repo>/branches/main/protection \
+        -H "Accept: application/vnd.github+json" --input - <<'JSON'
+      {
+        "required_status_checks": {
+          "strict": true,
+          "checks": [
+            {"context": "ADR-0093 DB-isolation cut-gate"},
+            {"context": "portable · build + lint + test"},
+            {"context": "defense · build + lint + test"}
+          ]
+        },
+        "enforce_admins": true,
+        "required_pull_request_reviews": null,
+        "restrictions": null
+      }
+      JSON
+
+  Status-check *contexts* are the job `name:` values. The cut-gate job is the
+  load-bearing required check (toolchain-free, fast); the two `ci.yml` arms are
+  recommended-additional.
+
+## Chunk 5 — publish (handoff)
+
+1. **Create the GitHub repo(s)** for the editions tree and push `main`
+   (fork-with-history per ADR-0093 §4). **Auth-gated:** the saved PAT is
+   **FLAGGED FOR ROTATION** and likely invalid — chunk 5 must **STOP and ask
+   Ervin for a fresh token** rather than fail or improvise, and must never
+   embed the token in a committed file.
+2. **Wire the required status check** (section above) once the repo exists.
+3. **Confirm prod still frozen** in the *original* repo (read-only):
+   `git -C <original-ABERP> rev-parse 'PROD_v2.27.76^{tree}'` must equal
+   `2d612811dd487a50f33476c484d1768cc8e99a51`; reconcile the tag's commit-object
+   label per the provenance note above.
+4. **Source of truth = the bundle.** The editions working checkout at
+   `~/Documents/Claude/Projects/ABERP-Editions` was observed at a *different
+   head* (`14d0b06`) than the written-back bundle; the **bundle is canonical**.
+   Chunk 5 must sync that checkout from the bundle before pushing and must not
+   push the stale checkout.
