@@ -1,0 +1,25 @@
+# ADR-0093 saw-off cut-gate — DB-isolation guardrail.
+#
+# Deliberately a standalone, toolchain-free job: it runs the bash cut-gate
+# (tools/cut_gate_db_isolation.sh) with nothing but a checkout, so it gates
+# fast and stays green independently of the heavy Rust+Tauri build in
+# ci.yml. Its sole job is to make the ADR-0002/ADR-0093 DB-isolation
+# mandate un-droppable at a product-line cut.
+name: cut-gate
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  db-isolation:
+    name: ADR-0093 DB-isolation cut-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run DB-isolation cut-gate
+        run: bash tools/cut_gate_db_isolation.sh
