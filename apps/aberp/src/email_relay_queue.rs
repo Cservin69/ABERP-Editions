@@ -526,7 +526,7 @@ pub fn attachments_root_for_tenant(tenant: &str) -> Result<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
         .ok_or_else(|| anyhow!("HOME env var not set"))?;
     Ok(home
-        .join(".aberp")
+        .join(crate::build_profile::edition_data_dirname())
         .join(tenant)
         .join("email-relay-attachments"))
 }

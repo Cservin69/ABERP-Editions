@@ -41,7 +41,7 @@ pub fn touchfile_path(tenant: &str) -> Result<PathBuf> {
         anyhow!("HOME environment variable not set; cannot resolve first-launch touchfile path")
     })?;
     Ok(PathBuf::from(home)
-        .join(".aberp")
+        .join(crate::build_profile::edition_data_dirname())
         .join(tenant)
         .join(TOUCHFILE_NAME))
 }

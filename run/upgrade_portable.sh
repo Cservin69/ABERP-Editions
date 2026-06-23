@@ -134,7 +134,7 @@ readonly SCRIPT_PATH="$script_path"
 readonly REPO_ROOT="$(cd "$SCRIPT_PATH/.." && pwd -P)"
 
 readonly TENANT="$tenant"
-readonly TENANT_DIR="${HOME}/.aberp/${TENANT}"
+readonly TENANT_DIR="${HOME}/.aberp-portable/${TENANT}"
 
 echo
 echo "${c_grn}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c_rst}" >&2

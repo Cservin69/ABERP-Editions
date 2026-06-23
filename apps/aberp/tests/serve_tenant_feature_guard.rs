@@ -8,10 +8,12 @@
 //! This integration test exec's the REAL built `aberp` binary with a
 //! mismatched env and asserts the process refuses to start. The CI gate
 //! (`cargo test --workspace`, default features) builds the DEV flavour,
-//! so the arm pinned here is "DEV build refuses tenant=prod". The mirror
-//! arm ("PROD build refuses tenant=test") only exists under `--features
-//! production`; it is covered by the unit pins in
-//! `build_profile::tests`.
+//! Under ADR-0093 BOTH editions refuse the frozen prod line's reserved
+//! `prod` tenant (the old "PROD build hard-locks tenant==prod" binding that
+//! pointed Defense at `~/.aberp/prod/` is removed). This test pins the
+//! Portable (default-feature) arm: a non-prod build refuses `--tenant prod`.
+//! The compile-time edition→root binding is pinned in `build_profile::tests`
+//! and `tests/edition_db_isolation.rs`.
 
 use std::process::Command;
 
@@ -42,11 +44,11 @@ fn dev_build_refuses_tenant_prod() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("DEV build but ABERP_TENANT=prod"),
-        "stderr must name the dev/prod mismatch; got:\n{stderr}"
+        stderr.contains("reserved tenant") && stderr.contains("ADR-0093"),
+        "stderr must name the reserved-prod-tenant refusal; got:\n{stderr}"
     );
     assert!(
-        stderr.contains("run/run_prod.sh"),
-        "stderr must steer the operator to run_prod.sh; got:\n{stderr}"
+        stderr.contains("run/run_portable.sh"),
+        "stderr must steer the operator to an editions launcher; got:\n{stderr}"
     );
 }

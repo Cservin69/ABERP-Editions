@@ -143,7 +143,9 @@ fn fixture_request(override_value: Option<String>) -> IssueInvoiceRequest {
 }
 
 fn write_fixture_seller_toml(home_dir: &std::path::Path) {
-    let tenant_dir = home_dir.join(".aberp").join(TEST_TENANT);
+    let tenant_dir = home_dir
+        .join(aberp::build_profile::edition_data_dirname())
+        .join(TEST_TENANT);
     std::fs::create_dir_all(&tenant_dir).expect("create tenant dir for seller.toml fixture");
     let body = r#"[seller]
 legal_name = "ABERP Supplier Kft."

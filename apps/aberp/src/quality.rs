@@ -1212,7 +1212,7 @@ pub fn photos_root_for_ncr(tenant: &str, ncr_id: &str) -> Result<std::path::Path
         .map(std::path::PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("HOME env var not set"))?;
     Ok(home
-        .join(".aberp")
+        .join(crate::build_profile::edition_data_dirname())
         .join(tenant)
         .join("ncr-photos")
         .join(ncr_id))

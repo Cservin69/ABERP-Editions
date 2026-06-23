@@ -172,7 +172,10 @@ fn keychain_service_for(tenant: &str) -> String {
 /// three platforms.
 fn serve_artifacts_dir(tenant: &str) -> Result<PathBuf> {
     let home = dirs_home_or_loud_fail()?;
-    Ok(home.join(".aberp").join("serve").join(tenant))
+    Ok(home
+        .join(crate::build_profile::edition_data_dirname())
+        .join("serve")
+        .join(tenant))
 }
 
 /// S291 / PR-272 — env-var override for the loopback HTTPS port. The
@@ -240,19 +243,56 @@ fn dirs_home_or_loud_fail() -> Result<PathBuf> {
 pub const NAV_DISABLED_LOGIN: &str = "nav-disabled";
 
 fn guard_tenant_matches_build(tenant: &str) {
-    if crate::build_profile::IS_PRODUCTION_BUILD && tenant != "prod" {
+    // ADR-0093 — the editions cross-stream guard. The sawed-off tree builds
+    // only Defense (`--features production`) or Portable; the frozen prod
+    // line — and its reserved `prod` tenant + `~/.aberp/prod/` database —
+    // live in a *different* repo. So BOTH editions refuse the reserved
+    // `prod` tenant slug. The old guard hard-locked a `--features
+    // production` build onto `tenant == "prod"`, which pointed Defense
+    // straight at prod's exact DB (`~/.aberp/prod/aberp.duckdb`) — the
+    // ADR-0093 §Context violation. That lock is removed: Defense now runs
+    // its own tenants under `~/.aberp-defense/<tenant>/`. The data ROOT is
+    // edition-locked at compile time (`build_profile::EDITION`), so even
+    // were this guard bypassed a binary still resolves only its own
+    // `~/.aberp-<edition>/` root; this is the loud, early, operator-facing
+    // half of that guarantee (CLAUDE.md rule 12).
+    if tenant == "prod" {
         eprintln!(
-            "❌ FATAL: this is a PRODUCTION build but ABERP_TENANT={tenant} (expected 'prod'). \
-             Refusing to start."
+            "❌ FATAL: '{tenant}' is the frozen prod line's reserved tenant — the {edition} \
+             edition refuses it (ADR-0093). Refusing to start.",
+            edition = crate::build_profile::edition_label(),
         );
-        eprintln!("   Either: launch with `run/run_prod.sh` (sets ABERP_TENANT=prod), OR");
-        eprintln!("   re-build without --features production for dev use.");
+        eprintln!(
+            "   The editions never open prod's database (~/{prod}/prod/aberp.duckdb); they use \
+             their own ~/{own}/<tenant>/ root.",
+            prod = crate::build_profile::PROD_DATA_DIRNAME,
+            own = crate::build_profile::edition_data_dirname(),
+        );
+        eprintln!(
+            "   Launch run/run_defense.sh or run/run_portable.sh with ABERP_TENANT set to a \
+             non-prod tenant."
+        );
         std::process::exit(1);
     }
-    if !crate::build_profile::IS_PRODUCTION_BUILD && tenant == "prod" {
-        eprintln!("❌ FATAL: this is a DEV build but ABERP_TENANT=prod. Refusing to start.");
-        eprintln!("   Either: launch with `run/run_prod.sh` (compiles --features production), OR");
-        eprintln!("   set ABERP_TENANT=test (or another non-prod tenant).");
+}
+
+/// ADR-0093 — the edition DB-binding guard. Refuses to boot `serve` against
+/// a database that resolves into a FOREIGN edition's root — prod's
+/// `~/.aberp/` or the sibling edition's `~/.aberp-<other>/` — no matter how
+/// the path arrived (`--db`, `ABERP_DB`, a hand-edited launcher, a switch
+/// hint). The DB root is *derived* from the compile-time edition
+/// ([`crate::build_profile::EDITION`]); this is the runtime backstop that
+/// makes "a build physically cannot open another edition's DB" true even
+/// under env/misconfig (FOUNDATION §5). Fires loud + `exit(1)` like
+/// [`guard_tenant_matches_build`], before any port / keychain / DB access.
+fn guard_db_matches_edition(db: &std::path::Path) {
+    if let Err(e) = crate::tenant_registry::ensure_db_path_isolated(db) {
+        eprintln!("❌ FATAL: {e}");
+        eprintln!(
+            "   Point --db / ABERP_DB at this edition's ~/{}/<tenant>/aberp.duckdb, or launch via \
+             run/run_defense.sh / run/run_portable.sh.",
+            crate::build_profile::edition_data_dirname()
+        );
         std::process::exit(1);
     }
 }
@@ -352,13 +392,13 @@ pub(crate) fn sanity_check_environment(
                     format!("❌ FATAL: PRODUCTION build expects seller.toml tax_number {expected_tax} (Áben Consulting Kft.)"),
                     format!("            but found {other}. Refusing to start."),
                     "   This is hülye-biztos protection: a prod binary must only run against the documented prod identity.".to_string(),
-                    format!("   Either: fix seller.toml at ~/.aberp/{tenant_name}/seller.toml, OR"),
+                    format!("   Either: fix seller.toml at ~/{}/{tenant_name}/seller.toml, OR", crate::build_profile::edition_data_dirname()),
                     "   rebuild without --features production for dev use.".to_string(),
                     String::new(),
                     format!("❌ VÉGZETES: az ÉLES build a(z) {expected_tax} adószámot várja a seller.toml-ban (Áben Consulting Kft.),"),
                     format!("            de {other} szerepel. Az indítás megtagadva."),
                     "   Ez hülye-biztos védelem: éles bináris kizárólag a dokumentált éles identitással futhat.".to_string(),
-                    format!("   Vagy: javítsd a seller.toml-t itt: ~/.aberp/{tenant_name}/seller.toml, VAGY"),
+                    format!("   Vagy: javítsd a seller.toml-t itt: ~/{}/{tenant_name}/seller.toml, VAGY", crate::build_profile::edition_data_dirname()),
                     "   fordítsd újra a --features production kapcsoló nélkül fejlesztői használatra.".to_string(),
                 ];
                 report.fatal = Some(lines.join("\n"));
@@ -379,12 +419,12 @@ pub(crate) fn sanity_check_environment(
         let lines = [
             "❌ FATAL: PRODUCTION build can't find NAV credentials in keychain.".to_string(),
             "   The first-launch ceremony was completed previously but the keychain entries are gone.".to_string(),
-            format!("   Either: re-run the first-launch wizard (clear ~/.aberp/{tenant_name}/.first-launch-acknowledged), OR"),
+            format!("   Either: re-run the first-launch wizard (clear ~/{}/{tenant_name}/.first-launch-acknowledged), OR", crate::build_profile::edition_data_dirname()),
             "   restore the keychain entries.".to_string(),
             String::new(),
             "❌ VÉGZETES: az ÉLES build nem találja a NAV hitelesítő adatokat a kulcstartóban.".to_string(),
             "   A first-launch ceremónia korábban lezárult, de a kulcstartó-bejegyzések eltűntek.".to_string(),
-            format!("   Vagy: futtasd újra a first-launch varázslót (töröld: ~/.aberp/{tenant_name}/.first-launch-acknowledged), VAGY"),
+            format!("   Vagy: futtasd újra a first-launch varázslót (töröld: ~/{}/{tenant_name}/.first-launch-acknowledged), VAGY", crate::build_profile::edition_data_dirname()),
             "   állítsd vissza a kulcstartó-bejegyzéseket.".to_string(),
         ];
         // Prefer the first fatal (A) if it already fired — the operator
@@ -758,6 +798,12 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // The prod/test choice is COMPILE-TIME (`build_profile`), so a dev
     // binary physically cannot run as tenant=prod and vice versa.
     guard_tenant_matches_build(&args.tenant);
+
+    // ADR-0093 — refuse to open a DB outside this edition's own root,
+    // even if a launcher / env / misconfig handed us prod's or the
+    // sibling edition's path via --db / ABERP_DB. Fires before the
+    // port, keychain, or DB are touched (same early-refuse posture).
+    guard_db_matches_edition(&args.db);
 
     // S165 / deliverable #3 — one-shot boot banner naming the NAV
     // environment this build talks to. Loud + colourised on a real
@@ -6877,7 +6923,10 @@ impl PreflightErrorItem {
 /// operators have one config home to anchor on.
 fn seller_toml_path_for_tenant(tenant: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/operator".to_string());
-    format!("{home}/.aberp/{tenant}/seller.toml")
+    format!(
+        "{home}/{root}/{tenant}/seller.toml",
+        root = crate::build_profile::edition_data_dirname()
+    )
 }
 
 /// PR-53 / session-73 — read the per-tenant `seller.toml` identity
@@ -16902,7 +16951,10 @@ async fn build_ap_sync_inputs(
 /// metadata for the tenant.
 fn ap_artifacts_dir(tenant: &str) -> Result<PathBuf> {
     let home = dirs_home_or_loud_fail()?;
-    Ok(home.join(".aberp").join(tenant).join("ap-artifacts"))
+    Ok(home
+        .join(crate::build_profile::edition_data_dirname())
+        .join(tenant)
+        .join("ap-artifacts"))
 }
 
 // ── S180 / PR-180 — NAV-as-DR restore wizard ─────────────────────────
