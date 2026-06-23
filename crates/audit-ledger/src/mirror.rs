@@ -430,10 +430,6 @@ pub enum RecoveryAction {
     /// Mirror was behind the DB; replayed the missing DB entries
     /// `[mirror_max_seq+1..=db_max_seq]`.
     Extended { entries_added: u64 },
-    /// Mirror was ahead of the DB (the dev-DB-nuke case — operator
-    /// deleted the DuckDB but left the mirror). Truncated to the DB's
-    /// max seq by rewriting `[1..=db_max_seq]` from the DB.
-    Truncated { entries_dropped: u64 },
     /// Mirror was the same length as the DB but its last `entry_hash`
     /// disagreed (or the mirror file was corrupt/unparseable). Full
     /// rebuild from the DB.
@@ -452,7 +448,8 @@ pub enum RecoveryAction {
 ///
 /// - mirror file missing → create fresh from DB → [`RecoveryAction::Created`]
 /// - mirror behind DB → replay missing entries → [`RecoveryAction::Extended`]
-/// - mirror ahead of DB → truncate to DB max seq → [`RecoveryAction::Truncated`]
+/// - mirror ahead of DB → preserve the ahead mirror + REFUSE
+///   ([`AppendError::MirrorAheadOfDb`]) — never silently truncated
 /// - equal length, last hash matches → [`RecoveryAction::Unchanged`]
 /// - equal length, last hash differs, OR mirror corrupt → full
 ///   rebuild → [`RecoveryAction::Rebuilt`]
@@ -524,18 +521,27 @@ pub fn ensure_consistent_with_db(
             entries_added: added,
         })
     } else if mirror_max_seq > db_max_seq {
-        let dropped = mirror_max_seq - db_max_seq;
-        tracing::warn!(
+        // The mirror is AHEAD of the DB — the fingerprint of a torn-write /
+        // lost DB commit (the 2026-06-22 corruption class) or a dev DB-nuke.
+        // ADR-0093 chunk 3 / ADR-0082 reconcile safety: NEVER silently
+        // truncate (that destroys the only surviving record of what the DB
+        // lost). Preserve the ahead mirror to a side file FIRST, then
+        // refuse-and-surface so a human investigates before any rebuild.
+        let entries_ahead = mirror_max_seq - db_max_seq;
+        let preserved = preserve_ahead_mirror(mirror_path)?;
+        tracing::error!(
             mirror_path = %mirror_path.display(),
             mirror_max_seq,
             db_max_seq,
-            entries_dropped = dropped,
-            "audit_mirror_recovered action=truncated (mirror was AHEAD of DB — \
-             dev-DB-nuke; mirror truncated to DB max seq)"
+            entries_ahead,
+            preserved = %preserved.display(),
+            "audit_mirror_AHEAD_of_db — REFUSING to auto-truncate; preserved the ahead \
+             mirror and surfacing (possible lost DB commit — investigate before re-running)"
         );
-        rebuild_mirror_from_db(conn, mirror_path)?;
-        Ok(RecoveryAction::Truncated {
-            entries_dropped: dropped,
+        Err(AppendError::MirrorAheadOfDb {
+            mirror_max_seq,
+            db_max_seq,
+            preserved: preserved.display().to_string(),
         })
     } else if db_max_seq == 0 {
         // Both empty (mirror file present but zero entries, DB empty).
@@ -575,10 +581,29 @@ fn read_db_max_seq(conn: &Connection) -> Result<u64, AppendError> {
     }
 }
 
+/// Preserve the current (AHEAD-of-DB) mirror to a timestamped side file so
+/// the evidence of what the DB lost is never destroyed (ADR-0093 chunk 3 /
+/// ADR-0082 reconcile safety). A byte-for-byte copy to
+/// `<mirror>.ahead-<nanos>.bak`; the original mirror is left in place, so
+/// the boot reconcile keeps surfacing the AHEAD condition until a human
+/// resolves it. Returns the backup path for the surfaced error message.
+fn preserve_ahead_mirror(mirror_path: &Path) -> Result<PathBuf, AppendError> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut os = mirror_path.as_os_str().to_owned();
+    os.push(format!(".ahead-{nanos}.bak"));
+    let backup = PathBuf::from(os);
+    std::fs::copy(mirror_path, &backup).map_err(AppendError::MirrorIo)?;
+    Ok(backup)
+}
+
 /// Truncate the mirror and rewrite it from the DB's full entry set
-/// `[1..=db_max_seq]`. Used by the Created, Truncated, and Rebuilt
-/// recovery paths — in all three `up_to == db_max_seq`, so the full
-/// DB scan IS `[1..=db_max_seq]`. Returns the entry count written.
+/// `[1..=db_max_seq]`. Used by the Created and Rebuilt recovery paths — in
+/// both `up_to == db_max_seq`, so the full DB scan IS `[1..=db_max_seq]`.
+/// Returns the entry count written. (The mirror-ahead case no longer
+/// rebuilds: it preserves + refuses via [`preserve_ahead_mirror`].)
 fn rebuild_mirror_from_db(conn: &Connection, mirror_path: &Path) -> Result<u64, AppendError> {
     let entries = read_db_entries_after(conn, 0)?;
     let file = OpenOptions::new()
@@ -1088,35 +1113,48 @@ mod tests {
     }
 
     #[test]
-    fn ensure_consistent_truncates_when_mirror_ahead_of_db_dev_nuke() {
-        // THE dev-DB-nuke case: operator rm'd the DuckDB but left the
-        // mirror in place. Old DB had 2 entries; mirror synced to them.
-        // A FRESH DB now holds ONE new entry → mirror is AHEAD by 1.
-        // Boot must truncate the mirror to the fresh DB's max seq and
-        // rewrite it from the FRESH chain (not the stale mirror bytes).
+    fn ensure_consistent_refuses_and_preserves_when_mirror_ahead_of_db() {
+        // The mirror is AHEAD of the DB (old DB had 2 entries the mirror
+        // synced to; the DB now has only 1 — a torn-write / lost commit, or
+        // a dev DB-nuke). Chunk-3 reconcile safety: boot must NOT silently
+        // truncate the ahead mirror (that would destroy the only record of
+        // what the DB lost). It preserves the ahead mirror to a side file
+        // and REFUSES (surfaces) so a human investigates.
         let dir = tempdir_under_target();
         let mirror = dir.join("ahead.audit.log");
         let (conn_old, meta_old) = open_conn_with_two_entries();
         sync_mirror(&conn_old, &meta_old, &mirror).unwrap();
         assert_eq!(read_mirror_entries(&mirror).unwrap().len(), 2);
+        let before = std::fs::read(&mirror).unwrap();
 
         let mut conn_fresh = Connection::open_in_memory().unwrap();
         ensure_schema(&conn_fresh).unwrap();
         let meta_fresh = mk_meta();
         append_one(&mut conn_fresh, &meta_fresh, "fresh-1", b"fresh-payload-1");
 
-        let action = ensure_consistent_with_db(&conn_fresh, &mirror).unwrap();
-        assert_eq!(action, RecoveryAction::Truncated { entries_dropped: 1 });
+        let err = ensure_consistent_with_db(&conn_fresh, &mirror)
+            .expect_err("mirror ahead of DB must REFUSE, never silently truncate");
+        match err {
+            AppendError::MirrorAheadOfDb {
+                mirror_max_seq,
+                db_max_seq,
+                preserved,
+            } => {
+                assert_eq!(mirror_max_seq, 2);
+                assert_eq!(db_max_seq, 1);
+                // The ahead mirror was preserved byte-for-byte as evidence.
+                let backup = std::fs::read(&preserved).expect("preserved backup exists");
+                assert_eq!(backup, before, "backup must be the intact ahead mirror");
+            }
+            other => panic!("expected MirrorAheadOfDb, got {other:?}"),
+        }
 
-        let entries = read_mirror_entries(&mirror).unwrap();
-        assert_eq!(entries.len(), 1, "mirror truncated to fresh DB max seq");
-        assert_eq!(entries[0].seq, 1);
-        // The rewritten head must match the FRESH DB entry, proving the
-        // rewrite sourced the DB and not the stale mirror line.
-        let db_entry = read_db_entry_at_seq(&conn_fresh, 1).unwrap().unwrap();
+        // The LIVE mirror is NOT truncated — recovery evidence survives, and
+        // the next boot keeps surfacing the AHEAD condition until resolved.
         assert_eq!(
-            entries[0].entry_hash,
-            hex::encode(db_entry.entry_hash.as_bytes())
+            read_mirror_entries(&mirror).unwrap().len(),
+            2,
+            "the ahead mirror must be left intact (never auto-truncated)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

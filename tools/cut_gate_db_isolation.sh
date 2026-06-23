@@ -19,6 +19,13 @@
 #           prod's ~/.aberp/prod. Enforced by default;
 #           ENFORCE_EDITION_DB_BINDING=0 disables it for a deliberate,
 #           temporary local probe only.
+#   CHECK 4 (chunk 3, ENFORCED) — the edition owns its OWN write/checkpoint
+#           path: an edition-scoped, prod-refusing snapshot store; the
+#           crash-safe durable checkpoint module (ADR-0082) wired into the
+#           snapshot crate + clean shutdown; and reconcile safety (a mirror
+#           AHEAD of the DB is preserved + refused, never silently
+#           truncated). ENFORCE_CHUNK3_INVARIANTS=0 disables it for a
+#           deliberate, temporary local probe only.
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -91,6 +98,67 @@ if [[ -n "$src_offenders" ]]; then
   printf '%s\n' "$src_offenders" | sed 's/^/      /'
 else
   note "✓ no source resolver reconstructs ~/.aberp/ (all via edition_data_dirname)"
+fi
+
+# ── CHECK 4 — edition own write/checkpoint path (ENFORCED · chunk 3) ──────
+# Chunk 3 landed the edition-scoped snapshot/restore + DuckDB write path:
+#   (a) snapshots go to an edition-scoped, prod-refusing store;
+#   (b) the deferred crash-safe durable-checkpoint fix (ADR-0082) lives in a
+#       dedicated module wired into the snapshot crate and clean shutdown;
+#   (c) boot reconcile refuses (never silently truncates) a mirror that is
+#       AHEAD of the DB, preserving the recovery evidence first.
+# This check proves all three stay in place.
+echo "[CHECK 4] edition own write/checkpoint path — snapshot store, crash-safe checkpoint, reconcile safety (ENFORCED)"
+enforce4="${ENFORCE_CHUNK3_INVARIANTS:-1}"
+flag4() { note "$1"; if [[ "$enforce4" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+has() { grep -q -- "$2" "$1" 2>/dev/null; }
+
+# 4a — crash-safe durable checkpoint module present + wired.
+cs="crates/aberp-snapshot/src/crash_safe.rs"
+if [[ -f "$cs" ]] && has "$cs" 'pub fn durable_checkpoint' && has "$cs" 'fn atomic_install' \
+   && has "$cs" 'fn fsync_dir' \
+   && has crates/aberp-snapshot/src/lib.rs 'mod crash_safe;' \
+   && has crates/aberp-snapshot/src/lib.rs 'durable_checkpoint'; then
+  note "✓ crash-safe durable checkpoint module present + exported (atomic rename + fsync file&dir)"
+else
+  flag4 "✗ crash-safe checkpoint module missing/unwired (crash_safe.rs + lib.rs mod/export)"
+fi
+
+# 4b — clean-shutdown durable checkpoint wired into serve.
+if has apps/aberp/src/snapshot.rs 'fn checkpoint_on_clean_shutdown' \
+   && has apps/aberp/src/serve.rs 'checkpoint_on_clean_shutdown('; then
+  note "✓ clean-shutdown durable checkpoint wired (snapshot.rs + serve.rs)"
+else
+  flag4 "✗ clean-shutdown checkpoint not wired into serve"
+fi
+
+# 4c — snapshot store is edition-scoped + prod-refusing.
+if has crates/aberp-snapshot/src/store.rs 'pub fn edition_store_dir' \
+   && has crates/aberp-snapshot/src/take.rs 'pub fn ensure_not_prod_path' \
+   && has apps/aberp/src/snapshot.rs 'edition_store_segment()' \
+   && has apps/aberp/src/snapshot.rs 'ensure_not_prod_path'; then
+  note "✓ snapshot store edition-scoped + prod-refusing (edition_store_dir + ensure_not_prod_path)"
+else
+  flag4 "✗ snapshot store not edition-scoped/prod-refusing"
+fi
+
+# 4d — the binary's store resolver no longer reaches prod's bare store.
+if has apps/aberp/src/snapshot.rs 'default_store_dir'; then
+  flag4 "✗ snapshot.rs still calls default_store_dir (prod-shaped store) — must use edition_store_dir"
+else
+  note "✓ binary store resolver uses only the edition-scoped store (no default_store_dir)"
+fi
+
+# 4e — reconcile safety: ahead mirror preserved + refused, never truncated.
+mir="crates/audit-ledger/src/mirror.rs"
+if grep -q 'RecoveryAction::Truncated' "$mir" 2>/dev/null; then
+  flag4 "✗ mirror.rs still has the silent-truncate path (RecoveryAction::Truncated)"
+elif has crates/audit-ledger/src/error.rs 'MirrorAheadOfDb' \
+     && has "$mir" 'fn preserve_ahead_mirror' \
+     && has apps/aberp/src/serve.rs 'MirrorAheadOfDb'; then
+  note "✓ reconcile safety: ahead mirror preserved + refused (MirrorAheadOfDb), boot refuses; no auto-truncate"
+else
+  flag4 "✗ reconcile safety incomplete (need MirrorAheadOfDb + preserve_ahead_mirror + serve refuse, and NO Truncated)"
 fi
 
 echo

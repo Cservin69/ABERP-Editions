@@ -26,14 +26,14 @@ pub struct ValidationReport {
 /// Single-quote a path for embedding in a DuckDB SQL string, doubling any
 /// embedded single quote. Tenant DB paths never contain quotes in
 /// practice, but escaping is cheap and removes the foot-gun.
-fn sql_quote(path: &Path) -> String {
+pub(crate) fn sql_quote(path: &Path) -> String {
     let s = path.to_string_lossy().replace('\'', "''");
     format!("'{s}'")
 }
 
 /// Hex SHA-256 of a file's bytes. Reads the whole file into memory — fine
 /// at tenant scale (S393 `copy_atomic` does the same).
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).map_err(|e| SnapshotError::io(path, e))?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
@@ -218,9 +218,17 @@ pub fn ensure_restore_allowed(target: &Path, confirm: bool) -> Result<()> {
         ));
     }
     let abs = absolutise(target);
-    if path_is_under_aberp_home(&abs) {
+    // Chunk 3 / ADR-0093 — explicit FROZEN-prod refusal FIRST, with a
+    // prod-named message: a restore can never target prod's DB root or
+    // prod's snapshot store, however the path arrived.
+    ensure_not_prod_path(&abs)?;
+    // ADR-0082 — never restore directly onto ANY live `~/.aberp*` tenant
+    // home (prod OR this edition's own): restore to a side path, stop
+    // `aberp serve`, then swap the file in. Intentional friction on the one
+    // irreversible operation.
+    if path_is_under_live_db_home(&abs) {
         return Err(SnapshotError::RestoreRefused(format!(
-            "target {} is under a live ~/.aberp tenant home — restore to a side path, \
+            "target {} is under a live ~/.aberp* tenant home — restore to a side path, \
              stop `aberp serve`, then swap the file in manually. \
              Magyarul: ne állíts vissza közvetlenül az éles adatbázisra.",
             abs.display()
@@ -241,11 +249,68 @@ fn absolutise(path: &Path) -> PathBuf {
     }
 }
 
-/// True if any component of `path` is `.aberp` — i.e. it lives under a live
-/// tenant home. Broader than matching only `prod` on purpose: no live
-/// tenant DB should ever be a restore target.
-fn path_is_under_aberp_home(path: &Path) -> bool {
-    path.components().any(|c| c.as_os_str() == ".aberp")
+/// Path component naming the FROZEN prod line's live DB root
+/// (`~/.aberp/…`, including `~/.aberp/prod/aberp.duckdb`).
+const PROD_DB_ROOT_COMPONENT: &str = ".aberp";
+/// Path component naming the FROZEN prod line's snapshot store
+/// (`~/Documents/ABERP-snapshots/…`). The edition stores
+/// `ABERP-snapshots-defense` / `-portable` are DIFFERENT components.
+const PROD_SNAPSHOT_STORE_COMPONENT: &str = "ABERP-snapshots";
+
+/// True if any component of `path` equals `name` exactly.
+fn path_has_component(path: &Path, name: &str) -> bool {
+    path.components().any(|c| c.as_os_str() == name)
+}
+
+/// True if any component of `path` starts with `.aberp` — i.e. it lives
+/// under SOME live DB home: prod's `.aberp`, or an edition's
+/// `.aberp-defense` / `.aberp-portable`. Broadened in chunk 3 from the
+/// prod-only check so an editions build also refuses to restore directly
+/// onto its OWN live tenant DB (ADR-0082: restore to a side path, then
+/// swap — never clobber a live file in place).
+fn path_is_under_live_db_home(path: &Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.starts_with(".aberp"))
+    })
+}
+
+/// Refuse any path that belongs to the FROZEN PROD line (ADR-0093). This is
+/// the mechanical guarantee that an editions build can never snapshot, list,
+/// prune, or restore prod — called by the binary on every snapshot source
+/// DB, store dir, and restore target. Two prod surfaces are refused:
+///
+///   - **prod's live DB root** — any path under `~/.aberp/` (a component
+///     exactly `.aberp`), which includes `~/.aberp/prod/aberp.duckdb`. The
+///     edition roots `.aberp-defense` / `.aberp-portable` are different
+///     components and are NOT refused here.
+///   - **prod's snapshot store** — any path under
+///     `~/Documents/ABERP-snapshots/` (a component exactly
+///     `ABERP-snapshots`). The edition stores `ABERP-snapshots-defense` /
+///     `-portable` are different components and are allowed.
+///
+/// Pure and total, so it is cheap to call on every operation.
+pub fn ensure_not_prod_path(path: &Path) -> Result<()> {
+    let abs = absolutise(path);
+    if path_has_component(&abs, PROD_DB_ROOT_COMPONENT) {
+        return Err(SnapshotError::RestoreRefused(format!(
+            "path {} is under the FROZEN prod DB root ~/.aberp/ — an editions build must \
+             never read, snapshot, or restore the prod line. \
+             Magyarul: az éles ~/.aberp/ tilos az editions buildnek.",
+            abs.display()
+        )));
+    }
+    if path_has_component(&abs, PROD_SNAPSHOT_STORE_COMPONENT) {
+        return Err(SnapshotError::RestoreRefused(format!(
+            "path {} is under prod's snapshot store ~/Documents/{}/ — an editions build \
+             snapshots only to its own ~/Documents/ABERP-snapshots-<edition>/ store \
+             (ADR-0093).",
+            abs.display(),
+            PROD_SNAPSHOT_STORE_COMPONENT
+        )));
+    }
+    Ok(())
 }
 
 /// Restore a snapshot directory into `target` via `IMPORT DATABASE`, then

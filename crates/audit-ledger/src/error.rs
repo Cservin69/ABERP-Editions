@@ -87,6 +87,29 @@ pub enum AppendError {
     #[error("audit-ledger mirror I/O error: {0}")]
     MirrorIo(#[source] std::io::Error),
 
+    /// ADR-0093 chunk 3 / ADR-0082 reconcile safety — at boot the audit
+    /// mirror (`<db>.audit.log`) was found AHEAD of the DB (its max seq is
+    /// greater than the DB's). This is the fingerprint of a torn-write /
+    /// lost-commit on the DB side (the 2026-06-22 corruption class), or a
+    /// dev DB-nuke. The editions tree REFUSES to silently auto-truncate the
+    /// ahead mirror (that would destroy the only surviving record of what
+    /// the DB lost); the ahead mirror is first PRESERVED to a side file and
+    /// boot surfaces this so a human investigates before anything is
+    /// rebuilt. Recovery: inspect `preserved`, restore the DB from the
+    /// newest valid snapshot if a commit was truly lost, or (for an
+    /// intentional dev-nuke) move the stale mirror aside and re-run.
+    #[error(
+        "audit-ledger mirror is AHEAD of the DB (mirror seq {mirror_max_seq} > DB seq \
+         {db_max_seq}); refusing to auto-truncate — the ahead mirror was preserved to \
+         {preserved}. Investigate (possible lost DB commit) before re-running. \
+         Magyarul: a napló-tükör előrébb tart a DB-nél; nem csonkítom, először vizsgáld ki."
+    )]
+    MirrorAheadOfDb {
+        mirror_max_seq: u64,
+        db_max_seq: u64,
+        preserved: String,
+    },
+
     /// S441 / ADR-0087 — a non-network timestamp-authority failure while
     /// taking an anchor. A *network* TSA failure NEVER reaches this
     /// variant: it queues a `pending` anchor instead (`take_anchor` never

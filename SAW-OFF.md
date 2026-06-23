@@ -54,9 +54,17 @@ git -C <original-ABERP> rev-parse 'origin/PROD_v2.27.76^{tree}'
    `apps/aberp/tests/edition_db_isolation.rs` + `build_profile`/`tenant_registry`
    units; `run_defense.sh`/`run_portable.sh` (+ upgraders) repointed to the
    sibling roots; cut-gate CHECK 3 flipped to **ENFORCED**
-   (`ENFORCE_EDITION_DB_BINDING=1`, hardened 4 ways). ✅ **(this chunk)**
-3. **Own write/checkpoint path** — edition-scoped `crates/aberp-snapshot` +
-   DuckDB write path; extend `ensure_restore_allowed` to refuse `~/.aberp/prod`.
+   (`ENFORCE_EDITION_DB_BINDING=1`, hardened 4 ways). ✅
+3. **Own write/checkpoint path** — edition-scoped `crates/aberp-snapshot`
+   (snapshots go to `~/Documents/ABERP-snapshots-<edition>/`, never prod's
+   bare store) + the deferred **crash-safe durable-checkpoint** fix (ADR-0082)
+   as a dedicated `crash_safe` module (atomic build-aside + `rename(2)` +
+   `fsync` of file *and* parent dir, reusing DuckDB's own corruption-free
+   logical `EXPORT`/`IMPORT`) wired into the snapshot crate + a clean-shutdown
+   checkpoint; `ensure_not_prod_path` refuses any prod path on every
+   snapshot/restore; and **reconcile safety** — boot no longer silently
+   truncates a mirror AHEAD of the DB (it preserves the ahead mirror + refuses
+   so a lost-commit isn't erased). Cut-gate CHECK 4 added (ENFORCED). ✅ **(this chunk)**
 4. **Cut-gate / CI hardening** — full ADR-0002 DB-isolation enforcement.
 5. **Publish** — create GitHub repo(s), push (auth-gated; stop on PAT
    failure), confirm original repo frozen at `v2.27.76`.
@@ -93,3 +101,43 @@ the Mac (mirror `.github/workflows/ci.yml`):
 (the Defense arm) — this exercises `apps/aberp/tests/edition_db_isolation.rs`
 and the updated `serve_tenant_feature_guard.rs`. The code is complete and
 committed; do not treat the deferred build as green until that run is clean.
+
+**Chunk 3 gating note (2026-06-23).** Chunk 3 lands the edition-scoped
+snapshot/restore + write path, the crash-safe durable-checkpoint fix
+(ADR-0082), and reconcile safety. The Rust toolchain (rustup 1.96.0 +
+rustfmt + clippy) was installed and used. **Verified green in-session:**
+`rustfmt --check` over all 12 edited source + test files; the **ENFORCED**
+DB-isolation cut-gate `tools/cut_gate_db_isolation.sh` (now CHECK 1–4) PASS,
+plus two fresh negative probes confirming the new **CHECK 4** *fails* when a
+silent-truncate path (`RecoveryAction::Truncated`) is re-introduced and when
+the binary store resolver falls back to prod's `default_store_dir`; `bash -n`
+on the cut-gate; and standalone `rustc --test` of the FAITHFUL core logic for
+the durability + reconcile + edition-isolation changes — **11/11** (5
+crash-safe COMMIT tests: atomic rename + WAL-clear + verified-good marker
+currency + the crash-before-rename-leaves-old-good-DB property; 3 reconcile
+tests: ahead → preserve+refuse leaving the mirror intact, behind → extend,
+equal → unchanged; 3 edition path-isolation tests across BOTH the Defense and
+Portable arms: store edition-scoped + disjoint from prod, `ensure_not_prod_path`
+refuses prod DB root + prod store while allowing edition roots/stores) — plus
+`clippy-driver -D warnings` clean on all three extracts. **Deferred to Ervin's
+Mac (honest, NOT green here):** the full bundled-DuckDB build/clippy/test and
+the Tauri UI — the same constraints as chunk 2 (bundled DuckDB is one ~8-min
+C++ unit; the sandbox kills work at ~45 s boundaries, 4 GB no-swap; `aberp-ui`
+needs webkit2gtk). In particular the DuckDB-backed crash-injection integration
+tests CANNOT run here. Run on the Mac (mirror `.github/workflows/ci.yml`),
+for BOTH edition arms (default + `--features production`):
+
+```
+cargo build --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+# the new chunk-3 tests specifically (bundled DuckDB + binary wiring):
+cargo test -p aberp-snapshot --test crash_safe_checkpoint_tests   # durable_checkpoint round-trip / refuse-corrupt / repeatable
+cargo test -p aberp-snapshot --test edition_isolation_tests        # edition_store_dir disjoint + ensure_not_prod_path
+cargo test -p aberp-audit-ledger ensure_consistent_refuses_and_preserves_when_mirror_ahead_of_db
+cargo test -p aberp --test edition_snapshot_isolation              # resolve_store edition-scoped + refuses prod --store
+# then repeat the three --workspace commands with --features production (Defense arm)
+```
+
+The code is complete and committed; do not treat the deferred bundled-DuckDB
+build/tests as green until that run is clean on the Mac.
