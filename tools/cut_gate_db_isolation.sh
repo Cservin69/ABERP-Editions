@@ -26,6 +26,22 @@
 #           AHEAD of the DB is preserved + refused, never silently
 #           truncated). ENFORCE_CHUNK3_INVARIANTS=0 disables it for a
 #           deliberate, temporary local probe only.
+#   CHECK 5 (chunk 4, ENFORCED) — durable checkpoint is build-aside +
+#           atomic rename (rename(2) + fsync of file & parent dir), never an
+#           in-place rewrite of the live DB. ENFORCE_CHECKPOINT_ATOMIC=0
+#           disables it for a deliberate, temporary local probe only.
+#   CHECK 6 (chunk 4, ENFORCED) — no editions BINARY source resolves prod's
+#           bare snapshot store ~/Documents/ABERP-snapshots/ (the
+#           default_store_dir resolver or the bare component); editions use
+#           ABERP-snapshots-<edition>. ENFORCE_SNAPSHOT_STORE_ISOLATION=0
+#           disables it.
+#   CHECK 7 (chunk 4, ENFORCED) — edition launchers bind a single MATCHING
+#           root; arms don't cross (a --features production launcher binds
+#           .aberp-defense, never the sibling/prod root).
+#           ENFORCE_LAUNCHER_ARM_MATCH=0 disables it.
+#
+# Negative probes for the CHECKs live in tools/cut_gate_negative_probes.sh
+# (each plants a violation in a throwaway copy and asserts the gate FAILS).
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -160,6 +176,102 @@ elif has crates/audit-ledger/src/error.rs 'MirrorAheadOfDb' \
 else
   flag4 "✗ reconcile safety incomplete (need MirrorAheadOfDb + preserve_ahead_mirror + serve refuse, and NO Truncated)"
 fi
+
+# ── CHECK 5 — durable checkpoint = build-aside + atomic rename, never an
+#    in-place rewrite of the live DB (ENFORCED · chunk 4) ──────────────────
+# ADR-0082: the corruption being fixed is an IN-PLACE WAL-fold that tears the
+# live *.duckdb. The fix MUST build a fresh, self-contained staging file and
+# swap it over the live path with a single rename(2) (+ fsync of file AND
+# parent dir). CHECK 4a only proves the symbols exist; this proves the COMMIT
+# stays swap-based and can never regress to overwriting the live file in place.
+echo "[CHECK 5] durable checkpoint = build-aside + atomic rename (no in-place live-file rewrite, ENFORCED)"
+enforce5="${ENFORCE_CHECKPOINT_ATOMIC:-1}"
+flag5() { note "$1"; if [[ "$enforce5" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+hasF() { grep -qF -- "$2" "$1" 2>/dev/null; }
+cs="crates/aberp-snapshot/src/crash_safe.rs"
+if [[ ! -f "$cs" ]]; then
+  flag5 "✗ crash_safe.rs missing — the durable-checkpoint primitive is gone"
+else
+  if hasF "$cs" 'std::fs::rename(staged, target)'; then
+    note "✓ atomic_install swaps via std::fs::rename(staged, target) (all-or-nothing)"
+  else
+    flag5 "✗ atomic_install no longer swaps via std::fs::rename(staged, target) — an in-place copy/overwrite would tear the live DB"
+  fi
+  if hasF "$cs" 'atomic_install(&staging, db_path)' && hasF "$cs" 'Connection::open(&staging)'; then
+    note "✓ durable_checkpoint imports into a PRIVATE staging DB and installs it via atomic_install (never the live file)"
+  else
+    flag5 "✗ durable_checkpoint must build a private staging DB (Connection::open(&staging)) and commit via atomic_install(&staging, db_path)"
+  fi
+  if hasF "$cs" 'fsync_dir(parent)'; then
+    note "✓ the rename is made durable (parent-directory fsync)"
+  else
+    flag5 "✗ atomic_install no longer fsyncs the parent dir after rename — the swap is not crash-durable"
+  fi
+fi
+
+# ── CHECK 6 — no editions binary source resolves prod's bare snapshot store
+#    ~/Documents/ABERP-snapshots/ (ENFORCED · chunk 4) ─────────────────────
+# ADR-0093 §5: snapshots are edition-scoped (ABERP-snapshots-<edition>). The
+# prod-shaped resolver default_store_dir() and the bare "ABERP-snapshots"
+# component must never be reached from an editions BINARY. CHECK 4d guards
+# snapshot.rs alone; this generalizes the ban to the whole binary so a NEW
+# source file cannot regress, and bans the bare-path construction directly.
+echo "[CHECK 6] no editions binary source resolves prod's bare snapshot store ~/Documents/ABERP-snapshots/ (ENFORCED)"
+enforce6="${ENFORCE_SNAPSHOT_STORE_ISOLATION:-1}"
+flag6() { note "$1"; if [[ "$enforce6" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+calls="$(grep -rnF 'default_store_dir(' apps/aberp/src 2>/dev/null || true)"
+if [[ -n "$calls" ]]; then
+  flag6 "✗ binary source calls prod-shaped default_store_dir() — must use edition_store_dir():"
+  printf '%s\n' "$calls" | sed 's/^/      /'
+else
+  note "✓ no binary source calls default_store_dir() (edition_store_dir only)"
+fi
+bare="$(grep -rnF '.join("ABERP-snapshots")' apps/aberp/src 2>/dev/null || true)"
+if [[ -n "$bare" ]]; then
+  flag6 '✗ binary source builds the bare prod snapshot path .join("ABERP-snapshots") (edition form is ABERP-snapshots-<seg>):'
+  printf '%s\n' "$bare" | sed 's/^/      /'
+else
+  note "✓ no binary source builds the bare ~/Documents/ABERP-snapshots/ path"
+fi
+
+# ── CHECK 7 — edition launchers bind a single MATCHING root; arms don't
+#    cross (ENFORCED · chunk 4) ────────────────────────────────────────────
+# CHECK 3b proves each named launcher binds ITS OWN root; it does NOT prove a
+# launcher avoids the SIBLING's root, nor that a launcher that ACTUALLY builds
+# the production (Defense) arm binds .aberp-defense. This catches a
+# mismatched/rogue launcher (e.g. a new Defense launcher that boots
+# `--features production` but points at .aberp-portable or prod). Comment lines
+# are ignored — only real bindings / build invocations count.
+echo "[CHECK 7] edition launchers bind a single matching root — arms don't cross (ENFORCED)"
+enforce7="${ENFORCE_LAUNCHER_ARM_MATCH:-1}"
+flag7() { note "$1"; if [[ "$enforce7" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+ncgrep() { grep -nE "$1" "$2" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' || true; }
+sibling_check() {  # $1 launcher  $2 own-regex  $3 sibling-regex  $4 own-label  $5 sibling-label
+  if [[ ! -f "$1" ]]; then flag7 "✗ missing launcher: $1"; return; fi
+  [[ -z "$(ncgrep "$2" "$1")" ]] && flag7 "✗ $(basename "$1") does not bind its own root ($4)"
+  local cross; cross="$(ncgrep "$3" "$1")"
+  if [[ -n "$cross" ]]; then
+    flag7 "✗ $(basename "$1") binds the SIBLING root ($5) — arms crossed:"
+    printf '%s\n' "$cross" | sed 's/^/      /'
+  else
+    note "✓ $(basename "$1") binds only $4"
+  fi
+}
+sibling_check run/run_defense.sh      '\.aberp-defense'  '\.aberp-portable' ".aberp-defense"  ".aberp-portable"
+sibling_check run/upgrade_defense.sh  '\.aberp-defense'  '\.aberp-portable' ".aberp-defense"  ".aberp-portable"
+sibling_check run/run_portable.sh     '\.aberp-portable' '\.aberp-defense'  ".aberp-portable" ".aberp-defense"
+sibling_check run/upgrade_portable.sh '\.aberp-portable' '\.aberp-defense'  ".aberp-portable" ".aberp-defense"
+for f in run/*.sh; do
+  [[ -f "$f" ]] || continue
+  if [[ -n "$(ncgrep 'cargo (build|run).*--features production.*--bin aberp' "$f")" ]]; then
+    [[ -z "$(ncgrep '\.aberp-defense' "$f")" ]] && flag7 "✗ $(basename "$f") builds the production (Defense) arm but never binds .aberp-defense"
+    wrong="$(ncgrep '\.aberp-portable|/\.aberp/prod' "$f")"
+    if [[ -n "$wrong" ]]; then
+      flag7 "✗ $(basename "$f") builds the production (Defense) arm but binds a non-defense root:"
+      printf '%s\n' "$wrong" | sed 's/^/      /'
+    fi
+  fi
+done
 
 echo
 if [[ "$fail" -ne 0 ]]; then echo "CUT-GATE: ✗ FAILED"; exit 1; fi
