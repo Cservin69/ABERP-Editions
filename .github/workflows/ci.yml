@@ -1,17 +1,24 @@
-# ABERP continuous integration.
+# ABERP — Editions tree CI (Portable + Defense), ADR-0093 saw-off.
 #
-# Per ADR-0007 section "Supply chain":
-#   - cargo-deny (license allow-list, banned crates, advisory check)
-#   - cargo-audit (RustSec advisories on locked deps)
-#   - pinned dependency versions, --locked builds
+# This is the FULL-TOOLCHAIN gate that chunks 1–3 honestly DEFERRED to a
+# machine with Rust+Tauri (the sandbox could not compile bundled DuckDB's
+# ~8-min C++ amalgamation unit or link webkit2gtk). It exercises the whole
+# workspace — build, test, clippy, fmt, supply-chain — for BOTH edition arms:
 #
-# Per ADR-0021 sub-decisions:
-#   - rust-toolchain.toml pins 1.85.0 (MSRV floor)
+#   • Portable  = default features        (dev-profile, NAV-off, demo tenant)
+#   • Defense   = --features production    (real-NAV production build)
 #
-# The job is intentionally a single sequence rather than a matrix or a
-# parallel fan-out. CLAUDE.md rule 2 (simplicity first) — fan-out adds
-# duplicate toolchain setup and a cache topology to manage, neither of
-# which is justified until CI duration becomes painful.
+# and runs the ADR-0093/0002 DB-isolation cut-gate (+ its negative probes) as
+# a fast fail-fast BEFORE the heavy build, so an isolation regression goes red
+# in seconds rather than after the 8-min DuckDB compile.
+#
+# Per ADR-0007 "Supply chain": cargo-deny + cargo-audit on --locked deps.
+# Per ADR-0001/0021: the toolchain is the pinned stable CHANNEL declared in
+# rust-toolchain.toml — the MSRV floor lives in each Cargo.toml's
+# `rust-version`, and Cargo.lock is the load-bearing reproducibility pin. CI
+# installs dtolnay/rust-toolchain@stable to MATCH that channel pin rather than
+# hard-coding a version here (which would fight the repo's deliberate ADR-0001
+# decision to pin the channel, not a version).
 
 name: ci
 
@@ -28,30 +35,54 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # CI is non-interactive; surface failures verbosely.
   CARGO_NET_RETRY: 3
   RUSTUP_MAX_RETRIES: 3
 
 jobs:
-  check:
-    name: build + lint + supply-chain
+  workspace:
+    name: ${{ matrix.edition }} · build + lint + test
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    strategy:
+      # Run both arms to completion — a Portable failure must not hide a
+      # Defense failure (or vice versa).
+      fail-fast: false
+      matrix:
+        include:
+          - edition: portable
+            features: ""
+          - edition: defense
+            features: "--features production"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Tauri system dependencies (Linux only)
+      # ── Fail-fast DB-isolation gate (toolchain-free, ~seconds) ──────────
+      # Runs BEFORE the ~8-min build so an ADR-0093/0002 isolation regression
+      # (prod launch surface, cross-edition root, in-place checkpoint rewrite,
+      # prod snapshot store, crossed launcher arms) goes red immediately. The
+      # negative probes prove the gate itself still has teeth. Identical for
+      # both arms (static source check) — cheap enough to keep per-arm so each
+      # job is self-contained.
+      - name: ADR-0093 DB-isolation cut-gate (CHECK 1–7, all ENFORCED)
+        env:
+          ENFORCE_EDITION_DB_BINDING: "1"
+          ENFORCE_CHUNK3_INVARIANTS: "1"
+          ENFORCE_CHECKPOINT_ATOMIC: "1"
+          ENFORCE_SNAPSHOT_STORE_ISOLATION: "1"
+          ENFORCE_LAUNCHER_ARM_MATCH: "1"
+        run: bash tools/cut_gate_db_isolation.sh
+
+      - name: Cut-gate negative probes (prove the gate has teeth)
+        run: bash tools/cut_gate_negative_probes.sh
+
+      - name: Install Tauri system dependencies (Linux)
         # apps/aberp-ui pulls in the Tauri 2 runtime (`wry`, `tao`,
-        # `tauri-runtime-wry`, `webkit2gtk-sys`, etc.). On macOS those
-        # crates link against system frameworks (Cocoa/WebKit) that are
-        # always present; on Ubuntu they invoke `pkg-config` against
-        # webkit2gtk-4.1, gtk-3, libsoup-3.0, librsvg, and ayatana
-        # appindicator. Without these `-dev` packages installed the
-        # cargo build fails at the build-script / link stage of `wry`
-        # or `tao`. List mirrors the canonical Tauri 2 Ubuntu 22.04+
-        # prerequisites (https://tauri.app/start/prerequisites/).
+        # `webkit2gtk-sys`, …). On Ubuntu those invoke pkg-config against
+        # webkit2gtk-4.1, gtk-3, libsoup-3.0, librsvg, ayatana appindicator;
+        # without the -dev packages the `wry`/`tao` build-scripts fail at link.
+        # Mirrors the canonical Tauri 2 Ubuntu prerequisites.
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -67,16 +98,16 @@ jobs:
             libsoup-3.0-dev \
             libgtk-3-dev
 
-      - name: Install Rust stable (matches rust-toolchain.toml's channel pin)
+      - name: Install Rust stable (matches rust-toolchain.toml channel pin)
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - name: Install Node.js
-        # apps/aberp-ui embeds the Svelte SPA via Tauri's `generate_context!`
-        # macro, which reads `frontendDist=ui/dist` at compile time. Without
-        # a pre-built SPA bundle the macro panics and the whole workspace
-        # build fails. Node + npm ci + vite build must run BEFORE cargo.
+        # apps/aberp-ui embeds the Svelte SPA via Tauri's `generate_context!`,
+        # which reads `frontendDist=ui/dist` at compile time. Without a
+        # pre-built SPA the macro panics and the whole workspace build fails,
+        # so Node + npm ci + vite build must run BEFORE cargo.
         uses: actions/setup-node@v5
         with:
           node-version: '20'
@@ -90,11 +121,10 @@ jobs:
           npm run build
 
       - name: Install Python (matches python/aberp-cad-extract pyproject min)
-        # `crates/aberp-cad-extract-wrapper/tests/*` shell out to the
-        # Python CLI at `python/aberp-cad-extract`. Without `python -m
-        # aberp_cad_extract` importable, `extract_smoke` /
-        # `step_extract_smoke` / `error_paths` / `schema_version` all
-        # fail loud with "No module named aberp_cad_extract" (S303).
+        # crates/aberp-cad-extract-wrapper/tests/* shell out to the Python CLI
+        # at python/aberp-cad-extract. Without `python -m aberp_cad_extract`
+        # importable, extract_smoke / step_extract_smoke / error_paths /
+        # schema_version fail loud with "No module named aberp_cad_extract".
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
@@ -102,55 +132,72 @@ jobs:
           cache-dependency-path: python/aberp-cad-extract/pyproject.toml
 
       - name: Install aberp-cad-extract Python package (with [step] extra)
-        # The `[step]` extra pulls cadquery-ocp + cadquery-ocp-proxy +
-        # vtk (~70 MB total). Required by `step_extract_smoke.rs` for
-        # OCCT-backed STEP parsing (S292/PR-273). STL-only tests would
-        # work without it, but installing once covers both fixtures.
-        #
-        # `ABERP_TEST_PYTHON` must be an ABSOLUTE path or pwd-drift in
-        # the cargo test harness kills the error-path tests
-        # ([[cad-extract-wrapper-s270]] memory). `sys.executable` is
-        # always absolute, so use that instead of `which python`.
+        # The [step] extra pulls cadquery-ocp (+ proxy) + vtk, required by
+        # step_extract_smoke.rs for OCCT-backed STEP parsing. ABERP_TEST_PYTHON
+        # must be ABSOLUTE (pwd-drift in the test harness kills error-path
+        # tests); sys.executable is always absolute.
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e 'python/aberp-cad-extract[step]'
           echo "ABERP_TEST_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
 
-      - name: Cargo cache
+      - name: Cargo cache (per edition arm)
         uses: Swatinem/rust-cache@v2
         with:
-          # Keyed on Cargo.lock contents; busted automatically on dep changes.
-          shared-key: aberp-ci
+          # Portable (default) and Defense (--features production) produce
+          # DIFFERENT artifacts; one shared key would thrash and let the ~8-min
+          # bundled-DuckDB unit recompile every run. Per-arm key + Cargo.lock
+          # hash (added by the action) keeps each arm's cache warm.
+          shared-key: aberp-ci-${{ matrix.edition }}
 
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Build (--locked)
-        # --all-targets builds tests/benches/examples too, which catches
-        # compilation errors that would only show up later in test/clippy.
-        run: cargo build --workspace --locked --all-targets
+      - name: Build (${{ matrix.edition }}, --locked)
+        # --all-targets builds tests/benches/examples too, catching compile
+        # errors that would otherwise only surface later in test/clippy.
+        run: cargo build --workspace --locked --all-targets ${{ matrix.features }}
 
-      - name: Test (--locked)
-        run: cargo test --workspace --locked
+      - name: Test (${{ matrix.edition }}, --locked)
+        run: cargo test --workspace --locked ${{ matrix.features }}
 
-      - name: Clippy (warnings denied per ADR-0007 fail-loud posture)
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Edition-isolation + crash-safe integration tests (by name)
+        # Named explicitly (per SAW-OFF.md chunk-3 handoff) so they are visible
+        # in the CI log and exercised even if the --workspace set is ever
+        # narrowed. These are the bundled-DuckDB / wiring tests the sandbox
+        # could not run. The `production` feature exists only on the
+        # aberp / aberp-ui packages, so the edition-agnostic crate tests
+        # (aberp-snapshot, aberp-audit-ledger) run WITHOUT it.
+        run: |
+          cargo test -p aberp --test edition_db_isolation ${{ matrix.features }} --locked
+          cargo test -p aberp --test edition_snapshot_isolation ${{ matrix.features }} --locked
+          cargo test -p aberp-snapshot --test crash_safe_checkpoint_tests --locked
+          cargo test -p aberp-snapshot --test edition_isolation_tests --locked
+          cargo test -p aberp-audit-ledger ensure_consistent_refuses_and_preserves_when_mirror_ahead_of_db --locked
 
+      - name: Clippy (${{ matrix.edition }}, warnings denied per ADR-0007)
+        run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings
+
+      # ── Supply chain (arm-independent: operates on Cargo.lock) ──────────
+      # Run once, on the Portable arm, to avoid duplicating the advisory/
+      # license scan across both matrix jobs.
       - name: Install cargo-deny and cargo-audit
+        if: matrix.edition == 'portable'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny,cargo-audit
 
       - name: cargo-deny check
+        if: matrix.edition == 'portable'
         # Runs all sections: licenses, advisories, bans, sources.
         run: cargo deny check
 
       - name: cargo-audit
-        # --deny warnings makes "informational" advisories (e.g. unmaintained
-        # crates) failing-loud instead of advisory-only. The --ignore list
-        # mirrors `audit.toml` / `deny.toml::[advisories].ignore` because
-        # cargo-audit's audit.toml auto-discovery is inconsistent in CI
-        # (S303). Keep all three in lockstep when amending.
+        if: matrix.edition == 'portable'
+        # --deny warnings makes "informational" advisories failing-loud. The
+        # --ignore list mirrors audit.toml / deny.toml::[advisories].ignore
+        # because cargo-audit's audit.toml auto-discovery is inconsistent in
+        # CI. Keep all three in lockstep when amending.
         run: |
           cargo audit --deny warnings \
             --ignore RUSTSEC-2025-0075 --ignore RUSTSEC-2025-0080 \
