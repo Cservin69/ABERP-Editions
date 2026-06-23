@@ -68,6 +68,11 @@ git -C <original-ABERP> rev-parse 'origin/PROD_v2.27.76^{tree}'
 4. **Cut-gate / CI hardening** — full ADR-0002 DB-isolation enforcement. ✅ **(this chunk)**
 5. **Publish** — create GitHub repo(s), push (auth-gated; stop on PAT
    failure), confirm original repo frozen at `v2.27.76`.
+   🔸 **PREPARED — awaiting Ervin's authenticated run** (2026-06-23):
+   publish + branch-protection commands authored and statically validated
+   against the canonical bundle (`efb55f0`); the saved PAT is flagged
+   DEAD/COMPROMISED and was **not** used; the authenticated push runs on
+   Ervin's Mac under his own `gh`/git auth. See "Chunk 5 — publish status".
 
 ## Gating note
 
@@ -292,3 +297,51 @@ protection on `main`:
    head* (`14d0b06`) than the written-back bundle; the **bundle is canonical**.
    Chunk 5 must sync that checkout from the bundle before pushing and must not
    push the stale checkout.
+
+
+## Chunk 5 — publish status (PREPARED 2026-06-23, awaiting authenticated run)
+
+Publish is **PREPARED, not executed.** It is auth-gated; the authenticated
+push happens on Ervin's Mac under his own `gh`/git auth.
+
+**Done in-session (sandbox, no auth):**
+- Confirmed the **canonical bundle** head `efb55f0` (`git bundle verify` =
+  complete history) and cloned it **fresh** — the stale `14d0b06` working
+  checkout was **not** used.
+- Grep-confirmed the branch-protection required-check **contexts** equal the
+  actual workflow job `name:` values (byte-for-byte, incl. the U+00B7 `·`):
+  `ADR-0093 DB-isolation cut-gate` (`cut-gate.yml`),
+  `portable · build + lint + test` and `defense · build + lint + test`
+  (`ci.yml` matrix arms).
+- Verified every named integration-test target referenced by the consolidated
+  build+test block exists (`aberp --test edition_db_isolation` /
+  `edition_snapshot_isolation`; `aberp-snapshot --test crash_safe_checkpoint_tests`
+  / `edition_isolation_tests`; the `aberp-audit-ledger` mirror-ahead reconcile
+  `#[test]`), and that the `production` feature lives only on `aberp`/`aberp-ui`
+  (so the snapshot/audit-ledger tests run featureless).
+- `bash -n`-validated the publish block, the plain-git fallback, and the
+  consolidated build+test block; validated the branch-protection JSON body.
+
+**NOT done here (auth boundary — honest):** the GitHub repo creation, the
+`git push`, and the branch-protection API call. The saved PAT is flagged
+**DEAD/COMPROMISED** and was deliberately **not** used or echoed; Ervin
+authenticates with `gh auth login` and runs the prepared command block.
+
+### Commit-label reconciliation (resolves the chunk-4 provenance flag)
+
+Re-verified **read-only** in the prod repo this chunk. `PROD_v2.27.76` exists
+as **both** a branch and an **annotated tag**, and they reconcile cleanly:
+
+- `refs/remotes/origin/PROD_v2.27.76` (branch) → commit **`f7519b4…`**, tree
+  **`2d612811…`**.
+- `refs/tags/PROD_v2.27.76` (annotated tag) → tag-object **`079db9c…`**, which
+  **peels (`^{commit}`) to the same commit `f7519b4…`** (tree `2d612811…`).
+
+The chunk-4 flag — "the tag sits on a *different commit object* `079db9c…`" —
+was an **annotated-tag-object vs commit** conflation: `079db9c…` is the
+annotated tag's **wrapper object** SHA (what a bare `rev-parse PROD_v2.27.76`
+returns), **not** a commit. Peeled, it is `f7519b4…` — **exactly the SAW-OFF
+baseline commit**. Both refs carry the **identical tree `2d612811…`** (the
+content anchor). So there is **no commit-object discrepancy**: commit =
+`f7519b4…` (baseline) and content = `2d612811…` (baseline) ⇒ **prod untouched**.
+**No action taken on prod** (read-only verification only).
