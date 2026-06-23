@@ -151,6 +151,7 @@ record. Backfilled 2026-06-17. -->
 - [ADR-0090 — NCR / CAPA quality workflow](0090-ncr-capa-quality-workflow.md) — non-conformance + corrective-action state machines, open-NCR shipment gate, 24h Critical escalation (S439).
 - [ADR-0091 — Purchasing / purchase-order module](0091-purchasing-purchase-order-module.md) — AVL-gated POs (create + issue), receiving-failure → auto-NCR, heat-lot capture on defense lines; supersedes ADR-0068's deferred purchasing scope (S440).
 - [ADR-0092 — On-machine probe ingestion → QC](0092-on-machine-probe-ingestion-to-qc.md) — DMG MORI (MTConnect) / Renishaw probe → QC inspections → auto-NCR; manual entry ships, probe sources stubbed (S442 / S443).
+- [ADR-0093 — Product-line saw-off: Portable + Defense isolated from the frozen Prod tree](0093-product-line-sawoff-isolation.md) — saw the active Portable+Defense editions off the shared `main` trunk into their OWN separate repo (fork-with-history), leaving prod (`v2.27.76`) frozen + byte-for-byte untouched; one combined editions tree, own DB roots (`~/.aberp-defense`, `~/.aberp-portable`) + own write path so the deferred crash-safe-checkpoint fix never touches prod; satisfies ADR-0002 / FOUNDATION §2 at the product-line granularity; cut-gate `tools/cut_gate_db_isolation.sh` (S2026-06-23, auto-mode).
 
 ### Deferred (not yet filed — tracked so they don't fall through)
 
