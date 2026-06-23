@@ -1,10 +1,16 @@
-# ADR-0093 saw-off cut-gate — DB-isolation guardrail.
+# ADR-0093 saw-off cut-gate — DB-isolation guardrail (the REQUIRED check).
 #
 # Deliberately a standalone, toolchain-free job: it runs the bash cut-gate
-# (tools/cut_gate_db_isolation.sh) with nothing but a checkout, so it gates
-# fast and stays green independently of the heavy Rust+Tauri build in
-# ci.yml. Its sole job is to make the ADR-0002/ADR-0093 DB-isolation
-# mandate un-droppable at a product-line cut.
+# (tools/cut_gate_db_isolation.sh, CHECK 1–7) PLUS the negative-probe harness
+# with nothing but a checkout, so it gates in seconds and stays green
+# independently of the heavy Rust+Tauri build in ci.yml. Its sole job is to
+# make the ADR-0002/ADR-0093 DB-isolation mandate un-droppable at a
+# product-line cut.
+#
+# This is the workflow intended as the branch-protection REQUIRED status
+# check on the editions repo (see SAW-OFF.md → "Required status check (chunk
+# 5 wiring)"). Because it needs no toolchain it can be required without making
+# the gate hostage to an 8-minute build.
 name: cut-gate
 on:
   push:
@@ -21,10 +27,21 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
-      - name: Run DB-isolation cut-gate
-        # ADR-0093 chunk 2 — CHECK 3 is ENFORCED. The flag is explicit here
-        # as well as defaulted in the script, so the enforcement is visible
-        # at the CI surface and cannot be silently weakened by a script edit.
+
+      - name: Run DB-isolation cut-gate (CHECK 1–7, all ENFORCED)
+        # Every ENFORCE_* flag is explicit here as well as defaulted in the
+        # script, so enforcement is visible at the CI surface and cannot be
+        # silently weakened by a one-line script edit.
         env:
-          ENFORCE_EDITION_DB_BINDING: "1"
+          ENFORCE_EDITION_DB_BINDING: "1"        # CHECK 3 (chunk 2)
+          ENFORCE_CHUNK3_INVARIANTS: "1"         # CHECK 4 (chunk 3)
+          ENFORCE_CHECKPOINT_ATOMIC: "1"         # CHECK 5 (chunk 4)
+          ENFORCE_SNAPSHOT_STORE_ISOLATION: "1"  # CHECK 6 (chunk 4)
+          ENFORCE_LAUNCHER_ARM_MATCH: "1"        # CHECK 7 (chunk 4)
         run: bash tools/cut_gate_db_isolation.sh
+
+      - name: Prove the cut-gate has teeth (negative probes)
+        # Plants each invariant's violation in a throwaway copy and asserts the
+        # gate FAILS — so a green gate above is a meaningful signal, not a
+        # gate that can no longer go red.
+        run: bash tools/cut_gate_negative_probes.sh
