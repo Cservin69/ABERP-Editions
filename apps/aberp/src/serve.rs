@@ -1322,9 +1322,13 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // is now AHEAD of the fresh DB; pre-152b the first post-commit
     // `sync_mirror` 500'd ("mirror is ahead of DB"), skipping the NAV
     // XML write and cascading into a submit 500. Boot reconciliation
-    // truncates the ahead mirror back to the DB's max seq (and handles
-    // missing / behind / corrupt / hash-mismatch). Idempotent on a
-    // healthy state. Per-write `sync_mirror` still loud-fails on
+    // handles missing / behind / corrupt / hash-mismatch idempotently.
+    // CHUNK-3 RECONCILE SAFETY (ADR-0093 / ADR-0082): a mirror that is
+    // AHEAD of the DB is the fingerprint of a torn-write / lost DB commit
+    // (the 2026-06-22 corruption class). The editions tree NO LONGER
+    // silently truncates it (that destroyed recovery evidence) — it
+    // preserves the ahead mirror to a side file and REFUSES boot so a
+    // human investigates. Per-write `sync_mirror` still loud-fails on
     // mid-process divergence — that IS a runtime bug.
     tracing::info!("boot step: reconciling audit-ledger mirror with DB (idempotent recovery)");
     {
@@ -1338,9 +1342,25 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         aberp_audit_ledger::ensure_schema(&conn)
             .context("ensure audit-ledger schema at serve boot")?;
         let mirror_path = aberp_audit_ledger::mirror_path_for(&args.db);
-        let action = aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path)
-            .context("reconcile audit-ledger mirror with DB at serve boot")?;
-        tracing::info!(?action, "audit-ledger mirror reconciled at boot");
+        match aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path) {
+            Ok(action) => tracing::info!(?action, "audit-ledger mirror reconciled at boot"),
+            Err(e @ aberp_audit_ledger::AppendError::MirrorAheadOfDb { .. }) => {
+                // Refuse-and-surface: the ahead mirror has already been
+                // preserved inside `ensure_consistent_with_db`; we stop boot
+                // loudly rather than overwrite the evidence of a lost commit.
+                tracing::error!(
+                    error = %e,
+                    "REFUSING to boot — audit-ledger mirror is AHEAD of the DB"
+                );
+                return Err(anyhow::Error::new(e)).context(
+                    "audit-ledger mirror is AHEAD of the DB at boot (possible lost DB commit                      after a torn write). The ahead mirror was preserved to a side file;                      investigate before re-running. For an intentional dev DB-nuke, move the                      stale <db>.audit.log aside and re-run.",
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .context("reconcile audit-ledger mirror with DB at serve boot")
+            }
+        }
     }
 
     // S433 — self-heal the tenant registry with the running tenant and,
@@ -2825,6 +2845,16 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         let shutdown_result = coordinator.shutdown(timeout).await;
         log_shutdown_result(&shutdown_result);
         write_shutdown_audit_entry(&recovery_state, &trigger, &shutdown_result);
+
+        // ADR-0082 follow-up (chunk 3) — leave the live DB crash-safe on a
+        // CLEAN shutdown: fold the WAL into a fresh, verified-good file via
+        // an atomic swap so the next boot needs no in-place WAL replay (the
+        // path that historically tripped duckdb#23046). Best-effort; logged
+        // loud and never blocks process exit. Editions-tree only.
+        crate::snapshot::checkpoint_on_clean_shutdown(
+            recovery_state.db_path.as_path(),
+            recovery_state.tenant.as_str(),
+        );
 
         // S291 / PR-272 — best-effort delete of the runtime-discovery
         // file (brief D). A leaked file from a crash is harmless

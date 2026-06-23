@@ -45,14 +45,22 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+mod crash_safe;
 mod retention;
 mod store;
 mod take;
 
+pub use crash_safe::{
+    atomic_install, checkpoint_is_current, durable_checkpoint, marker_path, read_marker,
+    write_marker, CheckpointMarker, CheckpointReport,
+};
 pub use retention::{plan_retention, prune, RetentionPlan, RetentionPolicy};
-pub use store::{default_store_dir, find_snapshot, list_snapshots, SnapshotRecord};
+pub use store::{
+    default_store_dir, edition_store_dir, find_snapshot, list_snapshots, SnapshotRecord,
+};
 pub use take::{
-    ensure_restore_allowed, restore_into, take_snapshot, validate_export, ValidationReport,
+    ensure_not_prod_path, ensure_restore_allowed, restore_into, take_snapshot, validate_export,
+    ValidationReport,
 };
 
 /// Typed error surface for the snapshot subsystem. Library crate → no

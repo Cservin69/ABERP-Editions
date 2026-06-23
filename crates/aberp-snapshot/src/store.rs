@@ -40,15 +40,15 @@ impl SnapshotRecord {
     }
 }
 
-/// Resolve `~/Documents/ABERP-snapshots/<tenant>/`. Uses HOME / USERPROFILE
-/// directly (no `dirs` dep), keeping the store OUTSIDE the repo and OUTSIDE
-/// `~/.aberp/` — the same posture S393 used so a tenant reset or a restore
-/// never deletes the rollback copies.
-pub fn default_store_dir(tenant: &str) -> Result<PathBuf> {
-    let home = std::env::var("HOME")
+/// `$HOME` (or `$USERPROFILE` on Windows) as a `PathBuf`. Used by the store
+/// resolvers; no `dirs` dep. A missing/empty value is a loud error, never a
+/// silent fallback to `/` or the cwd.
+fn home_dir() -> Result<PathBuf> {
+    std::env::var("HOME")
         .ok()
         .filter(|h| !h.is_empty())
         .or_else(|| std::env::var("USERPROFILE").ok().filter(|p| !p.is_empty()))
+        .map(PathBuf::from)
         .ok_or_else(|| {
             SnapshotError::io(
                 PathBuf::from("$HOME"),
@@ -57,10 +57,47 @@ pub fn default_store_dir(tenant: &str) -> Result<PathBuf> {
                     "neither HOME nor USERPROFILE is set",
                 ),
             )
-        })?;
-    Ok(PathBuf::from(home)
+        })
+}
+
+/// Resolve `~/Documents/ABERP-snapshots/<tenant>/` — the FROZEN-PROD-shaped
+/// store. Kept OUTSIDE the repo and OUTSIDE `~/.aberp/` so a tenant reset or
+/// a restore never deletes the rollback copies (the S393/ADR-0082 posture).
+///
+/// The sawed-off editions tree does NOT use this for its own snapshots — it
+/// uses [`edition_store_dir`] so Defense and Portable get disjoint stores
+/// that can never share prod's. This resolver is retained as the
+/// prod-shaped default (and the surface the prod-refusal guard names).
+pub fn default_store_dir(tenant: &str) -> Result<PathBuf> {
+    Ok(home_dir()?
         .join("Documents")
         .join("ABERP-snapshots")
+        .join(sanitise_tenant(tenant)))
+}
+
+/// Resolve the EDITION-SCOPED snapshot store
+/// `~/Documents/ABERP-snapshots-<edition>/<tenant>/` (ADR-0093 §5).
+///
+/// `edition` is the lowercase edition segment (`"defense"` / `"portable"`),
+/// which the binary derives from the COMPILE-TIME
+/// `build_profile::edition_store_segment()` — never an env/launcher string
+/// (FOUNDATION §5). The resulting store is:
+///   - **provably disjoint from prod's** `~/Documents/ABERP-snapshots/`:
+///     `ABERP-snapshots-defense` / `ABERP-snapshots-portable` are sibling
+///     directories of `ABERP-snapshots`, so neither is nested under the
+///     other — an editions build can never take, list, prune, or restore
+///     from prod's store; and
+///   - kept OUTSIDE `~/.aberp*` (the live DB roots) exactly like
+///     [`default_store_dir`], so a tenant reset or a restore never deletes
+///     the rollback copies (ADR-0082).
+///
+/// `edition` is sanitised identically to `tenant`, so it can never inject a
+/// path separator or `..`.
+pub fn edition_store_dir(edition: &str, tenant: &str) -> Result<PathBuf> {
+    let seg = sanitise_tenant(edition);
+    Ok(home_dir()?
+        .join("Documents")
+        .join(format!("ABERP-snapshots-{seg}"))
         .join(sanitise_tenant(tenant)))
 }
 

@@ -29,9 +29,11 @@ use tokio_util::sync::CancellationToken;
 
 use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
 use aberp_snapshot::{
-    default_store_dir, ensure_restore_allowed, find_snapshot, list_snapshots, plan_retention,
-    prune, restore_into, take_snapshot, RetentionPolicy, SnapshotRecord,
+    edition_store_dir, ensure_not_prod_path, ensure_restore_allowed, find_snapshot, list_snapshots,
+    plan_retention, prune, restore_into, take_snapshot, RetentionPolicy, SnapshotRecord,
 };
+
+use crate::build_profile;
 
 use crate::audit_payloads::{
     SnapshotCreatedPayload, SnapshotPrunedPayload, SnapshotRestoredPayload,
@@ -50,17 +52,95 @@ const BOOT_DELAY_SECS: u64 = 60;
 /// HTTP "snapshot now" still work).
 pub const POLL_DISABLE_ENV: &str = "ABERP_SNAPSHOT_DISABLE";
 
+/// Env kill-switch for the clean-shutdown durable checkpoint (below).
+pub const CHECKPOINT_ON_SHUTDOWN_DISABLE_ENV: &str = "ABERP_CHECKPOINT_ON_SHUTDOWN_DISABLE";
+
+/// ADR-0082 follow-up (chunk 3) — on CLEAN shutdown, leave the live DB in a
+/// crash-safe, verified-good state. This is the serve-side half of the
+/// deferred crash-safe-checkpoint fix (the mechanism lives in
+/// [`aberp_snapshot::durable_checkpoint`]).
+///
+/// If a verified-good checkpoint already covers the current file (the
+/// `<db>.ckpt-ok` marker matches), this is a no-op; otherwise it takes ONE
+/// durable checkpoint so the WAL is folded into a fresh file via an atomic
+/// swap and the next boot needs no in-place `LoadCheckpoint`/`ReadIndex`
+/// replay (the path that historically tripped `duckdb#23046`, S332/S375).
+///
+/// Best-effort by contract: every failure is logged LOUD (CLAUDE.md #12)
+/// and swallowed — a checkpoint hiccup must NEVER wedge process exit (that
+/// was the original S213 bug). Editions-tree ONLY; it refuses to act on a
+/// prod path as defense-in-depth behind the compile-time edition binding.
+pub fn checkpoint_on_clean_shutdown(db_path: &Path, tenant: &str) {
+    let disabled = std::env::var(CHECKPOINT_ON_SHUTDOWN_DISABLE_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if disabled {
+        tracing::info!(
+            env = CHECKPOINT_ON_SHUTDOWN_DISABLE_ENV,
+            "clean-shutdown durable checkpoint disabled by env"
+        );
+        return;
+    }
+    // Never checkpoint a prod path (impossible in an editions build, but the
+    // guard makes "never touches prod" mechanical here too).
+    if let Err(e) = ensure_not_prod_path(db_path) {
+        tracing::error!(
+            error = %e,
+            "refusing clean-shutdown checkpoint on a prod path (unreachable in an editions build)"
+        );
+        return;
+    }
+    if !db_path.exists() {
+        tracing::debug!(db = %db_path.display(), "no DB file at shutdown; nothing to checkpoint");
+        return;
+    }
+    if aberp_snapshot::checkpoint_is_current(db_path) {
+        tracing::info!(
+            db = %db_path.display(),
+            "clean shutdown: a verified-good checkpoint already covers the DB; skipping"
+        );
+        return;
+    }
+    match aberp_snapshot::durable_checkpoint(db_path, tenant) {
+        Ok(rep) => tracing::info!(
+            db = %db_path.display(),
+            sha = %rep.sha256,
+            bytes = rep.byte_size,
+            "clean shutdown: crash-safe durable checkpoint installed (ADR-0082 chunk 3)"
+        ),
+        Err(e) => tracing::error!(
+            db = %db_path.display(),
+            error = %e,
+            "clean-shutdown durable checkpoint FAILED; live DB left untouched, periodic \
+             snapshots remain the recovery path (process exit continues)"
+        ),
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Configuration resolution
 // ──────────────────────────────────────────────────────────────────────
 
 /// Resolve the snapshot store directory: an explicit `--store` wins,
-/// otherwise the per-tenant default `~/Documents/ABERP-snapshots/<tenant>`.
+/// otherwise the EDITION-SCOPED default
+/// `~/Documents/ABERP-snapshots-<edition>/<tenant>` (ADR-0093 §5).
+///
+/// The default is derived from the COMPILE-TIME
+/// [`build_profile::edition_store_segment`] — never an env/launcher string —
+/// so Defense and Portable get disjoint stores that can never share prod's.
+/// Whichever store is chosen, it is refused if it points at the frozen prod
+/// line (prod's `~/.aberp/` or `~/Documents/ABERP-snapshots/`), so even a
+/// hand-passed `--store` can never reach prod.
 pub fn resolve_store(tenant: &str, explicit: Option<&Path>) -> Result<PathBuf> {
-    match explicit {
-        Some(p) => Ok(p.to_path_buf()),
-        None => default_store_dir(tenant).context("resolve default snapshot store dir"),
-    }
+    let store = match explicit {
+        Some(p) => p.to_path_buf(),
+        None => edition_store_dir(build_profile::edition_store_segment(), tenant)
+            .context("resolve edition-scoped snapshot store dir")?,
+    };
+    ensure_not_prod_path(&store).map_err(|e| {
+        anyhow::anyhow!("snapshot store must not be under the frozen prod line: {e}")
+    })?;
+    Ok(store)
 }
 
 /// Read the retention policy from the environment, falling back to the
@@ -123,6 +203,12 @@ pub fn take_and_emit(
     binary_hash: BinaryHash,
     actor: Actor,
 ) -> Result<SnapshotRecord> {
+    // ADR-0093 — an editions build never snapshots the frozen prod DB,
+    // however `--db` arrived (defense-in-depth behind the compile-time
+    // edition→root binding from chunk 2).
+    ensure_not_prod_path(db_path).map_err(|e| {
+        anyhow::anyhow!("snapshot source DB must not be under the frozen prod line: {e}")
+    })?;
     let now = OffsetDateTime::now_utc();
     let rec = take_snapshot(db_path, store_dir, tenant.as_str(), now)
         .with_context(|| format!("take snapshot of {}", db_path.display()))?;
@@ -239,6 +325,14 @@ pub fn restore_and_emit(
     binary_hash: BinaryHash,
     actor: Actor,
 ) -> Result<SnapshotRecord> {
+    // ADR-0093 — restore reads ONLY this edition's own store and never
+    // writes a prod-line audit DB.
+    ensure_not_prod_path(store_dir).map_err(|e| {
+        anyhow::anyhow!("restore source store must not be under the frozen prod line: {e}")
+    })?;
+    ensure_not_prod_path(db_path_for_audit).map_err(|e| {
+        anyhow::anyhow!("restore audit DB must not be under the frozen prod line: {e}")
+    })?;
     let rec = find_snapshot(store_dir, selector)
         .map_err(|e| anyhow::anyhow!("find snapshot '{selector}': {e}"))?;
     restore_into(&rec.dir, target, tenant.as_str())

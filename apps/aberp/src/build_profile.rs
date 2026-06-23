@@ -192,6 +192,20 @@ pub const fn edition_label() -> &'static str {
     }
 }
 
+/// Lowercase store segment for this edition (`"defense"` / `"portable"`) —
+/// the suffix the edition-scoped snapshot store joins under
+/// `~/Documents/ABERP-snapshots-<segment>/` (ADR-0093 §5: snapshot stores
+/// are likewise edition-scoped). Derived from the same compile-time
+/// [`EDITION`], never an env/launcher string (FOUNDATION §5), so an
+/// editions build can never silently share prod's `ABERP-snapshots/` store.
+pub const fn edition_store_segment() -> &'static str {
+    match EDITION {
+        Edition::Prod => "prod",
+        Edition::Defense => "defense",
+        Edition::Portable => "portable",
+    }
+}
+
 /// The data-root dir names this build must REFUSE to resolve or open —
 /// every edition's root except its own. For the editions tree this ALWAYS
 /// includes the frozen prod root (`.aberp`) plus the sibling edition's root,
