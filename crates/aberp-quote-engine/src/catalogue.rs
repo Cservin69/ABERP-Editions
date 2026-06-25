@@ -158,6 +158,21 @@ pub struct QuotingParameters {
     /// Extra setup minutes when the part routes to a 5-axis machine
     /// (report §5.5). Day-1 = 25.
     pub setup_5axis_min: f64,
+    /// Largest bar-stock diameter (mm) the shop's bar-fed Swiss/turn-mill
+    /// accepts. A turned/round blank with `od <= bar_capacity_mm` routes to
+    /// the lights-out [`crate::MachineFamily::SwissTurnMill`]; a larger round
+    /// routes to [`crate::MachineFamily::TurnMill`] (ADR-0094 Gap 2 routing).
+    /// `#[serde(default)]` (32.0) so pre-ADR-0094 `quoting_parameters` rows
+    /// that lack the column still deserialize and price exactly as today.
+    #[serde(default = "default_bar_capacity_mm")]
+    pub bar_capacity_mm: f64,
+}
+
+/// Serde default for [`QuotingParameters::bar_capacity_mm`] — pre-ADR-0094
+/// persisted parameter rows predate the column. 32 mm is a common bar-feeder
+/// capacity (ADR-0094 Gap 2 proposed default).
+fn default_bar_capacity_mm() -> f64 {
+    32.0
 }
 
 /// A row from `quoting_stock_adjustments` (S267) — ±% price tweak
@@ -171,4 +186,31 @@ pub struct StockAdjustment {
     pub stock_status: String,
     /// Signed fractional adjustment: 0.10 = +10%, -0.05 = -5%.
     pub price_adjustment_pct: f64,
+}
+
+/// A row from the `quoting_machine_rates` catalogue table (ADR-0094 Gap 2,
+/// wired in S4). Keyed by [`crate::MachineFamily`] (via its `as_db_str`
+/// round-trip), it attaches the family's true EUR/min to the engine so a
+/// bar-fed Swiss running lights-out can price a small turned part below an
+/// attended 3-axis mill. Mirrors the snapshot shape of the other catalogue
+/// rows: the wiring layer reads the DB table, the engine treats
+/// `&[MachineRate]` as an immutable input. An **empty** slice (or no row for
+/// the routed family) ⇒ the engine falls back to the global
+/// [`QuotingParameters::machining_rate_eur_per_minute`] — byte-identical to
+/// pre-ADR-0094 pricing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MachineRate {
+    /// Matches [`crate::MachineFamily::as_db_str`] (e.g. `"swiss-turn-mill"`).
+    pub family: String,
+    /// The family's attended EUR/min — the rate when a dedicated operator
+    /// tends the machine.
+    pub attended_rate_eur_per_min: f64,
+    /// Multiplier in (0, 1] applied to the attended rate when the job runs
+    /// unattended (lights-out): effective EUR/min = attended * this. Only
+    /// applied when `unattended_capable` AND the job qualifies (turned part
+    /// on bar stock at/above the setup-amortization quantity).
+    pub lights_out_factor: f64,
+    /// Whether this family can run unattended (bar-fed Swiss/turn-mill =
+    /// true; a manual mill = false).
+    pub unattended_capable: bool,
 }

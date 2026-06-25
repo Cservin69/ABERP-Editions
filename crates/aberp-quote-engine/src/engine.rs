@@ -11,7 +11,7 @@
 use crate::breakdown::QuoteBreakdown;
 use crate::capacity::MachineFamily;
 use crate::catalogue::{
-    ComplexityRule, Material, QuotingParameters, StockAdjustment, ToleranceMultiplier,
+    ComplexityRule, MachineRate, Material, QuotingParameters, StockAdjustment, ToleranceMultiplier,
 };
 use crate::error::QuoteError;
 use crate::feature_graph::{FeatureGraph, SizeBucket, StockForm, ToleranceRange};
@@ -142,6 +142,52 @@ pub fn quote_with_calibration(
     quantity: u32,
     target_tolerance: ToleranceRange,
     calibration: &crate::calibration::CalibrationTable,
+) -> Result<QuoteBreakdown, QuoteError> {
+    // ADR-0094 Gap 2: delegate to the shop-model superset with an EMPTY
+    // machine-rate slice ⇒ no family rate ⇒ the global flat rate is used ⇒
+    // output (numbers + reasoning_log) is byte-identical to pre-ADR-0094.
+    quote_with_shop_model(
+        feature_graph,
+        materials,
+        complexity_rules,
+        tolerance_multipliers,
+        stock_adjustments,
+        parameters,
+        quantity,
+        target_tolerance,
+        calibration,
+        &[],
+    )
+}
+
+/// S3 / ADR-0094 Gap 2 — the superset entry point. Identical to
+/// [`quote_with_calibration`] except it additionally accepts the shop's
+/// per-[`MachineFamily`] [`MachineRate`] snapshot. [`route_family`] picks the
+/// part's machine family from its geometry (turned/round stock within
+/// `bar_capacity_mm` ⇒ lights-out Swiss; larger round ⇒ turn-mill; prismatic
+/// ⇒ 3-axis; the 5-axis flag wins outright), and the machining minutes are
+/// costed at that family's effective EUR/min — `attended_rate ×
+/// lights_out_factor` when the family is `unattended_capable` and the job
+/// qualifies (turned bar stock at/above the setup-amortization quantity),
+/// otherwise the attended rate.
+///
+/// **Inert by default:** an empty `machine_rates` slice, or no row for the
+/// routed family, falls back to the global `machining_rate_eur_per_minute`
+/// and emits TODAY'S EXACT machining line (no extra reasoning line) — so
+/// every existing golden/determinism/branch/property number is unchanged.
+/// Still pure.
+#[allow(clippy::too_many_arguments)]
+pub fn quote_with_shop_model(
+    feature_graph: &FeatureGraph,
+    materials: &[Material],
+    complexity_rules: &[ComplexityRule],
+    tolerance_multipliers: &[ToleranceMultiplier],
+    stock_adjustments: &[StockAdjustment],
+    parameters: &QuotingParameters,
+    quantity: u32,
+    target_tolerance: ToleranceRange,
+    calibration: &crate::calibration::CalibrationTable,
+    machine_rates: &[MachineRate],
 ) -> Result<QuoteBreakdown, QuoteError> {
     // ── Pre-flight validation ─────────────────────────────────────
     if quantity == 0 {
@@ -431,7 +477,20 @@ pub fn quote_with_calibration(
     // and the lead-time projection all stay consistent. Neutral (1.0)
     // tables add no line and leave the value untouched: pre-calibration
     // pricing is byte-identical.
-    let calibration_family = MachineFamily::for_route(feature_graph.requires_5_axis);
+    // ── ADR-0094 Gap 2: route the part to a machine family ────────
+    // Geometry-driven; supersedes `MachineFamily::for_route` (kept for other
+    // callers). For the default `RectangularBlock` form this returns exactly
+    // `for_route(requires_5_axis)` (ThreeAxisMill, or FiveAxisMill with the
+    // 5-axis flag), so every existing golden is byte-identical. The routed
+    // family keys BOTH the S429 calibration coefficient and the Gap-2 machine
+    // rate — one enum, three uses (capacity, calibration, rate).
+    let routed_family = route_family(
+        feature_graph.stock_form,
+        feature_graph.requires_5_axis,
+        stock_od_mm(feature_graph.stock_form),
+        parameters,
+    );
+    let calibration_family = routed_family;
     let calibration_coefficient = calibration.coefficient(calibration_family);
     let machining_minutes = if (calibration_coefficient - 1.0).abs() > f64::EPSILON {
         let adjusted = machining_minutes_base * calibration_coefficient;
@@ -461,15 +520,49 @@ pub fn quote_with_calibration(
     ));
 
     // ── Step 5: machining cost (report §5.3) ──────────────────────
+    // ADR-0094 Gap 2: effective machine-family rate. Default = today's
+    // global flat rate. A matching `MachineRate` row switches to the routed
+    // family's effective EUR/min: the attended rate, discounted by
+    // `lights_out_factor` when the family is `unattended_capable` AND the job
+    // qualifies (turned/round bar stock at/above the setup-amortization
+    // quantity — one operator tends several spindles overnight, so cost-per-
+    // minute drops while the physical cut minutes are unchanged). Empty slice
+    // / no matching row ⇒ stays the global rate and adds NO line ⇒ pricing is
+    // byte-identical to pre-ADR-0094. (Setup cost stays on the global rate —
+    // setup is attended; see ADR-0094 Gap 2 + the S3 hand-off note.)
+    let mut machining_rate = parameters.machining_rate_eur_per_minute;
+    if let Some(rate) = machine_rates
+        .iter()
+        .find(|r| r.family == routed_family.as_db_str())
+    {
+        let lights_out_eligible = rate.unattended_capable
+            && is_turned_bar_stock(feature_graph.stock_form)
+            && quantity >= parameters.setup_amortization_threshold;
+        machining_rate = if lights_out_eligible {
+            rate.attended_rate_eur_per_min * rate.lights_out_factor
+        } else {
+            rate.attended_rate_eur_per_min
+        };
+        log.push(format!(
+            "[machining] routed_family={fam}: machine-rate row matched (attended={att:.4} EUR/min, lights_out_factor={lof:.4}, unattended_capable={uc}); lights_out_eligible={loe} → effective_rate={eff:.4} EUR/min (global was {glob:.4})",
+            fam = routed_family.as_db_str(),
+            att = rate.attended_rate_eur_per_min,
+            lof = rate.lights_out_factor,
+            uc = rate.unattended_capable,
+            loe = lights_out_eligible,
+            eff = machining_rate,
+            glob = parameters.machining_rate_eur_per_minute,
+        ));
+    }
+
     let billable_minutes = machining_minutes + inspection_minutes;
-    let mut machining_cost =
-        billable_minutes * parameters.machining_rate_eur_per_minute * tolerance.multiplier;
+    let mut machining_cost = billable_minutes * machining_rate * tolerance.multiplier;
     log.push(format!(
         "[machining] (machining_minutes={mm:.4} + inspection_minutes={im:.4}) = billable={bm:.4} min; * rate={r:.4} EUR/min * tolerance_mult={tmu:.4} = machining_cost={mc:.4} EUR",
         mm = machining_minutes,
         im = inspection_minutes,
         bm = billable_minutes,
-        r = parameters.machining_rate_eur_per_minute,
+        r = machining_rate,
         tmu = tolerance.multiplier,
         mc = machining_cost,
     ));
@@ -743,4 +836,60 @@ fn pick_complexity_rule<'a>(
         }
     }
     best
+}
+
+/// S3 / ADR-0094 Gap 2 — pure geometry → machine-family routing.
+///
+/// Generalises [`MachineFamily::for_route`] (which only saw the 5-axis flag):
+/// the 5-axis flag still wins outright; otherwise a round/tube blank routes
+/// to the bar-fed, lights-out-capable [`MachineFamily::SwissTurnMill`] when
+/// its outer diameter fits the bar feeder (`od_mm <= params.bar_capacity_mm`),
+/// to [`MachineFamily::TurnMill`] when it is larger, and a prismatic
+/// `RectangularBlock` routes to [`MachineFamily::ThreeAxisMill`] — exactly
+/// what `for_route(false)` returned, so the default path is unchanged.
+///
+/// `od_mm` is supplied by the caller (derived from the stock form, or a
+/// future extractor hint) and is consulted only for round/tube stock. Pure,
+/// total, deterministic; the call site reasoning-logs the decision when it
+/// affects the rate.
+pub fn route_family(
+    stock_form: StockForm,
+    requires_5_axis: bool,
+    od_mm: f64,
+    params: &QuotingParameters,
+) -> MachineFamily {
+    if requires_5_axis {
+        return MachineFamily::FiveAxisMill;
+    }
+    match stock_form {
+        StockForm::RoundBar { .. } | StockForm::Tube { .. } => {
+            if od_mm <= params.bar_capacity_mm {
+                MachineFamily::SwissTurnMill
+            } else {
+                MachineFamily::TurnMill
+            }
+        }
+        StockForm::RectangularBlock => MachineFamily::ThreeAxisMill,
+    }
+}
+
+/// The outer diameter (mm) of a turned/round stock form, for
+/// [`route_family`]'s bar-capacity test. `RectangularBlock` is prismatic — no
+/// turning OD — so this returns `0.0` (unused: the prismatic branch ignores
+/// `od_mm`).
+fn stock_od_mm(stock_form: StockForm) -> f64 {
+    match stock_form {
+        StockForm::RoundBar { diameter_mm, .. } => diameter_mm,
+        StockForm::Tube { od_mm, .. } => od_mm,
+        StockForm::RectangularBlock => 0.0,
+    }
+}
+
+/// Whether the stock form is turned/round bar stock — the lights-out
+/// eligibility precondition (ADR-0094 Gap 2). A prismatic block is not.
+fn is_turned_bar_stock(stock_form: StockForm) -> bool {
+    matches!(
+        stock_form,
+        StockForm::RoundBar { .. } | StockForm::Tube { .. }
+    )
 }

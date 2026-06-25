@@ -140,3 +140,108 @@ fn engine_never_panics_across_varied_inputs() {
     // the panic-resistance claim is the property under test.
     let _ = errs;
 }
+
+#[test]
+fn shop_model_never_panics_and_stays_finite() {
+    use aberp_quote_engine::{quote_with_shop_model, CalibrationTable, MachineRate};
+    let materials = vec![default_material("6061-T6"), exotic_material("Inconel 718")];
+    let rules = catchall_complexity_rules();
+    let tols = default_tolerance_multipliers();
+    let adjs = no_stock_adjustments();
+    let params = default_parameters();
+    let rates = vec![
+        MachineRate {
+            family: "swiss-turn-mill".to_string(),
+            attended_rate_eur_per_min: 1.5,
+            lights_out_factor: 0.35,
+            unattended_capable: true,
+        },
+        MachineRate {
+            family: "turn-mill".to_string(),
+            attended_rate_eur_per_min: 1.6,
+            lights_out_factor: 0.45,
+            unattended_capable: true,
+        },
+        MachineRate {
+            family: "3-axis-mill".to_string(),
+            attended_rate_eur_per_min: 1.6667,
+            lights_out_factor: 1.0,
+            unattended_capable: false,
+        },
+        MachineRate {
+            family: "5-axis-mill".to_string(),
+            attended_rate_eur_per_min: 2.5,
+            lights_out_factor: 1.0,
+            unattended_capable: false,
+        },
+    ];
+    let tolerances = [
+        ToleranceRange::Loose,
+        ToleranceRange::Standard,
+        ToleranceRange::Tight,
+        ToleranceRange::Precision,
+        ToleranceRange::UltraPrecision,
+    ];
+
+    let mut lcg = Lcg::new(0x1234_5678_9ABC_DEF0);
+    let mut ok = 0u32;
+    for case in 0..400u32 {
+        let mut fg = simple_feature_graph(if case % 3 == 0 {
+            "Inconel 718"
+        } else {
+            "6061-T6"
+        });
+        fg.volume_mm3 = lcg.unit() * 200_000.0 + 100.0;
+        fg.thin_wall_present = (case & 1) == 0;
+        fg.requires_5_axis = (case & 2) == 0;
+        fg.stock_form = match case % 3 {
+            0 => StockForm::RectangularBlock,
+            1 => StockForm::RoundBar {
+                diameter_mm: lcg.unit() * 120.0 + 1.0,
+                length_mm: lcg.unit() * 200.0 + 1.0,
+            },
+            _ => {
+                let od = lcg.unit() * 120.0 + 10.0;
+                StockForm::Tube {
+                    od_mm: od,
+                    id_mm: lcg.unit() * (od - 1.0),
+                    length_mm: lcg.unit() * 200.0 + 1.0,
+                }
+            }
+        };
+        let qty = lcg.range(1, 100);
+        let tol = tolerances[lcg.range(0, tolerances.len() as u32 - 1) as usize];
+
+        let result = quote_with_shop_model(
+            &fg,
+            &materials,
+            &rules,
+            &tols,
+            &adjs,
+            &params,
+            qty,
+            tol,
+            &CalibrationTable::neutral(),
+            &rates,
+        );
+        if let Ok(b) = result {
+            for (name, v) in [
+                ("material_cost", b.material_cost),
+                ("machining_cost", b.machining_cost),
+                ("cad_cam_cost", b.cad_cam_cost),
+                ("setup_cost", b.setup_cost),
+                ("overhead", b.overhead),
+                ("margin", b.margin),
+                ("total_price", b.total_price),
+            ] {
+                assert!(v.is_finite(), "case {case}: {name} is non-finite ({v})");
+                assert!(v >= 0.0, "case {case}: {name} is negative ({v})");
+            }
+            ok += 1;
+        }
+    }
+    assert!(
+        ok > 0,
+        "no successful shop-model quotes — fixture too narrow"
+    );
+}

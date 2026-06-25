@@ -74,12 +74,23 @@ pub enum MachineFamily {
     Additive,
     /// Anything not covered above.
     Other,
+    // --- ADR-0094 Gap 2 (S3): turn-mill family extension. Appended last
+    //     to preserve every existing variant's discriminant/order. ---
+    /// Bar-fed Swiss-type turn-mill: sub-spindle pickoff, lights-out /
+    /// unattended-capable. Small turned parts within `bar_capacity_mm`
+    /// route here.
+    SwissTurnMill,
+    /// Fixed-head twin-spindle turn-mill (live tooling). Larger round
+    /// stock and turned parts needing milled features route here.
+    TurnMill,
+    /// 4-axis milling (indexed/continuous A-axis).
+    FourAxisMill,
 }
 
 impl MachineFamily {
     /// Every variant, in declaration order — for SPA dropdowns and the
     /// CRUD validator's closed-vocab check.
-    pub const ALL: [MachineFamily; 8] = [
+    pub const ALL: [MachineFamily; 11] = [
         Self::ThreeAxisMill,
         Self::FiveAxisMill,
         Self::WireEdm,
@@ -88,6 +99,13 @@ impl MachineFamily {
         Self::Grinder,
         Self::Additive,
         Self::Other,
+        // ADR-0094 Gap 2: appended AFTER `Other` so every pre-existing
+        // variant keeps its exact discriminant — the enum is `Ord`/`Hash`
+        // and used as a `BTreeMap` key + lead-time tie-break, so appending
+        // (never inserting) keeps all existing ordering byte-identical.
+        Self::SwissTurnMill,
+        Self::TurnMill,
+        Self::FourAxisMill,
     ];
 
     /// DB / wire storage string. Stable — `quoting_machines.family`
@@ -102,6 +120,9 @@ impl MachineFamily {
             Self::Grinder => "grinder",
             Self::Additive => "additive",
             Self::Other => "other",
+            Self::SwissTurnMill => "swiss-turn-mill",
+            Self::TurnMill => "turn-mill",
+            Self::FourAxisMill => "4-axis-mill",
         }
     }
 
