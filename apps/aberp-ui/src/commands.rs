@@ -655,6 +655,19 @@ pub async fn override_quote_margin(
     forward_post(&state, &path, body).await
 }
 
+/// S2 / ADR-0094 Gap 1 — set/clear the operator stock-form override (kind +
+/// dims) and re-price the job in place. Forwards the `{ kind, od_mm, id_mm,
+/// length_mm }` body to the HTTPS route.
+#[tauri::command]
+pub async fn set_quote_stock_form(
+    state: State<'_, AppState>,
+    quote_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-pricing-jobs/{quote_id}/stock-form");
+    forward_post(&state, &path, body).await
+}
+
 // ── S431 — Approved Vendor List (AVL) master data + screening + PO-gate ──
 //
 // Mirrors the machine CRUD bridge. `vendor_id` is the server-minted

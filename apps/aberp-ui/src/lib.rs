@@ -309,6 +309,7 @@ pub fn run() {
             commands::archive_margin_profile,
             commands::set_quote_buyer_partner,
             commands::override_quote_margin,
+            commands::set_quote_stock_form,
             // S431 — Approved Vendor List (AVL) master data.
             commands::list_avl_vendors,
             commands::get_avl_vendor,

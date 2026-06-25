@@ -1811,6 +1811,30 @@ export async function overrideQuoteMargin(
   });
 }
 
+/** S2 / ADR-0094 Gap 1 — `POST /api/quote-pricing-jobs/:quote_id/stock-form`.
+ * Set (or clear, with `kind: null`) the operator stock-form override and
+ * re-price the job in place. Round bar uses (`od_mm` = diameter, `length_mm`);
+ * tube uses (`od_mm`, `id_mm`, `length_mm`); `kind: null` reverts to the
+ * inert rectangular-block default. Resolves with the corrected price. */
+export interface StockFormResult {
+  ok: boolean;
+  stock_form: string | null;
+  total_price_eur: number;
+  below_floor: boolean;
+}
+
+export async function setQuoteStockForm(
+  quoteId: string,
+  body: {
+    kind: "round_bar" | "tube" | null;
+    od_mm: number | null;
+    id_mm: number | null;
+    length_mm: number | null;
+  },
+): Promise<StockFormResult> {
+  return await invoke<StockFormResult>("set_quote_stock_form", { quoteId, body });
+}
+
 // ── S431 — Approved Vendor List (AVL) ────────────────────────────────
 
 /** S431 — AVL approval lifecycle status. Mirrors
@@ -4188,6 +4212,15 @@ export interface PricingJobDetail extends PricingJobRow {
   /** S428 — the effective floor (fraction) the margin was measured
    * against, or `null` on the global path / pre-pricing. */
   margin_floor_pct: number | null;
+  /** S2 / ADR-0094 Gap 1 — operator stock-form selection. `stock_form` is
+   * the discriminant ('round_bar'|'tube'), or `null` when unset (the inert
+   * rectangular-block default). Dims (mm) carry the chosen variant: round
+   * bar uses (`stock_od_mm` = diameter, `stock_length_mm`); tube uses all
+   * three. The intake control seeds from these and POSTs changes back. */
+  stock_form: string | null;
+  stock_od_mm: number | null;
+  stock_id_mm: number | null;
+  stock_length_mm: number | null;
 }
 
 /** S349 / PR-40 (U1) — fetch the full detail for one pricing job.

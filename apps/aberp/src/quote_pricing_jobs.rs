@@ -313,6 +313,20 @@ ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS buyer_partner_id VARCHAR
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS margin_override_pct DOUBLE;
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS margin_below_floor BOOLEAN;
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS margin_floor_pct DOUBLE;
+-- S2 / ADR-0094 Gap 1 (wiring) — operator-supplied stock form. `stock_form`
+-- is the StockForm discriminant the operator (or, later, the S269 extractor)
+-- chose: 'round_bar' | 'tube'. NULL or 'rectangular_block' means unset: the
+-- pipeline keeps the FeatureGraph's RectangularBlock default, so the quote
+-- prices byte-identically to today (inert). The three dimensional columns
+-- carry the chosen variant's dims in millimetres: round bar uses
+-- (stock_od_mm = diameter, stock_length_mm); tube uses
+-- (stock_od_mm, stock_id_mm, stock_length_mm). All nullable, no DEFAULT per
+-- [[no-sql-specific]]; existing rows read back NULL and price exactly as
+-- before. Idempotent via ADD COLUMN IF NOT EXISTS.
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS stock_form VARCHAR;
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS stock_od_mm DOUBLE;
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS stock_id_mm DOUBLE;
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS stock_length_mm DOUBLE;
 ";
 
 /// Idempotent — call at every writer entry.
@@ -1244,6 +1258,17 @@ pub struct JobDetail {
     /// S428 — the effective floor the quote was measured against (for the
     /// operator banner), NULL pre-pricing / on the global path.
     pub margin_floor_pct: Option<f64>,
+    /// S2 / ADR-0094 Gap 1 — operator-chosen stock-form discriminant
+    /// ('round_bar' | 'tube'); NULL/'rectangular_block' = unset (inert).
+    /// Kept as the raw DB string here (this module stays free of engine
+    /// types); the pipeline reconstructs the `StockForm` it stamps.
+    pub stock_form: Option<String>,
+    /// S2 — outer diameter (round bar: the bar diameter; tube: OD), mm.
+    pub stock_od_mm: Option<f64>,
+    /// S2 — inner/bore diameter (tube only), mm.
+    pub stock_id_mm: Option<f64>,
+    /// S2 — cut-off length, mm.
+    pub stock_length_mm: Option<f64>,
 }
 
 /// S349 / PR-40 (U1) — read one job row + its artifacts for the detail
@@ -1266,7 +1291,8 @@ pub fn get_job_detail(
                     cad_filename, feature_graph_json, breakdown_json, pdf_path,
                     valid_until_iso, customer_company,
                     lead_time_days, lead_time_override_days,
-                    buyer_partner_id, margin_override_pct, margin_below_floor, margin_floor_pct
+                    buyer_partner_id, margin_override_pct, margin_below_floor, margin_floor_pct,
+                    stock_form, stock_od_mm, stock_id_mm, stock_length_mm
                 FROM quote_pricing_jobs
                 WHERE quote_id = ? AND tenant_id = ?",
         )
@@ -1324,6 +1350,10 @@ pub fn get_job_detail(
         margin_override_pct: r.get::<_, Option<f64>>(24).ok().flatten(),
         margin_below_floor: r.get::<_, Option<bool>>(25).ok().flatten().unwrap_or(false),
         margin_floor_pct: r.get::<_, Option<f64>>(26).ok().flatten(),
+        stock_form: r.get::<_, Option<String>>(27).ok().flatten(),
+        stock_od_mm: r.get::<_, Option<f64>>(28).ok().flatten(),
+        stock_id_mm: r.get::<_, Option<f64>>(29).ok().flatten(),
+        stock_length_mm: r.get::<_, Option<f64>>(30).ok().flatten(),
     }))
 }
 
@@ -1437,6 +1467,38 @@ pub fn set_margin_override(
             params![margin_override_pct, ts, quote_id, tenant_id],
         )
         .context("set_margin_override UPDATE")?;
+    Ok(changed > 0)
+}
+
+/// S2 / ADR-0094 Gap 1 — set or clear the operator's stock-form override.
+/// `kind` is the StockForm discriminant ('round_bar' | 'tube'); `None`
+/// (or a NULL kind) clears the override back to the inert default. The
+/// dimensional args carry the chosen variant's mm dims (round bar:
+/// od=diameter + length; tube: od + id + length). Returns `false` if no
+/// such row exists. Mirrors [`set_margin_override`]'s tenant-scoped,
+/// `updated_at`-stamped UPDATE; the daemon's next pricing pass re-reads
+/// these columns and re-stamps the graph.
+#[allow(clippy::too_many_arguments)]
+pub fn set_stock_form(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    kind: Option<&str>,
+    od_mm: Option<f64>,
+    id_mm: Option<f64>,
+    length_mm: Option<f64>,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    ensure_schema(conn)?;
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format stock_form updated_at")?;
+    let changed = conn
+        .execute(
+            "UPDATE quote_pricing_jobs SET stock_form = ?, stock_od_mm = ?,              stock_id_mm = ?, stock_length_mm = ?, updated_at = ?              WHERE quote_id = ? AND tenant_id = ?",
+            params![kind, od_mm, id_mm, length_mm, ts, quote_id, tenant_id],
+        )
+        .context("set_stock_form UPDATE")?;
     Ok(changed > 0)
 }
 

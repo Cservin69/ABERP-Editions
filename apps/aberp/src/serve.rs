@@ -4198,6 +4198,12 @@ pub fn build_router(state: AppState) -> Router {
             "/api/quote-pricing-jobs/:quote_id/margin-override",
             post(handle_override_quote_margin),
         )
+        // S2 / ADR-0094 Gap 1 — set/clear the operator stock-form override
+        // (kind + dims) and re-price in place. Inert when kind is null.
+        .route(
+            "/api/quote-pricing-jobs/:quote_id/stock-form",
+            post(handle_set_quote_stock_form),
+        )
         // S416 — the operator accept-on-behalf route (S354 / PR-42 / U16)
         // was REMOVED: it was redundant (the customer accepts via the
         // Accept button in their quote e-mail) and a footgun (an operator
@@ -12174,6 +12180,204 @@ pub fn override_quote_margin_request(
         )?;
     }
     Ok(())
+}
+
+// ── S2 / ADR-0094 Gap 1 — operator stock-form intake + in-place re-price ──
+
+/// Request body for `POST /api/quote-pricing-jobs/:quote_id/stock-form`.
+/// `kind` is the StockForm discriminant the operator chose: `"round_bar"`,
+/// `"tube"`, or `null` / `"rectangular_block"` to clear it back to the inert
+/// block default. Dimensions are millimetres; round bar uses
+/// (`od_mm` = diameter, `length_mm`), tube uses (`od_mm`, `id_mm`, `length_mm`).
+#[derive(Debug, serde::Deserialize)]
+pub struct StockFormBody {
+    pub kind: Option<String>,
+    pub od_mm: Option<f64>,
+    pub id_mm: Option<f64>,
+    pub length_mm: Option<f64>,
+}
+
+/// Typed error for the stock-form route, mapped to an HTTP status by the
+/// handler (same posture as [`MaterialEditRequestError`]).
+#[derive(Debug)]
+pub enum StockFormError {
+    /// The body failed validation (bad kind, missing or non-positive dim,
+    /// tube bore >= OD) -> 400.
+    Invalid(String),
+    /// No row for `(tenant, quote_id)` -> 404 (foreign-tenant rows invisible).
+    NotFound,
+    /// Unexpected internal failure -> 500.
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for StockFormError {
+    fn from(e: anyhow::Error) -> Self {
+        StockFormError::Other(e)
+    }
+}
+
+/// Validate + normalise the stock-form body into the persisted
+/// `(kind, od_mm, id_mm, length_mm)` columns. Pure — unit-tested. A `null`
+/// / `rectangular_block` kind clears the override (all columns NULL -> inert).
+fn normalize_stock_form_body(
+    body: &StockFormBody,
+) -> std::result::Result<(Option<String>, Option<f64>, Option<f64>, Option<f64>), StockFormError> {
+    let pos = |v: Option<f64>| v.filter(|x| x.is_finite() && *x > 0.0);
+    match body.kind.as_deref() {
+        None | Some("") | Some("rectangular_block") => Ok((None, None, None, None)),
+        Some("round_bar") => {
+            let d = pos(body.od_mm).ok_or_else(|| {
+                StockFormError::Invalid("round_bar requires a positive od_mm (diameter)".into())
+            })?;
+            let l = pos(body.length_mm).ok_or_else(|| {
+                StockFormError::Invalid("round_bar requires a positive length_mm".into())
+            })?;
+            Ok((Some("round_bar".to_string()), Some(d), None, Some(l)))
+        }
+        Some("tube") => {
+            let od = pos(body.od_mm)
+                .ok_or_else(|| StockFormError::Invalid("tube requires a positive od_mm".into()))?;
+            let id = pos(body.id_mm)
+                .ok_or_else(|| StockFormError::Invalid("tube requires a positive id_mm".into()))?;
+            let l = pos(body.length_mm).ok_or_else(|| {
+                StockFormError::Invalid("tube requires a positive length_mm".into())
+            })?;
+            if id >= od {
+                return Err(StockFormError::Invalid(
+                    "tube id_mm (bore) must be smaller than od_mm".into(),
+                ));
+            }
+            Ok((Some("tube".to_string()), Some(od), Some(id), Some(l)))
+        }
+        Some(other) => Err(StockFormError::Invalid(format!(
+            "unknown stock form kind `{other}` (expected round_bar | tube | rectangular_block)"
+        ))),
+    }
+}
+
+/// `POST /api/quote-pricing-jobs/:quote_id/stock-form` — set or clear the
+/// operator stock-form override (kind + dims), then re-price the job in
+/// place so the operator sees the corrected price immediately. Bearer-gated
+/// like the margin/material siblings. 400 on an invalid form; 404 when no
+/// row matches; 200 `{ ok, stock_form, total_price_eur, below_floor }`.
+///
+/// Audit posture (S2): the chosen form is audited via the daemon's extended
+/// `quote.pricing_priced` payload (it carries `stock_form` + provenance);
+/// this in-place re-price persists the corrected price + columns but does
+/// not mint a dedicated stock-form audit event (no new EventKind in S2 —
+/// flagged for a follow-up if a per-set audit row is wanted).
+async fn handle_set_quote_stock_form(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(quote_id): AxumPath<String>,
+    Json(body): Json<StockFormBody>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if !is_quote_id_shape(&quote_id) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid quote_id"})),
+        )
+            .into_response();
+    }
+    let state_for_task = state.clone();
+    let qid = quote_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        set_quote_stock_form_request(&state_for_task, &qid, body)
+    })
+    .await;
+    match result {
+        Ok(Ok(v)) => (axum::http::StatusCode::OK, axum::Json(v)).into_response(),
+        Ok(Err(StockFormError::Invalid(msg))) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "InvalidStockForm", "message": msg})),
+        )
+            .into_response(),
+        Ok(Err(StockFormError::NotFound)) => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(error_body(format!(
+                "no pricing job found with quote_id {quote_id}"
+            ))),
+        )
+            .into_response(),
+        Ok(Err(StockFormError::Other(e))) => internal_error("set_quote_stock_form_request", e),
+        Err(join_err) => internal_error(
+            "set_quote_stock_form_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+/// Library helper backing the stock-form route. `pub` so the integration
+/// test can hit it without the HTTPS listener (same posture as the
+/// material/margin helpers). Validates, persists the override columns,
+/// re-prices in place (the re-price re-reads the columns and stamps the
+/// graph), and persists the corrected breakdown + price.
+pub fn set_quote_stock_form_request(
+    state: &AppState,
+    quote_id: &str,
+    body: StockFormBody,
+) -> std::result::Result<serde_json::Value, StockFormError> {
+    let (kind, od, id, length) = normalize_stock_form_body(&body)?;
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tenant = state.tenant.as_str();
+    let now = time::OffsetDateTime::now_utc();
+
+    // 1) Persist the override columns FIRST so the re-price re-reads them.
+    let applied = crate::quote_pricing_jobs::set_stock_form(
+        &conn,
+        quote_id,
+        tenant,
+        kind.as_deref(),
+        od,
+        id,
+        length,
+        now,
+    )?;
+    if !applied {
+        return Err(StockFormError::NotFound);
+    }
+
+    // 2) Re-price in place — reprice_quote stamps the now-persisted form.
+    //    A `None` outcome here means the row exists (step 1 changed it) but
+    //    has not been extracted/priced yet: the columns are already saved, so
+    //    report `repriced: false` (the daemon's first pricing pass will stamp
+    //    them) rather than a misleading 404.
+    match crate::quote_pricing_pipeline::reprice_quote(&conn, tenant, quote_id, None)? {
+        Some(outcome) => {
+            // 3) Persist the corrected breakdown + price + floor verdict.
+            crate::quote_pricing_jobs::set_margin_result(
+                &conn,
+                quote_id,
+                tenant,
+                &outcome.breakdown_json,
+                outcome.total_price,
+                outcome.below_floor,
+                outcome.floor_pct,
+                now,
+            )?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "stock_form": kind,
+                "total_price_eur": outcome.total_price,
+                "below_floor": outcome.below_floor,
+                "repriced": true,
+            }))
+        }
+        None => Ok(serde_json::json!({
+            "ok": true,
+            "stock_form": kind,
+            "total_price_eur": serde_json::Value::Null,
+            "below_floor": false,
+            "repriced": false,
+        })),
+    }
 }
 
 /// Emit the margin-provenance events (global-margin / below-floor) after a
@@ -21292,6 +21496,15 @@ struct PricingJobDetailView {
     /// S428 — the effective floor measured against (fraction); `null` on
     /// the global path / pre-pricing.
     margin_floor_pct: Option<f64>,
+    /// S2 / ADR-0094 Gap 1 — operator stock-form selection. `stock_form` is
+    /// the discriminant ('round_bar'|'tube'); `null` = unset/inert. The
+    /// dims (mm) carry the chosen variant: round bar uses
+    /// (`stock_od_mm` = diameter, `stock_length_mm`); tube uses all three.
+    /// The intake control seeds from these and POSTs changes to `…/stock-form`.
+    stock_form: Option<String>,
+    stock_od_mm: Option<f64>,
+    stock_id_mm: Option<f64>,
+    stock_length_mm: Option<f64>,
 }
 
 /// S349 / PR-40 (U1) — `GET /api/quote-pricing-jobs/:quote_id`. Bearer-
@@ -21379,6 +21592,10 @@ async fn handle_get_quote_pricing_job_detail(
         margin_override_pct: d.margin_override_pct,
         margin_below_floor: d.margin_below_floor,
         margin_floor_pct: d.margin_floor_pct,
+        stock_form: d.stock_form,
+        stock_od_mm: d.stock_od_mm,
+        stock_id_mm: d.stock_id_mm,
+        stock_length_mm: d.stock_length_mm,
     };
     (axum::http::StatusCode::OK, axum::Json(view)).into_response()
 }
