@@ -224,6 +224,89 @@ pub enum StockForm {
     },
 }
 
+/// **ADR-0094 Gap 3.** The kind of gear teeth to generate. Sets the
+/// admissible process family: external spur/helical teeth are hobbed or
+/// (in-cycle on a turn-mill) power-skived; internal ring teeth have no
+/// hob/skive access and are shaped, broached, or wire-EDM'd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GearKind {
+    /// External spur or helical teeth on the outside of the blank.
+    ExternalSpurHelical,
+    /// Internal ring-gear teeth (cut from the bore).
+    InternalRing,
+}
+
+impl GearKind {
+    /// DB / wire storage string — matches the future `quoting_gear_ops.kind`.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::ExternalSpurHelical => "external_spur_helical",
+            Self::InternalRing => "internal_ring",
+        }
+    }
+}
+
+/// **ADR-0094 Gap 3.** The tooth-generation process. [`GearProcess::Auto`]
+/// lets the engine pick deterministically from `kind` + routed machine
+/// family + AGMA quality (see [`crate::select_gear_process`]); the explicit
+/// variants force a process (operator override, reasoning-logged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GearProcess {
+    /// Engine selects the process deterministically.
+    Auto,
+    /// Hobbing — external teeth on a dedicated hobber (standalone op).
+    Hob,
+    /// Power-skiving — external teeth in-cycle on a turn-mill (the part is
+    /// already on the spindle: no second op, no refixture ⇒ cheap).
+    PowerSkive,
+    /// Gear shaping — internal ring teeth (and external where blocked).
+    Shape,
+    /// Broaching — internal teeth: high setup, fast per part at volume.
+    Broach,
+    /// Wire-EDM — internal teeth at the tightest AGMA classes; slow + dear.
+    WireEdm,
+}
+
+impl GearProcess {
+    /// DB / wire storage string — matches [`crate::GearProcessRate::process`].
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Hob => "hob",
+            Self::PowerSkive => "power_skive",
+            Self::Shape => "shape",
+            Self::Broach => "broach",
+            Self::WireEdm => "wire_edm",
+        }
+    }
+}
+
+/// **ADR-0094 Gap 3.** One gear's teeth to cut, modelled as a costed
+/// operation — the volume/feature model cannot see teeth. Carries the
+/// parameters that drive generation cost (module, tooth count, face width,
+/// AGMA quality) and the process selection. Defaulted-empty on
+/// [`FeatureGraph::gears`], so a part with no gears prices exactly as today.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GearOp {
+    /// External spur/helical vs internal ring — sets the admissible process.
+    pub kind: GearKind,
+    /// Module `m` (mm) — the tooth-size unit. Bigger module ⇒ more metal per
+    /// tooth ⇒ slower generation (time scales by `module_mm^module_exponent`).
+    pub module_mm: f64,
+    /// Tooth count `z`. Generation time scales linearly with teeth.
+    pub teeth: u32,
+    /// Face width `b` (mm) — the axial length of the teeth.
+    pub face_width_mm: f64,
+    /// Target AGMA quality class (higher = tighter = slower). Drives the
+    /// quality factor and, for internal rings under `Auto`, the
+    /// shape→wire-EDM escalation above [`crate::GEAR_INTERNAL_WIRE_EDM_AGMA`].
+    pub quality_agma: u8,
+    /// The process to use; [`GearProcess::Auto`] ⇒ engine selects.
+    pub process: GearProcess,
+}
+
 /// The extracted-geometry side of the engine input.
 ///
 /// Produced by `aberp-cad-extract` (Python, S269) and validated +
@@ -280,6 +363,13 @@ pub struct FeatureGraph {
     /// and tubular parts.
     #[serde(default)]
     pub stock_form: StockForm,
+    /// **ADR-0094 Gap 3.** Per-gear tooth-generation operations. Defaulted
+    /// empty (`#[serde(default)]`, mirroring `stock_form` / `surface_area_mm2`)
+    /// so a graph that omits it — every persisted blob, every pre-S5 extractor
+    /// output — prices with NO gear cost and byte-identical output. The
+    /// extractor (S269) / operator (S6 wiring) populates it for geared parts.
+    #[serde(default)]
+    pub gears: Vec<GearOp>,
 }
 
 impl FeatureGraph {
@@ -292,5 +382,9 @@ impl FeatureGraph {
     /// (no `stock_form`) still loads — it defaults to `RectangularBlock`
     /// — and the version guard accepts any `schema_version ≤ 3`. The
     /// extractor's lockstep bump to v3 lands with S269 (ADR-0094 Q3).
-    pub const SCHEMA_VERSION: u32 = 3;
+    /// **v4 (ADR-0094 Gap 3)** adds the defaulted `gears` vector; a v2/v3
+    /// graph (no `gears`) still loads — it defaults to empty ⇒ zero gear cost
+    /// ⇒ today's price — and the guard accepts any `schema_version <= 4`. The
+    /// extractor's lockstep bump to v4 lands with S269 (ADR-0094 Q3).
+    pub const SCHEMA_VERSION: u32 = 4;
 }

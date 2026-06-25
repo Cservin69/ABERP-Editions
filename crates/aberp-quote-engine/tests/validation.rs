@@ -74,6 +74,7 @@ fn missing_complexity_rule_for_feature_errors_loud() {
         requires_5_axis: false,
         thin_wall_present: false,
         stock_form: StockForm::RectangularBlock,
+        gears: Vec::new(),
     };
     // Rules table covers only (pocket, M) — engraving/XS is missing.
     let rules = vec![ComplexityRule {

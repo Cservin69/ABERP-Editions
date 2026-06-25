@@ -37,6 +37,7 @@ fn peek_15pcs_50mm_cube_lands_in_benchmark_band() {
         requires_5_axis: false,
         thin_wall_present: false,
         stock_form: StockForm::RectangularBlock,
+        gears: Vec::new(),
     };
 
     let r = quote(

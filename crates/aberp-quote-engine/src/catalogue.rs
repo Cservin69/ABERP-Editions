@@ -214,3 +214,35 @@ pub struct MachineRate {
     /// true; a manual mill = false).
     pub unattended_capable: bool,
 }
+
+/// A row from the `quoting_gear_processes` catalogue table (ADR-0094 Gap 3,
+/// wired in S6). Keyed by [`crate::GearProcess::as_db_str`], it carries the
+/// per-process time coefficients so the gear-generation **math** stays pure
+/// in the engine while the **numbers** stay operator-tunable — mirroring the
+/// snapshot shape of the other catalogue rows. The wiring layer reads the DB
+/// table; the engine treats `&[GearProcessRate]` as an immutable input. An
+/// **empty** slice (or no row for a gear's selected process) ⇒ that gear
+/// contributes **zero** cost and a loud reasoning-log line. With no gears at
+/// all the gear path is never entered ⇒ pricing is byte-identical to
+/// pre-ADR-0094-Gap-3.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GearProcessRate {
+    /// Matches [`crate::GearProcess::as_db_str`] (e.g. `"power_skive"`).
+    pub process: String,
+    /// Indexing / tool-load minutes charged once per gear.
+    pub setup_min: f64,
+    /// Base generation minutes per tooth (before module / face-width /
+    /// quality scaling).
+    pub min_per_tooth: f64,
+    /// Generation time scales with `module_mm^module_exponent` — bigger teeth
+    /// cut slower.
+    pub module_exponent: f64,
+    /// Quality-factor growth per AGMA class above the datum
+    /// [`crate::GEAR_AGMA_DATUM_CLASS`]: `quality_factor = 1 + max(0, agma -
+    /// datum) * this`.
+    pub agma_quality_factor_base: f64,
+    /// Multiplier (< 1) applied when the process runs in-cycle on the routed
+    /// turning family (power-skiving on a Swiss/turn-mill — no second op, no
+    /// refixture). `1.0` for a standalone op.
+    pub in_cycle_factor: f64,
+}

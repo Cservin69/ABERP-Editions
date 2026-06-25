@@ -43,6 +43,15 @@ pub struct QuoteBreakdown {
     /// (`setup_base + 5-axis extra + fired-rule penalties`), report
     /// §5.5.
     pub setup_cost: f64,
+    /// EUR. **ADR-0094 Gap 3.** Sum of every gear's tooth-generation op cost
+    /// (`Σ gear_min × routed-family effective €/min`), folded into the
+    /// subtotal alongside material/machining/setup/cad_cam. Per part — each
+    /// part's teeth are cut. `#[serde(default)]` so pre-Gap-3 persisted blobs
+    /// deserialize as `0.0`; `skip_serializing_if` omits it from the wire when
+    /// it is exactly zero (no gears), keeping a no-gear `breakdown_json`
+    /// byte-identical to pre-Gap-3 — the inert-by-default wire contract.
+    #[serde(default, skip_serializing_if = "is_zero_eur")]
+    pub gear_cost: f64,
     /// EUR. `subtotal × overhead_factor` (step 13).
     pub overhead: f64,
     /// EUR. `(subtotal + overhead) × profit_margin_base` (step 14).
@@ -88,4 +97,12 @@ pub struct QuoteBreakdown {
 /// persisted breakdowns predate the field and price as neutral.
 fn default_calibration_coefficient() -> f64 {
     1.0
+}
+
+/// Serde skip predicate for [`QuoteBreakdown::gear_cost`] — omit the field
+/// from the wire when it is exactly zero (the no-gear path), keeping a
+/// no-gear `breakdown_json` byte-identical to pre-ADR-0094-Gap-3.
+#[allow(clippy::float_cmp)]
+fn is_zero_eur(v: &f64) -> bool {
+    *v == 0.0
 }

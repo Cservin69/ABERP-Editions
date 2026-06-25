@@ -35,6 +35,7 @@ fn blank(
         requires_5_axis: false,
         thin_wall_present: false,
         stock_form,
+        gears: Vec::new(),
     }
 }
 
