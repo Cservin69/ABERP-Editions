@@ -60,7 +60,7 @@ Sequenced, single-focus, clean-git-between. Companion to **ADR-0094**. All work 
 - **Tests:** table CRUD + seed; a geared part prices end-to-end with the gear line visible; internal-vs-external selection.
 - **Gates:** local fmt + cut-gate → push → CI both arms → merge.
 
-## S7 — Validation + integration: planetary-box golden
+## S7 — Validation + integration: planetary-box golden  ✅ DONE (2026-06-25)
 
 - **Goal:** the motivating case, as a **new** fixture (the €444 baseline is external — see Risk R1), proving direction + decomposition.
 - **Files:** new app-level (or engine-level, if all inputs are operator-set) golden test `apps/aberp/tests/quote_planetary_gearset.rs`: Ø100 planetary set — internal **ring** (shaped/wire-EDM, tube blank), 5 **planets** + **sun** (external, skived in-cycle on Swiss turn-mill, round-bar blanks), **carrier** (prismatic, 3-axis), 5 **pins** (round bar, Swiss lights-out), **hub** — qty 100. A short `docs/findings/` note recording the €444 provenance + the new per-line decomposition.
@@ -84,3 +84,73 @@ Sequenced, single-focus, clean-git-between. Companion to **ADR-0094**. All work 
 ## Validation target (success criterion)
 
 After S1–S7 land, re-quoting the Ø100 planetary box (qty 100) yields a **realistically lower, more-defensible per-box number than the external €444**, in which: the **pins** and turned blanks bill on **bar stock** (~21 % less material + less roughing) and route to a **Swiss lights-out** effective rate (no longer the attended-rate, square-block line that produced ~€1.93/pin); the **sun + planets** are **power-skived in-cycle** on the turn-mill (cheap) instead of a flat manual gear adder; the **internal ring** carries an explicit, justified shaping/wire-EDM line; and **every** contribution is an inspectable line in the `reasoning_log`. Prod tree-hash `2d612811` re-proved untouched.
+
+
+---
+
+## Status — ADR-0094 chain COMPLETE (S7 validation, 2026-06-25)
+
+S1–S7 have landed. **S7** adds the planetary-box validation golden
+`crates/aberp-quote-engine/tests/planetary_box_validation.rs`. It is an
+**engine-level** fixture (every input is operator-set, so — per this section's
+own "or engine-level, if all inputs are operator-set" — it runs fully
+in-sandbox with no DuckDB), pricing the Ø100 compound planetary gearbox (ring +
+5 planets + sun + carrier + 5 pins + hub) at **qty 100 boxes** through
+`quote_with_shop_model` with the seeded **6-family machine-rate** + **5-process
+gear** catalogues. An independent reference implementation of the engine
+arithmetic was run alongside and **agreed with the Rust engine to 4 dp on every
+line** — the pinned goldens are cross-checked, not just self-consistent.
+
+**Per-box result (upgraded engine, 6061-T6 @ €6/kg, Standard tol):**
+
+| component | per-box × | upgraded €/part | naive €/part |
+|---|---|---|---|
+| ring (ext Z50 + int ring Z60) | ×1 | 227.3354 | 126.3572 |
+| planet (ext Z24) | ×5 | 10.2000 | 10.8131 |
+| sun (ext Z18) | ×1 | 10.6314 | 9.8753 |
+| carrier (prismatic) | ×1 | 80.2016 | 80.2016 |
+| pin | ×5 | 1.0492 | 2.4452 |
+| hub | ×1 | 11.4491 | 26.0072 |
+| **PER BOX** | | **385.8635** | **308.7331** |
+
+- realistic pre-gap quote = naive €308.73 + legacy €95 gear adder = **€403.73**;
+  external manual baseline = **€444**. Upgraded **€385.86 < €403.73 < €444**. ✓
+
+**The five structural wins (the validation — not a € target) — all asserted green:**
+1. every cost line is present in each `reasoning_log` and the named lines
+   reconstruct the subtotal + total;
+2. planets/sun/pins (OD ≤ bar-cap 32) route to **Swiss lights-out €0.5250/min**,
+   ring/hub (OD > 32) to **turn-mill lights-out €0.7200/min** — never the flat
+   €1.6667 (€100/h);
+3. gears are costed (`gear_cost > 0` on geared parts, `== 0` elsewhere) and
+   external skiving (€9.36 on the ring) ≪ internal-ring shaping (€99.36);
+4. every round/tube part bills exactly **π/4 ≈ 78.5 %** of its bbox-block
+   material (Gap 1);
+5. the per-box total is finite, > 0, and below both realistic baselines.
+
+**⚠️ Honest baseline flag (conservative call, not rigged).** Against the
+*strict* no-gear baseline (€308.73) the upgraded box (€385.86) is **higher** —
+correctly so: Gap 3 surfaces ~€133/box of real gear-generation cost that the
+pre-Gap-3 engine simply could not see. A no-gear baseline structurally
+under-quotes a gearbox, so it is not a fair reference; the fair references
+(legacy-adder quote €403.73 and the external €444) are both beaten. The test
+documents this relationship explicitly rather than inverting it by fudging
+inputs.
+
+**⚠️ Seeds are illustrative, and self-correct.** The seed machine €/min, the
+gear-process coefficients, and the tooth counts / modules / face widths /
+AGMA classes are Dispatch-supplied **illustrative** values, not shop gospel.
+They self-correct through the **S429 calibration loop** (mean actual ÷ estimated
+per machine family) once Ervin enters the shop's measured rates and a real gear
+drawing. Recheck every gear parameter and seed rate before quoting a real
+planetary set (ADR-0094 Q4/Q5).
+
+**Gate (in-sandbox, pure engine crate):** `rustfmt --check` clean; `cargo test
+-p aberp-quote-engine` **15/15 binaries green** (the new fixture + every prior
+golden/determinism/branch/property test byte-identical — no engine source
+changed); `cargo clippy -p aberp-quote-engine --all-targets -- -D warnings`
+clean; `tools/cut_gate_db_isolation.sh` PASS. The full both-arm
+`--workspace` build-proof is Dispatch's consolidated Gap-2+Gap-3 CI run (this
+session deliberately builds only the engine crate — the bundled-DuckDB
+workspace build blows the sandbox disk). Prod tree-hash `2d612811` re-proved
+untouched.
