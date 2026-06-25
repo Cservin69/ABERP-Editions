@@ -353,6 +353,11 @@ pub fn run() {
             commands::create_stock_adjustment,
             commands::update_stock_adjustment,
             commands::delete_stock_adjustment,
+            // S4 / ADR-0094 Gap 2 — machine-family rate catalogue CRUD.
+            commands::list_machine_rates,
+            commands::create_machine_rate,
+            commands::update_machine_rate,
+            commands::delete_machine_rate,
             // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
             commands::list_inventory_balances,
             // S432 — heat-lot assignment + material traceability report.

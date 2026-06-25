@@ -145,6 +145,7 @@ pub mod audit_dap_boot;
 // re-POSTs `priced.pdf` with `stock_alert:true` to the storefront.
 pub mod quote_pdf_rerender_daemon;
 pub mod quote_pdf_rerender_queue;
+pub mod quoting_machine_rates;
 pub mod quoting_machines;
 pub mod quoting_materials;
 // S267 / PR-256 — four tunable tables feeding the future

@@ -998,6 +998,34 @@ pub async fn delete_stock_adjustment(state: State<'_, AppState>, id: String) -> 
     forward_delete(&state, &path).await
 }
 
+// ── S4 / ADR-0094 Gap 2 — quoting_machine_rates CRUD bridge ──────────
+
+#[tauri::command]
+pub async fn list_machine_rates(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quoting-machine-rates", true).await
+}
+
+#[tauri::command]
+pub async fn create_machine_rate(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/quoting-machine-rates", body).await
+}
+
+#[tauri::command]
+pub async fn update_machine_rate(
+    state: State<'_, AppState>,
+    id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quoting-machine-rates/{}", urlencode(&id));
+    forward_put(&state, &path, body).await
+}
+
+#[tauri::command]
+pub async fn delete_machine_rate(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let path = format!("/api/quoting-machine-rates/{}", urlencode(&id));
+    forward_delete(&state, &path).await
+}
+
 // ── S273 / PR-262 / ADR-0069 — Inventory Balances (material-side) ───
 
 /// `GET /api/inventory-balances` — list every `(material_grade, on_hand,

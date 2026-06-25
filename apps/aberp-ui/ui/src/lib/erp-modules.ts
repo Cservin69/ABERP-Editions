@@ -327,6 +327,8 @@ export const MODULES: ErpModule[] = [
       { id: "quoting-tolerance-multipliers", label: "Tolerance multipliers" },
       { id: "quoting-parameters", label: "Global parameters" },
       { id: "quoting-stock-adjustments", label: "Stock adjustments" },
+      // S4 / ADR-0094 Gap 2 — per-family machine EUR/min rate catalogue.
+      { id: "quoting-machine-rates", label: "Machine rates" },
       // S273 / PR-262 / ADR-0069 — material-side balances feed the DEAL
       // saga's `committed_qty +=` check. Read-only operator view in v1;
       // sits beside the engine tunables because the operator visits
@@ -504,6 +506,8 @@ export type MaintenanceTileStatusKind =
   | "ToleranceMultiplierCount"
   | "ParametersStatus"
   | "StockAdjustmentCount"
+  // S4 / ADR-0094 Gap 2 — count of per-family machine-rate rows.
+  | "MachineRateCount"
   // S273 / PR-262 / ADR-0069 — material-side inventory balances. The
   // tile's chip surfaces "N grades" — the count of `(tenant,
   // material_grade)` rows the operator has seeded balances for. Zero
@@ -701,6 +705,16 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Anyag × készletállapot árszorzó",
     description_en: "Material × stock-status price tweak",
     statusKind: "StockAdjustmentCount",
+  },
+  // S4 / ADR-0094 Gap 2 — per-family machine EUR/min rate tile.
+  {
+    moduleId: "quoting",
+    route: "quoting-machine-rates",
+    label_hu: "Gépdíjak",
+    label_en: "Machine rates",
+    description_hu: "Gépcsaládonkénti EUR/perc + lights-out",
+    description_en: "Per-family EUR/min + lights-out factor",
+    statusKind: "MachineRateCount",
   },
   // S273 / PR-262 / ADR-0069 — material-side balances tile. Read-only
   // operator surface that surfaces the DEAL saga's `committed_qty`

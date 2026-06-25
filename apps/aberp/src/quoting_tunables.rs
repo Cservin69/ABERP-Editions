@@ -306,6 +306,9 @@ pub struct QuotingParametersInputs {
     pub setup_base_min: f64,
     #[serde(default = "default_setup_5axis_min")]
     pub setup_5axis_min: f64,
+    // ADR-0094 Gap 2 (S4) — bar-feeder capacity routing tunable.
+    #[serde(default = "default_bar_capacity_mm")]
+    pub bar_capacity_mm: f64,
     #[serde(default)]
     pub notes: Option<String>,
 }
@@ -326,6 +329,8 @@ pub struct QuotingParameters {
     pub t_finish_min_per_cm2: f64,
     pub setup_base_min: f64,
     pub setup_5axis_min: f64,
+    /// ADR-0094 Gap 2 (S4) — bar-feeder capacity (mm) for engine routing.
+    pub bar_capacity_mm: f64,
     pub notes: Option<String>,
     pub updated_at: String,
     pub updated_by_actor: String,
@@ -400,6 +405,13 @@ fn default_setup_base_min() -> f64 {
 }
 fn default_setup_5axis_min() -> f64 {
     25.0
+}
+
+/// ADR-0094 Gap 2 (S4) — serde/seed default for `bar_capacity_mm`: the
+/// largest bar-stock diameter the shop's bar-fed Swiss/turn-mill accepts.
+/// 32 mm is a common bar-feeder capacity (engine default mirrored).
+fn default_bar_capacity_mm() -> f64 {
+    32.0
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq, Clone)]
@@ -480,6 +492,7 @@ CREATE TABLE IF NOT EXISTS quoting_parameters (
     t_finish_min_per_cm2          DOUBLE  NOT NULL DEFAULT 0.08,
     setup_base_min                DOUBLE  NOT NULL DEFAULT 20.0,
     setup_5axis_min               DOUBLE  NOT NULL DEFAULT 25.0,
+    bar_capacity_mm               DOUBLE  NOT NULL DEFAULT 32.0,
     notes                         VARCHAR,
     updated_at                    VARCHAR NOT NULL,
     updated_by_actor              VARCHAR NOT NULL
@@ -505,6 +518,15 @@ ALTER TABLE quoting_parameters ADD COLUMN IF NOT EXISTS mrr_rough_ref_cm3_per_mi
 ALTER TABLE quoting_parameters ADD COLUMN IF NOT EXISTS t_finish_min_per_cm2 DOUBLE;
 ALTER TABLE quoting_parameters ADD COLUMN IF NOT EXISTS setup_base_min DOUBLE;
 ALTER TABLE quoting_parameters ADD COLUMN IF NOT EXISTS setup_5axis_min DOUBLE;
+";
+
+/// ADR-0094 Gap 2 (S4) — add the `bar_capacity_mm` routing tunable to any
+/// pre-ADR-0094 parameters row. Replay-safe (DEFAULT-on-replay trap): the
+/// ADD carries NO `DEFAULT`, and `ensure_schema` backfills only the still-
+/// NULL column to 32.0 — a tuned value is never clobbered. Fresh installs
+/// already have the column + default from `CREATE TABLE`.
+const ADR0094_PARAMETERS_ADD_SQL: &str = "
+ALTER TABLE quoting_parameters ADD COLUMN IF NOT EXISTS bar_capacity_mm DOUBLE;
 ";
 
 // S410 / [[no-sql-specific]] — see `COMPLEXITY_RULES_SCHEMA_SQL` above.
@@ -540,6 +562,13 @@ pub fn ensure_schema(conn: &mut Connection, tenant: &str) -> Result<()> {
     conn.execute_batch(S418_PARAMETERS_ADD_SQL)
         .context("apply S418 quoting_parameters knob columns")?;
     backfill_s418_parameters(conn).context("backfill S418 quoting_parameters knobs")?;
+    conn.execute_batch(ADR0094_PARAMETERS_ADD_SQL)
+        .context("apply ADR-0094 bar_capacity_mm column")?;
+    conn.execute(
+        "UPDATE quoting_parameters SET bar_capacity_mm = ? WHERE bar_capacity_mm IS NULL;",
+        params![default_bar_capacity_mm()],
+    )
+    .context("backfill quoting_parameters.bar_capacity_mm")?;
     conn.execute_batch(STOCK_ADJUSTMENTS_SCHEMA_SQL)
         .context("ensure quoting_stock_adjustments schema")?;
     seed_tolerance_if_empty(conn, tenant)?;
@@ -640,8 +669,8 @@ fn seed_parameters_if_empty(conn: &mut Connection, tenant: &str) -> Result<()> {
             setup_amortization_threshold, min_margin, exotic_material_tax,
             machining_rate_eur_per_minute, cad_cam_rate_eur_per_hour, cad_cam_base_hours,
             mrr_rough_ref_cm3_per_min, t_finish_min_per_cm2, setup_base_min, setup_5axis_min,
-            notes, updated_at, updated_by_actor
-         ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'boot');",
+            bar_capacity_mm, notes, updated_at, updated_by_actor
+         ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'boot');",
         params![
             tenant,
             default_scrap_factor(),
@@ -657,6 +686,7 @@ fn seed_parameters_if_empty(conn: &mut Connection, tenant: &str) -> Result<()> {
             default_t_finish(),
             default_setup_base_min(),
             default_setup_5axis_min(),
+            default_bar_capacity_mm(),
             &now,
         ],
     )
@@ -1183,6 +1213,8 @@ pub fn validate_parameters(inputs: &QuotingParametersInputs) -> Result<(), Vec<V
     );
     check_non_negative(&mut errs, "setup_base_min", inputs.setup_base_min);
     check_non_negative(&mut errs, "setup_5axis_min", inputs.setup_5axis_min);
+    // ADR-0094 Gap 2 (S4) — bar capacity must be a finite, positive mm.
+    check_positive(&mut errs, "bar_capacity_mm", inputs.bar_capacity_mm);
     // min_margin must not exceed profit_margin_base — otherwise the
     // floor is above the base and every quote would be rejected.
     if inputs.min_margin.is_finite()
@@ -1211,7 +1243,7 @@ pub fn get_parameters(conn: &Connection, tenant: &str) -> Result<QuotingParamete
                     setup_amortization_threshold, min_margin, exotic_material_tax,
                     machining_rate_eur_per_minute, cad_cam_rate_eur_per_hour, cad_cam_base_hours,
                     mrr_rough_ref_cm3_per_min, t_finish_min_per_cm2, setup_base_min, setup_5axis_min,
-                    notes, updated_at, updated_by_actor
+                    notes, updated_at, updated_by_actor, bar_capacity_mm
              FROM quoting_parameters
              WHERE tenant_id = ? AND id = 1;",
         )
@@ -1259,6 +1291,7 @@ pub fn update_parameters(
                 t_finish_min_per_cm2          = ?,
                 setup_base_min                = ?,
                 setup_5axis_min               = ?,
+                bar_capacity_mm               = ?,
                 notes                         = ?,
                 updated_at                    = ?,
                 updated_by_actor              = ?
@@ -1277,6 +1310,7 @@ pub fn update_parameters(
                 inputs.t_finish_min_per_cm2,
                 inputs.setup_base_min,
                 inputs.setup_5axis_min,
+                inputs.bar_capacity_mm,
                 notes.as_deref(),
                 &now,
                 actor_login,
@@ -1736,6 +1770,11 @@ fn row_to_parameters(row: &duckdb::Row<'_>) -> duckdb::Result<QuotingParameters>
         notes: row.get(13)?,
         updated_at: row.get(14)?,
         updated_by_actor: row.get(15)?,
+        // ADR-0094 Gap 2 (S4) — NULL-safe: a migrated-but-not-yet-backfilled
+        // row reads the 32.0 default rather than erroring.
+        bar_capacity_mm: row
+            .get::<_, Option<f64>>(16)?
+            .unwrap_or_else(default_bar_capacity_mm),
     })
 }
 
@@ -1745,7 +1784,7 @@ fn read_parameters_in_tx(tx: &duckdb::Transaction<'_>, tenant: &str) -> Result<Q
                 setup_amortization_threshold, min_margin, exotic_material_tax,
                 machining_rate_eur_per_minute, cad_cam_rate_eur_per_hour, cad_cam_base_hours,
                 mrr_rough_ref_cm3_per_min, t_finish_min_per_cm2, setup_base_min, setup_5axis_min,
-                notes, updated_at, updated_by_actor
+                notes, updated_at, updated_by_actor, bar_capacity_mm
          FROM quoting_parameters
          WHERE tenant_id = ? AND id = 1;",
     )?;
@@ -2006,6 +2045,7 @@ mod tests {
             t_finish_min_per_cm2: 0.1,
             setup_base_min: 25.0,
             setup_5axis_min: 30.0,
+            bar_capacity_mm: 32.0,
             notes: Some("tuned 2026-06-06".to_string()),
         };
         let updated = update_parameters(&mut c, &m, "ervin", TENANT, &inputs).expect("update");
@@ -2031,6 +2071,7 @@ mod tests {
             t_finish_min_per_cm2: 0.08,
             setup_base_min: 20.0,
             setup_5axis_min: 25.0,
+            bar_capacity_mm: 32.0,
             notes: None,
         };
         let err = update_parameters(&mut c, &m, "ervin", TENANT, &bad);

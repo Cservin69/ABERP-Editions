@@ -1637,7 +1637,11 @@ export type MachineFamily =
   | "lathe"
   | "grinder"
   | "additive"
-  | "other";
+  | "other"
+  // S4 / ADR-0094 Gap 2 — turn-mill family extension (mirrors the S3 enum).
+  | "swiss-turn-mill"
+  | "turn-mill"
+  | "4-axis-mill";
 
 /** S427 — single quoting-machine row. Snake_case JSON mirrors
  * `aberp::machines::QuotingMachine`'s `#[derive(Serialize)]`. The
@@ -2247,6 +2251,8 @@ export interface QuotingParameters {
   t_finish_min_per_cm2: number;
   setup_base_min: number;
   setup_5axis_min: number;
+  // S4 / ADR-0094 Gap 2 — bar-feeder capacity (mm) for engine routing.
+  bar_capacity_mm: number;
   notes: string | null;
   updated_at: string;
   updated_by_actor: string;
@@ -2267,6 +2273,8 @@ export interface QuotingParametersInput {
   t_finish_min_per_cm2: number;
   setup_base_min: number;
   setup_5axis_min: number;
+  // S4 / ADR-0094 Gap 2 — bar-feeder capacity (mm) for engine routing.
+  bar_capacity_mm: number;
   notes: string | null;
 }
 
@@ -2346,6 +2354,51 @@ export async function updateStockAdjustment(
 }
 export async function deleteStockAdjustment(id: string): Promise<void> {
   await invoke<void>("delete_stock_adjustment", { id });
+}
+
+// ── S4 / ADR-0094 Gap 2 — Master Data → Machine Rates CRUD ───────────
+
+/** S4 — a `quoting_machine_rates` row (family-keyed EUR/min). Mirrors
+ * `aberp::quoting_machine_rates::MachineRateRow`'s `#[derive(Serialize)]`.
+ * One row per family per tenant. */
+export interface MachineRate {
+  /** Prefixed-ULID `qmr_<26-char-ULID>`. */
+  id: string;
+  family: MachineFamily;
+  attended_rate_eur_per_min: number;
+  lights_out_factor: number;
+  unattended_capable: boolean;
+  notes: string | null;
+  updated_at: string;
+  updated_by_actor: string;
+}
+
+/** S4 — request body for create/update. Mirror of
+ * `aberp::quoting_machine_rates::MachineRateInputs`. */
+export interface MachineRateInput {
+  family: MachineFamily;
+  attended_rate_eur_per_min: number;
+  lights_out_factor: number;
+  unattended_capable: boolean;
+  notes: string | null;
+}
+
+export async function listMachineRates(): Promise<{ rates: MachineRate[] }> {
+  return invoke<{ rates: MachineRate[] }>("list_machine_rates");
+}
+export async function createMachineRate(
+  body: MachineRateInput,
+): Promise<MachineRate> {
+  return invoke<MachineRate>("create_machine_rate", { body });
+}
+export async function updateMachineRate(
+  id: string,
+  body: MachineRateInput,
+): Promise<MachineRate> {
+  return invoke<MachineRate>("update_machine_rate", { id, body });
+}
+export async function deleteMachineRate(id: string): Promise<void> {
+  await invoke<void>("delete_machine_rate", { id });
 }
 
 // ── S273 / PR-262 / ADR-0069 — material-side Inventory Balances ──────

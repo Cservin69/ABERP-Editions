@@ -327,6 +327,12 @@ ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS stock_form VARCHAR;
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS stock_od_mm DOUBLE;
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS stock_id_mm DOUBLE;
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS stock_length_mm DOUBLE;
+-- S4 / ADR-0094 Gap 2 (wiring) — operator-supplied per-quote machine-family
+-- override. A `MachineFamily` db-string ('swiss-turn-mill' | 'turn-mill' |
+-- '4-axis-mill' | '3-axis-mill' | '5-axis-mill' | 'lathe' | …); NULL means
+-- unset, so the pipeline uses the geometry-routed family (inert default).
+-- Nullable, no DEFAULT per [[no-sql-specific]]; idempotent via IF NOT EXISTS.
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS machine_family_override VARCHAR;
 ";
 
 /// Idempotent — call at every writer entry.
@@ -1269,6 +1275,11 @@ pub struct JobDetail {
     pub stock_id_mm: Option<f64>,
     /// S2 — cut-off length, mm.
     pub stock_length_mm: Option<f64>,
+    /// S4 / ADR-0094 Gap 2 — operator-chosen machine-family override
+    /// (`MachineFamily` db-string); NULL = unset ⇒ pipeline uses the
+    /// geometry-routed family. Raw DB string here (this module stays free of
+    /// engine types); the pipeline parses + applies it.
+    pub machine_family_override: Option<String>,
 }
 
 /// S349 / PR-40 (U1) — read one job row + its artifacts for the detail
@@ -1292,7 +1303,8 @@ pub fn get_job_detail(
                     valid_until_iso, customer_company,
                     lead_time_days, lead_time_override_days,
                     buyer_partner_id, margin_override_pct, margin_below_floor, margin_floor_pct,
-                    stock_form, stock_od_mm, stock_id_mm, stock_length_mm
+                    stock_form, stock_od_mm, stock_id_mm, stock_length_mm,
+                    machine_family_override
                 FROM quote_pricing_jobs
                 WHERE quote_id = ? AND tenant_id = ?",
         )
@@ -1354,6 +1366,7 @@ pub fn get_job_detail(
         stock_od_mm: r.get::<_, Option<f64>>(28).ok().flatten(),
         stock_id_mm: r.get::<_, Option<f64>>(29).ok().flatten(),
         stock_length_mm: r.get::<_, Option<f64>>(30).ok().flatten(),
+        machine_family_override: r.get::<_, Option<String>>(31).ok().flatten(),
     }))
 }
 
@@ -1499,6 +1512,32 @@ pub fn set_stock_form(
             params![kind, od_mm, id_mm, length_mm, ts, quote_id, tenant_id],
         )
         .context("set_stock_form UPDATE")?;
+    Ok(changed > 0)
+}
+
+/// S4 / ADR-0094 Gap 2 — set or clear the operator's per-quote machine-family
+/// override. `family` is a `MachineFamily` db-string ('swiss-turn-mill', …);
+/// `None` clears it back to the geometry-routed default. Returns `false` if
+/// no such row exists. Mirrors [`set_margin_override`]; the daemon's next
+/// pricing pass re-reads the column and re-routes the rate.
+pub fn set_machine_family_override(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    family: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    ensure_schema(conn)?;
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format machine_family_override updated_at")?;
+    let changed = conn
+        .execute(
+            "UPDATE quote_pricing_jobs SET machine_family_override = ?, updated_at = ? \
+             WHERE quote_id = ? AND tenant_id = ?",
+            params![family, ts, quote_id, tenant_id],
+        )
+        .context("set_machine_family_override UPDATE")?;
     Ok(changed > 0)
 }
 
