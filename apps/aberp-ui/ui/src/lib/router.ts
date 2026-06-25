@@ -57,6 +57,8 @@ export type AppRoute =
   | "quoting-tolerance-multipliers"
   | "quoting-parameters"
   | "quoting-stock-adjustments"
+  // S4 / ADR-0094 Gap 2 — machine-family rate catalogue.
+  | "quoting-machine-rates"
   // S273 / PR-262 / ADR-0069 — material-side inventory balances. Lives
   // under the maintenance area's Quoting sub-nav alongside the
   // tunables (operators reach it when they need to bump on_hand_qty
@@ -173,6 +175,8 @@ export function parseRoute(hash: string): AppRoute {
       return "quoting-parameters";
     case "quoting-stock-adjustments":
       return "quoting-stock-adjustments";
+    case "quoting-machine-rates":
+      return "quoting-machine-rates";
     case "inventory-balances":
       return "inventory-balances";
     case "email-relay-queue":

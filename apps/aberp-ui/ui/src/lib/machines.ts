@@ -40,6 +40,10 @@ export const MACHINE_FAMILIES: readonly { value: MachineFamily; label: string }[
   { value: "grinder", label: "Grinder" },
   { value: "additive", label: "Additive" },
   { value: "other", label: "Other" },
+  // S4 / ADR-0094 Gap 2 — turn-mill family extension.
+  { value: "swiss-turn-mill", label: "Swiss turn-mill (lights-out)" },
+  { value: "turn-mill", label: "Turn-mill" },
+  { value: "4-axis-mill", label: "4-axis mill" },
 ];
 
 /** S427 — human label for a family db-string. Falls back to the raw

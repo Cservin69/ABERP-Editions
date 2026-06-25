@@ -69,6 +69,8 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "quoting-tolerance-multipliers",
   "quoting-parameters",
   "quoting-stock-adjustments",
+  // S4 / ADR-0094 Gap 2 — machine-family rate catalogue.
+  "quoting-machine-rates",
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
   "inventory-balances",
   // S281 / PR-266 — storefront email-relay queue inspector.
@@ -137,6 +139,7 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   "quoting-tolerance-multipliers": "quoting",
   "quoting-parameters": "quoting",
   "quoting-stock-adjustments": "quoting",
+  "quoting-machine-rates": "quoting",
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances; lives
   // under Quoting because the operator visits it when prepping a new
   // grade (the DEAL saga's auto-upsert lands the row at zeros until
@@ -191,6 +194,7 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   "quoting-tolerance-multipliers": "maintenance",
   "quoting-parameters": "maintenance",
   "quoting-stock-adjustments": "maintenance",
+  "quoting-machine-rates": "maintenance",
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
   "inventory-balances": "maintenance",
   // S281 / PR-266 — storefront email-relay queue inspector.
@@ -244,6 +248,8 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   "ToleranceMultiplierCount",
   "ParametersStatus",
   "StockAdjustmentCount",
+  // S4 / ADR-0094 Gap 2 — machine-family rate tile.
+  "MachineRateCount",
   // S273 / PR-262 / ADR-0069 — material-side balances tile.
   "InventoryBalanceCount",
   // S281 / PR-266 — storefront email-relay queue tile.

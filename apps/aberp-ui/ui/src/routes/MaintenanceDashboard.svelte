@@ -47,6 +47,7 @@
     listRestoredInvoices,
     listSellerBanks,
     listStockAdjustments,
+    listMachineRates,
     listToleranceMultipliers,
     type NavCredentialsStatusResponse,
     type SellerInfoResponse,
@@ -294,6 +295,13 @@
         const res = await listStockAdjustments();
         const n = res.adjustments.length;
         return n === 1 ? "1 adjustment" : `${n} adjustments`;
+      }
+      case "MachineRateCount": {
+        // S4 / ADR-0094 Gap 2 — count of per-family machine-rate rows.
+        // Seeded with the six ADR-0094 families on a fresh tenant.
+        const res = await listMachineRates();
+        const n = res.rates.length;
+        return n === 1 ? "1 family rate" : `${n} family rates`;
       }
       case "InventoryBalanceCount": {
         // S273 / PR-262 / ADR-0069 — count of `(tenant,

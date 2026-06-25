@@ -32,6 +32,7 @@
     t_finish_min_per_cm2: 0.08,
     setup_base_min: 20,
     setup_5axis_min: 25,
+    bar_capacity_mm: 32,
     notes: null,
   });
 
@@ -66,6 +67,7 @@
         t_finish_min_per_cm2: p.t_finish_min_per_cm2,
         setup_base_min: p.setup_base_min,
         setup_5axis_min: p.setup_5axis_min,
+        bar_capacity_mm: p.bar_capacity_mm,
         notes: p.notes,
       };
       loadState = "ready";
@@ -287,6 +289,17 @@
           bind:value={draft.setup_5axis_min}
         />
         <small>5-tengelyes útvonalnál hozzáadva / Added when the part routes to 5-axis.</small>
+      </label>
+      <label>
+        <span>Rúdadagoló kapacitás / Bar capacity (mm)</span>
+        <input
+          type="number"
+          step="any"
+          min="0"
+          disabled={demo}
+          bind:value={draft.bar_capacity_mm}
+        />
+        <small>Eddig az átmérőig esztergaközpontba / Round/tube parts up to this Ø route to the lights-out Swiss turn-mill (ADR-0094 Gap 2).</small>
       </label>
       <label class="qt-grid__notes">
         <span>Jegyzet / Notes</span>
