@@ -1043,8 +1043,7 @@ impl PricingPipelineService {
             // gear path ⇒ price byte-identical to pre-Gap-3.
             let gear_ops_source = stamp_gear_ops(
                 &mut graph,
-                operator_gear_ops(gear_ops_json.as_deref())
-                    .context("decode operator gear ops")?,
+                operator_gear_ops(gear_ops_json.as_deref()).context("decode operator gear ops")?,
             );
             let gear_process_rows =
                 crate::quoting_gear_processes::list_gear_processes(&conn, &tenant_id_string)

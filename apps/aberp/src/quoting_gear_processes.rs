@@ -242,8 +242,9 @@ pub fn validate_gear_process_inputs(
     if !(inputs.module_exponent.is_finite() && inputs.module_exponent >= 0.0) {
         errors.push(ValidationError {
             field: "module_exponent",
-            message: "A modul-kitevő legyen véges és >= 0. / Module exponent must be finite and >= 0."
-                .to_string(),
+            message:
+                "A modul-kitevő legyen véges és >= 0. / Module exponent must be finite and >= 0."
+                    .to_string(),
         });
     }
 
@@ -255,8 +256,9 @@ pub fn validate_gear_process_inputs(
     {
         errors.push(ValidationError {
             field: "in_cycle_factor",
-            message: "A ciklus-szorzó (0, 1] tartományban legyen. / In-cycle factor must be in (0, 1]."
-                .to_string(),
+            message:
+                "A ciklus-szorzó (0, 1] tartományban legyen. / In-cycle factor must be in (0, 1]."
+                    .to_string(),
         });
     }
 

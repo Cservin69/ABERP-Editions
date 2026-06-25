@@ -12632,7 +12632,9 @@ fn normalize_gear_ops_body(
             )));
         }
         if g.teeth < 1 {
-            return Err(GearOpsError::Invalid(format!("gear {i}: teeth must be >= 1")));
+            return Err(GearOpsError::Invalid(format!(
+                "gear {i}: teeth must be >= 1"
+            )));
         }
         if !(1u8..=15).contains(&g.quality_agma) {
             return Err(GearOpsError::Invalid(format!(
@@ -12686,9 +12688,10 @@ async fn handle_set_quote_gear_ops(
     }
     let state_for_task = state.clone();
     let qid = quote_id.clone();
-    let result =
-        tokio::task::spawn_blocking(move || set_quote_gear_ops_request(&state_for_task, &qid, body))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        set_quote_gear_ops_request(&state_for_task, &qid, body)
+    })
+    .await;
     match result {
         Ok(Ok(v)) => (axum::http::StatusCode::OK, axum::Json(v)).into_response(),
         Ok(Err(GearOpsError::Invalid(msg))) => (
