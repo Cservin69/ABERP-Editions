@@ -15,6 +15,7 @@
 //! The compile-time edition→root binding is pinned in `build_profile::tests`
 //! and `tests/edition_db_isolation.rs`.
 
+#[cfg(not(feature = "production"))]
 use std::process::Command;
 
 /// A dev build (no `production` feature) launched as `--tenant prod`
