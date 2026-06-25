@@ -3947,6 +3947,7 @@ mod tests {
     // ── S2 / ADR-0094 Gap 1 — stock-form stamp precedence (pure) ──────
     fn mk_graph(stock_form: StockForm) -> FeatureGraph {
         FeatureGraph {
+            gears: Vec::new(),
             schema_version: FeatureGraph::SCHEMA_VERSION,
             bounding_box_mm: [10.0, 10.0, 10.0],
             volume_mm3: 1000.0,

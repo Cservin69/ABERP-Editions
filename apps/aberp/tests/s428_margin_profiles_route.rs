@@ -222,6 +222,7 @@ fn fixed_ts() -> time::OffsetDateTime {
 
 fn sample_feature_graph_json() -> String {
     let g = FeatureGraph {
+        gears: Vec::new(),
         schema_version: FeatureGraph::SCHEMA_VERSION,
         bounding_box_mm: [50.0, 30.0, 20.0],
         volume_mm3: 12_345.6,

@@ -1150,6 +1150,7 @@ mod tests {
 
     fn sample_graph_json() -> String {
         let g = FeatureGraph {
+            gears: Vec::new(),
             schema_version: 2,
             bounding_box_mm: [50.0, 30.0, 20.0],
             volume_mm3: 12345.6,
@@ -1169,6 +1170,7 @@ mod tests {
 
     fn sample_breakdown_json() -> String {
         let b = QuoteBreakdown {
+            gear_cost: 0.0,
             material_cost: 1.23,
             machining_cost: 9.87,
             cad_cam_cost: 2.10,
