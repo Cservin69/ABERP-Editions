@@ -1231,6 +1231,16 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             .context("ensure quoting_machine_rates schema at serve boot")?;
         crate::quoting_machine_rates::seed_machine_rates_if_absent(&conn, tenant.as_str())
             .context("seed quoting_machine_rates families at serve boot")?;
+        // S6 / ADR-0094 Gap 3 — gear-process catalogue: idempotent schema +
+        // five-process seed (insert-if-absent). Co-located with the machine-
+        // rate boot migration; the pricing pipeline snapshots this into the
+        // engine's 11th `gear_process_rates` argument. Seeding is inert for
+        // existing quotes (gear cost accrues only on a part that carries gear
+        // ops, a brand-new defaulted-empty field).
+        crate::quoting_gear_processes::ensure_schema(&conn)
+            .context("ensure quoting_gear_processes schema at serve boot")?;
+        crate::quoting_gear_processes::seed_gear_processes_if_absent(&conn, tenant.as_str())
+            .context("seed quoting_gear_processes at serve boot")?;
     }
 
     // S232 / PR-228 / ADR-0062 — pin the work-orders schema at boot
@@ -3896,6 +3906,15 @@ pub fn build_router(state: AppState) -> Router {
             "/api/quoting-machine-rates/:id",
             put(handle_update_machine_rate).delete(handle_delete_machine_rate),
         )
+        // S6 / ADR-0094 Gap 3 — per-process gear-generation coefficient catalogue.
+        .route(
+            "/api/quoting-gear-processes",
+            get(handle_list_gear_processes).post(handle_create_gear_process),
+        )
+        .route(
+            "/api/quoting-gear-processes/:id",
+            put(handle_update_gear_process).delete(handle_delete_gear_process),
+        )
         // S273 / PR-262 / ADR-0069 — material-side inventory balances
         // (on_hand / reserved / committed / consumed). Read-only in v1;
         // writes happen via the DEAL saga (committed) and the future
@@ -4326,6 +4345,13 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/quote-pricing-jobs/:quote_id/stock-form",
             post(handle_set_quote_stock_form),
+        )
+        // S6 / ADR-0094 Gap 3 — set/clear the operator's per-quote gear ops
+        // (a vector of kind/module/teeth/face-width/AGMA/process) and re-price
+        // in place. Inert when the array is empty.
+        .route(
+            "/api/quote-pricing-jobs/:quote_id/gear-ops",
+            post(handle_set_quote_gear_ops),
         )
         // S416 — the operator accept-on-behalf route (S354 / PR-42 / U16)
         // was REMOVED: it was redundant (the customer accepts via the
@@ -12503,6 +12529,250 @@ pub fn set_quote_stock_form_request(
     }
 }
 
+// ── S6 / ADR-0094 Gap 3 — operator gear-ops intake + in-place re-price ──
+
+/// One operator-entered gear op in the request body. `kind` + `process` are
+/// db-strings checked against the engine's closed vocab (the `GearKind` /
+/// `GearProcess` enums ARE the vocabulary); numerics are range-checked.
+#[derive(Debug, serde::Deserialize)]
+pub struct GearOpInput {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub module_mm: f64,
+    #[serde(default)]
+    pub teeth: u32,
+    #[serde(default)]
+    pub face_width_mm: f64,
+    #[serde(default)]
+    pub quality_agma: u8,
+    #[serde(default)]
+    pub process: String,
+}
+
+/// Request body for `POST /api/quote-pricing-jobs/:quote_id/gear-ops`. An
+/// empty `gears` array clears the override back to the inert no-gear default.
+#[derive(Debug, serde::Deserialize)]
+pub struct GearOpsBody {
+    #[serde(default)]
+    pub gears: Vec<GearOpInput>,
+}
+
+/// Typed error for the gear-ops route, mapped to an HTTP status by the handler
+/// (same posture as [`StockFormError`]).
+#[derive(Debug)]
+pub enum GearOpsError {
+    /// Bad kind/process vocab, or a non-positive / out-of-band numeric -> 400.
+    Invalid(String),
+    /// No row for `(tenant, quote_id)` -> 404.
+    NotFound,
+    /// Unexpected internal failure -> 500.
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for GearOpsError {
+    fn from(e: anyhow::Error) -> Self {
+        GearOpsError::Other(e)
+    }
+}
+
+/// Closed-vocab: db-string -> engine `GearKind` (round-trips `as_db_str`).
+fn gear_kind_from_db_str(s: &str) -> Option<aberp_quote_engine::GearKind> {
+    use aberp_quote_engine::GearKind::{ExternalSpurHelical, InternalRing};
+    [ExternalSpurHelical, InternalRing]
+        .into_iter()
+        .find(|k| k.as_db_str() == s)
+}
+
+/// Closed-vocab: db-string -> engine `GearProcess` (round-trips `as_db_str`).
+/// Includes `auto` — a valid per-op directive (unlike the rates catalogue,
+/// which stores concrete processes only).
+fn gear_process_from_db_str(s: &str) -> Option<aberp_quote_engine::GearProcess> {
+    use aberp_quote_engine::GearProcess::{Auto, Broach, Hob, PowerSkive, Shape, WireEdm};
+    [Auto, Hob, PowerSkive, Shape, Broach, WireEdm]
+        .into_iter()
+        .find(|p| p.as_db_str() == s)
+}
+
+/// Validate the body into the canonical engine `Vec<GearOp>` JSON string the
+/// pipeline deserializes into `FeatureGraph.gears`. `Ok(None)` clears the
+/// override (empty array -> inert). Pure — unit-tested. Each gear's kind +
+/// process is checked against the engine closed vocab; numerics must be finite
+/// + positive, teeth >= 1, AGMA in 1..=15 (the band the engine datum /
+/// escalation constants live in). Surfaces the first failing gear loudly
+/// (CLAUDE.md rule 12).
+fn normalize_gear_ops_body(
+    body: &GearOpsBody,
+) -> std::result::Result<Option<String>, GearOpsError> {
+    if body.gears.is_empty() {
+        return Ok(None);
+    }
+    let mut ops: Vec<aberp_quote_engine::GearOp> = Vec::with_capacity(body.gears.len());
+    for (i, g) in body.gears.iter().enumerate() {
+        let kind = gear_kind_from_db_str(g.kind.trim()).ok_or_else(|| {
+            GearOpsError::Invalid(format!(
+                "gear {i}: unknown kind `{}` (external_spur_helical | internal_ring)",
+                g.kind
+            ))
+        })?;
+        let process = gear_process_from_db_str(g.process.trim()).ok_or_else(|| {
+            GearOpsError::Invalid(format!(
+                "gear {i}: unknown process `{}` (auto|hob|power_skive|shape|broach|wire_edm)",
+                g.process
+            ))
+        })?;
+        if !(g.module_mm.is_finite() && g.module_mm > 0.0) {
+            return Err(GearOpsError::Invalid(format!(
+                "gear {i}: module_mm must be finite and > 0"
+            )));
+        }
+        if !(g.face_width_mm.is_finite() && g.face_width_mm > 0.0) {
+            return Err(GearOpsError::Invalid(format!(
+                "gear {i}: face_width_mm must be finite and > 0"
+            )));
+        }
+        if g.teeth < 1 {
+            return Err(GearOpsError::Invalid(format!("gear {i}: teeth must be >= 1")));
+        }
+        if !(1u8..=15).contains(&g.quality_agma) {
+            return Err(GearOpsError::Invalid(format!(
+                "gear {i}: quality_agma must be in 1..=15"
+            )));
+        }
+        ops.push(aberp_quote_engine::GearOp {
+            kind,
+            module_mm: g.module_mm,
+            teeth: g.teeth,
+            face_width_mm: g.face_width_mm,
+            quality_agma: g.quality_agma,
+            process,
+        });
+    }
+    let json = serde_json::to_string(&ops)
+        .context("serialize validated gear ops")
+        .map_err(GearOpsError::Other)?;
+    Ok(Some(json))
+}
+
+/// `POST /api/quote-pricing-jobs/:quote_id/gear-ops` — set or clear the
+/// operator gear ops, then re-price the job in place so the operator sees the
+/// corrected price immediately. Bearer-gated like the stock-form/margin
+/// siblings. 400 on an invalid gear; 404 when no row matches; 200
+/// `{ ok, gear_count, total_price_eur, below_floor, repriced }`.
+///
+/// Audit posture (mirrors S2 stock-form): the chosen gears + cost are audited
+/// via the daemon's extended `quote.pricing_priced` payload (it carries
+/// `gear_cost_eur` + the resolved gear ops + the rate snapshot); this in-place
+/// re-price persists the corrected price + column but does not mint a dedicated
+/// gear-ops EventKind. FLAGGED if a per-set audit row is later wanted.
+async fn handle_set_quote_gear_ops(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(quote_id): AxumPath<String>,
+    Json(body): Json<GearOpsBody>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if !is_quote_id_shape(&quote_id) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid quote_id"})),
+        )
+            .into_response();
+    }
+    let state_for_task = state.clone();
+    let qid = quote_id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || set_quote_gear_ops_request(&state_for_task, &qid, body))
+            .await;
+    match result {
+        Ok(Ok(v)) => (axum::http::StatusCode::OK, axum::Json(v)).into_response(),
+        Ok(Err(GearOpsError::Invalid(msg))) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "InvalidGearOps", "message": msg})),
+        )
+            .into_response(),
+        Ok(Err(GearOpsError::NotFound)) => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(error_body(format!(
+                "no pricing job found with quote_id {quote_id}"
+            ))),
+        )
+            .into_response(),
+        Ok(Err(GearOpsError::Other(e))) => internal_error("set_quote_gear_ops_request", e),
+        Err(join_err) => internal_error(
+            "set_quote_gear_ops_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+/// Library helper backing the gear-ops route. `pub` so the integration test
+/// can hit it without the HTTPS listener (same posture as the stock-form
+/// helper). Validates, persists the override column, re-prices in place (the
+/// re-price re-reads the column + stamps the graph), and persists the
+/// corrected breakdown + price.
+pub fn set_quote_gear_ops_request(
+    state: &AppState,
+    quote_id: &str,
+    body: GearOpsBody,
+) -> std::result::Result<serde_json::Value, GearOpsError> {
+    let gear_ops_json = normalize_gear_ops_body(&body)?;
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tenant = state.tenant.as_str();
+    let now = time::OffsetDateTime::now_utc();
+
+    // 1) Persist the override column FIRST so the re-price re-reads it.
+    let applied = crate::quote_pricing_jobs::set_gear_ops(
+        &conn,
+        quote_id,
+        tenant,
+        gear_ops_json.as_deref(),
+        now,
+    )?;
+    if !applied {
+        return Err(GearOpsError::NotFound);
+    }
+
+    let gear_count = body.gears.len();
+
+    // 2) Re-price in place — reprice_quote stamps the now-persisted gears.
+    match crate::quote_pricing_pipeline::reprice_quote(&conn, tenant, quote_id, None)? {
+        Some(outcome) => {
+            // 3) Persist the corrected breakdown + price + floor verdict.
+            crate::quote_pricing_jobs::set_margin_result(
+                &conn,
+                quote_id,
+                tenant,
+                &outcome.breakdown_json,
+                outcome.total_price,
+                outcome.below_floor,
+                outcome.floor_pct,
+                now,
+            )?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "gear_count": gear_count,
+                "total_price_eur": outcome.total_price,
+                "below_floor": outcome.below_floor,
+                "repriced": true,
+            }))
+        }
+        None => Ok(serde_json::json!({
+            "ok": true,
+            "gear_count": gear_count,
+            "total_price_eur": serde_json::Value::Null,
+            "below_floor": false,
+            "repriced": false,
+        })),
+    }
+}
+
 /// Emit the margin-provenance events (global-margin / below-floor) after a
 /// re-price triggered by a buyer-partner change. Mirrors the daemon's
 /// first-pricing emission so an operator-assigned buyer leaves the same
@@ -13834,6 +14104,159 @@ async fn handle_delete_machine_rate(
         Ok(Err(e)) => tunable_write_response(e, "delete_machine_rate"),
         Err(join_err) => internal_error(
             "delete_machine_rate:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ── quoting_gear_processes (ADR-0094 Gap 3, S6) ──────────────────────
+// Mirrors the machine-rate CRUD handlers verbatim (bearer-gated, blocking
+// DuckDB on a worker, reused `tunable_write_response` mapping).
+
+async fn handle_list_gear_processes(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<Vec<crate::quoting_gear_processes::GearProcessRow>> {
+            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            crate::quoting_gear_processes::list_gear_processes(
+                &conn,
+                state_for_task.tenant.as_str(),
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "processes": rows })).into_response(),
+        Ok(Err(e)) => internal_error("list_gear_processes", e),
+        Err(join_err) => internal_error(
+            "list_gear_processes:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_create_gear_process(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<crate::quoting_gear_processes::GearProcessInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_gear_processes::create_gear_process(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => (StatusCode::CREATED, Json(row)).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "create_gear_process"),
+        Err(join_err) => internal_error(
+            "create_gear_process:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_update_gear_process(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<crate::quoting_gear_processes::GearProcessInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_gear_processes::update_gear_process(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &id,
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => Json(row).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "update_gear_process"),
+        Err(join_err) => internal_error(
+            "update_gear_process:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_delete_gear_process(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<(), crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_gear_processes::delete_gear_process(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &id,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "delete_gear_process"),
+        Err(join_err) => internal_error(
+            "delete_gear_process:join",
             anyhow!("blocking task panicked: {join_err}"),
         ),
     }
