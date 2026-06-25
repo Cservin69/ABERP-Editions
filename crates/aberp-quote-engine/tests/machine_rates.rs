@@ -44,6 +44,7 @@ fn shop_quote(fg: &FeatureGraph, qty: u32, rates: &[MachineRate]) -> QuoteBreakd
         DEFAULT_TOL,
         &CalibrationTable::neutral(),
         rates,
+        &[],
     )
     .expect("shop-model quote must succeed")
 }

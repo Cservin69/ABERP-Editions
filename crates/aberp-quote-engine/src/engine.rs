@@ -11,10 +11,13 @@
 use crate::breakdown::QuoteBreakdown;
 use crate::capacity::MachineFamily;
 use crate::catalogue::{
-    ComplexityRule, MachineRate, Material, QuotingParameters, StockAdjustment, ToleranceMultiplier,
+    ComplexityRule, GearProcessRate, MachineRate, Material, QuotingParameters, StockAdjustment,
+    ToleranceMultiplier,
 };
 use crate::error::QuoteError;
-use crate::feature_graph::{FeatureGraph, SizeBucket, StockForm, ToleranceRange};
+use crate::feature_graph::{
+    FeatureGraph, GearKind, GearOp, GearProcess, SizeBucket, StockForm, ToleranceRange,
+};
 use crate::ENGINE_VERSION;
 
 /// Machining-cost multiplier applied when the part has a thin wall AND
@@ -24,6 +27,28 @@ use crate::ENGINE_VERSION;
 /// `TODO`: when a future cut adds a per-machine-class rate split, this
 /// could migrate to the `quoting_parameters` row alongside the rate.
 pub const THIN_WALL_TIGHT_TOL_BUMP: f64 = 1.15;
+
+// ── ADR-0094 Gap 3: gear-generation op constants (golden-guarded) ─────
+//
+// Pinned engine constants — like `THIN_WALL_TIGHT_TOL_BUMP`, the golden gear
+// fixtures catch any drift. They encode the SHAPE of the cost model (datum
+// quality class, face-width reference, the internal-ring shape→wire-EDM
+// escalation); the per-process NUMBERS live in the operator-tunable
+// `GearProcessRate` catalogue.
+
+/// AGMA datum class for gear quality scaling: `quality_factor = 1 + max(0,
+/// agma - this) * rate.agma_quality_factor_base`. At/below the datum the
+/// quality factor is `1.0`; each class above adds the rate's per-class growth.
+pub const GEAR_AGMA_DATUM_CLASS: u8 = 8;
+
+/// Reference face width (mm): `facewidth_factor = face_width_mm / this`
+/// (linear — a 2x wider gear takes 2x the generation time).
+pub const GEAR_FACEWIDTH_REF_MM: f64 = 10.0;
+
+/// Internal-ring AGMA escalation: under [`GearProcess::Auto`], an internal
+/// ring at a class STRICTLY ABOVE this routes to slow, precise wire-EDM;
+/// at/below it routes to gear shaping.
+pub const GEAR_INTERNAL_WIRE_EDM_AGMA: u8 = 12;
 
 // ── CAD-CAM complexity-matrix weights (report §4.2) ──────────────────
 //
@@ -157,6 +182,7 @@ pub fn quote_with_calibration(
         target_tolerance,
         calibration,
         &[],
+        &[],
     )
 }
 
@@ -188,6 +214,7 @@ pub fn quote_with_shop_model(
     target_tolerance: ToleranceRange,
     calibration: &crate::calibration::CalibrationTable,
     machine_rates: &[MachineRate],
+    gear_process_rates: &[GearProcessRate],
 ) -> Result<QuoteBreakdown, QuoteError> {
     // ── Pre-flight validation ─────────────────────────────────────
     if quantity == 0 {
@@ -721,19 +748,49 @@ pub fn quote_with_shop_model(
         c = cad_cam_cost,
     ));
 
+    // ── ADR-0094 Gap 3: gear-generation op cost ───────────────────
+    // Per gear: resolve the process (Auto ⇒ `select_gear_process`), look up
+    // its operator-tunable `GearProcessRate`, and compute
+    //   gear_min = setup_min + z·min_per_tooth·module^exp·fw_factor·qual_factor
+    // (× in_cycle_factor when power-skived in-cycle on a routed turning
+    // family), costed at the routed family's EFFECTIVE €/min (the same rate
+    // the machining line used). Summed into `gear_cost` and folded into the
+    // subtotal. EMPTY gears ⇒ the loop never runs ⇒ `gear_cost` stays 0.0, NO
+    // reasoning line is added, and the subtotal line below is TODAY'S EXACT
+    // line ⇒ byte-identical pricing.
+    let gear_cost = gear_op_cost(
+        &feature_graph.gears,
+        routed_family,
+        machining_rate,
+        gear_process_rates,
+        &mut log,
+    );
+
     // ── Step 10–13: subtotal → overhead → margin → total ─────────
-    let subtotal = material_cost + machining_cost + setup_cost + cad_cam_cost;
+    let subtotal = material_cost + machining_cost + setup_cost + cad_cam_cost + gear_cost;
     let overhead = subtotal * parameters.overhead_factor;
     let margin = (subtotal + overhead) * parameters.profit_margin_base;
     let total_price = subtotal + overhead + margin;
-    log.push(format!(
-        "[totals] material={m:.4} + machining={mc:.4} + setup={s:.4} + cad_cam={cc:.4} = subtotal={st:.4} EUR",
-        m = material_cost,
-        mc = machining_cost,
-        s = setup_cost,
-        cc = cad_cam_cost,
-        st = subtotal,
-    ));
+    if feature_graph.gears.is_empty() {
+        log.push(format!(
+            "[totals] material={m:.4} + machining={mc:.4} + setup={s:.4} + cad_cam={cc:.4} = subtotal={st:.4} EUR",
+            m = material_cost,
+            mc = machining_cost,
+            s = setup_cost,
+            cc = cad_cam_cost,
+            st = subtotal,
+        ));
+    } else {
+        log.push(format!(
+            "[totals] material={m:.4} + machining={mc:.4} + setup={s:.4} + cad_cam={cc:.4} + gear={g:.4} = subtotal={st:.4} EUR",
+            m = material_cost,
+            mc = machining_cost,
+            s = setup_cost,
+            cc = cad_cam_cost,
+            g = gear_cost,
+            st = subtotal,
+        ));
+    }
     log.push(format!(
         "[totals] overhead = subtotal * overhead_factor={of:.4} = {oh:.4} EUR",
         of = parameters.overhead_factor,
@@ -773,6 +830,7 @@ pub fn quote_with_shop_model(
         machining_cost,
         cad_cam_cost,
         setup_cost,
+        gear_cost,
         overhead,
         margin,
         total_price,
@@ -892,4 +950,154 @@ fn is_turned_bar_stock(stock_form: StockForm) -> bool {
         stock_form,
         StockForm::RoundBar { .. } | StockForm::Tube { .. }
     )
+}
+
+/// S5 / ADR-0094 Gap 3 — deterministic gear-process selection for
+/// [`GearProcess::Auto`]. Pure, total, reasoning-logged at the call site.
+///
+/// - **External** spur/helical ⇒ power-skiving when the part is routed to a
+///   turning family ([`MachineFamily::SwissTurnMill`]/[`MachineFamily::TurnMill`])
+///   — the teeth are generated in-cycle on the spindle that already holds the
+///   part; otherwise hobbing on a dedicated hobber.
+/// - **Internal** ring ⇒ gear shaping, escalating to wire-EDM STRICTLY ABOVE
+///   [`GEAR_INTERNAL_WIRE_EDM_AGMA`] (the tightest classes need EDM's
+///   tool-free precision). Broaching is never auto-selected — it is a
+///   volume-driven operator override.
+///
+/// Public so the S6 SPA can preview the engine's choice (mirrors
+/// [`route_family`] / [`is_exotic_material`]).
+pub fn select_gear_process(
+    kind: GearKind,
+    routed_family: MachineFamily,
+    quality_agma: u8,
+) -> GearProcess {
+    match kind {
+        GearKind::ExternalSpurHelical => {
+            if matches!(
+                routed_family,
+                MachineFamily::SwissTurnMill | MachineFamily::TurnMill
+            ) {
+                GearProcess::PowerSkive
+            } else {
+                GearProcess::Hob
+            }
+        }
+        GearKind::InternalRing => {
+            if quality_agma > GEAR_INTERNAL_WIRE_EDM_AGMA {
+                GearProcess::WireEdm
+            } else {
+                GearProcess::Shape
+            }
+        }
+    }
+}
+
+/// S5 / ADR-0094 Gap 3 — sum the per-gear tooth-generation op cost, reasoning-
+/// logging each gear. Returns `0.0` for an EMPTY gear list WITHOUT touching
+/// `log`, so the no-gear path is byte-identical to pre-Gap-3. A gear whose
+/// resolved process has no [`GearProcessRate`] row contributes `0.0` and a
+/// loud log line (fail-soft + surfaced per CLAUDE.md rule 12 — the trust log
+/// is the signal). Pure, finite, non-negative for valid (non-negative) inputs.
+fn gear_op_cost(
+    gears: &[GearOp],
+    routed_family: MachineFamily,
+    effective_rate_eur_per_min: f64,
+    gear_process_rates: &[GearProcessRate],
+    log: &mut Vec<String>,
+) -> f64 {
+    let mut gear_cost = 0.0;
+    for (gi, g) in gears.iter().enumerate() {
+        // Resolve Auto → concrete process; reasoning-log the choice.
+        let resolved = match g.process {
+            GearProcess::Auto => {
+                let sel = select_gear_process(g.kind, routed_family, g.quality_agma);
+                log.push(format!(
+                    "[gear {gi}] kind={k} process=auto → selected {sel} (routed_family={fam}, agma={q})",
+                    k = g.kind.as_db_str(),
+                    sel = sel.as_db_str(),
+                    fam = routed_family.as_db_str(),
+                    q = g.quality_agma,
+                ));
+                sel
+            }
+            forced => {
+                log.push(format!(
+                    "[gear {gi}] kind={k} process={p} (operator-forced)",
+                    k = g.kind.as_db_str(),
+                    p = forced.as_db_str(),
+                ));
+                forced
+            }
+        };
+        // Look up the operator-tunable process coefficients.
+        let Some(rate) = gear_process_rates
+            .iter()
+            .find(|r| r.process == resolved.as_db_str())
+        else {
+            log.push(format!(
+                "[gear {gi}] WARNING no GearProcessRate row for process={p} → 0.0000 EUR (seed quoting_gear_processes)",
+                p = resolved.as_db_str(),
+            ));
+            continue;
+        };
+        // gen_min = z · min_per_tooth · module^exp · facewidth_factor · quality_factor
+        let quality_steps = g.quality_agma.saturating_sub(GEAR_AGMA_DATUM_CLASS);
+        let quality_factor = 1.0 + (quality_steps as f64) * rate.agma_quality_factor_base;
+        let facewidth_factor = (g.face_width_mm / GEAR_FACEWIDTH_REF_MM).max(0.0);
+        // Guard a non-positive module (extractor/wiring validates positives;
+        // defence-in-depth keeps `powf` finite, per the property test).
+        let module_pow = if g.module_mm > 0.0 {
+            g.module_mm.powf(rate.module_exponent)
+        } else {
+            0.0
+        };
+        let gen_min =
+            (g.teeth as f64) * rate.min_per_tooth * module_pow * facewidth_factor * quality_factor;
+        let base_gear_min = rate.setup_min + gen_min;
+        log.push(format!(
+            "[gear {gi}] setup={sm:.4} + z={z}·mpt={mpt:.4}·module^{me:.4}({mp:.4})·fw={fw:.4}·qual={qf:.4} = gear_min={gm:.4} min",
+            sm = rate.setup_min,
+            z = g.teeth,
+            mpt = rate.min_per_tooth,
+            me = rate.module_exponent,
+            mp = module_pow,
+            fw = facewidth_factor,
+            qf = quality_factor,
+            gm = base_gear_min,
+        ));
+        // In-cycle discount: power-skiving on the routed turning family.
+        let in_cycle = resolved == GearProcess::PowerSkive
+            && matches!(
+                routed_family,
+                MachineFamily::SwissTurnMill | MachineFamily::TurnMill
+            );
+        let gear_min = if in_cycle {
+            let v = base_gear_min * rate.in_cycle_factor;
+            log.push(format!(
+                "[gear {gi}] in-cycle on {fam}: gear_min * in_cycle_factor={icf:.4} = {b:.4} → {a:.4} min",
+                fam = routed_family.as_db_str(),
+                icf = rate.in_cycle_factor,
+                b = base_gear_min,
+                a = v,
+            ));
+            v
+        } else {
+            base_gear_min
+        };
+        let this_cost = (gear_min * effective_rate_eur_per_min).max(0.0);
+        gear_cost += this_cost;
+        log.push(format!(
+            "[gear {gi}] gear_min={gm:.4} min * effective_rate={r:.4} EUR/min = {c:.4} EUR",
+            gm = gear_min,
+            r = effective_rate_eur_per_min,
+            c = this_cost,
+        ));
+    }
+    if !gears.is_empty() {
+        log.push(format!(
+            "[gear] total gear_cost={gc:.4} EUR",
+            gc = gear_cost
+        ));
+    }
+    gear_cost
 }

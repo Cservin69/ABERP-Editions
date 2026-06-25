@@ -120,16 +120,18 @@ pub use capacity::{
     FALLBACK_DAILY_HOURS,
 };
 pub use catalogue::{
-    ComplexityRule, MachineRate, Material, QuotingParameters, StockAdjustment, StockStatus,
-    ToleranceMultiplier,
+    ComplexityRule, GearProcessRate, MachineRate, Material, QuotingParameters, StockAdjustment,
+    StockStatus, ToleranceMultiplier,
 };
 pub use engine::{
     is_exotic_material, quote, quote_with_calibration, quote_with_shop_model, route_family,
+    select_gear_process, GEAR_AGMA_DATUM_CLASS, GEAR_FACEWIDTH_REF_MM, GEAR_INTERNAL_WIRE_EDM_AGMA,
     THIN_WALL_TIGHT_TOL_BUMP,
 };
 pub use error::QuoteError;
 pub use feature_graph::{
-    Feature, FeatureGraph, FeatureType, SizeBucket, StockForm, ToleranceRange,
+    Feature, FeatureGraph, FeatureType, GearKind, GearOp, GearProcess, SizeBucket, StockForm,
+    ToleranceRange,
 };
 
 /// Crate version stamp emitted on every breakdown so a quote PDF can

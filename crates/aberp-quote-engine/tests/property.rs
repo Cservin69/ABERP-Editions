@@ -143,7 +143,10 @@ fn engine_never_panics_across_varied_inputs() {
 
 #[test]
 fn shop_model_never_panics_and_stays_finite() {
-    use aberp_quote_engine::{quote_with_shop_model, CalibrationTable, MachineRate};
+    use aberp_quote_engine::{
+        quote_with_shop_model, CalibrationTable, GearKind, GearOp, GearProcess, GearProcessRate,
+        MachineRate,
+    };
     let materials = vec![default_material("6061-T6"), exotic_material("Inconel 718")];
     let rules = catchall_complexity_rules();
     let tols = default_tolerance_multipliers();
@@ -174,6 +177,21 @@ fn shop_model_never_panics_and_stays_finite() {
             lights_out_factor: 1.0,
             unattended_capable: false,
         },
+    ];
+    let gr = |process: &str, setup, mpt, agma, icf| GearProcessRate {
+        process: process.to_string(),
+        setup_min: setup,
+        min_per_tooth: mpt,
+        module_exponent: 1.4,
+        agma_quality_factor_base: agma,
+        in_cycle_factor: icf,
+    };
+    let gear_rates = vec![
+        gr("hob", 20.0, 0.30, 0.10, 1.0),
+        gr("power_skive", 8.0, 0.10, 0.10, 0.5),
+        gr("shape", 30.0, 0.50, 0.15, 1.0),
+        gr("broach", 60.0, 0.05, 0.10, 1.0),
+        gr("wire_edm", 15.0, 2.00, 0.20, 1.0),
     ];
     let tolerances = [
         ToleranceRange::Loose,
@@ -209,6 +227,30 @@ fn shop_model_never_panics_and_stays_finite() {
                 }
             }
         };
+        // ADR-0094 Gap 3: attach 0-2 gears with valid (positive) params and a
+        // varied process incl. Auto — the gear path must stay finite + >= 0.
+        fg.gears.clear();
+        for _ in 0..lcg.range(0, 2) {
+            let kind = if (lcg.next_u64() & 1) == 0 {
+                GearKind::ExternalSpurHelical
+            } else {
+                GearKind::InternalRing
+            };
+            let process = match lcg.range(0, 3) {
+                0 => GearProcess::Auto,
+                1 => GearProcess::Hob,
+                2 => GearProcess::Shape,
+                _ => GearProcess::WireEdm,
+            };
+            fg.gears.push(GearOp {
+                kind,
+                module_mm: lcg.unit() * 6.0 + 0.5,
+                teeth: lcg.range(8, 120),
+                face_width_mm: lcg.unit() * 40.0 + 1.0,
+                quality_agma: lcg.range(5, 15) as u8,
+                process,
+            });
+        }
         let qty = lcg.range(1, 100);
         let tol = tolerances[lcg.range(0, tolerances.len() as u32 - 1) as usize];
 
@@ -223,6 +265,7 @@ fn shop_model_never_panics_and_stays_finite() {
             tol,
             &CalibrationTable::neutral(),
             &rates,
+            &gear_rates,
         );
         if let Ok(b) = result {
             for (name, v) in [
@@ -233,6 +276,7 @@ fn shop_model_never_panics_and_stays_finite() {
                 ("overhead", b.overhead),
                 ("margin", b.margin),
                 ("total_price", b.total_price),
+                ("gear_cost", b.gear_cost),
             ] {
                 assert!(v.is_finite(), "case {case}: {name} is non-finite ({v})");
                 assert!(v >= 0.0, "case {case}: {name} is negative ({v})");

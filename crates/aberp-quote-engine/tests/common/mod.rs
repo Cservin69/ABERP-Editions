@@ -149,6 +149,9 @@ pub fn simple_feature_graph(grade: &str) -> FeatureGraph {
         // S1/ADR-0094: explicit default form keeps every existing golden,
         // determinism, branch and property number byte-identical.
         stock_form: StockForm::RectangularBlock,
+        // S5/ADR-0094 Gap 3: explicit empty gears keeps every existing golden,
+        // determinism, branch, machine-rate and property number byte-identical.
+        gears: Vec::new(),
     }
 }
 

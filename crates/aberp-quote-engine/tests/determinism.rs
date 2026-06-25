@@ -175,6 +175,7 @@ fn shop_model_reasoning_log_byte_identical_across_runs() {
             DEFAULT_TOL,
             &CalibrationTable::neutral(),
             &rates,
+            &[],
         )
         .unwrap()
     };
@@ -188,4 +189,85 @@ fn shop_model_reasoning_log_byte_identical_across_runs() {
         .reasoning_log
         .iter()
         .any(|l| l.contains("effective_rate=0.5250")));
+}
+
+#[test]
+fn geared_quote_byte_identical_across_runs() {
+    // ADR-0094 Gap 3: a part with gears (external skive + internal wire-EDM)
+    // must produce a byte-identical breakdown AND reasoning_log across runs —
+    // the gear path is as pure/deterministic as the rest of the engine.
+    use aberp_quote_engine::{
+        quote_with_shop_model, CalibrationTable, GearKind, GearOp, GearProcess, GearProcessRate,
+        StockForm,
+    };
+    let materials = vec![default_material("6061-T6")];
+    let rules = catchall_complexity_rules();
+    let tols = default_tolerance_multipliers();
+    let adjs = no_stock_adjustments();
+    let params = default_parameters();
+    let mut fg = simple_feature_graph("6061-T6");
+    fg.stock_form = StockForm::RoundBar {
+        diameter_mm: 22.0,
+        length_mm: 70.0,
+    };
+    fg.gears = vec![
+        GearOp {
+            kind: GearKind::ExternalSpurHelical,
+            module_mm: 2.0,
+            teeth: 24,
+            face_width_mm: 12.0,
+            quality_agma: 9,
+            process: GearProcess::Auto,
+        },
+        GearOp {
+            kind: GearKind::InternalRing,
+            module_mm: 2.5,
+            teeth: 60,
+            face_width_mm: 14.0,
+            quality_agma: 13,
+            process: GearProcess::Auto,
+        },
+    ];
+    let rates = vec![
+        GearProcessRate {
+            process: "power_skive".to_string(),
+            setup_min: 8.0,
+            min_per_tooth: 0.10,
+            module_exponent: 1.0,
+            agma_quality_factor_base: 0.10,
+            in_cycle_factor: 0.5,
+        },
+        GearProcessRate {
+            process: "wire_edm".to_string(),
+            setup_min: 15.0,
+            min_per_tooth: 2.0,
+            module_exponent: 1.0,
+            agma_quality_factor_base: 0.20,
+            in_cycle_factor: 1.0,
+        },
+    ];
+    let run = || {
+        quote_with_shop_model(
+            &fg,
+            &materials,
+            &rules,
+            &tols,
+            &adjs,
+            &params,
+            10,
+            DEFAULT_TOL,
+            &CalibrationTable::neutral(),
+            &[],
+            &rates,
+        )
+        .unwrap()
+    };
+    let a = run();
+    let b = run();
+    assert_eq!(a, b, "geared quote must be byte-identical across runs");
+    assert!(a.gear_cost > 0.0, "geared quote must carry a gear cost");
+    assert!(a
+        .reasoning_log
+        .iter()
+        .any(|l| l.contains("[gear] total gear_cost=")));
 }
