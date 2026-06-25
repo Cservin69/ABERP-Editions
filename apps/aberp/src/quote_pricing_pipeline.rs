@@ -926,7 +926,8 @@ impl PricingPipelineService {
                     None => (None, None, None, None),
                 };
             // ADR-0094 Gap 1 (S2 wiring) — stamp the chosen stock form onto
-            // the graph BEFORE `quote_with_calibration`. Precedence:
+            // the graph BEFORE the engine call (now `quote_with_shop_model`,
+            // S4 Gap 2). Precedence:
             // operator field > extractor hint (already on the graph) >
             // RectangularBlock (the serde default). An unset operator field
             // leaves the graph's form untouched, so an existing quote with
