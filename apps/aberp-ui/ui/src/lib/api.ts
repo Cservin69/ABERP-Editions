@@ -1839,6 +1839,56 @@ export async function setQuoteStockForm(
   return await invoke<StockFormResult>("set_quote_stock_form", { quoteId, body });
 }
 
+/** S6 / ADR-0094 Gap 3 — closed-vocab gear kind (mirrors
+ * `aberp_quote_engine::GearKind::as_db_str`). */
+export type GearKindDb = "external_spur_helical" | "internal_ring";
+
+/** S6 — closed-vocab gear process (mirrors
+ * `aberp_quote_engine::GearProcess::as_db_str`); includes `auto`. */
+export type GearProcessDb =
+  | "auto"
+  | "hob"
+  | "power_skive"
+  | "shape"
+  | "broach"
+  | "wire_edm";
+
+/** S6 — the concrete (rateable) processes only — `auto` is a per-op
+ * directive, never a catalogue row. */
+export type GearProcessConcrete = Exclude<GearProcessDb, "auto">;
+
+/** S6 — one operator gear op (the engine `GearOp` wire shape). */
+export interface GearOp {
+  kind: GearKindDb;
+  module_mm: number;
+  teeth: number;
+  face_width_mm: number;
+  quality_agma: number;
+  process: GearProcessDb;
+}
+
+/** S6 — `POST /…/gear-ops` result: the in-place re-price outcome. */
+export interface GearOpsResult {
+  ok: boolean;
+  gear_count: number;
+  total_price_eur: number | null;
+  below_floor: boolean;
+  repriced: boolean;
+}
+
+/** S6 — set/clear the operator gear ops for a quote and re-price in place.
+ * An empty `gears` array clears the override back to the inert no-gear
+ * default. Resolves with the corrected price. */
+export async function setQuoteGearOps(
+  quoteId: string,
+  gears: GearOp[],
+): Promise<GearOpsResult> {
+  return await invoke<GearOpsResult>("set_quote_gear_ops", {
+    quoteId,
+    body: { gears },
+  });
+}
+
 // ── S431 — Approved Vendor List (AVL) ────────────────────────────────
 
 /** S431 — AVL approval lifecycle status. Mirrors
@@ -2399,6 +2449,57 @@ export async function updateMachineRate(
 }
 export async function deleteMachineRate(id: string): Promise<void> {
   await invoke<void>("delete_machine_rate", { id });
+}
+
+// ── S6 / ADR-0094 Gap 3 — quoting_gear_processes catalogue ───────────
+
+/** S6 — a `quoting_gear_processes` row (process-keyed time coefficients).
+ * Mirrors `aberp::quoting_gear_processes::GearProcessRow`'s
+ * `#[derive(Serialize)]`. One row per concrete process per tenant. */
+export interface GearProcessRate {
+  /** Prefixed-ULID `qgp_<26-char-ULID>`. */
+  id: string;
+  process: GearProcessConcrete;
+  setup_min: number;
+  min_per_tooth: number;
+  module_exponent: number;
+  agma_quality_factor_base: number;
+  in_cycle_factor: number;
+  notes: string | null;
+  updated_at: string;
+  updated_by_actor: string;
+}
+
+/** S6 — request body for create/update. Mirror of
+ * `aberp::quoting_gear_processes::GearProcessInputs`. */
+export interface GearProcessRateInput {
+  process: GearProcessConcrete;
+  setup_min: number;
+  min_per_tooth: number;
+  module_exponent: number;
+  agma_quality_factor_base: number;
+  in_cycle_factor: number;
+  notes: string | null;
+}
+
+export async function listGearProcesses(): Promise<{
+  processes: GearProcessRate[];
+}> {
+  return invoke<{ processes: GearProcessRate[] }>("list_gear_processes");
+}
+export async function createGearProcess(
+  body: GearProcessRateInput,
+): Promise<GearProcessRate> {
+  return invoke<GearProcessRate>("create_gear_process", { body });
+}
+export async function updateGearProcess(
+  id: string,
+  body: GearProcessRateInput,
+): Promise<GearProcessRate> {
+  return invoke<GearProcessRate>("update_gear_process", { id, body });
+}
+export async function deleteGearProcess(id: string): Promise<void> {
+  await invoke<void>("delete_gear_process", { id });
 }
 
 // ── S273 / PR-262 / ADR-0069 — material-side Inventory Balances ──────
@@ -4274,6 +4375,10 @@ export interface PricingJobDetail extends PricingJobRow {
   stock_od_mm: number | null;
   stock_id_mm: number | null;
   stock_length_mm: number | null;
+  /** S6 / ADR-0094 Gap 3 — operator gear ops as the engine `GearOp[]` JSON
+   * array string, or `null`/empty when no gears (the inert default). The
+   * intake control parses this to seed its rows and POSTs changes back. */
+  gear_ops_json: string | null;
 }
 
 /** S349 / PR-40 (U1) — fetch the full detail for one pricing job.

@@ -333,6 +333,14 @@ ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS stock_length_mm DOUBLE;
 -- unset, so the pipeline uses the geometry-routed family (inert default).
 -- Nullable, no DEFAULT per [[no-sql-specific]]; idempotent via IF NOT EXISTS.
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS machine_family_override VARCHAR;
+-- S6 / ADR-0094 Gap 3 (wiring) — operator-supplied per-quote gear operations,
+-- stored as a JSON array of the engine's `GearOp` wire shape (kind, module_mm,
+-- teeth, face_width_mm, quality_agma, process). NULL/empty ⇒ no gears, so the
+-- pipeline leaves `FeatureGraph.gears` at its empty serde-default and the quote
+-- prices byte-identically to today (inert). One nullable column (a gear vector
+-- per part doesn't fit flat columns), no DEFAULT per [[no-sql-specific]];
+-- idempotent via ADD COLUMN IF NOT EXISTS.
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS gear_ops_json VARCHAR;
 ";
 
 /// Idempotent — call at every writer entry.
@@ -1280,6 +1288,12 @@ pub struct JobDetail {
     /// geometry-routed family. Raw DB string here (this module stays free of
     /// engine types); the pipeline parses + applies it.
     pub machine_family_override: Option<String>,
+    /// S6 / ADR-0094 Gap 3 — operator-entered gear operations for this part,
+    /// as the raw JSON array string (the engine's `Vec<GearOp>` wire shape);
+    /// NULL/empty ⇒ no gears ⇒ inert. Kept as the raw DB string here (this
+    /// module stays free of engine types); the pipeline deserializes it into
+    /// `FeatureGraph.gears`.
+    pub gear_ops_json: Option<String>,
 }
 
 /// S349 / PR-40 (U1) — read one job row + its artifacts for the detail
@@ -1304,7 +1318,7 @@ pub fn get_job_detail(
                     lead_time_days, lead_time_override_days,
                     buyer_partner_id, margin_override_pct, margin_below_floor, margin_floor_pct,
                     stock_form, stock_od_mm, stock_id_mm, stock_length_mm,
-                    machine_family_override
+                    machine_family_override, gear_ops_json
                 FROM quote_pricing_jobs
                 WHERE quote_id = ? AND tenant_id = ?",
         )
@@ -1367,6 +1381,7 @@ pub fn get_job_detail(
         stock_id_mm: r.get::<_, Option<f64>>(29).ok().flatten(),
         stock_length_mm: r.get::<_, Option<f64>>(30).ok().flatten(),
         machine_family_override: r.get::<_, Option<String>>(31).ok().flatten(),
+        gear_ops_json: r.get::<_, Option<String>>(32).ok().flatten(),
     }))
 }
 
@@ -1538,6 +1553,33 @@ pub fn set_machine_family_override(
             params![family, ts, quote_id, tenant_id],
         )
         .context("set_machine_family_override UPDATE")?;
+    Ok(changed > 0)
+}
+
+/// S6 / ADR-0094 Gap 3 — set or clear the operator's per-quote gear ops.
+/// `gear_ops_json` is the engine `Vec<GearOp>` wire shape as a JSON string;
+/// `None` (or an empty/`[]` payload from the route layer) clears it back to no
+/// gears ⇒ inert. Returns `false` if no such row exists. Mirrors
+/// [`set_machine_family_override`]; the daemon's next pricing pass (and the
+/// in-place re-price) re-reads the column and re-stamps `FeatureGraph.gears`.
+pub fn set_gear_ops(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    gear_ops_json: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    ensure_schema(conn)?;
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format gear_ops updated_at")?;
+    let changed = conn
+        .execute(
+            "UPDATE quote_pricing_jobs SET gear_ops_json = ?, updated_at = ? \
+             WHERE quote_id = ? AND tenant_id = ?",
+            params![gear_ops_json, ts, quote_id, tenant_id],
+        )
+        .context("set_gear_ops UPDATE")?;
     Ok(changed > 0)
 }
 
