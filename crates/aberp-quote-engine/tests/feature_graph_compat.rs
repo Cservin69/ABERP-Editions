@@ -18,7 +18,7 @@
 //! crate itself has no JSON dep (per lib.rs: "parsing is the
 //! wrapper's job").
 
-use aberp_quote_engine::{FeatureGraph, FeatureType};
+use aberp_quote_engine::{FeatureGraph, FeatureType, StockForm};
 
 const PYTHON_FIXTURE: &str = include_str!("fixtures/feature_graph_python_v2.json");
 
@@ -27,7 +27,17 @@ fn python_v2_fixture_deserializes_into_rust_feature_graph() {
     let parsed: FeatureGraph = serde_json::from_str(PYTHON_FIXTURE)
         .expect("Python-produced fixture must deserialize into Rust FeatureGraph");
 
-    assert_eq!(parsed.schema_version, FeatureGraph::SCHEMA_VERSION);
+    // The Python extractor (S269) still emits v2; its lockstep bump to v3
+    // lands with S269 (ADR-0094 Q3). The v3 engine must still accept a v2
+    // graph: version <= current passes the guard, and the absent
+    // `stock_form` defaults to RectangularBlock (today's block math).
+    assert_eq!(parsed.schema_version, 2);
+    assert!(parsed.schema_version <= FeatureGraph::SCHEMA_VERSION);
+    assert_eq!(
+        parsed.stock_form,
+        StockForm::RectangularBlock,
+        "a v2 graph omits stock_form -> must default to RectangularBlock"
+    );
     assert_eq!(parsed.bounding_box_mm, [50.0, 30.0, 20.0]);
     assert_eq!(parsed.volume_mm3, 25_000.0);
     assert_eq!(parsed.surface_area_mm2, 6200.0);

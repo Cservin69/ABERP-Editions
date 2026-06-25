@@ -850,6 +850,7 @@ mod tests {
             }],
             requires_5_axis,
             thin_wall_present: thin_wall,
+            stock_form: aberp_quote_engine::StockForm::RectangularBlock,
         }
     }
 

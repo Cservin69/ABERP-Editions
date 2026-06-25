@@ -1152,6 +1152,7 @@ mod tests {
             }],
             requires_5_axis: false,
             thin_wall_present: false,
+            stock_form: aberp_quote_engine::StockForm::RectangularBlock,
         };
         serde_json::to_string(&g).unwrap()
     }

@@ -8,7 +8,9 @@
 
 mod common;
 
-use aberp_quote_engine::{quote, Feature, FeatureGraph, Material, StockStatus, ToleranceRange};
+use aberp_quote_engine::{
+    quote, Feature, FeatureGraph, Material, StockForm, StockStatus, ToleranceRange,
+};
 use common::*;
 
 /// PEEK, 15 pcs, solid 50 mm cube, Standard tolerance — the report
@@ -34,6 +36,7 @@ fn peek_15pcs_50mm_cube_lands_in_benchmark_band() {
         features: Vec::<Feature>::new(),
         requires_5_axis: false,
         thin_wall_present: false,
+        stock_form: StockForm::RectangularBlock,
     };
 
     let r = quote(
