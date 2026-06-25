@@ -1224,6 +1224,13 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         })?;
         crate::quoting_tunables::ensure_schema(&mut conn, tenant.as_str())
             .context("ensure quoting_tunables schemas + seeds at serve boot")?;
+        // S4 / ADR-0094 Gap 2 — machine-rate catalogue: idempotent schema +
+        // six-family seed (insert-if-absent). Co-located with the tunables
+        // boot migration; the pricing pipeline snapshots this into the engine.
+        crate::quoting_machine_rates::ensure_schema(&conn)
+            .context("ensure quoting_machine_rates schema at serve boot")?;
+        crate::quoting_machine_rates::seed_machine_rates_if_absent(&conn, tenant.as_str())
+            .context("seed quoting_machine_rates families at serve boot")?;
     }
 
     // S232 / PR-228 / ADR-0062 — pin the work-orders schema at boot
@@ -3879,6 +3886,15 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/quoting-stock-adjustments/:id",
             put(handle_update_stock_adjustment).delete(handle_delete_stock_adjustment),
+        )
+        // S4 / ADR-0094 Gap 2 — machine-family rate catalogue.
+        .route(
+            "/api/quoting-machine-rates",
+            get(handle_list_machine_rates).post(handle_create_machine_rate),
+        )
+        .route(
+            "/api/quoting-machine-rates/:id",
+            put(handle_update_machine_rate).delete(handle_delete_machine_rate),
         )
         // S273 / PR-262 / ADR-0069 — material-side inventory balances
         // (on_hand / reserved / committed / consumed). Read-only in v1;
@@ -13670,6 +13686,154 @@ async fn handle_delete_stock_adjustment(
         Ok(Err(e)) => tunable_write_response(e, "delete_stock_adjustment"),
         Err(join_err) => internal_error(
             "delete_stock_adjustment:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ── quoting_machine_rates (ADR-0094 Gap 2, S4) ───────────────────────
+
+async fn handle_list_machine_rates(headers: HeaderMap, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<Vec<crate::quoting_machine_rates::MachineRateRow>> {
+            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            crate::quoting_machine_rates::list_machine_rates(&conn, state_for_task.tenant.as_str())
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "rates": rows })).into_response(),
+        Ok(Err(e)) => internal_error("list_machine_rates", e),
+        Err(join_err) => internal_error(
+            "list_machine_rates:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_create_machine_rate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<crate::quoting_machine_rates::MachineRateInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_machine_rates::create_machine_rate(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => (StatusCode::CREATED, Json(row)).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "create_machine_rate"),
+        Err(join_err) => internal_error(
+            "create_machine_rate:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_update_machine_rate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<crate::quoting_machine_rates::MachineRateInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_machine_rates::update_machine_rate(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &id,
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => Json(row).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "update_machine_rate"),
+        Err(join_err) => internal_error(
+            "update_machine_rate:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_delete_machine_rate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<(), crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_machine_rates::delete_machine_rate(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &id,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "delete_machine_rate"),
+        Err(join_err) => internal_error(
+            "delete_machine_rate:join",
             anyhow!("blocking task panicked: {join_err}"),
         ),
     }

@@ -68,9 +68,10 @@ use aberp_audit_ledger::{
 };
 use aberp_cad_extract_wrapper::{CadExtractor, ExtractRequest};
 use aberp_quote_engine::{
-    self as engine, ComplexityRule as EngineComplexityRule, FeatureGraph,
-    Material as EngineMaterial, QuoteBreakdown, QuotingParameters, StockAdjustment, StockForm,
-    StockStatus, ToleranceMultiplier, ToleranceRange,
+    self as engine, ComplexityRule as EngineComplexityRule, FeatureGraph, MachineFamily,
+    MachineRate as EngineMachineRate, Material as EngineMaterial, QuoteBreakdown,
+    QuotingParameters, StockAdjustment, StockForm, StockStatus, ToleranceMultiplier,
+    ToleranceRange,
 };
 use aberp_quote_pdf::QuoteInputs;
 
@@ -909,7 +910,7 @@ impl PricingPipelineService {
             // partner's customer_type → active profile (or operator
             // override) overrides the global markup + floor. The engine
             // stays pure; we only swap the knobs we feed it.
-            let (buyer_partner_id, margin_override_pct, operator_form) =
+            let (buyer_partner_id, margin_override_pct, operator_form, machine_family_override) =
                 match jobs::get_job_detail(&conn, &quote_id, &tenant_id_string)? {
                     Some(d) => (
                         d.buyer_partner_id,
@@ -920,8 +921,9 @@ impl PricingPipelineService {
                             d.stock_id_mm,
                             d.stock_length_mm,
                         ),
+                        d.machine_family_override,
                     ),
-                    None => (None, None, None),
+                    None => (None, None, None, None),
                 };
             // ADR-0094 Gap 1 (S2 wiring) — stamp the chosen stock form onto
             // the graph BEFORE `quote_with_calibration`. Precedence:
@@ -960,7 +962,32 @@ impl PricingPipelineService {
             let cal_table = crate::quote_calibration::materialize_table(&conn, &tenant_id_string)
                 .context("materialize calibration table")?;
 
-            match engine::quote_with_calibration(
+            // ── ADR-0094 Gap 2 (S4 wiring) — machine-family rates ────────
+            // Load the operator's rate table, route the part to a family by
+            // geometry (the same `route_family` the engine uses internally),
+            // and apply any per-quote operator override by re-labelling the
+            // chosen rate row (see `apply_family_override`). An empty/absent
+            // table ⇒ the engine keeps the global flat rate (price unchanged).
+            let machine_rate_rows =
+                crate::quoting_machine_rates::list_machine_rates(&conn, &tenant_id_string)
+                    .context("load machine rates")?;
+            let base_machine_rates = convert_machine_rates(&machine_rate_rows);
+            let geometry_family = engine::route_family(
+                chosen_stock_form,
+                graph.requires_5_axis,
+                stock_od_mm(chosen_stock_form),
+                &engine_params,
+            );
+            let override_family = machine_family_override
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(MachineFamily::from_db_str);
+            let effective_family = override_family.unwrap_or(geometry_family);
+            let engine_machine_rates =
+                apply_family_override(&base_machine_rates, geometry_family, effective_family);
+
+            match engine::quote_with_shop_model(
                 &graph,
                 &engine_materials,
                 &engine_complexity,
@@ -970,6 +997,7 @@ impl PricingPipelineService {
                 qty,
                 target_tol,
                 &cal_table,
+                &engine_machine_rates,
             ) {
                 Ok(breakdown) => {
                     let json = serde_json::to_string(&breakdown).context("encode breakdown")?;
@@ -1110,6 +1138,18 @@ impl PricingPipelineService {
                         margin_eur: breakdown.margin,
                         stock_form: chosen_stock_form,
                         stock_form_source: stock_form_source.to_string(),
+                        routed_machine_family: Some(geometry_family.as_db_str().to_string()),
+                        machine_family_override: override_family.map(|f| f.as_db_str().to_string()),
+                        effective_machine_family: Some(effective_family.as_db_str().to_string()),
+                        machine_rate_snapshot: engine_machine_rates
+                            .iter()
+                            .map(|r| MachineRateAudit {
+                                family: r.family.clone(),
+                                attended_rate_eur_per_min: r.attended_rate_eur_per_min,
+                                lights_out_factor: r.lights_out_factor,
+                                unattended_capable: r.unattended_capable,
+                            })
+                            .collect(),
                         actor: "system".to_string(),
                         idempotency_key: format!("quote_pricing_priced:{quote_id}"),
                     };
@@ -2747,6 +2787,78 @@ fn convert_stock_adjustments(
         .collect()
 }
 
+/// S4 / ADR-0094 Gap 2 — snapshot the local machine-rate rows into the
+/// engine's `MachineRate` slice. Mirrors `convert_stock_adjustments`. An
+/// empty result ⇒ the engine uses the global flat rate (byte-identical to
+/// pre-ADR-0094). The loader (`quoting_machine_rates::list_machine_rates`)
+/// returns rows already validated on write.
+fn convert_machine_rates(
+    locals: &[crate::quoting_machine_rates::MachineRateRow],
+) -> Vec<EngineMachineRate> {
+    locals
+        .iter()
+        .map(|r| EngineMachineRate {
+            family: r.family.clone(),
+            attended_rate_eur_per_min: r.attended_rate_eur_per_min,
+            lights_out_factor: r.lights_out_factor,
+            unattended_capable: r.unattended_capable,
+        })
+        .collect()
+}
+
+/// S4 / ADR-0094 Gap 2 — outer diameter (mm) of a turned/round stock form,
+/// for the wiring's `route_family` call (mirrors the engine's private
+/// `stock_od_mm`). A prismatic block has no turning OD ⇒ 0.0.
+fn stock_od_mm(form: StockForm) -> f64 {
+    match form {
+        StockForm::RoundBar { diameter_mm, .. } => diameter_mm,
+        StockForm::Tube { od_mm, .. } => od_mm,
+        StockForm::RectangularBlock => 0.0,
+    }
+}
+
+/// S4 / ADR-0094 Gap 2 — honour a per-quote operator family override.
+///
+/// The engine (`quote_with_shop_model`) routes by geometry and keys the
+/// machine-rate row on the geometry-routed family. The engine crate is
+/// frozen for S4, so to make the override actually change the price the
+/// wiring re-labels the override family's rate row to the geometry family's
+/// db-string — the engine then matches it and charges the override family's
+/// EUR/min. Lights-out eligibility still keys on the real stock form inside
+/// the engine, so forcing a prismatic part onto an unattended family does
+/// NOT spuriously trigger the lights-out discount.
+///
+/// FLAG (handed to S5): the engine's own `[machining] routed_family=…`
+/// reasoning line names the GEOMETRY family, not the override — the
+/// authoritative override record is the pricing-audit payload
+/// (`routed/override/effective_machine_family`). A first-class engine-level
+/// family-override parameter is deferred to a future engine ADR.
+fn apply_family_override(
+    rates: &[EngineMachineRate],
+    geometry: MachineFamily,
+    effective: MachineFamily,
+) -> Vec<EngineMachineRate> {
+    if geometry == effective {
+        return rates.to_vec();
+    }
+    let Some(src) = rates.iter().find(|r| r.family == effective.as_db_str()) else {
+        // No rate row for the override family ⇒ nothing to substitute; leave
+        // the slice as-is (the engine falls back to the global rate for the
+        // geometry family if it has no row either).
+        return rates.to_vec();
+    };
+    let geo = geometry.as_db_str();
+    let mut out: Vec<EngineMachineRate> =
+        rates.iter().filter(|r| r.family != geo).cloned().collect();
+    out.push(EngineMachineRate {
+        family: geo.to_string(),
+        attended_rate_eur_per_min: src.attended_rate_eur_per_min,
+        lights_out_factor: src.lights_out_factor,
+        unattended_capable: src.unattended_capable,
+    });
+    out
+}
+
 /// S418 — the pre-S418 hardcoded `machining_rate` (1.0) is gone; the
 /// rate and all six geometry-model knobs now ride the local
 /// `quoting_parameters` singleton (operator-tunable from Settings →
@@ -2769,6 +2881,10 @@ fn convert_parameters(local: &crate::quoting_tunables::QuotingParameters) -> Quo
         t_finish_min_per_cm2: local.t_finish_min_per_cm2,
         setup_base_min: local.setup_base_min,
         setup_5axis_min: local.setup_5axis_min,
+        // ADR-0094 Gap 2 (S4) — bar-feeder capacity drives engine routing
+        // (round/tube within this OD ⇒ lights-out Swiss). Was the missing
+        // field that left apps/aberp non-compiling after the S3 engine bump.
+        bar_capacity_mm: local.bar_capacity_mm,
     }
 }
 
@@ -3017,6 +3133,16 @@ struct QuotePricingExtractedPayload {
     idempotency_key: String,
 }
 
+/// S4 / ADR-0094 Gap 2 — one machine-rate row as snapshotted into the
+/// priced-audit payload (the exact slice handed to the engine).
+#[derive(Debug, Serialize)]
+struct MachineRateAudit {
+    family: String,
+    attended_rate_eur_per_min: f64,
+    lights_out_factor: f64,
+    unattended_capable: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct QuotePricingPricedPayload {
     quote_id: String,
@@ -3041,6 +3167,16 @@ struct QuotePricingPricedPayload {
     /// `rectangular_block` / `default`.
     stock_form: StockForm,
     stock_form_source: String,
+    /// S4 / ADR-0094 Gap 2 — machine-family routing + rate provenance.
+    /// `routed_machine_family` = geometry route (engine `route_family`);
+    /// `machine_family_override` = operator per-quote override (None=unset);
+    /// `effective_machine_family` = what the rate was charged at
+    /// (override ?? routed). `machine_rate_snapshot` = the exact
+    /// `&[MachineRate]` slice the engine priced with ("the chosen rates").
+    routed_machine_family: Option<String>,
+    machine_family_override: Option<String>,
+    effective_machine_family: Option<String>,
+    machine_rate_snapshot: Vec<MachineRateAudit>,
     actor: String,
     idempotency_key: String,
 }
