@@ -59,13 +59,67 @@ use aberp_audit_ledger::{
 use aberp_cad_extract_wrapper::{CadExtractor, ExtractRequest};
 use aberp_quote_engine::{
     self as engine, ComplexityRule as EngineComplexityRule, FeatureGraph,
-    Material as EngineMaterial, QuoteBreakdown, QuotingParameters, StockAdjustment, StockStatus,
-    ToleranceMultiplier, ToleranceRange,
+    Material as EngineMaterial, QuoteBreakdown, QuotingParameters, StockAdjustment, StockForm,
+    StockStatus, ToleranceMultiplier, ToleranceRange,
 };
 use aberp_quote_pdf::QuoteInputs;
 
 use crate::catalogue_push::response_excerpt;
 use crate::quote_pricing_jobs::{self as jobs, FailureKind, JobState, PricingJobRow};
+
+/// S2 / ADR-0094 Gap 1 (wiring) — reconstruct the operator-chosen
+/// [`StockForm`] from the persisted quote/part columns. `None` means the
+/// operator left it unset (NULL or `rectangular_block`, or any unknown
+/// discriminant the SPA cannot emit), so the caller keeps whatever form
+/// the graph already carries (the extractor hint, or the
+/// `RectangularBlock` serde-default). Pure + total: unit-tested for each
+/// precedence path with neither a DB nor a live engine.
+fn operator_stock_form(
+    kind: Option<&str>,
+    od_mm: Option<f64>,
+    id_mm: Option<f64>,
+    length_mm: Option<f64>,
+) -> Option<StockForm> {
+    match kind {
+        Some("round_bar") => Some(StockForm::RoundBar {
+            diameter_mm: od_mm.unwrap_or(0.0),
+            length_mm: length_mm.unwrap_or(0.0),
+        }),
+        Some("tube") => Some(StockForm::Tube {
+            od_mm: od_mm.unwrap_or(0.0),
+            id_mm: id_mm.unwrap_or(0.0),
+            length_mm: length_mm.unwrap_or(0.0),
+        }),
+        // NULL, "rectangular_block", or anything unrecognised ⇒ no operator
+        // override (inert): the graph keeps its extractor hint / default.
+        _ => None,
+    }
+}
+
+/// S2 / ADR-0094 Gap 1 (wiring) — stamp the chosen stock form onto `graph`
+/// with precedence **operator field > extractor hint > RectangularBlock**,
+/// returning the chosen form + its provenance for the pricing audit.
+///
+/// The graph already carries the extractor's hint (or, until S269 lands,
+/// the `RectangularBlock` serde-default), so `operator = None` leaves it
+/// untouched — that IS the "extractor hint > RectangularBlock" tier, for
+/// free. An explicit operator form overwrites it. Provenance is best-
+/// effort: an extractor that explicitly emitted `RectangularBlock` is
+/// indistinguishable from the default and reads as `"default"` — harmless,
+/// since the math and the price are identical either way.
+fn stamp_stock_form(
+    graph: &mut FeatureGraph,
+    operator: Option<StockForm>,
+) -> (StockForm, &'static str) {
+    match operator {
+        Some(form) => {
+            graph.stock_form = form;
+            (form, "operator")
+        }
+        None if graph.stock_form != StockForm::RectangularBlock => (graph.stock_form, "extractor"),
+        None => (graph.stock_form, "default"),
+    }
+}
 
 /// What every pricing-pipeline cycle reports back. Used for the SPA
 /// "last cycle" indicator + the daemon's log line.
@@ -814,7 +868,7 @@ impl PricingPipelineService {
             let graph_json = arts
                 .feature_graph_json
                 .ok_or_else(|| anyhow!("Pricing state but no feature_graph_json"))?;
-            let graph: FeatureGraph =
+            let mut graph: FeatureGraph =
                 serde_json::from_str(&graph_json).context("decode FeatureGraph")?;
 
             // Catalogue snapshot — read all four tables synchronously
@@ -845,11 +899,28 @@ impl PricingPipelineService {
             // partner's customer_type → active profile (or operator
             // override) overrides the global markup + floor. The engine
             // stays pure; we only swap the knobs we feed it.
-            let (buyer_partner_id, margin_override_pct) =
+            let (buyer_partner_id, margin_override_pct, operator_form) =
                 match jobs::get_job_detail(&conn, &quote_id, &tenant_id_string)? {
-                    Some(d) => (d.buyer_partner_id, d.margin_override_pct),
-                    None => (None, None),
+                    Some(d) => (
+                        d.buyer_partner_id,
+                        d.margin_override_pct,
+                        operator_stock_form(
+                            d.stock_form.as_deref(),
+                            d.stock_od_mm,
+                            d.stock_id_mm,
+                            d.stock_length_mm,
+                        ),
+                    ),
+                    None => (None, None, None),
                 };
+            // ADR-0094 Gap 1 (S2 wiring) — stamp the chosen stock form onto
+            // the graph BEFORE `quote_with_calibration`. Precedence:
+            // operator field > extractor hint (already on the graph) >
+            // RectangularBlock (the serde default). An unset operator field
+            // leaves the graph's form untouched, so an existing quote with
+            // no stock form prices byte-identically to today.
+            let (chosen_stock_form, stock_form_source) =
+                stamp_stock_form(&mut graph, operator_form);
             let customer_type = crate::quote_margin::customer_type_for_partner(
                 &conn,
                 &tenant_id_string,
@@ -1027,6 +1098,8 @@ impl PricingPipelineService {
                         setup_cost_eur: breakdown.setup_cost,
                         overhead_eur: breakdown.overhead,
                         margin_eur: breakdown.margin,
+                        stock_form: chosen_stock_form,
+                        stock_form_source: stock_form_source.to_string(),
                         actor: "system".to_string(),
                         idempotency_key: format!("quote_pricing_priced:{quote_id}"),
                     };
@@ -2727,8 +2800,22 @@ pub fn reprice_quote(
     let Some(graph_json) = detail.feature_graph_json else {
         return Ok(None);
     };
-    let graph: FeatureGraph =
+    let mut graph: FeatureGraph =
         serde_json::from_str(&graph_json).context("decode FeatureGraph for reprice")?;
+    // ADR-0094 Gap 1 (S2) — apply the operator stock form here too, so an
+    // in-place re-price (a margin or buyer-partner change) on a part that
+    // already carries a stock-form override re-prices on that form rather
+    // than silently reverting to the block model. Same precedence as the
+    // daemon path; an unset override is inert.
+    let _ = stamp_stock_form(
+        &mut graph,
+        operator_stock_form(
+            detail.stock_form.as_deref(),
+            detail.stock_od_mm,
+            detail.stock_id_mm,
+            detail.stock_length_mm,
+        ),
+    );
     let qty = detail.row.quantity.max(1);
 
     let materials = crate::quoting_materials::list_materials(conn, tenant)?;
@@ -2936,6 +3023,14 @@ struct QuotePricingPricedPayload {
     setup_cost_eur: f64,
     overhead_eur: f64,
     margin_eur: f64,
+    /// S2 / ADR-0094 Gap 1 — the stock form the pipeline stamped onto the
+    /// graph for this pricing pass (serialised as `{ "kind": …, dims… }`
+    /// via the engine's serde), plus its provenance: "operator" (the
+    /// operator field), "extractor" (a hint already on the graph), or
+    /// "default" (the inert `RectangularBlock`). Inert quotes record
+    /// `rectangular_block` / `default`.
+    stock_form: StockForm,
+    stock_form_source: String,
     actor: String,
     idempotency_key: String,
 }
@@ -3495,6 +3590,105 @@ pub fn emit_index_migrated_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── S2 / ADR-0094 Gap 1 — stock-form stamp precedence (pure) ──────
+    fn mk_graph(stock_form: StockForm) -> FeatureGraph {
+        FeatureGraph {
+            schema_version: FeatureGraph::SCHEMA_VERSION,
+            bounding_box_mm: [10.0, 10.0, 10.0],
+            volume_mm3: 1000.0,
+            surface_area_mm2: 0.0,
+            material_grade: "6061-T6".to_string(),
+            features: Vec::new(),
+            requires_5_axis: false,
+            thin_wall_present: false,
+            stock_form,
+        }
+    }
+
+    #[test]
+    fn operator_stock_form_reads_each_discriminant() {
+        // round bar: stock_od_mm carries the diameter, stock_length_mm the length.
+        assert_eq!(
+            operator_stock_form(Some("round_bar"), Some(40.0), None, Some(30.0)),
+            Some(StockForm::RoundBar {
+                diameter_mm: 40.0,
+                length_mm: 30.0,
+            }),
+        );
+        // tube: od / id / length all carried through.
+        assert_eq!(
+            operator_stock_form(Some("tube"), Some(100.0), Some(80.0), Some(15.0)),
+            Some(StockForm::Tube {
+                od_mm: 100.0,
+                id_mm: 80.0,
+                length_mm: 15.0,
+            }),
+        );
+        // Unset / inert / unrecognised discriminants ⇒ None: the caller keeps
+        // whatever form the graph already carries (extractor hint or default).
+        assert_eq!(operator_stock_form(None, None, None, None), None);
+        assert_eq!(
+            operator_stock_form(Some("rectangular_block"), None, None, None),
+            None
+        );
+        assert_eq!(
+            operator_stock_form(Some("garbage"), Some(1.0), None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn stamp_precedence_operator_beats_extractor_hint() {
+        // Graph arrives with an extractor hint (round bar); operator forces a tube.
+        let mut g = mk_graph(StockForm::RoundBar {
+            diameter_mm: 50.0,
+            length_mm: 20.0,
+        });
+        let op = Some(StockForm::Tube {
+            od_mm: 100.0,
+            id_mm: 80.0,
+            length_mm: 15.0,
+        });
+        let (chosen, source) = stamp_stock_form(&mut g, op);
+        assert_eq!(
+            chosen,
+            StockForm::Tube {
+                od_mm: 100.0,
+                id_mm: 80.0,
+                length_mm: 15.0
+            }
+        );
+        assert_eq!(source, "operator");
+        assert_eq!(g.stock_form, chosen);
+    }
+
+    #[test]
+    fn stamp_precedence_extractor_hint_beats_default() {
+        // No operator field, but the extractor already wrote a round bar onto
+        // the graph: keep it, provenance "extractor".
+        let hint = StockForm::RoundBar {
+            diameter_mm: 40.0,
+            length_mm: 30.0,
+        };
+        let mut g = mk_graph(hint);
+        let (chosen, source) = stamp_stock_form(&mut g, None);
+        assert_eq!(chosen, hint);
+        assert_eq!(source, "extractor");
+        assert_eq!(g.stock_form, hint);
+    }
+
+    #[test]
+    fn stamp_inert_when_no_operator_and_no_hint() {
+        // The inert default: no operator field, graph carries RectangularBlock.
+        // Result is RectangularBlock / "default" — today's exact pricing path,
+        // so existing quotes are byte-identical.
+        let mut g = mk_graph(StockForm::RectangularBlock);
+        let (chosen, source) = stamp_stock_form(&mut g, None);
+        assert_eq!(chosen, StockForm::RectangularBlock);
+        assert_eq!(source, "default");
+        assert_eq!(g.stock_form, StockForm::RectangularBlock);
+    }
 
     #[test]
     fn backoff_follows_5_15_60_then_cadence() {

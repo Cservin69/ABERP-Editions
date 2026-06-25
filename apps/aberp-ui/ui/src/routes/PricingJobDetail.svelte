@@ -22,6 +22,7 @@
     overrideQuoteLeadTime,
     overrideQuoteMargin,
     setQuoteBuyerPartner,
+    setQuoteStockForm,
     retryQuotePricingJob,
     MaterialEditError,
     type AuditEntryView,
@@ -117,6 +118,19 @@
   );
   let floorReason = $state("");
 
+  // S2 / ADR-0094 Gap 1 — operator stock-form override state. Drafts are
+  // strings (parsed on save), matching the margin/lead-time controls.
+  let editingStockForm = $state(false);
+  let stockKindDraft = $state<"rectangular_block" | "round_bar" | "tube">(
+    "rectangular_block",
+  );
+  let stockOdDraft = $state(""); // diameter (round bar) or OD (tube), mm
+  let stockIdDraft = $state(""); // bore (tube only), mm
+  let stockLenDraft = $state(""); // length, mm
+  let stockBusy = $state(false);
+  let stockError = $state<string | null>(null);
+  let stockToast = $state<string | null>(null);
+
   const AUDIT_PAGE = 50;
 
   // Derived sections — all read off the one audit page we fetch.
@@ -189,6 +203,11 @@
       buyerSearch = "";
       floorConfirm = null;
       floorReason = "";
+      // S2 — seed the stock-form control from the persisted columns.
+      seedStockDrafts(d);
+      stockError = null;
+      stockToast = null;
+      editingStockForm = false;
       loadState = "ready";
     } catch (e) {
       errorMessage = e instanceof Error ? e.message : String(e);
@@ -354,6 +373,90 @@
             : String(e);
     } finally {
       materialSaveBusy = false;
+    }
+  }
+
+  // ── S2 / ADR-0094 Gap 1 — operator stock-form intake ────────────────
+  // Humanise the persisted columns for the read-only display.
+  function stockFormLabel(d: PricingJobDetail): string {
+    if (d.stock_form === "round_bar") {
+      return `Rúd / Round bar — Ø${d.stock_od_mm ?? "?"} × ${d.stock_length_mm ?? "?"} mm`;
+    }
+    if (d.stock_form === "tube") {
+      return `Cső / Tube — Ø${d.stock_od_mm ?? "?"}/${d.stock_id_mm ?? "?"} × ${d.stock_length_mm ?? "?"} mm`;
+    }
+    return "Tömb / Rectangular block (alapért. / default)";
+  }
+
+  function seedStockDrafts(d: PricingJobDetail | null): void {
+    stockKindDraft =
+      d?.stock_form === "round_bar" || d?.stock_form === "tube"
+        ? d.stock_form
+        : "rectangular_block";
+    stockOdDraft = d?.stock_od_mm != null ? String(d.stock_od_mm) : "";
+    stockIdDraft = d?.stock_id_mm != null ? String(d.stock_id_mm) : "";
+    stockLenDraft = d?.stock_length_mm != null ? String(d.stock_length_mm) : "";
+  }
+
+  function startStockFormEdit(): void {
+    if (!detail) return;
+    editingStockForm = true;
+    stockError = null;
+    stockToast = null;
+  }
+
+  function cancelStockFormEdit(): void {
+    editingStockForm = false;
+    stockError = null;
+    seedStockDrafts(detail); // discard unsaved edits
+  }
+
+  async function saveStockForm(): Promise<void> {
+    if (!quoteId) return;
+    stockBusy = true;
+    stockError = null;
+    try {
+      let body: {
+        kind: "round_bar" | "tube" | null;
+        od_mm: number | null;
+        id_mm: number | null;
+        length_mm: number | null;
+      };
+      if (stockKindDraft === "round_bar") {
+        const od = Number(stockOdDraft);
+        const len = Number(stockLenDraft);
+        if (!(od > 0) || !(len > 0)) {
+          stockError =
+            "Rúd: átmérő és hossz > 0 / Round bar: diameter and length > 0";
+          return;
+        }
+        body = { kind: "round_bar", od_mm: od, id_mm: null, length_mm: len };
+      } else if (stockKindDraft === "tube") {
+        const od = Number(stockOdDraft);
+        const id = Number(stockIdDraft);
+        const len = Number(stockLenDraft);
+        if (!(od > 0) || !(id > 0) || !(len > 0)) {
+          stockError = "Cső: KÁ, BÁ és hossz > 0 / Tube: OD, ID and length > 0";
+          return;
+        }
+        if (id >= od) {
+          stockError =
+            "Cső: a furat (BÁ) legyen kisebb a külső átmérőnél / Tube: bore < OD";
+          return;
+        }
+        body = { kind: "tube", od_mm: od, id_mm: id, length_mm: len };
+      } else {
+        body = { kind: null, od_mm: null, id_mm: null, length_mm: null };
+      }
+      await setQuoteStockForm(quoteId, body);
+      editingStockForm = false;
+      stockToast =
+        "Nyersanyag-forma frissítve, újraárazás… / Stock form updated, re-pricing…";
+      await load(quoteId);
+    } catch (e) {
+      stockError = e instanceof Error ? e.message : String(e);
+    } finally {
+      stockBusy = false;
     }
   }
 
@@ -776,6 +879,135 @@
                     data-testid="pricing-job-material-edit-btn">✎</button
                   >
                 {/if}
+              {/if}
+            </dd>
+            <dt>Nyersanyag-forma / Stock form</dt>
+            <dd>
+              {#if editingStockForm}
+                <div
+                  class="qjd__matedit qjd__stockedit"
+                  data-testid="pricing-job-stock-edit"
+                >
+                  <select
+                    class="qjd__matselect"
+                    bind:value={stockKindDraft}
+                    disabled={stockBusy}
+                    data-testid="pricing-job-stock-kind"
+                  >
+                    <option value="rectangular_block"
+                      >Tömb / Rectangular block</option
+                    >
+                    <option value="round_bar">Rúd / Round bar</option>
+                    <option value="tube">Cső / Tube</option>
+                  </select>
+                  {#if stockKindDraft === "round_bar"}
+                    <div class="qjd__stockdims">
+                      <label class="qjd__stockfield">
+                        <span>Ø átmérő / dia (mm)</span>
+                        <input
+                          class="qjd__stockinput"
+                          type="text"
+                          inputmode="decimal"
+                          bind:value={stockOdDraft}
+                          disabled={stockBusy}
+                          data-testid="pricing-job-stock-od"
+                        />
+                      </label>
+                      <label class="qjd__stockfield">
+                        <span>Hossz / length (mm)</span>
+                        <input
+                          class="qjd__stockinput"
+                          type="text"
+                          inputmode="decimal"
+                          bind:value={stockLenDraft}
+                          disabled={stockBusy}
+                          data-testid="pricing-job-stock-len"
+                        />
+                      </label>
+                    </div>
+                  {:else if stockKindDraft === "tube"}
+                    <div class="qjd__stockdims">
+                      <label class="qjd__stockfield">
+                        <span>Ø külső / OD (mm)</span>
+                        <input
+                          class="qjd__stockinput"
+                          type="text"
+                          inputmode="decimal"
+                          bind:value={stockOdDraft}
+                          disabled={stockBusy}
+                          data-testid="pricing-job-stock-od"
+                        />
+                      </label>
+                      <label class="qjd__stockfield">
+                        <span>Ø furat / ID (mm)</span>
+                        <input
+                          class="qjd__stockinput"
+                          type="text"
+                          inputmode="decimal"
+                          bind:value={stockIdDraft}
+                          disabled={stockBusy}
+                          data-testid="pricing-job-stock-id"
+                        />
+                      </label>
+                      <label class="qjd__stockfield">
+                        <span>Hossz / length (mm)</span>
+                        <input
+                          class="qjd__stockinput"
+                          type="text"
+                          inputmode="decimal"
+                          bind:value={stockLenDraft}
+                          disabled={stockBusy}
+                          data-testid="pricing-job-stock-len"
+                        />
+                      </label>
+                    </div>
+                  {/if}
+                  <div class="qjd__matedit-actions">
+                    <button
+                      type="button"
+                      class="btn btn--secondary"
+                      onclick={() => void saveStockForm()}
+                      disabled={stockBusy}
+                      data-testid="pricing-job-stock-save"
+                      >{stockBusy
+                        ? "Mentés… / Saving…"
+                        : "Mentés / Save"}</button
+                    >
+                    <button
+                      type="button"
+                      class="qjd__close"
+                      onclick={cancelStockFormEdit}
+                      disabled={stockBusy}
+                      aria-label="Mégse / Cancel"
+                      data-testid="pricing-job-stock-cancel">✕</button
+                    >
+                  </div>
+                </div>
+                {#if stockError}
+                  <p
+                    class="qjd__err qjd__matedit-err"
+                    data-testid="pricing-job-stock-error"
+                  >
+                    {stockError}
+                  </p>
+                {/if}
+              {:else}
+                <span class="qjd__matval" data-testid="pricing-job-stock-value"
+                  >{stockFormLabel(detail)}</span
+                >
+                <button
+                  type="button"
+                  class="qjd__matpencil"
+                  onclick={startStockFormEdit}
+                  aria-label="Nyersanyag-forma szerkesztése / Edit stock form"
+                  title="Nyersanyag-forma szerkesztése / Edit stock form"
+                  data-testid="pricing-job-stock-edit-btn">✎</button
+                >
+              {/if}
+              {#if stockToast}
+                <p class="qjd__toast" data-testid="pricing-job-stock-toast">
+                  {stockToast}
+                </p>
               {/if}
             </dd>
             <dt>Db / Qty</dt>
@@ -1553,6 +1785,31 @@
   .qjd__matedit-err {
     padding: 6px 0 0;
     font-size: 12px;
+  }
+  /* S2 / ADR-0094 Gap 1 — stock-form dimensional inputs. Canonical
+     warm-charcoal tokens (tokens.css); mono tabular figures for dims. */
+  .qjd__stockdims {
+    display: flex;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+    width: 100%;
+  }
+  .qjd__stockfield {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: var(--type-size-xs);
+    color: var(--color-text-secondary);
+  }
+  .qjd__stockinput {
+    background: var(--color-surface-sunken);
+    color: var(--color-text-primary);
+    border: 1px solid var(--color-surface-divider);
+    border-radius: 6px;
+    padding: var(--space-1) var(--space-2);
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+    width: 9ch;
   }
   /* S416 — the inline accept-on-behalf form CSS (.qjd__accept*) was
      removed along with the operator Accept affordance. */
