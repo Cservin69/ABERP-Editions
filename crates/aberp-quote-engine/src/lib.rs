@@ -120,9 +120,13 @@ pub use capacity::{
     FALLBACK_DAILY_HOURS,
 };
 pub use catalogue::{
-    ComplexityRule, Material, QuotingParameters, StockAdjustment, StockStatus, ToleranceMultiplier,
+    ComplexityRule, MachineRate, Material, QuotingParameters, StockAdjustment, StockStatus,
+    ToleranceMultiplier,
 };
-pub use engine::{is_exotic_material, quote, quote_with_calibration, THIN_WALL_TIGHT_TOL_BUMP};
+pub use engine::{
+    is_exotic_material, quote, quote_with_calibration, quote_with_shop_model, route_family,
+    THIN_WALL_TIGHT_TOL_BUMP,
+};
 pub use error::QuoteError;
 pub use feature_graph::{
     Feature, FeatureGraph, FeatureType, SizeBucket, StockForm, ToleranceRange,

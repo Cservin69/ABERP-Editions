@@ -49,6 +49,7 @@ pub fn default_parameters() -> QuotingParameters {
         t_finish_min_per_cm2: 0.08,
         setup_base_min: 20.0,
         setup_5axis_min: 25.0,
+        bar_capacity_mm: 32.0, // ADR-0094 Gap 2 default; inert for RectangularBlock
     }
 }
 

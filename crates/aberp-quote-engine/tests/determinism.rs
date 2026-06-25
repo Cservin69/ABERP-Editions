@@ -105,3 +105,87 @@ fn reasoning_log_byte_identical_with_reordered_complexity_rules() {
     );
     assert_eq!(from_a.total_price, from_b.total_price);
 }
+
+#[test]
+fn machine_family_vocabulary_is_stable() {
+    // ADR-0094 Gap 2 grew the closed vocab 8 → 11 by APPENDING (never
+    // reordering), so every pre-existing db-string and discriminant — which
+    // the engine uses as a `BTreeMap` key + lead-time tie-break — is
+    // unchanged. This pins the order so a future reorder fails loudly.
+    use aberp_quote_engine::MachineFamily;
+    let expected: [&str; 11] = [
+        "3-axis-mill",
+        "5-axis-mill",
+        "wire-EDM",
+        "sinker-EDM",
+        "lathe",
+        "grinder",
+        "additive",
+        "other",
+        "swiss-turn-mill",
+        "turn-mill",
+        "4-axis-mill",
+    ];
+    let got: Vec<&str> = MachineFamily::ALL.iter().map(|f| f.as_db_str()).collect();
+    assert_eq!(
+        got, expected,
+        "MachineFamily::ALL order + db-strings must be stable"
+    );
+    for f in MachineFamily::ALL {
+        assert_eq!(MachineFamily::from_db_str(f.as_db_str()), Some(f));
+    }
+}
+
+#[test]
+fn shop_model_reasoning_log_byte_identical_across_runs() {
+    use aberp_quote_engine::{quote_with_shop_model, CalibrationTable, MachineRate, StockForm};
+    let materials = vec![default_material("6061-T6")];
+    let rules = catchall_complexity_rules();
+    let tols = default_tolerance_multipliers();
+    let adjs = no_stock_adjustments();
+    let params = default_parameters();
+    let mut fg = simple_feature_graph("6061-T6");
+    fg.stock_form = StockForm::RoundBar {
+        diameter_mm: 18.0,
+        length_mm: 55.0,
+    };
+    let rates = vec![
+        MachineRate {
+            family: "swiss-turn-mill".to_string(),
+            attended_rate_eur_per_min: 1.5,
+            lights_out_factor: 0.35,
+            unattended_capable: true,
+        },
+        MachineRate {
+            family: "turn-mill".to_string(),
+            attended_rate_eur_per_min: 1.6,
+            lights_out_factor: 0.45,
+            unattended_capable: true,
+        },
+    ];
+    let run = || {
+        quote_with_shop_model(
+            &fg,
+            &materials,
+            &rules,
+            &tols,
+            &adjs,
+            &params,
+            DEFAULT_QTY,
+            DEFAULT_TOL,
+            &CalibrationTable::neutral(),
+            &rates,
+        )
+        .unwrap()
+    };
+    let a = run();
+    let b = run();
+    assert_eq!(
+        a, b,
+        "shop-model quote must be byte-identical across identical-input runs"
+    );
+    assert!(a
+        .reasoning_log
+        .iter()
+        .any(|l| l.contains("effective_rate=0.5250")));
+}
