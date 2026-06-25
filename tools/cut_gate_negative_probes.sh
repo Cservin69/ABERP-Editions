@@ -97,6 +97,42 @@ cargo build --release --features production --bin aberp
 ROGUE
 expect_fail "$c" "binds a non-defense root" "production-arm launcher pointed at .aberp-portable"
 
+echo "[CHECK 8] a NEW storefront daemon spawned OUTSIDE the gate (the core anti-regression)"
+c="$(fresh)"
+cat >> "$c/apps/aberp/src/serve.rs" <<'ROGUE'
+
+// ROGUE PROBE: a new storefront-reaching daemon spawned with NO edition gate.
+fn _rogue_storefront_probe() {
+    let rogue_handle = tokio::spawn(async move {});
+    coordinator.register("storefront-sync", rogue_handle);
+}
+ROGUE
+expect_fail "$c" "is NOT behind storefront_polling_allowed" "ungated storefront daemon spawn added"
+
+echo "[CHECK 8] removing the serve.rs boot guard (storefront reach un-refused at boot)"
+c="$(fresh)"; grep -v 'guard_storefront_reach_matches_edition();' "$c/apps/aberp/src/serve.rs" > "$c/apps/aberp/src/serve.rs.tmp" && mv "$c/apps/aberp/src/serve.rs.tmp" "$c/apps/aberp/src/serve.rs"
+expect_fail "$c" "boot guard guard_storefront_reach_matches_edition missing or not wired" "boot guard calls removed"
+
+echo "[CHECK 8] removing the storefront-reach predicate from build_profile.rs"
+c="$(fresh)"; grep -v 'pub fn assert_storefront_reach_allowed' "$c/apps/aberp/src/build_profile.rs" > "$c/apps/aberp/src/build_profile.rs.tmp" && mv "$c/apps/aberp/src/build_profile.rs.tmp" "$c/apps/aberp/src/build_profile.rs"
+expect_fail "$c" "missing the storefront-reach predicate" "assert_storefront_reach_allowed removed"
+
+echo "[CHECK 8] un-gating an on-demand storefront handler (handle_test_quote_intake_connection)"
+c="$(fresh)"
+python3 - "$c/apps/aberp/src/serve.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; L=open(p).read().split("\n")
+# find the handler signature, strip storefront_polling_allowed from its next 50 lines
+for i,l in enumerate(L):
+    if "fn handle_test_quote_intake_connection" in l:
+        for j in range(i, min(i+50, len(L))):
+            if "storefront_polling_allowed" in L[j]:
+                L[j] = "        // (gate removed by negative probe)"
+        break
+open(p,"w").write("\n".join(L))
+PYIN
+expect_fail "$c" "handler handle_test_quote_intake_connection does NOT gate on storefront_polling_allowed" "handler gate removed"
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi

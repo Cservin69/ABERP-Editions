@@ -39,6 +39,15 @@
 #           root; arms don't cross (a --features production launcher binds
 #           .aberp-defense, never the sibling/prod root).
 #           ENFORCE_LAUNCHER_ARM_MATCH=0 disables it.
+#   CHECK 8 (S2 storefront-isolation, ENFORCED) — storefront reach
+#           (polling abenerp.com for customer CAD / pushing the catalogue) is
+#           a COMPILE-TIME Defense-only capability: build_profile carries the
+#           predicate + runtime backstop, serve.rs has the boot guard wired
+#           into both config arms, and EVERY storefront daemon spawn + on-
+#           demand handler sits behind storefront_polling_allowed(). A Portable
+#           build physically cannot reach the storefront regardless of
+#           [quote_intake] config / ABERP_QUOTE_INTAKE_* env.
+#           ENFORCE_STOREFRONT_GATE=0 disables it for a deliberate local probe.
 #
 # Negative probes for the CHECKs live in tools/cut_gate_negative_probes.sh
 # (each plants a violation in a throwaway copy and asserts the gate FAILS).
@@ -272,6 +281,104 @@ for f in run/*.sh; do
     fi
   fi
 done
+
+# ── CHECK 8 — storefront reach is a COMPILE-TIME Defense-only capability
+#    (ENFORCED · ADR-0093 storefront isolation) ─────────────────────────────
+# The quote-intake / pricing pipeline polls the customer storefront
+# (abenerp.com) for uploaded CAD and pushes the catalogue / priced PDFs back.
+# That REACH pulls real customer data, so — like the prod-NAV endpoint and the
+# edition DB root — it is bound to the edition at COMPILE time, not merely
+# config-gated: ONLY the Defense build may reach the storefront; a Portable
+# (demo) build has the capability compiled out and physically cannot poll/push
+# regardless of [quote_intake] config or ABERP_QUOTE_INTAKE_* env. This check
+# proves every storefront-reaching spawn/handler sits behind the gate.
+echo "[CHECK 8] storefront reach gated to Defense edition (ADR-0093)"
+enforce8="${ENFORCE_STOREFRONT_GATE:-1}"
+flag8() { note "$1"; if [[ "$enforce8" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+bp="apps/aberp/src/build_profile.rs"
+sv="apps/aberp/src/serve.rs"
+probe="tools/storefront_gate_decision_probe.rs"
+# window-search helpers
+back_has() { local f="$1" ln="$2" win="$3" needle="$4" start; start=$(( ln - win )); (( start < 1 )) && start=1; sed -n "${start},${ln}p" "$f" | grep -qF "$needle"; }
+fwd_has()  { local f="$1" ln="$2" win="$3" needle="$4" end;   end=$(( ln + win )); sed -n "${ln},${end}p" "$f" | grep -qF "$needle"; }
+
+# 8a — compile-time predicate + runtime backstop + single-source DECISION rule.
+if [[ -f "$bp" ]] \
+   && grep -q 'pub const fn storefront_polling_allowed_for(edition: Edition) -> bool' "$bp" \
+   && grep -q 'pub const fn storefront_polling_allowed() -> bool' "$bp" \
+   && grep -q 'pub fn assert_storefront_reach_allowed' "$bp" \
+   && grep -qF 'matches!(edition, Edition::Defense)' "$bp"; then
+  note "✓ build_profile.rs: storefront_polling_allowed[_for] + assert_storefront_reach_allowed (Defense-only)"
+else
+  flag8 "✗ build_profile.rs missing the storefront-reach predicate / backstop / decision rule"
+fi
+
+# 8a' — the standalone both-arms proof carries the SAME decision rule (no drift).
+if [[ -f "$probe" ]] && grep -qF 'matches!(edition, Edition::Defense)' "$probe"; then
+  note "✓ both-arms decision probe present + carries build_profile's exact rule (drift-proof)"
+else
+  flag8 "✗ tools/storefront_gate_decision_probe.rs missing or drifted from build_profile's decision rule"
+fi
+
+# 8b — serve.rs boot guard present AND wired (definition + >=1 call site).
+if grep -q 'fn guard_storefront_reach_matches_edition' "$sv" \
+   && [[ "$(grep -c 'guard_storefront_reach_matches_edition' "$sv")" -ge 3 ]]; then
+  note "✓ serve.rs boot guard guard_storefront_reach_matches_edition present + called (resolved+malformed arms)"
+else
+  flag8 "✗ serve.rs boot guard guard_storefront_reach_matches_edition missing or not wired into both config arms"
+fi
+
+# 8c — every KNOWN storefront DAEMON spawn sits behind the gate: each
+#      coordinator.register("<tag>") has storefront_polling_allowed within the
+#      preceding 20 lines (per-spawn debug_assert backstop / boot guard).
+for tag in quote-intake catalogue-push quote-pricing-pipeline email-outbox-poll pdf-rerender; do
+  rln="$(grep -nE "coordinator\.register\([[:space:]]*\"$tag\"|^[[:space:]]*\"$tag\",[[:space:]]*$" "$sv" | head -1 | cut -d: -f1)"
+  if [[ -z "$rln" ]]; then
+    flag8 "✗ storefront daemon '$tag' has no coordinator.register — surface moved/renamed? gate may be stale"
+  elif back_has "$sv" "$rln" 20 "storefront_polling_allowed"; then
+    note "✓ '$tag' daemon spawn (L$rln) behind storefront_polling_allowed"
+  else
+    flag8 "✗ '$tag' daemon spawn (L$rln) is NOT behind storefront_polling_allowed — ungated storefront reach"
+  fi
+done
+
+# 8d — every on-demand storefront HTTP surface refuses in non-Defense: the
+#      gate token appears inside each handler body.
+for h in handle_test_catalogue_push handle_put_quote_intake_config handle_test_quote_intake_connection post_operator_accept; do
+  hln="$(grep -nE "fn $h\b" "$sv" | head -1 | cut -d: -f1)"
+  if [[ -z "$hln" ]]; then
+    flag8 "✗ storefront handler $h not found — surface moved/renamed? gate may be stale"
+  elif fwd_has "$sv" "$hln" 50 "storefront_polling_allowed"; then
+    note "✓ handler $h gates on storefront_polling_allowed (refuses in non-Defense)"
+  else
+    flag8 "✗ handler $h does NOT gate on storefront_polling_allowed"
+  fi
+done
+
+# 8e — ANTI-REGRESSION: ANY coordinator.register("<…storefront-keyword…>")
+#      — even a NEW tag — must be gated. Keyed STRICTLY off coordinator.register
+#      (not axum .route paths): for each register call, read the tag from the
+#      same line or, for the multiline form, the next non-blank line; if the tag
+#      names a storefront surface it must have storefront_polling_allowed within
+#      the preceding 20 lines. Catches a brand-new ungated storefront daemon.
+sfkey='storefront|catalogue|quote-intake|quote-pricing|pdf-rerender|email-outbox'
+while IFS=: read -r ln _; do
+  [[ -z "$ln" ]] && continue
+  same="$(sed -n "${ln}p" "$sv")"
+  tag="$(printf '%s' "$same" | sed -nE 's/.*coordinator\.register\([[:space:]]*"([^"]+)".*/\1/p')"
+  if [[ -z "$tag" ]]; then
+    # multiline form: tag is the first quoted string on the next 1-2 lines
+    tag="$(sed -n "$((ln+1)),$((ln+2))p" "$sv" | sed -nE 's/^[[:space:]]*"([^"]+)",?[[:space:]]*$/\1/p' | head -1)"
+  fi
+  [[ -z "$tag" ]] && continue
+  if printf '%s' "$tag" | grep -qE "$sfkey"; then
+    if back_has "$sv" "$ln" 20 "storefront_polling_allowed"; then
+      : # gated
+    else
+      flag8 "✗ storefront-ish daemon register '$tag' at L$ln is NOT behind storefront_polling_allowed"
+    fi
+  fi
+done < <(grep -nE 'coordinator\.register\(' "$sv" 2>/dev/null || true)
 
 echo
 if [[ "$fail" -ne 0 ]]; then echo "CUT-GATE: ✗ FAILED"; exit 1; fi

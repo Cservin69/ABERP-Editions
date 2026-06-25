@@ -297,6 +297,35 @@ fn guard_db_matches_edition(db: &std::path::Path) {
     }
 }
 
+/// S2 / ADR-0093 — the edition STOREFRONT-REACH guard. The mirror of
+/// [`guard_db_matches_edition`] for the customer storefront (`abenerp.com`):
+/// refuses to boot a daemon set that polls the storefront for customer CAD /
+/// pushes the catalogue when this build's edition is not allowed to reach it
+/// ([`crate::build_profile::storefront_polling_allowed`] — Defense only). The
+/// reach capability is *derived* from the compile-time
+/// [`crate::build_profile::EDITION`]; this is the LOUD runtime backstop that
+/// makes "a Portable build physically cannot poll abenerp.com" true even when
+/// it is handed `[quote_intake]` config or `ABERP_QUOTE_INTAKE_*` env
+/// (FOUNDATION §5). Fires loud + `exit(1)` like [`guard_db_matches_edition`],
+/// before any storefront daemon spawns. Called only once storefront config
+/// has actually resolved (operator asked for reach) — a Portable build with
+/// no `[quote_intake]` config simply skips the spawn, no refusal needed.
+fn guard_storefront_reach_matches_edition() {
+    if let Err(e) = crate::build_profile::assert_storefront_reach_allowed(
+        "quote-intake poll + catalogue-push + pricing-pipeline storefront daemons",
+    ) {
+        eprintln!("❌ FATAL: {e}");
+        eprintln!(
+            "   This {} build was handed [quote_intake] storefront config (seller.toml \
+             or ABERP_QUOTE_INTAKE_* env), but storefront reach is compiled OUT of this \
+             edition. Remove the [quote_intake] config / unset the env, or run a Defense \
+             build (run/run_defense.sh).",
+            crate::build_profile::edition_label()
+        );
+        std::process::exit(1);
+    }
+}
+
 /// S165 / deliverable #3 — one-shot boot banner. PRODUCTION builds get a
 /// loud red/yellow REAL-NAV warning; dev builds get a dim one-liner.
 /// Bilingual (HU + EN) per the closed-vocab banner constraint. ANSI
@@ -1909,6 +1938,16 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 };
             match cfg_result {
                 Ok(mut cfg) => {
+                    // S2 / ADR-0093 — storefront-reach edition gate. We are
+                    // here ONLY because storefront config resolved to
+                    // enabled (env or seller.toml `[quote_intake]`), i.e. the
+                    // operator asked this build to reach abenerp.com. If this
+                    // edition may not (Portable), refuse the boot LOUDLY now —
+                    // BEFORE the credential is populated or any of the
+                    // quote-intake / catalogue-push / pricing-pipeline
+                    // storefront daemons spawn. Defense lifts the gate and
+                    // falls straight through. Mirror of the DB-edition guard.
+                    guard_storefront_reach_matches_edition();
                     // S291 / PR-272 — `ABERP_SISTER_SERVICE_BASE_URL`
                     // env override (brief C). The dev-test launcher
                     // sets this so a local-loopback session uses
@@ -2013,6 +2052,14 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                             // shutdown coordinator; cancellation
                             // races the cadence sleep so a Tauri
                             // close exits within ms.
+                            // S2 / ADR-0093 — defense-in-depth: this storefront daemon is only
+                            // reachable in a Defense build (the boot guard / spawn gate above). The
+                            // assert is the never-hit backstop that pins the invariant at the spawn.
+                            debug_assert!(
+                                crate::build_profile::storefront_polling_allowed(),
+                                "quote-intake poll daemon spawned in a non-Defense edition — storefront reach is \
+                                 compiled out (ADR-0093)"
+                            );
                             let quote_intake_token = coordinator.token.clone();
                             let quote_intake_handle = tokio::spawn(async move {
                                 service.run_daemon_forever(quote_intake_token).await;
@@ -2043,6 +2090,14 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                             tracing::info!(
                                 cadence_secs = crate::catalogue_push::PUSH_CADENCE_SECS,
                                 "spawning catalogue-push daemon (S266 / PR-255)"
+                            );
+                            // S2 / ADR-0093 — defense-in-depth: this storefront daemon is only
+                            // reachable in a Defense build (the boot guard / spawn gate above). The
+                            // assert is the never-hit backstop that pins the invariant at the spawn.
+                            debug_assert!(
+                                crate::build_profile::storefront_polling_allowed(),
+                                "catalogue-push daemon spawned in a non-Defense edition — storefront reach is \
+                                 compiled out (ADR-0093)"
                             );
                             let push_token = coordinator.token.clone();
                             let push_task_handle = tokio::spawn(async move {
@@ -2294,6 +2349,14 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                          (S279 / PR-265, resolver S282 / PR-267, \
                                           supervisor S286 / PR-268)"
                                     );
+                                    // S2 / ADR-0093 — defense-in-depth: this storefront daemon is only
+                                    // reachable in a Defense build (the boot guard / spawn gate above). The
+                                    // assert is the never-hit backstop that pins the invariant at the spawn.
+                                    debug_assert!(
+                                        crate::build_profile::storefront_polling_allowed(),
+                                        "pricing-pipeline daemon spawned in a non-Defense edition — storefront reach is \
+                                         compiled out (ADR-0093)"
+                                    );
                                     let pipeline_token = coordinator.token.clone();
                                     let pipeline_handle = tokio::spawn(async move {
                                         // S286 / PR-268 — wrapped in panic-
@@ -2334,6 +2397,13 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     );
                 }
                 Err(e) => {
+                    // S2 / ADR-0093 — a non-Disabled error means storefront
+                    // config WAS present (env flag / [quote_intake] set) but
+                    // malformed. On a non-Defense build refuse with the clear
+                    // edition message (exit 1) rather than a downstream
+                    // "URL/token missing" symptom; on Defense this is a no-op
+                    // and the original config error is returned as before.
+                    guard_storefront_reach_matches_edition();
                     return Err(anyhow!("quote-intake config error: {e:#}"));
                 }
             }
@@ -2555,7 +2625,18 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // The storefront-credential handle is the shared S289 SPOC; the
         // daemon snapshots it per cycle, so an operator URL change in
         // SPA → Settings → Quote Intake takes effect without a restart.
-        if crate::email_outbox_poll_daemon::is_disabled() {
+        if !crate::build_profile::storefront_polling_allowed() {
+            // S2 / ADR-0093 — the email-outbox daemon polls + writes back to
+            // the storefront's `/api/internal/email-queue`. Storefront reach
+            // is Defense-only; a Portable build must not spawn it (the local
+            // SMTP drain stays available). Never spawned ⇒ never reaches
+            // abenerp.com, regardless of the storefront credential.
+            tracing::info!(
+                edition = crate::build_profile::edition_label(),
+                "email-outbox poll daemon NOT spawned — storefront reach is a Defense-only \
+                 capability, compiled out of this edition (ADR-0093)"
+            );
+        } else if crate::email_outbox_poll_daemon::is_disabled() {
             tracing::info!(
                 env = crate::email_outbox_poll_daemon::POLL_DISABLE_ENV,
                 "email-outbox poll daemon disabled by env (S307 / PR-276)"
@@ -2593,6 +2674,14 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 poll_interval,
                 sender: outbox_sender,
             };
+            // S2 / ADR-0093 — defense-in-depth: this storefront daemon is only
+            // reachable in a Defense build (the boot guard / spawn gate above). The
+            // assert is the never-hit backstop that pins the invariant at the spawn.
+            debug_assert!(
+                crate::build_profile::storefront_polling_allowed(),
+                "email-outbox poll daemon spawned in a non-Defense edition — storefront reach is \
+                 compiled out (ADR-0093)"
+            );
             let outbox_token = coordinator.token.clone();
             let outbox_handle = tokio::spawn(async move {
                 crate::email_outbox_poll_daemon::run_supervised(outbox_deps, outbox_token).await;
@@ -2613,7 +2702,17 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // storefront-credential SPOC, so an operator URL change takes
         // effect on the next cycle. Kill switch:
         // `ABERP_PDF_RERENDER_DISABLED=1`.
-        if crate::quote_pdf_rerender_daemon::is_disabled() {
+        if !crate::build_profile::storefront_polling_allowed() {
+            // S2 / ADR-0093 — the pdf-rerender daemon re-POSTs priced PDFs to
+            // the storefront `/api/quotes/{id}/priced`. Storefront reach is
+            // Defense-only; a Portable build must not spawn it. Never spawned
+            // ⇒ never reaches abenerp.com.
+            tracing::info!(
+                edition = crate::build_profile::edition_label(),
+                "pdf-rerender daemon NOT spawned — storefront reach is a Defense-only \
+                 capability, compiled out of this edition (ADR-0093)"
+            );
+        } else if crate::quote_pdf_rerender_daemon::is_disabled() {
             tracing::info!(
                 env = crate::quote_pdf_rerender_daemon::POLL_DISABLE_ENV,
                 "pdf-rerender daemon disabled by env (S325 / PR-25)"
@@ -2662,6 +2761,14 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 queue: recovery_state.quote_pdf_rerender_queue.clone(),
                 poll_interval: rr_poll_interval,
             };
+            // S2 / ADR-0093 — defense-in-depth: this storefront daemon is only
+            // reachable in a Defense build (the boot guard / spawn gate above). The
+            // assert is the never-hit backstop that pins the invariant at the spawn.
+            debug_assert!(
+                crate::build_profile::storefront_polling_allowed(),
+                "pdf-rerender daemon spawned in a non-Defense edition — storefront reach is \
+                 compiled out (ADR-0093)"
+            );
             let rr_token = coordinator.token.clone();
             let rr_handle = tokio::spawn(async move {
                 crate::quote_pdf_rerender_daemon::run_supervised(rr_deps, rr_token).await;
@@ -12909,6 +13016,22 @@ async fn handle_test_catalogue_push(headers: HeaderMap, State(state): State<AppS
         return resp;
     }
 
+    // S2 / ADR-0093 — storefront reach is Defense-only. A Portable build
+    // cannot push the catalogue to abenerp.com; refuse the on-demand test.
+    if !crate::build_profile::storefront_polling_allowed() {
+        return Json(CataloguePushTestOutcome {
+            outcome: "failed",
+            error_class: Some("edition"),
+            error_detail: Some(
+                "Storefront reach is a Defense-only capability, compiled out of this edition \
+                 (ADR-0093). A Portable build cannot push the catalogue to abenerp.com."
+                    .to_string(),
+            ),
+            pushed_count: None,
+        })
+        .into_response();
+    }
+
     let credential = match state.storefront_credential.snapshot() {
         Some(c) => c,
         None => {
@@ -20861,6 +20984,24 @@ async fn handle_put_quote_intake_config(
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
+    // S2 / ADR-0093 — refuse to ACCEPT/persist a storefront base_url in a
+    // non-Defense build. Storefront reach is Defense-only; a Portable build
+    // must never persist `[quote_intake]` base_url/token or populate the live
+    // credential (which would let a daemon reach abenerp.com). Refuse loudly.
+    if !crate::build_profile::storefront_polling_allowed() {
+        tracing::warn!(
+            edition = crate::build_profile::edition_label(),
+            "refused PUT /api/quote-intake/config — storefront reach is a Defense-only \
+             capability, compiled out of this edition (ADR-0093)"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "Storefront reach (abenerp.com quote intake) is a Defense-only capability and is \
+             compiled out of this edition (ADR-0093). The local quote engine and manual \
+             quoting remain available.",
+        )
+            .into_response();
+    }
     let cfg = quote_intake_config_mod::QuoteIntakeTomlConfig {
         enabled: wire.enabled,
         base_url: wire
@@ -20953,6 +21094,20 @@ async fn handle_test_quote_intake_connection(
     }
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
+    }
+    // S2 / ADR-0093 — storefront reach is Defense-only. A Portable build
+    // cannot probe a connection to abenerp.com; refuse before any HTTP.
+    if !crate::build_profile::storefront_polling_allowed() {
+        let outcome = QuoteIntakeTestOutcome {
+            outcome: "failed",
+            error_class: Some("edition"),
+            error_detail: Some(
+                "Storefront reach is a Defense-only capability, compiled out of this edition \
+                 (ADR-0093). A Portable build cannot test a connection to abenerp.com."
+                    .to_string(),
+            ),
+        };
+        return (StatusCode::OK, Json(outcome)).into_response();
     }
     let base_url = wire.base_url.trim().trim_end_matches('/').to_string();
     if base_url.is_empty() || !(base_url.starts_with("http://") || base_url.starts_with("https://"))
@@ -22177,6 +22332,15 @@ pub async fn post_operator_accept(
     use crate::quote_pricing_pipeline::{
         classify_send_error, classify_writeback_response, resolved_writeback_url, WritebackOutcome,
     };
+    // S2 / ADR-0093 — storefront reach is Defense-only. A Portable build must
+    // not POST a status writeback to abenerp.com; refuse before any HTTP.
+    if !crate::build_profile::storefront_polling_allowed() {
+        return WritebackOutcome::TransportError {
+            kind: "storefront reach is a Defense-only capability, compiled out of this edition \
+                   (ADR-0093) — refusing to POST a status writeback to abenerp.com"
+                .to_string(),
+        };
+    }
     let url = resolved_writeback_url(base_url, quote_id, "status");
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(20))

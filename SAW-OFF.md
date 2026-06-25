@@ -73,6 +73,25 @@ git -C <original-ABERP> rev-parse 'origin/PROD_v2.27.76^{tree}'
    against the canonical bundle (`efb55f0`); the saved PAT is flagged
    DEAD/COMPROMISED and was **not** used; the authenticated push runs on
    Ervin's Mac under his own `gh`/git auth. See "Chunk 5 — publish status".
+6. **Storefront-reach isolation (S2)** — the quote-intake / pricing pipeline's
+   reach to the customer storefront (`abenerp.com`: poll for uploaded CAD, push
+   the catalogue, write back priced PDFs / status) is now a COMPILE-TIME
+   **Defense-only** capability, mirroring the DB binding. `build_profile`
+   carries the predicate `storefront_polling_allowed[_for]` (only
+   `Edition::Defense`) + the runtime backstop `assert_storefront_reach_allowed`;
+   `serve.rs` has `guard_storefront_reach_matches_edition` (FATAL + `exit(1)`,
+   the mirror of `guard_db_matches_edition`) wired into BOTH the resolved- and
+   malformed-`[quote_intake]`-config arms, so a Portable build handed
+   `[quote_intake]` config or `ABERP_QUOTE_INTAKE_*` env **refuses at boot**
+   rather than poll. Every storefront daemon spawn (quote-intake, catalogue-
+   push, pricing-pipeline, email-outbox-poll, pdf-rerender) and every on-demand
+   storefront handler (test-connection ×2, config-PUT, REFUSE-saga writeback)
+   sits behind the gate; the local quote engine + manual quoting stay available
+   in BOTH editions. Cut-gate CHECK 8 added (ENFORCED, `ENFORCE_STOREFRONT_GATE=1`)
+   with four negative probes; both-arms decision proof in
+   `tools/storefront_gate_decision_probe.rs` (`rustc --test`, Portable⇒refuse /
+   Defense⇒allow). Full both-arm `cargo test` is **CI-deferred** (serve.rs is
+   DuckDB/HTTP-backed; repo CI build-proves both arms). ✅ **(this chunk)**
 
 ## Gating note
 

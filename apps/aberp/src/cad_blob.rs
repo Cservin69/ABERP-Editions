@@ -1,5 +1,14 @@
 //! S430 / ADR-0083 — CAD-blob encryption-at-rest + read-audit.
 //!
+//! ## S2 / ADR-0093 — storefront reach is gated upstream
+//!
+//! This module is LOCAL at-rest crypto, not itself a network surface. The CAD
+//! DOWNLOAD whose bytes it protects happens in
+//! [`crate::quote_pricing_pipeline`], whose daemon is spawned ONLY in a
+//! Defense build ([`crate::build_profile::storefront_polling_allowed`] / the
+//! [`crate::serve`] boot guard). A Portable build never pulls customer CAD off
+//! abenerp.com, so a storefront-sourced blob is never produced there.
+//!
 //! # Why
 //!
 //! The auto-quote pricing pipeline downloads a customer's CAD file
