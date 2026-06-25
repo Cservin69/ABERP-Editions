@@ -38,7 +38,7 @@ use time::OffsetDateTime;
 use ulid::Ulid;
 
 use aberp_audit_ledger::{append_in_tx, Actor, EventKind, LedgerMeta};
-use aberp_quote_engine::{MachineFamily, MachineRate as EngineMachineRate};
+use aberp_quote_engine::MachineFamily;
 
 // Reuse the tunables write-error + validation-error vocab so the serve
 // layer's `tunable_write_response` maps machine-rate failures identically.
@@ -459,31 +459,6 @@ pub fn delete_machine_rate(
         .context("commit delete_machine_rate")
         .map_err(TunableWriteError::Other)?;
     Ok(())
-}
-
-/// Load + snapshot the rate rows into the engine's `MachineRate` slice
-/// (ADR-0094 Gap 2). A row whose `family` no engine variant knows is skipped
-/// **loud** (defence against schema drift, CLAUDE.md rule 12) rather than
-/// silently bucketed. An empty result ⇒ the engine uses the global flat rate
-/// (byte-identical to pre-ADR-0094) — the inert-by-default contract.
-pub fn snapshot_machine_rates(conn: &Connection, tenant: &str) -> Result<Vec<EngineMachineRate>> {
-    let mut out = Vec::new();
-    for r in list_machine_rates(conn, tenant)? {
-        if MachineFamily::from_db_str(&r.family).is_none() {
-            eprintln!(
-                "WARN quoting_machine_rates: row {} has unknown family {:?}; skipped from snapshot",
-                r.id, r.family
-            );
-            continue;
-        }
-        out.push(EngineMachineRate {
-            family: r.family,
-            attended_rate_eur_per_min: r.attended_rate_eur_per_min,
-            lights_out_factor: r.lights_out_factor,
-            unattended_capable: r.unattended_capable,
-        });
-    }
-    Ok(out)
 }
 
 // ── Internals ───────────────────────────────────────────────────────────
