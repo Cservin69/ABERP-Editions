@@ -68,10 +68,10 @@ use aberp_audit_ledger::{
 };
 use aberp_cad_extract_wrapper::{CadExtractor, ExtractRequest};
 use aberp_quote_engine::{
-    self as engine, ComplexityRule as EngineComplexityRule, FeatureGraph, MachineFamily,
-    MachineRate as EngineMachineRate, Material as EngineMaterial, QuoteBreakdown,
-    QuotingParameters, StockAdjustment, StockForm, StockStatus, ToleranceMultiplier,
-    ToleranceRange,
+    self as engine, ComplexityRule as EngineComplexityRule, FeatureGraph, GearOp, GearProcess,
+    GearProcessRate as EngineGearProcessRate, MachineFamily, MachineRate as EngineMachineRate,
+    Material as EngineMaterial, QuoteBreakdown, QuotingParameters, StockAdjustment, StockForm,
+    StockStatus, ToleranceMultiplier, ToleranceRange,
 };
 use aberp_quote_pdf::QuoteInputs;
 
@@ -129,6 +129,46 @@ fn stamp_stock_form(
         }
         None if graph.stock_form != StockForm::RectangularBlock => (graph.stock_form, "extractor"),
         None => (graph.stock_form, "default"),
+    }
+}
+
+/// S6 / ADR-0094 Gap 3 (wiring) — reconstruct the operator-entered gear ops
+/// from the persisted `gear_ops_json` column (the engine's `Vec<GearOp>` wire
+/// shape). `None` / empty / `"[]"` ⇒ `None` (no operator override: the graph
+/// keeps its empty serde-default, or a future S269 extractor hint). A
+/// present-but-malformed payload is a hard error — fail loud (CLAUDE.md rule
+/// 12); the route layer validates the closed vocab before persisting, so a
+/// malformed blob here is real corruption, not operator input. Pure + total.
+fn operator_gear_ops(json: Option<&str>) -> Result<Option<Vec<GearOp>>> {
+    let Some(raw) = json else { return Ok(None) };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Ok(None);
+    }
+    let ops: Vec<GearOp> =
+        serde_json::from_str(trimmed).context("decode operator gear_ops_json")?;
+    if ops.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(ops))
+    }
+}
+
+/// S6 / ADR-0094 Gap 3 (wiring) — stamp the operator gear ops onto
+/// `graph.gears` with precedence **operator > extractor hint (already on the
+/// graph) > empty default**, returning the provenance for the pricing audit.
+/// Mirrors `stamp_stock_form`: `operator = None` leaves the graph's gears
+/// untouched, so a quote with no operator gears keeps its empty default ⇒ no
+/// gear cost ⇒ byte-identical to today. The gear count for the audit is read
+/// back off `graph.gears` after stamping.
+fn stamp_gear_ops(graph: &mut FeatureGraph, operator: Option<Vec<GearOp>>) -> &'static str {
+    match operator {
+        Some(ops) => {
+            graph.gears = ops;
+            "operator"
+        }
+        None if !graph.gears.is_empty() => "extractor",
+        None => "default",
     }
 }
 
@@ -910,21 +950,27 @@ impl PricingPipelineService {
             // partner's customer_type → active profile (or operator
             // override) overrides the global markup + floor. The engine
             // stays pure; we only swap the knobs we feed it.
-            let (buyer_partner_id, margin_override_pct, operator_form, machine_family_override) =
-                match jobs::get_job_detail(&conn, &quote_id, &tenant_id_string)? {
-                    Some(d) => (
-                        d.buyer_partner_id,
-                        d.margin_override_pct,
-                        operator_stock_form(
-                            d.stock_form.as_deref(),
-                            d.stock_od_mm,
-                            d.stock_id_mm,
-                            d.stock_length_mm,
-                        ),
-                        d.machine_family_override,
+            let (
+                buyer_partner_id,
+                margin_override_pct,
+                operator_form,
+                machine_family_override,
+                gear_ops_json,
+            ) = match jobs::get_job_detail(&conn, &quote_id, &tenant_id_string)? {
+                Some(d) => (
+                    d.buyer_partner_id,
+                    d.margin_override_pct,
+                    operator_stock_form(
+                        d.stock_form.as_deref(),
+                        d.stock_od_mm,
+                        d.stock_id_mm,
+                        d.stock_length_mm,
                     ),
-                    None => (None, None, None, None),
-                };
+                    d.machine_family_override,
+                    d.gear_ops_json,
+                ),
+                None => (None, None, None, None, None),
+            };
             // ADR-0094 Gap 1 (S2 wiring) — stamp the chosen stock form onto
             // the graph BEFORE the engine call (now `quote_with_shop_model`,
             // S4 Gap 2). Precedence:
@@ -988,6 +1034,23 @@ impl PricingPipelineService {
             let engine_machine_rates =
                 apply_family_override(&base_machine_rates, geometry_family, effective_family);
 
+            // ── ADR-0094 Gap 3 (S6 wiring) — gear-generation ops ─────────
+            // Stamp the operator's gear ops onto the graph (precedence
+            // operator > extractor hint > empty default; an unset column
+            // leaves the empty serde-default ⇒ no gear cost) and snapshot the
+            // operator's gear-process coefficient table into the engine's
+            // 11th argument. Empty either way ⇒ the engine never enters the
+            // gear path ⇒ price byte-identical to pre-Gap-3.
+            let gear_ops_source = stamp_gear_ops(
+                &mut graph,
+                operator_gear_ops(gear_ops_json.as_deref())
+                    .context("decode operator gear ops")?,
+            );
+            let gear_process_rows =
+                crate::quoting_gear_processes::list_gear_processes(&conn, &tenant_id_string)
+                    .context("load gear processes")?;
+            let engine_gear_process_rates = convert_gear_process_rates(&gear_process_rows);
+
             match engine::quote_with_shop_model(
                 &graph,
                 &engine_materials,
@@ -999,6 +1062,7 @@ impl PricingPipelineService {
                 target_tol,
                 &cal_table,
                 &engine_machine_rates,
+                &engine_gear_process_rates,
             ) {
                 Ok(breakdown) => {
                     let json = serde_json::to_string(&breakdown).context("encode breakdown")?;
@@ -1149,6 +1213,45 @@ impl PricingPipelineService {
                                 attended_rate_eur_per_min: r.attended_rate_eur_per_min,
                                 lights_out_factor: r.lights_out_factor,
                                 unattended_capable: r.unattended_capable,
+                            })
+                            .collect(),
+                        gear_cost_eur: breakdown.gear_cost,
+                        gear_ops_source: gear_ops_source.to_string(),
+                        gear_ops_snapshot: graph
+                            .gears
+                            .iter()
+                            .map(|g| {
+                                // Record the engine's resolved process (Auto →
+                                // concrete) using the SAME public selector the
+                                // engine uses, keyed on the effective family.
+                                let resolved = match g.process {
+                                    GearProcess::Auto => engine::select_gear_process(
+                                        g.kind,
+                                        effective_family,
+                                        g.quality_agma,
+                                    ),
+                                    other => other,
+                                };
+                                GearOpAudit {
+                                    kind: g.kind.as_db_str().to_string(),
+                                    module_mm: g.module_mm,
+                                    teeth: g.teeth,
+                                    face_width_mm: g.face_width_mm,
+                                    quality_agma: g.quality_agma,
+                                    requested_process: g.process.as_db_str().to_string(),
+                                    resolved_process: resolved.as_db_str().to_string(),
+                                }
+                            })
+                            .collect(),
+                        gear_process_rate_snapshot: engine_gear_process_rates
+                            .iter()
+                            .map(|r| GearProcessAudit {
+                                process: r.process.clone(),
+                                setup_min: r.setup_min,
+                                min_per_tooth: r.min_per_tooth,
+                                module_exponent: r.module_exponent,
+                                agma_quality_factor_base: r.agma_quality_factor_base,
+                                in_cycle_factor: r.in_cycle_factor,
                             })
                             .collect(),
                         actor: "system".to_string(),
@@ -2807,6 +2910,28 @@ fn convert_machine_rates(
         .collect()
 }
 
+/// S6 / ADR-0094 Gap 3 — snapshot the local gear-process rows into the
+/// engine's `GearProcessRate` slice. Mirrors `convert_machine_rates`. An
+/// empty result (no rows) ⇒ a gear whose resolved process has no row
+/// contributes 0.0 + a loud engine reasoning line; with no gears at all the
+/// slice is never consulted (byte-identical to pre-Gap-3). Rows are validated
+/// on write (`quoting_gear_processes::validate_gear_process_inputs`).
+fn convert_gear_process_rates(
+    locals: &[crate::quoting_gear_processes::GearProcessRow],
+) -> Vec<EngineGearProcessRate> {
+    locals
+        .iter()
+        .map(|r| EngineGearProcessRate {
+            process: r.process.clone(),
+            setup_min: r.setup_min,
+            min_per_tooth: r.min_per_tooth,
+            module_exponent: r.module_exponent,
+            agma_quality_factor_base: r.agma_quality_factor_base,
+            in_cycle_factor: r.in_cycle_factor,
+        })
+        .collect()
+}
+
 /// S4 / ADR-0094 Gap 2 — outer diameter (mm) of a turned/round stock form,
 /// for the wiring's `route_family` call (mirrors the engine's private
 /// `stock_od_mm`). A prismatic block has no turning OD ⇒ 0.0.
@@ -2975,7 +3100,49 @@ pub fn reprice_quote(
     );
     policy.apply(&mut engine_params);
 
-    let breakdown = engine::quote(
+    // ★ ADR-0094 Gap 2 (S4) + Gap 3 (S6) — route the in-place re-price through
+    // the shop-model entry so it respects BOTH machine-family rates AND gear
+    // cost. It previously called plain `engine::quote`, which ignored both
+    // (flagged by S4 + S5). Mirrors the daemon price path's family routing +
+    // operator override + gear stamp/snapshot.
+    //
+    // Calibration is intentionally kept NEUTRAL here — exactly as the prior
+    // `engine::quote` was (it delegates to `quote_with_calibration` with a
+    // neutral table). Aligning re-price with the daemon's LIVE calibration is
+    // a separate, deferred decision (FLAGGED to S7), kept out to stay surgical.
+    //
+    // Inert by default: the seeded 3-axis rate equals the global flat rate, so
+    // a prismatic part with no gears re-prices byte-identically to the old
+    // `engine::quote`; only seeded turned/geared work moves (the intended fix).
+    let machine_rate_rows = crate::quoting_machine_rates::list_machine_rates(conn, tenant)?;
+    let base_machine_rates = convert_machine_rates(&machine_rate_rows);
+    let geometry_family = engine::route_family(
+        graph.stock_form,
+        graph.requires_5_axis,
+        stock_od_mm(graph.stock_form),
+        &engine_params,
+    );
+    let effective_family = detail
+        .machine_family_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(MachineFamily::from_db_str)
+        .unwrap_or(geometry_family);
+    let engine_machine_rates =
+        apply_family_override(&base_machine_rates, geometry_family, effective_family);
+
+    // Gap 3 — stamp operator gear ops + snapshot the gear-process table. Unset
+    // gear ops leave the graph's empty default ⇒ no gear cost ⇒ inert.
+    let _ = stamp_gear_ops(
+        &mut graph,
+        operator_gear_ops(detail.gear_ops_json.as_deref())
+            .context("decode operator gear ops for reprice")?,
+    );
+    let gear_process_rows = crate::quoting_gear_processes::list_gear_processes(conn, tenant)?;
+    let engine_gear_process_rates = convert_gear_process_rates(&gear_process_rows);
+
+    let breakdown = engine::quote_with_shop_model(
         &graph,
         &engine_materials,
         &engine_complexity,
@@ -2984,6 +3151,9 @@ pub fn reprice_quote(
         &engine_params,
         qty,
         ToleranceRange::Standard,
+        &aberp_quote_engine::CalibrationTable::neutral(),
+        &engine_machine_rates,
+        &engine_gear_process_rates,
     )
     .map_err(|e| anyhow!("reprice engine error: {e:?}"))?;
 
@@ -3144,6 +3314,31 @@ struct MachineRateAudit {
     unattended_capable: bool,
 }
 
+/// S6 / ADR-0094 Gap 3 — one operator gear op + the engine's resolved process,
+/// as snapshotted into the priced-audit payload.
+#[derive(Debug, Serialize)]
+struct GearOpAudit {
+    kind: String,
+    module_mm: f64,
+    teeth: u32,
+    face_width_mm: f64,
+    quality_agma: u8,
+    requested_process: String,
+    resolved_process: String,
+}
+
+/// S6 / ADR-0094 Gap 3 — one gear-process coefficient row as snapshotted into
+/// the priced-audit payload (the exact slice handed to the engine).
+#[derive(Debug, Serialize)]
+struct GearProcessAudit {
+    process: String,
+    setup_min: f64,
+    min_per_tooth: f64,
+    module_exponent: f64,
+    agma_quality_factor_base: f64,
+    in_cycle_factor: f64,
+}
+
 #[derive(Debug, Serialize)]
 struct QuotePricingPricedPayload {
     quote_id: String,
@@ -3178,6 +3373,18 @@ struct QuotePricingPricedPayload {
     machine_family_override: Option<String>,
     effective_machine_family: Option<String>,
     machine_rate_snapshot: Vec<MachineRateAudit>,
+    /// S6 / ADR-0094 Gap 3 — gear-generation provenance. `gear_cost_eur` is
+    /// the engine's summed tooth-generation cost (0.0 on an inert quote — the
+    /// wire `gear_cost` key is itself omitted when zero). `gear_ops_source` =
+    /// "operator" | "extractor" | "default". `gear_ops_snapshot` records each
+    /// costed gear + its resolved process (Auto → concrete via the engine's
+    /// own selector); `gear_process_rate_snapshot` is the exact
+    /// `&[GearProcessRate]` slice the engine priced with. All empty/zero on a
+    /// no-gear quote.
+    gear_cost_eur: f64,
+    gear_ops_source: String,
+    gear_ops_snapshot: Vec<GearOpAudit>,
+    gear_process_rate_snapshot: Vec<GearProcessAudit>,
     actor: String,
     idempotency_key: String,
 }
