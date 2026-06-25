@@ -1,5 +1,15 @@
 //! S325 / PR-25 — customer-facing PDF re-render daemon (EVE addendum-2).
 //!
+//! ## S2 / ADR-0093 — Defense-only storefront reach
+//!
+//! This module reaches the customer storefront (`abenerp.com`). That reach is
+//! a COMPILE-TIME Defense-only capability
+//! ([`crate::build_profile::storefront_polling_allowed`]): in a Portable build
+//! the daemon is never spawned — the boot guard / spawn gate in
+//! [`crate::serve`] refuses — so this code physically never runs there. The
+//! local quote engine + manual quoting stay available in BOTH editions; only
+//! the abenerp.com reach is gated.
+//!
 //! Drains the in-memory [`crate::quote_pdf_rerender_queue`], and for each
 //! quote-id whose `quote_intake_log.stock_alert` just flipped FALSE →
 //! TRUE:

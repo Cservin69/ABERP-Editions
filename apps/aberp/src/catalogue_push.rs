@@ -1,4 +1,14 @@
 //! S266 / PR-255 — outbound storefront push of the material catalogue
+//!
+//! ## S2 / ADR-0093 — Defense-only storefront reach
+//!
+//! This module reaches the customer storefront (`abenerp.com`). That reach is
+//! a COMPILE-TIME Defense-only capability
+//! ([`crate::build_profile::storefront_polling_allowed`]): in a Portable build
+//! the daemon is never spawned — the boot guard / spawn gate in
+//! [`crate::serve`] refuses — so this code physically never runs there. The
+//! local quote engine + manual quoting stay available in BOTH editions; only
+//! the abenerp.com reach is gated.
 //! (design doc §4 / §14-C).
 //!
 //! ABERP has **no public inbound surface** (ADR-0057: local Tauri app,

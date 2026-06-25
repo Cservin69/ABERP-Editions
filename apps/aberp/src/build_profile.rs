@@ -221,6 +221,71 @@ pub const fn foreign_data_dirnames() -> [&'static str; 2] {
     }
 }
 
+// ── S2 / ADR-0093 — compile-time storefront-reach edition gate ───────────
+//
+// The quote-intake / pricing pipeline POLLS the customer-facing storefront
+// (`abenerp.com`) for uploaded CAD and PUSHES the catalogue / priced PDFs /
+// status back to it. That REACH pulls real customer data over the network,
+// so — exactly like the prod-NAV endpoint above and the edition DB root
+// below — it is bound to the edition at COMPILE time, not merely gated by
+// config. Only the Defense edition may reach the storefront; a Portable
+// (demo) build has the capability compiled OUT and physically cannot poll
+// or push, no matter what `[quote_intake]` config / `ABERP_QUOTE_INTAKE_*`
+// env it is handed (FOUNDATION §5 — capability derived from the build,
+// never user-supplied).
+//
+// SCOPE: this gate covers ONLY the network reach to the storefront. The
+// pure local quote engine (`aberp-quote-engine`) and the operator/manual
+// quoting paths stay fully available in BOTH editions — a Portable demo can
+// still price a part the operator types in; it just cannot pull a
+// customer's CAD off abenerp.com or push a catalogue to it.
+
+/// Whether a given [`Edition`] may reach the customer storefront. Pure,
+/// total over `Edition`, and the SINGLE source of truth for the reach
+/// decision: ONLY [`Edition::Defense`]. Parameterised so BOTH edition arms
+/// are provable in one compile (the binary only ever pins its own
+/// [`EDITION`], but a test can check every arm). `const fn` for const-context
+/// use + trivial inlining.
+pub const fn storefront_polling_allowed_for(edition: Edition) -> bool {
+    matches!(edition, Edition::Defense)
+}
+
+/// `true` iff THIS build's edition may reach the customer storefront
+/// (`abenerp.com`): poll for CAD uploads, push the catalogue, write back
+/// priced PDFs / status. Compile-time constant derived from [`EDITION`] via
+/// [`storefront_polling_allowed_for`]: Defense ⇒ `true`, Portable (and the
+/// never-built `Prod` arm) ⇒ `false`.
+pub const fn storefront_polling_allowed() -> bool {
+    storefront_polling_allowed_for(EDITION)
+}
+
+/// Defence-in-depth storefront-reach gate — the runtime backstop behind the
+/// compile-time [`storefront_polling_allowed`] binding, mirroring
+/// [`assert_endpoint_allowed`] (prod NAV) and
+/// [`crate::tenant_registry::ensure_db_path_isolated`] (edition DB root). A
+/// Defense build has the gate LIFTED — storefront reach proceeds. Any other
+/// build (Portable) REFUSES, no matter how the storefront config arrived
+/// (`[quote_intake]` in seller.toml, the `ABERP_QUOTE_INTAKE_ENABLED` /
+/// `ABERP_QUOTE_INTAKE_URL` env, a hand-edited launcher, the SPA): it
+/// loud-fails rather than poll `abenerp.com` or pull a customer's CAD.
+/// `intent` names the refused surface so the boot/handler message is
+/// specific. Pure decision function ⇒ unit-testable for both edition arms
+/// without standing up serve.rs.
+pub fn assert_storefront_reach_allowed(intent: &str) -> anyhow::Result<()> {
+    if !storefront_polling_allowed() {
+        anyhow::bail!(
+            "ADR-0093 edition isolation: the {} edition refuses storefront reach ({}) — \
+             polling abenerp.com for customer CAD / pushing the catalogue is a Defense-only \
+             capability, compiled OUT of this build. The local quote engine + manual quoting \
+             stay available; only the abenerp.com reach is Defense-only. Rebuild as Defense \
+             (`cargo build --features production`) to enable storefront reach.",
+            edition_label(),
+            intent,
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +383,41 @@ mod tests {
         assert!(foreign_data_dirnames().contains(&PROD_DATA_DIRNAME));
         assert!(foreign_data_dirnames().contains(&PORTABLE_DATA_DIRNAME));
         assert!(!foreign_data_dirnames().contains(&DEFENSE_DATA_DIRNAME));
+    }
+
+    // ── S2 / ADR-0093 — storefront-reach edition gate pins ───────────
+    // The reach predicate is compile-time, so each build flavour pins
+    // its own arm: Portable refuses storefront reach, Defense allows it.
+    // The PARAMETERISED decision fn lets one compile prove BOTH arms.
+
+    #[test]
+    fn storefront_reach_predicate_total_over_edition_both_arms() {
+        // Both arms, in a single compile: ONLY Defense may reach the
+        // storefront. Prod is never built here but must never be allowed.
+        assert!(storefront_polling_allowed_for(Edition::Defense));
+        assert!(!storefront_polling_allowed_for(Edition::Portable));
+        assert!(!storefront_polling_allowed_for(Edition::Prod));
+        // This build's predicate agrees with its own EDITION.
+        assert_eq!(storefront_polling_allowed(), EDITION == Edition::Defense);
+    }
+
+    #[cfg(not(feature = "production"))]
+    #[test]
+    fn portable_build_refuses_storefront_reach() {
+        // Portable: the capability is compiled OUT.
+        assert_eq!(EDITION, Edition::Portable);
+        assert!(!storefront_polling_allowed());
+        // The runtime backstop loud-fails even when config is "present"
+        // — the storefront base_url / token never reaches the network.
+        assert!(assert_storefront_reach_allowed("quote-intake poll daemon").is_err());
+    }
+
+    #[cfg(feature = "production")]
+    #[test]
+    fn defense_build_allows_storefront_reach() {
+        // Defense: the gate is LIFTED.
+        assert_eq!(EDITION, Edition::Defense);
+        assert!(storefront_polling_allowed());
+        assert!(assert_storefront_reach_allowed("quote-intake poll daemon").is_ok());
     }
 }

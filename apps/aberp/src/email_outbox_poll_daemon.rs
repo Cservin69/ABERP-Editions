@@ -1,5 +1,15 @@
 //! S307 / PR-276 — Email-outbox poll daemon (ADR-0009).
 //!
+//! ## S2 / ADR-0093 — Defense-only storefront reach
+//!
+//! This module reaches the customer storefront (`abenerp.com`). That reach is
+//! a COMPILE-TIME Defense-only capability
+//! ([`crate::build_profile::storefront_polling_allowed`]): in a Portable build
+//! the daemon is never spawned — the boot guard / spawn gate in
+//! [`crate::serve`] refuses — so this code physically never runs there. The
+//! local quote engine + manual quoting stay available in BOTH editions; only
+//! the abenerp.com reach is gated.
+//!
 //! Polls the storefront's `/api/internal/email-queue` endpoint, claims
 //! each entry the daemon decides to handle, sends it via ABERP's
 //! local SMTP (reusing the S281 lettre transport helpers from
