@@ -47,6 +47,7 @@
     listRestoredInvoices,
     listSellerBanks,
     listStockAdjustments,
+    listGearProcesses,
     listMachineRates,
     listToleranceMultipliers,
     type NavCredentialsStatusResponse,
@@ -302,6 +303,13 @@
         const res = await listMachineRates();
         const n = res.rates.length;
         return n === 1 ? "1 family rate" : `${n} family rates`;
+      }
+      case "GearProcessCount": {
+        // S6 / ADR-0094 Gap 3 — count of per-process gear coefficient rows.
+        // Seeded with the five concrete ADR-0094 processes on a fresh tenant.
+        const res = await listGearProcesses();
+        const n = res.processes.length;
+        return n === 1 ? "1 process" : `${n} processes`;
       }
       case "InventoryBalanceCount": {
         // S273 / PR-262 / ADR-0069 — count of `(tenant,

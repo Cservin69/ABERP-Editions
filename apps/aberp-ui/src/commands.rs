@@ -668,6 +668,18 @@ pub async fn set_quote_stock_form(
     forward_post(&state, &path, body).await
 }
 
+/// S6 / ADR-0094 Gap 3 — set/clear the operator gear ops for a quote and
+/// re-price in place. Forwards the `{ gears: [...] }` body to the HTTPS route.
+#[tauri::command]
+pub async fn set_quote_gear_ops(
+    state: State<'_, AppState>,
+    quote_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-pricing-jobs/{quote_id}/gear-ops");
+    forward_post(&state, &path, body).await
+}
+
 // ── S431 — Approved Vendor List (AVL) master data + screening + PO-gate ──
 //
 // Mirrors the machine CRUD bridge. `vendor_id` is the server-minted
@@ -1023,6 +1035,34 @@ pub async fn update_machine_rate(
 #[tauri::command]
 pub async fn delete_machine_rate(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let path = format!("/api/quoting-machine-rates/{}", urlencode(&id));
+    forward_delete(&state, &path).await
+}
+
+// ── S6 / ADR-0094 Gap 3 — quoting_gear_processes CRUD bridge ─────────
+
+#[tauri::command]
+pub async fn list_gear_processes(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quoting-gear-processes", true).await
+}
+
+#[tauri::command]
+pub async fn create_gear_process(state: State<'_, AppState>, body: Value) -> Result<Value, String> {
+    forward_post(&state, "/api/quoting-gear-processes", body).await
+}
+
+#[tauri::command]
+pub async fn update_gear_process(
+    state: State<'_, AppState>,
+    id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quoting-gear-processes/{}", urlencode(&id));
+    forward_put(&state, &path, body).await
+}
+
+#[tauri::command]
+pub async fn delete_gear_process(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let path = format!("/api/quoting-gear-processes/{}", urlencode(&id));
     forward_delete(&state, &path).await
 }
 

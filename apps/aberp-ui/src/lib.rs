@@ -310,6 +310,7 @@ pub fn run() {
             commands::set_quote_buyer_partner,
             commands::override_quote_margin,
             commands::set_quote_stock_form,
+            commands::set_quote_gear_ops,
             // S431 — Approved Vendor List (AVL) master data.
             commands::list_avl_vendors,
             commands::get_avl_vendor,
@@ -358,6 +359,11 @@ pub fn run() {
             commands::create_machine_rate,
             commands::update_machine_rate,
             commands::delete_machine_rate,
+            // S6 / ADR-0094 Gap 3 — gear-process coefficient catalogue CRUD.
+            commands::list_gear_processes,
+            commands::create_gear_process,
+            commands::update_gear_process,
+            commands::delete_gear_process,
             // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
             commands::list_inventory_balances,
             // S432 — heat-lot assignment + material traceability report.

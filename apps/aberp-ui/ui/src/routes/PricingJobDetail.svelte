@@ -23,12 +23,23 @@
     overrideQuoteMargin,
     setQuoteBuyerPartner,
     setQuoteStockForm,
+    setQuoteGearOps,
     retryQuotePricingJob,
     MaterialEditError,
     type AuditEntryView,
     type Partner,
     type PricingJobDetail,
+    type GearOp,
+    type GearKindDb,
+    type GearProcessDb,
+    type MachineFamily,
   } from "../lib/api";
+  import {
+    GEAR_KINDS,
+    GEAR_OP_PROCESSES,
+    gearProcessLabel,
+    selectGearProcess,
+  } from "../lib/gear-processes";
   import { formatPercent } from "../lib/margin-profiles";
   import PartnerTypeahead from "../lib/PartnerTypeahead.svelte";
   // S427 — lead-time chip colour + effective-value helper (pure).
@@ -131,6 +142,24 @@
   let stockError = $state<string | null>(null);
   let stockToast = $state<string | null>(null);
 
+  // S6 / ADR-0094 Gap 3 — operator gear-ops editor state. Each draft row is
+  // string-typed for the numeric inputs (parsed on save), mirroring the
+  // stock-form / margin controls. A vector of gears (a planetary box has many)
+  // so the editor is a list with add/remove.
+  interface GearDraft {
+    kind: GearKindDb;
+    module: string;
+    teeth: string;
+    faceWidth: string;
+    agma: string;
+    process: GearProcessDb;
+  }
+  let editingGears = $state(false);
+  let gearDrafts = $state<GearDraft[]>([]);
+  let gearBusy = $state(false);
+  let gearError = $state<string | null>(null);
+  let gearToast = $state<string | null>(null);
+
   const AUDIT_PAGE = 50;
 
   // Derived sections — all read off the one audit page we fetch.
@@ -208,6 +237,11 @@
       stockError = null;
       stockToast = null;
       editingStockForm = false;
+      // S6 — seed the gear-ops control from the persisted gear_ops_json.
+      seedGearDrafts(d);
+      gearError = null;
+      gearToast = null;
+      editingGears = false;
       loadState = "ready";
     } catch (e) {
       errorMessage = e instanceof Error ? e.message : String(e);
@@ -457,6 +491,134 @@
       stockError = e instanceof Error ? e.message : String(e);
     } finally {
       stockBusy = false;
+    }
+  }
+
+  // ── S6 / ADR-0094 Gap 3 — operator gear-ops intake ──────────────────
+  function parseGearOps(json: string | null): GearOp[] {
+    if (!json || json.trim() === "" || json.trim() === "[]") return [];
+    try {
+      const v = JSON.parse(json);
+      return Array.isArray(v) ? (v as GearOp[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function seedGearDrafts(d: PricingJobDetail | null): void {
+    gearDrafts = parseGearOps(d?.gear_ops_json ?? null).map((g) => ({
+      kind: g.kind,
+      module: String(g.module_mm),
+      teeth: String(g.teeth),
+      faceWidth: String(g.face_width_mm),
+      agma: String(g.quality_agma),
+      process: g.process,
+    }));
+  }
+
+  function gearSummary(d: PricingJobDetail): string {
+    const n = parseGearOps(d.gear_ops_json).length;
+    if (n === 0) return "Nincs fogazás / No gear ops (default)";
+    return n === 1
+      ? "1 fogazási művelet / 1 gear op"
+      : `${n} fogazási művelet / ${n} gear ops`;
+  }
+
+  // Coarse routed-family hint for the Auto preview: turned stock → a turning
+  // family (skive-capable), else a milling family. The engine confirms the
+  // exact family (incl. bar-capacity) at pricing; this is a display estimate.
+  function routedFamilyHint(d: PricingJobDetail | null): MachineFamily {
+    return d?.stock_form === "round_bar" || d?.stock_form === "tube"
+      ? "turn-mill"
+      : "3-axis-mill";
+  }
+
+  function previewProcess(draft: GearDraft): string {
+    const agma = Number(draft.agma);
+    const resolved =
+      draft.process === "auto"
+        ? selectGearProcess(
+            draft.kind,
+            routedFamilyHint(detail),
+            Number.isFinite(agma) ? agma : 8,
+          )
+        : draft.process;
+    return gearProcessLabel(resolved);
+  }
+
+  function startGearEdit(): void {
+    if (!detail) return;
+    editingGears = true;
+    gearError = null;
+    gearToast = null;
+  }
+
+  function cancelGearEdit(): void {
+    editingGears = false;
+    gearError = null;
+    seedGearDrafts(detail); // discard unsaved edits
+  }
+
+  function addGearRow(): void {
+    gearDrafts = [
+      ...gearDrafts,
+      {
+        kind: "external_spur_helical",
+        module: "2",
+        teeth: "20",
+        faceWidth: "10",
+        agma: "8",
+        process: "auto",
+      },
+    ];
+  }
+
+  function removeGearRow(i: number): void {
+    gearDrafts = gearDrafts.filter((_, idx) => idx !== i);
+  }
+
+  async function saveGears(): Promise<void> {
+    if (!quoteId) return;
+    gearBusy = true;
+    gearError = null;
+    try {
+      const gears: GearOp[] = [];
+      for (let i = 0; i < gearDrafts.length; i++) {
+        const d = gearDrafts[i];
+        const module_mm = Number(d.module);
+        const teeth = Number(d.teeth);
+        const face_width_mm = Number(d.faceWidth);
+        const quality_agma = Number(d.agma);
+        if (!(module_mm > 0) || !(face_width_mm > 0)) {
+          gearError = `Fog ${i + 1}: modul és fogszélesség > 0 / Gear ${i + 1}: module and face width > 0`;
+          return;
+        }
+        if (!Number.isInteger(teeth) || teeth < 1) {
+          gearError = `Fog ${i + 1}: fogszám egész, >= 1 / Gear ${i + 1}: teeth integer, >= 1`;
+          return;
+        }
+        if (!Number.isInteger(quality_agma) || quality_agma < 1 || quality_agma > 15) {
+          gearError = `Fog ${i + 1}: AGMA 1..15 / Gear ${i + 1}: AGMA in 1..15`;
+          return;
+        }
+        gears.push({
+          kind: d.kind,
+          module_mm,
+          teeth,
+          face_width_mm,
+          quality_agma,
+          process: d.process,
+        });
+      }
+      await setQuoteGearOps(quoteId, gears);
+      editingGears = false;
+      gearToast =
+        "Fogazás frissítve, újraárazás… / Gear ops updated, re-pricing…";
+      await load(quoteId);
+    } catch (e) {
+      gearError = e instanceof Error ? e.message : String(e);
+    } finally {
+      gearBusy = false;
     }
   }
 
@@ -1007,6 +1169,153 @@
               {#if stockToast}
                 <p class="qjd__toast" data-testid="pricing-job-stock-toast">
                   {stockToast}
+                </p>
+              {/if}
+            </dd>
+            <dt>Fogazás / Gear ops</dt>
+            <dd>
+              {#if editingGears}
+                <div
+                  class="qjd__matedit qjd__gearedit"
+                  data-testid="pricing-job-gear-edit"
+                >
+                  {#if gearDrafts.length === 0}
+                    <p class="qjd__gearhint">
+                      Nincs fogazási művelet. / No gear ops. Use “+ Fog / Gear”.
+                    </p>
+                  {/if}
+                  {#each gearDrafts as g, i (i)}
+                    <div class="qjd__gearrow" data-testid="pricing-job-gear-row">
+                      <select
+                        class="qjd__matselect"
+                        bind:value={g.kind}
+                        disabled={gearBusy}
+                        aria-label="Fogazás típusa / Gear kind"
+                      >
+                        {#each GEAR_KINDS as k (k.value)}
+                          <option value={k.value}>{k.label}</option>
+                        {/each}
+                      </select>
+                      <label class="qjd__gearfield">
+                        <span>m</span>
+                        <input
+                          class="qjd__stockinput"
+                          type="text"
+                          inputmode="decimal"
+                          bind:value={g.module}
+                          disabled={gearBusy}
+                          aria-label="modul / module (mm)"
+                        />
+                      </label>
+                      <label class="qjd__gearfield">
+                        <span>z</span>
+                        <input
+                          class="qjd__stockinput"
+                          type="text"
+                          inputmode="numeric"
+                          bind:value={g.teeth}
+                          disabled={gearBusy}
+                          aria-label="fogszám / teeth"
+                        />
+                      </label>
+                      <label class="qjd__gearfield">
+                        <span>b</span>
+                        <input
+                          class="qjd__stockinput"
+                          type="text"
+                          inputmode="decimal"
+                          bind:value={g.faceWidth}
+                          disabled={gearBusy}
+                          aria-label="fogszélesség / face width (mm)"
+                        />
+                      </label>
+                      <label class="qjd__gearfield">
+                        <span>AGMA</span>
+                        <input
+                          class="qjd__stockinput"
+                          type="text"
+                          inputmode="numeric"
+                          bind:value={g.agma}
+                          disabled={gearBusy}
+                          aria-label="AGMA"
+                        />
+                      </label>
+                      <select
+                        class="qjd__matselect"
+                        bind:value={g.process}
+                        disabled={gearBusy}
+                        aria-label="eljárás / process"
+                      >
+                        {#each GEAR_OP_PROCESSES as p (p.value)}
+                          <option value={p.value}>{p.label}</option>
+                        {/each}
+                      </select>
+                      <span
+                        class="qjd__gearpreview"
+                        title="Motor választása (becslés) / Engine resolution (estimate)"
+                        >→ {previewProcess(g)}</span
+                      >
+                      <button
+                        type="button"
+                        class="qjd__close"
+                        onclick={() => removeGearRow(i)}
+                        disabled={gearBusy}
+                        aria-label="Fog törlése / Remove gear">✕</button
+                      >
+                    </div>
+                  {/each}
+                  <div class="qjd__matedit-actions">
+                    <button
+                      type="button"
+                      class="btn btn--secondary"
+                      onclick={addGearRow}
+                      disabled={gearBusy}
+                      data-testid="pricing-job-gear-add">+ Fog / Gear</button
+                    >
+                    <button
+                      type="button"
+                      class="btn btn--secondary"
+                      onclick={() => void saveGears()}
+                      disabled={gearBusy}
+                      data-testid="pricing-job-gear-save"
+                      >{gearBusy
+                        ? "Mentés… / Saving…"
+                        : "Mentés / Save"}</button
+                    >
+                    <button
+                      type="button"
+                      class="qjd__close"
+                      onclick={cancelGearEdit}
+                      disabled={gearBusy}
+                      aria-label="Mégse / Cancel"
+                      data-testid="pricing-job-gear-cancel">✕</button
+                    >
+                  </div>
+                </div>
+                {#if gearError}
+                  <p
+                    class="qjd__err qjd__matedit-err"
+                    data-testid="pricing-job-gear-error"
+                  >
+                    {gearError}
+                  </p>
+                {/if}
+              {:else}
+                <span class="qjd__matval" data-testid="pricing-job-gear-value"
+                  >{gearSummary(detail)}</span
+                >
+                <button
+                  type="button"
+                  class="qjd__matpencil"
+                  onclick={startGearEdit}
+                  aria-label="Fogazás szerkesztése / Edit gear ops"
+                  title="Fogazás szerkesztése / Edit gear ops"
+                  data-testid="pricing-job-gear-edit-btn">✎</button
+                >
+              {/if}
+              {#if gearToast}
+                <p class="qjd__toast" data-testid="pricing-job-gear-toast">
+                  {gearToast}
                 </p>
               {/if}
             </dd>
@@ -1810,6 +2119,40 @@
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
     width: 9ch;
+  }
+  /* S6 / ADR-0094 Gap 3 — gear-ops editor: a wrapped list of compact rows. */
+  .qjd__gearedit {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    width: 100%;
+  }
+  .qjd__gearrow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-2);
+  }
+  .qjd__gearfield {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: var(--type-size-xs);
+    color: var(--color-text-secondary);
+  }
+  .qjd__gearfield .qjd__stockinput {
+    width: 6ch;
+  }
+  .qjd__gearhint {
+    margin: 0;
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
+  }
+  .qjd__gearpreview {
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    color: var(--color-text-muted);
+    white-space: nowrap;
   }
   /* S416 — the inline accept-on-behalf form CSS (.qjd__accept*) was
      removed along with the operator Accept affordance. */

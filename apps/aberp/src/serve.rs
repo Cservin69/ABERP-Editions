@@ -22247,6 +22247,10 @@ struct PricingJobDetailView {
     stock_od_mm: Option<f64>,
     stock_id_mm: Option<f64>,
     stock_length_mm: Option<f64>,
+    /// S6 / ADR-0094 Gap 3 — operator gear ops as the engine `Vec<GearOp>`
+    /// JSON array string; `null`/empty = no gears (inert). The intake control
+    /// seeds from this and POSTs changes to `…/gear-ops`.
+    gear_ops_json: Option<String>,
 }
 
 /// S349 / PR-40 (U1) — `GET /api/quote-pricing-jobs/:quote_id`. Bearer-
@@ -22338,6 +22342,7 @@ async fn handle_get_quote_pricing_job_detail(
         stock_od_mm: d.stock_od_mm,
         stock_id_mm: d.stock_id_mm,
         stock_length_mm: d.stock_length_mm,
+        gear_ops_json: d.gear_ops_json,
     };
     (axum::http::StatusCode::OK, axum::Json(view)).into_response()
 }
