@@ -35,6 +35,16 @@
 //!    and cannot run under a synthesised `HOME`. Same env-gating posture
 //!    as `serve_boot_budget_live.rs` and the other `*_live` tests.
 
+// S435 / ADR-0093 — this entire module is the PORTABLE-line boot smoke:
+// every pin asserts the Portable/DEV posture (`is_production_build:false`,
+// NAV-off demo boots to `Ready`). The Defense (`--features production`)
+// build inverts `is_production_build`, so these assertions are false BY
+// CONSTRUCTION there — scope the whole module out of the Defense arm. The
+// assertions stay correct and ALWAYS run in the Portable (default) build.
+// Defense keeps its own coverage: partner-create via serve_partners_route.rs,
+// /health via serve_smoke.rs, edition/boot guards via edition_db_isolation.rs.
+#![cfg(not(feature = "production"))]
+
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
