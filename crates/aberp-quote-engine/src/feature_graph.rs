@@ -173,6 +173,57 @@ pub struct Feature {
     pub representative_size_mm: f64,
 }
 
+/// The raw-stock envelope the part is cut from — the shape the shop
+/// actually buys and bills, and the volume roughing removes down to the
+/// finished part (ADR-0094 Gap 1).
+///
+/// **Back-compat (load-bearing).** `#[serde(default)]` on
+/// [`FeatureGraph::stock_form`] means a graph that omits the field —
+/// every persisted blob and every v2-extractor output — loads as
+/// [`StockForm::RectangularBlock`], whose volume is exactly today's
+/// bounding-box block (`bx·by·bz`). So every existing golden,
+/// determinism and property number stays byte-identical until the
+/// extractor/operator supplies a round form (Gap 1 part B, S2). Mirrors
+/// the `surface_area_mm2` (S418) / `calibration_coefficient` (S429)
+/// serde-default precedent.
+///
+/// Each variant carries its own dimensions: the pure engine evaluates a
+/// volume formula and never infers a spin axis from the bounding box —
+/// axis inference is the extractor's job, consistent with
+/// [`Feature::representative_size_mm`] ("the engine does not
+/// second-guess").
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StockForm {
+    /// A rectangular block sized to the bounding box — **today's
+    /// model**, reproduced byte-for-byte. Billed/roughed volume is
+    /// `bounding_box_mm[0] * [1] * [2]`. The default.
+    #[default]
+    RectangularBlock,
+    /// A solid round bar (turned stock). Billed/roughed volume is the
+    /// cylinder `π/4 · diameter_mm² · length_mm` — `0.7854×` the
+    /// bounding-box block, so a turned part bills ~21.5 % less material
+    /// (and roughs only what a near-net bar actually removes).
+    RoundBar {
+        /// Bar diameter in millimetres.
+        diameter_mm: f64,
+        /// Bar cut-off length in millimetres.
+        length_mm: f64,
+    },
+    /// A hollow tube / ring blank. Billed/roughed volume is the annulus
+    /// `π/4 · (od_mm² − id_mm²) · length_mm`. The bore is **never
+    /// bought**, so it is neither billed as material nor "roughed away"
+    /// — the correct model for a ring-gear blank.
+    Tube {
+        /// Outside diameter in millimetres.
+        od_mm: f64,
+        /// Inside (bore) diameter in millimetres.
+        id_mm: f64,
+        /// Tube length in millimetres.
+        length_mm: f64,
+    },
+}
+
 /// The extracted-geometry side of the engine input.
 ///
 /// Produced by `aberp-cad-extract` (Python, S269) and validated +
@@ -219,6 +270,16 @@ pub struct FeatureGraph {
     /// Drives the tight-tolerance labor bump
     /// ([`crate::THIN_WALL_TIGHT_TOL_BUMP`]).
     pub thin_wall_present: bool,
+    /// **ADR-0094 Gap 1.** The raw-stock envelope this part is cut from.
+    /// Drives BOTH the billed material volume AND the roughing
+    /// removed-volume `(stock − part)`. `#[serde(default)]` (mirroring
+    /// `surface_area_mm2` / `calibration_coefficient`) makes a graph that
+    /// omits it load as [`StockForm::RectangularBlock`] = today's
+    /// bounding-box block, so existing goldens stay byte-identical. The
+    /// extractor (S269) / operator (S2 wiring) populates it for turned
+    /// and tubular parts.
+    #[serde(default)]
+    pub stock_form: StockForm,
 }
 
 impl FeatureGraph {
@@ -226,6 +287,10 @@ impl FeatureGraph {
     /// wrapper (S270) compares this against the value in the JSON
     /// and refuses unknown versions loud. **v2 (S418)** added
     /// `surface_area_mm2`; the Python `SCHEMA_VERSION` and the
-    /// wrapper's `EXPECTED_SCHEMA_VERSION` bump in lockstep.
-    pub const SCHEMA_VERSION: u32 = 2;
+    /// wrapper's `EXPECTED_SCHEMA_VERSION` bump in lockstep. **v3
+    /// (ADR-0094 Gap 1)** adds the defaulted `stock_form`; a v2 graph
+    /// (no `stock_form`) still loads — it defaults to `RectangularBlock`
+    /// — and the version guard accepts any `schema_version ≤ 3`. The
+    /// extractor's lockstep bump to v3 lands with S269 (ADR-0094 Q3).
+    pub const SCHEMA_VERSION: u32 = 3;
 }

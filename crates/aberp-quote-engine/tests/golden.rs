@@ -72,4 +72,14 @@ fn fixed_input_produces_locked_numeric_output_at_4dp() {
     assert_eq!(round4(r.machining_minutes), 16.1475, "machining_minutes");
     assert_eq!(round4(r.inspection_minutes), 0.0000, "inspection_minutes");
     assert!(!r.route_to_5_axis);
+
+    // S1/ADR-0094 back-compat tripwire: the default (RectangularBlock)
+    // stock form must emit TODAY'S EXACT material line, byte-for-byte —
+    // not merely the same numbers. Guards the reasoning_log contract.
+    assert!(
+        r.reasoning_log
+            .iter()
+            .any(|l| l == "[material] bbox 50.000×30.000×20.000 = bbox_volume_mm3=30000.0000 * (1 + scrap_factor=0.1500) = stock_volume_mm3=34500.0000"),
+        "RectangularBlock must reproduce the pre-S1 material line exactly"
+    );
 }

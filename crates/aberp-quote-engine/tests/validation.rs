@@ -6,7 +6,8 @@
 mod common;
 
 use aberp_quote_engine::{
-    quote, ComplexityRule, Feature, FeatureGraph, FeatureType, QuoteError, ToleranceRange,
+    quote, ComplexityRule, Feature, FeatureGraph, FeatureType, QuoteError, StockForm,
+    ToleranceRange,
 };
 use common::*;
 
@@ -72,6 +73,7 @@ fn missing_complexity_rule_for_feature_errors_loud() {
         }],
         requires_5_axis: false,
         thin_wall_present: false,
+        stock_form: StockForm::RectangularBlock,
     };
     // Rules table covers only (pocket, M) — engraving/XS is missing.
     let rules = vec![ComplexityRule {

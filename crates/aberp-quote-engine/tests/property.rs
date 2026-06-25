@@ -6,7 +6,7 @@
 
 mod common;
 
-use aberp_quote_engine::{quote, FeatureType, ToleranceRange};
+use aberp_quote_engine::{quote, FeatureType, StockForm, ToleranceRange};
 use common::*;
 
 /// xorshift64* — tiny deterministic PRNG. Not for crypto; for
@@ -89,6 +89,25 @@ fn engine_never_panics_across_varied_inputs() {
         }
         let qty = lcg.range(1, 100);
         let tol = tolerances[lcg.range(0, tolerances.len() as u32 - 1) as usize];
+
+        // S1/ADR-0094: vary the stock form too. Dims are kept valid
+        // (positive; tube id < od ⇒ annulus >= 0) — invalid geometry is
+        // the extractor/wiring's job to reject, not the pure engine's.
+        fg.stock_form = match case % 3 {
+            0 => StockForm::RectangularBlock,
+            1 => StockForm::RoundBar {
+                diameter_mm: lcg.unit() * 120.0 + 1.0,
+                length_mm: lcg.unit() * 200.0 + 1.0,
+            },
+            _ => {
+                let od = lcg.unit() * 120.0 + 10.0;
+                StockForm::Tube {
+                    od_mm: od,
+                    id_mm: lcg.unit() * (od - 1.0),
+                    length_mm: lcg.unit() * 200.0 + 1.0,
+                }
+            }
+        };
 
         // The call MUST NOT panic; failure paths are typed errors.
         let result = quote(&fg, &materials, &rules, &tols, &adjs, &params, qty, tol);

@@ -124,7 +124,9 @@ pub use catalogue::{
 };
 pub use engine::{is_exotic_material, quote, quote_with_calibration, THIN_WALL_TIGHT_TOL_BUMP};
 pub use error::QuoteError;
-pub use feature_graph::{Feature, FeatureGraph, FeatureType, SizeBucket, ToleranceRange};
+pub use feature_graph::{
+    Feature, FeatureGraph, FeatureType, SizeBucket, StockForm, ToleranceRange,
+};
 
 /// Crate version stamp emitted on every breakdown so a quote PDF can
 /// surface "priced by engine v0.0.0" (per the design doc's mention of

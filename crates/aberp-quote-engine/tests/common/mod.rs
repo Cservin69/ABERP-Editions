@@ -6,7 +6,7 @@
 
 use aberp_quote_engine::{
     ComplexityRule, Feature, FeatureGraph, FeatureType, Material, QuotingParameters,
-    StockAdjustment, StockStatus, ToleranceMultiplier, ToleranceRange,
+    StockAdjustment, StockForm, StockStatus, ToleranceMultiplier, ToleranceRange,
 };
 
 pub fn default_material(grade: &str) -> Material {
@@ -145,6 +145,9 @@ pub fn simple_feature_graph(grade: &str) -> FeatureGraph {
         ],
         requires_5_axis: false,
         thin_wall_present: false,
+        // S1/ADR-0094: explicit default form keeps every existing golden,
+        // determinism, branch and property number byte-identical.
+        stock_form: StockForm::RectangularBlock,
     }
 }
 

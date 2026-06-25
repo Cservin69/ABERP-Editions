@@ -14,7 +14,7 @@ use crate::catalogue::{
     ComplexityRule, Material, QuotingParameters, StockAdjustment, ToleranceMultiplier,
 };
 use crate::error::QuoteError;
-use crate::feature_graph::{FeatureGraph, SizeBucket, ToleranceRange};
+use crate::feature_graph::{FeatureGraph, SizeBucket, StockForm, ToleranceRange};
 use crate::ENGINE_VERSION;
 
 /// Machining-cost multiplier applied when the part has a thin wall AND
@@ -199,14 +199,75 @@ pub fn quote_with_calibration(
     // stock-oversize margin. The same `stock_volume` drives roughing
     // removal below (one stock definition, report §5.1).
     let [bx, by, bz] = feature_graph.bounding_box_mm;
+    // `bbox_volume` stays the bounding-box block: it still drives the
+    // CAD-CAM `fill_ratio` (step 9) and the bbox-area finishing fallback,
+    // which are geometry signals independent of the stock form.
     let bbox_volume = bx * by * bz;
-    let stock_volume = bbox_volume * (1.0 + parameters.scrap_factor);
-    log.push(format!(
-        "[material] bbox {bx:.3}×{by:.3}×{bz:.3} = bbox_volume_mm3={bv:.4} * (1 + scrap_factor={sc:.4}) = stock_volume_mm3={sv:.4}",
-        bv = bbox_volume,
-        sc = parameters.scrap_factor,
-        sv = stock_volume,
-    ));
+    // ── ADR-0094 Gap 1: stock FORM sets the bought/roughed volume ──
+    // RectangularBlock == bbox_volume (today's math, byte-for-byte).
+    // RoundBar/Tube evaluate their own closed-form volume; the engine
+    // never infers a spin axis — the form carries its own dimensions
+    // (the extractor classifies; the engine evaluates).
+    let form_volume = match feature_graph.stock_form {
+        StockForm::RectangularBlock => bbox_volume,
+        StockForm::RoundBar {
+            diameter_mm,
+            length_mm,
+        } => std::f64::consts::FRAC_PI_4 * diameter_mm * diameter_mm * length_mm,
+        StockForm::Tube {
+            od_mm,
+            id_mm,
+            length_mm,
+        } => std::f64::consts::FRAC_PI_4 * (od_mm * od_mm - id_mm * id_mm) * length_mm,
+    };
+    let stock_volume = form_volume * (1.0 + parameters.scrap_factor);
+    match feature_graph.stock_form {
+        // RectangularBlock emits TODAY'S EXACT line → golden byte-identical.
+        StockForm::RectangularBlock => log.push(format!(
+            "[material] bbox {bx:.3}×{by:.3}×{bz:.3} = bbox_volume_mm3={bv:.4} * (1 + scrap_factor={sc:.4}) = stock_volume_mm3={sv:.4}",
+            bv = bbox_volume,
+            sc = parameters.scrap_factor,
+            sv = stock_volume,
+        )),
+        StockForm::RoundBar {
+            diameter_mm,
+            length_mm,
+        } => {
+            log.push(format!(
+                "[material] stock_form=round_bar: π/4 * d={d:.3}² * L={l:.3} = form_volume_mm3={fv:.4} (vs bbox_volume_mm3={bv:.4})",
+                d = diameter_mm,
+                l = length_mm,
+                fv = form_volume,
+                bv = bbox_volume,
+            ));
+            log.push(format!(
+                "[material] stock_volume_mm3 = form_volume {fv:.4} * (1 + scrap_factor={sc:.4}) = {sv:.4}",
+                fv = form_volume,
+                sc = parameters.scrap_factor,
+                sv = stock_volume,
+            ));
+        }
+        StockForm::Tube {
+            od_mm,
+            id_mm,
+            length_mm,
+        } => {
+            log.push(format!(
+                "[material] stock_form=tube: π/4 * (od={od:.3}² - id={id:.3}²) * L={l:.3} = form_volume_mm3={fv:.4} (bore not bought; vs bbox_volume_mm3={bv:.4})",
+                od = od_mm,
+                id = id_mm,
+                l = length_mm,
+                fv = form_volume,
+                bv = bbox_volume,
+            ));
+            log.push(format!(
+                "[material] stock_volume_mm3 = form_volume {fv:.4} * (1 + scrap_factor={sc:.4}) = {sv:.4}",
+                fv = form_volume,
+                sc = parameters.scrap_factor,
+                sv = stock_volume,
+            ));
+        }
+    }
     // mass_kg = stock_volume_mm3 × (g/cm3) × 1e-6   (mm3→cm3: /1000, g→kg: /1000)
     let mass_kg = stock_volume * material.density_g_cm3 / 1_000_000.0;
     let mut material_cost = mass_kg * material.cost_per_kg_eur;
