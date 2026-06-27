@@ -90,9 +90,10 @@ impl PostWriteCheckpoint {
             let db = self.db_path.clone();
             let tenant = self.tenant.clone();
             // DuckDB EXPORT/IMPORT is blocking — run off the async runtime.
-            let outcome =
-                tokio::task::spawn_blocking(move || crate::snapshot::live_checkpoint_logged(&db, &tenant))
-                    .await;
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::snapshot::live_checkpoint_logged(&db, &tenant)
+            })
+            .await;
             if let Err(join) = outcome {
                 tracing::error!(
                     error = %join,

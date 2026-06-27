@@ -127,7 +127,7 @@ fn entry_hashes(path: &Path) -> Vec<Vec<u8>> {
     l.entries()
         .unwrap()
         .iter()
-        .map(|e| e.entry_hash.as_bytes().to_vec())
+        .map(|e| e.entry_hash.as_bytes().as_slice().to_vec())
         .collect()
 }
 
@@ -209,7 +209,12 @@ fn recover_cli_auto_recovers_torn_db_with_no_lost_committed_entry() {
 
     // The crash outcome: a torn, unopenable live file.
     make_torn(&db);
-    assert!(Connection::open(&db).is_err(), "the torn file must not open");
+    assert!(
+        Connection::open(&db)
+            .and_then(|c| c.execute_batch("PRAGMA database_list;"))
+            .is_err(),
+        "the torn file must not open cleanly"
+    );
 
     // The ONE supported recovery step — no sidecar surgery.
     assert!(

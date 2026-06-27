@@ -828,7 +828,10 @@ fn emit_db_auto_recovered(
         EventKind::DbAutoRecovered,
         payload.to_bytes(),
     ) {
-        tracing::warn!(error = ?e, "could not record db.auto_recovered audit (recovery already durable)");
+        tracing::warn!(
+            error = ?e,
+            "could not record db.auto_recovered audit (recovery already durable)"
+        );
     }
 }
 
@@ -1387,7 +1390,13 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     error = %open_err,
                     "billing DB exists but failed to open at boot — attempting ADR-0095 §1 auto-recovery"
                 );
-                match attempt_db_auto_recovery(&args.db, &tenant, &binary_hash_handle, "torn_open")? {
+                let recovery = attempt_db_auto_recovery(
+                    &args.db,
+                    &tenant,
+                    &binary_hash_handle,
+                    "torn_open",
+                )?;
+                match recovery {
                     BootRecovery::Recovered => {
                         DuckDbBillingStore::open(&args.db).with_context(|| {
                             format!(
@@ -1677,8 +1686,13 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     "audit-ledger mirror is AHEAD of the DB — attempting ADR-0095 §1 auto-recovery"
                 );
                 drop(conn);
-                match attempt_db_auto_recovery(&args.db, &tenant, &binary_hash_handle, "mirror_ahead")
-                {
+                let recovery = attempt_db_auto_recovery(
+                    &args.db,
+                    &tenant,
+                    &binary_hash_handle,
+                    "mirror_ahead",
+                );
+                match recovery {
                     Ok(BootRecovery::Recovered) => {
                         tracing::warn!(
                             "ADR-0095 §1 — auto-recovery reconciled the ahead mirror with the DB at boot"
