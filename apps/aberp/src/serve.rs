@@ -780,6 +780,214 @@ fn record_tenant_boot(
     }
 }
 
+/// ADR-0095 §1 — actor login recorded on a `db.auto_recovered` audit entry.
+/// Boot/CLI auto-recovery is a SYSTEM action, not an operator one.
+const AUTO_RECOVER_LOGIN: &str = "system:auto-recover";
+
+/// Outcome of a guarded ADR-0095 §1 recovery decision at boot.
+enum BootRecovery {
+    /// The DB was rebuilt + atomically installed; boot may continue.
+    Recovered,
+    /// A guard rail declined (no valid snapshot, or snapshot+mirror prove
+    /// inconsistent). The caller keeps today's preserve-and-surface; the
+    /// string is the boot-fatal reason.
+    Refused(String),
+}
+
+/// Human suffix naming the retained `<db>.CORRUPT-<tag>` evidence copy, if any.
+fn retained_suffix(retained: &Option<PathBuf>) -> String {
+    match retained {
+        Some(p) => format!(" (corrupt DB retained at {})", p.display()),
+        None => String::new(),
+    }
+}
+
+/// Append the `db.auto_recovered` audit entry recording a completed ADR-0095
+/// §1 recovery. Best-effort: the recovery is ALREADY durable (atomic_install +
+/// verified-good marker), so a failed audit append is logged, never fatal.
+/// The append advances BOTH the DB and the mirror (via `Ledger::append` →
+/// `sync_mirror`), so they stay reconciled — no chain fork.
+fn emit_db_auto_recovered(
+    db_path: &Path,
+    tenant: &TenantId,
+    binary_hash: &BinaryHashHandle,
+    payload: audit_payloads::DbAutoRecoveredPayload,
+) {
+    let bh = match binary_hash.wait() {
+        Ok(bh) => bh,
+        Err(e) => {
+            tracing::warn!(error = ?e, "binary hash unavailable; skipping db.auto_recovered audit");
+            return;
+        }
+    };
+    if let Err(e) = crate::tenant_registry::emit_tenant_event(
+        db_path,
+        tenant.clone(),
+        bh,
+        AUTO_RECOVER_LOGIN,
+        EventKind::DbAutoRecovered,
+        payload.to_bytes(),
+    ) {
+        tracing::warn!(error = ?e, "could not record db.auto_recovered audit (recovery already durable)");
+    }
+}
+
+/// ADR-0095 §1 — attempt the guarded, reversible auto-recovery of the tenant
+/// DB. Covers BOTH failure modes (a torn/unopenable live DB and an
+/// ahead-of-DB mirror) with the one algorithm in
+/// [`aberp_snapshot::recover_or_refuse`]: preserve evidence → rebuild from the
+/// latest VALID snapshot → REPLAY the preserved mirror delta (never truncated)
+/// → validate → atomic-install + marker. On success emits `db.auto_recovered`
+/// and returns [`BootRecovery::Recovered`]; on a guard-rail refusal returns
+/// [`BootRecovery::Refused`] (caller keeps the preserve-and-surface fallback).
+/// Returns `Err` only for a hard MECHANICAL failure (a true boot-fatal).
+fn attempt_db_auto_recovery(
+    db_path: &Path,
+    tenant: &TenantId,
+    binary_hash: &BinaryHashHandle,
+    trigger: &str,
+) -> Result<BootRecovery> {
+    let store_dir = crate::snapshot::resolve_store(tenant.as_str(), None)
+        .context("resolve snapshot store for ADR-0095 auto-recovery")?;
+    let mirror_path = aberp_audit_ledger::mirror_path_for(db_path);
+    tracing::warn!(
+        db = %db_path.display(),
+        store = %store_dir.display(),
+        trigger,
+        "ADR-0095 §1 — attempting guarded snapshot+replay auto-recovery"
+    );
+    let outcome =
+        aberp_snapshot::recover_or_refuse(db_path, &store_dir, &mirror_path, tenant.as_str())
+            .context("ADR-0095 recover_or_refuse")?;
+    match outcome {
+        aberp_snapshot::RecoveryOutcome::Recovered {
+            source_snapshot_seq,
+            snapshot_audit_count,
+            replayed_entries,
+            recovered_max_seq,
+            retained_corrupt_db,
+        } => {
+            let retained = retained_corrupt_db.as_ref().map(|p| p.display().to_string());
+            tracing::warn!(
+                source_snapshot_seq,
+                snapshot_audit_count,
+                replayed_entries,
+                recovered_max_seq,
+                retained_corrupt_db = ?retained,
+                "ADR-0095 §1 — auto-recovery SUCCEEDED; live DB rebuilt + verified-good marker written"
+            );
+            emit_db_auto_recovered(
+                db_path,
+                tenant,
+                binary_hash,
+                audit_payloads::DbAutoRecoveredPayload {
+                    trigger: trigger.to_string(),
+                    source_snapshot_seq,
+                    snapshot_audit_count,
+                    replayed_entries,
+                    recovered_max_seq,
+                    retained_corrupt_db: retained,
+                },
+            );
+            Ok(BootRecovery::Recovered)
+        }
+        aberp_snapshot::RecoveryOutcome::RefusedNoSnapshot { retained_corrupt_db } => {
+            Ok(BootRecovery::Refused(format!(
+                "no VALID snapshot in {} to rebuild from{}",
+                store_dir.display(),
+                retained_suffix(&retained_corrupt_db)
+            )))
+        }
+        aberp_snapshot::RecoveryOutcome::RefusedUnsafe {
+            reason,
+            retained_corrupt_db,
+        } => Ok(BootRecovery::Refused(format!(
+            "{reason}{}",
+            retained_suffix(&retained_corrupt_db)
+        ))),
+    }
+}
+
+/// ADR-0095 §1 — `aberp recover`. The single supported MANUAL crash-recovery
+/// path (replaces the old hand-clear-the-sidecar surgery): runs the same
+/// guarded [`aberp_snapshot::recover_or_refuse`] the boot path runs, prints the
+/// outcome, and records `db.auto_recovered` on success. Returns `Err` on a
+/// guard-rail refusal so a script can detect it (process exits non-zero).
+pub fn run_recover(args: &crate::cli::RecoverArgs) -> Result<()> {
+    let tenant = TenantId::new(args.tenant.clone())
+        .ok_or_else(|| anyhow!("invalid tenant id {:?}", args.tenant))?;
+    let store_dir = crate::snapshot::resolve_store(&args.tenant, args.store.as_deref())
+        .context("resolve snapshot store for `aberp recover`")?;
+    let mirror_path = aberp_audit_ledger::mirror_path_for(&args.db);
+    let binary_hash = BinaryHashHandle::start_background();
+
+    println!("aberp recover — ADR-0095 §1 guarded, reversible recovery");
+    println!("  db:     {}", args.db.display());
+    println!("  store:  {}", store_dir.display());
+    println!("  mirror: {}", mirror_path.display());
+
+    let outcome =
+        aberp_snapshot::recover_or_refuse(&args.db, &store_dir, &mirror_path, &args.tenant)
+            .context("recover_or_refuse")?;
+    match outcome {
+        aberp_snapshot::RecoveryOutcome::Recovered {
+            source_snapshot_seq,
+            snapshot_audit_count,
+            replayed_entries,
+            recovered_max_seq,
+            retained_corrupt_db,
+        } => {
+            let retained = retained_corrupt_db.as_ref().map(|p| p.display().to_string());
+            emit_db_auto_recovered(
+                &args.db,
+                &tenant,
+                &binary_hash,
+                audit_payloads::DbAutoRecoveredPayload {
+                    trigger: "manual_cli".to_string(),
+                    source_snapshot_seq,
+                    snapshot_audit_count,
+                    replayed_entries,
+                    recovered_max_seq,
+                    retained_corrupt_db: retained.clone(),
+                },
+            );
+            println!("RECOVERED");
+            println!(
+                "  rebuilt from snapshot seq {source_snapshot_seq} (audit head {snapshot_audit_count})"
+            );
+            println!(
+                "  replayed {replayed_entries} mirror entries; recovered head seq {recovered_max_seq}"
+            );
+            if let Some(p) = retained {
+                println!("  corrupt DB retained at {p}");
+            }
+            Ok(())
+        }
+        aberp_snapshot::RecoveryOutcome::RefusedNoSnapshot { retained_corrupt_db } => {
+            if let Some(p) = &retained_corrupt_db {
+                println!("  corrupt DB retained at {}", p.display());
+            }
+            Err(anyhow!(
+                "REFUSED: no VALID snapshot in {} to rebuild from — nothing was changed; \
+                 the corrupt DB and any ahead mirror are preserved for investigation",
+                store_dir.display()
+            ))
+        }
+        aberp_snapshot::RecoveryOutcome::RefusedUnsafe {
+            reason,
+            retained_corrupt_db,
+        } => {
+            if let Some(p) = &retained_corrupt_db {
+                println!("  corrupt DB retained at {}", p.display());
+            }
+            Err(anyhow!(
+                "REFUSED (unsafe): {reason} — nothing was changed; the corrupt DB and any \
+                 ahead mirror are preserved for investigation"
+            ))
+        }
+    }
+}
+
 pub fn run(args: &ServeArgs) -> Result<()> {
     // S433 — honor-once tenant switch. The Tenants admin screen writes a
     // one-shot `~/.aberp/next_tenant` hint and restarts the binary; this
@@ -1140,12 +1348,75 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 )
             })?;
         }
-        let mut billing_store = DuckDbBillingStore::open(&args.db).with_context(|| {
-            format!(
-                "open billing DuckDB at {} for boot migration",
-                args.db.display()
-            )
-        })?;
+        // ADR-0095 §2 — atomic initial creation. When the tenant DB does not
+        // yet exist, build it ASIDE at `<db>.creating-<tag>.duckdb` (run the
+        // billing schema there), then atomically swap it onto the live path
+        // and write a verified-good marker. A crash mid-creation leaves only a
+        // disposable temp (cleaned next boot), NEVER a torn file at the live
+        // path — the exact Defense first-launch failure (root cause #3). Inert
+        // on the happy path: an existing DB skips this branch entirely.
+        if !args.db.exists() {
+            tracing::info!(
+                db = %args.db.display(),
+                "boot: tenant DB absent — provisioning atomically (ADR-0095 §2)"
+            );
+            aberp_snapshot::provision_atomic(&args.db, |creating| {
+                let mut store = DuckDbBillingStore::open(creating)?;
+                store.ensure_schema()?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .with_context(|| {
+                format!(
+                    "atomically provision initial tenant DuckDB at {}",
+                    args.db.display()
+                )
+            })?;
+        }
+        // ADR-0095 §1 — boot safe-open + auto-recover. Open the live DB; if it
+        // EXISTS but will not open, that is the torn-checkpoint signature
+        // (`Failed to load metadata pointer`, root cause #1). Route it through
+        // the guarded, reversible recovery instead of a fatal boot. On a
+        // guard-rail refusal keep today's preserve-and-surface (now the last
+        // resort, not the only outcome). The happy path — a clean open — is
+        // byte-identical to before.
+        let mut billing_store = match DuckDbBillingStore::open(&args.db) {
+            Ok(store) => store,
+            Err(open_err) if args.db.exists() => {
+                tracing::error!(
+                    db = %args.db.display(),
+                    error = %open_err,
+                    "billing DB exists but failed to open at boot — attempting ADR-0095 §1 auto-recovery"
+                );
+                match attempt_db_auto_recovery(&args.db, &tenant, &binary_hash_handle, "torn_open")? {
+                    BootRecovery::Recovered => {
+                        DuckDbBillingStore::open(&args.db).with_context(|| {
+                            format!(
+                                "re-open billing DuckDB at {} after ADR-0095 auto-recovery",
+                                args.db.display()
+                            )
+                        })?
+                    }
+                    BootRecovery::Refused(reason) => {
+                        return Err(anyhow::Error::new(open_err)).with_context(|| {
+                            format!(
+                                "billing DB at {} could not be opened and auto-recovery refused \
+                                 ({reason}); the corrupt DB and any ahead mirror were preserved — \
+                                 investigate, then run `aberp recover`",
+                                args.db.display()
+                            )
+                        });
+                    }
+                }
+            }
+            Err(open_err) => {
+                return Err(anyhow::Error::new(open_err)).with_context(|| {
+                    format!(
+                        "open billing DuckDB at {} for boot migration",
+                        args.db.display()
+                    )
+                });
+            }
+        };
         billing_store
             .ensure_schema()
             .context("ensure billing schema at serve boot")?;
@@ -1391,16 +1662,43 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         match aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path) {
             Ok(action) => tracing::info!(?action, "audit-ledger mirror reconciled at boot"),
             Err(e @ aberp_audit_ledger::AppendError::MirrorAheadOfDb { .. }) => {
-                // Refuse-and-surface: the ahead mirror has already been
-                // preserved inside `ensure_consistent_with_db`; we stop boot
-                // loudly rather than overwrite the evidence of a lost commit.
+                // ADR-0095 §1 — an ahead mirror is the fingerprint of a
+                // torn-write / lost DB commit (root cause #4). Instead of a
+                // fatal stop, attempt the guarded, reversible auto-recovery:
+                // rebuild from the latest VALID snapshot and REPLAY the
+                // preserved ahead mirror (the chunk-3 P1 guard already copied
+                // it to `<mirror>.ahead-*.bak`; recover_or_refuse READS it,
+                // never truncates it). On a guard-rail refusal keep today's
+                // preserve-and-surface (demoted from the ONLY outcome to the
+                // last resort). Drop the open handle first so the atomic swap
+                // can rename over the live path cleanly.
                 tracing::error!(
                     error = %e,
-                    "REFUSING to boot — audit-ledger mirror is AHEAD of the DB"
+                    "audit-ledger mirror is AHEAD of the DB — attempting ADR-0095 §1 auto-recovery"
                 );
-                return Err(anyhow::Error::new(e)).context(
-                    "audit-ledger mirror is AHEAD of the DB at boot (possible lost DB commit                      after a torn write). The ahead mirror was preserved to a side file;                      investigate before re-running. For an intentional dev DB-nuke, move the                      stale <db>.audit.log aside and re-run.",
-                );
+                drop(conn);
+                match attempt_db_auto_recovery(&args.db, &tenant, &binary_hash_handle, "mirror_ahead")
+                {
+                    Ok(BootRecovery::Recovered) => {
+                        tracing::warn!(
+                            "ADR-0095 §1 — auto-recovery reconciled the ahead mirror with the DB at boot"
+                        );
+                    }
+                    Ok(BootRecovery::Refused(reason)) => {
+                        tracing::error!(
+                            reason = %reason,
+                            "REFUSING to boot — ahead mirror could not be safely auto-recovered"
+                        );
+                        return Err(anyhow::Error::new(e)).context(
+                            "audit-ledger mirror is AHEAD of the DB at boot (possible lost DB commit                      after a torn write). The ahead mirror was preserved to a side file;                      investigate before re-running. For an intentional dev DB-nuke, move the                      stale <db>.audit.log aside and re-run.",
+                        );
+                    }
+                    Err(rec_err) => {
+                        return Err(rec_err).context(
+                            "ADR-0095 auto-recovery of an ahead mirror failed mechanically at boot",
+                        );
+                    }
+                }
             }
             Err(e) => {
                 return Err(anyhow::Error::new(e))
@@ -2842,6 +3140,31 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     "binary hash unavailable; snapshot daemon NOT spawned (boot continues)"
                 ),
             }
+        }
+
+        // ADR-0095 §3 — post-meaningful-write durable checkpoint (debounced).
+        // Install the process-global coordinator for THIS tenant DB and spawn
+        // its debounce loop on the graceful-shutdown token, so a durable
+        // checkpoint follows a burst of regulated writes (invoice issue /
+        // storno / modification) within ~1 min — bounding the exposure window
+        // after an important commit without ever stalling the request path.
+        // No-op when disabled by env; the periodic daemon checkpoint (§3) and
+        // the clean-shutdown checkpoint remain regardless.
+        match crate::live_checkpoint::install(
+            (*recovery_state.db_path).clone(),
+            recovery_state.tenant.as_str().to_string(),
+        ) {
+            Some(pw) => {
+                let pw_token = coordinator.token.clone();
+                let pw_handle = tokio::spawn(async move {
+                    pw.run(pw_token).await;
+                });
+                coordinator.register("post_write_checkpoint", pw_handle);
+                tracing::info!("spawned post-write durable-checkpoint debouncer (ADR-0095 §3)");
+            }
+            None => tracing::info!(
+                "post-write durable-checkpoint debouncer NOT spawned (disabled by env)"
+            ),
         }
 
         // S441 / ADR-0087 + ADR-0088 — DÁP/QES timestamp-anchored audit
@@ -7471,6 +7794,9 @@ async fn handle_issue_invoice(
     .await
     {
         Ok(summary) => {
+            // ADR-0095 §3 — a regulated write just committed durably; nudge the
+            // debounced post-write durable checkpoint (off the request path).
+            crate::live_checkpoint::trigger();
             // [[post-issue-async]] (session 158) — the post-issue tail
             // (default-on auto-send-to-buyer email + default-on
             // auto-submit-to-NAV + bounded poll) used to run HERE,
@@ -8849,6 +9175,8 @@ async fn handle_storno_invoice(
     let base_invoice_id_for_tail = invoice_id.clone();
     match storno_invoice_request(&state, &invoice_id, request) {
         Ok(summary) => {
+            // ADR-0095 §3 — debounced post-write durable checkpoint nudge.
+            crate::live_checkpoint::trigger();
             // S184 — post-issue tail mirrors `handle_issue_invoice`'s
             // [[post-issue-async]] pattern: a detached `tokio::spawn`
             // runs the default-on auto-email + auto-submit-to-NAV +
@@ -9240,6 +9568,8 @@ async fn handle_modification_invoice(
     let base_invoice_id_for_tail = invoice_id.clone();
     match modification_invoice_request(&state, &invoice_id, request) {
         Ok(summary) => {
+            // ADR-0095 §3 — debounced post-write durable checkpoint nudge.
+            crate::live_checkpoint::trigger();
             // S184 — post-issue tail. See `handle_storno_invoice` +
             // `run_chain_post_issue_tail` doc-comments for the
             // [[post-issue-async]] parallel.

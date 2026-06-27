@@ -629,6 +629,15 @@ pub enum Command {
     /// corruption. `aberp serve` also takes these automatically every 4h.
     #[command(subcommand)]
     Snapshot(SnapshotCommand),
+
+    /// ADR-0095 §1 — the single supported MANUAL crash-recovery path
+    /// (replaces the old hand-clear-the-sidecar surgery). Runs the same
+    /// guarded, reversible recovery `aberp serve` runs on boot: preserve the
+    /// corrupt DB → rebuild from the latest VALID snapshot → REPLAY the
+    /// append-only audit-ledger mirror delta (never truncated) → validate →
+    /// atomically install + write the verified-good marker. Refuses (changing
+    /// nothing) unless snapshot + mirror prove consistent.
+    Recover(RecoverArgs),
 }
 
 /// `aberp snapshot <now|list|restore>` (S426 / ADR-0082).
@@ -650,6 +659,26 @@ pub enum SnapshotCommand {
     /// clobber the live prod DB. Recover prod by restoring to a side path,
     /// stopping serve, then swapping the file in.
     Restore(SnapshotRestoreArgs),
+}
+
+/// `aberp recover` (ADR-0095 §1) — guarded, reversible crash recovery; the
+/// single supported manual entrypoint.
+#[derive(Debug, Parser)]
+pub struct RecoverArgs {
+    /// Path to the tenant DuckDB to recover (default `./aberp.duckdb`; the
+    /// live tenant DB is `~/.aberp-<edition>/<tenant>/aberp.duckdb`).
+    #[arg(long, default_value = "./aberp.duckdb")]
+    pub db: PathBuf,
+
+    /// Tenant identifier — selects the per-tenant snapshot store and is
+    /// recorded on the `db.auto_recovered` audit event.
+    #[arg(long, default_value = "default")]
+    pub tenant: String,
+
+    /// Override the snapshot store directory (default: the edition-scoped
+    /// per-tenant store). Refused if it points at the frozen prod line.
+    #[arg(long)]
+    pub store: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]

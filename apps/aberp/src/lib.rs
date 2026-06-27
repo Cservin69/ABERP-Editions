@@ -62,6 +62,7 @@ pub mod issue_invoice;
 pub mod issue_modification;
 pub mod issue_preflight;
 pub mod issue_storno;
+pub mod live_checkpoint;
 pub mod mark_abandoned;
 pub mod mark_invoice_paid;
 // S273 / PR-262 / ADR-0069 — material-side inventory balances +

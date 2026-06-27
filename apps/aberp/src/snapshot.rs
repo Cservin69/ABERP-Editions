@@ -117,6 +117,40 @@ pub fn checkpoint_on_clean_shutdown(db_path: &Path, tenant: &str) {
     }
 }
 
+/// ADR-0095 §3 — take ONE durable checkpoint of the LIVE file off the request
+/// path. Both the periodic daemon cadence ([`run_supervised`]) and the
+/// post-write debouncer ([`crate::live_checkpoint`]) call this, so a recent
+/// verified-good live file exists even with no clean shutdown — closing the
+/// "nothing checkpoints the live file on a path a crash traverses" gap
+/// (ADR-0095 root cause #2).
+///
+/// Best-effort by contract (mirrors [`checkpoint_on_clean_shutdown`]): a no-op
+/// when a verified-good checkpoint already covers the file (cheap, via
+/// [`aberp_snapshot::live_durable_checkpoint`] → `checkpoint_is_current`);
+/// every failure is logged LOUD (CLAUDE.md #12) and swallowed so a checkpoint
+/// hiccup never takes down `aberp serve`. Editions-tree ONLY — the wrapped
+/// primitive refuses a prod path as defense in depth.
+pub fn live_checkpoint_logged(db_path: &Path, tenant: &str) {
+    match aberp_snapshot::live_durable_checkpoint(db_path, tenant) {
+        Ok(Some(rep)) => tracing::info!(
+            db = %db_path.display(),
+            sha = %rep.sha256,
+            bytes = rep.byte_size,
+            "live-path crash-safe durable checkpoint installed (ADR-0095 §3)"
+        ),
+        Ok(None) => tracing::debug!(
+            db = %db_path.display(),
+            "live-path checkpoint skipped — a verified-good checkpoint already covers the DB"
+        ),
+        Err(e) => tracing::error!(
+            db = %db_path.display(),
+            error = %e,
+            "live-path durable checkpoint FAILED; live DB left untouched, periodic \
+             snapshots remain the recovery path (serve continues)"
+        ),
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Configuration resolution
 // ──────────────────────────────────────────────────────────────────────
@@ -493,7 +527,14 @@ pub async fn run_supervised(deps: SnapshotDaemonDeps, cancel: CancellationToken)
         let policy = deps.policy;
         let actor = cli_actor("system:snapshot-daemon");
         let outcome = tokio::task::spawn_blocking(move || {
-            run_cycle(&db, &store, &tenant, bh, actor, &policy)
+            let rec = run_cycle(&db, &store, &tenant, bh, actor, &policy);
+            // ADR-0095 §3 — also keep the LIVE file crash-safe between clean
+            // shutdowns: fold a debounced durable checkpoint into the daemon
+            // cadence so a recent verified-good live file always exists, even
+            // if the process never reaches a clean shutdown. No-op when
+            // `checkpoint_is_current`; logged-but-survives like the cycle.
+            live_checkpoint_logged(&db, tenant.as_str());
+            rec
         })
         .await;
         match outcome {
