@@ -5521,8 +5521,7 @@ mod tests {
             recovered_max_seq: 0,
             retained_corrupt_db: None,
         };
-        let back_none: DbAutoRecoveredPayload =
-            serde_json::from_slice(&p_none.to_bytes()).unwrap();
+        let back_none: DbAutoRecoveredPayload = serde_json::from_slice(&p_none.to_bytes()).unwrap();
         assert_eq!(back_none, p_none);
     }
 }

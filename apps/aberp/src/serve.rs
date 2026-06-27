@@ -870,7 +870,9 @@ fn attempt_db_auto_recovery(
             recovered_max_seq,
             retained_corrupt_db,
         } => {
-            let retained = retained_corrupt_db.as_ref().map(|p| p.display().to_string());
+            let retained = retained_corrupt_db
+                .as_ref()
+                .map(|p| p.display().to_string());
             tracing::warn!(
                 source_snapshot_seq,
                 snapshot_audit_count,
@@ -894,13 +896,13 @@ fn attempt_db_auto_recovery(
             );
             Ok(BootRecovery::Recovered)
         }
-        aberp_snapshot::RecoveryOutcome::RefusedNoSnapshot { retained_corrupt_db } => {
-            Ok(BootRecovery::Refused(format!(
-                "no VALID snapshot in {} to rebuild from{}",
-                store_dir.display(),
-                retained_suffix(&retained_corrupt_db)
-            )))
-        }
+        aberp_snapshot::RecoveryOutcome::RefusedNoSnapshot {
+            retained_corrupt_db,
+        } => Ok(BootRecovery::Refused(format!(
+            "no VALID snapshot in {} to rebuild from{}",
+            store_dir.display(),
+            retained_suffix(&retained_corrupt_db)
+        ))),
         aberp_snapshot::RecoveryOutcome::RefusedUnsafe {
             reason,
             retained_corrupt_db,
@@ -940,7 +942,9 @@ pub fn run_recover(args: &crate::cli::RecoverArgs) -> Result<()> {
             recovered_max_seq,
             retained_corrupt_db,
         } => {
-            let retained = retained_corrupt_db.as_ref().map(|p| p.display().to_string());
+            let retained = retained_corrupt_db
+                .as_ref()
+                .map(|p| p.display().to_string());
             emit_db_auto_recovered(
                 &args.db,
                 &tenant,
@@ -966,7 +970,9 @@ pub fn run_recover(args: &crate::cli::RecoverArgs) -> Result<()> {
             }
             Ok(())
         }
-        aberp_snapshot::RecoveryOutcome::RefusedNoSnapshot { retained_corrupt_db } => {
+        aberp_snapshot::RecoveryOutcome::RefusedNoSnapshot {
+            retained_corrupt_db,
+        } => {
             if let Some(p) = &retained_corrupt_db {
                 println!("  corrupt DB retained at {}", p.display());
             }
@@ -1390,12 +1396,8 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     error = %open_err,
                     "billing DB exists but failed to open at boot — attempting ADR-0095 §1 auto-recovery"
                 );
-                let recovery = attempt_db_auto_recovery(
-                    &args.db,
-                    &tenant,
-                    &binary_hash_handle,
-                    "torn_open",
-                )?;
+                let recovery =
+                    attempt_db_auto_recovery(&args.db, &tenant, &binary_hash_handle, "torn_open")?;
                 match recovery {
                     BootRecovery::Recovered => {
                         DuckDbBillingStore::open(&args.db).with_context(|| {
@@ -28850,10 +28852,7 @@ mod tests {
             "a malformed/absent SMTP section must never make boot fatal (ADR-0095 §4)"
         );
         assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.contains("seller.smtp")),
+            report.warnings.iter().any(|w| w.contains("seller.smtp")),
             "the degrade should surface as the SMTP warning"
         );
 

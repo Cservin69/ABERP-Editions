@@ -225,9 +225,16 @@ fn recover_cli_auto_recovers_torn_db_with_no_lost_committed_entry() {
     // Openable again, every committed audit entry intact, invoices restored.
     let after = entry_hashes(&db);
     for h in &committed {
-        assert!(after.contains(h), "a committed audit entry was lost in recovery");
+        assert!(
+            after.contains(h),
+            "a committed audit entry was lost in recovery"
+        );
     }
-    assert_eq!(invoice_ids(&db), vec![0, 1, 2], "invoices restored from the snapshot");
+    assert_eq!(
+        invoice_ids(&db),
+        vec![0, 1, 2],
+        "invoices restored from the snapshot"
+    );
     assert!(
         checkpoint_is_current(&db),
         "a verified-good marker covers the rebuilt DB"
@@ -237,7 +244,10 @@ fn recover_cli_auto_recovers_torn_db_with_no_lost_committed_entry() {
         1,
         "the recovery is audited as db.auto_recovered"
     );
-    assert!(corrupt_copies(t.dir()) >= 1, "the torn DB was retained as evidence");
+    assert!(
+        corrupt_copies(t.dir()) >= 1,
+        "the torn DB was retained as evidence"
+    );
     assert!(
         read_mirror_entries(&mirror).unwrap().len() as u64 >= head_before,
         "the audit-ledger mirror was read for replay, never truncated"
@@ -278,10 +288,21 @@ fn recover_cli_replays_ahead_mirror_with_no_fork_or_loss() {
     // Replayed, not truncated: every committed entry survives + invoices back.
     let after = entry_hashes(&db);
     for h in &committed {
-        assert!(after.contains(h), "an ahead-mirror committed entry was lost");
+        assert!(
+            after.contains(h),
+            "an ahead-mirror committed entry was lost"
+        );
     }
-    assert_eq!(invoice_ids(&db), vec![0, 1, 2], "invoices restored from the snapshot");
-    assert_eq!(count_kind(&db, EventKind::DbAutoRecovered), 1, "recovery audited");
+    assert_eq!(
+        invoice_ids(&db),
+        vec![0, 1, 2],
+        "invoices restored from the snapshot"
+    );
+    assert_eq!(
+        count_kind(&db, EventKind::DbAutoRecovered),
+        1,
+        "recovery audited"
+    );
     assert!(
         read_mirror_entries(&mirror).unwrap().len() as u64 >= head_before,
         "the ahead mirror was REPLAYED, never truncated"
