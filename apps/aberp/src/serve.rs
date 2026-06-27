@@ -28779,6 +28779,73 @@ mod tests {
         assert!(report.warnings[0].contains("seller.smtp"));
     }
 
+    /// ADR-0095 §4 — optional-config degrade pin. The genuine residual the ADR
+    /// flagged: an UNKNOWN `[seller.smtp] security` token must NOT hard-abort
+    /// boot. `SmtpSecurity::from_token` loud-fails (correct for the send path),
+    /// so the standing invariant is that every BOOT reader degrades via the
+    /// `matches!` pattern — turning a malformed SMTP section into "not
+    /// configured" → a warning, never a fatal `?`/exit. This pins both halves:
+    /// the boot reader degrades, and the resulting `smtp_configured = false`
+    /// is warning-only.
+    #[test]
+    fn sanity_malformed_smtp_security_degrades_boot_to_warning_not_fatal() {
+        let scratch = std::env::temp_dir().join(format!(
+            "aberp-adr0095-smtp-degrade-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let seller = scratch.join("seller.toml");
+        // Well-formed [seller.smtp] EXCEPT for an unknown transport-security
+        // token — the exact SmtpSecurity::from_token residual.
+        std::fs::write(
+            &seller,
+            "[seller.smtp]\n\
+             host = \"smtp.example.com\"\n\
+             port = 587\n\
+             from_address = \"a@b.c\"\n\
+             username = \"a@b.c\"\n\
+             security = \"plaintext\"\n\
+             attach_xml = false\n",
+        )
+        .expect("write seller.toml");
+
+        // 1. The exact boot-reader composition degrades a malformed SMTP
+        //    section to "not configured" — never panics, never `?` at boot.
+        let smtp_configured = matches!(smtp_config_mod::read_smtp_config(&seller), Ok(Some(_)));
+        assert!(
+            !smtp_configured,
+            "a malformed [seller.smtp] security token must degrade to not-configured"
+        );
+
+        // 2. sanity_check_environment treats not-configured SMTP as a WARNING,
+        //    never fatal — so no optional-config read can hard-abort boot.
+        let report = sanity_check_environment(
+            true,
+            PROD_IDENTITY,
+            Some("24904362-2-41"),
+            true,
+            true,
+            smtp_configured,
+        );
+        assert!(
+            report.fatal.is_none(),
+            "a malformed/absent SMTP section must never make boot fatal (ADR-0095 §4)"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("seller.smtp")),
+            "the degrade should surface as the SMTP warning"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// The acknowledge route's audit half: `record_first_prod_launch_audit`
     /// MUST append exactly one `FirstProdLaunchAcknowledged` entry whose
     /// payload round-trips the timestamp + tenant. Scratch on-disk DuckDB,

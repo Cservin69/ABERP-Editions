@@ -5491,6 +5491,40 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&pruned.to_bytes()).unwrap();
         assert_eq!(v["retained_count"], 24);
     }
+
+    /// ADR-0095 §1 — `db.auto_recovered` payload round-trips (serde) and keeps
+    /// every recovery field, including the retained-corrupt-DB evidence path.
+    #[test]
+    fn db_auto_recovered_payload_round_trips() {
+        let p = DbAutoRecoveredPayload {
+            trigger: "mirror_ahead".into(),
+            source_snapshot_seq: 12,
+            snapshot_audit_count: 40,
+            replayed_entries: 24,
+            recovered_max_seq: 64,
+            retained_corrupt_db: Some("/tmp/t/aberp.duckdb.CORRUPT-99-1".into()),
+        };
+        let blob = p.to_bytes();
+        let back: DbAutoRecoveredPayload = serde_json::from_slice(&blob).unwrap();
+        assert_eq!(back, p);
+        let v: serde_json::Value = serde_json::from_slice(&blob).unwrap();
+        assert_eq!(v["trigger"], "mirror_ahead");
+        assert_eq!(v["recovered_max_seq"], 64);
+        assert_eq!(v["snapshot_audit_count"], 40);
+
+        // The None case (no live file existed before recovery) round-trips too.
+        let p_none = DbAutoRecoveredPayload {
+            trigger: "manual_cli".into(),
+            source_snapshot_seq: 1,
+            snapshot_audit_count: 0,
+            replayed_entries: 0,
+            recovered_max_seq: 0,
+            retained_corrupt_db: None,
+        };
+        let back_none: DbAutoRecoveredPayload =
+            serde_json::from_slice(&p_none.to_bytes()).unwrap();
+        assert_eq!(back_none, p_none);
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
