@@ -5565,6 +5565,47 @@ impl SnapshotPrunedPayload {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// ADR-0095 §1 — boot/CLI auto-recovery of a torn DB or ahead mirror.
+// `db.*` family payload. App-layer JSON only, never NAV XML bytes.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::DbAutoRecovered`].
+///
+/// Written by ADR-0095 §1 boot/CLI auto-recovery (`serve` boot safe-open and
+/// the `aberp recover` command) when a torn/unopenable live DB or an
+/// ahead-of-DB mirror was repaired: rebuilt from the latest VALID snapshot
+/// (`source_snapshot_seq`) plus a verbatim REPLAY of the preserved mirror
+/// delta (`replayed_entries`), validated, and atomically installed. The
+/// corrupt DB is retained (`retained_corrupt_db`) and the mirror is never
+/// truncated, so every recovery is reversible. `db.*` prefix — a
+/// system/durability event, app-layer JSON only (no NAV XML), never swept
+/// into a per-invoice export bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbAutoRecoveredPayload {
+    /// What triggered the recovery: `"torn_open"` (the live DB would not
+    /// open), `"mirror_ahead"` (the mirror was ahead of the DB), or
+    /// `"manual_cli"` (the operator ran `aberp recover`).
+    pub trigger: String,
+    /// Seq of the snapshot the rebuild started from.
+    pub source_snapshot_seq: u64,
+    /// Audit-ledger head the snapshot carried (the replay floor).
+    pub snapshot_audit_count: u64,
+    /// Number of mirror entries replayed on top of the snapshot.
+    pub replayed_entries: u64,
+    /// Audit-ledger head of the rebuilt, installed DB (== mirror head).
+    pub recovered_max_seq: u64,
+    /// The retained `<db>.CORRUPT-<tag>` evidence copy, if the live file
+    /// existed before recovery. Never deleted.
+    pub retained_corrupt_db: Option<String>,
+}
+
+impl DbAutoRecoveredPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // S427 — quoting_machines master data + capacity-aware lead-time.
 // `mes.*` (machine CRUD) + `quote.*` (lead-time) family payloads. App-
 // layer JSON only, never NAV XML bytes.
