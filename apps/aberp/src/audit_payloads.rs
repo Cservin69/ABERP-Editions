@@ -5491,6 +5491,40 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&pruned.to_bytes()).unwrap();
         assert_eq!(v["retained_count"], 24);
     }
+
+    /// ADR-0095 §1 — `db.auto_recovered` payload round-trips (serde) and keeps
+    /// every recovery field, including the retained-corrupt-DB evidence path.
+    #[test]
+    fn db_auto_recovered_payload_round_trips() {
+        let p = DbAutoRecoveredPayload {
+            trigger: "mirror_ahead".into(),
+            source_snapshot_seq: 12,
+            snapshot_audit_count: 40,
+            replayed_entries: 24,
+            recovered_max_seq: 64,
+            retained_corrupt_db: Some("/tmp/t/aberp.duckdb.CORRUPT-99-1".into()),
+        };
+        let blob = p.to_bytes();
+        let back: DbAutoRecoveredPayload = serde_json::from_slice(&blob).unwrap();
+        assert_eq!(back, p);
+        let v: serde_json::Value = serde_json::from_slice(&blob).unwrap();
+        assert_eq!(v["trigger"], "mirror_ahead");
+        assert_eq!(v["recovered_max_seq"], 64);
+        assert_eq!(v["snapshot_audit_count"], 40);
+
+        // The None case (no live file existed before recovery) round-trips too.
+        let p_none = DbAutoRecoveredPayload {
+            trigger: "manual_cli".into(),
+            source_snapshot_seq: 1,
+            snapshot_audit_count: 0,
+            replayed_entries: 0,
+            recovered_max_seq: 0,
+            retained_corrupt_db: None,
+        };
+        let back_none: DbAutoRecoveredPayload =
+            serde_json::from_slice(&p_none.to_bytes()).unwrap();
+        assert_eq!(back_none, p_none);
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -5559,6 +5593,47 @@ pub struct SnapshotPrunedPayload {
 }
 
 impl SnapshotPrunedPayload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ADR-0095 §1 — boot/CLI auto-recovery of a torn DB or ahead mirror.
+// `db.*` family payload. App-layer JSON only, never NAV XML bytes.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Payload for [`aberp_audit_ledger::EventKind::DbAutoRecovered`].
+///
+/// Written by ADR-0095 §1 boot/CLI auto-recovery (`serve` boot safe-open and
+/// the `aberp recover` command) when a torn/unopenable live DB or an
+/// ahead-of-DB mirror was repaired: rebuilt from the latest VALID snapshot
+/// (`source_snapshot_seq`) plus a verbatim REPLAY of the preserved mirror
+/// delta (`replayed_entries`), validated, and atomically installed. The
+/// corrupt DB is retained (`retained_corrupt_db`) and the mirror is never
+/// truncated, so every recovery is reversible. `db.*` prefix — a
+/// system/durability event, app-layer JSON only (no NAV XML), never swept
+/// into a per-invoice export bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DbAutoRecoveredPayload {
+    /// What triggered the recovery: `"torn_open"` (the live DB would not
+    /// open), `"mirror_ahead"` (the mirror was ahead of the DB), or
+    /// `"manual_cli"` (the operator ran `aberp recover`).
+    pub trigger: String,
+    /// Seq of the snapshot the rebuild started from.
+    pub source_snapshot_seq: u64,
+    /// Audit-ledger head the snapshot carried (the replay floor).
+    pub snapshot_audit_count: u64,
+    /// Number of mirror entries replayed on top of the snapshot.
+    pub replayed_entries: u64,
+    /// Audit-ledger head of the rebuilt, installed DB (== mirror head).
+    pub recovered_max_seq: u64,
+    /// The retained `<db>.CORRUPT-<tag>` evidence copy, if the live file
+    /// existed before recovery. Never deleted.
+    pub retained_corrupt_db: Option<String>,
+}
+
+impl DbAutoRecoveredPayload {
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("JSON serialization of audit payload cannot fail")
     }

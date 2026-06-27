@@ -49,6 +49,7 @@ fn main() -> Result<()> {
             cli::SnapshotCommand::List(a) => snapshot::run_list(&a),
             cli::SnapshotCommand::Restore(a) => snapshot::run_restore(&a),
         },
+        cli::Command::Recover(a) => serve::run_recover(&a),
     }
 }
 
