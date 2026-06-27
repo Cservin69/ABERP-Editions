@@ -257,6 +257,66 @@ or `exit` at boot. Fatal is reserved for true safety stops (prod-identity
 mismatch, NAV creds vanished after a completed first launch); those keep
 `exit(1)`.
 
+## Implementation (as shipped — Sessions A & B)
+
+> Additive note (2026-06-27, Session C). The design above was authored as a
+> *Proposed* design pass; **Sessions A and B implemented it** on the editions
+> tree. The header Status line is left as-authored; this section records the
+> real call sites so the ADR matches what shipped. Nothing in the design above
+> is changed.
+
+**Session A — `crates/aberp-snapshot` (local, plain-file crash-injection
+verifiable).** The recovery engine landed in `src/recover.rs` as three additive
+entrypoints that *wire* the chunk-3 primitives (no new primitive invented):
+
+- `recover_or_refuse(db_path, store_dir, mirror_path, tenant) -> RecoveryOutcome`
+  — §1 boot safe-open + auto-recover (covers both torn-open and ahead-mirror).
+  Returns `RecoveryOutcome::{Recovered{source_snapshot_seq, snapshot_audit_count,
+  replayed_entries, recovered_max_seq, retained_corrupt_db}, RefusedNoSnapshot,
+  RefusedUnsafe{reason}}`. Preserves the torn DB to `<db>.CORRUPT-<tag>` (a copy,
+  never a move), builds/validates in a private `<db>.recover-<tag>.duckdb`, then
+  `atomic_install` + `write_marker`.
+- `provision_atomic(db_path, init)` — §2 atomic creation via
+  `<db>.creating-<tag>.duckdb` → checkpoint → `atomic_install` → `write_marker`;
+  `cleanup_siblings_with_infix` clears orphan temps on entry.
+- `live_durable_checkpoint(db_path, tenant) -> Option<CheckpointReport>` — §3
+  thin, debounced wrapper (`Ok(None)` no-op when `checkpoint_is_current`).
+- Reused replay helpers from `crates/audit-ledger`: `read_mirror_entries`,
+  `replay_mirror_delta` (verbatim, `seq > snapshot.audit_count`).
+- Tests: a real-subprocess plain-file crash-injection unit
+  (`provision_atomic_crash_before_rename_never_leaves_torn_live_file`) that runs
+  anywhere, plus the Mac-gated DuckDB suite `tests/recover_engine_tests.rs`.
+
+**Session B — `apps/aberp` (serve/boot wiring; e2e Mac-gated).**
+
+- Boot atomic creation: an absent tenant DB is provisioned through
+  `aberp_snapshot::provision_atomic(&args.db, |creating| …ensure_schema…)`
+  (~`serve.rs:1366`) before the schema chain.
+- Boot safe-open + auto-recover: a failed open of an existing DB routes through
+  `attempt_db_auto_recovery(.., "torn_open")` (~`serve.rs:1385`); a
+  `MirrorAheadOfDb` from the mirror reconcile routes through the same engine with
+  `"mirror_ahead"` (~`serve.rs:1683`). On `Refused*`, boot keeps the demoted
+  preserve-and-surface fallback (the chunk-3 P1 guard, no longer the only outcome).
+- `attempt_db_auto_recovery` / `run_recover` (`serve.rs:847` / `:919`) drive the
+  engine; `run_recover` backs the **`aberp recover`** CLI
+  (`cli.rs` `Command::Recover(RecoverArgs{db,tenant,store})` → `main.rs:52`) — the
+  single supported manual entrypoint, replacing sidecar surgery.
+- Audit: a `db.auto_recovered` entry (`EventKind::DbAutoRecovered`, login
+  `system:auto-recover`) carrying `DbAutoRecoveredPayload{trigger,
+  source_snapshot_seq, snapshot_audit_count, replayed_entries, recovered_max_seq,
+  retained_corrupt_db}` (`audit_payloads.rs`); `trigger ∈ {torn_open,
+  mirror_ahead, manual_cli}`.
+- §3 live checkpoints: `snapshot.rs::live_checkpoint_logged` wraps
+  `live_durable_checkpoint` for the periodic daemon cadence and the post-write
+  debouncer.
+- E2e: `apps/aberp/tests/boot_crash_recovery_e2e.rs`
+  (`recover_cli_auto_recovers_torn_db_with_no_lost_committed_entry`,
+  `recover_cli_replays_ahead_mirror_with_no_fork_or_loss`).
+
+**Session C — docs (this commit).** Operator runbook
+`docs/runbooks/db-corruption-recovery-operator-runbook.md`; the prod-backport
+decision **ADR-0096** (deferred, with explicit trigger criteria).
+
 ## Consequences
 
 **Easier:** first launch and crash recovery become automatic and reversible;
