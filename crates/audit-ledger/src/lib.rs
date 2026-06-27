@@ -49,8 +49,8 @@ mod storage;
 pub use entry::{Actor, BinaryHash, Entry, EntryHash, EntryId, EventKind, Sequence, TenantId};
 pub use error::{AppendError, VerifyError};
 pub use mirror::{
-    ensure_consistent_with_db, mirror_path_for, read_mirror_entries, sync_mirror, MirrorEntry,
-    RecoveryAction,
+    ensure_consistent_with_db, mirror_path_for, read_mirror_entries, replay_mirror_delta,
+    sync_mirror, MirrorEntry, RecoveryAction,
 };
 // S344 / PR-38 — OPTIONAL digital-identity attestation for future audit
 // payloads (foundation only; no event populates it yet). See [`signer`].

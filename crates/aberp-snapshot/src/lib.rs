@@ -46,6 +46,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 mod crash_safe;
+mod recover;
 mod retention;
 mod store;
 mod take;
@@ -54,6 +55,7 @@ pub use crash_safe::{
     atomic_install, checkpoint_is_current, durable_checkpoint, marker_path, read_marker,
     write_marker, CheckpointMarker, CheckpointReport,
 };
+pub use recover::{live_durable_checkpoint, provision_atomic, recover_or_refuse, RecoveryOutcome};
 pub use retention::{plan_retention, prune, RetentionPlan, RetentionPolicy};
 pub use store::{
     default_store_dir, edition_store_dir, find_snapshot, list_snapshots, SnapshotRecord,
@@ -93,6 +95,9 @@ pub enum SnapshotError {
 
     #[error("snapshot metadata at {path} is unreadable: {detail}")]
     BadMeta { path: PathBuf, detail: String },
+
+    #[error("atomic provisioning of {path} failed: {detail}")]
+    Provision { path: PathBuf, detail: String },
 }
 
 impl SnapshotError {

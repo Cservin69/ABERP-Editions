@@ -71,7 +71,7 @@ use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use duckdb::Connection;
+use duckdb::{params, Connection};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -246,6 +246,105 @@ pub fn read_mirror_entries(mirror_path: &Path) -> Result<Vec<MirrorEntry>, Appen
         out.push(record);
     }
     Ok(out)
+}
+
+/// Replay the mirror's append-only JSONL delta — every record with
+/// `seq > after_seq` — back into the `audit_ledger` table of `conn`,
+/// **byte-faithfully** and in seq order, inside one transaction. Returns
+/// the number of entries replayed.
+///
+/// ADR-0095 §1 step 4 — the boot recovery engine
+/// (`aberp_snapshot::recover_or_refuse`) restores the latest VALID logical
+/// snapshot (whose audit head is `after_seq`) into a private staging DB,
+/// then calls this to re-apply the committed entries the snapshot predates,
+/// reconstructing the live DB up to the mirror head. The mirror is **read
+/// only** here — never truncated (the ADR-0095 §1 guard-rail; truncating it
+/// would destroy the only record of the lost commits).
+///
+/// Each record is re-inserted through the same 12-canonical-column mapping
+/// the append path uses (`schema::INSERT`): the hex hashes and base64
+/// payload are decoded back to their stored blob form and the
+/// `seq`/`prev_hash`/`entry_hash` bytes are preserved exactly, so the
+/// rebuilt rows reproduce the originals and the tamper-evident hash chain
+/// verifies end-to-end (the caller re-runs [`crate::Ledger::verify_chain`]
+/// as the gate). The S441 session columns are written NULL — they are
+/// excluded from the `entry_hash` preimage, so a verbatim replay never
+/// carried them and the chain is unaffected.
+///
+/// # Errors
+///
+/// - [`AppendError::MirrorCorrupt`] if the mirror is unreadable/malformed
+///   (per [`read_mirror_entries`]) or a hash/payload field will not decode.
+/// - [`AppendError::Storage`] for any DuckDB write failure.
+/// - [`AppendError::SequenceConflict`] if a row with that `seq` already
+///   exists in `conn` (the staging DB must hold only `[1..=after_seq]`).
+pub fn replay_mirror_delta(
+    conn: &mut Connection,
+    mirror_path: &Path,
+    after_seq: u64,
+) -> Result<u64, AppendError> {
+    let entries = read_mirror_entries(mirror_path)?;
+    let tx = conn.transaction()?;
+    let mut replayed = 0u64;
+    for record in entries.iter().filter(|e| e.seq > after_seq) {
+        insert_mirror_entry_verbatim(&tx, record)?;
+        replayed += 1;
+    }
+    tx.commit()?;
+    Ok(replayed)
+}
+
+/// Insert one [`MirrorEntry`] into `audit_ledger` exactly as the mirror
+/// recorded it. The hex hashes and base64 payload are decoded to their
+/// stored blob form and every other column is written from the record's own
+/// value, so the row reproduces the original byte-for-byte. The S441 session
+/// columns (`session_id`/`session_pubkey`/`event_sig`) are written NULL: the
+/// mirror line shape (ADR-0030 §1) never carried them and they are excluded
+/// from the `entry_hash` preimage, so the chain is preserved.
+///
+/// Mirrors `crate::storage::insert_entry_verbatim` but binds from the JSONL
+/// record rather than an in-memory [`Entry`](crate::Entry), so the recovery
+/// engine can replay the mirror without reconstructing typed entries first.
+fn insert_mirror_entry_verbatim(conn: &Connection, m: &MirrorEntry) -> Result<(), AppendError> {
+    let decode_hex = |hex_str: &str, field: &str| -> Result<Vec<u8>, AppendError> {
+        hex::decode(hex_str).map_err(|e| AppendError::MirrorCorrupt {
+            reason: format!("{field} at seq {} is not valid hex: {e}", m.seq),
+        })
+    };
+    let prev_hash = decode_hex(&m.prev_hash, "prev_hash")?;
+    let binary_hash = decode_hex(&m.binary_hash, "binary_hash")?;
+    let entry_hash = decode_hex(&m.entry_hash, "entry_hash")?;
+    let payload =
+        BASE64_STANDARD
+            .decode(m.payload.as_bytes())
+            .map_err(|e| AppendError::MirrorCorrupt {
+                reason: format!("payload at seq {} is not valid base64: {e}", m.seq),
+            })?;
+
+    let inserted = conn.execute(
+        crate::storage::schema::INSERT,
+        params![
+            m.id,
+            m.seq as i64,
+            prev_hash.as_slice(),
+            m.time_wall,
+            m.time_mono as i64,
+            m.actor.to_storage_json(),
+            binary_hash.as_slice(),
+            m.tenant_id,
+            m.kind,
+            payload.as_slice(),
+            m.idempotency_key.as_deref(),
+            entry_hash.as_slice(),
+            None::<&str>,
+            None::<&str>,
+            None::<&str>,
+        ],
+    )?;
+    if inserted != 1 {
+        return Err(AppendError::SequenceConflict { seq: m.seq });
+    }
+    Ok(())
 }
 
 /// Synchronise the mirror file to the DB's current head. ADR-0030
