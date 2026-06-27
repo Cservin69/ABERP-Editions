@@ -298,6 +298,10 @@ fn recover_cli_replays_ahead_mirror_with_no_fork_or_loss() {
         vec![0, 1, 2],
         "invoices restored from the snapshot"
     );
+    assert!(
+        checkpoint_is_current(&db),
+        "a verified-good marker covers the rebuilt DB (ahead-mirror path)"
+    );
     assert_eq!(
         count_kind(&db, EventKind::DbAutoRecovered),
         1,

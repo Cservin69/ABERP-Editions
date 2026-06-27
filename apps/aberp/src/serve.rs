@@ -894,6 +894,16 @@ fn attempt_db_auto_recovery(
                     retained_corrupt_db: retained,
                 },
             );
+            // ADR-0095 §1 — the db.auto_recovered audit append above mutated the
+            // freshly rebuilt DB *after* recover_or_refuse wrote its verified-good
+            // marker, staling it. Re-establish the durable checkpoint so the
+            // `<db>.ckpt-ok` marker covers the FINAL on-disk DB. Idempotent (a
+            // no-op once the marker is current) and crash-safe (a crash here leaves
+            // a healthy DB with a briefly-stale marker that the next boot's
+            // recover_or_refuse / checkpoint re-establishes); best-effort like the
+            // audit append — a checkpoint hiccup must never fail a boot that has
+            // already durably recovered the DB.
+            crate::snapshot::live_checkpoint_logged(db_path, tenant.as_str());
             Ok(BootRecovery::Recovered)
         }
         aberp_snapshot::RecoveryOutcome::RefusedNoSnapshot {
@@ -958,6 +968,12 @@ pub fn run_recover(args: &crate::cli::RecoverArgs) -> Result<()> {
                     retained_corrupt_db: retained.clone(),
                 },
             );
+            // ADR-0095 §1 — the db.auto_recovered audit append above mutated the
+            // freshly rebuilt DB *after* recover_or_refuse wrote its verified-good
+            // marker, staling it. Re-establish the durable checkpoint so the
+            // `<db>.ckpt-ok` marker covers the FINAL on-disk DB (idempotent +
+            // crash-safe; best-effort like the audit append).
+            crate::snapshot::live_checkpoint_logged(&args.db, &args.tenant);
             println!("RECOVERED");
             println!(
                 "  rebuilt from snapshot seq {source_snapshot_seq} (audit head {snapshot_audit_count})"
