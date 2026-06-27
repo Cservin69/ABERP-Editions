@@ -133,6 +133,34 @@ open(p,"w").write("\n".join(L))
 PYIN
 expect_fail "$c" "handler handle_test_quote_intake_connection does NOT gate on storefront_polling_allowed" "handler gate removed"
 
+echo "[CHECK 9] editions upgrade re-defaulting the reserved prod tenant (bare tenant=\"prod\", which CHECK 3a misses)"
+c="$(fresh)"; printf '\ntenant="prod"\n' >> "$c/run/upgrade_defense.sh"
+expect_fail "$c" "defaults the reserved prod tenant" "editions upgrade re-defaulted tenant=prod (bare)"
+
+echo "[CHECK 9] editions upgrade routing its snapshot at the BARE prod root ~/.aberp/ (no literal prod, which CHECK 3a misses)"
+c="$(fresh)"; printf '\nSNAP_ROOT="${HOME}/.aberp/${TENANT}"\n' >> "$c/run/upgrade_defense.sh"
+expect_fail "$c" "references the frozen prod data root" "editions upgrade pointed back at the bare ~/.aberp/"
+
+echo "[CHECK 9] editions upgrade invoking snapshot-prod.sh WITHOUT ABERP_DATA_ROOT (would fall back to prod root)"
+c="$(fresh)"
+python3 - "$c/run/upgrade_defense.sh" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+s=s.replace('ABERP_DATA_ROOT="${EDITION_DATA_ROOT}" "$SNAPSHOT_SCRIPT"', '"$SNAPSHOT_SCRIPT"')
+open(p,"w").write(s)
+PYIN
+expect_fail "$c" "without ABERP_DATA_ROOT" "snapshot invocation lost its edition root"
+
+echo "[CHECK 9] snapshot-prod.sh hardcoding the prod root back (ABERP_DATA_ROOT override removed)"
+c="$(fresh)"
+python3 - "$c/tools/snapshot-prod.sh" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+s=s.replace('readonly DATA_ROOT="${ABERP_DATA_ROOT:-${HOME}/.aberp}"', 'readonly DATA_ROOT="${HOME}/.aberp"')
+open(p,"w").write(s)
+PYIN
+expect_fail "$c" "no longer honors ABERP_DATA_ROOT" "snapshot-prod.sh hardcoded the prod root"
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi

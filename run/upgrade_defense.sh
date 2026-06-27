@@ -27,7 +27,7 @@
 #  10. exec ./run/run_defense.sh — single terminal, continuous output.
 #
 # Forks (mirror upgrade_prod.sh):
-#   - Default tenant is `prod`. Override with the second positional arg:
+#   - Default tenant is `defense` (never the reserved `prod`; ADR-0093). Override with the second positional arg:
 #     `./run/upgrade_defense.sh PROD_Defense_v0.1.0 defense-acme`.
 #   - exec-into-run_defense.sh (not background-spawn).
 #   - Strict dev-workspace refusal unless ABERP_ALLOW_DEV_WORKSPACE=1.
@@ -105,7 +105,7 @@ print_help() {
 
 # ---------- arg parsing -----------------------------------------------------
 version=""
-tenant="defense"
+tenant="${ABERP_TENANT:-defense}"
 positional=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -147,7 +147,29 @@ readonly SCRIPT_PATH="$script_path"
 readonly REPO_ROOT="$(cd "$SCRIPT_PATH/.." && pwd -P)"
 
 readonly TENANT="$tenant"
-readonly TENANT_DIR="${HOME}/.aberp-defense/${TENANT}"
+
+# ---------- fail-fast: refuse the frozen prod line's reserved tenant --------
+# Mirror of the binary's guard_tenant_matches_build (apps/aberp/src/serve.rs):
+# BOTH editions refuse the reserved `prod` tenant (ADR-0093). The binary refuses
+# it at boot too — but boot is AFTER this script's pre-upgrade snapshot and git
+# switch, so we refuse HERE, before either, so the editions upgrade can never
+# read or write the frozen prod line. (Worded without the literal prod data path
+# so the ADR-0093 DB-isolation cut-gate stays green.)
+if [[ "$TENANT" == "prod" ]]; then
+  die "❌ '$TENANT' is the frozen prod line's reserved tenant — the Defense edition refuses it (ADR-0093). Refusing to upgrade.
+   The editions never touch the frozen prod line; they use their own ~/.aberp-defense/<tenant>/ root.
+   Re-run with a non-prod tenant, e.g. ./run/upgrade_defense.sh ${version} defense
+HU: a 'prod' a befagyasztott prod vonal fenntartott bérlője — a Defense kiadás elutasítja (ADR-0093). A frissítés megszakítva.
+   A kiadások a saját ~/.aberp-defense/<bérlő>/ gyökerüket használják; a prod vonalhoz soha nem nyúlnak.
+   Futtasd újra nem-prod bérlővel, pl.: ./run/upgrade_defense.sh ${version} defense"
+fi
+
+# Edition data root — the Defense edition's OWN ~/.aberp-defense/ tree
+# (build_profile::DEFENSE_DATA_DIRNAME). Every per-tenant path AND the
+# pre-upgrade snapshot derive from this, so the editions upgrade can never read
+# or write the frozen prod line's data root (ADR-0093 §5).
+readonly EDITION_DATA_ROOT="${HOME}/.aberp-defense"
+readonly TENANT_DIR="${EDITION_DATA_ROOT}/${TENANT}"
 readonly TENANT_SELLER_TOML="${TENANT_DIR}/seller.toml"
 
 echo
@@ -243,8 +265,8 @@ if [[ ! -x "$SNAPSHOT_SCRIPT" ]]; then
 HU: A snapshot-prod.sh hiányzik vagy nem futtatható: $SNAPSHOT_SCRIPT"
 fi
 echo
-info "running ${SNAPSHOT_SCRIPT} ${TENANT} (zip will prompt for an encryption password) ..."
-if ! "$SNAPSHOT_SCRIPT" "$TENANT"; then
+info "running ${SNAPSHOT_SCRIPT} ${TENANT} rooted at ${EDITION_DATA_ROOT} (zip will prompt for an encryption password) ..."
+if ! ABERP_DATA_ROOT="${EDITION_DATA_ROOT}" "$SNAPSHOT_SCRIPT" "$TENANT"; then
   die "snapshot-prod.sh failed — refusing to switch branches without a recovery handle
 HU: A snapshot futás nem sikerült — visszaállítási kézifogantyú nélkül nem váltok ágat." 3
 fi

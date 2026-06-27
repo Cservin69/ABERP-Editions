@@ -92,7 +92,7 @@ print_help() {
 
 # ---------- arg parsing -----------------------------------------------------
 version=""
-tenant="demo"
+tenant="${ABERP_TENANT:-demo}"
 positional=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -134,7 +134,29 @@ readonly SCRIPT_PATH="$script_path"
 readonly REPO_ROOT="$(cd "$SCRIPT_PATH/.." && pwd -P)"
 
 readonly TENANT="$tenant"
-readonly TENANT_DIR="${HOME}/.aberp-portable/${TENANT}"
+
+# ---------- fail-fast: refuse the frozen prod line's reserved tenant --------
+# Mirror of the binary's guard_tenant_matches_build (apps/aberp/src/serve.rs):
+# BOTH editions refuse the reserved `prod` tenant (ADR-0093). The binary refuses
+# it at boot too — but boot is AFTER this script's pre-upgrade snapshot and git
+# switch, so we refuse HERE, before either, so the editions upgrade can never
+# read or write the frozen prod line. (Worded without the literal prod data path
+# so the ADR-0093 DB-isolation cut-gate stays green.)
+if [[ "$TENANT" == "prod" ]]; then
+  die "❌ '$TENANT' is the frozen prod line's reserved tenant — the Portable edition refuses it (ADR-0093). Refusing to upgrade.
+   The editions never touch the frozen prod line; they use their own ~/.aberp-portable/<tenant>/ root.
+   Re-run with a non-prod tenant, e.g. ./run/upgrade_portable.sh ${version} demo
+HU: a 'prod' a befagyasztott prod vonal fenntartott bérlője — a Portable kiadás elutasítja (ADR-0093). A frissítés megszakítva.
+   A kiadások a saját ~/.aberp-portable/<bérlő>/ gyökerüket használják; a prod vonalhoz soha nem nyúlnak.
+   Futtasd újra nem-prod bérlővel, pl.: ./run/upgrade_portable.sh ${version} demo"
+fi
+
+# Edition data root — the Portable edition's OWN ~/.aberp-portable/ tree
+# (build_profile::PORTABLE_DATA_DIRNAME). Every per-tenant path AND the
+# pre-upgrade snapshot derive from this, so the editions upgrade can never read
+# or write the frozen prod line's data root (ADR-0093 §5).
+readonly EDITION_DATA_ROOT="${HOME}/.aberp-portable"
+readonly TENANT_DIR="${EDITION_DATA_ROOT}/${TENANT}"
 
 echo
 echo "${c_grn}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${c_rst}" >&2
@@ -226,8 +248,8 @@ if [[ "$tenant_dir_exists" -eq 1 ]]; then
 HU: A snapshot-prod.sh hiányzik vagy nem futtatható: $SNAPSHOT_SCRIPT"
   fi
   echo
-  info "running ${SNAPSHOT_SCRIPT} ${TENANT} (zip will prompt for an encryption password) ..."
-  if ! "$SNAPSHOT_SCRIPT" "$TENANT"; then
+  info "running ${SNAPSHOT_SCRIPT} ${TENANT} rooted at ${EDITION_DATA_ROOT} (zip will prompt for an encryption password) ..."
+  if ! ABERP_DATA_ROOT="${EDITION_DATA_ROOT}" "$SNAPSHOT_SCRIPT" "$TENANT"; then
     die "snapshot-prod.sh failed — refusing to switch branches without a recovery handle
 HU: A snapshot futás nem sikerült — visszaállítási kézifogantyú nélkül nem váltok ágat." 3
   fi
