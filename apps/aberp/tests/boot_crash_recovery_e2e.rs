@@ -238,6 +238,10 @@ fn recover_cli_auto_recovers_torn_db_with_no_lost_committed_entry() {
         "the recovery is audited as db.auto_recovered"
     );
     assert!(corrupt_copies(t.dir()) >= 1, "the torn DB was retained as evidence");
+    assert!(
+        read_mirror_entries(&mirror).unwrap().len() as u64 >= head_before,
+        "the audit-ledger mirror was read for replay, never truncated"
+    );
 }
 
 /// Ahead-mirror (root cause #4): the live DB was lost and a fresh empty one
