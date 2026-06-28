@@ -96,7 +96,7 @@ use aberp_quote_engine::{
     lead_time_days, quote, quote_with_shop_model, CalibrationTable, Feature, FeatureGraph,
     GearKind, GearOp, GearProcess, GearProcessRate, MachineCapacity, MachineFamily, MachineRate,
     Material, QuoteBreakdown, QuotingParameters, StockForm, StockStatus, ToleranceRange,
-    FALLBACK_BUFFER_PCT, FALLBACK_DAILY_HOURS,
+    ToleranceSpec, FALLBACK_BUFFER_PCT, FALLBACK_DAILY_HOURS,
 };
 use common::{catchall_complexity_rules, default_tolerance_multipliers, no_stock_adjustments};
 use std::collections::BTreeMap;
@@ -207,6 +207,8 @@ fn spinner_gear() -> GearOp {
 fn old_graph() -> FeatureGraph {
     FeatureGraph {
         schema_version: FeatureGraph::SCHEMA_VERSION,
+        tolerance: ToleranceSpec::Unspecified,
+        critical_feature_tolerances: Vec::new(),
         bounding_box_mm: BBOX,
         volume_mm3: PART_VOLUME_MM3,
         surface_area_mm2: PART_SURFACE_AREA_MM2,

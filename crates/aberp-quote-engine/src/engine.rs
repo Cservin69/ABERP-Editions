@@ -16,7 +16,8 @@ use crate::catalogue::{
 };
 use crate::error::QuoteError;
 use crate::feature_graph::{
-    FeatureGraph, GearKind, GearOp, GearProcess, SizeBucket, StockForm, ToleranceRange,
+    FeatureGraph, GearKind, GearOp, GearProcess, GeneralClass, SizeBucket, StockForm,
+    ToleranceRange, ToleranceSpec,
 };
 use crate::ENGINE_VERSION;
 
@@ -155,6 +156,242 @@ pub struct CatalogueSnapshot<'a> {
     // here as the next *field* (not a 12th positional arg). Intentionally
     // absent until T3 so T1 stays a pure, golden-byte-identical structural
     // refactor with no new field.
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ADR-0097 Part 1 (T2) — tolerance taxonomy → internal tightness scale.
+//
+// A pure, deterministic, reasoning-logged normaliser mapping every drawing
+// dialect ([`ToleranceSpec`]) onto the existing 5-band [`ToleranceRange`].
+// PURE math only — no I/O, clock, RNG. The heuristics that decide *which*
+// dialect a drawing used live in the extractor/wiring; the engine only
+// evaluates an already-classified [`ToleranceSpec`]. **T2 contributes nothing
+// to price** — `tightness` is not yet called by the scorer (the additive
+// tolerance cost line is T3); it is the typed, tested contract T3/T4 build on.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// IT-grade → band edge: grades **≤ this** map to
+/// [`ToleranceRange::UltraPrecision`]. Pinned, golden-guarded constant
+/// (ADR-0097 Q4); operator-overridable per job.
+pub const IT_GRADE_ULTRA_PRECISION_MAX: u8 = 5;
+/// IT-grade → band edge: grades above `ULTRA` up to **this** map to
+/// [`ToleranceRange::Precision`] (IT6–IT7). Pinned (ADR-0097 Q4).
+pub const IT_GRADE_PRECISION_MAX: u8 = 7;
+/// IT-grade → band edge: grades above `PRECISION` up to **this** map to
+/// [`ToleranceRange::Tight`] (IT8–IT9). Pinned (ADR-0097 Q4).
+pub const IT_GRADE_TIGHT_MAX: u8 = 9;
+/// IT-grade → band edge: grades above `TIGHT` up to **this** map to
+/// [`ToleranceRange::Standard`] (IT10–IT11); grades above it map to
+/// [`ToleranceRange::Loose`] (IT12–IT14). Pinned (ADR-0097 Q4).
+pub const IT_GRADE_STANDARD_MAX: u8 = 11;
+
+/// The outcome of normalising a [`ToleranceSpec`] onto the internal tightness
+/// scale: the resolved [`ToleranceRange`] band, the manual-review flag (set
+/// only by [`ToleranceSpec::PerDrawing`] — ADR-0097 Q5), and a deterministic
+/// reasoning-log line documenting the derivation.
+///
+/// Carrying the flag in the result type (not just the band) is the T2
+/// contract: T3/T4 surface `manual_review` in the breakdown / UI and gate
+/// auto-send on it; the band feeds the (future, T3) additive tolerance cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NormalizedTolerance {
+    /// The resolved internal tightness band.
+    pub band: ToleranceRange,
+    /// `true` iff the spec was [`ToleranceSpec::PerDrawing`] — route to a
+    /// human; never silently priced as tight or loose.
+    pub manual_review: bool,
+    /// A deterministic, operator-readable reasoning line (the trust signal).
+    pub reason: String,
+}
+
+/// ISO 286 grade multipliers (units of the standard tolerance factor `i`) for
+/// IT5..=IT16 — used to derive the IT grade nearest a given tolerance width.
+const IT_GRADE_MULTIPLIERS: [(u8, f64); 12] = [
+    (5, 7.0),
+    (6, 10.0),
+    (7, 16.0),
+    (8, 25.0),
+    (9, 40.0),
+    (10, 64.0),
+    (11, 100.0),
+    (12, 160.0),
+    (13, 250.0),
+    (14, 400.0),
+    (15, 640.0),
+    (16, 1000.0),
+];
+
+/// ISO 286-1 standard tolerance factor `i` (micrometres) for a nominal size:
+/// `i = 0.45·∛D + 0.001·D`, with `D` the geometric mean √(lo·hi) of the
+/// standard size segment containing `nominal_mm`. Reproduces the published
+/// ISO 286 IT values to < 1 µm. Pure; pinned segment table. `nominal_mm ≤ 0`
+/// or non-finite clamps to the smallest segment (defence-in-depth — the
+/// extractor should never emit those).
+fn iso286_tolerance_factor_um(nominal_mm: f64) -> f64 {
+    // ISO 286-1 standard size segments (mm), upper-inclusive; `D` is the
+    // geometric mean √(lo·hi). First segment uses √(1·3).
+    const SEGMENTS: [(f64, f64); 13] = [
+        (1.0, 3.0),
+        (3.0, 6.0),
+        (6.0, 10.0),
+        (10.0, 18.0),
+        (18.0, 30.0),
+        (30.0, 50.0),
+        (50.0, 80.0),
+        (80.0, 120.0),
+        (120.0, 180.0),
+        (180.0, 250.0),
+        (250.0, 315.0),
+        (315.0, 400.0),
+        (400.0, 500.0),
+    ];
+    let n = if nominal_mm.is_finite() && nominal_mm > 0.0 {
+        nominal_mm
+    } else {
+        1.0
+    };
+    let (lo, hi) = SEGMENTS
+        .iter()
+        .copied()
+        .find(|&(_, hi)| n <= hi)
+        .unwrap_or((400.0, 500.0));
+    let d = (lo * hi).sqrt();
+    0.45 * d.cbrt() + 0.001 * d
+}
+
+/// Derive the ISO 286 IT grade nearest to a symmetric `± value_mm` on a
+/// `nominal_mm` dimension. The ± half-width (µm) is compared against the
+/// standard grade values `multiplier · i(nominal)`; the nearest grade wins,
+/// ties breaking to the **tighter** (lower) grade — conservative, never
+/// under-state tightness. Saturates at IT5 (tighter ⇒ IT5) and IT16.
+///
+/// **Size-aware (ISO 286):** the same ± is a *tighter* grade on a *larger*
+/// nominal, because the grade values scale up with size.
+fn derive_it_grade_from_plus_minus(value_mm: f64, nominal_mm: f64) -> u8 {
+    let half_width_um = value_mm.abs() * 1000.0;
+    let i = iso286_tolerance_factor_um(nominal_mm);
+    let ratio = half_width_um / i;
+    let mut best_grade = IT_GRADE_MULTIPLIERS[0].0;
+    let mut best_dist = f64::INFINITY;
+    for &(grade, mult) in &IT_GRADE_MULTIPLIERS {
+        let dist = (mult - ratio).abs();
+        // Strict `<` + ascending iteration ⇒ ties resolve to the tighter grade.
+        if dist < best_dist {
+            best_dist = dist;
+            best_grade = grade;
+        }
+    }
+    best_grade
+}
+
+/// Map an ISO 286 IT grade onto the internal [`ToleranceRange`] band, per the
+/// pinned ADR-0097 Q4 edges (`≤IT5→Ultra`, `IT6–7→Precision`, `IT8–9→Tight`,
+/// `IT10–11→Standard`, `IT12+→Loose`).
+fn it_grade_to_band(grade: u8) -> ToleranceRange {
+    if grade <= IT_GRADE_ULTRA_PRECISION_MAX {
+        ToleranceRange::UltraPrecision
+    } else if grade <= IT_GRADE_PRECISION_MAX {
+        ToleranceRange::Precision
+    } else if grade <= IT_GRADE_TIGHT_MAX {
+        ToleranceRange::Tight
+    } else if grade <= IT_GRADE_STANDARD_MAX {
+        ToleranceRange::Standard
+    } else {
+        ToleranceRange::Loose
+    }
+}
+
+/// Map an ISO 2768 general class onto the internal [`ToleranceRange`] band,
+/// per the pinned ADR-0097 Q4 map (`fine→Tight`, `medium→Standard`,
+/// `coarse→Loose`, `very-coarse→Loose`). Medium is the universal title-block
+/// default ⇒ [`ToleranceRange::Standard`] ⇒ byte-identical to today.
+fn general_class_to_band(class: GeneralClass) -> ToleranceRange {
+    match class {
+        GeneralClass::Iso2768Fine => ToleranceRange::Tight,
+        GeneralClass::Iso2768Medium => ToleranceRange::Standard,
+        GeneralClass::Iso2768Coarse => ToleranceRange::Loose,
+        GeneralClass::Iso2768VeryCoarse => ToleranceRange::Loose,
+    }
+}
+
+/// Normalise a [`ToleranceSpec`] onto the internal 5-band [`ToleranceRange`]
+/// tightness scale — the **pure, deterministic** taxonomy normaliser
+/// (ADR-0097 Part 1).
+///
+/// - [`ToleranceSpec::Unspecified`] ⇒ [`ToleranceRange::Standard`], the inert
+///   today-equivalent band (the engine *defers* to the resolved
+///   `target_tolerance` for Unspecified — see [`normalize_tolerance`] — but
+///   this total function returns the matching default band).
+/// - [`ToleranceSpec::GeneralClass`] ⇒ ISO 2768 map.
+/// - [`ToleranceSpec::ItGrade`] ⇒ IT-grade → band map.
+/// - [`ToleranceSpec::PlusMinus`] ⇒ size-aware ISO 286 derivation then the
+///   IT-grade map; `nominal_mm` is the feature's `representative_size_mm` (or
+///   the part's, for a whole-part ±).
+/// - [`ToleranceSpec::PerDrawing`] ⇒ [`ToleranceRange::Standard`] (default
+///   band) — and the caller MUST honour the manual-review flag from
+///   [`normalize_tolerance`]; never silently tightened (ADR-0097 Q5).
+///
+/// > **Flagged deviation from the plan's illustrative example.** The plan's T2
+/// > note reads "±0.01@Ø10→IT6→Precision vs ±0.01@Ø250→looser". The Ø10 anchor
+/// > holds (±0.01@Ø10 ⇒ IT6 ⇒ Precision). The "Ø250→looser" half is
+/// > **physically backwards**: by ISO 286 a *fixed* ± is a *tighter* grade on
+/// > a *larger* nominal (grade values scale up with size), so ±0.01@Ø250
+/// > derives to ≤IT5 ⇒ [`ToleranceRange::UltraPrecision`] (tighter), not
+/// > looser. Implemented per the ISO 286 physics the ADR mandates
+/// > ("professionally-correct size-aware derivation") and the
+/// > no-silent-under-quote posture (Q5); the resolved band is
+/// > operator-overridable per job/feature. **Zero price impact in T2** (the
+/// > band is not yet costed).
+pub fn tightness(spec: ToleranceSpec, nominal_mm: f64) -> ToleranceRange {
+    match spec {
+        ToleranceSpec::Unspecified => ToleranceRange::Standard,
+        ToleranceSpec::GeneralClass { class } => general_class_to_band(class),
+        ToleranceSpec::ItGrade { grade } => it_grade_to_band(grade),
+        ToleranceSpec::PlusMinus { value_mm } => {
+            it_grade_to_band(derive_it_grade_from_plus_minus(value_mm, nominal_mm))
+        }
+        ToleranceSpec::PerDrawing => ToleranceRange::Standard,
+    }
+}
+
+/// Normalise a [`ToleranceSpec`] into a [`NormalizedTolerance`] — the band
+/// (via [`tightness`]), the manual-review flag (via
+/// [`ToleranceSpec::requires_manual_review`]), and a deterministic
+/// reasoning-log line. Pure; same inputs ⇒ byte-identical result (the log
+/// line is the trust signal).
+pub fn normalize_tolerance(spec: ToleranceSpec, nominal_mm: f64) -> NormalizedTolerance {
+    let band = tightness(spec, nominal_mm);
+    let manual_review = spec.requires_manual_review();
+    let reason = match spec {
+        ToleranceSpec::Unspecified => format!(
+            "tolerance: unspecified -> defer to resolved target_tolerance (today's behaviour; band {})",
+            band.as_db_str()
+        ),
+        ToleranceSpec::GeneralClass { class } => format!(
+            "tolerance: ISO 2768 {} -> {} band",
+            class.as_db_str(),
+            band.as_db_str()
+        ),
+        ToleranceSpec::ItGrade { grade } => {
+            format!("tolerance: IT{grade} -> {} band", band.as_db_str())
+        }
+        ToleranceSpec::PlusMinus { value_mm } => {
+            let grade = derive_it_grade_from_plus_minus(value_mm, nominal_mm);
+            format!(
+                "tolerance: +/-{value_mm:.4}mm @ nominal {nominal_mm:.1}mm -> IT{grade} (ISO 286 size-aware) -> {} band",
+                band.as_db_str()
+            )
+        }
+        ToleranceSpec::PerDrawing => format!(
+            "tolerance: per-drawing (GD&T) -> {} band + MANUAL REVIEW (not auto-priced; no silent tightening)",
+            band.as_db_str()
+        ),
+    };
+    NormalizedTolerance {
+        band,
+        manual_review,
+        reason,
+    }
 }
 
 /// Score a quote.

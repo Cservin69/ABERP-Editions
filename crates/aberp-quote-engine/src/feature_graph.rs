@@ -156,6 +156,136 @@ impl ToleranceRange {
     }
 }
 
+/// ISO 2768 general-tolerance (title-block) class — the drawing's default
+/// tolerance when no per-dimension callout overrides it.
+///
+/// **ADR-0097 Part 1 (T2).** One of the four professional drawing dialects the
+/// taxonomy normalises onto the internal [`ToleranceRange`] tightness scale.
+/// Explicit per-variant serde strings (not `rename_all`) pin the S269
+/// wire contract unambiguously — the same posture as
+/// [`FeatureType::Undercut5Axis`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GeneralClass {
+    /// ISO 2768 **fine** (`f`) — tightest general class. → [`ToleranceRange::Tight`].
+    #[serde(rename = "iso2768_fine")]
+    Iso2768Fine,
+    /// ISO 2768 **medium** (`m`) — the universal title-block default.
+    /// → [`ToleranceRange::Standard`] ⇒ byte-identical to today.
+    #[serde(rename = "iso2768_medium")]
+    Iso2768Medium,
+    /// ISO 2768 **coarse** (`c`). → [`ToleranceRange::Loose`].
+    #[serde(rename = "iso2768_coarse")]
+    Iso2768Coarse,
+    /// ISO 2768 **very coarse** (`v`). → [`ToleranceRange::Loose`].
+    #[serde(rename = "iso2768_very_coarse")]
+    Iso2768VeryCoarse,
+}
+
+impl GeneralClass {
+    /// The wire / DB storage string. Round-trips through serde unchanged.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Iso2768Fine => "iso2768_fine",
+            Self::Iso2768Medium => "iso2768_medium",
+            Self::Iso2768Coarse => "iso2768_coarse",
+            Self::Iso2768VeryCoarse => "iso2768_very_coarse",
+        }
+    }
+}
+
+/// The drawing-side **tolerance specification** — the professional taxonomy
+/// input the extractor (S269) / operator supplies, before the engine
+/// normalises it onto the internal [`ToleranceRange`] tightness scale via
+/// [`crate::tightness`].
+///
+/// **ADR-0097 Part 1 (T2).** A closed, serde-tagged enum covering the four
+/// real drawing dialects plus the inert [`ToleranceSpec::Unspecified`]
+/// default:
+///
+/// - [`ToleranceSpec::Unspecified`] — **the default.** No taxonomy input; the
+///   engine falls back to the externally-resolved `target_tolerance` argument
+///   exactly as today (the universal title-block default that lands here is
+///   ISO 2768-medium ↔ [`ToleranceRange::Standard`]). This is what keeps a
+///   graph carrying no tolerance input byte-identical to today.
+/// - [`ToleranceSpec::GeneralClass`] — an ISO 2768 title-block class.
+/// - [`ToleranceSpec::ItGrade`] — an ISO 286 IT grade on a fit (IT6–IT14).
+/// - [`ToleranceSpec::PlusMinus`] — an explicit symmetric ± on a nominal,
+///   normalised **size-aware** via the ISO 286 standard-tolerance factor.
+/// - [`ToleranceSpec::PerDrawing`] — GD&T-only; resolves to the default band
+///   **and raises a manual-review flag** (never silently tightened — Q5).
+///
+/// `Copy` + `#[serde(tag = "kind")]` + `#[default]` mirror [`StockForm`]. `Eq`
+/// is **not** derived because [`ToleranceSpec::PlusMinus`] carries an `f64`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToleranceSpec {
+    /// No taxonomy input — defer to the resolved `target_tolerance` argument
+    /// (today's behaviour). The inert default.
+    #[default]
+    Unspecified,
+    /// An ISO 2768 general-tolerance (title-block) class.
+    GeneralClass {
+        /// The ISO 2768 class.
+        class: GeneralClass,
+    },
+    /// An ISO 286 IT grade on a fit (typically IT6–IT14; any `u8` maps,
+    /// saturating at the band edges).
+    ItGrade {
+        /// The IT grade number (e.g. `7` for IT7).
+        grade: u8,
+    },
+    /// An explicit symmetric ± tolerance (millimetres) on a nominal
+    /// dimension. Normalised **size-aware**: the same ± is a tighter IT grade
+    /// on a larger nominal (ISO 286).
+    PlusMinus {
+        /// The ± half-width in millimetres (e.g. `0.01` for ±0.01 mm).
+        value_mm: f64,
+    },
+    /// "Per drawing" — GD&T callouts a human must read. Resolves to the
+    /// default band and raises the manual-review flag; never silently
+    /// tightened or loosened.
+    PerDrawing,
+}
+
+impl ToleranceSpec {
+    /// `true` for [`ToleranceSpec::Unspecified`] — the inert default that
+    /// defers to the resolved `target_tolerance`. Used as the
+    /// `skip_serializing_if` predicate so an unspecified spec adds **no** new
+    /// JSON key (absent ⇒ byte-identical wire contract).
+    pub fn is_unspecified(&self) -> bool {
+        matches!(self, ToleranceSpec::Unspecified)
+    }
+
+    /// `true` for [`ToleranceSpec::PerDrawing`] — the GD&T-only dialect the
+    /// engine refuses to silently price, raising a manual-review flag instead
+    /// (ADR-0097 Q5). No other dialect requires review.
+    pub fn requires_manual_review(&self) -> bool {
+        matches!(self, ToleranceSpec::PerDrawing)
+    }
+}
+
+/// A per-critical-feature tolerance callout — a tighter spec scoped to one
+/// feature on the part (e.g. a single ground journal on an otherwise rough
+/// part).
+///
+/// **ADR-0097 Part 1/Part 3 (T2).** Carried on
+/// [`FeatureGraph::critical_feature_tolerances`] (graph-level — the brief's
+/// "optional per-feature field on `FeatureGraph`") rather than inline on
+/// [`Feature`], so the existing `Feature` literal contract — and the locked
+/// `tests/property.rs` golden — stay byte-identical. `feature_index` binds the
+/// callout to `FeatureGraph.features[feature_index]`, whose
+/// `representative_size_mm` supplies the nominal for a
+/// [`ToleranceSpec::PlusMinus`] derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct FeatureTolerance {
+    /// Index into [`FeatureGraph::features`] this callout applies to.
+    #[serde(default)]
+    pub feature_index: usize,
+    /// The tighter tolerance spec for that feature.
+    #[serde(default)]
+    pub spec: ToleranceSpec,
+}
+
 /// One feature on the extracted part. The engine processes features
 /// in input order — the extractor is responsible for any normalising
 /// sort it wants applied.
@@ -370,6 +500,26 @@ pub struct FeatureGraph {
     /// extractor (S269) / operator (S6 wiring) populates it for geared parts.
     #[serde(default)]
     pub gears: Vec<GearOp>,
+    /// **ADR-0097 Part 1 (T2).** The part's overall drawing-tolerance spec —
+    /// the professional taxonomy input (ISO 2768 class / IT grade / explicit
+    /// ± / per-drawing). `#[serde(default)]` ⇒ a graph that omits it (every
+    /// persisted blob, every ≤v4 extractor output) loads as
+    /// [`ToleranceSpec::Unspecified`], which defers to the resolved
+    /// `target_tolerance` argument ⇒ **today's price, byte-identical**;
+    /// `skip_serializing_if` ⇒ an unspecified spec emits no JSON key. The
+    /// [`crate::tightness`] normaliser maps it onto [`ToleranceRange`]; the
+    /// additive cost it will drive lands in T3 — in T2 this field contributes
+    /// nothing to price.
+    #[serde(default, skip_serializing_if = "ToleranceSpec::is_unspecified")]
+    pub tolerance: ToleranceSpec,
+    /// **ADR-0097 Part 1/Part 3 (T2).** Optional per-critical-feature
+    /// tolerance callouts (e.g. one ground bore on an otherwise rough part),
+    /// each [`FeatureTolerance`] bound to a [`Feature`] by index. Defaulted
+    /// empty (`#[serde(default)]` + `skip_serializing_if`) so a graph that
+    /// omits it prices byte-identically. Inert in T2 (consumed by the T3 cost
+    /// model).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub critical_feature_tolerances: Vec<FeatureTolerance>,
 }
 
 impl FeatureGraph {
@@ -386,5 +536,12 @@ impl FeatureGraph {
     /// graph (no `gears`) still loads — it defaults to empty ⇒ zero gear cost
     /// ⇒ today's price — and the guard accepts any `schema_version <= 4`. The
     /// extractor's lockstep bump to v4 lands with S269 (ADR-0094 Q3).
-    pub const SCHEMA_VERSION: u32 = 4;
+    /// **v5 (ADR-0097 Part 1, T2)** adds the defaulted `tolerance`
+    /// ([`ToleranceSpec`]) and `critical_feature_tolerances`
+    /// ([`FeatureTolerance`]) fields; a ≤v4 graph (no `tolerance`) still loads
+    /// — `tolerance` defaults to [`ToleranceSpec::Unspecified`] (defers to the
+    /// resolved `target_tolerance` ⇒ today's price) and the callouts default
+    /// empty — and the guard accepts any `schema_version <= 5`. The
+    /// extractor's lockstep bump to v5 lands with S269 (ADR-0097 Q8).
+    pub const SCHEMA_VERSION: u32 = 5;
 }

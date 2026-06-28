@@ -10,7 +10,7 @@
 
 mod common;
 
-use aberp_quote_engine::{quote, FeatureGraph, StockForm, ToleranceRange};
+use aberp_quote_engine::{quote, FeatureGraph, StockForm, ToleranceRange, ToleranceSpec};
 use common::*;
 
 fn round4(v: f64) -> f64 {
@@ -27,6 +27,8 @@ fn blank(
 ) -> FeatureGraph {
     FeatureGraph {
         schema_version: FeatureGraph::SCHEMA_VERSION,
+        tolerance: ToleranceSpec::Unspecified,
+        critical_feature_tolerances: Vec::new(),
         bounding_box_mm: bbox,
         volume_mm3,
         surface_area_mm2,
