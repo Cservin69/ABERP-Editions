@@ -124,9 +124,9 @@ pub use catalogue::{
     StockStatus, ToleranceMultiplier,
 };
 pub use engine::{
-    is_exotic_material, quote, quote_with_calibration, quote_with_shop_model, route_family,
-    select_gear_process, GEAR_AGMA_DATUM_CLASS, GEAR_FACEWIDTH_REF_MM, GEAR_INTERNAL_WIRE_EDM_AGMA,
-    THIN_WALL_TIGHT_TOL_BUMP,
+    is_exotic_material, quote, quote_with_calibration, quote_with_catalogue, quote_with_shop_model,
+    route_family, select_gear_process, CatalogueSnapshot, GEAR_AGMA_DATUM_CLASS,
+    GEAR_FACEWIDTH_REF_MM, GEAR_INTERNAL_WIRE_EDM_AGMA, THIN_WALL_TIGHT_TOL_BUMP,
 };
 pub use error::QuoteError;
 pub use feature_graph::{
