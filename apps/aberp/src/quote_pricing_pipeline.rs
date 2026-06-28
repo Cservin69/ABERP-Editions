@@ -4196,6 +4196,8 @@ mod tests {
             requires_5_axis: false,
             thin_wall_present: false,
             stock_form,
+            tolerance: ToleranceSpec::Unspecified,
+            critical_feature_tolerances: Vec::new(),
         }
     }
 
