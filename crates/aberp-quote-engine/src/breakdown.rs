@@ -52,6 +52,19 @@ pub struct QuoteBreakdown {
     /// byte-identical to pre-Gap-3 — the inert-by-default wire contract.
     #[serde(default, skip_serializing_if = "is_zero_eur")]
     pub gear_cost: f64,
+    /// EUR. **ADR-0097 Part 2 / T3.** The additive, itemised professional-
+    /// tolerance cost — Σ per-critical-feature in-process gauging + CMM, extra
+    /// slower-feed finishing passes, a tightest-band grinding adder, and a
+    /// scrap/rework uplift on `(material + machining)` — each a reasoning-log
+    /// line, costed at the routed effective EUR/min (the same rate the machining
+    /// line used). Folded into the subtotal beside material/machining/setup/
+    /// cad_cam/gear. Per part. `#[serde(default)]` so pre-ADR-0097 persisted
+    /// blobs deserialize as `0.0`; `skip_serializing_if` omits it from the wire
+    /// when it is exactly zero (default class + empty/zero rate table), keeping a
+    /// no-tolerance-cost `breakdown_json` byte-identical to pre-ADR-0097 — the
+    /// inert-by-default wire contract (verbatim the `gear_cost` precedent).
+    #[serde(default, skip_serializing_if = "is_zero_eur")]
+    pub tolerance_cost: f64,
     /// EUR. `subtotal × overhead_factor` (step 13).
     pub overhead: f64,
     /// EUR. `(subtotal + overhead) × profit_margin_base` (step 14).
@@ -103,6 +116,6 @@ fn default_calibration_coefficient() -> f64 {
 /// from the wire when it is exactly zero (the no-gear path), keeping a
 /// no-gear `breakdown_json` byte-identical to pre-ADR-0094-Gap-3.
 #[allow(clippy::float_cmp)]
-fn is_zero_eur(v: &f64) -> bool {
+pub(crate) fn is_zero_eur(v: &f64) -> bool {
     *v == 0.0
 }

@@ -12,7 +12,7 @@ use crate::breakdown::QuoteBreakdown;
 use crate::capacity::MachineFamily;
 use crate::catalogue::{
     ComplexityRule, GearProcessRate, MachineRate, Material, QuotingParameters, StockAdjustment,
-    ToleranceMultiplier,
+    ToleranceCostRate, ToleranceMultiplier,
 };
 use crate::error::QuoteError;
 use crate::feature_graph::{
@@ -151,11 +151,11 @@ pub struct CatalogueSnapshot<'a> {
     /// `quoting_gear_processes` rows (ADR-0094 Gap 3). Empty ⇒ the gear path
     /// is never entered ⇒ zero gear cost ⇒ today's price.
     pub gear_process_rates: &'a [GearProcessRate],
-    // ADR-0097 Part 2 / T3 extension point: the additive professional-
-    // tolerance cost line adds `tolerance_cost_rates: &'a [ToleranceCostRate]`
-    // here as the next *field* (not a 12th positional arg). Intentionally
-    // absent until T3 so T1 stays a pure, golden-byte-identical structural
-    // refactor with no new field.
+    /// `quoting_tolerance_cost_rates` rows (ADR-0097 Part 2 / T3). Keyed by the
+    /// governing [`ToleranceRange`] band (`as_db_str`). Empty ⇒ the additive
+    /// `tolerance_cost` path is never entered ⇒ `tolerance_cost = 0.0`, no
+    /// reasoning line ⇒ today's price. T1 reserved this slot; T3 fills it.
+    pub tolerance_cost_rates: &'a [ToleranceCostRate],
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -184,6 +184,15 @@ pub const IT_GRADE_TIGHT_MAX: u8 = 9;
 /// [`ToleranceRange::Standard`] (IT10–IT11); grades above it map to
 /// [`ToleranceRange::Loose`] (IT12–IT14). Pinned (ADR-0097 Q4).
 pub const IT_GRADE_STANDARD_MAX: u8 = 11;
+
+/// ADR-0097 Part 2 / T3 — grinding-escalation minutes charged **per critical
+/// feature** when a [`ToleranceCostRate`] row sets `grinding_escalation` AND the
+/// governing band is the tightest ([`ToleranceRange::UltraPrecision`]). Models
+/// the second-operation grind (refixture + spark-out passes) the flat
+/// multiplier cannot see; costed at the `Grinder` [`MachineRate`] (falling back
+/// to the routed effective EUR/min if the shop seeds no grinder rate). Pinned,
+/// golden-guarded constant (ADR-0097 Q4); the rate stays operator-tunable.
+pub const GRINDING_ESCALATION_MIN_PER_CRITICAL_FEATURE: f64 = 12.0;
 
 /// The outcome of normalising a [`ToleranceSpec`] onto the internal tightness
 /// scale: the resolved [`ToleranceRange`] band, the manual-review flag (set
@@ -502,6 +511,9 @@ pub fn quote_with_shop_model(
             stock_adjustments,
             machine_rates,
             gear_process_rates,
+            // ADR-0097 T3: legacy entry points pass an empty rate slice ⇒ the
+            // additive tolerance-cost path is inert ⇒ byte-identical pricing.
+            tolerance_cost_rates: &[],
         },
         parameters,
         quantity,
@@ -539,6 +551,7 @@ pub fn quote_with_catalogue(
         stock_adjustments,
         machine_rates,
         gear_process_rates,
+        tolerance_cost_rates,
     } = *catalogue;
     // ── Pre-flight validation ─────────────────────────────────────
     if quantity == 0 {
@@ -1090,28 +1103,73 @@ pub fn quote_with_catalogue(
         &mut log,
     );
 
+    // ── ADR-0097 Part 2 / T3: additive professional-tolerance cost ──
+    // Itemised, costed at the routed EFFECTIVE EUR/min (the same rate the
+    // machining line used; grinding at the Grinder family rate). EMPTY rate
+    // slice ⇒ the path is never entered ⇒ `tolerance_cost` stays 0.0, NO
+    // reasoning line is added, and the subtotal line below is TODAY'S EXACT
+    // line ⇒ byte-identical pricing (mirrors the empty-`gears` posture above).
+    let tolerance_cost = tolerance_op_cost(
+        feature_graph,
+        target_tolerance,
+        material_cost,
+        machining_cost,
+        finishing_min,
+        machining_rate,
+        machine_rates,
+        tolerance_cost_rates,
+        &mut log,
+    );
+
     // ── Step 10–13: subtotal → overhead → margin → total ─────────
-    let subtotal = material_cost + machining_cost + setup_cost + cad_cam_cost + gear_cost;
+    let subtotal =
+        material_cost + machining_cost + setup_cost + cad_cam_cost + gear_cost + tolerance_cost;
     let overhead = subtotal * parameters.overhead_factor;
     let margin = (subtotal + overhead) * parameters.profit_margin_base;
     let total_price = subtotal + overhead + margin;
-    if feature_graph.gears.is_empty() {
+    // Byte-identity: when `tolerance_cost == 0.0` (empty/zero rate table or
+    // default class) the pre-ADR-0097 gear-only branch is emitted VERBATIM; the
+    // tolerance term is named only when non-zero (mirrors `gear_cost`).
+    if crate::breakdown::is_zero_eur(&tolerance_cost) {
+        if feature_graph.gears.is_empty() {
+            log.push(format!(
+                "[totals] material={m:.4} + machining={mc:.4} + setup={s:.4} + cad_cam={cc:.4} = subtotal={st:.4} EUR",
+                m = material_cost,
+                mc = machining_cost,
+                s = setup_cost,
+                cc = cad_cam_cost,
+                st = subtotal,
+            ));
+        } else {
+            log.push(format!(
+                "[totals] material={m:.4} + machining={mc:.4} + setup={s:.4} + cad_cam={cc:.4} + gear={g:.4} = subtotal={st:.4} EUR",
+                m = material_cost,
+                mc = machining_cost,
+                s = setup_cost,
+                cc = cad_cam_cost,
+                g = gear_cost,
+                st = subtotal,
+            ));
+        }
+    } else if feature_graph.gears.is_empty() {
         log.push(format!(
-            "[totals] material={m:.4} + machining={mc:.4} + setup={s:.4} + cad_cam={cc:.4} = subtotal={st:.4} EUR",
+            "[totals] material={m:.4} + machining={mc:.4} + setup={s:.4} + cad_cam={cc:.4} + tolerance={t:.4} = subtotal={st:.4} EUR",
             m = material_cost,
             mc = machining_cost,
             s = setup_cost,
             cc = cad_cam_cost,
+            t = tolerance_cost,
             st = subtotal,
         ));
     } else {
         log.push(format!(
-            "[totals] material={m:.4} + machining={mc:.4} + setup={s:.4} + cad_cam={cc:.4} + gear={g:.4} = subtotal={st:.4} EUR",
+            "[totals] material={m:.4} + machining={mc:.4} + setup={s:.4} + cad_cam={cc:.4} + gear={g:.4} + tolerance={t:.4} = subtotal={st:.4} EUR",
             m = material_cost,
             mc = machining_cost,
             s = setup_cost,
             cc = cad_cam_cost,
             g = gear_cost,
+            t = tolerance_cost,
             st = subtotal,
         ));
     }
@@ -1155,6 +1213,7 @@ pub fn quote_with_catalogue(
         cad_cam_cost,
         setup_cost,
         gear_cost,
+        tolerance_cost,
         overhead,
         margin,
         total_price,
@@ -1424,4 +1483,157 @@ fn gear_op_cost(
         ));
     }
     gear_cost
+}
+
+/// ADR-0097 Part 2 / T3 — the additive, itemised professional-tolerance cost.
+///
+/// Returns `0.0` for an EMPTY `tolerance_cost_rates` slice WITHOUT touching
+/// `log`, so the no-rate-table path is byte-identical to pre-ADR-0097 (the
+/// inert-by-default contract — mirrors [`gear_op_cost`]'s empty-`gears` posture).
+///
+/// With a rate table present it resolves the **governing band** — the tightest
+/// of the resolved `target_tolerance` and every per-critical-feature callout
+/// ([`FeatureGraph::critical_feature_tolerances`], normalised via
+/// [`normalize_tolerance`]); a [`ToleranceSpec::PerDrawing`] callout raises a
+/// loud manual-review line and is **never silently tightened** (its band is the
+/// default — ADR-0097 Q5) — looks up that band's row, and sums four reasoning-
+/// logged terms costed at the routed `effective_rate` (grinding at the
+/// `Grinder` rate): (1) Σ critical features × (in-process gauging + CMM)
+/// minutes; (2) extra slower-feed finishing passes; (3) a tightest-band
+/// grinding adder (only when `grinding_escalation` AND the band is
+/// [`ToleranceRange::UltraPrecision`]); (4) a scrap/rework uplift on
+/// `(material_cost + machining_cost)`. A band with no matching row is fail-soft
+/// `0.0` + a loud line (CLAUDE.md rule 12). Pure, finite, non-negative.
+#[allow(clippy::too_many_arguments)]
+fn tolerance_op_cost(
+    feature_graph: &FeatureGraph,
+    target_tolerance: ToleranceRange,
+    material_cost: f64,
+    machining_cost: f64,
+    base_finish_min: f64,
+    effective_rate_eur_per_min: f64,
+    machine_rates: &[MachineRate],
+    tolerance_cost_rates: &[ToleranceCostRate],
+    log: &mut Vec<String>,
+) -> f64 {
+    // Inert guard: no rate table ⇒ never entered ⇒ 0.0, NO log line ⇒ today's
+    // exact bytes (the golden's `tolerance = Standard`, empty-slice path).
+    if tolerance_cost_rates.is_empty() {
+        return 0.0;
+    }
+
+    // Resolve the governing band: the tightest of the resolved overall band and
+    // every per-critical-feature callout. Per-drawing flags review; it never
+    // silently tightens (Q5) — its band is the default.
+    let mut governing = target_tolerance;
+    let n_critical = feature_graph.critical_feature_tolerances.len();
+    for ft in &feature_graph.critical_feature_tolerances {
+        let nominal = feature_graph
+            .features
+            .get(ft.feature_index)
+            .map(|f| f.representative_size_mm)
+            .unwrap_or(0.0);
+        let nt = normalize_tolerance(ft.spec, nominal);
+        log.push(format!(
+            "[tolerance] critical feature #{idx}: {reason}",
+            idx = ft.feature_index,
+            reason = nt.reason,
+        ));
+        if nt.manual_review {
+            log.push(format!(
+                "[tolerance] critical feature #{idx} -> MANUAL REVIEW (per-drawing GD&T; priced at default band, not silently tightened)",
+                idx = ft.feature_index,
+            ));
+        }
+        if nt.band > governing {
+            governing = nt.band;
+        }
+    }
+
+    // Look up the governing band's rate row; fail-soft + loud if absent.
+    let Some(rate) = tolerance_cost_rates
+        .iter()
+        .find(|r| r.tolerance_class == governing.as_db_str())
+    else {
+        log.push(format!(
+            "[tolerance] WARNING no ToleranceCostRate row for band={band} -> tolerance_cost 0.0000 EUR (seed quoting_tolerance_cost_rates)",
+            band = governing.as_db_str(),
+        ));
+        return 0.0;
+    };
+
+    log.push(format!(
+        "[tolerance] governing band={band} (resolved target={tgt}, {n} critical-feature callout(s)) -> rate row matched",
+        band = governing.as_db_str(),
+        tgt = target_tolerance.as_db_str(),
+        n = n_critical,
+    ));
+
+    // Term 1 — per-critical-feature in-process gauging + CMM minutes.
+    let per_feature_min = rate.inproc_inspection_min + rate.cmm_min_per_critical_feature;
+    let inspection_min = per_feature_min * (n_critical as f64);
+    let inspection_cost = inspection_min * effective_rate_eur_per_min;
+    log.push(format!(
+        "[tolerance] inspection = ({ip:.4} in-proc + {cmm:.4} CMM) min/feat * {n} feat = {im:.4} min * rate={r:.4} EUR/min = {c:.4} EUR",
+        ip = rate.inproc_inspection_min,
+        cmm = rate.cmm_min_per_critical_feature,
+        n = n_critical,
+        im = inspection_min,
+        r = effective_rate_eur_per_min,
+        c = inspection_cost,
+    ));
+
+    // Term 2 — extra slower-feed finishing passes (whole-part).
+    let finish_min = rate.finish_passes_add * base_finish_min * rate.feed_slowdown_factor;
+    let finish_cost = finish_min * effective_rate_eur_per_min;
+    log.push(format!(
+        "[tolerance] finishing = finish_passes_add={fpa:.4} * base_finish_min={bfm:.4} * feed_slowdown={fsf:.4} = {fm:.4} min * rate={r:.4} EUR/min = {c:.4} EUR",
+        fpa = rate.finish_passes_add,
+        bfm = base_finish_min,
+        fsf = rate.feed_slowdown_factor,
+        fm = finish_min,
+        r = effective_rate_eur_per_min,
+        c = finish_cost,
+    ));
+
+    // Term 3 — tightest-band grinding escalation (per critical feature).
+    let is_tightest = governing == ToleranceRange::UltraPrecision;
+    let grinding_cost = if rate.grinding_escalation && is_tightest && n_critical > 0 {
+        let grinder_rate = machine_rates
+            .iter()
+            .find(|r| r.family == MachineFamily::Grinder.as_db_str())
+            .map(|r| r.attended_rate_eur_per_min)
+            .unwrap_or(effective_rate_eur_per_min);
+        let grinding_min = GRINDING_ESCALATION_MIN_PER_CRITICAL_FEATURE * (n_critical as f64);
+        let c = grinding_min * grinder_rate;
+        log.push(format!(
+            "[tolerance] grinding escalation (band={band}): {gm:.4} min ({per:.4}/feat * {n} feat) * grinder_rate={gr:.4} EUR/min = {c:.4} EUR",
+            band = governing.as_db_str(),
+            gm = grinding_min,
+            per = GRINDING_ESCALATION_MIN_PER_CRITICAL_FEATURE,
+            n = n_critical,
+            gr = grinder_rate,
+            c = c,
+        ));
+        c
+    } else {
+        0.0
+    };
+
+    // Term 4 — scrap / rework uplift on (material + machining).
+    let scrap_cost = rate.rework_scrap_pct * (material_cost + machining_cost);
+    log.push(format!(
+        "[tolerance] scrap/rework = rework_scrap_pct={rsp:.4} * (material={m:.4} + machining={mc:.4}) = {c:.4} EUR",
+        rsp = rate.rework_scrap_pct,
+        m = material_cost,
+        mc = machining_cost,
+        c = scrap_cost,
+    ));
+
+    let tolerance_cost = (inspection_cost + finish_cost + grinding_cost + scrap_cost).max(0.0);
+    log.push(format!(
+        "[tolerance] total tolerance_cost={tc:.4} EUR",
+        tc = tolerance_cost,
+    ));
+    tolerance_cost
 }
