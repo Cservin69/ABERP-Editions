@@ -4285,6 +4285,123 @@ mod tests {
         assert_eq!(g.stock_form, StockForm::RectangularBlock);
     }
 
+    // ── T4 / ADR-0097 Part 2 — per-job tolerance stamp precedence (pure) ──
+    #[test]
+    fn operator_tolerance_inert_inputs_yield_none() {
+        // NULL / empty / "{}" / an all-default payload ⇒ no operator override.
+        assert!(operator_tolerance(None).unwrap().is_none());
+        assert!(operator_tolerance(Some("")).unwrap().is_none());
+        assert!(operator_tolerance(Some("   ")).unwrap().is_none());
+        assert!(operator_tolerance(Some("{}")).unwrap().is_none());
+        let inert = serde_json::to_string(&PerJobTolerance::default()).unwrap();
+        assert!(operator_tolerance(Some(&inert)).unwrap().is_none());
+        // A malformed payload is real corruption ⇒ hard error (fail loud).
+        assert!(operator_tolerance(Some("{not json")).is_err());
+    }
+
+    #[test]
+    fn operator_tolerance_reads_a_real_spec() {
+        let t = PerJobTolerance {
+            overall: ToleranceSpec::ItGrade { grade: 7 },
+            critical_features: Vec::new(),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let got = operator_tolerance(Some(&json))
+            .unwrap()
+            .expect("a real spec");
+        assert_eq!(got.overall, ToleranceSpec::ItGrade { grade: 7 });
+    }
+
+    #[test]
+    fn tolerance_stamp_operator_beats_extractor_hint() {
+        // Graph arrives with an extractor hint (IT14, loose); operator forces IT7.
+        let mut g = mk_graph(StockForm::RectangularBlock);
+        g.tolerance = ToleranceSpec::ItGrade { grade: 14 };
+        let op = Some(PerJobTolerance {
+            overall: ToleranceSpec::ItGrade { grade: 7 },
+            critical_features: Vec::new(),
+        });
+        let stamp = stamp_tolerance(&mut g, op);
+        assert_eq!(stamp.source, "operator");
+        assert_eq!(g.tolerance, ToleranceSpec::ItGrade { grade: 7 });
+        let nominal = g.bounding_box_mm.iter().copied().fold(0.0_f64, f64::max);
+        assert_eq!(
+            stamp.resolved_band,
+            Some(engine::tightness(
+                ToleranceSpec::ItGrade { grade: 7 },
+                nominal
+            ))
+        );
+        assert!(!stamp.manual_review);
+    }
+
+    #[test]
+    fn tolerance_stamp_extractor_hint_beats_default() {
+        // No operator field, but the extractor already wrote a spec onto the
+        // graph: keep it, provenance "extractor", resolved via engine::tightness.
+        let mut g = mk_graph(StockForm::RectangularBlock);
+        g.tolerance = ToleranceSpec::ItGrade { grade: 7 };
+        let stamp = stamp_tolerance(&mut g, None);
+        assert_eq!(stamp.source, "extractor");
+        let nominal = g.bounding_box_mm.iter().copied().fold(0.0_f64, f64::max);
+        assert_eq!(
+            stamp.resolved_band,
+            Some(engine::tightness(
+                ToleranceSpec::ItGrade { grade: 7 },
+                nominal
+            ))
+        );
+    }
+
+    #[test]
+    fn tolerance_stamp_inert_when_no_operator_and_no_hint() {
+        // The inert default: no operator field, graph carries Unspecified + no
+        // callouts ⇒ "default" / resolved_band None ⇒ caller keeps its own
+        // default_tolerance ⇒ byte-identical pricing.
+        let mut g = mk_graph(StockForm::RectangularBlock);
+        let stamp = stamp_tolerance(&mut g, None);
+        assert_eq!(stamp.source, "default");
+        assert_eq!(stamp.resolved_band, None);
+        assert!(!stamp.manual_review);
+        assert!(g.tolerance.is_unspecified());
+        assert!(g.critical_feature_tolerances.is_empty());
+    }
+
+    #[test]
+    fn tolerance_stamp_per_drawing_flags_manual_review_without_tightening() {
+        // Per-drawing (GD&T) raises the manual-review flag and resolves to the
+        // DEFAULT band (Standard) — never silently tightened (ADR-0097 Q5).
+        let mut g = mk_graph(StockForm::RectangularBlock);
+        let op = Some(PerJobTolerance {
+            overall: ToleranceSpec::PerDrawing,
+            critical_features: Vec::new(),
+        });
+        let stamp = stamp_tolerance(&mut g, op);
+        assert_eq!(stamp.source, "operator");
+        assert!(stamp.manual_review);
+        assert_eq!(stamp.resolved_band, Some(ToleranceRange::Standard));
+    }
+
+    #[test]
+    fn tolerance_stamp_critical_callout_only_keeps_overall_default() {
+        // A per-critical-feature callout with an Unspecified overall: the overall
+        // band stays the caller default (resolved_band None) but the callout is
+        // stamped onto the graph and its per-drawing flag is surfaced.
+        let mut g = mk_graph(StockForm::RectangularBlock);
+        let op = Some(PerJobTolerance {
+            overall: ToleranceSpec::Unspecified,
+            critical_features: vec![FeatureTolerance {
+                feature_index: 0,
+                spec: ToleranceSpec::PerDrawing,
+            }],
+        });
+        let stamp = stamp_tolerance(&mut g, op);
+        assert_eq!(stamp.source, "operator");
+        assert_eq!(stamp.resolved_band, None);
+        assert!(stamp.manual_review);
+        assert_eq!(g.critical_feature_tolerances.len(), 1);
+    }
+
     #[test]
     fn backoff_follows_5_15_60_then_cadence() {
         let cadence = Duration::from_secs(60);
