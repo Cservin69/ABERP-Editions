@@ -341,6 +341,20 @@ ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS machine_family_override 
 -- per part doesn't fit flat columns), no DEFAULT per [[no-sql-specific]];
 -- idempotent via ADD COLUMN IF NOT EXISTS.
 ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS gear_ops_json VARCHAR;
+-- T4 / ADR-0097 Part 2 (wiring) — operator/extractor-supplied per-job tolerance.
+-- `tolerance_class` = the resolved overall ToleranceRange band db-string
+-- ('loose'|'standard'|'tight'|'precision'|'ultra_precision'), denormalised for
+-- display/audit. `tolerance_spec_json` = the structured spec the pipeline
+-- restamps onto the FeatureGraph: a JSON object { overall: ToleranceSpec,
+-- critical_features: [FeatureTolerance] } (engine wire shapes).
+-- `tolerance_manual_review` = the per-drawing (GD&T) review flag. All NULL ⇒
+-- unset: the pipeline keeps the FeatureGraph's Unspecified default and the
+-- daemon's default_tolerance, so the quote prices byte-identically to today
+-- (inert). Nullable, no DEFAULT per [[no-sql-specific]]; idempotent via
+-- ADD COLUMN IF NOT EXISTS.
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS tolerance_class VARCHAR;
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS tolerance_spec_json VARCHAR;
+ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS tolerance_manual_review BOOLEAN;
 ";
 
 /// Idempotent — call at every writer entry.
@@ -1294,6 +1308,18 @@ pub struct JobDetail {
     /// module stays free of engine types); the pipeline deserializes it into
     /// `FeatureGraph.gears`.
     pub gear_ops_json: Option<String>,
+    /// T4 / ADR-0097 Part 2 — resolved overall tolerance band db-string
+    /// (denormalised, for display/audit); NULL = unset ⇒ inert.
+    pub tolerance_class: Option<String>,
+    /// T4 / ADR-0097 Part 2 — structured per-job tolerance spec as the raw JSON
+    /// string `{ overall: ToleranceSpec, critical_features: [FeatureTolerance] }`
+    /// (engine wire shapes); NULL/empty ⇒ no override ⇒ inert. Kept as the raw
+    /// DB string here (this module stays free of engine types); the pipeline
+    /// deserializes it and re-stamps the graph.
+    pub tolerance_spec_json: Option<String>,
+    /// T4 / ADR-0097 Part 2 — per-drawing (GD&T) manual-review flag
+    /// (coerced from NULL → None ⇒ treated as false by consumers).
+    pub tolerance_manual_review: Option<bool>,
 }
 
 /// S349 / PR-40 (U1) — read one job row + its artifacts for the detail
@@ -1318,7 +1344,8 @@ pub fn get_job_detail(
                     lead_time_days, lead_time_override_days,
                     buyer_partner_id, margin_override_pct, margin_below_floor, margin_floor_pct,
                     stock_form, stock_od_mm, stock_id_mm, stock_length_mm,
-                    machine_family_override, gear_ops_json
+                    machine_family_override, gear_ops_json,
+                    tolerance_class, tolerance_spec_json, tolerance_manual_review
                 FROM quote_pricing_jobs
                 WHERE quote_id = ? AND tenant_id = ?",
         )
@@ -1382,6 +1409,9 @@ pub fn get_job_detail(
         stock_length_mm: r.get::<_, Option<f64>>(30).ok().flatten(),
         machine_family_override: r.get::<_, Option<String>>(31).ok().flatten(),
         gear_ops_json: r.get::<_, Option<String>>(32).ok().flatten(),
+        tolerance_class: r.get::<_, Option<String>>(33).ok().flatten(),
+        tolerance_spec_json: r.get::<_, Option<String>>(34).ok().flatten(),
+        tolerance_manual_review: r.get::<_, Option<bool>>(35).ok().flatten(),
     }))
 }
 
@@ -1580,6 +1610,45 @@ pub fn set_gear_ops(
             params![gear_ops_json, ts, quote_id, tenant_id],
         )
         .context("set_gear_ops UPDATE")?;
+    Ok(changed > 0)
+}
+
+/// T4 / ADR-0097 Part 2 — set or clear the operator's per-quote tolerance.
+/// `tolerance_class` is the resolved overall band db-string (denormalised),
+/// `tolerance_spec_json` the structured spec the pipeline restamps onto the
+/// graph (`{ overall, critical_features }`), and `tolerance_manual_review` the
+/// per-drawing GD&T flag. Pass `None` for each to clear back to the inert
+/// default (FeatureGraph Unspecified + daemon default_tolerance). Returns
+/// `false` if no such row exists. Mirrors [`set_gear_ops`]; the daemon's next
+/// pricing pass (and the in-place re-price) re-reads these columns and
+/// re-stamps the tolerance.
+pub fn set_tolerance(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    tolerance_class: Option<&str>,
+    tolerance_spec_json: Option<&str>,
+    tolerance_manual_review: Option<bool>,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    ensure_schema(conn)?;
+    let ts = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("format tolerance updated_at")?;
+    let changed = conn
+        .execute(
+            "UPDATE quote_pricing_jobs SET tolerance_class = ?, tolerance_spec_json = ?, \
+             tolerance_manual_review = ?, updated_at = ? WHERE quote_id = ? AND tenant_id = ?",
+            params![
+                tolerance_class,
+                tolerance_spec_json,
+                tolerance_manual_review,
+                ts,
+                quote_id,
+                tenant_id
+            ],
+        )
+        .context("set_tolerance UPDATE")?;
     Ok(changed > 0)
 }
 

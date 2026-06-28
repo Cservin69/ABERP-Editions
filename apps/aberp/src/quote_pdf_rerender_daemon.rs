@@ -1164,6 +1164,8 @@ mod tests {
             requires_5_axis: false,
             thin_wall_present: false,
             stock_form: aberp_quote_engine::StockForm::RectangularBlock,
+            tolerance: aberp_quote_engine::ToleranceSpec::Unspecified,
+            critical_feature_tolerances: Vec::new(),
         };
         serde_json::to_string(&g).unwrap()
     }
@@ -1171,6 +1173,7 @@ mod tests {
     fn sample_breakdown_json() -> String {
         let b = QuoteBreakdown {
             gear_cost: 0.0,
+            tolerance_cost: 0.0,
             material_cost: 1.23,
             machining_cost: 9.87,
             cad_cam_cost: 2.10,

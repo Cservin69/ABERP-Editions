@@ -547,6 +547,7 @@ mod tests {
         let conn = Connection::open(db).unwrap();
         let bd = QuoteBreakdown {
             gear_cost: 0.0,
+            tolerance_cost: 0.0,
             material_cost: 0.0,
             machining_cost: 0.0,
             cad_cam_cost: 0.0,

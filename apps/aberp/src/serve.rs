@@ -1539,6 +1539,19 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             .context("ensure quoting_gear_processes schema at serve boot")?;
         crate::quoting_gear_processes::seed_gear_processes_if_absent(&conn, tenant.as_str())
             .context("seed quoting_gear_processes at serve boot")?;
+        // T4 / ADR-0097 Part 2 — tolerance cost-rate catalogue: idempotent
+        // schema + five-band ZERO-CONTRIBUTION seed (insert-if-absent). The
+        // pricing pipeline snapshots this into the engine's
+        // `CatalogueSnapshot.tolerance_cost_rates`. The seed moves no money
+        // (every row contributes 0.0 EUR until the operator tunes it, R4);
+        // existing quotes are untouched.
+        crate::quoting_tolerance_cost_rates::ensure_schema(&conn)
+            .context("ensure quoting_tolerance_cost_rates schema at serve boot")?;
+        crate::quoting_tolerance_cost_rates::seed_tolerance_cost_rates_if_absent(
+            &conn,
+            tenant.as_str(),
+        )
+        .context("seed quoting_tolerance_cost_rates at serve boot")?;
     }
 
     // S232 / PR-228 / ADR-0062 — pin the work-orders schema at boot
