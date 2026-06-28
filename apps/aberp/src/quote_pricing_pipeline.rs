@@ -1059,6 +1059,8 @@ impl PricingPipelineService {
                     stock_adjustments: &engine_stock_adjustments,
                     machine_rates: &engine_machine_rates,
                     gear_process_rates: &engine_gear_process_rates,
+                    // ADR-0097 T3 (inert): empty rate slice until T4 wires quoting_tolerance_cost_rates.
+                    tolerance_cost_rates: &[],
                 },
                 &engine_params,
                 qty,
@@ -3152,6 +3154,8 @@ pub fn reprice_quote(
             stock_adjustments: &engine_stock_adjustments,
             machine_rates: &engine_machine_rates,
             gear_process_rates: &engine_gear_process_rates,
+            // ADR-0097 T3 (inert): empty rate slice until T4 wires quoting_tolerance_cost_rates.
+            tolerance_cost_rates: &[],
         },
         &engine_params,
         qty,

@@ -7,7 +7,7 @@
 use aberp_quote_engine::{
     CatalogueSnapshot, ComplexityRule, Feature, FeatureGraph, FeatureType, GearProcessRate,
     MachineRate, Material, QuotingParameters, StockAdjustment, StockForm, StockStatus,
-    ToleranceMultiplier, ToleranceRange, ToleranceSpec,
+    ToleranceCostRate, ToleranceMultiplier, ToleranceRange, ToleranceSpec,
 };
 
 pub fn default_material(grade: &str) -> Material {
@@ -173,6 +173,7 @@ pub struct CatalogueFixture {
     pub stock_adjustments: Vec<StockAdjustment>,
     pub machine_rates: Vec<MachineRate>,
     pub gear_process_rates: Vec<GearProcessRate>,
+    pub tolerance_cost_rates: Vec<ToleranceCostRate>,
 }
 
 impl CatalogueFixture {
@@ -188,6 +189,7 @@ impl CatalogueFixture {
             stock_adjustments: no_stock_adjustments(),
             machine_rates: Vec::new(),
             gear_process_rates: Vec::new(),
+            tolerance_cost_rates: Vec::new(),
         }
     }
 
@@ -200,6 +202,7 @@ impl CatalogueFixture {
             stock_adjustments: &self.stock_adjustments,
             machine_rates: &self.machine_rates,
             gear_process_rates: &self.gear_process_rates,
+            tolerance_cost_rates: &self.tolerance_cost_rates,
         }
     }
 }
