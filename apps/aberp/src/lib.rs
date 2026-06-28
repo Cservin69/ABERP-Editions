@@ -150,6 +150,9 @@ pub mod quoting_gear_processes;
 pub mod quoting_machine_rates;
 pub mod quoting_machines;
 pub mod quoting_materials;
+// T4 / ADR-0097 Part 2 — operator-managed tolerance cost-rate catalogue feeding
+// the engine's `tolerance_cost` line (mirrors quoting_machine_rates / quoting_gear_processes).
+pub mod quoting_tolerance_cost_rates;
 // S267 / PR-256 — four tunable tables feeding the future
 // `aberp-quote-engine`: complexity rules, tolerance multipliers, the
 // global parameters singleton, and per-material × stock-status price
