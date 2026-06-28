@@ -324,7 +324,7 @@ fs2 = "0.4"
 #
 # `lopdf` is the low-level Rust PDF document model — page tree, content
 # streams, font dictionaries, all the PDF primitives. Default features
-# include `chrono_time` + `nom_parser` + `rayon`; we don't need any of
+# include `chrono`, `jiff`, `rayon`, `time`; we don't need any of
 # them at the printed-invoice render boundary (we don't parse PDFs, we
 # don't date-stamp documents server-side, and the renderer is per-
 # invoice synchronous). `default-features = false` keeps the dep tree
@@ -337,8 +337,18 @@ fs2 = "0.4"
 # carry every §1.a field's text content (ADR-0037 §4 invariant C7's
 # print-render slice). Dev-dependency only — the production renderer
 # does not parse the bytes it emits.
-lopdf = { version = "0.34", default-features = false, features = ["nom_parser"] }
-pdf-extract = "0.7"
+# RUSTSEC-2026-0187 — bumped lopdf 0.34 -> 0.42 to clear the stack-overflow
+# DoS advisory (fixed in >=0.42). In 0.42 the nom parser is non-optional
+# (the `nom_parser` feature was removed) and chrono/jiff/rayon/time moved
+# behind default features the renderer does not use, so the pin is simply
+# `default-features = false` now: the always-on nom parser still backs
+# `Document::load_mem`, and no chrono/jiff/time/rayon is pulled.
+lopdf = { version = "0.42", default-features = false }
+# pdf-extract 0.12 is the first release whose `lopdf` dependency is >=0.42,
+# so it unifies on the SAME non-vulnerable lopdf 0.42 as the renderers
+# (no second, vulnerable lopdf 0.34 pulled transitively) — cargo-deny's
+# advisory check then passes cleanly. `extract_text_from_mem` is unchanged.
+pdf-extract = "0.12"
 
 # PR-176 — PNG decode for tenant-logo embedding on the printed-invoice
 # PDF header (convention `~/.aberp/<tenant>/logo.png`). Pure-Rust PNG

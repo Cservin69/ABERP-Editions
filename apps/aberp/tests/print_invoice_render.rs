@@ -224,7 +224,7 @@ fn pdf_page_count(path: &Path) -> u32 {
         .get(b"Root")
         .and_then(|o| match o {
             Object::Reference(id) => Ok(*id),
-            _ => Err(lopdf::Error::ObjectNotFound),
+            _ => Err(lopdf::Error::ObjectNotFound((0, 0))),
         })
         .expect("catalog reference");
     let catalog = doc.get_object(catalog_id).expect("catalog object");
@@ -442,12 +442,15 @@ fn pdf_has_image_xobject(path: &Path, name: &str) -> bool {
         .get(b"Root")
         .and_then(|o| match o {
             Object::Reference(id) => Ok(*id),
-            _ => Err(lopdf::Error::ObjectNotFound),
+            _ => Err(lopdf::Error::ObjectNotFound((0, 0))),
         })
         .expect("catalog reference");
     let catalog_dict = doc
         .get_object(catalog_id)
-        .and_then(|o| o.as_dict().map_err(|_| lopdf::Error::ObjectNotFound))
+        .and_then(|o| {
+            o.as_dict()
+                .map_err(|_| lopdf::Error::ObjectNotFound((0, 0)))
+        })
         .expect("catalog dict");
     let pages_id = match catalog_dict.get(b"Pages").expect("Pages ref") {
         Object::Reference(id) => *id,
@@ -455,13 +458,19 @@ fn pdf_has_image_xobject(path: &Path, name: &str) -> bool {
     };
     let pages_dict = doc
         .get_object(pages_id)
-        .and_then(|o| o.as_dict().map_err(|_| lopdf::Error::ObjectNotFound))
+        .and_then(|o| {
+            o.as_dict()
+                .map_err(|_| lopdf::Error::ObjectNotFound((0, 0)))
+        })
         .expect("Pages dict");
     let resources_obj = pages_dict.get(b"Resources").expect("Resources");
     let resources_dict = match resources_obj {
         Object::Reference(id) => doc
             .get_object(*id)
-            .and_then(|o| o.as_dict().map_err(|_| lopdf::Error::ObjectNotFound))
+            .and_then(|o| {
+                o.as_dict()
+                    .map_err(|_| lopdf::Error::ObjectNotFound((0, 0)))
+            })
             .expect("Resources dict"),
         Object::Dictionary(d) => d,
         _ => panic!("Resources unexpected shape"),
@@ -470,7 +479,10 @@ fn pdf_has_image_xobject(path: &Path, name: &str) -> bool {
         Ok(Object::Dictionary(d)) => d,
         Ok(Object::Reference(id)) => doc
             .get_object(*id)
-            .and_then(|o| o.as_dict().map_err(|_| lopdf::Error::ObjectNotFound))
+            .and_then(|o| {
+                o.as_dict()
+                    .map_err(|_| lopdf::Error::ObjectNotFound((0, 0)))
+            })
             .expect("XObject dict"),
         _ => return false,
     };
