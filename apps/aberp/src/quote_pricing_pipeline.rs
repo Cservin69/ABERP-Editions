@@ -68,10 +68,12 @@ use aberp_audit_ledger::{
 };
 use aberp_cad_extract_wrapper::{CadExtractor, ExtractRequest};
 use aberp_quote_engine::{
-    self as engine, ComplexityRule as EngineComplexityRule, FeatureGraph, GearOp, GearProcess,
-    GearProcessRate as EngineGearProcessRate, MachineFamily, MachineRate as EngineMachineRate,
-    Material as EngineMaterial, QuoteBreakdown, QuotingParameters, StockAdjustment, StockForm,
-    StockStatus, ToleranceMultiplier, ToleranceRange,
+    self as engine, ComplexityRule as EngineComplexityRule, FeatureGraph, FeatureTolerance, GearOp,
+    GearProcess, GearProcessRate as EngineGearProcessRate, MachineFamily,
+    MachineRate as EngineMachineRate, Material as EngineMaterial, QuoteBreakdown,
+    QuotingParameters, StockAdjustment, StockForm, StockStatus,
+    ToleranceCostRate as EngineToleranceCostRate, ToleranceMultiplier, ToleranceRange,
+    ToleranceSpec,
 };
 use aberp_quote_pdf::QuoteInputs;
 
@@ -169,6 +171,122 @@ fn stamp_gear_ops(graph: &mut FeatureGraph, operator: Option<Vec<GearOp>>) -> &'
         }
         None if !graph.gears.is_empty() => "extractor",
         None => "default",
+    }
+}
+
+/// T4 / ADR-0097 Part 2 (wiring) — the operator's per-job tolerance override,
+/// as persisted in `quote_pricing_jobs.tolerance_spec_json`. Mirrors the
+/// engine's `FeatureGraph` tolerance shape split across two fields: the part's
+/// overall [`ToleranceSpec`] and the per-critical-feature [`FeatureTolerance`]
+/// callouts. Both `#[serde(default)]` so a partial/legacy blob still decodes
+/// inert.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PerJobTolerance {
+    #[serde(default)]
+    overall: ToleranceSpec,
+    #[serde(default)]
+    critical_features: Vec<FeatureTolerance>,
+}
+
+impl PerJobTolerance {
+    /// `true` when this override carries no signal (overall Unspecified AND no
+    /// callouts) — treated as "no operator override" so it leaves the graph's
+    /// extractor hint / default untouched (inert).
+    fn is_inert(&self) -> bool {
+        self.overall.is_unspecified() && self.critical_features.is_empty()
+    }
+}
+
+/// T4 / ADR-0097 Part 2 (wiring) — reconstruct the operator-entered per-job
+/// tolerance from the persisted `tolerance_spec_json` column. `None` / empty /
+/// `"{}"` / an all-default payload ⇒ `None` (no operator override: the graph
+/// keeps its extractor hint or Unspecified default). A present-but-malformed
+/// payload is a hard error — fail loud (CLAUDE.md rule 12); the route layer
+/// (T5) validates the closed vocab before persisting, so a malformed blob here
+/// is real corruption, not operator input. Mirrors [`operator_gear_ops`].
+/// Pure + total.
+fn operator_tolerance(json: Option<&str>) -> Result<Option<PerJobTolerance>> {
+    let Some(raw) = json else { return Ok(None) };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return Ok(None);
+    }
+    let parsed: PerJobTolerance =
+        serde_json::from_str(trimmed).context("decode operator tolerance_spec_json")?;
+    if parsed.is_inert() {
+        Ok(None)
+    } else {
+        Ok(Some(parsed))
+    }
+}
+
+/// The resolved per-job tolerance after precedence + normalisation — handed to
+/// the engine call (`resolved_band` → the `target_tolerance` arg when present)
+/// and to the pricing audit (`source`, `manual_review`).
+struct ToleranceStamp {
+    /// Provenance: "operator" | "extractor" | "default".
+    source: &'static str,
+    /// The resolved overall band when an operator/extractor spec is present;
+    /// `None` ⇒ the caller keeps its own default (daemon `default_tolerance` /
+    /// reprice `Standard`), so an un-toleranced part prices byte-identically.
+    resolved_band: Option<ToleranceRange>,
+    /// `true` if the overall spec or any critical-feature callout is per-drawing
+    /// GD&T (raise the manual-review banner; never silently tightened — Q5).
+    manual_review: bool,
+}
+
+/// T4 / ADR-0097 Part 2 (wiring) — stamp the per-job tolerance onto `graph` with
+/// precedence **operator override > extractor hint (already on the graph) >
+/// Unspecified default**, mirroring [`stamp_stock_form`] / [`stamp_gear_ops`].
+/// Returns the resolved overall band (for the engine `target_tolerance` arg)
+/// plus provenance + the manual-review flag for the audit.
+///
+/// The engine reads the overall band only via its `target_tolerance` argument
+/// (it does NOT read `graph.tolerance`); the wiring is the documented home of
+/// the spec→band normalisation ([`engine::tightness`]). The per-critical-feature
+/// callouts ARE read off `graph.critical_feature_tolerances`, so we stamp those
+/// onto the graph. An operator override of `None` leaves both graph fields
+/// untouched ⇒ a part with no tolerance signal keeps its Unspecified default ⇒
+/// the caller's `default_tolerance` ⇒ byte-identical pricing.
+fn stamp_tolerance(graph: &mut FeatureGraph, operator: Option<PerJobTolerance>) -> ToleranceStamp {
+    let source = match operator {
+        Some(t) => {
+            graph.tolerance = t.overall;
+            graph.critical_feature_tolerances = t.critical_features;
+            "operator"
+        }
+        None if !graph.tolerance.is_unspecified()
+            || !graph.critical_feature_tolerances.is_empty() =>
+        {
+            "extractor"
+        }
+        None => "default",
+    };
+    // Whole-part nominal for a `ToleranceSpec::PlusMinus` overall (size-aware
+    // ISO 286). The engine's per-feature path uses each feature's
+    // `representative_size_mm`; for the part-level overall we use the largest
+    // bounding-box extent as the characteristic size. FLAG: a judgment call for
+    // the rare whole-part ± case (inert by default — overall defaults to
+    // Unspecified, where the nominal is unused by `tightness`).
+    let part_nominal = graph
+        .bounding_box_mm
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max);
+    let resolved_band = if graph.tolerance.is_unspecified() {
+        None
+    } else {
+        Some(engine::tightness(graph.tolerance, part_nominal))
+    };
+    let manual_review = graph.tolerance.requires_manual_review()
+        || graph
+            .critical_feature_tolerances
+            .iter()
+            .any(|ft| ft.spec.requires_manual_review());
+    ToleranceStamp {
+        source,
+        resolved_band,
+        manual_review,
     }
 }
 
@@ -956,6 +1074,7 @@ impl PricingPipelineService {
                 operator_form,
                 machine_family_override,
                 gear_ops_json,
+                tolerance_spec_json,
             ) = match jobs::get_job_detail(&conn, &quote_id, &tenant_id_string)? {
                 Some(d) => (
                     d.buyer_partner_id,
@@ -968,8 +1087,9 @@ impl PricingPipelineService {
                     ),
                     d.machine_family_override,
                     d.gear_ops_json,
+                    d.tolerance_spec_json,
                 ),
-                None => (None, None, None, None, None),
+                None => (None, None, None, None, None, None),
             };
             // ADR-0094 Gap 1 (S2 wiring) — stamp the chosen stock form onto
             // the graph BEFORE the engine call (now `quote_with_shop_model`,
@@ -1050,6 +1170,28 @@ impl PricingPipelineService {
                     .context("load gear processes")?;
             let engine_gear_process_rates = convert_gear_process_rates(&gear_process_rows);
 
+            // ── ADR-0097 Part 2 (T4 wiring) — per-job tolerance ──────────
+            // Stamp the operator's tolerance onto the graph (precedence
+            // operator > extractor hint > Unspecified default), resolve the
+            // overall band into the engine's `target_tolerance` arg (the engine
+            // reads the overall band only via that arg, not `graph.tolerance`),
+            // and snapshot the cost-rate catalogue. An unset override leaves the
+            // Unspecified default ⇒ `target_tol` stays `default_tolerance` and a
+            // zero/empty rate table adds no `tolerance_cost` ⇒ byte-identical.
+            let tolerance_stamp = stamp_tolerance(
+                &mut graph,
+                operator_tolerance(tolerance_spec_json.as_deref())?,
+            );
+            let target_tol = tolerance_stamp.resolved_band.unwrap_or(target_tol);
+            let tolerance_cost_rate_rows =
+                crate::quoting_tolerance_cost_rates::list_tolerance_cost_rates(
+                    &conn,
+                    &tenant_id_string,
+                )
+                .context("load tolerance cost rates")?;
+            let engine_tolerance_cost_rates =
+                convert_tolerance_cost_rates(&tolerance_cost_rate_rows);
+
             match engine::quote_with_catalogue(
                 &graph,
                 &engine::CatalogueSnapshot {
@@ -1059,8 +1201,9 @@ impl PricingPipelineService {
                     stock_adjustments: &engine_stock_adjustments,
                     machine_rates: &engine_machine_rates,
                     gear_process_rates: &engine_gear_process_rates,
-                    // ADR-0097 T3 (inert): empty rate slice until T4 wires quoting_tolerance_cost_rates.
-                    tolerance_cost_rates: &[],
+                    // ADR-0097 Part 2 (T4): operator-tunable tolerance cost-rate
+                    // catalogue. Empty/zero-seeded ⇒ tolerance_cost = 0.0.
+                    tolerance_cost_rates: &engine_tolerance_cost_rates,
                 },
                 &engine_params,
                 qty,
@@ -1255,6 +1398,22 @@ impl PricingPipelineService {
                                 module_exponent: r.module_exponent,
                                 agma_quality_factor_base: r.agma_quality_factor_base,
                                 in_cycle_factor: r.in_cycle_factor,
+                            })
+                            .collect(),
+                        tolerance_cost_eur: breakdown.tolerance_cost,
+                        tolerance_source: tolerance_stamp.source.to_string(),
+                        resolved_tolerance_band: target_tol.as_db_str().to_string(),
+                        tolerance_manual_review: tolerance_stamp.manual_review,
+                        tolerance_cost_rate_snapshot: engine_tolerance_cost_rates
+                            .iter()
+                            .map(|r| ToleranceCostRateAudit {
+                                tolerance_class: r.tolerance_class.clone(),
+                                finish_passes_add: r.finish_passes_add,
+                                inproc_inspection_min: r.inproc_inspection_min,
+                                cmm_min_per_critical_feature: r.cmm_min_per_critical_feature,
+                                rework_scrap_pct: r.rework_scrap_pct,
+                                feed_slowdown_factor: r.feed_slowdown_factor,
+                                grinding_escalation: r.grinding_escalation,
                             })
                             .collect(),
                         actor: "system".to_string(),
@@ -2935,6 +3094,28 @@ fn convert_gear_process_rates(
         .collect()
 }
 
+/// T4 / ADR-0097 Part 2 — snapshot the local tolerance-cost-rate rows into the
+/// engine's `ToleranceCostRate` slice. Mirrors [`convert_machine_rates`] /
+/// [`convert_gear_process_rates`]. An empty result (no rows) ⇒ the engine's
+/// additive `tolerance_cost` path is never entered ⇒ today's price. Rows are
+/// validated on write (`quoting_tolerance_cost_rates::validate_tolerance_cost_rate_inputs`).
+fn convert_tolerance_cost_rates(
+    locals: &[crate::quoting_tolerance_cost_rates::ToleranceCostRateRow],
+) -> Vec<EngineToleranceCostRate> {
+    locals
+        .iter()
+        .map(|r| EngineToleranceCostRate {
+            tolerance_class: r.tolerance_class.clone(),
+            finish_passes_add: r.finish_passes_add,
+            inproc_inspection_min: r.inproc_inspection_min,
+            cmm_min_per_critical_feature: r.cmm_min_per_critical_feature,
+            rework_scrap_pct: r.rework_scrap_pct,
+            feed_slowdown_factor: r.feed_slowdown_factor,
+            grinding_escalation: r.grinding_escalation,
+        })
+        .collect()
+}
+
 /// S4 / ADR-0094 Gap 2 — outer diameter (mm) of a turned/round stock form,
 /// for the wiring's `route_family` call (mirrors the engine's private
 /// `stock_od_mm`). A prismatic block has no turning OD ⇒ 0.0.
@@ -3145,6 +3326,27 @@ pub fn reprice_quote(
     let gear_process_rows = crate::quoting_gear_processes::list_gear_processes(conn, tenant)?;
     let engine_gear_process_rates = convert_gear_process_rates(&gear_process_rows);
 
+    // ── ADR-0097 Part 2 (T4) — fix the "reprice hardcodes Standard" defect.
+    // Read the stored per-job tolerance, stamp it onto the graph (operator >
+    // extractor hint > Unspecified default), resolve the overall band, and
+    // snapshot the cost-rate catalogue. An un-toleranced job resolves to `None`
+    // ⇒ `Standard` (today's reprice default) ⇒ byte-identical; a job carrying a
+    // stored spec now re-prices on its REAL band + tolerance_cost instead of
+    // always Standard with no tolerance line. (Reprice's Unspecified fallback
+    // stays `Standard` — not the daemon's `default_tolerance`, which this free
+    // function has no config handle for — preserving the prior inert reprice
+    // behaviour; aligning the two defaults is FLAGGED to S7, like calibration.)
+    let tolerance_stamp = stamp_tolerance(
+        &mut graph,
+        operator_tolerance(detail.tolerance_spec_json.as_deref())?,
+    );
+    let target_tol = tolerance_stamp
+        .resolved_band
+        .unwrap_or(ToleranceRange::Standard);
+    let tolerance_cost_rate_rows =
+        crate::quoting_tolerance_cost_rates::list_tolerance_cost_rates(conn, tenant)?;
+    let engine_tolerance_cost_rates = convert_tolerance_cost_rates(&tolerance_cost_rate_rows);
+
     let breakdown = engine::quote_with_catalogue(
         &graph,
         &engine::CatalogueSnapshot {
@@ -3154,12 +3356,13 @@ pub fn reprice_quote(
             stock_adjustments: &engine_stock_adjustments,
             machine_rates: &engine_machine_rates,
             gear_process_rates: &engine_gear_process_rates,
-            // ADR-0097 T3 (inert): empty rate slice until T4 wires quoting_tolerance_cost_rates.
-            tolerance_cost_rates: &[],
+            // ADR-0097 Part 2 (T4): operator-tunable tolerance cost-rate
+            // catalogue. Empty/zero-seeded ⇒ tolerance_cost = 0.0.
+            tolerance_cost_rates: &engine_tolerance_cost_rates,
         },
         &engine_params,
         qty,
-        ToleranceRange::Standard,
+        target_tol,
         &aberp_quote_engine::CalibrationTable::neutral(),
     )
     .map_err(|e| anyhow!("reprice engine error: {e:?}"))?;
@@ -3346,6 +3549,20 @@ struct GearProcessAudit {
     in_cycle_factor: f64,
 }
 
+/// T4 / ADR-0097 Part 2 — one tolerance cost-rate row as snapshotted into the
+/// priced-audit payload (the exact `&[ToleranceCostRate]` slice handed to the
+/// engine).
+#[derive(Debug, Serialize)]
+struct ToleranceCostRateAudit {
+    tolerance_class: String,
+    finish_passes_add: f64,
+    inproc_inspection_min: f64,
+    cmm_min_per_critical_feature: f64,
+    rework_scrap_pct: f64,
+    feed_slowdown_factor: f64,
+    grinding_escalation: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct QuotePricingPricedPayload {
     quote_id: String,
@@ -3392,6 +3609,20 @@ struct QuotePricingPricedPayload {
     gear_ops_source: String,
     gear_ops_snapshot: Vec<GearOpAudit>,
     gear_process_rate_snapshot: Vec<GearProcessAudit>,
+    /// T4 / ADR-0097 Part 2 — tolerance-cost provenance. `tolerance_cost_eur` is
+    /// the engine's additive tolerance line (0.0 on an inert quote — the wire
+    /// `tolerance_cost` key is omitted when zero). `tolerance_source` =
+    /// "operator" | "extractor" | "default". `resolved_tolerance_band` = the
+    /// overall band fed to the engine as `target_tolerance`.
+    /// `tolerance_manual_review` flags a per-drawing (GD&T) spec.
+    /// `tolerance_cost_rate_snapshot` is the exact `&[ToleranceCostRate]` slice
+    /// the engine priced with (the seeded band rows). Zero/empty on an
+    /// un-toleranced quote.
+    tolerance_cost_eur: f64,
+    tolerance_source: String,
+    resolved_tolerance_band: String,
+    tolerance_manual_review: bool,
+    tolerance_cost_rate_snapshot: Vec<ToleranceCostRateAudit>,
     actor: String,
     idempotency_key: String,
 }
