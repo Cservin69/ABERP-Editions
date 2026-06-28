@@ -93,7 +93,12 @@ else
   c_red=""; c_yel=""; c_grn=""; c_dim=""; c_rst=""
 fi
 
-readonly TENANT_DIR="${HOME}/.aberp/${TENANT}"
+# Data root is parameterizable so the EDITIONS upgrade scripts can root the
+# pre-upgrade snapshot at their OWN edition tree (~/.aberp-defense / ~/.aberp-
+# portable) and NEVER the frozen prod line. UNSET = the prod default (~/.aberp),
+# so the prod upgrade_prod.sh flow is byte-for-byte unchanged (ADR-0093 §5).
+readonly DATA_ROOT="${ABERP_DATA_ROOT:-${HOME}/.aberp}"
+readonly TENANT_DIR="${DATA_ROOT}/${TENANT}"
 readonly SNAPSHOT_ROOT="${HOME}/aberp-snapshots"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 readonly TIMESTAMP
@@ -183,7 +188,7 @@ fi
 # ---------- 2) tarball the tenant dir ---------------------------------------
 echo "${c_dim}[2/3] tarball ${TENANT_DIR} → ${SNAPSHOT_TGZ}${c_rst}" >&2
 # Tar from the parent so the tarball expands to `<tenant>/...` on restore.
-tar -C "${HOME}/.aberp" -czf "$SNAPSHOT_TGZ" "${TENANT}"
+tar -C "${DATA_ROOT}" -czf "$SNAPSHOT_TGZ" "${TENANT}"
 chmod 0600 "$SNAPSHOT_TGZ"
 TGZ_SIZE="$(du -h "$SNAPSHOT_TGZ" | awk '{print $1}')"
 echo "${c_grn}[ ok ]${c_rst} tarball written ($TGZ_SIZE): $SNAPSHOT_TGZ" >&2
@@ -267,7 +272,7 @@ echo "${c_grn}━━━━━━━━━━━━━━━━━━━━━━
 echo
 echo "${c_dim}Restore recipe (see runbook Step 9 for full procedure):${c_rst}" >&2
 echo "${c_dim}  1. Stop the app (Ctrl-C in the run_prod.sh terminal).${c_rst}" >&2
-echo "${c_dim}  2. tar -C \"\${HOME}/.aberp\" -xzf \"${SNAPSHOT_TGZ}\"${c_rst}" >&2
+echo "${c_dim}  2. tar -C \"${DATA_ROOT}\" -xzf \"${SNAPSHOT_TGZ}\"${c_rst}" >&2
 echo "${c_dim}  3. unzip the keychain zip + re-import via 'security add-generic-password'.${c_rst}" >&2
 echo "${c_dim}  4. Relaunch ./run/run_prod.sh${c_rst}" >&2
 echo

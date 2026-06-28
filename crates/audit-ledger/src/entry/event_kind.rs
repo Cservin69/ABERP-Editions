@@ -2596,6 +2596,16 @@ pub enum EventKind {
     /// count. `snapshot.*` family.
     SnapshotPruned,
 
+    /// ADR-0095 §1 — the boot/CLI auto-recovery engine repaired a
+    /// torn/unopenable live DB or an ahead-of-DB mirror by rebuilding from
+    /// the latest valid snapshot + a verbatim REPLAY of the preserved mirror
+    /// delta (never a truncation), validated, then atomically installed.
+    /// Payload (`DbAutoRecoveredPayload`) carries the trigger, source snapshot
+    /// seq, replay range, recovered head seq, and the retained `.CORRUPT-<tag>`
+    /// evidence path. `db.*` prefix — a system/durability event, app-layer
+    /// JSON only (never NAV XML), never swept into a per-invoice export bundle.
+    DbAutoRecovered,
+
     /// S427 — a `quoting_machines` master-data row was created. Payload
     /// (`MachineCreatedPayload`) carries the machine id, name, family,
     /// and capacity knobs. `mes.*` prefix family (shop-floor master
@@ -3236,6 +3246,7 @@ impl EventKind {
             EventKind::SnapshotValidationFailed => "snapshot.validation_failed",
             EventKind::SnapshotRestored => "snapshot.restored",
             EventKind::SnapshotPruned => "snapshot.pruned",
+            EventKind::DbAutoRecovered => "db.auto_recovered",
             EventKind::MachineCreated => "mes.machine_created",
             EventKind::MachineEdited => "mes.machine_edited",
             EventKind::MachineArchived => "mes.machine_archived",
@@ -3454,6 +3465,7 @@ impl EventKind {
             "snapshot.validation_failed" => Ok(EventKind::SnapshotValidationFailed),
             "snapshot.restored" => Ok(EventKind::SnapshotRestored),
             "snapshot.pruned" => Ok(EventKind::SnapshotPruned),
+            "db.auto_recovered" => Ok(EventKind::DbAutoRecovered),
             "mes.machine_created" => Ok(EventKind::MachineCreated),
             "mes.machine_edited" => Ok(EventKind::MachineEdited),
             "mes.machine_archived" => Ok(EventKind::MachineArchived),
@@ -3661,6 +3673,7 @@ impl EventKind {
         EventKind::SnapshotValidationFailed,
         EventKind::SnapshotRestored,
         EventKind::SnapshotPruned,
+        EventKind::DbAutoRecovered,
         EventKind::MachineCreated,
         EventKind::MachineEdited,
         EventKind::MachineArchived,
@@ -3874,6 +3887,7 @@ mod tests {
             EventKind::SnapshotValidationFailed,
             EventKind::SnapshotRestored,
             EventKind::SnapshotPruned,
+            EventKind::DbAutoRecovered,
             EventKind::MachineCreated,
             EventKind::MachineEdited,
             EventKind::MachineArchived,
@@ -3975,7 +3989,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            186,
+            187,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \

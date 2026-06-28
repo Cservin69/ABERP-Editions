@@ -92,7 +92,7 @@ pub fn marker_path(db_path: &Path) -> PathBuf {
 
 /// DuckDB names the WAL by appending `.wal` to the FULL filename
 /// (`x.duckdb` → `x.duckdb.wal`) — NOT `Path::with_extension`.
-fn wal_sibling(db: &Path) -> PathBuf {
+pub(crate) fn wal_sibling(db: &Path) -> PathBuf {
     let mut os = db.as_os_str().to_owned();
     os.push(".wal");
     PathBuf::from(os)
@@ -282,14 +282,14 @@ pub fn durable_checkpoint(db_path: &Path, tenant: &str) -> Result<CheckpointRepo
 }
 
 /// A sibling path `<db><suffix>` in the same directory as the DB.
-fn sibling(db_path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sibling(db_path: &Path, suffix: &str) -> PathBuf {
     let mut os = db_path.as_os_str().to_owned();
     os.push(suffix);
     PathBuf::from(os)
 }
 
 /// Process + nanosecond tag so concurrent/again runs never collide.
-fn unique_tag() -> String {
+pub(crate) fn unique_tag() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())

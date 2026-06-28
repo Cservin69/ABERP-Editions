@@ -380,6 +380,78 @@ while IFS=: read -r ln _; do
   fi
 done < <(grep -nE 'coordinator\.register\(' "$sv" 2>/dev/null || true)
 
+# ── CHECK 9 — editions UPGRADE + pre-upgrade snapshot never default to, accept,
+#    or target the frozen prod line (ENFORCED · prod-touch fix 2026-06-27) ──────
+# CHECK 3a bans the `:-prod}` default form and any literal `/.aberp/prod` in
+# run/. This closes the two gaps behind the live 2026-06-27 incident: (1) a BARE
+# `tenant="prod"` default (no `:-prod}` syntax), and (2) an editions upgrade
+# routing its pre-upgrade snapshot at the BARE prod root `~/.aberp/` (no literal
+# "prod"). It also proves snapshot-prod.sh stays parameterizable (so editions
+# can root it at their own tree) and that each editions upgrade passes its
+# edition root to the snapshot. ENFORCE_EDITIONS_UPGRADE_PROD_REFUSAL=0 disables
+# it for a deliberate, temporary local probe only.
+echo "[CHECK 9] editions upgrade+snapshot never default/accept/target the frozen prod line (ENFORCED)"
+enforce9="${ENFORCE_EDITIONS_UPGRADE_PROD_REFUSAL:-1}"
+flag9() { note "$1"; if [[ "$enforce9" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+ci_ncgrep() { grep -inE "$1" "$2" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' || true; }
+
+# 9a — snapshot-prod.sh stays parameterizable: honors ABERP_DATA_ROOT and falls
+#      back to the prod root ONLY when unset (prod's flow unchanged), so editions
+#      can root it at their own tree. A regression that hardcodes ~/.aberp/ trips this.
+snap="tools/snapshot-prod.sh"
+if [[ -f "$snap" ]] \
+   && grep -qE 'DATA_ROOT="\$\{ABERP_DATA_ROOT:-\$\{HOME\}/\.aberp\}"' "$snap" \
+   && grep -qE 'TENANT_DIR="\$\{DATA_ROOT\}/\$\{TENANT\}"' "$snap" \
+   && grep -qE 'tar -C "\$\{DATA_ROOT\}"' "$snap"; then
+  note "✓ snapshot-prod.sh honors ABERP_DATA_ROOT (editions root it at their own tree; prod default unchanged)"
+else
+  flag9 "✗ snapshot-prod.sh no longer honors ABERP_DATA_ROOT — editions cannot root the snapshot off the frozen prod line"
+fi
+
+# 9b/9c/9d — per editions upgrade script.
+check_editions_upgrade() {  # $1 script  $2 edition-root (.aberp-<ed>)
+  local f="$1" root="$2" base; base="$(basename "$f")"
+  if [[ ! -f "$f" ]]; then flag9 "✗ missing editions upgrade script: $f"; return; fi
+
+  # 9b — never DEFAULT the reserved prod tenant. Assignment-anchored so the
+  #      fail-fast guard's prose ("'prod' is the reserved tenant") never self-trips.
+  local q; q=$'^[[:space:]]*(readonly[[:space:]]+)?tenant=[\'\"]?prod([\'\"]|[[:space:]]|$)'
+  local bad_default
+  bad_default="$(ci_ncgrep "$q" "$f")"
+  bad_default+="$(ci_ncgrep '^[[:space:]]*(readonly[[:space:]]+)?tenant=.*:-[[:space:]]*prod[[:space:]]*}' "$f")"
+  if [[ -n "$bad_default" ]]; then
+    flag9 "✗ $base defaults the reserved prod tenant — editions must default to a non-prod tenant:"
+    printf '%s\n' "$bad_default" | sed 's/^/      /'
+  else
+    note "✓ $base does not default the reserved prod tenant"
+  fi
+
+  # 9c — never reference the BARE frozen prod data root ~/.aberp/ (only the
+  #      edition's own ~/.aberp-<ed>/). \.aberp/ matches the prod root but NOT
+  #      .aberp-defense/ / .aberp-portable/ (the hyphen breaks the match).
+  local bad_root
+  bad_root="$(ci_ncgrep '\.aberp/' "$f")"
+  if [[ -n "$bad_root" ]]; then
+    flag9 "✗ $base references the frozen prod data root ~/.aberp/ — editions must use only $root:"
+    printf '%s\n' "$bad_root" | sed 's/^/      /'
+  else
+    note "✓ $base references only its own edition root ($root), never the bare ~/.aberp/"
+  fi
+
+  # 9d — the pre-upgrade snapshot is rooted at the edition tree: the script passes
+  #      ABERP_DATA_ROOT to snapshot-prod.sh so it can never fall back to the prod
+  #      default. (CHECK 3b/CHECK 7 already prove the value is THIS edition's root.)
+  if [[ -n "$(ci_ncgrep 'snapshot-prod\.sh|SNAPSHOT_SCRIPT' "$f")" ]]; then
+    if [[ -n "$(ci_ncgrep 'ABERP_DATA_ROOT=.*("\$SNAPSHOT_SCRIPT"|snapshot-prod\.sh)' "$f")" ]]; then
+      note "✓ $base roots its pre-upgrade snapshot at its own edition tree (ABERP_DATA_ROOT → snapshot-prod.sh)"
+    else
+      flag9 "✗ $base invokes snapshot-prod.sh without ABERP_DATA_ROOT — the snapshot would fall back to the frozen prod root ~/.aberp/"
+    fi
+  fi
+}
+check_editions_upgrade run/upgrade_defense.sh  ".aberp-defense"
+check_editions_upgrade run/upgrade_portable.sh ".aberp-portable"
+
 echo
 if [[ "$fail" -ne 0 ]]; then echo "CUT-GATE: ✗ FAILED"; exit 1; fi
 echo "CUT-GATE: ✓ PASSED"

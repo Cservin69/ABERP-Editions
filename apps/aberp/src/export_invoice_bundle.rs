@@ -959,6 +959,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::SnapshotValidationFailed
         | EventKind::SnapshotRestored
         | EventKind::SnapshotPruned
+        | EventKind::DbAutoRecovered
         // S427 — mes.* machine master-data + quote.* lead-time family.
         // Machine id / name / family / capacity knobs, quote id + day
         // counts, fallback hours; app-layer JSON payloads, never NAV XML
@@ -1079,7 +1080,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 186,
+        EventKind::ALL_KINDS_COUNT == 187,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
