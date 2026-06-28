@@ -18,7 +18,7 @@
 //! crate itself has no JSON dep (per lib.rs: "parsing is the
 //! wrapper's job").
 
-use aberp_quote_engine::{FeatureGraph, FeatureType, StockForm};
+use aberp_quote_engine::{FeatureGraph, FeatureType, StockForm, ToleranceSpec};
 
 const PYTHON_FIXTURE: &str = include_str!("fixtures/feature_graph_python_v2.json");
 
@@ -37,6 +37,18 @@ fn python_v2_fixture_deserializes_into_rust_feature_graph() {
         parsed.stock_form,
         StockForm::RectangularBlock,
         "a v2 graph omits stock_form -> must default to RectangularBlock"
+    );
+    // ADR-0097 v5: a ≤v4 graph omits `tolerance` -> must default to
+    // Unspecified (defers to the resolved target_tolerance -> today's price)
+    // and the per-feature callouts default empty. Inert-by-default load.
+    assert_eq!(
+        parsed.tolerance,
+        ToleranceSpec::Unspecified,
+        "a graph omitting tolerance -> must default to Unspecified"
+    );
+    assert!(
+        parsed.critical_feature_tolerances.is_empty(),
+        "a graph omitting critical_feature_tolerances -> must default empty"
     );
     assert_eq!(parsed.bounding_box_mm, [50.0, 30.0, 20.0]);
     assert_eq!(parsed.volume_mm3, 25_000.0);
@@ -114,4 +126,58 @@ fn feature_type_strings_round_trip_through_serde() {
             .unwrap_or_else(|e| panic!("Python emits '{s}'; Rust must accept it: {e}"));
         assert_eq!(got, expected);
     }
+}
+
+#[test]
+fn graph_omitting_tolerance_loads_unspecified_and_is_skipped_on_serialize() {
+    // A v5-shaped graph that carries no `tolerance`/`critical_feature_tolerances`
+    // keys must (a) deserialize with the inert defaults, and (b) re-serialize
+    // WITHOUT introducing either key — the skip_serializing_if wire contract
+    // that keeps a no-tolerance blob byte-identical to the pre-ADR-0097 shape.
+    let src = r#"{
+        "_schema_version": 5,
+        "bounding_box_mm": [10.0, 10.0, 10.0],
+        "volume_mm3": 1000.0,
+        "material_grade": "6061-T6",
+        "features": [],
+        "requires_5_axis": false,
+        "thin_wall_present": false
+    }"#;
+    let fg: FeatureGraph = serde_json::from_str(src).expect("v5 graph without tolerance must load");
+    assert_eq!(fg.tolerance, ToleranceSpec::Unspecified);
+    assert!(fg.critical_feature_tolerances.is_empty());
+
+    let out = serde_json::to_string(&fg).expect("serialize");
+    assert!(
+        !out.contains("tolerance"),
+        "unspecified tolerance + empty callouts must add no key: {out}"
+    );
+}
+
+#[test]
+fn graph_with_tolerance_spec_round_trips() {
+    // When a tolerance IS supplied it round-trips through the wire unchanged.
+    let src = r#"{
+        "_schema_version": 5,
+        "bounding_box_mm": [10.0, 10.0, 10.0],
+        "volume_mm3": 1000.0,
+        "material_grade": "6061-T6",
+        "features": [],
+        "requires_5_axis": false,
+        "thin_wall_present": false,
+        "tolerance": {"kind": "it_grade", "grade": 7},
+        "critical_feature_tolerances": [
+            {"feature_index": 0, "spec": {"kind": "plus_minus", "value_mm": 0.01}}
+        ]
+    }"#;
+    let fg: FeatureGraph = serde_json::from_str(src).expect("graph with tolerance must load");
+    assert_eq!(fg.tolerance, ToleranceSpec::ItGrade { grade: 7 });
+    assert_eq!(fg.critical_feature_tolerances.len(), 1);
+    assert_eq!(fg.critical_feature_tolerances[0].feature_index, 0);
+    assert_eq!(
+        fg.critical_feature_tolerances[0].spec,
+        ToleranceSpec::PlusMinus { value_mm: 0.01 }
+    );
+    let out = serde_json::to_string(&fg).expect("serialize");
+    assert!(out.contains("it_grade"), "tolerance must serialize: {out}");
 }

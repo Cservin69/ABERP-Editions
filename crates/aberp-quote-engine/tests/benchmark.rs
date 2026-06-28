@@ -9,7 +9,7 @@
 mod common;
 
 use aberp_quote_engine::{
-    quote, Feature, FeatureGraph, Material, StockForm, StockStatus, ToleranceRange,
+    quote, Feature, FeatureGraph, Material, StockForm, StockStatus, ToleranceRange, ToleranceSpec,
 };
 use common::*;
 
@@ -29,6 +29,8 @@ fn peek_15pcs_50mm_cube_lands_in_benchmark_band() {
     };
     let fg = FeatureGraph {
         schema_version: FeatureGraph::SCHEMA_VERSION,
+        tolerance: ToleranceSpec::Unspecified,
+        critical_feature_tolerances: Vec::new(),
         bounding_box_mm: [50.0, 50.0, 50.0],
         volume_mm3: 125_000.0,
         surface_area_mm2: 15_000.0,

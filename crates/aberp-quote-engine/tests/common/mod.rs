@@ -7,7 +7,7 @@
 use aberp_quote_engine::{
     CatalogueSnapshot, ComplexityRule, Feature, FeatureGraph, FeatureType, GearProcessRate,
     MachineRate, Material, QuotingParameters, StockAdjustment, StockForm, StockStatus,
-    ToleranceMultiplier, ToleranceRange,
+    ToleranceMultiplier, ToleranceRange, ToleranceSpec,
 };
 
 pub fn default_material(grade: &str) -> Material {
@@ -126,6 +126,8 @@ pub fn no_stock_adjustments() -> Vec<StockAdjustment> {
 pub fn simple_feature_graph(grade: &str) -> FeatureGraph {
     FeatureGraph {
         schema_version: FeatureGraph::SCHEMA_VERSION,
+        tolerance: ToleranceSpec::Unspecified,
+        critical_feature_tolerances: Vec::new(),
         bounding_box_mm: [50.0, 30.0, 20.0],
         volume_mm3: 25_000.0,
         // Left 0.0 so tests exercise the engine's bbox-area fallback
