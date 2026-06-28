@@ -117,6 +117,46 @@ pub fn is_exotic_material(grade: &str) -> bool {
     EXOTIC_GRADE_SUBSTRINGS.iter().any(|sub| g.contains(sub))
 }
 
+/// Immutable, borrowed bundle of the per-tenant **catalogue snapshot**
+/// slices the engine prices against — the monetary inputs the wiring layer
+/// reads from the `quoting_*` DB tables and hands the scorer ([`Material`],
+/// [`ComplexityRule`], [`ToleranceMultiplier`], [`StockAdjustment`],
+/// [`MachineRate`], [`GearProcessRate`]).
+///
+/// Resolves **ADR-0094 Q2**: rather than grow the engine entry past its
+/// 11-positional-argument ceiling (the next catalogue slice would be the
+/// 12th), the catalogue slices collapse into this one struct. Every later
+/// session then adds a snapshot *field*, not a positional argument — the
+/// `ToleranceCostRate` slice (ADR-0097 Part 2 / T3) lands here next.
+///
+/// Purely a view: borrowing `&[T]` keeps the engine zero-copy and the wiring
+/// the owner of the `Vec`s. `Copy` because it is just a bundle of
+/// shared-reference slices; `Default` yields an all-empty snapshot.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CatalogueSnapshot<'a> {
+    /// `quoting_materials` rows. An empty slice ⇒
+    /// [`QuoteError::MaterialNotInCatalogue`] for the graph's grade.
+    pub materials: &'a [Material],
+    /// `quoting_complexity_rules` rows.
+    pub complexity_rules: &'a [ComplexityRule],
+    /// `quoting_tolerance_multipliers` rows — the overall-class flat
+    /// multiplier + per-feature inspection minutes (unchanged by this ADR).
+    pub tolerance_multipliers: &'a [ToleranceMultiplier],
+    /// `quoting_stock_adjustments` rows.
+    pub stock_adjustments: &'a [StockAdjustment],
+    /// `quoting_machine_rates` rows (ADR-0094 Gap 2). Empty (or no row for
+    /// the routed family) ⇒ the global flat machining rate ⇒ today's price.
+    pub machine_rates: &'a [MachineRate],
+    /// `quoting_gear_processes` rows (ADR-0094 Gap 3). Empty ⇒ the gear path
+    /// is never entered ⇒ zero gear cost ⇒ today's price.
+    pub gear_process_rates: &'a [GearProcessRate],
+    // ADR-0097 Part 2 / T3 extension point: the additive professional-
+    // tolerance cost line adds `tolerance_cost_rates: &'a [ToleranceCostRate]`
+    // here as the next *field* (not a 12th positional arg). Intentionally
+    // absent until T3 so T1 stays a pure, golden-byte-identical structural
+    // refactor with no new field.
+}
+
 /// Score a quote.
 ///
 /// **Pure.** No I/O, no clock, no RNG, no allocation beyond the
@@ -216,6 +256,53 @@ pub fn quote_with_shop_model(
     machine_rates: &[MachineRate],
     gear_process_rates: &[GearProcessRate],
 ) -> Result<QuoteBreakdown, QuoteError> {
+    quote_with_catalogue(
+        feature_graph,
+        &CatalogueSnapshot {
+            materials,
+            complexity_rules,
+            tolerance_multipliers,
+            stock_adjustments,
+            machine_rates,
+            gear_process_rates,
+        },
+        parameters,
+        quantity,
+        target_tolerance,
+        calibration,
+    )
+}
+
+/// ADR-0094 Q2 / ADR-0097 T1 — the **catalogue-snapshot** superset entry
+/// point, and the single home of the scoring algorithm. Behaviourally
+/// identical to [`quote_with_shop_model`]: it just takes the six catalogue
+/// slices as one borrowed [`CatalogueSnapshot`] instead of six positional
+/// arguments, so the forthcoming `ToleranceCostRate` slice (ADR-0097 Part 2)
+/// becomes a snapshot *field* rather than a 12th argument.
+///
+/// [`quote`], [`quote_with_calibration`] and [`quote_with_shop_model`] all
+/// delegate here, so an empty/default snapshot reproduces today's numbers
+/// and `reasoning_log` byte-for-byte. Still **pure** — no I/O, clock, RNG,
+/// async or global state; same inputs ⇒ byte-identical output.
+pub fn quote_with_catalogue(
+    feature_graph: &FeatureGraph,
+    catalogue: &CatalogueSnapshot,
+    parameters: &QuotingParameters,
+    quantity: u32,
+    target_tolerance: ToleranceRange,
+    calibration: &crate::calibration::CalibrationTable,
+) -> Result<QuoteBreakdown, QuoteError> {
+    // Re-bind the bundled catalogue slices to the exact local names the
+    // algorithm body uses, so the scoring logic below is the unchanged
+    // pre-ADR-0097 body (byte-identical numbers + reasoning_log).
+    let CatalogueSnapshot {
+        materials,
+        complexity_rules,
+        tolerance_multipliers,
+        stock_adjustments,
+        machine_rates,
+        gear_process_rates,
+    } = *catalogue;
     // ── Pre-flight validation ─────────────────────────────────────
     if quantity == 0 {
         return Err(QuoteError::QuantityZero);

@@ -1039,7 +1039,7 @@ impl PricingPipelineService {
             // operator > extractor hint > empty default; an unset column
             // leaves the empty serde-default ⇒ no gear cost) and snapshot the
             // operator's gear-process coefficient table into the engine's
-            // 11th argument. Empty either way ⇒ the engine never enters the
+            // CatalogueSnapshot. Empty either way ⇒ the engine never enters the
             // gear path ⇒ price byte-identical to pre-Gap-3.
             let gear_ops_source = stamp_gear_ops(
                 &mut graph,
@@ -1050,18 +1050,20 @@ impl PricingPipelineService {
                     .context("load gear processes")?;
             let engine_gear_process_rates = convert_gear_process_rates(&gear_process_rows);
 
-            match engine::quote_with_shop_model(
+            match engine::quote_with_catalogue(
                 &graph,
-                &engine_materials,
-                &engine_complexity,
-                &engine_tolerance,
-                &engine_stock_adjustments,
+                &engine::CatalogueSnapshot {
+                    materials: &engine_materials,
+                    complexity_rules: &engine_complexity,
+                    tolerance_multipliers: &engine_tolerance,
+                    stock_adjustments: &engine_stock_adjustments,
+                    machine_rates: &engine_machine_rates,
+                    gear_process_rates: &engine_gear_process_rates,
+                },
                 &engine_params,
                 qty,
                 target_tol,
                 &cal_table,
-                &engine_machine_rates,
-                &engine_gear_process_rates,
             ) {
                 Ok(breakdown) => {
                     let json = serde_json::to_string(&breakdown).context("encode breakdown")?;
@@ -3141,18 +3143,20 @@ pub fn reprice_quote(
     let gear_process_rows = crate::quoting_gear_processes::list_gear_processes(conn, tenant)?;
     let engine_gear_process_rates = convert_gear_process_rates(&gear_process_rows);
 
-    let breakdown = engine::quote_with_shop_model(
+    let breakdown = engine::quote_with_catalogue(
         &graph,
-        &engine_materials,
-        &engine_complexity,
-        &engine_tolerance,
-        &engine_stock_adjustments,
+        &engine::CatalogueSnapshot {
+            materials: &engine_materials,
+            complexity_rules: &engine_complexity,
+            tolerance_multipliers: &engine_tolerance,
+            stock_adjustments: &engine_stock_adjustments,
+            machine_rates: &engine_machine_rates,
+            gear_process_rates: &engine_gear_process_rates,
+        },
         &engine_params,
         qty,
         ToleranceRange::Standard,
         &aberp_quote_engine::CalibrationTable::neutral(),
-        &engine_machine_rates,
-        &engine_gear_process_rates,
     )
     .map_err(|e| anyhow!("reprice engine error: {e:?}"))?;
 

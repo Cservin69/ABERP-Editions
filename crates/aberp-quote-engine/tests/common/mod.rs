@@ -5,8 +5,9 @@
 #![allow(dead_code)]
 
 use aberp_quote_engine::{
-    ComplexityRule, Feature, FeatureGraph, FeatureType, Material, QuotingParameters,
-    StockAdjustment, StockForm, StockStatus, ToleranceMultiplier, ToleranceRange,
+    CatalogueSnapshot, ComplexityRule, Feature, FeatureGraph, FeatureType, GearProcessRate,
+    MachineRate, Material, QuotingParameters, StockAdjustment, StockForm, StockStatus,
+    ToleranceMultiplier, ToleranceRange,
 };
 
 pub fn default_material(grade: &str) -> Material {
@@ -157,3 +158,46 @@ pub fn simple_feature_graph(grade: &str) -> FeatureGraph {
 
 pub const DEFAULT_QTY: u32 = 10;
 pub const DEFAULT_TOL: ToleranceRange = ToleranceRange::Standard;
+
+/// Owns the default catalogue `Vec`s so a test can hand the engine a
+/// borrowed [`CatalogueSnapshot`] view (the snapshot borrows; the fixture
+/// owns). The machine-rate and gear-process slices default empty — inert,
+/// matching today's byte-identical pricing — and a test can push rows to
+/// exercise a populated path.
+pub struct CatalogueFixture {
+    pub materials: Vec<Material>,
+    pub complexity_rules: Vec<ComplexityRule>,
+    pub tolerance_multipliers: Vec<ToleranceMultiplier>,
+    pub stock_adjustments: Vec<StockAdjustment>,
+    pub machine_rates: Vec<MachineRate>,
+    pub gear_process_rates: Vec<GearProcessRate>,
+}
+
+impl CatalogueFixture {
+    /// The default single-material catalogue the engine tests use, mirroring
+    /// the positional `default_*` fixtures (one material, catch-all rules,
+    /// the five tolerance bands, no stock adjustment, empty machine/gear
+    /// slices).
+    pub fn new(grade: &str) -> Self {
+        Self {
+            materials: vec![default_material(grade)],
+            complexity_rules: catchall_complexity_rules(),
+            tolerance_multipliers: default_tolerance_multipliers(),
+            stock_adjustments: no_stock_adjustments(),
+            machine_rates: Vec::new(),
+            gear_process_rates: Vec::new(),
+        }
+    }
+
+    /// Borrow a [`CatalogueSnapshot`] view over the owned `Vec`s.
+    pub fn snapshot(&self) -> CatalogueSnapshot<'_> {
+        CatalogueSnapshot {
+            materials: &self.materials,
+            complexity_rules: &self.complexity_rules,
+            tolerance_multipliers: &self.tolerance_multipliers,
+            stock_adjustments: &self.stock_adjustments,
+            machine_rates: &self.machine_rates,
+            gear_process_rates: &self.gear_process_rates,
+        }
+    }
+}
