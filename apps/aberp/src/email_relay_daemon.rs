@@ -52,6 +52,53 @@ pub const DRAIN_TICK_SECS: u64 = 2;
 /// Retry cap per row. The 5th failure transitions the row to
 /// terminal `Failed`.
 pub const MAX_ATTEMPTS_PER_ROW: u32 = 5;
+
+/// Operator-facing kill switch — ADR-0098 S0 (the interim-stopgap
+/// bridge). Set `ABERP_EMAIL_RELAY_DRAIN_DISABLED=1` (or `true`,
+/// case-insensitive, surrounding whitespace ignored) to suppress this
+/// daemon's spawn at boot.
+///
+/// Why it exists: this drain is the one **unconditional** ~2s
+/// separate-instance DuckDB opener — it opens the live tenant DB every
+/// [`DRAIN_TICK_SECS`] to claim a row. ADR-0098's interim stopgap
+/// quiesces every *other* high-frequency opener (quote-intake /
+/// catalogue-push / email-outbox / pdf-rerender) through existing
+/// flags, but had no way to silence this one without a code gate
+/// (ADR-0098 D8 / the ADR's "Interim stopgap" section). With this set
+/// **plus** the storefront / outbox / rerender quiesce flags, the only
+/// residual live-DB openers are the 4-h snapshot daemon and human-paced
+/// SPA writes.
+///
+/// Named `POLL_DISABLE_ENV` to mirror
+/// [`crate::email_outbox_poll_daemon::POLL_DISABLE_ENV`] and
+/// [`crate::quote_pdf_rerender_daemon::POLL_DISABLE_ENV`] (and the
+/// snapshot daemon's) — the house convention for a daemon's disable
+/// const; only the *value* is drain-specific.
+///
+/// NOTE: disabling the drain means queued outbound email is **not
+/// sent** until it is re-enabled (rows stay `Queued` and drain on the
+/// next boot without the flag). Risk-reduction for a degraded
+/// manual-invoicing session, **not** the full fix — Session B's single
+/// shared `aberp_db::Handle` is what actually makes the process
+/// single-writer.
+pub const POLL_DISABLE_ENV: &str = "ABERP_EMAIL_RELAY_DRAIN_DISABLED";
+
+/// Kill-switch check. Returns `true` iff the daemon should **not** be
+/// spawned. Mirrors [`crate::email_outbox_poll_daemon::is_disabled`] and
+/// [`crate::quote_pdf_rerender_daemon::is_disabled`] byte-for-byte so all
+/// three operator switches parse identically: `1` / `true`
+/// (case-insensitive, trimmed) disables; everything else — including
+/// `0`, `false`, and empty — leaves the daemon ENABLED.
+pub fn is_disabled() -> bool {
+    std::env::var(POLL_DISABLE_ENV)
+        .ok()
+        .map(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
 /// Bound the wall-clock on each SMTP send. Inherited from
 /// [`crate::email_invoice`]'s `SMTP_SEND_TIMEOUT`.
 /// `pub(crate)` so [`crate::email_outbox_poll_daemon`] (S307) reuses the
@@ -472,5 +519,50 @@ mod tests {
         // PR-266 brief §B: "max 5 attempts". Pin the value so a
         // future contributor can't silently relax it.
         assert_eq!(MAX_ATTEMPTS_PER_ROW, 5);
+    }
+
+    // ── ADR-0098 S0 (bridge) — the `ABERP_EMAIL_RELAY_DRAIN_DISABLED`
+    //    kill switch. The email-relay-drain spawn in `serve.rs` branches
+    //    solely on `is_disabled()`: set => the `if`-arm logs and does NOT
+    //    spawn; unset => the `else`-arm spawns (today's behavior). The
+    //    full serve boot can't run in this sandbox (bundled DuckDB/Tauri),
+    //    so these unit-test the gate decision directly — the exact
+    //    predicate the two spawn branches read. Mirrors the email-outbox /
+    //    pdf-rerender `is_disabled` tests; a process-wide `ENV_LOCK`
+    //    serializes the env mutation so the default parallel test runner
+    //    can't race the key.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn relay_drain_is_disabled_false_by_default_so_drain_spawns() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(POLL_DISABLE_ENV);
+        // Unset => NOT disabled => serve takes the `else` arm and spawns
+        // the daemon, byte-for-byte today's behavior.
+        assert!(!is_disabled());
+    }
+
+    #[test]
+    fn relay_drain_is_disabled_true_for_canonical_values_so_spawn_is_skipped() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for v in ["1", "true", "TRUE", "True", " 1 ", " true "] {
+            std::env::set_var(POLL_DISABLE_ENV, v);
+            assert!(is_disabled(), "expected disabled=true for {v:?}");
+        }
+        // Falsey / non-canonical values keep the daemon ENABLED — no
+        // foot-gun where a typo silently stops outbound email.
+        for v in ["0", "false", "no", "off", "", "yes"] {
+            std::env::set_var(POLL_DISABLE_ENV, v);
+            assert!(!is_disabled(), "expected disabled=false for {v:?}");
+        }
+        std::env::remove_var(POLL_DISABLE_ENV);
+    }
+
+    #[test]
+    fn relay_drain_disable_env_name_is_the_documented_stopgap_flag() {
+        // Pin the operator-facing contract: the exact env var name in
+        // ADR-0098 §"Interim stopgap" / D8 and the S0 ops doc. A rename
+        // here would silently break the documented degraded-mode flag-set.
+        assert_eq!(POLL_DISABLE_ENV, "ABERP_EMAIL_RELAY_DRAIN_DISABLED");
     }
 }
