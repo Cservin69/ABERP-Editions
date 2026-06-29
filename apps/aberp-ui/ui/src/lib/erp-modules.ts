@@ -331,6 +331,8 @@ export const MODULES: ErpModule[] = [
       { id: "quoting-machine-rates", label: "Machine rates" },
       // S6 / ADR-0094 Gap 3 — per-process gear-generation coefficient catalogue.
       { id: "quoting-gear-processes", label: "Gear processes" },
+      // T5 / ADR-0097 Part 2 — per-band tolerance cost-rate catalogue.
+      { id: "quoting-tolerance-cost-rates", label: "Tolerance cost rates" },
       // S273 / PR-262 / ADR-0069 — material-side balances feed the DEAL
       // saga's `committed_qty +=` check. Read-only operator view in v1;
       // sits beside the engine tunables because the operator visits
