@@ -13403,7 +13403,10 @@ pub fn set_quote_tolerance_request(
     // NULL/false after a clear).
     let (tolerance_class, manual_review) =
         match crate::quote_pricing_jobs::get_job_detail(&conn, quote_id, tenant)? {
-            Some(d) => (d.tolerance_class, d.tolerance_manual_review.unwrap_or(false)),
+            Some(d) => (
+                d.tolerance_class,
+                d.tolerance_manual_review.unwrap_or(false),
+            ),
             None => (None, false),
         };
 
