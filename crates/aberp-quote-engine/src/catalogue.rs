@@ -246,3 +246,41 @@ pub struct GearProcessRate {
     /// refixture). `1.0` for a standalone op.
     pub in_cycle_factor: f64,
 }
+
+/// A row from the `quoting_tolerance_cost_rates` catalogue table (ADR-0097
+/// Part 2 / T3, wired in T4). Keyed by [`crate::ToleranceRange::as_db_str`]
+/// (the governing tightness band), it carries the five separable professional-
+/// tolerance cost drivers so the **math** stays pure in the engine while the
+/// **numbers** stay operator-tunable — mirroring the snapshot shape of
+/// [`MachineRate`] / [`GearProcessRate`] / [`ToleranceMultiplier`]. The wiring
+/// layer reads the DB table; the engine treats `&[ToleranceCostRate]` as an
+/// immutable input. An **empty** slice ⇒ the additive `tolerance_cost` path is
+/// never entered ⇒ `tolerance_cost = 0.0`, NO reasoning line, and a breakdown
+/// byte-identical to pre-ADR-0097. The boot seed (T4) is **zero-contribution**
+/// rows for every band — the CRUD has rows to edit but nothing moves until the
+/// operator tunes them (ADR-0097 Q6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToleranceCostRate {
+    /// Matches [`crate::ToleranceRange::as_db_str`] (e.g. `"tight"`) — the
+    /// governing tightness band this row prices.
+    pub tolerance_class: String,
+    /// Extra finishing passes contributed at this band (whole-part), each
+    /// costing `base_finish_min` (the geometry finishing minutes) at the routed
+    /// effective EUR/min.
+    pub finish_passes_add: f64,
+    /// In-process gauging minutes charged per critical feature.
+    pub inproc_inspection_min: f64,
+    /// Final / CMM-report minutes charged per critical feature.
+    pub cmm_min_per_critical_feature: f64,
+    /// Fractional uplift on `(material_cost + machining_cost)` for expected
+    /// scrap / rework at this band (e.g. `0.05` = +5%).
+    pub rework_scrap_pct: f64,
+    /// `>= 1.0`; multiplies the extra-finishing-pass minute contribution
+    /// (slower finishing feeds hold a tight tolerance). `1.0` = no slowdown.
+    pub feed_slowdown_factor: f64,
+    /// Tightest-band escalation: when `true` AND the governing band is the
+    /// tightest ([`crate::ToleranceRange::UltraPrecision`]), each critical
+    /// feature carries a grinding adder costed at the `Grinder` [`MachineRate`]
+    /// (ADR-0097 Part 2).
+    pub grinding_escalation: bool,
+}

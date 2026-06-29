@@ -121,17 +121,19 @@ pub use capacity::{
 };
 pub use catalogue::{
     ComplexityRule, GearProcessRate, MachineRate, Material, QuotingParameters, StockAdjustment,
-    StockStatus, ToleranceMultiplier,
+    StockStatus, ToleranceCostRate, ToleranceMultiplier,
 };
 pub use engine::{
-    is_exotic_material, quote, quote_with_calibration, quote_with_shop_model, route_family,
-    select_gear_process, GEAR_AGMA_DATUM_CLASS, GEAR_FACEWIDTH_REF_MM, GEAR_INTERNAL_WIRE_EDM_AGMA,
-    THIN_WALL_TIGHT_TOL_BUMP,
+    is_exotic_material, normalize_tolerance, quote, quote_with_calibration, quote_with_catalogue,
+    quote_with_shop_model, route_family, select_gear_process, tightness, CatalogueSnapshot,
+    NormalizedTolerance, GEAR_AGMA_DATUM_CLASS, GEAR_FACEWIDTH_REF_MM, GEAR_INTERNAL_WIRE_EDM_AGMA,
+    GRINDING_ESCALATION_MIN_PER_CRITICAL_FEATURE, IT_GRADE_PRECISION_MAX, IT_GRADE_STANDARD_MAX,
+    IT_GRADE_TIGHT_MAX, IT_GRADE_ULTRA_PRECISION_MAX, THIN_WALL_TIGHT_TOL_BUMP,
 };
 pub use error::QuoteError;
 pub use feature_graph::{
-    Feature, FeatureGraph, FeatureType, GearKind, GearOp, GearProcess, SizeBucket, StockForm,
-    ToleranceRange,
+    Feature, FeatureGraph, FeatureTolerance, FeatureType, GearKind, GearOp, GearProcess,
+    GeneralClass, SizeBucket, StockForm, ToleranceRange, ToleranceSpec,
 };
 
 /// Crate version stamp emitted on every breakdown so a quote PDF can

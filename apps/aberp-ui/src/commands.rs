@@ -680,6 +680,19 @@ pub async fn set_quote_gear_ops(
     forward_post(&state, &path, body).await
 }
 
+/// T5 / ADR-0097 Part 2 — set/clear the operator's per-job tolerance (overall
+/// spec + per-critical-feature callouts) and re-price in place. Forwards the
+/// `{ overall, critical_features }` body to the HTTPS route.
+#[tauri::command]
+pub async fn set_quote_tolerance(
+    state: State<'_, AppState>,
+    quote_id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quote-pricing-jobs/{quote_id}/tolerance");
+    forward_post(&state, &path, body).await
+}
+
 // ── S431 — Approved Vendor List (AVL) master data + screening + PO-gate ──
 //
 // Mirrors the machine CRUD bridge. `vendor_id` is the server-minted
@@ -1063,6 +1076,42 @@ pub async fn update_gear_process(
 #[tauri::command]
 pub async fn delete_gear_process(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let path = format!("/api/quoting-gear-processes/{}", urlencode(&id));
+    forward_delete(&state, &path).await
+}
+
+// ── T5 / ADR-0097 Part 2 — quoting_tolerance_cost_rates CRUD bridge ──
+// Mirrors the machine-rate / gear-process bridges: thin HTTPS forwarders to
+// the serve.rs routes (which carry the auth/tenant/audit + the T4 handlers).
+
+#[tauri::command]
+pub async fn list_tolerance_cost_rates(state: State<'_, AppState>) -> Result<Value, String> {
+    forward_get(&state, "/api/quoting-tolerance-cost-rates", true).await
+}
+
+#[tauri::command]
+pub async fn create_tolerance_cost_rate(
+    state: State<'_, AppState>,
+    body: Value,
+) -> Result<Value, String> {
+    forward_post(&state, "/api/quoting-tolerance-cost-rates", body).await
+}
+
+#[tauri::command]
+pub async fn update_tolerance_cost_rate(
+    state: State<'_, AppState>,
+    id: String,
+    body: Value,
+) -> Result<Value, String> {
+    let path = format!("/api/quoting-tolerance-cost-rates/{}", urlencode(&id));
+    forward_put(&state, &path, body).await
+}
+
+#[tauri::command]
+pub async fn delete_tolerance_cost_rate(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let path = format!("/api/quoting-tolerance-cost-rates/{}", urlencode(&id));
     forward_delete(&state, &path).await
 }
 

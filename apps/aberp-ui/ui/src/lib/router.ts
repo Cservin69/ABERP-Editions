@@ -61,6 +61,8 @@ export type AppRoute =
   | "quoting-machine-rates"
   // S6 / ADR-0094 Gap 3 — gear-process coefficient catalogue.
   | "quoting-gear-processes"
+  // T5 / ADR-0097 Part 2 — per-band tolerance cost-rate catalogue.
+  | "quoting-tolerance-cost-rates"
   // S273 / PR-262 / ADR-0069 — material-side inventory balances. Lives
   // under the maintenance area's Quoting sub-nav alongside the
   // tunables (operators reach it when they need to bump on_hand_qty
@@ -181,6 +183,8 @@ export function parseRoute(hash: string): AppRoute {
       return "quoting-machine-rates";
     case "quoting-gear-processes":
       return "quoting-gear-processes";
+    case "quoting-tolerance-cost-rates":
+      return "quoting-tolerance-cost-rates";
     case "inventory-balances":
       return "inventory-balances";
     case "email-relay-queue":

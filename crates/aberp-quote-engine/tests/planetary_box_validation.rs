@@ -63,7 +63,7 @@ mod common;
 use aberp_quote_engine::{
     quote, quote_with_shop_model, CalibrationTable, Feature, FeatureGraph, GearKind, GearOp,
     GearProcess, GearProcessRate, MachineRate, Material, QuoteBreakdown, QuotingParameters,
-    StockForm, StockStatus, ToleranceRange,
+    StockForm, StockStatus, ToleranceRange, ToleranceSpec,
 };
 use common::{catchall_complexity_rules, default_tolerance_multipliers, no_stock_adjustments};
 
@@ -183,6 +183,8 @@ impl Component {
     fn upgraded_graph(&self) -> FeatureGraph {
         FeatureGraph {
             schema_version: FeatureGraph::SCHEMA_VERSION,
+            tolerance: ToleranceSpec::Unspecified,
+            critical_feature_tolerances: Vec::new(),
             bounding_box_mm: self.bbox,
             volume_mm3: self.volume_mm3,
             surface_area_mm2: 0.0,

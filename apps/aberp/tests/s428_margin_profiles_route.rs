@@ -235,6 +235,8 @@ fn sample_feature_graph_json() -> String {
         requires_5_axis: false,
         thin_wall_present: false,
         stock_form: aberp_quote_engine::StockForm::RectangularBlock,
+        tolerance: aberp_quote_engine::ToleranceSpec::Unspecified,
+        critical_feature_tolerances: Vec::new(),
     };
     serde_json::to_string(&g).expect("encode FG")
 }
