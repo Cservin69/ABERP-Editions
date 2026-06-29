@@ -2831,12 +2831,30 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             }
         }
 
-        // S281 / PR-266 — spawn the email-relay drain daemon. Always
-        // active (the queue table is process-local and a row can
+        // S281 / PR-266 — spawn the email-relay drain daemon. Active by
+        // default (the queue table is process-local and a row can
         // arrive any time the relay token is configured). The drain
         // shutdown-cooperates via the coordinator's cancellation
         // token per [[graceful-shutdown-s213]].
-        {
+        //
+        // ADR-0098 S0 (the interim-stopgap bridge) — this drain is the
+        // one *unconditional* ~2s separate-instance DuckDB opener that the
+        // stopgap otherwise cannot quiet (it opens the live DB every
+        // `DRAIN_TICK_SECS` to claim a row; ADR-0098 D8 / the "Interim
+        // stopgap" section). `ABERP_EMAIL_RELAY_DRAIN_DISABLED` (mirroring
+        // the email-outbox / pdf-rerender kill switches) lets an operator
+        // silence it for a degraded-but-stable manual-invoicing session.
+        // Unset => today's behavior, byte-for-byte. Risk-reduction, not
+        // tear-proof — the full fix is Session B's single shared
+        // `aberp_db::Handle`.
+        if crate::email_relay_daemon::is_disabled() {
+            tracing::info!(
+                env = crate::email_relay_daemon::POLL_DISABLE_ENV,
+                "email-relay drain daemon NOT spawned — disabled by env \
+                 (ADR-0098 S0 bridge); queued outbound email will not be sent \
+                 until the flag is unset and serve is restarted"
+            );
+        } else {
             let operator_login = match recovery_state.boot_state.read() {
                 Ok(guard) => match &*guard {
                     ServeBootState::Ready { operator_login } => operator_login.clone(),
