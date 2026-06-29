@@ -290,6 +290,79 @@ fn stamp_tolerance(graph: &mut FeatureGraph, operator: Option<PerJobTolerance>) 
     }
 }
 
+/// ADR-0097 Q6 / T6 (wiring) — map the customer's storefront tolerance
+/// selection onto the per-job tolerance the engine prices on, or `None` for the
+/// inert default. This is the customer→engine consumer side of the ABERP-site
+/// wire contract (ADR-0097 Q6 / Part 1): today the selection only reached
+/// operator review; here it flows straight into pricing.
+///
+/// The mapping is on the **token**, never the customer-facing label:
+///
+/// - `general` (and absent / empty / any out-of-vocab value the storefront
+///   400-guard would have rejected) → ISO 2768-**medium** ↔
+///   [`ToleranceRange::Standard`] — **today's title-block default**. Never
+///   silently tightened on an unrecognised token (ADR-0097 inert-by-default).
+/// - `precision` → ISO 2768-**fine** ↔ [`ToleranceRange::Tight`].
+/// - `per_drawing` → [`ToleranceSpec::PerDrawing`] → resolves to the default
+///   band (Standard) and **raises manual review** (GD&T a human must read —
+///   never silently tightened, ADR-0097 Q5).
+///
+/// Manual review is also raised when the customer set `tolerance_critical` or
+/// wrote a non-empty `tolerance_note`. The note is operator-facing context
+/// **only** — it is never parsed into a tightness or a price.
+///
+/// Returns `None` for the inert case (the title-block default token with no
+/// review trigger) so the job's `tolerance_*` columns stay NULL and the quote
+/// prices byte-identically to a pre-tolerance submission. Otherwise returns the
+/// [`PerJobTolerance`] to persist (the exact wire shape the pricing pass reads
+/// back via [`operator_tolerance`]), the denormalised resolved band, and the
+/// manual-review flag. Pure + total; unit-tested.
+fn storefront_tolerance(
+    tolerance: Option<&str>,
+    tolerance_critical: bool,
+    tolerance_note: Option<&str>,
+) -> Option<(PerJobTolerance, ToleranceRange, bool)> {
+    let token = tolerance.unwrap_or_default().trim();
+    let note_present = tolerance_note.is_some_and(|n| !n.trim().is_empty());
+
+    // Map on the TOKEN. An unrecognised / empty token resolves to the inert
+    // title-block default (ISO 2768-medium ↔ Standard) — the daemon never
+    // silently tightens on input the storefront contract says it should reject.
+    let (overall, is_default_band) = match token {
+        "precision" => (
+            ToleranceSpec::GeneralClass {
+                class: engine::GeneralClass::Iso2768Fine,
+            },
+            false,
+        ),
+        "per_drawing" => (ToleranceSpec::PerDrawing, false),
+        _ => (
+            ToleranceSpec::GeneralClass {
+                class: engine::GeneralClass::Iso2768Medium,
+            },
+            true,
+        ),
+    };
+
+    let manual_review =
+        matches!(overall, ToleranceSpec::PerDrawing) || tolerance_critical || note_present;
+
+    // Inert iff the token resolves to today's default band AND nothing forces
+    // operator review: leave the columns NULL ⇒ byte-identical pricing.
+    if is_default_band && !manual_review {
+        return None;
+    }
+
+    let perjob = PerJobTolerance {
+        overall,
+        critical_features: Vec::new(),
+    };
+    // `tightness` ignores the nominal for GeneralClass / PerDrawing, so 0.0 is
+    // correct here (the part has not been CAD-extracted yet at enqueue time).
+    let band = engine::tightness(overall, 0.0);
+    Some((perjob, band, manual_review))
+}
+
 /// What every pricing-pipeline cycle reports back. Used for the SPA
 /// "last cycle" indicator + the daemon's log line.
 #[derive(Debug, Clone, Default)]
@@ -579,6 +652,12 @@ impl PricingPipelineService {
         // S401 — carry the buyer's company through to the pricing-jobs row
         // so the operator panel can show who they're quoting at a glance.
         let customer_company = quote.contact.company.trim().to_string();
+        // ADR-0097 Q6 / T6 (wiring) — carry the storefront tolerance selection
+        // into the closure so it can be stamped onto the freshly-created
+        // pricing job via the existing T4 `set_tolerance` path. Absent ⇒ inert.
+        let tolerance = quote.request.tolerance.clone();
+        let tolerance_critical = quote.request.tolerance_critical.unwrap_or(false);
+        let tolerance_note = quote.request.tolerance_note.clone();
 
         let db_path = self.deps.db_path.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
@@ -608,6 +687,30 @@ impl PricingPipelineService {
             )?;
             if !inserted {
                 return Ok(false);
+            }
+            // ── ADR-0097 Q6 / T6 (wiring) — stamp the customer's storefront
+            // tolerance onto the freshly-created job via the existing T4
+            // `set_tolerance` path, so the engine prices the customer's choice
+            // on the next pipeline cycle (today it only reached operator
+            // review). `storefront_tolerance` returns `None` for the inert
+            // default (general / absent, no review trigger) ⇒ the columns stay
+            // NULL ⇒ byte-identical to a pre-tolerance submission.
+            if let Some((perjob, band, manual_review)) = storefront_tolerance(
+                tolerance.as_deref(),
+                tolerance_critical,
+                tolerance_note.as_deref(),
+            ) {
+                let spec_json = serde_json::to_string(&perjob)
+                    .context("serialize storefront tolerance spec_json")?;
+                jobs::set_tolerance(
+                    &conn,
+                    &quote_id,
+                    &tenant_id,
+                    Some(band.as_db_str()),
+                    Some(&spec_json),
+                    Some(manual_review),
+                    now,
+                )?;
             }
             // Emit QuotePricingFetched in its own short tx — same posture as
             // the existing intake-daemon audit emits.
@@ -3476,6 +3579,23 @@ struct StorefrontRequest {
     material_preference: String,
     #[serde(default)]
     quantity: Option<i64>,
+    // ── ADR-0097 Q6 / T6 (wiring) — customer storefront tolerance ───────
+    // The storefront `/quote` form now collects a closed-vocab tolerance
+    // selection (`general` | `precision` | `per_drawing`), an optional
+    // `tolerance_critical` flag ("some features need tighter tolerance"), and
+    // an optional descriptive `tolerance_note` (operator-facing context only).
+    // All three are `#[serde(default)]` so a pre-tolerance storefront build —
+    // or any quote submitted before the field shipped — deserialises with them
+    // absent ⇒ `None` ⇒ the inert title-block default ⇒ byte-identical to
+    // today. The closed vocab is validated storefront-side (ADR-0097 wire
+    // contract, ABERP-site PR #24); the daemon maps on the TOKEN, never the
+    // customer-facing label.
+    #[serde(default)]
+    tolerance: Option<String>,
+    #[serde(default)]
+    tolerance_critical: Option<bool>,
+    #[serde(default)]
+    tolerance_note: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4400,6 +4520,101 @@ mod tests {
         assert_eq!(stamp.resolved_band, None);
         assert!(stamp.manual_review);
         assert_eq!(g.critical_feature_tolerances.len(), 1);
+    }
+
+    // ── ADR-0097 Q6 / T6 (wiring) — customer storefront tolerance mapping ──
+    #[test]
+    fn storefront_tolerance_absent_is_inert() {
+        // Forward-tolerant: a pre-tolerance submission (no token, no flag, no
+        // note) ⇒ None ⇒ NULL columns ⇒ byte-identical to today.
+        assert!(storefront_tolerance(None, false, None).is_none());
+        assert!(storefront_tolerance(Some(""), false, None).is_none());
+        assert!(storefront_tolerance(Some("   "), false, None).is_none());
+    }
+
+    #[test]
+    fn storefront_tolerance_general_unflagged_is_inert() {
+        // Explicit `general` with no review trigger is the title-block default
+        // ⇒ inert (None) ⇒ exactly today's price + columns.
+        assert!(storefront_tolerance(Some("general"), false, Some("")).is_none());
+        assert!(storefront_tolerance(Some("general"), false, Some("   ")).is_none());
+    }
+
+    #[test]
+    fn storefront_tolerance_unknown_token_never_tightens() {
+        // An out-of-vocab token (the storefront 400-guard would have rejected
+        // it) is treated as the inert default — never silently tightened.
+        assert!(storefront_tolerance(Some("IT7"), false, None).is_none());
+        assert!(storefront_tolerance(Some("ultra"), false, None).is_none());
+        assert!(storefront_tolerance(Some("GENERAL"), false, None).is_none());
+    }
+
+    #[test]
+    fn storefront_tolerance_precision_maps_to_fine_tight() {
+        // `precision` → ISO 2768-fine ↔ Tight; no review unless flagged.
+        let (perjob, band, manual_review) =
+            storefront_tolerance(Some("precision"), false, None).expect("non-inert");
+        assert_eq!(
+            perjob.overall,
+            ToleranceSpec::GeneralClass {
+                class: engine::GeneralClass::Iso2768Fine
+            }
+        );
+        assert!(perjob.critical_features.is_empty());
+        assert_eq!(band, ToleranceRange::Tight);
+        assert!(!manual_review);
+    }
+
+    #[test]
+    fn storefront_tolerance_per_drawing_default_band_plus_review() {
+        // `per_drawing` → PerDrawing → default band (Standard) + manual review.
+        let (perjob, band, manual_review) =
+            storefront_tolerance(Some("per_drawing"), false, None).expect("non-inert");
+        assert_eq!(perjob.overall, ToleranceSpec::PerDrawing);
+        assert_eq!(band, ToleranceRange::Standard);
+        assert!(manual_review);
+    }
+
+    #[test]
+    fn storefront_tolerance_critical_or_note_raises_review_without_tightening() {
+        // `general` + critical flag: still Standard band (no price change) but
+        // routed to operator review.
+        let (perjob, band, manual_review) =
+            storefront_tolerance(Some("general"), true, None).expect("non-inert");
+        assert_eq!(
+            perjob.overall,
+            ToleranceSpec::GeneralClass {
+                class: engine::GeneralClass::Iso2768Medium
+            }
+        );
+        assert_eq!(band, ToleranceRange::Standard);
+        assert!(manual_review);
+
+        // `general` + a non-empty note: same — review raised, band unchanged,
+        // and the note is never parsed into the spec.
+        let (_, band2, review2) =
+            storefront_tolerance(Some("general"), false, Some("bore H7")).expect("non-inert");
+        assert_eq!(band2, ToleranceRange::Standard);
+        assert!(review2);
+    }
+
+    #[test]
+    fn storefront_tolerance_spec_json_round_trips_to_perjob() {
+        // The persisted spec_json is exactly the shape the pricing pass reads
+        // back via `operator_tolerance` ⇒ the customer's choice prices on the
+        // next cycle.
+        let (perjob, _, _) =
+            storefront_tolerance(Some("precision"), false, None).expect("non-inert");
+        let spec_json = serde_json::to_string(&perjob).unwrap();
+        let back = operator_tolerance(Some(&spec_json))
+            .unwrap()
+            .expect("a real spec the pipeline re-stamps");
+        assert_eq!(
+            back.overall,
+            ToleranceSpec::GeneralClass {
+                class: engine::GeneralClass::Iso2768Fine
+            }
+        );
     }
 
     #[test]
@@ -6098,6 +6313,9 @@ mod tests {
             request: StorefrontRequest {
                 material_preference: "6061-T6".to_string(),
                 quantity: Some(2),
+                tolerance: None,
+                tolerance_critical: None,
+                tolerance_note: None,
             },
             files: vec![],
         }
@@ -6262,6 +6480,9 @@ mod tests {
             request: StorefrontRequest {
                 material_preference: "AL_6061_T6".to_string(),
                 quantity: Some(3),
+                tolerance: None,
+                tolerance_critical: None,
+                tolerance_note: None,
             },
             files: vec![StorefrontFile {
                 filename: filename.to_string(),
