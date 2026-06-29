@@ -311,6 +311,8 @@ pub fn run() {
             commands::override_quote_margin,
             commands::set_quote_stock_form,
             commands::set_quote_gear_ops,
+            // T5 / ADR-0097 Part 2 — per-job tolerance editor + reprice.
+            commands::set_quote_tolerance,
             // S431 — Approved Vendor List (AVL) master data.
             commands::list_avl_vendors,
             commands::get_avl_vendor,
@@ -364,6 +366,11 @@ pub fn run() {
             commands::create_gear_process,
             commands::update_gear_process,
             commands::delete_gear_process,
+            // T5 / ADR-0097 Part 2 — tolerance cost-rate catalogue CRUD.
+            commands::list_tolerance_cost_rates,
+            commands::create_tolerance_cost_rate,
+            commands::update_tolerance_cost_rate,
+            commands::delete_tolerance_cost_rate,
             // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
             commands::list_inventory_balances,
             // S432 — heat-lot assignment + material traceability report.

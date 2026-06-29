@@ -4283,6 +4283,17 @@ pub fn build_router(state: AppState) -> Router {
             "/api/quoting-gear-processes/:id",
             put(handle_update_gear_process).delete(handle_delete_gear_process),
         )
+        // T5 / ADR-0097 Part 2 — operator tolerance cost-rate catalogue.
+        // Mirrors the machine-rate routes (auth, tenant, audit) and wires the
+        // T4 `quoting_tolerance_cost_rates` handlers to HTTP.
+        .route(
+            "/api/quoting-tolerance-cost-rates",
+            get(handle_list_tolerance_cost_rates).post(handle_create_tolerance_cost_rate),
+        )
+        .route(
+            "/api/quoting-tolerance-cost-rates/:id",
+            put(handle_update_tolerance_cost_rate).delete(handle_delete_tolerance_cost_rate),
+        )
         // S273 / PR-262 / ADR-0069 — material-side inventory balances
         // (on_hand / reserved / committed / consumed). Read-only in v1;
         // writes happen via the DEAL saga (committed) and the future
@@ -4720,6 +4731,12 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/quote-pricing-jobs/:quote_id/gear-ops",
             post(handle_set_quote_gear_ops),
+        )
+        // T5 / ADR-0097 Part 2 — set/clear the operator's per-job tolerance
+        // (overall spec + per-critical-feature callouts) + in-place re-price.
+        .route(
+            "/api/quote-pricing-jobs/:quote_id/tolerance",
+            post(handle_set_quote_tolerance),
         )
         // S416 — the operator accept-on-behalf route (S354 / PR-42 / U16)
         // was REMOVED: it was redundant (the customer accepts via the
@@ -13151,6 +13168,390 @@ pub fn set_quote_gear_ops_request(
     }
 }
 
+// ── T5 / ADR-0097 Part 2 — operator per-job tolerance intake + reprice ──
+//
+// Mirrors the S6 gear-ops route: validate the operator's overall tolerance +
+// per-critical-feature callouts into the engine wire shapes, persist them on
+// the job (denormalised band + structured spec_json + manual-review flag),
+// then re-price in place so the operator sees the corrected band +
+// `tolerance_cost` immediately. Operator-only (full IT-grade/± professional
+// taxonomy); the customer storefront field is T6.
+
+/// Request body for `POST /api/quote-pricing-jobs/:quote_id/tolerance`. Field
+/// names + value shapes are the engine wire contract: `overall` is a
+/// [`aberp_quote_engine::ToleranceSpec`], `critical_features` a list of
+/// [`aberp_quote_engine::FeatureTolerance`]. Serializing this struct yields
+/// exactly the `quote_pricing_pipeline::PerJobTolerance`
+/// (`{ overall, critical_features }`) blob the pipeline restamps. An all-default
+/// body (overall Unspecified + no callouts) clears the override back to the
+/// inert default (byte-identical pricing).
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Default)]
+pub struct ToleranceBody {
+    #[serde(default)]
+    pub overall: aberp_quote_engine::ToleranceSpec,
+    #[serde(default)]
+    pub critical_features: Vec<aberp_quote_engine::FeatureTolerance>,
+}
+
+/// Typed error for the tolerance route, mapped to an HTTP status by the
+/// handler. Mirrors [`GearOpsError`].
+pub enum ToleranceError {
+    Invalid(String),
+    NotFound,
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for ToleranceError {
+    fn from(e: anyhow::Error) -> Self {
+        ToleranceError::Other(e)
+    }
+}
+
+/// `true` when the body carries no signal (overall Unspecified AND no
+/// callouts) — treated as "clear the override" (inert ⇒ byte-identical).
+fn tolerance_body_is_inert(body: &ToleranceBody) -> bool {
+    body.overall.is_unspecified() && body.critical_features.is_empty()
+}
+
+/// Validate one [`aberp_quote_engine::ToleranceSpec`]'s numerics. The serde
+/// tagged-enum already enforced the closed `kind`/`class` vocab on decode; the
+/// only open numeric is the explicit ± half-width, which must be finite + > 0.
+/// IT grades saturate at the band edges in the engine, so any `u8` is valid.
+fn validate_tolerance_spec(
+    spec: &aberp_quote_engine::ToleranceSpec,
+    where_: &str,
+) -> std::result::Result<(), ToleranceError> {
+    if let aberp_quote_engine::ToleranceSpec::PlusMinus { value_mm } = spec {
+        if !(value_mm.is_finite() && *value_mm > 0.0) {
+            return Err(ToleranceError::Invalid(format!(
+                "{where_}: a +/- value_mm must be finite and > 0"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the operator tolerance body's closed vocab + numerics BEFORE
+/// persisting — the pipeline's `operator_tolerance` treats a malformed stored
+/// blob as corruption (fail-loud), so the route is the validation home (the
+/// documented T5 responsibility). `num_features` is the extracted graph's
+/// feature count (`None` when not yet extracted — index bounds are then
+/// deferred; the spec stays inert until pricing). Pure + total; unit-tested.
+fn validate_tolerance_body(
+    body: &ToleranceBody,
+    num_features: Option<usize>,
+) -> std::result::Result<(), ToleranceError> {
+    validate_tolerance_spec(&body.overall, "overall")?;
+    for (i, ft) in body.critical_features.iter().enumerate() {
+        validate_tolerance_spec(&ft.spec, &format!("critical feature {i}"))?;
+        if let Some(n) = num_features {
+            if ft.feature_index >= n {
+                return Err(ToleranceError::Invalid(format!(
+                    "critical feature {i}: feature_index {} out of range (part has {} features)",
+                    ft.feature_index, n
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the denormalised overall band + manual-review flag the route
+/// persists, mirroring the pipeline's `stamp_tolerance` resolution so the
+/// SPA-displayed band matches what the engine prices on. `part_nominal_mm` is
+/// the part's characteristic size (largest bounding-box extent) for a
+/// size-aware ± overall; `tightness` ignores it for the other dialects. An
+/// overall `Unspecified` resolves to `None` (no overall band — only critical
+/// features were tightened); per-drawing or any per-drawing callout raises the
+/// manual-review flag (never silently tightened — ADR-0097 Q5). Pure;
+/// unit-tested.
+fn resolve_tolerance_band(
+    overall: aberp_quote_engine::ToleranceSpec,
+    critical_features: &[aberp_quote_engine::FeatureTolerance],
+    part_nominal_mm: f64,
+) -> (Option<String>, bool) {
+    let manual_review = overall.requires_manual_review()
+        || critical_features
+            .iter()
+            .any(|ft| ft.spec.requires_manual_review());
+    let band = if overall.is_unspecified() {
+        None
+    } else {
+        Some(
+            aberp_quote_engine::tightness(overall, part_nominal_mm)
+                .as_db_str()
+                .to_string(),
+        )
+    };
+    (band, manual_review)
+}
+
+/// `POST /api/quote-pricing-jobs/:quote_id/tolerance` — set or clear the
+/// operator's per-job tolerance, then re-price the job in place so the operator
+/// sees the resolved band + corrected price immediately. Bearer-gated like the
+/// stock-form / gear-ops siblings. 400 on an invalid spec; 404 when no row
+/// matches; 200 `{ ok, tolerance_class, manual_review, total_price_eur,
+/// below_floor, repriced }`.
+async fn handle_set_quote_tolerance(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(quote_id): AxumPath<String>,
+    Json(body): Json<ToleranceBody>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if !is_quote_id_shape(&quote_id) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "invalid quote_id"})),
+        )
+            .into_response();
+    }
+    let state_for_task = state.clone();
+    let qid = quote_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        set_quote_tolerance_request(&state_for_task, &qid, body)
+    })
+    .await;
+    match result {
+        Ok(Ok(v)) => (axum::http::StatusCode::OK, axum::Json(v)).into_response(),
+        Ok(Err(ToleranceError::Invalid(msg))) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "InvalidTolerance", "message": msg})),
+        )
+            .into_response(),
+        Ok(Err(ToleranceError::NotFound)) => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(error_body(format!(
+                "no pricing job found with quote_id {quote_id}"
+            ))),
+        )
+            .into_response(),
+        Ok(Err(ToleranceError::Other(e))) => internal_error("set_quote_tolerance_request", e),
+        Err(join_err) => internal_error(
+            "set_quote_tolerance_request:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+/// Library helper backing the tolerance route. `pub` so the integration test
+/// can hit it without the HTTPS listener (same posture as the gear-ops
+/// helper). Validates the closed vocab, resolves the denormalised band + the
+/// manual-review flag, persists (or clears) the per-job tolerance columns,
+/// re-prices in place (the re-price re-reads the columns + re-stamps the
+/// graph), and persists the corrected breakdown + price.
+pub fn set_quote_tolerance_request(
+    state: &AppState,
+    quote_id: &str,
+    body: ToleranceBody,
+) -> std::result::Result<serde_json::Value, ToleranceError> {
+    let conn = Connection::open(&*state.db_path)
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tenant = state.tenant.as_str();
+    let now = time::OffsetDateTime::now_utc();
+
+    // Existence check + the part nominal (largest bbox extent) for a
+    // size-aware ± overall. NotFound when no row matches (mirrors gear-ops).
+    let Some(detail) = crate::quote_pricing_jobs::get_job_detail(&conn, quote_id, tenant)? else {
+        return Err(ToleranceError::NotFound);
+    };
+    let graph: Option<aberp_quote_engine::FeatureGraph> = detail
+        .feature_graph_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let num_features = graph.as_ref().map(|g| g.features.len());
+    let part_nominal_mm = graph
+        .as_ref()
+        .map(|g| g.bounding_box_mm.iter().copied().fold(0.0_f64, f64::max))
+        .unwrap_or(0.0);
+
+    validate_tolerance_body(&body, num_features)?;
+
+    // Persist FIRST so the in-place re-price re-reads the columns + re-stamps
+    // the graph (operator > extractor hint > default), exactly like gear-ops.
+    let applied = if tolerance_body_is_inert(&body) {
+        // Clear back to the inert default ⇒ byte-identical pricing.
+        crate::quote_pricing_jobs::set_tolerance(&conn, quote_id, tenant, None, None, None, now)?
+    } else {
+        let (band, manual_review) =
+            resolve_tolerance_band(body.overall, &body.critical_features, part_nominal_mm);
+        // The structured spec the pipeline restamps onto the graph; serializing
+        // `ToleranceBody` yields exactly `PerJobTolerance` (`{ overall,
+        // critical_features }`), the engine wire shapes being the contract.
+        let spec_json =
+            serde_json::to_string(&body).context("serialize per-job tolerance spec_json")?;
+        crate::quote_pricing_jobs::set_tolerance(
+            &conn,
+            quote_id,
+            tenant,
+            band.as_deref(),
+            Some(&spec_json),
+            Some(manual_review),
+            now,
+        )?
+    };
+    if !applied {
+        return Err(ToleranceError::NotFound);
+    }
+
+    // Re-read the persisted denormalised band + flag for the response (both
+    // NULL/false after a clear).
+    let (tolerance_class, manual_review) =
+        match crate::quote_pricing_jobs::get_job_detail(&conn, quote_id, tenant)? {
+            Some(d) => (d.tolerance_class, d.tolerance_manual_review.unwrap_or(false)),
+            None => (None, false),
+        };
+
+    // Re-price in place — `reprice_quote` re-reads the stored tolerance + the
+    // cost-rate catalogue and re-stamps (T4 fixed the "reprice hardcodes
+    // Standard" defect).
+    match crate::quote_pricing_pipeline::reprice_quote(&conn, tenant, quote_id, None)? {
+        Some(outcome) => {
+            crate::quote_pricing_jobs::set_margin_result(
+                &conn,
+                quote_id,
+                tenant,
+                &outcome.breakdown_json,
+                outcome.total_price,
+                outcome.below_floor,
+                outcome.floor_pct,
+                now,
+            )?;
+            Ok(serde_json::json!({
+                "ok": true,
+                "tolerance_class": tolerance_class,
+                "manual_review": manual_review,
+                "total_price_eur": outcome.total_price,
+                "below_floor": outcome.below_floor,
+                "repriced": true,
+            }))
+        }
+        None => Ok(serde_json::json!({
+            "ok": true,
+            "tolerance_class": tolerance_class,
+            "manual_review": manual_review,
+            "total_price_eur": serde_json::Value::Null,
+            "below_floor": false,
+            "repriced": false,
+        })),
+    }
+}
+
+#[cfg(test)]
+mod t5_tolerance_route_tests {
+    //! Pure unit tests for the T5 tolerance-route helpers. These need no
+    //! DuckDB/HTTP, but live in `serve.rs` (DuckDB-linked) so they run on the
+    //! CI both-arm build, not in the toolchain-free sandbox.
+    use super::{resolve_tolerance_band, validate_tolerance_body, ToleranceBody, ToleranceError};
+    use aberp_quote_engine::{FeatureTolerance, GeneralClass, ToleranceSpec};
+
+    #[test]
+    fn inert_overall_resolves_to_no_band_no_review() {
+        let (band, review) = resolve_tolerance_band(ToleranceSpec::Unspecified, &[], 0.0);
+        assert_eq!(band, None);
+        assert!(!review);
+    }
+
+    #[test]
+    fn general_class_resolves_to_its_band() {
+        let (band, review) = resolve_tolerance_band(
+            ToleranceSpec::GeneralClass {
+                class: GeneralClass::Iso2768Fine,
+            },
+            &[],
+            0.0,
+        );
+        assert_eq!(band.as_deref(), Some("tight"));
+        assert!(!review);
+    }
+
+    #[test]
+    fn it_grade_resolves_size_independent() {
+        let (band, _) = resolve_tolerance_band(ToleranceSpec::ItGrade { grade: 7 }, &[], 0.0);
+        assert_eq!(band.as_deref(), Some("precision"));
+    }
+
+    #[test]
+    fn plus_minus_is_size_aware() {
+        // The same +/- is a tighter IT grade on a larger nominal (ISO 286), so
+        // the resolved band must differ with the part size.
+        let small =
+            resolve_tolerance_band(ToleranceSpec::PlusMinus { value_mm: 0.01 }, &[], 10.0).0;
+        let large =
+            resolve_tolerance_band(ToleranceSpec::PlusMinus { value_mm: 0.01 }, &[], 250.0).0;
+        assert!(small.is_some() && large.is_some());
+        assert_ne!(small, large);
+    }
+
+    #[test]
+    fn per_drawing_overall_flags_manual_review_without_silent_band() {
+        let (band, review) = resolve_tolerance_band(ToleranceSpec::PerDrawing, &[], 0.0);
+        // per-drawing prices at the default band (standard) but flags review.
+        assert_eq!(band.as_deref(), Some("standard"));
+        assert!(review);
+    }
+
+    #[test]
+    fn per_drawing_critical_feature_flags_review_even_with_inert_overall() {
+        let cfs = vec![FeatureTolerance {
+            feature_index: 0,
+            spec: ToleranceSpec::PerDrawing,
+        }];
+        let (band, review) = resolve_tolerance_band(ToleranceSpec::Unspecified, &cfs, 0.0);
+        assert_eq!(band, None); // overall unspecified ⇒ no overall band
+        assert!(review); // ...but the per-drawing callout still flags review
+    }
+
+    #[test]
+    fn validate_rejects_nonpositive_plus_minus() {
+        let body = ToleranceBody {
+            overall: ToleranceSpec::PlusMinus { value_mm: 0.0 },
+            critical_features: vec![],
+        };
+        assert!(matches!(
+            validate_tolerance_body(&body, None),
+            Err(ToleranceError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_feature_index() {
+        let body = ToleranceBody {
+            overall: ToleranceSpec::Unspecified,
+            critical_features: vec![FeatureTolerance {
+                feature_index: 5,
+                spec: ToleranceSpec::ItGrade { grade: 6 },
+            }],
+        };
+        // part has 2 features ⇒ index 5 is out of range.
+        assert!(matches!(
+            validate_tolerance_body(&body, Some(2)),
+            Err(ToleranceError::Invalid(_))
+        ));
+        // ...but with no extracted graph yet, the bound is deferred (Ok).
+        assert!(validate_tolerance_body(&body, None).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_body() {
+        let body = ToleranceBody {
+            overall: ToleranceSpec::GeneralClass {
+                class: GeneralClass::Iso2768Medium,
+            },
+            critical_features: vec![FeatureTolerance {
+                feature_index: 0,
+                spec: ToleranceSpec::PlusMinus { value_mm: 0.01 },
+            }],
+        };
+        assert!(validate_tolerance_body(&body, Some(3)).is_ok());
+    }
+}
+
 /// Emit the margin-provenance events (global-margin / below-floor) after a
 /// re-price triggered by a buyer-partner change. Mirrors the daemon's
 /// first-pricing emission so an operator-assigned buyer leaves the same
@@ -14635,6 +15036,164 @@ async fn handle_delete_gear_process(
         Ok(Err(e)) => tunable_write_response(e, "delete_gear_process"),
         Err(join_err) => internal_error(
             "delete_gear_process:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+// ── quoting_tolerance_cost_rates (ADR-0097 Part 2, T5) ───────────────
+// Mirrors the machine-rate CRUD handlers verbatim (bearer-gated, blocking
+// DuckDB on a worker, reused `tunable_write_response` mapping). Wires the T4
+// `crate::quoting_tolerance_cost_rates` handlers (list/create/update/delete)
+// to HTTP so the operator SPA can manage the per-band cost drivers.
+
+async fn handle_list_tolerance_cost_rates(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<Vec<crate::quoting_tolerance_cost_rates::ToleranceCostRateRow>> {
+            let conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            crate::quoting_tolerance_cost_rates::list_tolerance_cost_rates(
+                &conn,
+                state_for_task.tenant.as_str(),
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "rates": rows })).into_response(),
+        Ok(Err(e)) => internal_error("list_tolerance_cost_rates", e),
+        Err(join_err) => internal_error(
+            "list_tolerance_cost_rates:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_create_tolerance_cost_rate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(inputs): Json<crate::quoting_tolerance_cost_rates::ToleranceCostRateInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_tolerance_cost_rates::create_tolerance_cost_rate(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => (StatusCode::CREATED, Json(row)).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "create_tolerance_cost_rate"),
+        Err(join_err) => internal_error(
+            "create_tolerance_cost_rate:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_update_tolerance_cost_rate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(inputs): Json<crate::quoting_tolerance_cost_rates::ToleranceCostRateInputs>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_tolerance_cost_rates::update_tolerance_cost_rate(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &id,
+                &inputs,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => Json(row).into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "update_tolerance_cost_rate"),
+        Err(join_err) => internal_error(
+            "update_tolerance_cost_rate:join",
+            anyhow!("blocking task panicked: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_delete_tolerance_cost_rate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let login = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<(), crate::quoting_tunables::TunableWriteError> {
+            let mut conn = Connection::open(&*state_for_task.db_path).with_context(|| {
+                format!("open tenant DuckDB at {}", state_for_task.db_path.display())
+            })?;
+            let meta = tunable_ledger_meta(&state_for_task)?;
+            crate::quoting_tolerance_cost_rates::delete_tolerance_cost_rate(
+                &mut conn,
+                &meta,
+                &login,
+                state_for_task.tenant.as_str(),
+                &id,
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => tunable_write_response(e, "delete_tolerance_cost_rate"),
+        Err(join_err) => internal_error(
+            "delete_tolerance_cost_rate:join",
             anyhow!("blocking task panicked: {join_err}"),
         ),
     }
@@ -22629,6 +23188,15 @@ struct PricingJobDetailView {
     /// JSON array string; `null`/empty = no gears (inert). The intake control
     /// seeds from this and POSTs changes to `…/gear-ops`.
     gear_ops_json: Option<String>,
+    /// T5 / ADR-0097 Part 2 — operator per-job tolerance. `tolerance_class` is
+    /// the resolved overall band db-string (denormalised, for the SPA
+    /// display); `tolerance_spec_json` the structured `{ overall,
+    /// critical_features }` blob the editor seeds from + POSTs to
+    /// `…/tolerance`; `tolerance_manual_review` raises the per-drawing (GD&T)
+    /// banner. All `null` = unset ⇒ inert.
+    tolerance_class: Option<String>,
+    tolerance_spec_json: Option<String>,
+    tolerance_manual_review: Option<bool>,
 }
 
 /// S349 / PR-40 (U1) — `GET /api/quote-pricing-jobs/:quote_id`. Bearer-
@@ -22721,6 +23289,9 @@ async fn handle_get_quote_pricing_job_detail(
         stock_id_mm: d.stock_id_mm,
         stock_length_mm: d.stock_length_mm,
         gear_ops_json: d.gear_ops_json,
+        tolerance_class: d.tolerance_class,
+        tolerance_spec_json: d.tolerance_spec_json,
+        tolerance_manual_review: d.tolerance_manual_review,
     };
     (axum::http::StatusCode::OK, axum::Json(view)).into_response()
 }
