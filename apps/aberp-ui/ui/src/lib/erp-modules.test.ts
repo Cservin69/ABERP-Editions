@@ -73,6 +73,8 @@ const ALL_APP_ROUTES: AppRoute[] = [
   "quoting-machine-rates",
   // S6 / ADR-0094 Gap 3 — gear-process coefficient catalogue.
   "quoting-gear-processes",
+  // T5 / ADR-0097 Part 2 — tolerance cost-rate catalogue.
+  "quoting-tolerance-cost-rates",
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
   "inventory-balances",
   // S281 / PR-266 — storefront email-relay queue inspector.
@@ -143,6 +145,7 @@ const EXPECTED_OWNER: Partial<Record<AppRoute, ErpModuleId>> = {
   "quoting-stock-adjustments": "quoting",
   "quoting-machine-rates": "quoting",
   "quoting-gear-processes": "quoting",
+  "quoting-tolerance-cost-rates": "quoting",
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances; lives
   // under Quoting because the operator visits it when prepping a new
   // grade (the DEAL saga's auto-upsert lands the row at zeros until
@@ -199,6 +202,7 @@ const EXPECTED_AREA: Record<AppRoute, ErpArea> = {
   "quoting-stock-adjustments": "maintenance",
   "quoting-machine-rates": "maintenance",
   "quoting-gear-processes": "maintenance",
+  "quoting-tolerance-cost-rates": "maintenance",
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances.
   "inventory-balances": "maintenance",
   // S281 / PR-266 — storefront email-relay queue inspector.
@@ -256,6 +260,8 @@ const ALL_TILE_STATUS_KINDS: Set<MaintenanceTileStatusKind> = new Set<
   "MachineRateCount",
   // S6 / ADR-0094 Gap 3 — gear-process tile.
   "GearProcessCount",
+  // T5 / ADR-0097 Part 2 — tolerance cost-rate tile.
+  "ToleranceCostRateCount",
   // S273 / PR-262 / ADR-0069 — material-side balances tile.
   "InventoryBalanceCount",
   // S281 / PR-266 — storefront email-relay queue tile.

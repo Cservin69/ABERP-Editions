@@ -110,6 +110,7 @@
   import QuotingStockAdjustmentsList from "./routes/QuotingStockAdjustmentsList.svelte";
   import MachineRatesList from "./routes/MachineRatesList.svelte";
   import GearProcessesList from "./routes/GearProcessesList.svelte";
+  import QuotingToleranceCostRatesList from "./routes/QuotingToleranceCostRatesList.svelte";
   // S273 / PR-262 / ADR-0069 — material-side Inventory Balances view.
   import InventoryBalancesList from "./routes/InventoryBalancesList.svelte";
   // S281 / PR-266 — storefront email-relay queue inspector (ADR-0007).
@@ -784,6 +785,8 @@
           <MachineRatesList />
         {:else if route === "quoting-gear-processes"}
           <GearProcessesList />
+        {:else if route === "quoting-tolerance-cost-rates"}
+          <QuotingToleranceCostRatesList />
         {:else if route === "inventory-balances"}
           <InventoryBalancesList />
         {:else if route === "email-relay-queue"}

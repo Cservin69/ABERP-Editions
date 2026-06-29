@@ -2502,6 +2502,122 @@ export async function deleteGearProcess(id: string): Promise<void> {
   await invoke<void>("delete_gear_process", { id });
 }
 
+// ── T5 / ADR-0097 Part 2 — tolerance cost-rate catalogue CRUD ────────
+
+/** T5 — a `quoting_tolerance_cost_rates` row (band-keyed cost drivers).
+ * Mirrors `aberp::quoting_tolerance_cost_rates::ToleranceCostRateRow`'s
+ * `#[derive(Serialize)]`. One row per ToleranceRange band per tenant. */
+export interface ToleranceCostRate {
+  /** Prefixed-ULID `qtcr_<26-char-ULID>`. */
+  id: string;
+  /** Governing band db-string (mirrors `ToleranceRange::as_db_str`). */
+  tolerance_class: ToleranceRange;
+  finish_passes_add: number;
+  inproc_inspection_min: number;
+  cmm_min_per_critical_feature: number;
+  rework_scrap_pct: number;
+  feed_slowdown_factor: number;
+  grinding_escalation: boolean;
+  notes: string | null;
+  updated_at: string;
+  updated_by_actor: string;
+}
+
+/** T5 — request body for create/update. Mirror of
+ * `aberp::quoting_tolerance_cost_rates::ToleranceCostRateInputs`. */
+export interface ToleranceCostRateInput {
+  tolerance_class: ToleranceRange;
+  finish_passes_add: number;
+  inproc_inspection_min: number;
+  cmm_min_per_critical_feature: number;
+  rework_scrap_pct: number;
+  feed_slowdown_factor: number;
+  grinding_escalation: boolean;
+  notes: string | null;
+}
+
+export async function listToleranceCostRates(): Promise<{
+  rates: ToleranceCostRate[];
+}> {
+  return invoke<{ rates: ToleranceCostRate[] }>("list_tolerance_cost_rates");
+}
+export async function createToleranceCostRate(
+  body: ToleranceCostRateInput,
+): Promise<ToleranceCostRate> {
+  return invoke<ToleranceCostRate>("create_tolerance_cost_rate", { body });
+}
+export async function updateToleranceCostRate(
+  id: string,
+  body: ToleranceCostRateInput,
+): Promise<ToleranceCostRate> {
+  return invoke<ToleranceCostRate>("update_tolerance_cost_rate", { id, body });
+}
+export async function deleteToleranceCostRate(id: string): Promise<void> {
+  await invoke<void>("delete_tolerance_cost_rate", { id });
+}
+
+// ── T5 / ADR-0097 Part 2 — per-job tolerance editor (operator intake) ─
+
+/** T5 — ISO 2768 general-tolerance class (mirrors
+ * `aberp_quote_engine::GeneralClass::as_db_str`). */
+export type GeneralClassDb =
+  | "iso2768_fine"
+  | "iso2768_medium"
+  | "iso2768_coarse"
+  | "iso2768_very_coarse";
+
+/** T5 — the drawing-side tolerance specification. A serde-tagged union
+ * mirroring `aberp_quote_engine::ToleranceSpec` (`tag = "kind"`, snake_case).
+ * `unspecified` is the inert default (defers to the resolved target). */
+export type ToleranceSpec =
+  | { kind: "unspecified" }
+  | { kind: "general_class"; class: GeneralClassDb }
+  | { kind: "it_grade"; grade: number }
+  | { kind: "plus_minus"; value_mm: number }
+  | { kind: "per_drawing" };
+
+/** T5 — a per-critical-feature tolerance callout (mirrors
+ * `aberp_quote_engine::FeatureTolerance`). `feature_index` binds it to
+ * `FeatureGraph.features[feature_index]`. */
+export interface FeatureTolerance {
+  feature_index: number;
+  spec: ToleranceSpec;
+}
+
+/** T5 — request body for `POST /…/tolerance`: the part's overall spec + the
+ * per-critical-feature callouts. An all-default body (overall `unspecified`,
+ * no callouts) clears the override back to inert. */
+export interface ToleranceBody {
+  overall: ToleranceSpec;
+  critical_features: FeatureTolerance[];
+}
+
+/** T5 — `POST /…/tolerance` result: the resolved band + in-place re-price. */
+export interface ToleranceResult {
+  ok: boolean;
+  /** Resolved overall band db-string, or `null` when overall is unspecified
+   * (only critical features tightened) or the override was cleared. */
+  tolerance_class: ToleranceRange | null;
+  /** `true` when a per-drawing (GD&T) spec needs manual review. */
+  manual_review: boolean;
+  total_price_eur: number | null;
+  below_floor: boolean;
+  repriced: boolean;
+}
+
+/** T5 — set/clear the operator's per-job tolerance and re-price in place. An
+ * all-default body clears the override. Operator-only (full professional
+ * taxonomy: class / IT grade / explicit ±). */
+export async function setQuoteTolerance(
+  quoteId: string,
+  body: ToleranceBody,
+): Promise<ToleranceResult> {
+  return await invoke<ToleranceResult>("set_quote_tolerance", {
+    quoteId,
+    body,
+  });
+}
+
 // ── S273 / PR-262 / ADR-0069 — material-side Inventory Balances ──────
 
 /** S273 — one row of `inventory_balances`, plus a derived
@@ -4302,6 +4418,12 @@ export interface PricingBreakdownView {
   /** S418 — amortised one-time CAD-CAM design cost line. */
   cad_cam_cost?: number;
   setup_cost?: number;
+  /** T5 / ADR-0097 Part 2 — additive machining-tolerance cost line (in-process
+   * gauging + CMM + scrap/rework + slower-feed finishing + tightest-band
+   * grinding adder). The engine omits the key when zero
+   * (`skip_serializing_if`), so it surfaces only when a tighter spec/callout +
+   * seeded rates make it > 0. */
+  tolerance_cost?: number;
   overhead?: number;
   margin?: number;
   total_price?: number;
@@ -4379,6 +4501,14 @@ export interface PricingJobDetail extends PricingJobRow {
    * array string, or `null`/empty when no gears (the inert default). The
    * intake control parses this to seed its rows and POSTs changes back. */
   gear_ops_json: string | null;
+  /** T5 / ADR-0097 Part 2 — operator per-job tolerance. `tolerance_class` is
+   * the resolved overall band db-string (denormalised, for display), or `null`
+   * when unset. `tolerance_spec_json` is the structured `{ overall,
+   * critical_features }` blob the editor seeds from. `tolerance_manual_review`
+   * raises the per-drawing (GD&T) banner. */
+  tolerance_class: string | null;
+  tolerance_spec_json: string | null;
+  tolerance_manual_review: boolean | null;
 }
 
 /** S349 / PR-40 (U1) — fetch the full detail for one pricing job.

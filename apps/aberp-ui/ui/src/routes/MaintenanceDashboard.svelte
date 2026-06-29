@@ -49,6 +49,7 @@
     listStockAdjustments,
     listGearProcesses,
     listMachineRates,
+    listToleranceCostRates,
     listToleranceMultipliers,
     type NavCredentialsStatusResponse,
     type SellerInfoResponse,
@@ -310,6 +311,13 @@
         const res = await listGearProcesses();
         const n = res.processes.length;
         return n === 1 ? "1 process" : `${n} processes`;
+      }
+      case "ToleranceCostRateCount": {
+        // T5 / ADR-0097 Part 2 — count of per-band tolerance cost-rate rows.
+        // Seeded zero-contribution (5 bands) on a fresh tenant.
+        const res = await listToleranceCostRates();
+        const n = res.rates.length;
+        return n === 1 ? "1 band" : `${n} bands`;
       }
       case "InventoryBalanceCount": {
         // S273 / PR-262 / ADR-0069 — count of `(tenant,

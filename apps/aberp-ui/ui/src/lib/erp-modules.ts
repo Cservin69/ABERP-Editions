@@ -331,6 +331,8 @@ export const MODULES: ErpModule[] = [
       { id: "quoting-machine-rates", label: "Machine rates" },
       // S6 / ADR-0094 Gap 3 — per-process gear-generation coefficient catalogue.
       { id: "quoting-gear-processes", label: "Gear processes" },
+      // T5 / ADR-0097 Part 2 — per-band tolerance cost-rate catalogue.
+      { id: "quoting-tolerance-cost-rates", label: "Tolerance cost rates" },
       // S273 / PR-262 / ADR-0069 — material-side balances feed the DEAL
       // saga's `committed_qty +=` check. Read-only operator view in v1;
       // sits beside the engine tunables because the operator visits
@@ -511,6 +513,9 @@ export type MaintenanceTileStatusKind =
   // S4 / ADR-0094 Gap 2 — count of per-family machine-rate rows.
   | "MachineRateCount"
   | "GearProcessCount"
+  // T5 / ADR-0097 Part 2 — count of per-band tolerance cost-rate rows
+  // (seeded zero-contribution, 5 bands, on a fresh tenant).
+  | "ToleranceCostRateCount"
   // S273 / PR-262 / ADR-0069 — material-side inventory balances. The
   // tile's chip surfaces "N grades" — the count of `(tenant,
   // material_grade)` rows the operator has seeded balances for. Zero
@@ -728,6 +733,16 @@ export const MAINTENANCE_TILES: MaintenanceTile[] = [
     description_hu: "Eljárásonkénti fog-generálási idő-együtthatók",
     description_en: "Per-process tooth-generation time coefficients",
     statusKind: "GearProcessCount",
+  },
+  // T5 / ADR-0097 Part 2 — per-band tolerance cost-rate catalogue tile.
+  {
+    moduleId: "quoting",
+    route: "quoting-tolerance-cost-rates",
+    label_hu: "Tűrési költségek",
+    label_en: "Tolerance cost rates",
+    description_hu: "Sávonkénti tűrés-költségtényezők (mérés, CMM, selejt, csiszolás)",
+    description_en: "Per-band tolerance cost drivers (gauging, CMM, scrap, grinding)",
+    statusKind: "ToleranceCostRateCount",
   },
   // S273 / PR-262 / ADR-0069 — material-side balances tile. Read-only
   // operator surface that surfaces the DEAL saga's `committed_qty`
