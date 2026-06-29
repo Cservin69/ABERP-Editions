@@ -146,6 +146,10 @@ export function breakdownRows(
     ["labor_cost", "Megmunkálás / Machining"],
     ["cad_cam_cost", "Tervezés (CAD-CAM) / CAD-CAM"],
     ["setup_cost", "Beállítás / Setup"],
+    // T5 / ADR-0097 Part 2 — additive machining-tolerance line. Only
+    // present when a tighter spec/callout + seeded rates make it > 0
+    // (the engine omits the zero key), so an inert quote renders no row.
+    ["tolerance_cost", "Tűrés / Tolerance"],
     ["overhead", "Rezsi / Overhead"],
     ["margin", "Árrés / Margin"],
     ["total_price", "Végösszeg / Total"],

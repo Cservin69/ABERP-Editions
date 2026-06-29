@@ -153,6 +153,32 @@ describe("breakdownRows", () => {
     expect(rows[6].label).toContain("Total");
   });
 
+  it("inserts the T5 tolerance_cost line between Setup and Overhead when > 0", () => {
+    const bd: PricingBreakdownView = {
+      material_cost: 10,
+      labor_cost: 20,
+      cad_cam_cost: 8,
+      setup_cost: 5,
+      tolerance_cost: 6,
+      overhead: 3,
+      margin: 7,
+      total_price: 59,
+    };
+    const rows = breakdownRows(bd);
+    expect(rows.map((r) => r.value)).toEqual([10, 20, 8, 5, 6, 3, 7, 59]);
+    expect(rows[4].label).toContain("Tolerance");
+  });
+
+  it("omits the tolerance_cost line when absent (inert quote, no phantom 0.00)", () => {
+    const bd: PricingBreakdownView = {
+      material_cost: 10,
+      setup_cost: 5,
+      total_price: 15,
+    };
+    const labels = breakdownRows(bd).map((r) => r.label);
+    expect(labels.some((l) => l.includes("Tolerance"))).toBe(false);
+  });
+
   it("omits a line that is absent rather than rendering 0.00", () => {
     const bd: PricingBreakdownView = { total_price: 45 };
     const rows = breakdownRows(bd);

@@ -24,6 +24,7 @@
     setQuoteBuyerPartner,
     setQuoteStockForm,
     setQuoteGearOps,
+    setQuoteTolerance,
     retryQuotePricingJob,
     MaterialEditError,
     type AuditEntryView,
@@ -40,6 +41,21 @@
     gearProcessLabel,
     selectGearProcess,
   } from "../lib/gear-processes";
+  // T5 / ADR-0097 Part 2 — per-job tolerance editor helpers + labels.
+  import {
+    composeToleranceBody,
+    emptySpecDraft,
+    emptyToleranceEditorState,
+    GENERAL_CLASSES,
+    parseToleranceSpecJson,
+    toleranceEditorIsInert,
+    TOLERANCE_SPEC_KINDS,
+    type ToleranceEditorState,
+  } from "../lib/job-tolerance";
+  import {
+    featureTypeLabel,
+    toleranceRangeLabel,
+  } from "../lib/quoting-tunables-format";
   import { formatPercent } from "../lib/margin-profiles";
   import PartnerTypeahead from "../lib/PartnerTypeahead.svelte";
   // S427 — lead-time chip colour + effective-value helper (pure).
@@ -160,6 +176,16 @@
   let gearError = $state<string | null>(null);
   let gearToast = $state<string | null>(null);
 
+  // T5 / ADR-0097 Part 2 — operator per-job tolerance editor state. The draft
+  // is the structured { overall, critical_features } the route persists +
+  // re-prices on. Mirrors the gear-ops control (string-typed inputs, parsed on
+  // save); an all-inert draft clears the override back to the default band.
+  let editingTolerance = $state(false);
+  let tolState = $state<ToleranceEditorState>(emptyToleranceEditorState());
+  let tolBusy = $state(false);
+  let tolError = $state<string | null>(null);
+  let tolToast = $state<string | null>(null);
+
   const AUDIT_PAGE = 50;
 
   // Derived sections — all read off the one audit page we fetch.
@@ -167,6 +193,15 @@
   const writeback = $derived(latestWritebackOutcome(auditEvents));
   const priceRows = $derived(breakdownRows(detail?.breakdown ?? null));
   const reasoningLog = $derived(reasoningLogLines(detail?.breakdown ?? null));
+
+  // T5 — feature dropdown options for per-critical-feature tolerance callouts,
+  // derived from the extracted FeatureGraph (empty until the part is extracted).
+  const featureOptions = $derived(
+    (detail?.feature_graph?.features ?? []).map((f, i) => ({
+      index: i,
+      label: `#${i} ${featureTypeLabel(f.feature_type)} ${f.representative_size_mm}mm`,
+    })),
+  );
 
   // S427 — effective lead-time: override wins over engine-computed.
   const effLeadTime = $derived(
@@ -242,6 +277,11 @@
       gearError = null;
       gearToast = null;
       editingGears = false;
+      // T5 — seed the tolerance editor from the persisted tolerance_spec_json.
+      seedToleranceDrafts(d);
+      tolError = null;
+      tolToast = null;
+      editingTolerance = false;
       loadState = "ready";
     } catch (e) {
       errorMessage = e instanceof Error ? e.message : String(e);
@@ -619,6 +659,77 @@
       gearError = e instanceof Error ? e.message : String(e);
     } finally {
       gearBusy = false;
+    }
+  }
+
+  // ── T5 / ADR-0097 Part 2 — operator per-job tolerance intake ─────────
+  function seedToleranceDrafts(d: PricingJobDetail | null): void {
+    tolState = parseToleranceSpecJson(d?.tolerance_spec_json ?? null);
+  }
+
+  // Read-only summary: the resolved overall band (persisted, authoritative)
+  // plus the count of per-critical-feature callouts.
+  function toleranceSummary(d: PricingJobDetail): string {
+    const n = tolState.criticalFeatures.length;
+    const cf =
+      n === 0
+        ? ""
+        : n === 1
+          ? " + 1 kritikus jellemző / critical"
+          : ` + ${n} kritikus jellemző / critical`;
+    if (d.tolerance_class) {
+      return `${toleranceRangeLabel(d.tolerance_class)} sáv / band${cf}`;
+    }
+    if (n > 0) {
+      return `Alap sáv / default band${cf}`;
+    }
+    return "Alapértelmezett / Default (unspecified)";
+  }
+
+  function startToleranceEdit(): void {
+    if (!detail) return;
+    editingTolerance = true;
+    tolError = null;
+    tolToast = null;
+  }
+
+  function cancelToleranceEdit(): void {
+    editingTolerance = false;
+    tolError = null;
+    seedToleranceDrafts(detail); // discard unsaved edits
+  }
+
+  function addCriticalFeature(): void {
+    tolState.criticalFeatures = [
+      ...tolState.criticalFeatures,
+      {
+        featureIndex: String(featureOptions[0]?.index ?? 0),
+        spec: emptySpecDraft(),
+      },
+    ];
+  }
+
+  function removeCriticalFeature(i: number): void {
+    tolState.criticalFeatures = tolState.criticalFeatures.filter(
+      (_, idx) => idx !== i,
+    );
+  }
+
+  async function saveTolerance(): Promise<void> {
+    if (!quoteId) return;
+    tolBusy = true;
+    tolError = null;
+    try {
+      await setQuoteTolerance(quoteId, composeToleranceBody(tolState));
+      editingTolerance = false;
+      tolToast = toleranceEditorIsInert(tolState)
+        ? "Tűrés törölve, újraárazás… / Tolerance cleared, re-pricing…"
+        : "Tűrés frissítve, újraárazás… / Tolerance updated, re-pricing…";
+      await load(quoteId);
+    } catch (e) {
+      tolError = e instanceof Error ? e.message : String(e);
+    } finally {
+      tolBusy = false;
     }
   }
 
@@ -1319,6 +1430,210 @@
                 </p>
               {/if}
             </dd>
+            <dt>Tűrés / Tolerance</dt>
+            <dd>
+              {#if editingTolerance}
+                <div
+                  class="qjd__matedit qjd__gearedit"
+                  data-testid="pricing-job-tolerance-edit"
+                >
+                  <div class="qjd__gearrow">
+                    <span class="qjd__gearhint">Általános / Overall</span>
+                    <select
+                      class="qjd__matselect"
+                      bind:value={tolState.overall.kind}
+                      disabled={tolBusy}
+                      aria-label="Tűrés típusa / Tolerance kind"
+                    >
+                      {#each TOLERANCE_SPEC_KINDS as k (k.value)}
+                        <option value={k.value}>{k.label}</option>
+                      {/each}
+                    </select>
+                    {#if tolState.overall.kind === "general_class"}
+                      <select
+                        class="qjd__matselect"
+                        bind:value={tolState.overall.generalClass}
+                        disabled={tolBusy}
+                        aria-label="ISO 2768 osztály / class"
+                      >
+                        {#each GENERAL_CLASSES as c (c.value)}
+                          <option value={c.value}>{c.label}</option>
+                        {/each}
+                      </select>
+                    {:else if tolState.overall.kind === "it_grade"}
+                      <label class="qjd__gearfield">
+                        <span>IT</span>
+                        <input
+                          class="qjd__stockinput"
+                          type="text"
+                          inputmode="numeric"
+                          bind:value={tolState.overall.itGrade}
+                          disabled={tolBusy}
+                          aria-label="IT fokozat / grade"
+                        />
+                      </label>
+                    {:else if tolState.overall.kind === "plus_minus"}
+                      <label class="qjd__gearfield">
+                        <span>± mm</span>
+                        <input
+                          class="qjd__stockinput"
+                          type="text"
+                          inputmode="decimal"
+                          bind:value={tolState.overall.valueMm}
+                          disabled={tolBusy}
+                          aria-label="± mm"
+                        />
+                      </label>
+                    {/if}
+                  </div>
+
+                  {#if featureOptions.length === 0}
+                    <p class="qjd__gearhint">
+                      Kritikus jellemző callout a kinyerés után. / Per-feature
+                      callouts available after extraction.
+                    </p>
+                  {:else}
+                    {#each tolState.criticalFeatures as cf, i (i)}
+                      <div
+                        class="qjd__gearrow"
+                        data-testid="pricing-job-tolerance-feature"
+                      >
+                        <select
+                          class="qjd__matselect"
+                          bind:value={cf.featureIndex}
+                          disabled={tolBusy}
+                          aria-label="Jellemző / Feature"
+                        >
+                          {#each featureOptions as fo (fo.index)}
+                            <option value={String(fo.index)}>{fo.label}</option>
+                          {/each}
+                        </select>
+                        <select
+                          class="qjd__matselect"
+                          bind:value={cf.spec.kind}
+                          disabled={tolBusy}
+                          aria-label="Tűrés típusa / Tolerance kind"
+                        >
+                          {#each TOLERANCE_SPEC_KINDS as k (k.value)}
+                            <option value={k.value}>{k.label}</option>
+                          {/each}
+                        </select>
+                        {#if cf.spec.kind === "general_class"}
+                          <select
+                            class="qjd__matselect"
+                            bind:value={cf.spec.generalClass}
+                            disabled={tolBusy}
+                            aria-label="ISO 2768 osztály / class"
+                          >
+                            {#each GENERAL_CLASSES as c (c.value)}
+                              <option value={c.value}>{c.label}</option>
+                            {/each}
+                          </select>
+                        {:else if cf.spec.kind === "it_grade"}
+                          <label class="qjd__gearfield">
+                            <span>IT</span>
+                            <input
+                              class="qjd__stockinput"
+                              type="text"
+                              inputmode="numeric"
+                              bind:value={cf.spec.itGrade}
+                              disabled={tolBusy}
+                              aria-label="IT fokozat / grade"
+                            />
+                          </label>
+                        {:else if cf.spec.kind === "plus_minus"}
+                          <label class="qjd__gearfield">
+                            <span>± mm</span>
+                            <input
+                              class="qjd__stockinput"
+                              type="text"
+                              inputmode="decimal"
+                              bind:value={cf.spec.valueMm}
+                              disabled={tolBusy}
+                              aria-label="± mm"
+                            />
+                          </label>
+                        {/if}
+                        <button
+                          type="button"
+                          class="qjd__close"
+                          onclick={() => removeCriticalFeature(i)}
+                          disabled={tolBusy}
+                          aria-label="Jellemző törlése / Remove feature"
+                          >✕</button
+                        >
+                      </div>
+                    {/each}
+                  {/if}
+
+                  <div class="qjd__matedit-actions">
+                    {#if featureOptions.length > 0}
+                      <button
+                        type="button"
+                        class="btn btn--secondary"
+                        onclick={addCriticalFeature}
+                        disabled={tolBusy}
+                        data-testid="pricing-job-tolerance-add"
+                        >+ Kritikus jellemző / Critical feature</button
+                      >
+                    {/if}
+                    <button
+                      type="button"
+                      class="btn btn--secondary"
+                      onclick={() => void saveTolerance()}
+                      disabled={tolBusy}
+                      data-testid="pricing-job-tolerance-save"
+                      >{tolBusy ? "Mentés… / Saving…" : "Mentés / Save"}</button
+                    >
+                    <button
+                      type="button"
+                      class="qjd__close"
+                      onclick={cancelToleranceEdit}
+                      disabled={tolBusy}
+                      aria-label="Mégse / Cancel"
+                      data-testid="pricing-job-tolerance-cancel">✕</button
+                    >
+                  </div>
+                </div>
+                {#if tolError}
+                  <p
+                    class="qjd__err qjd__matedit-err"
+                    data-testid="pricing-job-tolerance-error"
+                  >
+                    {tolError}
+                  </p>
+                {/if}
+              {:else}
+                <span
+                  class="qjd__matval"
+                  data-testid="pricing-job-tolerance-value"
+                  >{toleranceSummary(detail)}</span
+                >
+                {#if detail.tolerance_manual_review}
+                  <span
+                    class="chip chip--warning"
+                    data-testid="pricing-job-tolerance-review"
+                    >⚠ Kézi ellenőrzés / Manual review</span
+                  >
+                {/if}
+                <button
+                  type="button"
+                  class="qjd__matpencil"
+                  onclick={startToleranceEdit}
+                  aria-label="Tűrés szerkesztése / Edit tolerance"
+                  title="Tűrés szerkesztése / Edit tolerance"
+                  data-testid="pricing-job-tolerance-edit-btn">✎</button
+                >
+              {/if}
+              {#if tolToast}
+                <p
+                  class="qjd__toast"
+                  data-testid="pricing-job-tolerance-toast"
+                >
+                  {tolToast}
+                </p>
+              {/if}
+            </dd>
             <dt>Db / Qty</dt>
             <dd>{detail.quantity}</dd>
             <dt>Pénznem / Currency</dt>
@@ -1592,6 +1907,19 @@
         <!-- Pricing breakdown -->
         <section class="qjd__sec">
           <h4>Árazási bontás / Pricing breakdown</h4>
+          {#if detail.tolerance_manual_review}
+            <div
+              class="qjd__tol-banner"
+              role="alert"
+              data-testid="pricing-job-tolerance-review-banner"
+            >
+              <strong>⚠ Kézi tűrés-ellenőrzés / Manual tolerance review.</strong>
+              GD&amp;T "rajz szerint" tűrés — az alap sávon árazva, csendes
+              szigorítás nélkül (ADR-0097 Q5); egy operátornak át kell néznie. /
+              A per-drawing (GD&amp;T) spec is priced at the default band, never
+              silently tightened; a human must review it.
+            </div>
+          {/if}
           {#if priceRows.length > 0}
             <table class="qjd__tbl" data-testid="pricing-job-detail-breakdown">
               <tbody>
@@ -2291,6 +2619,20 @@
   }
   .qjd__floor-banner strong {
     color: var(--color-signal-negative);
+  }
+  /* T5 / ADR-0097 Part 2 — per-job manual tolerance-review banner. A warning
+     (amber), not a hard block like the margin floor (red). */
+  .qjd__tol-banner {
+    margin: 8px 0;
+    padding: var(--space-2) var(--space-3);
+    border-left: 3px solid var(--color-signal-warning);
+    background: var(--color-surface-raised);
+    color: var(--color-text-primary);
+    font-size: var(--type-size-sm);
+    line-height: 1.4;
+  }
+  .qjd__tol-banner strong {
+    color: var(--color-signal-warning);
   }
   .qjd__buyer-edit {
     display: flex;

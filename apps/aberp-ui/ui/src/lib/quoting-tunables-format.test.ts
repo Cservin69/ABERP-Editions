@@ -8,8 +8,10 @@ import { describe, expect, it } from "vitest";
 import {
   featureTypeLabel,
   fmtPct,
+  generalClassLabel,
   sizeBucketLabel,
   toleranceRangeLabel,
+  toleranceSpecLabel,
 } from "./quoting-tunables-format";
 import { FEATURE_TYPES, SIZE_BUCKETS, TOLERANCE_RANGES } from "./api";
 
@@ -56,5 +58,35 @@ describe("fmtPct", () => {
   it("returns an em-dash on NaN/Inf", () => {
     expect(fmtPct(Number.NaN)).toBe("—");
     expect(fmtPct(Number.POSITIVE_INFINITY)).toBe("—");
+  });
+});
+
+describe("generalClassLabel (T5)", () => {
+  it("labels every ISO 2768 class, verbatim fallback on unknown", () => {
+    for (const c of [
+      "iso2768_fine",
+      "iso2768_medium",
+      "iso2768_coarse",
+      "iso2768_very_coarse",
+    ]) {
+      const label = generalClassLabel(c);
+      expect(label.trim().length).toBeGreaterThan(0);
+      expect(label).not.toBe(c);
+    }
+    expect(generalClassLabel("nope")).toBe("nope");
+  });
+});
+
+describe("toleranceSpecLabel (T5)", () => {
+  it("renders each drawing dialect compactly", () => {
+    expect(toleranceSpecLabel({ kind: "unspecified" })).toContain("Unspecified");
+    expect(
+      toleranceSpecLabel({ kind: "general_class", class: "iso2768_fine" }),
+    ).toContain("ISO 2768-f");
+    expect(toleranceSpecLabel({ kind: "it_grade", grade: 7 })).toBe("IT7");
+    expect(toleranceSpecLabel({ kind: "plus_minus", value_mm: 0.01 })).toBe(
+      "±0.01 mm",
+    );
+    expect(toleranceSpecLabel({ kind: "per_drawing" })).toContain("Per drawing");
   });
 });
