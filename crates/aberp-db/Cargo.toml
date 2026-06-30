@@ -1,0 +1,37 @@
+[package]
+name = "aberp-db"
+description = "ADR-0098 Gap 1a/1b — one process-wide shared DuckDB Handle: a single serialized writer over the live tenant DB, with a post-commit lockstep mirror append + debounced durable checkpoint. Eliminates the concurrent separate-instance opens that tore the Defense DB at 2026-06-29 17:02."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Library crate. The Handle owns a real `duckdb::Connection` (direct dep);
+# it reuses the ADR-0095 crash-safe primitives from `aberp-snapshot`
+# (`live_durable_checkpoint`, `ensure_not_prod_path`) and the lockstep
+# `sync_mirror` + `LedgerMeta` from `aberp-audit-ledger` — NO new durability
+# primitive is invented here (ADR-0098 Decision). Typed errors via
+# `thiserror` per ADR-0021 Part A (no `anyhow` in libs); the `apps/aberp`
+# daemons wrap Handle results with their own `anyhow` `.context(...)`.
+#
+# NOTE (build gate): `duckdb` pulls the bundled libduckdb 1.5.3 amalgamation,
+# which does NOT compile in the saw-off sandbox (same gate as ADR-0095
+# chunk-3). The pure `debounce` module has ZERO external deps and is
+# exercised by `tests/debounce_logic.rs` via `rustc --test` in-sandbox; the
+# duckdb-backed `Handle` is CI/Mac-gated.
+[dependencies]
+aberp-audit-ledger = { path = "../audit-ledger" }
+aberp-snapshot = { path = "../aberp-snapshot" }
+duckdb = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+aberp-audit-ledger = { path = "../audit-ledger", features = ["test-support"] }
+duckdb = { workspace = true }
+
+[lints]
+workspace = true
