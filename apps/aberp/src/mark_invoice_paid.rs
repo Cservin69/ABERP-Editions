@@ -96,7 +96,7 @@ pub struct MarkPaidOutcome {
 /// preconditions. Returns the resulting [`PaymentRecord`] for the
 /// route's JSON echo body.
 pub fn mark_paid(
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     operator_login: &str,
@@ -111,8 +111,14 @@ pub fn mark_paid(
     }
 
     // 2. Idempotency gate — refuse double-payment.
-    let ledger_for_check = Ledger::open(db_path, tenant.clone(), binary_hash)
-        .context("open audit ledger to check is_invoice_paid (mark-paid gate)")?;
+    // ADR-0098 C2 — idempotency read via a shared read clone (from_connection),
+    // not an independent Ledger::open of the live path.
+    let ledger_for_check = {
+        let conn = db
+            .read()
+            .context("shared read: mark-paid idempotency gate (ADR-0098 Gap 1a C2)")?;
+        Ledger::from_connection(conn, tenant.clone(), binary_hash)
+    };
     if let Some(existing) = audit_query::payment_record_for(&ledger_for_check, &input.invoice_id)? {
         return Err(MarkPaidError::AlreadyPaid(existing));
     }
@@ -123,29 +129,29 @@ pub fn mark_paid(
     let actor = Actor::from_local_cli(session_id, operator_login);
     let idempotency_key = IdempotencyKey::new();
 
-    // 4. Append the InvoicePaymentRecorded entry under one tx.
-    let mut conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for mark-paid audit append",
-            db_path.display()
-        )
-    })?;
+    // 4. Append the InvoicePaymentRecorded entry under one tx, through the
+    //    shared Handle's writer (ADR-0098 C2). The WriteGuard's post-commit hook
+    //    runs the lockstep sync_mirror on drop, so the explicit Ledger::open +
+    //    sync_mirror (a second live opener) is removed.
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash);
-    write_payment_audit_entry(&mut conn, &ledger_meta, actor, idempotency_key, &input)?;
+    {
+        let mut conn = db
+            .write()
+            .context("shared writer: mark-paid audit append (ADR-0098 Gap 1a C2)")?;
+        write_payment_audit_entry(&mut conn, &ledger_meta, actor, idempotency_key, &input)?;
+        // WriteGuard drops here -> post-commit hook runs the lockstep sync_mirror.
+    }
 
-    // 5. Verify chain post-commit.
-    drop(conn);
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to verify chain after mark-paid")?;
+    // 5. Verify chain post-commit via a shared READ clone (Ledger::from_connection)
+    //    — sees the just-committed append; no independent Connection::open /
+    //    Ledger::open re-open (the duckdb#23046 replay locus).
+    let verify_conn = db
+        .read()
+        .context("shared read: verify chain after mark-paid (ADR-0098 C2)")?;
+    let ledger = Ledger::from_connection(verify_conn, tenant, binary_hash);
     let verified = ledger
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER mark-paid")?;
-
-    // 6. Sync the audit-ledger mirror.
-    let mirror_path = audit_ledger::mirror_path_for(db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after mark-paid commit")?;
 
     // 7. Build the PaymentRecord echo from the inputs (the ledger
     //    has just persisted them verbatim).

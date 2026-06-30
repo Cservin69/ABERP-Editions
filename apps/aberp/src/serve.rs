@@ -10716,7 +10716,7 @@ pub fn mark_paid_request(
         }),
     };
     match mark_invoice_paid::mark_paid(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         &operator_login,
