@@ -193,6 +193,19 @@ pub fn take_snapshot(
     // per process" — that assumption is what the re-tear DISPROVED; corrected.
     {
         let conn = Connection::open(db_path)?;
+        // ADR-0098 C2 (review F6) — disable DuckDB's implicit checkpoint-on-
+        // close on THIS connection too. The EXPORT is a logical read-only table
+        // scan, but dropping a plain read-write connection triggers DuckDB's
+        // implicit close-checkpoint, which folds the on-disk WAL IN PLACE — the
+        // precise `duckdb#23046` write locus the "sanctioned residual"
+        // rationale (reason #1) had overlooked. With the pragma set, this
+        // connection's drop touches the live file no more than the Handle's own
+        // runtime connections do, making reason #1 ("never touches the
+        // ART/checkpoint metadata locus") actually true on the drop path.
+        // (Pragma spelling validated for libduckdb 1.5+, same as aberp-db's
+        // Handle; an unknown pragma errors hard — a future rename surfaces
+        // loudly, never silently. FLAGGED CI/Mac-gated.)
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")?;
 
         // ADR-0098 Part 2b (Gap 2b) — reconcile + fsync the audit-ledger
         // mirror to the live DB BEFORE the EXPORT, on this SAME connection (no
