@@ -8382,7 +8382,7 @@ pub async fn issue_invoice_request<P: MnbRatesProvider + ?Sized>(
         };
     issue_invoice::issue_from_parsed(
         input,
-        &state.db_path,
+        &state.db,
         state.tenant.as_str(),
         series,
         request.currency,
