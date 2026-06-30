@@ -165,11 +165,32 @@ pub fn take_snapshot(
         std::fs::remove_dir_all(&partial_dir).map_err(|e| SnapshotError::io(&partial_dir, e))?;
     }
 
-    // EXPORT runs against the live DB. When `serve` is running this opens a
-    // second in-process connection (DuckDB shares one instance per process,
-    // so no cross-process lock conflict); from the stopped-server CLI it is
-    // the only opener. EXPORT is a logical table scan — it never touches
-    // the ART/checkpoint structure that corrupts.
+    // EXPORT runs against the live DB via its OWN short-lived connection.
+    //
+    // ADR-0098 Session C — SANCTIONED RESIDUAL (gate allow-listed; FLAGGED).
+    // Post-Session-C this is the ONE remaining live-tenant-DB opener outside
+    // the shared `aberp_db::Handle`. It is retained deliberately, NOT migrated,
+    // for three reasons:
+    //   1. It is a LOGICAL, READ-ONLY operation — `EXPORT DATABASE ... PARQUET`
+    //      is a table scan, and the only preceding step (`ensure_consistent_
+    //      with_db`) reconciles the audit MIRROR FILE, reading (never writing)
+    //      the live DB. It never writes the live file and never touches the
+    //      ART/checkpoint metadata path that is the `duckdb#23046` corruption
+    //      locus (the 17:02 re-tear came from concurrent CHECKPOINT actors,
+    //      not logical read scans).
+    //   2. It runs at the snapshot daemon's LOW cadence (default 4 h) — the
+    //      lowest-frequency opener in the process, versus the ~2 s email-relay
+    //      drain that drove the incident.
+    //   3. The alternative — routing it through a Handle quiesce-around-EXPORT
+    //      (the pattern B used for `durable_checkpoint`) — would (a) add a new
+    //      public Handle API, and (b) hold the single writer mutex for the
+    //      ENTIRE multi-second EXPORT every cycle, freezing all request-handler
+    //      writes. That availability cost + the un-sandbox-compilable change to
+    //      the durability core is the LESS conservative option; it is FLAGGED
+    //      for the adversarial review as the path to full closure if wanted.
+    // The gate's CHECK 10 carries this file on its explicit allow-list.
+    // NOTE: the pre-ADR-0098 comment here asserted "DuckDB shares one instance
+    // per process" — that assumption is what the re-tear DISPROVED; corrected.
     {
         let conn = Connection::open(db_path)?;
 
