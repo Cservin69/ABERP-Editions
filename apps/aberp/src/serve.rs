@@ -8984,7 +8984,7 @@ pub async fn submit_invoice_request(
     let endpoint = build_profile::nav_endpoint();
     build_profile::assert_endpoint_allowed(endpoint).map_err(SubmitRouteError::Other)?;
     submit_invoice::submit_from_inputs(submit_invoice::SubmitFromInputs {
-        db: &state.db_path,
+        db: &state.db,
         tenant_str: state.tenant.as_str(),
         invoice_id_str: invoice_id,
         invoice_xml_origin: nav_xml_path.display().to_string(),

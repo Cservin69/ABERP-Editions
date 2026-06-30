@@ -157,8 +157,15 @@ pub fn run(args: &SubmitInvoiceArgs) -> Result<()> {
         .enable_all()
         .build()
         .context("build tokio current-thread runtime for submit-invoice CLI")?;
+    // ADR-0098 C2 — the one-shot CLI path constructs its own shared Handle so
+    // submit_from_inputs routes DB access through a single instance (the serve
+    // path passes state.db). Same dual-use resolution as poll_ack::run.
+    let tenant_for_handle = TenantId::new(args.tenant.clone())
+        .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", args.tenant))?;
+    let db_handle = aberp_db::Handle::open_default(&args.db, tenant_for_handle)
+        .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
     match runtime.block_on(submit_from_inputs(SubmitFromInputs {
-        db: &args.db,
+        db: &db_handle,
         tenant_str: &args.tenant,
         invoice_id_str: &args.invoice_id,
         invoice_xml_origin: args.invoice_xml.display().to_string(),
@@ -285,7 +292,10 @@ pub struct SubmitInvoiceOutcome {
 /// is moved in because the library consumes it.
 #[allow(missing_docs)]
 pub struct SubmitFromInputs<'a> {
-    pub db: &'a Path,
+    /// ADR-0098 C2 (Gap 1a) — the shared process-wide DuckDB Handle. DB opens
+    /// route through it (db.read()/db.write()); the cross-process submission
+    /// flock (out of ADR-0098 scope) takes a &Path via `db.db_path()`.
+    pub db: &'a aberp_db::HandleArc,
     pub tenant_str: &'a str,
     pub invoice_id_str: &'a str,
     /// Operator-facing origin label for `invoice_xml` — used only in
@@ -454,7 +464,7 @@ pub async fn submit_from_inputs(
     // `SubmissionInProgress` rather than double-POST (NAV
     // INVOICE_NUMBER_NOT_UNIQUE). The guard drops at function return,
     // releasing the lock.
-    let _submission_lock = match crate::submission_lock::try_acquire(db, tenant_str, invoice_id_str)
+    let _submission_lock = match crate::submission_lock::try_acquire(db.db_path(), tenant_str, invoice_id_str)
         .map_err(SubmitFromInputsError::Other)?
     {
         Some(guard) => guard,
@@ -478,12 +488,16 @@ pub async fn submit_from_inputs(
         "on-disk InvoiceData XML passed v3.0 invariant check before NAV submit"
     );
 
-    // 4. Load the previously-issued invoice + its idempotency_key.
-    let mut conn = Connection::open(db)
-        .with_context(|| format!("open tenant DuckDB at {}", db.display()))
-        .map_err(SubmitFromInputsError::Other)?;
-    let (ready_invoice, idempotency_key) =
-        load_issued_invoice(&mut conn, invoice_id_str).map_err(SubmitFromInputsError::Other)?;
+    // 4. Load the previously-issued invoice + its idempotency_key via a shared
+    //    READ clone of the one instance (ADR-0098 C2). Scoped so the read clone
+    //    drops before the TX1/TX2 writer windows; load_issued_invoice only reads.
+    let (ready_invoice, idempotency_key) = {
+        let mut conn = db
+            .read()
+            .context("shared read: load issued invoice for submit (ADR-0098 Gap 1a C2)")
+            .map_err(SubmitFromInputsError::Other)?;
+        load_issued_invoice(&mut conn, invoice_id_str).map_err(SubmitFromInputsError::Other)?
+    };
     if ready_invoice.id.to_prefixed_string() != invoice_id_str {
         return Err(SubmitFromInputsError::Other(anyhow!(
             "loaded invoice id {} does not match requested {}",
@@ -511,9 +525,13 @@ pub async fn submit_from_inputs(
     //     `InvoiceModificationIssued`) written at issuance is the
     //     canonical source.
     let operation = {
-        let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
-            .context("open audit ledger to derive NAV operation (S381/F1)")
+        // ADR-0098 C2 — read the chain via a shared read clone (from_connection),
+        // not an independent Ledger::open of the live path.
+        let conn = db
+            .read()
+            .context("shared read: derive NAV operation (S381/F1) (ADR-0098 C2)")
             .map_err(SubmitFromInputsError::Other)?;
+        let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
         let entries = ledger
             .entries()
             .context("read audit ledger entries to derive NAV operation (S381/F1)")
@@ -558,31 +576,26 @@ pub async fn submit_from_inputs(
         "manageInvoice envelope built; ready to write TX1 Attempt audit"
     );
 
-    // 7. TX1 — Attempt-before-call.
-    write_attempt_audit(
-        &mut conn,
-        &ledger_meta,
-        actor.clone(),
-        &ready_invoice,
-        idempotency_key,
-        endpoint_audit_label,
-        prepared.request_xml.clone(),
-    )
-    .map_err(SubmitFromInputsError::Other)?;
+    // 7. TX1 — Attempt-before-call. ADR-0098 C2 — own db.write() window; the
+    //    WriteGuard's post-commit hook runs the lockstep sync_mirror on drop,
+    //    so the explicit S388 sync_mirror is removed (the hook covers it). The
+    //    writer mutex is NOT held across the wire send: TX2 re-acquires it.
     {
-        // S388 — sync the mirror through the ALREADY-OPEN `conn` (the
-        // same handle `write_attempt_audit` just committed TX1 on) via
-        // the free `audit_ledger::sync_mirror`, NOT a fresh
-        // `Ledger::open` (a `Connection::open(path)` that re-triggers
-        // DuckDB 1.5.x's LoadCheckpoint/ReadIndex replay → the
-        // checkpoint/ART corruption family, duckdb#23046, S332). The
-        // post-attempt mirror sync mid-flow keeps the same crash-window
-        // closure S375/S381 applied on the issue/storno/modification
-        // paths. `conn` stays alive for the wire send + TX2.
-        let mirror_path = audit_ledger::mirror_path_for(db);
-        audit_ledger::sync_mirror(&conn, &ledger_meta, &mirror_path)
-            .context("sync audit-ledger mirror file after TX1 Attempt commit")
+        let mut conn = db
+            .write()
+            .context("shared writer: submit TX1 Attempt audit (ADR-0098 Gap 1a C2)")
             .map_err(SubmitFromInputsError::Other)?;
+        write_attempt_audit(
+            &mut conn,
+            &ledger_meta,
+            actor.clone(),
+            &ready_invoice,
+            idempotency_key,
+            endpoint_audit_label,
+            prepared.request_xml.clone(),
+        )
+        .map_err(SubmitFromInputsError::Other)?;
+        // WriteGuard drop -> lockstep sync_mirror (replaces the S388 explicit sync).
     }
     tracing::info!("TX1 Attempt audit committed; mirror synced; sending manageInvoice");
 
@@ -597,22 +610,34 @@ pub async fn submit_from_inputs(
                 transaction_id = %send_outcome.transaction_id,
                 "NAV manageInvoice OK"
             );
-            write_response_audit(
-                &mut conn,
-                &ledger_meta,
-                actor.clone(),
-                &ready_invoice,
-                idempotency_key,
-                &send_outcome.transaction_id,
-                send_outcome.response_xml,
-            )
-            .map_err(SubmitFromInputsError::Other)?;
-            // S388 — reuse the post-commit `conn` for verify+sync (no
-            // `drop(conn); Ledger::open(db, …)` re-open). See
-            // [`verify_chain_and_sync_reusing_conn`].
-            let verified = verify_chain_and_sync_reusing_conn(conn, tenant, binary_hash_bytes, db)
-                .context("post-submission verify+sync (Response)")
+            {
+                let mut conn = db
+                    .write()
+                    .context("shared writer: submit TX2 Response audit (ADR-0098 Gap 1a C2)")
+                    .map_err(SubmitFromInputsError::Other)?;
+                write_response_audit(
+                    &mut conn,
+                    &ledger_meta,
+                    actor.clone(),
+                    &ready_invoice,
+                    idempotency_key,
+                    &send_outcome.transaction_id,
+                    send_outcome.response_xml,
+                )
                 .map_err(SubmitFromInputsError::Other)?;
+                // WriteGuard drop -> lockstep sync_mirror.
+            }
+            // ADR-0098 C2 — verify via a shared READ clone; the hook already
+            // synced the mirror, so the reused helper's sync_mirror is an
+            // idempotent no-op re-run. No independent live re-open.
+            let read_conn = db
+                .read()
+                .context("shared read: post-submission verify (Response) (ADR-0098 C2)")
+                .map_err(SubmitFromInputsError::Other)?;
+            let verified =
+                verify_chain_and_sync_reusing_conn(read_conn, tenant, binary_hash_bytes, db.db_path())
+                    .context("post-submission verify+sync (Response)")
+                    .map_err(SubmitFromInputsError::Other)?;
             tracing::info!(entries_verified = verified, "audit chain verified");
             let submitted = ready_invoice.into_submitted(send_outcome.transaction_id.clone());
             Ok(SubmitInvoiceOutcome {
@@ -627,23 +652,35 @@ pub async fn submit_from_inputs(
             let (error_class, error_code) = submission_queue::classify_attempt_failure(&wire_err);
             let error_message = format!("{wire_err}");
             let response_xml: Option<Vec<u8>> = None;
-            write_attempt_failed_audit(
-                &mut conn,
-                &ledger_meta,
-                actor.clone(),
-                &ready_invoice,
-                idempotency_key,
-                endpoint_audit_label,
-                error_class,
-                error_code,
-                error_message.clone(),
-                response_xml,
-            )
-            .map_err(SubmitFromInputsError::Other)?;
-            // S388 — same post-commit conn reuse as the success arm.
-            let verified = verify_chain_and_sync_reusing_conn(conn, tenant, binary_hash_bytes, db)
-                .context("post-submission verify+sync (AttemptFailed)")
+            {
+                let mut conn = db
+                    .write()
+                    .context("shared writer: submit TX2 AttemptFailed audit (ADR-0098 Gap 1a C2)")
+                    .map_err(SubmitFromInputsError::Other)?;
+                write_attempt_failed_audit(
+                    &mut conn,
+                    &ledger_meta,
+                    actor.clone(),
+                    &ready_invoice,
+                    idempotency_key,
+                    endpoint_audit_label,
+                    error_class,
+                    error_code,
+                    error_message.clone(),
+                    response_xml,
+                )
                 .map_err(SubmitFromInputsError::Other)?;
+                // WriteGuard drop -> lockstep sync_mirror.
+            }
+            // ADR-0098 C2 — same read-clone verify as the success arm.
+            let read_conn = db
+                .read()
+                .context("shared read: post-submission verify (AttemptFailed) (ADR-0098 C2)")
+                .map_err(SubmitFromInputsError::Other)?;
+            let verified =
+                verify_chain_and_sync_reusing_conn(read_conn, tenant, binary_hash_bytes, db.db_path())
+                    .context("post-submission verify+sync (AttemptFailed)")
+                    .map_err(SubmitFromInputsError::Other)?;
             tracing::error!(
                 invoice_id = %ready_invoice.id.to_prefixed_string(),
                 entries_verified = verified,
