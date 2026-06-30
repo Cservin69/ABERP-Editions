@@ -129,6 +129,10 @@ struct Inner {
 /// boot ([`Handle::open`]); share as `Arc<Handle>` into `AppState` and every
 /// daemon spawn. **Send + Sync**: the `Connection` (which is `Send` but not
 /// `Sync`) lives behind a `Mutex`, and reads are served by owned `try_clone`s.
+/// Convenience alias — the shared handle is always reached as
+/// `Arc<Handle>` (cloned into `AppState` and every daemon `Deps`).
+pub type HandleArc = std::sync::Arc<Handle>;
+
 pub struct Handle {
     db_path: PathBuf,
     mirror_path: PathBuf,

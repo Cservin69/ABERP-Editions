@@ -428,6 +428,10 @@ pub struct PricingPipelineConfig {
 #[derive(Debug, Clone)]
 pub struct PricingPipelineDeps {
     pub db_path: PathBuf,
+    /// ADR-0098 Session B (Gap 1a) — the one shared DuckDB handle the whole
+    /// serve process routes through. `db_path` stays for log/message use and
+    /// for path-taking helpers; runtime opens go through `db`.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -660,6 +664,7 @@ impl PricingPipelineService {
         let tolerance_note = quote.request.tolerance_note.clone();
 
         let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         let quote_id = qid.clone();
         let filename = cad.filename.clone();
@@ -668,7 +673,7 @@ impl PricingPipelineService {
         let login = self.deps.operator_login.clone();
 
         let inserted = spawn_blocking(move || -> Result<bool> {
-            let mut conn = duckdb::Connection::open(&db_path).context("open DB for enqueue")?;
+            let mut conn = db.write().context("shared writer: enqueue (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
             jobs::ensure_schema(&conn).context("ensure quote_pricing_jobs schema")?;
             let now = OffsetDateTime::now_utc();
@@ -786,6 +791,7 @@ impl PricingPipelineService {
         let customer_company = quote.contact.company.trim().to_string();
 
         let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         let quote_id = qid.clone();
         let binary_hash = self.deps.binary_hash;
@@ -795,7 +801,7 @@ impl PricingPipelineService {
         let reason = "no CAD file on listing";
 
         let inserted = spawn_blocking(move || -> Result<bool> {
-            let conn = duckdb::Connection::open(&db_path).context("open DB for enqueue-fail")?;
+            let conn = db.write().context("shared writer: enqueue-fail (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
             jobs::ensure_schema(&conn).context("ensure quote_pricing_jobs schema")?;
             let now = OffsetDateTime::now_utc();
@@ -872,6 +878,7 @@ impl PricingPipelineService {
     /// connection + tx (the poll path has no surrounding `spawn_blocking`).
     async fn emit_poll_outcome_audit(&self, outcome: &WritebackOutcome) {
         let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
@@ -881,8 +888,7 @@ impl PricingPipelineService {
         let body_excerpt = outcome.body_excerpt().map(|s| s.to_string());
         let retryable = outcome.retryable();
         let res = spawn_blocking(move || -> Result<()> {
-            let mut conn =
-                duckdb::Connection::open(&db_path).context("open DB for poll-outcome audit")?;
+            let mut conn = db.write().context("shared writer: poll-outcome audit (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
             let tx = conn.transaction().context("open poll-outcome tx")?;
             let meta =
@@ -922,9 +928,10 @@ impl PricingPipelineService {
 
     async fn next_actionable_blocking(&self) -> Result<Option<PricingJobRow>> {
         let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         spawn_blocking(move || -> Result<Option<PricingJobRow>> {
-            let conn = duckdb::Connection::open(&db_path).context("open DB for next-job")?;
+            let conn = db.read().context("shared read: next-job (ADR-0098 Gap 1a)")?;
             jobs::next_actionable_job(&conn, &tenant_id)
         })
         .await
@@ -949,6 +956,7 @@ impl PricingPipelineService {
 
     async fn advance_extract(&self, row: PricingJobRow) -> Result<StepOutcome> {
         let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
@@ -961,7 +969,7 @@ impl PricingPipelineService {
         let cad_blob = self.cad_blob.clone();
 
         let outcome = spawn_blocking(move || -> Result<StepOutcome> {
-            let mut conn = duckdb::Connection::open(&db_path).context("open DB for extract")?;
+            let mut conn = db.write().context("shared writer: extract (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
             // S286 hotfix: NotFound aborts this step, AlreadyInState
@@ -1125,6 +1133,7 @@ impl PricingPipelineService {
 
     async fn advance_price(&self, row: PricingJobRow) -> Result<StepOutcome> {
         let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
@@ -1133,7 +1142,7 @@ impl PricingPipelineService {
         let target_tol = self.config.default_tolerance;
 
         let outcome = spawn_blocking(move || -> Result<StepOutcome> {
-            let mut conn = duckdb::Connection::open(&db_path).context("open DB for price")?;
+            let mut conn = db.write().context("shared writer: price (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
             let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
@@ -1624,6 +1633,7 @@ impl PricingPipelineService {
 
     async fn advance_render(&self, row: PricingJobRow) -> Result<StepOutcome> {
         let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
@@ -1638,7 +1648,7 @@ impl PricingPipelineService {
         let target_tol = self.config.default_tolerance;
 
         let outcome = spawn_blocking(move || -> Result<StepOutcome> {
-            let mut conn = duckdb::Connection::open(&db_path).context("open DB for render")?;
+            let mut conn = db.write().context("shared writer: render (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
             let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
@@ -1764,14 +1774,15 @@ impl PricingPipelineService {
         // Read row artifacts off-thread, then do the async HTTP POST
         // on the main runtime.
         let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let quote_id = row.quote_id.clone();
         let read_arts = {
             let qid = quote_id.clone();
             let tid = tenant_id_string.clone();
-            let db = db_path.clone();
+            let dbh = db.clone();
             spawn_blocking(move || -> Result<(jobs::JobArtifacts, String, String)> {
-                let conn = duckdb::Connection::open(&db).context("open DB for post")?;
+                let conn = dbh.read().context("shared read: post (ADR-0098 Gap 1a)")?;
                 let arts = jobs::get_job_artifacts(&conn, &qid, &tid)?;
                 // Re-fetch the persisted breakdown + hash from the row.
                 let mut stmt = conn.prepare(
@@ -1807,6 +1818,7 @@ impl PricingPipelineService {
             .await;
 
         let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
@@ -1814,7 +1826,7 @@ impl PricingPipelineService {
         let attempt_n = row.attempt_n;
 
         let final_outcome = spawn_blocking(move || -> Result<StepOutcome> {
-            let mut conn = duckdb::Connection::open(&db_path).context("open DB for post-finish")?;
+            let mut conn = db.write().context("shared writer: post-finish (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
 
@@ -2226,8 +2238,7 @@ pub(crate) fn emit_daemon_panicked_audit(
     restart_count_since_boot: u32,
     last_known_quote_id: Option<String>,
 ) -> Result<()> {
-    let mut conn =
-        duckdb::Connection::open(&deps.db_path).context("open DB for daemon-panic audit")?;
+    let mut conn = deps.db.write().context("shared writer: daemon-panic audit (ADR-0098 Gap 1a)")?;
     audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
     let tx = conn.transaction().context("open daemon-panic tx")?;
     let meta = LedgerMeta::new(
@@ -4203,14 +4214,13 @@ struct PipelinePythonResolvedPayload {
 /// double-call inside the same spawn-window is a no-op via the audit-
 /// ledger's UNIQUE defence.
 pub fn emit_python_resolved_audit(
-    db_path: &Path,
+    db: &aberp_db::HandleArc,
     tenant_id: &str,
     binary_hash: BinaryHash,
     login: &str,
     status: &PipelinePythonStatus,
 ) -> Result<()> {
-    let mut conn =
-        duckdb::Connection::open(db_path).context("open DB for python-resolved audit")?;
+    let mut conn = db.write().context("shared writer: python-resolved audit (ADR-0098 Gap 1a)")?;
     audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
     let tx = conn.transaction().context("open python-resolved tx")?;
     let meta = LedgerMeta::new(TenantId::new(tenant_id).context("tenant id")?, binary_hash);
@@ -4265,12 +4275,12 @@ struct QuotePricingJobsIndexMigratedPayload {
 /// impossible (the migration helper returns `false` once the index is
 /// gone), so the UNIQUE idempotency-key constraint is belt-and-braces.
 pub fn emit_index_migrated_audit(
-    db_path: &Path,
+    db: &aberp_db::HandleArc,
     tenant_id: &str,
     binary_hash: BinaryHash,
     login: &str,
 ) -> Result<()> {
-    let mut conn = duckdb::Connection::open(db_path).context("open DB for index-migrated audit")?;
+    let mut conn = db.write().context("shared writer: index-migrated audit (ADR-0098 Gap 1a)")?;
     audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
     let tx = conn.transaction().context("open index-migrated tx")?;
     let meta = LedgerMeta::new(TenantId::new(tenant_id).context("tenant id")?, binary_hash);
