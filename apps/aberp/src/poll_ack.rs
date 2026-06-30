@@ -182,8 +182,17 @@ pub fn run(args: &PollAckArgs) -> Result<()> {
         .enable_all()
         .build()
         .context("build tokio current-thread runtime for poll-ack CLI")?;
+    // ADR-0098 C2 — the one-shot CLI path constructs its OWN shared Handle so
+    // poll_ack_from_inputs routes DB access through a single instance uniformly
+    // (the serve path passes state.db). A CLI process has no concurrent writer,
+    // but this keeps the post-commit durability hook on this path too and lets
+    // poll_ack_from_inputs take `&HandleArc` for both callers.
+    let tenant_for_handle = TenantId::new(args.tenant.clone())
+        .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", args.tenant))?;
+    let db_handle = aberp_db::Handle::open_default(&args.db, tenant_for_handle)
+        .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
     let outcome = runtime.block_on(poll_ack_from_inputs(
-        &args.db,
+        &db_handle,
         &args.tenant,
         &args.invoice_id,
         &args.tax_number,
@@ -336,7 +345,7 @@ pub struct PollAckOutcome {
 /// JSON shape lives at the caller.
 #[allow(clippy::too_many_arguments)]
 pub async fn poll_ack_from_inputs(
-    db: &Path,
+    db: &aberp_db::HandleArc,
     tenant_str: &str,
     invoice_id_str: &str,
     tax_number_raw: &str,
@@ -349,10 +358,15 @@ pub async fn poll_ack_from_inputs(
         .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", tenant_str))?;
     let tax_number_8 = parse_tax_number_8(tax_number_raw)?;
 
-    // 3. Open DuckDB; load the invoice + its idempotency key.
-    let mut conn =
-        Connection::open(db).with_context(|| format!("open tenant DuckDB at {}", db.display()))?;
-    let (ready_invoice, idempotency_key) = load_issued_invoice(&mut conn, invoice_id_str)?;
+    // 3. Load the invoice + its idempotency key via a shared READ clone of the
+    //    ONE instance (ADR-0098 C2). Scoped so the read clone drops before the
+    //    poll loop's per-attempt writes; load_issued_invoice only reads.
+    let (ready_invoice, idempotency_key) = {
+        let mut conn = db
+            .read()
+            .context("shared read: load issued invoice for poll-ack (ADR-0098 Gap 1a C2)")?;
+        load_issued_invoice(&mut conn, invoice_id_str)?
+    };
     if ready_invoice.id.to_prefixed_string() != invoice_id_str {
         return Err(anyhow!(
             "loaded invoice id {} does not match requested {}",
@@ -394,23 +408,24 @@ pub async fn poll_ack_from_inputs(
         &tax_number_8,
         &transaction_id,
         &submitted_invoice_id,
-        &mut conn,
+        db,
         &ledger_meta,
         &actor,
     )
     .await?;
 
-    // 6. Verify the audit chain (success-criterion gate).
-    drop(conn);
-    let ledger = Ledger::open(db, tenant, binary_hash_bytes).context("open audit ledger")?;
+    // 6. Verify the audit chain (success-criterion gate). ADR-0098 C2 — via a
+    //    shared READ clone (Ledger::from_connection); the mirror was already
+    //    synced on each per-attempt WriteGuard drop in poll_loop. No independent
+    //    Connection::open / Ledger::open re-open (the duckdb#23046 replay locus).
+    let verify_conn = db
+        .read()
+        .context("shared read: verify chain after poll-ack (ADR-0098 C2)")?;
+    let ledger = Ledger::from_connection(verify_conn, tenant, binary_hash_bytes);
     let verified = ledger
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER poll-ack")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
-    let mirror_path = audit_ledger::mirror_path_for(db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after poll-ack commit")?;
 
     let (terminal, attempts_made) = match terminus {
         LoopTerminus::LastStatus(ProcessingStatus::Saved) => {
@@ -471,13 +486,17 @@ fn load_issued_invoice(
 /// PR-7-C doesn't do — but a future `RetrySubmission` command might),
 /// the latest is the one to poll against.
 fn lookup_transaction_id(
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     invoice_id: &str,
 ) -> Result<String> {
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to look up transactionId")?;
+    // ADR-0098 C2 — read the ledger via a shared read clone (from_connection),
+    // not an independent Ledger::open of the live path.
+    let conn = db
+        .read()
+        .context("shared read: look up NAV transactionId (ADR-0098 Gap 1a C2)")?;
+    let ledger = Ledger::from_connection(conn, tenant, binary_hash);
     let entries = ledger.entries().context("read audit ledger entries")?;
     let txid = entries
         .iter()
@@ -532,17 +551,15 @@ async fn poll_loop(
     tax_number_8: &str,
     transaction_id: &str,
     invoice_id: &str,
-    conn: &mut Connection,
+    db: &aberp_db::HandleArc,
     ledger_meta: &LedgerMeta,
     actor: &Actor,
 ) -> Result<LoopTerminus> {
     let transport = NavTransport::new(endpoint).context("build NAV transport")?;
-
-    // Ensure the audit-ledger schema exists once up-front so the
-    // per-poll tx body can call `append_in_tx` directly (the schema
-    // is idempotent so this is safe even when called after prior
-    // submit-invoice runs).
-    audit_ledger::ensure_schema(conn).context("ensure audit-ledger schema for poll-ack")?;
+    // ADR-0098 C2 — the daemon holds no long-lived `conn`; the audit-ledger
+    // schema is ensured inside each per-attempt `write_ack_audit_entry`
+    // db.write() window (idempotent), so the prior up-front ensure_schema on a
+    // threaded `conn` is removed.
 
     let mut last_error: Option<String> = None;
     let mut last_intermediate_status: Option<ProcessingStatus> = None;
@@ -576,7 +593,7 @@ async fn poll_loop(
                     // a crash mid-loop preserves every completed poll's
                     // evidence.
                     write_ack_audit_entry(
-                        conn,
+                        db,
                         ledger_meta,
                         actor,
                         invoice_id,
@@ -697,13 +714,21 @@ async fn run_one_attempt(
 /// Open a fresh per-poll DuckDB tx, append one `InvoiceAckStatus` entry
 /// carrying the verbatim NAV response_xml + parsed ack_status, commit.
 fn write_ack_audit_entry(
-    conn: &mut Connection,
+    db: &aberp_db::HandleArc,
     ledger_meta: &LedgerMeta,
     actor: &Actor,
     invoice_id: &str,
     transaction_id: &str,
     outcome: &QueryTransactionStatusOutcome,
 ) -> Result<()> {
+    // ADR-0098 C2 — acquire the shared writer for this single per-poll audit tx,
+    // then drop it (post-commit hook runs the lockstep sync_mirror). Tight
+    // window: the call sites run this inside a synchronous `span.in_scope` /
+    // terminal write, so the !Send WriteGuard never crosses the NAV await.
+    let mut conn = db
+        .write()
+        .context("shared writer: poll-ack InvoiceAckStatus (ADR-0098 Gap 1a C2)")?;
+    audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema for poll-ack")?;
     let tx = conn
         .transaction()
         .context("begin per-poll DuckDB transaction (InvoiceAckStatus append)")?;
@@ -778,7 +803,8 @@ const MAX_CONSECUTIVE_DAEMON_ERRORS: u32 = 10;
 /// `serve.rs` build this from the ledger + keychain) and so the spawn
 /// call reads clean.
 pub struct PollDaemonInputs {
-    pub db: PathBuf,
+    /// ADR-0098 C2 (Gap 1a) — the shared process-wide DuckDB Handle.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub invoice_id: String,
@@ -998,34 +1024,29 @@ fn write_daemon_terminal_ack(
     inputs: &PollDaemonInputs,
     outcome: &QueryTransactionStatusOutcome,
 ) -> Result<()> {
-    let mut conn = Connection::open(&inputs.db).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for daemon terminal write",
-            inputs.db.display()
-        )
-    })?;
-    audit_ledger::ensure_schema(&conn)
-        .context("ensure audit-ledger schema for daemon terminal write")?;
+    // ADR-0098 C2 — route the terminal audit append through the shared Handle.
+    // write_ack_audit_entry acquires db.write() internally (tight window; the
+    // post-commit hook syncs the mirror on drop). The post-commit verify_chain
+    // is preserved via a shared read clone — no independent Connection::open /
+    // Ledger::open re-open.
     let ledger_meta = LedgerMeta::new(inputs.tenant.clone(), inputs.binary_hash);
     write_ack_audit_entry(
-        &mut conn,
+        &inputs.db,
         &ledger_meta,
         &inputs.actor,
         &inputs.invoice_id,
         &inputs.transaction_id,
         outcome,
     )?;
-    drop(conn);
 
-    let ledger = Ledger::open(&inputs.db, inputs.tenant.clone(), inputs.binary_hash)
-        .context("open audit ledger after daemon terminal write")?;
+    let verify_conn = inputs
+        .db
+        .read()
+        .context("shared read: verify chain after daemon terminal write (ADR-0098 C2)")?;
+    let ledger = Ledger::from_connection(verify_conn, inputs.tenant.clone(), inputs.binary_hash);
     let verified = ledger
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER daemon terminal write")?;
-    let mirror_path = audit_ledger::mirror_path_for(&inputs.db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror after daemon terminal write")?;
     tracing::info!(
         invoice_id = %inputs.invoice_id,
         entries_verified = verified,

@@ -9120,7 +9120,7 @@ pub async fn poll_ack_request(
     let endpoint = build_profile::nav_endpoint();
     build_profile::assert_endpoint_allowed(endpoint).map_err(SubmitRouteError::Other)?;
     poll_ack::poll_ack_from_inputs(
-        &state.db_path,
+        &state.db,
         state.tenant.as_str(),
         invoice_id,
         &tax_number_8,
@@ -26709,7 +26709,7 @@ async fn build_poll_daemon_inputs(
     build_profile::assert_endpoint_allowed(endpoint)?;
 
     Ok(poll_ack::PollDaemonInputs {
-        db: (*state.db_path).clone(),
+        db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash,
         invoice_id: invoice_id.to_string(),
