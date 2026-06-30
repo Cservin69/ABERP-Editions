@@ -170,7 +170,6 @@ impl Handle {
     pub fn open(
         db_path: &Path,
         tenant: TenantId,
-        binary_hash: BinaryHash,
         config: HandleConfig,
     ) -> Result<Arc<Handle>, DbError> {
         // SAFETY: never let the shared handle become a prod opener.
@@ -178,7 +177,16 @@ impl Handle {
             .map_err(|e| DbError::ProdPath(e.to_string()))?;
 
         let mirror_path = aberp_audit_ledger::mirror_path_for(db_path);
-        let meta = LedgerMeta::new(tenant.clone(), binary_hash);
+        // The handle's internal meta is consumed ONLY by the post-commit
+        // `sync_mirror` lockstep, which reads `meta.tenant_id()` and NOTHING
+        // else (verified against `audit-ledger/src/mirror.rs::sync_mirror`:
+        // it appends already-hashed DB rows verbatim and never reads
+        // `binary_hash`). So the binary hash — which is background-computed at
+        // boot and not ready when the handle is built — is intentionally a
+        // fixed placeholder here. Daemons that *create* audit rows build their
+        // OWN `LedgerMeta` with the real `binary_hash` they `wait()` for; they
+        // never use this meta for `append_in_tx`.
+        let meta = LedgerMeta::new(tenant.clone(), BinaryHash::from_bytes([0u8; 32]));
         let conn = open_runtime_connection(db_path, &config)?;
         // Capture the coalescing window before `config` moves into the struct.
         let min_interval = config.min_checkpoint_interval;
@@ -197,12 +205,8 @@ impl Handle {
     }
 
     /// Production constructor: [`HandleConfig::default`] (D2 posture).
-    pub fn open_default(
-        db_path: &Path,
-        tenant: TenantId,
-        binary_hash: BinaryHash,
-    ) -> Result<Arc<Handle>, DbError> {
-        Self::open(db_path, tenant, binary_hash, HandleConfig::default())
+    pub fn open_default(db_path: &Path, tenant: TenantId) -> Result<Arc<Handle>, DbError> {
+        Self::open(db_path, tenant, HandleConfig::default())
     }
 
     /// The live DB path (for callers that still need it for log messages or

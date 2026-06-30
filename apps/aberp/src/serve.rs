@@ -1825,8 +1825,15 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         adapter_registry.clone(),
         shutdown_token_root.clone(),
     ));
+    // ADR-0098 Session B (Gap 1a) — open the ONE shared DuckDB instance here,
+    // after boot provisioning/recovery has left the live file known-good. All
+    // daemons + (Session C) request handlers route through this; the binary
+    // hash is NOT needed (the handle's mirror lockstep reads only tenant_id).
+    let db_handle = aberp_db::Handle::open_default(&args.db, tenant.clone())
+        .context("open the shared DuckDB handle (ADR-0098 Gap 1a single instance)")?;
     let state = AppState {
         db_path: Arc::new(args.db.clone()),
+        db: db_handle,
         tenant,
         nav_enabled,
         binary_hash: binary_hash_handle,
@@ -2388,6 +2395,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     );
                     let push_deps = crate::catalogue_push::CataloguePushDeps {
                         db_path: (*st.db_path).clone(),
+                        db: st.db.clone(),
                         tenant: st.tenant.clone(),
                         binary_hash,
                         operator_login: operator_login.clone(),
@@ -2397,6 +2405,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     let push_credential = st.storefront_credential.clone();
                     let deps = QuoteIntakeDeps {
                         db_path: (*st.db_path).clone(),
+                        db: st.db.clone(),
                         tenant: st.tenant.clone(),
                         binary_hash,
                         operator_login,
@@ -2507,7 +2516,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     // missing audit row is operator-visible via the SPA
                     // status snapshot).
                     if let Err(e) = crate::quote_pricing_pipeline::emit_python_resolved_audit(
-                        st.db_path.as_path(),
+                        &st.db,
                         st.tenant.as_str(),
                         binary_hash,
                         &pipeline_operator_login,
@@ -2558,6 +2567,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                             let pipeline_deps =
                                 crate::quote_pricing_pipeline::PricingPipelineDeps {
                                     db_path: (*st.db_path).clone(),
+                                    db: st.db.clone(),
                                     tenant: st.tenant.clone(),
                                     binary_hash,
                                     operator_login: pipeline_operator_login.clone(),
@@ -2640,7 +2650,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                             );
                                             if let Err(e) =
                                                 crate::quote_pricing_pipeline::emit_index_migrated_audit(
-                                                    st.db_path.as_path(),
+                                                    &st.db,
                                                     st.tenant.as_str(),
                                                     binary_hash,
                                                     &pipeline_operator_login,
@@ -2873,6 +2883,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             .context("resolve seller.toml path for email-relay drain")?;
             let relay_deps = crate::email_relay_daemon::EmailRelayDaemonDeps {
                 db_path: (*recovery_state.db_path).clone(),
+                db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash,
                 operator_login,
@@ -3044,6 +3055,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                 });
             let outbox_deps = crate::email_outbox_poll_daemon::EmailOutboxPollDaemonDeps {
                 db_path: (*recovery_state.db_path).clone(),
+                db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash,
                 operator_login,
@@ -3116,7 +3128,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             // Best-effort: a recovery error is logged, not fatal — the
             // daemon still serves new transitions.
             match crate::quote_pdf_rerender_daemon::recover_unfinished_rerenders(
-                &recovery_state.db_path,
+                &recovery_state.db,
                 &recovery_state.tenant,
                 &recovery_state.quote_pdf_rerender_queue,
             ) {
@@ -3132,6 +3144,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             }
             let rr_deps = crate::quote_pdf_rerender_daemon::QuotePdfRerenderDaemonDeps {
                 db_path: (*recovery_state.db_path).clone(),
+                db: recovery_state.db.clone(),
                 tenant: recovery_state.tenant.clone(),
                 binary_hash: rr_binary_hash,
                 operator_login: rr_operator_login,
@@ -3822,6 +3835,11 @@ fn derive_initial_boot_state_with_seller_check(
 #[derive(Clone)]
 pub struct AppState {
     pub db_path: Arc<PathBuf>,
+    /// ADR-0098 Session B (Gap 1a) — the ONE shared DuckDB handle the whole
+    /// serve process routes runtime DB access through. Created at boot after
+    /// `provision_atomic`/`recover_or_refuse`; cloned into every daemon
+    /// `Deps`. Nothing else opens the live tenant DB at runtime.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     /// S434 — the running tenant's NAV-synchron mode, resolved once at
     /// boot from `tenants.toml` (`tenant_registry::tenant_nav_enabled`).
@@ -28987,6 +29005,7 @@ async fn handle_relay_send_email(
     //    tracing.
     let deps = crate::email_relay_daemon::EmailRelayDaemonDeps {
         db_path: (*state.db_path).clone(),
+        db: state.db.clone(),
         tenant: state.tenant.clone(),
         binary_hash: match state.binary_hash.wait() {
             Ok(b) => b,
@@ -32095,8 +32114,11 @@ mod tests {
                 .expect("append chain link");
         }
 
+        let __db_handle = aberp_db::Handle::open_default(&db_path, tenant.clone())
+            .expect("ADR-0098 test shared handle");
         let state = AppState {
             db_path: std::sync::Arc::new(db_path),
+            db: __db_handle,
             tenant,
             nav_enabled: true,
             binary_hash: crate::binary_hash::BinaryHashHandle::from_ready(binary_hash),
@@ -32219,8 +32241,11 @@ mod tests {
                 .expect("append draft");
         }
 
+        let __db_handle = aberp_db::Handle::open_default(&db_path, tenant.clone())
+            .expect("ADR-0098 test shared handle");
         let state = AppState {
             db_path: std::sync::Arc::new(db_path),
+            db: __db_handle,
             tenant,
             nav_enabled: true,
             binary_hash: crate::binary_hash::BinaryHashHandle::from_ready(binary_hash),
@@ -32988,8 +33013,14 @@ mod tests {
     /// (`boot_state`, `session_token`, `db_path`, `tenant`,
     /// `restore_active`); the rest are inert defaults.
     fn abandon_test_state(db_path: std::path::PathBuf, tenant: &str) -> AppState {
+        let __db_handle = aberp_db::Handle::open_default(
+            &db_path,
+            TenantId::new(tenant.to_string()).expect("tenant id"),
+        )
+        .expect("ADR-0098 test shared handle");
         AppState {
             db_path: std::sync::Arc::new(db_path),
+            db: __db_handle,
             tenant: TenantId::new(tenant.to_string()).expect("tenant id"),
             nav_enabled: true,
             binary_hash: crate::binary_hash::BinaryHashHandle::from_ready(BinaryHash::from_bytes(

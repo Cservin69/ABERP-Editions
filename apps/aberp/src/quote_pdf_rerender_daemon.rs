@@ -888,12 +888,8 @@ mod tests {
         tenant: &TenantId,
         queue: &QuotePdfRerenderQueue,
     ) -> Result<usize> {
-        let handle = aberp_db::Handle::open_default(
-            db_path,
-            tenant.clone(),
-            BinaryHash::from_bytes([0u8; 32]),
-        )
-        .context("build test shared handle for boot-recovery shim")?;
+        let handle = aberp_db::Handle::open_default(db_path, tenant.clone())
+            .context("build test shared handle for boot-recovery shim")?;
         recover_unfinished_rerenders(&handle, tenant, queue)
     }
     use std::sync::Mutex;
@@ -1249,12 +1245,8 @@ mod tests {
             zeroize::Zeroizing::new("bearer-X".to_string()),
         );
         QuotePdfRerenderDaemonDeps {
-            db: aberp_db::Handle::open_default(
-                &db_path,
-                TenantId::new("t1").unwrap(),
-                BinaryHash::from_bytes([0u8; 32]),
-            )
-            .expect("test shared handle"),
+            db: aberp_db::Handle::open_default(&db_path, TenantId::new("t1").unwrap())
+                .expect("test shared handle"),
             db_path,
             tenant: TenantId::new("t1").unwrap(),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
