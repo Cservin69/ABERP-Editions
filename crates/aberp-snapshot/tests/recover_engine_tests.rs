@@ -90,6 +90,32 @@ fn sync_mirror_of(path: &Path) -> u64 {
     ledger.sync_mirror(&mirror).unwrap()
 }
 
+/// Keep only the first `n` JSON-Lines of the mirror — simulate a mirror that
+/// LAGS a snapshot (the "legacy snapshot ahead of the mirror" Gap 2a case,
+/// e.g. a lost tail or a snapshot predating the Gap 2b pre-snapshot fsync).
+fn truncate_mirror_to_lines(mirror: &Path, n: usize) {
+    let text = std::fs::read_to_string(mirror).unwrap();
+    let kept: String = text.lines().take(n).map(|l| format!("{l}\n")).collect();
+    std::fs::write(mirror, kept).unwrap();
+}
+
+/// Append `n` chained audit entries with a custom payload tag, so the
+/// resulting chain's entry_hashes differ from `append_audit`'s `{"i":k}`
+/// entries — used to build a mirror that DISAGREES with a snapshot's overlap.
+fn append_audit_with_tag(path: &Path, n: usize, tag: &str) {
+    let mut ledger = Ledger::open(path, tid(), BinaryHash::from_bytes([1u8; 32])).unwrap();
+    for i in 0..n {
+        ledger
+            .append(
+                EventKind::Test,
+                format!("{{\"{tag}\":{i}}}").into_bytes(),
+                Actor::test_only(),
+                None,
+            )
+            .unwrap();
+    }
+}
+
 fn invoice_ids(path: &Path) -> Vec<i64> {
     let conn = Connection::open(path).unwrap();
     let mut stmt = conn.prepare("SELECT id FROM invoice ORDER BY id").unwrap();
@@ -311,37 +337,173 @@ fn recover_refuses_when_no_valid_snapshot_exists() {
 }
 
 #[test]
-fn recover_refuses_unsafe_when_snapshot_is_ahead_of_the_mirror() {
+fn recover_recovers_from_self_certified_ahead_snapshot_and_tops_up_mirror() {
     let t = Tmp::new("ahead-snap");
     let db = t.db();
     let store = t.store();
     let mirror = mirror_path_for(&db);
 
-    // Mirror is synced at head 4, then two more entries are committed and a
-    // snapshot is taken at head 6 — so the snapshot LEADS the mirror.
-    seed(&db, 1, 4);
-    assert_eq!(sync_mirror_of(&db), 4);
-    append_audit(&db, 2);
+    // Truth at snapshot time: 1 invoice + 6 audit entries; the snapshot and
+    // the mirror are both at head 6 (take_snapshot fsyncs the mirror first —
+    // Gap 2b — so a fresh snapshot can no longer outrun the mirror).
+    seed(&db, 1, 6);
+    assert_eq!(sync_mirror_of(&db), 6);
     take_snapshot(&db, &store, TENANT, OffsetDateTime::now_utc()).unwrap();
+
+    // Simulate the LEGACY case Gap 2a exists for: a mirror that LAGS the
+    // snapshot (its tail was lost / it predates Gap 2b). Truncate it back to
+    // head 4 — the valid snapshot now LEADS the mirror by 2 (109>106-style).
+    truncate_mirror_to_lines(&mirror, 4);
+    assert_eq!(
+        read_mirror_entries(&mirror).unwrap().len(),
+        4,
+        "mirror lags at head 4"
+    );
+    let mirror_prefix_before = std::fs::read(&mirror).unwrap();
+    make_torn(&db);
+
+    // NEW (ADR-0098 Gap 2a): the ahead snapshot SELF-CERTIFIES — its chain
+    // verifies genesis→6 AND the mirror agrees over the overlap [1..4] — so we
+    // RECOVER from it and TOP UP the mirror to head 6, instead of RefusedUnsafe.
+    let outcome = recover_or_refuse(&db, &store, &mirror, TENANT).unwrap();
+    match outcome {
+        RecoveryOutcome::Recovered {
+            snapshot_audit_count,
+            replayed_entries,
+            recovered_max_seq,
+            retained_corrupt_db,
+            ..
+        } => {
+            assert_eq!(
+                snapshot_audit_count, 6,
+                "rebuild started from the head-6 snapshot"
+            );
+            assert_eq!(
+                replayed_entries, 0,
+                "ahead snapshot → nothing to replay from the mirror"
+            );
+            assert_eq!(
+                recovered_max_seq, 6,
+                "rebuilt head is the snapshot head (max(snapshot,mirror))"
+            );
+            assert!(retained_corrupt_db.is_some(), "evidence retained");
+        }
+        other => panic!("expected Recovered (ahead snapshot self-certifies), got {other:?}"),
+    }
+
+    // The mirror was TOPPED UP to 6 — APPEND-ONLY: the original 4 lines are
+    // byte-identical, entries 5 and 6 were appended, nothing was truncated.
+    let after = std::fs::read(&mirror).unwrap();
+    assert!(
+        after.starts_with(&mirror_prefix_before),
+        "top-up is append-only; the existing 4 lines are unchanged"
+    );
+    assert_eq!(
+        read_mirror_entries(&mirror).unwrap().len(),
+        6,
+        "mirror topped up to the snapshot head (never truncated)"
+    );
+
+    // ZERO manual steps: the live DB is openable with all 6 entries + the
+    // snapshot's invoice, and a verified-good marker covers it.
+    assert_eq!(audit_count(&db), 6, "no committed audit entry lost");
+    assert_eq!(
+        invoice_ids(&db),
+        vec![0],
+        "invoice restored from the snapshot"
+    );
+    assert!(checkpoint_is_current(&db));
+}
+
+#[test]
+fn recover_refuses_when_ahead_snapshot_overlap_disagrees_and_no_fallback() {
+    let t = Tmp::new("ahead-disagree");
+    let db = t.db();
+    let store = t.store();
+    let mirror = mirror_path_for(&db);
+
+    // The only snapshot is taken from THIS db at head 6.
+    seed(&db, 1, 6);
+    sync_mirror_of(&db);
+    take_snapshot(&db, &store, TENANT, OffsetDateTime::now_utc()).unwrap();
+
+    // Install a DIFFERENT 4-entry chain as the mirror (distinct payload tag →
+    // distinct entry_hashes over [1..4]). The ahead snapshot (head 6) then
+    // CANNOT self-certify — the mirror DISAGREES with it over the overlap —
+    // and there is no valid snapshot <= the mirror head (4) to fall back to,
+    // so the guard REFUSES (preserve-and-surface; never guess).
+    let other = t.0.join("other.duckdb");
+    append_audit_with_tag(&other, 4, "x");
+    let other_mirror = mirror_path_for(&other);
+    {
+        let l = Ledger::open(&other, tid(), BinaryHash::from_bytes([1u8; 32])).unwrap();
+        l.sync_mirror(&other_mirror).unwrap();
+    }
+    std::fs::copy(&other_mirror, &mirror).unwrap();
     let mirror_before = std::fs::read(&mirror).unwrap();
     make_torn(&db);
 
     let outcome = recover_or_refuse(&db, &store, &mirror, TENANT).unwrap();
     match outcome {
-        RecoveryOutcome::RefusedUnsafe { reason, .. } => {
-            assert!(
-                reason.contains("AHEAD"),
-                "reason names the inconsistency: {reason}"
-            );
-        }
-        other => panic!("expected RefusedUnsafe, got {other:?}"),
+        RecoveryOutcome::RefusedUnsafe { reason, .. } => assert!(
+            reason.contains("self-certify")
+                || reason.contains("disagree")
+                || reason.contains("AHEAD"),
+            "reason names the inconsistency: {reason}"
+        ),
+        other => panic!("expected RefusedUnsafe (ahead overlap disagrees), got {other:?}"),
     }
+    // No top-up happened — the mirror is byte-for-byte untouched on refuse.
     assert_eq!(
         std::fs::read(&mirror).unwrap(),
         mirror_before,
-        "mirror untouched on refuse"
+        "mirror untouched on refuse (never truncated, never extended)"
     );
     assert!(!checkpoint_is_current(&db));
+}
+
+#[test]
+fn take_snapshot_fsyncs_mirror_before_export_so_snapshot_never_ahead() {
+    let t = Tmp::new("presync");
+    let db = t.db();
+    let store = t.store();
+    let mirror = mirror_path_for(&db);
+
+    // No mirror exists yet. Seed 4 audit entries and take a snapshot: Gap 2b
+    // reconciles + fsyncs the mirror to the DB head BEFORE the EXPORT, so the
+    // mirror is created at head 4 and the snapshot is NOT ahead of it.
+    seed(&db, 1, 4);
+    assert!(!mirror.exists(), "no mirror before the first snapshot");
+    let rec = take_snapshot(&db, &store, TENANT, OffsetDateTime::now_utc()).unwrap();
+    assert!(
+        mirror.exists(),
+        "take_snapshot reconciled + fsynced the mirror before EXPORT (Gap 2b)"
+    );
+    let mirror_head = read_mirror_entries(&mirror).unwrap().len() as i64;
+    assert_eq!(
+        mirror_head, 4,
+        "mirror reconciled to the DB head before EXPORT"
+    );
+    assert!(
+        rec.meta.audit_count <= mirror_head,
+        "snapshot audit_count ({}) never exceeds the durable mirror head ({mirror_head})",
+        rec.meta.audit_count
+    );
+
+    // Commit two more entries (the mirror now lags the DB) and snapshot again:
+    // the pre-EXPORT reconcile catches the mirror up to head 6 first, so this
+    // snapshot is also never ahead of the durable mirror.
+    append_audit(&db, 2);
+    let rec2 = take_snapshot(&db, &store, TENANT, OffsetDateTime::now_utc()).unwrap();
+    let mirror_head2 = read_mirror_entries(&mirror).unwrap().len() as i64;
+    assert_eq!(
+        mirror_head2, 6,
+        "second snapshot fsynced the mirror up to the new DB head"
+    );
+    assert!(
+        rec2.meta.audit_count <= mirror_head2,
+        "snapshot still never ahead of the mirror"
+    );
 }
 
 #[test]

@@ -2,7 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use aberp_audit_ledger::{BinaryHash, Ledger, TenantId};
+use aberp_audit_ledger::{
+    ensure_consistent_with_db, mirror_path_for, AppendError, BinaryHash, Ledger, TenantId,
+};
 use duckdb::Connection;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -170,6 +172,43 @@ pub fn take_snapshot(
     // the ART/checkpoint structure that corrupts.
     {
         let conn = Connection::open(db_path)?;
+
+        // ADR-0098 Part 2b (Gap 2b) — reconcile + fsync the audit-ledger
+        // mirror to the live DB BEFORE the EXPORT, on this SAME connection (no
+        // re-open — S375). Afterwards `mirror_head == db_head`, so the
+        // snapshot's `audit_count` can never exceed the durable mirror head
+        // (`snapshot.audit_count <= mirror_head` by construction) and the
+        // recovery guard's ahead-snapshot branch (Gap 2a) becomes unreachable
+        // going forward. Best-effort: a mirror-AHEAD-of-DB condition (the P0
+        // owned by boot `ensure_consistent_with_db`) and any other reconcile
+        // error are SURFACED, never fatal — the EXPORT of the live DB is
+        // independently valuable and Gap 2a remains the safety net.
+        let mirror_path = mirror_path_for(db_path);
+        match ensure_consistent_with_db(&conn, &mirror_path) {
+            Ok(action) => tracing::debug!(
+                ?action,
+                mirror = %mirror_path.display(),
+                "ADR-0098 2b — pre-snapshot mirror reconcile + fsync"
+            ),
+            Err(AppendError::MirrorAheadOfDb {
+                mirror_max_seq,
+                db_max_seq,
+                preserved,
+            }) => tracing::warn!(
+                mirror_max_seq,
+                db_max_seq,
+                preserved,
+                "ADR-0098 2b — pre-snapshot mirror is AHEAD of the DB; preserved + surfaced \
+                 (boot recovery owns the ahead-mirror P0). Taking the snapshot anyway"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                mirror = %mirror_path.display(),
+                "ADR-0098 2b — pre-snapshot mirror reconcile failed (best-effort); \
+                 taking the snapshot anyway"
+            ),
+        }
+
         conn.execute_batch(&format!(
             "EXPORT DATABASE {} (FORMAT PARQUET);",
             sql_quote(&partial_dir)
