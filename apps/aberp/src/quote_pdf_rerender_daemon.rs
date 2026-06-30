@@ -110,6 +110,8 @@ const PANIC_LONG_BACKOFF: Duration = Duration::from_secs(5 * 60);
 #[derive(Clone)]
 pub struct QuotePdfRerenderDaemonDeps {
     pub db_path: PathBuf,
+    /// ADR-0098 Session B (Gap 1a) — shared DuckDB handle.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -161,16 +163,13 @@ pub fn is_disabled() -> bool {
 /// re-enqueue it implies was also lost on the crash, so the banner is
 /// still undelivered and must be recovered. Returns the count re-enqueued.
 pub fn recover_unfinished_rerenders(
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     tenant: &TenantId,
     queue: &QuotePdfRerenderQueue,
 ) -> Result<usize> {
-    let conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DB for pdf-rerender boot recovery at {}",
-            db_path.display()
-        )
-    })?;
+    let conn = db
+        .read()
+        .context("shared read: pdf-rerender boot recovery (ADR-0098 Gap 1a)")?;
     aberp_audit_ledger::ensure_schema(&conn)
         .context("ensure audit schema for pdf-rerender boot recovery")?;
     let mut stmt = conn.prepare(
@@ -412,12 +411,13 @@ enum PrepareError {
 /// and best-effort overwrite the on-disk `priced.pdf`. Pure DB + CPU; the
 /// caller runs it inside `spawn_blocking`.
 fn prepare_rerender(
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     tenant_id: &str,
     quote_id: &str,
 ) -> std::result::Result<PreparedRerender, PrepareError> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("open tenant DB at {}", db_path.display()))
+    let conn = db
+        .read()
+        .context("shared read: pdf-rerender prepare (ADR-0098 Gap 1a)")
         .map_err(PrepareError::Db)?;
     crate::quote_pricing_jobs::ensure_schema(&conn)
         .context("ensure quote_pricing_jobs schema")
@@ -573,10 +573,10 @@ async fn process_one(
     snap: &StorefrontCredentialSnapshot,
     quote_id: &str,
 ) {
-    let db_path = deps.db_path.clone();
+    let db = deps.db.clone();
     let tenant = deps.tenant.as_str().to_string();
     let qid = quote_id.to_string();
-    let prepared = spawn_blocking(move || prepare_rerender(&db_path, &tenant, &qid)).await;
+    let prepared = spawn_blocking(move || prepare_rerender(&db, &tenant, &qid)).await;
 
     let prep = match prepared {
         Ok(Ok(p)) => p,
@@ -744,14 +744,14 @@ async fn write_audit(
     kind: EventKind,
     payload: serde_json::Value,
 ) {
-    let db_path = deps.db_path.clone();
+    let db = deps.db.clone();
     let tenant = deps.tenant.clone();
     let binary_hash = deps.binary_hash;
     let login = deps.operator_login.clone();
     let kind_label = kind.as_str();
     let res = spawn_blocking(move || -> Result<()> {
         let bytes = serde_json::to_vec(&payload).context("serialize pdf-rerender payload")?;
-        let mut conn = Connection::open(&db_path).context("open DB for pdf-rerender audit")?;
+        let mut conn = db.write().context("shared writer: pdf-rerender audit (ADR-0098 Gap 1a)")?;
         aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
         let tx = conn.transaction().context("begin pdf-rerender audit tx")?;
         let meta = LedgerMeta::new(tenant, binary_hash);
@@ -876,6 +876,26 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0098 Session B — test-only shim: the production
+    /// `recover_unfinished_rerenders` now takes the shared `aberp_db::Handle`
+    /// (Gap 1a); these boot-recovery unit tests still drive a real DB file, so
+    /// build a transient handle from that path and delegate. (The `Connection`
+    /// the handle opens is the single instance — same coherence as production;
+    /// allow-listed by the D5 grep gate as a test path.)
+    fn recover_unfinished_rerenders_from_path(
+        db_path: &std::path::Path,
+        tenant: &TenantId,
+        queue: &QuotePdfRerenderQueue,
+    ) -> Result<usize> {
+        let handle = aberp_db::Handle::open_default(
+            db_path,
+            tenant.clone(),
+            BinaryHash::from_bytes([0u8; 32]),
+        )
+        .context("build test shared handle for boot-recovery shim")?;
+        recover_unfinished_rerenders(&handle, tenant, queue)
+    }
     use std::sync::Mutex;
 
     use aberp_quote_engine::{Feature, FeatureType};
@@ -1229,6 +1249,12 @@ mod tests {
             zeroize::Zeroizing::new("bearer-X".to_string()),
         );
         QuotePdfRerenderDaemonDeps {
+            db: aberp_db::Handle::open_default(
+                &db_path,
+                TenantId::new("t1").unwrap(),
+                BinaryHash::from_bytes([0u8; 32]),
+            )
+            .expect("test shared handle"),
             db_path,
             tenant: TenantId::new("t1").unwrap(),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
@@ -1510,7 +1536,7 @@ mod tests {
 
         let queue = QuotePdfRerenderQueue::new();
         let recovered =
-            recover_unfinished_rerenders(&db, &TenantId::new("t1").unwrap(), &queue).unwrap();
+            recover_unfinished_rerenders_from_path(&db, &TenantId::new("t1").unwrap(), &queue).unwrap();
 
         assert_eq!(recovered, 2, "only q3 (transient) + q4 (no terminal)");
         assert!(!queue.contains("q1"), "delivered quote not replayed");
@@ -1535,7 +1561,7 @@ mod tests {
 
         let queue = QuotePdfRerenderQueue::new();
         let recovered =
-            recover_unfinished_rerenders(&db, &TenantId::new("t1").unwrap(), &queue).unwrap();
+            recover_unfinished_rerenders_from_path(&db, &TenantId::new("t1").unwrap(), &queue).unwrap();
         assert_eq!(recovered, 1);
         assert!(
             queue.contains("q5"),

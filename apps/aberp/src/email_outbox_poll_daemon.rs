@@ -232,6 +232,8 @@ impl OutboxSender for LettreSender {
 #[derive(Clone)]
 pub struct EmailOutboxPollDaemonDeps {
     pub db_path: std::path::PathBuf,
+    /// ADR-0098 Session B (Gap 1a) — shared DuckDB handle.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -1181,7 +1183,7 @@ async fn write_audit(deps: &EmailOutboxPollDaemonDeps, kind: EventKind, bytes: V
     // this process can no longer read the same head and append a duplicate
     // `seq`. `ensure_schema` (inside `append_reopen`) also runs the
     // transparent boot migration off the legacy UNIQUE-ART schema.
-    let db_path = deps.db_path.clone();
+    let db = deps.db.clone();
     let tenant = deps.tenant.clone();
     let binary_hash = deps.binary_hash;
     let login = deps.operator_login.clone();
@@ -1189,8 +1191,19 @@ async fn write_audit(deps: &EmailOutboxPollDaemonDeps, kind: EventKind, bytes: V
     let res = tokio::task::spawn_blocking(move || -> Result<()> {
         let meta = LedgerMeta::new(tenant, binary_hash);
         let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
-        aberp_audit_ledger::append_reopen(&db_path, &meta, kind, bytes, actor, None)
-            .context("append email-outbox audit (serialized reopen-per-write)")?;
+        // ADR-0098 Gap 1a — the audit append now runs on the ONE shared
+        // instance under the writer mutex (which serializes appends, so the
+        // chain head is always current → correct next seq), replacing the
+        // separate-instance `append_reopen` + its AUDIT_APPEND_LOCK. See the
+        // Session-B report's seq-coherence FLAG re: the B→C window.
+        let mut conn = db
+            .write()
+            .context("shared writer: email-outbox audit (ADR-0098 Gap 1a)")?;
+        aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
+        let tx = conn.transaction().context("begin email-outbox audit tx")?;
+        aberp_audit_ledger::append_in_tx(&tx, &meta, kind, bytes, actor, None)
+            .context("append email-outbox audit")?;
+        tx.commit().context("commit email-outbox audit")?;
         Ok(())
     })
     .await;
@@ -1229,15 +1242,13 @@ async fn entry_already_delivered(
     deps: &EmailOutboxPollDaemonDeps,
     queue_row_id: &str,
 ) -> Result<bool> {
-    let db_path = deps.db_path.clone();
-    let tenant = deps.tenant.clone();
-    let binary_hash = deps.binary_hash;
+    let db = deps.db.clone();
     let qid = queue_row_id.to_string();
     tokio::task::spawn_blocking(move || -> Result<bool> {
-        let ledger = aberp_audit_ledger::Ledger::open(&db_path, tenant, binary_hash)
-            .context("open audit ledger for email-outbox dedup check (S391/E)")?;
-        let entries = ledger
-            .entries()
+        let conn = db
+            .read()
+            .context("shared read: email-outbox dedup check (ADR-0098 Gap 1a; S391/E)")?;
+        let entries = aberp_audit_ledger::recent_entries(&conn, u32::MAX)
             .context("read audit entries for email-outbox dedup check (S391/E)")?;
         Ok(ledger_has_sent_for(&entries, &qid))
     })

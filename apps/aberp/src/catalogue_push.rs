@@ -336,6 +336,8 @@ struct CatalogueBody {
 /// Dependencies for the audit write + table read (mirrors `QuoteIntakeDeps`).
 pub struct CataloguePushDeps {
     pub db_path: PathBuf,
+    /// ADR-0098 Session B (Gap 1a) — shared DuckDB handle.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -473,12 +475,12 @@ impl CataloguePushService {
 
         // Read the public catalogue off the DB (sync duckdb on a blocking
         // thread).
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant_str = self.deps.tenant.as_str().to_string();
         let rows = match tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(&db_path).with_context(|| {
-                format!("open DuckDB at {} for catalogue push", db_path.display())
-            })?;
+            let conn = db
+                .read()
+                .context("shared read: catalogue push (ADR-0098 Gap 1a)")?;
             crate::quoting_materials::list_public(&conn, &tenant_str)
         })
         .await
@@ -540,7 +542,7 @@ impl CataloguePushService {
     }
 
     async fn write_audit(&self, trigger: &str, outcome: &PushOutcome) {
-        let db_path = self.deps.db_path.clone();
+        let db = self.deps.db.clone();
         let tenant = self.deps.tenant.clone();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
@@ -548,8 +550,7 @@ impl CataloguePushService {
         let outcome = outcome.clone();
 
         let res = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = Connection::open(&db_path)
-                .context("open DuckDB for MaterialCataloguePushed audit")?;
+            let mut conn = db.write().context("shared writer: MaterialCataloguePushed audit (ADR-0098 Gap 1a)")?;
             aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
             let payload = serde_json::json!({
                 "trigger": trigger,

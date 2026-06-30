@@ -50,6 +50,8 @@ pub struct PollSummary {
 #[derive(Debug, Clone)]
 pub struct QuoteIntakeDeps {
     pub db_path: PathBuf,
+    /// ADR-0098 Session B (Gap 1a) — shared DuckDB handle.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -149,13 +151,14 @@ impl QuoteIntakeService {
     async fn process_one_quote(&self, quote: &Quote, summary: &mut PollSummary) {
         let tenant_id = self.deps.tenant.as_str().to_string();
         let db_path = self.deps.db_path.clone();
+        let db_handle = self.deps.db.clone();
         let quote_id = quote.id.clone();
 
         let quote_id_for_check = quote_id.clone();
         let tenant_for_check = tenant_id.clone();
-        let db_for_check = db_path.clone();
+        let db_for_check = db_handle.clone();
         let precheck = spawn_blocking(move || {
-            let conn = duckdb::Connection::open(&db_for_check).map_err(|e| {
+            let conn = db_for_check.read().map_err(|e| {
                 QuoteIntakeError::Storage(format!("open tenant DB for precheck: {e}"))
             })?;
             log_table::already_intook(&conn, &tenant_for_check, &quote_id_for_check)
@@ -198,10 +201,10 @@ impl QuoteIntakeService {
                 let tenant_for_err = tenant_id.clone();
                 let quote_id_for_err = quote.id.clone();
                 let received_at_for_err = quote.received_at.clone();
-                let db_for_err = db_path.clone();
+                let db_for_err = db_handle.clone();
                 let msg_for_err = msg.clone();
                 let insert_err = spawn_blocking(move || {
-                    let conn = duckdb::Connection::open(&db_for_err).map_err(|e| {
+                    let conn = db_for_err.write().map_err(|e| {
                         QuoteIntakeError::Storage(format!("open DB for error-row insert: {e}"))
                     })?;
                     log_table::insert_error_intake(
@@ -250,10 +253,10 @@ impl QuoteIntakeService {
         let received_at = quote.received_at.clone();
         let tenant_for_insert = tenant_id.clone();
         let quote_id_for_insert = quote_id.clone();
-        let db_for_insert = db_path.clone();
+        let db_for_insert = db_handle.clone();
         let invoice_id_for_insert = invoice_id.clone();
         let insert_outcome = spawn_blocking(move || {
-            let conn = duckdb::Connection::open(&db_for_insert).map_err(|e| {
+            let conn = db_for_insert.write().map_err(|e| {
                 QuoteIntakeError::Storage(format!("open tenant DB for insert: {e}"))
             })?;
             log_table::insert_intake(
@@ -305,9 +308,9 @@ impl QuoteIntakeService {
             Ok(()) => {
                 let tenant_for_mark = tenant_id.clone();
                 let quote_id_for_mark = quote.id.clone();
-                let db_for_mark = db_path.clone();
+                let db_for_mark = db_handle.clone();
                 let mark_outcome = spawn_blocking(move || {
-                    let conn = duckdb::Connection::open(&db_for_mark).map_err(|e| {
+                    let conn = db_for_mark.write().map_err(|e| {
                         QuoteIntakeError::Storage(format!("open DB for mark writeback: {e}"))
                     })?;
                     log_table::mark_writeback_complete(
@@ -345,9 +348,9 @@ impl QuoteIntakeService {
 
     async fn snapshot_pending_writebacks(&self) -> Result<Vec<String>, QuoteIntakeError> {
         let tenant_for_list = self.deps.tenant.as_str().to_string();
-        let db_for_list = self.deps.db_path.clone();
+        let db_for_list = self.deps.db.clone();
         match spawn_blocking(move || {
-            let conn = duckdb::Connection::open(&db_for_list)
+            let conn = db_for_list.read()
                 .map_err(|e| QuoteIntakeError::Storage(format!("open DB for pending list: {e}")))?;
             log_table::list_pending_writebacks(&conn, &tenant_for_list)
         })
@@ -364,6 +367,7 @@ impl QuoteIntakeService {
     async fn retry_pending_writebacks(&self, pending: &[String], summary: &mut PollSummary) {
         let tenant_id = self.deps.tenant.as_str().to_string();
         let db_path = self.deps.db_path.clone();
+        let db_handle = self.deps.db.clone();
 
         for quote_id in pending {
             let note = "ABERP writeback retry";
@@ -376,9 +380,9 @@ impl QuoteIntakeService {
                     let now = OffsetDateTime::now_utc();
                     let tenant_for_mark = tenant_id.clone();
                     let qid = quote_id.clone();
-                    let db_for_mark = db_path.clone();
+                    let db_for_mark = db_handle.clone();
                     let _ = spawn_blocking(move || {
-                        let conn = duckdb::Connection::open(&db_for_mark).map_err(|e| {
+                        let conn = db_for_mark.write().map_err(|e| {
                             QuoteIntakeError::Storage(format!(
                                 "open DB for retry-mark writeback: {e}"
                             ))
@@ -434,12 +438,12 @@ impl QuoteIntakeService {
                 elapsed_ms: summary.elapsed_ms,
             }
         });
-        let db_path = self.deps.db_path.clone();
+        let db_handle = self.deps.db.clone();
         let tenant = self.deps.tenant.clone();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
         let outcome = spawn_blocking(move || -> Result<(), QuoteIntakeError> {
-            let mut conn = duckdb::Connection::open(&db_path)
+            let mut conn = db_handle.write()
                 .map_err(|e| QuoteIntakeError::Storage(format!("open DB for audit append: {e}")))?;
             aberp_audit_ledger::ensure_schema(&conn).map_err(|e| {
                 QuoteIntakeError::Storage(format!("ensure audit-ledger schema: {e}"))
@@ -482,12 +486,12 @@ impl QuoteIntakeService {
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_else(|_| "unknown".to_string()),
         };
-        let db_path = self.deps.db_path.clone();
+        let db_handle = self.deps.db.clone();
         let tenant = self.deps.tenant.clone();
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
         let outcome = spawn_blocking(move || -> Result<(), QuoteIntakeError> {
-            let mut conn = duckdb::Connection::open(&db_path).map_err(|e| {
+            let mut conn = db_handle.write().map_err(|e| {
                 QuoteIntakeError::Storage(format!("open DB for row-added append: {e}"))
             })?;
             aberp_audit_ledger::ensure_schema(&conn).map_err(|e| {

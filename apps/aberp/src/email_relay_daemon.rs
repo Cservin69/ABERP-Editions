@@ -109,6 +109,10 @@ pub(crate) const SMTP_SEND_TIMEOUT_SECS: u64 = 30;
 #[derive(Clone)]
 pub struct EmailRelayDaemonDeps {
     pub db_path: PathBuf,
+    /// ADR-0098 Session B (Gap 1a) — the one shared DuckDB handle. This drain
+    /// was the unconditional ~2s separate-instance opener that drove the
+    /// 17:02 re-tear; it now claims/marks rows through the single instance.
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -176,12 +180,12 @@ pub async fn run_drain_loop(deps: EmailRelayDaemonDeps, cancel: CancellationToke
 /// `Ok(false)` when the queue was empty. Errors propagate to the
 /// caller for logging; the loop keeps running.
 async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
-    let db_path = deps.db_path.clone();
+    let db = deps.db.clone();
     let now = time::OffsetDateTime::now_utc();
     let claimed = tokio::task::spawn_blocking(move || -> Result<Option<OutboundEmailRow>> {
-        let conn = Connection::open(&db_path).with_context(|| {
-            format!("open DuckDB at {} for email-relay drain", db_path.display())
-        })?;
+        let conn = db
+            .write()
+            .context("shared writer: email-relay drain claim (ADR-0098 Gap 1a)")?;
         email_relay_queue::ensure_schema(&conn)?;
         claim_next_queued(&conn, now)
     })
@@ -199,10 +203,10 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
     match smtp_outcome {
         Ok(()) => {
             let id = row.id.clone();
-            let db_path2 = deps.db_path.clone();
+            let db = deps.db.clone();
             let now2 = time::OffsetDateTime::now_utc();
             tokio::task::spawn_blocking(move || -> Result<()> {
-                let conn = Connection::open(&db_path2).context("open DB to mark Sent")?;
+                let conn = db.write().context("shared writer: mark Sent (ADR-0098 Gap 1a)")?;
                 mark_sent(&conn, &id, now2)
             })
             .await
@@ -228,10 +232,10 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
             let detail = scrub_for_audit(&e.to_string());
             if attempt_n >= MAX_ATTEMPTS_PER_ROW {
                 let id = row.id.clone();
-                let db_path2 = deps.db_path.clone();
+                let db = deps.db.clone();
                 let detail_for_db = detail.clone();
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    let conn = Connection::open(&db_path2).context("open DB to mark Failed")?;
+                    let conn = db.write().context("shared writer: mark Failed (ADR-0098 Gap 1a)")?;
                     mark_failed(&conn, &id, &detail_for_db)
                 })
                 .await
@@ -257,10 +261,10 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
                 );
             } else {
                 let id = row.id.clone();
-                let db_path2 = deps.db_path.clone();
+                let db = deps.db.clone();
                 let detail_for_db = detail.clone();
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    let conn = Connection::open(&db_path2).context("open DB to requeue")?;
+                    let conn = db.write().context("shared writer: requeue (ADR-0098 Gap 1a)")?;
                     requeue_for_retry(&conn, &id, &detail_for_db)
                 })
                 .await
@@ -280,15 +284,12 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
 /// Opens its own short-lived connection (mirrors the per-op connection
 /// posture of [`process_one_row`]). Returns the count reconciled.
 async fn reconcile_startup(deps: &EmailRelayDaemonDeps) -> Result<u64> {
-    let db_path = deps.db_path.clone();
+    let db = deps.db.clone();
     let now = time::OffsetDateTime::now_utc();
     tokio::task::spawn_blocking(move || -> Result<u64> {
-        let conn = Connection::open(&db_path).with_context(|| {
-            format!(
-                "open DuckDB at {} for email-relay startup reconcile",
-                db_path.display()
-            )
-        })?;
+        let conn = db
+            .write()
+            .context("shared writer: email-relay startup reconcile (ADR-0098 Gap 1a)")?;
         reconcile_orphaned_sending(&conn, now)
     })
     .await
@@ -457,12 +458,12 @@ pub(crate) async fn write_relay_audit(
     kind: EventKind,
     payload: EmailRelayAuditPayload,
 ) {
-    let db_path = deps.db_path.clone();
+    let db = deps.db.clone();
     let tenant = deps.tenant.clone();
     let binary_hash = deps.binary_hash;
     let login = deps.operator_login.clone();
     let res = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = Connection::open(&db_path).context("open DB for email-relay audit")?;
+        let mut conn = db.write().context("shared writer: email-relay audit (ADR-0098 Gap 1a)")?;
         aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
         let bytes = payload.to_bytes();
         let tx = conn.transaction().context("begin email-relay audit tx")?;
@@ -482,10 +483,10 @@ pub(crate) async fn write_relay_audit(
 
 #[allow(dead_code)]
 pub(crate) fn read_row_helper(
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     id: &str,
 ) -> Result<Option<OutboundEmailRow>> {
-    let conn = Connection::open(db_path).context("open DB")?;
+    let conn = db.read().context("shared read: read_row_helper (ADR-0098 Gap 1a)")?;
     read_row(&conn, id)
 }
 

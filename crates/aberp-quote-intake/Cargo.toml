@@ -27,6 +27,8 @@ zeroize = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 aberp-audit-ledger = { path = "../audit-ledger" }
+# ADR-0098 Session B (Gap 1a) — the shared DuckDB handle.
+aberp-db = { path = "../aberp-db" }
 aberp-billing = { path = "../../modules/billing" }
 duckdb = { workspace = true }
 time = { workspace = true }
