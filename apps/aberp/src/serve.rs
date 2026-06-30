@@ -9473,7 +9473,7 @@ pub fn storno_invoice_request(
 
     issue_storno::storno_from_inputs(
         input,
-        &state.db_path,
+        &state.db,
         state.tenant.as_str(),
         DEFAULT_SERIES_CODE,
         invoice_id,
