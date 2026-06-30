@@ -1,0 +1,50 @@
+# ADR-0098 C2 — FROZEN residual independent-opener ledger (gate CHECK 10i).
+# Format: <count> <path>.  The gate re-derives each file's RUNTIME opener count
+#   (Connection::open(_with_flags)? / Ledger::open / DuckDbBillingStore::open /
+#    append_reopen; comment/string/cfg(test)-aware; open_in_memory & from_connection
+#    excluded; serve.rs boot opens in run/seed_demo_sample_data allow-listed)
+#   and FAILS if any file EXCEEDS its frozen count, or if a NEW opener-bearing
+#   file appears that is not listed here. Freezes the residual surface so it
+#   cannot silently grow (review F1-F4; 'never again green-while-blind').
+#
+# NOT listed (accounted for elsewhere): the 7 C2-migrated files (on the Handle,
+#   count 0, enforced by CHECK 10h); crates/aberp-db (the Handle's sole boot open);
+#   crates/aberp-snapshot/src/take.rs (sanctioned EXPORT residual, CHECK 10g).
+#
+# Categories (informational): (b)=operator-paced ERP request module — v0.2.6 target;
+#   (a-residual)=daemon-driven module reached at high freq via db.db_path() (HIGHEST
+#   v0.2.6 priority: incoming_invoices+submission_queue, driven by ap_sync backfill);
+#   (c)=CLI-only one-shot subcommand (separate process, out of ADR-0098 scope);
+#   (serve)=serve.rs request-handler audit reads (Ledger::open) C did not migrate;
+#   (boot)=pre-serve-loop create/provision.
+1 apps/aberp/src/audit_dap_boot.rs
+2 apps/aberp/src/avl_vendors.rs
+8 apps/aberp/src/drain_pending_retries.rs
+6 apps/aberp/src/drain_submission_queue.rs
+2 apps/aberp/src/email_invoice.rs
+1 apps/aberp/src/export_invoice_bundle.rs
+9 apps/aberp/src/incoming_invoices.rs
+4 apps/aberp/src/mark_abandoned.rs
+1 apps/aberp/src/material_inventory.rs
+1 apps/aberp/src/mes_manager.rs
+4 apps/aberp/src/observe_receiver_confirmation.rs
+1 apps/aberp/src/part_marking.rs
+3 apps/aberp/src/poll_annulment_ack.rs
+3 apps/aberp/src/print_invoice.rs
+7 apps/aberp/src/purchasing.rs
+2 apps/aberp/src/qc_inspection.rs
+11 apps/aberp/src/quality.rs
+2 apps/aberp/src/quote_calibration.rs
+1 apps/aberp/src/quoting_machines.rs
+4 apps/aberp/src/recover_from_nav.rs
+4 apps/aberp/src/reports.rs
+4 apps/aberp/src/request_technical_annulment.rs
+1 apps/aberp/src/restore_from_nav_extract.rs
+11 apps/aberp/src/restore_from_nav_outgoing.rs
+9 apps/aberp/src/retry_submission.rs
+30 apps/aberp/src/serve.rs
+1 apps/aberp/src/snapshot.rs
+1 apps/aberp/src/submission_queue.rs
+3 apps/aberp/src/submit_annulment.rs
+1 apps/aberp/src/tenant_registry.rs
+1 modules/billing/src/adapters/duckdb_store.rs

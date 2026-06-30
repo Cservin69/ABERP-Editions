@@ -218,6 +218,34 @@ open(p,"w").write(s)
 PYIN
 expect_fail "$c" "snapshot EXPORT opener allow-list marker missing" "CHECK 10g — snapshot-EXPORT residual marker removed (undocumented opener)"
 
+echo "[CHECK 10h] a runtime Ledger::open planted in a MIGRATED NAV daemon (ap_sync) — C2 audit-seam regression"
+c="$(fresh)"; printf '\nfn _c2_probe_ledger_open() {\n    let _ = Ledger::open(std::path::Path::new("/x"), "t", "h");\n}\n' >> "$c/apps/aberp/src/ap_sync.rs"
+expect_fail "$c" "(Session-C2 regression)" "CHECK 10h — Ledger::open re-added to ap_sync (the opener class C2 banned)"
+
+echo "[CHECK 10h] a runtime DuckDbBillingStore::open planted in submit_invoice — C2 billing-seam regression"
+c="$(fresh)"; printf '\nfn _c2_probe_billing_open() {\n    let _ = DuckDbBillingStore::open("/x");\n}\n' >> "$c/apps/aberp/src/submit_invoice.rs"
+expect_fail "$c" "(Session-C2 regression)" "CHECK 10h — DuckDbBillingStore::open re-added to submit_invoice (the un-inventoried opener class F4)"
+
+echo "[CHECK 10h] a Connection::open INSIDE a #[cfg(test)] block of a migrated file must NOT trip (cfg(test)-aware)"
+c="$(fresh)"
+python3 - "$c/apps/aberp/src/ap_sync.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+needle="let db_path = tmp.join(\"tenant.duckdb\");"
+assert needle in s, "ap_sync cfg(test) anchor moved — probe is stale"
+s=s.replace(needle, needle+"\n        let _t = Connection::open(&db_path).unwrap(); // test-only stray, scan must ignore", 1)
+open(p,"w").write(s)
+PYIN
+expect_pass "$c" "CHECK 10h — Connection::open inside #[cfg(test)] of a migrated file is correctly IGNORED"
+
+echo "[CHECK 10i] an operator-module residual GROWS its opener count (quality.rs +1) — frozen ledger must catch it"
+c="$(fresh)"; printf '\nfn _c2_probe_grow() {\n    let _ = duckdb::Connection::open("/x");\n}\n' >> "$c/apps/aberp/src/quality.rs"
+expect_fail "$c" "grew its residual openers" "CHECK 10i — operator-module residual opener count grew beyond its frozen baseline"
+
+echo "[CHECK 10i] a BRAND-NEW opener-bearing file not on the frozen ledger — must be caught (no silent new opener)"
+c="$(fresh)"; printf 'fn _c2_probe_new_opener() {\n    let _ = duckdb::Connection::open("/x");\n}\n' > "$c/apps/aberp/src/zz_c2_probe_opener.rs"
+expect_fail "$c" "NEW unaccounted opener-bearing file" "CHECK 10i — a new unlisted runtime-opener file is rejected"
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi

@@ -620,6 +620,87 @@ else
   flag10 "✗ snapshot EXPORT opener allow-list marker missing in take.rs (undocumented residual — see ADR-0098 Session C)"
 fi
 
+# ── CHECK 10h — ADR-0098 Session C2: the two NAV daemons (ap_sync + poll_ack) and
+#    the invoicing-mutation seam (issue/storno/modification/submit/mark-paid) route
+#    DuckDB through the shared Handle — NO runtime independent opener outside it.
+#    C's 10d/10f banned ONLY the Connection::open family and never scanned these
+#    files at all; review F1/F3/F4 showed the NAV daemons + the whole invoicing
+#    surface stayed live AND a whole opener class (Ledger::open / DuckDbBillingStore::
+#    open) was invisible — D5 was green-while-blind. 10h closes both: it scans the
+#    seven migrated files with the FULL ban set (Connection::open*/Ledger::open/
+#    DuckDbBillingStore::open/append_reopen), comment/string/cfg(test)-aware
+#    (tools/adr0098_opener_scan.awk; open_in_memory & from_connection are the
+#    sanctioned shared-instance seams and excluded).
+echo "[CHECK 10h] ADR-0098 Session C2 — NAV daemons + invoicing seam on the Handle (bans Connection::open/Ledger::open/DuckDbBillingStore::open; ENFORCED · D5)"
+scan="tools/adr0098_opener_scan.awk"
+[[ -f "$scan" ]] || flag10 "✗ opener scanner missing: $scan"
+c2_files=(
+  apps/aberp/src/ap_sync.rs
+  apps/aberp/src/poll_ack.rs
+  apps/aberp/src/issue_invoice.rs
+  apps/aberp/src/issue_storno.rs
+  apps/aberp/src/issue_modification.rs
+  apps/aberp/src/submit_invoice.rs
+  apps/aberp/src/mark_invoice_paid.rs
+)
+for f in "${c2_files[@]}"; do
+  if [[ ! -f "$f" ]]; then flag10 "✗ C2 migrated file missing: $f"; continue; fi
+  strays="$(awk -f "$scan" "$f" 2>/dev/null || true)"
+  if [[ -n "$strays" ]]; then
+    flag10 "✗ $f has a runtime independent live-DB opener OUTSIDE the Handle (Session-C2 regression):"
+    printf '%s\n' "$strays" | sed 's/^/      /'
+  else
+    note "✓ $(basename "$f") — no runtime Connection::open/Ledger::open/DuckDbBillingStore::open (routes through aberp_db::Handle)"
+  fi
+  if grep -qE '\.(read|write)\(\)' "$f"; then
+    note "  ✓ $(basename "$f") routes through the handle (.read()/.write() present)"
+  else
+    flag10 "✗ $(basename "$f") no longer calls the shared handle (.read()/.write()) — C2 migration reverted?"
+  fi
+done
+
+# ── CHECK 10i — ADR-0098 Session C2: the FROZEN residual-opener ledger. Every
+#    runtime independent opener NOT on the Handle is accounted for in
+#    tools/adr0098_c2_frozen_residuals.txt (operator-paced ERP modules + CLI
+#    one-shots + serve.rs request-handler audit reads). Each file's count is
+#    FROZEN: it may not EXCEED its listed count, and no NEW opener-bearing file
+#    may appear unlisted. This is what makes a deferred-to-v0.2.6 surface SAFE
+#    (it cannot silently grow) and what keeps a green D5 from ever again meaning
+#    "blind to most of the openers" (review F1-F4). Toolchain-free (awk).
+echo "[CHECK 10i] ADR-0098 Session C2 — frozen residual-opener ledger (operator/CLI/serve cannot grow; ENFORCED · D5)"
+manifest="tools/adr0098_c2_frozen_residuals.txt"
+if [[ ! -f "$manifest" ]]; then
+  flag10 "✗ frozen-residual manifest missing: $manifest"
+elif [[ ! -f "$scan" ]]; then
+  : # already flagged
+else
+  c2_set=" apps/aberp/src/ap_sync.rs apps/aberp/src/poll_ack.rs apps/aberp/src/issue_invoice.rs apps/aberp/src/issue_storno.rs apps/aberp/src/issue_modification.rs apps/aberp/src/submit_invoice.rs apps/aberp/src/mark_invoice_paid.rs "
+  resid_fail=0
+  while IFS= read -r f; do
+    case " $c2_set " in *" $f "*) continue;; esac
+    case "$f" in crates/aberp-db/*|crates/aberp-snapshot/src/take.rs) continue;; esac
+    if [[ "$f" == "apps/aberp/src/serve.rs" ]]; then
+      actual="$(awk -v allow="run,seed_demo_sample_data" -f "$scan" "$f" 2>/dev/null | wc -l | tr -d ' ')"
+    else
+      actual="$(awk -f "$scan" "$f" 2>/dev/null | wc -l | tr -d ' ')"
+    fi
+    [[ "${actual:-0}" -eq 0 ]] && continue
+    frozen="$(awk -v p="$f" '$1!="#" && $2==p{print $1}' "$manifest")"
+    if [[ -z "$frozen" ]]; then
+      flag10 "✗ NEW unaccounted opener-bearing file $f ($actual runtime opener(s)) — migrate it onto the Handle or add a tracked-residual line to $manifest"
+      resid_fail=1
+    elif [[ "$actual" -gt "$frozen" ]]; then
+      flag10 "✗ $f grew its residual openers ($actual > frozen $frozen) — the deferred surface may not grow; migrate the new opener onto the Handle"
+      resid_fail=1
+    fi
+  done < <(find apps/aberp/src modules -name '*.rs' | grep -vE '/tests/' | sort)
+  if [[ "$resid_fail" == "0" ]]; then
+    ft="$(grep -vE '^#' "$manifest" | awk '{s+=$1} END{print s}')"
+    ff="$(grep -vcE '^#' "$manifest")"
+    note "✓ frozen residual ledger holds — no file exceeds its frozen count, no new unlisted opener ($ft frozen openers across $ff files; v0.2.6 migration target)"
+  fi
+fi
+
 echo
 if [[ "$fail" -ne 0 ]]; then echo "CUT-GATE: ✗ FAILED"; exit 1; fi
 echo "CUT-GATE: ✓ PASSED"
