@@ -1,7 +1,7 @@
 # ADR-0093 saw-off cut-gate — DB-isolation guardrail (the REQUIRED check).
 #
 # Deliberately a standalone, toolchain-free job: it runs the bash cut-gate
-# (tools/cut_gate_db_isolation.sh, CHECK 1–7) PLUS the negative-probe harness
+# (tools/cut_gate_db_isolation.sh, CHECK 1–10) PLUS the negative-probe harness
 # with nothing but a checkout, so it gates in seconds and stays green
 # independently of the heavy Rust+Tauri build in ci.yml. Its sole job is to
 # make the ADR-0002/ADR-0093 DB-isolation mandate un-droppable at a
@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Run DB-isolation cut-gate (CHECK 1–7, all ENFORCED)
+      - name: Run DB-isolation cut-gate (CHECK 1–10, all ENFORCED)
         # Every ENFORCE_* flag is explicit here as well as defaulted in the
         # script, so enforcement is visible at the CI surface and cannot be
         # silently weakened by a one-line script edit.

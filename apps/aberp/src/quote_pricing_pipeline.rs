@@ -663,7 +663,6 @@ impl PricingPipelineService {
         let tolerance_critical = quote.request.tolerance_critical.unwrap_or(false);
         let tolerance_note = quote.request.tolerance_note.clone();
 
-        let db_path = self.deps.db_path.clone();
         let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         let quote_id = qid.clone();
@@ -790,7 +789,6 @@ impl PricingPipelineService {
         // panel identifies the buyer even when the listing had no CAD.
         let customer_company = quote.contact.company.trim().to_string();
 
-        let db_path = self.deps.db_path.clone();
         let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         let quote_id = qid.clone();
@@ -877,7 +875,6 @@ impl PricingPipelineService {
     /// but never changes the cycle's already-decided failure outcome. Own DB
     /// connection + tx (the poll path has no surrounding `spawn_blocking`).
     async fn emit_poll_outcome_audit(&self, outcome: &WritebackOutcome) {
-        let db_path = self.deps.db_path.clone();
         let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
@@ -927,7 +924,6 @@ impl PricingPipelineService {
     }
 
     async fn next_actionable_blocking(&self) -> Result<Option<PricingJobRow>> {
-        let db_path = self.deps.db_path.clone();
         let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         spawn_blocking(move || -> Result<Option<PricingJobRow>> {
@@ -955,7 +951,6 @@ impl PricingPipelineService {
     }
 
     async fn advance_extract(&self, row: PricingJobRow) -> Result<StepOutcome> {
-        let db_path = self.deps.db_path.clone();
         let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
@@ -1132,7 +1127,6 @@ impl PricingPipelineService {
     }
 
     async fn advance_price(&self, row: PricingJobRow) -> Result<StepOutcome> {
-        let db_path = self.deps.db_path.clone();
         let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
@@ -1632,7 +1626,6 @@ impl PricingPipelineService {
     }
 
     async fn advance_render(&self, row: PricingJobRow) -> Result<StepOutcome> {
-        let db_path = self.deps.db_path.clone();
         let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
@@ -1773,7 +1766,6 @@ impl PricingPipelineService {
     async fn advance_post(&self, row: PricingJobRow) -> Result<StepOutcome> {
         // Read row artifacts off-thread, then do the async HTTP POST
         // on the main runtime.
-        let db_path = self.deps.db_path.clone();
         let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let quote_id = row.quote_id.clone();
@@ -1817,7 +1809,6 @@ impl PricingPipelineService {
             )
             .await;
 
-        let db_path = self.deps.db_path.clone();
         let db = self.deps.db.clone();
         let tenant_id_string = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;

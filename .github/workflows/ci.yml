@@ -65,7 +65,7 @@ jobs:
       # negative probes prove the gate itself still has teeth. Identical for
       # both arms (static source check) — cheap enough to keep per-arm so each
       # job is self-contained.
-      - name: ADR-0093 DB-isolation cut-gate (CHECK 1–7, all ENFORCED)
+      - name: ADR-0093 DB-isolation cut-gate (CHECK 1–10, all ENFORCED)
         env:
           ENFORCE_EDITION_DB_BINDING: "1"
           ENFORCE_CHUNK3_INVARIANTS: "1"

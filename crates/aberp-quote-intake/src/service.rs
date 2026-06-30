@@ -150,7 +150,6 @@ impl QuoteIntakeService {
 
     async fn process_one_quote(&self, quote: &Quote, summary: &mut PollSummary) {
         let tenant_id = self.deps.tenant.as_str().to_string();
-        let db_path = self.deps.db_path.clone();
         let db_handle = self.deps.db.clone();
         let quote_id = quote.id.clone();
 
@@ -366,7 +365,6 @@ impl QuoteIntakeService {
 
     async fn retry_pending_writebacks(&self, pending: &[String], summary: &mut PollSummary) {
         let tenant_id = self.deps.tenant.as_str().to_string();
-        let db_path = self.deps.db_path.clone();
         let db_handle = self.deps.db.clone();
 
         for quote_id in pending {
