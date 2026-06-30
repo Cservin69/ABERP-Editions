@@ -42,14 +42,16 @@
 
 use std::path::{Path, PathBuf};
 
-use aberp_audit_ledger::{read_mirror_entries, replay_mirror_delta, BinaryHash, Ledger, TenantId};
+use aberp_audit_ledger::{
+    read_mirror_entries, replay_mirror_delta, BinaryHash, Ledger, MirrorEntry, TenantId,
+};
 use duckdb::Connection;
 
 use crate::crash_safe::{
     atomic_install, checkpoint_is_current, durable_checkpoint, sibling, unique_tag, wal_sibling,
     write_marker, CheckpointReport,
 };
-use crate::store::list_snapshots;
+use crate::store::{list_snapshots, SnapshotRecord};
 use crate::take::{ensure_not_prod_path, sql_quote};
 use crate::{Result, SnapshotError};
 
@@ -134,19 +136,21 @@ pub fn recover_or_refuse(
     ensure_not_prod_path(store_dir)?;
 
     // 1. PRESERVE evidence — never destroy it. The original live file stays
-    //    in place until step 6 swaps the rebuild over it.
+    //    in place until the rebuild is swapped over it.
     let retained_corrupt_db = if db_path.exists() {
         Some(preserve_corrupt_db(db_path)?)
     } else {
         None
     };
 
-    // 2. Latest VALID snapshot (ADR-0082). None → refuse (cannot rebuild from
-    //    nothing — fall through to the existing preserve-and-surface).
-    let snapshot = match list_snapshots(store_dir)?
+    // 2. The recovery candidates are the VALID snapshots (ADR-0082),
+    //    newest-seq first (the order `list_snapshots` returns). None → refuse
+    //    (cannot rebuild from nothing — the existing preserve-and-surface).
+    let valid_snapshots: Vec<SnapshotRecord> = list_snapshots(store_dir)?
         .into_iter()
-        .find(|r| r.meta.valid)
-    {
+        .filter(|r| r.meta.valid)
+        .collect();
+    let latest = match valid_snapshots.first() {
         Some(s) => s,
         None => {
             return Ok(RecoveryOutcome::RefusedNoSnapshot {
@@ -154,10 +158,12 @@ pub fn recover_or_refuse(
             })
         }
     };
-    let snapshot_audit_count = snapshot.meta.audit_count.max(0) as u64;
+    let snapshot_audit_count = latest.meta.audit_count.max(0) as u64;
 
-    // The mirror is the second source of recovery truth — read it, never
-    // mutate it. Missing/corrupt → unsafe → refuse (safe fallback).
+    // The mirror is the second source of recovery truth. It is READ here and
+    // mutated ONLY by an append-only TOP-UP on the self-certified ahead-
+    // snapshot path (ADR-0098 D3); it is NEVER truncated. Missing/corrupt →
+    // unsafe → refuse (safe fallback).
     let mirror_entries = match read_mirror_entries(mirror_path) {
         Ok(e) => e,
         Err(e) => {
@@ -174,64 +180,107 @@ pub fn recover_or_refuse(
     let mirror_max_seq = mirror_entries.last().map(|e| e.seq()).unwrap_or(0);
     let mirror_head_hash = mirror_entries.last().map(|e| e.entry_hash().to_string());
 
-    // GUARD-RAIL: the snapshot must be a PREFIX of the mirror — its audit head
-    // cannot be ahead of the mirror head, or the two disagree and we must not
-    // guess. Fall back to preserve-and-refuse.
-    if snapshot_audit_count > mirror_max_seq {
-        return Ok(RecoveryOutcome::RefusedUnsafe {
-            reason: format!(
-                "latest valid snapshot (audit_count={snapshot_audit_count}) is AHEAD of the \
-                 mirror head (seq={mirror_max_seq}); snapshot and mirror disagree — refusing"
-            ),
-            retained_corrupt_db,
-        });
-    }
-
-    // 3–5. Build a PRIVATE staging DB from the snapshot, replay the mirror
-    //      delta into it, and validate the rebuild. Nothing here touches the
-    //      live path. Clear any orphan staging from a crashed prior recovery
-    //      first (the `.CORRUPT-*` evidence has a different infix and is kept).
-    cleanup_siblings_with_infix(db_path, RECOVER_INFIX);
-    let staging = sibling(db_path, &format!("{RECOVER_INFIX}{}.duckdb", unique_tag()));
-    cleanup_temp(&staging);
-    let verdict = build_and_validate(
-        &staging,
-        &snapshot.dir,
+    // 3. ADR-0098 Gap 2a — guard COHERENCE. The latest valid snapshot is
+    //    either a PREFIX of the mirror (`audit_count <= mirror_head`, the
+    //    original IMPORT-snapshot + replay-mirror-delta path) or AHEAD of it
+    //    (`> mirror_head`). An ahead snapshot is recovered from IFF it
+    //    SELF-CERTIFIES (D4: its own hash chain verifies genesis→head AND the
+    //    mirror agrees with it over the overlap `[1..mirror_head]`); the
+    //    lagging mirror is then TOPPED UP to the snapshot head (append +
+    //    fsync, never truncate — D3). If the ahead snapshot cannot
+    //    self-certify we fall back to the newest valid snapshot
+    //    `<= mirror_head`; only if THAT is also impossible do we refuse.
+    //
+    //    The mirror-AHEAD-of-DB P0 preserve-and-refuse is a *different*
+    //    condition, handled in `audit-ledger`'s `ensure_consistent_with_db`;
+    //    it is untouched by this branch.
+    let primary = stage_and_validate(
+        db_path,
+        latest,
         mirror_path,
         tenant,
         snapshot_audit_count,
         mirror_max_seq,
         mirror_head_hash.as_deref(),
-    );
-    let info = match verdict {
-        Ok(Verdict::Recovered(info)) => info,
-        Ok(Verdict::Refuse(reason)) => {
-            cleanup_temp(&staging);
-            return Ok(RecoveryOutcome::RefusedUnsafe {
-                reason,
-                retained_corrupt_db,
-            });
-        }
-        Err(e) => {
-            // A hard mechanical failure (not a guard refusal): clean the
-            // disposable staging and surface loudly.
-            cleanup_temp(&staging);
-            return Err(e);
-        }
+        &mirror_entries,
+    )?;
+    let self_certifies = matches!(primary.verdict, Verdict::Recovered(_));
+
+    // The ahead-but-not-self-certifying fallback is the newest VALID snapshot
+    // whose head does not exceed the mirror head.
+    let ahead = snapshot_audit_count > mirror_max_seq;
+    let fallback = if ahead && !self_certifies {
+        valid_snapshots
+            .iter()
+            .find(|r| (r.meta.audit_count.max(0) as u64) <= mirror_max_seq)
+    } else {
+        None
     };
 
-    // 6. COMMIT atomically: swap the validated rebuild over the live path and
-    //    write the verified-good marker (reusing the chunk-3 primitives).
-    atomic_install(&staging, db_path)?;
-    write_marker(db_path)?;
-
-    Ok(RecoveryOutcome::Recovered {
-        source_snapshot_seq: snapshot.meta.seq,
+    match route_guard(
         snapshot_audit_count,
-        replayed_entries: info.replayed,
-        recovered_max_seq: info.max_seq,
-        retained_corrupt_db,
-    })
+        mirror_max_seq,
+        self_certifies,
+        fallback.is_some(),
+    ) {
+        // PREFIX: the primary attempt IS the existing prefix path.
+        // RECOVER-AHEAD-TOPUP: the primary self-certified and topped up the
+        // mirror. Both install (or surface a refusal from) the primary.
+        GuardRoute::Prefix | GuardRoute::RecoverAheadTopUp => install_or_refuse(
+            primary,
+            latest,
+            snapshot_audit_count,
+            retained_corrupt_db,
+            db_path,
+        ),
+        // FALL BACK: the ahead snapshot did not self-certify; rebuild from the
+        // newest valid snapshot `<= mirror_head` via the prefix path.
+        GuardRoute::FallBackToPrefix => {
+            cleanup_temp(&primary.staging);
+            let fb = fallback.expect("route_guard returned FallBackToPrefix => fallback present");
+            let fb_count = fb.meta.audit_count.max(0) as u64;
+            tracing::warn!(
+                latest_snapshot_seq = latest.meta.seq,
+                latest_audit_count = snapshot_audit_count,
+                mirror_head = mirror_max_seq,
+                fallback_snapshot_seq = fb.meta.seq,
+                fallback_audit_count = fb_count,
+                "ADR-0098 Gap 2a — ahead snapshot did not self-certify; falling back to the \
+                 newest valid snapshot at or below the mirror head"
+            );
+            let fb_attempt = stage_and_validate(
+                db_path,
+                fb,
+                mirror_path,
+                tenant,
+                fb_count,
+                mirror_max_seq,
+                mirror_head_hash.as_deref(),
+                &mirror_entries,
+            )?;
+            install_or_refuse(fb_attempt, fb, fb_count, retained_corrupt_db, db_path)
+        }
+        // REFUSE: ahead, cannot self-certify, and no valid snapshot
+        // `<= mirror_head` to fall back to. Preserve-and-surface (never guess)
+        // — the chunk-3 P1 default, demoted to a last resort.
+        GuardRoute::Refuse => {
+            let reason = match primary.verdict {
+                Verdict::Refuse(r) => format!(
+                    "latest valid snapshot (audit_count={snapshot_audit_count}) is AHEAD of the \
+                     mirror head (seq={mirror_max_seq}) and could not self-certify ({r}); no valid \
+                     snapshot at or below the mirror head to fall back to — refusing"
+                ),
+                Verdict::Recovered(_) => {
+                    unreachable!("route_guard returns Refuse only when the primary refused")
+                }
+            };
+            cleanup_temp(&primary.staging);
+            Ok(RecoveryOutcome::RefusedUnsafe {
+                reason,
+                retained_corrupt_db,
+            })
+        }
+    }
 }
 
 /// Infix of the private recovery-staging temp (`<db>.recover-<tag>.duckdb`).
@@ -242,7 +291,12 @@ const CREATING_INFIX: &str = ".creating-";
 const CORRUPT_INFIX: &str = ".CORRUPT-";
 
 struct RebuildInfo {
+    /// Mirror entries replayed on top of the snapshot (prefix path; 0 ahead).
     replayed: u64,
+    /// Snapshot entries appended to TOP UP a lagging mirror to the snapshot
+    /// head (ahead path, ADR-0098 D3; 0 on the prefix path). Append-only.
+    topped_up: u64,
+    /// Rebuilt + installed head seq (`max(snapshot_head, mirror_head)`).
     max_seq: u64,
 }
 
@@ -253,11 +307,151 @@ enum Verdict {
     Refuse(String),
 }
 
+/// One staged recovery attempt: the private staging DB path and the
+/// guard-rail [`Verdict`] of building + validating it. The staging file is
+/// the caller's to install (on `Recovered`) or clean up (otherwise).
+struct Attempt {
+    staging: PathBuf,
+    verdict: Verdict,
+}
+
+/// The guard's three-way recovery decision (ADR-0098 Gap 2a) as a PURE
+/// function of the snapshot / mirror heads, whether an ahead snapshot
+/// self-certifies, and whether a `<= mirror_head` fallback snapshot exists.
+/// [`recover_or_refuse`] routes on it; the table is unit-tested
+/// (`tests::route_guard_*`) and faithfully extracted for the saw-off gate
+/// (the crate cannot `cargo build` there — bundled DuckDB amalgamation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardRoute {
+    /// `snapshot_head <= mirror_head`: the snapshot is a prefix of the mirror
+    /// — the original IMPORT-snapshot + replay-mirror-delta path.
+    Prefix,
+    /// `snapshot_head > mirror_head` AND it self-certifies: recover from the
+    /// ahead snapshot and top the lagging mirror up to it (append + fsync).
+    RecoverAheadTopUp,
+    /// `snapshot_head > mirror_head`, does NOT self-certify, but a valid
+    /// snapshot `<= mirror_head` exists: fall back to it via the prefix path.
+    FallBackToPrefix,
+    /// `snapshot_head > mirror_head`, cannot self-certify, and no fallback
+    /// snapshot `<= mirror_head`: refuse (preserve-and-surface; never guess).
+    Refuse,
+}
+
+/// Pure routing for the Gap 2a guard (see [`GuardRoute`]). No I/O, so the
+/// full decision table is verifiable without DuckDB.
+fn route_guard(
+    snapshot_head: u64,
+    mirror_head: u64,
+    self_certifies: bool,
+    fallback_available: bool,
+) -> GuardRoute {
+    if snapshot_head <= mirror_head {
+        GuardRoute::Prefix
+    } else if self_certifies {
+        GuardRoute::RecoverAheadTopUp
+    } else if fallback_available {
+        GuardRoute::FallBackToPrefix
+    } else {
+        GuardRoute::Refuse
+    }
+}
+
+/// PURE: the first overlap seq at which the mirror and the rebuilt
+/// (snapshot-sourced) chain disagree on `entry_hash`, or `None` if every
+/// overlap entry agrees. `mirror` and `staging` are `(seq, entry_hash)` in
+/// seq order; the overlap is the mirror's range `[1..=mirror_head]`. A
+/// missing staging entry at a mirror seq counts as a disagreement. This is
+/// the overlap-agreement half of the D4 self-certification bar, kept I/O-free
+/// so it is verifiable without DuckDB (the saw-off gate).
+fn first_overlap_disagreement(mirror: &[(u64, String)], staging: &[(u64, String)]) -> Option<u64> {
+    for (seq, mirror_hash) in mirror {
+        match staging.iter().find(|(s, _)| s == seq) {
+            Some((_, staging_hash)) if staging_hash == mirror_hash => {}
+            _ => return Some(*seq),
+        }
+    }
+    None
+}
+
+/// Create a fresh private staging path and build + validate `snapshot` into
+/// it (prefix mode when `snapshot_audit_count <= mirror_max_seq`, ahead mode
+/// — which also tops up the mirror — otherwise). The live path is untouched.
+#[allow(clippy::too_many_arguments)]
+fn stage_and_validate(
+    db_path: &Path,
+    snapshot: &SnapshotRecord,
+    mirror_path: &Path,
+    tenant: &str,
+    snapshot_audit_count: u64,
+    mirror_max_seq: u64,
+    mirror_head_hash: Option<&str>,
+    mirror_entries: &[MirrorEntry],
+) -> Result<Attempt> {
+    // Clear any orphan staging from a crashed prior recovery first (the
+    // `.CORRUPT-*` evidence has a different infix and is kept).
+    cleanup_siblings_with_infix(db_path, RECOVER_INFIX);
+    let staging = sibling(db_path, &format!("{RECOVER_INFIX}{}.duckdb", unique_tag()));
+    cleanup_temp(&staging);
+    let verdict = build_and_validate(
+        &staging,
+        &snapshot.dir,
+        mirror_path,
+        tenant,
+        snapshot_audit_count,
+        mirror_max_seq,
+        mirror_head_hash,
+        mirror_entries,
+    )?;
+    Ok(Attempt { staging, verdict })
+}
+
+/// COMMIT a validated rebuild atomically (swap over the live path + write the
+/// verified-good marker), or surface the guard-rail refusal. On refusal the
+/// disposable staging is cleaned; the live inputs are untouched.
+fn install_or_refuse(
+    attempt: Attempt,
+    snapshot: &SnapshotRecord,
+    snapshot_audit_count: u64,
+    retained_corrupt_db: Option<PathBuf>,
+    db_path: &Path,
+) -> Result<RecoveryOutcome> {
+    match attempt.verdict {
+        Verdict::Recovered(info) => {
+            atomic_install(&attempt.staging, db_path)?;
+            write_marker(db_path)?;
+            if info.topped_up > 0 {
+                tracing::info!(
+                    source_snapshot_seq = snapshot.meta.seq,
+                    topped_up = info.topped_up,
+                    recovered_max_seq = info.max_seq,
+                    "ADR-0098 D3 — topped up the lagging mirror to the self-certified \
+                     ahead-snapshot head (append-only; never truncated)"
+                );
+            }
+            Ok(RecoveryOutcome::Recovered {
+                source_snapshot_seq: snapshot.meta.seq,
+                snapshot_audit_count,
+                replayed_entries: info.replayed,
+                recovered_max_seq: info.max_seq,
+                retained_corrupt_db,
+            })
+        }
+        Verdict::Refuse(reason) => {
+            cleanup_temp(&attempt.staging);
+            Ok(RecoveryOutcome::RefusedUnsafe {
+                reason,
+                retained_corrupt_db,
+            })
+        }
+    }
+}
+
 /// Build the staging DB from the snapshot export + mirror replay, then
 /// validate it. Returns a [`Verdict`] (recovered or a refusal reason) for
 /// guard-rail outcomes; a hard `Err` only for an unexpected I/O failure. The
 /// staging connection is opened ONCE and reused for verification (S375 — a
 /// re-open triggers the very `LoadCheckpoint`/ART replay path we recover from).
+#[allow(clippy::too_many_arguments)]
 fn build_and_validate(
     staging: &Path,
     snapshot_dir: &Path,
@@ -266,6 +460,7 @@ fn build_and_validate(
     snapshot_audit_count: u64,
     mirror_max_seq: u64,
     mirror_head_hash: Option<&str>,
+    mirror_entries: &[MirrorEntry],
 ) -> Result<Verdict> {
     let mut conn = Connection::open(staging)?;
 
@@ -279,6 +474,9 @@ fn build_and_validate(
     }
 
     // 4. REPLAY the append-only mirror delta (seq > snapshot head) verbatim.
+    //    For an AHEAD snapshot (snapshot head > mirror head) the mirror has
+    //    no entries beyond the snapshot, so this is a no-op (0 replayed) — the
+    //    rebuild is wholly the snapshot and the mirror is TOPPED UP below.
     let replayed = match replay_mirror_delta(&mut conn, mirror_path, snapshot_audit_count) {
         Ok(n) => n,
         Err(e) => return Ok(Verdict::Refuse(format!("mirror replay failed: {e}"))),
@@ -291,14 +489,18 @@ fn build_and_validate(
         )));
     }
 
-    // 5. VALIDATE: hash-chain genesis→head, head seq reconciles with the
-    //    mirror, head entry_hash matches the mirror head.
+    // 5. VALIDATE. The rebuild's head-of-truth is `max(snapshot_head,
+    //    mirror_head)`: the mirror head on the prefix path, the snapshot head
+    //    on the ahead path.
     let tenant_id = match TenantId::new(tenant.to_string()) {
         Some(t) => t,
         None => return Ok(Verdict::Refuse(format!("invalid tenant id {tenant:?}"))),
     };
-    // Reuse the already-open handle for verification (no re-open).
+    let validated_head = snapshot_audit_count.max(mirror_max_seq);
+    // Reuse the already-open handle for verification (no re-open — S375).
     let ledger = Ledger::from_connection(conn, tenant_id, BinaryHash::from_bytes([0u8; 32]));
+    // 5a. The hash chain verifies genesis→head (ADR-0008). For an ahead
+    //     snapshot this is the FIRST self-certification gate (D4).
     let chain_len = match ledger.verify_chain() {
         Ok(n) => n,
         Err(e) => {
@@ -307,29 +509,94 @@ fn build_and_validate(
             )))
         }
     };
-    if chain_len != mirror_max_seq {
+    // 5b. The rebuilt head seq reconciles with `max(snapshot, mirror)`.
+    if chain_len != validated_head {
         return Ok(Verdict::Refuse(format!(
-            "rebuilt DB head seq {chain_len} does not reconcile with the mirror head \
-             seq {mirror_max_seq}"
+            "rebuilt DB head seq {chain_len} does not reconcile with the expected head \
+             {validated_head} (snapshot head {snapshot_audit_count}, mirror head {mirror_max_seq})"
         )));
     }
-    let head = match ledger.recent(1) {
-        Ok(h) => h,
-        Err(e) => return Ok(Verdict::Refuse(format!("reading rebuilt head failed: {e}"))),
-    };
-    let head_hash = head.first().map(|e| hex::encode(e.entry_hash.as_bytes()));
-    if head_hash.as_deref() != mirror_head_hash {
-        return Ok(Verdict::Refuse(
-            "rebuilt DB head entry_hash disagrees with the mirror head".to_string(),
-        ));
-    }
 
-    // Close the handle (drop the Ledger) before the caller swaps the file.
-    drop(ledger);
-    Ok(Verdict::Recovered(RebuildInfo {
-        replayed,
-        max_seq: chain_len,
-    }))
+    if snapshot_audit_count > mirror_max_seq {
+        // ── AHEAD snapshot ───────────────────────────────────────────────
+        // 5c. SELF-CERTIFY gate 2 (D4): the mirror must agree with the
+        //     snapshot over their overlap `[1..=mirror_head]`. Compare the
+        //     mirror's recorded `entry_hash` at every overlap seq against the
+        //     rebuilt (snapshot-sourced) chain's `entry_hash`. Disagreement →
+        //     do NOT guess: refuse (the caller falls back to a `<= mirror_head`
+        //     snapshot, else `RefusedUnsafe`).
+        let staging_entries = match ledger.entries() {
+            Ok(es) => es,
+            Err(e) => {
+                return Ok(Verdict::Refuse(format!(
+                    "reading rebuilt entries for the overlap check failed: {e}"
+                )))
+            }
+        };
+        let staging_overlap: Vec<(u64, String)> = staging_entries
+            .iter()
+            .filter(|e| e.seq.as_u64() <= mirror_max_seq)
+            .map(|e| (e.seq.as_u64(), hex::encode(e.entry_hash.as_bytes())))
+            .collect();
+        let mirror_overlap: Vec<(u64, String)> = mirror_entries
+            .iter()
+            .filter(|m| m.seq() <= mirror_max_seq)
+            .map(|m| (m.seq(), m.entry_hash().to_string()))
+            .collect();
+        if let Some(seq) = first_overlap_disagreement(&mirror_overlap, &staging_overlap) {
+            return Ok(Verdict::Refuse(format!(
+                "ahead snapshot does not self-certify: the mirror and the snapshot disagree at \
+                 overlap seq {seq} (entry_hash mismatch) — refusing to recover from it"
+            )));
+        }
+
+        // 5d. TOP UP the lagging mirror to the snapshot head (ADR-0098 D3):
+        //     append the snapshot entries `(mirror_head .. snapshot_head]`
+        //     verbatim and fsync — the same append `sync_mirror` performs — so
+        //     the system reconciles to `Unchanged` with no chain fork. The
+        //     mirror is EXTENDED, never truncated. `sync_mirror` re-checks the
+        //     boundary overlap before appending (defence in depth).
+        let topped_head = match ledger.sync_mirror(mirror_path) {
+            Ok(h) => h,
+            Err(e) => {
+                return Ok(Verdict::Refuse(format!(
+                    "topping up the mirror to the ahead-snapshot head failed ({e}) — refusing"
+                )))
+            }
+        };
+        if topped_head != chain_len {
+            return Ok(Verdict::Refuse(format!(
+                "mirror top-up reached head {topped_head}, expected {chain_len} — refusing"
+            )));
+        }
+
+        drop(ledger);
+        Ok(Verdict::Recovered(RebuildInfo {
+            replayed,
+            topped_up: chain_len - mirror_max_seq,
+            max_seq: chain_len,
+        }))
+    } else {
+        // ── PREFIX snapshot (validation unchanged) ───────────────────────
+        // 5c. The rebuilt head `entry_hash` matches the mirror head.
+        let head = match ledger.recent(1) {
+            Ok(h) => h,
+            Err(e) => return Ok(Verdict::Refuse(format!("reading rebuilt head failed: {e}"))),
+        };
+        let head_hash = head.first().map(|e| hex::encode(e.entry_hash.as_bytes()));
+        if head_hash.as_deref() != mirror_head_hash {
+            return Ok(Verdict::Refuse(
+                "rebuilt DB head entry_hash disagrees with the mirror head".to_string(),
+            ));
+        }
+
+        drop(ledger);
+        Ok(Verdict::Recovered(RebuildInfo {
+            replayed,
+            topped_up: 0,
+            max_seq: chain_len,
+        }))
+    }
 }
 
 /// Atomic initial DB creation (ADR-0095 §2). Build the fresh DB ENTIRELY
@@ -614,5 +881,80 @@ mod tests {
                 .is_some_and(|n| n.contains(".CORRUPT-")),
             "evidence is named with the .CORRUPT- infix"
         );
+    }
+
+    // ── ADR-0098 Gap 2a — pure guard-decision logic (no DuckDB) ──────────
+    // The same logic is faithfully extracted and run under `rustc --test` on
+    // the saw-off sandbox (where the crate cannot `cargo build`); here it
+    // also rides the Mac `cargo test` gate.
+
+    #[test]
+    fn route_guard_prefix_when_snapshot_at_or_below_mirror_head() {
+        // A snapshot that is a prefix of the mirror takes the existing path,
+        // independent of self-cert / fallback (both irrelevant when behind).
+        assert_eq!(route_guard(100, 106, true, true), GuardRoute::Prefix);
+        assert_eq!(route_guard(100, 106, false, false), GuardRoute::Prefix);
+        assert_eq!(route_guard(106, 106, false, false), GuardRoute::Prefix);
+        assert_eq!(route_guard(0, 0, false, false), GuardRoute::Prefix);
+    }
+
+    #[test]
+    fn route_guard_recovers_from_ahead_snapshot_that_self_certifies() {
+        // The named case: snapshot head 109 > mirror head 106 and it
+        // self-certifies → recover from it + top up the mirror (NOT refuse),
+        // whether or not a fallback also exists.
+        assert_eq!(
+            route_guard(109, 106, true, false),
+            GuardRoute::RecoverAheadTopUp
+        );
+        assert_eq!(
+            route_guard(109, 106, true, true),
+            GuardRoute::RecoverAheadTopUp
+        );
+    }
+
+    #[test]
+    fn route_guard_falls_back_when_ahead_uncertifiable_with_fallback() {
+        // Ahead, cannot self-certify, but a `<= mirror_head` snapshot exists
+        // → fall back to the prefix path on it (never guess from the ahead).
+        assert_eq!(
+            route_guard(109, 106, false, true),
+            GuardRoute::FallBackToPrefix
+        );
+    }
+
+    #[test]
+    fn route_guard_refuses_only_when_ahead_uncertifiable_and_no_fallback() {
+        // Ahead, cannot self-certify, and nothing `<= mirror_head` to fall
+        // back to → the safe last resort: refuse.
+        assert_eq!(route_guard(109, 106, false, false), GuardRoute::Refuse);
+    }
+
+    #[test]
+    fn overlap_agreement_detects_first_disagreeing_seq() {
+        let mirror = vec![
+            (1u64, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string()),
+        ];
+        // The snapshot-sourced chain may extend past the overlap; agreement
+        // over [1..=mirror_head] is all that is required.
+        let agree = vec![
+            (1u64, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string()),
+            (4, "d".to_string()),
+        ];
+        assert_eq!(first_overlap_disagreement(&mirror, &agree), None);
+        // A differing entry_hash inside the overlap is reported at its seq.
+        let disagree = vec![
+            (1u64, "a".to_string()),
+            (2, "X".to_string()),
+            (3, "c".to_string()),
+        ];
+        assert_eq!(first_overlap_disagreement(&mirror, &disagree), Some(2));
+        // A missing overlap entry counts as a disagreement.
+        let missing = vec![(1u64, "a".to_string())];
+        assert_eq!(first_overlap_disagreement(&mirror, &missing), Some(2));
     }
 }
