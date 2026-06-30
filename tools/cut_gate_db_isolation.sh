@@ -463,7 +463,8 @@ check_editions_upgrade run/upgrade_portable.sh ".aberp-portable"
 # / open_with_flags OUTSIDE the Handle — so the class that caused the incident is
 # a RED BUILD, not a latent corruption. The Handle's own single boot open is the
 # ONLY allow-listed live open; #[cfg(test)] / in-memory opens are allow-listed.
-# Session C extends the ban to the serve request handlers.
+# Session C (CHECK 10f/10g below) extends the ban to the serve.rs request
+# handlers + records the one allow-listed snapshot-EXPORT residual.
 # ENFORCE_SHARED_DB_HANDLE=0 disables it for a deliberate, temporary local probe.
 echo "[CHECK 10] ADR-0098 Session B — daemons share the one aberp_db::Handle; no new live open (ENFORCED · D5)"
 enforce10="${ENFORCE_SHARED_DB_HANDLE:-1}"
@@ -528,6 +529,96 @@ for f in "${db_daemons[@]}"; do
     flag10 "✗ $(basename "$f") no longer calls the shared handle (.write()/.read()) — migration reverted?"
   fi
 done
+
+# ── CHECK 10f — ADR-0098 Session C: the on-demand HTTP REQUEST HANDLERS in
+#    serve.rs route DuckDB through the shared Handle too — closing the
+#    two-lock-regime window B flagged (daemons on the Handle, request handlers
+#    still Connection::open-ing per request). serve.rs INTERLEAVES #[cfg(test)]
+#    modules with runtime code, so the daemon files' single-#[cfg(test)]-cut
+#    heuristic (10d) does NOT apply; this uses a cfg(test)-aware brace scan
+#    (toolchain-free awk, validated against the Session-C enumeration) and
+#    allow-lists ONLY the boot-create region (run / seed_demo_sample_data —
+#    sequential, pre-serve-loop, before the Handle exists). Any OTHER runtime
+#    Connection::open / open_with_flags / append_reopen in serve.rs is the
+#    Session-C regression this fails on. ENFORCE_SHARED_DB_HANDLE=0 disables.
+echo "[CHECK 10f] ADR-0098 Session C — serve.rs request handlers share the one aberp_db::Handle; no new live open (ENFORCED · D5)"
+sv="apps/aberp/src/serve.rs"
+if [[ ! -f "$sv" ]]; then
+  flag10 "✗ serve.rs missing: $sv"
+else
+  scan_awk="$(mktemp "${TMPDIR:-/tmp}/serve_open_scan.XXXXXX.awk")"
+  cat > "$scan_awk" <<'SERVE_SCAN_AWK'
+# cfg(test)+boot-aware live-opener scanner (toolchain-free; bash/awk only).
+# Prints "LINE:text" for every Connection::open*/append_reopen in RUNTIME code
+# (outside #[cfg(test)]) whose enclosing fn is NOT on the boot allow-list.
+# Allow-listed boot fns passed via -v allow="fn1,fn2,...".
+BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0; n_allow=split(allow,A,",") }
+function is_allowed(name,   k){ for(k=1;k<=n_allow;k++) if(A[k]==name) return 1; return 0 }
+{
+  line=$0
+  # fn-name tracking (decls are never inside strings/comments at col<=~8)
+  if (match(line,/^[ \t]*(pub(\([^)]*\))?[ \t]+)?(async[ \t]+)?(unsafe[ \t]+)?fn[ \t]+[A-Za-z0-9_]+/)) {
+    fn=substr(line,RSTART,RLENGTH); sub(/.*fn[ \t]+/,"",fn); fname=fn
+  }
+  st=line; sub(/^[ \t]+/,"",st)
+  if (st ~ /^#\[cfg\(/ && st ~ /test/ && st !~ /not\(test\)/) pending=1
+  was_in=(tdepth>=0)
+  L=length(line)
+  for(i=1;i<=L;i++){
+    c=substr(line,i,1); d=substr(line,i,2)
+    if(inblk){ if(d=="*/"){inblk=0;i++} ; continue }
+    if(instr){ if(c=="\\"){i++;continue} ; if(c=="\""){instr=0} ; continue }
+    if(d=="//"){ break }            # line comment: ignore rest
+    if(d=="/*"){ inblk=1;i++;continue }
+    if(c=="\""){ instr=1; continue }
+    if(c=="'"){                      # char literal or lifetime: skip 'x' or '\x'
+       if(substr(line,i,3) ~ /^'\\.'/){ i+=2; }       # '\n'
+       else if(substr(line,i+2,1)=="'"){ i+=2 }       # 'x'
+       continue
+    }
+    if(c=="{"){ depth++; if(pending && tdepth<0){ tdepth=depth; pending=0 } }
+    else if(c=="}"){ if(tdepth==depth) tdepth=-1; depth-- }
+  }
+  now_in=(tdepth>=0)
+  intest = was_in || now_in
+  if (!intest) {
+    if (line ~ /Connection::open(_with_flags)?\(/ && line !~ /open_in_memory/) {
+      if (!is_allowed(fname)) { t=line; sub(/^[ \t]+/,"",t); printf "%d:%s:%s\n",NR,fname,substr(t,1,70) }
+    }
+    else if (line ~ /append_reopen[ \t]*\(/) {
+      if (!is_allowed(fname)) { t=line; sub(/^[ \t]+/,"",t); printf "%d:%s:%s\n",NR,fname,substr(t,1,70) }
+    }
+  }
+}
+SERVE_SCAN_AWK
+  # Boot allow-list: the sequential pre-serve-loop create/provision/seed region.
+  serve_strays="$(awk -v allow="run,seed_demo_sample_data" -f "$scan_awk" "$sv" || true)"
+  rm -f "$scan_awk"
+  if [[ -n "$serve_strays" ]]; then
+    flag10 "✗ serve.rs has a live-path Connection::open/open_with_flags/append_reopen OUTSIDE the Handle (Session-C regression):"
+    printf '%s\n' "$serve_strays" | sed 's/^/      /'
+  else
+    note "✓ serve.rs — no runtime request-handler Connection::open (routes through aberp_db::Handle; boot-create allow-listed)"
+  fi
+  if grep -qE 'state(_for_task)?\.db\.(read|write)\(\)' "$sv"; then
+    note "✓ serve.rs routes request handlers through state.db.read()/.write()"
+  else
+    flag10 "✗ serve.rs no longer calls state.db.read()/.write() — Session-C migration reverted?"
+  fi
+fi
+
+# ── CHECK 10g — ADR-0098 Session C: the SOLE sanctioned non-Handle live opener
+#    is the 4-h snapshot daemon's logical read-only EXPORT
+#    (crates/aberp-snapshot/src/take.rs). It must carry its SANCTIONED RESIDUAL
+#    marker so this allow-list entry is self-documenting and cannot silently
+#    grow into an undocumented separate opener.
+echo "[CHECK 10g] ADR-0098 Session C — snapshot EXPORT opener is the sole allow-listed residual (documented)"
+tk="crates/aberp-snapshot/src/take.rs"
+if [[ -f "$tk" ]] && grep -q 'SANCTIONED RESIDUAL (gate allow-listed' "$tk"; then
+  note "✓ snapshot EXPORT opener documented as the sole allow-listed residual (take.rs)"
+else
+  flag10 "✗ snapshot EXPORT opener allow-list marker missing in take.rs (undocumented residual — see ADR-0098 Session C)"
+fi
 
 echo
 if [[ "$fail" -ne 0 ]]; then echo "CUT-GATE: ✗ FAILED"; exit 1; fi

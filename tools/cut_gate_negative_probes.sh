@@ -21,9 +21,14 @@ pass=0; bad=0
 i=0
 
 fresh() {  # -> path to a fresh, clean copy of the tree (excludes .git)
-  i=$((i+1))
-  local d="$WORK/copy.$i"
-  mkdir -p "$d"
+  # NOTE (ADR-0098 Session C): use mktemp -d for a UNIQUE dir per call. The
+  # prior `i=$((i+1)); d="$WORK/copy.$i"` form incremented `i` inside this
+  # function's command-substitution subshell (`c="$(fresh)"`), so the counter
+  # never persisted in the parent — every copy collided on copy.1 and
+  # ACCUMULATED each probe's planted violation. Harmless for the expect_fail
+  # probes (the gate fails regardless), but it made any expect_pass probe after
+  # the first plant spuriously fail. Unique dirs fix it for good.
+  local d; d="$(mktemp -d "$WORK/copy.XXXXXX")"
   tar -C "$ROOT" --exclude=.git -cf - . | tar -C "$d" -xf -
   printf '%s' "$d"
 }
@@ -176,6 +181,42 @@ expect_fail "$c" "live-path Connection::open OUTSIDE the Handle" "CHECK 10d — 
 echo "[CHECK 10] the shared aberp_db::Handle crate removed (single-instance seam deleted)"
 c="$(fresh)"; rm -f "$c/crates/aberp-db/src/lib.rs"
 expect_fail "$c" "Handle missing or missing its write()/read()/open_runtime_connection" "CHECK 10a — aberp_db Handle crate deleted"
+
+echo "[CHECK 10f] a NEW live-path Connection::open planted in a serve.rs REQUEST HANDLER (Session-C two-lock-regime regression)"
+c="$(fresh)"
+python3 - "$c/apps/aberp/src/serve.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+needle="    let partners = partners::list_partners(&conn, state.tenant.as_str(), search)?;"
+assert needle in s, "list_partners_request anchor moved — probe is stale"
+s=s.replace(needle, '    let _stray = duckdb::Connection::open(&*state.db_path).expect("CHECK10f regression");\n'+needle, 1)
+open(p,"w").write(s)
+PYIN
+expect_fail "$c" "OUTSIDE the Handle (Session-C regression)" "CHECK 10f — stray separate-instance open planted in a serve.rs request handler"
+
+echo "[CHECK 10f] a Connection::open added INSIDE a #[cfg(test)] block must NOT trip (cfg(test)-aware precision, no false-positive)"
+c="$(fresh)"
+python3 - "$c/apps/aberp/src/serve.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+needle='let conn = Connection::open(&db).expect("open demo db");'
+assert needle in s, "cfg(test) anchor moved — probe is stale"
+s=s.replace(needle, needle+'\n        let _t = duckdb::Connection::open(&db).expect("test-only stray must be ignored by the scan");', 1)
+open(p,"w").write(s)
+PYIN
+expect_pass "$c" "CHECK 10f — Connection::open inside #[cfg(test)] is correctly IGNORED (scan is cfg(test)-aware, not blind)"
+
+echo "[CHECK 10g] the snapshot-EXPORT SANCTIONED-RESIDUAL allow-list marker removed from take.rs"
+c="$(fresh)"
+python3 - "$c/crates/aberp-snapshot/src/take.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+needle="SANCTIONED RESIDUAL (gate allow-listed; FLAGGED)."
+assert needle in s, "take.rs residual marker anchor moved — probe is stale"
+s=s.replace(needle, "(allow-list marker removed by negative probe).", 1)
+open(p,"w").write(s)
+PYIN
+expect_fail "$c" "snapshot EXPORT opener allow-list marker missing" "CHECK 10g — snapshot-EXPORT residual marker removed (undocumented opener)"
 
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
