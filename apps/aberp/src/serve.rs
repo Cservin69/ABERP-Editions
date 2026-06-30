@@ -9888,7 +9888,7 @@ pub fn modification_invoice_request(
     // 6. Dispatch into the library helper.
     issue_modification::modification_from_inputs(
         input,
-        &state.db_path,
+        &state.db,
         state.tenant.as_str(),
         series,
         invoice_id,

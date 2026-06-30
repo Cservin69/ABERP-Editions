@@ -121,9 +121,15 @@ pub fn run(args: &IssueModificationArgs) -> Result<()> {
         "NAV credentials loaded; actor derived for this CLI invocation"
     );
 
+    // ADR-0098 C2 — the one-shot CLI path builds its own shared Handle (same
+    // dual-use resolution as poll_ack/submit/storno run()).
+    let tenant_for_handle = TenantId::new(args.tenant.clone())
+        .ok_or_else(|| anyhow!("tenant value '{}' is empty or has a null byte", args.tenant))?;
+    let db_handle = aberp_db::Handle::open_default(&args.db, tenant_for_handle)
+        .with_context(|| format!("open shared DuckDB handle at {}", args.db.display()))?;
     let summary = modification_from_inputs(
         input,
-        &args.db,
+        &db_handle,
         &args.tenant,
         &args.series,
         &args.references,
@@ -187,7 +193,7 @@ pub struct ModificationIssuedSummary {
 #[allow(clippy::too_many_arguments)]
 pub fn modification_from_inputs(
     input: InvoiceInputJson,
-    db: &Path,
+    db: &aberp_db::HandleArc,
     tenant_str: &str,
     series_str: &str,
     references: &str,
@@ -229,7 +235,7 @@ pub fn modification_from_inputs(
 
     // ADR-0031 §5 pre-allocation hard-cap check.
     let pending_count =
-        crate::submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
+        crate::submission_queue::count_pending(db.db_path(), tenant.clone(), binary_hash_bytes)
             .context("count pending submissions (ADR-0031 §5 cap check) for modification")?;
     if pending_count >= crate::submission_queue::HARD_CAP_PENDING {
         return Err(anyhow!(
@@ -259,8 +265,12 @@ pub fn modification_from_inputs(
     // the S384/F5 storno fix. Resolved PRE-tx (the render closure has no
     // tx handle), same discipline as the storno path.
     let (base_nav_xml_path, total_prior_chain_line_count) = {
-        let ledger = Ledger::open(db, tenant.clone(), binary_hash_bytes)
-            .context("open audit ledger for modification precondition check")?;
+        // ADR-0098 C2 — read the chain via a shared read clone (from_connection),
+        // not an independent Ledger::open of the live path.
+        let pre_conn = db
+            .read()
+            .context("shared read: modification precondition check (ADR-0098 Gap 1a C2)")?;
+        let ledger = Ledger::from_connection(pre_conn, tenant.clone(), binary_hash_bytes);
         check_base_is_modifiable(&ledger, references)?;
         let base_path = crate::issue_storno::find_base_nav_xml_path_for_chain(&ledger, references)?;
         let total =
@@ -280,7 +290,7 @@ pub fn modification_from_inputs(
         .context("read [seller.numbering] template from seller.toml")?;
 
     // Pre-tx setup: schemas + series.
-    let (conn, series) = pre_tx_setup(db, &series_code, template.reset_policy.to_billing())?;
+    let series = pre_tx_setup(db, &series_code, template.reset_policy.to_billing())?;
 
     // Build the modification command.
     let command = build_modification_command(&input, &series_code)?;
@@ -460,8 +470,8 @@ pub fn modification_from_inputs(
     // `run_single_tx` runs the render closure before committing and hands
     // the post-commit Connection back so the verify path below reuses it
     // (no crash-prone Ledger::open re-open).
-    let (outcome, conn) = run_single_tx(
-        conn,
+    let outcome = run_single_tx(
+        db,
         &ledger_meta,
         allocate_args,
         idempotency_key,
@@ -493,18 +503,17 @@ pub fn modification_from_inputs(
     // 1.5.x's LoadCheckpoint/ReadIndex ART assertion, S332 / duckdb#23046
     // — the same crash family S375 closed for invoice + storno). No file
     // re-open → that crash is unreachable.
-    let ledger = Ledger::from_connection(conn, tenant.clone(), binary_hash_bytes);
+    // ADR-0098 C2 — verify via a shared READ clone (Ledger::from_connection);
+    // the mirror was already synced on the run_single_tx WriteGuard drop. No
+    // independent Connection::open / Ledger::open re-open.
+    let verify_conn = db
+        .read()
+        .context("shared read: verify chain after modification issuance (ADR-0098 Gap 1a C2)")?;
+    let ledger = Ledger::from_connection(verify_conn, tenant.clone(), binary_hash_bytes);
     let verified = ledger
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER modification issuance")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
-
-    // PR-17 / ADR-0030 §2 — sync the audit-ledger mirror file
-    // post-commit (matches the issue_invoice / issue_storno posture).
-    let mirror_path = audit_ledger::mirror_path_for(db);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after modification commit")?;
 
     // S174 — surface the SAME render that flowed to NAV on the
     // operator-visible summary (the render closure built it inside the tx
@@ -682,17 +691,28 @@ fn check_base_is_modifiable(ledger: &Ledger, base_invoice_id: &str) -> Result<()
 // ──────────────────────────────────────────────────────────────────────
 
 fn pre_tx_setup(
-    db_path: &Path,
+    db: &aberp_db::HandleArc,
     series_code: &SeriesCode,
     template_reset_policy: ResetPolicy,
-) -> Result<(Connection, InvoiceSeries)> {
-    let mut billing = DuckDbBillingStore::open(db_path)
-        .with_context(|| format!("open billing DuckDB at {}", db_path.display()))?;
+) -> Result<InvoiceSeries> {
+    // ADR-0098 C2 — billing schema + series setup through the shared Handle's
+    // writer window. The billing store needs an OWNED Connection, so it runs on
+    // a `try_clone` of the shared instance: same Database, NO second OS open;
+    // the CREATE TABLE + series INSERT commit to the one instance and are
+    // visible to the issuance tx on the same handle (the coherence dividend,
+    // aberp-db lib.rs single-instance). The guard drop fires the post-commit
+    // hook (cheap: schema/series only).
+    let guard = db
+        .write()
+        .context("shared writer: billing+audit schema & series setup (ADR-0098 Gap 1a C2)")?;
+    let setup_conn = guard
+        .try_clone()
+        .context("try_clone shared instance for billing store setup (ADR-0098 C2)")?;
+    let mut billing = DuckDbBillingStore::from_connection(setup_conn);
     billing.ensure_schema().context("ensure billing schema")?;
     let series = ensure_series(&mut billing, series_code, template_reset_policy)?;
-    let conn = billing.into_connection();
-    audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema")?;
-    Ok((conn, series))
+    audit_ledger::ensure_schema(&guard).context("ensure audit-ledger schema")?;
+    Ok(series)
 }
 
 /// PR-90 / ADR-0045 §2 — same shape as `issue_invoice::ensure_series`
@@ -761,7 +781,7 @@ struct TxOutcome {
 /// a render `Err` arriving before `tx.commit()` rolls everything back).
 #[allow(clippy::too_many_arguments)]
 fn run_single_tx<F>(
-    mut conn: Connection,
+    db: &aberp_db::HandleArc,
     ledger_meta: &LedgerMeta,
     mut allocate_args: AllocateArgs,
     idempotency_key: IdempotencyKey,
@@ -781,10 +801,16 @@ fn run_single_tx<F>(
     // inherited currency + rate metadata) and returns the rendered NAV
     // invoice number.
     render_and_write: F,
-) -> Result<(TxOutcome, Connection)>
+) -> Result<TxOutcome>
 where
     F: FnOnce(&ReadyInvoice, u32, Currency, Option<&RateMetadata>) -> Result<String>,
 {
+    // ADR-0098 C2 — the issuance tx runs on the shared Handle's serialized
+    // writer; the WriteGuard drop fires the post-commit hook. The render closure
+    // runs inside this tx (sync, no await) so the writer covers the issuance only.
+    let mut conn = db
+        .write()
+        .context("shared writer: modification issuance tx (ADR-0098 Gap 1a C2)")?;
     let tx = conn
         .transaction()
         .context("begin DuckDB transaction (modification: billing + audit-ledger)")?;
@@ -965,16 +991,13 @@ where
 
     tx.commit()
         .context("commit DuckDB transaction (modification: billing + audit-ledger)")?;
-    Ok((
-        TxOutcome {
-            modification: modification_invoice,
-            modification_index,
-            base_sequence_number,
-            was_fresh,
-            modification_invoice_number,
-        },
-        conn,
-    ))
+    Ok(TxOutcome {
+        modification: modification_invoice,
+        modification_index,
+        base_sequence_number,
+        was_fresh,
+        modification_invoice_number,
+    })
 }
 
 /// Walk `audit_ledger` inside the borrowed transaction for every
