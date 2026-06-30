@@ -170,7 +170,13 @@ pub struct CycleSummary {
 /// `serve.rs` builds one of these per tick; the manual route does
 /// the same.
 pub struct CycleInputs {
-    pub db_path: PathBuf,
+    /// ADR-0098 C2 (Gap 1a) — the shared process-wide DuckDB Handle. ap_sync's
+    /// OWN audit openers route through this (`db.write()` / `db.read()`); the
+    /// per-digest persist (`incoming_invoices::*`) still takes a `&Path` via
+    /// `db.db_path()` as a FROZEN, gate-tracked residual deferred to v0.2.6
+    /// (it is reached at the bootstrap-year 2 s backfill cadence — the
+    /// highest-priority v0.2.6 opener; see ADR-0098 C2 report).
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,
@@ -253,7 +259,7 @@ where
             return;
         }
         match build_inputs() {
-            Ok(inputs) if restore_lock_held(&inputs.db_path, inputs.tenant.as_str()) => {
+            Ok(inputs) if restore_lock_held(inputs.db.db_path(), inputs.tenant.as_str()) => {
                 // S264 / PR-253 (F2) — a restore-from-NAV lock is held
                 // (or a crashed restore left one). A daemon NAV walk
                 // against the same tenant is exactly the parallel
@@ -345,7 +351,7 @@ pub async fn run_one_cycle_for_window(
     // tokio worker pool is not blocked for the duration of the
     // INSERT + chain-verify + mirror-sync. `JoinError` is unified
     // into the existing warn! surface.
-    let audit_inputs_db = inputs.db_path.clone();
+    let audit_inputs_db = inputs.db.clone();
     let audit_inputs_tenant = inputs.tenant.clone();
     let audit_inputs_binary_hash = inputs.binary_hash;
     let audit_inputs_login = inputs.operator_login.clone();
@@ -437,7 +443,9 @@ async fn run_cycle_inner(
         // returns so the queryInvoiceData HTTP calls are NOT held on
         // the blocking pool.
         let digests = page_result.digests;
-        let db_path = inputs.db_path.clone();
+        // ADR-0098 C2 residual: incoming_invoices::* still path-opens (frozen,
+        // gate-tracked, deferred to v0.2.6); fed the live path via db.db_path().
+        let db_path = inputs.db.db_path().to_path_buf();
         let tenant = inputs.tenant.clone();
         let binary_hash = inputs.binary_hash;
         let operator_login = inputs.operator_login.clone();
@@ -536,7 +544,7 @@ async fn run_cycle_inner(
                 &transport,
                 &inputs.credentials,
                 &inputs.tax_number_8,
-                &inputs.db_path,
+                inputs.db.db_path(),
                 &inputs.tenant,
                 &inputs.ap_artifacts_dir,
                 &target,
@@ -1092,16 +1100,18 @@ pub fn year_to_date_month_chunks(now_utc: OffsetDateTime) -> Result<Vec<(String,
 /// returns `Ok(false)` so the bootstrap fires once on first launch
 /// after this PR lands.
 fn bootstrap_year_already_recorded(
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
 ) -> Result<bool> {
-    let ledger = Ledger::open(db_path, tenant, binary_hash).with_context(|| {
-        format!(
-            "open audit ledger at {} for bootstrap-year sentinel scan",
-            db_path.display()
-        )
-    })?;
+    // ADR-0098 C2 — read the audit ledger via a shared read clone of the ONE
+    // instance (Ledger::from_connection), not an independent Ledger::open (a
+    // fresh Connection::open of the live path = the duckdb#23046 re-open locus).
+    // Read-only: no writes here.
+    let conn = db
+        .read()
+        .context("shared read: bootstrap-year sentinel scan (ADR-0098 Gap 1a C2)")?;
+    let ledger = Ledger::from_connection(conn, tenant, binary_hash);
     let entries = ledger
         .entries()
         .context("read audit-ledger entries to look for prior bootstrap-year row")?;
@@ -1160,7 +1170,7 @@ async fn run_bootstrap_year_once(build_inputs: &(dyn Fn() -> Result<CycleInputs>
     // contention case the restore lock exists to prevent. Skip the whole
     // sweep when a lock is held; the once-per-DB sentinel is NOT recorded
     // on a skip, so the next boot (post-abandon) re-runs it.
-    if restore_lock_held(&inputs.db_path, inputs.tenant.as_str()) {
+    if restore_lock_held(inputs.db.db_path(), inputs.tenant.as_str()) {
         tracing::info!(
             "AP bootstrap-year sweep skipped — a restore-from-NAV lock is held; will retry on a \
              future boot once the restore is abandoned or completed"
@@ -1170,7 +1180,7 @@ async fn run_bootstrap_year_once(build_inputs: &(dyn Fn() -> Result<CycleInputs>
 
     // Sentinel check — already done? Skip silently.
     match bootstrap_year_already_recorded(
-        &inputs.db_path,
+        &inputs.db,
         inputs.tenant.clone(),
         inputs.binary_hash,
     ) {
@@ -1257,7 +1267,7 @@ async fn run_bootstrap_year_once(build_inputs: &(dyn Fn() -> Result<CycleInputs>
 /// splitting the owned fields out keeps the move ergonomics clean
 /// without a wrapping `Arc<CycleInputs>` clone.
 fn write_cycle_audit_entry_inner(
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator_login: &str,
@@ -1278,39 +1288,46 @@ fn write_cycle_audit_entry_inner(
     let actor = Actor::from_local_cli(session_id, operator_login);
     let ledger_meta = audit_ledger::LedgerMeta::new(tenant.clone(), binary_hash);
 
-    let mut conn = duckdb::Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for AP sync cycle audit entry",
-            db_path.display()
+    // ADR-0098 C2 — route the cycle audit append through the shared Handle's
+    // serialized writer (db.write()) instead of an independent Connection::open.
+    // The WriteGuard's post-commit hook runs the lockstep sync_mirror on drop,
+    // so the explicit Ledger::open + sync_mirror (a SECOND live opener) is
+    // removed. The post-commit verify_chain is preserved via a shared read
+    // clone (Ledger::from_connection) — no independent re-open.
+    {
+        let mut conn = db
+            .write()
+            .context("shared writer: AP sync cycle audit entry (ADR-0098 Gap 1a C2)")?;
+        audit_ledger::ensure_schema(&conn)
+            .context("ensure audit-ledger schema for AP sync cycle audit entry")?;
+        let tx = conn
+            .transaction()
+            .context("begin DuckDB transaction (AP sync cycle audit entry)")?;
+        audit_ledger::append_in_tx(
+            &tx,
+            &ledger_meta,
+            EventKind::IncomingInvoiceSyncCycleCompleted,
+            payload.to_bytes(),
+            actor,
+            Some(payload.idempotency_key.clone()),
         )
-    })?;
-    audit_ledger::ensure_schema(&conn)
-        .context("ensure audit-ledger schema for AP sync cycle audit entry")?;
-    let tx = conn
-        .transaction()
-        .context("begin DuckDB transaction (AP sync cycle audit entry)")?;
-    audit_ledger::append_in_tx(
-        &tx,
-        &ledger_meta,
-        EventKind::IncomingInvoiceSyncCycleCompleted,
-        payload.to_bytes(),
-        actor,
-        Some(payload.idempotency_key.clone()),
-    )
-    .map_err(|e| anyhow!("audit_ledger::append_in_tx IncomingInvoiceSyncCycleCompleted: {e}"))?;
-    tx.commit()
-        .context("commit DuckDB transaction (AP sync cycle audit entry)")?;
-    drop(conn);
+        .map_err(|e| anyhow!("audit_ledger::append_in_tx IncomingInvoiceSyncCycleCompleted: {e}"))?;
+        tx.commit()
+            .context("commit DuckDB transaction (AP sync cycle audit entry)")?;
+        // WriteGuard drops here -> post-commit hook runs the lockstep sync_mirror.
+    }
 
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to verify chain after AP sync cycle entry")?;
+    // ADR-0098 C2 — preserve the post-commit chain verification, reusing a
+    // shared READ clone (sees the just-committed append via the one shared
+    // instance) through Ledger::from_connection — never an independent
+    // Connection::open / Ledger::open (the duckdb#23046 replay locus).
+    let verify_conn = db
+        .read()
+        .context("shared read: verify chain after AP sync cycle entry (ADR-0098 C2)")?;
+    let ledger = Ledger::from_connection(verify_conn, tenant, binary_hash);
     ledger
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER AP sync cycle entry")?;
-    let mirror_path = audit_ledger::mirror_path_for(db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after AP sync cycle entry")?;
     Ok(())
 }
 
