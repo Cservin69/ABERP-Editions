@@ -161,6 +161,22 @@ open(p,"w").write(s)
 PYIN
 expect_fail "$c" "no longer honors ABERP_DATA_ROOT" "snapshot-prod.sh hardcoded the prod root"
 
+echo "[CHECK 10] a NEW live-path Connection::open in a migrated daemon (the 17:02 separate-instance regression)"
+c="$(fresh)"
+python3 - "$c/apps/aberp/src/email_relay_daemon.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+needle="pub async fn run_drain_loop(deps: EmailRelayDaemonDeps, cancel: CancellationToken) {"
+assert needle in s, "drain-loop anchor moved — probe is stale"
+s=s.replace(needle, needle+'\n    let _stray = duckdb::Connection::open(&deps.db_path).expect("regression");', 1)
+open(p,"w").write(s)
+PYIN
+expect_fail "$c" "live-path Connection::open OUTSIDE the Handle" "CHECK 10d — stray separate-instance open planted in the email-relay drain"
+
+echo "[CHECK 10] the shared aberp_db::Handle crate removed (single-instance seam deleted)"
+c="$(fresh)"; rm -f "$c/crates/aberp-db/src/lib.rs"
+expect_fail "$c" "Handle missing or missing its write()/read()/open_runtime_connection" "CHECK 10a — aberp_db Handle crate deleted"
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi

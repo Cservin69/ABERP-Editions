@@ -452,6 +452,83 @@ check_editions_upgrade() {  # $1 script  $2 edition-root (.aberp-<ed>)
 check_editions_upgrade run/upgrade_defense.sh  ".aberp-defense"
 check_editions_upgrade run/upgrade_portable.sh ".aberp-portable"
 
+# ── CHECK 10 — ADR-0098 Session B: daemons route DuckDB through the ONE shared
+#    aberp_db::Handle; no NEW separate-instance live open (ENFORCED · D5) ───────
+# The 2026-06-29 17:02 re-tear came from many subsystems each Connection::open-
+# ing the single-file tenant DB concurrently (N checkpoint actors racing one
+# file = duckdb#23046). Session B collapses ALL runtime DB access onto one
+# shared instance (crates/aberp-db Handle: one serialized writer + try_clone
+# reads + a post-commit lockstep sync_mirror + debounced live_durable_checkpoint).
+# This gate (D5) fails if a migrated daemon regrows a live-path Connection::open
+# / open_with_flags OUTSIDE the Handle — so the class that caused the incident is
+# a RED BUILD, not a latent corruption. The Handle's own single boot open is the
+# ONLY allow-listed live open; #[cfg(test)] / in-memory opens are allow-listed.
+# Session C extends the ban to the serve request handlers.
+# ENFORCE_SHARED_DB_HANDLE=0 disables it for a deliberate, temporary local probe.
+echo "[CHECK 10] ADR-0098 Session B — daemons share the one aberp_db::Handle; no new live open (ENFORCED · D5)"
+enforce10="${ENFORCE_SHARED_DB_HANDLE:-1}"
+flag10() { note "$1"; if [[ "$enforce10" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+
+# 10a — the shared Handle crate exists + exports the single-instance API.
+hb="crates/aberp-db/src/lib.rs"
+if [[ -f "$hb" ]] && grep -q 'pub struct Handle' "$hb" && grep -q 'pub fn write(' "$hb" \
+   && grep -q 'pub fn read(' "$hb" && grep -q 'fn open_runtime_connection' "$hb"; then
+  note "✓ aberp_db::Handle present with write()/read()/open_runtime_connection (single instance)"
+else
+  flag10 "✗ crates/aberp-db Handle missing or missing its write()/read()/open_runtime_connection API"
+fi
+
+# 10b — the post-commit hook REUSES the ADR-0095 primitives (no reinvented
+#       durability): lockstep sync_mirror + debounced live_durable_checkpoint.
+if grep -q 'sync_mirror' "$hb" && grep -q 'live_durable_checkpoint' "$hb"; then
+  note "✓ Handle post-commit hook reuses sync_mirror + live_durable_checkpoint (no new primitive)"
+else
+  flag10 "✗ Handle does not reuse the ADR-0095 sync_mirror + live_durable_checkpoint primitives"
+fi
+
+# 10c — the Handle owns the ONLY allow-listed live open (open_runtime_connection).
+if grep -q 'Connection::open(db_path)' "$hb"; then
+  note "✓ the single allow-listed live open is the Handle's open_runtime_connection"
+else
+  flag10 "✗ the Handle's single live open (open_runtime_connection -> Connection::open(db_path)) is missing"
+fi
+
+# 10d — NO live-path Connection::open / open_with_flags in the migrated Session-B
+#       daemon files OUTSIDE #[cfg(test)]. Scan only the runtime portion (lines
+#       before the first #[cfg(test)]; tests live at the bottom) and ban any
+#       Connection::open*/open_with_flags that is not open_in_memory.
+db_daemons=(
+  apps/aberp/src/quote_pricing_pipeline.rs
+  apps/aberp/src/email_relay_daemon.rs
+  apps/aberp/src/catalogue_push.rs
+  apps/aberp/src/quote_pdf_rerender_daemon.rs
+  apps/aberp/src/email_outbox_poll_daemon.rs
+  crates/aberp-quote-intake/src/service.rs
+)
+for f in "${db_daemons[@]}"; do
+  if [[ ! -f "$f" ]]; then flag10 "✗ migrated daemon file missing: $f"; continue; fi
+  cut="$(grep -nE '^[[:space:]]*#\[cfg\(test\)\]' "$f" | head -1 | cut -d: -f1)"
+  if [[ -z "$cut" ]]; then cut=$(( $(wc -l < "$f") + 1 )); fi
+  runtime_open="$(awk -v c="$cut" 'NR<c' "$f" | grep -nE 'Connection::open(_with_flags)?\(' | grep -v 'open_in_memory' || true)"
+  if [[ -n "$runtime_open" ]]; then
+    flag10 "✗ $f has a live-path Connection::open OUTSIDE the Handle (Session-B regression):"
+    printf '%s\n' "$runtime_open" | sed 's/^/      /'
+  else
+    note "✓ $(basename "$f") — no runtime Connection::open (routes through aberp_db::Handle)"
+  fi
+done
+
+# 10e — POSITIVE proof the daemons actually call the shared handle (migration
+#       present, not reverted): each migrated file calls the handle's write()/read().
+for f in "${db_daemons[@]}"; do
+  [[ -f "$f" ]] || continue
+  if grep -qE '\.(write|read)\(\)' "$f"; then
+    note "✓ $(basename "$f") routes through the handle (.write()/.read() present)"
+  else
+    flag10 "✗ $(basename "$f") no longer calls the shared handle (.write()/.read()) — migration reverted?"
+  fi
+done
+
 echo
 if [[ "$fail" -ne 0 ]]; then echo "CUT-GATE: ✗ FAILED"; exit 1; fi
 echo "CUT-GATE: ✓ PASSED"
