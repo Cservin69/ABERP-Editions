@@ -3877,18 +3877,16 @@ pub fn open_tenant_handle(
     db_path: &std::path::Path,
     tenant: TenantId,
 ) -> anyhow::Result<aberp_db::HandleArc> {
-    // Ensure all schemas on a PLAIN connection first (folds cleanly on close),
-    // BEFORE opening the shared Handle — mirrors serve-boot ordering and avoids
-    // firing the Handle's post-commit durable checkpoint at open time (which
-    // perturbed the read()-side view for the immediately-following operations,
-    // e.g. avl_vendors_route revoke->list).
-    {
-        let mut conn = Connection::open(db_path)
-            .with_context(|| format!("open {} for eager schema-ensure", db_path.display()))?;
-        ensure_all_tenant_schemas(&mut conn, tenant.as_str())?;
-    }
-    let handle = aberp_db::Handle::open_default(db_path, tenant)
+    // ADR-0093/0098 CHECK-10f — serve.rs must not open a new connection directly;
+    // eager-ensure the tenant schemas through the ONE shared Handle's writer.
+    let handle = aberp_db::Handle::open_default(db_path, tenant.clone())
         .context("open shared DuckDB handle (ADR-0098 Gap 1a)")?;
+    {
+        let mut guard = handle
+            .write()
+            .context("write guard for eager schema-ensure (ADR-0098 C2)")?;
+        ensure_all_tenant_schemas(&mut guard, tenant.as_str())?;
+    }
     Ok(handle)
 }
 
