@@ -76,8 +76,6 @@
 //!     Layer-2 idempotency per ADR-0009 §5 + ADR-0032 §"Open
 //!     questions" remains named-deferred (F44).
 
-use std::path::Path;
-
 use aberp_audit_ledger::{
     self as audit_ledger, Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId,
 };

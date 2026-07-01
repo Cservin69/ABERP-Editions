@@ -45,7 +45,6 @@
 //! ADR-0008's append-only contract forbids writing duplicates for the
 //! same business event.
 
-use std::path::Path;
 use std::str::FromStr;
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
@@ -62,7 +61,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::nav_number_probe::{NavInvoiceNumberProbe, SkippedNavNumber};
 use async_trait::async_trait;
-use duckdb::{params, Connection};
+use duckdb::params;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;

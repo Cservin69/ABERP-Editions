@@ -27,7 +27,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use duckdb::Connection;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 use zeroize::Zeroizing;

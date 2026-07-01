@@ -3831,7 +3831,6 @@ fn derive_initial_boot_state_with_seller_check(
 /// flips it to `Ready` after writing the four keychain entries.
 /// Every existing route checks the state via [`require_ready`] and
 /// either pulls `operator_login` OR returns 503 needs-setup.
-#[derive(Clone)]
 /// ADR-0098 C2 fix-forward — eagerly ensure EVERY tenant table exists.
 ///
 /// Under `read_returns_readonly=true` the read()-side connections are
@@ -3889,6 +3888,7 @@ pub fn open_tenant_handle(
     Ok(handle)
 }
 
+#[derive(Clone)]
 pub struct AppState {
     pub db_path: Arc<PathBuf>,
     /// ADR-0098 Session B (Gap 1a) — the ONE shared DuckDB handle the whole

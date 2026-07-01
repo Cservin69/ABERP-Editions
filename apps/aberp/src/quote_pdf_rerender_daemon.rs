@@ -73,7 +73,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use duckdb::{params, Connection};
+use duckdb::params;
 use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
