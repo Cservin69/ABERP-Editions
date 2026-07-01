@@ -553,6 +553,12 @@ CREATE TABLE IF NOT EXISTS quoting_stock_adjustments (
 /// complexity-rules and stock-adjustments tables stay empty — the
 /// operator builds them up over time, there is no defensible seed.
 pub fn ensure_schema(conn: &mut Connection, tenant: &str) -> Result<()> {
+    // ADR-0098 C2 fix-forward — no-op on a read-only conn (read_returns_readonly
+    // read()-side); the schema is created by a writer before any read reaches
+    // here. A genuine write mis-routed through read() still fails loud (F5).
+    if aberp_audit_ledger::connection_is_read_only(conn) {
+        return Ok(());
+    }
     conn.execute_batch(COMPLEXITY_RULES_SCHEMA_SQL)
         .context("ensure quoting_complexity_rules schema")?;
     conn.execute_batch(TOLERANCE_MULTIPLIERS_SCHEMA_SQL)

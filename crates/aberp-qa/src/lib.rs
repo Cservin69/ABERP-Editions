@@ -78,6 +78,12 @@ pub use qc::{
 /// in S443 to also create the QC tables so they exist wherever the QA
 /// queue does (one boot call, no new wiring at the call site).
 pub fn ensure_schema(conn: &duckdb::Connection) -> anyhow::Result<()> {
+    // ADR-0098 C2 fix-forward — no-op on a read-only conn (read_returns_readonly
+    // read()-side); the schema is created by a writer before any read reaches
+    // here. A genuine write mis-routed through read() still fails loud (F5).
+    if aberp_audit_ledger::connection_is_read_only(conn) {
+        return Ok(());
+    }
     repository::ensure_schema(conn)?;
     qc::ensure_qc_schema(conn)
 }

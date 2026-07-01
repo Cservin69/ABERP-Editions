@@ -362,6 +362,12 @@ fn check_non_negative(errors: &mut Vec<ValidationError>, field: &'static str, v:
 /// Create the table (idempotent) and, on a brand-new (empty) table, seed
 /// a small set of common grades the operator can then edit or delete.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
+    // ADR-0098 C2 fix-forward — no-op on a read-only conn (read_returns_readonly
+    // read()-side); the schema is created by a writer before any read reaches
+    // here. A genuine write mis-routed through read() still fails loud (F5).
+    if aberp_audit_ledger::connection_is_read_only(conn) {
+        return Ok(());
+    }
     conn.execute_batch(QUOTING_MATERIALS_SCHEMA_SQL)
         .context("ensure quoting_materials schema")?;
     // S357 / PR-44 — additive material-traceability columns. Idempotent on a

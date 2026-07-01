@@ -169,6 +169,12 @@ DROP INDEX IF EXISTS outbound_email_queue_submitter_idx;
 /// `DROP INDEX IF EXISTS` in `SCHEMA_SQL` removes them on the first call
 /// after upgrade — the daemon's startup is the first call.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
+    // ADR-0098 C2 fix-forward — no-op on a read-only conn (read_returns_readonly
+    // read()-side); the schema is created by a writer before any read reaches
+    // here. A genuine write mis-routed through read() still fails loud (F5).
+    if aberp_audit_ledger::connection_is_read_only(conn) {
+        return Ok(());
+    }
     conn.execute_batch(SCHEMA_SQL)
         .with_context(|| "ensure outbound_email_queue schema")
 }

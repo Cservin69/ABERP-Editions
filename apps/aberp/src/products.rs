@@ -259,6 +259,12 @@ CREATE INDEX IF NOT EXISTS products_tenant_name_idx
 /// Mirrors `partners::ensure_schema`. Called at serve boot per
 /// PR-73a's hot-path migration discipline.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
+    // ADR-0098 C2 fix-forward — no-op on a read-only conn (read_returns_readonly
+    // read()-side); the schema is created by a writer before any read reaches
+    // here. A genuine write mis-routed through read() still fails loud (F5).
+    if aberp_audit_ledger::connection_is_read_only(conn) {
+        return Ok(());
+    }
     conn.execute_batch(PRODUCTS_SCHEMA_SQL)
         .context("ensure products schema")
 }

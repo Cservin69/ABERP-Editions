@@ -411,6 +411,12 @@ CREATE INDEX IF NOT EXISTS ap_invoice_tenant_issue_idx
 /// Called at serve boot per the same hot-path posture as
 /// `partners::ensure_schema` and `products::ensure_schema`.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
+    // ADR-0098 C2 fix-forward — no-op on a read-only conn (read_returns_readonly
+    // read()-side); the schema is created by a writer before any read reaches
+    // here. A genuine write mis-routed through read() still fails loud (F5).
+    if aberp_audit_ledger::connection_is_read_only(conn) {
+        return Ok(());
+    }
     conn.execute_batch(AP_INVOICE_SCHEMA_SQL)
         .context("ensure ap_invoice schema")
 }

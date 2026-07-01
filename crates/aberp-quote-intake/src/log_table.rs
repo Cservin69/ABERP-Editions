@@ -12,6 +12,12 @@ use time::OffsetDateTime;
 use crate::error::QuoteIntakeError;
 
 pub fn ensure_schema(conn: &Connection) -> Result<(), QuoteIntakeError> {
+    // ADR-0098 C2 fix-forward — no-op on a read-only conn (read_returns_readonly
+    // read()-side); the schema is created by a writer before any read reaches
+    // here. A genuine write mis-routed through read() still fails loud (F5).
+    if aberp_audit_ledger::connection_is_read_only(conn) {
+        return Ok(());
+    }
     conn.execute_batch(SCHEMA_SQL)
         .map_err(|e| QuoteIntakeError::Storage(format!("ensure quote_intake_log schema: {e}")))?;
     // S255 / PR-244 — additive migration for the operator-pickup

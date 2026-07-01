@@ -233,6 +233,12 @@ CREATE TABLE IF NOT EXISTS avl_vendors (
 /// Idempotent table creation. No SQL CHECK/index ([[no-sql-specific]] — the
 /// table is small master data, scanned in full).
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
+    // ADR-0098 C2 fix-forward — no-op on a read-only conn (read_returns_readonly
+    // read()-side); the schema is created by a writer before any read reaches
+    // here. A genuine write mis-routed through read() still fails loud (F5).
+    if aberp_audit_ledger::connection_is_read_only(conn) {
+        return Ok(());
+    }
     conn.execute_batch(SCHEMA_SQL)
         .context("ensure avl_vendors schema")
 }

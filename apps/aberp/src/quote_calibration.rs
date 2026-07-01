@@ -60,6 +60,12 @@ CREATE TABLE IF NOT EXISTS quote_calibration_samples (
 /// Lazily create the samples table. Called at daemon boot and defensively by
 /// every reader/writer below.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
+    // ADR-0098 C2 fix-forward — no-op on a read-only conn (read_returns_readonly
+    // read()-side); the schema is created by a writer before any read reaches
+    // here. A genuine write mis-routed through read() still fails loud (F5).
+    if aberp_audit_ledger::connection_is_read_only(conn) {
+        return Ok(());
+    }
     conn.execute_batch(SCHEMA_SQL)
         .context("ensure quote_calibration_samples schema")
 }
