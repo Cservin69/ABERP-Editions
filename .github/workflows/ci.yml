@@ -158,6 +158,17 @@ jobs:
         # errors that would otherwise only surface later in test/clippy.
         run: cargo build --workspace --locked --all-targets ${{ matrix.features }}
 
+      # ── ADR-0098 Gap 1a/1b — the load-bearing DuckDB Handle e2e ──────
+      # Run the shared-Handle acceptance proof + the C2 assertion-#1
+      # (read-only open coexisting with the live read-write Handle) e2e
+      # EXPLICITLY, right after Build and BEFORE the broad workspace Test, so
+      # the load-bearing durability verdict is visible at the CI surface and
+      # is captured even if a later test step fails. No `production` feature:
+      # aberp-db is edition-agnostic (same rationale as the aberp-snapshot
+      # crate tests below).
+      - name: ADR-0098 DuckDB Handle e2e (assertion #1 + concurrency)
+        run: cargo test -p aberp-db --test handle_concurrency_e2e --locked -- --nocapture
+
       - name: Test (${{ matrix.edition }}, --locked)
         run: cargo test --workspace --locked ${{ matrix.features }}
 
