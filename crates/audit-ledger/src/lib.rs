@@ -56,8 +56,8 @@ pub use mirror::{
 // payloads (foundation only; no event populates it yet). See [`signer`].
 pub use signer::{DigitalIdRef, Signed};
 pub use storage::{
-    append_in_tx, append_in_tx_signed, append_reopen, ensure_schema, recent_entries, Ledger,
-    LedgerMeta, LedgerVerifyError,
+    append_in_tx, append_in_tx_signed, append_reopen, connection_is_read_only, ensure_schema,
+    recent_entries, Ledger, LedgerMeta, LedgerVerifyError,
 };
 // S441 — the extended-verification verdict + entrypoint live in `chain`.
 pub use chain::verify::{verify_chain_signed, ChainVerdict};

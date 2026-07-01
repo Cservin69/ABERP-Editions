@@ -364,6 +364,12 @@ ALTER TABLE quote_pricing_jobs ADD COLUMN IF NOT EXISTS tolerance_manual_review 
 /// embedded `DROP INDEX IF EXISTS` in `SCHEMA_SQL` cleans it up on the
 /// first call after upgrade — the daemon's startup is the first call.
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
+    // ADR-0098 C2 — no-op on a read-only conn (read_returns_readonly read()-side);
+    // schema is created by a writer before any read reaches here (F5 still
+    // fails loud for a genuine write mis-routed through read()).
+    if aberp_audit_ledger::connection_is_read_only(conn) {
+        return Ok(());
+    }
     conn.execute_batch(SCHEMA_SQL)
         .with_context(|| "ensure quote_pricing_jobs schema")
 }

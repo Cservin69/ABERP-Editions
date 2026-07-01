@@ -433,3 +433,52 @@ fn c2_assertion1_readonly_open_sees_each_commit_while_rw_instance_stays_open() {
         "file tore under repeated read-only + read-write coexistence"
     );
 }
+
+/// ADR-0098 C2 fix-forward — **read-only detection proof (Option A step 1).**
+/// The tolerant `ensure_schema` skips its idempotent DDL on a read-only conn.
+/// This proves the detector: it must report FALSE on the Handle's read-write
+/// guard connection and TRUE on the `read()`-side read-only connection
+/// (`read_returns_readonly` default). A wrong detector that reported TRUE on a
+/// write conn would silently skip real schema creation — so both directions
+/// are asserted here before the detector is relied on across the tree.
+#[test]
+fn c2_readonly_detection_distinguishes_ro_from_rw() {
+    let tmp = Tmp::new("ro-detect");
+    let db = tmp.db();
+    seed(&db);
+    let cfg = HandleConfig {
+        checkpoint_enabled: false,
+        ..Default::default()
+    };
+    let handle = Handle::open(&db, tenant(), cfg).unwrap();
+
+    // Read-write guard connection → must be detected NOT read-only.
+    {
+        let g = handle.write().unwrap();
+        let am: String = g
+            .query_row("SELECT current_setting('access_mode')", [], |r| r.get(0))
+            .unwrap_or_default();
+        eprintln!(
+            "detect RW: access_mode={am:?} is_ro={}",
+            aberp_audit_ledger::connection_is_read_only(&g)
+        );
+        assert!(
+            !aberp_audit_ledger::connection_is_read_only(&g),
+            "RW write-guard connection wrongly detected as read-only (access_mode={am})"
+        );
+    }
+
+    // read()-side connection (AccessMode::ReadOnly) → must be detected read-only.
+    let ro = handle.read().unwrap();
+    let am: String = ro
+        .query_row("SELECT current_setting('access_mode')", [], |r| r.get(0))
+        .unwrap_or_default();
+    eprintln!(
+        "detect RO: access_mode={am:?} is_ro={}",
+        aberp_audit_ledger::connection_is_read_only(&ro)
+    );
+    assert!(
+        aberp_audit_ledger::connection_is_read_only(&ro),
+        "read() read-only connection NOT detected as read-only (access_mode={am})"
+    );
+}

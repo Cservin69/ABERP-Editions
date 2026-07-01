@@ -22880,8 +22880,11 @@ async fn handle_list_quote_intake(headers: HeaderMap, State(state): State<AppSta
     // task so the enqueue does not block the list response.
     let rerender_queue = state.quote_pdf_rerender_queue.clone();
     let rows = match tokio::task::spawn_blocking(move || -> Result<_> {
+        // ADR-0098 C2 fix-forward (class-1) — persist_alerts_and_enqueue_rerender
+        // runs flip_and_audit_in_tx (guarded UPDATE + audit append) + enqueue, so
+        // this is a genuine WRITE path: route through the shared writer, not read().
         let mut conn = db
-            .read()
+            .write()
             .with_context(|| format!("open tenant DB at {}", db.db_path().display()))?;
         let listing = quote_intake_query_mod::list_quote_intake_rows(&conn, &tenant_id_string)?;
         // S275 / PR-264 / F2 + F16 — persist + audit one entry per

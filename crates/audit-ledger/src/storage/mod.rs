@@ -372,7 +372,31 @@ impl Ledger {
 /// operator-action-free regardless of which path reaches the corrupt DB
 /// first. After the one-time migration the detection query is a cheap
 /// metadata read that returns "no UNIQUE" and the function is a no-op.
+/// ADR-0098 C2 fix-forward — is this DuckDB connection read-only
+/// (`AccessMode::ReadOnly`)? The read()-side connections handed out by
+/// `aberp_db::Handle::read` under `read_returns_readonly` are read-only; the
+/// idempotent `ensure_schema` DDL must be a no-op on them (the schema is
+/// guaranteed to have been created by a writer conn at boot/first-write
+/// before any read reaches it). Detected via the `access_mode` setting the
+/// `duckdb` crate sets from `AccessMode::ReadOnly` ("READ_ONLY") — a stable
+/// metadata read, NOT a fragile error-string match. On any query error we
+/// return `false` (attempt the DDL, which then fails loud on a genuine
+/// read-only conn per F5 — no worse than before this helper).
+pub fn connection_is_read_only(conn: &Connection) -> bool {
+    conn.query_row("SELECT current_setting('access_mode')", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .map(|mode| mode.eq_ignore_ascii_case("read_only"))
+    .unwrap_or(false)
+}
+
 pub fn ensure_schema(conn: &Connection) -> Result<(), AppendError> {
+    // ADR-0098 C2 — skip the idempotent schema DDL on a read-only conn
+    // (read_returns_readonly read()-side). The schema already exists; a
+    // genuine write mis-routed through read() still fails loud (F5).
+    if connection_is_read_only(conn) {
+        return Ok(());
+    }
     conn.execute_batch(schema::CREATE_TABLE)?;
     // S441 / ADR-0087 — add the three nullable session-signing columns to
     // existing tenant DBs BEFORE the unique-ART migration runs (that
