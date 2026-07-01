@@ -88,6 +88,8 @@
 //!    trigger for the migrated-base path: the first PR that lands the
 //!    Billingo migration read (ADR-0010 build phase).
 
+#[cfg_attr(not(feature = "production"), allow(unused_imports))]
+use duckdb::Connection;
 use std::path::PathBuf;
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};

@@ -58,6 +58,8 @@
 //! schema has no `origin` column today, so the migrated-base
 //! conditional never fires.
 
+#[cfg_attr(not(feature = "production"), allow(unused_imports))]
+use duckdb::Connection;
 use std::path::PathBuf;
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
