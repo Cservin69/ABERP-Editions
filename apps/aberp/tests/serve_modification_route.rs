@@ -60,6 +60,8 @@ fn build_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new(TEST_TENANT.to_string()).expect("tenant id");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
     AppState {
+        db: aberp_db::Handle::open_default(&db_path, tenant.clone())
+            .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
         db_path: Arc::new(db_path),
         tenant,
         nav_enabled: true,
@@ -283,6 +285,12 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
     // CLI library helper to mint a fresh local invoice end-to-end so
     // the billing row + audit trace are co-created in lockstep.
     let xml_out = dir.join("base.xml");
+    // ADR-0098 C2 — issue_from_parsed now writes through the shared Handle.
+    let base_db_handle = aberp_db::Handle::open_default(
+        &db_path,
+        TenantId::new(TEST_TENANT.to_string()).expect("tenant id"),
+    )
+    .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)");
     aberp::issue_invoice::issue_from_parsed(
         aberp::issue_invoice::InvoiceInputJson {
             supplier: SupplierJson {
@@ -332,7 +340,7 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
             // base's resolver continues to fall back to partner.email.
             email_recipient_override: None,
         },
-        &db_path,
+        &base_db_handle,
         TEST_TENANT,
         "INV-default",
         aberp_billing::Currency::Huf,
@@ -345,6 +353,9 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
     )
     .await
     .expect("issue base HUF invoice");
+    // Close the seeding handle so the later open_ledger/build_state opens
+    // are the sole opener of this file (sequential single-instance).
+    drop(base_db_handle);
 
     // Find the base id from the audit ledger.
     let base_invoice_id = {

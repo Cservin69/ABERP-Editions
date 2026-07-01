@@ -184,6 +184,11 @@ fn build_service(addr: &SocketAddr, token: &str, db_path: &Path) -> QuoteIntakeS
         enabled: true,
     };
     let deps = QuoteIntakeDeps {
+        db: aberp_db::Handle::open_default(
+            db_path,
+            TenantId::new("t1".to_string()).expect("tenant"),
+        )
+        .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
         db_path: db_path.to_path_buf(),
         tenant: TenantId::new("t1".to_string()).expect("tenant"),
         binary_hash: BinaryHash::from_bytes([0u8; 32]),

@@ -223,6 +223,8 @@ async fn run_push(
 
     let handle = CataloguePushHandle::dormant();
     let deps = CataloguePushDeps {
+        db: aberp_db::Handle::open_default(&db_path, TenantId::new("test").expect("tenant id"))
+            .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
         db_path: db_path.clone(),
         tenant: TenantId::new("test").expect("tenant id"),
         binary_hash: BinaryHash::from_bytes([0u8; 32]),

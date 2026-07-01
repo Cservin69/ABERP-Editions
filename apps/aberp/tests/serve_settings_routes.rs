@@ -148,6 +148,8 @@ fn build_state_for(tenant: &str, db_path: PathBuf) -> AppState {
     let tenant_id = TenantId::new(tenant.to_string()).expect("tenant id");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
     AppState {
+        db: aberp_db::Handle::open_default(&db_path, tenant_id.clone())
+            .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
         db_path: Arc::new(db_path),
         tenant: tenant_id,
         nav_enabled: true,

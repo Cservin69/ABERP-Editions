@@ -265,8 +265,11 @@ fn rotation_preserves_other_three_fields() {
     use std::sync::Arc;
     let tenant_id = aberp_audit_ledger::TenantId::new(tenant.to_string()).expect("tenant id");
     let binary_hash = aberp_audit_ledger::BinaryHash::from_bytes([0u8; 32]);
+    let blob_db_path = std::env::temp_dir().join(format!("aberp-blob-{}.duckdb", Ulid::new()));
     let state = aberp::serve::AppState {
-        db_path: Arc::new(std::env::temp_dir().join(format!("aberp-blob-{}.duckdb", Ulid::new()))),
+        db: aberp_db::Handle::open_default(&blob_db_path, tenant_id.clone())
+            .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
+        db_path: Arc::new(blob_db_path),
         tenant: tenant_id,
         nav_enabled: true,
         binary_hash: aberp::binary_hash::BinaryHashHandle::from_ready(binary_hash),

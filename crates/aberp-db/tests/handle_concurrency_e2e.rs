@@ -300,3 +300,136 @@ fn daemon_write_killed_mid_checkpoint_is_recoverable() {
     let conn = Connection::open(&db).unwrap();
     let _ = recent_entries(&conn, u32::MAX).unwrap();
 }
+
+/// ADR-0098 C2 — **assertion #1 (CRITICAL for the v0.2.5 cut vs C3 decision).**
+///
+/// The default `HandleConfig` sets `read_returns_readonly = true`, so
+/// [`Handle::read`] hands out a SEPARATE read-only OS open
+/// (`AccessMode::ReadOnly`). That is exactly the shape `ap_sync` drives every
+/// ~2s during backfill (incoming_invoices + submission_queue reads) concurrent
+/// with the read-write Handle. On real libduckdb 1.5.3 this asserts:
+///
+///   1. DuckDB **ALLOWS** a same-process read-only open concurrent with the
+///      Handle's live read-write instance (if this fails, the ap_sync
+///      read-residual is still a tear/again path and the config must fall back
+///      to `read_returns_readonly = false` / `try_clone` — a C3 change, NOT a
+///      safe v0.2.6 defer);
+///   2. the read-only open **sees COMMITTED writes** (so a post-commit
+///      `verify_chain` read on a migrated NAV/invoicing path observes the
+///      just-committed append); and
+///   3. a write **mis-routed** through the read-only connection is REJECTED
+///      (the F5 "fail loud, never silently bypass the durability hook"
+///      guarantee), and neither open tears the file.
+///
+/// Read this test's CI result before cutting: PASS ⇒ read-residual safe to
+/// defer; FAIL on step 1 ⇒ still a tear path (C3).
+#[test]
+fn c2_assertion1_readonly_open_coexists_with_live_rw_handle_and_sees_commits() {
+    let tmp = Tmp::new("ro-coexist");
+    let db = tmp.db();
+    seed(&db);
+    // checkpoint disabled => the read-write instance stays CONTINUOUSLY open,
+    // so the read-only open below truly coexists with a live RW instance (the
+    // strictest case). `read_returns_readonly` stays true (the default) — that
+    // is the property under test.
+    let cfg = HandleConfig {
+        checkpoint_enabled: false,
+        ..Default::default()
+    };
+    assert!(
+        cfg.read_returns_readonly,
+        "this test must exercise the read-only read() path"
+    );
+    let handle = Handle::open(&db, tenant(), cfg).unwrap();
+
+    // Commit a write through the read-write instance.
+    {
+        let mut g = handle.write().unwrap();
+        append_one(&mut g, "ro-1");
+    }
+
+    // (1) A read-only open concurrent with the live RW instance must SUCCEED.
+    let ro = handle.read().expect(
+        "ASSERTION #1 FAILED: libduckdb 1.5.3 rejected a same-process read-only \
+         open concurrent with the read-write Handle. The ap_sync read-residual \
+         is still a tear path — set read_returns_readonly=false (try_clone) \
+         before cutting (C3).",
+    );
+
+    // (2) The read-only connection observes the committed row.
+    assert_eq!(
+        recent_entries(&ro, u32::MAX).unwrap().len(),
+        1,
+        "read-only open did not observe the committed write"
+    );
+
+    // Hold `ro` OPEN and commit a second write through the RW instance, then a
+    // fresh read-only open must observe BOTH — committed-write visibility while
+    // a prior read-only open and the RW instance all coexist in-process.
+    {
+        let mut g = handle.write().unwrap();
+        append_one(&mut g, "ro-2");
+    }
+    let ro2 = handle
+        .read()
+        .expect("second concurrent read-only open rejected (assertion #1)");
+    assert_eq!(
+        recent_entries(&ro2, u32::MAX).unwrap().len(),
+        2,
+        "second read-only open did not see the second committed write"
+    );
+
+    // (3a) A write mis-routed through the read-only connection FAILS LOUDLY
+    // (never silently commits to a second instance and bypasses the hook).
+    assert!(
+        ro.execute_batch("CREATE TABLE ro_probe (i INTEGER);")
+            .is_err(),
+        "a write through the read-only read() connection unexpectedly SUCCEEDED \
+         — the F5 fail-loud guarantee is broken"
+    );
+
+    // (3b) Neither open tore the file.
+    drop(ro);
+    drop(ro2);
+    assert!(
+        fresh_open_ok(&db),
+        "file tore under read-only + read-write same-process coexistence"
+    );
+}
+
+/// ADR-0098 C2 — assertion #1 reinforcement: after EACH of many commits, a
+/// fresh read-only open (concurrent with the continuously-open read-write
+/// instance) observes exactly the committed count so far. Deterministic
+/// (single thread) to avoid CI timing flakiness while still exercising real
+/// RO+RW same-process coexistence on every iteration.
+#[test]
+fn c2_assertion1_readonly_open_sees_each_commit_while_rw_instance_stays_open() {
+    let tmp = Tmp::new("ro-seq");
+    let db = tmp.db();
+    seed(&db);
+    let cfg = HandleConfig {
+        checkpoint_enabled: false,
+        ..Default::default()
+    };
+    let handle = Handle::open(&db, tenant(), cfg).unwrap();
+
+    let n = 50usize;
+    for i in 0..n {
+        {
+            let mut g = handle.write().unwrap();
+            append_one(&mut g, &format!("seq-{i}"));
+        }
+        let ro = handle
+            .read()
+            .expect("read-only open rejected while the read-write instance is live (assertion #1)");
+        assert_eq!(
+            recent_entries(&ro, u32::MAX).unwrap().len(),
+            i + 1,
+            "read-only open did not see all commits up to iteration {i}"
+        );
+    }
+    assert!(
+        fresh_open_ok(&db),
+        "file tore under repeated read-only + read-write coexistence"
+    );
+}

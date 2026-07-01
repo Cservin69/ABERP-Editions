@@ -66,6 +66,8 @@ fn demo_state(db_path: PathBuf) -> AppState {
     let tenant = TenantId::new("demo".to_string()).expect("demo tenant id");
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
     AppState {
+        db: aberp_db::Handle::open_default(&db_path, tenant.clone())
+            .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
         db_path: Arc::new(db_path),
         tenant,
         // The whole point of the Portable line: NAV submission is off.
