@@ -349,7 +349,8 @@ impl QuoteIntakeService {
         let tenant_for_list = self.deps.tenant.as_str().to_string();
         let db_for_list = self.deps.db.clone();
         match spawn_blocking(move || {
-            let conn = db_for_list.read()
+            let conn = db_for_list
+                .read()
                 .map_err(|e| QuoteIntakeError::Storage(format!("open DB for pending list: {e}")))?;
             log_table::list_pending_writebacks(&conn, &tenant_for_list)
         })
@@ -441,7 +442,8 @@ impl QuoteIntakeService {
         let binary_hash = self.deps.binary_hash;
         let login = self.deps.operator_login.clone();
         let outcome = spawn_blocking(move || -> Result<(), QuoteIntakeError> {
-            let mut conn = db_handle.write()
+            let mut conn = db_handle
+                .write()
                 .map_err(|e| QuoteIntakeError::Storage(format!("open DB for audit append: {e}")))?;
             aberp_audit_ledger::ensure_schema(&conn).map_err(|e| {
                 QuoteIntakeError::Storage(format!("ensure audit-ledger schema: {e}"))

@@ -557,8 +557,9 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     //     tx opens so the sequence-slot invariant (ADR-0009 §3)
     //     is preserved. The check opens + drops its own Ledger
     //     handle; pre_tx_setup below opens a fresh Connection.
-    let pending_count = submission_queue::count_pending(db.db_path(), tenant.clone(), binary_hash_bytes)
-        .context("count pending submissions (ADR-0031 §5 cap check)")?;
+    let pending_count =
+        submission_queue::count_pending(db.db_path(), tenant.clone(), binary_hash_bytes)
+            .context("count pending submissions (ADR-0031 §5 cap check)")?;
     if pending_count >= submission_queue::HARD_CAP_PENDING {
         return Err(anyhow!(
             "submission queue is full ({}/{} pending invoices per ADR-0009 §7 / ADR-0031 §5); \
@@ -659,9 +660,9 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         Some(probe) => {
             // ADR-0098 C2 — peek via a shared READ clone (runs BEFORE the
             // allocator tx; the pre-fix code held the pre_tx_setup conn here).
-            let peek_conn = db
-                .read()
-                .context("shared read: peek next sequence for NAV pre-flight (S392) (ADR-0098 C2)")?;
+            let peek_conn = db.read().context(
+                "shared read: peek next sequence for NAV pre-flight (S392) (ADR-0098 C2)",
+            )?;
             let start_seq = billing::peek_next_number(
                 &peek_conn,
                 series.id,

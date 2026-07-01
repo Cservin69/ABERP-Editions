@@ -550,7 +550,9 @@ impl CataloguePushService {
         let outcome = outcome.clone();
 
         let res = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = db.write().context("shared writer: MaterialCataloguePushed audit (ADR-0098 Gap 1a)")?;
+            let mut conn = db
+                .write()
+                .context("shared writer: MaterialCataloguePushed audit (ADR-0098 Gap 1a)")?;
             aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
             let payload = serde_json::json!({
                 "trigger": trigger,

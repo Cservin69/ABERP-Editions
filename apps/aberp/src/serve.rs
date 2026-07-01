@@ -10758,7 +10758,10 @@ fn read_invoice_currency(db: &aberp_db::HandleArc, invoice_id: &str) -> Result<C
 /// already excluded drafts by the time this runs). Reuses
 /// `billing::load_ready_invoice_by_id` so the gross read shares the
 /// list/detail read path's source of truth (CLAUDE.md rule 8).
-fn read_invoice_total_gross_minor(db: &aberp_db::HandleArc, invoice_id: &str) -> Result<Option<i64>> {
+fn read_invoice_total_gross_minor(
+    db: &aberp_db::HandleArc,
+    invoice_id: &str,
+) -> Result<Option<i64>> {
     let mut conn = db
         .read()
         .context("shared read: invoice total_gross lookup (ADR-0098 Gap 1a Session C)")?;
@@ -10885,7 +10888,9 @@ pub fn list_partners_request(
     state: &AppState,
     search: Option<&str>,
 ) -> std::result::Result<Vec<Partner>, PartnerRouteError> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let partners = partners::list_partners(&conn, state.tenant.as_str(), search)?;
     Ok(partners)
@@ -10919,7 +10924,9 @@ pub fn get_partner_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<Partner, PartnerRouteError> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     match partners::get_partner(&conn, state.tenant.as_str(), id)? {
         Some(p) => Ok(p),
@@ -10970,7 +10977,9 @@ pub fn create_partner_request(
     if let Err(errors) = partners::validate_partner_inputs(inputs) {
         return Err(PartnerRouteError::Validation(errors));
     }
-    let conn = state.db.write()
+    let conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let partner = partners::create_partner(&conn, state.tenant.as_str(), inputs)?;
     Ok(partner)
@@ -11034,7 +11043,9 @@ pub fn update_partner_request(
     // connection is scoped/dropped before the audit append opens its own
     // ledger connection (the S427 single-writer-lock posture).
     let (partner, old_customer_type) = {
-        let conn = state.db.write()
+        let conn = state
+            .db
+            .write()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         let old_customer_type =
             partners::get_partner(&conn, state.tenant.as_str(), id)?.map(|p| p.customer_type);
@@ -11107,7 +11118,9 @@ pub fn delete_partner_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<(), PartnerRouteError> {
-    let conn = state.db.write()
+    let conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let deleted = partners::soft_delete_partner(&conn, state.tenant.as_str(), id)?;
     if deleted {
@@ -11200,7 +11213,9 @@ async fn handle_list_machines(headers: HeaderMap, State(state): State<AppState>)
 pub fn list_machines_request(
     state: &AppState,
 ) -> std::result::Result<Vec<crate::quoting_machines::QuotingMachine>, MachineRouteError> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     Ok(crate::quoting_machines::list_machines(
         &conn,
@@ -11232,7 +11247,9 @@ async fn handle_get_calibration(headers: HeaderMap, State(state): State<AppState
 pub fn calibration_overview_request(
     state: &AppState,
 ) -> anyhow::Result<crate::quote_calibration::CalibrationOverview> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     crate::quote_calibration::calibration_overview(&conn, state.tenant.as_str())
 }
@@ -11260,7 +11277,9 @@ pub fn get_machine_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<crate::quoting_machines::QuotingMachine, MachineRouteError> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     match crate::quoting_machines::get_machine(&conn, state.tenant.as_str(), id)? {
         Some(m) => Ok(m),
@@ -11314,7 +11333,9 @@ pub fn create_machine_request(
     // opens its own connection — DuckDB rejects a second writer to the
     // same file while the first is still held.
     let machine = {
-        let conn = state.db.write()
+        let conn = state
+            .db
+            .write()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         crate::quoting_machines::create_machine(&conn, state.tenant.as_str(), inputs)?
     };
@@ -11383,7 +11404,9 @@ pub fn update_machine_request(
     }
     // Scope the write connection (see `create_machine_request`).
     let machine = {
-        let conn = state.db.write()
+        let conn = state
+            .db
+            .write()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         match crate::quoting_machines::update_machine(&conn, state.tenant.as_str(), id, inputs)? {
             Some(m) => m,
@@ -11450,7 +11473,9 @@ pub fn archive_machine_request(
 ) -> std::result::Result<(), MachineRouteError> {
     // Scope the write connection (see `create_machine_request`).
     let archived_at = {
-        let conn = state.db.write()
+        let conn = state
+            .db
+            .write()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         match crate::quoting_machines::archive_machine(&conn, state.tenant.as_str(), id)? {
             Some(ts) => ts,
@@ -11558,7 +11583,9 @@ async fn handle_list_avl_vendors(headers: HeaderMap, State(state): State<AppStat
 pub fn list_avl_vendors_request(
     state: &AppState,
 ) -> std::result::Result<Vec<crate::avl_vendors::AvlVendor>, VendorRouteError> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     Ok(crate::avl_vendors::list_vendors(
         &conn,
@@ -11589,7 +11616,9 @@ pub fn get_avl_vendor_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<crate::avl_vendors::AvlVendor, VendorRouteError> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     match crate::avl_vendors::get_vendor(&conn, state.tenant.as_str(), id)? {
         Some(v) => Ok(v),
@@ -11641,7 +11670,9 @@ pub fn create_avl_vendor_request(
     }
     // Scope the write connection (DuckDB single-writer; see create_machine_request).
     let vendor = {
-        let conn = state.db.write()
+        let conn = state
+            .db
+            .write()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         crate::avl_vendors::create_vendor(&conn, state.tenant.as_str(), inputs, operator_login)?
     };
@@ -11703,7 +11734,9 @@ pub fn update_avl_vendor_request(
     if let Err(errors) = crate::avl_vendors::validate_vendor_edit(inputs) {
         return Err(VendorRouteError::Validation(errors));
     }
-    let conn = state.db.write()
+    let conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     match crate::avl_vendors::update_vendor(
         &conn,
@@ -11771,7 +11804,9 @@ pub fn set_avl_vendor_status_request(
     })?;
     // Scope the write connection (DuckDB single-writer).
     let change = {
-        let conn = state.db.write()
+        let conn = state
+            .db
+            .write()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         match crate::avl_vendors::set_vendor_status(
             &conn,
@@ -11919,7 +11954,9 @@ pub fn screen_avl_vendor_request(
 
     // Scope the write connection (DuckDB single-writer).
     let vendor = {
-        let conn = state.db.write()
+        let conn = state
+            .db
+            .write()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         match crate::avl_vendors::record_screening(
             &conn,
@@ -12009,7 +12046,9 @@ pub fn avl_po_check_request(
     binary_hash: BinaryHash,
 ) -> std::result::Result<(), VendorRouteError> {
     let eligibility = {
-        let conn = state.db.read()
+        let conn = state
+            .db
+            .read()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         crate::avl_vendors::po_eligibility(&conn, state.tenant.as_str(), partner_id)?
     };
@@ -12138,7 +12177,9 @@ async fn handle_list_margin_profiles(
 pub fn list_margin_profiles_request(
     state: &AppState,
 ) -> std::result::Result<Vec<crate::margin_profiles::MarginProfile>, MarginProfileRouteError> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     Ok(crate::margin_profiles::list_profiles(
         &conn,
@@ -12213,7 +12254,9 @@ pub fn create_margin_profile_request(
     // Scope the write connection so it is dropped before the audit append
     // opens its own ledger connection (S427 single-writer-lock posture).
     let profile = {
-        let conn = state.db.write()
+        let conn = state
+            .db
+            .write()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         match crate::margin_profiles::create_profile(&conn, state.tenant.as_str(), inputs)? {
             crate::margin_profiles::CreateOutcome::Created(p) => p,
@@ -12284,7 +12327,9 @@ pub fn update_margin_profile_request(
         return Err(MarginProfileRouteError::Validation(errors));
     }
     let profile = {
-        let conn = state.db.write()
+        let conn = state
+            .db
+            .write()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         match crate::margin_profiles::update_profile(&conn, state.tenant.as_str(), id, inputs)? {
             crate::margin_profiles::UpdateOutcome::Updated(p) => p,
@@ -12354,7 +12399,9 @@ pub fn archive_margin_profile_request(
     binary_hash: BinaryHash,
 ) -> std::result::Result<(), MarginProfileRouteError> {
     let archived_at = {
-        let conn = state.db.write()
+        let conn = state
+            .db
+            .write()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         match crate::margin_profiles::archive_profile(&conn, state.tenant.as_str(), id)? {
             Some(ts) => ts,
@@ -12433,7 +12480,9 @@ pub fn override_lead_time_request(
     // Scope the write connection (see `create_machine_request`); capture
     // the computed value for the audit payload BEFORE writing.
     let computed_days = {
-        let conn = state.db.write()
+        let conn = state
+            .db
+            .write()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         let Some(detail) =
             crate::quote_pricing_jobs::get_job_detail(&conn, quote_id, state.tenant.as_str())?
@@ -12585,7 +12634,9 @@ pub fn set_quote_buyer_partner_request(
     let tenant = state.tenant.as_str();
     // Scope the write connection (S427 single-writer-lock posture).
     let reprice = {
-        let conn = state.db.write()
+        let conn = state
+            .db
+            .write()
             .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
         let stored_override =
             match crate::quote_pricing_jobs::get_job_detail(&conn, quote_id, tenant)? {
@@ -12684,7 +12735,9 @@ pub fn override_quote_margin_request(
     }
     // Re-price with the candidate override FIRST (no persistence yet) so a
     // below-floor override can be refused before it takes effect.
-    let conn = state.db.write()
+    let conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let Some(outcome) =
         crate::quote_pricing_pipeline::reprice_quote(&conn, tenant, quote_id, body.margin_pct)?
@@ -12897,7 +12950,9 @@ pub fn set_quote_stock_form_request(
     body: StockFormBody,
 ) -> std::result::Result<serde_json::Value, StockFormError> {
     let (kind, od, id, length) = normalize_stock_form_body(&body)?;
-    let conn = state.db.write()
+    let conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let tenant = state.tenant.as_str();
     let now = time::OffsetDateTime::now_utc();
@@ -13149,7 +13204,9 @@ pub fn set_quote_gear_ops_request(
     body: GearOpsBody,
 ) -> std::result::Result<serde_json::Value, GearOpsError> {
     let gear_ops_json = normalize_gear_ops_body(&body)?;
-    let conn = state.db.write()
+    let conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let tenant = state.tenant.as_str();
     let now = time::OffsetDateTime::now_utc();
@@ -13382,7 +13439,9 @@ pub fn set_quote_tolerance_request(
     quote_id: &str,
     body: ToleranceBody,
 ) -> std::result::Result<serde_json::Value, ToleranceError> {
-    let conn = state.db.write()
+    let conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let tenant = state.tenant.as_str();
     let now = time::OffsetDateTime::now_utc();
@@ -15448,7 +15507,9 @@ pub fn list_products_request(
     state: &AppState,
     search: Option<&str>,
 ) -> std::result::Result<Vec<Product>, ProductRouteError> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let items = products::list_products(&conn, state.tenant.as_str(), search)?;
     Ok(items)
@@ -15463,7 +15524,9 @@ pub fn list_products_with_inventory_request(
     state: &AppState,
     search: Option<&str>,
 ) -> std::result::Result<Vec<ProductWithInventory>, ProductRouteError> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let items = products::list_products(&conn, state.tenant.as_str(), search)?;
     let fields = aberp_inventory::inventory_fields_for_tenant(&conn, state.tenant.as_str())
@@ -15505,7 +15568,9 @@ pub fn get_product_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<Product, ProductRouteError> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     match products::get_product(&conn, state.tenant.as_str(), id)? {
         Some(p) => Ok(p),
@@ -15522,7 +15587,9 @@ pub fn get_product_with_inventory_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<ProductWithInventory, ProductRouteError> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let product = match products::get_product(&conn, state.tenant.as_str(), id)? {
         Some(p) => p,
@@ -15576,7 +15643,9 @@ pub fn create_product_request(
     if let Err(errors) = products::validate_product_inputs(inputs) {
         return Err(ProductRouteError::Validation(errors));
     }
-    let conn = state.db.write()
+    let conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let p = products::create_product(&conn, state.tenant.as_str(), inputs)?;
     Ok(p)
@@ -15625,7 +15694,9 @@ pub fn update_product_request(
     if let Err(errors) = products::validate_product_inputs(inputs) {
         return Err(ProductRouteError::Validation(errors));
     }
-    let conn = state.db.write()
+    let conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     match products::update_product(&conn, state.tenant.as_str(), id, inputs)? {
         Some(p) => Ok(p),
@@ -15673,7 +15744,9 @@ pub fn delete_product_request(
     state: &AppState,
     id: &str,
 ) -> std::result::Result<(), ProductRouteError> {
-    let conn = state.db.write()
+    let conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let deleted = products::soft_delete_product(&conn, state.tenant.as_str(), id)?;
     if deleted {
@@ -15820,7 +15893,9 @@ pub fn list_stock_movements_request(
     limit: u32,
     offset: u32,
 ) -> std::result::Result<Vec<aberp_inventory::StockMovement>, StockMovementRouteError> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     // Defensive 404 — the SPA path always opens the product detail
     // page first, but a direct curl that names an unknown product
@@ -15935,7 +16010,9 @@ pub fn create_stock_movement_request(
         }
     }
 
-    let mut conn = state.db.write()
+    let mut conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
 
     // 404 if the product is unknown — caught here before opening the
@@ -16027,7 +16104,9 @@ async fn handle_list_low_stock_products(
 pub fn list_low_stock_products_request(
     state: &AppState,
 ) -> anyhow::Result<Vec<aberp_inventory::LowStockRow>> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     aberp_inventory::low_stock_products(&conn, state.tenant.as_str())
 }
@@ -16177,7 +16256,9 @@ pub fn list_work_orders_request(
     limit: u32,
     offset: u32,
 ) -> anyhow::Result<Vec<aberp_work_orders::WorkOrder>> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     aberp_work_orders::list_work_orders(&conn, state.tenant.as_str(), state_filter, limit, offset)
 }
@@ -16385,7 +16466,9 @@ pub fn get_work_order_detail_request(
     state: &AppState,
     wo_id: &str,
 ) -> anyhow::Result<Option<WorkOrderDetailResponse>> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let wo = aberp_work_orders::read_work_order(&conn, state.tenant.as_str(), wo_id)
         .map_err(|e| anyhow!("read work order: {e}"))?;
@@ -17022,7 +17105,9 @@ pub fn get_product_bom_request(
     state: &AppState,
     product_id: &str,
 ) -> anyhow::Result<Vec<aberp_work_orders::BomLine>> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     aberp_work_orders::list_active_bom_for_product(&conn, state.tenant.as_str(), product_id)
 }
@@ -17342,7 +17427,9 @@ pub fn list_qa_inspections_request(
     limit: u32,
     offset: u32,
 ) -> anyhow::Result<Vec<aberp_qa::QaInspection>> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     aberp_qa::list_qa_inspections(&conn, state.tenant.as_str(), state_filter, limit, offset)
 }
@@ -17388,7 +17475,9 @@ pub fn get_qa_inspection_request(
     state: &AppState,
     qa_id: &str,
 ) -> anyhow::Result<Option<aberp_qa::QaInspection>> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     aberp_qa::get_qa_inspection(&conn, state.tenant.as_str(), qa_id)
 }
@@ -17735,7 +17824,9 @@ pub fn list_dispatches_request(
     limit: u32,
     offset: u32,
 ) -> anyhow::Result<Vec<aberp_dispatch::Dispatch>> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema (defensive)")?;
     aberp_dispatch::list_dispatches(&conn, state.tenant.as_str(), state_filter, limit, offset)
@@ -17781,7 +17872,9 @@ pub fn get_dispatch_request(
     state: &AppState,
     dsp_id: &str,
 ) -> anyhow::Result<Option<aberp_dispatch::Dispatch>> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema (defensive)")?;
     aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
@@ -17826,7 +17919,9 @@ pub fn list_eligible_work_orders_request(
     state: &AppState,
     limit: u32,
 ) -> anyhow::Result<Vec<aberp_dispatch::EligibleWorkOrder>> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     aberp_dispatch::ensure_schema(&conn).context("ensure dispatch schema (defensive)")?;
     aberp_dispatch::list_eligible_work_orders(&conn, state.tenant.as_str(), limit)
@@ -18149,7 +18244,9 @@ async fn handle_list_invoice_drafts(headers: HeaderMap, State(state): State<AppS
 }
 
 pub fn list_invoice_drafts_request(state: &AppState) -> Result<Vec<invoice_draft::InvoiceDraft>> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema (defensive)")?;
     invoice_draft::list_drafts(&conn, state.tenant.as_str())
@@ -18196,7 +18293,9 @@ pub fn get_invoice_draft_request(
     state: &AppState,
     drf_id: &str,
 ) -> Result<Option<invoice_draft::InvoiceDraft>> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema (defensive)")?;
     invoice_draft::read_draft(&conn, state.tenant.as_str(), drf_id)
@@ -18245,7 +18344,9 @@ pub fn delete_invoice_draft_request(
     operator_login: &str,
     drf_id: &str,
 ) -> Result<invoice_draft::DeleteDraftOutcome> {
-    let mut conn = state.db.write()
+    let mut conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     invoice_draft::ensure_schema(&conn).context("ensure invoice_draft schema (defensive)")?;
     // S239 / PR-233 — defensive `ensure_schema` for the `dispatches`
@@ -19844,7 +19945,9 @@ fn compute_workshop_dashboard(
     today: time::Date,
     binary_hash: aberp_audit_ledger::BinaryHash,
 ) -> anyhow::Result<WorkshopDashboard> {
-    let conn = state.db.read()
+    let conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let tenant_str = state.tenant.as_str();
     // ISO 8601 date `YYYY-MM-DD`. `time::Date`'s default Display is
@@ -19942,9 +20045,7 @@ fn compute_workshop_dashboard(
         diff_adapter_health(&mut guard, &adapters)
     };
     for t in &transitions_to_emit {
-        if let Err(e) =
-            emit_adapter_health_transition(&state.db, &state.tenant, binary_hash, t)
-        {
+        if let Err(e) = emit_adapter_health_transition(&state.db, &state.tenant, binary_hash, t) {
             tracing::error!(
                 adapter_id = %t.adapter_id,
                 from = t.from_state,
@@ -21895,7 +21996,9 @@ fn resolve_recipient_email(
     partner_id: Option<&str>,
     customer_tax_number: &str,
 ) -> Result<Option<(String, Option<String>)>> {
-    let mut conn = state.db.read()
+    let mut conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     // PR-203 / S203 — rung 1: per-invoice override.
     let override_value = {
@@ -22777,7 +22880,8 @@ async fn handle_list_quote_intake(headers: HeaderMap, State(state): State<AppSta
     // task so the enqueue does not block the list response.
     let rerender_queue = state.quote_pdf_rerender_queue.clone();
     let rows = match tokio::task::spawn_blocking(move || -> Result<_> {
-        let mut conn = db.read()
+        let mut conn = db
+            .read()
             .with_context(|| format!("open tenant DB at {}", db.db_path().display()))?;
         let listing = quote_intake_query_mod::list_quote_intake_rows(&conn, &tenant_id_string)?;
         // S275 / PR-264 / F2 + F16 — persist + audit one entry per
@@ -22871,7 +22975,9 @@ pub fn pickup_quote_as_draft_request(
     operator_login: &str,
     quote_id: &str,
 ) -> Result<quote_pickup::PickupQuoteOutcome> {
-    let mut conn = state.db.write()
+    let mut conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let binary_hash = state
         .binary_hash
@@ -23623,7 +23729,9 @@ pub fn amend_pricing_job_material_request(
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let mut conn = state.db.write()
+    let mut conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let tenant = state.tenant.as_str().to_string();
 
@@ -23822,7 +23930,9 @@ pub fn delete_pricing_job_request(
         .binary_hash
         .wait()
         .context("await background binary hash compute")?;
-    let mut conn = state.db.write()
+    let mut conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let tenant = state.tenant.as_str().to_string();
 
@@ -24284,7 +24394,8 @@ async fn handle_quote_intake_notifications(
 
     let result =
         tokio::task::spawn_blocking(move || -> Result<QuoteIntakeNotifications> {
-            let conn = db.read()
+            let conn = db
+                .read()
                 .with_context(|| format!("open tenant DB at {}", db.db_path().display()))?;
             let unpicked_count = aberp_quote_intake::log_table::count_unpicked(&conn, &tenant)
                 .context("count un-picked quotes")?;
@@ -24369,7 +24480,8 @@ async fn handle_quote_intake_retry_parse(
     let tenant = state.tenant.as_str().to_string();
     let quote_id_task = quote_id.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<RetryParseResult> {
-        let conn = db.write()
+        let conn = db
+            .write()
             .with_context(|| format!("open tenant DB at {}", db.db_path().display()))?;
         let Some((raw, _state)) =
             aberp_quote_intake::log_table::read_raw_and_state(&conn, &tenant, &quote_id_task)
@@ -24461,7 +24573,8 @@ async fn handle_quote_intake_mark_irrelevant(
     let tenant = state.tenant.as_str().to_string();
     let quote_id_task = quote_id.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<usize> {
-        let conn = db.write()
+        let conn = db
+            .write()
             .with_context(|| format!("open tenant DB at {}", db.db_path().display()))?;
         aberp_quote_intake::log_table::mark_irrelevant(&conn, &tenant, &quote_id_task)
             .context("mark quote irrelevant")
@@ -25580,7 +25693,9 @@ async fn handle_create_inspection_plan(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<aberp_qa::InspectionPlan, aberp_qa::QcError> {
-            let conn = state_for_task.db.write()
+            let conn = state_for_task
+                .db
+                .write()
                 .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
             aberp_qa::create_inspection_plan(
                 &conn,
@@ -25624,7 +25739,9 @@ async fn handle_update_inspection_plan(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<aberp_qa::InspectionPlan, aberp_qa::QcError> {
-            let conn = state_for_task.db.write()
+            let conn = state_for_task
+                .db
+                .write()
                 .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
             aberp_qa::update_inspection_plan(
                 &conn,
@@ -25668,7 +25785,9 @@ async fn handle_archive_inspection_plan(
     let state_for_task = state.clone();
     let result =
         tokio::task::spawn_blocking(move || -> std::result::Result<(), aberp_qa::QcError> {
-            let conn = state_for_task.db.write()
+            let conn = state_for_task
+                .db
+                .write()
                 .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
             aberp_qa::archive_inspection_plan(&conn, state_for_task.tenant.as_str(), &plan_id)
         })
@@ -26317,7 +26436,9 @@ pub fn run_deal_saga_request(
     deal_token: String,
     refresh_ack: Option<String>,
 ) -> Result<crate::quote_deal::DealSagaOutcome> {
-    let mut conn = state.db.write()
+    let mut conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let binary_hash = state
         .binary_hash
@@ -26531,7 +26652,9 @@ pub fn run_refuse_saga_request(
     quote_id: &str,
     reason: String,
 ) -> Result<crate::quote_refuse::RefuseOutcome> {
-    let mut conn = state.db.write()
+    let mut conn = state
+        .db
+        .write()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let binary_hash = state
         .binary_hash
@@ -26940,7 +27063,9 @@ fn list_invoices(state: &AppState) -> Result<Vec<InvoiceListItem>> {
 
     // Load billing details for each invoice id.
     let mut items: Vec<InvoiceListItem> = Vec::new();
-    let mut conn = state.db.read()
+    let mut conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     // S242 / PR-236 — same `YYYY-MM-DD` format the detail-modal
     // path emits (`get_invoice_detail` uses an identical descriptor);
@@ -27269,7 +27394,9 @@ fn get_invoice_detail(state: &AppState, invoice_id: &str) -> Result<Option<Invoi
         }
     }
 
-    let mut conn = state.db.read()
+    let mut conn = state
+        .db
+        .read()
         .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
     let billing = read_invoice_row(&mut conn, invoice_id)?;
 
@@ -29080,7 +29207,10 @@ async fn handle_list_email_relay_queue(
     let db = state.db.clone();
     let rows_res = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<_>> {
         let conn = db.read().with_context(|| {
-            format!("open DuckDB at {} for relay queue list", db.db_path().display())
+            format!(
+                "open DuckDB at {} for relay queue list",
+                db.db_path().display()
+            )
         })?;
         email_relay_queue::list_rows(&conn, state_filter, limit)
     })
@@ -29133,8 +29263,12 @@ async fn handle_get_email_relay_row(
     }
     let db = state.db.clone();
     let row_res = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = db.read()
-            .with_context(|| format!("open DuckDB at {} for relay queue row", db.db_path().display()))?;
+        let conn = db.read().with_context(|| {
+            format!(
+                "open DuckDB at {} for relay queue row",
+                db.db_path().display()
+            )
+        })?;
         email_relay_queue::read_row(&conn, &id)
     })
     .await;

@@ -36,10 +36,8 @@ impl Tmp {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let p = std::env::temp_dir().join(format!(
-            "aberp-db-it-{label}-{}-{n}",
-            std::process::id()
-        ));
+        let p =
+            std::env::temp_dir().join(format!("aberp-db-it-{label}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&p).unwrap();
         Tmp(p)
     }
@@ -241,7 +239,10 @@ fn handle_durable_checkpoint_keeps_live_file_openable() {
     }
     // The shared connection was dropped+reopened around atomic_install; a
     // brand-new external open must still succeed and see the row.
-    assert!(fresh_open_ok(&db), "live file not openable after durable checkpoint");
+    assert!(
+        fresh_open_ok(&db),
+        "live file not openable after durable checkpoint"
+    );
     let conn = handle.read().unwrap();
     assert_eq!(recent_entries(&conn, u32::MAX).unwrap().len(), 1);
 }
@@ -272,14 +273,20 @@ fn daemon_write_killed_mid_checkpoint_is_recoverable() {
 
     let exe = std::env::current_exe().unwrap();
     let status = std::process::Command::new(exe)
-        .args(["--exact", "daemon_write_killed_mid_checkpoint_is_recoverable"])
+        .args([
+            "--exact",
+            "daemon_write_killed_mid_checkpoint_is_recoverable",
+        ])
         .env("ABERP_DB_CRASH_CHILD", "1")
         .env("ABERP_DB_CRASH_DB", &db)
         .env("RUST_TEST_THREADS", "1")
         .output()
         .expect("spawn crash child");
     // The child aborted, so it did not exit 0.
-    assert!(!status.status.success(), "crash child unexpectedly exited clean");
+    assert!(
+        !status.status.success(),
+        "crash child unexpectedly exited clean"
+    );
 
     // The live file must NOT be torn: a fresh open succeeds (the validated
     // atomic_install commit is all-or-nothing — a crash is on one side of the

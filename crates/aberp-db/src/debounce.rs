@@ -133,7 +133,10 @@ mod tests {
         let d = CheckpointDebouncer::new(MIN);
         let now = Instant::now();
         assert!(!d.is_dirty());
-        assert!(!d.should_checkpoint_now(now), "clean file → no post-write ckpt");
+        assert!(
+            !d.should_checkpoint_now(now),
+            "clean file → no post-write ckpt"
+        );
         assert!(!d.should_checkpoint_on_idle(), "clean file → no idle ckpt");
     }
 
@@ -152,7 +155,7 @@ mod tests {
         let t0 = Instant::now();
         d.note_write();
         d.record_checkpoint(t0); // just checkpointed at t0
-        // Another write 30s later: dirty again, but inside the window → no fire.
+                                 // Another write 30s later: dirty again, but inside the window → no fire.
         d.note_write();
         assert!(!d.should_checkpoint_now(t0 + Duration::from_secs(30)));
         // Exactly at the window boundary → fires (>=).
@@ -168,7 +171,7 @@ mod tests {
         d.note_write();
         d.record_checkpoint(t0);
         d.note_write(); // dirtied again, 0s later
-        // Post-write path is coalesced (inside window)…
+                        // Post-write path is coalesced (inside window)…
         assert!(!d.should_checkpoint_now(t0 + Duration::from_secs(5)));
         // …but the loop-idle path takes it anyway (cheapest moment, D2).
         assert!(d.should_checkpoint_on_idle());
@@ -180,7 +183,10 @@ mod tests {
         let t0 = Instant::now();
         d.note_write();
         d.record_checkpoint(t0); // clean now
-        assert!(!d.should_checkpoint_on_idle(), "nothing written since ckpt → idle no-op");
+        assert!(
+            !d.should_checkpoint_on_idle(),
+            "nothing written since ckpt → idle no-op"
+        );
     }
 
     #[test]

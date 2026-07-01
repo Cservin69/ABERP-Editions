@@ -206,7 +206,9 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
             let db = deps.db.clone();
             let now2 = time::OffsetDateTime::now_utc();
             tokio::task::spawn_blocking(move || -> Result<()> {
-                let conn = db.write().context("shared writer: mark Sent (ADR-0098 Gap 1a)")?;
+                let conn = db
+                    .write()
+                    .context("shared writer: mark Sent (ADR-0098 Gap 1a)")?;
                 mark_sent(&conn, &id, now2)
             })
             .await
@@ -235,7 +237,9 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
                 let db = deps.db.clone();
                 let detail_for_db = detail.clone();
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    let conn = db.write().context("shared writer: mark Failed (ADR-0098 Gap 1a)")?;
+                    let conn = db
+                        .write()
+                        .context("shared writer: mark Failed (ADR-0098 Gap 1a)")?;
                     mark_failed(&conn, &id, &detail_for_db)
                 })
                 .await
@@ -264,7 +268,9 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
                 let db = deps.db.clone();
                 let detail_for_db = detail.clone();
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    let conn = db.write().context("shared writer: requeue (ADR-0098 Gap 1a)")?;
+                    let conn = db
+                        .write()
+                        .context("shared writer: requeue (ADR-0098 Gap 1a)")?;
                     requeue_for_retry(&conn, &id, &detail_for_db)
                 })
                 .await
@@ -463,7 +469,9 @@ pub(crate) async fn write_relay_audit(
     let binary_hash = deps.binary_hash;
     let login = deps.operator_login.clone();
     let res = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = db.write().context("shared writer: email-relay audit (ADR-0098 Gap 1a)")?;
+        let mut conn = db
+            .write()
+            .context("shared writer: email-relay audit (ADR-0098 Gap 1a)")?;
         aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
         let bytes = payload.to_bytes();
         let tx = conn.transaction().context("begin email-relay audit tx")?;
@@ -486,7 +494,9 @@ pub(crate) fn read_row_helper(
     db: &aberp_db::HandleArc,
     id: &str,
 ) -> Result<Option<OutboundEmailRow>> {
-    let conn = db.read().context("shared read: read_row_helper (ADR-0098 Gap 1a)")?;
+    let conn = db
+        .read()
+        .context("shared read: read_row_helper (ADR-0098 Gap 1a)")?;
     read_row(&conn, id)
 }
 

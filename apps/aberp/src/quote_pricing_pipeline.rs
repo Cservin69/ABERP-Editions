@@ -672,7 +672,9 @@ impl PricingPipelineService {
         let login = self.deps.operator_login.clone();
 
         let inserted = spawn_blocking(move || -> Result<bool> {
-            let mut conn = db.write().context("shared writer: enqueue (ADR-0098 Gap 1a)")?;
+            let mut conn = db
+                .write()
+                .context("shared writer: enqueue (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
             jobs::ensure_schema(&conn).context("ensure quote_pricing_jobs schema")?;
             let now = OffsetDateTime::now_utc();
@@ -799,7 +801,9 @@ impl PricingPipelineService {
         let reason = "no CAD file on listing";
 
         let inserted = spawn_blocking(move || -> Result<bool> {
-            let conn = db.write().context("shared writer: enqueue-fail (ADR-0098 Gap 1a)")?;
+            let conn = db
+                .write()
+                .context("shared writer: enqueue-fail (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
             jobs::ensure_schema(&conn).context("ensure quote_pricing_jobs schema")?;
             let now = OffsetDateTime::now_utc();
@@ -885,7 +889,9 @@ impl PricingPipelineService {
         let body_excerpt = outcome.body_excerpt().map(|s| s.to_string());
         let retryable = outcome.retryable();
         let res = spawn_blocking(move || -> Result<()> {
-            let mut conn = db.write().context("shared writer: poll-outcome audit (ADR-0098 Gap 1a)")?;
+            let mut conn = db
+                .write()
+                .context("shared writer: poll-outcome audit (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
             let tx = conn.transaction().context("open poll-outcome tx")?;
             let meta =
@@ -927,7 +933,9 @@ impl PricingPipelineService {
         let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         spawn_blocking(move || -> Result<Option<PricingJobRow>> {
-            let conn = db.read().context("shared read: next-job (ADR-0098 Gap 1a)")?;
+            let conn = db
+                .read()
+                .context("shared read: next-job (ADR-0098 Gap 1a)")?;
             jobs::next_actionable_job(&conn, &tenant_id)
         })
         .await
@@ -964,7 +972,9 @@ impl PricingPipelineService {
         let cad_blob = self.cad_blob.clone();
 
         let outcome = spawn_blocking(move || -> Result<StepOutcome> {
-            let mut conn = db.write().context("shared writer: extract (ADR-0098 Gap 1a)")?;
+            let mut conn = db
+                .write()
+                .context("shared writer: extract (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
             // S286 hotfix: NotFound aborts this step, AlreadyInState
@@ -1136,7 +1146,9 @@ impl PricingPipelineService {
         let target_tol = self.config.default_tolerance;
 
         let outcome = spawn_blocking(move || -> Result<StepOutcome> {
-            let mut conn = db.write().context("shared writer: price (ADR-0098 Gap 1a)")?;
+            let mut conn = db
+                .write()
+                .context("shared writer: price (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
             let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
@@ -1641,7 +1653,9 @@ impl PricingPipelineService {
         let target_tol = self.config.default_tolerance;
 
         let outcome = spawn_blocking(move || -> Result<StepOutcome> {
-            let mut conn = db.write().context("shared writer: render (ADR-0098 Gap 1a)")?;
+            let mut conn = db
+                .write()
+                .context("shared writer: render (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
             let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
@@ -1817,7 +1831,9 @@ impl PricingPipelineService {
         let attempt_n = row.attempt_n;
 
         let final_outcome = spawn_blocking(move || -> Result<StepOutcome> {
-            let mut conn = db.write().context("shared writer: post-finish (ADR-0098 Gap 1a)")?;
+            let mut conn = db
+                .write()
+                .context("shared writer: post-finish (ADR-0098 Gap 1a)")?;
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
 
@@ -2229,7 +2245,10 @@ pub(crate) fn emit_daemon_panicked_audit(
     restart_count_since_boot: u32,
     last_known_quote_id: Option<String>,
 ) -> Result<()> {
-    let mut conn = deps.db.write().context("shared writer: daemon-panic audit (ADR-0098 Gap 1a)")?;
+    let mut conn = deps
+        .db
+        .write()
+        .context("shared writer: daemon-panic audit (ADR-0098 Gap 1a)")?;
     audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
     let tx = conn.transaction().context("open daemon-panic tx")?;
     let meta = LedgerMeta::new(
@@ -4211,7 +4230,9 @@ pub fn emit_python_resolved_audit(
     login: &str,
     status: &PipelinePythonStatus,
 ) -> Result<()> {
-    let mut conn = db.write().context("shared writer: python-resolved audit (ADR-0098 Gap 1a)")?;
+    let mut conn = db
+        .write()
+        .context("shared writer: python-resolved audit (ADR-0098 Gap 1a)")?;
     audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
     let tx = conn.transaction().context("open python-resolved tx")?;
     let meta = LedgerMeta::new(TenantId::new(tenant_id).context("tenant id")?, binary_hash);
@@ -4271,7 +4292,9 @@ pub fn emit_index_migrated_audit(
     binary_hash: BinaryHash,
     login: &str,
 ) -> Result<()> {
-    let mut conn = db.write().context("shared writer: index-migrated audit (ADR-0098 Gap 1a)")?;
+    let mut conn = db
+        .write()
+        .context("shared writer: index-migrated audit (ADR-0098 Gap 1a)")?;
     audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
     let tx = conn.transaction().context("open index-migrated tx")?;
     let meta = LedgerMeta::new(TenantId::new(tenant_id).context("tenant id")?, binary_hash);

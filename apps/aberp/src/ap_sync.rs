@@ -1179,11 +1179,7 @@ async fn run_bootstrap_year_once(build_inputs: &(dyn Fn() -> Result<CycleInputs>
     }
 
     // Sentinel check — already done? Skip silently.
-    match bootstrap_year_already_recorded(
-        &inputs.db,
-        inputs.tenant.clone(),
-        inputs.binary_hash,
-    ) {
+    match bootstrap_year_already_recorded(&inputs.db, inputs.tenant.clone(), inputs.binary_hash) {
         Ok(true) => {
             tracing::info!("AP bootstrap-year sweep already recorded in audit ledger; skipping");
             return;
@@ -1311,7 +1307,9 @@ fn write_cycle_audit_entry_inner(
             actor,
             Some(payload.idempotency_key.clone()),
         )
-        .map_err(|e| anyhow!("audit_ledger::append_in_tx IncomingInvoiceSyncCycleCompleted: {e}"))?;
+        .map_err(|e| {
+            anyhow!("audit_ledger::append_in_tx IncomingInvoiceSyncCycleCompleted: {e}")
+        })?;
         tx.commit()
             .context("commit DuckDB transaction (AP sync cycle audit entry)")?;
         // WriteGuard drops here -> post-commit hook runs the lockstep sync_mirror.

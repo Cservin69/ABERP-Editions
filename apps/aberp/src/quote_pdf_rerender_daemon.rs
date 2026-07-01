@@ -751,7 +751,9 @@ async fn write_audit(
     let kind_label = kind.as_str();
     let res = spawn_blocking(move || -> Result<()> {
         let bytes = serde_json::to_vec(&payload).context("serialize pdf-rerender payload")?;
-        let mut conn = db.write().context("shared writer: pdf-rerender audit (ADR-0098 Gap 1a)")?;
+        let mut conn = db
+            .write()
+            .context("shared writer: pdf-rerender audit (ADR-0098 Gap 1a)")?;
         aberp_audit_ledger::ensure_schema(&conn).context("ensure audit schema")?;
         let tx = conn.transaction().context("begin pdf-rerender audit tx")?;
         let meta = LedgerMeta::new(tenant, binary_hash);
@@ -1528,7 +1530,8 @@ mod tests {
 
         let queue = QuotePdfRerenderQueue::new();
         let recovered =
-            recover_unfinished_rerenders_from_path(&db, &TenantId::new("t1").unwrap(), &queue).unwrap();
+            recover_unfinished_rerenders_from_path(&db, &TenantId::new("t1").unwrap(), &queue)
+                .unwrap();
 
         assert_eq!(recovered, 2, "only q3 (transient) + q4 (no terminal)");
         assert!(!queue.contains("q1"), "delivered quote not replayed");
@@ -1553,7 +1556,8 @@ mod tests {
 
         let queue = QuotePdfRerenderQueue::new();
         let recovered =
-            recover_unfinished_rerenders_from_path(&db, &TenantId::new("t1").unwrap(), &queue).unwrap();
+            recover_unfinished_rerenders_from_path(&db, &TenantId::new("t1").unwrap(), &queue)
+                .unwrap();
         assert_eq!(recovered, 1);
         assert!(
             queue.contains("q5"),

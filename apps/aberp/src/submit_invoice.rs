@@ -464,16 +464,17 @@ pub async fn submit_from_inputs(
     // `SubmissionInProgress` rather than double-POST (NAV
     // INVOICE_NUMBER_NOT_UNIQUE). The guard drops at function return,
     // releasing the lock.
-    let _submission_lock = match crate::submission_lock::try_acquire(db.db_path(), tenant_str, invoice_id_str)
-        .map_err(SubmitFromInputsError::Other)?
-    {
-        Some(guard) => guard,
-        None => {
-            return Err(SubmitFromInputsError::SubmissionInProgress {
-                invoice_id: invoice_id_str.to_string(),
-            })
-        }
-    };
+    let _submission_lock =
+        match crate::submission_lock::try_acquire(db.db_path(), tenant_str, invoice_id_str)
+            .map_err(SubmitFromInputsError::Other)?
+        {
+            Some(guard) => guard,
+            None => {
+                return Err(SubmitFromInputsError::SubmissionInProgress {
+                    invoice_id: invoice_id_str.to_string(),
+                })
+            }
+        };
 
     // 3a. PR-9-0 / ADR-0022: validate on-disk XML BEFORE any NAV call.
     aberp_nav_xsd_validator::validate_invoice_data(&invoice_xml)
@@ -634,10 +635,14 @@ pub async fn submit_from_inputs(
                 .read()
                 .context("shared read: post-submission verify (Response) (ADR-0098 C2)")
                 .map_err(SubmitFromInputsError::Other)?;
-            let verified =
-                verify_chain_and_sync_reusing_conn(read_conn, tenant, binary_hash_bytes, db.db_path())
-                    .context("post-submission verify+sync (Response)")
-                    .map_err(SubmitFromInputsError::Other)?;
+            let verified = verify_chain_and_sync_reusing_conn(
+                read_conn,
+                tenant,
+                binary_hash_bytes,
+                db.db_path(),
+            )
+            .context("post-submission verify+sync (Response)")
+            .map_err(SubmitFromInputsError::Other)?;
             tracing::info!(entries_verified = verified, "audit chain verified");
             let submitted = ready_invoice.into_submitted(send_outcome.transaction_id.clone());
             Ok(SubmitInvoiceOutcome {
@@ -677,10 +682,14 @@ pub async fn submit_from_inputs(
                 .read()
                 .context("shared read: post-submission verify (AttemptFailed) (ADR-0098 C2)")
                 .map_err(SubmitFromInputsError::Other)?;
-            let verified =
-                verify_chain_and_sync_reusing_conn(read_conn, tenant, binary_hash_bytes, db.db_path())
-                    .context("post-submission verify+sync (AttemptFailed)")
-                    .map_err(SubmitFromInputsError::Other)?;
+            let verified = verify_chain_and_sync_reusing_conn(
+                read_conn,
+                tenant,
+                binary_hash_bytes,
+                db.db_path(),
+            )
+            .context("post-submission verify+sync (AttemptFailed)")
+            .map_err(SubmitFromInputsError::Other)?;
             tracing::error!(
                 invoice_id = %ready_invoice.id.to_prefixed_string(),
                 entries_verified = verified,

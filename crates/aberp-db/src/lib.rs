@@ -475,8 +475,7 @@ impl Drop for WriteGuard<'_> {
         //      source). Uses the shared connection + the once-built meta, so
         //      it sees exactly what the just-finished txn committed.
         if let Some(conn) = self.inner.conn.as_ref() {
-            if let Err(e) =
-                aberp_audit_ledger::sync_mirror(conn, &handle.meta, &handle.mirror_path)
+            if let Err(e) = aberp_audit_ledger::sync_mirror(conn, &handle.meta, &handle.mirror_path)
             {
                 tracing::warn!(
                     error = %e,
