@@ -534,11 +534,26 @@ async fn issue_route_rejects_malformed_supplier_tax_with_loud_error() {
     );
 
     // The audit ledger must NOT have a fresh draft — the gate fires
-    // BEFORE `pre_tx_setup`. A regression that opened the DB before
-    // the gate would surface here as a present-but-empty DB file.
+    // BEFORE `pre_tx_setup`. ADR-0098 C2: the shared Handle eagerly opens +
+    // schema-ensures aberp.duckdb at boot (`open_tenant_handle`), so mere file
+    // existence is no longer the signal. The real invariant is unchanged — no
+    // invoice draft/sequence entry may be written before the gate fires — so
+    // assert the audit ledger carries neither issuance kind.
+    let ledger = Ledger::open(
+        dir.join("aberp.duckdb"),
+        TenantId::new(TEST_TENANT.to_string()).unwrap(),
+        BinaryHash::from_bytes([0u8; 32]),
+    )
+    .expect("open ledger");
+    let kinds: Vec<EventKind> = ledger
+        .entries()
+        .expect("read entries")
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
     assert!(
-        !dir.join("aberp.duckdb").exists(),
-        "pre-issuance gate must fail before any DB write; aberp.duckdb leaked at {}",
-        dir.join("aberp.duckdb").display()
+        !kinds.contains(&EventKind::InvoiceDraftCreated)
+            && !kinds.contains(&EventKind::InvoiceSequenceReserved),
+        "pre-issuance gate must fire before any invoice write; leaked issuance entries: {kinds:?}"
     );
 }

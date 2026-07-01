@@ -272,6 +272,16 @@ impl Handle {
             // COMMITTED writes (so the post-commit `verify_chain` reads on the
             // migrated paths see the just-committed append). Writes still flow
             // through `write()` with full coherence.
+            // ADR-0098 C2 round-13 — read-after-write COHERENCE: a separate
+            // read-only DuckDB instance observes only state durably CHECKPOINTED
+            // into the live file; it does NOT replay the live writer's WAL for
+            // updates, so a mutation committed since the last (debounced ≤ 1/min)
+            // durable checkpoint is INVISIBLE to it (the avl `revoke→list` stale
+            // read). Publish any pending committed writes via the sanctioned
+            // build-aside durable checkpoint BEFORE the read-only open, so it sees
+            // the latest committed state. Cheap when clean; F5 is intact (the
+            // read-only open still rejects a mis-routed write).
+            self.publish_committed_for_readonly()?;
             return open_runtime_connection_readonly(&self.db_path);
         }
         let mut inner = self.inner.lock().map_err(|_| DbError::Poisoned)?;
@@ -282,6 +292,52 @@ impl Handle {
             .expect("ensure_open guarantees Some")
             .try_clone()?;
         Ok(clone)
+    }
+
+    /// ADR-0098 C2 round-13 — ensure committed writes are durably present in
+    /// the live file so a SEPARATE read-only open (`read_returns_readonly` / F5)
+    /// observes them. A read-only DuckDB instance reads only the checkpointed
+    /// live file and does not replay the live writer's WAL for updates, so a
+    /// mutation committed to the WAL since the last (debounced ≤ 1/min) durable
+    /// checkpoint would be invisible to it — the avl `revoke→list` stale read.
+    /// Runs the sanctioned build-aside durable checkpoint (crash-safe
+    /// `atomic_install`, never an in-place fold) iff the file is dirty since the
+    /// last one; a clean file is a free no-op. Reuses the ADR-0095 primitive —
+    /// no new durability primitive, and F5 stays intact.
+    fn publish_committed_for_readonly(&self) -> Result<(), DbError> {
+        let mut inner = self.inner.lock().map_err(|_| DbError::Poisoned)?;
+        if !(self.config.checkpoint_enabled && inner.debouncer.is_dirty()) {
+            return Ok(());
+        }
+        // FORCE the build-aside durable checkpoint. `run_durable_checkpoint_locked`
+        // routes through `live_durable_checkpoint`, whose `checkpoint_is_current`
+        // fast-path SHAs the live *.duckdb and would NO-OP here: a WAL-only commit
+        // can leave the main-file bytes unchanged, so the verified-good marker still
+        // matches even though the WAL holds uncheckpointed UPDATEs a separate
+        // read-only open cannot observe. Call `durable_checkpoint` directly so the
+        // logical EXPORT (a fresh read-write open that DOES replay the WAL) always
+        // captures the latest committed rows into the freshly installed live file,
+        // and the verified-good marker is refreshed. Quiesce the shared connection
+        // first so the EXPORT/atomic_install is the sole opener (identical discipline
+        // to run_durable_checkpoint_locked), then reopen on the new inode.
+        inner.conn = None;
+        match aberp_snapshot::durable_checkpoint(&self.db_path, &self.tenant) {
+            Ok(_) => inner.debouncer.record_checkpoint(Instant::now()),
+            Err(e) => tracing::error!(
+                error = %e,
+                db = %self.db_path.display(),
+                "aberp-db: read-coherence publish checkpoint FAILED; read() may see a stale row"
+            ),
+        }
+        match open_runtime_connection(&self.db_path, &self.config) {
+            Ok(c) => inner.conn = Some(c),
+            Err(e) => tracing::error!(
+                error = %e,
+                db = %self.db_path.display(),
+                "aberp-db: failed to reopen shared connection after read-coherence publish"
+            ),
+        }
+        Ok(())
     }
 
     /// Loop-idle hook (ADR-0098 D2 "+ one at loop-idle"). A daemon calls this

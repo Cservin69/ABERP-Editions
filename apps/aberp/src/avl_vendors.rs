@@ -591,6 +591,38 @@ pub fn append_vendor_event(
     Ok(())
 }
 
+/// ADR-0098 C2 round-13 — route the AVL audit append through the ONE shared
+/// `aberp_db::Handle` (single instance) instead of a separate `Ledger::open`.
+/// A separate opener is a 2nd DuckDB instance that checkpoint-races the Handle's
+/// WAL on drop and can drop a row just committed THROUGH the Handle from a
+/// following `read()` (the `avl_paths_emit` create -> po_check loss). On the
+/// shared instance the append is coherent, the writer mutex serialises it
+/// (subsuming AUDIT_APPEND_LOCK for handle-routed writes), and the WriteGuard's
+/// post-commit hook syncs the mirror. The runtime request wrappers use this; the
+/// boot overdue scan keeps the path-based `append_vendor_event` (it holds no
+/// Handle).
+pub fn append_vendor_event_via_handle(
+    db: &aberp_db::HandleArc,
+    tenant: TenantId,
+    binary_hash: BinaryHash,
+    operator_login: &str,
+    kind: EventKind,
+    payload: Vec<u8>,
+) -> Result<()> {
+    let mut guard = db
+        .write()
+        .context("open shared Handle writer for AVL audit")?;
+    let conn = guard.conn();
+    aberp_audit_ledger::ensure_schema(conn).context("ensure audit-ledger schema")?;
+    let meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    let tx = conn.transaction().context("open AVL audit tx")?;
+    aberp_audit_ledger::append_in_tx(&tx, &meta, kind, payload, actor, None)
+        .context("append AVL vendor audit entry")?;
+    tx.commit().context("commit AVL audit tx")?;
+    Ok(())
+}
+
 /// Boot-time re-screening reminder: scan every non-revoked vendor whose
 /// `approved_until_utc` has lapsed and fire `supplier.avl_screening_overdue`
 /// once per such vendor. Returns the count fired. Non-fatal at the call site —

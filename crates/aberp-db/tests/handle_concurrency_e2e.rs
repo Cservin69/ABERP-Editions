@@ -21,8 +21,8 @@ use std::thread;
 use std::time::Duration;
 
 use aberp_audit_ledger::{
-    append_in_tx, ensure_schema, mirror_path_for, read_mirror_entries, recent_entries, Actor,
-    BinaryHash, EventKind, LedgerMeta, TenantId,
+    append_in_tx, append_reopen, ensure_schema, mirror_path_for, read_mirror_entries,
+    recent_entries, Actor, BinaryHash, EventKind, LedgerMeta, TenantId,
 };
 use aberp_db::{Handle, HandleConfig};
 use duckdb::Connection;
@@ -512,4 +512,90 @@ fn c2_read_after_write_sees_commit_under_default_checkpoint_config() {
              production checkpoint config — read-after-write visibility broken"
         );
     }
+}
+
+/// Read a `status` column back through the Handle's `read()` (F5 read-only) path.
+fn read_probe_status(handle: &Handle, id: &str) -> Option<String> {
+    let conn = handle.read().unwrap();
+    let mut stmt = conn
+        .prepare("SELECT status FROM avl_probe WHERE id = ?")
+        .unwrap();
+    let mut rows = stmt.query_map([id], |r| r.get::<_, String>(0)).unwrap();
+    rows.next().map(|r| r.unwrap())
+}
+
+/// ADR-0098 C2 round-13 — **read-after-write coherence for an UPDATE**, in the
+/// avl `create → edit → revoke → read` shape. The append-only sibling
+/// ([`c2_read_after_write_sees_commit_under_default_checkpoint_config`]) only
+/// INSERTs; avl `set_vendor_status` UPDATEs a column of an existing row and then
+/// reads the value back through `read()`. With the first durable checkpoint
+/// already consumed (mirroring the boot `ensure_all_tenant_schemas`), those
+/// UPDATEs are post-checkpoint, WAL-only writes; a SEPARATE read-only open
+/// (`read_returns_readonly`) does not replay them, so `read()` observed the
+/// pre-UPDATE row (the `avl_vendors_route` `revoke→list` failures). The residual
+/// `append_reopen` audit opener after each mutation is avl's exact shape. Pins
+/// the fix: `read()` publishes pending committed writes via the durable
+/// checkpoint before the read-only open.
+#[test]
+fn c2_read_after_write_sees_update_in_avl_shape() {
+    let tmp = Tmp::new("raw-avl-update");
+    let db = tmp.db();
+    seed(&db);
+    let handle = Handle::open_default(&db, tenant()).unwrap();
+    let meta = LedgerMeta::new(tenant(), BinaryHash::from_bytes([9u8; 32]));
+    let audit = |tag: &str| {
+        append_reopen(
+            &db,
+            &meta,
+            EventKind::DbAutoRecovered,
+            format!("{{\"probe\":\"{tag}\"}}").into_bytes(),
+            Actor::from_local_cli(format!("ulid-{tag}"), "tester"),
+            None,
+        )
+        .unwrap();
+    };
+
+    // Consume the immediate first-write durable checkpoint (as the boot
+    // schema-ensure does), so the row mutations below are WAL-only writes.
+    {
+        let g = handle.write().unwrap();
+        g.execute_batch("CREATE TABLE avl_probe (id TEXT PRIMARY KEY, status TEXT);")
+            .unwrap();
+    }
+    // create (INSERT) + residual audit append (avl's Ledger::open-per-mutation).
+    {
+        let g = handle.write().unwrap();
+        g.execute("INSERT INTO avl_probe VALUES ('v1', 'pending')", [])
+            .unwrap();
+    }
+    audit("create");
+    assert_eq!(
+        read_probe_status(&handle, "v1").as_deref(),
+        Some("pending"),
+        "read() must observe the committed INSERT"
+    );
+
+    // edit (UPDATE, no audit) then revoke (UPDATE) + residual audit append.
+    {
+        let g = handle.write().unwrap();
+        g.execute(
+            "UPDATE avl_probe SET status = 'conditional' WHERE id = 'v1'",
+            [],
+        )
+        .unwrap();
+    }
+    {
+        let g = handle.write().unwrap();
+        g.execute(
+            "UPDATE avl_probe SET status = 'revoked' WHERE id = 'v1'",
+            [],
+        )
+        .unwrap();
+    }
+    audit("revoke");
+    assert_eq!(
+        read_probe_status(&handle, "v1").as_deref(),
+        Some("revoked"),
+        "read() must observe the committed UPDATE (avl revoke→list coherence; ADR-0098 C2 round-13)"
+    );
 }

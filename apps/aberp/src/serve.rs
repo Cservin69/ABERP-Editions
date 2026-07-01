@@ -11742,8 +11742,8 @@ pub fn create_avl_vendor_request(
         approval_categories: vendor.approval_categories.clone(),
         reviewer_login: operator_login.to_string(),
     };
-    crate::avl_vendors::append_vendor_event(
-        &state.db_path,
+    crate::avl_vendors::append_vendor_event_via_handle(
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -11912,8 +11912,8 @@ pub fn set_avl_vendor_status_request(
             revoked_reason: change.vendor.revoked_reason.clone().unwrap_or_default(),
             reviewer_login: operator_login.to_string(),
         };
-        crate::avl_vendors::append_vendor_event(
-            &state.db_path,
+        crate::avl_vendors::append_vendor_event_via_handle(
+            &state.db,
             state.tenant.clone(),
             binary_hash,
             operator_login,
@@ -11928,8 +11928,8 @@ pub fn set_avl_vendor_status_request(
             new_status: new_status.as_str().to_string(),
             reviewer_login: operator_login.to_string(),
         };
-        crate::avl_vendors::append_vendor_event(
-            &state.db_path,
+        crate::avl_vendors::append_vendor_event_via_handle(
+            &state.db,
             state.tenant.clone(),
             binary_hash,
             operator_login,
@@ -12042,8 +12042,8 @@ pub fn screen_avl_vendor_request(
         reviewer_login: operator_login.to_string(),
         decision_time_utc: now,
     };
-    crate::avl_vendors::append_vendor_event(
-        &state.db_path,
+    crate::avl_vendors::append_vendor_event_via_handle(
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -12124,8 +12124,8 @@ pub fn avl_po_check_request(
                 vendor_status: status.as_str().to_string(),
                 attempted_at_utc: now,
             };
-            crate::avl_vendors::append_vendor_event(
-                &state.db_path,
+            crate::avl_vendors::append_vendor_event_via_handle(
+                &state.db,
                 state.tenant.clone(),
                 binary_hash,
                 operator_login,

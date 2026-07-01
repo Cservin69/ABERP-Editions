@@ -183,12 +183,24 @@ fn build_service(addr: &SocketAddr, token: &str, db_path: &Path) -> QuoteIntakeS
         poll_interval: std::time::Duration::from_secs(60),
         enabled: true,
     };
+    let db =
+        aberp_db::Handle::open_default(db_path, TenantId::new("t1".to_string()).expect("tenant"))
+            .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)");
+    // ADR-0098 C2 round-13 — replicate serve-boot's eager schema-ensure
+    // (`ensure_all_tenant_schemas`, which calls `log_table::ensure_schema`). The
+    // daemon's first DB op is an `already_intook` READ on a read-only conn whose
+    // `ensure_schema` no-ops, so a writer must create `quote_intake_log` up front.
+    // Production does this at boot; this crate-level test builds the Handle
+    // directly, so it must ensure the schema itself.
+    {
+        let conn = db
+            .write()
+            .expect("write guard for quote_intake_log schema-ensure");
+        aberp_quote_intake::log_table::ensure_schema(&conn)
+            .expect("ensure quote_intake_log schema");
+    }
     let deps = QuoteIntakeDeps {
-        db: aberp_db::Handle::open_default(
-            db_path,
-            TenantId::new("t1".to_string()).expect("tenant"),
-        )
-        .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
+        db,
         db_path: db_path.to_path_buf(),
         tenant: TenantId::new("t1".to_string()).expect("tenant"),
         binary_hash: BinaryHash::from_bytes([0u8; 32]),
