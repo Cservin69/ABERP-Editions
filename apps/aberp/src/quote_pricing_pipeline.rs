@@ -5044,6 +5044,8 @@ mod tests {
         // Best-effort: clean up a prior leftover from a flaky run.
         let _ = std::fs::remove_file(&db_path);
         let deps = PricingPipelineDeps {
+            db: aberp_db::Handle::open_default(&db_path, TenantId::new("T").expect("tid"))
+                .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
             db_path: db_path.clone(),
             tenant: TenantId::new("T").expect("tid"),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
@@ -5698,6 +5700,11 @@ mod tests {
                 default_tolerance: ToleranceRange::Standard,
             },
             deps: PricingPipelineDeps {
+                db: aberp_db::Handle::open_default(
+                    &std::env::temp_dir().join("aberp-s347-unused.duckdb"),
+                    TenantId::new("T").expect("tid"),
+                )
+                .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
                 db_path: std::env::temp_dir().join("aberp-s347-unused.duckdb"),
                 tenant: TenantId::new("T").expect("tid"),
                 binary_hash: BinaryHash::from_bytes([0u8; 32]),
@@ -6181,6 +6188,8 @@ mod tests {
                 default_tolerance: ToleranceRange::Standard,
             },
             deps: PricingPipelineDeps {
+                db: aberp_db::Handle::open_default(&db_path, TenantId::new("T").expect("tid"))
+                    .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
                 db_path,
                 tenant: TenantId::new("T").expect("tid"),
                 binary_hash: BinaryHash::from_bytes([0u8; 32]),
@@ -6307,6 +6316,8 @@ mod tests {
                 default_tolerance: ToleranceRange::Standard,
             },
             deps: PricingPipelineDeps {
+                db: aberp_db::Handle::open_default(&db_path, TenantId::new("T").expect("tid"))
+                    .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
                 db_path,
                 tenant: TenantId::new("T").expect("tid"),
                 binary_hash: BinaryHash::from_bytes([0u8; 32]),
@@ -6483,6 +6494,8 @@ mod tests {
                 default_tolerance: ToleranceRange::Standard,
             },
             deps: PricingPipelineDeps {
+                db: aberp_db::Handle::open_default(&db_path, TenantId::new("T").expect("tid"))
+                    .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
                 db_path,
                 tenant: TenantId::new("T").expect("tid"),
                 binary_hash: BinaryHash::from_bytes([0u8; 32]),

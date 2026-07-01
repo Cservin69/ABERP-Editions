@@ -24882,7 +24882,7 @@ fn mark_parts_request(
         })?;
         crate::part_marking::ensure_schema(&conn).map_err(WorkOrderRouteError::Other)?;
 
-        let Some(wo) = aberp_work_orders::read_work_order(&conn, state.tenant.as_str(), wo_id)
+        let Some(wo) = aberp_work_orders::read_work_order(&*conn, state.tenant.as_str(), wo_id)
             .map_err(map_wo_err)?
         else {
             return Err(WorkOrderRouteError::NotFound);
