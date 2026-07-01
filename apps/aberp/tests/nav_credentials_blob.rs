@@ -267,7 +267,7 @@ fn rotation_preserves_other_three_fields() {
     let binary_hash = aberp_audit_ledger::BinaryHash::from_bytes([0u8; 32]);
     let blob_db_path = std::env::temp_dir().join(format!("aberp-blob-{}.duckdb", Ulid::new()));
     let state = aberp::serve::AppState {
-        db: aberp_db::Handle::open_default(&blob_db_path, tenant_id.clone())
+        db: aberp::serve::open_tenant_handle(&blob_db_path, tenant_id.clone())
             .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
         db_path: Arc::new(blob_db_path),
         tenant: tenant_id,

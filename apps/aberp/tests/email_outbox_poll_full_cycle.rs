@@ -129,7 +129,7 @@ async fn s307_email_outbox_full_cycle_two_entries_succeed() {
     let handle = EmailOutboxDaemonHandle::dormant();
     let capture = Arc::new(CaptureSender::default());
     let deps = EmailOutboxPollDaemonDeps {
-        db: aberp_db::Handle::open_default(&db_path, TenantId::new("test").expect("tenant id"))
+        db: aberp::serve::open_tenant_handle(&db_path, TenantId::new("test").expect("tenant id"))
             .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
         db_path: db_path.clone(),
         tenant: TenantId::new("test").expect("tenant id"),

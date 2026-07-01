@@ -1829,8 +1829,8 @@ pub fn run(args: &ServeArgs) -> Result<()> {
     // after boot provisioning/recovery has left the live file known-good. All
     // daemons + (Session C) request handlers route through this; the binary
     // hash is NOT needed (the handle's mirror lockstep reads only tenant_id).
-    let db_handle = aberp_db::Handle::open_default(&args.db, tenant.clone())
-        .context("open the shared DuckDB handle (ADR-0098 Gap 1a single instance)")?;
+    let db_handle = open_tenant_handle(&args.db, tenant.clone())
+        .context("open shared DuckDB handle + eager tenant schemas (ADR-0098 Gap 1a / C2)")?;
     let state = AppState {
         db_path: Arc::new(args.db.clone()),
         db: db_handle,
@@ -3832,6 +3832,63 @@ fn derive_initial_boot_state_with_seller_check(
 /// Every existing route checks the state via [`require_ready`] and
 /// either pulls `operator_login` OR returns 503 needs-setup.
 #[derive(Clone)]
+/// ADR-0098 C2 fix-forward — eagerly ensure EVERY tenant table exists.
+///
+/// Under `read_returns_readonly=true` the read()-side connections are
+/// read-only, and the tolerant `ensure_schema` (correctly) no-ops its DDL on
+/// them. So any table that used to be created lazily on first *read* access
+/// would now be missing. This creates them all up front on a read-write
+/// connection (boot + test fixtures), making the "schema exists by boot time"
+/// invariant true. Idempotent (`CREATE TABLE IF NOT EXISTS`).
+pub fn ensure_all_tenant_schemas(conn: &mut Connection, tenant: &str) -> anyhow::Result<()> {
+    aberp_audit_ledger::ensure_schema(conn).map_err(|e| anyhow!("audit-ledger schema: {e}"))?;
+    crate::products::ensure_schema(conn)?;
+    crate::partners::ensure_schema(conn)?;
+    crate::avl_vendors::ensure_schema(conn)?;
+    crate::margin_profiles::ensure_schema(conn)?;
+    crate::material_inventory::ensure_schema(conn)?;
+    crate::part_marking::ensure_schema(conn)?;
+    crate::purchasing::ensure_schema(conn)?;
+    crate::quality::ensure_schema(conn)?;
+    crate::quote_calibration::ensure_schema(conn)?;
+    crate::quote_pricing_jobs::ensure_schema(conn)?;
+    crate::quoting_gear_processes::ensure_schema(conn)?;
+    crate::quoting_machine_rates::ensure_schema(conn)?;
+    crate::quoting_machines::ensure_schema(conn)?;
+    crate::quoting_materials::ensure_schema(conn)?;
+    crate::quoting_tolerance_cost_rates::ensure_schema(conn)?;
+    crate::quoting_tunables::ensure_schema(conn, tenant)?;
+    crate::email_relay_queue::ensure_schema(conn)?;
+    crate::incoming_invoices::ensure_schema(conn)?;
+    crate::invoice_draft::ensure_schema(conn)?;
+    crate::restore_from_nav_outgoing::ensure_schema(conn)?;
+    aberp_inventory::ensure_schema(conn)?;
+    aberp_qa::ensure_schema(conn)?;
+    aberp_dispatch::ensure_schema(conn)?;
+    aberp_work_orders::ensure_schema(conn)?;
+    aberp_quote_intake::log_table::ensure_schema(conn)
+        .map_err(|e| anyhow!("quote-intake log schema: {e}"))?;
+    Ok(())
+}
+
+/// Open the process-wide shared DuckDB [`aberp_db::Handle`] and eagerly ensure
+/// all tenant schemas exist (so read()-side access finds every table). Used at
+/// boot and by test fixtures (which bypass the boot schema-ensure path).
+pub fn open_tenant_handle(
+    db_path: &std::path::Path,
+    tenant: TenantId,
+) -> anyhow::Result<aberp_db::HandleArc> {
+    let handle = aberp_db::Handle::open_default(db_path, tenant.clone())
+        .context("open shared DuckDB handle (ADR-0098 Gap 1a)")?;
+    {
+        let mut guard = handle
+            .write()
+            .context("write guard for eager schema-ensure")?;
+        ensure_all_tenant_schemas(&mut guard, tenant.as_str())?;
+    }
+    Ok(handle)
+}
+
 pub struct AppState {
     pub db_path: Arc<PathBuf>,
     /// ADR-0098 Session B (Gap 1a) — the ONE shared DuckDB handle the whole

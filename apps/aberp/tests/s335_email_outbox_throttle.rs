@@ -182,7 +182,7 @@ fn make_deps(db_path: &PathBuf, addr: SocketAddr, bearer: &str) -> EmailOutboxPo
     let credential = StorefrontCredentialHandle::dormant();
     credential.set(format!("http://{addr}"), Zeroizing::new(bearer.to_string()));
     EmailOutboxPollDaemonDeps {
-        db: aberp_db::Handle::open_default(db_path, TenantId::new("test").expect("tenant id"))
+        db: aberp::serve::open_tenant_handle(db_path, TenantId::new("test").expect("tenant id"))
             .expect("open shared test DuckDB handle (ADR-0098 Gap 1a)"),
         db_path: db_path.clone(),
         tenant: TenantId::new("test").expect("tenant id"),
