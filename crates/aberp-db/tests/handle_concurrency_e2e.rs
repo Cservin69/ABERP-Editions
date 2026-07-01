@@ -482,3 +482,34 @@ fn c2_readonly_detection_distinguishes_ro_from_rw() {
         "read() read-only connection NOT detected as read-only (access_mode={am})"
     );
 }
+
+/// ADR-0098 C2 — **read-after-write under the PRODUCTION checkpoint config.**
+/// Assertion #1 proved read() sees committed writes with `checkpoint_enabled =
+/// false`. This exercises the DEFAULT (production) posture where the debounced
+/// durable checkpoint (quiesce → EXPORT → atomic_install → reopen) is LIVE, and
+/// asserts a read() taken AFTER a committed write() still observes it. If this
+/// fails, the read()-side residual is NOT safe under production config — the
+/// checkpoint's atomic_install swaps the inode out from under the separate
+/// read-only open. (Surfaced by the avl_vendors_route revoke→list failures.)
+#[test]
+fn c2_read_after_write_sees_commit_under_default_checkpoint_config() {
+    let tmp = Tmp::new("raw-ckpt");
+    let db = tmp.db();
+    seed(&db);
+    // DEFAULT config: checkpoint_enabled = true, read_returns_readonly = true.
+    let handle = Handle::open_default(&db, tenant()).unwrap();
+
+    for i in 1..=3usize {
+        {
+            let mut g = handle.write().unwrap();
+            append_one(&mut g, &format!("raw-{i}"));
+        }
+        let ro = handle.read().unwrap();
+        let seen = recent_entries(&ro, u32::MAX).unwrap().len();
+        assert_eq!(
+            seen, i,
+            "read() after {i} committed write(s) saw {seen} rows under the \
+             production checkpoint config — read-after-write visibility broken"
+        );
+    }
+}
