@@ -270,7 +270,10 @@ fn material_edit_wrong_tenant_is_not_found() {
         // ADR-0098 Option 1: seed TEST_TENANT's catalogue through the shared Handle
         // so amend's Handle-side grade validation sees it (a separate opener is
         // invisible to the live Handle instance -> NotInCatalogue{available_count:0}).
-        let mut conn = state.db.write().expect("seed own catalogue via shared handle");
+        let mut conn = state
+            .db
+            .write()
+            .expect("seed own catalogue via shared handle");
         quoting_materials::seed_if_empty(&mut conn, TEST_TENANT).expect("seed own catalogue");
     }
     // Plant the row under a DIFFERENT tenant; the state's tenant is
