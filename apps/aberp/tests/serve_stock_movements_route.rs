@@ -99,12 +99,17 @@ fn nav_pieces(name: &str) -> ProductInputs {
 
 fn create_with_min_stock(state: &AppState, name: &str, min_stock: &str) -> String {
     let p = serve::create_product_request(state, &nav_pieces(name)).expect("create product");
-    let conn = duckdb::Connection::open(&*state.db_path).unwrap();
-    conn.execute(
-        "UPDATE products SET min_stock = ? WHERE id = ? AND tenant_id = ?;",
-        duckdb::params![min_stock, &p.id, TEST_TENANT],
-    )
-    .unwrap();
+    // ADR-0098 Option 1: set min_stock through the shared Handle so low_stock_view
+    // (also on the Handle) observes it (a separate Connection::open would update
+    // only the file, invisible to the live Handle instance).
+    {
+        let conn = state.db.write().expect("min_stock via shared handle");
+        conn.execute(
+            "UPDATE products SET min_stock = ? WHERE id = ? AND tenant_id = ?;",
+            duckdb::params![min_stock, &p.id, TEST_TENANT],
+        )
+        .unwrap();
+    }
     p.id
 }
 

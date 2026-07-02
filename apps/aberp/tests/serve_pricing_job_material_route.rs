@@ -87,8 +87,10 @@ fn fixed_ts() -> time::OffsetDateTime {
 /// Seed the catalogue + insert a Failed pricing-job row carrying the
 /// (unknown) grade the customer submitted. `tenant` lets a test plant a
 /// row under a FOREIGN tenant for the isolation case.
-fn seed_failed_row(db_path: &PathBuf, tenant: &str, quote_id: &str) {
-    let mut conn = duckdb::Connection::open(db_path).expect("open db");
+fn seed_failed_row(state: &AppState, tenant: &str, quote_id: &str) {
+    // ADR-0098 Option 1: seed through the shared Handle so the Handle-routed
+    // amend request sees the job (a separate Connection::open is invisible to it).
+    let mut conn = state.db.write().expect("seed via shared handle");
     quoting_materials::seed_if_empty(&mut conn, tenant).expect("seed catalogue");
     quote_pricing_jobs::insert_fetched_job(
         &conn,
@@ -116,20 +118,23 @@ fn seed_failed_row(db_path: &PathBuf, tenant: &str, quote_id: &str) {
     .expect("fail it");
 }
 
-fn read_row(db_path: &PathBuf, tenant: &str, quote_id: &str) -> quote_pricing_jobs::JobDetail {
-    let conn = duckdb::Connection::open(db_path).expect("open db");
+fn read_row(state: &AppState, tenant: &str, quote_id: &str) -> quote_pricing_jobs::JobDetail {
+    let conn = state.db.read().expect("read via shared handle");
     quote_pricing_jobs::get_job_detail(&conn, quote_id, tenant)
         .expect("query")
         .expect("row present")
 }
 
-fn material_edit_entries(db_path: &PathBuf) -> Vec<aberp_audit_ledger::Entry> {
-    let ledger = Ledger::open(
-        db_path,
+fn material_edit_entries(state: &AppState) -> Vec<aberp_audit_ledger::Entry> {
+    // ADR-0098 Option 1: amend writes its audit row INSIDE the Handle's write
+    // transaction, so read it through the SAME shared instance (a separate
+    // Ledger::open would read only the checkpointed file and miss the WAL).
+    let conn = state.db.read().expect("read via shared handle");
+    let ledger = Ledger::from_connection(
+        conn,
         TenantId::new(TEST_TENANT.to_string()).unwrap(),
         BinaryHash::from_bytes([0u8; 32]),
-    )
-    .expect("open ledger");
+    );
     ledger
         .entries()
         .expect("read entries")
@@ -143,7 +148,7 @@ fn material_edit_happy_path_resets_state_and_writes_audit() {
     let dir = test_dir("happy");
     let db = dir.join("aberp.duckdb");
     let state = build_state(db.clone());
-    seed_failed_row(&db, TEST_TENANT, "q-happy-0000-0000-000000000000");
+    seed_failed_row(&state, TEST_TENANT, "q-happy-0000-0000-000000000000");
 
     let out = serve::amend_pricing_job_material_request(
         &state,
@@ -158,7 +163,7 @@ fn material_edit_happy_path_resets_state_and_writes_audit() {
     assert_eq!(out.new_attempt_n, 1);
 
     // Row reset to Fetched (re-enters pricing) + grade rewritten.
-    let row = read_row(&db, TEST_TENANT, "q-happy-0000-0000-000000000000");
+    let row = read_row(&state, TEST_TENANT, "q-happy-0000-0000-000000000000");
     assert_eq!(row.row.state, JobState::Fetched);
     assert_eq!(row.row.material_grade, VALID_GRADE);
     assert_eq!(row.row.attempt_n, 1);
@@ -166,7 +171,7 @@ fn material_edit_happy_path_resets_state_and_writes_audit() {
 
     // Exactly one audit row landed.
     assert_eq!(
-        material_edit_entries(&db).len(),
+        material_edit_entries(&state).len(),
         1,
         "one quote.material_grade_edited row"
     );
@@ -177,7 +182,7 @@ fn material_edit_grade_not_in_catalogue_400_no_change_no_audit() {
     let dir = test_dir("not-in-cat");
     let db = dir.join("aberp.duckdb");
     let state = build_state(db.clone());
-    seed_failed_row(&db, TEST_TENANT, "q-badcat-000-0000-000000000000");
+    seed_failed_row(&state, TEST_TENANT, "q-badcat-000-0000-000000000000");
 
     let err = serve::amend_pricing_job_material_request(
         &state,
@@ -194,12 +199,12 @@ fn material_edit_grade_not_in_catalogue_400_no_change_no_audit() {
     }
 
     // Row untouched — still Failed with the original grade.
-    let row = read_row(&db, TEST_TENANT, "q-badcat-000-0000-000000000000");
+    let row = read_row(&state, TEST_TENANT, "q-badcat-000-0000-000000000000");
     assert_eq!(row.row.state, JobState::Failed);
     assert_eq!(row.row.material_grade, "unknown");
     // No audit row.
     assert!(
-        material_edit_entries(&db).is_empty(),
+        material_edit_entries(&state).is_empty(),
         "a refused edit writes no audit row"
     );
 }
@@ -210,10 +215,10 @@ fn material_edit_terminal_row_409_no_change() {
     let db = dir.join("aberp.duckdb");
     let state = build_state(db.clone());
     let qid = "q-posted-000-0000-000000000000";
-    seed_failed_row(&db, TEST_TENANT, qid);
+    seed_failed_row(&state, TEST_TENANT, qid);
     // Drive the row to Posted (terminal — not editable).
     {
-        let mut conn = duckdb::Connection::open(&db).expect("open db");
+        let mut conn = state.db.write().expect("terminal setup via shared handle");
         // From Failed → operator retry resets to Fetched, then advance.
         quote_pricing_jobs::retry_job(&mut conn, qid, TEST_TENANT, fixed_ts()).expect("retry");
         quote_pricing_jobs::set_state(&conn, qid, TEST_TENANT, JobState::Extracting, fixed_ts())
@@ -248,9 +253,9 @@ fn material_edit_terminal_row_409_no_change() {
         MaterialEditRequestError::NotEditable { state: s } => assert_eq!(s, "posted"),
         other => panic!("expected NotEditable, got {other:?}"),
     }
-    let row = read_row(&db, TEST_TENANT, qid);
+    let row = read_row(&state, TEST_TENANT, qid);
     assert_eq!(row.row.state, JobState::Posted);
-    assert!(material_edit_entries(&db).is_empty());
+    assert!(material_edit_entries(&state).is_empty());
 }
 
 #[test]
@@ -262,12 +267,15 @@ fn material_edit_wrong_tenant_is_not_found() {
     // grade is valid — this isolates the tenant check from the catalogue
     // check.
     {
-        let mut conn = duckdb::Connection::open(&db).expect("open db");
+        // ADR-0098 Option 1: seed TEST_TENANT's catalogue through the shared Handle
+        // so amend's Handle-side grade validation sees it (a separate opener is
+        // invisible to the live Handle instance -> NotInCatalogue{available_count:0}).
+        let mut conn = state.db.write().expect("seed own catalogue via shared handle");
         quoting_materials::seed_if_empty(&mut conn, TEST_TENANT).expect("seed own catalogue");
     }
     // Plant the row under a DIFFERENT tenant; the state's tenant is
     // TEST_TENANT, so the request can't see it → NotFound (404).
-    seed_failed_row(&db, "some-other-tenant", "q-other-000-0000-000000000000");
+    seed_failed_row(&state, "some-other-tenant", "q-other-000-0000-000000000000");
 
     let err = serve::amend_pricing_job_material_request(
         &state,
@@ -278,7 +286,7 @@ fn material_edit_wrong_tenant_is_not_found() {
     .expect_err("a foreign-tenant row is invisible");
     assert!(matches!(err, MaterialEditRequestError::NotFound));
     // The foreign row is untouched.
-    let row = read_row(&db, "some-other-tenant", "q-other-000-0000-000000000000");
+    let row = read_row(&state, "some-other-tenant", "q-other-000-0000-000000000000");
     assert_eq!(row.row.material_grade, "unknown");
     assert_eq!(row.row.state, JobState::Failed);
 }
@@ -289,12 +297,12 @@ fn material_edit_audit_payload_round_trips() {
     let db = dir.join("aberp.duckdb");
     let state = build_state(db.clone());
     let qid = "q-audit-000-0000-0000-000000000000";
-    seed_failed_row(&db, TEST_TENANT, qid);
+    seed_failed_row(&state, TEST_TENANT, qid);
 
     serve::amend_pricing_job_material_request(&state, qid, VALID_GRADE, "operator-bob")
         .expect("edit");
 
-    let entries = material_edit_entries(&db);
+    let entries = material_edit_entries(&state);
     assert_eq!(entries.len(), 1);
     let payload: serde_json::Value =
         serde_json::from_slice(&entries[0].payload).expect("decode payload");
