@@ -301,99 +301,72 @@ fn daemon_write_killed_mid_checkpoint_is_recoverable() {
     let _ = recent_entries(&conn, u32::MAX).unwrap();
 }
 
-/// ADR-0098 C2 — **assertion #1 (CRITICAL for the v0.2.5 cut vs C3 decision).**
+/// ADR-0098 C2 -> v0.2.5 **Option 1** (Ervin-approved) — **read-after-write
+/// coherence via `try_clone`.** `Handle::read()` now hands out a `try_clone`
+/// of the SHARED instance (one buffer cache, no second OS open), so a read
+/// observes every committed write immediately — the coherent-read property the
+/// F5 separate read-only instance could NOT provide (a separate instance did
+/// not replay the live writer's WAL: the avl `revoke->list` stale read). This
+/// pins that coherence while the read-write instance stays continuously open
+/// (checkpoint off) and multiple read clones coexist in-process.
 ///
-/// The default `HandleConfig` sets `read_returns_readonly = true`, so
-/// [`Handle::read`] hands out a SEPARATE read-only OS open
-/// (`AccessMode::ReadOnly`). That is exactly the shape `ap_sync` drives every
-/// ~2s during backfill (incoming_invoices + submission_queue reads) concurrent
-/// with the read-write Handle. On real libduckdb 1.5.3 this asserts:
-///
-///   1. DuckDB **ALLOWS** a same-process read-only open concurrent with the
-///      Handle's live read-write instance (if this fails, the ap_sync
-///      read-residual is still a tear/again path and the config must fall back
-///      to `read_returns_readonly = false` / `try_clone` — a C3 change, NOT a
-///      safe v0.2.6 defer);
-///   2. the read-only open **sees COMMITTED writes** (so a post-commit
-///      `verify_chain` read on a migrated NAV/invoicing path observes the
-///      just-committed append); and
-///   3. a write **mis-routed** through the read-only connection is REJECTED
-///      (the F5 "fail loud, never silently bypass the durability hook"
-///      guarantee), and neither open tears the file.
-///
-/// Read this test's CI result before cutting: PASS ⇒ read-residual safe to
-/// defer; FAIL on step 1 ⇒ still a tear path (C3).
+/// Gap-2b (deferred to v0.2.6): a `try_clone` is read-WRITE, so a write
+/// mis-routed through `read()` no longer fails loud at the DB layer; that guard
+/// becomes a compile-time read-guard in v0.2.6 (docs/adr-0098-v0.2.6-scope.md).
+/// The single-WRITER durability invariant is unchanged — all real writes still
+/// flow through `write()`.
 #[test]
-fn c2_assertion1_readonly_open_coexists_with_live_rw_handle_and_sees_commits() {
-    let tmp = Tmp::new("ro-coexist");
+fn c2_read_clone_is_coherent_while_rw_instance_stays_open() {
+    let tmp = Tmp::new("clone-coherent");
     let db = tmp.db();
     seed(&db);
-    // checkpoint disabled => the read-write instance stays CONTINUOUSLY open,
-    // so the read-only open below truly coexists with a live RW instance (the
-    // strictest case). `read_returns_readonly` stays true (the default) — that
-    // is the property under test.
+    // checkpoint disabled => the read-write instance stays CONTINUOUSLY open, so
+    // the read clones below truly coexist with a live RW instance (strictest case).
     let cfg = HandleConfig {
         checkpoint_enabled: false,
         ..Default::default()
     };
-    assert!(
-        cfg.read_returns_readonly,
-        "this test must exercise the read-only read() path"
-    );
     let handle = Handle::open(&db, tenant(), cfg).unwrap();
 
     // Commit a write through the read-write instance.
     {
         let mut g = handle.write().unwrap();
-        append_one(&mut g, "ro-1");
+        append_one(&mut g, "co-1");
     }
 
-    // (1) A read-only open concurrent with the live RW instance must SUCCEED.
-    let ro = handle.read().expect(
-        "ASSERTION #1 FAILED: libduckdb 1.5.3 rejected a same-process read-only \
-         open concurrent with the read-write Handle. The ap_sync read-residual \
-         is still a tear path — set read_returns_readonly=false (try_clone) \
-         before cutting (C3).",
-    );
-
-    // (2) The read-only connection observes the committed row.
+    // (1) A read clone taken while the RW instance is live observes the commit.
+    let r1 = handle.read().unwrap();
     assert_eq!(
-        recent_entries(&ro, u32::MAX).unwrap().len(),
+        recent_entries(&r1, u32::MAX).unwrap().len(),
         1,
-        "read-only open did not observe the committed write"
+        "read() try_clone did not observe the committed write (coherence broken)"
     );
 
-    // Hold `ro` OPEN and commit a second write through the RW instance, then a
-    // fresh read-only open must observe BOTH — committed-write visibility while
-    // a prior read-only open and the RW instance all coexist in-process.
+    // (2) Hold r1 open, commit a second write; a fresh clone sees BOTH, and the
+    //     still-held r1 (on a NEW query) also sees the latest committed state --
+    //     one shared instance, not a point-in-time separate snapshot.
     {
         let mut g = handle.write().unwrap();
-        append_one(&mut g, "ro-2");
+        append_one(&mut g, "co-2");
     }
-    let ro2 = handle
-        .read()
-        .expect("second concurrent read-only open rejected (assertion #1)");
+    let r2 = handle.read().unwrap();
     assert_eq!(
-        recent_entries(&ro2, u32::MAX).unwrap().len(),
+        recent_entries(&r2, u32::MAX).unwrap().len(),
         2,
-        "second read-only open did not see the second committed write"
+        "fresh read() try_clone did not see the second committed write"
+    );
+    assert_eq!(
+        recent_entries(&r1, u32::MAX).unwrap().len(),
+        2,
+        "held read() try_clone did not observe the later commit (single-instance coherence)"
     );
 
-    // (3a) A write mis-routed through the read-only connection FAILS LOUDLY
-    // (never silently commits to a second instance and bypasses the hook).
-    assert!(
-        ro.execute_batch("CREATE TABLE ro_probe (i INTEGER);")
-            .is_err(),
-        "a write through the read-only read() connection unexpectedly SUCCEEDED \
-         — the F5 fail-loud guarantee is broken"
-    );
-
-    // (3b) Neither open tore the file.
-    drop(ro);
-    drop(ro2);
+    // (3) Neither the clones nor the live RW instance tore the file.
+    drop(r1);
+    drop(r2);
     assert!(
         fresh_open_ok(&db),
-        "file tore under read-only + read-write same-process coexistence"
+        "file tore under read-clone + read-write same-process coexistence"
     );
 }
 
@@ -434,16 +407,17 @@ fn c2_assertion1_readonly_open_sees_each_commit_while_rw_instance_stays_open() {
     );
 }
 
-/// ADR-0098 C2 fix-forward — **read-only detection proof (Option A step 1).**
-/// The tolerant `ensure_schema` skips its idempotent DDL on a read-only conn.
-/// This proves the detector: it must report FALSE on the Handle's read-write
-/// guard connection and TRUE on the `read()`-side read-only connection
-/// (`read_returns_readonly` default). A wrong detector that reported TRUE on a
-/// write conn would silently skip real schema creation — so both directions
-/// are asserted here before the detector is relied on across the tree.
+/// ADR-0098 C2 -> v0.2.5 **Option 1** — **read() hands out a coherent read-WRITE
+/// clone, not a separate read-only instance.** The F5 `AccessMode::ReadOnly`
+/// path is removed: `read()` is a `try_clone` of the shared instance, so
+/// `connection_is_read_only` reports FALSE for it (as it does for the write
+/// guard). The detector is RETAINED — it still guards the tolerant
+/// `ensure_schema` DDL — and its RW-direction correctness (never wrongly
+/// reporting a writable conn as read-only, which would silently skip real
+/// schema creation) is what this pins.
 #[test]
-fn c2_readonly_detection_distinguishes_ro_from_rw() {
-    let tmp = Tmp::new("ro-detect");
+fn c2_read_returns_coherent_rw_clone_not_readonly() {
+    let tmp = Tmp::new("rw-clone");
     let db = tmp.db();
     seed(&db);
     let cfg = HandleConfig {
@@ -452,34 +426,31 @@ fn c2_readonly_detection_distinguishes_ro_from_rw() {
     };
     let handle = Handle::open(&db, tenant(), cfg).unwrap();
 
-    // Read-write guard connection → must be detected NOT read-only.
+    // Read-write guard connection -> must be detected NOT read-only.
     {
         let g = handle.write().unwrap();
-        let am: String = g
-            .query_row("SELECT current_setting('access_mode')", [], |r| r.get(0))
-            .unwrap_or_default();
-        eprintln!(
-            "detect RW: access_mode={am:?} is_ro={}",
-            aberp_audit_ledger::connection_is_read_only(&g)
-        );
         assert!(
             !aberp_audit_ledger::connection_is_read_only(&g),
-            "RW write-guard connection wrongly detected as read-only (access_mode={am})"
+            "RW write-guard connection wrongly detected as read-only"
         );
     }
 
-    // read()-side connection (AccessMode::ReadOnly) → must be detected read-only.
-    let ro = handle.read().unwrap();
-    let am: String = ro
-        .query_row("SELECT current_setting('access_mode')", [], |r| r.get(0))
-        .unwrap_or_default();
-    eprintln!(
-        "detect RO: access_mode={am:?} is_ro={}",
-        aberp_audit_ledger::connection_is_read_only(&ro)
-    );
+    // Commit a write, then the read() clone must (a) NOT be read-only under
+    // Option 1 and (b) observe the committed row (coherent single instance).
+    {
+        let mut g = handle.write().unwrap();
+        append_one(&mut g, "rwc-1");
+    }
+    let r = handle.read().unwrap();
     assert!(
-        aberp_audit_ledger::connection_is_read_only(&ro),
-        "read() read-only connection NOT detected as read-only (access_mode={am})"
+        !aberp_audit_ledger::connection_is_read_only(&r),
+        "read() clone reported read-only — Option 1 hands out a read-WRITE \
+         try_clone of the shared instance, not a separate AccessMode::ReadOnly open"
+    );
+    assert_eq!(
+        recent_entries(&r, u32::MAX).unwrap().len(),
+        1,
+        "read() try_clone did not observe the committed write (coherence)"
     );
 }
 
@@ -496,7 +467,7 @@ fn c2_read_after_write_sees_commit_under_default_checkpoint_config() {
     let tmp = Tmp::new("raw-ckpt");
     let db = tmp.db();
     seed(&db);
-    // DEFAULT config: checkpoint_enabled = true, read_returns_readonly = true.
+    // DEFAULT config: checkpoint_enabled = true (production checkpoint posture).
     let handle = Handle::open_default(&db, tenant()).unwrap();
 
     for i in 1..=3usize {
@@ -514,7 +485,7 @@ fn c2_read_after_write_sees_commit_under_default_checkpoint_config() {
     }
 }
 
-/// Read a `status` column back through the Handle's `read()` (F5 read-only) path.
+/// Read a `status` column back through the Handle's `read()` (try_clone) path.
 fn read_probe_status(handle: &Handle, id: &str) -> Option<String> {
     let conn = handle.read().unwrap();
     let mut stmt = conn
@@ -534,8 +505,9 @@ fn read_probe_status(handle: &Handle, id: &str) -> Option<String> {
 /// (`read_returns_readonly`) does not replay them, so `read()` observed the
 /// pre-UPDATE row (the `avl_vendors_route` `revoke→list` failures). The residual
 /// `append_reopen` audit opener after each mutation is avl's exact shape. Pins
-/// the fix: `read()` publishes pending committed writes via the durable
-/// checkpoint before the read-only open.
+/// the fix: `read()` is a `try_clone` of the shared instance, which replays the
+/// live writer's WAL, so the post-checkpoint (WAL-only) UPDATE is visible with
+/// no publish step (v0.2.5 Option 1).
 #[test]
 fn c2_read_after_write_sees_update_in_avl_shape() {
     let tmp = Tmp::new("raw-avl-update");

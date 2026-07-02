@@ -102,16 +102,6 @@ pub struct HandleConfig {
     /// runtime connection so dropping it never folds the WAL in place (the
     /// vulnerable in-place checkpoint). Always `true` in production.
     pub disable_implicit_close_checkpoint: bool,
-    /// ADR-0098 C2 (review F5 / Gap-2b): when `true`, [`Handle::read`] hands
-    /// out a SEPARATE read-only connection (`AccessMode::ReadOnly`) instead of
-    /// a read-write `try_clone`, so a write mis-routed through `read()` fails
-    /// LOUDLY (DuckDB rejects it) instead of silently committing to the shared
-    /// instance and bypassing the post-commit durability hook. `true` in
-    /// production. FLAGGED (CI/Mac-gated): a same-process read-only open must
-    /// coexist with the Handle's read-write instance on DuckDB 1.5.3; flip to
-    /// `false` to fall back to the `try_clone` behaviour if the e2e shows the
-    /// read-only open is rejected.
-    pub read_returns_readonly: bool,
 }
 
 impl Default for HandleConfig {
@@ -120,7 +110,6 @@ impl Default for HandleConfig {
             min_checkpoint_interval: debounce::DEFAULT_MIN_CHECKPOINT_INTERVAL,
             checkpoint_enabled: true,
             disable_implicit_close_checkpoint: true,
-            read_returns_readonly: true,
         }
     }
 }
@@ -252,38 +241,15 @@ impl Handle {
     /// **same** instance (shared buffer cache; **not** a second OS open). The
     /// writer mutex is held only for the duration of the clone (cheap), not
     /// for the caller's query, so reads do not serialize behind each other.
+    ///
+    /// ADR-0098 C2 -> v0.2.5 **Option 1** (Ervin-approved): this `try_clone`
+    /// is the SOLE read path. The F5 separate read-only instance is removed --
+    /// a separate instance did not replay the live writer's WAL, so post-commit
+    /// (WAL-only) writes were invisible to it (the avl `revoke->list` stale
+    /// read); a `try_clone` of the shared instance is coherent. The DB-level
+    /// write-on-read fail-loud (Gap-2b) is deferred to v0.2.6 (a compile-time
+    /// read-guard); see `docs/adr-0098-v0.2.6-scope.md`.
     pub fn read(&self) -> Result<Connection, DbError> {
-        if self.config.read_returns_readonly {
-            // ADR-0098 C2 (review F5 / Gap-2b): hand out a READ-ONLY connection
-            // so a write mis-routed through `read()` FAILS LOUDLY (DuckDB
-            // rejects the write) instead of silently committing to the shared
-            // instance and bypassing the post-commit hook (lockstep mirror +
-            // debounced durable checkpoint). The single-WRITER invariant is
-            // intact: the only writable instance is still the Handle's guarded
-            // connection, and a read-only handle never checkpoints, so it is
-            // NOT a duckdb#23046 tear vector.
-            //
-            // FLAG (CI/Mac-gated — the top conservative call of C2): this
-            // replaces the shared-instance `try_clone` ("one buffer cache, no
-            // second OS open") with a separate read-only OS open. The e2e MUST
-            // assert (1) DuckDB 1.5.3 ALLOWS a same-process read-only open
-            // concurrent with the Handle's read-write instance (else set
-            // `read_returns_readonly=false`), and (2) a read-only open observes
-            // COMMITTED writes (so the post-commit `verify_chain` reads on the
-            // migrated paths see the just-committed append). Writes still flow
-            // through `write()` with full coherence.
-            // ADR-0098 C2 round-13 — read-after-write COHERENCE: a separate
-            // read-only DuckDB instance observes only state durably CHECKPOINTED
-            // into the live file; it does NOT replay the live writer's WAL for
-            // updates, so a mutation committed since the last (debounced ≤ 1/min)
-            // durable checkpoint is INVISIBLE to it (the avl `revoke→list` stale
-            // read). Publish any pending committed writes via the sanctioned
-            // build-aside durable checkpoint BEFORE the read-only open, so it sees
-            // the latest committed state. Cheap when clean; F5 is intact (the
-            // read-only open still rejects a mis-routed write).
-            self.publish_committed_for_readonly()?;
-            return open_runtime_connection_readonly(&self.db_path);
-        }
         let mut inner = self.inner.lock().map_err(|_| DbError::Poisoned)?;
         self.ensure_open(&mut inner)?;
         let clone = inner
@@ -292,52 +258,6 @@ impl Handle {
             .expect("ensure_open guarantees Some")
             .try_clone()?;
         Ok(clone)
-    }
-
-    /// ADR-0098 C2 round-13 — ensure committed writes are durably present in
-    /// the live file so a SEPARATE read-only open (`read_returns_readonly` / F5)
-    /// observes them. A read-only DuckDB instance reads only the checkpointed
-    /// live file and does not replay the live writer's WAL for updates, so a
-    /// mutation committed to the WAL since the last (debounced ≤ 1/min) durable
-    /// checkpoint would be invisible to it — the avl `revoke→list` stale read.
-    /// Runs the sanctioned build-aside durable checkpoint (crash-safe
-    /// `atomic_install`, never an in-place fold) iff the file is dirty since the
-    /// last one; a clean file is a free no-op. Reuses the ADR-0095 primitive —
-    /// no new durability primitive, and F5 stays intact.
-    fn publish_committed_for_readonly(&self) -> Result<(), DbError> {
-        let mut inner = self.inner.lock().map_err(|_| DbError::Poisoned)?;
-        if !(self.config.checkpoint_enabled && inner.debouncer.is_dirty()) {
-            return Ok(());
-        }
-        // FORCE the build-aside durable checkpoint. `run_durable_checkpoint_locked`
-        // routes through `live_durable_checkpoint`, whose `checkpoint_is_current`
-        // fast-path SHAs the live *.duckdb and would NO-OP here: a WAL-only commit
-        // can leave the main-file bytes unchanged, so the verified-good marker still
-        // matches even though the WAL holds uncheckpointed UPDATEs a separate
-        // read-only open cannot observe. Call `durable_checkpoint` directly so the
-        // logical EXPORT (a fresh read-write open that DOES replay the WAL) always
-        // captures the latest committed rows into the freshly installed live file,
-        // and the verified-good marker is refreshed. Quiesce the shared connection
-        // first so the EXPORT/atomic_install is the sole opener (identical discipline
-        // to run_durable_checkpoint_locked), then reopen on the new inode.
-        inner.conn = None;
-        match aberp_snapshot::durable_checkpoint(&self.db_path, &self.tenant) {
-            Ok(_) => inner.debouncer.record_checkpoint(Instant::now()),
-            Err(e) => tracing::error!(
-                error = %e,
-                db = %self.db_path.display(),
-                "aberp-db: read-coherence publish checkpoint FAILED; read() may see a stale row"
-            ),
-        }
-        match open_runtime_connection(&self.db_path, &self.config) {
-            Ok(c) => inner.conn = Some(c),
-            Err(e) => tracing::error!(
-                error = %e,
-                db = %self.db_path.display(),
-                "aberp-db: failed to reopen shared connection after read-coherence publish"
-            ),
-        }
-        Ok(())
     }
 
     /// Loop-idle hook (ADR-0098 D2 "+ one at loop-idle"). A daemon calls this
@@ -457,26 +377,6 @@ fn open_runtime_connection(db_path: &Path, config: &HandleConfig) -> Result<Conn
         // checkpoint-on-close for runtime connections.")
         conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")?;
     }
-    Ok(conn)
-}
-
-/// Open a SEPARATE **read-only** connection to the live tenant DB (ADR-0098 C2,
-/// review F5 / Gap-2b). [`Handle::read`] returns this when
-/// `read_returns_readonly` is set: a write issued through it is REJECTED by
-/// DuckDB (`AccessMode::ReadOnly`) rather than silently committing to the
-/// shared instance and bypassing the post-commit hook.
-///
-/// Read-only => never checkpoints => NOT a `duckdb#23046` tear vector; the
-/// single-WRITER invariant (the Handle's guarded connection is the only
-/// writable instance) is preserved. No `disable_checkpoint_on_shutdown` pragma
-/// is needed — a read-only connection cannot fold the WAL on close.
-///
-/// FLAG (CI/Mac-gated): `duckdb::AccessMode` / `Config::access_mode` /
-/// `open_with_flags` are otherwise unused in this tree; the exact API + the
-/// same-process RO-with-RW coexistence are asserted by the e2e, not the sandbox.
-fn open_runtime_connection_readonly(db_path: &Path) -> Result<Connection, DbError> {
-    let config = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
-    let conn = Connection::open_with_flags(db_path, config)?;
     Ok(conn)
 }
 
