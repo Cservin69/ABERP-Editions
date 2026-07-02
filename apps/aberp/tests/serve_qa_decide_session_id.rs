@@ -270,21 +270,28 @@ fn qa_decide_with_auto_complete_shares_session_id_across_audit_rows() {
     ensure_all_schemas(&db_path);
 
     let qa_id = seed_one_op_wo_with_pending_qa(&db_path);
+    // ADR-0098 Option 1: open the shared Handle AFTER the separate-opener seed
+    // (so it reads the seeded WO/QA from the file), then route BOTH ledger reads
+    // through it -- decide writes its audit inside the Handle's tx, which a
+    // separate Ledger::open would not observe.
+    let state = build_state(db_path.clone());
 
     // Snapshot the ledger length BEFORE the decide so we can isolate
     // the rows produced by THIS tx.
     let tenant = TenantId::new(TEST_TENANT.to_string()).unwrap();
     let binary_hash = BinaryHash::from_bytes([0u8; 32]);
-    let pre_count = Ledger::open(&db_path, tenant.clone(), binary_hash)
-        .expect("open ledger pre-decide")
-        .entries()
-        .expect("read pre-decide entries")
-        .len();
+    let pre_count = Ledger::from_connection(
+        state.db.read().expect("read via shared handle"),
+        tenant.clone(),
+        binary_hash,
+    )
+    .entries()
+    .expect("read pre-decide entries")
+    .len();
 
     // Drive the route handler. The body asks for Pass with no measurement
     // — the one-op WO satisfies the gate so the auto-complete cascade
     // fires inside the same tx.
-    let state = build_state(db_path.clone());
     let body = DecideQaInspectionBody {
         decision: "pass".to_string(),
         reason: None,
@@ -303,10 +310,13 @@ fn qa_decide_with_auto_complete_shares_session_id_across_audit_rows() {
     // Walk the audit rows added by this single route call. They MUST all
     // share `actor.session_id` — otherwise a forensic operator cannot
     // join the cascade by session column (S249 finding 2).
-    let entries = Ledger::open(&db_path, tenant, binary_hash)
-        .expect("open ledger post-decide")
-        .entries()
-        .expect("read post-decide entries");
+    let entries = Ledger::from_connection(
+        state.db.read().expect("read via shared handle"),
+        tenant,
+        binary_hash,
+    )
+    .entries()
+    .expect("read post-decide entries");
     let new_entries = &entries[pre_count..];
     assert!(
         new_entries.len() >= 2,
