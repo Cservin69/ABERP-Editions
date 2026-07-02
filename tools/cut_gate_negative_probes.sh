@@ -182,6 +182,13 @@ echo "[CHECK 10] the shared aberp_db::Handle crate removed (single-instance seam
 c="$(fresh)"; rm -f "$c/crates/aberp-db/src/lib.rs"
 expect_fail "$c" "Handle missing or missing its write()/read()/open_runtime_connection" "CHECK 10a — aberp_db Handle crate deleted"
 
+echo "[CHECK 10 try_clone] Handle read() regressed from try_clone to a SEPARATE read-only instance (AccessMode::ReadOnly / open_with_flags) — coherence regression"
+c="$(fresh)"
+# Re-introduce the removed F5 separate read-only opener inside the Handle -- the
+# exact stale-read vector Option 1 eliminated. The gate's 10c-tryclone must red.
+printf '\nfn _f5_regression_probe(p: &std::path::Path) -> Result<duckdb::Connection, duckdb::Error> {\n    let cfg = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;\n    duckdb::Connection::open_with_flags(p, cfg)\n}\n' >> "$c/crates/aberp-db/src/lib.rs"
+expect_fail "$c" "must be a try_clone of the shared instance" "CHECK 10 — Handle read() regressed to a separate read-only AccessMode/open_with_flags instance"
+
 echo "[CHECK 10f] a NEW live-path Connection::open planted in a serve.rs REQUEST HANDLER (Session-C two-lock-regime regression)"
 c="$(fresh)"
 python3 - "$c/apps/aberp/src/serve.rs" <<'PYIN'

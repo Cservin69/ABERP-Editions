@@ -494,6 +494,21 @@ else
   flag10 "✗ the Handle's single live open (open_runtime_connection -> Connection::open(db_path)) is missing"
 fi
 
+# 10c-tryclone — the Handle's read() is the SANCTIONED single-instance read: a
+#   duckdb try_clone of the ONE shared instance (coherent -- it replays the live
+#   writer's WAL), NOT a separate read-only OS open. The F5 AccessMode::ReadOnly
+#   instance proved to cause pervasive stale reads (a separate instance does not
+#   replay the WAL); ADR-0098 C2 / v0.2.5 Option 1 (Ervin-approved) adopts
+#   try_clone as the one coherent read seam. try_clone is PERMITTED (it is not a
+#   separate Connection::open); a regression to a separate open_with_flags/
+#   AccessMode read-only instance IN the Handle is a coherence RED BUILD (teeth:
+#   cut_gate_negative_probes.sh "[CHECK 10 try_clone]").
+if grep -q 'try_clone()' "$hb" && ! grep -qE 'open_with_flags\(|AccessMode::' "$hb"; then
+  note "✓ Handle::read() is the sanctioned single-instance try_clone (coherent; no separate read-only open_with_flags/AccessMode)"
+else
+  flag10 "✗ Handle::read() must be a try_clone of the shared instance (ADR-0098 C2 Option 1) — a separate open_with_flags/AccessMode read-only instance is a coherence regression"
+fi
+
 # 10d — NO live-path Connection::open / open_with_flags in the migrated Session-B
 #       daemon files OUTSIDE #[cfg(test)]. Scan only the runtime portion (lines
 #       before the first #[cfg(test)]; tests live at the bottom) and ban any
