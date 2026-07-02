@@ -356,19 +356,45 @@ fn override_persists_and_emits_event() {
     let db = dir.join("aberp.duckdb");
     let state = build_state(db.clone());
     let qid = "44444444-4444-4444-4444-444444444444";
-    seed_posted(&db, qid, 600.0, 1, false);
+    // ADR-0098 Option 1 (try_clone): the shared Handle instance is opened at
+    // build_state and only ever sees ITS OWN writes -- a record seeded via a
+    // SEPARATE Connection::open is invisible to it. So seed + read-back go
+    // through the Handle, exactly as production does (all DB access on the one
+    // instance). Prior F5 read()-reopens masked this by re-reading the file.
     {
+        let g = state.db.write().expect("seed via shared handle");
+        aberp::quote_pricing_jobs::insert_fetched_job(
+            &g,
+            qid,
+            TEST_TENANT,
+            "c@example.com",
+            "Cust Kft.",
+            "Cust Kft.",
+            "6061-T6",
+            1,
+            "p.step",
+            "/tmp/p.step",
+            fixed_ts(),
+        )
+        .expect("insert");
+        g.execute(
+            "UPDATE quote_pricing_jobs SET state = 'posted', breakdown_json = ? WHERE quote_id = ? AND tenant_id = ?",
+            duckdb::params![
+                "{\"machining_minutes\":600,\"route_to_5_axis\":false}",
+                qid,
+                TEST_TENANT
+            ],
+        )
+        .expect("post");
         // Give it a computed value first so the override payload's
         // computed_days is populated.
-        let conn = duckdb::Connection::open(&db).expect("open");
-        aberp::quote_pricing_jobs::set_computed_lead_time(&conn, qid, TEST_TENANT, 4)
-            .expect("comp");
+        aberp::quote_pricing_jobs::set_computed_lead_time(&g, qid, TEST_TENANT, 4).expect("comp");
     }
 
     // Operator overrides to 10 days.
     serve::override_lead_time_request(&state, qid, Some(10), "op", TEST_HASH).expect("override");
 
-    let conn = duckdb::Connection::open(&db).expect("open");
+    let conn = state.db.read().expect("read via handle");
     let eff = aberp::quote_pricing_jobs::get_effective_lead_time_days(&conn, qid, TEST_TENANT)
         .expect("effective");
     assert_eq!(eff, Some(10), "override wins over computed");
@@ -380,7 +406,7 @@ fn override_persists_and_emits_event() {
 
     // Clearing the override reverts to the computed value.
     serve::override_lead_time_request(&state, qid, None, "op", TEST_HASH).expect("clear");
-    let conn2 = duckdb::Connection::open(&db).expect("open");
+    let conn2 = state.db.read().expect("read via handle");
     let eff2 = aberp::quote_pricing_jobs::get_effective_lead_time_days(&conn2, qid, TEST_TENANT)
         .expect("effective2");
     assert_eq!(eff2, Some(4), "cleared override → computed value");
