@@ -110,6 +110,24 @@ pub enum AppendError {
         preserved: String,
     },
 
+    /// ADR-0098 R1 (Fable-5 findings D + E) — the audit-ledger mirror is
+    /// corrupt in a way the unified torn-tail policy will NOT auto-heal:
+    /// either corruption DEEPER than a single torn trailing line (a
+    /// break/gap/JSON/hash-chain mismatch not at the final line), or a head
+    /// `entry_hash` that DIVERGES from the DB at equal length. In every case
+    /// the original mirror was PRESERVED byte-for-byte to `preserved` BEFORE
+    /// refusing. The editions tree NEVER rebuilds-from-DB here (that could
+    /// destroy a prefix the DB lost via a dropped WAL tail) and the operator
+    /// must NEVER hand-edit the JSONL. Recovery: inspect `preserved`, then run
+    /// `aberp recover`.
+    #[error(
+        "audit-ledger mirror is unrecoverable ({reason}); the original was preserved to \
+         {preserved}. Recover with `aberp recover --db <db> --tenant <tenant> --store <store>`; \
+         do NOT hand-edit the mirror JSONL. Magyarul: a napló-tükör sérült; az eredetit \
+         félretettem, ne szerkeszd kézzel."
+    )]
+    MirrorCorruptPreserved { preserved: String, reason: String },
+
     /// S441 / ADR-0087 — a non-network timestamp-authority failure while
     /// taking an anchor. A *network* TSA failure NEVER reaches this
     /// variant: it queues a `pending` anchor instead (`take_anchor` never

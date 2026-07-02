@@ -43,7 +43,8 @@
 use std::path::{Path, PathBuf};
 
 use aberp_audit_ledger::{
-    read_mirror_entries, replay_mirror_delta, BinaryHash, Ledger, MirrorEntry, TenantId,
+    read_mirror_under_tail_policy, replay_mirror_delta, BinaryHash, Ledger, MirrorEntry,
+    MirrorTailPolicy, TenantId,
 };
 use duckdb::Connection;
 
@@ -160,12 +161,44 @@ pub fn recover_or_refuse(
     };
     let snapshot_audit_count = latest.meta.audit_count.max(0) as u64;
 
-    // The mirror is the second source of recovery truth. It is READ here and
-    // mutated ONLY by an append-only TOP-UP on the self-certified ahead-
-    // snapshot path (ADR-0098 D3); it is NEVER truncated. Missing/corrupt →
-    // unsafe → refuse (safe fallback).
-    let mirror_entries = match read_mirror_entries(mirror_path) {
-        Ok(e) => e,
+    // The mirror is the second source of recovery truth. Under the unified
+    // ADR-0098 R1 torn-tail policy it is READ here: a lone torn trailing line
+    // is PRESERVED + trimmed (the append never durably happened) and recovery
+    // proceeds on the intact prefix; corruption DEEPER than a torn tail, or a
+    // missing/unreadable mirror, is unsafe → refuse (safe fallback). Committed
+    // entries are NEVER truncated — the only content-bearing mutation is the
+    // append-only TOP-UP on the self-certified ahead-snapshot path (D3).
+    let mirror_entries = match read_mirror_under_tail_policy(mirror_path) {
+        Ok(MirrorTailPolicy::Clean(e)) => e,
+        Ok(MirrorTailPolicy::TornTail {
+            entries,
+            preserved,
+            dropped_bytes,
+        }) => {
+            tracing::warn!(
+                target: "audit_event",
+                event = "audit_mirror_torn_tail_trimmed",
+                mirror_path = %mirror_path.display(),
+                preserved = %preserved.display(),
+                dropped_bytes,
+                trimmed_head_seq = entries.last().map(|e| e.seq()).unwrap_or(0),
+                "ADR-0098 R1 — recovery mirror had a torn trailing line; preserved the original \
+                 and trimmed to the intact prefix, proceeding on the prefix"
+            );
+            entries
+        }
+        Ok(MirrorTailPolicy::DeepCorrupt { preserved, reason }) => {
+            return Ok(RecoveryOutcome::RefusedUnsafe {
+                reason: format!(
+                    "audit-ledger mirror at {} is corrupt beyond a torn tail ({reason}); the \
+                     original was preserved to {} — refusing to auto-recover (investigate; do \
+                     NOT hand-edit the mirror)",
+                    mirror_path.display(),
+                    preserved.display()
+                ),
+                retained_corrupt_db,
+            })
+        }
         Err(e) => {
             return Ok(RecoveryOutcome::RefusedUnsafe {
                 reason: format!(
@@ -326,8 +359,9 @@ enum GuardRoute {
     /// `snapshot_head <= mirror_head`: the snapshot is a prefix of the mirror
     /// — the original IMPORT-snapshot + replay-mirror-delta path.
     Prefix,
-    /// `snapshot_head > mirror_head` AND it self-certifies: recover from the
-    /// ahead snapshot and top the lagging mirror up to it (append + fsync).
+    /// `snapshot_head > mirror_head` AND it self-certifies AND `mirror_head >=
+    /// 1` (a real genesis anchor exists — ADR-0098 R1, finding G): recover from
+    /// the ahead snapshot and top the lagging mirror up to it (append + fsync).
     RecoverAheadTopUp,
     /// `snapshot_head > mirror_head`, does NOT self-certify, but a valid
     /// snapshot `<= mirror_head` exists: fall back to it via the prefix path.
@@ -347,7 +381,15 @@ fn route_guard(
 ) -> GuardRoute {
     if snapshot_head <= mirror_head {
         GuardRoute::Prefix
-    } else if self_certifies {
+    } else if self_certifies && mirror_head >= 1 {
+        // ADR-0098 R1 (finding G): an AHEAD snapshot may only be recovered from
+        // when there is a real genesis anchor to certify against. An EMPTY
+        // mirror (`mirror_head == 0`) makes the overlap `[1..=0]` vacuously
+        // satisfied, so ANY internally-valid snapshot would "self-certify" —
+        // refused here so a MISSING and an EMPTY mirror behave coherently (both
+        // refuse). Belt-and-suspenders with the same guard in
+        // `build_and_validate`, which prevents `self_certifies` for an empty
+        // mirror in the first place.
         GuardRoute::RecoverAheadTopUp
     } else if fallback_available {
         GuardRoute::FallBackToPrefix
@@ -371,6 +413,16 @@ fn first_overlap_disagreement(mirror: &[(u64, String)], staging: &[(u64, String)
         }
     }
     None
+}
+
+/// PURE (ADR-0098 R1, finding G): does the mirror overlap begin at genesis
+/// (seq 1)? The overlap is `(seq, entry_hash)` in seq order. An EMPTY overlap
+/// is NOT anchored — that is the empty-mirror vacuity an ahead-snapshot
+/// self-certification must reject (a MISSING mirror already refuses; an EMPTY
+/// one must too). I/O-free, so it is verifiable without DuckDB (the saw-off
+/// gate).
+fn overlap_is_genesis_anchored(mirror_overlap: &[(u64, String)]) -> bool {
+    matches!(mirror_overlap.first(), Some((seq, _)) if *seq == 1)
 }
 
 /// Create a fresh private staging path and build + validate `snapshot` into
@@ -519,6 +571,22 @@ fn build_and_validate(
 
     if snapshot_audit_count > mirror_max_seq {
         // ── AHEAD snapshot ───────────────────────────────────────────────
+        // 5c-0. ADR-0098 R1 (finding G): REQUIRE a genesis anchor. An EMPTY
+        //     mirror (`mirror_head == 0`) has no overlap, so `[1..=0]` is
+        //     vacuously satisfied — that would let ANY internally-valid
+        //     snapshot self-certify and install (a MISSING mirror refuses, but
+        //     an EMPTY one would recover — an incoherent asymmetry). Refuse
+        //     unless `mirror_head >= 1` AND the overlap is anchored at genesis
+        //     (seq 1 present); this makes `self_certifies` unreachable for an
+        //     empty mirror, so the belt-and-suspenders guard in `route_guard`
+        //     never even fires.
+        if mirror_max_seq == 0 {
+            return Ok(Verdict::Refuse(
+                "ahead snapshot cannot self-certify against an EMPTY mirror (mirror_head=0; no \
+                 genesis anchor) — refusing to install a vacuously-certified snapshot"
+                    .to_string(),
+            ));
+        }
         // 5c. SELF-CERTIFY gate 2 (D4): the mirror must agree with the
         //     snapshot over their overlap `[1..=mirror_head]`. Compare the
         //     mirror's recorded `entry_hash` at every overlap seq against the
@@ -543,6 +611,17 @@ fn build_and_validate(
             .filter(|m| m.seq() <= mirror_max_seq)
             .map(|m| (m.seq(), m.entry_hash().to_string()))
             .collect();
+        // ADR-0098 R1 (finding G): the overlap must be ANCHORED AT GENESIS
+        // (seq 1). With `mirror_head >= 1` (guaranteed above) the mirror's
+        // seq-1 entry is present; require it explicitly so a non-genesis
+        // overlap can never vacuously certify.
+        if !overlap_is_genesis_anchored(&mirror_overlap) {
+            return Ok(Verdict::Refuse(
+                "ahead snapshot cannot self-certify: the mirror overlap is not anchored at \
+                 genesis (missing seq 1) — refusing to recover from it"
+                    .to_string(),
+            ));
+        }
         if let Some(seq) = first_overlap_disagreement(&mirror_overlap, &staging_overlap) {
             return Ok(Verdict::Refuse(format!(
                 "ahead snapshot does not self-certify: the mirror and the snapshot disagree at \
@@ -931,6 +1010,24 @@ mod tests {
     }
 
     #[test]
+    fn route_guard_refuses_ahead_against_empty_mirror() {
+        // ADR-0098 R1 (finding G): an EMPTY mirror (mirror_head == 0) must NOT
+        // let an ahead snapshot self-certify, even if the (vacuous) self-cert
+        // flag were somehow set. With no fallback → Refuse; with a `<= 0`
+        // fallback available → FallBackToPrefix. NEVER RecoverAheadTopUp — so a
+        // MISSING mirror (refused upstream) and an EMPTY one behave coherently.
+        assert_eq!(route_guard(109, 0, true, false), GuardRoute::Refuse);
+        assert_eq!(
+            route_guard(109, 0, true, true),
+            GuardRoute::FallBackToPrefix
+        );
+        assert_ne!(
+            route_guard(109, 0, true, false),
+            GuardRoute::RecoverAheadTopUp
+        );
+    }
+
+    #[test]
     fn overlap_agreement_detects_first_disagreeing_seq() {
         let mirror = vec![
             (1u64, "a".to_string()),
@@ -956,5 +1053,17 @@ mod tests {
         // A missing overlap entry counts as a disagreement.
         let missing = vec![(1u64, "a".to_string())];
         assert_eq!(first_overlap_disagreement(&mirror, &missing), Some(2));
+    }
+
+    #[test]
+    fn overlap_genesis_anchor_requires_seq_1() {
+        // ADR-0098 R1 (finding G): an EMPTY overlap is NOT genesis-anchored; an
+        // overlap that starts at seq 1 IS; one that starts past genesis is NOT.
+        assert!(!overlap_is_genesis_anchored(&[]));
+        assert!(overlap_is_genesis_anchored(&[
+            (1u64, "a".to_string()),
+            (2, "b".to_string())
+        ]));
+        assert!(!overlap_is_genesis_anchored(&[(2u64, "b".to_string())]));
     }
 }

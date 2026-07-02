@@ -248,6 +248,222 @@ pub fn read_mirror_entries(mirror_path: &Path) -> Result<Vec<MirrorEntry>, Appen
     Ok(out)
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// ADR-0098 R1 — unified torn-tail policy (Fable-5 findings D + E).
+//
+// A crash during a mirror append leaves the commonest artifact: EXACTLY ONE
+// unterminated trailing line ("the append never durably happened", ADR-0030
+// §3). The strict `read_mirror_entries` correctly rejects it — but its two
+// recovery-sensitive callers historically took OPPOSITE, both-wrong stances:
+// the boot reconciler (`ensure_consistent_with_db`) SILENTLY
+// `rebuild_mirror_from_db` (`.truncate(true)`), destroying an intact prefix
+// that may hold entries the DB lost via a dropped WAL tail (finding D); the
+// recovery mirror-read (`aberp_snapshot::recover_or_refuse`) HARD-REFUSED,
+// bricking auto-recovery and demanding operator JSONL hand-surgery (finding E).
+//
+// `read_mirror_under_tail_policy` is the ONE code path both now share: it
+// PRESERVES the original first, then trims a lone torn tail and continues, or
+// refuses on anything deeper. It NEVER silently rebuilds-from-DB and NEVER
+// truncates a prefix that may hold entries the DB lacks.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The three-way classification of a mirror file under the unified torn-tail
+/// policy, returned by [`read_mirror_under_tail_policy`]. The boot reconciler
+/// [`ensure_consistent_with_db`] and `aberp_snapshot::recover_or_refuse` both
+/// route on it, so the two take ONE coherent stance on a torn trailing line.
+#[derive(Debug)]
+pub enum MirrorTailPolicy {
+    /// Parsed clean — no corruption. Carries the entries.
+    Clean(Vec<MirrorEntry>),
+    /// EXACTLY one unterminated/partial FINAL line — a torn tail. The original
+    /// was PRESERVED to `preserved`, the file was durably trimmed to the
+    /// verified-intact prefix, and `entries` are that prefix. The caller
+    /// CONTINUES (loud log + audit event); the boot arm then reconciles the
+    /// trimmed head against the DB, so a still-ahead trimmed mirror trips the
+    /// P0 ahead-of-DB preserve+refuse rather than being silently accepted.
+    TornTail {
+        entries: Vec<MirrorEntry>,
+        preserved: PathBuf,
+        dropped_bytes: u64,
+    },
+    /// Corruption DEEPER than a torn tail (a break/gap/JSON/chain mismatch NOT
+    /// at the final line). The original was PRESERVED to `preserved`. The
+    /// caller REFUSES — never rebuild-from-DB, never hand-edit the JSONL.
+    DeepCorrupt { preserved: PathBuf, reason: String },
+}
+
+/// PURE torn-tail decision core (ADR-0098 R1), I/O- and serde-free so it is
+/// faithfully unit-testable without a filesystem or DuckDB (the saw-off gate,
+/// which cannot build the bundled libduckdb amalgamation).
+///
+/// * `terminated` — the mirror's last byte is `\n` (no partial trailing line).
+/// * `prefix_ok`  — the newline-terminated PREFIX region parses AND
+///   re-verifies (JSON valid, seq ascending-contiguous from 1, hash-chain
+///   links intact).
+///
+/// The four combinations map to exactly one disposition:
+///
+/// | `terminated` | `prefix_ok` | disposition |
+/// |--------------|-------------|-------------|
+/// | true         | true        | `Clean`    — fully terminated, prefix intact |
+/// | true         | false       | `Deep`     — a COMPLETE line is broken (not a torn tail) |
+/// | false        | true        | `TornTail` — lone partial final line, prefix intact |
+/// | false        | false       | `Deep`     — partial final line AND a deeper break |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TailDecision {
+    Clean,
+    TornTail,
+    Deep,
+}
+
+/// The pure R1 torn-tail branch (see [`TailDecision`]). Copied verbatim into
+/// the saw-off gate's `rustc --test` extraction.
+pub(crate) fn decide_tail(terminated: bool, prefix_ok: bool) -> TailDecision {
+    match (terminated, prefix_ok) {
+        (true, true) => TailDecision::Clean,
+        (false, true) => TailDecision::TornTail,
+        (_, false) => TailDecision::Deep,
+    }
+}
+
+/// STRICT parse + hash-chain RE-VERIFICATION of a newline-terminated mirror
+/// region. Same JSON + ascending-contiguous-seq-from-1 invariant as
+/// [`read_mirror_entries`], PLUS a chain-LINK check (each entry's `prev_hash`
+/// equals the previous entry's `entry_hash`) — the "re-verify the chain over
+/// the trimmed prefix" R1 requires before it will accept a torn-tail trim. An
+/// empty region is vacuously clean (`Ok(vec![])`).
+fn parse_and_reverify_prefix(prefix: &[u8]) -> Result<Vec<MirrorEntry>, String> {
+    let mut out: Vec<MirrorEntry> = Vec::new();
+    for (idx, raw) in prefix.split_inclusive(|&b| b == b'\n').enumerate() {
+        let line_no = idx as u64 + 1;
+        let text = std::str::from_utf8(raw)
+            .map_err(|e| format!("non-UTF8 bytes at line {line_no}: {e}"))?;
+        let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
+        if trimmed.is_empty() {
+            return Err(format!("empty line at line {line_no}"));
+        }
+        let record: MirrorEntry = serde_json::from_str(trimmed)
+            .map_err(|e| format!("JSON decode failure at line {line_no}: {e}"))?;
+        let expected = out.len() as u64 + 1;
+        if record.seq != expected {
+            return Err(format!(
+                "seq jump at line {line_no}: expected seq={expected}, found seq={}",
+                record.seq
+            ));
+        }
+        if let Some(prev) = out.last() {
+            if record.prev_hash != prev.entry_hash {
+                return Err(format!(
+                    "hash-chain break at seq {}: prev_hash does not match the seq {} entry_hash",
+                    record.seq, prev.seq
+                ));
+            }
+        }
+        out.push(record);
+    }
+    Ok(out)
+}
+
+/// Split the mirror bytes at the last `\n`, strictly parse+re-verify the
+/// terminated prefix, and classify. Returns `(decision, prefix_entries,
+/// prefix_len_bytes, deep_reason)`. The serde/parse half is exercised on the
+/// Mac/CI gate; the pure branch structure is [`decide_tail`].
+fn classify_mirror_bytes(bytes: &[u8]) -> (TailDecision, Vec<MirrorEntry>, usize, Option<String>) {
+    if bytes.is_empty() {
+        return (TailDecision::Clean, Vec::new(), 0, None);
+    }
+    let terminated = bytes.last() == Some(&b'\n');
+    // The terminated prefix = bytes up to AND INCLUDING the last `\n` (empty if
+    // the whole file is a single unterminated line).
+    let prefix_len = match bytes.iter().rposition(|&b| b == b'\n') {
+        Some(i) => i + 1,
+        None => 0,
+    };
+    match parse_and_reverify_prefix(&bytes[..prefix_len]) {
+        Ok(entries) => (decide_tail(terminated, true), entries, prefix_len, None),
+        Err(reason) => (
+            decide_tail(terminated, false),
+            Vec::new(),
+            prefix_len,
+            Some(reason),
+        ),
+    }
+}
+
+/// Read the mirror under the unified torn-tail policy (ADR-0098 R1) — the ONE
+/// code path shared by the boot reconciler ([`ensure_consistent_with_db`]) and
+/// the recovery mirror-read (`aberp_snapshot::recover_or_refuse`), so the two
+/// are coherent (today they take opposite stances — boot too lax, recovery too
+/// strict).
+///
+/// * a clean parse → [`MirrorTailPolicy::Clean`];
+/// * a lone torn trailing line whose intact prefix re-verifies → PRESERVE the
+///   original to `<mirror>.corrupt-<nanos>.bak` FIRST, durably TRIM the file to
+///   the prefix, return [`MirrorTailPolicy::TornTail`];
+/// * anything deeper → PRESERVE, return [`MirrorTailPolicy::DeepCorrupt`] (the
+///   caller refuses).
+///
+/// A missing file surfaces as `MirrorIo(NotFound)` (callers handle it as they
+/// did before — boot creates, recovery refuses). Any other read I/O is loud.
+pub fn read_mirror_under_tail_policy(mirror_path: &Path) -> Result<MirrorTailPolicy, AppendError> {
+    let bytes = std::fs::read(mirror_path).map_err(AppendError::MirrorIo)?;
+    let (decision, entries, prefix_len, reason) = classify_mirror_bytes(&bytes);
+    match decision {
+        TailDecision::Clean => Ok(MirrorTailPolicy::Clean(entries)),
+        TailDecision::TornTail => {
+            // PRESERVE the original byte-for-byte BEFORE mutating anything.
+            let preserved = preserve_corrupt_mirror(mirror_path)?;
+            // Durably trim to the verified-intact prefix so a subsequent append
+            // cannot concatenate onto the non-durable partial line.
+            trim_mirror_to(mirror_path, prefix_len as u64)?;
+            Ok(MirrorTailPolicy::TornTail {
+                entries,
+                preserved,
+                dropped_bytes: (bytes.len() - prefix_len) as u64,
+            })
+        }
+        TailDecision::Deep => {
+            let preserved = preserve_corrupt_mirror(mirror_path)?;
+            Ok(MirrorTailPolicy::DeepCorrupt {
+                preserved,
+                reason: reason.unwrap_or_else(|| "mirror is malformed".to_string()),
+            })
+        }
+    }
+}
+
+/// Preserve the current (corrupt) mirror to a timestamped side file so the
+/// evidence is never destroyed — the torn-tail analogue of
+/// [`preserve_ahead_mirror`], writing `<mirror>.corrupt-<nanos>.bak`. Returns
+/// the backup path for the surfaced log/error.
+fn preserve_corrupt_mirror(mirror_path: &Path) -> Result<PathBuf, AppendError> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut os = mirror_path.as_os_str().to_owned();
+    os.push(format!(".corrupt-{nanos}.bak"));
+    let backup = PathBuf::from(os);
+    std::fs::copy(mirror_path, &backup).map_err(AppendError::MirrorIo)?;
+    Ok(backup)
+}
+
+/// Durably truncate the mirror to `keep_len` bytes (the verified-intact
+/// prefix), dropping a non-durable torn trailing line. fsync so the trim
+/// itself survives a crash. The dropped bytes were preserved by
+/// [`preserve_corrupt_mirror`] FIRST, so this destroys no evidence.
+fn trim_mirror_to(mirror_path: &Path, keep_len: u64) -> Result<(), AppendError> {
+    let file = OpenOptions::new()
+        .write(true)
+        .read(true)
+        .open(mirror_path)
+        .map_err(AppendError::MirrorIo)?;
+    file.lock_exclusive().map_err(AppendError::MirrorIo)?;
+    file.set_len(keep_len).map_err(AppendError::MirrorIo)?;
+    file.sync_all().map_err(AppendError::MirrorIo)?;
+    Ok(())
+}
+
 /// Replay the mirror's append-only JSONL delta — every record with
 /// `seq > after_seq` — back into the `audit_ledger` table of `conn`,
 /// **byte-faithfully** and in seq order, inside one transaction. Returns
@@ -573,10 +789,53 @@ pub fn ensure_consistent_with_db(
 ) -> Result<RecoveryAction, AppendError> {
     let db_max_seq = read_db_max_seq(conn)?;
 
-    // Read the mirror. Missing → Created. Corrupt/unparseable →
-    // Rebuilt. Any other I/O error (permissions, disk) is loud.
-    let mirror_entries = match read_mirror_entries(mirror_path) {
-        Ok(entries) => entries,
+    // Read the mirror under the unified ADR-0098 R1 torn-tail policy (findings
+    // D+E): a lone torn trailing line is preserved + trimmed and we CONTINUE on
+    // the intact prefix; corruption deeper than a torn tail is preserved +
+    // REFUSED (never rebuild-from-DB); a missing mirror is (re)built from the DB.
+    let mirror_entries = match read_mirror_under_tail_policy(mirror_path) {
+        Ok(MirrorTailPolicy::Clean(entries)) => entries,
+        // Torn tail — "the append never durably happened". The original was
+        // preserved and the file trimmed to the verified-intact prefix; continue
+        // and let the reconcile below compare the trimmed head to the DB (a
+        // still-ahead trimmed mirror trips the P0 ahead-of-DB preserve+refuse).
+        Ok(MirrorTailPolicy::TornTail {
+            entries,
+            preserved,
+            dropped_bytes,
+        }) => {
+            tracing::warn!(
+                target: "audit_event",
+                event = "audit_mirror_torn_tail_trimmed",
+                mirror_path = %mirror_path.display(),
+                preserved = %preserved.display(),
+                dropped_bytes,
+                trimmed_head_seq = entries.last().map(|e| e.seq).unwrap_or(0),
+                db_max_seq,
+                "audit_mirror torn trailing line — preserved original and trimmed to the intact \
+                 prefix; continuing (ADR-0098 R1; the dropped line was never durably committed)"
+            );
+            entries
+        }
+        // Deeper than a torn tail — NEVER rebuild-from-DB (that could destroy a
+        // prefix the DB lacks). Preserve + REFUSE: boot exits non-zero with an
+        // operator-actionable message naming the preserved path + recovery cmd.
+        Ok(MirrorTailPolicy::DeepCorrupt { preserved, reason }) => {
+            tracing::error!(
+                target: "audit_event",
+                event = "audit_mirror_deep_corrupt_refused",
+                mirror_path = %mirror_path.display(),
+                preserved = %preserved.display(),
+                %reason,
+                "audit_mirror is corrupt beyond a torn tail — REFUSING (preserved original; do \
+                 NOT rebuild-from-DB, do NOT hand-edit the JSONL) (ADR-0098 R1)"
+            );
+            return Err(AppendError::MirrorCorruptPreserved {
+                preserved: preserved.display().to_string(),
+                reason,
+            });
+        }
+        // Missing mirror: nothing to preserve; (re)build from the DB (Created).
         Err(AppendError::MirrorIo(io)) if io.kind() == std::io::ErrorKind::NotFound => {
             let written = rebuild_mirror_from_db(conn, mirror_path)?;
             tracing::info!(
@@ -586,19 +845,6 @@ pub fn ensure_consistent_with_db(
                 "audit_mirror_recovered action=created (mirror file was absent)"
             );
             return Ok(RecoveryAction::Created {
-                entries_written: written,
-            });
-        }
-        Err(AppendError::MirrorCorrupt { reason }) => {
-            let written = rebuild_mirror_from_db(conn, mirror_path)?;
-            tracing::warn!(
-                mirror_path = %mirror_path.display(),
-                entries_written = written,
-                db_max_seq,
-                %reason,
-                "audit_mirror_recovered action=rebuilt (mirror file was corrupt)"
-            );
-            return Ok(RecoveryAction::Rebuilt {
                 entries_written: written,
             });
         }
@@ -655,15 +901,28 @@ pub fn ensure_consistent_with_db(
         if db_hash == mirror_hash {
             Ok(RecoveryAction::Unchanged)
         } else {
-            let written = rebuild_mirror_from_db(conn, mirror_path)?;
-            tracing::warn!(
+            // ADR-0098 R1 (finding D): equal-length head-hash DIVERGENCE. Two
+            // chains of equal length with different heads on prod-class data is
+            // evidence of something worse than a torn tail — NEVER auto-resolve
+            // by rebuilding from the DB (that would destroy the mirror's record
+            // of what it holds). Preserve + REFUSE.
+            let preserved = preserve_corrupt_mirror(mirror_path)?;
+            tracing::error!(
+                target: "audit_event",
+                event = "audit_mirror_head_hash_divergence_refused",
                 mirror_path = %mirror_path.display(),
                 db_max_seq,
-                entries_written = written,
-                "audit_mirror_recovered action=rebuilt (head entry_hash disagreed with DB)"
+                preserved = %preserved.display(),
+                ?db_hash,
+                ?mirror_hash,
+                "audit_mirror head entry_hash DIVERGES from the DB at equal length — REFUSING \
+                 (preserved original; never auto-resolve equal-length divergence) (ADR-0098 R1)"
             );
-            Ok(RecoveryAction::Rebuilt {
-                entries_written: written,
+            Err(AppendError::MirrorCorruptPreserved {
+                preserved: preserved.display().to_string(),
+                reason: format!(
+                    "mirror head entry_hash diverges from the DB at equal length (seq={db_max_seq})"
+                ),
             })
         }
     }
@@ -1260,8 +1519,9 @@ mod tests {
     }
 
     #[test]
-    fn ensure_consistent_rebuilds_on_head_hash_mismatch() {
-        // Equal length but mirror head entry_hash disagrees → Rebuilt.
+    fn ensure_consistent_refuses_and_preserves_on_head_hash_mismatch() {
+        // ADR-0098 R1 (finding D): equal length but the mirror head entry_hash
+        // DIVERGES from the DB → PRESERVE + REFUSE (never silently rebuild).
         let dir = tempdir_under_target();
         let mirror = dir.join("mismatch.audit.log");
         let (conn, meta) = open_conn_with_two_entries();
@@ -1275,26 +1535,41 @@ mod tests {
             bytes.extend_from_slice(&encode_line(r).unwrap());
         }
         std::fs::write(&mirror, &bytes).unwrap();
+        let before = std::fs::read(&mirror).unwrap();
 
-        let action = ensure_consistent_with_db(&conn, &mirror).unwrap();
-        assert_eq!(action, RecoveryAction::Rebuilt { entries_written: 2 });
-        let rebuilt = read_mirror_entries(&mirror).unwrap();
-        assert_eq!(rebuilt.len(), 2);
-        let db_head = read_db_entry_at_seq(&conn, 2).unwrap().unwrap();
+        let err = ensure_consistent_with_db(&conn, &mirror).unwrap_err();
+        match err {
+            AppendError::MirrorCorruptPreserved { preserved, reason } => {
+                assert!(reason.contains("equal length"), "reason: {reason}");
+                assert!(
+                    std::path::Path::new(&preserved).exists(),
+                    "the original must be preserved to {preserved}"
+                );
+            }
+            other => panic!("expected MirrorCorruptPreserved, got {other:?}"),
+        }
+        // The refusal must NOT mutate the live mirror (no rebuild-from-DB).
         assert_eq!(
-            rebuilt[1].entry_hash,
-            hex::encode(db_head.entry_hash.as_bytes()),
-            "rebuilt head must match DB head"
+            std::fs::read(&mirror).unwrap(),
+            before,
+            "refusal must leave the mirror untouched"
+        );
+        // Exactly one `.corrupt-*.bak` preserved copy.
+        assert_eq!(
+            count_corrupt_baks(&dir),
+            1,
+            "exactly one preserved corrupt copy"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn ensure_consistent_rebuilds_on_corrupt_mirror() {
-        // A corrupt mirror (partial trailing line) is reinterpreted as
-        // "rebuild the cache" rather than surfaced as an error — the
-        // whole point of treating the mirror as derivable.
+    fn ensure_consistent_trims_torn_tail_and_continues() {
+        // ADR-0098 R1 (findings D+E): a lone torn trailing line (final newline
+        // lost) is NOT a silent rebuild-from-DB. The original is preserved, the
+        // file is trimmed to the intact prefix, and the reconcile continues —
+        // the DB still holds the dropped entry here, so it is re-extended.
         let dir = tempdir_under_target();
         let mirror = dir.join("corrupt.audit.log");
         let (conn, meta) = open_conn_with_two_entries();
@@ -1305,10 +1580,77 @@ mod tests {
         std::fs::write(&mirror, &bytes[..bytes.len() - 1]).unwrap();
 
         let action = ensure_consistent_with_db(&conn, &mirror).unwrap();
-        assert_eq!(action, RecoveryAction::Rebuilt { entries_written: 2 });
+        // Trimmed to seq 1; DB has seq 2 → the missing entry is re-extended.
+        assert_eq!(action, RecoveryAction::Extended { entries_added: 1 });
+        // The mirror re-reads clean at 2 entries.
         assert_eq!(read_mirror_entries(&mirror).unwrap().len(), 2);
+        // The torn original was preserved, not destroyed.
+        assert_eq!(
+            count_corrupt_baks(&dir),
+            1,
+            "torn original preserved to a .corrupt-*.bak"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_consistent_refuses_and_preserves_on_deep_corruption() {
+        // ADR-0098 R1 (findings D+E): corruption DEEPER than a torn tail — a
+        // newline-terminated file with a seq GAP — is PRESERVED + REFUSED,
+        // never rebuilt-from-DB (which could destroy a prefix the DB lacks).
+        let dir = tempdir_under_target();
+        let mirror = dir.join("deep.audit.log");
+        let (conn, meta) = open_conn_with_two_entries();
+        sync_mirror(&conn, &meta, &mirror).unwrap();
+
+        // Keep entry 1, then append a well-formed, newline-TERMINATED entry
+        // whose seq is 3 — a contiguity break that is NOT at a torn tail.
+        let entries = read_mirror_entries(&mirror).unwrap();
+        let mut e3 = entries[1].clone();
+        e3.seq = 3;
+        let mut bytes = encode_line(&entries[0]).unwrap();
+        bytes.extend_from_slice(&encode_line(&e3).unwrap());
+        std::fs::write(&mirror, &bytes).unwrap();
+        let before = std::fs::read(&mirror).unwrap();
+
+        let err = ensure_consistent_with_db(&conn, &mirror).unwrap_err();
+        assert!(
+            matches!(err, AppendError::MirrorCorruptPreserved { .. }),
+            "expected MirrorCorruptPreserved, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&mirror).unwrap(),
+            before,
+            "refusal must leave the mirror untouched"
+        );
+        assert_eq!(
+            count_corrupt_baks(&dir),
+            1,
+            "deep-corrupt original preserved"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decide_tail_maps_the_four_cases() {
+        // The PURE R1 torn-tail decision core (also extracted for the saw-off
+        // gate). Only a lone partial FINAL line (`!terminated && prefix_ok`) is
+        // a trim-able torn tail; every other unclean shape is Deep.
+        assert_eq!(decide_tail(true, true), TailDecision::Clean);
+        assert_eq!(decide_tail(false, true), TailDecision::TornTail);
+        assert_eq!(decide_tail(true, false), TailDecision::Deep);
+        assert_eq!(decide_tail(false, false), TailDecision::Deep);
+    }
+
+    /// Count `<mirror>.corrupt-*.bak` preserved copies in a test dir.
+    fn count_corrupt_baks(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count()
     }
 
     #[test]
