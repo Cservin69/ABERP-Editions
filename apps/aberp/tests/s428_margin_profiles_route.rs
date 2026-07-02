@@ -245,12 +245,16 @@ fn sample_feature_graph_json() -> String {
 
 /// Seed the catalogue + one extracted job (with a feature graph) so the
 /// re-price engine call succeeds.
-fn seed_job(db: &PathBuf, quote_id: &str) {
-    let mut conn = duckdb::Connection::open(db).expect("open");
-    aberp::quoting_tunables::ensure_schema(&mut conn, TEST_TENANT).expect("tunables");
-    aberp::quoting_materials::seed_if_empty(&mut conn, TEST_TENANT).expect("materials");
+fn seed_job(state: &AppState, quote_id: &str) {
+    // ADR-0098 Option 1 (try_clone): seed through the ONE shared Handle so the
+    // job is visible to the Handle-routed request handlers under test (a
+    // separate Connection::open opens a SECOND instance the Handle never sees).
+    // ensure_schema/seed_if_empty are idempotent (schemas ensured at handle boot).
+    let mut g = state.db.write().expect("seed via shared handle");
+    aberp::quoting_tunables::ensure_schema(&mut g, TEST_TENANT).expect("tunables");
+    aberp::quoting_materials::seed_if_empty(&mut g, TEST_TENANT).expect("materials");
     aberp::quote_pricing_jobs::insert_fetched_job(
-        &conn,
+        &g,
         quote_id,
         TEST_TENANT,
         "buyer@example.com",
@@ -263,18 +267,19 @@ fn seed_job(db: &PathBuf, quote_id: &str) {
         fixed_ts(),
     )
     .expect("insert job");
-    conn.execute(
-        "UPDATE quote_pricing_jobs SET state = 'rendering', feature_graph_json = ? \
-         WHERE quote_id = ? AND tenant_id = ?",
+    g.execute(
+        "UPDATE quote_pricing_jobs SET state = 'rendering', feature_graph_json = ? WHERE quote_id = ? AND tenant_id = ?",
         duckdb::params![sample_feature_graph_json(), quote_id, TEST_TENANT],
     )
     .expect("set feature graph");
 }
 
-fn stage_intake(db: &PathBuf, quote_id: &str) {
-    let conn = duckdb::Connection::open(db).expect("open");
+fn stage_intake(state: &AppState, quote_id: &str) {
+    // ADR-0098 Option 1: stage through the shared Handle so the saga (also on
+    // the Handle) sees the intake row.
+    let g = state.db.write().expect("stage intake via shared handle");
     log_table::insert_intake(
-        &conn,
+        &g,
         TEST_TENANT,
         quote_id,
         "inv_x",
@@ -309,7 +314,7 @@ fn customer_journey_partner_profile_quote_margin_floor_refuse() {
 
     // 3. quote-create (an extracted job) + assign the buyer → re-price.
     let quote_id = "5a5a5a5a-5a5a-5a5a-5a5a-5a5a5a5a5a5a";
-    seed_job(&db, quote_id);
+    seed_job(&state, quote_id);
     serve::set_quote_buyer_partner_request(
         &state,
         quote_id,
@@ -322,7 +327,7 @@ fn customer_journey_partner_profile_quote_margin_floor_refuse() {
     .expect("assign buyer + reprice");
 
     // The re-price flagged the job below the floor + emitted the event.
-    let conn = duckdb::Connection::open(&db).expect("open");
+    let conn = state.db.read().expect("read via shared handle");
     assert!(
         aberp::quote_pricing_jobs::margin_below_floor(&conn, quote_id, TEST_TENANT).expect("flag"),
         "defense profile (gross 4% < floor 10%) must trip the floor"
@@ -333,8 +338,8 @@ fn customer_journey_partner_profile_quote_margin_floor_refuse() {
     );
 
     // 4. margin-floor-refuse: the DEAL saga is hard-blocked.
-    stage_intake(&db, quote_id);
-    let mut saga_conn = duckdb::Connection::open(&db).expect("open saga conn");
+    stage_intake(&state, quote_id);
+    let mut saga_conn = state.db.write().expect("saga via shared handle");
     let meta = LedgerMeta::new(TenantId::new(TEST_TENANT).unwrap(), TEST_HASH);
     let err = run_deal_saga(
         &mut saga_conn,
@@ -363,7 +368,7 @@ fn margin_override_below_floor_needs_confirmation() {
 
     // A job with NO buyer (global default ~26% realized) prices fine.
     let quote_id = "6b6b6b6b-6b6b-6b6b-6b6b-6b6b6b6b6b6b";
-    seed_job(&db, quote_id);
+    seed_job(&state, quote_id);
 
     // An aggressive 1% markup override → realized ≈ 1% < global floor 10%.
     let unconfirmed = serve::override_quote_margin_request(
@@ -385,7 +390,7 @@ fn margin_override_below_floor_needs_confirmation() {
         "below-floor override without confirm must be refused"
     );
     // ...and nothing was persisted.
-    let conn = duckdb::Connection::open(&db).expect("open");
+    let conn = state.db.read().expect("read via shared handle");
     assert!(
         !aberp::quote_pricing_jobs::margin_below_floor(&conn, quote_id, TEST_TENANT).expect("flag"),
         "rejected override must not flag the job"
@@ -404,7 +409,7 @@ fn margin_override_below_floor_needs_confirmation() {
         TEST_HASH,
     )
     .expect("confirmed override");
-    let conn2 = duckdb::Connection::open(&db).expect("open");
+    let conn2 = state.db.read().expect("read via shared handle");
     assert!(
         aberp::quote_pricing_jobs::margin_below_floor(&conn2, quote_id, TEST_TENANT).expect("flag"),
         "confirmed below-floor override flags the job"
