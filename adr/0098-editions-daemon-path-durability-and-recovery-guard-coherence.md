@@ -1,6 +1,7 @@
 # ADR-0098 — Editions daemon-path durability & recovery-guard coherence: crash-safe quote/intake daemon writes, and recovery from a snapshot that is ahead of the mirror
 
 - **Status:** Proposed (design pass; conservative calls flagged for Ervin's confirmation/veto — see *Decisions surfaced* D1–D8. Implementation is sequenced in the companion plan `docs/daemon-durability-and-recovery-guard-fix-plan.md`, **not done here**.)
+- **Status update — v0.2.5 finalization (2026-07-02):** implemented over Sessions B/C/C2 and finalized with **Option 1 — `Handle::read()` = `try_clone` of the shared instance** (coherent reads, per the 1a design in D1). The Session-C2 F5 separate read-only instance (`read_returns_readonly`) is REMOVED — it caused pervasive post-checkpoint stale reads. Gap-2b (DB-level write-on-read fail-loud) is accepted for v0.2.5 and deferred to v0.2.6. See *§ v0.2.5 finalization* below and `docs/adr-0098-v0.2.6-scope.md`.
 - **Live evidence (2026-06-29 17:02, folded in):** the DB recovered at 16:58 (seq 109, validated, booted clean, mirror reconciled `Unchanged`) **re-tore at runtime ~4 minutes later under live daemon load** — a **reproducible** repro, not an intermittent one. This sharpened Gap 1's root cause from "the daemon write path skips the durable checkpoint" to the deeper "**multiple subsystems concurrently open the single-file DuckDB read-write in one process**"; the design below targets *that*. See §"Gap 1" and the §"Interim stopgap".
 - **Date:** 2026-06-29
 - **Deciders:** Ervin
@@ -190,6 +191,53 @@ The fix is not accepted until it **reproduces 2026-06-29 and then prevents it**:
 2. **Daemon-write crash-injection (mid-write kill → recoverable).** Re-exec a child that performs a daemon write through the handle and `abort()`s mid-checkpoint; assert the live path is never torn (the validated `durable_checkpoint`/`atomic_install` commit is all-or-nothing) and the next boot opens clean — the plain-file analogue already exists at `recover.rs:505`; extend it to the handle's checkpoint path.
 3. **Snapshot-ahead recovery (Gap 2a).** Construct snapshot head 109 > mirror head 106 with a self-consistent overlap; assert `recover_or_refuse` **Recovers** (rebuilds from the snapshot, tops the mirror up to 109, reconciles `Unchanged`) instead of `RefusedUnsafe`; and assert it still **refuses** when the overlap disagrees or the snapshot chain fails to verify.
 4. **Lockstep + pre-snapshot fsync (Gap 2b).** Assert that after a daemon write through the handle the mirror head == DB head (no lag), and that `take_snapshot` fsyncs the mirror before `EXPORT` so `snapshot.audit_count ≤ mirror_head` always holds.
+
+## v0.2.5 finalization (2026-07-02) — read() coherence: Option 1 (try_clone), Gap-2b deferred
+
+The 1a design (D1) specifies that `Handle::read()` hands out a `Connection::try_clone`
+of the one shared instance. Session C2 briefly deviated: to make a write *mis-routed*
+through `read()` fail loud at the DB layer, `read()` returned a SEPARATE read-only
+instance (`AccessMode::ReadOnly`, `read_returns_readonly = true` — review F5 / Gap-2b).
+
+**That deviation was proven wrong.** A separate DuckDB instance reads only the durably
+CHECKPOINTED live file; it does **not** replay the live writer's WAL. So any mutation
+committed since the last debounced (≤ 1/min) durable checkpoint was invisible to
+`read()` — the `avl_vendors_route` `revoke→list` stale read, and why four group-A route
+modules (quoting_machines, margin_profiles, pricing_job_material, stock_movements) went
+red. A round-13 "publish-before-read" (force a durable checkpoint before the read-only
+open) papered over it at the cost of a checkpoint on the read path. The discriminating
+e2e proved the clean fix: `read_returns_readonly = false` (try_clone of the shared
+instance) → **avl 7/7 green**, coherent everywhere.
+
+**Ervin approved Option 1 (2026-07-02).** v0.2.5 adopts `try_clone` as the SOLE read path:
+
+- **Removed:** `HandleConfig::read_returns_readonly`, the `AccessMode::ReadOnly` opener
+  (`open_runtime_connection_readonly`), and the publish-before-read
+  (`publish_committed_for_readonly`). A `try_clone` reads the shared instance's WAL
+  directly — no publish needed.
+- **Kept:** the class-1 write-on-read → `write()` routing; the tolerant `ensure_schema`
+  + eager `ensure_all_tenant_schemas`; `connection_is_read_only` (now inert on the read
+  clone, still guarding the idempotent DDL). Read call sites are unchanged (`handle.read()`).
+- **Idiomatic + no tear regression:** one instance / many connections is the DuckDB
+  model; a `try_clone` is NOT a second OS opener, so it is not a `duckdb#23046` tear
+  vector — consistent with the single-Handle design and the D5 cut-gate, which now
+  positively recognizes the Handle-internal `try_clone` (CHECK 10c-tryclone) while STILL
+  banning every separate `Connection::open` / `open_with_flags` / `Ledger::open` /
+  `DuckDbBillingStore::open` / `append_reopen` at call sites (10d/10f/10h) and keeping the
+  frozen residual-opener ledger (10i) intact.
+
+**Gap-2b acceptance.** The cost of Option 1 is losing the *DB-level* write-on-read
+fail-loud: a `try_clone` is read-WRITE, so a write mis-routed through `read()` would
+succeed silently (bypassing the post-commit durability hook) instead of being rejected.
+This is **narrow** (all real writes already flow through `write()`; the class-1 audit
+routed the known write-on-read sites) and is **accepted for v0.2.5**, then closed in
+v0.2.6 by a **compile-time** read-guard — a *stronger* guarantee than F5's runtime one,
+with NO separate instance. The single-WRITER durability invariant is unchanged.
+
+**Deferred to v0.2.6** (see `docs/adr-0098-v0.2.6-scope.md`): (a) the compile-time
+write-on-read guard; (b) the residual `Ledger::open` / separate-audit-opener migration
+(~180 runtime sites; the operator ERP modules frozen in cut-gate CHECK 10i — 139 openers
+across 31 files — which may not grow).
 
 ## Consequences
 
