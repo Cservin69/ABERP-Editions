@@ -58,7 +58,7 @@
 //! schema has no `origin` column today, so the migrated-base
 //! conditional never fires.
 
-#[cfg_attr(not(feature = "production"), allow(unused_imports))]
+#[allow(unused_imports)]
 use duckdb::Connection;
 use std::path::PathBuf;
 

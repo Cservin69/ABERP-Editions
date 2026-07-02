@@ -74,7 +74,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use duckdb::params;
-#[cfg_attr(not(feature = "production"), allow(unused_imports))]
+#[allow(unused_imports)]
 use duckdb::Connection;
 use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
