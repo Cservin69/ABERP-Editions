@@ -61,6 +61,15 @@ ignore = [
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; replaced upstream by web-time. Transitive via async-io / parking_lot test helpers." },
     { id = "RUSTSEC-2024-0388", reason = "derivative unmaintained; consider derive_more upstream. Transitive via Tauri ecosystem." },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; rustls 0.23.x pulls a transitional 2.x. Revisit when reqwest/rustls drop it." },
+
+    # ─── ADR-0098 durability branch (2026-07): newly-published 2026
+    # advisories flagged against the pristine, UNCHANGED Cargo.lock (orthogonal
+    # to the durability work). anyhow (RUSTSEC-2026-0190) was FIXED by a bump
+    # to 1.0.103 and is intentionally NOT ignored. The three below have no
+    # clean bump and are ignored with an explicit reachability assessment. ───
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained (patched=[]; no fixed version exists). Reached ONLY via lopdf -> invoice-pdf printed-invoice rendering (built-in Helvetica/WinAnsi + first-party templates, never attacker-supplied fonts) -> not attacker-reachable. TODO revisit: migrate font path to skrifa, or drop when lopdf stops depending on ttf-parser." },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml <0.41 quadratic attribute-dup DoS. Two instances: our direct 0.36 (NAV/MNB) parses XML only from authenticated NAV/MNB government TLS endpoints + self-produced InvoiceData (not attacker-controlled); the 0.39.4 instance is pinned transitively by tauri 2.11.2 -> plist (build-time .plist parsing) with no quick-xml >=0.41 upstream release yet -> no safe upgrade (same posture as the urlpattern/GTK ignores above). TODO revisit: migrate direct usage to >=0.41 in a dedicated, fully-tested branch once tauri/plist move." },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml <0.41 NsReader unbounded namespace-declaration memory-exhaustion DoS; same crate, same two instances, same >=0.41 fix and same reachability as RUSTSEC-2026-0194. TODO revisit: cleared together with -0194 when direct usage moves to >=0.41 and tauri/plist follow." },
 ]
 
 # ─────────────────────────────────────────────────────────────────────
