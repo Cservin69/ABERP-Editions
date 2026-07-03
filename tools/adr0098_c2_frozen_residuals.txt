@@ -23,6 +23,24 @@
 #   (c)=CLI-only one-shot subcommand (separate process, out of ADR-0098 scope);
 #   (serve)=serve.rs request-handler audit reads (Ledger::open) C did not migrate;
 #   (boot)=pre-serve-loop create/provision.
+#
+# ── R4 (Fable-5 finding H): the opener-scan SCOPE now includes crates/ (was
+#   apps/aberp/src + modules only — a new separate opener in a business crate
+#   e.g. aberp-mes/-qa/-inventory/-work-orders was previously INVISIBLE to D5).
+#   Hard-excluded as sanctioned seams: crates/aberp-db/* (the Handle's sole boot
+#   open, CHECK 10b/10c) and crates/aberp-snapshot/* (boot/recover/snapshot/
+#   checkpoint primitives, CHECK 5/10g). Every OTHER crate opener is frozen below:
+#   (central)=the audit-ledger central opener definitions (Ledger::open carries the
+#     R3 pragma; append_reopen is the legacy reopen-append; the `pub fn append_reopen(`
+#     self-match is a deterministic scanner artifact, counted here);
+#   (mes-residual)=aberp-mes ledger_writer::write_one — a REAL in-serve-process
+#     separate opener newly SURFACED by the R4 scope extension; FLAGGED as a v0.2.6
+#     Handle-migration target (NOT migrated this session — conservative);
+#   (c)=CLI-only bin one-shot (separate process, out of ADR-0098 scope).
+#   NOTE: CHECK 10j (pragma-presence) keeps its R3 scope (apps/aberp+modules); the
+#   crate residuals here are frozen for COUNT (10i) + FINGERPRINT (10k) but not
+#   pragma-enforced — residual fold-on-close risk for the mes/bin openers is noted
+#   in the R4 findings notes (v0.2.6: migrate onto the Handle, which carries it).
 1 apps/aberp/src/audit_dap_boot.rs
 2 apps/aberp/src/avl_vendors.rs
 8 apps/aberp/src/drain_pending_retries.rs
@@ -53,3 +71,6 @@
 3 apps/aberp/src/submit_annulment.rs
 1 apps/aberp/src/tenant_registry.rs
 1 modules/billing/src/adapters/duckdb_store.rs
+3 crates/audit-ledger/src/storage/mod.rs
+1 crates/aberp-mes/src/ledger_writer.rs
+1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs

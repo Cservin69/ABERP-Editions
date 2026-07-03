@@ -289,6 +289,33 @@ open(p,"w").write(s)
 PYIN
 expect_pass "$c" "CHECK 10j — a pragma-less Connection::open inside #[cfg(test)] is correctly IGNORED (not a residual)"
 
+echo "[CHECK 10i/crates] R4 finding H·a — a NEW live-path Connection::open in a business crate (aberp-qa) that the pre-R4 scope (apps/aberp+modules only) could NOT see"
+c="$(fresh)"
+printf 'pub fn _r4_probe_new_crate_opener(p: &std::path::Path) -> Result<duckdb::Connection, duckdb::Error> {\n    duckdb::Connection::open(p)\n}\n' > "$c/crates/aberp-qa/src/zz_r4_probe_opener.rs"
+expect_fail "$c" "NEW unaccounted opener-bearing file" "CHECK 10i/crates — a new separate opener in crates/ (invisible pre-R4) is now rejected"
+
+echo "[CHECK 10h/alias] R4 finding H·b — an ALIASED live-DB open (use duckdb::Connection as X; X::open) in a migrated file (ap_sync) that the literal-token scan would MISS"
+c="$(fresh)"
+printf '\nuse duckdb::Connection as R4AliasConn;\nfn _r4_probe_alias_open(p: &std::path::Path) -> Result<R4AliasConn, duckdb::Error> {\n    R4AliasConn::open(p)\n}\n' >> "$c/apps/aberp/src/ap_sync.rs"
+expect_fail "$c" "(Session-C2 regression)" "CHECK 10h/alias — an aliased Connection::open (alias-evasion) is caught, not invisible"
+
+echo "[CHECK 10h/alias] R4 finding H·b — an aliased open INSIDE a #[cfg(test)] block must NOT trip (alias scan is cfg(test)-aware, no false-positive)"
+c="$(fresh)"
+printf '\n#[cfg(test)]\nmod r4_alias_test_probe {\n    use duckdb::Connection as TAlias;\n    fn t(p: &std::path::Path) { let _ = TAlias::open(p); }\n}\n' >> "$c/apps/aberp/src/ap_sync.rs"
+expect_pass "$c" "CHECK 10h/alias — an aliased open inside #[cfg(test)] is correctly IGNORED (cfg(test)-aware alias scan)"
+
+echo "[CHECK 10k] R4 finding H·c — a COUNT-PRESERVING opener swap (mutate a frozen opener line) — 10i count stays green, 10k fingerprint must catch it"
+c="$(fresh)"
+python3 - "$c/apps/aberp/src/tenant_registry.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+old="let mut ledger = Ledger::open(db_path, tenant, binary_hash)"
+new="let mut ledger_swapped = Ledger::open(db_path, tenant, binary_hash)"
+assert s.count(old)==1, "10k probe anchor not unique"
+open(p,"w").write(s.replace(old,new,1))
+PYIN
+expect_fail "$c" "opener fingerprint set DIVERGED" "CHECK 10k — a count-preserving intra-file opener swap is caught by the fingerprint freeze"
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi

@@ -1,8 +1,12 @@
-# ADR-0098 C2 — shared comment/string/cfg(test)-aware live-DB opener scanner.
-# Toolchain-free (awk only). Prints "LINE:fname:text" for each RUNTIME (outside
-# #[cfg(test)]) independent live-tenant-DB opener:
+# ADR-0098 C2 (+ R4 finding H) — shared comment/string/cfg(test)-aware live-DB
+# opener scanner. Toolchain-free (awk only). Prints "LINE:fname:text" for each
+# RUNTIME (outside #[cfg(test)]) independent live-tenant-DB opener:
 #   Connection::open( / Connection::open_with_flags( / Ledger::open( /
-#   DuckDbBillingStore::open( / *.append_reopen(
+#   DuckDbBillingStore::open( / Database::open( / *.append_reopen(
+# R4 finding H (b) — ALIAS EVASION: a `use duckdb::Connection as C;` (or any
+#   `use ... <OpenerType> as <Alias>;`) rename followed by `<Alias>::open(` is
+#   now caught too. Aliases of Connection / Ledger / DuckDbBillingStore /
+#   Database are tracked per file and matched as `<Alias>::open(_with_flags)?(`.
 # EXCLUDED (the sanctioned shared-instance seams): open_in_memory, from_connection.
 # Boot/allow-listed fn names may be passed via -v allow="fn1,fn2".
 # Strings, // line comments and /* */ block comments are skipped so a banned
@@ -31,11 +35,26 @@ function is_allowed(name,   k){ for(k=1;k<=n_allow;k++) if(A[k]==name) return 1;
     else if(c=="}"){ if(tdepth==depth) tdepth=-1; depth-- }
   }
   now_in=(tdepth>=0); intest = was_in || now_in
+  # R4 (b): learn per-file aliases of the opener types from `use ... as X;`.
+  # A `use` line is never itself an opener call, so we can learn even in test
+  # regions (a test-only alias used only in test code is skipped below anyway).
+  if (code ~ /(^|[^A-Za-z0-9_])use([^A-Za-z0-9_])/ \
+      && match(code, /(Connection|Ledger|DuckDbBillingStore|Database)[ \t]+as[ \t]+[A-Za-z_][A-Za-z0-9_]*/)) {
+    a=substr(code,RSTART,RLENGTH); sub(/.*as[ \t]+/,"",a); ALIAS[a]=1
+  }
   if (!intest) {
-    if ((code ~ /(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open)\(/ \
+    hit=0
+    if ((code ~ /(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open|Database::open)\(/ \
          || code ~ /append_reopen[ \t]*\(/) \
         && code !~ /open_in_memory/ && code !~ /from_connection/) {
-      if (!is_allowed(fname)) { t=line; sub(/^[ \t]+/,"",t); printf "%d:%s:%s\n",NR,fname,substr(t,1,76) }
+      hit=1
     }
+    # R4 (b): aliased open — `<Alias>::open(` / `<Alias>::open_with_flags(`.
+    if (!hit && code !~ /open_in_memory/ && code !~ /from_connection/) {
+      for (a in ALIAS) {
+        if (code ~ (a "::open(_with_flags)?[ \t]*\\(")) { hit=1; break }
+      }
+    }
+    if (hit && !is_allowed(fname)) { t=line; sub(/^[ \t]+/,"",t); printf "%d:%s:%s\n",NR,fname,substr(t,1,76) }
   }
 }

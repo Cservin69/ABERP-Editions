@@ -682,7 +682,7 @@ done
 #    may appear unlisted. This is what makes a deferred-to-v0.2.6 surface SAFE
 #    (it cannot silently grow) and what keeps a green D5 from ever again meaning
 #    "blind to most of the openers" (review F1-F4). Toolchain-free (awk).
-echo "[CHECK 10i] ADR-0098 Session C2 — frozen residual-opener ledger (operator/CLI/serve cannot grow; ENFORCED · D5)"
+echo "[CHECK 10i] ADR-0098 Session C2 (+ R4 finding H·a: scope now includes crates/) — frozen residual-opener ledger (operator/CLI/serve/crates cannot grow; ENFORCED · D5)"
 manifest="tools/adr0098_c2_frozen_residuals.txt"
 if [[ ! -f "$manifest" ]]; then
   flag10 "✗ frozen-residual manifest missing: $manifest"
@@ -693,7 +693,7 @@ else
   resid_fail=0
   while IFS= read -r f; do
     case " $c2_set " in *" $f "*) continue;; esac
-    case "$f" in crates/aberp-db/*|crates/aberp-snapshot/src/take.rs) continue;; esac
+    case "$f" in crates/aberp-db/*|crates/aberp-snapshot/*) continue;; esac
     if [[ "$f" == "apps/aberp/src/serve.rs" ]]; then
       actual="$(awk -v allow="run,seed_demo_sample_data" -f "$scan" "$f" 2>/dev/null | wc -l | tr -d ' ')"
     else
@@ -708,7 +708,7 @@ else
       flag10 "✗ $f grew its residual openers ($actual > frozen $frozen) — the deferred surface may not grow; migrate the new opener onto the Handle"
       resid_fail=1
     fi
-  done < <(find apps/aberp/src modules -name '*.rs' | grep -vE '/tests/' | sort)
+  done < <(find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/' | sort)
   if [[ "$resid_fail" == "0" ]]; then
     ft="$(grep -vE '^#' "$manifest" | awk '{s+=$1} END{print s}')"
     ff="$(grep -vcE '^#' "$manifest")"
@@ -758,7 +758,7 @@ else
   pragma_fail=0
   while IFS= read -r f; do
     case " $c2_set " in *" $f "*) continue;; esac
-    case "$f" in crates/aberp-db/*|crates/aberp-snapshot/src/take.rs) continue;; esac
+    case "$f" in crates/aberp-db/*|crates/aberp-snapshot/*) continue;; esac
     frozen="$(awk -v p="$f" '$1!="#" && $2==p{print $1}' "$manifest")"
     [[ -z "$frozen" ]] && continue
     if [[ "$f" == "apps/aberp/src/serve.rs" ]]; then
@@ -779,6 +779,45 @@ else
   if [[ "$pragma_fail" == "0" ]]; then
     note "✓ every frozen residual Connection::open carries $PRAGMA within $WINDOW lines (no silent close-checkpoint fold)"
   fi
+fi
+
+# ── CHECK 10k — ADR-0098 R4 (finding H·c): per-opener FINGERPRINT freeze. 10i freezes
+#    the COUNT of residual openers per file; a raw count cannot see an intra-file SWAP
+#    (drop 3 legit openers + add 3 different ones = same count, gate stays green). 10k
+#    freezes the SET of per-opener fingerprints (<file>|<fname>:<opener-text>; line
+#    numbers dropped so a benign line-shift doesn't churn it) across the SAME extended
+#    scope as 10i (apps/aberp + modules + crates, minus the sanctioned aberp-db /
+#    aberp-snapshot seams + the 7 C2-migrated files). Any add, removal, or content change
+#    of an opener flips the set -> RED. 10i (count) stays as the coarse backstop; 10k is
+#    the precise one. Teeth: cut_gate_negative_probes.sh "[CHECK 10k]" does a count-
+#    preserving swap. ENFORCE_OPENER_FINGERPRINTS=0 disables it for a deliberate probe.
+echo "[CHECK 10k] ADR-0098 R4 (finding H·c) — per-opener fingerprint freeze (intra-file swap cannot hide; ENFORCED · D5)"
+enforce10k="${ENFORCE_OPENER_FINGERPRINTS:-1}"
+flag10k() { note "$1"; if [[ "$enforce10k" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+fpfile="tools/adr0098_r4_opener_fingerprints.txt"
+if [[ ! -f "$scan" || ! -f "$fpfile" ]]; then
+  flag10k "✗ opener scanner or fingerprint manifest missing: $fpfile"
+else
+  cur="$(mktemp)"; froz="$(mktemp)"
+  while IFS= read -r f; do
+    case " $c2_set " in *" $f "*) continue;; esac
+    case "$f" in crates/aberp-db/*|crates/aberp-snapshot/*) continue;; esac
+    if [[ "$f" == "apps/aberp/src/serve.rs" ]]; then
+      sigs="$(awk -v allow="run,seed_demo_sample_data" -f "$scan" "$f" 2>/dev/null | sed 's/^[0-9]*://')"
+    else
+      sigs="$(awk -f "$scan" "$f" 2>/dev/null | sed 's/^[0-9]*://')"
+    fi
+    [[ -z "$sigs" ]] && continue
+    while IFS= read -r sig; do printf '%s|%s\n' "$f" "$sig"; done <<< "$sigs"
+  done < <(find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/' | sort) | sort > "$cur"
+  grep -vE '^#' "$fpfile" | sort > "$froz"
+  if diff -q "$froz" "$cur" >/dev/null 2>&1; then
+    note "✓ opener fingerprint set matches the frozen baseline ($(grep -vcE '^#' "$fpfile") openers; no add/remove/swap)"
+  else
+    flag10k "✗ opener fingerprint set DIVERGED from $fpfile (an opener was added, removed, or content-swapped — count-preserving swaps are caught here):"
+    diff "$froz" "$cur" | sed 's/^/      /' | head -40
+  fi
+  rm -f "$cur" "$froz"
 fi
 
 echo
