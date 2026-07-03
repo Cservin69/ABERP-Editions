@@ -862,6 +862,8 @@ pub struct InvoiceNotes {
 pub fn load_invoice_notes(db: &Path, invoice_id: &str) -> Result<InvoiceNotes> {
     let mut conn = Connection::open(db)
         .with_context(|| format!("open tenant DuckDB for notes read at {}", db.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     let tx = conn
         .transaction()
         .context("begin read transaction for buyer-notes lookup")?;
@@ -923,6 +925,8 @@ pub fn load_invoice_bank_snapshot(
 ) -> Result<Option<BankAccountSnapshot>> {
     let mut conn = Connection::open(db)
         .with_context(|| format!("open tenant DuckDB for bank snapshot at {}", db.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     let tx = conn
         .transaction()
         .context("begin read transaction for bank snapshot lookup")?;

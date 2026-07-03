@@ -132,6 +132,8 @@ pub fn record_manual_inspection(
     let (recorded, plan) = {
         let mut conn = Connection::open(db_path)
             .map_err(|e| QcRecordError::Other(anyhow::anyhow!("open DuckDB: {e}")))?;
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .map_err(|e| QcRecordError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
         let plan = get_inspection_plan(&conn, tenant.as_str(), &req.plan_id)?
             .ok_or(QcRecordError::PlanNotFound)?;
         if plan.archived_at.is_some() {
@@ -216,6 +218,8 @@ pub fn record_manual_inspection(
         {
             let mut conn = Connection::open(db_path)
                 .map_err(|e| QcRecordError::Other(anyhow::anyhow!("open DuckDB for link: {e}")))?;
+            conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+                .map_err(|e| QcRecordError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
             let link_meta = LedgerMeta::new(tenant.clone(), binary_hash);
             let link_ctx = QcWriteContext {
                 tenant: tenant.as_str(),

@@ -237,6 +237,8 @@ pub fn record_calibration_for_completed_wo(
     };
 
     let conn = Connection::open(db_path).context("open tenant DuckDB for calibration hook")?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
 
     let estimate = read_quote_estimate(&conn, tenant.as_str(), job_id)?;
 

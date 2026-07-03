@@ -224,6 +224,8 @@ pub fn run(args: &RequestTechnicalAnnulmentArgs) -> Result<()> {
     );
     let mut conn = Connection::open(&args.db)
         .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     audit_ledger::ensure_schema(&conn)
         .context("ensure audit-ledger schema for request-technical-annulment")?;
     {

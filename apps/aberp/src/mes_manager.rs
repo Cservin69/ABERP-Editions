@@ -444,6 +444,8 @@ impl AdapterManager {
         let actor = Actor::from_local_cli(Ulid::new().to_string(), &deps.operator_login);
         let mut conn = Connection::open(&deps.db_path)
             .map_err(|e| AdapterMutationError::Io(anyhow!("open DuckDB for adapter audit: {e}")))?;
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .map_err(|e| AdapterMutationError::Io(anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
         aberp_audit_ledger::ensure_schema(&conn)
             .map_err(|e| AdapterMutationError::Io(anyhow!("ensure audit schema: {e}")))?;
         let tx = conn

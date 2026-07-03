@@ -1299,6 +1299,8 @@ pub fn compute_financial_report(
     let window = resolve_window(req.period)?;
     let conn = Connection::open(db_path)
         .with_context(|| format!("open DuckDB at {} for financial report", db_path.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
 
     // Ensure relevant schemas exist (idempotent; mirrors how the existing
     // list endpoints lazily ensure schema on first read). Billing-side
@@ -1322,6 +1324,8 @@ pub fn compute_financial_report(
             db_path.display()
         )
     })?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
 
     let tenant_str = tenant.as_str().to_string();
     let ledger = Ledger::open(db_path, tenant.clone(), binary_hash)

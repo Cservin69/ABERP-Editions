@@ -772,6 +772,8 @@ pub fn list_incoming(
             db_path.display()
         )
     })?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     ensure_schema(&conn).context("ensure ap_invoice schema (list)")?;
 
     let mut rows = Vec::new();
@@ -826,6 +828,8 @@ pub fn get_incoming(db_path: &Path, tenant: &str, id: &str) -> Result<Option<Inc
             db_path.display()
         )
     })?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     ensure_schema(&conn).context("ensure ap_invoice schema (get)")?;
     let mut stmt = conn.prepare(
         "SELECT id, supplier_tax_number, supplier_name, supplier_address,
@@ -860,6 +864,8 @@ pub fn get_nav_xml_path(
             db_path.display()
         )
     })?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     ensure_schema(&conn).context("ensure ap_invoice schema (nav_xml_path read)")?;
     let mut stmt = conn.prepare(
         "SELECT nav_xml_path FROM ap_invoice
@@ -893,6 +899,8 @@ pub fn set_nav_xml_path(
             db_path.display()
         )
     })?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     ensure_schema(&conn).context("ensure ap_invoice schema (nav_xml_path UPDATE)")?;
     let now = OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -983,6 +991,8 @@ pub fn change_status(
             db_path.display()
         )
     })?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     ensure_schema(&conn).context("ensure ap_invoice schema (status change)")?;
     audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema (status change)")?;
 

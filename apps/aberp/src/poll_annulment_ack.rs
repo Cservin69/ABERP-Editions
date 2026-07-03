@@ -224,6 +224,8 @@ pub fn run(args: &PollAnnulmentAckArgs) -> Result<()> {
     //    path needs a writable Connection).
     let mut conn = Connection::open(&args.db)
         .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

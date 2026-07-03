@@ -178,6 +178,8 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
     // 3. Load the previously-issued invoice + its idempotency key.
     let mut conn = Connection::open(&args.db)
         .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     let (ready_invoice, idempotency_key) = load_issued_invoice(&mut conn, &args.invoice_id)?;
     if ready_invoice.id.to_prefixed_string() != args.invoice_id {
         return Err(anyhow!(

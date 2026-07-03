@@ -676,6 +676,8 @@ pub fn create_ncr(
     {
         let conn = Connection::open(db_path)
             .map_err(|e| QualityError::Other(anyhow::anyhow!("open DuckDB for NCR create: {e}")))?;
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .map_err(|e| QualityError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
         ensure_schema(&conn)?;
         conn.execute(
             "INSERT INTO ncrs (ncr_id, tenant_id, discovered_at_utc, discovered_by_operator, \
@@ -744,6 +746,8 @@ pub fn transition_ncr(
         let conn = Connection::open(db_path).map_err(|e| {
             QualityError::Other(anyhow::anyhow!("open DuckDB for NCR transition: {e}"))
         })?;
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .map_err(|e| QualityError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
         ensure_schema(&conn)?;
         let Some(ncr) = get_ncr(&conn, tenant.as_str(), ncr_id)? else {
             return Err(QualityError::NcrNotFound(ncr_id.to_string()));
@@ -848,6 +852,8 @@ pub fn transition_ncr(
     }
     let conn = Connection::open(db_path)
         .map_err(|e| QualityError::Other(anyhow::anyhow!("reopen DuckDB: {e}")))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
     get_ncr(&conn, tenant.as_str(), ncr_id)?
         .ok_or_else(|| QualityError::NcrNotFound(ncr_id.to_string()))
 }
@@ -866,6 +872,8 @@ pub fn escalate_overdue_ncrs(
     let due: Vec<Ncr> = {
         let conn = Connection::open(db_path)
             .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
         list_ncrs(&conn, tenant.as_str(), &NcrFilter::default())?
             .into_iter()
             .filter(|n| {
@@ -882,6 +890,8 @@ pub fn escalate_overdue_ncrs(
         {
             let conn = Connection::open(db_path)
                 .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+            conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+                .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
             let seq: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(seq), -1) + 1 FROM ncr_transitions WHERE tenant_id = ?1 AND ncr_id = ?2",
@@ -974,6 +984,8 @@ pub fn create_capa(
         let conn = Connection::open(db_path).map_err(|e| {
             QualityError::Other(anyhow::anyhow!("open DuckDB for CAPA create: {e}"))
         })?;
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .map_err(|e| QualityError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
         ensure_schema(&conn)?;
         if get_ncr(&conn, tenant.as_str(), &capa.ncr_id)?.is_none() {
             return Err(QualityError::NcrNotFound(capa.ncr_id.clone()));
@@ -1029,6 +1041,8 @@ pub fn approve_capa(
         let conn = Connection::open(db_path).map_err(|e| {
             QualityError::Other(anyhow::anyhow!("open DuckDB for CAPA approve: {e}"))
         })?;
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .map_err(|e| QualityError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
         ensure_schema(&conn)?;
         let Some(capa) = get_capa(&conn, tenant.as_str(), capa_id)? else {
             return Err(QualityError::CapaNotFound(capa_id.to_string()));
@@ -1078,6 +1092,8 @@ pub fn review_capa_effectiveness(
         let conn = Connection::open(db_path).map_err(|e| {
             QualityError::Other(anyhow::anyhow!("open DuckDB for CAPA review: {e}"))
         })?;
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .map_err(|e| QualityError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
         ensure_schema(&conn)?;
         let Some(capa) = get_capa(&conn, tenant.as_str(), capa_id)? else {
             return Err(QualityError::CapaNotFound(capa_id.to_string()));
@@ -1126,6 +1142,8 @@ pub fn close_capa(
     let ncr_id = {
         let conn = Connection::open(db_path)
             .map_err(|e| QualityError::Other(anyhow::anyhow!("open DuckDB for CAPA close: {e}")))?;
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .map_err(|e| QualityError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
         ensure_schema(&conn)?;
         let Some(capa) = get_capa(&conn, tenant.as_str(), capa_id)? else {
             return Err(QualityError::CapaNotFound(capa_id.to_string()));
@@ -1165,6 +1183,8 @@ fn reread_capa(
 ) -> std::result::Result<Capa, QualityError> {
     let conn = Connection::open(db_path)
         .map_err(|e| QualityError::Other(anyhow::anyhow!("reopen DuckDB: {e}")))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .map_err(|e| QualityError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
     get_capa(&conn, tenant.as_str(), capa_id)?
         .ok_or_else(|| QualityError::CapaNotFound(capa_id.to_string()))
 }

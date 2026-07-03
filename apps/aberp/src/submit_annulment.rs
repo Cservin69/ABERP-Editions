@@ -218,6 +218,8 @@ pub fn run(args: &SubmitAnnulmentArgs) -> Result<()> {
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
     let mut conn = Connection::open(&args.db)
         .with_context(|| format!("open tenant DuckDB at {}", args.db.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     write_annulment_submission_audit_entries(
         &mut conn,
         &ledger_meta,

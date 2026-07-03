@@ -354,9 +354,13 @@ pub struct DuckDbBillingStore {
 
 impl DuckDbBillingStore {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, BillingError> {
-        Ok(Self {
-            conn: Connection::open(path)?,
-        })
+        let conn = Connection::open(path)?;
+        // ADR-0098 R3 (finding C) — suppress DuckDB's implicit close-checkpoint
+        // (in-place WAL fold, duckdb#23046) on the billing-store connection so
+        // its ~10 callers inherit the guard. Exact pragma string from
+        // take.rs:208 / aberp-db open_runtime_connection.
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")?;
+        Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self, BillingError> {

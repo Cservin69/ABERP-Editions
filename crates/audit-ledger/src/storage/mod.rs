@@ -151,6 +151,13 @@ impl Ledger {
         binary_hash: BinaryHash,
     ) -> Result<Self, AppendError> {
         let conn = Connection::open(path)?;
+        // ADR-0098 R3 (finding C) — suppress DuckDB's implicit close-checkpoint
+        // (in-place WAL fold, duckdb#23046) on every Ledger::open connection, so
+        // this central opener's ~145 callers inherit the guard. Exact pragma
+        // string from crates/aberp-snapshot/src/take.rs:208 / aberp-db
+        // open_runtime_connection. An unknown pragma errors HARD (loud, never
+        // silent) — the desired fail-hard posture.
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")?;
         Self::initialise(conn, tenant_id, binary_hash)
     }
 

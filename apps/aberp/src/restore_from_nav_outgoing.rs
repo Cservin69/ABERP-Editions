@@ -382,6 +382,8 @@ pub fn acquire_restore_lock_at(
 ) -> Result<bool> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     ensure_schema(&conn)?;
     acquire_restore_lock(&conn, tenant, operator, year, acquired_at)
 }
@@ -392,6 +394,8 @@ pub fn acquire_restore_lock_at(
 pub fn read_restore_lock_at(db_path: &Path, tenant: &str) -> Result<Option<RestoreLock>> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     ensure_schema(&conn)?;
     read_restore_lock(&conn, tenant)
 }
@@ -401,6 +405,8 @@ pub fn read_restore_lock_at(db_path: &Path, tenant: &str) -> Result<Option<Resto
 pub fn release_restore_lock_at(db_path: &Path, tenant: &str) -> Result<()> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     ensure_schema(&conn)?;
     release_restore_lock(&conn, tenant)
 }
@@ -642,6 +648,8 @@ pub struct RestoredInvoice {
 pub fn list_restored(db_path: &Path, tenant: &str) -> Result<Vec<RestoredInvoice>> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     ensure_schema(&conn)?;
     let mut stmt = conn.prepare(
         "SELECT id, source_nav_invoice_number, source_nav_transaction_id, issue_date,
@@ -868,6 +876,8 @@ pub fn list_restored_missing_buyer(
 ) -> Result<Vec<RestoredMissingBuyer>> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     ensure_schema(&conn)?;
     let mut stmt = conn.prepare(
         "SELECT source_nav_invoice_number
@@ -2054,6 +2064,8 @@ fn process_digest(
             ctx.db_path.display()
         )
     })?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     ensure_schema(&conn).context("ensure restored_invoice schema (insert)")?;
     audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema (restore insert)")?;
 
@@ -2394,6 +2406,8 @@ fn append_backfill_cycle_entry(
 ) -> Result<()> {
     let mut conn = Connection::open(&inputs.db_path)
         .with_context(|| format!("open tenant DuckDB at {}", inputs.db_path.display()))?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     audit_ledger::ensure_schema(&conn)
         .context("ensure audit-ledger schema for backfill cycle audit entry")?;
     let session_id = Ulid::new().to_string();
@@ -2480,6 +2494,8 @@ async fn backfill_one_row(
                 db_path.display()
             )
         })?;
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
         let affected = update_buyer_fields(
             &conn,
             &tenant,

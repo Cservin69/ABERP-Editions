@@ -846,6 +846,8 @@ pub fn open_for_extract(db_path: &Path) -> Result<Connection> {
             db_path.display()
         )
     })?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     partners::ensure_schema(&conn).context("ensure partners schema for S196 extraction")?;
     products::ensure_schema(&conn).context("ensure products schema for S196 extraction")?;
     Ok(conn)

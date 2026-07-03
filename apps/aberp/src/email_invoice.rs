@@ -701,6 +701,8 @@ pub fn record_email_audit_entry(
             db_path.display()
         )
     })?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
     aberp_audit_ledger::ensure_schema(&conn)
         .context("ensure audit-ledger schema for emailed-sent")?;
