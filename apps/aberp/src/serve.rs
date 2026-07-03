@@ -18623,11 +18623,13 @@ async fn handle_ingest_incoming_invoice(
         Ok(p) => p,
         Err(e) => return internal_error("ingest_incoming_invoice:artifacts_dir", e),
     };
-    let db_path = state.db_path.clone();
+    // ADR-0098 R3 (finding C) — ingest routes through the shared Handle (db.write())
+    // now, so hand the manual-route blocking task the Handle, not the bare path.
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let result = tokio::task::spawn_blocking(move || {
         incoming_invoices::ingest_incoming_invoice(
-            &db_path,
+            &db,
             tenant,
             binary_hash,
             &operator_login,

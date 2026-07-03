@@ -236,7 +236,7 @@ pub fn modification_from_inputs(
 
     // ADR-0031 §5 pre-allocation hard-cap check.
     let pending_count =
-        crate::submission_queue::count_pending(db.db_path(), tenant.clone(), binary_hash_bytes)
+        crate::submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
             .context("count pending submissions (ADR-0031 §5 cap check) for modification")?;
     if pending_count >= crate::submission_queue::HARD_CAP_PENDING {
         return Err(anyhow!(

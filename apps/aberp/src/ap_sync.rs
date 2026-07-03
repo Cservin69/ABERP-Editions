@@ -443,8 +443,12 @@ async fn run_cycle_inner(
         // returns so the queryInvoiceData HTTP calls are NOT held on
         // the blocking pool.
         let digests = page_result.digests;
-        // ADR-0098 C2 residual: incoming_invoices::* still path-opens (frozen,
-        // gate-tracked, deferred to v0.2.6); fed the live path via db.db_path().
+        // ADR-0098 R3 (finding C): the AP-ingest INSERT+audit now routes through
+        // the shared Handle (ingest_incoming_invoice takes &HandleArc, db.write()).
+        // The remaining incoming_invoices::* reads (get_nav_xml_path) stay
+        // path-opened frozen residuals (pragma-guarded) fed via db.db_path(),
+        // deferred to v0.2.6.
+        let db = inputs.db.clone();
         let db_path = inputs.db.db_path().to_path_buf();
         let tenant = inputs.tenant.clone();
         let binary_hash = inputs.binary_hash;
@@ -458,7 +462,7 @@ async fn run_cycle_inner(
                 match digest_to_ingestion_input(&digest) {
                     Ok(input) => {
                         match incoming_invoices::ingest_incoming_invoice(
-                            &db_path,
+                            &db,
                             tenant.clone(),
                             binary_hash,
                             &operator_login,
@@ -1681,7 +1685,7 @@ mod tests {
             currency: "HUF".into(),
             nav_xml: None,
         };
-        let outcome = incoming_invoices::ingest_incoming_invoice(
+        let outcome = incoming_invoices::ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             binary_hash,
@@ -2025,7 +2029,7 @@ mod tests {
             currency: "HUF".into(),
             nav_xml: None,
         };
-        let outcome = incoming_invoices::ingest_incoming_invoice(
+        let outcome = incoming_invoices::ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             binary_hash,

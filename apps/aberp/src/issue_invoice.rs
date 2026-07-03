@@ -557,7 +557,7 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     //     is preserved. The check opens + drops its own Ledger
     //     handle; pre_tx_setup below opens a fresh Connection.
     let pending_count =
-        submission_queue::count_pending(db.db_path(), tenant.clone(), binary_hash_bytes)
+        submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
             .context("count pending submissions (ADR-0031 §5 cap check)")?;
     if pending_count >= submission_queue::HARD_CAP_PENDING {
         return Err(anyhow!(

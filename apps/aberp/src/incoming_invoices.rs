@@ -452,7 +452,7 @@ static INGEST_SERIALIZER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// stays compact; an inspector can fetch the bytes from the
 /// well-known path.
 pub fn ingest_incoming_invoice(
-    db_path: &Path,
+    db: &aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: audit_ledger::BinaryHash,
     operator_login: &str,
@@ -478,11 +478,16 @@ pub fn ingest_incoming_invoice(
         .lock()
         .map_err(|_| anyhow!("ingest serializer mutex poisoned by a prior panic"))?;
 
-    let mut conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for ap_invoice ingestion",
-            db_path.display()
-        )
+    // ADR-0098 R3 (finding C) — route the AP-ingest INSERT + audit append through
+    // the shared Handle's serialized writer (db.write()) instead of an independent
+    // Connection::open of the live path. That separate opener was the
+    // daemon-frequency (~2s bootstrap-year backfill cadence, driven by ap_sync)
+    // swap-orphan silent-write-loss vector + duckdb#23046 in-place-fold re-open
+    // locus. The WriteGuard's post-commit hook runs the lockstep sync_mirror on
+    // drop; chain verification reuses a shared read clone below (never a second
+    // independent opener).
+    let mut conn = db.write().map_err(|e| {
+        IngestError::Other(anyhow!("shared writer for ap_invoice ingestion: {e}"))
     })?;
     ensure_schema(&conn).context("ensure ap_invoice schema (ingestion)")?;
     audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema (ingestion)")?;
@@ -644,18 +649,22 @@ pub fn ingest_incoming_invoice(
     tx.commit()
         .context("commit DuckDB transaction (ap_invoice ingest)")?;
 
-    // Mirror sync + chain verify post-commit (same posture as
-    // mark_invoice_paid::mark_paid).
-    drop(conn);
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to verify chain after ap_invoice ingest")?;
+    // ADR-0098 R3 (finding C) / C2 pattern — the WriteGuard's drop runs the
+    // lockstep sync_mirror post-commit hook, so the explicit Ledger::open +
+    // sync_mirror (a SECOND independent live opener) is removed. Chain
+    // verification reuses a shared READ clone (Ledger::from_connection over
+    // db.read() — a try_clone of the one instance, coherent), never an
+    // independent Connection::open / Ledger::open (the duckdb#23046 replay locus).
+    drop(conn); // WriteGuard drop -> post-commit lockstep sync_mirror
+    let verify_conn = db.read().map_err(|e| {
+        IngestError::Other(anyhow!(
+            "shared read to verify chain after ap_invoice ingest: {e}"
+        ))
+    })?;
+    let ledger = Ledger::from_connection(verify_conn, tenant, binary_hash);
     ledger
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER ap_invoice ingest")?;
-    let mirror_path = audit_ledger::mirror_path_for(db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after ap_invoice ingest")?;
 
     Ok(IngestOutcome::Created { id })
 }
@@ -1130,6 +1139,33 @@ pub(crate) fn is_canonical_iso_date(s: &str) -> bool {
     time::Date::parse(s, &format).is_ok()
 }
 
+// ADR-0098 R3 (finding C) — test shim. `ingest_incoming_invoice` now takes the
+// shared `aberp_db::HandleArc` (production routes ap_sync + the manual route
+// through it). Unit tests still express fixtures as a `&Path`; this shim builds
+// a throwaway Handle over that path and calls the migrated fn, so each test's
+// ingest exercises the real db.write() seam. Concurrency tests that need a
+// SHARED writer build one Handle and clone the Arc across threads directly.
+#[cfg(test)]
+pub(crate) fn ingest_incoming_invoice_via_handle_for_test(
+    db_path: &Path,
+    tenant: TenantId,
+    binary_hash: audit_ledger::BinaryHash,
+    operator_login: &str,
+    ap_artifacts_dir: &Path,
+    input: IngestionInput,
+) -> std::result::Result<IngestOutcome, IngestError> {
+    let db = aberp_db::Handle::open_default(db_path, tenant.clone())
+        .map_err(|e| IngestError::Other(anyhow!("open shared Handle for test ingest: {e}")))?;
+    ingest_incoming_invoice(
+        &db,
+        tenant,
+        binary_hash,
+        operator_login,
+        ap_artifacts_dir,
+        input,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1308,7 +1344,7 @@ mod tests {
         let tenant = fixture_tenant();
         let bh = fixture_binary_hash();
 
-        let first = ingest_incoming_invoice(
+        let first = ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1322,7 +1358,7 @@ mod tests {
             other => panic!("expected Created, got {other:?}"),
         };
 
-        let second = ingest_incoming_invoice(
+        let second = ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1351,7 +1387,7 @@ mod tests {
         let tenant = fixture_tenant();
         let bh = fixture_binary_hash();
 
-        ingest_incoming_invoice(
+        ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1363,7 +1399,7 @@ mod tests {
 
         let mut second = fixture_input();
         second.nav_invoice_number = "SUP-2026/000002".into();
-        ingest_incoming_invoice(
+        ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1375,7 +1411,7 @@ mod tests {
 
         let mut third = fixture_input();
         third.supplier_tax_number = "87654321".into();
-        ingest_incoming_invoice(
+        ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1407,7 +1443,7 @@ mod tests {
 
         let mut input = fixture_input();
         input.nav_xml = Some(xml_bytes.clone());
-        let outcome = ingest_incoming_invoice(
+        let outcome = ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1451,7 +1487,7 @@ mod tests {
         let tenant = fixture_tenant();
         let bh = fixture_binary_hash();
 
-        let outcome = ingest_incoming_invoice(
+        let outcome = ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1502,7 +1538,7 @@ mod tests {
         let tenant = fixture_tenant();
         let bh = fixture_binary_hash();
 
-        let outcome = ingest_incoming_invoice(
+        let outcome = ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1578,7 +1614,7 @@ mod tests {
         let tenant = fixture_tenant();
         let bh = fixture_binary_hash();
 
-        let outcome = ingest_incoming_invoice(
+        let outcome = ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1780,7 +1816,7 @@ mod tests {
         let tenant = fixture_tenant();
         let bh = fixture_binary_hash();
 
-        let first = ingest_incoming_invoice(
+        let first = ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1797,7 +1833,7 @@ mod tests {
         // A SECOND ingest of the SAME key (a fresh `Connection::open`
         // inside the call — the very scenario Part 1 proves the DB does
         // not guard) must dedup via the probe, NOT insert a duplicate.
-        let second = ingest_incoming_invoice(
+        let second = ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1855,11 +1891,18 @@ mod tests {
             audit_ledger::ensure_schema(&conn).unwrap();
         }
 
+        // ADR-0098 R3 (finding C) — ONE shared Handle cloned (Arc) across the
+        // four threads: the migrated ingest routes through db.write(), so the
+        // race-of-interest is now the shared serialized writer + INGEST_SERIALIZER
+        // dedup gate (not four independent Connection::open handles). The
+        // process-wide INGEST_SERIALIZER still guarantees at-most-one row.
+        let handle = aberp_db::Handle::open_default(&db_path, tenant.clone())
+            .expect("open shared Handle for concurrency test");
         // Four threads to up the race-trigger probability across
         // schedulings.
         let mut handles = Vec::new();
         for i in 0..4 {
-            let db = db_path.clone();
+            let db = handle.clone();
             let art = artifacts_dir.clone();
             let t = tenant.clone();
             let operator = format!("operator-{i}");
@@ -1914,7 +1957,7 @@ mod tests {
         let tenant = fixture_tenant();
         let bh = fixture_binary_hash();
 
-        let outcome_a = ingest_incoming_invoice(
+        let outcome_a = ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1929,7 +1972,7 @@ mod tests {
         };
         let mut second = fixture_input();
         second.nav_invoice_number = "SUP-2026/000002".into();
-        ingest_incoming_invoice(
+        ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1985,7 +2028,7 @@ mod tests {
         let tenant = fixture_tenant();
         let bh = fixture_binary_hash();
 
-        let outcome = ingest_incoming_invoice(
+        let outcome = ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -2053,7 +2096,7 @@ mod tests {
         // stays NULL on both).
         let mut input_a = fixture_input();
         input_a.nav_invoice_number = "SUP-2026/A".into();
-        ingest_incoming_invoice(
+        ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -2064,7 +2107,7 @@ mod tests {
         .expect("ingest A");
         let mut input_b = fixture_input();
         input_b.nav_invoice_number = "SUP-2026/B".into();
-        ingest_incoming_invoice(
+        ingest_incoming_invoice_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,

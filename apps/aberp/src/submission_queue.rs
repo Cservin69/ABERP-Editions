@@ -71,7 +71,6 @@
 //! `InvoiceQueuedForSubmissionPayload` variant. The ritual remains
 //! at its ninth landing.
 
-use std::path::Path;
 use std::time::Duration;
 
 use aberp_audit_ledger::{BinaryHash, Entry, EventKind, Ledger, TenantId};
@@ -176,9 +175,20 @@ pub fn pending_from_ledger(ledger: &Ledger) -> Result<Vec<PendingInvoice>> {
 /// takes the same `(db_path, tenant, binary_hash)` triple every
 /// other call site already builds; this keeps the cap check a one-
 /// liner at the `issue-*` orchestration boundaries.
-pub fn count_pending(db_path: &Path, tenant: TenantId, binary_hash: BinaryHash) -> Result<usize> {
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to count pending submissions")?;
+pub fn count_pending(
+    db: &aberp_db::HandleArc,
+    tenant: TenantId,
+    binary_hash: BinaryHash,
+) -> Result<usize> {
+    // ADR-0098 R3 (finding C) — route the pending-count read through the shared
+    // Handle's coherent read clone (try_clone of the ONE instance, replays the
+    // live writer's WAL) instead of an independent Ledger::open — the
+    // duckdb#23046 re-open locus. This (a-residual) daemon-frequency opener
+    // (driven by ap_sync backfill) comes OFF the frozen residual ledger.
+    let conn = db
+        .read()
+        .context("shared read: count pending submissions (ADR-0098 R3 finding C)")?;
+    let ledger = Ledger::from_connection(conn, tenant, binary_hash);
     Ok(pending_from_ledger(&ledger)?.len())
 }
 

@@ -277,7 +277,7 @@ pub fn storno_from_inputs(
     //     Loud-fail before any allocator tx opens so the
     //     sequence-slot invariant is preserved.
     let pending_count =
-        crate::submission_queue::count_pending(db.db_path(), tenant.clone(), binary_hash_bytes)
+        crate::submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
             .context("count pending submissions (ADR-0031 §5 cap check) for storno")?;
     if pending_count >= crate::submission_queue::HARD_CAP_PENDING {
         return Err(anyhow!(
