@@ -673,7 +673,11 @@ pub fn create_po(
         let conn = Connection::open(db_path)
             .map_err(|e| PoError::Other(anyhow::anyhow!("open DuckDB for AVL gate: {e}")))?;
         conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-            .map_err(|e| PoError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
+            .map_err(|e| {
+                PoError::Other(anyhow::anyhow!(
+                    "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
+                ))
+            })?;
         match resolve_avl(&conn, tenant.as_str(), input.vendor_partner_id.trim())? {
             Some((vendor, status)) if status.blocks_po() => {
                 drop(conn);
@@ -709,7 +713,11 @@ pub fn create_po(
         let mut conn = Connection::open(db_path)
             .map_err(|e| PoError::Other(anyhow::anyhow!("open DuckDB for PO create: {e}")))?;
         conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-            .map_err(|e| PoError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
+            .map_err(|e| {
+                PoError::Other(anyhow::anyhow!(
+                    "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
+                ))
+            })?;
         ensure_schema(&conn)?;
         let tx = conn.transaction().context("begin PO create transaction")?;
         po_number = reserve_po_number(&tx, tenant.as_str(), year, &now)?;
@@ -852,7 +860,11 @@ pub fn transition_po(
         let conn = Connection::open(db_path)
             .map_err(|e| PoError::Other(anyhow::anyhow!("open DuckDB for PO transition: {e}")))?;
         conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-            .map_err(|e| PoError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
+            .map_err(|e| {
+                PoError::Other(anyhow::anyhow!(
+                    "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
+                ))
+            })?;
         ensure_schema(&conn)?;
         let Some(po) = get_po(&conn, tenant.as_str(), po_id)? else {
             return Err(PoError::NotFound(po_id.to_string()));
@@ -1020,7 +1032,11 @@ pub fn record_receipt(
         let mut conn = Connection::open(db_path)
             .map_err(|e| PoError::Other(anyhow::anyhow!("open DuckDB for PO receipt: {e}")))?;
         conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-            .map_err(|e| PoError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
+            .map_err(|e| {
+                PoError::Other(anyhow::anyhow!(
+                    "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
+                ))
+            })?;
         ensure_schema(&conn)?;
         let Some(po) = get_po(&conn, tenant.as_str(), po_id)? else {
             return Err(PoError::NotFound(po_id.to_string()));
@@ -1233,7 +1249,11 @@ fn reread_po(
     let conn = Connection::open(db_path)
         .map_err(|e| PoError::Other(anyhow::anyhow!("reopen DuckDB: {e}")))?;
     conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .map_err(|e| PoError::Other(anyhow::anyhow!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
+        .map_err(|e| {
+            PoError::Other(anyhow::anyhow!(
+                "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
+            ))
+        })?;
     get_po(&conn, tenant.as_str(), po_id)?.ok_or_else(|| PoError::NotFound(po_id.to_string()))
 }
 

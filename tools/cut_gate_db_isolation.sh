@@ -716,6 +716,71 @@ else
   fi
 fi
 
+# ── CHECK 10j — ADR-0098 R3 (finding C): every FROZEN residual opener carries the
+#    no-in-place-fold pragma. R3 closes the swap-orphan silent-write-loss vector two
+#    ways: (Part 2) it MIGRATES the daemon-frequency ap_sync ingest seam
+#    (incoming_invoices::ingest_incoming_invoice + submission_queue::count_pending)
+#    onto the Handle; and (Part 1) it gives EVERY remaining residual runtime opener
+#    `PRAGMA disable_checkpoint_on_shutdown` so a residual open→close can never fold
+#    the shared WAL in place (duckdb#23046) while the Handle's instance is open.
+#    10i freezes the COUNT of residual openers; 10j freezes their SAFETY — a frozen
+#    opener that silently drops the guard is a RED BUILD. The central openers
+#    (audit-ledger Ledger::open + DuckDbBillingStore::open) carry it once for all
+#    their callers; every RAW residual Connection::open must carry it within a short
+#    window after the open (cfg(test)/comment/string-aware via the shared scanner;
+#    Ledger::open / DuckDbBillingStore::open openers are covered centrally, not
+#    per-site). Teeth: cut_gate_negative_probes.sh "[CHECK 10j]" strips the pragma
+#    from a frozen opener and asserts this goes red. ENFORCE_RESIDUAL_PRAGMA=0
+#    disables it for a deliberate, temporary local probe only.
+echo "[CHECK 10j] ADR-0098 R3 (finding C) — every frozen residual opener carries PRAGMA disable_checkpoint_on_shutdown (no silent fold-on-close; ENFORCED · D5)"
+enforce10j="${ENFORCE_RESIDUAL_PRAGMA:-1}"
+flag10j() { note "$1"; if [[ "$enforce10j" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+PRAGMA='disable_checkpoint_on_shutdown'
+WINDOW=15
+if [[ ! -f "$scan" || ! -f "$manifest" ]]; then
+  flag10j "✗ opener scanner or frozen manifest missing (10h/10i already flagged)"
+else
+  # (a) the two CENTRAL openers carry the pragma once for all their callers.
+  led="crates/audit-ledger/src/storage/mod.rs"
+  if grep -q "$PRAGMA" "$led"; then
+    note "✓ audit-ledger Ledger::open carries $PRAGMA (covers its ~145 residual callers)"
+  else
+    flag10j "✗ Ledger::open ($led) missing $PRAGMA — its residual callers would fold-on-close in place"
+  fi
+  bs="modules/billing/src/adapters/duckdb_store.rs"
+  if grep -q "$PRAGMA" "$bs"; then
+    note "✓ DuckDbBillingStore::open carries $PRAGMA (covers its residual callers)"
+  else
+    flag10j "✗ DuckDbBillingStore::open ($bs) missing $PRAGMA — its residual callers would fold-on-close in place"
+  fi
+  # (b) every RAW residual Connection::open must carry the pragma within WINDOW
+  #     lines. Ledger::open / DuckDbBillingStore::open openers are covered by (a).
+  pragma_fail=0
+  while IFS= read -r f; do
+    case " $c2_set " in *" $f "*) continue;; esac
+    case "$f" in crates/aberp-db/*|crates/aberp-snapshot/src/take.rs) continue;; esac
+    frozen="$(awk -v p="$f" '$1!="#" && $2==p{print $1}' "$manifest")"
+    [[ -z "$frozen" ]] && continue
+    if [[ "$f" == "apps/aberp/src/serve.rs" ]]; then
+      openers="$(awk -v allow="run,seed_demo_sample_data" -f "$scan" "$f" 2>/dev/null)"
+    else
+      openers="$(awk -f "$scan" "$f" 2>/dev/null)"
+    fi
+    while IFS= read -r rec; do
+      [[ -z "$rec" ]] && continue
+      case "$rec" in *Connection::open*) : ;; *) continue;; esac
+      ln="${rec%%:*}"
+      if ! sed -n "${ln},$((ln+WINDOW))p" "$f" | grep -q "$PRAGMA"; then
+        flag10j "✗ $f:$ln — residual Connection::open has NO $PRAGMA within $WINDOW lines (silent fold-on-close risk)"
+        pragma_fail=1
+      fi
+    done <<< "$openers"
+  done < <(find apps/aberp/src modules -name '*.rs' | grep -vE '/tests/' | sort)
+  if [[ "$pragma_fail" == "0" ]]; then
+    note "✓ every frozen residual Connection::open carries $PRAGMA within $WINDOW lines (no silent close-checkpoint fold)"
+  fi
+fi
+
 echo
 if [[ "$fail" -ne 0 ]]; then echo "CUT-GATE: ✗ FAILED"; exit 1; fi
 echo "CUT-GATE: ✓ PASSED"

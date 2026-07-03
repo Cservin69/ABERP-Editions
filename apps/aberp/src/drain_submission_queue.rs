@@ -396,7 +396,11 @@ fn drive_one_invoice(
         ))
     })?;
     conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .map_err(|e| DrainPerInvoiceError::Application(format!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
+        .map_err(|e| {
+            DrainPerInvoiceError::Application(format!(
+                "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
+            ))
+        })?;
     write_attempt_audit(
         &mut conn,
         ledger_meta,
@@ -443,7 +447,11 @@ fn drive_one_invoice(
         ))
     })?;
     conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .map_err(|e| DrainPerInvoiceError::Application(format!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
+        .map_err(|e| {
+            DrainPerInvoiceError::Application(format!(
+                "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
+            ))
+        })?;
     match wire_result {
         Ok(send_outcome) => {
             write_response_audit(

@@ -445,7 +445,11 @@ fn drive_one_retry(
         ))
     })?;
     conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .map_err(|e| DrainRetryError::Application(format!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
+        .map_err(|e| {
+            DrainRetryError::Application(format!(
+                "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
+            ))
+        })?;
     let (ready_invoice, billing_idempotency_key) =
         load_issued_invoice(&mut conn, &retry.invoice_id)
             .map_err(|e| DrainRetryError::Application(format!("{e:#}")))?;
@@ -580,7 +584,11 @@ fn drive_one_retry(
         ))
     })?;
     conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .map_err(|e| DrainRetryError::Application(format!("PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}")))?;
+        .map_err(|e| {
+            DrainRetryError::Application(format!(
+                "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
+            ))
+        })?;
     match wire_result {
         Ok(send_outcome) => {
             write_response_audit(

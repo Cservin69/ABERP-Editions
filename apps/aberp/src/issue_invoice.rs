@@ -556,9 +556,8 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     //     tx opens so the sequence-slot invariant (ADR-0009 §3)
     //     is preserved. The check opens + drops its own Ledger
     //     handle; pre_tx_setup below opens a fresh Connection.
-    let pending_count =
-        submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
-            .context("count pending submissions (ADR-0031 §5 cap check)")?;
+    let pending_count = submission_queue::count_pending(db, tenant.clone(), binary_hash_bytes)
+        .context("count pending submissions (ADR-0031 §5 cap check)")?;
     if pending_count >= submission_queue::HARD_CAP_PENDING {
         return Err(anyhow!(
             "submission queue is full ({}/{} pending invoices per ADR-0009 §7 / ADR-0031 §5); \

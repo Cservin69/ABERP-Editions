@@ -486,9 +486,9 @@ pub fn ingest_incoming_invoice(
     // locus. The WriteGuard's post-commit hook runs the lockstep sync_mirror on
     // drop; chain verification reuses a shared read clone below (never a second
     // independent opener).
-    let mut conn = db.write().map_err(|e| {
-        IngestError::Other(anyhow!("shared writer for ap_invoice ingestion: {e}"))
-    })?;
+    let mut conn = db
+        .write()
+        .map_err(|e| IngestError::Other(anyhow!("shared writer for ap_invoice ingestion: {e}")))?;
     ensure_schema(&conn).context("ensure ap_invoice schema (ingestion)")?;
     audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema (ingestion)")?;
 

@@ -12,8 +12,14 @@
 #   crates/aberp-snapshot/src/take.rs (sanctioned EXPORT residual, CHECK 10g).
 #
 # Categories (informational): (b)=operator-paced ERP request module — v0.2.6 target;
-#   (a-residual)=daemon-driven module reached at high freq via db.db_path() (HIGHEST
-#   v0.2.6 priority: incoming_invoices+submission_queue, driven by ap_sync backfill);
+#   (a-residual)=daemon-driven module reached at high freq via db.db_path().
+#   ADR-0098 R3 (finding C) MIGRATED the daemon-frequency ingest seam onto the
+#   Handle: ap_sync -> incoming_invoices::ingest_incoming_invoice (its
+#   Connection::open + Ledger::open) and submission_queue::count_pending are now
+#   Handle-routed (submission_queue off this list entirely; incoming_invoices 9->7,
+#   its 7 remaining openers are OPERATOR-paced reads/status-change, v0.2.6 target).
+#   Every residual below is pragma-guarded (disable_checkpoint_on_shutdown), asserted
+#   by cut-gate CHECK 10j;
 #   (c)=CLI-only one-shot subcommand (separate process, out of ADR-0098 scope);
 #   (serve)=serve.rs request-handler audit reads (Ledger::open) C did not migrate;
 #   (boot)=pre-serve-loop create/provision.
@@ -23,7 +29,7 @@
 6 apps/aberp/src/drain_submission_queue.rs
 2 apps/aberp/src/email_invoice.rs
 1 apps/aberp/src/export_invoice_bundle.rs
-9 apps/aberp/src/incoming_invoices.rs
+7 apps/aberp/src/incoming_invoices.rs
 4 apps/aberp/src/mark_abandoned.rs
 1 apps/aberp/src/material_inventory.rs
 1 apps/aberp/src/mes_manager.rs
@@ -44,7 +50,6 @@
 9 apps/aberp/src/retry_submission.rs
 30 apps/aberp/src/serve.rs
 1 apps/aberp/src/snapshot.rs
-1 apps/aberp/src/submission_queue.rs
 3 apps/aberp/src/submit_annulment.rs
 1 apps/aberp/src/tenant_registry.rs
 1 modules/billing/src/adapters/duckdb_store.rs

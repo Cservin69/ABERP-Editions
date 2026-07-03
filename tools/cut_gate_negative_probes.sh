@@ -253,6 +253,42 @@ echo "[CHECK 10i] a BRAND-NEW opener-bearing file not on the frozen ledger — m
 c="$(fresh)"; printf 'fn _c2_probe_new_opener() {\n    let _ = duckdb::Connection::open("/x");\n}\n' > "$c/apps/aberp/src/zz_c2_probe_opener.rs"
 expect_fail "$c" "NEW unaccounted opener-bearing file" "CHECK 10i — a new unlisted runtime-opener file is rejected"
 
+echo "[CHECK 10j] the no-in-place-fold pragma STRIPPED from a frozen residual Connection::open — must be caught (silent fold-on-close)"
+c="$(fresh)"
+python3 - "$c/apps/aberp/src/quote_calibration.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+block='    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")\n        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;\n'
+assert block in s, "quote_calibration pragma anchor moved — probe is stale"
+s=s.replace(block,'',1)
+open(p,"w").write(s)
+PYIN
+expect_fail "$c" "residual Connection::open has NO disable_checkpoint_on_shutdown within" "CHECK 10j — pragma stripped from a frozen residual opener (silent close-checkpoint fold)"
+
+echo "[CHECK 10j] the central audit-ledger Ledger::open pragma removed — its residual callers lose the guard"
+c="$(fresh)"
+python3 - "$c/crates/audit-ledger/src/storage/mod.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+needle='        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")?;\n'
+assert needle in s, "audit-ledger Ledger::open pragma anchor moved — probe is stale"
+s=s.replace(needle,'',1)
+open(p,"w").write(s)
+PYIN
+expect_fail "$c" "missing disable_checkpoint_on_shutdown" "CHECK 10j — central audit-ledger Ledger::open pragma removed (its ~145 residual callers lose the guard)"
+
+echo "[CHECK 10j] a pragma-less Connection::open INSIDE a #[cfg(test)] block must NOT trip 10j (cfg(test)-aware precision)"
+c="$(fresh)"
+python3 - "$c/apps/aberp/src/ap_sync.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+needle='let db_path = tmp.join("tenant.duckdb");'
+assert needle in s, "ap_sync cfg(test) anchor moved — probe is stale"
+s=s.replace(needle, needle+'\n        let _t = Connection::open(&db_path).unwrap(); // test-only, no pragma, 10j must ignore', 1)
+open(p,"w").write(s)
+PYIN
+expect_pass "$c" "CHECK 10j — a pragma-less Connection::open inside #[cfg(test)] is correctly IGNORED (not a residual)"
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi

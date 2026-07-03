@@ -643,7 +643,9 @@ pub fn fire_overdue_screening_reminders(
         let conn = Connection::open(db_path)
             .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
         conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-            .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
+            .context(
+                "ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener",
+            )?;
         list_vendors(&conn, tenant.as_str())?
             .into_iter()
             .filter(|v| vendor_is_overdue(v, now))
