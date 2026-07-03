@@ -442,8 +442,7 @@ pub fn resume_pending_install(db_path: &Path) -> Result<ResumeAction> {
         ResumeDecision::ClearStaleWal => {
             let target_wal = wal_sibling(&target);
             if target_wal.exists() {
-                std::fs::remove_file(&target_wal)
-                    .map_err(|e| SnapshotError::io(&target_wal, e))?;
+                std::fs::remove_file(&target_wal).map_err(|e| SnapshotError::io(&target_wal, e))?;
             }
             if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
                 fsync_dir(parent)?;
@@ -877,8 +876,14 @@ mod tests {
             ResumeAction::CompletedInstall
         );
         assert_eq!(std::fs::read(&db).unwrap(), b"NEW-SELF-CONTAINED");
-        assert!(!staging.exists(), "staging consumed by the completing rename");
-        assert!(!stale_wal.exists(), "stale live WAL deleted — no foreign replay");
+        assert!(
+            !staging.exists(),
+            "staging consumed by the completing rename"
+        );
+        assert!(
+            !stale_wal.exists(),
+            "stale live WAL deleted — no foreign replay"
+        );
         assert!(!install_intent_path(&db).exists(), "journal cleared");
     }
 
