@@ -61,10 +61,9 @@ pub mod debounce;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use aberp_audit_ledger::LedgerMeta;
-use aberp_audit_ledger::{BinaryHash, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId};
 use duckdb::Connection;
 
 use crate::debounce::CheckpointDebouncer;
@@ -80,8 +79,23 @@ pub enum DbError {
     ProdPath(String),
 
     /// The shared writer mutex was poisoned by a panic in another holder.
+    ///
+    /// Retained for API back-compat, but ADR-0098 R4 / Fable-5 finding F means
+    /// [`Handle::write`] / [`Handle::read`] no longer surface this: a poisoned
+    /// writer is now RECOVERED in-place (`clear_poison` + integrity re-verify)
+    /// rather than bricking the whole process forever. See
+    /// [`Handle::recover_from_poison`].
     #[error("aberp-db writer lock poisoned")]
     Poisoned,
+
+    /// ADR-0098 R4 / Fable-5 finding F — a poisoning panic was recovered
+    /// (`clear_poison`), but the POST-POISON integrity re-verify FAILED: on the
+    /// freshly re-opened instance the audit hash-chain did not verify
+    /// genesis→head. That is real corruption (not a benign prior panic), so it is
+    /// surfaced HARD rather than served from a bad DB. See
+    /// [`Handle::recover_from_poison`].
+    #[error("aberp-db post-poison integrity re-verify failed: {0}")]
+    PoisonRecoveryFailed(String),
 
     /// Underlying DuckDB error (open / try_clone / runtime pragma).
     #[error("duckdb: {0}")]
@@ -229,7 +243,10 @@ impl Handle {
     /// (ADR-0098 Consequences: a throughput ceiling, acceptable for a
     /// single-operator CNC-shop ERP).
     pub fn write(&self) -> Result<WriteGuard<'_>, DbError> {
-        let mut inner = self.inner.lock().map_err(|_| DbError::Poisoned)?;
+        // Finding F (R4): recover a poisoned writer in-place instead of returning
+        // `DbError::Poisoned` forever (which would brick every write path for the
+        // whole process). See [`Self::lock_recovering`].
+        let mut inner = self.lock_recovering()?;
         self.ensure_open(&mut inner)?;
         Ok(WriteGuard {
             handle: self,
@@ -250,7 +267,9 @@ impl Handle {
     /// write-on-read fail-loud (Gap-2b) is deferred to v0.2.6 (a compile-time
     /// read-guard); see `docs/adr-0098-v0.2.6-scope.md`.
     pub fn read(&self) -> Result<Connection, DbError> {
-        let mut inner = self.inner.lock().map_err(|_| DbError::Poisoned)?;
+        // Finding F (R4): same poison-recovery as write() — a reader must not be
+        // bricked by another holder's panic either.
+        let mut inner = self.lock_recovering()?;
         self.ensure_open(&mut inner)?;
         let clone = inner
             .conn
@@ -267,9 +286,20 @@ impl Handle {
         if !self.config.checkpoint_enabled {
             return;
         }
-        let Ok(mut inner) = self.inner.lock() else {
-            tracing::error!("aberp-db: writer lock poisoned at idle checkpoint");
-            return;
+        // Finding F (R4): route the idle-checkpoint lock through the SAME
+        // poison-recovery path as write()/read(). The prior `let Ok(..) else
+        // return` SILENTLY swallowed a poisoned mutex (dropped the checkpoint AND
+        // left the poison un-audited) — exactly what finding F forbids.
+        let mut inner = match self.lock_recovering() {
+            Ok(inner) => inner,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    db = %self.db_path.display(),
+                    "aberp-db: idle checkpoint skipped — writer poison-recovery returned a HARD error (integrity re-verify failed)"
+                );
+                return;
+            }
         };
         if inner.debouncer.should_checkpoint_on_idle() {
             self.run_durable_checkpoint_locked(&mut inner);
@@ -282,6 +312,143 @@ impl Handle {
             inner.conn = Some(open_runtime_connection(&self.db_path, &self.config)?);
         }
         Ok(())
+    }
+
+    /// Acquire the writer mutex, RECOVERING from a poisoning panic instead of
+    /// surfacing [`DbError::Poisoned`] forever (ADR-0098 R4 / Fable-5 finding F).
+    ///
+    /// Before the shared Handle (Gap 1a) a daemon that panicked mid-write hurt
+    /// only itself. The shared Handle made a panic while holding the
+    /// [`WriteGuard`] poison the ONE process-wide writer mutex — bricking every
+    /// write path (all ~7 daemons + every request handler) until a process
+    /// restart: a NEW single point of failure the shared instance introduced.
+    /// This heals it: on a poisoned lock we [`Mutex::clear_poison`], reclaim the
+    /// guard via [`std::sync::PoisonError::into_inner`], and run
+    /// [`Self::recover_from_poison`]. We recover ONCE (clear_poison), not on
+    /// every future acquire. A benign prior panic that left the DB CONSISTENT
+    /// resumes; only a FAILED integrity re-verify is a hard error.
+    fn lock_recovering(&self) -> Result<MutexGuard<'_, Inner>, DbError> {
+        match self.inner.lock() {
+            Ok(guard) => Ok(guard),
+            Err(poisoned) => {
+                self.inner.clear_poison();
+                let mut guard = poisoned.into_inner();
+                self.recover_from_poison(&mut guard)?;
+                Ok(guard)
+            }
+        }
+    }
+
+    /// Post-poison recovery (finding F). Reopen the shared connection FRESH and
+    /// re-verify the audit hash-chain genesis→head; loud log + a durable audit
+    /// row on success. Returns [`DbError::PoisonRecoveryFailed`] ONLY when the
+    /// chain does not verify (real corruption — surfaced, never swallowed).
+    fn recover_from_poison(&self, inner: &mut Inner) -> Result<(), DbError> {
+        tracing::error!(
+            db = %self.db_path.display(),
+            "aberp-db: writer mutex POISONED by a panic in a prior guard holder; recovering (clear_poison + drop/reopen + post-poison integrity re-verify) per ADR-0098 R4 / Fable-5 finding F — a poisoned shared writer must NOT brick the whole process"
+        );
+
+        // (1) The panicking holder may have left the shared connection mid-
+        //     transaction / indeterminate. Drop and reopen FRESH on the same live
+        //     inode so recovery starts clean. A failure to reopen IS a hard error
+        //     (the DB genuinely will not open) and propagates via `?`.
+        inner.conn = None;
+        self.ensure_open(inner)?;
+
+        // (2) POST-POISON INTEGRITY RE-VERIFY: verify the audit hash-chain
+        //     genesis→head on a try_clone of the freshly-reopened shared instance.
+        //     A mere prior panic that left the DB consistent must NOT permanently
+        //     brick the process; only a FAILED verify is a hard error.
+        let probe = inner
+            .conn
+            .as_ref()
+            .expect("ensure_open guarantees Some")
+            .try_clone()?;
+        let ledger = Ledger::from_connection(
+            probe,
+            self.meta.tenant_id().clone(),
+            BinaryHash::from_bytes([0u8; 32]),
+        );
+        let head_seq = match ledger.verify_chain() {
+            Ok(seq) => seq,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    db = %self.db_path.display(),
+                    "aberp-db: post-poison integrity re-verify FAILED (audit chain does NOT verify genesis→head) — surfacing a HARD error; this is real corruption, not a benign prior panic"
+                );
+                return Err(DbError::PoisonRecoveryFailed(e.to_string()));
+            }
+        };
+
+        tracing::warn!(
+            db = %self.db_path.display(),
+            head_seq,
+            "aberp-db: poison-recovery integrity re-verify PASSED (audit chain intact genesis→head); shared writer RESUMED"
+        );
+
+        // (3) Audit the recovery (finding F: "must log+audit"). Best-effort: the
+        //     mutex is already healed, so a failure to write the forensic row must
+        //     not re-brick the writer.
+        self.emit_poison_recovery_audit(inner, head_seq);
+        Ok(())
+    }
+
+    /// Append the poison-recovery forensic audit row. Reuses
+    /// [`EventKind::DbAutoRecovered`] (a system/durability event) with a
+    /// SCHEMA-VALID `DbAutoRecoveredPayload`: only its free-form `trigger` string
+    /// carries a new value (`writer_poison_recovered`) and the single variable is
+    /// a machine `u64`, so the payload is hand-formatted (no `serde_json` dep, no
+    /// decoder-shape risk). Best-effort by contract; the recovery already
+    /// succeeded and was logged loudly before this is attempted.
+    fn emit_poison_recovery_audit(&self, inner: &Inner, recovered_head_seq: u64) {
+        let probe = match inner.conn.as_ref().map(|c| c.try_clone()) {
+            Some(Ok(c)) => c,
+            Some(Err(e)) => {
+                tracing::error!(
+                    error = %e,
+                    db = %self.db_path.display(),
+                    "aberp-db: poison-recovery audit row SKIPPED (try_clone failed); recovery itself succeeded and was logged"
+                );
+                return;
+            }
+            None => return,
+        };
+        // Injection-free: `recovered_max_seq` is the only interpolation and it is
+        // a `u64`. Field set + names match `DbAutoRecoveredPayload` exactly so any
+        // typed decoder round-trips it (Option -> null).
+        let payload = format!(
+            "{{\"trigger\":\"writer_poison_recovered\",\"source_snapshot_seq\":0,\
+             \"snapshot_audit_count\":0,\"replayed_entries\":0,\
+             \"recovered_max_seq\":{recovered_head_seq},\"retained_corrupt_db\":null}}"
+        )
+        .into_bytes();
+        let session_id = format!(
+            "aberp-db-poison-recovery-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let actor = Actor::from_local_cli(session_id, "system:aberp-db");
+        let mut ledger = Ledger::from_connection(
+            probe,
+            self.meta.tenant_id().clone(),
+            BinaryHash::from_bytes([0u8; 32]),
+        );
+        match ledger.append(EventKind::DbAutoRecovered, payload, actor, None) {
+            Ok(_) => tracing::warn!(
+                db = %self.db_path.display(),
+                recovered_head_seq,
+                "aberp-db: poison-recovery AUDITED (db.auto_recovered, trigger=writer_poison_recovered)"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                db = %self.db_path.display(),
+                "aberp-db: poison-recovery audit-row append FAILED (non-fatal; the writer is already recovered and the recovery was logged loudly)"
+            ),
+        }
     }
 
     /// Run the validated, debounced durable checkpoint **while holding the

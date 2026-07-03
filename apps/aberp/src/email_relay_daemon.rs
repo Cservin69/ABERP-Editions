@@ -32,6 +32,8 @@ use ulid::Ulid;
 use zeroize::Zeroizing;
 
 use aberp_audit_ledger::{append_in_tx, Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
+
+use crate::daemon_tick_guard::guard_write_tick;
 use lettre::{
     message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart},
     transport::smtp::{authentication::Credentials, client::Tls, client::TlsParameters},
@@ -182,11 +184,13 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
     let db = deps.db.clone();
     let now = time::OffsetDateTime::now_utc();
     let claimed = tokio::task::spawn_blocking(move || -> Result<Option<OutboundEmailRow>> {
-        let conn = db
-            .write()
-            .context("shared writer: email-relay drain claim (ADR-0098 Gap 1a)")?;
-        email_relay_queue::ensure_schema(&conn)?;
-        claim_next_queued(&conn, now)
+        guard_write_tick("email-relay drain claim", move || {
+            let conn = db
+                .write()
+                .context("shared writer: email-relay drain claim (ADR-0098 Gap 1a)")?;
+            email_relay_queue::ensure_schema(&conn)?;
+            claim_next_queued(&conn, now)
+        })
     })
     .await
     .context("join claim task")??;
@@ -205,10 +209,12 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
             let db = deps.db.clone();
             let now2 = time::OffsetDateTime::now_utc();
             tokio::task::spawn_blocking(move || -> Result<()> {
-                let conn = db
-                    .write()
-                    .context("shared writer: mark Sent (ADR-0098 Gap 1a)")?;
-                mark_sent(&conn, &id, now2)
+                guard_write_tick("email-relay mark Sent", move || {
+                    let conn = db
+                        .write()
+                        .context("shared writer: mark Sent (ADR-0098 Gap 1a)")?;
+                    mark_sent(&conn, &id, now2)
+                })
             })
             .await
             .context("join mark_sent task")??;
@@ -236,10 +242,12 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
                 let db = deps.db.clone();
                 let detail_for_db = detail.clone();
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    let conn = db
-                        .write()
-                        .context("shared writer: mark Failed (ADR-0098 Gap 1a)")?;
-                    mark_failed(&conn, &id, &detail_for_db)
+                    guard_write_tick("email-relay mark Failed", move || {
+                        let conn = db
+                            .write()
+                            .context("shared writer: mark Failed (ADR-0098 Gap 1a)")?;
+                        mark_failed(&conn, &id, &detail_for_db)
+                    })
                 })
                 .await
                 .context("join mark_failed task")??;
@@ -267,10 +275,12 @@ async fn process_one_row(deps: &EmailRelayDaemonDeps) -> Result<bool> {
                 let db = deps.db.clone();
                 let detail_for_db = detail.clone();
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    let conn = db
-                        .write()
-                        .context("shared writer: requeue (ADR-0098 Gap 1a)")?;
-                    requeue_for_retry(&conn, &id, &detail_for_db)
+                    guard_write_tick("email-relay requeue", move || {
+                        let conn = db
+                            .write()
+                            .context("shared writer: requeue (ADR-0098 Gap 1a)")?;
+                        requeue_for_retry(&conn, &id, &detail_for_db)
+                    })
                 })
                 .await
                 .context("join requeue task")??;
@@ -292,10 +302,12 @@ async fn reconcile_startup(deps: &EmailRelayDaemonDeps) -> Result<u64> {
     let db = deps.db.clone();
     let now = time::OffsetDateTime::now_utc();
     tokio::task::spawn_blocking(move || -> Result<u64> {
-        let conn = db
-            .write()
-            .context("shared writer: email-relay startup reconcile (ADR-0098 Gap 1a)")?;
-        reconcile_orphaned_sending(&conn, now)
+        guard_write_tick("email-relay startup reconcile", move || {
+            let conn = db
+                .write()
+                .context("shared writer: email-relay startup reconcile (ADR-0098 Gap 1a)")?;
+            reconcile_orphaned_sending(&conn, now)
+        })
     })
     .await
     .context("join reconcile task")?

@@ -45,6 +45,7 @@ pub mod email_invoice;
 pub mod email_outbox_poll_daemon;
 pub mod email_relay;
 pub mod email_relay_credentials;
+pub mod daemon_tick_guard;
 pub mod email_relay_daemon;
 pub mod email_relay_queue;
 pub mod export_invoice_bundle;
