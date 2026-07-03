@@ -52,8 +52,9 @@ mod store;
 mod take;
 
 pub use crash_safe::{
-    atomic_install, checkpoint_is_current, durable_checkpoint, marker_path, read_marker,
-    write_marker, CheckpointMarker, CheckpointReport,
+    atomic_install, checkpoint_is_current, durable_checkpoint, install_intent_path, marker_path,
+    read_install_intent, read_marker, resume_pending_install, write_install_intent, write_marker,
+    CheckpointMarker, CheckpointReport, InstallIntent, ResumeAction,
 };
 pub use recover::{live_durable_checkpoint, provision_atomic, recover_or_refuse, RecoveryOutcome};
 pub use retention::{plan_retention, prune, RetentionPlan, RetentionPolicy};

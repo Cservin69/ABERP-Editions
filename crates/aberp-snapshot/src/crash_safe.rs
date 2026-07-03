@@ -57,6 +57,12 @@ use crate::{Result, SnapshotError};
 /// Suffix of the verified-good checkpoint marker written beside a DB.
 pub const CKPT_MARKER_SUFFIX: &str = ".ckpt-ok";
 
+/// Suffix of the journaled install-intent written beside a DB while a
+/// [`durable_checkpoint`] is mid-swap (ADR-0098 R2, finding B). Its presence at
+/// boot means the atomic swap was interrupted and must be RESUMED before any
+/// DuckDB open — see [`resume_pending_install`].
+pub const INSTALL_INTENT_SUFFIX: &str = ".install-intent";
+
 /// Verified-good checkpoint marker (`<db>.ckpt-ok`). Records the identity of
 /// the file that was last durably installed, so a clean shutdown can tell
 /// whether a fresh checkpoint is still needed.
@@ -83,6 +89,37 @@ pub struct CheckpointReport {
     pub validated: bool,
 }
 
+/// Journaled install-intent (`<db>.install-intent`). Written + fsync'd AFTER the
+/// staging file is built, fsync'd and validated, and BEFORE the rename, so a
+/// crash anywhere in the swap is deterministically recoverable at boot by
+/// [`resume_pending_install`] — the WAL handling becomes an explicit journaled
+/// protocol instead of relying on either an in-place WAL fold (the `duckdb#23046`
+/// locus) or luck (the naive-pragma double-replay window).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallIntent {
+    /// The finished, fsync'd staging file to be renamed onto the live path.
+    pub staging_path: PathBuf,
+    /// Hex SHA-256 of that staging file — the identity checked on resume.
+    pub staging_sha256: String,
+    /// The live DB path the staging file is being renamed onto.
+    pub target_path: PathBuf,
+    /// Unix seconds when the intent was journaled.
+    pub created_at_unix: i64,
+}
+
+/// What [`resume_pending_install`] did for a pending install-intent at boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeAction {
+    /// No install-intent journal beside the DB — nothing to resume.
+    NoPendingInstall,
+    /// Case (a): staging was still present + matched the journaled SHA, so the
+    /// interrupted rename (and stale-WAL delete) was completed.
+    CompletedInstall,
+    /// Case (b): the rename had already happened (live matched the journaled
+    /// identity); the now-stale foreign WAL was deleted and the journal cleared.
+    ClearedStaleWal,
+}
+
 /// `<db>.ckpt-ok` marker path.
 pub fn marker_path(db_path: &Path) -> PathBuf {
     let mut os = db_path.as_os_str().to_owned();
@@ -96,6 +133,49 @@ pub(crate) fn wal_sibling(db: &Path) -> PathBuf {
     let mut os = db.as_os_str().to_owned();
     os.push(".wal");
     PathBuf::from(os)
+}
+
+/// A cheap fence over the live WAL (presence + byte size), used by
+/// [`durable_checkpoint`] to detect a concurrent writer during the EXPORT
+/// (ADR-0098 R2 Bug-2 belt; the primary swap-orphan fix is R3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalFence {
+    pub(crate) present: bool,
+    pub(crate) size: u64,
+}
+
+/// Snapshot the live WAL's presence + size. A missing WAL is `{present:false}`.
+pub(crate) fn wal_stat(wal: &Path) -> WalFence {
+    match std::fs::metadata(wal) {
+        Ok(m) => WalFence {
+            present: true,
+            size: m.len(),
+        },
+        Err(_) => WalFence {
+            present: false,
+            size: 0,
+        },
+    }
+}
+
+/// `true` iff the live WAL changed between the EXPORT baseline and the
+/// pre-rename re-check in a way that means a concurrent writer's commits would
+/// be lost by the swap: it GREW (new uncaptured commits), VANISHED, or SHRANK
+/// (a concurrent checkpoint folded it). An empty WAL that our own read-only
+/// EXPORT open may have created (size 0 where there was none) is deliberately
+/// NOT a violation, and mtime is NOT compared — only a real size/presence delta
+/// counts, keeping the fence free of self-perturbation false positives.
+pub(crate) fn wal_fence_violated(before: WalFence, now: WalFence) -> bool {
+    if now.size > before.size {
+        return true;
+    }
+    if before.present && !now.present {
+        return true;
+    }
+    if before.present && now.present && now.size < before.size {
+        return true;
+    }
+    false
 }
 
 /// `fsync` a regular file's contents + metadata to disk.
@@ -207,18 +287,213 @@ pub fn checkpoint_is_current(db_path: &Path) -> bool {
     }
 }
 
+/// `<db>.install-intent` journal path.
+pub fn install_intent_path(db_path: &Path) -> PathBuf {
+    sibling(db_path, INSTALL_INTENT_SUFFIX)
+}
+
+/// Journal (write + fsync file + fsync dir) the install-intent for a swap that
+/// is about to rename `staging` onto `db_path`. Made durable BEFORE the rename
+/// so a crash anywhere in the swap is resumable at boot.
+pub fn write_install_intent(
+    db_path: &Path,
+    staging: &Path,
+    staging_sha256: &str,
+) -> Result<InstallIntent> {
+    let created_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let intent = InstallIntent {
+        staging_path: staging.to_path_buf(),
+        staging_sha256: staging_sha256.to_string(),
+        target_path: db_path.to_path_buf(),
+        created_at_unix,
+    };
+    let path = install_intent_path(db_path);
+    let bytes = serde_json::to_vec_pretty(&intent).map_err(|e| SnapshotError::BadMeta {
+        path: path.clone(),
+        detail: format!("serialize install-intent: {e}"),
+    })?;
+    std::fs::write(&path, bytes).map_err(|e| SnapshotError::io(&path, e))?;
+    fsync_file(&path)?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fsync_dir(parent)?;
+    }
+    Ok(intent)
+}
+
+/// Read + parse the install-intent journal beside `db_path`, if present.
+pub fn read_install_intent(db_path: &Path) -> Option<InstallIntent> {
+    let path = install_intent_path(db_path);
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Durably remove the install-intent journal (dir fsync so the clear persists).
+fn clear_install_intent(db_path: &Path) -> Result<()> {
+    let path = install_intent_path(db_path);
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| SnapshotError::io(&path, e))?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fsync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy an unreconcilable journal aside as boot evidence (never deletes the
+/// original — boot stays refused until an operator resolves it).
+fn preserve_install_intent(db_path: &Path) -> Result<PathBuf> {
+    let src = install_intent_path(db_path);
+    let dest = sibling(
+        db_path,
+        &format!("{INSTALL_INTENT_SUFFIX}.unreconciled-{}", unique_tag()),
+    );
+    std::fs::copy(&src, &dest).map_err(|e| SnapshotError::io(&dest, e))?;
+    Ok(dest)
+}
+
+/// PURE boot-resume decision (no I/O) — the load-bearing core proven by the
+/// `rustc --test` extraction. Given whether the journal is present, whether the
+/// staging file is still there and matches the journaled SHA, and whether the
+/// live target already matches the journaled SHA, decide how to reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeDecision {
+    NoPending,
+    Complete,
+    ClearStaleWal,
+    Refuse,
+}
+
+pub(crate) fn decide_resume(
+    intent_present: bool,
+    staging_present: bool,
+    staging_sha_matches: bool,
+    live_matches_target: bool,
+) -> ResumeDecision {
+    if !intent_present {
+        return ResumeDecision::NoPending;
+    }
+    if staging_present {
+        // (a) staging still here => the rename had not happened. Finish it iff
+        // the staging bytes match the journaled SHA; a mismatch means a
+        // corrupt/partial staging file — do NOT guess.
+        if staging_sha_matches {
+            ResumeDecision::Complete
+        } else {
+            ResumeDecision::Refuse
+        }
+    } else if live_matches_target {
+        // (b) staging gone + live already equals the journaled identity => the
+        // rename happened; only the stale-WAL delete + journal clear remain.
+        ResumeDecision::ClearStaleWal
+    } else {
+        // (c) neither reconciles => preserve evidence + refuse.
+        ResumeDecision::Refuse
+    }
+}
+
+/// Resume a durable-checkpoint install that a crash interrupted. Call this at
+/// the boot chokepoint BEFORE any DuckDB open. It reconciles the journaled swap
+/// deterministically:
+///
+///   (a) staging present + matches the journaled SHA => complete the install
+///       (atomic rename + stale-WAL delete) and clear the journal;
+///   (b) staging gone + live already matches the journaled identity => the
+///       rename happened, so just delete the now-stale WAL and clear the journal
+///       (this is what closes the naive-pragma double-replay window);
+///   (c) neither reconciles => preserve evidence and REFUSE (boot-fatal).
+///
+/// Pure file operations (no DuckDB), so it is exhaustively unit-tested and safe
+/// to run before the storage engine is opened.
+pub fn resume_pending_install(db_path: &Path) -> Result<ResumeAction> {
+    let Some(intent) = read_install_intent(db_path) else {
+        return Ok(ResumeAction::NoPendingInstall);
+    };
+    let staging = intent.staging_path.clone();
+    let target = intent.target_path.clone();
+    let staging_present = staging.exists();
+    let staging_sha_matches = staging_present
+        && sha256_file(&staging)
+            .map(|s| s == intent.staging_sha256)
+            .unwrap_or(false);
+    let live_matches_target = target.exists()
+        && sha256_file(&target)
+            .map(|s| s == intent.staging_sha256)
+            .unwrap_or(false);
+
+    match decide_resume(
+        true,
+        staging_present,
+        staging_sha_matches,
+        live_matches_target,
+    ) {
+        // Unreachable (the journal is present), mapped for totality.
+        ResumeDecision::NoPending => Ok(ResumeAction::NoPendingInstall),
+        ResumeDecision::Complete => {
+            // atomic_install: rename staging->target, delete the now-stale target
+            // WAL, fsync the parent dir. Then clear the journal. The verified-
+            // good marker re-establishes on the next live_durable_checkpoint.
+            atomic_install(&staging, &target)?;
+            clear_install_intent(db_path)?;
+            Ok(ResumeAction::CompletedInstall)
+        }
+        ResumeDecision::ClearStaleWal => {
+            let target_wal = wal_sibling(&target);
+            if target_wal.exists() {
+                std::fs::remove_file(&target_wal)
+                    .map_err(|e| SnapshotError::io(&target_wal, e))?;
+            }
+            if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+                fsync_dir(parent)?;
+            }
+            clear_install_intent(db_path)?;
+            Ok(ResumeAction::ClearedStaleWal)
+        }
+        ResumeDecision::Refuse => {
+            let preserved = preserve_install_intent(db_path)?;
+            Err(SnapshotError::RestoreRefused(format!(
+                "unreconcilable install-intent journal at {}: staging {} present={}, \
+                 live target {} present={} matched={}; evidence preserved to {} — \
+                 refusing to open the DB (investigate; do NOT hand-edit)",
+                install_intent_path(db_path).display(),
+                staging.display(),
+                staging_present,
+                target.display(),
+                target.exists(),
+                live_matches_target,
+                preserved.display()
+            )))
+        }
+    }
+}
+
 /// Take ONE crash-safe durable checkpoint of `db_path`, leaving the live
 /// file pristine + a fresh verified-good marker. Reuses ADR-0082's
-/// corruption-free logical export, then commits with [`atomic_install`].
+/// corruption-free logical export, then commits with [`atomic_install`] under a
+/// journaled install-intent so the WAL handling is an explicit crash-recoverable
+/// protocol — never an in-place WAL fold and never a replayable adjacency.
 ///
-/// Steps: `EXPORT` the live DB → a private staging export dir; validate the
-/// export (import + smoke + hash-chain) and **abort without touching the
-/// live file** if it does not validate (never checkpoint a corrupt DB on
-/// top of itself — the snapshots are the recovery path); `IMPORT` +
-/// `CHECKPOINT` into a fresh staging `*.duckdb`; [`atomic_install`] it over
-/// the live file; write the marker. Best-effort cleanup of the staging dir.
+/// Ordering (ADR-0098 R2, finding B):
+///   0. capture a live-WAL fence baseline (Bug-2 belt);
+///   i. `EXPORT` the live DB → a private staging export dir on a connection that
+///      sets `disable_checkpoint_on_shutdown`, so its drop never folds the live
+///      WAL in place; validate the export (import + smoke + hash-chain) and
+///      **abort without touching the live file** if it does not validate;
+///      `IMPORT` + `CHECKPOINT` into a fresh, private staging `*.duckdb`;
+///  ii. fsync the staging file, then journal an fsync'd `<db>.install-intent`
+///      (staging path + SHA-256 + target) BEFORE the rename;
+/// iii. [`atomic_install`] renames the staging file over the live path;
+///  iv. …and deletes the now-stale target WAL (both inside `atomic_install`);
+///   v. clear the journal, then write the verified-good marker.
 ///
-/// DuckDB-backed → its crash-injection integration test is Mac-gated.
+/// A crash at any instant is reconciled at boot by [`resume_pending_install`],
+/// which closes BOTH the in-place-fold window and the naive-pragma double-replay
+/// window. A live-WAL that grew during the EXPORT (a concurrent unmigrated
+/// writer) ABORTS the checkpoint, live file untouched.
+///
+/// DuckDB-backed → its full crash-injection integration test is Mac-gated.
 pub fn durable_checkpoint(db_path: &Path, tenant: &str) -> Result<CheckpointReport> {
     use duckdb::Connection;
 
@@ -233,9 +508,26 @@ pub fn durable_checkpoint(db_path: &Path, tenant: &str) -> Result<CheckpointRepo
     // Clear any leftovers from a crashed prior checkpoint.
     cleanup_stale(&export_dir, &staging, &staging_wal);
 
+    // 0. Bug-2 belt (ADR-0098 R2, defense-in-depth; the primary swap-orphan fix
+    //    is R3). Fence the LIVE WAL: capture (presence, size) BEFORE the EXPORT
+    //    begins so that, just before the swap, we can prove no concurrent writer
+    //    appended commits our logical snapshot did not capture. Meaningful under
+    //    the shared Handle's single-writer lock the runtime callers hold.
+    let live_wal = wal_sibling(db_path);
+    let wal_fence_before = wal_stat(&live_wal);
+
     // 1. Logical EXPORT of the live DB (a table scan, never the ART).
+    //    ADR-0098 R2 (finding B) — set `disable_checkpoint_on_shutdown` on THIS
+    //    connection (the F6 paired-site miss: take.rs:208 had it, crash_safe.rs
+    //    did not). Without it, dropping this plain read-write connection triggers
+    //    DuckDB's implicit close-checkpoint, folding the live WAL IN PLACE — the
+    //    exact `duckdb#23046` locus this primitive exists to avoid. The WAL is
+    //    instead handled explicitly by the journaled swap below. (Exact pragma
+    //    string shared with take.rs + aberp-db's Handle; an unknown pragma errors
+    //    HARD, so a future rename surfaces loudly — never silently.)
     {
         let conn = Connection::open(db_path)?;
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")?;
         conn.execute_batch(&format!(
             "EXPORT DATABASE {} (FORMAT PARQUET);",
             sql_quote(&export_dir)
@@ -264,10 +556,47 @@ pub fn durable_checkpoint(db_path: &Path, tenant: &str) -> Result<CheckpointRepo
         conn.execute_batch("CHECKPOINT;")?;
     }
 
-    // 4. Atomic, fsync'd swap over the live file (the crash-safe commit).
+    // 3a. fsync the finished staging file so its bytes are durable BEFORE we
+    //     journal its identity or swap it in, then hash it for the journal.
+    fsync_file(&staging)?;
+    let staging_sha256 = sha256_file(&staging)?;
+
+    // 3b. Bug-2 fence re-check (see step 0). A grown / vanished / shrunk live
+    //     WAL since the EXPORT began is evidence of a concurrent unmigrated
+    //     writer: ABORT and leave the live DB + its WAL untouched rather than
+    //     swap a stale staging file over it (which would lose those commits).
+    let wal_fence_now = wal_stat(&live_wal);
+    if wal_fence_violated(wal_fence_before, wal_fence_now) {
+        let _ = std::fs::remove_dir_all(&export_dir);
+        let _ = std::fs::remove_file(&staging);
+        let _ = std::fs::remove_file(&staging_wal);
+        return Err(SnapshotError::RestoreRefused(format!(
+            "durable_checkpoint aborted: live WAL {} changed during the EXPORT \
+             (before present={}/{} bytes, now present={}/{} bytes) — a concurrent \
+             writer's commits would be lost by the swap; refusing (live DB untouched)",
+            live_wal.display(),
+            wal_fence_before.present,
+            wal_fence_before.size,
+            wal_fence_now.present,
+            wal_fence_now.size
+        )));
+    }
+
+    // 4. (ADR-0098 R2, step ii) Journal an fsync'd install-intent (staging path
+    //    + SHA-256 + target) BEFORE the rename. A crash from here until the
+    //    journal is cleared is RESUMED at boot by `resume_pending_install`,
+    //    closing BOTH the in-place-fold and the naive-pragma double-replay
+    //    windows.
+    let _intent = write_install_intent(db_path, &staging, &staging_sha256)?;
+
+    // 5. (steps iii+iv) Atomic, fsync'd swap over the live file, which renames
+    //    the staging file in AND deletes the now-stale target WAL AND fsyncs the
+    //    directory (all-or-nothing).
     atomic_install(&staging, db_path)?;
 
-    // 5. Record the verified-good marker for the freshly installed file.
+    // 6. (step v) Clear the journal, then record the verified-good marker for
+    //    the freshly installed file.
+    clear_install_intent(db_path)?;
     let marker = write_marker(db_path)?;
 
     // Best-effort cleanup of the export dir (the staging file is gone —
@@ -432,5 +761,177 @@ mod tests {
         let db = t.join("live.duckdb");
         std::fs::write(&db, b"x").unwrap();
         assert!(!checkpoint_is_current(&db));
+    }
+
+    // ===== ADR-0098 R2 (finding B): journaled install-intent + boot-resume =====
+
+    #[test]
+    fn decide_resume_maps_the_four_cases() {
+        // no journal => nothing to do (crash-after-staging-before-journal path)
+        assert_eq!(
+            decide_resume(false, true, true, true),
+            ResumeDecision::NoPending
+        );
+        // (a) staging present + SHA matches => complete the interrupted rename
+        assert_eq!(
+            decide_resume(true, true, true, false),
+            ResumeDecision::Complete
+        );
+        // staging present but SHA mismatch => refuse (never guess)
+        assert_eq!(
+            decide_resume(true, true, false, false),
+            ResumeDecision::Refuse
+        );
+        // (b) staging gone + live matches target => delete stale WAL + clear
+        assert_eq!(
+            decide_resume(true, false, false, true),
+            ResumeDecision::ClearStaleWal
+        );
+        // (c) staging gone + live does NOT match => refuse
+        assert_eq!(
+            decide_resume(true, false, false, false),
+            ResumeDecision::Refuse
+        );
+    }
+
+    #[test]
+    fn wal_fence_flags_growth_vanish_shrink_but_not_empty_appearance() {
+        let none = WalFence {
+            present: false,
+            size: 0,
+        };
+        let empty = WalFence {
+            present: true,
+            size: 0,
+        };
+        let w100 = WalFence {
+            present: true,
+            size: 100,
+        };
+        let w200 = WalFence {
+            present: true,
+            size: 200,
+        };
+        // unchanged => ok
+        assert!(!wal_fence_violated(w100, w100));
+        assert!(!wal_fence_violated(none, none));
+        // our own read-only open may create an empty WAL => NOT a violation
+        assert!(!wal_fence_violated(none, empty));
+        // grew (new commits) / a WAL appeared with data => violation
+        assert!(wal_fence_violated(w100, w200));
+        assert!(wal_fence_violated(none, w100));
+        // vanished (concurrent fold) / shrank (partial fold) => violation
+        assert!(wal_fence_violated(w100, none));
+        assert!(wal_fence_violated(w200, w100));
+    }
+
+    #[test]
+    fn install_intent_journal_roundtrips() {
+        let t = Tmp::new("intent-rt");
+        let db = t.join("live.duckdb");
+        std::fs::write(&db, b"live").unwrap();
+        let staging = t.join("live.duckdb.ckpt-staging.duckdb");
+        std::fs::write(&staging, b"fresh").unwrap();
+        let sha = crate::take::sha256_file(&staging).unwrap();
+        let written = write_install_intent(&db, &staging, &sha).unwrap();
+        let read = read_install_intent(&db).expect("intent present");
+        assert_eq!(written, read);
+        assert_eq!(read.target_path, db);
+        assert_eq!(read.staging_path, staging);
+        assert_eq!(read.staging_sha256, sha);
+        assert!(install_intent_path(&db).exists());
+    }
+
+    #[test]
+    fn resume_no_intent_is_a_noop() {
+        // crash-after-staging-before-journal: no journal was ever written, so
+        // boot sees no intent and the old DB is left exactly intact.
+        let t = Tmp::new("resume-none");
+        let db = t.join("live.duckdb");
+        std::fs::write(&db, b"OLD-GOOD").unwrap();
+        let orphan_staging = t.join("live.duckdb.ckpt-staging.duckdb");
+        std::fs::write(&orphan_staging, b"NEVER-JOURNALED").unwrap();
+        assert_eq!(
+            resume_pending_install(&db).unwrap(),
+            ResumeAction::NoPendingInstall
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), b"OLD-GOOD");
+    }
+
+    #[test]
+    fn resume_completes_interrupted_rename_and_clears_stale_wal() {
+        // crash-after-journal-before-rename: staging is built + journaled but the
+        // rename had not run. Boot completes it and drops the now-stale live WAL.
+        let t = Tmp::new("resume-a");
+        let db = t.join("live.duckdb");
+        std::fs::write(&db, b"OLD-GOOD").unwrap();
+        let stale_wal = wal_sibling(&db);
+        std::fs::write(&stale_wal, b"stale-live-wal").unwrap();
+        let staging = t.join("live.duckdb.ckpt-staging.duckdb");
+        std::fs::write(&staging, b"NEW-SELF-CONTAINED").unwrap();
+        let sha = crate::take::sha256_file(&staging).unwrap();
+        write_install_intent(&db, &staging, &sha).unwrap();
+
+        assert_eq!(
+            resume_pending_install(&db).unwrap(),
+            ResumeAction::CompletedInstall
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), b"NEW-SELF-CONTAINED");
+        assert!(!staging.exists(), "staging consumed by the completing rename");
+        assert!(!stale_wal.exists(), "stale live WAL deleted — no foreign replay");
+        assert!(!install_intent_path(&db).exists(), "journal cleared");
+    }
+
+    #[test]
+    fn resume_clears_stale_wal_when_rename_already_happened() {
+        // crash-after-rename-before-WAL-clear (the naive-pragma double-replay
+        // window): the live file already IS the fresh bytes; a foreign WAL still
+        // sits beside it. Boot must delete that WAL and clear the journal.
+        let t = Tmp::new("resume-b");
+        let db = t.join("live.duckdb");
+        std::fs::write(&db, b"NEW-SELF-CONTAINED").unwrap();
+        let sha = crate::take::sha256_file(&db).unwrap();
+        let stale_wal = wal_sibling(&db);
+        std::fs::write(&stale_wal, b"foreign-wal-from-old-file").unwrap();
+        // staging path recorded but already gone (renamed away).
+        let staging = t.join("live.duckdb.ckpt-staging.duckdb");
+        write_install_intent(&db, &staging, &sha).unwrap();
+
+        assert_eq!(
+            resume_pending_install(&db).unwrap(),
+            ResumeAction::ClearedStaleWal
+        );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            b"NEW-SELF-CONTAINED",
+            "live file untouched"
+        );
+        assert!(
+            !stale_wal.exists(),
+            "foreign WAL deleted — double-replay prevented"
+        );
+        assert!(!install_intent_path(&db).exists(), "journal cleared");
+    }
+
+    #[test]
+    fn resume_refuses_and_preserves_when_unreconcilable() {
+        // intent present but neither a valid staging file nor a matching live
+        // file exists => refuse + preserve evidence, never guess.
+        let t = Tmp::new("resume-c");
+        let db = t.join("live.duckdb");
+        std::fs::write(&db, b"SOMETHING-ELSE").unwrap();
+        let staging = t.join("live.duckdb.ckpt-staging.duckdb"); // absent
+        write_install_intent(&db, &staging, "deadbeef_matches_no_file").unwrap();
+
+        let err = resume_pending_install(&db).unwrap_err();
+        assert!(matches!(err, SnapshotError::RestoreRefused(_)));
+        // original journal still present (boot stays refused until operator acts)
+        assert!(install_intent_path(&db).exists());
+        // an evidence copy was written aside
+        let preserved = std::fs::read_dir(&t.0)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".unreconciled-"));
+        assert!(preserved, "unreconcilable evidence preserved aside");
     }
 }

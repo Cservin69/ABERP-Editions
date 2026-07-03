@@ -1352,6 +1352,24 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         }
     }
 
+    // ADR-0098 R2 (finding B) — BEFORE any DuckDB open at boot, resume any
+    // install-intent journal left by a `durable_checkpoint` that crashed mid
+    // swap. This deterministically completes an interrupted rename, or deletes a
+    // now-stale foreign WAL that a naive checkpoint-on-shutdown pragma would let
+    // the next open double-replay, or — if it cannot be reconciled — preserves
+    // evidence and refuses the boot. MUST precede provision_atomic + the first
+    // billing-store open below (runs alongside R1's boot recovery guard).
+    match aberp_snapshot::resume_pending_install(&args.db)
+        .context("ADR-0098 R2 — resume interrupted durable-checkpoint install at boot")?
+    {
+        aberp_snapshot::ResumeAction::NoPendingInstall => {}
+        resumed => tracing::warn!(
+            db = %args.db.display(),
+            ?resumed,
+            "ADR-0098 R2 — resumed a crash-interrupted durable-checkpoint install before opening the DB"
+        ),
+    }
+
     // PR-73a / hotfix — run the idempotent billing schema migrations
     // at boot so an existing pre-PR-73 tenant DB picks up the five
     // `bank_account_*` columns on `invoice` before the first
