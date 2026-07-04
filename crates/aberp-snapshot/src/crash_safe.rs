@@ -708,6 +708,46 @@ mod tests {
         }
     }
 
+    /// NEW-1(a) REGRESSION (ADR-0098 R6). A verified-good marker over the main
+    /// file must NOT report "current" while a NON-EMPTY `<db>.wal` sibling holds
+    /// committed-but-unfolded data — every Handle commit is WAL-only, so the
+    /// pre-fix main-hash-only check reported "current" forever and the debounced
+    /// validated checkpoint never ran again, letting DuckDB self-fold in place
+    /// (duckdb#23046). Pure fs, so it runs in EVERY CI arm (no DuckDB needed).
+    #[test]
+    fn checkpoint_is_current_is_false_when_a_pending_wal_exists() {
+        let tmp = Tmp::new("cic-wal");
+        let db = tmp.join("t.duckdb");
+        std::fs::write(&db, b"main-file-bytes").unwrap();
+
+        // Marker matches the main file exactly => the main-hash half says current.
+        write_marker(&db).unwrap();
+        assert!(
+            checkpoint_is_current(&db),
+            "no WAL + matching marker => current"
+        );
+
+        // A NON-EMPTY WAL sibling => committed data the main hash does not cover.
+        let wal = wal_sibling(&db);
+        std::fs::write(&wal, b"pending-commit-bytes").unwrap();
+        assert!(
+            !checkpoint_is_current(&db),
+            "NEW-1(a): a non-empty pending WAL must force NOT-current so the              validated build-aside checkpoint actually runs"
+        );
+
+        // An EMPTY (size-0) WAL — e.g. one a read-only open created — is NOT a
+        // pending commit and must remain current (no false checkpoint churn).
+        std::fs::write(&wal, b"").unwrap();
+        assert!(
+            checkpoint_is_current(&db),
+            "an empty size-0 WAL is not a pending commit => still current"
+        );
+
+        // WAL removed => current again (marker still matches the main file).
+        std::fs::remove_file(&wal).unwrap();
+        assert!(checkpoint_is_current(&db));
+    }
+
     #[test]
     fn atomic_install_replaces_target_with_staged() {
         let t = Tmp::new("replace");

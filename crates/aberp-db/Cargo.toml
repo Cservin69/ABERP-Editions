@@ -32,6 +32,13 @@ tracing = { workspace = true }
 [dev-dependencies]
 aberp-audit-ledger = { path = "../audit-ledger", features = ["test-support"] }
 duckdb = { workspace = true }
+# ADR-0098 R6: the debounced-checkpoint WAL-fold regression test
+# (tests/handle_concurrency_e2e.rs::debounced_checkpoint_folds_a_pending_wal_every_dirty_tick)
+# asserts on `aberp_snapshot::checkpoint_is_current`; it is already a normal
+# dependency (the Handle calls live_durable_checkpoint) but integration tests
+# get their extern crates from dev-dependencies, so it is duplicated here (same
+# path dep -> no Cargo.lock change), matching the duckdb/audit-ledger convention.
+aberp-snapshot = { path = "../aberp-snapshot" }
 
 [lints]
 workspace = true

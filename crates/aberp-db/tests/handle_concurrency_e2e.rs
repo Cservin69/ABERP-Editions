@@ -571,3 +571,88 @@ fn c2_read_after_write_sees_update_in_avl_shape() {
         "read() must observe the committed UPDATE (avl revoke→list coherence; ADR-0098 C2 round-13)"
     );
 }
+
+/// ADR-0098 R6 (NEW-1) REGRESSION — the test the durability matrix lacked.
+///
+/// Proves the runtime **debounced** checkpoint folds a PENDING WAL on EVERY
+/// dirty tick — the behaviour NEW-1 restored. Before the fix,
+/// `checkpoint_is_current` hashed ONLY the main `.duckdb`; every Handle commit
+/// is WAL-only (main bytes unchanged), so after the FIRST post-boot checkpoint
+/// the debounced `live_durable_checkpoint` saw "current" forever, returned
+/// `Ok(None)`, and NEVER folded again — committed data piled up in the WAL until
+/// DuckDB's own ~16 MB auto-checkpoint folded it IN PLACE on the live file
+/// (duckdb#23046). With the fix a non-empty `<db>.wal` reports not-current, so
+/// the validated build-aside fold runs and clears the WAL each tick.
+///
+/// The acceptance test above runs with `checkpoint_enabled = false`; this drives
+/// the checkpoint ON with a zero coalescing window and asserts the SECOND
+/// (WAL-only) commit's WAL is folded — not just the first. DuckDB-backed, so it
+/// runs on the CI/Mac durability gate alongside the acceptance test.
+#[test]
+fn debounced_checkpoint_folds_a_pending_wal_every_dirty_tick() {
+    fn wal_len(db: &Path) -> u64 {
+        let mut w = db.as_os_str().to_owned();
+        w.push(".wal");
+        std::fs::metadata(PathBuf::from(w))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    let tmp = Tmp::new("wal-fold");
+    let db = tmp.db();
+    seed(&db);
+
+    // Checkpoint ON, ZERO coalescing window => every commit's guard-drop fires
+    // the debounced checkpoint (the pure D2 debounce logic is unit-tested in
+    // src/debounce.rs; here we exercise the real DuckDB fold path).
+    let cfg = HandleConfig {
+        checkpoint_enabled: true,
+        min_checkpoint_interval: Duration::ZERO,
+        disable_implicit_close_checkpoint: true,
+    };
+    let handle: Arc<Handle> = Handle::open(&db, tenant(), cfg).unwrap();
+
+    // Commit #1 — the first post-boot checkpoint installs a fresh main + marker
+    // (build-aside + atomic rename) and folds the WAL.
+    {
+        let mut g = handle.write().unwrap();
+        append_one(&mut g, "c1");
+    } // guard drops -> debounced checkpoint
+    assert_eq!(
+        wal_len(&db),
+        0,
+        "commit #1: the debounced checkpoint must fold the pending WAL"
+    );
+    assert!(
+        aberp_snapshot::checkpoint_is_current(&db),
+        "commit #1: a verified-good marker must cover the freshly-installed main file"
+    );
+
+    // Commit #2 — WAL-ONLY (main bytes unchanged). THE REGRESSION: under the
+    // pre-fix `checkpoint_is_current` (main-hash only) this reports "current",
+    // `live_durable_checkpoint` returns Ok(None), and the commit is stranded in a
+    // growing WAL. With the fix, the pending WAL forces the validated fold.
+    {
+        let mut g = handle.write().unwrap();
+        append_one(&mut g, "c2");
+    }
+    assert_eq!(
+        wal_len(&db),
+        0,
+        "REGRESSION (NEW-1): the SECOND WAL-only commit must ALSO be folded by the \
+         debounced checkpoint. A non-empty WAL here means checkpoint_is_current \
+         wrongly reported 'current' and the validated fold was skipped — the WAL \
+         would then grow until DuckDB self-folds IN PLACE (duckdb#23046)."
+    );
+    assert!(aberp_snapshot::checkpoint_is_current(&db));
+
+    // Both committed rows survived the two build-aside folds (rename-swap integrity).
+    drop(handle); // close the shared connection before a fresh verifying open
+    let c = Connection::open(&db).unwrap();
+    let entries = recent_entries(&c, 16).unwrap();
+    assert_eq!(
+        entries.len(),
+        2,
+        "both commits present after two build-aside folds (no data lost to the swaps)"
+    );
+}
