@@ -741,8 +741,15 @@ if [[ ! -f "$scan" || ! -f "$manifest" ]]; then
   flag10j "✗ opener scanner or frozen manifest missing (10h/10i already flagged)"
 else
   # (a) the two CENTRAL openers carry the pragma once for all their callers.
+  # R6 (NEW-3): storage/mod.rs now holds TWO openers (Ledger::open at
+  # `Connection::open(path)` + the append_reopen path at `Connection::open(db_path)`,
+  # the latter pragma-guarded in R6). A whole-file grep could no longer tell which
+  # opener carried the pragma, so check the pragma sits within $WINDOW lines of
+  # Ledger::open's OWN opener line specifically — a second pragma elsewhere in the
+  # file can never again mask a Ledger::open removal.
   led="crates/audit-ledger/src/storage/mod.rs"
-  if grep -q "$PRAGMA" "$led"; then
+  led_open_ln="$(grep -nE 'Connection::open\(path\)' "$led" | head -1 | cut -d: -f1)"
+  if [[ -n "$led_open_ln" ]] && sed -n "${led_open_ln},$((led_open_ln+WINDOW))p" "$led" | grep -q "$PRAGMA"; then
     note "✓ audit-ledger Ledger::open carries $PRAGMA (covers its ~145 residual callers)"
   else
     flag10j "✗ Ledger::open ($led) missing $PRAGMA — its residual callers would fold-on-close in place"
