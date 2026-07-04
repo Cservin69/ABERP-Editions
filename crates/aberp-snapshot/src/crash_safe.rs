@@ -278,6 +278,21 @@ pub fn read_marker(db_path: &Path) -> Option<CheckpointMarker> {
 /// written since the last checkpoint) all mean "checkpoint missing" → a
 /// clean shutdown should take one.
 pub fn checkpoint_is_current(db_path: &Path) -> bool {
+    // NEW-1(a) (ADR-0098 R6): a non-empty `<db>.wal` sibling means committed
+    // data lives in the WAL that the main-file hash does NOT cover. Every Handle
+    // commit is WAL-only (main bytes unchanged — proven on duckdb 1.5.3 by R5),
+    // so hashing ONLY the main file reported "current" forever after the first
+    // post-boot checkpoint; the debounced `live_durable_checkpoint` then skipped
+    // the validated build-aside fold in steady state, committed data accumulated
+    // in the WAL, and DuckDB's own ~16MB `wal_autocheckpoint` eventually folded
+    // it IN PLACE on the live file (the duckdb#23046 locus this release exists to
+    // eliminate). A pending WAL therefore means "NOT current" → the debounced
+    // checkpoint runs the validated EXPORT→validate→atomic-rename fold. The
+    // main-file-hash check below is the OTHER half: a staled marker (DB written
+    // since the last checkpoint) is also not-current.
+    if wal_stat(&wal_sibling(db_path)).size > 0 {
+        return false;
+    }
     let Some(marker) = read_marker(db_path) else {
         return false;
     };
@@ -588,15 +603,27 @@ pub fn durable_checkpoint(db_path: &Path, tenant: &str) -> Result<CheckpointRepo
     //    windows.
     let _intent = write_install_intent(db_path, &staging, &staging_sha256)?;
 
-    // 5. (steps iii+iv) Atomic, fsync'd swap over the live file, which renames
-    //    the staging file in AND deletes the now-stale target WAL AND fsyncs the
-    //    directory (all-or-nothing).
-    atomic_install(&staging, db_path)?;
-
-    // 6. (step v) Clear the journal, then record the verified-good marker for
-    //    the freshly installed file.
-    clear_install_intent(db_path)?;
-    let marker = write_marker(db_path)?;
+    // 5+6. NEW-2 (ADR-0098 R6): once the install-intent journal is on disk, ANY
+    //    error before we finish MUST NOT leave that journal behind. A surviving
+    //    `<db>.install-intent` is replayed at the NEXT boot by
+    //    `resume_pending_install`, and `decide_resume` has NO "the live DB moved
+    //    past the journaled state" notion — so a stale journal could rename this
+    //    now-stale staging over a live DB that has since progressed, or delete a
+    //    live `<db>.wal` holding real committed writes (data loss). Run the swap
+    //    + marker (steps iii–v) under a guard that, on any failure, best-effort
+    //    clears the journal and the staging leftovers BEFORE propagating. (If the
+    //    swap already succeeded, clearing again is a harmless no-op and boot's
+    //    `ClearStaleWal` path remains a safety net.)
+    let marker = match install_and_mark(db_path, &staging) {
+        Ok(marker) => marker,
+        Err(e) => {
+            let _ = clear_install_intent(db_path);
+            let _ = std::fs::remove_file(&staging);
+            let _ = std::fs::remove_file(&staging_wal);
+            let _ = std::fs::remove_dir_all(&export_dir);
+            return Err(e);
+        }
+    };
 
     // Best-effort cleanup of the export dir (the staging file is gone —
     // it was renamed onto the live path).
@@ -607,6 +634,17 @@ pub fn durable_checkpoint(db_path: &Path, tenant: &str) -> Result<CheckpointRepo
         byte_size: marker.byte_size,
         validated: true,
     })
+}
+
+/// Steps iii–v of [`durable_checkpoint`] as one fallible unit so the caller can
+/// clear the install-intent journal on ANY failure (ADR-0098 R6, NEW-2): the
+/// atomic swap of the validated staging over the live file (which also drops the
+/// now-stale live WAL), then clear the journal, then record the verified-good
+/// marker for the freshly installed file.
+fn install_and_mark(db_path: &Path, staging: &Path) -> Result<CheckpointMarker> {
+    atomic_install(staging, db_path)?;
+    clear_install_intent(db_path)?;
+    write_marker(db_path)
 }
 
 /// A sibling path `<db><suffix>` in the same directory as the DB.

@@ -543,6 +543,18 @@ fn open_runtime_connection(db_path: &Path, config: &HandleConfig) -> Result<Conn
         // live file. (ADR-0098 1b: "the handle disables DuckDB's implicit
         // checkpoint-on-close for runtime connections.")
         conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")?;
+        // NEW-1(b) (ADR-0098 R6): `disable_checkpoint_on_shutdown` only stops the
+        // fold on connection *close*. DuckDB STILL auto-folds the WAL IN PLACE
+        // once it grows past `wal_autocheckpoint` (~16MB default) DURING
+        // operation — empirically 6 in-place folds under sustained writes on
+        // libduckdb 1.5.3, the exact duckdb#23046 path. Raise the threshold to
+        // effectively infinite so the engine NEVER self-folds the live file; with
+        // (a) reporting a pending WAL as not-current, the ONLY thing that ever
+        // folds the live file is the validated build-aside checkpoint. Same
+        // `PRAGMA ...;` idiom as above; the spelling is confirmed VALID on 1.5.3
+        // (an unknown pragma errors HARD — duckdb#10127 — so a future typo makes
+        // `Handle::open` fail loudly, never silently degrade).
+        conn.execute_batch("PRAGMA wal_autocheckpoint='1TB';")?;
     }
     Ok(conn)
 }
