@@ -100,8 +100,7 @@ mod tests {
 
     #[test]
     fn panic_message_is_sanitized() {
-        let r: anyhow::Result<()> =
-            guard_write_tick("t", || panic!("line1\nline2\r\0tail"));
+        let r: anyhow::Result<()> = guard_write_tick("t", || panic!("line1\nline2\r\0tail"));
         let e = r.unwrap_err().to_string();
         assert!(!e.contains('\n') && !e.contains('\r') && !e.contains('\0'));
     }
