@@ -24,7 +24,16 @@ jobs:
   db-isolation:
     name: ADR-0093 DB-isolation cut-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # ADR-0098 R6: raised 5 -> 15. The gate itself still runs in seconds, but the
+    # negative-probe harness (tools/cut_gate_negative_probes.sh) fresh()-copies the
+    # whole tree once per probe and re-runs the full gate each time; with the R6
+    # CHECK-10j/crates probe added it now runs ~5 min, which repeatedly grazed the
+    # old 5-min cap and got the job CANCELLED (a false red on a REQUIRED check, and
+    # a red on main since this workflow also runs on push:main). Pure timeout
+    # accommodation — every ENFORCE_* check still runs in full and must pass (no
+    # de-gate). FLAG (v0.2.6): speed up fresh() (git-archive/worktree copy) so the
+    # suite is comfortably fast again.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
