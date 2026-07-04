@@ -732,7 +732,7 @@ fi
 #    per-site). Teeth: cut_gate_negative_probes.sh "[CHECK 10j]" strips the pragma
 #    from a frozen opener and asserts this goes red. ENFORCE_RESIDUAL_PRAGMA=0
 #    disables it for a deliberate, temporary local probe only.
-echo "[CHECK 10j] ADR-0098 R3 (finding C) — every frozen residual opener carries PRAGMA disable_checkpoint_on_shutdown (no silent fold-on-close; ENFORCED · D5)"
+echo "[CHECK 10j] ADR-0098 R3 (finding C) + R6 (NEW-3): scope now includes crates/ — every frozen residual opener carries PRAGMA disable_checkpoint_on_shutdown (no silent fold-on-close; ENFORCED · D5)"
 enforce10j="${ENFORCE_RESIDUAL_PRAGMA:-1}"
 flag10j() { note "$1"; if [[ "$enforce10j" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
 PRAGMA='disable_checkpoint_on_shutdown'
@@ -775,7 +775,7 @@ else
         pragma_fail=1
       fi
     done <<< "$openers"
-  done < <(find apps/aberp/src modules -name '*.rs' | grep -vE '/tests/' | sort)
+  done < <(find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/' | sort)
   if [[ "$pragma_fail" == "0" ]]; then
     note "✓ every frozen residual Connection::open carries $PRAGMA within $WINDOW lines (no silent close-checkpoint fold)"
   fi

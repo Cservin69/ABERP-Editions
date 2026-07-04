@@ -60,6 +60,11 @@ fn run() -> Result<u64> {
     let (tenant, db_path) = parse_args()?;
     let mut conn = Connection::open(&db_path)
         .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
+    // ADR-0098 R6 (NEW-3): pragma-guard this residual CLI opener so a rebuild run
+    // can never fold the tenant WAL in place on close (duckdb#23046). Enforced by
+    // cut-gate CHECK 10j (crates-scoped as of R6).
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+        .context("PRAGMA disable_checkpoint_on_shutdown on inventory rebuild residual opener (ADR-0098 R6)")?;
 
     // Idempotent schema-ensure so the binary works against a fresh
     // tenant DB that has products but has not yet booted aberp serve

@@ -316,6 +316,18 @@ open(p,"w").write(s.replace(old,new,1))
 PYIN
 expect_fail "$c" "opener fingerprint set DIVERGED" "CHECK 10k — a count-preserving intra-file opener swap is caught by the fingerprint freeze"
 
+echo "[CHECK 10j/crates] R6 (NEW-3) — pragma STRIPPED from a frozen CRATE residual opener (aberp-mes ledger_writer) — the R6 crates-scope extension must catch it"
+c="$(fresh)"
+python3 - "$c/crates/aberp-mes/src/ledger_writer.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+block='        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")\n            .map_err(|e| format!("PRAGMA disable_checkpoint_on_shutdown on MES ledger residual opener (ADR-0098 R6): {e}"))?;\n'
+assert block in s, "aberp-mes ledger_writer pragma anchor moved -- probe is stale"
+open(p,"w").write(s.replace(block,'',1))
+PYIN
+expect_fail "$c" "residual Connection::open has NO disable_checkpoint_on_shutdown within" "CHECK 10j/crates -- R6: pragma stripped from the aberp-mes crate residual opener (invisible pre-R6 crates-scope extension)"
+
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi

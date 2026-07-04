@@ -37,10 +37,13 @@
 #     separate opener newly SURFACED by the R4 scope extension; FLAGGED as a v0.2.6
 #     Handle-migration target (NOT migrated this session — conservative);
 #   (c)=CLI-only bin one-shot (separate process, out of ADR-0098 scope).
-#   NOTE: CHECK 10j (pragma-presence) keeps its R3 scope (apps/aberp+modules); the
-#   crate residuals here are frozen for COUNT (10i) + FINGERPRINT (10k) but not
-#   pragma-enforced — residual fold-on-close risk for the mes/bin openers is noted
-#   in the R4 findings notes (v0.2.6: migrate onto the Handle, which carries it).
+#   NOTE: ADR-0098 R6 (NEW-3) EXTENDED CHECK 10j (pragma-presence) scope to crates/
+#   (was apps/aberp+modules only): every frozen crate residual Connection::open now
+#   MUST carry PRAGMA disable_checkpoint_on_shutdown. R6 pragma-guarded the three
+#   surfaced crate openers — aberp-mes ledger_writer::write_one, aberp-inventory
+#   rebuild_stock_cache::run (CLI), and audit-ledger append_reopen (the audit-ledger
+#   central Ledger::open already carried it). Full Handle migration of the mes/bin
+#   openers remains a v0.2.6 target.
 1 apps/aberp/src/audit_dap_boot.rs
 2 apps/aberp/src/avl_vendors.rs
 8 apps/aberp/src/drain_pending_retries.rs

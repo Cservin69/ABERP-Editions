@@ -614,7 +614,16 @@ pub fn durable_checkpoint(db_path: &Path, tenant: &str) -> Result<CheckpointRepo
     //    clears the journal and the staging leftovers BEFORE propagating. (If the
     //    swap already succeeded, clearing again is a harmless no-op and boot's
     //    `ClearStaleWal` path remains a safety net.)
-    let marker = match install_and_mark(db_path, &staging) {
+    let install_and_mark = || -> Result<CheckpointMarker> {
+        // (steps iii+iv) Atomic, fsync'd swap over the live file, which renames
+        // the staging file in AND deletes the now-stale target WAL AND fsyncs the
+        // directory (all-or-nothing); then (step v) clear the journal and record
+        // the verified-good marker for the freshly installed file.
+        atomic_install(&staging, db_path)?;
+        clear_install_intent(db_path)?;
+        write_marker(db_path)
+    };
+    let marker = match install_and_mark() {
         Ok(marker) => marker,
         Err(e) => {
             let _ = clear_install_intent(db_path);
@@ -634,17 +643,6 @@ pub fn durable_checkpoint(db_path: &Path, tenant: &str) -> Result<CheckpointRepo
         byte_size: marker.byte_size,
         validated: true,
     })
-}
-
-/// Steps iii–v of [`durable_checkpoint`] as one fallible unit so the caller can
-/// clear the install-intent journal on ANY failure (ADR-0098 R6, NEW-2): the
-/// atomic swap of the validated staging over the live file (which also drops the
-/// now-stale live WAL), then clear the journal, then record the verified-good
-/// marker for the freshly installed file.
-fn install_and_mark(db_path: &Path, staging: &Path) -> Result<CheckpointMarker> {
-    atomic_install(staging, db_path)?;
-    clear_install_intent(db_path)?;
-    write_marker(db_path)
 }
 
 /// A sibling path `<db><suffix>` in the same directory as the DB.

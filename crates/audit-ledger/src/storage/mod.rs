@@ -608,6 +608,11 @@ pub fn append_reopen(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut conn = Connection::open(db_path)?;
+    // ADR-0098 R6 (NEW-3): the legacy reopen-append path opens the live audit DB
+    // per write and drops it — pragma-guard so its close can never fold the WAL in
+    // place (duckdb#23046). Enforced by cut-gate CHECK 10j (crates-scoped as of R6).
+    // Full Handle migration of this seam is a v0.2.6 target.
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")?;
     ensure_schema(&conn)?;
     let tx = conn.transaction()?;
     let id = append_in_tx(&tx, meta, kind, payload, actor, idempotency_key)?;

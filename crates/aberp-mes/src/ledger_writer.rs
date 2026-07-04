@@ -142,6 +142,12 @@ async fn write_one(deps: &LedgerWriterDeps, payload: &MesAdapterEventPayload, ad
     let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
         let mut conn = duckdb::Connection::open(&db_path)
             .map_err(|e| format!("open DB for MES audit append: {e}"))?;
+        // ADR-0098 R6 (NEW-3): this residual in-serve-process opener must not fold
+        // the shared WAL in place on close while the Handle's instance is open
+        // (duckdb#23046). Pragma-guard it — now enforced by cut-gate CHECK 10j,
+        // whose scope R6 extended to crates/. Full Handle migration is a v0.2.6 target.
+        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+            .map_err(|e| format!("PRAGMA disable_checkpoint_on_shutdown on MES ledger residual opener (ADR-0098 R6): {e}"))?;
         aberp_audit_ledger::ensure_schema(&conn)
             .map_err(|e| format!("ensure audit-ledger schema: {e}"))?;
         let tx = conn
