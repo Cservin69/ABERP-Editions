@@ -802,37 +802,52 @@ fn retained_suffix(retained: &Option<PathBuf>) -> String {
     }
 }
 
-/// Append the `db.auto_recovered` audit entry recording a completed ADR-0095
-/// §1 recovery. Best-effort: the recovery is ALREADY durable (atomic_install +
-/// verified-good marker), so a failed audit append is logged, never fatal.
-/// The append advances BOTH the DB and the mirror (via `Ledger::append` →
-/// `sync_mirror`), so they stay reconciled — no chain fork.
-fn emit_db_auto_recovered(
-    db_path: &Path,
-    tenant: &TenantId,
+/// ADR-0098 R3 regression fix — pre-install hook body for
+/// [`aberp_snapshot::recover_or_refuse_with_audit`]. BUILDS the
+/// `db.auto_recovered` audit row (event kind + serialized payload + actor +
+/// binary hash); the recovery engine appends it into the freshly-rebuilt
+/// **STAGING** DB and tops the mirror up to it BEFORE the atomic swap +
+/// verified-good marker. Because the row lands in the staging file (which the
+/// snapshot layer folds + installs + markers), the installed DB already carries
+/// the row and the marker covers the FINAL on-disk bytes — there is NO
+/// post-install mutation, so nothing stales the marker and no re-checkpoint
+/// window exists.
+///
+/// This only BUILDS the row (the app owns the payload schema); the DB open +
+/// append + `sync_mirror` happen inside `aberp-snapshot`, so no new live-path
+/// opener surfaces in the app tree (ADR-0093 D5 residual-opener freeze) and the
+/// crate layering (aberp-snapshot below the app audit types) is respected.
+/// Returns `None` (skip the row) if the binary hash is not ready — best-effort,
+/// matching the historical "audit append never fails a durable recovery".
+fn build_db_auto_recovered_row(
     binary_hash: &BinaryHashHandle,
-    payload: audit_payloads::DbAutoRecoveredPayload,
-) {
+    trigger: &str,
+    meta: &aberp_snapshot::RecoveredMeta,
+) -> Option<aberp_snapshot::StagedAuditRow> {
+    // The running binary hash goes on the entry; if it is not ready yet we skip
+    // the row (best-effort — same posture as the old emit path). The recovery
+    // itself is already durable regardless.
     let bh = match binary_hash.wait() {
         Ok(bh) => bh,
         Err(e) => {
             tracing::warn!(error = ?e, "binary hash unavailable; skipping db.auto_recovered audit");
-            return;
+            return None;
         }
     };
-    if let Err(e) = crate::tenant_registry::emit_tenant_event(
-        db_path,
-        tenant.clone(),
-        bh,
-        AUTO_RECOVER_LOGIN,
-        EventKind::DbAutoRecovered,
-        payload.to_bytes(),
-    ) {
-        tracing::warn!(
-            error = ?e,
-            "could not record db.auto_recovered audit (recovery already durable)"
-        );
-    }
+    let payload = audit_payloads::DbAutoRecoveredPayload {
+        trigger: trigger.to_string(),
+        source_snapshot_seq: meta.source_snapshot_seq,
+        snapshot_audit_count: meta.snapshot_audit_count,
+        replayed_entries: meta.replayed_entries,
+        recovered_max_seq: meta.recovered_max_seq,
+        retained_corrupt_db: meta.retained_corrupt_db.clone(),
+    };
+    Some(aberp_snapshot::StagedAuditRow {
+        binary_hash: bh,
+        kind: EventKind::DbAutoRecovered,
+        payload: payload.to_bytes(),
+        actor: Actor::from_local_cli(Ulid::new().to_string(), AUTO_RECOVER_LOGIN),
+    })
 }
 
 /// ADR-0095 §1 — attempt the guarded, reversible auto-recovery of the tenant
@@ -859,9 +874,19 @@ fn attempt_db_auto_recovery(
         trigger,
         "ADR-0095 §1 — attempting guarded snapshot+replay auto-recovery"
     );
-    let outcome =
-        aberp_snapshot::recover_or_refuse(db_path, &store_dir, &mirror_path, tenant.as_str())
-            .context("ADR-0095 recover_or_refuse")?;
+    // ADR-0098 R3 fix — emit the db.auto_recovered audit row into the STAGING
+    // DB (and mirror) BEFORE install, so the verified-good marker covers the
+    // final DB and no post-install mutation stales it.
+    let outcome = aberp_snapshot::recover_or_refuse_with_audit(
+        db_path,
+        &store_dir,
+        &mirror_path,
+        tenant.as_str(),
+        |meta: &aberp_snapshot::RecoveredMeta| {
+            build_db_auto_recovered_row(binary_hash, trigger, meta)
+        },
+    )
+    .context("ADR-0095 recover_or_refuse")?;
     match outcome {
         aberp_snapshot::RecoveryOutcome::Recovered {
             source_snapshot_seq,
@@ -879,31 +904,10 @@ fn attempt_db_auto_recovery(
                 replayed_entries,
                 recovered_max_seq,
                 retained_corrupt_db = ?retained,
-                "ADR-0095 §1 — auto-recovery SUCCEEDED; live DB rebuilt + verified-good marker written"
+                "ADR-0095 §1 — auto-recovery SUCCEEDED; live DB rebuilt with the \
+                 db.auto_recovered row appended pre-install + verified-good marker \
+                 covering the final DB (no post-install mutation)"
             );
-            emit_db_auto_recovered(
-                db_path,
-                tenant,
-                binary_hash,
-                audit_payloads::DbAutoRecoveredPayload {
-                    trigger: trigger.to_string(),
-                    source_snapshot_seq,
-                    snapshot_audit_count,
-                    replayed_entries,
-                    recovered_max_seq,
-                    retained_corrupt_db: retained,
-                },
-            );
-            // ADR-0095 §1 — the db.auto_recovered audit append above mutated the
-            // freshly rebuilt DB *after* recover_or_refuse wrote its verified-good
-            // marker, staling it. Re-establish the durable checkpoint so the
-            // `<db>.ckpt-ok` marker covers the FINAL on-disk DB. Idempotent (a
-            // no-op once the marker is current) and crash-safe (a crash here leaves
-            // a healthy DB with a briefly-stale marker that the next boot's
-            // recover_or_refuse / checkpoint re-establishes); best-effort like the
-            // audit append — a checkpoint hiccup must never fail a boot that has
-            // already durably recovered the DB.
-            crate::snapshot::live_checkpoint_logged(db_path, tenant.as_str());
             Ok(BootRecovery::Recovered)
         }
         aberp_snapshot::RecoveryOutcome::RefusedNoSnapshot {
@@ -929,7 +933,9 @@ fn attempt_db_auto_recovery(
 /// outcome, and records `db.auto_recovered` on success. Returns `Err` on a
 /// guard-rail refusal so a script can detect it (process exits non-zero).
 pub fn run_recover(args: &crate::cli::RecoverArgs) -> Result<()> {
-    let tenant = TenantId::new(args.tenant.clone())
+    // Validate the tenant id up-front (fail fast); the recovery engine re-derives
+    // it from `&args.tenant` for the pre-install audit append.
+    let _tenant = TenantId::new(args.tenant.clone())
         .ok_or_else(|| anyhow!("invalid tenant id {:?}", args.tenant))?;
     let store_dir = crate::snapshot::resolve_store(&args.tenant, args.store.as_deref())
         .context("resolve snapshot store for `aberp recover`")?;
@@ -941,9 +947,17 @@ pub fn run_recover(args: &crate::cli::RecoverArgs) -> Result<()> {
     println!("  store:  {}", store_dir.display());
     println!("  mirror: {}", mirror_path.display());
 
-    let outcome =
-        aberp_snapshot::recover_or_refuse(&args.db, &store_dir, &mirror_path, &args.tenant)
-            .context("recover_or_refuse")?;
+    // ADR-0098 R3 fix — pre-install audit append (see `attempt_db_auto_recovery`).
+    let outcome = aberp_snapshot::recover_or_refuse_with_audit(
+        &args.db,
+        &store_dir,
+        &mirror_path,
+        &args.tenant,
+        |meta: &aberp_snapshot::RecoveredMeta| {
+            build_db_auto_recovered_row(&binary_hash, "manual_cli", meta)
+        },
+    )
+    .context("recover_or_refuse")?;
     match outcome {
         aberp_snapshot::RecoveryOutcome::Recovered {
             source_snapshot_seq,
@@ -955,25 +969,10 @@ pub fn run_recover(args: &crate::cli::RecoverArgs) -> Result<()> {
             let retained = retained_corrupt_db
                 .as_ref()
                 .map(|p| p.display().to_string());
-            emit_db_auto_recovered(
-                &args.db,
-                &tenant,
-                &binary_hash,
-                audit_payloads::DbAutoRecoveredPayload {
-                    trigger: "manual_cli".to_string(),
-                    source_snapshot_seq,
-                    snapshot_audit_count,
-                    replayed_entries,
-                    recovered_max_seq,
-                    retained_corrupt_db: retained.clone(),
-                },
-            );
-            // ADR-0095 §1 — the db.auto_recovered audit append above mutated the
-            // freshly rebuilt DB *after* recover_or_refuse wrote its verified-good
-            // marker, staling it. Re-establish the durable checkpoint so the
-            // `<db>.ckpt-ok` marker covers the FINAL on-disk DB (idempotent +
-            // crash-safe; best-effort like the audit append).
-            crate::snapshot::live_checkpoint_logged(&args.db, &args.tenant);
+            // ADR-0098 R3 fix — the db.auto_recovered row was appended into the
+            // staging DB + mirror BEFORE install (see the hook above), so the
+            // verified-good marker already covers the final DB; no post-install
+            // mutation and no re-checkpoint needed here.
             println!("RECOVERED");
             println!(
                 "  rebuilt from snapshot seq {source_snapshot_seq} (audit head {snapshot_audit_count})"

@@ -43,8 +43,8 @@
 use std::path::{Path, PathBuf};
 
 use aberp_audit_ledger::{
-    read_mirror_under_tail_policy, replay_mirror_delta, BinaryHash, Ledger, MirrorEntry,
-    MirrorTailPolicy, TenantId,
+    read_mirror_under_tail_policy, replay_mirror_delta, Actor, BinaryHash, EventKind, Ledger,
+    MirrorEntry, MirrorTailPolicy, TenantId,
 };
 use duckdb::Connection;
 
@@ -93,6 +93,58 @@ pub enum RecoveryOutcome {
     },
 }
 
+/// Recovery metadata handed to the pre-install audit hook
+/// ([`recover_or_refuse_with_audit`]) so the app layer can build the
+/// `db.auto_recovered` payload from the SAME numbers the returned
+/// [`RecoveryOutcome::Recovered`] carries — computed BEFORE the swap.
+#[derive(Debug, Clone)]
+pub struct RecoveredMeta {
+    /// Seq of the snapshot the rebuild started from.
+    pub source_snapshot_seq: u64,
+    /// Audit-ledger head the snapshot carried (the replay floor).
+    pub snapshot_audit_count: u64,
+    /// Number of mirror entries replayed on top of the snapshot.
+    pub replayed_entries: u64,
+    /// Rebuilt head seq BEFORE the pre-install audit row is appended.
+    pub recovered_max_seq: u64,
+    /// The retained `<db>.CORRUPT-<tag>` evidence copy (display form), if the
+    /// live file existed before recovery. Never deleted.
+    pub retained_corrupt_db: Option<String>,
+}
+
+/// A recovery-audit row the app layer asks the recovery engine to append into
+/// the STAGING DB (and mirror) BEFORE install. It is carried as opaque audit
+/// primitives — [`aberp_audit_ledger`] types plus PRE-SERIALIZED `payload`
+/// bytes — so `aberp-snapshot` stays strictly BELOW the app's audit-payload
+/// types (crate layering: the app owns the payload shape; the recovery engine
+/// owns the durable append seam). The engine opens the private staging DB,
+/// appends this row, and tops the mirror up to it (staging head == mirror
+/// head) all BEFORE the atomic swap.
+pub struct StagedAuditRow {
+    /// Binary hash recorded on the appended entry (the app's running binary).
+    pub binary_hash: BinaryHash,
+    /// The audit event kind (e.g. `EventKind::DbAutoRecovered`).
+    pub kind: EventKind,
+    /// Pre-serialized payload bytes (the app owns the payload schema).
+    pub payload: Vec<u8>,
+    /// The actor to attribute the entry to.
+    pub actor: Actor,
+}
+
+/// Back-compat entry point: guarded auto-recovery with NO pre-install audit
+/// hook. Crate-level callers/tests that do not emit an app-layer audit row use
+/// this; it delegates to [`recover_or_refuse_with_audit`] with a no-op hook, so
+/// it is byte-identical to the historical behaviour (rebuild → validate →
+/// atomic-install + marker, with no post-install mutation).
+pub fn recover_or_refuse(
+    db_path: &Path,
+    store_dir: &Path,
+    mirror_path: &Path,
+    tenant: &str,
+) -> Result<RecoveryOutcome> {
+    recover_or_refuse_with_audit(db_path, store_dir, mirror_path, tenant, |_| None)
+}
+
 /// Boot safe-open + auto-recover (ADR-0095 §1). Covers BOTH failure modes —
 /// a torn/unopenable live DB and an ahead-of-DB mirror — with one algorithm:
 ///
@@ -111,8 +163,16 @@ pub enum RecoveryOutcome {
 ///    head seq reconciles with the mirror head; the rebuilt head `entry_hash`
 ///    matches the mirror head. Any failure → discard staging,
 ///    [`RecoveryOutcome::RefusedUnsafe`].
-/// 6. COMMIT atomically: [`atomic_install`] the staging file over the live
-///    path, then [`write_marker`].
+/// 6. PRE-INSTALL AUDIT (ADR-0098 R3 fix): ask `build_row` for the caller's
+///    `db.auto_recovered` row, then append it into the STAGING DB and top the
+///    mirror up to it (staging head == mirror head) — BEFORE the swap, never
+///    after. Best-effort: `build_row` returning `None` or a failing append is
+///    logged and recovery still installs the validated rebuild (row omitted),
+///    preserving the "audit append never fails a durable recovery" posture.
+/// 7. COMMIT atomically: fold any WAL the pre-install append left on the
+///    staging file, [`atomic_install`] it over the live path, then
+///    [`write_marker`] — so the verified-good marker covers the FINAL on-disk
+///    bytes and NO post-install mutation can stale it.
 ///
 /// GUARD-RAIL: auto-recover happens ONLY when a valid snapshot exists AND the
 /// mirror is a consistent extension of it AND the rebuild validates;
@@ -126,12 +186,16 @@ pub enum RecoveryOutcome {
 /// could not be preserved, or the atomic install failed) — a boot-fatal
 /// condition the caller surfaces loudly. A guard-rail refusal is **not** an
 /// error: it is an `Ok(Refused*)` outcome (the safe fallback).
-pub fn recover_or_refuse(
+pub fn recover_or_refuse_with_audit<F>(
     db_path: &Path,
     store_dir: &Path,
     mirror_path: &Path,
     tenant: &str,
-) -> Result<RecoveryOutcome> {
+    build_row: F,
+) -> Result<RecoveryOutcome>
+where
+    F: FnOnce(&RecoveredMeta) -> Option<StagedAuditRow>,
+{
     // SAFETY: an editions build must never act on the FROZEN prod line.
     ensure_not_prod_path(db_path)?;
     ensure_not_prod_path(store_dir)?;
@@ -265,6 +329,9 @@ pub fn recover_or_refuse(
             snapshot_audit_count,
             retained_corrupt_db,
             db_path,
+            mirror_path,
+            tenant,
+            build_row,
         ),
         // FALL BACK: the ahead snapshot did not self-certify; rebuild from the
         // newest valid snapshot `<= mirror_head` via the prefix path.
@@ -291,7 +358,16 @@ pub fn recover_or_refuse(
                 mirror_head_hash.as_deref(),
                 &mirror_entries,
             )?;
-            install_or_refuse(fb_attempt, fb, fb_count, retained_corrupt_db, db_path)
+            install_or_refuse(
+                fb_attempt,
+                fb,
+                fb_count,
+                retained_corrupt_db,
+                db_path,
+                mirror_path,
+                tenant,
+                build_row,
+            )
         }
         // REFUSE: ahead, cannot self-certify, and no valid snapshot
         // `<= mirror_head` to fall back to. Preserve-and-surface (never guess)
@@ -460,15 +536,61 @@ fn stage_and_validate(
 /// COMMIT a validated rebuild atomically (swap over the live path + write the
 /// verified-good marker), or surface the guard-rail refusal. On refusal the
 /// disposable staging is cleaned; the live inputs are untouched.
-fn install_or_refuse(
+#[allow(clippy::too_many_arguments)]
+fn install_or_refuse<F>(
     attempt: Attempt,
     snapshot: &SnapshotRecord,
     snapshot_audit_count: u64,
     retained_corrupt_db: Option<PathBuf>,
     db_path: &Path,
-) -> Result<RecoveryOutcome> {
+    mirror_path: &Path,
+    tenant: &str,
+    build_row: F,
+) -> Result<RecoveryOutcome>
+where
+    F: FnOnce(&RecoveredMeta) -> Option<StagedAuditRow>,
+{
     match attempt.verdict {
         Verdict::Recovered(info) => {
+            // ADR-0098 R3 regression fix — append the caller's
+            // `db.auto_recovered` audit row into the STAGING DB and top up the
+            // mirror BEFORE the swap, so the installed bytes already carry the
+            // row and the verified-good marker below covers the FINAL DB. This
+            // replaces the old post-install append that left an unfolded WAL
+            // (Ledger::open carries `disable_checkpoint_on_shutdown`) which the
+            // debounced live checkpoint then skipped as a no-op, staling the
+            // marker on the next plain open's WAL fold. Best-effort: a failed
+            // append is logged, never fatal (the recovery is still durable).
+            // The append (Ledger::open on the PRIVATE staging file) lives HERE
+            // in the recovery engine — not the app layer — so no new live-path
+            // opener appears in the app (ADR-0093 D5 residual-opener freeze) and
+            // the app keeps ownership only of the payload bytes (layering).
+            let meta = RecoveredMeta {
+                source_snapshot_seq: snapshot.meta.seq,
+                snapshot_audit_count,
+                replayed_entries: info.replayed,
+                recovered_max_seq: info.max_seq,
+                retained_corrupt_db: retained_corrupt_db
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+            };
+            if let Some(row) = build_row(&meta) {
+                if let Err(e) = append_staged_audit_row(&attempt.staging, mirror_path, tenant, row)
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "pre-install db.auto_recovered audit append failed; installing the \
+                         validated rebuild without the audit row (recovery still durable)"
+                    );
+                }
+            }
+            // Fold any WAL the pre-install append left beside the staging file
+            // into its main file BEFORE `atomic_install` (which deletes the
+            // staging WAL) — otherwise the appended row, living only in the WAL,
+            // would be discarded by the swap. Idempotent no-op if the append
+            // left nothing pending. Mirrors the fold `build_and_validate` and
+            // `durable_checkpoint` already perform on their staging files.
+            fold_staging_wal(&attempt.staging)?;
             atomic_install(&attempt.staging, db_path)?;
             write_marker(db_path)?;
             if info.topped_up > 0 {
@@ -496,6 +618,55 @@ fn install_or_refuse(
             })
         }
     }
+}
+
+/// Append a caller-provided [`StagedAuditRow`] into the PRIVATE staging DB and
+/// top the mirror up to the new head (append to BOTH → staging head seq ==
+/// mirror head seq; the mirror is EXTENDED, never truncated — no chain fork).
+/// Best-effort: any failure is returned as a display string for the caller to
+/// log; recovery still installs the validated rebuild without the row. This is
+/// the ONE recovery-time opener of the staging file for the audit append — it
+/// lives in `aberp-snapshot` (the sanctioned recovery layer) rather than the
+/// app so no new live-path opener surfaces in the app tree (ADR-0093 D5).
+fn append_staged_audit_row(
+    staging: &Path,
+    mirror_path: &Path,
+    tenant: &str,
+    row: StagedAuditRow,
+) -> std::result::Result<(), String> {
+    let tenant_id =
+        TenantId::new(tenant.to_string()).ok_or_else(|| format!("invalid tenant id {tenant:?}"))?;
+    // Ledger::open carries `disable_checkpoint_on_shutdown` (ADR-0098 R3), so
+    // this append leaves the row in the staging WAL; `fold_staging_wal` folds
+    // it into the staging main file before the swap.
+    let mut ledger = Ledger::open(staging, tenant_id, row.binary_hash)
+        .map_err(|e| format!("open staging ledger to record the recovery audit row: {e}"))?;
+    ledger
+        .append(row.kind, row.payload, row.actor, None)
+        .map_err(|e| format!("append the recovery audit row into the staging DB: {e}"))?;
+    ledger
+        .sync_mirror(mirror_path)
+        .map_err(|e| format!("top the mirror up to the staging head: {e}"))?;
+    Ok(())
+}
+
+/// Fold any WAL left beside a freshly-built staging file into its main file so
+/// the file is self-contained BEFORE [`atomic_install`] renames it over the
+/// live path (and deletes the staging WAL). Opening a fresh connection and
+/// issuing an explicit `CHECKPOINT` is the same self-contained-file fold
+/// `build_and_validate` and `durable_checkpoint` perform; a checkpoint failure
+/// here aborts the install (better than swapping in bytes the marker would not
+/// cover). A no-op when no WAL is pending.
+fn fold_staging_wal(staging: &Path) -> Result<()> {
+    // Only re-open when there is actually a WAL to fold: the back-compat no-hook
+    // path (and any hook that appended nothing) leaves the staging file
+    // self-contained from `build_and_validate`, so this is a pure no-op there.
+    if !wal_sibling(staging).exists() {
+        return Ok(());
+    }
+    let conn = Connection::open(staging)?;
+    conn.execute_batch("CHECKPOINT;")?;
+    Ok(())
 }
 
 /// Build the staging DB from the snapshot export + mirror replay, then

@@ -56,7 +56,10 @@ pub use crash_safe::{
     read_install_intent, read_marker, resume_pending_install, write_install_intent, write_marker,
     CheckpointMarker, CheckpointReport, InstallIntent, ResumeAction,
 };
-pub use recover::{live_durable_checkpoint, provision_atomic, recover_or_refuse, RecoveryOutcome};
+pub use recover::{
+    live_durable_checkpoint, provision_atomic, recover_or_refuse, recover_or_refuse_with_audit,
+    RecoveredMeta, RecoveryOutcome, StagedAuditRow,
+};
 pub use retention::{plan_retention, prune, RetentionPlan, RetentionPolicy};
 pub use store::{
     default_store_dir, edition_store_dir, find_snapshot, list_snapshots, SnapshotRecord,
