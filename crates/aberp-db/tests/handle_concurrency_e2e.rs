@@ -735,7 +735,9 @@ fn db_total_vs_distinct_seq(db: &Path) -> (i64, i64) {
         .query_row("SELECT COUNT(*) FROM audit_ledger", [], |r| r.get(0))
         .unwrap();
     let distinct: i64 = c
-        .query_row("SELECT COUNT(DISTINCT seq) FROM audit_ledger", [], |r| r.get(0))
+        .query_row("SELECT COUNT(DISTINCT seq) FROM audit_ledger", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     (total, distinct)
 }
@@ -810,7 +812,7 @@ fn boot_access_through_shared_handle_keeps_python_resolved_db_mirror_coherent() 
         // Boot row-count via the ONE shared instance (models count_jobs).
         {
             let c = handle.read().unwrap();
-            let _: i64 = c
+            let _boot_count: i64 = c
                 .query_row("SELECT COUNT(*) FROM audit_ledger", [], |r| r.get(0))
                 .unwrap();
         }
@@ -840,8 +842,10 @@ fn boot_access_through_shared_handle_keeps_python_resolved_db_mirror_coherent() 
     // Mirror head tracks DB head — nothing is DB-only.
     let db_max: i64 = {
         let c = Connection::open(&db).unwrap();
-        c.query_row("SELECT COALESCE(MAX(seq), 0) FROM audit_ledger", [], |r| r.get(0))
-            .unwrap()
+        c.query_row("SELECT COALESCE(MAX(seq), 0) FROM audit_ledger", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
     };
     let mir_max = read_mirror_entries(&mirror_path_for(&db))
         .unwrap()
