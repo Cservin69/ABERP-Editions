@@ -2601,21 +2601,27 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                             // CAD blobs in the clear.
                             let cad_blob_ctx_result = {
                                 let cad_tenant = st.tenant.as_str().to_string();
-                                let cad_db_path = (*st.db_path).clone();
+                                let cad_db = st.db.clone();
                                 let cad_login = pipeline_operator_login.clone();
                                 tokio::task::spawn_blocking(
                                     move || -> Result<crate::cad_blob::CadBlobCtx> {
                                         let (key, prov) =
                                             crate::cad_blob::load_or_provision_key(&cad_tenant)?;
                                         if prov == crate::cad_blob::KeyProvision::Minted {
-                                            let mut conn =
-                                                duckdb::Connection::open(&cad_db_path).context(
-                                                    "open DB for cad-blob-key provision audit",
-                                                )?;
-                                            aberp_audit_ledger::ensure_schema(&conn)
+                                            // ADR-0098: route through the shared Handle, never a
+                                            // separate boot opener. A raw Connection::open here is a
+                                            // SECOND un-pragma'd DuckDB instance whose fold-on-close
+                                            // double-applies the Handle's pending-WAL tail (the
+                                            // audit_ledger has no UNIQUE on `seq` since S341), forking
+                                            // a DB-only, mirror-absent audit row. write() folds on the
+                                            // one instance and its WriteGuard drop runs sync_mirror.
+                                            let mut guard = cad_db.write().context(
+                                                "shared writer: cad-blob-key provision audit (ADR-0098)",
+                                            )?;
+                                            aberp_audit_ledger::ensure_schema(&guard)
                                                 .context("ensure audit schema for cad-blob key")?;
                                             crate::cad_blob::emit_key_provisioned(
-                                                &mut conn,
+                                                &mut guard,
                                                 &cad_tenant,
                                                 binary_hash,
                                                 &cad_login,
@@ -2647,14 +2653,19 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                     // row fires only on `true`, giving a
                                     // forensic walker one-shot evidence
                                     // that this install was migrated.
-                                    let migrate_db_path = (*st.db_path).clone();
+                                    let migrate_db = st.db.clone();
                                     let migrate_res = tokio::task::spawn_blocking(
                                         move || -> Result<bool> {
-                                            let conn =
-                                                duckdb::Connection::open(&migrate_db_path)
-                                                    .context("open DB for index migration")?;
+                                            // ADR-0098: shared-Handle write(), not a separate boot
+                                            // opener. The migration DDL runs on the ONE instance so no
+                                            // second un-pragma'd instance folds the Handle's pending
+                                            // WAL (which would fork a DB-only, mirror-absent audit row
+                                            // — no UNIQUE on audit_ledger.seq since S341).
+                                            let guard = migrate_db.write().context(
+                                                "shared writer: S288 index migration (ADR-0098)",
+                                            )?;
                                             crate::quote_pricing_jobs::migrate_secondary_index_with_report(
-                                                &conn,
+                                                &guard,
                                             )
                                         },
                                     )
@@ -2701,13 +2712,17 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                                     // mortem of PROD_v2.27.2: a pre-
                                     // existing row was racing the daemon
                                     // into a DuckDB FATAL.
-                                    let count_db_path = (*st.db_path).clone();
+                                    let count_db = st.db.clone();
                                     let count_tenant = st.tenant.as_str().to_string();
                                     let count_res =
                                         tokio::task::spawn_blocking(move || -> Result<u64> {
-                                            let conn =
-                                                duckdb::Connection::open(&count_db_path)
-                                                    .context("open DB for boot row count")?;
+                                            // ADR-0098: shared-Handle read() (a coherent try_clone of
+                                            // the one instance), not a separate boot opener whose
+                                            // fold-on-close would double-apply the Handle's pending
+                                            // WAL tail and fork a DB-only, mirror-absent audit row.
+                                            let conn = count_db.read().context(
+                                                "shared read: quote_pricing_jobs boot count (ADR-0098)",
+                                            )?;
                                             crate::quote_pricing_jobs::count_jobs(
                                                 &conn,
                                                 &count_tenant,

@@ -656,3 +656,200 @@ fn debounced_checkpoint_folds_a_pending_wal_every_dirty_tick() {
         "both commits present after two build-aside folds (no data lost to the swaps)"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// ADR-0098 R7 — python-resolved BOOT-audit coherence (FACT-A orphan fix).
+//
+// FACT A (forensic on the live Defense DB): `audit_ledger` accumulated
+// `quote.pipeline_python_resolved` rows that are PRESENT in the DB but ABSENT
+// from the `.audit.log` mirror — one forked `seq` per process launch.
+// FACT B: the runtime emitter (`emit_python_resolved_audit`) is already
+// Handle-routed and idempotent-keyed, so it is NOT the source.
+//
+// The source was the serve.rs BOOT daemon-spawn block: right after the shared
+// Handle wrote the python-resolved row into its (debounced) PENDING WAL, the
+// block opened the live tenant DB with SEPARATE, un-pragma'd
+// `duckdb::Connection::open` instances (S288 index-migrate, S286 boot
+// row-count, cad-key provision). Those boot openers are allow-listed out of
+// cut-gate CHECK 10j, so they fold-on-close. A second instance folding the
+// Handle's pending WAL DOUBLE-APPLIES the tail row; because `audit_ledger`
+// carries no UNIQUE on `seq` (S341 / duckdb#23046) the fork is INSERTED rather
+// than rejected — a DB-only, mirror-absent duplicate, once per launch.
+//
+// The fix routes those three boot accesses through the shared Handle
+// (`db.write()`/`db.read()`): exactly ONE instance, one validated fold, no
+// double-apply. `separate_boot_opener_*` reproduces the pre-fix fork on real
+// libduckdb 1.5.3; `boot_access_through_shared_handle_*` asserts the post-fix
+// invariant (DB == mirror, contiguous seq, no orphan across relaunch).
+
+fn wal_path(db: &Path) -> PathBuf {
+    let mut s = db.as_os_str().to_os_string();
+    s.push(".wal");
+    PathBuf::from(s)
+}
+
+const PY_KIND: &str = "quote.pipeline_python_resolved";
+
+/// Append one `quote.pipeline_python_resolved` audit row through the shared
+/// Handle (the shape `emit_python_resolved_audit` takes). The WriteGuard drop
+/// runs the lockstep `sync_mirror`, so the row lands in DB **and** mirror.
+fn append_python_resolved(handle: &Handle, launch: &str) {
+    let mut g = handle.write().unwrap();
+    let meta = LedgerMeta::new(tenant(), BinaryHash::from_bytes([7u8; 32]));
+    let tx = g.transaction().unwrap();
+    let actor = Actor::from_local_cli(format!("proc-{launch}"), "system");
+    append_in_tx(
+        &tx,
+        &meta,
+        EventKind::PipelinePythonResolved,
+        br#"{"resolution_kind":"project_venv","module_importable":true}"#.to_vec(),
+        actor,
+        Some("quote_pipeline_python_resolved:defense:project_venv:/opt/venv".to_string()),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    // g drops here -> lockstep sync_mirror.
+}
+
+fn py_rows_in_db(db: &Path) -> i64 {
+    let c = Connection::open(db).unwrap();
+    c.query_row(
+        "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'quote.pipeline_python_resolved'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn py_rows_in_mirror(db: &Path) -> usize {
+    read_mirror_entries(&mirror_path_for(db))
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == PY_KIND)
+        .count()
+}
+
+fn db_total_vs_distinct_seq(db: &Path) -> (i64, i64) {
+    let c = Connection::open(db).unwrap();
+    let total: i64 = c
+        .query_row("SELECT COUNT(*) FROM audit_ledger", [], |r| r.get(0))
+        .unwrap();
+    let distinct: i64 = c
+        .query_row("SELECT COUNT(DISTINCT seq) FROM audit_ledger", [], |r| r.get(0))
+        .unwrap();
+    (total, distinct)
+}
+
+/// PRE-FIX repro: a separate un-pragma'd boot opener folds the Handle's
+/// pending-WAL python-resolved row; with no UNIQUE on `seq` the double-apply
+/// FORKS a DB-only, mirror-absent duplicate. Deterministic model of the two
+/// coexisting instances via a WAL snapshot/restore (empirically confirmed on
+/// libduckdb 1.5.3). This is what the boot block did on `c662e39`.
+#[test]
+fn separate_boot_opener_forks_a_pending_wal_python_resolved_row() {
+    let tmp = Tmp::new("pyfork");
+    let db = tmp.db();
+    seed(&db);
+    // Handle keeps a PENDING WAL: no debounced checkpoint, no close-fold.
+    let cfg = HandleConfig {
+        checkpoint_enabled: false,
+        disable_implicit_close_checkpoint: true,
+        ..Default::default()
+    };
+    let handle = Handle::open(&db, tenant(), cfg).unwrap();
+    append_python_resolved(&handle, "launch-1");
+    // The Handle write synced the mirror: mirror has exactly one.
+    assert_eq!(py_rows_in_mirror(&db), 1, "mirror got the one coherent row");
+    let wal = wal_path(&db);
+    let snap = std::fs::read(&wal).expect("row must sit in a pending WAL, not yet folded");
+    assert!(!snap.is_empty(), "pending WAL must be non-empty");
+    // The Handle instance is dropped WITHOUT folding (pragma) — its WAL view persists.
+    drop(handle);
+    // Boot opener #1 (a separate, un-pragma'd instance) folds the WAL on close.
+    {
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch("SELECT 1;").unwrap();
+    }
+    // The co-existing second instance (the Handle's own) held the same WAL view:
+    // restore it and let a second separate opener fold it too -> double-apply.
+    std::fs::write(&wal, &snap).unwrap();
+    {
+        let c = Connection::open(&db).unwrap();
+        c.execute_batch("CHECKPOINT;").unwrap();
+    }
+    let db_ct = py_rows_in_db(&db);
+    let mir_ct = py_rows_in_mirror(&db) as i64;
+    let (total, distinct) = db_total_vs_distinct_seq(&db);
+    assert!(
+        db_ct >= 2,
+        "pre-fix: the double-apply must FORK the python-resolved row in the DB (got {db_ct})"
+    );
+    assert!(
+        db_ct > mir_ct,
+        "pre-fix: the fork is DB-present but mirror-absent (FACT A): db={db_ct} mirror={mir_ct}"
+    );
+    assert!(
+        total > distinct,
+        "pre-fix: a duplicate/forked seq exists (total={total} distinct={distinct})"
+    );
+}
+
+/// POST-FIX invariant: when the boot DB accesses are routed through the shared
+/// Handle (`read()`/`write()`), there is ONE instance and one fold, so no
+/// separate opener can double-apply the pending WAL. Across two launches the
+/// audit chain stays coherent: every DB row is mirrored, the mirror head tracks
+/// the DB head, and no `seq` is forked. This is what the fixed serve.rs does.
+#[test]
+fn boot_access_through_shared_handle_keeps_python_resolved_db_mirror_coherent() {
+    let tmp = Tmp::new("pycoherent");
+    let db = tmp.db();
+    seed(&db);
+    for launch in ["launch-1", "launch-2"] {
+        let handle = Handle::open(&db, tenant(), HandleConfig::default()).unwrap();
+        append_python_resolved(&handle, launch);
+        // Boot row-count via the ONE shared instance (models count_jobs).
+        {
+            let c = handle.read().unwrap();
+            let _: i64 = c
+                .query_row("SELECT COUNT(*) FROM audit_ledger", [], |r| r.get(0))
+                .unwrap();
+        }
+        // Boot index-migration DDL via the ONE shared instance (models the S288
+        // migrate). No separate un-pragma'd opener exists to fold the WAL.
+        {
+            let g = handle.write().unwrap();
+            g.execute_batch(
+                "CREATE TABLE IF NOT EXISTS boot_probe(x INTEGER); DROP TABLE boot_probe;",
+            )
+            .unwrap();
+        }
+        drop(handle);
+    }
+    // Coherence invariant (the fix's guarantee):
+    let db_ct = py_rows_in_db(&db);
+    let mir_ct = py_rows_in_mirror(&db) as i64;
+    assert_eq!(
+        db_ct, mir_ct,
+        "no DB-only orphan: python-resolved DB rows ({db_ct}) must equal mirror rows ({mir_ct})"
+    );
+    let (total, distinct) = db_total_vs_distinct_seq(&db);
+    assert_eq!(
+        total, distinct,
+        "no forked seq across relaunch (total={total} distinct={distinct})"
+    );
+    // Mirror head tracks DB head — nothing is DB-only.
+    let db_max: i64 = {
+        let c = Connection::open(&db).unwrap();
+        c.query_row("SELECT COALESCE(MAX(seq), 0) FROM audit_ledger", [], |r| r.get(0))
+            .unwrap()
+    };
+    let mir_max = read_mirror_entries(&mirror_path_for(&db))
+        .unwrap()
+        .last()
+        .map(|e| e.seq)
+        .unwrap_or(0);
+    assert_eq!(
+        mir_max as i64, db_max,
+        "mirror head ({mir_max}) must equal DB head ({db_max}) — no DB-only rows"
+    );
+}
