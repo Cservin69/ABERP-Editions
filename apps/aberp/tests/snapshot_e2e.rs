@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aberp::snapshot::{restore_and_emit, retention_and_emit, take_and_emit};
+use aberp::snapshot::{restore_and_emit, retention_and_emit, take_and_emit, SnapshotAudit};
 use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
 use aberp_snapshot::{list_snapshots, RetentionPolicy};
 use duckdb::Connection;
@@ -106,7 +106,8 @@ fn create_list_restore_journey_emits_events() {
 
     // CREATE — emits SnapshotCreated against the live ledger.
     let before = ledger_kinds(&db).len();
-    let rec = take_and_emit(&db, &store, &tid(), bh(), actor()).expect("take");
+    let rec =
+        take_and_emit(&SnapshotAudit::Reopen, &db, &store, &tid(), bh(), actor()).expect("take");
     assert!(rec.meta.valid, "fresh snapshot valid: {:?}", rec.meta);
     assert_eq!(rec.meta.audit_count, 3);
     assert_eq!(rec.meta.invoice_count, 4);
@@ -127,7 +128,17 @@ fn create_list_restore_journey_emits_events() {
     // carries the same invoice rows (validate the round-trip end-to-end).
     let target = dir.path().join("recovery").join("aberp.duckdb");
     let selector = rec.meta.seq.to_string();
-    restore_and_emit(&db, &store, &selector, &target, &tid(), bh(), actor()).expect("restore");
+    restore_and_emit(
+        &SnapshotAudit::Reopen,
+        &db,
+        &store,
+        &selector,
+        &target,
+        &tid(),
+        bh(),
+        actor(),
+    )
+    .expect("restore");
     assert!(target.exists());
     assert_eq!(count_kind(&db, EventKind::SnapshotRestored), 1);
 
@@ -151,7 +162,8 @@ fn validation_failure_emits_validation_failed_event() {
     }
 
     let store = dir.path().join("store");
-    let rec = take_and_emit(&db, &store, &tid(), bh(), actor()).expect("take produces a record");
+    let rec = take_and_emit(&SnapshotAudit::Reopen, &db, &store, &tid(), bh(), actor())
+        .expect("take produces a record");
     assert!(!rec.meta.valid, "tampered chain must fail validation");
     assert_eq!(count_kind(&db, EventKind::SnapshotValidationFailed), 1);
     assert_eq!(count_kind(&db, EventKind::SnapshotCreated), 0);
@@ -166,7 +178,7 @@ fn retention_emits_pruned_event_and_removes_dirs() {
 
     // Take three snapshots.
     for _ in 0..3 {
-        take_and_emit(&db, &store, &tid(), bh(), actor()).unwrap();
+        take_and_emit(&SnapshotAudit::Reopen, &db, &store, &tid(), bh(), actor()).unwrap();
     }
     assert_eq!(list_snapshots(&store).unwrap().len(), 3);
 
@@ -176,7 +188,16 @@ fn retention_emits_pruned_event_and_removes_dirs() {
         daily_days: 0,
         weekly_weeks: 0,
     };
-    let removed = retention_and_emit(&db, &store, &tid(), bh(), actor(), &policy).unwrap();
+    let removed = retention_and_emit(
+        &SnapshotAudit::Reopen,
+        &db,
+        &store,
+        &tid(),
+        bh(),
+        actor(),
+        &policy,
+    )
+    .unwrap();
     assert_eq!(removed.len(), 2, "two older snapshots pruned");
     assert_eq!(list_snapshots(&store).unwrap().len(), 1);
     assert_eq!(count_kind(&db, EventKind::SnapshotPruned), 1);

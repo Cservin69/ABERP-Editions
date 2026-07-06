@@ -27,7 +27,8 @@ use anyhow::{Context, Result};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId};
+use aberp_db::HandleArc;
 use aberp_snapshot::{
     edition_store_dir, ensure_not_prod_path, ensure_restore_allowed, find_snapshot, list_snapshots,
     plan_retention, prune, restore_into, take_snapshot, RetentionPolicy, SnapshotRecord,
@@ -215,10 +216,83 @@ pub fn interval_from_env() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Open a [`Ledger`] against the live DB to append a snapshot audit event.
-fn open_ledger(db_path: &Path, tenant: &TenantId, binary_hash: BinaryHash) -> Result<Ledger> {
-    Ledger::open(db_path, tenant.clone(), binary_hash)
-        .map_err(|e| anyhow::anyhow!("open audit ledger for snapshot event: {e}"))
+/// ADR-0099 — how a snapshot audit event reaches the ledger. The seq-515 fork
+/// was the periodic snapshot daemon's `snapshot.created` opening an INDEPENDENT
+/// [`Ledger`] on the live DB (this module's old `open_ledger`) and self-assigning
+/// a seq off a stale head while the quote-intake daemon did the same off the same
+/// head — both in the ONE `aberp serve` process. The fix routes every in-process
+/// snapshot audit append through the ONE shared [`aberp_db::Handle`]. The CLI
+/// subcommands (`aberp snapshot now/restore`) are a SEPARATE process with no
+/// Handle, so they keep the sanctioned reopen (cannot fork the serve writer).
+pub enum SnapshotAudit<'a> {
+    /// In-process (`aberp serve`): the periodic daemon AND the operator-UI HTTP
+    /// endpoints. Appends through the shared Handle's serialized writer — never
+    /// an independent opener (the WriteGuard drop runs the lockstep mirror sync).
+    Handle(&'a HandleArc),
+    /// Separate-process CLI one-shot (`aberp snapshot now/restore`): no Handle
+    /// exists in that process, so reopen the live DB (see [`emit_reopen_cli`]).
+    Reopen,
+}
+
+/// Append one snapshot audit event, routed per [`SnapshotAudit`]. In-process
+/// callers append through the shared [`aberp_db::Handle`]; the CLI reopens.
+fn emit_snapshot_event(
+    audit: &SnapshotAudit<'_>,
+    db_path: &Path,
+    tenant: &TenantId,
+    binary_hash: BinaryHash,
+    kind: EventKind,
+    payload: Vec<u8>,
+    actor: Actor,
+) -> Result<()> {
+    match audit {
+        SnapshotAudit::Handle(handle) => {
+            // Shared writer: the ONE serialized instance. No independent opener,
+            // no stale-head seq collision. WriteGuard drop runs the lockstep
+            // sync_mirror, so no separate `sync_mirror` is needed here either.
+            let mut conn = handle
+                .write()
+                .map_err(|e| anyhow::anyhow!("shared writer for snapshot audit event: {e}"))?;
+            aberp_audit_ledger::ensure_schema(&conn)
+                .map_err(|e| anyhow::anyhow!("ensure audit-ledger schema (snapshot event): {e}"))?;
+            let tx = conn
+                .transaction()
+                .map_err(|e| anyhow::anyhow!("begin DuckDB tx (snapshot event): {e}"))?;
+            let meta = LedgerMeta::new(tenant.clone(), binary_hash);
+            aberp_audit_ledger::append_in_tx(&tx, &meta, kind, payload, actor, None).map_err(
+                |e| anyhow::anyhow!("append snapshot audit event via shared Handle: {e}"),
+            )?;
+            tx.commit()
+                .map_err(|e| anyhow::anyhow!("commit DuckDB tx (snapshot event): {e}"))?;
+            Ok(())
+        }
+        SnapshotAudit::Reopen => {
+            emit_reopen_cli(db_path, tenant, binary_hash, kind, payload, actor)
+        }
+    }
+}
+
+/// SANCTIONED RESIDUAL (ADR-0099 gate allow-list: `emit_reopen_cli`) — the CLI
+/// reopen path. Only the separate-process `aberp snapshot {now,restore}`
+/// subcommands reach this; they have no [`aberp_db::Handle`] (a different
+/// process from `aberp serve`), so reopening the live DB here cannot fork
+/// against the serve-process writer. The `aberp serve` daemon + HTTP callers
+/// NEVER reach this branch (they pass [`SnapshotAudit::Handle`]). Kept a
+/// distinct, single-purpose fn so the cut-gate can allow-list it by name.
+fn emit_reopen_cli(
+    db_path: &Path,
+    tenant: &TenantId,
+    binary_hash: BinaryHash,
+    kind: EventKind,
+    payload: Vec<u8>,
+    actor: Actor,
+) -> Result<()> {
+    let mut ledger = Ledger::open(db_path, tenant.clone(), binary_hash)
+        .map_err(|e| anyhow::anyhow!("open audit ledger for snapshot event (CLI): {e}"))?;
+    ledger
+        .append(kind, payload, actor, None)
+        .map_err(|e| anyhow::anyhow!("append snapshot audit event (CLI): {e}"))?;
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -231,6 +305,7 @@ fn open_ledger(db_path: &Path, tenant: &TenantId, binary_hash: BinaryHash) -> Re
 /// the invalid snapshot is kept on disk and the last-good is preserved by
 /// retention). Returns the finalized record either way.
 pub fn take_and_emit(
+    audit: &SnapshotAudit<'_>,
     db_path: &Path,
     store_dir: &Path,
     tenant: &TenantId,
@@ -248,7 +323,6 @@ pub fn take_and_emit(
         .with_context(|| format!("take snapshot of {}", db_path.display()))?;
 
     let created_at = rfc3339(rec.meta.created_at);
-    let mut ledger = open_ledger(db_path, tenant, binary_hash)?;
     if rec.meta.valid {
         let payload = SnapshotCreatedPayload {
             seq: rec.meta.seq,
@@ -260,9 +334,16 @@ pub fn take_and_emit(
             chain_len: rec.meta.chain_len,
             store_dir: store_dir.display().to_string(),
         };
-        ledger
-            .append(EventKind::SnapshotCreated, payload.to_bytes(), actor, None)
-            .map_err(|e| anyhow::anyhow!("append SnapshotCreated: {e}"))?;
+        emit_snapshot_event(
+            audit,
+            db_path,
+            tenant,
+            binary_hash,
+            EventKind::SnapshotCreated,
+            payload.to_bytes(),
+            actor,
+        )
+        .map_err(|e| anyhow::anyhow!("append SnapshotCreated: {e}"))?;
         tracing::info!(
             seq = rec.meta.seq,
             audit = rec.meta.audit_count,
@@ -279,14 +360,16 @@ pub fn take_and_emit(
                 .clone()
                 .unwrap_or_else(|| "unknown validation failure".to_string()),
         };
-        ledger
-            .append(
-                EventKind::SnapshotValidationFailed,
-                payload.to_bytes(),
-                actor,
-                None,
-            )
-            .map_err(|e| anyhow::anyhow!("append SnapshotValidationFailed: {e}"))?;
+        emit_snapshot_event(
+            audit,
+            db_path,
+            tenant,
+            binary_hash,
+            EventKind::SnapshotValidationFailed,
+            payload.to_bytes(),
+            actor,
+        )
+        .map_err(|e| anyhow::anyhow!("append SnapshotValidationFailed: {e}"))?;
         tracing::error!(
             seq = rec.meta.seq,
             error = rec.meta.validation_error.as_deref().unwrap_or("?"),
@@ -299,6 +382,7 @@ pub fn take_and_emit(
 /// Apply retention to the store and emit `SnapshotPruned` if anything was
 /// removed. Returns the pruned seqs.
 pub fn retention_and_emit(
+    audit: &SnapshotAudit<'_>,
     db_path: &Path,
     store_dir: &Path,
     tenant: &TenantId,
@@ -318,10 +402,16 @@ pub fn retention_and_emit(
             retained_count: plan.keep.len(),
             ran_at: rfc3339(OffsetDateTime::now_utc()),
         };
-        let mut ledger = open_ledger(db_path, tenant, binary_hash)?;
-        ledger
-            .append(EventKind::SnapshotPruned, payload.to_bytes(), actor, None)
-            .map_err(|e| anyhow::anyhow!("append SnapshotPruned: {e}"))?;
+        emit_snapshot_event(
+            audit,
+            db_path,
+            tenant,
+            binary_hash,
+            EventKind::SnapshotPruned,
+            payload.to_bytes(),
+            actor,
+        )
+        .map_err(|e| anyhow::anyhow!("append SnapshotPruned: {e}"))?;
         tracing::info!(pruned = ?removed, retained = plan.keep.len(), "snapshot retention applied");
     }
     Ok(removed)
@@ -330,6 +420,7 @@ pub fn retention_and_emit(
 /// One full daemon cycle: take + validate + emit, then retention + emit.
 /// Retention failure does not discard the snapshot just taken.
 pub fn run_cycle(
+    audit: &SnapshotAudit<'_>,
     db_path: &Path,
     store_dir: &Path,
     tenant: &TenantId,
@@ -338,8 +429,23 @@ pub fn run_cycle(
     policy: &RetentionPolicy,
 ) -> Result<SnapshotRecord> {
     // `BinaryHash` is `Copy`; `Actor` is cloned for the second emit.
-    let rec = take_and_emit(db_path, store_dir, tenant, binary_hash, actor.clone())?;
-    if let Err(e) = retention_and_emit(db_path, store_dir, tenant, binary_hash, actor, policy) {
+    let rec = take_and_emit(
+        audit,
+        db_path,
+        store_dir,
+        tenant,
+        binary_hash,
+        actor.clone(),
+    )?;
+    if let Err(e) = retention_and_emit(
+        audit,
+        db_path,
+        store_dir,
+        tenant,
+        binary_hash,
+        actor,
+        policy,
+    ) {
         // A retention hiccup must not fail the cycle — the fresh snapshot is
         // the valuable output; stale extras are harmless.
         tracing::warn!(error = %e, "snapshot retention failed this cycle (snapshot itself is fine)");
@@ -351,6 +457,7 @@ pub fn run_cycle(
 /// ([`ensure_restore_allowed`]) MUST already have passed — callers run it
 /// first so a refusal never even finds the snapshot.
 pub fn restore_and_emit(
+    audit: &SnapshotAudit<'_>,
     db_path_for_audit: &Path,
     store_dir: &Path,
     selector: &str,
@@ -381,10 +488,16 @@ pub fn restore_and_emit(
     // The audit row records the restore against the live DB's ledger (NOT
     // the freshly-restored side-DB), so the operator's main timeline shows
     // that a restore happened.
-    let mut ledger = open_ledger(db_path_for_audit, tenant, binary_hash)?;
-    ledger
-        .append(EventKind::SnapshotRestored, payload.to_bytes(), actor, None)
-        .map_err(|e| anyhow::anyhow!("append SnapshotRestored: {e}"))?;
+    emit_snapshot_event(
+        audit,
+        db_path_for_audit,
+        tenant,
+        binary_hash,
+        EventKind::SnapshotRestored,
+        payload.to_bytes(),
+        actor,
+    )
+    .map_err(|e| anyhow::anyhow!("append SnapshotRestored: {e}"))?;
     tracing::info!(seq = rec.meta.seq, target = %target.display(), "snapshot restored");
     Ok(rec)
 }
@@ -402,7 +515,16 @@ pub fn run_now(args: &SnapshotNowArgs) -> Result<()> {
     let actor = cli_actor("system:snapshot-cli");
     let policy = policy_from_env();
 
-    let rec = run_cycle(&args.db, &store_dir, &tenant, binary_hash, actor, &policy)?;
+    // CLI is a SEPARATE process from `aberp serve` (no Handle) — reopen.
+    let rec = run_cycle(
+        &SnapshotAudit::Reopen,
+        &args.db,
+        &store_dir,
+        &tenant,
+        binary_hash,
+        actor,
+        &policy,
+    )?;
     if rec.meta.valid {
         println!(
             "Snapshot #{} written and validated → {}\n  invoices={}  audit_rows={}  chain={}  size={}",
@@ -464,6 +586,7 @@ pub fn run_restore(args: &SnapshotRestoreArgs) -> Result<()> {
     let actor = cli_actor("system:snapshot-cli");
 
     let rec = restore_and_emit(
+        &SnapshotAudit::Reopen,
         &args.db,
         &store_dir,
         &args.selector,
@@ -486,6 +609,13 @@ pub fn run_restore(args: &SnapshotRestoreArgs) -> Result<()> {
 
 /// Everything the snapshot daemon needs, captured at boot.
 pub struct SnapshotDaemonDeps {
+    /// ADR-0099 — the ONE shared process-wide Handle. The daemon appends its
+    /// `snapshot.created`/`.pruned`/… audit rows through this serialized writer,
+    /// never an independent opener (the seq-515 fork was two independent openers
+    /// off the same head). `db_path` is retained for the logical `EXPORT`
+    /// (`take_snapshot`, the sanctioned read-only export seam) and prod-path
+    /// guards — NOT to open the ledger.
+    pub db: HandleArc,
     pub db_path: PathBuf,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
@@ -526,8 +656,12 @@ pub async fn run_supervised(deps: SnapshotDaemonDeps, cancel: CancellationToken)
         let bh = deps.binary_hash; // BinaryHash is Copy
         let policy = deps.policy;
         let actor = cli_actor("system:snapshot-daemon");
+        // ADR-0099 — this daemon is IN the `serve` process; append its audit
+        // rows through the ONE shared Handle, never an independent opener.
+        let handle = deps.db.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            let rec = run_cycle(&db, &store, &tenant, bh, actor, &policy);
+            let audit = SnapshotAudit::Handle(&handle);
+            let rec = run_cycle(&audit, &db, &store, &tenant, bh, actor, &policy);
             // ADR-0095 §3 — also keep the LIVE file crash-safe between clean
             // shutdowns: fold a debounced durable checkpoint into the daemon
             // cadence so a recent verified-good live file always exists, even

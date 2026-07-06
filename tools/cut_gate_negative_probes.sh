@@ -362,6 +362,26 @@ c="$(fresh)"
 printf '\n#[cfg(test)]\nmod r7_cfgtest_probe {\n    fn t() {\n        let _c = Ledger::open("/x");\n        let _m = _c.map(|l| l.sync_mirror(std::path::Path::new("/y")));\n    }\n}\n' >> "$c/apps/aberp/src/quality.rs"
 expect_pass "$c" "CHECK 10L — an opener+sync_mirror inside #[cfg(test)] is correctly IGNORED (10L is cfg(test)-aware)"
 
+echo "[CHECK 10M] a raw Ledger::open + append REPLANTED in the migrated snapshot.rs daemon+HTTP path — the ADR-0099 write-fork must go red (10M-a)"
+c="$(fresh)"
+printf '\nfn _adr0099_probe_snapshot_refork(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' >> "$c/apps/aberp/src/snapshot.rs"
+expect_fail "$c" "snapshot.rs REGREW an in-process write-fork" "CHECK 10M-a — independent Ledger::open+append replanted in the snapshot daemon path (the seq-515 fork) is caught"
+
+echo "[CHECK 10M] a raw Ledger::open + append REPLANTED in a serve.rs request handler — the write-fork must go red (10M-a)"
+c="$(fresh)"
+printf '\nfn _adr0099_probe_serve_refork(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n    let mut l = Ledger::open(p, t, bh).unwrap();\n    let _ = l.append(EventKind::Test, vec![], todo!(), None);\n}\n' >> "$c/apps/aberp/src/serve.rs"
+expect_fail "$c" "serve.rs REGREW an in-process write-fork" "CHECK 10M-a — independent Ledger::open+append replanted in a serve.rs request handler is caught"
+
+echo "[CHECK 10M] a BRAND-NEW write-fork fn (independent opener + append) outside the frozen residual set — must grow the set → red (10M-b)"
+c="$(fresh)"
+printf 'fn _adr0099_probe_new_fork(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' > "$c/apps/aberp/src/zz_adr0099_probe_fork.rs"
+expect_fail "$c" "a NEW/REGROWN write-fork" "CHECK 10M-b — a new independent-opener + append site outside the frozen set is caught"
+
+echo "[CHECK 10M] a write-fork inside a #[cfg(test)] fn must NOT trip 10M (cfg(test)-aware precision, no false-positive)"
+c="$(fresh)"
+printf '\n#[cfg(test)]\nmod adr0099_test_probe {\n    fn t(p: &std::path::Path, tn: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n        let mut l = aberp_audit_ledger::Ledger::open(p, tn, bh).unwrap();\n        let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n    }\n}\n' >> "$c/apps/aberp/src/serve.rs"
+expect_pass "$c" "CHECK 10M — a Ledger::open+append inside #[cfg(test)] is correctly IGNORED (10M is cfg(test)-aware)"
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi

@@ -3224,6 +3224,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     match crate::snapshot::resolve_store(recovery_state.tenant.as_str(), None) {
                         Ok(snap_store_dir) => {
                             let snap_deps = crate::snapshot::SnapshotDaemonDeps {
+                                db: recovery_state.db.clone(),
                                 db_path: (*recovery_state.db_path).clone(),
                                 tenant: recovery_state.tenant.clone(),
                                 binary_hash: snap_binary_hash,
@@ -6527,7 +6528,7 @@ fn acknowledge_first_prod_launch(state: &AppState, operator_login: &str) -> Resu
         .wait()
         .context("await background binary hash compute for first-launch acknowledgement")?;
     record_first_prod_launch_audit(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -6548,26 +6549,37 @@ fn acknowledge_first_prod_launch(state: &AppState, operator_login: &str) -> Resu
 /// constructing an [`AppState`] or mutating `HOME` (the touchfile-write
 /// half is pinned separately in `crate::first_launch`).
 fn record_first_prod_launch_audit(
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     operator_login: &str,
     acknowledged_at: &str,
 ) -> Result<()> {
     let tenant_str = tenant.as_str().to_string();
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record first-launch acknowledgement")?;
+    // ADR-0099 — append via the ONE shared Handle writer, not an independent opener.
+    let mut conn = db
+        .write()
+        .context("shared writer: FirstProdLaunchAcknowledged (ADR-0099)")?;
+    aberp_audit_ledger::ensure_schema(&conn)
+        .context("ensure audit-ledger schema for FirstProdLaunchAcknowledged")?;
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
     let payload =
         audit_payloads::FirstProdLaunchAcknowledgedPayload::new(acknowledged_at, tenant_str);
-    ledger
-        .append(
-            EventKind::FirstProdLaunchAcknowledged,
-            payload.to_bytes(),
-            actor,
-            None,
-        )
-        .context("append FirstProdLaunchAcknowledged audit entry")?;
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (FirstProdLaunchAcknowledged)")?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        EventKind::FirstProdLaunchAcknowledged,
+        payload.to_bytes(),
+        actor,
+        None,
+    )
+    .context("append FirstProdLaunchAcknowledged audit entry")?;
+    tx.commit()
+        .context("commit DuckDB transaction (FirstProdLaunchAcknowledged)")?;
     Ok(())
 }
 
@@ -8908,21 +8920,34 @@ fn emit_invoice_local_only(
         .binary_hash
         .wait()
         .context("await background binary hash for local-only emit")?;
-    let mut ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash)
-        .context("open audit ledger to record InvoiceLocalOnlyEmitted")?;
+    // ADR-0099 — route the audit append through the ONE shared Handle's
+    // serialized writer, never an independent Ledger::open (the seq-fork locus).
+    let mut conn = state
+        .db
+        .write()
+        .context("shared writer: InvoiceLocalOnlyEmitted (ADR-0099)")?;
+    aberp_audit_ledger::ensure_schema(&conn)
+        .context("ensure audit-ledger schema for InvoiceLocalOnlyEmitted")?;
     let payload = audit_payloads::InvoiceLocalOnlyEmittedPayload {
         invoice_id: invoice_id.to_string(),
         operator_login: operator_login.to_string(),
     };
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
-    ledger
-        .append(
-            EventKind::InvoiceLocalOnlyEmitted,
-            payload.to_bytes(),
-            actor,
-            None,
-        )
-        .context("append InvoiceLocalOnlyEmitted audit entry")?;
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (InvoiceLocalOnlyEmitted)")?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        EventKind::InvoiceLocalOnlyEmitted,
+        payload.to_bytes(),
+        actor,
+        None,
+    )
+    .context("append InvoiceLocalOnlyEmitted audit entry")?;
+    tx.commit()
+        .context("commit DuckDB transaction (InvoiceLocalOnlyEmitted)")?;
     tracing::info!(
         invoice_id = %invoice_id,
         tenant = %state.tenant.as_str(),
@@ -10476,7 +10501,6 @@ fn set_restored_partner_request(
         .wait()
         .map_err(|e| SetRestoredPartnerError::Other(anyhow!("await binary hash: {e}")))?;
     let tenant = state.tenant.clone();
-    let db_path = state.db_path.as_ref().clone();
 
     let mut conn = state
         .db
@@ -10585,14 +10609,10 @@ fn set_restored_partner_request(
     .map_err(|e| anyhow!("audit_ledger::append_in_tx ExtNavPartnerManualLink: {e}"))?;
     tx.commit()
         .context("commit DuckDB transaction (ExtNavPartnerManualLink)")?;
+    // ADR-0099 — dropping the WriteGuard runs the lockstep post-commit
+    // sync_mirror on the ONE shared instance, so the previous explicit
+    // `Ledger::open + sync_mirror` (a SECOND independent live opener) is gone.
     drop(conn);
-
-    let ledger = Ledger::open(&db_path, tenant.clone(), binary_hash)
-        .context("open audit ledger to sync mirror after manual-link entry")?;
-    let mirror_path = aberp_audit_ledger::mirror_path_for(&db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after manual-link entry")?;
 
     Ok(after)
 }
@@ -16891,20 +16911,29 @@ fn enforce_heat_lot_gate_for_start(
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
     });
-    let mut ledger = aberp_audit_ledger::Ledger::open(
-        state.db_path.as_path(),
-        state.tenant.clone(),
-        binary_hash,
+    // ADR-0099 — audit append via the ONE shared Handle writer, not an
+    // independent Ledger::open (the seq-fork locus).
+    let mut conn = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for wo-block audit: {e}"))
+    })?;
+    aberp_audit_ledger::ensure_schema(&conn).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("ensure schema for wo-block audit: {e}"))
+    })?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("begin tx for wo-block audit: {e}")))?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        aberp_audit_ledger::EventKind::MaterialWoBlockedNoHeatLot,
+        serde_json::to_vec(&payload).expect("serialize wo-blocked payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
     )
-    .map_err(|e| WorkOrderRouteError::Other(anyhow!("open ledger for wo-block audit: {e}")))?;
-    ledger
-        .append(
-            aberp_audit_ledger::EventKind::MaterialWoBlockedNoHeatLot,
-            serde_json::to_vec(&payload).expect("serialize wo-blocked payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
-            None,
-        )
-        .map_err(|e| WorkOrderRouteError::Other(anyhow!("append wo-block audit: {e}")))?;
+    .map_err(|e| WorkOrderRouteError::Other(anyhow!("append wo-block audit: {e}")))?;
+    tx.commit()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("commit tx for wo-block audit: {e}")))?;
 
     Err(WorkOrderRouteError::Conflict(format!(
         "Material {material_grade} requires heat lot before defense/aerospace WO start"
@@ -17014,22 +17043,29 @@ fn enforce_part_uid_gate_for_shipment(
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
     });
-    let mut ledger = aberp_audit_ledger::Ledger::open(
-        state.db_path.as_path(),
-        state.tenant.clone(),
-        binary_hash,
-    )
-    .map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!("open ledger for part-uid-block audit: {e}"))
+    // ADR-0099 — audit append via the ONE shared Handle writer.
+    let mut conn = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for part-uid-block audit: {e}"))
     })?;
-    ledger
-        .append(
-            aberp_audit_ledger::EventKind::WoBlockedNoPartUid,
-            serde_json::to_vec(&payload).expect("serialize part-uid-blocked payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
-            None,
-        )
-        .map_err(|e| WorkOrderRouteError::Other(anyhow!("append part-uid-block audit: {e}")))?;
+    aberp_audit_ledger::ensure_schema(&conn).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("ensure schema for part-uid-block audit: {e}"))
+    })?;
+    let tx = conn.transaction().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("begin tx for part-uid-block audit: {e}"))
+    })?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        aberp_audit_ledger::EventKind::WoBlockedNoPartUid,
+        serde_json::to_vec(&payload).expect("serialize part-uid-blocked payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
+    )
+    .map_err(|e| WorkOrderRouteError::Other(anyhow!("append part-uid-block audit: {e}")))?;
+    tx.commit().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("commit tx for part-uid-block audit: {e}"))
+    })?;
 
     // Name the first unmarked unit (1-based) so the operator knows where to look.
     let first_missing = marked_count + 1;
@@ -17142,22 +17178,29 @@ fn enforce_open_ncr_gate_for_shipment(
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
     });
-    let mut ledger = aberp_audit_ledger::Ledger::open(
-        state.db_path.as_path(),
-        state.tenant.clone(),
-        binary_hash,
-    )
-    .map_err(|e| {
-        WorkOrderRouteError::Other(anyhow!("open ledger for open-NCR-block audit: {e}"))
+    // ADR-0099 — audit append via the ONE shared Handle writer.
+    let mut conn = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for open-NCR-block audit: {e}"))
     })?;
-    ledger
-        .append(
-            aberp_audit_ledger::EventKind::WoBlockedByOpenNcr,
-            serde_json::to_vec(&payload).expect("serialize open-ncr-blocked payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
-            None,
-        )
-        .map_err(|e| WorkOrderRouteError::Other(anyhow!("append open-NCR-block audit: {e}")))?;
+    aberp_audit_ledger::ensure_schema(&conn).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("ensure schema for open-NCR-block audit: {e}"))
+    })?;
+    let tx = conn.transaction().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("begin tx for open-NCR-block audit: {e}"))
+    })?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        aberp_audit_ledger::EventKind::WoBlockedByOpenNcr,
+        serde_json::to_vec(&payload).expect("serialize open-ncr-blocked payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
+    )
+    .map_err(|e| WorkOrderRouteError::Other(anyhow!("append open-NCR-block audit: {e}")))?;
+    tx.commit().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("commit tx for open-NCR-block audit: {e}"))
+    })?;
 
     Err(WorkOrderRouteError::Conflict(format!(
         "Shipment blocked: work order has open NCR(s) {} — resolve or escalate first",
@@ -19261,7 +19304,8 @@ async fn record_restore_from_nav_run_audit(
         .binary_hash
         .wait()
         .context("await binary hash for RestoreFromNavRun audit")?;
-    let db_path = (*state.db_path).clone();
+    // ADR-0099 — append through the ONE shared Handle, not an independent opener.
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let operator = operator_login.to_string();
     let payload = audit_payloads::RestoreFromNavRunPayload {
@@ -19279,17 +19323,27 @@ async fn record_restore_from_nav_run_audit(
         ts: ts.to_string(),
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut ledger = Ledger::open(&db_path, tenant, binary_hash)
-            .context("open audit ledger to record RestoreFromNavRun")?;
+        let mut conn = db
+            .write()
+            .context("shared writer: RestoreFromNavRun (ADR-0099)")?;
+        aberp_audit_ledger::ensure_schema(&conn)
+            .context("ensure audit-ledger schema for RestoreFromNavRun")?;
+        let tx = conn
+            .transaction()
+            .context("begin DuckDB transaction (RestoreFromNavRun)")?;
+        let ledger_meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
         let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator);
-        ledger
-            .append(
-                EventKind::RestoreFromNavRun,
-                payload.to_bytes(),
-                actor,
-                None,
-            )
-            .context("append RestoreFromNavRun audit entry")?;
+        aberp_audit_ledger::append_in_tx(
+            &tx,
+            &ledger_meta,
+            EventKind::RestoreFromNavRun,
+            payload.to_bytes(),
+            actor,
+            None,
+        )
+        .context("append RestoreFromNavRun audit entry")?;
+        tx.commit()
+            .context("commit DuckDB transaction (RestoreFromNavRun)")?;
         Ok(())
     })
     .await
@@ -21385,7 +21439,7 @@ pub fn put_seller_numbering_request(
         .wait()
         .context("await background binary hash for numbering-change audit")?;
     record_numbering_change_audit(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         operator_login,
@@ -21407,7 +21461,7 @@ pub fn put_seller_numbering_request(
 /// [`NumberingTemplate::render`] (no build-profile `TEST-` prefix) so the
 /// record is stable across dev/prod binaries.
 fn record_numbering_change_audit(
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: aberp_audit_ledger::BinaryHash,
     operator_login: &str,
@@ -21422,8 +21476,12 @@ fn record_numbering_change_audit(
         .context("format numbering-change timestamp")?;
     let rendered_preview = template.render(now.year(), template.start_value);
     let tenant_str = tenant.as_str().to_string();
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record numbering-template change")?;
+    // ADR-0099 — append via the ONE shared Handle writer, not an independent opener.
+    let mut conn = db
+        .write()
+        .context("shared writer: NumberingTemplateChanged (ADR-0099)")?;
+    aberp_audit_ledger::ensure_schema(&conn)
+        .context("ensure audit-ledger schema for NumberingTemplateChanged")?;
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
     let payload = serde_json::json!({
         "tenant_id": tenant_str,
@@ -21435,9 +21493,21 @@ fn record_numbering_change_audit(
         "changed_at": changed_at,
     });
     let bytes = serde_json::to_vec(&payload).context("encode numbering-change audit payload")?;
-    ledger
-        .append(EventKind::NumberingTemplateChanged, bytes, actor, None)
-        .context("append NumberingTemplateChanged audit entry")?;
+    let tx = conn
+        .transaction()
+        .context("begin DuckDB transaction (NumberingTemplateChanged)")?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(tenant, binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        EventKind::NumberingTemplateChanged,
+        bytes,
+        actor,
+        None,
+    )
+    .context("append NumberingTemplateChanged audit entry")?;
+    tx.commit()
+        .context("commit DuckDB transaction (NumberingTemplateChanged)")?;
     Ok(())
 }
 
@@ -24899,17 +24969,21 @@ async fn handle_material_traceability(
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_default(),
             });
-            let mut ledger = aberp_audit_ledger::Ledger::open(
-                state_for_task.db_path.as_path(),
-                state_for_task.tenant.clone(),
-                binary_hash,
-            )?;
-            ledger.append(
+            // ADR-0099 — audit append via the ONE shared Handle writer.
+            let mut conn = state_for_task.db.write()?;
+            aberp_audit_ledger::ensure_schema(&conn)?;
+            let tx = conn.transaction()?;
+            let ledger_meta =
+                aberp_audit_ledger::LedgerMeta::new(state_for_task.tenant.clone(), binary_hash);
+            aberp_audit_ledger::append_in_tx(
+                &tx,
+                &ledger_meta,
                 aberp_audit_ledger::EventKind::MaterialTraceabilityViewed,
                 serde_json::to_vec(&payload).expect("serialize traceability-viewed payload"),
                 Actor::from_local_cli(Ulid::new().to_string(), &operator_login),
                 None,
             )?;
+            tx.commit()?;
             Ok(report)
         },
     )
@@ -25210,17 +25284,21 @@ async fn handle_part_traceability(
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_default(),
             });
-            let mut ledger = aberp_audit_ledger::Ledger::open(
-                state_for_task.db_path.as_path(),
-                state_for_task.tenant.clone(),
-                binary_hash,
-            )?;
-            ledger.append(
+            // ADR-0099 — audit append via the ONE shared Handle writer.
+            let mut conn = state_for_task.db.write()?;
+            aberp_audit_ledger::ensure_schema(&conn)?;
+            let tx = conn.transaction()?;
+            let ledger_meta =
+                aberp_audit_ledger::LedgerMeta::new(state_for_task.tenant.clone(), binary_hash);
+            aberp_audit_ledger::append_in_tx(
+                &tx,
+                &ledger_meta,
                 aberp_audit_ledger::EventKind::PartTraceabilityViewed,
                 serde_json::to_vec(&payload).expect("serialize part-traceability-viewed payload"),
                 Actor::from_local_cli(Ulid::new().to_string(), &operator_login),
                 None,
             )?;
+            tx.commit()?;
             Ok(report)
         })
         .await;
@@ -28853,7 +28931,10 @@ fn snapshot_now_request(state: &AppState) -> Result<SnapshotNowResponse> {
         .context("binary hash for snapshot")?;
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login_for_audit(state));
     let policy = crate::snapshot::policy_from_env();
+    // ADR-0099 — the operator-UI "snapshot now" is IN the serve process; route
+    // its audit append through the shared Handle, never an independent opener.
     let rec = crate::snapshot::run_cycle(
+        &crate::snapshot::SnapshotAudit::Handle(&state.db),
         &state.db_path,
         &store_dir,
         &state.tenant,
@@ -28877,7 +28958,9 @@ fn snapshot_restore_request(
         .wait()
         .context("binary hash for restore")?;
     let actor = Actor::from_local_cli(Ulid::new().to_string(), &operator_login_for_audit(state));
+    // ADR-0099 — in-process operator-UI restore: audit via the shared Handle.
     let rec = crate::snapshot::restore_and_emit(
+        &crate::snapshot::SnapshotAudit::Handle(&state.db),
         &state.db_path,
         &store_dir,
         &body.selector,
@@ -29755,14 +29838,18 @@ mod tests {
 
         let tenant = TenantId::new("test").expect("tenant id");
         let bh = BinaryHash::from_bytes([0u8; 32]);
+        // ADR-0099 — the audit now routes through the shared Handle.
+        let handle = aberp_db::Handle::open_default(&db_path, tenant.clone())
+            .expect("open shared handle for test");
         record_first_prod_launch_audit(
-            &db_path,
+            &handle,
             tenant.clone(),
             bh,
             "operator-login",
             "2026-06-01T08:00:00Z",
         )
         .expect("record audit entry");
+        drop(handle);
 
         let ledger = Ledger::open(&db_path, tenant, bh).expect("reopen ledger");
         let entries = ledger.entries().expect("read entries");
@@ -29814,8 +29901,12 @@ mod tests {
             reset_policy: crate::numbering::ResetPolicy::OnYearChange,
             start_value: 56,
         };
-        record_numbering_change_audit(&db_path, tenant.clone(), bh, "operator-login", 1, &template)
+        // ADR-0099 — the audit now routes through the shared Handle.
+        let handle = aberp_db::Handle::open_default(&db_path, tenant.clone())
+            .expect("open shared handle for test");
+        record_numbering_change_audit(&handle, tenant.clone(), bh, "operator-login", 1, &template)
             .expect("record numbering-change audit entry");
+        drop(handle);
 
         let ledger = Ledger::open(&db_path, tenant, bh).expect("reopen ledger");
         let entries = ledger.entries().expect("read entries");

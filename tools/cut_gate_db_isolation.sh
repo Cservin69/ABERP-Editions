@@ -922,9 +922,91 @@ else
     note "✓ opener fingerprint set matches the frozen baseline ($(grep -vcE '^#' "$fpfile") openers; no add/remove/swap)"
   else
     flag10k "✗ opener fingerprint set DIVERGED from $fpfile (an opener was added, removed, or content-swapped — count-preserving swaps are caught here):"
-    diff "$froz" "$cur" | sed 's/^/      /' | head -40
+    # `|| true`: keep this DIAGNOSTIC pipe from aborting the whole gate under
+    # `set -euo pipefail` (diff exits non-zero when the sets differ). Without it
+    # the script died here on any 10k divergence, so later checks (CHECK 10M) and
+    # the final summary never ran (ADR-0099).
+    { diff "$froz" "$cur" | sed 's/^/      /' | head -40; } || true
   fi
   rm -f "$cur" "$froz"
+fi
+
+# ── CHECK 10M — ADR-0099: the CORRECTED fork model. The seq-369/416/428/515
+#    forks were NOT the narrow "independent opener + rogue sync_mirror in one fn"
+#    class CHECK 10L froze — the seq-515 fork was the periodic snapshot daemon's
+#    `snapshot.created` and the quote-intake daemon EACH opening an INDEPENDENT
+#    Ledger on the live DB and self-assigning the next seq off the same stale
+#    head, in the ONE `serve` process. A rogue sync_mirror is NOT required; the
+#    TRUE fork primitive is ANY independent audit opener + append on the live DB
+#    outside the shared aberp_db::Handle. 10i merely FROZE the COUNT of such
+#    openers (a frozen fork is still a fork); 10L required a sync_mirror
+#    co-occurrence it did not have. 10M closes both gaps:
+#      • 10M-a (targeted, ZERO): the in-process seams MIGRATED this session — the
+#        snapshot daemon+HTTP audit path (snapshot.rs) and the serve.rs request
+#        handlers — must contain NO write-fork (independent opener + append). Any
+#        regrowth is a RED build (they must stay on db.write()+append_in_tx).
+#      • 10M-b (freeze, may-only-shrink): the remaining write-fork set (the
+#        separate-process CLI one-shots + the one deferred in-process daemon,
+#        restore_from_nav_outgoing::process_digest) is frozen in
+#        tools/adr0099_write_fork_residuals.txt and may only SHRINK — a NEW or
+#        REGROWN write-fork fails the build. This drives the surface to zero
+#        (the v0.2.9 completion) while making the corrected model enforceable now.
+#    Detector: tools/adr0099_write_fork_scan.awk (comment/string/cfg(test)-aware).
+#    Teeth: cut_gate_negative_probes.sh "[CHECK 10M]" plants a raw
+#    Ledger::open+append daemon in a migrated seam and asserts this goes red.
+#    ENFORCE_WRITE_FORK=0 disables it for a deliberate, temporary local probe only.
+echo "[CHECK 10M] ADR-0099 — corrected fork model: migrated in-process seams have ZERO write-fork; residual set frozen may-only-shrink (ENFORCED · D5)"
+enforce10M="${ENFORCE_WRITE_FORK:-1}"
+flag10M() { note "$1"; if [[ "$enforce10M" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+wf_scan="tools/adr0099_write_fork_scan.awk"
+wf_manifest="tools/adr0099_write_fork_residuals.txt"
+# Allow-list: pre-serve boot openers + the sanctioned separate-process/primitive
+# seams (append_reopen is the audit-ledger reopen primitive; emit_reopen_cli is
+# snapshot.rs's separate-process CLI reopen — no Handle in that process).
+WF_ALLOW="run,seed_demo_sample_data,record_upgrade_snapshot_mismatch_audit,emit_reopen_cli,append_reopen"
+if [[ ! -f "$wf_scan" || ! -f "$wf_manifest" ]]; then
+  flag10M "✗ write-fork scanner or frozen manifest missing: $wf_scan / $wf_manifest"
+else
+  # 10M-a — the MIGRATED in-process seams must stay at ZERO write-fork.
+  serve_wf="$(awk -v allow="run,seed_demo_sample_data,record_upgrade_snapshot_mismatch_audit" -f "$wf_scan" apps/aberp/src/serve.rs 2>/dev/null || true)"
+  snap_wf="$(awk -v allow="emit_reopen_cli" -f "$wf_scan" apps/aberp/src/snapshot.rs 2>/dev/null || true)"
+  if [[ -n "$serve_wf" ]]; then
+    flag10M "✗ serve.rs REGREW an in-process write-fork (independent opener + append) — route it through the shared Handle (db.write()+append_in_tx), ADR-0099:"
+    printf '%s\n' "$serve_wf" | sed 's/^/      /'
+  else
+    note "✓ serve.rs request handlers — no in-process write-fork (all audit appends on the shared Handle)"
+  fi
+  if [[ -n "$snap_wf" ]]; then
+    flag10M "✗ snapshot.rs REGREW an in-process write-fork — the daemon+HTTP audit path must stay on the shared Handle (only emit_reopen_cli, the CLI reopen, is allow-listed), ADR-0099:"
+    printf '%s\n' "$snap_wf" | sed 's/^/      /'
+  else
+    note "✓ snapshot.rs daemon+HTTP audit path — no in-process write-fork (seq-515 racer on the shared Handle)"
+  fi
+
+  # 10M-b — the frozen residual set may only SHRINK.
+  wf_cur="$(mktemp "${TMPDIR:-/tmp}/wf_cur.XXXXXX")"
+  wf_froz="$(mktemp "${TMPDIR:-/tmp}/wf_froz.XXXXXX")"
+  while IFS= read -r f; do
+    case "$f" in crates/aberp-db/*|crates/aberp-snapshot/*) continue;; esac
+    awk -v allow="$WF_ALLOW" -f "$wf_scan" "$f" 2>/dev/null | while IFS=: read -r ln fn rest; do
+      printf '%s:%s\n' "$f" "$fn"
+    done
+  done < <(find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/' | sort) | sort -u > "$wf_cur"
+  grep -vE '^#' "$wf_manifest" | sed 's/[[:space:]]*#.*$//;s/[[:space:]]*$//' | grep -vE '^$' | sort -u > "$wf_froz"
+  wf_grew="$(comm -13 "$wf_froz" "$wf_cur")"
+  if [[ -n "$wf_grew" ]]; then
+    flag10M "✗ a NEW/REGROWN write-fork (independent opener + append) appeared outside the frozen set — route it through the shared aberp_db::Handle (ADR-0099 regression):"
+    printf '%s\n' "$wf_grew" | sed 's/^/      /'
+  fi
+  wf_shrunk="$(comm -23 "$wf_froz" "$wf_cur")"
+  if [[ -n "$wf_shrunk" ]]; then
+    note "  (info) write-fork sites migrated off since freeze — refresh $wf_manifest to lock the smaller set:"
+    printf '%s\n' "$wf_shrunk" | sed 's/^/      /'
+  fi
+  if [[ -z "$wf_grew" ]]; then
+    note "✓ frozen write-fork residual holds ($(grep -vcE '^#' "$wf_manifest") sites; separate-process CLI + 1 deferred in-process daemon — v0.2.9 target, may only shrink)"
+  fi
+  rm -f "$wf_cur" "$wf_froz"
 fi
 
 echo

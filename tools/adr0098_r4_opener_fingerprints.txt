@@ -11,6 +11,10 @@
 #   requires refreshing this file. ENFORCE_OPENER_FINGERPRINTS=0 disables 10k for a
 #   deliberate, temporary local probe. Scope/skip identical to 10i (crates/aberp-db/* and
 #   crates/aberp-snapshot/* excluded as sanctioned seams; the 7 C2-migrated files excluded).
+# ── ADR-0099 REFRESH: the snapshot daemon+HTTP path and the serve.rs request
+#    handlers were migrated onto the shared Handle (write-fork removal), and
+#    snapshot.rs open_ledger -> emit_reopen_cli (CLI reopen). The opener set
+#    SHRANK accordingly; this pin is refreshed to the new (smaller) reality.
 apps/aberp/src/audit_dap_boot.rs|run_heartbeat_supervised:let mut ledger = Ledger::open(&db, tn, binary_hash)
 apps/aberp/src/avl_vendors.rs|append_vendor_event:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/avl_vendors.rs|fire_overdue_screening_reminders:let conn = Connection::open(db_path)
@@ -111,15 +115,9 @@ apps/aberp/src/serve.rs|audit_events_request:let ledger = Ledger::open(&*state.d
 apps/aberp/src/serve.rs|build_poll_daemon_inputs:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|create_stock_movement_request:if let Ok(ledger) = Ledger::open(&*state.db_path, state.tenant.clone(), bina
 apps/aberp/src/serve.rs|derive_state_for:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
-apps/aberp/src/serve.rs|emit_invoice_local_only:let mut ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_
-apps/aberp/src/serve.rs|enforce_heat_lot_gate_for_start:let mut ledger = aberp_audit_ledger::Ledger::open(
-apps/aberp/src/serve.rs|enforce_open_ncr_gate_for_shipment:let mut ledger = aberp_audit_ledger::Ledger::open(
-apps/aberp/src/serve.rs|enforce_part_uid_gate_for_shipment:let mut ledger = aberp_audit_ledger::Ledger::open(
 apps/aberp/src/serve.rs|get_audit_for_invoice:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|get_audit_for_quote:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|get_invoice_detail:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
-apps/aberp/src/serve.rs|handle_material_traceability:let mut ledger = aberp_audit_ledger::Ledger::open(
-apps/aberp/src/serve.rs|handle_part_traceability:let mut ledger = aberp_audit_ledger::Ledger::open(
 apps/aberp/src/serve.rs|handle_quote_intake_notifications:let ledger = Ledger::open(&db_for_ledger, tenant_for_ledger, binary_hash)
 apps/aberp/src/serve.rs|latest_quote_intake_poll:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|list_invoices:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
@@ -127,16 +125,12 @@ apps/aberp/src/serve.rs|list_notes_history_request:let ledger = Ledger::open(&*s
 apps/aberp/src/serve.rs|pickup_quote_as_draft_request:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|query_non_terminal_invoices:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
 apps/aberp/src/serve.rs|quote_intake_auth_paused:let ledger = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash
-apps/aberp/src/serve.rs|record_first_prod_launch_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-apps/aberp/src/serve.rs|record_numbering_change_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-apps/aberp/src/serve.rs|record_restore_from_nav_run_audit:let mut ledger = Ledger::open(&db_path, tenant, binary_hash)
 apps/aberp/src/serve.rs|record_upgrade_snapshot_mismatch_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/serve.rs|resolve_customer_identity:let ledger = Ledger::open(
 apps/aberp/src/serve.rs|resolve_invoice_xml_path:let ledger = Ledger::open(
-apps/aberp/src/serve.rs|set_restored_partner_request:let ledger = Ledger::open(&db_path, tenant.clone(), binary_hash)
 apps/aberp/src/serve.rs|spawn_dap_audit_chain:let mut ledger = aberp_audit_ledger::Ledger::open(&db_path, tenant.clone(), 
 apps/aberp/src/serve.rs|sync_audit_mirror_best_effort:if let Ok(ledger) = Ledger::open(db_path, tenant, binary_hash) {
-apps/aberp/src/snapshot.rs|open_ledger:Ledger::open(db_path, tenant.clone(), binary_hash)
+apps/aberp/src/snapshot.rs|emit_reopen_cli:let mut ledger = Ledger::open(db_path, tenant.clone(), binary_hash)
 apps/aberp/src/submit_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)
 apps/aberp/src/submit_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant.clone(), binary_hash_bytes)
 apps/aberp/src/submit_annulment.rs|run:let mut conn = Connection::open(&args.db)

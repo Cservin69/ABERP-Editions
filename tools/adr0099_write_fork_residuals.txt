@@ -1,0 +1,45 @@
+# ADR-0099 — FROZEN write-fork residual ledger (cut-gate CHECK 10M-b).
+#
+# Format: <file>:<fname>  (line numbers dropped so a benign shift never churns
+# it — cf. CHECK 10k). One line per RUNTIME write-fork = an INDEPENDENT audit
+# opener (Connection::open / Ledger::open / DuckDbBillingStore::open /
+# append_reopen) that is followed by an audit APPEND in the SAME fn, detected by
+# tools/adr0099_write_fork_scan.awk (comment/string/cfg(test)-aware).
+#
+# This set may only SHRINK. A NEW or REGROWN write-fork fails the build (CHECK
+# 10M-b): route it through the ONE shared aberp_db::Handle (db.write() +
+# append_in_tx), never an independent opener. This is the CORRECTED fork model —
+# the seq-369/416/428/515 forks were independent openers each self-assigning the
+# next seq off a stale head; a rogue sync_mirror (CHECK 10L's model) is NOT
+# required. CHECK 10L stays; 10M generalises it to the true primitive.
+#
+# ALLOW-LISTED (never listed here, never a fork): the shared-Handle seams
+# (aberp-db, aberp-snapshot), #[cfg(test)]/open_in_memory, the pre-serve boot
+# openers (run, seed_demo_sample_data, record_upgrade_snapshot_mismatch_audit),
+# the audit-ledger `append_reopen` primitive itself, and snapshot.rs
+# `emit_reopen_cli` (the separate-process CLI reopen — no Handle in that process).
+#
+# Categories:
+#  (cli)          = separate-process CLI one-shot (run() subcommand) — no Handle
+#                   in that process; a v0.2.9 cross-process advisory-lock item,
+#                   NOT an in-process fork (ADR-0099 §Deferred).
+#  (in-proc-defer)= reached INSIDE `aberp serve` — a real in-process residual,
+#                   tracked for the v0.2.9 completion (needs the Handle threaded
+#                   through its Ctx / a dual-use audit sink). MUST shrink to zero.
+#
+# The seams MIGRATED this session (snapshot daemon+HTTP, and the serve.rs request
+# handlers: emit_invoice_local_only, the heat-lot/part-uid/open-NCR gates,
+# material/part traceability, RestoreFromNavRun, FirstProdLaunchAcknowledged,
+# NumberingTemplateChanged, ExtNavPartnerManualLink) are NOT listed — CHECK
+# 10M-a proves they stay Handle-bound (zero) and can never regress.
+apps/aberp/src/avl_vendors.rs:append_vendor_event  # (cli)
+apps/aberp/src/email_invoice.rs:record_email_audit_entry  # (cli)
+apps/aberp/src/material_inventory.rs:append_heat_lot_events  # (cli)
+apps/aberp/src/mes_manager.rs:audit  # (cli)
+apps/aberp/src/part_marking.rs:append_mark_events  # (cli)
+apps/aberp/src/purchasing.rs:append_event  # (cli)
+apps/aberp/src/quality.rs:append_event  # (cli)
+apps/aberp/src/quote_calibration.rs:append_calibration_events  # (cli)
+apps/aberp/src/quoting_machines.rs:append_machine_event  # (cli)
+apps/aberp/src/restore_from_nav_outgoing.rs:process_digest  # (in-proc-defer)
+apps/aberp/src/tenant_registry.rs:emit_tenant_event  # (cli)
