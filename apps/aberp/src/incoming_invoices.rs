@@ -1174,6 +1174,36 @@ pub(crate) fn ingest_incoming_invoice_via_handle_for_test(
     )
 }
 
+// ADR-0098 R7 — test shim mirroring `ingest_incoming_invoice_via_handle_for_test`.
+// `change_status` now takes the shared `aberp_db::HandleArc` (production routes it
+// through `state.db`). Unit tests express fixtures as a `&Path`; this shim opens a
+// throwaway Handle over that path and calls the migrated fn, so each test's status
+// change exercises the real `db.write()` seam (sequential open/close per call — the
+// coherent reopen pattern, never two overlapping instances).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn change_status_via_handle_for_test(
+    db_path: &Path,
+    tenant: TenantId,
+    binary_hash: audit_ledger::BinaryHash,
+    operator_login: &str,
+    ap_invoice_id: &str,
+    to_status: IncomingInvoiceStatus,
+    reason: Option<String>,
+) -> std::result::Result<StatusChangeOutcome, StatusChangeError> {
+    let db = aberp_db::Handle::open_default(db_path, tenant.clone())
+        .map_err(|e| anyhow!("open shared Handle for test status change: {e}"))?;
+    change_status(
+        &db,
+        tenant,
+        binary_hash,
+        operator_login,
+        ap_invoice_id,
+        to_status,
+        reason,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1509,7 +1539,7 @@ mod tests {
             other => panic!("{other:?}"),
         };
 
-        let result = change_status(
+        let result = change_status_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1561,7 +1591,7 @@ mod tests {
         };
 
         // Missing reason → 400-shaped error.
-        let result = change_status(
+        let result = change_status_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1576,7 +1606,7 @@ mod tests {
         ));
 
         // Whitespace-only reason → same error.
-        let result_ws = change_status(
+        let result_ws = change_status_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1591,7 +1621,7 @@ mod tests {
         ));
 
         // Non-empty reason → succeeds.
-        let result_ok = change_status(
+        let result_ok = change_status_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1636,7 +1666,7 @@ mod tests {
             other => panic!("{other:?}"),
         };
 
-        change_status(
+        change_status_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1647,7 +1677,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = change_status(
+        let result = change_status_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
@@ -1676,7 +1706,7 @@ mod tests {
             ensure_schema(&conn).unwrap();
             audit_ledger::ensure_schema(&conn).unwrap();
         }
-        let result = change_status(
+        let result = change_status_via_handle_for_test(
             &db_path,
             tenant,
             bh,
@@ -1990,7 +2020,7 @@ mod tests {
         )
         .unwrap();
 
-        change_status(
+        change_status_via_handle_for_test(
             &db_path,
             tenant.clone(),
             bh,
