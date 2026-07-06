@@ -206,7 +206,7 @@ fn r7_backfill_cycle_via_shared_handle_is_coherent_no_refork() {
         .expect("reopen ledger for verify");
     let verified = ledger.verify_chain().expect("chain verifies");
     assert_eq!(
-        verified as u64, burst,
+        verified, burst,
         "verify_chain clean across the whole Handle-routed burst"
     );
 
