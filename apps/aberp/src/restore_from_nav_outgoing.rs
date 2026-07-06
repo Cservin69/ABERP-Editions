@@ -2197,6 +2197,16 @@ pub struct BuyerBackfillSummary {
 /// resolved at the call site (via `BinaryHashHandle::wait()`) so the
 /// backfill task does not need to know about the handle abstraction.
 pub struct BackfillInputs {
+    /// ADR-0098 R7 — the process-wide shared DuckDB [`aberp_db::Handle`]. The
+    /// boot-time cycle-audit append routes through this ONE instance's
+    /// serialized writer (`db.write()`), NOT an independent `Connection::open`
+    /// on `db_path`. The 415/416 fork came from the old raw opener re-assigning
+    /// a sequence off a STALE head + rewriting the mirror from its own view;
+    /// binding the Handle here closes that boot re-fork at the source.
+    pub db: aberp_db::HandleArc,
+    /// Still carried for the read helpers (`list_restored_missing_buyer`,
+    /// `backfill_one_row`) that are frozen residuals (ADR-0098 v0.2.6 scope);
+    /// the WRITE seam (`append_backfill_cycle_entry`) no longer uses it.
     pub db_path: PathBuf,
     pub tenant: TenantId,
     pub tax_number_8: String,
@@ -2404,15 +2414,27 @@ fn append_backfill_cycle_entry(
     inputs: &BackfillInputs,
     payload: &RestoreBuyerBackfillCycleCompletedPayload,
 ) -> Result<()> {
-    let mut conn = Connection::open(&inputs.db_path)
-        .with_context(|| format!("open tenant DuckDB at {}", inputs.db_path.display()))?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
-    audit_ledger::ensure_schema(&conn)
+    // ADR-0098 R7 — route the boot cycle-audit append through the ONE shared
+    // `aberp_db::Handle` writer (`db.write()`) instead of a RAW
+    // `Connection::open` + a second `Ledger::open`/`sync_mirror` on the DB
+    // PATH. Spawned at boot with `db_path` (serve.rs), that separate DuckDB
+    // instance read a STALE ledger head and re-assigned an already-used
+    // sequence (the seq-415 fork), then rewrote the mirror from its own view —
+    // the divergence the R1 guard refuses on. The old
+    // `PRAGMA disable_checkpoint_on_shutdown` FENCE could not stop the
+    // stale-head seq collision or the rogue `sync_mirror`; only sharing the
+    // single instance does. The `WriteGuard` drop runs the lockstep
+    // `sync_mirror` post-commit hook, so no explicit `Ledger::open`/`sync_mirror`
+    // (a second independent opener) is needed here anymore.
+    let mut guard = inputs
+        .db
+        .write()
+        .map_err(|e| anyhow!("shared writer for backfill cycle audit (ADR-0098 R7): {e}"))?;
+    audit_ledger::ensure_schema(&guard)
         .context("ensure audit-ledger schema for backfill cycle audit entry")?;
     let session_id = Ulid::new().to_string();
     let actor = Actor::from_local_cli(session_id, inputs.credentials.login());
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin tx for backfill cycle audit")?;
     let ledger_meta = audit_ledger::LedgerMeta::new(inputs.tenant.clone(), inputs.binary_hash);
@@ -2428,13 +2450,11 @@ fn append_backfill_cycle_entry(
     .map_err(|e| anyhow!("audit_ledger::append_in_tx RestoreBuyerBackfillCycleCompleted: {e}"))?;
     tx.commit()
         .context("commit DuckDB transaction (backfill cycle audit)")?;
-    drop(conn);
-    let ledger = Ledger::open(&inputs.db_path, inputs.tenant.clone(), inputs.binary_hash)
-        .context("open audit ledger to sync mirror after backfill cycle entry")?;
-    let mirror_path = audit_ledger::mirror_path_for(&inputs.db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after backfill cycle entry")?;
+    // `guard` drops here -> the Handle's post-commit hook fires the lockstep
+    // `sync_mirror` on the SHARED instance (coherent with the just-committed
+    // txn) + the debounced durable checkpoint. No separate opener, no rogue
+    // mirror rewrite.
+    drop(guard);
     Ok(())
 }
 

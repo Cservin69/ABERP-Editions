@@ -50,7 +50,7 @@
 6 apps/aberp/src/drain_submission_queue.rs
 2 apps/aberp/src/email_invoice.rs
 1 apps/aberp/src/export_invoice_bundle.rs
-7 apps/aberp/src/incoming_invoices.rs
+4 apps/aberp/src/incoming_invoices.rs
 4 apps/aberp/src/mark_abandoned.rs
 1 apps/aberp/src/material_inventory.rs
 1 apps/aberp/src/mes_manager.rs
@@ -67,7 +67,7 @@
 4 apps/aberp/src/reports.rs
 4 apps/aberp/src/request_technical_annulment.rs
 1 apps/aberp/src/restore_from_nav_extract.rs
-11 apps/aberp/src/restore_from_nav_outgoing.rs
+9 apps/aberp/src/restore_from_nav_outgoing.rs
 9 apps/aberp/src/retry_submission.rs
 30 apps/aberp/src/serve.rs
 1 apps/aberp/src/snapshot.rs

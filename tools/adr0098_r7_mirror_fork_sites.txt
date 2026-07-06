@@ -1,0 +1,31 @@
+# ADR-0098 R7 — FROZEN mirror-fork co-occurrence set (gate CHECK 10L-b).
+# Format: <file>|<fname>. Derived by tools/adr0098_r7_mirror_fork_scan.awk over the
+#   SAME scope/skip as CHECK 10i (apps/aberp/src + modules + crates, minus the
+#   sanctioned aberp-db / aberp-snapshot seams and the 7 C2-migrated files).
+# Each entry is a RUNTIME function that opens the live tenant DB INDEPENDENTLY of
+#   the shared aberp_db::Handle AND rewrites the audit mirror from that separate
+#   instance (a `.sync_mirror(` call) — the exact 415/416 stale-head re-fork
+#   signature. The gate FAILS if this set GROWS or a NEW file appears; it is a
+#   v0.2.6 Handle-migration worklist that may only SHRINK. It is the standing
+#   proof that the two seams closed THIS session (restore_from_nav_outgoing.rs::
+#   append_backfill_cycle_entry — the boot re-fork — and incoming_invoices.rs::
+#   change_status) have LEFT the set and cannot silently regrow the pair.
+# NOTE: presence here is NOT "safe" — it is the deferred fork-capable surface,
+#   frozen so it cannot expand. The sanctioned post-commit sync_mirror is the
+#   Handle's own WriteGuard drop (crates/aberp-db) — never one of these.
+apps/aberp/src/drain_pending_retries.rs|drive_one_retry
+apps/aberp/src/drain_pending_retries.rs|perform_layer_2_check
+apps/aberp/src/drain_submission_queue.rs|drive_one_invoice
+apps/aberp/src/email_invoice.rs|record_email_audit_entry
+apps/aberp/src/mark_abandoned.rs|run
+apps/aberp/src/observe_receiver_confirmation.rs|run
+apps/aberp/src/poll_annulment_ack.rs|run
+apps/aberp/src/recover_from_nav.rs|run
+apps/aberp/src/request_technical_annulment.rs|run
+apps/aberp/src/restore_from_nav_outgoing.rs|process_digest
+apps/aberp/src/retry_submission.rs|perform_layer_2_check
+apps/aberp/src/retry_submission.rs|run
+apps/aberp/src/serve.rs|create_stock_movement_request
+apps/aberp/src/serve.rs|set_restored_partner_request
+apps/aberp/src/serve.rs|sync_audit_mirror_best_effort
+apps/aberp/src/submit_annulment.rs|run

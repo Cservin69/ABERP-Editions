@@ -328,6 +328,40 @@ PYIN
 expect_fail "$c" "residual Connection::open has NO disable_checkpoint_on_shutdown within" "CHECK 10j/crates -- R6: pragma stripped from the aberp-mes crate residual opener (invisible pre-R6 crates-scope extension)"
 
 
+echo "[CHECK 10L] a raw Connection/Ledger opener + rogue sync_mirror REPLANTED inside the migrated boot seam append_backfill_cycle_entry — the R7 re-fork must go red"
+c="$(fresh)"
+python3 - "$c/apps/aberp/src/restore_from_nav_outgoing.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+needle='    audit_ledger::ensure_schema(&guard)\n        .context("ensure audit-ledger schema for backfill cycle audit entry")?;'
+assert needle in s, "append_backfill_cycle_entry anchor moved — probe is stale"
+s=s.replace(needle, needle+'\n    let _r7 = Ledger::open(&inputs.db_path, inputs.tenant.clone(), inputs.binary_hash); let _m = _r7.map(|l| l.sync_mirror(std::path::Path::new("/x"))); // R7 negative probe', 1)
+open(p,"w").write(s)
+PYIN
+expect_fail "$c" "ADR-0098 R7 regression" "CHECK 10L — opener+sync_mirror replanted in append_backfill_cycle_entry (the boot re-fork) is caught"
+
+echo "[CHECK 10L] a raw opener + rogue sync_mirror REPLANTED inside the migrated invoicing seam change_status — the R7 re-fork must go red"
+c="$(fresh)"
+python3 - "$c/apps/aberp/src/incoming_invoices.rs" <<'PYIN'
+import sys
+p=sys.argv[1]; s=open(p).read()
+needle='    ensure_schema(&guard).context("ensure ap_invoice schema (status change)")?;'
+assert needle in s, "change_status anchor moved — probe is stale"
+s=s.replace(needle, needle+'\n    let _r7 = Ledger::open(db_path, tenant.clone(), binary_hash); let _m = _r7.map(|l| l.sync_mirror(std::path::Path::new("/x"))); // R7 negative probe', 1)
+open(p,"w").write(s)
+PYIN
+expect_fail "$c" "ADR-0098 R7 regression" "CHECK 10L — opener+sync_mirror replanted in change_status is caught"
+
+echo "[CHECK 10L] a BRAND-NEW runtime fn with opener + sync_mirror (a new fork-capable site) must grow the frozen mirror-fork set — red"
+c="$(fresh)"
+printf '\nfn _r7_new_fork_site() {\n    let _c = duckdb::Connection::open("/x");\n    let _m = _c.map(|c| c.sync_mirror(std::path::Path::new("/y")));\n}\n' >> "$c/apps/aberp/src/quality.rs"
+expect_fail "$c" "write-fork) site appeared" "CHECK 10L — a new independent-opener + sync_mirror site is caught by the frozen-set freeze"
+
+echo "[CHECK 10L] an opener + sync_mirror inside a #[cfg(test)] fn must NOT trip 10L (cfg(test)-aware precision, no false-positive)"
+c="$(fresh)"
+printf '\n#[cfg(test)]\nmod r7_cfgtest_probe {\n    fn t() {\n        let _c = Ledger::open("/x");\n        let _m = _c.map(|l| l.sync_mirror(std::path::Path::new("/y")));\n    }\n}\n' >> "$c/apps/aberp/src/quality.rs"
+expect_pass "$c" "CHECK 10L — an opener+sync_mirror inside #[cfg(test)] is correctly IGNORED (10L is cfg(test)-aware)"
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi

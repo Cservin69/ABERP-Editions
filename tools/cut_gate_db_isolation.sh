@@ -674,6 +674,106 @@ for f in "${c2_files[@]}"; do
   fi
 done
 
+# ── CHECK 10L — ADR-0098 R7: the BOOT RE-FORK class (an independent live-DB opener
+#    + a rogue `sync_mirror` in the SAME runtime fn) cannot regrow, and the two write
+#    seams migrated THIS session stay Handle-bound. The 415/416 fork was NOT caught by
+#    10h–10k: the backfill opener WAS pragma-fenced (10j green) and frozen in the 10i
+#    ledger (count green) — yet it still forked, because it was spawned at BOOT with a
+#    bare `db_path`, opened a SEPARATE DuckDB instance, read a STALE ledger head,
+#    re-assigned seq-415, and REWROTE THE MIRROR FROM ITS OWN VIEW. The pragma fence
+#    cannot stop a stale-head seq collision or a rogue sync_mirror — only routing the
+#    write through the ONE shared aberp_db::Handle does (its WriteGuard drop is the sole
+#    sanctioned post-commit sync_mirror). 10L makes that class a RED BUILD:
+#      • 10L-a (targeted): restore_from_nav_outgoing.rs::append_backfill_cycle_entry (the
+#        boot re-fork) + incoming_invoices.rs::change_status must contain NO independent
+#        opener, NO direct sync_mirror, and MUST route through `.write()`.
+#      • 10L-b (freeze): the mirror-fork co-occurrence set (opener + sync_mirror in one
+#        runtime fn; same scope/skip as 10i) is frozen in
+#        tools/adr0098_r7_mirror_fork_sites.txt and may only SHRINK — a NEW or REGROWN
+#        fork-capable site fails the build. Teeth: cut_gate_negative_probes.sh
+#        "[CHECK 10L]" replants a raw opener+sync_mirror in a migrated seam.
+#    ENFORCE_MIRROR_FORK=0 disables it for a deliberate, temporary local probe only.
+echo "[CHECK 10L] ADR-0098 R7 — boot re-fork class (independent opener + rogue sync_mirror) frozen; migrated write seams stay Handle-bound (ENFORCED · D5)"
+enforce10L="${ENFORCE_MIRROR_FORK:-1}"
+flag10L() { note "$1"; if [[ "$enforce10L" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+mff_scan="tools/adr0098_r7_mirror_fork_scan.awk"
+mff_manifest="tools/adr0098_r7_mirror_fork_sites.txt"
+r7_c2_set=" apps/aberp/src/ap_sync.rs apps/aberp/src/poll_ack.rs apps/aberp/src/issue_invoice.rs apps/aberp/src/issue_storno.rs apps/aberp/src/issue_modification.rs apps/aberp/src/submit_invoice.rs apps/aberp/src/mark_invoice_paid.rs "
+if [[ ! -f "$mff_scan" || ! -f "$mff_manifest" ]]; then
+  flag10L "✗ R7 mirror-fork scanner or frozen manifest missing: $mff_scan / $mff_manifest"
+else
+  # 10L-b — the frozen mirror-fork set may only SHRINK; a new/regrown site is RED.
+  r7_cur="$(mktemp "${TMPDIR:-/tmp}/mff_cur.XXXXXX")"
+  r7_froz="$(mktemp "${TMPDIR:-/tmp}/mff_froz.XXXXXX")"
+  while IFS= read -r f; do
+    case " $r7_c2_set " in *" $f "*) continue;; esac
+    case "$f" in crates/aberp-db/*|crates/aberp-snapshot/*) continue;; esac
+    awk -f "$mff_scan" "$f" 2>/dev/null
+  done < <(find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/' | sort) | sort > "$r7_cur"
+  grep -vE '^#' "$mff_manifest" | sort > "$r7_froz"
+  r7_grew="$(comm -13 "$r7_froz" "$r7_cur")"
+  if [[ -n "$r7_grew" ]]; then
+    flag10L "✗ a NEW/REGROWN independent-opener + sync_mirror (write-fork) site appeared — route it through the shared Handle (ADR-0098 R7 regression):"
+    printf '%s\n' "$r7_grew" | sed 's/^/      /'
+  fi
+  r7_shrunk="$(comm -23 "$r7_froz" "$r7_cur")"
+  if [[ -n "$r7_shrunk" ]]; then
+    note "  (info) mirror-fork sites migrated off since freeze — refresh $mff_manifest to lock the smaller set:"
+    printf '%s\n' "$r7_shrunk" | sed 's/^/      /'
+  fi
+  if [[ -z "$r7_grew" ]]; then note "✓ mirror-fork set has not grown ($(grep -vcE '^#' "$mff_manifest") frozen fork-capable sites; v0.2.6 target — may only shrink)"; fi
+  rm -f "$r7_cur" "$r7_froz"
+
+  # 10L-a — the two seams migrated THIS session (ADR-0098 R7) must stay opener-free +
+  #   sync_mirror-free (mirror now via the Handle WriteGuard drop) and .write()-routed.
+  r7_extract="$(mktemp "${TMPDIR:-/tmp}/r7_extract_fn.XXXXXX.awk")"
+  cat > "$r7_extract" <<'R7_FN_AWK'
+BEGIN{ depth=0; inblk=0; instr=0; armed=0; bodydepth=-1;
+       re="^[ \t]*(pub(\\([^)]*\\))?[ \t]+)?(async[ \t]+)?(unsafe[ \t]+)?fn[ \t]+" fn "[ (<]" }
+{
+  line=$0
+  if (!armed && bodydepth<0 && line ~ re) armed=1
+  printed=0
+  code=""; L=length(line)
+  for(i=1;i<=L;i++){
+    c=substr(line,i,1); d=substr(line,i,2)
+    if(inblk){ if(d=="*/"){inblk=0;i++} ; continue }
+    if(instr){ if(c=="\\"){i++;continue} ; if(c=="\""){instr=0} ; continue }
+    if(d=="//"){ break }
+    if(d=="/*"){ inblk=1;i++;continue }
+    if(c=="\""){ instr=1; continue }
+    code=code c
+    if(c=="{"){ depth++; if(armed && bodydepth<0) bodydepth=depth }
+    else if(c=="}"){ if(armed && bodydepth>=0 && depth==bodydepth){ print code; printed=1; armed=0; bodydepth=-1 } depth-- }
+  }
+  if(armed && bodydepth>=0 && !printed) print code
+}
+R7_FN_AWK
+  r7_check_seam() { # $1 file  $2 fnname
+    local file="$1" fn="$2" body opn mir
+    if [[ ! -f "$file" ]]; then flag10L "✗ R7 seam file missing: $file"; return; fi
+    body="$(awk -v fn="$fn" -f "$r7_extract" "$file")"
+    if [[ -z "$body" ]]; then flag10L "✗ R7 seam fn not found: $file::$fn (renamed? update CHECK 10L)"; return; fi
+    opn="$(printf '%s\n' "$body" | grep -nE '(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open|Database::open)\(|append_reopen[[:space:]]*\(' | grep -vE 'open_in_memory|from_connection' || true)"
+    if [[ -n "$opn" ]]; then
+      flag10L "✗ $file::$fn REGREW an independent live-DB opener — the ADR-0098 R7 boot re-fork seam must stay on the shared Handle (db.write()):"
+      printf '%s\n' "$opn" | sed 's/^/      /'
+    fi
+    mir="$(printf '%s\n' "$body" | grep -nE 'sync_mirror[[:space:]]*\(' || true)"
+    if [[ -n "$mir" ]]; then
+      flag10L "✗ $file::$fn REGREW a direct sync_mirror — the post-commit mirror must come from the Handle WriteGuard drop, never a separate opener (ADR-0098 R7):"
+      printf '%s\n' "$mir" | sed 's/^/      /'
+    fi
+    if ! printf '%s\n' "$body" | grep -qE '\.write\(\)'; then
+      flag10L "✗ $file::$fn no longer routes through the shared Handle writer (.write()) — ADR-0098 R7 migration reverted?"
+    fi
+    if [[ -z "$opn" && -z "$mir" ]]; then note "✓ $(basename "$file")::$fn — Handle-bound (no independent opener, no rogue sync_mirror; mirror via WriteGuard drop)"; fi
+  }
+  r7_check_seam "apps/aberp/src/restore_from_nav_outgoing.rs" "append_backfill_cycle_entry"
+  r7_check_seam "apps/aberp/src/incoming_invoices.rs" "change_status"
+  rm -f "$r7_extract"
+fi
+
 # ── CHECK 10i — ADR-0098 Session C2: the FROZEN residual-opener ledger. Every
 #    runtime independent opener NOT on the Handle is accounted for in
 #    tools/adr0098_c2_frozen_residuals.txt (operator-paced ERP modules + CLI

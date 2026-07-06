@@ -2246,6 +2246,11 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                         }
                     };
                     restore_outgoing::BackfillInputs {
+                        // ADR-0098 R7 — pass the shared Handle (not just the
+                        // db_path) so the boot cycle-audit append routes through
+                        // the one live instance's writer and cannot re-fork the
+                        // ledger head (the 415/416 divergence).
+                        db: st.db.clone(),
                         db_path: (*st.db_path).clone(),
                         tenant: st.tenant.clone(),
                         tax_number_8: parsed.taxpayer_id,
@@ -18759,12 +18764,15 @@ async fn mark_incoming_status_inner(
         Ok(h) => h,
         Err(e) => return internal_error("mark_incoming_status:binary_hash", anyhow!(e)),
     };
-    let db_path = state.db_path.clone();
+    // ADR-0098 R7 — pass the shared Handle (not the bare db_path) so the
+    // status-change UPDATE + audit append route through the one live instance's
+    // writer and cannot re-fork the ledger head.
+    let db = state.db.clone();
     let tenant = state.tenant.clone();
     let id_for_task = id.clone();
     let result = tokio::task::spawn_blocking(move || {
         incoming_invoices::change_status(
-            &db_path,
+            &db,
             tenant,
             binary_hash,
             &operator_login,

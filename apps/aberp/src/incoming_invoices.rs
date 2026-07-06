@@ -977,7 +977,7 @@ fn transition_allowed(from: IncomingInvoiceStatus, to: IncomingInvoiceStatus) ->
 /// alongside the column update. The chain is verified + the mirror is
 /// synced post-commit, mirroring [`crate::mark_invoice_paid::mark_paid`].
 pub fn change_status(
-    db_path: &Path,
+    db: &aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: audit_ledger::BinaryHash,
     operator_login: &str,
@@ -994,18 +994,20 @@ pub fn change_status(
         return Err(StatusChangeError::ReasonRequiredForIrrelevant);
     }
 
-    let mut conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for ap_invoice status change",
-            db_path.display()
-        )
-    })?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
-    ensure_schema(&conn).context("ensure ap_invoice schema (status change)")?;
-    audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema (status change)")?;
+    // ADR-0098 R7 — route the status-change UPDATE + audit append through the
+    // ONE shared Handle writer (`db.write()`), not an independent
+    // `Connection::open` + `Ledger::open`/`sync_mirror` on the path. This is the
+    // same swap-orphan / stale-head re-fork class the backfill seam carried: a
+    // separate instance reads a stale head and can rewrite the mirror from its
+    // own view. The `WriteGuard` drop runs the lockstep `sync_mirror`
+    // post-commit hook; chain verification reuses a shared READ clone.
+    let mut guard = db
+        .write()
+        .map_err(|e| anyhow!("shared writer for ap_invoice status change (ADR-0098 R7): {e}"))?;
+    ensure_schema(&guard).context("ensure ap_invoice schema (status change)")?;
+    audit_ledger::ensure_schema(&guard).context("ensure audit-ledger schema (status change)")?;
 
-    let current = read_current_status(&conn, tenant.as_str(), ap_invoice_id)?;
+    let current = read_current_status(&guard, tenant.as_str(), ap_invoice_id)?;
     let from_status = match current {
         Some(s) => s,
         None => return Err(StatusChangeError::NotFound),
@@ -1024,9 +1026,13 @@ pub fn change_status(
     // writing anything. The route layer can echo the unchanged row.
     if from_parsed == to_status {
         // Get the verify count for a coherent echo.
-        drop(conn);
-        let ledger = Ledger::open(db_path, tenant, binary_hash)
-            .context("open audit ledger to count entries for status no-op")?;
+        // Release the writer BEFORE taking a read clone — `read()` locks the
+        // same process-wide writer mutex, so holding `guard` would deadlock.
+        drop(guard);
+        let verify_conn = db.read().map_err(|e| {
+            anyhow!("shared read to count entries for status no-op (ADR-0098 R7): {e}")
+        })?;
+        let ledger = Ledger::from_connection(verify_conn, tenant, binary_hash);
         let verified = ledger
             .verify_chain()
             .context("verify chain (status no-op)")?;
@@ -1048,7 +1054,7 @@ pub fn change_status(
         .format(&Rfc3339)
         .context("format updated_at as Rfc3339")?;
 
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin DuckDB transaction (ap_invoice status change)")?;
     // Update local_status + irrelevant_reason atomically.
@@ -1091,16 +1097,18 @@ pub fn change_status(
     tx.commit()
         .context("commit DuckDB transaction (ap_invoice status change)")?;
 
-    drop(conn);
-    let ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to verify chain after status change")?;
+    // `guard` drops here -> the Handle's post-commit hook fires the lockstep
+    // `sync_mirror` on the SHARED instance (coherent with the committed txn).
+    // Chain verification reuses a read clone — never a second independent
+    // `Ledger::open` (the duckdb#23046 replay / stale-head locus).
+    drop(guard);
+    let verify_conn = db.read().map_err(|e| {
+        anyhow!("shared read to verify chain after ap_invoice status change (ADR-0098 R7): {e}")
+    })?;
+    let ledger = Ledger::from_connection(verify_conn, tenant, binary_hash);
     let verified = ledger
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER ap_invoice status change")?;
-    let mirror_path = audit_ledger::mirror_path_for(db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after ap_invoice status change")?;
 
     Ok(StatusChangeOutcome {
         id: ap_invoice_id.to_string(),
