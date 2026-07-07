@@ -2965,11 +2965,11 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             };
             match recovery_state.binary_hash.wait() {
                 Ok(binary_hash) => {
-                    let db_path = (*recovery_state.db_path).clone();
+                    let db = recovery_state.db.clone();
                     let tenant = recovery_state.tenant.clone();
                     let scan = tokio::task::spawn_blocking(move || {
                         crate::avl_vendors::fire_overdue_screening_reminders(
-                            &db_path,
+                            &db,
                             tenant,
                             binary_hash,
                             &operator_login,
@@ -3019,10 +3019,12 @@ pub fn run(args: &ServeArgs) -> Result<()> {
             match recovery_state.binary_hash.wait() {
                 Ok(binary_hash) => {
                     let db_path = (*recovery_state.db_path).clone();
+                    let db = recovery_state.db.clone();
                     let tenant = recovery_state.tenant.clone();
                     let scan = tokio::task::spawn_blocking(move || {
                         crate::quality::escalate_overdue_ncrs(
                             &db_path,
+                            &db,
                             tenant,
                             binary_hash,
                             &operator_login,
@@ -14000,7 +14002,11 @@ async fn handle_create_adapter(
         Ok(p) => p,
         Err(e) => return internal_error("seller_toml_path_for_request", e),
     };
-    match state.adapter_manager.add(&deps, &path, input).await {
+    match state
+        .adapter_manager
+        .add(&deps, &state.db, &path, input)
+        .await
+    {
         Ok(entry) => (StatusCode::CREATED, Json(entry)).into_response(),
         Err(e) => adapter_mutation_response(e),
     }
@@ -14026,7 +14032,11 @@ async fn handle_update_adapter(
         Ok(p) => p,
         Err(e) => return internal_error("seller_toml_path_for_request", e),
     };
-    match state.adapter_manager.update(&deps, &path, &id, input).await {
+    match state
+        .adapter_manager
+        .update(&deps, &state.db, &path, &id, input)
+        .await
+    {
         Ok(entry) => Json(entry).into_response(),
         Err(e) => adapter_mutation_response(e),
     }
@@ -14051,7 +14061,11 @@ async fn handle_delete_adapter(
         Ok(p) => p,
         Err(e) => return internal_error("seller_toml_path_for_request", e),
     };
-    match state.adapter_manager.remove(&deps, &path, &id).await {
+    match state
+        .adapter_manager
+        .remove(&deps, &state.db, &path, &id)
+        .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => adapter_mutation_response(e),
     }
@@ -16795,6 +16809,10 @@ pub fn transition_work_order_request(
         aberp_work_orders::transition_work_order(&tx, &ctx, wo_id, inputs).map_err(map_wo_err)?;
     tx.commit()
         .context("commit work-order transition transaction")?;
+    // ADR-0099 — release the shared writer guard BEFORE the calibration hook.
+    // The hook routes its audit append through `state.db.write()`; holding this
+    // guard across it would dead-lock the exclusive writer re-entrantly.
+    drop(conn);
 
     // S429 — closed-loop calibration hook. Runs AFTER the Complete commit (the
     // crate can't reach quote_pricing_jobs). Observational: a failure is logged
@@ -16806,6 +16824,7 @@ pub fn transition_work_order_request(
     ) {
         if let Err(e) = crate::quote_calibration::record_calibration_for_completed_wo(
             &state.db_path,
+            &state.db,
             &state.tenant,
             binary_hash,
             operator_login,
@@ -22134,7 +22153,7 @@ fn finalize_email_audit(
     };
     let mut body = body;
     if let Err(e) = email_invoice::record_email_audit_entry(
-        state.db_path.as_path(),
+        &state.db,
         state.tenant.clone(),
         binary_hash_bytes,
         actor,
@@ -24885,7 +24904,7 @@ async fn handle_assign_heat_lot(
                 // conn dropped here — Ledger opens its own writer next.
             };
             crate::material_inventory::append_heat_lot_events(
-                &state_for_task.db_path,
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &assignment,
@@ -25176,7 +25195,7 @@ fn mark_parts_request(
     };
 
     crate::part_marking::append_mark_events(
-        &state.db_path,
+        &state.db,
         state.tenant.clone(),
         binary_hash,
         wo_id,
@@ -25471,6 +25490,7 @@ async fn handle_create_ncr(
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::create_ncr(
                 state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -25560,6 +25580,7 @@ async fn handle_transition_ncr(
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::transition_ncr(
                 state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -25612,6 +25633,7 @@ async fn handle_create_capa(
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::create_capa(
                 state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -25654,6 +25676,7 @@ async fn handle_approve_capa(
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::approve_capa(
                 state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -25705,6 +25728,7 @@ async fn handle_review_capa(
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::review_capa_effectiveness(
                 state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -25743,6 +25767,7 @@ async fn handle_close_capa(
                 .map_err(|e| crate::quality::QualityError::Other(anyhow!("binary hash: {e}")))?;
             crate::quality::close_capa(
                 state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -26137,6 +26162,7 @@ async fn handle_record_qc_inspection(
             let now = time::OffsetDateTime::now_utc();
             crate::qc_inspection::record_manual_inspection(
                 &state_for_task.db_path,
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -26352,6 +26378,7 @@ async fn handle_create_po(
                 .map_err(|e| crate::purchasing::PoError::Other(anyhow!("binary hash: {e}")))?;
             crate::purchasing::create_po(
                 state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -26433,6 +26460,7 @@ async fn handle_transition_po(
                 .map_err(|e| crate::purchasing::PoError::Other(anyhow!("binary hash: {e}")))?;
             crate::purchasing::transition_po(
                 state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,
@@ -26472,6 +26500,7 @@ async fn handle_receive_po(
                 .map_err(|e| crate::purchasing::PoError::Other(anyhow!("binary hash: {e}")))?;
             crate::purchasing::record_receipt(
                 state_for_task.db_path.as_path(),
+                &state_for_task.db,
                 state_for_task.tenant.clone(),
                 binary_hash,
                 &operator,

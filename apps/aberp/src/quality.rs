@@ -37,7 +37,8 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
+use aberp_db::HandleArc;
 
 // ── Closed-vocab enums ──────────────────────────────────────────────
 
@@ -648,6 +649,7 @@ fn now_rfc3339() -> String {
 /// `ncr.created`. Returns the persisted NCR.
 pub fn create_ncr(
     db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -722,7 +724,7 @@ pub fn create_ncr(
         "operator_user_id": operator,
     });
     append_event(
-        db_path,
+        db,
         tenant,
         binary_hash,
         operator,
@@ -738,6 +740,7 @@ pub fn create_ncr(
 /// transition log row and fires `ncr.state_changed` (+ `ncr.closed` on close).
 pub fn transition_ncr(
     db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -829,7 +832,7 @@ pub fn transition_ncr(
     };
 
     append_event(
-        db_path,
+        db,
         tenant.clone(),
         binary_hash,
         operator,
@@ -845,7 +848,7 @@ pub fn transition_ncr(
     )?;
     if to == NcrState::Closed {
         append_event(
-            db_path,
+            db,
             tenant.clone(),
             binary_hash,
             operator,
@@ -876,6 +879,7 @@ pub fn transition_ncr(
 /// Non-fatal at boot — the caller logs, never `?`-fails boot.
 pub fn escalate_overdue_ncrs(
     db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -931,7 +935,7 @@ pub fn escalate_overdue_ncrs(
             .map(|d| (now - d).whole_hours())
             .unwrap_or_default();
         append_event(
-            db_path,
+            db,
             tenant.clone(),
             binary_hash,
             operator,
@@ -964,6 +968,7 @@ pub struct NewCapa {
 /// Create a CAPA for a parent NCR (verdict `Pending`); fire `capa.created`.
 pub fn create_capa(
     db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -1031,7 +1036,7 @@ pub fn create_capa(
         .context("insert capa row")?;
     }
     append_event(
-        db_path,
+        db,
         tenant,
         binary_hash,
         operator,
@@ -1051,6 +1056,7 @@ pub fn create_capa(
 /// Approve a CAPA's plan; fire `capa.approved`.
 pub fn approve_capa(
     db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -1085,7 +1091,7 @@ pub fn approve_capa(
         capa.ncr_id
     };
     append_event(
-        db_path,
+        db,
         tenant.clone(),
         binary_hash,
         operator,
@@ -1104,6 +1110,7 @@ pub fn approve_capa(
 /// `capa.effectiveness_reviewed`.
 pub fn review_capa_effectiveness(
     db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -1141,7 +1148,7 @@ pub fn review_capa_effectiveness(
         capa.ncr_id
     };
     append_event(
-        db_path,
+        db,
         tenant.clone(),
         binary_hash,
         operator,
@@ -1161,6 +1168,7 @@ pub fn review_capa_effectiveness(
 /// Stamp a CAPA's actual close date; fire `capa.closed`.
 pub fn close_capa(
     db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -1193,7 +1201,7 @@ pub fn close_capa(
         capa.ncr_id
     };
     append_event(
-        db_path,
+        db,
         tenant.clone(),
         binary_hash,
         operator,
@@ -1228,23 +1236,40 @@ fn reread_capa(
 /// Open a fresh `Ledger` (after the read/write conn drops — DuckDB single-writer
 /// rule) and append one quality audit entry.
 fn append_event(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
     kind: EventKind,
     payload: serde_json::Value,
 ) -> Result<()> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record quality event")?;
-    ledger
-        .append(
-            kind,
-            serde_json::to_vec(&payload).expect("serialize quality payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator),
-            None,
-        )
-        .context("append quality audit entry")?;
+    // ADR-0099 — route the quality audit append through the ONE shared
+    // aberp_db::Handle writer instead of an independent Ledger::open on the live
+    // tenant DB. The NCR/CAPA CRUD handlers (and the boot overdue-escalation
+    // scan) run in-process under `aberp serve`; an independent opener off a
+    // stale chain head self-assigns an already-used seq (the 369→515 fork
+    // class). Self-contained (acquire→append→release) so callers that perform
+    // several audit appends never nest the exclusive writer guard.
+    let mut guard = db
+        .write()
+        .map_err(|e| anyhow::anyhow!("shared writer for quality audit (ADR-0099): {e}"))?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for quality event")?;
+    let tx = guard
+        .transaction()
+        .context("begin DuckDB transaction for quality event")?;
+    let meta = LedgerMeta::new(tenant, binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        kind,
+        serde_json::to_vec(&payload).expect("serialize quality payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("append quality audit entry: {e}"))?;
+    tx.commit()
+        .context("commit DuckDB transaction for quality event")?;
     Ok(())
 }
 
@@ -1475,7 +1500,7 @@ mod tests {
         );
     }
 
-    fn temp_db() -> (std::path::PathBuf, TenantId, BinaryHash) {
+    fn temp_db() -> (std::path::PathBuf, HandleArc, TenantId, BinaryHash) {
         let dir = std::env::temp_dir()
             .join("aberp-quality-test")
             .join(Ulid::new().to_string());
@@ -1486,15 +1511,28 @@ mod tests {
             aberp_audit_ledger::ensure_schema(&conn).unwrap();
             ensure_schema(&conn).unwrap();
         }
-        (
-            db_path,
-            TenantId::new("t").unwrap(),
-            BinaryHash::from_bytes([0u8; 32]),
+        let tenant = TenantId::new("t").unwrap();
+        // ADR-0099 — the shared Handle the audit appends now route through
+        // (checkpoint off; the business reads/writes keep their own connections,
+        // and audit readbacks see committed rows via WAL replay).
+        let handle = aberp_db::Handle::open(
+            &db_path,
+            tenant.clone(),
+            aberp_db::HandleConfig {
+                checkpoint_enabled: false,
+                ..Default::default()
+            },
         )
+        .unwrap();
+        (db_path, handle, tenant, BinaryHash::from_bytes([0u8; 32]))
     }
 
-    fn count_kind(db_path: &std::path::Path, kind: &str) -> i64 {
-        let conn = Connection::open(db_path).unwrap();
+    // ADR-0099 — read the audit ledger through the SAME shared Handle the
+    // migrated fns wrote through. A fresh Connection::open is a separate DuckDB
+    // instance that does not see the Handle's uncheckpointed WAL (production
+    // reads audit via state.db.read() too — this matches it).
+    fn count_kind(handle: &HandleArc, kind: &str) -> i64 {
+        let conn = handle.read().unwrap();
         conn.query_row(
             "SELECT COUNT(*) FROM audit_ledger WHERE kind = ?1",
             params![kind],
@@ -1517,9 +1555,10 @@ mod tests {
 
     #[test]
     fn create_ncr_fires_event_and_seeds_transition() {
-        let (db, tenant, hash) = temp_db();
+        let (db, handle, tenant, hash) = temp_db();
         let ncr = create_ncr(
             &db,
+            &handle,
             tenant.clone(),
             hash,
             "op",
@@ -1527,7 +1566,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ncr.state, NcrState::Open);
-        assert_eq!(count_kind(&db, "ncr.created"), 1);
+        assert_eq!(count_kind(&handle, "ncr.created"), 1);
         let conn = Connection::open(&db).unwrap();
         let t = list_transitions(&conn, tenant.as_str(), &ncr.ncr_id).unwrap();
         assert_eq!(t.len(), 1);
@@ -1536,9 +1575,10 @@ mod tests {
 
     #[test]
     fn close_is_refused_without_verified_capa_then_succeeds() {
-        let (db, tenant, hash) = temp_db();
+        let (db, handle, tenant, hash) = temp_db();
         let ncr = create_ncr(
             &db,
+            &handle,
             tenant.clone(),
             hash,
             "op",
@@ -1547,9 +1587,20 @@ mod tests {
         .unwrap();
         let id = &ncr.ncr_id;
         // Walk to CorrectionApplied.
-        transition_ncr(&db, tenant.clone(), hash, "op", id, NcrState::Contained, "").unwrap();
         transition_ncr(
             &db,
+            &handle,
+            tenant.clone(),
+            hash,
+            "op",
+            id,
+            NcrState::Contained,
+            "",
+        )
+        .unwrap();
+        transition_ncr(
+            &db,
+            &handle,
             tenant.clone(),
             hash,
             "op",
@@ -1560,6 +1611,7 @@ mod tests {
         .unwrap();
         transition_ncr(
             &db,
+            &handle,
             tenant.clone(),
             hash,
             "op",
@@ -1569,12 +1621,22 @@ mod tests {
         )
         .unwrap();
         // Close refused — no verified CAPA.
-        let err =
-            transition_ncr(&db, tenant.clone(), hash, "op", id, NcrState::Closed, "").unwrap_err();
+        let err = transition_ncr(
+            &db,
+            &handle,
+            tenant.clone(),
+            hash,
+            "op",
+            id,
+            NcrState::Closed,
+            "",
+        )
+        .unwrap_err();
         assert!(matches!(err, QualityError::IllegalTransition(_)));
         // Add + approve + verify a CAPA.
         let capa = create_capa(
             &db,
+            &handle,
             tenant.clone(),
             hash,
             "op",
@@ -1587,9 +1649,10 @@ mod tests {
             },
         )
         .unwrap();
-        approve_capa(&db, tenant.clone(), hash, "op", &capa.capa_id).unwrap();
+        approve_capa(&db, &handle, tenant.clone(), hash, "op", &capa.capa_id).unwrap();
         review_capa_effectiveness(
             &db,
+            &handle,
             tenant.clone(),
             hash,
             "op",
@@ -1601,6 +1664,7 @@ mod tests {
         // Now close succeeds.
         let closed = transition_ncr(
             &db,
+            &handle,
             tenant.clone(),
             hash,
             "op",
@@ -1611,17 +1675,18 @@ mod tests {
         .unwrap();
         assert_eq!(closed.state, NcrState::Closed);
         assert!(closed.closed_at_utc.is_some());
-        assert_eq!(count_kind(&db, "ncr.closed"), 1);
-        assert_eq!(count_kind(&db, "capa.created"), 1);
-        assert_eq!(count_kind(&db, "capa.approved"), 1);
-        assert_eq!(count_kind(&db, "capa.effectiveness_reviewed"), 1);
+        assert_eq!(count_kind(&handle, "ncr.closed"), 1);
+        assert_eq!(count_kind(&handle, "capa.created"), 1);
+        assert_eq!(count_kind(&handle, "capa.approved"), 1);
+        assert_eq!(count_kind(&handle, "capa.effectiveness_reviewed"), 1);
     }
 
     #[test]
     fn illegal_transition_is_refused_at_db_layer() {
-        let (db, tenant, hash) = temp_db();
+        let (db, handle, tenant, hash) = temp_db();
         let ncr = create_ncr(
             &db,
+            &handle,
             tenant.clone(),
             hash,
             "op",
@@ -1630,6 +1695,7 @@ mod tests {
         .unwrap();
         let err = transition_ncr(
             &db,
+            &handle,
             tenant.clone(),
             hash,
             "op",
@@ -1643,10 +1709,11 @@ mod tests {
 
     #[test]
     fn escalate_overdue_flips_only_late_critical() {
-        let (db, tenant, hash) = temp_db();
+        let (db, handle, tenant, hash) = temp_db();
         // A critical NCR, then back-date its discovered_at to 2 days ago.
         let crit = create_ncr(
             &db,
+            &handle,
             tenant.clone(),
             hash,
             "op",
@@ -1655,6 +1722,7 @@ mod tests {
         .unwrap();
         let major = create_ncr(
             &db,
+            &handle,
             tenant.clone(),
             hash,
             "op",
@@ -1678,9 +1746,9 @@ mod tests {
             .unwrap();
         }
         let now = OffsetDateTime::UNIX_EPOCH + Duration::days(200);
-        let n = escalate_overdue_ncrs(&db, tenant.clone(), hash, "boot", now).unwrap();
+        let n = escalate_overdue_ncrs(&db, &handle, tenant.clone(), hash, "boot", now).unwrap();
         assert_eq!(n, 1, "only the critical escalates");
-        assert_eq!(count_kind(&db, "ncr.escalated"), 1);
+        assert_eq!(count_kind(&handle, "ncr.escalated"), 1);
         let conn = Connection::open(&db).unwrap();
         assert_eq!(
             get_ncr(&conn, tenant.as_str(), &crit.ncr_id)
@@ -1698,7 +1766,7 @@ mod tests {
         );
         // Idempotent-ish: a second scan re-finds nothing (already escalated).
         assert_eq!(
-            escalate_overdue_ncrs(&db, tenant.clone(), hash, "boot", now).unwrap(),
+            escalate_overdue_ncrs(&db, &handle, tenant.clone(), hash, "boot", now).unwrap(),
             0
         );
     }

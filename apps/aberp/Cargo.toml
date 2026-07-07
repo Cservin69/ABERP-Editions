@@ -260,6 +260,10 @@ aberp-audit-ledger = { path = "../../crates/audit-ledger", features = ["test-sup
 # table + audit chain) and reads snapshot records back, exercising the
 # crate API directly alongside `aberp::snapshot`'s audit emission.
 aberp-snapshot = { path = "../../crates/aberp-snapshot" }
+# ADR-0099 — the NCR/CAPA + PO + QC-inspection integration tests open a shared
+# aberp_db::Handle (via aberp::serve::open_tenant_handle) and name HandleArc, so
+# the crate is needed at test-compile time (already a normal dependency above).
+aberp-db = { path = "../../crates/aberp-db" }
 duckdb = { workspace = true }
 time = { workspace = true }
 

@@ -446,7 +446,9 @@ fn boot_overdue_scan_fires_avl_screening_overdue_exactly_once() {
 
     let now = time::OffsetDateTime::now_utc();
     let fired = aberp::avl_vendors::fire_overdue_screening_reminders(
-        &db,
+        // ADR-0099 — the scan now routes through the shared Handle (state.db),
+        // the same instance build_state opened on this db path.
+        &state.db,
         tenant.clone(),
         TEST_HASH,
         "boot",

@@ -29,6 +29,8 @@ const T: &str = "ncr_capa_gate_test";
 
 struct Fixture {
     db_path: std::path::PathBuf,
+    // ADR-0099 — the shared Handle the quality audit appends route through.
+    handle: aberp_db::HandleArc,
     tenant: TenantId,
     hash: BinaryHash,
 }
@@ -48,9 +50,13 @@ fn setup() -> Fixture {
         aberp_dispatch::ensure_schema(&conn).unwrap();
         aberp::quote_pricing_jobs::ensure_schema(&conn).unwrap();
     }
+    let tenant = TenantId::new(T).unwrap();
+    let handle = aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+        .expect("open shared test Handle");
     Fixture {
         db_path,
-        tenant: TenantId::new(T).unwrap(),
+        handle,
+        tenant,
         hash: BinaryHash::from_bytes([0u8; 32]),
     }
 }
@@ -123,6 +129,7 @@ fn get_dispatch(conn: &Connection, dsp_id: &str) -> aberp_dispatch::Dispatch {
 fn open_ncr_on(fx: &Fixture, part_uids: &[String]) -> String {
     quality::create_ncr(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",
@@ -173,6 +180,7 @@ fn defense_dispatch_blocked_by_open_ncr_then_unblocked_when_closed() {
     // Contained still blocks (brief §4: Open OR Contained).
     quality::transition_ncr(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",
@@ -191,6 +199,7 @@ fn defense_dispatch_blocked_by_open_ncr_then_unblocked_when_closed() {
     // Drive to close with a verified CAPA → gate PASSES.
     quality::transition_ncr(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",
@@ -201,6 +210,7 @@ fn defense_dispatch_blocked_by_open_ncr_then_unblocked_when_closed() {
     .unwrap();
     quality::transition_ncr(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",
@@ -211,6 +221,7 @@ fn defense_dispatch_blocked_by_open_ncr_then_unblocked_when_closed() {
     .unwrap();
     let capa = quality::create_capa(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",
@@ -223,9 +234,18 @@ fn defense_dispatch_blocked_by_open_ncr_then_unblocked_when_closed() {
         },
     )
     .unwrap();
-    quality::approve_capa(&fx.db_path, fx.tenant.clone(), fx.hash, "qa", &capa.capa_id).unwrap();
+    quality::approve_capa(
+        &fx.db_path,
+        &fx.handle,
+        fx.tenant.clone(),
+        fx.hash,
+        "qa",
+        &capa.capa_id,
+    )
+    .unwrap();
     quality::review_capa_effectiveness(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",
@@ -236,6 +256,7 @@ fn defense_dispatch_blocked_by_open_ncr_then_unblocked_when_closed() {
     .unwrap();
     let closed = quality::transition_ncr(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",
@@ -307,6 +328,7 @@ fn full_loop_fires_all_quality_events() {
     let ncr_id = open_ncr_on(&fx, &["dp-AAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()]);
     quality::transition_ncr(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",
@@ -317,6 +339,7 @@ fn full_loop_fires_all_quality_events() {
     .unwrap();
     quality::transition_ncr(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",
@@ -327,6 +350,7 @@ fn full_loop_fires_all_quality_events() {
     .unwrap();
     quality::transition_ncr(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",
@@ -337,6 +361,7 @@ fn full_loop_fires_all_quality_events() {
     .unwrap();
     let capa = quality::create_capa(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",
@@ -349,9 +374,18 @@ fn full_loop_fires_all_quality_events() {
         },
     )
     .unwrap();
-    quality::approve_capa(&fx.db_path, fx.tenant.clone(), fx.hash, "qa", &capa.capa_id).unwrap();
+    quality::approve_capa(
+        &fx.db_path,
+        &fx.handle,
+        fx.tenant.clone(),
+        fx.hash,
+        "qa",
+        &capa.capa_id,
+    )
+    .unwrap();
     quality::review_capa_effectiveness(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",
@@ -360,9 +394,18 @@ fn full_loop_fires_all_quality_events() {
         "ok",
     )
     .unwrap();
-    quality::close_capa(&fx.db_path, fx.tenant.clone(), fx.hash, "qa", &capa.capa_id).unwrap();
+    quality::close_capa(
+        &fx.db_path,
+        &fx.handle,
+        fx.tenant.clone(),
+        fx.hash,
+        "qa",
+        &capa.capa_id,
+    )
+    .unwrap();
     quality::transition_ncr(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "qa",

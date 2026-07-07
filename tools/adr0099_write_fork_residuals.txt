@@ -6,62 +6,41 @@
 # append_reopen) that is followed by an audit APPEND in the SAME fn, detected by
 # tools/adr0099_write_fork_scan.awk (comment/string/cfg(test)-aware).
 #
-# This set may only SHRINK. A NEW or REGROWN write-fork fails the build (CHECK
-# 10M-b): route it through the ONE shared aberp_db::Handle (db.write() +
-# append_in_tx), never an independent opener. This is the CORRECTED fork model —
-# the seq-369/416/428/515 forks were independent openers each self-assigning the
-# next seq off a stale head; a rogue sync_mirror (CHECK 10L's model) is NOT
-# required. CHECK 10L stays; 10M generalises it to the true primitive.
+# ── THE SET IS NOW EMPTY ────────────────────────────────────────────────────
+# ADR-0099 completion: EVERY in-process (aberp serve) audit write-fork has been
+# migrated onto the ONE shared aberp_db::Handle (db.write() + append_in_tx, or a
+# db.read() for the paired scan read). CHECK 10M-b therefore holds at ZERO — a
+# NEW or REGROWN write-fork ANYWHERE under apps/aberp/src, modules, or crates
+# (minus the shared-Handle seams) now fails the build. There is nothing left to
+# shrink; the surface the corrected fork model (10M) targets is closed.
+#
+# Migrated in this ADR-0099 arc (all now Handle-bound; CHECK 10M-a proves the
+# serve.rs + snapshot.rs seams stay ZERO, 10M-b proves the rest never regrows):
+#   • snapshot.rs daemon+HTTP audit path (the seq-515 racer)
+#   • the serve.rs request handlers (invoice local-only, heat-lot/part-uid/
+#     open-NCR gates, material/part traceability, RestoreFromNavRun,
+#     FirstProdLaunchAcknowledged, NumberingTemplateChanged, ExtNavPartnerManualLink)
+#   • quoting_machines::append_machine_event, restore_from_nav_outgoing::process_digest,
+#     tenant_registry::emit_tenant_event (booted-DB → Handle; foreign-DB / pre-Handle
+#     boot → the allow-listed emit_tenant_reopen)
+#   • the operator-CRUD / boot-scan seams re-audited as in-process (NOT
+#     separate-process, as an earlier pass had mislabelled them): avl_vendors
+#     (fire_overdue_screening_reminders → append_vendor_event_via_handle),
+#     email_invoice::record_email_audit_entry, material_inventory::append_heat_lot_events,
+#     mes_manager::AdapterManager::audit, part_marking::append_mark_events,
+#     purchasing::{create_po,transition_po,record_receipt}→append_event,
+#     quality::{create_ncr,transition_ncr,create_capa,approve_capa,
+#     review_capa_effectiveness,close_capa,escalate_overdue_ncrs}→append_event,
+#     quote_calibration::record_calibration_for_completed_wo→append_calibration_events
+#   • qc_inspection::record_manual_inspection — a SPLIT write-fork (independent
+#     Connection::open here + the audit append inside record_inspection/
+#     link_auto_ncr) that the per-fn scanner did not flag; both phases now route
+#     through the shared Handle (in one guard/tx each).
 #
 # ALLOW-LISTED (never listed here, never a fork): the shared-Handle seams
 # (aberp-db, aberp-snapshot), #[cfg(test)]/open_in_memory, the pre-serve boot
 # openers (run, seed_demo_sample_data, record_upgrade_snapshot_mismatch_audit),
-# the audit-ledger `append_reopen` primitive itself, snapshot.rs `emit_reopen_cli`
-# (the separate-process CLI reopen — no Handle in that process), and
-# tenant_registry.rs `emit_tenant_reopen` (the sanctioned reopen for a DB with NO
-# shared Handle in this process — a FOREIGN tenant's DB, create/demo-seed, or a
-# PRE-Handle boot append; neither can fork the serve writer).
-#
-# MIGRATED this ADR-0099 session (now Handle-bound; DROPPED from this set —
-# CHECK 10M proves they stay zero and can never regrow):
-#   • snapshot.rs daemon+HTTP audit path (the seq-515 racer)              [10M-a]
-#   • the serve.rs request handlers (emit_invoice_local_only, the heat-lot/
-#     part-uid/open-NCR gates, material/part traceability, RestoreFromNavRun,
-#     FirstProdLaunchAcknowledged, NumberingTemplateChanged,
-#     ExtNavPartnerManualLink)                                           [10M-a]
-#   • quoting_machines.rs::append_machine_event — the machine / margin / lead-
-#     time CRUD handlers (12 serve call sites) now route through state.db.
-#   • restore_from_nav_outgoing.rs::process_digest — the restore-from-NAV wizard
-#     (in-serve) now threads the shared Handle through RestoreInputs/DigestContext.
-#   • tenant_registry.rs::emit_tenant_event — the tenant admin handlers (switch /
-#     archive-restore / toggle-nav / seller-region) now route booted-DB appends
-#     through state.db (TenantAudit::Handle); the FOREIGN-DB / pre-Handle-boot
-#     sites use the allow-listed emit_tenant_reopen (TenantAudit::Reopen).
-#
-# ── REMAINING RESIDUALS (v0.2.9 completion target; may only SHRINK) ──────────
-#
-# Categories:
-#  (cli)          = separate-process CLI one-shot (run() subcommand) — no Handle
-#                   in that process; a v0.2.9 cross-process advisory-lock item,
-#                   NOT an in-process fork (ADR-0099 §Deferred).
-#  (in-proc-serve)= reached INSIDE `aberp serve` from an HTTP request handler (or
-#                   a boot scan daemon) — a REAL in-process residual write-fork.
-#                   ⚠ NOT separate-process: an earlier pass mislabelled these
-#                   "(cli)". Re-audited ADR-0099: each is reachable from a serve
-#                   handler that passes state.db_path and opens an independent
-#                   Ledger on the BOOTED tenant DB, so it CAN fork the serve
-#                   writer (operator-paced / boot-once — lower churn than the
-#                   snapshot/quote-intake/backfill daemons that produced the
-#                   observed 369→515 forks, hence staged to v0.2.9). MUST shrink
-#                   to zero: migrate each onto the shared Handle exactly as the
-#                   MIGRATED set above (change the wrapper to take &HandleArc /
-#                   route via db.write()+append_in_tx; the serve caller passes
-#                   state.db). Tracked so 10M-b bars any GROWTH meanwhile.
-apps/aberp/src/avl_vendors.rs:append_vendor_event  # (in-proc-serve) fire_overdue_screening_reminders (boot scan)
-apps/aberp/src/email_invoice.rs:record_email_audit_entry  # (in-proc-serve) send_invoice_email_route (HTTP)
-apps/aberp/src/material_inventory.rs:append_heat_lot_events  # (in-proc-serve) handle_assign_heat_lot (HTTP)
-apps/aberp/src/mes_manager.rs:audit  # (in-proc-serve) handle_create_adapter / adapter CRUD (HTTP)
-apps/aberp/src/part_marking.rs:append_mark_events  # (in-proc-serve) handle_mark_parts (HTTP)
-apps/aberp/src/purchasing.rs:append_event  # (in-proc-serve) handle_create_po (HTTP)
-apps/aberp/src/quality.rs:append_event  # (in-proc-serve) handle_create_ncr (HTTP)
-apps/aberp/src/quote_calibration.rs:append_calibration_events  # (in-proc-serve) handle_transition_work_order (HTTP)
+# the audit-ledger `append_reopen` primitive, snapshot.rs `emit_reopen_cli` (the
+# separate-process CLI reopen), and tenant_registry.rs `emit_tenant_reopen` (the
+# sanctioned reopen for a DB with NO shared Handle in this process — a FOREIGN
+# tenant's DB or a PRE-Handle boot append; neither can fork the serve writer).

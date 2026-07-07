@@ -32,7 +32,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, TenantId};
 use aberp_compliance::avl::{
     render_categories, ApprovalCategory, ApprovedStatus, AvlScreeningResult,
 };
@@ -572,25 +572,6 @@ pub fn vendor_is_overdue(vendor: &AvlVendor, now: OffsetDateTime) -> bool {
     }
 }
 
-/// Append an AVL-lifecycle audit entry. Split from the DB write so the write
-/// half stays unit-testable without a ledger (mirrors `append_machine_event`).
-pub fn append_vendor_event(
-    db_path: &std::path::Path,
-    tenant: TenantId,
-    binary_hash: BinaryHash,
-    operator_login: &str,
-    kind: EventKind,
-    payload: Vec<u8>,
-) -> Result<()> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record AVL vendor event")?;
-    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
-    ledger
-        .append(kind, payload, actor, None)
-        .context("append AVL vendor audit entry")?;
-    Ok(())
-}
-
 /// ADR-0098 C2 round-13 — route the AVL audit append through the ONE shared
 /// `aberp_db::Handle` (single instance) instead of a separate `Ledger::open`.
 /// A separate opener is a 2nd DuckDB instance that checkpoint-races the Handle's
@@ -598,9 +579,9 @@ pub fn append_vendor_event(
 /// following `read()` (the `avl_paths_emit` create -> po_check loss). On the
 /// shared instance the append is coherent, the writer mutex serialises it
 /// (subsuming AUDIT_APPEND_LOCK for handle-routed writes), and the WriteGuard's
-/// post-commit hook syncs the mirror. The runtime request wrappers use this; the
-/// boot overdue scan keeps the path-based `append_vendor_event` (it holds no
-/// Handle).
+/// post-commit hook syncs the mirror. Both the runtime request wrappers AND the
+/// boot overdue scan (ADR-0099) use this — the scan runs in-process under
+/// `aberp serve` with the shared Handle in scope, so it must not fork.
 pub fn append_vendor_event_via_handle(
     db: &aberp_db::HandleArc,
     tenant: TenantId,
@@ -631,21 +612,22 @@ pub fn append_vendor_event_via_handle(
 /// "Exactly once" = once per overdue vendor per boot scan (the natural reminder
 /// cadence; a restart reminds again), pinned by `avl_vendors_route.rs`.
 pub fn fire_overdue_screening_reminders(
-    db_path: &std::path::Path,
+    db: &aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator_login: &str,
     now: OffsetDateTime,
 ) -> Result<usize> {
-    // Scope the read conn so it is dropped before the per-row audit append
-    // opens its own writer (DuckDB single-writer rule).
+    // ADR-0099 — the boot scan runs in-process under `aberp serve`, so both the
+    // read AND the per-vendor audit append route through the ONE shared Handle,
+    // never an independent Connection::open / Ledger::open (the 369→515 fork
+    // class). The read uses the sanctioned single-instance `db.read()`; the
+    // append uses `append_vendor_event_via_handle` (the serialized writer whose
+    // WriteGuard drop keeps the mirror in lockstep).
     let overdue: Vec<AvlVendor> = {
-        let conn = Connection::open(db_path)
-            .with_context(|| format!("open tenant DuckDB at {}", db_path.display()))?;
-        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-            .context(
-                "ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener",
-            )?;
+        let conn = db
+            .read()
+            .context("shared Handle read for AVL overdue scan")?;
         list_vendors(&conn, tenant.as_str())?
             .into_iter()
             .filter(|v| vendor_is_overdue(v, now))
@@ -659,8 +641,8 @@ pub fn fire_overdue_screening_reminders(
             approved_until_utc: v.approved_until_utc.clone().unwrap_or_default(),
             decision_time_utc: now_str.clone(),
         };
-        append_vendor_event(
-            db_path,
+        append_vendor_event_via_handle(
+            db,
             tenant.clone(),
             binary_hash,
             operator_login,

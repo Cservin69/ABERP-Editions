@@ -52,7 +52,6 @@ use aberp_mes::{
     AdapterConfigFieldError, AdapterHealth, AdapterKind, AdapterRegistry, LedgerWriterActor,
     LedgerWriterDeps,
 };
-use duckdb::Connection;
 
 use crate::mes_adapters_config;
 use crate::mes_boot::MesBootDeps;
@@ -194,6 +193,7 @@ impl AdapterManager {
     pub async fn add(
         &self,
         deps: &MesBootDeps,
+        handle: &aberp_db::HandleArc,
         seller_toml_path: &Path,
         input: AddAdapterInput,
     ) -> Result<AdapterConfigEntry, AdapterMutationError> {
@@ -221,7 +221,7 @@ impl AdapterManager {
         let mut next = existing;
         next.push(entry.clone());
         self.persist(seller_toml_path, &next)?;
-        self.audit(deps, EventKind::AdapterAdded, &entry)?;
+        self.audit(handle, deps, EventKind::AdapterAdded, &entry)?;
         Ok(entry)
     }
 
@@ -230,6 +230,7 @@ impl AdapterManager {
     pub async fn update(
         &self,
         deps: &MesBootDeps,
+        handle: &aberp_db::HandleArc,
         seller_toml_path: &Path,
         adapter_id: &str,
         input: EditAdapterInput,
@@ -273,7 +274,7 @@ impl AdapterManager {
             })
             .collect();
         self.persist(seller_toml_path, &next)?;
-        self.audit(deps, EventKind::AdapterUpdated, &new_entry)?;
+        self.audit(handle, deps, EventKind::AdapterUpdated, &new_entry)?;
         Ok(new_entry)
     }
 
@@ -281,6 +282,7 @@ impl AdapterManager {
     pub async fn remove(
         &self,
         deps: &MesBootDeps,
+        handle: &aberp_db::HandleArc,
         seller_toml_path: &Path,
         adapter_id: &str,
     ) -> Result<AdapterConfigEntry, AdapterMutationError> {
@@ -298,7 +300,7 @@ impl AdapterManager {
             .filter(|e| e.adapter_id != adapter_id)
             .collect();
         self.persist(seller_toml_path, &next)?;
-        self.audit(deps, EventKind::AdapterRemoved, &removed)?;
+        self.audit(handle, deps, EventKind::AdapterRemoved, &removed)?;
         Ok(removed)
     }
 
@@ -433,6 +435,7 @@ impl AdapterManager {
 
     fn audit(
         &self,
+        handle: &aberp_db::HandleArc,
         deps: &MesBootDeps,
         kind: EventKind,
         entry: &AdapterConfigEntry,
@@ -442,17 +445,17 @@ impl AdapterManager {
             AdapterMutationError::Io(anyhow!("serialize adapter audit payload: {e}"))
         })?;
         let actor = Actor::from_local_cli(Ulid::new().to_string(), &deps.operator_login);
-        let mut conn = Connection::open(&deps.db_path)
-            .map_err(|e| AdapterMutationError::Io(anyhow!("open DuckDB for adapter audit: {e}")))?;
-        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-            .map_err(|e| {
-                AdapterMutationError::Io(anyhow!(
-                    "PRAGMA disable_checkpoint_on_shutdown on residual opener (ADR-0098 R3): {e}"
-                ))
-            })?;
-        aberp_audit_ledger::ensure_schema(&conn)
+        // ADR-0099 — route the adapter-config audit append through the ONE
+        // shared aberp_db::Handle writer instead of an independent
+        // Connection::open on the live tenant DB. The adapter CRUD handlers run
+        // in-process under `aberp serve`; an independent opener off a stale
+        // chain head self-assigns an already-used seq (the 369→515 fork class).
+        let mut guard = handle.write().map_err(|e| {
+            AdapterMutationError::Io(anyhow!("shared writer for adapter audit: {e}"))
+        })?;
+        aberp_audit_ledger::ensure_schema(&guard)
             .map_err(|e| AdapterMutationError::Io(anyhow!("ensure audit schema: {e}")))?;
-        let tx = conn
+        let tx = guard
             .transaction()
             .map_err(|e| AdapterMutationError::Io(anyhow!("begin audit tx: {e}")))?;
         let meta = aberp_audit_ledger::LedgerMeta::new(deps.tenant.clone(), deps.binary_hash);
@@ -589,6 +592,21 @@ mod tests {
         }
     }
 
+    /// ADR-0099 — the shared Handle the adapter-CRUD audit append now routes
+    /// through (opened on the same `test.duckdb` `test_deps` names; checkpoint
+    /// off to isolate the single-writer property).
+    fn test_handle(dir: &Path) -> aberp_db::HandleArc {
+        aberp_db::Handle::open(
+            &dir.join("test.duckdb"),
+            TenantId::new("tenant-test").unwrap(),
+            aberp_db::HandleConfig {
+                checkpoint_enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
     fn manager() -> AdapterManager {
         AdapterManager::new(
             Arc::new(RwLock::new(AdapterRegistry::new())),
@@ -637,6 +655,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("seller.toml");
         let deps = test_deps(&dir);
+        let handle = test_handle(&dir);
         let mgr = manager();
 
         // Barcode binds 127.0.0.1:<ephemeral>; pick a high port.
@@ -648,7 +667,7 @@ mod tests {
             device_name: None,
             model: None,
         };
-        let added = mgr.add(&deps, &path, input).await.expect("add");
+        let added = mgr.add(&deps, &handle, &path, input).await.expect("add");
         assert!(added.adapter_id.starts_with("barcode-scanner-"));
 
         let rows = mgr.list(&path).expect("list");
@@ -663,7 +682,7 @@ mod tests {
         assert!(mgr.tokens.lock().unwrap().contains_key(&added.adapter_id));
 
         let removed = mgr
-            .remove(&deps, &path, &added.adapter_id)
+            .remove(&deps, &handle, &path, &added.adapter_id)
             .await
             .expect("remove");
         assert_eq!(removed.adapter_id, added.adapter_id);
@@ -681,6 +700,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("seller.toml");
         let deps = test_deps(&dir);
+        let handle = test_handle(&dir);
         let mgr = manager();
 
         let mk = |port| AddAdapterInput {
@@ -691,9 +711,11 @@ mod tests {
             device_name: None,
             model: None,
         };
-        mgr.add(&deps, &path, mk(53998)).await.expect("first add");
+        mgr.add(&deps, &handle, &path, mk(53998))
+            .await
+            .expect("first add");
         let err = mgr
-            .add(&deps, &path, mk(53998))
+            .add(&deps, &handle, &path, mk(53998))
             .await
             .expect_err("dup must fail");
         assert!(matches!(
@@ -705,7 +727,7 @@ mod tests {
 
         // cleanup: stop the live adapter
         let id = mgr.list(&path).unwrap()[0].entry.adapter_id.clone();
-        let _ = mgr.remove(&deps, &path, &id).await;
+        let _ = mgr.remove(&deps, &handle, &path, &id).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -715,8 +737,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("seller.toml");
         let deps = test_deps(&dir);
+        let handle = test_handle(&dir);
         let mgr = manager();
-        let err = mgr.remove(&deps, &path, "ghost").await.expect_err("nf");
+        let err = mgr
+            .remove(&deps, &handle, &path, "ghost")
+            .await
+            .expect_err("nf");
         assert!(matches!(err, AdapterMutationError::NotFound(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }

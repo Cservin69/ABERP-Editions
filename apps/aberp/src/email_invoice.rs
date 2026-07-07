@@ -65,10 +65,10 @@
 use std::path::Path;
 use std::time::Duration;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
 use aberp_billing::IdempotencyKey;
+use aberp_db::HandleArc;
 use anyhow::{anyhow, Context, Result};
-use duckdb::Connection;
 use lettre::{
     message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart},
     transport::smtp::{authentication::Credentials, client::Tls, client::TlsParameters},
@@ -688,26 +688,29 @@ pub fn load_smtp_credentials(
 /// the operator-twin record never has gaps. Returns the entry-count
 /// for parity with mark-paid's response shape.
 pub fn record_email_audit_entry(
-    db_path: &Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash_bytes: BinaryHash,
     actor: Actor,
     invoice_id: &str,
     payload: InvoiceEmailedSentPayload,
 ) -> Result<u64> {
-    let mut conn = Connection::open(db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for InvoiceEmailedSent audit append",
-            db_path.display()
-        )
-    })?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
-    let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash_bytes);
-    aberp_audit_ledger::ensure_schema(&conn)
+    // ADR-0099 — route the InvoiceEmailedSent audit append through the ONE
+    // shared aberp_db::Handle writer instead of an independent Connection::open
+    // (+ a second Ledger::open for verify/mirror) on the live tenant DB. This
+    // runs in-process under `aberp serve` (the email-invoice handler); an
+    // independent opener off a stale chain head self-assigns an already-used
+    // seq (the 369→515 fork class). The WriteGuard drop runs the lockstep
+    // mirror sync + debounced durable checkpoint, so the separate verify/sync
+    // opener is neither needed nor wanted here.
+    let mut guard = db
+        .write()
+        .map_err(|e| anyhow!("shared writer for emailed-sent audit (ADR-0099): {e}"))?;
+    let ledger_meta = LedgerMeta::new(tenant, binary_hash_bytes);
+    aberp_audit_ledger::ensure_schema(&guard)
         .context("ensure audit-ledger schema for emailed-sent")?;
     let idempotency_key_str = payload.idempotency_key.clone();
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin DuckDB transaction (emailed-sent audit append)")?;
     aberp_audit_ledger::append_in_tx(
@@ -721,19 +724,9 @@ pub fn record_email_audit_entry(
     .map_err(|e| anyhow!("audit_ledger::append_in_tx InvoiceEmailedSent: {e}"))?;
     tx.commit()
         .context("commit DuckDB transaction (emailed-sent audit append)")?;
-    drop(conn);
-    let ledger = Ledger::open(db_path, tenant, binary_hash_bytes)
-        .context("open audit ledger to verify chain after emailed-sent")?;
-    let verified = ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER emailed-sent")?;
-    let mirror_path = aberp_audit_ledger::mirror_path_for(db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after emailed-sent commit")?;
     let _ = invoice_id; // present for future per-invoice mirror-locking;
                         // currently the global mirror is the unit.
-    Ok(verified)
+    Ok(1)
 }
 
 /// Helper used by serve-route handlers: build a fresh idempotency

@@ -40,7 +40,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
+use aberp_db::HandleArc;
 
 // ── Pure: part UID / serial / DataMatrix payload ────────────────────
 
@@ -304,7 +305,7 @@ pub fn record_part_marks(
 /// batch `part.uid_marked` (the physical-mark record, the brief's payload).
 /// Both are UNSIGNED (DÁP signature thread is S438+ deferred).
 pub fn append_mark_events(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     wo_id: &str,
@@ -313,8 +314,22 @@ pub fn append_mark_events(
     heat_lot_reference: Option<&str>,
     marks: &[PartMark],
 ) -> Result<usize> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record part marking")?;
+    // ADR-0099 — route the marking audit appends through the ONE shared
+    // aberp_db::Handle writer instead of an independent Ledger::open on the
+    // live tenant DB. This runs in-process under `aberp serve` (the mark-parts
+    // handler); an independent opener off a stale chain head self-assigns an
+    // already-used seq (the 369→515 fork class) while a daemon writes the same
+    // chain. Both batch events land in ONE transaction on the shared instance;
+    // the WriteGuard drop runs the lockstep mirror sync.
+    let mut guard = db
+        .write()
+        .map_err(|e| anyhow::anyhow!("shared writer for part-marking audit (ADR-0099): {e}"))?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for part-marking events")?;
+    let tx = guard
+        .transaction()
+        .context("begin DuckDB transaction for part-marking events")?;
+    let meta = LedgerMeta::new(tenant, binary_hash);
 
     let serials: Vec<_> = marks
         .iter()
@@ -327,14 +342,15 @@ pub fn append_mark_events(
         "operator_user_id": operator,
         "assigned_at": marked_at,
     });
-    ledger
-        .append(
-            EventKind::PartSerialAssigned,
-            serde_json::to_vec(&serial_payload).expect("serialize serial-assigned payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator),
-            None,
-        )
-        .context("append part.serial_assigned")?;
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        EventKind::PartSerialAssigned,
+        serde_json::to_vec(&serial_payload).expect("serialize serial-assigned payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("append part.serial_assigned: {e}"))?;
 
     let parts: Vec<_> = marks
         .iter()
@@ -355,15 +371,18 @@ pub fn append_mark_events(
         "operator_user_id": operator,
         "marked_at": marked_at,
     });
-    ledger
-        .append(
-            EventKind::PartUidMarked,
-            serde_json::to_vec(&uid_payload).expect("serialize uid-marked payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator),
-            None,
-        )
-        .context("append part.uid_marked")?;
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        EventKind::PartUidMarked,
+        serde_json::to_vec(&uid_payload).expect("serialize uid-marked payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("append part.uid_marked: {e}"))?;
 
+    tx.commit()
+        .context("commit DuckDB transaction for part-marking events")?;
     Ok(2)
 }
 
@@ -697,9 +716,21 @@ mod tests {
         }
         let tenant = TenantId::new("t").unwrap();
         let hash = BinaryHash::from_bytes([0u8; 32]);
+        // ADR-0099 — append through a real shared Handle (checkpoint off to
+        // isolate the single-writer property); drop it before the readback so
+        // the assertion connection sees the committed rows via WAL replay.
+        let handle = aberp_db::Handle::open(
+            &db_path,
+            tenant.clone(),
+            aberp_db::HandleConfig {
+                checkpoint_enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let marks: Vec<_> = (1..=2).map(|i| sample_mark("wo-1", i)).collect();
         let n = append_mark_events(
-            &db_path,
+            &handle,
             tenant,
             hash,
             "wo-1",
@@ -710,6 +741,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(n, 2);
+        drop(handle);
 
         let conn = Connection::open(&db_path).unwrap();
         let one = |kind: &str| -> i64 {

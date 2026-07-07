@@ -24,7 +24,8 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
+use aberp_db::HandleArc;
 use aberp_quote_engine::{
     coefficient, CalibrationSample, CalibrationTable, MachineFamily, QuoteBreakdown,
 };
@@ -186,13 +187,16 @@ fn read_quote_estimate(
     Ok(Some((family, estimated_total)))
 }
 
-/// Append calibration audit entries through one ledger open. Mirrors
-/// [`crate::quoting_machines::append_machine_event`] but batches the (recorded
-/// + possible shift) pair. The caller MUST drop its DuckDB write connection
-/// before calling this — opening the ledger is a second connection to the same
-/// file and a held write conn silently loses the append (the S427 bug).
+/// Append calibration audit entries through the ONE shared aberp_db::Handle
+/// writer (ADR-0099), batching the (recorded + possible shift) pair in one tx.
+/// Mirrors [`crate::quoting_machines::append_machine_event`]. Replaces the old
+/// independent `Ledger::open` (a second connection that self-assigned a seq off
+/// a stale head — the 369→515 fork class). Self-contained (acquire→append→
+/// release); the caller (the WO-transition handler) MUST have dropped its own
+/// `state.db.write()` guard before this runs, else the exclusive writer
+/// dead-locks re-entrantly (see `transition_work_order_request`).
 fn append_calibration_events(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator_login: &str,
@@ -201,14 +205,22 @@ fn append_calibration_events(
     if events.is_empty() {
         return Ok(());
     }
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record calibration event")?;
+    let mut guard = db
+        .write()
+        .map_err(|e| anyhow::anyhow!("shared writer for calibration audit (ADR-0099): {e}"))?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for calibration events")?;
+    let tx = guard
+        .transaction()
+        .context("begin DuckDB transaction for calibration events")?;
+    let meta = LedgerMeta::new(tenant, binary_hash);
     for (kind, payload) in events {
         let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
-        ledger
-            .append(kind, payload, actor, None)
-            .context("append calibration audit entry")?;
+        aberp_audit_ledger::append_in_tx(&tx, &meta, kind, payload, actor, None)
+            .map_err(|e| anyhow::anyhow!("append calibration audit entry: {e}"))?;
     }
+    tx.commit()
+        .context("commit DuckDB transaction for calibration events")?;
     Ok(())
 }
 
@@ -224,6 +236,7 @@ fn append_calibration_events(
 /// unwinds the WO Complete (that already committed).
 pub fn record_calibration_for_completed_wo(
     db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: &TenantId,
     binary_hash: BinaryHash,
     operator_login: &str,
@@ -252,7 +265,7 @@ pub fn record_calibration_for_completed_wo(
             reason: reason.to_string(),
         };
         append_calibration_events(
-            db_path,
+            db,
             tenant.clone(),
             binary_hash,
             operator_login,
@@ -314,7 +327,7 @@ pub fn record_calibration_for_completed_wo(
             .to_bytes(),
         ));
     }
-    append_calibration_events(db_path, tenant.clone(), binary_hash, operator_login, events)
+    append_calibration_events(db, tenant.clone(), binary_hash, operator_login, events)
 }
 
 // ── SPA read model ──────────────────────────────────────────────────
@@ -548,6 +561,22 @@ mod tests {
         ensure_schema(&conn).unwrap();
     }
 
+    /// ADR-0099 — a short-lived shared Handle on the scratch DB for the audit
+    /// append the calibration hook now routes through (checkpoint off). Created
+    /// per call and dropped at the end of the call statement, so the following
+    /// readback connection sees the committed rows via WAL replay.
+    fn scratch_handle(db: &std::path::Path) -> HandleArc {
+        aberp_db::Handle::open(
+            db,
+            tenant(),
+            aberp_db::HandleConfig {
+                checkpoint_enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
     /// Seed a priced quote row whose breakdown carries `machining_minutes`
     /// (per part), `quantity`, and a neutral coefficient — so
     /// `read_quote_estimate` recovers `machining_minutes * quantity` as base.
@@ -618,6 +647,7 @@ mod tests {
         seed_priced_quote(&s.db(), "q1", 10.0, 4); // base = 40 min
         record_calibration_for_completed_wo(
             &s.db(),
+            &scratch_handle(&s.db()),
             &tenant(),
             BinaryHash::from_bytes([0u8; 32]),
             "op",
@@ -642,6 +672,7 @@ mod tests {
         seed_priced_quote(&s.db(), "q1", 10.0, 4);
         record_calibration_for_completed_wo(
             &s.db(),
+            &scratch_handle(&s.db()),
             &tenant(),
             BinaryHash::from_bytes([0u8; 32]),
             "op",
@@ -661,6 +692,7 @@ mod tests {
         setup_file_db(&s.db());
         record_calibration_for_completed_wo(
             &s.db(),
+            &scratch_handle(&s.db()),
             &tenant(),
             BinaryHash::from_bytes([0u8; 32]),
             "op",
@@ -688,6 +720,7 @@ mod tests {
         for i in 0..5 {
             record_calibration_for_completed_wo(
                 &s.db(),
+                &scratch_handle(&s.db()),
                 &tenant(),
                 BinaryHash::from_bytes([0u8; 32]),
                 "op",

@@ -23,6 +23,9 @@ const T: &str = "po_e2e_test";
 
 struct Fixture {
     db_path: std::path::PathBuf,
+    // ADR-0099 — the shared Handle the purchasing (+ auto-NCR) audit appends
+    // route through.
+    handle: aberp_db::HandleArc,
     tenant: TenantId,
     hash: BinaryHash,
 }
@@ -40,9 +43,13 @@ fn setup() -> Fixture {
         ensure_avl_schema(&conn).unwrap();
         aberp::quality::ensure_schema(&conn).unwrap();
     }
+    let tenant = TenantId::new(T).unwrap();
+    let handle = aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+        .expect("open shared test Handle");
     Fixture {
         db_path,
-        tenant: TenantId::new(T).unwrap(),
+        handle,
+        tenant,
         hash: BinaryHash::from_bytes([0u8; 32]),
     }
 }
@@ -92,8 +99,12 @@ fn sample_po(vendor: &str, heat_lot_line: bool) -> NewPo {
     }
 }
 
-fn count_kind(db_path: &std::path::Path, kind: &str) -> i64 {
-    let conn = Connection::open(db_path).unwrap();
+// ADR-0099 — read audit through the SAME shared Handle the migrated purchasing
+// fns wrote through (a fresh Connection::open is a separate DuckDB instance that
+// does not see the Handle's uncheckpointed WAL; production reads audit via
+// state.db.read() too).
+fn count_kind(handle: &aberp_db::HandleArc, kind: &str) -> i64 {
+    let conn = handle.read().unwrap();
     conn.query_row(
         "SELECT COUNT(*) FROM audit_ledger WHERE kind = ?1",
         params![kind],
@@ -111,6 +122,7 @@ fn full_procurement_journey_approved_vendor() {
 
     let po = create_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -125,12 +137,13 @@ fn full_procurement_journey_approved_vendor() {
     assert_eq!(po.vat_minor, 13770);
     assert_eq!(po.total_minor, 64770);
     assert_eq!(po.vendor_avl_status.as_deref(), Some("approved"));
-    assert_eq!(count_kind(&fx.db_path, "po.created"), 1);
-    assert_eq!(count_kind(&fx.db_path, "po.line_added"), 2);
+    assert_eq!(count_kind(&fx.handle, "po.created"), 1);
+    assert_eq!(count_kind(&fx.handle, "po.line_added"), 2);
 
     // Issue requires an approver.
     let err = transition_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -143,6 +156,7 @@ fn full_procurement_journey_approved_vendor() {
 
     let issued = transition_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -153,7 +167,7 @@ fn full_procurement_journey_approved_vendor() {
     .unwrap();
     assert_eq!(issued.state, PoState::IssuedToVendor);
     assert_eq!(issued.approved_by_operator.as_deref(), Some("manager"));
-    assert_eq!(count_kind(&fx.db_path, "po.issued"), 1);
+    assert_eq!(count_kind(&fx.handle, "po.issued"), 1);
 
     // Find the line ids.
     let conn = Connection::open(&fx.db_path).unwrap();
@@ -165,6 +179,7 @@ fn full_procurement_journey_approved_vendor() {
     // Receive PART of the bar (4 of 10), passing inspection, with a heat lot.
     let after_partial = record_receipt(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "receiver",
@@ -182,12 +197,13 @@ fn full_procurement_journey_approved_vendor() {
     )
     .unwrap();
     assert_eq!(after_partial.state, PoState::PartiallyReceived);
-    assert_eq!(count_kind(&fx.db_path, "po.receipt_recorded"), 1);
-    assert_eq!(count_kind(&fx.db_path, "po.partially_received"), 1);
+    assert_eq!(count_kind(&fx.handle, "po.receipt_recorded"), 1);
+    assert_eq!(count_kind(&fx.handle, "po.partially_received"), 1);
 
     // Receive the REMAINING bar (6) + all fasteners (4) → fully received.
     let after_full = record_receipt(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "receiver",
@@ -214,11 +230,12 @@ fn full_procurement_journey_approved_vendor() {
     )
     .unwrap();
     assert_eq!(after_full.state, PoState::Received);
-    assert_eq!(count_kind(&fx.db_path, "po.received"), 1);
+    assert_eq!(count_kind(&fx.handle, "po.received"), 1);
 
     // Close.
     let closed = transition_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -228,7 +245,7 @@ fn full_procurement_journey_approved_vendor() {
     )
     .unwrap();
     assert_eq!(closed.state, PoState::Closed);
-    assert_eq!(count_kind(&fx.db_path, "po.closed"), 1);
+    assert_eq!(count_kind(&fx.handle, "po.closed"), 1);
 }
 
 /// AVL gate ([[trust-code-not-operator]]): each status produces the expected
@@ -245,6 +262,7 @@ fn avl_gate_per_status() {
     // Suspended → refused at create; PoBlockedByVendorStatus fires.
     let err = create_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -259,6 +277,7 @@ fn avl_gate_per_status() {
     // Revoked → refused at create.
     let err = create_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -270,7 +289,7 @@ fn avl_gate_per_status() {
         "{err:?}"
     );
     assert_eq!(
-        count_kind(&fx.db_path, "supplier.po_blocked_by_vendor_status"),
+        count_kind(&fx.handle, "supplier.po_blocked_by_vendor_status"),
         2,
         "both suspended + revoked fired the S431 gate kind"
     );
@@ -278,6 +297,7 @@ fn avl_gate_per_status() {
     // Pending → create OK (Draft) but issue refused (needs approval first).
     let pending = create_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -287,6 +307,7 @@ fn avl_gate_per_status() {
     assert_eq!(pending.vendor_avl_status.as_deref(), Some("pending"));
     let err = transition_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -300,6 +321,7 @@ fn avl_gate_per_status() {
     // Conditional → create OK with snapshot, issue OK (flagged yellow in SPA).
     let cond = create_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -309,6 +331,7 @@ fn avl_gate_per_status() {
     assert_eq!(cond.vendor_avl_status.as_deref(), Some("conditional"));
     let issued = transition_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -322,6 +345,7 @@ fn avl_gate_per_status() {
     // Unlisted partner → no AVL row, no friction; snapshot is None.
     let unlisted = create_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -331,6 +355,7 @@ fn avl_gate_per_status() {
     assert_eq!(unlisted.vendor_avl_status, None);
     transition_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -349,6 +374,7 @@ fn failed_inspection_auto_creates_ncr() {
     seed_vendor(&fx, "ptn_approved", "approved");
     let po = create_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -357,6 +383,7 @@ fn failed_inspection_auto_creates_ncr() {
     .unwrap();
     transition_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -372,6 +399,7 @@ fn failed_inspection_auto_creates_ncr() {
     // Receive the bar but FAIL inspection.
     record_receipt(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "receiver",
@@ -389,12 +417,8 @@ fn failed_inspection_auto_creates_ncr() {
     )
     .unwrap();
 
-    assert_eq!(count_kind(&fx.db_path, "po.incoming_inspection_failed"), 1);
-    assert_eq!(
-        count_kind(&fx.db_path, "ncr.created"),
-        1,
-        "auto-NCR created"
-    );
+    assert_eq!(count_kind(&fx.handle, "po.incoming_inspection_failed"), 1);
+    assert_eq!(count_kind(&fx.handle, "ncr.created"), 1, "auto-NCR created");
 
     // The receipt row is linked to the NCR; the NCR is a SupplierIssue.
     let conn = Connection::open(&fx.db_path).unwrap();
@@ -414,6 +438,7 @@ fn heat_lot_required_on_receipt() {
     seed_vendor(&fx, "ptn_approved", "approved");
     let po = create_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -422,6 +447,7 @@ fn heat_lot_required_on_receipt() {
     .unwrap();
     transition_po(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "buyer",
@@ -437,6 +463,7 @@ fn heat_lot_required_on_receipt() {
     // No heat lot on the required line → refused.
     let err = record_receipt(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "receiver",
@@ -458,6 +485,7 @@ fn heat_lot_required_on_receipt() {
     // With a heat lot → accepted.
     record_receipt(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "receiver",
@@ -486,6 +514,7 @@ fn po_numbers_are_sequential_through_create() {
     for _ in 0..3 {
         let po = create_po(
             &fx.db_path,
+            &fx.handle,
             fx.tenant.clone(),
             fx.hash,
             "buyer",

@@ -33,6 +33,9 @@ const T: &str = "qc_gate_test";
 
 struct Fixture {
     db_path: std::path::PathBuf,
+    // ADR-0099 — the shared Handle the inspection + auto-NCR audit appends
+    // route through.
+    handle: aberp_db::HandleArc,
     tenant: TenantId,
     hash: BinaryHash,
 }
@@ -53,9 +56,13 @@ fn setup() -> Fixture {
         aberp_dispatch::ensure_schema(&conn).unwrap();
         aberp::quote_pricing_jobs::ensure_schema(&conn).unwrap();
     }
+    let tenant = TenantId::new(T).unwrap();
+    let handle = aberp::serve::open_tenant_handle(&db_path, tenant.clone())
+        .expect("open shared test Handle");
     Fixture {
         db_path,
-        tenant: TenantId::new(T).unwrap(),
+        handle,
+        tenant,
         hash: BinaryHash::from_bytes([0u8; 32]),
     }
 }
@@ -117,7 +124,12 @@ fn mark_one_unit(conn: &Connection, wo_id: &str) -> String {
 }
 
 fn seed_plan(fx: &Fixture) -> String {
-    let conn = Connection::open(&fx.db_path).unwrap();
+    // ADR-0099 — seed the plan through the SHARED Handle (as production's
+    // handle_create_inspection_plan does via state.db.write()), so
+    // record_manual_inspection's Handle-routed read sees it. A fresh
+    // Connection::open would be a separate DuckDB instance the persistent
+    // Handle does not observe.
+    let conn = fx.handle.write().unwrap();
     create_inspection_plan(
         &conn,
         T,
@@ -164,6 +176,7 @@ fn major_inspection_auto_ncr_blocks_defense_shipment() {
     // 0.015, ratio 1.5× half-width → MAJOR (verdict computed in code).
     let result = record_manual_inspection(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "ervin",
@@ -225,6 +238,7 @@ fn pass_inspection_does_not_block_shipment() {
     let plan_id = seed_plan(&fx);
     let result = record_manual_inspection(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "ervin",
@@ -271,6 +285,7 @@ fn calibration_stale_measurement_spawns_no_ncr() {
     let stale_cal = "2026-06-15T12:00:00Z".to_string();
     let result = record_manual_inspection(
         &fx.db_path,
+        &fx.handle,
         fx.tenant.clone(),
         fx.hash,
         "ervin",

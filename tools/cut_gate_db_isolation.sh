@@ -997,7 +997,12 @@ else
       printf '%s:%s\n' "$f" "$fn"
     done
   done < <(find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/' | sort) | sort -u > "$wf_cur"
-  grep -vE '^#' "$wf_manifest" | sed 's/[[:space:]]*#.*$//;s/[[:space:]]*$//' | grep -vE '^$' | sort -u > "$wf_froz"
+  # `|| true`: the residual set is now EMPTY (ADR-0099 complete). With an
+  # all-comment manifest the `grep -vE '^#'` matches nothing (exit 1) which,
+  # under `set -euo pipefail`, would abort the gate at the SUCCESS state; the
+  # guard keeps ZERO residuals a clean PASS. A regrown fork still trips 10M-b
+  # below (it appears in wf_cur, absent from wf_froz -> wf_grew non-empty).
+  grep -vE '^#' "$wf_manifest" | sed 's/[[:space:]]*#.*$//;s/[[:space:]]*$//' | grep -vE '^$' | sort -u > "$wf_froz" || true
   wf_grew="$(comm -13 "$wf_froz" "$wf_cur")"
   if [[ -n "$wf_grew" ]]; then
     flag10M "✗ a NEW/REGROWN write-fork (independent opener + append) appeared outside the frozen set — route it through the shared aberp_db::Handle (ADR-0099 regression):"
@@ -1009,7 +1014,8 @@ else
     printf '%s\n' "$wf_shrunk" | sed 's/^/      /'
   fi
   if [[ -z "$wf_grew" ]]; then
-    note "✓ frozen write-fork residual holds ($(grep -vcE '^#' "$wf_manifest") sites; in-process serve-handler residuals re-audited ADR-0099 — v0.2.9 migration target, may only shrink)"
+    wf_n="$(grep -vcE '^#' "$wf_manifest" || true)"
+    note "✓ frozen write-fork residual holds (${wf_n:-0} sites; ADR-0099 COMPLETE — every in-process aberp-serve audit write-fork is on the shared Handle; a NEW/REGROWN fork anywhere fails here)"
   fi
   rm -f "$wf_cur" "$wf_froz"
 fi

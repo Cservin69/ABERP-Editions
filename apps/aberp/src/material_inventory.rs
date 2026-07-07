@@ -104,10 +104,9 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{
-    append_in_tx, Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId,
-};
+use aberp_audit_ledger::{append_in_tx, Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
 use aberp_compliance::lot_heat::{validate_mtr_url, LotId};
+use aberp_db::HandleArc;
 
 /// `kg` is the default UoM for material-side balances. The catalogue
 /// quotes cost in `cost_per_kg_eur` + density in `g_cm3`; mass (kg) is
@@ -837,13 +836,27 @@ pub fn assign_heat_lot(
 /// conn is dropped — DuckDB rejects a second writer). Returns the count of
 /// entries appended so a caller / test can assert the MTR branch fired.
 pub fn append_heat_lot_events(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     assignment: &HeatLotAssignment,
 ) -> Result<usize> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record heat-lot assignment")?;
+    // ADR-0099 — route the heat-lot audit appends through the ONE shared
+    // aberp_db::Handle writer instead of an independent Ledger::open on the
+    // live tenant DB. This runs in-process under `aberp serve` (the assign-
+    // heat-lot handler); an independent opener off a stale chain head self-
+    // assigns an already-used seq (the 369→515 fork class) racing a daemon.
+    // Both events land in ONE transaction on the shared instance; the
+    // WriteGuard drop runs the lockstep mirror sync.
+    let mut guard = db
+        .write()
+        .map_err(|e| anyhow::anyhow!("shared writer for heat-lot audit (ADR-0099): {e}"))?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for heat-lot events")?;
+    let tx = guard
+        .transaction()
+        .context("begin DuckDB transaction for heat-lot events")?;
+    let meta = LedgerMeta::new(tenant, binary_hash);
     let operator = assignment.heat_assigned_by_operator.clone();
 
     let assigned_payload = serde_json::json!({
@@ -854,14 +867,15 @@ pub fn append_heat_lot_events(
         "assigned_at": assignment.heat_assigned_at_utc,
         "operator_user_id": operator,
     });
-    ledger
-        .append(
-            EventKind::MaterialHeatLotAssigned,
-            serde_json::to_vec(&assigned_payload).expect("serialize heat-lot payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), &operator),
-            None,
-        )
-        .context("append material.heat_lot_assigned")?;
+    append_in_tx(
+        &tx,
+        &meta,
+        EventKind::MaterialHeatLotAssigned,
+        serde_json::to_vec(&assigned_payload).expect("serialize heat-lot payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), &operator),
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("append material.heat_lot_assigned: {e}"))?;
     let mut appended = 1;
 
     if let Some(mtr) = assignment.mill_test_report_url.as_deref() {
@@ -872,17 +886,20 @@ pub fn append_heat_lot_events(
             "operator_user_id": operator,
             "recorded_at": assignment.heat_assigned_at_utc,
         });
-        ledger
-            .append(
-                EventKind::MaterialMtrUploaded,
-                serde_json::to_vec(&mtr_payload).expect("serialize mtr payload"),
-                Actor::from_local_cli(Ulid::new().to_string(), &operator),
-                None,
-            )
-            .context("append material.mtr_uploaded")?;
+        append_in_tx(
+            &tx,
+            &meta,
+            EventKind::MaterialMtrUploaded,
+            serde_json::to_vec(&mtr_payload).expect("serialize mtr payload"),
+            Actor::from_local_cli(Ulid::new().to_string(), &operator),
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("append material.mtr_uploaded: {e}"))?;
         appended += 1;
     }
 
+    tx.commit()
+        .context("commit DuckDB transaction for heat-lot events")?;
     Ok(appended)
 }
 
@@ -1371,6 +1388,18 @@ mod tests {
         }
         let tenant = TenantId::new("t").unwrap();
         let hash = BinaryHash::from_bytes([0u8; 32]);
+        // ADR-0099 — append through a real shared Handle (checkpoint off);
+        // drop it before the readback so the assertion connection sees the
+        // committed rows via WAL replay.
+        let handle = aberp_db::Handle::open(
+            &db_path,
+            tenant.clone(),
+            aberp_db::HandleConfig {
+                checkpoint_enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         // No MTR → 1 event.
         let a1 = HeatLotAssignment {
@@ -1381,7 +1410,7 @@ mod tests {
             heat_assigned_by_operator: "op".into(),
         };
         assert_eq!(
-            append_heat_lot_events(&db_path, tenant.clone(), hash, &a1).unwrap(),
+            append_heat_lot_events(&handle, tenant.clone(), hash, &a1).unwrap(),
             1
         );
 
@@ -1391,9 +1420,10 @@ mod tests {
             ..a1.clone()
         };
         assert_eq!(
-            append_heat_lot_events(&db_path, tenant, hash, &a2).unwrap(),
+            append_heat_lot_events(&handle, tenant, hash, &a2).unwrap(),
             2
         );
+        drop(handle);
 
         let conn = Connection::open(&db_path).unwrap();
         let assigned: i64 = conn

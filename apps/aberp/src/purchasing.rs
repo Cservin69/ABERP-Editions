@@ -34,8 +34,9 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
 use aberp_compliance::avl::ApprovedStatus;
+use aberp_db::HandleArc;
 
 // ── Closed-vocab state enum ─────────────────────────────────────────
 
@@ -621,6 +622,7 @@ fn resolve_avl(
 /// `supplier.po_blocked_by_vendor_status` kind.
 pub fn create_po(
     db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -688,7 +690,7 @@ pub fn create_po(
                     "attempted_at_utc": now,
                 });
                 append_event(
-                    db_path,
+                    db,
                     tenant.clone(),
                     binary_hash,
                     operator,
@@ -797,7 +799,7 @@ pub fn create_po(
 
     // ── Audit (after the write conn drops — DuckDB single-writer rule).
     append_event(
-        db_path,
+        db,
         tenant.clone(),
         binary_hash,
         operator,
@@ -818,7 +820,7 @@ pub fn create_po(
     )?;
     for l in &lines_persisted {
         append_event(
-            db_path,
+            db,
             tenant.clone(),
             binary_hash,
             operator,
@@ -846,6 +848,7 @@ pub fn create_po(
 /// ([[trust-code-not-operator]]). Fires the matching `po.*` event.
 pub fn transition_po(
     db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -934,7 +937,7 @@ pub fn transition_po(
 
     match to {
         PoState::IssuedToVendor => append_event(
-            db_path,
+            db,
             tenant.clone(),
             binary_hash,
             operator,
@@ -948,7 +951,7 @@ pub fn transition_po(
             }),
         )?,
         PoState::Cancelled => append_event(
-            db_path,
+            db,
             tenant.clone(),
             binary_hash,
             operator,
@@ -962,7 +965,7 @@ pub fn transition_po(
             }),
         )?,
         PoState::Closed => append_event(
-            db_path,
+            db,
             tenant.clone(),
             binary_hash,
             operator,
@@ -1006,6 +1009,7 @@ pub struct NewReceipt {
 /// delivery cannot be received without a quality record).
 pub fn record_receipt(
     db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
@@ -1142,7 +1146,7 @@ pub fn record_receipt(
 
     let any_failed = applied.iter().any(|a| !a.inspection_pass);
     append_event(
-        db_path,
+        db,
         tenant.clone(),
         binary_hash,
         operator,
@@ -1171,6 +1175,7 @@ pub fn record_receipt(
         );
         let ncr = crate::quality::create_ncr(
             db_path,
+            db,
             tenant.clone(),
             binary_hash,
             operator,
@@ -1201,7 +1206,7 @@ pub fn record_receipt(
             .context("link receipt row to NCR")?;
         }
         append_event(
-            db_path,
+            db,
             tenant.clone(),
             binary_hash,
             operator,
@@ -1225,7 +1230,7 @@ pub fn record_receipt(
         _ => EventKind::PoPartiallyReceived,
     };
     append_event(
-        db_path,
+        db,
         tenant.clone(),
         binary_hash,
         operator,
@@ -1260,23 +1265,40 @@ fn reread_po(
 /// Open a fresh `Ledger` (after the read/write conn drops — DuckDB single-writer
 /// rule) and append one purchasing audit entry.
 fn append_event(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator: &str,
     kind: EventKind,
     payload: serde_json::Value,
 ) -> Result<()> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record purchasing event")?;
-    ledger
-        .append(
-            kind,
-            serde_json::to_vec(&payload).expect("serialize purchasing payload"),
-            Actor::from_local_cli(Ulid::new().to_string(), operator),
-            None,
-        )
-        .context("append purchasing audit entry")?;
+    // ADR-0099 — route the purchasing audit append through the ONE shared
+    // aberp_db::Handle writer instead of an independent Ledger::open on the live
+    // tenant DB. The PO CRUD handlers run in-process under `aberp serve`; an
+    // independent opener off a stale chain head self-assigns an already-used seq
+    // (the 369→515 fork class) racing the periodic daemons. Self-contained
+    // (acquire→append→release) so a caller that itself performs several audit
+    // appends never nests the exclusive writer guard.
+    let mut guard = db
+        .write()
+        .map_err(|e| anyhow::anyhow!("shared writer for purchasing audit (ADR-0099): {e}"))?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for purchasing event")?;
+    let tx = guard
+        .transaction()
+        .context("begin DuckDB transaction for purchasing event")?;
+    let meta = LedgerMeta::new(tenant, binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &meta,
+        kind,
+        serde_json::to_vec(&payload).expect("serialize purchasing payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator),
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("append purchasing audit entry: {e}"))?;
+    tx.commit()
+        .context("commit DuckDB transaction for purchasing event")?;
     Ok(())
 }
 
