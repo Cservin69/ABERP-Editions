@@ -32,7 +32,8 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, LedgerMeta, TenantId};
+use aberp_db::HandleArc;
 use aberp_quote_engine::{MachineCapacity, MachineFamily};
 
 /// Default schedulable hours per day for a new machine (brief default).
@@ -383,18 +384,34 @@ pub fn list_enabled_capacities(conn: &Connection, tenant: &str) -> Result<Vec<Ma
 /// the write half stays unit-testable without a ledger, mirroring
 /// `record_numbering_change_audit`.
 pub fn append_machine_event(
-    db_path: &std::path::Path,
+    db: &HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator_login: &str,
     kind: EventKind,
     payload: Vec<u8>,
 ) -> Result<()> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record machine event")?;
+    // ADR-0099 — route the machine-lifecycle audit append through the ONE
+    // shared `aberp_db::Handle` writer (`db.write()`) instead of an
+    // independent `Ledger::open` on the live tenant DB. These wrappers run
+    // in-process under `aberp serve` (the machine / margin / lead-time CRUD
+    // handlers); an independent opener off a stale chain head self-assigns an
+    // already-used seq (the 369→515 fork class) while a daemon writes the same
+    // chain. The serialized writer re-reads the head under its mutex and the
+    // WriteGuard drop runs the lockstep mirror sync (no separate opener).
+    let mut guard = db
+        .write()
+        .map_err(|e| anyhow::anyhow!("shared writer for machine audit event (ADR-0099): {e}"))?;
+    aberp_audit_ledger::ensure_schema(&guard)
+        .context("ensure audit-ledger schema for machine event")?;
+    let tx = guard
+        .transaction()
+        .context("begin DuckDB transaction for machine event")?;
+    let meta = LedgerMeta::new(tenant, binary_hash);
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
-    ledger
-        .append(kind, payload, actor, None)
-        .context("append machine audit entry")?;
+    aberp_audit_ledger::append_in_tx(&tx, &meta, kind, payload, actor, None)
+        .map_err(|e| anyhow::anyhow!("append machine audit entry via shared Handle: {e}"))?;
+    tx.commit()
+        .context("commit DuckDB transaction for machine event")?;
     Ok(())
 }

@@ -32,7 +32,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, TenantId};
+use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId};
+use aberp_db::HandleArc;
 use anyhow::{anyhow, Context, Result};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -841,13 +842,38 @@ pub fn consume_next_tenant_hint() -> Result<Option<String>> {
 
 // ── Per-tenant audit emit ────────────────────────────────────────────
 
-/// Append a `tenant.*` lifecycle event into the ledger at `db_path` for
-/// `tenant`. Opening the ledger by path (not the running connection)
-/// lets the create + switch paths write into a DIFFERENT tenant's chain
-/// than the one the binary booted with — `TenantCreated` lands in the new
-/// tenant's ledger, `TenantSwitched` in the switched-to tenant's, never in
-/// the caller's. Mirrors `avl_vendors::append_vendor_event`.
+/// Routing for a `tenant.*` lifecycle audit append (ADR-0099). Mirrors
+/// [`crate::snapshot::SnapshotAudit`]: the corrected fork model bans ANY
+/// independent audit opener that appends on the LIVE (booted) tenant DB
+/// inside the `aberp serve` process — two such openers off one stale head
+/// self-assign the same seq (the 369→416→428→515 fork). The variant makes
+/// the routing explicit at each call site.
+pub enum TenantAudit<'a> {
+    /// In-process (`aberp serve`) append targeting the BOOTED tenant's own
+    /// DB — routed through the ONE shared [`aberp_db::Handle`]'s serialized
+    /// writer (no independent opener, no stale-head seq collision; the
+    /// WriteGuard drop runs the lockstep mirror sync). Used by the tenant
+    /// admin HTTP handlers (switch / archive-restore / toggle-nav /
+    /// seller-region) which all act on `state.tenant` in `state.db`.
+    Handle(&'a HandleArc),
+    /// A one-shot opener of a DB that has NO shared Handle in this process,
+    /// so it CANNOT fork the serve writer (cf. snapshot `emit_reopen_cli`):
+    ///   • a FOREIGN tenant's DB — `TenantCreated` lands in the NEW tenant's
+    ///     chain, `TenantDemoSeeded` in the demo tenant's — a DIFFERENT file
+    ///     than the booted Handle owns; the shared writer never touches it.
+    ///   • a PRE-Handle boot append — `record_tenant_boot` runs at boot
+    ///     BEFORE `open_tenant_handle` opens the shared instance, single-
+    ///     threaded, with no daemon writer yet.
+    /// Routed to the allow-listed [`emit_tenant_reopen`].
+    Reopen,
+}
+
+/// Append a `tenant.*` lifecycle event, routed per [`TenantAudit`]. The
+/// in-serve booted-DB callers append through the shared [`aberp_db::Handle`];
+/// the foreign-DB / pre-Handle-boot callers reopen (they have no Handle for
+/// that DB and cannot fork the serve writer).
 pub fn emit_tenant_event(
+    audit: &TenantAudit<'_>,
     db_path: &Path,
     tenant: TenantId,
     binary_hash: BinaryHash,
@@ -855,12 +881,56 @@ pub fn emit_tenant_event(
     kind: EventKind,
     payload: Vec<u8>,
 ) -> Result<()> {
-    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
-        .context("open audit ledger to record tenant lifecycle event")?;
     let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    match audit {
+        TenantAudit::Handle(handle) => {
+            // Shared writer: the ONE serialized instance. No independent
+            // opener, no stale-head seq collision. WriteGuard drop runs the
+            // lockstep sync_mirror, so no separate mirror step is needed.
+            let mut conn = handle
+                .write()
+                .map_err(|e| anyhow!("shared writer for tenant lifecycle event: {e}"))?;
+            aberp_audit_ledger::ensure_schema(&conn)
+                .map_err(|e| anyhow!("ensure audit-ledger schema (tenant event): {e}"))?;
+            let tx = conn
+                .transaction()
+                .map_err(|e| anyhow!("begin DuckDB tx (tenant event): {e}"))?;
+            let meta = LedgerMeta::new(tenant, binary_hash);
+            aberp_audit_ledger::append_in_tx(&tx, &meta, kind, payload, actor, None).map_err(
+                |e| anyhow!("append tenant lifecycle audit entry via shared Handle: {e}"),
+            )?;
+            tx.commit()
+                .map_err(|e| anyhow!("commit DuckDB tx (tenant event): {e}"))?;
+            Ok(())
+        }
+        TenantAudit::Reopen => {
+            emit_tenant_reopen(db_path, tenant, binary_hash, actor, kind, payload)
+        }
+    }
+}
+
+/// SANCTIONED RESIDUAL (ADR-0099 gate allow-list: `emit_tenant_reopen`) — a
+/// one-shot ledger opener for a DB that has NO [`aberp_db::Handle`] in this
+/// process. Opening the ledger by path (not the shared running instance) is
+/// exactly what lets the create + demo-seed paths write into a DIFFERENT
+/// tenant's chain than the one the binary booted with, and lets the boot
+/// path append before the shared Handle exists. Neither can fork the serve
+/// writer (that writer never opens these DBs), so this reopen is safe. Kept
+/// a distinct, single-purpose fn so the cut-gate can allow-list it by name
+/// (mirrors snapshot.rs `emit_reopen_cli`).
+fn emit_tenant_reopen(
+    db_path: &Path,
+    tenant: TenantId,
+    binary_hash: BinaryHash,
+    actor: Actor,
+    kind: EventKind,
+    payload: Vec<u8>,
+) -> Result<()> {
+    let mut ledger = Ledger::open(db_path, tenant, binary_hash)
+        .context("open audit ledger to record tenant lifecycle event (reopen)")?;
     ledger
         .append(kind, payload, actor, None)
-        .context("append tenant lifecycle audit entry")?;
+        .context("append tenant lifecycle audit entry (reopen)")?;
     Ok(())
 }
 
@@ -1328,6 +1398,9 @@ created_at = \"2026-06-16T00:00:00Z\"
             creator_login: "op".to_string(),
         };
         emit_tenant_event(
+            // Foreign-tenant DB (the new tenant's own chain) — no shared
+            // Handle owns it, so the sanctioned reopen (as in create).
+            &TenantAudit::Reopen,
             &db_new,
             TenantId::new("acme").unwrap(),
             bh,

@@ -916,6 +916,14 @@ pub struct RestoredMissingBuyer {
 /// posture (built once by the route handler from `AppState` +
 /// keychain).
 pub struct RestoreInputs {
+    /// ADR-0099 — the process-wide shared DuckDB [`aberp_db::Handle`]. The
+    /// wizard's `restored_invoice` INSERT + `InvoiceRestoredFromNav` audit
+    /// append route through this ONE serialized writer, NOT an independent
+    /// `Connection::open` on `db_path` (the seq-369→515 in-process fork class).
+    pub db: aberp_db::HandleArc,
+    /// The booted tenant's DB path. Still needed for the non-audit catalog
+    /// extraction + the already-restored cache load (plain reads/business
+    /// inserts, not the forked audit chain).
     pub db_path: PathBuf,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
@@ -932,7 +940,10 @@ pub struct RestoreInputs {
 /// `test-support` feature on `aberp-nav-transport`, kept out of this
 /// crate's dev-dependencies to mirror S178's posture).
 struct DigestContext<'a> {
-    db_path: &'a Path,
+    /// ADR-0099 — the shared writer the INSERT + audit append route through.
+    /// Owned (a cheap `Arc` clone of `RestoreInputs::db`) so the per-page
+    /// blocking task can hold it across the `'static` `spawn_blocking` closure.
+    db: aberp_db::HandleArc,
     tenant: TenantId,
     binary_hash: BinaryHash,
     operator_login: &'a str,
@@ -1699,7 +1710,7 @@ async fn walk_month(
         // run-level checksum BEFORE `digests` moves into the blocking
         // closure below.
         month_numbers.extend(digests.iter().map(|d| d.invoice_number.clone()));
-        let db_path = inputs.db_path.clone();
+        let db = inputs.db.clone();
         let tenant = inputs.tenant.clone();
         let binary_hash = inputs.binary_hash;
         let operator_login = inputs.operator_login.clone();
@@ -1708,7 +1719,7 @@ async fn walk_month(
         let (cache_returned, page_restored, page_skipped, page_errored, fresh_restored) =
             tokio::task::spawn_blocking(move || {
                 let ctx = DigestContext {
-                    db_path: &db_path,
+                    db,
                     tenant,
                     binary_hash,
                     operator_login: &operator_login,
@@ -2058,18 +2069,23 @@ fn process_digest(
     let actor = Actor::from_local_cli(session_id, ctx.operator_login);
     let ledger_meta = audit_ledger::LedgerMeta::new(ctx.tenant.clone(), ctx.binary_hash);
 
-    let mut conn = Connection::open(ctx.db_path).with_context(|| {
-        format!(
-            "open tenant DuckDB at {} for restored_invoice insert",
-            ctx.db_path.display()
-        )
-    })?;
-    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-        .context("ADR-0098 R3 (finding C): disable implicit close-checkpoint on residual opener")?;
-    ensure_schema(&conn).context("ensure restored_invoice schema (insert)")?;
-    audit_ledger::ensure_schema(&conn).context("ensure audit-ledger schema (restore insert)")?;
+    // ADR-0099 — route the restored_invoice INSERT + its InvoiceRestoredFromNav
+    // audit append through the ONE shared aberp_db::Handle writer (db.write())
+    // instead of an independent Connection::open on the live tenant DB. This
+    // wizard runs in-process under `aberp serve`; an independent opener off a
+    // stale chain head self-assigns an already-used seq (the seq-369→515 fork
+    // class) while a daemon writes the same chain. The serialized writer
+    // re-reads the head under its mutex; both the business row and the audit
+    // entry commit in ONE transaction on the SHARED instance, and the
+    // WriteGuard drop runs the lockstep mirror sync (no separate opener).
+    let mut guard = ctx
+        .db
+        .write()
+        .map_err(|e| anyhow!("shared writer for restored_invoice insert (ADR-0099): {e}"))?;
+    ensure_schema(&guard).context("ensure restored_invoice schema (insert)")?;
+    audit_ledger::ensure_schema(&guard).context("ensure audit-ledger schema (restore insert)")?;
 
-    let tx = conn
+    let tx = guard
         .transaction()
         .context("begin DuckDB transaction (restored_invoice insert)")?;
     tx.execute(
@@ -2117,17 +2133,11 @@ fn process_digest(
     .map_err(|e| anyhow!("audit_ledger::append_in_tx InvoiceRestoredFromNav: {e}"))?;
     tx.commit()
         .context("commit DuckDB transaction (restored_invoice insert)")?;
-    drop(conn);
-
-    let ledger = Ledger::open(ctx.db_path, ctx.tenant.clone(), ctx.binary_hash)
-        .context("open audit ledger to verify chain after restore insert")?;
-    ledger
-        .verify_chain()
-        .context("audit-ledger chain verification failed AFTER restore insert")?;
-    let mirror_path = audit_ledger::mirror_path_for(ctx.db_path);
-    ledger
-        .sync_mirror(&mirror_path)
-        .context("sync audit-ledger mirror file after restore insert")?;
+    // The WriteGuard drop runs the Handle's post-commit hook: the lockstep
+    // sync_mirror on the SHARED instance (coherent with the just-committed txn)
+    // + the debounced durable checkpoint. No separate Ledger::open / verify /
+    // mirror (a second independent opener) is needed or wanted here (ADR-0099).
+    drop(guard);
 
     // S186 — mark this NAV invoice number as already-restored so a
     // subsequent digest in the SAME cycle that re-names it (NAV
@@ -2672,15 +2682,29 @@ mod tests {
         }
     }
 
+    /// ADR-0099 — build a `DigestContext` backed by a REAL shared
+    /// `aberp_db::Handle` on `db_path` (checkpoint disabled to isolate the
+    /// single-writer property from the debounced checkpoint, as the
+    /// aberp-db concurrency repro does). `process_digest` now routes its
+    /// INSERT + audit append through this shared writer; the readback
+    /// assertions open their own connections and see the committed rows via
+    /// WAL replay (the same cross-instance visibility the ADR-0099 regression
+    /// test relies on).
     fn fixture_context<'a>(
-        db_path: &'a Path,
+        db_path: &Path,
         tenant_str: &str,
         operator: &'a str,
         year: i32,
     ) -> DigestContext<'a> {
+        let tenant = TenantId::new(tenant_str.to_string()).unwrap();
+        let cfg = aberp_db::HandleConfig {
+            checkpoint_enabled: false,
+            ..Default::default()
+        };
+        let db = aberp_db::Handle::open(db_path, tenant.clone(), cfg).expect("open test handle");
         DigestContext {
-            db_path,
-            tenant: TenantId::new(tenant_str.to_string()).unwrap(),
+            db,
+            tenant,
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
             operator_login: operator,
             year,

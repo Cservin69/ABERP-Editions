@@ -16,30 +16,52 @@
 # ALLOW-LISTED (never listed here, never a fork): the shared-Handle seams
 # (aberp-db, aberp-snapshot), #[cfg(test)]/open_in_memory, the pre-serve boot
 # openers (run, seed_demo_sample_data, record_upgrade_snapshot_mismatch_audit),
-# the audit-ledger `append_reopen` primitive itself, and snapshot.rs
-# `emit_reopen_cli` (the separate-process CLI reopen — no Handle in that process).
+# the audit-ledger `append_reopen` primitive itself, snapshot.rs `emit_reopen_cli`
+# (the separate-process CLI reopen — no Handle in that process), and
+# tenant_registry.rs `emit_tenant_reopen` (the sanctioned reopen for a DB with NO
+# shared Handle in this process — a FOREIGN tenant's DB, create/demo-seed, or a
+# PRE-Handle boot append; neither can fork the serve writer).
+#
+# MIGRATED this ADR-0099 session (now Handle-bound; DROPPED from this set —
+# CHECK 10M proves they stay zero and can never regrow):
+#   • snapshot.rs daemon+HTTP audit path (the seq-515 racer)              [10M-a]
+#   • the serve.rs request handlers (emit_invoice_local_only, the heat-lot/
+#     part-uid/open-NCR gates, material/part traceability, RestoreFromNavRun,
+#     FirstProdLaunchAcknowledged, NumberingTemplateChanged,
+#     ExtNavPartnerManualLink)                                           [10M-a]
+#   • quoting_machines.rs::append_machine_event — the machine / margin / lead-
+#     time CRUD handlers (12 serve call sites) now route through state.db.
+#   • restore_from_nav_outgoing.rs::process_digest — the restore-from-NAV wizard
+#     (in-serve) now threads the shared Handle through RestoreInputs/DigestContext.
+#   • tenant_registry.rs::emit_tenant_event — the tenant admin handlers (switch /
+#     archive-restore / toggle-nav / seller-region) now route booted-DB appends
+#     through state.db (TenantAudit::Handle); the FOREIGN-DB / pre-Handle-boot
+#     sites use the allow-listed emit_tenant_reopen (TenantAudit::Reopen).
+#
+# ── REMAINING RESIDUALS (v0.2.9 completion target; may only SHRINK) ──────────
 #
 # Categories:
 #  (cli)          = separate-process CLI one-shot (run() subcommand) — no Handle
 #                   in that process; a v0.2.9 cross-process advisory-lock item,
 #                   NOT an in-process fork (ADR-0099 §Deferred).
-#  (in-proc-defer)= reached INSIDE `aberp serve` — a real in-process residual,
-#                   tracked for the v0.2.9 completion (needs the Handle threaded
-#                   through its Ctx / a dual-use audit sink). MUST shrink to zero.
-#
-# The seams MIGRATED this session (snapshot daemon+HTTP, and the serve.rs request
-# handlers: emit_invoice_local_only, the heat-lot/part-uid/open-NCR gates,
-# material/part traceability, RestoreFromNavRun, FirstProdLaunchAcknowledged,
-# NumberingTemplateChanged, ExtNavPartnerManualLink) are NOT listed — CHECK
-# 10M-a proves they stay Handle-bound (zero) and can never regress.
-apps/aberp/src/avl_vendors.rs:append_vendor_event  # (cli)
-apps/aberp/src/email_invoice.rs:record_email_audit_entry  # (cli)
-apps/aberp/src/material_inventory.rs:append_heat_lot_events  # (cli)
-apps/aberp/src/mes_manager.rs:audit  # (cli)
-apps/aberp/src/part_marking.rs:append_mark_events  # (cli)
-apps/aberp/src/purchasing.rs:append_event  # (cli)
-apps/aberp/src/quality.rs:append_event  # (cli)
-apps/aberp/src/quote_calibration.rs:append_calibration_events  # (cli)
-apps/aberp/src/quoting_machines.rs:append_machine_event  # (cli)
-apps/aberp/src/restore_from_nav_outgoing.rs:process_digest  # (in-proc-defer)
-apps/aberp/src/tenant_registry.rs:emit_tenant_event  # (cli)
+#  (in-proc-serve)= reached INSIDE `aberp serve` from an HTTP request handler (or
+#                   a boot scan daemon) — a REAL in-process residual write-fork.
+#                   ⚠ NOT separate-process: an earlier pass mislabelled these
+#                   "(cli)". Re-audited ADR-0099: each is reachable from a serve
+#                   handler that passes state.db_path and opens an independent
+#                   Ledger on the BOOTED tenant DB, so it CAN fork the serve
+#                   writer (operator-paced / boot-once — lower churn than the
+#                   snapshot/quote-intake/backfill daemons that produced the
+#                   observed 369→515 forks, hence staged to v0.2.9). MUST shrink
+#                   to zero: migrate each onto the shared Handle exactly as the
+#                   MIGRATED set above (change the wrapper to take &HandleArc /
+#                   route via db.write()+append_in_tx; the serve caller passes
+#                   state.db). Tracked so 10M-b bars any GROWTH meanwhile.
+apps/aberp/src/avl_vendors.rs:append_vendor_event  # (in-proc-serve) fire_overdue_screening_reminders (boot scan)
+apps/aberp/src/email_invoice.rs:record_email_audit_entry  # (in-proc-serve) send_invoice_email_route (HTTP)
+apps/aberp/src/material_inventory.rs:append_heat_lot_events  # (in-proc-serve) handle_assign_heat_lot (HTTP)
+apps/aberp/src/mes_manager.rs:audit  # (in-proc-serve) handle_create_adapter / adapter CRUD (HTTP)
+apps/aberp/src/part_marking.rs:append_mark_events  # (in-proc-serve) handle_mark_parts (HTTP)
+apps/aberp/src/purchasing.rs:append_event  # (in-proc-serve) handle_create_po (HTTP)
+apps/aberp/src/quality.rs:append_event  # (in-proc-serve) handle_create_ncr (HTTP)
+apps/aberp/src/quote_calibration.rs:append_calibration_events  # (in-proc-serve) handle_transition_work_order (HTTP)

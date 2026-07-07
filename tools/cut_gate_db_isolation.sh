@@ -962,8 +962,13 @@ wf_scan="tools/adr0099_write_fork_scan.awk"
 wf_manifest="tools/adr0099_write_fork_residuals.txt"
 # Allow-list: pre-serve boot openers + the sanctioned separate-process/primitive
 # seams (append_reopen is the audit-ledger reopen primitive; emit_reopen_cli is
-# snapshot.rs's separate-process CLI reopen — no Handle in that process).
-WF_ALLOW="run,seed_demo_sample_data,record_upgrade_snapshot_mismatch_audit,emit_reopen_cli,append_reopen"
+# snapshot.rs's separate-process CLI reopen — no Handle in that process;
+# emit_tenant_reopen is tenant_registry.rs's sanctioned reopen for a DB with NO
+# shared Handle in this process — a FOREIGN tenant's DB (create/demo-seed writes
+# a different file than the booted Handle owns) or a PRE-Handle boot append
+# (record_tenant_boot runs before open_tenant_handle) — neither can fork the
+# serve writer, exactly as emit_reopen_cli).
+WF_ALLOW="run,seed_demo_sample_data,record_upgrade_snapshot_mismatch_audit,emit_reopen_cli,append_reopen,emit_tenant_reopen"
 if [[ ! -f "$wf_scan" || ! -f "$wf_manifest" ]]; then
   flag10M "✗ write-fork scanner or frozen manifest missing: $wf_scan / $wf_manifest"
 else
@@ -1004,7 +1009,7 @@ else
     printf '%s\n' "$wf_shrunk" | sed 's/^/      /'
   fi
   if [[ -z "$wf_grew" ]]; then
-    note "✓ frozen write-fork residual holds ($(grep -vcE '^#' "$wf_manifest") sites; separate-process CLI + 1 deferred in-process daemon — v0.2.9 target, may only shrink)"
+    note "✓ frozen write-fork residual holds ($(grep -vcE '^#' "$wf_manifest") sites; in-process serve-handler residuals re-audited ADR-0099 — v0.2.9 migration target, may only shrink)"
   fi
   rm -f "$wf_cur" "$wf_froz"
 fi
