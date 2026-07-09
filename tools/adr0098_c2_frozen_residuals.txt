@@ -45,7 +45,6 @@
 #   central Ledger::open already carried it). Full Handle migration of the mes/bin
 #   openers remains a v0.2.6 target.
 1 apps/aberp/src/audit_dap_boot.rs
-8 apps/aberp/src/drain_pending_retries.rs
 6 apps/aberp/src/drain_submission_queue.rs
 1 apps/aberp/src/export_invoice_bundle.rs
 4 apps/aberp/src/incoming_invoices.rs
@@ -57,12 +56,12 @@
 10 apps/aberp/src/quality.rs
 1 apps/aberp/src/quote_calibration.rs
 1 apps/aberp/src/quoting_machines.rs
-4 apps/aberp/src/recover_from_nav.rs
+3 apps/aberp/src/recover_from_nav.rs
 4 apps/aberp/src/reports.rs
 4 apps/aberp/src/request_technical_annulment.rs
 1 apps/aberp/src/restore_from_nav_extract.rs
 9 apps/aberp/src/restore_from_nav_outgoing.rs
-9 apps/aberp/src/retry_submission.rs
+8 apps/aberp/src/retry_submission.rs
 30 apps/aberp/src/serve.rs
 1 apps/aberp/src/snapshot.rs
 3 apps/aberp/src/submit_annulment.rs

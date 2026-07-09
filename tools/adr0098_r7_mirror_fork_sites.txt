@@ -13,8 +13,6 @@
 # NOTE: presence here is NOT "safe" — it is the deferred fork-capable surface,
 #   frozen so it cannot expand. The sanctioned post-commit sync_mirror is the
 #   Handle's own WriteGuard drop (crates/aberp-db) — never one of these.
-apps/aberp/src/drain_pending_retries.rs|drive_one_retry
-apps/aberp/src/drain_pending_retries.rs|perform_layer_2_check
 apps/aberp/src/drain_submission_queue.rs|drive_one_invoice
 apps/aberp/src/email_invoice.rs|record_email_audit_entry
 apps/aberp/src/mark_abandoned.rs|run

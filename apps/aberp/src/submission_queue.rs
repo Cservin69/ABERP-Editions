@@ -407,6 +407,17 @@ pub struct PendingRetry {
     /// FIFO ordering across pending retries (oldest stuck invoice
     /// retries first; matches the `pending_from_ledger` posture).
     pub issue_date: OffsetDateTime,
+    /// S381/F1 — the NAV `manageInvoice` envelope operation for this
+    /// invoice (CREATE / STORNO / MODIFY), derived from the audit
+    /// ledger's chain-link entries at classify time (same source as
+    /// [`PendingInvoice::operation`] via [`operation_for_invoice`]). The
+    /// `drain-pending-retries` worker passes this straight onto the
+    /// re-POST envelope. Hard-coding `Create` (the pre-fix shape) would
+    /// re-POST a stuck STORNO / MODIFY as a fresh CREATE — NAV v3.0
+    /// STORNO and MODIFY bodies are byte-identical to a CREATE body, so
+    /// the body cannot recover the operation; the audit ledger is the
+    /// only canonical source.
+    pub operation: InvoiceOperation,
 }
 
 /// Walk the audit ledger once and return every state-2 Pending
@@ -487,6 +498,13 @@ fn classify_pending_retries(entries: &[Entry]) -> Result<Vec<PendingRetry>> {
         }
     }
 
+    // S381/F1 — pre-pass: which invoice_ids are STORNO / MODIFY chain
+    // children, so each PendingRetry carries its NAV envelope operation
+    // (the drain worker re-POSTs a stuck STORNO / MODIFY under the right
+    // operation instead of a fresh CREATE). Same source as
+    // `classify_pending` / `operation_for_invoice`.
+    let (storno_ids, modify_ids) = chain_operation_sets(entries)?;
+
     // Second pass: collect every Attempt's invoice_id (deduplicated),
     // then build PendingRetry rows for those not excluded.
     let mut seen: HashSet<String> = HashSet::new();
@@ -529,11 +547,19 @@ fn classify_pending_retries(entries: &[Entry]) -> Result<Vec<PendingRetry>> {
                 ));
             }
         };
+        let operation = if modify_ids.contains(&payload.invoice_id) {
+            InvoiceOperation::Modify
+        } else if storno_ids.contains(&payload.invoice_id) {
+            InvoiceOperation::Storno
+        } else {
+            InvoiceOperation::Create
+        };
         pending.push(PendingRetry {
             invoice_id: payload.invoice_id,
             idempotency_key,
             nav_xml_path,
             issue_date,
+            operation,
         });
     }
 

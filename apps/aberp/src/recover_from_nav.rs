@@ -125,9 +125,7 @@
 use std::path::Path;
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
-use aberp_billing::{
-    self as billing, BillingStore, DuckDbBillingStore, IdempotencyKey, InvoiceSeries, ReadyInvoice,
-};
+use aberp_billing::{self as billing, IdempotencyKey, ReadyInvoice};
 use aberp_nav_transport::{
     operations::query_invoice_data::{self, QueryInvoiceDataOutcome},
     soap::InvoiceDirection,
@@ -203,7 +201,7 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
     //    uses the billing-row key from load_issued_invoice (already
     //    proven to match per the cross-check).
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
-    let nav_invoice_number_from_check = resolve_recovery_precondition(
+    let (nav_invoice_number_from_check, base_nav_xml_path) = resolve_recovery_precondition(
         &args.db,
         tenant.clone(),
         binary_hash_bytes,
@@ -211,30 +209,37 @@ pub fn run(args: &RecoverFromNavArgs) -> Result<()> {
         &idempotency_key,
     )?;
 
-    // 5. Derive the NAV-facing invoice number from the loaded
-    //    ReadyInvoice. Same canonical NAV-facing invoice number
-    //    shape per ADR-0009 §3 — `"{series_code}/{seq:05}"`.
-    let nav_invoice_number = derive_nav_invoice_number(&args.db, &ready_invoice)?;
+    // 5. Read the NAV-facing invoice number from the invoice's on-disk
+    //    NAV XML `<invoiceNumber>` — the byte-exact string NAV holds on
+    //    file (S184/S190). Re-deriving it from the billing series code +
+    //    sequence silently drifts: the legacy `INV-default` series
+    //    literal is not the number NAV was given (`ABERP/2026/00009`),
+    //    so `queryInvoiceData` would look up an invoice NAV never saw.
+    let nav_invoice_number = nav_query_invoice_number(&base_nav_xml_path)?;
     tracing::info!(
         nav_invoice_number = %nav_invoice_number,
         nav_invoice_number_from_check = %nav_invoice_number_from_check,
         "NAV-facing invoice number constructed for queryInvoiceData"
     );
 
-    // 5a. Defence-in-depth: the NAV-facing invoice number we
-    //     derived from the loaded ReadyInvoice MUST match the one
-    //     the prior InvoiceCheckPerformed entry recorded. Drift
-    //     between the two indicates ledger tampering or a
-    //     billing-row mutation between the prior retry-submission
-    //     and this recovery — both classes of failure CLAUDE.md
-    //     rule 12 names. Loud-fail rather than recover an
+    // 5a. Defence-in-depth: the NAV-facing invoice number we read from
+    //     the on-disk NAV XML MUST match the one the prior
+    //     InvoiceCheckPerformed entry recorded (which the fixed
+    //     retry-submission / drain-pending-retries Layer-2 check now also
+    //     reads off the same on-disk XML — S184/S190). Drift between the
+    //     two indicates ledger tampering, an on-disk XML edit, or a
+    //     recorded check-number written by a pre-fix binary (the legacy
+    //     synthesised `INV-default/...` number) — all classes of failure
+    //     CLAUDE.md rule 12 names. Loud-fail rather than recover an
     //     ambiguous identifier.
     if nav_invoice_number != nav_invoice_number_from_check {
         return Err(anyhow!(
-            "NAV-facing invoice number derived from billing row ('{}') does not match the \
+            "NAV-facing invoice number read from the on-disk NAV XML ('{}') does not match the \
              prior InvoiceCheckPerformed entry's nav_invoice_number ('{}') — the audit \
-             ledger or billing row appears tampered between the prior retry-submission \
-             Layer-2 check and this recover-from-nav run",
+             ledger or on-disk XML appears tampered between the prior retry-submission \
+             Layer-2 check and this recover-from-nav run, or the recorded check number was \
+             written by a pre-fix binary (the legacy synthesised series literal). Re-run \
+             `aberp retry-submission` to record a fresh Layer-2 check off the on-disk XML.",
             nav_invoice_number,
             nav_invoice_number_from_check,
         ));
@@ -370,9 +375,20 @@ fn resolve_recovery_precondition(
     binary_hash: aberp_audit_ledger::BinaryHash,
     invoice_id: &str,
     issuance_idempotency_key: &IdempotencyKey,
-) -> Result<String> {
+) -> Result<(String, std::path::PathBuf)> {
     let ledger = Ledger::open(db_path, tenant, binary_hash)
         .context("open audit ledger to resolve recover-from-nav precondition")?;
+    // S184/S190 — resolve the invoice's on-disk NAV XML path from the
+    // SAME ledger read (no second opener). The NAV-facing invoice number
+    // consumed by `queryInvoiceData` must be read off that XML's
+    // `<invoiceNumber>` (the byte-exact string NAV holds), NOT re-derived
+    // from the billing series code + sequence — the legacy `INV-default`
+    // series literal does not match the number NAV was given.
+    let base_nav_xml_path =
+        crate::issue_storno::find_base_nav_xml_path_for_chain(&ledger, invoice_id).context(
+            "S184/S190 — resolve the invoice's on-disk NAV XML path for recover-from-nav \
+             (the <invoiceNumber> queryInvoiceData looks up NAV by)",
+        )?;
     let stuck = match audit_query::stuck_precondition(&ledger, invoice_id)? {
         StuckOutcome::Stuck(p) => p,
         StuckOutcome::NotStuck(reason) => {
@@ -462,7 +478,7 @@ fn resolve_recovery_precondition(
         },
     };
 
-    Ok(nav_invoice_number_from_check)
+    Ok((nav_invoice_number_from_check, base_nav_xml_path))
 }
 
 /// Most-recent (highest-seq) `InvoiceCheckPerformed` entry for this
@@ -518,35 +534,23 @@ fn load_issued_invoice(
     Ok(pair)
 }
 
-/// Derive the NAV-facing invoice number string
-/// (`"{series_code}/{seq:05}"`) from the loaded `ReadyInvoice`.
-/// Mirror of `retry_submission::derive_nav_invoice_number` and
-/// `observe_receiver_confirmation::load_base_nav_invoice_number` —
-/// same canonical NAV-facing invoice number shape per ADR-0009 §3
-/// and `nav_xml::render_invoice_data`.
-fn derive_nav_invoice_number(db_path: &Path, invoice: &ReadyInvoice) -> Result<String> {
-    let store = DuckDbBillingStore::open(db_path).with_context(|| {
+/// S184/S190 — resolve the NAV-facing invoice number for
+/// `queryInvoiceData`: the byte-exact `<invoiceNumber>` NAV holds on
+/// file, read off the invoice's on-disk NAV XML. NEVER re-synthesised
+/// from the billing series code + sequence — the legacy `INV-default`
+/// series literal is not the number NAV was given (`ABERP/2026/00009`),
+/// so a synthesised number makes `queryInvoiceData` look up an invoice
+/// NAV never saw. Named seam (mirror of
+/// `retry_submission::nav_query_invoice_number`) so the equality pin can
+/// prove it byte-for-byte.
+fn nav_query_invoice_number(invoice_xml_path: &Path) -> Result<String> {
+    crate::nav_xml::read_invoice_number_from_xml(invoice_xml_path).with_context(|| {
         format!(
-            "open billing DuckDB at {} for recover-from-nav series lookup",
-            db_path.display()
+            "read the NAV-facing <invoiceNumber> from the invoice's on-disk NAV XML at {} \
+             for recover-from-nav queryInvoiceData (S184/S190)",
+            invoice_xml_path.display()
         )
-    })?;
-    let series: InvoiceSeries = store
-        .find_series_by_id(invoice.series_id)
-        .context("billing::find_series_by_id (recover-from-nav series lookup)")?
-        .ok_or_else(|| {
-            anyhow!(
-                "invoice {} references series_id {} which is not present in invoice_series — \
-                 tenant DB appears tampered between invoice insertion and recover-from-nav",
-                invoice.id.to_prefixed_string(),
-                invoice.series_id.to_prefixed_string()
-            )
-        })?;
-    Ok(format!(
-        "{}/{:05}",
-        series.code.as_str(),
-        invoice.sequence_number
-    ))
+    })
 }
 
 /// Drive one `queryInvoiceData` call. Mirror of
@@ -676,6 +680,48 @@ fn parse_tax_number_8(raw: &str) -> Result<String> {
 mod tests {
     use super::*;
     use aberp_audit_ledger::{Actor, BinaryHash, Ledger, TenantId};
+
+    /// Per-test unique on-disk path under the system temp root — avoids
+    /// the `tempfile` dev-dep (CLAUDE.md #2).
+    fn unique_temp_xml(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("aberp-recover-{tag}-{pid}-{nanos}-{seq}.xml"))
+    }
+
+    /// EQUALITY PIN (DEFECT 1). The number recover-from-nav passes to
+    /// `queryInvoiceData` MUST equal the on-disk XML `<invoiceNumber>`,
+    /// never the synthesised `"{series.code}/{seq:05}"`
+    /// (`INV-default/00009`) NAV never saw. Pre-fix both the
+    /// queryInvoiceData number AND the drift-check comparator were
+    /// synthesised, so they agreed on a wrong number. RED before the fix,
+    /// GREEN after.
+    #[test]
+    fn query_invoice_data_number_equals_on_disk_xml_number() {
+        let path = unique_temp_xml("eq");
+        std::fs::write(
+            &path,
+            b"<InvoiceData xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/data\">\
+              <invoiceNumber>ABERP/2026/00009</invoiceNumber>\
+              <invoiceIssueDate>2026-07-09</invoiceIssueDate></InvoiceData>",
+        )
+        .unwrap();
+        let placed = nav_query_invoice_number(&path).unwrap();
+        assert_eq!(placed, "ABERP/2026/00009");
+        assert_ne!(
+            placed,
+            format!("{}/{:05}", "INV-default", 9u64),
+            "recover-from-nav's queryInvoiceData number MUST be the on-disk XML number, \
+             not the synthesised series literal (Defect 1)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// `parse_tax_number_8` MUST match every other
     /// `parse_tax_number_8` in the binary per the operator-facing-

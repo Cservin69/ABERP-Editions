@@ -166,9 +166,7 @@
 //!     fact lives in the audit ledger per A5/A6.
 
 use aberp_audit_ledger::{self as audit_ledger, Actor, EventKind, Ledger, LedgerMeta, TenantId};
-use aberp_billing::{
-    self as billing, BillingStore, DuckDbBillingStore, IdempotencyKey, InvoiceSeries, ReadyInvoice,
-};
+use aberp_billing::{self as billing, IdempotencyKey, ReadyInvoice};
 use aberp_nav_transport::{
     operations::{
         manage_invoice,
@@ -274,7 +272,13 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
     //    committed in load_issued_invoice); we open a fresh Ledger
     //    handle which uses its own duckdb::Connection.
     let binary_hash_bytes = binary_hash::compute().context("compute binary hash")?;
-    let stuck = resolve_stuck_or_loud_fail(
+    // S381/F1 — resolve the stuck precondition AND the NAV envelope
+    // operation (CREATE / STORNO / MODIFY) from the SAME ledger read.
+    // NAV v3.0 STORNO and MODIFY bodies are byte-identical to a CREATE
+    // body, so the operation cannot be sniffed from the XML; the audit
+    // ledger's chain-link entry is canonical. Hard-coding `Create` (the
+    // pre-fix shape) would re-POST a stuck STORNO as a fresh CREATE.
+    let (stuck, operation) = resolve_stuck_or_loud_fail(
         &args.db,
         tenant.clone(),
         binary_hash_bytes,
@@ -335,7 +339,18 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
     //     proceeds (Absent), skips re-POST (Exists), or aborts
     //     (Failure per ADR-0033 §"Surfaced conflict 1 Reading A").
     if stuck.stage == StuckStage::Pending {
-        let nav_invoice_number = derive_nav_invoice_number(&args.db, &ready_invoice)?;
+        // S184/S190 — the NAV-facing invoice number MUST be the byte-exact
+        // string NAV holds on file: the `<invoiceNumber>` element of the
+        // on-disk InvoiceData XML the operator points `--invoice-xml` at
+        // (the same bytes about to be re-POSTed). Re-deriving it from the
+        // billing series code + sequence silently drifts — the legacy
+        // `INV-default` series literal is NOT the number in the XML
+        // (`ABERP/2026/00009`), so `queryInvoiceCheck` would ask NAV about
+        // a number it has never seen ⇒ always Absent ⇒ the Layer-2
+        // duplicate guard never fires. Read the authoritative number off
+        // the XML, exactly as `issue_storno` / `issue_modification` (S184)
+        // and `observe_receiver_confirmation` (S190) already do.
+        let nav_invoice_number = nav_query_invoice_number(&args.invoice_xml)?;
         tracing::info!(
             nav_invoice_number = %nav_invoice_number,
             "state-2 retry: performing Layer-2 queryInvoiceCheck per ADR-0033 §1"
@@ -445,12 +460,14 @@ pub fn run(args: &RetrySubmissionArgs) -> Result<()> {
     }
 
     // 6. NAV prepare phase: tokenExchange + build envelope. NO wire
-    //    send yet (PR-19 / ADR-0032 §1).
+    //    send yet (PR-19 / ADR-0032 §1). S381/F1 — the envelope
+    //    operation is the ledger-derived one, not a hard-coded CREATE.
     let prepared = runtime.block_on(prepare_for_attempt_audit(
         nav_endpoint,
         &credentials,
         &tax_number_8,
         &invoice_xml,
+        operation,
     ))?;
     tracing::info!(
         request_bytes = prepared.request_xml.len(),
@@ -615,9 +632,18 @@ fn resolve_stuck_or_loud_fail(
     binary_hash: aberp_audit_ledger::BinaryHash,
     invoice_id: &str,
     issuance_idempotency_key: &IdempotencyKey,
-) -> Result<StuckPrecondition> {
+) -> Result<(StuckPrecondition, InvoiceOperation)> {
     let ledger = Ledger::open(db_path, tenant, binary_hash)
         .context("open audit ledger to resolve retry-submission precondition")?;
+    // S381/F1 — derive the NAV envelope operation from the SAME ledger
+    // read (no second opener). The chain-link entries are the canonical
+    // source; the re-POST must carry the invoice's true operation.
+    let operation = {
+        let entries = ledger
+            .entries()
+            .context("read audit ledger entries to derive NAV operation for retry (S381/F1)")?;
+        submission_queue::operation_for_invoice(&entries, invoice_id)?
+    };
     match audit_query::stuck_precondition(&ledger, invoice_id)? {
         StuckOutcome::Stuck(p) => {
             if p.idempotency_key != *issuance_idempotency_key {
@@ -629,7 +655,7 @@ fn resolve_stuck_or_loud_fail(
                     issuance_idempotency_key.to_canonical_string(),
                 ));
             }
-            Ok(p)
+            Ok((p, operation))
         }
         StuckOutcome::NotStuck(reason) => Err(anyhow!(
             "cannot retry invoice {}: {}",
@@ -648,15 +674,17 @@ struct PreparedSubmission {
 
 /// PR-19 / ADR-0032 §1 + §3: open transport, tokenExchange, build
 /// envelope. Mirror of `submit_invoice::prepare_for_attempt_audit`
-/// per the operator-facing-twin posture. The retry path always uses
-/// `InvoiceOperation::Create` (same as the pre-PR-19 retry-submission
-/// shape) — chain operations (STORNO / MODIFY) are not yet on the
-/// retry surface (separate trigger).
+/// per the operator-facing-twin posture. S381/F1 — the envelope
+/// `operation` is derived from the audit ledger by
+/// `submission_queue::operation_for_invoice` (a stuck STORNO / MODIFY
+/// must re-POST under its own operation; NAV v3.0 bodies are
+/// byte-identical so the body cannot recover it).
 async fn prepare_for_attempt_audit(
     endpoint: NavEndpoint,
     credentials: &NavCredentials,
     tax_number_8: &str,
     invoice_xml: &[u8],
+    operation: InvoiceOperation,
 ) -> Result<PreparedSubmission> {
     let transport = NavTransport::new(endpoint).context("build NAV transport")?;
     let token = token_exchange::call(&transport, credentials, tax_number_8)
@@ -667,7 +695,7 @@ async fn prepare_for_attempt_audit(
         tax_number_8,
         &token.decoded_token,
         &[ManageInvoiceItem {
-            operation: InvoiceOperation::Create,
+            operation,
             invoice_data_xml: invoice_xml,
         }],
     )
@@ -875,42 +903,6 @@ enum Layer2Decision {
     Abort(String),
 }
 
-/// PR-20 / ADR-0033 §1: derive the NAV-facing invoice number
-/// string (`"{series_code}/{seq:05}"`) from the loaded ReadyInvoice.
-/// Mirror of `observe_receiver_confirmation::load_base_nav_invoice_number`
-/// — the same canonical NAV-facing invoice number shape per
-/// ADR-0009 §3 and `nav_xml::render_invoice_data`.
-///
-/// Opens a fresh `DuckDbBillingStore` to consult the
-/// `find_series_by_id` port. The caller already has the `ReadyInvoice`
-/// in hand (loaded by `load_issued_invoice`); the only missing piece
-/// is the series code, which the billing store resolves by ULID.
-fn derive_nav_invoice_number(db_path: &std::path::Path, invoice: &ReadyInvoice) -> Result<String> {
-    let store = DuckDbBillingStore::open(db_path).with_context(|| {
-        format!(
-            "open billing DuckDB at {} for Layer-2 series lookup",
-            db_path.display()
-        )
-    })?;
-    let series: InvoiceSeries = store
-        .find_series_by_id(invoice.series_id)
-        .context("billing::find_series_by_id (retry-submission Layer-2 series lookup)")?
-        .ok_or_else(|| {
-            anyhow!(
-                "invoice {} references series_id {} which is not present in \
-                 invoice_series — tenant DB appears tampered between invoice \
-                 insertion and retry-submission",
-                invoice.id.to_prefixed_string(),
-                invoice.series_id.to_prefixed_string()
-            )
-        })?;
-    Ok(format!(
-        "{}/{:05}",
-        series.code.as_str(),
-        invoice.sequence_number
-    ))
-}
-
 /// PR-20 / ADR-0033 §1: perform Phase 0 — the Layer-2
 /// `queryInvoiceCheck` disambiguation step. Drives the NAV wire
 /// call, writes the `InvoiceCheckPerformed` audit entry in TX0,
@@ -1066,6 +1058,26 @@ fn write_check_performed_audit(
     Ok(())
 }
 
+/// S184/S190 — resolve the NAV-facing invoice number for the Layer-2
+/// `queryInvoiceCheck`: the byte-exact `<invoiceNumber>` NAV holds on
+/// file, read off the invoice's on-disk InvoiceData XML (the same bytes
+/// re-POSTed). It must NEVER be re-synthesised from the billing series
+/// code + sequence — the legacy `INV-default` series literal is not the
+/// number NAV was given (`ABERP/2026/00009`), so a synthesised number
+/// makes `queryInvoiceCheck` ask NAV about a number it never saw ⇒
+/// always Absent ⇒ the Layer-2 duplicate guard never fires. This is the
+/// single decision the live prod incident turned on; it is a named seam
+/// so the equality pin below can prove it byte-for-byte.
+fn nav_query_invoice_number(invoice_xml_path: &std::path::Path) -> Result<String> {
+    crate::nav_xml::read_invoice_number_from_xml(invoice_xml_path).with_context(|| {
+        format!(
+            "read the NAV-facing <invoiceNumber> from the on-disk InvoiceData XML at {} \
+             for the Layer-2 queryInvoiceCheck (S184/S190)",
+            invoice_xml_path.display()
+        )
+    })
+}
+
 /// 8-digit base of a Hungarian tax number. Mirror of
 /// `submit_invoice::parse_tax_number_8` — same loud-fail shape.
 /// Duplicated for the same operator-facing-twin reason `poll_ack`
@@ -1084,6 +1096,65 @@ fn parse_tax_number_8(raw: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Per-test unique on-disk path under the system temp root — avoids
+    /// the `tempfile` dev-dep (CLAUDE.md #2); mirrors
+    /// `submit_invoice::tests::unique_temp_db`.
+    fn unique_temp_xml(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("aberp-retry-{tag}-{pid}-{nanos}-{seq}.xml"))
+    }
+
+    /// EQUALITY PIN (the test that would have caught DEFECT 1). The
+    /// NAV-facing number the state-2 retry places into
+    /// `<invoiceNumberQuery><invoiceNumber>` MUST equal the
+    /// `<invoiceNumber>` on the invoice's on-disk NAV XML — NOT a number
+    /// synthesised from the billing series code + sequence. Pre-fix the
+    /// orchestration derived `"{series.code}/{seq:05}"` where
+    /// `series.code` is the legacy literal `INV-default`, so it asked NAV
+    /// about `INV-default/00009` while the XML (and NAV) held
+    /// `ABERP/2026/00009` ⇒ always Absent ⇒ the Layer-2 duplicate guard
+    /// never fired (the live prod incident). RED before the fix (the
+    /// synthesised string is returned), GREEN after (the XML string is).
+    #[test]
+    fn layer2_query_number_equals_on_disk_xml_number() {
+        let path = unique_temp_xml("eq");
+        // Minimal NAV InvoiceData XML — the real number NAV holds is
+        // deliberately NOT the `INV-default/NNNNN` synthesised shape.
+        std::fs::write(
+            &path,
+            b"<InvoiceData xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/data\">\
+              <invoiceNumber>ABERP/2026/00009</invoiceNumber>\
+              <invoiceIssueDate>2026-07-09</invoiceIssueDate></InvoiceData>",
+        )
+        .unwrap();
+
+        // The EXACT resolution the orchestration performs for the query.
+        let placed = nav_query_invoice_number(&path).unwrap();
+        assert_eq!(
+            placed, "ABERP/2026/00009",
+            "the Layer-2 query number must be the on-disk XML <invoiceNumber>"
+        );
+
+        // The pre-fix synthesised shape (series.code = INV-default,
+        // seq = 9) — prove the fix does NOT produce it.
+        let legacy_synthesised = format!("{}/{:05}", "INV-default", 9u64);
+        assert_eq!(legacy_synthesised, "INV-default/00009");
+        assert_ne!(
+            placed, legacy_synthesised,
+            "the query number MUST NOT be re-synthesised from the billing series literal \
+             (that is the Defect-1 bug: NAV never saw INV-default/00009)"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn reason_must_be_non_empty() {
