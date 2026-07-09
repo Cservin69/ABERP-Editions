@@ -170,7 +170,7 @@ impl QuoteIntakeTransport {
     }
 
     fn bearer_header_value(&self) -> Result<reqwest::header::HeaderValue, QuoteIntakeError> {
-        let value = format!("Bearer {}", &*self.bearer_token);
+        let value = format!("Bearer {}", *self.bearer_token);
         let mut hv = reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
             QuoteIntakeError::Config(
                 "ABERP_QUOTE_INTAKE_TOKEN contains chars invalid for an HTTP header".to_string(),

@@ -500,7 +500,7 @@ impl CataloguePushService {
         let count = rows.len() as i64;
         let body = CatalogueBody { materials: rows };
         let url = format!("{}{CATALOGUE_PATH}", credential.base_url);
-        let auth = format!("Bearer {}", &*credential.bearer);
+        let auth = format!("Bearer {}", *credential.bearer);
 
         // S339 / PR-24 — satisfy the storefront's CloudFront→origin
         // shared-secret gate when provisioned. Additive: a `None`

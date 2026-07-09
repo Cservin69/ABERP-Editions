@@ -2016,7 +2016,7 @@ impl PricingPipelineService {
     }
 
     fn bearer_header(&self) -> Result<reqwest::header::HeaderValue> {
-        let s = format!("Bearer {}", &*self.config.bearer_token);
+        let s = format!("Bearer {}", *self.config.bearer_token);
         let mut hv = reqwest::header::HeaderValue::from_str(&s)
             .context("invalid bearer header (control chars)")?;
         hv.set_sensitive(true);

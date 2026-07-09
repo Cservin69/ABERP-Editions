@@ -14401,7 +14401,7 @@ async fn handle_test_catalogue_push(headers: HeaderMap, State(state): State<AppS
     let count = rows.len() as i64;
     let body = serde_json::json!({ "materials": rows });
     let url = format!("{}/api/catalogue/materials", credential.base_url);
-    let auth = format!("Bearer {}", &*credential.bearer);
+    let auth = format!("Bearer {}", *credential.bearer);
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
