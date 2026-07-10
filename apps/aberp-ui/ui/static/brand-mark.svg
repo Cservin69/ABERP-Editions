@@ -2,7 +2,7 @@
   <!-- Áben mark — full variant: the geometric A with the signature swoosh
        sweeping up and beyond the letterform to the upper right. Built from
        vector primitives (not an autotrace) so it stays crisp at any size.
-       Gold gradient hexes mirror --color-brand-gold-* in lib/tokens.css. -->
+       Gold gradient hexes mirror the color-brand-gold-* tokens in lib/tokens.css. -->
   <defs>
     <linearGradient id="abenGold" x1="0" y1="0" x2="0.35" y2="1">
       <stop offset="0" stop-color="#F6E7B4"/>

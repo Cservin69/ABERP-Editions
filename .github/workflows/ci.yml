@@ -77,6 +77,20 @@ jobs:
       - name: Cut-gate negative probes (prove the gate has teeth)
         run: bash tools/cut_gate_negative_probes.sh
 
+      # ── Asset hygiene: strict-parse every tracked SVG (toolchain-free) ──
+      # PROD_Defense_v0.2.10 shipped two SVGs with a literal "--" inside an XML
+      # comment (XML 1.0 §2.5 forbids it) — latent because browsers are lenient,
+      # but strict parsers (expat, rsvg-convert, resvg) refuse. This lint globs
+      # `git ls-files '*.svg'` so ANY new SVG anywhere is covered, and its
+      # negative probe proves the lint still goes red. Runs before the ~8-min
+      # build so a malformed asset fails in seconds. Uses the runner's system
+      # python3 (present before setup-python).
+      - name: SVG well-formedness lint (all tracked *.svg)
+        run: bash tools/lint_svg_wellformed.sh
+
+      - name: SVG lint negative probe (prove the lint has teeth)
+        run: bash tools/lint_svg_negative_probe.sh
+
       - name: Install Tauri system dependencies (Linux)
         # apps/aberp-ui pulls in the Tauri 2 runtime (`wry`, `tao`,
         # `webkit2gtk-sys`, …). On Ubuntu those invoke pkg-config against
