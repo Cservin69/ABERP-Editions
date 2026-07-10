@@ -333,7 +333,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -347,7 +347,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-base);
     color: var(--color-text-muted);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -363,7 +363,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-muted);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     line-height: 1.5;
   }
@@ -374,7 +374,7 @@
     padding: var(--space-3);
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-signal-negative);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-primary);
   }
   .erq-page__error strong {
@@ -384,7 +384,7 @@
     padding: var(--space-3);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-muted);
     text-align: center;
     line-height: 1.6;
@@ -392,7 +392,7 @@
   .erq-page__table-wrap {
     overflow-x: auto;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
   }
   .erq-table {
@@ -442,7 +442,7 @@
   .erq-chip {
     display: inline-block;
     padding: 0 var(--space-2);
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-xs);
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -471,7 +471,7 @@
     flex-direction: column;
     gap: var(--space-2);
     padding: var(--space-3);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
   }
@@ -522,7 +522,7 @@
     margin: 0;
     padding: var(--space-2);
     background: var(--color-surface-sunken);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-primary);
     font-size: var(--type-size-sm);
   }

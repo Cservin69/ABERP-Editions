@@ -188,7 +188,7 @@
     background: var(--color-surface-2, #374151);
     color: var(--color-text, #e5e7eb);
     border: 1px solid var(--color-border, #4b5563);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: 0.4rem 0.8rem;
     cursor: pointer;
     white-space: nowrap;
@@ -227,7 +227,7 @@
   .family-card {
     background: var(--color-surface, #1f2937);
     border: 1px solid var(--color-border, #374151);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 0.9rem;
   }
   .family-head {
@@ -249,7 +249,7 @@
     font-size: 0.75rem;
     font-weight: 600;
     padding: 0.1rem 0.45rem;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     border: 1px solid transparent;
   }
   .chip-neutral {
@@ -300,7 +300,7 @@
     display: inline-block;
     width: 9px;
     height: 9px;
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     margin-right: 2px;
     vertical-align: middle;
   }

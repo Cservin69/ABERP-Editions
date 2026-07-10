@@ -719,7 +719,7 @@
   .stats__basis {
     display: inline-flex;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     overflow: hidden;
   }
   .stats__basis-btn {
@@ -751,7 +751,7 @@
     background: var(--color-surface-raised);
     color: var(--color-text-primary);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-2);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
@@ -781,7 +781,7 @@
   }
   .stats__card {
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-3);
     display: flex;
     flex-direction: column;
@@ -872,7 +872,7 @@
   .stats__annual,
   .stats__top article {
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-3);
     background: var(--color-surface-raised);
   }
@@ -966,7 +966,7 @@
     flex: 0 0 auto;
     width: 7px;
     height: 7px;
-    border-radius: 50%;
+    border-radius: var(--radius-full);
     background: var(--color-signal-positive);
     opacity: 0.45;
     transform: translateY(-1px);
@@ -1052,7 +1052,7 @@
   }
   .stats__error {
     border: 1px solid var(--color-signal-negative);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-3);
     background: var(--color-surface-sunken);
     color: var(--color-text-primary);
@@ -1067,7 +1067,7 @@
     background: var(--color-surface-raised);
     color: var(--color-text-primary);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-2);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
@@ -1082,7 +1082,7 @@
     padding: var(--space-3);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
   .stats__custom label {
     display: inline-flex;
@@ -1095,7 +1095,7 @@
     background: var(--color-surface-sunken);
     color: var(--color-text-primary);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-2);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
@@ -1104,7 +1104,7 @@
     background: var(--color-surface-sunken);
     color: var(--color-text-strong);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-3);
     cursor: pointer;
     font-size: var(--type-size-sm);
@@ -1121,7 +1121,7 @@
   /* Currency split — stacked bar + legend. */
   .stats__split {
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-3);
     background: var(--color-surface-raised);
   }
@@ -1135,7 +1135,7 @@
     display: flex;
     width: 100%;
     height: 18px;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     overflow: hidden;
     background: var(--color-surface-sunken);
   }
@@ -1171,7 +1171,7 @@
     display: inline-block;
     width: 9px;
     height: 9px;
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     margin-right: var(--space-1);
   }
   .split-dot--huf {
@@ -1189,7 +1189,7 @@
   }
   .stats__aging {
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-3);
     background: var(--color-surface-raised);
   }

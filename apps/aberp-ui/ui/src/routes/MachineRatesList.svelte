@@ -191,7 +191,7 @@
     background: var(--color-signal-positive, var(--color-text-strong));
     color: var(--color-surface-base, white);
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     font-weight: 500;
     cursor: pointer;

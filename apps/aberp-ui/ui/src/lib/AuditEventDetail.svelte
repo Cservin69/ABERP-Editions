@@ -312,7 +312,7 @@
     background: var(--color-surface, #1f2937);
     color: var(--color-text, #e5e7eb);
     border: 1px solid var(--color-border, #374151);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     width: min(900px, 100%);
     max-height: 90vh;
     overflow: auto;
@@ -370,7 +370,7 @@
   }
   .aud-hash {
     border: 1px solid var(--color-border, #374151);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: 10px 12px;
     margin-bottom: 16px;
   }
@@ -421,7 +421,7 @@
   .aud-payload__json {
     background: var(--color-surface-2, #111827);
     border: 1px solid var(--color-border, #374151);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: 10px 12px;
     font-size: 12px;
     overflow: auto;
@@ -439,7 +439,7 @@
   }
   .aud-checklist {
     border: 1px solid var(--color-border, #374151);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: 10px 12px;
     margin-bottom: 10px;
   }
@@ -480,7 +480,7 @@
     background: var(--color-surface, #1f2937);
     color: var(--color-text, #e5e7eb);
     border: 1px solid var(--color-border, #374151);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 20px;
     max-width: 460px;
     width: calc(100% - 32px);

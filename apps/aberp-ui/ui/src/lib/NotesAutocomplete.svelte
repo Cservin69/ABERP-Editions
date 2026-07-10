@@ -243,7 +243,7 @@
     padding: 0;
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     max-height: 280px;
     overflow-y: auto;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);

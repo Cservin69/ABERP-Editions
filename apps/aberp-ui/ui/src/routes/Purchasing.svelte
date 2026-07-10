@@ -750,7 +750,7 @@
     background: var(--color-signal-positive, var(--color-text-strong));
     color: var(--color-surface-base, white);
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     font-weight: 500;
     cursor: pointer;
@@ -826,7 +826,7 @@
     background: var(--color-surface-raised);
     color: var(--color-text-strong);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-2);
   }
   .num {
@@ -836,7 +836,7 @@
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-3);
     cursor: pointer;
   }
@@ -850,7 +850,7 @@
   .chip {
     display: inline-block;
     padding: 0.1rem 0.5rem;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-size: var(--type-size-xs, 0.75rem);
     border: 1px solid var(--color-surface-divider);
   }
@@ -874,7 +874,7 @@
     padding: var(--space-4);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
@@ -910,7 +910,7 @@
     background: var(--color-surface-base, var(--color-surface-raised));
     color: var(--color-text-strong);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-2);
   }
   .lines {
@@ -928,7 +928,7 @@
     background: var(--color-surface-base, var(--color-surface-raised));
     color: var(--color-text-strong);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-2);
   }
   .product-dd {
@@ -941,7 +941,7 @@
     list-style: none;
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     max-height: 12rem;
     overflow-y: auto;
   }
@@ -973,7 +973,7 @@
     padding: var(--space-4);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
   }
   .detail__head {
     display: flex;
@@ -1023,7 +1023,7 @@
     background: var(--color-surface-base, var(--color-surface-raised));
     color: var(--color-text-strong);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-2);
   }
   .confirm__error {
@@ -1052,7 +1052,7 @@
   .modal {
     background: var(--color-surface-base, var(--color-surface-raised));
     border: 1px solid var(--color-surface-divider);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: var(--space-4);
     max-width: 900px;
     width: 90%;
@@ -1071,7 +1071,7 @@
     background: var(--color-surface-raised);
     color: var(--color-text-strong);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-2);
   }
 </style>

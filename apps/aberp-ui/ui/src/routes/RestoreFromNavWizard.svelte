@@ -485,7 +485,7 @@
     padding: var(--space-3);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
   }
   .wizard__warning h3 {
     margin: 0 0 var(--space-2) 0;
@@ -527,7 +527,7 @@
   .wizard__field input {
     padding: var(--space-2);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-md);
   }
@@ -550,7 +550,7 @@
     background: var(--color-text-strong);
     color: var(--color-surface-raised);
     border: none;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
     text-transform: uppercase;
@@ -566,7 +566,7 @@
     padding: var(--space-3);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-signal-negative);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     color: var(--color-signal-negative);
   }
   .wizard__error pre {
@@ -579,7 +579,7 @@
     padding: var(--space-3);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-signal-positive);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
   .wizard__result h3 {
     margin: 0 0 var(--space-2) 0;
@@ -630,7 +630,7 @@
     padding: var(--space-3);
     background: var(--color-surface-raised);
     border: 2px solid var(--color-signal-negative);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
   }
   .wizard__lock h3 {
     margin: 0 0 var(--space-2) 0;
@@ -659,7 +659,7 @@
     background: var(--color-text-strong);
     color: var(--color-surface-raised);
     border: none;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
     text-transform: uppercase;
@@ -690,7 +690,7 @@
     padding: var(--space-3);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
   .wizard__preview h3 {
     margin: 0 0 var(--space-2) 0;
@@ -738,7 +738,7 @@
     margin: var(--space-3) 0;
     padding: var(--space-3);
     border: 1px solid var(--color-signal-negative);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
   .wizard__gaps h4 {
     margin: 0 0 var(--space-2) 0;

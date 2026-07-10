@@ -667,7 +667,7 @@
   .pricing-jobs__err {
     padding: 12px;
     border: 1px solid var(--color-border, #374151);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     background: var(--color-surface, #1f2937);
   }
   .pricing-jobs__err {
@@ -679,7 +679,7 @@
   .pricing-jobs__warn {
     padding: 12px;
     border: 1px solid var(--color-warn, #f59e0b);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     background: var(--color-surface, #1f2937);
     color: var(--color-warn, #f59e0b);
   }
@@ -722,7 +722,7 @@
     background: var(--color-surface, #1f2937);
     color: var(--color-text, #e5e7eb);
     border: 1px solid var(--color-border, #374151);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: 6px 10px;
     font-size: 13px;
   }
@@ -737,7 +737,7 @@
   }
   .pricing-jobs__chip-btn {
     padding: 5px 12px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-size: 12px;
     font-weight: 500;
     cursor: pointer;
@@ -836,7 +836,7 @@
   .chip {
     display: inline-block;
     padding: 2px 8px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-size: 12px;
     font-weight: 500;
     background: #374151;
@@ -882,7 +882,7 @@
     background: var(--color-surface, #1f2937);
     color: var(--color-text, #e5e7eb);
     border: 1px solid var(--color-border, #374151);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 20px;
     max-width: 460px;
     width: calc(100% - 32px);

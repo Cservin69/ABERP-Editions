@@ -650,7 +650,7 @@
     color: var(--color-text-strong);
     background: var(--color-surface-raised);
     padding: 0 4px;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
   }
 
   .page__toolbar {
@@ -672,7 +672,7 @@
     color: var(--color-text-strong);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
 
   .page__muted {
@@ -697,7 +697,7 @@
     background: var(--color-signal-positive, var(--color-text-strong));
     color: var(--color-surface-base, white);
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     font-weight: 500;
     cursor: pointer;
@@ -854,7 +854,7 @@
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
     cursor: pointer;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
 
   .quiet-button:hover:not(:disabled) {
@@ -869,7 +869,7 @@
   .unit-chip {
     display: inline-block;
     padding: 0 var(--space-2);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-strong);
@@ -891,7 +891,7 @@
     display: inline-block;
     margin-left: var(--space-2);
     padding: 0 var(--space-2);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     font-size: var(--type-size-xs);
     font-weight: 600;
   }
@@ -962,7 +962,7 @@
     display: inline-block;
     padding: 0 var(--space-1);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
     font-family: var(--type-family-mono);

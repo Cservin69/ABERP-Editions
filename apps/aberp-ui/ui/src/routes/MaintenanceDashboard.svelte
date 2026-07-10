@@ -534,7 +534,7 @@
     padding: var(--space-4);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     color: var(--color-text-primary);
     text-decoration: none;
     transition: border-color 0.12s ease, transform 0.12s ease;
@@ -585,7 +585,7 @@
   .tile__status-dot {
     width: 6px;
     height: 6px;
-    border-radius: 50%;
+    border-radius: var(--radius-full);
     background: var(--color-signal-muted);
   }
 
@@ -612,7 +612,7 @@
     background: transparent;
     border: 1px solid var(--color-surface-divider);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-xs);
     text-transform: uppercase;

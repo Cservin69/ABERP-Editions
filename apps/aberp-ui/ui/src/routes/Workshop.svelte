@@ -1042,7 +1042,7 @@
     padding: var(--space-1) var(--space-3);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
 
@@ -1070,7 +1070,7 @@
     right: 0;
     width: 6px;
     height: 6px;
-    border-radius: 50%;
+    border-radius: var(--radius-full);
     background: var(--color-signal-positive);
     opacity: 0.3;
     pointer-events: none;
@@ -1108,7 +1108,7 @@
   .ws-tile {
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: var(--space-3);
     display: flex;
     flex-direction: column;
@@ -1216,7 +1216,7 @@
   .ws-stat {
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-2);
     display: flex;
     flex-direction: column;
@@ -1267,7 +1267,7 @@
   .ws-bignum {
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-3);
     color: inherit;
     text-align: left;
@@ -1326,7 +1326,7 @@
     gap: var(--space-2);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-2);
     font-size: var(--type-size-xs);
     min-width: 0;
@@ -1396,7 +1396,7 @@
   .ws-row__chip {
     font-size: var(--type-size-xs);
     padding: 0 var(--space-2);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-base);
     color: var(--color-text-secondary);
@@ -1460,7 +1460,7 @@
     gap: var(--space-2);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-2);
   }
 
@@ -1528,7 +1528,7 @@
   .ws-dot {
     width: 10px;
     height: 10px;
-    border-radius: 50%;
+    border-radius: var(--radius-full);
     flex: 0 0 auto;
     background: var(--color-text-muted);
   }
@@ -1552,7 +1552,7 @@
   .ws-pill {
     font-size: var(--type-size-xs);
     padding: 2px var(--space-2);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-base);
   }
@@ -1639,7 +1639,7 @@
     content: "";
     position: absolute;
     inset: -2px;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     pointer-events: none;
     border: 1px solid var(--color-signal-positive);
     box-shadow: 0 0 12px var(--color-signal-positive);

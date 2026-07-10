@@ -632,7 +632,7 @@
     background: var(--color-signal-positive, var(--color-text-strong));
     color: var(--color-surface-base, white);
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     font-weight: 500;
     cursor: pointer;
@@ -725,7 +725,7 @@
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
     cursor: pointer;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
   .quiet-button:hover {
     color: var(--color-text-strong);
@@ -744,7 +744,7 @@
   .chip {
     display: inline-block;
     padding: 0 var(--space-2);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     border: 1px solid var(--color-surface-divider);
     font-size: var(--type-size-xs);
     font-weight: 500;
@@ -770,7 +770,7 @@
     padding: var(--space-3);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     display: flex;
     flex-direction: column;
     gap: var(--space-3);
@@ -807,7 +807,7 @@
     padding: var(--space-2);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
   /* Detail panel */
   .detail {
@@ -816,7 +816,7 @@
     padding: var(--space-4);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
   .detail__head {
     display: flex;
@@ -871,7 +871,7 @@
     padding: var(--space-2);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
   .timeline {
     margin: 0;
@@ -885,7 +885,7 @@
   .capa {
     padding: var(--space-3);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     margin-bottom: var(--space-2);
   }
   .capa__head {

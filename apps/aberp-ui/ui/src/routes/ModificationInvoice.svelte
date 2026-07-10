@@ -893,7 +893,7 @@
     padding: var(--space-1) var(--space-2);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: var(--radius-sm, 3px);
+    border-radius: var(--radius-sm);
     color: var(--color-text-strong);
     font-size: var(--type-size-sm);
   }
@@ -904,6 +904,6 @@
     padding: var(--space-1) var(--space-2);
     background: var(--color-surface-raised);
     border: 1px dashed var(--color-surface-divider);
-    border-radius: var(--radius-sm, 3px);
+    border-radius: var(--radius-sm);
   }
 </style>

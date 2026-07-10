@@ -1766,7 +1766,7 @@
     line-height: 1.6;
     letter-spacing: 0.04em;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-secondary);
     cursor: pointer;
@@ -1868,7 +1868,7 @@
     margin-right: var(--space-1);
     padding: 0;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-secondary);
     font-family: var(--type-family-body);
@@ -1952,7 +1952,7 @@
     line-height: 1.6;
     letter-spacing: 0.04em;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-secondary);
     cursor: help;
@@ -2057,7 +2057,7 @@
   .extnav-partner-link:focus-visible {
     outline: 2px solid var(--color-accent, #4a90e2);
     outline-offset: 2px;
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
   }
   .extnav-partner-link-empty {
     text-decoration: underline dotted;
@@ -2183,7 +2183,7 @@
     display: inline-block;
     padding: 0 var(--space-1);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
     font-family: var(--type-family-mono);
@@ -2212,7 +2212,7 @@
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-surface-divider);
     border-left: 3px solid var(--color-signal-warning);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-secondary);
     font-size: var(--type-size-sm);
   }

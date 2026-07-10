@@ -459,7 +459,7 @@
     padding: var(--space-1) var(--space-3);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
 
@@ -476,7 +476,7 @@
   .dsp-eligible {
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-3);
   }
 
@@ -499,7 +499,7 @@
   .dsp-eligible li {
     background: var(--color-surface-raised);
     padding: var(--space-2);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     border: 1px solid var(--color-surface-divider);
   }
 
@@ -539,7 +539,7 @@
     padding: var(--space-1) var(--space-3);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
 
@@ -597,7 +597,7 @@
   .dsp-chip {
     display: inline-block;
     padding: 2px var(--space-2);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-xs);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
@@ -646,7 +646,7 @@
     padding: var(--space-1) var(--space-2);
     font-family: var(--type-family-body);
     font-size: var(--type-size-xs);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
 
@@ -682,7 +682,7 @@
     border: 1px dashed var(--color-surface-divider);
     background: var(--color-surface-raised);
     text-align: center;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
   }
 
@@ -702,7 +702,7 @@
     color: var(--color-text-primary);
     border: 1px solid var(--color-surface-divider);
     padding: var(--space-4) var(--space-5);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     max-width: 500px;
     width: 90%;
     animation: aberp-fade-in var(--motion-fade-in) both;
@@ -740,7 +740,7 @@
     width: 100%;
     padding: var(--space-2) var(--space-3);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-strong);
     font-family: var(--type-family-body);
@@ -764,7 +764,7 @@
     color: var(--color-text-secondary);
     border: 1px solid var(--color-surface-divider);
     padding: var(--space-2) var(--space-4);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
     cursor: pointer;

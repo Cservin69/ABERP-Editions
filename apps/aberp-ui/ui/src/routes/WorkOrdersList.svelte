@@ -724,7 +724,7 @@
     padding: var(--space-1) var(--space-3);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
 
@@ -747,7 +747,7 @@
     padding: var(--space-1) var(--space-3);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
 
@@ -804,7 +804,7 @@
     padding: var(--space-1) var(--space-2);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
 
@@ -823,7 +823,7 @@
     border: 1px dashed var(--color-surface-divider);
     background: var(--color-surface-raised);
     text-align: center;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
 
   /* Detail aside — sits below the list. */
@@ -833,7 +833,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-primary);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
 
   .wo-detail header {
@@ -858,7 +858,7 @@
     padding: var(--space-1) var(--space-3);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
 
@@ -897,7 +897,7 @@
     padding: var(--space-1) var(--space-4);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
 
@@ -920,7 +920,7 @@
     margin: var(--space-3) 0;
     padding: var(--space-3);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-raised);
   }
 
@@ -939,7 +939,7 @@
     letter-spacing: 0.04em;
     color: var(--color-signal-positive);
     border: 1px solid var(--color-signal-positive);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: 0 var(--space-1);
   }
 
@@ -962,7 +962,7 @@
     font-family: var(--type-family-mono);
     font-size: var(--type-size-xs);
     padding: 0 var(--space-2);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     color: var(--color-signal-positive);
     background: color-mix(in srgb, var(--color-signal-positive) 12%, transparent);
     border: 1px solid color-mix(in srgb, var(--color-signal-positive) 40%, transparent);
@@ -980,7 +980,7 @@
     background: var(--color-signal-positive, var(--color-text-strong));
     color: var(--color-surface-base, white);
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-4);
     font-size: var(--type-size-sm);
     font-weight: 500;
@@ -1042,7 +1042,7 @@
     background: var(--color-signal-positive, var(--color-text-strong));
     color: var(--color-surface-base, white);
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-1) var(--space-3);
     font-size: var(--type-size-sm);
     font-weight: 500;
@@ -1066,7 +1066,7 @@
   .verdict-chip {
     display: inline-block;
     padding: 0 var(--space-2);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     border: 1px solid var(--color-surface-divider);
     font-size: var(--type-size-xs);
     font-weight: 500;
@@ -1093,7 +1093,7 @@
   .wo-qa-chip {
     display: inline-block;
     padding: 2px var(--space-2);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-xs);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
@@ -1133,7 +1133,7 @@
     border: 1px solid var(--color-signal-positive);
     padding: 2px var(--space-2);
     font-size: var(--type-size-xs);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-weight: 500;
   }
@@ -1170,7 +1170,7 @@
     color: var(--color-text-primary);
     border: 1px solid var(--color-surface-divider);
     padding: var(--space-4) var(--space-5);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     max-width: 600px;
     width: 90%;
     max-height: 80vh;
@@ -1212,7 +1212,7 @@
     width: 100%;
     padding: var(--space-2) var(--space-3);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-strong);
     font-family: var(--type-family-mono);
@@ -1235,7 +1235,7 @@
     flex: 1;
     padding: var(--space-1) var(--space-2);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-strong);
     font-family: var(--type-family-mono);
@@ -1247,7 +1247,7 @@
     color: var(--color-text-secondary);
     border: 1px solid var(--color-surface-divider);
     padding: var(--space-1) var(--space-3);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
 
@@ -1261,7 +1261,7 @@
     color: var(--color-text-secondary);
     border: 1px solid var(--color-surface-divider);
     padding: var(--space-1) var(--space-3);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-size: var(--type-size-sm);
   }
@@ -1284,7 +1284,7 @@
     color: var(--color-text-secondary);
     border: 1px solid var(--color-surface-divider);
     padding: var(--space-2) var(--space-4);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
     cursor: pointer;

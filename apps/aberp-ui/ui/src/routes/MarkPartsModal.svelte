@@ -232,7 +232,7 @@
   .field input {
     padding: var(--space-2) var(--space-3);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base, var(--color-surface-raised));
     color: var(--color-text-strong);
     font-family: var(--type-family-mono);
@@ -262,7 +262,7 @@
     gap: var(--space-1) var(--space-2);
     padding: var(--space-2) var(--space-3);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-raised);
     font-size: var(--type-size-sm);
   }
@@ -294,7 +294,7 @@
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
     cursor: pointer;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
 
   .quiet-button:hover:not(:disabled) {
@@ -306,7 +306,7 @@
     background: var(--color-signal-positive, var(--color-text-strong));
     color: var(--color-surface-base, white);
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     font-weight: 500;
     cursor: pointer;

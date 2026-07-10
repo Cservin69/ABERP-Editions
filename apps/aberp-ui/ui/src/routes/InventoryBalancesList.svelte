@@ -258,7 +258,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -268,7 +268,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-muted);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     line-height: 1.5;
   }
@@ -279,7 +279,7 @@
     padding: var(--space-3);
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-signal-negative);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-primary);
   }
   .ib-page__error strong {
@@ -289,7 +289,7 @@
     padding: var(--space-3);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-muted);
     text-align: center;
     line-height: 1.6;
@@ -297,7 +297,7 @@
   .ib-page__table-wrap {
     overflow-x: auto;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
   }
   .ib-table {
@@ -347,7 +347,7 @@
   .ib-chip {
     display: inline-block;
     padding: 1px var(--space-2);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-xs);
     border: 1px solid transparent;
@@ -367,7 +367,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-xs);

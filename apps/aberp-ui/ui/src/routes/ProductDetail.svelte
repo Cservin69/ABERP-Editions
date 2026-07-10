@@ -522,7 +522,7 @@
     overflow-y: auto;
     padding: var(--space-4);
     border: 1px solid var(--color-surface-divider);
-    border-radius: var(--radius-md, 8px);
+    border-radius: var(--radius-md);
     background: var(--color-surface-base);
     color: var(--color-text-primary);
   }
@@ -577,7 +577,7 @@
   .chip {
     display: inline-block;
     padding: 1px 8px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-size: 0.75rem;
     margin-left: var(--space-2);
   }
@@ -594,7 +594,7 @@
     align-items: end;
     padding: var(--space-3);
     background: var(--color-surface-raised, #f6f6f6);
-    border-radius: var(--radius-sm, 4px);
+    border-radius: var(--radius-sm);
   }
   .movement-form__field {
     display: flex;
@@ -612,7 +612,7 @@
   .movement-form__field select {
     padding: 6px 8px;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-strong);
     font-family: var(--type-family-mono);
@@ -653,7 +653,7 @@
   }
   .page__primary {
     padding: 8px 14px;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--color-signal-positive);
     color: var(--color-surface-base);
     border: none;
@@ -669,7 +669,7 @@
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
   }
   .quiet-button:hover {
@@ -718,7 +718,7 @@
     margin-top: var(--space-3);
     padding: var(--space-3);
     background: var(--color-surface-raised, #f6f6f6);
-    border-radius: var(--radius-sm, 4px);
+    border-radius: var(--radius-sm);
   }
   .bom-form__title {
     margin: 0 0 var(--space-2) 0;
@@ -747,7 +747,7 @@
   .bom-form__field select {
     padding: 6px 8px;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-strong);
     font-family: var(--type-family-mono);

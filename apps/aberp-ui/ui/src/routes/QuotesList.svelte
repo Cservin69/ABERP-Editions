@@ -748,7 +748,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -773,7 +773,7 @@
     padding: var(--space-3);
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-signal-negative);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-primary);
   }
 
@@ -792,7 +792,7 @@
     padding: var(--space-4);
     background: var(--color-surface-raised);
     border: 1px dashed var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-secondary);
   }
 
@@ -883,7 +883,7 @@
   .quotes-chip {
     display: inline-block;
     padding: 2px 8px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
@@ -916,7 +916,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-strong);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -938,7 +938,7 @@
     border: 1px solid var(--color-signal-positive);
     background: var(--color-surface-raised);
     color: var(--color-signal-positive);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-mono);
     font-size: var(--type-size-xs);
@@ -975,7 +975,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -1009,7 +1009,7 @@
     border: 1px solid var(--color-signal-negative);
     border-left: 4px solid var(--color-signal-negative);
     background: var(--color-surface-sunken);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-strong);
   }
 
@@ -1087,7 +1087,7 @@
     color: var(--color-text-muted);
     background: var(--color-surface-raised);
     padding: 1px 6px;
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
   }
 
   /* S403 — REFUSE affordance. Sits next to the DEAL gate as its negative
@@ -1099,7 +1099,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -1129,7 +1129,7 @@
     max-width: 32rem;
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-4);
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
   }
@@ -1164,7 +1164,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-primary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
   }
@@ -1193,7 +1193,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -1208,7 +1208,7 @@
     border: 1px solid var(--color-signal-negative);
     background: var(--color-surface-raised);
     color: var(--color-signal-negative);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);

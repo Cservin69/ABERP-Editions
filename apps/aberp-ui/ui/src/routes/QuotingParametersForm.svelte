@@ -379,7 +379,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -392,7 +392,7 @@
     padding: var(--space-2) var(--space-3);
     border: 1px dashed var(--color-signal-warning);
     color: var(--color-signal-warning);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
   }
   .qt-page__notice {
@@ -400,7 +400,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-muted);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
   }
   .qt-page__muted {
@@ -411,7 +411,7 @@
     padding: var(--space-3);
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-signal-negative);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-primary);
   }
   .qt-page__error strong {
@@ -422,7 +422,7 @@
     border: 1px solid var(--color-signal-positive);
     color: var(--color-signal-positive);
     background: var(--color-surface-raised);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
   }
   .qt-grid {
@@ -431,7 +431,7 @@
     gap: var(--space-3);
     background: var(--color-surface-sunken);
     padding: var(--space-3);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     border: 1px solid var(--color-surface-divider);
   }
   .qt-grid label {
@@ -448,7 +448,7 @@
     padding: var(--space-2);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-strong);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);

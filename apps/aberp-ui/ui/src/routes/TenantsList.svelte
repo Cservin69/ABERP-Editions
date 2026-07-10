@@ -519,7 +519,7 @@
   }
   .tn-banner {
     padding: var(--space-3);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     color: var(--color-text-primary);
   }
@@ -542,7 +542,7 @@
     padding: var(--space-3);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
   }
   .tn-add__field {
     display: flex;
@@ -557,7 +557,7 @@
   .tn-add__input {
     padding: var(--space-2) var(--space-3);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-strong);
     font-family: var(--type-family-body);
@@ -580,7 +580,7 @@
     width: 100%;
     border-collapse: collapse;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     font-variant-numeric: tabular-nums;
   }
@@ -620,7 +620,7 @@
   .tn-chip {
     display: inline-block;
     padding: 0 var(--space-2);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-size: var(--type-size-sm);
     border: 1px solid var(--color-surface-divider);
     color: var(--color-text-secondary);
@@ -657,7 +657,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-sunken, var(--color-surface-base));
     color: var(--color-text-muted);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -669,7 +669,7 @@
   .tn-toggle__knob {
     width: 0.6rem;
     height: 0.6rem;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--color-text-muted);
   }
   .tn-toggle--on {
@@ -696,7 +696,7 @@
     width: 4.5rem;
     padding: var(--space-1) var(--space-2);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-strong);
     font-family: var(--type-family-body);
@@ -713,7 +713,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-base);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);

@@ -363,7 +363,7 @@
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
     cursor: pointer;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
   }
   .snap__btn:hover:not(:disabled) {
     background: var(--color-surface-divider);
@@ -388,7 +388,7 @@
     padding: var(--space-2) var(--space-3);
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     color: var(--color-text-secondary);
     margin-bottom: var(--space-3);
@@ -409,7 +409,7 @@
   }
   .snap__msg {
     padding: var(--space-2) var(--space-3);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     margin: var(--space-2) 0;
   }
@@ -435,7 +435,7 @@
     color: var(--color-text-secondary);
     font-size: var(--type-size-xs);
     cursor: pointer;
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
   }
   .snap__chip--on {
     background: var(--color-text-strong);
@@ -482,7 +482,7 @@
   }
   .snap__status {
     padding: 2px var(--space-2);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-xs);
   }
   .snap__status--ok {
@@ -498,7 +498,7 @@
     padding: var(--space-4);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-sunken);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     max-width: 640px;
   }
   .snap__wizard h2 {

@@ -206,7 +206,7 @@
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
     cursor: pointer;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
 
   .quiet-button:hover:not(:disabled) {
@@ -218,7 +218,7 @@
     background: var(--color-signal-negative);
     color: var(--color-surface-base);
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     font-weight: 500;
     cursor: pointer;

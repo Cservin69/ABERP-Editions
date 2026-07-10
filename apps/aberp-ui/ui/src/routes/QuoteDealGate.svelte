@@ -219,7 +219,7 @@
     padding: var(--space-3);
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
   }
 
   /* REFRESH gate (EVE addendum 2 UI half) — RED bordered, big, loud.
@@ -232,7 +232,7 @@
     padding: var(--space-3);
     background: var(--color-surface-base);
     border: 2px solid var(--color-signal-negative);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
   }
 
   .deal-gate__refresh-label {
@@ -257,7 +257,7 @@
     color: var(--color-text-strong);
     background: var(--color-surface-raised);
     padding: 0 4px;
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
   }
 
   .deal-gate__refresh-input {
@@ -268,7 +268,7 @@
     font-family: var(--type-family-mono);
     font-size: var(--type-size-lg);
     font-weight: 600;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     letter-spacing: 0.06em;
   }
 
@@ -288,7 +288,7 @@
     gap: var(--space-2);
     padding: var(--space-3);
     background: var(--color-surface-base);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
   }
 
   .deal-gate__deal-label {
@@ -313,7 +313,7 @@
     color: var(--color-text-strong);
     background: var(--color-surface-raised);
     padding: 1px 6px;
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
   }
 
@@ -328,7 +328,7 @@
     font-size: var(--type-size-lg);
     font-weight: 700;
     letter-spacing: 0.08em;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-strong);
     border: 2px solid var(--color-signal-negative);
@@ -353,7 +353,7 @@
      correct tone. Same loud affordance as the storno-confirm-accept. */
   .deal-gate__deal-button {
     padding: var(--space-2) var(--space-3);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
     font-weight: 700;
@@ -379,7 +379,7 @@
     border-left: 3px solid var(--color-signal-negative);
     background: var(--color-surface-raised);
     color: var(--color-text-primary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
   }
 
   .deal-gate__server-error strong {

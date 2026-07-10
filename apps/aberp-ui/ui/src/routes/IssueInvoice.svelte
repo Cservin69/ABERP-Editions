@@ -1975,7 +1975,7 @@
     padding: 0;
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     max-height: 320px;
     overflow-y: auto;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
@@ -2020,7 +2020,7 @@
   /* PR-97 / ADR-0048 — three-option buyer-type radio. */
   .buyer-vat-status {
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     padding: var(--space-2) var(--space-3);
     margin: 0;
     display: flex;
@@ -2070,7 +2070,7 @@
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-surface-divider);
     border-left: 3px solid var(--color-signal-positive);
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-md);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
     color: var(--color-text-primary);
@@ -2093,7 +2093,7 @@
     background: transparent;
     color: var(--color-text-muted);
     border: 1px solid var(--color-surface-divider);
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-md);
     font-family: var(--type-family-body);
     font-size: var(--type-size-xs);
     cursor: pointer;
@@ -2122,7 +2122,7 @@
     padding: 0;
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     max-height: 280px;
     overflow-y: auto;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
@@ -2177,7 +2177,7 @@
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-signal-warning, var(--color-surface-divider));
     border-left: 3px solid var(--color-signal-warning, var(--color-text-muted));
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-md);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-xs);
   }

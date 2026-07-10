@@ -2229,7 +2229,7 @@
   .qjd-pdf__panel {
     background: var(--color-surface, #1f2937);
     border: 1px solid var(--color-border, #374151);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     height: 100%;
     display: flex;
     flex-direction: column;
@@ -2258,7 +2258,7 @@
   .qjd__panel {
     background: var(--color-surface, #1f2937);
     border: 1px solid var(--color-border, #374151);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     max-height: 88vh;
     display: flex;
     flex-direction: column;
@@ -2293,7 +2293,7 @@
     background: transparent;
     border: 1px solid var(--color-border, #374151);
     color: var(--color-text, #e5e7eb);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     width: 32px;
     height: 32px;
     cursor: pointer;
@@ -2380,7 +2380,7 @@
     background: transparent;
     border: 1px solid var(--color-border, #374151);
     color: var(--color-text-muted, #9ca3af);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     width: 24px;
     height: 24px;
     line-height: 1;
@@ -2409,7 +2409,7 @@
     background: var(--color-bg, #111827);
     color: var(--color-text, #e5e7eb);
     border: 1px solid var(--color-border, #374151);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: 4px 6px;
     font-size: 13px;
     max-width: 100%;
@@ -2442,7 +2442,7 @@
     background: var(--color-surface-sunken);
     color: var(--color-text-primary);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: var(--space-1) var(--space-2);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
@@ -2537,7 +2537,7 @@
     word-break: break-word;
     background: var(--color-bg, #111827);
     border: 1px solid var(--color-border, #374151);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: 8px;
     font-size: 12px;
     margin: 6px 0 0;
@@ -2568,7 +2568,7 @@
   .chip {
     display: inline-block;
     padding: 2px 8px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-size: 12px;
     font-weight: 500;
     background: #374151;

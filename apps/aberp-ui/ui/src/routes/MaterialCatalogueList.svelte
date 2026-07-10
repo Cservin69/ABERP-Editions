@@ -416,7 +416,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -444,7 +444,7 @@
     border: 1px dashed var(--color-signal-warning);
     background: var(--color-surface-raised);
     color: var(--color-signal-warning);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
   }
 
@@ -453,7 +453,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-muted);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
   }
 
@@ -470,7 +470,7 @@
     padding: var(--space-3);
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-signal-negative);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-primary);
   }
 
@@ -488,7 +488,7 @@
     padding: var(--space-4);
     background: var(--color-surface-raised);
     border: 1px dashed var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-secondary);
   }
 
@@ -570,7 +570,7 @@
   .mat-chip {
     display: inline-block;
     padding: 2px 8px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
@@ -609,7 +609,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);

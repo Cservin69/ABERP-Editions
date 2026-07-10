@@ -52,7 +52,7 @@
     max-width: 24rem;
     border: 1px solid var(--color-signal-positive);
     background: var(--color-surface-raised);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
     animation: quote-toast-in var(--motion-fade-in);
   }

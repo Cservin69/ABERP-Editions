@@ -201,7 +201,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-base);
     color: var(--color-text-primary);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     padding: 0;
     max-width: 480px;
     width: 90vw;
@@ -295,7 +295,7 @@
   .picker-clear,
   .picker-cancel {
     padding: var(--space-2) var(--space-4);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);

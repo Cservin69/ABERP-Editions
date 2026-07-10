@@ -1145,7 +1145,7 @@
     gap: var(--space-1);
     padding: 2px var(--space-2);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-size: var(--type-size-xs);
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -1271,7 +1271,7 @@
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-surface-divider);
     border-left: 3px solid var(--color-signal-warning);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-secondary);
     font-size: var(--type-size-sm);
   }

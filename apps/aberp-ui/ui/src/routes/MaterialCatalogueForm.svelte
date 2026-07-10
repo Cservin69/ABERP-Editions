@@ -330,7 +330,7 @@
     border: 1px solid var(--color-signal-negative);
     background: var(--color-surface-sunken);
     color: var(--color-signal-negative);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
   }
 
@@ -375,7 +375,7 @@
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-surface-divider);
     color: var(--color-text-primary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
   }
@@ -407,7 +407,7 @@
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
     cursor: pointer;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
 
   .quiet-button:hover:not(:disabled) {
@@ -419,7 +419,7 @@
     background: var(--color-surface-raised);
     color: var(--color-text-strong);
     border: 1px solid var(--color-signal-positive);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     font-weight: 500;
     cursor: pointer;

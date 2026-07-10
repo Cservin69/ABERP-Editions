@@ -484,7 +484,7 @@
     padding: var(--space-3);
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
   }
   .mt-search__modes {
     display: flex;
@@ -501,7 +501,7 @@
     flex: 1 1 220px;
     padding: var(--space-2) var(--space-3);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-strong);
     font-family: var(--type-family-mono);
@@ -512,7 +512,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-base);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -525,7 +525,7 @@
     padding: var(--space-3);
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-signal-negative);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-primary);
   }
   .mt-error strong {
@@ -554,7 +554,7 @@
     padding: var(--space-3);
     background: var(--color-surface-raised);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-muted);
     font-size: var(--type-size-sm);
   }
@@ -565,7 +565,7 @@
     margin: 0;
     padding: var(--space-3);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
   }
   .mt-kv dt {
@@ -585,7 +585,7 @@
     width: 100%;
     border-collapse: collapse;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     font-variant-numeric: tabular-nums;
   }
@@ -616,7 +616,7 @@
     margin: 0;
     padding: var(--space-3) var(--space-4);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
   }
   .mt-list__item {
@@ -630,7 +630,7 @@
   .verdict-chip {
     display: inline-block;
     padding: 0 var(--space-2);
-    border-radius: 12px;
+    border-radius: var(--radius-lg);
     border: 1px solid var(--color-surface-divider);
     font-size: var(--type-size-xs);
     font-weight: 500;

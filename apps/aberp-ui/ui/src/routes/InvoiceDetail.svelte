@@ -1972,7 +1972,7 @@
     height: 2em;
     padding: 0;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-secondary);
     font-family: var(--type-family-body);
@@ -2107,7 +2107,7 @@
     padding: var(--space-3);
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-surface-divider);
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-md);
   }
 
   .action-group {
@@ -2153,7 +2153,7 @@
     padding: var(--space-1) var(--space-3);
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-signal-positive);
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-md);
     color: var(--color-signal-positive);
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -2245,7 +2245,7 @@
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-surface-divider);
     border-left-width: 4px;
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-md);
     animation: aberp-fade-in var(--motion-fade-in) both;
   }
   .email-outcome--succeeded {
@@ -2274,7 +2274,7 @@
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-signal-negative);
     border-left: 4px solid var(--color-signal-negative);
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-md);
     animation: aberp-fade-in var(--motion-fade-in) both;
   }
 
@@ -2366,7 +2366,7 @@
    * top-down without parsing a wall-of-text. */
   .nav-fault {
     border: 1px solid var(--color-signal-negative);
-    border-radius: var(--radius-md, 6px);
+    border-radius: var(--radius-md);
     padding: var(--space-2) var(--space-3);
     background: var(--color-surface-sunken);
   }
@@ -2402,7 +2402,7 @@
     margin: var(--space-1) 0 0 0;
     padding: var(--space-1) var(--space-2);
     background: var(--color-surface);
-    border-radius: var(--radius-sm, 3px);
+    border-radius: var(--radius-sm);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-xs);
     white-space: pre-wrap;
@@ -2447,7 +2447,7 @@
   .nav-fault-validation {
     padding: var(--space-2);
     background: var(--color-surface);
-    border-radius: var(--radius-sm, 3px);
+    border-radius: var(--radius-sm);
     border-left: 3px solid var(--color-signal-negative);
   }
 
@@ -2467,7 +2467,7 @@
   .nav-fault-validation-result {
     font-size: var(--type-size-xs);
     padding: 0 var(--space-1);
-    border-radius: var(--radius-sm, 3px);
+    border-radius: var(--radius-sm);
   }
 
   .nav-fault-validation-result.error {
@@ -2776,7 +2776,7 @@
     line-height: 1.6;
     letter-spacing: 0.04em;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-secondary);
     cursor: help;
@@ -2862,7 +2862,7 @@
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     background: var(--color-surface-base);
     color: var(--color-text-primary);
   }

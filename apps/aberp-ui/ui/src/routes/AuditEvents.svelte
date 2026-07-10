@@ -447,7 +447,7 @@
   }
   .audit__chain-bad {
     border: 1px solid var(--color-danger, #f87171);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     background: var(--color-surface, #1f2937);
     color: var(--color-danger, #f87171);
     padding: 12px;
@@ -490,7 +490,7 @@
     background: var(--color-surface, #1f2937);
     color: var(--color-text, #e5e7eb);
     border: 1px solid var(--color-border, #374151);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     padding: 6px 10px;
     font-size: 13px;
   }
@@ -507,7 +507,7 @@
   }
   .audit__chip-btn {
     padding: 5px 12px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-size: 12px;
     font-weight: 500;
     cursor: pointer;
@@ -533,7 +533,7 @@
   .audit__err {
     padding: 12px;
     border: 1px solid var(--color-border, #374151);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     background: var(--color-surface, #1f2937);
   }
   .audit__err {
@@ -622,7 +622,7 @@
   .aud-kind {
     display: inline-block;
     padding: 2px 8px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     font-size: 12px;
     font-weight: 500;
     background: #374151;

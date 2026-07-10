@@ -402,7 +402,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-family: var(--type-family-body);
     font-size: var(--type-size-sm);
@@ -416,7 +416,7 @@
     padding: var(--space-2) var(--space-3);
     border: 1px dashed var(--color-signal-warning);
     color: var(--color-signal-warning);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
   }
   .qt-page__muted {
@@ -427,7 +427,7 @@
     padding: var(--space-3);
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-signal-negative);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-primary);
   }
   .qt-page__error strong {
@@ -437,7 +437,7 @@
     padding: var(--space-4);
     background: var(--color-surface-raised);
     border: 1px dashed var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-secondary);
   }
   .qt-table {
@@ -480,7 +480,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-secondary);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     cursor: pointer;
     font-size: var(--type-size-sm);
   }
@@ -494,7 +494,7 @@
     color: var(--color-text-primary);
     padding: var(--space-4);
     max-width: 540px;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
   }
   .qt-form h3 {
     margin: 0 0 var(--space-3);
@@ -513,7 +513,7 @@
     padding: var(--space-2);
     background: var(--color-surface-sunken);
     border: 1px solid var(--color-surface-divider);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-strong);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-sm);
