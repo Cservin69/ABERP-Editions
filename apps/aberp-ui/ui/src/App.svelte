@@ -527,7 +527,36 @@
          declaration in <script>. -->
     <h1 class="wordmark">
       {#if logoFailed}
-        ABERP
+        <!-- Default Áben brand lockup: the gold mark + ABERP wordmark. Shown
+             whenever no operator logo is present (the editions default). The
+             gradient stops read the --color-brand-gold-* tokens; geometry is
+             the same primitives as static/brand-mark.svg. `aria-hidden` on the
+             SVG keeps the `<h1>` text ("ABERP") the single screen-reader
+             source of truth. -->
+        <svg
+          class="wordmark__mark"
+          viewBox="0 0 340 220"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+        >
+          <defs>
+            <linearGradient id="wm-gold" x1="0" y1="0" x2="0.35" y2="1">
+              <stop offset="0" style="stop-color: var(--color-brand-gold-hi)" />
+              <stop offset="0.45" style="stop-color: var(--color-brand-gold)" />
+              <stop offset="1" style="stop-color: var(--color-brand-gold-lo)" />
+            </linearGradient>
+            <linearGradient id="wm-gold-swoosh" x1="0" y1="1" x2="1" y2="0">
+              <stop offset="0" style="stop-color: var(--color-brand-gold-lo)" />
+              <stop offset="0.6" style="stop-color: var(--color-brand-gold)" />
+              <stop offset="1" style="stop-color: var(--color-brand-gold-hi)" />
+            </linearGradient>
+          </defs>
+          <path fill="url(#wm-gold-swoosh)" d="M150,120 C214,74 288,44 336,12 C300,42 226,80 160,128 C156,124 152,122 150,120 Z" />
+          <path fill="url(#wm-gold)" d="M105,24 L112,66 L66,196 L28,196 Z" />
+          <path fill="url(#wm-gold)" d="M119,24 L196,196 L158,196 L112,66 Z" />
+          <path fill="url(#wm-gold)" d="M82,150 L112,134 L142,150 L142,166 L112,150 L82,166 Z" />
+        </svg>
+        <span class="wordmark__text">ABERP</span>
       {:else}
         <img
           src="/aberp-logo.png"
@@ -1034,7 +1063,7 @@
     padding: var(--space-1) var(--space-3);
     background: transparent;
     border: 1px solid var(--color-surface-divider);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     color: var(--color-text-secondary);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-xs);
@@ -1068,11 +1097,27 @@
 
   .wordmark {
     margin: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-lg);
     font-weight: 600;
     letter-spacing: 0.06em;
     color: var(--color-text-strong);
+  }
+
+  /* The gold mark in the default lockup. Height-matched to the operator
+   * logo (32px) so switching between them doesn't reflow the topbar; the
+   * swoosh gives it an intrinsic ~1.55:1 aspect so width follows. */
+  .wordmark__mark {
+    display: block;
+    height: 30px;
+    width: auto;
+  }
+
+  .wordmark__text {
+    line-height: 1;
   }
 
   /* PR-188 / session 188 — operator-supplied SPA wordmark image. The
@@ -1098,7 +1143,7 @@
   .dot {
     width: 8px;
     height: 8px;
-    border-radius: 50%;
+    border-radius: var(--radius-full);
     background: var(--color-signal-muted);
   }
 
@@ -1260,7 +1305,7 @@
     flex: 0 0 auto;
     min-width: 1.25rem;
     padding: 0 var(--space-1);
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--color-signal-positive);
     color: var(--color-surface-base);
     font-size: var(--type-size-xs);
@@ -1379,7 +1424,7 @@
     margin: var(--space-5) auto;
     padding: var(--space-5);
     background: var(--color-surface-raised);
-    border-radius: 6px;
+    border-radius: var(--radius-md);
     border: 1px solid var(--color-surface-divider);
   }
 
@@ -1416,7 +1461,7 @@
     width: 16px;
     height: 16px;
     margin: 0 0 var(--space-3) 0;
-    border-radius: 50%;
+    border-radius: var(--radius-full);
     border: 2px solid var(--color-surface-divider);
     border-top-color: var(--color-signal-muted);
     animation: aberp-spin 1s linear infinite;
@@ -1431,7 +1476,7 @@
     border: 1px solid var(--color-surface-divider);
     background: var(--color-surface-raised);
     color: var(--color-text-strong);
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-size: var(--type-size-sm);
     cursor: pointer;
   }
@@ -1536,7 +1581,7 @@
     right: 2px;
     min-width: 1.1rem;
     padding: 0 4px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
     background: var(--color-signal-positive);
     color: var(--color-surface-base);
     font-size: var(--type-size-xs);

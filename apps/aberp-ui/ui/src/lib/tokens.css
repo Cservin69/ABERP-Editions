@@ -46,6 +46,19 @@
   --color-signal-divergence: #8c6dc6; /* reserved violet — see ADR-0017 §5 */
   --color-signal-muted: #555;         /* Unknown, missing state */
 
+  /* ── Brand accent (Áben gold) ─────────────────────────────────────────
+   * The mark's gold gradient — IDENTITY, not state. ADR-0017 keeps colour
+   * surgical: these are for the Áben mark (the header logo + favicon) ONLY.
+   * They are deliberately NOT part of the --color-signal-* family and MUST
+   * NOT be used to convey data/status meaning. One accent, three stops:
+   * champagne highlight (upper-left of the mark) → antique gold (its feet).
+   * These hexes are mirrored verbatim in the standalone brand SVGs
+   * (static/favicon.svg, static/brand-mark.svg) and the tools/source-logo
+   * icon master; keep them in lockstep if the gold is ever retuned. */
+  --color-brand-gold-hi: #F6E7B4;     /* champagne highlight */
+  --color-brand-gold: #D9B451;        /* mid antique gold */
+  --color-brand-gold-lo: #9C7A2A;     /* deep antique gold */
+
   /* ── Spacing scale (4px base) ───────────────────────────────────────── */
   --space-0: 0;
   --space-1: 4px;
@@ -56,6 +69,23 @@
   --space-6: 32px;
   --space-7: 48px;
   --space-8: 64px;
+
+  /* ── Radius (rounded-card surface language) ───────────────────────────
+   * ONE scale, tokenised so no component hardcodes a corner (same
+   * enforcement posture as colour/space). "Rounded card, not a box" — the
+   * whole SPA softens to these; ad-hoc px radii are a review block.
+   *   sm  → controls: inputs, buttons, badges, chips, small insets
+   *   md  → cards & panels: the dominant surface radius
+   *   lg  → large surfaces: modals, wizards, hero panels
+   *   pill→ fully-round tags/toggles (was the ad-hoc 999px)
+   *   full→ circles: status dots, avatars (was the ad-hoc 50%)
+   * Components previously carried `var(--radius-sm, 3px)`-style fallbacks
+   * against the day these landed; the fallbacks are now redundant. */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+  --radius-full: 50%;
 
   /* ── Typography ──────────────────────────────────────────────────────
    * Body stack: system-ui first (each OS picks something that handles

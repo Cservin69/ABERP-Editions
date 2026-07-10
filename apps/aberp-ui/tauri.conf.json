@@ -34,7 +34,7 @@
   "bundle": {
     "active": false,
     "targets": "all",
-    "icon": ["icons/icons.icns"],
+    "icon": ["icons/icon.icns"],
     "category": "Business",
     "shortDescription": "ABERP — modular multi-tenant ERP (operator shell).",
     "longDescription": "Local operator shell for ABERP. Launches the aberp backend on a loopback HTTPS listener and consumes it over the wire protocol defined by ADR-0021 §Part B."

@@ -8,3 +8,10 @@
 # ignore everything else.
 *
 !.gitignore
+
+# Áben brand DEFAULTS ship with the product (they are the fallback identity
+# rendered when no operator logo is present) — distinct from the private
+# operator-supplied assets above, so they MUST be tracked or a fresh clone /
+# CI `vite build` would 404 the favicon and lose the mark.
+!favicon.svg
+!brand-mark.svg

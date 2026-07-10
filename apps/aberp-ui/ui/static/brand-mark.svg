@@ -1,0 +1,22 @@
+<svg viewBox="0 0 340 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ABERP">
+  <!-- Áben mark — full variant: the geometric A with the signature swoosh
+       sweeping up and beyond the letterform to the upper right. Built from
+       vector primitives (not an autotrace) so it stays crisp at any size.
+       Gold gradient hexes mirror --color-brand-gold-* in lib/tokens.css. -->
+  <defs>
+    <linearGradient id="abenGold" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#F6E7B4"/>
+      <stop offset="0.45" stop-color="#D9B451"/>
+      <stop offset="1" stop-color="#9C7A2A"/>
+    </linearGradient>
+    <linearGradient id="abenGoldSwoosh" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#9C7A2A"/>
+      <stop offset="0.6" stop-color="#D9B451"/>
+      <stop offset="1" stop-color="#F6E7B4"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#abenGoldSwoosh)" d="M150,120 C214,74 288,44 336,12 C300,42 226,80 160,128 C156,124 152,122 150,120 Z"/>
+  <path fill="url(#abenGold)" d="M105,24 L112,66 L66,196 L28,196 Z"/>
+  <path fill="url(#abenGold)" d="M119,24 L196,196 L158,196 L112,66 Z"/>
+  <path fill="url(#abenGold)" d="M82,150 L112,134 L142,150 L142,166 L112,150 L82,166 Z"/>
+</svg>
