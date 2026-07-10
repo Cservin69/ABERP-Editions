@@ -2,7 +2,7 @@
   <!-- Áben mark — compact (favicon) variant: the geometric A only, no
        swoosh (the swoosh does not survive tab sizes). Same geometry as the
        full brand-mark.svg so 16px and 512px read identically. Gold gradient
-       hexes mirror --color-brand-gold-* in lib/tokens.css. -->
+       hexes mirror the color-brand-gold-* tokens in lib/tokens.css. -->
   <defs>
     <linearGradient id="abenGold" x1="0" y1="0" x2="0.35" y2="1">
       <stop offset="0" stop-color="#F6E7B4"/>
