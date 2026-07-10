@@ -48,13 +48,19 @@
 
   /* ── Brand accent (Áben gold) ─────────────────────────────────────────
    * The mark's gold gradient — IDENTITY, not state. ADR-0017 keeps colour
-   * surgical: these are for the Áben mark (the header logo + favicon) ONLY.
-   * They are deliberately NOT part of the --color-signal-* family and MUST
+   * surgical: this is the Áben brand accent ONLY (identity, never state).
+   * It is deliberately NOT part of the --color-signal-* family and MUST
    * NOT be used to convey data/status meaning. One accent, three stops:
-   * champagne highlight (upper-left of the mark) → antique gold (its feet).
-   * These hexes are mirrored verbatim in the standalone brand SVGs
-   * (static/favicon.svg, static/brand-mark.svg) and the tools/source-logo
-   * icon master; keep them in lockstep if the gold is ever retuned. */
+   * champagne highlight → mid antique gold → deep antique gold (its feet).
+   *
+   * NOTE: this is a SIMPLIFIED flat 3-stop accent. The actual mark artwork
+   * (static/brand-mark.svg, static/favicon.svg, the App.svelte header
+   * lockup, and the tools/source-logo icon master) carries the full
+   * per-facet metallic ramps — armL / armR / accent, sampled from the
+   * source photo — which these three tokens intentionally do NOT try to
+   * reproduce. The tokens are the accent for any future non-mark gold
+   * surface; they are currently unreferenced (the mark owns its own
+   * gradients) but kept as the canonical accent definition. */
   --color-brand-gold-hi: #F6E7B4;     /* champagne highlight */
   --color-brand-gold: #D9B451;        /* mid antique gold */
   --color-brand-gold-lo: #9C7A2A;     /* deep antique gold */
