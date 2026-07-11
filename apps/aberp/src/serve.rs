@@ -3673,10 +3673,97 @@ fn build_rustls_config(cert_pem: &str, key_pem: &str) -> Result<(Vec<Vec<u8>>, V
 
 // ── Session token in the OS keychain ─────────────────────────────────
 
+/// TEST-ONLY environment gate for the session-token keychain bypass in
+/// [`load_or_create_session_token`]. When this variable is set to `"1"` —
+/// AND the binary is a non-production debug build — boot supplies a fixed
+/// in-memory dummy token and does NOT touch the OS keychain. See
+/// [`test_only_session_token_bypass`] for the rationale + the compile-time
+/// gating that keeps it out of every release / Defense build.
+///
+/// The constant string itself is always compiled (it is inert — just a
+/// name); only the branch that *reads* it is `#[cfg]`-gated out of prod.
+pub const SESSION_TOKEN_TEST_BYPASS_ENV: &str = "ABERP_KEYCHAIN_TEST_BYPASS";
+
+/// TEST-ONLY session-token bypass — see [`SESSION_TOKEN_TEST_BYPASS_ENV`].
+///
+/// # Why this exists
+///
+/// The `aberp serve` boot path reads the SPA session token (the loopback
+/// Bearer secret, independent of NAV) from the OS keychain UNCONDITIONALLY,
+/// and `keyring` ships no in-process mock. A hermetic serve-boot e2e (e.g.
+/// `serve_boot_mirror_ahead_recovery_e2e.rs`) therefore had no way to run
+/// without a real login keychain: a synthesised `$HOME` breaks the macOS
+/// keychain ("a default keychain could not be found"), and using the real
+/// one reintroduces the interactive ACL-prompt hazard forbidden in dev/test.
+/// This bypass lets such a test skip the keychain with a deterministic dummy
+/// token.
+///
+/// # Security posture (harden over speed)
+///
+/// * **Absent from the LIVE Defense line.** The `#[cfg(all(debug_assertions,
+///   not(feature = "production")))]` gate means the branch does not exist in
+///   ANY `--features production` build — Defense (the live prod line) is built
+///   `--release --features production` (`run_defense.sh`), so BOTH
+///   sub-conditions are false and the code is removed before codegen. A
+///   Defense session-token read is therefore byte-for-byte the original
+///   keychain read below, with the bypass physically not present in the
+///   binary.
+/// * **Absent from any `--release` build.** `debug_assertions` is off in
+///   release (no `[profile.release]` override), so the branch is also removed
+///   from any packaged/optimised build regardless of edition.
+/// * **Dormant + explicit opt-in in a debug build.** In a debug, default-
+///   feature (Portable) build — a `run_portable.sh` dev launch or a
+///   `cargo test` build — the branch IS present but stays inert unless
+///   `ABERP_KEYCHAIN_TEST_BYPASS=1` is explicitly set; it can never trigger
+///   casually. This matches the repo's existing `ABERP_*_TEST` env hooks
+///   (`ABERP_PORTABLE_E2E`, `ABERP_BOOT_BUDGET_TEST`, `ABERP_SNAPSHOT_DISABLE`),
+///   and is strictly more hardened than they are (they carry no `#[cfg]` gate
+///   at all).
+/// * **No weakening of the real path.** It does not touch, relax, or share
+///   the keychain ACL; on a `None` return the caller falls through to the
+///   identical real keychain read.
+/// * **No secret leaks.** The dummy token is never logged or persisted (no
+///   keychain write); only a loud one-shot "test bypass active" marker is
+///   emitted so an accidental flip is visible in the logs.
+#[cfg(all(debug_assertions, not(feature = "production")))]
+fn test_only_session_token_bypass() -> Option<String> {
+    /// A fixed, obviously-fake 256-bit-shaped hex token. Deterministic so the
+    /// bypass is reproducible; the leading `7e57` reads "test". Never a real
+    /// secret — it only satisfies the non-empty Bearer-token contract for a
+    /// hermetic loopback test that authenticates no request.
+    const TEST_SESSION_TOKEN_DUMMY: &str =
+        "7e57000000000000000000000000000000000000000000000000000000000000";
+
+    if std::env::var(SESSION_TOKEN_TEST_BYPASS_ENV).ok().as_deref() != Some("1") {
+        return None;
+    }
+    tracing::warn!(
+        env = SESSION_TOKEN_TEST_BYPASS_ENV,
+        "TEST-ONLY session-token keychain bypass ACTIVE — supplying an in-memory dummy \
+         token and NOT reading the OS keychain. This branch is compiled out of every \
+         release build and every `--features production` (Defense) build."
+    );
+    Some(TEST_SESSION_TOKEN_DUMMY.to_string())
+}
+
 /// Look up the session token in the OS keychain for this tenant; if
 /// absent, generate a fresh 256-bit random token (hex-encoded) and
 /// persist it.
+///
+/// In non-production debug builds ONLY, an explicit
+/// `ABERP_KEYCHAIN_TEST_BYPASS=1` short-circuits to a dummy in-memory token
+/// and skips the keychain entirely (see [`test_only_session_token_bypass`]);
+/// that branch is `#[cfg]`-compiled out of every release / Defense build, so
+/// prod behaviour here is unchanged.
 fn load_or_create_session_token(tenant: &str) -> Result<String> {
+    // TEST-ONLY, non-production debug builds only, explicit env opt-in only.
+    // Compiled out of prod (release + `--features production`) — the real
+    // keychain read below is then byte-for-byte the original.
+    #[cfg(all(debug_assertions, not(feature = "production")))]
+    if let Some(dummy) = test_only_session_token_bypass() {
+        return Ok(dummy);
+    }
+
     let service = keychain_service_for(tenant);
     let entry = keyring::Entry::new(&service, SESSION_TOKEN_ACCOUNT)
         .context("build keyring::Entry for session token")?;

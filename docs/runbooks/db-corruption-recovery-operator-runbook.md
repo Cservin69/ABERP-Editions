@@ -268,6 +268,22 @@ proof of both is `apps/aberp/tests/boot_crash_recovery_e2e.rs`
   and ahead mirror are always retained).
 - **Single manual entrypoint:** `aberp recover` — same engine, guarded and audited.
 
+## Test hooks (developer-only — NEVER set on a real install)
+
+The end-to-end pin that proves the `aberp serve` **boot path** auto-heals an
+ahead-mirror tear unattended (`apps/aberp/tests/serve_boot_mirror_ahead_recovery_e2e.rs`)
+runs fully hermetic under a synthetic `$HOME`. To do that it needs the boot
+session-token read to skip the OS keychain (which otherwise requires a real
+login keychain). One TEST-ONLY environment variable enables that:
+
+- **`ABERP_KEYCHAIN_TEST_BYPASS=1`** — makes `serve` boot supply a dummy
+  in-memory SPA session token and NOT touch the OS keychain. It is compiled
+  **out** of every `--release` binary and every `--features production`
+  (Defense) binary — it does not exist in a shipped build — and even in a
+  debug build it is inert unless explicitly set. It never weakens the keychain
+  ACL and never logs or persists the dummy token. **Do not set it on an
+  operational install**; it is a test-harness convenience only.
+
 ## Prod is out of scope here
 
 This runbook covers the **editions** tree only. The `aberp-snapshot` engine refuses
