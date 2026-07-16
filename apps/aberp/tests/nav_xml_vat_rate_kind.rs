@@ -70,6 +70,7 @@ fn domestic_parties() -> NavParties {
             address_street: "Visszatero koz 6".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             customer_vat_status: CustomerVatStatus::Domestic,
             tax_number: Some("27952890-2-42".to_string()),
             name: "AZ9 Services".to_string(),

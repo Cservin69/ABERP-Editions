@@ -259,6 +259,16 @@ pub struct CustomerJson {
     /// callers that emit `""` still deserialise unchanged.
     #[serde(rename = "taxNumber")]
     pub tax_number: String,
+    /// ADR-0102 — EU community VAT number for an `Other` (foreign-EU
+    /// business) buyer. Snapshotted onto the wire body at issuance from
+    /// the picked partner's `eu_vat_number`; `#[serde(default)]` so
+    /// pre-ADR-0102 side-stored `input.json` bodies (which lack the
+    /// field) and CLI callers deserialise unchanged as `None` (the
+    /// Domestic path). Preflight requires + structurally-validates it
+    /// when `vat_status == Other` and rejects it (via
+    /// `CustomerVatStatusOther`'s sibling rules) otherwise.
+    #[serde(default, rename = "communityVatNumber")]
+    pub community_vat_number: Option<String>,
     pub name: String,
     /// PR-77 / session-101 — NAV business-rule `CUSTOMER_DATA_EXPECTED`
     /// requires a full `<customerAddress>` block whenever
@@ -751,49 +761,66 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
     //    a 6-decimal `<exchangeRate>`, and per-VAT-rate `*HUF` amounts
     //    computed from the stamped MNB rate (NOT re-fetched). HUF invoices
     //    serialize `<exchangeRate>1.000000` (uniformly 6-decimal per C11).
-    let parties = NavParties {
-        supplier: SupplierInfo {
-            tax_number: input.supplier.tax_number,
-            name: input.supplier.name,
-            address_country_code: input.supplier.address.country_code,
-            address_postal_code: input.supplier.address.postal_code,
-            address_city: input.supplier.address.city,
-            address_street: input.supplier.address.street,
-        },
-        customer: CustomerInfo {
-            // PR-97 / ADR-0048 — closed-vocab buyer-kind threaded
-            // from wire body through to NAV emit. Preflight gates the
-            // per-status invariants upstream; the emitter conditions
-            // `<customerVatData>` emission on this value.
-            customer_vat_status: input.customer.vat_status,
-            // PR-97 / ADR-0048 — `Option<String>`. Empty-after-trim
-            // collapses to `None` so PrivatePerson bodies that arrive
-            // with an empty-string tax_number do not synthesise a
-            // malformed `<customerVatData>` block downstream.
-            tax_number: {
-                let trimmed = input.customer.tax_number.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
+    let parties =
+        NavParties {
+            supplier: SupplierInfo {
+                tax_number: input.supplier.tax_number,
+                name: input.supplier.name,
+                address_country_code: input.supplier.address.country_code,
+                address_postal_code: input.supplier.address.postal_code,
+                address_city: input.supplier.address.city,
+                address_street: input.supplier.address.street,
             },
-            name: input.customer.name,
-            // PR-77 / session-101 — `<customerAddress>` is required for
-            // DOMESTIC (non-PRIVATE_PERSON) customerVatStatus and
-            // optional for PrivatePerson per ADR-0048. The wire body's
-            // `customer.address` is `Option<_>` so pre-PR-77 CLI-issued
-            // bodies still parse; preflight gates the
-            // required-when-Domestic case BEFORE the sequence is
-            // burned.
-            address: input.customer.address.map(|a| CustomerAddress {
-                country_code: a.country_code,
-                postal_code: a.postal_code,
-                city: a.city,
-                street: a.street,
-            }),
-        },
-    };
+            customer: CustomerInfo {
+                // PR-97 / ADR-0048 — closed-vocab buyer-kind threaded
+                // from wire body through to NAV emit. Preflight gates the
+                // per-status invariants upstream; the emitter conditions
+                // `<customerVatData>` emission on this value.
+                customer_vat_status: input.customer.vat_status,
+                // PR-97 / ADR-0048 — `Option<String>`. Empty-after-trim
+                // collapses to `None` so PrivatePerson bodies that arrive
+                // with an empty-string tax_number do not synthesise a
+                // malformed `<customerVatData>` block downstream.
+                tax_number: {
+                    let trimmed = input.customer.tax_number.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                },
+                // ADR-0102 — EU community VAT number, threaded from the wire
+                // body for `Other` buyers. Empty-after-trim collapses to
+                // `None` so a Domestic/PrivatePerson body carrying an empty
+                // `communityVatNumber` does not synthesise an empty
+                // `<customerVatData>` block. Preflight guarantees `Some(_)`
+                // for `Other` before the sequence is burned.
+                community_vat_number: input.customer.community_vat_number.as_deref().and_then(
+                    |s| {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    },
+                ),
+                name: input.customer.name,
+                // PR-77 / session-101 — `<customerAddress>` is required for
+                // DOMESTIC (non-PRIVATE_PERSON) customerVatStatus and
+                // optional for PrivatePerson per ADR-0048. The wire body's
+                // `customer.address` is `Option<_>` so pre-PR-77 CLI-issued
+                // bodies still parse; preflight gates the
+                // required-when-Domestic case BEFORE the sequence is
+                // burned.
+                address: input.customer.address.map(|a| CustomerAddress {
+                    country_code: a.country_code,
+                    postal_code: a.postal_code,
+                    city: a.city,
+                    street: a.street,
+                }),
+            },
+        };
     let render_currency = currency;
     let render_rate_metadata = rate_metadata.clone();
     let render_payment_method = input.payment_method;
@@ -878,6 +905,9 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         // through to the audit payload builder so the tamper-evident
         // trail captures the as-of-issuance value verbatim.
         input.customer.vat_status,
+        // ADR-0102 — pass the buyer's EU community VAT number through to
+        // the audit payload builder. `None` for Domestic/PrivatePerson.
+        input.customer.community_vat_number.clone(),
         // PR-97 / ADR-0048 (Ervin override 1) — pass the saved-partner
         // id (when present on the wire body) for the counter
         // increment that drives the PartnerForm field-selective lock.
@@ -1100,6 +1130,11 @@ fn run_single_tx<F>(
     // so the tamper-evident regulatory trail records the choice
     // as-of-issuance.
     customer_vat_status: crate::nav_xml::CustomerVatStatus,
+    // ADR-0102 — the buyer's EU community VAT number (Some for `Other`
+    // buyers), stamped onto the audit payload via
+    // `with_customer_community_vat_number` so the tamper-evident trail
+    // holds the snapshot alongside the on-disk NAV XML + input.json.
+    customer_community_vat_number: Option<String>,
     // PR-97 / ADR-0048 (Ervin override 1) — saved-partner id when
     // the SPA picked a buyer via typeahead. When `Some(_)` the issue
     // path increments `partners.issued_invoice_count` IN THE SAME TX
@@ -1251,7 +1286,9 @@ where
         // Some("AfterPaymentDeadline") for confirmed out-of-range).
         .with_invoice_dates(&invoice, delivery_date_override.as_deref())
         // PR-97 / ADR-0048 — stamp the buyer-kind discriminator.
-        .with_customer_vat_status(customer_vat_status);
+        .with_customer_vat_status(customer_vat_status)
+        // ADR-0102 — stamp the EU community VAT number (Other buyers).
+        .with_customer_community_vat_number(customer_community_vat_number.as_deref());
         audit_ledger::append_in_tx(
             &tx,
             ledger_meta,

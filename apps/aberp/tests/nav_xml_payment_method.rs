@@ -31,6 +31,7 @@ fn parties() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             customer_vat_status: CustomerVatStatus::Domestic,
             tax_number: Some("87654321-1-42".to_string()),
             name: "Test Customer Zrt.".to_string(),

@@ -129,6 +129,7 @@ fn fixture_ready_invoice() -> ReadyInvoice {
 fn fixture_request_body(currency: aberp_billing::Currency) -> ModificationInvoiceRequest {
     ModificationInvoiceRequest {
         customer: CustomerJson {
+            community_vat_number: None,
             // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
             // Domestic posture for legacy test fixtures.
             vat_status: CustomerVatStatus::Domestic,
@@ -314,6 +315,7 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
                 },
             },
             customer: CustomerJson {
+                community_vat_number: None,
                 // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
                 // Domestic posture for legacy test fixtures.
                 vat_status: CustomerVatStatus::Domestic,
@@ -499,6 +501,7 @@ async fn issue_and_finalize_base(
                 },
             },
             customer: CustomerJson {
+                community_vat_number: None,
                 vat_status: CustomerVatStatus::Domestic,
                 partner_id: None,
                 tax_number: "87654321-2-13".to_string(),

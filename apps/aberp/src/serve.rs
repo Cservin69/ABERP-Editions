@@ -30310,6 +30310,7 @@ mod tests {
                 address_street: "Visszatero koz 6".to_string(),
             },
             customer: crate::nav_xml::CustomerInfo {
+                community_vat_number: None,
                 // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
                 // posture for the round-trip fixture.
                 customer_vat_status: crate::nav_xml::CustomerVatStatus::Domestic,
@@ -30550,6 +30551,7 @@ mod tests {
 
     fn write_draft(ledger: &mut Ledger, actor: &Actor, invoice_id: &str, idem: IdempotencyKey) {
         let payload = audit_payloads::InvoiceDraftCreatedPayload {
+            customer_community_vat_number: None,
             invoice_id: invoice_id.to_string(),
             line_count: 1,
             idempotency_key: idem.to_canonical_string(),

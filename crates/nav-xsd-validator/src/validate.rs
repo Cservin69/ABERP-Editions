@@ -534,8 +534,62 @@ fn walk_customer_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidation
 
 fn walk_customer_vat_data(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
     const PARENT: &str = "customerVatData";
-    const ALLOWED: &[&str] = &["customerTaxNumber"];
-    expect_single_child_then_close(reader, PARENT, ALLOWED, walk_customer_tax_number)
+    // NAV v3.0 `CustomerVatDataType` is an XSD CHOICE — EXACTLY ONE of:
+    //   - `customerTaxNumber` (structured, `common:`-prefixed children —
+    //     the DOMESTIC arm, PR-50/PR-66); OR
+    //   - `communityVatNumber` (flat text, OSA data namespace — the
+    //     ADR-0102 EU `Other` arm).
+    // The non-EU `thirdStateTaxId` arm is NOT in ALLOWED (ABERP never
+    // emits it — ADR-0102 §8.1); a body carrying it loud-fails
+    // `UnexpectedElement`, which is the conservative posture.
+    const ALLOWED: &[&str] = &["customerTaxNumber", "communityVatNumber"];
+    let mut count: u32 = 0;
+    let mut child: Option<&'static str> = None;
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                count += 1;
+                if count > 1 {
+                    return Err(NavXsdValidationError::CardinalityExceeded {
+                        parent: PARENT,
+                        element: child.unwrap_or(canonical),
+                        max: 1,
+                        actual: count,
+                    });
+                }
+                child = Some(canonical);
+                match canonical {
+                    "customerTaxNumber" => walk_customer_tax_number(reader)?,
+                    // ADR-0102 — flat text, data namespace (no `common:`
+                    // prefix). Structural presence is all NAV requires
+                    // locally; the VIES shape is gated upstream at
+                    // `nav_xml::validate_community_vat_number`.
+                    "communityVatNumber" => {
+                        let _ = collect_text(reader, canonical)?;
+                    }
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+            }
+            Event::End(_) => {
+                if count == 0 {
+                    return Err(NavXsdValidationError::MissingRequiredChild {
+                        parent: PARENT,
+                        expected: ALLOWED[0],
+                    });
+                }
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
 }
 
 fn walk_customer_tax_number(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {

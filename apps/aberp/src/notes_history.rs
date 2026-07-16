@@ -269,6 +269,7 @@ mod tests {
     ) {
         let idem = IdempotencyKey::new();
         let mut payload = InvoiceDraftCreatedPayload {
+            customer_community_vat_number: None,
             invoice_id: invoice_id.to_string(),
             line_count: line_notes.len(),
             idempotency_key: idem.to_canonical_string(),

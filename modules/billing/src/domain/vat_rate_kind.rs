@@ -154,9 +154,34 @@ impl VatRateKind {
     }
 
     /// `true` for the default numeric-rate kind. The Session-1 preflight
-    /// shut door rejects every kind for which this is `false`.
+    /// shut door rejected every kind for which this is `false`.
     pub fn is_percent(&self) -> bool {
         matches!(self, VatRateKind::Percent)
+    }
+
+    /// `true` for the four non-`Percent` kinds ADR-0101 v1 FULLY WIRES
+    /// (Ervin-confirmed NAV codes: AAM / KBAET / EUFAD37 / the
+    /// `vatDomesticReverseCharge` boolean). These are the kinds Session 2
+    /// preflight ACCEPTS (each requiring a 0% line — ADR-0101 §4). The
+    /// remaining non-`Percent` kinds are named-deferred: enum-known so the
+    /// vocab is closed + complete-in-intent, but preflight rejects them
+    /// (`VatRateKindNotSupportedYet`) and NAV emit `anyhow!`s them
+    /// (`vat_rate_choice`), as explicit not-yet markers (CLAUDE.md rule 12).
+    ///
+    /// The membership here is the SINGLE source of truth for "which kinds
+    /// preflight opens"; it is kept in lock-step with the four `vat_rate_choice`
+    /// arms in `nav_xml.rs` that resolve to a concrete NAV choice (the
+    /// storno-fold inverse `vat_rate_kind_from_choice` iterates this same
+    /// four-kind set). A named-deferred kind added to `vat_rate_choice`
+    /// later MUST also be added here in the same PR.
+    pub fn is_wired(&self) -> bool {
+        matches!(
+            self,
+            VatRateKind::AamExempt
+                | VatRateKind::DomesticReverseCharge
+                | VatRateKind::IntraCommunityGoods
+                | VatRateKind::IntraCommunityServiceReverse
+        )
     }
 }
 
@@ -237,5 +262,42 @@ mod tests {
     fn unknown_db_token_is_none_not_default() {
         assert_eq!(VatRateKind::from_db_str("NotAKind"), None);
         assert_eq!(VatRateKind::from_db_str(""), None);
+    }
+
+    /// ADR-0101 §4 — exactly the four Ervin-confirmed kinds are `is_wired`
+    /// (Session-2 preflight accepts them at 0%); `Percent` is NOT wired (it
+    /// is the numeric path, gated separately) and every named-deferred kind
+    /// is NOT wired (preflight rejects them `VatRateKindNotSupportedYet`).
+    /// Pinning the exact set here means a future variant slipped into the
+    /// wired set without a confirmed NAV code trips this test, not a live
+    /// ÁFA submission.
+    #[test]
+    fn is_wired_is_exactly_the_four_confirmed_kinds() {
+        use VatRateKind::*;
+        let wired = [
+            AamExempt,
+            DomesticReverseCharge,
+            IntraCommunityGoods,
+            IntraCommunityServiceReverse,
+        ];
+        for k in wired {
+            assert!(k.is_wired(), "{k:?} must be wired");
+            assert!(!k.is_percent(), "{k:?} must not be Percent");
+        }
+        // Percent + every named-deferred kind must NOT be wired.
+        let not_wired = [
+            Percent,
+            TamExempt,
+            ExportGoods,
+            OtherInternational,
+            NewTransportIntraCommunity,
+            OutOfScopeThirdCountry,
+            MarginScheme,
+            NoVatCharge,
+            VatContent,
+        ];
+        for k in not_wired {
+            assert!(!k.is_wired(), "{k:?} must NOT be wired");
+        }
     }
 }

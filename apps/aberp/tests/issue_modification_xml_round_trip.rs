@@ -74,6 +74,7 @@ fn minimal_parties() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
             // Domestic posture for legacy test fixtures.
             customer_vat_status: CustomerVatStatus::Domestic,
@@ -347,6 +348,7 @@ fn minimal_parties_private_person() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // S154 / ADR-0048 — PRIVATE_PERSON suppresses tax + address.
             customer_vat_status: CustomerVatStatus::PrivatePerson,
             tax_number: None,
