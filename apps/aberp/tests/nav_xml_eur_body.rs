@@ -99,6 +99,7 @@ fn build_eur_invoice() -> ReadyInvoice {
                 quantity: rust_decimal::Decimal::from(2),
                 unit_price: Huf(1000), // 10.00 EUR per unit
                 vat_rate_basis_points: 2700,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             },
@@ -107,6 +108,7 @@ fn build_eur_invoice() -> ReadyInvoice {
                 quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(5000), // 50.00 EUR
                 vat_rate_basis_points: 2700,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             },
@@ -135,6 +137,7 @@ fn build_huf_invoice() -> ReadyInvoice {
                 quantity: rust_decimal::Decimal::from(2),
                 unit_price: Huf(1000),
                 vat_rate_basis_points: 2700,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             },
@@ -143,6 +146,7 @@ fn build_huf_invoice() -> ReadyInvoice {
                 quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(5000),
                 vat_rate_basis_points: 2700,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             },

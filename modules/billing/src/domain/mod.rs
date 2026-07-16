@@ -20,6 +20,10 @@
 //!                   unit to the NAV `<unitOfMeasure>` emit).
 //! - [`payment_method`] S160 — `PaymentMethod`, the per-invoice NAV
 //!                   `<paymentMethod>` closed-vocab snapshot (ADR-0050).
+//! - [`vat_rate_kind`] ADR-0101 — `VatRateKind`, the per-line closed-vocab
+//!                   discriminant selecting the NAV `<lineVatRate>` choice
+//!                   element (`vatPercentage` / `vatExemption` /
+//!                   `vatOutOfScope` / `vatDomesticReverseCharge`).
 
 pub mod ids;
 pub mod invoice;
@@ -29,3 +33,4 @@ pub mod payment_method;
 pub mod reservation;
 pub mod series;
 pub mod unit_of_measure;
+pub mod vat_rate_kind;

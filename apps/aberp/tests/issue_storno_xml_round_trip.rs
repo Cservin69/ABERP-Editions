@@ -48,6 +48,7 @@ fn build_minimal_storno_invoice() -> ReadyInvoice {
             // `nav_xml::render_storno_data` doc comment.
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }],
@@ -529,6 +530,7 @@ fn read_invoice_number_from_xml_round_trips_across_emit_shapes() {
                 quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(1000),
                 vat_rate_basis_points: 2700,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             }],
@@ -804,6 +806,7 @@ fn storno_line_operation_is_create_across_input_variations() {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -812,6 +815,7 @@ fn storno_line_operation_is_create_across_input_variations() {
             quantity: rust_decimal::Decimal::from(2),
             unit_price: Huf(500),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -820,6 +824,7 @@ fn storno_line_operation_is_create_across_input_variations() {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(123),
             vat_rate_basis_points: 0,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -871,6 +876,7 @@ fn build_storno_invoice_with_lines(n: usize) -> ReadyInvoice {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         })
@@ -1107,6 +1113,7 @@ fn read_invoice_lines_from_xml_round_trips_through_re_render() {
             quantity: rust_decimal::Decimal::from(3),
             unit_price: Huf(1234),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -1115,6 +1122,7 @@ fn read_invoice_lines_from_xml_round_trips_through_re_render() {
             quantity: rust_decimal::Decimal::new(15, 1), // 1.5
             unit_price: Huf(800),
             vat_rate_basis_points: 500, // 5%
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: Some(ProductUnit::Nav(NavUnitOfMeasure::Day)),
         },
@@ -1123,6 +1131,7 @@ fn read_invoice_lines_from_xml_round_trips_through_re_render() {
             quantity: rust_decimal::Decimal::from(2),
             unit_price: Huf(50),
             vat_rate_basis_points: 0,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: Some(ProductUnit::Own("liter@15C".to_string())),
         },
@@ -1224,6 +1233,7 @@ fn storno_render_reverses_base_plus_saved_modification_lines() {
         quantity: rust_decimal::Decimal::from(4),
         unit_price: Huf(250),
         vat_rate_basis_points: 2700,
+        vat_rate_kind: aberp_billing::VatRateKind::Percent,
         note: None,
         unit: None,
     });
@@ -1232,6 +1242,7 @@ fn storno_render_reverses_base_plus_saved_modification_lines() {
         quantity: rust_decimal::Decimal::from(7),
         unit_price: Huf(100),
         vat_rate_basis_points: 2700,
+        vat_rate_kind: aberp_billing::VatRateKind::Percent,
         note: None,
         unit: None,
     });

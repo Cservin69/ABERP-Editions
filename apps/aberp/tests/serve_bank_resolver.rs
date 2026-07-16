@@ -124,6 +124,7 @@ fn fixture_lines() -> Vec<LineJson> {
         quantity: rust_decimal::Decimal::from(1),
         unit_price: 10_000,
         vat_rate_percent: 27,
+        vat_rate_kind: aberp_billing::VatRateKind::Percent,
         note: None,
         unit: None,
     }]

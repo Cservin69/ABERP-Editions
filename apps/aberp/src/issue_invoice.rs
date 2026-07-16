@@ -52,7 +52,7 @@ use aberp_billing::{
     self as billing, huf_equivalent_round_half_even, AllocateArgs, AllocateOutcome,
     BankAccountSnapshot, BillingStore, Currency, CustomerId, DraftInvoice, DuckDbBillingStore, Huf,
     IdempotencyKey, InvoiceId, InvoiceSeries, IssueInvoiceCommand, LineItem, PaymentMethod,
-    ProductUnit, RateMetadata, ResetPolicy, SeriesCode, SeriesId,
+    ProductUnit, RateMetadata, ResetPolicy, SeriesCode, SeriesId, VatRateKind,
 };
 use aberp_mnb_rates::{MnbError, MnbRate, SOURCE as MNB_SOURCE};
 use aberp_nav_transport::operations::query_invoice_check::QueryInvoiceCheckOutcome;
@@ -286,6 +286,18 @@ pub struct LineJson {
     pub unit_price: i64,
     #[serde(rename = "vatRatePercent")]
     pub vat_rate_percent: u16,
+    /// ADR-0101 — the per-line VAT rate-KIND. `#[serde(default)]` →
+    /// `VatRateKind::Percent` when absent, so pre-0101 side-stored
+    /// `input.json` bodies (replayed by the storno / modification flows)
+    /// AND today's SPA/CLI callers (which do not send this field yet)
+    /// deserialize as `Percent` and round-trip byte-identically
+    /// (ADR-0101 §5). `Percent` keeps the numeric `vat_rate_percent`
+    /// meaning; the non-`Percent` kinds are 0%-VAT category lines. NOTE
+    /// (ADR-0101 §9): Session 1 keeps preflight REJECTING every
+    /// non-`Percent` kind — no invoice can carry one yet; Session 2 opens
+    /// that door behind the NAV-category adversarial review.
+    #[serde(default, rename = "vatRateKind")]
+    pub vat_rate_kind: VatRateKind,
     /// PR-82 — buyer-facing per-line note ("Megjegyzés"). Optional;
     /// `None` for lines the operator does not annotate. Recipient-
     /// facing only — NEVER reaches the NAV InvoiceData XML. Pre-PR-82
@@ -1305,6 +1317,12 @@ fn build_command(input: &InvoiceInputJson, code: &SeriesCode) -> Result<IssueInv
             quantity: l.quantity,
             unit_price: Huf(l.unit_price),
             vat_rate_basis_points: percent_to_basis_points(l.vat_rate_percent),
+            // ADR-0101 — carry the per-line VAT rate-kind through to the
+            // NAV emit. Pre-0101 bodies default to `Percent` (byte-identical
+            // path). Session-1 preflight has already rejected any
+            // non-`Percent` kind before this command is built, so in
+            // Session 1 this is always `Percent` in practice.
+            vat_rate_kind: l.vat_rate_kind,
             // PR-82 — per-line buyer note threads from the wire body
             // through to `LineItem`. The NAV emitter does not consume
             // this field; the printed-PDF + SPA detail surfaces do.

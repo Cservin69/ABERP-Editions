@@ -1466,6 +1466,12 @@ fn build_storno_command(
             quantity: l.quantity,
             unit_price: Huf(l.unit_price),
             vat_rate_basis_points: percent_to_basis_points(l.vat_rate_percent),
+            // ADR-0101 — carry the base line's VAT rate-kind through the
+            // storno so the negated correction line emits the SAME
+            // `<lineVatRate>` choice as the original (read off the
+            // side-store `input.json`). `negate_line` preserves it too.
+            // Pre-0101 bodies default to `Percent`.
+            vat_rate_kind: l.vat_rate_kind,
             // PR-82 — pass through whatever per-line note the
             // side-stored input.json carries from the base's issuance.
             // The negation step `negate_line` preserves notes too, so

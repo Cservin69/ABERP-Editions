@@ -1,7 +1,7 @@
 //! Integration tests for `POST /api/invoices/:id/modification` (PR-47β
 //! / session-65).
 //!
-//! Three pin tests:
+//! Pin tests:
 //!
 //! 1. **Modification precondition mismatch (Ready)** — POSTing
 //!    modification on an invoice that is only `Ready` (never submitted)
@@ -20,6 +20,14 @@
 //!    unknown invoice id must surface as `NotFound`. The audit ledger
 //!    carries no entries for the id; the helper rejects before any
 //!    DB write.
+//! 4. **Non-`Percent` base rejected (ADR-0101 / S2)** — modifying a base
+//!    that carries any fully-wired VAT rate-kind must surface as
+//!    `BadRequest` steering to the CLI. The SPA modification wire path
+//!    does not yet thread `vat_rate_kind`, so proceeding would silently
+//!    re-file the invoice to NAV as plain 0% VAT (CLAUDE.md rule 11).
+//! 5. **`Percent` base transparent (ADR-0101 / S2)** — the guard fires
+//!    ONLY on a non-`Percent` base; a `Percent` base falls straight
+//!    through to the pre-existing checks (byte-identical behaviour).
 //!
 //! The actual modification-issuance happy path is exercised by the
 //! existing `tests/issue_modification_local.rs` (CLI surface) —
@@ -105,6 +113,7 @@ fn fixture_ready_invoice() -> ReadyInvoice {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }],
@@ -139,6 +148,7 @@ fn fixture_request_body(currency: aberp_billing::Currency) -> ModificationInvoic
             quantity: rust_decimal::Decimal::from(2),
             unit_price: 1500,
             vat_rate_percent: 27,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }],
@@ -324,6 +334,7 @@ async fn modification_route_rejects_c6_currency_mismatch_with_bad_request() {
                 quantity: rust_decimal::Decimal::from(1),
                 unit_price: 1000,
                 vat_rate_percent: 27,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             }],
@@ -439,6 +450,208 @@ fn modification_route_returns_not_found_for_unknown_invoice() {
             );
         }
         other => panic!("expected NotFound, got {other:?}"),
+    }
+    let _keep = &dir;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ADR-0101 / S2 — non-`Percent` base modification guard
+// ──────────────────────────────────────────────────────────────────────
+
+/// Issue a base invoice carrying `kind` at `rate_percent`% VAT (HUF),
+/// then Finalize it (attempt / response / SAVED-ack) so the modification
+/// precondition passes. Returns the base invoice id. Mirrors the C6
+/// fixture's seed pattern: `issue_from_parsed` co-creates the billing row
+/// + audit trace, and the direct ledger appends finalize it. HUF-only —
+/// the vat-kind guard is currency-independent, and HUF avoids the MNB rate
+/// provider (`NeverProvider`).
+async fn issue_and_finalize_base(
+    db_path: &PathBuf,
+    kind: aberp_billing::VatRateKind,
+    rate_percent: u16,
+) -> String {
+    let xml_out = db_path
+        .parent()
+        .expect("db dir")
+        .join(format!("base-{}.xml", Ulid::new()));
+    // H3 (ADR-0099): open a scoped seed handle for the base issuance and
+    // DROP it before `build_state` opens the AppState's own handle on the
+    // same path (sequential, never overlapping).
+    let seed_handle = aberp::serve::open_tenant_handle(
+        db_path,
+        TenantId::new(TEST_TENANT.to_string()).expect("seed tenant id"),
+    )
+    .expect("open seed handle for base invoice");
+    {
+        let guard = seed_handle.write().expect("seed write guard");
+        aberp_audit_ledger::ensure_schema(&guard).expect("ensure audit-ledger schema (seed)");
+    }
+    aberp::issue_invoice::issue_from_parsed(
+        aberp::issue_invoice::InvoiceInputJson {
+            supplier: SupplierJson {
+                tax_number: "12345678-1-42".to_string(),
+                name: "Test Supplier Kft.".to_string(),
+                address: AddressJson {
+                    country_code: "HU".to_string(),
+                    postal_code: "1011".to_string(),
+                    city: "Budapest".to_string(),
+                    street: "Fő utca 1.".to_string(),
+                },
+            },
+            customer: CustomerJson {
+                vat_status: CustomerVatStatus::Domestic,
+                partner_id: None,
+                tax_number: "87654321-2-13".to_string(),
+                name: "Test Buyer Kft.".to_string(),
+                address: Some(AddressJson {
+                    country_code: "HU".to_string(),
+                    postal_code: "1052".to_string(),
+                    city: "Budapest".to_string(),
+                    street: "Váci utca 19.".to_string(),
+                }),
+            },
+            lines: vec![LineJson {
+                description: "Base line".to_string(),
+                quantity: rust_decimal::Decimal::from(1),
+                unit_price: 1000,
+                vat_rate_percent: rate_percent,
+                vat_rate_kind: kind,
+                note: None,
+                unit: None,
+            }],
+            invoice_note: None,
+            payment_deadline: None,
+            delivery_date: None,
+            delivery_date_override: None,
+            payment_method: aberp_billing::PaymentMethod::default(),
+            email_recipient_override: None,
+        },
+        &seed_handle,
+        TEST_TENANT,
+        "INV-default",
+        aberp_billing::Currency::Huf,
+        xml_out,
+        Actor::from_local_cli("sess".to_string(), "test-user"),
+        &NeverProvider,
+        None,
+        None,
+    )
+    .await
+    .expect("issue base invoice");
+    drop(seed_handle);
+
+    let base_invoice_id = {
+        let ledger = open_ledger(db_path);
+        let entries = ledger.entries().expect("ledger entries");
+        let mut id: Option<String> = None;
+        for entry in &entries {
+            if entry.kind == EventKind::InvoiceDraftCreated {
+                let parsed: InvoiceDraftCreatedPayload =
+                    serde_json::from_slice(&entry.payload).expect("parse draft payload");
+                id = Some(parsed.invoice_id);
+                break;
+            }
+        }
+        id.expect("base invoice id from ledger")
+    };
+
+    let actor = Actor::from_local_cli("sess".to_string(), "test-user");
+    let txid = "TXID-MODGUARD";
+    let idem = IdempotencyKey::new();
+    {
+        let mut ledger = open_ledger(db_path);
+        write_attempt(&mut ledger, &actor, &base_invoice_id, idem);
+        write_response(&mut ledger, &actor, &base_invoice_id, idem, txid);
+        write_ack(&mut ledger, &actor, &base_invoice_id, txid, "SAVED");
+    }
+
+    base_invoice_id
+}
+
+/// ADR-0101 / S2 — modifying a non-`Percent` base through the SPA route is
+/// loudly rejected server-side for EVERY fully-wired kind (AAM / domestic
+/// reverse-charge / intra-Community goods / intra-Community service
+/// reverse). Without the guard the route would rebuild the modification
+/// body from `request.lines` — whose `vat_rate_kind` deserialises as
+/// `#[serde(default)]` `Percent` because `composeModificationBody` omits
+/// it — and silently re-file the invoice to NAV as plain 0% VAT, dropping
+/// the exemption / self-assessment (CLAUDE.md rule 11, worst class). The
+/// body currency MATCHES the base (HUF) so the ONLY thing that can reject
+/// is the vat-kind guard: were it absent, the call would proceed past both
+/// early guards into real issuance and NOT return this `BadRequest`.
+#[tokio::test(flavor = "current_thread")]
+async fn modification_route_rejects_non_percent_base_for_every_wired_kind() {
+    for kind in [
+        aberp_billing::VatRateKind::AamExempt,
+        aberp_billing::VatRateKind::DomesticReverseCharge,
+        aberp_billing::VatRateKind::IntraCommunityGoods,
+        aberp_billing::VatRateKind::IntraCommunityServiceReverse,
+    ] {
+        let dir = test_dir(&format!("modification-reject-{}", kind.as_str()));
+        let db_path = dir.join("aberp.duckdb");
+        // Wired non-`Percent` kinds require a 0% line (ADR-0101 §4 preflight).
+        let base_invoice_id = issue_and_finalize_base(&db_path, kind, 0).await;
+
+        let state = build_state(db_path);
+        let body = fixture_request_body(aberp_billing::Currency::Huf);
+        let err = serve::modification_invoice_request(&state, &base_invoice_id, body)
+            .expect_err("modification of a non-Percent base must reject");
+        match err {
+            ModificationRouteError::BadRequest(message) => {
+                assert!(
+                    message.contains("not supported in the app"),
+                    "guard message must steer to CLI, got: {message}"
+                );
+                assert!(
+                    message.contains(kind.as_str()),
+                    "guard message must name the base kind {}, got: {message}",
+                    kind.as_str()
+                );
+                assert!(
+                    message.contains("aberp issue-modification"),
+                    "guard message must name the CLI fallback, got: {message}"
+                );
+            }
+            other => panic!(
+                "expected BadRequest for kind {}, got {other:?}",
+                kind.as_str()
+            ),
+        }
+        let _keep = &dir;
+    }
+}
+
+/// Regression pin (ADR-0101 / S2) — a `Percent` base is fully transparent
+/// to the new non-`Percent` modification guard: byte-identical behaviour.
+/// The guard runs BEFORE the C6 currency check, so a `Percent` base + a
+/// mismatched-currency body must still surface the C6 `BadRequest` (proving
+/// the guard let the `Percent` base straight through), NOT the vat-kind
+/// rejection.
+#[tokio::test(flavor = "current_thread")]
+async fn modification_route_percent_base_is_transparent_to_vat_kind_guard() {
+    let dir = test_dir("modification-percent-transparent");
+    let db_path = dir.join("aberp.duckdb");
+    let base_invoice_id =
+        issue_and_finalize_base(&db_path, aberp_billing::VatRateKind::Percent, 27).await;
+
+    let state = build_state(db_path);
+    // Mismatched currency (EUR vs stored HUF): the guard (Percent → pass)
+    // must fall through to the C6 check, which rejects.
+    let body = fixture_request_body(aberp_billing::Currency::Eur);
+    let err = serve::modification_invoice_request(&state, &base_invoice_id, body)
+        .expect_err("Percent base + mismatched currency must reject at the C6 check");
+    match err {
+        ModificationRouteError::BadRequest(message) => {
+            assert!(
+                message.contains("C6"),
+                "Percent base must reach the C6 check, got: {message}"
+            );
+            assert!(
+                !message.contains("VAT rate-kind"),
+                "Percent base must NOT trip the vat-kind guard, got: {message}"
+            );
+        }
+        other => panic!("expected C6 BadRequest, got {other:?}"),
     }
     let _keep = &dir;
 }

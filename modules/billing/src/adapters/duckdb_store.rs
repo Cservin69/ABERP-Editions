@@ -36,6 +36,7 @@ use crate::domain::invoice::{LineItem, ReadyInvoice};
 use crate::domain::money::{Currency, Huf};
 use crate::domain::reservation::{ReservationStatus, SequenceReservation};
 use crate::domain::series::{InvoiceSeries, ResetPolicy, SeriesCode};
+use crate::domain::vat_rate_kind::VatRateKind;
 use crate::ports::storage::{AllocateArgs, AllocateOutcome, BillingStore};
 
 // PR-73 / ADR-0040 §addendum added the per-invoice bank-account-snapshot
@@ -191,6 +192,16 @@ CREATE TABLE IF NOT EXISTS invoice_line (
     -- facing only; never emitted into the NAV InvoiceData XML. Nullable;
     -- pre-PR-82 rows gain the column via MIGRATE_PR_82_SQL and stay NULL.
     note                  VARCHAR,
+    -- ADR-0101 — per-line VAT rate-KIND (closed vocab: 'Percent' (default)
+    -- / 'AamExempt' / 'DomesticReverseCharge' / 'IntraCommunityGoods' /
+    -- 'IntraCommunityServiceReverse' / named-deferred remainder). Selects
+    -- which NAV `<lineVatRate>` choice element the line emits. Fresh DBs
+    -- create it NOT NULL DEFAULT 'Percent'; pre-0101 DBs gain it via
+    -- MIGRATE_S<adr0101>_SQL as a nullable column backfilled to 'Percent'
+    -- (DuckDB v1's `ALTER TABLE ADD COLUMN` rejects inline constraints —
+    -- same trap the PR-44γ / S157 migrations documented). The read path
+    -- treats NULL as 'Percent', so fresh + migrated DBs converge.
+    vat_rate_kind         VARCHAR NOT NULL DEFAULT 'Percent',
     PRIMARY KEY (invoice_id, ordinal)
 );
 "#;
@@ -345,6 +356,31 @@ ALTER TABLE invoice_line ADD COLUMN IF NOT EXISTS quantity_dec DECIMAL(18, 6);
 UPDATE invoice_line SET quantity_dec = quantity WHERE quantity_dec IS NULL;
 ALTER TABLE invoice_line DROP COLUMN IF EXISTS quantity;
 ALTER TABLE invoice_line RENAME COLUMN quantity_dec TO quantity;
+";
+
+/// ADR-0101 — additive migration for the per-line `vat_rate_kind` column.
+///
+/// Mirrors the PR-44γ / PR-82 posture: idempotent `ADD COLUMN IF NOT
+/// EXISTS`, then an `UPDATE` backfill. DuckDB v1's `ALTER TABLE ADD
+/// COLUMN` rejects the inline `NOT NULL DEFAULT 'Percent'` the fresh
+/// `CREATE_TABLES_SQL` carries ("Adding columns with constraints not yet
+/// supported"), so the migrated column is added bare (nullable) and the
+/// follow-up `UPDATE` backfills every pre-0101 row to `'Percent'`.
+///
+/// # Byte-identity (ADR-0101 §5)
+///
+/// The backfill writes the string `'Percent'`, which is EXACTLY the value
+/// the read path resolves a NULL / absent kind to. Every existing row
+/// therefore hydrates as `VatRateKind::Percent` and emits the same
+/// `<vatPercentage>` bytes it did pre-0101 — the migration changes no
+/// emitted byte for any existing invoice.
+///
+/// Idempotent and cheap to re-run every boot: the `IF NOT EXISTS` makes
+/// the ALTER a no-op on fresh + already-migrated DBs, and the `UPDATE`
+/// touches only rows still NULL (none after the first run).
+const MIGRATE_ADR0101_SQL: &str = "
+ALTER TABLE invoice_line ADD COLUMN IF NOT EXISTS vat_rate_kind VARCHAR;
+UPDATE invoice_line SET vat_rate_kind = 'Percent' WHERE vat_rate_kind IS NULL;
 ";
 
 #[derive(Debug)]
@@ -771,8 +807,8 @@ pub fn allocate_in_tx(
         tx.execute(
             "INSERT INTO invoice_line
              (invoice_id, ordinal, description, quantity,
-              unit_price, vat_rate_basis_points, note)
-             VALUES (?, ?, ?, ?, ?, ?, ?);",
+              unit_price, vat_rate_basis_points, note, vat_rate_kind)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
             params![
                 draft.id.to_prefixed_string(),
                 ordinal as i64,
@@ -784,6 +820,11 @@ pub fn allocate_in_tx(
                 line.unit_price.as_i64(),
                 line.vat_rate_basis_points as i64,
                 &line.note,
+                // ADR-0101 — persist the per-line VAT rate-kind as its
+                // canonical string. `Percent` lines write 'Percent', which
+                // is what a pre-0101 / migrated row also carries, so the
+                // report GROUP-BY (Session 3) and any hydrate see one value.
+                line.vat_rate_kind.as_str(),
             ],
         )?;
     }
@@ -855,6 +896,11 @@ impl BillingStore for DuckDbBillingStore {
         if self.quantity_column_is_integer()? {
             self.conn.execute_batch(MIGRATE_S157_SQL)?;
         }
+        // ADR-0101 — additive migration for the per-line `vat_rate_kind`
+        // column. Idempotent; pre-0101 DBs gain it nullable then backfill
+        // to 'Percent' (the read path treats NULL as 'Percent' regardless,
+        // so no emitted byte changes for existing invoices — ADR-0101 §5).
+        self.conn.execute_batch(MIGRATE_ADR0101_SQL)?;
         Ok(())
     }
 
@@ -1179,7 +1225,7 @@ fn load_invoice(
     // gain trailing zeros from the DECIMAL(18,6) scale); the emit/render
     // layers `.normalize()` those away.
     let mut stmt = tx.prepare(
-        "SELECT description, CAST(quantity AS VARCHAR), unit_price, vat_rate_basis_points, note
+        "SELECT description, CAST(quantity AS VARCHAR), unit_price, vat_rate_basis_points, note, vat_rate_kind
          FROM invoice_line WHERE invoice_id = ? ORDER BY ordinal ASC;",
     )?;
     let rows = stmt.query_map([invoice_id_str], |r| {
@@ -1189,19 +1235,33 @@ fn load_invoice(
             r.get::<_, i64>(2)?,
             r.get::<_, i64>(3)?,
             r.get::<_, Option<String>>(4)?,
+            // ADR-0101 — `Option<String>`: a pre-0101 row that predates the
+            // additive migration's backfill reads NULL; resolved to Percent
+            // below. Post-migration + fresh rows always carry a value.
+            r.get::<_, Option<String>>(5)?,
         ))
     })?;
     let mut lines = Vec::new();
     for r in rows {
-        let (description, quantity_str, unit_price, vat, note) = r?;
+        let (description, quantity_str, unit_price, vat, note, vat_rate_kind_str) = r?;
         let quantity = Decimal::from_str(&quantity_str)
             .map_err(|_| BillingError::Invalid("stored invoice_line.quantity is not a decimal"))?;
+        // ADR-0101 — NULL (pre-0101, pre-backfill) → Percent; a present
+        // value must parse to a known kind or the row is corrupt (fail
+        // loud, CLAUDE.md rule 11 — no silent default to Percent).
+        let vat_rate_kind = match vat_rate_kind_str {
+            None => VatRateKind::Percent,
+            Some(s) => VatRateKind::from_db_str(&s).ok_or(BillingError::Invalid(
+                "stored invoice_line.vat_rate_kind is not a known kind",
+            ))?,
+        };
         lines.push(LineItem {
             description,
             quantity,
             unit_price: Huf(unit_price),
             vat_rate_basis_points: vat as u16,
             note,
+            vat_rate_kind,
             // S159 — the unit is NOT persisted on `invoice_line` (no
             // column; it rides the side-store `input.json` per-line
             // payload). A DB-reconstructed line therefore carries

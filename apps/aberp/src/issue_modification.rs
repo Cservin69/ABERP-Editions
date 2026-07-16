@@ -1108,6 +1108,11 @@ fn build_modification_command(
             quantity: l.quantity,
             unit_price: Huf(l.unit_price),
             vat_rate_basis_points: percent_to_basis_points(l.vat_rate_percent),
+            // ADR-0101 — carry each line's VAT rate-kind through the
+            // modification chain so the replacement lines emit the SAME
+            // `<lineVatRate>` choice as the side-store `input.json` recorded
+            // at the base's issuance. Pre-0101 bodies default to `Percent`.
+            vat_rate_kind: l.vat_rate_kind,
             // PR-82 — pass through any per-line note. Modification
             // chains inherit the base's notes naturally; operator-
             // facing edits to per-line notes on modifications are

@@ -117,6 +117,7 @@ fn fixture_ready_invoice(
             quantity,
             unit_price: Huf(unit_price_minor),
             vat_rate_basis_points: vat_bps,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }],

@@ -43,6 +43,7 @@ fn build_minimal_invoice() -> ReadyInvoice {
                 quantity: rust_decimal::Decimal::from(2),
                 unit_price: Huf(1000),
                 vat_rate_basis_points: 2700, // 27%
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             },
@@ -51,6 +52,7 @@ fn build_minimal_invoice() -> ReadyInvoice {
                 quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(5000),
                 vat_rate_basis_points: 2700,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             },
@@ -129,6 +131,7 @@ fn decimal_quantity_emits_dot_separated_and_validates() {
         quantity: rust_decimal::Decimal::new(15, 1), // 1.5
         unit_price: Huf(1000),
         vat_rate_basis_points: 2700,
+        vat_rate_kind: aberp_billing::VatRateKind::Percent,
         note: None,
         unit: None,
     }];

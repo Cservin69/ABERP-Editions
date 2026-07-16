@@ -139,6 +139,9 @@ pub fn quote_to_draft_invoice(
         quantity,
         unit_price: Huf::ZERO,
         vat_rate_basis_points: DEFAULT_VAT_BP,
+        // ADR-0101 — quote-intake maps to the default numeric-rate kind
+        // (a quote is always a standard-percentage line today).
+        vat_rate_kind: aberp_billing::VatRateKind::Percent,
         note: None,
         unit: Some(ProductUnit::Nav(NavUnitOfMeasure::Piece)),
     };

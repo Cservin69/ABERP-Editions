@@ -35,7 +35,7 @@
 
 use aberp_billing::{
     huf_equivalent_round_half_even, Currency, Huf, LineItem, NavUnitOfMeasure, PaymentMethod,
-    ProductUnit, RateMetadata, ReadyInvoice, SeriesCode,
+    ProductUnit, RateMetadata, ReadyInvoice, SeriesCode, VatRateKind,
 };
 use anyhow::{anyhow, Context, Result};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
@@ -1086,6 +1086,11 @@ fn negate_line(line: &LineItem) -> LineItem {
         quantity: -line.quantity,
         unit_price: line.unit_price,
         vat_rate_basis_points: line.vat_rate_basis_points,
+        // ADR-0101 — preserve the base line's VAT rate-kind verbatim
+        // through negation. Like the description and VAT rate, the kind is
+        // not part of the amount-sign reversal; carrying it forward keeps
+        // the storno's `<lineVatRate>` choice element identical to the base.
+        vat_rate_kind: line.vat_rate_kind,
         // PR-82 — preserve the base's per-line `note` verbatim through
         // negation. The note is recipient-facing metadata, NOT part of
         // the amount-sign reversal; carrying it forward keeps the
@@ -1515,7 +1520,7 @@ fn write_lines(
 
         w.write_event(Event::Start(BytesStart::new("lineAmountsNormal")))?;
         write_line_net(w, net, currency, rate_metadata)?;
-        write_line_vat_rate(w, line.vat_rate_basis_points)?;
+        write_line_vat_rate(w, line.vat_rate_kind, line.vat_rate_basis_points)?;
         write_line_vat_amount(w, vat, currency, rate_metadata)?;
         write_line_gross(w, gross, currency, rate_metadata)?;
         w.write_event(Event::End(BytesEnd::new("lineAmountsNormal")))?;
@@ -1543,18 +1548,120 @@ fn write_line_net(
     w.write_event(Event::End(BytesEnd::new("lineNetAmountData")))?;
     Ok(())
 }
-/// Write <vatRate> for summary (not <lineVatRate>).
-fn write_vat_rate(w: &mut Writer<&mut Vec<u8>>, vat_rate_basis_points: u16) -> Result<()> {
-    let rate_decimal = format!("{:.2}", vat_rate_basis_points as f64 / 10000.0);
+/// ADR-0101 — the NAV `<lineVatRate>` / `<vatRate>` choice a
+/// [`VatRateKind`] resolves to. This is the SINGLE source of truth for the
+/// `(element, case, reason)` triple (ADR-0101 §3.2 / CLAUDE.md rule 5 —
+/// code answers the deterministic transform; the model stores only the
+/// kind). Consumed by BOTH the per-line emit (`write_line_vat_rate`) and
+/// the invoice-level summary mirror (`write_vat_rate`) so a line and its
+/// `summaryByVatRate` bucket can never disagree (§3.4 — a line/summary
+/// category mismatch is itself a NAV rejection).
+enum VatRateChoice {
+    /// `<vatPercentage>{rate}</vatPercentage>` — the numeric path,
+    /// byte-identical to the pre-0101 emit.
+    Percentage,
+    /// `<vatExemption><case>{case}</case><reason>{reason}</reason></…>`.
+    Exemption {
+        case: &'static str,
+        reason: &'static str,
+    },
+    /// `<vatOutOfScope><case>{case}</case><reason>{reason}</reason></…>`.
+    OutOfScope {
+        case: &'static str,
+        reason: &'static str,
+    },
+    /// `<vatDomesticReverseCharge>true</vatDomesticReverseCharge>` — a
+    /// boolean element with no case code.
+    DomesticReverseCharge,
+}
+
+/// Map a [`VatRateKind`] to its NAV choice. Case codes CONFIRMED by Ervin
+/// on the record (2026-07-15) — AAM / KBAET / EUFAD37 / the
+/// `vatDomesticReverseCharge` boolean. `reason` is a statutory Hungarian
+/// free-text string (NAV requires non-blank; it is NOT buyer PII — the
+/// ADR-0042 notes firewall is unaffected). The named-deferred kinds
+/// (ADR-0101 §3.1) `anyhow!` here as explicit not-yet markers (CLAUDE.md
+/// rule 12) — they are unreachable in Session 1 because preflight rejects
+/// every non-`Percent` kind before emit.
+fn vat_rate_choice(kind: VatRateKind) -> Result<VatRateChoice> {
+    Ok(match kind {
+        VatRateKind::Percent => VatRateChoice::Percentage,
+        VatRateKind::AamExempt => VatRateChoice::Exemption {
+            case: "AAM",
+            reason: "Alanyi adómentesség [Áfa tv. 187–196. §]",
+        },
+        VatRateKind::IntraCommunityGoods => VatRateChoice::Exemption {
+            case: "KBAET",
+            reason: "Közösségen belüli adómentes termékértékesítés [Áfa tv. 89. §]",
+        },
+        VatRateKind::IntraCommunityServiceReverse => VatRateChoice::OutOfScope {
+            case: "EUFAD37",
+            reason: "Áfa területi hatályán kívüli, fordított adózású ügylet [Áfa tv. 37. §]",
+        },
+        VatRateKind::DomesticReverseCharge => VatRateChoice::DomesticReverseCharge,
+        // ── named-deferred (ADR-0101 §3.1 / §10.4) — unreachable in
+        //    Session 1 (preflight shut door). Wiring one is a later PR that
+        //    must confirm its own NAV case code first. ──
+        other => {
+            return Err(anyhow!(
+                "VatRateKind::{other:?} is ADR-0101 named-deferred; NAV emit is not yet wired \
+                 for it (confirm its NAV case code first)"
+            ))
+        }
+    })
+}
+
+/// Write the inner choice element of a `<lineVatRate>` / `<vatRate>`.
+/// Shared so the per-line emit and the summary mirror stay in lock-step.
+fn write_vat_rate_choice(
+    w: &mut Writer<&mut Vec<u8>>,
+    kind: VatRateKind,
+    vat_rate_basis_points: u16,
+) -> Result<()> {
+    match vat_rate_choice(kind)? {
+        VatRateChoice::Percentage => {
+            let rate_decimal = format!("{:.2}", vat_rate_basis_points as f64 / 10000.0);
+            text_element(w, "vatPercentage", &rate_decimal)?;
+        }
+        VatRateChoice::Exemption { case, reason } => {
+            w.write_event(Event::Start(BytesStart::new("vatExemption")))?;
+            text_element(w, "case", case)?;
+            text_element(w, "reason", reason)?;
+            w.write_event(Event::End(BytesEnd::new("vatExemption")))?;
+        }
+        VatRateChoice::OutOfScope { case, reason } => {
+            w.write_event(Event::Start(BytesStart::new("vatOutOfScope")))?;
+            text_element(w, "case", case)?;
+            text_element(w, "reason", reason)?;
+            w.write_event(Event::End(BytesEnd::new("vatOutOfScope")))?;
+        }
+        VatRateChoice::DomesticReverseCharge => {
+            text_element(w, "vatDomesticReverseCharge", "true")?;
+        }
+    }
+    Ok(())
+}
+
+/// Write <vatRate> for summary (not <lineVatRate>). ADR-0101 — the summary
+/// mirror: same choice shape as the line, keyed on the (single) invoice
+/// kind so the `summaryByVatRate` bucket matches the lines (§3.4).
+fn write_vat_rate(
+    w: &mut Writer<&mut Vec<u8>>,
+    kind: VatRateKind,
+    vat_rate_basis_points: u16,
+) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("vatRate")))?;
-    text_element(w, "vatPercentage", &rate_decimal)?;
+    write_vat_rate_choice(w, kind, vat_rate_basis_points)?;
     w.write_event(Event::End(BytesEnd::new("vatRate")))?;
     Ok(())
 }
-fn write_line_vat_rate(w: &mut Writer<&mut Vec<u8>>, vat_rate_basis_points: u16) -> Result<()> {
-    let rate_decimal = format!("{:.2}", vat_rate_basis_points as f64 / 10000.0);
+fn write_line_vat_rate(
+    w: &mut Writer<&mut Vec<u8>>,
+    kind: VatRateKind,
+    vat_rate_basis_points: u16,
+) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("lineVatRate")))?;
-    text_element(w, "vatPercentage", &rate_decimal)?;
+    write_vat_rate_choice(w, kind, vat_rate_basis_points)?;
     w.write_event(Event::End(BytesEnd::new("lineVatRate")))?;
     Ok(())
 }
@@ -1633,7 +1740,12 @@ fn write_summary(
     // multi-rate invoices).
     if let Some(first) = lines.first() {
         w.write_event(Event::Start(BytesStart::new("summaryByVatRate")))?;
-        write_vat_rate(w, first.vat_rate_basis_points)?;
+        // ADR-0101 §3.4 — the summary mirror keys on the first line's KIND
+        // as well as its rate, so the `summaryByVatRate` bucket's choice
+        // element matches the lines' (today's single-bucket posture assumes
+        // all lines share a rate/kind). A line/summary category mismatch is
+        // a NAV cross-field rejection.
+        write_vat_rate(w, first.vat_rate_kind, first.vat_rate_basis_points)?;
         w.write_event(Event::Start(BytesStart::new("vatRateNetData")))?;
         text_element(
             w,
@@ -2179,6 +2291,17 @@ fn line_item_from_acc(acc: &XmlLineAcc, path: &std::path::Path) -> Result<LineIt
         quantity,
         unit_price,
         vat_rate_basis_points,
+        // ADR-0101 / Session-1 shut door — every invoice on disk is a
+        // `Percent` line (preflight rejects every other kind), so this
+        // XML-reconstruction path only ever sees `<vatPercentage>` and
+        // `Percent` is exact. ⚠ Session-2 FLAG: when preflight opens to the
+        // non-`Percent` kinds, a chain-member XML that renders `vatExemption`
+        // / `vatOutOfScope` / `vatDomesticReverseCharge` instead of
+        // `<vatPercentage>` would loud-fail the `parse_vat_percentage…`
+        // step above (no silent mis-categorisation — acceptable, but the
+        // storno-of-modification fold must then reconstruct the kind from
+        // the choice element here, or replay the side-store `input.json`).
+        vat_rate_kind: VatRateKind::Percent,
         // ADR-0042 — per-line notes are never in the NAV XML, so a
         // chain-member reversal carries none.
         note: None,

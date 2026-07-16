@@ -42,7 +42,7 @@
 //!     the SPA renders verbatim — translation duplication and drift
 //!     stay off the table.
 
-use aberp_billing::Currency;
+use aberp_billing::{Currency, VatRateKind};
 use rust_decimal::Decimal;
 
 use crate::nav_xml::{parse_hungarian_tax_number, CustomerVatStatus, SupplierConfigError};
@@ -139,6 +139,21 @@ pub enum InvoicePreflightError {
         actual: u16,
         allowed: &'static [u16],
     },
+    /// ADR-0101 §9 — the Session-1 SHUT DOOR. `lines[line_index]` carries
+    /// a `vat_rate_kind` other than `Percent`. The NAV machinery for the
+    /// 0%/exempt/reverse-charge kinds (model → schema → emit → validator)
+    /// ships in Session 1 but stays DORMANT: no invoice may actually be
+    /// issued in a new shape until Session 2 opens this gate behind the
+    /// mandatory NAV-category adversarial review. Until then every
+    /// non-`Percent` kind is rejected here, so the risky invoice→NAV/ÁFA
+    /// path has zero production exposure. Carries the rejected kind so the
+    /// message names it. When Session 2 lands, this variant is REPLACED by
+    /// the §4 accept/reject matrix (accept the four wired kinds when the
+    /// line is 0%, keep rejecting the named-deferred remainder).
+    LineItemVatRateKindNotYetIssuable {
+        line_index: usize,
+        kind: VatRateKind,
+    },
     /// PR-73 / ADR-0040 §addendum — `bank_account_id` omitted (or
     /// `None`) AND `seller_banks.default_bank_for(invoice.currency)`
     /// returned `None`. The operator must either add a bank-account
@@ -207,6 +222,9 @@ impl InvoicePreflightError {
                 "LineItemUnitPriceNonPositive"
             }
             InvoicePreflightError::LineItemVatRateUnknown { .. } => "LineItemVatRateUnknown",
+            InvoicePreflightError::LineItemVatRateKindNotYetIssuable { .. } => {
+                "LineItemVatRateKindNotYetIssuable"
+            }
             InvoicePreflightError::SellerBankMissingForCurrency { .. } => {
                 "SellerBankMissingForCurrency"
             }
@@ -246,6 +264,9 @@ impl InvoicePreflightError {
             }
             InvoicePreflightError::LineItemVatRateUnknown { line_index, .. } => {
                 format!("lines[{line_index}].vatRatePercent")
+            }
+            InvoicePreflightError::LineItemVatRateKindNotYetIssuable { line_index, .. } => {
+                format!("lines[{line_index}].vatRateKind")
             }
             InvoicePreflightError::SellerBankMissingForCurrency { .. }
             | InvoicePreflightError::SellerBankCurrencyMismatch { .. } => {
@@ -314,6 +335,13 @@ impl InvoicePreflightError {
                     "A(z) {}. tételsor ÁFA-kulcsa ({actual}%) nem szerepel a magyar szabványos kulcsok között ({}). Speciális kategóriák (AAM/TAM/TAH) jelenleg nem támogatottak.",
                     line_index + 1,
                     format_percent_list(allowed)
+                )
+            }
+            InvoicePreflightError::LineItemVatRateKindNotYetIssuable { line_index, kind } => {
+                format!(
+                    "A(z) {}. tételsor ÁFA-típusa ({}) még nem bocsátható ki. A 0%-os / adómentes / fordított adózású típusok NAV-gépezete készen áll, de átmenetileg zárolva van (ADR-0101). Használjon százalékos (Percent) ÁFA-kulcsot.",
+                    line_index + 1,
+                    kind.as_str()
                 )
             }
             InvoicePreflightError::SellerBankMissingForCurrency { currency } => {
@@ -397,6 +425,13 @@ impl InvoicePreflightError {
                     "Line {} VAT rate ({actual}%) is not a Hungarian standard rate (allowed: {}). Special categories (AAM/TAM/TAH) are not supported on this wire shape today.",
                     line_index + 1,
                     format_percent_list(allowed)
+                )
+            }
+            InvoicePreflightError::LineItemVatRateKindNotYetIssuable { line_index, kind } => {
+                format!(
+                    "Line {} VAT kind ({}) is not issuable yet. The NAV machinery for the 0%/exempt/reverse-charge kinds is in place but is deliberately gated shut (ADR-0101 Session 1); use a Percent VAT rate. Session 2 opens this behind the NAV-category adversarial review.",
+                    line_index + 1,
+                    kind.as_str()
                 )
             }
             InvoicePreflightError::SellerBankMissingForCurrency { currency } => {
@@ -628,7 +663,18 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
                     actual: line.unit_price,
                 });
             }
-            if !ALLOWED_VAT_RATES_PERCENT.contains(&line.vat_rate_percent) {
+            // ADR-0101 §9 — SHUT DOOR. Reject every non-`Percent` kind
+            // BEFORE the numeric-rate gate so a non-`Percent` line's
+            // (meaningless) `vat_rate_percent` does not ALSO trip
+            // `LineItemVatRateUnknown` — the operator sees the one precise
+            // "kind not issuable yet" error, not two. Session 2 replaces
+            // this branch with the §4 accept/reject matrix.
+            if !line.vat_rate_kind.is_percent() {
+                errors.push(InvoicePreflightError::LineItemVatRateKindNotYetIssuable {
+                    line_index,
+                    kind: line.vat_rate_kind,
+                });
+            } else if !ALLOWED_VAT_RATES_PERCENT.contains(&line.vat_rate_percent) {
                 errors.push(InvoicePreflightError::LineItemVatRateUnknown {
                     line_index,
                     actual: line.vat_rate_percent,
@@ -666,6 +712,7 @@ mod tests {
             quantity: Decimal::from(1),
             unit_price: 10_000,
             vat_rate_percent: 27,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }
@@ -714,6 +761,83 @@ mod tests {
     #[test]
     fn golden_valid_request_returns_empty_vec() {
         assert!(validate_invoice_preflight(&good_request()).is_empty());
+    }
+
+    /// ADR-0101 §9 — THE SHUT DOOR. Every non-`Percent` `vat_rate_kind`
+    /// must be rejected at preflight so NO invoice can be issued in a new
+    /// NAV shape during Session 1. This is the proof that the risky
+    /// invoice→NAV/ÁFA machinery ships dormant with zero prod exposure.
+    /// Session 2 replaces this with the §4 accept/reject matrix behind the
+    /// mandatory NAV-category adversarial review.
+    #[test]
+    fn shut_door_rejects_every_non_percent_kind() {
+        use aberp_billing::VatRateKind::*;
+        let kinds = [
+            AamExempt,
+            DomesticReverseCharge,
+            IntraCommunityGoods,
+            IntraCommunityServiceReverse,
+            TamExempt,
+            ExportGoods,
+            OtherInternational,
+            NewTransportIntraCommunity,
+            OutOfScopeThirdCountry,
+            MarginScheme,
+            NoVatCharge,
+            VatContent,
+        ];
+        for kind in kinds {
+            let mut r = good_request();
+            r.lines[0].vat_rate_kind = kind;
+            r.lines[0].vat_rate_percent = 0; // exempt/reverse-charge lines are 0%
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    InvoicePreflightError::LineItemVatRateKindNotYetIssuable { kind: k, .. }
+                        if *k == kind
+                )),
+                "kind {kind:?} must be rejected as not-yet-issuable (shut door); got {errs:?}"
+            );
+            // One precise error — the non-`Percent` guard short-circuits the
+            // numeric-rate gate, so `LineItemVatRateUnknown` must NOT co-fire.
+            assert!(
+                !errs
+                    .iter()
+                    .any(|e| matches!(e, InvoicePreflightError::LineItemVatRateUnknown { .. })),
+                "non-Percent kind must not ALSO trip LineItemVatRateUnknown; got {errs:?}"
+            );
+        }
+    }
+
+    /// The shut-door variant's discriminant + field_path + bilingual
+    /// messages are stable (the SPA renderer routes on the first two).
+    #[test]
+    fn shut_door_variant_discriminant_field_path_and_messages() {
+        let e = InvoicePreflightError::LineItemVatRateKindNotYetIssuable {
+            line_index: 2,
+            kind: aberp_billing::VatRateKind::AamExempt,
+        };
+        assert_eq!(e.kind(), "LineItemVatRateKindNotYetIssuable");
+        assert_eq!(e.field_path(), "lines[2].vatRateKind");
+        assert!(e.message_hu().contains("AamExempt"));
+        assert!(e.message_en().contains("AamExempt"));
+    }
+
+    /// The shut door did not swallow the existing numeric gate: a
+    /// `Percent` line with an out-of-vocab rate still trips
+    /// `LineItemVatRateUnknown` (unchanged behaviour).
+    #[test]
+    fn percent_kind_still_numeric_gated() {
+        let mut r = good_request();
+        r.lines[0].vat_rate_kind = aberp_billing::VatRateKind::Percent;
+        r.lines[0].vat_rate_percent = 9; // not in {0,5,18,27}
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InvoicePreflightError::LineItemVatRateUnknown { .. })),
+            "Percent + out-of-vocab rate must still trip LineItemVatRateUnknown; got {errs:?}"
+        );
     }
 
     #[test]
@@ -974,6 +1098,7 @@ mod tests {
                     quantity: Decimal::ZERO,     // zero
                     unit_price: -1,              // negative
                     vat_rate_percent: 12,        // off-vocab
+                    vat_rate_kind: aberp_billing::VatRateKind::Percent,
                     note: None,
                     unit: None,
                 },
@@ -983,6 +1108,7 @@ mod tests {
                     quantity: Decimal::from(1),
                     unit_price: 10,
                     vat_rate_percent: 99, // off-vocab
+                    vat_rate_kind: aberp_billing::VatRateKind::Percent,
                     note: None,
                     unit: None,
                 },

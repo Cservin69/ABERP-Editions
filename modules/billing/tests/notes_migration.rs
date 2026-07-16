@@ -242,6 +242,7 @@ fn line_note_round_trips_through_allocate_and_load() {
             quantity: rust_decimal::Decimal::from(3),
             unit_price: Huf(1_500),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: Some("Please ship to dock B".to_string()),
             unit: None,
         }],
