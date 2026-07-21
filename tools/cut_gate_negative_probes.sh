@@ -30,11 +30,23 @@ fresh() {  # -> path to a fresh, clean copy of the tree (excludes .git)
   # the first plant spuriously fail. Unique dirs fix it for good.
   local d; d="$(mktemp -d "$WORK/copy.XXXXXX")"
   tar -C "$ROOT" --exclude=.git -cf - . | tar -C "$d" -xf -
-  # Plant-detection marker (see assert_planted). tar restores the SOURCE mtimes,
-  # which are all older than now, so this marker is strictly newer than every
-  # extracted file and `find -newer` cleanly identifies anything a probe writes.
-  # Kept OUTSIDE the copy so the gate never sees an extra file.
-  : > "${d}.marker"
+  # Plant-detection marker (see assert_planted), kept OUTSIDE the copy so the
+  # gate never sees an extra file.
+  #
+  # Every extracted mtime is first normalised to a fixed PAST instant, then the
+  # marker is stamped fractionally later. A plant writes "now", which is
+  # unambiguously newer than the marker on any filesystem granularity.
+  #
+  # The obvious `: > "${d}.marker"` (marker = "now") is RACY and was caught by
+  # CI: `find -newer` is strictly-greater, so a fast one-liner plant
+  # (`c="$(fresh)"; printf ... >> file`) lands in the SAME timestamp tick as the
+  # marker and reads as "nothing planted" — 13 of 43 probes false-flagged as
+  # HARNESS BUG on the ubuntu runner while all 43 passed on macOS, whose slower
+  # shell and nanosecond APFS timestamps hid the race. Pinning both ends removes
+  # the timing dependency entirely instead of narrowing it.
+  # Costs ~55ms per probe on a clean 1097-file export.
+  find "$d" -exec touch -t 199901010000 {} + 2>/dev/null
+  touch -t 200001010000 "${d}.marker"
   printf '%s' "$d"
 }
 # Did the probe's plant actually modify the tree?
