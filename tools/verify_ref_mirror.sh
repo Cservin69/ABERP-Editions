@@ -52,12 +52,42 @@ echo
 
 echo "--- C. the archive is NOT installable: upgrade_portable.sh:205 gate ---"
 # :205 is `git ls-remote --exit-code --heads origin "$version"`; exit 2 == absent.
-for probe in "PROD_Portable_v0.1.0" "PROD_Portable_v0.1.2" \
-             "archive/aberp-git/PROD_Portable_v0.1.2" "PROD_Portable_v1.0.0"; do
+# ONLY archived / never-cut names belong here. `PROD_Portable_v1.0.0` was in this
+# list while it was still uncut; once S5 cut it (2026-07-21, 234b598) the probe
+# started reporting "PRESENT" and this script exited 1 with "DO NOT PRUNE" —
+# a red for a reason that has nothing to do with the archive, which would have
+# told the S3 session to abort a prune that is in fact fully cleared. Real
+# release names are asserted in section C2 instead.
+for probe in "PROD_Portable_v0.1.0" "PROD_Portable_v0.1.1" "PROD_Portable_v0.1.2" \
+             "archive/aberp-git/PROD_Portable_v0.1.2"; do
   git ls-remote --exit-code --heads origin "$probe" >/dev/null 2>&1
   e=$?
-  echo "  ls-remote --exit-code --heads origin '$probe' -> exit $e $([[ $e -eq 2 ]] && echo '(absent, gate refuses)' || echo '(PRESENT)')"
+  if [[ $e -eq 2 ]]; then
+    echo "  ls-remote --exit-code --heads origin '$probe' -> exit 2 (absent, gate refuses)"
+  else
+    echo "  ls-remote --exit-code --heads origin '$probe' -> exit $e (PRESENT) — FAIL"
+    rc=1
+  fi
 done
+echo
+
+echo "--- C2. the CUT release IS a real branch (disjoint from every archived name) ---"
+# The archive must never collide with a live release name. Cutting v1.0.0 is the
+# case that proves it: the release resolves as a branch, the archived v0.1.x
+# names do not, and no archived name is installable.
+git ls-remote --exit-code --heads origin "PROD_Portable_v1.0.0" >/dev/null 2>&1
+if [[ $? -eq 0 ]]; then
+  echo "  PROD_Portable_v1.0.0 -> present as refs/heads (installable release) [PASS]"
+else
+  echo "  PROD_Portable_v1.0.0 -> ABSENT as a branch"
+  echo "    (expected before S5 cut it; if you are running this after 2026-07-21 the release ref is missing)"
+fi
+for name in "${NAMES[@]}"; do
+  if [[ "$name" == "PROD_Portable_v1.0.0" ]]; then
+    echo "  COLLISION: an archived name equals the cut release name — FAIL"; rc=1
+  fi
+done
+echo "  archived names are v0.1.x only; the Editions line starts at v1.x (ADR-0100 §4) [PASS]"
 echo
 
 echo "--- D. VERSION_RE gate (upgrade_portable.sh:126) rejects the archive name ---"
@@ -67,11 +97,16 @@ for probe in "archive/aberp-git/PROD_Portable_v0.1.2" "PROD_Portable_v0.1.2"; do
 done
 echo
 
-echo "--- E. no Portable RELEASE BRANCH anywhere on origin ---"
-# Release-shaped names only: refs/heads/{,archive/...}PROD_Portable_v*.
+echo "--- E. the ARCHIVED v0.1.x lineage is not a branch anywhere on origin ---"
+# The property being asserted is "nothing from the ARCHIVED ABERP.git lineage was
+# mirrored as a branch" — NOT "no Portable branch exists at all". Those were the
+# same thing only until S5 cut PROD_Portable_v1.0.0; afterwards the blanket form
+# flagged the legitimate release and printed "DO NOT PRUNE", which would have
+# aborted a prune that is fully cleared. Scoped to v0.1.x accordingly.
+#
 # (A branch merely containing the word 'portable' — e.g. the ADR work branch
 #  'worktree-adr-portable-sawoff' — is not a release ref and is not a finding.)
-b=$(git ls-remote --heads origin | grep -E 'refs/heads/(.*/)?PROD_Portable_v' || true)
+b=$(git ls-remote --heads origin | grep -E 'refs/heads/(.*/)?PROD_Portable_v0\.1\.' || true)
 if [[ -z "$b" ]]; then echo "  (none) — PASS"; else echo "$b" | sed 's/^/  /'; echo "  FAIL"; rc=1; fi
 echo "  all origin heads, for the record:"
 git ls-remote --heads origin | awk '{print "    " $2}'
