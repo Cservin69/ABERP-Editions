@@ -30,7 +30,30 @@ fresh() {  # -> path to a fresh, clean copy of the tree (excludes .git)
   # the first plant spuriously fail. Unique dirs fix it for good.
   local d; d="$(mktemp -d "$WORK/copy.XXXXXX")"
   tar -C "$ROOT" --exclude=.git -cf - . | tar -C "$d" -xf -
+  # Plant-detection marker (see assert_planted). tar restores the SOURCE mtimes,
+  # which are all older than now, so this marker is strictly newer than every
+  # extracted file and `find -newer` cleanly identifies anything a probe writes.
+  # Kept OUTSIDE the copy so the gate never sees an extra file.
+  : > "${d}.marker"
   printf '%s' "$d"
+}
+# Did the probe's plant actually modify the tree?
+#
+# WHY THIS EXISTS: a plant that silently does nothing makes its probe report
+# "✗ ESCAPED", which reads as "the GATE is broken" when in truth the HARNESS
+# never planted the violation — the gate correctly passed a pristine tree. That
+# is worse than a plain failure: it is a red that sends you to audit the wrong
+# code, and it means the probe provides ZERO real coverage while looking like it
+# provides some. It bit CHECK 5 for exactly this reason (a GNU-only `sed -i` that
+# is a parse error on BSD/macOS, so the mutation never landed).
+#
+# The check is mechanism-agnostic on purpose: it catches a no-op `sed`, a python
+# plant whose anchor string drifted, and a `grep -v` filter that matched nothing,
+# without the harness having to know which idiom a given probe used.
+assert_planted() {  # $1 dir -> non-zero if nothing was modified since fresh()
+  local d="$1" m="${1}.marker"
+  [[ -e "$m" ]] || return 0   # no marker (dir not from fresh()) → don't block
+  [[ -n "$(find "$d" -newer "$m" -print -quit 2>/dev/null)" ]]
 }
 gate_rc() {  # run the COPY's gate; echo exit code; stash output in $1/.out
   ( cd "$1" && bash "$GATE" ) >"$1/.out" 2>&1
@@ -47,6 +70,13 @@ expect_pass() {  # $1 dir  $2 label
   fi
 }
 expect_fail() {  # $1 dir  $2 signature  $3 label
+  # MUST run before gate_rc: gate_rc writes "$1/.out" inside the copy, which
+  # would itself satisfy the -newer test and mask a no-op plant.
+  if ! assert_planted "$1"; then
+    printf '  ✗ HARNESS BUG: %s — the plant modified NOTHING, so this probe tests nothing.\n' "$3"
+    printf '        (the gate is not implicated: it correctly passed a pristine tree)\n'
+    bad=$((bad+1)); return
+  fi
   local rc; rc="$(gate_rc "$1")"
   if [[ "$rc" != "0" ]] && grep -qF -- "$2" "$1/.out"; then
     printf '  ✓ caught: %s  (exit=%s; matched: "%s")\n' "$3" "$rc" "$2"; pass=$((pass+1))
@@ -82,8 +112,24 @@ expect_fail "$c" "silent-truncate path" "RecoveryAction::Truncated re-introduced
 echo "[CHECK 5] in-place live-file rewrite (rename(2) -> in-place copy)"
 c="$(fresh)"
 # Replace the atomic rename swap with an in-place copy (the anti-pattern).
-sed -i 's#std::fs::rename(staged, target)#std::fs::copy(staged, target).map(|_| ())#' \
-    "$c/crates/aberp-snapshot/src/crash_safe.rs"
+#
+# Uses the python3 heredoc that every other in-place plant in this file uses.
+# It was `sed -i 's#...#...#'`, which is GNU-only: BSD/macOS sed reads the next
+# argument as the backup-file suffix, so it consumed the script, failed with
+# "invalid command code f", and left the file UNTOUCHED. The gate then passed a
+# pristine tree and this probe reported a bogus "ESCAPED" — red for the wrong
+# reason, and zero real coverage on any Mac. CI (ubuntu, GNU sed) never saw it.
+python3 - "$c/crates/aberp-snapshot/src/crash_safe.rs" <<'PYIN'
+import sys
+p = sys.argv[1]
+old = "std::fs::rename(staged, target)"
+new = "std::fs::copy(staged, target).map(|_| ())"
+s = open(p).read()
+# Fail loudly if the anchor ever drifts, rather than silently writing the file
+# back unchanged and letting the probe report a bogus escape.
+assert old in s, f"CHECK 5 probe anchor {old!r} not found in {p}"
+open(p, "w").write(s.replace(old, new))
+PYIN
 expect_fail "$c" "no longer swaps via std::fs::rename" "checkpoint regressed to in-place rewrite"
 
 echo "[CHECK 6] binary source resolving prod's bare snapshot store"
