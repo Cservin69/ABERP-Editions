@@ -164,3 +164,49 @@ fn serve_refuses_foreign_db_path_before_binding() {
         "stderr must name the edition-isolation refusal; got:\n{stderr}"
     );
 }
+
+// ── KNOWN GAP — symlinked foreign root walks through the guard ───────────
+//
+// `ensure_db_path_isolated` compares path COMPONENT NAMES and never resolves
+// symlinks, so `<dir>/link/prod/aberp.duckdb` with `link -> <dir>/.aberp`
+// carries no `.aberp` component and is accepted — the build then opens (and
+// WALs) the database inside the foreign root. Proven end-to-end in S2:
+// see `docs/findings/s2-aberp-db-symlink-escapes-edition-isolation.md`.
+//
+// This test asserts the behaviour the guard's own doc comment promises
+// ("refuses ... no matter how the path arrived", "resolves into a FOREIGN
+// edition's root"). It FAILS today, so it is `#[ignore]`d rather than left to
+// red the gates — S2's brief was to report the finding, not to change a
+// load-bearing security guard. Whoever lands the fix (canonicalize before the
+// component walk) should drop the `#[ignore]` in the same commit.
+//
+// Run explicitly with:
+//   cargo test --test edition_db_isolation -- --ignored
+#[test]
+#[ignore = "KNOWN GAP: symlink bypasses the foreign-root guard — see \
+            docs/findings/s2-aberp-db-symlink-escapes-edition-isolation.md"]
+#[cfg(not(feature = "production"))]
+fn foreign_root_reached_through_a_symlink_is_refused() {
+    let base = std::env::temp_dir().join("aberp-iso-symlink-test");
+    let _ = std::fs::remove_dir_all(&base);
+    let foreign = base.join(".aberp").join("prod");
+    std::fs::create_dir_all(&foreign).expect("create simulated foreign root");
+
+    // A link whose OWN name is innocuous, pointing at the forbidden root.
+    let link = base.join("sneaky");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(base.join(".aberp"), &link).expect("symlink");
+
+    // Resolves to <base>/.aberp/prod/aberp.duckdb — a foreign root.
+    let disguised = link.join("prod").join("aberp.duckdb");
+
+    let verdict = ensure_db_path_isolated(&disguised);
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert!(
+        verdict.is_err(),
+        "a path that RESOLVES into the foreign prod root must be refused, \
+         however it is spelled; got Ok for {}",
+        disguised.display()
+    );
+}
