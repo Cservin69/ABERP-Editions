@@ -351,3 +351,133 @@ holds `0100` (SaaS migration, re-sequenced), `0101`, and `0102`. The two ADR
 sequences forked at `0093` and have been diverging since — itself an instance
 of §9. Renumbering is not attempted here; cite this ADR as
 `ABERP-Editions ADR-0100` when the repository is not obvious from context.
+
+---
+
+## 11. S2 execution record — 2026-07-21
+
+S2 executed, plus the §4 `release.sh` blocker (which S5 cannot start without).
+**`PROD_Portable_v1.0.0` was NOT cut** — see §11.4.
+
+### 11.1 Decision A executed: the three tag objects are mirrored
+
+Pushed to `ABERP-Editions`:
+
+```
+refs/tags/archive/aberp-git/PROD_Portable_v0.1.0 -> 07d31599cfdf3265c5b191c96c77e40eecfb00dd
+refs/tags/archive/aberp-git/PROD_Portable_v0.1.1 -> 059b498c8a66d641715112f8551a492a77540ef9
+refs/tags/archive/aberp-git/PROD_Portable_v0.1.2 -> e4de7dca1777b386099d10191da0632b56892bea
+```
+
+No branches were mirrored. The three tipsts `7b849f7` / `9dbecb7` / `6a51d4f`
+were already present in this repository as ordinary history (it is a fork of
+`ABERP.git`), so only the tag objects needed transferring; the tag SHAs are
+byte-identical to the originals because a ref rename never rewrites the object.
+
+**Verification is the hard precondition for S3's prune**, so it was done against
+a FRESH `git clone` rather than against the pushing checkout — pushing is not
+proof. The verifier is committed as
+`docs/findings/s2-ref-mirror-verification.md` (transcript) and
+`tools/verify_ref_mirror.sh` (re-runnable). It asserts, in a clone made with the
+default refspec and no `--tags` / `--mirror`:
+
+- all three refs present, `git cat-file -t` = `tag`;
+- each tag-object SHA identical to the ABERP.git original;
+- each `^{commit}` identical to the ADR §2 tip;
+- `git ls-remote --exit-code --heads origin <name>` = **2** for the bare names,
+  the archive path, and `PROD_Portable_v1.0.0` — i.e. `upgrade_portable.sh:205`
+  refuses all of them;
+- `VERSION_RE` (`:126`) rejects `archive/aberp-git/PROD_Portable_v0.1.2`;
+- **no** `refs/heads/**/PROD_Portable_v*` exists on origin.
+
+Result: **all assertions pass, exit 0.** S3 may proceed on this basis.
+
+Note for a later reader: an earlier draft of the verifier reported a spurious
+failure because it grepped origin's heads for the substring `portable`, which
+matches the ADR work branch `worktree-adr-portable-sawoff`. The committed
+version matches release-shaped names only and lists all heads verbatim.
+
+### 11.2 §6 capability gap re-confirmed — still one line, still one-way
+
+Re-diffed `ABERP.git@6a51d4f` against this repository's tree. Every path the
+Portable range touches exists here except `run/upgrade_prod.sh`, which is the
+frozen prod launcher and correctly absent (it is S4b's subject, in the other
+repository). The three Portable-only files differ only by Editions **adding**
+hardening:
+
+| File | Δ | Direction |
+| --- | --- | --- |
+| `run/run_portable.sh` | 4 lines | `~/.aberp/` → `~/.aberp-portable/` — the entire saw-off |
+| `run/upgrade_portable.sh` | 32 lines | + reserved-`prod`-tenant refusal, + edition-scoped `EDITION_DATA_ROOT`, + snapshot rooted at it |
+| `apps/aberp/tests/portable_demo_boot_e2e.rs` | 14 lines | + `#![cfg(not(feature = "production"))]`, + shared `Handle` (ADR-0098 Gap 1a) |
+
+`ABERP.git`'s Portable has **no** capability Editions lacks. Nothing to port
+forward; **no Editions code change was needed to "close" the gap.** The
+remaining work is deletion in `ABERP.git` (S4), unchanged.
+
+### 11.3 §4 blocker cleared: `release.sh` can now cut both lines
+
+`run/release.sh`'s `VERSION_RE` is widened to
+`^PROD_(Defense_|Portable_)?v[0-9]+\.[0-9]+(\.[0-9]+)?$`, with the
+"already exists" suggester taught to replay the product-line prefix, and the
+operator next-step footer taught to print the line's own launcher/installer
+instead of always `run_prod.sh`. ADR-0056's pinned-invariant section is amended
+in the same change (see ADR-0056 §"Amendment — 2026-07-21").
+
+**How the existing `PROD_Defense_v*` releases were really cut: by hand.**
+Established, not assumed — `release.sh` has never been modified in this
+repository (last touch `893d5db`/PR-206, inherited pre-saw-off); it requires
+`HEAD == main` and pushes `main:<version>`, yet `PROD_Defense_v0.2.12`
+(`46c9f5f`) sits one commit **ahead** of `origin/main`; `PROD_Defense_v0.2.1`
+has no branch at all despite `README.md` naming it current stable; and `v0.2.0`
+and `v0.2.2` are the same commit. So Defense's release path was undocumented and
+equally broken, and is fixed by the same change. Full evidence in ADR-0056's
+amendment.
+
+The dev-workspace sentinel is deliberately left intact.
+
+### 11.4 S5 is BLOCKED: `PROD_Portable_v1.0.0` was not cut
+
+The pre-cut assertions ran against a Portable build (`cargo build --bin aberp`,
+default features). Two of three passed:
+
+- `edition_data_dirname()` = `.aberp-portable` — holds (compile-time `const`).
+- `ABERP_TENANT=prod` exits non-zero — holds (`guard_tenant_matches_build`,
+  exit 1).
+- **`ABERP_DB` containment — FAILS.**
+
+`tenant_registry::ensure_db_path_isolated` compares path **component names** and
+never canonicalizes. A symlink whose own name is innocuous therefore walks
+straight through it: with `sneaky -> <dir>/.aberp`, the path
+`<dir>/sneaky/prod/aberp.duckdb` carries no `.aberp` component, the guard stays
+silent, and the Portable build **opens the database inside the foreign root and
+writes a `.wal` file into it**. Proven end-to-end, both on the `serve` boot path
+and via `aberp snapshot now`, with the literal-path form refused as a control.
+
+This meets the stop-the-line condition set for S2, so the release was held.
+Details, reproduction, safety notes, and remediation options are in
+`docs/findings/s2-aberp-db-symlink-escapes-edition-isolation.md`. A regression
+test asserting the desired behaviour is committed `#[ignore]`d at
+`apps/aberp/tests/edition_db_isolation.rs`.
+
+This also **qualifies §5 of this ADR.** §5 argued that `ABERP_DB` being a live
+operator-reachable input is acceptable because the foreign-root refusal is
+load-bearing. That is true for literal paths and false for symlinked ones. The
+sentence "The data root of an Editions build cannot be handed `.aberp` by env,
+config, or launcher" should read: *cannot be handed a path that is literally
+spelled `.aberp`; a symlink resolving there is currently accepted.*
+
+Separately, and by design rather than by defect: the guard is a foreign-root
+**denylist**, not a containment allowlist — `./aberp.duckdb` and
+`/tmp/whatever/aberp.duckdb` are accepted, pinned deliberately at
+`edition_db_isolation.rs:87-88`. "The root cannot leave `~/.aberp-portable/`"
+was never the property the code offered.
+
+### 11.5 Stage status after S2
+
+| Stage | State |
+| --- | --- |
+| S2 — archive tag objects into Editions | **done, verified against a fresh clone** |
+| S3 — prune the six Portable refs in `ABERP.git` | **unblocked** by §11.1 |
+| S4 — excise the Portable surface from `ABERP.git` | unchanged; §11.2 confirms zero capability cost |
+| S5 — cut `PROD_Portable_v1.0.0` | **release path fixed (§11.3), cut BLOCKED on §11.4** |
