@@ -683,29 +683,133 @@ pub fn aberp_root() -> Result<PathBuf> {
     Ok(home_dir()?.join(crate::build_profile::edition_data_dirname()))
 }
 
+/// Resolve `path` as far as the filesystem allows, then re-append the
+/// components that do not exist yet.
+///
+/// [`std::fs::canonicalize`] resolves symlinks and `..`, but fails
+/// outright when any component is missing — and the DB path legitimately
+/// does not exist on a first launch (its parent dir is created later in
+/// the serve boot). So: canonicalize the deepest ancestor that DOES
+/// exist, then re-join the missing tail. Relative inputs are made
+/// absolute against the CWD first, so `./aberp.duckdb` compares as the
+/// real path it names rather than as a bare filename.
+///
+/// `..` and symlinks inside a *missing* tail are not resolved (there is no
+/// filesystem to resolve them against), so a `..` can SURVIVE this call.
+/// The guard does not reason about what such a leftover might mean — it
+/// refuses the path outright ([`ensure_db_path_isolated`]). `ABERP.git`'s
+/// copy of this comment argued the leftover was harmless because it could
+/// only ever make the comparison read a non-tenant segment; that argument
+/// was wrong there (its deny path is an allow-list keyed on the FIRST
+/// segment, which `..` leaves untouched) and does not hold here either.
+///
+/// Kept in step with the `ABERP.git` original
+/// (`db_path_guard::canonicalize_deepest`, d9b64a2) — the two repos having
+/// the same guard behave differently is what created this defect class.
+fn canonicalize_deepest(path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            // No CWD: leave it relative. A relative path cannot carry an
+            // absolute foreign root, so the caller treats it as an
+            // ordinary dev path.
+            Err(_) => path.to_path_buf(),
+        }
+    };
+    fn walk(p: &Path) -> PathBuf {
+        if let Ok(c) = p.canonicalize() {
+            return c;
+        }
+        match (p.parent(), p.file_name()) {
+            (Some(parent), Some(tail)) => walk(parent).join(tail),
+            // Filesystem root, or a path with no nameable tail: nothing
+            // left to peel.
+            _ => p.to_path_buf(),
+        }
+    }
+    walk(&abs)
+}
+
 /// ADR-0093 — refuse any DB / data path that resolves into a FOREIGN
 /// edition's root: the frozen prod line's `~/.aberp/`, or the sibling
 /// edition's `~/.aberp-<other>/`. The own edition's root and ordinary dev
 /// paths (`./aberp.duckdb`, a temp dir) are allowed. This is the runtime
-/// backstop behind the compile-time root binding: even a hand-set `--db` /
-/// `ABERP_DB` pointing at prod's database is refused, so the build
-/// physically cannot open another edition's DB (ADR-0093 — "physically
-/// refuses ... even via env/misconfig").
+/// backstop behind the compile-time root binding: a hand-set `--db` /
+/// `ABERP_DB` that NAMES prod's database is refused, however it is spelled.
+/// State the rule that narrowly and no wider — ADR-0093 §5 used to promise
+/// the binary "literally cannot open `~/.aberp/prod/…`", and that absolute
+/// was disproven by execution twice (see below). One residual is NOT
+/// covered: a hardlink to a file inside a foreign root, a second name for
+/// the same inode rather than a link any path walk can resolve. Every
+/// clause here is pinned row by row in the decision table in
+/// `apps/aberp/tests/edition_db_isolation.rs`.
+///
+/// The path is matched BOTH as spelled AND canonicalized, and either hit
+/// refuses. Matching the raw components alone was the S2 escape: a symlink
+/// into the foreign root (`<dir>/link -> <dir>/.aberp`, passed as
+/// `<dir>/link/prod/aberp.duckdb`) carries no `.aberp` component and walked
+/// straight through. Same defect class, same fix as `ABERP.git` d9b64a2 —
+/// but that repo's rule is an ALLOW-list (only under the own tenant root),
+/// where canonicalizing both sides is sufficient on its own. This one is a
+/// DENY-list on dirnames, and canonicalizing *instead of* the raw match
+/// would open a second hole in the other direction: if `~/.aberp` were
+/// itself a symlink, `~/.aberp/prod/aberp.duckdb` would resolve to a path
+/// carrying no foreign component and start passing — a refusal that works
+/// today, lost. Keeping both walks is strictly additive: every path refused
+/// before this change is still refused, and the symlinked ones now are too.
+///
+/// The dirname compare is ASCII-CASE-INSENSITIVE. macOS APFS (and Windows
+/// NTFS) resolve `~/.ABERP` and `~/.aberp` to the SAME directory, so a
+/// byte-exact compare let `ABERP_DB=~/.ABERP/prod/aberp.duckdb` open the
+/// frozen prod DuckDB read-write — executed, not theorised, on 2026-07-21.
+/// Canonicalizing case-corrects an EXISTING root, but the resolved walk
+/// alone is not enough: when the foreign root does not exist yet (a
+/// machine where the sibling edition was never installed) there is nothing
+/// to canonicalize against, the spelling survives verbatim, and the build
+/// would create the foreign root under a second spelling of the same
+/// directory. The foreign dirnames are pure ASCII, so `eq_ignore_ascii_case`
+/// is the whole of it; no Unicode folding is implied or needed.
 pub fn ensure_db_path_isolated(path: &Path) -> Result<()> {
-    for comp in path.components() {
-        if let std::path::Component::Normal(name) = comp {
-            for foreign in crate::build_profile::foreign_data_dirnames() {
-                if name == std::ffi::OsStr::new(foreign) {
-                    return Err(anyhow!(
-                        "ADR-0093 edition isolation: the {} edition refuses path {} — it resolves                          into the foreign data root '{}'. Each edition opens only its own ~/{}                          root, never prod's ~/.aberp/ or the sibling edition's.",
-                        crate::build_profile::edition_label(),
-                        path.display(),
-                        foreign,
-                        crate::build_profile::edition_data_dirname(),
-                    ));
+    let resolved = canonicalize_deepest(path);
+    for candidate in [path, resolved.as_path()] {
+        for comp in candidate.components() {
+            if let std::path::Component::Normal(name) = comp {
+                for foreign in crate::build_profile::foreign_data_dirnames() {
+                    if name.to_string_lossy().eq_ignore_ascii_case(foreign) {
+                        return Err(anyhow!(
+                            "ADR-0093 edition isolation: the {} edition refuses path {} (resolves to {}) — it resolves                          into the foreign data root '{}'. Each edition opens only its own ~/{}                          root, never prod's ~/.aberp/ or the sibling edition's.",
+                            crate::build_profile::edition_label(),
+                            path.display(),
+                            resolved.display(),
+                            foreign,
+                            crate::build_profile::edition_data_dirname(),
+                        ));
+                    }
                 }
             }
         }
+    }
+
+    // A `..` that SURVIVED canonicalization sits behind a component that
+    // does not exist, so nothing on disk fixes its meaning: whatever it
+    // names is decided later, by whoever creates that component first.
+    // The dirname walks above cannot see through it. Refuse — the guard
+    // never speculates about a path it could not resolve.
+    if resolved
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "ADR-0093 edition isolation: the {} edition refuses path {} — it resolves to {}, which \
+             still contains an unresolved '..' behind a component that does not exist. Such a path \
+             names no fixed directory, so it cannot be proven to stay out of prod's ~/.aberp/ or \
+             the sibling edition's root. Pass a path whose parents exist.",
+            crate::build_profile::edition_label(),
+            path.display(),
+            resolved.display(),
+        ));
     }
     Ok(())
 }
