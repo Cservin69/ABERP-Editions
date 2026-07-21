@@ -165,27 +165,29 @@ fn serve_refuses_foreign_db_path_before_binding() {
     );
 }
 
-// ── KNOWN GAP — symlinked foreign root walks through the guard ───────────
+// ── CLOSED GAP — a symlinked / `..`-spelled foreign root is refused ──────
 //
-// `ensure_db_path_isolated` compares path COMPONENT NAMES and never resolves
-// symlinks, so `<dir>/link/prod/aberp.duckdb` with `link -> <dir>/.aberp`
-// carries no `.aberp` component and is accepted — the build then opens (and
-// WALs) the database inside the foreign root. Proven end-to-end in S2:
+// `ensure_db_path_isolated` used to compare raw path COMPONENT NAMES and
+// never resolve symlinks, so `<dir>/link/prod/aberp.duckdb` with
+// `link -> <dir>/.aberp` carried no `.aberp` component and was accepted —
+// the build then opened (and WALed) the database inside the foreign root.
+// Proven end-to-end in S2:
 // see `docs/findings/s2-aberp-db-symlink-escapes-edition-isolation.md`.
 //
-// This test asserts the behaviour the guard's own doc comment promises
-// ("refuses ... no matter how the path arrived", "resolves into a FOREIGN
-// edition's root"). It FAILS today, so it is `#[ignore]`d rather than left to
-// red the gates — S2's brief was to report the finding, not to change a
-// load-bearing security guard. Whoever lands the fix (canonicalize before the
-// component walk) should drop the `#[ignore]` in the same commit.
+// The guard now canonicalizes before the component walk (matching
+// `ABERP.git` d9b64a2), so these assert the behaviour its doc comment has
+// always promised: "refuses ... no matter how the path arrived". They were
+// `#[ignore]`d while the gap was open; the `#[ignore]` is dropped with the
+// fix, as that note required.
 //
-// Run explicitly with:
-//   cargo test --test edition_db_isolation -- --ignored
+// Both arms run these: prod's `~/.aberp/` is foreign to Portable AND to
+// Defense, so there is nothing edition-conditional to pin here.
+
+/// Removing `canonicalize_deepest` from the guard turns this red while the
+/// direct-component cases above stay green — that asymmetry is what shows
+/// the canonicalization carries its own weight.
+#[cfg(unix)]
 #[test]
-#[ignore = "KNOWN GAP: symlink bypasses the foreign-root guard — see \
-            docs/findings/s2-aberp-db-symlink-escapes-edition-isolation.md"]
-#[cfg(not(feature = "production"))]
 fn foreign_root_reached_through_a_symlink_is_refused() {
     let base = std::env::temp_dir().join("aberp-iso-symlink-test");
     let _ = std::fs::remove_dir_all(&base);
@@ -194,11 +196,16 @@ fn foreign_root_reached_through_a_symlink_is_refused() {
 
     // A link whose OWN name is innocuous, pointing at the forbidden root.
     let link = base.join("sneaky");
-    #[cfg(unix)]
     std::os::unix::fs::symlink(base.join(".aberp"), &link).expect("symlink");
 
     // Resolves to <base>/.aberp/prod/aberp.duckdb — a foreign root.
     let disguised = link.join("prod").join("aberp.duckdb");
+
+    // Guard against the test silently stopping to exercise the residual.
+    assert!(
+        !disguised.components().any(|c| c.as_os_str() == ".aberp"),
+        "test is not exercising the residual: path still carries a .aberp component"
+    );
 
     let verdict = ensure_db_path_isolated(&disguised);
     let _ = std::fs::remove_dir_all(&base);
@@ -208,5 +215,77 @@ fn foreign_root_reached_through_a_symlink_is_refused() {
         "a path that RESOLVES into the foreign prod root must be refused, \
          however it is spelled; got Ok for {}",
         disguised.display()
+    );
+}
+
+/// A `..` traversal that climbs out of an innocuous directory and back into
+/// the foreign root through an aliased name. `..` alone is not an escape —
+/// `<base>/work/../.aberp/prod/x` still carries a `.aberp` component and the
+/// raw walk caught it. It becomes one only when the climb-out lands on a
+/// symlink, so the resolved path names the foreign root and the spelled path
+/// never does. Canonicalization resolves both halves at once.
+#[cfg(unix)]
+#[test]
+fn foreign_root_reached_through_a_dotdot_traversal_is_refused() {
+    let base = std::env::temp_dir().join("aberp-iso-dotdot-test");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join(".aberp").join("prod")).expect("create foreign root");
+    std::fs::create_dir_all(base.join("work").join("nested")).expect("create innocuous dirs");
+
+    // <base>/work/nested/../alias/prod — `alias` is a symlink to the foreign
+    // root, so the spelled path carries no `.aberp` component at all.
+    std::os::unix::fs::symlink(base.join(".aberp"), base.join("work").join("alias"))
+        .expect("symlink");
+
+    let disguised = base
+        .join("work")
+        .join("nested")
+        .join("..")
+        .join("alias")
+        .join("prod")
+        .join("aberp.duckdb");
+
+    assert!(
+        !disguised.components().any(|c| c.as_os_str() == ".aberp"),
+        "test is not exercising the residual: path still carries a .aberp component"
+    );
+
+    let verdict = ensure_db_path_isolated(&disguised);
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert!(
+        verdict.is_err(),
+        "a `..` traversal that resolves into the foreign prod root must be \
+         refused; got Ok for {}",
+        disguised.display()
+    );
+}
+
+/// The OTHER direction, and the reason the guard walks both the spelled and
+/// the resolved form rather than replacing one with the other. This rule is
+/// a deny-list on dirnames, so canonicalizing *instead of* matching raw
+/// would lose refusals that work today: if the foreign root is itself a
+/// symlink, resolving it strips the `.aberp` component and the path starts
+/// passing. Swapping the raw walk out for the resolved one turns this red.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_foreign_root_does_not_become_allowed() {
+    let base = std::env::temp_dir().join("aberp-iso-linked-root-test");
+    let _ = std::fs::remove_dir_all(&base);
+    // The real storage lives under an innocuous name; `.aberp` is the link.
+    std::fs::create_dir_all(base.join("elsewhere").join("prod")).expect("create backing dir");
+    std::os::unix::fs::symlink(base.join("elsewhere"), base.join(".aberp")).expect("symlink");
+
+    // Spelled with `.aberp`, but it resolves to `<base>/elsewhere/prod/...`,
+    // which carries no foreign component at all.
+    let spelled = base.join(".aberp").join("prod").join("aberp.duckdb");
+    let verdict = ensure_db_path_isolated(&spelled);
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert!(
+        verdict.is_err(),
+        "a path spelled with the foreign root must stay refused even when \
+         that root is a symlink; got Ok for {}",
+        spelled.display()
     );
 }

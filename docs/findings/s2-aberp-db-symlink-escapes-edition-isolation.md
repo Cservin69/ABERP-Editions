@@ -12,9 +12,12 @@
   for the exact containment behaviour the release carries.
 - **Severity:** the guard this defeats is the one ADR-0093 and ADR-0100 §5 both
   name as the reason `ABERP_DB` is safe to expose at all.
-- **Status:** OPEN, owned by the parallel canonicalization work. Not fixed here:
-  this session was explicitly told not to fix it, to avoid colliding with that
-  branch. Remediation options are in §5; option 1 is the recommendation.
+- **Status:** **FIXED** — see §6. Option 1 of §5 (canonicalize before scanning)
+  was taken by the owning work, in its own step with its own gates, as §5
+  recommended; the `#[ignore]`d regression test is now live and passing on both
+  arms. **`PROD_Portable_v1.0.0` (cut at `234b598`) predates the fix and ships
+  with the gap open** — the containment behaviour that release carries is
+  ADR-0100 §12.3, unchanged. The next cut is the first to carry the fix.
 
 ## 1. What was asserted, and what is actually true
 
@@ -133,3 +136,36 @@ its own step with its own gates — which is why S2 did not take it.
 A regression test asserting the *desired* behaviour is committed alongside this
 document, `#[ignore]`d with a pointer here, so the fix has a ready-made proof and
 the gap is discoverable from the test suite rather than only from this file.
+
+## 6. Resolution
+
+Option 1, ported from `ABERP.git` d9b64a2, which fixed the same defect class in
+that repo's copy of this guard. `canonicalize_deepest` resolves the deepest
+existing ancestor and re-appends the not-yet-existing tail, so the first-launch
+path (the DB file legitimately does not exist yet) still classifies correctly
+where a bare `canonicalize()` would just error.
+
+**One deviation from `ABERP.git`, and it is deliberate.** That repo's rule is an
+ALLOW-list — the DB must sit under the build's own tenant root — so canonicalizing
+both sides and comparing by prefix is sufficient there. This repo's rule is a
+DENY-list on dirnames (§2), and for a deny-list, canonicalizing *instead of*
+matching the raw components opens a hole in the opposite direction: if `~/.aberp`
+were itself a symlink, `~/.aberp/prod/aberp.duckdb` would resolve to a path
+carrying no foreign component and would start being **allowed** — a refusal that
+works today, silently lost. So the guard walks **both** forms and either hit
+refuses. That is strictly additive: every path refused before the fix is still
+refused, and the symlinked ones now are too.
+
+Mutation-verified, three arms (`cargo test -p aberp --test edition_db_isolation`,
+both edition features):
+
+| Mutation | Result |
+| --- | --- |
+| none (the fix) | 10 passed, 0 failed, **0 ignored** |
+| canonicalized walk removed (the pre-fix behaviour) | symlink + `..` cases RED, all direct-component cases green |
+| raw walk removed (the naive port) | `a_symlinked_foreign_root_does_not_become_allowed` RED |
+
+Both halves are therefore independently load-bearing. The ADR-0099 opener census
+is unmoved: `tenant_registry.rs` still contributes exactly one fingerprint
+(`emit_tenant_reopen`), byte-identical — only its line number shifted, which
+CHECK 10k strips by design.

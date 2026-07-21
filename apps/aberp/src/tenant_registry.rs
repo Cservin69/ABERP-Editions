@@ -683,6 +683,53 @@ pub fn aberp_root() -> Result<PathBuf> {
     Ok(home_dir()?.join(crate::build_profile::edition_data_dirname()))
 }
 
+/// Resolve `path` as far as the filesystem allows, then re-append the
+/// components that do not exist yet.
+///
+/// [`std::fs::canonicalize`] resolves symlinks and `..`, but fails
+/// outright when any component is missing — and the DB path legitimately
+/// does not exist on a first launch (its parent dir is created later in
+/// the serve boot). So: canonicalize the deepest ancestor that DOES
+/// exist, then re-join the missing tail. Relative inputs are made
+/// absolute against the CWD first, so `./aberp.duckdb` compares as the
+/// real path it names rather than as a bare filename.
+///
+/// The residual: `..` and symlinks inside a *missing* tail are not
+/// resolved (there is no filesystem to resolve them against). That cannot
+/// hide a foreign root from [`ensure_db_path_isolated`]: a component that
+/// does not exist cannot be a symlink, so it cannot redirect anywhere —
+/// if the path really does reach the foreign root at open time, every
+/// component that gets it there exists and IS resolved here.
+///
+/// Kept in step with the `ABERP.git` original
+/// (`db_path_guard::canonicalize_deepest`, d9b64a2) — the two repos having
+/// the same guard behave differently is what created this defect class.
+fn canonicalize_deepest(path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            // No CWD: leave it relative. A relative path cannot carry an
+            // absolute foreign root, so the caller treats it as an
+            // ordinary dev path.
+            Err(_) => path.to_path_buf(),
+        }
+    };
+    fn walk(p: &Path) -> PathBuf {
+        if let Ok(c) = p.canonicalize() {
+            return c;
+        }
+        match (p.parent(), p.file_name()) {
+            (Some(parent), Some(tail)) => walk(parent).join(tail),
+            // Filesystem root, or a path with no nameable tail: nothing
+            // left to peel.
+            _ => p.to_path_buf(),
+        }
+    }
+    walk(&abs)
+}
+
 /// ADR-0093 — refuse any DB / data path that resolves into a FOREIGN
 /// edition's root: the frozen prod line's `~/.aberp/`, or the sibling
 /// edition's `~/.aberp-<other>/`. The own edition's root and ordinary dev
@@ -691,18 +738,36 @@ pub fn aberp_root() -> Result<PathBuf> {
 /// `ABERP_DB` pointing at prod's database is refused, so the build
 /// physically cannot open another edition's DB (ADR-0093 — "physically
 /// refuses ... even via env/misconfig").
+///
+/// The path is matched BOTH as spelled AND canonicalized, and either hit
+/// refuses. Matching the raw components alone was the S2 escape: a symlink
+/// into the foreign root (`<dir>/link -> <dir>/.aberp`, passed as
+/// `<dir>/link/prod/aberp.duckdb`) carries no `.aberp` component and walked
+/// straight through. Same defect class, same fix as `ABERP.git` d9b64a2 —
+/// but that repo's rule is an ALLOW-list (only under the own tenant root),
+/// where canonicalizing both sides is sufficient on its own. This one is a
+/// DENY-list on dirnames, and canonicalizing *instead of* the raw match
+/// would open a second hole in the other direction: if `~/.aberp` were
+/// itself a symlink, `~/.aberp/prod/aberp.duckdb` would resolve to a path
+/// carrying no foreign component and start passing — a refusal that works
+/// today, lost. Keeping both walks is strictly additive: every path refused
+/// before this change is still refused, and the symlinked ones now are too.
 pub fn ensure_db_path_isolated(path: &Path) -> Result<()> {
-    for comp in path.components() {
-        if let std::path::Component::Normal(name) = comp {
-            for foreign in crate::build_profile::foreign_data_dirnames() {
-                if name == std::ffi::OsStr::new(foreign) {
-                    return Err(anyhow!(
-                        "ADR-0093 edition isolation: the {} edition refuses path {} — it resolves                          into the foreign data root '{}'. Each edition opens only its own ~/{}                          root, never prod's ~/.aberp/ or the sibling edition's.",
-                        crate::build_profile::edition_label(),
-                        path.display(),
-                        foreign,
-                        crate::build_profile::edition_data_dirname(),
-                    ));
+    let resolved = canonicalize_deepest(path);
+    for candidate in [path, resolved.as_path()] {
+        for comp in candidate.components() {
+            if let std::path::Component::Normal(name) = comp {
+                for foreign in crate::build_profile::foreign_data_dirnames() {
+                    if name == std::ffi::OsStr::new(foreign) {
+                        return Err(anyhow!(
+                            "ADR-0093 edition isolation: the {} edition refuses path {} (resolves to {}) — it resolves                          into the foreign data root '{}'. Each edition opens only its own ~/{}                          root, never prod's ~/.aberp/ or the sibling edition's.",
+                            crate::build_profile::edition_label(),
+                            path.display(),
+                            resolved.display(),
+                            foreign,
+                            crate::build_profile::edition_data_dirname(),
+                        ));
+                    }
                 }
             }
         }
