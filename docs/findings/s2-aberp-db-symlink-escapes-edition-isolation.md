@@ -3,12 +3,18 @@
 - **Date:** 2026-07-21
 - **Found in:** S2 of the ADR-0100 Portable saw-off, as the pre-cut assertion
   required before `PROD_Portable_v1.0.0`.
-- **Consequence:** **`PROD_Portable_v1.0.0` was NOT cut.** The release is held
-  pending a decision on the fix below.
+- **Consequence at discovery:** `PROD_Portable_v1.0.0` was held.
+- **Consequence now (updated 2026-07-21):** the gap was assigned to a parallel
+  session porting `ensure_db_path_isolated` into `ABERP.git` and canonicalizing
+  both sides. An owned residual is a different risk posture from an unowned
+  defect, so the hold was lifted and **`PROD_Portable_v1.0.0` was cut at
+  `234b598`, shipping with this gap open and documented** — see ADR-0100 §12.3
+  for the exact containment behaviour the release carries.
 - **Severity:** the guard this defeats is the one ADR-0093 and ADR-0100 §5 both
   name as the reason `ABERP_DB` is safe to expose at all.
-- **Status:** open. No fix is attempted in S2 — the S2 brief said report and do
-  not cut. The remediation options are listed in §5 for whoever takes it.
+- **Status:** OPEN, owned by the parallel canonicalization work. Not fixed here:
+  this session was explicitly told not to fix it, to avoid colliding with that
+  branch. Remediation options are in §5; option 1 is the recommendation.
 
 ## 1. What was asserted, and what is actually true
 

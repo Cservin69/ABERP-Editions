@@ -436,7 +436,16 @@ amendment.
 
 The dev-workspace sentinel is deliberately left intact.
 
-### 11.4 S5 is BLOCKED: `PROD_Portable_v1.0.0` was not cut
+### 11.4 The `ABERP_DB` containment assertion — one of three does not hold
+
+> **Superseded in part by §12.** This section originally read "S5 is BLOCKED:
+> `PROD_Portable_v1.0.0` was not cut", and that was the correct call *at the
+> time*: the symlink gap was open with no owner. It has since been assigned to a
+> parallel session (which is porting `ensure_db_path_isolated` into `ABERP.git`
+> and canonicalizing both sides), so it is a tracked residual rather than an
+> unowned defect, and the cut proceeded on that basis. **`PROD_Portable_v1.0.0`
+> is cut — see §12.** The technical content below is unchanged and still
+> accurate; only the blocking verdict is superseded.
 
 The pre-cut assertions ran against a Portable build (`cargo build --bin aberp`,
 default features). Two of three passed:
@@ -480,4 +489,112 @@ was never the property the code offered.
 | S2 — archive tag objects into Editions | **done, verified against a fresh clone** |
 | S3 — prune the six Portable refs in `ABERP.git` | **unblocked** by §11.1 |
 | S4 — excise the Portable surface from `ABERP.git` | unchanged; §11.2 confirms zero capability cost |
-| S5 — cut `PROD_Portable_v1.0.0` | **release path fixed (§11.3), cut BLOCKED on §11.4** |
+| S5 — cut `PROD_Portable_v1.0.0` | **DONE — cut at `234b598`, install-proven (§12)** |
+
+---
+
+## 12. S5 execution record — `PROD_Portable_v1.0.0` cut 2026-07-21
+
+**`PROD_Portable_v1.0.0` is cut**, at `234b598`, via `run/release.sh` — the
+first Editions release ever produced by the release script rather than by hand
+(§11.3 / ADR-0056 amendment).
+
+### 12.1 Why the §11.4 block was lifted
+
+§11.4 held the cut because the `ABERP_DB` symlink gap was open **and unowned**.
+It has since been assigned to a parallel session porting
+`ensure_db_path_isolated` into `ABERP.git` and canonicalizing both sides. An
+owned, tracked residual is a different risk posture from an unowned defect, so
+the cut proceeded and **v1.0.0 ships with the gap documented** rather than
+silently. The containment behaviour v1.0.0 actually shipped with is recorded in
+§12.3 so there is no ambiguity later about what was known at cut time.
+
+### 12.2 The cut
+
+`release.sh` was run from a clone **outside** the dev workspace, because its
+dev-sentinel is deliberately still in force (§11.3):
+
+```
+[ ok ] pushed origin/PROD_Portable_v1.0.0 → 234b598fa1e2
+  Branch:   PROD_Portable_v1.0.0
+  Commit:   234b598fa1e2e941c12900532eeb31b0fb03bc1b
+```
+
+The operator footer correctly printed `./run/run_portable.sh` and
+`./run/upgrade_portable.sh PROD_Portable_v1.0.0` — the line-specific
+launcher/installer derivation added in §11.3, exercised for real. Before that
+change it would have printed `run_prod.sh`, the frozen HU prod launcher.
+
+### 12.3 Pre-cut assertions — what v1.0.0 actually shipped with
+
+Run against a Portable build (`cargo build --bin aberp`, default features):
+
+| Assertion | Result |
+| --- | --- |
+| `edition_data_dirname()` → `.aberp-portable` | **holds** — `portable_build_binds_portable_root` passes; confirmed at runtime from the binary's own refusal text |
+| `ABERP_TENANT=prod` exits non-zero | **holds** — `guard_tenant_matches_build`, exit 1, before any I/O |
+| `ABERP_DB` cannot redirect the root outside `~/.aberp-portable/` | **does not hold** — see below |
+
+`ABERP_DB` containment as shipped in v1.0.0:
+
+- literal `~/.aberp/…` (prod root) → **refused**, exit 1
+- literal `~/.aberp-defense/…` (sibling) → **refused**, exit 1
+- `../` traversal into `.aberp` → **refused**, exit 1
+- reserved `prod` tenant → **refused**, exit 1
+- **symlinked** foreign root (`sneaky -> ~/.aberp`) → **ALLOWED** — known-open
+  residual, owned by the parallel canonicalization work
+- non-foreign paths outside the edition root (`./aberp.duckdb`,
+  `/tmp/…`) → **allowed by design**, pinned at `edition_db_isolation.rs:87-88`
+
+The guard is a foreign-root **denylist**, not a containment allowlist. That
+distinction matters for whoever lands the fix: an allowlist that simply requires
+paths under `~/.aberp-portable/` would break the two intentional allowances and
+the default `--db` value.
+
+### 12.4 Install proof — not merely tagged
+
+`run/upgrade_portable.sh PROD_Portable_v1.0.0` was run for real against a clone
+simulating an existing install (checked out at the pre-release `f5fb8ff`), with
+`HOME` sandboxed to a temp dir so the proof could not write into the real
+`~/.aberp-portable/`. The installer's own output:
+
+```
+[ ok ] release branch 'PROD_Portable_v1.0.0' exists on origin
+[info] tenant directory <sandbox>/.aberp-portable/demo not present — fresh install
+[ ok ] no aberp-ui / aberp process running — safe to swap
+[ ok ] switched to PROD_Portable_v1.0.0
+[ ok ] verified: on PROD_Portable_v1.0.0, clean tree, HEAD=234b598fa1e2 matches origin
+[ ok ] pipeline venv provisioned (module + OCP)
+       UPGRADE STATE READY — launching run_portable.sh
+```
+
+It then `exec`'d into `run_portable.sh`, which resolved the tenant root to
+`<sandbox>/.aberp-portable/demo` — the edition root, derived, not configured.
+
+The run was killed at the launcher (it ends in a GUI). The one `[fail]` line in
+the transcript is `npm install ... failed` immediately preceded by
+`Terminated: 15` — that is the SIGTERM from the kill, not a defect; `npm install`
+in the same clone exits 0 standalone.
+
+Verified afterwards: the real `~/.aberp-portable/` is still **empty** and
+`~/.aberp/prod` untouched.
+
+**Mode note.** `upgrade_portable.sh` hard-requires `run_portable.sh` to be
+executable (`[[ ! -x ]] → die`), so an exec-bit regression there breaks
+installation outright. Every `run/` and `tools/` script's *index* mode was
+audited: the install path (`run_portable.sh`, `tools/snapshot-prod.sh`) is
+`100755`. This is a live hazard in this repository — one clone has
+`core.fileMode=false`, so `chmod +x` never reaches the index and `git status`
+shows nothing. Two scripts added in PR #18 merged as `100644` for exactly that
+reason and were repaired with `git update-index --chmod=+x`. Use
+`git ls-files -s`, never `ls -l`, to check.
+
+### 12.5 Stage status after S5
+
+| Stage | State |
+| --- | --- |
+| S2 — archive tag objects into Editions | done, re-verified from a fresh clone (script now executable as documented) |
+| S3 — prune the six Portable refs in `ABERP.git` | **still outstanding** — all six refs are live; precondition satisfied |
+| S4 — excise the Portable surface from `ABERP.git` | **done by a parallel session** (`b5b6f93`), including S4b (`upgrade_prod.sh` narrowed back to `^PROD_v…$`) |
+| S5 — cut `PROD_Portable_v1.0.0` | **done** — `234b598`, install-proven |
+| residual — `ABERP_DB` symlink canonicalization | owned by a parallel session; v1.0.0 ships without it |
