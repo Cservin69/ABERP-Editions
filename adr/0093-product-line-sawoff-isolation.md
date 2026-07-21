@@ -88,6 +88,28 @@ separate repository, leaving prod frozen in place.** Concretely:
    §2) taken to its strongest form: separate binaries, from a separate repo,
    on separate roots.
 
+   **What the runtime guard actually enforces** (corrected 2026-07-21 — the
+   earlier absolute wording is retracted below). `tenant_registry::
+   ensure_db_path_isolated` refuses any `--db` / `ABERP_DB` path that NAMES a
+   foreign edition root — prod's `.aberp` or the sibling edition's
+   `.aberp-<other>` — **as spelled or as resolved**, comparing dirnames
+   case-insensitively, and refuses outright any path still carrying an
+   unresolved `..`. Paths outside every edition root (`./aberp.duckdb`, a temp
+   dir) stay allowed **by design**: this is a foreign-root deny-list, not a
+   containment allow-list. Its one residual, stated rather than papered over:
+   a **hardlink** to a file inside a foreign root is a second name for the
+   same inode, not a link the filesystem will resolve, so no path-level guard
+   can see it. Making a hardlink to prod's DuckDB is the same deliberate act
+   as copying it.
+
+   Proven by execution, not by reading: `apps/aberp/tests/
+   edition_db_isolation.rs::adr0093_guard_decision_table` runs 26 spellings
+   (case, symlink both directions, unresolved `..`, NFC/NFD, hardlink,
+   trailing/doubled/`/./` separators, a tenant slug that normalises to `prod`)
+   against the real function on both arms, and prints the table before it
+   asserts. The ALLOW rows — every legitimate Defense and Portable launch
+   path — are pinned with the same weight as the REFUSE rows.
+
 6. **Prod is frozen in place.** The original repo stays at `v2.27.76`; no
    new prod release exists or will (ADR-0056 line retired in README). Prod
    operators' clone/upgrade workflow is unchanged. Defense starts on a
@@ -100,9 +122,25 @@ Replace the literal `tenant=="prod"` gate with a compile-time **edition**
 identity (Prod | Defense | Portable). A build derives its tenant namespace
 and DB root from its own edition at compile time — *not* from an env var or
 launcher string (FOUNDATION §5: path derived, not user-supplied) — and
-**physically refuses** to open another edition's root. The editions binary
-literally cannot open `~/.aberp/prod/…`. This also reuses ADR-0082's existing
-`ensure_restore_allowed` precedent (already refuses writes under `~/.aberp/`).
+**physically refuses** to open another edition's root. This also reuses
+ADR-0082's existing `ensure_restore_allowed` precedent (already refuses writes
+under `~/.aberp/`).
+
+> **Retraction, 2026-07-21.** This section used to end "The editions binary
+> literally cannot open `~/.aberp/prod/…`", and the guard's own docstring
+> claimed the refusal held "even via env/misconfig". That absolute was
+> **false, and was disproven by execution**, twice: a symlinked foreign root
+> walked through (S2, `docs/findings/s2-aberp-db-symlink-escapes-edition-
+> isolation.md`), and then a **one-character case change** did — the dirname
+> compare was byte-exact while macOS APFS is case-insensitive, so
+> `ABERP_DB=~/.ABERP/prod/aberp.duckdb` named the operator's live production
+> DuckDB and the guard returned ALLOW. Replaying the shipped guard against the
+> decision table opens **9 of its 26 rows**. The compile-time root binding was
+> never the thing at fault — the runtime backstop behind it was, and the
+> claim outran what had actually been executed. What the guard enforces now
+> is stated positively in decision 5 above, together with the hardlink
+> residual it cannot close. Claims about this guard are to be written from a
+> table that was run, not from the rule as read.
 
 ### NOT in scope / explicitly deferred
 

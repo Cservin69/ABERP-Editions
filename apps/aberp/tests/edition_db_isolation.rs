@@ -289,3 +289,317 @@ fn a_symlinked_foreign_root_does_not_become_allowed() {
         spelled.display()
     );
 }
+
+// ── ADR-0093 §5 DECISION TABLE — every spelling, one execution ───────
+//
+// The single test that carries the §5 claim. Each row is a real path in a
+// real temp tree, handed to the REAL `ensure_db_path_isolated` — no
+// replica of the rule, which is exactly how the case bypass survived
+// review: the shipped guard compared dirnames BYTE-EXACTLY, and macOS
+// APFS opens `~/.ABERP/prod/aberp.duckdb` and `~/.aberp/prod/aberp.duckdb`
+// as the same file. A Defense build with `ABERP_DB` set to the first
+// spelling opened the live prod DuckDB read-write (executed 2026-07-21).
+//
+// The table prints in full BEFORE it asserts, so a mutation run (drop the
+// canonicalization, or restore the byte-exact compare) shows exactly
+// which rows go red and which stay green. A guard that refuses
+// everything is not a fix, so the ALLOW rows — every legitimate Defense
+// and Portable launch path — carry the same weight as the REFUSE rows.
+#[cfg(unix)]
+#[test]
+fn adr0093_guard_decision_table() {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use build_profile::{foreign_data_dirnames, PROD_DATA_DIRNAME};
+
+    let base = std::env::temp_dir()
+        .join("aberp-iso-decision-table")
+        .join(std::process::id().to_string());
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).expect("create table base");
+
+    // The simulated FOREIGN prod root, with a seeded victim file standing
+    // in for the operator's live `~/.aberp/prod/aberp.duckdb`. The real
+    // one is never read, written, or resolved: the guard consults no
+    // `$HOME`-relative path of its own, so a temp tree exercises byte-
+    // identical code.
+    let foreign_root = base.join(PROD_DATA_DIRNAME);
+    fs::create_dir_all(foreign_root.join("prod")).expect("create foreign root");
+    let victim = foreign_root.join("prod").join("aberp.duckdb");
+    fs::write(&victim, b"ERVIN INVOICES").expect("seed victim file");
+
+    // The sibling edition's root — foreign too, and deliberately NOT
+    // created, so its rows exercise the not-yet-existing root that
+    // canonicalization cannot correct.
+    let sibling = *foreign_data_dirnames()
+        .iter()
+        .find(|d| **d != PROD_DATA_DIRNAME)
+        .expect("an editions build always has a foreign sibling root");
+
+    // `sneaky -> <base>/.aberp`: an innocuous name over the foreign root.
+    let sneaky = base.join("sneaky");
+    std::os::unix::fs::symlink(&foreign_root, &sneaky).expect("sneaky symlink");
+
+    // The foreign root spelled correctly but backed by a symlink — the
+    // direction that would break if canonicalization REPLACED the raw
+    // walk instead of joining it.
+    let linked = base.join("linked");
+    fs::create_dir_all(linked.join("elsewhere").join("prod")).expect("create backing dir");
+    std::os::unix::fs::symlink(linked.join("elsewhere"), linked.join(PROD_DATA_DIRNAME))
+        .expect("linked-root symlink");
+
+    // A hardlink to the victim FILE, parked outside the foreign root.
+    let hardlink = base.join("decoy.duckdb");
+    fs::hard_link(&victim, &hardlink).expect("hardlink");
+
+    // An ordinary existing scratch dir, for the resolvable-`..` row.
+    fs::create_dir_all(base.join("scratch")).expect("create scratch");
+
+    // NFC/NFD: one name, two encodings. APFS compares normalization-
+    // insensitively, ext4 does not — probe the filesystem instead of
+    // assuming, and report the rows as n/a rather than faking them.
+    let nfc = format!("alias-{}", '\u{FC}'); // "alias-ü", precomposed
+    let nfd = format!("alias-u{}", '\u{308}'); // "alias-ü", decomposed
+    let mirror_nfd = format!("mirror-u{}", '\u{308}');
+    let mirror_nfc = format!("mirror-{}", '\u{FC}');
+    std::os::unix::fs::symlink(&foreign_root, base.join(&nfc)).expect("NFC symlink");
+    std::os::unix::fs::symlink(&foreign_root, base.join(&mirror_nfd)).expect("NFD symlink");
+    let nfc_nfd_equivalent = fs::metadata(base.join(&nfd)).is_ok();
+
+    let own_root = aberp_root().expect("HOME/USERPROFILE is set in the test env");
+    let db = |p: PathBuf| p.join("aberp.duckdb");
+
+    const REFUSE: bool = true;
+    const ALLOW: bool = false;
+
+    let mut rows: Vec<(&str, PathBuf, bool, &str)> = vec![
+        // ── the baseline the case rows are measured against ──────────
+        (
+            "baseline .aberp, spelled",
+            db(foreign_root.join("prod")),
+            REFUSE,
+            "the rule's original case — must never regress",
+        ),
+        // ── THE BREAK: one-character case change on a case-insensitive fs
+        (
+            "case .ABERP, root exists",
+            db(base.join(".ABERP").join("prod")),
+            REFUSE,
+            "APFS opens the same directory as .aberp",
+        ),
+        (
+            "case .Aberp, root exists",
+            db(base.join(".Aberp").join("prod")),
+            REFUSE,
+            "same, mixed case",
+        ),
+        (
+            "case .ABERP, root absent",
+            db(base.join("absent").join(".ABERP").join("prod")),
+            REFUSE,
+            "nothing on disk to canonicalize — the dirname compare carries it alone",
+        ),
+        (
+            "sibling root, exact",
+            db(base.join(sibling).join("acme")),
+            REFUSE,
+            "the other edition's root is foreign too",
+        ),
+        // ── symlinks, both directions ────────────────────────────────
+        (
+            "symlink into the foreign root",
+            db(sneaky.join("prod")),
+            REFUSE,
+            "S2 escape: no .aberp component when spelled",
+        ),
+        (
+            "foreign root IS a symlink, spelled",
+            db(linked.join(PROD_DATA_DIRNAME).join("prod")),
+            REFUSE,
+            "resolving strips the component — why both walks stay",
+        ),
+        (
+            "resolvable .. through the symlink",
+            db(sneaky.join("prod").join("..").join("prod")),
+            REFUSE,
+            "every component exists, so canonicalization resolves it",
+        ),
+        // ── F3: a `..` that canonicalization could not resolve ───────
+        (
+            ".. behind a missing component",
+            db(base.join("missing").join("..").join("sneaky").join("prod")),
+            REFUSE,
+            "unresolved — names no fixed directory, so refuse",
+        ),
+        // ── spelling noise that must not change the verdict ──────────
+        (
+            "trailing separator",
+            PathBuf::from(format!("{}/", db(foreign_root.join("prod")).display())),
+            REFUSE,
+            "trailing / must not hide the component",
+        ),
+        (
+            "doubled separators //",
+            PathBuf::from(format!("{}//prod//aberp.duckdb", foreign_root.display())),
+            REFUSE,
+            "empty components must not hide it either",
+        ),
+        (
+            "/./ segments",
+            PathBuf::from(format!("{}/./prod/./aberp.duckdb", foreign_root.display())),
+            REFUSE,
+            "CurDir components are noise",
+        ),
+        (
+            "the bare foreign root",
+            foreign_root.clone(),
+            REFUSE,
+            "the root itself belongs to no edition here",
+        ),
+        (
+            "foreign tenants.toml",
+            foreign_root.join("tenants.toml"),
+            REFUSE,
+            "the registry inside a foreign root is foreign",
+        ),
+        (
+            "absolute prod path, no fs backing",
+            PathBuf::from("/Users/op/.aberp/prod/aberp.duckdb"),
+            REFUSE,
+            "the classic ABERP_DB misconfiguration",
+        ),
+        // ── the residual this guard cannot close ─────────────────────
+        (
+            "hardlink to the victim file",
+            hardlink.clone(),
+            ALLOW,
+            "KNOWN RESIDUAL — a hardlink is a second name for the inode, \
+             not a link the fs will resolve; see ADR-0093 §5",
+        ),
+        // ── NEGATIVE CONTROLS: every legitimate launch path ──────────
+        (
+            "own edition root, tenant acme",
+            tenant_db_path("acme").expect("HOME set"),
+            ALLOW,
+            "run_defense.sh / run_portable.sh ABERP_DB",
+        ),
+        (
+            "own edition root, tenant 'prod'",
+            db(own_root.join("prod")),
+            ALLOW,
+            "a slug that normalises to prod is still THIS edition's tenant",
+        ),
+        (
+            "own edition root, tenant 'PROD'",
+            db(own_root.join("PROD")),
+            ALLOW,
+            "same, upper-cased — the guard keys on the ROOT, not the slug",
+        ),
+        (
+            "run_desktop.sh default ./aberp.duckdb",
+            PathBuf::from("./aberp.duckdb"),
+            ALLOW,
+            "the dev-loop default must keep working",
+        ),
+        (
+            "an ordinary temp path",
+            PathBuf::from("/tmp/whatever/aberp.duckdb"),
+            ALLOW,
+            "outside every edition root",
+        ),
+        (
+            "a scratch copy under the test tree",
+            db(base.join("scratch")),
+            ALLOW,
+            "test fixtures live here",
+        ),
+        (
+            "resolvable .. outside every root",
+            db(base.join("scratch").join("..").join("scratch")),
+            ALLOW,
+            "a `..` that DOES resolve must not be refused",
+        ),
+    ];
+
+    if nfc_nfd_equivalent {
+        rows.push((
+            "unicode NFC on disk, spelled NFD",
+            db(base.join(&nfd).join("prod")),
+            REFUSE,
+            "normalization-insensitive fs — same symlink",
+        ));
+        rows.push((
+            "unicode NFD on disk, spelled NFC",
+            db(base.join(&mirror_nfc).join("prod")),
+            REFUSE,
+            "the mirror direction",
+        ));
+    }
+
+    // The sibling row spelled in upper case only means something when the
+    // sibling name has letters to fold — it always does, but keep the
+    // construction explicit rather than clever.
+    rows.push((
+        "sibling root, upper-case",
+        db(base.join(sibling.to_uppercase()).join("acme")),
+        REFUSE,
+        "case bypass on the sibling edition's root",
+    ));
+
+    println!(
+        "\nADR-0093 §5 — edition DB-path guard decision table ({} build, {} on disk)",
+        build_profile::edition_label(),
+        if nfc_nfd_equivalent {
+            "normalization-insensitive fs"
+        } else {
+            "normalization-sensitive fs: NFC/NFD rows n/a"
+        }
+    );
+    println!(
+        "{:<6} {:<38} {:<7} {:<7} why",
+        "", "case", "expect", "guard"
+    );
+
+    let mut failures = Vec::new();
+    for (label, path, expect_refuse, why) in &rows {
+        let verdict = ensure_db_path_isolated(path);
+        let got_refuse = verdict.is_err();
+        let ok = got_refuse == *expect_refuse;
+        let word = |r: bool| if r { "REFUSE" } else { "ALLOW" };
+        println!(
+            "{:<6} {:<38} {:<7} {:<7} {}",
+            if ok { "ok" } else { "*** FAIL" },
+            label,
+            word(*expect_refuse),
+            word(got_refuse),
+            why
+        );
+        if !ok {
+            failures.push(format!(
+                "{label}: expected {}, got {} for {}",
+                word(*expect_refuse),
+                word(got_refuse),
+                path.display()
+            ));
+        }
+    }
+
+    // The victim file must still hold exactly what was seeded — the guard
+    // is a decision, never a writer.
+    let after = fs::read(&victim).expect("victim file still readable");
+    let victim_intact = after == b"ERVIN INVOICES";
+
+    let _ = fs::remove_dir_all(&base);
+
+    assert!(
+        victim_intact,
+        "the guard must never touch the file it is asked about"
+    );
+    assert!(
+        failures.is_empty(),
+        "ADR-0093 decision table has {} mismatching row(s):\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
