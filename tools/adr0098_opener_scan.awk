@@ -30,6 +30,15 @@ function is_allowed(name,   k){ for(k=1;k<=n_allow;k++) if(A[k]==name) return 1;
     if(d=="//"){ break }
     if(d=="/*"){ inblk=1;i++;continue }
     if(c=="\""){ instr=1; continue }
+    # A Rust CHAR literal is not a string. Without this, `out.push('"')` in
+    # `tenant_registry::quote` opened a phantom string that swallowed the rest
+    # of the file: the one real runtime opener there went UNSEEN while three
+    # `#[cfg(test)]` openers were reported as runtime ones. The file only
+    # re-synced by accident, on a stray `"` inside a doc comment further down —
+    # so editing a COMMENT could flip the scan's verdict. Skip a complete
+    # `'x'` / `'\n'` literal; a lone `'` (lifetime `'a`) falls through as an
+    # ordinary character, which is what the brace/test tracking wants.
+    if(c=="'"){ rest=substr(line,i); if(match(rest,/^'(\\.|[^'\\])'/)){ i+=RLENGTH-1; continue } }
     code=code c
     if(c=="{"){ depth++; if(pending && tdepth<0){ tdepth=depth; pending=0 } }
     else if(c=="}"){ if(tdepth==depth) tdepth=-1; depth-- }
