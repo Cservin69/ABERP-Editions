@@ -15,8 +15,21 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="tools/cut_gate_db_isolation.sh"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/cutgate-probes.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+# Nest ALL of this run's scratch — the per-probe tree copies AND the gate's own
+# mktemp temp files — under ONE run-unique dir, and free exactly that dir on
+# exit. mktemp -d gives a unique name per invocation; the trap removes only this
+# run's own dir, never a glob across cutgate-* . This makes a run UN-NUKEABLE by
+# a concurrent probe run that blanket-purges "$TMPDIR"/cutgate-probes.* — a
+# sibling project's wrapper did exactly that and wiped a validation run
+# mid-flight. Our scratch now lives under "$TMPDIR"/cutgate-run.XXXXXX/…, which
+# no cutgate-probes.* glob at the shared-$TMPDIR level can match; exporting
+# TMPDIR makes the spawned gate inherit it, so ITS temps nest here too. chmod -R
+# before rm: a copy can carry read-only dirs that rm alone cannot unlink (how
+# earlier runs leaked husks into $TMPDIR).
+RUN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/cutgate-run.XXXXXX")"
+export TMPDIR="$RUN_TMP"
+trap 'chmod -R u+w "$RUN_TMP" 2>/dev/null; rm -rf "$RUN_TMP"' EXIT
+WORK="$(mktemp -d "$TMPDIR/cutgate-probes.XXXXXX")"
 pass=0; bad=0
 i=0
 
@@ -29,7 +42,17 @@ fresh() {  # -> path to a fresh, clean copy of the tree (excludes .git)
   # probes (the gate fails regardless), but it made any expect_pass probe after
   # the first plant spuriously fail. Unique dirs fix it for good.
   local d; d="$(mktemp -d "$WORK/copy.XXXXXX")"
-  tar -C "$ROOT" --exclude=.git -cf - . | tar -C "$d" -xf -
+  # Exclude the build/dependency dirs the gate NEVER reads. Proven safe: the
+  # gate (cut_gate_db_isolation.sh) invokes no compiler/runtime and every scan
+  # is rooted at source (run/ apps/ crates/ modules/ tools/ adr/ + named
+  # markers); the set of *.rs it walks is byte-identical with or without
+  # target/ (there is no *.rs under any target/ inside a scanned root). Dropping
+  # target/ takes each copy from ~54G/213s to ~75M/1s — and every probe plants
+  # its violation in source, so the excluded dirs cannot change any verdict.
+  # target/ is anchored to the top level (./target) so a source dir that merely
+  # shares the name could never be dropped; node_modules/.venv are absent today
+  # but excluded to stay disk-safe if a future toolchain adds them.
+  tar -C "$ROOT" --exclude=.git --exclude=./target --exclude=./node_modules --exclude=./.venv -cf - . | tar -C "$d" -xf -
   # Plant-detection marker (see assert_planted), kept OUTSIDE the copy so the
   # gate never sees an extra file.
   #
