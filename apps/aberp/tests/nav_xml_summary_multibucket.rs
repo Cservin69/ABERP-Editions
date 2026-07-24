@@ -30,9 +30,13 @@ use aberp::nav_xml::{
     SupplierInfo,
 };
 use aberp_billing::{
-    Currency, CustomerId, Huf, InvoiceId, LineItem, ReadyInvoice, SeriesCode, SeriesId,
+    Currency, CustomerId, Huf, InvoiceId, LineItem, RateMetadata, ReadyInvoice, SeriesCode,
+    SeriesId,
 };
 use aberp_nav_xsd_validator::validate_invoice_data;
+use rust_decimal::Decimal;
+use std::str::FromStr;
+use time::macros::date;
 use time::OffsetDateTime;
 
 fn line(desc: &str, qty: i64, unit_price: i64, bp: u16) -> LineItem {
@@ -262,6 +266,100 @@ fn bucket_order_is_deterministic_regardless_of_line_order() {
         extract(&forward),
         extract(&reversed),
         "summary must be identical regardless of line order"
+    );
+}
+
+// ── T6 — per-bucket HUF conversion, only observable on a FOREIGN currency ──
+
+/// This is **ADR-0037 invariant C5** — "the HUF-equivalent total on the wire
+/// body equals the sum of the per-VAT-rate HUF amounts (§1.c per-VAT-rate
+/// posture, NOT direct conversion of the EUR invoice total)", whose declared
+/// test is "N EUR invoices with **mixed VAT rates**". C5 was **unsatisfiable**
+/// on this line until B3′: a mixed-rate invoice collapsed into ONE bucket, so
+/// there was no "sum of the per-VAT-rate HUF amounts" to compare against. The
+/// existing EUR wire-body suite (`nav_xml_eur_body.rs`) is single-rate — every
+/// line is 2700bp — so it exercises C5's degenerate one-bucket case only. This
+/// is C5's first real coverage on the Defense line.
+///
+/// The pin the tests above structurally CANNOT carry: `huf_equivalent_for`
+/// is the IDENTITY for `Currency::Huf`, so on a HUF invoice "sum the
+/// per-bucket HUF" and "convert the native grand total once" are the same
+/// number and neither policy can distinguish the other. `write_summary`'s
+/// load-bearing ADR-0037 §1.c claim — the invoice-level `*HUF` figures are
+/// the SUM of the per-bucket `*HUF`, never a fresh conversion of the native
+/// grand total — is therefore observable ONLY on a non-HUF invoice.
+///
+/// The fixture is chosen so the two policies disagree on TWO independent
+/// fields at MNB rate 356.690000 (round-half-even, ADR-0037 §1.c):
+///   net   5%: 300c → 1070 HUF,  27%: 500c → 1783 HUF
+///         sum = 2853   vs   grand(800c) = 2854
+///   vat   5%:  15c →   54 HUF,  27%: 135c →  482 HUF
+///         sum =  536   vs   grand(150c) =  535
+/// They diverge in OPPOSITE directions (+1 / −1), so no constant fudge and
+/// no accidental sign flip passes this pin.
+///
+/// MUTATION: convert the native grand totals once instead of accumulating
+/// the per-bucket HUF — i.e. replace the `inv_*_huf` accumulators with
+/// `huf_equivalent_for(inv_net.as_i64(), currency, rate_metadata)?` etc.
+/// Goes red on `invoiceNetAmountHUF` (2854) and `invoiceVatAmountHUF` (535).
+#[test]
+fn per_bucket_huf_conversion_is_summed_not_reconverted_on_eur() {
+    // A: 5%, net 300c, vat 15c, gross 315c.  B: 27%, net 500c, vat 135c, gross 635c.
+    let invoice = invoice_with_lines(vec![
+        line("5% line", 3, 100, 500),
+        line("27% line", 5, 100, 2700),
+    ]);
+    let rate_metadata = RateMetadata {
+        rate: Decimal::from_str("356.690000").unwrap(),
+        source: "MNB".to_string(),
+        date: date!(2026 - 05 - 08),
+        // Gross stamp kept self-consistent with the fixture (950c → 3389).
+        huf_equivalent_total: 3389,
+    };
+    let xml = nav_xml::render_invoice_data(
+        &invoice,
+        &series(),
+        &domestic_parties(),
+        Currency::Eur,
+        Some(&rate_metadata),
+    )
+    .expect("EUR multi-bucket emitter must succeed");
+    validate_invoice_data(&xml).unwrap_or_else(|e| {
+        panic!(
+            "validator rejected EUR multi-bucket body: {e}\n{}",
+            String::from_utf8_lossy(&xml)
+        )
+    });
+    let body = String::from_utf8(xml).expect("emit is UTF-8");
+    let c = compact(&body);
+    assert_eq!(bucket_count(&body), 2, "one bucket per rate; body:\n{body}");
+
+    // Per-bucket HUF: each bucket converts its OWN native total.
+    assert!(
+        c.contains("<vatRateNetAmount>3.00</vatRateNetAmount><vatRateNetAmountHUF>1070</vatRateNetAmountHUF>"),
+        "5% bucket net must convert its own 300c → 1070 HUF; body:\n{body}"
+    );
+    assert!(
+        c.contains("<vatRateNetAmount>5.00</vatRateNetAmount><vatRateNetAmountHUF>1783</vatRateNetAmountHUF>"),
+        "27% bucket net must convert its own 500c → 1783 HUF; body:\n{body}"
+    );
+
+    // ⭐ The divergent invoice-level figures — the actual mutation surface.
+    assert!(
+        c.contains("<invoiceNetAmountHUF>2853</invoiceNetAmountHUF>"),
+        "invoiceNetAmountHUF must be the SUM of the per-bucket HUF (1070+1783=2853), \
+         NOT a fresh conversion of the 800c grand total (which gives 2854); body:\n{body}"
+    );
+    assert!(
+        c.contains("<invoiceVatAmountHUF>536</invoiceVatAmountHUF>"),
+        "invoiceVatAmountHUF must be the SUM of the per-bucket HUF (54+482=536), \
+         NOT a fresh conversion of the 150c grand total (which gives 535); body:\n{body}"
+    );
+    // Native invoice-level totals are unaffected by the HUF policy.
+    assert!(
+        c.contains("<invoiceNetAmount>8.00</invoiceNetAmount>")
+            && c.contains("<invoiceVatAmount>1.50</invoiceVatAmount>"),
+        "native invoice totals must still be the plain sums; body:\n{body}"
     );
 }
 
