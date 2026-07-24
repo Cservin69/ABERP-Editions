@@ -1068,8 +1068,14 @@ fn walk_summary_normal(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidatio
         "invoiceVatAmount",
         "invoiceVatAmountHUF",
     ];
-    const ORDERED_REQUIRED: &[&str] = &[
-        "summaryByVatRate",
+    // ADR-0103 §3.1 — the four invoice-level amounts appear once each, in
+    // this order, AFTER a leading run of one-or-more `summaryByVatRate`
+    // buckets. `summaryByVatRate` is deliberately NOT in this list: it is
+    // `maxOccurs="unbounded"` (verified against the published NAV
+    // `invoiceData.xsd` `SummaryNormalType`) and is checked separately below
+    // — folding it into a positional `check_ordered_required` is exactly the
+    // pre-fix bug that bounced a correct multi-bucket body.
+    const ORDERED_INVOICE_AMOUNTS: &[&str] = &[
         "invoiceNetAmount",
         "invoiceNetAmountHUF",
         "invoiceVatAmount",
@@ -1101,7 +1107,32 @@ fn walk_summary_normal(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidatio
                 seen.push(canonical);
             }
             Event::End(_) => {
-                check_ordered_required(PARENT, ORDERED_REQUIRED, &seen)?;
+                // ADR-0103 §3.1 — `summaryByVatRate` is `maxOccurs="unbounded"`
+                // (NAV `SummaryNormalType`): one or more buckets, ALL appearing
+                // before the four invoice-level amounts, which then appear once
+                // each in order. The pre-fix validator hard-coded exactly one
+                // bucket and rejected a correct multi-bucket body with
+                // `ChildOrderViolation` — the validator was built to match the
+                // wrong shape.
+                if !seen.contains(&"summaryByVatRate") {
+                    return Err(NavXsdValidationError::MissingRequiredChild {
+                        parent: PARENT,
+                        expected: "summaryByVatRate",
+                    });
+                }
+                // No bucket may appear after an invoice-level amount has begun
+                // (the buckets must form a single leading run).
+                if let Some(first_amount) = seen.iter().position(|s| *s != "summaryByVatRate") {
+                    if seen[first_amount..].contains(&"summaryByVatRate") {
+                        return Err(NavXsdValidationError::ChildOrderViolation {
+                            parent: PARENT,
+                            expected_before: "invoiceNetAmount",
+                            actually_appeared_first: "summaryByVatRate".to_string(),
+                        });
+                    }
+                }
+                // The four invoice-level amounts: present, once each, in order.
+                check_ordered_required(PARENT, ORDERED_INVOICE_AMOUNTS, &seen)?;
                 return Ok(());
             }
             Event::Eof => return Err(eof_in(PARENT, reader)),
@@ -1717,6 +1748,53 @@ mod tests {
     fn minimum_valid_invoice_data_validates() {
         validate_invoice_data(MIN_VALID.as_bytes())
             .expect("the hand-rolled v3.0 minimum example must validate");
+    }
+
+    /// A second `<summaryByVatRate>` block, structurally complete, keyed on a
+    /// different rate — inserted before the existing bucket.
+    const SECOND_BUCKET: &str = "<summaryByVatRate><vatRate><vatPercentage>0.05</vatPercentage></vatRate>\
+<vatRateNetData><vatRateNetAmount>1000</vatRateNetAmount><vatRateNetAmountHUF>1000</vatRateNetAmountHUF></vatRateNetData>\
+<vatRateVatData><vatRateVatAmount>50</vatRateVatAmount><vatRateVatAmountHUF>50</vatRateVatAmountHUF></vatRateVatData>\
+<vatRateGrossData><vatRateGrossAmount>1050</vatRateGrossAmount><vatRateGrossAmountHUF>1050</vatRateGrossAmountHUF></vatRateGrossData>\
+</summaryByVatRate>";
+
+    /// B3′ / ADR-0103 §3.1 — the validator MUST accept a multi-bucket
+    /// `summaryNormal` (NAV `summaryByVatRate` is `maxOccurs="unbounded"`).
+    /// The pre-fix validator was built to the single-bucket shape and bounced
+    /// this correct body with `ChildOrderViolation` — the trap that would make
+    /// a careless session "fix" the emitter back into the defect.
+    ///
+    /// MUTATION: restore the single-bucket positional check — this goes red.
+    #[test]
+    fn validator_accepts_multiple_summary_by_vat_rate_buckets() {
+        let two_buckets = MIN_VALID.replacen(
+            "<summaryByVatRate>",
+            &format!("{SECOND_BUCKET}<summaryByVatRate>"),
+            1,
+        );
+        validate_invoice_data(two_buckets.as_bytes())
+            .expect("a multi-bucket summaryNormal must validate (summaryByVatRate is unbounded)");
+    }
+
+    /// The order rule still holds the OTHER way: a `summaryByVatRate` after an
+    /// invoice-level amount (buckets must be a single LEADING run) is rejected.
+    /// This is what stops the accept-multi-bucket relaxation from turning into
+    /// "accept buckets anywhere".
+    #[test]
+    fn validator_rejects_summary_by_vat_rate_after_invoice_amount() {
+        let bucket_after = MIN_VALID.replacen(
+            "<invoiceVatAmountHUF>540</invoiceVatAmountHUF>",
+            &format!("<invoiceVatAmountHUF>540</invoiceVatAmountHUF>{SECOND_BUCKET}"),
+            1,
+        );
+        let err = validate_invoice_data(bucket_after.as_bytes())
+            .expect_err("a bucket after the invoice-level amounts must be rejected");
+        match err {
+            NavXsdValidationError::ChildOrderViolation { parent, .. } => {
+                assert_eq!(parent, "summaryNormal");
+            }
+            other => panic!("expected ChildOrderViolation, got {other:?}"),
+        }
     }
 
     #[test]
