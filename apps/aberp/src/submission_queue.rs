@@ -759,6 +759,7 @@ mod tests {
         nav_xml_path: Option<&str>,
     ) {
         let payload = audit_payloads::InvoiceDraftCreatedPayload {
+            customer_community_vat_number: None,
             invoice_id: invoice_id.to_string(),
             line_count: 1,
             idempotency_key: idem.to_canonical_string(),

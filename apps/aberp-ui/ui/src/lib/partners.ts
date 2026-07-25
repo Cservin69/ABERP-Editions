@@ -198,6 +198,12 @@ export interface BuyerFields {
   customerPostalCode: string;
   customerCity: string;
   customerStreet: string;
+  /** ADR-0102 — the partner's `eu_vat_number` (the community VAT
+   * number). Seeds the IssueInvoice form's `customerCommunityVatNumber`
+   * so an `Other` (EU) buyer's number pre-fills; snapshotted onto the
+   * issued invoice at compose time. Empty string when the partner has
+   * no EU VAT number. */
+  customerCommunityVatNumber: string;
   /** PR-203 / S203 — partner's master `contact_email` (comma-separated
    * canonical form), to seed the IssueInvoice / Modification form's
    * per-invoice email recipient override input. Empty string when the
@@ -233,10 +239,20 @@ export function buyerFieldsFromPartner(partner: Partner): BuyerFields {
     // form binding; the form's radio + disabled input states reflect
     // the customerVatStatus.
     customerTaxNumber: partner.tax_number ?? "",
-    customerCountryCode: hungarianCountryAliasToCode(partner.address_country),
+    // ADR-0102 — for an `Other` (EU) buyer, pass the partner's actual
+    // address country through (best-effort, uppercased) rather than
+    // forcing `HU` — an Austrian buyer's `<customerAddress>` must carry
+    // `AT`, not `HU`. Domestic/PrivatePerson keep the HU-alias mapping.
+    // Full closed-vocab country validation stays deferred (ADR-0102 §8.3).
+    customerCountryCode:
+      partner.customer_vat_status === "Other"
+        ? foreignCountryToCode(partner.address_country)
+        : hungarianCountryAliasToCode(partner.address_country),
     customerPostalCode: partner.address_postal_code ?? "",
     customerCity: partner.address_city ?? "",
     customerStreet: partner.address_street ?? "",
+    // ADR-0102 — pre-fill the EU community VAT number for Other buyers.
+    customerCommunityVatNumber: partner.eu_vat_number ?? "",
     // PR-203 / S203 — pre-fill the IssueInvoice per-invoice email
     // recipient override from the partner master's `contact_email`.
     // The form value is editable in place; editing NEVER writes back to
@@ -279,6 +295,27 @@ export function hungarianCountryAliasToCode(
       // downstream (the tax-number shape, etc.).
       return "HU";
   }
+}
+
+/** ADR-0102 — best-effort ISO 3166-1 alpha-2 code for a FOREIGN
+ * (`Other`) buyer's address country. Unlike `hungarianCountryAliasToCode`
+ * (which forces `HU`), this passes the partner's country through: trim +
+ * uppercase whatever the operator typed (the country input on the form is
+ * editable so they can correct it before issuing). A full closed-vocab
+ * country validator is deferred (ADR-0102 §8.3); the Rust preflight
+ * `validate_country_code` guard (NAV-adversarial FIX #1) is the load-
+ * bearing `[A-Z]{2}` gate that turns a bad country into an operator error
+ * rather than a NAV bounce. This keeps an EU buyer's `<customerAddress>`
+ * from silently emitting `HU`. */
+export function foreignCountryToCode(
+  country: string | null | undefined,
+): string {
+  // A prior version branched on `/^[A-Za-z]{2}$/` but BOTH arms returned
+  // `trimmed.toUpperCase()` — a dead branch (NAV-adversarial FIX #1). The
+  // uppercase is unconditional; the structural `[A-Z]{2}` validation lives
+  // in the Rust preflight, not here (a partner-typed "Austria" must surface
+  // as a fixable preflight error, not be silently mangled client-side).
+  return (country ?? "").trim().toUpperCase();
 }
 
 /** PR-54 / session-74 — client-side admin-mode filter for the

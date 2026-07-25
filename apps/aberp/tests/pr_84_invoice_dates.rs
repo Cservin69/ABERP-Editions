@@ -43,6 +43,7 @@ fn parties() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
             // Domestic posture for legacy test fixtures.
             customer_vat_status: CustomerVatStatus::Domestic,
@@ -80,6 +81,7 @@ fn nav_emit_surfaces_three_distinct_dates() {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(1_000),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }],
@@ -160,6 +162,7 @@ fn duckdb_round_trip_preserves_payment_deadline_and_delivery_date() {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(1_000),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }],

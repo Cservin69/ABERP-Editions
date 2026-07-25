@@ -534,8 +534,62 @@ fn walk_customer_info(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidation
 
 fn walk_customer_vat_data(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
     const PARENT: &str = "customerVatData";
-    const ALLOWED: &[&str] = &["customerTaxNumber"];
-    expect_single_child_then_close(reader, PARENT, ALLOWED, walk_customer_tax_number)
+    // NAV v3.0 `CustomerVatDataType` is an XSD CHOICE — EXACTLY ONE of:
+    //   - `customerTaxNumber` (structured, `common:`-prefixed children —
+    //     the DOMESTIC arm, PR-50/PR-66); OR
+    //   - `communityVatNumber` (flat text, OSA data namespace — the
+    //     ADR-0102 EU `Other` arm).
+    // The non-EU `thirdStateTaxId` arm is NOT in ALLOWED (ABERP never
+    // emits it — ADR-0102 §8.1); a body carrying it loud-fails
+    // `UnexpectedElement`, which is the conservative posture.
+    const ALLOWED: &[&str] = &["customerTaxNumber", "communityVatNumber"];
+    let mut count: u32 = 0;
+    let mut child: Option<&'static str> = None;
+    loop {
+        match read_event(reader)? {
+            Event::Start(e) => {
+                let local = local_name_of(e.name()).to_string();
+                let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
+                    NavXsdValidationError::UnexpectedElement {
+                        parent: PARENT,
+                        element: local.clone(),
+                    }
+                })?;
+                count += 1;
+                if count > 1 {
+                    return Err(NavXsdValidationError::CardinalityExceeded {
+                        parent: PARENT,
+                        element: child.unwrap_or(canonical),
+                        max: 1,
+                        actual: count,
+                    });
+                }
+                child = Some(canonical);
+                match canonical {
+                    "customerTaxNumber" => walk_customer_tax_number(reader)?,
+                    // ADR-0102 — flat text, data namespace (no `common:`
+                    // prefix). Structural presence is all NAV requires
+                    // locally; the VIES shape is gated upstream at
+                    // `nav_xml::validate_community_vat_number`.
+                    "communityVatNumber" => {
+                        let _ = collect_text(reader, canonical)?;
+                    }
+                    other => unreachable!("canonicalized unknown element {other}"),
+                }
+            }
+            Event::End(_) => {
+                if count == 0 {
+                    return Err(NavXsdValidationError::MissingRequiredChild {
+                        parent: PARENT,
+                        expected: ALLOWED[0],
+                    });
+                }
+                return Ok(());
+            }
+            Event::Eof => return Err(eof_in(PARENT, reader)),
+            _ => {}
+        }
+    }
 }
 
 fn walk_customer_tax_number(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
@@ -912,12 +966,38 @@ fn walk_line_amounts_normal(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdVali
 }
 
 fn walk_line_vat_rate(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
-    const PARENT: &str = "lineVatRate";
+    walk_vat_rate_choice("lineVatRate", reader)
+}
+
+/// Walk <vatRate> inside summaryByVatRate (same shape as lineVatRate).
+fn walk_vat_rate(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
+    walk_vat_rate_choice("vatRate", reader)
+}
+
+/// ADR-0101 — the shared `lineVatRate` / `vatRate` choice-group walker.
+///
+/// NAV's `LineVatRateType` is an XSD choice; the emitter renders exactly
+/// one member. This validator models the members ABERP now emits:
+/// `vatPercentage` (numeric-checked), `vatExemption` / `vatOutOfScope`
+/// (interior `case` + `reason` now validated, not skipped —
+/// [`walk_vat_detail`]), and `vatDomesticReverseCharge` (boolean leaf,
+/// text-consumed). `vatContent` stays in the allowlist (ADR-0022 loose
+/// model) but is skipped. At least one member must appear.
+///
+/// Note (matches pre-ADR-0101 posture): this does not enforce STRICT
+/// exactly-one — a malformed body with two choice members is not rejected
+/// here. NAV's server-side schema is the backstop for that; the emitter
+/// only ever writes one member (see `nav_xml::write_vat_rate_choice`).
+fn walk_vat_rate_choice(
+    parent: &'static str,
+    reader: &mut Reader<&[u8]>,
+) -> Result<(), NavXsdValidationError> {
     const ALLOWED: &[&str] = &[
         "vatPercentage",
         "vatContent",
         "vatExemption",
         "vatOutOfScope",
+        "vatDomesticReverseCharge",
     ];
     let mut any_seen = false;
     loop {
@@ -926,71 +1006,70 @@ fn walk_line_vat_rate(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidation
                 let local = local_name_of(e.name()).to_string();
                 let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
                     NavXsdValidationError::UnexpectedElement {
-                        parent: PARENT,
+                        parent,
                         element: local.clone(),
                     }
                 })?;
-                if canonical == "vatPercentage" {
-                    let text = collect_text(reader, canonical)?;
-                    ensure_numeric_amount(canonical, &text)?;
-                } else {
-                    skip_to_matching_end(reader)?;
+                match canonical {
+                    "vatPercentage" => {
+                        let text = collect_text(reader, canonical)?;
+                        ensure_numeric_amount(canonical, &text)?;
+                    }
+                    "vatExemption" | "vatOutOfScope" => walk_vat_detail(canonical, reader)?,
+                    // vatContent (loose model) + vatDomesticReverseCharge
+                    // (boolean leaf) — consume without deep validation.
+                    _ => skip_to_matching_end(reader)?,
                 }
                 any_seen = true;
             }
             Event::End(_) => {
                 if !any_seen {
                     return Err(NavXsdValidationError::MissingRequiredChild {
-                        parent: PARENT,
+                        parent,
                         expected: "vatPercentage",
                     });
                 }
                 return Ok(());
             }
-            Event::Eof => return Err(eof_in(PARENT, reader)),
+            Event::Eof => return Err(eof_in(parent, reader)),
             _ => {}
         }
     }
 }
 
-/// Walk <vatRate> inside summaryByVatRate (same shape as lineVatRate).
-fn walk_vat_rate(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidationError> {
-    const PARENT: &str = "vatRate";
-    const ALLOWED: &[&str] = &[
-        "vatPercentage",
-        "vatContent",
-        "vatExemption",
-        "vatOutOfScope",
-    ];
-    let mut any_seen = false;
+/// ADR-0101 — walk the interior of `<vatExemption>` / `<vatOutOfScope>`.
+/// NAV's `DetailedReasonType` requires BOTH `<case>` (a code-list token)
+/// and `<reason>` (non-blank free text), `case` before `reason`. Modeling
+/// them (rather than `skip_to_matching_end` as before ADR-0101) makes a
+/// malformed exemption — e.g. one missing `<case>` — a local
+/// `MissingRequiredChild` instead of slipping past to a NAV-side rejection.
+fn walk_vat_detail(
+    parent: &'static str,
+    reader: &mut Reader<&[u8]>,
+) -> Result<(), NavXsdValidationError> {
+    const ALLOWED: &[&str] = &["case", "reason"];
+    const ORDERED_REQUIRED: &[&str] = &["case", "reason"];
+    let mut seen: Vec<&'static str> = Vec::new();
     loop {
         match read_event(reader)? {
             Event::Start(e) => {
                 let local = local_name_of(e.name()).to_string();
                 let canonical = canonicalize(ALLOWED, &local).ok_or_else(|| {
                     NavXsdValidationError::UnexpectedElement {
-                        parent: PARENT,
+                        parent,
                         element: local.clone(),
                     }
                 })?;
-                if canonical == "vatPercentage" {
-                    let text = collect_text(reader, canonical)?;
-                    ensure_numeric_amount(canonical, &text)?;
-                } else {
-                    skip_to_matching_end(reader)?;
-                }
-                any_seen = true;
+                // Consume the text (also rejects a nested element inside
+                // <case>/<reason> via collect_text's Start arm).
+                let _ = collect_text(reader, canonical)?;
+                seen.push(canonical);
             }
             Event::End(_) => {
-                if !any_seen {
-                    return Err(NavXsdValidationError::MissingRequiredChild {
-                        parent: PARENT,
-                        expected: "vatPercentage",
-                    });
-                }
+                check_ordered_required(parent, ORDERED_REQUIRED, &seen)?;
                 return Ok(());
             }
-            Event::Eof => return Err(eof_in(PARENT, reader)),
+            Event::Eof => return Err(eof_in(parent, reader)),
             _ => {}
         }
     }

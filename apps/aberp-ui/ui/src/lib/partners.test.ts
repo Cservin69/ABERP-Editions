@@ -19,6 +19,7 @@ import {
   emptyPartnerForm,
   filterPartners,
   filterPartnersWith,
+  foreignCountryToCode,
   formFromPartner,
   hungarianCountryAliasToCode,
   isPartnerFilterEmpty,
@@ -214,6 +215,33 @@ describe("composePartnerInputs", () => {
   });
 });
 
+// NAV-adversarial FIX #1 — `foreignCountryToCode` trims + uppercases the
+// partner's free-form address country for an Other buyer. The prior
+// `/^[A-Za-z]{2}$/` branch was DEAD (both arms returned
+// `trimmed.toUpperCase()`); this pins the (unchanged) behaviour so the
+// dead-branch removal is provably behaviour-identical, and documents that
+// structural `[A-Z]{2}` validation is the Rust preflight's job (a full
+// country name flows through unchanged here → the preflight guard rejects
+// it as an actionable error rather than this helper silently mangling it).
+describe("foreignCountryToCode", () => {
+  it("uppercases a two-letter code", () => {
+    expect(foreignCountryToCode("at")).toBe("AT");
+    expect(foreignCountryToCode("AT")).toBe("AT");
+  });
+  it("trims surrounding whitespace", () => {
+    expect(foreignCountryToCode("  de  ")).toBe("DE");
+  });
+  it("passes a full country name through (uppercased) — the preflight guard rejects it", () => {
+    // NOT normalised to an ISO code here; the Rust `validate_country_code`
+    // preflight is the load-bearing structural gate.
+    expect(foreignCountryToCode("Austria")).toBe("AUSTRIA");
+  });
+  it("folds null/undefined to empty string", () => {
+    expect(foreignCountryToCode(null)).toBe("");
+    expect(foreignCountryToCode(undefined)).toBe("");
+  });
+});
+
 describe("buyerFieldsFromPartner", () => {
   it("uses legal_name on the invoice (not display_name)", () => {
     // Regulatory compliance: NAV's printed invoice carries the legal
@@ -245,6 +273,25 @@ describe("buyerFieldsFromPartner", () => {
     };
     const fields = buyerFieldsFromPartner(privatePerson);
     expect(fields.customerVatStatus).toBe("PrivatePerson");
+    expect(fields.customerTaxNumber).toBe("");
+  });
+
+  // ADR-0102 — an Other (foreign-EU) partner surfaces its eu_vat_number
+  // as the community VAT number AND passes its actual address country
+  // through (not forced to HU) so an EU buyer's <customerAddress> is
+  // correct.
+  it("surfaces eu_vat_number + foreign country for an Other partner", () => {
+    const other: Partner = {
+      ...SAMPLE_PARTNER,
+      customer_vat_status: "Other",
+      tax_number: null,
+      eu_vat_number: "ATU12345678",
+      address_country: "AT",
+    };
+    const fields = buyerFieldsFromPartner(other);
+    expect(fields.customerVatStatus).toBe("Other");
+    expect(fields.customerCommunityVatNumber).toBe("ATU12345678");
+    expect(fields.customerCountryCode).toBe("AT");
     expect(fields.customerTaxNumber).toBe("");
   });
 

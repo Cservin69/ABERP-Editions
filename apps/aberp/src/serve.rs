@@ -10020,6 +10020,46 @@ pub fn modification_invoice_request(
         });
     }
 
+    // ADR-0101 / S2 GUARD (loud, conservative) — reject in-app
+    // modification of a non-`Percent` base. The SPA modification wire path
+    // does NOT yet thread the per-line `vat_rate_kind`:
+    // `composeModificationBody` (`apps/aberp-ui/ui/src/lib/modification.ts`)
+    // omits it, so every `ModificationInvoiceRequest` line deserialises the
+    // absent field as `#[serde(default)]` `Percent`, and step 5 below builds
+    // the modification `InvoiceInputJson` from `request.lines` (operator
+    // input, NOT the base's side-store). Emitting that would silently re-file
+    // an AAM / reverse-charge / intra-Community base to NAV as a plain
+    // `<vatPercentage>0.00</…>` — the exemption / self-assessment vanishes on
+    // real ÁFA (CLAUDE.md rule 11, worst class). The all-`Percent`-0% body is
+    // structurally valid, and this route never calls
+    // `validate_invoice_preflight` anyway, so nothing downstream could catch
+    // it. Until the kind is threaded through the modification wire (a later
+    // ADR-0101 session), REJECT loudly and steer to the CLI, which replays
+    // the base `input.json` verbatim (kind included) and is unaffected.
+    //
+    // The base kind is read from the persisted `invoice_line` column, NOT
+    // the side-store storno replays — see `read_base_line_vat_kinds` for why
+    // (the side-store has a CLI-issued gap; the column does not). The reader
+    // rides the shared `aberp_db::Handle` (ADR-0098/0099 — no independent
+    // opener). Placed BEFORE the currency check so a non-`Percent` base
+    // surfaces the precise kind blocker regardless of currency; all-`Percent`
+    // bases fall straight through — byte-identical behaviour, the guard fires
+    // ONLY on a non-`Percent` base line.
+    let base_vat_kinds =
+        read_base_line_vat_kinds(&state.db, invoice_id).map_err(ModificationRouteError::Other)?;
+    if let Some(kind) = base_vat_kinds.iter().copied().find(|k| !k.is_percent()) {
+        return Err(ModificationRouteError::BadRequest(format!(
+            "modification of invoice {invoice_id} is not supported in the app: a base line \
+             carries VAT rate-kind `{}` (exempt / reverse-charge / intra-Community). The in-app \
+             modification form does not yet thread the VAT rate-kind onto the NAV wire, so \
+             modifying it here would silently re-file the invoice to NAV as plain 0% VAT and drop \
+             the exemption / self-assessment. Use \
+             `aberp issue-modification --references {invoice_id} --in <PATH>` on the CLI, which \
+             replays the base issuance JSON (VAT rate-kind included) verbatim.",
+            kind.as_str()
+        )));
+    }
+
     // 2. C6 chain-currency invariant check (ADR-0037 §4). Load the
     //    base's stored currency and reject 400 if the body's currency
     //    differs. The SPA's modification form locks the currency
@@ -10158,6 +10198,54 @@ fn read_base_currency(db: &aberp_db::HandleArc, invoice_id: &str) -> Result<Curr
     tx.commit()
         .context("commit read transaction for base-currency lookup")?;
     Ok(metadata.currency)
+}
+
+/// ADR-0101 / S2 — read the BASE invoice's per-line [`VatRateKind`]s from
+/// the billing store, so [`modification_invoice_request`]'s guard can
+/// reject an in-app modification of a non-`Percent` (exempt /
+/// reverse-charge / intra-Community) base. Same shared-Handle scoped-read
+/// posture as [`read_invoice_total_gross_minor`] / [`read_base_currency`]
+/// (ADR-0098/0099 — NO independent `Connection::open`; the reader rides
+/// the ONE `aberp_db::Handle` via `db.read()`, so it registers ZERO new
+/// openers on the Defense cut-gate census). Reuses
+/// `billing::load_ready_invoice_by_id` so the kinds come from the SAME
+/// source of truth as the list / detail read path (CLAUDE.md rule 8).
+///
+/// FLAGGED design choice — this reads the persisted
+/// `invoice_line.vat_rate_kind` column, NOT the base's side-stored
+/// `input.json` (which the storno route replays). The side-store is
+/// written ONLY by the SPA-issue route; the CLI `aberp issue` flow writes
+/// none. Resolving the base kind from the side-store would therefore leave
+/// a CLI-issued non-`Percent` base UNRESOLVABLE, forcing a choice between
+/// reopening the exact silent-downgrade hole this guard closes (absent →
+/// proceed) and breaking Percent-base modifications of CLI-issued invoices
+/// (absent → reject). The DB column is populated for EVERY issued invoice
+/// (both the SPA and CLI issue paths run the billing allocator that writes
+/// `invoice_line` rows) and is keyed by `invoice_id`, so it has no gap.
+///
+/// Returns an empty Vec when the id has no allocated billing row (a
+/// draft); the caller treats that as all-`Percent` (nothing to reject),
+/// which is safe because the route's `Finalized`/`Amended` precondition
+/// has already established the base is an allocated, issued invoice — and
+/// a non-`Percent` invoice is necessarily allocated (it was issued).
+fn read_base_line_vat_kinds(
+    db: &aberp_db::HandleArc,
+    invoice_id: &str,
+) -> Result<Vec<aberp_billing::VatRateKind>> {
+    let mut conn = db
+        .read()
+        .context("shared read: base vat_rate_kind lookup (ADR-0098 Gap 1a Session C)")?;
+    let tx = conn
+        .transaction()
+        .context("begin read transaction for base vat_rate_kind lookup (modification route)")?;
+    let pair = billing::load_ready_invoice_by_id(&tx, invoice_id).with_context(|| {
+        format!("load_ready_invoice_by_id for base vat_rate_kind lookup {invoice_id}")
+    })?;
+    tx.commit()
+        .context("commit read transaction for base vat_rate_kind lookup")?;
+    Ok(pair
+        .map(|(inv, _)| inv.lines.iter().map(|l| l.vat_rate_kind).collect())
+        .unwrap_or_default())
 }
 
 // ── PR-47β / session-65 — GET /api/invoices/:id/issuance-input ───────
@@ -30203,6 +30291,7 @@ mod tests {
                 quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(69),
                 vat_rate_basis_points: 2700,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             }],
@@ -30221,6 +30310,7 @@ mod tests {
                 address_street: "Visszatero koz 6".to_string(),
             },
             customer: crate::nav_xml::CustomerInfo {
+                community_vat_number: None,
                 // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
                 // posture for the round-trip fixture.
                 customer_vat_status: crate::nav_xml::CustomerVatStatus::Domestic,
@@ -30461,6 +30551,7 @@ mod tests {
 
     fn write_draft(ledger: &mut Ledger, actor: &Actor, invoice_id: &str, idem: IdempotencyKey) {
         let payload = audit_payloads::InvoiceDraftCreatedPayload {
+            customer_community_vat_number: None,
             invoice_id: invoice_id.to_string(),
             line_count: 1,
             idempotency_key: idem.to_canonical_string(),

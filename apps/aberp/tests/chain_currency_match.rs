@@ -53,6 +53,7 @@ fn minimal_parties() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
             // Domestic posture for legacy test fixtures.
             customer_vat_status: CustomerVatStatus::Domestic,
@@ -86,6 +87,7 @@ fn build_eur_chain_child() -> ReadyInvoice {
             quantity: rust_decimal::Decimal::from(2),
             unit_price: Huf(1000), // 10.00 EUR per unit
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }],

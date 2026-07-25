@@ -82,6 +82,7 @@ fn fixture_parties() -> NavParties {
             address_street: "Test utca 1.".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
             // Domestic posture for legacy test fixtures.
             customer_vat_status: CustomerVatStatus::Domestic,
@@ -117,6 +118,7 @@ fn fixture_ready_invoice(
             quantity,
             unit_price: Huf(unit_price_minor),
             vat_rate_basis_points: vat_bps,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }],

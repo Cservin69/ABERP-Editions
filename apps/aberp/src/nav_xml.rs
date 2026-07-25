@@ -35,7 +35,7 @@
 
 use aberp_billing::{
     huf_equivalent_round_half_even, Currency, Huf, LineItem, NavUnitOfMeasure, PaymentMethod,
-    ProductUnit, RateMetadata, ReadyInvoice, SeriesCode,
+    ProductUnit, RateMetadata, ReadyInvoice, SeriesCode, VatRateKind,
 };
 use anyhow::{anyhow, Context, Result};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
@@ -75,11 +75,14 @@ pub enum CustomerVatStatus {
     /// ADR-0048 §3 open-question #5 lands on "name always, address
     /// optional" for v1).
     PrivatePerson,
-    /// Non-Hungarian buyer (EU community VAT or non-EU third-state
-    /// tax-id). v1 named-defers this branch per ADR-0048 §7; the
-    /// preflight emits [`CustomerVatStatusOtherNotSupportedV1`] BEFORE
-    /// the emitter can be reached, and the NAV emitter itself
-    /// loud-fails if it materialises this variant.
+    /// Non-Hungarian buyer. ADR-0102 wires the EU-community-VAT
+    /// sub-shape end-to-end: the NAV wire REQUIRES `<customerVatData>`
+    /// carrying `<communityVatNumber>` (flat text, data namespace) plus
+    /// `<customerName>` + `<customerAddress>` (the `CUSTOMER_DATA_EXPECTED`
+    /// predicate is `status != PRIVATE_PERSON`). The non-EU
+    /// `<thirdStateTaxId>` arm stays named-deferred (ADR-0102 §8.1). The
+    /// preflight cross-field matrix binds the intra-Community 0% VAT
+    /// kinds (KBAET/EUFAD37) to this status.
     Other,
 }
 
@@ -306,6 +309,122 @@ pub fn parse_hungarian_tax_number(input: &str) -> Result<HungarianTaxNumber, Sup
     })
 }
 
+/// ADR-0102 — the EU-VAT country prefixes accepted for a
+/// `<communityVatNumber>` (VIES structural shape). `EL` (Greece, not
+/// `GR`) and `XI` (Northern Ireland, post-Brexit) are the two
+/// non-obvious members; `HU` is included for structural completeness
+/// (a Hungarian community VAT id is well-formed even though an `Other`
+/// buyer with an HU prefix would normally be `Domestic`). Sorted for
+/// readability; membership — not order — is load-bearing.
+const EU_VAT_COUNTRY_PREFIXES: &[&str] = &[
+    "AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "EL", "ES", "FI", "FR", "HR", "HU", "IE", "IT",
+    "LT", "LU", "LV", "MT", "NL", "PL", "PT", "RO", "SE", "SI", "SK", "XI",
+];
+
+/// ADR-0102 — STRUCTURAL (VIES-shape) validation of an EU community VAT
+/// number, shared by the partner-form gate and the invoice preflight.
+/// This is deliberately NOT a live VIES lookup (out of scope, ADR-0102
+/// §8.2) and NOT a per-country length/checksum table — it is the
+/// operator-friendly "did you type something shaped like an EU VAT id"
+/// gate, symmetric with [`parse_hungarian_tax_number`]'s role for the
+/// Hungarian ADÓSZÁM. NAV's submit layer is the authoritative validator.
+///
+/// Shape: `<2-letter EU country prefix><2..=12 alphanumerics>`, case-
+/// and space-insensitive (VIES numbers are printed with spaces; some
+/// member states use letters in the body, e.g. NL/IE). Returns a
+/// bilingual, operator-actionable message on rejection (CLAUDE.md
+/// rule 12 — fail loud, name the problem).
+///
+/// B4 / ADR-0103 §4.3 (Invariant I — one value): on success this RETURNS
+/// the normalised (whitespace-stripped, upper-cased) number rather than
+/// discarding it. The caller writes it back into the customer body at
+/// INGEST, so the bytes validated, persisted to the side-store, stamped on
+/// the audit payload and written to the NAV XML are one and the same.
+///
+/// Normalising at EMIT instead would have been the wrong fix: ADR-0102
+/// §3.2 snapshots this number onto three artifacts, so an emit-time
+/// normalisation leaves the side-store and audit payload holding the raw
+/// string while NAV receives the normalised one — the same defect, moved.
+/// `write_customer` therefore stays dumb and emits the stored field
+/// verbatim, which is now normalised by construction.
+///
+/// Why normalise here rather than go verbatim-strict like
+/// [`validate_country_code`]? Operator reality differs: VIES numbers are
+/// published and pasted WITH spaces (`ATU 123 45678`), so verbatim-strict
+/// rejection would be hostile to a correct input; a lower-case country
+/// code is a typo. Different lenience, same invariant.
+///
+/// The `Err` arm is unchanged — this returns what a VALID number carries,
+/// never what the function accepts. A malformed number is still rejected.
+pub fn validate_community_vat_number(input: &str) -> Result<String, String> {
+    let normalized: String = input
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_uppercase())
+        .collect();
+    if normalized.is_empty() {
+        return Err("EU adószám kötelező külföldi (OTHER) vevőnél / \
+                    EU VAT number is required for a foreign (OTHER) buyer"
+            .to_string());
+    }
+    if normalized.len() < 2 || !normalized.is_char_boundary(2) {
+        return Err(format!(
+            "EU adószám túl rövid: „{input}” / EU VAT number too short: \"{input}\""
+        ));
+    }
+    let (prefix, body) = normalized.split_at(2);
+    if !EU_VAT_COUNTRY_PREFIXES.contains(&prefix) {
+        return Err(format!(
+            "Ismeretlen EU országkód „{prefix}” az EU adószámban / \
+             unknown EU country prefix \"{prefix}\" in the EU VAT number"
+        ));
+    }
+    if !(2..=12).contains(&body.len()) {
+        return Err(format!(
+            "Az EU adószám törzse 2–12 karakter kell legyen (kapott: {}) / \
+             EU VAT number body must be 2–12 chars (got {})",
+            body.len(),
+            body.len()
+        ));
+    }
+    if !body.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(format!(
+            "Az EU adószám törzse csak betű/szám lehet: „{input}” / \
+             EU VAT number body must be alphanumeric: \"{input}\""
+        ));
+    }
+    Ok(normalized)
+}
+
+/// ADR-0102 (NAV-adversarial FIX #1) — STRUCTURAL ISO 3166-1 alpha-2
+/// validation of a buyer address `country_code`, applied at invoice
+/// preflight for an `Other` (foreign-EU) buyer. NAV's `CountryCodeType`
+/// is `xs:pattern [A-Z]{2}`; an `Other` buyer's country flows from the
+/// (free-form) partner record, so a partner stored as "Austria" /
+/// "Ausztria" — or a lowercase "at" — would emit a `<countryCode>` NAV
+/// bounces with `INVALID_CUSTOMER_COUNTRY` at submit time (burning a
+/// sequence). This turns that NAV bounce into an operator-correctable
+/// ABERP preflight error, symmetric with [`validate_community_vat_number`].
+///
+/// Deliberately STRUCTURAL only — exactly two ASCII A–Z uppercase
+/// letters. A full closed-vocab country list stays deferred (ADR-0102
+/// §8.3); `[A-Z]{2}` is the shape NAV's XSD enforces and is enough here.
+/// VERBATIM-strict (no trim, no case-fold): `write_customer_address`
+/// emits `country_code` byte-for-byte, so anything the wire would reject
+/// — a trailing space, a lowercase letter — must reject here too, or the
+/// guard would pass a value NAV still bounces. Bilingual, operator-
+/// actionable message on rejection (CLAUDE.md rule 12).
+pub fn validate_country_code(input: &str) -> Result<(), String> {
+    if input.len() == 2 && input.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Ok(());
+    }
+    Err(format!(
+        "Az országkód „{input}” nem érvényes ISO 3166-1 alpha-2 kód \
+         (pontosan két nagybetű, pl. AT, DE) / country code \"{input}\" is not a \
+         valid ISO 3166-1 alpha-2 code (exactly two A–Z uppercase letters, e.g. AT, DE)"
+    ))
+}
+
 /// PR-50 / session-70 — supplier-info shape guard, called from
 /// `issue_from_parsed` BEFORE any DB write and from
 /// `serve::handle_issue_invoice` BEFORE dispatching to the issuance
@@ -338,6 +457,16 @@ pub struct CustomerInfo {
     /// `Some(_)`; a Domestic + `None` reaching the emitter is a
     /// programmer-error loud-fail.
     pub tax_number: Option<String>,
+    /// ADR-0102 — EU community VAT number for an `Other` (foreign-EU
+    /// business) buyer. Emitted as `<customerVatData><communityVatNumber>`.
+    /// `Some(_)` ONLY for `Other`; `None` for Domestic/PrivatePerson (they
+    /// carry no `communityVatNumber`). Snapshotted at issuance from the
+    /// picked partner's `eu_vat_number` (the wire body + on-disk NAV XML +
+    /// audit payload are the immutable record; a later partner edit does
+    /// not rewrite an issued invoice). An `Other` + `None` reaching the
+    /// emitter is a programmer-error loud-fail — preflight + partner-form
+    /// validation guarantee `Some(_)` upstream (ADR-0102 §4).
+    pub community_vat_number: Option<String>,
     pub name: String,
     /// PR-77 / session-101 — NAV v3.0 business-rule
     /// `CUSTOMER_DATA_EXPECTED` requires `<customerAddress>` whenever
@@ -1086,6 +1215,11 @@ fn negate_line(line: &LineItem) -> LineItem {
         quantity: -line.quantity,
         unit_price: line.unit_price,
         vat_rate_basis_points: line.vat_rate_basis_points,
+        // ADR-0101 — preserve the base line's VAT rate-kind verbatim
+        // through negation. Like the description and VAT rate, the kind is
+        // not part of the amount-sign reversal; carrying it forward keeps
+        // the storno's `<lineVatRate>` choice element identical to the base.
+        vat_rate_kind: line.vat_rate_kind,
         // PR-82 — preserve the base's per-line `note` verbatim through
         // negation. The note is recipient-facing metadata, NOT part of
         // the amount-sign reversal; carrying it forward keeps the
@@ -1198,10 +1332,24 @@ fn write_customer(w: &mut Writer<&mut Vec<u8>>, c: &CustomerInfo) -> Result<()> 
             // and the validator's symmetric ForbiddenChildUnderStatus rule.
         }
         CustomerVatStatus::Other => {
-            return Err(anyhow!(
-                "ADR-0048 §7: Other-status customer emit is v1 named-deferred \
-                 (use Domestic or PrivatePerson; foreign-buyer support lands in v2)"
-            ));
+            // ADR-0102 — foreign-EU business buyer. NAV's
+            // `CustomerVatDataType` choice carries `<communityVatNumber>`
+            // (a flat text element in the OSA data namespace — NOT the
+            // `common:`-prefixed structured `customerTaxNumber` shape) for
+            // the EU arm. The non-EU `<thirdStateTaxId>` arm stays named-
+            // deferred (ADR-0102 §8.1). `None` here is a programmer-error
+            // loud-fail: preflight (`CommunityVatNumberMissing`) + the
+            // partner-form gate guarantee `Some(_)` upstream.
+            let community_vat_number = c.community_vat_number.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "Other (foreign-EU) buyer requires community_vat_number at NAV-XML \
+                     render time — preflight + partner-form validation should have caught \
+                     this upstream (ADR-0102 §4)"
+                )
+            })?;
+            w.write_event(Event::Start(BytesStart::new("customerVatData")))?;
+            text_element(w, "communityVatNumber", community_vat_number)?;
+            w.write_event(Event::End(BytesEnd::new("customerVatData")))?;
         }
     }
 
@@ -1515,7 +1663,7 @@ fn write_lines(
 
         w.write_event(Event::Start(BytesStart::new("lineAmountsNormal")))?;
         write_line_net(w, net, currency, rate_metadata)?;
-        write_line_vat_rate(w, line.vat_rate_basis_points)?;
+        write_line_vat_rate(w, line.vat_rate_kind, line.vat_rate_basis_points)?;
         write_line_vat_amount(w, vat, currency, rate_metadata)?;
         write_line_gross(w, gross, currency, rate_metadata)?;
         w.write_event(Event::End(BytesEnd::new("lineAmountsNormal")))?;
@@ -1543,18 +1691,154 @@ fn write_line_net(
     w.write_event(Event::End(BytesEnd::new("lineNetAmountData")))?;
     Ok(())
 }
-/// Write <vatRate> for summary (not <lineVatRate>).
-fn write_vat_rate(w: &mut Writer<&mut Vec<u8>>, vat_rate_basis_points: u16) -> Result<()> {
-    let rate_decimal = format!("{:.2}", vat_rate_basis_points as f64 / 10000.0);
+/// ADR-0101 — the NAV `<lineVatRate>` / `<vatRate>` choice a
+/// [`VatRateKind`] resolves to. This is the SINGLE source of truth for the
+/// `(element, case, reason)` triple (ADR-0101 §3.2 / CLAUDE.md rule 5 —
+/// code answers the deterministic transform; the model stores only the
+/// kind). Consumed by BOTH the per-line emit (`write_line_vat_rate`) and
+/// the invoice-level summary mirror (`write_vat_rate`) so a line and its
+/// `summaryByVatRate` bucket can never disagree (§3.4 — a line/summary
+/// category mismatch is itself a NAV rejection).
+enum VatRateChoice {
+    /// `<vatPercentage>{rate}</vatPercentage>` — the numeric path,
+    /// byte-identical to the pre-0101 emit.
+    Percentage,
+    /// `<vatExemption><case>{case}</case><reason>{reason}</reason></…>`.
+    Exemption {
+        case: &'static str,
+        reason: &'static str,
+    },
+    /// `<vatOutOfScope><case>{case}</case><reason>{reason}</reason></…>`.
+    OutOfScope {
+        case: &'static str,
+        reason: &'static str,
+    },
+    /// `<vatDomesticReverseCharge>true</vatDomesticReverseCharge>` — a
+    /// boolean element with no case code.
+    DomesticReverseCharge,
+}
+
+/// Map a [`VatRateKind`] to its NAV choice. Case codes CONFIRMED by Ervin
+/// on the record (2026-07-15) — AAM / KBAET / EUFAD37 / the
+/// `vatDomesticReverseCharge` boolean. `reason` is a statutory Hungarian
+/// free-text string (NAV requires non-blank; it is NOT buyer PII — the
+/// ADR-0042 notes firewall is unaffected). The named-deferred kinds
+/// (ADR-0101 §3.1) `anyhow!` here as explicit not-yet markers (CLAUDE.md
+/// rule 12) — they are unreachable in Session 1 because preflight rejects
+/// every non-`Percent` kind before emit.
+fn vat_rate_choice(kind: VatRateKind) -> Result<VatRateChoice> {
+    Ok(match kind {
+        VatRateKind::Percent => VatRateChoice::Percentage,
+        VatRateKind::AamExempt => VatRateChoice::Exemption {
+            case: "AAM",
+            reason: "Alanyi adómentesség [Áfa tv. 187–196. §]",
+        },
+        VatRateKind::IntraCommunityGoods => VatRateChoice::Exemption {
+            case: "KBAET",
+            reason: "Közösségen belüli adómentes termékértékesítés [Áfa tv. 89. §]",
+        },
+        VatRateKind::IntraCommunityServiceReverse => VatRateChoice::OutOfScope {
+            case: "EUFAD37",
+            reason: "Áfa területi hatályán kívüli, fordított adózású ügylet [Áfa tv. 37. §]",
+        },
+        VatRateKind::DomesticReverseCharge => VatRateChoice::DomesticReverseCharge,
+        // ── named-deferred (ADR-0101 §3.1 / §10.4) — unreachable in
+        //    Session 1 (preflight shut door). Wiring one is a later PR that
+        //    must confirm its own NAV case code first. ──
+        other => {
+            return Err(anyhow!(
+                "VatRateKind::{other:?} is ADR-0101 named-deferred; NAV emit is not yet wired \
+                 for it (confirm its NAV case code first)"
+            ))
+        }
+    })
+}
+
+/// ADR-0101 storno fold — the INVERSE of [`vat_rate_choice`]: given the
+/// `<lineVatRate>` choice `element` name and its optional `<case>` code
+/// (read back from an on-disk NAV XML), recover the [`VatRateKind`] that
+/// emitted it. Returns `None` for any (element, case) pair no WIRED kind
+/// produces — the caller loud-fails rather than silently mis-categorising
+/// a storno line (CLAUDE.md rule 11).
+///
+/// Derived by iterating the four wired kinds and comparing against their
+/// forward `vat_rate_choice` output, so the two directions CANNOT drift:
+/// `vat_rate_choice` stays the single source of truth for the
+/// `(element, case, reason)` triple, and a change there is automatically
+/// reflected here. `Percent` is intentionally NOT in the search set — the
+/// numeric path is recovered from `<vatPercentage>`, not a wrapper element.
+fn vat_rate_kind_from_choice(element: &str, case: Option<&str>) -> Option<VatRateKind> {
+    const WIRED: [VatRateKind; 4] = [
+        VatRateKind::AamExempt,
+        VatRateKind::DomesticReverseCharge,
+        VatRateKind::IntraCommunityGoods,
+        VatRateKind::IntraCommunityServiceReverse,
+    ];
+    WIRED.into_iter().find(|&k| match vat_rate_choice(k) {
+        Ok(VatRateChoice::Exemption { case: c, .. }) => {
+            element == "vatExemption" && case == Some(c)
+        }
+        Ok(VatRateChoice::OutOfScope { case: c, .. }) => {
+            element == "vatOutOfScope" && case == Some(c)
+        }
+        Ok(VatRateChoice::DomesticReverseCharge) => element == "vatDomesticReverseCharge",
+        // Unreachable for the WIRED set (no wired kind maps to Percentage),
+        // and a named-deferred kind's `anyhow!` never matches an element.
+        Ok(VatRateChoice::Percentage) | Err(_) => false,
+    })
+}
+
+/// Write the inner choice element of a `<lineVatRate>` / `<vatRate>`.
+/// Shared so the per-line emit and the summary mirror stay in lock-step.
+fn write_vat_rate_choice(
+    w: &mut Writer<&mut Vec<u8>>,
+    kind: VatRateKind,
+    vat_rate_basis_points: u16,
+) -> Result<()> {
+    match vat_rate_choice(kind)? {
+        VatRateChoice::Percentage => {
+            let rate_decimal = format!("{:.2}", vat_rate_basis_points as f64 / 10000.0);
+            text_element(w, "vatPercentage", &rate_decimal)?;
+        }
+        VatRateChoice::Exemption { case, reason } => {
+            w.write_event(Event::Start(BytesStart::new("vatExemption")))?;
+            text_element(w, "case", case)?;
+            text_element(w, "reason", reason)?;
+            w.write_event(Event::End(BytesEnd::new("vatExemption")))?;
+        }
+        VatRateChoice::OutOfScope { case, reason } => {
+            w.write_event(Event::Start(BytesStart::new("vatOutOfScope")))?;
+            text_element(w, "case", case)?;
+            text_element(w, "reason", reason)?;
+            w.write_event(Event::End(BytesEnd::new("vatOutOfScope")))?;
+        }
+        VatRateChoice::DomesticReverseCharge => {
+            text_element(w, "vatDomesticReverseCharge", "true")?;
+        }
+    }
+    Ok(())
+}
+
+/// Write <vatRate> for summary (not <lineVatRate>). ADR-0101 — the summary
+/// mirror: same choice shape as the line, keyed on the (single) invoice
+/// kind so the `summaryByVatRate` bucket matches the lines (§3.4).
+fn write_vat_rate(
+    w: &mut Writer<&mut Vec<u8>>,
+    kind: VatRateKind,
+    vat_rate_basis_points: u16,
+) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("vatRate")))?;
-    text_element(w, "vatPercentage", &rate_decimal)?;
+    write_vat_rate_choice(w, kind, vat_rate_basis_points)?;
     w.write_event(Event::End(BytesEnd::new("vatRate")))?;
     Ok(())
 }
-fn write_line_vat_rate(w: &mut Writer<&mut Vec<u8>>, vat_rate_basis_points: u16) -> Result<()> {
-    let rate_decimal = format!("{:.2}", vat_rate_basis_points as f64 / 10000.0);
+fn write_line_vat_rate(
+    w: &mut Writer<&mut Vec<u8>>,
+    kind: VatRateKind,
+    vat_rate_basis_points: u16,
+) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("lineVatRate")))?;
-    text_element(w, "vatPercentage", &rate_decimal)?;
+    write_vat_rate_choice(w, kind, vat_rate_basis_points)?;
     w.write_event(Event::End(BytesEnd::new("lineVatRate")))?;
     Ok(())
 }
@@ -1595,17 +1879,22 @@ fn write_line_gross(
     Ok(())
 }
 
-/// One `summaryByVatRate` bucket: a distinct `vat_rate_basis_points` group
-/// and its accumulated native totals.
+/// One `summaryByVatRate` bucket: a distinct `(vat_rate_kind,
+/// vat_rate_basis_points)` group and its accumulated native totals.
 ///
-/// NOTE (Defense-line divergence from ABERP.git ADR-0103): the prod-line key
-/// is the composite `(vat_rate_kind, vat_rate_basis_points)`. This edition's
-/// `main` has no per-line `vat_rate_kind` (ADR-0101/0102 is parked on
-/// `port/vat-rate-kind-s1-machinery`, not merged), so the only distinction a
-/// line can carry here is its rate. The bucket key is therefore
-/// `vat_rate_basis_points` alone. When the rate-kind port lands it must widen
-/// this key to `(kind, basis_points)` — see the port note in the PR.
+/// The key WIDENED from `vat_rate_basis_points` alone to the composite
+/// `(kind, basis_points)` when the rate-kind port landed (ADR-0103 (Defense)
+/// §4.1) — discharging the port note the B3′ fix left here. It now matches
+/// the prod-line ABERP.git key exactly.
+///
+/// Why the rate alone is not enough: all four wired 0%-kinds carry
+/// `basis_points == 0` (forced by ADR-0101 §4), so under a rate-only key an
+/// `AamExempt` line and an `IntraCommunityGoods` line are indistinguishable
+/// and collapse into ONE bucket — which can carry only one NAV case code,
+/// silently filing one kind under the other's exemption. At 0% the rate
+/// carries no information at all.
 struct VatRateBucket {
+    kind: VatRateKind,
     basis_points: u16,
     net: Huf,
     vat: Huf,
@@ -1618,24 +1907,32 @@ fn write_summary(
     currency: Currency,
     rate_metadata: Option<&RateMetadata>,
 ) -> Result<()> {
-    // B3′ / ADR-0103 §3.1 (Invariant S — summary coverage), rate-only form.
-    // Group lines by `vat_rate_basis_points` and emit ONE `<summaryByVatRate>`
-    // per group, each carrying its OWN group's net/vat/gross sums; the
-    // invoice-level totals are the sum OVER buckets.
+    // B3/B3′ / ADR-0103 §3.1 (Invariant S — summary coverage). Group lines by
+    // the composite key `(vat_rate_kind, vat_rate_basis_points)` and emit ONE
+    // `<summaryByVatRate>` per group, each carrying its OWN group's
+    // net/vat/gross sums; the invoice-level totals are the sum OVER buckets.
     //
     // Was (the B3′ defect): a single bucket keyed on `lines.first()` wrapped
-    // around every line's total — so a mixed-rate invoice (e.g. a 27% line
-    // beside a 5% line) sent NAV one bucket carrying every line's money under
-    // the first line's rate, i.e. silently wrong ÁFA. The NAV OSA 3.0
-    // `SummaryNormalType` defines `summaryByVatRate` as `maxOccurs="unbounded"`
-    // (verified against the published `invoiceData.xsd`), so multiple buckets
-    // are the correct wire shape; the local `nav-xsd-validator` was corrected
-    // to accept them in lock-step.
+    // around every line's total — so a mixed-rate or mixed-kind invoice sent
+    // NAV one bucket carrying every line's money under the first line's rate,
+    // i.e. silently wrong ÁFA. The NAV OSA 3.0 `SummaryNormalType` defines
+    // `summaryByVatRate` as `maxOccurs="unbounded"` (verified against the
+    // published `invoiceData.xsd`), so multiple buckets are the correct wire
+    // shape; the local `nav-xsd-validator` was corrected to accept them in
+    // lock-step.
     //
-    // Determinism: buckets are emitted in a stable sort on basis points, NEVER
-    // `HashMap`/first-appearance order, so a given invoice renders
-    // byte-identically on every render and the on-disk XML stays a stable
-    // canonical record of what NAV saw.
+    // The key WIDENED from rate-only to `(kind, rate)` with the rate-kind
+    // port (ADR-0103 (Defense) §4.1). The rate alone is not a sufficient key:
+    // all four wired 0%-kinds carry `basis_points == 0`, so a rate-only key
+    // cannot tell AAM from KBAET from EUFAD37 from §142 and would collapse
+    // them into one bucket carrying a single NAV case code. Two lines at the
+    // SAME percentage but different kinds (27% taxable vs 27%-rated domestic
+    // reverse charge) likewise split into two buckets, as they must.
+    //
+    // Determinism: buckets are emitted in a stable sort on (kind canonical
+    // name, basis points), NEVER `HashMap`/first-appearance order, so a given
+    // invoice renders byte-identically on every render and the on-disk XML
+    // stays a stable canonical record of what NAV saw.
     //
     // HUF conversion is PER BUCKET (ADR-0037 §1.c): each bucket converts its
     // own native totals, and the invoice-level HUF figures are the SUM of the
@@ -1643,16 +1940,18 @@ fn write_summary(
     // total, which would reintroduce a rounding discrepancy the moment there
     // is more than one bucket.
     //
-    // Back-compat: for a single-rate invoice — every invoice issued to date —
-    // the grouping yields exactly one bucket and the emitted bytes are
-    // IDENTICAL to the pre-fix single-bucket output.
+    // Back-compat: for a single-rate, single-kind invoice — every invoice
+    // issued to date — the grouping yields exactly one bucket and the emitted
+    // bytes are IDENTICAL to both the pre-B3′ output and the rate-only form
+    // this widening replaces.
     let mut buckets: Vec<VatRateBucket> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        let key = line.vat_rate_basis_points;
-        let idx = match buckets.iter().position(|b| b.basis_points == key) {
+        let key = (line.vat_rate_kind, line.vat_rate_basis_points);
+        let idx = match buckets.iter().position(|b| (b.kind, b.basis_points) == key) {
             Some(idx) => idx,
             None => {
                 buckets.push(VatRateBucket {
+                    kind: line.vat_rate_kind,
                     basis_points: line.vat_rate_basis_points,
                     net: Huf::ZERO,
                     vat: Huf::ZERO,
@@ -1675,8 +1974,15 @@ fn write_summary(
             .checked_add(line.gross_total().unwrap_or(Huf::ZERO))
             .with_context(|| format!("gross overflow at line {i}"))?;
     }
-    // Stable, deterministic bucket order (independent of line order).
-    buckets.sort_by_key(|b| b.basis_points);
+    // Stable, deterministic bucket order (independent of line order). Sorting
+    // on the rate alone would leave two same-rate different-kind buckets in
+    // line order — a non-deterministic render. Both key components sort.
+    buckets.sort_by(|a, b| {
+        a.kind
+            .as_str()
+            .cmp(b.kind.as_str())
+            .then(a.basis_points.cmp(&b.basis_points))
+    });
 
     let mut inv_net = Huf::ZERO;
     let mut inv_vat = Huf::ZERO;
@@ -1696,9 +2002,11 @@ fn write_summary(
         let gross_huf = huf_equivalent_for(b.gross.as_i64(), currency, rate_metadata)?;
 
         w.write_event(Event::Start(BytesStart::new("summaryByVatRate")))?;
-        // The bucket's `<vatRate>` mirrors its lines' rate — a line/summary
-        // category mismatch is a NAV cross-field rejection.
-        write_vat_rate(w, b.basis_points)?;
+        // ADR-0101 §3.4 — the bucket's `<vatRate>` choice element mirrors
+        // THIS BUCKET's own kind + rate (never `lines.first()`'s, which is
+        // the B3′ defect). A line/summary category mismatch is a NAV
+        // cross-field rejection.
+        write_vat_rate(w, b.kind, b.basis_points)?;
         w.write_event(Event::Start(BytesStart::new("vatRateNetData")))?;
         text_element(
             w,
@@ -2145,6 +2453,28 @@ pub fn read_invoice_lines_from_xml(path: &std::path::Path) -> Result<Vec<LineIte
             Event::Start(e) if e.name().local_name().as_ref() == b"line" => {
                 cur = Some(XmlLineAcc::default());
             }
+            // ADR-0101 storno fold — a `<lineVatRate>` choice WRAPPER
+            // (`vatExemption` / `vatOutOfScope` / `vatDomesticReverseCharge`)
+            // has children (case/reason, or a bool text), so we record which
+            // wrapper this line carries and DO NOT `read_text` it (that would
+            // consume the interior). The inner `<case>` is captured as a leaf
+            // in the branch below; `<reason>` is intentionally ignored (the
+            // kind is reconstructed from element + case, not the free-text
+            // reason). Only ever reached while inside a `<line>`, so the
+            // summary `<vatRate>` block (outside any `<line>`) can't spoof it.
+            Event::Start(e)
+                if cur.is_some()
+                    && matches!(
+                        e.name().local_name().as_ref(),
+                        b"vatExemption" | b"vatOutOfScope" | b"vatDomesticReverseCharge"
+                    ) =>
+            {
+                let local = e.name().local_name();
+                if let Some(a) = cur.as_mut() {
+                    a.vat_choice_element =
+                        Some(String::from_utf8_lossy(local.as_ref()).into_owned());
+                }
+            }
             Event::Start(e) if cur.is_some() => {
                 let local = e.name().local_name();
                 let field: Option<&mut Option<String>> = match local.as_ref() {
@@ -2158,6 +2488,12 @@ pub fn read_invoice_lines_from_xml(path: &std::path::Path) -> Result<Vec<LineIte
                     // `<vatRate>` block is outside any `<line>`), so
                     // capturing it unconditionally here is safe.
                     b"vatPercentage" => cur.as_mut().map(|a| &mut a.vat_percentage),
+                    // ADR-0101 — the `<case>` code inside a `vatExemption` /
+                    // `vatOutOfScope` wrapper. Same bounded-to-`<line>`
+                    // reasoning as `vatPercentage` (a `<case>` only appears
+                    // inside those wrappers, which only appear in a line's
+                    // `<lineVatRate>` here).
+                    b"case" => cur.as_mut().map(|a| &mut a.vat_case),
                     _ => None,
                 };
                 if let Some(slot) = field {
@@ -2203,6 +2539,19 @@ struct XmlLineAcc {
     unit_of_measure_own: Option<String>,
     unit_price: Option<String>,
     vat_percentage: Option<String>,
+    /// ADR-0101 storno fold — the `<lineVatRate>` choice WRAPPER element
+    /// this line carried (`vatExemption` / `vatOutOfScope` /
+    /// `vatDomesticReverseCharge`), captured on its Start event. `None`
+    /// for a numeric `Percent` line (which carries `<vatPercentage>`
+    /// instead). Exactly one of `vat_percentage` / `vat_choice_element` is
+    /// set per NAV's `LineVatRateType` choice.
+    vat_choice_element: Option<String>,
+    /// ADR-0101 storno fold — the `<case>` code inside a `vatExemption` /
+    /// `vatOutOfScope` wrapper (`AAM` / `KBAET` / `EUFAD37` / …). `None`
+    /// for the numeric path and for the boolean `vatDomesticReverseCharge`
+    /// (which carries no case). Paired with `vat_choice_element` to
+    /// reconstruct the `VatRateKind` via `vat_rate_kind_from_choice`.
+    vat_case: Option<String>,
 }
 
 /// Build a [`LineItem`] from the leaf strings captured for one `<line>`.
@@ -2238,19 +2587,48 @@ fn line_item_from_acc(acc: &XmlLineAcc, path: &std::path::Path) -> Result<LineIt
         )
     })?);
 
-    let vat_str = acc.vat_percentage.as_deref().ok_or_else(|| {
-        anyhow!(
-            "<line> missing <vatPercentage> in {} (S384/F5)",
-            path.display()
-        )
-    })?;
-    let vat_rate_basis_points =
-        parse_vat_percentage_to_basis_points(vat_str).with_context(|| {
-            format!(
-                "parse <vatPercentage> '{vat_str}' to basis points in {} (S384/F5)",
-                path.display()
-            )
-        })?;
+    // ADR-0101 storno fold — reconstruct the (vat_rate_kind,
+    // vat_rate_basis_points) pair from whichever `<lineVatRate>` choice the
+    // on-disk XML carried (NAV's `LineVatRateType` is a choice — exactly one
+    // member per line). A numeric `<vatPercentage>` recovers `Percent` + its
+    // basis points (the pre-0101 path, byte-identical). A choice WRAPPER
+    // (`vatExemption` / `vatOutOfScope` / `vatDomesticReverseCharge`) recovers
+    // the wired kind via the `vat_rate_choice` inverse, with a 0 line rate
+    // (exempt / reverse-charge VAT is always 0). This is what makes a storno
+    // / modification of a NEW-KIND invoice fold correctly: the reversed body
+    // re-emits the SAME choice element, not a stale `<vatPercentage>0.00`.
+    let (vat_rate_kind, vat_rate_basis_points) = match acc.vat_choice_element.as_deref() {
+        None => {
+            // Numeric path — `Percent`.
+            let vat_str = acc.vat_percentage.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "<line> has neither <vatPercentage> nor a lineVatRate choice wrapper in {} (S384/F5 / ADR-0101)",
+                    path.display()
+                )
+            })?;
+            let bp = parse_vat_percentage_to_basis_points(vat_str).with_context(|| {
+                format!(
+                    "parse <vatPercentage> '{vat_str}' to basis points in {} (S384/F5)",
+                    path.display()
+                )
+            })?;
+            (VatRateKind::Percent, bp)
+        }
+        Some(element) => {
+            // Choice wrapper — a wired non-`Percent` kind, 0% line VAT.
+            let kind = vat_rate_kind_from_choice(element, acc.vat_case.as_deref())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unrecognised <lineVatRate> choice <{element}> (case {:?}) in {} — \
+                         cannot reconstruct VatRateKind for the storno/modification fold (ADR-0101). \
+                         Only the wired kinds (AAM / KBAET / EUFAD37 / vatDomesticReverseCharge) are foldable.",
+                        acc.vat_case,
+                        path.display()
+                    )
+                })?;
+            (kind, 0u16)
+        }
+    };
 
     let unit = match acc.unit_of_measure.as_deref() {
         Some("OWN") => acc.unit_of_measure_own.clone().map(ProductUnit::Own),
@@ -2263,6 +2641,11 @@ fn line_item_from_acc(acc: &XmlLineAcc, path: &std::path::Path) -> Result<LineIt
         quantity,
         unit_price,
         vat_rate_basis_points,
+        // ADR-0101 Session 2 — reconstructed above from the on-disk
+        // `<lineVatRate>` choice, so a storno / modification of a
+        // NEW-KIND invoice folds correctly (was hardcoded `Percent`
+        // behind the Session-1 shut door).
+        vat_rate_kind,
         // ADR-0042 — per-line notes are never in the NAV XML, so a
         // chain-member reversal carries none.
         note: None,
@@ -2523,6 +2906,7 @@ mod tests {
     #[test]
     fn write_customer_omits_customer_name_for_private_person() {
         let c = CustomerInfo {
+            community_vat_number: None,
             customer_vat_status: CustomerVatStatus::PrivatePerson,
             // PrivatePerson carries no ADÓSZÁM.
             tax_number: None,
@@ -2551,6 +2935,7 @@ mod tests {
     #[test]
     fn write_customer_omits_address_for_private_person_with_address() {
         let c = CustomerInfo {
+            community_vat_number: None,
             customer_vat_status: CustomerVatStatus::PrivatePerson,
             tax_number: None,
             name: "Teszt Magánszemély".to_string(),
@@ -2585,6 +2970,7 @@ mod tests {
     #[test]
     fn write_customer_emits_name_and_address_for_domestic() {
         let c = CustomerInfo {
+            community_vat_number: None,
             customer_vat_status: CustomerVatStatus::Domestic,
             tax_number: Some("24904362-2-41".to_string()),
             name: "Teszt Kft.".to_string(),
@@ -2608,6 +2994,147 @@ mod tests {
         assert!(
             xml.contains("<customerAddress>"),
             "DOMESTIC wire body must carry <customerAddress>, got: {xml}"
+        );
+    }
+
+    /// ADR-0102 — an `Other` (foreign-EU) buyer emits
+    /// `<customerVatData><communityVatNumber>` (flat, data namespace —
+    /// NO `common:` prefix) plus name + address, and does NOT emit the
+    /// structured `<customerTaxNumber>` block.
+    #[test]
+    fn write_customer_emits_community_vat_number_for_other() {
+        let c = CustomerInfo {
+            community_vat_number: Some("ATU12345678".to_string()),
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            name: "Wiener Handels GmbH".to_string(),
+            address: Some(CustomerAddress {
+                country_code: "AT".to_string(),
+                postal_code: "1010".to_string(),
+                city: "Wien".to_string(),
+                street: "Stephansplatz 1".to_string(),
+            }),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            write_customer(&mut w, &c).expect("write_customer");
+        }
+        let xml = String::from_utf8(buf).expect("utf8");
+        assert!(
+            xml.contains("<customerVatStatus>OTHER</customerVatStatus>"),
+            "OTHER status token; got: {xml}"
+        );
+        assert!(
+            xml.contains("<customerVatData><communityVatNumber>ATU12345678</communityVatNumber></customerVatData>"),
+            "OTHER must emit flat communityVatNumber inside customerVatData; got: {xml}"
+        );
+        assert!(
+            !xml.contains("<customerTaxNumber>"),
+            "OTHER must NOT emit the structured customerTaxNumber; got: {xml}"
+        );
+        assert!(
+            xml.contains("<customerName>Wiener Handels GmbH</customerName>"),
+            "OTHER wire body must carry <customerName>; got: {xml}"
+        );
+        assert!(
+            xml.contains("<customerAddress>"),
+            "OTHER wire body must carry <customerAddress>; got: {xml}"
+        );
+    }
+
+    /// ADR-0102 — the VIES structural validator accepts well-shaped EU
+    /// VAT numbers (incl. `EL`/Greece + a letter-bearing body) and
+    /// rejects an unknown prefix, an empty body, and a non-alphanumeric
+    /// body. NOT a live VIES lookup (§8.2) — structural only.
+    #[test]
+    fn validate_community_vat_number_shape() {
+        // Accept.
+        assert!(validate_community_vat_number("ATU12345678").is_ok());
+        assert!(validate_community_vat_number("HU12345678").is_ok());
+        assert!(validate_community_vat_number("EL123456789").is_ok());
+        // Space + lowercase tolerated (VIES prints spaces).
+        assert!(validate_community_vat_number("at U1234 5678").is_ok());
+        assert!(validate_community_vat_number("IE1234567FA").is_ok());
+        // Reject.
+        assert!(validate_community_vat_number("").is_err(), "empty");
+        assert!(
+            validate_community_vat_number("ZZ12345678").is_err(),
+            "bad prefix"
+        );
+        assert!(validate_community_vat_number("AT").is_err(), "empty body");
+        assert!(
+            validate_community_vat_number("AT!!!!").is_err(),
+            "non-alnum body"
+        );
+        assert!(
+            validate_community_vat_number("ATU1234567890123").is_err(),
+            "body too long (>12)"
+        );
+    }
+
+    /// ADR-0102 (NAV-adversarial FIX #1) — the structural country-code
+    /// guard accepts a well-formed ISO 3166-1 alpha-2 code and rejects
+    /// everything the NAV `CountryCodeType [A-Z]{2}` pattern rejects: a
+    /// full country NAME, a lowercase code, a trailing space, a
+    /// one-letter stub, and a digit-bearing value. VERBATIM-strict — no
+    /// trim, no case-fold — because the emitter writes `country_code`
+    /// byte-for-byte.
+    #[test]
+    fn validate_country_code_shape() {
+        // Accept — exactly two uppercase A–Z.
+        assert!(validate_country_code("AT").is_ok());
+        assert!(validate_country_code("DE").is_ok());
+        assert!(validate_country_code("HU").is_ok());
+        // Reject — the exact classes that would bounce at NAV.
+        assert!(
+            validate_country_code("Austria").is_err(),
+            "a country name must reject (the FIX #1 headline case)"
+        );
+        assert!(
+            validate_country_code("Ausztria").is_err(),
+            "the Hungarian country name must reject too"
+        );
+        assert!(
+            validate_country_code("at").is_err(),
+            "lowercase must reject"
+        );
+        assert!(
+            validate_country_code("AT ").is_err(),
+            "trailing space must reject"
+        );
+        assert!(
+            validate_country_code("A").is_err(),
+            "one letter must reject"
+        );
+        assert!(validate_country_code("").is_err(), "empty must reject");
+        assert!(validate_country_code("A1").is_err(), "digit must reject");
+    }
+
+    /// ADR-0102 — an `Other` buyer that reaches the emitter WITHOUT a
+    /// community VAT number is a programmer error (preflight guarantees
+    /// it upstream) and loud-fails rather than emitting an empty
+    /// `<customerVatData>`.
+    #[test]
+    fn write_customer_loud_fails_other_without_community_vat() {
+        let c = CustomerInfo {
+            community_vat_number: None,
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            name: "No VAT GmbH".to_string(),
+            address: Some(CustomerAddress {
+                country_code: "AT".to_string(),
+                postal_code: "1010".to_string(),
+                city: "Wien".to_string(),
+                street: "Ring 1".to_string(),
+            }),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        let mut w = Writer::new(&mut buf);
+        let err = write_customer(&mut w, &c).expect_err("must loud-fail");
+        assert!(
+            err.to_string().contains("community_vat_number"),
+            "message must name the missing field; got: {err}"
         );
     }
 

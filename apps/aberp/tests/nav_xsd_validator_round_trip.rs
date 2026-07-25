@@ -43,6 +43,7 @@ fn build_minimal_invoice() -> ReadyInvoice {
                 quantity: rust_decimal::Decimal::from(2),
                 unit_price: Huf(1000),
                 vat_rate_basis_points: 2700, // 27%
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             },
@@ -51,6 +52,7 @@ fn build_minimal_invoice() -> ReadyInvoice {
                 quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(5000),
                 vat_rate_basis_points: 2700,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             },
@@ -73,6 +75,7 @@ fn minimal_parties() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
             // behaviour for the minimal-invoice integration fixture.
             customer_vat_status: CustomerVatStatus::Domestic,
@@ -129,6 +132,7 @@ fn decimal_quantity_emits_dot_separated_and_validates() {
         quantity: rust_decimal::Decimal::new(15, 1), // 1.5
         unit_price: Huf(1000),
         vat_rate_basis_points: 2700,
+        vat_rate_kind: aberp_billing::VatRateKind::Percent,
         note: None,
         unit: None,
     }];
@@ -363,6 +367,7 @@ fn invoice_16_aben_consulting_tax_number_round_trips_through_emit_and_validate()
             address_street: "Visszatero koz 6".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
             // posture for the invoice-16 byte-verbatim fixture.
             customer_vat_status: CustomerVatStatus::Domestic,
@@ -489,6 +494,7 @@ fn emitter_writes_customer_address_under_domestic_status() {
             address_street: "Visszatero koz 6".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // PR-97 / ADR-0048 — preserve pre-PR-97 implicit Domestic
             // posture for the AZ9 Services regression fixture.
             customer_vat_status: CustomerVatStatus::Domestic,
@@ -595,6 +601,7 @@ fn emitter_writes_customer_info_under_private_person_omits_vat_data() {
             address_street: "Visszatero koz 6".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             customer_vat_status: CustomerVatStatus::PrivatePerson,
             // PRIVATE_PERSON forbids tax_number — None matches the
             // partner-form invariant + the validator's symmetric rule.
@@ -667,6 +674,7 @@ fn emitter_writes_customer_info_under_private_person_omits_name_and_address() {
             address_street: "Visszatero koz 6".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             customer_vat_status: CustomerVatStatus::PrivatePerson,
             tax_number: None,
             // §169 populates the buyer name for the PDF; the wire emit
@@ -712,14 +720,14 @@ fn emitter_writes_customer_info_under_private_person_omits_name_and_address() {
     );
 }
 
-/// PR-97 / ADR-0048 §7 — defence-in-depth pin: the v1 emitter
-/// loud-fails on `CustomerVatStatus::Other`. Preflight catches it
-/// upstream as `CustomerVatStatusOtherNotSupportedV1`, but a buggy
-/// caller that bypasses preflight must not escape an OTHER-shaped body
-/// onto the wire (v1 has no community-VAT / third-state-tax-id
-/// emission path).
+/// ADR-0102 — defence-in-depth pin: the emitter loud-fails on an
+/// `Other` buyer that reaches it WITHOUT a `community_vat_number`
+/// (programmer error — preflight `CommunityVatNumberMissing` +
+/// partner-form validation guarantee `Some(_)` upstream). A buggy
+/// caller that bypasses preflight must not escape an empty
+/// `<customerVatData>` onto the wire.
 #[test]
-fn emitter_loud_fails_when_other_status_materialises() {
+fn emitter_loud_fails_when_other_status_materialises_without_community_vat() {
     let invoice = build_minimal_invoice();
     let series = SeriesCode::new("INV-default".to_string()).unwrap();
     let parties = NavParties {
@@ -732,6 +740,7 @@ fn emitter_loud_fails_when_other_status_materialises() {
             address_street: "Visszatero koz 6".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             customer_vat_status: CustomerVatStatus::Other,
             tax_number: None,
             name: "Foreign Buyer".to_string(),
@@ -740,10 +749,154 @@ fn emitter_loud_fails_when_other_status_materialises() {
     };
 
     let err = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
-        .expect_err("Other-status emit MUST loud-fail in v1 per ADR-0048 §7");
+        .expect_err("Other-status emit without community_vat_number MUST loud-fail (ADR-0102)");
     let msg = err.to_string();
     assert!(
-        msg.contains("Other") || msg.contains("v2"),
-        "loud-fail message must name the v1-deferral reason; got: {msg}"
+        msg.contains("community_vat_number") || msg.contains("Other"),
+        "loud-fail message must name the missing community VAT number; got: {msg}"
     );
+}
+
+/// ADR-0102 — THE END-TO-END EU-0 ROUND-TRIP. An intra-Community 0%
+/// invoice (KBAET goods line) with an `Other` (foreign-EU) buyer emits
+/// `customerVatStatus=OTHER` + `<customerVatData><communityVatNumber>`
+/// + the `<vatExemption><case>KBAET</case>` line, and the emitted body
+/// validates cleanly against the NAV XSD structural recogniser. This is
+/// the invoice shape ADR-0101 could emit at the line but ADR-0048 left
+/// un-assemblable at the buyer — the gap this ADR closes.
+#[test]
+fn eu0_intra_community_invoice_with_other_buyer_round_trips() {
+    let mut invoice = build_minimal_invoice();
+    // Single KBAET (intra-Community goods) line at 0%.
+    invoice.lines = vec![LineItem {
+        description: "Exported widgets".to_string(),
+        quantity: rust_decimal::Decimal::from(3),
+        unit_price: Huf(10000),
+        vat_rate_basis_points: 0,
+        vat_rate_kind: aberp_billing::VatRateKind::IntraCommunityGoods,
+        note: None,
+        unit: None,
+    }];
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = NavParties {
+        supplier: SupplierInfo {
+            tax_number: "24904362-2-41".to_string(),
+            name: "Aben Consulting Kft".to_string(),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatero koz 6".to_string(),
+        },
+        customer: CustomerInfo {
+            community_vat_number: Some("ATU12345678".to_string()),
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            name: "Wiener Handels GmbH".to_string(),
+            address: Some(CustomerAddress {
+                country_code: "AT".to_string(),
+                postal_code: "1010".to_string(),
+                city: "Wien".to_string(),
+                street: "Stephansplatz 1".to_string(),
+            }),
+        },
+    };
+
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("EU-0 Other-buyer invoice must render");
+    let body = std::str::from_utf8(&xml).expect("UTF-8");
+
+    // Buyer side: OTHER + communityVatNumber, no structured HU tax block.
+    assert!(
+        body.contains("<customerVatStatus>OTHER</customerVatStatus>"),
+        "body:\n{body}"
+    );
+    // Emitter pretty-prints (newlines/indent), so check the elements
+    // individually rather than as a contiguous block.
+    assert!(body.contains("<customerVatData>"), "body:\n{body}");
+    assert!(
+        body.contains("<communityVatNumber>ATU12345678</communityVatNumber>"),
+        "body:\n{body}"
+    );
+    assert!(!body.contains("<customerTaxNumber>"), "body:\n{body}");
+    // Line side: KBAET exemption, not a numeric vatPercentage.
+    assert!(body.contains("<case>KBAET</case>"), "body:\n{body}");
+
+    // The whole thing validates against the NAV XSD structural recogniser.
+    validate_invoice_data(&xml)
+        .expect("EU-0 Other-buyer body must validate against the NAV XSD recogniser");
+}
+
+/// ADR-0102 (NAV-adversarial SHOULD-ADD) — the EUFAD37 (intra-Community
+/// SERVICE, reverse-charge) sibling of the KBAET round-trip above. The
+/// adversarial noted the service kind was only line-level-covered with no
+/// customer+line combined round-trip. An `Other` (foreign-EU) buyer +
+/// an `IntraCommunityServiceReverse` line emits `customerVatStatus=OTHER`
+/// + `<customerVatData><communityVatNumber>` + the
+/// `<vatOutOfScope><case>EUFAD37</case>` line (a `vatOutOfScope`, NOT a
+/// `vatExemption` — §37 places the supply out of the Hungarian VAT
+/// territory), and the whole body validates against the NAV XSD.
+#[test]
+fn eu0_intra_community_service_reverse_with_other_buyer_round_trips() {
+    let mut invoice = build_minimal_invoice();
+    // Single EUFAD37 (intra-Community service, reverse-charge) line at 0%.
+    invoice.lines = vec![LineItem {
+        description: "Cross-border engineering service".to_string(),
+        quantity: rust_decimal::Decimal::from(1),
+        unit_price: Huf(50000),
+        vat_rate_basis_points: 0,
+        vat_rate_kind: aberp_billing::VatRateKind::IntraCommunityServiceReverse,
+        note: None,
+        unit: None,
+    }];
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = NavParties {
+        supplier: SupplierInfo {
+            tax_number: "24904362-2-41".to_string(),
+            name: "Aben Consulting Kft".to_string(),
+            address_country_code: "HU".to_string(),
+            address_postal_code: "1037".to_string(),
+            address_city: "Budapest".to_string(),
+            address_street: "Visszatero koz 6".to_string(),
+        },
+        customer: CustomerInfo {
+            community_vat_number: Some("DE123456789".to_string()),
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            name: "Muenchner Technik GmbH".to_string(),
+            address: Some(CustomerAddress {
+                country_code: "DE".to_string(),
+                postal_code: "80331".to_string(),
+                city: "Muenchen".to_string(),
+                street: "Marienplatz 1".to_string(),
+            }),
+        },
+    };
+
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("EUFAD37 Other-buyer invoice must render");
+    let body = std::str::from_utf8(&xml).expect("UTF-8");
+
+    // Buyer side: OTHER + communityVatNumber (DE), no structured HU tax block.
+    assert!(
+        body.contains("<customerVatStatus>OTHER</customerVatStatus>"),
+        "body:\n{body}"
+    );
+    assert!(body.contains("<customerVatData>"), "body:\n{body}");
+    assert!(
+        body.contains("<communityVatNumber>DE123456789</communityVatNumber>"),
+        "body:\n{body}"
+    );
+    assert!(!body.contains("<customerTaxNumber>"), "body:\n{body}");
+    // Line side: EUFAD37 out-of-scope, NOT a numeric vatPercentage and NOT
+    // the KBAET vatExemption wrapper (service reverse-charge is vatOutOfScope).
+    assert!(body.contains("<vatOutOfScope>"), "body:\n{body}");
+    assert!(body.contains("<case>EUFAD37</case>"), "body:\n{body}");
+    assert!(
+        !body.contains("<vatExemption>"),
+        "EUFAD37 is vatOutOfScope, NOT vatExemption; body:\n{body}"
+    );
+
+    // The whole thing validates against the NAV XSD structural recogniser.
+    validate_invoice_data(&xml)
+        .expect("EUFAD37 Other-buyer body must validate against the NAV XSD recogniser");
 }

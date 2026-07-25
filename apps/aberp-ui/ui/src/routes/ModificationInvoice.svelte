@@ -135,13 +135,29 @@
     name: InvoicePreflightErrorItem | null;
     taxNumber: InvoicePreflightErrorItem | null;
     address: InvoicePreflightErrorItem | null;
-  } = $state({ name: null, taxNumber: null, address: null });
+    // ADR-0102 — EU community VAT + buyer-type control slots (the router
+    // can target these; modification of an EU-0 base is blocked upstream,
+    // but the shared router type requires the exhaustive shape).
+    communityVatNumber: InvoicePreflightErrorItem | null;
+    vatStatus: InvoicePreflightErrorItem | null;
+  } = $state({
+    name: null,
+    taxNumber: null,
+    address: null,
+    communityVatNumber: null,
+    vatStatus: null,
+  });
   let linesContainerError: InvoicePreflightErrorItem | null = $state(null);
   let lineErrors: Record<
     number,
     Partial<
       Record<
-        "description" | "quantity" | "unitPrice" | "vatRatePercent",
+        // ADR-0101 — `vatRateKind` added for type-compat with the shared
+        // `targetForFieldPath` (which can now return that line field). The
+        // modification flow never emits a kind-level error today (all its
+        // lines are Percent), but the Record must accept the field so the
+        // routing code type-checks.
+        "description" | "quantity" | "unitPrice" | "vatRatePercent" | "vatRateKind",
         InvoicePreflightErrorItem
       >
     >
@@ -246,6 +262,10 @@
           // wire-side minor units at compose time.
           unitPriceInput: "",
           vatRatePercent: 27,
+          // ADR-0101 — a fresh modification line defaults to the numeric
+          // `Percent` path (the modification SPA does not expose a VAT-kind
+          // selector — out of scope this session; see modification.ts FLAG).
+          vatRateKind: "Percent",
           // PR-82 — fresh line has no buyer note; operator opt-in.
           note: "",
         },
@@ -267,7 +287,7 @@
   // `bankAccountId` targets fall through to the unrouted bucket
   // (the general error block surfaces them verbatim — fail loud).
   function routePreflightErrors(body: InvoicePreflightErrorBody) {
-    customerErrors = { name: null, taxNumber: null, address: null };
+    customerErrors = { name: null, taxNumber: null, address: null, communityVatNumber: null, vatStatus: null };
     linesContainerError = null;
     lineErrors = {};
     unroutedPreflightErrors = [];
@@ -302,7 +322,7 @@
 
   function clearPreflightErrors() {
     preflightErrors = null;
-    customerErrors = { name: null, taxNumber: null, address: null };
+    customerErrors = { name: null, taxNumber: null, address: null, communityVatNumber: null, vatStatus: null };
     linesContainerError = null;
     lineErrors = {};
     unroutedPreflightErrors = [];

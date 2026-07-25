@@ -226,7 +226,7 @@ pub struct StornoIssuedSummary {
 /// call NAV). The CLI path stays compatible by passing the same
 /// `Actor::from_local_cli` it always built.
 pub fn storno_from_inputs(
-    input: InvoiceInputJson,
+    mut input: InvoiceInputJson,
     db: &aberp_db::HandleArc,
     tenant_str: &str,
     series_str: &str,
@@ -249,6 +249,12 @@ pub fn storno_from_inputs(
     if input.lines.is_empty() {
         return Err(anyhow!("input JSON has no lines"));
     }
+
+    // B4 / ADR-0103 §4.3 (Invariant I) — normalise at ingest. A storno
+    // REPLAYS the base's side-stored `input.json` (ADR-0049) through this
+    // same entry point, so a pre-B4 body carrying a raw number is
+    // normalised on re-emit rather than transmitted raw a second time.
+    crate::issue_invoice::normalize_customer_community_vat_number(&mut input);
 
     // 2. Resolve tenant id + series code (loud-fail on invalid input).
     let tenant = TenantId::new(tenant_str.to_string())
@@ -480,45 +486,60 @@ pub fn storno_from_inputs(
     // The STORNO's own number IS a fresh emit (NAV has not seen it yet)
     // so it uses the current template — its render is what NAV records on
     // the storno's first `manageInvoice` POST.
-    let parties = NavParties {
-        supplier: SupplierInfo {
-            tax_number: input.supplier.tax_number,
-            name: input.supplier.name,
-            address_country_code: input.supplier.address.country_code,
-            address_postal_code: input.supplier.address.postal_code,
-            address_city: input.supplier.address.city,
-            address_street: input.supplier.address.street,
-        },
-        customer: CustomerInfo {
-            // PR-97 / ADR-0048 — inherit the base invoice's
-            // `customer.vat_status` so the storno wire body mirrors the
-            // base's PRIVATE_PERSON / DOMESTIC shape verbatim. Pre-PR-97
-            // bases omit `vat_status` from the side-stored input.json;
-            // serde defaults to `Domestic` so chain operations on
-            // pre-PR-97 bases continue to emit Domestic wire bodies.
-            customer_vat_status: input.customer.vat_status,
-            tax_number: {
-                let trimmed = input.customer.tax_number.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
+    let parties =
+        NavParties {
+            supplier: SupplierInfo {
+                tax_number: input.supplier.tax_number,
+                name: input.supplier.name,
+                address_country_code: input.supplier.address.country_code,
+                address_postal_code: input.supplier.address.postal_code,
+                address_city: input.supplier.address.city,
+                address_street: input.supplier.address.street,
             },
-            name: input.customer.name,
-            // PR-77 / session-101 — inherit `customerAddress` from the
-            // base invoice's side-stored `input.json`. Pre-PR-97 chain
-            // operations on PRIVATE_PERSON bases omit the address (NAV
-            // wire layer permits it); the validator's symmetric rules
-            // pass the resulting body.
-            address: input.customer.address.map(|a| CustomerAddress {
-                country_code: a.country_code,
-                postal_code: a.postal_code,
-                city: a.city,
-                street: a.street,
-            }),
-        },
-    };
+            customer: CustomerInfo {
+                // PR-97 / ADR-0048 — inherit the base invoice's
+                // `customer.vat_status` so the storno wire body mirrors the
+                // base's PRIVATE_PERSON / DOMESTIC shape verbatim. Pre-PR-97
+                // bases omit `vat_status` from the side-stored input.json;
+                // serde defaults to `Domestic` so chain operations on
+                // pre-PR-97 bases continue to emit Domestic wire bodies.
+                customer_vat_status: input.customer.vat_status,
+                tax_number: {
+                    let trimmed = input.customer.tax_number.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                },
+                // ADR-0102 — inherit the base's EU community VAT number so the
+                // storno wire body mirrors the base's `Other` shape verbatim.
+                // Pre-ADR-0102 bases omit it (serde default `None` → Domestic
+                // path) so chain ops on pre-0102 bases are byte-identical.
+                community_vat_number: input.customer.community_vat_number.as_deref().and_then(
+                    |s| {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    },
+                ),
+                name: input.customer.name,
+                // PR-77 / session-101 — inherit `customerAddress` from the
+                // base invoice's side-stored `input.json`. Pre-PR-97 chain
+                // operations on PRIVATE_PERSON bases omit the address (NAV
+                // wire layer permits it); the validator's symmetric rules
+                // pass the resulting body.
+                address: input.customer.address.map(|a| CustomerAddress {
+                    country_code: a.country_code,
+                    postal_code: a.postal_code,
+                    city: a.city,
+                    street: a.street,
+                }),
+            },
+        };
     let render_series_code = series_code.clone();
     let render_payment_method = input.payment_method;
     let render_nav_out = nav_xml_out.clone();
@@ -1466,6 +1487,12 @@ fn build_storno_command(
             quantity: l.quantity,
             unit_price: Huf(l.unit_price),
             vat_rate_basis_points: percent_to_basis_points(l.vat_rate_percent),
+            // ADR-0101 — carry the base line's VAT rate-kind through the
+            // storno so the negated correction line emits the SAME
+            // `<lineVatRate>` choice as the original (read off the
+            // side-store `input.json`). `negate_line` preserves it too.
+            // Pre-0101 bodies default to `Percent`.
+            vat_rate_kind: l.vat_rate_kind,
             // PR-82 — pass through whatever per-line note the
             // side-stored input.json carries from the base's issuance.
             // The negation step `negate_line` preserves notes too, so

@@ -12,6 +12,7 @@ use time::{Date, OffsetDateTime};
 use super::ids::{CustomerId, InvoiceId, SeriesId};
 use super::money::Huf;
 use super::unit_of_measure::ProductUnit;
+use super::vat_rate_kind::VatRateKind;
 
 /// A line on the invoice. Quantities are `Decimal` (S157) so the operator
 /// can bill fractional units — `1.5` consulting days, `0.25` hours. The
@@ -34,8 +35,20 @@ pub struct LineItem {
     pub quantity: Decimal,
     pub unit_price: Huf,
     /// VAT rate in basis points: 2700 = 27% (Hungarian standard rate).
-    /// Integer to avoid floating-point in invariant calculations.
+    /// Integer to avoid floating-point in invariant calculations. Meaningful
+    /// only when [`Self::vat_rate_kind`] is `Percent`; for the exempt /
+    /// reverse-charge kinds it is `0` (the line VAT amount is 0 and the NAV
+    /// `<lineVatRate>` renders a category element, not a percentage).
     pub vat_rate_basis_points: u16,
+    /// ADR-0101 — the per-line VAT rate-KIND: which NAV `<lineVatRate>`
+    /// choice element this line emits (`vatPercentage` for the default
+    /// `Percent`; `vatExemption` / `vatOutOfScope` /
+    /// `vatDomesticReverseCharge` for the exempt / reverse-charge kinds).
+    /// The `(case, reason)` triple is DERIVED at emit time in
+    /// `nav_xml.rs`, not stored (ADR-0101 §3.2). `Percent` is the default
+    /// for pre-0101 side-store bodies and DB rows, so their emit is
+    /// byte-identical (ADR-0101 §5).
+    pub vat_rate_kind: VatRateKind,
     /// PR-82 — optional buyer-facing per-line note ("Megjegyzés").
     /// Recipient-facing only; never reaches the NAV InvoiceData XML.
     pub note: Option<String>,
@@ -60,9 +73,33 @@ impl LineItem {
         self.unit_price.checked_mul_decimal(self.quantity)
     }
 
-    /// VAT amount for the line: `floor(net_total * rate / 10_000)`.
+    /// VAT amount for the line: `floor(net_total * rate / 10_000)` for a
+    /// `Percent` line, and **unconditionally zero** for every other kind.
     /// Returns `None` on overflow.
+    ///
+    /// B2 / ADR-0103 §4.2 (Invariant V — kind-consistent VAT): a line whose
+    /// `vat_rate_kind` is not `Percent` has no VAT, for EVERY value of
+    /// `vat_rate_basis_points`. Emitting `<vatExemption>` alongside a
+    /// non-zero `<lineVatAmount>` is a self-contradicting filing.
+    ///
+    /// This lives at the DERIVATION, not at the preflight gate, on purpose.
+    /// Preflight already carries ADR-0101 §4's `NonZeroPercentForExemptKind`
+    /// — but preflight is a gate, and Invariant P (universal gating) is
+    /// deferred on both the Defense and prod lines, so gates here are
+    /// known-bypassable. Every emit path goes through `vat_amount()`. The
+    /// difference is between "no one has yet found a way in" and "there is
+    /// no way in".
+    ///
+    /// Back-compat is exact: a correctly-issued non-`Percent` line already
+    /// carries `basis_points == 0` (forced by ADR-0101 §4), so this already
+    /// returned 0 for it. Bytes change only on a preflight-bypassed body.
+    ///
+    /// `gross_total()` needs no change — it composes, so `gross == net`
+    /// falls out for exempt / reverse-charge lines automatically.
     pub fn vat_amount(&self) -> Option<Huf> {
+        if !self.vat_rate_kind.is_percent() {
+            return Some(Huf::ZERO);
+        }
         let net = self.net_total()?.as_i64();
         let vat = net.checked_mul(self.vat_rate_basis_points as i64)?;
         Some(Huf(vat / 10_000))
@@ -423,6 +460,7 @@ mod tests {
                     quantity: Decimal::from(3),
                     unit_price: Huf(1_000),
                     vat_rate_basis_points: 2700,
+                    vat_rate_kind: crate::VatRateKind::Percent,
                     note: None,
                     unit: None,
                 },
@@ -431,6 +469,7 @@ mod tests {
                     quantity: Decimal::from(1),
                     unit_price: Huf(500),
                     vat_rate_basis_points: 2700,
+                    vat_rate_kind: crate::VatRateKind::Percent,
                     note: None,
                     unit: None,
                 },

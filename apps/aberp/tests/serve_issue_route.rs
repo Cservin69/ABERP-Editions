@@ -115,6 +115,7 @@ fn fixture_supplier() -> SupplierJson {
 
 fn fixture_customer() -> CustomerJson {
     CustomerJson {
+        community_vat_number: None,
         // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
         // Domestic posture for legacy test fixtures.
         vat_status: CustomerVatStatus::Domestic,
@@ -137,6 +138,7 @@ fn fixture_lines() -> Vec<LineJson> {
         quantity: rust_decimal::Decimal::from(2),
         unit_price: 1000,
         vat_rate_percent: 27,
+        vat_rate_kind: aberp_billing::VatRateKind::Percent,
         note: None,
         unit: None,
     }]

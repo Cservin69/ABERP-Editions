@@ -61,7 +61,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use crate::nav_xml::CustomerVatStatus;
+use crate::nav_xml::{validate_community_vat_number, CustomerVatStatus};
 
 // ──────────────────────────────────────────────────────────────────────
 // PartnerId — prefixed-ULID newtype.
@@ -550,20 +550,45 @@ pub fn validate_partner_inputs(inputs: &PartnerInputs) -> Result<(), Vec<Validat
             }
         }
         CustomerVatStatus::Other => {
-            // v1 named-deferred per ADR-0048 §7. The SPA disables the
-            // Külföldi radio option with an inline v2 hint; if a wire
-            // body still arrives with Other (CLI / integration test
-            // / non-SPA client) surface a typed validation error so the
-            // operator sees the explicit "not yet supported" signal
-            // rather than an opaque downstream NAV reject.
-            errors.push(ValidationError {
-                field: "customer_vat_status",
-                message: "Külföldi vevő (OTHER) támogatása későbbi verzióban érkezik (v2). \
-                          Jelenleg csak Adóalany / Magánszemély választható. \
-                          / Foreign-buyer (OTHER) support is named-deferred to v2; \
-                          please pick Domestic or PrivatePerson for now."
-                    .to_string(),
-            });
+            // ADR-0102 — foreign-EU business buyer. The EU community VAT
+            // number lives on the reused `eu_vat_number` column (NOT a new
+            // column — ADR-0102 §1/§3.1); it becomes REQUIRED + structurally
+            // (VIES-shape) validated for `Other`. A Hungarian ADÓSZÁM is
+            // forbidden (an EU buyer carries an EU VAT number, not a HU one)
+            // — symmetric with the PrivatePerson tax-number rule above.
+            match inputs
+                .eu_vat_number
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None => errors.push(ValidationError {
+                    field: "eu_vat_number",
+                    message: "Külföldi (OTHER) vevőhöz kötelező az EU adószám. \
+                              / EU VAT number is required for a foreign (OTHER) buyer."
+                        .to_string(),
+                }),
+                Some(raw) => {
+                    if let Err(msg) = validate_community_vat_number(raw) {
+                        errors.push(ValidationError {
+                            field: "eu_vat_number",
+                            message: msg,
+                        });
+                    }
+                }
+            }
+            if inputs
+                .tax_number
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                errors.push(ValidationError {
+                    field: "tax_number",
+                    message: "Külföldi (OTHER) vevőhöz nem tartozhat magyar adószám. \
+                              / Foreign (OTHER) buyers must NOT carry a Hungarian tax number."
+                        .to_string(),
+                });
+            }
         }
     }
     if errors.is_empty() {
@@ -1570,20 +1595,63 @@ mod tests {
         );
     }
 
+    /// ADR-0102 — an `Other` (foreign-EU) partner REQUIRES a
+    /// structurally-valid EU VAT number (the reused `eu_vat_number`
+    /// column) and MUST NOT carry a Hungarian ADÓSZÁM.
     #[test]
-    fn validate_partner_inputs_rejects_other_status_in_v1() {
-        // v1 named-defers OTHER per ADR-0048 §7; the gate fires a
-        // typed validation error pointing at the radio.
-        let inputs = PartnerInputs {
+    fn validate_partner_inputs_other_requires_eu_vat_and_no_hu_tax() {
+        // Missing EU VAT number → flag eu_vat_number.
+        let missing = PartnerInputs {
             customer_vat_status: CustomerVatStatus::Other,
             tax_number: None,
+            eu_vat_number: None,
             ..minimal_valid_inputs()
         };
-        let errors = validate_partner_inputs(&inputs)
-            .expect_err("Other status must surface the v1-deferred error");
+        let errors =
+            validate_partner_inputs(&missing).expect_err("Other without EU VAT must reject");
         assert!(
-            errors.iter().any(|e| e.field == "customer_vat_status"),
-            "must flag customer_vat_status; got {errors:?}"
+            errors.iter().any(|e| e.field == "eu_vat_number"),
+            "must flag eu_vat_number; got {errors:?}"
+        );
+
+        // Malformed EU VAT number → flag eu_vat_number.
+        let malformed = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            eu_vat_number: Some("ZZ9".to_string()),
+            ..minimal_valid_inputs()
+        };
+        let errors = validate_partner_inputs(&malformed)
+            .expect_err("Other with malformed EU VAT must reject");
+        assert!(
+            errors.iter().any(|e| e.field == "eu_vat_number"),
+            "must flag eu_vat_number for malformed value; got {errors:?}"
+        );
+
+        // Valid EU VAT + a stray HU tax number → flag tax_number.
+        let with_hu_tax = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: Some("24904362-2-41".to_string()),
+            eu_vat_number: Some("ATU12345678".to_string()),
+            ..minimal_valid_inputs()
+        };
+        let errors = validate_partner_inputs(&with_hu_tax)
+            .expect_err("Other with a HU tax number must reject");
+        assert!(
+            errors.iter().any(|e| e.field == "tax_number"),
+            "must flag tax_number; got {errors:?}"
+        );
+
+        // Well-formed Other partner → accepts.
+        let ok = PartnerInputs {
+            customer_vat_status: CustomerVatStatus::Other,
+            tax_number: None,
+            eu_vat_number: Some("ATU12345678".to_string()),
+            ..minimal_valid_inputs()
+        };
+        assert!(
+            validate_partner_inputs(&ok).is_ok(),
+            "well-formed Other partner must validate"
         );
     }
 
