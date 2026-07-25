@@ -26,8 +26,8 @@
 //! Each test names the MUTATION that must turn it red (all mutation-verified).
 
 use aberp::nav_xml::{
-    self, CustomerAddress, CustomerInfo, CustomerVatStatus, NavParties, StornoReference,
-    SupplierInfo,
+    self, CustomerAddress, CustomerInfo, CustomerVatStatus, ModificationReference, NavParties,
+    StornoReference, SupplierInfo,
 };
 use aberp_billing::{
     Currency, CustomerId, Huf, InvoiceId, LineItem, RateMetadata, ReadyInvoice, SeriesCode,
@@ -188,6 +188,108 @@ fn two_percent_rates_emit_two_buckets_each_with_its_own_totals() {
     );
 }
 
+// ── T2 — MANY LINES AT ONE RATE COLLAPSE INTO A SINGLE BUCKET ──────────────
+
+/// The other half of Invariant S, and the half every pin above structurally
+/// CANNOT carry: not just "one bucket per distinct rate" but "**only** one".
+///
+/// Every multi-rate pin in this file carries exactly ONE line per rate, so an
+/// emitter that pushed a fresh bucket for every line — never merging — would
+/// satisfy all of them: T1/T3/T4 would still see two buckets with the two
+/// expected triples, T5's single-LINE invoice would still see one, and T6's
+/// two-line EUR invoice would still see two. Verified by mutation: replacing
+/// the bucket lookup with an unconditional push left the whole `aberp` +
+/// `aberp-nav-xsd-validator` + `aberp-billing` test set GREEN.
+///
+/// That is not a hypothetical shape. A multi-line invoice at a single rate is
+/// the commonest invoice ABERP issues, and per-line bucketing would send NAV
+/// N `<summaryByVatRate>` blocks all carrying the SAME `<vatRate>` — a
+/// duplicated ÁFA breakdown, not the per-rate one NAV's `SummaryNormalType`
+/// asks for. It is also exactly the loop the parked
+/// `port/vat-rate-kind-s1-machinery` merge must hand-resolve (it conflicts
+/// here), so this pin is the guard on that resolution.
+///
+/// MUTATION: make the bucket lookup always miss (unconditional push) — this
+/// goes red on the bucket count; nothing else in the tree does.
+#[test]
+fn lines_sharing_a_rate_merge_into_a_single_bucket() {
+    // Three separate 27% lines: net 10000 + 5000 + 1000 = 16000,
+    // per-line VAT 2700 + 1350 + 270 = 4320, gross 20320.
+    let body = render(vec![
+        line("27% line A", 1, 10_000, 2700),
+        line("27% line B", 1, 5_000, 2700),
+        line("27% line C", 1, 1_000, 2700),
+    ]);
+    assert_eq!(
+        bucket_count(&body),
+        1,
+        "three lines at one rate must collapse into ONE bucket, not three; body:\n{body}"
+    );
+    let c = compact(&body);
+    assert!(
+        c.contains(
+            "<summaryByVatRate><vatRate><vatPercentage>0.27</vatPercentage></vatRate>\
+             <vatRateNetData><vatRateNetAmount>16000</vatRateNetAmount><vatRateNetAmountHUF>16000</vatRateNetAmountHUF></vatRateNetData>\
+             <vatRateVatData><vatRateVatAmount>4320</vatRateVatAmount><vatRateVatAmountHUF>4320</vatRateVatAmountHUF></vatRateVatData>\
+             <vatRateGrossData><vatRateGrossAmount>20320</vatRateGrossAmount><vatRateGrossAmountHUF>20320</vatRateGrossAmountHUF></vatRateGrossData>\
+             </summaryByVatRate>"
+        ),
+        "the one bucket must carry the SUM of all three lines; body:\n{body}"
+    );
+}
+
+// ── T2b — three rates, and a rate carried by more than one line ────────────
+
+/// The full live shape: 27% + 18% + 0% with TWO lines at 27%. Three buckets,
+/// emitted ascending by basis points, each summing only its own lines, and
+/// the invoice-level totals the sum over buckets. 0% emits a literal
+/// `vatPercentage 0.00` — the pre-ADR-0101 posture on this line, where a line
+/// carries only a numeric rate (see the module header's divergence note).
+///
+/// MUTATION: unconditional bucket push (four buckets); bucket-key collapse
+/// (one bucket); sort dropped (0.27 emitted first).
+#[test]
+fn three_rates_with_a_repeated_rate_bucket_once_each_in_ascending_order() {
+    let body = render(vec![
+        line("27% line A", 1, 10_000, 2700),
+        line("18% line", 1, 20_000, 1800),
+        line("27% line B", 1, 5_000, 2700),
+        line("0% line", 1, 7_000, 0),
+    ]);
+    assert_eq!(
+        bucket_count(&body),
+        3,
+        "three distinct rates over four lines → 3 buckets; body:\n{body}"
+    );
+    let c = compact(&body);
+    assert!(
+        c.contains(
+            "<summaryByVatRate><vatRate><vatPercentage>0.00</vatPercentage></vatRate>\
+             <vatRateNetData><vatRateNetAmount>7000</vatRateNetAmount><vatRateNetAmountHUF>7000</vatRateNetAmountHUF></vatRateNetData>\
+             <vatRateVatData><vatRateVatAmount>0</vatRateVatAmount><vatRateVatAmountHUF>0</vatRateVatAmountHUF></vatRateVatData>\
+             <vatRateGrossData><vatRateGrossAmount>7000</vatRateGrossAmount><vatRateGrossAmountHUF>7000</vatRateGrossAmountHUF></vatRateGrossData>\
+             </summaryByVatRate>\
+             <summaryByVatRate><vatRate><vatPercentage>0.18</vatPercentage></vatRate>\
+             <vatRateNetData><vatRateNetAmount>20000</vatRateNetAmount><vatRateNetAmountHUF>20000</vatRateNetAmountHUF></vatRateNetData>\
+             <vatRateVatData><vatRateVatAmount>3600</vatRateVatAmount><vatRateVatAmountHUF>3600</vatRateVatAmountHUF></vatRateVatData>\
+             <vatRateGrossData><vatRateGrossAmount>23600</vatRateGrossAmount><vatRateGrossAmountHUF>23600</vatRateGrossAmountHUF></vatRateGrossData>\
+             </summaryByVatRate>\
+             <summaryByVatRate><vatRate><vatPercentage>0.27</vatPercentage></vatRate>\
+             <vatRateNetData><vatRateNetAmount>15000</vatRateNetAmount><vatRateNetAmountHUF>15000</vatRateNetAmountHUF></vatRateNetData>\
+             <vatRateVatData><vatRateVatAmount>4050</vatRateVatAmount><vatRateVatAmountHUF>4050</vatRateVatAmountHUF></vatRateVatData>\
+             <vatRateGrossData><vatRateGrossAmount>19050</vatRateGrossAmount><vatRateGrossAmountHUF>19050</vatRateGrossAmountHUF></vatRateGrossData>\
+             </summaryByVatRate>\
+             <invoiceNetAmount>42000</invoiceNetAmount><invoiceNetAmountHUF>42000</invoiceNetAmountHUF>\
+             <invoiceVatAmount>7650</invoiceVatAmount><invoiceVatAmountHUF>7650</invoiceVatAmountHUF>"
+        ),
+        "three buckets ascending, each with ITS OWN totals, invoice = sum; body:\n{body}"
+    );
+    assert!(
+        c.contains("<invoiceGrossAmount>49650</invoiceGrossAmount><invoiceGrossAmountHUF>49650</invoiceGrossAmountHUF>"),
+        "invoice gross must reconcile to 49650 (= 42000 net + 7650 VAT); body:\n{body}"
+    );
+}
+
 // ── T3 — storno of a multi-rate base (the second reachable path) ───────────
 
 /// A storno of a two-rate base emits the multi-bucket summary with NEGATED
@@ -241,6 +343,81 @@ fn storno_of_multi_rate_base_emits_negated_multi_bucket_summary() {
     assert!(
         c.contains("<invoiceVatAmount>-5900</invoiceVatAmount>"),
         "invoice-level storno VAT must be -5900; body:\n{body}"
+    );
+}
+
+// ── T3b — modification, the THIRD render path through `write_summary` ──────
+
+/// `render_modification_data` is the third caller of `write_summary`, and
+/// unlike storno it does NOT negate: a modification is a full-replace body
+/// carrying the corrected invoice's own amounts. T1 pins the fresh-issue
+/// path and T3 the storno path; without this the modification path's
+/// bucketing rests on "it's the same function" rather than on a pin, and a
+/// future refactor that gave modification its own summary emitter would land
+/// green. The existing modification suite does reach multi-rate bodies
+/// (`issue_modification_xml_round_trip.rs`) but asserts only
+/// `lineOperation`, never the summary.
+///
+/// MUTATION: bucket-key collapse — one bucket carrying 35000 under 27%.
+#[test]
+fn modification_of_a_multi_rate_invoice_emits_per_rate_buckets_unnegated() {
+    let invoice = invoice_with_lines(vec![
+        line("27% line A", 1, 10_000, 2700),
+        line("18% line", 1, 20_000, 1800),
+        line("27% line B", 1, 5_000, 2700),
+    ]);
+    let reference = ModificationReference {
+        base_invoice_number: "INV-default/00001".to_string(),
+        modification_index: 1,
+        base_line_count: 3,
+    };
+    let xml = nav_xml::render_modification_data(
+        &invoice,
+        &series(),
+        &domestic_parties(),
+        &reference,
+        Currency::Huf,
+        None,
+    )
+    .expect("modification emitter must succeed");
+    validate_invoice_data(&xml).unwrap_or_else(|e| {
+        panic!(
+            "validator rejected multi-bucket modification: {e}\n{}",
+            String::from_utf8_lossy(&xml)
+        )
+    });
+    let body = String::from_utf8(xml).expect("emit is UTF-8");
+    let c = compact(&body);
+    assert_eq!(
+        bucket_count(&body),
+        2,
+        "two distinct rates over three lines → 2 buckets; body:\n{body}"
+    );
+    // 18% bucket — its own line only.
+    assert!(
+        c.contains(
+            "<vatRate><vatPercentage>0.18</vatPercentage></vatRate>\
+             <vatRateNetData><vatRateNetAmount>20000</vatRateNetAmount>"
+        ) && c.contains("<vatRateVatAmount>3600</vatRateVatAmount>"),
+        "18% bucket must carry 20000/3600, not the invoice total; body:\n{body}"
+    );
+    // 27% bucket — the two 27% lines merged, POSITIVE (full-replace, not a
+    // storno negation).
+    assert!(
+        c.contains(
+            "<vatRate><vatPercentage>0.27</vatPercentage></vatRate>\
+             <vatRateNetData><vatRateNetAmount>15000</vatRateNetAmount>"
+        ) && c.contains("<vatRateVatAmount>4050</vatRateVatAmount>"),
+        "27% bucket must merge both 27% lines to 15000/4050, unnegated; body:\n{body}"
+    );
+    assert!(
+        c.contains(
+            "<invoiceNetAmount>35000</invoiceNetAmount>\
+             <invoiceNetAmountHUF>35000</invoiceNetAmountHUF>\
+             <invoiceVatAmount>7650</invoiceVatAmount>\
+             <invoiceVatAmountHUF>7650</invoiceVatAmountHUF>"
+        ),
+        "modification invoice-level totals must be the sum over buckets; body:\n{body}"
     );
 }
 

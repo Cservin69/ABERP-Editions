@@ -1147,9 +1147,9 @@ fn walk_summary_normal(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidatio
         "invoiceVatAmount",
         "invoiceVatAmountHUF",
     ];
-    // ADR-0103 §3.1 — the four invoice-level amounts appear once each, in
-    // this order, AFTER a leading run of one-or-more `summaryByVatRate`
-    // buckets. `summaryByVatRate` is deliberately NOT in this list: it is
+    // ADR-0103 §3.1 — the four invoice-level amounts appear in this order,
+    // AFTER a leading run of one-or-more `summaryByVatRate` buckets.
+    // `summaryByVatRate` is deliberately NOT in this list: it is
     // `maxOccurs="unbounded"` (verified against the published NAV
     // `invoiceData.xsd` `SummaryNormalType`) and is checked separately below
     // — folding it into a positional `check_ordered_required` is exactly the
@@ -1210,7 +1210,17 @@ fn walk_summary_normal(reader: &mut Reader<&[u8]>) -> Result<(), NavXsdValidatio
                         });
                     }
                 }
-                // The four invoice-level amounts: present, once each, in order.
+                // The four invoice-level amounts: present, and in order.
+                //
+                // NOT "once each": `check_ordered_required` projects `seen`
+                // onto `required` and compares the first `required.len()`
+                // positions, so a DUPLICATE trailing amount (…, vatHUF,
+                // vatHUF) is accepted — verified by probe. That is the shared
+                // helper's behaviour everywhere in this validator, not
+                // something this call tightens; the emitter cannot produce a
+                // duplicate, and NAV's own schema is the backstop. Said
+                // plainly here rather than claimed away, per ADR-0022's
+                // loose-model posture.
                 check_ordered_required(PARENT, ORDERED_INVOICE_AMOUNTS, &seen)?;
                 return Ok(());
             }
