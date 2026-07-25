@@ -42,10 +42,13 @@
 //!     the SPA renders verbatim — translation duplication and drift
 //!     stay off the table.
 
-use aberp_billing::Currency;
+use aberp_billing::{Currency, VatRateKind};
 use rust_decimal::Decimal;
 
-use crate::nav_xml::{parse_hungarian_tax_number, CustomerVatStatus, SupplierConfigError};
+use crate::nav_xml::{
+    parse_hungarian_tax_number, validate_community_vat_number, validate_country_code,
+    CustomerVatStatus, SupplierConfigError,
+};
 use crate::serve::IssueInvoiceRequest;
 
 /// Hungarian Áfa standard-rate closed-vocab. Per current Áfa törvény:
@@ -139,6 +142,58 @@ pub enum InvoicePreflightError {
         actual: u16,
         allowed: &'static [u16],
     },
+    /// ADR-0101 §4 (Session 2 — DOOR OPEN). `lines[line_index]` carries a
+    /// FULLY-WIRED non-`Percent` kind (AAM / domestic reverse-charge /
+    /// intra-Community goods / intra-Community service reverse) but a
+    /// **non-zero** `vat_rate_percent`. A reverse-charge / exempt line's
+    /// VAT is always 0 (the buyer self-assesses; the exemption carries no
+    /// rate); a non-zero rate on such a line is a category/rate
+    /// contradiction NAV would reject. The SPA selector LOCKS the rate to 0
+    /// for these kinds, so this fires only for a non-UI caller (CLI / API)
+    /// — a defence-in-depth gate, not an operator-reachable state through
+    /// the form. Carries the kind + the offending rate so the message names
+    /// both.
+    NonZeroPercentForExemptKind {
+        line_index: usize,
+        kind: VatRateKind,
+        actual: u16,
+    },
+    /// ADR-0101 §4 — `lines[line_index]` carries a NAMED-DEFERRED
+    /// `vat_rate_kind` (TAM / EAM / NAM / KBAUK / HO / marginScheme /
+    /// noVatCharge / vatContent). These are enum-known so the vocab is
+    /// closed + complete-in-intent, but v1 wires only the four Ervin-
+    /// confirmed kinds; the remainder are explicit not-yet markers
+    /// (ADR-0048 pattern / CLAUDE.md rule 12). Rejected LOUDLY at preflight
+    /// (and, in defence-in-depth, `anyhow!`ed at NAV emit) so no
+    /// unconfirmed-code body can reach the wire. Wiring one is a separate
+    /// PR that first confirms its NAV case code.
+    VatRateKindNotSupportedYet {
+        line_index: usize,
+        kind: VatRateKind,
+    },
+    /// ADR-0101 (Session-2 conservative guard — FLAGGED). The invoice mixes
+    /// a non-`Percent` `vat_rate_kind` with a DIFFERENT kind on another
+    /// line. The NAV emitter's `summaryByVatRate` is single-bucket, keyed
+    /// on the FIRST line's kind/rate (`nav_xml.rs::write_summary`), so a
+    /// mixed-kind invoice would emit a summary whose category does not
+    /// cover every line — a NAV cross-field rejection at best, a silently
+    /// mis-categorised filing at worst. Until the summary emitter groups by
+    /// (kind, rate) — a separate follow-up — an invoice that carries ANY
+    /// non-`Percent` line must have EVERY line on that same kind. All-
+    /// `Percent` invoices are unaffected (byte-identical backward-compat);
+    /// this guard fires only once a non-`Percent` kind is present. Carries
+    /// the two disagreeing kinds + the line that first differs.
+    ///
+    /// FLAG (for the NAV-category adversarial review): this enforces the
+    /// invariant `write_summary` already assumes but never checked. The
+    /// pre-existing mixed-`Percent`-RATE single-bucket gap (e.g. a 27% line
+    /// + a 5% line) is untouched here — out of ADR-0101 scope — and remains
+    /// a NAV-reject-on-submit rather than a preflight catch.
+    MixedVatRateKindsUnsupported {
+        line_index: usize,
+        first_kind: VatRateKind,
+        other_kind: VatRateKind,
+    },
     /// PR-73 / ADR-0040 §addendum — `bank_account_id` omitted (or
     /// `None`) AND `seller_banks.default_bank_for(invoice.currency)`
     /// returned `None`. The operator must either add a bank-account
@@ -179,13 +234,70 @@ pub enum InvoicePreflightError {
     /// disabled input was carrying (usually a copy/paste residue
     /// after switching the radio).
     CustomerTaxNumberPresentForPrivatePerson { actual: String },
-    /// PR-97 / ADR-0048 §7 — `customer.vat_status == Other`. v1
-    /// named-defers the foreign-buyer (EU community VAT / non-EU
-    /// third-state-tax-id) branch; preflight surfaces a typed error
-    /// pointing the operator at the radio so the "not yet supported"
-    /// signal is explicit and operator-actionable rather than landing
-    /// silently as a NAV-side ABORTED.
-    CustomerVatStatusOtherNotSupportedV1,
+    /// ADR-0102 §4(b) — `customer.vat_status == Other` AND
+    /// `customer.tax_number` is non-empty after trim. A foreign-EU
+    /// buyer carries a `<communityVatNumber>`, NOT a Hungarian ADÓSZÁM;
+    /// a HU tax number on an `Other` body is operator confusion (radio
+    /// flipped after typing) or a wire-bypass. Symmetric with the
+    /// PrivatePerson rule; surfaced loud so the operator clears the
+    /// field rather than silently emitting an ignored value.
+    CustomerTaxNumberPresentForOther { actual: String },
+    /// ADR-0102 §4(b) — `customer.vat_status == Other` but no EU
+    /// community VAT number was supplied. NAV's `CustomerVatDataType`
+    /// REQUIRES `<customerVatData>` for OTHER (the EU arm carries
+    /// `<communityVatNumber>`); an absent number would render an empty
+    /// `<customerVatData>` that NAV rejects. Fix is on the partner
+    /// record (fill the EU VAT number) or the buyer type.
+    CommunityVatNumberMissing,
+    /// ADR-0102 §3.3 — `customer.vat_status == Other` and the supplied
+    /// EU community VAT number fails the VIES STRUCTURAL shape
+    /// (unknown country prefix / bad length / non-alphanumeric body).
+    /// Carries the raw value + the bilingual reason from
+    /// `nav_xml::validate_community_vat_number`. (A live VIES online
+    /// check is out of scope — ADR-0102 §8.2.)
+    CommunityVatNumberMalformed { actual: String, reason: String },
+    /// ADR-0102 (NAV-adversarial FIX #1) — `customer.vat_status == Other`
+    /// and the buyer address `country_code` is not a well-formed ISO
+    /// 3166-1 alpha-2 code (`[A-Z]{2}`). An `Other` buyer's country flows
+    /// from the free-form partner record, so a partner saved as "Austria"
+    /// / "Ausztria" (or a lowercase "at") would emit a `<countryCode>` NAV
+    /// bounces at submit time. Surfaced loud at preflight (symmetric with
+    /// `CommunityVatNumberMalformed`) so the operator fixes the partner's
+    /// country on the editable form rather than burning a sequence at NAV.
+    /// Fires ONLY for `Other` (Domestic buyers are HU-forced by the SPA,
+    /// out of scope — backward-compat). Carries the raw value + the
+    /// bilingual reason from `nav_xml::validate_country_code`. A full
+    /// closed-vocab country list stays deferred (ADR-0102 §8.3).
+    CustomerCountryCodeInvalid { actual: String, reason: String },
+    /// ADR-0102 §4(a) — `lines[line_index]` carries an intra-Community
+    /// 0% kind (`IntraCommunityGoods`/KBAET or
+    /// `IntraCommunityServiceReverse`/EUFAD37) but the buyer is NOT
+    /// `Other` (foreign-EU business). An EU-0 line is only well-formed
+    /// against a foreign-EU buyer with a community VAT number; assembling
+    /// one against a domestic buyer is the exact "semantically-wrong
+    /// buyer" compliance error this ADR closes. Carries the kind + the
+    /// actual buyer status so the message names both. Fix: pick an
+    /// `Other` (EU) buyer, or change the line's VAT type.
+    VatKindRequiresOtherBuyer {
+        line_index: usize,
+        kind: VatRateKind,
+        actual_status: CustomerVatStatus,
+    },
+    /// ADR-0102 §4(a) — `lines[line_index]` carries `DomesticReverseCharge`
+    /// but the buyer is NOT `Domestic`. `belföldi fordított adózás` (§142)
+    /// is two domestic taxable persons by definition, so this kind is
+    /// Domestic-only. NOTE (NAV-adversarial FIX #2, 2026-07-16): `AamExempt`
+    /// USED to also require Domestic here, but AAM (alanyi adómentesség,
+    /// §187) is a SELLER-side exemption — NAV binds NO customerVatStatus to
+    /// it — so the strict rule wrongly blocked the common exempt-small-
+    /// business → magánszemély case. AAM is now buyer-agnostic (like
+    /// `Percent`) and never reaches this variant. Carries the kind + the
+    /// actual buyer status.
+    VatKindRequiresDomesticBuyer {
+        line_index: usize,
+        kind: VatRateKind,
+        actual_status: CustomerVatStatus,
+    },
 }
 
 impl InvoicePreflightError {
@@ -207,6 +319,15 @@ impl InvoicePreflightError {
                 "LineItemUnitPriceNonPositive"
             }
             InvoicePreflightError::LineItemVatRateUnknown { .. } => "LineItemVatRateUnknown",
+            InvoicePreflightError::NonZeroPercentForExemptKind { .. } => {
+                "NonZeroPercentForExemptKind"
+            }
+            InvoicePreflightError::VatRateKindNotSupportedYet { .. } => {
+                "VatRateKindNotSupportedYet"
+            }
+            InvoicePreflightError::MixedVatRateKindsUnsupported { .. } => {
+                "MixedVatRateKindsUnsupported"
+            }
             InvoicePreflightError::SellerBankMissingForCurrency { .. } => {
                 "SellerBankMissingForCurrency"
             }
@@ -216,8 +337,19 @@ impl InvoicePreflightError {
             InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson { .. } => {
                 "CustomerTaxNumberPresentForPrivatePerson"
             }
-            InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1 => {
-                "CustomerVatStatusOtherNotSupportedV1"
+            InvoicePreflightError::CustomerTaxNumberPresentForOther { .. } => {
+                "CustomerTaxNumberPresentForOther"
+            }
+            InvoicePreflightError::CommunityVatNumberMissing => "CommunityVatNumberMissing",
+            InvoicePreflightError::CommunityVatNumberMalformed { .. } => {
+                "CommunityVatNumberMalformed"
+            }
+            InvoicePreflightError::CustomerCountryCodeInvalid { .. } => {
+                "CustomerCountryCodeInvalid"
+            }
+            InvoicePreflightError::VatKindRequiresOtherBuyer { .. } => "VatKindRequiresOtherBuyer",
+            InvoicePreflightError::VatKindRequiresDomesticBuyer { .. } => {
+                "VatKindRequiresDomesticBuyer"
             }
         }
     }
@@ -247,14 +379,35 @@ impl InvoicePreflightError {
             InvoicePreflightError::LineItemVatRateUnknown { line_index, .. } => {
                 format!("lines[{line_index}].vatRatePercent")
             }
+            // All three ADR-0101 kind-level errors route to the per-line
+            // `vatRateKind` selector so the SPA renders them beneath the
+            // VAT-type dropdown (the control that drives the discriminant).
+            InvoicePreflightError::NonZeroPercentForExemptKind { line_index, .. }
+            | InvoicePreflightError::VatRateKindNotSupportedYet { line_index, .. }
+            | InvoicePreflightError::MixedVatRateKindsUnsupported { line_index, .. } => {
+                format!("lines[{line_index}].vatRateKind")
+            }
             InvoicePreflightError::SellerBankMissingForCurrency { .. }
             | InvoicePreflightError::SellerBankCurrencyMismatch { .. } => {
                 "bankAccountId".to_string()
             }
-            InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson { .. } => {
+            InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson { .. }
+            | InvoicePreflightError::CustomerTaxNumberPresentForOther { .. } => {
                 "customer.taxNumber".to_string()
             }
-            InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1 => {
+            InvoicePreflightError::CommunityVatNumberMissing
+            | InvoicePreflightError::CommunityVatNumberMalformed { .. } => {
+                "customer.communityVatNumber".to_string()
+            }
+            InvoicePreflightError::CustomerCountryCodeInvalid { .. } => {
+                "customer.address.countryCode".to_string()
+            }
+            // The cross-field kind↔buyer mismatches are triggered by a
+            // line's VAT type but fixed on the buyer side; route them to
+            // the buyer-type control so the operator sees "this line kind
+            // needs a different buyer".
+            InvoicePreflightError::VatKindRequiresOtherBuyer { .. }
+            | InvoicePreflightError::VatKindRequiresDomesticBuyer { .. } => {
                 "customer.vatStatus".to_string()
             }
         }
@@ -311,9 +464,39 @@ impl InvoicePreflightError {
                 allowed,
             } => {
                 format!(
-                    "A(z) {}. tételsor ÁFA-kulcsa ({actual}%) nem szerepel a magyar szabványos kulcsok között ({}). Speciális kategóriák (AAM/TAM/TAH) jelenleg nem támogatottak.",
+                    "A(z) {}. tételsor ÁFA-kulcsa ({actual}%) nem szerepel a magyar szabványos kulcsok között ({}). Adómentes / fordított adózású tételhez válassza a megfelelő ÁFA-típust (AAM, belföldi fordított adózás, Közösségen belüli) a legördülő menüből.",
                     line_index + 1,
                     format_percent_list(allowed)
+                )
+            }
+            InvoicePreflightError::NonZeroPercentForExemptKind {
+                line_index,
+                kind,
+                actual,
+            } => {
+                format!(
+                    "A(z) {}. tételsor ÁFA-típusa ({}) adómentes / fordított adózású, ezért az ÁFA-kulcs kötelezően 0% (kapott: {actual}%). A vevő önadózik / az ügylet adómentes — állítsa 0%-ra.",
+                    line_index + 1,
+                    kind.as_str()
+                )
+            }
+            InvoicePreflightError::VatRateKindNotSupportedYet { line_index, kind } => {
+                format!(
+                    "A(z) {}. tételsor ÁFA-típusa ({}) még nincs bekötve (ADR-0101 named-deferred). Jelenleg a Százalékos (Percent), AAM, belföldi fordított adózás, valamint a Közösségen belüli termékértékesítés / szolgáltatás típusok bocsáthatók ki. Válasszon ezek közül.",
+                    line_index + 1,
+                    kind.as_str()
+                )
+            }
+            InvoicePreflightError::MixedVatRateKindsUnsupported {
+                line_index,
+                first_kind,
+                other_kind,
+            } => {
+                format!(
+                    "A(z) {}. tételsor ÁFA-típusa ({}) eltér a számla első tételsorának típusától ({}). Egy adómentes / fordított adózású számlán minden tételsornak azonos ÁFA-típusúnak kell lennie (a NAV összesítő egyetlen kategóriát tartalmaz). Bontsa külön számlára a különböző ÁFA-típusú tételeket.",
+                    line_index + 1,
+                    other_kind.as_str(),
+                    first_kind.as_str()
                 )
             }
             InvoicePreflightError::SellerBankMissingForCurrency { currency } => {
@@ -340,10 +523,48 @@ impl InvoicePreflightError {
                      blokkot — váltson Adóalany típusra, vagy hagyja üresen az ADÓSZÁM mezőt."
                 )
             }
-            InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1 => {
-                "Külföldi (OTHER) vevő kibocsátása későbbi verzióban érkezik (ADR-0048 §7 / v2). \
-                 Jelenleg csak Adóalany / Magánszemély típusú vevő számlázható."
+            InvoicePreflightError::CustomerTaxNumberPresentForOther { actual } => {
+                format!(
+                    "Külföldi (OTHER) vevőhöz nem tartozhat magyar adószám (kapott: `{actual}`). \
+                     Az EU-s vevő EU-adószámot (communityVatNumber) visel — hagyja üresen az \
+                     ADÓSZÁM mezőt."
+                )
+            }
+            InvoicePreflightError::CommunityVatNumberMissing => {
+                "Külföldi (OTHER) vevőhöz kötelező az EU adószám (communityVatNumber). \
+                 Töltse ki a partner „EU VAT number\" mezőjét, vagy váltson vevőtípust."
                     .to_string()
+            }
+            InvoicePreflightError::CommunityVatNumberMalformed { actual, reason } => {
+                format!(
+                    "Az EU adószám `{actual}` nem érvényes alakú: {reason}. \
+                     (Csak alaki ellenőrzés — élő VIES ellenőrzés nem történik.)"
+                )
+            }
+            InvoicePreflightError::CustomerCountryCodeInvalid { actual, reason } => {
+                format!(
+                    "A külföldi (OTHER) vevő országkódja `{actual}` nem érvényes: {reason}. \
+                     Javítsa a partner országát ISO 3166-1 alpha-2 kódra (pl. AT, DE) — \
+                     a NAV a kétbetűs kódot várja."
+                )
+            }
+            InvoicePreflightError::VatKindRequiresOtherBuyer { line_index, kind, actual_status } => {
+                format!(
+                    "A(z) {}. sor ÁFA-típusa ({kind:?}) Közösségen belüli 0%-os ügylet, \
+                     amely külföldi EU-s (OTHER) vevőt igényel — a jelenlegi vevő {}. \
+                     Válasszon EU-s vevőt (EU adószámmal), vagy módosítsa a sor ÁFA-típusát.",
+                    line_index + 1,
+                    actual_status.as_nav_token()
+                )
+            }
+            InvoicePreflightError::VatKindRequiresDomesticBuyer { line_index, kind, actual_status } => {
+                format!(
+                    "A(z) {}. sor ÁFA-típusa ({kind:?}) belföldi ügylet, amely belföldi \
+                     (DOMESTIC) vevőt igényel — a jelenlegi vevő {}. Válasszon belföldi vevőt, \
+                     vagy módosítsa a sor ÁFA-típusát.",
+                    line_index + 1,
+                    actual_status.as_nav_token()
+                )
             }
         }
     }
@@ -394,9 +615,39 @@ impl InvoicePreflightError {
                 allowed,
             } => {
                 format!(
-                    "Line {} VAT rate ({actual}%) is not a Hungarian standard rate (allowed: {}). Special categories (AAM/TAM/TAH) are not supported on this wire shape today.",
+                    "Line {} VAT rate ({actual}%) is not a Hungarian standard rate (allowed: {}). For an exempt / reverse-charge line, pick the matching VAT type (AAM, domestic reverse-charge, intra-Community) from the VAT-type selector instead.",
                     line_index + 1,
                     format_percent_list(allowed)
+                )
+            }
+            InvoicePreflightError::NonZeroPercentForExemptKind {
+                line_index,
+                kind,
+                actual,
+            } => {
+                format!(
+                    "Line {} VAT kind ({}) is exempt / reverse-charge, so its VAT rate must be 0% (got {actual}%). The buyer self-assesses / the supply is exempt — set the rate to 0.",
+                    line_index + 1,
+                    kind.as_str()
+                )
+            }
+            InvoicePreflightError::VatRateKindNotSupportedYet { line_index, kind } => {
+                format!(
+                    "Line {} VAT kind ({}) is not wired yet (ADR-0101 named-deferred). Issuable kinds today: Percent, AamExempt, DomesticReverseCharge, IntraCommunityGoods, IntraCommunityServiceReverse — pick one of those. Wiring another is a later PR that first confirms its NAV case code.",
+                    line_index + 1,
+                    kind.as_str()
+                )
+            }
+            InvoicePreflightError::MixedVatRateKindsUnsupported {
+                line_index,
+                first_kind,
+                other_kind,
+            } => {
+                format!(
+                    "Line {} VAT kind ({}) differs from the invoice's first line kind ({}). An invoice carrying any exempt / reverse-charge line must have EVERY line on the same VAT kind — NAV's summaryByVatRate is single-bucket, so a mixed-kind invoice mis-categorises the summary. Split differing VAT kinds onto separate invoices.",
+                    line_index + 1,
+                    other_kind.as_str(),
+                    first_kind.as_str()
                 )
             }
             InvoicePreflightError::SellerBankMissingForCurrency { currency } => {
@@ -424,12 +675,56 @@ impl InvoicePreflightError {
                      ADÓSZÁM field."
                 )
             }
-            InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1 => {
-                "Foreign-buyer (OTHER) issuance is named-deferred to v2 per ADR-0048 §7. \
-                 v1 supports Domestic and PrivatePerson buyers only — pick one of those, \
-                 or wait for the v2 PR that wires the EU community-VAT / non-EU third-state \
-                 tax-id branch."
+            InvoicePreflightError::CustomerTaxNumberPresentForOther { actual } => {
+                format!(
+                    "Foreign-EU (OTHER) buyers must NOT carry a Hungarian tax number \
+                     (got `{actual}`). An EU buyer carries an EU VAT number \
+                     (communityVatNumber) — clear the ADÓSZÁM field."
+                )
+            }
+            InvoicePreflightError::CommunityVatNumberMissing => {
+                "Foreign-EU (OTHER) buyers require an EU VAT number (communityVatNumber). \
+                 Fill the partner's `EU VAT number` field, or change the buyer type."
                     .to_string()
+            }
+            InvoicePreflightError::CommunityVatNumberMalformed { actual, reason } => {
+                format!(
+                    "EU VAT number `{actual}` is not structurally valid: {reason}. \
+                     (Structural check only — no live VIES lookup is performed.)"
+                )
+            }
+            InvoicePreflightError::CustomerCountryCodeInvalid { actual, reason } => {
+                format!(
+                    "Foreign-EU (OTHER) buyer country code `{actual}` is not valid: {reason}. \
+                     Fix the partner's country to an ISO 3166-1 alpha-2 code (e.g. AT, DE) — \
+                     NAV requires the two-letter code."
+                )
+            }
+            InvoicePreflightError::VatKindRequiresOtherBuyer {
+                line_index,
+                kind,
+                actual_status,
+            } => {
+                format!(
+                    "Line {} VAT type ({kind:?}) is an intra-Community 0% transaction that \
+                     requires a foreign-EU (OTHER) buyer — the current buyer is {}. Pick an EU \
+                     buyer (with an EU VAT number), or change the line's VAT type.",
+                    line_index + 1,
+                    actual_status.as_nav_token()
+                )
+            }
+            InvoicePreflightError::VatKindRequiresDomesticBuyer {
+                line_index,
+                kind,
+                actual_status,
+            } => {
+                format!(
+                    "Line {} VAT type ({kind:?}) is a domestic transaction that requires a \
+                     Domestic buyer — the current buyer is {}. Pick a domestic buyer, or change \
+                     the line's VAT type.",
+                    line_index + 1,
+                    actual_status.as_nav_token()
+                )
             }
         }
     }
@@ -604,7 +899,53 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
             }
         }
         CustomerVatStatus::Other => {
-            errors.push(InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1);
+            // ADR-0102 §4(b) — foreign-EU business buyer. NAV requires
+            // `<customerVatData>` (the EU arm carries `<communityVatNumber>`)
+            // AND `<customerAddress>` for OTHER (the `CUSTOMER_DATA_EXPECTED`
+            // predicate is `status != PRIVATE_PERSON`). A HU ADÓSZÁM is
+            // forbidden (an EU buyer carries an EU VAT number, not a HU one).
+            if !tax_trimmed.is_empty() {
+                errors.push(InvoicePreflightError::CustomerTaxNumberPresentForOther {
+                    actual: tax_trimmed.to_string(),
+                });
+            }
+            match request
+                .customer
+                .community_vat_number
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None => errors.push(InvoicePreflightError::CommunityVatNumberMissing),
+                Some(raw) => {
+                    if let Err(reason) = validate_community_vat_number(raw) {
+                        errors.push(InvoicePreflightError::CommunityVatNumberMalformed {
+                            actual: raw.to_string(),
+                            reason,
+                        });
+                    }
+                }
+            }
+            // Address REQUIRED for OTHER (same `CUSTOMER_DATA_EXPECTED`
+            // rule as Domestic — the predicate is `status != PRIVATE_PERSON`).
+            if !customer_address_complete(&request.customer.address) {
+                errors.push(InvoicePreflightError::CustomerAddressMissing);
+            } else if let Some(addr) = request.customer.address.as_ref() {
+                // ADR-0102 (NAV-adversarial FIX #1) — the address is present
+                // and non-empty, but for an `Other` (foreign-EU) buyer the
+                // `country_code` flows from the free-form partner record; NAV's
+                // `CountryCodeType` is `[A-Z]{2}`, so a partner saved as
+                // "Austria"/"Ausztria" would bounce at submit time. Guard the
+                // structural shape here (verbatim — the emitter writes it
+                // byte-for-byte). Only `Other` is checked; Domestic buyers are
+                // HU-forced by the SPA and out of scope (backward-compat).
+                if let Err(reason) = validate_country_code(&addr.country_code) {
+                    errors.push(InvoicePreflightError::CustomerCountryCodeInvalid {
+                        actual: addr.country_code.clone(),
+                        reason,
+                    });
+                }
+            }
         }
     }
 
@@ -628,12 +969,137 @@ pub fn validate_invoice_preflight(request: &IssueInvoiceRequest) -> Vec<InvoiceP
                     actual: line.unit_price,
                 });
             }
-            if !ALLOWED_VAT_RATES_PERCENT.contains(&line.vat_rate_percent) {
-                errors.push(InvoicePreflightError::LineItemVatRateUnknown {
+            // ADR-0101 §4 — the per-line VAT rate-kind accept/reject matrix
+            // (Session 2, DOOR OPEN). Branch on the kind FIRST so a
+            // non-`Percent` line's (meaningless) `vat_rate_percent` cannot
+            // ALSO trip `LineItemVatRateUnknown` — the operator sees the one
+            // precise kind-level error.
+            //
+            //   Percent        → numeric-rate gate (unchanged): rate ∈ {0,5,18,27}
+            //   wired non-Pct  → accept iff rate == 0, else NonZeroPercentForExemptKind
+            //   named-deferred → VatRateKindNotSupportedYet (loud not-yet)
+            if line.vat_rate_kind.is_percent() {
+                if !ALLOWED_VAT_RATES_PERCENT.contains(&line.vat_rate_percent) {
+                    errors.push(InvoicePreflightError::LineItemVatRateUnknown {
+                        line_index,
+                        actual: line.vat_rate_percent,
+                        allowed: ALLOWED_VAT_RATES_PERCENT,
+                    });
+                }
+            } else if line.vat_rate_kind.is_wired() {
+                // AAM / domestic reverse-charge / intra-Community goods /
+                // intra-Community service reverse: the line VAT amount is 0
+                // (buyer self-assesses / exempt), so a non-zero rate is a
+                // category/rate contradiction. Accept only rate 0.
+                if line.vat_rate_percent != 0 {
+                    errors.push(InvoicePreflightError::NonZeroPercentForExemptKind {
+                        line_index,
+                        kind: line.vat_rate_kind,
+                        actual: line.vat_rate_percent,
+                    });
+                }
+            } else {
+                // Named-deferred remainder — enum-known, not yet wired.
+                errors.push(InvoicePreflightError::VatRateKindNotSupportedYet {
                     line_index,
-                    actual: line.vat_rate_percent,
-                    allowed: ALLOWED_VAT_RATES_PERCENT,
+                    kind: line.vat_rate_kind,
                 });
+            }
+        }
+
+        // Mixed-kind guard — KEPT, but RE-FOUNDED (ADR-0103 (Defense) §4.4).
+        //
+        // Its original ADR-0101 justification was "the NAV emitter's
+        // `summaryByVatRate` is single-bucket, keyed on the FIRST line's
+        // kind". That reason is now FALSE: `nav_xml::write_summary` groups on
+        // the composite `(vat_rate_kind, vat_rate_basis_points)` and emits one
+        // bucket per group, so a mixed-kind invoice would be covered exactly.
+        // The old comment (and its sentence declaring the mixed-`Percent`-RATE
+        // gap intentionally-not-gated — that gap is the B3′ defect, closed by
+        // PR #25) is deleted rather than amended: a stale comment asserting a
+        // closed defect is still open is precisely how B3′ survived on the
+        // prod line.
+        //
+        // The guard nevertheless STANDS, on an independent and stronger
+        // reason: ADR-0102 §4(a)'s buyer-status ↔ line-kind matrix is
+        // INVOICE-SCOPED. `IntraCommunityGoods` requires
+        // `customerVatStatus = Other`; `DomesticReverseCharge` requires
+        // `Domestic`. An invoice carrying one line of each demands both at
+        // once — unsatisfiable. Post-grouping such a body would produce two
+        // structurally well-formed buckets and pass the local (deliberately
+        // loose, ADR-0022) validator while being semantically impossible.
+        //
+        // This is NOT defence-in-depth for the summary shape — it is a
+        // different invariant that happened to share an implementation. The
+        // §4(a) matrix check immediately below RELIES on it: it reads the
+        // first non-`Percent` kind as "the invoice's operative kind", which
+        // is only sound because this guard forbids a second one.
+        //
+        // All-`Percent` invoices skip the guard entirely (the `any`
+        // short-circuits false), so backward-compat is byte-identical.
+        let any_non_percent = request.lines.iter().any(|l| !l.vat_rate_kind.is_percent());
+        if any_non_percent {
+            let first_kind = request.lines[0].vat_rate_kind;
+            for (line_index, line) in request.lines.iter().enumerate() {
+                if line.vat_rate_kind != first_kind {
+                    errors.push(InvoicePreflightError::MixedVatRateKindsUnsupported {
+                        line_index,
+                        first_kind,
+                        other_kind: line.vat_rate_kind,
+                    });
+                }
+            }
+        }
+
+        // ADR-0102 §4(a) — CROSS-FIELD VAT-kind ↔ buyer-status matrix.
+        // The mixed-kind guard above already forces every non-`Percent`
+        // line to share one kind, so the invoice's operative non-`Percent`
+        // kind is the FIRST such line; checking it once against the
+        // invoice-scoped customer status is sufficient (and avoids piling a
+        // duplicate error on every line). This closes the "EU-0 line
+        // assembled against a semantically-wrong domestic buyer" risk: the
+        // ONLY accept path for an intra-Community 0% kind is an `Other`
+        // (foreign-EU) buyer, and `DomesticReverseCharge` REQUIRES a
+        // Domestic buyer.
+        //
+        // NAV-adversarial FIX #2 (2026-07-16) — `AamExempt` (AAM, alanyi
+        // adómentesség §187) is now BUYER-AGNOSTIC, like `Percent`: AAM is a
+        // SELLER-side exemption and NAV binds no customerVatStatus to it, so
+        // the earlier "AAM requires Domestic" rule wrongly blocked the common
+        // legitimate case (exempt small business → magánszemély /
+        // PrivatePerson, or → EU buyer). Only `DomesticReverseCharge` stays
+        // Domestic-only (§142 belföldi = two domestic taxable persons — that
+        // one is genuinely buyer-constrained). `Percent` is buyer-agnostic
+        // (ADR-0101 hold) and never reaches this branch.
+        if let Some((line_index, line)) = request
+            .lines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| !l.vat_rate_kind.is_percent())
+        {
+            let status = request.customer.vat_status;
+            match line.vat_rate_kind {
+                VatRateKind::IntraCommunityGoods | VatRateKind::IntraCommunityServiceReverse
+                    if status != CustomerVatStatus::Other =>
+                {
+                    errors.push(InvoicePreflightError::VatKindRequiresOtherBuyer {
+                        line_index,
+                        kind: line.vat_rate_kind,
+                        actual_status: status,
+                    });
+                }
+                VatRateKind::DomesticReverseCharge if status != CustomerVatStatus::Domestic => {
+                    errors.push(InvoicePreflightError::VatKindRequiresDomesticBuyer {
+                        line_index,
+                        kind: line.vat_rate_kind,
+                        actual_status: status,
+                    });
+                }
+                // Matching-buyer cases + `AamExempt` (buyer-agnostic per FIX #2)
+                // fall through (accepted). Percent never reaches here (find
+                // skips is_percent); named-deferred kinds were already rejected
+                // loud above by `VatRateKindNotSupportedYet`.
+                _ => {}
             }
         }
     }
@@ -666,6 +1132,7 @@ mod tests {
             quantity: Decimal::from(1),
             unit_price: 10_000,
             vat_rate_percent: 27,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }
@@ -674,6 +1141,7 @@ mod tests {
     fn good_request() -> IssueInvoiceRequest {
         IssueInvoiceRequest {
             customer: CustomerJson {
+                community_vat_number: None,
                 // PR-97 / ADR-0048 — explicit Domestic preserves
                 // pre-PR-97 implicit posture for legacy preflight tests.
                 vat_status: CustomerVatStatus::Domestic,
@@ -714,6 +1182,261 @@ mod tests {
     #[test]
     fn golden_valid_request_returns_empty_vec() {
         assert!(validate_invoice_preflight(&good_request()).is_empty());
+    }
+
+    /// ADR-0101 §4 (DOOR OPEN) + ADR-0102 §4 — each of the four
+    /// FULLY-WIRED kinds is ACCEPTED when the line is 0% AND the buyer
+    /// matches the cross-field matrix (AAM / domestic reverse-charge
+    /// require a Domestic buyer; the intra-Community 0% kinds require an
+    /// `Other` (EU) buyer with a valid EU VAT number). Proven
+    /// kind-by-kind so a regression that re-shut one specific kind — or
+    /// broke its buyer-matrix cell — fails loudly.
+    #[test]
+    fn wired_kinds_accepted_at_zero_rate_with_matching_buyer() {
+        use aberp_billing::VatRateKind::*;
+        for kind in [
+            AamExempt,
+            DomesticReverseCharge,
+            IntraCommunityGoods,
+            IntraCommunityServiceReverse,
+        ] {
+            let mut r = good_request();
+            r.lines[0].vat_rate_kind = kind;
+            r.lines[0].vat_rate_percent = 0; // exempt / reverse-charge is 0%
+                                             // ADR-0102 — the EU-0 kinds need an Other buyer; the domestic
+                                             // kinds keep good_request's Domestic buyer.
+            if matches!(kind, IntraCommunityGoods | IntraCommunityServiceReverse) {
+                make_other_buyer(&mut r);
+            }
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.is_empty(),
+                "wired kind {kind:?} at 0% + matching buyer must be accepted; got {errs:?}"
+            );
+        }
+    }
+
+    /// ADR-0101 §4 — a wired kind with a NON-ZERO rate trips
+    /// `NonZeroPercentForExemptKind` (and NOT the numeric `LineItemVatRateUnknown`
+    /// — the kind branch is taken first, so the operator sees one precise
+    /// error). A reverse-charge / exempt line's VAT is always 0.
+    #[test]
+    fn wired_kind_with_nonzero_rate_rejected_non_zero_percent() {
+        use aberp_billing::VatRateKind::*;
+        for kind in [
+            AamExempt,
+            DomesticReverseCharge,
+            IntraCommunityGoods,
+            IntraCommunityServiceReverse,
+        ] {
+            let mut r = good_request();
+            r.lines[0].vat_rate_kind = kind;
+            r.lines[0].vat_rate_percent = 27; // contradiction: exempt kind + rate
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    InvoicePreflightError::NonZeroPercentForExemptKind { kind: k, actual: 27, .. }
+                        if *k == kind
+                )),
+                "wired kind {kind:?} + 27% must trip NonZeroPercentForExemptKind; got {errs:?}"
+            );
+            assert!(
+                !errs
+                    .iter()
+                    .any(|e| matches!(e, InvoicePreflightError::LineItemVatRateUnknown { .. })),
+                "the kind branch is taken first — LineItemVatRateUnknown must NOT co-fire; got {errs:?}"
+            );
+        }
+    }
+
+    /// ADR-0101 §4 — every NAMED-DEFERRED kind stays rejected (loud)
+    /// `VatRateKindNotSupportedYet`, at any rate. This is the closed-vocab
+    /// not-yet marker: no unconfirmed-code body reaches the wire.
+    #[test]
+    fn named_deferred_kinds_rejected_not_supported_yet() {
+        use aberp_billing::VatRateKind::*;
+        for kind in [
+            TamExempt,
+            ExportGoods,
+            OtherInternational,
+            NewTransportIntraCommunity,
+            OutOfScopeThirdCountry,
+            MarginScheme,
+            NoVatCharge,
+            VatContent,
+        ] {
+            for rate in [0u16, 27] {
+                let mut r = good_request();
+                r.lines[0].vat_rate_kind = kind;
+                r.lines[0].vat_rate_percent = rate;
+                let errs = validate_invoice_preflight(&r);
+                assert!(
+                    errs.iter().any(|e| matches!(
+                        e,
+                        InvoicePreflightError::VatRateKindNotSupportedYet { kind: k, .. }
+                            if *k == kind
+                    )),
+                    "named-deferred kind {kind:?} @ {rate}% must be rejected VatRateKindNotSupportedYet; got {errs:?}"
+                );
+            }
+        }
+    }
+
+    /// B4 / ADR-0103 (Defense) §4.3 — the `Err` arm of
+    /// `validate_community_vat_number` is UNTOUCHED by Invariant I.
+    ///
+    /// B4 changed what the function's `Ok` arm CARRIES (the normalised value,
+    /// previously discarded), never what it ADMITS. This pins that a
+    /// malformed number is still rejected, so the signature change opened no
+    /// new hole — and that a merely UN-NORMALISED but valid number is still
+    /// accepted, so the fix did not accidentally become verbatim-strict.
+    ///
+    /// ⚠ Asserted HERE, at the preflight boundary, and not through
+    /// `serve::issue_invoice_request` — because that function sits BELOW the
+    /// gate. `validate_invoice_preflight` runs in the route handler
+    /// (`serve.rs`), upstream of it, so an integration test entering at
+    /// `issue_invoice_request` bypasses preflight entirely. That is Invariant
+    /// P (B1 — universal gating), deferred on both the Defense and prod lines
+    /// (ADR-0103 §6.1); it is pre-existing and unrelated to B4, but it is why
+    /// this pin cannot live in `tests/serve_issue_route.rs`.
+    ///
+    /// MUTATION: make `validate_community_vat_number` return `Ok(normalized)`
+    /// unconditionally → the malformed half goes red.
+    #[test]
+    fn malformed_community_vat_still_rejected_after_b4_signature_change() {
+        // Malformed: `ZZ` is not an EU country prefix, so no amount of
+        // normalisation can rescue it.
+        let mut bad = good_request();
+        bad.customer.vat_status = CustomerVatStatus::Other;
+        bad.customer.tax_number = String::new();
+        bad.customer.community_vat_number = Some("zz 999 999".to_string());
+        bad.customer.address = Some(AddressJson {
+            country_code: "AT".to_string(),
+            ..good_customer_address()
+        });
+        let errs = validate_invoice_preflight(&bad);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InvoicePreflightError::CommunityVatNumberMalformed { .. })),
+            "a malformed community VAT number must still be rejected; got {errs:?}"
+        );
+
+        // Valid-but-un-normalised: spaces + lowercase is exactly how member
+        // states PUBLISH these, so it must be ACCEPTED (and normalised at
+        // ingest), not rejected. This is the half that would go red if B4
+        // had been implemented as verbatim-strict rejection.
+        let mut ok = good_request();
+        ok.customer.vat_status = CustomerVatStatus::Other;
+        ok.customer.tax_number = String::new();
+        ok.customer.community_vat_number = Some("at u123 45678".to_string());
+        ok.customer.address = Some(AddressJson {
+            country_code: "AT".to_string(),
+            ..good_customer_address()
+        });
+        let errs = validate_invoice_preflight(&ok);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, InvoicePreflightError::CommunityVatNumberMalformed { .. })),
+            "a VIES-style spaced/lowercase number is VALID and must not be \
+             rejected — it is normalised at ingest; got {errs:?}"
+        );
+    }
+
+    /// Mixed-kind guard — an invoice mixing a non-`Percent` kind with a
+    /// DIFFERENT kind trips `MixedVatRateKindsUnsupported`. A Percent line
+    /// beside an AAM line is a mix; two AAM lines are not.
+    ///
+    /// NOT because the summary emitter is single-bucket — it is not, since
+    /// ADR-0103 §4.1 widened the bucket key to `(kind, basis_points)`. The
+    /// guard is re-founded on ADR-0102 §4(a): the buyer-status ↔ line-kind
+    /// matrix is invoice-scoped, so two operative non-`Percent` kinds on one
+    /// invoice demand two incompatible `customerVatStatus` values at once.
+    /// See the re-founding comment at the guard itself.
+    #[test]
+    fn mixed_kinds_rejected_but_uniform_non_percent_accepted() {
+        use aberp_billing::VatRateKind::*;
+        // Percent line 0 + AAM line 1 → mix (line 1 differs from first).
+        let mut mixed = good_request();
+        mixed.lines = vec![good_line(), good_line()];
+        mixed.lines[1].vat_rate_kind = AamExempt;
+        mixed.lines[1].vat_rate_percent = 0;
+        let errs = validate_invoice_preflight(&mixed);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                InvoicePreflightError::MixedVatRateKindsUnsupported {
+                    line_index: 1,
+                    first_kind: Percent,
+                    other_kind: AamExempt,
+                }
+            )),
+            "Percent + AAM mix must trip MixedVatRateKindsUnsupported at line 1; got {errs:?}"
+        );
+
+        // Two AAM lines → uniform, accepted (no mix error).
+        let mut uniform = good_request();
+        uniform.lines = vec![good_line(), good_line()];
+        for l in uniform.lines.iter_mut() {
+            l.vat_rate_kind = AamExempt;
+            l.vat_rate_percent = 0;
+        }
+        let errs = validate_invoice_preflight(&uniform);
+        assert!(
+            errs.is_empty(),
+            "a uniform all-AAM invoice must be accepted; got {errs:?}"
+        );
+    }
+
+    /// The three ADR-0101 kind variants' discriminant + field_path route to
+    /// the per-line `vatRateKind` selector (the SPA renderer keys on the
+    /// first two) and the bilingual messages name the offending kind.
+    #[test]
+    fn adr0101_kind_variants_discriminant_field_path_and_messages() {
+        let nonzero = InvoicePreflightError::NonZeroPercentForExemptKind {
+            line_index: 2,
+            kind: aberp_billing::VatRateKind::AamExempt,
+            actual: 27,
+        };
+        assert_eq!(nonzero.kind(), "NonZeroPercentForExemptKind");
+        assert_eq!(nonzero.field_path(), "lines[2].vatRateKind");
+        assert!(nonzero.message_hu().contains("AamExempt"));
+        assert!(nonzero.message_en().contains("AamExempt"));
+
+        let deferred = InvoicePreflightError::VatRateKindNotSupportedYet {
+            line_index: 0,
+            kind: aberp_billing::VatRateKind::TamExempt,
+        };
+        assert_eq!(deferred.kind(), "VatRateKindNotSupportedYet");
+        assert_eq!(deferred.field_path(), "lines[0].vatRateKind");
+        assert!(deferred.message_hu().contains("TamExempt"));
+        assert!(deferred.message_en().contains("TamExempt"));
+
+        let mixed = InvoicePreflightError::MixedVatRateKindsUnsupported {
+            line_index: 1,
+            first_kind: aberp_billing::VatRateKind::Percent,
+            other_kind: aberp_billing::VatRateKind::AamExempt,
+        };
+        assert_eq!(mixed.kind(), "MixedVatRateKindsUnsupported");
+        assert_eq!(mixed.field_path(), "lines[1].vatRateKind");
+        assert!(mixed.message_en().contains("AamExempt"));
+    }
+
+    /// The kind branch did not swallow the existing numeric gate: a
+    /// `Percent` line with an out-of-vocab rate still trips
+    /// `LineItemVatRateUnknown` (unchanged behaviour).
+    #[test]
+    fn percent_kind_still_numeric_gated() {
+        let mut r = good_request();
+        r.lines[0].vat_rate_kind = aberp_billing::VatRateKind::Percent;
+        r.lines[0].vat_rate_percent = 9; // not in {0,5,18,27}
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InvoicePreflightError::LineItemVatRateUnknown { .. })),
+            "Percent + out-of-vocab rate must still trip LineItemVatRateUnknown; got {errs:?}"
+        );
     }
 
     #[test]
@@ -962,6 +1685,7 @@ mod tests {
     fn collects_all_errors_in_one_pass_for_multi_failing_request() {
         let r = IssueInvoiceRequest {
             customer: CustomerJson {
+                community_vat_number: None,
                 vat_status: CustomerVatStatus::Domestic,
                 partner_id: None,
                 tax_number: "12345".to_string(), // malformed
@@ -974,6 +1698,7 @@ mod tests {
                     quantity: Decimal::ZERO,     // zero
                     unit_price: -1,              // negative
                     vat_rate_percent: 12,        // off-vocab
+                    vat_rate_kind: aberp_billing::VatRateKind::Percent,
                     note: None,
                     unit: None,
                 },
@@ -983,6 +1708,7 @@ mod tests {
                     quantity: Decimal::from(1),
                     unit_price: 10,
                     vat_rate_percent: 99, // off-vocab
+                    vat_rate_kind: aberp_billing::VatRateKind::Percent,
                     note: None,
                     unit: None,
                 },
@@ -1116,7 +1842,32 @@ mod tests {
             InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson {
                 actual: "12345678-1-42".to_string(),
             },
-            InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1,
+            // ADR-0102 — EU-partner customer type + cross-field matrix.
+            InvoicePreflightError::CustomerTaxNumberPresentForOther {
+                actual: "12345678-1-42".to_string(),
+            },
+            InvoicePreflightError::CommunityVatNumberMissing,
+            InvoicePreflightError::CommunityVatNumberMalformed {
+                actual: "ZZ1".to_string(),
+                reason: "bad".to_string(),
+            },
+            // NAV-adversarial FIX #1.
+            InvoicePreflightError::CustomerCountryCodeInvalid {
+                actual: "Austria".to_string(),
+                reason: "not alpha-2".to_string(),
+            },
+            InvoicePreflightError::VatKindRequiresOtherBuyer {
+                line_index: 0,
+                kind: VatRateKind::IntraCommunityGoods,
+                actual_status: CustomerVatStatus::Domestic,
+            },
+            // FIX #2 — DomesticReverseCharge is the only Domestic-required
+            // kind now (AAM is buyer-agnostic).
+            InvoicePreflightError::VatKindRequiresDomesticBuyer {
+                line_index: 0,
+                kind: VatRateKind::DomesticReverseCharge,
+                actual_status: CustomerVatStatus::Other,
+            },
         ];
         let kinds: std::collections::HashSet<&'static str> =
             variants.iter().map(|v| v.kind()).collect();
@@ -1188,7 +1939,30 @@ mod tests {
             InvoicePreflightError::CustomerTaxNumberPresentForPrivatePerson {
                 actual: "12345678-1-42".to_string(),
             },
-            InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1,
+            // ADR-0102 — EU-partner customer type + cross-field matrix.
+            InvoicePreflightError::CustomerTaxNumberPresentForOther {
+                actual: "12345678-1-42".to_string(),
+            },
+            InvoicePreflightError::CommunityVatNumberMissing,
+            InvoicePreflightError::CommunityVatNumberMalformed {
+                actual: "ZZ1".to_string(),
+                reason: "bad".to_string(),
+            },
+            // NAV-adversarial FIX #1.
+            InvoicePreflightError::CustomerCountryCodeInvalid {
+                actual: "Austria".to_string(),
+                reason: "not alpha-2".to_string(),
+            },
+            InvoicePreflightError::VatKindRequiresOtherBuyer {
+                line_index: 0,
+                kind: VatRateKind::IntraCommunityGoods,
+                actual_status: CustomerVatStatus::Domestic,
+            },
+            InvoicePreflightError::VatKindRequiresDomesticBuyer {
+                line_index: 0,
+                kind: VatRateKind::DomesticReverseCharge,
+                actual_status: CustomerVatStatus::Other,
+            },
         ];
         for v in variants {
             assert!(!v.message_hu().is_empty(), "HU missing for {v:?}");
@@ -1391,19 +2165,279 @@ mod tests {
         );
     }
 
-    /// Other buyer kind surfaces the v1 named-deferral error pointing
-    /// at the radio. The SPA's PartnerForm disables the Külföldi
-    /// option, but a wire body still carrying Other (CLI / integration
-    /// test) must not be silently malformed.
+    /// ADR-0102 — an `Other` buyer with a stray HU tax number and no EU
+    /// VAT number surfaces BOTH the tax-number-forbidden and the
+    /// community-VAT-missing errors (the two `Other`-completeness rules).
+    /// `good_request()` carries a Domestic tax number + no community VAT,
+    /// so flipping to Other trips both.
     #[test]
-    fn fires_customer_vat_status_other_not_supported_v1() {
+    fn other_buyer_without_eu_vat_and_with_hu_tax_fires_both_rules() {
         let mut r = good_request();
         r.customer.vat_status = CustomerVatStatus::Other;
         let errs = validate_invoice_preflight(&r);
         assert!(
-            errs.contains(&InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1),
-            "expected CustomerVatStatusOtherNotSupportedV1, got {errs:?}"
+            errs.iter()
+                .any(|e| matches!(e, InvoicePreflightError::CommunityVatNumberMissing)),
+            "expected CommunityVatNumberMissing, got {errs:?}"
         );
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                InvoicePreflightError::CustomerTaxNumberPresentForOther { .. }
+            )),
+            "expected CustomerTaxNumberPresentForOther, got {errs:?}"
+        );
+    }
+
+    /// ADR-0102 — a fully-formed `Other` buyer (EU VAT number present +
+    /// valid, no HU tax number, address complete) passes preflight on a
+    /// plain `Percent` invoice (Percent is buyer-agnostic).
+    #[test]
+    fn well_formed_other_buyer_with_percent_line_passes() {
+        let mut r = good_request();
+        r.customer.vat_status = CustomerVatStatus::Other;
+        r.customer.tax_number = "".to_string();
+        r.customer.community_vat_number = Some("ATU12345678".to_string());
+        let errs = validate_invoice_preflight(&r);
+        assert!(errs.is_empty(), "expected no errors, got {errs:?}");
+    }
+
+    /// ADR-0102 — helper: a well-formed `Other` (EU) buyer.
+    fn make_other_buyer(r: &mut IssueInvoiceRequest) {
+        r.customer.vat_status = CustomerVatStatus::Other;
+        r.customer.tax_number = "".to_string();
+        r.customer.community_vat_number = Some("ATU12345678".to_string());
+    }
+
+    /// ADR-0102 §4(a) — THE CROSS-FIELD MATRIX. One row per compliance
+    /// case; the dangerous direction (EU-0 line + domestic buyer) MUST
+    /// reject, and the correct EU-0 assembly (EU-0 line + Other buyer +
+    /// EU VAT) MUST accept.
+    #[test]
+    fn cross_field_matrix_eu0_requires_other_buyer() {
+        use aberp_billing::VatRateKind::*;
+
+        // EU-0 goods + Domestic buyer → reject VatKindRequiresOtherBuyer.
+        for kind in [IntraCommunityGoods, IntraCommunityServiceReverse] {
+            let mut r = good_request();
+            r.lines[0].vat_rate_kind = kind;
+            r.lines[0].vat_rate_percent = 0;
+            // buyer stays Domestic (good_request default)
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    InvoicePreflightError::VatKindRequiresOtherBuyer { kind: k, .. } if *k == kind
+                )),
+                "{kind:?} + Domestic must fire VatKindRequiresOtherBuyer; got {errs:?}"
+            );
+        }
+
+        // EU-0 goods + Other buyer w/ EU VAT → accept.
+        for kind in [IntraCommunityGoods, IntraCommunityServiceReverse] {
+            let mut r = good_request();
+            make_other_buyer(&mut r);
+            r.lines[0].vat_rate_kind = kind;
+            r.lines[0].vat_rate_percent = 0;
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.is_empty(),
+                "{kind:?} + well-formed Other buyer must accept; got {errs:?}"
+            );
+        }
+    }
+
+    /// ADR-0102 §4(a) — `DomesticReverseCharge` REQUIRES a Domestic buyer
+    /// (§142 belföldi = two domestic taxable persons); pairing it with an
+    /// `Other` buyer rejects. DRC + Domestic accepts (happy path).
+    #[test]
+    fn cross_field_matrix_domestic_reverse_charge_requires_domestic_buyer() {
+        use aberp_billing::VatRateKind::*;
+
+        // DRC + Other buyer → reject VatKindRequiresDomesticBuyer.
+        let mut r = good_request();
+        make_other_buyer(&mut r);
+        r.lines[0].vat_rate_kind = DomesticReverseCharge;
+        r.lines[0].vat_rate_percent = 0;
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                InvoicePreflightError::VatKindRequiresDomesticBuyer {
+                    kind: DomesticReverseCharge,
+                    ..
+                }
+            )),
+            "DRC + Other must fire VatKindRequiresDomesticBuyer; got {errs:?}"
+        );
+
+        // DRC + Domestic buyer → accept (the happy path stays green).
+        let mut r = good_request();
+        r.lines[0].vat_rate_kind = DomesticReverseCharge;
+        r.lines[0].vat_rate_percent = 0;
+        let errs = validate_invoice_preflight(&r);
+        assert!(errs.is_empty(), "DRC + Domestic must accept; got {errs:?}");
+    }
+
+    /// NAV-adversarial FIX #2 (2026-07-16) — `AamExempt` (AAM, alanyi
+    /// adómentesség §187) is a SELLER-side exemption: NAV binds NO
+    /// customerVatStatus to it, so AAM must be BUYER-AGNOSTIC (like
+    /// `Percent`). The previous strict "AAM requires Domestic" wrongly
+    /// blocked the common exempt-small-business cases. This pins that AAM
+    /// now ACCEPTS against Domestic, PrivatePerson, AND Other buyers, and
+    /// NEVER fires `VatKindRequiresDomesticBuyer`.
+    #[test]
+    fn aam_is_buyer_agnostic() {
+        use aberp_billing::VatRateKind::*;
+
+        // AAM + Domestic → accept.
+        let mut r = good_request();
+        r.lines[0].vat_rate_kind = AamExempt;
+        r.lines[0].vat_rate_percent = 0;
+        let errs = validate_invoice_preflight(&r);
+        assert!(errs.is_empty(), "AAM + Domestic must accept; got {errs:?}");
+
+        // AAM + PrivatePerson → accept (the headline legitimate case:
+        // exempt small business invoicing a magánszemély). PrivatePerson
+        // forbids a tax number, so clear it.
+        let mut r = good_request();
+        r.customer.vat_status = CustomerVatStatus::PrivatePerson;
+        r.customer.tax_number = "".to_string();
+        r.lines[0].vat_rate_kind = AamExempt;
+        r.lines[0].vat_rate_percent = 0;
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.is_empty(),
+            "AAM + PrivatePerson must accept (FIX #2); got {errs:?}"
+        );
+
+        // AAM + Other (well-formed EU buyer) → accept.
+        let mut r = good_request();
+        make_other_buyer(&mut r);
+        r.lines[0].vat_rate_kind = AamExempt;
+        r.lines[0].vat_rate_percent = 0;
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.is_empty(),
+            "AAM + Other must accept (FIX #2); got {errs:?}"
+        );
+
+        // Across every buyer status, AAM must NEVER fire the domestic-buyer
+        // requirement (the exact bug FIX #2 removes).
+        for status in [
+            CustomerVatStatus::Domestic,
+            CustomerVatStatus::PrivatePerson,
+            CustomerVatStatus::Other,
+        ] {
+            let mut r = good_request();
+            match status {
+                CustomerVatStatus::Other => make_other_buyer(&mut r),
+                CustomerVatStatus::PrivatePerson => {
+                    r.customer.vat_status = status;
+                    r.customer.tax_number = "".to_string();
+                }
+                CustomerVatStatus::Domestic => {}
+            }
+            r.lines[0].vat_rate_kind = AamExempt;
+            r.lines[0].vat_rate_percent = 0;
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                !errs.iter().any(|e| matches!(
+                    e,
+                    InvoicePreflightError::VatKindRequiresDomesticBuyer { .. }
+                )),
+                "AAM must never fire VatKindRequiresDomesticBuyer ({status:?}); got {errs:?}"
+            );
+        }
+    }
+
+    /// ADR-0102 §4(b) — an `Other` buyer with a malformed EU VAT number
+    /// fires `CommunityVatNumberMalformed` (structural VIES shape).
+    #[test]
+    fn other_buyer_with_malformed_eu_vat_rejects() {
+        let mut r = good_request();
+        r.customer.vat_status = CustomerVatStatus::Other;
+        r.customer.tax_number = "".to_string();
+        r.customer.community_vat_number = Some("ZZ99".to_string());
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InvoicePreflightError::CommunityVatNumberMalformed { .. })),
+            "malformed EU VAT must fire CommunityVatNumberMalformed; got {errs:?}"
+        );
+    }
+
+    /// NAV-adversarial FIX #1 — an `Other` (foreign-EU) buyer whose
+    /// address `country_code` is a full country NAME (the "Austria" /
+    /// "Ausztria" partner-record case) fires `CustomerCountryCodeInvalid`
+    /// at preflight rather than bouncing at NAV. A well-formed alpha-2
+    /// code (`AT`) does NOT fire it.
+    #[test]
+    fn other_buyer_with_country_name_fires_country_code_invalid() {
+        // Country NAME → reject.
+        for bad in ["Austria", "Ausztria", "at"] {
+            let mut r = good_request();
+            make_other_buyer(&mut r);
+            r.lines[0].vat_rate_kind = aberp_billing::VatRateKind::IntraCommunityGoods;
+            r.lines[0].vat_rate_percent = 0;
+            r.customer.address.as_mut().unwrap().country_code = bad.to_string();
+            let errs = validate_invoice_preflight(&r);
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    InvoicePreflightError::CustomerCountryCodeInvalid { actual, .. } if actual == bad
+                )),
+                "Other buyer with country `{bad}` must fire CustomerCountryCodeInvalid; got {errs:?}"
+            );
+        }
+
+        // Valid alpha-2 → no country-code error (the happy EU-0 path).
+        let mut r = good_request();
+        make_other_buyer(&mut r);
+        r.lines[0].vat_rate_kind = aberp_billing::VatRateKind::IntraCommunityGoods;
+        r.lines[0].vat_rate_percent = 0;
+        r.customer.address.as_mut().unwrap().country_code = "AT".to_string();
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, InvoicePreflightError::CustomerCountryCodeInvalid { .. })),
+            "Other buyer with country `AT` must NOT fire CustomerCountryCodeInvalid; got {errs:?}"
+        );
+    }
+
+    /// NAV-adversarial FIX #1 — the country-code guard is scoped to
+    /// `Other` buyers ONLY (backward-compat): a Domestic buyer with a
+    /// non-alpha-2 country in the address does NOT fire
+    /// `CustomerCountryCodeInvalid` (Domestic buyers are HU-forced by the
+    /// SPA; guarding them would be an out-of-scope behaviour change).
+    #[test]
+    fn domestic_buyer_country_code_not_guarded() {
+        let mut r = good_request();
+        // Domestic (good_request default) with a full country name.
+        r.customer.address.as_mut().unwrap().country_code = "Hungary".to_string();
+        let errs = validate_invoice_preflight(&r);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, InvoicePreflightError::CustomerCountryCodeInvalid { .. })),
+            "Domestic buyer must NOT be country-code-guarded (FIX #1 is Other-only); got {errs:?}"
+        );
+    }
+
+    /// NAV-adversarial FIX #1 — the country-code variant routes to the
+    /// address country input and its bilingual messages name the offending
+    /// value.
+    #[test]
+    fn country_code_invalid_field_path_and_messages() {
+        let e = InvoicePreflightError::CustomerCountryCodeInvalid {
+            actual: "Austria".to_string(),
+            reason: "not alpha-2".to_string(),
+        };
+        assert_eq!(e.kind(), "CustomerCountryCodeInvalid");
+        assert_eq!(e.field_path(), "customer.address.countryCode");
+        assert!(e.message_hu().contains("Austria"));
+        assert!(e.message_en().contains("Austria"));
     }
 
     /// Domestic buyer's pre-PR-97 invariants still hold — sanity pin
@@ -1499,7 +2533,28 @@ mod tests {
             };
         assert_eq!(private_person_with_tax.field_path(), "customer.taxNumber");
 
-        let other = InvoicePreflightError::CustomerVatStatusOtherNotSupportedV1;
-        assert_eq!(other.field_path(), "customer.vatStatus");
+        // ADR-0102 — the community-VAT variants route to the EU-VAT
+        // input; the cross-field kind↔buyer mismatches route to the
+        // buyer-type control (the fix is on the buyer side).
+        let missing_eu_vat = InvoicePreflightError::CommunityVatNumberMissing;
+        assert_eq!(missing_eu_vat.field_path(), "customer.communityVatNumber");
+
+        let malformed_eu_vat = InvoicePreflightError::CommunityVatNumberMalformed {
+            actual: "ZZ1".to_string(),
+            reason: "bad".to_string(),
+        };
+        assert_eq!(malformed_eu_vat.field_path(), "customer.communityVatNumber");
+
+        let eu_tax_present = InvoicePreflightError::CustomerTaxNumberPresentForOther {
+            actual: "x".to_string(),
+        };
+        assert_eq!(eu_tax_present.field_path(), "customer.taxNumber");
+
+        let needs_other = InvoicePreflightError::VatKindRequiresOtherBuyer {
+            line_index: 0,
+            kind: VatRateKind::IntraCommunityGoods,
+            actual_status: CustomerVatStatus::Domestic,
+        };
+        assert_eq!(needs_other.field_path(), "customer.vatStatus");
     }
 }

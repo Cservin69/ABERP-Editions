@@ -98,6 +98,7 @@ fn build_allocate_args(series_id: SeriesId) -> AllocateArgs {
                 quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(1_000),
                 vat_rate_basis_points: 2700,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             }],

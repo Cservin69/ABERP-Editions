@@ -26,7 +26,7 @@ use aberp::nav_xml::{
 };
 use aberp_billing::{
     Currency, CustomerId, Huf, InvoiceId, LineItem, NavUnitOfMeasure, PaymentMethod, ProductUnit,
-    ReadyInvoice, SeriesCode, SeriesId,
+    ReadyInvoice, SeriesCode, SeriesId, VatRateKind,
 };
 use aberp_nav_xsd_validator::{validate_invoice_data, NAV_XSD_VERSION};
 use time::OffsetDateTime;
@@ -48,6 +48,7 @@ fn build_minimal_storno_invoice() -> ReadyInvoice {
             // `nav_xml::render_storno_data` doc comment.
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }],
@@ -71,6 +72,7 @@ fn minimal_parties() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
             // Domestic posture for legacy test fixtures.
             customer_vat_status: CustomerVatStatus::Domestic,
@@ -344,6 +346,7 @@ fn minimal_parties_private_person() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // S154 / ADR-0048 — PRIVATE_PERSON buyers carry NO tax number
             // (NAV business rule INVALID_CUSTOMER_VAT_STATUS rejects
             // `<customerVatData>` for PRIVATE_PERSON) and NO address
@@ -529,6 +532,7 @@ fn read_invoice_number_from_xml_round_trips_across_emit_shapes() {
                 quantity: rust_decimal::Decimal::from(1),
                 unit_price: Huf(1000),
                 vat_rate_basis_points: 2700,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
                 note: None,
                 unit: None,
             }],
@@ -804,6 +808,7 @@ fn storno_line_operation_is_create_across_input_variations() {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -812,6 +817,7 @@ fn storno_line_operation_is_create_across_input_variations() {
             quantity: rust_decimal::Decimal::from(2),
             unit_price: Huf(500),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -820,6 +826,7 @@ fn storno_line_operation_is_create_across_input_variations() {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(123),
             vat_rate_basis_points: 0,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -871,6 +878,7 @@ fn build_storno_invoice_with_lines(n: usize) -> ReadyInvoice {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         })
@@ -1107,6 +1115,7 @@ fn read_invoice_lines_from_xml_round_trips_through_re_render() {
             quantity: rust_decimal::Decimal::from(3),
             unit_price: Huf(1234),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -1115,6 +1124,7 @@ fn read_invoice_lines_from_xml_round_trips_through_re_render() {
             quantity: rust_decimal::Decimal::new(15, 1), // 1.5
             unit_price: Huf(800),
             vat_rate_basis_points: 500, // 5%
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: Some(ProductUnit::Nav(NavUnitOfMeasure::Day)),
         },
@@ -1123,6 +1133,7 @@ fn read_invoice_lines_from_xml_round_trips_through_re_render() {
             quantity: rust_decimal::Decimal::from(2),
             unit_price: Huf(50),
             vat_rate_basis_points: 0,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: Some(ProductUnit::Own("liter@15C".to_string())),
         },
@@ -1170,6 +1181,119 @@ fn read_invoice_lines_from_xml_round_trips_through_re_render() {
         extract_lines(&xml),
         extract_lines(&re_xml),
         "parsed → re-rendered <invoiceLines> must be byte-identical (S384/F5)"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// ADR-0101 (Session 2) — the storno-of-NEW-KIND fold. Render an invoice
+/// carrying each of the four WIRED non-`Percent` kinds (one line each, all
+/// 0%), parse the lines back, and assert `read_invoice_lines_from_xml`
+/// reconstructs the exact `VatRateKind` from the `<lineVatRate>` choice
+/// element (was hardcoded `Percent` behind the Session-1 shut door). The
+/// re-render byte-equality proves a storno of such an invoice reverses the
+/// SAME choice element NAV recorded — not a stale `<vatPercentage>0.00`.
+/// This is the Session-1 flag #3 fix.
+#[test]
+fn read_invoice_lines_reconstructs_wired_vat_rate_kinds() {
+    use ulid::Ulid;
+
+    let scratch = std::env::temp_dir().join(format!("aberp-adr0101-fold-{}", Ulid::new()));
+    std::fs::create_dir_all(&scratch).expect("create scratch dir");
+
+    // One line per wired kind, all 0% (exempt / reverse-charge line VAT is
+    // 0). Mixed kinds in one body is fine for the LINE round-trip — the
+    // preflight mixed-kind guard is a separate concern; render_invoice_data
+    // does not preflight.
+    let kinds = [
+        VatRateKind::AamExempt,
+        VatRateKind::DomesticReverseCharge,
+        VatRateKind::IntraCommunityGoods,
+        VatRateKind::IntraCommunityServiceReverse,
+    ];
+    let mut invoice = build_minimal_storno_invoice();
+    invoice.lines = kinds
+        .iter()
+        .enumerate()
+        .map(|(i, &kind)| LineItem {
+            description: format!("kind line {i}"),
+            quantity: rust_decimal::Decimal::from(1),
+            unit_price: Huf(1000),
+            vat_rate_basis_points: 0,
+            vat_rate_kind: kind,
+            note: None,
+            unit: None,
+        })
+        .collect();
+
+    let series = SeriesCode::new("INV-default".to_string()).unwrap();
+    let parties = minimal_parties();
+    let xml = nav_xml::render_invoice_data(&invoice, &series, &parties, Currency::Huf, None)
+        .expect("base renders");
+    let path = scratch.join(format!("{}.xml", Ulid::new()));
+    std::fs::write(&path, &xml).expect("write xml");
+
+    let parsed = nav_xml::read_invoice_lines_from_xml(&path).expect("parse lines back");
+    assert_eq!(parsed.len(), 4, "all four kind lines recovered");
+    for (i, &kind) in kinds.iter().enumerate() {
+        assert_eq!(
+            parsed[i].vat_rate_kind, kind,
+            "line {i} must reconstruct {kind:?} from its lineVatRate choice"
+        );
+        assert_eq!(
+            parsed[i].vat_rate_basis_points, 0,
+            "a non-Percent line folds back at 0% VAT"
+        );
+    }
+
+    // Re-render equality — a storno built from the folded lines emits the
+    // SAME choice elements byte-for-byte.
+    let mut re = build_minimal_storno_invoice();
+    re.lines = parsed;
+    let re_xml = nav_xml::render_invoice_data(&re, &series, &parties, Currency::Huf, None)
+        .expect("re-render from parsed lines");
+    let extract_lines = |b: &[u8]| {
+        let s = std::str::from_utf8(b).unwrap().to_string();
+        let start = s.find("<invoiceLines>").unwrap();
+        let end = s.find("</invoiceLines>").unwrap();
+        s[start..end].to_string()
+    };
+    assert_eq!(
+        extract_lines(&xml),
+        extract_lines(&re_xml),
+        "parsed → re-rendered <invoiceLines> must be byte-identical for the new kinds (ADR-0101)"
+    );
+
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// ADR-0101 — an UNRECOGNISED `<lineVatRate>` choice (an exemption case no
+/// wired kind emits) loud-fails the fold rather than silently defaulting to
+/// `Percent` or dropping the line (CLAUDE.md rule 11). Proves the
+/// reconstruction is strict where it must be.
+#[test]
+fn read_invoice_lines_loud_fails_on_unrecognised_choice() {
+    use ulid::Ulid;
+
+    let scratch = std::env::temp_dir().join(format!("aberp-adr0101-badfold-{}", Ulid::new()));
+    std::fs::create_dir_all(&scratch).expect("create scratch dir");
+    let path = scratch.join("bad.xml");
+    // A vatExemption with a case code (`TAM`) no WIRED kind maps to.
+    let body = "<InvoiceData><invoiceLines>\
+        <line><lineNumber>1</lineNumber><lineDescription>A</lineDescription>\
+        <quantity>1</quantity><unitOfMeasure>PIECE</unitOfMeasure>\
+        <unitPrice>1000</unitPrice><lineAmountsNormal>\
+        <lineVatRate><vatExemption><case>TAM</case><reason>x</reason></vatExemption></lineVatRate>\
+        </lineAmountsNormal></line>\
+        </invoiceLines></InvoiceData>";
+    std::fs::write(&path, body).unwrap();
+
+    let err = nav_xml::read_invoice_lines_from_xml(&path)
+        .expect_err("an unrecognised lineVatRate choice must loud-fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unrecognised") || msg.contains("VatRateKind"),
+        "loud-fail must name the reconstruction failure; got: {msg}"
     );
 
     let _ = std::fs::remove_dir_all(&scratch);
@@ -1224,6 +1348,7 @@ fn storno_render_reverses_base_plus_saved_modification_lines() {
         quantity: rust_decimal::Decimal::from(4),
         unit_price: Huf(250),
         vat_rate_basis_points: 2700,
+        vat_rate_kind: aberp_billing::VatRateKind::Percent,
         note: None,
         unit: None,
     });
@@ -1232,6 +1357,7 @@ fn storno_render_reverses_base_plus_saved_modification_lines() {
         quantity: rust_decimal::Decimal::from(7),
         unit_price: Huf(100),
         vat_rate_basis_points: 2700,
+        vat_rate_kind: aberp_billing::VatRateKind::Percent,
         note: None,
         unit: None,
     });

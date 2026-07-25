@@ -102,6 +102,7 @@ fn fixture_supplier() -> SupplierJson {
 
 fn fixture_customer() -> CustomerJson {
     CustomerJson {
+        community_vat_number: None,
         vat_status: CustomerVatStatus::Domestic,
         partner_id: None,
         tax_number: "87654321-2-13".to_string(),
@@ -121,6 +122,7 @@ fn fixture_lines() -> Vec<LineJson> {
         quantity: rust_decimal::Decimal::from(2),
         unit_price: 1000,
         vat_rate_percent: 27,
+        vat_rate_kind: aberp_billing::VatRateKind::Percent,
         note: None,
         unit: None,
     }]

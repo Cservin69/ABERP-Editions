@@ -88,6 +88,7 @@ fn fixture_ready_invoice() -> ReadyInvoice {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(9000),
             vat_rate_basis_points: 0,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }],

@@ -44,6 +44,7 @@ describe("composeModificationBody", () => {
           // 1200 forints (same wire output as pre-PR-88 `unitPriceMinor: 1200`).
           unitPriceInput: "1200",
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "",
         },
       ],
@@ -66,6 +67,10 @@ describe("composeModificationBody", () => {
           quantity: "3",
           unitPrice: 1200,
           vatRatePercent: 27,
+          // ADR-0101 — the ModificationInvoiceRequest wire body carries NO
+          // vatRateKind (the modification wire path does not thread the kind
+          // — see modification.ts FLAG); composeModificationBody must NOT
+          // emit it.
           // PR-82 — blank-after-trim ⇒ null on the wire.
           note: null,
         },
@@ -104,6 +109,7 @@ describe("composeModificationBody", () => {
           // here; using `"1"` makes the round-trip obvious.
           unitPriceInput: "1",
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "",
         },
       ],
@@ -143,6 +149,7 @@ describe("formFromIssuanceInput", () => {
           quantity: "2",
           unitPrice: 1000,
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "",
         },
         {
@@ -150,6 +157,7 @@ describe("formFromIssuanceInput", () => {
           quantity: "1",
           unitPrice: 5000,
           vatRatePercent: 5,
+          vatRateKind: "Percent" as const,
           note: "",
         },
       ],
@@ -171,6 +179,7 @@ describe("formFromIssuanceInput", () => {
         quantityInput: "2",
         unitPriceInput: "10.00",
         vatRatePercent: 27,
+        vatRateKind: "Percent" as const,
         note: "",
       },
       {
@@ -178,6 +187,7 @@ describe("formFromIssuanceInput", () => {
         quantityInput: "1",
         unitPriceInput: "50.00",
         vatRatePercent: 5,
+        vatRateKind: "Percent" as const,
         note: "",
       },
     ]);
@@ -212,6 +222,7 @@ describe("formFromIssuanceInput", () => {
           quantity: "1",
           unitPrice: 1234,
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "",
         },
       ],
@@ -247,6 +258,7 @@ describe("formFromIssuanceInput", () => {
           quantity: "1",
           unitPrice: 1,
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "",
         },
       ],

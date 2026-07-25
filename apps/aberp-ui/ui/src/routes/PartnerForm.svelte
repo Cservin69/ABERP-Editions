@@ -186,16 +186,16 @@
               />
               <span>Magánszemély / Natural person</span>
             </label>
-            <label class="radio radio--disabled">
+            <label class="radio">
               <input
                 type="radio"
                 name="customerVatStatus"
                 value="Other"
-                disabled
+                bind:group={form.customerVatStatus}
               />
               <span>
                 Külföldi / Foreign
-                <span class="field__hint">v2-ben jön / Coming in v2</span>
+                <span class="field__hint">EU-s vevő EU adószámmal / EU business (EU VAT)</span>
               </span>
             </label>
             {#if fieldErrors.customer_vat_status !== undefined}
@@ -217,7 +217,7 @@
                 {:else if form.customerVatStatus === "PrivatePerson"}
                   Magánszemély vevő esetén nem kell adószám / no tax number for natural persons
                 {:else}
-                  v2-ben jön / Coming in v2
+                  Külföldi vevőnél EU adószámot adjon meg (lent) / EU buyers: use the EU VAT number (below)
                 {/if}
               </span>
             </span>
@@ -264,17 +264,37 @@
             </select>
           </label>
 
+          <!-- ADR-0102 — EU community VAT number. REQUIRED + structurally
+               validated (backend `validate_community_vat_number`, VIES
+               shape) for an Other (foreign-EU) buyer; optional free-text
+               metadata for Domestic/PrivatePerson. This column is the
+               community-VAT source snapshotted onto issued invoices. -->
           <label class="field">
             <span class="field__label">
               EU VAT number
-              <span class="field__hint">optional</span>
+              {#if form.customerVatStatus === "Other"}
+                *
+              {/if}
+              <span class="field__hint">
+                {#if form.customerVatStatus === "Other"}
+                  kötelező — pl. ATU12345678 / required — e.g. ATU12345678
+                {:else}
+                  optional
+                {/if}
+              </span>
             </span>
             <input
               type="text"
               bind:value={form.euVatNumber}
               autocomplete="off"
               spellcheck="false"
+              required={form.customerVatStatus === "Other"}
+              placeholder="ATU12345678"
+              aria-invalid={fieldErrors.eu_vat_number !== undefined}
             />
+            {#if fieldErrors.eu_vat_number !== undefined}
+              <span class="field__error">{fieldErrors.eu_vat_number}</span>
+            {/if}
           </label>
 
           <!-- Session-150 — bilingual (HU primary) address block. All
@@ -543,11 +563,6 @@
     font-size: var(--type-size-sm);
     color: var(--color-text-strong);
     cursor: pointer;
-  }
-
-  .radio--disabled {
-    color: var(--color-text-muted);
-    cursor: not-allowed;
   }
 
   .field input[aria-invalid="true"] {

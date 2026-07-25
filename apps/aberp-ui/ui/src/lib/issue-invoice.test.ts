@@ -16,6 +16,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   applyProductPick,
+  applyVatKind,
   cannotIssueDueToBank,
   composeIssueInvoiceBody,
   deliveryDateOverrideFor,
@@ -26,10 +27,13 @@ import {
   paymentDeadlineFromOffset,
   resolveBankForCurrency,
   targetForFieldPath,
+  vatKindBuyerMismatch,
+  VAT_KIND_OPTIONS,
+  vatKindLocksRate,
   type InvoicePreflightErrorKind,
   type IssueInvoiceFormState,
 } from "./issue-invoice";
-import type { Product, SellerBankResponse } from "./api";
+import type { Product, SellerBankResponse, VatRateKindBody } from "./api";
 
 describe("composeIssueInvoiceBody", () => {
   it("reshapes HUF form state into the wire body verbatim", () => {
@@ -51,6 +55,7 @@ describe("composeIssueInvoiceBody", () => {
           // `unitPriceMinor: 1000` posture.
           unitPriceInput: "1000",
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "",
         },
       ],
@@ -80,6 +85,7 @@ describe("composeIssueInvoiceBody", () => {
           quantity: "2",
           unitPrice: 1000,
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           // PR-82 — blank line note normalises to `null` on the wire
           // so the backend sees a clean "no note" signal.
           note: null,
@@ -146,6 +152,7 @@ describe("composeIssueInvoiceBody", () => {
           quantityInput: "1.5",
           unitPriceInput: "1000",
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "",
         },
       ],
@@ -170,6 +177,7 @@ describe("composeIssueInvoiceBody", () => {
           quantityInput: "",
           unitPriceInput: "1000",
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "",
         },
       ],
@@ -277,6 +285,7 @@ describe("composeIssueInvoiceBody", () => {
           quantityInput: "1",
           unitPriceInput: "1000",
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "Please ship to dock B",
         },
       ],
@@ -301,6 +310,7 @@ describe("composeIssueInvoiceBody", () => {
           quantityInput: "1",
           unitPriceInput: "100",
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "  ",
         },
       ],
@@ -322,6 +332,7 @@ describe("composeIssueInvoiceBody", () => {
           quantityInput: "1",
           unitPriceInput: "100",
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "  Line A note  ",
         },
       ],
@@ -361,6 +372,7 @@ describe("composeIssueInvoiceBody", () => {
           // what's on the invoice, the parser converts."
           unitPriceInput: "125.00",
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "",
         },
       ],
@@ -374,6 +386,7 @@ describe("composeIssueInvoiceBody", () => {
       quantity: "8",
       unitPrice: 12500,
       vatRatePercent: 27,
+      vatRateKind: "Percent" as const,
       // PR-82 — blank-after-trim ⇒ null on the wire.
       note: null,
       // S159 — no product picked ⇒ unit null ⇒ PIECE fallback.
@@ -398,6 +411,7 @@ describe("composeIssueInvoiceBody", () => {
           quantityInput: "1",
           unitPriceInput: "500",
           vatRatePercent: 27,
+          vatRateKind: "Percent" as const,
           note: "",
         },
       ],
@@ -485,9 +499,9 @@ describe("composeIssueInvoiceBody", () => {
       customerTaxNumber: "y",
       currency: "HUF" as const,
       lines: [
-        { description: "A", quantityInput: "1", unitPriceInput: "100", vatRatePercent: 27, note: "" },
-        { description: "B", quantityInput: "2", unitPriceInput: "200", vatRatePercent: 5, note: "" },
-        { description: "C", quantityInput: "3", unitPriceInput: "300", vatRatePercent: 0, note: "" },
+        { description: "A", quantityInput: "1", unitPriceInput: "100", vatRatePercent: 27, vatRateKind: "Percent" as const, note: "" },
+        { description: "B", quantityInput: "2", unitPriceInput: "200", vatRatePercent: 5, vatRateKind: "Percent" as const, note: "" },
+        { description: "C", quantityInput: "3", unitPriceInput: "300", vatRatePercent: 0, vatRateKind: "Percent" as const, note: "" },
       ],
     };
 
@@ -515,6 +529,7 @@ describe("composeIssueInvoiceBody", () => {
             quantityInput: "2",
             unitPriceInput: "1000",
             vatRatePercent: 27,
+            vatRateKind: "Percent" as const,
             note: "",
             unit: { kind: "Nav", value: "LITER" },
           },
@@ -534,6 +549,7 @@ describe("composeIssueInvoiceBody", () => {
             quantityInput: "2",
             unitPriceInput: "1000",
             vatRatePercent: 27,
+            vatRateKind: "Percent" as const,
             note: "",
             unit: { kind: "Own", value: "liter@15C" },
           },
@@ -553,6 +569,7 @@ describe("composeIssueInvoiceBody", () => {
             quantityInput: "1",
             unitPriceInput: "100",
             vatRatePercent: 27,
+            vatRateKind: "Percent" as const,
             note: "",
           },
         ],
@@ -600,17 +617,30 @@ describe("composeIssueInvoiceBody", () => {
       expect(body.customer.name).not.toBe("");
     });
 
-    it("emits vatStatus=Other if the form somehow carries it (preflight gate behind)", () => {
+    it("emits vatStatus=Other + communityVatNumber for an Other (EU) buyer", () => {
       const body = composeIssueInvoiceBody({
         ...emptyForm(),
         customerVatStatus: "Other",
         customerName: "Foreign Buyer",
         customerTaxNumber: "",
+        customerCommunityVatNumber: "ATU12345678",
       });
-      // The composer is pure — Other passes through here so the
-      // backend's preflight can surface the typed
-      // CustomerVatStatusOtherNotSupportedV1 error.
+      // ADR-0102 — the composer snapshots the EU VAT number onto the
+      // wire body for Other buyers; the backend preflight requires +
+      // validates it.
       expect(body.customer.vatStatus).toBe("Other");
+      expect(body.customer.communityVatNumber).toBe("ATU12345678");
+    });
+
+    it("omits communityVatNumber for a non-Other buyer", () => {
+      const body = composeIssueInvoiceBody({
+        ...emptyForm(),
+        customerVatStatus: "Domestic",
+        customerCommunityVatNumber: "ATU12345678",
+      });
+      // ADR-0102 — the number rides on the wire ONLY for Other buyers,
+      // so a Domestic body stays byte-identical (undefined → serde None).
+      expect(body.customer.communityVatNumber).toBeUndefined();
     });
   });
 });
@@ -750,11 +780,18 @@ describe("parseInvoicePreflightErrors — per-variant rendering pins", () => {
       message_en:
         "A private-person buyer must not carry a tax number (got `12345678-2-13`).",
     },
+    // ADR-0102 — EU-partner (Other) customer type + cross-field matrix.
     {
-      kind: "CustomerVatStatusOtherNotSupportedV1",
+      kind: "CommunityVatNumberMissing",
+      field_path: "customer.communityVatNumber",
+      message_hu: "Külföldi (OTHER) vevőhöz kötelező az EU adószám.",
+      message_en: "Foreign-EU (OTHER) buyers require an EU VAT number.",
+    },
+    {
+      kind: "VatKindRequiresOtherBuyer",
       field_path: "customer.vatStatus",
-      message_hu: "Külföldi (OTHER) vevő kibocsátása későbbi verzióban érkezik.",
-      message_en: "Foreign (OTHER) buyer issuance lands in a later version.",
+      message_hu: "A(z) 1. sor ÁFA-típusa külföldi EU-s vevőt igényel.",
+      message_en: "Line 1 VAT type requires a foreign-EU buyer.",
     },
     {
       kind: "InvoiceLinesEmpty",
@@ -789,6 +826,34 @@ describe("parseInvoicePreflightErrors — per-variant rendering pins", () => {
         "A(z) 1. tételsor ÁFA-kulcsa (12%) nem szerepel a magyar szabványos kulcsok között (0%, 5%, 18%, 27%). Speciális kategóriák (AAM/TAM/TAH) jelenleg nem támogatottak.",
       message_en:
         "Line 1 VAT rate (12%) is not a Hungarian standard rate (allowed: 0%, 5%, 18%, 27%). Special categories (AAM/TAM/TAH) are not supported on this wire shape today.",
+    },
+    // ADR-0101 (Session 2) — the three per-line VAT rate-kind variants. All
+    // route to `lines[N].vatRateKind`. Adding them here proves
+    // `isKnownPreflightKind` recognises them (a regression that dropped one
+    // would surface as `null` from the parser).
+    {
+      kind: "NonZeroPercentForExemptKind",
+      field_path: "lines[0].vatRateKind",
+      message_hu:
+        "A(z) 1. tételsor ÁFA-típusa (AamExempt) adómentes / fordított adózású, ezért az ÁFA-kulcs kötelezően 0% (kapott: 27%).",
+      message_en:
+        "Line 1 VAT kind (AamExempt) is exempt / reverse-charge, so its VAT rate must be 0% (got 27%).",
+    },
+    {
+      kind: "VatRateKindNotSupportedYet",
+      field_path: "lines[0].vatRateKind",
+      message_hu:
+        "A(z) 1. tételsor ÁFA-típusa (TamExempt) még nincs bekötve (ADR-0101 named-deferred).",
+      message_en:
+        "Line 1 VAT kind (TamExempt) is not wired yet (ADR-0101 named-deferred).",
+    },
+    {
+      kind: "MixedVatRateKindsUnsupported",
+      field_path: "lines[1].vatRateKind",
+      message_hu:
+        "A(z) 2. tételsor ÁFA-típusa (AamExempt) eltér a számla első tételsorának típusától (Percent).",
+      message_en:
+        "Line 2 VAT kind (AamExempt) differs from the invoice's first line kind (Percent).",
     },
     // PR-73 / ADR-0040 §addendum — bank-related variants.
     {
@@ -974,6 +1039,14 @@ describe("targetForFieldPath — closed-vocab router", () => {
       lineIndex: 7,
       field: "quantity",
     });
+    // ADR-0101 — the per-line VAT-type selector path the three kind-level
+    // preflight errors route to. The Session-1 flag was that the discriminant
+    // union / router did NOT know this path; this pin proves it now does.
+    expect(targetForFieldPath("lines[5].vatRateKind")).toEqual({
+      kind: "line",
+      lineIndex: 5,
+      field: "vatRateKind",
+    });
   });
 
   it("returns null for paths outside the closed-vocab (forward-compat fallback)", () => {
@@ -992,6 +1065,42 @@ describe("targetForFieldPath — closed-vocab router", () => {
     expect(targetForFieldPath("bankAccountId")).toEqual({
       kind: "bankAccountId",
     });
+  });
+
+  // ADR-0102 — EU community VAT input + buyer-type control routing.
+  it("routes the ADR-0102 customer paths", () => {
+    expect(targetForFieldPath("customer.communityVatNumber")).toEqual({
+      kind: "customer",
+      field: "communityVatNumber",
+    });
+    expect(targetForFieldPath("customer.vatStatus")).toEqual({
+      kind: "customer",
+      field: "vatStatus",
+    });
+  });
+});
+
+// ADR-0102 — cross-field kind↔buyer guidance helper.
+describe("vatKindBuyerMismatch — cross-field guidance", () => {
+  it("flags an EU-0 kind against a non-Other buyer", () => {
+    expect(vatKindBuyerMismatch("IntraCommunityGoods", "Domestic")).not.toBeNull();
+    expect(
+      vatKindBuyerMismatch("IntraCommunityServiceReverse", "PrivatePerson"),
+    ).not.toBeNull();
+    // ...and clears once the buyer is Other.
+    expect(vatKindBuyerMismatch("IntraCommunityGoods", "Other")).toBeNull();
+  });
+
+  it("flags a domestic kind against a non-Domestic buyer", () => {
+    expect(vatKindBuyerMismatch("AamExempt", "Other")).not.toBeNull();
+    expect(vatKindBuyerMismatch("DomesticReverseCharge", "Other")).not.toBeNull();
+    expect(vatKindBuyerMismatch("AamExempt", "Domestic")).toBeNull();
+  });
+
+  it("never flags Percent (buyer-agnostic)", () => {
+    for (const s of ["Domestic", "PrivatePerson", "Other"] as const) {
+      expect(vatKindBuyerMismatch("Percent", s)).toBeNull();
+    }
   });
 });
 
@@ -1466,5 +1575,121 @@ describe("S406 journey — pick EUR product, override to HUF, compose", () => {
     expect(body.bankAccountId).toBe(HUF_BANK.id);
     expect(body.lines[0].description).toBe("Konzultáció");
     expect(body.lines[0].unit).toEqual({ kind: "Nav", value: "HOUR" });
+  });
+});
+
+// ADR-0101 (Session 2) — the per-line VAT rate-kind selector + composer.
+describe("ADR-0101 — VAT rate-kind selector", () => {
+  const NON_PERCENT: VatRateKindBody[] = [
+    "AamExempt",
+    "DomesticReverseCharge",
+    "IntraCommunityGoods",
+    "IntraCommunityServiceReverse",
+  ];
+
+  it("VAT_KIND_OPTIONS exposes exactly the five selectable kinds, Percent first", () => {
+    expect(VAT_KIND_OPTIONS.map((o) => o.value)).toEqual([
+      "Percent",
+      "AamExempt",
+      "DomesticReverseCharge",
+      "IntraCommunityGoods",
+      "IntraCommunityServiceReverse",
+    ]);
+    // Every option carries a bilingual label + hint (HÜLYE-BIZTOS — the
+    // operator never sees a bare code with no explanation).
+    for (const o of VAT_KIND_OPTIONS) {
+      expect(o.labelHu.length).toBeGreaterThan(0);
+      expect(o.labelEn.length).toBeGreaterThan(0);
+      expect(o.hintHu.length).toBeGreaterThan(0);
+      expect(o.hintEn.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("vatKindLocksRate is true for every non-Percent kind, false for Percent", () => {
+    expect(vatKindLocksRate("Percent")).toBe(false);
+    for (const k of NON_PERCENT) {
+      expect(vatKindLocksRate(k)).toBe(true);
+    }
+  });
+
+  it("applyVatKind locks the rate to 0 for a non-Percent kind", () => {
+    for (const k of NON_PERCENT) {
+      // Start from a 27% line, pick the exempt/reverse kind → rate forced 0.
+      const form = emptyForm(); // one line, vatRatePercent 27, kind Percent
+      const next = applyVatKind(form, 0, k);
+      expect(next.lines[0].vatRateKind).toBe(k);
+      expect(next.lines[0].vatRatePercent).toBe(0);
+      // Purity — the input form is untouched.
+      expect(form.lines[0].vatRateKind).toBe("Percent");
+      expect(form.lines[0].vatRatePercent).toBe(27);
+    }
+  });
+
+  it("applyVatKind restores the standard 27% when switching back to Percent from a locked 0", () => {
+    let form = emptyForm();
+    form = applyVatKind(form, 0, "AamExempt"); // rate now locked to 0
+    expect(form.lines[0].vatRatePercent).toBe(0);
+    form = applyVatKind(form, 0, "Percent"); // unlock — restore 27
+    expect(form.lines[0].vatRateKind).toBe("Percent");
+    expect(form.lines[0].vatRatePercent).toBe(27);
+  });
+
+  it("applyVatKind preserves a non-zero Percent rate when re-selecting Percent", () => {
+    // A Percent line the operator set to 5% must not be bumped to 27 by a
+    // no-op Percent re-select.
+    let form = emptyForm();
+    form = { ...form, lines: [{ ...form.lines[0], vatRatePercent: 5 }] };
+    form = applyVatKind(form, 0, "Percent");
+    expect(form.lines[0].vatRatePercent).toBe(5);
+  });
+
+  it("applyVatKind only touches the targeted line", () => {
+    let form = emptyForm();
+    form = { ...form, lines: [form.lines[0], { ...emptyForm().lines[0] }] };
+    form = applyVatKind(form, 1, "DomesticReverseCharge");
+    expect(form.lines[0].vatRateKind).toBe("Percent");
+    expect(form.lines[0].vatRatePercent).toBe(27);
+    expect(form.lines[1].vatRateKind).toBe("DomesticReverseCharge");
+    expect(form.lines[1].vatRatePercent).toBe(0);
+  });
+
+  it("composeIssueInvoiceBody emits vatRateKind and forces rate 0 for non-Percent", () => {
+    for (const k of NON_PERCENT) {
+      // Even if a stale non-zero rate slipped past the UI lock, the composer
+      // force-zeroes it (defence in depth).
+      const form = {
+        ...emptyForm(),
+        lines: [
+          {
+            ...emptyForm().lines[0],
+            description: "svc",
+            unitPriceInput: "1000",
+            vatRateKind: k,
+            vatRatePercent: 27, // deliberately wrong — must be zeroed
+          },
+        ],
+      };
+      const body = composeIssueInvoiceBody(form);
+      expect(body.lines[0].vatRateKind).toBe(k);
+      expect(body.lines[0].vatRatePercent).toBe(0);
+    }
+  });
+
+  it("composeIssueInvoiceBody leaves a Percent line's rate untouched (backward-compat)", () => {
+    const form = {
+      ...emptyForm(),
+      lines: [
+        {
+          ...emptyForm().lines[0],
+          description: "svc",
+          unitPriceInput: "1000",
+          vatRateKind: "Percent" as const,
+          vatRatePercent: 27,
+        },
+      ],
+    };
+    const body = composeIssueInvoiceBody(form);
+    expect(body.lines[0].vatRateKind).toBe("Percent");
+    expect(body.lines[0].vatRatePercent).toBe(27);
   });
 });

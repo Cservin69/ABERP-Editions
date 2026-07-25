@@ -71,6 +71,7 @@ fn parties() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
             // Domestic posture for legacy test fixtures.
             customer_vat_status: CustomerVatStatus::Domestic,
@@ -104,6 +105,7 @@ fn fixture_invoice(with_notes: bool) -> ReadyInvoice {
             quantity: rust_decimal::Decimal::from(2),
             unit_price: Huf(1_000),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -112,6 +114,7 @@ fn fixture_invoice(with_notes: bool) -> ReadyInvoice {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(5_000),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -279,6 +282,45 @@ fn nav_xml_invoice_data_byte_identical_with_partial_line_notes() {
 // carry). The byte-identity assertion catches it loud per
 // CLAUDE.md rule 12 + ADR-0042.
 // ──────────────────────────────────────────────────────────────────────
+
+/// ADR-0101 §8.D — the notes / PII firewall holds ACROSS the new
+/// exempt-kind emit branch. A line carrying a buyer note AND an `AamExempt`
+/// kind must still NOT leak the recipient-facing note, while the STATUTORY
+/// `reason` string (which IS intentional NAV wire content, not buyer PII)
+/// DOES appear. This proves ADR-0101 did not open a new leak channel and
+/// that its added wire content is statutory, not operator/buyer-identifying.
+#[test]
+fn exempt_kind_line_note_still_never_leaks_but_statutory_reason_is_wire_content() {
+    let parties = parties();
+    let series = SeriesCode::new("INV-default".to_string()).expect("valid series code");
+
+    let mut inv = fixture_invoice(true); // both lines carry sentinel notes
+    for line in inv.lines.iter_mut() {
+        line.vat_rate_kind = aberp_billing::VatRateKind::AamExempt;
+        line.vat_rate_basis_points = 0;
+    }
+
+    let xml = nav_xml::render_invoice_data(&inv, &series, &parties, Currency::Huf, None)
+        .expect("render NAV XML (AAM lines with notes)");
+    let body = std::str::from_utf8(&xml).expect("NAV body is UTF-8");
+
+    // Buyer notes STILL firewalled — the new emit branch does not consume them.
+    for needle in [SENTINEL_LINE_A_NOTE, SENTINEL_LINE_B_NOTE] {
+        assert!(
+            !body.contains(needle),
+            "ADR-0101 / ADR-0042 VIOLATION: exempt-kind emit leaked note `{needle}`; body:\n{body}"
+        );
+    }
+    // The statutory case + reason ARE intentional wire content (not PII).
+    assert!(
+        body.contains("<case>AAM</case>"),
+        "AAM case must be emitted as intentional wire content; body:\n{body}"
+    );
+    assert!(
+        body.contains("Alanyi adómentesség"),
+        "the statutory reason must be emitted (non-PII wire content); body:\n{body}"
+    );
+}
 
 fn storno_reference() -> StornoReference {
     StornoReference {

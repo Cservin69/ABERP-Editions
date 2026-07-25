@@ -50,6 +50,7 @@ fn build_minimal_modification_invoice() -> ReadyInvoice {
             // negation (contrast with STORNO emitter).
             unit_price: Huf(1200),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         }],
@@ -73,6 +74,7 @@ fn minimal_parties() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // PR-97 / ADR-0048 — preserve pre-PR-97 implicit
             // Domestic posture for legacy test fixtures.
             customer_vat_status: CustomerVatStatus::Domestic,
@@ -346,6 +348,7 @@ fn minimal_parties_private_person() -> NavParties {
             address_street: "Fő utca 1.".to_string(),
         },
         customer: CustomerInfo {
+            community_vat_number: None,
             // S154 / ADR-0048 — PRIVATE_PERSON suppresses tax + address.
             customer_vat_status: CustomerVatStatus::PrivatePerson,
             tax_number: None,
@@ -455,6 +458,7 @@ fn modification_line_operation_is_create_across_input_variations() {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(1000),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -463,6 +467,7 @@ fn modification_line_operation_is_create_across_input_variations() {
             quantity: rust_decimal::Decimal::from(2),
             unit_price: Huf(500),
             vat_rate_basis_points: 2700,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -471,6 +476,7 @@ fn modification_line_operation_is_create_across_input_variations() {
             quantity: rust_decimal::Decimal::from(1),
             unit_price: Huf(123),
             vat_rate_basis_points: 0,
+            vat_rate_kind: aberp_billing::VatRateKind::Percent,
             note: None,
             unit: None,
         },
@@ -520,6 +526,7 @@ fn modification_line_number_reference_continues_past_two_line_base() {
         quantity: rust_decimal::Decimal::from(1),
         unit_price: Huf(1200),
         vat_rate_basis_points: 2700,
+        vat_rate_kind: aberp_billing::VatRateKind::Percent,
         note: None,
         unit: None,
     }];

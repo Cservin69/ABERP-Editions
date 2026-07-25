@@ -21,6 +21,7 @@ import type {
   Product,
   ProductUnit,
   SellerBankResponse,
+  VatRateKindBody,
 } from "./api";
 import { DEFAULT_PAYMENT_METHOD } from "./payment-method";
 import {
@@ -68,6 +69,13 @@ export interface LineFormState {
   quantityInput: string;
   unitPriceInput: string;
   vatRatePercent: number;
+  /** ADR-0101 — per-line VAT rate-kind selector value. Defaults to
+   * `"Percent"` (the numeric path — backward-compat). For any non-`Percent`
+   * kind the UI LOCKS `vatRatePercent` to 0 and disables the VAT% input
+   * (exempt / reverse-charge line VAT is always 0); the composer also forces
+   * `vatRatePercent: 0` on the wire. Set exclusively via [`applyVatKind`] so
+   * the rate-lock invariant lives in one place. */
+  vatRateKind: VatRateKindBody;
   /** PR-82 — operator-typed per-line note ("Megjegyzés"). Empty
    * string when blank; `composeIssueInvoiceBody` normalises to
    * `null` on the wire so the backend sees a clean "no note"
@@ -137,6 +145,14 @@ export interface IssueInvoiceFormState {
   customerPostalCode: string;
   customerCity: string;
   customerStreet: string;
+  /** ADR-0102 — the buyer's EU community VAT number. Shown + required
+   * ONLY when `customerVatStatus === "Other"` (a foreign-EU business
+   * buyer); empty for Domestic/PrivatePerson. Populated from the picked
+   * partner's `eu_vat_number` via `buyerFieldsFromPartner`; the composer
+   * emits it on the wire body (snapshotted onto the issued invoice) only
+   * for Other. Structurally validated (VIES shape) at the backend
+   * preflight + partner-form gate. */
+  customerCommunityVatNumber: string;
   currency: Currency;
   lines: LineFormState[];
   /** PR-73 / ADR-0040 §addendum — operator-selected bank account id
@@ -245,6 +261,9 @@ export function emptyForm(): IssueInvoiceFormState {
     customerPostalCode: "",
     customerCity: "",
     customerStreet: "",
+    // ADR-0102 — empty until an Other (EU) partner is picked / the
+    // operator types an EU VAT number.
+    customerCommunityVatNumber: "",
     currency: "HUF",
     lines: [emptyLine()],
     // PR-73 — `null` means "use the per-currency default"; the
@@ -299,6 +318,10 @@ export function emptyLine(): LineFormState {
     quantityInput: "1",
     unitPriceInput: "",
     vatRatePercent: 27,
+    // ADR-0101 — default to the numeric `Percent` path (27% is the
+    // Hungarian standard rate, set above). Backward-compat: an untouched
+    // line composes exactly as pre-0101.
+    vatRateKind: "Percent",
     // PR-82 — per-line note seeds blank; operator opt-in.
     note: "",
     // PR-100 / S406 — no product picked yet on a fresh line.
@@ -358,6 +381,144 @@ export function applyProductPick(
   // S406 — auto-flip the invoice currency to the product's default.
   // Idempotent when they already match.
   return { ...form, currency: product.currency, lines };
+}
+
+/** ADR-0101 — one operator-selectable VAT rate-kind option: its wire
+ * value + a bilingual human label + a short bilingual explanation the SPA
+ * shows beneath the selector so the operator knows what each category means
+ * (HÜLYE-BIZTOS: never make the operator guess what "EUFAD37" is). */
+export interface VatKindOption {
+  value: VatRateKindBody;
+  labelHu: string;
+  labelEn: string;
+  /** Short "what this means" line — statutory ref + plain wording. */
+  hintHu: string;
+  hintEn: string;
+}
+
+/** ADR-0101 — the five operator-selectable VAT rate-kinds, in menu order.
+ * `Percent` first (the default / dominant path); then the four
+ * Ervin-confirmed non-`Percent` kinds. The named-deferred backend kinds are
+ * intentionally ABSENT — they are not issuable, so listing them would be a
+ * dead option (the operator would pick one and hit a preflight rejection).
+ *
+ * This is the SINGLE source of truth for the selector's options + labels;
+ * the Svelte component renders from it and the vitest pin asserts its
+ * membership equals the `VatRateKindBody` union. */
+export const VAT_KIND_OPTIONS: readonly VatKindOption[] = [
+  {
+    value: "Percent",
+    labelHu: "Százalékos ÁFA (27/18/5/0%)",
+    labelEn: "Percentage VAT (27/18/5/0%)",
+    hintHu: "Normál, számszerű ÁFA-kulcs. A magyar belföldi értékesítés alapesete.",
+    hintEn: "Standard numeric VAT rate. The default for domestic sales.",
+  },
+  {
+    value: "AamExempt",
+    labelHu: "Alanyi adómentes (AAM)",
+    labelEn: "Subjective exemption (AAM)",
+    hintHu: "Alanyi adómentesség [Áfa tv. 187–196. §]. 0% ÁFA, nincs felszámított adó.",
+    hintEn: "Small-taxpayer exemption. 0% VAT, no tax charged.",
+  },
+  {
+    value: "DomesticReverseCharge",
+    labelHu: "Belföldi fordított adózás",
+    labelEn: "Domestic reverse charge",
+    hintHu:
+      "Belföldi fordított adózás [Áfa tv. 142. §]. A vevő önadózik; a soron 0% ÁFA.",
+    hintEn: "Domestic reverse charge. The buyer self-assesses; 0% VAT on the line.",
+  },
+  {
+    value: "IntraCommunityGoods",
+    labelHu: "Közösségen belüli termékértékesítés (0%)",
+    labelEn: "Intra-Community supply of goods (0%)",
+    hintHu:
+      "Közösségen belüli adómentes termékértékesítés [Áfa tv. 89. §] (KBAET). EU-s vevő, 0% ÁFA.",
+    hintEn: "Intra-Community exempt supply of goods (KBAET). EU buyer, 0% VAT.",
+  },
+  {
+    value: "IntraCommunityServiceReverse",
+    labelHu: "Közösségen belüli szolgáltatás – fordított",
+    labelEn: "Intra-Community service – reverse charge",
+    hintHu:
+      "Áfa területi hatályán kívüli, fordított adózású ügylet [Áfa tv. 37. §] (EUFAD37). Nem adómentesség — a teljesítés helye a vevő tagállama.",
+    hintEn:
+      "Out-of-scope, reverse-charged service (EUFAD37). Not an exemption — place of supply is the buyer's member state.",
+  },
+] as const;
+
+/** ADR-0101 — does this VAT kind force the line VAT rate to 0 (and thus
+ * lock the VAT% input)? True for every non-`Percent` kind: exempt /
+ * reverse-charge / out-of-scope lines carry 0 VAT by law. This is the one
+ * predicate the selector, the composer, and the vitest pin all share. */
+export function vatKindLocksRate(kind: VatRateKindBody): boolean {
+  return kind !== "Percent";
+}
+
+/** ADR-0102 — HÜLYE-BIZTOS cross-field guidance: does the selected VAT
+ * kind require a different buyer type than the one currently chosen?
+ * Returns a bilingual hint when there's a mismatch, or `null` when the
+ * kind + buyer are compatible. The backend preflight is the hard gate
+ * (`VatKindRequiresOtherBuyer` / `VatKindRequiresDomesticBuyer`); this
+ * pure helper lets the form warn the operator inline BEFORE they submit,
+ * so they don't assemble an invalid EU-0 + domestic-buyer invoice.
+ *
+ *   IntraCommunity* (KBAET/EUFAD37) → REQUIRES an `Other` (EU) buyer.
+ *   AamExempt / DomesticReverseCharge → REQUIRES a `Domestic` buyer.
+ *   Percent → any buyer (no hint). */
+export function vatKindBuyerMismatch(
+  kind: VatRateKindBody,
+  vatStatus: CustomerVatStatusBody,
+): { hu: string; en: string } | null {
+  const needsOther =
+    kind === "IntraCommunityGoods" || kind === "IntraCommunityServiceReverse";
+  const needsDomestic =
+    kind === "AamExempt" || kind === "DomesticReverseCharge";
+  if (needsOther && vatStatus !== "Other") {
+    return {
+      hu: "Ez a Közösségen belüli 0%-os ÁFA-típus külföldi EU-s (Külföldi) vevőt igényel EU adószámmal. Válasszon EU-s vevőt, vagy módosítsa az ÁFA-típust.",
+      en: "This intra-Community 0% VAT type requires a foreign-EU (Other) buyer with an EU VAT number. Pick an EU buyer, or change the VAT type.",
+    };
+  }
+  if (needsDomestic && vatStatus !== "Domestic") {
+    return {
+      hu: "Ez a belföldi ÁFA-típus belföldi (Adóalany) vevőt igényel. Válasszon belföldi vevőt, vagy módosítsa az ÁFA-típust.",
+      en: "This domestic VAT type requires a Domestic buyer. Pick a domestic buyer, or change the VAT type.",
+    };
+  }
+  return null;
+}
+
+/** ADR-0101 — apply an operator VAT-kind pick to one line, HÜLYE-BIZTOS.
+ * Pure — returns a fresh form; no side effects (mirror of
+ * [`applyProductPick`] so vitest can pin the lock without mounting the
+ * component). Switching TO a non-`Percent` kind forces `vatRatePercent` to
+ * 0 (the invalid-combination guard: an exempt / reverse-charge line cannot
+ * carry a rate). Switching BACK to `Percent` restores the Hungarian
+ * standard 27% so the operator is not stranded on the 0 the lock left
+ * behind — they can still type any standard rate afterwards.
+ *
+ * The component's `<select>` onchange calls this so the rate-lock invariant
+ * lives in exactly one place (the composer also force-zeroes on the wire as
+ * defence in depth). */
+export function applyVatKind(
+  form: IssueInvoiceFormState,
+  lineIndex: number,
+  kind: VatRateKindBody,
+): IssueInvoiceFormState {
+  const lines = form.lines.map((line, i) => {
+    if (i !== lineIndex) return line;
+    if (vatKindLocksRate(kind)) {
+      return { ...line, vatRateKind: kind, vatRatePercent: 0 };
+    }
+    // Back to Percent — restore the standard rate if the lock had zeroed it.
+    return {
+      ...line,
+      vatRateKind: kind,
+      vatRatePercent: line.vatRatePercent === 0 ? 27 : line.vatRatePercent,
+    };
+  });
+  return { ...form, lines };
 }
 
 /** S406 — resolve which seller-bank id the form should hold for a
@@ -555,12 +716,30 @@ export type InvoicePreflightErrorKind =
   // paths the session-150 address gate now exercises. Added alongside
   // CustomerAddressMissing to restore the documented exhaustive vocab.
   | "CustomerTaxNumberPresentForPrivatePerson"
-  | "CustomerVatStatusOtherNotSupportedV1"
+  // ADR-0102 — EU-partner (Other) customer type + cross-field VAT
+  // matrix. The Other buyer requires a valid communityVatNumber and no
+  // HU tax number; the intra-Community 0% kinds require an Other buyer
+  // and the domestic kinds require a Domestic buyer.
+  | "CustomerTaxNumberPresentForOther"
+  | "CommunityVatNumberMissing"
+  | "CommunityVatNumberMalformed"
+  | "VatKindRequiresOtherBuyer"
+  | "VatKindRequiresDomesticBuyer"
   | "InvoiceLinesEmpty"
   | "LineItemDescriptionEmpty"
   | "LineItemQuantityZero"
   | "LineItemUnitPriceNonPositive"
   | "LineItemVatRateUnknown"
+  // ADR-0101 (Session 2) — the per-line VAT rate-kind gate. All three route
+  // to `lines[N].vatRateKind` (the selector). `NonZeroPercentForExemptKind`
+  // fires only for a non-UI caller (the selector locks the rate);
+  // `VatRateKindNotSupportedYet` rejects a named-deferred kind;
+  // `MixedVatRateKindsUnsupported` rejects an invoice mixing kinds (the NAV
+  // summary is single-bucket). New variant → extend this union AND add a
+  // vitest case, same closed-vocab discipline as the rest.
+  | "NonZeroPercentForExemptKind"
+  | "VatRateKindNotSupportedYet"
+  | "MixedVatRateKindsUnsupported"
   | "SellerBankMissingForCurrency"
   | "SellerBankCurrencyMismatch";
 
@@ -662,12 +841,19 @@ function isKnownPreflightKind(s: string): s is InvoicePreflightErrorKind {
     case "CustomerTaxNumberMalformed":
     case "CustomerAddressMissing":
     case "CustomerTaxNumberPresentForPrivatePerson":
-    case "CustomerVatStatusOtherNotSupportedV1":
+    case "CustomerTaxNumberPresentForOther":
+    case "CommunityVatNumberMissing":
+    case "CommunityVatNumberMalformed":
+    case "VatKindRequiresOtherBuyer":
+    case "VatKindRequiresDomesticBuyer":
     case "InvoiceLinesEmpty":
     case "LineItemDescriptionEmpty":
     case "LineItemQuantityZero":
     case "LineItemUnitPriceNonPositive":
     case "LineItemVatRateUnknown":
+    case "NonZeroPercentForExemptKind":
+    case "VatRateKindNotSupportedYet":
+    case "MixedVatRateKindsUnsupported":
     case "SellerBankMissingForCurrency":
     case "SellerBankCurrencyMismatch":
       return true;
@@ -687,13 +873,30 @@ function isKnownPreflightKind(s: string): s is InvoicePreflightErrorKind {
  * than dropping it. Same posture as the closed-vocab kind guard
  * above. */
 export type PreflightFieldTarget =
-  | { kind: "customer"; field: "name" | "taxNumber" | "address" }
+  | {
+      kind: "customer";
+      // ADR-0102 — `communityVatNumber` (the EU VAT input) + `vatStatus`
+      // (the buyer-type control the cross-field matrix errors route to).
+      field:
+        | "name"
+        | "taxNumber"
+        | "address"
+        | "communityVatNumber"
+        | "vatStatus";
+    }
   | { kind: "lines" }
   | { kind: "bankAccountId" }
   | {
       kind: "line";
       lineIndex: number;
-      field: "description" | "quantity" | "unitPrice" | "vatRatePercent";
+      field:
+        | "description"
+        | "quantity"
+        | "unitPrice"
+        | "vatRatePercent"
+        // ADR-0101 — the per-line VAT-type selector; the three kind-level
+        // preflight errors route here.
+        | "vatRateKind";
     };
 
 export function targetForFieldPath(
@@ -712,6 +915,14 @@ export function targetForFieldPath(
   if (fieldPath === "customer.address") {
     return { kind: "customer", field: "address" };
   }
+  // ADR-0102 — the EU community VAT input + the buyer-type control (the
+  // cross-field kind↔buyer mismatches route to `vatStatus`).
+  if (fieldPath === "customer.communityVatNumber") {
+    return { kind: "customer", field: "communityVatNumber" };
+  }
+  if (fieldPath === "customer.vatStatus") {
+    return { kind: "customer", field: "vatStatus" };
+  }
   if (fieldPath === "lines") {
     return { kind: "lines" };
   }
@@ -719,8 +930,9 @@ export function targetForFieldPath(
     return { kind: "bankAccountId" };
   }
   // Match `lines[N].field` where N is a non-negative integer and
-  // field is one of the four line-level closed-vocab field names.
-  const lineMatch = /^lines\[(\d+)\]\.(description|quantity|unitPrice|vatRatePercent)$/.exec(
+  // field is one of the line-level closed-vocab field names (ADR-0101
+  // adds `vatRateKind`).
+  const lineMatch = /^lines\[(\d+)\]\.(description|quantity|unitPrice|vatRatePercent|vatRateKind)$/.exec(
     fieldPath,
   );
   if (lineMatch) {
@@ -731,7 +943,8 @@ export function targetForFieldPath(
         | "description"
         | "quantity"
         | "unitPrice"
-        | "vatRatePercent",
+        | "vatRatePercent"
+        | "vatRateKind",
     };
   }
   return null;
@@ -765,6 +978,15 @@ export function composeIssueInvoiceBody(
       // CustomerTaxNumberPresentForPrivatePerson gate fires only on
       // a non-empty value).
       taxNumber: form.customerTaxNumber.trim(),
+      // ADR-0102 — snapshot the EU community VAT number onto the wire
+      // body for Other (foreign-EU) buyers only. Trim; omit (undefined)
+      // for non-Other or when blank so the backend's serde default
+      // (None → Domestic path) keeps every non-Other body byte-identical.
+      communityVatNumber:
+        form.customerVatStatus === "Other" &&
+        form.customerCommunityVatNumber.trim().length > 0
+          ? form.customerCommunityVatNumber.trim()
+          : undefined,
       name: form.customerName.trim(),
       // PR-77 / session-101 — customer address quartet. Always emit
       // the field when ANY of the four sub-strings is non-empty after
@@ -794,7 +1016,16 @@ export function composeIssueInvoiceBody(
       // bad-amount issuance. See [`parseAmountToMinor`] for the
       // closed grammar.
       unitPrice: parseAmountToMinor(l.unitPriceInput, form.currency) ?? 0,
-      vatRatePercent: l.vatRatePercent,
+      // ADR-0101 — a non-`Percent` kind's line VAT is always 0. Force it
+      // here (defence in depth) so a UI-lock bypass or a stale
+      // `vatRatePercent` can never send a nonzero rate for an exempt /
+      // reverse-charge line (the backend also rejects that via
+      // `NonZeroPercentForExemptKind`, but the composer should never emit
+      // the contradiction in the first place).
+      vatRatePercent: vatKindLocksRate(l.vatRateKind) ? 0 : l.vatRatePercent,
+      // ADR-0101 — the operator's VAT-type choice, sent verbatim. Absent →
+      // backend defaults `"Percent"`; the SPA always emits it explicitly.
+      vatRateKind: l.vatRateKind,
       // PR-82 — per-line buyer note. Trim + normalise empty to
       // `null` so the backend's preflight / persistence path sees a
       // clean "no note" signal rather than a blank-string row.

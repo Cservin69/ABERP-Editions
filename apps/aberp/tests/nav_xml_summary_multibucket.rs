@@ -39,12 +39,18 @@ use std::str::FromStr;
 use time::macros::date;
 use time::OffsetDateTime;
 
+/// An all-`Percent` line. The rate-kind port (ADR-0103 (Defense)) added
+/// `vat_rate_kind` to `LineItem`; this file's pins predate it and are
+/// deliberately kept on the `Percent` path so they keep testing exactly what
+/// they tested before — the mixed-*RATE* B3′ bucketing. The mixed-*KIND*
+/// cases live in `nav_xml_summary_mixed_kind.rs`.
 fn line(desc: &str, qty: i64, unit_price: i64, bp: u16) -> LineItem {
     LineItem {
         description: desc.to_string(),
         quantity: rust_decimal::Decimal::from(qty),
         unit_price: Huf(unit_price),
         vat_rate_basis_points: bp,
+        vat_rate_kind: aberp_billing::VatRateKind::Percent,
         note: None,
         unit: None,
     }
@@ -77,6 +83,7 @@ fn domestic_parties() -> NavParties {
         customer: CustomerInfo {
             customer_vat_status: CustomerVatStatus::Domestic,
             tax_number: Some("27952890-2-42".to_string()),
+            community_vat_number: None,
             name: "AZ9 Services".to_string(),
             address: Some(CustomerAddress {
                 country_code: "HU".to_string(),

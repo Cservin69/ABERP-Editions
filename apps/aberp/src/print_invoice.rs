@@ -1643,6 +1643,7 @@ swift_bic = "OTPVHUHB"
 
     fn private_person_input(name: &str, address: Option<AddressJson>) -> CustomerJson {
         CustomerJson {
+            community_vat_number: None,
             vat_status: CustomerVatStatus::PrivatePerson,
             partner_id: None,
             tax_number: String::new(),
@@ -1774,6 +1775,7 @@ swift_bic = "OTPVHUHB"
     fn domestic_pdf_passes_through_nav_xml_values() {
         let parsed = domestic_parsed_with_populated_customer_block();
         let input = CustomerJson {
+            community_vat_number: None,
             vat_status: CustomerVatStatus::Domestic,
             partner_id: None,
             tax_number: "12345678-2-13".to_string(),

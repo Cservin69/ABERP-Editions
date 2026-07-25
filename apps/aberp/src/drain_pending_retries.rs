@@ -1231,6 +1231,7 @@ mod tests {
         // A storno child invoice, drafted + attempted (state-2 Pending),
         // with an InvoiceStornoIssued chain-link naming it the storno.
         let draft = audit_payloads::InvoiceDraftCreatedPayload {
+            customer_community_vat_number: None,
             invoice_id: "inv_STORNO".to_string(),
             line_count: 1,
             idempotency_key: idem.to_canonical_string(),
