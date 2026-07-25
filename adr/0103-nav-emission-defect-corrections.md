@@ -176,12 +176,64 @@ The residual is stated plainly, not softened: **a preflight-bypassing CLI door c
 
 ---
 
-## 8. Implementation record
+## 8. Implementation record (2026-07-25)
 
-*(filled in as each step lands — a step is not landed until its mutations are observed red)*
+Branch `port/vat-rate-kind-complete` off `f7c216e`. ADR committed first
+(`e6257d6`), then the machinery merge + corrections (`52b3a10`, a true merge
+commit with both parents), then the pins (`97076e2`).
 
-- [ ] Step 0 — merge machinery, resolve the `nav_xml.rs` conflict toward the widened form
-- [ ] Step 1 — V (B2)
-- [ ] Step 2 — S widening + guard re-founding
-- [ ] Step 3 — I (B4)
-- [ ] Step 4 — pins T1–T10, each mutation-verified
+- [x] **Step 0 — merge machinery, resolve toward the widened form.** One
+      conflict, in `write_summary`, resolved to `write_vat_rate(w, b.kind,
+      b.basis_points)`. `validate.rs` auto-merged correctly (disjoint
+      functions). The B3′ pin survived the merge and needed only the two new
+      struct fields on the `Percent` path.
+- [x] **Step 1 — V (B2).** `vat_amount()` early-returns `Huf::ZERO` for every
+      non-`Percent` kind.
+- [x] **Step 2 — S widening + guard re-founding.** Key, sort and choice
+      element all widened; the guard's comment replaced wholesale.
+- [x] **Step 3 — I (B4).** `validate_community_vat_number -> Result<String,
+      String>`; `normalize_customer_community_vat_number` at all three
+      issuance entry points.
+- [x] **Step 4 — pins, each mutation-verified.**
+
+### Mutation log (applied → red observed → reverted)
+
+| Mutation | Observed |
+|---|---|
+| bucket key → `basis_points` only | all **6** mixed-kind pins RED; all **5** B3′ pins stay GREEN |
+| `kind.as_str()` dropped from sort | exactly the determinism pin RED (5 others green) |
+| `vat_amount` → rate-only | B2 pin RED **+** `same_rate_different_kind` RED — §5's V-before-S dependency confirmed empirically |
+| ingest normalisation dropped | B4 four-way pin RED |
+| emitter → `lines.first()` collapse | 4/5 B3′ pins **and** all 6 mixed-kind pins RED |
+| mixed-kind guard deleted | guard pin RED (§4.4 verified behaviourally) |
+
+The first row is the load-bearing one: it demonstrates the superset property
+in **both** directions — the widening cannot break the landed B3′ fix, and the
+landed fix does not already cover the widening.
+
+### Two pins were wrong and the mutations caught them
+
+1. **The headline same-rate-different-kind pin originally PASSED under the
+   narrowing mutation.** A §142 line correctly carries `bp == 0` (ADR-0101 §4),
+   so it never shared a rate with the 27 % line — the test was not testing its
+   own name. Rewritten to put a **stray 2700** on the reverse-charge line: the
+   preflight-bypassed state, which is the only state in which a same-rate
+   collision exists, and the same state the Invariant V pin uses. This is worth
+   recording as a finding in its own right: **under correct gating,
+   same-rate-different-kind is unreachable; the widening's same-rate arm buys
+   safety only on the ungated doors.** The 0 %-kind arm (§4.1) is the one that
+   matters for reachable bodies, because there the rate genuinely carries no
+   information.
+2. **The B4 malformed-rejection pin was written one level too low.**
+   `serve::issue_invoice_request` sits BELOW the gate —
+   `validate_invoice_preflight` runs in the route handler upstream of it. That
+   is Invariant P, deferred (§6.1), pre-existing and unrelated to B4. Re-sited
+   to the preflight boundary, with the reason recorded on the test.
+
+### Gates
+
+`cargo fmt --all`, `cargo clippy --workspace --all-targets -D warnings`
+(clean), full `cargo test --workspace` on both edition arms. The CAD extract
+smoke test needed the documented `.venv-cad-extract` with `.[step]` and a warm
+OCP import (cold import 7.8 s against a 15 s subprocess timeout) — an
+environment prerequisite, not a code failure; green once warmed.
