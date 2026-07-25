@@ -1283,6 +1283,67 @@ mod tests {
         }
     }
 
+    /// B4 / ADR-0103 (Defense) §4.3 — the `Err` arm of
+    /// `validate_community_vat_number` is UNTOUCHED by Invariant I.
+    ///
+    /// B4 changed what the function's `Ok` arm CARRIES (the normalised value,
+    /// previously discarded), never what it ADMITS. This pins that a
+    /// malformed number is still rejected, so the signature change opened no
+    /// new hole — and that a merely UN-NORMALISED but valid number is still
+    /// accepted, so the fix did not accidentally become verbatim-strict.
+    ///
+    /// ⚠ Asserted HERE, at the preflight boundary, and not through
+    /// `serve::issue_invoice_request` — because that function sits BELOW the
+    /// gate. `validate_invoice_preflight` runs in the route handler
+    /// (`serve.rs`), upstream of it, so an integration test entering at
+    /// `issue_invoice_request` bypasses preflight entirely. That is Invariant
+    /// P (B1 — universal gating), deferred on both the Defense and prod lines
+    /// (ADR-0103 §6.1); it is pre-existing and unrelated to B4, but it is why
+    /// this pin cannot live in `tests/serve_issue_route.rs`.
+    ///
+    /// MUTATION: make `validate_community_vat_number` return `Ok(normalized)`
+    /// unconditionally → the malformed half goes red.
+    #[test]
+    fn malformed_community_vat_still_rejected_after_b4_signature_change() {
+        // Malformed: `ZZ` is not an EU country prefix, so no amount of
+        // normalisation can rescue it.
+        let mut bad = good_request();
+        bad.customer.vat_status = CustomerVatStatus::Other;
+        bad.customer.tax_number = String::new();
+        bad.customer.community_vat_number = Some("zz 999 999".to_string());
+        bad.customer.address = Some(AddressJson {
+            country_code: "AT".to_string(),
+            ..good_customer_address()
+        });
+        let errs = validate_invoice_preflight(&bad);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InvoicePreflightError::CommunityVatNumberMalformed { .. })),
+            "a malformed community VAT number must still be rejected; got {errs:?}"
+        );
+
+        // Valid-but-un-normalised: spaces + lowercase is exactly how member
+        // states PUBLISH these, so it must be ACCEPTED (and normalised at
+        // ingest), not rejected. This is the half that would go red if B4
+        // had been implemented as verbatim-strict rejection.
+        let mut ok = good_request();
+        ok.customer.vat_status = CustomerVatStatus::Other;
+        ok.customer.tax_number = String::new();
+        ok.customer.community_vat_number = Some("at u123 45678".to_string());
+        ok.customer.address = Some(AddressJson {
+            country_code: "AT".to_string(),
+            ..good_customer_address()
+        });
+        let errs = validate_invoice_preflight(&ok);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, InvoicePreflightError::CommunityVatNumberMalformed { .. })),
+            "a VIES-style spaced/lowercase number is VALID and must not be \
+             rejected — it is normalised at ingest; got {errs:?}"
+        );
+    }
+
     /// Mixed-kind guard — an invoice mixing a non-`Percent` kind with a
     /// DIFFERENT kind trips `MixedVatRateKindsUnsupported`. A Percent line
     /// beside an AAM line is a mix; two AAM lines are not.

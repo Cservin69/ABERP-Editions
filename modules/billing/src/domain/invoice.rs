@@ -449,6 +449,67 @@ mod tests {
     use super::*;
     use crate::domain::ids::{CustomerId, InvoiceId, SeriesId};
 
+    /// B2 / ADR-0103 §4.2 (Invariant V — kind-consistent VAT).
+    ///
+    /// The state under test is the one a PREFLIGHT-BYPASSED body carries: a
+    /// non-`Percent` kind with a deliberately NON-ZERO
+    /// `vat_rate_basis_points`. ADR-0101 §4 forbids that combination at the
+    /// gate — but Invariant P (universal preflight) is deferred on both the
+    /// Defense and prod lines, so seven of eight invoice-originating doors
+    /// never run the gate. Testing the already-legal `basis_points == 0`
+    /// case would pass against the BROKEN code too and prove nothing; this
+    /// is the whole point of putting Invariant V at the derivation.
+    ///
+    /// MUTATION: delete the `is_percent()` early-return from `vat_amount` →
+    /// every non-`Percent` arm returns 5400 and this goes red.
+    #[test]
+    fn vat_amount_is_zero_for_non_percent_kinds_even_with_nonzero_rate() {
+        use crate::VatRateKind;
+        let non_percent = [
+            VatRateKind::AamExempt,
+            VatRateKind::DomesticReverseCharge,
+            VatRateKind::IntraCommunityGoods,
+            VatRateKind::IntraCommunityServiceReverse,
+        ];
+        for kind in non_percent {
+            let line = LineItem {
+                description: format!("{kind:?} line carrying a stray rate"),
+                quantity: Decimal::from(2),
+                unit_price: Huf(10_000),
+                // The bypassed state: a non-zero rate on a non-`Percent` kind.
+                vat_rate_basis_points: 2700,
+                vat_rate_kind: kind,
+                note: None,
+                unit: None,
+            };
+            assert_eq!(
+                line.vat_amount(),
+                Some(Huf::ZERO),
+                "{kind:?}: non-`Percent` VAT must be 0 regardless of basis points"
+            );
+            assert_eq!(
+                line.gross_total(),
+                line.net_total(),
+                "{kind:?}: gross must equal net when VAT is 0"
+            );
+        }
+
+        // Control: the `Percent` path still computes VAT from the rate, so
+        // the early-return cannot be a blanket "always zero".
+        let percent = LineItem {
+            description: "27% line".to_string(),
+            quantity: Decimal::from(2),
+            unit_price: Huf(10_000),
+            vat_rate_basis_points: 2700,
+            vat_rate_kind: crate::VatRateKind::Percent,
+            note: None,
+            unit: None,
+        };
+        assert_eq!(percent.net_total(), Some(Huf(20_000)));
+        assert_eq!(percent.vat_amount(), Some(Huf(5_400)));
+        assert_eq!(percent.gross_total(), Some(Huf(25_400)));
+    }
+
     fn fixture_submitted() -> SubmittedInvoice {
         SubmittedInvoice {
             id: InvoiceId::new(),

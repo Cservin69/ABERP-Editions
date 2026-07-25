@@ -130,3 +130,4 @@ quote-artifacts/
 
 # Local-only working doc — keep out of the repo (per owner decision)
 docs/EIC_DUALUSE_BRIEFING_HANDOFF.md
+.venv-cad-extract/
