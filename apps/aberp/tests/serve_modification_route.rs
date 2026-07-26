@@ -673,3 +673,86 @@ impl aberp::mnb_rates_provider::MnbRatesProvider for NeverProvider {
         unreachable!("HUF issuance path never consults the rate provider")
     }
 }
+
+/// ADR-0101 / S2, REQUEST side — a `Percent` base passes the base-kind guard,
+/// but the modification body's OWN per-line `vat_rate_kind` (a
+/// `#[serde(default)]` field on `LineJson`) must not reach the NAV wire
+/// unchecked. This route never calls `validate_invoice_preflight`, so neither
+/// `MixedVatRateKindsUnsupported` nor the ADR-0102 §4(a) buyer-status matrix
+/// sees such a body: before this guard, a hand-crafted request filed
+/// `<vatExemption><case>KBAET</case>` — an intra-Community exempt supply —
+/// for a DOMESTIC buyer, which §4(a) calls unsatisfiable.
+///
+/// Every wired kind is covered, and the mixed case (a `Percent` line PLUS a
+/// smuggled one) too, since that is what defeats the base-side guard.
+///
+/// MUTATION (must turn this red): delete the request-side guard in
+/// `serve::modification_invoice_request` — the call then returns `Ok` and the
+/// emitted body carries the exemption.
+#[tokio::test(flavor = "current_thread")]
+async fn modification_route_rejects_non_percent_kind_in_the_request_body() {
+    for kind in [
+        aberp_billing::VatRateKind::AamExempt,
+        aberp_billing::VatRateKind::DomesticReverseCharge,
+        aberp_billing::VatRateKind::IntraCommunityGoods,
+        aberp_billing::VatRateKind::IntraCommunityServiceReverse,
+    ] {
+        let dir = test_dir(&format!("modification-request-kind-{}", kind.as_str()));
+        let db_path = dir.join("aberp.duckdb");
+        // A `Percent` base — the base-side guard passes it, so the ONLY thing
+        // that can reject here is the request-side guard.
+        let base_invoice_id =
+            issue_and_finalize_base(&db_path, aberp_billing::VatRateKind::Percent, 27).await;
+
+        let state = build_state(db_path);
+        // Currency MATCHES the base (HUF), so the C6 check cannot be what
+        // rejects; and line 0 stays `Percent`, so the rejection must come
+        // from scanning EVERY line, not just the first.
+        let mut body = fixture_request_body(aberp_billing::Currency::Huf);
+        body.lines = vec![
+            LineJson {
+                description: "still 27%".to_string(),
+                quantity: rust_decimal::Decimal::from(1),
+                unit_price: 10_000,
+                vat_rate_percent: 27,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
+                note: None,
+                unit: None,
+            },
+            LineJson {
+                description: "smuggled 0%-kind".to_string(),
+                quantity: rust_decimal::Decimal::from(1),
+                unit_price: 50_000,
+                vat_rate_percent: 0,
+                vat_rate_kind: kind,
+                note: None,
+                unit: None,
+            },
+        ];
+
+        let err = serve::modification_invoice_request(&state, &base_invoice_id, body)
+            .expect_err("a non-Percent kind in the request body must reject");
+        match err {
+            ModificationRouteError::BadRequest(message) => {
+                assert!(
+                    message.contains("modification body line 1"),
+                    "message must name the offending line index, got: {message}"
+                );
+                assert!(
+                    message.contains(kind.as_str()),
+                    "message must name the smuggled kind {}, got: {message}",
+                    kind.as_str()
+                );
+                assert!(
+                    message.contains("aberp issue-modification"),
+                    "message must name the CLI fallback, got: {message}"
+                );
+            }
+            other => panic!(
+                "expected BadRequest for smuggled kind {}, got {other:?}",
+                kind.as_str()
+            ),
+        }
+        let _keep = &dir;
+    }
+}

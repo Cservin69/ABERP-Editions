@@ -10060,6 +10060,54 @@ pub fn modification_invoice_request(
         )));
     }
 
+    // ADR-0101 / S2 GUARD, REQUEST SIDE (the guard above reads the BASE).
+    //
+    // The base-side guard alone leaves the door open in the other direction:
+    // a `Percent` base passes it, and step 5 below then builds the
+    // modification `InvoiceInputJson` from `request.lines` — whose
+    // `vat_rate_kind` is a `#[serde(default)]` field on `LineJson`, so a
+    // hand-crafted body can set ANY wired kind on ANY line. This route calls
+    // `validate_invoice_preflight` NOWHERE (Invariant P is deferred —
+    // ADR-0103 (Defense) §6.1), so nothing downstream re-checks it:
+    //
+    //   - `MixedVatRateKindsUnsupported` never runs, so a `Percent` line and
+    //     an exempt / reverse-charge line can ride the same body;
+    //   - the ADR-0102 §4(a) buyer-status ↔ line-kind matrix never runs, so
+    //     an `IntraCommunityGoods` line (which REQUIRES
+    //     `customerVatStatus = Other`) can be filed against a DOMESTIC buyer
+    //     — the exact combination §4(a) calls unsatisfiable.
+    //
+    // The emitter then does its job correctly and files
+    // `<vatExemption><case>KBAET</case>` for that line's net. Silently wrong
+    // ÁFA of the worst class (CLAUDE.md rule 11): domestic taxable turnover
+    // declared to NAV as an intra-Community exempt supply.
+    //
+    // Rejecting is byte-identical for every real SPA request:
+    // `composeModificationBody` (`apps/aberp-ui/ui/src/lib/modification.ts`)
+    // does not emit `vatRateKind` at all, so a form-originated body always
+    // deserialises every line as `Percent` and falls straight through. A body
+    // that DOES carry a non-`Percent` kind did not come from the form. Same
+    // remedy as the base-side guard: steer to the CLI, which replays the
+    // base's `input.json` verbatim through `issue_modification::run` (a
+    // different entry point that does not pass through this function).
+    if let Some((line_index, kind)) = request
+        .lines
+        .iter()
+        .enumerate()
+        .find_map(|(i, l)| (!l.vat_rate_kind.is_percent()).then_some((i, l.vat_rate_kind)))
+    {
+        return Err(ModificationRouteError::BadRequest(format!(
+            "modification body line {line_index} carries VAT rate-kind `{}` (exempt / \
+             reverse-charge / intra-Community). The in-app modification form never sends a \
+             VAT rate-kind, and this route runs no pre-flight validator, so the mixed-kind \
+             guard and the ADR-0102 §4(a) buyer-status matrix would not see it — the line \
+             would be filed to NAV under that exemption with no cross-check against the \
+             buyer's VAT status. Use `aberp issue-modification --references {invoice_id} \
+             --in <PATH>` on the CLI, which replays the base issuance JSON verbatim.",
+            kind.as_str()
+        )));
+    }
+
     // 2. C6 chain-currency invariant check (ADR-0037 §4). Load the
     //    base's stored currency and reject 400 if the body's currency
     //    differs. The SPA's modification form locks the currency
