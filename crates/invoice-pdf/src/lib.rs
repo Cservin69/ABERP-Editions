@@ -2084,6 +2084,20 @@ mod tests {
     /// indistinguishable "0% ÁFA" row. Preflight admits a single kind per
     /// invoice today, making this a guard rather than a live regrouping —
     /// but the guard is what keeps a future multi-kind invoice honest.
+    ///
+    /// Driven through the REAL `write_totals`, and asserted on the op
+    /// stream it emits: an earlier version of this pin rebuilt the map in
+    /// its own body and was a tautology — replacing the production key's
+    /// kind component with a literal (i.e. reinstating the pre-fix
+    /// single-bucket collapse) left it green.
+    ///
+    /// NOTE — the widened key is currently INERT AT THE LABEL LAYER: the
+    /// row label is still `format!("{}% ÁFA:", pct)`, so two kind-buckets
+    /// print two IDENTICAL "0% ÁFA:" rows. Whether the kind belongs in
+    /// that label is a product/legal decision (Ervin's, tied to the "0%
+    /// ÁFA" labelling question) and deliberately NOT made here. The
+    /// observable consequence of the key — and what this test holds — is
+    /// therefore the row COUNT, not the row text.
     #[test]
     fn totals_do_not_merge_an_exempt_line_with_a_numeric_zero_line() {
         let mut m = pin_model_with_brand(None);
@@ -2097,20 +2111,66 @@ mod tests {
         zero_rated.vat_rate_kind = aberp_billing::VatRateKind::Percent;
         zero_rated.vat_rate_percent = 0;
         zero_rated.vat_minor = 0;
+        let gross = exempt.gross_minor + zero_rated.gross_minor;
         m.lines = vec![exempt, zero_rated];
 
-        let mut by_rate: std::collections::BTreeMap<(&'static str, u16), i64> =
-            std::collections::BTreeMap::new();
-        for line in &m.lines {
-            *by_rate
-                .entry((line.vat_rate_kind.as_str(), line.vat_rate_percent))
-                .or_insert(0) += line.net_minor;
-        }
+        // The real totals renderer — HUF, so each bucket emits exactly one
+        // row (the non-HUF arm adds a second, HUF-equivalent row per
+        // bucket, which would blur the count this pin depends on).
+        assert!(matches!(m.currency, Currency::Huf));
+        let mut ops: Vec<Operation> = Vec::new();
+        write_totals(&mut ops, &m, 600, gross);
+
+        let label = text::winansi_bytes("0% ÁFA:");
+        let rows: Vec<i64> = tj_runs(&ops)
+            .into_iter()
+            .filter(|(_, bytes)| *bytes == label)
+            .map(|(x, _)| x)
+            .collect();
         assert_eq!(
-            by_rate.len(),
+            rows.len(),
             2,
             "an AAM line and a numeric 0% line are legally different and must not \
-             share a totals bucket"
+             share a totals bucket — the totals block must emit ONE row per \
+             (rate-kind, percent) bucket, so two here. Getting 1 means the bucket \
+             key collapsed the kind component and the pre-fix single-\"0% ÁFA\" \
+             merge is back. ops: {ops:?}"
         );
+    }
+
+    /// The back-compat half of the bucket-key widening: an all-`Percent`
+    /// invoice must bucket exactly as it did before the kind joined the
+    /// key — one row per distinct rate, in ascending rate order. Two lines
+    /// at the SAME rate still share one row; a third at another rate adds
+    /// exactly one more. Held through the real `write_totals`.
+    #[test]
+    fn totals_for_an_all_percent_invoice_bucket_by_rate_as_before() {
+        let mut m = pin_model_with_brand(None);
+        let base = m.lines[0].clone();
+        let mut at_27_a = base.clone();
+        at_27_a.vat_rate_percent = 27;
+        let mut at_27_b = base.clone();
+        at_27_b.vat_rate_percent = 27;
+        let mut at_5 = base.clone();
+        at_5.vat_rate_percent = 5;
+        let gross = at_27_a.gross_minor + at_27_b.gross_minor + at_5.gross_minor;
+        m.lines = vec![at_27_a, at_27_b, at_5];
+
+        let mut ops: Vec<Operation> = Vec::new();
+        write_totals(&mut ops, &m, 600, gross);
+
+        let count = |needle: &str| -> usize {
+            let expected = text::winansi_bytes(needle);
+            tj_runs(&ops)
+                .into_iter()
+                .filter(|(_, bytes)| *bytes == expected)
+                .count()
+        };
+        assert_eq!(
+            count("27% ÁFA:"),
+            1,
+            "two lines at the same rate share ONE bucket"
+        );
+        assert_eq!(count("5% ÁFA:"), 1, "the second rate gets its own bucket");
     }
 }

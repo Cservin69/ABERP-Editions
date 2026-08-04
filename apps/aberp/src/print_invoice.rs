@@ -693,8 +693,18 @@ pub fn parse_nav_invoice_xml(bytes: &[u8]) -> Result<ParsedNavInvoice> {
                 // ADR-0101 — the `<case>` code inside a line's
                 // `vatExemption` / `vatOutOfScope` wrapper. Bounded to
                 // `cur_line` for the same anti-spoof reason as the wrapper
-                // capture above; `<case>` appears nowhere else inside a
-                // `<line>`.
+                // capture above.
+                //
+                // `<case>` is NOT unique to those two wrappers inside a
+                // `<line>`: NAV's `vatAmountMismatch` arm of the same
+                // `lineVatRate` choice carries a `<case>` child too. That
+                // is harmless here only because `vatAmountMismatch` is not
+                // one of the recorded wrapper elements, so no
+                // `cur_vat_choice_element` is ever set for it and the
+                // captured case is dropped unread at `</line>`. Widening
+                // the wrapper list to a kind that coexists with
+                // `vatAmountMismatch` would make this capture ambiguous —
+                // scope it to the wrapper's own subtree at that point.
                 if cur_line.is_some() && path.last().map(String::as_str) == Some("case") {
                     cur_vat_case = Some(value.clone());
                 }
@@ -2424,32 +2434,110 @@ swift_bic = "OTPVHUHB"
     /// element + `<case>` names OUTSIDE any `<line>`. It must not leak
     /// into a line's kind — a summary-driven kind would put the wrong
     /// legal clause on a taxed line.
+    /// The invoice-level `summaryByVatRate` block carries the very same
+    /// wrapper element and `<case>` names a line does, OUTSIDE any
+    /// `<line>`. None of them may reach a line's kind: a summary-driven
+    /// kind would print the wrong legal clause on a taxed line.
+    ///
+    /// # What actually holds this up, and what reds it
+    ///
+    /// Two independent sites enforce it, and they are JOINTLY REDUNDANT —
+    /// each alone is sufficient, so neither can be mutation-tested on its
+    /// own (verified empirically across the four shapes below plus two
+    /// more):
+    ///
+    /// 1. the `cur_line.is_some()` guards on the wrapper arm and on the
+    ///    `<case>` capture — a wrapper outside a line is never recorded;
+    /// 2. the reset of `cur_vat_choice_element` / `cur_vat_case` at every
+    ///    canonical `<line>` Start — anything recorded outside a line is
+    ///    wiped before that line can consume it.
+    ///
+    /// Delete EITHER and every shape below still parses identically;
+    /// delete BOTH and shapes B and C break. That is this pin's teeth.
+    /// (`cur_line` can only become `Some` in the same match arm that does
+    /// the reset, which is why no single-site mutation is observable.)
+    ///
+    /// The SHAPE matters more than the assertion here. Shape A — a
+    /// summary strictly after the last `</line>`, i.e. canonical NAV
+    /// element order — is red under NOTHING, because no `</line>` follows
+    /// it to consume a leaked value; an earlier version of this test used
+    /// only that shape and was therefore toothless. B and C place the
+    /// block where a leak would actually land.
     #[test]
     fn summary_vat_rate_block_cannot_spoof_a_line_kind() {
-        let xml = r#"<InvoiceData>
+        let head = r#"<InvoiceData>
   <invoiceNumber>TST-2026-SUM</invoiceNumber>
   <invoiceMain><invoice><invoiceHead>
     <customerInfo><customerName>X</customerName></customerInfo>
-  </invoiceHead>
-  <invoiceLines>
-    <line>
-      <lineDescription>Tanácsadás</lineDescription>
-      <quantity>1</quantity>
-      <unitPrice>100000</unitPrice>
-      <lineVatRate><vatPercentage>0.27</vatPercentage></lineVatRate>
-    </line>
-  </invoiceLines>
-  <invoiceSummary><summaryNormal><summaryByVatRate>
-    <vatRate><vatExemption><case>AAM</case><reason>Alanyi adómentesség [Áfa tv. 187–196. §]</reason></vatExemption></vatRate>
-  </summaryByVatRate></summaryNormal></invoiceSummary>
-  </invoice></invoiceMain>
-</InvoiceData>"#;
-        let parsed = parse_nav_invoice_xml(xml.as_bytes()).expect("parse fixture");
-        assert_eq!(
-            parsed.lines[0].vat_rate_kind,
-            billing::VatRateKind::Percent,
-            "a summary-block exemption must not rewrite the line's kind"
-        );
-        assert_eq!(parsed.lines[0].vat_rate_percent, 27);
+  </invoiceHead>"#;
+        let tail = "</invoice></invoiceMain>\n</InvoiceData>";
+        // A taxed line — the one whose kind must survive untouched.
+        let taxed_line = "<line>\
+             <lineDescription>Tanácsadás</lineDescription>\
+             <quantity>1</quantity>\
+             <unitPrice>100000</unitPrice>\
+             <lineVatRate><vatPercentage>0.27</vatPercentage></lineVatRate>\
+             </line>";
+        // A summary bucket carrying the AAM exemption — element name,
+        // `<case>` and `<reason>` all identical to what a line would file.
+        let summary = "<invoiceSummary><summaryNormal><summaryByVatRate>\
+             <vatRate><vatExemption><case>AAM</case>\
+             <reason>Alanyi adómentesség [Áfa tv. 187–196. §]</reason>\
+             </vatExemption></vatRate>\
+             </summaryByVatRate></summaryNormal></invoiceSummary>";
+
+        let shapes = [
+            (
+                "A: summary after the lines (canonical NAV order)",
+                format!("{head}<invoiceLines>{taxed_line}</invoiceLines>{summary}{tail}"),
+                1,
+            ),
+            (
+                "B: summary BEFORE the lines — a leak here would land on line 1",
+                format!("{head}{summary}<invoiceLines>{taxed_line}</invoiceLines>{tail}"),
+                1,
+            ),
+            (
+                "C: exemption bucket BETWEEN two lines — a leak lands on line 2",
+                format!(
+                    "{head}<invoiceLines>{taxed_line}\
+                     <vatRate><vatExemption><case>AAM</case><reason>r</reason></vatExemption></vatRate>\
+                     {taxed_line}</invoiceLines>{tail}"
+                ),
+                2,
+            ),
+            (
+                "D: exemption bucket after the last line, still inside <invoiceLines>",
+                format!(
+                    "{head}<invoiceLines>{taxed_line}\
+                     <vatRate><vatExemption><case>AAM</case><reason>r</reason></vatExemption></vatRate>\
+                     </invoiceLines>{tail}"
+                ),
+                1,
+            ),
+        ];
+
+        for (label, xml, expected_lines) in shapes {
+            let parsed = parse_nav_invoice_xml(xml.as_bytes())
+                .unwrap_or_else(|e| panic!("{label}: must parse, got {e:#}"));
+            assert_eq!(parsed.lines.len(), expected_lines, "{label}: line count");
+            for (i, line) in parsed.lines.iter().enumerate() {
+                assert_eq!(
+                    line.vat_rate_kind,
+                    billing::VatRateKind::Percent,
+                    "{label}: line {} is a taxed 27% line — an out-of-line \
+                     exemption block must not rewrite its kind",
+                    i + 1
+                );
+                assert_eq!(line.vat_rate_percent, 27, "{label}: line {}", i + 1);
+                assert_eq!(
+                    crate::nav_xml::printed_vat_reference(line.vat_rate_kind)
+                        .expect("Percent resolves"),
+                    None,
+                    "{label}: line {} must print no exemption clause",
+                    i + 1
+                );
+            }
+        }
     }
 }
