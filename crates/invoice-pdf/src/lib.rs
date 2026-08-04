@@ -691,12 +691,34 @@ fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i6
             text_in(ops, "FI", 8, TableLayout::DESC_X, sub_y, &perf, MUTED);
             sub_y -= 11;
         }
+        let mut extra_subline = 0;
+        // ADR-0101 / Áfa tv. §169 — a non-`Percent` line (AAM, belföldi
+        // fordított adózás, KBAET, EUFAD37) charges no VAT, and the
+        // buyer's printed copy must name the legal ground for that.
+        // Before this sub-line existed such a line printed a bare "0%"
+        // in the ÁFA column with no reference at all, while NAV received
+        // the correct category — the paper copy was the non-compliant
+        // half. The string is derived by the orchestrator from the SAME
+        // mapping that emits the filed `<reason>`
+        // (`nav_xml::printed_vat_reference`), never composed here, so the
+        // two cannot drift.
+        //
+        // Printed ABOVE the operator's free-text note: the statutory
+        // reference is document content, the note is commentary.
+        if let Some(reference) = line
+            .vat_exemption_reference
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            text_in(ops, "FI", 8, TableLayout::DESC_X, sub_y, reference, MUTED);
+            sub_y -= 11;
+            extra_subline += 12;
+        }
         // PR-82 — per-line buyer note ("Megjegyzés"). Italic sub-line
         // labelled in Hungarian ("Megjegyzés:") so the buyer reads it
         // in context. Only renders when present; absent notes leave
         // the row at its base height so unannotated invoices look
         // identical to pre-PR-82 output.
-        let mut extra_subline = 0;
         if let Some(note) = line.note.as_ref().filter(|s| !s.trim().is_empty()) {
             let label = format!("Megjegyzés: {}", note);
             text_in(ops, "FI", 8, TableLayout::DESC_X, sub_y, &label, MUTED);
@@ -706,6 +728,7 @@ fn write_lines_table(ops: &mut Vec<Operation>, m: &InvoiceModel, top: i64) -> i6
         // Per PR-82 + PR-85 row-height composition:
         //   base 28pt
         // + (desc_lines - 1) × 11pt for each wrapped description line
+        // + 12pt iff an ADR-0101 VAT exemption reference prints
         // + 12pt iff a buyer note prints
         // Performance-period stays inside the 28pt slot (pre-PR-82
         // legacy posture — overlays into the row).
@@ -722,11 +745,21 @@ fn write_totals(
     top: i64,
     invoice_gross_minor: i64,
 ) -> i64 {
-    // Aggregate per-VAT-rate amounts.
-    let mut by_rate: std::collections::BTreeMap<u16, (i64, i64)> =
+    // Aggregate per-VAT-rate amounts. ADR-0101 — keyed on
+    // (rate-kind, percent), not percent alone: every non-`Percent` kind
+    // carries 0% by law, so a percent-only key would silently merge an
+    // AAM line, a reverse-charge line and a genuine numeric 0% line into
+    // one indistinguishable "0% ÁFA" bucket. Preflight admits only one
+    // kind per invoice today, so this is a guard rather than a live
+    // regrouping; for an all-`Percent` invoice the key's first component
+    // is constant and the ordering — hence the rendered output — is
+    // byte-identical to the pre-ADR-0101 percent-keyed map.
+    let mut by_rate: std::collections::BTreeMap<(&'static str, u16), (i64, i64)> =
         std::collections::BTreeMap::new();
     for line in &m.lines {
-        let entry = by_rate.entry(line.vat_rate_percent).or_insert((0, 0));
+        let entry = by_rate
+            .entry((line.vat_rate_kind.as_str(), line.vat_rate_percent))
+            .or_insert((0, 0));
         entry.0 += line.net_minor;
         entry.1 += line.vat_minor;
     }
@@ -748,7 +781,7 @@ fn write_totals(
     y -= 14;
 
     // Per-VAT-rate ÁFA in invoice currency, then HUF (non-HUF only).
-    for (&pct, &(_net, vat_minor)) in &by_rate {
+    for (&(_kind, pct), &(_net, vat_minor)) in &by_rate {
         let label = format!("{}% ÁFA:", pct);
         text_right_in(ops, "F1", 9, label_right, y, &label, MUTED);
         text_right(
@@ -1587,6 +1620,8 @@ mod tests {
                 unit_price_minor: 100_000,
                 net_minor: 100_000,
                 vat_rate_percent: 27,
+                vat_rate_kind: aberp_billing::VatRateKind::Percent,
+                vat_exemption_reference: None,
                 vat_minor: 27_000,
                 gross_minor: 127_000,
                 performance_period: None,
@@ -1903,6 +1938,179 @@ mod tests {
         assert!(
             !has_pair(&huf_ops),
             "HUF layout must not emit a € + NBSP pair (HUF is postfix `Ft`)"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Backlog #1 — the Áfa tv. §169 exemption reference on the printed
+    // copy. Before this, a non-`Percent` line rendered a bare "0%" in the
+    // ÁFA column and nothing else, so the buyer's paper invoice named no
+    // legal ground for charging no VAT — while NAV received the correct
+    // category. The renderer does not compose the wording (the
+    // orchestrator hands it over from the same mapping that files the
+    // NAV `<reason>`); what these pin is that it REACHES the page.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Does the emitted op stream contain a `Tj` run carrying `needle`?
+    fn renders_text(ops: &[Operation], needle: &str) -> bool {
+        let expected = text::winansi_bytes(needle);
+        tj_runs(ops)
+            .iter()
+            .any(|(_, bytes)| bytes.windows(expected.len().max(1)).any(|w| w == expected))
+    }
+
+    /// Each of the four wired non-`Percent` kinds renders its statutory
+    /// reference onto the page. Parameterised over the kinds with the
+    /// canonical strings `nav_xml::printed_vat_reference` produces, so a
+    /// renderer change that drops the sub-line is red for every kind.
+    #[test]
+    fn every_non_percent_kind_renders_its_exemption_reference() {
+        let cases = [
+            (
+                aberp_billing::VatRateKind::AamExempt,
+                "Alanyi adómentesség [Áfa tv. 187–196. §]",
+            ),
+            (
+                aberp_billing::VatRateKind::DomesticReverseCharge,
+                "Belföldi fordított adózás [Áfa tv. 142. §]",
+            ),
+            (
+                aberp_billing::VatRateKind::IntraCommunityGoods,
+                "Közösségen belüli adómentes termékértékesítés [Áfa tv. 89. §]",
+            ),
+            (
+                aberp_billing::VatRateKind::IntraCommunityServiceReverse,
+                "Áfa területi hatályán kívüli, fordított adózású ügylet [Áfa tv. 37. §]",
+            ),
+        ];
+
+        for (kind, reference) in cases {
+            let mut m = pin_model_with_brand(None);
+            m.lines[0].vat_rate_kind = kind;
+            m.lines[0].vat_rate_percent = 0;
+            m.lines[0].vat_minor = 0;
+            m.lines[0].gross_minor = m.lines[0].net_minor;
+            m.lines[0].vat_exemption_reference = Some(reference.to_string());
+
+            let mut ops: Vec<Operation> = Vec::new();
+            layout(&mut ops, &m, None);
+
+            assert!(
+                renders_text(&ops, reference),
+                "{kind:?} must print its Áfa tv. reference on the invoice; a bare \
+                 \"0%\" with no clause is the reported defect"
+            );
+        }
+    }
+
+    /// An ordinary numeric line is untouched: no extra sub-line, and its
+    /// rate still prints. Held against the exact op stream of the
+    /// unmodified pin model so any stray glyph would surface.
+    #[test]
+    fn percent_line_renders_unchanged_with_no_reference_subline() {
+        let m = pin_model_with_brand(None);
+        assert_eq!(
+            m.lines[0].vat_rate_kind,
+            aberp_billing::VatRateKind::Percent,
+            "the pin model's line is the ordinary numeric path"
+        );
+        assert!(m.lines[0].vat_exemption_reference.is_none());
+
+        let mut ops: Vec<Operation> = Vec::new();
+        layout(&mut ops, &m, None);
+        assert!(
+            renders_text(&ops, "27%"),
+            "a numeric line must still print its rate"
+        );
+        assert!(
+            !renders_text(&ops, "Áfa tv."),
+            "a fully-taxed line must carry NO exemption clause"
+        );
+    }
+
+    /// The reference sub-line grows the row rather than overprinting the
+    /// buyer note: with both present, each renders and they sit on
+    /// distinct baselines. A shared baseline would stack two strings of
+    /// ink on top of each other and lose the legal reference in practice.
+    #[test]
+    fn exemption_reference_and_buyer_note_do_not_overlap() {
+        let reference = "Alanyi adómentesség [Áfa tv. 187–196. §]";
+        let note = "PO-ref: 2026/Q2-007";
+        let mut m = pin_model_with_brand(None);
+        m.lines[0].vat_rate_kind = aberp_billing::VatRateKind::AamExempt;
+        m.lines[0].vat_rate_percent = 0;
+        m.lines[0].vat_exemption_reference = Some(reference.to_string());
+        m.lines[0].note = Some(note.to_string());
+
+        let mut ops: Vec<Operation> = Vec::new();
+        layout(&mut ops, &m, None);
+        assert!(renders_text(&ops, reference), "reference must render");
+        assert!(renders_text(&ops, note), "buyer note must still render");
+
+        // Collect the y of each sub-line's Td. `tj_runs` tracks x only,
+        // so walk the stream directly for the (x, y) pair.
+        let y_of = |needle: &str| -> i64 {
+            let expected = text::winansi_bytes(needle);
+            let mut last_y = i64::MIN;
+            for op in &ops {
+                match op.operator.as_str() {
+                    "Td" => {
+                        if let Some(Object::Integer(y)) = op.operands.get(1) {
+                            last_y = *y;
+                        }
+                    }
+                    "Tj" => {
+                        if let Some(Object::String(bytes, _)) = op.operands.first() {
+                            if bytes.windows(expected.len()).any(|w| w == expected) {
+                                return last_y;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("{needle:?} not found in the op stream");
+        };
+        assert_ne!(
+            y_of(reference),
+            y_of(note),
+            "the exemption reference and the buyer note must sit on separate \
+             baselines — overprinting would bury the statutory clause"
+        );
+    }
+
+    /// The totals block buckets on (rate-kind, percent), so an exempt line
+    /// and a genuine numeric 0% line cannot collapse into one
+    /// indistinguishable "0% ÁFA" row. Preflight admits a single kind per
+    /// invoice today, making this a guard rather than a live regrouping —
+    /// but the guard is what keeps a future multi-kind invoice honest.
+    #[test]
+    fn totals_do_not_merge_an_exempt_line_with_a_numeric_zero_line() {
+        let mut m = pin_model_with_brand(None);
+        let mut exempt = m.lines[0].clone();
+        exempt.vat_rate_kind = aberp_billing::VatRateKind::AamExempt;
+        exempt.vat_rate_percent = 0;
+        exempt.vat_minor = 0;
+        exempt.vat_exemption_reference =
+            Some("Alanyi adómentesség [Áfa tv. 187–196. §]".to_string());
+        let mut zero_rated = m.lines[0].clone();
+        zero_rated.vat_rate_kind = aberp_billing::VatRateKind::Percent;
+        zero_rated.vat_rate_percent = 0;
+        zero_rated.vat_minor = 0;
+        m.lines = vec![exempt, zero_rated];
+
+        let mut by_rate: std::collections::BTreeMap<(&'static str, u16), i64> =
+            std::collections::BTreeMap::new();
+        for line in &m.lines {
+            *by_rate
+                .entry((line.vat_rate_kind.as_str(), line.vat_rate_percent))
+                .or_insert(0) += line.net_minor;
+        }
+        assert_eq!(
+            by_rate.len(),
+            2,
+            "an AAM line and a numeric 0% line are legally different and must not \
+             share a totals bucket"
         );
     }
 }

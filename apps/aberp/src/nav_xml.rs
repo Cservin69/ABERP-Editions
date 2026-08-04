@@ -1754,6 +1754,68 @@ fn vat_rate_choice(kind: VatRateKind) -> Result<VatRateChoice> {
     })
 }
 
+/// ADR-0101 — the statutory Hungarian reference a `DomesticReverseCharge`
+/// line must carry on the PRINTED invoice.
+///
+/// # Why this is a constant and not read off [`vat_rate_choice`]
+///
+/// The other three wired kinds file a `<reason>` free-text element inside
+/// their `<vatExemption>` / `<vatOutOfScope>` wrapper, so their printed
+/// reference IS the filed reason (see [`printed_vat_reference`]).
+/// `DomesticReverseCharge` is different by NAV's own schema: it files a
+/// bare boolean `<vatDomesticReverseCharge>true</…>` that carries NO case
+/// code and NO reason element (ADR-0101 §2.2 table row 5). NAV therefore
+/// supplies no string to reuse — but Áfa tv. §169 still requires the
+/// reference on the buyer's paper copy, so the one kind that cannot
+/// derive its text needs it stated once, here, next to the mapping it
+/// belongs to.
+///
+/// The wording is NOT invented at this PR: it is the operator-facing
+/// selector hint's statutory clause, verbatim, from
+/// `apps/aberp-ui/ui/src/lib/issue-invoice.ts` (`VAT_KIND_OPTIONS` →
+/// `DomesticReverseCharge.hintHu`, "Belföldi fordított adózás [Áfa tv.
+/// 142. §]. A vevő önadózik; …" — the trailing self-assessment sentence
+/// is operator guidance, not the reference, so it is not printed). It
+/// matches the `<description> [Áfa tv. N. §]` shape of the three filed
+/// reasons above, and the §142 citation is the one ADR-0101 §2.2 records
+/// for this kind. `domestic_reverse_charge_reference_cites_142` (test)
+/// pins both the §142 citation and the fact that the wire really does
+/// carry no `<reason>` to derive from.
+const DOMESTIC_REVERSE_CHARGE_PRINTED_REFERENCE: &str =
+    "Belföldi fordított adózás [Áfa tv. 142. §]";
+
+/// The statutory Hungarian exemption / reverse-charge reference the
+/// PRINTED invoice must carry for one line — Áfa tv. §169, which requires
+/// the buyer's paper copy to name the legal ground whenever no VAT is
+/// charged. `None` for [`VatRateKind::Percent`]: an ordinary numeric line
+/// prints its rate and nothing more (the pre-fix output, unchanged).
+///
+/// # Single source of truth
+///
+/// This is DERIVED from [`vat_rate_choice`] — the same function that
+/// produces the `(element, case, reason)` triple actually filed to NAV —
+/// so the reference on the buyer's copy and the category in NAV's record
+/// cannot drift. For `AamExempt` / `IntraCommunityGoods` /
+/// `IntraCommunityServiceReverse` the printed string is byte-identical to
+/// the `<reason>` element in the submitted XML. Editing a `reason` in
+/// [`vat_rate_choice`] moves the printed invoice in the same commit,
+/// by construction. The single exception is the boolean
+/// `DomesticReverseCharge` kind, whose NAV element carries no reason at
+/// all — see [`DOMESTIC_REVERSE_CHARGE_PRINTED_REFERENCE`].
+///
+/// Named-deferred kinds propagate [`vat_rate_choice`]'s `anyhow!` rather
+/// than printing a blank reference (CLAUDE.md rule 12) — a kind that
+/// cannot be filed must not be printable either.
+pub(crate) fn printed_vat_reference(kind: VatRateKind) -> Result<Option<&'static str>> {
+    Ok(match vat_rate_choice(kind)? {
+        VatRateChoice::Percentage => None,
+        VatRateChoice::Exemption { reason, .. } | VatRateChoice::OutOfScope { reason, .. } => {
+            Some(reason)
+        }
+        VatRateChoice::DomesticReverseCharge => Some(DOMESTIC_REVERSE_CHARGE_PRINTED_REFERENCE),
+    })
+}
+
 /// ADR-0101 storno fold — the INVERSE of [`vat_rate_choice`]: given the
 /// `<lineVatRate>` choice `element` name and its optional `<case>` code
 /// (read back from an on-disk NAV XML), recover the [`VatRateKind`] that
@@ -1767,7 +1829,7 @@ fn vat_rate_choice(kind: VatRateKind) -> Result<VatRateChoice> {
 /// `(element, case, reason)` triple, and a change there is automatically
 /// reflected here. `Percent` is intentionally NOT in the search set — the
 /// numeric path is recovered from `<vatPercentage>`, not a wrapper element.
-fn vat_rate_kind_from_choice(element: &str, case: Option<&str>) -> Option<VatRateKind> {
+pub(crate) fn vat_rate_kind_from_choice(element: &str, case: Option<&str>) -> Option<VatRateKind> {
     const WIRED: [VatRateKind; 4] = [
         VatRateKind::AamExempt,
         VatRateKind::DomesticReverseCharge,
@@ -3192,5 +3254,170 @@ mod tests {
             msg.contains("read base NAV XML"),
             "must name the read failure: {msg}"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Backlog #1 — printed-invoice VAT exemption reference (Áfa tv. §169)
+    //
+    // The defect these pin: the printed PDF carried only
+    // `vat_rate_percent`, so a non-`Percent` line printed a bare "0% ÁFA"
+    // with NO statutory reference while NAV received the correct
+    // category. The buyer's paper copy — the half Hungarian law addresses
+    // — was the non-compliant one.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// The load-bearing anti-drift pin: for EVERY kind ADR-0101 wires,
+    /// the reference printed on the buyer's copy is the SAME string the
+    /// NAV emit derives its category from. Three of the four file a
+    /// `<reason>`, and the printed text must be that reason byte-for-byte
+    /// — editing one in `vat_rate_choice` therefore moves the printed
+    /// invoice in the same commit, or trips here.
+    ///
+    /// `DomesticReverseCharge` is the one kind that CANNOT be equal-tested
+    /// against a filed reason: NAV files it as a bare boolean carrying no
+    /// reason element at all (ADR-0101 §2.2 row 5). It is pinned instead
+    /// against its named constant, and separately for its §142 citation by
+    /// `domestic_reverse_charge_reference_cites_142`.
+    #[test]
+    fn printed_vat_reference_matches_the_filed_nav_reason_for_every_wired_kind() {
+        for kind in [
+            VatRateKind::AamExempt,
+            VatRateKind::DomesticReverseCharge,
+            VatRateKind::IntraCommunityGoods,
+            VatRateKind::IntraCommunityServiceReverse,
+        ] {
+            assert!(kind.is_wired(), "{kind:?} must be a wired kind");
+            let printed = printed_vat_reference(kind)
+                .unwrap_or_else(|e| panic!("printed_vat_reference({kind:?}): {e:#}"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{kind:?} charges no VAT, so Áfa tv. §169 requires a statutory \
+                         reference on the printed invoice — got None, which is exactly the \
+                         bare-\"0% ÁFA\" defect"
+                    )
+                });
+            assert!(
+                !printed.trim().is_empty(),
+                "{kind:?} printed reference must not be blank"
+            );
+            assert!(
+                printed.contains("Áfa tv."),
+                "{kind:?} printed reference must cite the Áfa tv.; got {printed:?}"
+            );
+
+            match vat_rate_choice(kind).expect("wired kind resolves a NAV choice") {
+                VatRateChoice::Exemption { reason, .. }
+                | VatRateChoice::OutOfScope { reason, .. } => assert_eq!(
+                    printed, reason,
+                    "{kind:?} — the printed reference and the filed <reason> MUST be one \
+                     string; they have drifted"
+                ),
+                VatRateChoice::DomesticReverseCharge => assert_eq!(
+                    printed, DOMESTIC_REVERSE_CHARGE_PRINTED_REFERENCE,
+                    "{kind:?} files no <reason>; its printed reference is the named constant"
+                ),
+                VatRateChoice::Percentage => {
+                    panic!("{kind:?} is wired and must not resolve to the numeric path")
+                }
+            }
+        }
+    }
+
+    /// The three kinds that DO file a `<reason>` must emit that very text
+    /// on the wire — proving the equality above is against the bytes NAV
+    /// actually receives, not merely against a sibling match arm.
+    #[test]
+    fn printed_vat_reference_appears_verbatim_in_the_emitted_nav_xml() {
+        for kind in [
+            VatRateKind::AamExempt,
+            VatRateKind::IntraCommunityGoods,
+            VatRateKind::IntraCommunityServiceReverse,
+        ] {
+            let printed = printed_vat_reference(kind)
+                .expect("wired kind")
+                .expect("non-Percent kind carries a reference");
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let mut w = Writer::new(&mut buf);
+                write_line_vat_rate(&mut w, kind, 0).expect("write_line_vat_rate");
+            }
+            let xml = String::from_utf8(buf).expect("utf8");
+            assert!(
+                xml.contains(&format!("<reason>{printed}</reason>")),
+                "{kind:?} — the printed reference must be the filed <reason>; \
+                 printed {printed:?}, emitted {xml}"
+            );
+        }
+    }
+
+    /// `DomesticReverseCharge` files a bare boolean — no `<case>`, no
+    /// `<reason>` — which is WHY its printed text is a constant rather
+    /// than a derivation. Pin both halves: the wire stays the boolean,
+    /// and the printed reference still names §142 (the citation ADR-0101
+    /// §2.2 records for this kind).
+    #[test]
+    fn domestic_reverse_charge_reference_cites_142() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            write_line_vat_rate(&mut w, VatRateKind::DomesticReverseCharge, 0)
+                .expect("write_line_vat_rate");
+        }
+        let xml = String::from_utf8(buf).expect("utf8");
+        assert!(
+            xml.contains("<vatDomesticReverseCharge>true</vatDomesticReverseCharge>"),
+            "the wire shape must stay the bare boolean: {xml}"
+        );
+        assert!(
+            !xml.contains("<reason>"),
+            "NAV files no reason for this kind — that is why the printed text is a \
+             constant; if a reason appears here, derive the printed text from it: {xml}"
+        );
+        assert!(
+            DOMESTIC_REVERSE_CHARGE_PRINTED_REFERENCE.contains("142. §"),
+            "printed reference must cite Áfa tv. §142; got {DOMESTIC_REVERSE_CHARGE_PRINTED_REFERENCE:?}"
+        );
+        assert!(
+            DOMESTIC_REVERSE_CHARGE_PRINTED_REFERENCE.contains("Belföldi fordított adózás"),
+            "printed reference must name the transaction in Hungarian; got \
+             {DOMESTIC_REVERSE_CHARGE_PRINTED_REFERENCE:?}"
+        );
+    }
+
+    /// An ordinary numeric line prints its rate and nothing else — the
+    /// pre-fix output, held byte-identical. A reference appearing here
+    /// would put an exemption clause on a fully-taxed invoice.
+    #[test]
+    fn printed_vat_reference_is_none_for_percent() {
+        assert_eq!(
+            printed_vat_reference(VatRateKind::Percent).expect("Percent resolves"),
+            None,
+            "a numeric VAT line must carry NO exemption reference"
+        );
+    }
+
+    /// A named-deferred kind cannot be filed, so it must not be printable
+    /// either: the error propagates from `vat_rate_choice` rather than
+    /// yielding a blank reference (CLAUDE.md rule 12).
+    #[test]
+    fn printed_vat_reference_rejects_named_deferred_kinds() {
+        for kind in [
+            VatRateKind::TamExempt,
+            VatRateKind::ExportGoods,
+            VatRateKind::OtherInternational,
+            VatRateKind::NewTransportIntraCommunity,
+            VatRateKind::OutOfScopeThirdCountry,
+            VatRateKind::MarginScheme,
+            VatRateKind::NoVatCharge,
+            VatRateKind::VatContent,
+        ] {
+            let err = printed_vat_reference(kind)
+                .expect_err("named-deferred kinds must not resolve a printed reference");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("named-deferred"),
+                "{kind:?} must fail loud as named-deferred; got {msg}"
+            );
+        }
     }
 }

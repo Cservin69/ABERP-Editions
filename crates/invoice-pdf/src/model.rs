@@ -6,7 +6,7 @@
 //! of those three sources is not on the model — no speculative fields
 //! per CLAUDE.md rule 2.
 
-use aberp_billing::{Currency, RateMetadata};
+use aberp_billing::{Currency, RateMetadata, VatRateKind};
 use rust_decimal::Decimal;
 use time::Date;
 
@@ -116,6 +116,34 @@ pub struct LineItem {
     pub unit_price_minor: i64,
     pub net_minor: i64,
     pub vat_rate_percent: u16,
+    /// ADR-0101 — WHICH NAV `<lineVatRate>` choice this line was filed
+    /// under. `Percent` (the default, and every pre-0101 invoice) means
+    /// `vat_rate_percent` above is the whole story. The non-`Percent`
+    /// kinds are the Hungarian zero-VAT situations — exempt /
+    /// reverse-charge / out-of-scope — which are NOT a numeric zero rate
+    /// and must not print as one: they file 0 VAT under a named legal
+    /// ground, carried in [`Self::vat_exemption_reference`].
+    ///
+    /// The renderer routes on this rather than on `vat_rate_percent == 0`
+    /// because a genuine numeric 0% line and an AAM line are legally
+    /// different documents while sharing the same amounts.
+    pub vat_rate_kind: VatRateKind,
+    /// ADR-0101 / Áfa tv. §169 — the statutory Hungarian reference the
+    /// buyer's printed copy must name whenever no VAT is charged (e.g.
+    /// "Alanyi adómentesség [Áfa tv. 187–196. §]"). Rendered as a sub-line
+    /// under the line description.
+    ///
+    /// `Some` exactly when [`Self::vat_rate_kind`] is non-`Percent`;
+    /// `None` for an ordinary numeric line (which renders byte-identically
+    /// to the pre-ADR-0101 output).
+    ///
+    /// The renderer does NOT compose this text — it is derived by the
+    /// binary-side orchestrator from `nav_xml::printed_vat_reference`, the
+    /// same mapping that produces the `<reason>` actually filed to NAV, so
+    /// the paper copy and the NAV record cannot drift. Keeping the string
+    /// on the model (rather than a match inside the renderer) is what
+    /// keeps the legal wording in ONE place, next to the NAV emit.
+    pub vat_exemption_reference: Option<String>,
     pub vat_minor: i64,
     pub gross_minor: i64,
     /// Optional sub-line printed under the description as

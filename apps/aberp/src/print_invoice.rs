@@ -278,26 +278,48 @@ pub fn render_to_bytes(
         .lines
         .iter()
         .enumerate()
-        .map(|(idx, l)| PdfLine {
-            description: l.description.clone(),
-            quantity: l.quantity,
-            unit: unit_display_from_nav(&l.unit_of_measure, l.unit_of_measure_own.as_deref()),
-            unit_price_minor: native_to_minor(&l.unit_price_native, currency),
-            net_minor: native_to_minor(&l.net_native, currency),
-            vat_rate_percent: l.vat_rate_percent,
-            vat_minor: native_to_minor(&l.vat_native, currency),
-            gross_minor: native_to_minor(&l.gross_native, currency),
-            performance_period: None,
-            // PR-82 — pair the per-line note off the DuckDB read by
-            // ordinal. The NAV-XML line order is the regulatory wire
-            // order (ordered by `ordinal` ascending at write time per
-            // `allocate_in_tx`'s `invoice_line` INSERT loop), so
-            // index-pairing here is sound. A drift on either side
-            // would surface visibly: NAV line 1's gross next to the
-            // wrong line's note.
-            note: invoice_notes.line_notes.get(idx).cloned().unwrap_or(None),
+        .map(|(idx, l)| {
+            // ADR-0101 / Áfa tv. §169 — the exemption reference for a
+            // non-`Percent` line comes off `nav_xml::printed_vat_reference`,
+            // which derives it from `vat_rate_choice` — the SAME mapping
+            // that emitted the `<reason>` in the filed XML. The printed
+            // reference and the NAV category are therefore one source; the
+            // renderer is handed finished text and composes no legal
+            // wording of its own. `None` for `Percent`, which prints
+            // exactly as it did before.
+            let vat_exemption_reference = crate::nav_xml::printed_vat_reference(l.vat_rate_kind)
+                .with_context(|| {
+                    format!(
+                        "resolve the Áfa tv. exemption reference for printed-invoice line {} \
+                         (VAT rate-kind {})",
+                        idx + 1,
+                        l.vat_rate_kind.as_str()
+                    )
+                })?
+                .map(str::to_string);
+            Ok(PdfLine {
+                description: l.description.clone(),
+                quantity: l.quantity,
+                unit: unit_display_from_nav(&l.unit_of_measure, l.unit_of_measure_own.as_deref()),
+                unit_price_minor: native_to_minor(&l.unit_price_native, currency),
+                net_minor: native_to_minor(&l.net_native, currency),
+                vat_rate_percent: l.vat_rate_percent,
+                vat_rate_kind: l.vat_rate_kind,
+                vat_exemption_reference,
+                vat_minor: native_to_minor(&l.vat_native, currency),
+                gross_minor: native_to_minor(&l.gross_native, currency),
+                performance_period: None,
+                // PR-82 — pair the per-line note off the DuckDB read by
+                // ordinal. The NAV-XML line order is the regulatory wire
+                // order (ordered by `ordinal` ascending at write time per
+                // `allocate_in_tx`'s `invoice_line` INSERT loop), so
+                // index-pairing here is sound. A drift on either side
+                // would surface visibly: NAV line 1's gross next to the
+                // wrong line's note.
+                note: invoice_notes.line_notes.get(idx).cloned().unwrap_or(None),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let model = InvoiceModel {
         invoice_number: parsed.invoice_number.clone(),
@@ -518,6 +540,19 @@ pub struct ParsedNavLine {
     pub unit_price_native: String,
     pub net_native: String,
     pub vat_rate_percent: u16,
+    /// ADR-0101 — WHICH `<lineVatRate>` choice the filed XML carried for
+    /// this line, recovered from the on-disk regulatory record via
+    /// [`crate::nav_xml::vat_rate_kind_from_choice`] (the same inverse the
+    /// storno fold uses). `Percent` — the `Default` — for the numeric
+    /// `<vatPercentage>` path and therefore for every pre-ADR-0101
+    /// invoice, so nothing about legacy XML parsing changes.
+    ///
+    /// Before this field existed the parser captured `<vatPercentage>`
+    /// only. A non-`Percent` line has NO `<vatPercentage>` element at all
+    /// (NAV's `LineVatRateType` is a choice), so `vat_rate_percent` simply
+    /// stayed at its `0` default and the printed PDF showed a bare "0%"
+    /// with no legal ground — the defect this field closes.
+    pub vat_rate_kind: billing::VatRateKind,
     pub vat_native: String,
     pub gross_native: String,
 }
@@ -535,6 +570,13 @@ pub fn parse_nav_invoice_xml(bytes: &[u8]) -> Result<ParsedNavInvoice> {
     let mut path: Vec<String> = Vec::new();
     let mut out = ParsedNavInvoice::empty();
     let mut cur_line: Option<ParsedNavLine> = None;
+    // ADR-0101 — the `<lineVatRate>` choice WRAPPER element + its `<case>`
+    // code for the line currently being read. Kept as parser locals rather
+    // than fields on `ParsedNavLine` because they are scaffolding: they are
+    // consumed at `</line>` to resolve `vat_rate_kind` and never surface on
+    // the parsed model. Reset on every `<line>`.
+    let mut cur_vat_choice_element: Option<String> = None;
+    let mut cur_vat_case: Option<String> = None;
     let mut address_buf: Vec<String> = Vec::new();
     let mut address_in: Option<&'static str> = None;
     let mut buf = Vec::new();
@@ -566,6 +608,22 @@ pub fn parse_nav_invoice_xml(bytes: &[u8]) -> Result<ParsedNavInvoice> {
                         ) =>
                     {
                         cur_line = Some(ParsedNavLine::default());
+                        cur_vat_choice_element = None;
+                        cur_vat_case = None;
+                    }
+                    // ADR-0101 — a `<lineVatRate>` choice WRAPPER. Record
+                    // WHICH one this line carries; the `<case>` child (if
+                    // any) is captured as a leaf below and the pair is
+                    // resolved to a `VatRateKind` at `</line>`. Guarded on
+                    // `cur_line` so the invoice-level `summaryByVatRate`
+                    // block — which carries the very same element names
+                    // outside any `<line>` — cannot spoof a line's kind.
+                    // Same bounded-to-`<line>` posture as the storno fold's
+                    // reader in `nav_xml::read_invoice_lines_from_xml`.
+                    "vatExemption" | "vatOutOfScope" | "vatDomesticReverseCharge"
+                        if cur_line.is_some() =>
+                    {
+                        cur_vat_choice_element = Some(name.clone());
                     }
                     "supplierAddress" => {
                         address_in = Some("supplier");
@@ -585,7 +643,37 @@ pub fn parse_nav_invoice_xml(bytes: &[u8]) -> Result<ParsedNavInvoice> {
             Ok(Event::End(e)) => {
                 let name = String::from_utf8_lossy(local_name(e.name().as_ref())).to_string();
                 if name == "line" && cur_line.is_some() {
-                    out.lines.push(cur_line.take().unwrap());
+                    let mut line = cur_line.take().unwrap();
+                    // ADR-0101 — resolve the recorded choice wrapper into
+                    // the kind that emitted it, through the SAME inverse
+                    // the storno fold uses, so the printed category and the
+                    // filed category are one derivation. Absent wrapper =
+                    // the numeric `<vatPercentage>` path, which already
+                    // filled `vat_rate_percent` and leaves the default
+                    // `Percent` kind in place (pre-ADR-0101 XML unchanged).
+                    if let Some(element) = cur_vat_choice_element.take() {
+                        line.vat_rate_kind = crate::nav_xml::vat_rate_kind_from_choice(
+                            &element,
+                            cur_vat_case.as_deref(),
+                        )
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "unrecognised <lineVatRate> choice <{element}> (case {:?}) while \
+                                 rendering the printed invoice — cannot determine the Áfa tv. \
+                                 exemption reference this line must carry (ADR-0101). Only the \
+                                 wired kinds (AAM / KBAET / EUFAD37 / vatDomesticReverseCharge) \
+                                 are printable.",
+                                cur_vat_case
+                            )
+                        })?;
+                        // Exempt / reverse-charge / out-of-scope lines carry
+                        // 0 VAT by law and file no `<vatPercentage>`; make
+                        // the numeric column say so explicitly rather than
+                        // leaning on the struct default.
+                        line.vat_rate_percent = 0;
+                    }
+                    cur_vat_case = None;
+                    out.lines.push(line);
                 }
                 if name == "supplierAddress" && address_in == Some("supplier") {
                     out.supplier_address_lines = std::mem::take(&mut address_buf);
@@ -602,6 +690,14 @@ pub fn parse_nav_invoice_xml(bytes: &[u8]) -> Result<ParsedNavInvoice> {
                     .unescape()
                     .map_err(|e| anyhow!("XML text decode failed: {e}"))?
                     .into_owned();
+                // ADR-0101 — the `<case>` code inside a line's
+                // `vatExemption` / `vatOutOfScope` wrapper. Bounded to
+                // `cur_line` for the same anti-spoof reason as the wrapper
+                // capture above; `<case>` appears nowhere else inside a
+                // `<line>`.
+                if cur_line.is_some() && path.last().map(String::as_str) == Some("case") {
+                    cur_vat_case = Some(value.clone());
+                }
                 handle_text(
                     &path,
                     &value,
@@ -2140,5 +2236,220 @@ swift_bic = "OTPVHUHB"
             .map(|l| unit_display_from_nav(&l.unit_of_measure, l.unit_of_measure_own.as_deref()))
             .collect();
         assert_eq!(labels, vec!["nap".to_string(), "liter@15C".to_string()]);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Backlog #1 — the printed invoice must carry the Áfa tv. exemption
+    // reference for every non-`Percent` line (ADR-0101 / Áfa tv. §169).
+    //
+    // The defect: this parser captured `<vatPercentage>` and nothing
+    // else. A non-`Percent` line files NO `<vatPercentage>` at all (NAV's
+    // `LineVatRateType` is a choice), so `vat_rate_percent` stayed at its
+    // `0` default and the PDF printed a bare "0%" with no legal ground,
+    // while NAV held the correct category. These pins are red the moment
+    // the kind stops reaching the renderer.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Build a one-line NAV body whose `<lineVatRate>` carries the given
+    /// choice XML — the same shape `nav_xml::write_line_vat_rate` emits.
+    fn xml_with_line_vat_rate(choice: &str) -> String {
+        format!(
+            r#"<InvoiceData>
+  <invoiceNumber>TST-2026-VAT</invoiceNumber>
+  <invoiceMain><invoice><invoiceHead>
+    <customerInfo><customerName>X</customerName></customerInfo>
+  </invoiceHead>
+  <invoiceLines>
+    <line>
+      <lineDescription>Tanácsadás</lineDescription>
+      <quantity>1</quantity>
+      <unitOfMeasure>PIECE</unitOfMeasure>
+      <unitPrice>100000</unitPrice>
+      <lineNetAmount>100000</lineNetAmount>
+      <lineVatRate>{choice}</lineVatRate>
+      <lineVatAmount>0</lineVatAmount>
+      <lineGrossAmountNormal>100000</lineGrossAmountNormal>
+    </line>
+  </invoiceLines>
+  </invoice></invoiceMain>
+</InvoiceData>"#
+        )
+    }
+
+    /// Every wired non-`Percent` kind must survive the round trip
+    /// XML → parsed kind → printed reference, and the reference must be
+    /// a real Áfa tv. clause rather than a bare rate. The AAM /
+    /// domestic-reverse-charge / EU-goods (KBAET) / EU-service (EUFAD37)
+    /// arms are each exercised.
+    #[test]
+    fn every_wired_kind_parses_back_and_yields_its_exemption_reference() {
+        let cases = [
+            (
+                "<vatExemption><case>AAM</case><reason>Alanyi adómentesség [Áfa tv. 187–196. §]</reason></vatExemption>",
+                billing::VatRateKind::AamExempt,
+            ),
+            (
+                "<vatDomesticReverseCharge>true</vatDomesticReverseCharge>",
+                billing::VatRateKind::DomesticReverseCharge,
+            ),
+            (
+                "<vatExemption><case>KBAET</case><reason>Közösségen belüli adómentes termékértékesítés [Áfa tv. 89. §]</reason></vatExemption>",
+                billing::VatRateKind::IntraCommunityGoods,
+            ),
+            (
+                "<vatOutOfScope><case>EUFAD37</case><reason>Áfa területi hatályán kívüli, fordított adózású ügylet [Áfa tv. 37. §]</reason></vatOutOfScope>",
+                billing::VatRateKind::IntraCommunityServiceReverse,
+            ),
+        ];
+
+        for (choice, expected_kind) in cases {
+            let xml = xml_with_line_vat_rate(choice);
+            let parsed = parse_nav_invoice_xml(xml.as_bytes())
+                .unwrap_or_else(|e| panic!("parse {expected_kind:?} fixture: {e:#}"));
+            assert_eq!(parsed.lines.len(), 1);
+            let line = &parsed.lines[0];
+            assert_eq!(
+                line.vat_rate_kind, expected_kind,
+                "the filed <lineVatRate> choice must recover {expected_kind:?}"
+            );
+            assert_eq!(line.vat_rate_percent, 0, "{expected_kind:?} charges no VAT");
+
+            let reference = crate::nav_xml::printed_vat_reference(line.vat_rate_kind)
+                .unwrap_or_else(|e| panic!("reference for {expected_kind:?}: {e:#}"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{expected_kind:?} printed as a bare 0% line with no Áfa tv. \
+                         reference — this is the reported defect"
+                    )
+                });
+            assert!(
+                reference.contains("Áfa tv."),
+                "{expected_kind:?} must print a statutory clause, not a bare rate; \
+                 got {reference:?}"
+            );
+        }
+    }
+
+    /// The exemption / out-of-scope kinds must print the EXACT `<reason>`
+    /// their own filed XML carries — the buyer's copy and NAV's record
+    /// stating the same legal ground, from the same source. (The
+    /// domestic-reverse-charge kind is absent here by construction: NAV
+    /// files it as a bare boolean with no reason to compare against.)
+    #[test]
+    fn printed_reference_equals_the_reason_in_the_filed_xml() {
+        let cases = [
+            (
+                "AAM",
+                "Alanyi adómentesség [Áfa tv. 187–196. §]",
+                "vatExemption",
+            ),
+            (
+                "KBAET",
+                "Közösségen belüli adómentes termékértékesítés [Áfa tv. 89. §]",
+                "vatExemption",
+            ),
+            (
+                "EUFAD37",
+                "Áfa területi hatályán kívüli, fordított adózású ügylet [Áfa tv. 37. §]",
+                "vatOutOfScope",
+            ),
+        ];
+        for (case, reason, element) in cases {
+            let xml = xml_with_line_vat_rate(&format!(
+                "<{element}><case>{case}</case><reason>{reason}</reason></{element}>"
+            ));
+            let parsed = parse_nav_invoice_xml(xml.as_bytes()).expect("parse fixture");
+            let reference = crate::nav_xml::printed_vat_reference(parsed.lines[0].vat_rate_kind)
+                .expect("wired kind")
+                .expect("non-Percent kind carries a reference");
+            assert_eq!(
+                reference, reason,
+                "case {case}: the printed reference must be the filed <reason>"
+            );
+        }
+    }
+
+    /// An ordinary numeric line is untouched: `Percent` kind, its real
+    /// rate, and no exemption reference. This is the back-compat half —
+    /// every pre-ADR-0101 invoice on disk takes this path.
+    #[test]
+    fn percent_line_is_unchanged_and_carries_no_reference() {
+        let xml = xml_with_line_vat_rate("<vatPercentage>0.27</vatPercentage>");
+        let parsed = parse_nav_invoice_xml(xml.as_bytes()).expect("parse fixture");
+        let line = &parsed.lines[0];
+        assert_eq!(line.vat_rate_kind, billing::VatRateKind::Percent);
+        assert_eq!(line.vat_rate_percent, 27);
+        assert_eq!(
+            crate::nav_xml::printed_vat_reference(line.vat_rate_kind).expect("Percent resolves"),
+            None,
+            "a taxed line must not print an exemption clause"
+        );
+    }
+
+    /// A genuine numeric 0% line stays `Percent` — it is NOT silently
+    /// upgraded into an exemption. The two are legally different
+    /// documents that happen to share the same amounts, which is exactly
+    /// why the renderer routes on the kind and not on `percent == 0`.
+    #[test]
+    fn numeric_zero_percent_line_is_not_treated_as_exempt() {
+        let xml = xml_with_line_vat_rate("<vatPercentage>0.00</vatPercentage>");
+        let parsed = parse_nav_invoice_xml(xml.as_bytes()).expect("parse fixture");
+        let line = &parsed.lines[0];
+        assert_eq!(line.vat_rate_kind, billing::VatRateKind::Percent);
+        assert_eq!(line.vat_rate_percent, 0);
+        assert_eq!(
+            crate::nav_xml::printed_vat_reference(line.vat_rate_kind).expect("Percent resolves"),
+            None
+        );
+    }
+
+    /// An unrecognised `<lineVatRate>` choice loud-fails the render rather
+    /// than printing a reference-less 0% line (CLAUDE.md rule 11) — the
+    /// silent-wrong-paper-copy failure mode must stay impossible.
+    #[test]
+    fn unrecognised_vat_choice_loud_fails_the_parse() {
+        let xml = xml_with_line_vat_rate(
+            "<vatExemption><case>TAM</case><reason>x</reason></vatExemption>",
+        );
+        let err = parse_nav_invoice_xml(xml.as_bytes())
+            .expect_err("an unwired case code must not parse into a printable line");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unrecognised <lineVatRate> choice"),
+            "must name the unrecognised choice: {msg}"
+        );
+    }
+
+    /// The invoice-level `summaryByVatRate` block carries the very same
+    /// element + `<case>` names OUTSIDE any `<line>`. It must not leak
+    /// into a line's kind — a summary-driven kind would put the wrong
+    /// legal clause on a taxed line.
+    #[test]
+    fn summary_vat_rate_block_cannot_spoof_a_line_kind() {
+        let xml = r#"<InvoiceData>
+  <invoiceNumber>TST-2026-SUM</invoiceNumber>
+  <invoiceMain><invoice><invoiceHead>
+    <customerInfo><customerName>X</customerName></customerInfo>
+  </invoiceHead>
+  <invoiceLines>
+    <line>
+      <lineDescription>Tanácsadás</lineDescription>
+      <quantity>1</quantity>
+      <unitPrice>100000</unitPrice>
+      <lineVatRate><vatPercentage>0.27</vatPercentage></lineVatRate>
+    </line>
+  </invoiceLines>
+  <invoiceSummary><summaryNormal><summaryByVatRate>
+    <vatRate><vatExemption><case>AAM</case><reason>Alanyi adómentesség [Áfa tv. 187–196. §]</reason></vatExemption></vatRate>
+  </summaryByVatRate></summaryNormal></invoiceSummary>
+  </invoice></invoiceMain>
+</InvoiceData>"#;
+        let parsed = parse_nav_invoice_xml(xml.as_bytes()).expect("parse fixture");
+        assert_eq!(
+            parsed.lines[0].vat_rate_kind,
+            billing::VatRateKind::Percent,
+            "a summary-block exemption must not rewrite the line's kind"
+        );
+        assert_eq!(parsed.lines[0].vat_rate_percent, 27);
     }
 }
