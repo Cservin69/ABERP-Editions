@@ -82,7 +82,18 @@ Key trust boundaries documented today:
 ### Supply chain
 
 - `cargo-deny` in CI: forbidden licenses, banned crates, advisory checks.
-- `cargo-audit` in CI: known-vuln check on every build.
+  Runs unconditionally on every push and PR — never gated to a matrix arm.
+- ~~`cargo-audit` in CI: known-vuln check on every build.~~ **Retired
+  2026-08-04.** `cargo-audit` reads `Cargo.lock` textually and is feature-blind;
+  `Cargo.lock` records *optional* dependencies whether or not any feature
+  activates them, so it reported CVE-class advisories against crates this
+  workspace never compiles (RUSTSEC-2026-0235 / `rkyv`, an optional
+  `rust_decimal` dep behind a feature nothing enables). The only ways to green
+  it were to ignore a CVE-class advisory or to fork the crate — both worse than
+  the finding. `cargo-deny` resolves features, so it is now the single advisory
+  gate, hardened to compensate: `unmaintained`/`unsound` scoped to `"all"` (the
+  defaults skip transitive deps) and the config-drift lints promoted to errors.
+  Rationale and the reachability argument live at the top of `deny.toml`.
 - **Pinned dependency versions** (`Cargo.lock` checked in, `--locked` builds).
 - **License allow-list**: MIT, Apache-2.0, BSD-3-Clause, MPL-2.0. Anything
   else requires a documented exception.

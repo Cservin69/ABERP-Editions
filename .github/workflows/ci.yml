@@ -17,10 +17,9 @@
 # release branches and run/upgrade_portable.sh are deliberately LEFT IN PLACE
 # — this change is scoped to CI.
 #
-# Per ADR-0007 "Supply chain": cargo-deny on --locked deps. (ADR-0007 and the
-# S303 notes still say "cargo-deny + cargo-audit"; cargo-audit was retired
-# 2026-08-04 as feature-blind — see the supply-chain step below and deny.toml.
-# ADR-0007 wants a superseding amendment to ratify the single-gate posture.)
+# Per ADR-0007 "Supply chain": cargo-deny on --locked deps. (cargo-audit was
+# retired 2026-08-04 as feature-blind — see the supply-chain step below,
+# deny.toml, and the amended ADR-0007 §"Supply chain".)
 # Per ADR-0001/0021: the toolchain is the pinned stable CHANNEL declared in
 # rust-toolchain.toml — the MSRV floor lives in each Cargo.toml's
 # `rust-version`, and Cargo.lock is the load-bearing reproducibility pin. CI
