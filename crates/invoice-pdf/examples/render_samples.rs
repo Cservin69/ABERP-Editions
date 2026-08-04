@@ -20,7 +20,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use aberp_billing::{Currency, RateMetadata};
+use aberp_billing::{Currency, RateMetadata, VatRateKind};
 use aberp_invoice_pdf::{render_invoice, InvoiceModel, LineItem, PartyInfo};
 use rust_decimal::Decimal;
 use time::macros::date;
@@ -98,6 +98,8 @@ fn sample_huf_short() -> InvoiceModel {
             unit_price_minor: 250_000,
             net_minor: 250_000,
             vat_rate_percent: 27,
+            vat_rate_kind: VatRateKind::Percent,
+            vat_exemption_reference: None,
             vat_minor: 67_500,
             gross_minor: 317_500,
             performance_period: None,
@@ -138,6 +140,8 @@ fn sample_eur_long() -> InvoiceModel {
                 unit_price_minor: 150_000,
                 net_minor: 150_000,
                 vat_rate_percent: 27,
+                vat_rate_kind: VatRateKind::Percent,
+                vat_exemption_reference: None,
                 vat_minor: 40_500,
                 gross_minor: 190_500,
                 performance_period: Some((date!(2026 - 04 - 01), date!(2026 - 06 - 30))),
@@ -150,6 +154,8 @@ fn sample_eur_long() -> InvoiceModel {
                 unit_price_minor: 50_000,
                 net_minor: 50_000,
                 vat_rate_percent: 27,
+                vat_rate_kind: VatRateKind::Percent,
+                vat_exemption_reference: None,
                 vat_minor: 13_500,
                 gross_minor: 63_500,
                 performance_period: None,
