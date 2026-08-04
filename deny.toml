@@ -1,17 +1,44 @@
 # cargo-deny configuration per ADR-0007 section "Supply chain".
 #
-# License allow-list, advisory checks against RustSec, ban + source policy.
-# Run locally before opening a PR:
+# cargo-deny is THE supply-chain gate. License allow-list, advisory checks
+# against RustSec, ban + source policy. Run locally before opening a PR with
+# the SAME flags CI uses — a bare `cargo deny check` is WEAKER, because the
+# drift lints below are warnings by default:
 #
-#   cargo deny check
+#   cargo deny check --deny advisory-not-detected \
+#                    --deny license-not-encountered \
+#                    --deny license-exception-not-encountered \
+#                    --deny unmatched-skip
 #
-# CI runs this on every push and pull request via .github/workflows/ci.yml.
+# CI runs exactly that on every push and pull request via
+# .github/workflows/ci.yml, UNCONDITIONALLY — not gated to a matrix arm.
+# (Gating it to one arm is what silently killed the previous gate: the arm
+# was dropped, the `if:` went permanently false, and the step reported
+# `skipped` — green — for every merge.)
+#
+# 2026-08-04: `cargo audit` was REMOVED as a second gate. It scans Cargo.lock
+# textually and is feature-BLIND, so it reports optional dependencies that are
+# never compiled. Concretely it failed on RUSTSEC-2026-0235 (rkyv 0.7.46) even
+# though `rkyv` is an *optional* dep of `rust_decimal` behind a non-default
+# feature nothing in this workspace enables — `cargo tree -i rkyv` prints
+# "nothing to print". A gate that cannot tell "in the lockfile" from "in the
+# build" trains people to add ignore entries for phantom findings, which is
+# how a real advisory eventually gets waved through. cargo-deny resolves
+# features, so it never saw rkyv and needs NO ignore entry for it.
+# One gate, feature-aware, maximally strict.
 #
 # Exceptions are added per-crate with a comment naming the crate and the
 # reason. Soft-asserting "we'll allow this whole license class because it's
 # everywhere" is exactly the failure mode CLAUDE.md rule 12 names.
 
 [graph]
+# LOAD-BEARING — do not flip to `true` casually. The feature-aware graph is
+# the entire reason cargo-deny can replace cargo-audit WITHOUT ignore-listing
+# a CVE-class advisory (see the rkyv note above). Verified 2026-08-04 that
+# `--all-features` does not currently drag `rkyv` back in (rust_decimal is a
+# dependency, not a workspace member, so its optional features stay off), but
+# widening the graph is exactly the change that could resurrect a phantom
+# finding. If you flip this, re-run `cargo tree -i rkyv --workspace` first.
 all-features = false
 no-default-features = false
 
@@ -19,14 +46,39 @@ no-default-features = false
 feature-depth = 1
 
 # ─────────────────────────────────────────────────────────────────────
-# Advisories — RustSec advisory database. cargo-audit covers the same
-# database from a different angle; running both is intentional per the
-# session-5 handoff and ADR-0007 "cargo-deny and cargo-audit in CI".
+# Advisories — RustSec advisory database. cargo-deny is the ONLY advisory
+# gate as of 2026-08-04 (see the cargo-audit removal note at the top).
+#
+# On SEVERITY: with `version = 2` there are NO `vulnerability` / `notice` /
+# `severity-threshold` knobs — cargo-deny removed them (upstream PR #611) and
+# every advisory is a hard error unless explicitly listed in `ignore` below.
+# The vulnerability class is therefore already maximally strict and cannot be
+# downgraded from this file. Setting `vulnerability = "deny"` is not "extra
+# safe", it is a config parse ERROR.
+#
+# The two knobs that DO still exist — `unmaintained` and `unsound` — are NOT
+# severities, they are reachability SCOPES, and their defaults do not cover
+# transitive dependencies. That default is precisely how an advisory class
+# went silently un-gated here: under the previous config cargo-deny reported
+# 20 advisories, and the 21st (RUSTSEC-2024-0429, `unsound` in glib, reached
+# transitively through Tauri's GTK3 backend) was never emitted at all. Its
+# ignore entry sat dead in this list warning `advisory-not-detected`, which
+# reads like a stale entry to prune rather than a scoped-out finding — the
+# most dangerous shape a dead gate can take. Both are pinned to "all" so
+# transitive crates count. DO NOT LOWER THEM.
+#
+# On DRIFT: a dead ignore entry is only a warning to cargo-deny by default, so
+# this list could accumulate entries matching nothing while a real advisory
+# hid behind a scope. CI promotes `advisory-not-detected` to an ERROR, so
+# every id below must match something in the graph on every run or the build
+# fails. Prune, don't accumulate.
 # ─────────────────────────────────────────────────────────────────────
 [advisories]
 version = 2
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
+unmaintained = "all"
+unsound = "all"
 ignore = [
     # S303 first-CI-green sweep: two `unic-ucd-*` unmaintained advisories
     # reach the graph via `tauri-utils → urlpattern → unic-ucd-ident →
@@ -53,7 +105,7 @@ ignore = [
     { id = "RUSTSEC-2024-0418", reason = "gtk-sys unmaintained via Tauri GTK3 backend." },
     { id = "RUSTSEC-2024-0419", reason = "gdkwayland-sys unmaintained via Tauri GTK3 backend." },
     { id = "RUSTSEC-2024-0420", reason = "gdkx11-sys unmaintained via Tauri GTK3 backend." },
-    { id = "RUSTSEC-2024-0429", reason = "glib 0.18.x VariantStrIter unsoundness via Tauri GTK3 backend. Not directly used by ABERP; revisit when Tauri 2 ships a GTK4 path." },
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18.x VariantStrIter unsoundness via Tauri GTK3 backend. Not directly used by ABERP; revisit when Tauri 2 ships a GTK4 path. NOTE: only actually REPORTED since `unsound = \"all\"` (2026-08-04) — before that this entry matched nothing and warned advisory-not-detected, which looked like drift but was a scoped-out finding." },
 
     # ─── Older ecosystem crates still in transitive trees; none
     # ship CVE-class issues — all are unmaintained warnings. ───
@@ -66,10 +118,25 @@ ignore = [
     # advisories flagged against the pristine, UNCHANGED Cargo.lock (orthogonal
     # to the durability work). anyhow (RUSTSEC-2026-0190) was FIXED by a bump
     # to 1.0.103 and is intentionally NOT ignored. The three below have no
-    # clean bump and are ignored with an explicit reachability assessment. ───
+    # clean bump and are ignored with an explicit reachability assessment.
+    # Re-verified 2026-08-04 against the feature-aware graph: cargo-deny flags
+    # all three on its own (-0194/-0195 as `vulnerability`, -0192 as
+    # `unmaintained`), so none were cargo-audit-only artifacts. They lived only
+    # in the CI inline --ignore list and in this file, never in audit.toml;
+    # with cargo-audit gone this file is the single source of truth. ───
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained (patched=[]; no fixed version exists). Reached ONLY via lopdf -> invoice-pdf printed-invoice rendering (built-in Helvetica/WinAnsi + first-party templates, never attacker-supplied fonts) -> not attacker-reachable. TODO revisit: migrate font path to skrifa, or drop when lopdf stops depending on ttf-parser." },
     { id = "RUSTSEC-2026-0194", reason = "quick-xml <0.41 quadratic attribute-dup DoS. Two instances: our direct 0.36 (NAV/MNB) parses XML only from authenticated NAV/MNB government TLS endpoints + self-produced InvoiceData (not attacker-controlled); the 0.39.4 instance is pinned transitively by tauri 2.11.2 -> plist (build-time .plist parsing) with no quick-xml >=0.41 upstream release yet -> no safe upgrade (same posture as the urlpattern/GTK ignores above). TODO revisit: migrate direct usage to >=0.41 in a dedicated, fully-tested branch once tauri/plist move." },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml <0.41 NsReader unbounded namespace-declaration memory-exhaustion DoS; same crate, same two instances, same >=0.41 fix and same reachability as RUSTSEC-2026-0194. TODO revisit: cleared together with -0194 when direct usage moves to >=0.41 and tauri/plist follow." },
+
+    # ─── DELIBERATELY ABSENT — do not "helpfully" add these ───
+    # RUSTSEC-2026-0235 (rkyv 0.7.46, CVE-class OOB reads) is NOT ignored and
+    # must never be. cargo-deny does not report it because `rkyv` is not in the
+    # compiled graph at all — it is an optional rust_decimal dependency behind
+    # a feature nothing enables. It is ELIMINATED, not suppressed, and the
+    # `rkyv` entry under [bans] fails the build if it ever enters for real.
+    #
+    # RUSTSEC-2026-0221 (event-listener 5.4.1, unsound) is likewise NOT ignored:
+    # it was eliminated by bumping event-listener to the patched 5.4.2.
 ]
 
 # ─────────────────────────────────────────────────────────────────────
@@ -77,6 +144,11 @@ ignore = [
 # Apache-2.0 WITH LLVM-exception is the SPDX variant used by several
 # RustCrypto crates; same Apache-2.0 terms with an extended patent grant.
 # Anything else requires a per-crate exception entry with a comment.
+#
+# Drift control: CI promotes `license-not-encountered` and
+# `license-exception-not-encountered` to ERRORS, so an `allow` entry that no
+# longer matches any crate fails the build instead of lingering as a silent
+# widening of policy. Every entry below is load-bearing as of 2026-08-04.
 # ─────────────────────────────────────────────────────────────────────
 [licenses]
 version = 2
@@ -117,6 +189,13 @@ private = { ignore = true }
 # ─────────────────────────────────────────────────────────────────────
 # Bans — duplicate-version is warn-only because transitive deps often
 # pull in multiple versions of common crates (e.g. windows-sys, syn).
+# There are 53 such duplicates today, essentially all from the Tauri and
+# windows-sys trees; promoting them to errors would require a large `skip`
+# list, and a stale skip list is the same drift problem this config exists to
+# eliminate. Left as "warn" DELIBERATELY, not by omission. (This is also why
+# CI denies specific drift lints rather than passing a blanket `-D warnings`,
+# which would fail on all 53.) `unmatched-skip` IS promoted to an error, so if
+# a skip list is ever added it cannot go stale.
 # Wildcards are denied because Cargo.toml never uses them; this enforces
 # that intentionally.
 # ─────────────────────────────────────────────────────────────────────
@@ -133,7 +212,17 @@ highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
 allow = []
-deny = []
+deny = [
+    # ENFORCES the invariant that makes dropping cargo-audit safe. `rkyv` is
+    # currently unreachable — an optional rust_decimal dependency behind a
+    # feature nothing enables — which is why RUSTSEC-2026-0235 needs no ignore
+    # entry above. That argument holds ONLY while rkyv stays out of the build
+    # graph. If anything ever enables `rust_decimal/rkyv` (or adds rkyv
+    # directly), this ban fails the build LOUDLY rather than silently
+    # re-introducing a CVE-class crate that no advisory ignore covers.
+    # To lift: move to an rkyv >= 0.8.17 line, then delete this entry.
+    { crate = "rkyv", reason = "CVE-class RUSTSEC-2026-0235 (out-of-bounds reads, fixed >=0.8.17). rust_decimal pins the vulnerable 0.7.46 only as an OPTIONAL dep; keeping it out of the compiled graph is what lets us ELIMINATE the advisory instead of ignoring it. Do not enable the rust_decimal/rkyv feature." },
+]
 skip = []
 skip-tree = []
 

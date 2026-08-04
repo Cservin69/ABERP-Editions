@@ -1,18 +1,25 @@
-# ABERP — Editions tree CI (Portable + Defense), ADR-0093 saw-off.
+# ABERP — Editions tree CI (Defense), ADR-0093 saw-off.
 #
 # This is the FULL-TOOLCHAIN gate that chunks 1–3 honestly DEFERRED to a
 # machine with Rust+Tauri (the sandbox could not compile bundled DuckDB's
 # ~8-min C++ amalgamation unit or link webkit2gtk). It exercises the whole
-# workspace — build, test, clippy, fmt, supply-chain — for BOTH edition arms:
+# workspace — build, test, clippy, fmt, supply-chain — for the edition arm:
 #
-#   • Portable  = default features        (dev-profile, NAV-off, demo tenant)
 #   • Defense   = --features production    (real-NAV production build)
 #
 # and runs the ADR-0093/0002 DB-isolation cut-gate (+ its negative probes) as
 # a fast fail-fast BEFORE the heavy build, so an isolation regression goes red
 # in seconds rather than after the 8-min DuckDB compile.
 #
-# Per ADR-0007 "Supply chain": cargo-deny + cargo-audit on --locked deps.
+# The Portable arm was dropped 2026-08-04: this repository is Defense-only,
+# and the Portable line is built in ABERP.git per the architecture. That makes
+# this a relocation of coverage, not a loss of it. The `PROD_Portable_v*`
+# release branches and run/upgrade_portable.sh are deliberately LEFT IN PLACE
+# — this change is scoped to CI.
+#
+# Per ADR-0007 "Supply chain": cargo-deny on --locked deps. (cargo-audit was
+# retired 2026-08-04 as feature-blind — see the supply-chain step below,
+# deny.toml, and the amended ADR-0007 §"Supply chain".)
 # Per ADR-0001/0021: the toolchain is the pinned stable CHANNEL declared in
 # rust-toolchain.toml — the MSRV floor lives in each Cargo.toml's
 # `rust-version`, and Cargo.lock is the load-bearing reproducibility pin. CI
@@ -44,13 +51,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
-      # Run both arms to completion — a Portable failure must not hide a
-      # Defense failure (or vice versa).
+      # Defense-only from 2026-08-04: this repository's CI builds the Defense
+      # line alone. The Portable line lives in ABERP.git per the architecture,
+      # so dropping the arm here is a relocation, not a coverage loss. The
+      # matrix shape is kept (single arm) so re-adding a line is a one-entry
+      # change and `matrix.edition` / `matrix.features` stay meaningful.
       fail-fast: false
       matrix:
         include:
-          - edition: portable
-            features: ""
           - edition: defense
             features: "--features production"
 
@@ -204,36 +212,55 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings
 
       # ── Supply chain (arm-independent: operates on Cargo.lock) ──────────
-      # Run once, on the Portable arm, to avoid duplicating the advisory/
-      # license scan across both matrix jobs.
-      - name: Install cargo-deny and cargo-audit
-        if: matrix.edition == 'portable'
+      # These steps were gated `if: matrix.edition == 'portable'` to run the
+      # scan once across the two-arm matrix. With the Portable arm dropped
+      # (2026-08-04) that condition would be permanently false and the
+      # advisory / license scan would silently stop gating every merge — which
+      # is exactly what had already been happening, because the Portable arm
+      # timed out before ever reaching these steps and reported `skipped`
+      # (green). NO `if:` GUARD BELOW. This must run on every PR, always. If
+      # you ever add a matrix arm back, do NOT re-gate these to one arm;
+      # duplicate work is cheaper than a gate that silently stops gating.
+      #
+      # cargo-audit was REMOVED here on 2026-08-04. It reads Cargo.lock
+      # textually and is feature-BLIND: Cargo.lock records OPTIONAL
+      # dependencies whether or not any feature activates them, so cargo-audit
+      # reported RUSTSEC-2026-0235 against `rkyv 0.7.46` — a crate this
+      # workspace never compiles (an optional `rust_decimal` dep behind a
+      # feature nothing enables; `cargo tree -i rkyv` prints "nothing to
+      # print"). The only ways to make that green were to ignore a CVE-class
+      # advisory or to fork rkyv. cargo-deny resolves features, never saw the
+      # crate, and needs no ignore entry — so it is now the single gate.
+      # Rationale in full at the top of deny.toml. `[bans]` there fails the
+      # build if rkyv ever actually enters the graph, so the elimination is
+      # enforced rather than assumed.
+      - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-audit
+          tool: cargo-deny
 
-      - name: cargo-deny check
-        if: matrix.edition == 'portable'
-        # Runs all sections: licenses, advisories, bans, sources.
-        run: cargo deny check
-
-      - name: cargo-audit
-        if: matrix.edition == 'portable'
-        # --deny warnings makes "informational" advisories failing-loud. The
-        # --ignore list mirrors audit.toml / deny.toml::[advisories].ignore
-        # because cargo-audit's audit.toml auto-discovery is inconsistent in
-        # CI. Keep all three in lockstep when amending.
+      - name: cargo-deny check (advisories, licenses, bans, sources)
+        # Severity note: under deny.toml's `[advisories] version = 2` every
+        # advisory is ALREADY a hard error — cargo-deny removed the
+        # vulnerability/notice/severity-threshold knobs. Strictness comes from
+        # deny.toml's `unmaintained = "all"` / `unsound = "all"` SCOPES (the
+        # defaults exclude transitive deps, which is how RUSTSEC-2024-0429 went
+        # unreported) plus the drift lints promoted to errors below.
+        #
+        # The four --deny lints are the drift-proofing: each is a WARNING by
+        # default, so a config entry that has stopped matching anything would
+        # rot silently. A blanket `-D warnings` is deliberately NOT used — it
+        # would fail on the 53 benign duplicate-version warnings from the Tauri
+        # and windows-sys trees. Unknown lint names are rejected by cargo-deny
+        # (exit 2), so a typo here fails loudly rather than weakening the gate.
+        #
+        #   advisory-not-detected            → an ignore id matching nothing
+        #   license-not-encountered          → an allowed license nothing uses
+        #   license-exception-not-encountered→ a per-crate exception nothing uses
+        #   unmatched-skip                   → a [bans] skip matching nothing
         run: |
-          cargo audit --deny warnings \
-            --ignore RUSTSEC-2025-0075 --ignore RUSTSEC-2025-0080 \
-            --ignore RUSTSEC-2025-0081 --ignore RUSTSEC-2025-0098 \
-            --ignore RUSTSEC-2025-0100 \
-            --ignore RUSTSEC-2024-0411 --ignore RUSTSEC-2024-0412 \
-            --ignore RUSTSEC-2024-0413 --ignore RUSTSEC-2024-0415 \
-            --ignore RUSTSEC-2024-0416 --ignore RUSTSEC-2024-0418 \
-            --ignore RUSTSEC-2024-0419 --ignore RUSTSEC-2024-0420 \
-            --ignore RUSTSEC-2024-0429 \
-            --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2024-0384 \
-            --ignore RUSTSEC-2024-0388 --ignore RUSTSEC-2025-0134 \
-            --ignore RUSTSEC-2026-0192 --ignore RUSTSEC-2026-0194 \
-            --ignore RUSTSEC-2026-0195
+          cargo deny check \
+            --deny advisory-not-detected \
+            --deny license-not-encountered \
+            --deny license-exception-not-encountered \
+            --deny unmatched-skip
