@@ -42,7 +42,9 @@ jobs:
   workspace:
     name: ${{ matrix.edition }} · build + lint + test
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 90 (was 60): a cold cargo cache overran the 60-min wall, and a timed-out
+    # job never runs `Post Cargo cache` — so the cache never repopulated.
+    timeout-minutes: 90
     strategy:
       # Run both arms to completion — a Portable failure must not hide a
       # Defense failure (or vice versa).
