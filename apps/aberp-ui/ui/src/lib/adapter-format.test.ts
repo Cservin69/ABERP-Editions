@@ -26,6 +26,7 @@ describe("adapterKindLabel", () => {
     expect(adapterKindLabel("label-printer")).toBe("Zebra label printer");
     expect(adapterKindLabel("cnc-machine")).toBe("MTConnect CNC");
     expect(adapterKindLabel("robot")).toBe("UR RTDE robot");
+    expect(adapterKindLabel("laser-cutter")).toBe("Trumpf laser cutter");
   });
 
   it("every ordered kind has a label (no orphan in the picker)", () => {

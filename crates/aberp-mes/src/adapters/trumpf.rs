@@ -316,9 +316,11 @@ pub struct OseonLaserSource;
 #[async_trait]
 impl TrumpfSource for OseonLaserSource {
     async fn poll(&self) -> Result<LaserSnapshot, String> {
-        Err("Oseon / TruTops Fab laser backend is not implemented in v1 \
+        Err(
+            "Oseon / TruTops Fab laser backend is not implemented in v1 \
              (needs a licensed Oseon deployment to design against)"
-            .to_string())
+                .to_string(),
+        )
     }
 
     fn backend(&self) -> &'static str {
@@ -885,7 +887,10 @@ mod tests {
     /// the same contract the MTConnect adapter gives its consumers.
     #[test]
     fn first_observation_baselines_from_unknown() {
-        let events = derive(&LaserObservation::default(), &snap(MachineState::Idle, None));
+        let events = derive(
+            &LaserObservation::default(),
+            &snap(MachineState::Idle, None),
+        );
         assert_eq!(events.len(), 1);
         assert_eq!(
             ms(&events[0]),
@@ -1145,7 +1150,11 @@ mod tests {
             .expect("baseline machine-state event");
         assert_eq!(
             ms(&first),
-            ("laser-baseline", MachineState::Unknown, MachineState::Running)
+            (
+                "laser-baseline",
+                MachineState::Unknown,
+                MachineState::Running
+            )
         );
         let second = next_event(&mut rx, Duration::from_secs(2))
             .await
@@ -1274,11 +1283,7 @@ mod tests {
             .expect("post-error transition");
         assert_eq!(
             ms(&recovered),
-            (
-                "laser-recover",
-                MachineState::Idle,
-                MachineState::Running
-            )
+            ("laser-recover", MachineState::Idle, MachineState::Running)
         );
         adapter.stop().await.unwrap();
     }
@@ -1834,7 +1839,10 @@ mod tests {
             payloads.len(),
             3,
             "expected 3 audit rows, got {:?}",
-            payloads.iter().map(|p| p.event.type_tag()).collect::<Vec<_>>()
+            payloads
+                .iter()
+                .map(|p| p.event.type_tag())
+                .collect::<Vec<_>>()
         );
         for payload in &payloads {
             assert_eq!(payload.adapter_name, "laser-ledger");
