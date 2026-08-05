@@ -146,6 +146,32 @@ pub const DEFAULT_DEVICE_NAME: &str = "default";
 /// away in [`normalise_data_item`].
 pub const MTCONNECT_UNAVAILABLE: &str = "UNAVAILABLE";
 
+/// Maximum accepted byte length of a vendor data-item string (job id,
+/// program name, material ref).
+///
+/// Mirrors the barcode scanner's `DEFAULT_MAX_PAYLOAD_LEN` — the same
+/// 4096-byte bound the project already applies to the other
+/// operator/vendor-supplied string that becomes an event field. Real NC
+/// program and nest names run well under 100 bytes.
+///
+/// Load-bearing: `poll_once` caps the whole *response* at
+/// `max_response_bytes` (4 MiB), but that is a bound on the document,
+/// not on the single field that escapes into durable storage as
+/// `work_order_id`. Without this, a gateway — or an operator naming a
+/// nest — could push a multi-megabyte string into an audit-ledger row on
+/// every job edge.
+///
+/// **Refused, not truncated.** A truncated nest name is a *plausible but
+/// wrong* identity that could collide with a real nest, which is exactly
+/// why the barcode scanner drops an oversized line instead of shortening
+/// it. The module docs promise the vendor string is recorded verbatim;
+/// silently shortening it would break that promise in a way no
+/// downstream reader could detect. An over-length value is therefore
+/// treated as "no trustworthy identity" — the same outcome as
+/// `UNAVAILABLE` — and the machine-state signal, which is unaffected,
+/// still flows.
+pub const MAX_DATA_ITEM_LEN: usize = 4096;
+
 /// One poll's worth of "what is the laser doing right now", normalised
 /// away from whichever backend produced it.
 ///
@@ -197,10 +223,26 @@ impl Default for LaserSnapshot {
 ///
 /// The `Err` string is operator-readable and lands verbatim in
 /// [`AdapterHealth::Unhealthy`], so it MUST NOT carry credential bytes.
+///
+/// ## Contract
+///
+/// Implementations **MUST NOT panic**. Report every failure — including
+/// "not implemented" — as `Err(reason)`. A panic is not a supported
+/// failure channel: it carries no operator-readable reason, and the
+/// adapter can only report it generically.
+///
+/// The adapter defends this rather than trusting it: a panicking poll is
+/// caught and converted to [`AdapterHealth::Unhealthy`]
+/// (see [`poll_source`]). Without that, a backend that panicked on every
+/// tick would leave the cached health latched at whatever it last
+/// succeeded with, and the Adapters page would show a green laser that
+/// is no longer being polled at all — the silent misclassification
+/// CLAUDE.md rule 12 exists to prevent.
 #[async_trait]
 pub trait TrumpfSource: Send + Sync + std::fmt::Debug {
     /// Poll the machine once. Returns the current snapshot, or an
-    /// operator-readable failure reason.
+    /// operator-readable failure reason. MUST NOT panic — see the trait
+    /// contract above.
     async fn poll(&self) -> Result<LaserSnapshot, String>;
 
     /// Short label naming the backend, for logs and health context
@@ -384,10 +426,25 @@ impl TrumpfSource for MockLaserSource {
 ///
 /// Blank and MTConnect's `UNAVAILABLE` sentinel both mean "no value" —
 /// see [`MTCONNECT_UNAVAILABLE`] for why conflating them with an
-/// identity mints phantom work orders.
+/// identity mints phantom work orders. Anything longer than
+/// [`MAX_DATA_ITEM_LEN`] is refused outright; see that constant for why
+/// it is dropped rather than truncated.
 fn normalise_data_item(raw: Option<String>) -> Option<String> {
     let trimmed = raw?.trim().to_string();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(MTCONNECT_UNAVAILABLE) {
+        return None;
+    }
+    if trimmed.len() > MAX_DATA_ITEM_LEN {
+        // Loud, per CLAUDE.md rule 12 — the operator must be able to see
+        // that a nest identity was refused rather than silently missing.
+        // The value itself is NOT logged: it is unbounded, attacker-
+        // influenced, and would just move the flooding problem into the
+        // log.
+        tracing::warn!(
+            len = trimmed.len(),
+            cap = MAX_DATA_ITEM_LEN,
+            "laser data item exceeds the cap; refused as a job identity"
+        );
         return None;
     }
     Some(trimmed)
@@ -567,7 +624,7 @@ impl Adapter for TrumpfAdapter {
 
         // Initial poll synchronously so the first `health()` read after
         // start sees the real outcome, not the transient Starting.
-        let outcome = poll_source(source.as_ref()).await;
+        let outcome = poll_source(&source).await;
         apply_poll_outcome(
             outcome,
             &health_slot,
@@ -615,13 +672,56 @@ impl Adapter for TrumpfAdapter {
     }
 }
 
-/// Time one backend poll. The seam returns only the snapshot; the
-/// adapter owns the clock so every backend gets the same
-/// `Healthy` / `Degraded` verdict rule.
-async fn poll_source(source: &dyn TrumpfSource) -> Result<(LaserSnapshot, Duration), String> {
+/// Aborts the wrapped poll task if dropped before it is joined, so a
+/// poll that loses the cancel race cannot linger as a detached task.
+/// Preserves the documented drain semantics: shutdown costs one request
+/// boundary, not one full `poll_interval`.
+struct AbortOnDrop(tokio::task::JoinHandle<Result<LaserSnapshot, String>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        // A no-op once the task has already completed.
+        self.0.abort();
+    }
+}
+
+/// Time one backend poll, and contain a backend that breaks its
+/// `MUST NOT panic` contract.
+///
+/// The seam returns only the snapshot; the adapter owns the clock so
+/// every backend gets the same `Healthy` / `Degraded` verdict rule.
+///
+/// The poll runs on its own task so a panic surfaces as a `JoinError`
+/// instead of unwinding the shared poll loop. That matters because the
+/// poll loop owns the health cell: if it died, health would stay latched
+/// at its last value — a stale green tile for a laser nobody is polling.
+/// Converting the panic into `Err` routes it through the ordinary
+/// `Unhealthy { reason }` path, so a broken backend looks broken.
+/// (`tokio::spawn` rather than a `catch_unwind` combinator keeps the
+/// zero-new-dependency property — this crate has no `futures`.)
+async fn poll_source(source: &Arc<dyn TrumpfSource>) -> Result<(LaserSnapshot, Duration), String> {
     let start = std::time::Instant::now();
-    let snapshot = source.poll().await?;
-    Ok((snapshot, start.elapsed()))
+    let polled = source.clone();
+    let mut task = AbortOnDrop(tokio::spawn(async move { polled.poll().await }));
+
+    match (&mut task.0).await {
+        Ok(Ok(snapshot)) => Ok((snapshot, start.elapsed())),
+        Ok(Err(reason)) => Err(reason),
+        Err(join_error) if join_error.is_panic() => {
+            // The panic payload is deliberately NOT interpolated: it is
+            // backend-controlled text that lands in an operator-visible
+            // health reason, which MUST NOT carry credential bytes. The
+            // default panic hook has already printed the real message
+            // and backtrace to stderr for debugging.
+            Err(format!(
+                "backend `{}` panicked during poll (a TrumpfSource MUST NOT \
+                 panic — see the trait contract); adapter is no longer \
+                 receiving data from it",
+                source.backend()
+            ))
+        }
+        Err(join_error) => Err(format!("backend poll task failed: {join_error}")),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -654,7 +754,7 @@ async fn run_poll_loop(
                         tracing::debug!(machine_id = %machine_id, "Trumpf poll cancelled mid-request");
                         return;
                     }
-                    o = poll_source(source.as_ref()) => o,
+                    o = poll_source(&source) => o,
                 };
                 apply_poll_outcome(
                     outcome,
@@ -1878,6 +1978,72 @@ mod tests {
         adapter.stop().await.unwrap();
         agent.abort();
         std::fs::remove_dir_all(&tempdir).ok();
+    }
+
+    /// The v1 backend guesses NOTHING it cannot read off the wire. No
+    /// MTConnect Streams data item carries the sheet/material
+    /// designation, so `material_ref` MUST stay `None` — and because it
+    /// never reaches the ledger, a guessed value would otherwise go
+    /// unnoticed.
+    #[tokio::test]
+    async fn mtconnect_backend_never_guesses_material_ref() {
+        let port = pick_free_port().await;
+        let agent = spawn_mock_agent(
+            port,
+            MockBehaviour::Ok(laser_streams_xml("ACTIVE", "NEST_1.LST", 7)),
+        )
+        .await;
+
+        let cfg = cfg_for_test("laser-material", port);
+        let source = MtconnectLaserSource::new(&cfg).expect("build backend");
+        let snapshot = source.poll().await.expect("poll");
+
+        assert_eq!(
+            snapshot.material_ref, None,
+            "the MTConnect wire carries no material designation — it must \
+             stay absent rather than be inferred"
+        );
+        // The fields it CAN read really are read.
+        assert_eq!(snapshot.program_name.as_deref(), Some("NEST_1.LST"));
+        assert_eq!(snapshot.piece_count, Some(7));
+        assert_eq!(snapshot.machine_state, MachineState::Running);
+
+        agent.abort();
+    }
+
+    /// The vendor-string cap matches the barcode scanner's
+    /// `DEFAULT_MAX_PAYLOAD_LEN`, and an over-length value is REFUSED
+    /// (yielding no identity) rather than truncated into a
+    /// plausible-but-wrong one.
+    #[test]
+    fn oversized_data_items_are_refused_not_truncated() {
+        assert_eq!(
+            MAX_DATA_ITEM_LEN,
+            crate::adapters::barcode_scanner::DEFAULT_MAX_PAYLOAD_LEN,
+            "the laser cap must track the barcode scanner's payload cap"
+        );
+
+        let at_cap = "N".repeat(MAX_DATA_ITEM_LEN);
+        assert_eq!(
+            normalise_data_item(Some(at_cap.clone())),
+            Some(at_cap),
+            "a value exactly at the cap is still a valid identity"
+        );
+
+        let over = "N".repeat(MAX_DATA_ITEM_LEN + 1);
+        assert_eq!(
+            normalise_data_item(Some(over)),
+            None,
+            "an over-length value must be refused outright, never truncated"
+        );
+
+        // Trimming happens BEFORE the length check, so surrounding
+        // whitespace cannot push a legitimate name over the cap.
+        let padded = format!("  {}  ", "N".repeat(MAX_DATA_ITEM_LEN));
+        assert!(
+            normalise_data_item(Some(padded)).is_some(),
+            "whitespace must not count toward the cap"
+        );
     }
 
     /// The v1 backend polls the same `/{device}/current` URL shape the
