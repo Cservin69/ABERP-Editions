@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapter::Adapter;
 use crate::adapters::barcode_scanner::{BarcodeScannerAdapter, BarcodeScannerConfig};
 use crate::adapters::mtconnect::{MtconnectAdapter, MtconnectAdapterConfig};
+use crate::adapters::trumpf::{TrumpfAdapter, TrumpfAdapterConfig};
 use crate::adapters::ur_rtde::{UrRtdeAdapter, UrRtdeAdapterConfig};
 use crate::adapters::zebra::{ZebraAdapter, ZebraAdapterConfig};
 
@@ -42,6 +43,9 @@ pub const DEFAULT_MTCONNECT_DEVICE_NAME: &str = "default";
 /// Default UR model label when the config omits it. Mirrors the env-
 /// boot default (`ABERP_UR_RTDE_MODEL` → `"UR"`).
 pub const DEFAULT_UR_RTDE_MODEL: &str = "UR";
+/// Default laser device path when the config omits it. The v1 Trumpf
+/// backend is MTConnect, so this mirrors the MTConnect default.
+pub const DEFAULT_LASER_DEVICE_NAME: &str = "default";
 
 /// Closed-vocab adapter kind. Wire strings are byte-identical to the
 /// matching `Adapter::kind()` so config and live-registry rows join on
@@ -66,6 +70,15 @@ pub enum AdapterKind {
     /// the kind-specific `model` label.
     #[serde(rename = "robot")]
     Robot,
+    /// Trumpf laser cutter — polled through the [`TrumpfSource`] seam.
+    /// The v1 backend is MTConnect-over-HTTP (so `host:port` is the
+    /// gateway fronting the laser) and it reuses the kind-specific
+    /// `device_name`; a future OPC-UA / Oseon backend swaps in behind
+    /// the same seam without touching this vocab.
+    ///
+    /// [`TrumpfSource`]: crate::TrumpfSource
+    #[serde(rename = "laser-cutter")]
+    Laser,
 }
 
 impl AdapterKind {
@@ -76,6 +89,7 @@ impl AdapterKind {
             AdapterKind::LabelPrinter => "label-printer",
             AdapterKind::Cnc => "cnc-machine",
             AdapterKind::Robot => "robot",
+            AdapterKind::Laser => "laser-cutter",
         }
     }
 
@@ -88,18 +102,20 @@ impl AdapterKind {
             "label-printer" => Some(AdapterKind::LabelPrinter),
             "cnc-machine" => Some(AdapterKind::Cnc),
             "robot" => Some(AdapterKind::Robot),
+            "laser-cutter" => Some(AdapterKind::Laser),
             _ => None,
         }
     }
 
     /// Every kind, in display order. Powers the Add-wizard kind picker
     /// + the round-trip test.
-    pub fn all() -> [AdapterKind; 4] {
+    pub fn all() -> [AdapterKind; 5] {
         [
             AdapterKind::BarcodeScanner,
             AdapterKind::LabelPrinter,
             AdapterKind::Cnc,
             AdapterKind::Robot,
+            AdapterKind::Laser,
         ]
     }
 }
@@ -303,6 +319,25 @@ pub fn build_adapter(entry: &AdapterConfigEntry) -> Result<Arc<dyn Adapter>, Ada
             );
             Ok(Arc::new(UrRtdeAdapter::new(cfg)))
         }
+        AdapterKind::Laser => {
+            let device_name = entry
+                .device_name
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_LASER_DEVICE_NAME.to_string());
+            let cfg = TrumpfAdapterConfig::new(
+                entry.adapter_id.clone(),
+                entry.friendly_name.clone(),
+                entry.host.clone(),
+                entry.port,
+                device_name,
+            );
+            // `TrumpfAdapter::new` selects the v1 MTConnect backend. The
+            // backend is deliberately NOT an operator field — swapping
+            // it is a code decision (`TrumpfAdapter::with_source`), per
+            // [[trust-code-not-operator]].
+            Ok(Arc::new(TrumpfAdapter::new(cfg)))
+        }
     }
 }
 
@@ -333,7 +368,14 @@ mod tests {
             (AdapterKind::LabelPrinter, "printer.local"),
             (AdapterKind::Cnc, "cnc.local"),
             (AdapterKind::Robot, "robot.local"),
+            (AdapterKind::Laser, "laser-gateway.local"),
         ];
+        assert_eq!(
+            cases.len(),
+            AdapterKind::all().len(),
+            "every AdapterKind must be exercised here — a new kind added \
+             without a case would slip past this join-key pin"
+        );
         for (kind, host) in cases {
             let entry = base(kind, host, 9000);
             let adapter = build_adapter(&entry).expect("build");
@@ -408,6 +450,21 @@ mod tests {
         assert!(build_adapter(&cnc).is_ok());
         let robot = base(AdapterKind::Robot, "robot.local", 30004);
         assert!(build_adapter(&robot).is_ok());
+        let laser = base(AdapterKind::Laser, "laser-gateway.local", 5000);
+        assert!(build_adapter(&laser).is_ok());
+    }
+
+    /// A laser entry builds an adapter whose endpoint metadata round-
+    /// trips from the config entry — the Adapters page shows the
+    /// gateway the operator typed, not a default.
+    #[test]
+    fn laser_entry_carries_endpoint_through_to_the_adapter() {
+        let mut entry = base(AdapterKind::Laser, "10.0.2.40", 5000);
+        entry.device_name = Some("TruLaser5030".to_string());
+        let adapter = build_adapter(&entry).expect("build laser");
+        assert_eq!(adapter.kind(), "laser-cutter");
+        assert_eq!(adapter.endpoint_host().as_deref(), Some("10.0.2.40"));
+        assert_eq!(adapter.endpoint_port(), Some(5000));
     }
 
     #[test]
