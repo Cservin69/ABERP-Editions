@@ -1607,6 +1607,73 @@ mod tests {
         agent.abort();
     }
 
+    /// A Streams document with NO `Execution` data item at all — a
+    /// gateway that publishes a program but no execution state.
+    fn laser_streams_xml_without_execution(program: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MTConnectStreams xmlns="urn:mtconnect.org:MTConnectStreams:1.7">
+  <Header creationTime="2026-08-05T09:00:00Z" sender="gateway" instanceId="1" version="1.7.0" />
+  <Streams>
+    <DeviceStream name="TruLaser" uuid="trumpf-1">
+      <ComponentStream component="Path" name="path" componentId="p">
+        <Events>
+          <Program dataItemId="prog">{program}</Program>
+        </Events>
+      </ComponentStream>
+    </DeviceStream>
+  </Streams>
+</MTConnectStreams>"#
+        )
+    }
+
+    /// ADVERSARIAL: a gateway that publishes no `Execution` item must
+    /// leave the machine state at `Unknown` — NOT at a plausible-looking
+    /// `Idle`. A default of Idle would silently report a laser as
+    /// available-and-fine when we have no idea what it is doing, which
+    /// is exactly the misclassification the closed map exists to
+    /// prevent. `Unknown → Unknown` is not an edge, so nothing is
+    /// emitted; the job start still is.
+    #[tokio::test]
+    async fn e2e_absent_execution_stays_unknown_and_emits_no_state_event() {
+        let port = pick_free_port().await;
+        let agent = spawn_mock_agent(
+            port,
+            MockBehaviour::Ok(laser_streams_xml_without_execution("NEST_3300.LST")),
+        )
+        .await;
+
+        let adapter = Arc::new(TrumpfAdapter::new(cfg_for_test("laser-noexec", port)));
+        let mut rx = adapter.subscribe();
+        adapter.start().await.unwrap();
+
+        // The ONLY event may be the job start — no machine-state event,
+        // because the state never left Unknown.
+        let first = next_event(&mut rx, Duration::from_secs(3))
+            .await
+            .expect("job start");
+        assert_eq!(
+            wo(&first),
+            (
+                "NEST_3300.LST",
+                WorkOrderState::Released,
+                WorkOrderState::InProgress
+            ),
+            "absent Execution must not manufacture a machine-state edge"
+        );
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let extra = next_event(&mut rx, Duration::from_millis(300)).await;
+        assert!(
+            extra.is_none(),
+            "absent Execution produced a state event: {extra:?}"
+        );
+        assert_eq!(adapter.health(), AdapterHealth::Healthy);
+
+        adapter.stop().await.unwrap();
+        agent.abort();
+    }
+
     #[tokio::test]
     async fn e2e_404_from_gateway_reports_unhealthy_with_status() {
         let port = pick_free_port().await;
@@ -1714,38 +1781,54 @@ mod tests {
         let cancel = CancellationToken::new();
         let writer = spawn_ledger_writer(adapter_for_writer, deps, cancel.clone());
 
-        // Subscribe the writer BEFORE the adapter's first synchronous
-        // poll, or the baseline event races the subscription.
+        // A second subscriber, so the test can tell "the adapter never
+        // emitted it" apart from "the writer never wrote it".
+        let mut rx = adapter.subscribe();
+
+        // Let the writer subscribe BEFORE the adapter's first
+        // synchronous poll, or the baseline event races the
+        // subscription.
         tokio::time::sleep(Duration::from_millis(50)).await;
         adapter.start().await.unwrap();
 
-        // Expect exactly three rows: Unknown→Idle, Idle→Running, and
-        // the nest start. Poll the DB with a bounded timeout.
-        let started = std::time::Instant::now();
-        let mut payloads: Vec<MesAdapterEventPayload> = Vec::new();
-        while started.elapsed() < Duration::from_secs(10) {
-            let conn = duckdb::Connection::open(&db_path).unwrap();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT payload FROM audit_ledger \
-                     WHERE kind = 'mes.adapter_event' ORDER BY seq",
-                )
-                .unwrap();
-            payloads = stmt
-                .query_map([], |r| r.get::<_, Vec<u8>>(0))
-                .unwrap()
-                .map(|blob| {
-                    serde_json::from_slice::<MesAdapterEventPayload>(&blob.unwrap())
-                        .expect("ledger payload must round-trip")
-                })
-                .collect();
-            drop(stmt);
-            drop(conn);
-            if payloads.len() >= 3 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        // Expect exactly three events: Unknown→Idle, Idle→Running, and
+        // the nest start.
+        let mut emitted = Vec::new();
+        for _ in 0..3 {
+            let event = next_event(&mut rx, Duration::from_secs(5))
+                .await
+                .unwrap_or_else(|| panic!("adapter emitted only {} events", emitted.len()));
+            emitted.push(event);
         }
+
+        // Quiesce the writer BEFORE reading the ledger. DuckDB takes a
+        // single-writer file lock, and the writer opens a fresh
+        // connection per event — a test that polls the same file
+        // concurrently makes the writer's own open fail, and a failed
+        // write is logged-and-dropped ("event lost"), not retried. So
+        // drain, cancel, join, and only then read.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+        let joined = tokio::time::timeout(Duration::from_secs(5), writer).await;
+        assert!(joined.is_ok(), "ledger writer did not exit within 5s");
+
+        let conn = duckdb::Connection::open(&db_path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload FROM audit_ledger \
+                 WHERE kind = 'mes.adapter_event' ORDER BY seq",
+            )
+            .unwrap();
+        let payloads: Vec<MesAdapterEventPayload> = stmt
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .map(|blob| {
+                serde_json::from_slice::<MesAdapterEventPayload>(&blob.unwrap())
+                    .expect("ledger payload must round-trip")
+            })
+            .collect();
+        drop(stmt);
+        drop(conn);
 
         assert_eq!(
             payloads.len(),
@@ -1784,8 +1867,6 @@ mod tests {
             "a phantom UNAVAILABLE work order reached the audit ledger"
         );
 
-        cancel.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
         adapter.stop().await.unwrap();
         agent.abort();
         std::fs::remove_dir_all(&tempdir).ok();
