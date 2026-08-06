@@ -94,9 +94,34 @@ const WRITE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(25);
 /// Wall-clock budget for draining the broadcast backlog after
 /// cancellation. Shutdown must not hang, but it also must not silently
 /// discard the tail of the audit trail, so the drain is bounded rather
-/// than either unbounded or absent. Exceeding it is an ERROR — the only
-/// remaining path on which a cancelled writer can leave events unwritten,
-/// and it is loud.
+/// than either unbounded or absent.
+///
+/// ## This 30 s is NOT the budget the writer actually gets
+///
+/// In `aberp serve` the real limit is `ShutdownCoordinator`'s, and it is
+/// much tighter: `DEFAULT_SHUTDOWN_TIMEOUT` is **5 s**, and that is ONE
+/// budget **shared across ~13 registered daemons** (the coordinator
+/// recomputes `remaining` from a single deadline as it joins each one).
+/// MES registers mid-list, so in practice it sees a slice of 5 s, never
+/// 30 s.
+///
+/// Worse for the log line below: on overrun the coordinator does
+/// `tokio::time::timeout(remaining, daemon.handle)`, which **drops** the
+/// `JoinHandle`. Dropping a tokio `JoinHandle` DETACHES the task, it does
+/// not abort it — so the writer keeps draining into a process that is
+/// already exiting, and the loud `UNWRITTEN` error below is not something
+/// production can be relied on to emit.
+///
+/// The 30 s is therefore deliberately a **backstop against an unbounded
+/// drain**, not a promise about how long shutdown will wait. It is left
+/// larger than the coordinator's window on purpose: clamping it to 5 s
+/// would make the writer give up early in tests and in any embedding that
+/// does grant it more time, without buying anything in `serve`.
+///
+/// This is not currently a live loss path — MTConnect/Trumpf poll on a 5 s
+/// cadence and emit on state-change, so real backlogs sit far below the
+/// ceiling a 5 s slice can drain — but the reconciliation is recorded here
+/// rather than left implied. See ADR-0104 §5.
 const DRAIN_BUDGET: Duration = Duration::from_secs(30);
 
 /// Dependencies the ledger-writer task needs to write into the audit
@@ -170,7 +195,9 @@ async fn run_ledger_writer(
         };
         match recv {
             Ok(event) => {
-                write_event(&deps, &adapter_name, event).await;
+                // Outcome is already logged loudly inside `write_one`; the
+                // steady-state arm has nothing further to do either way.
+                let _landed = write_event(&deps, &adapter_name, event).await;
             }
             Err(RecvError::Lagged(n)) => {
                 // Loud-fail per CLAUDE.md rule 12 — operator MUST see
@@ -195,10 +222,11 @@ async fn run_ledger_writer(
 }
 
 /// Mint the payload for one canonical event and write it, retrying.
-async fn write_event(deps: &LedgerWriterDeps, adapter_name: &str, event: CanonicalEvent) {
+/// Returns whether the row actually landed.
+async fn write_event(deps: &LedgerWriterDeps, adapter_name: &str, event: CanonicalEvent) -> bool {
     let payload =
         MesAdapterEventPayload::new(adapter_name.to_string(), Ulid::new().to_string(), event);
-    write_one(deps, &payload, adapter_name).await;
+    write_one(deps, &payload, adapter_name).await
 }
 
 /// Drain whatever the broadcast still holds after cancellation.
@@ -214,6 +242,7 @@ async fn drain_backlog(
 ) {
     let deadline = Instant::now() + DRAIN_BUDGET;
     let mut drained: u64 = 0;
+    let mut lost: u64 = 0;
     loop {
         if Instant::now() >= deadline {
             tracing::error!(
@@ -227,8 +256,15 @@ async fn drain_backlog(
         }
         match rx.try_recv() {
             Ok(event) => {
-                write_event(deps, adapter_name, event).await;
-                drained += 1;
+                // Count only what LANDED. Counting attempts here would
+                // report a reassuring "drained = N" in the shutdown log
+                // while some of those N were lost — the drain's own log
+                // line must not overstate what it saved.
+                if write_event(deps, adapter_name, event).await {
+                    drained += 1;
+                } else {
+                    lost += 1;
+                }
             }
             Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
             Err(TryRecvError::Lagged(n)) => {
@@ -244,7 +280,15 @@ async fn drain_backlog(
             }
         }
     }
-    if drained > 0 {
+    if lost > 0 {
+        tracing::error!(
+            adapter = %adapter_name,
+            drained,
+            lost,
+            "MES ledger-writer drained its backlog but some events were \
+             NOT written (every retry exhausted)"
+        );
+    } else if drained > 0 {
         tracing::info!(
             adapter = %adapter_name,
             drained,
@@ -255,10 +299,14 @@ async fn drain_backlog(
 
 /// Write one event, retrying a transient failure up to
 /// [`WRITE_ATTEMPTS`] times before giving up loudly.
-async fn write_one(deps: &LedgerWriterDeps, payload: &MesAdapterEventPayload, adapter_name: &str) {
+async fn write_one(
+    deps: &LedgerWriterDeps,
+    payload: &MesAdapterEventPayload,
+    adapter_name: &str,
+) -> bool {
     for attempt in 1..=WRITE_ATTEMPTS {
         match try_write_once(deps, payload).await {
-            Ok(()) => return,
+            Ok(()) => return true,
             Err(e) if attempt < WRITE_ATTEMPTS => {
                 let backoff = WRITE_RETRY_BASE_BACKOFF * 2u32.pow(attempt - 1);
                 tracing::warn!(
@@ -281,9 +329,11 @@ async fn write_one(deps: &LedgerWriterDeps, payload: &MesAdapterEventPayload, ad
                     attempts = WRITE_ATTEMPTS,
                     "MES audit-ledger write failed after every retry; EVENT LOST"
                 );
+                return false;
             }
         }
     }
+    false
 }
 
 /// One attempt at appending this event on the shared handle.

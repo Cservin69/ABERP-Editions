@@ -55,6 +55,21 @@ const PROD_CHANNEL_CAPACITY: usize = 1024;
 /// every other test binary and a loaded machine slows each ~60 ms append.
 const JOIN_TIMEOUT_SECS: u64 = 120;
 
+/// Open a raw DuckDB connection with the ADR-0098 R6 guard.
+///
+/// Every opener in the tree carries `PRAGMA disable_checkpoint_on_shutdown`
+/// so its close can never fold the shared WAL in place (duckdb#23046).
+/// `tests/` is NOT scanned by cut-gate CHECK 10j, so nothing enforces that
+/// here — and an unguarded reopen in a probe silently DESTROYS committed
+/// rows, which reads as writer event-loss or (worse) as a chain fork the
+/// writer never caused. This probe measured exactly that before the
+/// poller was guarded, so every raw open in this file goes through here.
+fn open_guarded(path: &std::path::Path) -> duckdb::Result<duckdb::Connection> {
+    let conn = duckdb::Connection::open(path)?;
+    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")?;
+    Ok(conn)
+}
+
 /// Open the ONE shared handle for a probe, exactly as `serve` does at boot.
 /// Every writer in a probe shares this single handle — that IS the fix under
 /// test, so a probe that handed each writer its own handle would be testing
@@ -88,14 +103,14 @@ async fn run_probe(hold_open: bool) -> (u64, String) {
     std::fs::create_dir_all(&tempdir).unwrap();
     let db_path = tempdir.join("audit.duckdb");
     {
-        let conn = duckdb::Connection::open(&db_path).unwrap();
+        let conn = open_guarded(&db_path).unwrap();
         ensure_schema(&conn).unwrap();
     }
 
     // The coexisting read-write handle, standing in for `serve`'s
     // long-lived audit-DB connection.
     let holder = if hold_open {
-        match duckdb::Connection::open(&db_path) {
+        match open_guarded(&db_path) {
             Ok(c) => Some(c),
             Err(e) => return (0, format!("second open itself failed: {e}")),
         }
@@ -139,7 +154,7 @@ async fn run_probe(hold_open: bool) -> (u64, String) {
     adapter.stop().await.unwrap();
     drop(holder);
 
-    let conn = duckdb::Connection::open(&db_path).unwrap();
+    let conn = open_guarded(&db_path).unwrap();
     let rows = conn
         .query_row(
             "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'mes.adapter_event'",
@@ -186,7 +201,7 @@ async fn two_concurrent_ledger_writers_lose_no_events() {
     std::fs::create_dir_all(&tempdir).unwrap();
     let db_path = tempdir.join("audit.duckdb");
     {
-        let conn = duckdb::Connection::open(&db_path).unwrap();
+        let conn = open_guarded(&db_path).unwrap();
         ensure_schema(&conn).unwrap();
     }
 
@@ -243,7 +258,7 @@ async fn two_concurrent_ledger_writers_lose_no_events() {
     a.stop().await.unwrap();
     b.stop().await.unwrap();
 
-    let conn = duckdb::Connection::open(&db_path).unwrap();
+    let conn = open_guarded(&db_path).unwrap();
     let rows = conn
         .query_row(
             "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'mes.adapter_event'",
@@ -282,7 +297,7 @@ async fn four_concurrent_ledger_writers_lose_no_events() {
     std::fs::create_dir_all(&tempdir).unwrap();
     let db_path = tempdir.join("audit.duckdb");
     {
-        let conn = duckdb::Connection::open(&db_path).unwrap();
+        let conn = open_guarded(&db_path).unwrap();
         ensure_schema(&conn).unwrap();
     }
 
@@ -339,7 +354,7 @@ async fn four_concurrent_ledger_writers_lose_no_events() {
         adapter.stop().await.unwrap();
     }
 
-    let conn = duckdb::Connection::open(&db_path).unwrap();
+    let conn = open_guarded(&db_path).unwrap();
     let rows = conn
         .query_row(
             "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'mes.adapter_event'",
@@ -371,7 +386,7 @@ async fn burst_write_under_a_polling_reader_loses_no_events() {
     std::fs::create_dir_all(&tempdir).unwrap();
     let db_path = tempdir.join("audit.duckdb");
     {
-        let conn = duckdb::Connection::open(&db_path).unwrap();
+        let conn = open_guarded(&db_path).unwrap();
         ensure_schema(&conn).unwrap();
     }
 
@@ -405,15 +420,10 @@ async fn burst_write_under_a_polling_reader_loses_no_events() {
         let mut opens = 0u32;
         let mut open_failures = 0u32;
         while !poll_stop.load(std::sync::atomic::Ordering::SeqCst) {
-            match duckdb::Connection::open(&poll_path) {
+            match open_guarded(&poll_path) {
                 Ok(conn) => {
-                    // ADR-0098 R6: an opener that closes WITHOUT this pragma
-                    // can fold the shared WAL in place on drop (duckdb#23046)
-                    // and destroy a just-committed row. This poller reopens
-                    // every 5 ms, so without the guard the READER silently
-                    // eats the writer's rows and the probe blames the writer.
-                    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-                        .expect("poller pragma guard");
+                    // Guarded via `open_guarded` — this poller reopens every
+                    // 5 ms, and unguarded it ate the writer's committed rows.
                     opens += 1;
                     let _ = conn.query_row(
                         "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'mes.adapter_event'",
@@ -452,7 +462,7 @@ async fn burst_write_under_a_polling_reader_loses_no_events() {
     let (opens, open_failures) = poller.join().unwrap();
     adapter.stop().await.unwrap();
 
-    let conn = duckdb::Connection::open(&db_path).unwrap();
+    let conn = open_guarded(&db_path).unwrap();
     let rows = conn
         .query_row(
             "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'mes.adapter_event'",
@@ -469,5 +479,112 @@ async fn burst_write_under_a_polling_reader_loses_no_events() {
          landed (reader opens={opens}, reader open failures={open_failures}). \
          Every append must survive the reader's file-lock contention via \
          retry, and any backlog must be drained at cancellation."
+    );
+}
+
+/// The RETRY has teeth: an append that fails is retried until it lands,
+/// not logged-and-dropped.
+///
+/// This was the one advertised fix with no coverage — an adversarial
+/// mutation that deleted the retry outright produced zero red tests.
+///
+/// The failure is induced deterministically rather than by racing: the
+/// `audit_ledger` TABLE is renamed aside and a VIEW is put in its place,
+/// so the writer's `ensure_schema` (a `CREATE TABLE IF NOT EXISTS`) hits a
+/// catalog-type conflict — and even if that no-ops, the follow-on
+/// `append_in_tx` cannot INSERT into a view. Either way the append fails
+/// for real, through the real write path, with no seam or fake injected.
+/// Healing the schema mid-flight lets a later attempt succeed.
+///
+/// Timing: attempts land at ~0, 25, 75, 175, 375, 775, 1575, 3175 ms
+/// (exponential backoff over `WRITE_ATTEMPTS`). Healing at ~500 ms leaves
+/// several attempts in hand, so this is not a tight race. With the retry
+/// removed, the single attempt at t≈0 fails and the row is lost forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_append_is_retried_rather_than_dropped() {
+    let tempdir = std::env::temp_dir().join(format!("aberp-retry-{}", Ulid::new()));
+    std::fs::create_dir_all(&tempdir).unwrap();
+    let db_path = tempdir.join("audit.duckdb");
+    {
+        let conn = open_guarded(&db_path).unwrap();
+        ensure_schema(&conn).unwrap();
+    }
+
+    let handle = shared_handle(&db_path, "ten_probe_retry");
+
+    // BREAK the append path — on the shared instance, so there is still
+    // exactly one writer instance and this cannot itself fork anything.
+    {
+        let conn = handle.write().expect("shared writer");
+        conn.execute_batch(
+            "ALTER TABLE audit_ledger RENAME TO audit_ledger_parked;
+             CREATE VIEW audit_ledger AS SELECT * FROM audit_ledger_parked;",
+        )
+        .expect("park the audit table behind a view");
+    }
+
+    let adapter: Arc<NoopAdapter> = Arc::new(NoopAdapter::with_capacity(
+        "retry-probe",
+        PROD_CHANNEL_CAPACITY,
+    ));
+    adapter.start().await.unwrap();
+    let deps = LedgerWriterDeps {
+        db: handle.clone(),
+        tenant: TenantId::new("ten_probe_retry").expect("tenant"),
+        binary_hash: BinaryHash::from_bytes([0u8; 32]),
+        actor: LedgerWriterActor {
+            session_id: Ulid::new().to_string(),
+            operator_login: "probe".to_string(),
+        },
+    };
+    let cancel = CancellationToken::new();
+    let writer = spawn_ledger_writer(adapter.clone() as Arc<dyn Adapter>, deps, cancel.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let n = adapter.emit_for_test(CanonicalEvent::ScanReceived {
+        scanner_id: "retry-probe".into(),
+        payload: "RETRY-1".into(),
+        symbology: None,
+        source_addr: None,
+        at_iso8601: "2026-08-05T09:00:00Z".into(),
+    });
+    assert!(n >= 1, "writer must be subscribed");
+
+    // Let the first attempts fail, then HEAL.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    {
+        let conn = handle.write().expect("shared writer");
+        conn.execute_batch(
+            "DROP VIEW audit_ledger;
+             ALTER TABLE audit_ledger_parked RENAME TO audit_ledger;",
+        )
+        .expect("restore the audit table");
+    }
+
+    // Give the remaining attempts room, then quiesce.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(JOIN_TIMEOUT_SECS), writer)
+        .await
+        .expect("ledger-writer must finish its shutdown drain before rows are counted")
+        .expect("ledger-writer task must not panic");
+    adapter.stop().await.unwrap();
+
+    let conn = open_guarded(&db_path).unwrap();
+    let rows = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'mes.adapter_event'",
+            [],
+            |r| r.get::<_, u64>(0),
+        )
+        .unwrap();
+    drop(conn);
+    std::fs::remove_dir_all(&tempdir).ok();
+
+    assert_eq!(
+        rows, 1,
+        "EVENT LOST: the append failed while the schema was broken and was \
+         never retried once it healed. A failed audit write must be retried, \
+         not logged-and-dropped."
     );
 }

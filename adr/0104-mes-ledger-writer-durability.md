@@ -124,7 +124,9 @@ Had the first draft been trusted, this change would have shipped an architecture
 
 1. **`LedgerWriterDeps.db_path` → `db: aberp_db::HandleArc`.** `try_write_once` now does `db.write()` + `ensure_schema` + tx + `append_in_tx` + commit — byte-for-byte the `email_outbox_poll_daemon` shape. `aberp-mes` takes a dependency on `aberp-db` (no cycle: `aberp-db` depends only on `audit-ledger` and `aberp-snapshot`). `mes_boot::MesBootDeps` carries the handle instead of the path; both `serve.rs` construction sites already had one in scope.
 
-   This kills the per-event open/close churn as a side effect: the probe suite's wall-clock fell from **16 s to 2.9 s**, because a write went from ~60 ms to ~1 ms.
+   This kills the per-event open/close churn as a side effect: the probe suite's wall-clock fell from **16 s to 2.9 s**, because a write went from ~60 ms to **~23.75 ms**.
+
+   > **Corrected.** An earlier draft of this ADR said "~1 ms". That was inferred from the suite's wall-clock, not measured per-write, and it was wrong by more than an order of magnitude. Independent measurement puts a write at **~23.75 ms**: `ensure_schema` 7-11 ms + tx/append/commit ~7 ms + `WriteGuard::drop` / `sync_mirror` 11-27 ms. The migration is still a large win over ~60 ms, but "~1 ms" overstated it badly and is corrected everywhere it appeared.
 
 2. **`drain_backlog`** — on cancellation, drain the broadcast with `try_recv` until empty, bounded by `DRAIN_BUDGET` (30 s). Overrun logs at **ERROR**: it is the one remaining path on which a cancelled writer leaves events unwritten, and it is loud. The select arm resolves to an `Option` first, because the `rx.recv()` branch holds a mutable borrow the drain also needs.
 
@@ -166,28 +168,35 @@ Mutation-verified, isolating each half:
 
 | Build | Rows | Chain |
 |---|---|---|
-| Full fix | **5/5 pass** | intact |
+| Full fix | **6/6 pass** | intact |
 | **B** — shared Handle reverted to the per-event opener (drain + retry kept) | 3 red (39/40) | **forked** — `OutOfOrder { expected: 2, found: 1 }`, in BOTH concurrency shapes |
 | **A** — shared Handle kept, **drain disabled** | 1 red (4-adapter burst) | intact |
+| **C** — shared Handle + drain kept, **retry removed** | 1 red (0/1 rows) | intact |
 
-Mutation **B** proves the Handle migration's teeth: with everything else in place, reverting just the writer instance forks the chain. Mutation **A** proves the drain's, and shows the two fixes are independent rather than one masking the other.
+Mutation **B** proves the Handle migration's teeth: with everything else in place, reverting just the writer instance forks the chain. Mutation **A** proves the drain's, and **C** the retry's — the three fixes are independent, none masking another.
 
-**Report on A:** the drain is now caught by the 4-adapter tight-burst shape *only*. On the shared Handle a write costs ~1 ms instead of ~60 ms, so the gentler two-writer and single-burst shapes no longer accumulate a backlog before cancellation and stay green without it. The drain still guards a real path — a fast writer can still be behind when a burst coincides with shutdown — but its coverage now rests on that one probe. Removing or weakening `four_concurrent_ledger_writers_lose_no_events` would silently un-gate the drain.
+**Mutation C was added late, and only because an adversarial found it missing.** The retry shipped in the first draft of this change with *zero* coverage: deleting it outright produced no red test at all. One of three advertised fixes was unverified. `a_failing_append_is_retried_rather_than_dropped` now closes that. It induces a real failure through the real write path rather than through an injected seam — the `audit_ledger` table is renamed aside and a VIEW put in its place, so `ensure_schema`'s `CREATE TABLE IF NOT EXISTS` hits a catalog-type conflict (and, if that ever no-ops, the follow-on `append_in_tx` still cannot INSERT into a view). Healing the schema at ~500 ms leaves several of the eight attempts in hand, so it is not a tight race. With the retry removed, the single attempt at t≈0 fails and the row is gone: **0/1**.
+
+**Report on A:** the drain is now caught by the 4-adapter tight-burst shape *only*. On the shared Handle a write costs ~23.75 ms instead of ~60 ms, so the gentler two-writer and single-burst shapes no longer accumulate a backlog before cancellation and stay green without it. The drain still guards a real path — a fast writer can still be behind when a burst coincides with shutdown — but its coverage now rests on that one probe. Removing or weakening `four_concurrent_ledger_writers_lose_no_events` would silently un-gate the drain.
 
 ---
 
 ## 5. Consequences
 
-- Adapter audit rows survive shutdown, transient write contention, and concurrent adapters. The audit chain no longer forks under a laser + CNC.
+- Adapter audit rows survive shutdown, transient write contention, and concurrent adapters.
+- **The audit chain no longer forks *among MES writers on the shared Handle*.** That qualifier is load-bearing and this ADR should not be read as claiming more. The ledger still has **two disjoint lock domains** — `append_in_tx` takes no lock of its own, so a writer holding the `Handle` mutex and a writer holding `AUDIT_APPEND_LOCK` do not exclude each other — and a cross-domain fork remains reachable. That is **pre-existing**, not introduced here; its live trigger is `audit_dap_boot::heartbeat`, which is **default OFF**. Being on the Handle is what makes MES *eligible* for the eventual fix rather than a second forking domain of its own. Tracked as a separate follow-up (§6.1), together with the CHECK 10M blind spot.
 - **`aberp-mes` now depends on `aberp-db`.** A hardware-adapter crate taking a DB-handle dependency is a real coupling; it is the price of the writer holding the shared instance rather than a path. The alternative — a trait seam with the Handle impl in `apps/aberp` — was considered and rejected as more machinery for the same result, and it would have left the probes testing a stand-in rather than the production surface.
-- The per-event open/close churn is gone: a write went from ~60 ms to ~1 ms, and the probe suite from 16 s to 2.9 s. Backlogs are now far harder to build, which is also why the drain's test coverage narrowed (§4.2).
+- The per-event open/close churn is gone: a write went from ~60 ms to ~23.75 ms, and the probe suite from 16 s to 2.9 s. Backlogs are now far harder to build, which is also why the drain's test coverage narrowed (§4.2).
 - Every MES append now serializes on the shared Handle's writer mutex with every other in-process audit writer. That is the same contention every migrated daemon already accepts, and it is what makes the chain single-writer.
-- Shutdown may take up to `DRAIN_BUDGET` longer in the worst case; overrun is loud and counted, rather than a silent discard.
+- **`DRAIN_BUDGET` (30 s) is a backstop, not the budget the writer gets — and the overrun ERROR cannot be relied on in production.** An earlier draft implied otherwise; corrected here. `ShutdownCoordinator`'s `DEFAULT_SHUTDOWN_TIMEOUT` is **5 s**, shared as ONE deadline across **~13 registered daemons**, with MES registered mid-list — so MES sees a slice of 5 s, never 30 s. And on overrun the coordinator does `tokio::time::timeout(remaining, daemon.handle)`, which **drops** the `JoinHandle`: dropping a tokio `JoinHandle` *detaches* the task rather than aborting it, so the writer drains on into an exiting process and the loud `UNWRITTEN` error is not guaranteed to be emitted.
+
+  The 30 s is deliberately left above the coordinator's window: it exists to stop an unbounded drain, and clamping it to 5 s would only make the writer give up early in tests and in embeddings that do grant more time. **This is not a live loss path** — MTConnect/Trumpf poll on a 5 s cadence and emit on state-change, so real backlogs sit far below what a 5 s slice drains — but the sizing is acknowledged rather than left implied.
 - `Lagged` remains licensed and unchanged. At 1024 deep it takes a sustained overload to reach it, and it stays loud and counted when it does.
 
 ## 6. Follow-ups (not in this change)
 
-1. **CHECK 10M's wrapper blind spot** (§3.3). The pre-fix MES write-fork — an independent opener plus an append, the exact primitive ADR-0099 bans — was invisible to the scanner because the append sat behind `write_mes_adapter_event` instead of appearing as a bare `append_in_tx(` in the same function body. Verified against the base revision: the scanner returns nothing. Any fork hidden behind a one-line helper is unguarded today. This is the highest-value follow-up here: the gate reads as green while blind, which is precisely the failure mode ADR-0098's F1-F4 review set out to end.
-2. **A test harness that opens the audit DB unguarded manufactures false durability defects** (§4.1). The probe's own poller cost 1-2 rows a run until it carried `PRAGMA disable_checkpoint_on_shutdown`. Worth a lint or a shared test helper, since the next probe author will hit it too.
-3. **`NoopAdapter::DEFAULT_CHANNEL_CAPACITY = 16`** contradicts ADR-0060's "size generously" on the crate's own reference adapter — the fixture footgun that produced the wrong premise in §1.
-4. **The `Lagged` counter ADR-0060 promised** ("emit a counter the future operations dashboard surfaces") is still only a log line, in both the steady-state and drain arms.
+1. **The cross-lock-domain chain fork.** The ledger has two disjoint lock domains — `append_in_tx` takes no lock of its own, so a writer holding the `Handle` mutex and one holding `AUDIT_APPEND_LOCK` do not exclude each other. A fork across them is still reachable. **Pre-existing**, not introduced here; live trigger is `audit_dap_boot::heartbeat`, default OFF. This is why §5 qualifies the fork claim to "among MES writers on the shared Handle." Being on the Handle makes MES eligible for the eventual fix instead of being a second forking domain. Owned by a separate follow-up alongside item 2.
+2. **CHECK 10M's wrapper blind spot** (§3.3). The pre-fix MES write-fork — an independent opener plus an append, the exact primitive ADR-0099 bans — was invisible to the scanner because the append sat behind `write_mes_adapter_event` instead of appearing as a bare `append_in_tx(` in the same function body. Verified against the base revision: the scanner returns nothing. Any fork hidden behind a one-line helper is unguarded today. This is the highest-value follow-up here: the gate reads as green while blind, which is precisely the failure mode ADR-0098's F1-F4 review set out to end.
+3. **A test harness that opens the audit DB unguarded manufactures false durability defects** (§4.1). The probe's own poller cost 1-2 rows a run until it carried `PRAGMA disable_checkpoint_on_shutdown`. Worth a lint or a shared test helper, since the next probe author will hit it too.
+4. **`NoopAdapter::DEFAULT_CHANNEL_CAPACITY = 16`** contradicts ADR-0060's "size generously" on the crate's own reference adapter — the fixture footgun that produced the wrong premise in §1.
+5. **The `Lagged` counter ADR-0060 promised** ("emit a counter the future operations dashboard surfaces") is still only a log line, in both the steady-state and drain arms.
