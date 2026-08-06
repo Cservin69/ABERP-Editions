@@ -10,14 +10,21 @@
 //!
 //! ## Design
 //!
-//! One writer task per adapter. The task subscribes to the adapter
-//! once, opens a fresh DuckDB connection (per-write — matches the
-//! quote-intake / AP-sync posture; the connection is short-lived and
-//! the audit-ledger schema is idempotent via `ensure_schema`).
+//! One writer task per adapter. The task subscribes to the adapter once
+//! and appends every event on the ONE shared `aberp_db::Handle`
+//! (ADR-0098 Gap 1a) — the same surface `email_outbox_poll_daemon` uses.
+//!
+//! It does NOT open its own connection. Before ADR-0104 it opened a
+//! fresh one per event, which meant two adapters ran two writer
+//! instances against one audit DB with no lock between them: both could
+//! read the same committed head and self-assign the same `seq`, forking
+//! the hash chain. The shared handle's writer mutex serializes appends,
+//! so the head a writer reads is always current.
 //!
 //! Cancellation races the broadcast receive via `tokio::select!`; a
 //! Tauri window close or a Ctrl-C in `run_prod.sh` exits the task
-//! within ms.
+//! within ms — after draining whatever is still buffered (see
+//! [`DRAIN_BUDGET`]).
 //!
 //! ## Lossiness contract
 //!
