@@ -89,8 +89,13 @@
     try {
       // Only thread kind-specific fields for the kind that uses them so
       // a stale device_name typed under a different kind never persists.
+      // Both MTConnect CNCs and Trumpf lasers use the device_name
+      // slot (the laser's v1 backend IS MTConnect, so it is the same
+      // Agent device path).
+      const kindUsesDeviceName =
+        kind === "cnc-machine" || kind === "laser-cutter";
       const deviceField =
-        kind === "cnc-machine" && deviceName.trim().length > 0
+        kindUsesDeviceName && deviceName.trim().length > 0
           ? deviceName.trim()
           : null;
       const modelField =
@@ -208,6 +213,23 @@
             data-testid="adapter-form-device-name"
           />
           <span class="field__hint">MTConnect device name (default: "default")</span>
+        </label>
+      {/if}
+
+      {#if kind === "laser-cutter"}
+        <label class="field">
+          <span class="field__label">Eszköznév / Device name</span>
+          <input
+            type="text"
+            bind:value={deviceName}
+            disabled={busy}
+            placeholder="default"
+            data-testid="adapter-form-device-name"
+          />
+          <span class="field__hint"
+            >MTConnect gateway device name for the laser (default:
+            "default")</span
+          >
         </label>
       {/if}
 

@@ -2065,7 +2065,8 @@ export type AdapterKind =
   | "barcode-scanner"
   | "label-printer"
   | "cnc-machine"
-  | "robot";
+  | "robot"
+  | "laser-cutter";
 
 // `AdapterStatus` (the closed-vocab live status vocab) is already
 // defined below for the Workshop dashboard — reused here verbatim.

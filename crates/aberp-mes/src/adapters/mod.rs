@@ -36,5 +36,6 @@
 pub mod barcode_scanner;
 pub mod common;
 pub mod mtconnect;
+pub mod trumpf;
 pub mod ur_rtde;
 pub mod zebra;

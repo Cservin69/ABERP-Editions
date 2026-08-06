@@ -13,6 +13,7 @@ export const ADAPTER_KIND_LABELS: Record<AdapterKind, string> = {
   "label-printer": "Zebra label printer",
   "cnc-machine": "MTConnect CNC",
   robot: "UR RTDE robot",
+  "laser-cutter": "Trumpf laser cutter",
 };
 
 /** Display order for the Add-wizard kind picker. */
@@ -21,6 +22,7 @@ export const ADAPTER_KIND_ORDER: AdapterKind[] = [
   "label-printer",
   "cnc-machine",
   "robot",
+  "laser-cutter",
 ];
 
 /** Resolve a kind to its display label. Closed-vocab graceful degrade:

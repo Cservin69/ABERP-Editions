@@ -408,7 +408,13 @@ async fn run_poll_loop(
 /// Single poll: HTTP GET, classify response, parse body. Returns the
 /// parsed snapshot + elapsed time on success; the caller picks the
 /// `Healthy` / `Degraded` verdict from `elapsed`.
-async fn poll_once(
+///
+/// `pub(crate)` so the Trumpf laser adapter's
+/// [`MtconnectLaserSource`](crate::adapters::trumpf::MtconnectLaserSource)
+/// can reuse this exact wire path — including both response-size caps
+/// and the error classification — rather than re-implementing an HTTP
+/// poll with its own (drifting) DoS bounds.
+pub(crate) async fn poll_once(
     client: &reqwest::Client,
     url: &str,
     max_response_bytes: usize,
@@ -568,7 +574,12 @@ pub(crate) fn parse_mtconnect_current(xml: &[u8]) -> Result<MtconnectSnapshot, S
 /// vocabulary". Closed match — anything we don't recognise lands on
 /// [`MachineState::Unknown`], never on a default like Idle (silent
 /// misclassification is the failure mode CLAUDE.md rule 12 names).
-fn map_execution_to_state(execution: &str) -> MachineState {
+///
+/// `pub(crate)` so the Trumpf laser adapter maps Execution through the
+/// SAME closed table — a laser behind an MTConnect gateway reports the
+/// same vocabulary, and a second copy of this match would be free to
+/// drift from this one.
+pub(crate) fn map_execution_to_state(execution: &str) -> MachineState {
     match execution {
         "ACTIVE" => MachineState::Running,
         "READY" => MachineState::Idle,
