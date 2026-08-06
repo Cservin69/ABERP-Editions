@@ -397,16 +397,22 @@ open(p,"w").write(s.replace(old,new,1))
 PYIN
 expect_fail "$c" "opener fingerprint set DIVERGED" "CHECK 10k — a count-preserving intra-file opener swap is caught by the fingerprint freeze"
 
-echo "[CHECK 10j/crates] R6 (NEW-3) — pragma STRIPPED from a frozen CRATE residual opener (aberp-mes ledger_writer) — the R6 crates-scope extension must catch it"
+# ADR-0104 re-anchored this probe. It used to strip the pragma from
+# aberp-mes ledger_writer::write_one, but that opener is GONE — the MES
+# writer moved onto the shared aberp_db::Handle, so aberp-mes owns no
+# runtime opener at all. The probe now targets the inventory rebuild CLI,
+# which is still a frozen crates/ residual, so the R6 crates-scope
+# extension keeps its teeth.
+echo "[CHECK 10j/crates] R6 (NEW-3) — pragma STRIPPED from a frozen CRATE residual opener (aberp-inventory rebuild_stock_cache) — the R6 crates-scope extension must catch it"
 c="$(fresh)"
-python3 - "$c/crates/aberp-mes/src/ledger_writer.rs" <<'PYIN'
+python3 - "$c/crates/aberp-inventory/src/bin/rebuild_stock_cache.rs" <<'PYIN'
 import sys
 p=sys.argv[1]; s=open(p).read()
-block='        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")\n            .map_err(|e| format!("PRAGMA disable_checkpoint_on_shutdown on MES ledger residual opener (ADR-0098 R6): {e}"))?;\n'
-assert block in s, "aberp-mes ledger_writer pragma anchor moved -- probe is stale"
+block='    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")\n        .context("PRAGMA disable_checkpoint_on_shutdown on inventory rebuild residual opener (ADR-0098 R6)")?;\n'
+assert block in s, "aberp-inventory rebuild_stock_cache pragma anchor moved -- probe is stale"
 open(p,"w").write(s.replace(block,'',1))
 PYIN
-expect_fail "$c" "residual Connection::open has NO disable_checkpoint_on_shutdown within" "CHECK 10j/crates -- R6: pragma stripped from the aberp-mes crate residual opener (invisible pre-R6 crates-scope extension)"
+expect_fail "$c" "residual Connection::open has NO disable_checkpoint_on_shutdown within" "CHECK 10j/crates -- R6: pragma stripped from a crate residual opener (invisible pre-R6 crates-scope extension)"
 
 
 echo "[CHECK 10L] a raw Connection/Ledger opener + rogue sync_mirror REPLANTED inside the migrated boot seam append_backfill_cycle_entry — the R7 re-fork must go red"
