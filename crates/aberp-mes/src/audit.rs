@@ -11,10 +11,12 @@
 //! (e.g. an adapter-registered event distinct from per-event-recording)
 //! add `EventKind` variants but keep the `mes.` prefix.
 
+use std::path::Path;
+
 use duckdb::Transaction;
 use serde::{Deserialize, Serialize};
 
-use aberp_audit_ledger::{append_in_tx, Actor, AppendError, EventKind, LedgerMeta};
+use aberp_audit_ledger::{append_in_tx, append_reopen, Actor, AppendError, EventKind, LedgerMeta};
 
 use crate::events::CanonicalEvent;
 
@@ -77,6 +79,53 @@ pub fn write_mes_adapter_event(
 ) -> Result<(), AppendError> {
     append_in_tx(
         tx,
+        meta,
+        EventKind::MesAdapterEvent,
+        payload.to_bytes(),
+        actor,
+        Some(payload.idempotency_key.clone()),
+    )
+    .map(|_| ())
+}
+
+/// Append one MES-adapter-event entry by way of the audit-ledger's
+/// S341 serialized reopen-per-write surface
+/// ([`append_reopen`](aberp_audit_ledger::append_reopen)).
+///
+/// This is the surface the ledger-writer runtime task uses. It is NOT
+/// interchangeable with [`write_mes_adapter_event`]: that helper rides
+/// a caller-owned transaction (the ADR-0008 §"Storage" same-tx rule,
+/// for callers whose upstream state change is already in flight),
+/// whereas an adapter event has no sibling state change to ride — the
+/// broadcast emission IS the event — so the writer owns the whole
+/// open → append → commit window on its own.
+///
+/// Routing through `append_reopen` (rather than hand-rolling
+/// `Connection::open` + `ensure_schema` + `append_in_tx` + `commit`, as
+/// this path did before) buys two properties the hand-rolled form did
+/// not have:
+///
+/// 1. **No chain fork.** `append_reopen` holds `AUDIT_APPEND_LOCK`
+///    across the entire window, so two concurrent in-process writers —
+///    `mes_manager` spawns one per configured adapter, so a shop with a
+///    laser and a CNC has two — cannot read the same committed head and
+///    append a duplicate `seq`. The hand-rolled form took no lock at
+///    all.
+/// 2. **No concurrent-open assertion.** Independent `Connection::open`
+///    handles touching the same file at once can trip a DuckDB-internal
+///    assertion; serializing the whole reopen-per-write keeps the
+///    in-process audit path single-writer.
+///
+/// The pragma guard for ADR-0098 R6 (duckdb#23046) lives inside
+/// `append_reopen`, so this path inherits it rather than restating it.
+pub fn append_mes_adapter_event_reopen(
+    db_path: &Path,
+    meta: &LedgerMeta,
+    actor: Actor,
+    payload: &MesAdapterEventPayload,
+) -> Result<(), AppendError> {
+    append_reopen(
+        db_path,
         meta,
         EventKind::MesAdapterEvent,
         payload.to_bytes(),

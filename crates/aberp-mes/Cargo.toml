@@ -25,7 +25,9 @@ async-trait = { workspace = true }
 # inside the barcode-scanner adapter's per-connection reader loop;
 # `rt` for `spawn_blocking` used by the ledger writer's per-event
 # DuckDB-append surface.
-tokio = { workspace = true, features = ["io-util", "rt"] }
+# `time` (ADR-0104) backs the ledger-writer's bounded write-retry
+# backoff; without it a transient audit-write failure was dropped.
+tokio = { workspace = true, features = ["io-util", "rt", "time"] }
 
 # Error machinery — same crate every other ABERP crate uses.
 thiserror = { workspace = true }

@@ -27,11 +27,32 @@
 //! `RecvError::Lagged(n)` arm logs loud (so the future operations
 //! dashboard surfaces the drop count) but otherwise continues — the
 //! adapter MUST stay running even if the ledger-writer falls behind.
+//!
+//! That contract covers `RecvError::Lagged` — a channel that OVERFLOWS —
+//! and nothing else. Two other loss paths existed here and were NOT
+//! covered by it (ADR-0104):
+//!
+//! - **Shutdown discarded the backlog.** The cancel arm of the
+//!   `tokio::select!` returned immediately, abandoning every event
+//!   already buffered in the broadcast but not yet written. Because the
+//!   pre-ADR-0104 write cost ~60 ms per event (a fresh `Connection::open`
+//!   + `ensure_schema` + tx + commit each time), a burst arriving faster
+//!   than that built a backlog as a matter of course, so this fired on
+//!   ordinary shop-floor traffic rather than only under stress. It is
+//!   now drained — see [`DRAIN_BUDGET`].
+//! - **A failed write was logged and dropped.** One `warn!` and the
+//!   event was gone. Writes are now retried (see [`WRITE_ATTEMPTS`]) and
+//!   a genuinely exhausted write logs at ERROR, not WARN.
+//!
+//! Neither path is licensed by ADR-0060; a `Lagged` overflow is a
+//! deliberate, counted, bounded drop, whereas both of these were silent.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+use tokio::sync::broadcast::Receiver;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
@@ -39,7 +60,28 @@ use ulid::Ulid;
 use aberp_audit_ledger::{Actor, BinaryHash, LedgerMeta, TenantId};
 
 use crate::adapter::Adapter;
-use crate::audit::{write_mes_adapter_event, MesAdapterEventPayload};
+use crate::audit::{append_mes_adapter_event_reopen, MesAdapterEventPayload};
+use crate::events::CanonicalEvent;
+
+/// How many times a single event's ledger write is attempted before the
+/// writer gives up on it. A write can fail transiently — DuckDB takes a
+/// single-writer file lock, so a sibling in-process opener (the snapshot
+/// daemon, a dashboard query, another adapter's writer) can lose the
+/// race. Retrying converts a transient loser into a durable row; the
+/// pre-ADR-0104 code dropped it on the first failure.
+const WRITE_ATTEMPTS: u32 = 5;
+
+/// Backoff between write attempts. Deliberately short — the contended
+/// window is a single DuckDB open/commit, not a network round trip.
+const WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Wall-clock budget for draining the broadcast backlog after
+/// cancellation. Shutdown must not hang, but it also must not silently
+/// discard the tail of the audit trail, so the drain is bounded rather
+/// than either unbounded or absent. Exceeding it is an ERROR — the only
+/// remaining path on which a cancelled writer can leave events unwritten,
+/// and it is loud.
+const DRAIN_BUDGET: Duration = Duration::from_secs(30);
 
 /// Dependencies the ledger-writer task needs to write into the audit
 /// ledger. Constructed by the boot code in `apps/aberp::serve` from
@@ -92,21 +134,22 @@ async fn run_ledger_writer(
     tracing::info!(adapter = %adapter_name, "MES ledger-writer task started");
 
     loop {
+        // The cancel arm must NOT borrow `rx` — the drain needs it
+        // mutably, and the `rx.recv()` branch holds a mutable borrow for
+        // the lifetime of the select. Resolve to an Option first, then
+        // drain outside the select.
         let recv = tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::info!(adapter = %adapter_name, "MES ledger-writer cancelled; exiting");
-                return;
-            }
-            r = rx.recv() => r,
+            _ = cancel.cancelled() => None,
+            r = rx.recv() => Some(r),
+        };
+        let Some(recv) = recv else {
+            drain_backlog(&mut rx, &deps, &adapter_name).await;
+            tracing::info!(adapter = %adapter_name, "MES ledger-writer cancelled; exiting");
+            return;
         };
         match recv {
             Ok(event) => {
-                let payload = MesAdapterEventPayload::new(
-                    adapter_name.clone(),
-                    Ulid::new().to_string(),
-                    event,
-                );
-                write_one(&deps, &payload, &adapter_name).await;
+                write_event(&deps, &adapter_name, event).await;
             }
             Err(RecvError::Lagged(n)) => {
                 // Loud-fail per CLAUDE.md rule 12 — operator MUST see
@@ -130,56 +173,122 @@ async fn run_ledger_writer(
     }
 }
 
+/// Mint the payload for one canonical event and write it, retrying.
+async fn write_event(deps: &LedgerWriterDeps, adapter_name: &str, event: CanonicalEvent) {
+    let payload =
+        MesAdapterEventPayload::new(adapter_name.to_string(), Ulid::new().to_string(), event);
+    write_one(deps, &payload, adapter_name).await;
+}
+
+/// Drain whatever the broadcast still holds after cancellation.
+///
+/// Without this the cancel arm returned straight away and every buffered
+/// event went with it — the dominant loss path measured in
+/// `tests/ledger_contention_probe.rs` (24/40 and 43/50 rows landing).
+/// Bounded by [`DRAIN_BUDGET`] so a wedged ledger cannot hang shutdown.
+async fn drain_backlog(
+    rx: &mut Receiver<CanonicalEvent>,
+    deps: &LedgerWriterDeps,
+    adapter_name: &str,
+) {
+    let deadline = Instant::now() + DRAIN_BUDGET;
+    let mut drained: u64 = 0;
+    loop {
+        if Instant::now() >= deadline {
+            tracing::error!(
+                adapter = %adapter_name,
+                drained,
+                budget_secs = DRAIN_BUDGET.as_secs(),
+                "MES ledger-writer shutdown drain exceeded its budget; \
+                 remaining buffered events are UNWRITTEN"
+            );
+            return;
+        }
+        match rx.try_recv() {
+            Ok(event) => {
+                write_event(deps, adapter_name, event).await;
+                drained += 1;
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+            Err(TryRecvError::Lagged(n)) => {
+                // Same ADR-0060 contract as the steady-state arm: an
+                // overflow is a counted, licensed drop. Keep draining
+                // what survived.
+                tracing::warn!(
+                    adapter = %adapter_name,
+                    skipped = n,
+                    "MES broadcast lagged during shutdown drain; events \
+                     dropped from tail (per ADR-0060 broadcast lossiness contract)"
+                );
+            }
+        }
+    }
+    if drained > 0 {
+        tracing::info!(
+            adapter = %adapter_name,
+            drained,
+            "MES ledger-writer drained its backlog before exiting"
+        );
+    }
+}
+
+/// Write one event, retrying a transient failure up to
+/// [`WRITE_ATTEMPTS`] times before giving up loudly.
 async fn write_one(deps: &LedgerWriterDeps, payload: &MesAdapterEventPayload, adapter_name: &str) {
+    for attempt in 1..=WRITE_ATTEMPTS {
+        match try_write_once(deps, payload).await {
+            Ok(()) => return,
+            Err(e) if attempt < WRITE_ATTEMPTS => {
+                tracing::warn!(
+                    adapter = %adapter_name,
+                    error = %e,
+                    attempt,
+                    max_attempts = WRITE_ATTEMPTS,
+                    "MES audit-ledger write failed; retrying"
+                );
+                tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
+            }
+            Err(e) => {
+                // Loud-fail per CLAUDE.md rule 12. ERROR, not WARN: an
+                // audit row that never lands is an integrity event, not
+                // an operational nuisance.
+                tracing::error!(
+                    adapter = %adapter_name,
+                    error = %e,
+                    attempts = WRITE_ATTEMPTS,
+                    "MES audit-ledger write failed after every retry; EVENT LOST"
+                );
+            }
+        }
+    }
+}
+
+/// One attempt at the serialized reopen-per-write append.
+async fn try_write_once(
+    deps: &LedgerWriterDeps,
+    payload: &MesAdapterEventPayload,
+) -> Result<(), String> {
     let db_path = deps.db_path.clone();
     let tenant = deps.tenant.clone();
     let binary_hash = deps.binary_hash;
     let session_id = deps.actor.session_id.clone();
     let login = deps.actor.operator_login.clone();
     let payload_owned = payload.clone();
-    let adapter_name = adapter_name.to_string();
 
-    let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let mut conn = duckdb::Connection::open(&db_path)
-            .map_err(|e| format!("open DB for MES audit append: {e}"))?;
-        // ADR-0098 R6 (NEW-3): this residual in-serve-process opener must not fold
-        // the shared WAL in place on close while the Handle's instance is open
-        // (duckdb#23046). Pragma-guard it — now enforced by cut-gate CHECK 10j,
-        // whose scope R6 extended to crates/. Full Handle migration is a v0.2.6 target.
-        conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
-            .map_err(|e| format!("PRAGMA disable_checkpoint_on_shutdown on MES ledger residual opener (ADR-0098 R6): {e}"))?;
-        aberp_audit_ledger::ensure_schema(&conn)
-            .map_err(|e| format!("ensure audit-ledger schema: {e}"))?;
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("open MES audit tx: {e}"))?;
+    // `append_reopen` blocks on AUDIT_APPEND_LOCK and on DuckDB itself,
+    // so it stays on the blocking pool.
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
         let meta = LedgerMeta::new(tenant, binary_hash);
         let actor = Actor::from_local_cli(session_id, &login);
-        write_mes_adapter_event(&tx, &meta, actor, &payload_owned)
-            .map_err(|e| format!("write MES adapter event: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("commit MES audit tx: {e}"))?;
-        Ok(())
+        // S341 serialized reopen-per-write. Holds AUDIT_APPEND_LOCK
+        // across open → ensure_schema → append → commit, so two adapter
+        // writers cannot read the same head and fork the chain, and
+        // carries the ADR-0098 R6 pragma guard internally.
+        append_mes_adapter_event_reopen(&db_path, &meta, actor, &payload_owned)
+            .map_err(|e| format!("append MES adapter event: {e}"))
     })
-    .await;
-
-    match outcome {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            tracing::warn!(
-                adapter = %adapter_name,
-                error = %e,
-                "MES audit-ledger write failed; event lost"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                adapter = %adapter_name,
-                error = %e,
-                "MES audit-ledger task panicked; event lost"
-            );
-        }
-    }
+    .await
+    .map_err(|e| format!("MES audit-ledger blocking task panicked: {e}"))?
 }
 
 #[cfg(test)]

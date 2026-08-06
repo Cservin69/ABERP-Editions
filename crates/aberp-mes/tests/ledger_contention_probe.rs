@@ -17,9 +17,41 @@ use std::time::Duration;
 use aberp_mes::{
     spawn_ledger_writer, Adapter, CanonicalEvent, LedgerWriterActor, LedgerWriterDeps, NoopAdapter,
 };
-use aberp_audit_ledger::{ensure_schema, BinaryHash, TenantId};
+use aberp_audit_ledger::{ensure_schema, BinaryHash, Ledger, TenantId};
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
+
+/// The broadcast depth every REAL adapter ships with — `barcode_scanner`,
+/// `mtconnect`, `zebra`, `ur_rtde` and `trumpf` all define
+/// `DEFAULT_CHANNEL_CAPACITY: usize = 1024`, per ADR-0060's "size the
+/// receiver generously" mitigation.
+///
+/// `NoopAdapter::new` defaults to 16 instead. That is a fixture default on
+/// a reference adapter which emits nothing in production, and at 16 a
+/// burst overflows the channel and loses events to `RecvError::Lagged` —
+/// a drop ADR-0060 explicitly LICENSES, and therefore not the defect
+/// under test. These probes pin the production depth so what they measure
+/// is the writer's own durability, not a fixture's channel depth.
+const PROD_CHANNEL_CAPACITY: usize = 1024;
+
+/// Assert the hash chain has not forked. Two ledger-writers appending
+/// concurrently without `AUDIT_APPEND_LOCK` can read the same committed
+/// head and write a duplicate `seq`; `verify_chain` is what catches it.
+fn assert_chain_intact(db_path: &std::path::Path, tenant: &str, expected: usize) {
+    let ledger = Ledger::open(
+        db_path,
+        TenantId::new(tenant).expect("tenant"),
+        BinaryHash::from_bytes([0u8; 32]),
+    )
+    .expect("reopen ledger for verification");
+    let verified = ledger
+        .verify_chain()
+        .expect("audit chain must verify after concurrent adapter writes");
+    assert!(
+        verified as usize >= expected,
+        "chain verified {verified} entries, expected at least {expected}"
+    );
+}
 
 async fn run_probe(hold_open: bool) -> (u64, String) {
     let tempdir = std::env::temp_dir().join(format!("aberp-contention-{}", Ulid::new()));
@@ -135,8 +167,12 @@ async fn two_concurrent_ledger_writers_lose_no_events() {
         },
     };
 
-    let a: Arc<NoopAdapter> = Arc::new(NoopAdapter::new("laser-probe"));
-    let b: Arc<NoopAdapter> = Arc::new(NoopAdapter::new("cnc-probe"));
+    let a: Arc<NoopAdapter> = Arc::new(NoopAdapter::with_capacity(
+        "laser-probe",
+        PROD_CHANNEL_CAPACITY,
+    ));
+    let b: Arc<NoopAdapter> =
+        Arc::new(NoopAdapter::with_capacity("cnc-probe", PROD_CHANNEL_CAPACITY));
     a.start().await.unwrap();
     b.start().await.unwrap();
     let cancel = CancellationToken::new();
@@ -174,16 +210,106 @@ async fn two_concurrent_ledger_writers_lose_no_events() {
         )
         .unwrap();
     drop(conn);
+
+    // Integrity, not just count: two writers appending without
+    // AUDIT_APPEND_LOCK can read the same head and fork the chain.
+    assert_chain_intact(&db_path, "ten_probe_two", PER_ADAPTER * 2);
     std::fs::remove_dir_all(&tempdir).ok();
 
     assert_eq!(
         rows as usize,
         PER_ADAPTER * 2,
-        "SILENT EVENT LOSS with two adapters running at once: {rows}/{} rows \
-         landed. Each ledger-writer opens its own short-lived DuckDB \
-         connection per event; a failed open is logged-and-dropped, never \
-         retried.",
+        "EVENT LOSS with two adapters running at once: {rows}/{} rows \
+         landed. Each ledger-writer drives its own reopen-per-write append; \
+         events still buffered when the writer is cancelled must be drained, \
+         and a failed append must be retried rather than dropped.",
         PER_ADAPTER * 2
+    );
+}
+
+/// Higher-concurrency shape: four adapters, therefore four ledger-writer
+/// tasks contending on one audit DB. A shop running a laser, a CNC, a
+/// robot cell and a label printer at once. Every event must land AND the
+/// chain must still verify.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn four_concurrent_ledger_writers_lose_no_events() {
+    const PER_ADAPTER: usize = 20;
+    const ADAPTERS: [&str; 4] = ["laser", "cnc", "robot", "labeller"];
+
+    let tempdir = std::env::temp_dir().join(format!("aberp-contention-four-{}", Ulid::new()));
+    std::fs::create_dir_all(&tempdir).unwrap();
+    let db_path = tempdir.join("audit.duckdb");
+    {
+        let conn = duckdb::Connection::open(&db_path).unwrap();
+        ensure_schema(&conn).unwrap();
+    }
+
+    let cancel = CancellationToken::new();
+    let mut adapters = Vec::new();
+    let mut writers = Vec::new();
+    for name in ADAPTERS {
+        let adapter: Arc<NoopAdapter> =
+            Arc::new(NoopAdapter::with_capacity(name, PROD_CHANNEL_CAPACITY));
+        adapter.start().await.unwrap();
+        let deps = LedgerWriterDeps {
+            db_path: db_path.clone(),
+            tenant: TenantId::new("ten_probe_four").expect("tenant"),
+            binary_hash: BinaryHash::from_bytes([0u8; 32]),
+            actor: LedgerWriterActor {
+                session_id: format!("{name}-{}", Ulid::new()),
+                operator_login: "probe".to_string(),
+            },
+        };
+        writers.push(spawn_ledger_writer(
+            adapter.clone() as Arc<dyn Adapter>,
+            deps,
+            cancel.clone(),
+        ));
+        adapters.push(adapter);
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Tight burst — no inter-event sleep, so the writers are guaranteed to
+    // fall behind and carry a backlog into cancellation.
+    for i in 0..PER_ADAPTER {
+        for (adapter, name) in adapters.iter().zip(ADAPTERS) {
+            let n = adapter.emit_for_test(CanonicalEvent::ScanReceived {
+                scanner_id: name.into(),
+                payload: format!("{name}-{i}"),
+                symbology: None,
+                source_addr: None,
+                at_iso8601: "2026-08-05T09:00:00Z".into(),
+            });
+            assert!(n >= 1, "{name} writer must stay subscribed");
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    cancel.cancel();
+    for w in writers {
+        let _ = tokio::time::timeout(Duration::from_secs(60), w).await;
+    }
+    for adapter in &adapters {
+        adapter.stop().await.unwrap();
+    }
+
+    let conn = duckdb::Connection::open(&db_path).unwrap();
+    let rows = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'mes.adapter_event'",
+            [],
+            |r| r.get::<_, u64>(0),
+        )
+        .unwrap();
+    drop(conn);
+
+    let expected = PER_ADAPTER * ADAPTERS.len();
+    assert_chain_intact(&db_path, "ten_probe_four", expected);
+    std::fs::remove_dir_all(&tempdir).ok();
+
+    assert_eq!(
+        rows as usize, expected,
+        "EVENT LOSS with four adapters running at once: {rows}/{expected} rows landed."
     );
 }
 
@@ -203,7 +329,10 @@ async fn burst_write_under_a_polling_reader_loses_no_events() {
         ensure_schema(&conn).unwrap();
     }
 
-    let adapter: Arc<NoopAdapter> = Arc::new(NoopAdapter::new("burst-probe"));
+    let adapter: Arc<NoopAdapter> = Arc::new(NoopAdapter::with_capacity(
+        "burst-probe",
+        PROD_CHANNEL_CAPACITY,
+    ));
     let adapter_for_writer: Arc<dyn Adapter> = adapter.clone();
     adapter.start().await.unwrap();
 
