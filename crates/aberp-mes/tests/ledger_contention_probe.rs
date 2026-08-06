@@ -1,23 +1,37 @@
-//! Probe: is the ledger-writer's "logged-and-dropped" write failure a
-//! TEST artefact only, or a real production event-loss path?
+//! Durability probe for the MES ledger-writer: does every adapter event
+//! reach the audit ledger, and does the hash chain survive concurrent
+//! adapters? See ADR-0104.
 //!
-//! `write_one` opens a FRESH `duckdb::Connection` per event. DuckDB takes
-//! a single-writer file lock. In `apps/aberp serve` the audit DB is also
-//! held open by the process (the ledger writer's own source comment cites
-//! ADR-0098 R6 and calls itself a "residual in-serve-process opener").
+//! ## What this probe originally claimed, and what it actually showed
 //!
-//! If a coexisting read-write handle makes every `Connection::open` fail,
-//! then adapter events are silently dropped in production — a `warn!` and
-//! nothing else. This test holds such a handle open and checks whether the
-//! event still lands.
+//! These tests were written by the Trumpf adversarial review to prove
+//! that `write_one`'s "logged-and-dropped" write failure lost events in
+//! production. Instrumenting the code disproved that: **not one write
+//! ever failed.** The loss it measured was `RecvError::Lagged` — the
+//! broadcast overflowing `NoopAdapter`'s 16-slot fixture channel — which
+//! ADR-0060 explicitly LICENSES. Every real adapter ships a 1024-deep
+//! channel (see [`PROD_CHANNEL_CAPACITY`]), so that shape was a fixture
+//! artifact and not a production one.
+//!
+//! The probes are therefore pinned to the production channel depth, which
+//! takes the licensed overflow off the table and leaves only the writer's
+//! own durability under test. At that depth they still caught three real,
+//! undocumented defects, all fixed in ADR-0104:
+//!
+//! 1. cancellation abandoned the undrained broadcast backlog;
+//! 2. a failed append was logged once and dropped, never retried;
+//! 3. the writer bypassed `AUDIT_APPEND_LOCK`, so two concurrent adapters
+//!    could read the same committed head and **fork the audit chain** —
+//!    which is why the concurrency shapes assert `verify_chain` and not
+//!    just a row count. A count alone cannot see a fork.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use aberp_audit_ledger::{ensure_schema, BinaryHash, Ledger, TenantId};
 use aberp_mes::{
     spawn_ledger_writer, Adapter, CanonicalEvent, LedgerWriterActor, LedgerWriterDeps, NoopAdapter,
 };
-use aberp_audit_ledger::{ensure_schema, BinaryHash, Ledger, TenantId};
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
@@ -126,25 +140,25 @@ async fn control_uncontended_write_lands() {
     assert_eq!(rows, 1, "uncontended write should land ({note})");
 }
 
-/// The real question: with a coexisting read-write handle open on the
-/// same file — the production `serve` shape — does the event still reach
-/// the ledger, or is it silently dropped?
+/// A coexisting read-write handle on the same file — the `serve` shape,
+/// where the audit DB is also held open by the process. This one never
+/// reproduced loss (the coexisting open does not make the writer's own
+/// open fail); it is kept as a standing guard on that assumption.
 #[tokio::test]
 async fn contended_write_still_lands_or_the_event_is_silently_lost() {
     let (rows, note) = run_probe(true).await;
     assert_eq!(
         rows, 1,
-        "SILENT EVENT LOSS: a coexisting read-write DuckDB handle on the \
-         audit DB made the ledger-writer's per-event open fail; the event \
-         was logged-and-dropped, not retried. note={note}"
+        "EVENT LOSS: a coexisting read-write DuckDB handle on the audit DB \
+         stopped the ledger-writer's append from landing. note={note}"
     );
 }
 
-/// PRODUCTION SHAPE: two adapters, therefore two ledger-writer tasks,
-/// each opening its own short-lived `duckdb::Connection` per event on the
-/// SAME audit DB. No test-only reader involved. `mes_manager` spawns one
-/// writer per configured adapter, so this is what a shop with a laser and
-/// a CNC running at once actually does.
+/// PRODUCTION SHAPE: two adapters, therefore two ledger-writer tasks
+/// appending to the SAME audit DB. `mes_manager` spawns one writer per
+/// configured adapter, so this is what a shop with a laser and a CNC
+/// running at once actually does — and it is the shape that forked the
+/// hash chain before the writer moved onto `append_reopen`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_concurrent_ledger_writers_lose_no_events() {
     const PER_ADAPTER: usize = 25;
@@ -171,8 +185,10 @@ async fn two_concurrent_ledger_writers_lose_no_events() {
         "laser-probe",
         PROD_CHANNEL_CAPACITY,
     ));
-    let b: Arc<NoopAdapter> =
-        Arc::new(NoopAdapter::with_capacity("cnc-probe", PROD_CHANNEL_CAPACITY));
+    let b: Arc<NoopAdapter> = Arc::new(NoopAdapter::with_capacity(
+        "cnc-probe",
+        PROD_CHANNEL_CAPACITY,
+    ));
     a.start().await.unwrap();
     b.start().await.unwrap();
     let cancel = CancellationToken::new();
