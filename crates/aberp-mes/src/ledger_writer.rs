@@ -47,7 +47,6 @@
 //! Neither path is licensed by ADR-0060; a `Lagged` overflow is a
 //! deliberate, counted, bounded drop, whereas both of these were silent.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -57,10 +56,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use aberp_audit_ledger::{Actor, BinaryHash, LedgerMeta, TenantId};
+use aberp_audit_ledger::{append_in_tx, Actor, BinaryHash, LedgerMeta, TenantId};
 
 use crate::adapter::Adapter;
-use crate::audit::{append_mes_adapter_event_reopen, MesAdapterEventPayload};
+use crate::audit::{mes_adapter_event_parts, MesAdapterEventPayload};
 use crate::events::CanonicalEvent;
 
 /// How many times a single event's ledger write is attempted before the
@@ -69,11 +68,21 @@ use crate::events::CanonicalEvent;
 /// daemon, a dashboard query, another adapter's writer) can lose the
 /// race. Retrying converts a transient loser into a durable row; the
 /// pre-ADR-0104 code dropped it on the first failure.
-const WRITE_ATTEMPTS: u32 = 5;
+/// A flat retry budget is not enough on its own: a sibling that reopens
+/// the audit DB in a tight loop (a dashboard poller was measured at ~400
+/// opens over a 40-event burst) can lose the file-lock race several times
+/// in a row, and a fixed short backoff simply retries into the same
+/// contention. The backoff is therefore exponential — see
+/// [`WRITE_RETRY_BASE_BACKOFF`] — giving a total budget of roughly 3 s
+/// before an event is declared lost.
+const WRITE_ATTEMPTS: u32 = 8;
 
-/// Backoff between write attempts. Deliberately short — the contended
-/// window is a single DuckDB open/commit, not a network round trip.
-const WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+/// First retry delay; each subsequent attempt doubles it
+/// (25 ms, 50, 100, … ≈ 3.2 s total across [`WRITE_ATTEMPTS`]). Starts
+/// short because the contended window is a single DuckDB open/commit,
+/// not a network round trip, and backs off because sustained contention
+/// needs the writer to stop hammering.
+const WRITE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(25);
 
 /// Wall-clock budget for draining the broadcast backlog after
 /// cancellation. Shutdown must not hang, but it also must not silently
@@ -89,7 +98,12 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(30);
 /// + a fresh per-session [`LedgerWriterActor`].
 #[derive(Debug, Clone)]
 pub struct LedgerWriterDeps {
-    pub db_path: PathBuf,
+    /// The ONE shared DuckDB handle (ADR-0098 Gap 1a). The writer appends
+    /// on this rather than opening its own connection per event: a second
+    /// instance would read a stale chain head and fork the hash chain, and
+    /// the churn of open→close per event is what made the writer slow
+    /// enough to build a backlog in the first place (ADR-0104).
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub actor: LedgerWriterActor,
@@ -239,14 +253,16 @@ async fn write_one(deps: &LedgerWriterDeps, payload: &MesAdapterEventPayload, ad
         match try_write_once(deps, payload).await {
             Ok(()) => return,
             Err(e) if attempt < WRITE_ATTEMPTS => {
+                let backoff = WRITE_RETRY_BASE_BACKOFF * 2u32.pow(attempt - 1);
                 tracing::warn!(
                     adapter = %adapter_name,
                     error = %e,
                     attempt,
                     max_attempts = WRITE_ATTEMPTS,
+                    backoff_ms = backoff.as_millis() as u64,
                     "MES audit-ledger write failed; retrying"
                 );
-                tokio::time::sleep(WRITE_RETRY_BACKOFF).await;
+                tokio::time::sleep(backoff).await;
             }
             Err(e) => {
                 // Loud-fail per CLAUDE.md rule 12. ERROR, not WARN: an
@@ -263,29 +279,44 @@ async fn write_one(deps: &LedgerWriterDeps, payload: &MesAdapterEventPayload, ad
     }
 }
 
-/// One attempt at the serialized reopen-per-write append.
+/// One attempt at appending this event on the shared handle.
 async fn try_write_once(
     deps: &LedgerWriterDeps,
     payload: &MesAdapterEventPayload,
 ) -> Result<(), String> {
-    let db_path = deps.db_path.clone();
+    let db = deps.db.clone();
     let tenant = deps.tenant.clone();
     let binary_hash = deps.binary_hash;
     let session_id = deps.actor.session_id.clone();
     let login = deps.actor.operator_login.clone();
     let payload_owned = payload.clone();
 
-    // `append_reopen` blocks on AUDIT_APPEND_LOCK and on DuckDB itself,
-    // so it stays on the blocking pool.
+    // DuckDB work is blocking, and `db.write()` parks on the handle's
+    // writer mutex, so this stays off the async runtime.
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         let meta = LedgerMeta::new(tenant, binary_hash);
         let actor = Actor::from_local_cli(session_id, &login);
-        // S341 serialized reopen-per-write. Holds AUDIT_APPEND_LOCK
-        // across open → ensure_schema → append → commit, so two adapter
-        // writers cannot read the same head and fork the chain, and
-        // carries the ADR-0098 R6 pragma guard internally.
-        append_mes_adapter_event_reopen(&db_path, &meta, actor, &payload_owned)
-            .map_err(|e| format!("append MES adapter event: {e}"))
+        let (kind, bytes, idempotency_key) = mes_adapter_event_parts(&payload_owned);
+        // ADR-0098 Gap 1a — the audit append runs on the ONE shared
+        // instance under the writer mutex, which serializes appends so the
+        // chain head is always current and the next `seq` is correct. This
+        // is the same surface `email_outbox_poll_daemon` uses; it replaces
+        // this path's hand-rolled `Connection::open` + `ensure_schema` +
+        // tx + commit, which took no lock at all and could therefore fork
+        // the chain when two adapters ran at once (ADR-0104 §2.3).
+        let mut conn = db
+            .write()
+            .map_err(|e| format!("shared writer for MES adapter audit: {e}"))?;
+        aberp_audit_ledger::ensure_schema(&conn)
+            .map_err(|e| format!("ensure audit-ledger schema: {e}"))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("begin MES adapter audit tx: {e}"))?;
+        append_in_tx(&tx, &meta, kind, bytes, actor, idempotency_key)
+            .map_err(|e| format!("append MES adapter event: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit MES adapter audit tx: {e}"))?;
+        Ok(())
     })
     .await
     .map_err(|e| format!("MES audit-ledger blocking task panicked: {e}"))?
@@ -303,9 +334,20 @@ mod tests {
     use crate::adapters::barcode_scanner::{BarcodeScannerAdapter, BarcodeScannerConfig};
     use crate::events::CanonicalEvent;
 
+    /// Open a shared handle on `db_path`, exactly as `serve` does at boot.
+    /// Tests share ONE handle per DB so they exercise the production
+    /// single-writer-instance shape rather than a per-test connection.
+    fn handle_for_test(db_path: &std::path::Path) -> aberp_db::HandleArc {
+        aberp_db::Handle::open_default(
+            db_path,
+            TenantId::new("ten_test_mes_writer").expect("tenant id"),
+        )
+        .expect("open shared handle for test")
+    }
+
     fn deps_for_test(db_path: PathBuf) -> LedgerWriterDeps {
         LedgerWriterDeps {
-            db_path,
+            db: handle_for_test(&db_path),
             tenant: TenantId::new("ten_test_mes_writer").expect("tenant id"),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
             actor: LedgerWriterActor {

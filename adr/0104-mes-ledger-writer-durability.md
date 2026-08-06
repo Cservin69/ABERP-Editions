@@ -117,9 +117,12 @@ A long-lived MES connection would therefore read a **stale chain head** and appe
 
 ### 3.2 What was implemented
 
-1. **`append_mes_adapter_event_reopen`** (`crates/aberp-mes/src/audit.rs`) — delegates to `append_reopen` with identical kind / payload-bytes / idempotency-key mapping. `write_mes_adapter_event` is kept unchanged for in-tx callers; the two are documented as *not* interchangeable (an adapter event has no sibling state change to ride, so the writer owns the whole window). The ADR-0098 R6 pragma guard now comes from inside `append_reopen` rather than being restated — one fewer hand-rolled opener in `crates/`, which is CHECK 10j's direction of travel.
+1. **`append_reopen` in `try_write_once`** (`ledger_writer.rs`) — replaces the hand-rolled `Connection::open` + `ensure_schema` + tx + commit. The kind / payload-bytes / idempotency-key mapping stays single-sourced in `audit::mes_adapter_event_parts`, which deliberately **opens nothing**. `write_mes_adapter_event` is kept unchanged for in-tx callers; the two are documented as *not* interchangeable (an adapter event has no sibling state change to ride, so the writer owns the whole window). The ADR-0098 R6 pragma guard now comes from inside `append_reopen` rather than being restated.
+
+   > **Gate note.** The call deliberately lives in `ledger_writer.rs` and not in `audit.rs`. The opener scanner counts `append_reopen(` as an opener, and CHECK 10i fails on a *new* opener-bearing file. Keeping it in `ledger_writer.rs` holds that file at its frozen count of 1 and leaves `audit.rs` at 0, so **`tools/adr0098_c2_frozen_residuals.txt` needs no edit at all**. Verified by running `tools/adr0098_opener_scan.awk` on both files rather than by reading the manifest. CHECK 10k (per-opener fingerprints) does still change by exactly one line — the opener's text and enclosing function changed — and that re-freeze is the only governance edit here.
+
 2. **`drain_backlog`** — on cancellation, drain the broadcast with `try_recv` until empty, bounded by `DRAIN_BUDGET` (30 s). Overrun logs at **ERROR**: it is the one remaining path on which a cancelled writer leaves events unwritten, and it is loud. The select arm was restructured to resolve to an `Option` first, because the `rx.recv()` branch holds a mutable borrow the drain also needs.
-3. **`WRITE_ATTEMPTS` = 5** with a 50 ms backoff. Exhaustion logs at **ERROR**, not WARN — an audit row that never lands is an integrity event, not an operational nuisance.
+3. **`WRITE_ATTEMPTS` = 8** with an **exponential** backoff from 25 ms (≈3.2 s total). A flat 5×50 ms budget was tried first and measurably was not enough: under a sibling reopening the audit DB every 5 ms, single events still failed all their attempts. Exhaustion logs at **ERROR**, not WARN — an audit row that never lands is an integrity event, not an operational nuisance.
 4. `tokio`'s `time` feature added to `aberp-mes` for the backoff.
 
 `NoopAdapter`'s 16-slot default is left **unchanged**: nothing depends on it, and raising it would paper over §1.3 rather than record it. It is a fixture-shaped footgun on the crate's copy-paste reference adapter — flagged, not fixed here.
@@ -130,12 +133,24 @@ A long-lived MES connection would therefore read a **stale chain head** and appe
 
 `crates/aberp-mes/tests/ledger_contention_probe.rs`, at the production channel depth of 1024 (`PROD_CHANNEL_CAPACITY`), so no test can pass by accident of a licensed `Lagged` drop. Five tests: the two original shapes, a 4-adapter higher-concurrency burst, and the two single-event controls. The concurrency shapes assert **`verify_chain`** as well as row count — count alone cannot see a fork.
 
+### 4.1 The probe's own reader was corrupting the ledger
+
+With the fix in place the burst shape still lost 1–2 rows, intermittently, and instrumentation showed **no write ever failed and no retry ever ran**. The events were not lost by the writer at all.
+
+The cause was the probe's polling reader. It opened the audit DB read-write every 5 ms (~400 opens per run) and dropped the connection **without** `PRAGMA disable_checkpoint_on_shutdown`, so its close could fold the shared WAL in place (duckdb#23046) and destroy a just-committed row. The reader was eating the writer's rows, and the assertion blamed the writer.
+
+Adding the pragma to the poller — the same guard every opener in the tree carries — made the probe green 6 runs out of 6. This is worth recording twice over: it is an independent, accidental confirmation of exactly why ADR-0098 R6 exists, and it is a standing warning that a test harness which opens the audit DB unguarded will manufacture "durability defects" that are its own.
+
+The probes' writer joins were also made assertive (`JOIN_TIMEOUT_SECS`, 120 s). They previously discarded the timeout result, so on a loaded machine the row count could be read while the writer was still draining — a spurious red that looked exactly like event loss.
+
+### 4.2 Mutation results
+
 Mutation-verified, isolating each half:
 
 | Build | Rows | Chain |
 |---|---|---|
-| Full fix | **5/5 pass** | intact |
-| Fix reverted entirely | 3 red (e.g. 31/40) | **forked** — `OutOfOrder { expected: 3, found: 2 }` |
+| Full fix | **5/5 pass**, 6 consecutive runs | intact |
+| Fix reverted entirely | 3 red (26/40) | **forked** — `OutOfOrder { expected: 2, found: 1 }` |
 | `append_reopen` kept, **drain disabled** | 3 red | **intact** |
 
 The middle row proves the drain's teeth; the third row proves `append_reopen`'s, and that the two fixes are independent rather than one masking the other.

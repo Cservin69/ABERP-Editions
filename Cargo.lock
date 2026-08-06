@@ -197,6 +197,7 @@ name = "aberp-mes"
 version = "0.0.0"
 dependencies = [
  "aberp-audit-ledger",
+ "aberp-db",
  "async-trait",
  "duckdb",
  "quick-xml 0.36.2",

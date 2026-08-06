@@ -48,6 +48,22 @@ use ulid::Ulid;
 /// is the writer's own durability, not a fixture's channel depth.
 const PROD_CHANNEL_CAPACITY: usize = 1024;
 
+/// Generous ceiling on joining a cancelled ledger-writer. This is a
+/// deadlock guard, NOT a timing assertion: the writer is expected to exit
+/// as soon as its drain completes. It must comfortably exceed the
+/// writer's own 30 s `DRAIN_BUDGET`, because these probes run alongside
+/// every other test binary and a loaded machine slows each ~60 ms append.
+const JOIN_TIMEOUT_SECS: u64 = 120;
+
+/// Open the ONE shared handle for a probe, exactly as `serve` does at boot.
+/// Every writer in a probe shares this single handle — that IS the fix under
+/// test, so a probe that handed each writer its own handle would be testing
+/// the wrong thing.
+fn shared_handle(db_path: &std::path::Path, tenant: &str) -> aberp_db::HandleArc {
+    aberp_db::Handle::open_default(db_path, TenantId::new(tenant).expect("tenant"))
+        .expect("open shared handle")
+}
+
 /// Assert the hash chain has not forked. Two ledger-writers appending
 /// concurrently without `AUDIT_APPEND_LOCK` can read the same committed
 /// head and write a duplicate `seq`; `verify_chain` is what catches it.
@@ -92,7 +108,7 @@ async fn run_probe(hold_open: bool) -> (u64, String) {
     adapter.start().await.unwrap();
 
     let deps = LedgerWriterDeps {
-        db_path: db_path.clone(),
+        db: shared_handle(&db_path, "ten_probe_contention"),
         tenant: TenantId::new("ten_probe_contention").expect("tenant"),
         binary_hash: BinaryHash::from_bytes([0u8; 32]),
         actor: LedgerWriterActor {
@@ -116,7 +132,10 @@ async fn run_probe(hold_open: bool) -> (u64, String) {
     // Let the writer attempt its write, then quiesce it fully.
     tokio::time::sleep(Duration::from_millis(500)).await;
     cancel.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
+    tokio::time::timeout(Duration::from_secs(JOIN_TIMEOUT_SECS), writer)
+        .await
+        .expect("ledger-writer must finish its shutdown drain before rows are counted")
+        .expect("ledger-writer task must not panic");
     adapter.stop().await.unwrap();
     drop(holder);
 
@@ -171,8 +190,9 @@ async fn two_concurrent_ledger_writers_lose_no_events() {
         ensure_schema(&conn).unwrap();
     }
 
+    let shared = shared_handle(&db_path, "ten_probe_two");
     let mk_deps = |tag: &str| LedgerWriterDeps {
-        db_path: db_path.clone(),
+        db: shared.clone(),
         tenant: TenantId::new("ten_probe_two").expect("tenant"),
         binary_hash: BinaryHash::from_bytes([0u8; 32]),
         actor: LedgerWriterActor {
@@ -212,8 +232,14 @@ async fn two_concurrent_ledger_writers_lose_no_events() {
 
     tokio::time::sleep(Duration::from_millis(2000)).await;
     cancel.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(20), wa).await;
-    let _ = tokio::time::timeout(Duration::from_secs(20), wb).await;
+    tokio::time::timeout(Duration::from_secs(JOIN_TIMEOUT_SECS), wa)
+        .await
+        .expect("ledger-writer must finish its shutdown drain before rows are counted")
+        .expect("ledger-writer task must not panic");
+    tokio::time::timeout(Duration::from_secs(JOIN_TIMEOUT_SECS), wb)
+        .await
+        .expect("ledger-writer must finish its shutdown drain before rows are counted")
+        .expect("ledger-writer task must not panic");
     a.stop().await.unwrap();
     b.stop().await.unwrap();
 
@@ -260,6 +286,7 @@ async fn four_concurrent_ledger_writers_lose_no_events() {
         ensure_schema(&conn).unwrap();
     }
 
+    let shared = shared_handle(&db_path, "ten_probe_four");
     let cancel = CancellationToken::new();
     let mut adapters = Vec::new();
     let mut writers = Vec::new();
@@ -268,7 +295,7 @@ async fn four_concurrent_ledger_writers_lose_no_events() {
             Arc::new(NoopAdapter::with_capacity(name, PROD_CHANNEL_CAPACITY));
         adapter.start().await.unwrap();
         let deps = LedgerWriterDeps {
-            db_path: db_path.clone(),
+            db: shared.clone(),
             tenant: TenantId::new("ten_probe_four").expect("tenant"),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
             actor: LedgerWriterActor {
@@ -303,7 +330,10 @@ async fn four_concurrent_ledger_writers_lose_no_events() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     cancel.cancel();
     for w in writers {
-        let _ = tokio::time::timeout(Duration::from_secs(60), w).await;
+        tokio::time::timeout(Duration::from_secs(JOIN_TIMEOUT_SECS), w)
+            .await
+            .expect("ledger-writer must finish its shutdown drain before rows are counted")
+            .expect("ledger-writer task must not panic");
     }
     for adapter in &adapters {
         adapter.stop().await.unwrap();
@@ -353,7 +383,7 @@ async fn burst_write_under_a_polling_reader_loses_no_events() {
     adapter.start().await.unwrap();
 
     let deps = LedgerWriterDeps {
-        db_path: db_path.clone(),
+        db: shared_handle(&db_path, "ten_probe_burst"),
         tenant: TenantId::new("ten_probe_burst").expect("tenant"),
         binary_hash: BinaryHash::from_bytes([0u8; 32]),
         actor: LedgerWriterActor {
@@ -377,6 +407,13 @@ async fn burst_write_under_a_polling_reader_loses_no_events() {
         while !poll_stop.load(std::sync::atomic::Ordering::SeqCst) {
             match duckdb::Connection::open(&poll_path) {
                 Ok(conn) => {
+                    // ADR-0098 R6: an opener that closes WITHOUT this pragma
+                    // can fold the shared WAL in place on drop (duckdb#23046)
+                    // and destroy a just-committed row. This poller reopens
+                    // every 5 ms, so without the guard the READER silently
+                    // eats the writer's rows and the probe blames the writer.
+                    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown;")
+                        .expect("poller pragma guard");
                     opens += 1;
                     let _ = conn.query_row(
                         "SELECT COUNT(*) FROM audit_ledger WHERE kind = 'mes.adapter_event'",
@@ -407,7 +444,10 @@ async fn burst_write_under_a_polling_reader_loses_no_events() {
     // been attempted under contention.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     cancel.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(20), writer).await;
+    tokio::time::timeout(Duration::from_secs(JOIN_TIMEOUT_SECS), writer)
+        .await
+        .expect("ledger-writer must finish its shutdown drain before rows are counted")
+        .expect("ledger-writer task must not panic");
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     let (opens, open_failures) = poller.join().unwrap();
     adapter.stop().await.unwrap();
@@ -425,8 +465,9 @@ async fn burst_write_under_a_polling_reader_loses_no_events() {
 
     assert_eq!(
         rows as usize, BURST,
-        "SILENT EVENT LOSS under a concurrently-polling reader: {rows}/{BURST} \
-         rows landed (reader opens={opens}, reader open failures={open_failures}). \
-         Failed ledger writes are logged-and-dropped, never retried."
+        "EVENT LOSS under a concurrently-polling reader: {rows}/{BURST} rows \
+         landed (reader opens={opens}, reader open failures={open_failures}). \
+         Every append must survive the reader's file-lock contention via \
+         retry, and any backlog must be drained at cancellation."
     );
 }

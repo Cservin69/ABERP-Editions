@@ -25,7 +25,7 @@
 //! NOT operator-exposed — neither here nor in the TOML. Only the
 //! operator-meaningful identity + endpoint fields persist.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
@@ -78,9 +78,13 @@ const DEFAULT_UR_RTDE_MODEL: &str = "UR";
 /// spawned ledger-writer task and every audit append. Built from the
 /// boot call site (`db_path` / `tenant` / `binary_hash`) + operator
 /// session info.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MesBootDeps {
-    pub db_path: PathBuf,
+    /// The ONE shared DuckDB handle (ADR-0098 Gap 1a). Replaces the old
+    /// `db_path`: the ledger-writer now appends on this shared instance
+    /// rather than opening its own connection per event, so two adapters
+    /// can no longer read the same chain head and fork it (ADR-0104).
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub operator_login: String,

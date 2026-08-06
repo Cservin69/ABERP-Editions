@@ -534,7 +534,7 @@ fn spawn_writer(
     cancel: &CancellationToken,
 ) -> JoinHandle<()> {
     let writer_deps = LedgerWriterDeps {
-        db_path: deps.db_path.clone(),
+        db: deps.db.clone(),
         tenant: deps.tenant.clone(),
         binary_hash: deps.binary_hash,
         actor: LedgerWriterActor {
@@ -584,7 +584,11 @@ mod tests {
 
     fn test_deps(dir: &Path) -> MesBootDeps {
         MesBootDeps {
-            db_path: dir.join("test.duckdb"),
+            db: aberp_db::Handle::open_default(
+                &dir.join("test.duckdb"),
+                TenantId::new("ten_test_mes_mgr").expect("tenant id"),
+            )
+            .expect("open shared handle for test"),
             tenant: TenantId::new("tenant-test").unwrap(),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
             operator_login: "op".to_string(),

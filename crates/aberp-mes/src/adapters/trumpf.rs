@@ -1875,7 +1875,11 @@ mod tests {
         let adapter = Arc::new(TrumpfAdapter::new(cfg_for_test("laser-ledger", port)));
         let adapter_for_writer: Arc<dyn Adapter> = adapter.clone();
         let deps = LedgerWriterDeps {
-            db_path: db_path.clone(),
+            db: aberp_db::Handle::open_default(
+                &db_path,
+                TenantId::new("ten_test_trumpf_e2e").expect("tenant id"),
+            )
+            .expect("open shared handle for test"),
             tenant: TenantId::new("ten_test_trumpf_e2e").expect("tenant id"),
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
             actor: LedgerWriterActor {

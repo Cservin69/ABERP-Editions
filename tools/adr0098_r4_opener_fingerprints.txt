@@ -117,7 +117,6 @@ apps/aberp/src/submit_annulment.rs|run:let ledger = Ledger::open(&args.db, tenan
 apps/aberp/src/submit_annulment.rs|run:let mut conn = Connection::open(&args.db)
 apps/aberp/src/tenant_registry.rs|emit_tenant_reopen:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs|run:let mut conn = Connection::open(&db_path)
-crates/aberp-mes/src/ledger_writer.rs|write_one:let mut conn = duckdb::Connection::open(&db_path)
 crates/audit-ledger/src/storage/mod.rs|append_reopen:let mut conn = Connection::open(db_path)?;
 crates/audit-ledger/src/storage/mod.rs|append_reopen:pub fn append_reopen(
 crates/audit-ledger/src/storage/mod.rs|open:let conn = Connection::open(path)?;
