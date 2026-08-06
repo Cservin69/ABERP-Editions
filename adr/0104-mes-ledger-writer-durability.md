@@ -4,7 +4,7 @@
 - **Date:** 2026-08-06
 - **Deciders:** Ervin Áben (set the scope: fix the MES adapter audit-durability defect; conservative option where ambiguous; no AskUserQuestion; do not merge). Investigation + implementation by Dispatch.
 - **Base:** Editions `main` @ `e0ae99a` (PR #32 — the Trumpf laser seam). Every file:line below was read and every number below was measured in this session at that SHA, not inferred.
-- **Related:** ADR-0060 (Stage 3 adapter framework — the broadcast lossiness contract, §1.2); S341 / `append_reopen` (the serialized reopen-per-write surface this adopts); ADR-0098 R6 + cut-gate CHECK 10j (the in-process-opener pragma guard); ADR-0008 §"Storage" (ledger entries ride the same tx as their state change).
+- **Related:** **ADR-0098 Gap 1a** (the ONE shared `aberp_db::Handle` — the surface this migrates onto, and the reason `append_reopen` is legacy); ADR-0099 + cut-gate CHECK 10M (the write-fork model that forced the correction, §3.1); ADR-0060 (the broadcast lossiness contract, §1.2); S341 / `append_reopen` (the superseded reopen-per-write surface); ADR-0098 R6 + CHECK 10j (the in-process-opener pragma guard, which §4.1 confirms the hard way); ADR-0008 §"Storage".
 - **Provenance:** the failing-first probe (`crates/aberp-mes/tests/ledger_contention_probe.rs`) was written by the Trumpf adversarial review and recovered from its worktree. It is committed here as a gate.
 
 ---
@@ -17,7 +17,7 @@ The MES ledger-writer had **three** ways to lose an audit row, none of them lice
 |---|---|---|---|---|
 | 1 | Cancellation abandoned the undrained broadcast backlog | **yes** | **no** | bounded drain (`DRAIN_BUDGET`) |
 | 2 | A failed append was logged once at WARN and dropped | **yes**, latent | **no** | retry (`WRITE_ATTEMPTS`) + ERROR on exhaustion |
-| 3 | Two writers bypassed `AUDIT_APPEND_LOCK` → **chain fork** | **yes** | **no** | route through `append_reopen` |
+| 3 | Two writer instances off the same head → **chain fork** | **yes** | **no** | migrate onto the shared `Handle` |
 | 4 | `RecvError::Lagged` overflow | yes | **YES — explicitly** | unchanged, by design |
 
 **The headline claim handed to this session was wrong.** The measured loss (24/40, 43/50 rows) was path **4** — a licensed `Lagged` overflow of `NoopAdapter`'s **16-slot fixture channel** — and *not* the `write_one` "logged-and-dropped" path it was attributed to. That path never fired once. Every real adapter ships a **1024**-deep channel. The correction is load-bearing: it changes both what to fix and what to claim, and it is why the probes in this ADR pin the production channel depth (§3).
@@ -83,13 +83,11 @@ Latent, not measured: it never fired in these probes. It is fixed anyway, becaus
 
 ### 2.3 The chain fork — the serious one
 
-`write_one` hand-rolled its own `Connection::open` + `ensure_schema` + `conn.transaction()` + `write_mes_adapter_event` + `commit`.
+`write_one` hand-rolled its own `Connection::open` + `ensure_schema` + `conn.transaction()` + `write_mes_adapter_event` + `commit`, per event.
 
-`audit-ledger` already has a surface for exactly this, `append_reopen`, whose own doc comment reads:
+`mes_manager` spawns **one writer per adapter**. A shop with a laser and a CNC therefore has two writers, each opening its **own** DuckDB instance on one audit DB, holding **no** cross-writer lock. Two instances read the same committed chain head, both self-assign the same next `seq`, and the tamper-evident hash chain forks — the seq-515 fork primitive ADR-0099 named.
 
-> the safe replacement for the hand-rolled `Connection::open` + `ensure_schema` + `append_in_tx` + `commit` pattern the high-frequency daemons used […] plus the process-wide append lock so two in-process writers cannot read the same head and fork the chain now that the `UNIQUE(seq)` ART is gone.
-
-`mes_manager` spawns **one writer per adapter**. A shop with a laser and a CNC has two, appending to one audit DB, holding **no lock** — the precise scenario `AUDIT_APPEND_LOCK` exists to prevent. `email_outbox_poll_daemon` was migrated to `append_reopen` under S341. The MES writer never was. It is the same recurring root cause the snapshot-daemon audit-fork fix hit: **a writer that never moved to the shared surface.**
+Every other in-process audit writer had already been moved off this shape and onto the ONE shared `aberp_db::Handle` (ADR-0098 Gap 1a), whose writer mutex serializes appends so the head is always current. **The MES writer was the last one that never moved** — the same recurring root cause as the snapshot-daemon audit-fork fix.
 
 This is not theoretical. With the fix reverted, the probe's chain verification fails:
 
@@ -103,31 +101,50 @@ The audit chain — the tamper-evidence substrate — **forks under two concurre
 
 ## 3. Decision
 
-Adopt **option 2 (bounded retry / no silent drop)**, plus the drain and the migration to `append_reopen`. **Reject option 1 (a single shared long-lived `Handle`)** — deliberately, and against the stated preference.
+**Take option 1: migrate the ledger-writer onto the ONE shared `aberp_db::Handle`.** Add the bounded retry and the shutdown drain on top, because the shared Handle fixes the fork and the churn but does not by itself make shutdown or a failed append lossless.
 
-### 3.1 Why option 1 is rejected
+### 3.1 The route not taken, and why the first attempt was wrong
 
-The brief preferred one shared long-lived Handle, mirroring the snapshot-daemon fix. That instinct is right about the disease — the churn — and wrong about the cure *here*, because the audit ledger has a coherence requirement the snapshot path does not.
+This ADR's first draft chose `append_reopen` (the S341 serialized reopen-per-write surface) and **rejected** the shared Handle, on the reasoning that a long-lived connection cannot see commits made through other in-process reopen-writers and would therefore read a stale chain head — reintroducing the very fork it was meant to cure.
 
-`append_reopen` reopens per write **on purpose**. Its doc calls the fresh open "the coherence mechanism every ABERP daemon relies on, S335": a new `Connection` reads the *current* on-disk committed head. Independent `Connection::open` calls in duckdb-rs get independent database instances with independent buffer managers, so a **long-lived** connection is not guaranteed to observe commits made through the other in-process writers that still use `append_reopen` — `email_outbox_poll_daemon`, quote-intake, AP sync.
+That reasoning was wrong, and the codebase says so plainly. **ADR-0098 Gap 1a already superseded `append_reopen` for exactly this class.** `email_outbox_poll_daemon` carries the record in its own comment: the audit append now runs
 
-A long-lived MES connection would therefore read a **stale chain head** and append on top of it: the exact fork of §2.3, reintroduced by the fix meant to cure it, and this time not fixable by a lock, because the staleness is in the snapshot rather than the interleaving. Killing the churn would mean migrating *every* in-process audit writer to one shared handle in one change — a far larger, riskier blast radius than this defect warrants, on a line that is in pilot.
+> on the ONE shared instance under the writer mutex (which serializes appends, so the chain head is always current → correct next seq), replacing the separate-instance `append_reopen` + its `AUDIT_APPEND_LOCK`.
 
-**Conservative option, taken and flagged:** keep reopen-per-write; make it correct and lossless. The churn stays, and with it the ~60 ms write cost. That is a performance property, not a durability one, and §3.2 removes its ability to lose data. Consolidating the audit writers onto one handle remains the right long-term move and is **out of scope here** — flagged for its own workstream.
+The stale-head objection only bites when there are *several* writer instances. The shared Handle answers it by construction: there is exactly one writer instance in the process, its mutex serializes every append, and so every reader of the chain head is current by definition. `append_reopen` is now the *legacy* surface — the scanner evidence below is decisive on that point.
+
+Two independent checks confirmed the correction rather than my reading of it:
+
+- `append_reopen` has **zero** live callers in the tree. Its apparent callers in `email_outbox_poll_daemon` are comments describing the migration away from it.
+- **CHECK 10M treats any `append_reopen` caller as a write-fork** and fails the build. Routing MES through it turned the cut-gate red. That is the gate stating the architecture directly: this class belongs on the Handle.
+
+Had the first draft been trusted, this change would have shipped an architecture the gate forbids. The lesson is the one this repo keeps relearning — **a writer that never moved to the shared Handle** — and MES was the last in-process audit writer still off it.
 
 ### 3.2 What was implemented
 
-1. **`append_reopen` in `try_write_once`** (`ledger_writer.rs`) — replaces the hand-rolled `Connection::open` + `ensure_schema` + tx + commit. The kind / payload-bytes / idempotency-key mapping stays single-sourced in `audit::mes_adapter_event_parts`, which deliberately **opens nothing**. `write_mes_adapter_event` is kept unchanged for in-tx callers; the two are documented as *not* interchangeable (an adapter event has no sibling state change to ride, so the writer owns the whole window). The ADR-0098 R6 pragma guard now comes from inside `append_reopen` rather than being restated.
+1. **`LedgerWriterDeps.db_path` → `db: aberp_db::HandleArc`.** `try_write_once` now does `db.write()` + `ensure_schema` + tx + `append_in_tx` + commit — byte-for-byte the `email_outbox_poll_daemon` shape. `aberp-mes` takes a dependency on `aberp-db` (no cycle: `aberp-db` depends only on `audit-ledger` and `aberp-snapshot`). `mes_boot::MesBootDeps` carries the handle instead of the path; both `serve.rs` construction sites already had one in scope.
 
-   > **Gate note.** The call deliberately lives in `ledger_writer.rs` and not in `audit.rs`. The opener scanner counts `append_reopen(` as an opener, and CHECK 10i fails on a *new* opener-bearing file. Keeping it in `ledger_writer.rs` holds that file at its frozen count of 1 and leaves `audit.rs` at 0, so **`tools/adr0098_c2_frozen_residuals.txt` needs no edit at all**. Verified by running `tools/adr0098_opener_scan.awk` on both files rather than by reading the manifest. CHECK 10k (per-opener fingerprints) does still change by exactly one line — the opener's text and enclosing function changed — and that re-freeze is the only governance edit here.
+   This kills the per-event open/close churn as a side effect: the probe suite's wall-clock fell from **16 s to 2.9 s**, because a write went from ~60 ms to ~1 ms.
 
-2. **`drain_backlog`** — on cancellation, drain the broadcast with `try_recv` until empty, bounded by `DRAIN_BUDGET` (30 s). Overrun logs at **ERROR**: it is the one remaining path on which a cancelled writer leaves events unwritten, and it is loud. The select arm was restructured to resolve to an `Option` first, because the `rx.recv()` branch holds a mutable borrow the drain also needs.
-3. **`WRITE_ATTEMPTS` = 8** with an **exponential** backoff from 25 ms (≈3.2 s total). A flat 5×50 ms budget was tried first and measurably was not enough: under a sibling reopening the audit DB every 5 ms, single events still failed all their attempts. Exhaustion logs at **ERROR**, not WARN — an audit row that never lands is an integrity event, not an operational nuisance.
+2. **`drain_backlog`** — on cancellation, drain the broadcast with `try_recv` until empty, bounded by `DRAIN_BUDGET` (30 s). Overrun logs at **ERROR**: it is the one remaining path on which a cancelled writer leaves events unwritten, and it is loud. The select arm resolves to an `Option` first, because the `rx.recv()` branch holds a mutable borrow the drain also needs.
+
+3. **`WRITE_ATTEMPTS` = 8** with an **exponential** backoff from 25 ms (≈3.2 s total). A flat 5×50 ms budget was tried first and measurably was not enough under a sibling reopening the audit DB every 5 ms. Exhaustion logs at **ERROR**, not WARN — an audit row that never lands is an integrity event, not an operational nuisance.
+
 4. `tokio`'s `time` feature added to `aberp-mes` for the backoff.
 
-`NoopAdapter`'s 16-slot default is left **unchanged**: nothing depends on it, and raising it would paper over §1.3 rather than record it. It is a fixture-shaped footgun on the crate's copy-paste reference adapter — flagged, not fixed here.
+### 3.3 Effect on the frozen ledgers
 
----
+`aberp-mes` now owns **zero** runtime openers, so every ADR-0098/0099 ledger **shrinks** — the direction they are allowed to move:
+
+| Ledger | Before | After |
+|---|---|---|
+| CHECK 10i residual openers | 114 across 26 files | **113 across 25** |
+| CHECK 10k opener fingerprints | 101 | **100** |
+| CHECK 10M write-fork residual | 0 | **0** (unchanged) |
+
+`crates/aberp-mes/src/ledger_writer.rs` is delisted from both manifests, joining the other Handle-migrated files. Its stale prose in the residual ledger — which still described the opener as a deferred v0.2.6 target — is corrected in place. Every count above came from running the scanners (`tools/adr0098_opener_scan.awk`, `tools/adr0099_write_fork_scan.awk`), not from reading the manifests.
+
+> **Gate blind spot, reported not fixed.** The pre-fix code was a genuine write-fork (independent opener + append, no lock) and **CHECK 10M did not flag it**, because the append sat behind the `write_mes_adapter_event` wrapper rather than appearing as a bare `append_in_tx(` in the same function. The scanner matches append tokens lexically within one function body. Any fork hidden behind a one-line helper is invisible to it. Verified by running the scanner against the base revision: it returns nothing. See §6.
 
 ## 4. Teeth
 
@@ -149,23 +166,28 @@ Mutation-verified, isolating each half:
 
 | Build | Rows | Chain |
 |---|---|---|
-| Full fix | **5/5 pass**, 6 consecutive runs | intact |
-| Fix reverted entirely | 3 red (26/40) | **forked** — `OutOfOrder { expected: 2, found: 1 }` |
-| `append_reopen` kept, **drain disabled** | 3 red | **intact** |
+| Full fix | **5/5 pass** | intact |
+| **B** — shared Handle reverted to the per-event opener (drain + retry kept) | 3 red (39/40) | **forked** — `OutOfOrder { expected: 2, found: 1 }`, in BOTH concurrency shapes |
+| **A** — shared Handle kept, **drain disabled** | 1 red (4-adapter burst) | intact |
 
-The middle row proves the drain's teeth; the third row proves `append_reopen`'s, and that the two fixes are independent rather than one masking the other.
+Mutation **B** proves the Handle migration's teeth: with everything else in place, reverting just the writer instance forks the chain. Mutation **A** proves the drain's, and shows the two fixes are independent rather than one masking the other.
+
+**Report on A:** the drain is now caught by the 4-adapter tight-burst shape *only*. On the shared Handle a write costs ~1 ms instead of ~60 ms, so the gentler two-writer and single-burst shapes no longer accumulate a backlog before cancellation and stay green without it. The drain still guards a real path — a fast writer can still be behind when a burst coincides with shutdown — but its coverage now rests on that one probe. Removing or weakening `four_concurrent_ledger_writers_lose_no_events` would silently un-gate the drain.
 
 ---
 
 ## 5. Consequences
 
 - Adapter audit rows survive shutdown, transient write contention, and concurrent adapters. The audit chain no longer forks under a laser + CNC.
-- Shutdown may now take up to `DRAIN_BUDGET` longer in the worst case. At ~60 ms/event a full 1024-deep backlog would exceed 30 s and log ERROR with a count — visible, bounded, and far better than the silent discard it replaces.
-- Every MES append now serializes on `AUDIT_APPEND_LOCK` with every other in-process audit writer. Throughput per adapter is bounded by that lock; this is the price of not forking the chain, and §2.2's retry exists partly to absorb it.
+- **`aberp-mes` now depends on `aberp-db`.** A hardware-adapter crate taking a DB-handle dependency is a real coupling; it is the price of the writer holding the shared instance rather than a path. The alternative — a trait seam with the Handle impl in `apps/aberp` — was considered and rejected as more machinery for the same result, and it would have left the probes testing a stand-in rather than the production surface.
+- The per-event open/close churn is gone: a write went from ~60 ms to ~1 ms, and the probe suite from 16 s to 2.9 s. Backlogs are now far harder to build, which is also why the drain's test coverage narrowed (§4.2).
+- Every MES append now serializes on the shared Handle's writer mutex with every other in-process audit writer. That is the same contention every migrated daemon already accepts, and it is what makes the chain single-writer.
+- Shutdown may take up to `DRAIN_BUDGET` longer in the worst case; overrun is loud and counted, rather than a silent discard.
 - `Lagged` remains licensed and unchanged. At 1024 deep it takes a sustained overload to reach it, and it stays loud and counted when it does.
 
 ## 6. Follow-ups (not in this change)
 
-1. **Consolidate all in-process audit writers onto one shared handle** (§3.1). The real cure for the churn; needs its own ADR and blast-radius analysis.
-2. **`NoopAdapter::DEFAULT_CHANNEL_CAPACITY = 16`** contradicts ADR-0060's "size generously" on the crate's own reference adapter (§3.2).
-3. **The `Lagged` counter ADR-0060 promised** ("emit a counter the future operations dashboard surfaces") is still only a log line, in both the steady-state and drain arms.
+1. **CHECK 10M's wrapper blind spot** (§3.3). The pre-fix MES write-fork — an independent opener plus an append, the exact primitive ADR-0099 bans — was invisible to the scanner because the append sat behind `write_mes_adapter_event` instead of appearing as a bare `append_in_tx(` in the same function body. Verified against the base revision: the scanner returns nothing. Any fork hidden behind a one-line helper is unguarded today. This is the highest-value follow-up here: the gate reads as green while blind, which is precisely the failure mode ADR-0098's F1-F4 review set out to end.
+2. **A test harness that opens the audit DB unguarded manufactures false durability defects** (§4.1). The probe's own poller cost 1-2 rows a run until it carried `PRAGMA disable_checkpoint_on_shutdown`. Worth a lint or a shared test helper, since the next probe author will hit it too.
+3. **`NoopAdapter::DEFAULT_CHANNEL_CAPACITY = 16`** contradicts ADR-0060's "size generously" on the crate's own reference adapter — the fixture footgun that produced the wrong premise in §1.
+4. **The `Lagged` counter ADR-0060 promised** ("emit a counter the future operations dashboard surfaces") is still only a log line, in both the steady-state and drain arms.
