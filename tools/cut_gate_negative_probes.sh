@@ -514,10 +514,29 @@ c="$(fresh)"
 printf '\n#[cfg(test)]\nmod adr0105_test_probe {\n    fn t(p: &std::path::Path, tn: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n        let mut l = aberp_audit_ledger::Ledger::open(p, tn, bh).unwrap();\n        hidden(&mut l);\n    }\n    fn hidden(l: &mut aberp_audit_ledger::Ledger) {\n        let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n    }\n}\n' >> "$c/apps/aberp/src/serve.rs"
 expect_pass "$c" "CHECK 10N — a wrapper-hidden fork inside #[cfg(test)] is correctly IGNORED (10N is cfg(test)-aware)"
 
+# Precision probe for the Handle barrier. NOTE the assertion shape: this canNOT
+# be an `expect_pass`. Any plant that introduces a new opener necessarily trips
+# CHECK 10i ("NEW unaccounted opener-bearing file") and CHECK 10k (the
+# per-opener fingerprint freeze), so the gate is *expected* to fail here — just
+# not for a 10N reason. The claim under test is therefore "10N stayed silent",
+# which is an ABSENCE assertion, not a gate-exit assertion.
 echo "[CHECK 10N] an opener whose helper routes through the shared Handle must NOT trip 10N (Handle barrier, no false-positive)"
 c="$(fresh)"
 printf '\nfn _adr0105_probe_handle_routed(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash, db: &aberp_db::HandleArc) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    _adr0105_probe_handle_append(db, &mut l);\n}\nfn _adr0105_probe_handle_append(db: &aberp_db::HandleArc, _l: &mut aberp_audit_ledger::Ledger) {\n    let mut g = db.write().unwrap();\n    let tx = g.transaction().unwrap();\n    let _ = aberp_audit_ledger::append_in_tx(&tx, todo!(), aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' > "$c/apps/aberp/src/zz_adr0105_probe_handle.rs"
-expect_pass "$c" "CHECK 10N — an append that takes the shared Handle itself is correctly IGNORED (serialization boundary, not a fork)"
+if ! assert_planted "$c"; then
+  printf '  ✗ HARNESS BUG: CHECK 10N Handle-barrier probe — the plant modified NOTHING.\n'; bad=$((bad+1))
+else
+  rc="$(gate_rc "$c")"
+  if grep -q 'WRAPPER-HIDDEN write-fork' "$c/.out"; then
+    printf '  ✗ ESCAPED: CHECK 10N FALSE-POSITIVE — an append that takes the shared Handle itself was reported as a wrapper-hidden fork; the barrier rule is broken (every ADR-0099-migrated seam would fail).\n'
+    grep 'WRAPPER-HIDDEN' -A 3 "$c/.out" | sed 's/^/        /'; bad=$((bad+1))
+  elif grep -q 'NEW unaccounted opener-bearing file' "$c/.out"; then
+    printf '  ✓ CHECK 10N — an append that takes the shared Handle itself is correctly IGNORED (10N silent; the gate still fails on the CHECK 10i/10k opener freeze, as designed)  (exit=%s)\n' "$rc"; pass=$((pass+1))
+  else
+    printf '  ✗ HARNESS BUG: CHECK 10N Handle-barrier probe — neither the 10N signature NOR the expected CHECK 10i opener-freeze failure appeared; the probe is no longer exercising what it claims (exit=%s).\n' "$rc"
+    sed 's/^/        /' "$c/.out"; bad=$((bad+1))
+  fi
+fi
 
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
