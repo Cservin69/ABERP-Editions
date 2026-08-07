@@ -104,10 +104,14 @@ fn handle_domain_append(handle: &Handle, tag: &str) {
     tx.commit().unwrap();
 }
 
-/// DOMAIN 2 — the audit-ledger writer. `Ledger::append` holds
+/// DOMAIN 2, PRE-FIX — the audit-ledger writer. `Ledger::append` holds
 /// `AUDIT_APPEND_LOCK` and nothing else. Built on a `try_clone` of the shared
 /// instance so ONLY the lock domain differs from `handle_domain_append`.
-fn ledger_domain_append(handle: &Handle, tag: &str) {
+/// Retained (and exercised by [`unfixed_ledger_writer_still_forks`]) so the
+/// test suite keeps PROVING the hazard is real rather than merely asserting the
+/// fixed path is fine — a guard whose failure mode is never demonstrated is a
+/// guard nobody can tell is still wired up.
+fn ledger_domain_append_unguarded(handle: &Handle, tag: &str) {
     let conn = handle.read().unwrap();
     let mut ledger = Ledger::from_connection(conn, tenant(), BinaryHash::from_bytes([7u8; 32]));
     ledger
@@ -120,12 +124,27 @@ fn ledger_domain_append(handle: &Handle, tag: &str) {
         .unwrap();
 }
 
-/// FAILING-FIRST. Two writers, one in each lock domain, on ONE DuckDB instance.
-/// Pre-fix this forks the chain; post-fix (both routed through the handle's
-/// writer mutex via `Handle::with_ledger`) it must hold one contiguous chain.
-#[test]
-fn concurrent_handle_and_ledger_writers_keep_one_chain() {
-    let tmp = Tmp::new("domains");
+/// DOMAIN 2, FIXED — the same `Ledger` work routed through
+/// [`Handle::with_ledger`], which holds the writer mutex across it so the two
+/// domains can no longer interleave. This is the shape the DÁP boot + heartbeat
+/// paths now use.
+fn ledger_domain_append_via_handle(handle: &Handle, tag: &str) {
+    handle
+        .with_ledger(BinaryHash::from_bytes([7u8; 32]), |ledger| {
+            ledger.append(
+                EventKind::DbAutoRecovered,
+                payload(tag),
+                Actor::from_local_cli(format!("ulid-{tag}"), "tester"),
+                None,
+            )
+        })
+        .unwrap()
+        .unwrap();
+}
+
+/// Run the two-domain race and return the chain verdict.
+fn race(label: &str, ledger_arm: fn(&Handle, &str)) -> (PathBuf, Tmp, Arc<Handle>) {
+    let tmp = Tmp::new(label);
     let db = tmp.db();
     seed(&db);
     let handle = Handle::open_default(&db, tenant()).unwrap();
@@ -142,12 +161,38 @@ fn concurrent_handle_and_ledger_writers_keep_one_chain() {
         let h: Arc<Handle> = handle.clone();
         thread::spawn(move || {
             for i in 0..ROUNDS {
-                ledger_domain_append(&h, &format!("B{i}"));
+                ledger_arm(&h, &format!("B{i}"));
             }
         })
     };
     a.join().unwrap();
     b.join().unwrap();
+    (db, tmp, handle)
+}
+
+/// MUTATION GUARD. The unguarded `Ledger` writer MUST still fork when raced
+/// against a handle-routed writer. If this ever passes, the hazard model is
+/// wrong (or the race stopped interleaving) and
+/// [`concurrent_handle_and_ledger_writers_keep_one_chain`] below has become
+/// vacuous — it would pass whether or not `with_ledger` holds the mutex.
+#[test]
+fn unfixed_ledger_writer_still_forks() {
+    let (db, _tmp, _h) = race("unguarded", ledger_domain_append_unguarded);
+    let ledger = Ledger::open(&db, tenant(), BinaryHash::from_bytes([7u8; 32])).unwrap();
+    let verdict = ledger.verify_chain();
+    assert!(
+        verdict.is_err(),
+        "the UNGUARDED cross-domain race must still fork the chain — it verified \
+         clean ({verdict:?}), so the fixed-path test has lost its teeth"
+    );
+}
+
+/// THE FIX. Same race, but the `Ledger` arm goes through
+/// [`Handle::with_ledger`], so both writers serialize on the handle's writer
+/// mutex. One contiguous chain, proven with `verify_chain` (not a row count).
+#[test]
+fn concurrent_handle_and_ledger_writers_keep_one_chain() {
+    let (db, _tmp, _h) = race("domains", ledger_domain_append_via_handle);
 
     // Integrity is proven with the hash chain, NOT a row count: a fork keeps the
     // row count correct while breaking the links, which is exactly why the prod

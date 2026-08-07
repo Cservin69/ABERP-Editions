@@ -279,6 +279,68 @@ impl Handle {
         Ok(clone)
     }
 
+    /// ADR-0105 — run a `Ledger`-shaped audit operation inside the ONE shared
+    /// serialization domain.
+    ///
+    /// # The problem this closes
+    ///
+    /// There are two audit-append paths and, before this method, two DISJOINT
+    /// locks guarding them:
+    ///
+    /// | path | lock held |
+    /// |---|---|
+    /// | [`Handle::write`] + `append_in_tx` | this handle's writer mutex (`append_in_tx` takes none) |
+    /// | `Ledger::append` / `append_signed` / `append_reopen` | audit-ledger's `AUDIT_APPEND_LOCK` |
+    ///
+    /// Neither excludes the other. One writer in each domain can read the same
+    /// committed head and both self-assign `seq = head + 1`; the `UNIQUE(seq)`
+    /// ART is gone, so both rows commit and the hash chain FORKS
+    /// (`Chain(OutOfOrder { expected: 2, found: 1 })` — the seq-369/416/428/515
+    /// prod signature). Reproduced by
+    /// `tests/audit_lock_domain_e2e.rs::concurrent_handle_and_ledger_writers_keep_one_chain`.
+    ///
+    /// # Why this shape
+    ///
+    /// The audit-ledger SESSION api (`open_service_session`, `heartbeat`,
+    /// `recover_crashed_sessions` — ADR-0087/0088) is written against
+    /// `&mut Ledger`, and `Ledger` owns its `Connection`. So a caller cannot
+    /// simply borrow the handle's connection. This method closes the gap
+    /// without touching that api:
+    ///
+    /// 1. take the writer mutex (so no handle-routed writer can interleave), then
+    /// 2. hand the closure a `Ledger` built from a **`try_clone` of the shared
+    ///    instance** — not a fresh `Connection::open`, so there is still exactly
+    ///    ONE DuckDB instance / one checkpoint actor (ADR-0098 Gap 1a) and the
+    ///    chain head read inside is coherent with every committed row.
+    ///
+    /// Both properties are load-bearing. A clone alone would NOT be enough —
+    /// the two lock domains would still interleave — which is exactly what the
+    /// failing-first test pins by using `read()` (a clone) in the racing arm.
+    ///
+    /// `Ledger::append` inside the closure still takes `AUDIT_APPEND_LOCK`, so
+    /// this path holds BOTH locks and therefore excludes writers in either
+    /// domain. Lock order is always handle-mutex → `AUDIT_APPEND_LOCK`; no
+    /// inversion is possible because `aberp-audit-ledger` does not depend on
+    /// this crate and so can never call back in while holding its lock.
+    ///
+    /// The post-commit lockstep mirror sync + debounced checkpoint run as usual
+    /// when the guard drops, after the ledger clone is closed.
+    pub fn with_ledger<R>(
+        &self,
+        binary_hash: BinaryHash,
+        f: impl FnOnce(&mut Ledger) -> R,
+    ) -> Result<R, DbError> {
+        let guard = self.write()?;
+        let clone = guard.try_clone()?;
+        let mut ledger = Ledger::from_connection(clone, self.meta.tenant_id().clone(), binary_hash);
+        let out = f(&mut ledger);
+        // Close the clone BEFORE the guard's post-commit hooks (mirror sync +
+        // debounced checkpoint) run on drop.
+        drop(ledger);
+        drop(guard);
+        Ok(out)
+    }
+
     /// Loop-idle hook (ADR-0098 D2 "+ one at loop-idle"). A daemon calls this
     /// when its queue drains; if the file is dirty since the last checkpoint
     /// we take one now (the cheapest moment), even inside the 1-min window.
