@@ -469,6 +469,56 @@ c="$(fresh)"
 printf '\n#[cfg(test)]\nmod adr0099_test_probe {\n    fn t(p: &std::path::Path, tn: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n        let mut l = aberp_audit_ledger::Ledger::open(p, tn, bh).unwrap();\n        let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n    }\n}\n' >> "$c/apps/aberp/src/serve.rs"
 expect_pass "$c" "CHECK 10M — a Ledger::open+append inside #[cfg(test)] is correctly IGNORED (10M is cfg(test)-aware)"
 
+
+# ── CHECK 10N — ADR-0105 wrapper-hidden write-fork ────────────────────────────
+# THE probe for this ADR: the exact pre-PR-33 aberp-mes shape — an independent
+# opener in one fn, the audit append hidden one call away in a helper. CHECK 10M
+# cannot see it (that is the whole point); CHECK 10N must.
+
+echo "[CHECK 10N] the pre-PR-33 WRAPPER-HIDDEN fork (opener here, append one call away) — 10N must go red"
+c="$(fresh)"
+printf '\nfn _adr0105_probe_wrapper_fork(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    _adr0105_probe_hidden_append(&mut l);\n}\nfn _adr0105_probe_hidden_append(l: &mut aberp_audit_ledger::Ledger) {\n    let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' > "$c/apps/aberp/src/zz_adr0105_probe_wrapper.rs"
+expect_fail "$c" "a NEW/REGROWN WRAPPER-HIDDEN write-fork" "CHECK 10N-b — an opener whose append hides ONE level down in a helper is caught"
+
+echo "[CHECK 10N] the same fork hidden TWO wrapper levels down — the taint closure must still reach it"
+c="$(fresh)"
+printf '\nfn _adr0105_probe_deep_fork(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    _adr0105_probe_mid(&mut l);\n}\nfn _adr0105_probe_mid(l: &mut aberp_audit_ledger::Ledger) {\n    _adr0105_probe_deep_append(l);\n}\nfn _adr0105_probe_deep_append(l: &mut aberp_audit_ledger::Ledger) {\n    let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' > "$c/apps/aberp/src/zz_adr0105_probe_deep.rs"
+expect_fail "$c" "a NEW/REGROWN WRAPPER-HIDDEN write-fork" "CHECK 10N-b — N-level (2-deep) wrapper indirection is caught by the taint closure"
+
+# This one pins the BLIND SPOT itself. If a future change teaches CHECK 10M to
+# see through wrappers, this probe flips to a HARNESS BUG report — which is
+# correct: the blind spot 10N exists to cover would have closed, and that should
+# be a deliberate, visible decision rather than a silent overlap.
+echo "[CHECK 10N] the wrapper-hidden fork planted in snapshot.rs — 10M-a (ZERO-tolerance) does NOT see it; only 10N does"
+c="$(fresh)"
+printf '\nfn _adr0105_probe_blindspot(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    _adr0105_probe_blindspot_append(&mut l);\n}\nfn _adr0105_probe_blindspot_append(l: &mut aberp_audit_ledger::Ledger) {\n    let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' >> "$c/apps/aberp/src/snapshot.rs"
+if ! assert_planted "$c"; then
+  printf '  ✗ HARNESS BUG: CHECK 10N blind-spot probe — the plant modified NOTHING.\n'; bad=$((bad+1))
+else
+  rc="$(gate_rc "$c")"
+  m10m="$(grep -c 'snapshot.rs REGREW an in-process write-fork' "$c/.out" || true)"
+  m10n="$(grep -c 'WRAPPER-HIDDEN write-fork' "$c/.out" || true)"
+  if [[ "$rc" != "0" && "$m10m" == "0" && "$m10n" != "0" ]]; then
+    printf '  ✓ caught: CHECK 10N — wrapper-hidden fork in snapshot.rs caught by 10N while 10M-a stays blind (the documented gap)  (exit=%s)\n' "$rc"; pass=$((pass+1))
+  elif [[ "$rc" != "0" && "$m10m" != "0" ]]; then
+    printf '  ✗ HARNESS BUG: CHECK 10M-a now ALSO catches the wrapper-hidden fork — the ADR-0105 blind-spot premise no longer holds.\n'
+    printf '        Re-verify whether CHECK 10N is still needed, then update this probe deliberately.\n'; bad=$((bad+1))
+  else
+    printf '  ✗ ESCAPED: CHECK 10N — wrapper-hidden fork in snapshot.rs was NOT caught (exit=%s)\n' "$rc"
+    sed 's/^/        /' "$c/.out"; bad=$((bad+1))
+  fi
+fi
+
+echo "[CHECK 10N] a wrapper-hidden fork inside #[cfg(test)] must NOT trip 10N (cfg(test)-aware precision, no false-positive)"
+c="$(fresh)"
+printf '\n#[cfg(test)]\nmod adr0105_test_probe {\n    fn t(p: &std::path::Path, tn: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n        let mut l = aberp_audit_ledger::Ledger::open(p, tn, bh).unwrap();\n        hidden(&mut l);\n    }\n    fn hidden(l: &mut aberp_audit_ledger::Ledger) {\n        let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n    }\n}\n' >> "$c/apps/aberp/src/serve.rs"
+expect_pass "$c" "CHECK 10N — a wrapper-hidden fork inside #[cfg(test)] is correctly IGNORED (10N is cfg(test)-aware)"
+
+echo "[CHECK 10N] an opener whose helper routes through the shared Handle must NOT trip 10N (Handle barrier, no false-positive)"
+c="$(fresh)"
+printf '\nfn _adr0105_probe_handle_routed(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash, db: &aberp_db::HandleArc) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    _adr0105_probe_handle_append(db, &mut l);\n}\nfn _adr0105_probe_handle_append(db: &aberp_db::HandleArc, _l: &mut aberp_audit_ledger::Ledger) {\n    let mut g = db.write().unwrap();\n    let tx = g.transaction().unwrap();\n    let _ = aberp_audit_ledger::append_in_tx(&tx, todo!(), aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' > "$c/apps/aberp/src/zz_adr0105_probe_handle.rs"
+expect_pass "$c" "CHECK 10N — an append that takes the shared Handle itself is correctly IGNORED (serialization boundary, not a fork)"
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi

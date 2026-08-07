@@ -45,8 +45,20 @@
 //! other side: a `try_clone` of the shared instance *does* observe every
 //! committed row (one shared cache), and [`Handle::write`] serializes writes
 //! behind the writer mutex — which subsumes `AUDIT_APPEND_LOCK`'s role for
-//! handle-routed writes. (Audit appends that still go through
-//! `append_reopen` keep their own lock; see the FLAG in the Session-B report.)
+//! handle-routed writes.
+//!
+//! # ONE serialization domain (ADR-0105)
+//!
+//! The Session-B report FLAGGED that audit appends going through
+//! `Ledger::append` / `append_reopen` keep their OWN lock. That flag was a real
+//! defect, not a note: the writer mutex and `AUDIT_APPEND_LOCK` are DISJOINT, so
+//! a writer in each domain could read the same head and both take
+//! `seq = head + 1` — `Chain(OutOfOrder { .. })`, the seq-369/416/428/515
+//! signature. [`Handle::with_ledger`] closes it: `Ledger`-shaped audit work now
+//! runs under the writer mutex on a `try_clone` of the shared instance, so it
+//! holds BOTH locks and excludes either domain. Reproduced and pinned in
+//! `tests/audit_lock_domain_e2e.rs`. Cross-PROCESS writers remain outside any
+//! in-process lock (S335 §3.4), backstopped by the hash chain as before.
 //!
 //! # No new primitive
 //!
