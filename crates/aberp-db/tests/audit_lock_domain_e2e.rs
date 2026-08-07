@@ -18,15 +18,34 @@
 //! gated on the tenant's `dap_enabled` flag, which DEFAULTS OFF — latent, not
 //! firing, but loaded.
 //!
-//! [`concurrent_handle_and_ledger_writers_keep_one_chain`] is the failing-first
-//! proof. It deliberately builds the `Ledger` from `Handle::read()` — a
-//! `try_clone` of the SAME DuckDB instance — so the only variable under test is
-//! the LOCK DOMAIN. (A separate `Connection::open`, which is what the live
-//! heartbeat actually does, would additionally drag in the ADR-0098 Gap-1a
-//! two-instance tear and confound the result.) That framing is also the reason
-//! `Handle::with_ledger` cannot just hand out a clone and call it a day: a
-//! shared instance is necessary but NOT sufficient — the caller must hold the
-//! writer mutex too, which is precisely what `with_ledger` does.
+//! # What proves what (read this before changing a test here)
+//!
+//! The original failing-first repro was a thread race asserted with
+//! `verify_chain`. It reproduced the fork immediately on a dev box — and it is
+//! NOT kept as a guard, because a race proves a hazard EXISTS (one fork is
+//! proof) but can never prove one is GONE: a green run is equally explained by
+//! "the mutex works" and "the interleaving didn't happen". Both halves of that
+//! were observed for real — the race passed with the mutex mutated OUT on an
+//! 8-core box, and its unguarded counterpart failed to fork at all in 6
+//! attempts on a 2-core CI runner. So the two load-bearing tests are
+//! DETERMINISTIC:
+//!
+//! * [`two_unserialized_appenders_fork_the_chain`] — the hazard. Two appenders
+//!   with no shared serialization point, transactions ordered by hand, no
+//!   threads. Both take `seq = head + 1`; the chain forks, every time.
+//! * [`with_ledger_holds_the_writer_mutex_across_its_closure`] — the fix. Parks
+//!   inside the closure and proves a handle-routed writer is locked out.
+//!
+//! [`concurrent_handle_and_ledger_writers_keep_one_chain`] remains only as
+//! corroboration that the fixed path survives real contention (no deadlock
+//! between the two locks, no corruption).
+//!
+//! Note both use `Handle::read()` — a `try_clone` of the SAME DuckDB instance —
+//! so the variable under test is the LOCK DOMAIN alone. A separate
+//! `Connection::open` (what the live heartbeat did) would additionally drag in
+//! the ADR-0098 Gap-1a two-instance tear and confound the result. That is also
+//! why `Handle::with_ledger` cannot just hand out a clone: a shared instance is
+//! necessary but NOT sufficient — the caller must hold the writer mutex too.
 //!
 //! Same build gate as `handle_concurrency_e2e.rs`: real DuckDB, so Mac/CI only.
 
@@ -42,9 +61,9 @@ use aberp_db::{Handle, HandleConfig};
 use duckdb::Connection;
 
 const TENANT: &str = "defense";
-/// Rounds per writer. The fork is a race, so this needs enough interleavings to
-/// be reliable rather than flaky-green; 150 × 2 threads reproduces on every run
-/// observed on the pre-fix tree.
+/// Rounds per writer for the corroboration race. Sized for real contention, NOT
+/// as a fork detector — see the module docs on why no assertion here may depend
+/// on the threads actually interleaving.
 const ROUNDS: usize = 150;
 
 struct Tmp(PathBuf);
@@ -105,26 +124,6 @@ fn handle_domain_append(handle: &Handle, tag: &str) {
     tx.commit().unwrap();
 }
 
-/// DOMAIN 2, PRE-FIX — the audit-ledger writer. `Ledger::append` holds
-/// `AUDIT_APPEND_LOCK` and nothing else. Built on a `try_clone` of the shared
-/// instance so ONLY the lock domain differs from `handle_domain_append`.
-/// Retained (and exercised by [`unfixed_ledger_writer_still_forks`]) so the
-/// test suite keeps PROVING the hazard is real rather than merely asserting the
-/// fixed path is fine — a guard whose failure mode is never demonstrated is a
-/// guard nobody can tell is still wired up.
-fn ledger_domain_append_unguarded(handle: &Handle, tag: &str) {
-    let conn = handle.read().unwrap();
-    let mut ledger = Ledger::from_connection(conn, tenant(), BinaryHash::from_bytes([7u8; 32]));
-    ledger
-        .append(
-            EventKind::DbAutoRecovered,
-            payload(tag),
-            Actor::from_local_cli(format!("ulid-{tag}"), "tester"),
-            None,
-        )
-        .unwrap();
-}
-
 /// DOMAIN 2, FIXED — the same `Ledger` work routed through
 /// [`Handle::with_ledger`], which holds the writer mutex across it so the two
 /// domains can no longer interleave. This is the shape the DÁP boot + heartbeat
@@ -173,13 +172,8 @@ fn race(label: &str, ledger_arm: fn(&Handle, &str)) -> (PathBuf, Tmp, Arc<Handle
 
 /// **THE LOAD-BEARING GUARD — deterministic, not a race.**
 ///
-/// The race-based tests below are probabilistic: a fork needs writer B to read
-/// the head inside writer A's read→commit window, and whether that happens on a
-/// given run is timing. That is fine for DEMONSTRATING the hazard (one fork is
-/// proof) but useless for proving it GONE — a green race run is equally
-/// explained by "the mutex works" and by "the interleaving didn't happen this
-/// time". Confirmed the hard way: with the writer mutex mutated OUT of
-/// `with_ledger`, the race test still passed.
+/// A race cannot pin this: with the writer mutex mutated OUT of `with_ledger`,
+/// the race test still passed.
 ///
 /// So the fix is pinned on the property itself: `with_ledger` must hold the
 /// writer mutex FOR THE WHOLE DURATION OF ITS CLOSURE. That is the only thing
@@ -254,39 +248,97 @@ fn with_ledger_holds_the_writer_mutex_across_its_closure() {
     );
 }
 
-/// MUTATION GUARD for the race harness. The UNGUARDED `Ledger` writer must
-/// still be able to fork when raced against a handle-routed writer. If this
-/// stops forking, the race harness has stopped interleaving and
-/// [`concurrent_handle_and_ledger_writers_keep_one_chain`] is vacuous.
+/// **THE HAZARD, DEMONSTRATED DETERMINISTICALLY** — no threads, no timing, no
+/// retries.
 ///
-/// Retried because a single race is probabilistic; forking even once proves the
-/// hazard, so ATTEMPTS independent races and needs only one to fork.
+/// This replaced a retried race (`ATTEMPTS` independent races, needing one to
+/// fork). That version was green on an 8-core dev box and **failed on a 2-core
+/// CI runner, which never interleaved in 6 attempts** — a test whose verdict
+/// depends on the scheduler is worthless as a guard in either direction.
+///
+/// The fork needs no concurrency at all, only two appenders with **no shared
+/// serialization point**. Each opens its own transaction, so each reads the same
+/// committed head inside its own snapshot, and each self-assigns
+/// `seq = head + 1`. `UNIQUE(seq)` is gone, so both commit and the chain forks.
+/// Ordering the two transactions by hand makes that inevitable rather than
+/// likely — which is exactly the property the two disjoint lock domains fail to
+/// provide, and exactly what [`Handle::with_ledger`] restores.
 #[test]
-fn unfixed_ledger_writer_still_forks() {
-    const ATTEMPTS: usize = 6;
-    for attempt in 0..ATTEMPTS {
-        let (db, _tmp, _h) = race(
-            &format!("unguarded{attempt}"),
-            ledger_domain_append_unguarded,
-        );
-        let ledger = Ledger::open(&db, tenant(), BinaryHash::from_bytes([7u8; 32])).unwrap();
-        if ledger.verify_chain().is_err() {
-            return; // hazard demonstrated
-        }
-    }
-    panic!(
-        "the UNGUARDED cross-domain race did not fork in {ATTEMPTS} attempts — the \
-         race harness has stopped interleaving, so the fixed-path race test proves \
-         nothing. Fix the harness (more rounds / tighter window)."
+fn two_unserialized_appenders_fork_the_chain() {
+    let tmp = Tmp::new("deterministic");
+    let db = tmp.db();
+    seed(&db);
+    let handle = Handle::open(
+        &db,
+        tenant(),
+        HandleConfig {
+            checkpoint_enabled: false,
+            ..HandleConfig::default()
+        },
+    )
+    .unwrap();
+
+    // One committed row first, so "the head both writers read" is a real row
+    // rather than the genesis special case.
+    handle_domain_append(&handle, "seed");
+
+    // Two connections on the SAME instance (`read()` is a try_clone), so this is
+    // NOT the ADR-0098 two-instance hazard — only the missing serialization.
+    let mut c1 = handle.read().unwrap();
+    let mut c2 = handle.read().unwrap();
+
+    // Both transactions open BEFORE either commits: each sees the same head.
+    let tx1 = c1.transaction().unwrap();
+    let tx2 = c2.transaction().unwrap();
+    append_in_tx(
+        &tx1,
+        &meta(),
+        EventKind::DbAutoRecovered,
+        payload("A"),
+        Actor::from_local_cli("ulid-A".to_string(), "tester"),
+        None,
+    )
+    .unwrap();
+    append_in_tx(
+        &tx2,
+        &meta(),
+        EventKind::DbAutoRecovered,
+        payload("B"),
+        Actor::from_local_cli("ulid-B".to_string(), "tester"),
+        None,
+    )
+    .unwrap();
+    tx1.commit().unwrap();
+    tx2.commit().unwrap();
+
+    let ledger = Ledger::open(&db, tenant(), BinaryHash::from_bytes([7u8; 32])).unwrap();
+    let verdict = ledger.verify_chain();
+    assert!(
+        verdict.is_err(),
+        "two appenders with no shared serialization point BOTH took seq = head + 1, \
+         yet the chain verified clean ({verdict:?}). Either DuckDB now rejects the \
+         second commit or a UNIQUE(seq) constraint is back — in which case the \
+         premise behind Handle::with_ledger has changed and ADR-0105 must be \
+         revisited, not this assertion relaxed."
     );
 }
 
-/// End-to-end CORROBORATION (not the load-bearing guard — see
-/// [`with_ledger_is_mutually_exclusive_with_a_handle_writer`] for that). Runs the
-/// real workload through [`Handle::with_ledger`] and proves chain integrity with
-/// `verify_chain` rather than a row count: a fork leaves the row COUNT correct
-/// and only breaks the links, which is why the prod incidents were invisible
-/// until someone verified the chain.
+/// End-to-end CORROBORATION — explicitly NOT a fork detector.
+///
+/// 300 real appends through [`Handle::with_ledger`] against a concurrent
+/// handle-routed writer, verified with `verify_chain` (not a row count — a fork
+/// leaves the COUNT correct and only breaks the links, which is why the prod
+/// incidents stayed invisible until someone verified the chain).
+///
+/// What this DOES prove: the fixed path survives real contention — no deadlock
+/// between the writer mutex and `AUDIT_APPEND_LOCK`, no panic, no corruption,
+/// and the chain is contiguous afterwards. What it does NOT prove: that the
+/// mutex is doing the work. A green run here is equally explained by "the
+/// interleaving never happened", which is precisely what a 2-core CI runner
+/// does. The load-bearing guards are
+/// [`with_ledger_holds_the_writer_mutex_across_its_closure`] (deterministic
+/// exclusion) and [`two_unserialized_appenders_fork_the_chain`] (deterministic
+/// hazard).
 #[test]
 fn concurrent_handle_and_ledger_writers_keep_one_chain() {
     let (db, _tmp, _h) = race("domains", ledger_domain_append_via_handle);
