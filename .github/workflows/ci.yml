@@ -191,6 +191,16 @@ jobs:
       - name: ADR-0098 DuckDB Handle e2e (assertion #1 + concurrency)
         run: cargo test -p aberp-db --test handle_concurrency_e2e --locked -- --nocapture
 
+      # ADR-0105 — same rationale as the step above: this is the acceptance proof
+      # that the two audit-append lock domains (the Handle writer mutex and the
+      # audit-ledger AUDIT_APPEND_LOCK) can no longer interleave and fork the
+      # hash chain. Surfaced explicitly, before the broad workspace Test, so the
+      # verdict is visible even if a later step fails. Single-threaded: the
+      # mutual-exclusion guard measures lock WAIT, and cargo's default parallel
+      # test threads add scheduler noise to that measurement.
+      - name: ADR-0105 audit lock-domain e2e (cross-domain fork)
+        run: cargo test -p aberp-db --test audit_lock_domain_e2e --locked -- --nocapture --test-threads=1
+
       - name: Test (${{ matrix.edition }}, --locked)
         run: cargo test --workspace --locked ${{ matrix.features }}
 

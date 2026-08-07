@@ -265,7 +265,10 @@ fn with_ledger_holds_the_writer_mutex_across_its_closure() {
 fn unfixed_ledger_writer_still_forks() {
     const ATTEMPTS: usize = 6;
     for attempt in 0..ATTEMPTS {
-        let (db, _tmp, _h) = race(&format!("unguarded{attempt}"), ledger_domain_append_unguarded);
+        let (db, _tmp, _h) = race(
+            &format!("unguarded{attempt}"),
+            ledger_domain_append_unguarded,
+        );
         let ledger = Ledger::open(&db, tenant(), BinaryHash::from_bytes([7u8; 32])).unwrap();
         if ledger.verify_chain().is_err() {
             return; // hazard demonstrated
