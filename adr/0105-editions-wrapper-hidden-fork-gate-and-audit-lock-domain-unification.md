@@ -101,7 +101,10 @@ The second attempt asserted `with_ledger` *blocks while a handle writer holds th
 
 The third attempt measured the right direction but included the guard's drop hooks (mirror sync + checkpoint) in the timing, which alone exceed the threshold; it passed under mutation for the wrong reason.
 
-The guard that actually works parks **inside** `with_ledger`'s closure, times **only** the `write()` acquisition from another thread, and runs with the checkpoint disabled: **417 ns vs 600 ms** under mutation. Recorded here because "mutation-verified" was claimed prematurely three times, and only the fourth framing earned it.
+The guard that actually works parks **inside** `with_ledger`'s closure, times **only** the `write()` acquisition from another thread, and runs with the checkpoint disabled: **417 ns / 542 ns vs 600 ms** under mutation. Recorded here because "mutation-verified" was claimed prematurely three times, and only the fourth framing earned it.
+
+**Then CI made the same point from the other side.** The retried race that asserted the hazard is *still demonstrable* (`unfixed_ledger_writer_still_forks`) passed on an 8-core dev box and **failed on the 2-core CI runner** — the unguarded race never interleaved in 6 attempts. A scheduler-dependent test is worthless as a guard in **either** direction, so the hazard proof was made deterministic as well:
+[`two_unserialized_appenders_fork_the_chain`] uses no threads and no timing — two appenders with no shared serialization point, transactions ordered by hand, both reading the same head and both taking `seq = head + 1`. It forks on any core count. If it ever stops forking, its failure message says the PREMISE changed (DuckDB rejecting the second commit, or a `UNIQUE(seq)` returning) and this ADR must be revisited rather than the assertion relaxed. The thread race survives only as corroboration that the fixed path tolerates real contention.
 
 ---
 
@@ -127,6 +130,8 @@ Every audit-append call site in runtime code (`apps/`, `modules/`, `crates/`, ex
 **Easier.** A wrapper-hidden fork now fails the build with the wrapper named (`via=<callee>`). The DÁP chain is no longer a second DuckDB instance on the live file, so enabling `dap_enabled` no longer arms both a fork hazard and a Gap-1a tear. `Handle::with_ledger` gives any future `Ledger`-shaped audit work one correct way to run.
 
 **Harder.** CHECK 10N adds a second scanner to keep honest; its precision rules (Handle barrier, escape attribution) are heuristics over syntax, and a sufficiently unusual shape can still evade them — see §5. The heartbeat now blocks on the writer mutex once per interval (default 900 s), which is a real if negligible contention change.
+
+**CI budget.** Both workflow timeouts were raised on measured evidence (cut-gate 15 → 30 after a 14 m 32 s run against a 15-min cap; ci 60 → 90 after PR #33 ran 59 min against a 60-min cap and PR #29 was cancelled at exactly 60). The negative-probe harness costs ~17.5 s per probe and runs in BOTH workflows, so every probe added is paid twice. Speeding up `fresh()` is now load-bearing, not cosmetic.
 
 **Locked in.** `HeartbeatDeps` carries a `HandleArc`, not a `db_path` — the DÁP boot path can no longer be constructed without a Handle. That is intentional.
 
