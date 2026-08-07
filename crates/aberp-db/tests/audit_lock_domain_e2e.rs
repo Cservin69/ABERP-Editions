@@ -31,13 +31,14 @@
 //! Same build gate as `handle_concurrency_e2e.rs`: real DuckDB, so Mac/CI only.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use aberp_audit_ledger::{
     append_in_tx, ensure_schema, Actor, BinaryHash, EventKind, Ledger, LedgerMeta, TenantId,
 };
-use aberp_db::Handle;
+use aberp_db::{Handle, HandleConfig};
 use duckdb::Connection;
 
 const TENANT: &str = "defense";
@@ -170,26 +171,119 @@ fn race(label: &str, ledger_arm: fn(&Handle, &str)) -> (PathBuf, Tmp, Arc<Handle
     (db, tmp, handle)
 }
 
-/// MUTATION GUARD. The unguarded `Ledger` writer MUST still fork when raced
-/// against a handle-routed writer. If this ever passes, the hazard model is
-/// wrong (or the race stopped interleaving) and
-/// [`concurrent_handle_and_ledger_writers_keep_one_chain`] below has become
-/// vacuous — it would pass whether or not `with_ledger` holds the mutex.
+/// **THE LOAD-BEARING GUARD — deterministic, not a race.**
+///
+/// The race-based tests below are probabilistic: a fork needs writer B to read
+/// the head inside writer A's read→commit window, and whether that happens on a
+/// given run is timing. That is fine for DEMONSTRATING the hazard (one fork is
+/// proof) but useless for proving it GONE — a green race run is equally
+/// explained by "the mutex works" and by "the interleaving didn't happen this
+/// time". Confirmed the hard way: with the writer mutex mutated OUT of
+/// `with_ledger`, the race test still passed.
+///
+/// So the fix is pinned on the property itself: `with_ledger` must hold the
+/// writer mutex FOR THE WHOLE DURATION OF ITS CLOSURE. That is the only thing
+/// that makes the two domains exclusive — the append happens inside the closure,
+/// so a mutex released before it runs protects nothing.
+///
+/// The direction matters. Asserting "`with_ledger` blocks while a handle writer
+/// holds the guard" does NOT work: `Handle::read()` also takes the same mutex
+/// briefly to `try_clone`, so the mutated build blocks too and the test passes
+/// vacuously (verified — it did). The discriminating direction is the opposite
+/// one: park inside `with_ledger`'s closure and prove a handle-routed writer is
+/// locked OUT. With the mutation (`read()`), the guard is already released by
+/// the time the closure runs, the writer sails in, and this fails every time.
 #[test]
-fn unfixed_ledger_writer_still_forks() {
-    let (db, _tmp, _h) = race("unguarded", ledger_domain_append_unguarded);
-    let ledger = Ledger::open(&db, tenant(), BinaryHash::from_bytes([7u8; 32])).unwrap();
-    let verdict = ledger.verify_chain();
+fn with_ledger_holds_the_writer_mutex_across_its_closure() {
+    const HOLD: Duration = Duration::from_millis(600);
+
+    let tmp = Tmp::new("exclusion");
+    let db = tmp.db();
+    seed(&db);
+    // Checkpoint OFF: the WriteGuard's post-commit durable checkpoint can itself
+    // take longer than the threshold, which would satisfy the assertion for the
+    // wrong reason. (It did, on the first draft — the mutated build "passed"
+    // purely on checkpoint time.) This test is about lock WAIT and nothing else.
+    let handle = Handle::open(
+        &db,
+        tenant(),
+        HandleConfig {
+            checkpoint_enabled: false,
+            ..HandleConfig::default()
+        },
+    )
+    .unwrap();
+
+    let inside = Arc::new(Barrier::new(2));
+    let b = {
+        let h: Arc<Handle> = handle.clone();
+        let inside = inside.clone();
+        thread::spawn(move || {
+            h.with_ledger(BinaryHash::from_bytes([7u8; 32]), |ledger| {
+                inside.wait(); // we are INSIDE the closure now
+                thread::sleep(HOLD);
+                ledger
+                    .append(
+                        EventKind::DbAutoRecovered,
+                        payload("inside"),
+                        Actor::from_local_cli("ulid-inside".to_string(), "tester"),
+                        None,
+                    )
+                    .unwrap();
+            })
+            .unwrap();
+        })
+    };
+
+    inside.wait();
+    // B is inside `with_ledger`'s closure. A handle-routed writer must WAIT.
+    // Time ONLY the guard acquisition — not the append, and not the guard's
+    // drop hooks (mirror sync + checkpoint), whose cost would mask the signal.
+    let started = Instant::now();
+    let g = handle.write().unwrap();
+    let waited = started.elapsed();
+    drop(g);
+    b.join().unwrap();
+
     assert!(
-        verdict.is_err(),
-        "the UNGUARDED cross-domain race must still fork the chain — it verified \
-         clean ({verdict:?}), so the fixed-path test has lost its teeth"
+        waited >= HOLD / 2,
+        "a handle-routed writer acquired the guard in {waited:?} while another \
+         thread was inside with_ledger's closure (which parked for {HOLD:?}) — \
+         with_ledger is NOT holding the writer mutex across the append, so the \
+         two audit lock domains are still disjoint and the chain can fork"
     );
 }
 
-/// THE FIX. Same race, but the `Ledger` arm goes through
-/// [`Handle::with_ledger`], so both writers serialize on the handle's writer
-/// mutex. One contiguous chain, proven with `verify_chain` (not a row count).
+/// MUTATION GUARD for the race harness. The UNGUARDED `Ledger` writer must
+/// still be able to fork when raced against a handle-routed writer. If this
+/// stops forking, the race harness has stopped interleaving and
+/// [`concurrent_handle_and_ledger_writers_keep_one_chain`] is vacuous.
+///
+/// Retried because a single race is probabilistic; forking even once proves the
+/// hazard, so ATTEMPTS independent races and needs only one to fork.
+#[test]
+fn unfixed_ledger_writer_still_forks() {
+    const ATTEMPTS: usize = 6;
+    for attempt in 0..ATTEMPTS {
+        let (db, _tmp, _h) = race(&format!("unguarded{attempt}"), ledger_domain_append_unguarded);
+        let ledger = Ledger::open(&db, tenant(), BinaryHash::from_bytes([7u8; 32])).unwrap();
+        if ledger.verify_chain().is_err() {
+            return; // hazard demonstrated
+        }
+    }
+    panic!(
+        "the UNGUARDED cross-domain race did not fork in {ATTEMPTS} attempts — the \
+         race harness has stopped interleaving, so the fixed-path race test proves \
+         nothing. Fix the harness (more rounds / tighter window)."
+    );
+}
+
+/// End-to-end CORROBORATION (not the load-bearing guard — see
+/// [`with_ledger_is_mutually_exclusive_with_a_handle_writer`] for that). Runs the
+/// real workload through [`Handle::with_ledger`] and proves chain integrity with
+/// `verify_chain` rather than a row count: a fork leaves the row COUNT correct
+/// and only breaks the links, which is why the prod incidents were invisible
+/// until someone verified the chain.
 #[test]
 fn concurrent_handle_and_ledger_writers_keep_one_chain() {
     let (db, _tmp, _h) = race("domains", ledger_domain_append_via_handle);
