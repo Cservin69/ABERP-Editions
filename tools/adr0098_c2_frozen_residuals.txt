@@ -33,17 +33,21 @@
 #   (central)=the audit-ledger central opener definitions (Ledger::open carries the
 #     R3 pragma; append_reopen is the legacy reopen-append; the `pub fn append_reopen(`
 #     self-match is a deterministic scanner artifact, counted here);
-#   (mes-residual)=aberp-mes ledger_writer::write_one — a REAL in-serve-process
-#     separate opener newly SURFACED by the R4 scope extension; FLAGGED as a v0.2.6
-#     Handle-migration target (NOT migrated this session — conservative);
+#   (mes-residual)=aberp-mes ledger_writer::write_one — was a REAL in-serve-process
+#     separate opener surfaced by the R4 scope extension. MIGRATED onto the shared
+#     Handle by ADR-0104 and therefore DELISTED (count 0, like the other migrated
+#     files). It was not merely a pragma question: holding no AUDIT_APPEND_LOCK, two
+#     adapter writers could read the same head and FORK the chain — reproduced by
+#     crates/aberp-mes/tests/ledger_contention_probe.rs;
 #   (c)=CLI-only bin one-shot (separate process, out of ADR-0098 scope).
 #   NOTE: ADR-0098 R6 (NEW-3) EXTENDED CHECK 10j (pragma-presence) scope to crates/
 #   (was apps/aberp+modules only): every frozen crate residual Connection::open now
 #   MUST carry PRAGMA disable_checkpoint_on_shutdown. R6 pragma-guarded the three
 #   surfaced crate openers — aberp-mes ledger_writer::write_one, aberp-inventory
 #   rebuild_stock_cache::run (CLI), and audit-ledger append_reopen (the audit-ledger
-#   central Ledger::open already carried it). Full Handle migration of the mes/bin
-#   openers remains a v0.2.6 target.
+#   central Ledger::open already carried it). The aberp-mes opener is now GONE
+#   (ADR-0104, on the shared Handle); full Handle migration of the remaining bin
+#   openers stays a v0.2.6 target.
 1 apps/aberp/src/audit_dap_boot.rs
 6 apps/aberp/src/drain_submission_queue.rs
 1 apps/aberp/src/export_invoice_bundle.rs
@@ -68,5 +72,4 @@
 1 apps/aberp/src/tenant_registry.rs
 1 modules/billing/src/adapters/duckdb_store.rs
 3 crates/audit-ledger/src/storage/mod.rs
-1 crates/aberp-mes/src/ledger_writer.rs
 1 crates/aberp-inventory/src/bin/rebuild_stock_cache.rs

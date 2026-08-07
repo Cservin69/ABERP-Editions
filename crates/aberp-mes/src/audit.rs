@@ -86,6 +86,38 @@ pub fn write_mes_adapter_event(
     .map(|_| ())
 }
 
+/// The `(kind, payload bytes, idempotency key)` triple that one MES
+/// adapter event contributes to an audit-ledger append.
+///
+/// Single source of truth for the mapping, shared by
+/// [`write_mes_adapter_event`] (which rides a caller-owned transaction)
+/// and by the ledger-writer runtime task, which takes the ONE shared
+/// `aberp_db::Handle` (`db.write()` → `ensure_schema` → `transaction()` →
+/// `append_in_tx` → `commit`) per ADR-0098 Gap 1a.
+///
+/// The two are NOT interchangeable. `write_mes_adapter_event` exists for
+/// callers whose upstream state change is already in flight, per ADR-0008
+/// §"Storage". An adapter event has no sibling state change to ride — the
+/// broadcast emission IS the event — so the writer appends on its own,
+/// but on the SHARED instance, never on one of its own.
+///
+/// **Do not "restore" an opener here or in `ledger_writer`.** Neither this
+/// module nor `ledger_writer` opens a DuckDB connection, and `aberp-mes`
+/// is delisted from ADR-0098's frozen residual-opener ledger as a result
+/// (ADR-0104 §3.3). A per-event `Connection::open` — or `append_reopen`,
+/// which is legacy and has no live callers — re-creates the two-instance
+/// chain fork this crate's probes exist to catch, and fails cut-gate
+/// CHECK 10M.
+pub(crate) fn mes_adapter_event_parts(
+    payload: &MesAdapterEventPayload,
+) -> (EventKind, Vec<u8>, Option<String>) {
+    (
+        EventKind::MesAdapterEvent,
+        payload.to_bytes(),
+        Some(payload.idempotency_key.clone()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

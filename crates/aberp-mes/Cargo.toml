@@ -25,7 +25,9 @@ async-trait = { workspace = true }
 # inside the barcode-scanner adapter's per-connection reader loop;
 # `rt` for `spawn_blocking` used by the ledger writer's per-event
 # DuckDB-append surface.
-tokio = { workspace = true, features = ["io-util", "rt"] }
+# `time` (ADR-0104) backs the ledger-writer's bounded write-retry
+# backoff; without it a transient audit-write failure was dropped.
+tokio = { workspace = true, features = ["io-util", "rt", "time"] }
 
 # Error machinery — same crate every other ABERP crate uses.
 thiserror = { workspace = true }
@@ -38,6 +40,11 @@ serde_json = { workspace = true }
 # Audit-ledger writer surface — append_in_tx + EventKind::MesAdapterEvent
 # per ADR-0060 §"Audit-ledger integration".
 aberp-audit-ledger = { path = "../audit-ledger" }
+
+# ADR-0104 — the ledger-writer appends on the ONE shared DuckDB handle
+# (ADR-0098 Gap 1a) instead of opening its own connection per event. Same
+# surface `email_outbox_poll_daemon` uses: db.write() + append_in_tx.
+aberp-db = { path = "../aberp-db" }
 
 # DuckDB Transaction is the type signature of write_mes_adapter_event —
 # regular (not dev-only) dep because the audit-ledger writer surface
@@ -82,6 +89,11 @@ quick-xml = { workspace = true }
 # clocks in lifecycle tests, plus net/sync/io for the TCP listener
 # integration tests.
 tokio = { workspace = true, features = ["test-util"] }
+
+# ADR-0104 — the contention probes build a real `aberp_db::Handle` so they
+# exercise the SAME shared-instance path production uses, rather than a
+# test-only stand-in that could not reproduce a chain fork.
+aberp-db = { path = "../aberp-db" }
 
 # PR-235 / S241 — inherit workspace lint config.
 [lints]
