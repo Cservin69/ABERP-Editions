@@ -54,7 +54,9 @@ apps/aberp/src/drain_submission_queue.rs:drive_one_invoice
 # These hold an independent opener AND call something that can reach an append,
 # but are NOT forks; the scanner clears them structurally, and each was read by
 # hand to confirm the structural verdict matches the code:
-#   • Handle-routed appenders (86 of them, e.g. quality::append_event,
+#   • Handle-routed appenders (89 in this corpus; 101 including the aberp-db /
+#     aberp-snapshot shared-Handle seams — see ADR-0105 §3.1 for the measuring
+#     command. e.g. quality::append_event,
 #     purchasing::append_event, mes ledger_writer::try_write_once). They take
 #     `db.write()` THEMSELVES, so the caller's opener is irrelevant to the audit
 #     chain. Their callers (e.g. quality::create_ncr) keep an independent

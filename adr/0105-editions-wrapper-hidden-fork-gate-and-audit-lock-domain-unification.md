@@ -1,6 +1,6 @@
 # ADR-0105 (Defense) — The wrapper-hidden write-fork gate, and one serialization domain for every audit append
 
-- **Status:** **Proposed — implemented, not yet adversarially reviewed.**
+- **Status:** **Proposed — implemented; adversarially reviewed (PR #34, verdict *merge-after-fixes*).** The review's verdict on `Handle::with_ledger` (§2) was CLEAN — it survived panic-poison, deadlock/lock-inversion, production-posture chain integrity, and its own mutation check. Every finding was against the **scanner** (§5.0): **F1 is closed here**; **F2 and F3 remain OPEN** as a scoped gate-hardening follow-up. Not merged.
 - **Date:** 2026-08-07
 - **Deciders:** Ervin Áben (scope: close the two durability follow-ups the PR #33 adversarial flagged as their own workstream; conservative option where ambiguous; no AskUserQuestion; open a PR, do **not** merge). Investigation + implementation by Dispatch.
 - **Base:** Editions `main` @ `9723df3` (PR #33 — the MES ledger-writer durability fix). Every file:line and every result below was reproduced in this session at that SHA.
@@ -10,12 +10,14 @@
 
 ## 0. TL;DR
 
-Two gaps, one root cause and one loaded gun.
+Two gaps, one root cause and one loaded gun — plus three gate bypasses the adversarial review then found in the scanner itself (§5.0), one of which is closed here.
 
 | # | Gap | Was it real? | Status |
 |---|---|---|---|
 | 1 | **CHECK 10M is blind to wrapper-hidden audit forks.** It only fires when the opener token and the append token sit in the *same* function body. | **Yes — and it was hiding live forks, including one in `serve.rs` where 10M-a demands a hard ZERO and was passing.** | New **CHECK 10N** (transitive taint closure) + 5 negative probes |
 | 2 | **`append_in_tx` takes no lock; the Handle mutex and `AUDIT_APPEND_LOCK` are disjoint domains.** One writer in each forks the chain. | **Yes**, reproduced: `Chain(OutOfOrder { expected: 2, found: 1 })`. Pre-existing, **not** a PR #33 regression. Live trigger `dap_enabled`, default **off** — latent, not firing. | New `Handle::with_ledger`; both DÁP writers migrated |
+
+**Post-review addendum.** The `with_ledger` fix was found clean. The review instead broke the *gate*: `from_connection` line-laundering (**F1**, closed here — it let a DIRECT fork pass the FULL gate in `snapshot.rs`, a zero-tolerance file), the bare-name allow-list (**F2**, open), and `RwLock::write()` poisoning the 10N barrier (**F3**, open). See §5.0.
 
 The two gaps turned out to be **the same two call sites**: `serve.rs::spawn_dap_audit_chain` and `audit_dap_boot::run_heartbeat_supervised` each hold an independent `Ledger::open` whose append is hidden inside a session helper. Gap 1 is precisely *why* Gap 2 was never caught by the gate.
 
@@ -114,12 +116,28 @@ Every audit-append call site in runtime code (`apps/`, `modules/`, `crates/`, ex
 
 | Class | Count | Meaning |
 |---|---|---|
-| **Handle-routed** | **101** across the full runtime corpus (**89** within the gate's scanned corpus, which excludes the `aberp-db` / `aberp-snapshot` shared-Handle seams themselves) | The appending fn takes `db.write()` itself. Serialized by the writer mutex. Safe. |
+| **Handle-routed** | **89** in the gate's scanned corpus; **101** over the full runtime corpus (see §3.1) | The appending fn takes `db.write()` itself. Serialized by the writer mutex. Safe. |
 | **CLI one-shot (separate process)** | 1 in-scope (`drain_submission_queue::drive_one_invoice`) + the allow-listed `emit_reopen_cli`, `emit_tenant_reopen`, `run`, `seed_demo_sample_data`, `record_upgrade_snapshot_mismatch_audit` | No `serve` process, so no shared Handle to route through, so it cannot race a handle-routed writer. |
 | **Unguarded in-process** | **2 — both CLOSED here** | `serve.rs::spawn_dap_audit_chain`, `audit_dap_boot::run_heartbeat_supervised`. |
 | **In-tx appenders** (take a caller-supplied `&Transaction`) | the bulk of the ~200 `append_in_tx` sites | Inherit the caller's serialization; classified by their caller, which is Handle-routed or CLI. |
 
 `drain_submission_queue` is reached **only** via `main.rs` → `cli::Command::DrainSubmissionQueue` → `drain_submission_queue::run`; it has zero references in `serve.rs`. It is frozen in `tools/adr0105_wrapper_fork_residuals.txt` rather than allow-listed, because the allow-list matches on fn *name* and an in-process fn later named `drive_one_invoice` must still fail the build.
+
+### 3.1 Reconciling the Handle-routed count (89 / 101)
+
+Three different numbers for this figure were in circulation — 89 (this ADR), 86 (the residual manifest) and 90 (the PR #34 review). Re-measured at this commit, with the command stated so it is reproducible rather than asserted:
+
+```
+FILES=(... find apps/aberp/src modules crates -name '*.rs' | grep -vE '/tests/' \
+        [ | grep -vE '^crates/(aberp-db|aberp-snapshot)/' for the gate corpus ] ... )
+awk -v allow="$WF_ALLOW" -v levels=12 -v show_barriers=1 \
+    -f tools/adr0105_wrapper_fork_scan.awk "${FILES[@]}" 2>&1 >/dev/null | grep -c BARRIER
+```
+
+* **89** — the gate's corpus (excludes `crates/aberp-db` and `crates/aberp-snapshot`, the shared-Handle seams themselves). 89 records, 89 unique `file:fn`, 84 distinct fn names, across 30 files.
+* **101** — the full runtime corpus, i.e. the same set plus those two crates.
+* **86** — **stale**. It predates two scanner corrections in this PR (excluding `#[cfg(test)]` definitions from the resolution index, and keeping `OpenOptions::append(true)` out of the callee list), both of which changed the taint set. The manifest has been corrected to 89.
+* **90** — **not reproducible here.** No corpus variant tried (gate corpus, either crate excluded singly, or including `/tests/`) yields 90; the closest are 89, 100 and 115. Recorded as unreconciled rather than silently rounded to the number that suited.
 
 **Not closed, and deliberately so:** cross-PROCESS races (a CLI subcommand run while `serve` is up) are outside *any* in-process lock. That is the standing S335 §3.4 limitation, backstopped by the hash chain's detection. This ADR does not change it.
 
@@ -139,11 +157,29 @@ Every audit-append call site in runtime code (`apps/`, `modules/`, `crates/`, ex
 
 ## 5. Adversarial review
 
-**"Your scanner is syntactic. Name a fork it still misses."** Several. A wrapper reached through a trait object or a function pointer (no resolvable callee name). A wrapper whose name is defined in >1 file where the same-file rule picks wrong — reported `AMBIGUOUS` rather than silently dropped, but only if *some* definition of that name is tainted. An opened connection stored in a struct field and appended from elsewhere (no escape attribution). CHECK 10N narrows the hole; it does not prove absence. The chain's own `verify_chain` remains the only *detection* backstop, unchanged.
+### 5.0 Known gate bypasses — F1, F2, F3
+
+The PR #34 adversarial review found three ways to plant a **real in-process audit write-fork** and keep the gate green. All three are recorded here in full, because an earlier draft of this section listed only strictly weaker gaps and would have left a reader believing the gate was tighter than it is. Repro for all three: `tools/adv_pr34_gate_bypass_repro.sh` (from the review's worktree).
+
+| # | Bypass | Severity, as MEASURED | Status |
+|---|---|---|---|
+| **F1** | **`from_connection` line-laundering.** Every opener scanner skipped any line containing the substring `from_connection`. The exclusion was LINE-scoped, so `Ledger::from_connection(Connection::open(p)?, ..)` hid a genuinely independent opener *as an argument on that same line*. | **Total bypass** — but not everywhere. Planted in `serve.rs` the gate still went red, because CHECK 10 (the serve.rs-specific live-path scan) never carried the clause. Planted in `quality.rs`, `crates/aberp-qa/`, or **`snapshot.rs` — which CHECK 10M-a holds at a hard ZERO** — the pre-fix gate passed **in full** (exit 0). | **CLOSED** by this ADR. Clause removed from 6 sites; proven a NO-OP on the clean tree (122 records byte-identical). Permanent probe `[ADR-0105 F1]` plants in `snapshot.rs` and asserts the 10M-a signature. |
+| **F2** | **Allow-list matches a bare fn NAME.** The sanctioned list contains `run`, so *any* of the ~21 runtime fns named `run` — including `serve.rs::run`, the long-running process entry point, which is emphatically **not** a separate-process CLI one-shot — may open and append freely. | **Total bypass** in `serve.rs`, a DIRECT same-fn fork, gate green. Verified. | **OPEN — scoped follow-up.** Fix is to key the allow-list on `file:fn`, not bare name. Deliberately not attempted here: it touches CHECK 10M's allow-list, which this PR committed to leaving byte-identical. |
+| **F3** | **`RwLock::write()` poisons the 10N taint barrier.** 10N stops taint at any callee containing `.write()` with empty parens, intended as "takes the shared Handle". `RwLock::write()` and tokio's `.write().await` match identically, so adding ONE unrelated lock line to an append wrapper silently clears the entire caller chain. | Defeats **CHECK 10N specifically** (the wrapper class this ADR exists for). The review's control case proves 10N catches the same fork without the lock line. | **OPEN — scoped follow-up.** Fix is to freeze the barrier set using the existing `-v show_barriers=1` machinery, so a NEW barrier must be reviewed rather than silently trusted. |
+
+F2 and F3 are queued as a separate gate-hardening change at Ervin's direction; they are **not** fixed in this PR.
+
+### 5.1 Other objections
+
+**"Your scanner is syntactic. Name a fork it still misses."** Beyond F2/F3 above: a wrapper whose name is defined in >1 file where the same-file rule picks wrong — reported `AMBIGUOUS` rather than silently dropped, but only if *some* definition of that name is tainted; a wrapper reached through a **function pointer** (no callee name at the call site at all); and an opened connection stored in a struct field and appended from elsewhere (no escape attribution). CHECK 10N narrows the hole; it does not prove absence. The chain's own `verify_chain` remains the only *detection* backstop, unchanged.
+
+**Correction — trait objects are NOT a blind spot.** An earlier draft of this section claimed a wrapper reached "through a trait object" was missed. That is wrong, and it understated the scanner. Callee extraction is receiver-agnostic: `s.zz_unique_sink_name(&mut l)` on a `&dyn AuditSink` yields the callee token `zz_unique_sink_name`, which resolves like any other name. Verified by planting exactly that shape — 10N reports `zz_dyn_caller:TRANSITIVE:opener@L9:via=zz_unique_sink_name`. Dynamic dispatch is caught whenever the method name is same-file- or corpus-unique; when several types implement the same method name it degrades to `AMBIGUOUS`, which is still **reported**, not dropped.
 
 **"You disabled the checkpoint in the exclusion test — are you testing production?"** No, and deliberately: with the checkpoint on, the assertion passed under mutation purely on checkpoint time. The test isolates lock-wait. Production posture is covered by the existing `handle_concurrency_e2e.rs` suite and by the end-to-end `verify_chain` race in the same file, which runs with defaults.
 
-**"The `.write()` barrier token would also match `RwLock::write()`."** It would. It is only ever consulted on a definition that already reaches an append, so a lock-only `.write()` in a non-appending fn is inert. A fn that both takes an `RwLock` write guard and appends via an independent opener would be mis-cleared. The full barrier list is emitted on demand (`-v show_barriers=1`) and was read as a set — every entry is a recognisable ADR-0099-migrated audit sink (`*::append_event`, `write_*_audit`, `emit_*_audit`, `ledger_writer::try_write_once`), with no `RwLock`-shaped outlier. It was **not** line-by-line audited across all 101, so this is a reviewed shape, not a proof. CHECK 10M still covers the same-fn case independently.
+**"The `.write()` barrier token would also match `RwLock::write()`."** It does — this is **F3**, and it is worse than the earlier draft of this ADR admitted. That draft argued the token "is only ever consulted on a definition that already reaches an append, so a lock-only `.write()` is inert", and then leaned on "CHECK 10M still covers the same-fn case independently". **That mitigation does not apply.** The whole point of the wrapper class is that the opener and the append are in *different* functions, which is exactly what 10M cannot see — so when F3 blinds 10N, nothing else covers it. One unrelated `RwLock` line in an append wrapper clears the entire caller chain, and the review demonstrated it against a control that 10N otherwise catches.
+
+The barrier list is emitted on demand (`-v show_barriers=1`) and was read as a set — every entry is a recognisable ADR-0099-migrated audit sink (`*::append_event`, `write_*_audit`, `emit_*_audit`, `ledger_writer::try_write_once`), with no `RwLock`-shaped outlier **today**. It was not line-by-line audited across all 89, so this is a reviewed shape, not a proof, and nothing stops the next one. Freezing that set is the F3 follow-up.
 
 **"You changed frozen baselines — is that a weakening?"** Two, both shrinks, both forced by removing openers: `adr0098_r4_opener_fingerprints.txt` loses the 2 migrated `Ledger::open` lines (100 → 98), and `adr0098_c2_frozen_residuals.txt` tightens `serve.rs` 30 → 29 and drops `audit_dap_boot.rs` entirely. Dropping the file's line is strictly *stronger*: a re-added opener there now fails as "NEW unaccounted opener-bearing file". No count was raised.
 
