@@ -111,7 +111,7 @@ Every audit-append call site in runtime code (`apps/`, `modules/`, `crates/`, ex
 
 | Class | Count | Meaning |
 |---|---|---|
-| **Handle-routed** | 101 | The appending fn takes `db.write()` itself. Serialized by the writer mutex. Safe. |
+| **Handle-routed** | **101** across the full runtime corpus (**89** within the gate's scanned corpus, which excludes the `aberp-db` / `aberp-snapshot` shared-Handle seams themselves) | The appending fn takes `db.write()` itself. Serialized by the writer mutex. Safe. |
 | **CLI one-shot (separate process)** | 1 in-scope (`drain_submission_queue::drive_one_invoice`) + the allow-listed `emit_reopen_cli`, `emit_tenant_reopen`, `run`, `seed_demo_sample_data`, `record_upgrade_snapshot_mismatch_audit` | No `serve` process, so no shared Handle to route through, so it cannot race a handle-routed writer. |
 | **Unguarded in-process** | **2 — both CLOSED here** | `serve.rs::spawn_dap_audit_chain`, `audit_dap_boot::run_heartbeat_supervised`. |
 | **In-tx appenders** (take a caller-supplied `&Transaction`) | the bulk of the ~200 `append_in_tx` sites | Inherit the caller's serialization; classified by their caller, which is Handle-routed or CLI. |
@@ -138,7 +138,7 @@ Every audit-append call site in runtime code (`apps/`, `modules/`, `crates/`, ex
 
 **"You disabled the checkpoint in the exclusion test — are you testing production?"** No, and deliberately: with the checkpoint on, the assertion passed under mutation purely on checkpoint time. The test isolates lock-wait. Production posture is covered by the existing `handle_concurrency_e2e.rs` suite and by the end-to-end `verify_chain` race in the same file, which runs with defaults.
 
-**"The `.write()` barrier token would also match `RwLock::write()`."** It would. It is only ever consulted on a definition that already reaches an append, so a lock-only `.write()` in a non-appending fn is inert. A fn that both takes an `RwLock` write guard and appends via an independent opener would be mis-cleared; none exists today (all 101 barrier sites were listed and reviewed), and CHECK 10M still covers the same-fn case independently.
+**"The `.write()` barrier token would also match `RwLock::write()`."** It would. It is only ever consulted on a definition that already reaches an append, so a lock-only `.write()` in a non-appending fn is inert. A fn that both takes an `RwLock` write guard and appends via an independent opener would be mis-cleared. The full barrier list is emitted on demand (`-v show_barriers=1`) and was read as a set — every entry is a recognisable ADR-0099-migrated audit sink (`*::append_event`, `write_*_audit`, `emit_*_audit`, `ledger_writer::try_write_once`), with no `RwLock`-shaped outlier. It was **not** line-by-line audited across all 101, so this is a reviewed shape, not a proof. CHECK 10M still covers the same-fn case independently.
 
 **"You changed frozen baselines — is that a weakening?"** Two, both shrinks, both forced by removing openers: `adr0098_r4_opener_fingerprints.txt` loses the 2 migrated `Ledger::open` lines (100 → 98), and `adr0098_c2_frozen_residuals.txt` tightens `serve.rs` 30 → 29 and drops `audit_dap_boot.rs` entirely. Dropping the file's line is strictly *stronger*: a re-added opener there now fails as "NEW unaccounted opener-bearing file". No count was raised.
 

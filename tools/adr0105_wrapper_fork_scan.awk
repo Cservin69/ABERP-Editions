@@ -116,17 +116,25 @@ function flush(   ){
     DOPEN[ndef]=cur_open ? cur_open_ln : 0
     DAPP[ndef]=cur_app; DCALLS[ndef]=cur_calls; DHANDLE[ndef]=cur_handle
     DESCTO[ndef]=cur_escto; DRECV[ndef]=cur_recv
-    DEFCOUNT[cur_fn]++; DEFIDX[cur_fn]=ndef
+    DTEST[ndef]=cur_istest
+    # A #[cfg(test)] fn must NOT enter the resolution index. Its body is skipped
+    # (so it can never be tainted), but leaving its NAME in the index lets a test
+    # helper shadow the runtime definition it shares a name with: same-file
+    # resolution sees 2 and gives up, and — the real hazard — a name whose only
+    # in-corpus definition is a test fn would resolve to an untainted record and
+    # silently UNDER-report. Test defs are still recorded (so brace/flush
+    # bookkeeping is unchanged) but are invisible to resolve().
+    if (!cur_istest) { DEFCOUNT[cur_fn]++; DEFIDX[cur_fn]=ndef }
     # Same-FILE index. Rust resolves an unqualified call to the enclosing
     # module first, so a same-file definition is the callee with very high
     # confidence — this is what disambiguates the several private helpers that
     # share a name across files (`write_attempt_audit` exists in both
     # submit_invoice.rs and drain_submission_queue.rs, `write_check_performed_audit`
     # in both retry_submission.rs and drain_pending_retries.rs).
-    FCOUNT[cur_file SUBSEP cur_fn]++; FIDX[cur_file SUBSEP cur_fn]=ndef
+    if (!cur_istest) { FCOUNT[cur_file SUBSEP cur_fn]++; FIDX[cur_file SUBSEP cur_fn]=ndef }
   }
   cur_open=0; cur_app=0; cur_open_ln=0; cur_calls=""; cur_handle=0
-  cur_openvars=""; cur_escto=""; cur_recv=""; pending_call=""; cdepth=0
+  cur_openvars=""; cur_escto=""; cur_recv=""; pending_call=""; cdepth=0; cur_istest=0
 }
 
 # Per-file reset — brace/comment state must not leak across files.
@@ -139,6 +147,7 @@ FNR==1 { flush(); cur_fn=""; depth=0; tdepth=-1; pending=0; inblk=0; instr=0; fn
     if (fn_depth<0 || depth<=fn_depth) {
       flush()
       f=substr(line,RSTART,RLENGTH); sub(/.*fn[ \t]+/,"",f); cur_fn=f; cur_file=FILENAME; fn_pending=1
+      cur_istest=(tdepth>=0)   # declared inside a #[cfg(test)] block
       # The declaration line's own `name(` must NOT be collected as a callee —
       # it would make every fn appear to call itself and report `via=<itself>`
       # instead of the real wrapper.
