@@ -28717,26 +28717,35 @@ fn spawn_dap_audit_chain(
         .wait()
         .map_err(|e| anyhow!("binary hash unavailable for DÁP audit boot: {e}"))?;
     let tenant = recovery_state.tenant.clone();
-    let db_path = (*recovery_state.db_path).clone();
 
     let service_key = crate::audit_dap_boot::load_or_provision_service_key(tenant.as_str())?;
     let actor = Actor::from_local_cli(Ulid::new().to_string(), "system:audit-service");
 
     // Open the service session BEFORE serving (ADR-0088: no daemon precedes
-    // its session open) on a short-lived ledger handle, then drop it.
-    let mut ledger = aberp_audit_ledger::Ledger::open(&db_path, tenant.clone(), binary_hash)
-        .map_err(|e| anyhow!("open ledger for DÁP service session: {e}"))?;
+    // its session open).
+    //
+    // ADR-0105 — this runs through the SHARED handle, not a short-lived
+    // `Ledger::open`. `open_tenant_handle` has already run by the time
+    // `spawn_dap_audit_chain` is called, so the pre-fix code opened a SECOND
+    // DuckDB instance on the live file (ADR-0098 Gap 1a) and put its appends in
+    // the `AUDIT_APPEND_LOCK` domain, disjoint from the handle-mutex domain
+    // every other writer uses. CHECK 10M could not see it: the appends are
+    // wrapper-hidden inside `open_service_session_and_recover`.
     let tsa = aberp_audit_ledger::session::tsa::MockTimestampAuthority::new();
-    let service = crate::audit_dap_boot::open_service_session_and_recover(
-        &mut ledger,
-        &tsa,
-        actor.clone(),
-        service_key,
-    )?;
-    drop(ledger);
+    let service = recovery_state
+        .db
+        .with_ledger(binary_hash, |ledger| {
+            crate::audit_dap_boot::open_service_session_and_recover(
+                ledger,
+                &tsa,
+                actor.clone(),
+                service_key,
+            )
+        })
+        .map_err(|e| anyhow!("shared writer for DÁP service session: {e}"))??;
 
     let deps = crate::audit_dap_boot::HeartbeatDeps {
-        db_path,
+        db: recovery_state.db.clone(),
         tenant,
         binary_hash,
         actor,

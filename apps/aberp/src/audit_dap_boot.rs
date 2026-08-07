@@ -17,7 +17,6 @@
 //! network-free and unit-tested; the keychain load and the Tokio actor are
 //! thin shells around it.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use aes_gcm::aead::rand_core::RngCore;
@@ -115,8 +114,14 @@ pub fn open_service_session_and_recover(
 }
 
 /// Dependencies for the heartbeat actor.
+///
+/// ADR-0105 — carries the shared [`aberp_db::HandleArc`], not a `db_path`. The
+/// pre-fix actor did its own `Ledger::open` per cycle, which put its append in
+/// the `AUDIT_APPEND_LOCK` domain while every other `serve` writer sits in the
+/// handle-mutex domain; the two do not exclude each other, so the chain could
+/// fork. See [`aberp_db::Handle::with_ledger`].
 pub struct HeartbeatDeps {
-    pub db_path: PathBuf,
+    pub db: aberp_db::HandleArc,
     pub tenant: TenantId,
     pub binary_hash: BinaryHash,
     pub actor: Actor,
@@ -139,8 +144,8 @@ pub async fn run_heartbeat_supervised(deps: HeartbeatDeps, cancel: CancellationT
         _ = tokio::time::sleep(Duration::from_secs(HEARTBEAT_BOOT_DELAY_SECS)) => {}
     }
     let HeartbeatDeps {
-        db_path,
-        tenant,
+        db,
+        tenant: _tenant,
         binary_hash,
         actor,
         mut service,
@@ -150,18 +155,26 @@ pub async fn run_heartbeat_supervised(deps: HeartbeatDeps, cancel: CancellationT
         if cancel.is_cancelled() {
             return;
         }
-        let db = db_path.clone();
-        let tn = tenant.clone();
+        let handle = db.clone();
         let act = actor.clone();
         // Move the service ctx into the blocking task and ALWAYS return it
         // (even on error) so the loop keeps its signing key across cycles.
         let outcome = tokio::task::spawn_blocking(move || {
             let res = (|| -> Result<()> {
-                let mut ledger = Ledger::open(&db, tn, binary_hash)
-                    .map_err(|e| anyhow!("reopen ledger for heartbeat: {e}"))?;
-                let tsa = MockTimestampAuthority::new();
-                heartbeat(&mut ledger, &tsa, act, &service)
-                    .map_err(|e| anyhow!("take heartbeat anchor: {e}"))?;
+                // ADR-0105 — the anchor + its signed audit entry run INSIDE the
+                // shared handle's writer guard, so this actor can no longer
+                // interleave with a handle-routed writer and fork the chain.
+                // `with_ledger` hands out a `try_clone` of the ONE instance, so
+                // this is also no longer a second `Database` on the live file
+                // (ADR-0098 Gap 1a). Blocking by construction: `with_ledger`
+                // parks on the writer mutex, hence `spawn_blocking`.
+                handle
+                    .with_ledger(binary_hash, |ledger| {
+                        let tsa = MockTimestampAuthority::new();
+                        heartbeat(ledger, &tsa, act, &service)
+                            .map_err(|e| anyhow!("take heartbeat anchor: {e}"))
+                    })
+                    .map_err(|e| anyhow!("shared writer for heartbeat anchor: {e}"))??;
                 Ok(())
             })();
             (service, res)
