@@ -754,7 +754,7 @@ R7_FN_AWK
     if [[ ! -f "$file" ]]; then flag10L "✗ R7 seam file missing: $file"; return; fi
     body="$(awk -v fn="$fn" -f "$r7_extract" "$file")"
     if [[ -z "$body" ]]; then flag10L "✗ R7 seam fn not found: $file::$fn (renamed? update CHECK 10L)"; return; fi
-    opn="$(printf '%s\n' "$body" | grep -nE '(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open|Database::open)\(|append_reopen[[:space:]]*\(' | grep -vE 'open_in_memory|from_connection' || true)"
+    opn="$(printf '%s\n' "$body" | grep -nE '(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open|Database::open)\(|append_reopen[[:space:]]*\(' | grep -vE 'open_in_memory' || true)"
     if [[ -n "$opn" ]]; then
       flag10L "✗ $file::$fn REGREW an independent live-DB opener — the ADR-0098 R7 boot re-fork seam must stay on the shared Handle (db.write()):"
       printf '%s\n' "$opn" | sed 's/^/      /'
@@ -1091,7 +1091,12 @@ else
     # 10N-a — DIRECT is 10M's own class and must be empty here.
     tf_direct="$(grep ':DIRECT:' "$tf_raw" || true)"
     if [[ -n "$tf_direct" ]]; then
-      flag10N "✗ ADR-0105 reports a DIRECT (same-fn) write-fork that CHECK 10M did not — the two scanners disagree, which is a harness fault:"
+      # Worded so it is accurate whether or not 10M also fired: this check does
+      # not (and cannot cheaply) verify 10M's verdict for the same site, so it
+      # must not assert one. If 10M above IS silent for this site the scanners
+      # genuinely disagree; if 10M also fired, this is simply the same real fork
+      # reported twice.
+      flag10N "✗ ADR-0105 reports a DIRECT (same-fn) write-fork. CHECK 10M covers this class — if 10M above is SILENT for the same site the two scanners disagree (HARNESS FAULT); if 10M also flagged it, fix the fork:"
       printf '%s\n' "$tf_direct" | sed 's/^/      /'
     else
       note "✓ no DIRECT write-fork (agrees with CHECK 10M)"

@@ -3,7 +3,8 @@
 # #[cfg(test)]) function that contains BOTH:
 #   (1) an INDEPENDENT live-DB opener — Connection::open(_with_flags)? /
 #       Ledger::open / DuckDbBillingStore::open / Database::open / append_reopen
-#       (open_in_memory & from_connection excluded: the sanctioned shared-instance
+#       (open_in_memory excluded: the sanctioned shared-instance seam.
+#       from_connection is NOT excluded — ADR-0105 F1: line-scoped laundering.
 #        seams), AND
 #   (2) a `.sync_mirror(` call.
 # That pair IS the write-fork signature the 415/416 forensic named: a separate
@@ -47,7 +48,7 @@ BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0; curfn=""; curfn_depth=-1
   }
   intest=(tdepth>=0)
   if(!intest && curfn!=""){
-    if((code ~ /(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open|Database::open)\(/ || code ~ /append_reopen[ \t]*\(/) && code !~ /open_in_memory/ && code !~ /from_connection/) has_open=1
+    if((code ~ /(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open|Database::open)\(/ || code ~ /append_reopen[ \t]*\(/) && code !~ /open_in_memory/) has_open=1
     if(code ~ /sync_mirror[ \t]*\(/) has_mirror=1
   }
 }

@@ -186,11 +186,14 @@ FNR==1 { flush(); cur_fn=""; depth=0; tdepth=-1; pending=0; inblk=0; instr=0; fn
   now_in=(tdepth>=0); intest = was_in || now_in
   if (intest || cur_fn=="") next
 
-  # INDEPENDENT live-DB opener? (identical token set to the 10M scanner —
-  # open_in_memory / from_connection are the sanctioned shared-instance seams)
+  # INDEPENDENT live-DB opener? (identical token set to the 10M scanner.
+  # open_in_memory is the sanctioned shared-instance seam. `from_connection` is
+  # deliberately NOT excluded — ADR-0105 F1: the exclusion was LINE-scoped, so
+  # `Ledger::from_connection(Connection::open(p)?, ..)` laundered a real
+  # independent opener past every scanner in the tree.)
   if ((code ~ /(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open|Database::open)\(/ \
        || code ~ /append_reopen[ \t]*\(/) \
-      && code !~ /open_in_memory/ && code !~ /from_connection/) {
+      && code !~ /open_in_memory/) {
     if(!cur_open){ cur_open=1; cur_open_ln=FNR }
     # Bind the opened value's variable so we can ask the decisive question
     # later: does THIS connection actually reach the append? Two shapes cover

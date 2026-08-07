@@ -15,7 +15,9 @@
 #   • an INDEPENDENT live-DB opener — one of
 #       Connection::open(_with_flags)? / Ledger::open / DuckDbBillingStore::open /
 #       Database::open / append_reopen(               (open_in_memory &
-#       from_connection are the sanctioned shared-instance seams, excluded), AND
+#       is the sanctioned shared-instance seam, excluded; `from_connection` is
+#       NOT excluded — see ADR-0105 F1: a line-scoped exclusion laundered a real
+#       `Connection::open` hidden on the same line), AND
 #   • an AUDIT APPEND —
 #       .append( / .append_signed( / append_in_tx( / append_in_tx_signed( /
 #       append_reopen(                                (append_reopen is itself
@@ -79,7 +81,7 @@ function flush(   ){
   # opener?
   if ((code ~ /(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open|Database::open)\(/ \
        || code ~ /append_reopen[ \t]*\(/) \
-      && code !~ /open_in_memory/ && code !~ /from_connection/) {
+      && code !~ /open_in_memory/) {
     if(!cur_open){ cur_open=1; cur_open_ln=NR }
   }
   # append?

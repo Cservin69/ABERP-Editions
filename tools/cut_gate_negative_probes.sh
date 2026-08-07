@@ -538,6 +538,50 @@ else
   fi
 fi
 
+
+# ── ADR-0105 F1 — the `from_connection` LAUNDERING channel ────────────────────
+# Found by the PR #34 adversarial. EVERY opener scanner in the tree used to skip
+# any line containing the substring `from_connection`. The exclusion was
+# LINE-scoped, not call-scoped, so a genuinely independent `Connection::open`
+# hidden as an ARGUMENT on that same line became invisible to 10i / 10j / 10k /
+# 10L / 10M / 10N at once:
+#
+#     let mut l = Ledger::from_connection(Connection::open(p)?, tid(), bh());
+#     l.append(..);
+#
+# That is a DIRECT, same-fn write-fork. Severity was measured rather than
+# assumed: planted in serve.rs the pre-fix gate still went red, because CHECK 10
+# (the serve.rs-specific live-path opener scan) never carried the clause. But
+# planted ANYWHERE ELSE — quality.rs, crates/aberp-qa, and snapshot.rs, which
+# CHECK 10M-a holds at a hard ZERO — the pre-fix gate passed **in full**.
+#
+# So the probe plants in **snapshot.rs**: a zero-tolerance file where the bypass
+# was total, not one that another check happened to cover. The exclusion was a
+# proven no-op for its stated purpose (`Ledger::from_connection(` matches none
+# of the opener regexes, so it never suppressed a real record) and was removed;
+# this probe is what keeps it removed. It asserts the 10M-a zero-tolerance
+# signature specifically, so a partial re-introduction that leaves only the
+# opener freezes firing cannot pass unnoticed.
+echo "[ADR-0105 F1] a Connection::open LAUNDERED through Ledger::from_connection on one line — must be caught, not skipped"
+c="$(fresh)"
+printf '\npub fn _adr0105_f1_laundered_fork(p: &std::path::Path) -> anyhow::Result<()> {\n    let mut l = Ledger::from_connection(Connection::open(p)?, tid(), bh());\n    l.append(EventKind::Test, Vec::new(), actor(), None)?;\n    Ok(())\n}\n' >> "$c/apps/aberp/src/snapshot.rs"
+if ! assert_planted "$c"; then
+  printf '  ✗ HARNESS BUG: ADR-0105 F1 probe — the plant modified NOTHING.\n'; bad=$((bad+1))
+else
+  rc="$(gate_rc "$c")"
+  m_10m="$(grep -c 'snapshot.rs REGREW an in-process write-fork' "$c/.out" || true)"
+  m_open="$(grep -c 'grew its residual openers\|opener fingerprint set DIVERGED' "$c/.out" || true)"
+  if [[ "$rc" != "0" && "$m_10m" != "0" && "$m_open" != "0" ]]; then
+    printf '  ✓ caught: ADR-0105 F1 — from_connection line-laundering trips 10M-a (zero-tolerance) AND the opener freeze (exit=%s)\n' "$rc"; pass=$((pass+1))
+  elif [[ "$rc" == "0" ]]; then
+    printf '  ✗ ESCAPED: ADR-0105 F1 — a DIRECT write-fork laundered through from_connection passed the WHOLE gate. The line-scoped exclusion is back; remove it from every opener scanner (see ADR-0105 §5 F1).\n'
+    bad=$((bad+1))
+  else
+    printf '  ✗ ESCAPED (partial): ADR-0105 F1 — the gate failed but NOT on 10M-a (zero-tolerance=%s opener-freeze=%s). A subset of the scanners still skips the laundered line.\n' "$m_10m" "$m_open"
+    sed 's/^/        /' "$c/.out"; bad=$((bad+1))
+  fi
+fi
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi
