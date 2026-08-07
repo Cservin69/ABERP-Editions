@@ -24,16 +24,32 @@ jobs:
   db-isolation:
     name: ADR-0093 DB-isolation cut-gate
     runs-on: ubuntu-latest
-    # ADR-0098 R6: raised 5 -> 15. The gate itself still runs in seconds, but the
-    # negative-probe harness (tools/cut_gate_negative_probes.sh) fresh()-copies the
-    # whole tree once per probe and re-runs the full gate each time; with the R6
-    # CHECK-10j/crates probe added it now runs ~5 min, which repeatedly grazed the
-    # old 5-min cap and got the job CANCELLED (a false red on a REQUIRED check, and
-    # a red on main since this workflow also runs on push:main). Pure timeout
-    # accommodation — every ENFORCE_* check still runs in full and must pass (no
-    # de-gate). FLAG (v0.2.6): speed up fresh() (git-archive/worktree copy) so the
-    # suite is comfortably fast again.
-    timeout-minutes: 15
+    # ADR-0098 R6: raised 5 -> 15. ADR-0105: raised 15 -> 30.
+    #
+    # The gate itself runs in ~15 s. The cost is the negative-probe harness
+    # (tools/cut_gate_negative_probes.sh), which fresh()-copies the whole tree
+    # once per probe and re-runs the full gate each time.
+    #
+    # MEASURED on this runner (job 92868392762, 2026-08-07), not estimated:
+    # **17.5 s per probe**, 46 probes -> ~13.4 min, job total **14 m 32 s**
+    # against the old 15-min cap — a ~28-second margin. The "~5 min" figure in
+    # the previous version of this comment was stale by a wide margin: the suite
+    # was already at ~12.3 min (41 probes) BEFORE the 5 ADR-0105 CHECK-10N
+    # probes were added, so it had been running one slow runner away from the cap
+    # for some time. That is precisely the failure this comment already records:
+    # the job gets CANCELLED, which is a false red on a REQUIRED check (and a red
+    # on main, since this workflow also runs on push:main).
+    #
+    # Pure timeout accommodation — every ENFORCE_* check still runs in full and
+    # must pass. No de-gate, no probe skipped.
+    #
+    # FLAG (v0.2.6), now load-bearing rather than nice-to-have: the harness is
+    # O(probes x full-tree-copy + full-gate-run). Speeding up fresh() (git
+    # archive / a shared worktree, or a single copy reused read-only with the
+    # plant applied via overlay) would take this back to a couple of minutes and
+    # remove the standing cap risk. Until then, every new probe costs ~17.5 s and
+    # the cap must be re-checked when probes are added.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
