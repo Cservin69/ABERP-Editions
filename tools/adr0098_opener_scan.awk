@@ -7,7 +7,15 @@
 #   `use ... <OpenerType> as <Alias>;`) rename followed by `<Alias>::open(` is
 #   now caught too. Aliases of Connection / Ledger / DuckDbBillingStore /
 #   Database are tracked per file and matched as `<Alias>::open(_with_flags)?(`.
-# EXCLUDED (the sanctioned shared-instance seams): open_in_memory, from_connection.
+# EXCLUDED (the sanctioned shared-instance seam): open_in_memory.
+#
+# `from_connection` USED to be excluded here too. It was removed (ADR-0105 F1):
+# the exclusion was LINE-scoped, not call-scoped, so
+#     let mut l = Ledger::from_connection(Connection::open(p)?, tid(), bh());
+# laundered a genuinely independent `Connection::open` past EVERY opener scanner
+# in the tree. Dropping the clause is a proven NO-OP on the clean tree —
+# `Ledger::from_connection(` matches none of the opener regexes above, so it
+# never suppressed a real record; it only ever suppressed the laundered ones.
 # Boot/allow-listed fn names may be passed via -v allow="fn1,fn2".
 # Strings, // line comments and /* */ block comments are skipped so a banned
 # token inside a doc-comment or string never trips the scan.
@@ -55,11 +63,11 @@ function is_allowed(name,   k){ for(k=1;k<=n_allow;k++) if(A[k]==name) return 1;
     hit=0
     if ((code ~ /(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open|Database::open)\(/ \
          || code ~ /append_reopen[ \t]*\(/) \
-        && code !~ /open_in_memory/ && code !~ /from_connection/) {
+        && code !~ /open_in_memory/) {
       hit=1
     }
     # R4 (b): aliased open — `<Alias>::open(` / `<Alias>::open_with_flags(`.
-    if (!hit && code !~ /open_in_memory/ && code !~ /from_connection/) {
+    if (!hit && code !~ /open_in_memory/) {
       for (a in ALIAS) {
         if (code ~ (a "::open(_with_flags)?[ \t]*\\(")) { hit=1; break }
       }

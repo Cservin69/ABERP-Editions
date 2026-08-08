@@ -49,7 +49,24 @@ jobs:
   workspace:
     name: ${{ matrix.edition }} · build + lint + test
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # ADR-0105: raised 60 -> 90.
+    #
+    # This job ALSO runs the negative-probe harness (as its fail-fast first
+    # step), so it carries the same ~17.5 s/probe cost as cut-gate.yml — the
+    # suite runs TWICE per PR, once in each workflow.
+    #
+    # MEASURED on this repo's own history: the ci run for PR #33 took **59 min
+    # against this 60-min cap**, and PR #29 was **CANCELLED at exactly 60**.
+    # Warm-cache runs sit at 25-28 min; the 59-min case is a cold/evicted cargo
+    # cache (see the portable-arm wedge this workflow already documents). Adding
+    # the 5 ADR-0105 probes puts ~1.5 min more on a job with a recorded
+    # cancellation at the cap, and a cancelled job is a FALSE RED on a required
+    # check — indistinguishable from a real regression.
+    #
+    # Pure timeout accommodation: no step skipped, no lint relaxed, no
+    # `continue-on-error`. Speeding up the probe harness (the v0.2.6 FLAG in
+    # cut-gate.yml) is what would actually reclaim the headroom.
+    timeout-minutes: 90
     strategy:
       # Defense-only from 2026-08-04: this repository's CI builds the Defense
       # line alone. The Portable line lives in ABERP.git per the architecture,
@@ -190,6 +207,16 @@ jobs:
       # crate tests below).
       - name: ADR-0098 DuckDB Handle e2e (assertion #1 + concurrency)
         run: cargo test -p aberp-db --test handle_concurrency_e2e --locked -- --nocapture
+
+      # ADR-0105 — same rationale as the step above: this is the acceptance proof
+      # that the two audit-append lock domains (the Handle writer mutex and the
+      # audit-ledger AUDIT_APPEND_LOCK) can no longer interleave and fork the
+      # hash chain. Surfaced explicitly, before the broad workspace Test, so the
+      # verdict is visible even if a later step fails. Single-threaded: the
+      # mutual-exclusion guard measures lock WAIT, and cargo's default parallel
+      # test threads add scheduler noise to that measurement.
+      - name: ADR-0105 audit lock-domain e2e (cross-domain fork)
+        run: cargo test -p aberp-db --test audit_lock_domain_e2e --locked -- --nocapture --test-threads=1
 
       - name: Test (${{ matrix.edition }}, --locked)
         run: cargo test --workspace --locked ${{ matrix.features }}

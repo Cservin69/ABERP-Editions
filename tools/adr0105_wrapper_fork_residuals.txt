@@ -1,0 +1,71 @@
+# ADR-0105 — FROZEN TRANSITIVE (wrapper-hidden) write-fork residual ledger.
+# Cut-gate CHECK 10N-b. May only SHRINK.
+#
+# Format: <file>:<fname>   (line numbers deliberately dropped so a benign shift
+# never churns this file — same posture as CHECK 10k / the ADR-0099 manifest.)
+#
+# A record here is a RUNTIME fn that holds an INDEPENDENT live-DB opener whose
+# opened value reaches an audit append THROUGH A WRAPPER — the class CHECK 10M
+# is structurally blind to, because 10M requires the opener token and the append
+# token to sit in the SAME function body. Detector:
+# tools/adr0105_wrapper_fork_scan.awk (whole-program taint closure over fn
+# definitions; comment/string/char-literal aware).
+#
+# ── WHY THIS FILE EXISTS ────────────────────────────────────────────────────
+# CHECK 10M returned NOTHING for the pre-PR-33 aberp-mes writer, whose append
+# hid one call away in `write_mes_adapter_event`, and it returned NOTHING for
+# BOTH DÁP audit writers on `main` @ 9723df3 — including one inside serve.rs,
+# where 10M-a demands a hard ZERO. 10M-a passed anyway. The blind spot was not
+# theoretical; it was hiding live forks.
+#
+# ── CLOSED IN THIS ADR (were UNGUARDED in-process, now Handle-routed) ───────
+#   • serve.rs::spawn_dap_audit_chain        — opened a SECOND Ledger on the live
+#     DB (after open_tenant_handle had already run) and appended through
+#     `open_service_session_and_recover` → `open_service_session` →
+#     `Ledger::append_signed`. Now `recovery_state.db.with_ledger(..)`.
+#   • audit_dap_boot.rs::run_heartbeat_supervised — re-opened a Ledger EVERY
+#     cycle and appended through `session::heartbeat` → `Ledger::append_signed`.
+#     Now `HeartbeatDeps.db.with_ledger(..)`; `HeartbeatDeps` carries the
+#     HandleArc instead of a db_path.
+# Both were in the `AUDIT_APPEND_LOCK` domain while every other serve writer is
+# in the handle-mutex domain — disjoint locks, so they could fork the chain
+# against any handle-routed writer (ADR-0105 §2, proved in
+# crates/aberp-db/tests/audit_lock_domain_e2e.rs).
+#
+# ── THE FROZEN SET ─────────────────────────────────────────────────────────
+# ONE entry, and it is a SEPARATE-PROCESS CLI one-shot, not an in-process fork:
+#
+#   `aberp drain-submission-queue` is reached ONLY via
+#   main.rs → cli::Command::DrainSubmissionQueue → drain_submission_queue::run.
+#   There is no `aberp serve` in that process and therefore no shared Handle to
+#   route through, so its own `Connection::open` cannot race a handle-routed
+#   writer. Same sanctioned class as ADR-0099's `emit_reopen_cli` /
+#   `emit_tenant_reopen`. Cross-PROCESS races (a CLI subcommand run while
+#   `serve` is up) are outside ANY in-process lock and remain backstopped by the
+#   hash chain's detection — the standing S335 §3.4 limitation, unchanged here.
+#
+#   It is listed rather than allow-listed because the allow-list matches on fn
+#   NAME, and `drive_one_invoice` is not a name we want globally exempt: an
+#   in-process fn of that name added later must fail the build.
+#
+apps/aberp/src/drain_submission_queue.rs:drive_one_invoice
+#
+# ── NOT LISTED, and why (verified, not assumed) ────────────────────────────
+# These hold an independent opener AND call something that can reach an append,
+# but are NOT forks; the scanner clears them structurally, and each was read by
+# hand to confirm the structural verdict matches the code:
+#   • Handle-routed appenders (89 in this corpus; 101 including the aberp-db /
+#     aberp-snapshot shared-Handle seams — see ADR-0105 §3.1 for the measuring
+#     command. e.g. quality::append_event,
+#     purchasing::append_event, mes ledger_writer::try_write_once). They take
+#     `db.write()` THEMSELVES, so the caller's opener is irrelevant to the audit
+#     chain. Their callers (e.g. quality::create_ncr) keep an independent
+#     `Connection::open` for the BUSINESS row — a frozen CHECK 10i/10k opener,
+#     a different concern from a write-fork.
+#   • Openers whose value only feeds a post-commit `sync_mirror`, never an
+#     append: retry_submission::perform_layer_2_check,
+#     serve::create_stock_movement_request, serve::sync_audit_mirror_best_effort.
+#   • Openers whose value feeds a READ helper while the append runs on the
+#     Handle guard: serve::pickup_quote_as_draft_request (its independent
+#     `Ledger::open` feeds `count_prior_pickups`; the append goes through
+#     `db.write()`).

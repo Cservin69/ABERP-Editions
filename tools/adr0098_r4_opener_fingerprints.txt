@@ -21,7 +21,6 @@
 #    removed derive_nav_invoice_number (DuckDbBillingStore::open dropped in
 #    retry_submission + recover_from_nav too). The opener set SHRANK by 10;
 #    this pin is refreshed to the new (smaller) reality.
-apps/aberp/src/audit_dap_boot.rs|run_heartbeat_supervised:let mut ledger = Ledger::open(&db, tn, binary_hash)
 apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let ledger = Ledger::open(db_path, tenant, binary_hash_bytes).map_err(|e| {
 apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let ledger = Ledger::open(db_path, tenant, binary_hash_bytes).map_err(|e| {
 apps/aberp/src/drain_submission_queue.rs|drive_one_invoice:let ledger_tx1 = Ledger::open(db_path, tenant.clone(), binary_hash_bytes).ma
@@ -109,7 +108,6 @@ apps/aberp/src/serve.rs|quote_intake_auth_paused:let ledger = Ledger::open(&*sta
 apps/aberp/src/serve.rs|record_upgrade_snapshot_mismatch_audit:let mut ledger = Ledger::open(db_path, tenant, binary_hash)
 apps/aberp/src/serve.rs|resolve_customer_identity:let ledger = Ledger::open(
 apps/aberp/src/serve.rs|resolve_invoice_xml_path:let ledger = Ledger::open(
-apps/aberp/src/serve.rs|spawn_dap_audit_chain:let mut ledger = aberp_audit_ledger::Ledger::open(&db_path, tenant.clone(), 
 apps/aberp/src/serve.rs|sync_audit_mirror_best_effort:if let Ok(ledger) = Ledger::open(db_path, tenant, binary_hash) {
 apps/aberp/src/snapshot.rs|emit_reopen_cli:let mut ledger = Ledger::open(db_path, tenant.clone(), binary_hash)
 apps/aberp/src/submit_annulment.rs|run:let ledger = Ledger::open(&args.db, tenant, binary_hash_bytes)

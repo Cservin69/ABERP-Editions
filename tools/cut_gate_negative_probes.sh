@@ -469,6 +469,119 @@ c="$(fresh)"
 printf '\n#[cfg(test)]\nmod adr0099_test_probe {\n    fn t(p: &std::path::Path, tn: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n        let mut l = aberp_audit_ledger::Ledger::open(p, tn, bh).unwrap();\n        let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n    }\n}\n' >> "$c/apps/aberp/src/serve.rs"
 expect_pass "$c" "CHECK 10M — a Ledger::open+append inside #[cfg(test)] is correctly IGNORED (10M is cfg(test)-aware)"
 
+
+# ── CHECK 10N — ADR-0105 wrapper-hidden write-fork ────────────────────────────
+# THE probe for this ADR: the exact pre-PR-33 aberp-mes shape — an independent
+# opener in one fn, the audit append hidden one call away in a helper. CHECK 10M
+# cannot see it (that is the whole point); CHECK 10N must.
+
+echo "[CHECK 10N] the pre-PR-33 WRAPPER-HIDDEN fork (opener here, append one call away) — 10N must go red"
+c="$(fresh)"
+printf '\nfn _adr0105_probe_wrapper_fork(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    _adr0105_probe_hidden_append(&mut l);\n}\nfn _adr0105_probe_hidden_append(l: &mut aberp_audit_ledger::Ledger) {\n    let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' > "$c/apps/aberp/src/zz_adr0105_probe_wrapper.rs"
+expect_fail "$c" "a NEW/REGROWN WRAPPER-HIDDEN write-fork" "CHECK 10N-b — an opener whose append hides ONE level down in a helper is caught"
+
+echo "[CHECK 10N] the same fork hidden TWO wrapper levels down — the taint closure must still reach it"
+c="$(fresh)"
+printf '\nfn _adr0105_probe_deep_fork(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    _adr0105_probe_mid(&mut l);\n}\nfn _adr0105_probe_mid(l: &mut aberp_audit_ledger::Ledger) {\n    _adr0105_probe_deep_append(l);\n}\nfn _adr0105_probe_deep_append(l: &mut aberp_audit_ledger::Ledger) {\n    let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' > "$c/apps/aberp/src/zz_adr0105_probe_deep.rs"
+expect_fail "$c" "a NEW/REGROWN WRAPPER-HIDDEN write-fork" "CHECK 10N-b — N-level (2-deep) wrapper indirection is caught by the taint closure"
+
+# This one pins the BLIND SPOT itself. If a future change teaches CHECK 10M to
+# see through wrappers, this probe flips to a HARNESS BUG report — which is
+# correct: the blind spot 10N exists to cover would have closed, and that should
+# be a deliberate, visible decision rather than a silent overlap.
+echo "[CHECK 10N] the wrapper-hidden fork planted in snapshot.rs — 10M-a (ZERO-tolerance) does NOT see it; only 10N does"
+c="$(fresh)"
+printf '\nfn _adr0105_probe_blindspot(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    _adr0105_probe_blindspot_append(&mut l);\n}\nfn _adr0105_probe_blindspot_append(l: &mut aberp_audit_ledger::Ledger) {\n    let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' >> "$c/apps/aberp/src/snapshot.rs"
+if ! assert_planted "$c"; then
+  printf '  ✗ HARNESS BUG: CHECK 10N blind-spot probe — the plant modified NOTHING.\n'; bad=$((bad+1))
+else
+  rc="$(gate_rc "$c")"
+  m10m="$(grep -c 'snapshot.rs REGREW an in-process write-fork' "$c/.out" || true)"
+  m10n="$(grep -c 'WRAPPER-HIDDEN write-fork' "$c/.out" || true)"
+  if [[ "$rc" != "0" && "$m10m" == "0" && "$m10n" != "0" ]]; then
+    printf '  ✓ caught: CHECK 10N — wrapper-hidden fork in snapshot.rs caught by 10N while 10M-a stays blind (the documented gap)  (exit=%s)\n' "$rc"; pass=$((pass+1))
+  elif [[ "$rc" != "0" && "$m10m" != "0" ]]; then
+    printf '  ✗ HARNESS BUG: CHECK 10M-a now ALSO catches the wrapper-hidden fork — the ADR-0105 blind-spot premise no longer holds.\n'
+    printf '        Re-verify whether CHECK 10N is still needed, then update this probe deliberately.\n'; bad=$((bad+1))
+  else
+    printf '  ✗ ESCAPED: CHECK 10N — wrapper-hidden fork in snapshot.rs was NOT caught (exit=%s)\n' "$rc"
+    sed 's/^/        /' "$c/.out"; bad=$((bad+1))
+  fi
+fi
+
+echo "[CHECK 10N] a wrapper-hidden fork inside #[cfg(test)] must NOT trip 10N (cfg(test)-aware precision, no false-positive)"
+c="$(fresh)"
+printf '\n#[cfg(test)]\nmod adr0105_test_probe {\n    fn t(p: &std::path::Path, tn: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n        let mut l = aberp_audit_ledger::Ledger::open(p, tn, bh).unwrap();\n        hidden(&mut l);\n    }\n    fn hidden(l: &mut aberp_audit_ledger::Ledger) {\n        let _ = l.append(aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n    }\n}\n' >> "$c/apps/aberp/src/serve.rs"
+expect_pass "$c" "CHECK 10N — a wrapper-hidden fork inside #[cfg(test)] is correctly IGNORED (10N is cfg(test)-aware)"
+
+# Precision probe for the Handle barrier. NOTE the assertion shape: this canNOT
+# be an `expect_pass`. Any plant that introduces a new opener necessarily trips
+# CHECK 10i ("NEW unaccounted opener-bearing file") and CHECK 10k (the
+# per-opener fingerprint freeze), so the gate is *expected* to fail here — just
+# not for a 10N reason. The claim under test is therefore "10N stayed silent",
+# which is an ABSENCE assertion, not a gate-exit assertion.
+echo "[CHECK 10N] an opener whose helper routes through the shared Handle must NOT trip 10N (Handle barrier, no false-positive)"
+c="$(fresh)"
+printf '\nfn _adr0105_probe_handle_routed(p: &std::path::Path, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash, db: &aberp_db::HandleArc) {\n    let mut l = aberp_audit_ledger::Ledger::open(p, t, bh).unwrap();\n    _adr0105_probe_handle_append(db, &mut l);\n}\nfn _adr0105_probe_handle_append(db: &aberp_db::HandleArc, _l: &mut aberp_audit_ledger::Ledger) {\n    let mut g = db.write().unwrap();\n    let tx = g.transaction().unwrap();\n    let _ = aberp_audit_ledger::append_in_tx(&tx, todo!(), aberp_audit_ledger::EventKind::Test, vec![], todo!(), None);\n}\n' > "$c/apps/aberp/src/zz_adr0105_probe_handle.rs"
+if ! assert_planted "$c"; then
+  printf '  ✗ HARNESS BUG: CHECK 10N Handle-barrier probe — the plant modified NOTHING.\n'; bad=$((bad+1))
+else
+  rc="$(gate_rc "$c")"
+  if grep -q 'WRAPPER-HIDDEN write-fork' "$c/.out"; then
+    printf '  ✗ ESCAPED: CHECK 10N FALSE-POSITIVE — an append that takes the shared Handle itself was reported as a wrapper-hidden fork; the barrier rule is broken (every ADR-0099-migrated seam would fail).\n'
+    grep 'WRAPPER-HIDDEN' -A 3 "$c/.out" | sed 's/^/        /'; bad=$((bad+1))
+  elif grep -q 'NEW unaccounted opener-bearing file' "$c/.out"; then
+    printf '  ✓ CHECK 10N — an append that takes the shared Handle itself is correctly IGNORED (10N silent; the gate still fails on the CHECK 10i/10k opener freeze, as designed)  (exit=%s)\n' "$rc"; pass=$((pass+1))
+  else
+    printf '  ✗ HARNESS BUG: CHECK 10N Handle-barrier probe — neither the 10N signature NOR the expected CHECK 10i opener-freeze failure appeared; the probe is no longer exercising what it claims (exit=%s).\n' "$rc"
+    sed 's/^/        /' "$c/.out"; bad=$((bad+1))
+  fi
+fi
+
+
+# ── ADR-0105 F1 — the `from_connection` LAUNDERING channel ────────────────────
+# Found by the PR #34 adversarial. EVERY opener scanner in the tree used to skip
+# any line containing the substring `from_connection`. The exclusion was
+# LINE-scoped, not call-scoped, so a genuinely independent `Connection::open`
+# hidden as an ARGUMENT on that same line became invisible to 10i / 10j / 10k /
+# 10L / 10M / 10N at once:
+#
+#     let mut l = Ledger::from_connection(Connection::open(p)?, tid(), bh());
+#     l.append(..);
+#
+# That is a DIRECT, same-fn write-fork. Severity was measured rather than
+# assumed: planted in serve.rs the pre-fix gate still went red, because CHECK 10
+# (the serve.rs-specific live-path opener scan) never carried the clause. But
+# planted ANYWHERE ELSE — quality.rs, crates/aberp-qa, and snapshot.rs, which
+# CHECK 10M-a holds at a hard ZERO — the pre-fix gate passed **in full**.
+#
+# So the probe plants in **snapshot.rs**: a zero-tolerance file where the bypass
+# was total, not one that another check happened to cover. The exclusion was a
+# proven no-op for its stated purpose (`Ledger::from_connection(` matches none
+# of the opener regexes, so it never suppressed a real record) and was removed;
+# this probe is what keeps it removed. It asserts the 10M-a zero-tolerance
+# signature specifically, so a partial re-introduction that leaves only the
+# opener freezes firing cannot pass unnoticed.
+echo "[ADR-0105 F1] a Connection::open LAUNDERED through Ledger::from_connection on one line — must be caught, not skipped"
+c="$(fresh)"
+printf '\npub fn _adr0105_f1_laundered_fork(p: &std::path::Path) -> anyhow::Result<()> {\n    let mut l = Ledger::from_connection(Connection::open(p)?, tid(), bh());\n    l.append(EventKind::Test, Vec::new(), actor(), None)?;\n    Ok(())\n}\n' >> "$c/apps/aberp/src/snapshot.rs"
+if ! assert_planted "$c"; then
+  printf '  ✗ HARNESS BUG: ADR-0105 F1 probe — the plant modified NOTHING.\n'; bad=$((bad+1))
+else
+  rc="$(gate_rc "$c")"
+  m_10m="$(grep -c 'snapshot.rs REGREW an in-process write-fork' "$c/.out" || true)"
+  m_open="$(grep -c 'grew its residual openers\|opener fingerprint set DIVERGED' "$c/.out" || true)"
+  if [[ "$rc" != "0" && "$m_10m" != "0" && "$m_open" != "0" ]]; then
+    printf '  ✓ caught: ADR-0105 F1 — from_connection line-laundering trips 10M-a (zero-tolerance) AND the opener freeze (exit=%s)\n' "$rc"; pass=$((pass+1))
+  elif [[ "$rc" == "0" ]]; then
+    printf '  ✗ ESCAPED: ADR-0105 F1 — a DIRECT write-fork laundered through from_connection passed the WHOLE gate. The line-scoped exclusion is back; remove it from every opener scanner (see ADR-0105 §5 F1).\n'
+    bad=$((bad+1))
+  else
+    printf '  ✗ ESCAPED (partial): ADR-0105 F1 — the gate failed but NOT on 10M-a (zero-tolerance=%s opener-freeze=%s). A subset of the scanners still skips the laundered line.\n' "$m_10m" "$m_open"
+    sed 's/^/        /' "$c/.out"; bad=$((bad+1))
+  fi
+fi
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi

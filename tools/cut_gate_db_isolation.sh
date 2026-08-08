@@ -754,7 +754,7 @@ R7_FN_AWK
     if [[ ! -f "$file" ]]; then flag10L "✗ R7 seam file missing: $file"; return; fi
     body="$(awk -v fn="$fn" -f "$r7_extract" "$file")"
     if [[ -z "$body" ]]; then flag10L "✗ R7 seam fn not found: $file::$fn (renamed? update CHECK 10L)"; return; fi
-    opn="$(printf '%s\n' "$body" | grep -nE '(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open|Database::open)\(|append_reopen[[:space:]]*\(' | grep -vE 'open_in_memory|from_connection' || true)"
+    opn="$(printf '%s\n' "$body" | grep -nE '(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open|Database::open)\(|append_reopen[[:space:]]*\(' | grep -vE 'open_in_memory' || true)"
     if [[ -n "$opn" ]]; then
       flag10L "✗ $file::$fn REGREW an independent live-DB opener — the ADR-0098 R7 boot re-fork seam must stay on the shared Handle (db.write()):"
       printf '%s\n' "$opn" | sed 's/^/      /'
@@ -1018,6 +1018,116 @@ else
     note "✓ frozen write-fork residual holds (${wf_n:-0} sites; ADR-0099 COMPLETE — every in-process aberp-serve audit write-fork is on the shared Handle; a NEW/REGROWN fork anywhere fails here)"
   fi
   rm -f "$wf_cur" "$wf_froz"
+fi
+
+# ── CHECK 10N — ADR-0105: the WRAPPER-HIDDEN write-fork. CHECK 10M above is a
+#    per-FUNCTION scan: it fires only when the independent opener token and the
+#    audit-append token appear in the SAME fn body. That model is structurally
+#    blind to the most common real shape — the opener in one fn, the append one
+#    (or N) calls away in a helper:
+#
+#        fn tick()  { let mut l = Ledger::open(..); write_event(&mut l, ..); }
+#        fn write_event(l: &mut Ledger, ..) { l.append_signed(..) }
+#
+#    Neither fn trips 10M. This is not hypothetical: the pre-PR-33 aberp-mes
+#    writer had exactly this shape (`write_mes_adapter_event`) and scanned CLEAN
+#    while forking the chain in production, and on main @ 9723df3 BOTH DÁP audit
+#    writers were invisible to 10M — one of them inside serve.rs, where 10M-a
+#    demands a hard ZERO and was passing. The ADR-0099 manifest already recorded
+#    a third instance of the same miss (qc_inspection::record_manual_inspection).
+#
+#    10N does NOT replace or relax 10M — 10M keeps its exact semantics and its
+#    own frozen manifest. 10N adds the transitive teeth:
+#      • detector: tools/adr0105_wrapper_fork_scan.awk — a whole-program taint
+#        closure over fn DEFINITIONS (crossing crate boundaries, since the live
+#        case is apps/aberp calling into crates/audit-ledger), seeded at the
+#        append primitives, resolved same-file-first, stopping at any callee that
+#        takes the shared Handle itself (that IS the serialization point), and
+#        requiring the OPENED VALUE to actually reach the tainted callee.
+#      • 10N-a: DIRECT records must stay at ZERO (they are 10M's own class; a
+#        DIRECT hit here means 10M and 10N disagree — a harness fault).
+#      • 10N-b: the TRANSITIVE/AMBIGUOUS set is frozen in
+#        tools/adr0105_wrapper_fork_residuals.txt and may only SHRINK.
+#      • a non-converged taint closure (exit 3) is a HARNESS FAULT, never a pass.
+#    Teeth: cut_gate_negative_probes.sh "[CHECK 10N]" reintroduces the pre-PR-33
+#    wrapper-hidden fork and asserts this goes red (and that 10M does NOT — the
+#    probe pins the blind spot itself, so a future 10M that also catches it is a
+#    visible, deliberate change rather than a silent one).
+#    ENFORCE_WRAPPER_FORK=0 disables it for a deliberate, temporary local probe only.
+echo "[CHECK 10N] ADR-0105 — wrapper-hidden write-fork: transitive taint closure, DIRECT==0 + frozen residual may-only-shrink (ENFORCED · D5)"
+enforce10N="${ENFORCE_WRAPPER_FORK:-1}"
+flag10N() { note "$1"; if [[ "$enforce10N" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+tf_scan="tools/adr0105_wrapper_fork_scan.awk"
+tf_manifest="tools/adr0105_wrapper_fork_residuals.txt"
+# 10N deliberately shares CHECK 10M's sanctioned-fn set: same fork model, same
+# pre-serve boot openers and separate-process CLI seams. `:?` rather than a
+# duplicated literal — a copy would drift, and if the checks are ever reordered
+# so 10N runs first this aborts loudly instead of silently scanning with an
+# EMPTY allow-list (which would flag every boot opener and look like a code
+# regression rather than a harness fault).
+: "${WF_ALLOW:?CHECK 10N needs WF_ALLOW, defined by CHECK 10M — check ordering}"
+if [[ ! -f "$tf_scan" || ! -f "$tf_manifest" ]]; then
+  flag10N "✗ wrapper-fork scanner or frozen manifest missing: $tf_scan / $tf_manifest"
+else
+  tf_files="$(mktemp "${TMPDIR:-/tmp}/tf_files.XXXXXX")"
+  tf_raw="$(mktemp "${TMPDIR:-/tmp}/tf_raw.XXXXXX")"
+  tf_cur="$(mktemp "${TMPDIR:-/tmp}/tf_cur.XXXXXX")"
+  tf_froz="$(mktemp "${TMPDIR:-/tmp}/tf_froz.XXXXXX")"
+  # Same corpus as 10M-b: runtime sources only, minus the shared-Handle seams.
+  find apps/aberp/src modules crates -name '*.rs' \
+    | grep -vE '/tests/' \
+    | grep -vE '^crates/(aberp-db|aberp-snapshot)/' \
+    | sort > "$tf_files"
+  # `xargs`-free: the file list is passed as arguments in one shot. `set -e` is
+  # active, so capture the exit code explicitly to tell a non-converged closure
+  # (3 = harness fault) apart from a clean scan that simply found records.
+  tf_rc=0
+  awk -v allow="$WF_ALLOW" -v levels=12 -f "$tf_scan" $(cat "$tf_files") > "$tf_raw" 2>/dev/null || tf_rc=$?
+  if [[ "$tf_rc" -eq 3 ]]; then
+    flag10N "✗ ADR-0105 taint closure did NOT converge — the scan is WEAKER than a complete one; raise -v levels (HARNESS FAULT, not a code regression)"
+  elif [[ "$tf_rc" -ne 0 ]]; then
+    flag10N "✗ ADR-0105 wrapper-fork scanner errored (exit $tf_rc) — treat as a harness fault, do not ignore"
+  else
+    # 10N-a — DIRECT is 10M's own class and must be empty here.
+    tf_direct="$(grep ':DIRECT:' "$tf_raw" || true)"
+    if [[ -n "$tf_direct" ]]; then
+      # Worded so it is accurate whether or not 10M also fired: this check does
+      # not (and cannot cheaply) verify 10M's verdict for the same site, so it
+      # must not assert one. If 10M above IS silent for this site the scanners
+      # genuinely disagree; if 10M also fired, this is simply the same real fork
+      # reported twice.
+      flag10N "✗ ADR-0105 reports a DIRECT (same-fn) write-fork. CHECK 10M covers this class — if 10M above is SILENT for the same site the two scanners disagree (HARNESS FAULT); if 10M also flagged it, fix the fork:"
+      printf '%s\n' "$tf_direct" | sed 's/^/      /'
+    else
+      note "✓ no DIRECT write-fork (agrees with CHECK 10M)"
+    fi
+    # 10N-b — the frozen transitive/ambiguous set may only SHRINK.
+    # `cut`, NOT `sed 's/:\(A\|B\):.*//'` — BSD sed (macOS, where this gate is
+    # run by hand) has no BRE alternation, so that pattern silently matches
+    # NOTHING and every record stays fully-qualified, never matching the frozen
+    # key. Records are `<file>:<fn>:<CLASS>:opener@L<n>:via=<x>` and neither a
+    # path nor a Rust fn name can contain `:`, so fields 1-2 are the stable key.
+    cut -d: -f1,2 "$tf_raw" | sort -u > "$tf_cur"
+    grep -vE '^#' "$tf_manifest" | sed 's/[[:space:]]*#.*$//;s/[[:space:]]*$//' | grep -vE '^$' | sort -u > "$tf_froz" || true
+    tf_grew="$(comm -13 "$tf_froz" "$tf_cur")"
+    if [[ -n "$tf_grew" ]]; then
+      flag10N "✗ a NEW/REGROWN WRAPPER-HIDDEN write-fork appeared outside the frozen set — the opener's connection reaches an audit append through a helper; route it through the shared aberp_db::Handle (ADR-0105):"
+      printf '%s\n' "$tf_grew" | sed 's/^/      /'
+      printf '%s\n' "$tf_grew" | while IFS= read -r k; do
+        grep -F "$k:" "$tf_raw" | sed 's/^/        via: /'
+      done
+    fi
+    tf_shrunk="$(comm -23 "$tf_froz" "$tf_cur")"
+    if [[ -n "$tf_shrunk" ]]; then
+      note "  (info) wrapper-fork sites migrated off since freeze — refresh $tf_manifest to lock the smaller set:"
+      printf '%s\n' "$tf_shrunk" | sed 's/^/      /'
+    fi
+    if [[ -z "$tf_grew" ]]; then
+      tf_n="$(grep -vcE '^#' "$tf_manifest" || true)"
+      note "✓ frozen wrapper-fork residual holds (${tf_n:-0} site(s); the only entry is the separate-process CLI one-shot — every IN-PROCESS wrapper-hidden audit fork is on the shared Handle)"
+    fi
+  fi
+  rm -f "$tf_files" "$tf_raw" "$tf_cur" "$tf_froz"
 fi
 
 echo
