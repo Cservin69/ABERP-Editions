@@ -149,6 +149,7 @@ name = "aberp-dispatch"
 version = "0.0.0"
 dependencies = [
  "aberp-audit-ledger",
+ "aberp-compliance",
  "aberp-inventory",
  "aberp-qa",
  "aberp-work-orders",

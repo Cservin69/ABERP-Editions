@@ -17,8 +17,20 @@
 //!   shipped_at; one `Dispatch` `stock_movements` row (via
 //!   [`aberp_inventory::record_movement`]); one spawned invoice id
 //!   (via the injected [`InvoiceSpawner`] — see §"Invoice spawner"
-//!   below); one `DispatchShipped` audit entry. Any failure rolls back
-//!   all of them.
+//!   below); one `DispatchShipped` audit entry; and — S440 — the three
+//!   `export.*` export-control entries (`classification_set`,
+//!   `access_check`, `shipment_logged`) produced by the injected
+//!   [`ExportControlContext`]. Any failure rolls back all of them.
+//!
+//! ## S440 — export-control firing sites
+//!
+//! A shipment is the one place in ABERP where an export-controlled
+//! action actually happens, so `mark_shipped` is where the `export.*`
+//! family (kinds-only since S359) fires. The gate refuses the ship in
+//! code when the consignee screens to a denied-party / restricted match
+//! ([[trust-code-not-operator]]). **Weak without RBAC:** the events
+//! record *what happened*, not *who was permitted* — there is no
+//! role/citizenship check behind `operator_user_id` yet.
 //!
 //! - [`cancel_dispatch`] — operator cancels a Drafted dispatch. No
 //!   inventory impact, no invoice spawn, no dedicated audit kind per
@@ -80,15 +92,18 @@ mod repository;
 mod state;
 mod types;
 
-pub use audit::{DispatchCreatedPayload, DispatchShippedPayload};
+pub use audit::{
+    DispatchCreatedPayload, DispatchShippedPayload, ExportAccessCheckPayload,
+    ExportClassificationSetPayload, ExportShipmentLoggedPayload,
+};
 pub use error::DispatchError;
 pub use repository::{
     cancel_dispatch, count_dispatches_by_state, count_dispatches_shipped_today,
     count_eligible_work_orders, create_dispatch, ensure_schema, get_dispatch, list_dispatches,
     list_eligible_work_orders, mark_shipped, null_spawned_invoice_id_in_tx, CreateDispatchInputs,
-    Dispatch, DispatchStateCounts, DispatchWriteContext, EligibleWorkOrder, InvoiceSpawner,
-    MarkShippedInputs, MarkShippedOutcome, NoopInvoiceSpawner, MAX_DISPATCH_LIST_LIMIT,
-    MAX_ELIGIBLE_WO_LIMIT,
+    Dispatch, DispatchStateCounts, DispatchWriteContext, EligibleWorkOrder, ExportControlContext,
+    InvoiceSpawner, MarkShippedInputs, MarkShippedOutcome, NoopInvoiceSpawner,
+    MAX_DISPATCH_LIST_LIMIT, MAX_ELIGIBLE_WO_LIMIT,
 };
 pub use state::{next_dispatch_state, DispatchAction, DispatchStateError};
 pub use types::{CarrierKind, DispatchState};

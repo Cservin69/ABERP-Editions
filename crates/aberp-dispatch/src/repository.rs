@@ -69,12 +69,19 @@ use time::OffsetDateTime;
 use ulid::Ulid;
 
 use aberp_audit_ledger::{append_in_tx, Actor, EventKind, LedgerMeta};
+use aberp_compliance::export_control::{
+    validate_eccn, AccessDecision, Classifiable, ExportClassification, ExportControlProvider,
+    PartyRef,
+};
 use aberp_inventory::{
     record_movement, ActorKind, MovementReason, MovementRefKind, RecordMovementContext,
     RecordMovementInputs,
 };
 
-use crate::audit::{DispatchCreatedPayload, DispatchShippedPayload};
+use crate::audit::{
+    DispatchCreatedPayload, DispatchShippedPayload, ExportAccessCheckPayload,
+    ExportClassificationSetPayload, ExportShipmentLoggedPayload,
+};
 use crate::error::DispatchError;
 use crate::state::{next_dispatch_state, DispatchAction};
 use crate::types::{CarrierKind, DispatchState};
@@ -146,6 +153,88 @@ pub struct DispatchWriteContext<'a> {
     pub actor: ActorKind,
     pub ledger_meta: &'a LedgerMeta,
     pub ledger_actor: Actor,
+}
+
+// ── S440 — export-control gate inputs ──────────────────────────────
+
+/// S440 — everything [`mark_shipped`] needs to run the export-control gate and
+/// fire the `export.*` audit family, injected the same way the
+/// [`InvoiceSpawner`] is.
+///
+/// Why injected rather than resolved here: the `partners` table is owned by
+/// `apps/aberp`, not by this crate (see the crate doc's "No
+/// `aberp_work_orders` runtime dep" note — dispatch reads only the
+/// `work_orders` column contract). The route layer already resolves the
+/// dispatch's partner for the S438 / S439 shipment gates, so it resolves the
+/// consignee once and hands it down; this crate stays free of a second
+/// app-table dependency.
+pub struct ExportControlContext<'a> {
+    /// The classification + denied-party-screening backend. Production wires
+    /// `aberp_compliance::export_control::MockExportControlProvider`, which
+    /// answers `NotClassified` + `Clear` for everything and WARNs on
+    /// construction — the events fire faithfully, they just record that no real
+    /// determination exists yet.
+    pub provider: &'a dyn ExportControlProvider,
+    /// The consignee, resolved by the caller from the dispatch's `partner_id`.
+    pub recipient: PartyRef,
+    /// The exporter of record for the `export.shipment_logged` payload. ABERP
+    /// has no dedicated exporter-of-record party record, so the route passes
+    /// the tenant id (flagged in the S440 PR body).
+    pub exporter_party_id: String,
+    /// The operator the `export.*` payloads are attributed to — the same login
+    /// the `ledger_actor` carries, passed explicitly because `Actor`'s login is
+    /// not readable back out.
+    pub operator_user_id: String,
+}
+
+/// Hand-written because `&dyn ExportControlProvider` is not `Debug` (the trait
+/// is defined in `aberp-compliance`, so the blanket impl would be an orphan);
+/// the backend's `name()` tag is the useful part in a log line anyway. Written
+/// out rather than skipped so the crate-level `missing_debug_implementations`
+/// warning stays clean.
+impl std::fmt::Debug for ExportControlContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExportControlContext")
+            .field("provider", &self.provider.name())
+            .field("recipient", &self.recipient)
+            .field("exporter_party_id", &self.exporter_party_id)
+            .field("operator_user_id", &self.operator_user_id)
+            .finish()
+    }
+}
+
+/// The commodity submitted for classification at the shipment boundary — the
+/// finished good the WO produced, keyed by its `product_id` (the stable
+/// descriptor a classification service would dereference).
+struct ShippedCommodity<'a> {
+    product_id: &'a str,
+}
+
+impl Classifiable for ShippedCommodity<'_> {
+    fn classification_descriptor(&self) -> String {
+        self.product_id.to_string()
+    }
+}
+
+/// Convert an RFC3339 stamp to the epoch-ms the `export.*` payloads specify.
+/// Fails loud (CLAUDE.md rule 12) rather than defaulting to 0 — a zeroed
+/// timestamp on an export-control row is a falsified record, not a gap.
+fn rfc3339_to_epoch_ms(s: &str) -> Result<i64, DispatchError> {
+    let dt = OffsetDateTime::parse(s.trim(), &Rfc3339).map_err(|e| {
+        DispatchError::Validation(format!("export audit stamp {s:?} is not RFC3339: {e}"))
+    })?;
+    Ok((dt.unix_timestamp_nanos() / 1_000_000) as i64)
+}
+
+/// Render the ISO 3166-1 alpha-2 destination for the shipment payload. An
+/// unknown country stays the empty string — recorded faithfully rather than
+/// guessed, because an invented destination is a false export record.
+fn render_recipient_country(party: &PartyRef) -> String {
+    party
+        .country
+        .as_deref()
+        .map(|c| c.trim().to_ascii_uppercase())
+        .unwrap_or_default()
 }
 
 // ── Invoice spawner trait ──────────────────────────────────────────
@@ -412,12 +501,40 @@ pub struct MarkShippedOutcome {
 /// steps 4–7 returns `Err(_)`, the caller's `tx.commit()` is never
 /// reached and the entire transaction rolls back — no state flip, no
 /// stock movement, no spawned invoice, no audit entry.
+///
+/// ## S440 — the export-control gate + the `export.*` firing sites
+///
+/// A shipment leaving the building is the one place in ABERP where an
+/// export-controlled action actually happens, so this is where the
+/// `export.*` family (kinds-only since S359) fires. Inside the SAME
+/// caller-owned transaction, and BEFORE the state flip:
+///
+/// - the shipped commodity is classified through the injected
+///   [`ExportControlProvider`] → one `export.classification_set` entry;
+/// - the consignee is screened against the denied-party lists → one
+///   `export.access_check` entry recording the granted decision;
+/// - after the state flip and the `DispatchShipped` entry → one
+///   `export.shipment_logged` entry.
+///
+/// A refused screening returns [`DispatchError::ExportControlDenied`] and
+/// nothing commits ([[trust-code-not-operator]] — the refusal is in code). The
+/// denial's own `export.access_check` row is therefore appended by the ROUTE
+/// layer outside this transaction, because a rollback would take an in-tx
+/// denial row with it and there is no business write left for it to be atomic
+/// with.
+///
+/// **Honest limitation:** these events record *what happened*, not *who was
+/// allowed to make it happen* — ABERP has no RBAC layer yet, so the
+/// `operator_user_id` on each row is the logged-in operator with no
+/// role/citizenship check behind it. The audit trail is real and complete; the
+/// access *control* half of "export access control" lands with RBAC.
 pub fn mark_shipped(
     tx: &Transaction<'_>,
     ctx: &DispatchWriteContext<'_>,
     dsp_id: &str,
     inputs: MarkShippedInputs,
     spawner: &dyn InvoiceSpawner,
+    export_ctx: &ExportControlContext<'_>,
 ) -> Result<MarkShippedOutcome, DispatchError> {
     if inputs.idempotency_key.trim().is_empty() {
         return Err(DispatchError::Validation(
@@ -467,6 +584,83 @@ pub fn mark_shipped(
         .clone()
         .map(Ok)
         .unwrap_or_else(now_rfc3339)?;
+    let now_ms = rfc3339_to_epoch_ms(&now)?;
+
+    // 4b. S440 — export-control gate. Runs BEFORE any write in this tx so a
+    //     refusal costs nothing, and its two audit appends land in the SAME tx
+    //     as the ship they authorise (never business-commit-then-audit-append).
+    //
+    //     Classification first: what is leaving? The determination is the
+    //     provider's — never inferred here (mis-classification is a felony).
+    let classification = export_ctx
+        .provider
+        .classify(&ShippedCommodity {
+            product_id: &wo_product_id,
+        })
+        .map_err(|e| DispatchError::ExportControlUnavailable(format!("classify: {e}")))?;
+    // Shape-gate the code before it reaches the ledger. An append-only,
+    // hash-chained row cannot be corrected later, so a backend that answers a
+    // malformed ECCN fails the ship loud rather than writing a bad record.
+    if let ExportClassification::ECCN(code) = &classification {
+        validate_eccn(code).map_err(|e| {
+            DispatchError::ExportControlUnavailable(format!(
+                "backend {} returned a malformed ECCN: {e}",
+                export_ctx.provider.name()
+            ))
+        })?;
+    }
+    let classification_payload = ExportClassificationSetPayload {
+        entity_kind: "product".to_string(),
+        entity_id: wo_product_id.clone(),
+        eccn: classification.eccn().map(str::to_string),
+        usml_category: classification.usml_category().map(str::to_string),
+        jurisdiction: classification.jurisdiction().as_str().to_string(),
+        operator_user_id: export_ctx.operator_user_id.clone(),
+        classified_at_ms: now_ms,
+    };
+    append_in_tx(
+        tx,
+        ctx.ledger_meta,
+        EventKind::ExportClassificationSet,
+        classification_payload.to_bytes(),
+        ctx.ledger_actor.clone(),
+        Some(format!("export_classify:{}", inputs.idempotency_key)),
+    )
+    .map_err(|e| DispatchError::Storage(anyhow!("audit append ExportClassificationSet: {e}")))?;
+
+    //     Then the access decision: may this export proceed to THIS consignee?
+    let screening = export_ctx
+        .provider
+        .screen_party(&export_ctx.recipient)
+        .map_err(|e| DispatchError::ExportControlUnavailable(format!("screen_party: {e}")))?;
+    let decision = screening.access_decision();
+    let reason = screening.reason();
+    if decision == AccessDecision::Denied {
+        // Refuse in code. The whole tx rolls back — including the
+        // classification row appended a moment ago — so the route layer owns
+        // persisting the denial (see the doc comment above).
+        return Err(DispatchError::ExportControlDenied {
+            dsp_id: dsp_id.to_string(),
+            reason,
+        });
+    }
+    let access_payload = ExportAccessCheckPayload {
+        entity_kind: "dispatch".to_string(),
+        entity_id: dsp_id.to_string(),
+        operator_user_id: export_ctx.operator_user_id.clone(),
+        decision: decision.as_str().to_string(),
+        reason,
+        checked_at_ms: now_ms,
+    };
+    append_in_tx(
+        tx,
+        ctx.ledger_meta,
+        EventKind::ExportAccessCheck,
+        access_payload.to_bytes(),
+        ctx.ledger_actor.clone(),
+        Some(format!("export_access:{}", inputs.idempotency_key)),
+    )
+    .map_err(|e| DispatchError::Storage(anyhow!("audit append ExportAccessCheck: {e}")))?;
 
     // 5. Emit the Dispatch stock_movement (qty_delta = -wo.qty_target).
     let movement_ctx = RecordMovementContext {
@@ -557,6 +751,32 @@ pub fn mark_shipped(
         Some(format!("ship:{}", inputs.idempotency_key)),
     )
     .map_err(|e| DispatchError::Storage(anyhow!("audit append DispatchShipped: {e}")))?;
+
+    // 8b. S440 — the physical-export record, in the SAME tx as the state flip
+    //     it describes. `ecn_or_authorization` reuses the determination from
+    //     step 4b so the shipment row and the classification row can never
+    //     disagree about what was cited.
+    let shipment_payload = ExportShipmentLoggedPayload {
+        shipment_id: prior.dsp_id.clone(),
+        exporter_party_id: export_ctx.exporter_party_id.clone(),
+        recipient_party_id: prior.partner_id.clone(),
+        recipient_country: render_recipient_country(&export_ctx.recipient),
+        ecn_or_authorization: classification
+            .eccn()
+            .or_else(|| classification.usml_category())
+            .map(str::to_string),
+        shipped_at_ms: now_ms,
+        operator_user_id: export_ctx.operator_user_id.clone(),
+    };
+    append_in_tx(
+        tx,
+        ctx.ledger_meta,
+        EventKind::ExportShipmentLogged,
+        shipment_payload.to_bytes(),
+        ctx.ledger_actor.clone(),
+        Some(format!("export_ship:{}", inputs.idempotency_key)),
+    )
+    .map_err(|e| DispatchError::Storage(anyhow!("audit append ExportShipmentLogged: {e}")))?;
 
     // 9. Read back the live row.
     let live = read_dispatch_in_tx(tx, ctx.tenant, dsp_id)?.ok_or_else(|| {
