@@ -586,9 +586,10 @@ pub fn mark_shipped(
         .unwrap_or_else(now_rfc3339)?;
     let now_ms = rfc3339_to_epoch_ms(&now)?;
 
-    // 4b. S440 — export-control gate. Runs BEFORE any write in this tx so a
-    //     refusal costs nothing, and its two audit appends land in the SAME tx
-    //     as the ship they authorise (never business-commit-then-audit-append).
+    // 4b. S440 — export-control gate. Runs BEFORE any business write in this
+    //     tx so a refusal costs nothing, and its two audit appends (the third,
+    //     `export.shipment_logged`, lands at step 8b) ride the SAME tx as the
+    //     ship they authorise — never business-commit-then-audit-append.
     //
     //     Classification first: what is leaving? The determination is the
     //     provider's — never inferred here (mis-classification is a felony).
