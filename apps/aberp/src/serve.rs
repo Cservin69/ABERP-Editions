@@ -18195,8 +18195,8 @@ fn map_dispatch_err(e: aberp_dispatch::DispatchError) -> WorkOrderRouteError {
 /// Today this is always the mock: it answers `NotClassified` + `Clear` for
 /// everything, so the `export.*` rows faithfully record "no determination has
 /// been made" rather than a fabricated clearance.
-fn export_control_provider() -> &'static dyn aberp_compliance::export_control::ExportControlProvider
-{
+pub fn export_control_provider(
+) -> &'static dyn aberp_compliance::export_control::ExportControlProvider {
     static PROVIDER: std::sync::OnceLock<
         aberp_compliance::export_control::MockExportControlProvider,
     > = std::sync::OnceLock::new();
@@ -18266,7 +18266,7 @@ pub fn resolve_export_recipient(
 /// Best-effort by design at the *error* boundary: a failure to record the
 /// denial is logged and the operator still gets their 409 refusal (the refusal
 /// itself is the load-bearing behaviour — [[hulye-biztos]]).
-fn append_export_access_denied(
+pub fn append_export_access_denied(
     state: &AppState,
     dsp_id: &str,
     operator_login: &str,

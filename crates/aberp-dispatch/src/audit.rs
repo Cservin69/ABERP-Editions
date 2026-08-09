@@ -177,7 +177,8 @@ pub struct ExportAccessCheckPayload {
 
 impl ExportAccessCheckPayload {
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("JSON serialization of ExportAccessCheckPayload cannot fail")
+        serde_json::to_vec(self)
+            .expect("JSON serialization of ExportAccessCheckPayload cannot fail")
     }
 }
 

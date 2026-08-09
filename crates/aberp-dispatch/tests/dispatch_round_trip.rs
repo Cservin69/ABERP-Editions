@@ -1612,7 +1612,8 @@ fn read_payload<T: serde::de::DeserializeOwned>(conn: &Connection, kind: &str) -
             |row| row.get(0),
         )
         .unwrap_or_else(|e| panic!("no audit row for kind {kind}: {e}"));
-    serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("payload for {kind} did not parse: {e}"))
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|e| panic!("payload for {kind} did not parse: {e}"))
 }
 
 /// The headline: one shipment fires each of the three `export.*` kinds
@@ -1819,12 +1820,8 @@ fn s440_restricted_party_also_refuses_the_ship() {
 #[test]
 fn s440_export_rows_roll_back_with_a_failed_ship() {
     let spawner = MockInvoiceSpawner::return_err("billing exploded");
-    let (conn, dsp_id, res) = ship_with_export_ctx(
-        "WO-EXP-ATOMIC",
-        &test_export_ctx(),
-        &spawner,
-        None,
-    );
+    let (conn, dsp_id, res) =
+        ship_with_export_ctx("WO-EXP-ATOMIC", &test_export_ctx(), &spawner, None);
     assert!(
         matches!(res, Err(DispatchError::InvoiceSpawnFailed(_))),
         "expected the spawner failure to surface, got {res:?}"

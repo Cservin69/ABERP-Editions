@@ -152,7 +152,9 @@ impl ScreeningResult {
     pub fn reason(&self) -> String {
         match self {
             ScreeningResult::Clear => "denied-party screening: clear".to_string(),
-            ScreeningResult::Restricted(why) => format!("denied-party screening: restricted ({why})"),
+            ScreeningResult::Restricted(why) => {
+                format!("denied-party screening: restricted ({why})")
+            }
             ScreeningResult::Denied(why) => format!("denied-party screening: denied ({why})"),
         }
     }
@@ -415,12 +417,18 @@ mod tests {
             ExportClassification::USMLCategory("VIII(h)".into()).jurisdiction(),
             Jurisdiction::Itar
         );
-        assert_eq!(ExportClassification::EAR99.jurisdiction(), Jurisdiction::Ear99);
+        assert_eq!(
+            ExportClassification::EAR99.jurisdiction(),
+            Jurisdiction::Ear99
+        );
         assert_eq!(
             ExportClassification::NotClassified.jurisdiction(),
             Jurisdiction::Unknown
         );
-        assert_eq!(ExportClassification::Pending.jurisdiction(), Jurisdiction::Unknown);
+        assert_eq!(
+            ExportClassification::Pending.jurisdiction(),
+            Jurisdiction::Unknown
+        );
     }
 
     /// S440 — the `eccn` / `usml_category` payload fields are populated from the
