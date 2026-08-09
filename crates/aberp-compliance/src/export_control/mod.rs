@@ -45,6 +45,119 @@ pub enum ExportClassification {
     Pending,
 }
 
+impl ExportClassification {
+    /// The regulatory regime this determination implies.
+    ///
+    /// This is a *rendering* of the provider's own answer, NOT an inference
+    /// about the item: an `ECCN` determination is by definition an EAR/CCL
+    /// listing, a `USMLCategory` determination is by definition ITAR, and both
+    /// `NotClassified` and `Pending` mean *no determination exists yet* →
+    /// [`Jurisdiction::Unknown`], the conservative default the mock boundary
+    /// surfaces. Mis-classification is a felony, so nothing here guesses; the
+    /// only input is what a licensed classification service already said.
+    ///
+    /// S440 — the `export.classification_set` firing site renders the payload's
+    /// `jurisdiction` field through this, so a free-text regime can never reach
+    /// the ledger (the discipline [`Jurisdiction`]'s doc pins).
+    pub fn jurisdiction(&self) -> Jurisdiction {
+        match self {
+            ExportClassification::ECCN(_) => Jurisdiction::Ear,
+            ExportClassification::USMLCategory(_) => Jurisdiction::Itar,
+            ExportClassification::EAR99 => Jurisdiction::Ear99,
+            ExportClassification::NotClassified | ExportClassification::Pending => {
+                Jurisdiction::Unknown
+            }
+        }
+    }
+
+    /// The determined ECCN, when this determination carries one. `EAR99` is an
+    /// ECCN-shaped value in the audit payload's `eccn` field (it is the EAR
+    /// catch-all code an exporter cites), so it is surfaced here too;
+    /// `USMLCategory` / `NotClassified` / `Pending` carry none.
+    pub fn eccn(&self) -> Option<&str> {
+        match self {
+            ExportClassification::ECCN(code) => Some(code.as_str()),
+            ExportClassification::EAR99 => Some("EAR99"),
+            _ => None,
+        }
+    }
+
+    /// The determined USML category, when ITAR-controlled.
+    pub fn usml_category(&self) -> Option<&str> {
+        match self {
+            ExportClassification::USMLCategory(cat) => Some(cat.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// The verdict of an export-control access decision — the closed vocabulary the
+/// `export.access_check` audit payload's `decision` field carries.
+///
+/// S440 — a typed enum rather than a free-text string for the same reason
+/// [`Jurisdiction`] is typed: the decision token is the field an auditor greps
+/// for, so a typo (`"grant"`, `"GRANTED"`) must be impossible at the write
+/// boundary. Round-trip-proven via [`AccessDecision::as_str`] /
+/// [`AccessDecision::from_storage_str`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AccessDecision {
+    /// The access / export may proceed.
+    Granted,
+    /// The access / export is refused. The accompanying `reason` field names
+    /// the rule that drove the refusal.
+    Denied,
+}
+
+impl AccessDecision {
+    /// Canonical storage / audit-payload token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessDecision::Granted => "granted",
+            AccessDecision::Denied => "denied",
+        }
+    }
+
+    /// Parse the storage token. Fail loud on unknown (CLAUDE.md rule 12) — a
+    /// silent fallback to `Granted` would be the worst-class export-control bug
+    /// (it would read a denial back out of the ledger as an approval).
+    pub fn from_storage_str(s: &str) -> Result<Self, &'static str> {
+        match s {
+            "granted" => Ok(AccessDecision::Granted),
+            "denied" => Ok(AccessDecision::Denied),
+            _ => Err("unknown AccessDecision storage string"),
+        }
+    }
+}
+
+impl ScreeningResult {
+    /// The access decision this screening outcome implies.
+    ///
+    /// `Clear` → [`AccessDecision::Granted`]. BOTH `Restricted` and `Denied` →
+    /// [`AccessDecision::Denied`]: a `Restricted` match means the transaction
+    /// needs a licence that this install has no surface to record, so the
+    /// conservative posture is to refuse and let a human adjudicate
+    /// ([[trust-code-not-operator]]) rather than let a licensable-but-unlicensed
+    /// export through.
+    pub fn access_decision(&self) -> AccessDecision {
+        match self {
+            ScreeningResult::Clear => AccessDecision::Granted,
+            ScreeningResult::Restricted(_) | ScreeningResult::Denied(_) => AccessDecision::Denied,
+        }
+    }
+
+    /// The rule / list that drove the verdict — the `reason` field of the
+    /// `export.access_check` payload. `Clear` has no list hit, so it renders the
+    /// positive statement rather than an empty string (an empty `reason` reads
+    /// as "the writer forgot the field").
+    pub fn reason(&self) -> String {
+        match self {
+            ScreeningResult::Clear => "denied-party screening: clear".to_string(),
+            ScreeningResult::Restricted(why) => format!("denied-party screening: restricted ({why})"),
+            ScreeningResult::Denied(why) => format!("denied-party screening: denied ({why})"),
+        }
+    }
+}
+
 /// The export-control **jurisdiction** (regulatory regime) an item falls
 /// under — a distinct axis from [`ExportClassification`].
 ///
@@ -286,6 +399,101 @@ mod tests {
                 "{bad} should be rejected"
             );
         }
+    }
+
+    /// S440 — every `ExportClassification` renders exactly the regime the
+    /// regulation assigns it, and the two "no determination yet" variants land
+    /// on `UNKNOWN` (never a silent `NOT_CONTROLLED`, which is a *positive*
+    /// determination and would read as "cleared for export").
+    #[test]
+    fn s440_classification_renders_its_jurisdiction() {
+        assert_eq!(
+            ExportClassification::ECCN("7A994".into()).jurisdiction(),
+            Jurisdiction::Ear
+        );
+        assert_eq!(
+            ExportClassification::USMLCategory("VIII(h)".into()).jurisdiction(),
+            Jurisdiction::Itar
+        );
+        assert_eq!(ExportClassification::EAR99.jurisdiction(), Jurisdiction::Ear99);
+        assert_eq!(
+            ExportClassification::NotClassified.jurisdiction(),
+            Jurisdiction::Unknown
+        );
+        assert_eq!(ExportClassification::Pending.jurisdiction(), Jurisdiction::Unknown);
+    }
+
+    /// S440 — the `eccn` / `usml_category` payload fields are populated from the
+    /// determination and NEVER cross over (an ITAR determination must not leak
+    /// into the `eccn` column and vice versa).
+    #[test]
+    fn s440_classification_code_accessors_do_not_cross_over() {
+        let ear = ExportClassification::ECCN("3A001".into());
+        assert_eq!(ear.eccn(), Some("3A001"));
+        assert_eq!(ear.usml_category(), None);
+
+        let itar = ExportClassification::USMLCategory("VIII(h)".into());
+        assert_eq!(itar.eccn(), None);
+        assert_eq!(itar.usml_category(), Some("VIII(h)"));
+
+        // EAR99 IS the code an exporter cites, so it surfaces as the eccn.
+        assert_eq!(ExportClassification::EAR99.eccn(), Some("EAR99"));
+        assert_eq!(ExportClassification::EAR99.usml_category(), None);
+
+        for undetermined in [
+            ExportClassification::NotClassified,
+            ExportClassification::Pending,
+        ] {
+            assert_eq!(undetermined.eccn(), None);
+            assert_eq!(undetermined.usml_category(), None);
+        }
+    }
+
+    /// S440 — `AccessDecision` round-trips and pins its two tokens.
+    #[test]
+    fn s440_access_decision_round_trips_and_pins_tokens() {
+        for d in [AccessDecision::Granted, AccessDecision::Denied] {
+            assert_eq!(AccessDecision::from_storage_str(d.as_str()), Ok(d));
+        }
+        assert_eq!(AccessDecision::Granted.as_str(), "granted");
+        assert_eq!(AccessDecision::Denied.as_str(), "denied");
+        assert!(AccessDecision::from_storage_str("GRANTED").is_err());
+        assert!(AccessDecision::from_storage_str("grant").is_err());
+        assert!(AccessDecision::from_storage_str("").is_err());
+    }
+
+    /// S440 — the load-bearing conservatism: a `Restricted` screening hit is a
+    /// DENIAL at this boundary, not a pass. A restricted party needs a licence
+    /// and ABERP has no licence surface to check one against, so letting it
+    /// through would be the worst-class export bug.
+    #[test]
+    fn s440_restricted_screening_is_denied_not_granted() {
+        assert_eq!(
+            ScreeningResult::Clear.access_decision(),
+            AccessDecision::Granted
+        );
+        assert_eq!(
+            ScreeningResult::Restricted("BIS Entity List partial".into()).access_decision(),
+            AccessDecision::Denied
+        );
+        assert_eq!(
+            ScreeningResult::Denied("OFAC SDN".into()).access_decision(),
+            AccessDecision::Denied
+        );
+    }
+
+    /// S440 — the `reason` field is never empty, including on the clear path
+    /// (an empty reason reads as "the writer forgot the field"), and it carries
+    /// the list/why string through on a hit.
+    #[test]
+    fn s440_screening_reason_is_never_empty_and_carries_the_hit() {
+        assert!(!ScreeningResult::Clear.reason().is_empty());
+        assert!(ScreeningResult::Denied("OFAC SDN".into())
+            .reason()
+            .contains("OFAC SDN"));
+        assert!(ScreeningResult::Restricted("licence required".into())
+            .reason()
+            .contains("licence required"));
     }
 
     /// S359 — `Jurisdiction` also survives a serde JSON round-trip (it derives

@@ -27,6 +27,14 @@ aberp-audit-ledger = { path = "../audit-ledger" }
 # pattern. Same posture as aberp-qa's inventory dep.
 aberp-inventory = { path = "../aberp-inventory" }
 
+# S440 — the `export.*` firing sites. `mark_shipped` consults the injected
+# `ExportControlProvider` (classification + denied-party screening) and renders
+# the audit payloads through the crate's typed vocab (`Jurisdiction`,
+# `AccessDecision`, `validate_eccn`) so no free-text regime / decision / code
+# can reach the ledger. aberp-compliance is a leaf (serde + thiserror +
+# tracing only) — no cycle.
+aberp-compliance = { path = "../aberp-compliance" }
+
 # Read `work_orders.state` + `work_orders.product_id` + `work_orders.qty_target`
 # directly via SQL inside the supplied transaction. NO dep on
 # aberp-work-orders to avoid a cycle (work-orders depends on aberp-qa

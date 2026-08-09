@@ -58,6 +58,29 @@ pub enum DispatchError {
     #[error("invoice spawn failed: {0}")]
     InvoiceSpawnFailed(String),
 
+    /// S440 — the export-control gate refused the shipment: the consignee
+    /// screened to a denied-party or restricted match. Per
+    /// [[trust-code-not-operator]] the refusal is in code, so the whole
+    /// `mark_shipped` transaction rolls back — no state flip, no stock
+    /// movement, no invoice draft. Route layer → 409 AND (because the rollback
+    /// takes the in-tx audit row with it) a standalone `export.access_check`
+    /// denial append, mirroring `enforce_part_uid_gate_for_shipment`.
+    #[error("export-control screening refused this shipment: {reason}")]
+    ExportControlDenied {
+        /// The `dsp_id` whose release was refused — the route needs it to build
+        /// the standalone denial payload.
+        dsp_id: String,
+        /// The rule / list that drove the refusal.
+        reason: String,
+    },
+
+    /// S440 — the export-control backend could not answer (unconfigured or
+    /// unreachable). Fail loud and roll back: shipping controlled goods on an
+    /// *unanswered* screening is exactly the outcome the gate exists to
+    /// prevent. Route layer → 500.
+    #[error("export-control backend could not answer: {0}")]
+    ExportControlUnavailable(String),
+
     /// DB-layer error from DuckDB or the audit-ledger / inventory
     /// crate write. Route layer → 500.
     #[error("storage error: {0}")]

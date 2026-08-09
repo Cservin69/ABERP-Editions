@@ -27,8 +27,9 @@ pub use crate::avl::{
 };
 pub use crate::cui::{CuiCategory, CuiMarking, DisseminationControl};
 pub use crate::export_control::{
-    validate_eccn, Classifiable, EccnError, ExportClassification, ExportControlError,
-    ExportControlProvider, Jurisdiction, MockExportControlProvider, PartyRef, ScreeningResult,
+    validate_eccn, AccessDecision, Classifiable, EccnError, ExportClassification,
+    ExportControlError, ExportControlProvider, Jurisdiction, MockExportControlProvider, PartyRef,
+    ScreeningResult,
 };
 pub use crate::incident::{
     dod_72h_report_due_at_ms, DetectionSource, IncidentSeverity, DFARS_72H_REPORT_WINDOW_MS,
