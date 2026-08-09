@@ -18169,7 +18169,151 @@ fn map_dispatch_err(e: aberp_dispatch::DispatchError) -> WorkOrderRouteError {
         D::InvoiceSpawnFailed(msg) => {
             WorkOrderRouteError::Other(anyhow!("invoice spawn failed: {msg}"))
         }
+        // S440 — the export-control gate refused the shipment. 409 (an operator
+        // must adjudicate), same class as the S438 / S439 shipment gates. The
+        // caller appends the standalone `export.access_check` denial BEFORE
+        // mapping, so this arm never carries the audit responsibility.
+        D::ExportControlDenied { reason, .. } => WorkOrderRouteError::Conflict(reason),
+        D::ExportControlUnavailable(msg) => {
+            WorkOrderRouteError::Other(anyhow!("export-control backend could not answer: {msg}"))
+        }
         D::Storage(e) => WorkOrderRouteError::Other(e),
+    }
+}
+
+/// S440 — the process-wide [`aberp_compliance::export_control::ExportControlProvider`].
+///
+/// Mirrors [`build_digital_id_provider`]'s boot-helper posture (construct once,
+/// WARN once) without adding an `AppState` field: the mock is a ZST whose
+/// constructor WARNs, and per-request construction would spam that WARN on
+/// every shipment. Deliberately conservative — moving it onto `AppState`
+/// (which the `ExportControlProvider` doc anticipates) is a mechanical
+/// follow-up for when a real backend and its env selection land, and it would
+/// otherwise mean touching ~25 test `build_state` constructors for no
+/// behavioural gain today.
+///
+/// Today this is always the mock: it answers `NotClassified` + `Clear` for
+/// everything, so the `export.*` rows faithfully record "no determination has
+/// been made" rather than a fabricated clearance.
+fn export_control_provider() -> &'static dyn aberp_compliance::export_control::ExportControlProvider
+{
+    static PROVIDER: std::sync::OnceLock<
+        aberp_compliance::export_control::MockExportControlProvider,
+    > = std::sync::OnceLock::new();
+    PROVIDER.get_or_init(aberp_compliance::export_control::MockExportControlProvider::new)
+}
+
+/// S440 — resolve a dispatch's consignee into the
+/// [`aberp_compliance::export_control::PartyRef`] the export-control gate
+/// screens and the `export.shipment_logged` payload records.
+///
+/// Read-only, and deliberately forgiving about *missing* data: an unknown
+/// dispatch or partner is not this function's error to raise (the normal
+/// `mark_shipped` path 404s an unknown dispatch), and a partner with no
+/// recorded country yields `country: None` — which the payload records as an
+/// empty destination rather than a guessed one. Fabricating `"HU"` for an
+/// unstated destination would be a false export record, which is worse than a
+/// visibly incomplete one.
+pub fn resolve_export_recipient(
+    state: &AppState,
+    dsp_id: &str,
+) -> std::result::Result<aberp_compliance::export_control::PartyRef, WorkOrderRouteError> {
+    let conn = state.db.read().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for export recipient: {e}"))
+    })?;
+    aberp_dispatch::ensure_schema(&conn)
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
+    let Some(dispatch) = aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
+        .map_err(WorkOrderRouteError::Other)?
+    else {
+        // Unknown dispatch → defer to the normal 404 path; the gate never runs.
+        return Ok(aberp_compliance::export_control::PartyRef {
+            name: String::new(),
+            country: None,
+        });
+    };
+    let partner = crate::partners::get_partner(&conn, state.tenant.as_str(), &dispatch.partner_id)
+        .map_err(WorkOrderRouteError::Other)?;
+    Ok(match partner {
+        Some(p) => aberp_compliance::export_control::PartyRef {
+            name: p.legal_name,
+            country: p
+                .address_country
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(|c| c.to_ascii_uppercase()),
+        },
+        // Partner row missing: screen on the id we do have rather than skipping
+        // the screen entirely (a silent skip is the failure mode this whole
+        // gate exists to prevent).
+        None => aberp_compliance::export_control::PartyRef {
+            name: dispatch.partner_id,
+            country: None,
+        },
+    })
+}
+
+/// S440 — persist the `export.access_check` DENIAL that
+/// [`aberp_dispatch::mark_shipped`] could not persist itself.
+///
+/// A refused screening rolls the ship transaction back, which would take an
+/// in-tx denial row with it — so the denial is appended here, standalone, on
+/// the ONE shared Handle writer (ADR-0099), exactly the shape
+/// [`enforce_part_uid_gate_for_shipment`] uses. There is no business write to
+/// be atomic with on this path: nothing shipped.
+///
+/// Best-effort by design at the *error* boundary: a failure to record the
+/// denial is logged and the operator still gets their 409 refusal (the refusal
+/// itself is the load-bearing behaviour — [[hulye-biztos]]).
+fn append_export_access_denied(
+    state: &AppState,
+    dsp_id: &str,
+    operator_login: &str,
+    reason: &str,
+) {
+    let payload = aberp_dispatch::ExportAccessCheckPayload {
+        entity_kind: "dispatch".to_string(),
+        entity_id: dsp_id.to_string(),
+        operator_user_id: operator_login.to_string(),
+        decision: aberp_compliance::export_control::AccessDecision::Denied
+            .as_str()
+            .to_string(),
+        reason: reason.to_string(),
+        checked_at_ms: (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64,
+    };
+    let appended = (|| -> anyhow::Result<()> {
+        let binary_hash = state
+            .binary_hash
+            .wait()
+            .map_err(|e| anyhow!("binary hash unavailable: {e}"))?;
+        let mut conn = state
+            .db
+            .write()
+            .map_err(|e| anyhow!("shared writer for export-denial audit: {e}"))?;
+        aberp_audit_ledger::ensure_schema(&conn)
+            .context("ensure schema for export-denial audit")?;
+        let tx = conn
+            .transaction()
+            .context("begin tx for export-denial audit")?;
+        let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+        aberp_audit_ledger::append_in_tx(
+            &tx,
+            &ledger_meta,
+            aberp_audit_ledger::EventKind::ExportAccessCheck,
+            payload.to_bytes(),
+            Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+            None,
+        )
+        .map_err(|e| anyhow!("append export-denial audit: {e}"))?;
+        tx.commit().context("commit tx for export-denial audit")?;
+        Ok(())
+    })();
+    if let Err(e) = appended {
+        tracing::error!(
+            dispatch_id = %dsp_id,
+            "S440: FAILED to record the export.access_check DENIAL for a refused shipment: {e:#}"
+        );
     }
 }
 
@@ -18481,6 +18625,16 @@ pub fn mark_dispatch_shipped_request(
     // resolved or escalated. [[trust-code-not-operator]]; non-defense unaffected.
     enforce_open_ncr_gate_for_shipment(state, dsp_id, operator_login)?;
 
+    // S440 — resolve the consignee ONCE, here, for the export-control gate
+    // inside `mark_shipped`. The `partners` table is owned by this app, not by
+    // aberp-dispatch (which reads only the `work_orders` column contract), so
+    // the route hands the resolved party down rather than teaching the leaf
+    // crate a second app table. A missing dispatch/partner is NOT an error
+    // here — the normal mark_shipped path 404s it — so an unresolved party
+    // degrades to "name = the partner id, country unknown", which the audit
+    // payload records faithfully rather than guessing.
+    let recipient = resolve_export_recipient(state, dsp_id)?;
+
     let mut conn = state.db.write().map_err(|e| {
         WorkOrderRouteError::Other(anyhow!(
             "open tenant DuckDB at {}: {e}",
@@ -18523,7 +18677,17 @@ pub fn mark_dispatch_shipped_request(
         ledger_meta: &ledger_meta,
         ledger_actor,
     };
-    let outcome = aberp_dispatch::mark_shipped(
+    // S440 — the export-control gate's inputs. Its three `export.*` appends
+    // run inside `tx`, atomic with the state flip they describe.
+    let export_ctx = aberp_dispatch::ExportControlContext {
+        provider: export_control_provider(),
+        recipient,
+        // ABERP has no dedicated exporter-of-record party record; the tenant is
+        // the closest faithful identifier (flagged in the S440 PR body).
+        exporter_party_id: state.tenant.as_str().to_string(),
+        operator_user_id: operator_login.to_string(),
+    };
+    let outcome = match aberp_dispatch::mark_shipped(
         &tx,
         &ctx,
         dsp_id,
@@ -18534,8 +18698,30 @@ pub fn mark_dispatch_shipped_request(
             idempotency_key: body.idempotency_key,
         },
         &spawner,
-    )
-    .map_err(map_dispatch_err)?;
+        &export_ctx,
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // S440 — an export-control denial rolled its own in-tx
+            // `export.access_check` row back along with everything else, so
+            // record it standalone. The tx AND the shared writer guard must be
+            // released first: `append_export_access_denied` takes
+            // `state.db.write()` itself, and re-entering the writer mutex while
+            // still holding it would deadlock this request forever.
+            let denial = match &e {
+                aberp_dispatch::DispatchError::ExportControlDenied { dsp_id, reason } => {
+                    Some((dsp_id.clone(), reason.clone()))
+                }
+                _ => None,
+            };
+            drop(tx);
+            drop(conn);
+            if let Some((denied_dsp_id, reason)) = denial {
+                append_export_access_denied(state, &denied_dsp_id, operator_login, &reason);
+            }
+            return Err(map_dispatch_err(e));
+        }
+    };
     tx.commit()
         .context("commit mark_shipped transaction")
         .map_err(WorkOrderRouteError::Other)?;
