@@ -20,12 +20,16 @@ use std::sync::Mutex;
 use aberp_audit_ledger::{
     ensure_schema as ensure_audit_schema, Actor, BinaryHash, LedgerMeta, TenantId,
 };
+use aberp_compliance::export_control::{
+    Classifiable, ExportClassification, ExportControlError, ExportControlProvider,
+    MockExportControlProvider, PartyRef, ScreeningResult,
+};
 use aberp_dispatch::{
     cancel_dispatch, count_dispatches_by_state, count_dispatches_shipped_today,
     count_eligible_work_orders, create_dispatch, ensure_schema as ensure_dispatch_schema,
     get_dispatch, list_dispatches, list_eligible_work_orders, mark_shipped, CarrierKind,
     CreateDispatchInputs, Dispatch, DispatchError, DispatchState, DispatchWriteContext,
-    InvoiceSpawner, MarkShippedInputs, NoopInvoiceSpawner,
+    ExportControlContext, InvoiceSpawner, MarkShippedInputs, NoopInvoiceSpawner,
 };
 use aberp_inventory::{
     current_stock, ensure_schema as ensure_inventory_schema, record_movement, ActorKind,
@@ -155,6 +159,24 @@ fn dispatch_ctx_for<'a>(meta: &'a LedgerMeta, login: &str) -> DispatchWriteConte
         },
         ledger_meta: meta,
         ledger_actor: Actor::from_local_cli("test-session".to_string(), login),
+    }
+}
+
+/// S440 — the default export-control context for the pre-existing dispatch
+/// tests: the production `MockExportControlProvider` (NotClassified + Clear),
+/// a German consignee. Every existing invariant must still hold with the
+/// export-control gate in the path, which is the point of threading it through
+/// the whole file rather than only the new tests.
+fn test_export_ctx() -> ExportControlContext<'static> {
+    static PROVIDER: MockExportControlProvider = MockExportControlProvider;
+    ExportControlContext {
+        provider: &PROVIDER,
+        recipient: PartyRef {
+            name: "ACME GmbH".to_string(),
+            country: Some("DE".to_string()),
+        },
+        exporter_party_id: TEST_TENANT.to_string(),
+        operator_user_id: "ervin".to_string(),
     }
 }
 
@@ -601,6 +623,7 @@ fn mark_shipped_writes_movement_and_audit_in_same_tx_with_noop_spawner() {
             idempotency_key: "ship-dsp-1".to_string(),
         },
         &NoopInvoiceSpawner,
+        &test_export_ctx(),
     )
     .unwrap();
     tx.commit().unwrap();
@@ -670,6 +693,7 @@ fn mark_shipped_writes_movement_and_spawns_draft_in_same_tx() {
             idempotency_key: "ship-dsp-spawn".to_string(),
         },
         &spawner,
+        &test_export_ctx(),
     )
     .unwrap();
     tx.commit().unwrap();
@@ -746,6 +770,7 @@ fn mark_shipped_rolls_back_on_draft_failure() {
             idempotency_key: "ship-dsp-rollback".to_string(),
         },
         &spawner,
+        &test_export_ctx(),
     );
     // Tx is dropped without commit — DuckDB rolls back automatically.
     drop(tx);
@@ -829,6 +854,7 @@ fn mark_shipped_idempotent_on_already_shipped() {
             idempotency_key: "ship-dsp-idem-1".to_string(),
         },
         &NoopInvoiceSpawner,
+        &test_export_ctx(),
     )
     .unwrap();
     tx.commit().unwrap();
@@ -855,6 +881,7 @@ fn mark_shipped_idempotent_on_already_shipped() {
             idempotency_key: "ship-dsp-idem-2".to_string(),
         },
         &NoopInvoiceSpawner,
+        &test_export_ctx(),
     )
     .unwrap();
     tx.commit().unwrap();
@@ -963,6 +990,7 @@ fn cancel_shipped_dispatch_is_refused() {
             idempotency_key: "ship-cs".to_string(),
         },
         &NoopInvoiceSpawner,
+        &test_export_ctx(),
     )
     .unwrap();
     tx.commit().unwrap();
@@ -1071,6 +1099,7 @@ fn dispatch_shipped_audit_payload_parses_with_expected_fields() {
             idempotency_key: "ship-payload".to_string(),
         },
         &MockInvoiceSpawner::return_some("inv_payload_test"),
+        &test_export_ctx(),
     )
     .unwrap();
     tx.commit().unwrap();
@@ -1331,6 +1360,7 @@ fn count_dispatches_by_state_groups_correctly() {
             idempotency_key: "cnt-s-ship".to_string(),
         },
         &NoopInvoiceSpawner,
+        &test_export_ctx(),
     )
     .unwrap();
     tx.commit().unwrap();
@@ -1426,6 +1456,7 @@ fn count_dispatches_shipped_today_matches_iso_date_prefix() {
             idempotency_key: "ship-today-mark".to_string(),
         },
         &NoopInvoiceSpawner,
+        &test_export_ctx(),
     )
     .unwrap();
     tx.commit().unwrap();
@@ -1444,4 +1475,463 @@ fn count_dispatches_shipped_today_matches_iso_date_prefix() {
         0,
         "tenant-scoped: other tenant sees zero"
     );
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// S440 — the `export.*` firing sites
+//
+// The three export-control kinds shipped in S359 as definitions with
+// ZERO write sites. These tests pin that each one now fires at the
+// right code point, with the right payload, and — the load-bearing
+// property — ATOMICALLY with the shipment it describes.
+// ═════════════════════════════════════════════════════════════════════
+
+/// A configurable [`ExportControlProvider`] so the tests can drive the
+/// branches the production mock can never reach (a real ECCN, a USML
+/// determination, a denied party, an unreachable backend).
+#[derive(Debug)]
+struct StubExportControl {
+    classification: Result<ExportClassification, &'static str>,
+    screening: Result<ScreeningResult, &'static str>,
+}
+
+impl StubExportControl {
+    fn new(classification: ExportClassification, screening: ScreeningResult) -> Self {
+        Self {
+            classification: Ok(classification),
+            screening: Ok(screening),
+        }
+    }
+
+    fn classify_fails() -> Self {
+        Self {
+            classification: Err("backend down"),
+            screening: Ok(ScreeningResult::Clear),
+        }
+    }
+}
+
+impl ExportControlProvider for StubExportControl {
+    fn name(&self) -> &str {
+        "stub"
+    }
+
+    fn classify(
+        &self,
+        _item: &dyn Classifiable,
+    ) -> Result<ExportClassification, ExportControlError> {
+        self.classification
+            .clone()
+            .map_err(|e| ExportControlError::BackendUnavailable(e.to_string()))
+    }
+
+    fn screen_party(&self, _party: &PartyRef) -> Result<ScreeningResult, ExportControlError> {
+        self.screening
+            .clone()
+            .map_err(|e| ExportControlError::BackendUnavailable(e.to_string()))
+    }
+}
+
+/// Build an export context around a caller-supplied provider + consignee.
+fn export_ctx_with<'a>(
+    provider: &'a dyn ExportControlProvider,
+    country: Option<&str>,
+) -> ExportControlContext<'a> {
+    ExportControlContext {
+        provider,
+        recipient: PartyRef {
+            name: "ACME GmbH".to_string(),
+            country: country.map(str::to_string),
+        },
+        exporter_party_id: TEST_TENANT.to_string(),
+        operator_user_id: "ervin".to_string(),
+    }
+}
+
+/// Drive one dispatch from Completed WO to the `mark_shipped` call, with the
+/// supplied export context. Returns `(conn, dsp_id, ship_result)`; the ship tx
+/// is committed only when the call succeeded, so a refusal leaves the DB in the
+/// rolled-back state the assertions inspect.
+fn ship_with_export_ctx(
+    wo_number: &str,
+    export_ctx: &ExportControlContext<'_>,
+    spawner: &dyn InvoiceSpawner,
+    shipped_at: Option<&str>,
+) -> (Connection, String, Result<(), DispatchError>) {
+    let mut conn = setup_db();
+    let meta = meta();
+    let wo_id = create_completed_wo(&mut conn, &meta, wo_number);
+
+    let tx = conn.transaction().unwrap();
+    let dsp = create_dispatch(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        CreateDispatchInputs {
+            wo_id,
+            partner_id: "ptr_acme".to_string(),
+            notes: None,
+            idempotency_key: format!("create-{wo_number}"),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let tx = conn.transaction().unwrap();
+    let result = mark_shipped(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        &dsp.dsp_id,
+        MarkShippedInputs {
+            carrier_kind: CarrierKind::Gls,
+            tracking_number: Some("GLS-EXPORT".to_string()),
+            shipped_at: shipped_at.map(str::to_string),
+            idempotency_key: format!("ship-{wo_number}"),
+        },
+        spawner,
+        export_ctx,
+    );
+    let outcome = match result {
+        Ok(_) => {
+            tx.commit().unwrap();
+            Ok(())
+        }
+        Err(e) => {
+            // No commit — DuckDB rolls the whole tx back on drop.
+            drop(tx);
+            Err(e)
+        }
+    };
+    (conn, dsp.dsp_id, outcome)
+}
+
+fn read_payload<T: serde::de::DeserializeOwned>(conn: &Connection, kind: &str) -> T {
+    let bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM audit_ledger WHERE kind = ? LIMIT 1",
+            duckdb::params![kind],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|e| panic!("no audit row for kind {kind}: {e}"));
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("payload for {kind} did not parse: {e}"))
+}
+
+/// The headline: one shipment fires each of the three `export.*` kinds
+/// exactly once. Before S440 all three counts were zero for every code path
+/// in the workspace — the kinds were defined and type-validated with no writer.
+#[test]
+fn s440_one_shipment_fires_each_export_kind_exactly_once() {
+    let (conn, _dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-COUNT",
+        &test_export_ctx(),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    res.expect("mock provider clears every party");
+
+    assert_eq!(count_kind(&conn, "export.classification_set"), 1);
+    assert_eq!(count_kind(&conn, "export.access_check"), 1);
+    assert_eq!(count_kind(&conn, "export.shipment_logged"), 1);
+    // …alongside, not instead of, the dispatch family.
+    assert_eq!(count_kind(&conn, "mes.dispatch_shipped"), 1);
+}
+
+/// Under the production `MockExportControlProvider` the classification row
+/// records `UNKNOWN` with both code fields null — "no determination has been
+/// made", NOT `NOT_CONTROLLED` (a positive determination that would read to an
+/// auditor as "someone cleared this for export").
+#[test]
+fn s440_mock_backend_records_unknown_never_not_controlled() {
+    let (conn, _dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-UNKNOWN",
+        &test_export_ctx(),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    res.unwrap();
+
+    let p: aberp_dispatch::ExportClassificationSetPayload =
+        read_payload(&conn, "export.classification_set");
+    assert_eq!(p.jurisdiction, "UNKNOWN");
+    assert_eq!(p.eccn, None);
+    assert_eq!(p.usml_category, None);
+    assert_eq!(p.entity_kind, "product");
+    assert_eq!(
+        p.entity_id, "prd_widget",
+        "the classified entity is the WO's finished good"
+    );
+    assert_eq!(p.operator_user_id, "ervin");
+}
+
+/// An EAR determination lands in `eccn` with `jurisdiction = EAR`, and the
+/// shipment row cites the same code — the two rows can never disagree about
+/// what authorization was claimed.
+#[test]
+fn s440_ear_determination_populates_eccn_and_is_cited_on_the_shipment() {
+    let stub = StubExportControl::new(
+        ExportClassification::ECCN("7A994".to_string()),
+        ScreeningResult::Clear,
+    );
+    let (conn, dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-EAR",
+        &export_ctx_with(&stub, Some("de")),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    res.unwrap();
+
+    let c: aberp_dispatch::ExportClassificationSetPayload =
+        read_payload(&conn, "export.classification_set");
+    assert_eq!(c.jurisdiction, "EAR");
+    assert_eq!(c.eccn.as_deref(), Some("7A994"));
+    assert_eq!(c.usml_category, None);
+
+    let s: aberp_dispatch::ExportShipmentLoggedPayload =
+        read_payload(&conn, "export.shipment_logged");
+    assert_eq!(s.ecn_or_authorization.as_deref(), Some("7A994"));
+    assert_eq!(s.shipment_id, dsp_id);
+    assert_eq!(s.recipient_party_id, "ptr_acme");
+    assert_eq!(s.exporter_party_id, TEST_TENANT);
+    assert_eq!(
+        s.recipient_country, "DE",
+        "alpha-2 destination is upper-cased at the write boundary"
+    );
+}
+
+/// An ITAR determination populates `usml_category` and leaves `eccn` null —
+/// the two code fields must never cross over.
+#[test]
+fn s440_itar_determination_populates_usml_not_eccn() {
+    let stub = StubExportControl::new(
+        ExportClassification::USMLCategory("VIII(h)".to_string()),
+        ScreeningResult::Clear,
+    );
+    let (conn, _dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-ITAR",
+        &export_ctx_with(&stub, Some("US")),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    res.unwrap();
+
+    let c: aberp_dispatch::ExportClassificationSetPayload =
+        read_payload(&conn, "export.classification_set");
+    assert_eq!(c.jurisdiction, "ITAR");
+    assert_eq!(c.eccn, None);
+    assert_eq!(c.usml_category.as_deref(), Some("VIII(h)"));
+
+    let s: aberp_dispatch::ExportShipmentLoggedPayload =
+        read_payload(&conn, "export.shipment_logged");
+    assert_eq!(s.ecn_or_authorization.as_deref(), Some("VIII(h)"));
+}
+
+/// The access check records the GRANTED decision too, not only denials —
+/// ITAR's deemed-export rule makes the full decision trail load-bearing. The
+/// reason is never empty.
+#[test]
+fn s440_access_check_records_the_granted_decision_with_a_reason() {
+    let (conn, dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-GRANT",
+        &test_export_ctx(),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    res.unwrap();
+
+    let a: aberp_dispatch::ExportAccessCheckPayload = read_payload(&conn, "export.access_check");
+    assert_eq!(a.decision, "granted");
+    assert_eq!(a.entity_kind, "dispatch");
+    assert_eq!(a.entity_id, dsp_id);
+    assert_eq!(a.operator_user_id, "ervin");
+    assert!(
+        !a.reason.trim().is_empty(),
+        "an empty reason reads as 'the writer forgot the field'"
+    );
+}
+
+/// A denied-party hit REFUSES the shipment in code
+/// ([[trust-code-not-operator]]) and rolls back everything: no state flip, no
+/// stock movement, no invoice draft, and no `export.*` rows either (the
+/// classification row appended a moment earlier goes with them).
+#[test]
+fn s440_denied_party_refuses_the_ship_and_rolls_back_every_write() {
+    let stub = StubExportControl::new(
+        ExportClassification::EAR99,
+        ScreeningResult::Denied("BIS Entity List".to_string()),
+    );
+    let (conn, dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-DENY",
+        &export_ctx_with(&stub, Some("RU")),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    match res {
+        Err(DispatchError::ExportControlDenied { dsp_id: d, reason }) => {
+            assert_eq!(d, dsp_id);
+            assert!(reason.contains("BIS Entity List"), "reason was {reason:?}");
+        }
+        other => panic!("expected ExportControlDenied, got {other:?}"),
+    }
+
+    // Nothing shipped.
+    let live = get_dispatch(&conn, TEST_TENANT, &dsp_id).unwrap().unwrap();
+    assert_eq!(live.state, DispatchState::Drafted);
+    assert_eq!(count_kind(&conn, "mes.dispatch_shipped"), 0);
+    // …and no export row survived the rollback.
+    assert_eq!(count_kind(&conn, "export.classification_set"), 0);
+    assert_eq!(count_kind(&conn, "export.access_check"), 0);
+    assert_eq!(count_kind(&conn, "export.shipment_logged"), 0);
+    // Stock untouched: the WoCompletion +5 widget is still there.
+    assert_eq!(
+        current_stock(&conn, TEST_TENANT, "prd_widget")
+            .unwrap()
+            .unwrap(),
+        Decimal::from_str("5").unwrap()
+    );
+}
+
+/// A RESTRICTED hit refuses too. A restricted party needs a licence and ABERP
+/// has no licence surface to check one against, so "restricted" must not be a
+/// quiet pass — this is the arm most likely to be loosened by accident.
+#[test]
+fn s440_restricted_party_also_refuses_the_ship() {
+    let stub = StubExportControl::new(
+        ExportClassification::EAR99,
+        ScreeningResult::Restricted("licence required".to_string()),
+    );
+    let (conn, dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-RESTRICT",
+        &export_ctx_with(&stub, Some("CN")),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    assert!(
+        matches!(res, Err(DispatchError::ExportControlDenied { .. })),
+        "a restricted screening must refuse, not pass"
+    );
+    let live = get_dispatch(&conn, TEST_TENANT, &dsp_id).unwrap().unwrap();
+    assert_eq!(live.state, DispatchState::Drafted);
+}
+
+/// THE ATOMICITY PROOF. The export rows are appended BEFORE the state flip,
+/// so the dangerous failure mode is an export row that outlives a shipment
+/// that never happened. A spawner failure — which occurs strictly AFTER all
+/// three export appends — must take every one of them down with it.
+#[test]
+fn s440_export_rows_roll_back_with_a_failed_ship() {
+    let spawner = MockInvoiceSpawner::return_err("billing exploded");
+    let (conn, dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-ATOMIC",
+        &test_export_ctx(),
+        &spawner,
+        None,
+    );
+    assert!(
+        matches!(res, Err(DispatchError::InvoiceSpawnFailed(_))),
+        "expected the spawner failure to surface, got {res:?}"
+    );
+
+    let live = get_dispatch(&conn, TEST_TENANT, &dsp_id).unwrap().unwrap();
+    assert_eq!(live.state, DispatchState::Drafted);
+    assert_eq!(
+        count_kind(&conn, "export.classification_set"),
+        0,
+        "an export.classification_set row survived a shipment that rolled back — \
+         the audit append is NOT atomic with the business write"
+    );
+    assert_eq!(count_kind(&conn, "export.access_check"), 0);
+    assert_eq!(count_kind(&conn, "export.shipment_logged"), 0);
+}
+
+/// The backend failing to ANSWER fails the ship loud. Shipping controlled
+/// goods on an unanswered screening is exactly what the gate exists to
+/// prevent, so an unavailable backend must never degrade to "assume clear".
+#[test]
+fn s440_unavailable_backend_fails_the_ship_loud() {
+    let stub = StubExportControl::classify_fails();
+    let (conn, dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-BACKEND",
+        &export_ctx_with(&stub, Some("DE")),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    match res {
+        Err(DispatchError::ExportControlUnavailable(msg)) => {
+            assert!(msg.contains("classify"), "message was {msg:?}");
+        }
+        other => panic!("expected ExportControlUnavailable, got {other:?}"),
+    }
+    let live = get_dispatch(&conn, TEST_TENANT, &dsp_id).unwrap().unwrap();
+    assert_eq!(live.state, DispatchState::Drafted);
+    assert_eq!(count_kind(&conn, "export.classification_set"), 0);
+}
+
+/// A backend that answers a malformed ECCN fails the ship rather than writing
+/// a bad code into an append-only, hash-chained row that can never be
+/// corrected.
+#[test]
+fn s440_malformed_eccn_from_the_backend_fails_the_ship() {
+    let stub = StubExportControl::new(
+        ExportClassification::ECCN("not-an-eccn".to_string()),
+        ScreeningResult::Clear,
+    );
+    let (conn, _dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-BADECCN",
+        &export_ctx_with(&stub, Some("DE")),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    match res {
+        Err(DispatchError::ExportControlUnavailable(msg)) => {
+            assert!(msg.contains("malformed ECCN"), "message was {msg:?}");
+        }
+        other => panic!("expected the malformed ECCN to be refused, got {other:?}"),
+    }
+    assert_eq!(count_kind(&conn, "export.classification_set"), 0);
+}
+
+/// An unknown destination is recorded as an EMPTY country, never guessed. A
+/// fabricated destination on an export record is worse than a visibly
+/// incomplete one.
+#[test]
+fn s440_unknown_recipient_country_is_recorded_empty_not_guessed() {
+    let stub = StubExportControl::new(ExportClassification::EAR99, ScreeningResult::Clear);
+    let (conn, _dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-NOCOUNTRY",
+        &export_ctx_with(&stub, None),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    res.unwrap();
+
+    let s: aberp_dispatch::ExportShipmentLoggedPayload =
+        read_payload(&conn, "export.shipment_logged");
+    assert_eq!(s.recipient_country, "");
+    // EAR99 IS the code an exporter cites, so it is still carried.
+    assert_eq!(s.ecn_or_authorization.as_deref(), Some("EAR99"));
+}
+
+/// The epoch-ms stamps come from the shipment's own timestamp, not from
+/// `now()`, so a back-dated ship records the date it claims. All three rows
+/// share one stamp — an auditor reading them apart must see one event, not a
+/// three-second-apart sequence.
+#[test]
+fn s440_export_stamps_track_the_operator_supplied_ship_time() {
+    let (conn, _dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-STAMP",
+        &test_export_ctx(),
+        &NoopInvoiceSpawner,
+        Some("2026-06-03T12:00:00Z"),
+    );
+    res.unwrap();
+
+    // 2026-06-03T12:00:00Z
+    let expected_ms = 1_780_488_000_000_i64;
+    let c: aberp_dispatch::ExportClassificationSetPayload =
+        read_payload(&conn, "export.classification_set");
+    let a: aberp_dispatch::ExportAccessCheckPayload = read_payload(&conn, "export.access_check");
+    let s: aberp_dispatch::ExportShipmentLoggedPayload =
+        read_payload(&conn, "export.shipment_logged");
+    assert_eq!(c.classified_at_ms, expected_ms);
+    assert_eq!(a.checked_at_ms, expected_ms);
+    assert_eq!(s.shipped_at_ms, expected_ms);
 }
