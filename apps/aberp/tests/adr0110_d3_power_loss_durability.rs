@@ -302,3 +302,123 @@ fn the_wal_is_in_the_durable_set_only_because_the_write_path_fsynced_it() {
          un-fsynced posture with a durable_ack call in front of it."
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// PR #37 ADVERSARIAL — B2. The mirror-ahead fork on the ack's ERROR path.
+//
+// Test body adapted from the adversarial's own `attack_d3_residuals.rs::f1`,
+// pulled in as the regression pin for the fix.
+// ══════════════════════════════════════════════════════════════════════
+
+/// **The B2 pin.** When the data flush fails, the audit mirror must NOT record
+/// the write the operator was just told did not happen.
+///
+/// The first cut of this port had `WriteGuard::drop` `fsync` the mirror and
+/// `durable_ack` run strictly afterwards, so the mirror was unconditionally
+/// made durable FIRST. On the happy path that merely shrank a window. On the
+/// ack's failure path it froze a fork:
+///
+/// * `mark_paid` returns `Err` — the operator is told the payment did not go
+///   through, and (presumably) takes it again;
+/// * the mirror durably holds the `InvoicePaymentRecorded` entry anyway;
+/// * boot's `attempt_db_auto_recovery(mirror_ahead)` → `replay_mirror_delta`
+///   replays it into `audit_ledger` and the payment RESURRECTS.
+///
+/// Pre-D3 that state was unreachable, because `mark_paid` returned `Ok` here —
+/// so the first cut of D3 *introduced* a fork on the very path it existed to
+/// protect. The fix reorders the flush ahead of the mirror sync and SKIPS the
+/// mirror sync when it fails, leaving the mirror behind (benign, self-healing)
+/// rather than ahead.
+///
+/// The failure is injected the same way the crate's own fault-injection suite
+/// does it: unlink the main DB path. The `Handle`'s open `Connection` keeps its
+/// fd so the commit still succeeds; only the flush's fresh `File::open` sees
+/// `ENOENT`.
+#[test]
+fn b2_failed_data_flush_must_not_leave_the_mirror_ahead_of_the_db() {
+    let live = tenant_dir("mirror-ahead");
+    let db = live.join(DB_FILE);
+    provision(&db);
+
+    let handle = aberp_db::Handle::open_default(&db, tenant_id()).expect("handle");
+    enter_debounce_shadow(&handle);
+
+    // Break ONLY the flush's reach.
+    std::fs::remove_file(&db).expect("unlink the main DB path");
+
+    let mirror = live.join(MIRROR_FILE);
+    let before = aberp_audit_ledger::read_mirror_entries(&mirror)
+        .expect("read mirror")
+        .len();
+
+    let invoice_id = format!("inv_{}", ulid::Ulid::new());
+    let outcome = aberp::mark_invoice_paid::mark_paid(
+        &handle,
+        tenant_id(),
+        TEST_BINARY_HASH,
+        "operator@test",
+        aberp::mark_invoice_paid::MarkPaidInput {
+            invoice_id: invoice_id.clone(),
+            paid_at: "2026-08-08".to_string(),
+            amount_minor: 4_242_424,
+            currency: "HUF".to_string(),
+            method: aberp::audit_payloads::PaymentMethod::BankTransfer,
+            reference: Some("ACK-FAILS".to_string()),
+        },
+    );
+
+    assert!(
+        outcome.is_err(),
+        "premise: with the flush's reach broken, mark_paid must fail — otherwise \
+         this test is not measuring the error path at all"
+    );
+
+    let after = aberp_audit_ledger::read_mirror_entries(&mirror)
+        .expect("read mirror")
+        .len();
+
+    assert_eq!(
+        after,
+        before,
+        "ADR-0110 MIRROR-AHEAD FORK. mark_paid returned Err — the operator was \
+         told invoice {invoice_id} was NOT marked paid ({outcome:?}) — but the \
+         audit MIRROR at {} grew from {before} to {after} entries: it durably \
+         recorded the payment anyway.\n\n\
+         Defense's boot auto-heal replays the mirror into `audit_ledger`, so \
+         this payment RESURRECTS on the next boot, after the operator was told \
+         it failed and has presumably taken it again.\n\n\
+         The data flush must happen BEFORE the mirror sync, and the mirror sync \
+         must be SKIPPED when it fails.",
+        mirror.display()
+    );
+}
+
+/// The other half of B2: the reorder must not have broken the happy path. On a
+/// successful ack the mirror still tracks the DB in lockstep — mirror-behind is
+/// tolerated, but it must not become the permanent resting state.
+#[test]
+fn b2_successful_ack_still_syncs_the_mirror_in_lockstep() {
+    let live = tenant_dir("mirror-lockstep");
+    let db = live.join(DB_FILE);
+    provision(&db);
+
+    let handle = aberp_db::Handle::open_default(&db, tenant_id()).expect("handle");
+    enter_debounce_shadow(&handle);
+
+    let mirror = live.join(MIRROR_FILE);
+    let before = aberp_audit_ledger::read_mirror_entries(&mirror)
+        .expect("read mirror")
+        .len();
+
+    mark_one_paid(&handle, 7_777, "B2-HAPPY-PATH");
+
+    let after = aberp_audit_ledger::read_mirror_entries(&mirror)
+        .expect("read mirror")
+        .len();
+    assert!(
+        after > before,
+        "the reorder must not have disabled the lockstep mirror sync on the \
+         SUCCESS path: mirror stayed at {before} entries across a successful \
+         money-path ack"
+    );
+}

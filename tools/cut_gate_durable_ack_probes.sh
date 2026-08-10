@@ -81,6 +81,26 @@ swallow_mut="perl -0pi -e 's/    db\.durable_ack\(\)\n        \.context\(\"ADR-0
 
 probe "P7 the call kept but its error SWALLOWED (rule-11 downgrade) -> RED" 1 "$swallow_mut"
 
+# P9/P10 — PR #37 adversarial B1. P7 above only fails because the site it
+# mutates (issue_invoice) happens to have no `?` in the three lines after the
+# ack. The adversarial defeated the window-based D3-C by downgrading the ack at
+# mark_invoice_paid.rs and letting an UNRELATED trailing `?;` satisfy the
+# window — gate green, clippy clean, ack dead. These probe that exact shape at
+# a site that is NOT the P7 site, so the calibration accident cannot hide it.
+B1_SWALLOW='if let Err(e) = db.durable_ack() {\n        tracing::warn!(error = %e, "durable-ack failed; continuing");\n    }\n    let _unrelated = is_canonical_iso_date(\&input.paid_at)\n        .then_some(())\n        .ok_or_else(|| anyhow!("unrelated"))?;'
+b1_mut="perl -0pi -e 's/    db\.durable_ack\(\)\n        \.context\(\"ADR-0110 D3 durable-ack fsync after mark-paid commit\"\)\?;/    ${B1_SWALLOW}/' apps/aberp/src/mark_invoice_paid.rs"
+
+probe "P9 ack downgraded but an UNRELATED trailing ?; follows (B1 bypass) -> RED" 1 "$b1_mut"
+
+# P10 — the non-wrapper half of the same bypass: the call is left bare (its own
+# Result dropped on the floor) with a propagating statement right after it. The
+# window check read the neighbour's `?` and passed; the statement-anchored
+# check must not.
+BARE='db.durable_ack();\n    let _unrelated = is_canonical_iso_date(\&input.paid_at)\n        .then_some(())\n        .ok_or_else(|| anyhow!("unrelated"))?;'
+bare_mut="perl -0pi -e 's/    db\.durable_ack\(\)\n        \.context\(\"ADR-0110 D3 durable-ack fsync after mark-paid commit\"\)\?;/    ${BARE}/' apps/aberp/src/mark_invoice_paid.rs"
+
+probe "P10 bare ack + a neighbouring ?; (statement-anchor test) -> RED" 1 "$bare_mut"
+
 # P8 — precision, not just sensitivity. A check that flagged every site would
 # also go red here and would be useless; assert it names the ONE mutated site
 # and clears the other four.

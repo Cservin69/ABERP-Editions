@@ -170,62 +170,128 @@ fn d3_ack_journals_the_wal_not_just_the_main_db() {
     );
 }
 
-/// **Defense-specific pin #2.** The WAL arm has its own *reach*, and it must
-/// fail loud the same way the main-file arm does.
+/// **Defense-specific pin #2.** A tenant with no WAL must still ack, and must
+/// not journal a WAL it never synced.
 ///
-/// The WAL is `fsync`'d behind an `if self.wal_path.exists()` guard. A
-/// plausible-looking refactor that widened that guard into a swallow — e.g.
-/// `let _ = fsync_path(&self.wal_path);` — would keep every other D3 gate green
-/// (the call site is still there, still propagates its outer error) while
-/// silently dropping the one file that matters most. Here the WAL exists, is
-/// then removed, and the ack must surface a typed failure naming it.
+/// The WAL is flushed behind an `if self.wal_path.exists()` guard. Two ways
+/// that can go wrong in opposite directions: unconditionally opening
+/// `wal_path` would fail every ack on a WAL-less tenant, and journalling the
+/// WAL without syncing it would make the durability journal lie — which the
+/// power-loss spec builds its copy manifest from, so it would silently widen
+/// the "durable" set to include a file that is not.
+///
+/// Uses a handle with NO committed write, so `last_ack` is empty and
+/// `durable_ack` takes its direct-flush fallback. That exercises the fallback
+/// path as well.
 #[test]
-fn d3_ack_reaches_the_wal_fault() {
-    let dir = scratch_dir("wal-reach");
+fn d3_ack_on_a_wal_less_tenant_succeeds_and_journals_no_wal() {
+    let dir = scratch_dir("wal-absent");
     let db = dir.join("aberp.duckdb");
     let wal = dir.join("aberp.duckdb.wal");
     let handle = Handle::open_default(&db, tenant()).expect("open shared Handle");
 
+    assert!(
+        !wal.exists(),
+        "premise: a handle with no committed write must have no WAL"
+    );
+
+    handle
+        .durable_ack()
+        .expect("a tenant whose WAL is absent must still ack on the main file alone");
+
+    assert!(
+        handle.fsynced_paths().iter().any(|p| p == &db),
+        "the main DB file must still be journalled: {:?}",
+        handle.fsynced_paths()
+    );
+    assert!(
+        !handle.fsynced_paths().iter().any(|p| p == &wal),
+        "an absent WAL must not be journalled as synced — the journal must mean \
+         'this is on stable storage', never 'we tried': {:?}",
+        handle.fsynced_paths()
+    );
+}
+
+/// **B3 pin (PR #37 adversarial).** The parent-directory `fsync` must be
+/// recorded, and therefore assertable.
+///
+/// Before this, dropping just the directory `fsync` was invisible to
+/// EVERYTHING: both test files, all four gate checks and all nine probes —
+/// because `fsync_path(parent)` bypassed the journal entirely. The directory
+/// flush is what makes the rename/create of the DB and WAL entries themselves
+/// durable on POSIX, so an unpinned one is a silent hole.
+///
+/// Recorded in its own journal (`fsynced_dirs`) rather than `fsynced_paths`, so
+/// the power-loss spec's copy manifest keeps meaning "files carrying rows".
+#[test]
+fn b3_the_tenant_directory_fsync_is_recorded_and_therefore_pinned() {
+    let dir = scratch_dir("dir-journal");
+    let db = dir.join("aberp.duckdb");
+    let handle = Handle::open_default(&db, tenant()).expect("open shared Handle");
+
+    handle
+        .durable_ack()
+        .expect("durable_ack on an intact tenant");
+
+    let dirs = handle.fsynced_dirs();
+    assert!(
+        dirs.iter().any(|p| p == &dir),
+        "ADR-0110 D3 B3 REGRESSION: the tenant directory {} is not in the \
+         directory durability journal ({dirs:?}). Either the parent-directory \
+         fsync was dropped, or it stopped being recorded — and an unrecorded \
+         fsync is one no test and no gate can see.",
+        dir.display()
+    );
+
+    // Precision: the directory must NOT leak into the file journal, or the
+    // power-loss spec would try to treat it as a file to copy.
+    assert!(
+        !handle.fsynced_paths().iter().any(|p| p == &dir),
+        "the tenant directory must stay OUT of fsynced_paths (files only): {:?}",
+        handle.fsynced_paths()
+    );
+}
+
+/// **Fail-closed park.** An unclaimed flush FAILURE must not be erased by a
+/// later successful write.
+///
+/// The B2 reorder moved the flush into the guard drop and parks its outcome for
+/// `durable_ack` to claim. A money path holds no lock between dropping its
+/// guard and claiming, so another writer (Defense runs many daemons) can drop a
+/// guard in that window. If a later `Ok` overwrote an unclaimed `Err`, the
+/// money path would claim someone else's success and ack a write whose own
+/// flush failed — the exact lie the whole D3 apparatus exists to prevent.
+///
+/// The reverse mis-attribution (claiming someone else's `Err`) is the safe
+/// direction: it fails an ack that may have been durable, which rule 11 already
+/// prefers over acking one that was not.
+#[test]
+fn an_unclaimed_flush_failure_is_not_erased_by_a_later_successful_write() {
+    let dir = scratch_dir("fail-closed");
+    let db = dir.join("aberp.duckdb");
+    let handle = Handle::open_default(&db, tenant()).expect("open shared Handle");
+
+    // Write #1 with the flush's reach broken -> parks an Err that nobody claims.
     commit_a_row(&handle);
-    assert!(wal.exists(), "precondition: a WAL must exist to break");
+    let restore = std::fs::read(&db).expect("snapshot the db bytes");
+    std::fs::remove_file(&db).expect("break the reach");
+    commit_a_row(&handle); // guard drop flushes -> Err parked
 
-    // Make the main file's fsync succeed and the WAL's fail: replace the WAL
-    // path with a directory, which `File::open` succeeds on but `sync_all`
-    // handles differently — so instead, remove it after stat'ing. Removing it
-    // makes `wal_path.exists()` false and the arm is skipped, which is CORRECT
-    // (nothing to flush). To exercise the fault we must keep the path visible
-    // to `exists()` but unopenable, so swap in a path we cannot open: a
-    // dangling symlink.
-    std::fs::remove_file(&wal).expect("remove the real WAL");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(dir.join("no-such-wal-target"), &wal)
-        .expect("plant a dangling symlink where the WAL was");
+    // Repair the reach and let a LATER write succeed, without claiming.
+    std::fs::write(&db, &restore).expect("restore the db path");
+    commit_a_row(&handle); // guard drop flushes -> Ok, must NOT erase the Err
 
-    #[cfg(unix)]
-    {
-        // `Path::exists()` follows symlinks, so a DANGLING link reports false —
-        // which would silently skip the arm and make this test vacuous. Assert
-        // the shape we actually planted before drawing any conclusion from it.
-        assert!(
-            !wal.exists(),
-            "a dangling symlink should not report exists(); test premise changed"
-        );
-        assert!(
-            std::fs::symlink_metadata(&wal).is_ok(),
-            "the symlink itself must be present"
-        );
-        // With `exists()` false the WAL arm is correctly SKIPPED and the ack
-        // succeeds on the main file alone. That is the designed behaviour: a
-        // tenant with no WAL has nothing to flush. Pin it so a future change
-        // that starts unconditionally opening `wal_path` — and would then fail
-        // every ack on a WAL-less tenant — is caught here.
-        handle
-            .durable_ack()
-            .expect("a tenant whose WAL is absent must still ack on the main file alone");
-        assert!(
-            !handle.fsynced_paths().iter().any(|p| p == &wal),
-            "an absent WAL must not be journalled as synced — the journal must \
-             mean 'this is on stable storage', never 'we tried'"
-        );
-    }
+    let claimed = handle.durable_ack();
+    assert!(
+        claimed.is_err(),
+        "ADR-0110 D3 REGRESSION: an unclaimed flush FAILURE was erased by a \
+         later successful write. A money path claiming here would be told its \
+         write is durable on the strength of somebody else's fsync."
+    );
+
+    // …and once claimed, the failure is consumed: the next ack reflects the
+    // current state rather than latching forever.
+    handle
+        .durable_ack()
+        .expect("a claimed failure must not latch — the next ack flushes afresh");
 }
