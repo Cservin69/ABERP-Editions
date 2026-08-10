@@ -153,6 +153,17 @@ pub fn mark_paid(
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER mark-paid")?;
 
+    // 6. ADR-0110 D3 — the durable-ack boundary. The guard drop already fsync'd
+    //    the audit MIRROR, and this payment is recorded as an audit row
+    //    (`InvoicePaymentRecorded`) which `audit_query::payment_record_for`
+    //    reads the state back from — so the mirror fsync alone already made the
+    //    payment recoverable. `durable_ack` still runs, because the DB's own
+    //    `audit_ledger` table is what the idempotency gate earlier in this
+    //    function reads, and a payment durable ONLY in the mirror re-opens the
+    //    exact double-payment window that gate exists to close.
+    db.durable_ack()
+        .context("ADR-0110 D3 durable-ack fsync after mark-paid commit")?;
+
     // 7. Build the PaymentRecord echo from the inputs (the ledger
     //    has just persisted them verbatim).
     let payment = PaymentRecord {

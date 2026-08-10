@@ -986,6 +986,19 @@ pub async fn issue_from_parsed<P: MnbRatesProvider + ?Sized>(
         .context("audit-ledger chain verification failed AFTER issuance")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
+    // ADR-0110 D3 — the durable-ack boundary. `run_single_tx` has committed and
+    // dropped the WriteGuard (whose post-commit hook fsync'd the audit mirror),
+    // but nothing has fsync'd the live DB or its WAL: the `invoice` +
+    // `invoice_line` rows this call just created are still only in an
+    // un-fsync'd WAL until the debounced D2 checkpoint runs, up to 60s later.
+    // Flush them before the operator is told "invoice created".
+    //
+    // A failure here is propagated, never warned: the tx has committed, so the
+    // choice is "tell the operator it failed" vs "promise durability we did not
+    // achieve" (CLAUDE.md rule 11). Cut-gate CHECK D3-C enforces the `?`.
+    db.durable_ack()
+        .context("ADR-0110 D3 durable-ack fsync after invoice issuance commit")?;
+
     tracing::info!(
         invoice_number = %invoice_number,
         entries_verified = verified,
