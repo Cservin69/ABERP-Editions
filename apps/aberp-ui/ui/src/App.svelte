@@ -527,15 +527,16 @@
          declaration in <script>. -->
     <h1 class="wordmark">
       {#if logoFailed}
-        <!-- Default Áben brand lockup: the gold mark + ABERP wordmark. Shown
-             whenever no operator logo is present (the editions default). The
-             mark is the real Á-built-X-like logomark — armL / armR / accent
-             facets, the upper-right arm escaping into the acute accent. Paths
-             and per-facet gold gradients are byte-identical to
+        <!-- Default Áben brand lockup: the gold mark + the edition wordmark
+             — "ABERP-Defense" on this, the Defense line. Shown whenever no
+             operator logo is present (the editions default). The mark is the
+             real Á-built-X-like logomark — armL / armR / accent facets, the
+             upper-right arm escaping into the acute accent. Paths and
+             per-facet gold gradients are byte-identical to
              static/brand-mark.svg (the overlay-verified trace); the viewBox
              tightly frames the letterform for topbar height. `aria-hidden` on
-             the SVG keeps the `<h1>` text ("ABERP") the single screen-reader
-             source of truth. -->
+             the SVG keeps the `<h1>` text ("ABERP-Defense") the single
+             screen-reader source of truth. -->
         <svg
           class="wordmark__mark"
           viewBox="160 352 612 438"
@@ -573,11 +574,11 @@
           <path fill="url(#wm-armR)" d="M495.5,753.2C488.5,737.4 475.6,708.4 466.9,688.7C458.2,668.9 448.7,647.8 445.8,641.8L440.5,630.7L467.9,603.8C482.9,589.0 495.6,577.0 496.1,577.2C497.0,577.5 509.4,604.4 516.9,622.0C518.4,625.6 523.8,637.5 528.8,648.5C541.4,676.3 558.4,714.4 570.2,741.0C575.7,753.4 581.9,767.4 584.1,772.1C586.2,776.8 588.0,781.0 588.0,781.3C588.0,781.7 570.1,782.0 548.2,782.0L508.4,782.0L495.5,753.2Z" />
           <path fill="url(#wm-accent)" d="M390.3,712.7C387.1,709.8 379.1,702.9 372.5,697.4C365.9,691.9 352.2,680.5 342.0,672.0C331.8,663.5 321.8,655.1 319.7,653.5L316.0,650.5L328.7,636.5C350.7,612.3 376.8,587.1 405.4,562.5C414.0,555.2 455.9,523.8 467.5,516.0C562.2,452.6 657.9,407.4 765.8,375.5C767.9,374.9 768.0,375.2 768.0,379.7L768.0,384.5L762.7,386.7C730.5,400.3 718.0,405.9 697.0,416.1C671.5,428.6 645.0,442.5 629.5,451.5C624.5,454.4 616.5,459.1 611.5,462.0C564.0,489.6 498.6,537.6 460.2,572.9C436.0,595.2 396.2,637.4 390.7,646.7C390.2,647.5 396.2,653.9 406.7,664.2C442.5,698.9 460.6,717.0 460.2,717.5C459.9,717.8 445.4,718.0 427.9,718.0L396.1,718.0L390.3,712.7Z" />
         </svg>
-        <span class="wordmark__text">ABERP</span>
+        <span class="wordmark__text">ABERP-Defense</span>
       {:else}
         <img
           src="/aberp-logo.png"
-          alt="ABERP"
+          alt="ABERP-Defense"
           class="wordmark__img"
           onerror={() => (logoFailed = true)}
         />
