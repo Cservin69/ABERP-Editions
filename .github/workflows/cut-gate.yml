@@ -70,3 +70,30 @@ jobs:
         # gate FAILS — so a green gate above is a meaningful signal, not a
         # gate that can no longer go red.
         run: bash tools/cut_gate_negative_probes.sh
+
+      - name: ADR-0110 D3 durable-ack gate (money-path census, ENFORCED)
+        # D3 ports Portable PROD_v2.33.6's power-loss durability to Defense's
+        # money paths. One test is not a gate: the fault-injection suite
+        # (crates/aberp-db/tests/durable_ack_fault_injection.rs) proves the ack
+        # really reaches the filesystem TODAY and runs in ci.yml; THIS keeps it
+        # that way, by holding the census of money-path `Handle::durable_ack()`
+        # sites closed in BOTH directions — a deleted call and an unregistered
+        # new one are equally red — and by requiring each call to PROPAGATE its
+        # error (CHECK D3-C), since a present-but-swallowed ack is the exact
+        # rule-11 downgrade that would look green while promising nothing.
+        # It is the only cover for the three ack sites no unattended test
+        # reaches (modification, storno, AP status change — all need NAV or an
+        # operator). Enforcement is explicit here as well as defaulted in the
+        # script, so it cannot be silently weakened by a one-line script edit.
+        env:
+          ENFORCE_DURABLE_ACK: "1"
+        run: bash tools/cut_gate_durable_ack.sh
+
+      - name: Prove the durable-ack gate has teeth (negative probes)
+        # Plants each real regression shape — the call deleted, commented out
+        # "just for now", an unregistered new call site, a census entry dropped,
+        # and the call kept but its error swallowed — and asserts RED. Pins the
+        # non-triggers too: the unmutated tree stays GREEN and a doc-comment
+        # mention is never counted as a call, because a gate that cries wolf
+        # gets switched off. Also asserts a de-gated run ANNOUNCES itself.
+        run: bash tools/cut_gate_durable_ack_probes.sh

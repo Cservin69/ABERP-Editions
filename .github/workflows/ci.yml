@@ -218,6 +218,16 @@ jobs:
       - name: ADR-0105 audit lock-domain e2e (cross-domain fork)
         run: cargo test -p aberp-db --test audit_lock_domain_e2e --locked -- --nocapture --test-threads=1
 
+      # ADR-0110 D3 — same rationale as the two steps above. This is the
+      # acceptance proof that `Handle::durable_ack` actually REACHES the
+      # filesystem (main file + WAL) rather than returning Ok and journalling
+      # syncs that never happened. It is the counterpart to the census cut-gate
+      # in cut-gate.yml: the gate keeps the ack CALLED, this keeps the ack REAL.
+      # Surfaced before the broad workspace Test so the verdict is visible even
+      # if a later step fails.
+      - name: ADR-0110 D3 durable-ack fault injection (fsync reach)
+        run: cargo test -p aberp-db --test durable_ack_fault_injection --locked -- --nocapture
+
       - name: Test (${{ matrix.edition }}, --locked)
         run: cargo test --workspace --locked ${{ matrix.features }}
 

@@ -1,0 +1,51 @@
+# ADR-0110 D3 — the FROZEN money-path durable-ack census.
+#
+# One line per production call site of `Handle::durable_ack()`: the ack
+# boundaries where an operator is told a money-path write succeeded, and where
+# that write must therefore already be in the power-loss durable set (ADR-0110
+# R1). `tools/cut_gate_durable_ack.sh` holds this set closed in BOTH directions:
+#
+#   * a site that loses its `durable_ack()` call goes red (the regression that
+#     actually matters — a refactor silently un-durables invoicing);
+#   * a NEW `durable_ack()` call site that is not listed here goes red, so
+#     growth is a deliberate, reviewed edit of this file and not a drive-by;
+#   * a site that KEEPS the call but SWALLOWS its error goes red (CHECK D3-C).
+#     Added after the PR #59 adversarial found that rewriting
+#     `db.durable_ack().context(..)?` as
+#     `if let Err(e) = db.durable_ack() { warn!(..) }` — the exact ADR-0110 R3 /
+#     CLAUDE.md rule-11 downgrade — left the gate green. A present-but-ignored
+#     ack is the 2026-08-08 posture with a log line.
+#
+# Format: <path>\t<function>\t<what the operator was told>
+# Lines starting with '#' and blank lines are ignored.
+#
+# Adding a site: add the call, add the line here, and say in the PR why that
+# ack is a money path. Removing one: it must be because the ack itself is gone.
+#
+# NOT listed, deliberately:
+#   * `incoming_invoices::change_status`'s early `from_parsed == to_status`
+#     return — it writes nothing, so there is nothing to make durable.
+#   * every non-money write (quotes, inventory, MES, catalogue, email outbox).
+#     ADR-0110 bounds the blast radius on purpose: fsyncing every write in the
+#     system would put the cost on paths that do not carry the risk. The scope
+#     came from ONE incident.
+#
+# DEFENSE DIVERGENCE (read before reasoning from the Portable ADR).
+# On Portable the standing warning is "H4 — still unbuilt — is what would cover
+# the rest". That is FALSE here and the sentence has been removed rather than
+# carried over. Defense HAS a built, validated durable checkpoint
+# (`aberp_snapshot::durable_checkpoint` / `live_durable_checkpoint`, driven from
+# `aberp_db::Handle`'s debounced post-commit hook, crash-safe via a journaled
+# `atomic_install`). There is no "H4" identifier anywhere in this tree.
+#
+# So the residual Defense carries after D3 is NARROWER than Portable's: a
+# non-money write is covered by the debounced checkpoint within
+# DEFAULT_MIN_CHECKPOINT_INTERVAL (60s) rather than not at all. D3 exists here
+# to close the *window* on money paths (ack-time vs up-to-60s-later), not to
+# substitute for a checkpoint that does not exist.
+
+apps/aberp/src/issue_invoice.rs	issue_from_parsed	"invoice created" (invoice + invoice_line rows)
+apps/aberp/src/issue_modification.rs	modification_from_inputs	"modification issued" (burns a NAV number)
+apps/aberp/src/issue_storno.rs	storno_from_inputs	"storno issued" (cancels a filed document)
+apps/aberp/src/mark_invoice_paid.rs	mark_paid	"marked paid" (AR payment record)
+apps/aberp/src/incoming_invoices.rs	change_status	"marked paid" (AP ap_invoice.status UPDATE)
