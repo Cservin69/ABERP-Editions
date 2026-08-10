@@ -105,19 +105,23 @@ export function isZeroContribution(rate: ToleranceCostRate): boolean {
   );
 }
 
-/** The marker the backend's `SEED_NOTE` opens with (see
- * `apps/aberp/src/quoting_tolerance_cost_rates.rs`). Matched as a **prefix**
- * rather than by full equality so the long bilingual sentence does not have to
- * be duplicated verbatim on this side, and so an operator who appends their own
- * note to a still-untuned seed row keeps the seed badge. */
-export const SEED_NOTE_MARKER = "SEED —";
+/** The actor the backend stamps on a row it wrote itself (boot seed or the
+ * seed upgrade). Every CRUD write stamps the operator's login instead, so this
+ * is the authoritative "no human owns this row yet" signal. */
+export const SEED_ACTOR = "boot";
 
-/** `true` when this row still carries the boot seed's provenance stamp, i.e.
- * the numbers are the researched **default EU/DE machine-shop** values and NOT
- * this shop's measured ones. Any operator write through the form replaces
- * `notes`, so the badge clears as soon as a human owns the row. Pure. */
+/** `true` when this row is still the boot seed's, i.e. the numbers are the
+ * researched **default EU/DE machine-shop** values and NOT this shop's measured
+ * ones.
+ *
+ * N2 (PR #38 adversarial): this deliberately keys on `updated_by_actor`, NOT on
+ * the `notes` stamp. The edit form pre-fills `notes` from the row, so an
+ * operator who changes only the numbers re-submits `SEED_NOTE` **verbatim** — a
+ * genuinely tuned row would have carried the seed badge forever. The actor
+ * cannot be spoofed from the form: the backend overwrites it with the caller's
+ * login on every write. Pure. */
 export function isSeedDefault(rate: ToleranceCostRate): boolean {
-  return (rate.notes ?? "").trimStart().startsWith(SEED_NOTE_MARKER);
+  return rate.updated_by_actor === SEED_ACTOR;
 }
 
 /** The Status-column chip. Three states, because "not zero" is NOT the same as

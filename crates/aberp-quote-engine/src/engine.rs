@@ -194,6 +194,29 @@ pub const IT_GRADE_STANDARD_MAX: u8 = 11;
 /// golden-guarded constant (ADR-0097 Q4); the rate stays operator-tunable.
 pub const GRINDING_ESCALATION_MIN_PER_CRITICAL_FEATURE: f64 = 12.0;
 
+/// Per-part ceiling on the total grinding-escalation minutes
+/// ([`GRINDING_ESCALATION_MIN_PER_CRITICAL_FEATURE`] × critical features).
+///
+/// The per-feature adder is **flat and size-independent**, so without a ceiling
+/// the term grows without bound in the number of GD&T callouts: 8 callouts on a
+/// pocket-sized bracket charged 96 min of grinding, which at a 2.50 EUR/min
+/// grinder is 240 EUR of a ~400 EUR line — a figure driven purely by *how many
+/// boxes a draughtsman ticked*, not by how much material is actually ground.
+///
+/// `48.0` = four features' worth. The model is that the 12 min represents a
+/// refixture plus spark-out; past a handful of ground features those share one
+/// setup, and the part has stopped being "a milled part with a ground feature"
+/// and become a dedicated grinding job that a human must quote. When the cap
+/// binds, the reasoning log says so loudly and asks for that review
+/// (CLAUDE.md rule 12) rather than silently absorbing the difference.
+///
+/// The cap is **monotone downward** — it can only ever reduce a quote, never
+/// inflate one — and does not move any part with ≤ 4 critical callouts, so
+/// every existing golden and the ADR-0097 T7 validation numbers are unchanged.
+/// Pinned, golden-guarded (ADR-0097 Q4); introduced with the PR that first
+/// switches `grinding_escalation` on in the boot seed.
+pub const GRINDING_ESCALATION_MAX_MIN_PER_PART: f64 = 48.0;
+
 /// The outcome of normalising a [`ToleranceSpec`] onto the internal tightness
 /// scale: the resolved [`ToleranceRange`] band, the manual-review flag (set
 /// only by [`ToleranceSpec::PerDrawing`] — ADR-0097 Q5), and a deterministic
@@ -1604,7 +1627,8 @@ fn tolerance_op_cost(
             .find(|r| r.family == MachineFamily::Grinder.as_db_str())
             .map(|r| r.attended_rate_eur_per_min)
             .unwrap_or(effective_rate_eur_per_min);
-        let grinding_min = GRINDING_ESCALATION_MIN_PER_CRITICAL_FEATURE * (n_critical as f64);
+        let uncapped_min = GRINDING_ESCALATION_MIN_PER_CRITICAL_FEATURE * (n_critical as f64);
+        let grinding_min = uncapped_min.min(GRINDING_ESCALATION_MAX_MIN_PER_PART);
         let c = grinding_min * grinder_rate;
         log.push(format!(
             "[tolerance] grinding escalation (band={band}): {gm:.4} min ({per:.4}/feat * {n} feat) * grinder_rate={gr:.4} EUR/min = {c:.4} EUR",
@@ -1615,6 +1639,14 @@ fn tolerance_op_cost(
             gr = grinder_rate,
             c = c,
         ));
+        if grinding_min < uncapped_min {
+            log.push(format!(
+                "[tolerance] grinding escalation CAPPED at {cap:.4} min/part (uncapped {u:.4} min for {n} callouts) -> MANUAL REVIEW: a part with this many ground features is a dedicated grinding job, quote the ground faces explicitly",
+                cap = GRINDING_ESCALATION_MAX_MIN_PER_PART,
+                u = uncapped_min,
+                n = n_critical,
+            ));
+        }
         c
     } else {
         0.0
