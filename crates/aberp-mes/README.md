@@ -1,11 +1,12 @@
-# `aberp-mes` — Stage 3 manufacturing-adapter framework (Phase α)
+# `aberp-mes` — Stage 3 manufacturing-adapter framework
 
-The bones for ABERP's shop-floor integration: a closed canonical-event
-vocabulary, a minimal `Adapter` trait, a runtime registry, and the
-audit-ledger integration. **No real hardware code lives here.** Phase β
-(next session in this strand) will add the first real adapter — most
-likely a barcode scanner per the Stage 3 research's standing
-recommendation.
+ABERP's shop-floor integration: a closed canonical-event vocabulary, the
+`Adapter` trait, a runtime registry, the audit-ledger integration, and
+**five concrete adapters with real transports** — barcode scanner (TCP
+listener), Zebra label printer (raw TCP ZPL), CNC over MTConnect (HTTP
+polling), Universal Robots (RTDE over TCP), and Trumpf laser (via an
+MTConnect agent). They live in the `adapters` module rather than in
+per-vendor crates, because none of them needed a vendor SDK.
 
 For the architectural decision and rationale, read
 [ADR-0060](../../adr/0060-stage3-manufacturing-adapter-framework.md).
@@ -88,10 +89,12 @@ NMH 6300. The minimum you need:
    downstream consumers — operations dashboard projection, SPA UI —
    need to learn the new type).
 
-6. **Register at boot.** A future Phase β PR will wire boot-time
-   adapter registration (likely from a `[mes]` section in
-   `seller.toml`). For now, the framework's tests show the manual
-   shape:
+6. **Register at boot.** Boot-time registration is live: the `[mes]`
+   section in `seller.toml` is read into `AdapterConfigEntry` values,
+   `build_adapter` turns each into a live adapter, and the binary's
+   `mes_manager` starts it and inserts it into the registry. Add your
+   arm to `build_adapter` and a variant to `AdapterKind`. The manual
+   shape below is what the framework's own tests use:
 
    ```rust
    let mut registry = AdapterRegistry::new();
@@ -181,16 +184,20 @@ What the framework does NOT guarantee:
   retry, MQTT QoS 1), your adapter must dedupe. The
   `idempotency_key` on the payload is operator-decision, not wire-level.
 
-## What stays out of an adapter crate (Phase α scope)
+## What stays out of an adapter
 
-- **Bidirectional control / commands.** No write-back to the machine
-  yet. The trait will gain an `AdapterCommand` enum + `dispatch` method
-  in a future PR when the first real adapter needs it.
-- **Operator configuration surface.** No TOML parsing in your adapter;
-  Phase β lands the `[mes]` `seller.toml` section.
-- **UI / SPA surface.** No HTTP routes, no Svelte components. The
-  registry's `health()` snapshot will surface through a future
-  `/api/mes/health` route; the adapter author doesn't write the route.
+- **Bidirectional control / commands.** The `Adapter` trait carries no
+  write-back to the machine. `ZebraAdapter` has an inherent `print_zpl`
+  for the label path, but there is still no `AdapterCommand` enum or
+  `dispatch` method on the trait — that lands when an adapter needs it
+  through the generic surface.
+- **Operator configuration parsing.** No TOML parsing in your adapter.
+  The `[mes]` `seller.toml` section is live and is read for you; your
+  adapter receives an `AdapterConfigEntry` via `build_adapter`.
+- **UI / SPA surface.** The adapter CRUD routes (`/api/adapters`,
+  `/api/adapters/:id`) and the Svelte components are live, but the
+  adapter author does not write them — you add a `build_adapter` arm and
+  the existing surface picks it up.
 - **Cell-controller / offline-first split.** Phase α assumes a single
   ABERP process. The offline-first ADR lands when first cell hardware
   ships and the SaaS-migration topology firms up.
