@@ -1,0 +1,353 @@
+# Backlog — Designed → Live
+
+Every capability the [README](../README.md) lists as **Designed — awaiting
+hardware/endpoint** has one entry here. The goal for each is to drive it to
+**Live**: a real emitter or handler, exercised end to end.
+
+The two lists are **1:1**. If you add a Designed row to the README, add an
+entry here; if an entry reaches Live, flip the README row and delete the
+entry. A Designed row with no backlog entry (or the reverse) is a drift bug.
+
+Each entry records:
+
+- **Surface today** — the code that already exists, cited by file. This is
+  what justifies listing the capability at all; a capability with no code
+  surface does not belong in either document.
+- **Missing for Live** — the concrete hardware, external endpoint, or
+  wiring that is absent.
+- **Blocked on** — whether it is waiting on something external (an
+  account, credentials, a machine, a licence) or is purely our own work.
+  This is the useful axis: the externally-blocked ones cannot be scheduled,
+  the unblocked ones can.
+- **Size** — a rough shape only, inferred from the surface that exists. Not
+  an estimate, and there are no dates anywhere in this file.
+
+Line numbers drift; treat them as a starting point, not a contract.
+
+---
+
+## Externally blocked
+
+Nothing here can start until something outside the repo arrives.
+
+<a id="d-01"></a>
+### D-01 — Denied-party / export-control screening backend
+
+**Surface today.** `ExportControlProvider` trait with `classify` and
+`screen_party` (`crates/aberp-compliance/src/export_control/mod.rs:389`).
+`MockExportControlProvider` is the only implementation
+(`crates/aberp-compliance/src/export_control/mock.rs:17`), installed at boot
+(`apps/aberp/src/serve.rs:18203`). The consuming half is already Live: all
+three `export.*` kinds fire inside `mark_shipped`'s transaction, a blocking
+decision refuses the shipment, and the recorded row carries
+`decision: "not_determined"` with `backend: "mock"` so a mock answer can be
+told apart from a real screen after the data leaves the process.
+
+**Missing for Live.** A real screening service behind the trait — the US
+Consolidated Screening List or a commercial equivalent — plus classification
+data for the commodity side. Nothing else has to move: the trait, the
+firing sites, the atomicity, and the `backend` tag are all in place.
+
+**Blocked on.** A chosen provider and its account/API access.
+
+**Size.** Small once a provider is picked — one trait impl plus its error
+mapping. The `AccessDecision` vocabulary already covers
+`granted` / `restricted` / `denied` / `not_determined`.
+
+**Do not regress.** The mock must keep answering `not_determined`. Making
+it answer `granted` would write an uncorrectable claim that a screen ran
+and cleared, onto an append-only ledger.
+
+<a id="d-02"></a>
+### D-02 — On-machine QC probe ingestion
+
+**Surface today.** `ProbeIngestionSource` trait with `ProbeCursor` and
+`RawProbeEvent` (`crates/aberp-qa/src/qc/probe.rs:52`). Three
+implementations: `MockProbeSource` works (`:63`), `MtconnectProbeSource`
+(`:95`) and `RenishawCentralSource` (`:128`) are `todo!`. The
+failure path is already Live — `qc.probe_ingestion_failed` has a real
+emitter at `crates/aberp-qa/src/qc/inspections.rs:338` — as is the whole
+manual inspection workflow it would feed.
+
+**Missing for Live.** A DMG MORI machine exposing probe results over
+MTConnect, and a Renishaw Central deployment, to read and design against.
+The result-to-verdict math, the tolerance tiers, and the auto-NCR are
+already built for hand-entered values and would be reused.
+
+**Blocked on.** Physical machine access.
+
+**Size.** Medium per source: a poll loop and a parser against a real
+sample. The cursor semantics are already defined by the trait.
+
+<a id="d-05"></a>
+### D-05 — DÁP eAzonosítás operator login
+
+**Surface today.** `DapTransport` trait
+(`crates/aberp-digital-id/src/dap_transport.rs:82`), a working
+`MockDapTransport` (`:97`), and `OidcDapTransport` (`:160`) whose methods
+are `todo!` pending relying-party registration. The mock is not
+shelf-ware — `POST /api/dap/mock-login`
+(route at `apps/aberp/src/serve.rs:4427`, `handle_dap_mock_login`) drives initiate +
+complete server-side and returns the synthetic identity, so the flow shape
+is exercised. Four `auth.dap_login_*` EventKinds are defined with
+documented payloads and no firing site.
+
+**Missing for Live.** szeusz.gov.hu relying-party credentials and spec
+access; then the real OIDC exchange behind the trait, the operator-facing
+login overlay, and the four firing sites.
+
+**Blocked on.** Government RP registration.
+
+**Size.** Medium — an OIDC client plus a UI overlay. The transport
+boundary and the audit vocabulary already exist.
+
+<a id="d-06"></a>
+### D-06 — NETLOCK qualified timestamp authority
+
+**Surface today.** `TimestampAuthority` trait
+(`crates/audit-ledger/src/session/tsa.rs:63`), `MockTimestampAuthority`
+(`:82`) running today, and `NetlockTsa` (`:172`) which compiles into the
+binary with every method `todo!`. The surrounding machinery is Live behind
+the per-tenant `dap_enabled` toggle (**default off**): ed25519 session
+keys, service sessions opened at boot, crash-recovered sessions, a
+heartbeat actor, and `audit.timestamp_anchor_taken` / `_delayed` emitters.
+
+**Missing for Live.** NETLOCK account onboarding, then an RFC-3161 client
+behind the trait and swapping the authority at the anchor site.
+
+**Blocked on.** NETLOCK commercial onboarding.
+
+**Size.** Small-to-medium — RFC-3161 is a well-specified exchange and the
+delayed-anchor path (`TsaStatus`, token-NULL rows) is already modelled.
+
+**Do not regress.** Until this lands, the chain signs with a mock. It is a
+structural floor, not a qualified signature, and must not be described as
+one.
+
+<a id="d-07"></a>
+### D-07 — CAC / PIV operator identity
+
+**Surface today.** `DigitalIdProvider` trait
+(`crates/aberp-digital-id/src/provider.rs:29`) with two selectable
+backends chosen at boot by `build_digital_id_provider`
+(`apps/aberp/src/serve.rs:4201`): `MockProvider`, and `UsDodCacProvider`
+(`crates/aberp-digital-id/src/cac.rs:70`). The CAC backend is a
+deliberate second stub that proves the trait actually abstracts — it holds
+an `Option<CacSession>` so `current_operator()` and `sign()` are genuinely
+fallible when no card is inserted, it is EDIPI-keyed, and it verifies by
+cert-chain membership rather than MAC equality. It WARNs loudly on
+construction.
+
+**Missing for Live.** A real card reader (PKCS#11), real DoD PKI chain
+validation, and real signing primitives. The mock "signs" with an HMAC
+keyed on a hardcoded, publicly-known test key and must never back a
+production identity.
+
+**Blocked on.** A customer who actually requires CAC, plus reader
+hardware and PKI trust material.
+
+**Size.** Large — real smartcard integration and certificate-path
+validation.
+
+<a id="d-13"></a>
+### D-13 — Trumpf laser: OPC UA backend
+
+**Surface today.** `OpcUaLaserSource` implements the `TrumpfSource` trait
+(`crates/aberp-mes/src/adapters/trumpf.rs:332`; trait at `:242`). It
+returns a descriptive error rather than panicking, and `build_adapter`
+never constructs it, so it cannot be reached from operator config. The
+MTConnect-backed sibling is Live.
+
+**Missing for Live.** An OPC-UA client dependency and an address-space
+capture from the target machine — which items map to state and program
+identity is machine-specific and cannot be guessed.
+
+**Blocked on.** Access to a target machine's address space.
+
+**Size.** Medium, and it adds a dependency — the current adapter set is
+deliberately zero-new-deps.
+
+<a id="d-14"></a>
+### D-14 — Trumpf laser: Oseon / TruTops Fab backend
+
+**Surface today.** `OseonLaserSource` implements `TrumpfSource`
+(`crates/aberp-mes/src/adapters/trumpf.rs:356`), same non-panicking,
+not-constructible posture as D-13.
+
+**Missing for Live.** A licensed Oseon deployment to design against.
+Availability, API surface, and auth model are all shop-specific and
+possibly commercially gated.
+
+**Blocked on.** A licensed deployment.
+
+**Size.** Unknown — the API surface is not public. Worth noting this is
+where *job-level* data lives (order linkage, nest identity, completion),
+which is closer to what ABERP wants than the machine telemetry D-13 and
+the Live MTConnect backend expose.
+
+---
+
+## Unblocked — our own work
+
+These need no external party. They are firing sites and surfaces against
+types that already exist.
+
+<a id="d-15"></a>
+### D-15 — `personnel.*` audit events and the e-signature ceremony
+
+**Surface today.** Four EventKinds — `personnel.id_registered`,
+`personnel.access_granted`, `personnel.access_denied`,
+`personnel.signature_applied` — each with a documented payload schema,
+round-trip storage-form validation, and exhaustive handling in the bundle
+classifier and `aberp-verify`. The identity layer they would record is
+D-07's `DigitalIdProvider`.
+
+**Missing for Live.** The firing sites, and the e-signature ceremony UI
+for `signature_applied`.
+
+**Blocked on.** Nothing external — though a signature event recorded
+against a stub identity provider is of limited value, so this is most
+useful alongside D-07.
+
+**Size.** Medium; the ceremony UI is the bulk of it.
+
+<a id="d-08"></a>
+### D-08 — CUI marking and access control
+
+**Surface today.** `aberp-compliance::cui` implements `CuiMarking`
+(`crates/aberp-compliance/src/cui/mod.rs:26`), `CuiCategory` (`:45`),
+`DisseminationControl` (`:114`), plus `display_marking()` and
+`to_banner_str()` — the 32 CFR Part 2002 / DoD CUI Registry vocabulary.
+Two EventKinds are defined: `cui.marking_applied` and `cui.access_event`,
+the latter documented to record *every* access decision, not only denials,
+because improper CUI disclosure is itself reportable.
+
+**Missing for Live.** Storage of a marking against an artifact (CAD blob,
+document, product), the access-check call site, the two firing sites, and
+the SPA banner that `to_banner_str()` exists to render.
+
+**Blocked on.** Nothing external.
+
+**Size.** Medium — it touches artifact storage and the SPA, and the
+access check needs a defined enforcement point.
+
+<a id="d-09"></a>
+### D-09 — DFARS 252.204-7012 cyber-incident reporting
+
+**Surface today.** `aberp-compliance::incident` implements
+`IncidentSeverity` (`crates/aberp-compliance/src/incident/mod.rs:36`),
+`DetectionSource`, and `dod_72h_report_due_at_ms()` (`:155`), which
+computes the 72-hour reporting deadline. `incident.cyber_detected` is
+defined with a full payload schema — CDI / OCS / CUI affected flags,
+exfiltration suspicion, affected systems, detection source, mitigation
+notes, and the computed deadline.
+
+**Missing for Live.** An operator intake surface for declaring an
+incident, and the firing site. Whether anything should *act* on the
+deadline (an alert, a dashboard countdown) is an open design question, not
+a decided one.
+
+**Blocked on.** Nothing external.
+
+**Size.** Small-to-medium — the types and the deadline math are done; this
+is a form, a route, and an append.
+
+<a id="d-10"></a>
+### D-10 — DPAS priority rating audit event
+
+**Surface today.** `DpasRating` (`crates/aberp-compliance/src/avl/mod.rs:90`)
+and `DpasPriority` (`:28`) implement the FAR 11.6 / 15 CFR 700 rating
+vocabulary. The storage half is **already Live**: partners carry a
+`dpas_rating VARCHAR` column (`apps/aberp/src/partners.rs:717`) whose
+values are validated through `DpasRating::parse`, so a free-text rating
+cannot be stored. What is missing is only the audit trail.
+
+**Missing for Live.** A firing site for `supplier.dpas_priority_set` at
+the point the rating is assigned or changed.
+
+**Blocked on.** Nothing external.
+
+**Size.** Small — this is the closest entry to Live in the file. The
+value is validated and stored today; only the append is absent.
+
+<a id="d-11"></a>
+### D-11 — Material reserve / release / consume, and certificate capture
+
+**Surface today.** `inventory.material_committed` is Live, with a typed
+payload and a real emitter (`apps/aberp/src/material_inventory.rs:701`).
+Three sibling kinds — `inventory.material_reserved`, `_released`,
+`_consumed` — plus `material.cert_attached` are defined and documented
+with no firing site. `aberp-compliance::lot_heat` already validates lot
+and heat ids, and heat-lot assignment, MTR upload, and the
+work-order-start gate are all Live.
+
+**Missing for Live.** The reserve/release/consume state transitions in
+inventory (the events are the easy half; the state machine is the work),
+and certificate capture for `cert_attached` — mill cert, CoA, heat
+treatment — which needs blob storage and a document-type discriminator.
+
+**Blocked on.** Nothing external.
+
+**Size.** Medium — reserve/release/consume is a real inventory state
+machine, not just three appends.
+
+<a id="d-12"></a>
+### D-12 — Out-of-band quote acceptance writeback
+
+**Surface today.** `quote.pricing_operator_accepted` is defined with an
+unusually complete payload schema: acceptance channel
+(`phone` / `email` / `in_person` / `other`), operator note, the accepting
+operator, the timestamp bound into the HMAC sent to the storefront, an
+optional path to a scanned confirmation, the writeback outcome tag, a
+`retry_available` flag, and an idempotency key. The in-app siblings
+`quote.operator_accepted` and `quote.priced_writeback_outcome` are Live,
+as is the storefront writeback transport.
+
+**Missing for Live.** The operator UI for accepting on a customer's behalf
+and the firing site. The payload design has already thought through
+retries and idempotency; that is the hard part.
+
+**Blocked on.** Nothing external.
+
+**Size.** Small-to-medium — mostly UI, on top of an existing transport.
+
+<a id="d-03"></a>
+### D-03 — MIL-STD-130N IUID minting
+
+**Surface today.** `aberp-compliance::uid` implements `IuidConstruct1`,
+`IuidConstruct2`, the `Iuid` enum
+(`crates/aberp-compliance/src/uid/mod.rs:265`), `validate_iac()` (`:117`),
+and IRI rendering. Per-unit part marking is **Live** — it mints a
+`dp-`-prefixed ULID with a DataMatrix payload, enforces a
+shipment gate that refuses to ship a defense dispatch until every unit is
+marked, and supports forward and reverse trace. It just is not a DoD IUID.
+
+**Missing for Live.** An assigned Issuing Agency Code and enterprise
+identifier for the shop, then swapping the minting site to construct a
+real `Iuid` and render its IRI into the DataMatrix payload. Existing
+`dp-` UIDs would need a migration decision.
+
+**Blocked on.** An enterprise identifier assignment — arguably external,
+but it is a registration the operator can pursue, not a vendor
+dependency.
+
+**Size.** Small in code; the migration question for already-marked units
+is the real decision.
+
+<a id="d-04"></a>
+### D-04 — NIST SP 800-171 control tagging
+
+**Surface today.** All 110 DFARS 252.204-7012 control identifiers exist as
+string constants in `crates/aberp-compliance/src/nist_800_171/mod.rs`,
+with an `ALL_CONTROLS: [&str; 110]` array. Nothing in the repo consumes
+them — this is the thinnest surface in this file, and it is listed
+because the control set is exactly what an assessor asks to see mapped.
+
+**Missing for Live.** A decision on where a control tag lives (an audit
+payload field? a separate mapping table?), then tagging the events that
+satisfy each control, and a report that renders the coverage.
+
+**Blocked on.** Nothing external — but it wants a design pass first.
+
+**Size.** Medium, and mostly analysis rather than code: deciding which
+existing events evidence which controls is the work.
