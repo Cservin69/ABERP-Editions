@@ -39,8 +39,14 @@ impl ExportControlProvider for MockExportControlProvider {
         Ok(ExportClassification::NotClassified)
     }
 
+    /// S441 (review finding #1) — answers [`ScreeningResult::NotScreened`], NOT
+    /// `Clear`. `Clear` is a positive finding ("we consulted the denied-party
+    /// lists and this party is not on them"); this backend consults nothing, so
+    /// claiming it would put a fabricated screening result into an append-only,
+    /// hash-chained ITAR row. Symmetric with [`Self::classify`] answering
+    /// `NotClassified` rather than `EAR99`.
     fn screen_party(&self, _party: &PartyRef) -> Result<ScreeningResult, ExportControlError> {
-        Ok(ScreeningResult::Clear)
+        Ok(ScreeningResult::NotScreened)
     }
 }
 
@@ -63,16 +69,24 @@ mod tests {
         assert_eq!(got, ExportClassification::NotClassified);
     }
 
+    /// S441 (review finding #1) — this test previously asserted
+    /// `ScreeningResult::Clear`, which is what let the mock manufacture a
+    /// `decision="granted"` compliance row. The mock screens nothing, so the
+    /// only honest answer is `NotScreened`. `Clear` is now reserved for a
+    /// backend that actually consulted the lists.
     #[test]
-    fn s345_mock_export_screen_party_returns_clear() {
+    fn s441_mock_export_screen_party_returns_not_screened_never_clear() {
         let p = MockExportControlProvider::new();
         let party = PartyRef {
             name: "ACME Aerospace GmbH".to_string(),
             country: Some("DE".to_string()),
         };
-        assert_eq!(
-            p.screen_party(&party).expect("screen"),
-            ScreeningResult::Clear
+        let got = p.screen_party(&party).expect("screen");
+        assert_eq!(got, ScreeningResult::NotScreened);
+        assert_ne!(
+            got,
+            ScreeningResult::Clear,
+            "a backend that consults no lists must never report a CLEAR screen"
         );
     }
 

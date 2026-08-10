@@ -202,6 +202,7 @@ fn append_export_access_denied_records_the_refusal_outside_the_ship_tx() {
         &dsp_id,
         "test-operator",
         "denied-party screening: denied (BIS Entity List)",
+        "denied",
     );
 
     let kinds = ledger_kinds(&db);
@@ -217,6 +218,11 @@ fn append_export_access_denied_records_the_refusal_outside_the_ship_tx() {
     let payload: aberp_dispatch::ExportAccessCheckPayload =
         serde_json::from_slice(&entry.payload).expect("denial payload parses");
     assert_eq!(payload.decision, "denied");
+    assert_eq!(
+        payload.backend, "mock",
+        "S441 — the standalone denial row must name the backend too, so a \
+         refusal can be triaged the same way a non-blocking decision can"
+    );
     assert_eq!(payload.entity_kind, "dispatch");
     assert_eq!(payload.entity_id, dsp_id);
     assert_eq!(payload.operator_user_id, "test-operator");
