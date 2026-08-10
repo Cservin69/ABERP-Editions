@@ -93,9 +93,37 @@ struct Seed {
     unattended_capable: bool,
 }
 
-/// The six families ADR-0094 Gap 2 seeds. 3-axis carries today's global
-/// rate (1.6667) so a seeded shop's prismatic parts price exactly as before;
+/// The unmistakable provenance label stamped into every seeded row's `notes`
+/// column, so an operator never mistakes a **seed default** for their own
+/// measured machine-hour rate. The SPA's rate list renders `notes` verbatim.
+pub const SEED_NOTE: &str =
+    "SEED — default EU/DE machine-shop rates, NOT your shop's measured values. \
+     Tune to your shop. / ALAPÉRTÉK — EU/DE gépipari átlag, hangolja a saját műhelyére.";
+
+/// The families ADR-0094 Gap 2 seeds. 3-axis carries today's global rate
+/// (1.6667) so a seeded shop's prismatic parts price exactly as before;
 /// Swiss + turn-mill are the unattended families that drive the Gap-2 win.
+///
+/// ## Cross-check against real German shop rates (2026-08-10)
+///
+/// The pre-existing six were re-verified rather than re-cut — a published
+/// German `Maschinenstundensatz` calculator quotes **70–100 €/h** for a 3-axis
+/// mill, **100–150 €/h** for 5-axis and **60–90 €/h** for a CNC lathe, so the
+/// seeds (3-axis 1.6667 €/min = **100 €/h**, 5-axis 2.50 = **150 €/h**, lathe
+/// 1.50 = **90 €/h**) already sit inside those bands, at the upper end that a
+/// DACH shop with certification and documentation overhead earns. Re-cutting
+/// them would move every seeded shop's prices for no accuracy gain and would
+/// break the ADR-0094 pin of 3-axis to the global `machining_rate_eur_per_minute`.
+/// Citations: `docs/findings/0097-tolerance-seed-rates-eu-de-2026-08-10.md`.
+///
+/// **`Grinder` is new here.** ADR-0097's tightest-band grinding escalation
+/// prices its adder at the `Grinder` family rate and *falls back to the routed
+/// effective rate* when no such row exists — which for a lights-out Swiss part
+/// is as low as 0.5250 €/min, badly under-costing a grind. Since the
+/// `ultra_precision` cost-rate seed now switches that escalation **on**, the
+/// row must exist for the adder to be priced honestly. No part ever *routes*
+/// to `Grinder` (capacity routing is unchanged), so the row is inert for base
+/// pricing and touches only the escalation.
 const SEEDS: &[Seed] = &[
     Seed {
         family: MachineFamily::SwissTurnMill,
@@ -130,6 +158,19 @@ const SEEDS: &[Seed] = &[
     Seed {
         family: MachineFamily::Lathe,
         attended_rate_eur_per_min: 1.50,
+        lights_out_factor: 1.0,
+        unattended_capable: false,
+    },
+    // ADR-0097 tightest-band escalation target. 2.50 €/min = **150 €/h**, held
+    // level with 5-axis: no German trade source publishes a grinding
+    // `Maschinenstundensatz`, but precision/coordinate grinding is described as
+    // climate-controlled CNC work at form-and-position accuracies below what
+    // milling holds, i.e. at least 5-axis-class overhead. Pegging it to 5-axis
+    // rather than guessing higher is the conservative read — and it is already
+    // far above the no-row fallback it replaces. Attended, never routed to.
+    Seed {
+        family: MachineFamily::Grinder,
+        attended_rate_eur_per_min: 2.50,
         lights_out_factor: 1.0,
         unattended_capable: false,
     },
@@ -211,9 +252,11 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         .context("ensure quoting_machine_rates schema")
 }
 
-/// Seed the six ADR-0094 families, **insert-if-absent** per family — so a
-/// re-run (or a partially-seeded table) never duplicates and never clobbers
-/// an operator-tuned value. Idempotent: gated per `(tenant, family)`.
+/// Seed the [`SEEDS`] families, **insert-if-absent** per family — so a re-run
+/// (or a partially-seeded table) never duplicates and never clobbers an
+/// operator-tuned value. Idempotent: gated per `(tenant, family)`. Each seeded
+/// row is stamped with [`SEED_NOTE`] so it reads unmistakably as a default
+/// rather than a shop-measured rate.
 pub fn seed_machine_rates_if_absent(conn: &Connection, tenant: &str) -> Result<()> {
     ensure_schema(conn)?;
     let now = now_rfc3339()?;
@@ -234,7 +277,7 @@ pub fn seed_machine_rates_if_absent(conn: &Connection, tenant: &str) -> Result<(
             "INSERT INTO quoting_machine_rates (id, tenant_id, family, \
              attended_rate_eur_per_min, lights_out_factor, unattended_capable, \
              notes, updated_at, updated_by_actor) \
-             VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'boot');",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'boot');",
             params![
                 &id,
                 tenant,
@@ -242,12 +285,32 @@ pub fn seed_machine_rates_if_absent(conn: &Connection, tenant: &str) -> Result<(
                 seed.attended_rate_eur_per_min,
                 seed.lights_out_factor,
                 seed.unattended_capable,
+                SEED_NOTE,
                 &now,
             ],
         )
         .with_context(|| format!("seed quoting_machine_rates row for {family}"))?;
     }
     Ok(())
+}
+
+/// The [`SEEDS`] table as the engine consumes it — the exact
+/// `&[MachineRate]` slice a freshly-seeded tenant hands to
+/// `CatalogueSnapshot::machine_rates`. Test-only: it lets the tolerance
+/// cost-rate seed test prove the tightest-band grinding adder prices at the
+/// seeded `Grinder` rate rather than the routed fallback, without standing up
+/// a DB.
+#[cfg(test)]
+pub(crate) fn seed_rates_for_tests() -> Vec<aberp_quote_engine::MachineRate> {
+    SEEDS
+        .iter()
+        .map(|s| aberp_quote_engine::MachineRate {
+            family: s.family.as_db_str().to_string(),
+            attended_rate_eur_per_min: s.attended_rate_eur_per_min,
+            lights_out_factor: s.lights_out_factor,
+            unattended_capable: s.unattended_capable,
+        })
+        .collect()
 }
 
 fn now_rfc3339() -> Result<String> {
