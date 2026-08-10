@@ -208,22 +208,43 @@ the HU-production compliance stack.
 
 ---
 
-## Audit — what is recorded, and what protects it
+## Capability status — how to read the next two sections
 
-The ledger is the compliance product, so this section is deliberately
-specific about what fires today and what is only declared. A kind that is
-*defined* but has no emitter is listed as **reserved** — an entry of that
-kind has never been written by any code path in this repo.
+The house is wired for more sockets than currently have an appliance
+plugged in. Both sections below list the whole wiring, each capability
+carrying one of two statuses:
+
+- **Live** — a real emitter or handler exists and is exercised end to end.
+  This is a working control.
+- **Designed — awaiting hardware/endpoint** — the code surface genuinely
+  exists in this repo (a trait, a scaffold, a validated `EventKind`, a
+  defined adapter), but it is not connected to the real device or external
+  backend yet. The socket is in the wall; nothing is plugged into it.
+
+**A Designed capability is not an operational one.** On an export-controlled
+product that distinction is the whole point: a designed control described
+as active is the dangerous overstatement. Nothing is listed unless its code
+surface was verified in this repo — there are no aspirational entries.
+
+Every Designed item has a matching entry in
+[`docs/BACKLOG-designed-to-live.md`](docs/BACKLOG-designed-to-live.md),
+which records the code surface that exists today and what is concretely
+missing to drive it to Live.
+
+---
+
+## Audit — what is recorded, and what protects it
 
 ### The event surface
 
 Every audited action becomes one entry with a typed JSON payload and a
-namespaced `domain.event_name` kind. **187 kinds are defined**; **170 are
-wired to a real emitter**, **17 are reserved**. Kind strings are stable
-identifiers — the audit screen, the export bundle, and `aberp-verify` all
-key off them.
+namespaced `domain.event_name` kind. **187 kinds are defined**: **170 are
+Live**, **17 are Designed** — defined, documented, round-trip validated,
+and handled by the classifier and the verifier, but with no firing site
+yet. Kind strings are stable identifiers — the audit screen, the export
+bundle, and `aberp-verify` all key off them.
 
-| Domain | What it records | Wired |
+| Domain | What it records | Live |
 |---|---|---|
 | `quote.*` | The CAD → pricing → PDF pipeline: geometry extraction, pricing runs and classified failures, margin / lead-time overrides and below-floor refusals, operator accept / refuse, calibration samples and coefficient shifts, tunables (machine rates, gear processes, materials, tolerance multipliers, complexity rules), deal → sales order → work order, PDF re-render, stock alerts, storefront email-outbox claim / fetch / send / fail | 45 / 46 |
 | `invoice.*` | The full NAV lifecycle: sequence reservation, draft created / deleted, staged, submission attempt / response / failure, ack polling, storno, modification, technical annulment (request → submit → ack → receiver confirmation), invoice check, payment recorded, emailed, marked abandoned, picked up from a quote, LocalOnly issuance | 22 / 22 |
@@ -251,22 +272,24 @@ key off them.
 The table accounts for 186 kinds; the 187th is `test`, written only by the
 chain-conformance suite.
 
-### Reserved — defined and validated, never emitted
+### Designed — the 17 kinds awaiting a firing site
 
-These kinds parse, round-trip, and carry documented payload schemas, but
-**no code path writes them**. They are declared so the classifier and the
-verifier are exhaustive ahead of the features landing; do not read them as
-shipped controls.
+Each of these parses, round-trips through storage form, carries a
+documented payload schema, and is handled exhaustively by the bundle
+classifier and `aberp-verify` — but **no code path writes one today**. In
+several cases the supporting types are built too, which is why they are
+listed rather than hidden. Backlog IDs link to
+[`docs/BACKLOG-designed-to-live.md`](docs/BACKLOG-designed-to-live.md).
 
-- `cui.marking_applied`, `cui.access_event` — CUI marking / access.
-- `personnel.id_registered`, `personnel.access_granted`,
-  `personnel.access_denied`, `personnel.signature_applied`.
-- `incident.cyber_detected` — the DoD 72-hour cyber-incident report.
-- `auth.dap_login_initiated` / `_completed` / `_failed` / `_fallback` —
-  blocked on the real DÁP integration.
-- `inventory.material_reserved` / `_released` / `_consumed`,
-  `material.cert_attached`.
-- `quote.pricing_operator_accepted`, `supplier.dpas_priority_set`.
+| Kinds | Supporting code surface that exists today | Backlog |
+|---|---|---|
+| `cui.marking_applied`, `cui.access_event` | `aberp-compliance::cui` — `CuiMarking`, `CuiCategory`, `DisseminationControl`, `display_marking()`, `to_banner_str()` (32 CFR 2002 / DoD CUI Registry vocabulary) | [D-08](docs/BACKLOG-designed-to-live.md#d-08) |
+| `personnel.id_registered`, `personnel.access_granted`, `personnel.access_denied`, `personnel.signature_applied` | The `DigitalIdProvider` trait and its two stub backends (see [D-07](docs/BACKLOG-designed-to-live.md#d-07)); no e-signature ceremony yet | [D-15](docs/BACKLOG-designed-to-live.md#d-15) |
+| `incident.cyber_detected` | `aberp-compliance::incident` — `IncidentSeverity`, `DetectionSource`, and `dod_72h_report_due_at_ms()` computing the DFARS 252.204-7012 deadline | [D-09](docs/BACKLOG-designed-to-live.md#d-09) |
+| `auth.dap_login_initiated` / `_completed` / `_failed` / `_fallback` | The `DapTransport` trait, a working `MockDapTransport`, and a live `POST /api/dap/mock-login` route driving it end to end | [D-05](docs/BACKLOG-designed-to-live.md#d-05) |
+| `inventory.material_reserved` / `_released` / `_consumed`, `material.cert_attached` | The inventory tables and `inventory.material_committed`, which is Live; `aberp-compliance::lot_heat` validates the ids | [D-11](docs/BACKLOG-designed-to-live.md#d-11) |
+| `supplier.dpas_priority_set` | `aberp-compliance::avl::DpasRating` (FAR 11.6 / 15 CFR 700), plus a live `dpas_rating` column on partners that already validates through it — the value is stored, the audit event is not written | [D-10](docs/BACKLOG-designed-to-live.md#d-10) |
+| `quote.pricing_operator_accepted` | The out-of-band accept path (operator accepts by phone/email on the customer's behalf) with a documented writeback payload; the in-app `quote.operator_accepted` and `quote.priced_writeback_outcome` are Live | [D-12](docs/BACKLOG-designed-to-live.md#d-12) |
 
 ### Export control / ITAR *[Defense]*
 
@@ -287,13 +310,20 @@ exist without its export rows:
 - `export.shipment_logged` — the physical export record: exporter,
   consignee, destination country, cited authorization.
 
-**The shipped provider is a mock.** With no denied-party list wired, it
-answers `not_determined` with `backend: "mock"` — never `granted`. That is
-deliberate: a `granted` row on an append-only ledger would assert a screen
-ran and cleared, and it could never be corrected. Timestamps come from the
-system clock, not from the operator-supplied ship date, so a back-dated
-shipment cannot claim its screening ran in the past. Separately,
-`supplier.export_screened` records AVL-side export screening of vendors.
+The gate, the transaction atomicity, the recording, and the shipment
+refusal on a blocking decision are all **Live**. The **screening backend
+itself is Designed** ([D-01](docs/BACKLOG-designed-to-live.md#d-01)): the
+`ExportControlProvider` trait defines `classify` and `screen_party`, and
+the only implementation is `MockExportControlProvider`, selected at boot.
+
+That distinction is enforced in the data, not just in this README. With no
+denied-party list wired, the provider answers `not_determined` with
+`backend: "mock"` — **never `granted`**. A `granted` row on an append-only
+ledger would assert that a screen ran and cleared, and it could never be
+corrected. Timestamps come from the system clock rather than the
+operator-supplied ship date, so a back-dated shipment cannot claim its
+screening ran in the past. Separately, `supplier.export_screened` records
+AVL-side export screening of vendors, and is Live.
 
 ### What protects the chain
 
@@ -319,10 +349,27 @@ shipment cannot claim its screening ran in the past. Separately,
 - **Session signing** *[Defense]*. With the per-tenant `dap_enabled`
   toggle on (**default off**), boot mints an ed25519 service session,
   recovers sessions left open by a crash, signs entries, and takes
-  periodic timestamp anchors. The timestamp authority is still the
-  **mock** — the NETLOCK and DÁP transports are `todo!` — so treat the
-  `auth.*` and `audit.*` kinds as a working structural floor, not a
-  qualified signature (see [roadmap](#roadmap)).
+  periodic timestamp anchors. That machinery is Live; the **timestamp
+  authority behind it is Designed**
+  ([D-06](docs/BACKLOG-designed-to-live.md#d-06)) — `NetlockTsa` exists
+  and every method is `todo!`, so `MockTimestampAuthority` is what runs.
+  Treat the `auth.*` and `audit.*` kinds as a working structural floor,
+  **not a qualified signature**.
+
+### Designed — compliance types built ahead of their surfaces
+
+Two more sockets with no EventKind of their own yet:
+
+- **MIL-STD-130N IUID** ([D-03](docs/BACKLOG-designed-to-live.md#d-03)).
+  `aberp-compliance::uid` implements `IuidConstruct1` / `IuidConstruct2`,
+  `validate_iac()`, and IRI rendering. Per-unit marking is Live today, but
+  it mints a `dp-`-prefixed ULID and a DataMatrix payload — not a DoD
+  IUID. Minting a real one needs an assigned enterprise identifier.
+- **NIST SP 800-171 control tagging**
+  ([D-04](docs/BACKLOG-designed-to-live.md#d-04)). All 110 DFARS
+  252.204-7012 control identifiers exist as constants in
+  `aberp-compliance::nist_800_171`, ready to tag audit events. Nothing
+  consumes them yet.
 
 ### Reading and exporting it
 
@@ -413,7 +460,7 @@ keychain. TLS is mandatory — the transport-security setting is a closed
 vocabulary of `StartTls` or `Tls`, with no plaintext variant an operator
 could type.
 
-**Machine and shop-floor adapters** *[Defense]*
+**Machine and shop-floor adapters — Live** *[Defense]*
 
 Operators register adapters (host, port, device) in the app; the MES
 manager builds and supervises them, and every event and health transition
@@ -428,12 +475,27 @@ are wired to real transports:
 | Robot (Universal Robots) | RTDE over TCP, version handshake | Reconnect with exponential backoff |
 | Laser (Trumpf) | MTConnect agent / gateway | Backend is a code decision, not an operator field |
 
-Two further laser backends are **declared but not implemented** — OPC UA
-(needs a dependency and an address-space capture) and Oseon / TruTops Fab
-(needs a licensed deployment). Both return an error rather than
-pretending; neither is constructible from operator config. On-machine
-*probe* ingestion (DMG MORI, Renishaw) is likewise not wired — QC
-inspection results are entered by hand today (see [roadmap](#roadmap)).
+### Designed — awaiting hardware or endpoint
+
+These have a real code surface in this repo — a trait, an implementing
+type, or a scaffold that compiles into the binary — but nothing is plugged
+into them yet. None can be reached from operator configuration; the
+unimplemented backends return an error or a documented `todo!` rather than
+pretending to work. Each has a backlog entry in
+[`docs/BACKLOG-designed-to-live.md`](docs/BACKLOG-designed-to-live.md).
+
+| Capability | Code surface today | Missing to reach Live | Backlog |
+|---|---|---|---|
+| Denied-party / export screening backend | `ExportControlProvider` trait (`classify` + `screen_party`); `MockExportControlProvider` is the only impl, chosen at boot | A real screening service (e.g. the US Consolidated Screening List / BIS) behind the trait | [D-01](docs/BACKLOG-designed-to-live.md#d-01) |
+| On-machine QC probe ingestion | `ProbeIngestionSource` trait + `ProbeCursor` / `RawProbeEvent`; a working `MockProbeSource`; `MtconnectProbeSource` and `RenishawCentralSource` both `todo!`. `qc.probe_ingestion_failed` is already a Live emitter | A DMG MORI MTConnect probe endpoint and a Renishaw Central deployment to read against | [D-02](docs/BACKLOG-designed-to-live.md#d-02) |
+| Laser — OPC UA backend | `OpcUaLaserSource` implements the `TrumpfSource` trait; returns an error, never constructed by `build_adapter` | An OPC-UA client dependency plus an address-space capture from the target machine | [D-13](docs/BACKLOG-designed-to-live.md#d-13) |
+| Laser — Oseon / TruTops Fab backend | `OseonLaserSource` implements `TrumpfSource`; same non-panicking posture | A licensed Oseon deployment to design against — this is where job-level linkage lives | [D-14](docs/BACKLOG-designed-to-live.md#d-14) |
+| DÁP eAzonosítás operator login | `DapTransport` trait; `MockDapTransport` driven end to end by a live `POST /api/dap/mock-login`; the OIDC transport is `todo!` | szeusz.gov.hu relying-party credentials and spec access | [D-05](docs/BACKLOG-designed-to-live.md#d-05) |
+| NETLOCK qualified timestamp | `NetlockTsa` compiles into the binary, every method `todo!`; `MockTimestampAuthority` runs in its place | NETLOCK account onboarding, then swapping the authority at the anchor site | [D-06](docs/BACKLOG-designed-to-live.md#d-06) |
+| CAC / PIV operator identity | `DigitalIdProvider` trait with two selectable backends — `MockProvider` and `UsDodCacProvider`, a card-session stub that WARNs on construction and makes `current_operator()` genuinely fallible | A real card reader (PKCS#11) and DoD PKI chain validation instead of the stub's chain-membership check | [D-07](docs/BACKLOG-designed-to-live.md#d-07) |
+
+QC inspection results are entered by hand today; the probe sources above
+are what would feed them automatically.
 
 ---
 
@@ -512,7 +574,11 @@ The versioning rules (when to bump patch vs minor vs major) are pinned in
 
 ## Roadmap
 
-Honest about what isn't built yet:
+Honest about what isn't built yet. The **Designed — awaiting
+hardware/endpoint** capabilities above each have a tracked entry in
+[`docs/BACKLOG-designed-to-live.md`](docs/BACKLOG-designed-to-live.md),
+which is the working list for driving them to Live; this section is the
+wider view, including work with no code surface yet.
 
 - **Real DÁP / QES audit-chain signing (HU)** — the structural floor has
   landed: traits for the DÁP transport and a timestamp authority, an
@@ -564,6 +630,7 @@ ABERP/
   adr/                 ← Architecture Decision Records, numbered + indexed
   docs/
     CUTOVER_RUNBOOK.md ← prod cutover + update workflow (the source of truth)
+    BACKLOG-designed-to-live.md ← the Designed → Live capability backlog
     threat-model.md
   crates/              ← audit-ledger, nav-transport, quote-engine, inventory,
                          work-orders, qa, dispatch, mes, compliance, digital-id, …
@@ -733,5 +800,8 @@ Absent file → text-only header.
 2. [`adr/README.md`](adr/README.md) — how ADRs work; numbered, in order.
 3. [`docs/CUTOVER_RUNBOOK.md`](docs/CUTOVER_RUNBOOK.md) — the prod cutover +
    update procedure.
+4. [`docs/BACKLOG-designed-to-live.md`](docs/BACKLOG-designed-to-live.md) —
+   every Designed capability, the code surface behind it, and what is
+   missing to drive it to Live.
 </content>
 </invoke>
