@@ -133,27 +133,64 @@ echo
 # 2026-08-08 posture with extra steps: the operator is acked, the write is not
 # durable, and the only trace is a log line nobody reads.
 #
-# The `?` may not be on the call line: the house style is
-#     db.durable_ack()
-#         .context("...")?;
-# so scan a small WINDOW forward from the call. The window is deliberately
-# tight — a `?` five lines later belongs to a different statement.
+# PR #37 adversarial (B1): the first cut of this check scanned a 3-line WINDOW
+# for any `?;`. That is defeatable and was defeated — an UNRELATED trailing
+# `?;` inside the window satisfied it while the ack itself was downgraded, with
+# clippy fully clean. Probe P7 only passed because it was calibrated at the one
+# site whose next 3 lines happen to contain no `?`. Since D3-C is the ONLY
+# cover for the three money paths no unattended test can reach, a defeatable
+# D3-C is the whole gate.
+#
+# So the check is now anchored on the durable_ack STATEMENT, not a window:
+#   1. accumulate lines from the call until the statement's terminating `;`
+#      (comments stripped), and require the terminator to be `?;` — i.e. the
+#      `?` belongs to THIS statement, not to a neighbour;
+#   2. reject wrapper prefixes on the call line outright (`if let Err`,
+#      `let _ =`, `match`, and the `.ok()`/`.is_err()`/`unwrap_or*` shapes),
+#      which consume the Result without propagating it.
 echo "[CHECK D3-C] every durable_ack() call PROPAGATES its error (ENFORCED)"
-WINDOW=3
+
+# The statement that begins at line $2 of file $1, comments stripped, joined,
+# truncated at its first `;`. Bounded so a malformed file cannot run away.
+ack_statement() {
+  awk -v start="$2" '
+    NR < start { next }
+    { line = $0; sub(/\/\/.*/, "", line); stmt = stmt " " line
+      if (index(line, ";") > 0) { print substr(stmt, 1, index(stmt, ";")); exit }
+      if (NR > start + 20) { print stmt; exit } }
+  ' "$1"
+}
+
 for f in "${census_files[@]}"; do
   [[ -f "$f" ]] || continue
   while IFS= read -r rec; do
     [[ -z "$rec" ]] && continue
     ln="${rec%%:*}"
-    # Lines [ln, ln+WINDOW], comments stripped, looking for a `?` terminator.
-    if sed -n "${ln},$((ln + WINDOW))p" "$f" | sed 's://.*::' | grep -qE '\?[[:space:]]*;'; then
+    call_line="$(sed -n "${ln}p" "$f" | sed 's://.*::')"
+    stmt="$(ack_statement "$f" "$ln")"
+
+    # (2) Wrapper prefixes that consume the Result instead of propagating it.
+    if printf '%s' "$call_line" | grep -qE '(if[[:space:]]+let[[:space:]]+Err|let[[:space:]+_[[:space:]]*=|let[[:space:]]+_[[:space:]]*=|^[[:space:]]*match[[:space:]]|\bmatch[[:space:]]+[A-Za-z_.]*durable_ack)'; then
+      flag "✗ SWALLOWED durable-ack failure at $f:$ln — the call is wrapped in a construct that consumes the Result."
+      note "    line: ${call_line}"
+      continue
+    fi
+    if printf '%s' "$stmt" | grep -qE '\.durable_ack\(\)[^;]*\.(ok|is_err|is_ok|unwrap_or|unwrap_or_else|unwrap_or_default)\b'; then
+      flag "✗ SWALLOWED durable-ack failure at $f:$ln — the Result is consumed by a non-propagating combinator."
+      note "    stmt: ${stmt}"
+      continue
+    fi
+
+    # (1) The statement's OWN terminator must be `?;`.
+    if printf '%s' "$stmt" | grep -qE '\?[[:space:]]*;[[:space:]]*$'; then
       note "✓ $f:$ln — PROPAGATES"
     else
-      flag "✗ SWALLOWED durable-ack failure at $f:$ln — no \`?\` within $WINDOW line(s)."
+      flag "✗ SWALLOWED durable-ack failure at $f:$ln — the durable_ack STATEMENT does not end in \`?;\`."
       note "    ADR-0110 R3 / CLAUDE.md rule 11: a money-path write that could not be"
       note "    made durable must FAIL the ack, not log and continue. Acking a write"
-      note "    nothing fsync'd is precisely the 2026-08-08 loss. Context:"
-      sed -n "${ln},$((ln + WINDOW))p" "$f" | sed 's/^/        /'
+      note "    nothing fsync'd is precisely the 2026-08-08 loss."
+      note "    A \`?\` on a NEIGHBOURING statement does not count (PR #37 adversarial B1)."
+      note "    stmt: ${stmt}"
     fi
   done < <(ack_calls "$f")
 done

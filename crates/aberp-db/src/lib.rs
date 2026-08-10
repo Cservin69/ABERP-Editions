@@ -34,18 +34,35 @@
 //!   handle **disables DuckDB's implicit checkpoint-on-close** so a runtime
 //!   connection drop never folds the WAL in place (the vulnerable path); the
 //!   only checkpoint is the validated logical one.
-//! * **D3 — power-loss durable money paths.** 1b above makes a commit
+//! * **D3 — power-loss durable writes, ordered.** 1b above makes a commit
 //!   *process-crash* durable (the mirror is `fsync`'d in lockstep) and
 //!   *eventually* file-durable (the debounced D2 checkpoint, ≤ 1/min). Neither
 //!   `fsync`s the live DB or its WAL at commit time, so for up to a checkpoint
-//!   interval a money-path write acked to the operator survives only in an
-//!   un-`fsync`'d WAL — a power loss drops the business rows while the mirror
-//!   keeps the audit row. [`Handle::durable_ack`] closes that: after a
-//!   money-path commit it `fsync`s the main file, the WAL and the tenant
-//!   directory, and its failure is propagated, never logged-and-ignored.
-//!   Ported from Portable PROD_v2.33.6 (ADR-0110 D3); the frozen census of
-//!   money-path ack sites is `tools/adr0110_durable_ack_sites.txt`, held closed
-//!   in both directions by `tools/cut_gate_durable_ack.sh`.
+//!   interval a write acked to the operator survives only in an un-`fsync`'d
+//!   WAL — a power loss drops the business rows while the mirror keeps the
+//!   audit row.
+//!
+//!   The [`WriteGuard`] drop now `fsync`s the main file, the WAL and the tenant
+//!   directory **BEFORE** it syncs the mirror, and **skips** the mirror sync if
+//!   that flush fails. That ordering is the invariant: *the data is durable
+//!   before the record that points to it*, so the mirror can never be ahead of
+//!   the DB at rest, in either the success or the failure case. Mirror-behind
+//!   is benign and self-healing (it reconciles on the next write or at the
+//!   pre-snapshot fsync); mirror-ahead is the direction that forks, because
+//!   boot's `attempt_db_auto_recovery(mirror_ahead)` → `replay_mirror_delta`
+//!   resurrects the delta.
+//!
+//!   [`Handle::durable_ack`] is the money-path *claim* of that flush's outcome:
+//!   it returns the parked `Result` so the operator-facing ack propagates a
+//!   failure instead of logging it. Ported from Portable PROD_v2.33.6
+//!   (ADR-0110 D3); the frozen census of money-path ack sites is
+//!   `tools/adr0110_durable_ack_sites.txt`, held closed in both directions by
+//!   `tools/cut_gate_durable_ack.sh`.
+//!
+//!   The B2 reorder diverges from Portable, where `durable_ack` still does its
+//!   own `fsync` after the guard drops. Portable can afford that: it has no
+//!   boot mirror-replay, so a mirror-ahead tear there is inert. Defense's
+//!   auto-heal makes it live, which is why the ordering had to move.
 //!
 //! # The single-instance coherence dividend (S335/S341)
 //!
@@ -175,6 +192,15 @@ struct Inner {
     conn: Option<Connection>,
     /// D2 cadence coordinator (pure; see [`debounce`]).
     debouncer: CheckpointDebouncer,
+    /// ADR-0110 D3 B2 — the outcome of the data `fsync` the most recent
+    /// [`WriteGuard`] drop performed, waiting to be claimed by
+    /// [`Handle::durable_ack`].
+    ///
+    /// The fsync happens in the guard's `Drop`, which cannot return a `Result`,
+    /// so the outcome is parked here and the money path's `durable_ack()` takes
+    /// it. `None` means "no write has completed since the last claim" — see
+    /// [`Handle::durable_ack`] for what that falls back to.
+    last_ack: Option<Result<(), DbError>>,
 }
 
 /// The process-wide shared DuckDB handle (ADR-0098 Gap 1a). Construct once at
@@ -203,6 +229,15 @@ pub struct Handle {
     /// expected set from what the write path really did, so deleting an `fsync`
     /// deletes the path from the set and turns the spec red.
     synced: Mutex<Vec<PathBuf>>,
+    /// ADR-0110 D3 B3 — the DIRECTORY half of the durability journal, kept
+    /// separate so [`Handle::fsynced_paths`] keeps meaning "files carrying rows"
+    /// (the power-loss spec builds its copy manifest from it).
+    ///
+    /// Split out because the PR #37 adversarial found the parent-directory
+    /// `fsync` was pinned by NOTHING: it bypassed the journal entirely, so
+    /// deleting it was invisible to both test files, all four gate checks and
+    /// all nine probes. Recording it is what makes it assertable.
+    synced_dirs: Mutex<Vec<PathBuf>>,
     /// Built **once** per process (S341 semantics): tenant + binary hash. The
     /// lockstep [`aberp_audit_ledger::sync_mirror`] needs it on every commit.
     meta: LedgerMeta,
@@ -263,12 +298,14 @@ impl Handle {
             wal_path: wal_path_for(db_path),
             mirror_path,
             synced: Mutex::new(Vec::new()),
+            synced_dirs: Mutex::new(Vec::new()),
             meta,
             tenant: tenant.as_str().to_string(),
             config,
             inner: Mutex::new(Inner {
                 conn: Some(conn),
                 debouncer: CheckpointDebouncer::new(min_interval),
+                last_ack: None,
             }),
         }))
     }
@@ -396,63 +433,99 @@ impl Handle {
         Ok(out)
     }
 
-    /// ADR-0110 D3 — make an already-committed money-path write **power-loss**
+    /// ADR-0110 D3 — the money-path **claim** that this commit is power-loss
     /// durable, not merely process-crash durable. Ported from Portable
-    /// PROD_v2.33.6.
+    /// PROD_v2.33.6, with the B2 ordering fix below.
     ///
-    /// `fsync`s, in order: the main DB file, the WAL (when present), then the
-    /// tenant directory that names them. Main file before WAL because a WAL is
-    /// only meaningful on top of a durable base; both before the directory
-    /// entry.
+    /// # It claims; the guard flushes
     ///
-    /// # What this fixes on Defense specifically
+    /// The `fsync` of the main file, the WAL and the tenant directory happens in
+    /// [`WriteGuard::drop`], **before** that drop syncs the audit mirror. This
+    /// returns the parked outcome so the money path can propagate a failure
+    /// instead of logging it.
     ///
-    /// Defense's post-commit hook ([`WriteGuard::drop`]) already `fsync`s the
-    /// **audit mirror** on every commit, and the debounced D2 checkpoint
-    /// eventually installs a fully-`fsync`'d replacement of the live file. But
-    /// nothing `fsync`s the live DB or its WAL at commit time, and the D2 window
-    /// is [`crate::debounce::DEFAULT_MIN_CHECKPOINT_INTERVAL`] (60s). So between
-    /// a money-path ack and the next checkpoint, the business rows live only in
-    /// an un-`fsync`'d WAL: a power loss drops them while the mirror keeps the
-    /// audit row — an audit entry for an invoice that no longer exists. This
-    /// closes that window at the ack itself.
+    /// It reads that way round because of the ordering invariant: *the data must
+    /// be durable before the record that points to it.* Doing the `fsync` here —
+    /// after the guard has already dropped and synced the mirror, which is what
+    /// the first cut of this port did, and what Portable still does — makes the
+    /// mirror unconditionally durable FIRST. On the happy path that only shrinks
+    /// a window. On the failure path it freezes a fork: the operator is told the
+    /// money write FAILED while the mirror durably says it SUCCEEDED, and
+    /// Defense's boot `attempt_db_auto_recovery(mirror_ahead)` →
+    /// `replay_mirror_delta` then resurrects it. Portable has no mirror replay
+    /// at all (verified: zero hits for it in that tree), so the tear is inert
+    /// there and live here — which is why Defense reorders and Portable did not
+    /// have to.
     ///
     /// # Locking
     ///
-    /// Deliberately takes **no** writer lock. Money paths call this at the ack,
-    /// after `drop(guard)`; re-acquiring would serialize every other writer
-    /// behind an `fsync` for no benefit (the commit already happened, so the
-    /// bytes to flush are settled). The durability journal has its own mutex.
+    /// Takes the writer mutex briefly to claim the outcome, and does **no** I/O
+    /// under it. Call it AFTER `drop(guard)` — calling it while holding a guard
+    /// would deadlock on the non-reentrant mutex.
     ///
     /// # Errors
     ///
-    /// [`DbError::DurableAck`] if any `fsync` fails. **Propagate it — never
-    /// downgrade it to a `warn!`** (see the variant's docs; cut-gate CHECK D3-C
-    /// enforces this).
+    /// [`DbError::DurableAck`] if the flush failed. **Propagate it — never
+    /// downgrade it to a `warn!`** (cut-gate CHECK D3-C enforces this). When it
+    /// fails the mirror sync was skipped, so the mirror is BEHIND the DB, which
+    /// is the benign, self-healing direction.
     ///
     /// # Honest scope
     ///
     /// **On macOS this IS a device flush.** `File::sync_all` does not call
     /// `fsync(2)` on Apple targets — the stdlib routes it to
     /// `fcntl(fd, F_FULLFSYNC)` — so the bytes are pushed past the drive's own
-    /// write cache rather than merely handed to the OS. That is what makes an
-    /// acked write survive a power loss and not just a process kill. Linux gets
-    /// `fsync`/`fdatasync`; Windows `FlushFileBuffers`.
-    ///
-    /// It is also the same primitive `aberp_snapshot::crash_safe`'s
-    /// `fsync_file` and the audit mirror already use here, so this is the
-    /// tree's existing idiom, not a new one.
+    /// write cache rather than merely handed to the OS. Linux gets
+    /// `fsync`/`fdatasync`; Windows `FlushFileBuffers` (and the directory step
+    /// is skipped there — see [`Handle::fsync_and_record_dir`]).
     ///
     /// The residual bottoms out at the **drive honouring the flush**: a
     /// third-party external enclosure may lie. A tenant on external storage is
     /// outside what this can promise.
     pub fn durable_ack(&self) -> Result<(), DbError> {
+        // B2: the fsync itself has already happened, in the WriteGuard's drop,
+        // BEFORE that drop synced the mirror. All this does is claim the parked
+        // outcome, so the money path can propagate it. Doing the fsync here
+        // instead would be too late to fix the ordering — and would be a third,
+        // redundant F_FULLFSYNC of bytes already flushed.
+        let claimed = {
+            let mut inner = self.lock_recovering()?;
+            inner.last_ack.take()
+        };
+        match claimed {
+            Some(result) => result,
+            // No write has completed on this handle since the last claim, so
+            // there is no parked outcome. Flush directly: an ack must never
+            // silently succeed on the strength of an fsync that never ran.
+            // Reached by a money path whose write was a no-op, and by direct
+            // callers in tests.
+            None => self.fsync_data_paths(),
+        }
+    }
+
+    /// The D3 data flush: main file, then WAL (when present), then the tenant
+    /// directory that names them. Main before WAL because a WAL is only
+    /// meaningful on top of a durable base; both before the directory entry.
+    ///
+    /// Called from [`WriteGuard::drop`] BEFORE the mirror sync — see the B2
+    /// ordering note on [`Handle::durable_ack`].
+    fn fsync_data_paths(&self) -> Result<(), DbError> {
         self.fsync_and_record(&self.db_path)?;
         if self.wal_path.exists() {
+            // TOCTOU, deliberately accepted (PR #37 adversarial F2). The D2
+            // checkpoint's `atomic_install` unlinks the live WAL, so a
+            // concurrent checkpoint can in principle land between this
+            // `exists()` and the `File::open` inside `fsync_and_record`,
+            // turning a durable write into a money-path error. The adversarial
+            // raced 742k acks against 155 checkpointing commits and got ZERO
+            // hits: the checkpoint holds the writer mutex across the unlink and
+            // this now runs inside a guard drop that also holds it, so the two
+            // are in fact serialized. Left as a comment rather than a redesign;
+            // if it ever fires the error names the WAL and is not silent.
             self.fsync_and_record(&self.wal_path)?;
         }
         if let Some(parent) = self.db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fsync_path(parent)?;
+            self.fsync_and_record_dir(parent)?;
         }
         Ok(())
     }
@@ -477,9 +550,56 @@ impl Handle {
         Ok(())
     }
 
+    /// `fsync` a DIRECTORY and record it in the directory journal (B3).
+    ///
+    /// Windows: `File::open` on a directory fails there, and a directory
+    /// `fsync` has no Windows equivalent (`FlushFileBuffers` needs a file
+    /// handle) — the rename durability it buys on POSIX is provided by NTFS
+    /// metadata journalling instead. `aberp_snapshot::crash_safe::fsync_dir`
+    /// already swallows this; matching that here, because hard-failing every
+    /// money path on Windows over a no-op step would be a worse bug than the
+    /// one it guards. Nothing is journalled when it is skipped: the journal
+    /// must mean "this is on stable storage", never "we tried".
+    fn fsync_and_record_dir(&self, dir: &Path) -> Result<(), DbError> {
+        match fsync_path(dir) {
+            Ok(()) => {}
+            #[cfg(windows)]
+            Err(_) => return Ok(()),
+            #[cfg(not(windows))]
+            Err(e) => return Err(e),
+        }
+        let mut synced = match self.synced_dirs.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                self.synced_dirs.clear_poison();
+                poisoned.into_inner()
+            }
+        };
+        if !synced.iter().any(|p| p == dir) {
+            synced.push(dir.to_path_buf());
+        }
+        Ok(())
+    }
+
+    /// ADR-0110 D3 B3 — every DIRECTORY this handle has `fsync`'d, in first-sync
+    /// order. Kept out of [`Self::fsynced_paths`] so that stays "files carrying
+    /// rows" for the power-loss spec's copy manifest.
+    ///
+    /// Exists because the PR #37 adversarial found the parent-directory `fsync`
+    /// was pinned by nothing at all — it bypassed the journal, so deleting it
+    /// was invisible to both test files, all four gate checks and all nine
+    /// probes.
+    pub fn fsynced_dirs(&self) -> Vec<PathBuf> {
+        match self.synced_dirs.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
     /// ADR-0110 D3 — every file this handle has `fsync`'d via
-    /// [`Self::durable_ack`], in first-sync order. Directories are never listed
-    /// (they are flushed but carry no rows).
+    /// [`Self::durable_ack`], in first-sync order. Directories are listed
+    /// separately by [`Self::fsynced_dirs`] (they are flushed but carry no
+    /// rows, so the power-loss copy manifest must not include them).
     ///
     /// Read by the durability spec to build its expected set out of what the
     /// write path actually certified, so that deleting the `fsync` deletes the
@@ -728,13 +848,6 @@ impl Handle {
     }
 }
 
-/// Open one runtime connection to the live tenant DB and apply the
-/// single-writer hardening pragmas.
-///
-/// `disable_checkpoint_on_shutdown` is what makes the quiesce-drop in
-/// [`Handle::run_durable_checkpoint_locked`] safe: without it, dropping the
-/// connection would trigger DuckDB's implicit close-checkpoint and fold the
-/// WAL into the live file **in place** — the very `duckdb#23046` path we are
 /// `<db>.wal` — DuckDB's WAL sibling for `db_path`. The extension is
 /// **appended** to the whole file name (`aberp.duckdb` → `aberp.duckdb.wal`),
 /// not substituted, which `Path::set_extension` would get wrong.
@@ -770,6 +883,13 @@ fn fsync_path(path: &Path) -> Result<(), DbError> {
     })
 }
 
+/// Open one runtime connection to the live tenant DB and apply the
+/// single-writer hardening pragmas.
+///
+/// `disable_checkpoint_on_shutdown` is what makes the quiesce-drop in
+/// [`Handle::run_durable_checkpoint_locked`] safe: without it, dropping the
+/// connection would trigger DuckDB's implicit close-checkpoint and fold the
+/// WAL into the live file **in place** — the very `duckdb#23046` path we are
 /// eliminating. With it, the only checkpoint that ever touches the live file
 /// is the validated logical one.
 ///
@@ -853,18 +973,69 @@ impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
         let handle = self.handle;
 
-        // 1b — LOCKSTEP mirror append (always; cheap; closes Gap 2b at the
-        //      source). Uses the shared connection + the once-built meta, so
-        //      it sees exactly what the just-finished txn committed.
-        if let Some(conn) = self.inner.conn.as_ref() {
-            if let Err(e) = aberp_audit_ledger::sync_mirror(conn, &handle.meta, &handle.mirror_path)
-            {
-                tracing::warn!(
-                    error = %e,
-                    mirror = %handle.mirror_path.display(),
-                    "aberp-db: lockstep sync_mirror failed (post-commit); mirror will \
-                     reconcile on the next write or at the pre-snapshot fsync"
-                );
+        // D3 B2 — DATA BEFORE THE RECORD THAT POINTS TO IT.
+        //
+        // The mirror sync below `fsync`s the mirror. Before this reorder that
+        // was the FIRST durability event of the commit and `durable_ack` ran
+        // strictly after the guard dropped, so the mirror was unconditionally
+        // made durable before the DB and WAL were. On the happy path that only
+        // shrank a window; on the ack's ERROR path it froze the ordering into a
+        // fork: the operator is told the money write FAILED while the mirror
+        // durably records that it SUCCEEDED, and Defense's boot auto-heal
+        // (`attempt_db_auto_recovery(mirror_ahead)` → `replay_mirror_delta`)
+        // then RESURRECTS it. Pre-D3 that state was unreachable.
+        //
+        // So the data flush moves ahead of the mirror sync, and on failure the
+        // mirror sync is SKIPPED. That leaves the mirror BEHIND the DB, which
+        // is the benign direction the code already tolerates by design (see the
+        // warn! below: it reconciles on the next write or at the pre-snapshot
+        // fsync). Mirror-ahead is the only direction that forks.
+        //
+        // The outcome is parked in `last_ack` for `Handle::durable_ack` to
+        // claim, because `Drop` cannot return a `Result`.
+        let ack = handle.fsync_data_paths();
+        let data_is_durable = ack.is_ok();
+        if let Err(e) = &ack {
+            tracing::error!(
+                error = %e,
+                db = %handle.db_path.display(),
+                "aberp-db: D3 data fsync FAILED (post-commit); SKIPPING the mirror \
+                 sync so the mirror cannot end up ahead of the DB. The mirror stays \
+                 behind and reconciles on the next successful write; a money path \
+                 will surface this from durable_ack()"
+            );
+        }
+        // Park the outcome for `durable_ack` to claim — FAIL-CLOSED.
+        //
+        // A money path drops its guard and then calls `durable_ack()`; it holds
+        // no lock in between, so another writer's guard can drop in that window
+        // and overwrite the parked outcome. Overwriting an Err with a later Ok
+        // would let the money path claim someone else's success and ack a write
+        // whose own flush failed. So an unclaimed Err STICKS: it is only
+        // cleared by being claimed. The inverse mis-attribution (claiming
+        // someone else's Err) is the safe direction — it fails an ack that may
+        // have been durable, which rule 11 already prefers over the reverse.
+        match (&self.inner.last_ack, &ack) {
+            (Some(Err(_)), _) => { /* keep the unclaimed failure */ }
+            _ => self.inner.last_ack = Some(ack),
+        }
+
+        // 1b — LOCKSTEP mirror append (closes Gap 2b at the source). Uses the
+        //      shared connection + the once-built meta, so it sees exactly what
+        //      the just-finished txn committed. Gated on the data flush above:
+        //      a mirror row must never be durable before the row it mirrors.
+        if data_is_durable {
+            if let Some(conn) = self.inner.conn.as_ref() {
+                if let Err(e) =
+                    aberp_audit_ledger::sync_mirror(conn, &handle.meta, &handle.mirror_path)
+                {
+                    tracing::warn!(
+                        error = %e,
+                        mirror = %handle.mirror_path.display(),
+                        "aberp-db: lockstep sync_mirror failed (post-commit); mirror will \
+                         reconcile on the next write or at the pre-snapshot fsync"
+                    );
+                }
             }
         }
 
