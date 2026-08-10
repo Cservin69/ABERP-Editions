@@ -4,9 +4,16 @@ Every capability the [README](../README.md) lists as **Designed — awaiting
 hardware/endpoint** has one entry here. The goal for each is to drive it to
 **Live**: a real emitter or handler, exercised end to end.
 
-The two lists are **1:1**. If you add a Designed row to the README, add an
-entry here; if an entry reaches Live, flip the README row and delete the
-entry. A Designed row with no backlog entry (or the reverse) is a drift bug.
+The file also tracks **expansion slots on capabilities that are already
+Live** — a base that works, sitting on a seam with more capacity than is
+currently drawn on. [D-16](#d-16) is the first of these. An expansion entry
+never downgrades the Live claim it hangs off; it itemises what is *not yet*
+drawn from a socket that already carries load.
+
+The two lists are **1:1**. If you add a Designed row or an expansion
+pointer to the README, add an entry here; if an entry reaches Live, flip the
+README row and delete the entry. A README reference with no backlog anchor
+(or the reverse) is a drift bug.
 
 Each entry records:
 
@@ -78,6 +85,13 @@ already built for hand-entered values and would be reused.
 
 **Size.** Medium per source: a poll loop and a parser against a real
 sample. The cursor semantics are already defined by the trait.
+
+**Shares work with [D-16](#d-16).** The MTConnect arm of this entry needs
+gap-safe `/sample?from=<nextSequence>` polling and a `/probe` capture to
+confirm the probe `Sensor` items are on the wire — both are D-16 expansion
+slots. Doing them once in the shared MTConnect transport serves this entry
+and the CNC/laser adapters together; doing them twice is the failure mode
+to avoid.
 
 <a id="d-05"></a>
 ### D-05 — DÁP eAzonosítás operator login
@@ -351,3 +365,136 @@ satisfy each control, and a report that renders the coverage.
 
 **Size.** Medium, and mostly analysis rather than code: deciding which
 existing events evidence which controls is the work.
+
+---
+
+## Expansion slots on a Live capability
+
+<a id="d-16"></a>
+### D-16 — MTConnect: develop the base transport into a full socket
+
+**Status: the base transport is Live and stays Live.** This entry does not
+downgrade it. MTConnect was picked over N proprietary vendor SDKs precisely
+because one open standard covers the whole controller population — DMG
+MORI, Mazak, Haas, Okuma, Fanuc, Heidenhain — and that bet has already paid
+out inside the repo: the CNC adapter
+(`crates/aberp-mes/src/adapters/mtconnect.rs`) and the Trumpf laser both
+run on the same code. `trumpf.rs:106` imports `poll_once` and
+`map_execution_to_state` from the MTConnect module and reuses
+`parse_mtconnect_current` verbatim. Two machine families, one transport.
+
+This entry itemises the capacity that seam has and we are not yet drawing.
+Each slot below has real code behind it today.
+
+#### Slot 1 — five parsed data items with no consumer
+
+`parse_mtconnect_current` extracts six leaf data items into
+`MtconnectSnapshot` (`mtconnect.rs:352`): `Execution`, `Availability`,
+`Program`, `ControllerMode`, `PartCount`, and `RotaryVelocity` /
+`SpindleSpeed` (parse arms at `mtconnect.rs:533`–`:542`). But `apply_poll_outcome`
+reads **only** `snapshot.execution` — the other five are parsed off the
+wire every five seconds and dropped.
+
+The seam is proven, not theoretical: `MtconnectLaserSource` already
+consumes a second field (`snapshot.program`, `trumpf.rs:293`) through the
+same parser. Nothing structural blocks the rest.
+
+*Missing:* consumers, and in most cases a new `CanonicalEvent` variant to
+carry the value. Today's five variants — `PartMoved`,
+`MachineStateChanged`, `QualityResultReceived`, `ScanReceived`,
+`WorkOrderStateChanged` (`crates/aberp-mes/src/events.rs`) — have no shape
+for a part count or a spindle speed. `PartCount` is the obvious first one:
+it is a production-count signal the shop actually wants, it is already
+parsed and integer-validated, and it needs no hardware we do not have.
+
+*Blocked on:* nothing external.
+
+*Size:* small per data item, once the event shape is decided. The event
+shape is the design call, not the parsing.
+
+#### Slot 2 — `/sample` subscription with sequence gap detection
+
+v1 re-pulls `/current` every 5s, which works against any Agent but misses
+state pulses shorter than the poll interval. The module docs carry this as
+a named PR-240 follow-up (`mtconnect.rs:75`): long-poll or chunked
+`/sample?from=X&count=Y` with sequence-based gap detection.
+
+*Missing:* the `/sample` client and cursor handling. **This is the same
+work [D-02](#d-02)'s MTConnect probe arm needs** — its `todo!` names
+`poll /sample?from=<nextSequence>` explicitly. Build it once here.
+
+*Blocked on:* nothing external to write it; validating it against a real
+Agent's sequence numbering wants machine access.
+
+*Size:* medium, and it is the highest-leverage slot — it unblocks D-02 and
+raises fidelity for every adapter on the seam.
+
+#### Slot 3 — Condition / fault stream parsing
+
+Only `Execution` currently triggers a state change. MTConnect Conditions
+and Warnings carry their own vocabulary, and `MachineState::Fault` already
+exists as a mapping target (named as future work at `mtconnect.rs:79`).
+
+*Missing:* the Condition parse arms and a `Condition.fault` →
+`MachineState::Fault` mapping. Today a machine in a fault condition that
+still reports `Execution: ACTIVE` reads as Running.
+
+*Blocked on:* nothing external, though real fault documents are worth
+capturing before fixing the mapping.
+
+*Size:* small-to-medium.
+
+#### Slot 4 — `/probe` device-catalog introspection
+
+`/probe` returns the device's data-item catalog. Named as future work at
+`mtconnect.rs:83`.
+
+*Missing:* the call plus a validation pass. Two payoffs: it tells an
+operator at adapter-registration time whether their controller actually
+exposes the items we consume instead of failing silently into `Unknown`,
+and it is **literally step one of [D-02](#d-02)'s MTConnect arm** — the
+`MtconnectProbeSource` doc calls for a `/probe` + `/current` capture from
+the target machine to confirm probe `Sensor` items are on the wire.
+
+*Blocked on:* nothing external to write; the confirmation step needs a
+machine.
+
+*Size:* small.
+
+#### Slot 5 — `/assets`: cutting tool and workpiece tracking
+
+MTConnect asset tracking (`cuttingTool`, `workpiece`), named at
+`mtconnect.rs:86`.
+
+*Missing:* everything but the transport. Worth noting the adjacency: tool
+life and workpiece identity are the natural join to the Live part-UID and
+heat-lot traceability chains, which is what would make this more than
+telemetry.
+
+*Blocked on:* nothing external.
+
+*Size:* medium, and it wants a design pass on how assets relate to the
+existing traceability model before any code.
+
+#### Slot 6 — SHDR-side Adapter SDK
+
+Named at `mtconnect.rs:87`. We assume the Agent is already up — built-in on
+modern controllers, sidecar on legacy ones — and ship no Adapter-side code.
+
+*Missing:* the SHDR publishing side, for shops with a legacy controller and
+no Agent in front of it.
+
+*Blocked on:* a shop that actually has this problem. Do not build it
+speculatively; the population it serves is exactly the one we cannot
+currently reach, so it is unmeasured.
+
+*Size:* large, and the widest scope in this entry.
+
+#### Do not regress
+
+The DoS bounds are enforced in code, not operator config
+(`max_response_bytes` 4 MiB, `request_timeout` 4s set deliberately below
+the 5s `poll_interval` so stalled requests cannot pile up across ticks).
+Any new endpoint added above inherits that posture — a `/sample` long-poll
+in particular needs its own explicit bound, since it is the one shape here
+that is *supposed* to hold a connection open.
