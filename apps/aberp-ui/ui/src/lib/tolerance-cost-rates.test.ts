@@ -120,12 +120,21 @@ describe("seed-default badging", () => {
     updated_by_actor: "boot",
   };
 
-  it("recognises the backend seed stamp by prefix", () => {
+  it("keys on the write actor, NOT on the notes stamp (N2)", () => {
     expect(isSeedDefault(base)).toBe(true);
-    expect(isSeedDefault({ ...base, notes: null })).toBe(false);
-    expect(isSeedDefault({ ...base, notes: "our measured cell" })).toBe(false);
-    // An operator appending to a still-seeded note keeps the badge.
-    expect(isSeedDefault({ ...base, notes: `${SEED} (checked 2026-09)` })).toBe(true);
+    // The notes stamp is NOT the signal: the edit form pre-fills it, so a row
+    // an operator has written carries SEED_NOTE verbatim and must still read
+    // as theirs.
+    expect(isSeedDefault({ ...base, updated_by_actor: "ervin" })).toBe(false);
+    expect(
+      isSeedDefault({ ...base, notes: null, updated_by_actor: "ervin" }),
+    ).toBe(false);
+    // ...and clearing the note on a row nobody has written does not fake
+    // ownership.
+    expect(isSeedDefault({ ...base, notes: null })).toBe(true);
+    expect(isSeedDefault({ ...base, notes: `${SEED} (checked 2026-09)` })).toBe(
+      true,
+    );
   });
 
   it("a seeded non-zero band is NOT reported as tuned", () => {
@@ -137,7 +146,11 @@ describe("seed-default badging", () => {
 
   it("an operator-owned row reads as tuned, and a zero row as dormant", () => {
     expect(
-      toleranceCostRateStatus({ ...base, notes: "measured on cell 3" }),
+      toleranceCostRateStatus({
+        ...base,
+        notes: "measured on cell 3",
+        updated_by_actor: "ervin",
+      }),
     ).toBe("tuned");
     expect(
       toleranceCostRateStatus({

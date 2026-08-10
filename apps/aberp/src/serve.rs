@@ -72,8 +72,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aberp_audit_ledger::{
-    compute_entry_hash, Actor, BinaryHash, Entry, EventKind, Ledger, LedgerVerifyError, TenantId,
-    VerifyError,
+    compute_entry_hash, Actor, BinaryHash, Entry, EventKind, Ledger, LedgerMeta, LedgerVerifyError,
+    TenantId, VerifyError,
 };
 use aberp_billing::{self as billing, BillingStore, Currency, DuckDbBillingStore, ReadyInvoice};
 use aberp_nav_transport::{
@@ -1568,15 +1568,26 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         crate::quoting_gear_processes::seed_gear_processes_if_absent(&conn, tenant.as_str())
             .context("seed quoting_gear_processes at serve boot")?;
         // T4 / ADR-0097 Part 2 — tolerance cost-rate catalogue: idempotent
-        // schema + five-band ZERO-CONTRIBUTION seed (insert-if-absent). The
-        // pricing pipeline snapshots this into the engine's
-        // `CatalogueSnapshot.tolerance_cost_rates`. The seed moves no money
-        // (every row contributes 0.0 EUR until the operator tunes it, R4);
-        // existing quotes are untouched.
+        // schema + the five-band seed. The pricing pipeline snapshots this into
+        // the engine's `CatalogueSnapshot.tolerance_cost_rates`.
+        //
+        // The band set is laid down ONCE PER TENANT (marker-gated, so an
+        // operator deleting a band is not overruled on the next boot — B1), and
+        // `loose`/`standard` stay zero-contribution so an un-toleranced part
+        // still prices byte-identically (R4). The migration arm re-prices a
+        // tenant still on the original all-zero seed and is audited inside its
+        // own write tx, hence the `LedgerMeta` (N1).
         crate::quoting_tolerance_cost_rates::ensure_schema(&conn)
             .context("ensure quoting_tolerance_cost_rates schema at serve boot")?;
+        let tolerance_seed_meta = LedgerMeta::new(
+            tenant.clone(),
+            binary_hash_handle
+                .wait()
+                .context("await binary hash for tolerance cost-rate seed audit")?,
+        );
         crate::quoting_tolerance_cost_rates::seed_tolerance_cost_rates_if_absent(
-            &conn,
+            &mut conn,
+            &tolerance_seed_meta,
             tenant.as_str(),
         )
         .context("seed quoting_tolerance_cost_rates at serve boot")?;

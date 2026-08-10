@@ -83,7 +83,7 @@ inert for base pricing and touches only the escalation.
 | standard | 0.0 | 0.0 | 0.0 | 0.00 | 1.0 | no |
 | tight | 0.0 | 0.5 | 1.0 | **0.02** | 1.0 | no |
 | precision | 0.5 | 1.0 | 2.0 | **0.05** | 1.25 | no |
-| ultra_precision | 1.0 | 2.0 | 4.0 | **0.12** | 1.5 | **yes** |
+| ultra_precision | 0.5 | 2.0 | 4.0 | **0.12** | 1.5 | **yes** |
 
 **Scrap / rework — the one directly-anchored column.** A published case relaxing
 twenty ±0.01 mm dimensions to ±0.03 mm "reduced machining time by ~40% and
@@ -92,19 +92,23 @@ lowered scrap from 12% to 2%" [4]. Read straight off: ≈**2 %** at the `tight`
 `precision` interpolated at 5 %.
 
 **Slower feeds + extra finishing passes.** Tight tolerances raise machining time
-"by 30–200%" [4]; going from ±0.005″ to ±0.0005″ raises machining cost 30–50 %
-through slower feeds and additional finishing passes [5]. Hence **half** an extra
-whole-part pass at a 1.25 feed factor at `precision` and a full one at 1.5 at
-`ultra_precision`.
+"by 30–200%" [4]. On metric steps, tightening ±0.05→±0.02 mm "adds 50-80%" and
+±0.02→±0.01 mm "multiplies by 2-4x" [5]. Hence **half** an extra whole-part pass
+at a 1.25 feed factor at `precision`, and the same half-pass at 1.5 at
+`ultra_precision` — the feed factor, not the pass count, carries the extra
+tightness. Both sit at the bottom of those ranges.
 
-`finish_passes_add` multiplies the **whole-part** geometry finishing minutes, so
-it is the dominant term on any part with real surface area. A full 1.0 at
-`precision` measured out at **~50 % of the machining line** on the test bracket —
-the very top of the cited 30–50 % range, and stacked on top of the 1.9×
-`quoting_tolerance_multipliers` row that already fires at that band (risk R1).
-Half a pass — physically, re-finishing the toleranced regions rather than every
-surface on the part — lands it mid-range at ~30 %. Both values were cut in half
-from the first draft for exactly this reason.
+> **CORRECTION (post-adversarial, B3).** The first version of this note cited
+> Metalworks Plus for *"±0.005″→±0.0005″ raises machining cost 30–50 % via slower
+> feeds, additional finishing passes and more frequent tool changes."* **That page
+> does not contain that claim** — it has no inch figures, no 30–50 %, and no
+> feeds/passes text; it is a metric IT-grade multiplier table. I could not find
+> any fetchable source carrying that sentence, so **the claim is withdrawn**
+> rather than re-attributed. It had been the entire justification for both
+> `finish_passes_add` values, which are now re-anchored on [4] and [5] above and,
+> more importantly, bounded by the published ceiling below. `ultra_precision`'s
+> `finish_passes_add` was also halved 1.0 → 0.5 for the same whole-part reason
+> already applied to `precision`.
 
 **Inspection.** A simple part's CMM run is put at 15–30 minutes, complex
 components "an hour or more" [7]; tight tolerances "double inspection effort"
@@ -112,13 +116,46 @@ components "an hour or more" [7]; tight tolerances "double inspection effort"
 `precision` on a programmed repeat run, doubled to 4 at the tightest band, with
 in-process gauging at half the CMM minutes.
 
-**Sanity ceiling.** Independently, IT7 is reported at 3–5× the IT8–IT9 baseline
-and IT5–IT6 at 8–15× [8]. Those are whole-part *price* multipliers spanning
-material, machining and setup, so they are **not** directly comparable to this
-additive line — they are recorded only as an upper sanity bound. Note the
-existing `quoting_tolerance_multipliers` (1.4 / 1.9 / 2.8) already carries part of
-that escalation; the ADR-0097 line is additive on top and measures a different
-quantity (risk R1).
+### Published ceiling — the binding check (re-run post-B3)
+
+Metalworks Plus's **actual** content is a cost-factor table against an IT8 base
+[5b]: **IT5 4–6×, IT6 2–4×, IT7 1.5–2×, IT9–IT11 0.6–0.9×**. That maps directly
+onto our band edges (ultra ≤ IT5, precision IT6–7, tight IT8–9, standard IT10–11).
+
+Because our `standard` band *is* IT10–11, dividing through by its 0.75 midpoint
+gives the ceiling **relative to our own baseline**:
+
+| band | IT grades | vs IT8 [5b] | ceiling vs our standard | measured (this seed) | verdict |
+|---|---|---|---:|---:|---|
+| tight | IT8–9 | ~1.0× | ~1.33× (tested at 1.5) | **1.19×** | inside |
+| precision | IT6–7 | 1.5–4× | ~5.3× | **1.63×** | inside (conservative) |
+| ultra_precision | ≤IT5 | 4–6× | 8.0× | **3.13×** | inside (conservative) |
+
+Measured at the worst case tested (8 critical callouts, callout-only path) on the
+test bracket. **All three bands are inside, and `precision` and `ultra` are in
+fact *below* the published floor for their grades** — this seed under-prices
+tightness relative to the literature rather than over-pricing it, which is the
+intended direction for a default nobody has approved yet. Pinned by
+`pin_seeded_bands_stay_under_the_published_it_grade_ceiling`, which asserts the
+ratio across n ∈ {1, 4, 8} so it cannot silently drift at higher callout counts.
+
+Note the pre-existing `quoting_tolerance_multipliers` (1.4 / 1.9 / 2.8) carries
+part of the same escalation; the ADR-0097 line is additive on top and measures a
+different quantity (risk R1). The ratios above are measured on the composed
+result, so the ceiling check covers both together.
+
+### Grinding escalation — now capped
+
+`GRINDING_ESCALATION_MIN_PER_CRITICAL_FEATURE` is a flat 12 min **per callout**,
+size-independent, and was **uncapped**: 8 GD&T boxes on a pocket-sized bracket
+charged 96 min = 240 EUR of grinding, driven purely by how many boxes a
+draughtsman ticked. Since this change is what first switches the escalation on,
+it also adds `GRINDING_ESCALATION_MAX_MIN_PER_PART = 48.0` (four features'
+worth): past a handful of ground features the refixtures share a setup and the
+part is a dedicated grinding job a human must quote, which the reasoning log now
+says loudly. The cap is **monotone downward** — it can only reduce a quote — and
+does not move any part with ≤ 4 callouts, so every golden and the T7 validation
+numbers are unchanged.
 
 Every value is deliberately at the **low end** of its researched range: a seed
 that under-states is corrected at the operator's first quote review, whereas one
@@ -130,10 +167,11 @@ that over-states silently loses work.
 2. [CNC Magazin — CNC Fräsen Preisliste 2025](https://cnc-and-more.blog/cnc-fraesen-preisliste-2025-kostenfaktoren-und-tipps/) — "Moderne 5-Achs-Zentren liegen oft zwischen 60–120 Euro pro Stunde." Published 2025-07-28.
 3. [uneed — CNC Machining Cost: Pricing & Savings Guide 2026](https://www.uneedpm.com/cnc-machining-cost-pricing-savings-guide-2026/) — European job-shop rates: 3-axis milling €70–120/hr, turning €75–125/hr, 5-axis €150–250/hr; DACH shops at the upper end. Accessed 2026-08-10.
 4. [Tirapid — Tight Tolerance Machining](https://tirapid.com/tight-tolerance-machining/) — "relaxing twenty ±0.01mm dimensions to ±0.03mm reduced machining time by ~40% and lowered scrap from 12% to 2%"; "Machining time rises by 30–200%"; "Inspection effort doubles". Published 2026-04-30.
-5. [Metalworks Plus — Precision Machined Parts: Tolerance Standards & Cost](https://metalworksplus.com/news/precision-machined-parts-tolerance-standards-cost/) — ±0.005″ → ±0.0005″ raises machining cost 30–50 % via slower feeds, additional finishing passes, more frequent tool changes. Accessed 2026-08-10.
+5. [okdor — How Much Do Tight Tolerances Add to Machining Costs?](https://okdor.com/tight-tolerances-raise-costs/) — "±0.05mm to ±0.02mm adds 50-80%"; "±0.02mm to ±0.01mm multiplies by 2-4x". Published 2025-01-02.
+5b. [Metalworks Plus — Precision Machined Parts: Tolerance Standards & Cost](https://metalworksplus.com/news/precision-machined-parts-tolerance-standards-cost/) — Table 1 cost factors vs an IT8 base: "IT5 … 4×–6× Base", "IT6 … 2×–4× Base", "IT7 … 1.5×–2× Base", "IT9–IT11 … 0.6×–0.9× Base". Accessed 2026-08-10. **NB:** this page does NOT contain the 30–50 %/inch/feeds claim an earlier draft attributed to it — see the CORRECTION above.
 6. [oberflaechen-bearbeitung.de — Koordinatenschleifen](https://oberflaechen-bearbeitung.de/fertigungsverfahren/koordinatenschleifen/) — coordinate grinding described as climate-controlled CNC work at nanometre-range accuracy for demanding form-and-position tolerances; **no hourly rate published**. Accessed 2026-08-10.
 7. [BOYI — CMM for Precision Part Inspection](https://www.boyiprototyping.com/cnc-machining-guide/cmm-for-precision-part-inspection/) — "Simple parts usually take around 15-30 minutes, while more complex components may require up to an hour or more." Published 2024-08-20.
-8. [Alibaba Seller Blog — IT Tolerance Grades Explained](https://seller.alibaba.com/blogs/2026/southeast-asia/precision-machining/it-tolerance-grades-guide-alibaba-b2b) — "IT7 tolerance costs 3-5x more than IT8-IT9 baseline, while IT5-IT6 can cost 8-15x base pricing". No publication date shown.
+8. [Alibaba Seller Blog — IT Tolerance Grades Explained](https://seller.alibaba.com/blogs/2026/southeast-asia/precision-machining/it-tolerance-grades-guide-alibaba-b2b) — "IT7 tolerance costs 3-5x more than IT8-IT9 baseline, while IT5-IT6 can cost 8-15x base pricing". No publication date shown. Recorded as a secondary, looser corroboration only; the binding ceiling above uses [5b].
 
 ## Caveats
 
