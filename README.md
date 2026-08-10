@@ -231,6 +231,12 @@ Every Designed item has a matching entry in
 which records the code surface that exists today and what is concretely
 missing to drive it to Live.
 
+A capability can also be **Live with expansion slots** — the base works and
+is in use, but the seam it sits on has more capacity than is currently
+drawn on. Those are tracked in the same backlog; the base stays Live.
+MTConnect ([D-16](docs/BACKLOG-designed-to-live.md#d-16)) is the current
+example.
+
 ---
 
 ## Audit — what is recorded, and what protects it
@@ -474,6 +480,17 @@ are wired to real transports:
 | CNC (MTConnect) | HTTP `GET /{device}/current` polling | Bounded response size, classified transport errors |
 | Robot (Universal Robots) | RTDE over TCP, version handshake | Reconnect with exponential backoff |
 | Laser (Trumpf) | MTConnect agent / gateway | Backend is a code decision, not an operator field |
+
+**MTConnect is the load-bearing seam, and it has room to grow**
+([D-16](docs/BACKLOG-designed-to-live.md#d-16)). One open standard already
+serves two machine families here — the CNC adapter and the Trumpf laser
+share the same polling and parsing code — which is exactly why it was
+chosen over N vendor SDKs. The base transport is Live and stays Live; what
+is tracked as a development socket is the capacity beyond it. Today the
+parser already extracts six data items per poll but only `Execution` drives
+an event, and the adapter polls `/current` snapshots without touching
+`/sample`, `/probe`, or `/assets`. Each of those is a concrete slot with
+existing code behind it, itemised in the backlog.
 
 ### Designed — awaiting hardware or endpoint
 
