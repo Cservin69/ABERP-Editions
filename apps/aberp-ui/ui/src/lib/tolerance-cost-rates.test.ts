@@ -11,6 +11,9 @@ import {
   formFromToleranceCostRate,
   isZeroContribution,
   TOLERANCE_BANDS,
+  isSeedDefault,
+  toleranceCostRateStatus,
+  toleranceCostRateStatusLabel,
 } from "./tolerance-cost-rates";
 import { TOLERANCE_RANGES, type ToleranceCostRate } from "./api";
 
@@ -96,5 +99,55 @@ describe("isZeroContribution", () => {
     );
     expect(isZeroContribution({ ...base, feed_slowdown_factor: 1.2 })).toBe(false);
     expect(isZeroContribution({ ...base, grinding_escalation: true })).toBe(false);
+  });
+});
+
+describe("seed-default badging", () => {
+  const SEED =
+    "SEED — default EU/DE machine-shop rates, NOT your shop's measured values. " +
+    "Tune to your shop. / ALAPÉRTÉK — EU/DE gépipari átlag, hangolja a saját műhelyére.";
+  const base: ToleranceCostRate = {
+    id: "qtcr_y",
+    tolerance_class: "precision",
+    finish_passes_add: 0.5,
+    inproc_inspection_min: 1,
+    cmm_min_per_critical_feature: 2,
+    rework_scrap_pct: 0.05,
+    feed_slowdown_factor: 1.25,
+    grinding_escalation: false,
+    notes: SEED,
+    updated_at: "",
+    updated_by_actor: "boot",
+  };
+
+  it("recognises the backend seed stamp by prefix", () => {
+    expect(isSeedDefault(base)).toBe(true);
+    expect(isSeedDefault({ ...base, notes: null })).toBe(false);
+    expect(isSeedDefault({ ...base, notes: "our measured cell" })).toBe(false);
+    // An operator appending to a still-seeded note keeps the badge.
+    expect(isSeedDefault({ ...base, notes: `${SEED} (checked 2026-09)` })).toBe(true);
+  });
+
+  it("a seeded non-zero band is NOT reported as tuned", () => {
+    expect(toleranceCostRateStatus(base)).toBe("seed");
+    expect(toleranceCostRateStatusLabel(base)).toBe(
+      "seed default — tune to your shop",
+    );
+  });
+
+  it("an operator-owned row reads as tuned, and a zero row as dormant", () => {
+    expect(
+      toleranceCostRateStatus({ ...base, notes: "measured on cell 3" }),
+    ).toBe("tuned");
+    expect(
+      toleranceCostRateStatus({
+        ...base,
+        finish_passes_add: 0,
+        inproc_inspection_min: 0,
+        cmm_min_per_critical_feature: 0,
+        rework_scrap_pct: 0,
+        feed_slowdown_factor: 1,
+      }),
+    ).toBe("dormant");
   });
 });

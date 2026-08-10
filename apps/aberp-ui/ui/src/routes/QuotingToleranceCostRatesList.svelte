@@ -14,7 +14,7 @@
     listToleranceCostRates,
     type ToleranceCostRate,
   } from "../lib/api";
-  import { isZeroContribution } from "../lib/tolerance-cost-rates";
+  import { toleranceCostRateStatus, toleranceCostRateStatusLabel } from "../lib/tolerance-cost-rates";
   import { fmtPct, toleranceRangeLabel } from "../lib/quoting-tunables-format";
   import QuotingToleranceCostRateForm from "./QuotingToleranceCostRateForm.svelte";
 
@@ -133,7 +133,9 @@
             <td class="num">{fmtPct(rate.rework_scrap_pct)}</td>
             <td class="num">{rate.feed_slowdown_factor.toFixed(4)}</td>
             <td>{rate.grinding_escalation ? "yes" : "no"}</td>
-            <td class="muted">{isZeroContribution(rate) ? "dormant (0)" : "tuned"}</td>
+            <td class:muted={toleranceCostRateStatus(rate) !== "seed"} class:seed-badge={toleranceCostRateStatus(rate) === "seed"}>
+              {toleranceCostRateStatusLabel(rate)}
+            </td>
             <td class="actions-col">
               {#if confirmDeleteId === rate.id}
                 <span class="confirm">
@@ -237,6 +239,15 @@
     color: var(--color-text-muted);
     font-family: var(--type-family-mono);
     font-size: var(--type-size-xs);
+  }
+
+  /* A seeded band carries real money nobody at this shop has approved yet —
+     it must read as an action item, not as a settled value. */
+  .seed-badge {
+    color: var(--color-text-warning, var(--color-text-primary));
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-xs);
+    font-weight: 600;
   }
 
   .actions-col {

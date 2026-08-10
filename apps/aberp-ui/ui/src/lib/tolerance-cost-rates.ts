@@ -104,3 +104,41 @@ export function isZeroContribution(rate: ToleranceCostRate): boolean {
     !rate.grinding_escalation
   );
 }
+
+/** The marker the backend's `SEED_NOTE` opens with (see
+ * `apps/aberp/src/quoting_tolerance_cost_rates.rs`). Matched as a **prefix**
+ * rather than by full equality so the long bilingual sentence does not have to
+ * be duplicated verbatim on this side, and so an operator who appends their own
+ * note to a still-untuned seed row keeps the seed badge. */
+export const SEED_NOTE_MARKER = "SEED —";
+
+/** `true` when this row still carries the boot seed's provenance stamp, i.e.
+ * the numbers are the researched **default EU/DE machine-shop** values and NOT
+ * this shop's measured ones. Any operator write through the form replaces
+ * `notes`, so the badge clears as soon as a human owns the row. Pure. */
+export function isSeedDefault(rate: ToleranceCostRate): boolean {
+  return (rate.notes ?? "").trimStart().startsWith(SEED_NOTE_MARKER);
+}
+
+/** The Status-column chip. Three states, because "not zero" is NOT the same as
+ * "the operator vouches for this number": a seeded tight band carries real
+ * money that nobody at this shop has approved yet, and calling that "tuned"
+ * would be exactly the mislabelling the seed stamp exists to prevent. */
+export function toleranceCostRateStatus(
+  rate: ToleranceCostRate,
+): "dormant" | "seed" | "tuned" {
+  if (isSeedDefault(rate)) return isZeroContribution(rate) ? "dormant" : "seed";
+  return isZeroContribution(rate) ? "dormant" : "tuned";
+}
+
+/** Operator-facing label for [`toleranceCostRateStatus`]. */
+export function toleranceCostRateStatusLabel(rate: ToleranceCostRate): string {
+  switch (toleranceCostRateStatus(rate)) {
+    case "dormant":
+      return "dormant (0)";
+    case "seed":
+      return "seed default — tune to your shop";
+    case "tuned":
+      return "tuned";
+  }
+}

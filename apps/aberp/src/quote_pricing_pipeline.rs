@@ -248,6 +248,29 @@ struct ToleranceStamp {
 /// onto the graph. An operator override of `None` leaves both graph fields
 /// untouched ⇒ a part with no tolerance signal keeps its Unspecified default ⇒
 /// the caller's `default_tolerance` ⇒ byte-identical pricing.
+///
+/// ## FLAG — the `"extractor"` arm has no CAD producer today (2026-08-10)
+///
+/// The middle precedence arm fires when the graph *arrives* carrying a tolerance
+/// hint, and it is correct and unit-tested. But **nothing in the CAD path can
+/// currently put one there**, so in production the source is only ever
+/// `"operator"` or `"default"`:
+///
+/// * `python/aberp-cad-extract` pins `SCHEMA_VERSION = 2` and its pydantic
+///   `FeatureGraph` is `extra="forbid"` with **no** tolerance field — it cannot
+///   even round-trip one;
+/// * `aberp-cad-extract-wrapper` pins `EXPECTED_SCHEMA_VERSION = 2` and hard-
+///   rejects anything else, so the two stay in lockstep by construction;
+/// * the STEP extractor is OCCT bbox/volume/surface-area only — it does not read
+///   AP242 PMI/GD&T, which is where a drawing's tolerances actually live.
+///
+/// Closing this is **not** a wiring task: it needs semantic PMI extraction out
+/// of AP242 (partial in OCCT), a Python `SCHEMA_VERSION` 2→3 bump carrying
+/// `tolerance` + per-feature callouts, and the matching wrapper bump — ADR-0097
+/// R5's schema-lockstep item, tracked but deliberately **not** attempted as part
+/// of the cost-rate seed. Until then a customer's storefront selection or the
+/// operator's per-job editor is the only tolerance signal, and both land on the
+/// `"operator"` arm. Nothing here is broken; the arm is simply dormant.
 fn stamp_tolerance(graph: &mut FeatureGraph, operator: Option<PerJobTolerance>) -> ToleranceStamp {
     let source = match operator {
         Some(t) => {
