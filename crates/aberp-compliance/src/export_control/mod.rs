@@ -13,8 +13,12 @@
 //!
 //! S345 ships the [`ExportControlProvider`] trait (the swap-point) and one
 //! implementation, [`MockExportControlProvider`], which answers
-//! [`ExportClassification::NotClassified`] + [`ScreeningResult::Clear`] for
-//! everything. The real backends slot in behind the same trait later.
+//! [`ExportClassification::NotClassified`] + [`ScreeningResult::NotScreened`]
+//! for everything. The real backends slot in behind the same trait later.
+//!
+//! Both mock answers are deliberately *absences*, never positive findings
+//! (S441): a backend that consults nothing must not put `EAR99` or a CLEAR
+//! screening result into an append-only, hash-chained compliance row.
 
 mod mock;
 
@@ -99,13 +103,30 @@ impl ExportClassification {
 /// for, so a typo (`"grant"`, `"GRANTED"`) must be impossible at the write
 /// boundary. Round-trip-proven via [`AccessDecision::as_str`] /
 /// [`AccessDecision::from_storage_str`].
+///
+/// S441 (review finding #1) widened this from a two-value granted/denied flag.
+/// Two-valued, it forced two separate lies: an *unscreened* export had to be
+/// recorded as `granted`, and a *restricted* (licence-required) party had to be
+/// recorded as a flat `denied`, overstating the regulator's status. Four values
+/// let each real outcome say what it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccessDecision {
-    /// The access / export may proceed.
+    /// A screen RAN and the access / export may proceed. A positive finding —
+    /// never used for "we did not look".
     Granted,
-    /// The access / export is refused. The accompanying `reason` field names
-    /// the rule that drove the refusal.
+    /// A screen ran and returned a *restricting* match (e.g. a licence is
+    /// required). Blocks the export here ([`Self::blocks_export`]) because
+    /// ABERP has no licence surface to check one against, but the token stays
+    /// distinct from `denied`: the regulator's status is "restricted", and an
+    /// auditor must be able to tell a licensable party from a debarred one.
+    Restricted,
+    /// A screen ran and returned a denied-party match. The transaction must not
+    /// proceed.
     Denied,
+    /// **No screening was performed**, so no decision exists. The
+    /// [`ScreeningResult::NotScreened`] counterpart — the token that keeps an
+    /// unscreened export from reading as a cleared one.
+    NotDetermined,
 }
 
 impl AccessDecision {
@@ -113,42 +134,64 @@ impl AccessDecision {
     pub fn as_str(self) -> &'static str {
         match self {
             AccessDecision::Granted => "granted",
+            AccessDecision::Restricted => "restricted",
             AccessDecision::Denied => "denied",
+            AccessDecision::NotDetermined => "not_determined",
         }
     }
 
     /// Parse the storage token. Fail loud on unknown (CLAUDE.md rule 12) — a
     /// silent fallback to `Granted` would be the worst-class export-control bug
-    /// (it would read a denial back out of the ledger as an approval).
+    /// (it would read a denial, or an unscreened export, back out of the ledger
+    /// as an approval).
     pub fn from_storage_str(s: &str) -> Result<Self, &'static str> {
         match s {
             "granted" => Ok(AccessDecision::Granted),
+            "restricted" => Ok(AccessDecision::Restricted),
             "denied" => Ok(AccessDecision::Denied),
+            "not_determined" => Ok(AccessDecision::NotDetermined),
             _ => Err("unknown AccessDecision storage string"),
         }
+    }
+
+    /// `true` if the export must be refused at the write boundary.
+    ///
+    /// `Restricted` and `Denied` block. `NotDetermined` does **not**: with no
+    /// screening backend configured, blocking would halt every shipment on the
+    /// install, which is a policy change no one has asked for. The honest
+    /// record — `decision="not_determined"` plus the `backend` tag — is what
+    /// this axis delivers today; turning "unscreened" into a hard refusal is a
+    /// named follow-up, not a silent default.
+    pub fn blocks_export(self) -> bool {
+        matches!(self, AccessDecision::Restricted | AccessDecision::Denied)
     }
 }
 
 impl ScreeningResult {
     /// The access decision this screening outcome implies.
     ///
-    /// `Clear` → [`AccessDecision::Granted`]. BOTH `Restricted` and `Denied` →
-    /// [`AccessDecision::Denied`]: a `Restricted` match means the transaction
-    /// needs a licence that this install has no surface to record, so the
-    /// conservative posture is to refuse and let a human adjudicate
-    /// ([[trust-code-not-operator]]) rather than let a licensable-but-unlicensed
-    /// export through.
+    /// One-to-one, deliberately: each screening outcome keeps its own decision
+    /// token. `Restricted` no longer flattens into `Denied` (it still blocks —
+    /// see [`AccessDecision::blocks_export`] — but the recorded status is the
+    /// regulator's, not our enforcement of it), and `NotScreened` maps to
+    /// `NotDetermined` rather than manufacturing a `Granted` for a screen that
+    /// never ran (S441 review finding #1).
     pub fn access_decision(&self) -> AccessDecision {
         match self {
             ScreeningResult::Clear => AccessDecision::Granted,
-            ScreeningResult::Restricted(_) | ScreeningResult::Denied(_) => AccessDecision::Denied,
+            ScreeningResult::Restricted(_) => AccessDecision::Restricted,
+            ScreeningResult::Denied(_) => AccessDecision::Denied,
+            ScreeningResult::NotScreened => AccessDecision::NotDetermined,
         }
     }
 
     /// The rule / list that drove the verdict — the `reason` field of the
-    /// `export.access_check` payload. `Clear` has no list hit, so it renders the
-    /// positive statement rather than an empty string (an empty `reason` reads
-    /// as "the writer forgot the field").
+    /// `export.access_check` payload. Never empty (an empty `reason` reads as
+    /// "the writer forgot the field").
+    ///
+    /// `NotScreened` must NOT name an outcome of a procedure that did not run:
+    /// it states the absence itself. `Clear` is the only variant allowed to
+    /// assert that a screen returned clear.
     pub fn reason(&self) -> String {
         match self {
             ScreeningResult::Clear => "denied-party screening: clear".to_string(),
@@ -156,6 +199,10 @@ impl ScreeningResult {
                 format!("denied-party screening: restricted ({why})")
             }
             ScreeningResult::Denied(why) => format!("denied-party screening: denied ({why})"),
+            ScreeningResult::NotScreened => {
+                "no denied-party screening was performed — no screening backend is configured"
+                    .to_string()
+            }
         }
     }
 }
@@ -293,7 +340,8 @@ pub struct PartyRef {
 /// The outcome of screening a [`PartyRef`] against the denied-party lists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScreeningResult {
-    /// No match — the party is clear to transact with.
+    /// No match — the party is clear to transact with. A POSITIVE finding: a
+    /// screen ran against the denied-party lists and returned nothing.
     Clear,
     /// A match that restricts (but does not outright deny) the transaction —
     /// e.g. requires a license. The string names the list / reason.
@@ -301,6 +349,20 @@ pub enum ScreeningResult {
     /// A denied-party match — the transaction must not proceed. The string
     /// names the list / reason.
     Denied(String),
+    /// **No screening was performed.** The screening-axis counterpart of
+    /// [`ExportClassification::NotClassified`], and the honest answer from a
+    /// backend that has no denied-party lists to consult (the
+    /// [`MockExportControlProvider`]).
+    ///
+    /// S441 (PR #35 adversarial review, finding #1). Before this variant the
+    /// mock answered [`Self::Clear`], so the append-only `export.access_check`
+    /// row read `decision="granted", reason="denied-party screening: clear"` —
+    /// two affirmative claims that a screen RAN and CLEARED, about an event
+    /// that never happened. On a hash-chained ITAR row that can never be
+    /// corrected, a fabricated positive finding is worse than a visible gap.
+    /// This is the same discipline the classification axis already had:
+    /// `NotClassified` renders `UNKNOWN`, never `NOT_CONTROLLED`.
+    NotScreened,
 }
 
 /// Failure modes a [`ExportControlProvider`] can surface.
@@ -457,51 +519,98 @@ mod tests {
         }
     }
 
-    /// S440 — `AccessDecision` round-trips and pins its two tokens.
+    /// S440/S441 — `AccessDecision` round-trips and pins all four tokens.
     #[test]
     fn s440_access_decision_round_trips_and_pins_tokens() {
-        for d in [AccessDecision::Granted, AccessDecision::Denied] {
+        for d in [
+            AccessDecision::Granted,
+            AccessDecision::Restricted,
+            AccessDecision::Denied,
+            AccessDecision::NotDetermined,
+        ] {
             assert_eq!(AccessDecision::from_storage_str(d.as_str()), Ok(d));
         }
         assert_eq!(AccessDecision::Granted.as_str(), "granted");
+        assert_eq!(AccessDecision::Restricted.as_str(), "restricted");
         assert_eq!(AccessDecision::Denied.as_str(), "denied");
+        assert_eq!(AccessDecision::NotDetermined.as_str(), "not_determined");
         assert!(AccessDecision::from_storage_str("GRANTED").is_err());
         assert!(AccessDecision::from_storage_str("grant").is_err());
         assert!(AccessDecision::from_storage_str("").is_err());
     }
 
-    /// S440 — the load-bearing conservatism: a `Restricted` screening hit is a
-    /// DENIAL at this boundary, not a pass. A restricted party needs a licence
-    /// and ABERP has no licence surface to check one against, so letting it
-    /// through would be the worst-class export bug.
+    /// S441 (review finding #1) — every screening outcome keeps its OWN
+    /// decision token. The two collapses this replaces were both falsifying:
+    /// `NotScreened → Granted` claimed a screen that never ran, and
+    /// `Restricted → Denied` overstated the regulator's status.
     #[test]
-    fn s440_restricted_screening_is_denied_not_granted() {
+    fn s441_each_screening_outcome_keeps_its_own_decision_token() {
         assert_eq!(
             ScreeningResult::Clear.access_decision(),
             AccessDecision::Granted
         );
         assert_eq!(
             ScreeningResult::Restricted("BIS Entity List partial".into()).access_decision(),
-            AccessDecision::Denied
+            AccessDecision::Restricted
         );
         assert_eq!(
             ScreeningResult::Denied("OFAC SDN".into()).access_decision(),
             AccessDecision::Denied
         );
+        assert_eq!(
+            ScreeningResult::NotScreened.access_decision(),
+            AccessDecision::NotDetermined,
+            "an unscreened export must never be recorded as granted"
+        );
     }
 
-    /// S440 — the `reason` field is never empty, including on the clear path
-    /// (an empty reason reads as "the writer forgot the field"), and it carries
-    /// the list/why string through on a hit.
+    /// S441 — the enforcement axis is separate from the recording axis.
+    /// `Restricted` still BLOCKS (no licence surface exists to check against),
+    /// even though its recorded token is no longer `denied`. `NotDetermined`
+    /// does not block — see [`AccessDecision::blocks_export`] for why that is a
+    /// stated policy rather than an oversight.
+    #[test]
+    fn s441_restricted_still_blocks_even_though_it_is_no_longer_labelled_denied() {
+        assert!(AccessDecision::Restricted.blocks_export());
+        assert!(AccessDecision::Denied.blocks_export());
+        assert!(!AccessDecision::Granted.blocks_export());
+        assert!(!AccessDecision::NotDetermined.blocks_export());
+    }
+
+    /// S440/S441 — the `reason` field is never empty (an empty reason reads as
+    /// "the writer forgot the field"), carries the list/why string on a hit,
+    /// and — the finding-#1 property — the unscreened path never asserts that a
+    /// screening returned clear.
     #[test]
     fn s440_screening_reason_is_never_empty_and_carries_the_hit() {
-        assert!(!ScreeningResult::Clear.reason().is_empty());
+        for r in [
+            ScreeningResult::Clear,
+            ScreeningResult::Restricted("x".into()),
+            ScreeningResult::Denied("y".into()),
+            ScreeningResult::NotScreened,
+        ] {
+            assert!(
+                !r.reason().trim().is_empty(),
+                "{r:?} rendered an empty reason"
+            );
+        }
         assert!(ScreeningResult::Denied("OFAC SDN".into())
             .reason()
             .contains("OFAC SDN"));
         assert!(ScreeningResult::Restricted("licence required".into())
             .reason()
             .contains("licence required"));
+
+        let unscreened = ScreeningResult::NotScreened.reason();
+        assert!(
+            !unscreened.contains("clear"),
+            "the unscreened reason {unscreened:?} names the outcome of a \
+             procedure that did not run"
+        );
+        assert!(
+            unscreened.contains("no denied-party screening was performed"),
+            "the unscreened reason must state the absence itself: {unscreened:?}"
+        );
     }
 
     /// S359 — `Jurisdiction` also survives a serde JSON round-trip (it derives

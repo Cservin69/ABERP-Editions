@@ -70,8 +70,7 @@ use ulid::Ulid;
 
 use aberp_audit_ledger::{append_in_tx, Actor, EventKind, LedgerMeta};
 use aberp_compliance::export_control::{
-    validate_eccn, AccessDecision, Classifiable, ExportClassification, ExportControlProvider,
-    PartyRef,
+    validate_eccn, Classifiable, ExportClassification, ExportControlProvider, PartyRef,
 };
 use aberp_inventory::{
     record_movement, ActorKind, MovementReason, MovementRefKind, RecordMovementContext,
@@ -584,7 +583,17 @@ pub fn mark_shipped(
         .clone()
         .map(Ok)
         .unwrap_or_else(now_rfc3339)?;
-    let now_ms = rfc3339_to_epoch_ms(&now)?;
+    // The operator's stated ship date → the SHIPMENT stamp only.
+    let shipped_at_ms = rfc3339_to_epoch_ms(&now)?;
+    // S441 (review finding #3) — the classification/screening stamps record
+    // when the SYSTEM asked the provider, which is always NOW. `shipped_at` is
+    // unbounded operator HTTP input; deriving these from it let a ship claiming
+    // 2019 write a row stating the denied-party screening ran in 2019 — a
+    // falsified compliance record, the same class `rfc3339_to_epoch_ms`'s own
+    // doc refuses. The route's denial path already stamped from `now_utc()`, so
+    // the two halves of `export.access_check` used to disagree.
+    let asked_provider_at_ms =
+        (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
 
     // 4b. S440 — export-control gate. Runs BEFORE any business write in this
     //     tx so a refusal costs nothing, and its two audit appends (the third,
@@ -617,7 +626,7 @@ pub fn mark_shipped(
         usml_category: classification.usml_category().map(str::to_string),
         jurisdiction: classification.jurisdiction().as_str().to_string(),
         operator_user_id: export_ctx.operator_user_id.clone(),
-        classified_at_ms: now_ms,
+        classified_at_ms: asked_provider_at_ms,
     };
     append_in_tx(
         tx,
@@ -636,13 +645,17 @@ pub fn mark_shipped(
         .map_err(|e| DispatchError::ExportControlUnavailable(format!("screen_party: {e}")))?;
     let decision = screening.access_decision();
     let reason = screening.reason();
-    if decision == AccessDecision::Denied {
+    if decision.blocks_export() {
         // Refuse in code. The whole tx rolls back — including the
         // classification row appended a moment ago — so the route layer owns
-        // persisting the denial (see the doc comment above).
+        // persisting the refusal (see the doc comment above). `blocks_export`
+        // covers Denied AND Restricted; NotDetermined does not block (S441 —
+        // no screening backend is configured, and halting every shipment is a
+        // policy change, not a bug fix). The row records the truth either way.
         return Err(DispatchError::ExportControlDenied {
             dsp_id: dsp_id.to_string(),
             reason,
+            decision: decision.as_str(),
         });
     }
     let access_payload = ExportAccessCheckPayload {
@@ -651,7 +664,8 @@ pub fn mark_shipped(
         operator_user_id: export_ctx.operator_user_id.clone(),
         decision: decision.as_str().to_string(),
         reason,
-        checked_at_ms: now_ms,
+        backend: export_ctx.provider.name().to_string(),
+        checked_at_ms: asked_provider_at_ms,
     };
     append_in_tx(
         tx,
@@ -766,7 +780,9 @@ pub fn mark_shipped(
             .eccn()
             .or_else(|| classification.usml_category())
             .map(str::to_string),
-        shipped_at_ms: now_ms,
+        // The operator's stated ship date — their fact to state, unlike the
+        // provider-interaction stamps above (S441 review finding #3).
+        shipped_at_ms,
         operator_user_id: export_ctx.operator_user_id.clone(),
     };
     append_in_tx(

@@ -72,6 +72,13 @@ pub enum DispatchError {
         dsp_id: String,
         /// The rule / list that drove the refusal.
         reason: String,
+        /// S441 — the `AccessDecision` storage token the standalone row must
+        /// carry (`"denied"` or `"restricted"`). Threaded through the error
+        /// rather than re-derived at the route, which would have to guess and
+        /// would flatten a licence-required `restricted` back into `denied` —
+        /// re-introducing on the refusal path exactly the overstatement
+        /// review finding #1 removed from the in-tx path.
+        decision: &'static str,
     },
 
     /// S440 — the export-control backend could not answer (unconfigured or

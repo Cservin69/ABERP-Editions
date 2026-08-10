@@ -2279,7 +2279,8 @@ pub enum EventKind {
     /// `usml_category` (optional — the USML category when ITAR-controlled),
     /// `jurisdiction` (the regime string), `operator_user_id` (who made
     /// the determination — the accountability anchor), and `classified_at_ms`
-    /// (epoch-ms stamp).
+    /// (epoch-ms stamp of when the SYSTEM asked the provider — never an
+    /// operator-supplied date; S441).
     ///
     /// `export.*` prefix family — NOT `invoice.*` / `system.*` / `mes.*` /
     /// `quote.*` / `inventory.*` / `email.*` / `personnel.*` / `material.*` /
@@ -2305,8 +2306,19 @@ pub enum EventKind {
     ///
     /// Payload (`serde_json::Value`): `entity_kind` (artifact kind), `entity_id`
     /// (artifact key), `operator_user_id` (who asked), `decision`
-    /// (`"granted"` / `"denied"`), `reason` (the rule that drove the verdict),
-    /// and `checked_at_ms` (epoch-ms stamp).
+    /// (`"granted"` / `"restricted"` / `"denied"` / `"not_determined"`),
+    /// `reason` (the rule that drove the verdict), `backend` (which
+    /// `ExportControlProvider` answered — `"mock"` until a real BIS/OFAC
+    /// integration lands), and `checked_at_ms` (epoch-ms stamp of when the
+    /// SYSTEM asked the provider — never an operator-supplied date).
+    ///
+    /// S441 (PR #35 review) added `backend` and widened `decision` from a bare
+    /// granted/denied flag. Two-valued, it forced the write boundary to record
+    /// an *unscreened* export as `"granted"` and a *restricted* party as a flat
+    /// `"denied"` — the first a fabricated positive finding, the second an
+    /// overstatement of the regulator's status. `"not_determined"` is what the
+    /// mock backend produces; `backend` is what lets an exported row be triaged
+    /// into "really screened" vs "no backend answered" after the fact.
     ///
     /// `export.*` prefix family — same segregation rationale as
     /// [`Self::ExportClassificationSet`].

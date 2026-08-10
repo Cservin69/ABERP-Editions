@@ -18271,15 +18271,20 @@ pub fn append_export_access_denied(
     dsp_id: &str,
     operator_login: &str,
     reason: &str,
+    decision: &str,
 ) {
     let payload = aberp_dispatch::ExportAccessCheckPayload {
         entity_kind: "dispatch".to_string(),
         entity_id: dsp_id.to_string(),
         operator_user_id: operator_login.to_string(),
-        decision: aberp_compliance::export_control::AccessDecision::Denied
-            .as_str()
-            .to_string(),
+        // S441 — the token the gate actually produced, carried out through the
+        // error. Hardcoding `Denied` here would re-flatten a licence-required
+        // `restricted` refusal into a debarment.
+        decision: decision.to_string(),
         reason: reason.to_string(),
+        // S441 — same provider that produced the refusal, so a denial row can
+        // be triaged the same way a granted one can.
+        backend: export_control_provider().name().to_string(),
         checked_at_ms: (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64,
     };
     let appended = (|| -> anyhow::Result<()> {
@@ -18709,15 +18714,23 @@ pub fn mark_dispatch_shipped_request(
             // `state.db.write()` itself, and re-entering the writer mutex while
             // still holding it would deadlock this request forever.
             let denial = match &e {
-                aberp_dispatch::DispatchError::ExportControlDenied { dsp_id, reason } => {
-                    Some((dsp_id.clone(), reason.clone()))
-                }
+                aberp_dispatch::DispatchError::ExportControlDenied {
+                    dsp_id,
+                    reason,
+                    decision,
+                } => Some((dsp_id.clone(), reason.clone(), *decision)),
                 _ => None,
             };
             drop(tx);
             drop(conn);
-            if let Some((denied_dsp_id, reason)) = denial {
-                append_export_access_denied(state, &denied_dsp_id, operator_login, &reason);
+            if let Some((denied_dsp_id, reason, decision)) = denial {
+                append_export_access_denied(
+                    state,
+                    &denied_dsp_id,
+                    operator_login,
+                    &reason,
+                    decision,
+                );
             }
             return Err(map_dispatch_err(e));
         }

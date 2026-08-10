@@ -1725,11 +1725,15 @@ fn s440_itar_determination_populates_usml_not_eccn() {
     assert_eq!(s.ecn_or_authorization.as_deref(), Some("VIII(h)"));
 }
 
-/// The access check records the GRANTED decision too, not only denials —
-/// ITAR's deemed-export rule makes the full decision trail load-bearing. The
-/// reason is never empty.
+/// The access check records a NON-blocking decision too, not only refusals —
+/// ITAR's deemed-export rule makes the full decision trail load-bearing.
+///
+/// AMENDED by S441 (review finding #1): under the production mock the
+/// non-blocking decision is `not_determined`, not `granted`. `granted` is
+/// asserted separately by [`s441_a_real_clear_screen_is_recorded_as_granted`],
+/// driven by a stub that actually returns `Clear`.
 #[test]
-fn s440_access_check_records_the_granted_decision_with_a_reason() {
+fn s440_access_check_records_the_nonblocking_decision_with_a_reason() {
     let (conn, dsp_id, res) = ship_with_export_ctx(
         "WO-EXP-GRANT",
         &test_export_ctx(),
@@ -1739,14 +1743,63 @@ fn s440_access_check_records_the_granted_decision_with_a_reason() {
     res.unwrap();
 
     let a: aberp_dispatch::ExportAccessCheckPayload = read_payload(&conn, "export.access_check");
-    assert_eq!(a.decision, "granted");
+    assert_eq!(a.decision, "not_determined");
     assert_eq!(a.entity_kind, "dispatch");
     assert_eq!(a.entity_id, dsp_id);
     assert_eq!(a.operator_user_id, "ervin");
+    assert_eq!(a.backend, "mock");
     assert!(
         !a.reason.trim().is_empty(),
         "an empty reason reads as 'the writer forgot the field'"
     );
+}
+
+/// S441 — `granted` is still reachable, and only from a backend that really
+/// returned `Clear`. Without this, widening the vocab could have silently
+/// orphaned the token.
+#[test]
+fn s441_a_real_clear_screen_is_recorded_as_granted() {
+    let stub = StubExportControl::new(ExportClassification::EAR99, ScreeningResult::Clear);
+    let (conn, _dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-REALCLEAR",
+        &export_ctx_with(&stub, Some("DE")),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    res.unwrap();
+
+    let a: aberp_dispatch::ExportAccessCheckPayload = read_payload(&conn, "export.access_check");
+    assert_eq!(a.decision, "granted");
+    assert!(a.reason.contains("clear"));
+    assert_eq!(a.backend, "stub");
+}
+
+/// S441 (review finding #1, the `Restricted` flatten) — a licence-required
+/// party still BLOCKS, but the row the route persists must say `restricted`,
+/// not `denied`. A debarred party and a licensable one are different
+/// regulatory statuses and an auditor must be able to tell them apart.
+#[test]
+fn s441_restricted_refusal_carries_the_restricted_token_not_denied() {
+    let stub = StubExportControl::new(
+        ExportClassification::EAR99,
+        ScreeningResult::Restricted("licence required".to_string()),
+    );
+    let (_conn, _dsp_id, res) = ship_with_export_ctx(
+        "WO-EXP-RESTRICT-TOKEN",
+        &export_ctx_with(&stub, Some("CN")),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    match res {
+        Err(DispatchError::ExportControlDenied { decision, .. }) => {
+            assert_eq!(
+                decision, "restricted",
+                "the refusal must carry its own token out to the route, which \
+                 persists the standalone row"
+            );
+        }
+        other => panic!("expected ExportControlDenied, got {other:?}"),
+    }
 }
 
 /// A denied-party hit REFUSES the shipment in code
@@ -1766,9 +1819,14 @@ fn s440_denied_party_refuses_the_ship_and_rolls_back_every_write() {
         None,
     );
     match res {
-        Err(DispatchError::ExportControlDenied { dsp_id: d, reason }) => {
+        Err(DispatchError::ExportControlDenied {
+            dsp_id: d,
+            reason,
+            decision,
+        }) => {
             assert_eq!(d, dsp_id);
             assert!(reason.contains("BIS Entity List"), "reason was {reason:?}");
+            assert_eq!(decision, "denied");
         }
         other => panic!("expected ExportControlDenied, got {other:?}"),
     }
@@ -1813,12 +1871,19 @@ fn s440_restricted_party_also_refuses_the_ship() {
     assert_eq!(live.state, DispatchState::Drafted);
 }
 
-/// THE ATOMICITY PROOF. The export rows are appended BEFORE the state flip,
-/// so the dangerous failure mode is an export row that outlives a shipment
-/// that never happened. A spawner failure — which occurs strictly AFTER all
-/// three export appends — must take every one of them down with it.
+/// Mid-flight rollback: a spawner failure at step 6 must take the step-4b
+/// appends (`classification_set`, `access_check`) down with it.
+///
+/// AMENDED by S441 (review finding #2). The original docstring claimed the
+/// spawner failure occurred "strictly AFTER all three export appends" — false.
+/// The spawner is step 6; `export.shipment_logged` is appended at step 8b,
+/// AFTER it, so on this path the third append never executes and its
+/// `assert_eq!(count, 0)` was vacuous. That assertion is dropped here rather
+/// than left to look like coverage it never provided; the third site is pinned
+/// for real by
+/// [`review_s440_shipment_logged_also_rolls_back_when_the_commit_never_lands`].
 #[test]
-fn s440_export_rows_roll_back_with_a_failed_ship() {
+fn s440_step4b_export_rows_roll_back_when_the_ship_fails_mid_flight() {
     let spawner = MockInvoiceSpawner::return_err("billing exploded");
     let (conn, dsp_id, res) =
         ship_with_export_ctx("WO-EXP-ATOMIC", &test_export_ctx(), &spawner, None);
@@ -1836,7 +1901,8 @@ fn s440_export_rows_roll_back_with_a_failed_ship() {
          the audit append is NOT atomic with the business write"
     );
     assert_eq!(count_kind(&conn, "export.access_check"), 0);
-    assert_eq!(count_kind(&conn, "export.shipment_logged"), 0);
+    // NOTE: no assertion on export.shipment_logged here — step 8b never runs on
+    // this path, so asserting 0 would be vacuous coverage. See the docstring.
 }
 
 /// The backend failing to ANSWER fails the ship loud. Shipping controlled
@@ -1907,12 +1973,15 @@ fn s440_unknown_recipient_country_is_recorded_empty_not_guessed() {
     assert_eq!(s.ecn_or_authorization.as_deref(), Some("EAR99"));
 }
 
-/// The epoch-ms stamps come from the shipment's own timestamp, not from
-/// `now()`, so a back-dated ship records the date it claims. All three rows
-/// share one stamp — an auditor reading them apart must see one event, not a
-/// three-second-apart sequence.
+/// AMENDED by S441 (review finding #3). This test used to assert that ALL
+/// THREE stamps tracked the operator-supplied `shipped_at` — which is exactly
+/// the defect: it pinned the falsification in place.
+///
+/// The corrected split: `shipped_at_ms` is the operator's stated fact and does
+/// follow `shipped_at`; `classified_at_ms` / `checked_at_ms` record when the
+/// SYSTEM asked the provider and must be `now()`, unreachable from HTTP input.
 #[test]
-fn s440_export_stamps_track_the_operator_supplied_ship_time() {
+fn s440_shipment_stamp_tracks_the_operator_ship_time_but_screening_stamps_do_not() {
     let (conn, _dsp_id, res) = ship_with_export_ctx(
         "WO-EXP-STAMP",
         &test_export_ctx(),
@@ -1922,13 +1991,296 @@ fn s440_export_stamps_track_the_operator_supplied_ship_time() {
     res.unwrap();
 
     // 2026-06-03T12:00:00Z
-    let expected_ms = 1_780_488_000_000_i64;
+    let ship_ms = 1_780_488_000_000_i64;
     let c: aberp_dispatch::ExportClassificationSetPayload =
         read_payload(&conn, "export.classification_set");
     let a: aberp_dispatch::ExportAccessCheckPayload = read_payload(&conn, "export.access_check");
     let s: aberp_dispatch::ExportShipmentLoggedPayload =
         read_payload(&conn, "export.shipment_logged");
-    assert_eq!(c.classified_at_ms, expected_ms);
-    assert_eq!(a.checked_at_ms, expected_ms);
-    assert_eq!(s.shipped_at_ms, expected_ms);
+
+    assert_eq!(
+        s.shipped_at_ms, ship_ms,
+        "the ship date IS the operator's to state"
+    );
+    assert_ne!(
+        c.classified_at_ms, ship_ms,
+        "classified_at_ms must record when the provider was asked, not the \
+         operator's chosen ship date"
+    );
+    assert_ne!(a.checked_at_ms, ship_ms, "same for checked_at_ms");
+    // Both provider stamps come from the same `now()` read, so they agree.
+    assert_eq!(c.classified_at_ms, a.checked_at_ms);
+}
+// ══════════════════════════════════════════════════════════════════════
+// ADVERSARIAL REVIEW — PR #35 (S440). Added by the review, not the author.
+// ══════════════════════════════════════════════════════════════════════
+
+/// REVIEW FINDING #1 — the mock backend manufactures a POSITIVE screening
+/// claim.
+///
+/// `MockExportControlProvider` performs NO denied-party screening. Yet the
+/// row it drives into the append-only, hash-chained ledger reads:
+///
+///     decision = "granted"
+///     reason   = "denied-party screening: clear"
+///
+/// Both halves are affirmative assertions about an event that never happened.
+/// The classification row on the SAME shipment is honest about this
+/// (`jurisdiction = "UNKNOWN"`, both code fields null — the author got that
+/// axis right); the decision row is not. An ITAR auditor reading the ledger
+/// cannot distinguish this from a real BIS/OFAC screen that returned clear,
+/// because no field records which backend answered.
+///
+/// This test asserts the property the trail MUST have: an unscreened export
+/// must not be recorded as a completed, cleared screening. It FAILS on
+/// 3425a29 — that failure is the finding.
+#[test]
+fn review_s440_unscreened_export_must_not_be_recorded_as_screened_and_cleared() {
+    // The production provider, exactly as `serve::export_control_provider()`
+    // returns it.
+    let (conn, _dsp_id, res) = ship_with_export_ctx(
+        "WO-REVIEW-FALSEGREEN",
+        &test_export_ctx(),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    res.expect("the mock clears every party, so the ship succeeds");
+
+    let p: aberp_dispatch::ExportAccessCheckPayload = read_payload(&conn, "export.access_check");
+
+    assert_ne!(
+        p.decision, "granted",
+        "the MOCK backend ran no screening, yet the ledger records \
+         decision=\"granted\" — an auditor reads this as \"we screened this \
+         consignee and cleared the export\". A distinct not_determined / \
+         unscreened token is required so an unscreened export cannot be read \
+         as a cleared one."
+    );
+    assert!(
+        !p.reason.contains("clear"),
+        "reason={:?} asserts a denied-party screening returned CLEAR. No \
+         screening was performed — this is a fabricated positive finding on \
+         an append-only row that can never be corrected.",
+        p.reason
+    );
+}
+
+/// REVIEW FINDING #1b — the ledger row carries no record of WHICH backend
+/// answered, so the mock's output is indistinguishable from a real
+/// determination once the rows leave the process.
+///
+/// `production_export_control_backend_is_still_the_mock` pins the mock in
+/// SOURCE, which protects future contributors — but it does not travel with
+/// the data. The provider already exposes `name()` (the PR uses it in the
+/// malformed-ECCN error), so recording it is nearly free.
+#[test]
+fn review_s440_access_check_row_must_name_the_backend_that_answered() {
+    let (conn, _dsp_id, res) = ship_with_export_ctx(
+        "WO-REVIEW-BACKENDTAG",
+        &test_export_ctx(),
+        &NoopInvoiceSpawner,
+        None,
+    );
+    res.unwrap();
+
+    let raw: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM audit_ledger WHERE kind = 'export.access_check' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert!(
+        v.get("backend").is_some() || v.get("provider").is_some(),
+        "the export.access_check payload has no backend/provider field: {v}. \
+         Exported ledger rows therefore cannot be triaged into \
+         'really screened' vs 'mock answered' after the fact."
+    );
+}
+
+/// REVIEW FINDING #2 — the atomicity proof does not cover the THIRD firing
+/// site.
+///
+/// `s440_export_rows_roll_back_with_a_failed_ship` uses a failing
+/// `InvoiceSpawner`. The spawner is step 6; `export.shipment_logged` is
+/// appended at step 8b — AFTER it. So on that path the third append never
+/// executes, and its `assert_eq!(count, 0)` is vacuous. The test's own
+/// docstring ("a spawner failure ... occurs strictly AFTER all three export
+/// appends") is factually wrong.
+///
+/// Proof this is a real hole and not a nitpick: moving the step-8b append onto
+/// a second connection in its own committed transaction — the exact AVL
+/// anti-pattern ADR-0084/S431 uses, which the author explicitly rejected —
+/// leaves the ENTIRE author suite green. The same mutation applied to step 4b
+/// turns two tests red.
+///
+/// This test closes the hole: it drives a SUCCESSFUL mark_shipped (so all
+/// three appends execute) and then abandons the transaction, which is what a
+/// failing `tx.commit()` or a crash between `mark_shipped` returning and the
+/// route's commit does. All three rows must be gone.
+#[test]
+fn review_s440_shipment_logged_also_rolls_back_when_the_commit_never_lands() {
+    let mut conn = setup_db();
+    let meta = meta();
+    let wo_id = create_completed_wo(&mut conn, &meta, "WO-REVIEW-NOCOMMIT");
+
+    let tx = conn.transaction().unwrap();
+    let dsp = create_dispatch(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        CreateDispatchInputs {
+            wo_id,
+            partner_id: "ptr_acme".to_string(),
+            notes: None,
+            idempotency_key: "create-review-nocommit".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let tx = conn.transaction().unwrap();
+    let export_ctx = test_export_ctx();
+    mark_shipped(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        &dsp.dsp_id,
+        MarkShippedInputs {
+            carrier_kind: CarrierKind::Gls,
+            tracking_number: Some("GLS-REVIEW".to_string()),
+            shipped_at: None,
+            idempotency_key: "ship-review-nocommit".to_string(),
+        },
+        &NoopInvoiceSpawner,
+        &export_ctx,
+    )
+    .expect("the ship itself succeeds — all three export appends execute");
+
+    // The commit never lands (failed commit / crash / route error after
+    // mark_shipped returned). DuckDB rolls back on drop.
+    drop(tx);
+
+    assert_eq!(
+        get_dispatch(&conn, TEST_TENANT, &dsp.dsp_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        DispatchState::Drafted,
+        "no commit, so the state flip must be gone"
+    );
+    assert_eq!(count_kind(&conn, "export.classification_set"), 0);
+    assert_eq!(count_kind(&conn, "export.access_check"), 0);
+    assert_eq!(
+        count_kind(&conn, "export.shipment_logged"),
+        0,
+        "an export.shipment_logged row — the record asserting goods PHYSICALLY \
+         LEFT — survived a shipment that never committed"
+    );
+}
+
+/// REVIEW #6 — a retried ship must not double-record the export family.
+/// Step 2's already-Shipped short-circuit sits ABOVE the step-4b gate, so a
+/// second call returns before re-appending. Pinned because the ordering is
+/// load-bearing and nothing else asserts it for the export.* rows.
+#[test]
+fn review_s440_retried_ship_does_not_duplicate_the_export_family() {
+    let mut conn = setup_db();
+    let meta = meta();
+    let wo_id = create_completed_wo(&mut conn, &meta, "WO-REVIEW-RETRY");
+
+    let tx = conn.transaction().unwrap();
+    let dsp = create_dispatch(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        CreateDispatchInputs {
+            wo_id,
+            partner_id: "ptr_acme".to_string(),
+            notes: None,
+            idempotency_key: "create-review-retry".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let export_ctx = test_export_ctx();
+    for attempt in 0..3 {
+        let tx = conn.transaction().unwrap();
+        mark_shipped(
+            &tx,
+            &dispatch_ctx_for(&meta, "ervin"),
+            &dsp.dsp_id,
+            MarkShippedInputs {
+                carrier_kind: CarrierKind::Gls,
+                tracking_number: Some("GLS-RETRY".to_string()),
+                shipped_at: None,
+                idempotency_key: "ship-review-retry".to_string(),
+            },
+            &NoopInvoiceSpawner,
+            &export_ctx,
+        )
+        .unwrap_or_else(|e| panic!("attempt {attempt} failed: {e}"));
+        tx.commit().unwrap();
+    }
+
+    assert_eq!(count_kind(&conn, "export.classification_set"), 1);
+    assert_eq!(count_kind(&conn, "export.access_check"), 1);
+    assert_eq!(count_kind(&conn, "export.shipment_logged"), 1);
+    assert_eq!(count_kind(&conn, "mes.dispatch_shipped"), 1);
+}
+
+/// REVIEW FINDING #3 — the operator can back-date the SCREENING timestamp.
+///
+/// `MarkDispatchShippedBody.shipped_at` is unbounded, operator-supplied HTTP
+/// input (`serve.rs` — "Optional explicit RFC3339 timestamp"). `mark_shipped`
+/// derives ONE `now_ms` from it and stamps all three export rows with it.
+///
+/// For `shipped_at_ms` that is correct — the ship date is the operator's fact.
+/// For `classified_at_ms` and `checked_at_ms` it is NOT: those record when the
+/// system actually asked the provider, which is always *now*. Stamping them
+/// with an operator-chosen date writes a false statement about when a
+/// denied-party screening was performed — the exact class of error the crate's
+/// own `rfc3339_to_epoch_ms` doc rejects ("a zeroed timestamp on an
+/// export-control row is a falsified record, not a gap").
+///
+/// The route's own denial path already gets this right: it stamps
+/// `checked_at_ms` with `OffsetDateTime::now_utc()`, ignoring `shipped_at`. So
+/// a DENIED check is honestly stamped and a GRANTED check is operator-
+/// controlled — the two halves of the same event kind disagree.
+///
+/// FAILS on 3425a29. `s440_export_stamps_track_the_operator_supplied_ship_time`
+/// pins the opposite, so that test must be amended alongside the fix.
+#[test]
+fn review_s440_screening_stamps_must_not_be_operator_back_datable() {
+    // An operator ships today but claims a 2019 ship date.
+    let (conn, _dsp_id, res) = ship_with_export_ctx(
+        "WO-REVIEW-BACKDATE",
+        &test_export_ctx(),
+        &NoopInvoiceSpawner,
+        Some("2019-01-01T00:00:00Z"),
+    );
+    res.unwrap();
+
+    let a: aberp_dispatch::ExportAccessCheckPayload = read_payload(&conn, "export.access_check");
+    let c: aberp_dispatch::ExportClassificationSetPayload =
+        read_payload(&conn, "export.classification_set");
+    let s: aberp_dispatch::ExportShipmentLoggedPayload =
+        read_payload(&conn, "export.shipment_logged");
+
+    // The ship date IS the operator's to state.
+    assert_eq!(s.shipped_at_ms, 1_546_300_800_000);
+
+    // The screening/classification dates are the SYSTEM's fact.
+    let floor = 1_700_000_000_000_i64; // 2023-11
+    assert!(
+        a.checked_at_ms > floor,
+        "checked_at_ms={} — the ledger claims the denied-party screening ran in \
+         2019. It ran just now; the operator merely typed a 2019 ship date. \
+         An append-only compliance row now carries a false screening date.",
+        a.checked_at_ms
+    );
+    assert!(
+        c.classified_at_ms > floor,
+        "classified_at_ms={} — same falsification on the classification row.",
+        c.classified_at_ms
+    );
 }

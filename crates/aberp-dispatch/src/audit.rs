@@ -133,7 +133,12 @@ pub struct ExportClassificationSetPayload {
     pub jurisdiction: String,
     /// Who the determination is recorded against — the accountability anchor.
     pub operator_user_id: String,
-    /// Epoch-ms stamp of the determination.
+    /// Epoch-ms stamp of when the SYSTEM asked the provider for the
+    /// determination.
+    ///
+    /// S441 (review finding #3): stamped from `now_utc()`, NEVER from the
+    /// operator-supplied `shipped_at` — see
+    /// [`ExportAccessCheckPayload::checked_at_ms`].
     pub classified_at_ms: i64,
 }
 
@@ -165,13 +170,29 @@ pub struct ExportAccessCheckPayload {
     pub entity_id: String,
     /// Who asked (the operator driving the ship).
     pub operator_user_id: String,
-    /// `"granted"` / `"denied"`, rendered through
-    /// `aberp_compliance::export_control::AccessDecision::as_str`.
+    /// `"granted"` / `"restricted"` / `"denied"` / `"not_determined"`, rendered
+    /// through `aberp_compliance::export_control::AccessDecision::as_str`.
+    ///
+    /// S441 (review finding #1): `"not_determined"` is what the production mock
+    /// backend produces. It must never be `"granted"` — that would assert a
+    /// screen ran and cleared, on a row that can never be corrected.
     pub decision: String,
-    /// The rule that drove the verdict. Never empty — the clear path renders
-    /// the positive statement rather than `""`.
+    /// The rule that drove the verdict. Never empty. Only a genuine `Clear`
+    /// asserts that a screening returned clear; the unscreened path states the
+    /// absence itself.
     pub reason: String,
-    /// Epoch-ms stamp of the check.
+    /// S441 (review finding #1b) — which `ExportControlProvider` answered
+    /// (`provider.name()`; `"mock"` today). Without it an exported ledger row
+    /// cannot be triaged into "really screened" vs "the mock answered" once it
+    /// leaves the process — the in-source
+    /// `production_export_control_backend_is_still_the_mock` pin protects
+    /// contributors, but it does not travel with the data.
+    pub backend: String,
+    /// Epoch-ms stamp of when the SYSTEM asked the provider.
+    ///
+    /// S441 (review finding #3): stamped from `now_utc()`, NEVER from the
+    /// operator-supplied `shipped_at`. A ship back-dated to 2019 must not write
+    /// a row claiming the denied-party screening ran in 2019.
     pub checked_at_ms: i64,
 }
 
@@ -326,6 +347,7 @@ mod tests {
             operator_user_id: "ervin".into(),
             decision: "granted".into(),
             reason: "denied-party screening: clear".into(),
+            backend: "mock".into(),
             checked_at_ms: 1_780_000_000_000,
         };
         let v: serde_json::Value = serde_json::from_slice(&access.to_bytes()).unwrap();
@@ -334,6 +356,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "backend",
                 "checked_at_ms",
                 "decision",
                 "entity_id",
@@ -391,6 +414,7 @@ mod tests {
             operator_user_id: "ervin".into(),
             decision: "denied".into(),
             reason: "denied-party screening: denied (OFAC SDN)".into(),
+            backend: "bis-api".into(),
             checked_at_ms: 2,
         };
         let back: ExportAccessCheckPayload = serde_json::from_slice(&access.to_bytes()).unwrap();
