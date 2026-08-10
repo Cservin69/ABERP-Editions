@@ -654,6 +654,14 @@ pub fn storno_from_inputs(
         .context("audit-ledger chain verification failed AFTER storno issuance")?;
     tracing::info!(entries_verified = verified, "audit chain verified");
 
+    // ADR-0110 D3 — the durable-ack boundary. Same shape and the same reasoning
+    // as `issue_invoice::issue_from_parsed`. A storno burns its own NAV invoice
+    // number AND is the row that cancels a filed regulatory document, so a lost
+    // storno leaves the base invoice looking live: strictly worse than a lost
+    // issuance.
+    db.durable_ack()
+        .context("ADR-0110 D3 durable-ack fsync after storno issuance commit")?;
+
     Ok(StornoIssuedSummary {
         invoice_id: outcome.storno.id.to_prefixed_string(),
         invoice_number: outcome.storno_invoice_number,

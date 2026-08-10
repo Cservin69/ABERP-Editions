@@ -1110,6 +1110,19 @@ pub fn change_status(
         .verify_chain()
         .context("audit-ledger chain verification failed AFTER ap_invoice status change")?;
 
+    // ADR-0110 D3 — the durable-ack boundary. The AP status UPDATE is an
+    // in-place mutation of `ap_invoice.local_status`; unlike an issuance there
+    // is no re-ingest that would recreate it (a re-sync re-ingests lost rows
+    // under FRESH ULIDs), so this UPDATE has no recovery path other than being
+    // durable in the first place. The guard drop fsync'd the mirror; this
+    // fsyncs the live DB + WAL that hold the UPDATE.
+    //
+    // Note the no-op short-circuit above (`from_parsed == to_status`)
+    // deliberately does NOT call this: it wrote nothing, so there is nothing to
+    // make durable.
+    db.durable_ack()
+        .context("ADR-0110 D3 durable-ack fsync after ap_invoice status-change commit")?;
+
     Ok(StatusChangeOutcome {
         id: ap_invoice_id.to_string(),
         from_status: from_parsed.as_str().to_string(),

@@ -34,6 +34,18 @@
 //!   handle **disables DuckDB's implicit checkpoint-on-close** so a runtime
 //!   connection drop never folds the WAL in place (the vulnerable path); the
 //!   only checkpoint is the validated logical one.
+//! * **D3 — power-loss durable money paths.** 1b above makes a commit
+//!   *process-crash* durable (the mirror is `fsync`'d in lockstep) and
+//!   *eventually* file-durable (the debounced D2 checkpoint, ≤ 1/min). Neither
+//!   `fsync`s the live DB or its WAL at commit time, so for up to a checkpoint
+//!   interval a money-path write acked to the operator survives only in an
+//!   un-`fsync`'d WAL — a power loss drops the business rows while the mirror
+//!   keeps the audit row. [`Handle::durable_ack`] closes that: after a
+//!   money-path commit it `fsync`s the main file, the WAL and the tenant
+//!   directory, and its failure is propagated, never logged-and-ignored.
+//!   Ported from Portable PROD_v2.33.6 (ADR-0110 D3); the frozen census of
+//!   money-path ack sites is `tools/adr0110_durable_ack_sites.txt`, held closed
+//!   in both directions by `tools/cut_gate_durable_ack.sh`.
 //!
 //! # The single-instance coherence dividend (S335/S341)
 //!
@@ -112,6 +124,20 @@ pub enum DbError {
     /// Underlying DuckDB error (open / try_clone / runtime pragma).
     #[error("duckdb: {0}")]
     Duck(#[from] duckdb::Error),
+
+    /// ADR-0110 D3 — an `fsync` on the money-path durable-ack boundary failed.
+    ///
+    /// Ported from Portable PROD_v2.33.6. **Callers must propagate this, never
+    /// downgrade it to a `warn!`.** The business transaction has already
+    /// committed by the time [`Handle::durable_ack`] runs, so the caller is
+    /// choosing between "tell the operator it failed when it may have landed"
+    /// and "promise durability we did not achieve". CLAUDE.md rule 11 picks the
+    /// first. The cut-gate CHECK D3-C fails any call site that swallows it.
+    #[error("aberp-db durable-ack fsync failed for {path}: {source}")]
+    DurableAck {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// Tunables for a [`Handle`]. [`HandleConfig::default`] is the ADR-0098 D2
@@ -161,7 +187,22 @@ pub type HandleArc = std::sync::Arc<Handle>;
 
 pub struct Handle {
     db_path: PathBuf,
+    /// `<db>.wal` — DuckDB's write-ahead log for [`Self::db_path`]. Precomputed
+    /// once because [`Self::durable_ack`] needs it on every money-path ack
+    /// (ADR-0110 D3, ported from Portable PROD_v2.33.6).
+    wal_path: PathBuf,
     mirror_path: PathBuf,
+    /// ADR-0110 D3 — the durability journal: every path this handle has
+    /// actually `fsync`'d, in first-sync order, deduped.
+    ///
+    /// Behind its **own** mutex, never the writer's: [`Self::durable_ack`] runs
+    /// AFTER the [`WriteGuard`] has dropped and deliberately does not take the
+    /// writer lock (see its docs), so recording must not reach for it either.
+    ///
+    /// Not telemetry — it is the seam that lets a durability spec DERIVE its
+    /// expected set from what the write path really did, so deleting an `fsync`
+    /// deletes the path from the set and turns the spec red.
+    synced: Mutex<Vec<PathBuf>>,
     /// Built **once** per process (S341 semantics): tenant + binary hash. The
     /// lockstep [`aberp_audit_ledger::sync_mirror`] needs it on every commit.
     meta: LedgerMeta,
@@ -219,7 +260,9 @@ impl Handle {
 
         Ok(Arc::new(Handle {
             db_path: db_path.to_path_buf(),
+            wal_path: wal_path_for(db_path),
             mirror_path,
+            synced: Mutex::new(Vec::new()),
             meta,
             tenant: tenant.as_str().to_string(),
             config,
@@ -351,6 +394,101 @@ impl Handle {
         drop(ledger);
         drop(guard);
         Ok(out)
+    }
+
+    /// ADR-0110 D3 — make an already-committed money-path write **power-loss**
+    /// durable, not merely process-crash durable. Ported from Portable
+    /// PROD_v2.33.6.
+    ///
+    /// `fsync`s, in order: the main DB file, the WAL (when present), then the
+    /// tenant directory that names them. Main file before WAL because a WAL is
+    /// only meaningful on top of a durable base; both before the directory
+    /// entry.
+    ///
+    /// # What this fixes on Defense specifically
+    ///
+    /// Defense's post-commit hook ([`WriteGuard::drop`]) already `fsync`s the
+    /// **audit mirror** on every commit, and the debounced D2 checkpoint
+    /// eventually installs a fully-`fsync`'d replacement of the live file. But
+    /// nothing `fsync`s the live DB or its WAL at commit time, and the D2 window
+    /// is [`crate::debounce::DEFAULT_MIN_CHECKPOINT_INTERVAL`] (60s). So between
+    /// a money-path ack and the next checkpoint, the business rows live only in
+    /// an un-`fsync`'d WAL: a power loss drops them while the mirror keeps the
+    /// audit row — an audit entry for an invoice that no longer exists. This
+    /// closes that window at the ack itself.
+    ///
+    /// # Locking
+    ///
+    /// Deliberately takes **no** writer lock. Money paths call this at the ack,
+    /// after `drop(guard)`; re-acquiring would serialize every other writer
+    /// behind an `fsync` for no benefit (the commit already happened, so the
+    /// bytes to flush are settled). The durability journal has its own mutex.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::DurableAck`] if any `fsync` fails. **Propagate it — never
+    /// downgrade it to a `warn!`** (see the variant's docs; cut-gate CHECK D3-C
+    /// enforces this).
+    ///
+    /// # Honest scope
+    ///
+    /// **On macOS this IS a device flush.** `File::sync_all` does not call
+    /// `fsync(2)` on Apple targets — the stdlib routes it to
+    /// `fcntl(fd, F_FULLFSYNC)` — so the bytes are pushed past the drive's own
+    /// write cache rather than merely handed to the OS. That is what makes an
+    /// acked write survive a power loss and not just a process kill. Linux gets
+    /// `fsync`/`fdatasync`; Windows `FlushFileBuffers`.
+    ///
+    /// It is also the same primitive `aberp_snapshot::crash_safe`'s
+    /// `fsync_file` and the audit mirror already use here, so this is the
+    /// tree's existing idiom, not a new one.
+    ///
+    /// The residual bottoms out at the **drive honouring the flush**: a
+    /// third-party external enclosure may lie. A tenant on external storage is
+    /// outside what this can promise.
+    pub fn durable_ack(&self) -> Result<(), DbError> {
+        self.fsync_and_record(&self.db_path)?;
+        if self.wal_path.exists() {
+            self.fsync_and_record(&self.wal_path)?;
+        }
+        if let Some(parent) = self.db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fsync_path(parent)?;
+        }
+        Ok(())
+    }
+
+    /// `fsync` `path` and record it in the durability journal. Recording only
+    /// happens on SUCCESS — the journal must mean "this is on stable storage",
+    /// never "we tried".
+    fn fsync_and_record(&self, path: &Path) -> Result<(), DbError> {
+        fsync_path(path)?;
+        // A poisoned journal mutex must not fail a write that IS now durable:
+        // the journal is evidence, not the contract. Recover in place.
+        let mut synced = match self.synced.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                self.synced.clear_poison();
+                poisoned.into_inner()
+            }
+        };
+        if !synced.iter().any(|p| p == path) {
+            synced.push(path.to_path_buf());
+        }
+        Ok(())
+    }
+
+    /// ADR-0110 D3 — every file this handle has `fsync`'d via
+    /// [`Self::durable_ack`], in first-sync order. Directories are never listed
+    /// (they are flushed but carry no rows).
+    ///
+    /// Read by the durability spec to build its expected set out of what the
+    /// write path actually certified, so that deleting the `fsync` deletes the
+    /// file from the set and turns the spec red.
+    pub fn fsynced_paths(&self) -> Vec<PathBuf> {
+        match self.synced.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// Loop-idle hook (ADR-0098 D2 "+ one at loop-idle"). A daemon calls this
@@ -597,6 +735,41 @@ impl Handle {
 /// [`Handle::run_durable_checkpoint_locked`] safe: without it, dropping the
 /// connection would trigger DuckDB's implicit close-checkpoint and fold the
 /// WAL into the live file **in place** — the very `duckdb#23046` path we are
+/// `<db>.wal` — DuckDB's WAL sibling for `db_path`. The extension is
+/// **appended** to the whole file name (`aberp.duckdb` → `aberp.duckdb.wal`),
+/// not substituted, which `Path::set_extension` would get wrong.
+///
+/// Re-derived here rather than reused from `aberp_snapshot::crash_safe`: that
+/// helper (`wal_sibling`) is private. Defense's `aberp-db` DOES depend on
+/// `aberp-snapshot` (unlike Portable's, where the same comment cites avoiding
+/// the dep), so the reason here is visibility, not layering — widening the
+/// snapshot crate's API for a three-line path join is the bigger change.
+fn wal_path_for(db_path: &Path) -> PathBuf {
+    let mut name = db_path.as_os_str().to_os_string();
+    name.push(".wal");
+    PathBuf::from(name)
+}
+
+/// `fsync` a path's contents + metadata. Works for regular files and, on POSIX,
+/// for directories — opening read-only and `sync_all`-ing the fd is the
+/// canonical way to persist either (the same shape as
+/// `aberp_snapshot::crash_safe::fsync_file`).
+///
+/// Unlike that helper's directory arm, a failure here is **hard**. It is
+/// reached only from [`Handle::durable_ack`], where "we could not make the
+/// operator's money-path write durable" is exactly the thing that must not be
+/// swallowed (ADR-0110 R3 / CLAUDE.md rule 11).
+fn fsync_path(path: &Path) -> Result<(), DbError> {
+    let f = std::fs::File::open(path).map_err(|source| DbError::DurableAck {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    f.sync_all().map_err(|source| DbError::DurableAck {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 /// eliminating. With it, the only checkpoint that ever touches the live file
 /// is the validated logical one.
 ///
