@@ -208,6 +208,235 @@ the HU-production compliance stack.
 
 ---
 
+## Audit — what is recorded, and what protects it
+
+The ledger is the compliance product, so this section is deliberately
+specific about what fires today and what is only declared. A kind that is
+*defined* but has no emitter is listed as **reserved** — an entry of that
+kind has never been written by any code path in this repo.
+
+### The event surface
+
+Every audited action becomes one entry with a typed JSON payload and a
+namespaced `domain.event_name` kind. **187 kinds are defined**; **170 are
+wired to a real emitter**, **17 are reserved**. Kind strings are stable
+identifiers — the audit screen, the export bundle, and `aberp-verify` all
+key off them.
+
+| Domain | What it records | Wired |
+|---|---|---|
+| `quote.*` | The CAD → pricing → PDF pipeline: geometry extraction, pricing runs and classified failures, margin / lead-time overrides and below-floor refusals, operator accept / refuse, calibration samples and coefficient shifts, tunables (machine rates, gear processes, materials, tolerance multipliers, complexity rules), deal → sales order → work order, PDF re-render, stock alerts, storefront email-outbox claim / fetch / send / fail | 45 / 46 |
+| `invoice.*` | The full NAV lifecycle: sequence reservation, draft created / deleted, staged, submission attempt / response / failure, ack polling, storno, modification, technical annulment (request → submit → ack → receiver confirmation), invoice check, payment recorded, emailed, marked abandoned, picked up from a quote, LocalOnly issuance | 22 / 22 |
+| `mes.*` | Machine adapters (added / updated / removed / health transitions), adapter events off the wire, work orders and routing-op state, QA inspections, stock movements, dispatch created / shipped, machine master data | 16 / 16 |
+| `system.*` | Daemon cycle outcomes and shutdown, incoming-invoice (AP) ingest and sync cycles, quote-intake poll attempts / failures / rows, restore-from-NAV runs and buyer backfill, ExtNav manual partner link, numbering-template changes, first-prod-launch acknowledgement, upgrade snapshot mismatch | 15 / 15 |
+| `po.*` | Purchase orders: created, line added, issued, received / partially received, receipt recorded, incoming inspection failed, cancelled, closed | 9 / 9 |
+| `tenant.*` | Tenant create / archive / restore / switch, NAV toggle, seller region + setup, demo seeding | 9 / 9 |
+| `auth.*` | Audit-session lifecycle: operator and service sessions opened / closed / endorsed, crash-recovered sessions | 6 / 10 |
+| `supplier.*` | AVL: vendor added, status changed, revoked, screening overdue, export screening recorded, PO blocked by vendor status | 6 / 7 |
+| `qc.*` | Inspection recorded / passed / failed, auto-NCR raised, probe calibration-stale warning, probe ingestion failure | 6 / 6 |
+| `ncr.*` | NCR created, state changed, escalated, closed, and work orders blocked by an open NCR | 5 / 5 |
+| `capa.*` | CAPA created, approved, effectiveness reviewed, closed | 4 / 4 |
+| `part.*` | Per-unit serial assigned, UID marked, traceability viewed, work order blocked for a missing UID | 4 / 4 |
+| `snapshot.*` | Snapshot created, pruned, restored, validation failed | 4 / 4 |
+| `material.*` | Heat lot assigned, MTR uploaded, traceability viewed, work order blocked for a missing heat lot | 4 / 5 |
+| `export.*` | Export control / ITAR — see below | 3 / 3 |
+| `email.*` | SMTP relay queued / sent / failed | 3 / 3 |
+| `cad.*` | Encrypted-CAD key provisioning and every blob read, including legacy-plaintext reads | 3 / 3 |
+| `audit.*` | Qualified-timestamp anchor taken / delayed | 2 / 2 |
+| `inventory.*` | Material committed to a work order | 1 / 4 |
+| `db.*` | Boot-time automatic ledger recovery | 1 / 1 |
+| `partner.*` | Customer-type change (drives the margin profile) | 1 / 1 |
+| `cui.*`, `personnel.*`, `incident.*` | — | 0 / 7 |
+
+The table accounts for 186 kinds; the 187th is `test`, written only by the
+chain-conformance suite.
+
+### Reserved — defined and validated, never emitted
+
+These kinds parse, round-trip, and carry documented payload schemas, but
+**no code path writes them**. They are declared so the classifier and the
+verifier are exhaustive ahead of the features landing; do not read them as
+shipped controls.
+
+- `cui.marking_applied`, `cui.access_event` — CUI marking / access.
+- `personnel.id_registered`, `personnel.access_granted`,
+  `personnel.access_denied`, `personnel.signature_applied`.
+- `incident.cyber_detected` — the DoD 72-hour cyber-incident report.
+- `auth.dap_login_initiated` / `_completed` / `_failed` / `_fallback` —
+  blocked on the real DÁP integration.
+- `inventory.material_reserved` / `_released` / `_consumed`,
+  `material.cert_attached`.
+- `quote.pricing_operator_accepted`, `supplier.dpas_priority_set`.
+
+### Export control / ITAR *[Defense]*
+
+Three kinds fire at the shipment boundary, all inside the single
+`mark_shipped` transaction that flips the dispatch state — so an export
+row cannot exist for a shipment that rolled back, and a shipment cannot
+exist without its export rows:
+
+- `export.classification_set` — the classification the injected
+  `ExportControlProvider` returned for the commodity (`eccn`,
+  `usml_category`, `jurisdiction`), stamped with the operator and a
+  system clock.
+- `export.access_check` — the consignee screening decision
+  (`granted` / `restricted` / `denied` / `not_determined`) plus the
+  `reason` and a `backend` field naming which provider answered. A
+  denial rolls the ship back, so that row is appended by the route layer
+  instead.
+- `export.shipment_logged` — the physical export record: exporter,
+  consignee, destination country, cited authorization.
+
+**The shipped provider is a mock.** With no denied-party list wired, it
+answers `not_determined` with `backend: "mock"` — never `granted`. That is
+deliberate: a `granted` row on an append-only ledger would assert a screen
+ran and cleared, and it could never be corrected. Timestamps come from the
+system clock, not from the operator-supplied ship date, so a back-dated
+shipment cannot claim its screening ran in the past. Separately,
+`supplier.export_screened` records AVL-side export screening of vendors.
+
+### What protects the chain
+
+- **Hash chain.** `entry_hash[N] = SHA-256(canonical-CBOR(entry[N] with
+  prev_hash = entry_hash[N-1]))`, anchored at a genesis hash derived from
+  the tenant id. One canonical encoder, used by both the writer and the
+  verifier.
+- **Append-only, one writer.** All ledger writes go through the shared
+  `aberp-db` handle (`Handle::with_ledger`), so appends across daemons and
+  request handlers serialize instead of forking the chain.
+- **Atomic with the business write.** `append_in_tx` takes a caller-owned
+  transaction, so the state change and its audit entry commit or roll back
+  together.
+- **A JSONL mirror alongside the DuckDB table**, with a boot-time
+  consistency check that replays or repairs a mirror/DB divergence and
+  records the repair as `db.auto_recovered`.
+- **Build-gated write-fork scanners.** The cut gate refuses a release
+  whose sources grow a new ledger opener or a wrapper that appends outside
+  the shared handle (`tools/adr0099_write_fork_scan.awk`,
+  `tools/adr0105_wrapper_fork_scan.awk`), and
+  `tools/cut_gate_negative_probes.sh` re-plants each defect to prove the
+  scanner still catches it.
+- **Session signing** *[Defense]*. With the per-tenant `dap_enabled`
+  toggle on (**default off**), boot mints an ed25519 service session,
+  recovers sessions left open by a crash, signs entries, and takes
+  periodic timestamp anchors. The timestamp authority is still the
+  **mock** — the NETLOCK and DÁP transports are `todo!` — so treat the
+  `auth.*` and `audit.*` kinds as a working structural floor, not a
+  qualified signature (see [roadmap](#roadmap)).
+
+### Reading and exporting it
+
+- **Audit screen in the app** — `GET /api/audit-events` behind the SPA's
+  Audit Events view. Server-side filters on date range, kind, domain
+  prefix, subject (matched across own id *and* chain-base id, so a storno
+  is found by the invoice it credits), operator, and free text; cursor
+  pagination; storefront heartbeat kinds hidden by default. The detail
+  view (`/api/audit-events/:seq`) returns the full typed payload plus a
+  recomputed `hash_ok`, `prev_hash`, and `entry_hash`.
+- **`aberp export-invoice-bundle`** — a single `.tar.zst` evidence archive
+  for one invoice: the chain slice, the NAV request/response archive, and
+  a manifest.
+- **`aberp-verify`** — a separate binary that re-verifies an exported
+  bundle from its bytes alone, without trusting the app that produced it,
+  and reports every check it ran rather than stopping at the first
+  failure.
+
+---
+
+## External connected workflows
+
+Everything ABERP talks to over a wire. It has **no public inbound
+surface** — the app itself is a loopback-only listener on the operator's
+Mac, with no webhook and no tunnel — so every internet-facing integration
+below is outbound: ABERP polls or pushes. The only sockets it accepts on
+are shop-floor ones, bound on the local network for adapters that can
+only push (the barcode scanner).
+
+**NAV Online Számla 3.0** *[Defense]*
+
+- **Outbound invoicing.** `tokenExchange` + `manageInvoice` for issue,
+  storno, and modification, with NAV v3.0 XSD + invariant validation
+  before the wire and `queryTransactionStatus` ack polling after it.
+  `manageAnnulment` covers technical annulment, with its own ack poll and
+  receiver-confirmation observation.
+- **Offline queue and retry drains.** `drain-submission-queue` classifies
+  invoices that were drafted but never submitted and files them FIFO,
+  stopping on the first transport-layer error; `drain-pending-retries`
+  drives invoices stuck between attempt and response back through the
+  submission pipeline.
+- **Inbound AP sync.** A background daemon polls `queryInvoiceDigest` +
+  `queryInvoiceData` for invoices issued *against* you, ingests them as
+  incoming-invoice rows, and tracks status changes. Tax IDs are redacted
+  from the diagnostic previews it logs.
+- **NAV as disaster recovery.** `restore-from-nav-outgoing` pages your own
+  outgoing invoices back out of NAV to rebuild a lost local database:
+  digest paging, a preview pass, a per-tenant restore lock, sequence-gap
+  detection, and a checksum over the restored numbers. Restored rows land
+  in a separate `restored_invoice` table surfaced as **ExtNav** rows — the
+  NAV digest carries no buyer identity, so a background backfill and an
+  operator-driven `system.extnav_partner_manual_link` attach the partner
+  rather than the system guessing. `recover-from-nav` reconstructs a
+  single invoice from `queryInvoiceData`.
+- NAV credentials live in the macOS keychain (`./run/setup_nav_creds.sh`).
+  A build without `--features production` structurally cannot reach the
+  live endpoint.
+
+**Storefront (abenerp.com)** *[Defense]*
+
+Reach to the storefront is a **compile-time Defense-only** capability: in
+a Portable build these daemons are never spawned, and a boot guard refuses
+the reach. Local quoting is unaffected in both editions.
+
+- **Quote intake (pull).** Polls the storefront for approved quotes and
+  stages them in a purpose-built intake table together with a
+  pre-prepared draft invoice. It deliberately never touches the `invoice`
+  table — the operator picks a row up in the SPA and it goes through the
+  normal issue pipeline, so the sequence burn, the audit chain, and the
+  NAV submission stay operator-gated.
+- **Catalogue push.** `PUT`s the public projection of the material
+  catalogue to the storefront on a cadence and on every operator write, so
+  the public quote form's dropdown is fed without the customer's browser
+  ever reaching ABERP.
+- **Email outbox (pull-then-send).** Polls the storefront's internal email
+  queue, claims each entry, sends it through ABERP's own SMTP, then posts
+  the sent/failed result back — the single-point-of-contact posture, where
+  ABERP is the only thing holding mail credentials.
+
+**SMTP** *[both]*
+
+A local `lettre` transport over rustls, used for both invoice delivery and
+the storefront outbox. Outbound mail is queued in a DuckDB table and
+drained by a background daemon with a bounded retry budget; every
+transition is audited (`email.relay_queued` / `_sent` / `_failed`).
+Credentials are entered in Tenant Settings; the password lives in the OS
+keychain. TLS is mandatory — the transport-security setting is a closed
+vocabulary of `StartTls` or `Tls`, with no plaintext variant an operator
+could type.
+
+**Machine and shop-floor adapters** *[Defense]*
+
+Operators register adapters (host, port, device) in the app; the MES
+manager builds and supervises them, and every event and health transition
+is written to the ledger by a dedicated writer task. Five adapter families
+are wired to real transports:
+
+| Adapter | Transport | Notes |
+|---|---|---|
+| Barcode scanner | TCP listener, line-delimited UTF-8 | Bounded payload length and concurrent connections |
+| Label printer (Zebra) | Raw TCP ZPL, TCP-connect health probe | Per-print connection, auto-reconnect |
+| CNC (MTConnect) | HTTP `GET /{device}/current` polling | Bounded response size, classified transport errors |
+| Robot (Universal Robots) | RTDE over TCP, version handshake | Reconnect with exponential backoff |
+| Laser (Trumpf) | MTConnect agent / gateway | Backend is a code decision, not an operator field |
+
+Two further laser backends are **declared but not implemented** — OPC UA
+(needs a dependency and an address-space capture) and Oseon / TruTops Fab
+(needs a licensed deployment). Both return an error rather than
+pretending; neither is constructible from operator config. On-machine
+*probe* ingestion (DMG MORI, Renishaw) is likewise not wired — QC
+inspection results are entered by hand today (see [roadmap](#roadmap)).
+
+---
+
 ## Why this is interesting
 
 A few things under the hood that engineers tend to enjoy:
