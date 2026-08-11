@@ -56,6 +56,17 @@ pub const POLL_DISABLE_ENV: &str = "ABERP_SNAPSHOT_DISABLE";
 /// Env kill-switch for the clean-shutdown durable checkpoint (below).
 pub const CHECKPOINT_ON_SHUTDOWN_DISABLE_ENV: &str = "ABERP_CHECKPOINT_ON_SHUTDOWN_DISABLE";
 
+/// How long the clean-shutdown checkpoint will wait for the Handle's writer
+/// mutex before giving up and letting the process exit (ADR-0111 / PR #41
+/// adversarial finding 2).
+///
+/// 2 s, chosen against the shutdown budget it runs after: the drain gets 5 s
+/// (`shutdown_timeout_from_env`) and DETACHES whatever it could not join, so
+/// this is time spent purely on stragglers that already ignored the drain.
+/// Long enough to absorb an in-flight transaction; short enough that exit stays
+/// prompt for an operator watching a terminal.
+const SHUTDOWN_CHECKPOINT_LOCK_BUDGET: Duration = Duration::from_secs(2);
+
 /// ADR-0082 follow-up (chunk 3) — on CLEAN shutdown, leave the live DB in a
 /// crash-safe, verified-good state. This is the serve-side half of the
 /// deferred crash-safe-checkpoint fix (the mechanism lives in
@@ -118,22 +129,39 @@ pub fn checkpoint_on_clean_shutdown(db: &HandleArc) {
     // into aberp-db's log line); failures are loud and swallowed there, so a
     // checkpoint ERROR never wedges exit (the original S213 bug).
     //
-    // ACCEPTED RISK (ADR-0111 §5) — this now WAITS on the writer mutex, which
-    // the path-based call did not. The wait is bounded in every non-pathological
-    // case: the lock is held only for the length of one transaction, or for one
-    // in-flight checkpoint (and if that one just completed, ours is a marker
-    // no-op). The unbounded case is a daemon permanently wedged inside a
-    // `WriteGuard` — a process in which every write path is already dead, and
-    // which the drain above has already failed to stop. Taken over the
-    // alternative, because NOT holding the lock here is what corrupted the
-    // mirror: the handle is still open at this point (it lives in
-    // `recovery_state.db`), so a path-based swap strands its connection and the
-    // primitive's own `Connection::open` is a second live opener (ADR-0098 1a).
-    db.checkpoint_now();
-    tracing::info!(
-        db = %db_path.display(),
-        "clean shutdown: crash-safe durable checkpoint taken under the shared handle (ADR-0082 chunk 3 / ADR-0111)"
-    );
+    // BOUNDED, and here is why (PR #41 adversarial, finding 2). The first cut
+    // of this claimed "the drain already finished, so no WriteGuard is alive".
+    // That is FALSE: `ShutdownCoordinator::shutdown` races each daemon's
+    // `JoinHandle` against a shared 5 s budget with `tokio::time::timeout`, and
+    // on expiry it DROPS the handle — which DETACHES the tokio task rather than
+    // aborting it. A straggler daemon is therefore still running and may still
+    // be inside a `WriteGuard`, so an unbounded `checkpoint_now()` would park on
+    // its mutex (measured ~1.8 s against a slow straggler; unbounded in
+    // principle) and block process exit. Rule 12 / S213 forbid that, so the wait
+    // is capped and a miss is loud.
+    //
+    // Giving up costs little: the live file is left to the next boot's recovery
+    // path, exactly as after any unclean stop, and the ADR-0095 §3 daemon
+    // cadence has been folding it all along. What we do NOT do is drop back to
+    // the path-based primitive — the handle is still open here (it lives in
+    // `recovery_state.db`), so that would strand its connection AND make the
+    // primitive's own `Connection::open` a second live opener (ADR-0098 1a).
+    //
+    // Only the SUCCESS arm announces success. The first cut logged "durable
+    // checkpoint installed" unconditionally, including when the checkpoint had
+    // just errored (PR #41 adversarial) — a line an operator would read during
+    // a recovery as evidence the live file was folded when it was not. The
+    // failure arms are logged loud inside `aberp-db` (the checkpoint error) and
+    // inside `checkpoint_now_within` (the lock miss, with its fallback), so
+    // there is nothing to add on either.
+    // `Some(true)` and nothing else: `Some(false)` is a checkpoint that ERRORED
+    // (logged in aberp-db) and `None` is the lock miss (logged there too).
+    if db.checkpoint_now_within(SHUTDOWN_CHECKPOINT_LOCK_BUDGET) == Some(true) {
+        tracing::info!(
+            db = %db_path.display(),
+            "clean shutdown: crash-safe durable checkpoint installed under the shared handle (ADR-0082 chunk 3 / ADR-0111)"
+        );
+    }
 }
 
 /// ADR-0095 §3 — take ONE durable checkpoint of the LIVE file off the request
@@ -170,7 +198,19 @@ pub fn checkpoint_on_clean_shutdown(db: &HandleArc) {
 /// **Never call this while a `WriteGuard` is alive** — the writer mutex is not
 /// reentrant. Both callers run it after their write work has fully returned.
 pub fn live_checkpoint_logged(db: &HandleArc) {
-    db.checkpoint_now();
+    // The name promises a log line, and the first cut stopped emitting one when
+    // the body became a single delegation (PR #41 adversarial): the handle logs
+    // an installed checkpoint at DEBUG and a failure at ERROR, so at the
+    // default level a healthy daemon tick went completely silent — there was no
+    // longer any way to see from the logs that the cadence was running at all.
+    // One INFO line on success restores that, and costs one line per tick.
+    if db.checkpoint_now() {
+        tracing::info!(
+            db = %db.db_path().display(),
+            "live-path crash-safe durable checkpoint taken under the shared handle (ADR-0095 §3 / ADR-0111)"
+        );
+    }
+    // The failure arm is logged LOUD inside the handle, with the fallback.
 }
 
 // ──────────────────────────────────────────────────────────────────────

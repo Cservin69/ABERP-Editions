@@ -1,0 +1,77 @@
+# ADR-0111 — the FROZEN census of the rename-over-a-live-DB-path family.
+#
+# WHY THIS FILE EXISTS (read before editing it).
+#
+# The first cut of CHECK C-A banned exactly one spelling — `durable_checkpoint(`
+# / `live_durable_checkpoint(` — and the PR #41 adversarial walked straight
+# through it. Three bypasses compiled clean AND left the gate saying PASSED:
+#
+#   (a) an ALIASED import:
+#         use aberp_snapshot::live_durable_checkpoint as fold_live;
+#         fold_live(&db, &tenant);          // the banned name is never called
+#   (b) a DIFFERENT public wrapper over the same rename:
+#         aberp_snapshot::provision_atomic(..) / resume_pending_install(..)
+#   (c) the rename primitive ITSELF, which is `pub`:
+#         aberp_snapshot::atomic_install(staged, db_path)
+#
+# All three do the identical damaging thing: install a different inode at the
+# live DB path while the shared `aberp_db::Handle` holds the old one. So the
+# gate can no longer key on one function name. It keys on the whole FAMILY —
+# every public entry point that reaches `atomic_install` (or, for
+# `restore_into`, does its own `rename` over the target) — and it counts
+# TOUCHES, not calls, so an import alias is caught at the import.
+#
+# THE RULE. Every touch of a family symbol outside `crates/aberp-snapshot/**`
+# must appear here, with the reason it is sound. A touch is a whole-word
+# occurrence on a code line (string literals and comments stripped), so it
+# covers a call, a `use` (aliased or not), and a bare function-pointer
+# reference — the three shapes (a)-(c) above.
+#
+# WHY A COUNT AND NOT JUST A FILE. `serve.rs` legitimately touches three of
+# these during boot. Censusing the FILE would hand a 30k-line file a blanket
+# pass, so a new `atomic_install(..)` dropped anywhere in it would be invisible.
+# The census pins (file, symbol, count): a new symbol is red, and one more
+# touch of an already-listed symbol is red.
+#
+# Format: <path>\t<symbol>\t<count>\t<why this touch is sound>
+# Lines starting with '#' and blank lines are ignored.
+
+# ── Pre-Handle boot sequence (apps/aberp/src/serve.rs) ───────────────────────
+# These run BEFORE the shared Handle is opened (`open_tenant_handle` at
+# serve.rs:1871). There is no shared connection to orphan yet, which is the
+# entire reason they are sound — and the reason their ORDER is load-bearing.
+# ADR-0098 R2 says so explicitly at the `resume_pending_install` site: "MUST
+# precede provision_atomic + the first billing-store open below". Moving any of
+# these AFTER the Handle opens would reintroduce the ADR-0111 defect on the boot
+# path, so a reviewer seeing this count change must check the position, not just
+# the call.
+apps/aberp/src/serve.rs	resume_pending_install	1	boot, pre-Handle: completes a checkpoint install interrupted by a crash (ADR-0098 R2), before any DuckDB open
+apps/aberp/src/serve.rs	provision_atomic	1	boot, pre-Handle: atomically creates the tenant DB when absent (ADR-0095 §2)
+apps/aberp/src/serve.rs	recover_or_refuse_with_audit	2	boot, pre-Handle (`attempt_db_auto_recovery`) + the separate-process `aberp recover` CLI (`run_recover`); neither has a live Handle
+
+# ── The sanctioned in-Handle caller ──────────────────────────────────────────
+# The ONE runtime checkpoint, taken under the writer mutex with the shared
+# connection quiesced and reopened around the swap. CHECK C-B pins that it
+# still does all three of those things.
+crates/aberp-db/src/lib.rs	live_durable_checkpoint	1	`run_durable_checkpoint_locked` — quiesces, checkpoints, reopens, all under the writer lock
+
+# ── KNOWN RESIDUAL — operator restore (follow-up, NOT closed by this PR) ─────
+# `restore_into` builds a `<target>.restoring` file and renames it over
+# `target`. `apps/aberp/src/snapshot.rs::restore_and_emit` is reached from the
+# CLI (`aberp snapshot restore`, a separate process — sound) AND from
+# `POST /api/snapshots/restore` (`serve.rs::snapshot_restore_request`), which
+# runs IN the serve process with the Handle open in `state.db`. If an operator
+# points `to` at the live DB — the intended use — that rename orphans the shared
+# connection exactly as the daemon checkpoint used to.
+#
+# PRE-EXISTING, not introduced by ADR-0111, and no longer silent: the inode
+# fence in `WriteGuard::drop` detects the swap on the next commit, SKIPS the
+# mirror sync (so the mirror can never end up ahead), fails the money-path ack
+# with `DbError::LiveFileSwapped`, and reopens on the restored file. The
+# residual is the in-flight write, which is lost and now loudly reported.
+#
+# Closing it properly means quiescing the Handle across a restore, which is a
+# design question this PR does not answer: a restore replaces the whole DB
+# INCLUDING the audit chain, so the reopened Handle's ledger head, the JSONL
+# mirror and `LedgerMeta` all have to be reconciled. Tracked as a follow-up.
+apps/aberp/src/snapshot.rs	restore_into	2	`use` + the `restore_and_emit` call; sound for the CLI arm, MITIGATED (not closed) for the in-process HTTP arm — see the note above

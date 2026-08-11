@@ -40,7 +40,14 @@
 //! the live file untouched) if its WAL fence trips, and a no-op checkpoint
 //! cannot orphan anything, so "no rows lost" would pass for the wrong reason.
 //!
-//! Same build gate as `handle_concurrency_e2e.rs`: real DuckDB, Mac/CI only.
+//! These open **real DuckDB** files. There is no `cfg` gate on them — the whole
+//! `aberp-db` crate depends on the bundled libduckdb amalgamation, so if that
+//! builds these run, and if it does not the crate does not compile at all.
+//! (The sibling suites' "Mac/CI only" headers describe the SAW-OFF sandbox,
+//! where the amalgamation cannot build; that is a property of the environment,
+//! not a `#[cfg]`. Said plainly here because the PR #41 adversarial went
+//! looking for the cfg those headers imply and found none.) The unit-testable
+//! D2 debounce logic lives in `src/debounce.rs` and runs anywhere.
 
 use std::path::{Path, PathBuf};
 
@@ -110,8 +117,9 @@ fn append_one(conn: &mut Connection, label: &str) {
 /// before it now points at an unlinked file nobody will ever read again.
 ///
 /// Unix-only by construction (the tree's whole `cfg(windows)` surface in
-/// `aberp-db` is the directory-`fsync` no-op); the test module is Mac/CI-gated
-/// anyway.
+/// `aberp-db` is the directory-`fsync` no-op), which is why the tests that use
+/// it carry `#[cfg(unix)]` individually — see the module header on why there is
+/// no build gate beyond that.
 #[cfg(unix)]
 fn file_identity(p: &Path) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
@@ -355,6 +363,170 @@ fn file_id_changed_by(p: &Path, f: impl FnOnce()) -> bool {
     let before = file_identity(p);
     f();
     file_identity(p) != before
+}
+
+/// **The `durable_ack` by-path hole** (PR #41 adversarial, finding 3).
+///
+/// The guard-drop fence only covers acks with a PARKED outcome. `durable_ack`'s
+/// other arm — no write has completed since the last claim, so `last_ack` is
+/// `None` — falls through to `fsync_data_paths()`, which opens the DB, the WAL
+/// and the parent dir **by path**. After a swap those paths name the NEW inode,
+/// so the fsync succeeds, the durability journal records it, and the ack returns
+/// `Ok(())`: the operator is told a write is power-loss durable on the strength
+/// of flushing a file that has nothing to do with it.
+///
+/// This is the arm a money path hits when its write was a no-op — exactly the
+/// case where "nothing to flush" must not be confused with "flushed something".
+#[cfg(unix)]
+#[test]
+fn an_unparked_ack_over_a_swapped_file_fails_instead_of_fsyncing_the_new_inode() {
+    let tmp = Tmp::new("ack-unparked");
+    let db = tmp.db();
+    seed(&db);
+    let cfg = HandleConfig {
+        checkpoint_enabled: false,
+        ..Default::default()
+    };
+    let handle = Handle::open(&db, tenant(), cfg).unwrap();
+
+    // A write, then CLAIM its parked outcome — so `last_ack` is back to `None`
+    // and the next ack takes the fall-through arm under test.
+    {
+        let mut g = handle.write().unwrap();
+        append_one(&mut g, "A-before-swap");
+    }
+    handle
+        .durable_ack()
+        .expect("the first ack claims a healthy parked outcome");
+
+    // Sanity: with no swap, the unparked arm still succeeds. Without this the
+    // test could pass simply because the arm always fails.
+    handle
+        .durable_ack()
+        .expect("an unparked ack on an UNSWAPPED file must still succeed");
+
+    // The out-of-process swap. No write follows it, so nothing parks an outcome
+    // and the guard-drop fence never runs — this arm is the only guard left.
+    let swapped = file_id_changed_by(&db, || {
+        aberp_snapshot::durable_checkpoint(&db, TENANT).expect("out-of-process checkpoint");
+    });
+    assert!(swapped, "the simulated swap did not change the live inode");
+
+    let err = handle
+        .durable_ack()
+        .expect_err("an unparked ack over a SWAPPED file must FAIL, not fsync the new inode");
+    assert!(
+        matches!(err, aberp_db::DbError::LiveFileSwapped { .. }),
+        "expected DbError::LiveFileSwapped, got {err:?}"
+    );
+}
+
+/// Reads must not keep serving the pre-swap file.
+///
+/// `Handle::read()` hands out a `try_clone` of the shared connection. If that
+/// connection is stranded on a swapped-away inode the clone reads the OLD file
+/// — so after an operator restore the UI would show pre-restore rows
+/// indefinitely, because nothing on the read path ever reopens. Cheaper to fix
+/// than the write path (no commit is at stake): drop and reopen.
+#[cfg(unix)]
+#[test]
+fn reads_do_not_keep_serving_the_pre_swap_file() {
+    let tmp = Tmp::new("read-fence");
+    let db = tmp.db();
+    seed(&db);
+    let cfg = HandleConfig {
+        checkpoint_enabled: false,
+        ..Default::default()
+    };
+    let handle = Handle::open(&db, tenant(), cfg).unwrap();
+    {
+        let mut g = handle.write().unwrap();
+        append_one(&mut g, "A-before-swap");
+    }
+    assert_eq!(
+        recent_entries(&handle.read().unwrap(), u32::MAX)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Swap in a file with DIFFERENT contents — a second row the stranded
+    // connection has never seen. Built by checkpointing a scratch DB and
+    // renaming it over the live path, i.e. what an operator restore does.
+    let scratch = tmp.0.join("restored.duckdb");
+    seed(&scratch);
+    {
+        let mut c = Connection::open(&scratch).unwrap();
+        append_one(&mut c, "A-before-swap");
+        append_one(&mut c, "B-only-in-the-restored-file");
+        c.execute_batch("CHECKPOINT;").unwrap();
+    }
+    let before = file_identity(&db);
+    std::fs::rename(&scratch, &db).unwrap();
+    let _ = std::fs::remove_file(format!("{}.wal", db.display()));
+    assert_ne!(
+        before,
+        file_identity(&db),
+        "the rename did not swap the file"
+    );
+
+    // The read must observe the RESTORED file, not the orphan.
+    let seen = recent_entries(&handle.read().unwrap(), u32::MAX)
+        .unwrap()
+        .iter()
+        .map(|e| String::from_utf8_lossy(&e.payload).to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        seen.iter()
+            .any(|p| p.contains("B-only-in-the-restored-file")),
+        "read() served the PRE-SWAP file — the shared connection is still on the \
+         orphaned inode and nothing reopened it: {seen:?}"
+    );
+}
+
+/// The clean-shutdown checkpoint must not be able to block process exit.
+///
+/// The drain that runs before it does NOT guarantee the writer mutex is free:
+/// `ShutdownCoordinator::shutdown` races each daemon's `JoinHandle` against a
+/// shared budget and, on expiry, DROPS it — which detaches the tokio task
+/// rather than aborting it, so a straggler can still be inside a `WriteGuard`.
+/// `checkpoint_now_within` must give up on that rather than park (S213).
+#[test]
+fn a_bounded_checkpoint_gives_up_when_a_writer_still_holds_the_lock() {
+    let tmp = Tmp::new("bounded");
+    let db = tmp.db();
+    seed(&db);
+    let cfg = HandleConfig {
+        checkpoint_enabled: false,
+        ..Default::default()
+    };
+    let handle = Handle::open(&db, tenant(), cfg).unwrap();
+
+    // Stand in for the detached straggler: hold a guard across the call.
+    let guard = handle.write().unwrap();
+    let started = std::time::Instant::now();
+    let outcome = handle.checkpoint_now_within(std::time::Duration::from_millis(200));
+    let waited = started.elapsed();
+    drop(guard);
+
+    assert!(
+        outcome.is_none(),
+        "checkpoint_now_within returned {outcome:?} while a WriteGuard was held — it must \
+         report the lock miss, not somehow run"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(2),
+        "checkpoint_now_within waited {waited:?} on a 200ms budget — process exit would hang \
+         behind a detached straggler (S213)"
+    );
+
+    // And once the writer is gone it runs normally — the bound must not have
+    // left the handle in a state where checkpoints stop happening.
+    assert_eq!(
+        handle.checkpoint_now_within(std::time::Duration::from_secs(5)),
+        Some(true),
+        "the bounded checkpoint failed on a FREE lock"
+    );
 }
 
 /// The checkpoint must leave the shared handle USABLE, not merely intact on

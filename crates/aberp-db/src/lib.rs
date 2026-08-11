@@ -420,6 +420,24 @@ impl Handle {
         // Finding F (R4): same poison-recovery as write() — a reader must not be
         // bricked by another holder's panic either.
         let mut inner = self.lock_recovering()?;
+        // ADR-0111 — fence reads too (PR #41 adversarial, lower-severity gap).
+        // A `try_clone` of a connection stranded on a swapped-away inode serves
+        // the OLD file: after an operator restore the UI would keep reading
+        // pre-restore rows, indefinitely and silently, because nothing on the
+        // read path ever re-opens. Unlike the write path there is nothing to
+        // lose here — no commit has happened — so this just drops the stale
+        // connection and lets `ensure_open` below reopen on the live file and
+        // re-arm the fence.
+        if self.live_file_swapped(&inner) {
+            tracing::error!(
+                db = %self.db_path.display(),
+                "aberp-db: LIVE DB FILE SWAPPED under the open handle (inode changed); the shared \
+                 connection was serving the OLD file. Reopening before this read so it cannot \
+                 return pre-swap rows (ADR-0111)"
+            );
+            inner.conn = None;
+            inner.fence = None;
+        }
         self.ensure_open(&mut inner)?;
         let clone = inner
             .conn
@@ -546,9 +564,12 @@ impl Handle {
         // outcome, so the money path can propagate it. Doing the fsync here
         // instead would be too late to fix the ordering — and would be a third,
         // redundant F_FULLFSYNC of bytes already flushed.
-        let claimed = {
+        let (claimed, swapped) = {
             let mut inner = self.lock_recovering()?;
-            inner.last_ack.take()
+            // ADR-0111 — read the inode fence under the SAME lock acquisition
+            // that claims the outcome, so the answer cannot change between them.
+            let swapped = self.live_file_swapped(&inner);
+            (inner.last_ack.take(), swapped)
         };
         match claimed {
             Some(result) => result,
@@ -557,7 +578,39 @@ impl Handle {
             // silently succeed on the strength of an fsync that never ran.
             // Reached by a money path whose write was a no-op, and by direct
             // callers in tests.
+            //
+            // ADR-0111 (PR #41 adversarial, finding 3) — but NOT over a swapped
+            // file. `fsync_data_paths` opens BY PATH, so after an
+            // out-of-process swap it would flush and journal the brand-new
+            // inode and return `Ok(())`: an ack certifying a file that has
+            // nothing to do with this handle's writes. That is the by-path
+            // residual, and this arm is where it survived the guard-drop fence.
+            None if swapped => Err(DbError::LiveFileSwapped {
+                path: self.db_path.clone(),
+            }),
             None => self.fsync_data_paths(),
+        }
+    }
+
+    /// ADR-0111 — is the file at [`Self::db_path`] a DIFFERENT file from the one
+    /// `inner`'s connection was opened onto?
+    ///
+    /// `atomic_install` (and `restore_into`) commit by `rename`, which installs
+    /// a new inode at the same path, so an identity change IS the swap and the
+    /// open connection is stranded on an unlinked file.
+    ///
+    /// Conservative on purpose: `None` on either side — a non-unix target, or
+    /// the file momentarily absent mid-swap — reads as "no evidence", not as a
+    /// swap. This is a belt; one that fires on a stat race would be worse than
+    /// the hazard it guards.
+    ///
+    /// Must be called with the writer lock held (it takes `&Inner`), which is
+    /// also what makes it race-free: the checkpoint that legitimately changes
+    /// the inode re-arms `fence` under that same lock.
+    fn live_file_swapped(&self, inner: &Inner) -> bool {
+        match (inner.fence, file_id(&self.db_path)) {
+            (Some(opened_on), Some(now)) => opened_on != now,
+            _ => false,
         }
     }
 
@@ -692,7 +745,9 @@ impl Handle {
             }
         };
         if inner.debouncer.should_checkpoint_on_idle() {
-            self.run_durable_checkpoint_locked(&mut inner);
+            // Automatic cadence: the outcome is already logged inside, and there
+            // is no caller to report it to.
+            let _ = self.run_durable_checkpoint_locked(&mut inner);
         }
     }
 
@@ -748,7 +803,12 @@ impl Handle {
     /// CLAUDE.md rule 12) and swallows it, so a checkpoint hiccup can never
     /// wedge a daemon tick or process exit — which is why this returns `()`
     /// rather than a `Result` the callers would only be able to log.
-    pub fn checkpoint_now(&self) {
+    ///
+    /// Waits as long as it takes to acquire the lock. A caller that must not
+    /// block forever — process exit — wants [`Self::checkpoint_now_within`].
+    /// Returns `true` if the checkpoint actually succeeded — callers that
+    /// announce it to an operator must not say "installed" on the error arm.
+    pub fn checkpoint_now(&self) -> bool {
         // Same poison-recovery path as write()/read()/checkpoint_on_idle: a
         // poisoned mutex must never SILENTLY drop the checkpoint (finding F).
         let mut inner = match self.lock_recovering() {
@@ -759,10 +819,69 @@ impl Handle {
                     db = %self.db_path.display(),
                     "aberp-db: explicit checkpoint skipped — writer poison-recovery returned a HARD error (integrity re-verify failed)"
                 );
-                return;
+                return false;
             }
         };
-        self.run_durable_checkpoint_locked(&mut inner);
+        self.run_durable_checkpoint_locked(&mut inner)
+    }
+
+    /// [`Self::checkpoint_now`] with a **bound on the lock wait**. Returns
+    /// `true` if the checkpoint ran, `false` if the writer mutex could not be
+    /// acquired within `budget` (logged LOUD; the caller proceeds).
+    ///
+    /// # Why process exit needs this (PR #41 adversarial, finding 2)
+    ///
+    /// The clean-shutdown checkpoint used to reason "the drain already
+    /// finished, so no `WriteGuard` is alive". That is **false**.
+    /// `ShutdownCoordinator::shutdown` races each daemon's `JoinHandle` against
+    /// a shared 5 s budget with `tokio::time::timeout`; on expiry it **drops**
+    /// the handle. Dropping a tokio `JoinHandle` DETACHES the task, it does not
+    /// abort it. So a straggler daemon is still running, can still be inside a
+    /// `WriteGuard`, and an unbounded `checkpoint_now` would park on its mutex
+    /// for as long as that guard lives — measured at ~1.8 s against a slow
+    /// straggler, unbounded in principle. Blocking process exit on a checkpoint
+    /// is the original S213 bug, and CLAUDE.md rule 12 forbids it.
+    ///
+    /// Giving up is the right trade here and costs little: the live file is
+    /// simply left for the next boot's recovery path, exactly as it is after
+    /// any unclean stop, and the ADR-0095 §3 daemon cadence has been folding it
+    /// all along.
+    ///
+    /// Implemented as a `try_lock` poll rather than a timed lock because
+    /// `std::sync::Mutex` has none. The poll interval is deliberately coarse
+    /// (`POLL`): this runs once per process, at exit, and a tight spin would
+    /// contend with the very guard it is waiting on.
+    pub fn checkpoint_now_within(&self, budget: Duration) -> Option<bool> {
+        const POLL: Duration = Duration::from_millis(25);
+        let deadline = Instant::now() + budget;
+        loop {
+            match self.inner.try_lock() {
+                Ok(mut inner) => {
+                    return Some(self.run_durable_checkpoint_locked(&mut inner));
+                }
+                // Poisoned: fall back to the blocking path, which RECOVERS the
+                // poison (finding F) rather than spinning on it forever — the
+                // lock is free in this case, so there is nothing to wait for.
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Some(self.checkpoint_now());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        tracing::error!(
+                            db = %self.db_path.display(),
+                            budget_ms = budget.as_millis(),
+                            "aberp-db: checkpoint SKIPPED — the writer mutex was still held after \
+                             the budget. A writer is still running (a shutdown drain drops straggler \
+                             JoinHandles, which DETACHES them rather than aborting). Proceeding \
+                             without the checkpoint: the live file falls back to the boot recovery \
+                             path, exactly as after any unclean stop. Never block exit on this (S213)"
+                        );
+                        return None;
+                    }
+                    std::thread::sleep(POLL);
+                }
+            }
+        }
     }
 
     /// (Re)open the shared connection if it is not currently present.
@@ -932,7 +1051,7 @@ impl Handle {
     ///
     /// [`durable_checkpoint`]: aberp_snapshot::durable_checkpoint
     /// [`live_durable_checkpoint`]: aberp_snapshot::live_durable_checkpoint
-    fn run_durable_checkpoint_locked(&self, inner: &mut Inner) {
+    fn run_durable_checkpoint_locked(&self, inner: &mut Inner) -> bool {
         // 1. Quiesce: drop the shared connection so the checkpoint is the
         //    sole opener of the live file. (No in-place fold: the runtime
         //    connection was opened with checkpoint-on-close disabled.)
@@ -941,7 +1060,13 @@ impl Handle {
         // 2. The validated logical checkpoint (reused verbatim). `Ok(None)`
         //    means a verified-good marker already covers the file
         //    (`checkpoint_is_current`) — a free no-op.
-        match aberp_snapshot::live_durable_checkpoint(&self.db_path, &self.tenant) {
+        //
+        //    The outcome is RETURNED, not just logged: the clean-shutdown caller
+        //    used to announce "durable checkpoint installed" unconditionally,
+        //    including on the error arm below (PR #41 adversarial). A log line
+        //    that says the live file was folded when it was not is exactly the
+        //    kind of thing an operator reads during a recovery.
+        let ok = match aberp_snapshot::live_durable_checkpoint(&self.db_path, &self.tenant) {
             Ok(report) => {
                 inner.debouncer.record_checkpoint(Instant::now());
                 if report.is_some() {
@@ -950,6 +1075,7 @@ impl Handle {
                         "aberp-db: durable checkpoint installed (post-commit, debounced)"
                     );
                 }
+                true
             }
             Err(e) => {
                 // Do NOT poison the write: the business txn already committed.
@@ -961,8 +1087,9 @@ impl Handle {
                     "aberp-db: debounced durable checkpoint FAILED (post-commit); \
                      live file falls back to the periodic snapshot recovery path"
                 );
+                false
             }
-        }
+        };
 
         // 3. Reopen on the (possibly newly-installed) inode. If this fails,
         //    leave `conn = None`; the next `write()`/`read()` retries via
@@ -984,6 +1111,7 @@ impl Handle {
                  next write/read will retry"
             ),
         }
+        ok
     }
 }
 
@@ -1138,27 +1266,25 @@ impl Drop for WriteGuard<'_> {
         // sites route through `checkpoint_now`, which re-arms the fence). It is
         // the belt for an out-of-process swapper, and the loud proof that the
         // census gate has not been quietly defeated.
-        let live_now = file_id(&handle.db_path);
-        if let (Some(opened_on), Some(now)) = (self.inner.fence, live_now) {
-            if opened_on != now {
-                tracing::error!(
-                    db = %handle.db_path.display(),
-                    opened_on = ?opened_on,
-                    live_now = ?now,
-                    "aberp-db: LIVE DB FILE SWAPPED under the open handle (inode changed). \
-                     The commit that just finished went to an ORPHANED file and is LOST. \
-                     SKIPPING the data fsync and the mirror sync so the mirror cannot end \
-                     up ahead of the DB; reopening on the live file. If this fires, some \
-                     writer is taking a durable checkpoint outside Handle::checkpoint_now \
-                     (ADR-0111) or another process is rewriting the tenant DB"
-                );
-                self.inner.last_ack = Some(Err(DbError::LiveFileSwapped {
-                    path: handle.db_path.clone(),
-                }));
-                self.inner.conn = None;
-                self.inner.fence = None;
-                return;
-            }
+        if handle.live_file_swapped(&self.inner) {
+            tracing::error!(
+                db = %handle.db_path.display(),
+                opened_on = ?self.inner.fence,
+                live_now = ?file_id(&handle.db_path),
+                "aberp-db: LIVE DB FILE SWAPPED under the open handle (inode changed). \
+                 The commit that just finished went to an ORPHANED file and is LOST. \
+                 SKIPPING the data fsync and the mirror sync so the mirror cannot end \
+                 up ahead of the DB; reopening on the live file. If this fires, some \
+                 writer is taking a durable checkpoint outside Handle::checkpoint_now \
+                 (ADR-0111), or an in-process operator restore (POST /api/snapshots/restore) \
+                 landed on the live path, or another process is rewriting the tenant DB"
+            );
+            self.inner.last_ack = Some(Err(DbError::LiveFileSwapped {
+                path: handle.db_path.clone(),
+            }));
+            self.inner.conn = None;
+            self.inner.fence = None;
+            return;
         }
 
         // D3 B2 — DATA BEFORE THE RECORD THAT POINTS TO IT.
@@ -1236,7 +1362,8 @@ impl Drop for WriteGuard<'_> {
         {
             // Reborrow split: `run_durable_checkpoint_locked` needs `&mut Inner`.
             let inner: &mut Inner = &mut self.inner;
-            handle.run_durable_checkpoint_locked(inner);
+            // Automatic D2 cadence: logged inside, no caller to report to.
+            let _ = handle.run_durable_checkpoint_locked(inner);
         }
     }
 }

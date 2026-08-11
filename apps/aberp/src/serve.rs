@@ -3442,8 +3442,16 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // path-based call renamed the live file out from under its connection
         // and unlinked the WAL, and its own `Connection::open` was a second
         // live opener beside the handle's — the ADR-0098 two-instance hazard.
-        // The drain above has already finished, so no `WriteGuard` is alive and
-        // the non-reentrant writer mutex is free to take.
+        //
+        // The drain above does NOT guarantee that no `WriteGuard` is alive (an
+        // earlier version of this comment claimed it did — PR #41 adversarial,
+        // finding 2). `coordinator.shutdown(timeout)` races each daemon's
+        // `JoinHandle` against a shared 5 s budget and, on expiry, DROPS the
+        // handle — which DETACHES the tokio task, it does not abort it. A
+        // straggler daemon can still be mid-`WriteGuard` right here. So the
+        // checkpoint's wait for the non-reentrant writer mutex is BOUNDED
+        // inside `checkpoint_on_clean_shutdown`, and a miss is logged loud
+        // rather than blocking exit (S213 / CLAUDE.md rule 12).
         crate::snapshot::checkpoint_on_clean_shutdown(&recovery_state.db);
 
         // S291 / PR-272 — best-effort delete of the runtime-discovery
