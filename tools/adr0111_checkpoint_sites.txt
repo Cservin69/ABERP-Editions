@@ -55,5 +55,5 @@
 # while a `WriteGuard` is alive self-deadlocks the calling thread. Every site
 # below is outside any guard scope. A new site must state where its guards end.
 
-apps/aberp/src/snapshot.rs	live_checkpoint_logged	daemon cadence + ADR-0095 §3 post-write debouncer (both callers route through this one wrapper)
-apps/aberp/src/snapshot.rs	checkpoint_on_clean_shutdown	clean-shutdown fold, called from serve.rs after the drain
+apps/aberp/src/snapshot.rs	live_checkpoint_logged	daemon cadence + ADR-0095 §3 post-write debouncer (both callers route through this one wrapper); unbounded `checkpoint_now()` — a daemon tick may wait for the lock
+apps/aberp/src/snapshot.rs	checkpoint_on_clean_shutdown	clean-shutdown fold, called from serve.rs after the drain; uses the BOUNDED `checkpoint_now_within()` because the drain DETACHES stragglers (it drops their JoinHandles) so a WriteGuard can still be live — parking here would block process exit (S213)

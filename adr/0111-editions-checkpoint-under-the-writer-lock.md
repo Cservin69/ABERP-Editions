@@ -71,9 +71,23 @@ That is `MirrorAheadOfDb` — the direction `preserve_ahead_mirror` refuses at b
 
 *Non-reentrancy.* `std::sync::Mutex` is not reentrant: `checkpoint_now` inside a live `WriteGuard` self-deadlocks. All three sites are outside any guard scope, and the census requires a new site to state where its guards end.
 
-**P2a (done).** An **inode fence**: `Inner.fence` records `(st_dev, st_ino)` at every open (boot, `ensure_open`, the post-checkpoint reopen); `WriteGuard::drop` compares it first and, on a mismatch, skips **both** the by-path `fsync` and the mirror sync, parks `DbError::LiveFileSwapped` for `durable_ack` to claim, and drops the stranded connection so the next call reopens on the live file. In-process this is unreachable after P1 — it is the belt for an out-of-process swapper (a second `aberp` invocation, an operator restore, a backup tool), the one case no in-process discipline can prevent. It also closes the `durable_ack` by-path residual: before it, `durable_ack` returned `Ok(())` after a swap, certifying a write that went to an orphan.
+**P2a (done).** An **inode fence**: `Inner.fence` records `(st_dev, st_ino)` at every open (boot, `ensure_open`, the post-checkpoint reopen), and `Handle::live_file_swapped` compares it at all **three** points where a stale identity does damage:
 
-**P2b (done).** `tools/cut_gate_checkpoint_sites.sh` + the frozen census `tools/adr0111_checkpoint_sites.txt`, wired into both CI workflows with a 13-probe teeth harness.
+| site | on a mismatch |
+|---|---|
+| `WriteGuard::drop` | skip **both** the by-path `fsync` and the mirror sync, park `DbError::LiveFileSwapped`, drop the stranded connection |
+| `Handle::durable_ack`, unparked (`None`) arm | fail the ack instead of falling through to `fsync_data_paths` |
+| `Handle::read` | drop and reopen, so a `try_clone` cannot keep serving the pre-swap file |
+
+In-process this is unreachable after P1 — it is the belt for an out-of-process swapper (a second `aberp` invocation, a backup tool) and for the in-process operator restore below, which P1 does *not* cover.
+
+The `durable_ack` and `read` arms were added after the PR #41 adversarial. The first cut fenced only the guard drop, which left two holes: `durable_ack`'s `None` arm (no parked outcome — a money path whose write was a no-op) fell through to `fsync_data_paths`, which opens **by path**, so after a swap it flushed and journalled the brand-new inode and returned `Ok(())`; and `read` handed out clones of the stranded connection forever, so an operator restore would leave the UI showing pre-restore rows indefinitely.
+
+**P2b (done).** `tools/cut_gate_checkpoint_sites.sh` + two frozen censuses (`tools/adr0111_checkpoint_sites.txt`, `tools/adr0111_rename_family_sites.txt`), wired into both CI workflows with a 21-probe teeth harness.
+
+The first cut of CHECK C-A keyed on one function *name* and the adversarial walked through it three ways, each compiling clean while the gate said PASSED: an aliased import (`use ...live_durable_checkpoint as fold_live`), a different public wrapper over the same rename (`provision_atomic` / `resume_pending_install`), and the `pub` rename primitive itself (`atomic_install`). So C-A now governs the **whole rename-over-a-DB-path family** and counts **touches** (a call, a `use` aliased or not, a bare function-pointer reference) rather than calls of one spelling.
+
+The complication is that three of those symbols are *legitimately* called from the **pre-Handle boot sequence** — `resume_pending_install`, `provision_atomic`, `recover_or_refuse_with_audit`, all before `open_tenant_handle` at `serve.rs:1871`, where there is no shared connection to orphan. Banning the names globally would red the boot path. So the census pins **(file, symbol, count)**: those three are listed with the reason they are sound, and a *new* symbol or *one more* touch of a listed one is red. Censusing the file instead would have handed 30k-line `serve.rs` a blanket pass.
 
 ### Two premises corrected before deciding
 
@@ -98,8 +112,27 @@ Green after P1. `checkpoint_actually_swaps_the_live_inode` is the **anti-vacuity
 ## 5. Consequences and accepted risks
 
 - **The snapshot cycle now serializes against writes.** `checkpoint_now` holds the writer mutex across the primitive's EXPORT + IMPORT. This is **not a new class**: the handle's own debounced checkpoint (`WriteGuard::drop`) and `checkpoint_on_idle` already did exactly this. It widens an existing throughput ceiling that ADR-0098 accepted for a single-operator CNC-shop ERP. No deadlock is possible: `aberp-snapshot` does not depend on `aberp-db`, so nothing inside the checkpoint can call back into the handle, and the only other lock in play (`AUDIT_APPEND_LOCK`) is taken strictly *after* the handle mutex by `with_ledger` and never before it — `checkpoint_now` never takes it at all, so no inversion exists.
+
+- **The checkpoint costs O(whole DB), not O(WAL) — and that cost is now paid under the writer mutex.** The primitive is a logical `EXPORT DATABASE` + `IMPORT DATABASE`, so it rewrites *everything*, however small the pending WAL. Measured on this branch (M-series dev box, debug build, audit rows only; one dirty write before each checkpoint so none is a marker no-op):
+
+  | audit rows | live file | `checkpoint_now` |
+  |---|---|---|
+  | 200 | 0.5 MB | 0.29 s |
+  | 2 000 | 0.8 MB | 0.39 s |
+  | 20 000 | 2.9 MB | 1.42 s |
+
+  Writes park for that whole window. At Defense's pilot scale (a single operator, a DB in the low MB) a ~1 s stall once per debounce window is not something an operator can perceive, and the daemon tick is off the request path entirely. It does **not** stay negligible: the cost tracks total DB size, so a tree that grows to hundreds of MB would be stalling writers for seconds every time the post-write debouncer fires. The lever when that day comes is the *cadence* (`min_checkpoint_interval`, the debounce window), not removing the lock — the lock is the fix. A release-build re-measure at real data volume is the trigger to revisit.
+
+  (The PR #41 adversarial measured the same shape with different absolute numbers on its own box — 0.42 s at 200 rows, ~16 s at 20 k. The numbers above are the ones reproducible from this branch; the conclusion, that cost scales with DB size rather than WAL size, is the same either way and is what matters here.)
 - **A daemon tick can now be blocked by a long write, and vice versa.** Both run on blocking threads, never on a runtime worker.
-- **Clean shutdown now WAITS on the writer mutex** (the path-based call did not). Bounded in every non-pathological case — the lock is held for one transaction, or for one in-flight checkpoint, after which ours is a marker no-op. The unbounded case is a daemon permanently wedged inside a `WriteGuard`, i.e. a process whose every write path is already dead and which the 5 s drain has already failed to stop. Accepted, because *not* holding the lock here is exactly what corrupted the mirror. A checkpoint **error** still never wedges exit (S213) — it is logged and swallowed inside the handle.
-- **The fence costs one `stat` per committed write.** It is silent when the identity cannot be read (non-unix, or the file is momentarily absent): a belt that fires on a stat race would be worse than the hazard.
+- **Clean shutdown waits on the writer mutex, but only for 2 s.** The path-based call did not wait at all. An earlier draft of this section — and the call-site comment — claimed the drain guaranteed no `WriteGuard` was alive by then. That is **false**, and the PR #41 adversarial disproved it: `ShutdownCoordinator::shutdown` races each daemon's `JoinHandle` against a shared 5 s budget with `tokio::time::timeout` and, on expiry, **drops** the handle — which *detaches* the tokio task rather than aborting it. A straggler is therefore still running and can still be mid-guard, so an unbounded wait could block process exit indefinitely (the S213 bug). `Handle::checkpoint_now_within` caps it and logs a miss loudly; giving up leaves the live file to the next boot's recovery path, exactly as after any unclean stop.
+- **The fence costs one `stat` per committed write, per ack, and per `read()`.** `read()` is the hot path (once per request handler), so this is the one to watch; a `stat` on a warm dentry is ~1 µs against a DuckDB query, and the alternative is serving pre-restore rows forever. It is silent when the identity cannot be read (non-unix, or the file momentarily absent): a belt that fires on a stat race would be worse than the hazard.
 - **`DbError` gains a variant** (`LiveFileSwapped`). Additive; the one external `match` on `DbError` has a fallback arm.
-- **Portable carries the same defect** on its non-money audit paths (`ABERP.git`). A port is a **follow-up**, not this change.
+
+## 6. Follow-up (NOT closed by this ADR)
+
+1. **The in-process operator restore.** `POST /api/snapshots/restore` → `snapshot_restore_request` → `restore_and_emit` → `aberp_snapshot::restore_into`, which builds `<target>.restoring` and renames it over `target`. Pointed at the live DB — the intended use — that orphans the shared connection exactly as the daemon checkpoint used to, **while `state.db` is open**. Found while enumerating the rename family for CHECK C-A; **pre-existing**, not introduced here, and censused with this reasoning in `tools/adr0111_rename_family_sites.txt`.
+
+   No longer silent: the inode fence detects it on the next commit, skips the mirror sync so the mirror cannot run ahead, fails the money-path ack, and reopens — and the `read` arm stops the UI serving pre-restore rows. The residual is the in-flight write: lost, and now loudly reported. Closing it properly means quiescing the Handle across a restore, which is a design question this PR does not answer — a restore replaces the whole DB **including the audit chain**, so the reopened handle's ledger head, the JSONL mirror and `LedgerMeta` all need reconciling.
+
+2. **Portable (`ABERP.git`) carries the same defect** on its non-money audit paths. The port is its own change.
