@@ -97,3 +97,35 @@ jobs:
         # mention is never counted as a call, because a gate that cries wolf
         # gets switched off. Also asserts a de-gated run ANNOUNCES itself.
         run: bash tools/cut_gate_durable_ack_probes.sh
+
+      - name: ADR-0111 checkpoint-site gate (call-site census, ENFORCED)
+        # The durable checkpoint commits by renaming a new inode over the live
+        # DB and unlinking its WAL. Run on a PATH while the shared Handle is
+        # open, that strands the shared connection on the old inode: later
+        # commits go to a file the kernel frees at exit, while the lockstep
+        # sync_mirror — reading that same connection — durably mirrors them.
+        # Mirror ahead of DB, which boot refuses and the auto-heal replays: the
+        # root behind the recurring audit-chain forks. Two production callers
+        # did exactly that for months.
+        #
+        # crates/aberp-db/tests/checkpoint_swap_orphan.rs proves it is fixed
+        # TODAY (and runs in ci.yml); THIS keeps it fixed, by banning the
+        # path-based primitive outside its two owner files, holding the
+        # Handle::checkpoint_now() census closed in both directions, and
+        # pinning the three lines the mechanism actually rests on — the lock,
+        # the quiesce and the reopen. Enforcement is explicit here as well as
+        # defaulted in the script, so it cannot be silently weakened by a
+        # one-line script edit.
+        env:
+          ENFORCE_CHECKPOINT_SITES: "1"
+        run: bash tools/cut_gate_checkpoint_sites.sh
+
+      - name: Prove the checkpoint-site gate has teeth (negative probes)
+        # Plants each way this defect comes back — the path-based call
+        # restored, the quiesce quietly dropped while every call site still
+        # looks correct, the fence downgraded to a log line, census drift in
+        # both directions — and asserts RED. Pins the non-triggers too: this
+        # gate bans a name that appears in doc comments across the tree and is
+        # a strict prefix of the SANCTIONED wrapper's name, so a matcher that
+        # cannot tell those apart would cry wolf and get switched off.
+        run: bash tools/cut_gate_checkpoint_probes.sh

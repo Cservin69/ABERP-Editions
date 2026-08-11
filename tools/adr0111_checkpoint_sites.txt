@@ -1,0 +1,59 @@
+# ADR-0111 — the FROZEN durable-checkpoint call-site census.
+#
+# Exactly one mechanism folds the live tenant DB's WAL into a fresh file:
+# `aberp_snapshot::durable_checkpoint`, reached via `live_durable_checkpoint`.
+# It commits by `atomic_install` — `rename(staging → db_path)` plus an unlink of
+# `<db>.wal`. That is sound ONLY while the process-wide `aberp_db::Handle`'s
+# shared connection is quiesced, which exactly one caller arranges:
+# `Handle::run_durable_checkpoint_locked` (drop the connection → checkpoint →
+# reopen on the freshly installed inode).
+#
+# Before ADR-0111 two production callers ran the primitive on a PATH, from
+# `spawn_blocking`, holding no lock: the periodic snapshot daemon and the
+# ADR-0095 §3 post-write debouncer. After their rename the shared connection was
+# stranded on the OLD, now-unlinked inode. Every later commit landed in that
+# orphan — freed at process exit — and yet was fully visible to the post-commit
+# `sync_mirror` running on that same connection, which durably appended it to
+# the JSONL mirror. The result is the MIRROR AHEAD OF THE DB: the direction
+# `preserve_ahead_mirror` refuses at boot and Defense's auto-heal
+# (`attempt_db_auto_recovery(mirror_ahead)` → `replay_mirror_delta`) RESURRECTS
+# from — i.e. the root behind the recurring audit-chain fork incidents. It is
+# not a shutdown-only effect: a long-running serve loses every row written after
+# the first daemon tick, silently.
+#
+# `tools/cut_gate_checkpoint_sites.sh` holds this closed in BOTH directions:
+#
+#   * a NEW caller of the path-based `durable_checkpoint` /
+#     `live_durable_checkpoint` outside the two owner files goes red (CHECK
+#     C-A) — that is the regression, and it is a one-line refactor away;
+#   * a censused `Handle::checkpoint_now()` site that LOSES its call goes red,
+#     and an uncensused one that GAINS a call goes red too (CHECK C-C), so the
+#     set of things that checkpoint the live file is a reviewed edit of this
+#     file, never a drive-by;
+#   * the mechanism itself losing its quiesce, its reopen, or the inode fence
+#     goes red (CHECK C-B / C-D) — a `checkpoint_now` that no longer drops and
+#     reopens the connection is the defect with the fix's name on it.
+#
+# Format: <path>\t<function>\t<which of the three checkpoint routes this is>
+# Lines starting with '#' and blank lines are ignored.
+#
+# ALLOW-LISTED owners of the path-based primitive (never censused here):
+#   * crates/aberp-snapshot/**            — it defines and tests the primitive.
+#   * crates/aberp-db/src/lib.rs          — `run_durable_checkpoint_locked` is
+#                                           THE sanctioned caller, under the
+#                                           writer lock, quiesced and reopened.
+#
+# NOT a checkpoint route, deliberately:
+#   * `Handle::checkpoint_on_idle` and the `WriteGuard` drop hook. Both are the
+#     handle's OWN automatic D2 cadence and already run under the lock; they
+#     call `run_durable_checkpoint_locked` directly, not `checkpoint_now`.
+#   * the periodic ADR-0082 *snapshot* (`take_snapshot`) — a logical EXPORT to
+#     the snapshot store. It never renames anything over the live path.
+#
+# NON-REENTRANCY (read before adding a site). `checkpoint_now` takes the
+# handle's writer mutex, and `std::sync::Mutex` is not reentrant: calling it
+# while a `WriteGuard` is alive self-deadlocks the calling thread. Every site
+# below is outside any guard scope. A new site must state where its guards end.
+
+apps/aberp/src/snapshot.rs	live_checkpoint_logged	daemon cadence + ADR-0095 §3 post-write debouncer (both callers route through this one wrapper)
+apps/aberp/src/snapshot.rs	checkpoint_on_clean_shutdown	clean-shutdown fold, called from serve.rs after the drain
