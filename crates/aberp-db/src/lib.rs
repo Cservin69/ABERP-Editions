@@ -155,6 +155,52 @@ pub enum DbError {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    /// ADR-0111 — the live DB file at [`Handle::db_path`] is **no longer the
+    /// file this handle's connection is writing to**: something renamed a new
+    /// inode over the path while the handle was open, so the shared connection
+    /// is stranded on the old, unlinked one.
+    ///
+    /// Parked as the money path's ack outcome when the [`WriteGuard`] inode
+    /// fence trips (see [`WriteGuard::drop`]). The just-committed rows went
+    /// into a file the kernel will free at process exit — nothing can make them
+    /// durable, so the ack must FAIL rather than certify them (ADR-0110 R3 /
+    /// CLAUDE.md rule 11).
+    ///
+    /// In-process this is unreachable after ADR-0111: every checkpoint goes
+    /// through [`Handle::checkpoint_now`], which quiesces and reopens under the
+    /// lock. It stays as the belt for an OUT-OF-PROCESS swapper (a second
+    /// `aberp` invocation, an operator restore, a backup tool) — the one case
+    /// no in-process discipline can prevent.
+    #[error(
+        "aberp-db: the live DB file at {path} was swapped out from under the open handle \
+         (inode changed); writes since the swap went to an orphaned file and are LOST"
+    )]
+    LiveFileSwapped { path: PathBuf },
+}
+
+/// Identity of the file currently at `path`: `(st_dev, st_ino)` on unix.
+///
+/// `atomic_install` commits by `rename(2)`, which installs a **different**
+/// inode at the same path — so a change here is exactly "the live file was
+/// swapped", and any fd opened before it now refers to an unlinked file.
+///
+/// `None` means "cannot tell": a missing file (mid-swap, or a DB not created
+/// yet) and every non-unix target. The fence treats `None` as "no evidence of a
+/// swap" and stays quiet — it is a belt, and a belt that fires on a stat race
+/// would be worse than the hazard. On Windows there is no cheap stable
+/// equivalent (`nFileIndex` needs an open handle), which is the same reason
+/// `fsync_and_record_dir` no-ops there.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_path: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// Tunables for a [`Handle`]. [`HandleConfig::default`] is the ADR-0098 D2
@@ -201,6 +247,15 @@ struct Inner {
     /// it. `None` means "no write has completed since the last claim" — see
     /// [`Handle::durable_ack`] for what that falls back to.
     last_ack: Option<Result<(), DbError>>,
+    /// ADR-0111 inode fence — the `(st_dev, st_ino)` of the live file as it was
+    /// when [`Inner::conn`] was opened onto it.
+    ///
+    /// Re-captured at EVERY open (boot, `ensure_open`, the post-checkpoint
+    /// reopen) and compared in [`WriteGuard::drop`]. A mismatch means the path
+    /// now names a different inode than the connection holds — the swap-orphan
+    /// state. `None` when the identity could not be read (non-unix, or the file
+    /// is momentarily absent); the fence then stays silent.
+    fence: Option<(u64, u64)>,
 }
 
 /// The process-wide shared DuckDB handle (ADR-0098 Gap 1a). Construct once at
@@ -306,6 +361,9 @@ impl Handle {
                 conn: Some(conn),
                 debouncer: CheckpointDebouncer::new(min_interval),
                 last_ack: None,
+                // ADR-0111: captured AFTER the open, so it names the inode this
+                // connection actually holds.
+                fence: file_id(db_path),
             }),
         }))
     }
@@ -638,10 +696,83 @@ impl Handle {
         }
     }
 
+    /// ADR-0111 — take ONE validated durable checkpoint of the live file
+    /// **now**, under the writer lock, quiescing and reopening the shared
+    /// connection around the swap. **The only sanctioned way for a runtime
+    /// caller to checkpoint the live DB.**
+    ///
+    /// # Why this exists (the mirror-ahead defect)
+    ///
+    /// [`aberp_snapshot::durable_checkpoint`] finishes with `atomic_install`:
+    /// `rename(staging → db_path)` and then it DELETES `<db>.wal`. That is
+    /// sound only while the shared connection is quiesced, which is exactly
+    /// what [`Self::run_durable_checkpoint_locked`] arranges.
+    ///
+    /// Two production callers ran that primitive on a PATH from
+    /// `spawn_blocking`, holding no lock at all — the periodic snapshot daemon
+    /// and the ADR-0095 §3 post-write debouncer. After their rename the shared
+    /// connection still held an fd on the OLD, now-unlinked inode. Every
+    /// subsequent commit landed in that orphan (freed at process exit) — yet it
+    /// was fully visible to the post-commit `sync_mirror` running on that same
+    /// connection, so those rows were durably appended to the JSONL mirror. The
+    /// mirror ends up **AHEAD of the DB**: the one direction the design calls
+    /// unrecoverable, the direction Defense's boot auto-heal RESURRECTS from,
+    /// and the root behind the recurring audit-chain fork incidents. It is not
+    /// a shutdown-only effect: a long session loses every row written after the
+    /// first daemon checkpoint.
+    ///
+    /// # Deliberately UNCONDITIONAL
+    ///
+    /// Unlike [`Self::checkpoint_on_idle`] and the [`WriteGuard`] drop hook,
+    /// this ignores BOTH the D2 coalescing window (`should_checkpoint_now`) and
+    /// [`HandleConfig::checkpoint_enabled`]. Those two gate the handle's own
+    /// AUTOMATIC cadence; this method is an explicit caller demand — the
+    /// daemon tick, the post-write debounce, the clean-shutdown fold — and each
+    /// of those callers already owns its own cadence and env kill-switch. A
+    /// silently-skipped checkpoint here would put us straight back to "nothing
+    /// folds the live file on a path a crash traverses" (ADR-0095 root #2).
+    /// The underlying [`aberp_snapshot::live_durable_checkpoint`] is still a
+    /// cheap no-op when a verified-good marker already covers the file, so
+    /// calling this often is inexpensive, not a disk thrash.
+    ///
+    /// # NOT REENTRANT
+    ///
+    /// This takes the writer mutex. Calling it while a [`WriteGuard`] is alive
+    /// **self-deadlocks** — `std::sync::Mutex` is not reentrant. Every call
+    /// site must be outside any guard scope. (The three runtime callers are:
+    /// the snapshot daemon *after* its cycle returns, the post-write debouncer
+    /// on its own blocking task, and the clean-shutdown hook after the drain.)
+    ///
+    /// Best-effort by contract, like every other post-commit hook here:
+    /// `run_durable_checkpoint_locked` logs a failure LOUD (`tracing::error!`,
+    /// CLAUDE.md rule 12) and swallows it, so a checkpoint hiccup can never
+    /// wedge a daemon tick or process exit — which is why this returns `()`
+    /// rather than a `Result` the callers would only be able to log.
+    pub fn checkpoint_now(&self) {
+        // Same poison-recovery path as write()/read()/checkpoint_on_idle: a
+        // poisoned mutex must never SILENTLY drop the checkpoint (finding F).
+        let mut inner = match self.lock_recovering() {
+            Ok(inner) => inner,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    db = %self.db_path.display(),
+                    "aberp-db: explicit checkpoint skipped — writer poison-recovery returned a HARD error (integrity re-verify failed)"
+                );
+                return;
+            }
+        };
+        self.run_durable_checkpoint_locked(&mut inner);
+    }
+
     /// (Re)open the shared connection if it is not currently present.
     fn ensure_open(&self, inner: &mut Inner) -> Result<(), DbError> {
         if inner.conn.is_none() {
             inner.conn = Some(open_runtime_connection(&self.db_path, &self.config)?);
+            // ADR-0111: the fence names the inode the CURRENT connection holds,
+            // so it is re-captured with every open — otherwise the first write
+            // after any legitimate reopen would trip it.
+            inner.fence = file_id(&self.db_path);
         }
         Ok(())
     }
@@ -836,6 +967,14 @@ impl Handle {
         // 3. Reopen on the (possibly newly-installed) inode. If this fails,
         //    leave `conn = None`; the next `write()`/`read()` retries via
         //    `ensure_open` and surfaces the error to that caller.
+        //
+        //    ADR-0111: re-arm the inode fence on the file we just installed. Our
+        //    OWN checkpoint legitimately changes the live inode, so without this
+        //    the very next `WriteGuard::drop` would report our own swap as a
+        //    hostile one. Re-armed BEFORE the match so it is correct on both
+        //    arms; if the reopen failed, `ensure_open` re-captures it on the
+        //    retry that actually establishes a connection.
+        inner.fence = file_id(&self.db_path);
         match open_runtime_connection(&self.db_path, &self.config) {
             Ok(c) => inner.conn = Some(c),
             Err(e) => tracing::error!(
@@ -972,6 +1111,55 @@ impl std::ops::DerefMut for WriteGuard<'_> {
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
         let handle = self.handle;
+
+        // ADR-0111 INODE FENCE — before anything else, prove the file we are
+        // about to certify is still the file we just wrote to.
+        //
+        // `atomic_install` commits a checkpoint by `rename`-ing a NEW inode over
+        // `db_path` and unlinking `<db>.wal`. Done under this mutex with a
+        // quiesce+reopen (`checkpoint_now`) that is sound. Done by anyone else
+        // while this handle is open, it strands the shared connection on the old
+        // inode — and then both hooks below actively make things WORSE:
+        //
+        //   * `fsync_data_paths` opens BY PATH, so it would flush the brand-new
+        //     inode and record it in the durability journal — certifying bytes
+        //     that have nothing to do with this commit (the D3 by-path residual);
+        //   * `sync_mirror` reads the ORPHANED connection, so it would durably
+        //     append rows the live file does not contain — mirror ahead of DB,
+        //     the direction that forks the chain on the next boot auto-heal.
+        //
+        // So on a mismatch we do NEITHER, park a hard failure for the money
+        // path's `durable_ack` to claim, and drop the stranded connection so the
+        // next `write()`/`read()` reopens on the live inode via `ensure_open`.
+        // The mirror is left BEHIND — benign and self-healing, which is the
+        // whole point of choosing this direction.
+        //
+        // In-process this is unreachable after ADR-0111 (all three checkpoint
+        // sites route through `checkpoint_now`, which re-arms the fence). It is
+        // the belt for an out-of-process swapper, and the loud proof that the
+        // census gate has not been quietly defeated.
+        let live_now = file_id(&handle.db_path);
+        if let (Some(opened_on), Some(now)) = (self.inner.fence, live_now) {
+            if opened_on != now {
+                tracing::error!(
+                    db = %handle.db_path.display(),
+                    opened_on = ?opened_on,
+                    live_now = ?now,
+                    "aberp-db: LIVE DB FILE SWAPPED under the open handle (inode changed). \
+                     The commit that just finished went to an ORPHANED file and is LOST. \
+                     SKIPPING the data fsync and the mirror sync so the mirror cannot end \
+                     up ahead of the DB; reopening on the live file. If this fires, some \
+                     writer is taking a durable checkpoint outside Handle::checkpoint_now \
+                     (ADR-0111) or another process is rewriting the tenant DB"
+                );
+                self.inner.last_ack = Some(Err(DbError::LiveFileSwapped {
+                    path: handle.db_path.clone(),
+                }));
+                self.inner.conn = None;
+                self.inner.fence = None;
+                return;
+            }
+        }
 
         // D3 B2 — DATA BEFORE THE RECORD THAT POINTS TO IT.
         //

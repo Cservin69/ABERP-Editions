@@ -67,11 +67,21 @@ pub const CHECKPOINT_ON_SHUTDOWN_DISABLE_ENV: &str = "ABERP_CHECKPOINT_ON_SHUTDO
 /// swap and the next boot needs no in-place `LoadCheckpoint`/`ReadIndex`
 /// replay (the path that historically tripped `duckdb#23046`, S332/S375).
 ///
+/// **ADR-0111** — the checkpoint is taken through the shared
+/// [`aberp_db::Handle`], never on a bare path. Even at shutdown the handle is
+/// still open (it lives in `recovery_state.db`), so a path-based
+/// `durable_checkpoint` here would `rename` the live file out from under the
+/// shared connection and unlink its WAL. That is the same orphaning the daemon
+/// paths suffered; it also re-creates the ADR-0098 two-instance hazard, because
+/// the primitive's own `Connection::open` would be a SECOND live opener beside
+/// the handle's.
+///
 /// Best-effort by contract: every failure is logged LOUD (CLAUDE.md #12)
 /// and swallowed — a checkpoint hiccup must NEVER wedge process exit (that
 /// was the original S213 bug). Editions-tree ONLY; it refuses to act on a
 /// prod path as defense-in-depth behind the compile-time edition binding.
-pub fn checkpoint_on_clean_shutdown(db_path: &Path, tenant: &str) {
+pub fn checkpoint_on_clean_shutdown(db: &HandleArc) {
+    let db_path = db.db_path();
     let disabled = std::env::var(CHECKPOINT_ON_SHUTDOWN_DISABLE_ENV)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -82,8 +92,9 @@ pub fn checkpoint_on_clean_shutdown(db_path: &Path, tenant: &str) {
         );
         return;
     }
-    // Never checkpoint a prod path (impossible in an editions build, but the
-    // guard makes "never touches prod" mechanical here too).
+    // Never checkpoint a prod path (impossible in an editions build — and
+    // `Handle::open` already refuses one — but the guard keeps "never touches
+    // prod" mechanical at this site too).
     if let Err(e) = ensure_not_prod_path(db_path) {
         tracing::error!(
             error = %e,
@@ -102,20 +113,27 @@ pub fn checkpoint_on_clean_shutdown(db_path: &Path, tenant: &str) {
         );
         return;
     }
-    match aberp_snapshot::durable_checkpoint(db_path, tenant) {
-        Ok(rep) => tracing::info!(
-            db = %db_path.display(),
-            sha = %rep.sha256,
-            bytes = rep.byte_size,
-            "clean shutdown: crash-safe durable checkpoint installed (ADR-0082 chunk 3)"
-        ),
-        Err(e) => tracing::error!(
-            db = %db_path.display(),
-            error = %e,
-            "clean-shutdown durable checkpoint FAILED; live DB left untouched, periodic \
-             snapshots remain the recovery path (process exit continues)"
-        ),
-    }
+    // Under the writer lock, with the shared connection quiesced and reopened
+    // around the swap. Logs its own success/failure (the report's sha/bytes move
+    // into aberp-db's log line); failures are loud and swallowed there, so a
+    // checkpoint ERROR never wedges exit (the original S213 bug).
+    //
+    // ACCEPTED RISK (ADR-0111 §5) — this now WAITS on the writer mutex, which
+    // the path-based call did not. The wait is bounded in every non-pathological
+    // case: the lock is held only for the length of one transaction, or for one
+    // in-flight checkpoint (and if that one just completed, ours is a marker
+    // no-op). The unbounded case is a daemon permanently wedged inside a
+    // `WriteGuard` — a process in which every write path is already dead, and
+    // which the drain above has already failed to stop. Taken over the
+    // alternative, because NOT holding the lock here is what corrupted the
+    // mirror: the handle is still open at this point (it lives in
+    // `recovery_state.db`), so a path-based swap strands its connection and the
+    // primitive's own `Connection::open` is a second live opener (ADR-0098 1a).
+    db.checkpoint_now();
+    tracing::info!(
+        db = %db_path.display(),
+        "clean shutdown: crash-safe durable checkpoint taken under the shared handle (ADR-0082 chunk 3 / ADR-0111)"
+    );
 }
 
 /// ADR-0095 §3 — take ONE durable checkpoint of the LIVE file off the request
@@ -125,31 +143,34 @@ pub fn checkpoint_on_clean_shutdown(db_path: &Path, tenant: &str) {
 /// "nothing checkpoints the live file on a path a crash traverses" gap
 /// (ADR-0095 root cause #2).
 ///
+/// # ADR-0111 — why this takes a handle, not a path
+///
+/// This used to call [`aberp_snapshot::live_durable_checkpoint`] on a bare
+/// path, from a `spawn_blocking` task, holding no lock. That primitive ends in
+/// `atomic_install`: `rename(staging → db)` plus an unlink of `<db>.wal`. The
+/// shared connection was left holding an fd on the OLD inode, so every commit
+/// after a daemon tick landed in an unlinked file the kernel freed at exit —
+/// while the post-commit `sync_mirror`, reading that same connection, durably
+/// wrote those rows into the JSONL mirror. **Mirror ahead of DB**: the
+/// direction `preserve_ahead_mirror` refuses and Defense's boot auto-heal
+/// replays, i.e. the root behind the recurring audit-chain forks.
+/// [`aberp_db::Handle::checkpoint_now`] takes the writer mutex, quiesces the
+/// shared connection so the checkpoint is the sole opener, and reopens on the
+/// freshly installed inode. Pinned by
+/// `crates/aberp-db/tests/checkpoint_swap_orphan.rs`.
+///
 /// Best-effort by contract (mirrors [`checkpoint_on_clean_shutdown`]): a no-op
 /// when a verified-good checkpoint already covers the file (cheap, via
-/// [`aberp_snapshot::live_durable_checkpoint`] → `checkpoint_is_current`);
-/// every failure is logged LOUD (CLAUDE.md #12) and swallowed so a checkpoint
-/// hiccup never takes down `aberp serve`. Editions-tree ONLY — the wrapped
-/// primitive refuses a prod path as defense in depth.
-pub fn live_checkpoint_logged(db_path: &Path, tenant: &str) {
-    match aberp_snapshot::live_durable_checkpoint(db_path, tenant) {
-        Ok(Some(rep)) => tracing::info!(
-            db = %db_path.display(),
-            sha = %rep.sha256,
-            bytes = rep.byte_size,
-            "live-path crash-safe durable checkpoint installed (ADR-0095 §3)"
-        ),
-        Ok(None) => tracing::debug!(
-            db = %db_path.display(),
-            "live-path checkpoint skipped — a verified-good checkpoint already covers the DB"
-        ),
-        Err(e) => tracing::error!(
-            db = %db_path.display(),
-            error = %e,
-            "live-path durable checkpoint FAILED; live DB left untouched, periodic \
-             snapshots remain the recovery path (serve continues)"
-        ),
-    }
+/// [`aberp_snapshot::live_durable_checkpoint`] → `checkpoint_is_current`, which
+/// the handle still calls underneath); every failure is logged LOUD
+/// (CLAUDE.md #12) inside the handle and swallowed, so a checkpoint hiccup
+/// never takes down `aberp serve`. Editions-tree ONLY — the wrapped primitive
+/// refuses a prod path as defense in depth, and `Handle::open` already did.
+///
+/// **Never call this while a `WriteGuard` is alive** — the writer mutex is not
+/// reentrant. Both callers run it after their write work has fully returned.
+pub fn live_checkpoint_logged(db: &HandleArc) {
+    db.checkpoint_now();
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -667,7 +688,19 @@ pub async fn run_supervised(deps: SnapshotDaemonDeps, cancel: CancellationToken)
             // cadence so a recent verified-good live file always exists, even
             // if the process never reaches a clean shutdown. No-op when
             // `checkpoint_is_current`; logged-but-survives like the cycle.
-            live_checkpoint_logged(&db, tenant.as_str());
+            //
+            // ADR-0111 — routed through the SHARED handle (`deps.db`), not the
+            // path. The path form renamed the live file out from under the
+            // shared connection and unlinked its WAL, orphaning every commit
+            // made after this tick into a freed inode while the lockstep
+            // `sync_mirror` still recorded them — mirror ahead of DB.
+            //
+            // Ordering matters and is deliberate: `run_cycle` has FULLY
+            // returned here, so its audit `WriteGuard`s are dropped and the
+            // writer mutex is free. `checkpoint_now` takes that mutex and the
+            // mutex is NOT reentrant — calling it inside a guard would
+            // self-deadlock this daemon thread.
+            live_checkpoint_logged(&handle);
             rec
         })
         .await;

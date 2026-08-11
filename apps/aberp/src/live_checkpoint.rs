@@ -21,11 +21,29 @@
 //! coordinator is a process-global [`OnceLock`]: the issue/storno/modification
 //! handlers can [`trigger`] without threading a handle through `AppState`, and
 //! a CLI process that never installs it sees [`trigger`] as a no-op.
+//!
+//! # ADR-0111 — the checkpoint runs through the shared handle
+//!
+//! This debouncer used to hold a `db_path` + `tenant` and take the checkpoint
+//! on that PATH from its blocking task, holding no lock. The primitive it
+//! called ends in `atomic_install` — `rename(staging → db)` plus an unlink of
+//! `<db>.wal` — so the process-wide `aberp_db::Handle`'s connection was left on
+//! the OLD, now-unlinked inode. Every commit after the first debounce fire
+//! landed in that orphan (freed at process exit) and yet was visible to the
+//! post-commit `sync_mirror` on that same connection, which durably appended it
+//! to the JSONL mirror: **mirror ahead of DB**, the direction boot refuses and
+//! Defense's auto-heal replays. It now holds the [`HandleArc`] and calls
+//! [`aberp_db::Handle::checkpoint_now`], which takes the writer mutex, quiesces
+//! the shared connection and reopens on the newly installed inode.
+//!
+//! Holding the handle rather than a path also removes a whole class of drift:
+//! the debouncer can no longer be pointed at a different file than the one the
+//! process actually writes through.
 
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use aberp_db::HandleArc;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -44,17 +62,19 @@ static GLOBAL: OnceLock<Arc<PostWriteCheckpoint>> = OnceLock::new();
 
 /// Debounced post-write durable-checkpoint coordinator (ADR-0095 §3).
 pub struct PostWriteCheckpoint {
-    db_path: PathBuf,
-    tenant: String,
+    /// ADR-0111 — the ONE shared handle. Replaces the `db_path` + `tenant`
+    /// pair this held before: the checkpoint must be taken under the handle's
+    /// writer lock, and the handle already knows both (`db_path()` for logging,
+    /// its own tenant for the validated checkpoint).
+    db: HandleArc,
     debounce: Duration,
     notify: Notify,
 }
 
 impl PostWriteCheckpoint {
-    fn new(db_path: PathBuf, tenant: String, debounce: Duration) -> Arc<Self> {
+    fn new(db: HandleArc, debounce: Duration) -> Arc<Self> {
         Arc::new(Self {
-            db_path,
-            tenant,
+            db,
             debounce,
             notify: Notify::new(),
         })
@@ -73,7 +93,7 @@ impl PostWriteCheckpoint {
     /// token). A no-op when `checkpoint_is_current`, so it never thrashes disk.
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) {
         tracing::info!(
-            db = %self.db_path.display(),
+            db = %self.db.db_path().display(),
             debounce_secs = self.debounce.as_secs(),
             "post-write durable-checkpoint debouncer started (ADR-0095 §3)"
         );
@@ -87,13 +107,14 @@ impl PostWriteCheckpoint {
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(self.debounce) => {}
             }
-            let db = self.db_path.clone();
-            let tenant = self.tenant.clone();
+            let db = self.db.clone();
             // DuckDB EXPORT/IMPORT is blocking — run off the async runtime.
-            let outcome = tokio::task::spawn_blocking(move || {
-                crate::snapshot::live_checkpoint_logged(&db, &tenant)
-            })
-            .await;
+            // ADR-0111: `checkpoint_now` also PARKS on the handle's writer
+            // mutex for the whole EXPORT+IMPORT, which is another reason this
+            // must stay on a blocking thread and never on a runtime worker.
+            let outcome =
+                tokio::task::spawn_blocking(move || crate::snapshot::live_checkpoint_logged(&db))
+                    .await;
             if let Err(join) = outcome {
                 tracing::error!(
                     error = %join,
@@ -123,7 +144,11 @@ fn debounce_from_env() -> Duration {
 /// Install the process-global coordinator for this serve process's tenant DB
 /// and return the handle so the caller can spawn its [`PostWriteCheckpoint::run`]
 /// loop. Returns `None` when disabled by env or already installed (idempotent).
-pub fn install(db_path: PathBuf, tenant: String) -> Option<Arc<PostWriteCheckpoint>> {
+///
+/// ADR-0111 — takes the shared [`HandleArc`] (`recovery_state.db`) rather than
+/// a path + tenant, so the debouncer physically cannot checkpoint anything but
+/// the file the process writes through, and can only do it under the lock.
+pub fn install(db: HandleArc) -> Option<Arc<PostWriteCheckpoint>> {
     if is_disabled() {
         tracing::info!(
             env = POST_WRITE_CHECKPOINT_DISABLE_ENV,
@@ -131,7 +156,7 @@ pub fn install(db_path: PathBuf, tenant: String) -> Option<Arc<PostWriteCheckpoi
         );
         return None;
     }
-    let coordinator = PostWriteCheckpoint::new(db_path, tenant, debounce_from_env());
+    let coordinator = PostWriteCheckpoint::new(db, debounce_from_env());
     match GLOBAL.set(coordinator.clone()) {
         Ok(()) => Some(coordinator),
         Err(_) => None,
