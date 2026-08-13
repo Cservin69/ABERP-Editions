@@ -779,11 +779,28 @@ fn entry_in_window(entry: &Entry, window: DateWindow) -> bool {
 struct OutgoingLineGroup {
     invoice_id: String,
     currency: String,
-    /// The invoice's ISSUE date — the DSO anchor. Deliberately NOT the
-    /// basis/teljesites column (`COALESCE(delivery_date, issue_date)`):
-    /// anchoring days-sales-outstanding on fulfillment makes a prepayment
-    /// (paid before fulfillment) come out NEGATIVE. Credit-to-cash runs
-    /// from the invoice being issued.
+    /// The invoice's ISSUE date, normalised to `YYYY-MM-DD` — the DSO
+    /// anchor. Deliberately NOT the basis/teljesites column
+    /// (`COALESCE(delivery_date, issue_date)`): anchoring
+    /// days-sales-outstanding on fulfillment makes a prepayment (paid
+    /// before fulfillment) come out NEGATIVE. Credit-to-cash runs from
+    /// the invoice being issued.
+    ///
+    /// Projected as `SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10)`, which
+    /// is load-bearing in three ways:
+    ///   * `invoice.issue_date` is a **VARCHAR holding RFC3339** in
+    ///     production (`duckdb_store.rs` writes
+    ///     `draft.issue_date.format(&Rfc3339)` into a `VARCHAR NOT NULL`
+    ///     column), e.g. `2026-06-15T12:00:00Z`. [`parse_iso_date`] only
+    ///     accepts `[year]-[month]-[day]`, so an unsliced value would
+    ///     fail to parse and EVERY DSO sample would be silently dropped
+    ///     at the `if let (Ok, Ok)` guard below — the tile would render
+    ///     `— (n=0)`. The `SUBSTR` truncates the time component away.
+    ///   * a date-only VARCHAR (`2026-06-15`) passes through unchanged.
+    ///   * the `CAST` tolerates a legacy pre-PR-73 **DATE**-typed column:
+    ///     without it, `row.get::<String>` on a DATE returns
+    ///     `InvalidColumnType`, and the `?` would fail the WHOLE
+    ///     financial report, not merely DSO.
     issue_date: String,
     payment_deadline: Option<String>,
     vat_rate_basis_points: i32,
@@ -847,14 +864,14 @@ fn query_outgoing_groups(
         "SELECT i.id,
                 COALESCE(i.currency, 'HUF') AS currency,
                 {date_col} AS basis_date,
-                i.issue_date AS issue_date,
+                SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10) AS issue_date,
                 CAST(i.payment_deadline AS VARCHAR) AS payment_deadline,
                 il.vat_rate_basis_points,
                 CAST(SUM(CAST(il.quantity AS DECIMAL(38,6)) * il.unit_price) AS VARCHAR) AS net_decimal
            FROM invoice i
            JOIN invoice_line il ON i.id = il.invoice_id
           {where_clause}
-          GROUP BY i.id, currency, basis_date, issue_date, payment_deadline,
+          GROUP BY i.id, currency, basis_date, SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10), payment_deadline,
                    il.vat_rate_basis_points",
     );
     let mut stmt = conn
@@ -2283,12 +2300,18 @@ mod tests {
                  quantity DECIMAL(18,6),
                  unit_price BIGINT
              );
+             -- PRODUCTION-SHAPED issue_date: a VARCHAR holding RFC3339,
+             -- exactly what duckdb_store.rs writes
+             -- (`draft.issue_date.format(&Rfc3339)`). Seeding date-only
+             -- here would be unfaithful to the write path and would let
+             -- an anchor that cannot tolerate a time component pass.
+             --
              -- Prepayment: fulfilled 2026-06-25, but issued 2026-06-10
              -- and paid 2026-06-15 — five days after ISSUE, ten days
              -- BEFORE fulfillment.
              INSERT INTO invoice VALUES
-               ('inv-prepay',   'HUF', '2026-06-10', DATE '2026-06-25', DATE '2026-07-10'),
-               ('inv-ordinary', 'HUF', '2026-06-01', NULL,              DATE '2026-07-01');
+               ('inv-prepay',   'HUF', '2026-06-10T09:00:00Z', DATE '2026-06-25', DATE '2026-07-10'),
+               ('inv-ordinary', 'HUF', '2026-06-01T17:45:31Z', NULL,              DATE '2026-07-01');
              INSERT INTO invoice_line VALUES
                ('inv-prepay',   2700, 1.0, 100000),
                ('inv-ordinary', 2700, 1.0, 100000);",
@@ -2302,6 +2325,22 @@ mod tests {
         let groups =
             query_outgoing_groups(&conn, window, DateBasis::Teljesites).expect("outgoing groups");
         assert_eq!(groups.len(), 2, "both invoices fall in the window");
+        // The anchor must arrive NORMALISED — an RFC3339 time component
+        // would make `parse_iso_date` reject it and silently drop every
+        // DSO sample (tile renders "— (n=0)").
+        for g in &groups {
+            assert_eq!(
+                g.issue_date.len(),
+                10,
+                "issue_date must be normalised to YYYY-MM-DD, got `{}`",
+                g.issue_date
+            );
+            assert!(
+                parse_iso_date(&g.issue_date).is_ok(),
+                "the DSO anchor must be parseable by parse_iso_date, got `{}`",
+                g.issue_date
+            );
+        }
 
         let entries = vec![
             pin_ack("inv-prepay", "SAVED"),
@@ -2326,5 +2365,136 @@ mod tests {
              2026-06-25 fulfillment date); ordinary = 2026-06-21 − 2026-06-01 = 20d"
         );
         assert_eq!(mean(&agg.dso_huf_samples).unwrap(), 12.5);
+    }
+
+    /// PIN (c2) — the anchor projection is TYPE-tolerant. Against a
+    /// legacy pre-PR-73 DATE-typed `invoice.issue_date`, reading the
+    /// column bare as a `String` returns `InvalidColumnType`; in
+    /// `row_to_outgoing` that `?` would fail the WHOLE financial report,
+    /// not merely DSO. The `CAST(... AS VARCHAR)` in the projection is
+    /// what prevents that, and this pin holds both halves: bare read
+    /// FAILS, projected read SUCCEEDS and normalises.
+    ///
+    /// Scope note: this pins the PROJECTION, not the whole query. A
+    /// DATE-typed `issue_date` still cannot be served end-to-end,
+    /// because the pre-existing basis column
+    /// (`COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date)`,
+    /// see [`date_col_sql_invoice`]) binder-errors on mixed
+    /// VARCHAR/DATE before this projection is ever reached. That is
+    /// out of scope here — the basis/window path is deliberately
+    /// untouched by the DSO fix — and is flagged, not fixed.
+    #[test]
+    fn dso_anchor_projection_tolerates_a_legacy_date_typed_column() {
+        let conn = Connection::open_in_memory().expect("in-memory duckdb");
+        conn.execute_batch(
+            "CREATE TABLE invoice (id VARCHAR, issue_date DATE);
+             INSERT INTO invoice VALUES ('inv-legacy', DATE '2026-06-05');",
+        )
+        .expect("seed legacy DATE-typed invoice");
+
+        // Bare read of a DATE column as String — the crash the CAST averts.
+        let bare: duckdb::Result<String> = conn
+            .prepare("SELECT i.issue_date FROM invoice i")
+            .unwrap()
+            .query_row([], |r| r.get(0));
+        assert!(
+            bare.is_err(),
+            "a bare DATE column read as String must fail — this is the \
+             InvalidColumnType that would error the whole report"
+        );
+
+        // The projection the DSO anchor actually uses.
+        let projected: String = conn
+            .prepare("SELECT SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10) FROM invoice i")
+            .unwrap()
+            .query_row([], |r| r.get(0))
+            .expect("the CAST+SUBSTR projection must read a DATE column as a String");
+        assert_eq!(projected, "2026-06-05");
+        assert!(parse_iso_date(&projected).is_ok());
+    }
+
+    /// PIN (d) — EXHAUSTIVE storno-child coverage. The base leaves AR if
+    /// and only if its storno child classifies as `Counted`. This walks
+    /// every [`CountedKind`] a storno child can reach, including the
+    /// `Abandoned` and `Unknown` states the three headline pins don't
+    /// touch, and asserts revenue and AR stay coherent in each.
+    #[test]
+    fn base_leaves_ar_iff_storno_child_is_counted_across_all_child_states() {
+        let today = Date::from_calendar_date(2026, Month::June, 1).unwrap();
+        // (label, child's audit entries, child lands?)
+        let cases: Vec<(&str, Vec<Entry>, bool)> = vec![
+            (
+                "SAVED ack → Counted",
+                vec![pin_ack("inv-storno", "SAVED")],
+                true,
+            ),
+            (
+                "submission response, no ack → Counted",
+                vec![pin_entry(
+                    EventKind::InvoiceSubmissionResponse,
+                    serde_json::json!({
+                        "invoice_id": "inv-storno",
+                        "idempotency_key": "idem",
+                        "transaction_id": "tx",
+                        "response_xml": [],
+                    }),
+                )],
+                true,
+            ),
+            (
+                "ABORTED ack → Rejected",
+                vec![pin_ack("inv-storno", "ABORTED")],
+                false,
+            ),
+            (
+                "draft only → PendingDraft",
+                vec![pin_draft("inv-storno")],
+                false,
+            ),
+            (
+                "marked abandoned → Abandoned",
+                vec![pin_entry(
+                    EventKind::InvoiceMarkedAbandoned,
+                    serde_json::json!({ "invoice_id": "inv-storno" }),
+                )],
+                false,
+            ),
+            ("no entries at all → Unknown", vec![], false),
+        ];
+
+        for (label, child_entries, lands) in cases {
+            let mut entries = vec![
+                pin_ack("inv-base", "SAVED"),
+                pin_storno_link("inv-base", "inv-storno"),
+            ];
+            entries.extend(child_entries);
+            let walk = walk_entries(&entries, DateWindow::unbounded());
+            assert_eq!(
+                walk.traces["inv-base"].has_landed_storno, lands,
+                "{label}: has_landed_storno must track whether the child COUNTS"
+            );
+
+            let groups = vec![
+                pin_group("inv-base", "2026-05-01", "2026-06-15", 100_000),
+                pin_group("inv-storno", "2026-05-02", "2026-06-15", 100_000),
+            ];
+            let agg = aggregate_outgoing(groups, &walk.traces, today, &HashMap::new());
+
+            let (want_revenue, want_ar) = if lands {
+                // The pair nets in revenue; nothing is owed.
+                (0, 0)
+            } else {
+                // The storno never counted: the base stands, in BOTH.
+                (127_000, 127_000)
+            };
+            assert_eq!(
+                agg.revenue.huf.gross_minor, want_revenue,
+                "{label}: revenue"
+            );
+            assert_eq!(
+                agg.receivables.huf.gross_minor, want_ar,
+                "{label}: receivables must stay coherent with revenue"
+            );
+        }
     }
 }
