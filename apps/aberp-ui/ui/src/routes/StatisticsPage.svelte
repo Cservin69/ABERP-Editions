@@ -433,20 +433,23 @@
 
       <article class="stats__card">
         <h3>Cash-flow forward (gross of receivables due)</h3>
+        <p class="muted">
+          (cumulative — each band includes the shorter ones, so 90d ⊇ 60d ⊇ 30d)
+        </p>
         <p class="stats__row">
-          <span>Next 30d</span>
+          <span>Within 30d</span>
           <span class="num">
             HUF {formatHuf(r.cashflow_forward.next_30.huf_minor)} · EUR {formatMinor(r.cashflow_forward.next_30.eur_minor, "EUR")}
           </span>
         </p>
         <p class="stats__row">
-          <span>Next 60d</span>
+          <span>Within 60d</span>
           <span class="num">
             HUF {formatHuf(r.cashflow_forward.next_60.huf_minor)} · EUR {formatMinor(r.cashflow_forward.next_60.eur_minor, "EUR")}
           </span>
         </p>
         <p class="stats__row">
-          <span>Next 90d</span>
+          <span>Within 90d</span>
           <span class="num">
             HUF {formatHuf(r.cashflow_forward.next_90.huf_minor)} · EUR {formatMinor(r.cashflow_forward.next_90.eur_minor, "EUR")}
           </span>
