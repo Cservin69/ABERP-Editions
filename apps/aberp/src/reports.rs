@@ -828,10 +828,15 @@ struct RestoredRow {
     partner_id: Option<String>,
 }
 
+/// The `basis_date` projection for the outgoing query. Shares
+/// [`WINDOW_DATE_EXPR`] on the teljesites basis — same expression, so
+/// the column the query groups by cannot drift from the column the
+/// window filters on, and both tolerate a legacy DATE-typed
+/// `issue_date` (see [`WINDOW_DATE_EXPR`] on why the CAST matters).
 fn date_col_sql_invoice(basis: DateBasis) -> &'static str {
     match basis {
-        DateBasis::Teljesites => "COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date)",
-        DateBasis::Issued => "i.issue_date",
+        DateBasis::Teljesites => WINDOW_DATE_EXPR,
+        DateBasis::Issued => "SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10)",
     }
 }
 
@@ -1045,36 +1050,46 @@ fn query_restored_rows(
     Ok(out)
 }
 
+/// The ONE invoice-side date-window expression — the teljesites basis
+/// (`delivery_date`, falling back to `issue_date`) normalised to a
+/// date-only `YYYY-MM-DD` string. Every window `WHERE` arm compares
+/// this, so revenue, VAT, receivables, DSO and the currency split can
+/// never disagree about what falls inside a period.
+///
+/// Both halves are load-bearing:
+///   * the **`SUBSTR`** is the fix. `invoice.issue_date` is a VARCHAR
+///     holding RFC3339 (`duckdb_store.rs` writes
+///     `draft.issue_date.format(&Rfc3339)`), and `delivery_date` stays
+///     NULL for pre-PR-84 rows and every non-SPA issuance — so the
+///     COALESCE falls through to a value like `2026-06-30T21:15:00Z`.
+///     Compared as a raw string against the date-only upper bound
+///     `2026-06-30`, that sorts ABOVE it, and an invoice issued on the
+///     period's LAST DAY silently dropped out of revenue, VAT and AR.
+///     Truncating to 10 chars puts both sides in the same shape.
+///   * the **`CAST(i.issue_date AS VARCHAR)`** tolerates a legacy
+///     pre-PR-73 DATE-typed `issue_date`. Without it the COALESCE mixes
+///     VARCHAR and DATE and DuckDB binder-errors, failing the WHOLE
+///     financial report rather than one tile.
+///
+/// Recovering the boundary rows is the entire behaviour change: no
+/// invoice that already counted toward a period leaves it.
+const WINDOW_DATE_EXPR: &str =
+    "SUBSTR(COALESCE(CAST(i.delivery_date AS VARCHAR), CAST(i.issue_date AS VARCHAR)), 1, 10)";
+
+/// Emit the invoice-side date-window `WHERE` clause plus which bind slots
+/// it uses. Every arm compares [`WINDOW_DATE_EXPR`], so revenue, VAT,
+/// receivables, DSO and the currency split all decide period membership
+/// with ONE predicate.
 fn build_date_where(window: DateWindow) -> (String, bool, bool) {
-    let date_col = "COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date)";
-    // The outgoing query always supplies the column via `date_col_sql_invoice`;
-    // here we just emit the WHERE shape and report which bind slots are used.
-    // We re-use the `i.issue_date`/`i.delivery_date` reference at the
-    // caller's call site via `{where_clause}` interpolation; this helper
-    // produces only the canonical default. The outgoing query embeds the
-    // date column directly via {date_col} in its format!() — this helper
-    // is unused by it. (Kept for ap/restored which build their WHERE
-    // dynamically above.)
-    let _ = date_col;
     match (window.from, window.to) {
         (Some(_), Some(_)) => (
-            "WHERE COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date) >= ? AND \
-                       COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date) <= ?"
-                .into(),
+            format!("WHERE {WINDOW_DATE_EXPR} >= ? AND {WINDOW_DATE_EXPR} <= ?"),
             true,
             true,
         ),
-        (Some(_), None) => (
-            "WHERE COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date) >= ?".into(),
-            true,
-            false,
-        ),
-        (None, Some(_)) => (
-            "WHERE COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date) <= ?".into(),
-            false,
-            true,
-        ),
-        (None, None) => ("".into(), false, false),
+        (Some(_), None) => (format!("WHERE {WINDOW_DATE_EXPR} >= ?"), true, false),
+        (None, Some(_)) => (format!("WHERE {WINDOW_DATE_EXPR} <= ?"), false, true),
+        (None, None) => (String::new(), false, false),
     }
 }
 
@@ -2375,14 +2390,11 @@ mod tests {
     /// what prevents that, and this pin holds both halves: bare read
     /// FAILS, projected read SUCCEEDS and normalises.
     ///
-    /// Scope note: this pins the PROJECTION, not the whole query. A
-    /// DATE-typed `issue_date` still cannot be served end-to-end,
-    /// because the pre-existing basis column
-    /// (`COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date)`,
-    /// see [`date_col_sql_invoice`]) binder-errors on mixed
-    /// VARCHAR/DATE before this projection is ever reached. That is
-    /// out of scope here — the basis/window path is deliberately
-    /// untouched by the DSO fix — and is flagged, not fixed.
+    /// Scope note: this pins the PROJECTION alone. The end-to-end gap it
+    /// used to flag — the basis/window column binder-erroring on a mixed
+    /// VARCHAR/DATE COALESCE before this projection was ever reached — is
+    /// now closed by [`WINDOW_DATE_EXPR`], and pinned by
+    /// [`window_binds_and_filters_both_legacy_date_and_date_only_varchar`].
     #[test]
     fn dso_anchor_projection_tolerates_a_legacy_date_typed_column() {
         let conn = Connection::open_in_memory().expect("in-memory duckdb");
@@ -2411,6 +2423,318 @@ mod tests {
             .expect("the CAST+SUBSTR projection must read a DATE column as a String");
         assert_eq!(projected, "2026-06-05");
         assert!(parse_iso_date(&projected).is_ok());
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Date-WINDOW normalisation pins (port of the Portable PR-66
+    // financial-window fix).
+    //
+    // `invoice.issue_date` is a VARCHAR holding RFC3339 (duckdb_store.rs
+    // writes `draft.issue_date.format(&Rfc3339)`), and `delivery_date`
+    // is a nullable DATE that stays NULL for pre-PR-84 rows and for
+    // every non-SPA issuance. When the basis COALESCE falls through to
+    // the raw RFC3339 `issue_date`, a string compare against the
+    // date-only upper bound (`2026-06-30`) sorts `2026-06-30T21:15:00Z`
+    // ABOVE it — so an invoice issued on the period's LAST DAY silently
+    // dropped out of revenue, VAT, receivables and the currency split.
+    //
+    // [`WINDOW_DATE_EXPR`] is the fix: ONE normalised `YYYY-MM-DD`
+    // expression shared by every window WHERE arm. These four pins are
+    // permanent, and each reds under the plausible mutation — reverting
+    // the const to the raw `COALESCE(CAST(i.delivery_date AS VARCHAR),
+    // i.issue_date)` comparison.
+    // ──────────────────────────────────────────────────────────────
+
+    /// Seed the production-shaped `invoice` + `invoice_line` pair used by
+    /// the window pins: `issue_date` a VARCHAR holding RFC3339,
+    /// `delivery_date` a nullable DATE. Every row is 100_000 net @ 27%.
+    fn seed_window_fixture(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE invoice (
+                 id VARCHAR,
+                 currency VARCHAR,
+                 issue_date VARCHAR,
+                 delivery_date DATE,
+                 payment_deadline DATE,
+                 huf_equivalent_total DECIMAL(18,0)
+             );
+             CREATE TABLE invoice_line (
+                 invoice_id VARCHAR,
+                 vat_rate_basis_points INTEGER,
+                 quantity DECIMAL(18,6),
+                 unit_price BIGINT
+             );
+             -- `inv-lastday` is the whole point: issued on the period's
+             -- LAST DAY, late in the day, with NO delivery_date — so the
+             -- basis COALESCE falls through to the raw RFC3339 string.
+             INSERT INTO invoice VALUES
+               ('inv-lastday', 'HUF', '2026-06-30T21:15:00Z', NULL, DATE '2026-07-31', NULL),
+               ('inv-mid',     'HUF', '2026-06-10T09:00:00Z', NULL, DATE '2026-07-10', NULL),
+               ('inv-next',    'HUF', '2026-07-01T08:00:00Z', NULL, DATE '2026-08-01', NULL);
+             INSERT INTO invoice_line VALUES
+               ('inv-lastday', 2700, 1.0, 100000),
+               ('inv-mid',     2700, 1.0, 100000),
+               ('inv-next',    2700, 1.0, 100000);",
+        )
+        .expect("seed window fixture");
+    }
+
+    fn june_2026() -> DateWindow {
+        DateWindow {
+            from: Some(Date::from_calendar_date(2026, Month::June, 1).unwrap()),
+            to: Some(Date::from_calendar_date(2026, Month::June, 30).unwrap()),
+        }
+    }
+
+    /// PIN (e) — an invoice issued on the period's LAST DAY, stamped
+    /// RFC3339 and carrying no `delivery_date`, must stay inside the
+    /// window: present in revenue, in VAT collected, and in receivables.
+    /// The July invoice must still be excluded — the fix RECOVERS the
+    /// boundary row, it does not widen the period.
+    ///
+    /// Mutation guard: revert [`WINDOW_DATE_EXPR`] to the raw
+    /// `COALESCE(CAST(i.delivery_date AS VARCHAR), i.issue_date)` and
+    /// `inv-lastday` vanishes from all three — this reds.
+    #[test]
+    fn last_day_rfc3339_invoice_stays_in_revenue_vat_and_receivables() {
+        let conn = Connection::open_in_memory().expect("in-memory duckdb");
+        seed_window_fixture(&conn);
+
+        let groups = query_outgoing_groups(&conn, june_2026(), DateBasis::Teljesites)
+            .expect("outgoing groups");
+        let mut ids: Vec<&str> = groups.iter().map(|g| g.invoice_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["inv-lastday", "inv-mid"],
+            "the last-day RFC3339 invoice belongs to June; the July invoice does not"
+        );
+
+        let entries = vec![pin_ack("inv-lastday", "SAVED"), pin_ack("inv-mid", "SAVED")];
+        let walk = walk_entries(&entries, DateWindow::unbounded());
+        let today = Date::from_calendar_date(2026, Month::June, 30).unwrap();
+        let agg = aggregate_outgoing(groups, &walk.traces, today, &HashMap::new());
+
+        // Two invoices × (100_000 net + 27_000 VAT).
+        assert_eq!(agg.revenue.huf.count, 2, "both June invoices are revenue");
+        assert_eq!(agg.revenue.huf.net_minor, 200_000, "revenue net");
+        assert_eq!(agg.revenue.huf.gross_minor, 254_000, "revenue gross");
+        assert_eq!(
+            agg.vat_collected.huf.vat_minor, 54_000,
+            "VAT collected must carry the last-day invoice's 27_000 too"
+        );
+        assert_eq!(
+            agg.receivables.huf.count, 2,
+            "neither June invoice is paid — both are receivables"
+        );
+        assert_eq!(
+            agg.receivables.huf.gross_minor, 254_000,
+            "receivables must include the last-day invoice's gross"
+        );
+    }
+
+    /// PIN (f) — the currency split ([`query_eur_huf_equivalent`]) shares
+    /// the SAME window predicate, so it must keep the last-day EUR
+    /// invoice too. If it did not, the EUR bar segment would disagree
+    /// with the revenue figure it is supposed to split.
+    ///
+    /// Mutation guard: revert [`WINDOW_DATE_EXPR`] to the raw comparison
+    /// and the 500_000 last-day contribution disappears — this reds.
+    #[test]
+    fn currency_split_keeps_the_last_day_rfc3339_invoice() {
+        let conn = Connection::open_in_memory().expect("in-memory duckdb");
+        conn.execute_batch(
+            "CREATE TABLE invoice (
+                 id VARCHAR,
+                 currency VARCHAR,
+                 issue_date VARCHAR,
+                 delivery_date DATE,
+                 huf_equivalent_total DECIMAL(18,0)
+             );
+             INSERT INTO invoice VALUES
+               ('eur-lastday', 'EUR', '2026-06-30T21:15:00Z', NULL, 500000),
+               ('eur-mid',     'EUR', '2026-06-10T09:00:00Z', NULL, 190000),
+               ('eur-next',    'EUR', '2026-07-01T08:00:00Z', NULL, 999999);",
+        )
+        .expect("seed EUR rows");
+
+        let got = query_eur_huf_equivalent(&conn, june_2026(), DateBasis::Teljesites)
+            .expect("eur huf equivalent");
+        assert_eq!(
+            got, 690_000,
+            "the last-day EUR invoice (500_000) must be in the split alongside \
+             the mid-month one (190_000); the July row (999_999) must not"
+        );
+    }
+
+    /// PIN (g) — the window predicate BINDS and FILTERS against both
+    /// column shapes the invoice table can present: a legacy pre-PR-73
+    /// **DATE**-typed `issue_date`, and a date-only **VARCHAR**. The raw
+    /// predicate handles neither cleanly — against a DATE-typed column
+    /// `COALESCE(CAST(delivery_date AS VARCHAR), issue_date)` is a mixed
+    /// VARCHAR/DATE COALESCE that binder-errors and fails the WHOLE
+    /// financial report. The `CAST(i.issue_date AS VARCHAR)` inside
+    /// [`WINDOW_DATE_EXPR`] is what makes both shapes servable, and this
+    /// pin closes the gap PIN (c2)'s scope note used to flag.
+    ///
+    /// Mutation guard: revert [`WINDOW_DATE_EXPR`] to the raw comparison
+    /// and the DATE-typed half errors outright — this reds.
+    #[test]
+    fn window_binds_and_filters_both_legacy_date_and_date_only_varchar() {
+        // (label, issue_date column type, literal form)
+        let cases: [(&str, &str, &str); 2] = [
+            ("legacy DATE-typed issue_date", "DATE", "DATE '{}'"),
+            ("date-only VARCHAR issue_date", "VARCHAR", "'{}'"),
+        ];
+        for (label, col_type, lit) in cases {
+            let conn = Connection::open_in_memory().expect("in-memory duckdb");
+            let render = |d: &str| lit.replace("{}", d);
+            conn.execute_batch(&format!(
+                "CREATE TABLE invoice (
+                     id VARCHAR,
+                     currency VARCHAR,
+                     issue_date {col_type},
+                     delivery_date DATE,
+                     payment_deadline DATE
+                 );
+                 CREATE TABLE invoice_line (
+                     invoice_id VARCHAR,
+                     vat_rate_basis_points INTEGER,
+                     quantity DECIMAL(18,6),
+                     unit_price BIGINT
+                 );
+                 INSERT INTO invoice VALUES
+                   ('inv-lastday', 'HUF', {lastday}, NULL, DATE '2026-07-31'),
+                   ('inv-next',    'HUF', {next},    NULL, DATE '2026-08-01');
+                 INSERT INTO invoice_line VALUES
+                   ('inv-lastday', 2700, 1.0, 100000),
+                   ('inv-next',    2700, 1.0, 100000);",
+                lastday = render("2026-06-30"),
+                next = render("2026-07-01"),
+            ))
+            .unwrap_or_else(|e| panic!("{label}: seed: {e}"));
+
+            let groups = query_outgoing_groups(&conn, june_2026(), DateBasis::Teljesites)
+                .unwrap_or_else(|e| {
+                    panic!("{label}: the window query must bind against this column shape: {e}")
+                });
+            let ids: Vec<&str> = groups.iter().map(|g| g.invoice_id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["inv-lastday"],
+                "{label}: the last-day row is kept and the July row is filtered out"
+            );
+            assert!(
+                parse_iso_date(&groups[0].issue_date).is_ok(),
+                "{label}: the DSO anchor must still normalise, got `{}`",
+                groups[0].issue_date
+            );
+        }
+    }
+
+    /// PIN (h) — the HALF-OPEN window arms share the one normalised
+    /// predicate with the closed arm. Structural half: every arm
+    /// [`build_date_where`] can emit references [`WINDOW_DATE_EXPR`] and
+    /// never a bare `i.issue_date` comparison — that is what "one
+    /// predicate for revenue, VAT, AR and DSO" MEANS, and it is what
+    /// stops the two bounds from drifting apart again. Behavioural half:
+    /// each arm still binds its slot and filters correctly, with the
+    /// last-day RFC3339 row landing on the right side of both bounds.
+    ///
+    /// Two mutation guards, one per half. Inline a raw comparison into
+    /// any single arm — the drift this pin exists to catch — and that
+    /// arm's structural assertion reds. Revert [`WINDOW_DATE_EXPR`]
+    /// itself to the raw comparison and the to-only behavioural half
+    /// reds (the last-day row drops back out of the window).
+    #[test]
+    fn half_open_windows_share_the_normalised_predicate() {
+        let jun_1 = Date::from_calendar_date(2026, Month::June, 1).unwrap();
+        let jun_30 = Date::from_calendar_date(2026, Month::June, 30).unwrap();
+
+        // Structural: all three emitting arms, one shared expression.
+        let arms = [
+            ("closed", june_2026(), true, true),
+            (
+                "from-only",
+                DateWindow {
+                    from: Some(jun_1),
+                    to: None,
+                },
+                true,
+                false,
+            ),
+            (
+                "to-only",
+                DateWindow {
+                    from: None,
+                    to: Some(jun_30),
+                },
+                false,
+                true,
+            ),
+        ];
+        for (label, window, want_from, want_to) in arms {
+            let (sql, has_from, has_to) = build_date_where(window);
+            assert_eq!(
+                (has_from, has_to),
+                (want_from, want_to),
+                "{label}: bind slots"
+            );
+            let want_refs = usize::from(want_from) + usize::from(want_to);
+            assert_eq!(
+                sql.matches(WINDOW_DATE_EXPR).count(),
+                want_refs,
+                "{label}: every bound must compare the shared normalised \
+                 expression, got `{sql}`"
+            );
+            assert!(
+                !sql.replace(WINDOW_DATE_EXPR, "").contains("issue_date"),
+                "{label}: no bound may compare a raw issue_date, got `{sql}`"
+            );
+        }
+        // The unbounded arm emits nothing and binds nothing.
+        assert_eq!(
+            build_date_where(DateWindow::unbounded()),
+            (String::new(), false, false),
+            "the unbounded window must emit no WHERE and no bind slots"
+        );
+
+        // Behavioural: each half-open arm binds its slot and filters.
+        let conn = Connection::open_in_memory().expect("in-memory duckdb");
+        seed_window_fixture(&conn);
+        let from_only = DateWindow {
+            from: Some(jun_30),
+            to: None,
+        };
+        let mut ids: Vec<String> = query_outgoing_groups(&conn, from_only, DateBasis::Teljesites)
+            .expect("from-only window")
+            .into_iter()
+            .map(|g| g.invoice_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["inv-lastday", "inv-next"],
+            "from-only: the last-day row is ON the lower bound and stays; \
+             the mid-month row is below it and goes"
+        );
+
+        let to_only = DateWindow {
+            from: None,
+            to: Some(jun_30),
+        };
+        let mut ids: Vec<String> = query_outgoing_groups(&conn, to_only, DateBasis::Teljesites)
+            .expect("to-only window")
+            .into_iter()
+            .map(|g| g.invoice_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["inv-lastday", "inv-mid"],
+            "to-only: the last-day RFC3339 row is ON the upper bound and must \
+             NOT sort above it; the July row stays out"
+        );
     }
 
     /// PIN (d) — EXHAUSTIVE storno-child coverage. The base leaves AR if
