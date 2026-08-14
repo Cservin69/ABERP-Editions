@@ -3009,16 +3009,10 @@ mod tests {
         ];
         let agg = aggregate_outgoing(groups, &traces, today, &HashMap::new());
 
-        // (b) Out of the TOTAL. Only the two readable-deadline invoices
-        //     are owed; 840 180 or 845 180 here would mean an undated row
-        //     is still being counted as money someone owes us.
-        assert_eq!(
-            agg.receivables.huf.gross_minor, 63_180,
-            "a deadline-less invoice is settled and must not be counted as outstanding"
-        );
-        assert_eq!(agg.receivables.huf.count, 2);
-
-        // (a) The invariant — buckets and total move together.
+        // (a) THE INVARIANT, asserted FIRST so it is the first thing to
+        //     red under a revert to "in the total but not in a bucket" —
+        //     the shape of the original defect. Buckets and total must
+        //     move together whatever the deadlines look like.
         let (net, vat, gross, count) = aging_totals(&agg.receivables_aging);
         assert_eq!(
             gross, agg.receivables.huf.gross_minor,
@@ -3027,6 +3021,15 @@ mod tests {
         assert_eq!(net, agg.receivables.huf.net_minor);
         assert_eq!(vat, agg.receivables.huf.vat_minor);
         assert_eq!(count, agg.receivables.huf.count);
+
+        // (b) …and they agree at the RIGHT value: only the two
+        //     readable-deadline invoices are owed. 845 180 here would mean
+        //     an undated row is still counted as money someone owes us.
+        assert_eq!(
+            agg.receivables.huf.gross_minor, 63_180,
+            "a deadline-less invoice is settled and must not be counted as outstanding"
+        );
+        assert_eq!(agg.receivables.huf.count, 2);
 
         // (c) Valid deadlines placed EXACTLY as before.
         assert_eq!(agg.receivables_aging.current.gross_minor, 20_000);
@@ -3084,8 +3087,11 @@ mod tests {
             today,
             &HashMap::new(),
         );
+        // Invariant first, at zero on both sides.
+        let (_, _, gross, count) = aging_totals(&agg.receivables_aging);
+        assert_eq!(gross, agg.receivables.eur.gross_minor);
+        assert_eq!(count, agg.receivables.eur.count);
         assert_eq!(agg.receivables.eur, AmountAggregate::default());
-        assert_eq!(aging_totals(&agg.receivables_aging), (0, 0, 0, 0));
         assert_eq!(agg.settled_undated.count, 2);
         assert_eq!(agg.outstanding_past_deadline_count, 0);
 
@@ -3154,14 +3160,7 @@ mod tests {
         ];
         let ap = aggregate_ap(&rows, today);
 
-        // (b) Out of the TOTAL — only the two readable-deadline payables.
-        assert_eq!(
-            ap.payables.huf.gross_minor, 63_180,
-            "a deadline-less payable is settled and must not be counted as owed"
-        );
-        assert_eq!(ap.payables.huf.count, 2);
-
-        // (a) The invariant.
+        // (a) THE INVARIANT, asserted FIRST — same reason as the AR pin.
         let (net, vat, gross, count) = aging_totals(&ap.payables_aging);
         assert_eq!(
             gross, ap.payables.huf.gross_minor,
@@ -3170,6 +3169,13 @@ mod tests {
         assert_eq!(net, ap.payables.huf.net_minor);
         assert_eq!(vat, ap.payables.huf.vat_minor);
         assert_eq!(count, ap.payables.huf.count);
+
+        // (b) …at the right value — only the two readable-deadline rows.
+        assert_eq!(
+            ap.payables.huf.gross_minor, 63_180,
+            "a deadline-less payable is settled and must not be counted as owed"
+        );
+        assert_eq!(ap.payables.huf.count, 2);
 
         // (d) Both undated rows disclosed, by id, and nothing else.
         assert_eq!(ap.settled_undated.count, 2);
