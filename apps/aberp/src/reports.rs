@@ -155,7 +155,103 @@ pub struct FinancialReport {
     pub deltas: PeriodDeltas,
     pub annual_running: AnnualRunningPanel,
     pub deferred_notes: Vec<String>,
+    /// Integrity signal for THIS run of the aggregator — see
+    /// [`LedgerDiagnostics`]. Non-zero means the figures above are
+    /// possibly incomplete.
+    #[serde(default)]
+    pub ledger_diagnostics: LedgerDiagnostics,
 }
+
+/// Per-run integrity diagnostics for the financial report.
+///
+/// Two independent signals, both of the same family — a silent drop made
+/// loud: entries the audit-ledger walk ([`walk_entries`]) could not decode,
+/// and outstanding invoices whose payment deadline the aging pass could
+/// not read ([`aging_placement`]).
+///
+/// The first, in detail:
+///
+/// The walk decodes every audit entry's JSON payload to derive per-invoice
+/// state (ack status, payment, storno chain links). Before this fix, a
+/// payload that failed to decode was dropped on the floor: the `if let
+/// Ok(..)` / `.ok()?` arms in [`ReportTrace::merge`],
+/// [`extract_chain_link_local`] and [`extract_invoice_id_local`] each fell
+/// through to "nothing happened". A malformed `InvoicePaymentRecorded`
+/// payload therefore made an invoice look UNPAID (inflating receivables,
+/// dropping its DSO sample, and possibly counting it past-deadline); a
+/// malformed `InvoiceAckStatus` payload could demote a SAVED invoice to
+/// `PendingDraft` and take it out of revenue + VAT-collected entirely; a
+/// malformed storno chain link left the base uncancelled. All of it
+/// silently — the operator saw a clean number that was simply wrong.
+///
+/// The conservative posture is NOT to abort the whole dashboard on one bad
+/// row: a single corrupt entry must not blank the operator's entire
+/// financial screen, and every valid row's arithmetic is unchanged.
+/// Instead the drop is made VISIBLE and ATTRIBUTABLE — a `tracing::error!`
+/// per entry carrying its id, seq, kind and the decode error, plus this
+/// machine-countable signal on the wire so a caller can flag the figures
+/// as possibly-incomplete rather than present them as authoritative.
+///
+/// An entry is counted AT MOST ONCE even when several decode attempts fail
+/// on it (a payload that is not JSON at all fails both the id extraction
+/// and the chain-link decode): the count answers "how many entries could
+/// not be read", not "how many decode attempts failed".
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct LedgerDiagnostics {
+    /// Number of audit entries whose payload the report walk could not
+    /// decode, and which are therefore NOT reflected in any figure above.
+    /// Exact and uncapped.
+    pub unparseable_entries: u64,
+    /// Audit-entry ids (`aud_<ULID>`) of those entries, so the operator
+    /// can go find them. Capped at [`MAX_UNPARSEABLE_ENTRY_IDS`] — the
+    /// count above stays exact, so `unparseable_entries >
+    /// unparseable_entry_ids.len()` simply means "and more".
+    pub unparseable_entry_ids: Vec<String>,
+    /// Invoices — receivable OR payable — that carried NO readable
+    /// `payment_deadline` (missing or unparseable) and were therefore
+    /// treated as SETTLED and excluded from outstanding entirely: out of
+    /// the receivables / payables total, out of every aging bucket, and
+    /// out of the past-deadline counters. Exact and uncapped. See
+    /// [`aging_placement`].
+    ///
+    /// This is an operator-directed classification, not a measurement:
+    /// these are legacy invoices imported from NAV, issued by the prior
+    /// system, and are settled. The count exists because that
+    /// classification is an ASSUMPTION about money — a genuinely unpaid
+    /// deadline-less invoice would be excluded by exactly the same rule,
+    /// and the count plus the aggregate `tracing::warn!` in
+    /// [`compute_financial_report`] are what stop that happening
+    /// silently.
+    #[serde(default)]
+    pub aging_settled_undated: u64,
+    /// Ids of those invoices, sorted. Capped at
+    /// [`MAX_UNPARSEABLE_ENTRY_IDS`] on the same "count exact, ids are a
+    /// starting point" contract as [`Self::unparseable_entry_ids`].
+    ///
+    /// MACHINE-READABLE ONLY — the SPA deliberately does not render this
+    /// list. NAV-synced payables carry no deadline at all, so on a real
+    /// book it would be a permanent wall of ids on the dashboard. It stays
+    /// on the wire for support and debugging; the operator-facing surface
+    /// is the per-side count below.
+    #[serde(default)]
+    pub aging_settled_undated_invoice_ids: Vec<String>,
+    /// The [`Self::aging_settled_undated`] total split by side, so each
+    /// aging panel can footnote its OWN excluded rows. Rendering the
+    /// combined figure under both panels would double-report it.
+    ///
+    /// `aging_settled_undated_receivables + aging_settled_undated_payables
+    /// == aging_settled_undated`.
+    #[serde(default)]
+    pub aging_settled_undated_receivables: u64,
+    #[serde(default)]
+    pub aging_settled_undated_payables: u64,
+}
+
+/// Cap on [`LedgerDiagnostics::unparseable_entry_ids`]. A systemically
+/// corrupt ledger must not balloon the report's JSON payload; the count is
+/// the machine-countable signal, the ids are the operator's starting
+/// point.
+const MAX_UNPARSEABLE_ENTRY_IDS: usize = 50;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PeriodMeta {
@@ -269,8 +365,25 @@ pub struct HygienePanel {
     pub restored_no_partner_count: u64,
     /// Counted outgoing invoices whose payment_deadline has passed and
     /// no payment is recorded.
+    ///
+    /// EXCLUDES invoices with a missing or unreadable `payment_deadline`
+    /// — not by a special gate here, but because such an invoice is
+    /// classified SETTLED and never enters outstanding at all (see
+    /// [`aging_placement`]). It is therefore absent from the receivables
+    /// total and every aging bucket too, and is disclosed via
+    /// [`LedgerDiagnostics::aging_settled_undated`].
     pub outstanding_past_deadline_count: u64,
     /// Outstanding ap_invoice rows whose payment_deadline has passed.
+    ///
+    /// Excludes missing / unreadable deadlines for the same reason as
+    /// [`Self::outstanding_past_deadline_count`], and the exclusion is
+    /// far-reaching here: `ap_sync` records `payment_deadline: None` on
+    /// every NAV-synced payable, so on a NAV-populated book essentially
+    /// the whole payables population is classified settled and this
+    /// counter reads zero. That is the operator-directed behaviour; the
+    /// tripwire against it hiding a real unpaid payable is
+    /// [`LedgerDiagnostics::aging_settled_undated_payables`] plus the
+    /// aggregate warning [`compute_financial_report`] emits.
     pub payable_past_deadline_count: u64,
     /// Number of `InvoiceStornoIssued` chain entries in the period.
     pub storno_chain_count: u64,
@@ -390,9 +503,35 @@ pub fn parse_period(s: &str) -> Result<PeriodKind> {
     Err(anyhow!("unparseable period `{}`", trimmed))
 }
 
+/// Parse a canonical `YYYY-MM-DD` date, and NOTHING else.
+///
+/// This function decides whether an invoice is outstanding at all
+/// ([`aging_placement`]), so what it rejects is as load-bearing as what it
+/// accepts. Two things it must NOT inherit from a bare `time` parse:
+///
+///   * `[year]` accepts an optional LEADING SIGN, so `Date::parse` alone
+///     takes `+2026-06-15` — an 11-character value the SQL projections
+///     truncate to `+2026-06-1` and then reject, writing a live invoice
+///     off as settled. The writers no longer store that shape (see
+///     [`crate::incoming_invoices::is_canonical_iso_date`]) and this
+///     refuses it too, so neither half of the round trip can reintroduce
+///     it.
+///   * `str::trim` strips Unicode `White_Space`, which does NOT include
+///     U+FEFF, while JavaScript's `String.prototype.trim` DOES. The SPA
+///     runs the same classification client-side, so a shared input must
+///     get the same verdict on both sides or a tile and its drill-down
+///     disagree about whether money is owed. Trimming ASCII whitespace
+///     only — on both sides — is the narrow rule that actually matches.
+///
+/// Pinned against the SPA by `DEADLINE_PARITY_VOCAB` /
+/// `aging-deadline-parity.test.ts`.
 fn parse_iso_date(s: &str) -> Result<Date> {
+    let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    if !crate::incoming_invoices::is_canonical_iso_date(trimmed) {
+        anyhow::bail!("parse ISO date `{}`: not a canonical YYYY-MM-DD date", s);
+    }
     let fmt = format_description!("[year]-[month]-[day]");
-    Date::parse(s.trim(), fmt).with_context(|| format!("parse ISO date `{}`", s))
+    Date::parse(trimmed, fmt).with_context(|| format!("parse ISO date `{}`", s))
 }
 
 /// Resolve a [`PeriodKind`] to inclusive ISO-date bounds for SQL
@@ -588,6 +727,8 @@ struct LedgerWalk {
     /// AFTER the walk completes — the child's own trace is only complete
     /// once every entry has been merged.
     storno_links: Vec<(String, String)>,
+    /// Entries this walk could NOT decode — see [`LedgerDiagnostics`].
+    diagnostics: LedgerDiagnostics,
 }
 
 fn walk_ledger(ledger: &Ledger, period_window: DateWindow) -> Result<LedgerWalk> {
@@ -602,38 +743,90 @@ fn walk_ledger(ledger: &Ledger, period_window: DateWindow) -> Result<LedgerWalk>
 fn walk_entries(entries: &[Entry], period_window: DateWindow) -> LedgerWalk {
     let mut walk = LedgerWalk::default();
     for entry in entries {
-        if let Some(id) = extract_invoice_id_local(entry) {
-            walk.traces.entry(id.clone()).or_default().merge(entry, &id);
-        }
-        if let Some(link) = extract_chain_link_local(entry) {
-            if link.is_storno {
-                walk.traces
-                    .entry(link.child_invoice_id.clone())
-                    .or_default()
-                    .is_storno_self = true;
-                // Record the link only — do NOT flag the base here. The
-                // flag means "a storno LANDED", which is not knowable at
-                // issuance time; it is resolved below.
-                walk.traces.entry(link.base_invoice_id.clone()).or_default();
-                walk.storno_links
-                    .push((link.base_invoice_id.clone(), link.child_invoice_id.clone()));
-                if entry_in_window(entry, period_window) {
-                    walk.storno_links_in_period = walk.storno_links_in_period.saturating_add(1);
-                }
-            } else {
-                walk.traces
-                    .entry(link.base_invoice_id.clone())
-                    .or_default()
-                    .is_amended_base = true;
-                if entry_in_window(entry, period_window) {
-                    walk.modification_links_in_period =
-                        walk.modification_links_in_period.saturating_add(1);
+        // A decode failure on THIS entry, if any. Recorded once at the end
+        // of the iteration rather than at each failing call site: a payload
+        // that is not JSON at all fails both decodes below, and the
+        // operator-facing count is entries-not-read, not attempts-failed.
+        let mut decode_error: Option<String> = None;
+
+        match extract_invoice_id_local(entry) {
+            Ok(Some(id)) => {
+                // The trace row is created either way (`or_default()` runs
+                // before `merge`), exactly as before — a failed typed decode
+                // leaves it at its defaults instead of vanishing the id.
+                if let Err(e) = walk.traces.entry(id.clone()).or_default().merge(entry, &id) {
+                    decode_error = Some(e.to_string());
                 }
             }
+            // Valid JSON with no `invoice_id` key — the ordinary case for
+            // every event kind that is not invoice-scoped. NOT a defect.
+            Ok(None) => {}
+            Err(e) => decode_error = Some(e.to_string()),
+        }
+
+        match extract_chain_link_local(entry) {
+            Ok(Some(link)) => {
+                if link.is_storno {
+                    walk.traces
+                        .entry(link.child_invoice_id.clone())
+                        .or_default()
+                        .is_storno_self = true;
+                    // Record the link only — do NOT flag the base here. The
+                    // flag means "a storno LANDED", which is not knowable at
+                    // issuance time; it is resolved below.
+                    walk.traces.entry(link.base_invoice_id.clone()).or_default();
+                    walk.storno_links
+                        .push((link.base_invoice_id.clone(), link.child_invoice_id.clone()));
+                    if entry_in_window(entry, period_window) {
+                        walk.storno_links_in_period = walk.storno_links_in_period.saturating_add(1);
+                    }
+                } else {
+                    walk.traces
+                        .entry(link.base_invoice_id.clone())
+                        .or_default()
+                        .is_amended_base = true;
+                    if entry_in_window(entry, period_window) {
+                        walk.modification_links_in_period =
+                            walk.modification_links_in_period.saturating_add(1);
+                    }
+                }
+            }
+            // Not a chain-link kind. The overwhelming majority of entries.
+            Ok(None) => {}
+            Err(e) => {
+                decode_error.get_or_insert_with(|| e.to_string());
+            }
+        }
+
+        if let Some(err) = decode_error {
+            record_unparseable_entry(&mut walk.diagnostics, entry, &err);
         }
     }
     resolve_landed_stornos(&mut walk);
     walk
+}
+
+/// Make one undecodable audit entry LOUD and ATTRIBUTABLE: a structured
+/// error log naming the entry, and a bump on the machine-countable signal
+/// that rides out on [`FinancialReport::ledger_diagnostics`].
+///
+/// Deliberately not a hard error. Aborting the walk would let a single
+/// corrupt row blank the operator's whole financial screen, which trades a
+/// wrong number for no number at all. See [`LedgerDiagnostics`].
+fn record_unparseable_entry(diag: &mut LedgerDiagnostics, entry: &Entry, error: &str) {
+    let id = entry.id.to_prefixed_string();
+    tracing::error!(
+        entry_id = %id,
+        entry_seq = entry.seq.0,
+        entry_kind = ?entry.kind,
+        decode_error = %error,
+        "financial report: audit entry payload could not be decoded — this entry is \
+         NOT reflected in the reported figures"
+    );
+    diag.unparseable_entries = diag.unparseable_entries.saturating_add(1);
+    if diag.unparseable_entry_ids.len() < MAX_UNPARSEABLE_ENTRY_IDS {
+        diag.unparseable_entry_ids.push(id);
+    }
 }
 
 /// Post-walk pass: flag a storno BASE as `has_landed_storno` only when its
@@ -664,54 +857,59 @@ fn resolve_landed_stornos(walk: &mut LedgerWalk) {
 }
 
 impl ReportTrace {
-    fn merge(&mut self, entry: &Entry, invoice_id: &str) {
+    /// Fold one audit entry into this invoice's trace.
+    ///
+    /// `Err` means the entry's typed payload did NOT decode, so nothing was
+    /// folded and this entry is missing from every figure derived from the
+    /// trace. The caller MUST surface it — see [`LedgerDiagnostics`]. The
+    /// four decode arms used to be `if let Ok(..)` with no `else`, which is
+    /// precisely the silent drop.
+    ///
+    /// The `parsed.invoice_id == invoice_id` guards are unchanged: a
+    /// successfully-decoded payload naming a DIFFERENT invoice is not a
+    /// defect, it just does not belong to this trace.
+    fn merge(&mut self, entry: &Entry, invoice_id: &str) -> serde_json::Result<()> {
         match entry.kind {
             EventKind::InvoiceDraftCreated => self.has_draft = true,
             EventKind::InvoiceSubmissionAttempt => {
-                if let Ok(parsed) = serde_json::from_slice::<
+                let parsed = serde_json::from_slice::<
                     audit_payloads::InvoiceSubmissionAttemptPayload,
-                >(&entry.payload)
-                {
-                    if parsed.invoice_id == invoice_id {
-                        self.has_attempt = true;
-                    }
+                >(&entry.payload)?;
+                if parsed.invoice_id == invoice_id {
+                    self.has_attempt = true;
                 }
             }
             EventKind::InvoiceSubmissionResponse => {
-                if let Ok(parsed) = serde_json::from_slice::<
+                let parsed = serde_json::from_slice::<
                     audit_payloads::InvoiceSubmissionResponsePayload,
-                >(&entry.payload)
-                {
-                    if parsed.invoice_id == invoice_id {
-                        self.has_submission_response = true;
-                    }
+                >(&entry.payload)?;
+                if parsed.invoice_id == invoice_id {
+                    self.has_submission_response = true;
                 }
             }
             EventKind::InvoiceAckStatus => {
-                if let Ok(parsed) = serde_json::from_slice::<audit_payloads::InvoiceAckStatusPayload>(
+                let parsed = serde_json::from_slice::<audit_payloads::InvoiceAckStatusPayload>(
                     &entry.payload,
-                ) {
-                    if parsed.invoice_id == invoice_id {
-                        self.last_ack_status = Some(parsed.ack_status);
-                    }
+                )?;
+                if parsed.invoice_id == invoice_id {
+                    self.last_ack_status = Some(parsed.ack_status);
                 }
             }
             EventKind::InvoiceMarkedAbandoned => {
                 self.has_marked_abandoned = true;
             }
             EventKind::InvoicePaymentRecorded => {
-                if let Ok(parsed) = serde_json::from_slice::<
-                    audit_payloads::InvoicePaymentRecordedPayload,
-                >(&entry.payload)
-                {
-                    if parsed.invoice_id == invoice_id {
-                        self.payment_paid_at = Some(parsed.paid_at);
-                        self.payment_amount_minor = Some(parsed.amount_minor);
-                    }
+                let parsed = serde_json::from_slice::<audit_payloads::InvoicePaymentRecordedPayload>(
+                    &entry.payload,
+                )?;
+                if parsed.invoice_id == invoice_id {
+                    self.payment_paid_at = Some(parsed.paid_at);
+                    self.payment_amount_minor = Some(parsed.amount_minor);
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 }
 
@@ -721,36 +919,46 @@ struct ChainLinkLocal {
     is_storno: bool,
 }
 
-fn extract_chain_link_local(entry: &Entry) -> Option<ChainLinkLocal> {
+/// `Ok(None)` = this entry is not a chain-link kind (the ordinary case).
+/// `Err` = it IS one and its payload did not decode, so the chain link is
+/// lost — a storno that never nets its base to zero, leaving revenue and
+/// receivables overstated. Used to be `.ok()?`, indistinguishable from
+/// "not a chain link" and therefore silent.
+fn extract_chain_link_local(entry: &Entry) -> serde_json::Result<Option<ChainLinkLocal>> {
     match entry.kind {
         EventKind::InvoiceStornoIssued => {
             let parsed: audit_payloads::InvoiceStornoIssuedPayload =
-                serde_json::from_slice(&entry.payload).ok()?;
-            Some(ChainLinkLocal {
+                serde_json::from_slice(&entry.payload)?;
+            Ok(Some(ChainLinkLocal {
                 base_invoice_id: parsed.base_invoice_id,
                 child_invoice_id: parsed.storno_invoice_id,
                 is_storno: true,
-            })
+            }))
         }
         EventKind::InvoiceModificationIssued => {
             let parsed: audit_payloads::InvoiceModificationIssuedPayload =
-                serde_json::from_slice(&entry.payload).ok()?;
-            Some(ChainLinkLocal {
+                serde_json::from_slice(&entry.payload)?;
+            Ok(Some(ChainLinkLocal {
                 base_invoice_id: parsed.base_invoice_id,
                 child_invoice_id: parsed.modification_invoice_id,
                 is_storno: false,
-            })
+            }))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
-fn extract_invoice_id_local(entry: &Entry) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(&entry.payload).ok()?;
-    v.as_object()
+/// `Ok(None)` = the payload is well-formed JSON that carries no
+/// `invoice_id` (chain links, tenant-level events, …) — normal, and NOT a
+/// diagnostic. `Err` = the payload is not JSON at all, so the entry never
+/// reaches [`ReportTrace::merge`] and contributes to nothing. Used to be
+/// `.ok()?`, which collapsed those two cases into one silent `None`.
+fn extract_invoice_id_local(entry: &Entry) -> serde_json::Result<Option<String>> {
+    let v: serde_json::Value = serde_json::from_slice(&entry.payload)?;
+    Ok(v.as_object()
         .and_then(|m| m.get("invoice_id"))
         .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
+        .map(|s| s.to_string()))
 }
 
 fn entry_in_window(entry: &Entry, window: DateWindow) -> bool {
@@ -802,6 +1010,20 @@ struct OutgoingLineGroup {
     ///     `InvalidColumnType`, and the `?` would fail the WHOLE
     ///     financial report, not merely DSO.
     issue_date: String,
+    /// The aging anchor, normalised to `YYYY-MM-DD` by the SAME
+    /// `SUBSTR(CAST(.. AS VARCHAR), 1, 10)` guard as [`Self::issue_date`],
+    /// and for a sharper reason since the settled-exclusion rule landed.
+    ///
+    /// `invoice.payment_deadline` is a `DATE` today, so the `CAST` alone
+    /// would render `2026-06-15` and parse fine. But
+    /// [`parse_iso_date`] accepts ONLY `[year]-[month]-[day]`, so the day
+    /// this column widens to a `TIMESTAMP` — or any writer starts storing
+    /// RFC3339 in it, exactly as `issue_date` already does — every value
+    /// becomes unparseable at once. Under [`aging_placement`] that no
+    /// longer means "aged conservatively": it means EVERY receivable is
+    /// classified settled and silently leaves the books, with the
+    /// diagnostic reporting the whole ledger as excluded. The `SUBSTR` is
+    /// what stops a column-type change from emptying receivables.
     payment_deadline: Option<String>,
     vat_rate_basis_points: i32,
     net_minor: i64,
@@ -809,7 +1031,26 @@ struct OutgoingLineGroup {
 
 #[derive(Debug, Clone)]
 struct ApRow {
+    /// `ap_invoice.id` — carried so an aging diagnostic can NAME the
+    /// offending payable instead of just counting it.
+    id: String,
     supplier_name: String,
+    /// Same `SUBSTR(CAST(.. AS VARCHAR), 1, 10)` guard as the AR side, and
+    /// this is the MORE dangerous of the two.
+    ///
+    /// `ap_invoice.payment_deadline` is a `VARCHAR` whose only writer that
+    /// sets it at all is the manual/ingestion path; `ap_sync` leaves it
+    /// NULL. So undated is ALREADY the dominant AP population and the
+    /// settled-exclusion rule already empties most of payables. If the
+    /// column ever carried a timestamp-shaped string — or were migrated to
+    /// `TIMESTAMP` — the remaining readable rows would join them and
+    /// payables would report zero with no code change anywhere.
+    ///
+    /// The bare `CAST` also matters on its own: without it a
+    /// `DATE`/`TIMESTAMP`-typed column makes `row.get::<Option<String>>`
+    /// return `InvalidColumnType`, and the `?` fails the WHOLE financial
+    /// report rather than one panel. Before this guard the projection had
+    /// neither.
     payment_deadline: Option<String>,
     net_minor: i64,
     vat_minor: i64,
@@ -870,13 +1111,14 @@ fn query_outgoing_groups(
                 COALESCE(i.currency, 'HUF') AS currency,
                 {date_col} AS basis_date,
                 SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10) AS issue_date,
-                CAST(i.payment_deadline AS VARCHAR) AS payment_deadline,
+                SUBSTR(CAST(i.payment_deadline AS VARCHAR), 1, 10) AS payment_deadline,
                 il.vat_rate_basis_points,
                 CAST(SUM(CAST(il.quantity AS DECIMAL(38,6)) * il.unit_price) AS VARCHAR) AS net_decimal
            FROM invoice i
            JOIN invoice_line il ON i.id = il.invoice_id
           {where_clause}
-          GROUP BY i.id, currency, basis_date, SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10), payment_deadline,
+          GROUP BY i.id, currency, basis_date, SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10),
+                   SUBSTR(CAST(i.payment_deadline AS VARCHAR), 1, 10),
                    il.vat_rate_basis_points",
     );
     let mut stmt = conn
@@ -978,7 +1220,8 @@ fn query_ap_rows(
         binds.push(date_str(to));
     }
     let sql = format!(
-        "SELECT a.supplier_name, a.payment_deadline,
+        "SELECT a.id, a.supplier_name,
+                SUBSTR(CAST(a.payment_deadline AS VARCHAR), 1, 10) AS payment_deadline,
                 a.total_net_minor, a.total_vat_minor, a.total_gross_minor, a.currency,
                 a.local_status
            FROM ap_invoice a
@@ -990,13 +1233,14 @@ fn query_ap_rows(
         binds.iter().map(|s| s as &dyn duckdb::ToSql).collect();
     let rows = stmt.query_map(params_dyn.as_slice(), |row| {
         Ok(ApRow {
-            supplier_name: row.get(0)?,
-            payment_deadline: row.get(1)?,
-            net_minor: row.get(2)?,
-            vat_minor: row.get(3)?,
-            gross_minor: row.get(4)?,
-            currency: row.get(5)?,
-            local_status: row.get(6)?,
+            id: row.get(0)?,
+            supplier_name: row.get(1)?,
+            payment_deadline: row.get(2)?,
+            net_minor: row.get(3)?,
+            vat_minor: row.get(4)?,
+            gross_minor: row.get(5)?,
+            currency: row.get(6)?,
+            local_status: row.get(7)?,
         })
     })?;
     let mut out = Vec::new();
@@ -1127,6 +1371,9 @@ struct OutgoingAggregate {
     dso_eur_samples: Vec<f64>,
     counted_invoice_ids: HashSet<String>,
     outstanding_past_deadline_count: u64,
+    /// Receivables excluded from outstanding as settled legacy imports —
+    /// see [`aging_placement`].
+    settled_undated: SettledUndated,
     rejected_count: u64,
     abandoned_count: u64,
     pending_count: u64,
@@ -1251,30 +1498,31 @@ fn aggregate_outgoing(
         let trace = traces.get(id).cloned().unwrap_or_default();
         let paid = trace.payment_paid_at.is_some();
         if !paid && !*is_storno_self && !trace.has_landed_storno {
-            let ar_target = match currency.as_str() {
-                "EUR" => &mut agg.receivables.eur,
-                _ => &mut agg.receivables.huf,
-            };
-            ar_target.net_minor = ar_target.net_minor.saturating_add(*net);
-            ar_target.vat_minor = ar_target.vat_minor.saturating_add(*vat);
-            ar_target.gross_minor = ar_target.gross_minor.saturating_add(gross);
-            ar_target.count = ar_target.count.saturating_add(1);
-            // Aging + cashflow forward bucketing.
-            if let Some(deadline_str) = deadline {
-                if let Ok(deadline_d) = parse_iso_date(deadline_str) {
-                    let bucket = aging_bucket_for(today, deadline_d);
-                    let panel = &mut agg.receivables_aging;
-                    let dest = match bucket {
-                        AgingBucket::Current => &mut panel.current,
-                        AgingBucket::Days1To30 => &mut panel.days_1_30,
-                        AgingBucket::Days31To60 => &mut panel.days_31_60,
-                        AgingBucket::Days61To90 => &mut panel.days_61_90,
-                        AgingBucket::Days90Plus => &mut panel.days_90_plus,
+            // ONE decision, taken BEFORE the total is touched. The total
+            // and the aging bucket now live in the SAME arm, which is what
+            // makes `sum(buckets) == receivables total` structural rather
+            // than something the two sites have to agree about: an
+            // invoice cannot enter one without entering the other.
+            match aging_placement(today, id, deadline.as_deref()) {
+                // No readable deadline → a settled legacy import. Out of
+                // outstanding entirely — no total, no bucket, no
+                // past-deadline count, no cash-flow projection. Recorded
+                // so the exclusion is countable and the aggregate warning
+                // can name it.
+                None => agg.settled_undated.record(id, gross),
+                Some((bucket, deadline_d)) => {
+                    let ar_target = match currency.as_str() {
+                        "EUR" => &mut agg.receivables.eur,
+                        _ => &mut agg.receivables.huf,
                     };
-                    dest.net_minor = dest.net_minor.saturating_add(*net);
-                    dest.vat_minor = dest.vat_minor.saturating_add(*vat);
-                    dest.gross_minor = dest.gross_minor.saturating_add(gross);
-                    dest.count = dest.count.saturating_add(1);
+                    ar_target.net_minor = ar_target.net_minor.saturating_add(*net);
+                    ar_target.vat_minor = ar_target.vat_minor.saturating_add(*vat);
+                    ar_target.gross_minor = ar_target.gross_minor.saturating_add(gross);
+                    ar_target.count = ar_target.count.saturating_add(1);
+                    accrue_aging(&mut agg.receivables_aging, bucket, *net, *vat, gross);
+                    // Every invoice reaching here HAS a readable deadline,
+                    // so the bucket is a measurement and the lateness
+                    // assertion below is supported by it.
                     if !matches!(bucket, AgingBucket::Current) {
                         agg.outstanding_past_deadline_count =
                             agg.outstanding_past_deadline_count.saturating_add(1);
@@ -1360,6 +1608,158 @@ fn aging_bucket_for(today: Date, deadline: Date) -> AgingBucket {
     }
 }
 
+/// Per-side tally of invoices excluded from outstanding because they
+/// carried no readable deadline. Merged onto [`LedgerDiagnostics`] when
+/// the report is assembled.
+#[derive(Default)]
+struct SettledUndated {
+    count: u64,
+    ids: Vec<String>,
+    /// Gross of the excluded rows, in MIXED currency minor units (HUF
+    /// forints and EUR cents summed as-is). Log-only, never on the wire
+    /// and never rendered: it exists so the aggregate warning can say how
+    /// much money the settled classification removed, at the same
+    /// "amounts sum HUF + EUR" precision the aging tiles already use.
+    gross_minor: i64,
+}
+
+impl SettledUndated {
+    fn record(&mut self, invoice_id: &str, gross_minor: i64) {
+        self.count = self.count.saturating_add(1);
+        self.gross_minor = self.gross_minor.saturating_add(gross_minor);
+        if self.ids.len() < MAX_UNPARSEABLE_ENTRY_IDS {
+            self.ids.push(invoice_id.to_string());
+        }
+    }
+}
+
+/// Decide whether ONE candidate invoice (receivable or payable) is still
+/// OUTSTANDING, and if so which aging bucket it belongs in.
+///
+/// `Some((bucket, deadline))` — the deadline was readable, so the invoice
+/// is outstanding and this is its bucket. Placement is byte-identical to
+/// the pre-existing [`aging_bucket_for`] behaviour; nothing about a
+/// healthy invoice changes.
+///
+/// `None` — the `payment_deadline` was MISSING or UNPARSEABLE. Per
+/// operator direction these are legacy invoices imported from NAV, issued
+/// by the prior system, and are all SETTLED. The invoice is therefore
+/// excluded from outstanding ENTIRELY: not in the receivables / payables
+/// total, not in any aging bucket, not in the past-deadline counters.
+///
+/// **The invariant this exists to hold: an invoice is counted in the
+/// outstanding TOTAL if and only if it lands in an aging bucket, so
+/// `sum(buckets) == total`, always.** Both aging sites used to read
+/// `if let Ok(d) = parse_iso_date(..)` with no `else`, nested inside
+/// `if let Some(deadline)` — but the lines ABOVE had already added the
+/// invoice to the total. A missing or malformed deadline therefore fell
+/// out of every bucket while still counting toward the headline above it:
+/// the operator read "Receivables 4 500 000" over buckets adding to
+/// 3 200 000 with no way to learn which figure was the lie. Returning one
+/// decision that gates the total and the bucket TOGETHER is what closes
+/// that — by exclusion rather than by imputation, so the two sides move
+/// as one.
+///
+/// **This classification is an assumption about money, and a load-bearing
+/// one.** A genuinely unpaid invoice that happens to carry no deadline is
+/// excluded by exactly this rule and would simply stop appearing in
+/// payables. That is why the caller records every exclusion into
+/// [`SettledUndated`] and why [`compute_financial_report`] emits an
+/// aggregate `tracing::warn!` naming the count and amount: the exclusion
+/// is deliberate, but it must never be silent. See
+/// [`LedgerDiagnostics::aging_settled_undated`].
+///
+/// Called once per candidate invoice per aggregation run. The comparative
+/// windows (MoM / YoY / annual-running) run the same aggregation over
+/// their own windows; only the primary window's tally rides out on the
+/// wire.
+fn aging_placement(
+    today: Date,
+    invoice_id: &str,
+    deadline: Option<&str>,
+) -> Option<(AgingBucket, Date)> {
+    match deadline {
+        Some(raw) => match parse_iso_date(raw) {
+            Ok(parsed) => Some((aging_bucket_for(today, parsed), parsed)),
+            Err(error) => {
+                // A deadline that is PRESENT but unreadable is NOT an
+                // expected shape on either side, so unlike the absent case
+                // it earns an error line per row. It is still classified
+                // settled, which is why this is loud: the most likely way
+                // to reach here in bulk is not bad data at all but a
+                // column-type change defeating the `SUBSTR` guards on the
+                // two projections (see `OutgoingLineGroup::payment_deadline`
+                // and `ApRow::payment_deadline`) — and that would exclude
+                // the entire ledger as settled at once.
+                tracing::error!(
+                    invoice_id = %invoice_id,
+                    payment_deadline = %raw,
+                    parse_error = %error,
+                    "financial report: invoice has an UNREADABLE payment_deadline — treated as \
+                     SETTLED and excluded from outstanding (total, aging buckets and \
+                     past-deadline counters). If this invoice is in fact unpaid, fix the \
+                     deadline and it returns to the books"
+                );
+                None
+            }
+        },
+        None => {
+            // An ABSENT deadline is the expected legacy shape on BOTH
+            // sides, for two different and equally concrete reasons:
+            //
+            //   * AR — `payment_deadline` arrived as a NULLable column in
+            //     the PR-84 additive migration (`MIGRATE_PR_84_SQL` in
+            //     `billing/adapters/duckdb_store.rs`), which deliberately
+            //     runs NO backfill `UPDATE`. So a NULL here means exactly
+            //     "issued before PR-84" — a bounded, historical set that
+            //     the operator has ruled settled. It is NOT the case that
+            //     every issued invoice has a validated deadline; the
+            //     issue path simply had nowhere to store one before PR-84.
+            //   * AP — `ap_sync` stamps `payment_deadline: None` on every
+            //     NAV-synced payable, ongoing, so this is unbounded and
+            //     the dominant population. That is the exposure the
+            //     aggregate warning exists for.
+            //
+            // Either way it must not be logged like a fault: at error
+            // level the AP case alone would emit a line per payable per
+            // dashboard load and drown the ledger diagnostics that ARE
+            // errors. The
+            // honest signal is the aggregate — one WARN summary per report
+            // plus the machine-countable
+            // `LedgerDiagnostics::aging_settled_undated` — with the
+            // per-invoice attribution kept at debug for whoever is
+            // actually chasing one.
+            tracing::debug!(
+                invoice_id = %invoice_id,
+                "financial report: invoice has NO payment_deadline — treated as SETTLED and \
+                 excluded from outstanding (total, aging buckets and past-deadline counters)"
+            );
+            None
+        }
+    }
+}
+
+/// The bucket's slot on a panel — the one place the bucket→field mapping
+/// lives, so the two aging sites cannot drift apart.
+fn aging_slot(panel: &mut AgingPanel, bucket: AgingBucket) -> &mut AmountAggregate {
+    match bucket {
+        AgingBucket::Current => &mut panel.current,
+        AgingBucket::Days1To30 => &mut panel.days_1_30,
+        AgingBucket::Days31To60 => &mut panel.days_31_60,
+        AgingBucket::Days61To90 => &mut panel.days_61_90,
+        AgingBucket::Days90Plus => &mut panel.days_90_plus,
+    }
+}
+
+/// Add one invoice's amounts to its aging bucket.
+fn accrue_aging(panel: &mut AgingPanel, bucket: AgingBucket, net: i64, vat: i64, gross: i64) {
+    let dest = aging_slot(panel, bucket);
+    dest.net_minor = dest.net_minor.saturating_add(net);
+    dest.vat_minor = dest.vat_minor.saturating_add(vat);
+    dest.gross_minor = dest.gross_minor.saturating_add(gross);
+    dest.count = dest.count.saturating_add(1);
+}
+
 /// Round-half-even integer division (banker's rounding) — matches the
 /// `huf_equivalent_round_half_even` posture in `modules/billing` for
 /// the VAT minor-unit rounding pass. `divisor` is assumed positive
@@ -1429,6 +1829,16 @@ pub fn compute_financial_report(
     let ledger = Ledger::open(db_path, tenant.clone(), binary_hash)
         .context("open audit ledger for financial report")?;
     let walk = walk_ledger(&ledger, window)?;
+    // The walk already error-logged each undecodable entry individually.
+    // This is the one operator-facing line that says the SNAPSHOT as a
+    // whole is suspect, and it rides out on the report so a caller/UI can
+    // say so too.
+    if walk.diagnostics.unparseable_entries > 0 {
+        tracing::error!(
+            unparseable_entries = walk.diagnostics.unparseable_entries,
+            "financial report: figures may be INCOMPLETE — some audit entries could not be read"
+        );
+    }
 
     // Build a best-effort buyer-name map by reading side-store input.json
     // files for each `InvoiceDraftCreated` entry's `nav_xml_path`. Same
@@ -1485,66 +1895,8 @@ pub fn compute_financial_report(
         }
     }
 
-    // AP-side: expenses + VAT-paid + payables + payable-aging + top
-    // vendors. Irrelevant rows are excluded from every bucket per the
-    // S177 closed-vocab semantics (operator declared not-our-problem).
-    let mut ap = ApAggregate::default();
-    let mut payable_past_deadline = 0u64;
-    for r in &ap_rows {
-        if r.local_status == "Irrelevant" {
-            continue;
-        }
-        let exp_target = match r.currency.as_str() {
-            "EUR" => &mut ap.expenses.eur,
-            _ => &mut ap.expenses.huf,
-        };
-        exp_target.net_minor = exp_target.net_minor.saturating_add(r.net_minor);
-        exp_target.vat_minor = exp_target.vat_minor.saturating_add(r.vat_minor);
-        exp_target.gross_minor = exp_target.gross_minor.saturating_add(r.gross_minor);
-        exp_target.count = exp_target.count.saturating_add(1);
-        let vp_target = match r.currency.as_str() {
-            "EUR" => &mut ap.vat_paid.eur,
-            _ => &mut ap.vat_paid.huf,
-        };
-        vp_target.vat_minor = vp_target.vat_minor.saturating_add(r.vat_minor);
-        vp_target.gross_minor = vp_target.gross_minor.saturating_add(r.vat_minor);
-        vp_target.count = vp_target.count.saturating_add(1);
-        // Top vendors
-        let key = (r.supplier_name.clone(), r.currency.clone());
-        let entry = ap.top_vendors.entry(key).or_insert((0, 0));
-        entry.0 = entry.0.saturating_add(r.gross_minor);
-        entry.1 = entry.1.saturating_add(1);
-        // Payables + aging — outstanding only.
-        if r.local_status == "Outstanding" {
-            let p_target = match r.currency.as_str() {
-                "EUR" => &mut ap.payables.eur,
-                _ => &mut ap.payables.huf,
-            };
-            p_target.net_minor = p_target.net_minor.saturating_add(r.net_minor);
-            p_target.vat_minor = p_target.vat_minor.saturating_add(r.vat_minor);
-            p_target.gross_minor = p_target.gross_minor.saturating_add(r.gross_minor);
-            p_target.count = p_target.count.saturating_add(1);
-            if let Some(deadline_s) = &r.payment_deadline {
-                if let Ok(deadline_d) = parse_iso_date(deadline_s) {
-                    let bucket = aging_bucket_for(req.today, deadline_d);
-                    let dest = match bucket {
-                        AgingBucket::Current => &mut ap.payables_aging.current,
-                        AgingBucket::Days1To30 => &mut ap.payables_aging.days_1_30,
-                        AgingBucket::Days31To60 => &mut ap.payables_aging.days_31_60,
-                        AgingBucket::Days61To90 => &mut ap.payables_aging.days_61_90,
-                        AgingBucket::Days90Plus => &mut ap.payables_aging.days_90_plus,
-                    };
-                    dest.net_minor = dest.net_minor.saturating_add(r.net_minor);
-                    dest.vat_minor = dest.vat_minor.saturating_add(r.vat_minor);
-                    dest.gross_minor = dest.gross_minor.saturating_add(r.gross_minor);
-                    dest.count = dest.count.saturating_add(1);
-                    if !matches!(bucket, AgingBucket::Current) {
-                        payable_past_deadline = payable_past_deadline.saturating_add(1);
-                    }
-                }
-            }
-        }
-    }
+    let ap = aggregate_ap(&ap_rows, req.today);
+    let payable_past_deadline = ap.payable_past_deadline;
 
     let deferred_notes: Vec<String> = vec![
         "Revenue currency split now ships in snapshot-rate HUF (S262); FX-aggregated \
@@ -1651,6 +2003,62 @@ pub fn compute_financial_report(
             .saturating_sub(ap.vat_paid.eur.vat_minor),
     };
 
+    // Merge the two settled-undated tallies onto the walk's diagnostics —
+    // one integrity object goes out on the wire.
+    //
+    // The COUNT is exact. The id list is a sample, and honestly so: each
+    // side already capped its own ids at `MAX_UNPARSEABLE_ENTRY_IDS` while
+    // collecting, so the order here is cap → merge → sort → cap. The
+    // published ids are therefore a sorted subset of "the first 50 each
+    // side happened to see", NOT the 50 smallest ids overall — and on the
+    // AR side "happened to see" is `HashMap` iteration order, which is not
+    // stable between runs. The sort buys presentation determinism for a
+    // given set, not a deterministic set. That is the same
+    // count-exact/ids-are-a-starting-point contract
+    // `unparseable_entry_ids` ships under; anyone needing the full list
+    // reads the log.
+    let mut ledger_diagnostics = walk.diagnostics;
+    ledger_diagnostics.aging_settled_undated_receivables = outgoing.settled_undated.count;
+    ledger_diagnostics.aging_settled_undated_payables = ap.settled_undated.count;
+    ledger_diagnostics.aging_settled_undated = outgoing
+        .settled_undated
+        .count
+        .saturating_add(ap.settled_undated.count);
+    let mut settled_ids = outgoing.settled_undated.ids;
+    settled_ids.extend(ap.settled_undated.ids);
+    settled_ids.sort();
+    settled_ids.truncate(MAX_UNPARSEABLE_ENTRY_IDS);
+    ledger_diagnostics.aging_settled_undated_invoice_ids = settled_ids;
+    // THE TRIPWIRE. Excluding a deadline-less invoice from outstanding is
+    // a deliberate operator-directed classification, but it is still an
+    // assumption about money: a genuinely unpaid invoice that happens to
+    // carry no deadline leaves the books by exactly this route. It may be
+    // deliberate; it must never be SILENT. So one aggregate line per
+    // report, at WARN, naming how many rows and how much gross were
+    // written off as settled — per side, because `ap_sync` stamps no
+    // deadline on any NAV-synced payable and the AP figure is therefore
+    // expected to be large while a non-zero AR figure is not.
+    //
+    // Amounts are mixed-currency minor units (HUF forints + EUR cents
+    // summed as-is), the same precision the aging tiles already disclose;
+    // the field name says so rather than implying a real total.
+    if ledger_diagnostics.aging_settled_undated > 0 {
+        tracing::warn!(
+            settled_undated_total = ledger_diagnostics.aging_settled_undated,
+            settled_undated_receivables = ledger_diagnostics.aging_settled_undated_receivables,
+            settled_undated_payables = ledger_diagnostics.aging_settled_undated_payables,
+            excluded_gross_minor_mixed_currency = outgoing
+                .settled_undated
+                .gross_minor
+                .saturating_add(ap.settled_undated.gross_minor),
+            "financial report: invoices with NO readable payment deadline were treated as \
+             SETTLED and EXCLUDED from outstanding — they are absent from the receivables / \
+             payables totals, from every aging bucket and from the past-deadline counters. \
+             This is the configured legacy-import behaviour; if any of these invoices is in \
+             fact unpaid it is NOT on the books until its deadline is set"
+        );
+    }
+
     let dso_days = DsoPanel {
         huf_days: mean(&outgoing.dso_huf_samples),
         eur_days: mean(&outgoing.dso_eur_samples),
@@ -1687,6 +2095,7 @@ pub fn compute_financial_report(
         deltas: PeriodDeltas { mom, yoy },
         annual_running,
         deferred_notes,
+        ledger_diagnostics,
     })
 }
 
@@ -1697,6 +2106,82 @@ struct ApAggregate {
     payables: CurrencyAggregate,
     payables_aging: AgingPanel,
     top_vendors: HashMap<(String, String), (i64, u64)>,
+    payable_past_deadline: u64,
+    /// Payables excluded from outstanding as settled legacy imports — see
+    /// [`aging_placement`].
+    settled_undated: SettledUndated,
+}
+
+/// AP-side aggregation: expenses + VAT-paid + payables + payable-aging +
+/// top vendors. Irrelevant rows are excluded from every bucket per the
+/// S177 closed-vocab semantics (operator declared not-our-problem).
+///
+/// Extracted from [`compute_financial_report`]'s body so the payables
+/// aging invariant (`sum(buckets) == payables total`) is unit-testable
+/// without standing up a DuckDB fixture — the AR side already was, and
+/// only the AR side had pins.
+fn aggregate_ap(rows: &[ApRow], today: Date) -> ApAggregate {
+    let mut ap = ApAggregate::default();
+    for r in rows {
+        if r.local_status == "Irrelevant" {
+            continue;
+        }
+        let exp_target = match r.currency.as_str() {
+            "EUR" => &mut ap.expenses.eur,
+            _ => &mut ap.expenses.huf,
+        };
+        exp_target.net_minor = exp_target.net_minor.saturating_add(r.net_minor);
+        exp_target.vat_minor = exp_target.vat_minor.saturating_add(r.vat_minor);
+        exp_target.gross_minor = exp_target.gross_minor.saturating_add(r.gross_minor);
+        exp_target.count = exp_target.count.saturating_add(1);
+        let vp_target = match r.currency.as_str() {
+            "EUR" => &mut ap.vat_paid.eur,
+            _ => &mut ap.vat_paid.huf,
+        };
+        vp_target.vat_minor = vp_target.vat_minor.saturating_add(r.vat_minor);
+        vp_target.gross_minor = vp_target.gross_minor.saturating_add(r.vat_minor);
+        vp_target.count = vp_target.count.saturating_add(1);
+        // Top vendors
+        let key = (r.supplier_name.clone(), r.currency.clone());
+        let entry = ap.top_vendors.entry(key).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(r.gross_minor);
+        entry.1 = entry.1.saturating_add(1);
+        // Payables + aging — outstanding only.
+        if r.local_status == "Outstanding" {
+            // Same single decision as the AR side, gating the total and
+            // the bucket together. It bites hardest here: `ap_sync` stamps
+            // `payment_deadline: None` on EVERY NAV-synced payable, so on
+            // a NAV-populated book this excludes essentially the whole
+            // payables population as settled. That is the operator's
+            // call — these are legacy prior-system invoices — and
+            // `ap.settled_undated` plus the aggregate warning are what
+            // keep it from being a silent write-off.
+            match aging_placement(today, &r.id, r.payment_deadline.as_deref()) {
+                None => ap.settled_undated.record(&r.id, r.gross_minor),
+                Some((bucket, _deadline_d)) => {
+                    let p_target = match r.currency.as_str() {
+                        "EUR" => &mut ap.payables.eur,
+                        _ => &mut ap.payables.huf,
+                    };
+                    p_target.net_minor = p_target.net_minor.saturating_add(r.net_minor);
+                    p_target.vat_minor = p_target.vat_minor.saturating_add(r.vat_minor);
+                    p_target.gross_minor = p_target.gross_minor.saturating_add(r.gross_minor);
+                    p_target.count = p_target.count.saturating_add(1);
+                    accrue_aging(
+                        &mut ap.payables_aging,
+                        bucket,
+                        r.net_minor,
+                        r.vat_minor,
+                        r.gross_minor,
+                    );
+                    if !matches!(bucket, AgingBucket::Current) {
+                        ap.payable_past_deadline = ap.payable_past_deadline.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    ap
 }
 
 fn mean(xs: &[f64]) -> Option<f64> {
@@ -2092,6 +2577,13 @@ mod tests {
     /// Synthetic audit entry — the hash/actor fields are placeholders;
     /// the walk never reads them. Mirrors `audit_summary::tests::entry`.
     fn pin_entry(kind: EventKind, payload: serde_json::Value) -> Entry {
+        pin_entry_raw(kind, serde_json::to_vec(&payload).unwrap())
+    }
+
+    /// Same, but with the payload bytes given VERBATIM — the only way to
+    /// build an entry whose payload is malformed or not JSON at all, which
+    /// is exactly what the unparseable-payload pins need.
+    fn pin_entry_raw(kind: EventKind, payload: Vec<u8>) -> Entry {
         Entry {
             id: EntryId::new(),
             seq: Sequence::FIRST,
@@ -2106,7 +2598,7 @@ mod tests {
             binary_hash: BinaryHash::from_bytes([0u8; 32]),
             tenant_id: TenantId::new("t").unwrap(),
             kind,
-            payload: serde_json::to_vec(&payload).unwrap(),
+            payload,
             idempotency_key: None,
             entry_hash: EntryHash::from_bytes([0u8; 32]),
             session_id: None,
@@ -2204,6 +2696,15 @@ mod tests {
             walk.traces["inv-base"].has_landed_storno,
             "a SAVED storno child must flag its base as landed"
         );
+        // A ledger of exclusively well-formed payloads must produce an
+        // EMPTY diagnostic. Without this, a diagnostic that fires on
+        // everything would pass the malformed-payload pins below while
+        // crying wolf on every real report.
+        assert_eq!(
+            walk.diagnostics,
+            LedgerDiagnostics::default(),
+            "no false positives: every payload here decodes, so nothing is unreadable"
+        );
 
         let groups = vec![
             pin_group("inv-base", "2026-05-01", "2026-06-15", 100_000),
@@ -2287,6 +2788,823 @@ mod tests {
             );
             assert_eq!(agg.receivables.huf.count, 1, "{label}: one invoice owed");
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Unparseable-payload diagnostics.
+    //
+    // The walk used to swallow a payload that failed to decode (`if let
+    // Ok(..)` with no else, `.ok()?`). The entry then contributed to
+    // nothing and NOTHING said so — the operator read a clean number that
+    // silently omitted a payment / an ack / a storno reversal. These pins
+    // hold the two halves of the fix together: the drop is COUNTED and
+    // ATTRIBUTED, and the valid rows' arithmetic is untouched.
+    //
+    // Mutation check: reverting any decode site to its silent form
+    // (`if let Ok(parsed) = ..` in `merge`, `.ok()?` in the extractors)
+    // drives `unparseable_entries` to 0 and reds every assertion below.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// An invoice-scoped entry whose payload is well-formed JSON naming
+    /// the invoice but MISSING the typed payload's required fields — so
+    /// the entry reaches `merge` and the typed decode is what fails.
+    fn pin_broken_payment(invoice_id: &str) -> Entry {
+        pin_entry_raw(
+            EventKind::InvoicePaymentRecorded,
+            format!(r#"{{"invoice_id":"{invoice_id}","paid_at":"2026-07-20"}}"#).into_bytes(),
+        )
+    }
+
+    /// `net == gross` groups (VAT basis points 0) so the aging arithmetic
+    /// in these pins is legible at a glance, and an optional deadline so
+    /// the NULL half of the aging hole is reachable.
+    fn undated_group(
+        invoice_id: &str,
+        currency: &str,
+        net: i64,
+        deadline: Option<&str>,
+    ) -> OutgoingLineGroup {
+        OutgoingLineGroup {
+            invoice_id: invoice_id.to_string(),
+            currency: currency.to_string(),
+            issue_date: "2026-07-01".to_string(),
+            payment_deadline: deadline.map(|s| s.to_string()),
+            vat_rate_basis_points: 0,
+            net_minor: net,
+        }
+    }
+
+    fn saved_trace() -> ReportTrace {
+        ReportTrace {
+            last_ack_status: Some("SAVED".to_string()),
+            ..ReportTrace::default()
+        }
+    }
+
+    /// The headline case. Two SAVED invoices, both with a recorded
+    /// payment; one payment payload is malformed.
+    ///
+    /// Pre-fix the malformed payment simply evaporated: the invoice looked
+    /// unpaid, sat in receivables, and no signal existed anywhere.
+    /// Post-fix the NUMBERS ARE THE SAME — deliberately, this fix does not
+    /// guess at an amount it could not read — but the run now says one
+    /// entry was unreadable, so "receivables" can be presented as
+    /// possibly-incomplete instead of authoritative.
+    #[test]
+    fn malformed_payment_payload_is_counted_not_swallowed() {
+        let entries = vec![
+            pin_ack("paid_ok", "SAVED"),
+            pin_payment("paid_ok", "2026-07-20", 100_000),
+            pin_ack("paid_broken", "SAVED"),
+            pin_broken_payment("paid_broken"),
+        ];
+        let walk = walk_entries(&entries, DateWindow::unbounded());
+
+        // (a) The drop is visible and attributable.
+        assert_eq!(
+            walk.diagnostics.unparseable_entries, 1,
+            "the malformed payment must be counted; 0 means it vanished silently again"
+        );
+        assert_eq!(walk.diagnostics.unparseable_entry_ids.len(), 1);
+        assert!(
+            walk.diagnostics.unparseable_entry_ids[0].starts_with("aud_"),
+            "the id must be the operator-facing prefixed form, got {:?}",
+            walk.diagnostics.unparseable_entry_ids[0]
+        );
+
+        // (b) The valid row is untouched — same payment, same ack.
+        assert_eq!(
+            walk.traces["paid_ok"].payment_paid_at.as_deref(),
+            Some("2026-07-20")
+        );
+        assert_eq!(walk.traces["paid_ok"].payment_amount_minor, Some(100_000));
+        assert_eq!(
+            walk.traces["paid_ok"].last_ack_status.as_deref(),
+            Some("SAVED")
+        );
+        // The unreadable payment is NOT invented: the invoice stays as it
+        // was before that entry — SAVED, no payment. Preserving current
+        // numeric behaviour is the point; only the silence is fixed.
+        assert_eq!(walk.traces["paid_broken"].payment_paid_at, None);
+        assert_eq!(
+            walk.traces["paid_broken"].last_ack_status.as_deref(),
+            Some("SAVED"),
+            "the malformed payment must not take the invoice's own valid ack down with it"
+        );
+
+        // (c) Aggregates over the valid rows are unchanged: `paid_ok` is
+        // out of receivables because it is paid, `paid_broken` is in
+        // because nothing readable said otherwise.
+        let today = Date::from_calendar_date(2026, Month::August, 13).unwrap();
+        let groups = vec![
+            undated_group("paid_ok", "HUF", 100_000, Some("2026-07-14")),
+            undated_group("paid_broken", "HUF", 250_000, Some("2026-07-14")),
+        ];
+        let agg = aggregate_outgoing(groups, &walk.traces, today, &HashMap::new());
+        assert_eq!(
+            agg.receivables.huf.gross_minor, 250_000,
+            "only the unpaid one is owed; the valid payment still clears its invoice"
+        );
+        assert_eq!(agg.revenue.huf.gross_minor, 350_000);
+    }
+
+    /// The other two decode surfaces on the same walk, and the
+    /// count-each-entry-once rule.
+    ///
+    /// A malformed ACK is the most damaging of the three: pre-fix it left
+    /// `last_ack_status` at `None`, so a genuinely SAVED invoice
+    /// classified as `PendingDraft` and dropped out of revenue AND
+    /// VAT-collected entirely. A malformed STORNO chain link left the base
+    /// uncancelled. A payload that is not JSON at all never even reached
+    /// `merge`.
+    #[test]
+    fn malformed_ack_chain_link_and_non_json_payloads_are_each_counted_once() {
+        let entries = vec![
+            // One healthy invoice to prove the valid path survives all of it.
+            pin_ack("healthy", "SAVED"),
+            // Malformed ack: has `invoice_id`, missing `transaction_id` +
+            // `response_xml`.
+            pin_entry_raw(
+                EventKind::InvoiceAckStatus,
+                br#"{"invoice_id":"bad_ack","ack_status":"SAVED"}"#.to_vec(),
+            ),
+            // Malformed storno chain link: no `invoice_id` key at all
+            // (normal for this kind — `Ok(None)` from the id extractor),
+            // and the typed chain-link decode fails on the missing fields.
+            pin_entry_raw(
+                EventKind::InvoiceStornoIssued,
+                br#"{"base_invoice_id":"some_base"}"#.to_vec(),
+            ),
+            // Not JSON at all, on a kind that BOTH decode paths look at.
+            // Must still be one entry, not two: the count answers "how
+            // many entries could not be read", not "how many decode
+            // attempts failed".
+            pin_entry_raw(EventKind::InvoiceStornoIssued, b"<<< not json >>>".to_vec()),
+        ];
+        let walk = walk_entries(&entries, DateWindow::unbounded());
+
+        assert_eq!(
+            walk.diagnostics.unparseable_entries, 3,
+            "one per unreadable ENTRY — the non-JSON storno fails both decodes but counts once"
+        );
+        assert_eq!(walk.diagnostics.unparseable_entry_ids.len(), 3);
+
+        // The malformed ack did not fabricate a trace state, and — the
+        // point of the fix — did not fabricate silence either.
+        assert!(
+            walk.traces
+                .get("bad_ack")
+                .is_none_or(|t| t.last_ack_status.is_none()),
+            "an unreadable ack must not be guessed at"
+        );
+        // The healthy invoice is completely unaffected by its corrupt
+        // neighbours.
+        assert_eq!(
+            walk.traces["healthy"].last_ack_status.as_deref(),
+            Some("SAVED")
+        );
+        assert!(matches!(
+            walk.traces["healthy"].classify(),
+            CountedKind::Counted {
+                is_storno_self: false
+            }
+        ));
+        // The unreadable chain link contributed no hygiene count — pre-fix
+        // that was ALSO true, and equally silent. Now it is accounted for.
+        assert_eq!(walk.storno_links_in_period, 0);
+    }
+
+    /// The id list is capped so a systemically corrupt ledger cannot
+    /// balloon the report payload, but the COUNT stays exact — the
+    /// difference is what tells a caller "and more".
+    #[test]
+    fn unparseable_entry_ids_are_capped_while_the_count_stays_exact() {
+        let corrupt = MAX_UNPARSEABLE_ENTRY_IDS + 7;
+        let entries: Vec<Entry> = (0..corrupt)
+            .map(|_| pin_entry_raw(EventKind::InvoicePaymentRecorded, b"not json".to_vec()))
+            .collect();
+
+        let walk = walk_entries(&entries, DateWindow::unbounded());
+
+        assert_eq!(walk.diagnostics.unparseable_entries, corrupt as u64);
+        assert_eq!(
+            walk.diagnostics.unparseable_entry_ids.len(),
+            MAX_UNPARSEABLE_ENTRY_IDS
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Aging coherence — `sum(buckets) == total`, by EXCLUSION.
+    //
+    // Both aging sites used to read `if let Ok(d) = parse_iso_date(..)`
+    // with no `else`, nested in `if let Some(deadline)`. An invoice whose
+    // `payment_deadline` was missing or malformed fell out of every bucket
+    // — but the lines directly above had already added it to the
+    // receivables / payables TOTAL. The panel's breakdown summed to less
+    // than the panel's own headline and nothing said so. Same silent-drop
+    // class as the audit entries above, different code path.
+    //
+    // The closure is by EXCLUSION, per operator direction: a deadline-less
+    // invoice is a settled legacy import (issued by the prior system,
+    // reaching us through NAV) and is not outstanding at all — out of the
+    // total, out of every bucket, out of the past-deadline counters. One
+    // `aging_placement` decision gates the total and the bucket together,
+    // so the two cannot disagree.
+    //
+    // MUTATION PROOF for the pins below: restore the old shape at either
+    // site — take the total unconditionally and bucket only when the
+    // deadline parses, e.g. in `aggregate_outgoing`
+    //
+    //     ..add to the AR total..
+    //     if let Some(s) = deadline {
+    //         if let Ok(d) = parse_iso_date(s) { ..accrue_aging.. }
+    //     }
+    //
+    // and the `sum == total` assertion is the FIRST thing that reds
+    // (buckets short by exactly the excluded invoices), followed by the
+    // total and diagnostics assertions.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Sum an aging panel's five buckets — the figure that must equal the
+    /// receivables / payables headline the panel sits under.
+    fn aging_totals(panel: &AgingPanel) -> (i64, i64, i64, u64) {
+        [
+            &panel.current,
+            &panel.days_1_30,
+            &panel.days_31_60,
+            &panel.days_61_90,
+            &panel.days_90_plus,
+        ]
+        .into_iter()
+        .fold((0, 0, 0, 0), |acc, b| {
+            (
+                acc.0 + b.net_minor,
+                acc.1 + b.vat_minor,
+                acc.2 + b.gross_minor,
+                acc.3 + b.count,
+            )
+        })
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Deadline-classifier PARITY vocabulary.
+    //
+    // `parse_iso_date` decides, on the backend, whether an invoice is
+    // outstanding at all: unreadable → settled → out of the totals, the
+    // buckets and the counters. The SPA's `parseDeadline` (aging.ts) makes
+    // the SAME call client-side for the aging drill-downs. If the two ever
+    // disagree about one string, the tile and its list disagree about a
+    // row — and the disagreement is now about whether money is on the
+    // books, not merely which bucket it sits in.
+    //
+    // This exact table is duplicated in `aging-deadline-parity.test.ts`.
+    // Both must accept and reject identically. The nastiest rows are the
+    // ones a naive parser gets WRONG rather than merely differently:
+    // `2026-02-30` (JS `Date` silently rolls it to March 2) and
+    // `2026-06-15T00:00:00Z` (accepted by `Date.parse`, rejected here) —
+    // either would make the SPA bucket a row the backend calls settled.
+    // ──────────────────────────────────────────────────────────────────
+    const DEADLINE_PARITY_VOCAB: &[(&str, bool)] = &[
+        ("2026-06-15", true),
+        ("  2026-06-15  ", true),        // both sides trim
+        ("2024-02-29", true),            // real leap day
+        ("2026-02-30", false),           // day out of range for the month
+        ("2025-02-29", false),           // not a leap year
+        ("2026-13-01", false),           // month out of range
+        ("2026-06-31", false),           // June has 30 days
+        ("2026-06-15T00:00:00Z", false), // trailing time component
+        ("2026-06-15x", false),          // trailing junk
+        ("2026-6-5", false),             // unpadded
+        ("15/06/2026", false),           // wrong order + separator
+        ("", false),
+        ("not-a-date", false),
+        // ── Exotic shapes where the two runtimes diverge BY DEFAULT.
+        // Every row below was a genuine disagreement before this pass;
+        // together they are why `parse_iso_date` gained an explicit
+        // shape gate and an ASCII-only trim.
+        //
+        // `time`'s `[year]` takes an optional leading sign, so a bare
+        // `Date::parse` accepts these while the SPA's anchored regex
+        // never did. The writer accepted them too, and the 10-char SQL
+        // projection truncates `+2026-06-15` to `+2026-06-1` — a live,
+        // genuinely-outstanding payable written off as settled.
+        ("+2026-06-15", false),
+        ("-2026-06-15", false),
+        // Rust accepts year 1; JS `Date.UTC` maps years 0..=99 onto
+        // 1900..=1999, so the SPA's round-trip check used to reject it.
+        // A real calendar date must not depend on which language reads
+        // it.
+        ("0001-01-01", true),
+        // U+FEFF is NOT Unicode `White_Space`, so Rust's `str::trim`
+        // leaves it — but JS `String.prototype.trim` strips it. Both
+        // sides now trim ASCII whitespace only, so both reject.
+        ("\u{FEFF}2026-06-15", false),
+        ("2026-06-15\u{FEFF}", false),
+        // U+0085 (NEL) and U+00A0 (NBSP) are Unicode whitespace that
+        // BOTH runtimes' default trim strips — they agreed, but on the
+        // wrong answer: a canonical date has no such padding. ASCII-only
+        // trimming makes both reject.
+        ("\u{0085}2026-06-15", false),
+        ("\u{00A0}2026-06-15", false),
+        // ASCII whitespace IS trimmed, on both sides.
+        ("\t2026-06-15\n", true),
+    ];
+
+    /// The backend half of the parity contract. Mutation guard: relaxing
+    /// `parse_iso_date` (e.g. slicing the first 10 chars before parsing,
+    /// or swapping to a permissive parser) reds the rows it starts
+    /// accepting.
+    #[test]
+    fn parse_iso_date_matches_the_shared_deadline_vocabulary() {
+        for (raw, expected_ok) in DEADLINE_PARITY_VOCAB {
+            assert_eq!(
+                parse_iso_date(raw).is_ok(),
+                *expected_ok,
+                "parse_iso_date({raw:?}) must be {}; the SPA's parseDeadline agrees, and a \
+                 disagreement means a tile and its drill-down disagree about whether an \
+                 invoice is on the books",
+                if *expected_ok { "accepted" } else { "rejected" }
+            );
+        }
+    }
+
+    /// The classifier decides OUTSTANDING-ness, not just bucketing, so the
+    /// vocabulary is asserted through `aging_placement` too — the level
+    /// the rest of the report actually consumes.
+    #[test]
+    fn aging_placement_excludes_exactly_the_vocabulary_rejects() {
+        let today = Date::from_calendar_date(2026, Month::August, 13).unwrap();
+        for (raw, expected_ok) in DEADLINE_PARITY_VOCAB {
+            let placed = aging_placement(today, "inv", Some(raw)).is_some();
+            assert_eq!(
+                placed,
+                *expected_ok,
+                "aging_placement({raw:?}) must be {}",
+                if *expected_ok {
+                    "outstanding"
+                } else {
+                    "settled/excluded"
+                }
+            );
+        }
+        // And the NULL case is always settled.
+        assert!(aging_placement(today, "inv", None).is_none());
+    }
+
+    /// Both `payment_deadline` projections must survive a column that is
+    /// TIMESTAMP-typed (or a VARCHAR holding RFC3339), because
+    /// [`parse_iso_date`] accepts only `[year]-[month]-[day]`.
+    ///
+    /// This matters far more than it did before the settled-exclusion
+    /// rule. Previously an unparseable deadline was aged conservatively
+    /// into 90+ and stayed on the books; now it is classified SETTLED and
+    /// leaves the outstanding total entirely. So a column-type change on
+    /// either side would not merely mis-bucket — it would empty
+    /// receivables or payables in one step, with the diagnostic dutifully
+    /// reporting the whole ledger as excluded.
+    ///
+    /// **The real-projection pin.** Drives `query_outgoing_groups` and
+    /// `query_ap_rows` THEMSELVES against a widened deadline column, and
+    /// asserts the row survives all the way through to an aging bucket.
+    ///
+    /// The hand-written-SQL variant below cannot do this job: it asserts
+    /// on a literal string this test file owns, so reverting the two real
+    /// projections to a bare `CAST` leaves it green while receivables and
+    /// payables silently empty. This one reds on exactly that mutation,
+    /// because it reads the SQL the report actually issues.
+    #[test]
+    fn real_projections_keep_a_timestamp_shaped_deadline_outstanding() {
+        let today = Date::from_calendar_date(2026, Month::August, 13).unwrap();
+
+        // ── AR: `invoice.payment_deadline` widened to TIMESTAMP.
+        let conn = Connection::open_in_memory().expect("in-memory duckdb");
+        conn.execute_batch(
+            "CREATE TABLE invoice (
+                 id VARCHAR, currency VARCHAR, issue_date VARCHAR,
+                 delivery_date DATE, payment_deadline TIMESTAMP,
+                 huf_equivalent_total DECIMAL(18,0)
+             );
+             CREATE TABLE invoice_line (
+                 invoice_id VARCHAR, vat_rate_basis_points INTEGER,
+                 quantity DECIMAL(18,6), unit_price BIGINT
+             );
+             INSERT INTO invoice VALUES
+               ('inv-ts', 'HUF', '2026-06-10T09:00:00Z', NULL,
+                TIMESTAMP '2026-07-14 12:00:00', NULL);
+             INSERT INTO invoice_line VALUES ('inv-ts', 0, 1.0, 43180);",
+        )
+        .expect("seed AR fixture with a TIMESTAMP deadline");
+
+        let groups = query_outgoing_groups(&conn, june_2026(), DateBasis::Issued)
+            .expect("the real AR projection must read a widened column without failing");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].payment_deadline.as_deref(),
+            Some("2026-07-14"),
+            "query_outgoing_groups must normalise the deadline to YYYY-MM-DD; a bare CAST \
+             yields `2026-07-14 12:00:00`, which parse_iso_date rejects"
+        );
+
+        // …and it must still be OUTSTANDING once aggregated. This is the
+        // assertion that turns a projection detail into a money fact.
+        let traces: HashMap<String, ReportTrace> =
+            HashMap::from([("inv-ts".into(), saved_trace())]);
+        let agg = aggregate_outgoing(groups, &traces, today, &HashMap::new());
+        assert_eq!(
+            agg.receivables.huf.gross_minor, 43_180,
+            "a readable-but-widened deadline must NOT be written off as settled"
+        );
+        assert_eq!(agg.receivables_aging.days_1_30.count, 1);
+        assert_eq!(
+            agg.settled_undated.count, 0,
+            "0 here is the whole point: the row is on the books, not excluded"
+        );
+
+        // ── AP: `ap_invoice.payment_deadline` holding RFC3339 text.
+        let ap_conn = Connection::open_in_memory().expect("in-memory duckdb");
+        ap_conn
+            .execute_batch(
+                "CREATE TABLE ap_invoice (
+                     id VARCHAR, tenant_id VARCHAR, supplier_name VARCHAR,
+                     issue_date VARCHAR, delivery_date VARCHAR,
+                     payment_deadline VARCHAR,
+                     total_net_minor BIGINT, total_vat_minor BIGINT,
+                     total_gross_minor BIGINT, currency VARCHAR,
+                     local_status VARCHAR
+                 );
+                 INSERT INTO ap_invoice VALUES
+                   ('ap-ts', 't1', 'Beszállító Kft.', '2026-06-10', NULL,
+                    '2026-07-14T12:00:00Z', 43180, 0, 43180, 'HUF', 'Outstanding');",
+            )
+            .expect("seed AP fixture with an RFC3339 deadline");
+
+        let rows = query_ap_rows(&ap_conn, "t1", june_2026(), DateBasis::Issued)
+            .expect("the real AP projection must read the column without failing");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].payment_deadline.as_deref(),
+            Some("2026-07-14"),
+            "query_ap_rows must normalise the deadline to YYYY-MM-DD"
+        );
+
+        let ap = aggregate_ap(&rows, today);
+        assert_eq!(
+            ap.payables.huf.gross_minor, 43_180,
+            "a readable-but-timestamp-shaped payable must NOT be written off as settled"
+        );
+        assert_eq!(ap.payables_aging.days_1_30.count, 1);
+        assert_eq!(ap.settled_undated.count, 0);
+        assert_eq!(ap.payable_past_deadline, 1);
+    }
+
+    /// Mutation guard: drop the `SUBSTR(..., 1, 10)` from either
+    /// projection and its arm reds; drop the `CAST` from the AP
+    /// projection and the bare read below is what it becomes.
+    ///
+    /// NOTE: this asserts on SQL literals written HERE, so on its own it
+    /// proves only that the expression works — not that the report uses
+    /// it. `real_projections_keep_a_timestamp_shaped_deadline_outstanding`
+    /// above is what pins the actual queries; this one is kept for the
+    /// CAST-alone-is-insufficient demonstration it makes explicit.
+    #[test]
+    fn deadline_projections_survive_a_widened_column_on_both_sides() {
+        let conn = Connection::open_in_memory().expect("in-memory duckdb");
+        conn.execute_batch(
+            "CREATE TABLE invoice (id VARCHAR, payment_deadline TIMESTAMP);
+             INSERT INTO invoice VALUES ('inv', TIMESTAMP '2026-06-15 12:00:00');
+             CREATE TABLE ap_invoice (id VARCHAR, payment_deadline VARCHAR);
+             INSERT INTO ap_invoice VALUES ('ap', '2026-06-15T12:00:00Z');",
+        )
+        .expect("seed widened deadline columns");
+
+        // A bare read of the AR side is the InvalidColumnType that would
+        // fail the WHOLE report — the reason the CAST is there at all.
+        let bare: duckdb::Result<String> = conn
+            .prepare("SELECT i.payment_deadline FROM invoice i")
+            .unwrap()
+            .query_row([], |r| r.get(0));
+        assert!(bare.is_err(), "a bare TIMESTAMP read as String must fail");
+
+        // CAST alone is NOT enough: it renders the time component, which
+        // `parse_iso_date` rejects → the invoice would be classified
+        // settled and silently leave receivables.
+        let cast_only: String = conn
+            .prepare("SELECT CAST(i.payment_deadline AS VARCHAR) FROM invoice i")
+            .unwrap()
+            .query_row([], |r| r.get(0))
+            .expect("CAST reads it");
+        assert!(
+            parse_iso_date(&cast_only).is_err(),
+            "CAST alone yields {cast_only:?}, which parse_iso_date rejects — this is exactly \
+             the silent write-off the SUBSTR prevents"
+        );
+
+        // The projections the two queries actually use.
+        for (table, col) in [("invoice i", "i"), ("ap_invoice a", "a")] {
+            let projected: String = conn
+                .prepare(&format!(
+                    "SELECT SUBSTR(CAST({col}.payment_deadline AS VARCHAR), 1, 10) FROM {table}"
+                ))
+                .unwrap()
+                .query_row([], |r| r.get(0))
+                .expect("the CAST+SUBSTR projection must read the column as a String");
+            assert_eq!(projected, "2026-06-15");
+            assert!(
+                parse_iso_date(&projected).is_ok(),
+                "{table}: the projected deadline must stay readable, or every row on this \
+                 side is classified settled at once"
+            );
+        }
+    }
+
+    /// **RECEIVABLES — the headline pin.** A deadline-less invoice
+    /// (missing OR unparseable) is a settled legacy import and must leave
+    /// outstanding COMPLETELY, while its valid-deadline neighbours do not
+    /// move at all.
+    ///
+    /// (a) `sum(buckets) == receivables total` — the core invariant, now
+    ///     held by excluding from BOTH sides rather than imputing into a
+    ///     bucket. This assertion is the one that reds first under a
+    ///     revert to "in the total but not in a bucket".
+    /// (b) both undated rows are out of the TOTAL, out of EVERY bucket
+    ///     (including 90+, which is what the previous behaviour used) and
+    ///     out of the past-deadline counter.
+    /// (c) the two valid-deadline neighbours are byte-identical:
+    ///     `2026-08-23` still `current`, `2026-07-14` still `days_1_30`.
+    ///     A change that re-bucketed healthy invoices to make the sum work
+    ///     would be a worse defect than the one it replaced.
+    /// (d) the excluded rows are COUNTED and NAMED in the settled
+    ///     diagnostic — the exclusion is deliberate but never silent.
+    #[test]
+    fn undated_receivable_is_treated_as_settled_and_excluded_from_outstanding() {
+        let today = Date::from_calendar_date(2026, Month::August, 13).unwrap();
+        let traces: HashMap<String, ReportTrace> = HashMap::from([
+            ("future".into(), saved_trace()),
+            ("overdue".into(), saved_trace()),
+            ("garbled".into(), saved_trace()),
+            ("dateless".into(), saved_trace()),
+        ]);
+        let groups = vec![
+            undated_group("future", "HUF", 20_000, Some("2026-08-23")),
+            undated_group("overdue", "HUF", 43_180, Some("2026-07-14")),
+            // Real-world shape of a broken deadline: a swapped-format date
+            // the ISO parser rejects.
+            undated_group("garbled", "HUF", 777_000, Some("14/07/2026")),
+            // The NULL half of the same rule.
+            undated_group("dateless", "HUF", 5_000, None),
+        ];
+        let agg = aggregate_outgoing(groups, &traces, today, &HashMap::new());
+
+        // (a) THE INVARIANT, asserted FIRST so it is the first thing to
+        //     red under a revert to "in the total but not in a bucket" —
+        //     the shape of the original defect. Buckets and total must
+        //     move together whatever the deadlines look like.
+        let (net, vat, gross, count) = aging_totals(&agg.receivables_aging);
+        assert_eq!(
+            gross, agg.receivables.huf.gross_minor,
+            "the aging buckets must sum to the receivables total the panel is showing"
+        );
+        assert_eq!(net, agg.receivables.huf.net_minor);
+        assert_eq!(vat, agg.receivables.huf.vat_minor);
+        assert_eq!(count, agg.receivables.huf.count);
+
+        // (b) …and they agree at the RIGHT value: only the two
+        //     readable-deadline invoices are owed. 845 180 here would mean
+        //     an undated row is still counted as money someone owes us.
+        assert_eq!(
+            agg.receivables.huf.gross_minor, 63_180,
+            "a deadline-less invoice is settled and must not be counted as outstanding"
+        );
+        assert_eq!(agg.receivables.huf.count, 2);
+
+        // (c) Valid deadlines placed EXACTLY as before.
+        assert_eq!(agg.receivables_aging.current.gross_minor, 20_000);
+        assert_eq!(agg.receivables_aging.current.count, 1);
+        assert_eq!(agg.receivables_aging.days_1_30.gross_minor, 43_180);
+        assert_eq!(agg.receivables_aging.days_1_30.count, 1);
+        assert_eq!(agg.receivables_aging.days_31_60, AmountAggregate::default());
+        assert_eq!(agg.receivables_aging.days_61_90, AmountAggregate::default());
+        // (b) NOT 90+. The previous behaviour aged undated rows here, so
+        //     this specific bucket being empty is what pins the change.
+        assert_eq!(
+            agg.receivables_aging.days_90_plus,
+            AmountAggregate::default(),
+            "undated rows are excluded, NOT aged into 90+"
+        );
+
+        // (b) Out of the past-deadline counter too — only `overdue`, whose
+        //     deadline we could read and which has actually passed.
+        assert_eq!(
+            agg.outstanding_past_deadline_count, 1,
+            "a settled invoice is not a late invoice"
+        );
+        // Only `current` feeds the forward projection.
+        assert_eq!(agg.cashflow_forward.next_90.huf_minor, 20_000);
+
+        // (d) Counted and named. Sorted because `per_invoice` is a HashMap
+        //     and its iteration order is not stable between runs.
+        assert_eq!(agg.settled_undated.count, 2);
+        let mut ids = agg.settled_undated.ids.clone();
+        ids.sort();
+        assert_eq!(ids, vec!["dateless".to_string(), "garbled".to_string()]);
+        assert_eq!(
+            agg.settled_undated.gross_minor, 782_000,
+            "the tripwire must be able to say HOW MUCH left the books"
+        );
+    }
+
+    /// The invariant on the two degenerate books the headline pin cannot
+    /// cover: EVERY receivable undated, and no receivables at all. Both
+    /// must still satisfy `sum(buckets) == total` — trivially, at zero.
+    #[test]
+    fn receivables_buckets_sum_to_total_on_all_undated_and_empty_books() {
+        let today = Date::from_calendar_date(2026, Month::August, 13).unwrap();
+
+        // All undated → nothing outstanding, nothing bucketed, all
+        // disclosed.
+        let traces: HashMap<String, ReportTrace> =
+            HashMap::from([("a".into(), saved_trace()), ("b".into(), saved_trace())]);
+        let agg = aggregate_outgoing(
+            vec![
+                undated_group("a", "EUR", 51_500, None),
+                undated_group("b", "EUR", 12_000, Some("not-a-date")),
+            ],
+            &traces,
+            today,
+            &HashMap::new(),
+        );
+        // Invariant first, at zero on both sides.
+        let (_, _, gross, count) = aging_totals(&agg.receivables_aging);
+        assert_eq!(gross, agg.receivables.eur.gross_minor);
+        assert_eq!(count, agg.receivables.eur.count);
+        assert_eq!(agg.receivables.eur, AmountAggregate::default());
+        assert_eq!(agg.settled_undated.count, 2);
+        assert_eq!(agg.outstanding_past_deadline_count, 0);
+
+        // Empty book → the invariant holds vacuously, and nothing is
+        // reported as settled (no cry-wolf on an empty period).
+        let empty = aggregate_outgoing(vec![], &HashMap::new(), today, &HashMap::new());
+        assert_eq!(empty.receivables.huf, AmountAggregate::default());
+        assert_eq!(aging_totals(&empty.receivables_aging), (0, 0, 0, 0));
+        assert_eq!(empty.settled_undated.count, 0);
+    }
+
+    /// An invoice that is ALREADY out of AR for the ordinary reason — it
+    /// was paid — must not be double-reported as settled-undated. The
+    /// diagnostic counts invoices this rule removed, not every invoice
+    /// that happens to lack a deadline, or the tripwire's number stops
+    /// meaning anything.
+    #[test]
+    fn paid_invoice_with_an_unparseable_deadline_is_not_reported_as_settled_undated() {
+        let today = Date::from_calendar_date(2026, Month::August, 13).unwrap();
+        let traces: HashMap<String, ReportTrace> = HashMap::from([(
+            "paid".into(),
+            ReportTrace {
+                payment_paid_at: Some("2026-07-20".into()),
+                ..saved_trace()
+            },
+        )]);
+        let groups = vec![undated_group("paid", "HUF", 100_000, Some("garbage"))];
+        let agg = aggregate_outgoing(groups, &traces, today, &HashMap::new());
+
+        assert_eq!(agg.receivables.huf, AmountAggregate::default());
+        assert_eq!(aging_totals(&agg.receivables_aging), (0, 0, 0, 0));
+        assert_eq!(
+            agg.settled_undated.count, 0,
+            "already-paid invoices never reached the rule — do not inflate the tripwire"
+        );
+    }
+
+    fn ap_row(id: &str, deadline: Option<&str>, gross: i64, status: &str) -> ApRow {
+        ApRow {
+            id: id.into(),
+            supplier_name: "Beszállító Kft.".into(),
+            payment_deadline: deadline.map(|s| s.into()),
+            net_minor: gross,
+            vat_minor: 0,
+            gross_minor: gross,
+            currency: "HUF".into(),
+            local_status: status.into(),
+        }
+    }
+
+    /// **PAYABLES.** The mirror of the receivables pin, on the second
+    /// site. Same invariant, same disclosure, same don't-move-the-healthy
+    /// -rows requirement.
+    #[test]
+    fn undated_payable_is_treated_as_settled_and_excluded_from_outstanding() {
+        let today = Date::from_calendar_date(2026, Month::August, 13).unwrap();
+        let rows = vec![
+            ap_row("ap_future", Some("2026-08-23"), 20_000, "Outstanding"),
+            ap_row("ap_overdue", Some("2026-06-04"), 43_180, "Outstanding"),
+            ap_row("ap_garbled", Some("2026-13-45"), 777_000, "Outstanding"),
+            ap_row("ap_dateless", None, 5_000, "Outstanding"),
+            // Settled + operator-declared-irrelevant rows are not payable
+            // and must not be dragged in by the fix.
+            ap_row("ap_settled", Some("nonsense"), 900_000, "Settled"),
+            ap_row("ap_skip", None, 800_000, "Irrelevant"),
+        ];
+        let ap = aggregate_ap(&rows, today);
+
+        // (a) THE INVARIANT, asserted FIRST — same reason as the AR pin.
+        let (net, vat, gross, count) = aging_totals(&ap.payables_aging);
+        assert_eq!(
+            gross, ap.payables.huf.gross_minor,
+            "the payables buckets must sum to the payables total the panel is showing"
+        );
+        assert_eq!(net, ap.payables.huf.net_minor);
+        assert_eq!(vat, ap.payables.huf.vat_minor);
+        assert_eq!(count, ap.payables.huf.count);
+
+        // (b) …at the right value — only the two readable-deadline rows.
+        assert_eq!(
+            ap.payables.huf.gross_minor, 63_180,
+            "a deadline-less payable is settled and must not be counted as owed"
+        );
+        assert_eq!(ap.payables.huf.count, 2);
+
+        // (d) Both undated rows disclosed, by id, and nothing else.
+        assert_eq!(ap.settled_undated.count, 2);
+        assert_eq!(
+            ap.settled_undated.ids,
+            vec!["ap_garbled".to_string(), "ap_dateless".to_string()]
+        );
+        assert_eq!(ap.settled_undated.gross_minor, 782_000);
+
+        // (c) Valid deadlines unmoved.
+        assert_eq!(ap.payables_aging.current.gross_minor, 20_000);
+        assert_eq!(ap.payables_aging.days_61_90.gross_minor, 43_180);
+        assert_eq!(ap.payables_aging.days_1_30, AmountAggregate::default());
+        assert_eq!(ap.payables_aging.days_31_60, AmountAggregate::default());
+        // (b) NOT 90+ — the bucket the previous behaviour imputed into.
+        assert_eq!(
+            ap.payables_aging.days_90_plus,
+            AmountAggregate::default(),
+            "undated payables are excluded, NOT aged into 90+"
+        );
+
+        // (b) Only `ap_overdue` is ASSERTED late.
+        assert_eq!(
+            ap.payable_past_deadline, 1,
+            "a settled payable is not a late payable"
+        );
+
+        // The non-payable rows still reach expenses, and only there —
+        // exclusion from OUTSTANDING is not exclusion from the P&L.
+        assert_eq!(ap.expenses.huf.gross_minor, 1_745_180);
+        assert_eq!(ap.expenses.huf.count, 5);
+    }
+
+    /// **The production shape.** `ap_sync::digest_to_ingestion_input`
+    /// records `payment_deadline: None` on EVERY NAV-synced payable, and
+    /// NAV sync is how the payables book is populated — so "all rows
+    /// undated" is not an edge case, it is Tuesday.
+    ///
+    /// Under the settled-exclusion rule such a book reports payables of
+    /// ZERO — the entire population is classified as settled legacy
+    /// imports. The invariant still holds (trivially: nothing in the
+    /// total, nothing in any bucket), and the whole book shows up in the
+    /// settled diagnostic, which is the ONLY thing standing between this
+    /// behaviour and a silent write-off of the payables ledger.
+    ///
+    /// This pin is deliberately blunt about that: if `ap_sync` keeps
+    /// stamping no deadline on ongoing NAV syncs, a genuinely unpaid new
+    /// payable lands here too. The count and the aggregate `warn!` are the
+    /// designed mitigation; this test is where that trade is written down.
+    #[test]
+    fn an_all_nav_synced_payables_book_reports_zero_owed_and_discloses_every_row() {
+        let today = Date::from_calendar_date(2026, Month::August, 13).unwrap();
+        let rows = vec![
+            ap_row("ap_nav_1", None, 120_000, "Outstanding"),
+            ap_row("ap_nav_2", None, 340_000, "Outstanding"),
+            ap_row("ap_nav_3", None, 55_000, "Outstanding"),
+        ];
+        let ap = aggregate_ap(&rows, today);
+
+        assert_eq!(
+            ap.payables.huf,
+            AmountAggregate::default(),
+            "every row is deadline-less, so the whole book is classified settled"
+        );
+        let (_, _, gross, count) = aging_totals(&ap.payables_aging);
+        assert_eq!(gross, ap.payables.huf.gross_minor);
+        assert_eq!(count, ap.payables.huf.count);
+        assert_eq!(ap.payables_aging.days_90_plus, AmountAggregate::default());
+        assert_eq!(ap.payable_past_deadline, 0);
+
+        // The tripwire. Silence here would mean the entire payables ledger
+        // vanished with nothing said — the exact failure this whole branch
+        // exists to make impossible.
+        assert_eq!(
+            ap.settled_undated.count, 3,
+            "every excluded row must be counted; 0 means the book vanished silently"
+        );
+        assert_eq!(
+            ap.settled_undated.gross_minor, 515_000,
+            "the warning must be able to state how much was excluded as settled"
+        );
+        // Expenses are untouched — these invoices still happened.
+        assert_eq!(ap.expenses.huf.gross_minor, 515_000);
     }
 
     /// PIN (c) — DSO must anchor on the invoice's ISSUE date, not the

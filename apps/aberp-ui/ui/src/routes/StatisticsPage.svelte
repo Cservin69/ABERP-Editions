@@ -305,6 +305,34 @@
       <span><strong>Today:</strong> {r.period.today}</span>
     </p>
 
+    <!-- Audit-ledger integrity banner. The backend's ledger walk drops any
+         entry whose payload it cannot decode; it used to do so silently,
+         so a malformed payment or ack just made the figures quietly wrong.
+         Now it counts them, and a non-zero count means EVERY figure on
+         this page may be incomplete — say so above the numbers, not in a
+         collapsed disclosure. Zero on a healthy ledger, so this is
+         invisible in normal operation. -->
+    {#if r.ledger_diagnostics.unparseable_entries > 0}
+      <div class="stats__integrity" role="alert">
+        <strong>
+          {r.ledger_diagnostics.unparseable_entries} audit
+          {r.ledger_diagnostics.unparseable_entries === 1 ? "record" : "records"}
+          could not be read — figures below may be incomplete.
+        </strong>
+        <p>
+          Ezek a bejegyzések egyik számban sincsenek benne. /
+          These entries are reflected in none of the figures. Audit entry
+          {r.ledger_diagnostics.unparseable_entry_ids.length === 1 ? "id" : "ids"}:
+          <span class="stats__integrity-ids"
+            >{r.ledger_diagnostics.unparseable_entry_ids.join(", ")}</span
+          >{#if r.ledger_diagnostics.unparseable_entries > r.ledger_diagnostics.unparseable_entry_ids.length}
+            … (+{r.ledger_diagnostics.unparseable_entries -
+              r.ledger_diagnostics.unparseable_entry_ids.length} more; see the server log)
+          {/if}
+        </p>
+      </div>
+    {/if}
+
     <!-- Row 1: revenue / expenses / gross profit / VAT-to-pay -->
     <section class="stats__cards" aria-label="Headline figures">
       <article class="stats__card">
@@ -503,7 +531,12 @@
     </section>
 
     <!-- Row 2c: AR + AP aging, click-through to filtered lists. S262 -->
-    {#snippet agingPanel(title: string, panel: AgingPanel, tab: "outgoing" | "incoming")}
+    {#snippet agingPanel(
+      title: string,
+      panel: AgingPanel,
+      tab: "outgoing" | "incoming",
+      settledUndatedCount: number,
+    )}
       <section class="stats__aging" aria-label={title}>
         <h3>{title}</h3>
         <ul class="aging-list">
@@ -534,6 +567,29 @@
           {/each}
         </ul>
         <p class="stats__detail">* counts are exact; amounts sum HUF + EUR.</p>
+        <!-- Rows with no readable due date are treated as settled legacy
+             imports and excluded from outstanding entirely — that is what
+             keeps the buckets summing to the total above, and it is why
+             this figure is NOT part of the numbers beside it.
+             Deliberately a QUIET inline footnote, not a page-level alert,
+             and deliberately count-only: NAV-synced payables carry no
+             deadline at all, so an alarm block would be lit on every load
+             and a rendered id list would be a permanent wall of ids —
+             cry-wolf either way. The loud channel for this is the
+             backend's aggregate `warn!`, which names the count AND the
+             excluded amount; the ids stay on the wire in
+             `ledger_diagnostics` for support, just unrendered.
+             Presentation is reversible: if Ervin would rather see this as
+             a per-side alert or a threshold-suppressed list, only this
+             block and its pins need to change. -->
+        {#if settledUndatedCount > 0}
+          <p class="stats__detail">
+            Ebből {settledUndatedCount} rendezett számlán nincs rögzített fizetési határidő — a nyitott
+            tételekből kihagyva. / {settledUndatedCount} settled
+            {settledUndatedCount === 1 ? "invoice" : "invoices"} with no recorded due date, excluded
+            from outstanding.
+          </p>
+        {/if}
       </section>
     {/snippet}
     <section class="stats__aging-grid" aria-label="Aging">
@@ -541,11 +597,13 @@
         "Receivables aging / Vevőkövetelés korosítás",
         r.receivables_aging,
         "outgoing",
+        r.ledger_diagnostics.aging_settled_undated_receivables,
       )}
       {@render agingPanel(
         "Payables aging / Szállítói tartozás korosítás",
         r.payables_aging,
         "incoming",
+        r.ledger_diagnostics.aging_settled_undated_payables,
       )}
     </section>
 
@@ -1062,6 +1120,25 @@
   }
   .stats__error strong {
     color: var(--color-signal-negative);
+  }
+  /* Ledger-integrity banner — same negative chrome as the load-failure
+   * box, because "the numbers may be wrong" is the same class of news as
+   * "there are no numbers". */
+  .stats__integrity {
+    border: 1px solid var(--color-signal-negative);
+    border-radius: var(--radius-sm);
+    padding: var(--space-3);
+    background: var(--color-surface-sunken);
+    color: var(--color-text-primary);
+  }
+  .stats__integrity strong {
+    color: var(--color-signal-negative);
+  }
+  .stats__integrity-ids {
+    font-family: var(--type-family-mono);
+    font-size: var(--type-size-sm);
+    color: var(--color-text-secondary);
+    word-break: break-all;
   }
 
   /* S262 / PR-251 — top-N number input matches the period select chrome. */

@@ -43,11 +43,15 @@
   import { parseInvoicesUrl } from "../lib/hygiene-clickthrough";
   // S262 / PR-251 — payables-aging bucket deep-link from the Finance
   // dashboard's AP-aging card.
+  import { AGING_LABELS, type AgingBucket } from "../lib/aging";
+  // The two drill-down predicates live in `aging-facets` so they can be
+  // pinned by BEHAVIOUR (`aging-facets.test.ts`) rather than by grepping
+  // this file's source. Do NOT reinstate local copies — the dashboard
+  // tiles and this list must classify identically.
   import {
-    agingBucketFor,
-    AGING_LABELS,
-    type AgingBucket,
-  } from "../lib/aging";
+    incomingAgingMatches,
+    incomingPastDeadlineMatches,
+  } from "../lib/aging-facets";
   import { formatTotal, formatInvoiceDate } from "../lib/format";
   import {
     actionsForStatus,
@@ -233,21 +237,16 @@
     // `payable_past_deadline_count`: unpaid (local_status ===
     // Outstanding) AND payment_deadline strictly before today.
     const hygiene = filter.hygiene ?? null;
-    if (hygiene === "past_deadline") {
-      if (inv.local_status !== "Outstanding") return false;
-      if (inv.payment_deadline === null) return false;
-      if (inv.payment_deadline >= todayIso()) return false;
+    if (hygiene === "past_deadline" && !incomingPastDeadlineMatches(inv, todayIso())) {
+      return false;
     }
     // S262 / PR-251 — payables-aging bucket gate. Mirrors the dashboard's
     // `payables_aging` panel: Outstanding rows only, classified by
     // `payment_deadline` vs today into the same buckets the backend
-    // `reports::aging_bucket_for` computes.
-    if (agingFacet !== null) {
-      if (inv.local_status !== "Outstanding") return false;
-      if (inv.payment_deadline === null) return false;
-      if (agingBucketFor(todayIso(), inv.payment_deadline) !== agingFacet) {
-        return false;
-      }
+    // `reports::aging_placement` computes — including its exclusion of
+    // rows with a missing or unreadable deadline.
+    if (!incomingAgingMatches(inv, agingFacet, todayIso())) {
+      return false;
     }
     const needle = filter.needle.trim().toLowerCase();
     if (needle === "") return true;

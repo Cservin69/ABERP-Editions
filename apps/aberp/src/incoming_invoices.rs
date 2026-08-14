@@ -790,7 +790,8 @@ pub fn list_incoming(
         Some(status) => {
             let mut stmt = conn.prepare(
                 "SELECT id, supplier_tax_number, supplier_name, supplier_address,
-                        nav_invoice_number, issue_date, delivery_date, payment_deadline,
+                        nav_invoice_number, issue_date, delivery_date,
+                        SUBSTR(CAST(payment_deadline AS VARCHAR), 1, 10) AS payment_deadline,
                         total_net_minor, total_vat_minor, total_gross_minor, currency,
                         local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
                    FROM ap_invoice
@@ -811,7 +812,8 @@ pub fn list_incoming(
         None => {
             let mut stmt = conn.prepare(
                 "SELECT id, supplier_tax_number, supplier_name, supplier_address,
-                        nav_invoice_number, issue_date, delivery_date, payment_deadline,
+                        nav_invoice_number, issue_date, delivery_date,
+                        SUBSTR(CAST(payment_deadline AS VARCHAR), 1, 10) AS payment_deadline,
                         total_net_minor, total_vat_minor, total_gross_minor, currency,
                         local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
                    FROM ap_invoice
@@ -842,7 +844,8 @@ pub fn get_incoming(db_path: &Path, tenant: &str, id: &str) -> Result<Option<Inc
     ensure_schema(&conn).context("ensure ap_invoice schema (get)")?;
     let mut stmt = conn.prepare(
         "SELECT id, supplier_tax_number, supplier_name, supplier_address,
-                nav_invoice_number, issue_date, delivery_date, payment_deadline,
+                nav_invoice_number, issue_date, delivery_date,
+                SUBSTR(CAST(payment_deadline AS VARCHAR), 1, 10) AS payment_deadline,
                 total_net_minor, total_vat_minor, total_gross_minor, currency,
                 local_status, irrelevant_reason, nav_xml_path, created_at, updated_at
            FROM ap_invoice
@@ -1151,11 +1154,39 @@ fn read_current_status(
 // Helpers.
 // ──────────────────────────────────────────────────────────────────────
 
-/// Strict YYYY-MM-DD validator. Same posture as
-/// `mark_invoice_paid::is_canonical_iso_date` — silent acceptance of
-/// non-canonical date strings would lock the wrong shape into the
-/// audit ledger forever.
+/// Strict YYYY-MM-DD validator — the ONE canonical implementation.
+/// `mark_invoice_paid` and `reports::parse_iso_date` both route through
+/// it, because silent acceptance of a non-canonical date string would
+/// lock the wrong shape into the audit ledger forever.
+///
+/// The shape check is NOT redundant with `time::Date::parse`. `time`'s
+/// `[year]` component accepts an OPTIONAL LEADING SIGN, so a bare
+/// `Date::parse` accepts `+2026-06-15` and `-2026-06-15` and this writer
+/// would store the 11-character form. That is a live data-loss path, not
+/// a curiosity: the financial report projects
+/// `SUBSTR(CAST(payment_deadline AS VARCHAR), 1, 10)`, which truncates
+/// `+2026-06-15` to `+2026-06-1` — unparseable — and
+/// `reports::aging_placement` then classifies a genuinely OUTSTANDING
+/// payable as SETTLED, removing it from the payables total, every aging
+/// bucket and the past-deadline counter. A valid invoice would silently
+/// leave the books.
+///
+/// So: anchored, exactly ten ASCII characters, `NNNN-NN-NN`, no sign and
+/// no trailing content — then `time` validates the real calendar range
+/// (month 1..=12, day-in-month, leap years). This is byte-for-byte the
+/// contract the SPA's `ISO_DATE_RE` enforces, which is what makes the
+/// `DEADLINE_PARITY_VOCAB` agreement possible.
 pub(crate) fn is_canonical_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    let shaped = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[0..4].iter().all(u8::is_ascii_digit)
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[8..10].iter().all(u8::is_ascii_digit);
+    if !shaped {
+        return false;
+    }
     let format = time::macros::format_description!("[year]-[month]-[day]");
     time::Date::parse(s, &format).is_ok()
 }
@@ -1221,6 +1252,91 @@ pub(crate) fn change_status_via_handle_for_test(
 mod tests {
     use super::*;
     use aberp_audit_ledger::BinaryHash;
+
+    /// **Tile ↔ drill-down agreement under a widened column.**
+    ///
+    /// The financial report normalises `ap_invoice.payment_deadline`
+    /// through `SUBSTR(CAST(.. AS VARCHAR), 1, 10)`; this list feeds the
+    /// drill-down the operator reaches by CLICKING that report's aging
+    /// tile. The list read used to take the column RAW, so a
+    /// timestamp-shaped value classified as readable on the report
+    /// (bucketed, counted as owed) and unreadable in the SPA (dropped as
+    /// settled) — the tile counts a row the list hides.
+    ///
+    /// Mutation guard: drop the SUBSTR/CAST from the list projection and
+    /// the returned deadline reverts to the raw string, reddening this.
+    #[test]
+    fn list_read_normalises_the_deadline_the_same_way_the_report_does() {
+        let dir = ScopedTempDir::new("deadline-normalise");
+        let db_path = dir.path().join("tenant.duckdb");
+        let conn = Connection::open(&db_path).expect("open");
+        ensure_schema(&conn).expect("schema");
+        conn.execute_batch(
+            "INSERT INTO ap_invoice
+               (id, tenant_id, supplier_tax_number, supplier_name, nav_invoice_number,
+                issue_date, payment_deadline, total_net_minor, total_vat_minor,
+                total_gross_minor, currency, local_status, created_at, updated_at)
+             VALUES
+               ('ap-ts', 't1', '12345678', 'Beszállító Kft.', 'NAV-1',
+                '2026-06-10', '2026-07-14T12:00:00Z', 43180, 0, 43180, 'HUF',
+                'Outstanding', '2026-06-10', '2026-06-10');",
+        )
+        .expect("seed a timestamp-shaped deadline");
+        drop(conn);
+
+        let rows = list_incoming(&db_path, "t1", None, 50, 0).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].payment_deadline.as_deref(),
+            Some("2026-07-14"),
+            "the drill-down must see the SAME normalised deadline the aging tile counted; a \
+             raw read yields `2026-07-14T12:00:00Z`, which the SPA classifies unreadable and \
+             hides — so the tile would count a row the list does not show"
+        );
+
+        // The single-row read backing the detail view shares the column
+        // list, so it must agree too.
+        let one = get_incoming(&db_path, "t1", "ap-ts")
+            .expect("get")
+            .expect("row");
+        assert_eq!(one.payment_deadline.as_deref(), Some("2026-07-14"));
+    }
+
+    /// The AP writer must store ONLY a canonical ten-character
+    /// `YYYY-MM-DD`, because the financial report reads every date back
+    /// through `SUBSTR(CAST(.. AS VARCHAR), 1, 10)`.
+    ///
+    /// `time`'s `[year]` component accepts an OPTIONAL LEADING SIGN, so
+    /// the previous bare `Date::parse` validator accepted `+2026-06-15`
+    /// and this writer stored the 11-character form. The report's
+    /// projection then truncates it to `+2026-06-1`, which
+    /// `parse_iso_date` rejects, and `aging_placement` classifies the
+    /// invoice SETTLED — a genuinely outstanding payable removed from
+    /// the payables total, every aging bucket and the past-deadline
+    /// counter. Loud rejection at the writer is the fix; this pins it.
+    #[test]
+    fn is_canonical_iso_date_rejects_signed_and_out_of_range_years() {
+        // The shapes the sign bug let through.
+        assert!(!is_canonical_iso_date("+2026-06-15"));
+        assert!(!is_canonical_iso_date("-2026-06-15"));
+        assert!(!is_canonical_iso_date("+12026-06-15"));
+        // Real calendar-range validation still applies.
+        assert!(!is_canonical_iso_date("2026-13-01"));
+        assert!(!is_canonical_iso_date("2026-02-30"));
+        assert!(!is_canonical_iso_date("2025-02-29"));
+        assert!(!is_canonical_iso_date("2026-06-31"));
+        // Shape: exactly ten ASCII chars, zero-padded, nothing trailing.
+        assert!(!is_canonical_iso_date("2026-6-5"));
+        assert!(!is_canonical_iso_date("2026-06-15T00:00:00Z"));
+        assert!(!is_canonical_iso_date("2026-06-15 "));
+        assert!(!is_canonical_iso_date(" 2026-06-15"));
+        assert!(!is_canonical_iso_date(""));
+        // …and the well-formed cases still pass, including year 1 and a
+        // real leap day (both live rows of the shared parity vocabulary).
+        assert!(is_canonical_iso_date("2026-06-15"));
+        assert!(is_canonical_iso_date("0001-01-01"));
+        assert!(is_canonical_iso_date("2024-02-29"));
+    }
 
     /// S410 / [[no-sql-specific]] — the
     /// `CHECK (local_status IN ('Outstanding','Paid','Irrelevant'))` DDL

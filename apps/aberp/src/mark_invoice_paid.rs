@@ -218,9 +218,13 @@ fn write_payment_audit_entry(
 /// dashes, etc.) per CLAUDE.md rule 12 — silent acceptance of
 /// `"2026/05/26"` or `"26 May 2026"` would lock the wrong shape
 /// into the audit ledger forever.
+/// Delegates to the ONE canonical validator. This used to be its own
+/// bare `time::Date::parse`, which accepts an optional leading sign on
+/// `[year]` — so `+2026-05-26` passed and an 11-character `paid_at` went
+/// into the ledger, where the report's 10-char projection would truncate
+/// it back to garbage. Same defect, same fix, one implementation.
 fn is_canonical_iso_date(s: &str) -> bool {
-    let format = time::macros::format_description!("[year]-[month]-[day]");
-    time::Date::parse(s, &format).is_ok()
+    crate::incoming_invoices::is_canonical_iso_date(s)
 }
 
 #[cfg(test)]
@@ -245,6 +249,19 @@ mod tests {
         assert!(!is_canonical_iso_date("2026-5-26")); // zero-pad required
         assert!(!is_canonical_iso_date("2026-13-01")); // bad month
         assert!(!is_canonical_iso_date("2026-02-30")); // bad day
+                                                       // `time`'s `[year]` accepts an optional LEADING SIGN, so a bare
+                                                       // `Date::parse` took these and an 11-character `paid_at` went
+                                                       // into the ledger. The report then reads dates through a 10-char
+                                                       // `SUBSTR` projection, which truncates `+2026-05-26` to
+                                                       // `+2026-05-2` — unparseable — so the payment silently stops
+                                                       // counting. Rejected at the writer instead.
+        assert!(!is_canonical_iso_date("+2026-05-26"));
+        assert!(!is_canonical_iso_date("-2026-05-26"));
+        assert!(!is_canonical_iso_date("+12026-05-26"));
+        // Trailing content and padding are not "close enough" either.
+        assert!(!is_canonical_iso_date("2026-05-26T00:00:00Z"));
+        assert!(!is_canonical_iso_date(" 2026-05-26"));
+        assert!(!is_canonical_iso_date("2026-05-26 "));
         assert!(!is_canonical_iso_date("twenty-twenty-six")); // alphabetic
         assert!(!is_canonical_iso_date("2026-05-26T00:00:00")); // timestamp form
     }
