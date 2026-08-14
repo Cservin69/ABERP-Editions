@@ -188,9 +188,13 @@
     ) {
       return false;
     }
-    // No early-out on a null deadline: the dashboard's `receivables_aging`
-    // ages such a row as `d90_plus` rather than dropping it, so this list
-    // must too or the click-through count disagrees with the tile.
+    // Deadline-less rows are EXCLUDED, matching the dashboard: the
+    // backend treats an invoice with no readable `payment_deadline` as a
+    // settled legacy import and keeps it out of `receivables_aging` AND
+    // out of the receivables total (`reports::aging_placement`). Keeping
+    // it here would show the operator a row the tile says is settled.
+    // `agingBucketFor` returns null for those, which matches no facet.
+    if (row.payment_deadline === null) return false;
     return agingBucketFor(todayIsoLocal(), row.payment_deadline) === agingFacet;
   }
 

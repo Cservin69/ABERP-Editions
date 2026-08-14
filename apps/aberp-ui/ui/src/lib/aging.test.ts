@@ -32,31 +32,34 @@ describe("agingBucketFor — boundaries mirror reports::aging_bucket_for", () =>
     });
   }
 
-  // The backend used to drop an outstanding invoice with a missing or
-  // unreadable `payment_deadline` out of every aging bucket while still
-  // counting it in the receivables/payables total, so the panel's
-  // breakdown summed to less than its own headline. It now ages such a
-  // row as `d90_plus` (`reports::aging_placement`). This mirror MUST move
-  // with it: if it kept excluding those rows, the operator would click
-  // "90+ nap = 3" and land on a list showing 2 — the exact drift this
-  // shared module exists to prevent.
-  it("ages an unreadable deadline as d90_plus, never excluded", () => {
-    expect(agingBucketFor(TODAY, "not-a-date")).toBe("d90_plus");
-    expect(agingBucketFor(TODAY, "30/06/2026")).toBe("d90_plus");
+  // A row with no readable `payment_deadline` is a SETTLED legacy import
+  // (`reports::aging_placement` returns None): the backend keeps it out
+  // of the outstanding total AND out of every aging bucket, so the
+  // buckets still sum to the total. This mirror must agree — a caller
+  // that kept such a row would show the operator an invoice the tile
+  // says is settled, and the 90+ drill-down would over-count its tile.
+  //
+  // `null` here is a CLASSIFICATION ("not outstanding"), not a failure to
+  // classify. Returning a bucket instead — `d90_plus` in particular, the
+  // previous behaviour — is the mutation these pins are aimed at.
+  it("returns null for an unreadable deadline — settled, not bucketed", () => {
+    expect(agingBucketFor(TODAY, "not-a-date")).toBeNull();
+    expect(agingBucketFor(TODAY, "30/06/2026")).toBeNull();
   });
 
-  it("ages a MISSING deadline as d90_plus, never excluded", () => {
-    expect(agingBucketFor(TODAY, null)).toBe("d90_plus");
-    expect(agingBucketFor(TODAY, undefined)).toBe("d90_plus");
+  it("returns null for a MISSING deadline — settled, not bucketed", () => {
+    expect(agingBucketFor(TODAY, null)).toBeNull();
+    expect(agingBucketFor(TODAY, undefined)).toBeNull();
   });
 
-  it("never returns a non-bucket, so no caller can silently drop a row", () => {
-    // The old signature returned `AgingBucket | null` and every caller
-    // read the null as "exclude". Restoring that return type is the
-    // mutation this pin is aimed at.
-    for (const deadline of ["2026-05-31", "not-a-date", null, undefined]) {
-      expect(AGING_BUCKETS).toContain(agingBucketFor(TODAY, deadline));
+  it("never lands a deadline-less row in a real bucket, 90+ least of all", () => {
+    for (const deadline of ["not-a-date", null, undefined]) {
+      expect(AGING_BUCKETS).not.toContain(agingBucketFor(TODAY, deadline));
+      expect(agingBucketFor(TODAY, deadline)).not.toBe("d90_plus");
     }
+    // A readable deadline still classifies normally — the exclusion must
+    // not have swallowed the healthy path with it.
+    expect(AGING_BUCKETS).toContain(agingBucketFor(TODAY, "2026-05-31"));
   });
 });
 

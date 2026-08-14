@@ -241,14 +241,16 @@
     // S262 / PR-251 — payables-aging bucket gate. Mirrors the dashboard's
     // `payables_aging` panel: Outstanding rows only, classified by
     // `payment_deadline` vs today into the same buckets the backend
-    // `reports::aging_placement` computes — including its imputation of
-    // `d90_plus` for a missing or unreadable deadline.
+    // `reports::aging_placement` computes — including its exclusion of
+    // rows with a missing or unreadable deadline.
     if (agingFacet !== null) {
       if (inv.local_status !== "Outstanding") return false;
-      // No early-out on a null deadline — the dashboard's
-      // `payables_aging` ages such a row as `d90_plus` rather than
-      // dropping it, so this list must too or the click-through count
-      // disagrees with the tile.
+      // Deadline-less rows are EXCLUDED, matching the dashboard: the
+      // backend treats them as settled legacy imports and keeps them out
+      // of `payables_aging` AND out of the payables total. Load-bearing
+      // here — `ap_sync` records no deadline on NAV-synced payables, so
+      // this is most of the AP book.
+      if (inv.payment_deadline === null) return false;
       if (agingBucketFor(todayIso(), inv.payment_deadline) !== agingFacet) {
         return false;
       }

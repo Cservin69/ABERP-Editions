@@ -8,28 +8,28 @@ import outgoing from "../routes/InvoiceList.svelte?raw";
 import incoming from "../routes/IncomingInvoiceList.svelte?raw";
 
 // ─────────────────────────────────────────────────────────────────────
-// The dashboard's aging panels age an outstanding invoice with a missing
-// or unreadable `payment_deadline` into `d90_plus` instead of dropping it
-// (`reports::aging_placement`), which is what makes the buckets sum to
-// the receivables / payables total. Each aging tile is CLICKABLE: it deep
-// links into one of these two lists via `?aging=`, and the list re-runs
-// the classification client-side.
+// An outstanding invoice with a missing or unreadable `payment_deadline`
+// is treated as a SETTLED legacy import: the backend excludes it from the
+// outstanding total, from every aging bucket, and from the past-deadline
+// counters (`reports::aging_placement`). That single exclusion is what
+// makes `sum(buckets) == total` hold.
 //
-// So the tile and its list must agree on undated rows or the fix trades
-// one incoherence for another — the operator clicks "90+ nap = 3" and
-// lands on a list showing 2. Both consumers previously short-circuited on
-// `payment_deadline === null`; `aging.ts` moving to a total function does
-// NOT stop a caller from re-adding that early-out, and a full revert of
-// both stayed green before these pins existed.
+// Each aging tile is CLICKABLE: it deep links into one of these two lists
+// via `?aging=`, and the list re-runs the classification client-side. So
+// both lists must exclude deadline-less rows too, or the operator clicks
+// "90+ nap = 2" and lands on a list showing 5 — rows the dashboard has
+// already declared settled.
 //
-// The hygiene facet is the deliberate exception and is pinned separately
-// below — see `payable_past_deadline_count`.
+// The hygiene facet excludes them as well, for its own reason (a settled
+// invoice is not a late invoice). Under this behaviour the two facets
+// AGREE about null deadlines — that agreement is itself pinned below, so
+// a future change cannot quietly split them again.
 // ─────────────────────────────────────────────────────────────────────
 
 /** Any shape of "bail out because the deadline is absent". Deliberately
- * broader than the literal `=== null` the two components used, so the
- * pin is not sidestepped by `== null`, a falsy check, or an early
- * `!deadline` guard. */
+ * broader than the literal `=== null` the components use, so the pin
+ * still passes if someone rewrites it as `== null` or a falsy check —
+ * and still FAILS if the guard is deleted outright. */
 const NULL_DEADLINE_EXCLUSION = /payment_deadline\s*(===?|!==?)\s*null|!\w+\.payment_deadline/;
 
 /** Slice `source` from `startMarker` to the first line that closes at
@@ -54,35 +54,28 @@ describe("aging click-through stays in lockstep with the dashboard panels", () =
     expect(outgoingAging).toContain("agingBucketFor(");
   });
 
-  it("outgoing list does NOT exclude rows with a null deadline", () => {
-    // The revert this pin exists for: re-adding
-    // `if (row.payment_deadline === null) return false;` makes the
-    // receivables 90+ tile over-count its own drill-down, silently.
-    expect(outgoingAging).not.toMatch(NULL_DEADLINE_EXCLUSION);
+  it("outgoing list EXCLUDES rows with a null deadline", () => {
+    // The revert this pin exists for: dropping the early-out puts rows
+    // the dashboard counts as settled back into the receivables aging
+    // drill-down, so the 90+ tile under-counts its own list.
+    expect(outgoingAging).toMatch(NULL_DEADLINE_EXCLUSION);
   });
 
   it("incoming list classifies through the shared helper, not its own copy", () => {
     expect(incomingAging).toContain("agingBucketFor(");
   });
 
-  it("incoming list does NOT exclude rows with a null deadline", () => {
+  it("incoming list EXCLUDES rows with a null deadline", () => {
     // Load-bearing on this side: `ap_sync` records no deadline at all for
-    // NAV-synced payables, so excluding them would empty the payables
-    // aging drill-down against a fully-populated 90+ tile.
-    expect(incomingAging).not.toMatch(NULL_DEADLINE_EXCLUSION);
+    // NAV-synced payables, so without the early-out essentially the whole
+    // AP book would appear in a drill-down whose tile reads zero.
+    expect(incomingAging).toMatch(NULL_DEADLINE_EXCLUSION);
   });
 });
 
-describe("the past-deadline HYGIENE facet keeps excluding undated rows", () => {
-  // The counterpart contract, and the reason this is not simply "never
-  // exclude null deadlines anywhere". An aging bucket is an age ESTIMATE,
-  // so imputing 90+ is defensible and disclosed.
-  // `payable_past_deadline_count` is a LATENESS ASSERTION, and nothing
-  // supports one for an invoice with no deadline — so the backend counter
-  // skips undated rows (`reports::aggregate_ap`) and this list, which is
-  // that tile's drill-down, must skip them too. Dropping this early-out
-  // to "match" the aging facet would make the list over-count the tile
-  // instead.
+describe("the past-deadline HYGIENE facet also excludes undated rows", () => {
+  // Same conclusion, independent reason: a settled invoice is not a late
+  // invoice, and `payable_past_deadline_count` is a lateness assertion.
   it("still short-circuits on a null deadline", () => {
     expect(incomingHygiene).toMatch(NULL_DEADLINE_EXCLUSION);
   });
@@ -91,10 +84,13 @@ describe("the past-deadline HYGIENE facet keeps excluding undated rows", () => {
     expect(incomingHygiene).toContain("todayIso()");
   });
 
-  it("is a DIFFERENT predicate from the aging facet on exactly this point", () => {
-    // If both blocks ever agree about null deadlines, one of the two
-    // tiles has stopped matching its own drill-down.
+  it("AGREES with the aging facet about null deadlines", () => {
+    // Both tiles now derive from the same "deadline-less means settled"
+    // rule, so both drill-downs must exclude those rows. If these two
+    // ever disagree, one tile has stopped matching its own list —
+    // whichever direction the split happens in.
     expect(NULL_DEADLINE_EXCLUSION.test(incomingHygiene)).toBe(true);
-    expect(NULL_DEADLINE_EXCLUSION.test(incomingAging)).toBe(false);
+    expect(NULL_DEADLINE_EXCLUSION.test(incomingAging)).toBe(true);
+    expect(NULL_DEADLINE_EXCLUSION.test(outgoingAging)).toBe(true);
   });
 });

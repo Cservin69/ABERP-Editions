@@ -5038,15 +5038,14 @@ export interface HygienePanel {
   outgoing_pending_count: number;
   restored_no_partner_count: number;
   /** Both past-deadline counters EXCLUDE invoices with a missing or
-   * unreadable `payment_deadline`. Those are aged into the `days_90_plus`
-   * bucket on the aging panels (an age estimate — see
-   * `reports::aging_placement`), but these are lateness ASSERTIONS and an
-   * absent deadline is unknown lateness, not lateness. The exclusion is
-   * why the two hygiene drill-downs still short-circuit on a null
-   * deadline while the aging drill-downs no longer do; it is load-bearing
-   * on the AP side, where NAV-synced payables carry no deadline at all.
-   * The imputed rows are disclosed via
-   * `LedgerDiagnostics.aging_undated_*` instead. */
+   * unreadable `payment_deadline` — not by a special rule of their own,
+   * but because such an invoice is classified SETTLED and never enters
+   * outstanding at all (`reports::aging_placement`). It is absent from
+   * the receivables / payables totals and every aging bucket too, which
+   * is why the aging drill-downs and the hygiene drill-downs now BOTH
+   * exclude deadline-less rows. Load-bearing on the AP side, where
+   * NAV-synced payables carry no deadline at all. Disclosed via
+   * `LedgerDiagnostics.aging_settled_undated_*`. */
   outstanding_past_deadline_count: number;
   payable_past_deadline_count: number;
   storno_chain_count: number;
@@ -5119,19 +5118,24 @@ export interface FinancialReport {
 export interface LedgerDiagnostics {
   unparseable_entries: number;
   unparseable_entry_ids: string[];
-  /** Outstanding invoices (AR or AP) whose `payment_deadline` was missing
-   * or unreadable. They ARE in the receivables / payables totals and in
-   * the `days_90_plus` aging bucket — the count says their age is an
-   * imputation, not that a figure is missing. */
-  aging_undated_invoices: number;
+  /** Invoices (AR or AP) whose `payment_deadline` was missing or
+   * unreadable. These are treated as SETTLED legacy imports and excluded
+   * from outstanding entirely — absent from the receivables / payables
+   * totals, from every aging bucket, and from the past-deadline counters.
+   *
+   * The count exists because that is an assumption about money: a
+   * genuinely unpaid deadline-less invoice leaves the books by the same
+   * rule. The backend also emits an aggregate `warn!` naming the count
+   * and amount. */
+  aging_settled_undated: number;
   /** Machine-readable only. The dashboard does NOT render this list:
    * NAV-synced payables have no deadline at all, so on a real book it
    * would be a permanent wall of ids. Kept for support/debugging. */
-  aging_undated_invoice_ids: string[];
-  /** Per-side split of `aging_undated_invoices`, so each aging panel can
-   * footnote its own imputed rows without double-reporting the total. */
-  aging_undated_receivables: number;
-  aging_undated_payables: number;
+  aging_settled_undated_invoice_ids: string[];
+  /** Per-side split of `aging_settled_undated`, so each aging panel can
+   * footnote its own excluded rows without double-reporting the total. */
+  aging_settled_undated_receivables: number;
+  aging_settled_undated_payables: number;
 }
 
 /** Fetch the financial-statistics snapshot for the given period +
