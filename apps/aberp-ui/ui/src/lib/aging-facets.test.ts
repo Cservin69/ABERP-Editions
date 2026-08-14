@@ -153,6 +153,20 @@ describe("AP past-deadline hygiene drill-down", () => {
     );
   });
 
+  it("zero-pads the YEAR before comparing", () => {
+    // Unpadded, `${parsed.y}` renders year 999 as "999-01-01", which
+    // sorts AFTER "2026-08-13" — so an ancient deadline would read as
+    // NOT late. Three- and one-digit years are absurd as data, but the
+    // comparison is lexicographic and a wrong verdict here is silent.
+    expect("999-01-01" > TODAY).toBe(true); // the unpadded trap
+    expect(incomingPastDeadlineMatches(apRow({ payment_deadline: "0999-01-01" }), TODAY)).toBe(
+      true,
+    );
+    expect(incomingPastDeadlineMatches(apRow({ payment_deadline: "0001-01-01" }), TODAY)).toBe(
+      true,
+    );
+  });
+
   it("still counts a genuinely late, readable deadline", () => {
     expect(incomingPastDeadlineMatches(apRow({ payment_deadline: "2026-08-12" }), TODAY)).toBe(true);
     expect(incomingPastDeadlineMatches(apRow({ payment_deadline: "  2026-08-12  " }), TODAY)).toBe(

@@ -38,6 +38,32 @@ const DEADLINE_PARITY_VOCAB: ReadonlyArray<readonly [string, boolean]> = [
   ["15/06/2026", false], // wrong order + separator
   ["", false],
   ["not-a-date", false],
+  // ── Exotic shapes where the two runtimes diverge BY DEFAULT. Every
+  // row below was a genuine disagreement before this pass.
+  //
+  // Rust's `time` crate accepts an optional leading SIGN on `[year]`,
+  // so the backend used to take these while this anchored regex never
+  // did. The AP writer accepted them too, and the report's 10-char SQL
+  // projection truncates `+2026-06-15` to `+2026-06-1` — a live,
+  // genuinely-outstanding payable written off as settled.
+  ["+2026-06-15", false],
+  ["-2026-06-15", false],
+  // `Date.UTC` maps years 0–99 onto 1900–1999, so `Date.UTC(1,0,1)` is
+  // 1901 and the round-trip check used to reject this real date while
+  // Rust accepted it. Fixed in `invoice-dates::parseIsoDate`.
+  ["0001-01-01", true],
+  // U+FEFF: `String.prototype.trim` STRIPS it, Rust's `str::trim` does
+  // not (it is not Unicode `White_Space`). Both sides now trim ASCII
+  // whitespace only, so both reject.
+  ["﻿2026-06-15", false],
+  ["2026-06-15﻿", false],
+  // U+0085 (NEL) / U+00A0 (NBSP): both runtimes' default trim strips
+  // these, so they agreed — on the wrong answer. ASCII-only trimming
+  // makes both reject.
+  ["2026-06-15", false],
+  [" 2026-06-15", false],
+  // ASCII whitespace IS trimmed, on both sides.
+  ["\t2026-06-15\n", true],
 ];
 
 const TODAY = "2026-06-30";

@@ -104,7 +104,25 @@ export function bucketAmount(panel: AgingPanel, bucket: AgingBucket): AmountAggr
  * disagreed on exactly the inputs that matter most. */
 export function parseDeadline(raw: string | null | undefined): IsoParts | null {
   if (raw == null) return null;
-  return parseIsoDate(raw.trim());
+  return parseIsoDate(asciiTrim(raw));
+}
+
+/** ASCII whitespace only — NOT `String.prototype.trim`.
+ *
+ * JS `trim` strips the full Unicode whitespace set PLUS U+FEFF
+ * (zero-width no-break space). Rust's `str::trim` strips the Unicode
+ * `White_Space` property, which does NOT include U+FEFF. So a
+ * BOM-prefixed deadline is trimmed and ACCEPTED by a naive SPA and
+ * rejected by the backend — the two classifiers disagree, and under the
+ * settled-exclusion rule they disagree about whether an invoice is on
+ * the books.
+ *
+ * Rather than chase Rust's Unicode table from JS, both sides narrow to
+ * the same small, explicit set: ASCII whitespace. `reports::parse_iso_date`
+ * uses `trim_matches(char::is_ascii_whitespace)` for exactly this reason.
+ * Pinned by the U+FEFF / U+0085 / U+00A0 rows of the shared vocabulary. */
+function asciiTrim(s: string): string {
+  return s.replace(/^[\t\n\v\f\r ]+/, "").replace(/[\t\n\v\f\r ]+$/, "");
 }
 
 /** The `{y, m, d}` triple `invoice-dates::parseIsoDate` returns. */

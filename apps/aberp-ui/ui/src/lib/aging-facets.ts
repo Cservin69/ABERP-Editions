@@ -96,6 +96,14 @@ export function incomingPastDeadlineMatches(inv: IncomingAgingRow, todayIso: str
   if (inv.local_status !== "Outstanding") return false;
   const parsed = parseDeadline(inv.payment_deadline);
   if (parsed === null) return false;
-  const canonical = `${parsed.y}-${String(parsed.m).padStart(2, "0")}-${String(parsed.d).padStart(2, "0")}`;
+  // The YEAR needs padding too, not just month and day. Unpadded,
+  // year 999 renders "999-01-01", which sorts AFTER "2026-08-13" — a
+  // millennium-old deadline would read as NOT late. (The raw string
+  // compare this replaced had the same trap from the other direction;
+  // padding is what makes the lexicographic compare honest.)
+  const canonical =
+    `${String(parsed.y).padStart(4, "0")}-` +
+    `${String(parsed.m).padStart(2, "0")}-` +
+    `${String(parsed.d).padStart(2, "0")}`;
   return canonical < todayIso;
 }

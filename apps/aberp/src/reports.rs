@@ -503,9 +503,35 @@ pub fn parse_period(s: &str) -> Result<PeriodKind> {
     Err(anyhow!("unparseable period `{}`", trimmed))
 }
 
+/// Parse a canonical `YYYY-MM-DD` date, and NOTHING else.
+///
+/// This function decides whether an invoice is outstanding at all
+/// ([`aging_placement`]), so what it rejects is as load-bearing as what it
+/// accepts. Two things it must NOT inherit from a bare `time` parse:
+///
+///   * `[year]` accepts an optional LEADING SIGN, so `Date::parse` alone
+///     takes `+2026-06-15` — an 11-character value the SQL projections
+///     truncate to `+2026-06-1` and then reject, writing a live invoice
+///     off as settled. The writers no longer store that shape (see
+///     [`crate::incoming_invoices::is_canonical_iso_date`]) and this
+///     refuses it too, so neither half of the round trip can reintroduce
+///     it.
+///   * `str::trim` strips Unicode `White_Space`, which does NOT include
+///     U+FEFF, while JavaScript's `String.prototype.trim` DOES. The SPA
+///     runs the same classification client-side, so a shared input must
+///     get the same verdict on both sides or a tile and its drill-down
+///     disagree about whether money is owed. Trimming ASCII whitespace
+///     only — on both sides — is the narrow rule that actually matches.
+///
+/// Pinned against the SPA by `DEADLINE_PARITY_VOCAB` /
+/// `aging-deadline-parity.test.ts`.
 fn parse_iso_date(s: &str) -> Result<Date> {
+    let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    if !crate::incoming_invoices::is_canonical_iso_date(trimmed) {
+        anyhow::bail!("parse ISO date `{}`: not a canonical YYYY-MM-DD date", s);
+    }
     let fmt = format_description!("[year]-[month]-[day]");
-    Date::parse(s.trim(), fmt).with_context(|| format!("parse ISO date `{}`", s))
+    Date::parse(trimmed, fmt).with_context(|| format!("parse ISO date `{}`", s))
 }
 
 /// Resolve a [`PeriodKind`] to inclusive ISO-date bounds for SQL
@@ -3052,6 +3078,36 @@ mod tests {
         ("15/06/2026", false),           // wrong order + separator
         ("", false),
         ("not-a-date", false),
+        // ── Exotic shapes where the two runtimes diverge BY DEFAULT.
+        // Every row below was a genuine disagreement before this pass;
+        // together they are why `parse_iso_date` gained an explicit
+        // shape gate and an ASCII-only trim.
+        //
+        // `time`'s `[year]` takes an optional leading sign, so a bare
+        // `Date::parse` accepts these while the SPA's anchored regex
+        // never did. The writer accepted them too, and the 10-char SQL
+        // projection truncates `+2026-06-15` to `+2026-06-1` — a live,
+        // genuinely-outstanding payable written off as settled.
+        ("+2026-06-15", false),
+        ("-2026-06-15", false),
+        // Rust accepts year 1; JS `Date.UTC` maps years 0..=99 onto
+        // 1900..=1999, so the SPA's round-trip check used to reject it.
+        // A real calendar date must not depend on which language reads
+        // it.
+        ("0001-01-01", true),
+        // U+FEFF is NOT Unicode `White_Space`, so Rust's `str::trim`
+        // leaves it — but JS `String.prototype.trim` strips it. Both
+        // sides now trim ASCII whitespace only, so both reject.
+        ("\u{FEFF}2026-06-15", false),
+        ("2026-06-15\u{FEFF}", false),
+        // U+0085 (NEL) and U+00A0 (NBSP) are Unicode whitespace that
+        // BOTH runtimes' default trim strips — they agreed, but on the
+        // wrong answer: a canonical date has no such padding. ASCII-only
+        // trimming makes both reject.
+        ("\u{0085}2026-06-15", false),
+        ("\u{00A0}2026-06-15", false),
+        // ASCII whitespace IS trimmed, on both sides.
+        ("\t2026-06-15\n", true),
     ];
 
     /// The backend half of the parity contract. Mutation guard: relaxing
@@ -3107,9 +3163,109 @@ mod tests {
     /// receivables or payables in one step, with the diagnostic dutifully
     /// reporting the whole ledger as excluded.
     ///
+    /// **The real-projection pin.** Drives `query_outgoing_groups` and
+    /// `query_ap_rows` THEMSELVES against a widened deadline column, and
+    /// asserts the row survives all the way through to an aging bucket.
+    ///
+    /// The hand-written-SQL variant below cannot do this job: it asserts
+    /// on a literal string this test file owns, so reverting the two real
+    /// projections to a bare `CAST` leaves it green while receivables and
+    /// payables silently empty. This one reds on exactly that mutation,
+    /// because it reads the SQL the report actually issues.
+    #[test]
+    fn real_projections_keep_a_timestamp_shaped_deadline_outstanding() {
+        let today = Date::from_calendar_date(2026, Month::August, 13).unwrap();
+
+        // ── AR: `invoice.payment_deadline` widened to TIMESTAMP.
+        let conn = Connection::open_in_memory().expect("in-memory duckdb");
+        conn.execute_batch(
+            "CREATE TABLE invoice (
+                 id VARCHAR, currency VARCHAR, issue_date VARCHAR,
+                 delivery_date DATE, payment_deadline TIMESTAMP,
+                 huf_equivalent_total DECIMAL(18,0)
+             );
+             CREATE TABLE invoice_line (
+                 invoice_id VARCHAR, vat_rate_basis_points INTEGER,
+                 quantity DECIMAL(18,6), unit_price BIGINT
+             );
+             INSERT INTO invoice VALUES
+               ('inv-ts', 'HUF', '2026-06-10T09:00:00Z', NULL,
+                TIMESTAMP '2026-07-14 12:00:00', NULL);
+             INSERT INTO invoice_line VALUES ('inv-ts', 0, 1.0, 43180);",
+        )
+        .expect("seed AR fixture with a TIMESTAMP deadline");
+
+        let groups = query_outgoing_groups(&conn, june_2026(), DateBasis::Issued)
+            .expect("the real AR projection must read a widened column without failing");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].payment_deadline.as_deref(),
+            Some("2026-07-14"),
+            "query_outgoing_groups must normalise the deadline to YYYY-MM-DD; a bare CAST \
+             yields `2026-07-14 12:00:00`, which parse_iso_date rejects"
+        );
+
+        // …and it must still be OUTSTANDING once aggregated. This is the
+        // assertion that turns a projection detail into a money fact.
+        let traces: HashMap<String, ReportTrace> =
+            HashMap::from([("inv-ts".into(), saved_trace())]);
+        let agg = aggregate_outgoing(groups, &traces, today, &HashMap::new());
+        assert_eq!(
+            agg.receivables.huf.gross_minor, 43_180,
+            "a readable-but-widened deadline must NOT be written off as settled"
+        );
+        assert_eq!(agg.receivables_aging.days_1_30.count, 1);
+        assert_eq!(
+            agg.settled_undated.count, 0,
+            "0 here is the whole point: the row is on the books, not excluded"
+        );
+
+        // ── AP: `ap_invoice.payment_deadline` holding RFC3339 text.
+        let ap_conn = Connection::open_in_memory().expect("in-memory duckdb");
+        ap_conn
+            .execute_batch(
+                "CREATE TABLE ap_invoice (
+                     id VARCHAR, tenant_id VARCHAR, supplier_name VARCHAR,
+                     issue_date VARCHAR, delivery_date VARCHAR,
+                     payment_deadline VARCHAR,
+                     total_net_minor BIGINT, total_vat_minor BIGINT,
+                     total_gross_minor BIGINT, currency VARCHAR,
+                     local_status VARCHAR
+                 );
+                 INSERT INTO ap_invoice VALUES
+                   ('ap-ts', 't1', 'Beszállító Kft.', '2026-06-10', NULL,
+                    '2026-07-14T12:00:00Z', 43180, 0, 43180, 'HUF', 'Outstanding');",
+            )
+            .expect("seed AP fixture with an RFC3339 deadline");
+
+        let rows = query_ap_rows(&ap_conn, "t1", june_2026(), DateBasis::Issued)
+            .expect("the real AP projection must read the column without failing");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].payment_deadline.as_deref(),
+            Some("2026-07-14"),
+            "query_ap_rows must normalise the deadline to YYYY-MM-DD"
+        );
+
+        let ap = aggregate_ap(&rows, today);
+        assert_eq!(
+            ap.payables.huf.gross_minor, 43_180,
+            "a readable-but-timestamp-shaped payable must NOT be written off as settled"
+        );
+        assert_eq!(ap.payables_aging.days_1_30.count, 1);
+        assert_eq!(ap.settled_undated.count, 0);
+        assert_eq!(ap.payable_past_deadline, 1);
+    }
+
     /// Mutation guard: drop the `SUBSTR(..., 1, 10)` from either
     /// projection and its arm reds; drop the `CAST` from the AP
     /// projection and the bare read below is what it becomes.
+    ///
+    /// NOTE: this asserts on SQL literals written HERE, so on its own it
+    /// proves only that the expression works — not that the report uses
+    /// it. `real_projections_keep_a_timestamp_shaped_deadline_outstanding`
+    /// above is what pins the actual queries; this one is kept for the
+    /// CAST-alone-is-insufficient demonstration it makes explicit.
     #[test]
     fn deadline_projections_survive_a_widened_column_on_both_sides() {
         let conn = Connection::open_in_memory().expect("in-memory duckdb");

@@ -49,6 +49,15 @@ export function parseIsoDate(s: IsoDate): { y: number; m: number; d: number } | 
   // the calendar date. Verify the parsed date round-trips (catches
   // overflow like "2026-02-30" which Date silently corrects).
   const dt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+  // `Date.UTC` maps years 0–99 onto 1900–1999, so `Date.UTC(1, 0, 1)` is
+  // 1901 and the round-trip below would reject `0001-01-01` as
+  // malformed. It is a real calendar date and the Rust side accepts it,
+  // so the two classifiers would disagree — see the parity contract in
+  // `aging.ts::parseDeadline`. `setUTCFullYear` writes the literal year
+  // back, restoring the round-trip's meaning for those years.
+  if (y >= 0 && y < 100) {
+    dt.setUTCFullYear(y);
+  }
   if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) {
     return null;
   }
