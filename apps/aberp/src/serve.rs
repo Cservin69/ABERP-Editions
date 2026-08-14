@@ -3288,10 +3288,10 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // after an important commit without ever stalling the request path.
         // No-op when disabled by env; the periodic daemon checkpoint (§3) and
         // the clean-shutdown checkpoint remain regardless.
-        match crate::live_checkpoint::install(
-            (*recovery_state.db_path).clone(),
-            recovery_state.tenant.as_str().to_string(),
-        ) {
+        // ADR-0111 — hand the debouncer the ONE shared handle, not a path: its
+        // checkpoint must run under the handle's writer lock (a path-based swap
+        // orphaned the shared connection and pushed the mirror ahead of the DB).
+        match crate::live_checkpoint::install(recovery_state.db.clone()) {
             Some(pw) => {
                 let pw_token = coordinator.token.clone();
                 let pw_handle = tokio::spawn(async move {
@@ -3436,10 +3436,23 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         // an atomic swap so the next boot needs no in-place WAL replay (the
         // path that historically tripped duckdb#23046). Best-effort; logged
         // loud and never blocks process exit. Editions-tree only.
-        crate::snapshot::checkpoint_on_clean_shutdown(
-            recovery_state.db_path.as_path(),
-            recovery_state.tenant.as_str(),
-        );
+        //
+        // ADR-0111 — through the shared handle. The handle is still OPEN here
+        // (it lives in `recovery_state.db` and outlives this block), so the old
+        // path-based call renamed the live file out from under its connection
+        // and unlinked the WAL, and its own `Connection::open` was a second
+        // live opener beside the handle's — the ADR-0098 two-instance hazard.
+        //
+        // The drain above does NOT guarantee that no `WriteGuard` is alive (an
+        // earlier version of this comment claimed it did — PR #41 adversarial,
+        // finding 2). `coordinator.shutdown(timeout)` races each daemon's
+        // `JoinHandle` against a shared 5 s budget and, on expiry, DROPS the
+        // handle — which DETACHES the tokio task, it does not abort it. A
+        // straggler daemon can still be mid-`WriteGuard` right here. So the
+        // checkpoint's wait for the non-reentrant writer mutex is BOUNDED
+        // inside `checkpoint_on_clean_shutdown`, and a miss is logged loud
+        // rather than blocking exit (S213 / CLAUDE.md rule 12).
+        crate::snapshot::checkpoint_on_clean_shutdown(&recovery_state.db);
 
         // S291 / PR-272 — best-effort delete of the runtime-discovery
         // file (brief D). A leaked file from a crash is harmless
