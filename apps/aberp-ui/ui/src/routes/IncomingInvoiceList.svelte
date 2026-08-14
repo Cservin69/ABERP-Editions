@@ -241,10 +241,14 @@
     // S262 / PR-251 — payables-aging bucket gate. Mirrors the dashboard's
     // `payables_aging` panel: Outstanding rows only, classified by
     // `payment_deadline` vs today into the same buckets the backend
-    // `reports::aging_bucket_for` computes.
+    // `reports::aging_placement` computes — including its imputation of
+    // `d90_plus` for a missing or unreadable deadline.
     if (agingFacet !== null) {
       if (inv.local_status !== "Outstanding") return false;
-      if (inv.payment_deadline === null) return false;
+      // No early-out on a null deadline — the dashboard's
+      // `payables_aging` ages such a row as `d90_plus` rather than
+      // dropping it, so this list must too or the click-through count
+      // disagrees with the tile.
       if (agingBucketFor(todayIso(), inv.payment_deadline) !== agingFacet) {
         return false;
       }

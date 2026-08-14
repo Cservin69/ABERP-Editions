@@ -32,8 +32,31 @@ describe("agingBucketFor — boundaries mirror reports::aging_bucket_for", () =>
     });
   }
 
-  it("returns null on an unparseable deadline (row excluded, not coerced)", () => {
-    expect(agingBucketFor(TODAY, "not-a-date")).toBeNull();
+  // The backend used to drop an outstanding invoice with a missing or
+  // unreadable `payment_deadline` out of every aging bucket while still
+  // counting it in the receivables/payables total, so the panel's
+  // breakdown summed to less than its own headline. It now ages such a
+  // row as `d90_plus` (`reports::aging_placement`). This mirror MUST move
+  // with it: if it kept excluding those rows, the operator would click
+  // "90+ nap = 3" and land on a list showing 2 — the exact drift this
+  // shared module exists to prevent.
+  it("ages an unreadable deadline as d90_plus, never excluded", () => {
+    expect(agingBucketFor(TODAY, "not-a-date")).toBe("d90_plus");
+    expect(agingBucketFor(TODAY, "30/06/2026")).toBe("d90_plus");
+  });
+
+  it("ages a MISSING deadline as d90_plus, never excluded", () => {
+    expect(agingBucketFor(TODAY, null)).toBe("d90_plus");
+    expect(agingBucketFor(TODAY, undefined)).toBe("d90_plus");
+  });
+
+  it("never returns a non-bucket, so no caller can silently drop a row", () => {
+    // The old signature returned `AgingBucket | null` and every caller
+    // read the null as "exclude". Restoring that return type is the
+    // mutation this pin is aimed at.
+    for (const deadline of ["2026-05-31", "not-a-date", null, undefined]) {
+      expect(AGING_BUCKETS).toContain(agingBucketFor(TODAY, deadline));
+    }
   });
 });
 

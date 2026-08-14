@@ -12,6 +12,8 @@
 //      31..60 → d31_60
 //      61..90 → d61_90
 //        > 90 → d90_plus
+//     missing / unreadable deadline → d90_plus (conservative imputation,
+//       mirroring `reports::aging_placement`)
 //
 // If the two ever drift, the operator clicks "31–60 nap = 3 invoices" and
 // lands on a list showing 2 — the canonical fail-loud regression this
@@ -86,13 +88,24 @@ function dayDiff(aIso: string, bIso: string): number | null {
 }
 
 /** Classify a payment deadline into its aging bucket relative to `today`.
- * Both args are ISO `YYYY-MM-DD`. Returns `null` only when `deadlineIso`
- * is unparseable — callers treat that as "row has no usable deadline" and
- * exclude it (the same posture the backend takes when `parse_iso_date`
- * fails). Mirrors `reports::aging_bucket_for`. */
-export function agingBucketFor(todayIso: string, deadlineIso: string): AgingBucket | null {
-  const overdue = dayDiff(todayIso, deadlineIso);
-  if (overdue === null) return null;
+ * `todayIso` is ISO `YYYY-MM-DD`.
+ *
+ * A MISSING (`null`) or unparseable deadline returns `d90_plus`, never
+ * `null`: an outstanding invoice whose due date cannot be read cannot be
+ * assumed not-yet-due, so it is aged as most-overdue. This mirrors
+ * `reports::aging_placement` exactly — both used to exclude such a row
+ * from every bucket while still counting it in the receivables / payables
+ * TOTAL, so the panel's breakdown summed to less than its own headline.
+ * If only one of the two sides were fixed, the operator would click
+ * "90+ nap = 3" and land on a list showing 2 — the drift this shared
+ * module exists to prevent. Mirrors `reports::aging_bucket_for` for every
+ * readable deadline, unchanged. */
+export function agingBucketFor(
+  todayIso: string,
+  deadlineIso: string | null | undefined,
+): AgingBucket {
+  const overdue = deadlineIso == null ? null : dayDiff(todayIso, deadlineIso);
+  if (overdue === null) return "d90_plus";
   if (overdue <= 0) return "current";
   if (overdue <= 30) return "d1_30";
   if (overdue <= 60) return "d31_60";

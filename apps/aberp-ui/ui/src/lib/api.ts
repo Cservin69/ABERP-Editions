@@ -5037,6 +5037,16 @@ export interface HygienePanel {
   outgoing_abandoned_count: number;
   outgoing_pending_count: number;
   restored_no_partner_count: number;
+  /** Both past-deadline counters EXCLUDE invoices with a missing or
+   * unreadable `payment_deadline`. Those are aged into the `days_90_plus`
+   * bucket on the aging panels (an age estimate — see
+   * `reports::aging_placement`), but these are lateness ASSERTIONS and an
+   * absent deadline is unknown lateness, not lateness. The exclusion is
+   * why the two hygiene drill-downs still short-circuit on a null
+   * deadline while the aging drill-downs no longer do; it is load-bearing
+   * on the AP side, where NAV-synced payables carry no deadline at all.
+   * The imputed rows are disclosed via
+   * `LedgerDiagnostics.aging_undated_*` instead. */
   outstanding_past_deadline_count: number;
   payable_past_deadline_count: number;
   storno_chain_count: number;
@@ -5094,6 +5104,34 @@ export interface FinancialReport {
   deltas: PeriodDeltas;
   annual_running: AnnualRunningPanel;
   deferred_notes: string[];
+  ledger_diagnostics: LedgerDiagnostics;
+}
+
+/** Integrity signal for one run of the aggregator. `unparseable_entries >
+ * 0` means the backend's audit-ledger walk hit entries whose payload it
+ * could not decode; those entries are reflected in NO figure above, so the
+ * whole snapshot must be presented as possibly-incomplete rather than
+ * authoritative. Zero on every healthy report.
+ *
+ * `unparseable_entry_ids` is capped backend-side (50); the count is exact,
+ * so `unparseable_entries > unparseable_entry_ids.length` means "and
+ * more". */
+export interface LedgerDiagnostics {
+  unparseable_entries: number;
+  unparseable_entry_ids: string[];
+  /** Outstanding invoices (AR or AP) whose `payment_deadline` was missing
+   * or unreadable. They ARE in the receivables / payables totals and in
+   * the `days_90_plus` aging bucket — the count says their age is an
+   * imputation, not that a figure is missing. */
+  aging_undated_invoices: number;
+  /** Machine-readable only. The dashboard does NOT render this list:
+   * NAV-synced payables have no deadline at all, so on a real book it
+   * would be a permanent wall of ids. Kept for support/debugging. */
+  aging_undated_invoice_ids: string[];
+  /** Per-side split of `aging_undated_invoices`, so each aging panel can
+   * footnote its own imputed rows without double-reporting the total. */
+  aging_undated_receivables: number;
+  aging_undated_payables: number;
 }
 
 /** Fetch the financial-statistics snapshot for the given period +

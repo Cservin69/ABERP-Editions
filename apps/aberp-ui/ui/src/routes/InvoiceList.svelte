@@ -188,7 +188,9 @@
     ) {
       return false;
     }
-    if (row.payment_deadline === null) return false;
+    // No early-out on a null deadline: the dashboard's `receivables_aging`
+    // ages such a row as `d90_plus` rather than dropping it, so this list
+    // must too or the click-through count disagrees with the tile.
     return agingBucketFor(todayIsoLocal(), row.payment_deadline) === agingFacet;
   }
 
