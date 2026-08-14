@@ -984,6 +984,20 @@ struct OutgoingLineGroup {
     ///     `InvalidColumnType`, and the `?` would fail the WHOLE
     ///     financial report, not merely DSO.
     issue_date: String,
+    /// The aging anchor, normalised to `YYYY-MM-DD` by the SAME
+    /// `SUBSTR(CAST(.. AS VARCHAR), 1, 10)` guard as [`Self::issue_date`],
+    /// and for a sharper reason since the settled-exclusion rule landed.
+    ///
+    /// `invoice.payment_deadline` is a `DATE` today, so the `CAST` alone
+    /// would render `2026-06-15` and parse fine. But
+    /// [`parse_iso_date`] accepts ONLY `[year]-[month]-[day]`, so the day
+    /// this column widens to a `TIMESTAMP` — or any writer starts storing
+    /// RFC3339 in it, exactly as `issue_date` already does — every value
+    /// becomes unparseable at once. Under [`aging_placement`] that no
+    /// longer means "aged conservatively": it means EVERY receivable is
+    /// classified settled and silently leaves the books, with the
+    /// diagnostic reporting the whole ledger as excluded. The `SUBSTR` is
+    /// what stops a column-type change from emptying receivables.
     payment_deadline: Option<String>,
     vat_rate_basis_points: i32,
     net_minor: i64,
@@ -995,6 +1009,22 @@ struct ApRow {
     /// offending payable instead of just counting it.
     id: String,
     supplier_name: String,
+    /// Same `SUBSTR(CAST(.. AS VARCHAR), 1, 10)` guard as the AR side, and
+    /// this is the MORE dangerous of the two.
+    ///
+    /// `ap_invoice.payment_deadline` is a `VARCHAR` whose only writer that
+    /// sets it at all is the manual/ingestion path; `ap_sync` leaves it
+    /// NULL. So undated is ALREADY the dominant AP population and the
+    /// settled-exclusion rule already empties most of payables. If the
+    /// column ever carried a timestamp-shaped string — or were migrated to
+    /// `TIMESTAMP` — the remaining readable rows would join them and
+    /// payables would report zero with no code change anywhere.
+    ///
+    /// The bare `CAST` also matters on its own: without it a
+    /// `DATE`/`TIMESTAMP`-typed column makes `row.get::<Option<String>>`
+    /// return `InvalidColumnType`, and the `?` fails the WHOLE financial
+    /// report rather than one panel. Before this guard the projection had
+    /// neither.
     payment_deadline: Option<String>,
     net_minor: i64,
     vat_minor: i64,
@@ -1055,13 +1085,14 @@ fn query_outgoing_groups(
                 COALESCE(i.currency, 'HUF') AS currency,
                 {date_col} AS basis_date,
                 SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10) AS issue_date,
-                CAST(i.payment_deadline AS VARCHAR) AS payment_deadline,
+                SUBSTR(CAST(i.payment_deadline AS VARCHAR), 1, 10) AS payment_deadline,
                 il.vat_rate_basis_points,
                 CAST(SUM(CAST(il.quantity AS DECIMAL(38,6)) * il.unit_price) AS VARCHAR) AS net_decimal
            FROM invoice i
            JOIN invoice_line il ON i.id = il.invoice_id
           {where_clause}
-          GROUP BY i.id, currency, basis_date, SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10), payment_deadline,
+          GROUP BY i.id, currency, basis_date, SUBSTR(CAST(i.issue_date AS VARCHAR), 1, 10),
+                   SUBSTR(CAST(i.payment_deadline AS VARCHAR), 1, 10),
                    il.vat_rate_basis_points",
     );
     let mut stmt = conn
@@ -1163,7 +1194,8 @@ fn query_ap_rows(
         binds.push(date_str(to));
     }
     let sql = format!(
-        "SELECT a.id, a.supplier_name, a.payment_deadline,
+        "SELECT a.id, a.supplier_name,
+                SUBSTR(CAST(a.payment_deadline AS VARCHAR), 1, 10) AS payment_deadline,
                 a.total_net_minor, a.total_vat_minor, a.total_gross_minor, a.currency,
                 a.local_status
            FROM ap_invoice a
@@ -1624,13 +1656,15 @@ fn aging_placement(
         Some(raw) => match parse_iso_date(raw) {
             Ok(parsed) => Some((aging_bucket_for(today, parsed), parsed)),
             Err(error) => {
-                // A deadline that is PRESENT but malformed is genuinely
-                // wrong data — both writers validate the shape on the way
-                // in (`incoming_invoices::validate`, the billing store),
-                // so reaching here means something bypassed them. Rare,
-                // and worth an error line each: unlike an absent deadline
-                // this one is not the expected legacy-import shape, yet it
-                // is being classified settled all the same.
+                // A deadline that is PRESENT but unreadable is NOT an
+                // expected shape on either side, so unlike the absent case
+                // it earns an error line per row. It is still classified
+                // settled, which is why this is loud: the most likely way
+                // to reach here in bulk is not bad data at all but a
+                // column-type change defeating the `SUBSTR` guards on the
+                // two projections (see `OutgoingLineGroup::payment_deadline`
+                // and `ApRow::payment_deadline`) — and that would exclude
+                // the entire ledger as settled at once.
                 tracing::error!(
                     invoice_id = %invoice_id,
                     payment_deadline = %raw,
@@ -1644,11 +1678,26 @@ fn aging_placement(
             }
         },
         None => {
-            // An ABSENT deadline is the expected legacy shape and must not
-            // be logged like a fault: `ap_sync` records
-            // `payment_deadline: None` on every NAV-synced payable, so at
-            // error level this would emit a line per payable per dashboard
-            // load and drown the ledger diagnostics that ARE errors. The
+            // An ABSENT deadline is the expected legacy shape on BOTH
+            // sides, for two different and equally concrete reasons:
+            //
+            //   * AR — `payment_deadline` arrived as a NULLable column in
+            //     the PR-84 additive migration (`MIGRATE_PR_84_SQL` in
+            //     `billing/adapters/duckdb_store.rs`), which deliberately
+            //     runs NO backfill `UPDATE`. So a NULL here means exactly
+            //     "issued before PR-84" — a bounded, historical set that
+            //     the operator has ruled settled. It is NOT the case that
+            //     every issued invoice has a validated deadline; the
+            //     issue path simply had nowhere to store one before PR-84.
+            //   * AP — `ap_sync` stamps `payment_deadline: None` on every
+            //     NAV-synced payable, ongoing, so this is unbounded and
+            //     the dominant population. That is the exposure the
+            //     aggregate warning exists for.
+            //
+            // Either way it must not be logged like a fault: at error
+            // level the AP case alone would emit a line per payable per
+            // dashboard load and drown the ledger diagnostics that ARE
+            // errors. The
             // honest signal is the aggregate — one WARN summary per report
             // plus the machine-countable
             // `LedgerDiagnostics::aging_settled_undated` — with the
@@ -2969,6 +3018,147 @@ mod tests {
                 acc.3 + b.count,
             )
         })
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Deadline-classifier PARITY vocabulary.
+    //
+    // `parse_iso_date` decides, on the backend, whether an invoice is
+    // outstanding at all: unreadable → settled → out of the totals, the
+    // buckets and the counters. The SPA's `parseDeadline` (aging.ts) makes
+    // the SAME call client-side for the aging drill-downs. If the two ever
+    // disagree about one string, the tile and its list disagree about a
+    // row — and the disagreement is now about whether money is on the
+    // books, not merely which bucket it sits in.
+    //
+    // This exact table is duplicated in `aging-deadline-parity.test.ts`.
+    // Both must accept and reject identically. The nastiest rows are the
+    // ones a naive parser gets WRONG rather than merely differently:
+    // `2026-02-30` (JS `Date` silently rolls it to March 2) and
+    // `2026-06-15T00:00:00Z` (accepted by `Date.parse`, rejected here) —
+    // either would make the SPA bucket a row the backend calls settled.
+    // ──────────────────────────────────────────────────────────────────
+    const DEADLINE_PARITY_VOCAB: &[(&str, bool)] = &[
+        ("2026-06-15", true),
+        ("  2026-06-15  ", true),        // both sides trim
+        ("2024-02-29", true),            // real leap day
+        ("2026-02-30", false),           // day out of range for the month
+        ("2025-02-29", false),           // not a leap year
+        ("2026-13-01", false),           // month out of range
+        ("2026-06-31", false),           // June has 30 days
+        ("2026-06-15T00:00:00Z", false), // trailing time component
+        ("2026-06-15x", false),          // trailing junk
+        ("2026-6-5", false),             // unpadded
+        ("15/06/2026", false),           // wrong order + separator
+        ("", false),
+        ("not-a-date", false),
+    ];
+
+    /// The backend half of the parity contract. Mutation guard: relaxing
+    /// `parse_iso_date` (e.g. slicing the first 10 chars before parsing,
+    /// or swapping to a permissive parser) reds the rows it starts
+    /// accepting.
+    #[test]
+    fn parse_iso_date_matches_the_shared_deadline_vocabulary() {
+        for (raw, expected_ok) in DEADLINE_PARITY_VOCAB {
+            assert_eq!(
+                parse_iso_date(raw).is_ok(),
+                *expected_ok,
+                "parse_iso_date({raw:?}) must be {}; the SPA's parseDeadline agrees, and a \
+                 disagreement means a tile and its drill-down disagree about whether an \
+                 invoice is on the books",
+                if *expected_ok { "accepted" } else { "rejected" }
+            );
+        }
+    }
+
+    /// The classifier decides OUTSTANDING-ness, not just bucketing, so the
+    /// vocabulary is asserted through `aging_placement` too — the level
+    /// the rest of the report actually consumes.
+    #[test]
+    fn aging_placement_excludes_exactly_the_vocabulary_rejects() {
+        let today = Date::from_calendar_date(2026, Month::August, 13).unwrap();
+        for (raw, expected_ok) in DEADLINE_PARITY_VOCAB {
+            let placed = aging_placement(today, "inv", Some(raw)).is_some();
+            assert_eq!(
+                placed,
+                *expected_ok,
+                "aging_placement({raw:?}) must be {}",
+                if *expected_ok {
+                    "outstanding"
+                } else {
+                    "settled/excluded"
+                }
+            );
+        }
+        // And the NULL case is always settled.
+        assert!(aging_placement(today, "inv", None).is_none());
+    }
+
+    /// Both `payment_deadline` projections must survive a column that is
+    /// TIMESTAMP-typed (or a VARCHAR holding RFC3339), because
+    /// [`parse_iso_date`] accepts only `[year]-[month]-[day]`.
+    ///
+    /// This matters far more than it did before the settled-exclusion
+    /// rule. Previously an unparseable deadline was aged conservatively
+    /// into 90+ and stayed on the books; now it is classified SETTLED and
+    /// leaves the outstanding total entirely. So a column-type change on
+    /// either side would not merely mis-bucket — it would empty
+    /// receivables or payables in one step, with the diagnostic dutifully
+    /// reporting the whole ledger as excluded.
+    ///
+    /// Mutation guard: drop the `SUBSTR(..., 1, 10)` from either
+    /// projection and its arm reds; drop the `CAST` from the AP
+    /// projection and the bare read below is what it becomes.
+    #[test]
+    fn deadline_projections_survive_a_widened_column_on_both_sides() {
+        let conn = Connection::open_in_memory().expect("in-memory duckdb");
+        conn.execute_batch(
+            "CREATE TABLE invoice (id VARCHAR, payment_deadline TIMESTAMP);
+             INSERT INTO invoice VALUES ('inv', TIMESTAMP '2026-06-15 12:00:00');
+             CREATE TABLE ap_invoice (id VARCHAR, payment_deadline VARCHAR);
+             INSERT INTO ap_invoice VALUES ('ap', '2026-06-15T12:00:00Z');",
+        )
+        .expect("seed widened deadline columns");
+
+        // A bare read of the AR side is the InvalidColumnType that would
+        // fail the WHOLE report — the reason the CAST is there at all.
+        let bare: duckdb::Result<String> = conn
+            .prepare("SELECT i.payment_deadline FROM invoice i")
+            .unwrap()
+            .query_row([], |r| r.get(0));
+        assert!(bare.is_err(), "a bare TIMESTAMP read as String must fail");
+
+        // CAST alone is NOT enough: it renders the time component, which
+        // `parse_iso_date` rejects → the invoice would be classified
+        // settled and silently leave receivables.
+        let cast_only: String = conn
+            .prepare("SELECT CAST(i.payment_deadline AS VARCHAR) FROM invoice i")
+            .unwrap()
+            .query_row([], |r| r.get(0))
+            .expect("CAST reads it");
+        assert!(
+            parse_iso_date(&cast_only).is_err(),
+            "CAST alone yields {cast_only:?}, which parse_iso_date rejects — this is exactly \
+             the silent write-off the SUBSTR prevents"
+        );
+
+        // The projections the two queries actually use.
+        for (table, col) in [("invoice i", "i"), ("ap_invoice a", "a")] {
+            let projected: String = conn
+                .prepare(&format!(
+                    "SELECT SUBSTR(CAST({col}.payment_deadline AS VARCHAR), 1, 10) FROM {table}"
+                ))
+                .unwrap()
+                .query_row([], |r| r.get(0))
+                .expect("the CAST+SUBSTR projection must read the column as a String");
+            assert_eq!(projected, "2026-06-15");
+            assert!(
+                parse_iso_date(&projected).is_ok(),
+                "{table}: the projected deadline must stay readable, or every row on this \
+                 side is classified settled at once"
+            );
+        }
     }
 
     /// **RECEIVABLES — the headline pin.** A deadline-less invoice

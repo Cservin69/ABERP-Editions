@@ -107,12 +107,13 @@
   import { parseInvoicesUrl } from "../lib/hygiene-clickthrough";
   // S262 / PR-251 — receivables-aging bucket deep-link from the Finance
   // dashboard's AR-aging card.
-  import {
-    agingBucketFor,
-    AGING_LABELS,
-    todayIsoLocal,
-    type AgingBucket,
-  } from "../lib/aging";
+  import { AGING_LABELS, todayIsoLocal, type AgingBucket } from "../lib/aging";
+  // The drill-down predicate itself lives in `aging-facets` so it can be
+  // pinned by BEHAVIOUR (`aging-facets.test.ts`) rather than by grepping
+  // this file's source. Do NOT reinstate a local copy — the dashboard
+  // tile and this list must classify identically or the operator clicks
+  // a count and lands on a different one.
+  import { outgoingAgingMatches } from "../lib/aging-facets";
   import InvoiceDetail from "./InvoiceDetail.svelte";
   import ModificationInvoice from "./ModificationInvoice.svelte";
   // S220 / PR-217 — operator-paced partner picker for ExtNav rows.
@@ -178,24 +179,7 @@
    * from the dashboard bucket count in those cases — the same
    * best-effort posture S227 documented for the storno-chain row. */
   function agingMatches(row: InvoiceListItem): boolean {
-    if (agingFacet === null) return true;
-    if (row.payment !== null) return false; // paid → not a receivable
-    if (row.is_storno) return false; // storno child
-    if (
-      row.state !== "Submitted" &&
-      row.state !== "Recovered" &&
-      row.state !== "Finalized"
-    ) {
-      return false;
-    }
-    // Deadline-less rows are EXCLUDED, matching the dashboard: the
-    // backend treats an invoice with no readable `payment_deadline` as a
-    // settled legacy import and keeps it out of `receivables_aging` AND
-    // out of the receivables total (`reports::aging_placement`). Keeping
-    // it here would show the operator a row the tile says is settled.
-    // `agingBucketFor` returns null for those, which matches no facet.
-    if (row.payment_deadline === null) return false;
-    return agingBucketFor(todayIsoLocal(), row.payment_deadline) === agingFacet;
+    return outgoingAgingMatches(row, agingFacet, todayIsoLocal());
   }
 
   // PR-94 / session-114 — sortable-columns state. `key === null` keeps
