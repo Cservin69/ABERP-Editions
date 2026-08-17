@@ -54,12 +54,11 @@ from typing import List, Optional, Sequence, Tuple
 from aberp_cad_extract.feature_graph import HoleEndCondition, LocatedHole
 
 try:
-    from OCP.BRep import BRep_Tool
     from OCP.BRepAdaptor import BRepAdaptor_Surface
     from OCP.BRepClass3d import BRepClass3d_SolidClassifier
     from OCP.BRepTools import BRepTools
     from OCP.GeomAbs import GeomAbs_SurfaceType
-    from OCP.gp import gp_Dir, gp_Pnt, gp_Vec
+    from OCP.gp import gp_Pnt
     from OCP.TopAbs import TopAbs_FACE, TopAbs_IN, TopAbs_ON, TopAbs_REVERSED
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopoDS import TopoDS
@@ -158,7 +157,7 @@ class _CylFace:
         self.internal = internal
 
 
-def _is_internal_cylinder(face, adaptor) -> bool:
+def _is_internal_cylinder(face) -> bool:
     """True when the MATERIAL is outside the cylinder — i.e. it's a hole.
 
     Correctness risk #1 from the ADR. A cylindrical face is a bore only
@@ -175,7 +174,6 @@ def _is_internal_cylinder(face, adaptor) -> bool:
     so the face is REVERSED. `tube_od_not_a_hole.step` pins both arms in
     one fixture.
     """
-    del adaptor  # signature kept explicit; the decision is orientation-only
     return face.Orientation() == TopAbs_REVERSED
 
 
@@ -220,7 +218,7 @@ def _face_to_cyl(face) -> Optional[_CylFace]:
         direction=direction,
         t_min=t_min,
         t_max=t_max,
-        internal=_is_internal_cylinder(face, adaptor),
+        internal=_is_internal_cylinder(face),
     )
 
 
@@ -282,10 +280,8 @@ def _point_on_axis(
     )
 
 
-def _classify_ends(
-    solid, origin, direction, t_lo, t_hi
-) -> Tuple[HoleEndCondition, bool]:
-    """Decide through/blind/unknown, and whether the bottom is flat.
+def _classify_ends(solid, origin, direction, t_lo, t_hi) -> HoleEndCondition:
+    """Decide through / blind / unknown for one merged bore.
 
     Probes just OUTSIDE each end of the bore span with OCCT's solid
     classifier:
@@ -309,15 +305,15 @@ def _classify_ends(
         lo_inside = inside(t_lo - END_PROBE_MM)
         hi_inside = inside(t_hi + END_PROBE_MM)
     except Exception:  # noqa: BLE001 — an unclassifiable end is UNKNOWN, not a crash
-        return HoleEndCondition.UNKNOWN, False
+        return HoleEndCondition.UNKNOWN
 
     if not lo_inside and not hi_inside:
-        return HoleEndCondition.THROUGH, False
+        return HoleEndCondition.THROUGH
     if lo_inside != hi_inside:
-        # Blind. Flat-bottom detection is left to the caller's face scan;
-        # see `_has_flat_bottom`.
-        return HoleEndCondition.BLIND, False
-    return HoleEndCondition.UNKNOWN, False
+        # Terminates in material at exactly one end. Whether that end is
+        # FLAT is a separate structural question — see `_has_flat_bottom`.
+        return HoleEndCondition.BLIND
+    return HoleEndCondition.UNKNOWN
 
 
 def _has_flat_bottom(faces, origin, direction, radius, t_bottom) -> bool:
@@ -403,7 +399,7 @@ def mine_cylindrical_holes(shape) -> List[LocatedHole]:
             if depth <= 0.0:
                 continue
 
-            end_condition, _ = _classify_ends(shape, origin, direction, t_lo, t_hi)
+            end_condition = _classify_ends(shape, origin, direction, t_lo, t_hi)
 
             # Entry point + drill direction. For a blind hole the entry is
             # the OPEN end, so the axis points from open end into the
