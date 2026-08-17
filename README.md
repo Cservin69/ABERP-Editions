@@ -510,9 +510,15 @@ pretending to work. Each has a backlog entry in
 | DÁP eAzonosítás operator login | `DapTransport` trait; `MockDapTransport` driven end to end by a live `POST /api/dap/mock-login`; the OIDC transport is `todo!` | szeusz.gov.hu relying-party credentials and spec access | [D-05](docs/BACKLOG-designed-to-live.md#d-05) |
 | NETLOCK qualified timestamp | `NetlockTsa` compiles into the binary, every method `todo!`; `MockTimestampAuthority` runs in its place | NETLOCK account onboarding, then swapping the authority at the anchor site | [D-06](docs/BACKLOG-designed-to-live.md#d-06) |
 | CAC / PIV operator identity | `DigitalIdProvider` trait with two selectable backends — `MockProvider` and `UsDodCacProvider`, a card-session stub that WARNs on construction and makes `current_operator()` genuinely fallible | A real card reader (PKCS#11) and DoD PKI chain validation instead of the stub's chain-membership check | [D-07](docs/BACKLOG-designed-to-live.md#d-07) |
+| Solid CAD interchange → canonical STEP, normalised in-pipeline | The OCCT kernel is already provisioned and load-bearing: `run/provision_pipeline_venv.sh` installs the extractor with the `[step]` extra (`cadquery-ocp` 7.9.3.1.1) and gates on `import OCP`, and the STEP path off it is Live end to end — `STEPControl_Reader` → `extract_step` → FeatureGraph → quote, run as an isolated subprocess. The storefront already *accepts* `.iges`; it dead-ends as a `Permanent` extract failure (PR-274 / S297 F1) | An offline OCCT transcode of the uploaded solid into one canonical STEP (no FreeCAD, no SaaS), then the existing extractor unchanged — plus the same widened solid allowlist in all three places that disagree: the ABERP-site storefront validator, the daemon's CAD picker, and the Python `_route`. Adds IGES `.iges`/`.igs` and BREP `.brep` only; **mesh stays rejected** (`.stl`/`.3mf`/`.obj`) — this does not reverse the ADR-0112 STL drop | [D-18](docs/BACKLOG-designed-to-live.md#d-18) |
 
 QC inspection results are entered by hand today; the probe sources above
 are what would feed them automatically.
+
+One row is listed here for its code surface rather than for a hardware wait:
+[D-18](docs/BACKLOG-designed-to-live.md#d-18) waits on nothing external at
+all — the OCCT kernel it needs is already installed and gate-tested, so it
+is purely our own work, coordinated across this repo and ABERP-site.
 
 ---
 

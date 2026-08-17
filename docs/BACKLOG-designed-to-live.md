@@ -366,6 +366,134 @@ satisfy each control, and a report that renders the coverage.
 **Size.** Medium, and mostly analysis rather than code: deciding which
 existing events evidence which controls is the work.
 
+<a id="d-18"></a>
+### D-18 — Normalise solid CAD interchange formats to a canonical STEP, in the pipeline
+
+**Not a customer-facing feature.** No convert hint, no converter UI, and the
+customer never receives a STEP back. The conversion is invisible plumbing;
+the deliverable to them stays the quote today and the toolpath later. What
+changes is only *which uploads reach the extractor instead of dead-ending*.
+
+**Surface today.** The kernel that would do the work is already provisioned
+and already load-bearing. `run/provision_pipeline_venv.sh:75` installs the
+extractor package with the `[step]` extra — the ~63 MB `cadquery-ocp` wheel,
+i.e. OCCT — and the verify gate at `:78` refuses to pass unless
+`import aberp_cad_extract, OCP` succeeds; the two upgrade scripts carry the
+same contract (`run/upgrade_defense.sh:356`,
+`run/upgrade_portable.sh:341`), and `run/tests/provision_pipeline_venv_step_test.sh`
+regression-tests it. The STEP path off that kernel is Live end to end:
+`_load_step_shape` drives `STEPControl_Reader`
+(`python/aberp-cad-extract/aberp_cad_extract/extractors/step.py:82`, reader
+constructed at `:105`) into `extract_step` (`:128`), the Rust side runs it
+as an isolated subprocess so an OCCT crash cannot take the daemon down
+(`crates/aberp-cad-extract-wrapper/src/lib.rs:41`, request contract at
+`:248`), and the pricing daemon consumes it as stage 2 of four —
+storefront poll, extract, price, render
+(`apps/aberp/src/quote_pricing_pipeline.rs:15`, extractor constructed at
+`:1078`).
+
+The gap is documented, not hypothetical, and it is currently a
+**dead-end**. Three allowlists disagree, widest first:
+
+1. The storefront accepts far more than three formats — `ALLOWED_EXT` in
+   **`ABERP-site/src/routes/api/quote/+server.ts:17–32`** *(cross-repo;
+   ABERP-site is not checked out here)*, with per-format magic-byte
+   validation in **`ABERP-site/src/lib/server/cad-validate.ts:1–313`**
+   *(cross-repo)*. Both are recorded from this side at
+   `docs/findings/s346-audit-quote-workflow.md:85`. Beyond `.stl` /
+   `.step` / `.stp` it admits `.iges`, `.igs`, `.x_t`, `.x_b`, `.sldprt`,
+   `.ipt`, `.f3d`, `.dxf`, `.dwg`, `.3mf`, `.obj`
+   (`docs/reviews/S296-adversarial-s286-s295-overnight.md:50`).
+2. The pricing daemon's file picker takes the first `.stl` / `.step` /
+   `.stp` file in the quote and nothing else
+   (`apps/aberp/src/quote_pricing_pipeline.rs:626`) — an IGES-only quote
+   never even gets picked; it falls to `enqueue_failed_no_cad`.
+3. The Python dispatcher `_route` routes the same three
+   (`python/aberp-cad-extract/aberp_cad_extract/cli.py:29`, error at
+   `:36`).
+
+So IGES is *already* accepted at the front door and already fails: PR-274 /
+S297 F1 added a classifier rule so `Unsupported file extension '.iges'`
+lands as `FailureKind::Permanent` rather than `Unknown`
+(`apps/aberp/src/quote_pricing_pipeline.rs:2862` and the rule at `:2912`,
+pinned by `pr274_classify_unsupported_extension_is_permanent` at `:5197`).
+That rule is correct as a *fail-fast*, and it is exactly what this entry
+converts into a *transcode* for the formats the kernel can actually read.
+
+**Missing for Live.** An offline transcode step, then reuse — do not fork
+the STEP path:
+
+- **Broaden accept to the solid interchange formats OCCT reads, and only
+  those.** Confirmed against the wheel this repo installs — `cadquery-ocp`
+  **7.9.3.1.1** (OCCT 7.9.3) in `python/aberp-cad-extract/.venv`, by
+  importing the reader classes rather than reading vendor docs:
+  `STEPControl_Reader` / `STEPCAFControl_Reader`, `IGESControl_Reader` /
+  `IGESCAFControl_Reader`, and `BRepTools::Read` all import; `RWObj` is
+  **absent from the build entirely**, and there is no `Parasolid`, `ACIS`,
+  `JT`, or `DE_Wrapper` module of any kind. The exact set is therefore
+  **STEP `.step`/`.stp` (already accepted) + IGES `.iges`/`.igs` + BREP
+  `.brep`** — three formats, not an open-ended rule. "Other OCCT-readable
+  solid formats" resolves to nothing further in this build; a fourth format
+  means a different OCCT distribution and its own decision. Note also that
+  `.x_t`/`.x_b`/`.sldprt`/`.ipt`/`.f3d` are accepted at the storefront
+  today and are **unreadable by this kernel** — the storefront allowlist
+  promises what OCCT cannot keep, and narrowing it belongs with this work.
+- **Mesh formats stay rejected. This entry does not reverse the STL drop.**
+  A mesh cannot be turned back into a solid — there are no faces, no axes,
+  no cylinders to mine, so no located holes and no honest quote. `.stl`,
+  `.3mf`, and `.obj` stay out, as do the 2D `.dxf`/`.dwg`. `StlAPI_Reader`
+  and `RWGltf_CafReader` do exist in the wheel and must not be mistaken for
+  a way in: they yield a triangulation, not a B-Rep body. STL is dropped by
+  ADR-0112 Slice A (`b141436` on branch
+  `feat/adr-0112-step-only-located-holes`, unmerged as of this entry) —
+  anyone reading D-18 as licence to re-add mesh has read it backwards.
+- **The transcode itself: server-side, offline, no SaaS.** OCCT/OCP reads
+  the uploaded solid and writes **one canonical STEP** into the existing
+  artifact directory next to the upload; from there the pipeline proceeds
+  unchanged. **FreeCAD is explicitly not needed** — it would only wrap the
+  same kernel we already ship and pull in a GUI-scale dependency for
+  nothing. It runs inside the existing subprocess isolation, so a
+  transcode-side OCCT crash has the same non-fatal shape as an extract-side
+  one. IGES is the one with real work in it: it is surface-based, so a
+  read may land as a shell rather than a solid and needs an explicit
+  sew/solid-check with a loud failure when it will not close — an
+  unclosed shell must fail, never quietly become a quote.
+- **Then reuse the STEP path verbatim.** Canonical STEP → the existing
+  extractor → FeatureGraph
+  (`python/aberp-cad-extract/aberp_cad_extract/feature_graph.py:57`,
+  `HOLE` at `:35`;
+  located holes land with ADR-0112 Slice B, `f7f234a` on the branch above)
+  → quote → toolpath as the downstream possibility. One extractor, one
+  schema, one quote path.
+- **Two repos, two surfaces — but three allowlists.** The **front door** is
+  the ABERP-site storefront upload/content-sniff validation (the two
+  cross-repo anchors above): broaden the accepted-solid allowlist and add
+  the matching magic-byte arms there, and drop the formats OCCT cannot
+  read. The **transcode, extract, and quote** live here in the Editions
+  pipeline. Do not miss that the Editions side has *two* gates of its own —
+  the daemon's CAD picker (`quote_pricing_pipeline.rs:626`) and the Python
+  `_route` (`cli.py:29`) — and both must learn the same widened set, or the
+  front door widens onto the same dead end it does today.
+
+**Blocked on.** Nothing external. The kernel is already installed,
+provisioned, and gate-tested; no account, licence, machine, or vendor SDK
+is involved. It does need the ABERP-site change to land in step with this
+one — that is coordination across two repos we own, not an external
+dependency.
+
+**Size.** Medium. Small per format for STEP and BREP; IGES carries most of
+the risk (sew-to-solid, and the failure mode when it will not close).
+Widening three allowlists in lockstep is the coordination cost, and the
+quote-side maths does not move at all.
+
+**Do not regress.** The `FailureKind::Permanent` classification for an
+unsupported extension stays for everything still out of scope — mesh, 2D,
+and the native/Parasolid formats. Softening it to `Unknown` or `Transient`
+would put the operator back on the futile-Retry loop PR-274 closed. And
+the canonical STEP is an internal artifact: it must never be offered back
+to the customer as a download, or the invisible plumbing becomes a
+product promise nobody agreed to ship.
+
 ---
 
 ## Expansion slots on a Live capability
