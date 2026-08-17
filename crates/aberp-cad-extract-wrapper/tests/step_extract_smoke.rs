@@ -17,7 +17,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use aberp_cad_extract_wrapper::{CadExtractor, ExtractRequest, EXPECTED_SCHEMA_VERSION};
+use aberp_cad_extract_wrapper::{
+    CadExtractor, ExtractRequest, EXPECTED_SCHEMA_VERSION, MIN_SCHEMA_VERSION,
+};
 
 mod common;
 use common::test_python_bin;
@@ -60,7 +62,16 @@ fn step_cube_extracts_into_feature_graph_via_real_python() {
         ),
     };
 
-    assert_eq!(graph.schema_version, EXPECTED_SCHEMA_VERSION);
+    // ADR-0112 B.1: the guard is a RANGE, so the smoke test asserts the
+    // range too. Pinning exact equality here would re-create, in a test,
+    // exactly the lockstep coupling the range guard exists to remove.
+    assert!(
+        (MIN_SCHEMA_VERSION..=EXPECTED_SCHEMA_VERSION).contains(&graph.schema_version),
+        "extractor emitted v{}, outside the accepted {}..={}",
+        graph.schema_version,
+        MIN_SCHEMA_VERSION,
+        EXPECTED_SCHEMA_VERSION
+    );
     // AddOptimal_s gives an exact 20.0 bbox for an axis-aligned cube;
     // serde converts through f64 with no precision loss.
     assert_eq!(graph.bounding_box_mm, [20.0, 20.0, 20.0]);

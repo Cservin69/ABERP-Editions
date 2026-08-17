@@ -14,7 +14,9 @@
 
 use std::time::Duration;
 
-use aberp_cad_extract_wrapper::{CadExtractor, ExtractRequest, EXPECTED_SCHEMA_VERSION};
+use aberp_cad_extract_wrapper::{
+    CadExtractor, ExtractRequest, EXPECTED_SCHEMA_VERSION, MIN_SCHEMA_VERSION,
+};
 
 mod common;
 use common::{test_python_bin, write_cube_stl};
@@ -41,7 +43,11 @@ fn cube_stl_extracts_into_feature_graph_via_real_python() {
         }
     };
 
-    assert_eq!(graph.schema_version, EXPECTED_SCHEMA_VERSION);
+    assert!(
+        (MIN_SCHEMA_VERSION..=EXPECTED_SCHEMA_VERSION).contains(&graph.schema_version),
+        "extractor emitted v{}, outside the accepted range",
+        graph.schema_version
+    );
     assert_eq!(graph.bounding_box_mm, [20.0, 20.0, 20.0]);
     assert_eq!(graph.material_grade, "6061-T6");
     // STL v1 returns an empty features list — that's honest, per the

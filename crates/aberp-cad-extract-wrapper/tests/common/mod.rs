@@ -103,6 +103,30 @@ fn repo_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Absolute path to a committed Python-side STEP fixture.
+///
+/// `CARGO_MANIFEST_DIR` points at `crates/aberp-cad-extract-wrapper`;
+/// [`repo_root`] walks up two levels, then into the Python package's
+/// `tests/fixtures/`. Same resolution `step_extract_smoke.rs` uses.
+pub fn step_fixture_source(name: &str) -> PathBuf {
+    repo_root()
+        .join("python/aberp-cad-extract/aberp_cad_extract/tests/fixtures")
+        .join(name)
+}
+
+/// Copy the 20 mm-cube STEP fixture to `dest`.
+///
+/// ADR-0112 replacement for `write_cube_stl`. The tests using this need
+/// a **carrier file** — something that exists on disk so the wrapper's
+/// pre-flight `input_path.exists()` check passes and the stub Python
+/// module (which never opens it) gets to run. A format synthesiser is
+/// overkill for that; copying the committed fixture is simpler and
+/// honest about which formats are live.
+pub fn copy_step_fixture(dest: &Path) -> std::io::Result<()> {
+    let src = step_fixture_source("unit_cube.step");
+    std::fs::copy(&src, dest).map(|_| ())
+}
+
 /// Write a 20 mm cube as a binary STL to `path`. Matches the
 /// fixture geometry exercised by the Python-side CLI test
 /// (`test_cli_emits_valid_feature_graph_json`) — 20×20×20 axis-

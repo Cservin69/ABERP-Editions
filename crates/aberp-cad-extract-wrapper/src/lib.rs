@@ -73,11 +73,34 @@
 //!
 //! ## Schema versioning
 //!
-//! [`EXPECTED_SCHEMA_VERSION`] pins the Python-side schema this build
-//! of the wrapper understands. When S269+ emits v2, bump the constant
-//! in this crate in the same diff. The mismatch error
-//! ([`ExtractError::SchemaVersionMismatch`]) names both values so the
-//! operator can read it without guessing.
+//! [`EXPECTED_SCHEMA_VERSION`] is the NEWEST Python-side schema this
+//! build understands; [`MIN_SCHEMA_VERSION`] is the OLDEST still
+//! accepted. The guard is a **range**, `MIN..=EXPECTED`, matching the
+//! engine's own `schema_version <= FeatureGraph::SCHEMA_VERSION`
+//! check (`aberp_quote_engine::engine`) so the two layers agree.
+//!
+//! **ADR-0112 B.1 — version-drift reconciliation.** Before this cut
+//! there were THREE independently-maintained version numbers (Rust
+//! engine `FeatureGraph::SCHEMA_VERSION` = 5, Python `SCHEMA_VERSION`
+//! = 2, wrapper `EXPECTED_SCHEMA_VERSION` = 2) and the wrapper's guard
+//! was **exact equality** while this crate's and
+//! `feature_graph.rs`'s docs both claimed it accepted `<= N`. The two
+//! defects compounded: bumping the Python version without editing the
+//! wrapper constant in the same diff would have failed EVERY extraction
+//! with [`ExtractError::SchemaVersionMismatch`], which the daemon's
+//! `classify_failure` marks **Permanent** — no auto-retry, every
+//! in-flight quote parked until an operator clicks Retry on each one.
+//! Silent until deploy.
+//!
+//! Both are fixed here and the drift is designed out rather than
+//! re-synchronised: [`EXPECTED_SCHEMA_VERSION`] is now **derived from**
+//! [`FeatureGraph::SCHEMA_VERSION`] instead of being a third hand-kept
+//! copy, so the Rust side can no longer disagree with itself. The
+//! Python `SCHEMA_VERSION` remains a separate literal (different
+//! language, no shared constant) but it is now only ever required to
+//! land INSIDE the range, not to equal a specific value — so a
+//! lockstep-bump miss degrades to "older schema, defaulted fields"
+//! instead of a pipeline outage.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -91,11 +114,27 @@ use thiserror::Error;
 
 pub use aberp_quote_engine::FeatureGraph;
 
-/// The Python-side `_schema_version` value this build of the wrapper
-/// accepts. Bump in the same diff as the Python extractor when the
-/// schema evolves; [`ExtractError::SchemaVersionMismatch`] surfaces a
-/// mismatch loud rather than silently mis-parsing fields.
-pub const EXPECTED_SCHEMA_VERSION: u32 = 2;
+/// The NEWEST Python-side `_schema_version` this build of the wrapper
+/// understands — i.e. the top of the accepted range.
+///
+/// **Derived, not hand-kept** (ADR-0112 B.1). It is defined as
+/// [`FeatureGraph::SCHEMA_VERSION`] so the wrapper cannot drift from the
+/// engine struct it parses into: the engine's own guard is
+/// `schema_version <= FeatureGraph::SCHEMA_VERSION`, and a wrapper that
+/// accepted a HIGHER value would just hand the engine a graph it then
+/// rejects one layer down. Adding a field to `FeatureGraph` and bumping
+/// its `SCHEMA_VERSION` moves this constant automatically.
+pub const EXPECTED_SCHEMA_VERSION: u32 = FeatureGraph::SCHEMA_VERSION;
+
+/// The OLDEST `_schema_version` still accepted.
+///
+/// v1 predates `surface_area_mm2` and the addendum-1 booleans; a v1
+/// graph is not a shape this build can price honestly, so it is refused
+/// rather than defaulted. v2 upward, every added field is
+/// `#[serde(default)]` on the Rust struct, so an older graph loads with
+/// inert defaults and prices at its historical number — which is exactly
+/// what re-pricing a stored blob must do.
+pub const MIN_SCHEMA_VERSION: u32 = 2;
 
 /// Default subprocess timeout. The operator-click-to-quote flow
 /// targets 1–2 seconds end-to-end; 30 seconds is the "something is
@@ -225,7 +264,10 @@ impl CadExtractor {
                 error: e,
             })?;
 
-        if graph.schema_version != EXPECTED_SCHEMA_VERSION {
+        // ADR-0112 B.1 — RANGE, not equality. See the crate-level
+        // "Schema versioning" section for why the old `!=` form was a
+        // latent Defense-line outage.
+        if !(MIN_SCHEMA_VERSION..=EXPECTED_SCHEMA_VERSION).contains(&graph.schema_version) {
             return Err(ExtractError::SchemaVersionMismatch {
                 expected: EXPECTED_SCHEMA_VERSION,
                 got: graph.schema_version,
@@ -323,12 +365,17 @@ pub enum ExtractError {
         error: serde_json::Error,
     },
 
-    /// JSON parsed cleanly but the `_schema_version` did not match
-    /// [`EXPECTED_SCHEMA_VERSION`]. Either the Python extractor was
-    /// upgraded without a matching Rust bump, or the wrapper is stale.
+    /// JSON parsed cleanly but the `_schema_version` fell OUTSIDE the
+    /// accepted range [`MIN_SCHEMA_VERSION`]`..=`[`EXPECTED_SCHEMA_VERSION`]
+    /// — either a graph newer than this build understands (the Python
+    /// extractor was upgraded without a matching Rust bump, or the
+    /// wrapper is stale), or a v1 graph too old to price honestly.
     #[error("FeatureGraph _schema_version mismatch: expected {expected}, got {got}")]
     SchemaVersionMismatch {
-        /// The constant this build of the wrapper accepts.
+        /// The TOP of the range this build of the wrapper accepts (the
+        /// bottom is [`MIN_SCHEMA_VERSION`]). Kept named `expected` —
+        /// the `Display` string it feeds is matched by the daemon's
+        /// `classify_failure` (`_schema_version mismatch` → Permanent).
         expected: u32,
         /// The value carried by the JSON we just parsed.
         got: u32,

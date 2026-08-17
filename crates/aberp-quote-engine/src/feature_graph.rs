@@ -523,25 +523,35 @@ pub struct FeatureGraph {
 }
 
 impl FeatureGraph {
-    /// The schema version this build of the engine understands. The
-    /// wrapper (S270) compares this against the value in the JSON
-    /// and refuses unknown versions loud. **v2 (S418)** added
-    /// `surface_area_mm2`; the Python `SCHEMA_VERSION` and the
-    /// wrapper's `EXPECTED_SCHEMA_VERSION` bump in lockstep. **v3
-    /// (ADR-0094 Gap 1)** adds the defaulted `stock_form`; a v2 graph
-    /// (no `stock_form`) still loads — it defaults to `RectangularBlock`
-    /// — and the version guard accepts any `schema_version ≤ 3`. The
-    /// extractor's lockstep bump to v3 lands with S269 (ADR-0094 Q3).
+    /// The NEWEST schema version this build of the engine understands, and
+    /// — since ADR-0112 B.1 — the SINGLE Rust-side source of truth for it:
+    /// `aberp_cad_extract_wrapper::EXPECTED_SCHEMA_VERSION` is now *defined
+    /// as* this constant rather than being a second, independently-drifting
+    /// copy.
+    ///
+    /// **How the guard actually works (corrected).** Two layers, both
+    /// range-based, both accepting OLDER graphs:
+    ///
+    /// - wrapper: `MIN_SCHEMA_VERSION..=EXPECTED_SCHEMA_VERSION`
+    /// - engine:  `schema_version <= SCHEMA_VERSION`
+    ///
+    /// Before ADR-0112 this doc claimed four times over that "the version
+    /// guard accepts any `schema_version <= N`", while the wrapper's guard
+    /// was in fact **exact equality against 2**. Only the engine's `<=` was
+    /// real, and it sits DOWNSTREAM of the wrapper, so on the extraction
+    /// path it was never reached — the wrapper rejected first. Both the
+    /// guard and this text are fixed; see the wrapper crate docs for the
+    /// silent-until-deploy outage that mismatch would otherwise have caused.
+    ///
+    /// **v2 (S418)** added `surface_area_mm2`.
+    /// **v3 (ADR-0094 Gap 1)** adds the defaulted `stock_form`; a v2 graph
+    /// (no `stock_form`) still loads — it defaults to `RectangularBlock`.
     /// **v4 (ADR-0094 Gap 3)** adds the defaulted `gears` vector; a v2/v3
-    /// graph (no `gears`) still loads — it defaults to empty ⇒ zero gear cost
-    /// ⇒ today's price — and the guard accepts any `schema_version <= 4`. The
-    /// extractor's lockstep bump to v4 lands with S269 (ADR-0094 Q3).
+    /// graph still loads — empty ⇒ zero gear cost ⇒ today's price.
     /// **v5 (ADR-0097 Part 1, T2)** adds the defaulted `tolerance`
     /// ([`ToleranceSpec`]) and `critical_feature_tolerances`
-    /// ([`FeatureTolerance`]) fields; a ≤v4 graph (no `tolerance`) still loads
-    /// — `tolerance` defaults to [`ToleranceSpec::Unspecified`] (defers to the
-    /// resolved `target_tolerance` ⇒ today's price) and the callouts default
-    /// empty — and the guard accepts any `schema_version <= 5`. The
-    /// extractor's lockstep bump to v5 lands with S269 (ADR-0097 Q8).
+    /// ([`FeatureTolerance`]); a ≤v4 graph loads with `tolerance` =
+    /// [`ToleranceSpec::Unspecified`] (defers to the resolved
+    /// `target_tolerance` ⇒ today's price) and the callouts empty.
     pub const SCHEMA_VERSION: u32 = 5;
 }
