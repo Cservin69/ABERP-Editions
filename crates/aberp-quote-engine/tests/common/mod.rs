@@ -127,6 +127,8 @@ pub fn simple_feature_graph(grade: &str) -> FeatureGraph {
     FeatureGraph {
         schema_version: FeatureGraph::SCHEMA_VERSION,
         tolerance: ToleranceSpec::Unspecified,
+        // ADR-0112 v6 — inert: empty ⇒ no JSON key, no price change.
+        located_holes: Vec::new(),
         critical_feature_tolerances: Vec::new(),
         bounding_box_mm: [50.0, 30.0, 20.0],
         volume_mm3: 25_000.0,

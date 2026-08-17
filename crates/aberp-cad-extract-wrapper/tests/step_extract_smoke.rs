@@ -95,3 +95,103 @@ fn step_cube_extracts_into_feature_graph_via_real_python() {
         graph.volume_mm3
     );
 }
+
+/// ADR-0112 Part B, end-to-end through the REAL wire.
+///
+/// The Python-side pins (`test_holes.py`) prove the miner; this proves
+/// the whole path — OCCT face-walk -> Pydantic model -> canonical JSON ->
+/// subprocess stdout -> serde -> the Rust `LocatedHole` struct — with no
+/// field lost, renamed or mistyped in between. A cross-language wire
+/// contract is exactly the kind of thing that compiles fine on both sides
+/// while agreeing on nothing.
+#[test]
+fn step_plate_yields_four_located_holes_through_the_real_wire() {
+    use aberp_cad_extract_wrapper::FeatureGraph;
+
+    let fixture = step_fixture_path("plate_4_through_holes.step");
+    assert!(
+        fixture.exists(),
+        "STEP fixture missing at {}: regenerate via \
+         python/aberp-cad-extract/tools/generate_step_fixtures.py",
+        fixture.display()
+    );
+
+    let extractor = CadExtractor::new()
+        .with_python_bin(test_python_bin())
+        .with_timeout(Duration::from_secs(30));
+
+    let graph: FeatureGraph = extractor
+        .extract(&ExtractRequest {
+            input_path: fixture,
+            material_grade: "6061-T6".to_string(),
+        })
+        .unwrap_or_else(|e| {
+            panic!(
+                "located-hole smoke failed: {e}\n\
+                 (install the Python extractor with `pip install -e '.[step]'`)"
+            )
+        });
+
+    // The extractor emits v6 now; the range guard is what makes that safe.
+    assert!(
+        (MIN_SCHEMA_VERSION..=EXPECTED_SCHEMA_VERSION).contains(&graph.schema_version),
+        "extractor emitted v{}, outside the accepted range",
+        graph.schema_version
+    );
+
+    assert_eq!(
+        graph.located_holes.len(),
+        4,
+        "the 100x60x12 plate has four Ø8 through-holes; got {:?}",
+        graph.located_holes
+    );
+
+    // Exact geometry — same numbers the fixture was BUILT from.
+    let expected_entries = [
+        [20.0, 20.0, 0.0],
+        [20.0, 40.0, 0.0],
+        [80.0, 20.0, 0.0],
+        [80.0, 40.0, 0.0],
+    ];
+    for (hole, entry) in graph.located_holes.iter().zip(expected_entries) {
+        assert!((hole.diameter_mm - 8.0).abs() < 1e-6, "diameter: {hole:?}");
+        assert!((hole.depth_mm - 12.0).abs() < 1e-6, "depth: {hole:?}");
+        for (got, want) in hole.axis_unit.iter().zip([0.0, 0.0, 1.0]) {
+            assert!((got - want).abs() < 1e-6, "axis: {hole:?}");
+        }
+        for (got, want) in hole.entry_point_mm.iter().zip(entry) {
+            assert!((got - want).abs() < 1e-6, "entry: {hole:?}");
+        }
+        assert_eq!(
+            hole.end_condition,
+            aberp_quote_engine::HoleEndCondition::Through
+        );
+        assert!(!hole.flat_bottom);
+    }
+}
+
+/// A hole-less part must come back over the wire with the field EMPTY —
+/// and the canonical encoding it produced carried no `located_holes` key
+/// at all, which is what keeps its `feature_graph_hash` unchanged.
+#[test]
+fn step_cube_yields_no_located_holes() {
+    let extractor = CadExtractor::new()
+        .with_python_bin(test_python_bin())
+        .with_timeout(Duration::from_secs(30));
+
+    let graph = extractor
+        .extract(&ExtractRequest {
+            input_path: step_fixture_path("unit_cube.step"),
+            material_grade: "6061-T6".to_string(),
+        })
+        .expect("cube extraction");
+
+    assert!(
+        graph.located_holes.is_empty(),
+        "a solid cube has no cylindrical faces: {:?}",
+        graph.located_holes
+    );
+    // Re-encoding it emits no key — the pre-v6 shape, byte-for-byte.
+    let out = serde_json::to_string(&graph).expect("serialize");
+    assert!(!out.contains("located_holes"), "{out}");
+}

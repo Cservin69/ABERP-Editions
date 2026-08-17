@@ -55,7 +55,12 @@ def test_valid_payload_round_trips_through_wire_aliases():
 
 
 def test_schema_version_constant_matches_default():
-    assert SCHEMA_VERSION == 2
+    # ADR-0112 Part B: 2 -> 6 (located_holes). NOT 2 -> 3: v3/v4/v5 fields
+    # already exist on the Rust struct and are operator-supplied, so the
+    # extractor jumps straight to the current ceiling. The bump is only
+    # safe because ADR-0112 B.1 turned the wrapper's guard into a range —
+    # under the old exact-equality guard it was a Defense-line outage.
+    assert SCHEMA_VERSION == 6
     fg = FeatureGraph(
         bounding_box_mm=[10.0, 10.0, 10.0],
         volume_mm3=1000.0,

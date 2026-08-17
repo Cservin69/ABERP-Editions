@@ -30,6 +30,8 @@ fn peek_15pcs_50mm_cube_lands_in_benchmark_band() {
     let fg = FeatureGraph {
         schema_version: FeatureGraph::SCHEMA_VERSION,
         tolerance: ToleranceSpec::Unspecified,
+        // ADR-0112 v6 — inert: empty ⇒ no JSON key, no price change.
+        located_holes: Vec::new(),
         critical_feature_tolerances: Vec::new(),
         bounding_box_mm: [50.0, 50.0, 50.0],
         volume_mm3: 125_000.0,

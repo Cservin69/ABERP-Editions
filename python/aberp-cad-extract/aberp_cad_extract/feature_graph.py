@@ -21,7 +21,23 @@ from typing import List
 from pydantic import BaseModel, ConfigDict, Field
 
 
-SCHEMA_VERSION: int = 2
+#: Wire schema version. Must land inside the Rust wrapper's accepted
+#: range ``MIN_SCHEMA_VERSION..=EXPECTED_SCHEMA_VERSION`` (2..=6), where
+#: the ceiling is ``aberp_quote_engine::FeatureGraph::SCHEMA_VERSION``.
+#:
+#: **ADR-0112 B.1 note.** Before that cut the wrapper's guard was exact
+#: equality against 2, so bumping this constant without editing the Rust
+#: side in the same diff would have failed EVERY extraction Permanent.
+#: The guard is now a range, which is what makes this 2 -> 6 bump safe:
+#: it lands inside the range, and a stored graph stamped at any older
+#: version keeps loading with the newer fields defaulted.
+#:
+#: Jumped 2 -> 6, not 2 -> 3: v3/v4/v5 fields (``stock_form``, ``gears``,
+#: ``tolerance``) already exist on the Rust struct and are supplied by
+#: the operator paths, not by this extractor. Catching the extractor up
+#: to them is a SEPARATE workstream (ADR-0112 Part B0) because it moves
+#: prices; v6 does not.
+SCHEMA_VERSION: int = 6
 
 
 class FeatureType(str, Enum):
@@ -52,6 +68,44 @@ class Feature(BaseModel):
     feature_type: FeatureType
     count: int = Field(ge=1)
     representative_size_mm: float = Field(ge=0.0)
+
+
+class HoleEndCondition(str, Enum):
+    """How a located hole terminates along its axis.
+
+    Mirrors the Rust ``HoleEndCondition`` serde strings (snake_case).
+
+    ``UNKNOWN`` is FIRST-CLASS, never a silent default to ``THROUGH``: a
+    blind hole mis-read as through under-counts peck cycles and therefore
+    under-prices. An extractor that cannot tell must say so.
+    """
+
+    THROUGH = "through"
+    BLIND = "blind"
+    UNKNOWN = "unknown"
+
+
+class LocatedHole(BaseModel):
+    """One cylindrical hole with a known axis, depth, diameter, position.
+
+    **ADR-0112 Part B (schema v6).** Mirrors the Rust ``LocatedHole``
+    struct field-for-field. Millimetres, in the part's own coordinate
+    system (the STEP reader normalises any declared ``LENGTH_UNIT`` to MM
+    on import). No WCS, no fixture offset.
+
+    ``axis_unit`` is normalised HERE, by the extractor — the engine "does
+    not second-guess the extractor". It points from ``entry_point_mm``
+    into the material.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    diameter_mm: float = Field(gt=0.0)
+    depth_mm: float = Field(gt=0.0)
+    axis_unit: List[float] = Field(min_length=3, max_length=3)
+    entry_point_mm: List[float] = Field(min_length=3, max_length=3)
+    end_condition: HoleEndCondition = HoleEndCondition.UNKNOWN
+    flat_bottom: bool = False
 
 
 class FeatureGraph(BaseModel):
@@ -86,11 +140,28 @@ class FeatureGraph(BaseModel):
     requires_5_axis: bool
     thin_wall_present: bool
 
+    #: **ADR-0112 Part B (v6).** Located holes mined from the STEP B-rep.
+    #: Defaults to empty, and ``to_canonical_dict`` OMITS the key when it
+    #: is empty (see there) — so a hole-less part serialises byte-identically
+    #: to the pre-v6 encoding and its ``feature_graph_hash`` is unchanged.
+    located_holes: List[LocatedHole] = Field(default_factory=list)
+
     def to_canonical_dict(self) -> dict:
         """Plain-JSON dict using the wire field names (Rust-compatible).
 
         The Rust deserializer reads ``_schema_version``; this is the
         single point that turns the Python field name into the wire
         name before ``json.dumps`` is called by the CLI.
+
+        **ADR-0112 v6.** An EMPTY ``located_holes`` emits no key at all,
+        mirroring the Rust side's ``skip_serializing_if = "Vec::is_empty"``.
+        Both halves of the wire contract have to agree on this or the
+        round-trip stops being byte-identical: the daemon blake3-hashes
+        this exact encoding into ``feature_graph_hash``, so an extra
+        ``"located_holes": []`` would silently change the hash of every
+        hole-less part.
         """
-        return self.model_dump(by_alias=True, mode="json")
+        out = self.model_dump(by_alias=True, mode="json")
+        if not out.get("located_holes"):
+            out.pop("located_holes", None)
+        return out

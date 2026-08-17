@@ -853,6 +853,8 @@ mod tests {
             thin_wall_present: thin_wall,
             stock_form: aberp_quote_engine::StockForm::RectangularBlock,
             tolerance: aberp_quote_engine::ToleranceSpec::Unspecified,
+            // ADR-0112 v6 — inert: empty ⇒ no JSON key, no price change.
+            located_holes: Vec::new(),
             critical_feature_tolerances: Vec::new(),
         }
     }

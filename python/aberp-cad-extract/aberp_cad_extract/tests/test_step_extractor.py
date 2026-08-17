@@ -16,7 +16,10 @@ import pytest
 ocp = pytest.importorskip("OCP", reason="STEP tests require `pip install -e '.[step]'`")
 
 from aberp_cad_extract.extractors.step import extract_step  # noqa: E402
-from aberp_cad_extract.feature_graph import FeatureGraph  # noqa: E402
+from aberp_cad_extract.feature_graph import (  # noqa: E402
+    SCHEMA_VERSION,
+    FeatureGraph,
+)
 
 
 def test_cube_bounding_box_and_volume(step_cube_path: Path):
@@ -56,7 +59,7 @@ def test_thin_plate_flags_thin_wall(step_thin_plate_path: Path):
 def test_canonical_dict_uses_wire_field_names(step_cube_path: Path):
     fg = extract_step(step_cube_path, material_grade="6061-T6")
     out = fg.to_canonical_dict()
-    assert out["_schema_version"] == 2
+    assert out["_schema_version"] == SCHEMA_VERSION
     assert "surface_area_mm2" in out
     assert "requires_5_axis" in out
     assert "thin_wall_present" in out

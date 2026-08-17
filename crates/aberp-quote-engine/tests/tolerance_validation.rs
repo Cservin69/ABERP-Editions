@@ -156,6 +156,8 @@ fn sun_graph() -> FeatureGraph {
     FeatureGraph {
         schema_version: FeatureGraph::SCHEMA_VERSION,
         tolerance: ToleranceSpec::Unspecified,
+        // ADR-0112 v6 — inert: empty ⇒ no JSON key, no price change.
+        located_holes: Vec::new(),
         critical_feature_tolerances: Vec::new(),
         bounding_box_mm: [22.0, 22.0, 20.0],
         volume_mm3: 6_597.0,
@@ -179,6 +181,8 @@ fn ring_graph() -> FeatureGraph {
     FeatureGraph {
         schema_version: FeatureGraph::SCHEMA_VERSION,
         tolerance: ToleranceSpec::Unspecified,
+        // ADR-0112 v6 — inert: empty ⇒ no JSON key, no price change.
+        located_holes: Vec::new(),
         critical_feature_tolerances: Vec::new(),
         bounding_box_mm: [100.0, 100.0, 20.0],
         volume_mm3: 61_500.0,

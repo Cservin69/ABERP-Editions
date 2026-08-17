@@ -1,14 +1,18 @@
-"""STEP extractor — OCCT/OCP-backed.
+"""STEP extractor — OCCT/OCP-backed. The ONLY extractor (ADR-0112 A).
 
 Loads a STEP file via cadquery-ocp (the OpenCascade Python bindings),
-extracts its tight bounding box + volume via OCCT, and populates the
-addendum-1 booleans via the same heuristics module the STL extractor
-uses. STL semantics still drive 5-axis / thin-wall inference in v1;
-proper BREP feature mining is left to a follow-on cut.
+extracts its tight bounding box + volume + surface area via OCCT, mines
+located holes from the B-rep (ADR-0112 Part B), and populates the
+addendum-1 booleans via the `heuristics` module. The 5-axis / thin-wall
+inference is still the bounding-box proxy; proper geometric analysis for
+those two remains a follow-on cut.
 
-OCP is an OPTIONAL dependency (``pip install -e '.[step]'``). When it
-is missing — typical for a CI image that hasn't been seeded with the
-~63 MB OCCT wheel — ``extract_step`` raises ``NotImplementedError``
+OCP is nominally an OPTIONAL dependency (``pip install -e '.[step]'``),
+but since ADR-0112 Part A made STEP the only input format it is in
+practice REQUIRED: without it the package cannot extract anything at
+all, rather than falling back to another format. When it is missing —
+a CI image not seeded with the ~63 MB OCCT wheel — ``extract_step``
+raises ``NotImplementedError``
 with wording the FailureKind classifier in
 ``apps/aberp/src/quote_pricing_pipeline.rs`` recognises as Permanent.
 That preserves the existing operator-retry contract: a daemon running
@@ -16,7 +20,7 @@ in an environment without OCP surfaces an actionable error rather
 than auto-retrying a failure that can only be cleared by a one-time
 install on the operator's box.
 
-Single-part STEP only in v1. Assemblies (multi-solid STEP files) and
+Single-part STEP only. Assemblies (multi-solid STEP files) and
 shapes that transfer to zero solids are explicit ``ValueError`` paths
 — both classify as Permanent via the new "step file" rule in the
 classifier. The operator gets a clear SPA badge instead of the
@@ -37,6 +41,7 @@ from aberp_cad_extract.heuristics import (
     infer_requires_5_axis,
     infer_thin_wall_present,
 )
+from aberp_cad_extract.holes import mine_cylindrical_holes
 
 try:
     from OCP.Bnd import Bnd_Box
@@ -192,6 +197,31 @@ def extract_step(
 
     summary = MeshSummary(bounding_box_mm=extent, volume_mm3=volume)
 
+    # ── ADR-0112 Part B — located holes ──────────────────────────────
+    #
+    # Hole mining must NEVER fail the extraction. This is DELIBERATELY
+    # the opposite of the posture taken above on *shape* errors, where
+    # failing loud is right because the geometry is then unusable. An
+    # empty hole list is a known-conservative degradation with an
+    # established meaning — it is exactly what every pre-v6 graph
+    # carries, and the part simply prices at today's hole-blind number.
+    # A CORRUPT hole list has no such meaning, and once Part C prices
+    # off these it would move real money on numbers nobody measured.
+    #
+    # Inside `_silence_stdout_fd` because the face-walk re-enters OCCT,
+    # which writes progress bytes to the C stdout fd that would
+    # otherwise interleave with the FeatureGraph JSON on stdout.
+    try:
+        with _silence_stdout_fd():
+            located_holes = mine_cylindrical_holes(shape)
+    except Exception as exc:  # noqa: BLE001 — diagnostic to stderr, part survives
+        print(
+            f"aberp-cad-extract: hole mining failed ({type(exc).__name__}: {exc}); "
+            "continuing with no located holes",
+            file=sys.stderr,
+        )
+        located_holes = []
+
     return FeatureGraph(
         schema_version=SCHEMA_VERSION,
         bounding_box_mm=list(extent),
@@ -201,4 +231,5 @@ def extract_step(
         features=features or [],
         requires_5_axis=infer_requires_5_axis(summary),
         thin_wall_present=infer_thin_wall_present(summary),
+        located_holes=located_holes,
     )

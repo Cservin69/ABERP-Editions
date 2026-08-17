@@ -521,6 +521,120 @@ pub struct FeatureGraph {
     /// model).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub critical_feature_tolerances: Vec<FeatureTolerance>,
+    /// **ADR-0112 Part B (v6).** Located holes mined from the STEP B-rep —
+    /// real axes, depths, diameters and positions, as opposed to the
+    /// scalar `features[]` counts.
+    ///
+    /// **Inert by construction, and that is load-bearing three times over:**
+    ///
+    /// 1. `#[serde(default)]` ⇒ every stored ≤v5 graph (and every v2 blob
+    ///    on disk) loads with it EMPTY and re-prices at its historical
+    ///    number.
+    /// 2. `skip_serializing_if = "Vec::is_empty"` ⇒ an empty vector emits
+    ///    **no JSON key**, so re-serialising such a graph is byte-identical
+    ///    to the pre-v6 encoding. That is what keeps `feature_graph_hash`
+    ///    (a blake3 over the canonical encoding, `quote_pricing_pipeline`)
+    ///    stable for hole-less parts. Same posture as `tolerance` /
+    ///    `critical_feature_tolerances`.
+    /// 3. It is also what makes the frozen **Portable** edition provably
+    ///    unmoved: nothing produces located holes there — the extractor is
+    ///    unreachable in Portable (ADR-0093 reach gate, pinned by
+    ///    `apps/aberp/tests/edition_cad_reach.rs`) — so the field is always
+    ///    empty, always absent from the wire, and contributes nothing.
+    ///    Portable output is byte-identical **by construction, not by
+    ///    policy**.
+    ///
+    /// **Nothing prices off this yet.** Drilling cycle-time is ADR-0112
+    /// Part C. In v6 the field is carried, hashed and round-tripped; the
+    /// engine does not read it for cost. Carried as a PARALLEL vector
+    /// rather than as extra fields on [`Feature`], because `Feature`'s
+    /// three fields are mandatory by design and golden-locked
+    /// (`tests/property.rs`) — the same call ADR-0097 made for
+    /// `critical_feature_tolerances`.
+    ///
+    /// Order is the extractor's responsibility and is contractually
+    /// deterministic (see the Python `holes.py` sort); the engine does not
+    /// re-sort.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub located_holes: Vec<LocatedHole>,
+}
+
+/// How a located hole terminates along its axis.
+///
+/// **ADR-0112 Part B.** `Unknown` is FIRST-CLASS, never a silent default
+/// to `Through`. A blind hole mis-read as through under-counts peck
+/// cycles and therefore under-prices; the conservative branch has to be
+/// representable so Part C can price it conservatively and say so in the
+/// reasoning log, rather than the extractor guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HoleEndCondition {
+    /// The hole passes through the solid — open at both ends of its span.
+    Through,
+    /// The hole terminates inside the solid.
+    Blind,
+    /// Topology was ambiguous, or the coaxial-face merge was uncertain.
+    /// The default: an extractor that cannot tell says so.
+    #[default]
+    Unknown,
+}
+
+impl HoleEndCondition {
+    /// The wire / DB storage string. Round-trips through serde unchanged.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Through => "through",
+            Self::Blind => "blind",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One located hole on the part — a cylindrical bore with a known axis,
+/// depth, diameter and position.
+///
+/// **ADR-0112 Part B (v6).** This is the difference between "the part has
+/// four holes" and "the part has a Ø6.0 hole 12 mm deep entering at
+/// (10, 10, 20) along −Z". The former cannot be drilled-priced and cannot
+/// be toolpathed; the latter can be both.
+///
+/// **Units and frame.** Millimetres, in the part's OWN coordinate system
+/// as the STEP file defines it (the reader normalises any declared
+/// `LENGTH_UNIT` to MM on import). No WCS, no fixture offset — the
+/// extractor has no idea where the part sits on a table.
+///
+/// **Deliberately NOT in v6:** counterbores, countersinks, threads,
+/// tapped-vs-clearance, tool access, hole *groups*. Threads are not
+/// reliably recoverable from B-rep without semantic PMI, and inferring
+/// "M6 because Ø5.0" is exactly the silent-wrong-value class this
+/// codebase refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LocatedHole {
+    /// Bore diameter in mm. Strictly positive.
+    pub diameter_mm: f64,
+    /// Axial length of the bore in mm — how deep the drill must go.
+    /// Strictly positive.
+    pub depth_mm: f64,
+    /// Hole axis as a UNIT vector, pointing from `entry_point_mm` INTO
+    /// the material.
+    ///
+    /// Normalised by the extractor, not by the engine: "the engine does
+    /// not second-guess the extractor" is the standing rule for this
+    /// struct. The engine may assert.
+    pub axis_unit: [f64; 3],
+    /// XYZ position (mm) where the axis meets the part surface — the
+    /// point the drill tip approaches.
+    pub entry_point_mm: [f64; 3],
+    /// Through / blind / unknown. Defaults to
+    /// [`HoleEndCondition::Unknown`] so a producer that omits the key is
+    /// treated conservatively rather than optimistically.
+    #[serde(default)]
+    pub end_condition: HoleEndCondition,
+    /// `true` when a planar face perpendicular to the axis caps a blind
+    /// bore — a flat-bottom drill or end-mill, a different (slower)
+    /// cycle than a standard 118°/135° point.
+    #[serde(default)]
+    pub flat_bottom: bool,
 }
 
 impl FeatureGraph {
@@ -554,5 +668,13 @@ impl FeatureGraph {
     /// ([`FeatureTolerance`]); a ≤v4 graph loads with `tolerance` =
     /// [`ToleranceSpec::Unspecified`] (defers to the resolved
     /// `target_tolerance` ⇒ today's price) and the callouts empty.
-    pub const SCHEMA_VERSION: u32 = 5;
+    /// **v6 (ADR-0112 Part B)** adds the defaulted [`LocatedHole`] vector
+    /// [`FeatureGraph::located_holes`] — real hole axes, depths, diameters
+    /// and positions mined from the STEP B-rep. A ≤v5 graph loads with it
+    /// **empty**, and empty is `skip_serializing_if`-suppressed on the way
+    /// out, so a stored graph re-serialises byte-identically and prices at
+    /// its historical number. Pricing off located holes is ADR-0112 Part C
+    /// and is NOT in this cut: v6 carries the field, nothing reads it for
+    /// cost.
+    pub const SCHEMA_VERSION: u32 = 6;
 }

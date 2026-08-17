@@ -63,6 +63,8 @@ fn missing_complexity_rule_for_feature_errors_loud() {
     let fg = FeatureGraph {
         schema_version: FeatureGraph::SCHEMA_VERSION,
         tolerance: ToleranceSpec::Unspecified,
+        // ADR-0112 v6 — inert: empty ⇒ no JSON key, no price change.
+        located_holes: Vec::new(),
         critical_feature_tolerances: Vec::new(),
         bounding_box_mm: [10.0, 10.0, 10.0],
         volume_mm3: 1000.0,

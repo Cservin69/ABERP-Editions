@@ -1198,6 +1198,8 @@ mod tests {
             thin_wall_present: false,
             stock_form: StockForm::RectangularBlock,
             tolerance: ToleranceSpec::Unspecified,
+            // ADR-0112 v6 — inert: empty ⇒ no JSON key, no price change.
+            located_holes: Vec::new(),
             critical_feature_tolerances: callout
                 .map(|spec| {
                     vec![FeatureTolerance {

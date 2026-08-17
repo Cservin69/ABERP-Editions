@@ -134,7 +134,8 @@ pub use engine::{
 pub use error::QuoteError;
 pub use feature_graph::{
     Feature, FeatureGraph, FeatureTolerance, FeatureType, GearKind, GearOp, GearProcess,
-    GeneralClass, SizeBucket, StockForm, ToleranceRange, ToleranceSpec,
+    GeneralClass, HoleEndCondition, LocatedHole, SizeBucket, StockForm, ToleranceRange,
+    ToleranceSpec,
 };
 
 /// Crate version stamp emitted on every breakdown so a quote PDF can

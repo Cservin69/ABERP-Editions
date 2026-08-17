@@ -184,6 +184,8 @@ impl Component {
         FeatureGraph {
             schema_version: FeatureGraph::SCHEMA_VERSION,
             tolerance: ToleranceSpec::Unspecified,
+            // ADR-0112 v6 — inert: empty ⇒ no JSON key, no price change.
+            located_holes: Vec::new(),
             critical_feature_tolerances: Vec::new(),
             bounding_box_mm: self.bbox,
             volume_mm3: self.volume_mm3,
