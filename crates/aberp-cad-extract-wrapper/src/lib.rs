@@ -258,6 +258,27 @@ impl CadExtractor {
             });
         }
 
+        // ADR-0112 adversarial S2 — stderr is checked on the SUCCESS
+        // path too, not only inside the `!status.success()` arm above.
+        //
+        // The Python extractor deliberately survives a hole-mining crash:
+        // it still builds a complete, valid graph and still exits 0. So
+        // until this cut a part with 200 holes whose mining blew up
+        // arrived here WIRE-IDENTICAL to a blank billet — same exit code,
+        // same schema version, no `located_holes` key, only a warning on
+        // a stream nobody was reading. Nothing downstream could tell the
+        // two apart, and once ADR-0112 Part C prices drilling off that
+        // field, "could not measure" silently becomes "nothing to charge
+        // for". That is the silent-under-quote class, and it is exactly
+        // what CLAUDE.md rule 12 says to fail loud on.
+        //
+        // Checked BEFORE the JSON parse: once the extractor has told us
+        // its own output is incomplete, whether it parses is beside the
+        // point.
+        if let Some(detail) = hole_mining_failure_detail(&stderr_text) {
+            return Err(ExtractError::HoleMiningFailed { detail });
+        }
+
         let graph: FeatureGraph =
             serde_json::from_str(&stdout_text).map_err(|e| ExtractError::MalformedJson {
                 stdout: stdout_text.clone(),
@@ -276,6 +297,34 @@ impl CadExtractor {
 
         Ok(graph)
     }
+}
+
+/// The literal the Python extractor stamps on stderr when its hole
+/// miner failed but the rest of the graph survived.
+///
+/// **ADR-0112 adversarial S2.** Cross-language contract, deliberately
+/// duplicated rather than shared: the producing side is
+/// `HOLE_MINING_FAILED_SENTINEL` in
+/// `python/aberp-cad-extract/aberp_cad_extract/extractors/step.py`.
+/// There is no mechanism to share a constant across the process
+/// boundary, so both halves pin the literal in their own tests and a
+/// change to either is a visible break in both.
+pub const HOLE_MINING_FAILED_SENTINEL: &str = "ABERP-CAD-EXTRACT-ERROR hole-mining-failed:";
+
+/// Extract the diagnostic that follows the sentinel, if it is present.
+///
+/// Returns the remainder of the sentinel's line, trimmed — the Python
+/// exception type and message. Scans line-by-line rather than taking
+/// everything after the marker, so unrelated OCCT chatter further down
+/// stderr does not end up inside the error.
+fn hole_mining_failure_detail(stderr_text: &str) -> Option<String> {
+    stderr_text.lines().find_map(|line| {
+        line.find(HOLE_MINING_FAILED_SENTINEL).map(|at| {
+            line[at + HOLE_MINING_FAILED_SENTINEL.len()..]
+                .trim()
+                .to_string()
+        })
+    })
 }
 
 /// What the caller hands to [`CadExtractor::extract`].
@@ -358,6 +407,31 @@ pub enum ExtractError {
         code: Option<i32>,
         /// Verbatim stderr.
         stderr: String,
+    },
+
+    /// The subprocess exited 0 and produced a usable graph, but told us
+    /// on stderr that its HOLE MINER crashed — so `located_holes` is
+    /// empty because it could not be measured, not because the part has
+    /// no holes.
+    ///
+    /// **ADR-0112 adversarial S2, and the whole reason this variant
+    /// exists.** Those two cases used to be indistinguishable on the
+    /// wire. Empty is the honest encoding of "no holes" AND the
+    /// degradation value for "mining failed", so a 200-hole part that
+    /// failed to mine looked exactly like a blank billet. Once Part C
+    /// prices drilling off `located_holes`, quoting the second as the
+    /// first is a silent under-quote — the failure class CLAUDE.md
+    /// rule 12 is written against.
+    ///
+    /// Classified **Permanent** by the daemon (`classify_failure` matches
+    /// `hole mining failed`): the geometry is deterministic, so the same
+    /// file will crash the same way on retry, and an operator needs to
+    /// see it rather than have it auto-retried into a quiet corner.
+    #[error("hole mining failed inside the extractor: {detail}")]
+    HoleMiningFailed {
+        /// The Python exception type and message, verbatim from the
+        /// sentinel line.
+        detail: String,
     },
 
     /// The subprocess exited 0 but stdout was not parseable as a

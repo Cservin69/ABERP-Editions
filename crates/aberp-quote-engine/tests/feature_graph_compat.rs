@@ -224,18 +224,30 @@ fn v2_graph_without_located_holes_loads_empty() {
 
 #[test]
 fn empty_located_holes_adds_no_json_key() {
-    // PIN: the byte-identity guarantee. `skip_serializing_if` means an
-    // empty vector emits NO key, so re-serialising a pre-v6 graph is
-    // byte-for-byte what it was before this cut.
+    // PIN: the byte-identity guarantee for a STORED graph.
+    // `skip_serializing_if` means an empty vector emits NO key, so
+    // re-serialising a pre-v6 graph off disk is byte-for-byte what it was
+    // before this cut — it keeps its own stamped `_schema_version`, and
+    // this field adds nothing beside it.
     //
-    // This is load-bearing well past aesthetics: the daemon blake3-hashes
-    // this exact encoding into `feature_graph_hash`
-    // (`quote_pricing_pipeline`). An extra `"located_holes":[]` would
-    // silently change the hash of EVERY hole-less part.
+    // Load-bearing well past aesthetics: the daemon blake3-hashes this
+    // exact encoding into `feature_graph_hash` (`quote_pricing_pipeline`).
+    // An extra `"located_holes":[]` would silently change the hash of
+    // every stored hole-less graph on every re-price.
     //
     // It is also what makes the frozen Portable edition provably unmoved:
     // nothing produces located holes there (the extractor is unreachable),
     // so the field is always empty, always absent, always inert.
+    //
+    // SCOPE — corrected in the ADR-0112 adversarial round (S1). This says
+    // nothing about a part extracted FRESH. The Python extractor's stamp
+    // moved 2 -> 6 in this same cut, and that field is inside the very
+    // encoding hashed here, so newly extracted parts DO get a new
+    // `feature_graph_hash` — holes or no holes. Bounded (nothing compares
+    // the hash to a stored one) but real. Do not read this test as
+    // covering it; the extractor-path accounting lives on the Python
+    // `SCHEMA_VERSION` constant and is pinned by
+    // `test_hole_free_extraction_differs_from_pre_v6_only_in_the_version`.
     let src = r#"{
         "_schema_version": 5,
         "bounding_box_mm": [10.0, 10.0, 10.0],

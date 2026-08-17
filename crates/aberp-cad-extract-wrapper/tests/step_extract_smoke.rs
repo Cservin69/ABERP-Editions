@@ -170,9 +170,18 @@ fn step_plate_yields_four_located_holes_through_the_real_wire() {
     }
 }
 
-/// A hole-less part must come back over the wire with the field EMPTY —
-/// and the canonical encoding it produced carried no `located_holes` key
-/// at all, which is what keeps its `feature_graph_hash` unchanged.
+/// A hole-less part must come back over the wire with the field EMPTY,
+/// and its canonical encoding must carry no `located_holes` key at all.
+///
+/// CORRECTED (ADR-0112 adversarial S1). This used to end "…which is what
+/// keeps its `feature_graph_hash` unchanged", and that was false on
+/// exactly the path this test exercises — the REAL extractor. The same
+/// cut moved the Python `SCHEMA_VERSION` from 2 to 6, `_schema_version`
+/// sits inside the encoding the daemon blake3-hashes, so this cube's
+/// hash DOES change. What the absent key buys is that `located_holes`
+/// contributes nothing to that change — worth having, asserted below,
+/// and not the same thing as hash stability. Claiming the stronger
+/// property is what stopped anyone checking the weaker one.
 #[test]
 fn step_cube_yields_no_located_holes() {
     let extractor = CadExtractor::new()
@@ -191,7 +200,15 @@ fn step_cube_yields_no_located_holes() {
         "a solid cube has no cylindrical faces: {:?}",
         graph.located_holes
     );
-    // Re-encoding it emits no key — the pre-v6 shape, byte-for-byte.
+    // Re-encoding it emits no key — this field adds no bytes.
     let out = serde_json::to_string(&graph).expect("serialize");
     assert!(!out.contains("located_holes"), "{out}");
+    // …and the version field is the one that DID move, stated here so
+    // the encoding change is visible at the site that used to deny it.
+    assert!(
+        out.contains(r#""_schema_version":6"#),
+        "the extractor stamps v6, which is the (deliberate, one-time) \
+         reason this part's feature_graph_hash differs from its pre-v6 \
+         value: {out}"
+    );
 }

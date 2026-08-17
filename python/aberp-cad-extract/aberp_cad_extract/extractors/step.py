@@ -43,6 +43,27 @@ from aberp_cad_extract.heuristics import (
 )
 from aberp_cad_extract.holes import mine_cylindrical_holes
 
+#: Machine-readable marker written to stderr when hole mining fails.
+#:
+#: **ADR-0112 adversarial S2.** The wire contract for "the hole list you
+#: are holding is not trustworthy". The Rust wrapper
+#: (``crates/aberp-cad-extract-wrapper``) greps stderr for this on the
+#: SUCCESS path as well as the failure path, and turns a hit into
+#: ``ExtractError::HoleMiningFailed`` — because without it a part whose
+#: mining crashed is byte-for-byte indistinguishable from a part with no
+#: holes, and that is a silent under-quote.
+#:
+#: Changing this string is a CROSS-LANGUAGE break, so both halves are
+#: pinned against each other:
+#: ``tests/test_holes.py::test_hole_mining_failure_does_not_kill_the_extraction``
+#: asserts it is emitted (and its sibling that a healthy run does NOT emit
+#: it), while the Rust
+#: ``tests/hole_mining_failure.rs::the_sentinel_literal_matches_the_python_side``
+#: reads this constant out of the real module and compares it to its own
+#: hard-coded copy. Editing one side alone fails there rather than in
+#: production, where the symptom would be the silent under-quote.
+HOLE_MINING_FAILED_SENTINEL: str = "ABERP-CAD-EXTRACT-ERROR hole-mining-failed:"
+
 try:
     from OCP.Bnd import Bnd_Box
     from OCP.BRepBndLib import BRepBndLib
@@ -199,14 +220,26 @@ def extract_step(
 
     # ── ADR-0112 Part B — located holes ──────────────────────────────
     #
-    # Hole mining must NEVER fail the extraction. This is DELIBERATELY
-    # the opposite of the posture taken above on *shape* errors, where
-    # failing loud is right because the geometry is then unusable. An
-    # empty hole list is a known-conservative degradation with an
-    # established meaning — it is exactly what every pre-v6 graph
-    # carries, and the part simply prices at today's hole-blind number.
-    # A CORRUPT hole list has no such meaning, and once Part C prices
-    # off these it would move real money on numbers nobody measured.
+    # Mining does not raise out of HERE: the graph is still built and
+    # still emitted, so the geometry the rest of the pipeline needs is
+    # never lost to a hole-miner bug.
+    #
+    # But it is no longer SILENT either, and that reversal is deliberate
+    # (ADR-0112 adversarial S2). The original posture was "an empty hole
+    # list is a known-conservative degradation — it is exactly what every
+    # pre-v6 graph carries". That reasoning has a hole in it: empty also
+    # means "this part genuinely has no holes", so a 200-hole part whose
+    # mining blew up was WIRE-IDENTICAL to a blank billet. Nothing
+    # downstream could tell them apart, and once Part C prices drilling
+    # off this field the indistinguishable case is a silent UNDER-quote —
+    # the exact failure class CLAUDE.md rule 12 exists to forbid.
+    #
+    # So the failure is stamped on stderr in a form the Rust wrapper
+    # greps for (`HOLE_MINING_FAILED_SENTINEL`), and the wrapper turns it
+    # into a hard `ExtractError` regardless of the exit code. Choosing
+    # loud-at-the-boundary over exit-non-zero-here keeps the decision in
+    # ONE place — the daemon layer, where retry and degrade policy
+    # already live — instead of hard-coding "die" into the extractor.
     #
     # Inside `_silence_stdout_fd` because the face-walk re-enters OCCT,
     # which writes progress bytes to the C stdout fd that would
@@ -216,8 +249,7 @@ def extract_step(
             located_holes = mine_cylindrical_holes(shape)
     except Exception as exc:  # noqa: BLE001 — diagnostic to stderr, part survives
         print(
-            f"aberp-cad-extract: hole mining failed ({type(exc).__name__}: {exc}); "
-            "continuing with no located holes",
+            f"{HOLE_MINING_FAILED_SENTINEL} {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
         located_holes = []

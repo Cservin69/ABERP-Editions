@@ -37,6 +37,42 @@ from pydantic import BaseModel, ConfigDict, Field
 #: the operator paths, not by this extractor. Catching the extractor up
 #: to them is a SEPARATE workstream (ADR-0112 Part B0) because it moves
 #: prices; v6 does not.
+#:
+#: **This bump CHANGES ``feature_graph_hash`` for every freshly extracted
+#: part — including parts with no holes.** Stated plainly here because an
+#: earlier revision of these docs claimed the opposite. The daemon hashes
+#: ``blake3(serde_json::to_vec(&graph))``
+#: (``apps/aberp/src/quote_pricing_pipeline.rs``), that encoding contains
+#: ``_schema_version``, and this constant is inside it. Omitting an empty
+#: ``located_holes`` keeps the REST of the encoding identical, which is
+#: worth doing and is pinned — but it does not and cannot hold the
+#: version field still.
+#:
+#: Why the jump is nevertheless the right call rather than something to
+#: minimise:
+#:
+#: * The number has to move at all, because v6 is the version at which
+#:   ``located_holes`` may be present and the wrapper's accepted range is
+#:   what tells the two sides apart. Stamping 2 while emitting v6 content
+#:   would be a lie in the field whose entire job is to describe the
+#:   content.
+#: * Stamping 3, 4 or 5 instead would be a DIFFERENT lie — those versions
+#:   mean "carries ``stock_form`` / ``gears`` / ``tolerance``", which this
+#:   extractor does not produce. There is no smaller honest step; the
+#:   version line is a ladder, not a bitmask.
+#: * The blast radius is bounded and was checked, not assumed: nothing in
+#:   the tree COMPARES a ``feature_graph_hash`` against a stored one. It
+#:   is written into the ``quote.pricing_extracted`` audit payload and
+#:   posted to the storefront as a content tag; no cache key, no
+#:   idempotency short-circuit, no golden asserts a literal value. So the
+#:   effect is that parts re-extracted after this deploy get a new tag —
+#:   once — and no price, no PDF and no stored breakdown moves.
+#:
+#: What IS byte-identical, and is pinned rather than asserted in prose:
+#: a stored ≤v5 graph re-serialises to exactly its old bytes (it keeps
+#: its own stamped version), and the frozen Portable edition never runs
+#: this extractor at all, so its encoding cannot move. See
+#: ``crates/aberp-quote-engine/tests/feature_graph_compat.rs``.
 SCHEMA_VERSION: int = 6
 
 
@@ -142,8 +178,15 @@ class FeatureGraph(BaseModel):
 
     #: **ADR-0112 Part B (v6).** Located holes mined from the STEP B-rep.
     #: Defaults to empty, and ``to_canonical_dict`` OMITS the key when it
-    #: is empty (see there) — so a hole-less part serialises byte-identically
-    #: to the pre-v6 encoding and its ``feature_graph_hash`` is unchanged.
+    #: is empty (see there), so a hole-less part adds no bytes here.
+    #:
+    #: CORRECTED (ADR-0112 adversarial S1): that does NOT make a freshly
+    #: extracted hole-less part's ``feature_graph_hash`` unchanged, which
+    #: is what this comment used to claim. ``_schema_version`` moved 2 ->
+    #: 6 in the same cut and is inside the hashed encoding, so the hash
+    #: moves for every extracted part regardless of this field. See
+    #: :data:`SCHEMA_VERSION` for the full accounting and for what byte
+    #: identity genuinely does still hold.
     located_holes: List[LocatedHole] = Field(default_factory=list)
 
     def to_canonical_dict(self) -> dict:
@@ -155,11 +198,16 @@ class FeatureGraph(BaseModel):
 
         **ADR-0112 v6.** An EMPTY ``located_holes`` emits no key at all,
         mirroring the Rust side's ``skip_serializing_if = "Vec::is_empty"``.
-        Both halves of the wire contract have to agree on this or the
-        round-trip stops being byte-identical: the daemon blake3-hashes
-        this exact encoding into ``feature_graph_hash``, so an extra
-        ``"located_holes": []`` would silently change the hash of every
-        hole-less part.
+        Both halves of the wire contract have to agree on this, because
+        the daemon blake3-hashes this exact encoding into
+        ``feature_graph_hash`` and a graph that round-trips through Rust
+        must come back as the same bytes it went in as.
+
+        Scoped honestly (ADR-0112 adversarial S1): this keeps the two
+        LANGUAGES' encodings identical to each other. It does not keep a
+        freshly extracted part's hash identical to its pre-v6 value —
+        ``_schema_version`` moved 2 -> 6 in the same cut and is inside the
+        same hashed encoding. See :data:`SCHEMA_VERSION`.
         """
         out = self.model_dump(by_alias=True, mode="json")
         if not out.get("located_holes"):

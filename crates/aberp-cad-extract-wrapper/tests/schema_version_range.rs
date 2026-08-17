@@ -79,10 +79,19 @@ fn extract_with_version(
 fn the_range_is_actually_a_range() {
     // The whole pin is worthless if the two ends coincide — an equality
     // guard would then pass every case below. Assert the premise.
-    assert!(
-        MIN_SCHEMA_VERSION < EXPECTED_SCHEMA_VERSION,
-        "ADR-0112 B.1 pin requires a NON-DEGENERATE range; got {MIN_SCHEMA_VERSION}..={EXPECTED_SCHEMA_VERSION}"
-    );
+    //
+    // In a `const` block, so this is a COMPILE-time check. Both operands
+    // are constants, so clippy's `assertions_on_constants` rightly
+    // rejects the runtime form — it was failing `-D warnings` on this
+    // branch before the ADR-0112 adversarial round. The const block is
+    // also the stronger statement: a degenerate range now fails to BUILD
+    // rather than waiting for someone to run the suite.
+    const {
+        assert!(
+            MIN_SCHEMA_VERSION < EXPECTED_SCHEMA_VERSION,
+            "ADR-0112 B.1 pin requires a NON-DEGENERATE schema-version range"
+        );
+    }
 }
 
 #[test]

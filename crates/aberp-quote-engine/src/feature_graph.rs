@@ -531,11 +531,25 @@ pub struct FeatureGraph {
     ///    on disk) loads with it EMPTY and re-prices at its historical
     ///    number.
     /// 2. `skip_serializing_if = "Vec::is_empty"` ⇒ an empty vector emits
-    ///    **no JSON key**, so re-serialising such a graph is byte-identical
-    ///    to the pre-v6 encoding. That is what keeps `feature_graph_hash`
-    ///    (a blake3 over the canonical encoding, `quote_pricing_pipeline`)
-    ///    stable for hole-less parts. Same posture as `tolerance` /
-    ///    `critical_feature_tolerances`.
+    ///    **no JSON key**, so re-serialising a STORED graph is
+    ///    byte-identical to the pre-v6 encoding and its
+    ///    `feature_graph_hash` (a blake3 over the canonical encoding,
+    ///    `quote_pricing_pipeline`) is unmoved. Same posture as
+    ///    `tolerance` / `critical_feature_tolerances`.
+    ///
+    ///    **Scope, corrected in the ADR-0112 adversarial round.**
+    ///    "Stored" is load-bearing; this used to say "for hole-less
+    ///    parts", which over-claimed. A stored graph keeps whatever
+    ///    `_schema_version` it was stamped with, so its bytes really are
+    ///    unmoved. A part extracted FRESH is a different matter: the
+    ///    Python extractor's stamp moved 2 → 6 in this same cut, that
+    ///    field sits inside the hashed encoding, and so the hash changes
+    ///    for every newly extracted part whether it has holes or not.
+    ///    Bounded — nothing in the tree compares a `feature_graph_hash`
+    ///    against a stored one, so no price, PDF or breakdown moves — but
+    ///    real, and NOT something this field's `skip_serializing_if`
+    ///    prevents. The full accounting is on the Python
+    ///    `SCHEMA_VERSION` constant.
     /// 3. It is also what makes the frozen **Portable** edition provably
     ///    unmoved: nothing produces located holes there — the extractor is
     ///    unreachable in Portable (ADR-0093 reach gate, pinned by

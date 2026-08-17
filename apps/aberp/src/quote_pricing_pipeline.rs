@@ -2943,6 +2943,17 @@ pub fn classify_failure(stage: &str, reason: &str) -> FailureKind {
     if stage == "extract" && r.contains("step file") {
         return FailureKind::Permanent;
     }
+    // ADR-0112 adversarial S2 — the extractor produced a usable graph
+    // but reported on stderr that its HOLE MINER crashed, so
+    // `located_holes` is empty because nothing could be MEASURED, not
+    // because the part is blank. Permanent: the geometry is
+    // deterministic, so the same file fails the same way on every retry,
+    // and an operator has to see it rather than have it auto-retried out
+    // of sight. Quoting a 200-hole part as a blank billet is precisely
+    // the silent-under-quote class.
+    if stage == "extract" && r.contains("hole mining failed") {
+        return FailureKind::Permanent;
+    }
     // PR-274 / S297 F1 — storefront whitelist (11 extensions) is wider
     // than the dispatcher's route table (3 extensions). For any
     // unsupported format the CLI raises `ValueError("Unsupported file
@@ -5205,6 +5216,40 @@ mod tests {
         let lower = "valueerror: step file contains an assembly with 2 solids";
         assert_eq!(classify_failure("extract", upper), FailureKind::Permanent);
         assert_eq!(classify_failure("extract", lower), FailureKind::Permanent);
+    }
+
+    /// ADR-0112 adversarial S2 — a hole-mining crash is Permanent.
+    ///
+    /// The wrapper renders `ExtractError::HoleMiningFailed` as "hole
+    /// mining failed inside the extractor: <detail>". The geometry is
+    /// deterministic, so the same file crashes the same way on every
+    /// retry; auto-retrying it just buries a part whose holes could not
+    /// be measured, and once Part C prices drilling that part quotes as
+    /// a blank billet. Permanent puts it in front of an operator.
+    #[test]
+    fn adr0112_classify_hole_mining_failure_is_permanent() {
+        let reason = "hole mining failed inside the extractor: \
+            RuntimeError: OCCT face-walk exploded";
+        assert_eq!(classify_failure("extract", reason), FailureKind::Permanent);
+    }
+
+    /// …and it must NOT fall through to the `Unknown` default, which is
+    /// what would happen if the wrapper's `Display` wording ever drifted
+    /// away from the token matched here. Pinned as its own assertion so
+    /// the failure message names the cause.
+    #[test]
+    fn adr0112_hole_mining_failure_never_lands_in_unknown() {
+        let reason = aberp_cad_extract_wrapper::ExtractError::HoleMiningFailed {
+            detail: "RuntimeError: boom".into(),
+        }
+        .to_string();
+        assert_ne!(
+            classify_failure("extract", &reason),
+            FailureKind::Unknown,
+            "the wrapper's HoleMiningFailed Display drifted from the token \
+             `classify_failure` greps for; a mining crash would be \
+             auto-retried forever instead of surfacing. Reason was: {reason}"
+        );
     }
 
     /// PR-273: the "step file" rule is scoped to the extract stage.
