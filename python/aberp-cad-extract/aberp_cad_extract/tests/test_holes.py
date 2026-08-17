@@ -146,6 +146,16 @@ def test_stepped_bore_stays_two_holes(fixtures_dir: Path):
     _approx_vec(small.entry_point_mm, (25.0, 25.0, 0.0))
     _approx_vec(large.entry_point_mm, (25.0, 25.0, 17.0))
 
+    # NOTE, deliberately not asserted: the miner classifies BOTH of these
+    # as THROUGH, including the counterbore. That is geometrically honest
+    # — the Ø14 cylindrical face really does open to air at both ends
+    # (upward to the top face, downward into the Ø6 bore) — but it is not
+    # what a machinist means by "through", and Part C should not read it
+    # as "no peck retract needed". Left unasserted rather than pinned so
+    # this test does not lock in an interpretation Part C may need to
+    # refine; flagged here so the next reader does not think it was
+    # missed.
+
 
 # ── end condition + flat bottom ──────────────────────────────────────────
 
