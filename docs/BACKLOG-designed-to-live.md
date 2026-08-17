@@ -201,6 +201,41 @@ the Live MTConnect backend expose.
 
 ---
 
+<a id="d-17"></a>
+### D-17 — `internal.abenerp.com`: remote read-only portal over an outbound-only relay
+
+**Surface today.** The design is complete —
+[ADR-0113](../adr/0113-internal-portal-outbound-only-remote-access.md)
+(Proposed, design-only) — and the read surface it proxies is already Live
+locally: `GET /health` (`apps/aberp/src/serve.rs:4271`, the one
+unauthenticated route, which is what lets the agent report ABERP up/down),
+`GET /invoices` (`serve.rs:4280`), `GET /invoices/:id` (`serve.rs:4282`),
+and `GET /invoices/:id/pdf` (`serve.rs:4283`), all behind the existing
+keychain-held session bearer (`serve.rs:160`). Nothing portal-side exists
+yet: no agent daemon, no relay, no shell. This entry queues that build; it
+does not start before the entries above it are ground through.
+
+**Missing for Live.** The three deployables ADR-0113 §7 phases out:
+the Mac **agent daemon** (launchd, outbound-only WSS + pinned mTLS,
+WebAuthn relying party, `GET`-only route allowlist), the **relay + front**
+on a VPS (dumb authenticated pipe, uniform-404 undiscoverability posture,
+wildcard cert), and the **portal shell** (health card, then the invoice
+list/detail/PDF pages). Phase 0 is tunnel + health + the WebAuthn gate;
+Phase 1 is the read-only invoice page.
+
+**Blocked on.** Ervin provisioning: a relay VPS (or the decision to reuse
+Lightsail — ADR-0113 §9.6 recommends against), the
+`internal.abenerp.com` DNS record, a **wildcard** `*.abenerp.com`
+certificate (per-name would leak the label into CT logs), and the ADR's
+§9.1–9.3 decisions (auth posture, label, gate mechanism). The coding work
+itself needs no external party.
+
+**Size.** Medium-large — three small new deployables rather than one deep
+change; no modification to ABERP itself in Phase 0/1 (the serve.rs routes
+are consumed as-is).
+
+---
+
 ## Unblocked — our own work
 
 These need no external party. They are firing sites and surfaces against
