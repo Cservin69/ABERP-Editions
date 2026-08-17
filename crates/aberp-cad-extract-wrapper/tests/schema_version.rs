@@ -17,13 +17,13 @@ use aberp_cad_extract_wrapper::{
 };
 
 mod common;
-use common::{test_python_bin, write_cube_stl};
+use common::{copy_step_fixture, test_python_bin};
 
 #[test]
 fn schema_version_mismatch_returns_typed_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let stl = tmp.path().join("cube.stl");
-    write_cube_stl(&stl, 20.0).unwrap();
+    let carrier = tmp.path().join("cube.step");
+    copy_step_fixture(&carrier).unwrap();
 
     // Synthetic package emits a valid-shaped FeatureGraph with
     // _schema_version=99. All other fields are well-typed so the
@@ -53,7 +53,7 @@ fn schema_version_mismatch_returns_typed_error() {
         .with_timeout(Duration::from_secs(5));
 
     let req = ExtractRequest {
-        input_path: stl,
+        input_path: carrier,
         material_grade: "6061-T6".into(),
     };
 

@@ -280,19 +280,27 @@ impl CadExtractor {
 
 /// What the caller hands to [`CadExtractor::extract`].
 ///
-/// `material_grade` is operator-supplied at quote time (STL has no
-/// material metadata; even STEP rarely does in customer uploads). The
+/// `material_grade` is operator-supplied at quote time (STEP rarely
+/// carries usable material metadata in customer uploads). The
 /// Python extractor passes it through verbatim into the FeatureGraph;
 /// the quote engine validates it against `quoting_materials.grade`.
 #[derive(Debug, Clone)]
 pub struct ExtractRequest {
     /// Absolute or working-dir-relative path to the input CAD file.
-    /// Both `.stl` and `.step`/`.stp` are supported as of PR-273. STEP
-    /// requires the Python `[step]` extra (cadquery-ocp); when that
-    /// extra is absent the Python extractor exits with a "not yet
-    /// implemented in this build" message that surfaces as
-    /// [`ExtractError::NonZeroExit`] and classifies Permanent on the
-    /// daemon side.
+    ///
+    /// **STEP only** — `.step` / `.stp` (ADR-0112 Part A). `.stl` is a
+    /// REJECTED input, not a degraded one: the Python dispatcher raises
+    /// with the literal `Unsupported file extension`, which surfaces as
+    /// [`ExtractError::NonZeroExit`] and classifies **Permanent** on the
+    /// daemon side. STL is a triangle mesh with no topology, so it cannot
+    /// carry the hole axes / depths / diameters the located-hole schema
+    /// needs; the parser was deleted rather than deprecated in place.
+    ///
+    /// STEP requires the Python `[step]` extra (cadquery-ocp). Since Part
+    /// A there is no other format to fall back to, so a venv without it
+    /// is a hard-down extractor, not a partial one; it exits with a "not
+    /// yet implemented in this build" message that also classifies
+    /// Permanent (the fix is a one-time operator-side install).
     pub input_path: PathBuf,
     /// Material grade as it appears in `quoting_materials.grade` —
     /// e.g. `6061-T6`.

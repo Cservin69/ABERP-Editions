@@ -73,7 +73,7 @@ pub struct QuoteBreakdown {
     pub total_price: f64,
     /// Minutes of machining per part — the geometry-driven roughing +
     /// finishing total (report §5.2), plus any feature-graph rule time
-    /// (0 today: STL/STEP v1 emit no features). Difficulty is folded
+    /// (0 today: the STEP extractor emits no `features[]`). Difficulty is folded
     /// into the roughing/finishing terms; tolerance + thin-wall
     /// multipliers are applied to the cost, not these minutes.
     pub machining_minutes: f64,

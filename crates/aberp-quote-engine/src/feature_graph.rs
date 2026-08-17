@@ -456,8 +456,9 @@ pub struct FeatureGraph {
     /// Solid volume in mm³ (after extraction, before scrap).
     pub volume_mm3: f64,
     /// Total surface area in mm² (schema v2, S418). Drives the
-    /// finishing-pass machining time (report §5.2). STL: Σ ½‖(v1−v0)×
-    /// (v2−v0)‖ over triangles; STEP: `BRepGProp::SurfaceProperties`.
+    /// finishing-pass machining time (report §5.2). Computed by the STEP
+    /// extractor via `BRepGProp::SurfaceProperties`. (The triangle-sum
+    /// formula the retired STL path used is gone with it — ADR-0112 A.)
     /// `#[serde(default)]` keeps the engine fail-soft on a v1 graph or
     /// a corrupt extractor: a non-positive value falls back to the
     /// bounding-box surface area `2(xy+yz+zx)` inside the engine

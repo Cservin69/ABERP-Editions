@@ -177,8 +177,10 @@ jobs:
       - name: Install Python (matches python/aberp-cad-extract pyproject min)
         # crates/aberp-cad-extract-wrapper/tests/* shell out to the Python CLI
         # at python/aberp-cad-extract. Without `python -m aberp_cad_extract`
-        # importable, extract_smoke / step_extract_smoke / error_paths /
-        # schema_version fail loud with "No module named aberp_cad_extract".
+        # importable, step_extract_smoke / error_paths / schema_version /
+        # schema_version_range fail loud with "No module named
+        # aberp_cad_extract". (`extract_smoke` was the STL twin of
+        # step_extract_smoke and is gone with the STL path — ADR-0112 A.3.)
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
@@ -186,8 +188,10 @@ jobs:
           cache-dependency-path: python/aberp-cad-extract/pyproject.toml
 
       - name: Install aberp-cad-extract Python package (with [step] extra)
-        # The [step] extra pulls cadquery-ocp (+ proxy) + vtk, required by
-        # step_extract_smoke.rs for OCCT-backed STEP parsing. ABERP_TEST_PYTHON
+        # The [step] extra pulls cadquery-ocp (+ proxy) + vtk. Since ADR-0112
+        # Part A made the pipeline STEP-only it is required by EVERY
+        # end-to-end extractor test, not just step_extract_smoke.rs — there
+        # is no OCCT-free lane left. ABERP_TEST_PYTHON
         # must be ABSOLUTE (pwd-drift in the test harness kills error-path
         # tests); sys.executable is always absolute.
         run: |

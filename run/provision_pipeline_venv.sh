@@ -9,7 +9,7 @@
 #   run it just to materialize a venv for a CI/cut gate. The cut gate runs
 #   `cargo test` in an ISOLATED worktree that has NO venv (the canonical
 #   `python/aberp-cad-extract/.venv` is gitignored, so each worktree starts
-#   empty). Without a venv there, the two CAD-smoke tests
+#   empty). Without a venv there, the CAD-smoke tests
 #   (`aberp-cad-extract-wrapper`) fall through to a system `python3` that
 #   lacks the module and fail loud with an ImportError — a false RED for a
 #   tree that is actually green. The cut session runs THIS script in the gate
@@ -70,8 +70,10 @@ python3 -m venv "$venv_dir"
 # Install WITH the `[step]` extra (the ~63 MB OCP wheel): the pyproject says
 # "Production installs (and CI) MUST install with `.[step]`" so STEP
 # submissions extract cleanly instead of the NotImplementedError stub. Both
-# CAD-smoke tests (STL + STEP) then pass — without it `step_extract_smoke`
-# REDs on a missing OCP backend.
+# CAD-smoke tests then pass — without it `step_extract_smoke` REDs on a
+# missing OCP backend. ADR-0112 Part A made the pipeline STEP-only, so this
+# is no longer "one of two smoke lanes needs OCP": OCP is required for the
+# extractor to do anything at all.
 "$venv_python" -m pip install --quiet -e "${pkg_dir}[step]"
 
 # Verify — fail loud if the module OR the OCP STEP backend isn't importable.

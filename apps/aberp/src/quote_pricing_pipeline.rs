@@ -618,13 +618,18 @@ impl PricingPipelineService {
     /// quote already had a pricing-jobs row (idempotent).
     async fn enqueue_one(&self, quote: StorefrontQuote) -> Result<bool> {
         let qid = &quote.id;
-        // Pick the first .stl/.step file — v1 is single-CAD-per-quote
-        // per the design doc; a multi-CAD quote will need explicit
-        // operator routing.
-        let cad = match quote.files.iter().find(|f| {
-            let lower = f.filename.to_lowercase();
-            lower.ends_with(".stl") || lower.ends_with(".step") || lower.ends_with(".stp")
-        }) {
+        // Pick the first .step/.stp file — single-CAD-per-quote per the
+        // design doc; a multi-CAD quote will need explicit operator
+        // routing.
+        //
+        // ADR-0112 Part A: `.stl` was REMOVED from this picker. It has to
+        // come out here as well as in the Python dispatcher — otherwise a
+        // quote whose only attachment is an STL would still be selected,
+        // downloaded, encrypted at rest and enqueued (burning a fetch and
+        // a blob) purely to fail Permanent one step later at extract. Not
+        // picking it routes the quote to `enqueue_failed_no_cad`, which is
+        // the honest verdict: this quote carries no CAD file we can price.
+        let cad = match quote.files.iter().find(|f| is_extractable_cad(&f.filename)) {
             Some(c) => c,
             None => {
                 // S379 — the storefront listing returned this quote with no
@@ -2818,6 +2823,32 @@ fn backoff_duration(idx: usize, cadence: Duration) -> Duration {
     }
 }
 
+/// The suffixes the storefront CAD picker will select, lowercase.
+///
+/// **ADR-0112 Part A — STEP only.** This is deliberately the SAME set the
+/// Python dispatcher accepts (`cli.SUPPORTED_SUFFIXES`), and the two must
+/// stay equal in the tightening direction: a picker that is WIDER than the
+/// extractor downloads, decrypts and enqueues files that can only fail
+/// Permanent one step later (that is exactly the storefront-vs-extractor
+/// mismatch C6 documents, reproduced one layer further in).
+pub const EXTRACTABLE_CAD_SUFFIXES: [&str; 2] = [".step", ".stp"];
+
+/// Whether `filename` names a CAD file this build can actually extract.
+///
+/// Case-insensitive on the suffix — the storefront echoes the customer's
+/// own filename, and `PART.STEP` is a STEP file.
+///
+/// Extracted from the inline closure in `enqueue_one` so the predicate is
+/// unit-testable: it is a one-line policy decision whose regression mode
+/// (silently re-admitting `.stl`) is invisible in a diff of an async
+/// method but obvious in a named test.
+pub fn is_extractable_cad(filename: &str) -> bool {
+    let lower = filename.to_lowercase();
+    EXTRACTABLE_CAD_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
 /// S290 / PR-271 — classify a per-stage failure into a daemon-actionable
 /// verdict. Pure function — no I/O, no DB, no clock. Runs ONCE per
 /// failure transition just before `set_failed`.
@@ -2859,11 +2890,14 @@ fn backoff_duration(idx: usize, cadence: Duration) -> Duration {
 ///   without that change won't help.
 /// - **stage="extract"** + reason contains `"unsupported file extension"`
 ///   → `Permanent`. PR-274 (S297 F1) closes the storefront-vs-extractor
-///   whitelist mismatch: the storefront accepts 11 CAD formats but the
-///   Python dispatcher (`cli.py::_route`) only routes `.stl`/`.step`/`.stp`.
-///   Anything else (`.iges`, `.dxf`, `.sldprt`, …) raises `ValueError`
-///   with the literal "Unsupported file extension". Retry can never help
-///   — the customer must re-upload in a supported format.
+///   whitelist mismatch: the storefront accepts ~11 CAD formats but the
+///   Python dispatcher (`cli.py::_route`) routes only `.step`/`.stp`
+///   (ADR-0112 Part A narrowed it from three — `.stl` moved from routed
+///   to rejected). Anything else — `.stl`, `.iges`, `.dxf`, `.sldprt`, …
+///   — raises `ValueError` with the literal "Unsupported file extension".
+///   Retry can never help; the customer must re-upload as STEP. ADR-0112
+///   A.2 deliberately KEPT that literal in the new STL-specific message
+///   so STL rejection inherits Permanent with no change here.
 /// - **stage="post"** + reason contains `"HTTP 401"` OR `"HTTP 403"` →
 ///   `Permanent`. Auth — operator must rotate the storefront token via
 ///   Settings → Storefront credentials.
@@ -5188,8 +5222,10 @@ mod tests {
     // ── PR-274 / S297 F1 — storefront-vs-extractor whitelist mismatch ─
 
     /// PR-274 / S297 F1: the storefront accepts `.iges`, `.dxf`,
-    /// `.sldprt`, `.obj`, etc., but the Python CLI dispatcher only routes
-    /// `.stl`/`.step`/`.stp`. Anything else raises `ValueError` with the
+    /// `.sldprt`, `.obj`, etc., but the Python CLI dispatcher routes only
+    /// `.step`/`.stp` (ADR-0112 Part A; `.stl` is rejected, and the
+    /// ADR-0112 pin for that lives in `tests/edition_cad_reach.rs`).
+    /// Anything else raises `ValueError` with the
     /// literal "Unsupported file extension '.iges'…" string. Without
     /// this rule the classifier fell through to `Unknown`, so the SPA
     /// badge gave the operator no signal that Retry was futile.
@@ -5197,7 +5233,7 @@ mod tests {
     fn pr274_classify_unsupported_extension_is_permanent() {
         let reason = "subprocess exited with code Some(2): \
             ValueError: Unsupported file extension '.iges'. \
-            Supported: .stl, .step, .stp";
+            Supported: .step, .stp";
         assert_eq!(
             classify_failure("extract", reason),
             FailureKind::Permanent,
@@ -5211,7 +5247,7 @@ mod tests {
     #[test]
     fn pr274_classify_unsupported_extension_is_case_insensitive() {
         let upper = "ValueError: Unsupported File Extension '.DXF'. \
-            Supported: .stl, .step, .stp";
+            Supported: .step, .stp";
         assert_eq!(classify_failure("extract", upper), FailureKind::Permanent);
     }
 
@@ -6580,17 +6616,18 @@ mod tests {
     /// storefront served (length + content preserved).
     #[tokio::test]
     async fn s430_enqueue_writes_encrypted_blob_at_rest() {
-        let plaintext = b"solid part\n  the customer's proprietary geometry\nendsolid".to_vec();
+        let plaintext =
+            b"ISO-10303-21;\n  the customer's proprietary geometry\nEND-ISO-10303-21;".to_vec();
         let addr = s430_spawn_cad_mock(plaintext.clone()).await;
         let db = s430_temp("enc.duckdb");
         let artifacts = s430_temp("art");
         let qid = "00000000-0000-0000-0000-0000000000aa";
         let svc = s430_service(&addr, db.clone(), artifacts.clone());
 
-        let inserted = svc.enqueue_one(s430_quote(qid, "part.stl")).await.unwrap();
+        let inserted = svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap();
         assert!(inserted, "first enqueue inserts a Fetched row");
 
-        let on_disk = std::fs::read(artifacts.join(qid).join("part.stl")).expect("blob on disk");
+        let on_disk = std::fs::read(artifacts.join(qid).join("part.step")).expect("blob on disk");
         // Encrypted at rest: magic header present, NOT the plaintext.
         assert_eq!(
             &on_disk[..crate::cad_blob::MAGIC.len()],
@@ -6617,15 +6654,15 @@ mod tests {
     /// already renders Failed rows' stage + reason — no new SPA surface).
     #[tokio::test]
     async fn s430_tampered_blob_fails_extract_with_decrypt_stage() {
-        let addr = s430_spawn_cad_mock(b"solid x endsolid".to_vec()).await;
+        let addr = s430_spawn_cad_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
         let db = s430_temp("tamper.duckdb");
         let artifacts = s430_temp("art");
         let qid = "00000000-0000-0000-0000-0000000000bb";
         let svc = s430_service(&addr, db.clone(), artifacts.clone());
-        svc.enqueue_one(s430_quote(qid, "part.stl")).await.unwrap();
+        svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap();
 
         // Flip a byte in the stored ciphertext body (past magic + nonce).
-        let blob_path = artifacts.join(qid).join("part.stl");
+        let blob_path = artifacts.join(qid).join("part.step");
         let mut bytes = std::fs::read(&blob_path).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
@@ -6666,7 +6703,7 @@ mod tests {
         let artifacts = s430_temp("art");
         let qid = "00000000-0000-0000-0000-0000000000cc";
         let svc = s430_service(&addr, db.clone(), artifacts.clone());
-        svc.enqueue_one(s430_quote(qid, "part.stl")).await.unwrap();
+        svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap();
 
         let row = svc.next_actionable_blocking().await.unwrap().unwrap();
         let _ = svc.advance_one_step(row).await.unwrap();

@@ -759,10 +759,14 @@ pub fn quote_with_catalogue(
     // deterministic iteration in the log line below.
     let mut fired_setup_penalties: std::collections::BTreeMap<i64, f64> =
         std::collections::BTreeMap::new();
-    // Feature-graph machining time. 0 today: STL is a triangle soup with
-    // no topology, and STEP v1 emits an empty `features[]` (report §3).
-    // Kept additive so a future feature-mining cut layers rule time on
-    // top of the geometry model below without a re-wire.
+    // Feature-graph machining time. 0 today: the STEP extractor emits an
+    // empty `features[]` (report §3). ADR-0112 Part A retired the STL
+    // path, so "a triangle soup with no topology" is no longer one of
+    // the reasons this is empty — STEP B-rep CAN carry the geometry, the
+    // mining just isn't wired into `features[]`. ADR-0112 Part B mines
+    // located holes into the separate `located_holes` vector; pricing
+    // off them is Part C. Kept additive so either cut layers rule time
+    // on top of the geometry model below without a re-wire.
     let mut feature_machining_minutes: f64 = 0.0;
 
     for (idx, feature) in feature_graph.features.iter().enumerate() {

@@ -5,21 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aberp-cad-extract"
 version = "0.1.0"
-description = "Python CAD extractor — STEP/STL → FeatureGraph JSON for crates/aberp-quote-engine. v0.1 (S292/PR-273) adds OCCT-backed STEP via cadquery-ocp; STL kept on numpy-stl."
+description = "Python CAD extractor — STEP → FeatureGraph JSON for crates/aberp-quote-engine. OCCT-backed via cadquery-ocp. ADR-0112 Part A made the pipeline STEP-only: STL is rejected, not parsed."
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 authors = [{ name = "Áben Consulting KFT." }]
 dependencies = [
     "pydantic>=2.5,<3.0",
+    # numpy stays: `heuristics.py` and the ADR-0112 hole miner use it.
+    # `numpy-stl` is GONE — ADR-0112 Part A deleted the STL parser, and
+    # a dependency whose only consumer was deleted is dead weight that
+    # would keep implying STL is a live input.
     "numpy>=1.26,<3.0",
-    "numpy-stl>=3.1,<4.0",
 ]
 
 [project.optional-dependencies]
-# Optional. The OCP wheel is ~63 MB; we don't force it on every dev
-# environment. Production installs (and CI) MUST install with
-# `pip install -e '.[step]'` so STEP submissions extract cleanly
-# instead of falling through to the NotImplementedError stub path.
+# ADR-0112 Part A: STEP is now the ONLY input format, so this extra is
+# effectively REQUIRED — without it the package cannot extract anything
+# at all, not merely "STEP falls through to a stub". It stays an extra
+# rather than a hard dependency only so a lint/type-check environment
+# can skip the ~63 MB OCP wheel; every install that actually extracts
+# (production, CI, the cut gate) MUST use `pip install -e '.[step]'`.
+# `run/provision_pipeline_venv.sh` already does, and verifies `import OCP`.
 # vtk is a runtime dylib dependency of OCP (libvtkWrappingPythonCore);
 # cadquery-ocp-proxy is the import-shim companion the wheel requires.
 step = [

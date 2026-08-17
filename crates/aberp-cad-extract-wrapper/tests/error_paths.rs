@@ -20,13 +20,13 @@ use std::time::Duration;
 use aberp_cad_extract_wrapper::{CadExtractor, ExtractError, ExtractRequest};
 
 mod common;
-use common::{test_python_bin, write_cube_stl};
+use common::{copy_step_fixture, test_python_bin};
 
 #[test]
 fn missing_input_file_returns_input_file_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let req = ExtractRequest {
-        input_path: tmp.path().join("ghost.stl"),
+        input_path: tmp.path().join("ghost.step"),
         material_grade: "6061-T6".into(),
     };
     let extractor = CadExtractor::new().with_python_bin(test_python_bin());
@@ -40,15 +40,15 @@ fn missing_input_file_returns_input_file_not_found() {
 #[test]
 fn missing_python_binary_returns_python_not_found() {
     let tmp = tempfile::tempdir().unwrap();
-    let stl = tmp.path().join("cube.stl");
-    write_cube_stl(&stl, 20.0).unwrap();
+    let carrier = tmp.path().join("cube.step");
+    copy_step_fixture(&carrier).unwrap();
 
     let extractor = CadExtractor::new()
         .with_python_bin("/does/not/exist/python-ghost-42")
         .with_timeout(Duration::from_secs(5));
 
     let req = ExtractRequest {
-        input_path: stl,
+        input_path: carrier,
         material_grade: "6061-T6".into(),
     };
 
@@ -62,8 +62,8 @@ fn missing_python_binary_returns_python_not_found() {
 #[test]
 fn unimportable_module_returns_module_not_found() {
     let tmp = tempfile::tempdir().unwrap();
-    let stl = tmp.path().join("cube.stl");
-    write_cube_stl(&stl, 20.0).unwrap();
+    let carrier = tmp.path().join("cube.step");
+    copy_step_fixture(&carrier).unwrap();
 
     // Use the real Python interpreter, but ask for an obviously-
     // bogus module — Python will exit 1 with
@@ -76,7 +76,7 @@ fn unimportable_module_returns_module_not_found() {
         .with_timeout(Duration::from_secs(5));
 
     let req = ExtractRequest {
-        input_path: stl,
+        input_path: carrier,
         material_grade: "6061-T6".into(),
     };
 
@@ -95,8 +95,8 @@ fn unimportable_module_returns_module_not_found() {
 #[test]
 fn timeout_kills_child_and_returns_timeout() {
     let tmp = tempfile::tempdir().unwrap();
-    let stl = tmp.path().join("cube.stl");
-    write_cube_stl(&stl, 20.0).unwrap();
+    let carrier = tmp.path().join("cube.step");
+    copy_step_fixture(&carrier).unwrap();
 
     // Write a synthetic Python module that sleeps longer than the
     // wrapper's timeout. Layout under the tempdir:
@@ -147,7 +147,7 @@ fn timeout_kills_child_and_returns_timeout() {
         .with_timeout(Duration::from_millis(400));
 
     let req = ExtractRequest {
-        input_path: stl,
+        input_path: carrier,
         material_grade: "6061-T6".into(),
     };
 
@@ -169,8 +169,8 @@ fn timeout_kills_child_and_returns_timeout() {
 #[test]
 fn non_zero_exit_returns_non_zero_exit_with_stderr() {
     let tmp = tempfile::tempdir().unwrap();
-    let stl = tmp.path().join("cube.stl");
-    write_cube_stl(&stl, 20.0).unwrap();
+    let carrier = tmp.path().join("cube.step");
+    copy_step_fixture(&carrier).unwrap();
 
     let pkg_dir = tmp.path().join("fail_pkg");
     fs::create_dir(&pkg_dir).unwrap();
@@ -193,7 +193,7 @@ fn non_zero_exit_returns_non_zero_exit_with_stderr() {
         .with_timeout(Duration::from_secs(5));
 
     let req = ExtractRequest {
-        input_path: stl,
+        input_path: carrier,
         material_grade: "6061-T6".into(),
     };
 
@@ -212,8 +212,8 @@ fn non_zero_exit_returns_non_zero_exit_with_stderr() {
 #[test]
 fn zero_exit_with_garbage_stdout_returns_malformed_json() {
     let tmp = tempfile::tempdir().unwrap();
-    let stl = tmp.path().join("cube.stl");
-    write_cube_stl(&stl, 20.0).unwrap();
+    let carrier = tmp.path().join("cube.step");
+    copy_step_fixture(&carrier).unwrap();
 
     let pkg_dir = tmp.path().join("garbage_pkg");
     fs::create_dir(&pkg_dir).unwrap();
@@ -231,7 +231,7 @@ fn zero_exit_with_garbage_stdout_returns_malformed_json() {
         .with_timeout(Duration::from_secs(5));
 
     let req = ExtractRequest {
-        input_path: stl,
+        input_path: carrier,
         material_grade: "6061-T6".into(),
     };
 

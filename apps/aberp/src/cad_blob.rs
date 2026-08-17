@@ -12,7 +12,7 @@
 //! # Why
 //!
 //! The auto-quote pricing pipeline downloads a customer's CAD file
-//! (`.stl` / `.step`) from the storefront and lands it on the local
+//! (`.step` / `.stp` — STEP-only since ADR-0112 Part A) from the storefront and lands it on the local
 //! filesystem under `artifact_dir/<quote_id>/<filename>` (see
 //! [`crate::quote_pricing_pipeline`]). Pre-S430 those bytes sat on disk
 //! in the clear — a customer's proprietary geometry, readable by anyone
@@ -335,8 +335,13 @@ pub struct DecryptedTempFile {
 
 impl DecryptedTempFile {
     /// Write `plaintext` to a sibling of `encrypted_path` whose filename
-    /// is prefixed with `._decrypted_` so it keeps the original extension
-    /// (the extractor dispatches STL vs STEP by extension).
+    /// is prefixed with `._decrypted_` so it keeps the original extension.
+    ///
+    /// The extension is still load-bearing after ADR-0112 Part A — more
+    /// so, not less. The extractor now requires a `.step`/`.stp` suffix
+    /// and REJECTS everything else, so a temp file that dropped or
+    /// mangled the extension would turn a perfectly good STEP submission
+    /// into an `Unsupported file extension` Permanent failure.
     pub fn write_beside(encrypted_path: &Path, plaintext: &[u8]) -> Result<Self> {
         let parent = encrypted_path.parent().unwrap_or_else(|| Path::new("."));
         let fname = encrypted_path
