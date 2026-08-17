@@ -5252,6 +5252,64 @@ mod tests {
         );
     }
 
+    /// ADR-0112 adversarial round 2 — an extract-stage TIMEOUT is
+    /// `Unknown`, and that is the safe answer rather than an oversight.
+    ///
+    /// The round-1 commit said a too-slow part fails Permanent. It does
+    /// not, and nothing in the tree ever made it: `HoleMiningFailed` is
+    /// the Permanent one, and the claim was carried across to a variant
+    /// it never covered. `ExtractError::Timeout` renders as "subprocess
+    /// exceeded timeout of 30s", and the classifier's `"timeout"` rule
+    /// lives inside the `stage == "post"` block, so at extract it falls
+    /// through to the `Unknown` default.
+    ///
+    /// Which is the behaviour to want, and the reason this is a doc
+    /// correction rather than a code change. `Unknown` is bounded — the
+    /// daemon auto-retries it at most `UNKNOWN_AUTO_RETRY_CAP` times and
+    /// then freezes the row for an operator — so an over-large part
+    /// burns a fixed number of deadlines and stops. Permanent would
+    /// refuse to retry at all, which is wrong for the one extract-stage
+    /// failure that a less loaded box can genuinely clear.
+    ///
+    /// Built from the real `Display` rather than a hand-typed string, so
+    /// this goes red if the wording drifts into some OTHER rule's
+    /// substring — which would silently change a bounded retry into a
+    /// dead row, or into an unbounded one.
+    #[test]
+    fn adr0112_r2_classify_extract_timeout_is_unknown_not_permanent() {
+        let reason =
+            aberp_cad_extract_wrapper::ExtractError::Timeout(std::time::Duration::from_secs(30))
+                .to_string();
+        assert_eq!(
+            classify_failure("extract", &reason),
+            FailureKind::Unknown,
+            "an extract-stage timeout must land in the capped-auto-retry \
+             bucket; the round-1 commit called it Permanent. Reason was: \
+             {reason}"
+        );
+        // The retry is CAPPED, which is what makes Unknown safe here.
+        // A const block rather than a runtime assert: both operands are
+        // constants, so this is a compile-time check and clippy's
+        // `assertions_on_constants` is right that the weaker form would
+        // be misleading.
+        const {
+            assert!(
+                jobs::UNKNOWN_AUTO_RETRY_CAP > 0 && jobs::UNKNOWN_AUTO_RETRY_CAP < 10,
+                "Unknown is only a safe verdict for an extract-stage \
+                 timeout while its auto-retry is bounded"
+            );
+        }
+        // …and the SAME wording at the post stage really is Transient,
+        // so the extract verdict above is the stage gate doing its job
+        // rather than the substring simply never matching anywhere.
+        assert_eq!(
+            classify_failure("post", &reason),
+            FailureKind::Transient,
+            "the `timeout` rule exists and is scoped to post; if this \
+             stops holding, the extract assertion above is vacuous"
+        );
+    }
+
     /// PR-273: the "step file" rule is scoped to the extract stage.
     /// Other stages defaulting to Unknown on the same substring is the
     /// honest verdict — a "step file" mention at the post stage would

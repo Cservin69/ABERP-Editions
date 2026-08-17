@@ -140,6 +140,30 @@ pub const MIN_SCHEMA_VERSION: u32 = 2;
 /// targets 1–2 seconds end-to-end; 30 seconds is the "something is
 /// genuinely wrong" ceiling. Caller can override via
 /// [`CadExtractor::with_timeout`].
+///
+/// **Deliberately NOT raised** in the ADR-0112 adversarial round 2, and
+/// the measurements are why. Round 1's hole miner ate the budget — a
+/// 600-hole plate finished in 29.88 s of the 30 s here and a 1000-hole
+/// one took 69.62 s, putting the crossover at roughly 600 holes and
+/// making a merely-large part fail. Round 2 removed the per-bore ring
+/// probe, the per-face point-in-solid query, and a quadratic UV-bounds
+/// walk; on the same fixtures and the same box that plate now takes
+/// 1.74 s and the 1000-hole one 3.15 s.
+///
+/// What that leaves is a budget the miner barely touches. At the sizes
+/// where the 30 s ceiling still bites, the time is OCCT's STEP READER,
+/// not this crate's caller: a 3000-hole plate spends 13.75 s reading and
+/// 3.78 s mining, and a 2000-hole cross-drilled bar — every cap curved,
+/// so every end takes the general intersector — spends 28.42 s reading
+/// and 1.83 s mining. Crossover is now ≈3800 holes for planar caps and
+/// ≈1800 for all-curved ones, against a stated goal of clearing 1000.
+///
+/// So raising the ceiling would buy headroom for the STEP reader on
+/// parts an order of magnitude past anything quoted here, at the cost of
+/// making a genuinely stuck extraction take longer to surface. If that
+/// trade is ever wanted it should be argued from a measurement of the
+/// READER, which is a different change with a different owner. Raising
+/// it now would only be laundering an unmeasured worry into a constant.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configured subprocess invoker.
@@ -392,6 +416,23 @@ pub enum ExtractError {
 
     /// The configured timeout was exceeded. The wrapper has already
     /// killed the child and reaped its exit status before returning.
+    ///
+    /// **Classifies `Unknown`, not `Permanent`** (ADR-0112 adversarial
+    /// round 2). This `Display` renders as `subprocess exceeded timeout
+    /// of 30s`, and `classify_failure`'s `"timeout"` rule is gated on
+    /// `stage == "post"`, so at `stage == "extract"` the reason falls
+    /// through every rule to the default. Bounded and safe: `Unknown`
+    /// auto-retries at most `UNKNOWN_AUTO_RETRY_CAP` (3) times and then
+    /// freezes pending an operator click, so a part that is simply too
+    /// big burns three deadlines and stops rather than looping.
+    ///
+    /// Recorded here because the round-1 commit said `Permanent` — that
+    /// is what `HoleMiningFailed` classifies as, and it was carried over
+    /// to this variant, which it never covered. Nothing is being changed
+    /// to MAKE it Permanent: a timeout is the one extract-stage failure
+    /// where the same file on a less loaded box can genuinely succeed,
+    /// so the capped auto-retry is the right policy and it was only the
+    /// wording that was wrong.
     #[error("subprocess exceeded timeout of {0:?}")]
     Timeout(Duration),
 

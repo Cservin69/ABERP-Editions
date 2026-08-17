@@ -46,6 +46,37 @@ def _approx_vec(value, expected):
         assert got == pytest.approx(want, abs=TOL)
 
 
+def _miner_ast():
+    """`holes.py` parsed, for the two N2 probes that pin a STRUCTURAL
+    property of the module rather than a value it computes.
+
+    Parsed, not grepped: the module's own prose talks about the
+    `BRepClass3d_SolidClassifier` it no longer uses and about the
+    `BRepAdaptor_Surface` default it deliberately avoids, and a text
+    search cannot tell an explanation from a call.
+    """
+    import ast
+    import inspect
+
+    import aberp_cad_extract.holes as holes_mod
+
+    return ast.parse(inspect.getsource(holes_mod))
+
+
+def _imported_names(tree):
+    """Every module path and symbol the miner imports."""
+    import ast
+
+    names = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            names.append(node.module or "")
+            names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            names.extend(alias.name for alias in node.names)
+    return names
+
+
 # ── the headline pin: count, diameters, depths, positions ────────────────
 
 
@@ -394,7 +425,8 @@ def test_b5_filleted_block_has_no_holes(fixtures_dir: Path):
     real teeth for the fillet family is
     `test_b5_concave_fillet_is_not_a_hole` (reds the moment the sweep
     union is weakened) and, for the exact shape the adversarial ran,
-    `test_b5_in_memory_filleted_block_is_where_the_guards_bite` below.
+    `test_b5_in_memory_filleted_block_is_where_the_sweep_union_bites`
+    below.
     This one stays as the end-to-end statement of the user-visible
     property: rounded edges must not become drilling operations.
     """
@@ -406,23 +438,29 @@ def test_b5_filleted_block_has_no_holes(fixtures_dir: Path):
     )
 
 
-def test_b5_in_memory_filleted_block_is_where_the_guards_bite():
+def test_b5_in_memory_filleted_block_is_where_the_sweep_union_bites():
     """B5: the adversarial's exact shape, before STEP flattens it.
 
     Built in memory rather than read from a committed fixture, and
-    deliberately so — this is the ONE place the suite needs a face
-    orientation that OCCT's STEP writer would normalise away. Straight off
+    deliberately so — this is the ONE place the suite can present a face
+    orientation that OCCT's STEP writer normalises away. Straight off
     `BRepFilletAPI_MakeFillet`, six of the twelve quarter-cylinders come
-    back REVERSED, which is the only material-side signal the shipped
-    miner had; those six were the six phantom Ø10 holes.
+    back REVERSED, which is exactly what a bore looks like to
+    `_is_bore_face`; those six were the six phantom Ø10 holes.
 
-    Both of `_is_bore_face`'s arms and the post-merge sweep union are
-    independently sufficient to reject them, so no single mutation reds
-    this either — but removing the whole of `_is_bore_face` AND the sweep
-    union does, and it reproduces the phantom count exactly. The
-    redundancy is the point: after the B1 move, deleting the sweep guard
-    alone no longer resurrects the phantom holes, which is what "the
-    fillet guard is no longer vacuous" has to mean.
+    REWRITTEN (ADR-0112 adversarial round 2, correction 1). Round 1 named
+    this test as the place its axis-in-the-void arm was "pinned in
+    memory", and that framing was wrong twice: the arm was never the only
+    thing rejecting these faces, and what it really pinned elsewhere was
+    a false negative (see
+    `test_c1_a_bore_over_a_centre_post_is_not_dropped`). With the arm
+    removed, this part is now the strongest statement of what carries the
+    convex-fillet case: `_is_bore_face` waves all six REVERSED
+    quarter-cylinders through, and the post-merge SWEEP UNION is the only
+    thing between them and six invented drilling operations. Weaken
+    `FULL_SWEEP_FRACTION` and this goes red at exactly six phantoms —
+    which the committed `filleted_block.step` cannot do, because the STEP
+    round-trip normalises the orientation away before the miner sees it.
     """
     from OCP.BRepAdaptor import BRepAdaptor_Surface
     from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
@@ -487,6 +525,290 @@ def test_b5_concave_fillet_is_not_a_hole(fixtures_dir: Path):
     assert holes == [], (
         "an internal-corner fillet is not a hole; got "
         f"{[(h.diameter_mm, h.entry_point_mm) for h in holes]}"
+    )
+
+
+# ── ADR-0112 adversarial round 2 — N1 and correction 1 ───────────────────
+#
+# Round 1's B4 fix asked the CAP FACE where a bore really ends, which is
+# right, and then only implemented it for PLANAR caps. Every fixture it
+# committed had planar caps, so the suite could not see the half that was
+# missing. These put a curved cap on each shape that matters. Every one
+# of them was run against the round-1 miner and reported the number in
+# its own failure message before the fix landed.
+
+
+def test_n1_cross_drilled_shaft_measures_to_the_round_od(fixtures_dir: Path):
+    """N1: a bore exiting through a CYLINDRICAL surface, measured right.
+
+    The B4 defect, alive on a curved cap. A Ø8 cross-hole 10 mm off the
+    centreline of a Ø30 bar has no planar face anywhere near it, so
+    round 1's cap walk found nothing and the parametric bound stood: the
+    trim curve on the OD reaches x = ±13.7477 while the bore's axis
+    leaves the material at ±11.1803. Reported 27.4955 deep against a true
+    22.3607 — 22.96 % of drilling nobody does — and put the entry
+    2.57 mm outside the bar, a coordinate you cannot post to a machine.
+
+    Both numbers are stated by construction, not measured: the axis runs
+    at y=10 through a bar of radius 15, so it crosses the OD at
+    x = ±sqrt(15² - 10²).
+    """
+    holes = _mine(fixtures_dir / "cross_drilled_shaft.step")
+
+    assert len(holes) == 1, (
+        "the Ø30 bar OD is not a hole and the cross-bore is; "
+        f"got {[h.diameter_mm for h in holes]}"
+    )
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    _approx(hole.depth_mm, 2.0 * math.sqrt(125.0))
+    assert hole.depth_mm == pytest.approx(2.0 * math.sqrt(125.0), abs=TOL), (
+        "depth must stop at the bar's surface, not at the exit curve's "
+        f"extreme; got {hole.depth_mm} (round 1 reported 27.495454170)"
+    )
+    _approx_vec(hole.entry_point_mm, (-math.sqrt(125.0), 10.0, 30.0))
+    # …and the entry is ON the bar. Pinned separately because that is the
+    # whole point: round 1 put it at x=-13.7477, in mid-air.
+    entry = hole.entry_point_mm
+    assert math.hypot(entry[0], entry[1]) == pytest.approx(15.0, abs=TOL), (
+        "the entry point must lie on the Ø30 outer surface; it is "
+        f"{math.hypot(entry[0], entry[1])} from the bar axis, not 15.0"
+    )
+    _approx_vec(hole.axis_unit, (1.0, 0.0, 0.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_n1_blind_hole_under_a_curved_top(fixtures_dir: Path):
+    """N1's blind arm: entry on a barrelled surface, depth measured from it.
+
+    A Ø10 flat-bottomed bore dropped into an R25 D-section bar at x=10.
+    The top surface there is at z = sqrt(25² - 10²); the bore's trim curve
+    on it reaches z = sqrt(25² - 5²), so round 1 ran 1.58 mm long with the
+    entry that far above the material.
+
+    This also pins that the curved-cap generalisation did not cost the
+    BLIND classification: the flat bottom is still a bottom and the entry
+    is still the open end.
+    """
+    holes = _mine(fixtures_dir / "blind_hole_curved_top.step")
+
+    assert len(holes) == 1, (
+        f"the R25 barrelled top is not a hole; got {[h.diameter_mm for h in holes]}"
+    )
+    hole = holes[0]
+    top_z = math.sqrt(525.0)
+    _approx(hole.diameter_mm, 10.0)
+    _approx(hole.depth_mm, top_z - 5.0)
+    _approx_vec(hole.entry_point_mm, (10.0, 20.0, top_z))
+    assert hole.entry_point_mm[2] == pytest.approx(top_z, abs=TOL), (
+        "the entry must sit ON the curved top; round 1 put it at "
+        f"z={math.sqrt(600.0)}, 1.58 mm above the material"
+    )
+    _approx_vec(hole.axis_unit, (0.0, 0.0, -1.0))
+    assert hole.end_condition is HoleEndCondition.BLIND
+    assert hole.flat_bottom is True
+
+
+def test_n1_bore_breaking_out_through_a_fillet(fixtures_dir: Path):
+    """N1's fillet arm — and correction 1's positive control.
+
+    A Ø6 through-bore whose top end breaks out inside an R10 edge fillet.
+    Two claims at once, and they pull in opposite directions:
+
+    - the fillet is a legitimate CAP, so the depth is measured to where
+      the axis leaves it (z = 20 + sqrt(75)), not to the trim curve's
+      extreme, which is what round 1 reported;
+    - and the bore itself must SURVIVE. A guard that rejects fillets by
+      rejecting everything near one would pass the two hole-free fillet
+      fixtures and silently drop this hole.
+    """
+    holes = _mine(fixtures_dir / "bore_into_fillet.step")
+
+    assert len(holes) == 1, (
+        "a bore that breaks out through a fillet is still a hole, and the "
+        f"fillet is still not one; got {[h.diameter_mm for h in holes]}"
+    )
+    hole = holes[0]
+    _approx(hole.diameter_mm, 6.0)
+    _approx(hole.depth_mm, 20.0 + math.sqrt(75.0))
+    _approx_vec(hole.entry_point_mm, (55.0, 30.0, 0.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, 1.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_c1_a_real_bore_beside_a_concave_fillet_survives(fixtures_dir: Path):
+    """Correction 1: the sweep union carries the fillet defence alone now.
+
+    Round 1's `_is_bore_face` had a second arm requiring the bore's own
+    axis to be in void, sold as redundant cover against fillets. It is
+    gone (see `test_c1_a_bore_over_a_centre_post_is_not_dropped` for what
+    it actually did), which leaves the post-merge sweep union as the only
+    thing separating an internal-corner fillet from a bore.
+
+    So ask both halves of that on ONE part: an R5 concave fillet 1 mm
+    below a genuine Ø8 through-bore. Exactly one hole — the fillet
+    contributing none, the bore contributing one. Weakening
+    `FULL_SWEEP_FRACTION` reds this on the phantom side; dropping the
+    bore reds it on the other.
+    """
+    holes = _mine(fixtures_dir / "bore_beside_concave_fillet.step")
+
+    assert len(holes) == 1, (
+        "one bore, no phantom from the concave fillet beside it; got "
+        f"{[(h.diameter_mm, h.entry_point_mm) for h in holes]}"
+    )
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    _approx(hole.depth_mm, 30.0)
+    _approx_vec(hole.entry_point_mm, (0.0, 20.0, 25.0))
+    _approx_vec(hole.axis_unit, (1.0, 0.0, 0.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_c1_a_bore_over_a_centre_post_is_not_dropped(fixtures_dir: Path):
+    """Correction 1's revert-proof: the removed arm was a FALSE NEGATIVE.
+
+    Round 1 shipped an axis-in-the-void arm in `_is_bore_face` and
+    documented it as unpinnable by any valid STEP file, on the argument
+    that a well-formed solid cannot present a cylindrical face that is
+    REVERSED, sweeps a full 2π, and has material on its own axis.
+
+    This part is a box, a cut and a fuse, and it does exactly that: a Ø30
+    recess 20 mm deep with a Ø10 boss standing on its floor up the
+    centreline. Ordinary geometry — a bored pocket around a raised spigot.
+    What the arm does to it is not reject a phantom, it DROPS THE RECESS:
+    zero holes reported on a part with one, an under-count, on the side
+    nobody sees. Restoring the arm reds this test at `len(holes) == 0`.
+
+    The Ø10 post's own OD must stay out of the answer, which is the
+    orientation arm still doing its job on the same part.
+    """
+    holes = _mine(fixtures_dir / "bore_over_centre_post.step")
+
+    assert len(holes) == 1, (
+        "a Ø30 recess with a boss up its axis is one hole; got "
+        f"{[h.diameter_mm for h in holes]} (restoring the axis-in-void "
+        "arm reports none at all)"
+    )
+    hole = holes[0]
+    _approx(hole.diameter_mm, 30.0)
+    _approx(hole.depth_mm, 20.0)
+    _approx_vec(hole.entry_point_mm, (30.0, 30.0, 40.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, -1.0))
+    assert hole.end_condition is HoleEndCondition.BLIND
+    assert hole.flat_bottom is True
+
+
+def test_n2_end_conditions_come_from_the_cap_faces_not_a_probe(fixtures_dir: Path):
+    """N2: the whole through/blind vocabulary, off the cap walk alone.
+
+    Round 1 answered "is this end open?" with 36 point-in-solid queries
+    per bore — a ring of eight samples near the bore wall, at two depths,
+    at both ends. That worked and it cost most of the subprocess budget
+    (a 600-hole plate took 29.88 s of the wrapper's 30 s, re-measured
+    against the round-1 module on this box), and the ring count was a
+    free parameter no fixture pinned.
+
+    It is now one dot product against the cap face's outward normal, and
+    `BRepClass3d_SolidClassifier` is gone from the module entirely. This
+    sweeps the shapes that separate the answers — a flat through-exit, a
+    flat blind bottom, a conical drill point, and a curved breakout in
+    both the through and the blind direction — and asserts every one
+    still lands where B2 and the round-1 fixtures put it. Inverting the
+    sense of `_cap_says_open` reds all five; making it always answer
+    "open" reds the three blind ones.
+    """
+    expected = {
+        "plate_4_through_holes.step": HoleEndCondition.THROUGH,
+        "blind_hole_flat_bottom.step": HoleEndCondition.BLIND,
+        "blind_hole_drill_point.step": HoleEndCondition.BLIND,
+        "cross_drilled_shaft.step": HoleEndCondition.THROUGH,
+        "blind_hole_curved_top.step": HoleEndCondition.BLIND,
+    }
+    for name, want in expected.items():
+        for hole in _mine(fixtures_dir / name):
+            assert hole.end_condition is want, (
+                f"{name}: expected every hole {want}, got {hole.end_condition}"
+            )
+
+    import aberp_cad_extract.holes as holes_mod
+
+    assert not hasattr(holes_mod, "_end_is_open"), (
+        "the ring probe must be GONE, not merely unused — a dormant "
+        "second answer to the same question is how the two drift apart"
+    )
+    assert not hasattr(holes_mod, "_axis_point_is_material"), (
+        "no point-in-solid query survives in the miner"
+    )
+
+
+def test_n2_no_point_in_solid_classifier_reaches_the_miner():
+    """N2: `BRepClass3d_SolidClassifier` is gone, not merely called less.
+
+    Its CONSTRUCTION indexes the whole shell, and every one of its
+    queries was a walk. Round 1 already shared one instance across bores
+    to cut the cost; removing the last caller removes the class. Stated
+    as an import-level assertion because "we only call it twice now" is
+    the kind of claim that decays — a future edit that reaches for a
+    point classifier has to justify bringing the dependency back rather
+    than quietly extending an existing one.
+    """
+    imported = _imported_names(_miner_ast())
+    assert not [name for name in imported if "BRepClass3d" in name], (
+        "the miner must not reach for a solid classifier at all; "
+        f"openness comes from the cap face's outward normal (N2). Found: "
+        f"{[n for n in imported if 'BRepClass3d' in n]}"
+    )
+
+
+def test_n2_surface_adaptors_never_compute_a_uv_restriction(fixtures_dir: Path):
+    """N2's quadratic term, pinned on the property rather than the clock.
+
+    `BRepAdaptor_Surface(face)` defaults to `Restriction=True`, which
+    calls `BRepTools::UVBounds` and walks EVERY EDGE of the face. On the
+    parts that matter that is quadratic: a plate's top face carries one
+    wire per hole, and the miner touches that face several times per
+    bore. Measured at 3.6 ms per construction on a 2000-hole plate
+    against 0.5 µs unrestricted — 29 s of a 39 s subprocess run.
+
+    Nothing in the miner reads those bounds; the one place that wants the
+    trimmed extent asks `BRepTools.UVBounds_s` directly. So the invariant
+    is simply that every adaptor is built unrestricted, and it is pinned
+    two ways — the helper really is unrestricted, and no call site
+    bypasses it. A wall-clock assertion would be flaky and would not say
+    which of those two broke.
+    """
+    import ast
+
+    import aberp_cad_extract.holes as holes_mod
+
+    constructions = [
+        node
+        for node in ast.walk(_miner_ast())
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "BRepAdaptor_Surface"
+    ]
+    assert len(constructions) == 1, (
+        "every surface adaptor must go through `_adaptor`; found "
+        f"{len(constructions)} construction sites, so at least one bypasses "
+        "it and reintroduces the quadratic UV-bounds walk"
+    )
+    (only,) = constructions
+    assert len(only.args) == 2 and only.args[1].value is False, (
+        "`_adaptor` must pass Restriction=False explicitly; the OCCT "
+        "default is True and that is the quadratic path"
+    )
+
+    with _silence_stdout_fd():
+        shape = _load_step_shape(str(fixtures_dir / "plate_4_through_holes.step"))
+        faces = holes_mod._collect_faces(shape)
+        adaptors = [holes_mod._adaptor(f) for f in faces]
+        first_u = [a.FirstUParameter() for a in adaptors]
+
+    assert any(u < -1e50 for u in first_u), (
+        "an unrestricted adaptor reports an infinite parameter range; "
+        f"got {first_u}, which means the restriction is being computed"
     )
 
 

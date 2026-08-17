@@ -12,9 +12,9 @@ The algorithm
 -------------
 
 1. Walk every ``TopAbs_FACE`` of the solid; keep the cylindrical ones.
-2. Reject cylinders whose material lies INSIDE the surface — a bar OD, a
-   boss, or a convex edge fillet. Two independent tests, and BOTH are
-   required; see :func:`_is_bore_face` for why neither alone is enough.
+2. Reject cylinders whose material lies INSIDE the surface — a bar OD or
+   a boss. One test, the face orientation flag; see :func:`_is_bore_face`
+   for why the second test this used to carry was removed.
 3. Sort the survivors into a canonical order, then group them into bores:
    equal radius, coincident axis line, **and axially contiguous**. The
    contiguity arm is what stops two holes 80 mm apart in two separate
@@ -23,11 +23,17 @@ The algorithm
    *after* the grouping, so a bore split into quarter-faces at a seam is
    rejoined before it is judged. A group still short of 2π is a fillet,
    a slot end, or a lone split sliver (§ "Why the sweep test moved").
-5. Measure the bore's TRUE axial span from the faces that CAP its ends,
-   not by reading the parametric bounding box (§ "Why UVBounds is not the
-   answer").
-6. Classify the end condition; detect a flat bottom.
+   This is the ONLY thing separating a concave fillet from a bore.
+5. Walk the faces that CAP the bore's ends. That single walk answers
+   BOTH of the remaining questions — where each end really is (§ "Why
+   UVBounds is not the answer") and whether it opens to air (§ "Open or
+   capped").
+6. Detect a flat bottom.
 7. Emit in a deterministic, frame-independent order.
+
+Nothing in that list asks "is this point inside the solid?". The miner
+used to, in two places, and both are gone — see § "Open or capped" for
+why the answer is structural rather than sampled, and what it bought.
 
 Why the sweep test moved (ADR-0112 adversarial, B1/B5)
 ------------------------------------------------------
@@ -45,15 +51,25 @@ That is the wrong place twice over:
   filleted block then reported six phantom Ø10 holes. The guard was doing
   real work and nothing proved it. ``filleted_block.step`` and
   ``concave_fillet_step.step`` now cover it from both the convex and the
-  concave side — see :func:`_is_bore_face` for which of the two guards
-  each one actually pins, which is not symmetric.
+  concave side.
 
 So the test now runs on the merged group, and it is a genuine
 CIRCUMFERENTIAL UNION rather than a per-face sweep width: four 90° faces
 that tile the circle are one bore, four 90° faces that do not are not.
 
-Why UVBounds is not the answer (ADR-0112 adversarial, B4)
-----------------------------------------------------------
+And since the ADR-0112 round-2 corrections it is the ONLY thing doing
+that job. :func:`_is_bore_face`'s surviving orientation arm rules out a
+bar OD and nothing else — an internal-corner fillet is REVERSED, has its
+axis in air, and has its material outside the cylinder, which is a bore
+in every respect except that it sweeps 90° instead of 360°. The guard
+that used to sit alongside this one is gone because what it really
+caught was a real hole (see :func:`_is_bore_face`), so this test is now
+load-bearing rather than redundant: weaken :data:`FULL_SWEEP_FRACTION`
+and ``concave_fillet_step.step``, ``bore_beside_concave_fillet.step``
+and the in-memory filleted block all go red.
+
+Why UVBounds is not the answer (ADR-0112 adversarial, B4 + N1)
+---------------------------------------------------------------
 
 ``BRepTools.UVBounds_s`` returns the parametric bounding box of the
 trimmed face. For a bore that meets the part face at an angle, the
@@ -66,22 +82,128 @@ material.
 The fix is to ask the topology instead of the parametrisation. Each end
 of a bore is bounded by an edge, and across that edge sits the face that
 CAPS the bore — the part's outer face for a through-hole, a counterbore
-floor, a flat bottom. Where that neighbour is planar, the point where the
-bore's axis meets its plane is the exact entry (or exit): it is where a
-drill first touches, and it is right at any trim angle, because the
-ellipse's centre and the axis-plane intersection are the same point.
+floor, a flat bottom, a shaft's own OD. The point where the bore's AXIS
+meets that cap's unbounded surface is the exact entry (or exit): it is
+where a drill first touches, and it is right at any trim angle, because
+the trim curve's centre and the axis-surface intersection are the same
+point.
 
 Note what is deliberately NOT done: intersecting the axis with the SOLID.
 That was the first attempt and it finds nothing, because a bore's axis
 runs down the middle of the hole and never touches the part's skin at
 either opening. Only the cap's unbounded surface has the answer.
 
-Where the neighbour is not planar the parametric bound stands, and that
-is the correct answer for the case that produces it rather than a fudge:
-a 118° drill point's neighbour is a CONE whose apex lies beyond the
-full-diameter cylinder, so the cylinder's own parametric end — the
-full-diameter depth, which is the number on the drawing — is what is
-wanted, and a perpendicular trim has no ellipse to distort it.
+CORRECTED (ADR-0112 adversarial round 2, N1). The first cut of this fix
+only intersected PLANAR caps and let every other cap keep the parametric
+bound. That left the identical defect alive on any curved cap, and made
+the contract self-inconsistent besides: the same hole measured
+differently depending only on whether the face next door happened to be
+flat. A routine cross-drilled shaft — a Ø8 bore through a Ø30 bar, 10 mm
+off the bar's centreline — came back 22.96 % too deep (27.4955 against a
+true 22.3607) with its entry at x=-13.7477 where the bar's surface is at
+x=-11.1803: 2.57 mm out in mid-air, on a part every shop makes.
+:func:`_cap_axis_intersections` now handles ANY cap surface —
+cylindrical, conical, toroidal, B-spline — via ``GeomAPI_IntCS``, with an
+analytic fast path for planes so the planar answers stay bit-for-bit what
+they were.
+
+Two properties of the general case that the planar one did not have, and
+that the code has to answer for:
+
+- A curved surface can meet a line MORE THAN ONCE. A bore straight
+  through a round bar cuts its OD at both ends, and both roots are inside
+  the bore's parametric span. The root nearest the EDGE that led to the
+  face is the one that belongs to that end; the others are somebody
+  else's end, or nobody's.
+- The bound check is what keeps a drill point out. A 118° point's
+  neighbour is a CONE, and a line down the cone's own axis meets it only
+  at the APEX — beyond the full-diameter cylinder, so outside the
+  parametric span, so discarded. The cylinder's own parametric end
+  stands, which is the full-diameter depth and the number on the drawing.
+  That is the same answer the planar-only version gave, reached the same
+  way; it is not a special case for cones.
+
+Open or capped (ADR-0112 adversarial, B2 + N2)
+------------------------------------------------
+
+An end is OPEN when the part's material stops there and a drill would
+break out. Getting this wrong is money in both directions: a blind hole
+read as THROUGH drops the peck cycles, and its reported entry is at the
+CLOSED end, a coordinate no machine can reach.
+
+B2 killed the original single-point probe: a 118° drill point leaves the
+bore's AXIS in void for the whole height of the cone, so a classifier
+sample just past the end read "open" on a hole that is plainly blind.
+Round 1 answered that by sampling the whole cross-section — a ring of
+eight points near the bore wall, at two depths, at both ends. It worked,
+and it cost 36 ``BRepClass3d_SolidClassifier`` queries per bore on top of
+one per candidate face. Re-measured here against the round-1 module on
+the same fixtures and the same box: a 600-hole plate took 29.88 s of the
+wrapper's 30 s subprocess budget and a 1000-hole plate 69.62 s, putting
+the crossover at roughly 600 holes. A part that is merely large is not a
+part that is wrong, so that was an availability defect (N2). The ring
+count was also a free parameter no fixture pinned — 8 could have been 3
+or 40 and nothing would have moved.
+
+Both problems have the same root: the question was being SAMPLED when
+the topology already knows the answer. The cap-face walk above has
+already found the exact face across each end. That face carries the
+solid's outward normal, and "does the material stop here?" is just
+whether that normal points OUT of the end:
+
+    open  ⟺  outward_normal · outward_axial_direction > 0
+
+A flat top face at a through-exit gives +1. A flat blind bottom gives -1
+— its outward normal points back UP the bore, into the void. A 118°
+point's cone gives -sin(59°), for the same reason, which is exactly the
+case the axis probe could not see and needs no probe at all. A
+cross-drilled shaft's OD gives the cosine of the breakout angle. No
+sampling, no ring, no free parameter, and no point-in-solid query
+anywhere in the miner — ``BRepClass3d_SolidClassifier``, whose
+construction indexes the whole shell, is gone entirely.
+
+Where an end has no in-bounds cap intersection (the drill point), the
+verdict comes from the neighbour faces at that end evaluated on the
+shared edge instead, and EVERY one of them must say "out" for the end to
+be open. Where there is no neighbour at all, or the normal is undefined,
+or the dot product is within :data:`CAP_OUTWARD_MIN_COS` of zero (a
+grazing cap is not a breakout), the end is CAPPED. Ambiguity resolves
+towards blind on purpose: an over-price is visible in the reasoning log
+and an under-price is not.
+
+What N2 actually cost, measured
+---------------------------------
+
+Deleting the ring was necessary and was not sufficient — it roughly
+halved the bill and left a crossover of ~1080 holes, which clears the
+1000-hole target by nothing worth calling margin. Profiling the rest
+found two costs that had nothing to do with geometry and everything to
+do with how OCCT is reached from Python, both fixed here and both
+documented at the code: iterating the ancestor map's returned
+``TopTools_ListOfShape`` (see :class:`_EdgeFaces`) and the surface
+adaptor's default UV restriction (see :func:`_adaptor`). Same box, same
+fixtures, end-to-end wall clock of the subprocess the 30 s budget
+actually covers:
+
+===================  ==========  ==========
+part                 round 1     round 2
+===================  ==========  ==========
+600-hole plate         29.88 s      1.74 s
+1000-hole plate        69.62 s      3.15 s
+3000-hole plate             --     18.69 s
+2000-hole shaft (a)         --     33.47 s
+===================  ==========  ==========
+
+(a) every cap curved, so every end takes ``GeomAPI_IntCS`` rather than
+the analytic plane path — the worst case for the N1 work.
+
+Crossover moves from ~600 holes to ~3800 (planar caps) and ~1800
+(all-curved). The miner is no longer what spends the budget at those
+sizes: of the 3000-hole plate's 18.69 s, 13.75 s is OCCT's STEP READER
+and 3.78 s is mining; of the curved 2000-hole bar's 33.47 s, 28.42 s is
+the reader and 1.83 s is mining. Which is why ``DEFAULT_TIMEOUT`` is left
+at 30 s — raising it would buy headroom for the reader, not for this
+module, and that case should be argued from a measurement of the reader.
 
 Contiguity (ADR-0112 adversarial, B3)
 --------------------------------------
@@ -110,7 +232,24 @@ Hole mining does not fail the extraction from *inside*: any exception in
 longer SILENT either — see ``extractors/step.py`` and ADR-0112 S2. A part
 with 200 holes that failed to mine used to be wire-identical to a blank
 part, which is a silent under-quote; the caller now stamps a
-machine-readable marker on stderr that the Rust wrapper fails on.
+machine-readable marker on stderr that the Rust wrapper fails on. That
+path — and only that path — classifies ``Permanent``.
+
+TAKING TOO LONG IS A DIFFERENT PATH, and the round-1 commit conflated
+them (ADR-0112 adversarial round 2, correction to N2). A miner that
+overruns the subprocess deadline never writes the sentinel and never
+exits: the wrapper kills the child and returns
+``ExtractError::Timeout``, whose ``Display`` is "subprocess exceeded
+timeout of 30s". ``classify_failure`` matches "timeout" only under
+``stage == "post"``, so at ``stage == "extract"`` that reason falls
+through every rule to the default — ``FailureKind::Unknown``, NOT
+``Permanent``. Bounded and safe rather than wrong: ``Unknown`` auto-
+retries at most ``UNKNOWN_AUTO_RETRY_CAP`` (3) times and then freezes
+pending an operator click, so a part that is simply too big burns three
+deadlines and stops. It is still an availability defect for the customer
+whose part it is, which is why the cost of this walk is a correctness
+concern and not only a tuning one; see § "Open or capped" and
+``crates/aberp-cad-extract-wrapper``'s ``DEFAULT_TIMEOUT``.
 
 Determinism
 -----------
@@ -136,16 +275,19 @@ from aberp_cad_extract.feature_graph import HoleEndCondition, LocatedHole
 
 try:
     from OCP.Bnd import Bnd_Box
+    from OCP.BRep import BRep_Tool
     from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
     from OCP.BRepBndLib import BRepBndLib
-    from OCP.BRepClass3d import BRepClass3d_SolidClassifier
     from OCP.BRepTools import BRepTools
+    from OCP.Geom import Geom_Line
     from OCP.GeomAbs import GeomAbs_SurfaceType
-    from OCP.gp import gp_Pnt
-    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_ON, TopAbs_REVERSED
-    from OCP.TopExp import TopExp, TopExp_Explorer
+    from OCP.GeomAPI import GeomAPI_IntCS, GeomAPI_ProjectPointOnSurf
+    from OCP.GeomLProp import GeomLProp_SLProps
+    from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_REVERSED
+    from OCP.TopExp import TopExp_Explorer
     from OCP.TopoDS import TopoDS
-    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    from OCP.TopTools import TopTools_IndexedMapOfShape
 
     _OCP_AVAILABLE = True
 except ImportError:  # pragma: no cover — mirrors extractors/step.py
@@ -178,11 +320,6 @@ FULL_SWEEP_FRACTION: float = 0.999
 #: when deciding whether a stepped bore is one hole or two.
 RADIUS_TOL_MM: float = 1e-4
 
-#: How far outside a hole's end to probe when classifying through/blind.
-#: Must exceed OCCT's own point-classification fuzz but stay well under
-#: any realistic wall thickness.
-END_PROBE_MM: float = 1e-3
-
 #: Coaxial equal-radius faces separated by more than this many DIAMETERS
 #: of axial air are separate bores, not one interrupted bore. See the
 #: module docstring's "Contiguity" section for the physical argument and
@@ -198,33 +335,38 @@ MAX_MERGE_GAP_DIAMETERS: float = 1.0
 #: same bore no matter how small the drill.
 MAX_MERGE_GAP_FLOOR_MM: float = 1.0
 
-#: Number of points sampled around the bore's circumference when asking
-#: whether an end is open. Fixed (not adaptive) so the answer is
-#: deterministic.
-END_PROBE_RING_POINTS: int = 8
-
-#: Radial fraction of the bore at which that ring is sampled. Inside the
-#: bore wall, but far enough out to be in material the instant a
-#: conical drill point starts closing the hole.
-END_PROBE_RING_FRACTION: float = 0.9
-
-#: Second probe distance past an end, as a fraction of the RADIUS. The
-#: first probe sits at :data:`END_PROBE_MM`, flush against the end, which
-#: catches a flat bottom or a counterbore shoulder; this one reaches far
-#: enough in for a conical drill point to have closed the bore across
-#: :data:`END_PROBE_RING_FRACTION` of its width.
+#: How far the cap face's outward normal must lean along the bore's own
+#: axis before that end counts as OPEN — a cosine, so 1e-6 is about
+#: 0.006° off tangent.
 #:
-#: 0.5 covers the whole realistic drill-point range with margin. A point
-#: of included angle 2θ has a tip length r/tan(θ), and at 0.5 r in from
-#: the shoulder its remaining void radius is under 0.9 r for everything
-#: from a 60° spot drill (0.71 r) through the common 118° (0.17 r) to a
-#: near-flat 150°. Scaled by radius rather than absolute so it behaves
-#: the same on a Ø2 hole and a Ø50 one.
-#:
-#: Kept as SHORT as that argument allows on purpose: every millimetre
-#: further out is another millimetre in which some unrelated feature can
-#: sit and make a genuine through-hole read as blind.
-END_PROBE_CONE_FRACTION: float = 0.5
+#: This is a degeneracy floor, not a tuning knob. A cap whose normal is
+#: perpendicular to the bore axis is a surface the bore runs ALONG rather
+#: than breaks OUT of, and the sign of the dot product there is float
+#: noise deciding between through and blind. Anything at or under it
+#: reads CAPPED, which is the over-price direction and therefore the
+#: visible one. Every real case is orders of magnitude clear of it: a
+#: flat face square to the bore gives 1.0, a 45° angled entry 0.71, a
+#: 118° drill point -0.86.
+CAP_OUTWARD_MIN_COS: float = 1e-6
+
+
+def _adaptor(face):
+    """A surface adaptor for ``face`` that does NOT compute its UV
+    restriction.
+
+    ``BRepAdaptor_Surface(face)`` defaults to ``Restriction=True``, which
+    calls ``BRepTools::UVBounds`` and therefore walks every edge of the
+    face. Nothing here ever reads those bounds — the miner wants the
+    surface's TYPE and its underlying geometry, and where it wants the
+    trimmed extent it asks ``BRepTools.UVBounds_s`` directly, once, in
+    :func:`_face_to_cyl`.
+
+    Paying for the restriction anyway is quadratic on exactly the parts
+    that matter, because a plate's top face carries one wire per hole:
+    3.6 ms per construction on a 2000-hole plate against 0.5 µs without,
+    a factor of 7300, several times per bore. It was 29 s of a 39 s run.
+    """
+    return BRepAdaptor_Surface(face, False)
 
 
 def _unit(v: Sequence[float]) -> Tuple[float, float, float]:
@@ -323,7 +465,7 @@ class _CylFace:
     measured as a signed distance from ``origin``. They bound the true
     extent but are not it — for an angled trim they run past the real end
     by the ellipse's half-height, which is exactly the B4 defect. The true
-    span is resolved per bore in :func:`_true_axial_span`.
+    span is resolved per bore in :func:`_walk_caps`.
 
     ``arc_start``/``arc_len`` are the face's circumferential coverage,
     expressed as an absolute angle about the CANONICAL axis frame so that
@@ -350,7 +492,7 @@ class _CylFace:
         self.arc_start = arc_start
         self.arc_len = arc_len
         #: The TopoDS face itself, kept for the cap-face walk in
-        #: :func:`_true_axial_span`. Deliberately absent from
+        #: :func:`_walk_caps`. Deliberately absent from
         #: :meth:`sort_key` — a shape handle has no canonical order.
         self.face = face
 
@@ -383,70 +525,42 @@ def _perp_basis(d: Sequence[float]) -> Tuple[Tuple[float, ...], Tuple[float, ...
     return e1, e2
 
 
-def _axis_point_is_material(classifier, origin, direction, t) -> bool:
-    """Is the point ``t`` along the axis inside the solid?
+def _is_bore_face(face) -> bool:
+    """True when this cylindrical face carries its material OUTWARD.
 
-    ``TopAbs_ON`` counts as material deliberately: an axis that grazes a
-    face is not evidence of a void, and treating it as one would invent a
-    hole. Ambiguity resolves towards "not a hole".
+    Correctness risk #1 from the ADR. A cylinder's surface normal points
+    radially outward from the axis, and the face's orientation flag says
+    which side the solid is on. A bar OD carries its material inward, so
+    the face is FORWARD; a bore carries it outward, so the face is
+    REVERSED. ``tube_od_not_a_hole.step`` pins it — delete this and the
+    Ø40 outside of every turned part becomes a Ø40 drilling operation.
+
+    This is a NECESSARY condition, not a sufficient one, and it is not
+    asked to be sufficient: an internal-corner fillet is REVERSED too and
+    is separated from a bore one step later, by the post-merge sweep
+    union, which is where that job belongs (§ "Why the sweep test moved").
+
+    REMOVED (ADR-0112 adversarial round 2, correction 1): a second arm
+    that also required the bore's own axis to be in VOID. Round 1 shipped
+    it as redundant belt-and-braces against convex fillets and recorded
+    that no committed STEP file could pin it, on the argument that a
+    well-formed solid cannot present a face that is REVERSED, sweeps a
+    full 2π, and has material on its own axis. That argument is false —
+    a plain Ø30 counterbored recess with a boss standing on its
+    centreline is well formed, legal STEP, and does exactly that — and
+    what the arm does on such a part is DROP A REAL BORE. It was a false
+    negative wearing a guard's coat, on the under-count side, which is
+    the side nobody sees. The concave-fillet sweep-union separation is
+    the real guard and it stands alone; ``bore_beside_concave_fillet.step``
+    pins that removing this arm does not resurrect a phantom fillet hole
+    and does not drop the genuine bore beside it, and
+    ``bore_into_fillet.step`` pins a bore that breaks OUT through a
+    fillet surface.
     """
-    px, py, pz = _point_on_axis(origin, direction, t)
-    classifier.Perform(gp_Pnt(px, py, pz), 1e-7)
-    return classifier.State() in (TopAbs_IN, TopAbs_ON)
+    return face.Orientation() == TopAbs_REVERSED
 
 
-def _is_bore_face(face, classifier, origin, direction, t_mid) -> bool:
-    """True when this cylindrical face bounds a HOLE.
-
-    Correctness risk #1 from the ADR, plus the B5 fillet arm the first cut
-    missed. TWO tests, and both are required, because each one alone
-    admits something that is not a hole:
-
-    - **Orientation.** A cylinder's surface normal points radially
-      outward from the axis, and the face's orientation flag says which
-      side the solid is on. A bar OD carries its material inward, so the
-      face is FORWARD; a bore carries it outward, so the face is
-      REVERSED. ``tube_od_not_a_hole.step`` pins both arms.
-
-      Not sufficient on its own: on a filleted block, OCCT hands back six
-      of the twelve edge-fillet quarter-cylinders as REVERSED. Those are
-      the six phantom Ø10 "holes" the adversarial found.
-
-    - **Axis in the void.** A bore is empty along its own centreline; a
-      convex fillet has solid material there. This kills all twelve
-      fillet faces outright, orientation flag or not.
-
-      Not sufficient on its own either: a TUBE's outer face shares its
-      centreline with the tube's own bore, so the axis of the Ø40 OD sits
-      in the Ø20 void and the test would wave it through as a Ø40 hole —
-      on every turned part in the shop.
-
-    **Which arm is actually PINNED, stated honestly.** The orientation arm
-    is: delete it and ``tube_od_not_a_hole`` goes red. The axis arm is
-    NOT pinned by any committed STEP fixture, and structurally cannot be —
-    a well-formed solid cannot present a face that is REVERSED, sweeps a
-    full 2π, and has material on its own axis, because REVERSED already
-    says the material is on the other side. The arm earns its place
-    against inputs that are NOT well formed: a mirrored or negative-volume
-    import, or a kernel whose orientation bookkeeping does not survive a
-    round-trip. Straight out of ``BRepFilletAPI`` — before OCCT's STEP
-    writer normalises it away — six of a filleted block's twelve
-    quarter-cylinders really are REVERSED, and this arm is what stops
-    them; that state is pinned in memory by
-    ``test_b5_in_memory_filleted_block_is_where_the_guards_bite``, because
-    no committed STEP file can carry it.
-
-    So the two arms are deliberately REDUNDANT on a convex fillet, and the
-    redundancy IS the B5 fix rather than an accident of it: now that the
-    sweep test runs after the merge, "delete the sweep guard and the
-    phantom holes come back" has to stop being true.
-    """
-    if face.Orientation() != TopAbs_REVERSED:
-        return False
-    return not _axis_point_is_material(classifier, origin, direction, t_mid)
-
-
-def _face_to_cyl(face, classifier) -> Optional[_CylFace]:
+def _face_to_cyl(face) -> Optional[_CylFace]:
     """Reduce one face to a :class:`_CylFace`, or ``None`` if it is not a
     cylindrical face that bounds a hole.
 
@@ -454,7 +568,14 @@ def _face_to_cyl(face, classifier) -> Optional[_CylFace]:
     circumference the face covers. A quarter-face may be one quarter of a
     real bore, and only the merged group knows. See the module docstring.
     """
-    adaptor = BRepAdaptor_Surface(face)
+    # Cheapest possible rejection, and it applies to every face in the
+    # part rather than only the cylindrical ones — so it goes before the
+    # adaptor is even constructed. On a 600-hole part the walk sees tens
+    # of thousands of faces and roughly half leave here.
+    if not _is_bore_face(face):
+        return None
+
+    adaptor = _adaptor(face)
     if adaptor.GetType() != GeomAbs_SurfaceType.GeomAbs_Cylinder:
         return None
 
@@ -499,9 +620,6 @@ def _face_to_cyl(face, classifier) -> Optional[_CylFace]:
     a = offset + sense * float(v_min)
     b = offset + sense * float(v_max)
     t_min, t_max = min(a, b), max(a, b)
-
-    if not _is_bore_face(face, classifier, origin, direction, 0.5 * (t_min + t_max)):
-        return None
 
     arc_start, arc_len = _face_arc(cyl, direction, u_min, u_max)
     return _CylFace(
@@ -684,14 +802,39 @@ def _edge_axial_mean(edge, origin, direction) -> Optional[float]:
     return total / samples
 
 
+def _edge_mid_point(edge) -> Optional[Tuple[float, float, float]]:
+    """A point at the middle of this edge's parameter range.
+
+    Only ever used as a place to ASK a neighbouring surface which way its
+    normal points, never as a measurement, so the parametric middle is
+    good enough and its being off the geometric centre does not matter.
+    """
+    try:
+        curve = BRepAdaptor_Curve(edge)
+        u0, u1 = float(curve.FirstParameter()), float(curve.LastParameter())
+        p = curve.Value(0.5 * (u0 + u1))
+    except Exception:  # noqa: BLE001 — an unreadable edge simply has no point
+        return None
+    return (float(p.X()), float(p.Y()), float(p.Z()))
+
+
 def _plane_axis_intersection(face, origin, direction) -> Optional[float]:
     """Where the bore's axis meets this face's (unbounded) plane.
 
     ``None`` when the face is not planar, or when the axis lies so nearly
     IN the plane that the intersection is numerically meaningless — a
     grazing cap is not a cap.
+
+    Kept as a separate ANALYTIC path even though
+    :func:`_cap_axis_intersections` would handle a plane too, and
+    deliberately: it is one dot product and one divide against a general
+    intersector's iterative solve, planar caps are the overwhelming
+    majority of every real part, and — the reason it is not merely an
+    optimisation — it keeps every planar answer bit-for-bit identical to
+    what it was before the curved-cap generalisation (N1) landed. A fix
+    for curved caps must not move a single planar number.
     """
-    adaptor = BRepAdaptor_Surface(face)
+    adaptor = _adaptor(face)
     if adaptor.GetType() != GeomAbs_SurfaceType.GeomAbs_Plane:
         return None
     plane = adaptor.Plane()
@@ -709,31 +852,253 @@ def _plane_axis_intersection(face, origin, direction) -> Optional[float]:
     return _dot(to_plane, normal) / denom
 
 
-def _true_axial_span(group, ancestors, p_lo, p_hi) -> Tuple[float, float]:
-    """The bore's REAL axial span, not its parametric bounding box (B4).
+def _cap_axis_intersections(face, origin, direction) -> List[float]:
+    """Every point where the bore's axis meets this face's UNBOUNDED
+    surface, as axial parameters, for a cap of ANY shape (N1).
 
-    ``p_lo``/``p_hi`` are the parametric bounds — a strict SUPERSET of the
-    truth, since an angled trim's ellipse runs past the real end. The
-    exact ends come from the faces that CAP the bore: walk the bore's own
-    boundary edges, step across each one to the neighbouring face, and
-    where that neighbour is planar take the point at which the axis meets
-    its plane. For any trim angle that point is both the ellipse's centre
-    and the spot a drill touches first, which is the definition wanted.
+    The planar case delegates to the analytic path above. Everything else
+    — a shaft's OD, a spherical or barrelled top, a fillet, an imported
+    B-spline skin — goes through ``GeomAPI_IntCS``, which intersects a
+    ``Geom_Line`` with the face's underlying surface.
 
-    Candidates are split at the bore's midpoint rather than taken as a
-    global min/max, so a feature CROSSING the bore — a slot, a
-    counterbore floor — cannot be mistaken for one of its ends. Within an
-    end the outermost candidate wins, which is what carries a bore
-    interrupted by a slot out to the part's real faces.
+    UNBOUNDED is the load-bearing word, and it is why this asks the
+    SURFACE rather than the face: a bore's axis exits through the middle
+    of the opening the bore itself cut, so the trimmed cap face has a
+    hole exactly where the axis crosses it. The untrimmed surface is what
+    still passes through that point. (Same reason the axis is not
+    intersected with the SOLID — see the module docstring.)
 
-    Either end with no planar cap keeps its parametric bound. See the
-    module docstring for why that is the right answer and not a fallback.
+    Returns ALL roots, unfiltered and unordered. A line meets a plane at
+    most once, but it meets a cylinder or a cone twice and a general
+    surface any number of times; deciding which root belongs to which end
+    of the bore needs the edge that led here, so the caller does it.
+    Degenerate contact — a line lying IN the surface — surfaces as a
+    ``GeomAPI_IntCS`` segment rather than a point and is dropped: a bore
+    running along its cap breaks out of nothing.
+    """
+    t_plane = _plane_axis_intersection(face, origin, direction)
+    if t_plane is not None:
+        return [t_plane]
+    if _adaptor(face).GetType() == GeomAbs_SurfaceType.GeomAbs_Plane:
+        # Planar but grazing — the analytic path already refused it, and
+        # handing the same grazing case to the general intersector would
+        # only launder a refusal into a numerically meaningless answer.
+        return []
+
+    surface = BRep_Tool.Surface_s(face)
+    if surface is None:
+        return []
+    line = Geom_Line(
+        gp_Ax1(
+            gp_Pnt(origin[0], origin[1], origin[2]),
+            gp_Dir(direction[0], direction[1], direction[2]),
+        )
+    )
+    intersector = GeomAPI_IntCS(line, surface)
+    if not intersector.IsDone():
+        return []
+    roots: List[float] = []
+    for i in range(1, intersector.NbPoints() + 1):
+        p = intersector.Point(i)
+        roots.append(
+            _dot(
+                (
+                    float(p.X()) - origin[0],
+                    float(p.Y()) - origin[1],
+                    float(p.Z()) - origin[2],
+                ),
+                direction,
+            )
+        )
+    return roots
+
+
+def _outward_normal(face, point) -> Optional[Tuple[float, float, float]]:
+    """The SOLID's outward unit normal on ``face`` at ``point``.
+
+    The geometric normal of a surface is a property of how it was
+    parametrised; which side of it the material sits on is carried by the
+    face's orientation flag, exactly as in :func:`_is_bore_face`. So the
+    surface normal is taken and then flipped for a REVERSED face, and the
+    result points out of the part.
+
+    Planar faces answer analytically — no projection, no local-property
+    solve — which is both the common case and the cheap one.
+    """
+    try:
+        adaptor = _adaptor(face)
+        if adaptor.GetType() == GeomAbs_SurfaceType.GeomAbs_Plane:
+            n = adaptor.Plane().Axis().Direction()
+            normal = _unit((float(n.X()), float(n.Y()), float(n.Z())))
+        else:
+            surface = BRep_Tool.Surface_s(face)
+            if surface is None:
+                return None
+            projector = GeomAPI_ProjectPointOnSurf(
+                gp_Pnt(point[0], point[1], point[2]), surface
+            )
+            if not projector.IsDone() or projector.NbPoints() < 1:
+                return None
+            u, v = projector.LowerDistanceParameters()
+            props = GeomLProp_SLProps(surface, u, v, 1, 1e-7)
+            if not props.IsNormalDefined():
+                return None
+            n = props.Normal()
+            normal = _unit((float(n.X()), float(n.Y()), float(n.Z())))
+    except Exception:  # noqa: BLE001 — an unreadable cap has no verdict
+        return None
+    if face.Orientation() == TopAbs_REVERSED:
+        return (-normal[0], -normal[1], -normal[2])
+    return normal
+
+
+def _cap_says_open(face, point, outward: Sequence[float]) -> bool:
+    """Does the material stop at this cap, in the direction ``outward``?
+
+    The whole of the through/blind decision, in one dot product. See the
+    module docstring's "Open or capped" for why this replaced 36
+    point-in-solid queries per bore, and why an undecidable answer reads
+    CAPPED rather than open.
+    """
+    normal = _outward_normal(face, point)
+    if normal is None:
+        return False
+    return _dot(normal, outward) > CAP_OUTWARD_MIN_COS
+
+
+class _EndEvidence:
+    """What the cap walk found at ONE end of a bore.
+
+    ``caps`` are (axial parameter, face, 3-D point) triples from
+    neighbours whose surface the axis actually meets inside the bore's
+    parametric span. ``touching`` is every neighbour at this end paired
+    with a point on the shared edge, including the ones that produced no
+    usable intersection — a drill point's cone caps the bore without its
+    axis ever meeting it inside the span, and it still gets a vote on
+    whether the end is open.
+    """
+
+    __slots__ = ("caps", "touching")
+
+    def __init__(self):
+        self.caps: List[Tuple[float, object, Tuple[float, float, float]]] = []
+        self.touching: List[Tuple[object, Tuple[float, float, float]]] = []
+
+    def resolve(
+        self, fallback_t: float, direction: Sequence[float], sign: float
+    ) -> Tuple[float, bool]:
+        """This end's true axial parameter, and whether it opens to air.
+
+        ``sign`` is -1 at the low end and +1 at the high end, so the way
+        OUT of the bore at this end is ``sign * direction`` and
+        "outermost" is simply the largest ``sign * t``.
+
+        The outermost cap wins the position. That is what carries a bore
+        interrupted by a slot or a counterbore floor out to the part's
+        real face instead of stopping at the interruption — and, because
+        the same cap then answers the openness question, it is also what
+        stops the slot's own wall from voting "blind" on a through-hole.
+
+        With no cap at all the parametric bound stands and every
+        neighbour that merely TOUCHES this end votes; all of them must
+        say "out" for the end to be open. That is the drill-point case,
+        and it is the conservative reading of a genuinely ambiguous one.
+        """
+        outward = (sign * direction[0], sign * direction[1], sign * direction[2])
+        if self.caps:
+            furthest = max(sign * cap[0] for cap in self.caps)
+            # TIED caps all get a vote, and every one of them must say
+            # "out". Two faces meeting exactly at the bore's exit — a
+            # chamfer landing on its own edge, a bore breaking out on the
+            # seam between two skin patches — are equally the cap there,
+            # and picking whichever the face walk happened to reach first
+            # would make the answer depend on OCCT's explorer order. That
+            # is the S3 defect, in the one place the round-2 rewrite could
+            # have reintroduced it: the position was always tie-proof (the
+            # two ties agree on t by definition), but the openness verdict
+            # reads the FACE, which they need not agree on.
+            winners = [
+                (face, point)
+                for t_cap, face, point in self.caps
+                if sign * t_cap >= furthest - 1e-9
+            ]
+            return sign * furthest, all(
+                _cap_says_open(face, point, outward) for face, point in winners
+            )
+        if not self.touching:
+            return fallback_t, False
+        return fallback_t, all(
+            _cap_says_open(face, point, outward) for face, point in self.touching
+        )
+
+
+class _EdgeFaces:
+    """Edge → the faces that bound it, built once per part.
+
+    This is what ``TopExp.MapShapesAndAncestors_s`` gives you, and the
+    round-1 miner used that map directly. It has to be rebuilt in Python
+    for a reason that is entirely about the BINDING and not the geometry:
+    the OCCT lookup itself is free (~1 µs), but the
+    ``TopTools_ListOfShape`` it hands back costs ~4.3 ms to iterate from
+    Python — pybind marshals a fresh wrapper per element per traversal.
+    At two edge-lookups per bore that alone was 12.75 s of the 14.76 s a
+    600-hole part spent mining, dwarfing everything the cap walk actually
+    computes. Walking the faces once and keeping plain Python lists costs
+    7 ms for the whole part and makes the lookup free too.
+
+    Keyed on ``TopTools_IndexedMapOfShape``'s index rather than on the
+    shape, because that map hashes with ``IsSame`` semantics: an edge is
+    ONE key however many faces reach it and whichever orientation each of
+    them sees it in. Python's own hashing of a ``TopoDS_Shape`` would
+    split a shared edge in two by orientation and every bore would lose
+    half its caps.
+    """
+
+    __slots__ = ("_index", "_faces")
+
+    def __init__(self, faces: Sequence):
+        self._index = TopTools_IndexedMapOfShape()
+        self._faces: dict = {}
+        for face in faces:
+            explorer = TopExp_Explorer(face, TopAbs_EDGE)
+            while explorer.More():
+                edge = TopoDS.Edge_s(explorer.Current())
+                explorer.Next()
+                self._faces.setdefault(self._index.Add(edge), []).append(face)
+
+    def of(self, edge) -> List:
+        """The faces bounding ``edge``; empty if the edge is unknown."""
+        return self._faces.get(self._index.FindIndex(edge), ())
+
+
+def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence]:
+    """Gather what caps each end of the bore. ONE walk, TWO answers.
+
+    Walk the bore's own boundary edges, step across each to the
+    neighbouring face, and intersect the bore's axis with that
+    neighbour's unbounded surface. What comes back is where each end
+    really is (B4/N1) and, from the same faces, whether each end opens to
+    air (B2/N2) — questions the miner used to answer in two separate
+    passes, the second of which cost 36 point-in-solid queries per bore.
+
+    Evidence is split at the bore's MIDPOINT rather than pooled, so a
+    feature CROSSING the bore — a slot, a counterbore floor — cannot be
+    mistaken for one of its ends.
+
+    Two filters on every candidate root:
+
+    - It must lie inside the parametric span. Those bounds are a strict
+      SUPERSET of the truth (an angled trim's ellipse runs past the real
+      end), so anything outside them belongs to a different feature. This
+      is what discards a drill point's cone apex.
+    - Of the roots that survive, only the one NEAREST THE EDGE that led
+      to this face is kept. A line crosses a shaft's OD twice, and the
+      far crossing is the other end of the bore, not this one.
     """
     origin, direction = group.origin, group.direction
     mid = 0.5 * (p_lo + p_hi)
     pad = 1e-6
-    low: List[float] = []
-    high: List[float] = []
+    low, high = _EndEvidence(), _EndEvidence()
 
     for cyl_face in group.faces:
         explorer = TopExp_Explorer(cyl_face, TopAbs_EDGE)
@@ -741,100 +1106,72 @@ def _true_axial_span(group, ancestors, p_lo, p_hi) -> Tuple[float, float]:
             edge = TopoDS.Edge_s(explorer.Current())
             explorer.Next()
             try:
-                if not ancestors.Contains(edge):
+                neighbours = ancestors.of(edge)
+                if not neighbours:
                     continue
                 t_edge = _edge_axial_mean(edge, origin, direction)
                 if t_edge is None:
                     continue
-                for neighbour in ancestors.FindFromKey(edge):
-                    if any(neighbour.IsSame(own) for own in group.faces):
+                edge_point = _edge_mid_point(edge)
+                if edge_point is None:
+                    continue
+                end = low if t_edge < mid else high
+                for face in neighbours:
+                    if any(face.IsSame(own) for own in group.faces):
                         continue
-                    t_cap = _plane_axis_intersection(
-                        TopoDS.Face_s(neighbour), origin, direction
+                    end.touching.append((face, edge_point))
+                    roots = [
+                        t
+                        for t in _cap_axis_intersections(face, origin, direction)
+                        if p_lo - pad <= t <= p_hi + pad
+                    ]
+                    if not roots:
+                        continue
+                    t_cap = min(roots, key=lambda t: abs(t - t_edge))
+                    end.caps.append(
+                        (t_cap, face, _point_on_axis(origin, direction, t_cap))
                     )
-                    if t_cap is None or not (p_lo - pad <= t_cap <= p_hi + pad):
-                        continue
-                    (low if t_edge < mid else high).append(t_cap)
             except Exception:  # noqa: BLE001 — one odd edge must not kill the bore
                 continue
 
-    return (min(low) if low else p_lo), (max(high) if high else p_hi)
+    return low, high
 
 
-def _end_is_open(classifier, origin, direction, radius, t_end, outward) -> bool:
-    """Does the bore open to air at this end, or is it capped?
+def _resolve_span(group, ancestors, p_lo, p_hi) -> Tuple[float, float, bool, bool]:
+    """The bore's real axial span AND the openness of both its ends.
 
-    Probing a single point on the axis is not enough, and that is B2. A
-    118° conical drill point leaves the axis in VOID for the whole height
-    of the cone, so an axis-only probe just inside the point reads "open"
-    and the hole is reported THROUGH — with its entry at the closed end
-    and its axis pointing out of the part. Real money: a blind hole read
-    as through under-counts peck cycles, and the entry point is somewhere
-    a drill cannot go.
-
-    So the whole CROSS-SECTION is probed, at a ring near the bore wall as
-    well as on the axis, and at several distances out. A cone closes on
-    the wall long before it closes on the axis, so the ring catches it
-    immediately. The end is OPEN only if EVERY sample is outside the
-    solid — one material sample is enough to call it capped, which is the
-    conservative direction (blind costs more than through, and an
-    over-price is visible where an under-price is not).
+    One cap walk, both answers — see :func:`_walk_caps` and the module
+    docstring's "Why UVBounds is not the answer" and "Open or capped".
     """
-    two_pi = 2.0 * math.pi
-    e1, e2 = _perp_basis(direction)
-    ring_r = END_PROBE_RING_FRACTION * radius
-    offsets = sorted({END_PROBE_MM, END_PROBE_CONE_FRACTION * radius})
-
-    for off in offsets:
-        t = t_end + outward * off
-        cx, cy, cz = _point_on_axis(origin, direction, t)
-        classifier.Perform(gp_Pnt(cx, cy, cz), 1e-7)
-        if classifier.State() in (TopAbs_IN, TopAbs_ON):
-            return False
-        for k in range(END_PROBE_RING_POINTS):
-            a = two_pi * k / END_PROBE_RING_POINTS
-            ox = ring_r * (math.cos(a) * e1[0] + math.sin(a) * e2[0])
-            oy = ring_r * (math.cos(a) * e1[1] + math.sin(a) * e2[1])
-            oz = ring_r * (math.cos(a) * e1[2] + math.sin(a) * e2[2])
-            classifier.Perform(gp_Pnt(cx + ox, cy + oy, cz + oz), 1e-7)
-            if classifier.State() in (TopAbs_IN, TopAbs_ON):
-                return False
-    return True
+    low, high = _walk_caps(group, ancestors, p_lo, p_hi)
+    direction = group.direction
+    t_lo, lo_open = low.resolve(p_lo, direction, -1.0)
+    t_hi, hi_open = high.resolve(p_hi, direction, +1.0)
+    return t_lo, t_hi, lo_open, hi_open
 
 
-def _classify_ends(
-    classifier, origin, direction, radius, t_lo, t_hi
-) -> Tuple[HoleEndCondition, bool, bool]:
-    """Decide through / blind / unknown, and report which ends are open.
+def _classify_ends(lo_open: bool, hi_open: bool) -> HoleEndCondition:
+    """Decide through / blind / unknown from the two end verdicts.
 
     - both ends open  -> THROUGH
     - exactly one     -> BLIND, and the open one is the entry
     - neither         -> UNKNOWN (an internal cavity, or a bore running
       into another feature)
 
-    UNKNOWN is returned rather than guessed whenever the classifier
-    itself errors, too: an extractor that cannot tell says so.
-
-    Takes the caller's `classifier` rather than building its own.
-    ``BRepClass3d_SolidClassifier`` does real work at construction — it
-    indexes the whole shell — and end classification is per BORE, so a
-    200-hole plate was paying for 200 of them. Reuse is the documented
-    usage pattern (``Perform`` carries the per-query state) and it is what
-    the face walk already does.
+    Every way of failing to decide an end — no cap face, an undefined
+    normal, a grazing dot product, an OCCT throw inside the walk — lands
+    on "not open" upstream in :meth:`_EndEvidence.resolve`, so a bore the
+    extractor genuinely cannot read comes out UNKNOWN rather than
+    guessed. UNKNOWN is a value Part C can refuse to price; a wrong
+    THROUGH is not.
     """
-    try:
-        lo_open = _end_is_open(classifier, origin, direction, radius, t_lo, -1.0)
-        hi_open = _end_is_open(classifier, origin, direction, radius, t_hi, +1.0)
-    except Exception:  # noqa: BLE001 — an unclassifiable end is UNKNOWN, not a crash
-        return HoleEndCondition.UNKNOWN, False, False
-
     if lo_open and hi_open:
-        return HoleEndCondition.THROUGH, lo_open, hi_open
+        return HoleEndCondition.THROUGH
     if lo_open != hi_open:
         # Terminates in material at exactly one end. Whether that end is
         # FLAT is a separate structural question — see `_has_flat_bottom`.
-        return HoleEndCondition.BLIND, lo_open, hi_open
-    return HoleEndCondition.UNKNOWN, lo_open, hi_open
+        return HoleEndCondition.BLIND
+    return HoleEndCondition.UNKNOWN
 
 
 def _has_flat_bottom(faces, origin, direction, radius, t_bottom) -> bool:
@@ -855,7 +1192,7 @@ def _has_flat_bottom(faces, origin, direction, radius, t_bottom) -> bool:
     bottom_pt = _point_on_axis(origin, direction, t_bottom)
     for face in faces:
         try:
-            adaptor = BRepAdaptor_Surface(face)
+            adaptor = _adaptor(face)
             if adaptor.GetType() != GeomAbs_SurfaceType.GeomAbs_Plane:
                 continue
             plane = adaptor.Plane()
@@ -922,15 +1259,16 @@ def mine_cylindrical_holes(shape) -> List[LocatedHole]:
     faces = _collect_faces(shape)
 
     # Edge -> adjacent faces, built once. This is how a bore finds the
-    # face that caps each of its ends (B4); see `_true_axial_span`.
-    ancestors = TopTools_IndexedDataMapOfShapeListOfShape()
-    TopExp.MapShapesAndAncestors_s(shape, TopAbs_EDGE, TopAbs_FACE, ancestors)
+    # faces that cap each of its ends, which is where BOTH its true span
+    # (B4/N1) and its end conditions (B2/N2) come from; see `_walk_caps`.
+    # Built from `faces` rather than from `shape` so that the S3
+    # reversed-walk fixture exercises this table too.
+    ancestors = _EdgeFaces(faces)
 
-    classifier = BRepClass3d_SolidClassifier(shape)
     cylinders: List[_CylFace] = []
     for face in faces:
         try:
-            cyl = _face_to_cyl(face, classifier)
+            cyl = _face_to_cyl(face)
         except Exception:  # noqa: BLE001 — skip the face, keep the part
             continue
         if cyl is not None:
@@ -959,14 +1297,14 @@ def mine_cylindrical_holes(shape) -> List[LocatedHole]:
                 continue
 
             radius, origin, direction = group.radius, group.origin, group.direction
-            t_lo, t_hi = _true_axial_span(group, ancestors, group.lo, group.hi)
+            t_lo, t_hi, lo_open, hi_open = _resolve_span(
+                group, ancestors, group.lo, group.hi
+            )
             depth = t_hi - t_lo
             if depth <= 0.0:
                 continue
 
-            end_condition, lo_open, _hi_open = _classify_ends(
-                classifier, origin, direction, radius, t_lo, t_hi
-            )
+            end_condition = _classify_ends(lo_open, hi_open)
 
             # Entry point + drill direction. For a blind hole the entry is
             # the OPEN end, so the axis points from that end into the

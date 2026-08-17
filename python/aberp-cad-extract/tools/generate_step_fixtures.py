@@ -341,12 +341,17 @@ def filleted_block():
 def concave_fillet_step():
     """60 x 40 x 30 L-block with its internal concave edge filleted R5.0.
 
-    B5, the concave arm — and the one the orientation/axis tests alone do
-    NOT catch. A fillet in an internal corner has its axis in AIR and its
+    B5, the concave arm — and the one `_is_bore_face` does NOT catch. A
+    fillet in an internal corner is REVERSED, has its axis in AIR and its
     material OUTSIDE the cylinder, exactly like a bore; only the fact that
     it sweeps 90° rather than 360° tells them apart. So this is the
     fixture that keeps the post-merge sweep union honest, and it fails the
     instant that union is weakened to accept a partial sweep.
+
+    Since the ADR-0112 round-2 corrections that union is the ONLY guard
+    standing between a concave fillet and a phantom hole — see
+    `bore_beside_concave_fillet`, which asks the same question on a part
+    that also carries a real bore.
 
     Expected: 0 holes.
     """
@@ -374,6 +379,158 @@ def concave_fillet_step():
     return maker.Shape()
 
 
+# ── the ADR-0112 adversarial fixtures, round 2 (N1, correction 1) ────────
+#
+# Round 1 fixed depth and entry by intersecting the bore's axis with the
+# face that caps it — but only when that cap was PLANAR. Every fixture it
+# committed had planar caps, so nothing noticed.
+#
+# The first three put a CURVED cap on each shape that matters: a
+# through-exit, a blind entry, and a breakout into a fillet. The last two
+# belong to correction 1 — one asks whether the sweep union alone still
+# separates a concave fillet from the real bore beside it, and one is the
+# ordinary part that the removed axis-in-void guard would have silently
+# stripped a hole from.
+
+
+def _one_edge(shape, want):
+    """The single edge of `shape` that `want(direction, midpoint)` picks.
+
+    Raises rather than filleting the wrong edge — a fixture that quietly
+    rounds a different corner is a fixture whose expected numbers are
+    fiction.
+    """
+    chosen = []
+    for edge in _edges(shape):
+        curve = BRepAdaptor_Curve(edge)
+        if curve.GetType() != GeomAbs_CurveType.GeomAbs_Line:
+            continue
+        mid = curve.Value(0.5 * (curve.FirstParameter() + curve.LastParameter()))
+        if want(curve.Line().Direction(), mid):
+            chosen.append(edge)
+    if len(chosen) != 1:
+        raise RuntimeError(f"expected exactly 1 matching edge, found {len(chosen)}")
+    return chosen[0]
+
+
+def cross_drilled_shaft():
+    """Ø30 x 60 round bar, one Ø8 cross-hole 10 mm off the centreline.
+
+    N1, and the headline repro: a bore that exits through a CYLINDRICAL
+    outer surface. There is no planar cap anywhere on this hole, so the
+    round-1 fix did nothing and the parametric bound stood — 22.96 % too
+    deep with the entry 2.57 mm outside the bar, in mid-air. An off-centre
+    cross-drilling (a lube port, a cross-pin hole) is not an exotic part.
+
+    Truth is stated, not measured: the bore axis runs along +X at y=10,
+    z=30 and meets the Ø30 OD (x² + y² = 15²) at x = ±sqrt(225 - 100).
+
+    Expected: 1 hole, Ø8.0, depth 2·sqrt(125) = 22.360679774997898, entry
+    (-sqrt(125), 10, 30), axis (1,0,0), THROUGH.
+
+    (Centred on the bar this defect VANISHES — with y=0 the trim curve's
+    extreme and the axis crossing are the same point. The offset is what
+    makes the fixture bite, and it is why "cross-drilled" alone would not
+    have been enough.)
+    """
+    bar = _cyl(0.0, 0.0, 0.0, 0, 0, 1, 15.0, 60.0)
+    bore = _cyl(-30.0, 10.0, 30.0, 1, 0, 0, 4.0, 60.0)
+    return BRepAlgoAPI_Cut(bar, bore).Shape()
+
+
+def blind_hole_curved_top():
+    """R25 D-section bar, Ø10 flat-bottomed blind bore under the CURVE.
+
+    N1's blind arm. The bore is drilled straight down at x=10, where the
+    barrelled top sits at z = sqrt(625 - 100), so its entry is on a
+    cylindrical surface and its depth is measured from there. Round 1
+    reported it 1.58 mm deep-and-high — the entry floating above the
+    material, the same defect B4 closed for flat-topped parts.
+
+    Expected: 1 hole, Ø10.0, depth sqrt(525) - 5 = 17.912878474779199,
+    entry (10, 20, sqrt(525)), axis (0,0,-1), BLIND, flat_bottom=True.
+    """
+    bar = _cyl(0.0, 0.0, 0.0, 0, 1, 0, 25.0, 40.0)
+    flat = BRepPrimAPI_MakeBox(gp_Pnt(-30.0, -5.0, -30.0), 60.0, 50.0, 30.0).Shape()
+    shape = BRepAlgoAPI_Cut(bar, flat).Shape()
+    return BRepAlgoAPI_Cut(shape, _cyl(10.0, 20.0, 5.0, 0, 0, 1, 5.0, 30.0)).Shape()
+
+
+def bore_into_fillet():
+    """60 x 60 x 30 block, top-right edge filleted R10, Ø6 bore through it.
+
+    N1's fillet arm AND correction 1's positive control: a real bore that
+    breaks OUT through a fillet surface must keep its true depth and must
+    not be dropped. The bore is placed at x=55 so its whole Ø6 footprint
+    (x = 52..58) lands inside the fillet's x = 50..60 band — clear of the
+    tangent line, so the cap is unambiguously the curved face.
+
+    The fillet is the quarter-cylinder of radius 10 about the line
+    x=50, z=20, so the bore's axis leaves it at z = 20 + sqrt(75).
+
+    Expected: 1 hole, Ø6.0, depth 20 + sqrt(75) = 28.660254037844386,
+    entry (55, 30, 0), axis (0,0,1), THROUGH.
+    """
+    shape = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 60.0, 30.0).Shape()
+    maker = BRepFilletAPI_MakeFillet(shape)
+    maker.Add(
+        10.0,
+        _one_edge(
+            shape,
+            lambda d, p: abs(abs(d.Y()) - 1.0) <= 1e-9
+            and abs(p.X() - 60.0) <= 1e-6
+            and abs(p.Z() - 30.0) <= 1e-6,
+        ),
+    )
+    return BRepAlgoAPI_Cut(
+        maker.Shape(), _cyl(55.0, 30.0, -5.0, 0, 0, 1, 3.0, 50.0)
+    ).Shape()
+
+
+def bore_beside_concave_fillet():
+    """`concave_fillet_step` plus a genuine Ø8 bore through the wall.
+
+    Correction 1's negative-and-positive control in one part. Round 1's
+    `_is_bore_face` carried an axis-in-the-void arm on the argument that
+    it was redundant belt-and-braces against fillets; that arm is gone,
+    which leaves the post-merge sweep union as the ONLY thing separating
+    an internal-corner fillet from a bore. This part asks both halves of
+    that at once: the R5 concave fillet must still contribute NO hole,
+    and the real bore 1 mm above it must still contribute exactly one.
+
+    Expected: 1 hole, Ø8.0, depth 30.0, entry (0, 20, 25), axis (1,0,0),
+    THROUGH.
+    """
+    return BRepAlgoAPI_Cut(
+        concave_fillet_step(), _cyl(-5.0, 20.0, 25.0, 1, 0, 0, 4.0, 40.0)
+    ).Shape()
+
+
+def bore_over_centre_post():
+    """60 x 60 x 40 block, Ø30 recess 20 deep, with a Ø10 post up its axis.
+
+    Correction 1's revert-proof, and the counter-example that removed the
+    arm. Round 1 recorded the axis-in-the-void test as unpinnable by any
+    valid STEP file, reasoning that a well-formed solid cannot present a
+    face that is REVERSED, sweeps a full 2π, and has material on its own
+    axis. This part does exactly that, from two primitives and two
+    booleans, and it is an ordinary shape — a bored recess with a raised
+    centre boss.
+
+    What the arm would do here is not catch a phantom: it would DROP the
+    Ø30 recess entirely, reporting zero holes on a part with one. A false
+    negative, on the under-count side, which is the side nobody sees.
+
+    Expected: 1 hole, Ø30.0 (never the Ø10 post's OD), depth 20.0, entry
+    (30, 30, 40), axis (0,0,-1), BLIND, flat_bottom=True.
+    """
+    shape = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 60.0, 40.0).Shape()
+    shape = BRepAlgoAPI_Cut(shape, _cyl(30.0, 30.0, 20.0, 0, 0, 1, 15.0, 25.0)).Shape()
+    return BRepAlgoAPI_Fuse(
+        shape, _cyl(30.0, 30.0, 20.0, 0, 0, 1, 5.0, 20.0)
+    ).Shape()
+
+
 FIXTURES = {
     "plate_4_through_holes.step": plate_4_through_holes,
     "blind_hole_flat_bottom.step": blind_hole_flat_bottom,
@@ -390,6 +547,12 @@ FIXTURES = {
     "both_sides_drilled.step": both_sides_drilled,
     "filleted_block.step": filleted_block,
     "concave_fillet_step.step": concave_fillet_step,
+    # ADR-0112 adversarial round 2.
+    "cross_drilled_shaft.step": cross_drilled_shaft,
+    "blind_hole_curved_top.step": blind_hole_curved_top,
+    "bore_into_fillet.step": bore_into_fillet,
+    "bore_beside_concave_fillet.step": bore_beside_concave_fillet,
+    "bore_over_centre_post.step": bore_over_centre_post,
 }
 
 
