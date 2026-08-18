@@ -161,6 +161,45 @@ rule rather than out of their positions, and the bound — no longer doing
 work it was not fit for — relaxes to what it can honestly claim: a root
 past the bore's FAR end belongs to the other end, or to neither.
 
+CORRECTED AGAIN (ADR-0112 adversarial round 4, the foreign-root hijack).
+Round 3 relaxed that outward bound and left the CROSS-FACE contest in
+:meth:`_EndEvidence.resolve` as "the outermost cap wins". Those two were
+co-designed and only one of them was changed. Round 2's inward clip had
+been holding every outward root down at the bore's own end, so
+outermost-wins could not reach past the part; without it, a face that
+merely NEIGHBOURS the bore's mouth wins the end whenever its UNBOUNDED
+carrier surface happens to cross the axis further out than the true cap
+does. Three ordinary parts, all measured against the real kernel:
+
+- A Ø8 through-bore 2 mm inboard of a 6 mm 45° CHAMFERED part edge, close
+  enough that its mouth bites into the chamfer. The chamfer's plane is
+  ``x + z = 54``; the bore's axis at x=32 meets it at z=22, two
+  millimetres above a part that stops at z=20. Depth 22.0 against a true
+  20.0, entry off the part.
+- The same chamfer on a BLIND bore, where the error becomes a
+  coordinate: depth 14.0 against 12.0, entry at z=22 — 2 mm in mid-air.
+- A Ø14 through-bore beside a concave R6 corner FILLET whose axis lies
+  outside the fillet's real extent. The fillet's carrier cylinder still
+  crosses the axis, at z=20.8038 on a 20 mm plate.
+
+``nearest-to-edge`` does not touch any of this: it disambiguates the
+several roots of ONE face, and the defect is a contest BETWEEN faces.
+Restricting the round-3 relaxation to non-planar caps does not close it
+either — the concave fillet is not planar, and hijacks anyway.
+
+What the neighbour is missing is not a bound but OWNERSHIP. A cap ends a
+bore because the bore's mouth is cut in THAT face, and a face that owns
+the mouth surrounds the axis with it. The chamfer owns 120° of the
+mouth's 360° and the fillet 129°; the true cap owns the rest. So the
+contest is now run over the faces that own the mouth, and only over
+them: the outermost OWNED cap wins the end, and outermost-wins survives
+untouched among the owned — which is what still carries a bore through a
+slot or a counterbore floor out to the part's real face. Every genuine
+cap on every committed fixture, curved ones included, owns its whole
+mouth as a closed loop and none of their answers moves by a bit.
+:func:`_mouth_owns_axis` is the test, and it is exact — vertex parity and
+one sidedness comparison, no sampling and no tolerance to tune.
+
 Open or capped (ADR-0112 adversarial, B2 + N2)
 ------------------------------------------------
 
@@ -331,7 +370,12 @@ try:
     from OCP.GeomAPI import GeomAPI_IntCS, GeomAPI_ProjectPointOnSurf
     from OCP.GeomLProp import GeomLProp_SLProps
     from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt
-    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_REVERSED
+    from OCP.TopAbs import (
+        TopAbs_EDGE,
+        TopAbs_FACE,
+        TopAbs_REVERSED,
+        TopAbs_VERTEX,
+    )
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopoDS import TopoDS
     from OCP.TopTools import TopTools_IndexedMapOfShape
@@ -394,6 +438,21 @@ MAX_MERGE_GAP_FLOOR_MM: float = 1.0
 #: visible one. Every real case is orders of magnitude clear of it: a
 #: flat face square to the bore gives 1.0, a 45° angled entry 0.71, a
 #: 118° drill point -0.86.
+#:
+#: RECONSIDERED and DELIBERATELY LEFT (ADR-0112 adversarial round 4). A
+#: floor this low admits a near-tangent neighbour, and once round 3 made
+#: outward roots unbounded a near-tangent neighbour is exactly the one
+#: whose carrier crosses the axis furthest out — so this looked like an
+#: amplifier of the foreign-root hijack and a candidate for tightening.
+#: It is not, and tightening it would have been a second defect. What the
+#: hijack needed was not a smaller admission angle but the OWNERSHIP gate
+#: in :meth:`_EndEvidence.resolve`: a near-tangent face can only carry an
+#: end now if it owns the bore's whole mouth, and a face that owns the
+#: whole mouth IS the cap however tangent it is. Meanwhile a tighter
+#: floor would start refusing real caps — a 0.5° draft face reads 0.0087
+#: — and would trade a wrong THROUGH for a wrong depth. So the number
+#: keeps the one job it was ever fit for, deciding GRAZING, and the
+#: distance a root may travel is bounded by ownership instead.
 CAP_OUTWARD_MIN_COS: float = 1e-6
 
 #: Below this RATIO between the two surface-derivative magnitudes at a
@@ -440,13 +499,45 @@ DEGENERATE_ISOLINE_RATIO: float = 1e-9
 #: analytic sphere's pole 1.2e-16, a NURBS sphere's pole 2.0e-16. A 90°
 #: countersink 8.2e-01, a 120° countersink 7.7e-01, and even an absurd
 #: 170°-included cone 1.7e-01. Ten orders of margin below, five above.
-#: And it degrades the right way: a cone so shallow that its tangents are
-#: coplanar to within this floor is geometrically a flat cap, and reading
-#: it as one is right.
+#: And it degrades the right way at BOTH limits, which is worth writing
+#: down because only the shallow one was (ADR-0112 adversarial round 4).
+#:
+#: SHALLOW — a cone so nearly flat that its tangents are coplanar to
+#: within this floor is geometrically a flat cap, and reading it as one is
+#: right. That is the first arm below, and the answer it gives is "cap".
+#:
+#: SHARP — a cone so nearly a needle that its generatrices are all but
+#: PARALLEL to the axis spans no plane at all, and the second arm below
+#: refuses it before coplanarity is ever asked. The answer there is "not a
+#: cap", which is also right: a spike the axis runs down does not end a
+#: bore. The two arms meet nowhere near anything real. With
+#: :data:`DEGENERATE_PROBE_DIRECTIONS` sampling the collapsed isoline at
+#: quarter turns, two tangents of a cone of half-angle α span
+#: ``sin α·sqrt(1 + cos²α)``, so the sharp arm bites only below
+#: ``sin α ≈ 7.1e-7`` — an INCLUDED angle under 1e-4 degrees, which is a
+#: needle 1 mm across and 700 metres long. A 170°-included cone, already
+#: absurd, measures 1.7e-01 at the shallow arm.
 #:
 #: Used twice, for the same kind of question: two tangents this close to
 #: PARALLEL span no plane to test against either.
 DEGENERATE_COPLANARITY_TOL: float = 1e-6
+
+#: Twice the signed triangle area, in mm², that the bore MOUTH's chord and
+#: a point on the mouth itself must span before the mouth is ruled to lie
+#: on one side of that chord — the last step of :func:`_mouth_owns_axis`.
+#:
+#: A degeneracy floor, not a tuning knob. Vanishing area means the mouth's
+#: two loose ends and the mouth between them are COLLINEAR, which is to
+#: say the face owns exactly half a turn of the mouth and there is no side
+#: to be had; the axis is ON the chord and neither answer is the true one.
+#: Unproven reads NOT owned, which simply leaves the pre-round-4 contest
+#: standing for that end rather than inventing a winner.
+#:
+#: The margin is the mouth's own size: a face owning any definite sector
+#: of a bore of radius r spans an area of order r², so a Ø0.5 micro-drill
+#: — the smallest thing a shop puts through a plate — clears this by ten
+#: orders of magnitude, and a Ø8 bore by thirteen.
+MOUTH_CHORD_MIN_AREA_MM2: float = 1e-12
 
 #: How many directions of approach a degenerate point is probed from,
 #: spaced evenly over the collapsed isoline's full parametric range.
@@ -1314,28 +1405,230 @@ def _cap_says_open(face, point, outward: Sequence[float], normal=None) -> bool:
     return _dot(oriented, outward) > CAP_OUTWARD_MIN_COS
 
 
+def _mouth_loose_ends(edges) -> Optional[List[Tuple[float, float, float]]]:
+    """The free ends of the bore's MOUTH in one cap face.
+
+    ``edges`` is every edge the face shares with the bore's own
+    cylinders — the opening the bore cut in it. Returns an EMPTY list
+    when those edges close up into a loop (the face owns the whole
+    mouth), the two end POINTS when they form a single open chain, and
+    ``None`` when they are neither: several disjoint arcs, which this
+    cannot read and will not guess at.
+
+    Counted by vertex PARITY rather than by walking the chain in order.
+    An interior joint is shared by exactly two edges and a loose end by
+    one, so the odd-count vertices ARE the loose ends — whatever order
+    OCCT hands the edges back in, and however many pieces a seam split
+    the mouth into. A closed edge reports its single vertex twice, which
+    is even, so a mouth that is one full circle answers "no loose ends"
+    without being special-cased.
+
+    Keyed on ``TopTools_IndexedMapOfShape``'s index for the same reason
+    :class:`_EdgeFaces` is: that map hashes with ``IsSame`` semantics, so
+    one vertex is ONE key however many orientations reach it. Python's
+    own hashing of a ``TopoDS_Shape`` would split every joint in two and
+    report a closed loop as all loose ends.
+    """
+    index = TopTools_IndexedMapOfShape()
+    seen: dict = {}
+    for edge in edges:
+        explorer = TopExp_Explorer(edge, TopAbs_VERTEX)
+        while explorer.More():
+            vertex = TopoDS.Vertex_s(explorer.Current())
+            explorer.Next()
+            key = index.Add(vertex)
+            count, point = seen.get(key, (0, None))
+            if point is None:
+                p = BRep_Tool.Pnt_s(vertex)
+                point = (float(p.X()), float(p.Y()), float(p.Z()))
+            seen[key] = (count + 1, point)
+    if not seen:
+        return None
+    loose = [point for _key, (count, point) in sorted(seen.items()) if count % 2]
+    if not loose:
+        return []
+    return loose if len(loose) == 2 else None
+
+
+def _mouth_owns_axis(edges, origin, direction) -> bool:
+    """Does this face's share of the bore's MOUTH surround the axis?
+
+    The round-4 ownership test, and the whole of the foreign-root fix —
+    see the module docstring. A face caps a bore because the bore's mouth
+    is cut in it; a face that merely stands NEXT TO the mouth owns a
+    sector of it and no more, and its unbounded carrier surface has no
+    business deciding where the bore ends.
+
+    "Surrounds" is asked of the mouth rather than of the crossing point,
+    and that is what makes the test exact instead of a classification
+    problem. The obvious reading of ownership — project the axis crossing
+    onto the face and ask ``BRepClass`` whether it lands ON the face —
+    answers NO for every genuine cap the miner has, because the crossing
+    lands in the middle of the hole the bore itself cut. Measured on the
+    committed fixtures: the crown of a Ø40 ball, of a NURBS dome and of a
+    torus wall all classify OUT, and the two domes are outside the face's
+    UV bounds as well (their trim stops at v = ±1.3694 rad and the axis
+    leaves at ±π/2). A UV-in-bounds or on-face gate would therefore have
+    re-opened round 3's blocker 2 at both ends of all three. The mouth
+    has no such trouble: it is a real boundary of the real face, and it
+    either goes round the axis or it does not.
+
+    Two cases, both exact:
+
+    - The mouth CLOSES on itself — no loose ends — so it encircles the
+      axis and the face owns the end. Every cap on every committed
+      fixture is this case, including the ones the mouth arrives in
+      pieces on: a seam-split bore hands its top face four quarter-arcs
+      and a torus wall four edges, and parity closes both. This costs a
+      vertex walk and no geometry at all.
+
+    - The mouth is one open CHAIN, so the face shares it with another
+      face and owns an arc between two loose ends. Every point of that
+      arc lies on the bore's own cylinder, so seen down the axis it is an
+      arc of a circle with the crossing at its CENTRE, and the centre of
+      a circle lies inside an arc's own segment exactly when that arc
+      exceeds half a turn. Which is one sidedness comparison against the
+      chord: the axis is owned when it falls on the same side of the
+      chord as the mouth does. No angles are summed and nothing is
+      sampled — a chord and a single point on the arc settle it.
+
+    The 45° chamfer of the round-4 repro owns 120° of its neighbour's
+    mouth and the concave R6 fillet 129°, so both fail; the true cap owns
+    the remaining 240° and 231° and passes. A face reaching neither case
+    — a mouth in several disjoint pieces — is not owned, which leaves the
+    pre-round-4 contest standing for that end rather than guessing.
+    """
+    try:
+        loose = _mouth_loose_ends(edges)
+    except Exception:  # noqa: BLE001 — an unreadable mouth proves no ownership
+        return False
+    if loose is None:
+        return False
+    if not loose:
+        return True
+
+    e1, e2 = _perp_basis(direction)
+
+    def lateral(point: Sequence[float]) -> Tuple[float, float]:
+        """``point`` seen down the bore's axis, from the axis."""
+        offset = (
+            point[0] - origin[0],
+            point[1] - origin[1],
+            point[2] - origin[2],
+        )
+        return _dot(offset, e1), _dot(offset, e2)
+
+    try:
+        curve = BRepAdaptor_Curve(edges[0])
+        u0, u1 = float(curve.FirstParameter()), float(curve.LastParameter())
+        p = curve.Value(0.5 * (u0 + u1))
+        on_mouth = lateral((float(p.X()), float(p.Y()), float(p.Z())))
+    except Exception:  # noqa: BLE001 — as above
+        return False
+
+    a, b = lateral(loose[0]), lateral(loose[1])
+
+    def side(point: Sequence[float]) -> float:
+        """Twice the signed area of (chord start, chord end, ``point``)."""
+        return (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])
+
+    reference = side(on_mouth)
+    if abs(reference) <= MOUTH_CHORD_MIN_AREA_MM2:
+        return False
+    return side((0.0, 0.0)) * reference > 0.0
+
+
 class _EndEvidence:
     """What the cap walk found at ONE end of a bore.
 
-    ``caps`` are (axial parameter, face, 3-D point, surface normal)
-    quadruples from neighbours whose surface the axis actually CROSSES in
-    range of this end. ``touching`` is every neighbour at this end paired
-    with a point on the shared edge, including the ones that produced no
-    usable crossing — a drill point's cone caps the bore without its axis
-    ever crossing it, and it still gets a vote on whether the end is
-    open.
+    ``caps`` are (axial parameter, face, 3-D point, surface normal, face
+    key) quintuples from neighbours whose surface the axis actually
+    CROSSES in range of this end. ``touching`` is every neighbour at this
+    end paired with a point on the shared edge, including the ones that
+    produced no usable crossing — a drill point's cone caps the bore
+    without its axis ever crossing it, and it still gets a vote on
+    whether the end is open.
+
+    ``mouths`` maps a face key to every edge that face shares with the
+    bore's own cylinders at this end — the bore's MOUTH in it, pooled
+    across however many edges and however many of the bore's own faces
+    lead there. That pooling is the point: a seam-split bore reaches one
+    cap face along four quarter-arcs, and the mouth is only a closed loop
+    when all four are held together. :meth:`resolve` reads it to decide
+    which candidate OWNS the end (ADR-0112 adversarial round 4).
+
+    The key is ``TopTools_IndexedMapOfShape``'s index rather than the
+    face itself, for the reason :class:`_EdgeFaces` gives at length: that
+    map hashes with ``IsSame`` semantics, and Python's own hashing of a
+    ``TopoDS_Shape`` would file one face under two keys and split its
+    mouth in half.
     """
 
-    __slots__ = ("caps", "touching")
+    __slots__ = ("caps", "touching", "mouths", "_face_keys")
 
     def __init__(self):
         self.caps: List[
-            Tuple[float, object, Tuple[float, float, float], Tuple[float, float, float]]
+            Tuple[
+                float,
+                object,
+                Tuple[float, float, float],
+                Tuple[float, float, float],
+                int,
+            ]
         ] = []
         self.touching: List[Tuple[object, Tuple[float, float, float]]] = []
+        self.mouths: dict = {}
+        self._face_keys = TopTools_IndexedMapOfShape()
+
+    def note_mouth(self, face, edge) -> int:
+        """Record ``edge`` as part of the bore's mouth in ``face``.
+
+        Returns the face's key, which the caller stores on the cap so
+        :meth:`resolve` can find the mouth again. Recorded for EVERY
+        neighbour, including the ones that yield no root — another edge
+        of the same face may yield one, and the mouth it is judged on has
+        to be the whole mouth by then.
+        """
+        key = self._face_keys.Add(face)
+        edges = self.mouths.setdefault(key, [])
+        if not any(edge.IsSame(other) for other in edges):
+            edges.append(edge)
+        return key
+
+    def _at(self, level: float, sign: float) -> List:
+        """Every cap sitting at ``level``, ties included.
+
+        TIED caps all get a vote, and every one of them must say "out".
+        Two faces meeting exactly at the bore's exit — a chamfer landing
+        on its own edge, a bore breaking out on the seam between two skin
+        patches — are equally the cap there, and picking whichever the
+        face walk happened to reach first would make the answer depend on
+        OCCT's explorer order. That is the S3 defect, in the one place the
+        round-2 rewrite could have reintroduced it: the position was
+        always tie-proof (the two ties agree on t by definition), but the
+        openness verdict reads the FACE, which they need not agree on.
+        """
+        return [cap for cap in self.caps if abs(sign * cap[0] - level) <= 1e-9]
+
+    def _owns(self, winners: Sequence, origin, direction) -> bool:
+        """Do the tied caps at one level, TOGETHER, own the bore's mouth?
+
+        Pooled across the tie rather than asked of each face alone,
+        because a tie is precisely the case where one mouth is shared: a
+        bore breaking out on the seam between two skin patches gives each
+        patch half the loop, and only the pair of them closes it. Faces
+        at DIFFERENT levels are not pooled — that is the hijack, and
+        keeping them apart is what exposes it.
+        """
+        mouth: List = []
+        for cap in winners:
+            for edge in self.mouths.get(cap[4], ()):
+                if not any(edge.IsSame(other) for other in mouth):
+                    mouth.append(edge)
+        return _mouth_owns_axis(mouth, origin, direction)
 
     def resolve(
-        self, fallback_t: float, direction: Sequence[float], sign: float
+        self, fallback_t: float, origin, direction: Sequence[float], sign: float
     ) -> Tuple[float, bool]:
         """This end's true axial parameter, and whether it opens to air.
 
@@ -1343,11 +1636,28 @@ class _EndEvidence:
         OUT of the bore at this end is ``sign * direction`` and
         "outermost" is simply the largest ``sign * t``.
 
-        The outermost cap wins the position. That is what carries a bore
-        interrupted by a slot or a counterbore floor out to the part's
-        real face instead of stopping at the interruption — and, because
-        the same cap then answers the openness question, it is also what
-        stops the slot's own wall from voting "blind" on a through-hole.
+        The outermost cap that OWNS the bore's mouth wins the position.
+        Outermost is what carries a bore interrupted by a slot or a
+        counterbore floor out to the part's real face instead of stopping
+        at the interruption — and, because the same cap then answers the
+        openness question, it is also what stops the slot's own wall from
+        voting "blind" on a through-hole. Both of those interruptions cut
+        a full circle out of the face they cross, so they own their
+        mouths and the rule reaches them unchanged.
+
+        Ownership is what round 4 added, and it decides only which
+        candidate the contest is between — see :func:`_mouth_owns_axis`
+        and the module docstring. Without it the outermost carrier
+        surface wins whether or not the bore ever reached it, and a
+        chamfer or a fillet standing beside the mouth carries the end off
+        the part. With it, a face has to have the mouth cut in it before
+        its surface is allowed to say where the bore stops.
+
+        Where NOTHING at this end owns the mouth the outermost cap wins
+        as it did before. That is deliberate: ownership is a fact the
+        topology can prove, not one it can disprove, and an end whose
+        mouth reads as several disjoint arcs is no reason to throw away
+        the only evidence there is.
 
         With no cap at all the parametric bound stands and every
         neighbour that merely TOUCHES this end votes; all of them must
@@ -1356,25 +1666,19 @@ class _EndEvidence:
         """
         outward = (sign * direction[0], sign * direction[1], sign * direction[2])
         if self.caps:
-            furthest = max(sign * cap[0] for cap in self.caps)
-            # TIED caps all get a vote, and every one of them must say
-            # "out". Two faces meeting exactly at the bore's exit — a
-            # chamfer landing on its own edge, a bore breaking out on the
-            # seam between two skin patches — are equally the cap there,
-            # and picking whichever the face walk happened to reach first
-            # would make the answer depend on OCCT's explorer order. That
-            # is the S3 defect, in the one place the round-2 rewrite could
-            # have reintroduced it: the position was always tie-proof (the
-            # two ties agree on t by definition), but the openness verdict
-            # reads the FACE, which they need not agree on.
-            winners = [
-                (face, point, normal)
-                for t_cap, face, point, normal in self.caps
-                if sign * t_cap >= furthest - 1e-9
-            ]
-            return sign * furthest, all(
+            levels = sorted({sign * cap[0] for cap in self.caps}, reverse=True)
+            winner_level = next(
+                (
+                    level
+                    for level in levels
+                    if self._owns(self._at(level, sign), origin, direction)
+                ),
+                levels[0],
+            )
+            winners = self._at(winner_level, sign)
+            return sign * winner_level, all(
                 _cap_says_open(face, point, outward, normal)
-                for face, point, normal in winners
+                for _t_cap, face, point, normal, _key in winners
             )
         if not self.touching:
             return fallback_t, False
@@ -1466,6 +1770,13 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
     - Of the roots that survive, only the one NEAREST THE EDGE that led
       to this face is kept. A line crosses a shaft's OD twice, and the
       far crossing is the other end of the bore, not this one.
+
+      This settles the several roots of ONE face and nothing more, which
+      is worth saying because round 4 found the defect it does NOT reach:
+      a contest between two different faces at the same end. Each of them
+      keeps its own nearest root perfectly correctly, and the wrong one
+      still won the end. That is :meth:`_EndEvidence.resolve`'s to fix,
+      and it fixes it with the mouth this walk records here.
     """
     origin, direction = group.origin, group.direction
     mid = 0.5 * (p_lo + p_hi)
@@ -1497,6 +1808,11 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
                     if any(face.IsSame(own) for own in group.faces):
                         continue
                     end.touching.append((face, edge_point))
+                    # This edge is part of the bore's MOUTH in that face.
+                    # Recorded before the root is looked for, because the
+                    # ownership test needs the whole mouth even when this
+                    # particular edge contributes no crossing.
+                    key = end.note_mouth(face, edge)
                     roots = [
                         root
                         for root in _cap_axis_intersections(face, origin, direction)
@@ -1511,6 +1827,7 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
                             face,
                             _point_on_axis(origin, direction, t_cap),
                             normal,
+                            key,
                         )
                     )
             except Exception:  # noqa: BLE001 — one odd edge must not kill the bore
@@ -1526,9 +1843,9 @@ def _resolve_span(group, ancestors, p_lo, p_hi) -> Tuple[float, float, bool, boo
     docstring's "Why UVBounds is not the answer" and "Open or capped".
     """
     low, high = _walk_caps(group, ancestors, p_lo, p_hi)
-    direction = group.direction
-    t_lo, lo_open = low.resolve(p_lo, direction, -1.0)
-    t_hi, hi_open = high.resolve(p_hi, direction, +1.0)
+    origin, direction = group.origin, group.direction
+    t_lo, lo_open = low.resolve(p_lo, origin, direction, -1.0)
+    t_hi, hi_open = high.resolve(p_hi, origin, direction, +1.0)
     return t_lo, t_hi, lo_open, hi_open
 
 

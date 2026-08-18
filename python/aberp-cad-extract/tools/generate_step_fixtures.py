@@ -37,7 +37,7 @@ from pathlib import Path
 
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
 from OCP.BRepAdaptor import BRepAdaptor_Curve
-from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer, BRepFilletAPI_MakeFillet
 from OCP.BRepBuilderAPI import BRepBuilderAPI_NurbsConvert
 from OCP.BRepPrimAPI import (
     BRepPrimAPI_MakeBox,
@@ -734,6 +734,152 @@ def bore_through_nurbs_dome():
     return BRepAlgoAPI_Cut(nurbs, _cyl(0, 0, -30.0, 0, 0, 1, 4.0, 60.0)).Shape()
 
 
+# ── ADR-0112 adversarial round 4: the FOREIGN-ROOT HIJACK ────────────────
+#
+# Round 3 relaxed the outward parametric bound and left the cross-face
+# contest as "the outermost cap wins". With the bound gone, a face that
+# merely NEIGHBOURS the bore's mouth wins the end whenever its UNBOUNDED
+# carrier surface crosses the axis further out than the true cap — and
+# reports a hole deeper than the part with its entry in mid-air.
+#
+# All three parts put an ordinary bore close enough to an ordinary edge
+# treatment that its mouth bites into it. None of them is exotic; a bore
+# 2 mm inboard of a chamfered edge is a hole near the edge of a plate.
+#
+# The 45° chamfer and the concave corner fillet are the clean pins: on
+# both, the hijacking face's own trimmed extent provably excludes the
+# crossing, so the answer is a hard number rather than a judgement.
+
+
+def _chamfered_block():
+    """40 x 40 x 20 block, top edge at x=40 chamfered 45° x 6 mm.
+
+    The chamfer face runs from (34, z=20) to (40, z=14) and therefore
+    spans x in [34, 40]; its plane, unbounded, is ``x + z = 54``.
+    """
+    box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    maker = BRepFilletAPI_MakeChamfer(box)
+    maker.Add(
+        6.0,
+        _one_edge(
+            box,
+            lambda d, p: abs(abs(d.Y()) - 1.0) <= 1e-9
+            and abs(p.X() - 40.0) <= 1e-6
+            and abs(p.Z() - 20.0) <= 1e-6,
+        ),
+    )
+    return maker.Shape()
+
+
+def bore_beside_chamfered_edge():
+    """`_chamfered_block` with a Ø8 THROUGH bore at x=32.
+
+    The bore spans x = 28..36, so its mouth straddles x=34 and the
+    chamfer is a NEIGHBOUR of the bore — but the AXIS is at x=32, two
+    millimetres inboard of where the chamfer face begins. The chamfer's
+    unbounded plane meets that axis at z = 54 - 32 = 22, which is 2 mm
+    above a part that stops at z=20 and 2 mm outside the chamfer's own
+    x range. Round 3 took it for the cap.
+
+    Stated by construction: the axis leaves through the flat top at
+    z=20, and the chamfer owns only the 120° of the bore's mouth with
+    x >= 34 (cos θ >= 1/2).
+
+    Expected: 1 hole, Ø8.0, depth 20.0, entry (32, 20, 0), axis (0,0,1),
+    THROUGH.  Round 3: depth 22.0, entry z=22, off the part.
+    """
+    return BRepAlgoAPI_Cut(
+        _chamfered_block(), _cyl(32.0, 20.0, -5.0, 0, 0, 1, 4.0, 30.0)
+    ).Shape()
+
+
+def blind_bore_beside_chamfered_edge():
+    """The same chamfer on a BLIND bore, where the error is a coordinate.
+
+    A Ø8 flat-bottomed bore 12 mm deep from the top face. Depth is wrong
+    by the same 2 mm, and because the OPEN end of a blind hole is the one
+    that carries the entry point, the reported entry moves off the part
+    into air — a coordinate no machine can reach, which is exactly the
+    failure B4 and round 3's blind-dome arm were about.
+
+    Expected: 1 hole, Ø8.0, depth 12.0, entry (32, 20, 20), axis
+    (0,0,-1), BLIND, flat_bottom=True.  Round 3: depth 14.0, entry
+    (32, 20, 22) — 2 mm in mid-air.
+    """
+    return BRepAlgoAPI_Cut(
+        _chamfered_block(), _cyl(32.0, 20.0, 8.0, 0, 0, 1, 4.0, 30.0)
+    ).Shape()
+
+
+def bore_inside_a_chamfer():
+    """The POSITIVE control: a chamfer that genuinely IS the cap.
+
+    The three parts above all rule a chamfer or a fillet OUT of the
+    contest, and a miner that simply refused every chamfer would pass all
+    three. This is the part that refuses it: the same 40 x 40 x 20 block
+    with a 14 mm chamfer, so the chamfer face spans x in [26, 40] and the
+    Ø8 bore at x=32 sits entirely INSIDE it. The whole mouth is cut in
+    the chamfer, the chamfer owns all 360° of it, and the bore really
+    does leave through the chamfer's plane.
+
+    The chamfer plane runs (26, z=20) to (40, z=6), so it is ``x + z =
+    46`` and the axis at x=32 leaves it at z=14.
+
+    Expected: 1 hole, Ø8.0, depth 14.0, entry (32, 20, 0), axis (0,0,1),
+    THROUGH.
+    """
+    box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    maker = BRepFilletAPI_MakeChamfer(box)
+    maker.Add(
+        14.0,
+        _one_edge(
+            box,
+            lambda d, p: abs(abs(d.Y()) - 1.0) <= 1e-9
+            and abs(p.X() - 40.0) <= 1e-6
+            and abs(p.Z() - 20.0) <= 1e-6,
+        ),
+    )
+    return BRepAlgoAPI_Cut(
+        maker.Shape(), _cyl(32.0, 20.0, -5.0, 0, 0, 1, 4.0, 30.0)
+    ).Shape()
+
+
+def bore_beside_concave_corner_fillet():
+    """A Ø14 through bore beside a CONCAVE R6 corner fillet.
+
+    The second half of the blocker, and the reason restricting round 3's
+    relaxation to non-planar caps would not have been enough: this
+    hijacker is a cylinder, not a plane, and it hijacks anyway.
+
+    A 60 x 40 x 20 base plate carries an upstand for x >= 30. The
+    internal edge at (x=30, z=20) is filleted R6, giving a concave
+    quarter-cylinder about the line x=24, z=26 that spans x in [24, 30].
+    The bore is at x=21 — OUTSIDE the fillet's real extent — and its Ø14
+    footprint reaches x=28, so the fillet is a neighbour. The fillet's
+    carrier cylinder, unbounded, still meets the axis:
+    z = 26 - sqrt(36 - 9) = 20.8038.
+
+    Expected: 1 hole, Ø14.0, depth 20.0, entry (21, 20, 0), axis
+    (0,0,1), THROUGH.  Round 3: depth 20.803847577293368.
+    """
+    base = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 40.0, 20.0).Shape()
+    upstand = BRepPrimAPI_MakeBox(gp_Pnt(30.0, 0, 20.0), 30.0, 40.0, 30.0).Shape()
+    shape = BRepAlgoAPI_Fuse(base, upstand).Shape()
+    maker = BRepFilletAPI_MakeFillet(shape)
+    maker.Add(
+        6.0,
+        _one_edge(
+            shape,
+            lambda d, p: abs(abs(d.Y()) - 1.0) <= 1e-9
+            and abs(p.X() - 30.0) <= 1e-6
+            and abs(p.Z() - 20.0) <= 1e-6,
+        ),
+    )
+    return BRepAlgoAPI_Cut(
+        maker.Shape(), _cyl(21.0, 20.0, -5.0, 0, 0, 1, 7.0, 40.0)
+    ).Shape()
+
+
 FIXTURES = {
     "plate_4_through_holes.step": plate_4_through_holes,
     "blind_hole_flat_bottom.step": blind_hole_flat_bottom,
@@ -765,6 +911,11 @@ FIXTURES = {
     "blind_bore_under_dome.step": blind_bore_under_dome,
     "bore_through_torus_wall.step": bore_through_torus_wall,
     "bore_through_nurbs_dome.step": bore_through_nurbs_dome,
+    # ADR-0112 adversarial round 4.
+    "bore_beside_chamfered_edge.step": bore_beside_chamfered_edge,
+    "blind_bore_beside_chamfered_edge.step": blind_bore_beside_chamfered_edge,
+    "bore_beside_concave_corner_fillet.step": bore_beside_concave_corner_fillet,
+    "bore_inside_a_chamfer.step": bore_inside_a_chamfer,
 }
 
 

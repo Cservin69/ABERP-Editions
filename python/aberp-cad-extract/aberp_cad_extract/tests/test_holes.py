@@ -1160,6 +1160,279 @@ def test_r3_the_drill_point_and_the_countersink_are_one_rule(fixtures_dir: Path)
     assert countersink[0].end_condition is HoleEndCondition.THROUGH
 
 
+
+# ── ADR-0112 adversarial round 4: the foreign-root hijack ────────────────
+#
+# Round 3 unbounded the outward root and left the CROSS-FACE contest as
+# "outermost cap wins". A face that merely neighbours the bore's mouth
+# then wins the end whenever its UNBOUNDED carrier crosses the axis
+# further out than the true cap. Each number below is the number the
+# fixture was built from; the round-3 number it replaces is named in the
+# failure message so a regression says what it regressed to.
+
+
+def test_r4_bore_beside_a_chamfered_edge_stops_at_the_part(fixtures_dir: Path):
+    """A Ø8 through-bore 2 mm inboard of a 45° chamfered part edge.
+
+    The chamfer's plane is ``x + z = 54`` and the bore's axis is at
+    x=32, so that plane crosses the axis at z=22 — 2 mm above a part
+    that stops at z=20, and 2 mm outside the chamfer face's own x range
+    of [34, 40]. The chamfer is a genuine NEIGHBOUR (the bore spans
+    x = 28..36, so its mouth bites into it) and it owns 120° of that
+    mouth; the flat top owns the other 240° and is where the axis
+    actually leaves.
+    """
+    holes = _mine(fixtures_dir / "bore_beside_chamfered_edge.step")
+
+    assert len(holes) == 1, f"got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    assert hole.depth_mm == pytest.approx(20.0, abs=TOL), (
+        f"depth must be the plate's 20.0; got {hole.depth_mm} "
+        "(round 3 reported 22.0, deeper than the part)"
+    )
+    _approx_vec(hole.entry_point_mm, (32.0, 20.0, 0.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, 1.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_r4_blind_bore_beside_a_chamfer_enters_on_the_part(fixtures_dir: Path):
+    """The same chamfer on a BLIND bore, where the error is a coordinate.
+
+    A blind hole carries its entry at the OPEN end, so hijacking that end
+    moves the entry off the part: round 3 put it at z=22, two
+    millimetres above the metal, which is a coordinate no machine can
+    reach. Pinned as a position, not only as a depth.
+    """
+    holes = _mine(fixtures_dir / "blind_bore_beside_chamfered_edge.step")
+
+    assert len(holes) == 1, f"got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    assert hole.depth_mm == pytest.approx(12.0, abs=TOL), (
+        f"depth must be the drilled 12.0; got {hole.depth_mm} "
+        "(round 3 reported 14.0)"
+    )
+    assert hole.entry_point_mm[2] == pytest.approx(20.0, abs=TOL), (
+        "the entry must sit ON the top face at z=20; it is at "
+        f"{hole.entry_point_mm[2]} (round 3 put it at 22.0, in mid-air)"
+    )
+    _approx_vec(hole.entry_point_mm, (32.0, 20.0, 20.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, -1.0))
+    assert hole.end_condition is HoleEndCondition.BLIND
+    assert hole.flat_bottom is True
+
+
+def test_r4_bore_beside_a_concave_corner_fillet_keeps_its_depth(fixtures_dir: Path):
+    """A Ø14 through-bore beside a concave R6 corner fillet.
+
+    The arm that rules out the cheap fix. Restricting round 3's
+    relaxation to non-planar caps would have closed the chamfer and left
+    this one open: the hijacker here IS non-planar. The fillet is the
+    quarter-cylinder about x=24, z=26 spanning x in [24, 30]; the bore's
+    axis is at x=21, outside that span, and the fillet's carrier cylinder
+    still meets the axis at z = 26 - sqrt(27) = 20.8038.
+    """
+    holes = _mine(fixtures_dir / "bore_beside_concave_corner_fillet.step")
+
+    assert len(holes) == 1, (
+        f"the R6 fillet is not a hole; got {[h.diameter_mm for h in holes]}"
+    )
+    hole = holes[0]
+    _approx(hole.diameter_mm, 14.0)
+    assert hole.depth_mm == pytest.approx(20.0, abs=TOL), (
+        f"depth must be the plate's 20.0; got {hole.depth_mm} "
+        f"(round 3 reported {26.0 - math.sqrt(27.0)})"
+    )
+    _approx_vec(hole.entry_point_mm, (21.0, 20.0, 0.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, 1.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_r4_a_chamfer_that_really_is_the_cap_still_wins(fixtures_dir: Path):
+    """The positive control, without which the fix could be a blanket ban.
+
+    The three fixtures above all rule a chamfer or a fillet OUT of the
+    contest, and a miner that simply refused every chamfer would pass
+    every one of them. Here the Ø8 bore at x=32 sits entirely inside a
+    14 mm chamfer spanning x in [26, 40]: the whole mouth is cut in the
+    chamfer, so the chamfer owns all 360° of it and genuinely IS where
+    the bore leaves. Its plane is ``x + z = 46``, so the axis leaves at
+    z=14 and the hole is 14 mm deep, not the plate's 20.
+    """
+    holes = _mine(fixtures_dir / "bore_inside_a_chamfer.step")
+
+    assert len(holes) == 1, f"got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    assert hole.depth_mm == pytest.approx(14.0, abs=TOL), (
+        f"the chamfer IS this bore's cap; got {hole.depth_mm} — a depth of "
+        "20.0 would mean ownership had been refused to a face that owns "
+        "the whole mouth"
+    )
+    _approx_vec(hole.entry_point_mm, (32.0, 20.0, 0.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, 1.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_r4_ownership_is_the_only_thing_holding_the_foreign_root_out(
+    fixtures_dir: Path, monkeypatch
+):
+    """REVERT-PROOF: concede ownership and all three go red, exactly.
+
+    The three fixtures above would still pass against a miner that fixed
+    the hijack some other way — or against one that never had it. This
+    disables the ONE mechanism that closes it, by making every candidate
+    claim it owns the bore's mouth, which is precisely what
+    "outermost cap wins" meant before round 4. Each fixture must then
+    report the round-3 number, to the bit.
+
+    So the fixtures are pinned to the mechanism and not merely to the
+    outcome: delete `_mouth_owns_axis`, or stop calling it, and this test
+    is the one that says which change did it.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    monkeypatch.setattr(
+        holes_mod, "_mouth_owns_axis", lambda edges, origin, direction: True
+    )
+
+    hijacked = _mine(fixtures_dir / "bore_beside_chamfered_edge.step")
+    assert len(hijacked) == 1
+    _approx(hijacked[0].depth_mm, 22.0)
+
+    hijacked = _mine(fixtures_dir / "blind_bore_beside_chamfered_edge.step")
+    assert len(hijacked) == 1
+    _approx(hijacked[0].depth_mm, 14.0)
+    _approx_vec(hijacked[0].entry_point_mm, (32.0, 20.0, 22.0))
+
+    hijacked = _mine(fixtures_dir / "bore_beside_concave_corner_fillet.step")
+    assert len(hijacked) == 1
+    _approx(hijacked[0].depth_mm, 26.0 - math.sqrt(27.0))
+
+
+def _winning_caps(monkeypatch, path: Path):
+    """Mine `path`, returning the (face, point) of every cap that WON an end.
+
+    `_cap_says_open` is called once per winning cap and on nothing else —
+    `_EndEvidence.resolve` reads it only after the contest is settled —
+    so spying on it is how a test gets hold of the face the miner
+    actually measured to, without reaching into the walk.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    seen = []
+    original = holes_mod._cap_says_open
+
+    def spy(face, point, outward, normal=None):
+        seen.append((face, point))
+        return original(face, point, outward, normal)
+
+    monkeypatch.setattr(holes_mod, "_cap_says_open", spy)
+    _mine(path)
+    return seen
+
+
+def test_r4_a_closed_mouth_is_what_carries_every_committed_cap(
+    fixtures_dir: Path, monkeypatch
+):
+    """The ownership rule reaches the older fixtures by its EXACT arm.
+
+    `_mouth_owns_axis` has two arms — a mouth that CLOSES on itself, and
+    an open CHAIN judged against its own chord — plus an "unreadable"
+    answer that leaves the pre-round-4 contest standing. Every cap on
+    every pre-round-4 fixture takes the closed arm, which is why none of
+    their numbers moved by a bit; the round-4 parts are the only
+    committed ones that reach the chord.
+
+    Worth pinning because it is the claim the whole round rests on. If a
+    future change starts routing an ordinary through-hole down the
+    unproven answer, that hole's depth is one edge case away from falling
+    back to the parametric bound, and nothing else here would say so.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    mouths = []
+    original = holes_mod._mouth_owns_axis
+
+    def spy(edges, origin, direction):
+        mouths.append(holes_mod._mouth_loose_ends(edges))
+        return original(edges, origin, direction)
+
+    monkeypatch.setattr(holes_mod, "_mouth_owns_axis", spy)
+
+    for name in (
+        "plate_4_through_holes",
+        "bore_through_spherical_dome",
+        "bore_through_nurbs_dome",
+        "bore_through_torus_wall",
+        "seam_split_bore",
+        "blind_hole_drill_point",
+        "stepped_bore",
+        "bore_over_centre_post",
+        "cross_drilled_shaft",
+    ):
+        mouths.clear()
+        _mine(fixtures_dir / f"{name}.step")
+        assert mouths, f"{name}: the ownership test was never consulted"
+        assert all(loose == [] for loose in mouths), (
+            f"{name}: a cap's mouth did not close — {mouths} — so its depth "
+            "now rests on the chord arm rather than on topology alone"
+        )
+
+
+def test_r4_an_on_face_trim_test_would_have_re_broken_the_domes(
+    fixtures_dir: Path, monkeypatch
+):
+    """Why ownership is asked of the MOUTH and not of the crossing point.
+
+    The obvious reading of "bound the root by the cap face's own trim" is
+    to project the axis crossing onto the face and ask whether it lands
+    ON it. That answers NO for every genuine curved cap the miner has,
+    because the crossing lands in the middle of the hole the bore itself
+    cut — and on the domes it falls outside the face's UV bounds as well.
+
+    Measured here rather than asserted, so the design note in
+    `_mouth_owns_axis` is a fact: a UV-in-bounds or a BRepClass on-face
+    gate would have reopened round 3's blocker 2 at both ends of the
+    spherical dome, the NURBS dome and the torus wall.
+    """
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepTopAdaptor import BRepTopAdaptor_FClass2d
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.gp import gp_Pnt, gp_Pnt2d
+    from OCP.ShapeAnalysis import ShapeAnalysis
+    from OCP.TopAbs import TopAbs_State
+
+    for name, curved in (
+        ("bore_through_spherical_dome", True),
+        ("bore_through_nurbs_dome", True),
+        ("bore_through_torus_wall", False),
+    ):
+        checked = 0
+        for face, point in _winning_caps(monkeypatch, fixtures_dir / f"{name}.step"):
+            surface = BRep_Tool.Surface_s(face)
+            projector = GeomAPI_ProjectPointOnSurf(gp_Pnt(*point), surface)
+            assert projector.IsDone() and projector.NbPoints() >= 1
+            u, v = projector.LowerDistanceParameters()
+
+            state = BRepTopAdaptor_FClass2d(face, 1e-7).Perform(gp_Pnt2d(u, v))
+            assert state == TopAbs_State.TopAbs_OUT, (
+                f"{name}: the winning cap's crossing classifies {state}. If "
+                "OCCT now reports it ON the face, an on-face gate has become "
+                "available and the mouth test's design note needs revisiting"
+            )
+
+            if curved:
+                _u_lo, _u_hi, v_lo, v_hi = ShapeAnalysis.GetFaceUVBounds_s(face)
+                assert not v_lo <= v <= v_hi, (
+                    f"{name}: the crown at v={v} lies inside the face's trim "
+                    f"[{v_lo}, {v_hi}] — a UV-in-bounds gate would have kept it"
+                )
+            checked += 1
+        assert checked, f"{name}: no winning cap was reached"
+
+
 # ── determinism ──────────────────────────────────────────────────────────
 
 
