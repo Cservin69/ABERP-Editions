@@ -115,13 +115,51 @@ that the code has to answer for:
   the bore's parametric span. The root nearest the EDGE that led to the
   face is the one that belongs to that end; the others are somebody
   else's end, or nobody's.
-- The bound check is what keeps a drill point out. A 118° point's
-  neighbour is a CONE, and a line down the cone's own axis meets it only
-  at the APEX — beyond the full-diameter cylinder, so outside the
-  parametric span, so discarded. The cylinder's own parametric end
-  stands, which is the full-diameter depth and the number on the drawing.
-  That is the same answer the planar-only version gave, reached the same
-  way; it is not a special case for cones.
+- A line can meet a surface without CROSSING it, and a bore only ends
+  where it crosses. A 118° point's neighbour is a CONE, and a line down
+  the cone's own axis meets it at exactly one point, the APEX — which the
+  axis touches and carries straight through, still in the same void. So
+  the cone does not move the end, and the cylinder's own parametric end
+  stands: the full-diameter depth, and the number on the drawing.
+
+CORRECTED AGAIN (ADR-0112 adversarial round 3, blockers 1 and 2). Round 2
+decided both of those by WHERE THE ROOT FELL — it had to lie inside the
+bore's parametric span — and that one test was standing in for two
+different questions it could not actually answer. "Is this a cap at all?"
+was answered correctly for a drill point only by the accident that a
+point's apex falls BELOW the bore. And "is this cap this end's?" was
+answered by a bound that is not the superset it was documented to be.
+The luck ran out in both directions at once:
+
+- **Blocker 1, the countersink.** The identical cone at the MOUTH of a
+  bore puts its apex INSIDE the span, where the span test admitted it as
+  the cap. A Ø8 through-bore with a 90° countersink measured 13.0 deep
+  against a true 17.0 — 23.5 % of the hole gone — and a blind one
+  reported its ENTRY four millimetres inside solid metal. Worse, the end
+  condition is read off the cap's normal and a cone's apex HAS no normal,
+  so what OCCT returned there was whichever generatrix its intersector
+  landed on: the 90° hole came back THROUGH and the 120° hole BLIND, for
+  the same shape of part.
+
+- **Blocker 2, the dome.** A doubly-curved CONVEX cap puts its crown
+  OUTSIDE the span, where the span test refused it. A dome's trim curve
+  never reaches the crown the axis leaves through, so a Ø8 bore through a
+  Ø40 ball measured 39.1918 against a true 40.0 and entered 0.4 mm inside
+  the metal. A singly-curved cap hid this for a whole round — a round bar
+  does not curve along its own axis, so its trim runs right up to the
+  crown and the root landed ON the old bound. It takes curvature in BOTH
+  directions to open the gap. At its worst the bore VANISHED: through a
+  torus wall, clipping the convex crown left the far end with no root but
+  the near end's concave one, both ends resolved to the same place, the
+  depth came out zero and a zero-deep bore is dropped. Zero holes on a
+  part with one.
+
+Both are fixed by asking the geometry the question the span was standing
+in for: does the axis CROSS this surface here? :func:`_crossing_normal`
+answers it, the drill point and the countersink now fall out of that ONE
+rule rather than out of their positions, and the bound — no longer doing
+work it was not fit for — relaxes to what it can honestly claim: a root
+past the bore's FAR end belongs to the other end, or to neither.
 
 Open or capped (ADR-0112 adversarial, B2 + N2)
 ------------------------------------------------
@@ -196,6 +234,15 @@ part                 round 1     round 2
 
 (a) every cap curved, so every end takes ``GeomAPI_IntCS`` rather than
 the analytic plane path — the worst case for the N1 work.
+
+Round 3's crossing test (:func:`_crossing_normal`) adds one
+``GeomLProp_SLProps`` per CURVED root, and nothing at all to a planar
+cap. Re-measured on the shape that bill lands hardest on — a bar with
+every cap curved, so every end takes the general path — mining goes
+0.037 s -> 0.038 s at 150 bores and 0.093 s -> 0.098 s at 300, about
+5 %. It buys a correct answer on a countersink and a dome, and it does
+not move the crossover: mining is ~0.3 ms per bore either way, against a
+STEP READER that is already the whole of the bill at these sizes.
 
 Crossover moves from ~600 holes to ~3800 (planar caps) and ~1800
 (all-curved). The miner is no longer what spends the budget at those
@@ -348,6 +395,69 @@ MAX_MERGE_GAP_FLOOR_MM: float = 1.0
 #: flat face square to the bore gives 1.0, a 45° angled entry 0.71, a
 #: 118° drill point -0.86.
 CAP_OUTWARD_MIN_COS: float = 1e-6
+
+#: Below this RATIO between the two surface-derivative magnitudes at a
+#: point, that point sits on a DEGENERATE isoline — a parametric line
+#: that has collapsed to a single point. A cone's apex and a sphere's
+#: pole are both such points, and the miner meets both: a countersink's
+#: cone and a domed cap are each swept about the bore's own axis, so the
+#: axis lands exactly on the degeneracy.
+#:
+#: A degeneracy floor, not a tuning knob, and measured with enormous
+#: margin on both sides. At a real degeneracy OCCT reports the collapsed
+#: derivative at ~1e-16 against ~1e0 for its partner — a ratio of 1e-16.
+#: At any regular point the two are within a few orders of magnitude of
+#: each other. Nothing real lives within nine orders of 1e-9.
+DEGENERATE_ISOLINE_RATIO: float = 1e-9
+
+#: How far out of ONE PLANE, as a sine, the isoline tangents around a
+#: collapsed isoline may lie before that point is ruled to have no
+#: tangent plane at all.
+#:
+#: This is the whole of the countersink fix, so it is worth stating what
+#: it separates. Every curve that runs INTO a smooth point leaves it
+#: along a tangent, and at a smooth point all of those tangents lie in
+#: one plane — the tangent plane. Sweep a sphere's pole and the meridian
+#: tangents sweep the equatorial plane: coplanar, so there is a tangent
+#: plane, so the axis genuinely crosses the surface there. Sweep a cone's
+#: apex and the generatrices sweep a CONE: not coplanar, so there is no
+#: tangent plane, so the axis only TOUCHES the apex, and a touch caps
+#: nothing.
+#:
+#: Asking the tangents rather than the normal is what makes this work on
+#: an imported B-spline. OCCT's ``Normal()`` is ``D1U ^ D1V``, and on a
+#: collapsed isoline one of those is zero, so the normal it reports is
+#: noise crossed with a real vector: at the pole of a NURBS-converted
+#: sphere it comes back as (0, -0.214, 0.977) and (-0.674, -0.026, 0.738)
+#: at neighbouring parameters, on a surface whose true normal is
+#: (0, 0, 1) everywhere along that line. Raising the derivative order
+#: does not rescue it. The surviving first derivative is exact, so this
+#: test uses only that, and recovers the true normal as the tangents'
+#: own plane.
+#:
+#: The margin is not close, and it does not depend on any step size,
+#: because nothing here is a limit taken numerically. Measured: an
+#: analytic sphere's pole 1.2e-16, a NURBS sphere's pole 2.0e-16. A 90°
+#: countersink 8.2e-01, a 120° countersink 7.7e-01, and even an absurd
+#: 170°-included cone 1.7e-01. Ten orders of margin below, five above.
+#: And it degrades the right way: a cone so shallow that its tangents are
+#: coplanar to within this floor is geometrically a flat cap, and reading
+#: it as one is right.
+#:
+#: Used twice, for the same kind of question: two tangents this close to
+#: PARALLEL span no plane to test against either.
+DEGENERATE_COPLANARITY_TOL: float = 1e-6
+
+#: How many directions of approach a degenerate point is probed from,
+#: spaced evenly over the collapsed isoline's full parametric range.
+#:
+#: Three is the minimum that can test coplanarity at all: two tangents
+#: DEFINE the plane and the third is the first that can fall out of it.
+#: Four is the smallest EVENLY SPACED set with a spare, so a degeneracy
+#: whose first two probes happen to land parallel — spanning no plane —
+#: still has a pair left to define one. It costs four surface
+#: evaluations at a point the miner reaches once per countersink.
+DEGENERATE_PROBE_DIRECTIONS: int = 4
 
 
 def _adaptor(face):
@@ -818,8 +928,11 @@ def _edge_mid_point(edge) -> Optional[Tuple[float, float, float]]:
     return (float(p.X()), float(p.Y()), float(p.Z()))
 
 
-def _plane_axis_intersection(face, origin, direction) -> Optional[float]:
-    """Where the bore's axis meets this face's (unbounded) plane.
+def _plane_axis_intersection(
+    face, origin, direction
+) -> Optional[Tuple[float, Tuple[float, float, float]]]:
+    """Where the bore's axis meets this face's (unbounded) plane, and the
+    plane's normal there.
 
     ``None`` when the face is not planar, or when the axis lies so nearly
     IN the plane that the intersection is numerically meaningless — a
@@ -849,12 +962,198 @@ def _plane_axis_intersection(face, origin, direction) -> Optional[float]:
         float(p.Y()) - origin[1],
         float(p.Z()) - origin[2],
     )
-    return _dot(to_plane, normal) / denom
+    return _dot(to_plane, normal) / denom, normal
 
 
-def _cap_axis_intersections(face, origin, direction) -> List[float]:
-    """Every point where the bore's axis meets this face's UNBOUNDED
-    surface, as axial parameters, for a cap of ANY shape (N1).
+def _isoline_tangent(surface, u, v, along_u) -> Optional[Tuple[float, float, float]]:
+    """Unit tangent of the isoline that is NOT collapsed at ``(u, v)``.
+
+    ``along_u`` says the collapsed isoline is the one traced by varying
+    U, so the surviving tangent is ``D1V``, and vice versa.
+    """
+    props = GeomLProp_SLProps(surface, u, v, 1, 1e-7)
+    d = props.D1V() if along_u else props.D1U()
+    vec = (float(d.X()), float(d.Y()), float(d.Z()))
+    if math.sqrt(vec[0] ** 2 + vec[1] ** 2 + vec[2] ** 2) <= 0.0:
+        return None
+    return _unit(vec)
+
+
+def _degenerate_point_normal(
+    surface, u, v, along_u, lo, hi, w_pole, w_min, w_max
+) -> Optional[Tuple[float, float, float]]:
+    """The tangent-plane normal at a point on a COLLAPSED isoline, or
+    ``None`` when the point has no tangent plane at all.
+
+    A collapsed isoline is a parametric line that is a single point in
+    space — a cone's apex, a sphere's pole, the seam of a B-spline
+    stitched shut. The miner meets them because a countersink's cone and
+    a domed cap are both swept about the bore's OWN axis, so the axis
+    lands exactly on the degeneracy rather than near it.
+
+    The surface has a tangent plane there iff every curve arriving at the
+    point arrives in ONE plane. Those arrivals are exactly the
+    non-collapsed isolines, sampled around the collapsed one at
+    :data:`DEGENERATE_PROBE_DIRECTIONS` evenly spaced parameters, and
+    their coplanarity is the whole test — see
+    :data:`DEGENERATE_COPLANARITY_TOL` for what it separates, why it is
+    asked of the TANGENTS rather than of OCCT's own reported normal, and
+    the measured margin.
+
+    The plane's normal is returned because it is the honest normal at
+    that point, and the caller needs one: it is what decides whether the
+    end opens to air, and at a B-spline pole it is a vector OCCT will not
+    give you any other way.
+
+    Its SENSE has to be OCCT's own, though, because what the caller does
+    with it is flip it for a REVERSED face — a convention that means
+    nothing unless the vector started out on the ``D1U ^ D1V`` side. A
+    cross product of two sampled tangents has no such allegiance, and
+    taking its sense on trust reads a domed through-hole as BLIND at
+    whichever of its two poles the parametrisation runs away from.
+
+    The correction is exact rather than sampled. Write the surface near
+    the collapsed line, whose parameter is ``w_pole``, as
+    ``P(t, w) ≈ P0 + (w - w_pole)·T(t)`` with ``T`` the surviving
+    tangent. Then the collapsed derivative is
+    ``(w - w_pole)·dT/dt``, so
+
+        D1U ^ D1V  ∝  -(w - w_pole) · (T ^ dT/dt)
+
+    while the tangents sampled here, taken in increasing ``t``, give
+    ``T ^ dT/dt`` with a PLUS sign. The two therefore agree exactly when
+    ``w - w_pole`` is negative — that is, when the surface lies BELOW the
+    collapsed line, which is to say when the line sits at the top of the
+    range. A sphere's north pole is at its ``v`` maximum and agrees; its
+    south pole is at the minimum and is opposite. So the sense is read
+    off which end of the range the degeneracy sits at, and that is all.
+    """
+    tangents = []
+    for k in range(DEGENERATE_PROBE_DIRECTIONS):
+        t = lo + (hi - lo) * k / DEGENERATE_PROBE_DIRECTIONS
+        tangent = (
+            _isoline_tangent(surface, t, v, along_u)
+            if along_u
+            else _isoline_tangent(surface, u, t, along_u)
+        )
+        if tangent is None:
+            return None
+        tangents.append(tangent)
+
+    normal = None
+    for other in tangents[1:]:
+        span = _cross(tangents[0], other)
+        spread = math.sqrt(span[0] ** 2 + span[1] ** 2 + span[2] ** 2)
+        if spread > DEGENERATE_COPLANARITY_TOL:
+            normal = _unit(span)
+            break
+    if normal is None:
+        # Every arrival is along the same line. That is a surface pinched
+        # to a spike, not a cap, and there is no plane to test the rest
+        # against; unproven reads "not a cap".
+        return None
+
+    for tangent in tangents:
+        if abs(_dot(tangent, normal)) > DEGENERATE_COPLANARITY_TOL:
+            return None
+
+    if abs(w_pole - w_max) > abs(w_pole - w_min):
+        normal = (-normal[0], -normal[1], -normal[2])
+    return normal
+
+
+def _crossing_normal(surface, u, v, direction) -> Optional[Tuple[float, float, float]]:
+    """The surface normal where the bore's axis CROSSES ``surface`` at
+    ``(u, v)`` — or ``None`` when the axis only TOUCHES it there.
+
+    ``GeomAPI_IntCS`` answers "the line meets the surface here". That is
+    not the same question as "the bore ends here", and the difference is
+    a countersink (ADR-0112 adversarial round 3, blocker 1).
+
+    A cap ends a bore because material stops at it: the axis is on one
+    side of the surface before it and the other side after. That needs a
+    surface with a TANGENT PLANE at the root, met at a non-zero angle.
+    Two ways a root can fail to be one, and both are met in practice:
+
+    - **Grazing.** The normal is perpendicular to the axis, so the bore
+      runs ALONG the surface rather than out of it, and which side it is
+      on is float noise. Refused at :data:`CAP_OUTWARD_MIN_COS` — the
+      same floor, for the same reason, that
+      :func:`_plane_axis_intersection` has always applied to a grazing
+      plane. This generalises that rule to every surface instead of
+      leaving it to the one that happened to have an analytic path.
+
+    - **A conical point.** The root sits on a collapsed isoline and the
+      surface has no tangent plane there at all. This is the countersink,
+      and it is the case round 2 got wrong: a coaxial cone meets the
+      bore's axis at exactly one point, its APEX, and OCCT reports that
+      as a perfectly ordinary intersection with a perfectly ordinary
+      normal. It is not ordinary. The apex is a point the axis touches
+      and carries on through the same void it was already in, and the
+      normal OCCT hands back there is whichever generatrix the
+      intersector happened to land on — a determinism hazard on top of a
+      wrong answer, and the reason two countersinks that differ only in
+      included angle came back one THROUGH and one BLIND.
+
+    A degeneracy is NOT by itself a disqualification, and that is the
+    whole delicacy of this test. A domed cap — a sphere, a barrel, a
+    NURBS bulge swept about the bore's own axis — puts its POLE on the
+    axis too, and a pole is degenerate in exactly the same parametric
+    way. The difference is geometric rather than parametric, and
+    :func:`_degenerate_point_normal` is where it is drawn.
+
+    What this buys, beyond the countersink: the drill point now falls out
+    of the SAME rule. Round 2 discarded a 118° point's apex because it
+    lay outside the bore's parametric span — which was true of a drill
+    point and an accident of where the apex happened to fall. The
+    identical cone at the MOUTH of the same bore falls INSIDE the span
+    and was kept. Both are conical points, neither is a cap, and neither
+    is special-cased now.
+    """
+    props = GeomLProp_SLProps(surface, u, v, 1, 1e-7)
+    d_u, d_v = props.D1U(), props.D1V()
+    mag_u = math.sqrt(d_u.X() ** 2 + d_u.Y() ** 2 + d_u.Z() ** 2)
+    mag_v = math.sqrt(d_v.X() ** 2 + d_v.Y() ** 2 + d_v.Z() ** 2)
+
+    u_min, u_max, v_min, v_max = surface.Bounds()
+    if mag_u <= DEGENERATE_ISOLINE_RATIO * mag_v:
+        lo, hi, along_u = u_min, u_max, True
+    elif mag_v <= DEGENERATE_ISOLINE_RATIO * mag_u:
+        lo, hi, along_u = v_min, v_max, False
+    else:
+        # A regular point. OCCT's own normal is trustworthy here.
+        if not props.IsNormalDefined():
+            return None
+        n = props.Normal()
+        normal = _unit((float(n.X()), float(n.Y()), float(n.Z())))
+        return normal if abs(_dot(direction, normal)) > CAP_OUTWARD_MIN_COS else None
+
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+        # No parametric range to sweep, so no set of arrivals to test for
+        # coplanarity and no tangent plane to be had. Unproven reads "not
+        # a cap", which loses the root and leaves the bore's own
+        # parametric end standing — the conservative, over-price
+        # direction. (The range swept is always the COLLAPSED parameter's,
+        # which is the "around" one and finite on every surface of
+        # revolution; a cone's unbounded range is its v, and v is the one
+        # that survives.)
+        return None
+
+    w_pole, w_min, w_max = (v, v_min, v_max) if along_u else (u, u_min, u_max)
+    normal = _degenerate_point_normal(
+        surface, u, v, along_u, lo, hi, w_pole, w_min, w_max
+    )
+    if normal is None:
+        return None
+    return normal if abs(_dot(direction, normal)) > CAP_OUTWARD_MIN_COS else None
+
+
+def _cap_axis_intersections(
+    face, origin, direction
+) -> List[Tuple[float, Tuple[float, float, float]]]:
+    """Every point where the bore's axis CROSSES this face's UNBOUNDED
+    surface, as an axial parameter paired with the surface normal there,
+    for a cap of ANY shape (N1).
 
     The planar case delegates to the analytic path above. Everything else
     — a shaft's OD, a spherical or barrelled top, a fillet, an imported
@@ -868,17 +1167,30 @@ def _cap_axis_intersections(face, origin, direction) -> List[float]:
     still passes through that point. (Same reason the axis is not
     intersected with the SOLID — see the module docstring.)
 
-    Returns ALL roots, unfiltered and unordered. A line meets a plane at
-    most once, but it meets a cylinder or a cone twice and a general
-    surface any number of times; deciding which root belongs to which end
-    of the bore needs the edge that led here, so the caller does it.
-    Degenerate contact — a line lying IN the surface — surfaces as a
-    ``GeomAPI_IntCS`` segment rather than a point and is dropped: a bore
-    running along its cap breaks out of nothing.
+    Returns every root at which the axis genuinely CROSSES the surface,
+    unordered. A line meets a plane at most once, but it meets a cylinder
+    or a cone twice and a general surface any number of times; deciding
+    which root belongs to which end of the bore needs the edge that led
+    here, so the caller does it.
+
+    Roots the axis merely TOUCHES are not returned — see
+    :func:`_crossing_normal`, which is what keeps a countersink's cone and
+    a drill point's cone out by the same rule. Degenerate contact along a
+    whole line — a line lying IN the surface — surfaces as a
+    ``GeomAPI_IntCS`` segment rather than a point and is dropped for the
+    same reason: a bore running along its cap breaks out of nothing.
+
+    The NORMAL travels with the root rather than being re-derived from
+    the point later, and that is not only to save a projection. At a
+    B-spline pole — a domed cap on an imported part — projecting the
+    point back onto the surface and asking OCCT for a normal returns
+    noise (see :data:`DEGENERATE_COPLANARITY_TOL`). The vector computed
+    here is the one the geometry actually has, and the openness verdict
+    is entitled to it.
     """
-    t_plane = _plane_axis_intersection(face, origin, direction)
-    if t_plane is not None:
-        return [t_plane]
+    planar = _plane_axis_intersection(face, origin, direction)
+    if planar is not None:
+        return [planar]
     if _adaptor(face).GetType() == GeomAbs_SurfaceType.GeomAbs_Plane:
         # Planar but grazing — the analytic path already refused it, and
         # handing the same grazing case to the general intersector would
@@ -897,17 +1209,29 @@ def _cap_axis_intersections(face, origin, direction) -> List[float]:
     intersector = GeomAPI_IntCS(line, surface)
     if not intersector.IsDone():
         return []
-    roots: List[float] = []
+    roots: List[Tuple[float, Tuple[float, float, float]]] = []
     for i in range(1, intersector.NbPoints() + 1):
+        u, v, _w = intersector.Parameters(i)
+        normal = _crossing_normal(surface, u, v, direction)
+        if normal is None:
+            continue
         p = intersector.Point(i)
+        # The axial parameter is taken from the POINT rather than from
+        # the line parameter ``_w`` the intersector also returns. They are
+        # the same number — ``Geom_Line`` is unit-speed from ``origin``
+        # along ``direction`` — and this is the arithmetic that was here
+        # before, kept so that no answer moves by a last bit.
         roots.append(
-            _dot(
-                (
-                    float(p.X()) - origin[0],
-                    float(p.Y()) - origin[1],
-                    float(p.Z()) - origin[2],
+            (
+                _dot(
+                    (
+                        float(p.X()) - origin[0],
+                        float(p.Y()) - origin[1],
+                        float(p.Z()) - origin[2],
+                    ),
+                    direction,
                 ),
-                direction,
+                normal,
             )
         )
     return roots
@@ -947,41 +1271,67 @@ def _outward_normal(face, point) -> Optional[Tuple[float, float, float]]:
             normal = _unit((float(n.X()), float(n.Y()), float(n.Z())))
     except Exception:  # noqa: BLE001 — an unreadable cap has no verdict
         return None
+    return _orient(face, normal)
+
+
+def _orient(face, normal: Sequence[float]) -> Tuple[float, float, float]:
+    """Turn a GEOMETRIC surface normal into the SOLID's outward one.
+
+    Which side of a surface the material sits on is carried by the face's
+    orientation flag, exactly as in :func:`_is_bore_face`, so a REVERSED
+    face flips it. Split out of :func:`_outward_normal` because a cap
+    reached through :func:`_cap_axis_intersections` already HAS its
+    geometric normal and only needs this half.
+    """
     if face.Orientation() == TopAbs_REVERSED:
         return (-normal[0], -normal[1], -normal[2])
-    return normal
+    return (normal[0], normal[1], normal[2])
 
 
-def _cap_says_open(face, point, outward: Sequence[float]) -> bool:
+def _cap_says_open(face, point, outward: Sequence[float], normal=None) -> bool:
     """Does the material stop at this cap, in the direction ``outward``?
 
     The whole of the through/blind decision, in one dot product. See the
     module docstring's "Open or capped" for why this replaced 36
     point-in-solid queries per bore, and why an undecidable answer reads
     CAPPED rather than open.
+
+    ``normal`` is the cap's GEOMETRIC surface normal where the axis
+    crossed it, when the caller already knows it — which the cap walk
+    does, because :func:`_cap_axis_intersections` computed it to decide
+    the root was a crossing at all. Passing it through is exact where
+    re-deriving it is not: at a B-spline pole the projection route
+    returns noise. Callers holding only a POINT on the face — the
+    neighbours that merely touch an end — leave it ``None`` and take the
+    projection route.
     """
-    normal = _outward_normal(face, point)
     if normal is None:
+        oriented = _outward_normal(face, point)
+    else:
+        oriented = _orient(face, normal)
+    if oriented is None:
         return False
-    return _dot(normal, outward) > CAP_OUTWARD_MIN_COS
+    return _dot(oriented, outward) > CAP_OUTWARD_MIN_COS
 
 
 class _EndEvidence:
     """What the cap walk found at ONE end of a bore.
 
-    ``caps`` are (axial parameter, face, 3-D point) triples from
-    neighbours whose surface the axis actually meets inside the bore's
-    parametric span. ``touching`` is every neighbour at this end paired
+    ``caps`` are (axial parameter, face, 3-D point, surface normal)
+    quadruples from neighbours whose surface the axis actually CROSSES in
+    range of this end. ``touching`` is every neighbour at this end paired
     with a point on the shared edge, including the ones that produced no
-    usable intersection — a drill point's cone caps the bore without its
-    axis ever meeting it inside the span, and it still gets a vote on
-    whether the end is open.
+    usable crossing — a drill point's cone caps the bore without its axis
+    ever crossing it, and it still gets a vote on whether the end is
+    open.
     """
 
     __slots__ = ("caps", "touching")
 
     def __init__(self):
-        self.caps: List[Tuple[float, object, Tuple[float, float, float]]] = []
+        self.caps: List[
+            Tuple[float, object, Tuple[float, float, float], Tuple[float, float, float]]
+        ] = []
         self.touching: List[Tuple[object, Tuple[float, float, float]]] = []
 
     def resolve(
@@ -1018,12 +1368,13 @@ class _EndEvidence:
             # two ties agree on t by definition), but the openness verdict
             # reads the FACE, which they need not agree on.
             winners = [
-                (face, point)
-                for t_cap, face, point in self.caps
+                (face, point, normal)
+                for t_cap, face, point, normal in self.caps
                 if sign * t_cap >= furthest - 1e-9
             ]
             return sign * furthest, all(
-                _cap_says_open(face, point, outward) for face, point in winners
+                _cap_says_open(face, point, outward, normal)
+                for face, point, normal in winners
             )
         if not self.touching:
             return fallback_t, False
@@ -1087,10 +1438,31 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
 
     Two filters on every candidate root:
 
-    - It must lie inside the parametric span. Those bounds are a strict
-      SUPERSET of the truth (an angled trim's ellipse runs past the real
-      end), so anything outside them belongs to a different feature. This
-      is what discards a drill point's cone apex.
+    - It must not lie past the bore's FAR bound. A root beyond the other
+      end of the bore belongs to that end, or to neither.
+
+      This bound used to be two-sided — the root had to lie inside the
+      parametric span at both ends — on the reasoning that the span is a
+      strict SUPERSET of the truth because an angled trim's ellipse runs
+      past the real end. That is true of a planar cap and of a concave
+      one, and it is FALSE of a doubly-curved CONVEX one (ADR-0112
+      adversarial round 3, blocker 2). A dome's trim curve never reaches
+      its crown: a Ø8 bore through a Ø40 ball is trimmed at z = ±19.5959
+      and leaves the material at ±20, so the truth sat 0.4 mm OUTSIDE the
+      "superset" and was thrown away at both ends. The bore came back
+      39.1918 deep against a true 40, entering 0.4 mm inside solid metal.
+
+      A singly-curved cap hid it. A bore through a round bar is trimmed
+      right up to the crown — the bar does not curve along its own axis —
+      so its root lands ON the old bound and squeaked through. It takes
+      curvature in BOTH directions to open the gap.
+
+      Relaxing the bound outward can only ADD roots, never move one that
+      was already accepted, which is why no planar or singly-curved
+      answer shifts by a bit. What keeps the relaxation honest is that a
+      root outside the span is no longer discarded for being outside it,
+      but for not being a crossing at all — see
+      :func:`_axis_crosses_surface`.
     - Of the roots that survive, only the one NEAREST THE EDGE that led
       to this face is kept. A line crosses a shaft's OD twice, and the
       far crossing is the other end of the bore, not this one.
@@ -1115,21 +1487,31 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
                 edge_point = _edge_mid_point(edge)
                 if edge_point is None:
                     continue
-                end = low if t_edge < mid else high
+                at_low = t_edge < mid
+                end = low if at_low else high
+                # The far bound for THIS end: a low-end cap may lie as far
+                # below the bore as its own curvature carries it, but not
+                # above the high end.
+                far = p_hi + pad if at_low else p_lo - pad
                 for face in neighbours:
                     if any(face.IsSame(own) for own in group.faces):
                         continue
                     end.touching.append((face, edge_point))
                     roots = [
-                        t
-                        for t in _cap_axis_intersections(face, origin, direction)
-                        if p_lo - pad <= t <= p_hi + pad
+                        root
+                        for root in _cap_axis_intersections(face, origin, direction)
+                        if (root[0] <= far if at_low else root[0] >= far)
                     ]
                     if not roots:
                         continue
-                    t_cap = min(roots, key=lambda t: abs(t - t_edge))
+                    t_cap, normal = min(roots, key=lambda root: abs(root[0] - t_edge))
                     end.caps.append(
-                        (t_cap, face, _point_on_axis(origin, direction, t_cap))
+                        (
+                            t_cap,
+                            face,
+                            _point_on_axis(origin, direction, t_cap),
+                            normal,
+                        )
                     )
             except Exception:  # noqa: BLE001 — one odd edge must not kill the bore
                 continue

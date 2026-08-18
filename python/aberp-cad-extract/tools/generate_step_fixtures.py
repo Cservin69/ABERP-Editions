@@ -38,10 +38,13 @@ from pathlib import Path
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
 from OCP.BRepAdaptor import BRepAdaptor_Curve
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+from OCP.BRepBuilderAPI import BRepBuilderAPI_NurbsConvert
 from OCP.BRepPrimAPI import (
     BRepPrimAPI_MakeBox,
     BRepPrimAPI_MakeCone,
     BRepPrimAPI_MakeCylinder,
+    BRepPrimAPI_MakeSphere,
+    BRepPrimAPI_MakeTorus,
 )
 from OCP.GeomAbs import GeomAbs_CurveType
 from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
@@ -531,6 +534,206 @@ def bore_over_centre_post():
     ).Shape()
 
 
+# ── the ADR-0112 adversarial round-3 fixtures (blockers 1 and 2) ─────────
+#
+# Round 2 generalised the cap walk from planar caps to any cap, and left
+# two families wrong. Both are here, and every one of these RED-lights the
+# round-2 miner with the number recorded in its test.
+#
+# Blocker 1 is the COUNTERSINK family: a cap that is a cone COAXIAL with
+# the bore. Round 2 met such a cone only ever at a drill POINT, where its
+# apex falls below the bore and was discarded for being out of parametric
+# range. The identical cone at the bore's MOUTH puts its apex INSIDE the
+# bore, where it was taken for the cap and cut the reported depth by the
+# apex's whole height.
+#
+# Blocker 2 is the DOUBLY-CURVED CONVEX cap: a dome, a barrel, an
+# imported bulge. A bore's trim curve on such a cap never reaches the
+# crown the axis leaves through, so the truth lies OUTSIDE the parametric
+# span that round 2 required roots to be inside, and was thrown away at
+# both ends. A singly-curved cap hid this — a round bar does not curve
+# along its own axis, so the trim runs right up to the crown.
+
+
+def _countersunk_bore(half_angle_deg: float, cs_top_radius: float):
+    """40 x 40 x 20 block, Ø8.0 through-bore, countersunk at the mouth.
+
+    The countersink runs from the bore's own Ø8 up to `cs_top_radius` at
+    the top face z=20 with the given half angle, so the full-diameter
+    cylinder ends at z = 20 - (cs_top_radius - 4) / tan(half_angle).
+    THAT is the depth: a countersink is not drilled depth, and neither is
+    a drill point.
+    """
+    drop = (cs_top_radius - 4.0) / math.tan(math.radians(half_angle_deg))
+    z_cs = 20.0 - drop
+    shape = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    shape = BRepAlgoAPI_Cut(shape, _cyl(20.0, 20.0, -5.0, 0, 0, 1, 4.0, 30.0)).Shape()
+    # Run the cone tool past the top face so the cut is unambiguous; the
+    # half angle, not the tool's height, sets where it lands.
+    over = drop + 3.0
+    cone = BRepPrimAPI_MakeCone(
+        gp_Ax2(gp_Pnt(20.0, 20.0, z_cs), gp_Dir(0, 0, 1)),
+        4.0,
+        4.0 + over * math.tan(math.radians(half_angle_deg)),
+        over,
+    ).Shape()
+    return BRepAlgoAPI_Cut(shape, cone).Shape()
+
+
+def countersunk_through_bore():
+    """Blocker 1's headline: a 90°-included countersink (45° half angle).
+
+    Full diameter runs z=0..17, then the countersink opens out to Ø14 at
+    the top face. The cone's apex sits at z=13, 4 mm INSIDE the bore, and
+    round 2 reported that as the hole's end: depth 13.0 against a true
+    17.0, 23.5 % of the hole missing.
+
+    Expected: 1 hole, Ø8.0, depth 17.0, axis (0,0,1), entry (20,20,0),
+    THROUGH.
+    """
+    return _countersunk_bore(45.0, 7.0)
+
+
+def countersunk_bore_120():
+    """The same defect at the other standard countersink angle.
+
+    120° included, so a 60° half angle: full diameter runs to
+    z = 20 - 3/tan(60°) = 18.2679 and the apex sits at 15.9585.
+
+    Two angles rather than one because round 2 did not merely mis-measure
+    this hole, it mis-CLASSIFIED it, and inconsistently: the 90° hole came
+    back THROUGH and the 120° hole BLIND. The end condition is read off
+    the cap's normal, and at a cone's apex there is no normal — OCCT
+    returns whichever generatrix the intersector happened to land on, so
+    the verdict turned on solver internals. Two angles pin that both are
+    now decided by geometry.
+
+    Expected: 1 hole, Ø8.0, depth 20 - 3/tan(60°), entry (20,20,0),
+    THROUGH.
+    """
+    return _countersunk_bore(60.0, 7.0)
+
+
+def chamfered_mouth_bore():
+    """A plain CHAMFERED mouth — the same cone, without the countersink name.
+
+    45° half angle again but only 1.5 mm across — an ordinary broken
+    edge, not a countersink — so full diameter runs z=0..18.5 and the
+    apex sits at 14.5. Here because a chamfered bore is the commonest
+    part in any shop and nothing about the defect needed a countersink;
+    anything conical and coaxial at the mouth triggered it.
+
+    Expected: 1 hole, Ø8.0, depth 18.5, entry (20,20,0), THROUGH.
+    """
+    return _countersunk_bore(45.0, 5.5)
+
+
+def countersunk_blind_bore():
+    """The countersink over a BLIND flat-bottomed bore.
+
+    40 x 40 x 20 block, Ø8 flat-bottomed bore from z=6 to z=17, 90°
+    countersink above it. Round 2 put the ENTRY at z=13 — the apex, a
+    point 4 mm inside solid metal that no drill can be started at — and
+    called the hole 7.0 deep against a true 11.0.
+
+    Expected: 1 hole, Ø8.0, depth 11.0, axis (0,0,-1), entry (20,20,17),
+    BLIND, flat_bottom=True.
+    """
+    shape = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    shape = BRepAlgoAPI_Cut(shape, _cyl(20.0, 20.0, 6.0, 0, 0, 1, 4.0, 11.0)).Shape()
+    cone = BRepPrimAPI_MakeCone(
+        gp_Ax2(gp_Pnt(20.0, 20.0, 17.0), gp_Dir(0, 0, 1)), 4.0, 10.0, 6.0
+    ).Shape()
+    return BRepAlgoAPI_Cut(shape, cone).Shape()
+
+
+def bore_through_spherical_dome():
+    """Blocker 2's headline: a Ø8 bore straight through a Ø40 ball.
+
+    The bore's axis runs through the centre, so it meets the sphere at
+    TRUE NORMAL INCIDENCE at both ends — the worst case, because that is
+    where a dome's trim curve falls furthest short of the crown. The trim
+    sits at z = ±sqrt(20² - 4²) = ±19.5959 and the material ends at ±20.
+
+    Expected: 1 hole, Ø8.0, depth 40.0, axis (0,0,1), entry (0,0,-20),
+    THROUGH. Round 2: 39.1918 deep, entering 0.4 mm inside solid metal.
+    """
+    ball = BRepPrimAPI_MakeSphere(gp_Pnt(0, 0, 0), 20.0).Shape()
+    return BRepAlgoAPI_Cut(ball, _cyl(0, 0, -30.0, 0, 0, 1, 4.0, 60.0)).Shape()
+
+
+def blind_bore_under_dome():
+    """The dome defect on a BLIND hole, where it moves the entry point.
+
+    A Ø10 flat-bottomed bore drilled DOWN into the same Ø40 ball from the
+    crown, bottoming at z=8. Depth is 12.0 and the entry is the crown
+    itself, (0,0,20).
+
+    Round 2 reported 11.3649 and put the entry at z=19.3649 — inside the
+    ball. Separate from the through arm because a through hole's error is
+    only a number, and a blind hole's error is also a coordinate somebody
+    posts to a machine.
+
+    Expected: 1 hole, Ø10.0, depth 12.0, axis (0,0,-1), entry (0,0,20),
+    BLIND, flat_bottom=True.
+    """
+    ball = BRepPrimAPI_MakeSphere(gp_Pnt(0, 0, 0), 20.0).Shape()
+    return BRepAlgoAPI_Cut(ball, _cyl(0, 0, 8.0, 0, 0, 1, 5.0, 30.0)).Shape()
+
+
+def bore_through_torus_wall():
+    """A Ø4 bore radially outward through the wall of a torus.
+
+    Major radius 12, minor 8, so the tube's wall runs from x=4 to x=20 on
+    the axis the bore is drilled along. Both caps are TOROIDAL: the bore
+    enters through the concave inner wall and leaves through the convex
+    outer one. Depth is 20 - 4 = 16.
+
+    This is the arm that shows the defect was not only a wrong number.
+    Round 2 clipped the convex crown at x=20 for being outside the
+    parametric span, so the far end had no root left but the CONCAVE
+    one at x=4 — the near end's. Both ends resolved to x=4, the bore
+    measured zero deep, and a hole that measures zero deep is dropped.
+    The part came back with NO holes at all: an under-count, silent, on
+    the side nobody sees.
+
+    Expected: 1 hole, Ø4.0, depth 16.0, axis (1,0,0), entry (4,0,0),
+    THROUGH. Round 2: zero holes.
+    """
+    torus = BRepPrimAPI_MakeTorus(
+        gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), 12.0, 8.0
+    ).Shape()
+    return BRepAlgoAPI_Cut(torus, _cyl(-1.0, 0, 0, 1, 0, 0, 2.0, 40.0)).Shape()
+
+
+def bore_through_nurbs_dome():
+    """The dome again, as a B-SPLINE rather than an analytic sphere.
+
+    ``BRepBuilderAPI_NurbsConvert`` turns the ball of
+    :func:`bore_through_spherical_dome` into the kind of surface an
+    imported customer part actually carries, and the geometry is
+    unchanged: depth 40.0, entry (0,0,-20).
+
+    It earns its place because the analytic sphere cannot see the harder
+    half of the problem. Both surfaces put a degenerate parametric POLE
+    exactly where the bore's axis leaves them, and a pole has to be told
+    apart from a cone's apex — but OCCT special-cases the analytic sphere
+    and returns the right normal there, while at the B-spline's pole it
+    returns noise ((0,-0.214,0.977) and (-0.674,-0.026,0.738) at
+    neighbouring parameters of a surface whose normal is (0,0,1) along
+    that whole line), and raising the derivative order does not help. A
+    fix that reads OCCT's normal at the pole passes the sphere and fails
+    this.
+
+    Expected: 1 hole, Ø8.0, depth 40.0, axis (0,0,1), entry (0,0,-20),
+    THROUGH — to fitting tolerance, not to the bit; it is a fitted
+    surface.
+    """
+    ball = BRepPrimAPI_MakeSphere(gp_Pnt(0, 0, 0), 20.0).Shape()
+    nurbs = BRepBuilderAPI_NurbsConvert(ball, True).Shape()
+    return BRepAlgoAPI_Cut(nurbs, _cyl(0, 0, -30.0, 0, 0, 1, 4.0, 60.0)).Shape()
+
+
 FIXTURES = {
     "plate_4_through_holes.step": plate_4_through_holes,
     "blind_hole_flat_bottom.step": blind_hole_flat_bottom,
@@ -553,6 +756,15 @@ FIXTURES = {
     "bore_into_fillet.step": bore_into_fillet,
     "bore_beside_concave_fillet.step": bore_beside_concave_fillet,
     "bore_over_centre_post.step": bore_over_centre_post,
+    # ADR-0112 adversarial round 3.
+    "countersunk_through_bore.step": countersunk_through_bore,
+    "countersunk_bore_120.step": countersunk_bore_120,
+    "chamfered_mouth_bore.step": chamfered_mouth_bore,
+    "countersunk_blind_bore.step": countersunk_blind_bore,
+    "bore_through_spherical_dome.step": bore_through_spherical_dome,
+    "blind_bore_under_dome.step": blind_bore_under_dome,
+    "bore_through_torus_wall.step": bore_through_torus_wall,
+    "bore_through_nurbs_dome.step": bore_through_nurbs_dome,
 }
 
 

@@ -812,6 +812,354 @@ def test_n2_surface_adaptors_never_compute_a_uv_restriction(fixtures_dir: Path):
     )
 
 
+# ── ADR-0112 adversarial round 3 — blockers 1 and 2 ──────────────────────
+#
+# Round 2 generalised the cap walk from PLANAR caps to any cap. Two
+# families were still wrong, and each is here with the number round 2
+# actually reported in its own failure message. Every one of these was run
+# against the round-2 miner and confirmed to fail before the fix landed.
+#
+# The two share a root cause worth naming, because it is what makes them
+# one fix and not two. Round 2 decided which intersections counted by
+# WHERE THEY FELL — a root had to lie inside the bore's parametric span.
+# That test stood in for two different questions it could not actually
+# answer: "is this a cap at all?" (a drill point's apex is not) and "is
+# this cap this end's?" It got the first right only by luck of position,
+# and the luck ran out in both directions at once. A coaxial cone at the
+# MOUTH of a bore puts its apex INSIDE the span, where the test admitted
+# it — blocker 1. A doubly-curved convex cap puts its crown OUTSIDE the
+# span, where the test refused it — blocker 2. Asking the geometry
+# instead — does the axis CROSS this surface here? — answers the first
+# question properly and lets the second bound relax.
+
+
+def test_r3_countersunk_through_bore_measures_the_bore_not_the_apex(
+    fixtures_dir: Path,
+):
+    """Blocker 1: a countersunk mouth must not shorten the hole.
+
+    A Ø8 through-bore in a 20 mm plate, countersunk 90° included at the
+    top. Full diameter runs z=0..17 and the countersink opens out above
+    it. The cone is COAXIAL with the bore, so the bore's axis meets its
+    surface at exactly one point — the APEX, at z=13, four millimetres
+    INSIDE the hole. Round 2 took that for the end of the bore and
+    reported 17 mm of drilling as 13.
+
+    Which is the same cone, in the same place, that a 118° drill point
+    puts at the other end of a hole — and round 2 got THAT right, because
+    a drill point's apex falls outside the bore rather than inside it.
+    Position was doing work that geometry should have been doing.
+    """
+    holes = _mine(fixtures_dir / "countersunk_through_bore.step")
+
+    assert len(holes) == 1, (
+        "a countersunk bore is one hole and the countersink is not a "
+        f"second one; got {[h.diameter_mm for h in holes]}"
+    )
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    assert hole.depth_mm == pytest.approx(17.0, abs=TOL), (
+        "depth must run to the end of the full-diameter bore, not to the "
+        f"countersink cone's apex; got {hole.depth_mm} (round 2 reported "
+        "13.0 — 23.5 % of the hole missing)"
+    )
+    _approx_vec(hole.entry_point_mm, (20.0, 20.0, 0.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, 1.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_r3_countersink_angle_does_not_decide_the_end_condition(
+    fixtures_dir: Path,
+):
+    """Blocker 1's classification arm: 120° included, same answer shape.
+
+    Round 2 did not merely mis-measure a countersunk hole, it
+    mis-CLASSIFIED it, and inconsistently: the 90° fixture above came back
+    THROUGH and this one BLIND. Both are through-holes. The end condition
+    is read off the cap's outward normal, and a cone's apex HAS no normal
+    — approach it along a different generatrix and you get a different
+    vector — so what OCCT returned there was whichever generatrix its
+    intersector happened to land on. The verdict turned on solver
+    internals, which is a determinism defect wearing a correctness
+    defect's clothes.
+
+    Depth is stated by construction: the full-diameter bore ends where a
+    60°-half-angle cone reaching Ø14 at the top face starts.
+    """
+    holes = _mine(fixtures_dir / "countersunk_bore_120.step")
+
+    assert len(holes) == 1, (
+        f"one hole, countersunk; got {[h.diameter_mm for h in holes]}"
+    )
+    hole = holes[0]
+    expected_depth = 20.0 - 3.0 / math.tan(math.radians(60.0))
+    _approx(hole.diameter_mm, 8.0)
+    assert hole.depth_mm == pytest.approx(expected_depth, abs=TOL), (
+        f"got {hole.depth_mm}; round 2 reported 15.958548, the apex"
+    )
+    _approx_vec(hole.entry_point_mm, (20.0, 20.0, 0.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH, (
+        "a countersunk through-hole is THROUGH at every countersink "
+        "angle; round 2 called this one BLIND while calling the 90° twin "
+        f"THROUGH; got {hole.end_condition}"
+    )
+
+
+def test_r3_chamfered_mouth_bore_keeps_its_full_depth(fixtures_dir: Path):
+    """Blocker 1 without the word "countersink".
+
+    The same defect on the commonest feature in any shop: a bore with a
+    plain 45° chamfer broken at its mouth. Nothing about the failure
+    needed a countersink — anything CONICAL and coaxial at the mouth
+    triggered it. Full diameter runs z=0..18.5; the apex sits at 14.5.
+    """
+    holes = _mine(fixtures_dir / "chamfered_mouth_bore.step")
+
+    assert len(holes) == 1, (
+        f"a chamfer is not a hole; got {[h.diameter_mm for h in holes]}"
+    )
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    assert hole.depth_mm == pytest.approx(18.5, abs=TOL), (
+        f"got {hole.depth_mm} (round 2 reported 14.5, the apex)"
+    )
+    _approx_vec(hole.entry_point_mm, (20.0, 20.0, 0.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_r3_countersunk_blind_bore_enters_at_the_mouth(fixtures_dir: Path):
+    """Blocker 1 on a blind hole, where it also moves the ENTRY POINT.
+
+    A Ø8 flat-bottomed bore from z=6 to z=17 under a 90° countersink.
+    Round 2 called it 7.0 deep and put the entry at z=13 — the cone's
+    apex, a point four millimetres inside solid metal. A wrong depth is a
+    wrong price; a wrong entry is a coordinate somebody posts to a
+    machine.
+
+    Also pins that the fix did not cost the BLIND classification or the
+    flat-bottom detection: the countersink is at the OPEN end, and the
+    open end is still where the hole is entered.
+    """
+    holes = _mine(fixtures_dir / "countersunk_blind_bore.step")
+
+    assert len(holes) == 1, (
+        f"one blind hole, countersunk; got {[h.diameter_mm for h in holes]}"
+    )
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    assert hole.depth_mm == pytest.approx(11.0, abs=TOL), (
+        f"got {hole.depth_mm} (round 2 reported 7.0)"
+    )
+    assert hole.entry_point_mm[2] == pytest.approx(17.0, abs=TOL), (
+        "the entry must be at the bore's mouth, not at the countersink "
+        f"cone's apex; got z={hole.entry_point_mm[2]} (round 2 put it at "
+        "13.0, inside the material)"
+    )
+    _approx_vec(hole.entry_point_mm, (20.0, 20.0, 17.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, -1.0))
+    assert hole.end_condition is HoleEndCondition.BLIND
+    assert hole.flat_bottom is True
+
+
+def test_r3_a_plain_bore_is_unchanged_to_the_bit():
+    """Blocker 1's control: no cone, no change, exactly.
+
+    The same 40 x 40 x 20 block and the same Ø8 through-bore as the
+    countersink fixtures, with the countersink NOT cut. Its depth is
+    20.0 and its entry (20,20,0), and this asserts EQUALITY rather than
+    approximate equality: the crossing test added for blocker 1 must not
+    move a plain bore's answer by a last bit, and `==` is the only way to
+    say that.
+
+    In memory rather than as a fixture because the point is that this
+    part is the countersink fixtures minus one cut, which a committed
+    STEP file would state less clearly than the four lines below.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    bore = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(20.0, 20.0, -5.0), gp_Dir(0, 0, 1)), 4.0, 30.0
+    ).Shape()
+    holes = mine_cylindrical_holes(BRepAlgoAPI_Cut(block, bore).Shape())
+
+    assert len(holes) == 1
+    hole = holes[0]
+    assert hole.depth_mm == 20.0, (
+        f"a plain bore's depth must be exactly 20.0, not {hole.depth_mm!r}"
+    )
+    assert hole.entry_point_mm == [20.0, 20.0, 0.0]
+    assert hole.diameter_mm == 8.0
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_r3_bore_through_a_spherical_dome_reaches_the_crown(fixtures_dir: Path):
+    """Blocker 2: a doubly-curved CONVEX cap, at true normal incidence.
+
+    A Ø8 bore straight through the centre of a Ø40 ball. The axis meets
+    the sphere square on at both ends, which is the worst case rather
+    than a special one: normal incidence is exactly where a dome's trim
+    curve falls furthest short of the crown the axis leaves through. The
+    trim sits at z = ±sqrt(20² - 4²) = ±19.5959 and the material ends at
+    ±20, so the truth lay 0.4 mm OUTSIDE the parametric span round 2
+    required roots to be inside, and was discarded at BOTH ends.
+
+    Both numbers are stated by construction, not measured.
+    """
+    holes = _mine(fixtures_dir / "bore_through_spherical_dome.step")
+
+    assert len(holes) == 1, (
+        f"the ball's own surface is not a hole; got {[h.diameter_mm for h in holes]}"
+    )
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    assert hole.depth_mm == pytest.approx(40.0, abs=TOL), (
+        "depth must run crown to crown; got "
+        f"{hole.depth_mm} (round 2 reported {2.0 * math.sqrt(384.0)})"
+    )
+    _approx_vec(hole.entry_point_mm, (0.0, 0.0, -20.0))
+    # …and the entry is ON the sphere. Pinned separately because that is
+    # the whole point: round 2 put it 0.4 mm inside solid metal.
+    entry = hole.entry_point_mm
+    assert math.sqrt(sum(c * c for c in entry)) == pytest.approx(20.0, abs=TOL), (
+        "the entry must lie on the Ø40 surface; it is "
+        f"{math.sqrt(sum(c * c for c in entry))} from the centre, not 20.0"
+    )
+    _approx_vec(hole.axis_unit, (0.0, 0.0, 1.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_r3_blind_bore_under_a_dome_enters_on_the_crown(fixtures_dir: Path):
+    """Blocker 2's blind arm — where the error is a coordinate.
+
+    A Ø10 flat-bottomed bore dropped into the same Ø40 ball from the
+    crown, bottoming at z=8. Round 2 reported 11.3649 deep entering at
+    z=19.3649, a point inside the ball.
+    """
+    holes = _mine(fixtures_dir / "blind_bore_under_dome.step")
+
+    assert len(holes) == 1, (
+        f"one blind hole under a dome; got {[h.diameter_mm for h in holes]}"
+    )
+    hole = holes[0]
+    _approx(hole.diameter_mm, 10.0)
+    assert hole.depth_mm == pytest.approx(12.0, abs=TOL), (
+        "got "
+        f"{hole.depth_mm} (round 2 reported {math.sqrt(375.0) - 8.0}, "
+        "measuring from the trim curve instead of the crown)"
+    )
+    assert hole.entry_point_mm[2] == pytest.approx(20.0, abs=TOL), (
+        "the entry must sit ON the crown; round 2 put it at 19.364917, "
+        f"inside the ball; got z={hole.entry_point_mm[2]}"
+    )
+    _approx_vec(hole.entry_point_mm, (0.0, 0.0, 20.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, -1.0))
+    assert hole.end_condition is HoleEndCondition.BLIND
+    assert hole.flat_bottom is True
+
+
+def test_r3_bore_through_a_torus_wall_is_not_dropped(fixtures_dir: Path):
+    """Blocker 2 at its worst: the hole DISAPPEARED.
+
+    A Ø4 bore radially outward through the wall of a torus of major
+    radius 12 and minor radius 8, so the wall runs from x=4 to x=20 along
+    the bore's axis. Both caps are toroidal — in through the concave
+    inner wall, out through the convex outer one — and the depth is 16.
+
+    What round 2 did here is the reason this arm exists. It clipped the
+    convex crown at x=20 for lying outside the parametric span, which
+    left the far end with no root of its own; the nearest surviving root
+    was the CONCAVE cap's, at x=4, the near end's. Both ends resolved to
+    x=4, the bore measured zero deep, and a zero-deep bore is dropped.
+    The part came back with NO HOLES AT ALL — an under-count, and a
+    silent one, which is the direction nobody sees.
+    """
+    holes = _mine(fixtures_dir / "bore_through_torus_wall.step")
+
+    assert len(holes) == 1, (
+        "a bore through a torus wall is a hole and the torus is not; got "
+        f"{[h.diameter_mm for h in holes]} (round 2 reported none at all)"
+    )
+    hole = holes[0]
+    _approx(hole.diameter_mm, 4.0)
+    assert hole.depth_mm == pytest.approx(16.0, abs=TOL), (
+        f"outer surface at x=20, inner at x=4; got {hole.depth_mm}"
+    )
+    _approx_vec(hole.entry_point_mm, (4.0, 0.0, 0.0))
+    _approx_vec(hole.axis_unit, (1.0, 0.0, 0.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_r3_bore_through_a_nurbs_dome_reaches_the_crown(fixtures_dir: Path):
+    """Blocker 2 on a B-SPLINE cap — the arm the analytic sphere cannot cover.
+
+    The same ball and the same bore as the spherical fixture, with the
+    solid run through ``BRepBuilderAPI_NurbsConvert`` first, which is the
+    kind of surface an imported customer part actually carries.
+
+    It is a separate test because a fix can pass the analytic sphere and
+    still fail this. Both surfaces put a degenerate parametric POLE
+    exactly where the bore's axis leaves them, and telling a smooth pole
+    from a cone's apex is the whole of the blocker-1 test — but OCCT
+    special-cases the analytic sphere and reports the right normal at its
+    pole, while at the B-spline's pole it reports noise: (0,-0.214,0.977)
+    and (-0.674,-0.026,0.738) at neighbouring parameters of a surface
+    whose true normal is (0,0,1) all along that line, and raising the
+    derivative order does not rescue it. A fix that trusts OCCT's normal
+    at a pole passes the sphere and fails here.
+
+    Looser than TOL on purpose, and only here: the surface is FITTED, so
+    the crown is where the fit put it, not where the algebra does.
+    """
+    holes = _mine(fixtures_dir / "bore_through_nurbs_dome.step")
+
+    assert len(holes) == 1, (
+        f"one bore through a fitted dome; got {[h.diameter_mm for h in holes]}"
+    )
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    assert hole.depth_mm == pytest.approx(40.0, abs=1e-9), (
+        "depth must run crown to crown on a fitted surface too; got "
+        f"{hole.depth_mm} (round 2 reported 39.191836)"
+    )
+    assert hole.entry_point_mm[2] == pytest.approx(-20.0, abs=1e-9), (
+        f"entry must be on the fitted crown; got z={hole.entry_point_mm[2]}"
+    )
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_r3_the_drill_point_and_the_countersink_are_one_rule(fixtures_dir: Path):
+    """The two cones, side by side, decided the same way.
+
+    A 118° drill point and a 90° countersink are the same surface — a
+    cone coaxial with the bore — differing only in which end of the hole
+    they sit at. Round 2 decided them by POSITION and so decided them
+    differently: the point's apex falls below the bore and was discarded,
+    the countersink's apex falls inside it and was taken for the cap.
+
+    Both are now discarded for the same reason, that a cone's apex is a
+    point the axis touches rather than a surface it crosses, and both
+    holes therefore measure to the end of their full-diameter cylinder.
+    This asserts the pair together, because the claim being pinned is
+    that they are ONE rule and not two: it reds if a later change
+    special-cases either.
+    """
+    point = _mine(fixtures_dir / "blind_hole_drill_point.step")
+    countersink = _mine(fixtures_dir / "countersunk_through_bore.step")
+
+    assert len(point) == 1 and len(countersink) == 1
+    # The drill point's full-diameter run is z=15..40 (the cone tapers
+    # below 15 to an apex at 15 - 4/tan(59°)); the countersink's is
+    # z=0..17 (the cone opens above 17 from an apex at 13). Each is its
+    # cylinder's own extent, and neither is moved by its cone.
+    _approx(point[0].depth_mm, 25.0)
+    _approx(countersink[0].depth_mm, 17.0)
+    assert point[0].end_condition is HoleEndCondition.BLIND
+    assert countersink[0].end_condition is HoleEndCondition.THROUGH
+
+
 # ── determinism ──────────────────────────────────────────────────────────
 
 
