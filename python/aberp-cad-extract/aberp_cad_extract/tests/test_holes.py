@@ -1290,9 +1290,17 @@ def test_r4_ownership_is_the_only_thing_holding_the_foreign_root_out(
     So the fixtures are pinned to the mechanism and not merely to the
     outcome: delete `_mouth_owns_axis`, or stop calling it, and this test
     is the one that says which change did it.
+
+    Round 5 put `_mouth_rims` in FRONT of the per-face test, so both have
+    to be conceded to get back to "outermost cap wins". Conceding the
+    rim rule alone leaves these three correct — which is the point of
+    `test_r5_the_round_4_per_face_arm_still_carries_its_own_fixtures`
+    below, and is why round 4's arm is still load-bearing rather than
+    dead code behind a newer rule.
     """
     import aberp_cad_extract.holes as holes_mod
 
+    monkeypatch.setattr(holes_mod, "_mouth_rims", lambda mouths: [])
     monkeypatch.setattr(
         holes_mod, "_mouth_owns_axis", lambda edges, origin, direction: True
     )
@@ -1333,33 +1341,37 @@ def _winning_caps(monkeypatch, path: Path):
     return seen
 
 
-def test_r4_a_closed_mouth_is_what_carries_every_committed_cap(
+def test_r5_one_closed_rim_of_one_face_carries_every_committed_cap(
     fixtures_dir: Path, monkeypatch
 ):
     """The ownership rule reaches the older fixtures by its EXACT arm.
 
-    `_mouth_owns_axis` has two arms — a mouth that CLOSES on itself, and
-    an open CHAIN judged against its own chord — plus an "unreadable"
-    answer that leaves the pre-round-4 contest standing. Every cap on
-    every pre-round-4 fixture takes the closed arm, which is why none of
-    their numbers moved by a bit; the round-4 parts are the only
-    committed ones that reach the chord.
+    Round 4 asked this of `_mouth_owns_axis` and its closed-mouth arm;
+    round 5 decides ownership on RIMS first, so the same claim is now
+    made of `_mouth_rims` — and it is the claim the whole round rests
+    on. Every capped end of every pre-round-4 fixture resolves through
+    exactly ONE closed rim contributed by exactly ONE face, which is why
+    none of their numbers moved by a bit. The corner parts are the only
+    committed ones whose rim spans several faces, and the slot-crossed
+    bore the only one with two rims at an end.
 
-    Worth pinning because it is the claim the whole round rests on. If a
-    future change starts routing an ordinary through-hole down the
-    unproven answer, that hole's depth is one edge case away from falling
-    back to the parametric bound, and nothing else here would say so.
+    Worth pinning because a rim that fails to close drops the end back to
+    the round-4 contest, and an end that reaches neither drops to the
+    parametric bound. If a future change starts routing an ordinary
+    through-hole down either fall-back, that hole's depth is one edge
+    case away from being a guess, and nothing else here would say so.
     """
     import aberp_cad_extract.holes as holes_mod
 
-    mouths = []
-    original = holes_mod._mouth_owns_axis
+    rims = []
+    original = holes_mod._mouth_rims
 
-    def spy(edges, origin, direction):
-        mouths.append(holes_mod._mouth_loose_ends(edges))
-        return original(edges, origin, direction)
+    def spy(mouths):
+        found = original(mouths)
+        rims.append((len(mouths), [len(keys) for keys, _edges in found]))
+        return found
 
-    monkeypatch.setattr(holes_mod, "_mouth_owns_axis", spy)
+    monkeypatch.setattr(holes_mod, "_mouth_rims", spy)
 
     for name in (
         "plate_4_through_holes",
@@ -1372,12 +1384,13 @@ def test_r4_a_closed_mouth_is_what_carries_every_committed_cap(
         "bore_over_centre_post",
         "cross_drilled_shaft",
     ):
-        mouths.clear()
+        rims.clear()
         _mine(fixtures_dir / f"{name}.step")
-        assert mouths, f"{name}: the ownership test was never consulted"
-        assert all(loose == [] for loose in mouths), (
-            f"{name}: a cap's mouth did not close — {mouths} — so its depth "
-            "now rests on the chord arm rather than on topology alone"
+        assert rims, f"{name}: the rim decomposition was never consulted"
+        assert all(shape == (1, [1]) for shape in rims), (
+            f"{name}: an end no longer resolves through a single closed rim "
+            f"of a single face — {rims} — so its depth now rests on a "
+            "fall-back rather than on topology alone"
         )
 
 
@@ -1434,6 +1447,484 @@ def test_r4_an_on_face_trim_test_would_have_re_broken_the_domes(
 
 
 # ── determinism ──────────────────────────────────────────────────────────
+
+
+# ---------------------------------------------------------------------------
+# ADR-0112 adversarial round 5 — a bore beside a DOUBLY-chamfered corner.
+#
+# Round 4 made a face earn the right to end a bore by having the bore's
+# MOUTH cut in it, and tested that against ONE neighbouring chamfer or
+# fillet. With one neighbour the true cap keeps 240 deg of the mouth and
+# clears half a turn on its own, so "does this face own more than half"
+# was a sufficient test. Chamfer the ADJACENT top edge as well — an
+# ordinary plate detail — and the mouth splits three ways with no face
+# holding half of it. Every face abstained, and the end fell through to
+# the outermost carrier surface: a chamfer plane 2-3 mm ABOVE a plate
+# that stops at z=20.
+#
+# The fix is to stop asking faces and start asking RIMS: the mouth's
+# arcs sum to the full turn however the faces divide it, so the whole
+# mouth is always evidence even when no part of it is. See
+# `_mouth_rims` and `_EndEvidence._rim_winner`.
+
+
+def test_r5_bore_beside_a_two_chamfer_corner_stops_at_the_plate(fixtures_dir: Path):
+    """Equal 6 mm chamfers on both top edges, Ø8 through-bore at (32, 32).
+
+    Both chamfer planes are ``· + z = 54`` and both meet the axis at
+    z=22, two millimetres above the metal. The mouth divides
+    150 deg / 105 deg / 105 deg between the flat top and the two
+    chamfers, so round 4's per-face test abstained on all three — and
+    then the two chamfers, TIED at z=22, had their sectors pooled into
+    one 210 deg chain that beat the real top outright. Pooling is sound
+    for faces sharing one cap seam; these are distinct faces that merely
+    agree on a number.
+    """
+    holes = _mine(fixtures_dir / "bore_beside_two_chamfers_corner.step")
+
+    assert len(holes) == 1, f"got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    assert hole.depth_mm == pytest.approx(20.0, abs=TOL), (
+        f"depth must be the plate's 20.0; got {hole.depth_mm} "
+        "(round 4 reported 22.0, above the part)"
+    )
+    _approx_vec(hole.entry_point_mm, (32.0, 32.0, 0.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, 1.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_r5_uneven_corner_chamfers_do_not_carry_the_end_off_the_part(
+    fixtures_dir: Path,
+):
+    """The same corner with 6 mm and 5 mm legs — no tie to pool.
+
+    The chamfers cross at z=22 and z=23 and the outermost simply won.
+    The mouth splits 168.59 / 115.18 / 76.23 deg, so the flat top misses
+    half a turn by 11.41 deg and abstains: the escape hatch, reached by
+    nothing more exotic than two different chamfers on one corner.
+    """
+    holes = _mine(fixtures_dir / "bore_beside_uneven_chamfer_corner.step")
+
+    assert len(holes) == 1, f"got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    assert hole.depth_mm == pytest.approx(20.0, abs=TOL), (
+        f"depth must be the plate's 20.0; got {hole.depth_mm} "
+        "(round 4 reported 23.0, 3 mm above the part)"
+    )
+    _approx_vec(hole.entry_point_mm, (32.0, 32.0, 0.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, 1.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+
+
+def test_r5_a_blind_bore_at_a_chamfered_corner_enters_on_the_part(
+    fixtures_dir: Path,
+):
+    """The corner's NEGATIVE control, and the one that moves a coordinate.
+
+    A miner that answered the corner by calling every bore near one
+    THROUGH would pass the two above and fail here. On a blind hole the
+    OPEN end carries the entry point, so the hijack put the entry at
+    z=22 — two millimetres of mid-air above the plate, a coordinate no
+    machine can reach.
+    """
+    holes = _mine(fixtures_dir / "blind_bore_beside_two_chamfers_corner.step")
+
+    assert len(holes) == 1, f"got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    assert hole.depth_mm == pytest.approx(12.0, abs=TOL), (
+        f"depth must be the drilled 12.0; got {hole.depth_mm} "
+        "(round 4 reported 14.0)"
+    )
+    assert hole.entry_point_mm[2] == pytest.approx(20.0, abs=TOL), (
+        "the entry must sit ON the top face at z=20; it is at "
+        f"{hole.entry_point_mm[2]} (round 4 put it at 22.0, in mid-air)"
+    )
+    _approx_vec(hole.entry_point_mm, (32.0, 32.0, 20.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, -1.0))
+    assert hole.end_condition is HoleEndCondition.BLIND
+    assert hole.flat_bottom is True
+
+
+def test_r5_a_bore_whose_axis_sits_on_a_chamfer_boundary_is_through(
+    fixtures_dir: Path,
+):
+    """Equal chamfers, bore at (32, 34): the axis ON where a chamfer starts.
+
+    y=34 is exactly where the y=40 chamfer begins, so that chamfer's
+    plane meets the axis at z=20 — the SAME level as the flat top. The
+    winning level is therefore a tie between two genuinely different
+    faces, and every one of them has to vote the end open for it to be
+    open. Pinned as a configuration this family has to get right, next
+    to the two above where the chamfers cross well outside the part.
+
+    Not a regression pin: this reads correctly on round 4 too, because
+    the defect it was built for — an INDIRECT carrier plane inverting one
+    face's outward normal — does not survive OCCT's STEP writer. The
+    test with teeth for that is
+    `test_r5_in_memory_corner_chamfer_is_where_the_indirect_plane_bites`.
+    """
+    holes = _mine(fixtures_dir / "bore_on_a_chamfer_corner_boundary.step")
+
+    assert len(holes) == 1, f"got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    _approx(hole.depth_mm, 20.0)
+    _approx_vec(hole.entry_point_mm, (32.0, 34.0, 0.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, 1.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH
+    assert hole.flat_bottom is False
+
+
+def test_r5_the_corner_fixtures_really_are_the_escape_hatch(
+    fixtures_dir: Path, monkeypatch
+):
+    """Guard the guard: these parts must reach the case they were built for.
+
+    Every corner fixture above would pass against a miner that still
+    decided ends per-face, if only some face happened to own half the
+    mouth. State the shape of the evidence out loud instead: at the high
+    end there are THREE mouth faces, they form ONE closed rim of four
+    edges, and NOT ONE of them owns the axis on its own. That triple is
+    what makes round 4's rule abstain, and it is the whole reason round 5
+    exists.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    seen = []
+    original = holes_mod._mouth_rims
+
+    def spy(mouths):
+        found = original(mouths)
+        seen.append((dict(mouths), found))
+        return found
+
+    monkeypatch.setattr(holes_mod, "_mouth_rims", spy)
+
+    for name in (
+        "bore_beside_two_chamfers_corner",
+        "bore_beside_uneven_chamfer_corner",
+        "bore_on_a_chamfer_corner_boundary",
+        "blind_bore_beside_two_chamfers_corner",
+    ):
+        seen.clear()
+        _mine(fixtures_dir / f"{name}.step")
+        corner = [(mouths, rims) for mouths, rims in seen if len(mouths) == 3]
+        assert len(corner) == 1, (
+            f"{name}: expected exactly one end with three mouth faces; "
+            f"got {[len(mouths) for mouths, _rims in seen]}"
+        )
+        mouths, rims = corner[0]
+        assert [(len(keys), len(edges)) for keys, edges in rims] == [(3, 4)], (
+            f"{name}: the corner mouth is no longer ONE closed rim spanning "
+            f"all three faces — {[(len(k), len(e)) for k, e in rims]}"
+        )
+        assert not any(
+            holes_mod._mouth_owns_axis(edges, (32.0, 32.0, 0.0), (0.0, 0.0, 1.0))
+            for edges in mouths.values()
+        ), (
+            f"{name}: some face now owns the axis on its own, so this part "
+            "no longer exercises the escape hatch round 5 is about"
+        )
+
+
+def test_r5_a_tie_at_one_level_is_not_a_shared_cap(fixtures_dir: Path):
+    """The tie-pooling half of the corner, stated as the numbers it turns on.
+
+    `_EndEvidence._owns` pools the mouths of every cap TIED at one axial
+    level, because a bore breaking out across a seam reaches one cap
+    along several arcs and only the pair of them closes the loop. On the
+    equal-leg corner that pooling misfires exactly: the two chamfers are
+    distinct faces that merely agree on a number, and pooled they make a
+    210 deg chain which DOES clear half a turn.
+
+    So the old rule did not merely abstain here — it was outvoted. The
+    tie at z=22 claims ownership and the real top at z=20 does not, and
+    "outermost owned wins" then picks the pair, off the part. Pinned as
+    that exact asymmetry, because it is what says the corner needed a
+    different question rather than a wider threshold.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    with _silence_stdout_fd():
+        shape = _load_step_shape(
+            str(fixtures_dir / "bore_beside_two_chamfers_corner.step")
+        )
+    faces = holes_mod._collect_faces(shape)
+    ancestors = holes_mod._EdgeFaces(faces)
+
+    groups = []
+    for face in faces:
+        cyl = holes_mod._face_to_cyl(face)
+        if cyl is None:
+            continue
+        for group in groups:
+            if group.accepts(cyl):
+                group.add(cyl)
+                break
+        else:
+            groups.append(holes_mod._BoreGroup(cyl))
+    bore = [group for group in groups if group.is_full_sweep()]
+    assert len(bore) == 1
+    group = bore[0]
+
+    _low, high = holes_mod._walk_caps(group, ancestors, group.lo, group.hi)
+    levels = sorted({cap[0] for cap in high.caps}, reverse=True)
+    assert levels == pytest.approx([22.0, 20.0], abs=TOL), (
+        f"the corner's high end should offer z=22 (both chamfers, tied) and "
+        f"z=20 (the plate's top); got {levels}"
+    )
+
+    tied = high._at(levels[0], 1.0)
+    assert len({cap[4] for cap in tied}) == 2, (
+        "the two chamfers must reach z=22 as TWO distinct faces for this to "
+        "be the pooling case at all"
+    )
+    assert high._owns(tied, group.origin, group.direction) is True, (
+        "the pooled tie no longer claims the mouth, so this part has stopped "
+        "exercising the defect: two distinct faces pooled into one 210 deg "
+        "chain is what beat the real cap"
+    )
+    assert (
+        high._owns(high._at(levels[1], 1.0), group.origin, group.direction) is False
+    ), (
+        "the plate's own top must NOT own the mouth on its own — it holds "
+        "150 deg of it — or the corner would never have been mis-mined"
+    )
+
+    # And the rim rule ignores that claim: the end is the plate's top.
+    assert high.resolve(group.hi, group.origin, group.direction, 1.0)[0] == (
+        pytest.approx(20.0, abs=TOL)
+    )
+
+
+def test_r5_the_corner_family_is_stable_under_a_reversed_walk(
+    fixtures_dir: Path, monkeypatch
+):
+    """S3 over the new machinery: rims must not depend on the walk order.
+
+    `_mouth_rims` is the first thing in the miner to build a union-find
+    over edges, and a union-find is exactly the kind of code whose
+    component ORDER — and therefore whose "outermost rim" — can follow
+    the order its input arrived in. OCCT does not contractually
+    guarantee explorer order across versions, so reverse it explicitly
+    and require the same answer to the bit.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    names = (
+        "bore_beside_two_chamfers_corner",
+        "bore_beside_uneven_chamfer_corner",
+        "bore_on_a_chamfer_corner_boundary",
+        "blind_bore_beside_two_chamfers_corner",
+    )
+    forward = {
+        name: [hole.model_dump() for hole in _mine(fixtures_dir / f"{name}.step")]
+        for name in names
+    }
+
+    original = holes_mod._collect_faces
+    monkeypatch.setattr(
+        holes_mod, "_collect_faces", lambda shape: list(reversed(original(shape)))
+    )
+    for name in names:
+        walked = [hole.model_dump() for hole in _mine(fixtures_dir / f"{name}.step")]
+        assert walked == forward[name], (
+            f"{name}: the face-walk order reached the output — "
+            f"forward={forward[name]} reversed={walked}"
+        )
+
+
+def test_r5_the_rim_rule_is_the_only_thing_holding_the_corner_together(
+    fixtures_dir: Path, monkeypatch
+):
+    """REVERT-PROOF: take the rim decomposition away and all three go red.
+
+    Disabling `_mouth_rims` drops every end back to round 4's per-face
+    contest, which is exactly the miner that shipped before this round.
+    Each corner fixture must then report its round-4 number, to the bit —
+    so these fixtures are pinned to the mechanism and not merely to the
+    outcome.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    monkeypatch.setattr(holes_mod, "_mouth_rims", lambda mouths: [])
+
+    hijacked = _mine(fixtures_dir / "bore_beside_two_chamfers_corner.step")
+    assert len(hijacked) == 1
+    _approx(hijacked[0].depth_mm, 22.0)
+
+    hijacked = _mine(fixtures_dir / "bore_beside_uneven_chamfer_corner.step")
+    assert len(hijacked) == 1
+    _approx(hijacked[0].depth_mm, 23.0)
+
+    hijacked = _mine(fixtures_dir / "blind_bore_beside_two_chamfers_corner.step")
+    assert len(hijacked) == 1
+    _approx(hijacked[0].depth_mm, 14.0)
+    _approx_vec(hijacked[0].entry_point_mm, (32.0, 32.0, 22.0))
+
+
+def test_r5_the_round_4_per_face_arm_still_carries_its_own_fixtures(
+    fixtures_dir: Path, monkeypatch
+):
+    """Round 4's rule is a live fall-back, not dead code behind a newer one.
+
+    With `_mouth_rims` disabled the four round-4 parts stay EXACT, which
+    is what says the per-face ownership test still works and still earns
+    its place. It is what answers an end whose mouth does not close — a
+    partial or unreadable rim — and round 5 deliberately left that path
+    standing rather than replacing it.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    monkeypatch.setattr(holes_mod, "_mouth_rims", lambda mouths: [])
+
+    for name, depth in (
+        ("bore_beside_chamfered_edge", 20.0),
+        ("blind_bore_beside_chamfered_edge", 12.0),
+        ("bore_beside_concave_corner_fillet", 20.0),
+        ("bore_inside_a_chamfer", 14.0),
+    ):
+        holes = _mine(fixtures_dir / f"{name}.step")
+        assert len(holes) == 1, f"{name}: got {[h.diameter_mm for h in holes]}"
+        assert holes[0].depth_mm == pytest.approx(depth, abs=TOL), (
+            f"{name}: round 4's own fixture no longer survives without the "
+            f"rim rule; got {holes[0].depth_mm}, want {depth}"
+        )
+
+
+def test_r5_in_memory_corner_chamfer_is_where_the_indirect_plane_bites():
+    """The openness half of round 5, before STEP normalises it away.
+
+    Built in memory for the same reason
+    `test_b5_in_memory_filleted_block_is_where_the_sweep_union_bites` is:
+    OCCT's STEP writer re-parametrises the carrier surface, and this
+    defect lives in the parametrisation. Chamfer two ADJACENT top edges
+    of a block and the second chamfer comes back on an INDIRECT
+    (left-handed) `gp_Ax3`, whose parametric normal is the NEGATION of
+    its `Axis().Direction()`. The face's FORWARD/REVERSED flag refers to
+    the parametric normal, so reading the axis direction alone inverts
+    that one face's outward normal — it votes "material continues" at a
+    genuine exit, and being tied at the winning level it vetoes the
+    opening. A Ø8 through-hole came back BLIND with a flat bottom, which
+    prices as a different cycle on a different machine.
+
+    OCCT's own `BRepClass3d_SolidClassifier` is the arbiter and agrees
+    with `_plane_normal`: material is on the side it now reports.
+    """
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+    from OCP.GeomAbs import GeomAbs_SurfaceType
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    import aberp_cad_extract.holes as holes_mod
+    from aberp_cad_extract.holes import mine_cylindrical_holes as mine
+
+    def one_edge(shape, want):
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GeomAbs import GeomAbs_CurveType
+        from OCP.TopAbs import TopAbs_EDGE
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopoDS import TopoDS
+
+        seen, chosen = [], []
+        explorer = TopExp_Explorer(shape, TopAbs_EDGE)
+        while explorer.More():
+            edge = TopoDS.Edge_s(explorer.Current())
+            explorer.Next()
+            if any(edge.IsSame(other) for other in seen):
+                continue
+            seen.append(edge)
+            curve = BRepAdaptor_Curve(edge)
+            if curve.GetType() != GeomAbs_CurveType.GeomAbs_Line:
+                continue
+            mid = curve.Value(0.5 * (curve.FirstParameter() + curve.LastParameter()))
+            if want(curve.Line().Direction(), mid):
+                chosen.append(edge)
+        assert len(chosen) == 1, f"expected 1 edge, found {len(chosen)}"
+        return chosen[0]
+
+    box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    maker = BRepFilletAPI_MakeChamfer(box)
+    maker.Add(
+        6.0,
+        one_edge(
+            box,
+            lambda d, p: abs(abs(d.Y()) - 1.0) <= 1e-9
+            and abs(p.X() - 40.0) <= 1e-6
+            and abs(p.Z() - 20.0) <= 1e-6,
+        ),
+    )
+    maker.Add(
+        6.0,
+        one_edge(
+            box,
+            lambda d, p: abs(abs(d.X()) - 1.0) <= 1e-9
+            and abs(p.Y() - 40.0) <= 1e-6
+            and abs(p.Z() - 20.0) <= 1e-6,
+        ),
+    )
+    axis = gp_Ax2(gp_Pnt(32.0, 34.0, -5.0), gp_Dir(0, 0, 1))
+    shape = BRepAlgoAPI_Cut(
+        maker.Shape(), BRepPrimAPI_MakeCylinder(axis, 4.0, 30.0).Shape()
+    ).Shape()
+
+    indirect = 0
+    for face in holes_mod._collect_faces(shape):
+        adaptor = BRepAdaptor_Surface(face)
+        if adaptor.GetType() != GeomAbs_SurfaceType.GeomAbs_Plane:
+            continue
+        if not adaptor.Plane().Position().Direct():
+            indirect += 1
+
+    # Guard the guard: without an indirect carrier this probe silently
+    # stops testing anything, so say so out loud instead.
+    assert indirect == 1, (
+        "this probe only means something while OCCT gives the second "
+        f"chamfer an INDIRECT plane; it reported {indirect} of them, so the "
+        "inverted-normal path it exists to cover is no longer reachable here"
+    )
+
+    holes = mine(shape)
+    assert len(holes) == 1, f"got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    _approx(hole.depth_mm, 20.0)
+    _approx_vec(hole.entry_point_mm, (32.0, 34.0, 0.0))
+    assert hole.end_condition is HoleEndCondition.THROUGH, (
+        f"a through-hole read {hole.end_condition}; the indirect chamfer "
+        "plane is voting with an inverted outward normal"
+    )
+    assert hole.flat_bottom is False
+
+
+def test_r5_ignoring_plane_handedness_re_breaks_the_corner_in_memory(
+    monkeypatch,
+):
+    """REVERT-PROOF for the handedness correction, on the same part.
+
+    Put `_plane_normal` back to reading `Axis().Direction()` alone — the
+    code that shipped through round 4 — and the in-memory corner bore
+    must go BLIND with a flat bottom again. Nothing else in the suite
+    can say this: every committed STEP fixture has direct planes only,
+    so the correction is inert on all of them by construction.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    def naive(plane):
+        direction = plane.Axis().Direction()
+        return holes_mod._unit(
+            (float(direction.X()), float(direction.Y()), float(direction.Z()))
+        )
+
+    monkeypatch.setattr(holes_mod, "_plane_normal", naive)
+
+    with pytest.raises(AssertionError, match="inverted outward normal"):
+        test_r5_in_memory_corner_chamfer_is_where_the_indirect_plane_bites()
 
 
 def test_s3_both_sides_drilled_is_stable_under_a_reversed_walk(

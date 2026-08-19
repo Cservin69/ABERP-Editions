@@ -880,6 +880,133 @@ def bore_beside_concave_corner_fillet():
     ).Shape()
 
 
+# ---------------------------------------------------------------- round 5.
+#
+# A bore beside a DOUBLY-chamfered part corner. Round 4 taught the miner
+# that a face has to have the bore's mouth cut in it before its surface
+# may say where the bore ends, and tested that with ONE neighbouring
+# chamfer or fillet, where the true cap keeps 240 deg of the mouth and
+# clears half a turn on its own. Chamfer the ADJACENT top edge as well —
+# an ordinary detail, on an ordinary plate — and the mouth splits three
+# ways with no face holding half of it, which is the round-5 blocker.
+#
+# Every number below is stated by construction. On the 40 x 40 x 20
+# block the x=40 chamfer of leg `a` runs from (40 - a, z=20) to (40,
+# z=20 - a), so its plane is `x + z = 60 - a`; the y=40 chamfer of leg
+# `b` is `y + z = 60 - b`. A bore on the axis (x0, y0) therefore meets
+# those two planes at z = 60 - a - x0 and z = 60 - b - y0, both ABOVE
+# the plate's real top at z=20 whenever the axis is inboard of the
+# chamfer. The plate still stops at 20.
+
+
+def _corner_chamfered_block(leg_x: float, leg_y: float):
+    """40 x 40 x 20 block, BOTH top edges at x=40 and y=40 chamfered.
+
+    `leg_x` chamfers the edge at x=40 (plane ``x + z = 60 - leg_x``) and
+    `leg_y` the one at y=40 (plane ``y + z = 60 - leg_y``). The two
+    chamfers meet over the corner, so a bore placed near it has three
+    different faces around its mouth.
+    """
+    box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    maker = BRepFilletAPI_MakeChamfer(box)
+    maker.Add(
+        leg_x,
+        _one_edge(
+            box,
+            lambda d, p: abs(abs(d.Y()) - 1.0) <= 1e-9
+            and abs(p.X() - 40.0) <= 1e-6
+            and abs(p.Z() - 20.0) <= 1e-6,
+        ),
+    )
+    maker.Add(
+        leg_y,
+        _one_edge(
+            box,
+            lambda d, p: abs(abs(d.X()) - 1.0) <= 1e-9
+            and abs(p.Y() - 40.0) <= 1e-6
+            and abs(p.Z() - 20.0) <= 1e-6,
+        ),
+    )
+    return maker.Shape()
+
+
+def bore_beside_two_chamfers_corner():
+    """The headline: equal 6 mm chamfers, Ø8 through-bore at (32, 32).
+
+    Both chamfer planes are ``· + z = 54`` and both cross the axis at
+    z = 22 — 2 mm above a plate that stops at 20. The mouth divides
+    150 deg / 105 deg / 105 deg between the flat top and the two
+    chamfers, so NO face holds half of it and round 4's per-face
+    ownership abstained on all three. Worse, the two chamfers TIE at
+    z=22, and pooling their sectors made one 210 deg chain that beat the
+    real top outright.
+
+    Expected: 1 hole, Ø8.0, depth 20.0, entry (32, 32, 0), axis (0,0,1),
+    THROUGH.  Round 4: depth 22.0, entry z=22, off the part.
+    """
+    return BRepAlgoAPI_Cut(
+        _corner_chamfered_block(6.0, 6.0), _cyl(32.0, 32.0, -5.0, 0, 0, 1, 4.0, 30.0)
+    ).Shape()
+
+
+def bore_beside_uneven_chamfer_corner():
+    """The same corner with UNEQUAL legs — 6 mm and 5 mm — at (32, 32).
+
+    No tie to pool this time: the chamfers cross the axis at z=22 and
+    z=23, and the outermost of them simply won. The mouth splits
+    168.59 / 115.18 / 76.23 deg, so the flat top misses half a turn by
+    11.41 deg and abstains — the escape hatch, reached by an ordinary
+    part with two different chamfers on it.
+
+    Expected: 1 hole, Ø8.0, depth 20.0, entry (32, 32, 0), axis (0,0,1),
+    THROUGH.  Round 4: depth 23.0, entry z=23, 3 mm off the part.
+    """
+    return BRepAlgoAPI_Cut(
+        _corner_chamfered_block(6.0, 5.0), _cyl(32.0, 32.0, -5.0, 0, 0, 1, 4.0, 30.0)
+    ).Shape()
+
+
+def bore_on_a_chamfer_corner_boundary():
+    """Equal 6 mm chamfers, bore at (32, 34) — the axis ON a chamfer's edge.
+
+    y=34 is exactly where the y=40 chamfer begins, so that chamfer's
+    plane meets the axis at z=20 — the same level as the flat top, and
+    the right answer for once. The position was never wrong here; the
+    OPENNESS was. The second chamfer OCCT builds on a block carries an
+    INDIRECT (left-handed) plane, whose parametric normal is the
+    negation of its ``Axis().Direction()``, and reading the axis
+    direction alone flipped that one face's outward normal. It voted
+    "material continues" at a genuine exit and, tied at the winning
+    level, vetoed the opening — so a through-hole came back BLIND with a
+    flat bottom, which prices as a different cycle.
+
+    Expected: 1 hole, Ø8.0, depth 20.0, entry (32, 34, 0), axis (0,0,1),
+    THROUGH, flat_bottom False.  Round 4: 20.0 BLIND, flat_bottom True.
+    """
+    return BRepAlgoAPI_Cut(
+        _corner_chamfered_block(6.0, 6.0), _cyl(32.0, 34.0, -5.0, 0, 0, 1, 4.0, 30.0)
+    ).Shape()
+
+
+def blind_bore_beside_two_chamfers_corner():
+    """The corner's NEGATIVE control: a bore that really is blind.
+
+    Same equal-chamfer corner and the same axis at (32, 32), but the Ø8
+    bore is flat-bottomed and stops 12 mm down. A miner that answered
+    the three parts above by simply calling every corner bore THROUGH
+    would pass all three and fail this one, and the entry point is the
+    coordinate that moves: on a blind hole the OPEN end carries it, so
+    the round-4 answer put the entry 2 mm above the plate in mid-air.
+
+    Expected: 1 hole, Ø8.0, depth 12.0, entry (32, 32, 20), axis
+    (0,0,-1), BLIND, flat_bottom=True.  Round 4: depth 14.0, entry
+    (32, 32, 22).
+    """
+    return BRepAlgoAPI_Cut(
+        _corner_chamfered_block(6.0, 6.0), _cyl(32.0, 32.0, 8.0, 0, 0, 1, 4.0, 30.0)
+    ).Shape()
+
+
 FIXTURES = {
     "plate_4_through_holes.step": plate_4_through_holes,
     "blind_hole_flat_bottom.step": blind_hole_flat_bottom,
@@ -916,6 +1043,11 @@ FIXTURES = {
     "blind_bore_beside_chamfered_edge.step": blind_bore_beside_chamfered_edge,
     "bore_beside_concave_corner_fillet.step": bore_beside_concave_corner_fillet,
     "bore_inside_a_chamfer.step": bore_inside_a_chamfer,
+    # ADR-0112 adversarial round 5.
+    "bore_beside_two_chamfers_corner.step": bore_beside_two_chamfers_corner,
+    "bore_beside_uneven_chamfer_corner.step": bore_beside_uneven_chamfer_corner,
+    "bore_on_a_chamfer_corner_boundary.step": bore_on_a_chamfer_corner_boundary,
+    "blind_bore_beside_two_chamfers_corner.step": blind_bore_beside_two_chamfers_corner,
 }
 
 

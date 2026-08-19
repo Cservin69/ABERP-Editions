@@ -200,6 +200,65 @@ mouth as a closed loop and none of their answers moves by a bit.
 :func:`_mouth_owns_axis` is the test, and it is exact — vertex parity and
 one sidedness comparison, no sampling and no tolerance to tune.
 
+CORRECTED AGAIN (ADR-0112 adversarial round 5, the corner). Ownership
+asked of ONE FACE is sufficient only while one face holds more than half
+the mouth, and round 4's three parts all had a single neighbour, where
+the true cap keeps 240 deg and clears half a turn comfortably. Chamfer
+the ADJACENT top edge of the same plate — a detail on almost every real
+part — and a bore beside the corner divides its mouth three ways: 150 /
+105 / 105 deg with equal 6 mm legs, 168.59 / 115.18 / 76.23 with legs of
+6 and 5. NO face clears half a turn, every one of them abstains, and the
+end falls through to the outermost carrier surface again. Measured
+against the real kernel on a 40 x 40 x 20 plate whose Zmax is 20.0:
+depth 22.0 with equal legs, 23.0 with uneven ones, and a blind variant
+entering at z=22 in mid-air. Sweeping twelve corner configurations,
+through and blind, 22 of 24 answers were wrong.
+
+Worse than abstention, the fall-back could be actively outvoted. Two
+faces TIED at one axial level had their mouth sectors pooled, on the
+reasoning that a bore breaking out across a seam reaches one cap along
+several arcs. The corner's two equal chamfers both cross the axis at
+z=22 and are pooled into a single 210 deg chain — which does clear half
+a turn, so the foreign PAIR won ownership outright. Pooling is sound for
+faces sharing one cap seam and unsound for distinct faces that merely
+agree on a number.
+
+So ownership moved from faces to RIMS. Pool the whole mouth at one end,
+split it into connected components by vertex identity, and keep the ones
+that CLOSE: those are the rims where the bore's wall stops. A rim has no
+blind spot, because its arcs sum to the full turn however the faces
+divide it — there is no threshold on any one face's share left to miss.
+It also draws the pooling line where the topology does: faces sharing a
+rim are one cap however far apart their carriers cross, and faces merely
+tying at a level are not. The outermost RIM wins the end, ranked on its
+own edges rather than on where an unbounded surface happens to cross, so
+round 4's hijack cannot come back; within that rim the bore ends at the
+INNERMOST crossing, because every face of a rim bounds the solid at the
+mouth and the axis leaves through the first one it reaches. That reading
+also cannot put an exit above the part, which is the whole failure class
+of rounds 4 and 5. A bore CROSSED by a slot still has two rims at one
+end and still measures out to the part's real face.
+:func:`_mouth_rims` is the test; round 4's per-face rule stays as the
+fall-back for an end whose mouth does not close, and still carries its
+own four fixtures on its own.
+
+One more thing round 5 found, unrelated to ownership and quieter. A
+plane's ``Axis().Direction()`` is its Z direction, which equals the
+parametric normal ``dU x dV`` only while the ``gp_Ax3`` is right-handed.
+OCCT hands out LEFT-handed ones readily — chamfer two adjacent top edges
+of a block and the second chamfer gets one — and a face's
+FORWARD/REVERSED flag refers to the PARAMETRIC normal, so reading the
+axis direction alone inverts that face's outward normal. It then votes
+"material continues" at a genuine exit and, tied at the winning level,
+vetoes the opening: a Ø8 through-hole read BLIND with a flat bottom,
+which prices as a different cycle. :func:`_plane_normal` is the
+correction, ``BRepClass3d_SolidClassifier`` is what settles which side
+the material is on, and the curved branch never had the bug because
+``GeomLProp_SLProps`` returns the parametric normal already. It is inert
+on every committed fixture — OCCT's STEP writer re-parametrises planes,
+so every one of them is direct — which is why the part that proves it is
+built in memory.
+
 Open or capped (ADR-0112 adversarial, B2 + N2)
 ------------------------------------------------
 
@@ -1019,6 +1078,39 @@ def _edge_mid_point(edge) -> Optional[Tuple[float, float, float]]:
     return (float(p.X()), float(p.Y()), float(p.Z()))
 
 
+def _plane_normal(plane) -> Tuple[float, float, float]:
+    """A ``gp_Pln``'s PARAMETRIC unit normal — the one the face's
+    FORWARD/REVERSED flag is defined against.
+
+    ``Axis().Direction()`` is the plane's Z direction, and for the
+    right-handed coordinate systems OCCT builds almost everywhere it IS
+    the parametric normal ``dU x dV``. It is not when the ``gp_Ax3`` is
+    LEFT-handed: there ``dU x dV`` is its NEGATION, while the face's
+    orientation flag still refers to the parametric one. Read the Z
+    direction alone and an indirect plane's OUTWARD normal comes back
+    inverted — the face reads as facing into the material when it faces
+    out of it (ADR-0112 adversarial round 5).
+
+    Not a hypothetical: chamfering two ADJACENT top edges of a plain
+    block gives the second chamfer an indirect carrier, and that one
+    face then answered every openness question backwards — a genuine
+    through-hole at the corner read BLIND with a flat bottom. OCCT's own
+    ``BRepClass3d_SolidClassifier`` puts the material on the side this
+    function now reports, and the curved branch of
+    :func:`_outward_normal` never had the bug: ``GeomLProp_SLProps``
+    returns the parametric normal already.
+
+    Inert on every part whose planes are direct, and the correction
+    cancels in :func:`_plane_axis_intersection`'s ratio, so no cap
+    POSITION moves by a bit either way.
+    """
+    n = plane.Axis().Direction()
+    normal = _unit((float(n.X()), float(n.Y()), float(n.Z())))
+    if plane.Position().Direct():
+        return normal
+    return (-normal[0], -normal[1], -normal[2])
+
+
 def _plane_axis_intersection(
     face, origin, direction
 ) -> Optional[Tuple[float, Tuple[float, float, float]]]:
@@ -1042,8 +1134,7 @@ def _plane_axis_intersection(
     if adaptor.GetType() != GeomAbs_SurfaceType.GeomAbs_Plane:
         return None
     plane = adaptor.Plane()
-    n = plane.Axis().Direction()
-    normal = _unit((float(n.X()), float(n.Y()), float(n.Z())))
+    normal = _plane_normal(plane)
     denom = _dot(direction, normal)
     if abs(denom) < 1e-6:
         return None
@@ -1343,8 +1434,7 @@ def _outward_normal(face, point) -> Optional[Tuple[float, float, float]]:
     try:
         adaptor = _adaptor(face)
         if adaptor.GetType() == GeomAbs_SurfaceType.GeomAbs_Plane:
-            n = adaptor.Plane().Axis().Direction()
-            normal = _unit((float(n.X()), float(n.Y()), float(n.Z())))
+            normal = _plane_normal(adaptor.Plane())
         else:
             surface = BRep_Tool.Surface_s(face)
             if surface is None:
@@ -1448,6 +1538,107 @@ def _mouth_loose_ends(edges) -> Optional[List[Tuple[float, float, float]]]:
     if not loose:
         return []
     return loose if len(loose) == 2 else None
+
+
+def _mouth_rims(mouths) -> List[Tuple[List[int], List]]:
+    """The bore's mouth at ONE end, split into complete RIMS.
+
+    ``mouths`` maps a face key to the edges that face shares with the
+    bore's own cylinders at this end. Pooled across every face, those
+    edges form one or more CLOSED loops — the rims where the bore's wall
+    stops. Returns ``(face keys, edges)`` per rim that closes, in a
+    deterministic order; ranking them is the caller's.
+
+    Why rims and not faces (ADR-0112 adversarial round 5). Round 4 asked
+    each face ALONE whether its share of the mouth surrounded the axis,
+    and gave the end to the outermost face that said yes. That is exact
+    only while ONE face owns more than half the mouth, and at a
+    doubly-chamfered part CORNER none does. Chamfer two adjacent top
+    edges of a plate — an ordinary shape, not a contrived one — and a
+    bore beside the corner splits its mouth three ways: 150 deg of flat
+    top and 105 deg of each chamfer on the equal-leg part, 168.59 /
+    115.18 / 76.23 when the legs differ. Every face answers "not mine",
+    and the fall-back handed the end to the OUTERMOST carrier surface,
+    which is a chamfer plane 2-3 mm above a part that stops at z=20.
+
+    A rim has no such blind spot, because it IS the whole mouth by
+    construction: its arcs sum to the full turn however the faces divide
+    it, so no threshold on any one face's share can be missed.
+
+    It also separates the two things a level-based test conflates.
+    Faces that merely TIE at one axial level are not thereby one cap —
+    the corner's two equal chamfers both cross the axis at z=22 and are
+    distinct faces, and pooling their sectors made a 210 deg "open
+    chain" that outvoted the real top. Faces that genuinely SHARE a rim
+    are one cap however far apart their carrier surfaces cross, which is
+    the seam-split bore the pooling was written for. Sharing a rim is a
+    topological fact about vertices; tying at a level is an arithmetic
+    coincidence, and only the first is evidence.
+
+    Connectivity and closure both come from vertex PARITY, for the
+    reason :func:`_mouth_loose_ends` gives at length: an interior joint
+    is shared by exactly two edges and a loose end by one, and
+    ``TopTools_IndexedMapOfShape`` hashes with ``IsSame`` semantics so
+    one vertex is ONE key however many edges and orientations reach it.
+    A rim arriving as one closed edge reports its single vertex twice,
+    which is even, and needs no special case.
+    """
+    index = TopTools_IndexedMapOfShape()
+    entries: List[Tuple[int, object, List[int]]] = []
+    for face_key, edges in sorted(mouths.items()):
+        for edge in edges:
+            vertices: List[int] = []
+            explorer = TopExp_Explorer(edge, TopAbs_VERTEX)
+            while explorer.More():
+                vertex = TopoDS.Vertex_s(explorer.Current())
+                explorer.Next()
+                vertices.append(index.Add(vertex))
+            entries.append((face_key, edge, vertices))
+    if not entries:
+        return []
+
+    # Union-find over edges that share a vertex. Roots are kept at the
+    # LOWEST member index so the component order is a function of the
+    # sorted face keys and not of OCCT's walk order (S3).
+    parent = list(range(len(entries)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    seen_at: dict = {}
+    for i, (_key, _edge, vertices) in enumerate(entries):
+        for vertex in vertices:
+            j = seen_at.setdefault(vertex, i)
+            root_i, root_j = find(i), find(j)
+            if root_i != root_j:
+                parent[max(root_i, root_j)] = min(root_i, root_j)
+
+    components: dict = {}
+    for i in range(len(entries)):
+        components.setdefault(find(i), []).append(i)
+
+    rims: List[Tuple[List[int], List]] = []
+    for root in sorted(components):
+        members = components[root]
+        parity: dict = {}
+        for i in members:
+            for vertex in entries[i][2]:
+                parity[vertex] = parity.get(vertex, 0) + 1
+        if any(count % 2 for count in parity.values()):
+            # An open chain: this end's mouth is not all here. No rim.
+            continue
+        keys: List[int] = []
+        rim_edges: List = []
+        for i in members:
+            key, edge, _vertices = entries[i]
+            if key not in keys:
+                keys.append(key)
+            rim_edges.append(edge)
+        rims.append((sorted(keys), rim_edges))
+    return rims
 
 
 def _mouth_owns_axis(edges, origin, direction) -> bool:
@@ -1627,6 +1818,68 @@ class _EndEvidence:
                     mouth.append(edge)
         return _mouth_owns_axis(mouth, origin, direction)
 
+    def _rim_winner(self, origin, direction, sign) -> Optional[Tuple[float, List]]:
+        """The level this end leaves through, and the caps that say so.
+
+        The round-5 rule, in three steps and no thresholds:
+
+        - Split this end's pooled mouth into complete RIMS
+          (:func:`_mouth_rims`). One bore end usually has exactly one;
+          a bore CROSSED by a slot has two, because the slot's own
+          opening is a second full loop in the same evidence pool.
+        - Rank rims by their OUTERMOST edge and take the winner. This is
+          what carries a bore past an interruption out to the part's
+          real face, and it is ranked on the rim's own edges — real
+          boundary of the real solid — rather than on where a carrier
+          surface happens to cross, so no unbounded plane can win a rim
+          it has no edge in. That was round 4's hijack.
+        - Within that rim, the bore ends at the INNERMOST crossing among
+          the rim's own faces. Every face of a rim bounds the solid at
+          the mouth, so going outward the axis leaves the material at
+          the FIRST of them it reaches; a face crossing further out has
+          had its material cut away before the axis gets there. On the
+          corner part that is min(20, 22, 23) = 20, the flat top, which
+          is where the plate actually ends.
+
+        The innermost reading is also the safe one. It can only report a
+        cap at or inside a crossing that some face of the rim genuinely
+        has, so it cannot put an exit in mid-air ABOVE the part — which
+        is the entire failure class rounds 4 and 5 are about (23.0 and
+        22.0 on a part whose Zmax is 20.0). Round 4's own concave
+        hijacker agrees with it: the R6 corner fillet crosses at
+        20.8038 and the true top at 20, and 20 is the answer.
+
+        ``None`` when no rim closes, which leaves the round-4 contest
+        standing rather than guessing — see :meth:`resolve`.
+        """
+        rims = _mouth_rims(self.mouths)
+        if not rims:
+            return None
+        ranked = []
+        for keys, edges in rims:
+            means = [_edge_axial_mean(edge, origin, direction) for edge in edges]
+            outer = [sign * mean for mean in means if mean is not None]
+            levels = [sign * cap[0] for cap in self.caps if cap[4] in keys]
+            if outer and levels:
+                ranked.append((max(outer), min(levels), len(edges), keys))
+        if not ranked:
+            return None
+        # Ranked outermost-rim first. Every tiebreak after that is a
+        # GEOMETRIC quantity — the rim's own crossing level, then how many
+        # edges it arrived in — because the face keys are handed out in
+        # OCCT's walk order, and S3 does not allow that order to reach the
+        # answer. Keys are the last resort and only separate two rims that
+        # agree on all three, which is a degenerate part rather than an
+        # ordinary one.
+        ranked.sort(key=lambda entry: (-entry[0], entry[1], -entry[2], entry[3]))
+        _outer, level, _count, keys = ranked[0]
+        winners = [
+            cap
+            for cap in self.caps
+            if cap[4] in keys and abs(sign * cap[0] - level) <= 1e-9
+        ]
+        return level, winners
+
     def resolve(
         self, fallback_t: float, origin, direction: Sequence[float], sign: float
     ) -> Tuple[float, bool]:
@@ -1666,16 +1919,20 @@ class _EndEvidence:
         """
         outward = (sign * direction[0], sign * direction[1], sign * direction[2])
         if self.caps:
-            levels = sorted({sign * cap[0] for cap in self.caps}, reverse=True)
-            winner_level = next(
-                (
-                    level
-                    for level in levels
-                    if self._owns(self._at(level, sign), origin, direction)
-                ),
-                levels[0],
-            )
-            winners = self._at(winner_level, sign)
+            decided = self._rim_winner(origin, direction, sign)
+            if decided is not None:
+                winner_level, winners = decided
+            else:
+                levels = sorted({sign * cap[0] for cap in self.caps}, reverse=True)
+                winner_level = next(
+                    (
+                        level
+                        for level in levels
+                        if self._owns(self._at(level, sign), origin, direction)
+                    ),
+                    levels[0],
+                )
+                winners = self._at(winner_level, sign)
             return sign * winner_level, all(
                 _cap_says_open(face, point, outward, normal)
                 for _t_cap, face, point, normal, _key in winners
