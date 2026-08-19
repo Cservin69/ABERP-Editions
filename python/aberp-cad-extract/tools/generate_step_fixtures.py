@@ -1007,6 +1007,169 @@ def blind_bore_beside_two_chamfers_corner():
     ).Shape()
 
 
+# ── ADR-0112 adversarial round 6 ─────────────────────────────────────────
+#
+# A bore whose mouth STRADDLES an edge of the part reaches two faces of
+# the outer skin, and only one of them is the skin over the AXIS. Round 5
+# took the innermost crossing over every face of the winning rim, which is
+# right while no part edge crosses the mouth's footprint and wrong the
+# moment one does: the face on the far side of that edge contributes the
+# crossing of its UNBOUNDED carrier, which runs on under the neighbouring
+# face and under the material.
+#
+# Every one of these under-reports on round 5, which is the direction that
+# costs money — a hole mined shallower than it is gets quoted for less
+# metal than the machine has to move, and on the blind bore it puts the
+# entry point inside solid stock.
+#
+# The straddle is the uncovered gap between `bore_into_fillet`, whose bore
+# lies WHOLLY INSIDE the fillet band, and the round-4 chamfer parts, whose
+# neighbour crosses ABOVE the true top and is thrown out by the innermost
+# rule for free. Straddling puts the neighbour's carrier BELOW it.
+
+
+def _rounded_edge_block(radius: float):
+    """40 x 40 x 20 block, top edge at x=40 rounded to `radius`.
+
+    The fillet face spans x in [40 - radius, 40]; its cylinder, unbounded,
+    has its axis at (40 - radius, y, 20 - radius) and dives away below
+    z=20 the moment x drops under 40 - radius. That dive is the whole
+    finding: at 6 mm of round the carrier is at z=18.4721 over an axis
+    4 mm inboard of where the fillet begins, and the plate is 20 thick.
+    """
+    box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    maker = BRepFilletAPI_MakeFillet(box)
+    maker.Add(
+        radius,
+        _one_edge(
+            box,
+            lambda d, p: abs(abs(d.Y()) - 1.0) <= 1e-9
+            and abs(p.X() - 40.0) <= 1e-6
+            and abs(p.Z() - 20.0) <= 1e-6,
+        ),
+    )
+    return maker.Shape()
+
+
+def bore_straddling_a_rounded_edge():
+    """`_rounded_edge_block(6)` with a Ø10 THROUGH bore at x=30.
+
+    The bore spans x = 25..35 and the round begins at x=34, so the mouth
+    straddles it: 286.26 deg of flat top and 73.74 deg of fillet. The axis
+    is 4 mm inboard of the fillet and the plate under it stops at z=20.
+
+    Expected: 1 hole, Ø10.0, depth 20.0, entry (30, 20, 0), THROUGH.
+    Round 5: depth 18.472136 — 14 + sqrt(36 - 16), the fillet's unbounded
+    cylinder, 1.53 mm of plate not quoted for.
+    """
+    return BRepAlgoAPI_Cut(
+        _rounded_edge_block(6.0), _cyl(30.0, 20.0, -5.0, 0, 0, 1, 5.0, 30.0)
+    ).Shape()
+
+
+def blind_bore_straddling_a_rounded_edge():
+    """The same straddle on a BLIND bore, where the error is a coordinate.
+
+    Ø10 from z=8 up. The bore ends on the plate's flat top at z=20, so it
+    is 12 deep and its entry point is on the skin. Round 5 put the entry
+    at z=18.472136 — 1.53 mm INSIDE solid metal, a point no drill ever
+    touches — and called the hole 10.472136 deep.
+
+    Expected: 1 hole, Ø10.0, depth 12.0, entry (30, 20, 20), axis
+    (0, 0, -1), BLIND, flat bottom.
+    """
+    return BRepAlgoAPI_Cut(
+        _rounded_edge_block(6.0), _cyl(30.0, 20.0, 8.0, 0, 0, 1, 5.0, 30.0)
+    ).Shape()
+
+
+def bore_straddling_a_concave_fillet():
+    """A straddle where the neighbour is CONCAVE and the axis is under IT.
+
+    A 40 x 40 x 20 block with a 10 mm rib standing 10 mm proud along
+    x >= 40, and the inside corner filleted R6. The fillet's cylinder has
+    its axis at (34, y, 26) and the fillet face spans x in [34, 40]; the
+    flat top is what is left, x < 34.
+
+    The Ø6 bore at x=36 spans x = 33..39, so the mouth straddles x=34 the
+    other way round from `bore_straddling_a_rounded_edge`: the flat top
+    holds 96.38 deg of it and the fillet 263.62 deg, and the AXIS is under
+    the fillet. The part over the axis therefore stops at
+    26 - sqrt(36 - 4) = 20.343146, ABOVE the flat top — so this is the
+    case where the innermost crossing of the whole rim is the one face
+    that is NOT there, and picking it loses material rather than
+    inventing it. It also pins that the fix is not "take the outermost":
+    the corner parts still need the innermost.
+
+    Expected: 1 hole, Ø6.0, depth 20.343146, entry (36, 20, 0), THROUGH.
+    Round 5: depth 20.0, the flat top's plane, 0.343 mm short.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    rib = BRepPrimAPI_MakeBox(gp_Pnt(40.0, 0, 0), 10.0, 40.0, 30.0).Shape()
+    fused = BRepAlgoAPI_Fuse(block, rib).Shape()
+    maker = BRepFilletAPI_MakeFillet(fused)
+    maker.Add(
+        6.0,
+        _one_edge(
+            fused,
+            lambda d, p: abs(abs(d.Y()) - 1.0) <= 1e-9
+            and abs(p.X() - 40.0) <= 1e-6
+            and abs(p.Z() - 20.0) <= 1e-6,
+        ),
+    )
+    return BRepAlgoAPI_Cut(
+        maker.Shape(), _cyl(36.0, 20.0, -5.0, 0, 0, 1, 3.0, 40.0)
+    ).Shape()
+
+
+def bore_through_a_domed_shoulder():
+    """A straddle at the LOW end, on a doubly-curved neighbour.
+
+    An R8 ball fused onto the block's top corner at (40, 20, 20), so the
+    sphere is the part's skin both ABOVE the block and OUTBOARD of it —
+    one face, reached at BOTH ends of a bore beside it.
+
+    The Ø8 bore at x=37 leaves through the dome at
+    20 + sqrt(64 - 9) = 27.416198 and enters through the block's flat
+    BOTTOM at z=0. Round 5 got the top right and the bottom wrong: the
+    sphere's carrier crosses the axis a second time at z=12.583802, deep
+    inside the block, and being the innermost crossing of the low end's
+    rim it won. Both ends of the reported hole were then inside metal and
+    the depth came back 14.832397 against a true 27.416198 — 45.9% short,
+    the largest single under-report of the round.
+
+    Expected: 1 hole, Ø8.0, depth 27.416198, entry (37, 20, 0), THROUGH.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    ball = BRepPrimAPI_MakeSphere(gp_Pnt(40.0, 20.0, 20.0), 8.0).Shape()
+    return BRepAlgoAPI_Cut(
+        BRepAlgoAPI_Fuse(block, ball).Shape(),
+        _cyl(37.0, 20.0, -5.0, 0, 0, 1, 4.0, 90.0),
+    ).Shape()
+
+
+def ball_nose_blind_bore():
+    """A BLIND Ø8 bore with a ball-nose bottom — a tangency, not a corner.
+
+    A ball-nose cutter leaves a hemisphere of its own radius, so the
+    sphere is TANGENT to the bore it ends. The mouth between them is the
+    sphere's EQUATOR, which puts both poles exactly one radius from it,
+    and "keep the root nearest the mouth" has nothing left to say. The tie
+    fell to `GeomAPI_IntCS`'s list order and landed on the INWARD pole —
+    inside the void the bore itself hollowed out — so the pocket read 8
+    deep and THROUGH against a true 16 and BLIND, and the answer FLIPPED
+    if OCCT listed its roots the other way (an S3 defect as well as a 50%
+    under-report).
+
+    Expected: 1 hole, Ø8.0, depth 16.0, entry (20, 20, 20), axis
+    (0, 0, -1), BLIND, and NOT a flat bottom.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    bored = BRepAlgoAPI_Cut(block, _cyl(20.0, 20.0, 8.0, 0, 0, 1, 4.0, 30.0)).Shape()
+    nose = BRepPrimAPI_MakeSphere(gp_Pnt(20.0, 20.0, 8.0), 4.0).Shape()
+    return BRepAlgoAPI_Cut(bored, nose).Shape()
+
+
 FIXTURES = {
     "plate_4_through_holes.step": plate_4_through_holes,
     "blind_hole_flat_bottom.step": blind_hole_flat_bottom,
@@ -1048,6 +1211,12 @@ FIXTURES = {
     "bore_beside_uneven_chamfer_corner.step": bore_beside_uneven_chamfer_corner,
     "bore_on_a_chamfer_corner_boundary.step": bore_on_a_chamfer_corner_boundary,
     "blind_bore_beside_two_chamfers_corner.step": blind_bore_beside_two_chamfers_corner,
+    # ADR-0112 adversarial round 6.
+    "bore_straddling_a_rounded_edge.step": bore_straddling_a_rounded_edge,
+    "blind_bore_straddling_a_rounded_edge.step": blind_bore_straddling_a_rounded_edge,
+    "bore_straddling_a_concave_fillet.step": bore_straddling_a_concave_fillet,
+    "bore_through_a_domed_shoulder.step": bore_through_a_domed_shoulder,
+    "ball_nose_blind_bore.step": ball_nose_blind_bore,
 }
 
 

@@ -428,7 +428,7 @@ try:
     from OCP.GeomAbs import GeomAbs_SurfaceType
     from OCP.GeomAPI import GeomAPI_IntCS, GeomAPI_ProjectPointOnSurf
     from OCP.GeomLProp import GeomLProp_SLProps
-    from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt
+    from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Vec
     from OCP.TopAbs import (
         TopAbs_EDGE,
         TopAbs_FACE,
@@ -608,6 +608,40 @@ MOUTH_CHORD_MIN_AREA_MM2: float = 1e-12
 #: still has a pair left to define one. It costs four surface
 #: evaluations at a point the miner reaches once per countersink.
 DEGENERATE_PROBE_DIRECTIONS: int = 4
+
+#: How far past the bore's MOUTH a part edge the bore CUT THROUGH is
+#: followed, in multiples of the bore's radius, when working out which
+#: face of a rim is the skin the part presents over the AXIS.
+#:
+#: Such an edge enters the mouth's footprint at one rim vertex and leaves
+#: it at another, so what has to be recovered is at most a footprint
+#: crossing — one diameter for a straight edge, and longer only in
+#: proportion to how far a curved one wanders on the way. Three radii is
+#: a diameter and a half. It is a REACH and not a cost: the march stops
+#: the instant the track leaves the footprint, which on the straight edge
+#: that cuts an ordinary chamfer or fillet happens within a step or two.
+BARRIER_REACH_RADII: float = 3.0
+
+#: Steps per radius of :data:`BARRIER_REACH_RADII`.
+#:
+#: The march only ever decides WHICH SIDE of a cut edge the axis lies on,
+#: so what matters is that its chords do not cut a corner across the axis.
+#: Sixteen steps per radius put the chord of the worst case a curve can
+#: be — one bending through a full radius — at r/2048 from the true
+#: curve, three orders below the distances being separated, which are of
+#: order r. A straight cut edge, which is what a chamfer or a tangent
+#: fillet edge leaves, is followed EXACTLY at any step count.
+BARRIER_MARCH_STEPS_PER_RADIUS: int = 16
+
+#: How many points of a face's share of the mouth are tried as the target
+#: of the ray that asks whether that face's skin reaches the AXIS.
+#:
+#: One would do for a face whose share of the footprint is convex, which
+#: is every face of every ordinary part. The extras are what keep a face
+#: whose share is PINCHED — a rim interrupted twice, at a part corner —
+#: from reading as not reaching the axis at all because the one ray tried
+#: happened to clip an obstruction. They cost one curve evaluation each.
+MOUTH_RAY_SAMPLES: int = 5
 
 
 def _adaptor(face):
@@ -1729,12 +1763,239 @@ def _mouth_owns_axis(edges, origin, direction) -> bool:
     return side((0.0, 0.0)) * reference > 0.0
 
 
+def _mouth_reach(mouths, origin, direction, sign) -> Optional[float]:
+    """How far OUT this end's mouth itself gets, over every edge of it.
+
+    The mouth is on the part's boundary — that is what makes it the
+    mouth — so nothing beyond the outermost of it is on the part at this
+    end. It is the bound :meth:`_EndEvidence.resolve` puts on its
+    fall-back, and it is measured on the mouth's own EDGES, real
+    boundary of the real solid, for the same reason :meth:`_rim_winner`
+    ranks rims on theirs.
+
+    ``None`` when no edge of the mouth can be measured, which bounds
+    nothing.
+    """
+    reach = [
+        sign * mean
+        for mean in (
+            _edge_axial_mean(edge, origin, direction)
+            for edges in mouths.values()
+            for edge in edges
+        )
+        if mean is not None
+    ]
+    return max(reach) if reach else None
+
+
+def _edge_vertices(edge) -> List:
+    """Both ends of an edge, as vertices."""
+    verts: List = []
+    explorer = TopExp_Explorer(edge, TopAbs_VERTEX)
+    while explorer.More():
+        verts.append(TopoDS.Vertex_s(explorer.Current()))
+        explorer.Next()
+    return verts
+
+
+def _across(point, origin, e1, e2) -> Tuple[float, float]:
+    """A 3-D point seen ACROSS the bore: its offset from the axis in the
+    plane the mouth lives in, with the axis itself at the origin.
+
+    The basis comes from :func:`_perp_basis`, which derives it from the
+    bore's direction alone, so every face of one mouth is measured
+    against the same reference.
+    """
+    v = (point[0] - origin[0], point[1] - origin[1], point[2] - origin[2])
+    return _dot(v, e1), _dot(v, e2)
+
+
+def _crosses(a, b, c, d) -> bool:
+    """Do the 2-D segments ``ab`` and ``cd`` PROPERLY cross?
+
+    Properly: each segment must have the other's ends STRICTLY to either
+    side. Merely touching is not a crossing, and both ways of touching
+    matter here.
+
+    A ray aimed at the very vertex where a cut edge meets the mouth
+    grazes it, and at that vertex the two faces meet, so neither is shut
+    out by it.
+
+    And a cut edge running through the AXIS ITSELF divides the footprint
+    without dividing the axis from anything: the axis is ON the division,
+    where the two skins meet, and there they agree — a bore centred
+    exactly on a part's chamfer boundary gets the same crossing from the
+    flat top and from the chamfer, because that is what meeting means.
+    The case is not exotic. A sphere's parametric SEAM is such an edge,
+    it is not a crease in the skin at all, and OCCT puts it on the
+    meridian a bore beside a dome is very often centred on.
+    """
+
+    def turn(o, p, q) -> float:
+        return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+
+    d1, d2 = turn(a, b, c), turn(a, b, d)
+    d3, d4 = turn(c, d, a), turn(c, d, b)
+    return ((d1 > 0.0 > d2) or (d2 > 0.0 > d1)) and (
+        (d3 > 0.0 > d4) or (d4 > 0.0 > d3)
+    )
+
+
+def _barrier_track(edge, vertex, origin, e1, e2, radius) -> List[Tuple[float, float]]:
+    """The 2-D track, ACROSS the bore's mouth, of a part edge the bore CUT.
+
+    ``edge`` is a stub the bore left outside the mouth, and ``vertex`` is
+    the end of it the bore cut — a rim vertex, on the mouth itself. The
+    piece of that edge which used to run on across the mouth's footprint
+    is gone from the topology, and this walks the edge's own UNTRIMMED
+    curve out past the vertex to get it back.
+
+    UNTRIMMED for exactly the reason :func:`_cap_axis_intersections`
+    gives for surfaces: the bore removed the very piece being asked
+    about, and what still runs there is the curve underneath it.
+
+    The walk steps by ARC LENGTH — the curve's own first derivative
+    converts each step, so a spline's uneven parametrisation does not
+    stretch or bunch it — and stops the moment the track leaves the
+    footprint, which is where the cut edge re-emerges as its other stub
+    and has finished dividing anything.
+    """
+    try:
+        curve = BRepAdaptor_Curve(edge)
+        u_lo, u_hi = float(curve.FirstParameter()), float(curve.LastParameter())
+        u = float(BRep_Tool.Parameter_s(vertex, edge))
+        start = curve.Value(u)
+    except Exception:  # noqa: BLE001 — an unreadable edge divides nothing
+        return []
+    # Out past the cut end, which is to say away from the stub that
+    # survived: the vertex is one end of the trimmed range and the
+    # footprint is on the far side of it.
+    march = -1.0 if abs(u - u_lo) <= abs(u - u_hi) else 1.0
+    steps = max(1, int(BARRIER_MARCH_STEPS_PER_RADIUS * BARRIER_REACH_RADII))
+    stride = BARRIER_REACH_RADII * radius / steps
+    track = [
+        _across(
+            (float(start.X()), float(start.Y()), float(start.Z())), origin, e1, e2
+        )
+    ]
+    point, tangent = gp_Pnt(), gp_Vec()
+    for _ in range(steps):
+        try:
+            curve.D1(u, point, tangent)
+            speed = float(tangent.Magnitude())
+            if speed <= 0.0:
+                break
+            u += march * stride / speed
+            here = curve.Value(u)
+        except Exception:  # noqa: BLE001 — a curve that stops answering stops here
+            break
+        step = _across(
+            (float(here.X()), float(here.Y()), float(here.Z())), origin, e1, e2
+        )
+        track.append(step)
+        if math.hypot(step[0], step[1]) > radius:
+            break
+    return track
+
+
+def _rim_barriers(faces, mouth, origin, e1, e2, radius) -> List[List[Tuple[float, float]]]:
+    """Every part edge the bore CUT at this rim, as a track across the
+    mouth's footprint.
+
+    A rim face's own edges that TOUCH the mouth without being part of it
+    are exactly the edges the bore interrupted. Each one ran across the
+    footprint until the bore took the middle out of it, and each one
+    divides the footprint in two: the flat top and the chamfer beside it
+    meet along such an edge, and so do the flat top and a tangent fillet.
+
+    Empty when the bore's mouth landed in the middle of its faces and cut
+    no edge at all, which is the ordinary hole in the ordinary plate —
+    and an empty result is what leaves that hole's answer exactly where
+    round 5 left it.
+    """
+    ends = [end for edge in mouth for end in _edge_vertices(edge)]
+    tracks: List[List[Tuple[float, float]]] = []
+    seen: List = []
+    for face in faces:
+        explorer = TopExp_Explorer(face, TopAbs_EDGE)
+        while explorer.More():
+            edge = TopoDS.Edge_s(explorer.Current())
+            explorer.Next()
+            if any(edge.IsSame(other) for other in mouth):
+                continue
+            if any(edge.IsSame(other) for other in seen):
+                continue
+            cut = next(
+                (
+                    vertex
+                    for vertex in _edge_vertices(edge)
+                    if any(vertex.IsSame(end) for end in ends)
+                ),
+                None,
+            )
+            if cut is None:
+                continue
+            seen.append(edge)
+            track = _barrier_track(edge, cut, origin, e1, e2, radius)
+            if len(track) > 1:
+                tracks.append(track)
+    return tracks
+
+
+def _skin_reaches_axis(mouth_edges, barriers, origin, e1, e2) -> bool:
+    """Is THIS face's skin what the part presents over the bore's axis?
+
+    The face holds a share of the mouth. The question is whether that
+    share and the axis lie on the same side of every edge the bore cut
+    through the mouth's footprint, and it is answered by aiming a ray
+    from the axis at the face's own mouth: an unobstructed ray is a path
+    across the footprint from the axis to skin this face demonstrably
+    owns, with no cut edge in between, and therefore skin this face owns
+    the whole way.
+
+    Several points of the mouth are tried and ANY of them succeeding is
+    enough — see :data:`MOUTH_RAY_SAMPLES`. Failing all of them means
+    every route from the axis to this face's mouth crosses an edge where
+    the part's skin changes face, which is precisely what a bore
+    straddling a rounded or chamfered edge does to the face on the far
+    side of it.
+    """
+    for edge in mouth_edges:
+        try:
+            curve = BRepAdaptor_Curve(edge)
+            u0, u1 = float(curve.FirstParameter()), float(curve.LastParameter())
+        except Exception:  # noqa: BLE001 — an unreadable mouth edge is no route
+            continue
+        for k in range(1, MOUTH_RAY_SAMPLES + 1):
+            try:
+                p = curve.Value(u0 + (u1 - u0) * k / (MOUTH_RAY_SAMPLES + 1))
+            except Exception:  # noqa: BLE001
+                continue
+            tip = _across(
+                (float(p.X()), float(p.Y()), float(p.Z())), origin, e1, e2
+            )
+            if math.hypot(tip[0], tip[1]) <= 0.0:
+                continue
+            if not any(
+                _crosses((0.0, 0.0), tip, track[i], track[i + 1])
+                for track in barriers
+                for i in range(len(track) - 1)
+            ):
+                return True
+    return False
+
+
 class _EndEvidence:
     """What the cap walk found at ONE end of a bore.
 
     ``caps`` are (axial parameter, face, 3-D point, surface normal, face
-    key) quintuples from neighbours whose surface the axis actually
-    CROSSES in range of this end. ``touching`` is every neighbour at this
+    key, mouth edge) sextuples from neighbours whose surface the axis
+    actually CROSSES in range of this end. The EDGE is the one that led
+    to the face and picked this root out of its several; it travels with
+    the cap because :meth:`_skin_over_axis` has to ask its question of
+    the edge rather than of the face — one face can reach an end along
+    two different pieces of the mouth and offer a different root at
+    each. ``touching`` is every neighbour at this
     end paired with a point on the shared edge, including the ones that
     produced no usable crossing — a drill point's cone caps the bore
     without its axis ever crossing it, and it still gets a vote on
@@ -1818,7 +2079,55 @@ class _EndEvidence:
                     mouth.append(edge)
         return _mouth_owns_axis(mouth, origin, direction)
 
-    def _rim_winner(self, origin, direction, sign) -> Optional[Tuple[float, List]]:
+    def _skin_over_axis(self, keys, edges, origin, direction, radius) -> List:
+        """The caps of a rim that stand where the part's skin crosses the
+        AXIS.
+
+        The mouth's footprint is divided by the edges the bore CUT on its
+        way through — :func:`_rim_barriers` — and each piece of the mouth
+        holds the part of the footprint on its own side of them. A cap
+        stands over the axis when a ray from the axis reaches the piece
+        of mouth that FOUND it without crossing one of those edges
+        (:func:`_skin_reaches_axis`): that ray is a path from the axis to
+        skin this face demonstrably owns, over skin that never changes
+        face on the way.
+
+        Asked of the cap's own mouth EDGE, not of its face, because the
+        two are not the same question. A ball fused onto a block's corner
+        presents ONE spherical face as the skin both above the block and
+        outboard of it, and a bore beside it reaches that face twice: on
+        the dome, where the sphere really is the skin over the axis, and
+        on the underside of the ball's outboard bulge, where it is not.
+        The face covers the axis; the second piece of mouth does not, and
+        the root it picks is the sphere's other crossing, 11 mm inside
+        the material.
+
+        Empty when the question does not arise or cannot be answered:
+        when the bore cut no edge of the part, when no route survives, or
+        when OCCT declines somewhere in the walk. Empty means the caller
+        keeps every cap, which is round 5's rule exactly — this narrows
+        the field where the geometry says which skin owns the axis, and
+        says nothing where it does not.
+        """
+        e1, e2 = _perp_basis(direction)
+        try:
+            faces = [TopoDS.Face_s(self._face_keys.FindKey(key)) for key in keys]
+            barriers = _rim_barriers(faces, edges, origin, e1, e2, radius)
+        except Exception:  # noqa: BLE001 — an unreadable rim narrows nothing
+            return []
+        if not barriers:
+            return []
+        return [
+            cap
+            for cap in self.caps
+            if cap[4] in keys
+            and any(cap[5].IsSame(edge) for edge in edges)
+            and _skin_reaches_axis([cap[5]], barriers, origin, e1, e2)
+        ]
+
+    def _rim_winner(
+        self, origin, direction, sign, radius
+    ) -> Optional[Tuple[float, List]]:
         """The level this end leaves through, and the caps that say so.
 
         The round-5 rule, in three steps and no thresholds:
@@ -1834,12 +2143,33 @@ class _EndEvidence:
           surface happens to cross, so no unbounded plane can win a rim
           it has no edge in. That was round 4's hijack.
         - Within that rim, the bore ends at the INNERMOST crossing among
-          the rim's own faces. Every face of a rim bounds the solid at
-          the mouth, so going outward the axis leaves the material at
-          the FIRST of them it reaches; a face crossing further out has
-          had its material cut away before the axis gets there. On the
-          corner part that is min(20, 22, 23) = 20, the flat top, which
-          is where the plate actually ends.
+          the rim's faces whose SKIN REACHES THE AXIS. Every face of a
+          rim bounds the solid at the mouth, so going outward the axis
+          leaves the material at the FIRST of them it reaches; a face
+          crossing further out has had its material cut away before the
+          axis gets there. On the corner part that is min(20, 22, 23) =
+          20, the flat top, which is where the plate actually ends.
+
+          Reaching the axis is what round 5 left out. A rim face bounds
+          the solid SOMEWHERE on the mouth; that does not make its
+          surface the part's skin over the middle of the mouth, where
+          the axis crosses. Where the bore STRADDLES an edge of the part
+          the two are different faces, and the crossing taken from the
+          one that does not cover the axis is not on the part at all:
+          it comes from the UNTRIMMED carrier
+          :func:`_cap_axis_intersections` deliberately asks, which
+          carries on under the neighbouring face and under the material.
+          A Ø10 bore straddling a convex R6 rounded top edge crosses
+          that fillet's cylinder 1.5 mm BELOW the flat top the plate
+          really ends at, and innermost-of-all-faces took it: 18.472136
+          against a true 20, on a blind bore an entry point 1.5 mm
+          inside solid metal, and on a domed shoulder 45.9% short at
+          BOTH ends (ADR-0112 adversarial round 6, blocker 1).
+
+          Which faces reach the axis is :meth:`_skin_over_axis`. It
+          answers nothing at all when the bore cut no edge of the part —
+          the ordinary hole in the ordinary plate — and there the rule
+          is round 5's, unchanged and to the bit.
 
         The innermost reading is also the safe one. It can only report a
         cap at or inside a crossing that some face of the rim genuinely
@@ -1847,7 +2177,9 @@ class _EndEvidence:
         is the entire failure class rounds 4 and 5 are about (23.0 and
         22.0 on a part whose Zmax is 20.0). Round 4's own concave
         hijacker agrees with it: the R6 corner fillet crosses at
-        20.8038 and the true top at 20, and 20 is the answer.
+        20.8038 and the true top at 20, and 20 is the answer. Round 6
+        narrows WHICH crossings are in that reckoning without touching
+        the reckoning itself, so it stays safe in the same direction.
 
         ``None`` when no rim closes, which leaves the round-4 contest
         standing rather than guessing — see :meth:`resolve`.
@@ -1861,7 +2193,7 @@ class _EndEvidence:
             outer = [sign * mean for mean in means if mean is not None]
             levels = [sign * cap[0] for cap in self.caps if cap[4] in keys]
             if outer and levels:
-                ranked.append((max(outer), min(levels), len(edges), keys))
+                ranked.append((max(outer), min(levels), len(edges), keys, edges))
         if not ranked:
             return None
         # Ranked outermost-rim first. Every tiebreak after that is a
@@ -1872,7 +2204,23 @@ class _EndEvidence:
         # agree on all three, which is a degenerate part rather than an
         # ordinary one.
         ranked.sort(key=lambda entry: (-entry[0], entry[1], -entry[2], entry[3]))
-        _outer, level, _count, keys = ranked[0]
+        _outer, _level, _count, keys, edges = ranked[0]
+        # Ranked on the rim's own EDGES, so narrowing the faces afterwards
+        # cannot move which rim won — only where, within it, the bore
+        # ends.
+        standing = self._skin_over_axis(keys, edges, origin, direction, radius)
+        level = min(
+            sign * cap[0]
+            for cap in (standing or [cap for cap in self.caps if cap[4] in keys])
+        )
+        # The narrowing decides the LEVEL and stops there. Which faces then
+        # get a vote on whether the end is OPEN is the round-2 tie rule,
+        # unchanged: every cap of the rim that reaches the winning level is
+        # equally the cap there, and all of them must say "out". A face
+        # whose skin does not cover the axis can still meet the winner
+        # exactly — at a part corner the axis can sit ON the edge where the
+        # flat top and a chamfer agree — and disenfranchising it there
+        # would throw away a vote the geometry genuinely casts.
         winners = [
             cap
             for cap in self.caps
@@ -1881,7 +2229,12 @@ class _EndEvidence:
         return level, winners
 
     def resolve(
-        self, fallback_t: float, origin, direction: Sequence[float], sign: float
+        self,
+        fallback_t: float,
+        origin,
+        direction: Sequence[float],
+        sign: float,
+        radius: float,
     ) -> Tuple[float, bool]:
         """This end's true axial parameter, and whether it opens to air.
 
@@ -1919,11 +2272,31 @@ class _EndEvidence:
         """
         outward = (sign * direction[0], sign * direction[1], sign * direction[2])
         if self.caps:
-            decided = self._rim_winner(origin, direction, sign)
+            decided = self._rim_winner(origin, direction, sign, radius)
             if decided is not None:
                 winner_level, winners = decided
             else:
                 levels = sorted({sign * cap[0] for cap in self.caps}, reverse=True)
+                # Round 4's contest, BOUNDED by the mouth. Round 5 proved
+                # this arm insufficient at a chamfered corner — outermost
+                # owned put the exit at z=22 on a plate 20 thick — and no
+                # committed part reaches it, which is the danger: a real
+                # imported part whose mouth is a shade unsewn would drop
+                # to a rule known to be wrong and say nothing. It cannot
+                # any more. The mouth is boundary of the solid, so a cap
+                # further OUT than every edge of it is off the part, and
+                # the corner's z=22 goes out on that alone (ADR-0112
+                # adversarial round 6, should-fix).
+                #
+                # The bound narrows and never empties: where it would
+                # leave nothing it is not applied, so this arm still
+                # carries every answer it carried before rather than
+                # trading a wrong number for no number.
+                reach = _mouth_reach(self.mouths, origin, direction, sign)
+                if reach is not None:
+                    levels = [
+                        level for level in levels if level <= reach + 1e-9
+                    ] or levels
                 winner_level = next(
                     (
                         level
@@ -1935,7 +2308,7 @@ class _EndEvidence:
                 winners = self._at(winner_level, sign)
             return sign * winner_level, all(
                 _cap_says_open(face, point, outward, normal)
-                for _t_cap, face, point, normal, _key in winners
+                for _t_cap, face, point, normal, _key, _edge in winners
             )
         if not self.touching:
             return fallback_t, False
@@ -1981,6 +2354,56 @@ class _EdgeFaces:
     def of(self, edge) -> List:
         """The faces bounding ``edge``; empty if the edge is unknown."""
         return self._faces.get(self._index.FindIndex(edge), ())
+
+
+def _root_for_end(
+    roots: Sequence[Tuple[float, Tuple[float, float, float]]],
+    t_edge: float,
+    at_low: bool,
+) -> Tuple[float, Tuple[float, float, float]]:
+    """Which crossing of ONE cap face belongs to THIS end of the bore.
+
+    The crossing NEAREST the edge that led to the face, which is what
+    settles a shaft's two crossings: a line meets a cylinder twice and
+    the far meeting is the other end of the bore, not this one.
+
+    Nearest cannot settle a TIE, and a tie here is not float noise — it
+    is a TANGENCY, and the commonest tangency in a machined part is a
+    ball-nose bottom. A ball-nose is a sphere of the cutter's radius
+    ending a bore of the same radius, so the sphere is tangent to the
+    bore, the mouth is the sphere's own EQUATOR, and the two poles sit
+    exactly one radius from it on either side. Nearest has nothing to
+    say, and whichever of the two ``GeomAPI_IntCS`` happened to list
+    first won the end: on a Ø8 ball-nose pocket 16 mm deep that is a
+    reported depth of 8 and a verdict of THROUGH — half the depth, the
+    wrong end condition, and an answer that FLIPS with the intersector's
+    list order (ADR-0112 adversarial round 6, blocker 2, and an S3
+    defect as well as a wrong number).
+
+    An exact tie is broken by taking the OUTERMOST of the tied roots,
+    and that is a fact about the bore rather than a preference. The two
+    tied roots straddle the mouth: one lies outward of it, the other
+    exactly as far INWARD — and inward of the mouth, at this end, is
+    inside the bore's own void, which the bore itself hollowed out. No
+    surface can bound the solid there, so the inward twin is not a
+    candidate for the end of anything. The outward one is where the
+    material can still be.
+
+    The tie must be EXACT to be broken this way. Preferring the outward
+    root wherever the two merely come close would re-break the cases
+    nearest exists for: ``bore_through_torus_wall`` reads 24 instead of
+    16 the moment the far crossing of the torus is allowed to win, and
+    the spherical dome goes with it. So the test is equality of the two
+    distances as computed, not equality within a tolerance, and it fires
+    only where the geometry is genuinely tangent.
+    """
+    best = min(roots, key=lambda root: abs(root[0] - t_edge))
+    reach = abs(best[0] - t_edge)
+    tied = [root for root in roots if abs(root[0] - t_edge) == reach]
+    if len(tied) < 2:
+        return best
+    sign = -1.0 if at_low else 1.0
+    return max(tied, key=lambda root: sign * root[0])
 
 
 def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence]:
@@ -2077,7 +2500,7 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
                     ]
                     if not roots:
                         continue
-                    t_cap, normal = min(roots, key=lambda root: abs(root[0] - t_edge))
+                    t_cap, normal = _root_for_end(roots, t_edge, at_low)
                     end.caps.append(
                         (
                             t_cap,
@@ -2085,6 +2508,7 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
                             _point_on_axis(origin, direction, t_cap),
                             normal,
                             key,
+                            edge,
                         )
                     )
             except Exception:  # noqa: BLE001 — one odd edge must not kill the bore
@@ -2101,8 +2525,8 @@ def _resolve_span(group, ancestors, p_lo, p_hi) -> Tuple[float, float, bool, boo
     """
     low, high = _walk_caps(group, ancestors, p_lo, p_hi)
     origin, direction = group.origin, group.direction
-    t_lo, lo_open = low.resolve(p_lo, origin, direction, -1.0)
-    t_hi, hi_open = high.resolve(p_hi, origin, direction, +1.0)
+    t_lo, lo_open = low.resolve(p_lo, origin, direction, -1.0, group.radius)
+    t_hi, hi_open = high.resolve(p_hi, origin, direction, +1.0, group.radius)
     return t_lo, t_hi, lo_open, hi_open
 
 

@@ -1301,6 +1301,12 @@ def test_r4_ownership_is_the_only_thing_holding_the_foreign_root_out(
     import aberp_cad_extract.holes as holes_mod
 
     monkeypatch.setattr(holes_mod, "_mouth_rims", lambda mouths: [])
+    # Round 6 bounded the fall-back by the mouth, so that guard has to
+    # be conceded too before round 4's arm can carry anything off the
+    # part — see `test_r6_the_mouth_bound_is_what_stops_the_fall_back`.
+    monkeypatch.setattr(
+        holes_mod, "_mouth_reach", lambda mouths, origin, direction, sign: None
+    )
     monkeypatch.setattr(
         holes_mod, "_mouth_owns_axis", lambda edges, origin, direction: True
     )
@@ -1695,9 +1701,9 @@ def test_r5_a_tie_at_one_level_is_not_a_shared_cap(fixtures_dir: Path):
     )
 
     # And the rim rule ignores that claim: the end is the plate's top.
-    assert high.resolve(group.hi, group.origin, group.direction, 1.0)[0] == (
-        pytest.approx(20.0, abs=TOL)
-    )
+    assert high.resolve(
+        group.hi, group.origin, group.direction, 1.0, group.radius
+    )[0] == (pytest.approx(20.0, abs=TOL))
 
 
 def test_r5_the_corner_family_is_stable_under_a_reversed_walk(
@@ -1751,6 +1757,12 @@ def test_r5_the_rim_rule_is_the_only_thing_holding_the_corner_together(
     import aberp_cad_extract.holes as holes_mod
 
     monkeypatch.setattr(holes_mod, "_mouth_rims", lambda mouths: [])
+    # Round 6 bounded the fall-back by the mouth, so that guard has to
+    # be conceded too before round 4's arm can carry anything off the
+    # part — see `test_r6_the_mouth_bound_is_what_stops_the_fall_back`.
+    monkeypatch.setattr(
+        holes_mod, "_mouth_reach", lambda mouths, origin, direction, sign: None
+    )
 
     hijacked = _mine(fixtures_dir / "bore_beside_two_chamfers_corner.step")
     assert len(hijacked) == 1
@@ -2171,3 +2183,361 @@ def test_a_successful_extraction_emits_no_failure_sentinel(fixtures_dir: Path, c
         "a healthy extraction must NOT stamp the failure marker; "
         f"stderr was: {err!r}"
     )
+
+
+# ── ADR-0112 adversarial round 6 ─────────────────────────────────────────
+#
+# A bore whose mouth STRADDLES an edge of the part, and a bore whose bottom
+# is TANGENT to it. Both under-reported on round 5, which is the direction
+# that costs money.
+
+R6_STRADDLES = {
+    # fixture: (diameter, depth, entry, axis, end condition, flat bottom)
+    "bore_straddling_a_rounded_edge": (
+        10.0, 20.0, (30.0, 20.0, 0.0), (0.0, 0.0, 1.0),
+        HoleEndCondition.THROUGH, False,
+    ),
+    "blind_bore_straddling_a_rounded_edge": (
+        10.0, 12.0, (30.0, 20.0, 20.0), (0.0, 0.0, -1.0),
+        HoleEndCondition.BLIND, True,
+    ),
+    "bore_straddling_a_concave_fillet": (
+        6.0, 26.0 - math.sqrt(32.0), (36.0, 20.0, 0.0), (0.0, 0.0, 1.0),
+        HoleEndCondition.THROUGH, False,
+    ),
+    "bore_through_a_domed_shoulder": (
+        8.0, 20.0 + math.sqrt(55.0), (37.0, 20.0, 0.0), (0.0, 0.0, 1.0),
+        HoleEndCondition.THROUGH, False,
+    ),
+}
+
+#: What round 5 returned for each of them, to the digits it returned. Used
+#: by the revert-proof below, and written out here because the numbers are
+#: the finding: every one is SHORTER than the truth.
+R6_ROUND5_STRADDLES = {
+    # fixture: (round 5's depth, round 5's entry z)
+    #
+    # 14 + sqrt(20) is the R6 fillet's unbounded cylinder, 1.53 mm under
+    # a plate that stops at 20; the blind bore is the same surface read as
+    # a coordinate, 8 -> 18.4721 instead of 8 -> 20. On the concave part it
+    # is the flat top's plane at 20 where the fillet over the axis reaches
+    # 20.3431. On the dome it is the sphere's SECOND crossing, so both ends
+    # move and the depth collapses to the chord between them, 2*sqrt(55).
+    "bore_straddling_a_rounded_edge": (14.0 + math.sqrt(20.0), 0.0),
+    "blind_bore_straddling_a_rounded_edge": (
+        6.0 + math.sqrt(20.0),
+        14.0 + math.sqrt(20.0),
+    ),
+    "bore_straddling_a_concave_fillet": (20.0, 0.0),
+    "bore_through_a_domed_shoulder": (
+        2.0 * math.sqrt(55.0),
+        20.0 - math.sqrt(55.0),
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(R6_STRADDLES))
+def test_r6_a_straddled_edge_does_not_shorten_the_bore(fixtures_dir: Path, name):
+    """The bore ends where the part ends, not where a NEIGHBOUR's carrier
+    happens to cross the axis.
+
+    Each of these puts the bore's mouth across an edge of the part, so two
+    faces of the outer skin reach it and only one of them is the skin over
+    the axis. Round 5 took the innermost crossing over every face of the
+    rim; the other face's UNBOUNDED carrier dives under the material and
+    won, and every answer came back SHORT. The exact shortfalls are pinned
+    in :func:`test_r6_keeping_every_rim_face_re_breaks_the_straddles`.
+
+    The four cases are deliberately not variations of one shape: the round
+    puts the axis over the FLAT and the neighbour convex, the axis over the
+    NEIGHBOUR and it concave, the same on a blind bore where the error
+    lands in a coordinate rather than a length, and a doubly-curved
+    neighbour that is the skin at BOTH ends of the bore.
+    """
+    diameter, depth, entry, axis, end, flat = R6_STRADDLES[name]
+    holes = _mine(fixtures_dir / f"{name}.step")
+    assert len(holes) == 1, f"got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, diameter)
+    _approx(hole.depth_mm, depth)
+    _approx_vec(hole.entry_point_mm, entry)
+    _approx_vec(hole.axis_unit, axis)
+    assert hole.end_condition is end
+    assert hole.flat_bottom is flat
+
+
+def test_r6_ball_nose_blind_bore_is_blind_and_full_depth(fixtures_dir: Path):
+    """A spherical bottom TANGENT to its bore reads BLIND at full depth.
+
+    The ball-nose is the tangency a machine shop actually makes, and
+    tangency is what leaves the two roots of the sphere EXACTLY equidistant
+    from the mouth — the mouth being the sphere's own equator. Round 5's
+    "keep the root nearest the mouth" then had nothing to choose with and
+    took whichever `GeomAPI_IntCS` listed first: 8 deep and THROUGH against
+    a true 16 and BLIND, on a pocket that does not go anywhere.
+
+    Not a flat bottom: the cap is a sphere, and `_has_flat_bottom` must
+    keep saying so — the depth being right is no excuse for pricing a ball
+    nose as a flat-bottomed pocket.
+    """
+    holes = _mine(fixtures_dir / "ball_nose_blind_bore.step")
+    assert len(holes) == 1, f"got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, 8.0)
+    _approx(hole.depth_mm, 16.0)
+    _approx_vec(hole.entry_point_mm, (20.0, 20.0, 20.0))
+    _approx_vec(hole.axis_unit, (0.0, 0.0, -1.0))
+    assert hole.end_condition is HoleEndCondition.BLIND
+    assert hole.flat_bottom is False
+
+
+def test_r6_keeping_every_rim_face_re_breaks_the_straddles(
+    fixtures_dir: Path, monkeypatch
+):
+    """REVERT-PROOF for the narrowing, on all four straddles at once.
+
+    Put `_EndEvidence._skin_over_axis` back to answering "nothing to say"
+    — which is round 5's rule exactly, since an empty answer is what the
+    caller falls back on — and every straddle must return the wrong number
+    it returned then, to the digit. Anything else means these fixtures have
+    stopped covering the defect.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    monkeypatch.setattr(
+        holes_mod._EndEvidence,
+        "_skin_over_axis",
+        lambda self, keys, edges, origin, direction, radius: [],
+    )
+    for name, (depth, entry_z) in sorted(R6_ROUND5_STRADDLES.items()):
+        holes = _mine(fixtures_dir / f"{name}.step")
+        assert len(holes) == 1, name
+        assert holes[0].depth_mm == pytest.approx(depth, abs=TOL), (
+            f"{name}: without the narrowing this must be round 5's wrong "
+            f"depth {depth}, got {holes[0].depth_mm}"
+        )
+        assert holes[0].entry_point_mm[2] == pytest.approx(entry_z, abs=TOL), (
+            f"{name}: round 5's entry z was {entry_z}, got "
+            f"{holes[0].entry_point_mm[2]}"
+        )
+        assert holes[0].depth_mm < R6_STRADDLES[name][1] - TOL, (
+            f"{name}: the round-5 answer must be SHORT of the truth — that "
+            "is what makes this an under-quote and not a rounding argument"
+        )
+
+
+def test_r6_nearest_root_alone_re_breaks_the_ball_nose(
+    fixtures_dir: Path, monkeypatch
+):
+    """REVERT-PROOF for the tangency tie-break.
+
+    Put `_root_for_end` back to a bare nearest-the-mouth pick and the
+    ball-nose pocket must go back to reading 8 deep and THROUGH — half its
+    depth, and an end condition that says the part has a hole in it.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    monkeypatch.setattr(
+        holes_mod,
+        "_root_for_end",
+        lambda roots, t_edge, at_low: min(
+            roots, key=lambda root: abs(root[0] - t_edge)
+        ),
+    )
+    holes = _mine(fixtures_dir / "ball_nose_blind_bore.step")
+    assert len(holes) == 1
+    assert holes[0].depth_mm == pytest.approx(8.0, abs=TOL)
+    assert holes[0].end_condition is HoleEndCondition.THROUGH
+
+
+def test_r6_the_ball_nose_does_not_depend_on_the_root_order(
+    fixtures_dir: Path, monkeypatch
+):
+    """S3 over the tangency: a tie must not be settled by OCCT's list order.
+
+    The bug this closes was not only a wrong number, it was a wrong number
+    that FLIPPED — reverse `GeomAPI_IntCS`'s roots and round 5 answered
+    16/BLIND instead of 8/THROUGH for one unchanged part. OCCT does not
+    contractually guarantee that order, so reverse it explicitly and
+    require the same answer to the bit.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    forward = _mine(fixtures_dir / "ball_nose_blind_bore.step")
+    original = holes_mod._cap_axis_intersections
+    monkeypatch.setattr(
+        holes_mod,
+        "_cap_axis_intersections",
+        lambda face, origin, direction: list(reversed(original(face, origin, direction))),
+    )
+    reversed_roots = _mine(fixtures_dir / "ball_nose_blind_bore.step")
+
+    assert len(forward) == 1 and len(reversed_roots) == 1
+    assert forward[0].depth_mm == reversed_roots[0].depth_mm
+    assert forward[0].entry_point_mm == reversed_roots[0].entry_point_mm
+    assert forward[0].end_condition is reversed_roots[0].end_condition
+    _approx(forward[0].depth_mm, 16.0)
+
+
+@pytest.mark.parametrize("name", sorted(R6_STRADDLES))
+def test_r6_the_straddles_are_stable_under_a_reversed_walk(
+    fixtures_dir: Path, monkeypatch, name
+):
+    """S3 over the narrowing: the answer must not follow the face walk.
+
+    `_rim_barriers` explores faces and edges in whatever order OCCT hands
+    them over, and `_skin_reaches_axis` stops at the first mouth sample
+    that gets through. Neither may reach the answer.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    forward = _mine(fixtures_dir / f"{name}.step")
+    original = holes_mod._collect_faces
+    monkeypatch.setattr(
+        holes_mod, "_collect_faces", lambda shape: list(reversed(original(shape)))
+    )
+    backward = _mine(fixtures_dir / f"{name}.step")
+
+    assert len(forward) == 1 and len(backward) == 1
+    assert forward[0].depth_mm == backward[0].depth_mm
+    assert forward[0].entry_point_mm == backward[0].entry_point_mm
+    assert forward[0].axis_unit == backward[0].axis_unit
+    assert forward[0].end_condition is backward[0].end_condition
+    _approx(forward[0].depth_mm, R6_STRADDLES[name][1])
+
+
+def test_r6_the_narrowing_is_inert_where_the_bore_cuts_no_edge(fixtures_dir: Path):
+    """The plain hole in the plain plate must not go NEAR the new machinery.
+
+    `_rim_barriers` is what the narrowing runs on, and it is empty unless
+    the bore actually cut an edge of the part. Where it is empty
+    `_skin_over_axis` answers nothing and the caller keeps every cap, which
+    is round 5's rule to the bit — so the whole of round 6 is inert on an
+    ordinary hole by construction rather than by luck. Asserted here
+    because it is the reason 38 committed fixtures did not move.
+
+    The straddles are the other half of the same statement: there the
+    barriers must NOT be empty, or these fixtures would be testing nothing.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    def barriers_of(name):
+        with _silence_stdout_fd():
+            shape = _load_step_shape(str(fixtures_dir / f"{name}.step"))
+        faces = holes_mod._collect_faces(shape)
+        ancestors = holes_mod._EdgeFaces(faces)
+        groups = []
+        for face in faces:
+            cyl = holes_mod._face_to_cyl(face)
+            if cyl is None:
+                continue
+            for group in groups:
+                if group.accepts(cyl):
+                    group.add(cyl)
+                    break
+            else:
+                groups.append(holes_mod._BoreGroup(cyl))
+        bores = [group for group in groups if group.is_full_sweep()]
+        assert bores, name
+        group = bores[0]
+        low, high = holes_mod._walk_caps(group, ancestors, group.lo, group.hi)
+        e1, e2 = holes_mod._perp_basis(group.direction)
+        found = []
+        for end in (low, high):
+            for keys, edges in holes_mod._mouth_rims(end.mouths):
+                faces_of = [
+                    holes_mod.TopoDS.Face_s(end._face_keys.FindKey(key))
+                    for key in keys
+                ]
+                found.append(
+                    len(
+                        holes_mod._rim_barriers(
+                            faces_of, edges, group.origin, e1, e2, group.radius
+                        )
+                    )
+                )
+        return found
+
+    assert max(barriers_of("plate_4_through_holes")) == 0, (
+        "an ordinary hole in an ordinary plate cut no edge of it, so the "
+        "round-6 narrowing must have nothing to work on there"
+    )
+    assert min(barriers_of("bore_straddling_a_rounded_edge")) >= 0
+    assert max(barriers_of("bore_straddling_a_rounded_edge")) > 0, (
+        "the straddle must actually produce a cut edge, or this fixture is "
+        "not exercising the narrowing at all"
+    )
+
+
+def test_r6_the_mouth_bound_is_what_stops_the_fall_back(
+    fixtures_dir: Path, monkeypatch
+):
+    """The fall-back may no longer carry an end OFF the part.
+
+    `_EndEvidence.resolve` keeps round 4's per-face contest for the case
+    where no rim closes — a real imported part whose mouth is a shade
+    unsewn — and NO committed part reaches it. That was the danger: an arm
+    round 5 proved insufficient at a chamfered corner, live, untested by
+    any fixture, and silent when it fired.
+
+    Round 6 bounds it by the mouth, which is boundary of the solid, so a
+    cap further out than every edge of the mouth is off the part and
+    cannot be where the bore leaves it. Conceded here in both directions:
+    with the bound the corner stays on the plate at z=20 even with the rim
+    rule and ownership both disabled, and without it the old z=22 comes
+    straight back.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    def concede_the_newer_rules():
+        monkeypatch.setattr(holes_mod, "_mouth_rims", lambda mouths: [])
+        monkeypatch.setattr(
+            holes_mod, "_mouth_owns_axis", lambda edges, origin, direction: True
+        )
+
+    concede_the_newer_rules()
+    held = _mine(fixtures_dir / "bore_beside_two_chamfers_corner.step")
+    assert len(held) == 1
+    _approx(held[0].depth_mm, 20.0)
+    assert held[0].end_condition is HoleEndCondition.THROUGH, (
+        "the bounded fall-back must still read the corner bore as through — "
+        "bounding it may not cost an end condition"
+    )
+
+    monkeypatch.setattr(
+        holes_mod, "_mouth_reach", lambda mouths, origin, direction, sign: None
+    )
+    loose = _mine(fixtures_dir / "bore_beside_two_chamfers_corner.step")
+    assert len(loose) == 1
+    _approx(loose[0].depth_mm, 22.0)
+    assert loose[0].depth_mm > 20.0, (
+        "without the bound the chamfer planes must still carry the exit "
+        "above a plate that stops at z=20, or this test has stopped "
+        "covering the arm it exists for"
+    )
+
+
+def test_r6_the_mouth_bound_never_empties_the_contest(fixtures_dir: Path, monkeypatch):
+    """Bounding the fall-back must not trade a wrong number for no number.
+
+    The bound narrows the candidates and is dropped where it would leave
+    none, so round 4's four parts still come out of that arm EXACTLY as
+    they did — which is what makes this a guard rather than a rewrite.
+    `bore_inside_a_chamfer` is the one that matters: there the chamfer
+    really IS the cap and its crossing sits inside its own mouth, so the
+    bound must let it through.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    monkeypatch.setattr(holes_mod, "_mouth_rims", lambda mouths: [])
+    for name, depth in (
+        ("bore_beside_chamfered_edge", 20.0),
+        ("blind_bore_beside_chamfered_edge", 12.0),
+        ("bore_inside_a_chamfer", 14.0),
+    ):
+        holes = _mine(fixtures_dir / f"{name}.step")
+        assert len(holes) == 1, name
+        assert holes[0].depth_mm == pytest.approx(depth, abs=TOL), (
+            f"{name}: round 4's arm must still carry this exactly, got "
+            f"{holes[0].depth_mm}"
+        )
