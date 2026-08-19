@@ -1170,6 +1170,101 @@ def ball_nose_blind_bore():
     return BRepAlgoAPI_Cut(bored, nose).Shape()
 
 
+def ball_nose_blind_bore_d6():
+    """The ball-nose tie at a depth whose arithmetic is NOT bit-symmetric.
+
+    Identical in kind to :func:`ball_nose_blind_bore` and different in
+    exactly one respect: the nose centre is at z=13.2 rather than z=8.0,
+    so the two tied root distances round to 2.9999999999999982 and
+    3.0000000000000018 instead of to the same double. Round 6 broke the
+    tie with ``==``, which fires on the committed fixture and on nothing
+    else, so this pocket mined 3.8 deep and THROUGH against a true 9.8
+    and BLIND — the whole of round 6's defect, intact (round 7, blocker
+    1).
+
+    Expected: 1 hole, Ø6.0, depth 9.8, entry (20, 20, 20), axis
+    (0, 0, -1), BLIND, and NOT a flat bottom.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    bored = BRepAlgoAPI_Cut(block, _cyl(20.0, 20.0, 13.2, 0, 0, 1, 3.0, 30.0)).Shape()
+    nose = BRepPrimAPI_MakeSphere(gp_Pnt(20.0, 20.0, 13.2), 3.0).Shape()
+    return BRepAlgoAPI_Cut(bored, nose).Shape()
+
+
+def ball_nose_blind_bore_d4_deep():
+    """The same tangency again, at a DIFFERENT diameter and depth.
+
+    Ø4 at a nose centre of 5.7398492 — an untidy number on purpose, so
+    that no arithmetic coincidence of the plate's or the cutter's can be
+    what makes the answer come out. Round 6 mined 12.2601508 and THROUGH
+    against a true 16.2601508 and BLIND.
+
+    Two of them, at two diameters, is what makes the pair a MECHANISM
+    rather than a second coincidence: the tie-break has to hold across
+    the cutter sizes, not at one of them.
+
+    Expected: 1 hole, Ø4.0, depth 16.2601508, entry (20, 20, 20), axis
+    (0, 0, -1), BLIND, and NOT a flat bottom.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    bored = BRepAlgoAPI_Cut(
+        block, _cyl(20.0, 20.0, 5.7398492, 0, 0, 1, 2.0, 30.0)
+    ).Shape()
+    nose = BRepPrimAPI_MakeSphere(gp_Pnt(20.0, 20.0, 5.7398492), 2.0).Shape()
+    return BRepAlgoAPI_Cut(bored, nose).Shape()
+
+
+def bore_beside_a_conical_boss():
+    """A Ø8 bore under a conical boss that OVERHANGS the plate's edge.
+
+    R10 x 20 cone based at z=10 on the corner at (40, 20), so it stands
+    10 mm proud of the plate and hangs off the side of it. The bore at
+    (38.5, 22) is 2.5 mm from the cone's axis, so the skin over the axis
+    is the CONE at z = 30 - 2*2.5 = 25, not the plate top at 20.
+
+    The rim here is pinched: the cone's share of the mouth is free over
+    only its first 15%, and round 6's five evenly spaced rays start at
+    16.7% and miss it. `_skin_over_axis` then found nothing, `_rim_winner`
+    fell back to the innermost crossing of the whole rim, and the bore
+    read 20.0 — 20% short, exiting 5 mm inside solid boss (round 7,
+    blocker 2).
+
+    Expected: 1 hole, Ø8.0, depth 25.0, axis (0,0,1), entry
+    (38.5, 22, 0), THROUGH. Round 6: 20.0, exiting 5 mm inside the boss.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    cone = BRepPrimAPI_MakeCone(
+        gp_Ax2(gp_Pnt(40.0, 20.0, 10.0), gp_Dir(0, 0, 1)), 10.0, 0.0, 20.0
+    ).Shape()
+    return BRepAlgoAPI_Cut(
+        BRepAlgoAPI_Fuse(block, cone).Shape(),
+        _cyl(38.5, 22.0, -5.0, 0, 0, 1, 4.0, 120.0),
+    ).Shape()
+
+
+def bore_beside_a_taller_conical_boss():
+    """:func:`bore_beside_a_conical_boss` with the cone 5 mm taller.
+
+    The neighbour, and the reason the fix is not the ray COUNT. Steepen
+    the cone and the free run of its mouth moves; five rays happen to
+    find this one and miss the shorter cone, six find the shorter one,
+    and neither count is a property of the part. Committing both means a
+    fix that merely re-tunes the count cannot pass.
+
+    Expected: 1 hole, Ø8.0, depth 28.75, axis (0,0,1), entry
+    (38.5, 22, 0), THROUGH — and round 6 gets this one RIGHT, which is
+    the point of committing it.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    cone = BRepPrimAPI_MakeCone(
+        gp_Ax2(gp_Pnt(40.0, 20.0, 10.0), gp_Dir(0, 0, 1)), 10.0, 0.0, 25.0
+    ).Shape()
+    return BRepAlgoAPI_Cut(
+        BRepAlgoAPI_Fuse(block, cone).Shape(),
+        _cyl(38.5, 22.0, -5.0, 0, 0, 1, 4.0, 120.0),
+    ).Shape()
+
+
 FIXTURES = {
     "plate_4_through_holes.step": plate_4_through_holes,
     "blind_hole_flat_bottom.step": blind_hole_flat_bottom,
@@ -1217,6 +1312,11 @@ FIXTURES = {
     "bore_straddling_a_concave_fillet.step": bore_straddling_a_concave_fillet,
     "bore_through_a_domed_shoulder.step": bore_through_a_domed_shoulder,
     "ball_nose_blind_bore.step": ball_nose_blind_bore,
+    # ADR-0112 adversarial round 7.
+    "ball_nose_blind_bore_d6.step": ball_nose_blind_bore_d6,
+    "ball_nose_blind_bore_d4_deep.step": ball_nose_blind_bore_d4_deep,
+    "bore_beside_a_conical_boss.step": bore_beside_a_conical_boss,
+    "bore_beside_a_taller_conical_boss.step": bore_beside_a_taller_conical_boss,
 }
 
 

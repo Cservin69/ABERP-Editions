@@ -609,6 +609,14 @@ MOUTH_CHORD_MIN_AREA_MM2: float = 1e-12
 #: evaluations at a point the miner reaches once per countersink.
 DEGENERATE_PROBE_DIRECTIONS: int = 4
 
+#: How far two surfaces may disagree and still count as the SAME surface
+#: — OCCT's own ``Precision::Confusion``, in mm, restated here so the
+#: feature-off import guard stays a pure-Python affair.
+#:
+#: Used only to size :func:`_tangency_band`, never to compare positions.
+SURFACE_CONFUSION_MM: float = 1e-7
+
+
 #: How far past the bore's MOUTH a part edge the bore CUT THROUGH is
 #: followed, in multiples of the bore's radius, when working out which
 #: face of a rim is the skin the part presents over the AXIS.
@@ -633,15 +641,77 @@ BARRIER_REACH_RADII: float = 3.0
 #: fillet edge leaves, is followed EXACTLY at any step count.
 BARRIER_MARCH_STEPS_PER_RADIUS: int = 16
 
-#: How many points of a face's share of the mouth are tried as the target
-#: of the ray that asks whether that face's skin reaches the AXIS.
+#: How many EVENLY SPACED points of a face's share of the mouth are tried
+#: as the target of the ray that asks whether that face's skin reaches
+#: the AXIS.
 #:
 #: One would do for a face whose share of the footprint is convex, which
 #: is every face of every ordinary part. The extras are what keep a face
 #: whose share is PINCHED — a rim interrupted twice, at a part corner —
 #: from reading as not reaching the axis at all because the one ray tried
 #: happened to clip an obstruction. They cost one curve evaluation each.
+#:
+#: This ladder covers the MIDDLE of a mouth edge and nothing else: its
+#: coarsest gap is at the two ENDS, where the first and last samples sit
+#: ``1/(n+1)`` of the edge in from the vertices. That is exactly where
+#: the surviving slivers are — see :func:`_barrier_chord_tolerance` — so the
+#: count here is deliberately NOT what makes the test robust, and raising
+#: it would not make it robust either.
 MOUTH_RAY_SAMPLES: int = 5
+
+#: Why the ends of a mouth edge need refining at all: every barrier is
+#: the stub of a part edge the bore CUT, and :func:`_barrier_track`
+#: starts each one AT the rim vertex it was cut at and marches away
+#: across the footprint. So a barrier always emanates from an END of a
+#: mouth edge, and the piece of mouth it leaves unobstructed is always a
+#: run anchored at the OTHER end. Such a run can be arbitrarily short —
+#: it is bounded by wherever the cut edge happens to sweep — while the
+#: evenly spaced ladder cannot see anything shorter than ``1/(n+1)`` of
+#: the edge, whatever ``n`` is.
+#:
+#: A Ø8 bore beside a conical boss overhanging the plate's edge leaves a
+#: free run over the first 15% of the cone's mouth. Five samples start at
+#: 16.7% and miss it by 1.7 points; six start at 14.3% and clear it by
+#: 0.7 — so six is not a fix, it is the same coincidence with a luckier
+#: number, and a boss one degree steeper would take it back (round 7,
+#: blocker 2). Halving the gap at each end finds that run on the FIRST
+#: halving, and would find one a hundred times narrower.
+#:
+#: Where the halving must STOP is :func:`_barrier_chord_tolerance`, and
+#: that bound is load-bearing rather than a cost control. Arbitrarily
+#: close to a rim vertex EVERY ray reads unobstructed, because the
+#: barrier's own track begins at that vertex and a target a hair to one
+#: side of it passes the segment test on a technicality. That is not a
+#: route across the footprint, it is the polyline running out of
+#: resolution — and a randomised boss sweep turns up such slivers at
+#: ~1.6e-7 of a mouth edge on parts whose true answer is "this face does
+#: NOT cover the axis". Refining past the barrier's own accuracy would
+#: read all seven of them as covered.
+
+
+def _barrier_chord_tolerance(radius: float) -> float:
+    """How well :func:`_barrier_track`'s polyline locates its own edge.
+
+    The march lays down chords of ``stride`` along a curve whose tightest
+    useful bend is the bore's own radius (:data:`BARRIER_REACH_RADII`
+    follows an edge only across the footprint), so each chord departs the
+    true curve by at most ``stride² / 8r`` — the r/2048 that
+    :data:`BARRIER_MARCH_STEPS_PER_RADIUS` is chosen to give.
+
+    A ray target nearer a barrier than this is inside the barrier's own
+    uncertainty: whether the segment test says it crosses is a fact about
+    the polyline, not about the part. So this is where
+    :func:`_mouth_ray_fractions` stops closing on a vertex.
+
+    On a Ø8 bore that is 1.95e-3 mm. The conical-boss sliver that blocker
+    2 is about sits 0.52 mm from its vertex — 270x outside it — and the
+    degenerate slivers that the same sweep produces sit at 9.4e-7 mm,
+    2000x inside. ``test_r7_the_mouth_ray_floor_is_not_a_tuned_epsilon``
+    walks the decades between and pins that the answers do not move.
+    """
+    steps = max(1, int(BARRIER_MARCH_STEPS_PER_RADIUS * BARRIER_REACH_RADII))
+    stride = BARRIER_REACH_RADII * max(radius, 0.0) / steps
+    return stride * stride / (8.0 * radius) if radius > 0.0 else 0.0
 
 
 def _adaptor(face):
@@ -1942,7 +2012,49 @@ def _rim_barriers(faces, mouth, origin, e1, e2, radius) -> List[List[Tuple[float
     return tracks
 
 
-def _skin_reaches_axis(mouth_edges, barriers, origin, e1, e2) -> bool:
+def _mouth_ray_fractions(radius: float):
+    """Where along a mouth edge to aim the rays of :func:`_skin_reaches_axis`.
+
+    Two ladders, in this order:
+
+    - the EVENLY SPACED one, ``k/(n+1)`` for ``k`` in ``1..n``
+      (:data:`MOUTH_RAY_SAMPLES`), which is what round 6 tried and all
+      that an unpinched mouth ever needs;
+    - then, from each end inward, the gap the first ladder left there
+      HALVED again and again, down to :func:`_barrier_chord_tolerance`.
+
+    Coarse first, so the ordinary part answers on its first ray and pays
+    nothing for the rest: the refinement is only ever reached by a face
+    whose whole evenly spaced ladder was blocked, which is the pinched
+    rim the refinement exists for.
+
+    Depth comes from the geometry rather than from a chosen count, at
+    both ends of it. A mouth edge lies inside the bore's own footprint,
+    so it is no longer than that footprint's perimeter ``2πr``, which
+    turns the fractions into millimetres; and the halving stops at
+    :func:`_barrier_chord_tolerance`, the accuracy of the very polylines
+    the rays are tested against. Eleven halvings on a bore of any size,
+    because both bounds scale with the radius.
+
+    Adding samples can only ever turn a "no route" into a "route", never
+    the other way about, so the old ladder being a PREFIX of this one is
+    what keeps every answer round 6 already got bit-identical.
+    """
+    for k in range(1, MOUTH_RAY_SAMPLES + 1):
+        # round 6's expression, to the BIT — see the prefix argument above
+        yield k / (MOUTH_RAY_SAMPLES + 1)
+    step = 1.0 / (MOUTH_RAY_SAMPLES + 1)
+    floor = _barrier_chord_tolerance(radius)
+    reach = 2.0 * math.pi * max(radius, 0.0) * step
+    fraction = step
+    while reach * 0.5 > floor:
+        reach *= 0.5
+        fraction *= 0.5
+        yield fraction
+        yield 1.0 - fraction
+
+
+def _skin_reaches_axis(mouth_edges, barriers, origin, e1, e2, radius) -> bool:
     """Is THIS face's skin what the part presents over the bore's axis?
 
     The face holds a share of the mouth. The question is whether that
@@ -1954,7 +2066,10 @@ def _skin_reaches_axis(mouth_edges, barriers, origin, e1, e2) -> bool:
     the whole way.
 
     Several points of the mouth are tried and ANY of them succeeding is
-    enough — see :data:`MOUTH_RAY_SAMPLES`. Failing all of them means
+    enough — see :func:`_mouth_ray_fractions`, which covers the middle of
+    each mouth edge evenly and then closes on its two ENDS, because a
+    pinched face's surviving sliver of mouth is always anchored at one of
+    them. Failing all of them means
     every route from the axis to this face's mouth crosses an edge where
     the part's skin changes face, which is precisely what a bore
     straddling a rounded or chamfered edge does to the face on the far
@@ -1966,9 +2081,9 @@ def _skin_reaches_axis(mouth_edges, barriers, origin, e1, e2) -> bool:
             u0, u1 = float(curve.FirstParameter()), float(curve.LastParameter())
         except Exception:  # noqa: BLE001 — an unreadable mouth edge is no route
             continue
-        for k in range(1, MOUTH_RAY_SAMPLES + 1):
+        for fraction in _mouth_ray_fractions(radius):
             try:
-                p = curve.Value(u0 + (u1 - u0) * k / (MOUTH_RAY_SAMPLES + 1))
+                p = curve.Value(u0 + (u1 - u0) * fraction)
             except Exception:  # noqa: BLE001
                 continue
             tip = _across(
@@ -2122,7 +2237,7 @@ class _EndEvidence:
             for cap in self.caps
             if cap[4] in keys
             and any(cap[5].IsSame(edge) for edge in edges)
-            and _skin_reaches_axis([cap[5]], barriers, origin, e1, e2)
+            and _skin_reaches_axis([cap[5]], barriers, origin, e1, e2, radius)
         ]
 
     def _rim_winner(
@@ -2356,10 +2471,50 @@ class _EdgeFaces:
         return self._faces.get(self._index.FindIndex(edge), ())
 
 
+def _tangency_band(radius: float) -> float:
+    """How far two root distances may differ and still be a TANGENCY.
+
+    A cap that meets the bore's wall TANGENTIALLY puts its two axis
+    crossings exactly one radius either side of the mouth, so the two
+    distances are equal — see :func:`_root_for_end` for why the inward
+    one is then not a candidate. Equal in exact arithmetic; what comes
+    back from OCCT is equal to about a ULP, and which of the two rounds
+    the shorter way is not a fact about the part.
+
+    The band is not a fudge factor, it is the tangency test restated as a
+    distance. Take a spherical cap of radius ``R`` on a bore of radius
+    ``r``: its crossings sit at ``t_c ± R`` and its mouth at
+    ``t_c ± sqrt(R² - r²)``, so the two distances differ by exactly
+    ``2·sqrt(R² - r²)``. Writing ``R = r + e`` for the amount by which
+    the cap FAILS to be tangent gives ``2·sqrt(2·r·e + e²)``, and the
+    surfaces are indistinguishable — the same surface, as far as the
+    kernel is concerned — once ``e`` drops to
+    :data:`SURFACE_CONFUSION_MM`. So
+
+        band(r) = 2·sqrt(2·r·SURFACE_CONFUSION_MM)
+
+    is exactly "the two surfaces agree to within OCCT's own confusion
+    over the whole mouth", carried into the units the caller compares in.
+
+    Note the SQUARE ROOT, which is the whole reason a band is needed at
+    all rather than an equality: near a tangency the distance difference
+    is the square root of the surface mismatch, so it is enormously more
+    sensitive than the mismatch is. On a Ø8 bore the band is 1.8e-3 mm —
+    twelve orders above the ~4e-15 mm of float noise that actually
+    separates a machined ball-nose's two roots, and four orders BELOW the
+    15.5 mm that separates the nearest genuinely untied pair in the
+    fixture set (``bore_through_torus_wall``). The answer is flat across
+    that whole band; ``test_r7_the_tangency_band_is_not_a_tuned_epsilon``
+    walks it decade by decade and pins that.
+    """
+    return 2.0 * math.sqrt(2.0 * max(radius, 0.0) * SURFACE_CONFUSION_MM)
+
+
 def _root_for_end(
     roots: Sequence[Tuple[float, Tuple[float, float, float]]],
     t_edge: float,
     at_low: bool,
+    radius: float,
 ) -> Tuple[float, Tuple[float, float, float]]:
     """Which crossing of ONE cap face belongs to THIS end of the bore.
 
@@ -2389,21 +2544,49 @@ def _root_for_end(
     candidate for the end of anything. The outward one is where the
     material can still be.
 
-    The tie must be EXACT to be broken this way. Preferring the outward
-    root wherever the two merely come close would re-break the cases
-    nearest exists for: ``bore_through_torus_wall`` reads 24 instead of
-    16 the moment the far crossing of the torus is allowed to win, and
-    the spherical dome goes with it. So the test is equality of the two
-    distances as computed, not equality within a tolerance, and it fires
-    only where the geometry is genuinely tangent.
+    Round 6 required the tie to be EXACT — ``==`` on the two distances
+    as computed — reasoning that any looser test would re-break the cases
+    nearest exists for, since ``bore_through_torus_wall`` reads 24
+    instead of 16 the moment the far crossing of the torus is allowed to
+    win. The reasoning about the torus is right and the conclusion was
+    wrong, because a tangency does not SURVIVE being computed. The two
+    distances are equal in exact arithmetic and about a ULP apart in
+    doubles: on the committed fixture they happen to round to the same
+    double and the tie fires, and one bit of a different nose depth is
+    enough that it does not. Ø6 at z=13.2 in a 20 mm plate mined 3.8 and
+    THROUGH against a true 9.8 and BLIND — the whole of round 6's defect,
+    intact, on 74 of 240 randomly sized pockets, and PASSING on the other
+    166 only because the noise happened to fall the right way, which is
+    the same S3 flip wearing different clothes (round 7, blocker 1).
+
+    So the test is a BAND, and the band is the tangency condition itself
+    rather than a tolerance chosen to make the fixture pass — see
+    :func:`_tangency_band`, which derives it from the amount by which the
+    cap would have to fail to be tangent before OCCT called it a
+    different surface at all. It is four orders tighter than the closest
+    untied pair anywhere in the fixture set, so the torus and the dome
+    are as far outside it as they were outside equality.
+
+    The tied roots must also STRADDLE the mouth — one outward of it, one
+    inward — which is not an extra safeguard but the same paragraph as
+    above said properly: what disqualifies the twin is lying inside the
+    bore's own void, and only a root on the INWARD side of the mouth
+    does. Roots that merely bunch on ONE side are a fitted surface
+    answering the same crossing several times, which is what
+    ``bore_through_nurbs_dome`` does, and there the nearest is still the
+    answer. Requiring the straddle is why every one of the 43 committed
+    fixtures stays bit-identical rather than 42 of them.
     """
     best = min(roots, key=lambda root: abs(root[0] - t_edge))
     reach = abs(best[0] - t_edge)
-    tied = [root for root in roots if abs(root[0] - t_edge) == reach]
-    if len(tied) < 2:
-        return best
+    band = _tangency_band(radius)
+    tied = [root for root in roots if abs(abs(root[0] - t_edge) - reach) <= band]
     sign = -1.0 if at_low else 1.0
-    return max(tied, key=lambda root: sign * root[0])
+    outward = [root for root in tied if sign * (root[0] - t_edge) >= 0.0]
+    inward = [root for root in tied if sign * (root[0] - t_edge) < 0.0]
+    if not (outward and inward):
+        return best
+    return max(outward, key=lambda root: sign * root[0])
 
 
 def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence]:
@@ -2500,7 +2683,9 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
                     ]
                     if not roots:
                         continue
-                    t_cap, normal = _root_for_end(roots, t_edge, at_low)
+                    t_cap, normal = _root_for_end(
+                        roots, t_edge, at_low, group.radius
+                    )
                     end.caps.append(
                         (
                             t_cap,

@@ -2340,7 +2340,7 @@ def test_r6_nearest_root_alone_re_breaks_the_ball_nose(
     monkeypatch.setattr(
         holes_mod,
         "_root_for_end",
-        lambda roots, t_edge, at_low: min(
+        lambda roots, t_edge, at_low, radius: min(
             roots, key=lambda root: abs(root[0] - t_edge)
         ),
     )
@@ -2541,3 +2541,532 @@ def test_r6_the_mouth_bound_never_empties_the_contest(fixtures_dir: Path, monkey
             f"{name}: round 4's arm must still carry this exactly, got "
             f"{holes[0].depth_mm}"
         )
+
+
+# ── ADR-0112 adversarial round 7 ─────────────────────────────────────────
+#
+# Two under-quotes, and both of them are round 6's own fixes holding only
+# where their fixture holds them.
+#
+# B1: the ball-nose tie-break fired on `==`, which is true of the
+#     committed pocket and of essentially no other. B2: the evenly spaced
+#     mouth rays found the conical boss's sliver of skin at six samples
+#     and not at five, which is a property of the number and not of the
+#     part.
+
+
+R7_FIXTURES = {
+    # fixture: (diameter, depth, entry, axis, end condition, flat bottom)
+    "ball_nose_blind_bore_d6": (
+        6.0, 9.8, (20.0, 20.0, 20.0), (0.0, 0.0, -1.0),
+        HoleEndCondition.BLIND, False,
+    ),
+    "ball_nose_blind_bore_d4_deep": (
+        4.0, 16.2601508, (20.0, 20.0, 20.0), (0.0, 0.0, -1.0),
+        HoleEndCondition.BLIND, False,
+    ),
+    "bore_beside_a_conical_boss": (
+        8.0, 25.0, (38.5, 22.0, 0.0), (0.0, 0.0, 1.0),
+        HoleEndCondition.THROUGH, False,
+    ),
+    "bore_beside_a_taller_conical_boss": (
+        8.0, 28.75, (38.5, 22.0, 0.0), (0.0, 0.0, 1.0),
+        HoleEndCondition.THROUGH, False,
+    ),
+}
+
+#: What round 6 mined for each, where it was wrong. Every one of these is
+#: SHORT of the truth, which is what makes them under-quotes.
+R7_ROUND6 = {
+    "ball_nose_blind_bore_d6": (3.8, HoleEndCondition.THROUGH),
+    "ball_nose_blind_bore_d4_deep": (12.2601508, HoleEndCondition.THROUGH),
+    "bore_beside_a_conical_boss": (20.0, HoleEndCondition.THROUGH),
+}
+
+
+@pytest.mark.parametrize("name", sorted(R7_FIXTURES))
+def test_r7_fixtures_are_exact(fixtures_dir: Path, name):
+    """Every round-7 part, against the dimensions it was built from."""
+    diameter, depth, entry, axis, end, flat = R7_FIXTURES[name]
+    holes = _mine(fixtures_dir / f"{name}.step")
+
+    assert len(holes) == 1, name
+    _approx(holes[0].diameter_mm, diameter)
+    _approx(holes[0].depth_mm, depth)
+    _approx_vec(holes[0].entry_point_mm, entry)
+    _approx_vec(holes[0].axis_unit, axis)
+    assert holes[0].end_condition is end, name
+    assert holes[0].flat_bottom is flat, name
+
+
+@pytest.mark.parametrize("name", sorted(R7_ROUND6))
+def test_r7_every_round6_answer_was_short(fixtures_dir: Path, name):
+    """The defect was an UNDER-quote, on all three parts.
+
+    Stated as its own test because "wrong" and "short" are different
+    claims and only the second one is a quote that loses money.
+    """
+    was, _ = R7_ROUND6[name]
+    assert was < R7_FIXTURES[name][1] - TOL, name
+
+
+# ── B1: the tangency tie ─────────────────────────────────────────────────
+
+
+def _ball_nose(nose_centre_z: float, radius: float, thickness: float = 20.0):
+    """A ball-nose pocket, built in memory from its dimensions.
+
+    Same construction as ``ball_nose_blind_bore`` with the depth and the
+    cutter free, so a whole family can be swept without committing a STEP
+    file per member. The pocket bottoms at ``nose_centre_z - radius``, so
+    its depth from the plate top is ``thickness - nose_centre_z + radius``.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCylinder,
+        BRepPrimAPI_MakeSphere,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, thickness).Shape()
+    shaft = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(20.0, 20.0, nose_centre_z), gp_Dir(0, 0, 1)),
+        radius,
+        thickness + 10.0,
+    ).Shape()
+    nose = BRepPrimAPI_MakeSphere(gp_Pnt(20.0, 20.0, nose_centre_z), radius).Shape()
+    return BRepAlgoAPI_Cut(BRepAlgoAPI_Cut(block, shaft).Shape(), nose).Shape()
+
+
+#: The adversarial's 36-size family: one ball-nose pocket per cutter from
+#: Ø1 to Ø18, all at the same nose depth, so nothing but the SIZE varies.
+R7_BALL_NOSE_SIZES = tuple(0.5 + 0.25 * k for k in range(36))
+
+
+def _ball_nose_verdicts(sizes, nose_centre_z=13.2, thickness=20.0):
+    """``{radius: (depth, end condition)}`` over a family of pockets."""
+    out = {}
+    for radius in sizes:
+        holes = [
+            hole
+            for hole in mine_cylindrical_holes(
+                _ball_nose(nose_centre_z, radius, thickness)
+            )
+            if abs(hole.diameter_mm - 2.0 * radius) < TOL
+        ]
+        out[radius] = (
+            (holes[0].depth_mm, holes[0].end_condition) if len(holes) == 1 else None
+        )
+    return out
+
+
+def test_r7_the_tangency_tie_holds_across_a_whole_size_sweep():
+    """The tie-break must be about the GEOMETRY, not about one pocket.
+
+    Round 6's `==` is true of the committed fixture's arithmetic and of
+    almost nothing else, so a fix that merely moves the coincidence would
+    still pass a single new fixture. Thirty-six cutters at one depth is
+    the family the defect was found on, and every one of them must come
+    back at its full depth and BLIND.
+    """
+    verdicts = _ball_nose_verdicts(R7_BALL_NOSE_SIZES)
+    wrong = {
+        radius: got
+        for radius, got in verdicts.items()
+        if got is None
+        or abs(got[0] - (20.0 - 13.2 + radius)) > TOL
+        or got[1] is not HoleEndCondition.BLIND
+    }
+    assert not wrong, f"{len(wrong)}/{len(verdicts)} pockets mis-mined: {wrong}"
+
+
+def test_r7_the_tangency_tie_holds_as_the_pocket_is_walked_down():
+    """The same sweep along the OTHER axis: one cutter, every depth.
+
+    A tie that survives 36 diameters at one depth could still be an
+    artifact of that depth's arithmetic. Ø8 walked from a nose centre of
+    4.05 to 19.35 in steps of 0.1 takes the tie through 154 different
+    roundings of the same exact tangency.
+    """
+    depths = [4.05 + 0.1 * k for k in range(154)]
+    wrong = []
+    for nose_centre_z in depths:
+        holes = mine_cylindrical_holes(_ball_nose(nose_centre_z, 4.0))
+        want = 20.0 - nose_centre_z + 4.0
+        if (
+            len(holes) != 1
+            or abs(holes[0].depth_mm - want) > TOL
+            or holes[0].end_condition is not HoleEndCondition.BLIND
+        ):
+            wrong.append((nose_centre_z, [(h.depth_mm, h.end_condition) for h in holes]))
+    assert not wrong, f"{len(wrong)}/{len(depths)} depths mis-mined: {wrong[:5]}"
+
+
+def test_r7_a_bit_exact_tie_re_breaks_the_whole_sweep(monkeypatch):
+    """REVERT-PROOF for the band, and the round-6 test's blind spot.
+
+    `test_r6_nearest_root_alone_re_breaks_the_ball_nose` pins the tie-break
+    by removing it entirely. It cannot see the defect this round is about,
+    because round 6's `==` and round 7's band agree exactly on the one
+    fixture that test uses. So put the criterion back to BIT-EXACT — the
+    code as round 6 shipped it — and require the sweep to collapse.
+
+    Most of the family must break, and the committed round-6 fixture must
+    NOT: that asymmetry IS the defect. A tie that fires on one pocket and
+    not on its neighbours is a coincidence, however geometric its prose.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    monkeypatch.setattr(holes_mod, "_tangency_band", lambda radius: 0.0)
+
+    verdicts = _ball_nose_verdicts(R7_BALL_NOSE_SIZES)
+    broken = [
+        radius
+        for radius, got in verdicts.items()
+        if got is None
+        or abs(got[0] - (20.0 - 13.2 + radius)) > TOL
+        or got[1] is not HoleEndCondition.BLIND
+    ]
+    assert len(broken) > len(verdicts) // 2, (
+        "with a bit-exact tie most of the size sweep must go back to being "
+        f"short and THROUGH; only {len(broken)}/{len(verdicts)} did"
+    )
+
+    # ... and every one of them short by exactly one cutter diameter,
+    # which is the signature of the INWARD pole winning the end.
+    for radius in broken:
+        got = verdicts[radius]
+        assert got is not None and abs(
+            got[0] - (20.0 - 13.2 + radius - 2.0 * radius)
+        ) <= TOL, (radius, got)
+
+
+def test_r7_a_bit_exact_tie_still_passes_the_round6_fixture(
+    fixtures_dir: Path, monkeypatch
+):
+    """The other half of the same statement, on the committed part.
+
+    Round 6's fixture is exactly the pocket whose two root distances round
+    to the same double, so a bit-exact tie answers it correctly. Pinned so
+    that nobody reads the test above as "round 6 was wrong about the
+    tangency" — round 6 was right about the tangency and wrong about
+    floating point.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    monkeypatch.setattr(holes_mod, "_tangency_band", lambda radius: 0.0)
+    holes = _mine(fixtures_dir / "ball_nose_blind_bore.step")
+    assert len(holes) == 1
+    _approx(holes[0].depth_mm, 16.0)
+    assert holes[0].end_condition is HoleEndCondition.BLIND
+
+
+def test_r7_the_tangency_band_is_not_a_tuned_epsilon():
+    """The band may be moved by decades without moving a single answer.
+
+    An epsilon tuned to make a fixture pass has an answer that changes
+    just outside it. This one does not: the noise it must swallow is
+    ~4e-15 mm and the nearest genuinely untied pair in the corpus is
+    15.5 mm away, so everything from 1e-12 to 1e-2 mm of surface
+    mismatch — twenty decades of the quantity the band is derived from —
+    gives the same numbers. :data:`SURFACE_CONFUSION_MM` sits in the
+    middle of that because it is the kernel's own figure, not because it
+    is where the fixtures pass.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    baseline = None
+    for confusion in (1e-12, 1e-10, 1e-8, 1e-7, 1e-6, 1e-4, 1e-2):
+        band = 2.0 * math.sqrt(2.0 * 3.0 * confusion)
+        original = holes_mod._tangency_band
+        try:
+            holes_mod._tangency_band = lambda radius, _b=band: _b
+            verdicts = _ball_nose_verdicts(R7_BALL_NOSE_SIZES[:12])
+        finally:
+            holes_mod._tangency_band = original
+        signature = repr(sorted(verdicts.items()))
+        if baseline is None:
+            baseline = signature
+        assert signature == baseline, (
+            f"the answer moved when the surface-confusion figure was "
+            f"{confusion}; that would make the band a tuned epsilon"
+        )
+
+
+def test_r7_the_untied_caps_stay_far_outside_the_band(fixtures_dir: Path):
+    """The torus and the dome are not near-misses of the band.
+
+    Round 6 refused a tolerance because a loose one reads
+    ``bore_through_torus_wall`` as 24 instead of 16. The refusal was
+    sound and the margin is enormous: the closest that fixture's roots
+    come to being tied is four orders outside the band. Measured rather
+    than asserted, so the claim cannot rot.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    seen = []
+    original = holes_mod._root_for_end
+
+    def spy(roots, t_edge, at_low, radius):
+        reaches = sorted(abs(root[0] - t_edge) for root in roots)
+        if len(reaches) > 1:
+            seen.append((reaches[1] - reaches[0], holes_mod._tangency_band(radius)))
+        return original(roots, t_edge, at_low, radius)
+
+    holes_mod._root_for_end = spy
+    try:
+        for name in ("bore_through_torus_wall", "bore_through_spherical_dome"):
+            assert len(_mine(fixtures_dir / f"{name}.step")) == 1
+    finally:
+        holes_mod._root_for_end = original
+
+    assert seen, "neither fixture presented a face with two roots"
+    untied = [(gap, band) for gap, band in seen if gap > band]
+    assert untied, "every pair read as tied; these fixtures test nothing"
+    assert min(gap / band for gap, band in untied) > 1e3, (
+        f"an untied pair came within 1000x of the band: {sorted(untied)[:3]}"
+    )
+
+
+def test_r7_the_ball_nose_sweep_does_not_depend_on_the_root_order(monkeypatch):
+    """S3 over the tangency, across the family rather than one part.
+
+    Round 6 pinned root-order independence on its own fixture, where the
+    tie fired. Everywhere else the tie did NOT fire, so the answer was
+    whichever pole `GeomAPI_IntCS` listed first — S3, on 36 parts,
+    invisible to a test that only looked at one.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    sizes = R7_BALL_NOSE_SIZES[:12]
+    forward = _ball_nose_verdicts(sizes)
+
+    original = holes_mod._cap_axis_intersections
+    monkeypatch.setattr(
+        holes_mod,
+        "_cap_axis_intersections",
+        lambda face, origin, direction: list(
+            reversed(original(face, origin, direction))
+        ),
+    )
+    backward = _ball_nose_verdicts(sizes)
+
+    assert repr(sorted(forward.items())) == repr(sorted(backward.items()))
+
+
+# ── B2: the pinched mouth ────────────────────────────────────────────────
+
+
+def _conical_boss(cone_height: float, bore_x: float = 38.5, bore_y: float = 22.0):
+    """A plate with an R10 conical boss on its edge, and a bore beside it."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCone,
+        BRepPrimAPI_MakeCylinder,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    cone = BRepPrimAPI_MakeCone(
+        gp_Ax2(gp_Pnt(40.0, 20.0, 10.0), gp_Dir(0, 0, 1)), 10.0, 0.0, cone_height
+    ).Shape()
+    bore = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(bore_x, bore_y, -5.0), gp_Dir(0, 0, 1)), 4.0, 120.0
+    ).Shape()
+    return BRepAlgoAPI_Cut(BRepAlgoAPI_Fuse(block, cone).Shape(), bore).Shape()
+
+
+def test_r7_evenly_spaced_rays_alone_re_break_the_boss(
+    fixtures_dir: Path, monkeypatch
+):
+    """REVERT-PROOF for the end-anchored refinement.
+
+    Put :func:`_mouth_ray_fractions` back to round 6's evenly spaced
+    ladder and the conical boss must go back to reading 20.0 — the plate
+    top, on a part whose skin over the axis is the cone 5 mm above it.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    monkeypatch.setattr(
+        holes_mod,
+        "_mouth_ray_fractions",
+        lambda radius: [
+            k / (holes_mod.MOUTH_RAY_SAMPLES + 1)
+            for k in range(1, holes_mod.MOUTH_RAY_SAMPLES + 1)
+        ],
+    )
+    holes = _mine(fixtures_dir / "bore_beside_a_conical_boss.step")
+    assert len(holes) == 1
+    _approx(holes[0].depth_mm, 20.0)
+
+
+def test_r7_the_boss_does_not_depend_on_the_ray_count(fixtures_dir: Path, monkeypatch):
+    """The COUNT must not reach the answer — which is the whole fix.
+
+    Round 6 answered this part at six evenly spaced rays and not at five,
+    so the number was load-bearing and one geometry away from being wrong
+    again. With the ends refined, every count from one to twenty-one
+    gives 25.0 to the bit: the coarse ladder only decides how quickly the
+    refinement is reached, never what it finds.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    answers = {}
+    for count in (1, 2, 3, 4, 5, 6, 7, 9, 13, 21):
+        monkeypatch.setattr(holes_mod, "MOUTH_RAY_SAMPLES", count)
+        holes = _mine(fixtures_dir / "bore_beside_a_conical_boss.step")
+        assert len(holes) == 1, count
+        answers[count] = holes[0].depth_mm
+
+    assert len(set(answers.values())) == 1, f"the count reached the answer: {answers}"
+    _approx(next(iter(answers.values())), 25.0)
+
+
+def test_r7_the_refinement_finds_slivers_a_bumped_count_never_would():
+    """Cone heights where NO evenly spaced count in reach gets it right.
+
+    The boss's free sliver of mouth moves as the cone steepens. Round 6's
+    five rays miss it at a height of 20 and find it at 25; six find 20 and
+    a seventh geometry would defeat both. Sweeping the height is what
+    shows the refinement is answering the part rather than the ladder.
+    """
+    heights = (20.0, 22.0, 25.0, 28.0, 30.0)
+    wrong = []
+    for height in heights:
+        holes = mine_cylindrical_holes(_conical_boss(height))
+        # the cone's own surface 2.5 mm off its axis: base + h*(1 - 2.5/10)
+        want = 10.0 + height * 0.75
+        if len(holes) != 1 or abs(holes[0].depth_mm - want) > TOL:
+            wrong.append((height, want, [h.depth_mm for h in holes]))
+    assert not wrong, wrong
+
+
+def test_r7_the_mouth_ray_floor_is_load_bearing(monkeypatch):
+    """Refining PAST the barrier's own accuracy invents routes.
+
+    Arbitrarily close to a rim vertex every ray reads unobstructed,
+    because the barrier's track begins at that vertex and a target a hair
+    to one side of it passes the segment test on a technicality. This
+    part — a bore under a boss whose cone is BURIED below the plate top
+    over the axis — has no route at all, and reads 20.0 correctly. Drop
+    :func:`_barrier_chord_tolerance` to a thousandth of a micron and the
+    miner finds one of those phantom slivers at ~1e-7 of a mouth edge and
+    reports the cone's crossing 6 mm inside the plate instead.
+
+    So the floor is not a cost control. It is the statement that a ray
+    aimed nearer a barrier than the barrier is known is not evidence.
+    """
+    import aberp_cad_extract.holes as holes_mod
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCone,
+        BRepPrimAPI_MakeCylinder,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    cone = BRepPrimAPI_MakeCone(
+        gp_Ax2(gp_Pnt(40.0, 20.0, 6.2829), gp_Dir(0, 0, 1)), 11.1653, 0.0, 20.1485
+    ).Shape()
+    bore = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(33.4153, 22.0507, -5.0), gp_Dir(0, 0, 1)), 3.7313, 120.0
+    ).Shape()
+    part = BRepAlgoAPI_Cut(BRepAlgoAPI_Fuse(block, cone).Shape(), bore).Shape()
+
+    holes = mine_cylindrical_holes(part)
+    assert len(holes) == 1
+    _approx(holes[0].depth_mm, 20.0)
+
+    monkeypatch.setattr(
+        holes_mod, "_barrier_chord_tolerance", lambda radius: radius * 1e-12
+    )
+    unfloored = mine_cylindrical_holes(part)
+    assert len(unfloored) == 1
+    assert unfloored[0].depth_mm < 20.0 - TOL, (
+        "without the floor this part must pick up a phantom route and read "
+        f"the buried cone; got {unfloored[0].depth_mm}"
+    )
+
+
+def test_r7_the_mouth_ray_floor_is_not_a_tuned_epsilon(fixtures_dir: Path):
+    """The floor may be moved by decades without moving an answer.
+
+    The sliver that matters sits 0.52 mm from its vertex and the phantom
+    ones sit at 9.4e-7 mm, so any floor between them does the same job.
+    :func:`_barrier_chord_tolerance` lands at 1.95e-3 mm on a O8 bore
+    because that is what the barrier march's chords are worth, and the
+    three decades either side of it give the same answer.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    original = holes_mod._barrier_chord_tolerance
+    answers = {}
+    try:
+        for scale in (1e-2, 1e-1, 1.0, 1e1, 1e2):
+            holes_mod._barrier_chord_tolerance = (
+                lambda radius, _s=scale: original(radius) * _s
+            )
+            holes = _mine(fixtures_dir / "bore_beside_a_conical_boss.step")
+            assert len(holes) == 1, scale
+            answers[scale] = holes[0].depth_mm
+    finally:
+        holes_mod._barrier_chord_tolerance = original
+
+    assert len(set(answers.values())) == 1, f"the floor reached the answer: {answers}"
+    _approx(next(iter(answers.values())), 25.0)
+
+
+def test_r7_the_refinement_is_a_superset_of_round_6s_ladder():
+    """Why no answer round 6 already had could move.
+
+    `_skin_reaches_axis` returns True on the FIRST sample that gets
+    through, so a sample set that contains round 6's can only ever turn a
+    "no route" into a "route". The evenly spaced ladder being a prefix of
+    the new schedule is therefore the whole regression argument for B2,
+    and it is a property of the schedule rather than of any part — so it
+    is checked here directly, at several radii.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    for radius in (0.5, 4.0, 37.5, 500.0):
+        schedule = list(holes_mod._mouth_ray_fractions(radius))
+        prefix = [
+            k / (holes_mod.MOUTH_RAY_SAMPLES + 1)
+            for k in range(1, holes_mod.MOUTH_RAY_SAMPLES + 1)
+        ]
+        assert schedule[: len(prefix)] == prefix, radius
+        assert all(0.0 < fraction < 1.0 for fraction in schedule), radius
+        # bounded, and bounded by the GEOMETRY rather than by a count
+        assert len(prefix) < len(schedule) <= len(prefix) + 2 * 40, radius
+
+
+def test_r7_the_refinement_is_inert_where_the_bore_cuts_no_edge(fixtures_dir: Path):
+    """The ordinary hole in the ordinary plate never reaches the ladder.
+
+    Round 6's inertness argument is that `_rim_barriers` is empty there,
+    so `_skin_over_axis` returns before any ray is aimed. Round 7 adds
+    samples behind that gate and not in front of it, which is why the 43
+    committed fixtures stay bit-identical. Asserted by counting the rays
+    actually aimed.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    aimed = []
+    original = holes_mod._mouth_ray_fractions
+
+    def spy(radius):
+        for fraction in original(radius):
+            aimed.append(fraction)
+            yield fraction
+
+    holes_mod._mouth_ray_fractions = spy
+    try:
+        assert len(_mine(fixtures_dir / "plate_4_through_holes.step")) == 4
+        assert aimed == [], "an ordinary plate aimed a mouth ray"
+        assert len(_mine(fixtures_dir / "bore_beside_a_conical_boss.step")) == 1
+        assert aimed, "the boss aimed none, so this fixture tests nothing"
+    finally:
+        holes_mod._mouth_ray_fractions = original
