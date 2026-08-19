@@ -77,7 +77,7 @@ That last command does everything for you, in order:
    nothing to roll back to yet).
 3. Resets your checkout cleanly to the release.
 4. Provisions a small Python environment for the CAD geometry pipeline
-   (so STL/STEP quoting works without you installing anything by hand).
+   (so STEP quoting works without you installing anything by hand).
 5. Builds and launches the desktop app straight into the **demo** tenant.
 
 The first window opens on a dashboard (not a setup wizard) with a sample
@@ -143,8 +143,8 @@ the HU-production compliance stack.
 
 **Quote → price → win the job**
 
-- **Quoting (CAD-aware)** *[both]*. Drop in an STL or STEP file → it
-  extracts the geometry → estimates machining time → applies the margin
+- **Quoting (CAD-aware)** *[both]*. Drop in a STEP file (`.step` / `.stp`)
+  → it extracts the geometry → estimates machining time → applies the margin
   profile for that customer type → shows a lead-time chip (green / yellow /
   red) → renders a customer-ready PDF. Quotes that would price below the
   margin floor are refused outright, not silently shipped.
