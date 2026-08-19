@@ -366,6 +366,69 @@ satisfy each control, and a report that renders the coverage.
 **Size.** Medium, and mostly analysis rather than code: deciding which
 existing events evidence which controls is the work.
 
+<a id="d-19"></a>
+### D-19 — Located-holes geometry hardening — GATES slice C (drilling cycle-time pricing)
+
+**HARD GATE.** Slice C — the drilling cycle-time pricing that would price
+off `located_holes` — **must not ship until every defect below is closed**.
+This is a *pre-emptive* gate, not an incident report. As of ADR-0112 slice
+B, `located_holes` is **computed but unconsumed**: no quote path and no
+toolpath reads it, so there is **zero live quoting impact today**. Every
+defect listed is **pre-existing on the feature** — each was present in
+every adversarial round, none is a regression introduced by the round-7
+landing.
+
+**Surface today.** The STEP hole miner in
+`python/aberp-cad-extract/aberp_cad_extract/holes.py` emits `located_holes`
+into FeatureGraph v6. The named parts below are where each defect lives:
+`_skin_over_axis`, `_root_for_end`, `_walk_caps`,
+`DEGENERATE_ISOLINE_RATIO`, `SURFACE_CONFUSION_MM`.
+
+**Missing for Live.** The five open defects, in priority order. All are
+mutation-verified from adversarial pass 8, and all but N2 **under-quote**
+(they read the part as cheaper than it is):
+
+1. **N4 — undercut spherical cavity** (ball-end seat; nose radius exceeds
+   bore radius by `e >= 4e-7`). Reads **up to 87% short** *and* reports a
+   blind pocket as **through**, because the walk ends at the sphere's top
+   pole in mid-void. The trigger is an **ordinary** feature — ball-end
+   undercuts and spherical seats are routine — which combined with the
+   87% makes this the **worst offender**.
+2. **N3 — dropped hole.** A Ø16 bore with undercut `e` in `{4e-7, 1e-6}`
+   returns **zero holes**: a silent under-count, not a wrong number. The
+   trigger is narrow, but the outcome is the worst of the set — the
+   feature vanishes with no signal.
+3. **Zero-caps boss-overhang band.** `_skin_over_axis` narrows to zero
+   caps, so the caller falls back to the innermost crossing of the *whole*
+   rim and under-reports depth by **0.05–4.36 mm (<= 17.9%)**. This is a
+   **contiguous band** — roughly **42%** of its local region, cone heights
+   ~14–20 crossed with bore offsets ~37.0–38.5 — and it is a **barrier-set**
+   defect, insensitive to ray count, *not* a sampling artifact. (The
+   round-7 commit first recorded this as "4 of 92 configs"; that count was
+   a grid-spacing artifact of the sweep and is corrected in that commit
+   message.)
+4. **N2 — 118° drill-point apex admitted as a cap.** `DEGENERATE_ISOLINE_RATIO`
+   is `1e-9`, about **89× tighter** than `GeomAPI_IntCS`'s own noise floor,
+   so the apex passes as a cap. **Over-quotes** by the point length
+   (~0.3·D). Topology-dependent: 7/180 fused, ~49/100 two-step. Candidate
+   fix is raising the ratio to ~`1e-6`, which needs its own regression
+   sweep.
+5. **N1 — breakout hole.** When the nose/point breaks the far face, the
+   hole reads **blind** with a depth *exceeding the plate*, because the
+   measurement runs to a pole in the air below the part.
+
+**Blocked on.** Nothing external. This is purely our own work in one file.
+The adversarial-8 repros lived in the branch's `scratchpad/` and were not
+committed; they are regenerable from the descriptions above and from
+`tools/generate_step_fixtures.py`.
+
+**Size.** Medium-to-large. N3 and N4 share the undercut root cause and the
+half-order robustness window documented on the round-7 commit
+(`SURFACE_CONFUSION_MM = 1e-7`: correct at `e <= 3x`, fails at `4x`), so
+they are likely one fix. Items 3, 4 and 5 are independent, and item 4 in
+particular is a constant change whose blast radius is the whole fixture
+corpus.
+
 ---
 
 ## Expansion slots on a Live capability

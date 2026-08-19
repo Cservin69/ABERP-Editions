@@ -510,9 +510,16 @@ pretending to work. Each has a backlog entry in
 | DÁP eAzonosítás operator login | `DapTransport` trait; `MockDapTransport` driven end to end by a live `POST /api/dap/mock-login`; the OIDC transport is `todo!` | szeusz.gov.hu relying-party credentials and spec access | [D-05](docs/BACKLOG-designed-to-live.md#d-05) |
 | NETLOCK qualified timestamp | `NetlockTsa` compiles into the binary, every method `todo!`; `MockTimestampAuthority` runs in its place | NETLOCK account onboarding, then swapping the authority at the anchor site | [D-06](docs/BACKLOG-designed-to-live.md#d-06) |
 | CAC / PIV operator identity | `DigitalIdProvider` trait with two selectable backends — `MockProvider` and `UsDodCacProvider`, a card-session stub that WARNs on construction and makes `current_operator()` genuinely fallible | A real card reader (PKCS#11) and DoD PKI chain validation instead of the stub's chain-membership check | [D-07](docs/BACKLOG-designed-to-live.md#d-07) |
+| Located-holes geometry, hardened enough to price off *[gate on slice C]* | ADR-0112 slice B mines `located_holes` from STEP into FeatureGraph v6 (`python/aberp-cad-extract/aberp_cad_extract/holes.py`), and the data is emitted on every extract today — but **nothing consumes it**: no quote path and no toolpath reads it, so there is zero live quoting impact | Five open geometry defects (undercut spherical cavities, a dropped Ø16 bore, the zero-caps boss-overhang band, the 118° drill-point apex, and breakout holes) closed **before** slice C — drilling cycle-time pricing — reads the field. This is a hard gate, and all five are pre-existing on the feature rather than regressions | [D-19](docs/BACKLOG-designed-to-live.md#d-19) |
 
 QC inspection results are entered by hand today; the probe sources above
 are what would feed them automatically.
+
+One row above is listed for its code surface rather than for a hardware
+wait: [D-19](docs/BACKLOG-designed-to-live.md#d-19) waits on nothing
+external. It is a **hard gate** in the other direction — the geometry it
+covers is already computed, and the entry exists to stop a *future* pricing
+slice from consuming it before the known defects are closed.
 
 ---
 
