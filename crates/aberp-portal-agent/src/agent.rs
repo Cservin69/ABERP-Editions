@@ -465,6 +465,7 @@ fn parse_body<T: serde::de::DeserializeOwned>(req: &PortalRequest) -> Option<T> 
 fn webauthn_reason(e: &WebAuthnError) -> &'static str {
     match e {
         WebAuthnError::Rand(_) => "csprng failure",
+        WebAuthnError::TooManyChallenges => "ceremony rate ceiling",
         WebAuthnError::ClientDataEncoding | WebAuthnError::ClientDataJson(_) => {
             "malformed clientData"
         }

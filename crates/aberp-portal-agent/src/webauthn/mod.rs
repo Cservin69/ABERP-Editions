@@ -50,6 +50,17 @@ use cose::Es256PublicKey;
 /// 60 s TTL)".
 pub const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 
+/// Ceiling on simultaneously outstanding challenges.
+///
+/// The ceremony routes are necessarily unauthenticated — they are how
+/// one becomes authenticated — so anyone who has the knock token can
+/// ask for challenges as fast as the tunnel allows. Without a cap that
+/// is an unbounded map on the Mac. One operator with a handful of
+/// devices never approaches 256 within a 60-second window; a caller
+/// who does is not Ervin, and is told so rather than being served
+/// silently.
+pub const MAX_OUTSTANDING_CHALLENGES: usize = 256;
+
 /// Which ceremony a challenge was minted for. A `create` challenge
 /// presented in a `get` is refused: without this, an enrolment nonce
 /// observed in flight could be steered into an authentication.
@@ -82,6 +93,10 @@ pub enum WebAuthnError {
     WrongCeremonyType { got: String, want: &'static str },
     #[error("challenge is unknown, expired, or already used")]
     UnknownChallenge,
+    #[error(
+        "too many ceremonies in flight ({MAX_OUTSTANDING_CHALLENGES}) — refusing to mint another"
+    )]
+    TooManyChallenges,
     #[error("origin is `{got}`, expected `{want}` — an assertion for another host verifies against nothing")]
     WrongOrigin { got: String, want: String },
     #[error("attestationObject is not valid base64url")]
@@ -144,11 +159,21 @@ impl ChallengeStore {
         let challenge = rand::token()?;
         let mut g = self.lock();
         g.retain(|_, (_, exp)| *exp > Instant::now());
+        if g.len() >= MAX_OUTSTANDING_CHALLENGES {
+            return Err(WebAuthnError::TooManyChallenges);
+        }
         g.insert(
             challenge.clone(),
             (ceremony, Instant::now() + CHALLENGE_TTL),
         );
         Ok(challenge)
+    }
+
+    /// How many unexpired challenges are outstanding — the number the
+    /// cap is measured against.
+    #[must_use]
+    pub fn outstanding(&self) -> usize {
+        self.lock().len()
     }
 
     /// Consume `challenge` if it is outstanding, unexpired, and was
@@ -507,6 +532,33 @@ mod tests {
             "cross-ceremony use must fail"
         );
         assert!(s.consume(&c, Ceremony::Create));
+    }
+
+    #[test]
+    fn challenge_minting_is_capped() {
+        // Behind the knock, but still unauthenticated: the ceremony
+        // routes must not be an unbounded allocator on the Mac.
+        let s = ChallengeStore::new();
+        for _ in 0..MAX_OUTSTANDING_CHALLENGES {
+            s.mint(Ceremony::Get).expect("under the cap");
+        }
+        assert!(matches!(
+            s.mint(Ceremony::Get),
+            Err(WebAuthnError::TooManyChallenges)
+        ));
+        assert_eq!(s.outstanding(), MAX_OUTSTANDING_CHALLENGES);
+    }
+
+    #[test]
+    fn consuming_a_challenge_makes_room_again() {
+        let s = ChallengeStore::new();
+        let mut minted = Vec::new();
+        for _ in 0..MAX_OUTSTANDING_CHALLENGES {
+            minted.push(s.mint(Ceremony::Get).expect("under the cap"));
+        }
+        assert!(s.mint(Ceremony::Get).is_err());
+        assert!(s.consume(&minted[0], Ceremony::Get));
+        s.mint(Ceremony::Get).expect("room after a consume");
     }
 
     #[test]
