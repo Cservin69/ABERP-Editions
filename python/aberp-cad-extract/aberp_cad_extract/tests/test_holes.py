@@ -2340,7 +2340,7 @@ def test_r6_nearest_root_alone_re_breaks_the_ball_nose(
     monkeypatch.setattr(
         holes_mod,
         "_root_for_end",
-        lambda roots, t_edge, at_low, radius: min(
+        lambda roots, t_edge, at_low, radius, t_inner: min(
             roots, key=lambda root: abs(root[0] - t_edge)
         ),
     )
@@ -2703,22 +2703,57 @@ def test_r7_the_tangency_tie_holds_as_the_pocket_is_walked_down():
     assert not wrong, f"{len(wrong)}/{len(depths)} depths mis-mined: {wrong[:5]}"
 
 
-def test_r7_a_bit_exact_tie_re_breaks_the_whole_sweep(monkeypatch):
-    """REVERT-PROOF for the band, and the round-6 test's blind spot.
+def _round7_root_for_end(roots, t_edge, at_low, radius, _t_inner=None):
+    """`_root_for_end` exactly as ADR-0112 round 7 shipped it.
 
-    `test_r6_nearest_root_alone_re_breaks_the_ball_nose` pins the tie-break
-    by removing it entirely. It cannot see the defect this round is about,
-    because round 6's `==` and round 7's band agree exactly on the one
-    fixture that test uses. So put the criterion back to BIT-EXACT — the
-    code as round 6 shipped it — and require the sweep to collapse.
-
-    Most of the family must break, and the committed round-6 fixture must
-    NOT: that asymmetry IS the defect. A tie that fires on one pocket and
-    not on its neighbours is a coincidence, however geometric its prose.
+    Nearest the mouth, with the two crossings of a TANGENT cap broken by
+    :func:`_tangency_band` in favour of the outward one. Kept verbatim in
+    the tests, not in the miner, because D-19 replaced the trigger and
+    the round-7 claims still have to be checkable — both the one that was
+    right and the one that was not.
     """
     import aberp_cad_extract.holes as holes_mod
 
-    monkeypatch.setattr(holes_mod, "_tangency_band", lambda radius: 0.0)
+    best = min(roots, key=lambda root: abs(root[0] - t_edge))
+    reach = abs(best[0] - t_edge)
+    band = holes_mod._tangency_band(radius)
+    tied = [root for root in roots if abs(abs(root[0] - t_edge) - reach) <= band]
+    sign = -1.0 if at_low else 1.0
+    outward = [root for root in tied if sign * (root[0] - t_edge) >= 0.0]
+    inward = [root for root in tied if sign * (root[0] - t_edge) < 0.0]
+    if not (outward and inward):
+        return best
+    return max(outward, key=lambda root: sign * root[0])
+
+
+def test_r7_nearest_root_alone_re_breaks_the_whole_sweep(monkeypatch):
+    """REVERT-PROOF for the void bound, on the whole tangency family.
+
+    `test_r6_nearest_root_alone_re_breaks_the_ball_nose` does this on the
+    one committed fixture. Thirty-six cutters is the family the round-7
+    defect was found on, and it is what shows the protection is not a
+    property of one pocket's arithmetic: take the bound away — leaving a
+    bare nearest-the-mouth pick, which is round 5 — and most of the sweep
+    must collapse.
+
+    Until D-19 this test removed round 7's tangency BAND instead, on the
+    reading that the band was what protected the sweep. It was, and it
+    protected it for a reason that turned out to be more general than the
+    band: the inward pole is disqualified for being inside the bore's own
+    hollow, whether or not anything is tied with it (see
+    :func:`aberp_cad_extract.holes._root_for_end`). Zeroing the band now
+    changes nothing, so the revert has to remove the rule that is
+    actually load bearing.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    monkeypatch.setattr(
+        holes_mod,
+        "_root_for_end",
+        lambda roots, t_edge, at_low, radius, t_inner: min(
+            roots, key=lambda root: abs(root[0] - t_edge)
+        ),
+    )
 
     verdicts = _ball_nose_verdicts(R7_BALL_NOSE_SIZES)
     broken = [
@@ -2729,8 +2764,8 @@ def test_r7_a_bit_exact_tie_re_breaks_the_whole_sweep(monkeypatch):
         or got[1] is not HoleEndCondition.BLIND
     ]
     assert len(broken) > len(verdicts) // 2, (
-        "with a bit-exact tie most of the size sweep must go back to being "
-        f"short and THROUGH; only {len(broken)}/{len(verdicts)} did"
+        "with a bare nearest-the-mouth pick most of the size sweep must go "
+        f"back to being short and THROUGH; only {len(broken)}/{len(verdicts)} did"
     )
 
     # ... and every one of them short by exactly one cutter diameter,
@@ -2742,37 +2777,44 @@ def test_r7_a_bit_exact_tie_re_breaks_the_whole_sweep(monkeypatch):
         ) <= TOL, (radius, got)
 
 
-def test_r7_a_bit_exact_tie_still_passes_the_round6_fixture(
-    fixtures_dir: Path, monkeypatch
-):
-    """The other half of the same statement, on the committed part.
+def test_r7_zeroing_the_band_no_longer_moves_the_tangency(monkeypatch):
+    """The band has stopped being the tangency's protection, deliberately.
 
-    Round 6's fixture is exactly the pocket whose two root distances round
-    to the same double, so a bit-exact tie answers it correctly. Pinned so
-    that nobody reads the test above as "round 6 was wrong about the
-    tangency" — round 6 was right about the tangency and wrong about
-    floating point.
+    Pinned rather than deleted, because "this knob does nothing now" is a
+    claim about the fix and not a tidy-up: D-19 promoted round 6's REASON
+    — a crossing inside the bore's own hollow is not a candidate — from a
+    tie-break to the rule, and the tangency became the zero-undercut
+    member of the undercut family. The band survives only as the slack on
+    that comparison, and a slack of zero rejects the inward pole just the
+    same.
     """
     import aberp_cad_extract.holes as holes_mod
 
     monkeypatch.setattr(holes_mod, "_tangency_band", lambda radius: 0.0)
-    holes = _mine(fixtures_dir / "ball_nose_blind_bore.step")
-    assert len(holes) == 1
-    _approx(holes[0].depth_mm, 16.0)
-    assert holes[0].end_condition is HoleEndCondition.BLIND
+
+    verdicts = _ball_nose_verdicts(R7_BALL_NOSE_SIZES)
+    wrong = {
+        radius: got
+        for radius, got in verdicts.items()
+        if got is None
+        or abs(got[0] - (20.0 - 13.2 + radius)) > TOL
+        or got[1] is not HoleEndCondition.BLIND
+    }
+    assert not wrong, f"{len(wrong)}/{len(verdicts)} pockets moved: {wrong}"
 
 
 def test_r7_the_tangency_band_is_not_a_tuned_epsilon():
     """The band may be moved by decades without moving a single answer.
 
     An epsilon tuned to make a fixture pass has an answer that changes
-    just outside it. This one does not: the noise it must swallow is
-    ~4e-15 mm and the nearest genuinely untied pair in the corpus is
-    15.5 mm away, so everything from 1e-12 to 1e-2 mm of surface
-    mismatch — twenty decades of the quantity the band is derived from —
-    gives the same numbers. :data:`SURFACE_CONFUSION_MM` sits in the
-    middle of that because it is the kernel's own figure, not because it
-    is where the fixtures pass.
+    just outside it. This one does not, in its round-7 role as the
+    tangency tie or in its D-19 role as the slack on the void bound: the
+    noise it must swallow is ~4e-15 mm and the nearest thing it must not
+    swallow is 0.64 mm away, so everything from 1e-12 to 1e-2 mm of
+    surface mismatch — twenty decades of the quantity the band is derived
+    from — gives the same numbers. :data:`SURFACE_CONFUSION_MM` sits in
+    the middle of that because it is the kernel's own figure, not because
+    it is where the fixtures pass.
     """
     import aberp_cad_extract.holes as holes_mod
 
@@ -2794,38 +2836,53 @@ def test_r7_the_tangency_band_is_not_a_tuned_epsilon():
         )
 
 
-def test_r7_the_untied_caps_stay_far_outside_the_band(fixtures_dir: Path):
-    """The torus and the dome are not near-misses of the band.
+def test_d19_no_true_cap_comes_near_the_void_bound(fixtures_dir: Path):
+    """The bound separates two populations that are nowhere near each other.
 
-    Round 6 refused a tolerance because a loose one reads
-    ``bore_through_torus_wall`` as 24 instead of 16. The refusal was
-    sound and the margin is enormous: the closest that fixture's roots
-    come to being tied is four orders outside the band. Measured rather
-    than asserted, so the claim cannot rot.
+    Measured over every committed fixture rather than asserted, so the
+    claim cannot rot. For each crossing the cap walk offers, take how far
+    OUTWARD of its own mouth it sits:
+
+    - every crossing the bound KEEPS is at zero or positive — a true cap
+      lands on its mouth or outside it, and not one of them lands inward
+      even by a float's worth, so the slack is swallowing nothing at all;
+    - every crossing the bound DISCARDS is at least 0.6 mm inward, three
+      orders past the largest slack any fixture's radius produces.
+
+    Between the two there is nothing. That is what makes the slack
+    untunable rather than merely untuned.
     """
     import aberp_cad_extract.holes as holes_mod
 
-    seen = []
+    kept, discarded = [], []
     original = holes_mod._root_for_end
 
-    def spy(roots, t_edge, at_low, radius):
-        reaches = sorted(abs(root[0] - t_edge) for root in roots)
-        if len(reaches) > 1:
-            seen.append((reaches[1] - reaches[0], holes_mod._tangency_band(radius)))
-        return original(roots, t_edge, at_low, radius)
+    def spy(roots, t_edge, at_low, radius, t_inner):
+        if t_inner is not None:
+            sign = -1.0 if at_low else 1.0
+            slack = 0.5 * holes_mod._tangency_band(radius)
+            margins = [sign * (root[0] - t_inner) for root in roots]
+            live = [m for m in margins if m >= -slack]
+            # Where the bound would empty it is not applied, so those
+            # crossings are not ones it judged.
+            if live:
+                kept.extend(live)
+                discarded.extend(m for m in margins if m < -slack)
+        return original(roots, t_edge, at_low, radius, t_inner)
 
     holes_mod._root_for_end = spy
     try:
-        for name in ("bore_through_torus_wall", "bore_through_spherical_dome"):
-            assert len(_mine(fixtures_dir / f"{name}.step")) == 1
+        for path in sorted(fixtures_dir.glob("*.step")):
+            _mine(path)
     finally:
         holes_mod._root_for_end = original
 
-    assert seen, "neither fixture presented a face with two roots"
-    untied = [(gap, band) for gap, band in seen if gap > band]
-    assert untied, "every pair read as tied; these fixtures test nothing"
-    assert min(gap / band for gap, band in untied) > 1e3, (
-        f"an untied pair came within 1000x of the band: {sorted(untied)[:3]}"
+    assert kept and discarded, "the corpus exercised neither side of the bound"
+    assert min(kept) >= 0.0, (
+        f"a crossing the bound kept sat INWARD of its own mouth: {min(kept)}"
+    )
+    assert max(discarded) < -0.6, (
+        f"a discarded crossing came within 0.6 mm of its mouth: {max(discarded)}"
     )
 
 
@@ -2980,8 +3037,17 @@ def test_r7_the_mouth_ray_floor_is_load_bearing(monkeypatch):
     assert len(holes) == 1
     _approx(holes[0].depth_mm, 20.0)
 
+    # TWO knobs, because D-19 added a second and independent reason this
+    # part comes out right: the buried cone crosses the axis 6 mm inside
+    # the bore's own hollow, so the void bound in `_root_for_end` throws
+    # that crossing away before any route is aimed at it. The floor is
+    # still what stops the phantom ROUTE being found, and showing that it
+    # is means taking the later net away as well.
     monkeypatch.setattr(
         holes_mod, "_barrier_chord_tolerance", lambda radius: radius * 1e-12
+    )
+    monkeypatch.setattr(
+        holes_mod, "_mouth_inward_bound", lambda edge, origin, direction, sign: None
     )
     unfloored = mine_cylindrical_holes(part)
     assert len(unfloored) == 1
@@ -2989,6 +3055,17 @@ def test_r7_the_mouth_ray_floor_is_load_bearing(monkeypatch):
         "without the floor this part must pick up a phantom route and read "
         f"the buried cone; got {unfloored[0].depth_mm}"
     )
+
+    # The void bound alone does NOT make the floor redundant: put the
+    # floor back and take only the bound away, and the part still reads
+    # 20.0, so the assertion above is about the floor.
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        holes_mod, "_mouth_inward_bound", lambda edge, origin, direction, sign: None
+    )
+    unbounded = mine_cylindrical_holes(part)
+    assert len(unbounded) == 1
+    _approx(unbounded[0].depth_mm, 20.0)
 
 
 def test_r7_the_mouth_ray_floor_is_not_a_tuned_epsilon(fixtures_dir: Path):
@@ -3070,3 +3147,480 @@ def test_r7_the_refinement_is_inert_where_the_bore_cuts_no_edge(fixtures_dir: Pa
         assert aimed, "the boss aimed none, so this fixture tests nothing"
     finally:
         holes_mod._mouth_ray_fractions = original
+
+
+# ══ D-19: the undercut spherical cavity (N4 + N3) ════════════════════════
+#
+# A spherical seat whose radius EXCEEDS the bore's: a ball-end cutter
+# swung out, a lollipop cutter, an O-ring gland, a seat for a ball. The
+# cavity is wider than the hole that reaches it, so the sphere's upper
+# pole is left in mid-void one sphere radius above the mouth — and the
+# round-6/7 rule, which only looked for a pole in the void when something
+# was TIED with it, walked straight into it.
+
+
+#: Committed undercut parts: name -> (diameter, depth, entry, axis, end,
+#: flat). Every number is one the fixture was BUILT from — the seat sits
+#: at z=12 on a 20 mm plate, so the pocket bottoms at
+#: ``12 - (bore radius + undercut)`` and its depth is ``20`` less that.
+D19_FIXTURES = {
+    "undercut_ball_seat_blind_bore": (
+        12.0,
+        14.1,
+        (20.0, 20.0, 20.0),
+        (0.0, 0.0, -1.0),
+        HoleEndCondition.BLIND,
+        False,
+    ),
+    "undercut_ball_seat_blind_bore_d8": (
+        8.0,
+        12.1,
+        (20.0, 20.0, 20.0),
+        (0.0, 0.0, -1.0),
+        HoleEndCondition.BLIND,
+        False,
+    ),
+    "undercut_ball_seat_at_the_confusion_edge": (
+        16.0,
+        16.000001,
+        (20.0, 20.0, 20.0),
+        (0.0, 0.0, -1.0),
+        HoleEndCondition.BLIND,
+        False,
+    ),
+    "undercut_ball_seat_below_the_confusion": (
+        16.0,
+        16.00000005,
+        (20.0, 20.0, 20.0),
+        (0.0, 0.0, -1.0),
+        HoleEndCondition.BLIND,
+        False,
+    ),
+}
+
+#: What the miner said BEFORE D-19: name -> (depth, end condition), or
+#: ``None`` where it produced no hole at all. Measured against the real
+#: kernel on these exact committed files, not reconstructed from prose.
+D19_BEFORE = {
+    "undercut_ball_seat_blind_bore": (1.9, HoleEndCondition.THROUGH),
+    "undercut_ball_seat_blind_bore_d8": (3.9, HoleEndCondition.THROUGH),
+    "undercut_ball_seat_at_the_confusion_edge": None,
+    "undercut_ball_seat_below_the_confusion": (16.00000005, HoleEndCondition.BLIND),
+}
+
+
+@pytest.mark.parametrize("name", sorted(D19_FIXTURES))
+def test_d19_the_undercut_seat_is_blind_to_its_real_floor(fixtures_dir: Path, name):
+    """An undercut spherical seat is BLIND, and bottoms where it bottoms.
+
+    The floor is the sphere's LOWER pole, which is solid-bounded metal;
+    the upper pole is in the void the bore itself cut and is not the end
+    of anything. Entry is the plate's top face, where the drill went in.
+    """
+    diameter, depth, entry, axis, end, flat = D19_FIXTURES[name]
+    holes = _mine(fixtures_dir / f"{name}.step")
+    assert len(holes) == 1, f"{name}: got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, diameter)
+    _approx(hole.depth_mm, depth)
+    _approx_vec(hole.entry_point_mm, entry)
+    _approx_vec(hole.axis_unit, axis)
+    assert hole.end_condition is end
+    assert hole.flat_bottom is flat
+
+
+@pytest.mark.parametrize("name", sorted(D19_BEFORE))
+def test_d19_every_wrong_answer_was_an_under_quote(name):
+    """The three ways this defect showed, all of them costing money.
+
+    Two of the parts came back SHORT and THROUGH — a pocket priced as a
+    fraction of itself, and as a hole that goes somewhere. The third came
+    back as no hole at all, which is the same under-quote with nothing
+    left to notice it by. Stated as its own test because "wrong" and
+    "cheap" are different claims and only the second one loses money.
+    """
+    was = D19_BEFORE[name]
+    truth = D19_FIXTURES[name][1]
+    if was is None:
+        return  # a dropped hole is short by the whole of it
+    if was[1] is HoleEndCondition.BLIND:
+        # the sub-confusion neighbour, which was already right
+        assert abs(was[0] - truth) <= TOL, name
+        return
+    assert was[0] < truth - TOL, name
+
+
+def test_d19_the_dropped_hole_was_a_silent_under_count():
+    """The worst of the three: a part with one bore mining ZERO.
+
+    Pinned separately because a missing hole cannot be spotted by
+    eyeballing a depth. At Ø16 with the seat at z=12 the pole in the void
+    lands at z=20.000001 — above the plate's own top face and still
+    inside the far bound — so the span came out negative and
+    :func:`mine_cylindrical_holes` dropped the bore.
+    """
+    assert D19_BEFORE["undercut_ball_seat_at_the_confusion_edge"] is None
+    assert D19_FIXTURES["undercut_ball_seat_at_the_confusion_edge"][1] > 16.0
+
+
+def test_d19_the_before_table_is_measured_and_not_remembered(fixtures_dir: Path):
+    """`D19_BEFORE` is checkable, on the committed files, to the digit.
+
+    A table of "what it used to say" written in prose rots the moment
+    anybody edits a fixture. Put `_root_for_end` back to round 7 verbatim
+    — the code as it shipped, band and all — and every entry has to come
+    back out of the real kernel: 1.9 and THROUGH, 3.9 and THROUGH, no
+    hole at all, and the sub-confusion neighbour unchanged at its true
+    depth. That last one is the control: it says the fix moved the parts
+    that were wrong and nothing else.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    original = holes_mod._root_for_end
+    holes_mod._root_for_end = _round7_root_for_end
+    try:
+        for name, was in sorted(D19_BEFORE.items()):
+            holes = _mine(fixtures_dir / f"{name}.step")
+            if was is None:
+                assert holes == [], f"{name}: round 7 dropped this bore; got {holes}"
+                continue
+            assert len(holes) == 1, name
+            assert holes[0].depth_mm == pytest.approx(was[0], abs=TOL), name
+            assert holes[0].end_condition is was[1], name
+    finally:
+        holes_mod._root_for_end = original
+
+
+def _undercut_seat(bore_radius, undercut, nose_centre_z=12.0, thickness=20.0):
+    """An undercut spherical seat, built in memory from its dimensions.
+
+    Same construction as ``undercut_ball_seat_blind_bore`` with the
+    cutter, the undercut and the depth free, so the whole family can be
+    swept without a STEP file per member. The pocket bottoms at
+    ``nose_centre_z - (bore_radius + undercut)``.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCylinder,
+        BRepPrimAPI_MakeSphere,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, thickness).Shape()
+    shaft = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(20.0, 20.0, nose_centre_z), gp_Dir(0, 0, 1)),
+        bore_radius,
+        thickness + 10.0,
+    ).Shape()
+    seat = BRepPrimAPI_MakeSphere(
+        gp_Pnt(20.0, 20.0, nose_centre_z), bore_radius + undercut
+    ).Shape()
+    return BRepAlgoAPI_Cut(BRepAlgoAPI_Cut(block, shaft).Shape(), seat).Shape()
+
+
+#: Nine cutters from O1 to O16 ...
+D19_RADII = (0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)
+
+#: ... crossed with the undercut swept ACROSS OCCT's confusion figure.
+#: 0 is the tangent ball nose; 5e-8 and 1e-7 are at or below
+#: `SURFACE_CONFUSION_MM`, where round 7's band still read the seat as the
+#: tangency it cannot be told apart from; 4e-7 upward is where the band
+#: stopped firing and the defect appeared. The boundary must not be
+#: visible in the answers.
+D19_UNDERCUTS = (0.0, 5e-8, 1e-7, 2e-7, 4e-7, 1e-6, 1e-5, 1e-3, 0.05, 0.5)
+
+
+def _undercut_verdicts(radii=D19_RADII, undercuts=D19_UNDERCUTS, nose_centre_z=12.0):
+    """``{(radius, undercut): (depth, end condition)}`` over the family."""
+    out = {}
+    for radius in radii:
+        for undercut in undercuts:
+            holes = mine_cylindrical_holes(_undercut_seat(radius, undercut, nose_centre_z))
+            out[(radius, undercut)] = (
+                (holes[0].depth_mm, holes[0].end_condition) if len(holes) == 1 else None
+            )
+    return out
+
+
+def _undercut_wrong(verdicts, nose_centre_z=12.0, thickness=20.0):
+    """The members of a sweep that are not at their built depth and BLIND."""
+    return {
+        key: got
+        for key, got in verdicts.items()
+        if got is None
+        or abs(got[0] - (thickness - nose_centre_z + key[0] + key[1])) > TOL
+        or got[1] is not HoleEndCondition.BLIND
+    }
+
+
+def test_d19_the_undercut_family_is_right_across_size_and_undercut():
+    """Ninety seats: every cutter, every undercut, one mechanism.
+
+    Two committed parts could be two coincidences. This is the family
+    they belong to, swept along BOTH axes at once — the cutter, which
+    sets how far into the void the wrong pole sits, and the undercut,
+    which sets whether the kernel can tell the seat from a tangent ball
+    nose at all. Nothing in the answers may show where that boundary is.
+    """
+    wrong = _undercut_wrong(_undercut_verdicts())
+    assert not wrong, f"{len(wrong)}/90 seats mis-mined: {sorted(wrong)[:6]}"
+
+
+def test_d19_the_undercut_family_is_right_as_the_seat_is_walked_down():
+    """The same family along the third axis: one seat, every depth.
+
+    O8 with 0.1 mm of undercut, walked from a seat centre of 4.6 to 18.9
+    in steps of 0.1. Depth is the one thing the wrong answer tracked most
+    closely — it was always short by exactly two seat radii — so walking
+    it is what shows the fix is not reading a coincidence of one plate.
+
+    The walk stops at 18.9 because at 19.1 the seat stops being one: its
+    mouth reaches the plate's top face, the bore's cylindrical wall is
+    consumed entirely, and what is left is a spherical dish with no bore
+    to mine. That is a different part, not a harder one.
+    """
+    wrong = []
+    for k in range(144):
+        nose_centre_z = 4.6 + 0.1 * k
+        verdicts = _undercut_verdicts(
+            radii=(4.0,), undercuts=(0.1,), nose_centre_z=nose_centre_z
+        )
+        bad = _undercut_wrong(verdicts, nose_centre_z=nose_centre_z)
+        if bad:
+            wrong.append((nose_centre_z, bad))
+    assert not wrong, f"{len(wrong)}/144 depths mis-mined: {wrong[:5]}"
+
+
+def test_d19_nearest_root_alone_re_breaks_the_undercut_family():
+    """REVERT-PROOF for the void bound, on the family it was found on.
+
+    Take the bound away — a bare nearest-the-mouth pick, which is round 5
+    — and every seat in the sweep must go back to being short by exactly
+    two seat radii, because the crossing nearest the mouth IS the pole in
+    the void and it sits one seat radius the wrong side of it.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    original = holes_mod._root_for_end
+    holes_mod._root_for_end = lambda roots, t_edge, at_low, radius, t_inner: min(
+        roots, key=lambda root: abs(root[0] - t_edge)
+    )
+    try:
+        verdicts = _undercut_verdicts(radii=(2.0, 4.0, 6.0), undercuts=(1e-6, 0.1))
+    finally:
+        holes_mod._root_for_end = original
+
+    assert _undercut_wrong(verdicts) == verdicts, "the bound was not load bearing"
+    for (radius, undercut), got in verdicts.items():
+        if got is None:
+            continue
+        short_by = 2.0 * (radius + undercut)
+        assert abs(got[0] - (20.0 - 12.0 + radius + undercut - short_by)) <= TOL, (
+            (radius, undercut),
+            got,
+        )
+        assert got[1] is HoleEndCondition.THROUGH, ((radius, undercut), got)
+
+
+def test_d19_round7s_own_rule_answers_the_tangency_and_not_the_undercut():
+    """Round 7 was right about the tangency and wrong about the trigger.
+
+    Put `_root_for_end` back to round 7 VERBATIM — nearest the mouth,
+    with a tangency broken by the band in favour of the outward crossing
+    — and the two halves of D-19's finding come apart cleanly:
+
+    - the ball-nose sweep is still perfect, so nothing round 7 claimed
+      about the tangency is being contradicted here;
+    - every undercut seat past the confusion figure is still wrong, and
+      the sub-confusion neighbour is still right, which is the whole
+      shape of the defect: an answer that depended on whether OCCT could
+      tell two surfaces apart.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    original = holes_mod._root_for_end
+    holes_mod._root_for_end = _round7_root_for_end
+    try:
+        tangency = _ball_nose_verdicts(R7_BALL_NOSE_SIZES[:12])
+        seats = _undercut_verdicts(radii=(4.0,), undercuts=(5e-8, 1e-7, 4e-7, 0.1))
+    finally:
+        holes_mod._root_for_end = original
+
+    assert not {
+        radius: got
+        for radius, got in tangency.items()
+        if got is None
+        or abs(got[0] - (20.0 - 13.2 + radius)) > TOL
+        or got[1] is not HoleEndCondition.BLIND
+    }, "round 7's rule must still answer the tangency it was written for"
+
+    survived = sorted(key for key in seats if key not in _undercut_wrong(seats))
+    assert survived == [(4.0, 5e-8), (4.0, 1e-7)], (
+        "round 7's rule must answer exactly the seats OCCT cannot tell from "
+        f"a tangent ball nose, and no others; it answered {survived}"
+    )
+
+
+def test_d19_the_undercut_family_does_not_depend_on_the_root_order():
+    """S3 over the seat: OCCT's list order may not reach the answer.
+
+    `GeomAPI_IntCS` hands back a sphere's two poles in whatever order it
+    likes, and until D-19 the nearer of them won an undercut seat. Now
+    neither of them wins on being listed first, so reversing the list has
+    to leave the family bit-identical.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    radii, undercuts = (2.0, 4.0, 8.0), (0.0, 1e-6, 0.1)
+    forward = _undercut_verdicts(radii=radii, undercuts=undercuts)
+
+    original = holes_mod._cap_axis_intersections
+    holes_mod._cap_axis_intersections = lambda face, origin, direction: list(
+        reversed(original(face, origin, direction))
+    )
+    try:
+        backward = _undercut_verdicts(radii=radii, undercuts=undercuts)
+    finally:
+        holes_mod._cap_axis_intersections = original
+
+    assert repr(sorted(forward.items())) == repr(sorted(backward.items()))
+
+    # ... and the same over the FACE walk, which is the other order OCCT
+    # does not promise. The bound is read off one mouth edge at a time,
+    # so the order the edges arrive in must not reach the answer either.
+    collect = holes_mod._collect_faces
+    holes_mod._collect_faces = lambda shape: list(reversed(collect(shape)))
+    try:
+        reversed_walk = _undercut_verdicts(radii=radii, undercuts=undercuts)
+    finally:
+        holes_mod._collect_faces = collect
+
+    assert repr(sorted(forward.items())) == repr(sorted(reversed_walk.items()))
+
+
+def test_d19_the_void_bound_narrows_and_never_empties(fixtures_dir: Path):
+    """Where the bound would leave no candidate it is not applied.
+
+    A bore STRADDLING a convex rounded edge reaches the fillet along a
+    mouth that lies entirely ABOVE where the fillet's carrier crosses the
+    axis, so both of that carrier's crossings read as void and the bound
+    has nothing left to offer. It withdraws, the fillet's evidence stands
+    exactly as it did, and
+    :meth:`aberp_cad_extract.holes._EndEvidence._skin_over_axis` goes on
+    being what rejects it — which is where that rejection belongs, and
+    which is why `test_r6_keeping_every_rim_face_re_breaks_the_straddles`
+    still shows round 5's numbers to the digit.
+
+    Asserted by counting: the straddles must actually reach the empty
+    case, or this is describing something that does not happen.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    emptied = []
+    original = holes_mod._root_for_end
+
+    def spy(roots, t_edge, at_low, radius, t_inner):
+        if t_inner is not None:
+            sign = -1.0 if at_low else 1.0
+            slack = 0.5 * holes_mod._tangency_band(radius)
+            if not [r for r in roots if sign * (r[0] - t_inner) >= -slack]:
+                emptied.append(len(roots))
+        return original(roots, t_edge, at_low, radius, t_inner)
+
+    holes_mod._root_for_end = spy
+    try:
+        assert len(_mine(fixtures_dir / "bore_straddling_a_rounded_edge.step")) == 1
+    finally:
+        holes_mod._root_for_end = original
+
+    assert emptied, "the straddle never reached the empty case; the test is vacuous"
+
+
+def _seat_on_axis(seat_point, direction, bore_radius, undercut, run=30.0):
+    """An undercut seat on a bore of ARBITRARY position and direction.
+
+    `_undercut_seat` builds the family Z-up and seat-at-the-low-end,
+    which is one corner of the space the rule has to hold over. The rule
+    is written in the bore's own frame — inward is ``-sign`` along the
+    bore's axis, not down Z — so the frame has to be varied to show it.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCylinder,
+        BRepPrimAPI_MakeSphere,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    frame = gp_Ax2(gp_Pnt(*seat_point), gp_Dir(*direction))
+    bored = BRepAlgoAPI_Cut(
+        block, BRepPrimAPI_MakeCylinder(frame, bore_radius, run).Shape()
+    ).Shape()
+    seat = BRepPrimAPI_MakeSphere(gp_Pnt(*seat_point), bore_radius + undercut).Shape()
+    return BRepAlgoAPI_Cut(bored, seat).Shape()
+
+
+#: label -> (seat point, bore direction, bore radius, undercut, true depth,
+#: true entry, true axis, the depth D-19 replaced).
+D19_ORIENTATIONS = {
+    "seat at the bore's HIGH end": (
+        (20.0, 20.0, 8.0),
+        (0.0, 0.0, -1.0),
+        4.0,
+        0.1,
+        12.1,
+        (20.0, 20.0, 0.0),
+        (0.0, 0.0, 1.0),
+        3.9,
+    ),
+    "seat at the bore's LOW end": (
+        (20.0, 20.0, 12.0),
+        (0.0, 0.0, 1.0),
+        4.0,
+        0.1,
+        12.1,
+        (20.0, 20.0, 20.0),
+        (0.0, 0.0, -1.0),
+        3.9,
+    ),
+    "seat on a 30 deg angled bore": (
+        (14.0, 20.0, 20.0 - 12.0 * math.cos(math.radians(30.0))),
+        (-0.5, 0.0, math.cos(math.radians(30.0))),
+        3.0,
+        0.1,
+        15.1,
+        (8.0, 20.0, 20.0),
+        (0.5, 0.0, -math.cos(math.radians(30.0))),
+        8.9,
+    ),
+}
+
+
+@pytest.mark.parametrize("label", sorted(D19_ORIENTATIONS))
+def test_d19_the_void_bound_is_in_the_bores_own_frame(label):
+    """The seat is not a Z-up, low-end fact, and neither is the rule.
+
+    Inward is back up the BORE, so the same seat has to come out right
+    capping the bore's high end, capping its low end, and on an axis
+    tilted 30 deg out of Z where "up" and "outward" are different
+    directions. All three read short and THROUGH before D-19, by exactly
+    two seat radii, which is the same signature the Z-up family shows.
+    """
+    point, direction, radius, undercut, depth, entry, axis, was = (
+        D19_ORIENTATIONS[label]
+    )
+    holes = mine_cylindrical_holes(
+        _seat_on_axis(point, direction, radius, undercut)
+    )
+    assert len(holes) == 1, f"{label}: got {[h.depth_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, 2.0 * radius)
+    _approx(hole.depth_mm, depth)
+    _approx_vec(hole.entry_point_mm, entry)
+    _approx_vec(hole.axis_unit, axis)
+    assert hole.end_condition is HoleEndCondition.BLIND
+    # the pre-D-19 answer, and the arithmetic that makes it a signature
+    assert was == pytest.approx(depth - 2.0 * (radius + undercut), abs=TOL)
+    assert was < depth - TOL

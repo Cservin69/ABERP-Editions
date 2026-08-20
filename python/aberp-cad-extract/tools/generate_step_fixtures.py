@@ -1265,6 +1265,98 @@ def bore_beside_a_taller_conical_boss():
     ).Shape()
 
 
+def _undercut_ball_seat(bore_radius: float, undercut: float, nose_centre_z: float = 12.0):
+    """A blind bore ended by a spherical seat WIDER than the bore itself.
+
+    A ball-end cutter plunged and then swung, a lollipop cutter, an
+    O-ring gland, a seat for a ball: the sphere's radius EXCEEDS the
+    bore's by ``undercut``, so the cavity is wider than the hole that
+    reaches it and the sphere's upper pole is left in mid-void, one
+    sphere radius above the mouth and INSIDE the bore's own hollow.
+
+    ``ball_nose_blind_bore`` is the ``undercut = 0`` member of this same
+    family, which is the point: the two are one mechanism, and the
+    committed pair either side of it is what says so.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    bored = BRepAlgoAPI_Cut(
+        block, _cyl(20.0, 20.0, nose_centre_z, 0, 0, 1, bore_radius, 30.0)
+    ).Shape()
+    seat = BRepPrimAPI_MakeSphere(
+        gp_Pnt(20.0, 20.0, nose_centre_z), bore_radius + undercut
+    ).Shape()
+    return BRepAlgoAPI_Cut(bored, seat).Shape()
+
+
+def undercut_ball_seat_blind_bore():
+    """A Ø12 bore ended by a R6.1 spherical seat — 0.1 mm of undercut.
+
+    The seat's two axis crossings are no longer equidistant from the
+    mouth, so round 7's tangency band never fires: the crossing NEAREST
+    the mouth is the pole in mid-void, 6.1 mm up inside the bore, and the
+    miner ended the pocket there. Worse than a wrong depth, the sphere's
+    normal at that pole points down the bore, so the end read OPEN and a
+    pocket that goes nowhere came back THROUGH.
+
+    Expected: 1 hole, Ø12.0, depth 14.1, entry (20, 20, 20), axis
+    (0, 0, -1), BLIND, and NOT a flat bottom. Before D-19: 1.9 and
+    THROUGH — 86.5 % of the hole gone, entry reported at z = 18.1, in
+    mid-air inside the pocket.
+    """
+    return _undercut_ball_seat(6.0, 0.1)
+
+
+def undercut_ball_seat_blind_bore_d8():
+    """The same undercut at a different cutter, so it is a MECHANISM.
+
+    Ø8 with the same 0.1 mm of undercut and the same seat centre. The
+    wrong answer tracks the cutter exactly — the pocket is short by
+    ``2 * nose radius`` every time — which is the signature of the
+    inward pole winning and is not something one part's arithmetic can
+    produce.
+
+    Expected: 1 hole, Ø8.0, depth 12.1, entry (20, 20, 20), axis
+    (0, 0, -1), BLIND, not flat. Before D-19: 3.9 and THROUGH.
+    """
+    return _undercut_ball_seat(4.0, 0.1)
+
+
+def undercut_ball_seat_at_the_confusion_edge():
+    """The undercut that made the bore VANISH: Ø16, 1 µm of undercut.
+
+    Seated at z=12 on a 20 mm plate, the pole in the void lands at
+    ``12 + 8.000001`` — a hair ABOVE the plate's own top face, and still
+    inside the far bound the cap walk allows. The bore's span came out
+    NEGATIVE, and a bore of negative depth is dropped: ZERO holes on a
+    part with one, which is a silent under-count and the worst of the
+    three ways this defect showed.
+
+    One micron is also just past the point where OCCT can still tell the
+    seat from a tangent ball nose, which is why round 7's band caught the
+    sub-micron members and this one went through it.
+
+    Expected: 1 hole, Ø16.0, depth 16.000001, entry (20, 20, 20), axis
+    (0, 0, -1), BLIND, not flat. Before D-19: no hole at all.
+    """
+    return _undercut_ball_seat(8.0, 1e-6)
+
+
+def undercut_ball_seat_below_the_confusion():
+    """The neighbour, 20x smaller an undercut, that D-19 got RIGHT.
+
+    Ø16 again with 50 nm of undercut — below :data:`SURFACE_CONFUSION_MM`,
+    so round 7's band read the seat as the tangency it is
+    indistinguishable from and answered correctly. Committed because a
+    fix that merely moves the boundary would pass the fixture above and
+    break this one; both of them together say the answer does not depend
+    on where the boundary is at all.
+
+    Expected: 1 hole, Ø16.0, depth 16.00000005, entry (20, 20, 20), axis
+    (0, 0, -1), BLIND, not flat — before D-19 as well as after.
+    """
+    return _undercut_ball_seat(8.0, 5e-8)
+
+
 FIXTURES = {
     "plate_4_through_holes.step": plate_4_through_holes,
     "blind_hole_flat_bottom.step": blind_hole_flat_bottom,
@@ -1317,6 +1409,15 @@ FIXTURES = {
     "ball_nose_blind_bore_d4_deep.step": ball_nose_blind_bore_d4_deep,
     "bore_beside_a_conical_boss.step": bore_beside_a_conical_boss,
     "bore_beside_a_taller_conical_boss.step": bore_beside_a_taller_conical_boss,
+    # D-19: the undercut spherical cavity (defects N4 + N3).
+    "undercut_ball_seat_blind_bore.step": undercut_ball_seat_blind_bore,
+    "undercut_ball_seat_blind_bore_d8.step": undercut_ball_seat_blind_bore_d8,
+    "undercut_ball_seat_at_the_confusion_edge.step": (
+        undercut_ball_seat_at_the_confusion_edge
+    ),
+    "undercut_ball_seat_below_the_confusion.step": (
+        undercut_ball_seat_below_the_confusion
+    ),
 }
 
 

@@ -384,20 +384,28 @@ into FeatureGraph v6. The named parts below are where each defect lives:
 `_skin_over_axis`, `_root_for_end`, `_walk_caps`,
 `DEGENERATE_ISOLINE_RATIO`, `SURFACE_CONFUSION_MM`.
 
-**Missing for Live.** The five open defects, in priority order. All are
+**Missing for Live.** Five defects, in priority order. All are
 mutation-verified from adversarial pass 8, and all but N2 **under-quote**
-(they read the part as cheaper than it is):
+(they read the part as cheaper than it is). **Two are CLOSED**; three
+remain, and the gate stands until all five are.
 
-1. **N4 — undercut spherical cavity** (ball-end seat; nose radius exceeds
-   bore radius by `e >= 4e-7`). Reads **up to 87% short** *and* reports a
-   blind pocket as **through**, because the walk ends at the sphere's top
-   pole in mid-void. The trigger is an **ordinary** feature — ball-end
-   undercuts and spherical seats are routine — which combined with the
-   87% makes this the **worst offender**.
-2. **N3 — dropped hole.** A Ø16 bore with undercut `e` in `{4e-7, 1e-6}`
-   returns **zero holes**: a silent under-count, not a wrong number. The
-   trigger is narrow, but the outcome is the worst of the set — the
-   feature vanishes with no signal.
+1. ~~**N4 — undercut spherical cavity**~~ **— CLOSED.** (Ball-end seat;
+   nose radius exceeds bore radius by `e >= 4e-7`.) Read **up to 87%
+   short** *and* reported a blind pocket as **through**, because the walk
+   ended at the sphere's top pole in mid-void. Fixed by promoting round
+   6's own reason — a crossing inside the bore's own hollow bounds
+   nothing — from a tie-break trigger to the rule: `_root_for_end` now
+   discards any crossing inward of the mouth
+   (`_mouth_inward_bound`), of which the ball-nose tangency is the
+   zero-undercut member. Four committed fixtures plus a 90-member
+   size x undercut sweep and a 144-step depth walk.
+2. ~~**N3 — dropped hole**~~ **— CLOSED by the same fix.** A Ø16 bore
+   with undercut `e` in `{4e-7, 1e-6}` returned **zero holes**: the pole
+   in the void landed at z=20.000001 on a 20 mm plate, so the span came
+   out negative and the bore was dropped. Same root cause as N4, same
+   one-line rule; `undercut_ball_seat_at_the_confusion_edge.step` pins
+   it, and `undercut_ball_seat_below_the_confusion.step` pins the
+   sub-confusion neighbour that was already right.
 3. **Zero-caps boss-overhang band.** `_skin_over_axis` narrows to zero
    caps, so the caller falls back to the innermost crossing of the *whole*
    rim and under-reports depth by **0.05–4.36 mm (<= 17.9%)**. This is a
@@ -420,14 +428,17 @@ mutation-verified from adversarial pass 8, and all but N2 **under-quote**
 **Blocked on.** Nothing external. This is purely our own work in one file.
 The adversarial-8 repros lived in the branch's `scratchpad/` and were not
 committed; they are regenerable from the descriptions above and from
-`tools/generate_step_fixtures.py`.
+`tools/generate_step_fixtures.py`. The N3/N4 repros no longer need to be:
+they are committed fixtures and in-memory sweeps in
+`aberp_cad_extract/tests/test_holes.py`.
 
-**Size.** Medium-to-large. N3 and N4 share the undercut root cause and the
-half-order robustness window documented on the round-7 commit
-(`SURFACE_CONFUSION_MM = 1e-7`: correct at `e <= 3x`, fails at `4x`), so
-they are likely one fix. Items 3, 4 and 5 are independent, and item 4 in
-particular is a constant change whose blast radius is the whole fixture
-corpus.
+**Size.** Medium-to-large. N3 and N4 shared the undercut root cause and
+the half-order robustness window documented on the round-7 commit
+(`SURFACE_CONFUSION_MM = 1e-7`: correct at `e <= 3x`, fails at `4x`), and
+they were indeed one fix — the boundary is gone rather than moved, so the
+answer no longer depends on whether OCCT can tell the seat from a tangent
+ball nose. Items 3, 4 and 5 are independent, and item 4 in particular is
+a constant change whose blast radius is the whole fixture corpus.
 
 ---
 
