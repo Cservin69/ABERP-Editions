@@ -240,7 +240,8 @@ async fn a_scan_burst_is_one_alert_not_a_flood() {
     assert!(!samples.is_empty());
     // Every probe is counted even though only a capped sample survives:
     // the batch summaries' totals add up to the whole burst.
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         let total: u64 = p
             .canary_log()
             .iter()

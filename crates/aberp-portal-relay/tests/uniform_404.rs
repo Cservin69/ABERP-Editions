@@ -129,13 +129,29 @@ async fn attach_agent(broker: &Arc<Broker>) {
                 .await;
         }
     });
-    for _ in 0..200 {
-        if broker.agent_connected() {
+    // A deadline, not a fixed number of 5 ms naps. CI runners and a
+    // developer machine running a parallel build are both slow enough
+    // to lose a one-second race here, and a test that goes red under
+    // load is a false red on a required check — indistinguishable from
+    // a real regression, which this repo's ci.yml already has scars
+    // from.
+    await_condition(
+        || broker.agent_connected(),
+        "the in-memory agent never attached",
+    )
+    .await;
+}
+
+/// Poll `condition` until it holds or the deadline passes.
+async fn await_condition(mut condition: impl FnMut() -> bool, failure: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if condition() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    panic!("the in-memory agent never attached");
+    panic!("{failure} (waited 30s)");
 }
 
 /// The probe matrix: paths a scanner actually tries, plus the shapes

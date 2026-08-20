@@ -420,11 +420,11 @@ mod tests {
             }
         });
 
-        // Wait for the Hello to land.
-        for _ in 0..200 {
-            if broker.agent_connected() {
-                break;
-            }
+        // Wait for the Hello to land, against a deadline rather than a
+        // fixed nap count — a loaded machine loses a one-second race
+        // here and reds the build for no reason.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline && !broker.agent_connected() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         broker

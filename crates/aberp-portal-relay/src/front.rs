@@ -173,7 +173,6 @@ fn trip(
     headers: &HeaderMap,
 ) {
     front.canary.observe(Observation {
-        at: std::time::Instant::now(),
         wall: time::OffsetDateTime::now_utc(),
         source,
         method: method.as_str().to_string(),

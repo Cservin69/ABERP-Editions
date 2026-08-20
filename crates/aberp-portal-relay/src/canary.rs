@@ -124,9 +124,13 @@ impl Default for AggregatorConfig {
 }
 
 /// One observation, as the response path hands it over.
+///
+/// The timestamp is wall-clock because it is reported to a human and
+/// correlated with other logs. Windowing uses the aggregator's own
+/// monotonic clock rather than a stamp carried per observation, so
+/// there is no second clock here to disagree with it.
 #[derive(Debug)]
 pub struct Observation {
-    pub at: Instant,
     pub wall: time::OffsetDateTime,
     pub source: Option<IpAddr>,
     pub method: String,
@@ -427,7 +431,6 @@ mod tests {
 
     fn observation(path: &str, host: Option<&str>) -> Observation {
         Observation {
-            at: Instant::now(),
             wall: time::OffsetDateTime::now_utc(),
             source: Some("203.0.113.7".parse().expect("ip")),
             method: "GET".into(),

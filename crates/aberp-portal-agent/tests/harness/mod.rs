@@ -358,8 +358,11 @@ pub async fn start_portal(tag: &str) -> Portal {
     let a = Arc::clone(&agent);
     tokio::spawn(async move { tunnel::run_forever(a).await });
 
-    // Wait for the tunnel to publish the knock token.
-    for _ in 0..400 {
+    // Wait for the tunnel to publish the knock token, against a
+    // deadline — see the note in `uniform_404.rs` on load-sensitive
+    // waits reading as regressions.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         if broker.knock_matches(&knock) {
             return Portal {
                 base: format!("http://127.0.0.1:{}", front_addr.port()),
@@ -373,7 +376,7 @@ pub async fn start_portal(tag: &str) -> Portal {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("the agent never dialled the relay");
+    panic!("the agent never dialled the relay (waited 30s)");
 }
 
 impl Portal {
@@ -412,7 +415,8 @@ impl Portal {
     /// on it), so the test waits for the outcome instead of guessing a
     /// duration.
     pub async fn await_canary(&self, at_least: usize) -> Vec<serde_json::Value> {
-        for _ in 0..400 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
             let log = self.canary_log();
             let samples: Vec<_> = log
                 .iter()
