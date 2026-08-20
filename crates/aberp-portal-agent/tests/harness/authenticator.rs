@@ -13,6 +13,8 @@
 //! this authenticator can therefore also lie about it, which is exactly
 //! what `refuses_an_assertion_without_user_verification` needs.
 
+#![allow(dead_code)]
+
 use ciborium::value::Value;
 use p256::ecdsa::signature::Signer as _;
 use sha2::{Digest, Sha256};

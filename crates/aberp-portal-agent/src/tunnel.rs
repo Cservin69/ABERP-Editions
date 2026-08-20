@@ -150,6 +150,13 @@ pub async fn connect_once(agent: &Arc<Agent>) -> Result<(), TunnelError> {
         .write_frame(&Frame::Hello {
             protocol_version: PROTOCOL_VERSION,
             knock_token,
+            // The canary needs the label to tell "someone typed the
+            // hostname" from "someone hit the IP" — the whole
+            // HIGH-versus-LOW distinction. It lives in the relay's
+            // memory for the life of this connection and nowhere else,
+            // the same posture as the knock token above.
+            expected_host: Some(cfg.rp_id.clone()),
+            tripwire_path: cfg.tripwire_path.clone(),
             tunnel_id: tunnel_id.clone(),
         })
         .await?;
@@ -214,6 +221,13 @@ where
                 let _ = tx.send(Frame::Pong { nonce }).await;
             }
             Frame::Pong { .. } => {}
+            Frame::Canary { batch } => {
+                // Off the frame loop: the alert path can block on SMTP
+                // for as long as its timeout allows, and the tunnel must
+                // keep answering requests while it does.
+                let agent = Arc::clone(agent);
+                tokio::spawn(async move { agent.canary.record(&batch).await });
+            }
             // The agent is the only party that sends these; a relay
             // that sent one is not speaking this protocol.
             Frame::Hello { .. } | Frame::Response { .. } => {

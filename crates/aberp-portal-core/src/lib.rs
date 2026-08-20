@@ -16,6 +16,8 @@
 //! claim auditable is for the shared surface to contain no policy, no
 //! credential handling, and no persistence — just
 //!
+//! - [`canary`] — the scanner-trap observation types and classifier
+//!   (the trap itself is split across the front and the agent);
 //! - [`frame`] — the length-prefixed codec that carries Leg B;
 //! - [`proto`] — the request/response shapes that cross it;
 //! - [`pin`] — the mutual peer-pinning TLS configs (ADR-0113 §2.3);
@@ -42,11 +44,13 @@
 //! sends [`proto::Frame::Request`]s; the agent answers with
 //! [`proto::Frame::Response`]s carrying the same `id`.
 
+pub mod canary;
 pub mod ct;
 pub mod frame;
 pub mod pin;
 pub mod proto;
 
+pub use canary::{CanaryBatch, ProbeSample, Reason, Severity};
 pub use frame::{FrameError, FrameReader, FrameWriter, MAX_FRAME_BYTES};
 pub use pin::{PinError, PinnedFingerprint};
 pub use proto::{Frame, PortalRequest, PortalResponse};

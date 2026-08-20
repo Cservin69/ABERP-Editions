@@ -22,6 +22,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+<!--
+  Inline, empty icons. Without these a browser asks the BARE HOST for
+  /favicon.ico (and, on "Add to Home Screen", /apple-touch-icon.png) —
+  requests that carry no knock token and DO carry the portal hostname,
+  which the canary would correctly read as a high-severity probe. Every
+  legitimate visit would page Ervin. Declaring the icons here stops the
+  requests being made at all; `canary::AUTHORISED_GRACE` on the relay is
+  the belt to this file's braces, because browser icon behaviour is not
+  something to bet a pager on.
+
+  `data:,` is also the right answer for §3.2 independently: there is no
+  favicon to fetch, so there is no portal artifact to fingerprint.
+-->
+<link rel="icon" href="data:,">
+<link rel="apple-touch-icon" href="data:,">
 <title>Status</title>
 <style>
   :root { color-scheme: light dark; --fg: #111; --bg: #fff; --muted: #666; --line: #ddd; --ok: #1a7f37; --bad: #b3261e; }

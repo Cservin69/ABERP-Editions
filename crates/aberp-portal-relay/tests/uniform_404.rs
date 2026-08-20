@@ -32,7 +32,7 @@ use std::time::Duration;
 use aberp_portal_core::frame::{FrameReader, FrameWriter};
 use aberp_portal_core::proto::{Frame, PortalResponse, PROTOCOL_VERSION};
 use aberp_portal_relay::broker::serve_agent;
-use aberp_portal_relay::{front, Broker, Front};
+use aberp_portal_relay::{canary, front, Broker, Canary, Front};
 
 const KNOCK: &str = "k4Hn3vQ7ZbYt2mLp";
 
@@ -72,8 +72,18 @@ async fn observe(client: &reqwest::Client, method: reqwest::Method, url: &str) -
 async fn start_front() -> (String, Arc<Broker>) {
     aberp_portal_core::pin::install_default_crypto_provider();
     let broker = Arc::new(Broker::new());
+    // The real canary, so this matrix proves the uniform 404 holds
+    // WITH the trap wired in — a trap that changed a byte of the
+    // answer would be the fingerprint §3.2 forbids.
+    let (canary_handle, canary_rx) = Canary::new();
+    tokio::spawn(canary::run_aggregator(
+        Arc::clone(&canary_handle),
+        Arc::clone(&broker),
+        canary_rx,
+    ));
     let app = front::router(Arc::new(Front {
         broker: Arc::clone(&broker),
+        canary: canary_handle,
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -104,6 +114,8 @@ async fn attach_agent(broker: &Arc<Broker>) {
             .write_frame(&Frame::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 knock_token: KNOCK.to_string(),
+                expected_host: Some("portal.test".into()),
+                tripwire_path: "/backup/site-config.old".into(),
                 tunnel_id: "tunnel-uniform404".into(),
             })
             .await
@@ -149,6 +161,9 @@ fn probe_paths() -> Vec<String> {
         format!("/{KNOCK}extra/"),
         // The right knock, percent-encoded — the front never decodes.
         format!("/{}/", KNOCK.replace('4', "%34")),
+        // The canary's decoy: it must answer exactly like everything
+        // else, or the trap is findable by the people it watches.
+        "/backup/site-config.old".into(),
         // Deep and traversal-shaped paths under a valid knock.
         format!("/{KNOCK}/../etc/passwd"),
         format!("/{KNOCK}/index.html"),

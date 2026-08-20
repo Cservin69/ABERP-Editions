@@ -152,6 +152,8 @@ mod tests {
             Frame::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 knock_token: "tok".into(),
+                expected_host: None,
+                tripwire_path: "/decoy".into(),
                 tunnel_id: "tid".into(),
             },
             Frame::Request {

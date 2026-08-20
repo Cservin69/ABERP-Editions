@@ -26,7 +26,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# `io-util` is a real dependency, not a dev one: `frame::FrameReader` /
+# `FrameWriter` are built on `AsyncReadExt` / `AsyncWriteExt`. It was
+# briefly only in `[dev-dependencies]`, which compiled anyway because
+# another workspace member happened to enable the feature — the classic
+# feature-unification trap, where `cargo build -p aberp-portal-core`
+# alone is the only thing that catches it.
+tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "rt", "macros"] }

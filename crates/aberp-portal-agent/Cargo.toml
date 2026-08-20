@@ -37,6 +37,13 @@ hex = { workspace = true }
 # behind an explicit config choice so dev and test never touch the real
 # keychain — see `config::SecretSource`.
 keyring = { workspace = true }
+# The canary alert rides the SMTP SPOC. `lettre` is pinned at the
+# workspace level with the rustls-only feature set and NO native-tls, so
+# there is one TLS backend in the tree and no plaintext transport is
+# constructible — ADR-0047 §1. The agent reuses that pin rather than
+# introducing a second mail path; see `alert.rs` on why the SPOC is
+# single in configuration and policy but not yet in code.
+lettre = { workspace = true }
 p256 = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }

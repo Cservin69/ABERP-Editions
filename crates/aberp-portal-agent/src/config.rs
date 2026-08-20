@@ -22,8 +22,9 @@
 //!
 //! # Secrets come from the keychain in production
 //!
-//! Two secrets exist on the Mac: the agent's mTLS client key (§2.2) and
-//! the ABERP session bearer (§6.4). Both are [`SecretSource`]s so the
+//! Three secrets exist on the Mac: the agent's mTLS client key (§2.2),
+//! the ABERP session bearer (§6.4), and the SMTP password the canary
+//! alert is sent with (ADR-0047). All are [`SecretSource`]s so the
 //! keychain path is the production default while dev and test read a
 //! file or an env var — the DEV keychain-bypass rule, so no test ever
 //! prompts for, or touches, real keychain material.
@@ -187,6 +188,12 @@ pub struct AgentConfig {
     /// `false` drops the `Secure` cookie attribute. Test-only; the
     /// production path never sets it (§4.4 requires `Secure`).
     pub cookie_secure: bool,
+    /// The decoy path the canary treats as an unambiguous scanner hit.
+    /// Published to the relay in the tunnel handshake, so rotating it
+    /// needs no relay redeploy and leaves no value in this repository.
+    pub tripwire_path: String,
+    /// Where canary alerts are delivered.
+    pub alert_sink: crate::alert::AlertSink,
 }
 
 fn env(var: &'static str) -> Result<String, ConfigError> {
@@ -339,6 +346,37 @@ impl AgentConfig {
             },
         };
 
+        let tripwire_path = std::env::var("PORTAL_TRIPWIRE_PATH")
+            .ok()
+            .filter(|v| v.starts_with('/'))
+            .unwrap_or_else(|| aberp_portal_core::canary::DEFAULT_TRIPWIRE_PATH.to_string());
+
+        // `PORTAL_ALERT_SINK`: `smtp` (default), `file:<path>`, `off`.
+        // The default is the real one — an operator who never sets the
+        // variable gets alerts, not silence.
+        let alert_sink = match std::env::var("PORTAL_ALERT_SINK").as_deref() {
+            Ok("off") => crate::alert::AlertSink::Disabled,
+            Ok(v) if v.starts_with("file:") => {
+                crate::alert::AlertSink::File(PathBuf::from(&v["file:".len()..]))
+            }
+            _ => crate::alert::AlertSink::Spoc {
+                seller_toml: home()?
+                    .join(DEFENSE_DATA_DIRNAME)
+                    .join(&tenant)
+                    .join("seller.toml"),
+                // The SAME keychain entry `apps/aberp` uses — the SPOC
+                // is single in configuration even where it is not yet
+                // single in code (see `alert.rs`).
+                password: SecretSource::Keychain {
+                    service: format!("aberp.smtp.{tenant}"),
+                    account: "smtp_password".to_string(),
+                },
+                to: std::env::var("PORTAL_ALERT_TO")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
+            },
+        };
+
         // Opt-OUT, never opt-in: an unset variable yields `Secure`.
         let cookie_secure = std::env::var("PORTAL_COOKIE_INSECURE_FOR_TEST")
             .map(|v| v != "1")
@@ -361,6 +399,8 @@ impl AgentConfig {
             },
             discovery,
             cookie_secure,
+            tripwire_path,
+            alert_sink,
         })
     }
 }

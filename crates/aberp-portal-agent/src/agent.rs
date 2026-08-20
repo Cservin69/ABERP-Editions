@@ -41,6 +41,7 @@ use serde::Deserialize;
 
 use crate::allowlist::{self, Decision};
 use crate::audit::{AuditLog, Event};
+use crate::canary::CanaryWatch;
 use crate::config::AgentConfig;
 use crate::credstore::{Credential, CredentialStore};
 use crate::enrol::EnrolStore;
@@ -64,6 +65,10 @@ pub struct Agent {
     pub knock: KnockStore,
     pub health: HealthMonitor,
     pub audit: AuditLog,
+    /// The Mac half of the scanner trap: the durable probe log and the
+    /// alert. The front sees the probes; this is where the record and
+    /// the SMTP credential live (ADR-0113 §2.4).
+    pub canary: CanaryWatch,
 }
 
 impl Agent {
@@ -83,6 +88,7 @@ impl Agent {
             knock: KnockStore::in_dir(&cfg.state_dir),
             health: HealthMonitor::new(),
             audit: AuditLog::in_dir(&cfg.state_dir),
+            canary: CanaryWatch::new(&cfg.state_dir, cfg.alert_sink.clone()),
             rp,
             cfg,
         }))

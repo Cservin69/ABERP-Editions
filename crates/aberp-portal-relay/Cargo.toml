@@ -38,6 +38,9 @@ rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# `time` stamps the canary's probe records. The relay writes no dates
+# anywhere else — it has no disk state to date.
+time = { workspace = true }
 tokio = { workspace = true, features = ["io-util"] }
 tokio-rustls = { workspace = true }
 tower = { workspace = true }

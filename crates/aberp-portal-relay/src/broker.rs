@@ -51,6 +51,13 @@ const WRITER_QUEUE: usize = 64;
 #[derive(Debug)]
 struct Link {
     knock_token: String,
+    /// The portal hostname the agent published for this tunnel, if it
+    /// has one. In memory only, for the life of the connection — the
+    /// same posture as the knock token (§2.4). The canary needs it to
+    /// tell "named the label" from "hit the IP".
+    expected_host: Option<String>,
+    /// The decoy path the agent published for this tunnel.
+    tripwire_path: String,
     tunnel_id: String,
     tx: mpsc::Sender<Frame>,
     next_id: AtomicU64,
@@ -110,6 +117,37 @@ impl Broker {
     #[must_use]
     pub fn tunnel_id(&self) -> Option<String> {
         self.read().as_ref().map(|l| l.tunnel_id.clone())
+    }
+
+    /// The hostname the connected agent published, if any.
+    #[must_use]
+    pub fn expected_host(&self) -> Option<String> {
+        self.read().as_ref().and_then(|l| l.expected_host.clone())
+    }
+
+    /// The decoy path the connected agent published. Falls back to the
+    /// compiled-in default while no agent is connected, so the trap
+    /// still recognises its own decoy during a tunnel outage.
+    #[must_use]
+    pub fn tripwire_path(&self) -> String {
+        self.read().as_ref().map_or_else(
+            || aberp_portal_core::canary::DEFAULT_TRIPWIRE_PATH.to_string(),
+            |l| l.tripwire_path.clone(),
+        )
+    }
+
+    /// Push a frame to the agent without waiting for room.
+    ///
+    /// `true` iff it was queued. Used by the canary, which must never
+    /// block: it runs on a task the response path feeds, and an
+    /// aggregator stalled on a full writer queue would eventually stall
+    /// the observations behind it. A canary batch that cannot be sent
+    /// now is retried on the next flush.
+    #[must_use]
+    pub fn try_send_now(&self, frame: Frame) -> bool {
+        self.read()
+            .as_ref()
+            .is_some_and(|link| link.tx.try_send(frame).is_ok())
     }
 
     /// Forward one request to the Mac and wait for its answer.
@@ -237,21 +275,24 @@ where
     let mut reader = FrameReader::new(read_half);
     let mut writer = FrameWriter::new(write_half);
 
-    let (knock_token, tunnel_id) = match reader.read_frame::<Frame>().await? {
-        Frame::Hello {
-            protocol_version,
-            knock_token,
-            tunnel_id,
-        } => {
-            if protocol_version != PROTOCOL_VERSION {
-                return Err(AgentLegError::ProtocolMismatch {
-                    got: protocol_version,
-                });
+    let (knock_token, expected_host, tripwire_path, tunnel_id) =
+        match reader.read_frame::<Frame>().await? {
+            Frame::Hello {
+                protocol_version,
+                knock_token,
+                expected_host,
+                tripwire_path,
+                tunnel_id,
+            } => {
+                if protocol_version != PROTOCOL_VERSION {
+                    return Err(AgentLegError::ProtocolMismatch {
+                        got: protocol_version,
+                    });
+                }
+                (knock_token, expected_host, tripwire_path, tunnel_id)
             }
-            (knock_token, tunnel_id)
-        }
-        _ => return Err(AgentLegError::NoHello),
-    };
+            _ => return Err(AgentLegError::NoHello),
+        };
 
     let (tx, mut rx) = mpsc::channel::<Frame>(WRITER_QUEUE);
     let writer_task = tokio::spawn(async move {
@@ -265,6 +306,8 @@ where
 
     let link = Arc::new(Link {
         knock_token,
+        expected_host,
+        tripwire_path,
         tunnel_id: tunnel_id.clone(),
         tx,
         next_id: AtomicU64::new(1),
@@ -306,7 +349,11 @@ where
             }
             Frame::Pong { .. } => {}
             // Relay-only frames from the agent are a protocol error.
-            Frame::Hello { .. } | Frame::Request { .. } => return Err(AgentLegError::NoHello),
+            // `Canary` included: it travels relay → agent only, and an
+            // agent that sent one is not speaking this protocol.
+            Frame::Hello { .. } | Frame::Request { .. } | Frame::Canary { .. } => {
+                return Err(AgentLegError::NoHello)
+            }
         }
     }
 }
@@ -356,6 +403,8 @@ mod tests {
                 .write_frame(&Frame::Hello {
                     protocol_version: PROTOCOL_VERSION,
                     knock_token: knock,
+                    expected_host: Some("portal.test".into()),
+                    tripwire_path: "/decoy".into(),
                     tunnel_id: "tunnel-test".into(),
                 })
                 .await
@@ -389,6 +438,21 @@ mod tests {
         assert!(!b.knock_matches("the-toke"));
         assert!(!b.knock_matches("the-tokenX"));
         assert_eq!(b.tunnel_id().as_deref(), Some("tunnel-test"));
+        assert_eq!(b.expected_host().as_deref(), Some("portal.test"));
+        assert_eq!(b.tripwire_path(), "/decoy");
+    }
+
+    #[tokio::test]
+    async fn with_no_agent_the_tripwire_falls_back_to_the_compiled_default() {
+        // The trap must still recognise its own decoy during a tunnel
+        // outage — that is exactly when a scan is most interesting.
+        let b = Broker::new();
+        assert_eq!(
+            b.tripwire_path(),
+            aberp_portal_core::canary::DEFAULT_TRIPWIRE_PATH
+        );
+        assert!(b.expected_host().is_none());
+        assert!(!b.try_send_now(Frame::Ping { nonce: 1 }));
     }
 
     #[tokio::test]

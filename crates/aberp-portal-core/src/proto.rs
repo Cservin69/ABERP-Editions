@@ -36,6 +36,25 @@ pub enum Frame {
         protocol_version: u32,
         /// The current knock token, base64url, no padding.
         knock_token: String,
+        /// The portal's hostname, so the front can tell a probe that
+        /// *named the label* from one that merely reached the IP —
+        /// the difference between a HIGH and a LOW canary.
+        ///
+        /// It arrives with the tunnel and leaves with it, exactly like
+        /// the knock token: never on the relay's disk, never in this
+        /// repository (see `aberp-portal-agent::config`). A hostile
+        /// relay learns the label from the first legitimate request's
+        /// `Host` header anyway, so publishing it here costs nothing
+        /// that was not already spent — and buys the canary its most
+        /// important signal.
+        ///
+        /// `None` when the agent has no hostname to publish; the
+        /// canary then simply never raises `NamedTheHost`.
+        expected_host: Option<String>,
+        /// The decoy path whose every hit is a high-severity canary.
+        /// Published by the agent so rotating it needs no relay
+        /// redeploy.
+        tripwire_path: String,
         /// Fresh random id per connection. Sessions are bound to it
         /// (§4.4 "bound to the front connection that carried the
         /// ceremony"), so a reconnect invalidates every session.
@@ -49,11 +68,20 @@ pub enum Frame {
     Ping { nonce: u64 },
     /// **Either direction.** Keepalive answer.
     Pong { nonce: u64 },
+    /// **Relay → agent.** A coalesced report of probes the front saw.
+    ///
+    /// Travels the tunnel that already exists, in the direction it
+    /// already runs, so the alert can be *sent from the Mac* — the VPS
+    /// never needs SMTP credentials, which §2.4 forbids it to hold.
+    Canary { batch: crate::canary::CanaryBatch },
 }
 
 /// The wire version [`Frame::Hello`] declares. Bumped when the shapes
 /// in this module change incompatibly; the relay refuses anything else.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// `2` added the canary: `Hello` gained `expected_host` and
+/// `tripwire_path`, and [`Frame::Canary`] appeared.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A browser request, forwarded verbatim (minus the knock prefix).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,6 +164,8 @@ mod tests {
         let f = Frame::Hello {
             protocol_version: PROTOCOL_VERSION,
             knock_token: "abc".into(),
+            expected_host: Some("host.invalid".into()),
+            tripwire_path: crate::canary::DEFAULT_TRIPWIRE_PATH.into(),
             tunnel_id: "t1".into(),
         };
         let s = serde_json::to_string(&f).expect("serialise");

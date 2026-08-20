@@ -24,6 +24,7 @@
 //! | Outbound-only, mutually pinned, jittered reconnect | [`tunnel`] |
 //! | ABERP up/down independent of ABERP | [`health`] |
 //! | Metadata-only, append-only, refusals logged | [`audit`] |
+//! | Scanner trap: probe log + rate-limited alert | [`canary`], [`alert`] |
 //!
 //! # What Phase 0 does NOT do, honestly
 //!
@@ -39,10 +40,17 @@
 //!   available for desktop-only use later.
 //! - **No read-only-scoped upstream bearer.** §6.4's liability stands
 //!   until hardening H2 lands in `serve.rs`.
+//! - **The canary records no TLS SNI or client fingerprint** — see
+//!   [`canary`] and `aberp-portal-relay::canary` for why that needs a
+//!   custom TLS acceptor, and why it is Phase 2 rather than half-done.
+//! - **The SMTP SPOC is single in configuration and policy, not yet in
+//!   code** — see [`alert`].
 
 pub mod agent;
+pub mod alert;
 pub mod allowlist;
 pub mod audit;
+pub mod canary;
 pub mod config;
 pub mod credstore;
 pub mod enrol;

@@ -19,6 +19,8 @@ it first; this file assumes it.
 | Relay + front (blind pipe, uniform 404) | `crates/aberp-portal-relay` | the VPS |
 | Shared wire types + mutual pinning | `crates/aberp-portal-core` | both |
 | Portal shell (one HTML file) | `crates/aberp-portal-relay/assets/shell.html` | served by the front |
+| Canary trap (probe detection) | `…-relay/src/canary.rs` | the VPS |
+| Canary trap (probe log + alert) | `…-agent/src/{canary,alert}.rs` | the Mac |
 
 The Mac opens **no inbound port**. There is no `TcpListener` anywhere
 in `aberp-portal-agent`; the only socket it creates is the outbound dial
@@ -131,6 +133,9 @@ Environment:
 | `PORTAL_AGENT_KEY_KEYCHAIN_SERVICE` | keychain service holding its key |
 | `ABERP_PORTAL_STATE_DIR` | defaults to `~/.aberp-defense/portal-agent/` |
 | `ABERP_TENANT` | which tenant's `runtime.json` and keychain bearer to use |
+| `PORTAL_TRIPWIRE_PATH` | the canary's decoy path (defaults to a compiled-in value) |
+| `PORTAL_ALERT_SINK` | `smtp` (default), `file:<path>`, or `off` |
+| `PORTAL_ALERT_TO` | canary alert recipient (defaults to the SPOC's own `from_address`) |
 
 Install as a launchd **daemon** with `KeepAlive` so it starts at boot
 and survives ABERP being stopped, crashed or upgraded. That separation
@@ -162,6 +167,64 @@ aberp-portal-agent revoke --all       # panic button (also drops sessions)
 The audit log is `<state dir>/audit.log`, append-only JSONL, metadata
 only — every proxied request and every auth event, refusals as loudly as
 successes.
+
+---
+
+## 4a. The canary trap
+
+The host has no legitimate unauthenticated traffic — it is never
+linked, never crawled, never referenced. So **every request that fails
+the knock is a probe**, and each one trips a silent canary.
+
+The prober sees nothing. The response is the byte-identical uniform
+404, produced by the same code path in the same shape of time, whether
+they brushed the host or hit the decoy. That is not a nicety: a trap
+that could be detected would be exactly the fingerprint §3.2 forbids,
+and the prober would learn more from finding it than you learn from it
+firing.
+
+**Where the alert comes from.** The probe is seen on the VPS; the mail
+is sent from the **Mac**. §2.4 forbids authentication material at rest
+on the relay and ADR-0047 puts the SMTP password in the keychain, so a
+relay that could send mail would need a credential a relay compromise
+would hand over. Batches ride the tunnel that already exists, in the
+direction it already runs.
+
+**Severity.**
+
+| Class | What it means | Cadence |
+|---|---|---|
+| `suppressed` | the source passed the knock minutes ago — your own browser fetching `/favicon.ico` off the bare host | logged, never mailed |
+| `low` | background noise: reached the IP, did not name the host, asked for nothing meaningful | at most hourly, a digest |
+| `high` | the decoy was hit, the hostname was used, a knock-shaped token was guessed, or an API-shaped path was requested | at most every 5 minutes |
+
+`high` is the one that matters: it means somebody knows something they
+should not. If it was not you, rotate the knock token
+(`aberp-portal-agent rotate-knock`). Passkeys are unaffected — no
+authentication can succeed without your Face ID or Touch ID.
+
+**The decoy.** One path, referenced by nothing: not the shell, not a
+redirect, not a `robots.txt` (there is none). Any hit is unambiguous.
+It defaults to a compiled-in value and is overridden with
+`PORTAL_TRIPWIRE_PATH`, which the agent publishes to the relay in the
+tunnel handshake — so rotating it needs no relay redeploy and leaves no
+value in the repository.
+
+**Coalescing.** Two ceilings, protecting different things. The front
+batches probes into 30-second windows with a 60-second floor between
+`high` batches (protects the tunnel); the agent rate-limits alerts and
+folds the held-back counts into the next one (protects your attention).
+A `/16` sweep is a handful of mails saying "1,400 probes from 62
+sources", not 1,400 mails.
+
+**Storage.** The relay keeps nothing on disk — a bounded in-memory
+window and metadata-only journald lines, per Ervin's §9.5 decision. The
+Mac keeps `<state dir>/canary.log`, append-only JSONL, metadata only,
+rotated at 1 MiB with one generation retained.
+
+**Testing it after deploy.** Request the decoy path from a phone on
+mobile data (not your home IP, which the grace window will suppress).
+You should get the ordinary 404 and an alert within a minute.
 
 ---
 
@@ -198,3 +261,36 @@ successes.
   8 MiB. Bounded and transient — nothing is spooled to disk — but ADR-0113
   §7 wants streaming for large PDFs.
 - **No QR rendering** of the enrolment URL yet; it prints as text.
+- **The canary records no TLS SNI and no client fingerprint.**
+  `ProbeSample::sni` is always `None`: `axum-server`'s rustls acceptor
+  does not surface the handshake's SNI or a JA3-style fingerprint to the
+  handler, and recovering them means running a custom acceptor and
+  threading per-connection state into the request extensions — real
+  regression surface on the one listener that must never behave
+  distinguishably. The `Host` header covers most of the signal, with the
+  caveat that it is client-controlled where SNI is observed. **Phase 2.**
+- **The SMTP SPOC is single in configuration and policy, not in code.**
+  The agent reads the same `[seller.smtp]` section, the same
+  `aberp.smtp.<tenant>` keychain entry and the same closed-vocab
+  `security` field, and builds the transport with the same TLS-mandatory
+  posture — but it is a second call site, because the agent cannot link
+  `apps/aberp` without dragging DuckDB, NAV and Tauri into a daemon that
+  must run when they are stopped. Unifying it means extracting
+  `smtp_config.rs` and the transport builder into a shared crate, which
+  edits the frozen invoice application; that was not taken unilaterally
+  inside a portal build. Until it is, both sites carry the same
+  source-scanning pin against a plaintext fallback. **Should-fix.**
+- **The grace window is IP-based.** A source that passed the knock is
+  treated as the operator for five minutes, so an attacker sharing your
+  egress IP inside that window is suppressed too. The alternative —
+  alerting at HIGH on every legitimate portal visit, because browsers
+  fetch `/favicon.ico` off the bare host — trains you to ignore the
+  alert, which is worse. **Accepted.**
+- **A hostile relay can suppress canaries.** It can drop any frame,
+  including these. Inherent to the relay being untrusted, and not
+  something a mailer on the VPS would fix — that would only add a
+  credential for the same attacker to steal.
+- **The relay's backlog is bounded and volatile.** While the tunnel is
+  down, batches wait in memory (32 of them) and flush on reconnect; a
+  relay restart loses them. Correct for a box that must hold nothing,
+  but it means a scan during an outage may be seen only in part.

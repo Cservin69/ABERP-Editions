@@ -24,6 +24,12 @@
 //!    therefore dropped for the test only (`cookie_secure: false`),
 //!    which `config::AgentConfig::from_env` makes opt-out.
 
+// This module is compiled into every integration-test binary, and each
+// one uses a different slice of it. Without this, the slice a given
+// binary does not use is a `dead_code` warning — and the workspace
+// gate is `clippy --all-targets -D warnings`.
+#![allow(dead_code)]
+
 pub mod authenticator;
 
 use std::path::PathBuf;
@@ -31,10 +37,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use aberp_portal_agent::alert::AlertSink;
 use aberp_portal_agent::config::{AgentConfig, SecretSource, UpstreamConfig, UpstreamDiscovery};
 use aberp_portal_agent::{tunnel, Agent};
 use aberp_portal_core::PinnedFingerprint;
-use aberp_portal_relay::{front, Broker, Front};
+use aberp_portal_relay::{canary as relay_canary, front, Broker, Canary, Front};
 use axum::extract::Path as AxumPath;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -44,6 +51,10 @@ use sha2::{Digest, Sha256};
 pub const UPSTREAM_BEARER: &str = "test-session-token-not-a-real-secret";
 pub const INVOICE_ID: &str = "INV-2026-0001";
 pub const PDF_MAGIC: &[u8] = b"%PDF-1.7 stub";
+/// The decoy the harness plants. Deliberately not the compiled-in
+/// default, so the tests prove the agent's value is what reaches the
+/// front rather than both sides happening to agree on a constant.
+pub const TRIPWIRE_PATH: &str = "/backup/site-config.old";
 
 /// A self-signed loopback identity plus the SHA-256 its peer pins.
 pub struct Identity {
@@ -243,7 +254,6 @@ pub struct Portal {
     pub stub: StubAberp,
     pub rp_id: String,
     pub origin: String,
-    #[allow(dead_code)]
     pub state_dir: PathBuf,
 }
 
@@ -280,9 +290,26 @@ pub async fn start_portal(tag: &str) -> Portal {
         Arc::new(leg_b_tls),
     ));
 
-    // Leg A: plaintext loopback -- see the module docs.
+    // Leg A: plaintext loopback -- see the module docs. The scanner
+    // trap is the real one, with its real aggregator task, so the e2e
+    // proves the deployed wiring rather than a stub.
+    let (canary_handle, canary_rx) = Canary::new();
+    // The real aggregator, driven at a test cadence. The production
+    // windows are 30 s and 60 s; waiting those out would make the
+    // canary tests minutes long and would tempt someone to stub the
+    // aggregator instead, which is the thing worth testing.
+    tokio::spawn(relay_canary::run_aggregator_with(
+        Arc::clone(&canary_handle),
+        Arc::clone(&broker),
+        canary_rx,
+        relay_canary::AggregatorConfig {
+            flush_interval: Duration::from_millis(50),
+            high_coalesce_window: Duration::from_millis(100),
+        },
+    ));
     let app = front::router(Arc::new(Front {
         broker: Arc::clone(&broker),
+        canary: canary_handle,
     }));
     let front_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -318,6 +345,11 @@ pub async fn start_portal(tag: &str) -> Portal {
         },
         discovery: UpstreamDiscovery::Fixed,
         cookie_secure: false,
+        tripwire_path: TRIPWIRE_PATH.to_string(),
+        // The file sink: no SMTP, no keychain, no real secrets. The
+        // production default is the SPOC; this is the dev/test form the
+        // brief asks for.
+        alert_sink: AlertSink::File(state_dir.join("alerts.log")),
     };
 
     let agent = Agent::new(cfg).expect("agent");
@@ -356,6 +388,43 @@ impl Portal {
             .lines()
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect()
+    }
+
+    /// The Mac-side probe log, parsed.
+    pub fn canary_log(&self) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(self.agent.canary.log_path())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// The alerts the file sink wrote.
+    pub fn alerts(&self) -> String {
+        std::fs::read_to_string(self.state_dir.join("alerts.log")).unwrap_or_default()
+    }
+
+    /// Wait until the canary's window has flushed through the relay,
+    /// down the tunnel, and into the Mac's probe log — or give up.
+    ///
+    /// Polls rather than sleeping a fixed interval: the path is
+    /// genuinely asynchronous by design (the response must never wait
+    /// on it), so the test waits for the outcome instead of guessing a
+    /// duration.
+    pub async fn await_canary(&self, at_least: usize) -> Vec<serde_json::Value> {
+        for _ in 0..400 {
+            let log = self.canary_log();
+            let samples: Vec<_> = log
+                .iter()
+                .filter(|v| v.get("severity").is_some())
+                .cloned()
+                .collect();
+            if samples.len() >= at_least {
+                return samples;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        self.canary_log()
     }
 
     pub fn audit_kinds(&self) -> Vec<String> {

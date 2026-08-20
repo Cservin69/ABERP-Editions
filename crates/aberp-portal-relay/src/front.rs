@@ -44,6 +44,7 @@ use axum::Router;
 use aberp_portal_core::proto::PortalRequest;
 
 use crate::broker::Broker;
+use crate::canary::{Canary, Observation};
 
 /// The one body an unauthenticated caller ever sees.
 ///
@@ -84,6 +85,8 @@ pub const MAX_REQUEST_BODY: usize = 64 * 1024;
 #[derive(Debug)]
 pub struct Front {
     pub broker: Arc<Broker>,
+    /// The scanner trap. Fed on the un-knocked path only.
+    pub canary: Arc<Canary>,
 }
 
 /// Build the router. One fallback, no routes — see the module docs.
@@ -107,12 +110,21 @@ async fn handle(
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     let path = uri.path();
+    let source = connect_info.as_ref().map(|ConnectInfo(a)| a.ip());
+
     let Some((knock, rest)) = split_knock(path) else {
+        trip(&front, source, &method, path, &headers);
         return uniform_404();
     };
     if !front.broker.knock_matches(knock) {
+        trip(&front, source, &method, path, &headers);
         return uniform_404();
     }
+    // A valid knock is the operator. Remember the source briefly so the
+    // browser's own follow-up requests to the bare host — `/favicon.ico`
+    // and friends, which carry no knock — do not page anyone. See
+    // `canary::AUTHORISED_GRACE`.
+    front.canary.note_authorised(source);
 
     // Past the gate. The shell, or a forwarded API call — nothing else.
     match rest {
@@ -139,9 +151,43 @@ async fn handle(
         },
         // A knocked caller asking for a path the portal does not have
         // gets the same 404 as a stranger. There is no "page not found"
-        // page to learn the shape of the app from.
+        // page to learn the shape of the app from. No canary: they
+        // presented the token, so they are the operator or someone who
+        // already has it — which the knock-shaped classifier would only
+        // mislabel.
         _ => uniform_404(),
     }
+}
+
+/// Hand one probe to the canary.
+///
+/// Everything expensive happens on the aggregator task; this is a
+/// struct build and a `try_send`. Identical work for every probe —
+/// tripping the decoy costs exactly what brushing the host costs, so
+/// the trap cannot be found by timing it.
+fn trip(
+    front: &Arc<Front>,
+    source: Option<std::net::IpAddr>,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+) {
+    front.canary.observe(Observation {
+        at: std::time::Instant::now(),
+        wall: time::OffsetDateTime::now_utc(),
+        source,
+        method: method.as_str().to_string(),
+        path: path.to_string(),
+        user_agent: header_str(headers, axum::http::header::USER_AGENT),
+        host: header_str(headers, axum::http::header::HOST),
+    });
+}
+
+fn header_str(headers: &HeaderMap, name: axum::http::header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 /// Split `/<knock>/rest` into `("<knock>", "/rest")`.
@@ -169,6 +215,7 @@ async fn forward(
 ) -> Response {
     use base64::Engine as _;
 
+    let source = connect_info.map(|ConnectInfo(a)| a.ip().to_string());
     let req = PortalRequest {
         // Verbatim. The relay has no opinion about verbs; §6.3 puts
         // that opinion on the Mac.
@@ -181,7 +228,7 @@ async fn forward(
             .map(str::to_string),
         body_b64: (!body.is_empty())
             .then(|| base64::engine::general_purpose::STANDARD.encode(&body)),
-        peer: connect_info.map(|ConnectInfo(a)| a.ip().to_string()),
+        peer: source,
     };
 
     match front.broker.dispatch(req).await {

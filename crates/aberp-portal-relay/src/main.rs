@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aberp_portal_core::PinnedFingerprint;
-use aberp_portal_relay::{broker, front, Broker, Front};
+use aberp_portal_relay::{broker, canary, front, Broker, Canary, Front};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -123,7 +123,20 @@ async fn main() -> Result<()> {
         Arc::new(leg_b_tls),
     ));
 
-    let app = front::router(Arc::new(Front { broker }));
+    // The scanner trap. Its aggregator is a background task, so the
+    // response path only ever does a non-blocking hand-off — see
+    // `aberp_portal_relay::canary`.
+    let (canary_handle, canary_rx) = Canary::new();
+    tokio::spawn(canary::run_aggregator(
+        Arc::clone(&canary_handle),
+        Arc::clone(&broker),
+        canary_rx,
+    ));
+
+    let app = front::router(Arc::new(Front {
+        broker,
+        canary: canary_handle,
+    }));
     tracing::info!(addr = %cli.front_addr, "front listening");
 
     if cli.front_plaintext {
