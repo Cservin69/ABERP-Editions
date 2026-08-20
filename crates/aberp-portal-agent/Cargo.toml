@@ -1,0 +1,75 @@
+[package]
+name = "aberp-portal-agent"
+description = "ADR-0113 Phase 0 — the Mac-side outbound portal agent: WebAuthn relying party, read-only proxy, zero inbound ports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Library + binary. The library half is where every security decision
+# lives (allowlist, WebAuthn verification, session minting) so it can be
+# tested without a daemon, a relay, or a keychain; `src/main.rs` is a
+# thin CLI over it and is the only place `anyhow` appears, per ADR-0021
+# Part A item 2.
+#
+# This crate is a SEPARATE process from `aberp serve` on purpose
+# (ADR-0113 §2.2): its liveness is the portal's liveness, and ABERP's
+# liveness is merely a status it reports. It therefore shares no state,
+# no DuckDB handle and no code with `apps/aberp` — it is a *client* of
+# `serve.rs` over loopback exactly as the Tauri shell is.
+[[bin]]
+name = "aberp-portal-agent"
+path = "src/main.rs"
+
+[dependencies]
+aberp-portal-core = { path = "../aberp-portal-core" }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+ciborium = { workspace = true }
+clap = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+# The OS keychain is where the agent's mTLS client key and the ABERP
+# session bearer live in production (ADR-0113 §2.2 / ADR-0047). Both are
+# behind an explicit config choice so dev and test never touch the real
+# keychain — see `config::SecretSource`.
+keyring = { workspace = true }
+p256 = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+# The end-to-end proof drives the REAL relay binary's library half, so
+# the whole path (front → knock → passkey → relay → agent → loopback
+# read) is exercised rather than mocked. The dependency is one-way:
+# nothing in the relay knows this crate exists.
+aberp-portal-relay = { path = "../aberp-portal-relay" }
+# The end-to-end test stands up a stub that speaks the same contract as
+# `aberp serve`'s four read routes over loopback HTTPS: bearer-gated,
+# self-signed, fingerprint-pinned. It is NOT `aberp serve` itself —
+# booting the real binary would need DuckDB, a tenant, NAV credentials
+# and the keychain, which is the opposite of what a portal test should
+# require. `tests/route_drift.rs` is what keeps the contract honest.
+axum = { workspace = true }
+axum-server = { workspace = true }
+ciborium = { workspace = true }
+rcgen = { workspace = true }
+reqwest = { workspace = true, features = ["cookies"] }
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

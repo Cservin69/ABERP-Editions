@@ -1,0 +1,293 @@
+<!doctype html>
+<!--
+  ADR-0113 Phase 0 — the portal shell.
+
+  Served ONLY to a request that carried the current knock token
+  (§3.3); a stranger never receives a byte of this file, so there is no
+  bundle, favicon or manifest for anyone to fingerprint (§3.2).
+
+  It is deliberately one file of vanilla HTML/CSS/JS with no build step
+  and no dependency: it is served from a machine ADR-0113 treats as
+  honest-but-curious at best, so the less of it there is, the less
+  there is to tamper with — and every security decision it appears to
+  make is actually made on the Mac. The shell hides the invoice nav
+  when ABERP is down; the AGENT refuses the reads regardless (§5.2:
+  "the UI hiding a button is never the enforcement").
+
+  No password field exists anywhere in this file. Passwordless,
+  passkey-only, per Ervin's §9.1 decision.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Status</title>
+<style>
+  :root { color-scheme: light dark; --fg: #111; --bg: #fff; --muted: #666; --line: #ddd; --ok: #1a7f37; --bad: #b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e8e8e8; --bg: #111; --muted: #999; --line: #333; --ok: #4ac26b; --bad: #ff6b60; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 1rem; font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         color: var(--fg); background: var(--bg); max-width: 44rem; margin-inline: auto; }
+  h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }
+  .dot { display: inline-block; width: .6rem; height: .6rem; border-radius: 50%; margin-right: .4rem; }
+  .up .dot { background: var(--ok); } .down .dot { background: var(--bad); }
+  .up strong { color: var(--ok); } .down strong { color: var(--bad); }
+  .muted { color: var(--muted); font-size: .85rem; }
+  button { font: inherit; padding: .7rem 1.1rem; border-radius: 8px; border: 1px solid var(--line);
+           background: var(--fg); color: var(--bg); cursor: pointer; }
+  button.secondary { background: transparent; color: var(--fg); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: .45rem .3rem; border-bottom: 1px solid var(--line); font-size: .9rem; }
+  th { color: var(--muted); font-weight: 500; }
+  a { color: inherit; }
+  .hidden { display: none; }
+  pre { white-space: pre-wrap; word-break: break-word; font-size: .8rem; }
+  .ro { font-size: .75rem; border: 1px solid var(--line); border-radius: 6px; padding: .1rem .4rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<h1>Status <span class="ro">read-only</span></h1>
+
+<div id="gate" class="card hidden">
+  <p id="gate-text">Unlock with the passkey on this device.</p>
+  <button id="gate-button">Unlock</button>
+  <p id="gate-error" class="muted hidden"></p>
+</div>
+
+<div id="status" class="card hidden">
+  <p><span class="dot"></span>ABERP: <strong id="status-text">…</strong></p>
+  <p class="muted" id="status-detail"></p>
+  <p class="muted" id="status-uptime"></p>
+</div>
+
+<div id="invoices" class="card hidden">
+  <table>
+    <thead><tr><th>Invoice</th><th>State</th><th>Total</th><th></th></tr></thead>
+    <tbody id="invoice-rows"></tbody>
+  </table>
+  <p class="muted" id="invoice-note"></p>
+</div>
+
+<div id="detail" class="card hidden">
+  <button class="secondary" id="detail-back">Back</button>
+  <pre id="detail-body"></pre>
+</div>
+
+<script>
+"use strict";
+
+// The API lives under the same knock-prefixed path this page was
+// served from. Nothing here knows the hostname, and nothing here knows
+// the knock token beyond what is already in the address bar.
+const API = location.pathname.replace(/\/+$/, "") + "/api";
+
+const $ = (id) => document.getElementById(id);
+const show = (id, on) => $(id).classList.toggle("hidden", !on);
+
+const b64urlToBytes = (s) => {
+  const pad = s.replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(pad + "===".slice((pad.length + 3) % 4));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+};
+const bytesToB64url = (buf) =>
+  btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+async function api(path, options) {
+  const res = await fetch(API + path, Object.assign({ credentials: "same-origin" }, options || {}));
+  return { status: res.status, body: res.status === 204 ? null : await res.json().catch(() => null) };
+}
+
+// ---- ceremonies -------------------------------------------------------
+// Every value below is minted and verified on the Mac. This code
+// transcribes between JSON and the WebAuthn binary types and does
+// nothing else; there is no decision here worth attacking.
+
+async function authenticate() {
+  const begin = await api("/auth/begin", { method: "POST" });
+  if (begin.status !== 200) throw new Error(begin.body?.error || "unavailable");
+  const o = begin.body;
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge: b64urlToBytes(o.challenge),
+      rpId: o.rpId,
+      timeout: o.timeout,
+      userVerification: o.userVerification,
+      allowCredentials: (o.allowCredentials || []).map((c) => ({
+        type: c.type, id: b64urlToBytes(c.id),
+      })),
+    },
+  });
+  const finish = await api("/auth/finish", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      id: bytesToB64url(assertion.rawId),
+      client_data_json: bytesToB64url(assertion.response.clientDataJSON),
+      authenticator_data: bytesToB64url(assertion.response.authenticatorData),
+      signature: bytesToB64url(assertion.response.signature),
+    }),
+  });
+  if (finish.status !== 200) throw new Error("unlock refused");
+}
+
+async function enrol(token) {
+  const begin = await api("/enrol/begin", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  if (begin.status !== 200) throw new Error("this enrolment link is closed");
+  const o = begin.body.options;
+  const cred = await navigator.credentials.create({
+    publicKey: {
+      rp: o.rp,
+      user: {
+        id: b64urlToBytes(o.user.id),
+        name: o.user.name,
+        displayName: o.user.displayName,
+      },
+      challenge: b64urlToBytes(o.challenge),
+      pubKeyCredParams: o.pubKeyCredParams,
+      timeout: o.timeout,
+      attestation: o.attestation,
+      authenticatorSelection: o.authenticatorSelection,
+      excludeCredentials: (o.excludeCredentials || []).map((c) => ({
+        type: c.type, id: b64urlToBytes(c.id),
+      })),
+    },
+  });
+  const finish = await api("/enrol/finish", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      token,
+      client_data_json: bytesToB64url(cred.response.clientDataJSON),
+      attestation_object: bytesToB64url(cred.response.attestationObject),
+    }),
+  });
+  if (finish.status !== 200) throw new Error("enrolment refused");
+}
+
+// ---- views ------------------------------------------------------------
+
+async function renderStatus() {
+  const { status, body } = await api("/status");
+  if (status !== 200) return false;
+  const up = body.aberp_up === true;
+  $("status").className = "card " + (up ? "up" : "down");
+  $("status-text").textContent = up ? "up" : "down";
+  $("status-detail").textContent = up
+    ? "up since " + body.since
+    : (body.detail || "not running") + " — since " + body.since +
+      (body.last_good ? ", last seen " + body.last_good : "");
+  $("status-uptime").textContent = "portal agent up " + body.agent_uptime_seconds + "s";
+  show("status", true);
+  show("invoices", up);
+  if (up) await renderInvoices();
+  return true;
+}
+
+async function renderInvoices() {
+  const { status, body } = await api("/invoices");
+  const rows = $("invoice-rows");
+  rows.textContent = "";
+  if (status !== 200 || !Array.isArray(body)) {
+    $("invoice-note").textContent = "Invoice list unavailable (" + status + ").";
+    return;
+  }
+  $("invoice-note").textContent = body.length ? "" : "No invoices.";
+  for (const inv of body) {
+    const id = inv.id ?? inv.invoice_id ?? inv.invoice_number ?? "";
+    const tr = document.createElement("tr");
+    const cells = [
+      inv.invoice_number ?? id,
+      inv.state ?? inv.status ?? "",
+      inv.total ?? inv.gross_total ?? inv.total_gross ?? "",
+    ];
+    for (const c of cells) {
+      const td = document.createElement("td");
+      td.textContent = String(c);
+      tr.appendChild(td);
+    }
+    const actions = document.createElement("td");
+    const view = document.createElement("a");
+    view.href = "#";
+    view.textContent = "view";
+    view.addEventListener("click", (e) => { e.preventDefault(); renderDetail(id); });
+    actions.appendChild(view);
+    if (id) {
+      actions.appendChild(document.createTextNode(" · "));
+      const pdf = document.createElement("a");
+      pdf.href = API + "/invoices/" + encodeURIComponent(id) + "/pdf";
+      pdf.target = "_blank";
+      pdf.rel = "noopener";
+      pdf.textContent = "pdf";
+      actions.appendChild(pdf);
+    }
+    tr.appendChild(actions);
+    rows.appendChild(tr);
+  }
+}
+
+async function renderDetail(id) {
+  const { status, body } = await api("/invoices/" + encodeURIComponent(id));
+  $("detail-body").textContent =
+    status === 200 ? JSON.stringify(body, null, 2) : "Unavailable (" + status + ").";
+  show("invoices", false);
+  show("detail", true);
+}
+
+$("detail-back").addEventListener("click", () => {
+  show("detail", false);
+  show("invoices", true);
+});
+
+// ---- boot -------------------------------------------------------------
+
+function pendingEnrolToken() {
+  const m = /(?:^|[#&])enrol=([A-Za-z0-9_-]+)/.exec(location.hash || "");
+  return m ? m[1] : null;
+}
+
+async function boot() {
+  // If a session is already live, the status call succeeds and no
+  // ceremony is needed.
+  if (await renderStatus()) return;
+
+  const token = pendingEnrolToken();
+  if (token) {
+    $("gate-text").textContent = "Enrol this device's passkey.";
+    $("gate-button").textContent = "Enrol";
+  }
+  show("gate", true);
+
+  $("gate-button").addEventListener("click", async () => {
+    show("gate-error", false);
+    try {
+      if (token) {
+        await enrol(token);
+        // Drop the one-time token from the address bar so it does not
+        // linger in history or a synced bookmark.
+        history.replaceState(null, "", location.pathname + location.search);
+      } else {
+        await authenticate();
+      }
+      show("gate", false);
+      await renderStatus();
+    } catch (e) {
+      $("gate-error").textContent = String(e && e.message ? e.message : e);
+      show("gate-error", true);
+    }
+  });
+}
+
+boot();
+</script>
+</body>
+</html>

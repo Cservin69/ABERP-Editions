@@ -1,0 +1,53 @@
+[package]
+name = "aberp-portal-relay"
+description = "ADR-0113 Phase 0 — the VPS-side relay + front: a blind, mutually-authenticated pipe that holds nothing at rest."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Library + binary, same split as the agent: the library half is what
+# the end-to-end test drives, so the thing proven is the thing deployed.
+#
+# The dependency list is the design statement. There is no database
+# driver, no keychain, no crypto beyond TLS, and no `p256` — because a
+# relay that could verify an assertion could mint a session, and
+# ADR-0113 §4.2 says it cannot. If a future change adds storage or
+# verification here, that is the change an adversarial reviewer should
+# stop at.
+[[bin]]
+name = "aberp-portal-relay"
+path = "src/main.rs"
+
+[dependencies]
+aberp-portal-core = { path = "../aberp-portal-core" }
+anyhow = { workspace = true }
+axum = { workspace = true }
+# Public TLS on Leg A (the browser leg). The wildcard `*.abenerp.com`
+# certificate is supplied at deploy time and never lives in this repo —
+# ADR-0113 §3.2 uses the wildcard precisely so the portal's label never
+# enters a Certificate Transparency log.
+axum-server = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+tokio-rustls = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

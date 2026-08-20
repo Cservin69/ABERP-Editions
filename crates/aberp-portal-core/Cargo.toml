@@ -1,0 +1,35 @@
+[package]
+name = "aberp-portal-core"
+description = "ADR-0113 Phase 0 — shared wire types + mTLS pinning for the outbound-only remote portal (agent ↔ relay)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Library crate: typed errors via `thiserror` per ADR-0021 Part A (no
+# `anyhow` in libs).
+#
+# This crate is the ONLY thing the agent (Mac, trusted) and the relay
+# (VPS, untrusted-ish) share. It therefore contains no policy and no
+# secrets — only the frame codec, the request/response shapes that cross
+# Leg B, and the peer-pinning TLS configs both ends build from a
+# fingerprint. Keeping it policy-free is what makes "the relay decides
+# nothing" (ADR-0113 §2.4) checkable by reading one small crate.
+[dependencies]
+base64 = { workspace = true }
+hex = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "rt", "macros"] }
+
+[lints]
+workspace = true

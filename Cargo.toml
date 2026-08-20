@@ -23,6 +23,27 @@
 #                              / `mes.routing_op_state_changed`); transactional
 #                              inventory coupling consumes BOM on Release +
 #                              produces finished good on Complete.
+#   crates/aberp-portal-core - ADR-0113 Phase 0. The shared Leg-B surface
+#                              between the Mac agent and the VPS relay: frame
+#                              codec, request/response shapes, mutual
+#                              certificate pinning, constant-time compare.
+#                              Deliberately policy-free — "the relay decides
+#                              nothing" (ADR-0113 §2.4) is checkable by
+#                              reading this one crate.
+#   crates/aberp-portal-agent- ADR-0113 Phase 0. The Mac-side outbound agent
+#                              daemon: dials OUT to the relay (zero inbound
+#                              ports on the Mac), IS the WebAuthn relying
+#                              party (credential store, challenge verify,
+#                              session mint — §4.2), and proxies a fixed
+#                              GET-only allowlist to the local `aberp serve`
+#                              (§6.3). A SEPARATE process from `aberp serve`
+#                              so it can report ABERP up/down.
+#   crates/aberp-portal-relay- ADR-0113 Phase 0. The VPS-side relay + front:
+#                              a dumb, mutually-authenticated blind pipe with
+#                              NOTHING at rest, plus the front that answers
+#                              every un-knocked request with one uniform 404
+#                              (§3.2). Never mints a session, never stores a
+#                              credential.
 #   crates/audit-ledger      - tamper-evident hash-chained audit ledger (ADR-0008).
 #   crates/aberp-verify      - bundle verifier CLI (ADR-0035, PR-22) — re-verifies
 #                              a per-invoice export bundle from its own bytes alone;
@@ -80,6 +101,9 @@ members = [
     "crates/aberp-work-orders",
     "crates/aberp-qa",
     "crates/aberp-dispatch",
+    "crates/aberp-portal-core",
+    "crates/aberp-portal-agent",
+    "crates/aberp-portal-relay",
     "crates/invoice-pdf",
     "crates/mnb-rates",
     "crates/nav-transport",
@@ -399,6 +423,37 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 # tauri.conf.json + capabilities/*.json. Pinned at the same 2.x line.
 tauri = { version = "2", default-features = false }
 tauri-build = { version = "2", default-features = false }
+
+# ── ADR-0113 Phase 0 additions — the outbound-only remote portal ────
+#
+# `tokio-rustls` is the async TLS stream wrapper for Leg B (the agent's
+# outbound, mutually-pinned connection to the relay — ADR-0113 §2.3).
+# It was ALREADY in Cargo.lock transitively (reqwest 0.13 and lettre
+# both pull it); this line promotes it to a direct pin per ADR-0021 §A0
+# ("pin on first direct use"). It is a thin adapter over the existing
+# `rustls` 0.23 pin — no second TLS backend enters the tree. Both legs
+# of the portal build their `ClientConfig`/`ServerConfig` by hand (see
+# `crates/aberp-portal-core/src/pin.rs`) for the same reason
+# `nav-transport` does: a config we did not construct is a config whose
+# trust anchors we cannot swear to.
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+
+# `p256` is ECDSA over NIST P-256 — the `alg: -7` (ES256) signature
+# every Apple platform authenticator produces. ADR-0113 §4.2 puts the
+# WebAuthn relying party ON THE MAC, so the assertion signature is
+# verified in `crates/aberp-portal-agent`; this is the one primitive
+# that verification needs and the workspace did not already have
+# (SHA-256 is `sha2`, CBOR is `ciborium`, base64url is `base64`).
+#
+# Deliberately NOT `webauthn-rs`: the same operator-twin posture that
+# hand-rolls SOAP in `nav-transport` and the XSD invariants in
+# `nav-xsd-validator` applies here — the RP is ~300 lines of parsing
+# and one signature check, and it sits on the crown-jewel auth path
+# where "we can read every line" is worth more than a framework.
+# `default-features = false` + `ecdsa` keeps the ECDH/JWK/PKCS#8 halves
+# out of the tree; the verifier only needs `VerifyingKey::verify`.
+# License: MIT/Apache-2.0 dual (RustCrypto).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [profile.release]
 # Reproducible builds posture per ADR-0007 section "Supply chain".
