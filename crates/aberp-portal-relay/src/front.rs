@@ -206,6 +206,14 @@ fn render(res: &aberp_portal_core::PortalResponse) -> Response {
     if let Ok(v) = HeaderValue::from_str(&res.content_type) {
         h.insert(axum::http::header::CONTENT_TYPE, v);
     }
+    // Invoice data must not settle into the phone's HTTP cache: this
+    // surface exists to be read from a device that may be shared,
+    // synced or lost, and a cached response outlives both the session
+    // and a knock rotation.
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
     // The cookie was minted on the Mac; the relay only carries it.
     if let Some(cookie) = &res.set_cookie {
         if let Ok(v) = HeaderValue::from_str(cookie) {
@@ -252,6 +260,17 @@ fn stamp_common_headers(h: &mut HeaderMap) {
     h.insert(
         axum::http::header::SERVER,
         HeaderValue::from_static(SERVER_HEADER),
+    );
+    // HSTS per ADR-0113 §2.1, on EVERY response including the uniform
+    // 404. A header that appeared only on portal responses would be a
+    // discriminator; this listener is the only thing on the host, so
+    // "uniform" and "always" are the same thing here. Deliberately
+    // without `includeSubDomains`: the storefront is a different host
+    // with its own posture, and this surface does not get to speak for
+    // it (§8 — "the storefront is untouched").
+    h.insert(
+        axum::http::header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000"),
     );
 }
 

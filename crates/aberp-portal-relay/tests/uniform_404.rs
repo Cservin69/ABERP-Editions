@@ -293,6 +293,28 @@ async fn an_oversized_body_gets_the_uniform_404_rather_than_a_413() {
 }
 
 #[tokio::test]
+async fn portal_responses_are_never_cacheable() {
+    // Invoice data on a phone that may be shared, synced or lost.
+    let (base, broker) = start_front().await;
+    attach_agent(&broker).await;
+    let client = reqwest::Client::new();
+
+    for url in [
+        format!("{base}/{KNOCK}/"),
+        format!("{base}/{KNOCK}/api/status"),
+    ] {
+        let res = client.get(&url).send().await.expect("send");
+        assert_eq!(
+            res.headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "{url} is cacheable"
+        );
+    }
+}
+
+#[tokio::test]
 async fn no_response_ever_advertises_the_portal_in_a_header() {
     let (base, broker) = start_front().await;
     attach_agent(&broker).await;
