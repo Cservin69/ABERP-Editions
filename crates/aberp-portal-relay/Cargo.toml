@@ -1,6 +1,6 @@
 [package]
 name = "aberp-portal-relay"
-description = "ADR-0113 Phase 0 — the VPS-side relay + front: a blind, mutually-authenticated pipe that holds nothing at rest."
+description = "ADR-0115 Phase 0 — the VPS-side relay + front: a blind, mutually-authenticated pipe that holds nothing at rest."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,7 @@ publish.workspace = true
 # The dependency list is the design statement. There is no database
 # driver, no keychain, no crypto beyond TLS, and no `p256` — because a
 # relay that could verify an assertion could mint a session, and
-# ADR-0113 §4.2 says it cannot. If a future change adds storage or
+# ADR-0115 §4.2 says it cannot. If a future change adds storage or
 # verification here, that is the change an adversarial reviewer should
 # stop at.
 [[bin]]
@@ -25,12 +25,12 @@ path = "src/main.rs"
 [dependencies]
 aberp-portal-core = { path = "../aberp-portal-core" }
 anyhow = { workspace = true }
-axum = { workspace = true }
-# Public TLS on Leg A (the browser leg). The wildcard `*.abenerp.com`
-# certificate is supplied at deploy time and never lives in this repo —
-# ADR-0113 §3.2 uses the wildcard precisely so the portal's label never
-# enters a Certificate Transparency log.
-axum-server = { workspace = true }
+# Public TLS on Leg A (the browser leg) is terminated with `tokio-rustls`
+# directly — see `src/http1.rs` for why this crate owns its own
+# connections instead of delegating to a web framework. The wildcard
+# `*.abenerp.com` certificate is supplied at deploy time and never lives
+# in this repo: ADR-0115 §3.2 uses the wildcard precisely so the portal's
+# label never enters a Certificate Transparency log.
 base64 = { workspace = true }
 clap = { workspace = true }
 rustls = { workspace = true }
@@ -43,7 +43,6 @@ thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["io-util"] }
 tokio-rustls = { workspace = true }
-tower = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

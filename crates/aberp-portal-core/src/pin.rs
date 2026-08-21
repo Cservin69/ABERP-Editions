@@ -1,4 +1,4 @@
-//! Mutual peer pinning for Leg B (ADR-0113 §2.3).
+//! Mutual peer pinning for Leg B (ADR-0115 §2.3).
 //!
 //! > The **relay pins the agent** […] The **agent pins the relay** […]
 //! > The public WebPKI is not consulted on Leg B, so a mis-issued
@@ -189,6 +189,33 @@ pub fn relay_server_config(
         .with_client_cert_verifier(verifier)
         .with_single_cert(server_chain, server_key)?;
     Ok(cfg)
+}
+
+/// Leg A's server config: the public wildcard certificate, no client
+/// authentication.
+///
+/// Deliberately ordinary. This is the one TLS surface in the design
+/// that faces the open internet with a WebPKI certificate, and it must
+/// look exactly like every other HTTPS host — a browser reaching it
+/// gets a normal handshake with a normal certificate, because §3.2's
+/// disguise starts below HTTP and a listener that demanded a client
+/// certificate would announce itself as something unusual before a
+/// single request was made.
+///
+/// The knock, not the transport, is the gate on this leg (§9.3's Phase-0
+/// decision; client certificates remain available as hardening H3).
+///
+/// ALPN is left at rustls's default of "unset" rather than advertising
+/// `http/1.1`, matching a stock nginx build that has not been told
+/// about HTTP/2 — one more field with nothing distinguishing in it.
+pub fn front_server_config(
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig, PinError> {
+    install_default_crypto_provider();
+    Ok(ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)?)
 }
 
 /// One verifier type serves both directions — the check is symmetric.

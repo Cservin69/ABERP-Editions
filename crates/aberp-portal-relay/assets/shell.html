@@ -1,13 +1,13 @@
 <!doctype html>
 <!--
-  ADR-0113 Phase 0 — the portal shell.
+  ADR-0115 Phase 0 — the portal shell.
 
   Served ONLY to a request that carried the current knock token
   (§3.3); a stranger never receives a byte of this file, so there is no
   bundle, favicon or manifest for anyone to fingerprint (§3.2).
 
   It is deliberately one file of vanilla HTML/CSS/JS with no build step
-  and no dependency: it is served from a machine ADR-0113 treats as
+  and no dependency: it is served from a machine ADR-0115 treats as
   honest-but-curious at best, so the less of it there is, the less
   there is to tamper with — and every security decision it appears to
   make is actually made on the Mac. The shell hides the invoice nav
@@ -170,6 +170,10 @@ async function enrol(token) {
       challenge: b64urlToBytes(o.challenge),
       pubKeyCredParams: o.pubKeyCredParams,
       timeout: o.timeout,
+      // "direct" since ADR-0115 §4.3a. Forwarded from the agent rather
+      // than hard-coded here: the relying party decides what it will
+      // accept, and this file is served BY the relay, which §4.2 says
+      // decides nothing.
       attestation: o.attestation,
       authenticatorSelection: o.authenticatorSelection,
       excludeCredentials: (o.excludeCredentials || []).map((c) => ({
@@ -186,7 +190,15 @@ async function enrol(token) {
       attestation_object: bytesToB64url(cred.response.attestationObject),
     }),
   });
-  if (finish.status !== 200) throw new Error("enrolment refused");
+  // 202, not 200 (ADR-0115 §4.3b). The ceremony passed every
+  // cryptographic check, including the Apple attestation chain — and
+  // NOTHING has been granted yet. The credential is staged until
+  // someone at the Mac confirms it, and no session was minted here.
+  if (finish.status === 202) return finish.body.code || "";
+  // One shape for every refusal: a device that cannot produce an Apple
+  // attestation and a device presenting a spent token must look the
+  // same from here. The agent's audit log has the real reason.
+  throw new Error("enrolment refused");
 }
 
 // ---- views ------------------------------------------------------------
@@ -275,7 +287,10 @@ async function boot() {
   // ceremony is needed.
   if (await renderStatus()) return;
 
-  const token = pendingEnrolToken();
+  // `let`, not `const`: it is cleared once spent, so the next click
+  // unlocks rather than replaying a token the agent has already
+  // consumed (§4.3 — single use, even inside the 10-minute window).
+  let token = pendingEnrolToken();
   if (token) {
     $("gate-text").textContent = "Enrol this device's passkey.";
     $("gate-button").textContent = "Enrol";
@@ -286,13 +301,24 @@ async function boot() {
     show("gate-error", false);
     try {
       if (token) {
-        await enrol(token);
+        const code = await enrol(token);
+        // Spent — by the agent, whether or not the ceremony verified.
+        // Clearing it here keeps the button honest: the next click is
+        // an unlock, not a replay.
+        token = null;
         // Drop the one-time token from the address bar so it does not
         // linger in history or a synced bookmark.
         history.replaceState(null, "", location.pathname + location.search);
-      } else {
-        await authenticate();
+        // Deliberately NOT signed in. §4.3b commits nothing until a
+        // human at the Mac types this code, so the gate stays up and
+        // the instruction is the whole screen.
+        $("gate-text").textContent =
+          "Almost done. At the Mac, run:  aberp-portal-agent confirm --code " +
+          code + "   — then come back and unlock.";
+        $("gate-button").textContent = "Unlock";
+        return;
       }
+      await authenticate();
       show("gate", false);
       await renderStatus();
     } catch (e) {

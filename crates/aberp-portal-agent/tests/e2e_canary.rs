@@ -58,27 +58,34 @@ async fn observe(c: &reqwest::Client, url: &str, host: Option<&str>) -> Observed
     }
 }
 
+/// Get to an authenticated session the way the operator does.
+///
+/// The credential is committed by the console step (§4.3b) rather than
+/// by replaying a ceremony: a software authenticator cannot enrol at
+/// all under §4.3a, which `e2e_portal::a_software_credential_cannot_enrol`
+/// proves. What this exercises is everything after enrolment — the
+/// assertion, the session mint, and the fact that a legitimate sign-in
+/// raises no alert.
 async fn enrol_and_authenticate(p: &Portal, c: &reqwest::Client, auth: &VirtualAuthenticator) {
-    let token = p.agent.enrolment.mint("iPhone").expect("console enrolment");
+    p.provision_credential(auth, "iPhone");
     let begin: serde_json::Value = c
-        .post(p.url("/api/enrol/begin"))
-        .json(&serde_json::json!({ "token": token }))
+        .post(p.url("/api/auth/begin"))
+        .json(&serde_json::json!({}))
         .send()
         .await
         .expect("begin")
         .json()
         .await
         .expect("json");
-    let challenge = begin["options"]["challenge"].as_str().expect("challenge");
-    let mut body = auth.register_verified(&p.rp_id, &p.origin, challenge);
-    body["token"] = serde_json::Value::String(token);
+    let challenge = begin["challenge"].as_str().expect("challenge");
+    let body = auth.assert_verified(&p.rp_id, &p.origin, challenge);
     let res = c
-        .post(p.url("/api/enrol/finish"))
+        .post(p.url("/api/auth/finish"))
         .json(&body)
         .send()
         .await
         .expect("finish");
-    assert_eq!(res.status().as_u16(), 200);
+    assert_eq!(res.status().as_u16(), 200, "authentication failed");
 }
 
 fn severities(samples: &[serde_json::Value]) -> Vec<String> {
@@ -111,7 +118,7 @@ async fn the_trap_does_not_change_the_response() {
     assert_eq!(noise, named, "naming the host answered differently");
     assert_eq!(
         noise.body,
-        aberp_portal_relay::UNIFORM_404_BODY.as_bytes(),
+        aberp_portal_relay::Class::NotFound.body().as_bytes(),
         "the 404 drifted from the compiled-in constant"
     );
     assert!(!noise.headers.iter().any(|(k, _)| k == "set-cookie"));
@@ -174,7 +181,7 @@ async fn the_tripwire_is_an_instant_high_severity_canary() {
     assert_eq!(res.status().as_u16(), 404);
     assert_eq!(
         res.text().await.expect("body"),
-        aberp_portal_relay::UNIFORM_404_BODY
+        aberp_portal_relay::Class::NotFound.body()
     );
 
     let samples = p.await_canary(1).await;
@@ -360,11 +367,24 @@ async fn a_mutating_verb_on_an_unknocked_path_is_still_only_a_404_and_a_canary()
             .send()
             .await
             .expect("probe");
-        assert_eq!(res.status().as_u16(), 404, "{method}");
-        assert_eq!(
-            res.text().await.expect("body"),
-            aberp_portal_relay::UNIFORM_404_BODY
-        );
+        // Flipped pin (§3.2, the B1/B2 reconciliation). This used to
+        // assert 404 for every verb, on the "one uniform answer"
+        // reading. A real nginx answers `POST` with 404 and `DELETE` /
+        // `PUT` with 405 — its static module serves GET/HEAD/POST and
+        // nothing else — so answering 404 to all three was itself the
+        // tell: no nginx behaves that way.
+        //
+        // The anti-oracle property is untouched, and is what this test
+        // really guards: the answer depends only on the VERB, never on
+        // the path. Both classes are asserted byte-exact below, and
+        // `aberp-portal-relay`'s own `nginx_differential` test proves
+        // both against a live nginx.
+        let expected = match method {
+            reqwest::Method::POST => aberp_portal_relay::Class::NotFound,
+            _ => aberp_portal_relay::Class::NotAllowed,
+        };
+        assert_eq!(res.status().as_u16(), expected.code(), "{method}");
+        assert_eq!(res.text().await.expect("body"), expected.body(), "{method}");
     }
 
     let samples = p.await_canary(1).await;

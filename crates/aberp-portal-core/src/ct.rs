@@ -1,6 +1,6 @@
 //! Constant-time byte comparison.
 //!
-//! Every token the portal compares — the knock token (ADR-0113 §3.3),
+//! Every token the portal compares — the knock token (ADR-0115 §3.3),
 //! the enrolment token (§4.3), the session token (§4.4), the WebAuthn
 //! challenge (§4.3) — goes through here. §3.2 makes the timing
 //! property explicit for the knock in particular: "no timing cliff (the

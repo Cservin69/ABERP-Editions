@@ -1,4 +1,4 @@
-//! The pre-auth gate token (ADR-0113 §3.3, Ervin's §9.3 decision (b)).
+//! The pre-auth gate token (ADR-0115 §3.3, Ervin's §9.3 decision (b)).
 //!
 //! > The token is **not** an authenticator — it only decides *whether
 //! > the door is even visible*; WebAuthn remains the lock.
@@ -10,7 +10,8 @@
 //!
 //! - the relay never has a knock token at rest (§2.4), only for the
 //!   life of a connection it did not initiate;
-//! - when the tunnel is down the relay has no token at all, so *every*
+//! - when the Mac stops polling the relay's lease lapses and it has no
+//!   token at all, so *every*
 //!   request — including a correctly-bookmarked one from Ervin — gets
 //!   the uniform 404. That is §5.3's "Mac down → nothing", achieved by
 //!   construction rather than by a check someone could forget.

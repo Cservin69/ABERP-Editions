@@ -1,6 +1,6 @@
 //! `aberp-portal-agent` — the launchd daemon and its console CLI.
 //!
-//! ADR-0113 §2.2 installs this as a launchd daemon with `KeepAlive`, so
+//! ADR-0115 §2.2 installs this as a launchd daemon with `KeepAlive`, so
 //! it runs from boot and survives ABERP being stopped, crashed or
 //! upgraded. The subcommands other than `run` are the **console**
 //! surface (§4.3): they exist to be typed by someone sitting at the
@@ -13,14 +13,14 @@
 
 use std::sync::Arc;
 
-use aberp_portal_agent::{config::AgentConfig, tunnel, Agent};
+use aberp_portal_agent::{config::AgentConfig, poll, Agent};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
     name = "aberp-portal-agent",
-    about = "ADR-0113 portal agent — outbound-only remote access to this Mac",
+    about = "ADR-0115 portal agent — outbound-only remote access to this Mac",
     long_about = None
 )]
 struct Cli {
@@ -42,6 +42,21 @@ enum Command {
         /// Close any open enrolment window instead of opening one.
         #[arg(long)]
         cancel: bool,
+    },
+    /// Confirm — or reject — a passkey enrolment waiting at this Mac.
+    ///
+    /// ADR-0115 §4.3b. A ceremony that passed every cryptographic check
+    /// is STAGED, not stored: nothing is granted until someone standing
+    /// at this Mac types the code. That is the one check no remote
+    /// attacker can satisfy, and enrolment is the only operation in the
+    /// design that grants standing access.
+    Confirm {
+        /// The code shown on the enrolling device and in the alert mail.
+        #[arg(long, conflicts_with = "reject")]
+        code: Option<String>,
+        /// Discard whatever is staged. Use this if you did not start it.
+        #[arg(long)]
+        reject: bool,
     },
     /// List enrolled credentials.
     Credentials,
@@ -82,6 +97,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Run => run(agent).await,
         Command::Enrol { label, cancel } => enrol(&agent, &label, cancel),
+        Command::Confirm { code, reject } => confirm(&agent, code.as_deref(), reject),
         Command::Credentials => credentials(&agent),
         Command::Revoke { id, all } => revoke(&agent, id.as_deref(), all),
         Command::RotateKnock => rotate_knock(&agent),
@@ -90,7 +106,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run(agent: Arc<Agent>) -> Result<()> {
-    // The health poller is independent of the tunnel: ABERP's state is
+    // The health poller is independent of Leg B: ABERP's state is
     // observed whether or not anyone is looking (§5.1), so the status
     // card is already accurate the moment a session opens.
     let poller = Arc::clone(&agent);
@@ -108,7 +124,7 @@ async fn run(agent: Arc<Agent>) -> Result<()> {
         state_dir = %agent.cfg.state_dir.display(),
         "portal agent starting — outbound only, no listening sockets"
     );
-    tunnel::run_forever(agent).await;
+    poll::run_forever(agent).await;
     Ok(())
 }
 
@@ -134,7 +150,63 @@ fn enrol(agent: &Arc<Agent>, label: &str, cancel: bool) -> Result<()> {
     println!("  {base}/{knock}/#enrol={token}");
     println!();
     println!("Open it on the device being enrolled and approve with Face ID / Touch ID.");
-    println!("(ADR-0113 §4.3 also asks for a QR rendering of this URL — not yet built.)");
+    println!("(ADR-0115 §4.3 also asks for a QR rendering of this URL — not yet built.)");
+    Ok(())
+}
+
+fn confirm(agent: &Arc<Agent>, code: Option<&str>, reject: bool) -> Result<()> {
+    use aberp_portal_agent::audit::Event;
+
+    if reject {
+        agent.staging.clear();
+        println!("Discarded. Nothing was enrolled.");
+        println!();
+        println!("If you did not start this enrolment, rotate the knock token as well:");
+        println!("  aberp-portal-agent rotate-knock");
+        agent.audit.append(
+            &Event::new("portal.enrol.rejected").reason("operator rejected at the console"),
+        );
+        return Ok(());
+    }
+
+    let staged = agent
+        .staging
+        .peek()
+        .context("no passkey enrolment is waiting at this Mac")?;
+
+    let Some(code) = code else {
+        // Shown, not auto-confirmed: the operator must still type it,
+        // so that reading this output is not the same act as approving.
+        println!("A passkey enrolment is waiting for confirmation.");
+        println!();
+        println!("  device:        {}", staged.credential.label);
+        println!("  credential id: {}", staged.credential.id);
+        println!("  code:          {}", staged.code);
+        println!();
+        println!("If this is the enrolment you just started, and the code above matches");
+        println!("the one on that device, run:");
+        println!();
+        println!("  aberp-portal-agent confirm --code {}", staged.code);
+        println!();
+        println!("If you did NOT start it, run `aberp-portal-agent confirm --reject`.");
+        return Ok(());
+    };
+
+    let credential = agent
+        .staging
+        .confirm(code)
+        .context("confirming the staged enrolment")?;
+    let id = credential.id.clone();
+    let label = credential.label.clone();
+    agent
+        .credentials
+        .add(credential)
+        .context("writing the credential store")?;
+    agent
+        .audit
+        .append(&Event::new("portal.enrol.confirmed").credential(id.clone()));
+    println!("Enrolled `{label}` ({id}).");
+    println!("Sign in from that device now — no session was minted by the ceremony itself.");
     Ok(())
 }
 

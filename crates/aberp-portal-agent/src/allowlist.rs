@@ -1,4 +1,4 @@
-//! Read-only, enforced at the agent (ADR-0113 §6.3).
+//! Read-only, enforced at the agent (ADR-0115 §6.3).
 //!
 //! > The allowlist is compiled into the agent as **(method, exact route
 //! > shape)** pairs — the four rows above, `GET` only. Everything else
@@ -29,7 +29,7 @@
 //! requests cannot drift apart.
 
 /// The four `GET` routes of `apps/aberp/src/serve.rs` that Phase 0/1
-/// exposes (ADR-0113 §6.2). Verbatim — `tests/route_drift.rs` asserts
+/// exposes (ADR-0115 §6.2). Verbatim — `tests/route_drift.rs` asserts
 /// they still exist in `serve.rs` so a rename upstream fails the build
 /// rather than the portal at runtime (§7: "drift fails *closed*").
 pub const UPSTREAM_ROUTES: [&str; 4] =
@@ -99,6 +99,15 @@ impl Refusal {
 /// §6.3's promise is that the refusal happens on the Mac, and "the
 /// other end would have refused it" is exactly the reasoning that
 /// promise exists to avoid relying on.
+/// Compared case-INSENSITIVELY. `/invoices/ISSUE` and
+/// `/invoices/Issue` reach the same upstream route as
+/// `/invoices/issue` — axum's router does not lowercase a path segment
+/// before matching a literal, but the upstream stack in front of it
+/// may, and "may" is not something a refusal should rest on. The whole
+/// reason this list exists is that §6.3 promises the refusal happens on
+/// the Mac rather than relying on what the other end would have done,
+/// and a case-sensitive check quietly reintroduces exactly that
+/// reliance for the cost of one keystroke.
 const RESERVED_INVOICE_SEGMENTS: [&str; 1] = ["issue"];
 
 /// Longest permitted invoice id. ABERP invoice ids are ULID- and
@@ -153,7 +162,10 @@ fn invoice_id(raw: &str) -> Result<&str, Refusal> {
     if raw.is_empty() || raw.len() > MAX_INVOICE_ID {
         return Err(Refusal::BadInvoiceId);
     }
-    if RESERVED_INVOICE_SEGMENTS.contains(&raw) {
+    if RESERVED_INVOICE_SEGMENTS
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(raw))
+    {
         return Err(Refusal::BadInvoiceId);
     }
     if raw
@@ -234,11 +246,18 @@ mod tests {
             );
         }
         // `issue` is a legal id *shape*, so it is caught by the reserved
-        // -segment rule rather than by shape matching.
-        assert_eq!(
-            refusal("GET", "/api/invoices/issue", None),
-            Refusal::BadInvoiceId
-        );
+        // -segment rule rather than by shape matching — in EVERY case
+        // spelling. A case-sensitive check here would have let
+        // `/invoices/ISSUE` through to whatever the upstream stack does
+        // with it, which is precisely the "the other end would have
+        // refused it" reasoning §6.3 exists to avoid.
+        for spelling in ["issue", "ISSUE", "Issue", "iSsUe"] {
+            assert_eq!(
+                refusal("GET", &format!("/api/invoices/{spelling}"), None),
+                Refusal::BadInvoiceId,
+                "`{spelling}` was not caught by the reserved-segment rule"
+            );
+        }
     }
 
     #[test]

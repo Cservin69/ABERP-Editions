@@ -1,6 +1,6 @@
 [package]
 name = "aberp-portal-agent"
-description = "ADR-0113 Phase 0 — the Mac-side outbound portal agent: WebAuthn relying party, read-only proxy, zero inbound ports."
+description = "ADR-0115 Phase 0 — the Mac-side outbound portal agent: WebAuthn relying party, read-only proxy, zero inbound ports."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,7 +16,7 @@ publish.workspace = true
 # Part A item 2.
 #
 # This crate is a SEPARATE process from `aberp serve` on purpose
-# (ADR-0113 §2.2): its liveness is the portal's liveness, and ABERP's
+# (ADR-0115 §2.2): its liveness is the portal's liveness, and ABERP's
 # liveness is merely a status it reports. It therefore shares no state,
 # no DuckDB handle and no code with `apps/aberp` — it is a *client* of
 # `serve.rs` over loopback exactly as the Tauri shell is.
@@ -33,7 +33,7 @@ clap = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 # The OS keychain is where the agent's mTLS client key and the ABERP
-# session bearer live in production (ADR-0113 §2.2 / ADR-0047). Both are
+# session bearer live in production (ADR-0115 §2.2 / ADR-0047). Both are
 # behind an explicit config choice so dev and test never touch the real
 # keychain — see `config::SecretSource`.
 keyring = { workspace = true }
@@ -45,6 +45,10 @@ keyring = { workspace = true }
 # single in configuration and policy but not yet in code.
 lettre = { workspace = true }
 p256 = { workspace = true }
+# ADR-0115 §4.3a — the enrolment attestation chain. See the workspace
+# manifest for why these versions and not the newer ones.
+p384 = { workspace = true }
+x509-cert = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

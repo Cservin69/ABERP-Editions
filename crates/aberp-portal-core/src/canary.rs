@@ -2,7 +2,7 @@
 //!
 //! # The premise
 //!
-//! ADR-0113 §G2 says an unauthenticated observer must not be able to
+//! ADR-0115 §G2 says an unauthenticated observer must not be able to
 //! establish that the portal exists. The flip side is the useful one:
 //! **the host has no legitimate unauthenticated traffic at all.** It is
 //! never linked, never crawled, never referenced. So any request that
@@ -29,7 +29,7 @@
 //! # Where the parts live
 //!
 //! - **Front (VPS)** observes and classifies, keeps nothing on disk,
-//!   coalesces into batches and pushes them down the existing tunnel.
+//!   coalesces into batches and hands them to the next poll response.
 //! - **Agent (Mac)** receives batches, writes the rotating probe log,
 //!   rate-limits, and sends the alert through the SMTP SPOC.
 //!
@@ -37,7 +37,7 @@
 //! credentials on the relay would be the single largest regression
 //! available to this build: §2.4 makes "no authentication material at
 //! rest on the VPS" absolute, and ADR-0047 makes the keychain the only
-//! home for the SMTP password. The tunnel already exists and already
+//! home for the SMTP password. The poll loop already runs and already
 //! runs in the right direction, so the canary rides it.
 
 use serde::{Deserialize, Serialize};
@@ -56,7 +56,7 @@ use serde::{Deserialize, Serialize};
 /// with every other request, the answer is the uniform 404.
 ///
 /// Overridable at deploy time via `PORTAL_TRIPWIRE_PATH` on the agent,
-/// which pushes it to the relay in the tunnel handshake — so rotating
+/// which publishes it to the relay on every poll — so rotating
 /// the decoy needs no relay redeploy and leaves no value in this repo.
 pub const DEFAULT_TRIPWIRE_PATH: &str = "/admin/config.backup";
 
@@ -64,10 +64,11 @@ pub const DEFAULT_TRIPWIRE_PATH: &str = "/admin/config.backup";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
-    /// Not a probe: this source passed the knock moments ago, so this
-    /// is almost certainly the operator's own browser making an
-    /// automatic request (`/favicon.ico`, `/apple-touch-icon.png`)
-    /// against the bare host. Counted, never alerted.
+    /// Not a probe: this source passed the knock moments ago AND
+    /// asked for one of the fixed paths a browser fetches on its own
+    /// (`/favicon.ico`, `/apple-touch-icon*.png`, `/manifest.json`)
+    /// against the bare host. Counted, never alerted. Nothing else a
+    /// knocked source asks for lands here.
     Suppressed,
     /// Internet background noise: reached the IP, did not name the
     /// portal's hostname, asked for nothing meaningful. The whole
@@ -96,7 +97,10 @@ impl Severity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
-    /// The source passed the knock within the grace window.
+    /// The source passed the knock within the grace window AND
+    /// asked for one of the handful of paths a browser fetches by
+    /// itself. See [`AUTHORISED_CHATTER_PATHS`] — this is a path
+    /// exemption, not a licence for the source.
     RecentlyAuthorised,
     /// The decoy resource. Unambiguous.
     Tripwire,
@@ -145,7 +149,7 @@ pub struct ProbeInput<'a> {
     /// Request path, as received. Never decoded.
     pub path: &'a str,
     /// `true` iff the `Host` header equalled the hostname the agent
-    /// published for this tunnel.
+    /// published for this presence lease.
     pub matched_expected_host: bool,
     /// `true` iff the path is exactly the tripwire.
     pub tripwire: bool,
@@ -158,21 +162,86 @@ pub struct ProbeInput<'a> {
 /// guess, not a stray crawl.
 pub const KNOCK_TOKEN_CHARS: usize = 43;
 
+/// The **only** paths a recently-authorised source may ask for without
+/// being classified as a probe.
+///
+/// This list exists for one concrete false positive and nothing else: a
+/// browser that has just loaded the portal will, entirely on its own,
+/// ask the **bare host** for these. They carry no knock and they DO
+/// carry the portal's hostname, so without an exemption every
+/// legitimate visit would page Ervin at HIGH severity — and an alert
+/// that fires on normal use is an alert that gets ignored.
+///
+/// It is a fixed *path* allowlist rather than a blanket per-source
+/// suppression, and the difference is the whole point. A blanket
+/// suppression meant a source that had passed the knock in the last
+/// five minutes could ask for **anything** — including the decoy —
+/// without raising a thing, and because each knock renewed the window,
+/// a knocked source hammering the tripwire produced tens of thousands
+/// of hits and zero alerts. Whoever holds the knock token is exactly
+/// the population worth watching once they start asking for things the
+/// portal does not have.
+pub const AUTHORISED_CHATTER_PATHS: [&str; 2] = ["/favicon.ico", "/manifest.json"];
+
+/// Longest path accepted by the `apple-touch-icon` family match. iOS's
+/// longest real form is `/apple-touch-icon-precomposed.png` at 32;
+/// 64 is generous and bounds what the matcher will walk.
+const MAX_CHATTER_PATH: usize = 64;
+
+/// `true` iff `path` is one of the automatic requests a browser makes
+/// against the bare host after loading the portal.
+///
+/// Exact for the fixed names; a bounded family match for iOS's
+/// `apple-touch-icon` variants (`-precomposed`, `-120x120`, and the
+/// cross product). Nothing here percent-decodes, nothing accepts a
+/// second path segment, and the middle of the icon name is restricted
+/// to `[A-Za-z0-9._-]` — so the exemption cannot be widened by a
+/// crafted path.
+#[must_use]
+pub fn is_authorised_chatter(path: &str) -> bool {
+    if path.len() > MAX_CHATTER_PATH {
+        return false;
+    }
+    if AUTHORISED_CHATTER_PATHS.contains(&path) {
+        return true;
+    }
+    const PREFIX: &str = "/apple-touch-icon";
+    const SUFFIX: &str = ".png";
+    let Some(rest) = path.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let Some(middle) = rest.strip_suffix(SUFFIX) else {
+        return false;
+    };
+    middle
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
 /// Classify one probe. Pure, allocation-free, and identical work for
 /// every request — see the module docs on why that matters.
+///
+/// # Order of checks, and why it is this order
+///
+/// 1. **The tripwire first, before anything can suppress it.** Nothing
+///    legitimate ever requests the decoy — not a crawler, not a
+///    redirect, and emphatically not the operator's own browser, which
+///    has never been told the path exists. A hit is unambiguous
+///    regardless of who the source is, so no later branch gets to
+///    silence it.
+/// 2. **Then the narrow browser-chatter exemption**, for a
+///    recently-authorised source only, and only for the exact paths in
+///    [`AUTHORISED_CHATTER_PATHS`] (plus the `apple-touch-icon`
+///    family). Everything else a knocked source asks for classifies
+///    normally.
+/// 3. Then the three "somebody knows something" signals, then noise.
 #[must_use]
 pub fn classify(input: &ProbeInput<'_>) -> Reason {
-    // Checked first so the operator's own browser fetching
-    // `/favicon.ico` against the bare host never pages anyone. It also
-    // means a suppressed source cannot be *escalated* by what it asks
-    // for, which is the trade named in the residuals: an attacker
-    // sharing Ervin's egress IP inside the grace window is suppressed
-    // too.
-    if input.recently_authorised {
-        return Reason::RecentlyAuthorised;
-    }
     if input.tripwire {
         return Reason::Tripwire;
+    }
+    if input.recently_authorised && is_authorised_chatter(input.path) {
+        return Reason::RecentlyAuthorised;
     }
     if input.matched_expected_host {
         return Reason::NamedTheHost;
@@ -266,7 +335,7 @@ pub fn sanitise(raw: &str, max: usize) -> String {
 /// Batching is what keeps a scan burst to one alert. A `/16` sweep can
 /// produce thousands of probes a second; the agent must learn *that it
 /// happened*, not receive it one message at a time.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanaryBatch {
     /// RFC-3339 UTC of the first and last observation in the window.
     pub window_start: String,
@@ -374,17 +443,85 @@ mod tests {
     }
 
     #[test]
-    fn a_recently_authorised_source_is_suppressed_whatever_it_asks_for() {
+    fn a_recently_authorised_source_is_suppressed_only_for_browser_chatter() {
         // The operator's own browser fetching /favicon.ico against the
-        // bare host must not page anyone at 02:00.
-        let mut i = input("/favicon.ico");
+        // bare host must not page anyone at 02:00 …
+        for chatter in [
+            "/favicon.ico",
+            "/manifest.json",
+            "/apple-touch-icon.png",
+            "/apple-touch-icon-precomposed.png",
+            "/apple-touch-icon-120x120.png",
+            "/apple-touch-icon-120x120-precomposed.png",
+        ] {
+            let mut i = input(chatter);
+            i.recently_authorised = true;
+            i.matched_expected_host = true;
+            assert_eq!(classify(&i), Reason::RecentlyAuthorised, "{chatter}");
+            assert_eq!(classify(&i).severity(), Severity::Suppressed, "{chatter}");
+        }
+    }
+
+    #[test]
+    fn a_recently_authorised_source_is_not_a_licence_to_probe() {
+        // This is the flipped pin. The previous behaviour suppressed a
+        // recently-authorised source WHATEVER it asked for, and since a
+        // knock renewed the window, a knocked source hammering the decoy
+        // produced 21,600 hits and zero alerts. Everything outside the
+        // chatter allowlist must now classify normally.
+        let mut i = input("/admin/config.backup");
+        i.recently_authorised = true;
+        i.tripwire = true;
+        assert_eq!(
+            classify(&i),
+            Reason::Tripwire,
+            "a knocked source silenced the tripwire"
+        );
+        assert_eq!(classify(&i).severity(), Severity::High);
+
+        let mut i = input("/api/invoices");
+        i.recently_authorised = true;
+        assert_eq!(classify(&i), Reason::ApiShaped);
+
+        let mut i = input("/.env");
         i.recently_authorised = true;
         i.matched_expected_host = true;
-        assert_eq!(classify(&i), Reason::RecentlyAuthorised);
-        assert_eq!(classify(&i).severity(), Severity::Suppressed);
-        // Even the tripwire — see the residual note in `classify`.
+        assert_eq!(classify(&i), Reason::NamedTheHost);
+
+        let guess = format!("/{}", "A".repeat(KNOCK_TOKEN_CHARS));
+        let mut i = input(&guess);
+        i.recently_authorised = true;
+        assert_eq!(classify(&i), Reason::KnockShaped);
+    }
+
+    #[test]
+    fn the_tripwire_outranks_every_suppression() {
+        // Checked first, so no ordering change downstream can silence it.
+        let mut i = input("/favicon.ico");
         i.tripwire = true;
-        assert_eq!(classify(&i), Reason::RecentlyAuthorised);
+        i.recently_authorised = true;
+        assert_eq!(classify(&i), Reason::Tripwire);
+    }
+
+    #[test]
+    fn the_chatter_allowlist_cannot_be_widened_by_a_crafted_path() {
+        // Every one of these is a near-miss that a prefix/suffix match
+        // done carelessly would have admitted.
+        for hostile in [
+            "/favicon.ico/../admin",
+            "/favicon.ico%00",
+            "/apple-touch-icon/../../etc/passwd.png",
+            "/apple-touch-icon-%2e%2e.png",
+            "/apple-touch-icon.png.bak",
+            "/manifest.json/",
+            "/Favicon.ico",
+            "/apple-touch-icon-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png",
+        ] {
+            assert!(
+                !is_authorised_chatter(hostile),
+                "the chatter allowlist admitted `{hostile}`"
+            );
+        }
     }
 
     #[test]

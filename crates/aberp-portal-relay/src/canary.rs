@@ -26,7 +26,7 @@
 //!
 //! # Nothing at rest
 //!
-//! Per ADR-0113 §2.4 and Ervin's §9.5 decision, the relay keeps no
+//! Per ADR-0115 §2.4 and Ervin's §9.5 decision, the relay keeps no
 //! probe log on disk. Observations live in a bounded in-memory window,
 //! are coalesced into a [`CanaryBatch`], and are pushed down the tunnel
 //! to the Mac, which owns the durable log and the alert. If the tunnel
@@ -55,7 +55,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aberp_portal_core::canary::{classify, CanaryBatch, ProbeInput, ProbeSample, Severity};
-use aberp_portal_core::proto::Frame;
 use tokio::sync::mpsc;
 
 use crate::broker::Broker;
@@ -99,6 +98,21 @@ const MAX_PENDING_BATCHES: usize = 32;
 
 /// Most sources remembered as recently-authorised.
 const MAX_AUTHORISED: usize = 256;
+
+/// Most distinct source addresses tracked in one window.
+///
+/// The set exists only to report `distinct_sources`, and it is fed one
+/// entry per probe from the open internet — so without a bound it is a
+/// remote memory-growth primitive costing an attacker one spoofable
+/// packet per entry, on the box whose whole claim is that it holds
+/// nothing.
+///
+/// Past the cap the set stops growing and `distinct_sources`
+/// **saturates**. That loses precision exactly where precision has no
+/// value: the difference between "1024 sources" and "90,000 sources"
+/// changes no decision Ervin makes, both read as *a distributed sweep*,
+/// and `total` still carries the true volume either way.
+const MAX_SOURCES: usize = 1024;
 
 /// The aggregator's timing.
 ///
@@ -236,7 +250,11 @@ impl Window {
             Severity::Low => self.low += 1,
             Severity::Suppressed => self.suppressed += 1,
         }
-        self.sources.insert(sample.source_ip.clone());
+        // Bounded: see MAX_SOURCES. `distinct_sources` saturates
+        // rather than the process growing without limit.
+        if self.sources.len() < MAX_SOURCES {
+            self.sources.insert(sample.source_ip.clone());
+        }
         if self.first.is_none() {
             self.first = parse_stamp(&sample.at);
         }
@@ -368,6 +386,20 @@ pub async fn run_aggregator_with(
             _ = ticker.tick() => true,
         };
 
+        // Retry anything still waiting for a poll to carry it, on
+        // EVERY wake-up — including the ones that produce no new batch.
+        //
+        // This used to sit only at the bottom of the loop, after the
+        // `continue` below. That meant batches accumulated while the
+        // Mac was away were retried only when a *new* probe arrived:
+        // a scan that stopped the moment the Mac went down left its
+        // own evidence stranded in `pending` indefinitely, and the
+        // alert never fired. The quiet case is precisely the one worth
+        // getting right.
+        if !pending.is_empty() {
+            pending.retain(|batch| !forward(&broker, batch));
+        }
+
         if !flush_now || window.is_empty() {
             continue;
         }
@@ -408,11 +440,23 @@ pub async fn run_aggregator_with(
     }
 }
 
-/// Try to push one batch down the tunnel. `true` iff it went.
+/// Hand one batch to the broker to ride the next poll. `true` iff it
+/// was queued.
+///
+/// Never blocks. The relay cannot push — the Mac pulls — so "sent"
+/// here means "queued for the next poll response", and the broker
+/// holds it until a later poll acknowledges its sequence number
+/// (`aberp_portal_core::proto::PollRequest::ack_canary_seq`). That is
+/// what makes canary delivery at-least-once rather than
+/// fire-and-forget: a poll response lost to a dropped connection does
+/// not lose the probes with it.
 fn forward(broker: &Arc<Broker>, batch: &CanaryBatch) -> bool {
-    broker.try_send_now(Frame::Canary {
-        batch: batch.clone(),
-    })
+    if !broker.queue_canary(batch.clone()) {
+        tracing::warn!("canary queue full — the oldest pending batch was dropped");
+    }
+    // Queued either way: the broker's own bound is what dropped the
+    // oldest, and this batch is now in the queue regardless.
+    true
 }
 
 fn stamp(t: time::OffsetDateTime) -> String {

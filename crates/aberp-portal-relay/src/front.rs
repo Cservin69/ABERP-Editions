@@ -1,200 +1,216 @@
-//! The front (ADR-0113 §3) — one handler, two possible answers.
+//! The front (ADR-0115 §3) — one handler, two possible answers.
 //!
-//! Every request that reaches this process, by any method, on any path,
-//! with any headers, gets exactly one of:
+//! Every request that reaches this listener, by any method, on any
+//! path, with any headers, gets exactly one of:
 //!
-//! 1. the **uniform 404** ([`UNIFORM_404_BODY`]) — byte-identical
-//!    whether the portal exists, the Mac is offline, the knock is
-//!    wrong, or the path is garbage; or
+//! 1. **the parked nginx** ([`crate::nginx`]) — the answer a default,
+//!    empty vhost would have given to that same request class, byte for
+//!    byte, whether the portal exists, the Mac is offline, the knock is
+//!    wrong, or the request line is garbage; or
 //! 2. the portal, because the request carried the current knock token.
 //!
-//! # Why this is a single fallback handler and not a route table
+//! # Why this is a single handler and not a route table
 //!
-//! A `Router` with real routes answers `405 Method Not Allowed` for a
-//! known path with the wrong verb, `404` for an unknown one, and may
-//! vary headers between them. Each of those differences is a bit of
-//! information about whether a path exists — exactly what §3.2 forbids:
+//! A router with real routes answers `405` for a known path with the
+//! wrong verb and `404` for an unknown one, and may vary headers
+//! between them. Each difference is a bit of information about whether
+//! a path exists — exactly what §3.2 forbids:
 //!
 //! > every unauthenticated request — wrong path, right path, `HEAD`,
-//! > `POST`, garbage SNI, direct IP — receives the same minimal 404:
-//! > same status, same headers […] same body bytes.
+//! > `POST`, garbage SNI, direct IP — receives the same minimal
+//! > answer: same status, same headers […] same body bytes.
 //!
 //! So there is no route table. One handler sees everything, and the
-//! only branch that can produce something other than the uniform 404 is
-//! a constant-time knock comparison against a token the Mac supplied.
+//! only branch that can produce something other than the parked answer
+//! is a constant-time knock comparison against a token the Mac
+//! supplied.
+//!
+//! Note what §3.2 does and does not promise, restated after the B1/B2
+//! reconciliation in [`crate::nginx`]: the answer is fixed and
+//! **path-independent**, which is the anti-oracle property it was
+//! written for. It is not identical across request *classes*, because a
+//! real nginx is not either, and pretending otherwise was the louder
+//! tell of the two.
 //!
 //! # And when the Mac is gone
 //!
-//! [`Broker::knock_matches`] answers `false` when no agent is
-//! connected, so a tunnel outage collapses the portal to the uniform
-//! 404 for everyone — including a correctly-bookmarked, fully-enrolled
-//! Ervin. Ervin's §9.5 decision: "keep the pure 404 (unreachable =
-//! invisible, no exceptions)".
+//! [`Broker::knock_matches`] answers `false` when no lease is live, so
+//! an outage collapses the portal to the parked 404 for everyone —
+//! including a correctly-bookmarked, fully-enrolled Ervin. Ervin's §9.5
+//! decision: "keep the pure 404 (unreachable = invisible, no
+//! exceptions)".
+//!
+//! # Nothing escapes the trap
+//!
+//! Every path that ends in a parked response feeds the canary — the
+//! ordinary un-knocked 404, a wrong knock, an overloaded queue, a Mac
+//! that never answered, **and** the protocol-level refusals that never
+//! reach a parsed request at all ([`Front::observe_protocol_error`]).
+//! The observation is silent and the response is byte-identical either
+//! way, so the trap costs a prober nothing observable and misses
+//! nothing.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-
-use axum::body::Bytes;
-use axum::extract::rejection::BytesRejection;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
-use axum::response::{IntoResponse, Response};
-use axum::Router;
 
 use aberp_portal_core::proto::PortalRequest;
 
 use crate::broker::Broker;
 use crate::canary::{Canary, Observation};
-
-/// The one body an unauthenticated caller ever sees.
-///
-/// Shaped like the default 404 of the commonest parked-host server so
-/// the portal blends into the background of the internet rather than
-/// standing out as "something custom is running here" (§3.2: "The
-/// identical response is also what the VPS's default vhost returns").
-pub const UNIFORM_404_BODY: &str = "<html>\r
-<head><title>404 Not Found</title></head>\r
-<body>\r
-<center><h1>404 Not Found</h1></center>\r
-</body>\r
-</html>\r
-";
-
-/// The `Server` header, sent on **every** response.
-///
-/// Uniform on purpose: a header that appeared only on portal responses
-/// would be a discriminator all by itself. §3.2 asks for "a bare,
-/// common server line".
-pub const SERVER_HEADER: &str = "nginx";
+use crate::http1::{Answer, Handler, PortalAnswer, RequestHead};
+use crate::nginx::Class;
 
 /// The portal shell, compiled in. Served only to a caller that passed
 /// the knock — §3.2's "No portal artifact pre-gate: no favicon, no JS
 /// bundle, no manifest […] the app shell literally is not served".
 pub const SHELL_HTML: &str = include_str!("../assets/shell.html");
 
-/// Largest request body the front will read.
-///
-/// The only bodies the portal has are WebAuthn ceremony JSON — a few
-/// kilobytes at most. A relay that buffers whatever it is sent is an
-/// OOM waiting to happen on a box whose entire job is to hold nothing
-/// (§2.4), so the limit is explicit rather than inherited from a
-/// framework default that a future upgrade could change.
-pub const MAX_REQUEST_BODY: usize = 64 * 1024;
-
 /// Front state.
 #[derive(Debug)]
 pub struct Front {
     pub broker: Arc<Broker>,
-    /// The scanner trap. Fed on the un-knocked path only.
+    /// The scanner trap. Fed on every parked-response path.
     pub canary: Arc<Canary>,
 }
 
-/// Build the router. One fallback, no routes — see the module docs.
-pub fn router(front: Arc<Front>) -> Router {
-    Router::new()
-        .fallback(handle)
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY))
-        .with_state(front)
+impl Handler for Front {
+    fn handle<'a>(
+        &'a self,
+        head: &'a RequestHead,
+        body: &'a [u8],
+        peer: Option<SocketAddr>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Answer> + Send + 'a>> {
+        Box::pin(self.respond(head, body, peer))
+    }
+
+    fn observe_protocol_error(&self, class: Class, peer: Option<SocketAddr>, hint: Option<&str>) {
+        // A malformed request line never produced a `RequestHead`, so
+        // there is no method and no path to record — but "somebody sent
+        // this host a deliberately broken request" is a strong signal
+        // on a host with no legitimate unauthenticated visitors, and
+        // losing it because the parser refused first would be a hole in
+        // the trap exactly where scanners aim.
+        self.canary.observe(Observation {
+            wall: time::OffsetDateTime::now_utc(),
+            source: peer.map(|a| a.ip()),
+            method: format!("<{}>", class.code()),
+            // Sanitised and truncated downstream by
+            // `aberp_portal_core::canary::sanitise`; this is attacker
+            // bytes and never reaches a log unfiltered.
+            path: hint.unwrap_or("<malformed>").to_string(),
+            user_agent: None,
+            host: None,
+        });
+    }
 }
 
-async fn handle(
-    State(front): State<Arc<Front>>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    // `Result<Bytes, _>` rather than `Bytes`: a bare extractor rejection
-    // would be answered by axum itself, BEFORE the knock is checked, and
-    // a `413` where everyone else gets a `404` is a discriminator. Taking
-    // the rejection as a value keeps every answer inside this function.
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let path = uri.path();
-    let source = connect_info.as_ref().map(|ConnectInfo(a)| a.ip());
+impl Front {
+    async fn respond(&self, head: &RequestHead, body: &[u8], peer: Option<SocketAddr>) -> Answer {
+        let path = head.path();
+        let source = peer.map(|a| a.ip());
 
-    let Some((knock, rest)) = split_knock(path) else {
-        trip(&front, source, &method, path, &headers);
-        return uniform_404();
-    };
-    if !front.broker.knock_matches(knock) {
-        trip(&front, source, &method, path, &headers);
-        return uniform_404();
+        let Some((knock, rest)) = split_knock(path) else {
+            self.trip(source, head);
+            return Answer::not_found();
+        };
+        if !self.broker.knock_matches(knock) {
+            self.trip(source, head);
+            return Answer::not_found();
+        }
+        // A valid knock is the operator. Remember the source briefly so
+        // the browser's own follow-up requests to the bare host —
+        // `/favicon.ico` and friends, which carry no knock — do not
+        // page anyone. See `canary::AUTHORISED_GRACE`, and
+        // `aberp_portal_core::canary::AUTHORISED_CHATTER_PATHS` for how
+        // narrow that exemption is.
+        self.canary.note_authorised(source);
+
+        // Past the gate. The shell, or a forwarded API call — nothing
+        // else.
+        match rest {
+            "" | "/" => shell(),
+            api if api.starts_with("/api/") => self.forward(head, api, body, peer, knock).await,
+            // A knocked caller asking for a path the portal does not
+            // have gets the same answer as a stranger. There is no
+            // "page not found" page to learn the shape of the app from.
+            // No canary: they presented the token, so they are the
+            // operator or someone who already has it — which the
+            // knock-shaped classifier would only mislabel.
+            _ => Answer::not_found(),
+        }
     }
-    // A valid knock is the operator. Remember the source briefly so the
-    // browser's own follow-up requests to the bare host — `/favicon.ico`
-    // and friends, which carry no knock — do not page anyone. See
-    // `canary::AUTHORISED_GRACE`.
-    front.canary.note_authorised(source);
 
-    // Past the gate. The shell, or a forwarded API call — nothing else.
-    match rest {
-        "" | "/" => shell(),
-        api if api.starts_with("/api/") => match body {
-            Ok(body) => {
-                forward(
-                    &front,
-                    connect_info,
-                    &method,
-                    api,
-                    uri.query(),
-                    &headers,
-                    body,
-                )
-                .await
-            }
-            // Oversized or unreadable body from a knocked caller: still
-            // the uniform 404, so the limit is not an oracle either.
+    /// Hand one probe to the canary.
+    ///
+    /// Everything expensive happens on the aggregator task; this is a
+    /// struct build and a `try_send`. Identical work for every probe —
+    /// tripping the decoy costs exactly what brushing the host costs,
+    /// so the trap cannot be found by timing it.
+    fn trip(&self, source: Option<std::net::IpAddr>, head: &RequestHead) {
+        self.canary.observe(Observation {
+            wall: time::OffsetDateTime::now_utc(),
+            source,
+            method: head.method.clone(),
+            path: head.path().to_string(),
+            user_agent: head.header("user-agent").map(str::to_string),
+            host: head.header("host").map(str::to_string),
+        });
+    }
+
+    async fn forward(
+        &self,
+        head: &RequestHead,
+        path: &str,
+        body: &[u8],
+        peer: Option<SocketAddr>,
+        knock: &str,
+    ) -> Answer {
+        use base64::Engine as _;
+
+        let req = PortalRequest {
+            // Verbatim. The relay has no opinion about verbs; §6.3 puts
+            // that opinion on the Mac.
+            method: head.method.clone(),
+            path: path.to_string(),
+            query: head.query().map(str::to_string),
+            cookie: head.header("cookie").map(str::to_string),
+            body_b64: (!body.is_empty())
+                .then(|| base64::engine::general_purpose::STANDARD.encode(body)),
+            peer: peer.map(|a| a.ip().to_string()),
+        };
+
+        match self.broker.park(req).await {
+            Ok(res) => render(&res, knock),
+            // Every failure to reach the Mac collapses to the parked
+            // answer. A `502 Bad Gateway` here would confirm that
+            // something exists behind this host — the one thing §G2
+            // forbids — and a `503` under load would do the same.
+            //
+            // NO canary here, deliberately. This caller presented a
+            // valid knock, so they are the operator or someone who
+            // already holds the token; a timeout on a slow PDF render,
+            // or a full queue, would otherwise classify Ervin's own
+            // `/api/...` request as an `ApiShaped` HIGH and page him
+            // for a degradation he is already looking at. An alert that
+            // fires during normal degraded operation is an alert that
+            // gets ignored, which costs more than the observation is
+            // worth. The failure is logged here and the Mac's own
+            // heartbeat gap (`aberp_portal_agent::poll`) is what
+            // reports a relay that has genuinely stopped answering.
             Err(e) => {
-                tracing::info!(reason = %e, "request body refused");
-                uniform_404()
+                tracing::info!(reason = ?e, "dispatch failed; answering as a parked host");
+                Answer::not_found()
             }
-        },
-        // A knocked caller asking for a path the portal does not have
-        // gets the same 404 as a stranger. There is no "page not found"
-        // page to learn the shape of the app from. No canary: they
-        // presented the token, so they are the operator or someone who
-        // already has it — which the knock-shaped classifier would only
-        // mislabel.
-        _ => uniform_404(),
+        }
     }
-}
-
-/// Hand one probe to the canary.
-///
-/// Everything expensive happens on the aggregator task; this is a
-/// struct build and a `try_send`. Identical work for every probe —
-/// tripping the decoy costs exactly what brushing the host costs, so
-/// the trap cannot be found by timing it.
-fn trip(
-    front: &Arc<Front>,
-    source: Option<std::net::IpAddr>,
-    method: &Method,
-    path: &str,
-    headers: &HeaderMap,
-) {
-    front.canary.observe(Observation {
-        wall: time::OffsetDateTime::now_utc(),
-        source,
-        method: method.as_str().to_string(),
-        path: path.to_string(),
-        user_agent: header_str(headers, axum::http::header::USER_AGENT),
-        host: header_str(headers, axum::http::header::HOST),
-    });
-}
-
-fn header_str(headers: &HeaderMap, name: axum::http::header::HeaderName) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
 }
 
 /// Split `/<knock>/rest` into `("<knock>", "/rest")`.
 ///
 /// Purely lexical: no percent-decoding, no normalisation, no `..`
-/// collapsing. Whatever the client sent is what gets compared, so
-/// there is no decoded-vs-compared discrepancy for an attacker to
-/// wedge apart.
+/// collapsing. Whatever the client sent is what gets compared, so there
+/// is no decoded-versus-compared discrepancy for an attacker to wedge
+/// apart.
 fn split_knock(path: &str) -> Option<(&str, &str)> {
     let trimmed = path.strip_prefix('/')?;
     match trimmed.find('/') {
@@ -203,121 +219,77 @@ fn split_knock(path: &str) -> Option<(&str, &str)> {
     }
 }
 
-async fn forward(
-    front: &Arc<Front>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
-    method: &Method,
-    path: &str,
-    query: Option<&str>,
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Response {
-    use base64::Engine as _;
-
-    let source = connect_info.map(|ConnectInfo(a)| a.ip().to_string());
-    let req = PortalRequest {
-        // Verbatim. The relay has no opinion about verbs; §6.3 puts
-        // that opinion on the Mac.
-        method: method.as_str().to_string(),
-        path: path.to_string(),
-        query: query.map(str::to_string),
-        cookie: headers
-            .get(axum::http::header::COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string),
-        body_b64: (!body.is_empty())
-            .then(|| base64::engine::general_purpose::STANDARD.encode(&body)),
-        peer: source,
-    };
-
-    match front.broker.dispatch(req).await {
-        Ok(res) => render(&res),
-        // Every failure to reach the Mac collapses to the uniform 404.
-        // A "502 Bad Gateway" here would confirm that something exists
-        // behind this host — the one thing §G2 forbids.
-        Err(e) => {
-            tracing::info!(reason = ?e, "dispatch failed; answering the uniform 404");
-            uniform_404()
-        }
-    }
-}
-
-fn render(res: &aberp_portal_core::PortalResponse) -> Response {
+/// Render an answer the Mac produced.
+fn render(res: &aberp_portal_core::PortalResponse, knock: &str) -> Answer {
     let Some(body) = res.body() else {
-        return uniform_404();
+        // An agent we cannot render is an agent we do not advertise.
+        return Answer::not_found();
     };
-    let status = StatusCode::from_u16(res.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut response = (status, body).into_response();
-    let h = response.headers_mut();
-    if let Ok(v) = HeaderValue::from_str(&res.content_type) {
-        h.insert(axum::http::header::CONTENT_TYPE, v);
+    Answer::Portal(Box::new(PortalAnswer {
+        status: res.status,
+        reason: reason_for(res.status),
+        content_type: res.content_type.clone(),
+        body,
+        set_cookie: res.set_cookie.as_ref().map(|c| scope_cookie(c, knock)),
+    }))
+}
+
+/// Pin a `Set-Cookie` the Mac minted to the knock prefix it was minted
+/// under.
+///
+/// The agent mints the cookie and owns its flags (§4.4:
+/// `Secure; HttpOnly; SameSite=Strict`), but the relay is the only
+/// party that knows the URL prefix the browser actually used, because
+/// the knock is stripped before the request crosses Leg B. So the
+/// `Path` is stamped here.
+///
+/// Why it matters: a cookie at `Path=/` is sent to **every** path on the
+/// host, including the un-knocked ones. That hands the session cookie
+/// to any request that brushes the bare hostname — a mistyped URL, a
+/// prefetch, an embedded image — and undoes the point of putting the
+/// gate in the path. Scoping it to `/<knock>/` means the browser only
+/// ever offers it inside the portal.
+///
+/// If the agent already set a `Path`, it is replaced: the agent cannot
+/// know the right one.
+fn scope_cookie(cookie: &str, knock: &str) -> String {
+    let kept: Vec<&str> = cookie
+        .split(';')
+        .map(str::trim)
+        .filter(|a| !a.is_empty() && !a.to_ascii_lowercase().starts_with("path="))
+        .collect();
+    format!("{}; Path=/{}/", kept.join("; "), knock)
+}
+
+fn shell() -> Answer {
+    Answer::Portal(Box::new(PortalAnswer {
+        status: 200,
+        reason: "OK",
+        content_type: "text/html; charset=utf-8".to_string(),
+        body: SHELL_HTML.as_bytes().to_vec(),
+        set_cookie: None,
+    }))
+}
+
+/// Reason phrases for the statuses the agent can produce.
+///
+/// A fixed table rather than a formatted number: the reason phrase is
+/// on the wire, and an unrecognised status must not put an
+/// attacker-influenced string there.
+fn reason_for(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        204 => "No Content",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Not Allowed",
+        429 => "Too Many Requests",
+        503 => "Service Unavailable",
+        _ => "OK",
     }
-    // Invoice data must not settle into the phone's HTTP cache: this
-    // surface exists to be read from a device that may be shared,
-    // synced or lost, and a cached response outlives both the session
-    // and a knock rotation.
-    h.insert(
-        axum::http::header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
-    // The cookie was minted on the Mac; the relay only carries it.
-    if let Some(cookie) = &res.set_cookie {
-        if let Ok(v) = HeaderValue::from_str(cookie) {
-            h.insert(axum::http::header::SET_COOKIE, v);
-        }
-    }
-    stamp_common_headers(h);
-    response
-}
-
-fn shell() -> Response {
-    let mut response = (StatusCode::OK, SHELL_HTML).into_response();
-    let h = response.headers_mut();
-    h.insert(
-        axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    // The shell must never be cached: it is the only artifact that
-    // proves the portal exists, and a cached copy in a shared browser
-    // would outlive the knock rotation that was supposed to revoke it.
-    h.insert(
-        axum::http::header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
-    stamp_common_headers(h);
-    response
-}
-
-/// The uniform 404. Every field is fixed; nothing about the request
-/// influences any byte of it.
-#[must_use]
-pub fn uniform_404() -> Response {
-    let mut response = (StatusCode::NOT_FOUND, UNIFORM_404_BODY).into_response();
-    let h = response.headers_mut();
-    h.insert(
-        axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html"),
-    );
-    stamp_common_headers(h);
-    response
-}
-
-fn stamp_common_headers(h: &mut HeaderMap) {
-    h.insert(
-        axum::http::header::SERVER,
-        HeaderValue::from_static(SERVER_HEADER),
-    );
-    // HSTS per ADR-0113 §2.1, on EVERY response including the uniform
-    // 404. A header that appeared only on portal responses would be a
-    // discriminator; this listener is the only thing on the host, so
-    // "uniform" and "always" are the same thing here. Deliberately
-    // without `includeSubDomains`: the storefront is a different host
-    // with its own posture, and this surface does not get to speak for
-    // it (§8 — "the storefront is untouched").
-    h.insert(
-        axum::http::header::STRICT_TRANSPORT_SECURITY,
-        HeaderValue::from_static("max-age=31536000"),
-    );
 }
 
 #[cfg(test)]
@@ -338,15 +310,61 @@ mod tests {
     }
 
     #[test]
-    fn the_uniform_404_body_carries_no_portal_artifact() {
-        // If this ever grows a link, a script tag, a token or a name,
-        // the whole §3.2 posture is gone.
-        let b = UNIFORM_404_BODY.to_ascii_lowercase();
+    fn the_shell_is_the_only_artifact_and_it_is_behind_the_knock() {
+        // If the shell ever became reachable without a knock, §3.2's
+        // "no portal artifact pre-gate" is gone.
+        let b = SHELL_HTML.to_ascii_lowercase();
+        assert!(!b.is_empty());
+        // And the parked answer must still mention none of it.
+        let parked = Class::NotFound.body().to_ascii_lowercase();
         for forbidden in ["script", "aberp", "portal", "invoice", "knock", "webauthn"] {
             assert!(
-                !b.contains(forbidden),
-                "the uniform 404 mentions `{forbidden}`"
+                !parked.contains(forbidden),
+                "the parked answer mentions `{forbidden}`"
             );
         }
+    }
+
+    #[test]
+    fn a_session_cookie_is_scoped_to_the_knock_prefix() {
+        let got = scope_cookie("s=abc; Secure; HttpOnly; SameSite=Strict", "KNOCK");
+        assert_eq!(
+            got,
+            "s=abc; Secure; HttpOnly; SameSite=Strict; Path=/KNOCK/"
+        );
+        assert!(
+            !got.contains("Path=/;"),
+            "a Path=/ cookie is offered to the un-knocked surface too"
+        );
+    }
+
+    #[test]
+    fn an_agent_supplied_path_is_replaced_not_appended() {
+        // The agent cannot know the right prefix — the knock is
+        // stripped before the request reaches it.
+        let got = scope_cookie("s=abc; Path=/; HttpOnly", "K");
+        assert_eq!(got, "s=abc; HttpOnly; Path=/K/");
+        assert_eq!(got.matches("Path=").count(), 1);
+        let got = scope_cookie("s=abc; path=/wrong; HttpOnly", "K");
+        assert_eq!(got, "s=abc; HttpOnly; Path=/K/", "case-insensitively");
+    }
+
+    #[test]
+    fn an_unknown_status_gets_a_fixed_reason_phrase() {
+        assert_eq!(reason_for(200), "OK");
+        assert_eq!(reason_for(418), "OK");
+        assert_eq!(reason_for(401), "Unauthorized");
+    }
+
+    #[test]
+    fn a_body_the_relay_cannot_decode_becomes_the_parked_answer() {
+        // Not a 502: that would confirm something is behind this host.
+        let res = aberp_portal_core::PortalResponse {
+            status: 200,
+            content_type: "application/json".into(),
+            body_b64: "!!!not base64!!!".into(),
+            set_cookie: None,
+        };
+        assert!(matches!(render(&res, "k"), Answer::Nginx(Class::NotFound)));
     }
 }

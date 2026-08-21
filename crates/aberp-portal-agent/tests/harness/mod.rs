@@ -39,9 +39,9 @@ use std::time::Duration;
 
 use aberp_portal_agent::alert::AlertSink;
 use aberp_portal_agent::config::{AgentConfig, SecretSource, UpstreamConfig, UpstreamDiscovery};
-use aberp_portal_agent::{tunnel, Agent};
+use aberp_portal_agent::{poll, Agent};
 use aberp_portal_core::PinnedFingerprint;
-use aberp_portal_relay::{canary as relay_canary, front, Broker, Canary, Front};
+use aberp_portal_relay::{canary as relay_canary, http1, AgentLeg, Broker, Canary, Front};
 use axum::extract::Path as AxumPath;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -83,7 +83,7 @@ pub fn write(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
 // -- the stub ABERP ----------------------------------------------------
 
 /// Counts every request the stub saw on a MUTATING route. It must stay
-/// at zero: ADR-0113 §G5 says Phase 1 "structurally cannot write", and
+/// at zero: ADR-0115 §G5 says Phase 1 "structurally cannot write", and
 /// the way to check that is to leave live mutating routes sitting next
 /// to the read ones and prove nothing ever reaches them.
 #[derive(Debug, Default)]
@@ -268,7 +268,7 @@ pub async fn start_portal(tag: &str) -> Portal {
     let stub = start_stub_aberp().await;
 
     // Leg B identities: the relay pins the agent, the agent pins the
-    // relay. Both directions, exactly as ADR-0113 section 2.3 specifies.
+    // relay. Both directions, exactly as ADR-0115 section 2.3 specifies.
     let relay_id = identity("relay.test");
     let agent_id = identity("agent.test");
 
@@ -284,11 +284,24 @@ pub async fn start_portal(tag: &str) -> Portal {
         .await
         .expect("bind agent leg");
     let agent_addr = agent_listener.local_addr().expect("addr");
-    tokio::spawn(aberp_portal_relay::broker::accept_forever(
-        Arc::clone(&broker),
-        agent_listener,
-        Arc::new(leg_b_tls),
-    ));
+    let leg = Arc::new(AgentLeg {
+        broker: Arc::clone(&broker),
+    });
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(leg_b_tls));
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, peer)) = agent_listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            let leg = Arc::clone(&leg);
+            tokio::spawn(async move {
+                if let Ok(stream) = acceptor.accept(tcp).await {
+                    http1::serve(stream, Some(peer), leg).await;
+                }
+            });
+        }
+    });
 
     // Leg A: plaintext loopback -- see the module docs. The scanner
     // trap is the real one, with its real aggregator task, so the e2e
@@ -307,20 +320,26 @@ pub async fn start_portal(tag: &str) -> Portal {
             high_coalesce_window: Duration::from_millis(100),
         },
     ));
-    let app = front::router(Arc::new(Front {
+    // The real front, on the real hand-written HTTP/1.1 server — the
+    // one that owns the connection so the nginx disguise covers
+    // protocol errors too. Testing through anything else would test
+    // everything except the layer round 2 rebuilt.
+    let front = Arc::new(Front {
         broker: Arc::clone(&broker),
         canary: canary_handle,
-    }));
+    });
     let front_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind front");
     let front_addr = front_listener.local_addr().expect("addr");
     tokio::spawn(async move {
-        let _ = axum::serve(
-            front_listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await;
+        loop {
+            let Ok((tcp, peer)) = front_listener.accept().await else {
+                return;
+            };
+            let front = Arc::clone(&front);
+            tokio::spawn(async move { http1::serve(tcp, Some(peer), front).await });
+        }
     });
 
     let rp_id = "localhost".to_string();
@@ -356,11 +375,11 @@ pub async fn start_portal(tag: &str) -> Portal {
     let knock = agent.knock.load_or_mint().expect("knock");
 
     let a = Arc::clone(&agent);
-    tokio::spawn(async move { tunnel::run_forever(a).await });
+    tokio::spawn(async move { poll::run_forever(a).await });
 
-    // Wait for the tunnel to publish the knock token, against a
-    // deadline — see the note in `uniform_404.rs` on load-sensitive
-    // waits reading as regressions.
+    // Wait for the agent's first poll to publish the knock token,
+    // against a deadline — a fixed nap here loses a race on a loaded
+    // machine and reads as a regression.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         if broker.knock_matches(&knock) {
@@ -376,10 +395,34 @@ pub async fn start_portal(tag: &str) -> Portal {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("the agent never dialled the relay (waited 30s)");
+    panic!("the agent never polled the relay (waited 30s)");
 }
 
 impl Portal {
+    /// Put a credential straight into the store, as a console
+    /// confirmation would (ADR-0115 §4.3b).
+    ///
+    /// # Why the tests cannot enrol through the ceremony any more
+    ///
+    /// §4.3a requires Apple hardware attestation, and
+    /// [`authenticator::VirtualAuthenticator`] is a software P-256 key.
+    /// It therefore CANNOT enrol — which is the entire point of the
+    /// defence, and is pinned as a test in its own right by
+    /// `e2e_portal::a_software_credential_cannot_enrol`.
+    ///
+    /// Everything downstream of enrolment — assertions, sessions, the
+    /// proxy allowlist — is unchanged by that, and still needs an
+    /// enrolled credential to exercise. So the tests take the same
+    /// route the operator does: the credential is committed by the
+    /// console step, and the ceremony that produced it is not replayed.
+    /// Nothing is stubbed except the walk to the Mac.
+    pub fn provision_credential(&self, auth: &authenticator::VirtualAuthenticator, label: &str) {
+        self.agent
+            .credentials
+            .add(auth.as_stored_credential(label))
+            .expect("provision credential");
+    }
+
     pub fn url(&self, path: &str) -> String {
         format!("{}/{}{}", self.base, self.knock, path)
     }
@@ -408,7 +451,8 @@ impl Portal {
     }
 
     /// Wait until the canary's window has flushed through the relay,
-    /// down the tunnel, and into the Mac's probe log — or give up.
+    /// ridden a poll response, and landed in the Mac's probe log — or
+    /// give up.
     ///
     /// Polls rather than sleeping a fixed interval: the path is
     /// genuinely asynchronous by design (the response must never wait

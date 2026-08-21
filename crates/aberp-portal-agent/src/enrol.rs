@@ -1,5 +1,5 @@
 //! Enrolment — physical presence at the Mac is the credential
-//! (ADR-0113 §4.3).
+//! (ADR-0115 §4.3).
 //!
 //! > **Registration (enrolment):** disabled remotely, always. Enrolment
 //! > runs only via a one-time, 10-minute, single-use URL minted **at the
@@ -26,10 +26,28 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::credstore::Credential;
 use crate::rand;
 
 /// §4.3's window.
 pub const ENROL_TTL_SECONDS: u64 = 10 * 60;
+
+/// How long a verified-but-unconfirmed credential waits at the console.
+///
+/// Long enough for Ervin to walk to the Mac, short enough that a
+/// staged credential is not left sitting there overnight for someone
+/// else to confirm.
+pub const CONFIRM_TTL_SECONDS: u64 = 10 * 60;
+
+/// Length of the confirmation code the operator types.
+///
+/// Eight hex characters — 32 bits — is not a secret and is not doing
+/// cryptographic work: an attacker who could reach this code could
+/// already reach the console it is typed at. It is there so the
+/// operator confirms *the enrolment in front of them* rather than
+/// blindly approving whatever happens to be staged, and so two
+/// enrolments cannot be confused for one another.
+pub const CONFIRM_CODE_CHARS: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EnrolError {
@@ -53,6 +71,12 @@ pub enum EnrolError {
     Expired,
     #[error("enrolment token does not match")]
     BadToken,
+    #[error("no credential is waiting for confirmation at this Mac")]
+    NoneStaged,
+    #[error("the confirmation window has closed — start the enrolment again")]
+    ConfirmExpired,
+    #[error("that confirmation code does not match the credential waiting at this Mac")]
+    BadConfirmCode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,6 +181,146 @@ impl EnrolStore {
     }
 }
 
+/// A credential that has passed every cryptographic check and is
+/// waiting for a human at the Mac to say yes (ADR-0115 §4.3b).
+///
+/// # Why this step exists
+///
+/// Everything upstream of it is a check a *machine* performs, and each
+/// one can be satisfied by an attacker who has what it asks for. The
+/// enrolment token is single-use and console-minted — but until
+/// hardening H1 it crosses relay memory in plaintext, so a compromised
+/// relay can see a live one. Apple attestation proves the key lives in
+/// a Secure Enclave — but it does not prove it is *Ervin's* Secure
+/// Enclave; an attacker with a stolen token and any iPhone satisfies
+/// it.
+///
+/// This step asks a different question, and it is the one no remote
+/// attacker can answer: **is a human standing at the Mac right now who
+/// meant to do this?** Enrolment is the only operation in the whole
+/// design that grants standing access, so it is the one worth spending
+/// a walk to the console on.
+///
+/// The confirmation code is not a secret and does not need to be one.
+/// Its job is to make the operator confirm the specific enrolment in
+/// front of them: a second, silent enrolment staged by an attacker has
+/// a different code, so approving one does not approve the other.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StagedCredential {
+    /// The code the operator types. Derived from the credential id, so
+    /// it is reproducible and can be shown on both screens.
+    pub code: String,
+    pub credential: Credential,
+    /// Unix seconds.
+    pub expires_at: u64,
+}
+
+/// The single credential awaiting console confirmation, if any.
+#[derive(Debug, Clone)]
+pub struct StagingStore {
+    path: PathBuf,
+}
+
+impl StagingStore {
+    #[must_use]
+    pub fn in_dir(state_dir: &Path) -> Self {
+        Self {
+            path: state_dir.join("enrol.staged.json"),
+        }
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The confirmation code for a credential id. Deterministic, so the
+    /// daemon, the console and the browser all derive the same string
+    /// from the same credential without passing it around.
+    #[must_use]
+    pub fn code_for(credential_id: &str) -> String {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(credential_id.as_bytes());
+        hex::encode(digest)[..CONFIRM_CODE_CHARS].to_string()
+    }
+
+    /// Stage a verified credential and return the code to display.
+    ///
+    /// Replaces any predecessor: at most one credential is ever waiting,
+    /// so an attacker cannot queue one behind a legitimate enrolment
+    /// and have the operator's single confirmation commit both.
+    pub fn stage(&self, credential: Credential) -> Result<String, EnrolError> {
+        let code = Self::code_for(&credential.id);
+        let staged = StagedCredential {
+            code: code.clone(),
+            credential,
+            expires_at: now_unix() + CONFIRM_TTL_SECONDS,
+        };
+        let io = |source| EnrolError::Io {
+            path: self.path.clone(),
+            source,
+        };
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(io)?;
+        }
+        let body = serde_json::to_string(&staged).map_err(|e| EnrolError::Io {
+            path: self.path.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+        })?;
+        std::fs::write(&self.path, body).map_err(io)?;
+        restrict_permissions(&self.path);
+        Ok(code)
+    }
+
+    /// What is waiting, for the console to display.
+    pub fn peek(&self) -> Result<StagedCredential, EnrolError> {
+        let staged = self.read()?;
+        if staged.expires_at <= now_unix() {
+            self.clear();
+            return Err(EnrolError::ConfirmExpired);
+        }
+        Ok(staged)
+    }
+
+    /// Validate `code` and hand back the credential to commit.
+    ///
+    /// Single-use, and constant-time on the code so a mistyped digit
+    /// leaks nothing about the rest of it — cheap, and the alternative
+    /// is arguing about whether it matters.
+    pub fn confirm(&self, code: &str) -> Result<Credential, EnrolError> {
+        let staged = self.peek()?;
+        if !aberp_portal_core::ct::eq(
+            staged.code.as_bytes(),
+            code.trim().to_ascii_lowercase().as_bytes(),
+        ) {
+            // Deliberately NOT cleared: a wrong guess must not let an
+            // attacker cancel a legitimate staged enrolment.
+            return Err(EnrolError::BadConfirmCode);
+        }
+        self.clear();
+        Ok(staged.credential)
+    }
+
+    /// Discard whatever is staged (the `--reject` path).
+    pub fn clear(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+
+    fn read(&self) -> Result<StagedCredential, EnrolError> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(raw) => serde_json::from_str(&raw).map_err(|source| EnrolError::Malformed {
+                path: self.path.clone(),
+                source,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(EnrolError::NoneStaged),
+            Err(source) => Err(EnrolError::Io {
+                path: self.path.clone(),
+                source,
+            }),
+        }
+    }
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -237,6 +401,94 @@ mod tests {
         assert!(!s.is_open());
         assert!(matches!(s.consume(&t), Err(EnrolError::Expired)));
         assert!(matches!(s.consume(&t), Err(EnrolError::NonePending)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn credential(id: &str) -> Credential {
+        Credential {
+            id: id.to_string(),
+            x: "00".into(),
+            y: "00".into(),
+            sign_count: 0,
+            label: "iPhone".into(),
+            created_at: "2026-08-21T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn a_staged_credential_is_committed_only_by_its_own_code() {
+        let dir = tmpdir("stage");
+        let s = StagingStore::in_dir(&dir);
+        let code = s.stage(credential("cred-a")).expect("stage");
+        assert_eq!(code.len(), CONFIRM_CODE_CHARS);
+        assert_eq!(code, StagingStore::code_for("cred-a"), "deterministic");
+
+        assert!(matches!(
+            s.confirm("deadbeef"),
+            Err(EnrolError::BadConfirmCode)
+        ));
+        assert!(
+            s.peek().is_ok(),
+            "a wrong code must not discard the staging"
+        );
+        assert_eq!(s.confirm(&code).expect("confirm").id, "cred-a");
+        assert!(
+            matches!(s.peek(), Err(EnrolError::NoneStaged)),
+            "single use"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn with_nothing_staged_nothing_can_be_confirmed() {
+        // The property that makes silent remote enrolment impossible:
+        // no console step, no credential.
+        let dir = tmpdir("nostage");
+        let s = StagingStore::in_dir(&dir);
+        assert!(matches!(s.confirm("anything"), Err(EnrolError::NoneStaged)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_second_staging_replaces_the_first_rather_than_queueing() {
+        // Otherwise an attacker could stage one behind a legitimate
+        // enrolment and have a single confirmation commit both.
+        let dir = tmpdir("restage");
+        let s = StagingStore::in_dir(&dir);
+        let first = s.stage(credential("cred-a")).expect("stage");
+        let second = s.stage(credential("cred-b")).expect("stage");
+        assert_ne!(first, second);
+        assert!(matches!(s.confirm(&first), Err(EnrolError::BadConfirmCode)));
+        assert_eq!(s.confirm(&second).expect("confirm").id, "cred-b");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_expired_staging_is_refused_and_cleared() {
+        let dir = tmpdir("stale-stage");
+        let s = StagingStore::in_dir(&dir);
+        let code = s.stage(credential("cred-a")).expect("stage");
+        let expired = StagedCredential {
+            code: code.clone(),
+            credential: credential("cred-a"),
+            expires_at: now_unix() - 1,
+        };
+        std::fs::write(s.path(), serde_json::to_string(&expired).expect("json")).expect("write");
+        assert!(matches!(s.confirm(&code), Err(EnrolError::ConfirmExpired)));
+        assert!(matches!(s.peek(), Err(EnrolError::NoneStaged)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_confirmation_code_is_typed_case_insensitively() {
+        // It is read off one screen and typed at another; a case
+        // mismatch is a support call, not a security boundary.
+        let dir = tmpdir("case");
+        let s = StagingStore::in_dir(&dir);
+        let code = s.stage(credential("cred-a")).expect("stage");
+        assert!(s
+            .confirm(&format!("  {}  ", code.to_ascii_uppercase()))
+            .is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 

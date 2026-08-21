@@ -23,27 +23,32 @@
 #                              / `mes.routing_op_state_changed`); transactional
 #                              inventory coupling consumes BOM on Release +
 #                              produces finished good on Complete.
-#   crates/aberp-portal-core - ADR-0113 Phase 0. The shared Leg-B surface
-#                              between the Mac agent and the VPS relay: frame
-#                              codec, request/response shapes, mutual
-#                              certificate pinning, constant-time compare.
+#   crates/aberp-portal-core - ADR-0115 Phase 0. The shared Leg-B surface
+#                              between the Mac agent and the VPS relay: the
+#                              poll/deliver shapes, mutual certificate
+#                              pinning, the canary classifier, constant-time
+#                              compare. (The frame codec is gone with the
+#                              tunnel — the Mac polls, it does not hold a
+#                              socket open.)
 #                              Deliberately policy-free — "the relay decides
-#                              nothing" (ADR-0113 §2.4) is checkable by
+#                              nothing" (ADR-0115 §2.4) is checkable by
 #                              reading this one crate.
-#   crates/aberp-portal-agent- ADR-0113 Phase 0. The Mac-side outbound agent
-#                              daemon: dials OUT to the relay (zero inbound
+#   crates/aberp-portal-agent- ADR-0115 Phase 0. The Mac-side outbound agent
+#                              daemon: POLLS OUT to the relay (zero inbound
 #                              ports on the Mac), IS the WebAuthn relying
 #                              party (credential store, challenge verify,
 #                              session mint — §4.2), and proxies a fixed
 #                              GET-only allowlist to the local `aberp serve`
 #                              (§6.3). A SEPARATE process from `aberp serve`
 #                              so it can report ABERP up/down.
-#   crates/aberp-portal-relay- ADR-0113 Phase 0. The VPS-side relay + front:
-#                              a dumb, mutually-authenticated blind pipe with
+#   crates/aberp-portal-relay- ADR-0115 Phase 0. The VPS-side relay + front:
+#                              a dumb, mutually-authenticated parking lot with
 #                              NOTHING at rest, plus the front that answers
-#                              every un-knocked request with one uniform 404
+#                              every un-knocked request exactly as a parked
+#                              nginx would, byte for byte, per request class
 #                              (§3.2). Never mints a session, never stores a
-#                              credential.
+#                              credential. Owns its own HTTP/1.1 connections
+#                              so protocol errors wear the disguise too.
 #   crates/audit-ledger      - tamper-evident hash-chained audit ledger (ADR-0008).
 #   crates/aberp-verify      - bundle verifier CLI (ADR-0035, PR-22) — re-verifies
 #                              a per-invoice export bundle from its own bytes alone;
@@ -424,10 +429,10 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 tauri = { version = "2", default-features = false }
 tauri-build = { version = "2", default-features = false }
 
-# ── ADR-0113 Phase 0 additions — the outbound-only remote portal ────
+# ── ADR-0115 Phase 0 additions — the outbound-only remote portal ────
 #
 # `tokio-rustls` is the async TLS stream wrapper for Leg B (the agent's
-# outbound, mutually-pinned connection to the relay — ADR-0113 §2.3).
+# outbound, mutually-pinned connection to the relay — ADR-0115 §2.3).
 # It was ALREADY in Cargo.lock transitively (reqwest 0.13 and lettre
 # both pull it); this line promotes it to a direct pin per ADR-0021 §A0
 # ("pin on first direct use"). It is a thin adapter over the existing
@@ -439,7 +444,7 @@ tauri-build = { version = "2", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 
 # `p256` is ECDSA over NIST P-256 — the `alg: -7` (ES256) signature
-# every Apple platform authenticator produces. ADR-0113 §4.2 puts the
+# every Apple platform authenticator produces. ADR-0115 §4.2 puts the
 # WebAuthn relying party ON THE MAC, so the assertion signature is
 # verified in `crates/aberp-portal-agent`; this is the one primitive
 # that verification needs and the workspace did not already have
@@ -454,6 +459,30 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc
 # out of the tree; the verifier only needs `VerifyingKey::verify`.
 # License: MIT/Apache-2.0 dual (RustCrypto).
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+
+# ADR-0115 §4.3a — Apple anonymous attestation verification, the
+# Phase-0 enrolment defence.
+#
+# Together these are what makes "a software-generated credential is
+# REFUSED" true rather than aspirational. Without them the agent
+# trusted whatever public key the ceremony handed it, so anything that
+# could reach the enrolment endpoint — including a compromised relay
+# replaying a console-minted token — could enrol a key it had generated
+# itself and held the private half of.
+#
+# `x509-cert` parses the attestation chain; `p384` verifies it, because
+# the Apple WebAuthn Root CA and its intermediate are both P-384 while
+# the leaf credential certificate is P-256 (`p256`, already present
+# above, covers that half).
+#
+# Version choice is NOT free here: both are pinned to the releases built
+# on `der` 0.7 / `spki` 0.7 / `const-oid` 0.9, which is exactly what
+# `p256` 0.13 already pulls in. Taking `x509-cert` 0.3 or `p384` 0.14
+# would fork the `der`/`spki` graph into two incompatible copies and
+# make the SPKI types stop lining up. Both are MIT OR Apache-2.0, so
+# `deny.toml`'s allow-list needs no new entry.
+x509-cert = { version = "0.2", default-features = false, features = ["pem", "std"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 
 [profile.release]
 # Reproducible builds posture per ADR-0007 section "Supply chain".

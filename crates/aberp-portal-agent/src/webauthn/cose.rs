@@ -4,7 +4,7 @@
 //! WebAuthn wraps the credential public key as a COSE_Key (RFC 8152)
 //! CBOR map inside the attested credential data. Apple's platform
 //! authenticator — Face ID on the iPhone, Touch ID on the Mac, the two
-//! authenticators ADR-0113 §4.1 targets — produces exactly one
+//! authenticators ADR-0115 §4.1 targets — produces exactly one
 //! algorithm: `alg: -7`, ES256, ECDSA over NIST P-256. So this parser
 //! accepts exactly that and refuses everything else, rather than
 //! carrying a general COSE decoder whose extra branches nobody

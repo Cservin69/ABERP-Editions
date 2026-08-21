@@ -1,5 +1,5 @@
 //! Leg C — the agent as a client of `aberp serve` over loopback
-//! (ADR-0113 §2.1).
+//! (ADR-0115 §2.1).
 //!
 //! > Leg C — agent to the local ABERP process over loopback, exactly as
 //! > the Tauri shell talks to it today (`Authorization: Bearer`).
@@ -12,7 +12,7 @@
 //!   reads. Pinning is done the way `apps/aberp-ui/src/pinned_client.rs`
 //!   does it, for the reason recorded there.
 //! - **The existing bearer, read from the keychain, never leaving the
-//!   Mac** (§2.2). ADR-0113 §6.4 names the liability honestly: this is
+//!   Mac** (§2.2). ADR-0115 §6.4 names the liability honestly: this is
 //!   an all-routes token today. The agent's allowlist confines what can
 //!   be *asked*; hardening H2 (a read-only-scoped bearer minted by
 //!   `serve.rs`) is what would confine what can be *held*.

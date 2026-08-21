@@ -1,0 +1,58 @@
+# Captured from a real nginx, `server_tokens off;`, 2026-08-21.
+#
+#   nginx version: nginx/1.31.4 (Homebrew, arm64 macOS)
+#   conf: worker_processes 1; server_tokens off; listen 8791; root html;
+#
+# These are the bytes `crates/aberp-portal-relay/src/nginx.rs` must
+# reproduce EXACTLY on the un-knocked path. `{DATE}` is the only field
+# that varies; everything else — status line, header ORDER, every
+# Content-Length, the body down to its CRLFs — is pinned by
+# `tests/nginx_indistinguishable.rs`.
+#
+# The capture procedure is in ADR-0115 §3.3 so a future reader can
+# re-run it against a newer nginx rather than trusting this file.
+#
+# Header order is load-bearing: Server, Date, Content-Type,
+# Content-Length, Connection. nginx emits exactly that, and a reordered
+# set is a fingerprint even when every value matches.
+
+[404] GET /nope HTTP/1.1 + Host + Connection: close
+HTTP/1.1 404 Not Found\r\nServer: nginx\r\nDate: {DATE}\r\nContent-Type: text/html\r\nContent-Length: 146\r\nConnection: close\r\n\r\n<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n
+
+[404-keepalive] GET /nope HTTP/1.1 + Host (no Connection header)
+HTTP/1.1 404 Not Found\r\nServer: nginx\r\nDate: {DATE}\r\nContent-Type: text/html\r\nContent-Length: 146\r\nConnection: keep-alive\r\n\r\n<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n
+
+[400] bad request-line ("NOT A VALID REQUEST LINE"), missing Host on
+      HTTP/1.1, duplicate Host, space in the URI, malformed header
+      name, and TLS ClientHello bytes sent to a plaintext port — all
+      collapse to this one answer.
+HTTP/1.1 400 Bad Request\r\nServer: nginx\r\nDate: {DATE}\r\nContent-Type: text/html\r\nContent-Length: 150\r\nConnection: close\r\n\r\n<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n
+
+[405] FROBNICATE /nope HTTP/1.1 — a well-formed token that is not
+      GET/HEAD/POST. Note it ECHOES keep-alive; it does not close.
+HTTP/1.1 405 Not Allowed\r\nServer: nginx\r\nDate: {DATE}\r\nContent-Type: text/html\r\nContent-Length: 150\r\nConnection: keep-alive\r\n\r\n<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n
+
+[414] request line longer than the 8k large_client_header_buffers slot
+HTTP/1.1 414 Request-URI Too Large\r\nServer: nginx\r\nDate: {DATE}\r\nContent-Type: text/html\r\nContent-Length: 170\r\nConnection: close\r\n\r\n<html>\r\n<head><title>414 Request-URI Too Large</title></head>\r\n<body>\r\n<center><h1>414 Request-URI Too Large</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n
+
+[505] HTTP/9.9 and HTTP/2.0 over a cleartext http1 listener
+HTTP/1.1 505 HTTP Version Not Supported\r\nServer: nginx\r\nDate: {DATE}\r\nContent-Type: text/html\r\nContent-Length: 180\r\nConnection: close\r\n\r\n<html>\r\n<head><title>505 HTTP Version Not Supported</title></head>\r\n<body>\r\n<center><h1>505 HTTP Version Not Supported</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n
+
+# Behaviours pinned as assertions rather than byte captures
+# (tests/nginx_indistinguishable.rs):
+#
+#   HEAD /nope       -> the 404 HEAD, Content-Length: 146, NO body.
+#   GET /nope HTTP/1.0 without Host  -> 404, not 400. Host is only
+#                                       mandatory on HTTP/1.1.
+#   GET /nope HTTP/1.0               -> Connection: close by default.
+#   GET /nope HTTP/1.0 + keep-alive  -> Connection: keep-alive.
+#   Connection: KEEP-ALIVE           -> matched case-insensitively.
+#   chunked request body             -> body drained, then the 404,
+#                                       keep-alive preserved.
+#   leading CRLFs before the line    -> skipped, then the 404.
+#   bare-LF line endings             -> accepted, then the 404.
+#   absolute-form target             -> 404 (not 400).
+#   OPTIONS * HTTP/1.1               -> 400.
+#   GET /nope with no HTTP version   -> HTTP/0.9: the 146-byte body
+#                                       ALONE, no status line, no
+#                                       headers, then close.

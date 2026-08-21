@@ -2,7 +2,7 @@
 //!
 //! # The hostname is NOT in this repository
 //!
-//! ADR-0113 §3.2 closes the Certificate-Transparency leak by presenting
+//! ADR-0115 §3.2 closes the Certificate-Transparency leak by presenting
 //! the **wildcard** `*.abenerp.com` certificate, so the portal's label
 //! never enters a public CT log. That control is worth exactly nothing
 //! if the label is committed to a git repository instead, so the
@@ -43,7 +43,7 @@ pub const PORTAL_HOST_ENV: &str = "PORTAL_HOST";
 /// not this design (§2.3).
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("{0} is not set — the portal hostname is minted at deploy time and never committed (ADR-0113 §3.2)")]
+    #[error("{0} is not set — the portal hostname is minted at deploy time and never committed (ADR-0115 §3.2)")]
     MissingHost(&'static str),
     #[error("{var} is not set")]
     Missing { var: &'static str },
@@ -63,7 +63,7 @@ pub enum SecretSource {
     /// Production: the OS keychain, `service`/`account` as the entry
     /// coordinates. For the ABERP bearer these are `aberp.nav.<tenant>`
     /// / `session_token` — the same entry `serve.rs` provisions, read
-    /// rather than duplicated (ADR-0113 §2.2).
+    /// rather than duplicated (ADR-0115 §2.2).
     Keychain { service: String, account: String },
     /// Dev/test: a file on disk. Never used in production; the
     /// keychain is the auth surface, a `chmod 0600` file is not
@@ -189,7 +189,7 @@ pub struct AgentConfig {
     /// production path never sets it (§4.4 requires `Secure`).
     pub cookie_secure: bool,
     /// The decoy path the canary treats as an unambiguous scanner hit.
-    /// Published to the relay in the tunnel handshake, so rotating it
+    /// Published to the relay on every poll, so rotating it
     /// needs no relay redeploy and leaves no value in this repository.
     pub tripwire_path: String,
     /// Where canary alerts are delivered.
@@ -257,6 +257,24 @@ pub fn runtime_discovery_path(tenant: &str) -> Result<PathBuf, ConfigError> {
 }
 
 impl AgentConfig {
+    /// The `https://` origin the agent polls (ADR-0115 §2.1).
+    ///
+    /// Built from [`AgentConfig::relay_server_name`] rather than from
+    /// [`AgentConfig::relay_addr`] so the TLS `ServerName` on the wire
+    /// is the one the operator configured. Where the two differ, the
+    /// poll loop pins the address with reqwest's `resolve` instead of
+    /// letting DNS choose — see `crate::poll::connect`.
+    ///
+    /// The name is not a security control on this leg: Leg B is
+    /// verified by leaf-certificate SHA-256 and the public WebPKI is
+    /// not consulted at all (§2.3). It is here so a relay behind a name
+    /// gets the SNI it expects.
+    #[must_use]
+    pub fn relay_base_url(&self) -> String {
+        let port = self.relay_addr.rsplit_once(':').map_or("443", |(_, p)| p);
+        format!("https://{}:{}", self.relay_server_name, port)
+    }
+
     /// Build the config from the environment.
     ///
     /// Production sets `PORTAL_*` plus nothing else and gets: keychain

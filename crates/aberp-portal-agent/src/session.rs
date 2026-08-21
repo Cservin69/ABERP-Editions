@@ -1,19 +1,34 @@
 //! Portal sessions — minted, held and expired **on the Mac**
-//! (ADR-0113 §4.4).
+//! (ADR-0115 §4.4).
 //!
 //! > Agent-minted, short-lived, scoped tokens: 15-minute idle timeout,
-//! > 8-hour absolute cap, bound to the front connection that carried
-//! > the ceremony (a stolen cookie replayed through a new connection
-//! > fails), delivered as `Secure; HttpOnly; SameSite=Strict`,
-//! > revocable at the agent […] No refresh tokens.
+//! > 8-hour absolute cap, bound to the generation that carried the
+//! > ceremony (a stolen cookie replayed under a new one fails),
+//! > delivered as `Secure; HttpOnly; SameSite=Strict`, revocable at the
+//! > agent […] No refresh tokens.
 //!
-//! The tunnel binding is the interesting one. Every session records the
-//! `tunnel_id` of the Leg-B connection it was minted over
-//! ([`aberp_portal_core::Frame::Hello`]). A reconnect mints a new
-//! tunnel id, so every session dies with the tunnel — which also means
-//! a cookie exfiltrated from the relay's memory (the §2.4 residual)
-//! stops working the moment the tunnel flaps, and cannot be carried to
-//! a different relay at all.
+//! # The epoch binding is the interesting one
+//!
+//! Every session records the **presence epoch** it was minted under
+//! ([`aberp_portal_core::proto::AgentIdentity::epoch`]).
+//!
+//! Round 1 bound sessions to a tunnel id, and a tunnel drop revoked
+//! them. The poll transport (§2.1) holds nothing open, so there is no
+//! drop to observe — the binding is to the epoch instead, and the agent
+//! rotates the epoch whenever the relay reports it had no live presence
+//! for one it had already acknowledged (`crate::poll`).
+//!
+//! The guarantee is the same one, and it is worth stating as the
+//! property rather than the mechanism: **a cookie that transited relay
+//! memory dies no later than the relay's own memory of the Mac.** So a
+//! cookie exfiltrated from relay memory — the §2.4 residual — stops
+//! working the moment the relay restarts or the lease lapses, and
+//! cannot be carried to a different relay at all.
+//!
+//! The `Path=/<knock>/` scoping that keeps the browser from offering
+//! this cookie to the un-knocked surface is stamped at the relay, which
+//! is the only party that knows the prefix — see
+//! `aberp_portal_relay::front`.
 //!
 //! Sessions live in memory only. A daemon restart logs Ervin out, which
 //! §4.4 already accepts: "a lapsed session is one Face ID glance away
@@ -37,7 +52,7 @@ pub const ABSOLUTE_CAP: Duration = Duration::from_secs(8 * 60 * 60);
 
 #[derive(Debug, Clone)]
 struct Session {
-    tunnel_id: String,
+    epoch: String,
     created: Instant,
     last_seen: Instant,
 }
@@ -54,9 +69,9 @@ impl SessionStore {
         Self::default()
     }
 
-    /// Mint a session bound to `tunnel_id`. Returns the raw token; the
+    /// Mint a session bound to `epoch`. Returns the raw token; the
     /// caller wraps it in a `Set-Cookie` via [`cookie_header`].
-    pub fn mint(&self, tunnel_id: &str) -> Result<String, rand::RandError> {
+    pub fn mint(&self, epoch: &str) -> Result<String, rand::RandError> {
         let token = rand::token()?;
         let now = Instant::now();
         let mut g = self.lock();
@@ -64,7 +79,7 @@ impl SessionStore {
         g.insert(
             token.clone(),
             Session {
-                tunnel_id: tunnel_id.to_string(),
+                epoch: epoch.to_string(),
                 created: now,
                 last_seen: now,
             },
@@ -72,10 +87,10 @@ impl SessionStore {
         Ok(token)
     }
 
-    /// Validate the browser's `Cookie` header against `tunnel_id`,
+    /// Validate the browser's `Cookie` header against `epoch`,
     /// refreshing the idle clock on success.
     #[must_use]
-    pub fn validate(&self, cookie_header: Option<&str>, tunnel_id: &str) -> bool {
+    pub fn validate(&self, cookie_header: Option<&str>, epoch: &str) -> bool {
         let Some(token) = cookie_header.and_then(extract_cookie) else {
             return false;
         };
@@ -88,7 +103,7 @@ impl SessionStore {
         let Some(s) = g.get_mut(&token) else {
             return false;
         };
-        if expired(s, now) || s.tunnel_id != tunnel_id {
+        if expired(s, now) || s.epoch != epoch {
             g.remove(&token);
             return false;
         }
@@ -104,9 +119,9 @@ impl SessionStore {
         n
     }
 
-    /// Drop every session bound to a tunnel that has gone away.
-    pub fn revoke_tunnel(&self, tunnel_id: &str) {
-        self.lock().retain(|_, s| s.tunnel_id != tunnel_id);
+    /// Drop every session bound to a generation that has gone away.
+    pub fn revoke_epoch(&self, epoch: &str) {
+        self.lock().retain(|_, s| s.epoch != epoch);
     }
 
     #[must_use]
@@ -156,48 +171,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_minted_session_validates_on_its_own_tunnel() {
+    fn a_minted_session_validates_on_its_own_epoch() {
         let s = SessionStore::new();
-        let t = s.mint("tunnel-1").expect("mint");
-        assert!(s.validate(Some(&format!("{COOKIE_NAME}={t}")), "tunnel-1"));
+        let t = s.mint("epoch-1").expect("mint");
+        assert!(s.validate(Some(&format!("{COOKIE_NAME}={t}")), "epoch-1"));
     }
 
     #[test]
-    fn a_session_replayed_through_a_different_tunnel_fails() {
+    fn a_session_replayed_under_a_different_epoch_fails() {
         // §4.4's headline property, and the thing that bounds the §2.4
         // plaintext-in-relay residual.
         let s = SessionStore::new();
-        let t = s.mint("tunnel-1").expect("mint");
-        assert!(!s.validate(Some(&format!("{COOKIE_NAME}={t}")), "tunnel-2"));
+        let t = s.mint("epoch-1").expect("mint");
+        assert!(!s.validate(Some(&format!("{COOKIE_NAME}={t}")), "epoch-2"));
         // And it is dropped, not merely rejected once.
-        assert!(!s.validate(Some(&format!("{COOKIE_NAME}={t}")), "tunnel-1"));
+        assert!(!s.validate(Some(&format!("{COOKIE_NAME}={t}")), "epoch-1"));
     }
 
     #[test]
     fn no_cookie_and_unknown_cookie_both_fail() {
         let s = SessionStore::new();
-        assert!(!s.validate(None, "tunnel-1"));
-        assert!(!s.validate(Some("s=made-up"), "tunnel-1"));
-        assert!(!s.validate(Some("other=value"), "tunnel-1"));
+        assert!(!s.validate(None, "epoch-1"));
+        assert!(!s.validate(Some("s=made-up"), "epoch-1"));
+        assert!(!s.validate(Some("other=value"), "epoch-1"));
     }
 
     #[test]
-    fn revoking_a_tunnel_drops_only_its_sessions() {
+    fn revoking_an_epoch_drops_only_its_sessions() {
         let s = SessionStore::new();
-        let a = s.mint("tunnel-a").expect("mint");
-        let b = s.mint("tunnel-b").expect("mint");
-        s.revoke_tunnel("tunnel-a");
-        assert!(!s.validate(Some(&format!("{COOKIE_NAME}={a}")), "tunnel-a"));
-        assert!(s.validate(Some(&format!("{COOKIE_NAME}={b}")), "tunnel-b"));
+        let a = s.mint("epoch-a").expect("mint");
+        let b = s.mint("epoch-b").expect("mint");
+        s.revoke_epoch("epoch-a");
+        assert!(!s.validate(Some(&format!("{COOKIE_NAME}={a}")), "epoch-a"));
+        assert!(s.validate(Some(&format!("{COOKIE_NAME}={b}")), "epoch-b"));
     }
 
     #[test]
     fn revoke_all_empties_the_table() {
         let s = SessionStore::new();
-        let t = s.mint("tunnel-1").expect("mint");
+        let t = s.mint("epoch-1").expect("mint");
         assert_eq!(s.revoke_all(), 1);
         assert!(s.is_empty());
-        assert!(!s.validate(Some(&format!("{COOKIE_NAME}={t}")), "tunnel-1"));
+        assert!(!s.validate(Some(&format!("{COOKIE_NAME}={t}")), "epoch-1"));
     }
 
     #[test]

@@ -1333,6 +1333,75 @@ this list had recorded separately.
 
 ---
 
+<a id="d-20"></a>
+### D-20 — Outbound-only remote portal (ADR-0115 Phase 0) — deploy it
+
+**Surface today.** Three crates, complete and tested, with nothing
+deployed:
+
+- `crates/aberp-portal-core` — the poll/deliver wire shapes
+  (`PROTOCOL_VERSION = 3`), mutual leaf-certificate pinning (`pin.rs`),
+  constant-time compare, and the canary classifier.
+- `crates/aberp-portal-agent` — the Mac daemon. Polls **out** to the relay
+  (`poll.rs`), IS the WebAuthn relying party (`webauthn/`), verifies Apple
+  attestation against a vendored root (`webauthn/attestation.rs`), stages
+  enrolments for console confirmation (`enrol.rs`), and proxies a
+  four-route read-only allowlist to the local `aberp serve`
+  (`allowlist.rs`). There is no `TcpListener` anywhere in the crate.
+- `crates/aberp-portal-relay` — the VPS binary. Parks requests in a
+  bounded queue (`broker.rs`), owns its own HTTP/1.1 connections
+  (`http1.rs`), and answers every un-authenticated request exactly as a
+  parked nginx would (`nginx.rs`).
+
+The end-to-end path is exercised in one process on loopback —
+`crates/aberp-portal-agent/tests/e2e_portal.rs` and `e2e_canary.rs` — with
+the real front, the real relay, the real pinned Leg-B handshake, the real
+poll transport and the real relying party. The disguise is diffed against a
+**live nginx** across 24 request classes by
+`crates/aberp-portal-relay/tests/nginx_differential.rs`.
+
+**Missing for Live.** Not code — deployment, and three things only the
+operator can supply:
+
+1. **A VPS and a hostname.** The portal's label is a deploy-time secret
+   that deliberately never enters this repository, this binary, or a
+   Certificate Transparency log — hence the wildcard certificate
+   (ADR-0115 §3.2). `tests/no_committed_hostname.rs` is what keeps that
+   true.
+2. **The wildcard `*.abenerp.com` certificate and the two Leg-B
+   identities**, plus each side's pinned SHA-256. Nothing is generated
+   here; `--pin-agent` is required and an empty allowlist is refused at
+   startup.
+3. **The SMTP SPOC credentials** on the Mac, for the canary and enrolment
+   alerts. They live on the Mac and nowhere else — §2.4 forbids the VPS to
+   hold them, which is why the alert is sent from the side that polls.
+
+Then: a launchd unit for the agent, a systemd unit for the relay, one
+console enrolment, and one confirmation typed at the Mac.
+
+**Blocked on.** Our own work, plus an operator decision to rent a VPS. No
+vendor, no account application, no licence — the reason this sits in the
+unblocked half.
+
+**Size.** Small for the deployment itself. The three known follow-ons are
+each their own ADR and are not part of reaching Live:
+
+- **H1 — browser↔agent inner encryption (HPKE).** Phase 2. Until it lands,
+  Leg A's TLS terminates at the VPS and payloads transit relay memory in
+  plaintext. ADR-0115 §4.3a/§4.3b remove that compromise's ability to
+  *enrol*; they do not remove its ability to *watch*.
+- **H2 — a read-only-scoped upstream bearer** in `serve.rs`. Today the
+  agent holds the same bearer the desktop app does and restrains itself by
+  allowlist.
+- **H3 — client certificates on the browser leg**, available for
+  desktop-only use; §9.3 chose the knock token for Phase 0.
+
+**Note on the frozen tree.** Nothing here touches the Prod invoice tree or
+the Portable edition. `cargo tree -p aberp` contains no portal crate, and
+that is the check to re-run if this entry ever grows.
+
+---
+
 ## Expansion slots on a Live capability
 
 <a id="d-16"></a>

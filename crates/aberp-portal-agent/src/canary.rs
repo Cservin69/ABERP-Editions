@@ -2,7 +2,7 @@
 //!
 //! The front sees the probes; this side keeps the record and tells
 //! Ervin. That split is not an accident of layering — it is the same
-//! rule the rest of ADR-0113 follows. Durable state and credentials
+//! rule the rest of ADR-0115 follows. Durable state and credentials
 //! live on the Mac; the VPS holds nothing (§2.4). So the probe log is
 //! here, and so is the SMTP password ([`crate::alert`]).
 //!
@@ -11,7 +11,7 @@
 //! The front already collapses a burst into one [`CanaryBatch`]
 //! (30-second windows, 60-second minimum between HIGH batches). This
 //! side adds a second ceiling, because the two limits protect different
-//! things: the front's protects the tunnel, and this one protects
+//! things: the front's protects the relay, and this one protects
 //! Ervin's attention and the SMTP relay's reputation. A `/16` sweep
 //! that lasts an hour must produce a handful of mails, not one every
 //! half minute.
@@ -108,6 +108,19 @@ impl CanaryWatch {
         self.sink.label()
     }
 
+    /// A handle to the alert path, for the one caller that is not a
+    /// canary batch.
+    ///
+    /// Enrolment alerts (§4.3b) go out over the same configured SPOC as
+    /// probe alerts — one mail path, one place to get the credentials
+    /// right, one thing to test. They deliberately do NOT go through
+    /// [`CanaryWatch::record`]: that applies probe rate limiting, and an
+    /// enrolment must never be coalesced away.
+    #[must_use]
+    pub fn clone_sink(&self) -> AlertSink {
+        self.sink.clone()
+    }
+
     /// Record a batch and alert if the rate limit allows.
     pub async fn record(&self, batch: &CanaryBatch) {
         self.append(batch);
@@ -129,6 +142,52 @@ impl CanaryWatch {
             // alert.
             tracing::error!(error = %e, "canary alert could not be delivered");
             self.restore(batch);
+        }
+    }
+
+    /// Report that the relay has stopped answering (ADR-0115 §3.4).
+    ///
+    /// The canary's weakest link is silence. A relay that has crashed,
+    /// been firewalled, or been taken over and told to drop canary
+    /// batches produces exactly the same observable as a quiet
+    /// internet: nothing. Every poll response carries a heartbeat
+    /// precisely so that this case becomes *detectable*, and this is
+    /// where the detection is acted on.
+    ///
+    /// Rate-limited on the HIGH stamp, because that is what it is: a
+    /// portal that cannot report probes is a portal running blind, and
+    /// it is worth the same interruption as a scan. It shares the stamp
+    /// rather than taking its own so a relay outage and a sweep during
+    /// that outage cannot double-page.
+    pub async fn report_silence(&self, quiet_for: Duration) {
+        {
+            let mut g = self.lock();
+            let now = Instant::now();
+            if g.last_high
+                .is_some_and(|t| now.duration_since(t) < HIGH_ALERT_INTERVAL)
+            {
+                return;
+            }
+            g.last_high = Some(now);
+        }
+        let subject = "ABERP portal: the relay has gone quiet".to_string();
+        let body = format!(
+            "The portal agent has had no answer from the relay for {} seconds.\n\
+             \n\
+             While this lasts the portal is invisibly down — every request to the\n\
+             host gets the ordinary parked answer — and, more importantly, scanner\n\
+             probes CANNOT be reported. Treat a long silence as an unmonitored\n\
+             window rather than a quiet one.\n\
+             \n\
+             Nothing is lost: probe batches are held at the relay until this agent\n\
+             acknowledges them, and the agent's own probe log is unaffected.\n\
+             \n\
+             This is the ADR-0115 §3.4 silence detector. It fires at most once per\n\
+             alert interval.\n",
+            quiet_for.as_secs()
+        );
+        if let Err(e) = self.sink.send(&subject, &body).await {
+            tracing::error!(error = %e, "relay-silence alert could not be delivered");
         }
     }
 
@@ -160,15 +219,25 @@ impl CanaryWatch {
     }
 
     /// Put a failed alert's counts back so the next one carries them.
+    /// Fold a batch whose alert could not be sent back into the
+    /// deferred counts.
+    ///
+    /// The stamp is deliberately **kept**. Clearing it — the previous
+    /// behaviour — meant a failed send reset the rate limiter, so with
+    /// SMTP down every subsequent batch tried to send immediately: a
+    /// scan arriving while the mail path was broken turned into an
+    /// unbounded retry loop against the SMTP server, at exactly the
+    /// moment the network was already unhealthy. It also inverted the
+    /// intent of the limiter, which exists to make a sweep produce one
+    /// alert rather than thousands.
+    ///
+    /// Keeping the stamp costs at most one alert interval of delay, and
+    /// costs nothing in information: the counts are in `deferred` and
+    /// the probe log already has the batch, so the next alert that does
+    /// go out carries everything that happened in between.
     fn restore(&self, batch: &CanaryBatch) {
         let mut g = self.lock();
         g.deferred.add(batch);
-        // Clear the stamp so the retry is not itself rate-limited into
-        // silence.
-        match batch.severity() {
-            Severity::High => g.last_high = None,
-            _ => g.last_low = None,
-        }
     }
 
     fn append(&self, batch: &CanaryBatch) {
@@ -494,9 +563,19 @@ mod tests {
             .contains("portal.canary.window"));
         // …and the counts were put back for the next attempt.
         assert_eq!(w.lock().deferred.batches, 1);
+        // The stamp is KEPT — this is the flipped pin (should-fix 1).
+        //
+        // It used to be cleared, on the reasoning that a failed send
+        // should not be rate-limited into silence. But clearing it meant
+        // a failed send RESET the limiter, so with SMTP down every
+        // subsequent batch tried to send immediately: a scan arriving
+        // while the mail path was broken became an unbounded retry loop
+        // against an SMTP server on an already-unhealthy network. The
+        // interval is the right backoff, and nothing is lost — the
+        // counts are deferred and the probe log has the batch.
         assert!(
-            w.lock().last_high.is_none(),
-            "the retry was rate-limited into silence"
+            w.lock().last_high.is_some(),
+            "a failed send reset the rate limiter into an unbounded retry loop"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

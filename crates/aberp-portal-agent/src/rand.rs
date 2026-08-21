@@ -1,8 +1,8 @@
 //! Token minting.
 //!
-//! Every unguessable value the agent produces — knock token (ADR-0113
+//! Every unguessable value the agent produces — knock token (ADR-0115
 //! §3.3), enrolment token (§4.3), WebAuthn challenge (§4.3), session
-//! token (§4.4), tunnel id (§2.1), WebAuthn user handle — comes from
+//! token (§4.4), presence epoch (§2.1), WebAuthn user handle — comes from
 //! here, so there is one place to audit the entropy source.
 //!
 //! `getrandom` is the OS CSPRNG (`getentropy` on macOS). It is already
@@ -13,7 +13,7 @@ use base64::Engine as _;
 
 /// Token width in bytes. 256 bits everywhere.
 ///
-/// ADR-0113 §3.3 specifies 128 bits for the knock token; we mint 256
+/// ADR-0115 §3.3 specifies 128 bits for the knock token; we mint 256
 /// for every token uniformly because the cost is 22 more characters in
 /// a bookmark and the benefit is that no reader has to ask which token
 /// is which strength. §9.2's "memorable" requirement lives in the

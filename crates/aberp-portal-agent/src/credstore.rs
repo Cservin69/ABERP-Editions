@@ -1,6 +1,6 @@
 //! The WebAuthn credential store — public keys only, on the Mac.
 //!
-//! ADR-0113 §4.2:
+//! ADR-0115 §4.2:
 //!
 //! > Credential public keys + metadata live in the agent's own small
 //! > store on the Mac (not in an ABERP tenant DB — the agent must work

@@ -134,6 +134,25 @@ impl VirtualAuthenticator {
         })
     }
 
+    /// The stored form of this authenticator's credential, as the
+    /// console-confirmation step would commit it (ADR-0115 §4.3b).
+    ///
+    /// This is the ONLY way a software authenticator gets into the
+    /// credential store now: §4.3a refuses its ceremony outright, and
+    /// `e2e_portal::a_software_credential_cannot_enrol` pins that. See
+    /// `Portal::provision_credential`.
+    pub fn as_stored_credential(&self, label: &str) -> aberp_portal_agent::credstore::Credential {
+        let point = self.key.verifying_key().to_encoded_point(false);
+        aberp_portal_agent::credstore::Credential {
+            id: b64url(&self.credential_id),
+            x: hex::encode(point.x().expect("x")),
+            y: hex::encode(point.y().expect("y")),
+            sign_count: self.sign_count,
+            label: label.to_string(),
+            created_at: "2026-08-21T00:00:00Z".to_string(),
+        }
+    }
+
     /// The normal case: user present and user verified.
     pub fn register_verified(
         &self,

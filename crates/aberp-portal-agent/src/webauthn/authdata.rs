@@ -10,7 +10,7 @@
 //! aaguid (16) | credentialIdLength (2, big-endian) | credentialId | credentialPublicKey (COSE)
 //! ```
 //!
-//! The three checks ADR-0113 §4.3 names — RP-ID hash, user
+//! The three checks ADR-0115 §4.3 names — RP-ID hash, user
 //! verification, sign-count regression — all read fields parsed here.
 
 use sha2::{Digest, Sha256};
@@ -20,7 +20,7 @@ use super::cose::{CoseError, Es256PublicKey};
 /// `UP` — user present.
 pub const FLAG_UP: u8 = 0x01;
 /// `UV` — user verified (the biometric/passcode gate actually fired).
-/// ADR-0113 §4.3 requires `userVerification: required`, so this bit
+/// ADR-0115 §4.3 requires `userVerification: required`, so this bit
 /// being clear is a refusal, not a downgrade.
 pub const FLAG_UV: u8 = 0x04;
 /// `AT` — attested credential data present (registration only).
@@ -96,7 +96,7 @@ impl AuthenticatorData {
     /// `true` iff this data was produced for `rp_id`.
     ///
     /// This is the origin binding that makes a passkey unphishable
-    /// (ADR-0113 §G3): an assertion minted for a look-alike host hashes
+    /// (ADR-0115 §G3): an assertion minted for a look-alike host hashes
     /// to a different value here and verifies against nothing.
     #[must_use]
     pub fn rp_id_matches(&self, rp_id: &str) -> bool {

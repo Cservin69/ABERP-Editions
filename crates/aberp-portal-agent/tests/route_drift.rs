@@ -1,4 +1,4 @@
-//! ADR-0113 §7: "serve.rs route drift breaking the allowlist (the
+//! ADR-0115 §7: "serve.rs route drift breaking the allowlist (the
 //! allowlist is exact — drift fails *closed*, portal shows an error,
 //! nothing silently widens)".
 //!
@@ -30,7 +30,7 @@ fn every_allowlisted_route_still_exists_in_serve_rs() {
         let needle = format!(".route(\"{route}\", get(");
         assert!(
             src.contains(&needle),
-            "ADR-0113 §6.2 row `{route}` is no longer registered as a GET in serve.rs.\n\
+            "ADR-0115 §6.2 row `{route}` is no longer registered as a GET in serve.rs.\n\
              The portal's allowlist would fail closed at runtime; fix the allowlist \
              (crates/aberp-portal-agent/src/allowlist.rs) to match the new route shape \
              rather than deleting this test."
@@ -40,12 +40,12 @@ fn every_allowlisted_route_still_exists_in_serve_rs() {
 
 #[test]
 fn the_allowlist_has_exactly_the_four_adr_rows() {
-    // Widening the portal's read surface is a decision ADR-0113 §6.2
+    // Widening the portal's read surface is a decision ADR-0115 §6.2
     // reserves ("each needing its own justification"), not an edit.
     assert_eq!(
         UPSTREAM_ROUTES,
         ["/health", "/invoices", "/invoices/:id", "/invoices/:id/pdf"],
-        "the portal's upstream surface changed — ADR-0113 §6.2 lists exactly four rows"
+        "the portal's upstream surface changed — ADR-0115 §6.2 lists exactly four rows"
     );
 }
 

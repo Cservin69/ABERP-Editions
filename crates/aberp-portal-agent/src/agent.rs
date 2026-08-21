@@ -6,7 +6,7 @@
 //! | Route | Session? | What it is |
 //! |---|---|---|
 //! | `GET  /api/session` | no | pre-auth status: is anyone enrolled, is an enrolment window open |
-//! | `POST /api/auth/begin` | no | assertion options (ADR-0113 §4.3) |
+//! | `POST /api/auth/begin` | no | assertion options (ADR-0115 §4.3) |
 //! | `POST /api/auth/finish` | no | assertion verify → session mint (§4.4) |
 //! | `POST /api/enrol/begin` | no, but needs a console-minted token | creation options (§4.3) |
 //! | `POST /api/enrol/finish` | same | registration verify → credential stored |
@@ -44,7 +44,7 @@ use crate::audit::{AuditLog, Event};
 use crate::canary::CanaryWatch;
 use crate::config::AgentConfig;
 use crate::credstore::{Credential, CredentialStore};
-use crate::enrol::EnrolStore;
+use crate::enrol::{EnrolStore, StagingStore};
 use crate::health::{self, HealthMonitor};
 use crate::knock::KnockStore;
 use crate::rand;
@@ -62,12 +62,15 @@ pub struct Agent {
     pub sessions: SessionStore,
     pub credentials: CredentialStore,
     pub enrolment: EnrolStore,
+    /// Credentials that passed every cryptographic check and are
+    /// waiting for a human at the Mac to confirm them (§4.3b).
+    pub staging: StagingStore,
     pub knock: KnockStore,
     pub health: HealthMonitor,
     pub audit: AuditLog,
     /// The Mac half of the scanner trap: the durable probe log and the
     /// alert. The front sees the probes; this is where the record and
-    /// the SMTP credential live (ADR-0113 §2.4).
+    /// the SMTP credential live (ADR-0115 §2.4).
     pub canary: CanaryWatch,
 }
 
@@ -85,6 +88,7 @@ impl Agent {
             sessions: SessionStore::new(),
             credentials: CredentialStore::in_dir(&cfg.state_dir),
             enrolment: EnrolStore::in_dir(&cfg.state_dir),
+            staging: StagingStore::in_dir(&cfg.state_dir),
             knock: KnockStore::in_dir(&cfg.state_dir),
             health: HealthMonitor::new(),
             audit: AuditLog::in_dir(&cfg.state_dir),
@@ -113,29 +117,47 @@ impl Agent {
         Ok(handle)
     }
 
-    /// Dispatch one request that arrived over the tunnel.
-    pub async fn handle(&self, req: &PortalRequest, tunnel_id: &str) -> PortalResponse {
+    /// Dispatch one request the poll loop collected.
+    ///
+    /// `epoch` is the relay-presence generation this request belongs to;
+    /// sessions are bound to it (§4.4).
+    pub async fn handle(&self, req: &PortalRequest, epoch: &str) -> PortalResponse {
         let path = req.path.as_str();
         let method = req.method.as_str();
 
         match (method, path) {
             ("GET", "/api/session") => self.session_status(),
             ("POST", "/api/auth/begin") => self.auth_begin(req),
-            ("POST", "/api/auth/finish") => self.auth_finish(req, tunnel_id),
+            ("POST", "/api/auth/finish") => self.auth_finish(req, epoch),
             ("POST", "/api/enrol/begin") => self.enrol_begin(req),
-            ("POST", "/api/enrol/finish") => self.enrol_finish(req, tunnel_id),
-            _ => self.authenticated(req, tunnel_id).await,
+            ("POST", "/api/enrol/finish") => self.enrol_finish(req),
+            _ => self.authenticated(req, epoch).await,
         }
     }
 
     /// Pre-auth status. Says only what the shell must know to render a
     /// button, and nothing about *who* is enrolled.
+    ///
+    /// # What it deliberately no longer says
+    ///
+    /// `enrolment_open` used to be here, and it was a live oracle. This
+    /// endpoint is reachable by anyone who has the knock and nothing
+    /// else, so publishing it meant an attacker holding a stolen knock
+    /// could poll a few times a minute and learn the exact moment Ervin
+    /// opened a 10-minute enrolment window — the one window in which a
+    /// registration ceremony is accepted at all. That turns a window
+    /// nobody can see into a scheduled opportunity, and it cost
+    /// nothing to publish because the shell does not need it: the
+    /// enrolment flow is entered from a URL fragment the console
+    /// printed, so a browser that has the enrolment token already knows
+    /// a window was open, and one that does not has no button to draw.
+    ///
+    /// `enrolled` stays. It is what decides whether the shell offers
+    /// "sign in" or "nothing is enrolled yet", it does not move on
+    /// Ervin's schedule, and it says nothing about who.
     fn session_status(&self) -> PortalResponse {
         let enrolled = self.credentials.load().map(|c| c.len()).unwrap_or(0);
-        json_ok(&serde_json::json!({
-            "enrolled": enrolled,
-            "enrolment_open": self.enrolment.is_open(),
-        }))
+        json_ok(&serde_json::json!({ "enrolled": enrolled }))
     }
 
     fn auth_begin(&self, req: &PortalRequest) -> PortalResponse {
@@ -149,7 +171,10 @@ impl Agent {
             // already passed the gate.
             return self.refuse(req, 409, "no credential enrolled", "no credential enrolled");
         }
-        match self.rp.request_options(&self.challenges, &enrolled) {
+        match self
+            .rp
+            .request_options(&self.challenges, &enrolled, req.peer.as_deref())
+        {
             Ok(opts) => {
                 self.audit
                     .append(&Event::new("portal.auth.challenge_issued").peer(req.peer.as_deref()));
@@ -159,7 +184,7 @@ impl Agent {
         }
     }
 
-    fn auth_finish(&self, req: &PortalRequest, tunnel_id: &str) -> PortalResponse {
+    fn auth_finish(&self, req: &PortalRequest, epoch: &str) -> PortalResponse {
         #[derive(Deserialize)]
         struct Body {
             #[serde(flatten)]
@@ -186,7 +211,7 @@ impl Agent {
                 let _ = self
                     .credentials
                     .update_sign_count(&credential.id, new_count);
-                self.mint_session(req, tunnel_id, &credential.id, "portal.auth.verified")
+                self.mint_session(req, epoch, &credential.id, "portal.auth.verified")
             }
             Err(e) => {
                 // The reason is the agent's own typed error, never the
@@ -233,7 +258,7 @@ impl Agent {
         };
         match self
             .rp
-            .creation_options(&self.challenges, &handle, &enrolled)
+            .creation_options(&self.challenges, &handle, &enrolled, req.peer.as_deref())
         {
             Ok(opts) => {
                 self.audit
@@ -247,7 +272,7 @@ impl Agent {
         }
     }
 
-    fn enrol_finish(&self, req: &PortalRequest, tunnel_id: &str) -> PortalResponse {
+    fn enrol_finish(&self, req: &PortalRequest) -> PortalResponse {
         #[derive(Deserialize)]
         struct Body {
             token: String,
@@ -290,10 +315,42 @@ impl Agent {
                     label,
                     created_at: now_rfc3339(),
                 };
-                if let Err(e) = self.credentials.add(credential) {
-                    return self.refuse(req, 500, "credential store unwritable", &e.to_string());
-                }
-                self.mint_session(req, tunnel_id, &v.credential_id, "portal.enrol.registered")
+                // §4.3b — STAGED, not stored. Every check up to here is
+                // one a machine performs and an attacker with the right
+                // inputs can satisfy; the credential is only committed
+                // once a human at the Mac types the code below. No
+                // session is minted here either: an enrolment that
+                // nobody confirmed grants nothing at all.
+                let code = match self.staging.stage(credential) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return self.refuse(req, 500, "enrolment staging failed", &e.to_string())
+                    }
+                };
+                self.audit.append(
+                    &Event::new("portal.enrol.staged")
+                        .credential(v.credential_id.clone())
+                        .peer(req.peer.as_deref()),
+                );
+                // Printed where the operator can see it without opening
+                // a log viewer: this daemon's console IS the enrolment
+                // credential.
+                tracing::warn!(
+                    code = %code,
+                    "a passkey enrolment is waiting for confirmation — run \
+                     `aberp-portal-agent confirm --code {code}` at this Mac to commit it, \
+                     or `aberp-portal-agent confirm --reject` if you did not start it"
+                );
+                self.alert_enrolment(&v.credential_id, &code);
+                PortalResponse::json(
+                    202,
+                    &serde_json::json!({
+                        "staged": true,
+                        "code": code,
+                        "message": "Confirm this code at the Mac to finish enrolling.",
+                    })
+                    .to_string(),
+                )
             }
             Err(e) => {
                 self.audit.append(
@@ -306,14 +363,60 @@ impl Agent {
         }
     }
 
+    /// Alert on EVERY enrolment attempt that got this far (§4.3b).
+    ///
+    /// Not rate-limited and not conditional. Enrolment is the only
+    /// operation in the design that grants standing access — access
+    /// that survives knock rotation, relay redeploys and the original
+    /// compromise being cleaned up — so the one thing Ervin must never
+    /// miss is that one happened. A legitimate enrolment produces one
+    /// mail Ervin was expecting; an illegitimate one produces a mail
+    /// nobody was expecting, next to a console prompt nobody typed.
+    ///
+    /// Sent off-task: the alert path can block on SMTP for as long as
+    /// its timeout allows, and the answer to the browser must not wait
+    /// for it.
+    fn alert_enrolment(&self, credential_id: &str, code: &str) {
+        let canary = self.canary.clone_sink();
+        let subject = "ABERP portal: a passkey enrolment is waiting for confirmation".to_string();
+        let body = format!(
+            "Someone completed a passkey enrolment ceremony against the portal.\n\
+             \n\
+             Confirmation code: {code}\n\
+             Credential id:     {credential_id}\n\
+             \n\
+             NOTHING HAS BEEN GRANTED YET. The credential is staged and will be\n\
+             discarded unless someone at the Mac runs:\n\
+             \n\
+             \x20   aberp-portal-agent confirm --code {code}\n\
+             \n\
+             If you did not just do this, do NOT confirm it. Run:\n\
+             \n\
+             \x20   aberp-portal-agent confirm --reject\n\
+             \x20   aberp-portal-agent rotate-knock\n\
+             \n\
+             …and treat the enrolment URL as compromised — someone had a live,\n\
+             console-minted enrolment token that was not used by you.\n\
+             \n\
+             This alert is ADR-0115 §4.3b and is deliberately NOT rate-limited.\n"
+        );
+        tokio::spawn(async move {
+            if let Err(e) = canary.send(&subject, &body).await {
+                // The console prompt is the backstop: an alert that
+                // could not be sent does not commit anything.
+                tracing::error!(error = %e, "enrolment alert could not be delivered");
+            }
+        });
+    }
+
     fn mint_session(
         &self,
         req: &PortalRequest,
-        tunnel_id: &str,
+        epoch: &str,
         credential_id: &str,
         kind: &'static str,
     ) -> PortalResponse {
-        match self.sessions.mint(tunnel_id) {
+        match self.sessions.mint(epoch) {
             Ok(token) => {
                 self.audit.append(
                     &Event::new(kind)
@@ -331,8 +434,8 @@ impl Agent {
     }
 
     /// Everything past the auth wall.
-    async fn authenticated(&self, req: &PortalRequest, tunnel_id: &str) -> PortalResponse {
-        if !self.sessions.validate(req.cookie.as_deref(), tunnel_id) {
+    async fn authenticated(&self, req: &PortalRequest, epoch: &str) -> PortalResponse {
+        if !self.sessions.validate(req.cookie.as_deref(), epoch) {
             self.audit.append(
                 &Event::new("portal.request.unauthenticated")
                     .request(&req.method, &req.path)
@@ -480,7 +583,13 @@ fn webauthn_reason(e: &WebAuthnError) -> &'static str {
         WebAuthnError::WrongOrigin { .. } => "origin mismatch",
         WebAuthnError::AttestationEncoding
         | WebAuthnError::AttestationCbor(_)
+        | WebAuthnError::AttestationNoFmt
         | WebAuthnError::AttestationNoAuthData => "malformed attestation",
+        // §4.3a. Deliberately distinct from "malformed attestation":
+        // a well-formed statement that does not chain to Apple is the
+        // signature of an attempted software enrolment, and it is the
+        // single most important line this log can carry.
+        WebAuthnError::Attestation(_) => "attestation not Apple hardware",
         WebAuthnError::AuthData(_) | WebAuthnError::AuthDataEncoding => {
             "malformed authenticator data"
         }

@@ -1,5 +1,5 @@
 //! "Running or not running" — the Phase-0 health surface
-//! (ADR-0113 §5).
+//! (ADR-0115 §5).
 //!
 //! This is the whole reason the agent is a **separate process** from
 //! `aberp serve` (§2.2). If health lived inside ABERP, the one state

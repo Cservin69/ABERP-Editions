@@ -1,6 +1,6 @@
 [package]
 name = "aberp-portal-core"
-description = "ADR-0113 Phase 0 — shared wire types + mTLS pinning for the outbound-only remote portal (agent ↔ relay)."
+description = "ADR-0115 Phase 0 — shared wire types + mTLS pinning for the outbound-only remote portal (agent ↔ relay)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,7 +17,7 @@ publish.workspace = true
 # secrets — only the frame codec, the request/response shapes that cross
 # Leg B, and the peer-pinning TLS configs both ends build from a
 # fingerprint. Keeping it policy-free is what makes "the relay decides
-# nothing" (ADR-0113 §2.4) checkable by reading one small crate.
+# nothing" (ADR-0115 §2.4) checkable by reading one small crate.
 [dependencies]
 base64 = { workspace = true }
 hex = { workspace = true }

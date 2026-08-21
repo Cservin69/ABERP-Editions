@@ -1,4 +1,4 @@
-//! The agent's local, append-only audit log (ADR-0113 §6.5).
+//! The agent's local, append-only audit log (ADR-0115 §6.5).
 //!
 //! > on the Mac, append-only, no bodies logged, and refusals are logged
 //! > as loudly as successes.
@@ -212,7 +212,7 @@ mod tests {
         for forbidden in ["body", "body_b64", "query", "payload", "response"] {
             assert!(
                 !obj.contains_key(forbidden),
-                "audit record grew a `{forbidden}` field — ADR-0113 §6.5 forbids bodies in this log"
+                "audit record grew a `{forbidden}` field — ADR-0115 §6.5 forbids bodies in this log"
             );
         }
     }

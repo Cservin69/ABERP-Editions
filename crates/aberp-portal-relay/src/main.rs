@@ -4,9 +4,14 @@
 //! deployment unit is one binary plus a systemd unit file:
 //!
 //! - the **agent listener**, mutually-authenticated, which the Mac
-//!   dials out to (ADR-0113 §2.3);
+//!   polls (ADR-0115 §2.3);
 //! - the **front listener**, public HTTPS with the wildcard
 //!   `*.abenerp.com` certificate (§3.2).
+//!
+//! Both are served by [`aberp_portal_relay::http1`] rather than a web
+//! framework, because the front's whole job is to be byte-identical to
+//! a parked nginx and a framework answers malformed requests before any
+//! of our code runs. See that module for the full argument.
 //!
 //! # Nothing here knows the portal's hostname
 //!
@@ -24,15 +29,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aberp_portal_core::PinnedFingerprint;
-use aberp_portal_relay::{broker, canary, front, Broker, Canary, Front};
+use aberp_portal_relay::{canary, http1, AgentLeg, Broker, Canary, Front};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::net::TcpListener;
 
 #[derive(Parser)]
 #[command(
     name = "aberp-portal-relay",
-    about = "ADR-0113 portal relay — a blind, mutually-authenticated pipe with nothing at rest",
+    about = "ADR-0115 portal relay — a blind, mutually-authenticated parking lot with nothing at rest",
     long_about = None
 )]
 struct Cli {
@@ -40,7 +46,7 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0:443")]
     front_addr: SocketAddr,
 
-    /// Where the Mac agent dials in (Leg B).
+    /// Where the Mac agent polls (Leg B).
     #[arg(long, default_value = "0.0.0.0:8443")]
     agent_addr: SocketAddr,
 
@@ -112,20 +118,23 @@ async fn main() -> Result<()> {
 
     let broker = Arc::new(Broker::new());
 
-    let agent_listener = tokio::net::TcpListener::bind(cli.agent_addr)
+    // Leg B. The TLS config demands and pins a client certificate, so
+    // an unpinned peer is dropped inside the handshake — "before any
+    // application byte, indistinguishable from a closed service" (§2.3).
+    let agent_listener = TcpListener::bind(cli.agent_addr)
         .await
         .with_context(|| format!("binding the agent listener on {}", cli.agent_addr))?;
     tracing::info!(addr = %cli.agent_addr, "agent leg listening (mutually pinned)");
-    let acceptor_broker = Arc::clone(&broker);
-    tokio::spawn(broker::accept_forever(
-        acceptor_broker,
+    tokio::spawn(serve_tls(
         agent_listener,
         Arc::new(leg_b_tls),
+        Arc::new(AgentLeg {
+            broker: Arc::clone(&broker),
+        }),
     ));
 
     // The scanner trap. Its aggregator is a background task, so the
-    // response path only ever does a non-blocking hand-off — see
-    // `aberp_portal_relay::canary`.
+    // response path only ever does a non-blocking hand-off.
     let (canary_handle, canary_rx) = Canary::new();
     tokio::spawn(canary::run_aggregator(
         Arc::clone(&canary_handle),
@@ -133,22 +142,17 @@ async fn main() -> Result<()> {
         canary_rx,
     ));
 
-    let app = front::router(Arc::new(Front {
+    let front = Arc::new(Front {
         broker,
         canary: canary_handle,
-    }));
+    });
+    let front_listener = TcpListener::bind(cli.front_addr)
+        .await
+        .with_context(|| format!("binding the front on {}", cli.front_addr))?;
     tracing::info!(addr = %cli.front_addr, "front listening");
 
     if cli.front_plaintext {
-        let listener = tokio::net::TcpListener::bind(cli.front_addr)
-            .await
-            .with_context(|| format!("binding the front on {}", cli.front_addr))?;
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .context("serving the front")?;
+        serve_plain(front_listener, front).await;
     } else {
         let cert = cli
             .front_cert_pem
@@ -156,15 +160,57 @@ async fn main() -> Result<()> {
         let key = cli
             .front_key_pem
             .expect("clap requires it without --front-plaintext");
-        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
-            .await
+        let tls = aberp_portal_core::pin::front_server_config(load_chain(&cert)?, load_key(&key)?)
             .context("loading the front (wildcard) certificate")?;
-        axum_server::bind_rustls(cli.front_addr, tls)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .context("serving the front")?;
+        serve_tls(front_listener, Arc::new(tls), front).await;
     }
     Ok(())
+}
+
+/// Accept forever, terminate TLS, hand each connection to `http1`.
+async fn serve_tls<H: http1::Handler>(
+    listener: TcpListener,
+    tls: Arc<rustls::ServerConfig>,
+    handler: Arc<H>,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let handler = Arc::clone(&handler);
+        tokio::spawn(async move {
+            // Metadata-only logging, Ervin's §9.5 decision: peer address
+            // and timestamps, no paths, no tokens, no bodies.
+            match acceptor.accept(tcp).await {
+                Ok(stream) => http1::serve(stream, Some(peer), handler).await,
+                // A failed handshake — including an unpinned client
+                // certificate on Leg B — is answered with silence.
+                // Nothing was served, and nothing is said about why.
+                Err(e) => tracing::debug!(%peer, error = %e, "handshake refused"),
+            }
+        });
+    }
+}
+
+/// The loopback-only plaintext front.
+async fn serve_plain<H: http1::Handler>(listener: TcpListener, handler: Arc<H>) {
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed");
+                continue;
+            }
+        };
+        let handler = Arc::clone(&handler);
+        tokio::spawn(async move { http1::serve(tcp, Some(peer), handler).await });
+    }
 }
 
 fn load_chain(path: &PathBuf) -> Result<Vec<CertificateDer<'static>>> {

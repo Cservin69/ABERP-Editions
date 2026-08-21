@@ -3,14 +3,14 @@
 //! # Why the alert is sent from the Mac
 //!
 //! The probe is seen on the VPS, but the mail is sent from here.
-//! ADR-0113 §2.4 makes "no authentication material at rest on the VPS"
+//! ADR-0115 §2.4 makes "no authentication material at rest on the VPS"
 //! absolute and ADR-0047 makes the OS keychain the only home for the
 //! SMTP password; a relay that could send mail would need a credential
-//! that a relay compromise would then hand over. The tunnel already
+//! that a relay compromise would then hand over. The poll loop already
 //! exists and already runs relay → agent, so the canary rides it and
 //! the credential never leaves the machine it belongs to.
 //!
-//! Cost of that choice, stated: while the tunnel is down, no alert can
+//! Cost of that choice, stated: while Leg B is down, no alert can
 //! be sent. The front keeps a bounded in-memory backlog and flushes on
 //! reconnect. A relay that is *hostile* rather than merely offline can
 //! suppress canaries entirely — inherent, since a hostile relay can

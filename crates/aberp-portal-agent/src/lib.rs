@@ -1,4 +1,4 @@
-//! ADR-0113 Phase 0 — the Mac-side portal agent.
+//! ADR-0115 Phase 0 — the Mac-side portal agent.
 //!
 //! # The one-paragraph version
 //!
@@ -7,7 +7,7 @@
 //! that connection. It is the **WebAuthn relying party** — it holds the
 //! credential store, issues and verifies challenges, and mints sessions
 //! — so a relay compromise can neither mint a session nor read anything
-//! at rest (ADR-0113 §4.2, §G4). It proxies exactly four `GET` routes to
+//! at rest (ADR-0115 §4.2, §G4). It proxies exactly four `GET` routes to
 //! the local ABERP behind the existing keychain bearer and refuses every
 //! mutating verb (§6.3). The Mac opens **no inbound port** (§G1).
 //!
@@ -20,8 +20,8 @@
 //! | Hostname never committed (`PORTAL_HOST`) | [`config`] |
 //! | High-entropy knock token, minted at the agent | [`knock`] |
 //! | Read-only, enforced at the agent | [`allowlist`] |
-//! | Sessions bound to the tunnel, no refresh tokens | [`session`] |
-//! | Outbound-only, mutually pinned, jittered reconnect | [`tunnel`] |
+//! | Sessions bound to the relay presence epoch, no refresh tokens | [`session`] |
+//! | Outbound-only, mutually pinned, jittered retry | [`poll`] |
 //! | ABERP up/down independent of ABERP | [`health`] |
 //! | Metadata-only, append-only, refusals logged | [`audit`] |
 //! | Scanner trap: probe log + rate-limited alert | [`canary`], [`alert`] |
@@ -34,7 +34,7 @@
 //!   transit relay memory in plaintext. A live root-level compromise of
 //!   the relay can read a session while it happens. Bounded by: the
 //!   data is read-only, no standing access is gained, challenges are
-//!   single-use, and sessions die with the tunnel.
+//!   single-use, and sessions die with the presence epoch.
 //! - **No mTLS on the browser leg.** §9.3 chose the knock token for
 //!   Phase 0; client certificates (§3.3a, hardening H3) remain
 //!   available for desktop-only use later.
@@ -56,9 +56,9 @@ pub mod credstore;
 pub mod enrol;
 pub mod health;
 pub mod knock;
+pub mod poll;
 pub mod rand;
 pub mod session;
-pub mod tunnel;
 pub mod upstream;
 pub mod webauthn;
 

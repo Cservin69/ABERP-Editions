@@ -1,4 +1,4 @@
-//! The portal's hostname must never be committed (ADR-0113 §3.2 +
+//! The portal's hostname must never be committed (ADR-0115 §3.2 +
 //! Ervin's §9.2 decision).
 //!
 //! The wildcard `*.abenerp.com` certificate keeps the label out of
@@ -88,7 +88,7 @@ fn no_portal_source_file_contains_a_real_hostname() {
     }
     assert!(
         offenders.is_empty(),
-        "ADR-0113 §3.2 — the portal hostname is minted at deploy time and must never be \
+        "ADR-0115 §3.2 — the portal hostname is minted at deploy time and must never be \
          committed. The wildcard certificate keeps the label out of CT logs; a source file \
          would put it right back. Read it from `PORTAL_HOST` instead.\n{}",
         offenders.join("\n")
@@ -98,7 +98,7 @@ fn no_portal_source_file_contains_a_real_hostname() {
 /// Return the committed label, if this line names one.
 ///
 /// The **apex** is not a secret and appears in prose here and in
-/// ADR-0113 itself; the **wildcard** `*.<apex>` is not a secret either
+/// ADR-0115 itself; the **wildcard** `*.<apex>` is not a secret either
 /// — it is the certificate that exists precisely so the label stays
 /// private. What must never appear is a concrete label in front of the
 /// apex. So: find the apex, read backwards over the label characters,
