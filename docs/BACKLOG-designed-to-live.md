@@ -384,10 +384,13 @@ into FeatureGraph v6. The named parts below are where each defect lives:
 `_skin_over_axis`, `_root_for_end`, `_walk_caps`,
 `DEGENERATE_ISOLINE_RATIO`, `SURFACE_CONFUSION_MM`.
 
-**Missing for Live.** Five defects, in priority order. All are
-mutation-verified from adversarial pass 8, and all but N2 **under-quote**
-(they read the part as cheaper than it is). **Two are CLOSED**; three
-remain, and the gate stands until all five are.
+**Missing for Live.** Eight items, in priority order — seven defects and
+one undecided convention. All are mutation-verified: items 1-5 from
+adversarial pass 8, items 6-8 from the D-19 round-2 pass. **Three are
+CLOSED**; five remain, and the gate stands until all of them are. Note
+that the defects do **not** all fail in the same direction: 1, 2, 3, 5 and
+7 under-quote, 4 and 6 over-quote, and 6 does so by three orders of
+magnitude. Item 8 is a decision, not a direction.
 
 1. ~~**N4 — undercut spherical cavity**~~ **— CLOSED.** (Ball-end seat;
    nose radius exceeds bore radius by `e >= 4e-7`.) Read **up to 87%
@@ -424,6 +427,53 @@ remain, and the gate stands until all five are.
 5. **N1 — breakout hole.** When the nose/point breaks the far face, the
    hole reads **blind** with a depth *exceeding the plate*, because the
    measurement runs to a pole in the air below the part.
+6. ~~**R2-A — convex floor / cap off the part**~~ **— CLOSED.** The
+   *mirror* of N4, found by the round-2 adversarial pass, and the only
+   item here that **over-quotes**. Two compounding faults in
+   `_root_for_end`: the void bound from item 1 discarded the **crown of a
+   doubly-curved convex floor** — which *is* the floor, since the metal
+   starts there — and the nearest pick then took the carrier's *other*
+   crossing, which nothing constrained. A Ø12 pocket with a crown
+   standing 1.2e-3 mm proud read **30012 mm deep and THROUGH in a 20 mm
+   plate**, flipping at exactly the bound's slack; a Ø8 bore breaking out
+   through a sphere read **24 in a 20**; a Ø4 bore with a spherical mouth
+   undercut put its far end 2.556 mm **above** the plate's top face and
+   read UNKNOWN. Fixed by validating against the **solid**: where the
+   bound discards, a crossing the axis really leaves the metal at takes
+   the end (rescuing the crown), and a survivor outside the part's own
+   extent is refused outright rather than inherited. Position and normal
+   cannot separate these — a convex crown and an undercut pole sit in the
+   same place and both read `(0,0,+1)`. Four committed fixtures, a
+   13-crown sweep across the slack, a 6-cutter sweep, and direct
+   arithmetic pins on all three selection rules.
+7. **R2-B — toroidal undercut (O-ring / snap-ring gland).** A gland at the
+   bore's end reads **short and THROUGH**: a Ø8 bore with a R4 x 1.5
+   gland at z=12 mines **6.5 THROUGH** where the axis has metal below
+   z=12 (so it is BLIND) and the gland's own floor is at z=10.5 — **8.0
+   or 9.5** depending on whether depth is measured on the axis or to the
+   deepest point of the feature, which is itself undecided. **Pre-existing
+   and unchanged by the round-2 fix**, verified by running both rules over
+   the same part: a **ring torus never crosses its own axis**, so that cap
+   face offers *no* crossing at all and root selection is never asked. The
+   end falls back to the bore's parametric bound and the touching vote
+   calls it open. Fixing it means giving `_cap_axis_intersections` or
+   `_EndEvidence.resolve` something to say when a cap face contributes no
+   axis crossing — a different mechanism from items 1 and 6, which is why
+   it was left rather than half-fixed.
+8. **R2-C — depth convention at a relieved mouth.** Not a defect so much
+   as an **undecided convention**, recorded because the round-2 pass
+   surfaced a disagreement about it. The miner measures a hole to the top
+   of its own **cylindrical wall**, so a countersink, a chamfer or a
+   spherical dish at the mouth is *not* part of the hole:
+   `countersunk_blind_bore` is pinned at **11.0, not 14.0**,
+   `chamfered_mouth_bore` at **18.5, not 20.0**, and
+   `spherical_mouth_undercut_bore` at **9.0404, not 10.632**. Measuring
+   from the part's face instead is defensible — it is what a drawing
+   dimension usually means — but it is a **corpus-wide convention change**
+   touching at least those three committed fixtures and their goldens, so
+   it needs its own decision and its own pass. Slice C must not price off
+   `located_holes` until it is settled, because the two readings differ by
+   the full depth of the relief.
 
 **Blocked on.** Nothing external. This is purely our own work in one file.
 The adversarial-8 repros lived in the branch's `scratchpad/` and were not
@@ -437,8 +487,11 @@ the half-order robustness window documented on the round-7 commit
 (`SURFACE_CONFUSION_MM = 1e-7`: correct at `e <= 3x`, fails at `4x`), and
 they were indeed one fix — the boundary is gone rather than moved, so the
 answer no longer depends on whether OCCT can tell the seat from a tangent
-ball nose. Items 3, 4 and 5 are independent, and item 4 in particular is
-a constant change whose blast radius is the whole fixture corpus.
+ball nose. Item 6 is that same fix's mirror and closed the same way, by
+replacing a presumption about position with a question put to the solid.
+Items 3, 4, 5 and 7 are independent; item 4 is a constant change whose
+blast radius is the whole fixture corpus, and item 8 is a decision rather
+than a fix.
 
 ---
 

@@ -742,22 +742,119 @@ def test_n2_end_conditions_come_from_the_cap_faces_not_a_probe(fixtures_dir: Pat
     )
 
 
-def test_n2_no_point_in_solid_classifier_reaches_the_miner():
-    """N2: `BRepClass3d_SolidClassifier` is gone, not merely called less.
+#: The committed parts on which `_root_for_end` builds an `_AxisMaterial`
+#: classifier at all — exactly the parts that have a crossing the void
+#: bound discards, which is the only place the material question is put.
+#: Everything else (an ordinary plate, a flat-bottomed pocket, a
+#: countersink, a chamfered mouth, a dome) walks its caps without one.
+CLASSIFIER_PARTS = [
+    "ball_nose_blind_bore",
+    "ball_nose_blind_bore_d4_deep",
+    "ball_nose_blind_bore_d6",
+    "blind_bore_straddling_a_rounded_edge",
+    "bore_into_fillet",
+    "bore_straddling_a_rounded_edge",
+    "bore_through_a_domed_shoulder",
+    "bore_through_torus_wall",
+    "cross_drilled_shaft",
+    "domed_floor_pocket",
+    "domed_floor_pocket_proud",
+    "far_opening_through_bore",
+    "spherical_mouth_undercut_bore",
+    "undercut_ball_seat_at_the_confusion_edge",
+    "undercut_ball_seat_below_the_confusion",
+    "undercut_ball_seat_blind_bore",
+    "undercut_ball_seat_blind_bore_d8",
+]
 
-    Its CONSTRUCTION indexes the whole shell, and every one of its
-    queries was a walk. Round 1 already shared one instance across bores
-    to cut the cost; removing the last caller removes the class. Stated
-    as an import-level assertion because "we only call it twice now" is
-    the kind of claim that decays — a future edit that reaches for a
-    point classifier has to justify bringing the dependency back rather
-    than quietly extending an existing one.
+
+def test_n2_the_point_classifier_is_rationed_not_readmitted(fixtures_dir: Path):
+    """N2: the classifier is back for ONE question, and pays for itself.
+
+    Round 1 answered "is this end open?" with a ring of THIRTY-SIX
+    point-in-solid queries PER BORE. N2 removed them — the cap face's own
+    outward normal answers that for free — and pinned the removal as an
+    import-level ban, on the reasoning that "we only call it twice now"
+    decays and that anyone reaching for a point classifier again should
+    have to justify bringing the dependency back rather than quietly
+    extending an existing one.
+
+    D-19 round 2 is that justification, and the ban is replaced by the
+    contract it was standing in for rather than deleted. The question is
+    different — "is there metal beyond this crossing, along the axis?",
+    which no normal can answer, because a normal is local and this is
+    not — and so is the cost. What is pinned now:
+
+    - **openness is still not a classifier's business.** The ring probe
+      and its helper stay gone, so there is exactly one answer to "is
+      this end open?" and it is still the outward normal.
+    - **an ordinary part never builds one.** The Ø8 four-hole plate is
+      the part N2 was measured on; all four of its bores go through the
+      cap walk without a single classifier being constructed, because
+      the void bound never has to discard anything. So does every
+      committed part but the handful in :data:`CLASSIFIER_PARTS`.
+    - **at most one per bore, built lazily.** Not one per root, not one
+      per cap face, and none at all for a bore that never asks.
+    - **the queries are bounded by the crossings in doubt.** The
+      worst committed part spends 16, against round 1's 36 on EVERY
+      bore of every part; the ball nose and the undercut seats spend 4.
+
+    Measured, not asserted, so the numbers cannot rot into prose.
     """
-    imported = _imported_names(_miner_ast())
-    assert not [name for name in imported if "BRepClass3d" in name], (
-        "the miner must not reach for a solid classifier at all; "
-        f"openness comes from the cap face's outward normal (N2). Found: "
-        f"{[n for n in imported if 'BRepClass3d' in n]}"
+    import aberp_cad_extract.holes as holes_mod
+
+    assert not hasattr(holes_mod, "_end_is_open"), (
+        "the ring probe must stay gone; openness is the outward normal's"
+    )
+    assert not hasattr(holes_mod, "_axis_point_is_material"), (
+        "no second point-in-solid path may grow beside `_AxisMaterial`"
+    )
+
+    built = []
+    original = holes_mod._AxisMaterial._inside
+
+    def counting(self, t):
+        built.append(self)
+        return original(self, t)
+
+    def census(name):
+        built.clear()
+        holes = _mine(fixtures_dir / name)
+        return holes, len(built), len({id(o) for o in built})
+
+    holes_mod._AxisMaterial._inside = counting
+    try:
+        plate, plate_queries, plate_oracles = census("plate_4_through_holes.step")
+        _seat, seat_queries, seat_oracles = census("undercut_ball_seat_blind_bore.step")
+        corpus = {
+            path.stem: census(path.name)[1:]
+            for path in sorted(fixtures_dir.glob("*.step"))
+        }
+    finally:
+        holes_mod._AxisMaterial._inside = original
+
+    assert len(plate) == 4
+    assert plate_queries == 0 and plate_oracles == 0, (
+        "an ordinary plate must not touch a point classifier at all; it "
+        f"spent {plate_queries} queries across {plate_oracles} oracles"
+    )
+    assert seat_oracles == 1, (
+        f"one bore must build at most one oracle; the seat built {seat_oracles}"
+    )
+    assert seat_queries == 4, (
+        f"the seat's two crossings are two probes each; got {seat_queries}"
+    )
+    worst_part, (worst, _) = max(corpus.items(), key=lambda kv: kv[1][0])
+    assert worst < 36, (
+        f"the worst committed part ({worst_part}) spends {worst} queries — "
+        "round 1 spent 36 on EVERY bore, and that budget is the whole reason "
+        "N2 removed them"
+    )
+    loud = sorted(name for name, (_q, oracles) in corpus.items() if oracles)
+    assert loud == CLASSIFIER_PARTS, (
+        "the set of parts that build a classifier is a property of the "
+        "rule, not a budget — every one of them has a crossing the void "
+        f"bound discards. Expected {CLASSIFIER_PARTS}, got {loud}"
     )
 
 
@@ -2340,7 +2437,7 @@ def test_r6_nearest_root_alone_re_breaks_the_ball_nose(
     monkeypatch.setattr(
         holes_mod,
         "_root_for_end",
-        lambda roots, t_edge, at_low, radius, t_inner: min(
+        lambda roots, t_edge, at_low, radius, t_inner, material=None: min(
             roots, key=lambda root: abs(root[0] - t_edge)
         ),
     )
@@ -2703,7 +2800,7 @@ def test_r7_the_tangency_tie_holds_as_the_pocket_is_walked_down():
     assert not wrong, f"{len(wrong)}/{len(depths)} depths mis-mined: {wrong[:5]}"
 
 
-def _round7_root_for_end(roots, t_edge, at_low, radius, _t_inner=None):
+def _round7_root_for_end(roots, t_edge, at_low, radius, _t_inner=None, _material=None):
     """`_root_for_end` exactly as ADR-0112 round 7 shipped it.
 
     Nearest the mouth, with the two crossings of a TANGENT cap broken by
@@ -2750,7 +2847,7 @@ def test_r7_nearest_root_alone_re_breaks_the_whole_sweep(monkeypatch):
     monkeypatch.setattr(
         holes_mod,
         "_root_for_end",
-        lambda roots, t_edge, at_low, radius, t_inner: min(
+        lambda roots, t_edge, at_low, radius, t_inner, material=None: min(
             roots, key=lambda root: abs(root[0] - t_edge)
         ),
     )
@@ -2837,27 +2934,52 @@ def test_r7_the_tangency_band_is_not_a_tuned_epsilon():
 
 
 def test_d19_no_true_cap_comes_near_the_void_bound(fixtures_dir: Path):
-    """The bound separates two populations that are nowhere near each other.
+    """What the margin can decide, what it cannot, and that the answer is right.
 
-    Measured over every committed fixture rather than asserted, so the
-    claim cannot rot. For each crossing the cap walk offers, take how far
-    OUTWARD of its own mouth it sits:
+    THREE claims, and D-19 round 2 rewrote this test because the version
+    with two of them was measuring the wrong thing. All of it is measured
+    over every committed fixture rather than asserted, so none of it can
+    rot. For each crossing the cap walk offers, take how far OUTWARD of
+    its own mouth it sits.
 
-    - every crossing the bound KEEPS is at zero or positive — a true cap
-      lands on its mouth or outside it, and not one of them lands inward
-      even by a float's worth, so the slack is swallowing nothing at all;
-    - every crossing the bound DISCARDS is at least 0.6 mm inward, three
-      orders past the largest slack any fixture's radius produces.
+    **What the margin still decides.** Every crossing the bound KEEPS is
+    at zero or positive — a true cap lands on its mouth or outside it,
+    and not one of them lands inward even by a float's worth. So the
+    slack swallows nothing, and it is still not a tuned epsilon.
 
-    Between the two there is nothing. That is what makes the slack
-    untunable rather than merely untuned.
+    **What the margin turned out NOT to decide, which is the round-2
+    finding.** This test used to go on to say that every DISCARDED
+    crossing is at least 0.6 mm inward, and that between the two
+    populations there is nothing — so a discard was safe. That was true
+    of a corpus with no convex floor in it. ``domed_floor_pocket`` has
+    one, its floor is 1.2e-3 mm inward of the mouth, and the bound
+    discards it: a genuine floor, INSIDE the scale the slack itself works
+    at (1.1e-3 mm at r=6). The two populations are not separated and
+    cannot be — the crown is a free dimension of the part, so a real
+    floor can be put at ANY margin, and
+    ``test_d19r2_the_dome_floor_family_is_right_across_the_whole_crown_sweep``
+    walks it across the slack to show that. No threshold does this job,
+    which is the entire argument for asking the SOLID instead.
+
+    So the discarded population is split by the material question rather
+    than by the margin, and that is what is asserted: the discards that
+    bound metal reach to within a thousandth of a millimetre of their
+    mouth, and the discards that do not are the ones sitting 0.6 mm and
+    further inside the bore's own hollow.
+
+    **And the answer that comes out is the built one.** A margin with the
+    right sign is not an answer. The old version stopped at the
+    arithmetic, and the arithmetic looked just as healthy on the part the
+    miner reported 30 metres deep. So the depth and the end condition
+    every pinned fixture was built from are checked here too, in the same
+    walk that measures the margins.
     """
     import aberp_cad_extract.holes as holes_mod
 
-    kept, discarded = [], []
+    kept, floors, hollow = [], [], []
     original = holes_mod._root_for_end
 
-    def spy(roots, t_edge, at_low, radius, t_inner):
+    def spy(roots, t_edge, at_low, radius, t_inner, material=None):
         if t_inner is not None:
             sign = -1.0 if at_low else 1.0
             slack = 0.5 * holes_mod._tangency_band(radius)
@@ -2867,22 +2989,61 @@ def test_d19_no_true_cap_comes_near_the_void_bound(fixtures_dir: Path):
             # crossings are not ones it judged.
             if live:
                 kept.extend(live)
-                discarded.extend(m for m in margins if m < -slack)
-        return original(roots, t_edge, at_low, radius, t_inner)
+                step = holes_mod._tangency_band(radius)
+                for root, margin in zip(roots, margins):
+                    if margin >= -slack:
+                        continue
+                    # Split by what the SOLID says, not by how far in it
+                    # sits — which is the whole of the round-2 finding.
+                    bucket = (
+                        floors
+                        if material is not None
+                        and material.is_exit(root[0], sign, step)
+                        else hollow
+                    )
+                    bucket.append(margin)
+        return original(roots, t_edge, at_low, radius, t_inner, material)
 
     holes_mod._root_for_end = spy
+    checked = 0
     try:
         for path in sorted(fixtures_dir.glob("*.step")):
-            _mine(path)
+            holes = _mine(path)
+            want = COMMITTED_ONE_HOLE.get(path.stem)
+            if want is None:
+                continue
+            assert len(holes) == 1, f"{path.stem}: got {len(holes)} holes"
+            assert holes[0].depth_mm == pytest.approx(want[0], abs=TOL), path.stem
+            assert holes[0].end_condition is want[1], path.stem
+            checked += 1
     finally:
         holes_mod._root_for_end = original
 
-    assert kept and discarded, "the corpus exercised neither side of the bound"
+    assert checked == len(COMMITTED_ONE_HOLE), (
+        f"only {checked}/{len(COMMITTED_ONE_HOLE)} of the pinned parts were "
+        "walked; the correctness half of this test is not covering what it says"
+    )
+    assert kept and floors and hollow, (
+        "the corpus must exercise the kept side, a discarded crossing that "
+        f"bounds metal, and one that does not; got {len(kept)}/"
+        f"{len(floors)}/{len(hollow)}"
+    )
     assert min(kept) >= 0.0, (
         f"a crossing the bound kept sat INWARD of its own mouth: {min(kept)}"
     )
-    assert max(discarded) < -0.6, (
-        f"a discarded crossing came within 0.6 mm of its mouth: {max(discarded)}"
+    assert max(floors) > -1e-2, (
+        "the corpus no longer holds a real floor the bound discards by a "
+        f"hair, so it has stopped showing why the margin cannot decide "
+        f"this; the closest is {max(floors)}"
+    )
+    assert max(hollow) < -0.6, (
+        "a crossing in the bore's own hollow came within 0.6 mm of its "
+        f"mouth: {max(hollow)}"
+    )
+    assert max(floors) > max(hollow), (
+        "the two discarded populations must overlap or sit the wrong way "
+        "round for a threshold; if they ever separate cleanly, this test "
+        "is no longer showing what it claims"
     )
 
 
@@ -3403,8 +3564,10 @@ def test_d19_nearest_root_alone_re_breaks_the_undercut_family():
     import aberp_cad_extract.holes as holes_mod
 
     original = holes_mod._root_for_end
-    holes_mod._root_for_end = lambda roots, t_edge, at_low, radius, t_inner: min(
-        roots, key=lambda root: abs(root[0] - t_edge)
+    holes_mod._root_for_end = (
+        lambda roots, t_edge, at_low, radius, t_inner, material=None: min(
+            roots, key=lambda root: abs(root[0] - t_edge)
+        )
     )
     try:
         verdicts = _undercut_verdicts(radii=(2.0, 4.0, 6.0), undercuts=(1e-6, 0.1))
@@ -3520,13 +3683,13 @@ def test_d19_the_void_bound_narrows_and_never_empties(fixtures_dir: Path):
     emptied = []
     original = holes_mod._root_for_end
 
-    def spy(roots, t_edge, at_low, radius, t_inner):
+    def spy(roots, t_edge, at_low, radius, t_inner, material=None):
         if t_inner is not None:
             sign = -1.0 if at_low else 1.0
             slack = 0.5 * holes_mod._tangency_band(radius)
             if not [r for r in roots if sign * (r[0] - t_inner) >= -slack]:
                 emptied.append(len(roots))
-        return original(roots, t_edge, at_low, radius, t_inner)
+        return original(roots, t_edge, at_low, radius, t_inner, material)
 
     holes_mod._root_for_end = spy
     try:
@@ -3624,3 +3787,628 @@ def test_d19_the_void_bound_is_in_the_bores_own_frame(label):
     # the pre-D-19 answer, and the arithmetic that makes it a signature
     assert was == pytest.approx(depth - 2.0 * (radius + undercut), abs=TOL)
     assert was < depth - TOL
+
+
+# ══ D-19 round 2: the mirror — a convex floor, and caps off the part ═════
+#
+# Round 1 fixed a crossing in mid-void being taken as the floor. Round 2
+# is the same function failing in the opposite direction: the real floor
+# DISCARDED for standing where a mid-void crossing would stand, and then
+# the crossing that inherits the end never checked for being on the part
+# at all. It over-quotes where round 1 under-quoted, and on a dome-floored
+# pocket it did so by three orders of magnitude.
+
+
+def _crown_carrier(crown: float, radius: float = 6.0) -> float:
+    """The sphere radius that stands ``crown`` proud over ``radius``."""
+    return (radius * radius + crown * crown) / (2.0 * crown)
+
+
+#: The round-2 parts: name -> (diameter, depth, entry, axis, end, flat).
+#: Every number is arithmetic on the dimensions the fixture was BUILT
+#: from — the pocket's mouth is at z=8 and its dome crowns ``c`` above
+#: that, so a 20 mm plate leaves ``12 - c``.
+D19R2_FIXTURES = {
+    "domed_floor_pocket": (
+        12.0,
+        12.0 - 1.2e-3,
+        (30.0, 30.0, 20.0),
+        (0.0, 0.0, -1.0),
+        HoleEndCondition.BLIND,
+        False,
+    ),
+    "domed_floor_pocket_proud": (
+        12.0,
+        12.0 - 5.0,
+        (30.0, 30.0, 20.0),
+        (0.0, 0.0, -1.0),
+        HoleEndCondition.BLIND,
+        False,
+    ),
+    "far_opening_through_bore": (
+        8.0,
+        12.0,
+        (30.0, 30.0, 8.0),
+        (0.0, 0.0, 1.0),
+        HoleEndCondition.THROUGH,
+        False,
+    ),
+    "spherical_mouth_undercut_bore": (
+        4.0,
+        20.0 - math.sqrt(2.556**2 - 2.0**2) - 9.368,
+        (30.0, 30.0, 20.0 - math.sqrt(2.556**2 - 2.0**2)),
+        (0.0, 0.0, -1.0),
+        HoleEndCondition.BLIND,
+        True,
+    ),
+}
+
+#: What the miner said after D-19 round 1 and before round 2:
+#: name -> (depth, end condition). Measured against the real kernel on
+#: these exact committed files by
+#: ``test_d19r2_the_before_table_is_measured_and_not_remembered``.
+D19R2_BEFORE = {
+    "domed_floor_pocket": (30012.0, HoleEndCondition.THROUGH),
+    "domed_floor_pocket_proud": (19.2, HoleEndCondition.THROUGH),
+    "far_opening_through_bore": (24.0, HoleEndCondition.BLIND),
+    "spherical_mouth_undercut_bore": (13.188, HoleEndCondition.UNKNOWN),
+}
+
+
+@pytest.mark.parametrize("name", sorted(D19R2_FIXTURES))
+def test_d19r2_fixtures_are_exact(fixtures_dir: Path, name):
+    """The four round-2 parts, against the dimensions they were built from.
+
+    - the two DOMED FLOORS bottom on their crown, which is inward of the
+      mouth and is still the floor;
+    - the FAR-OPENING bore is through, and ends where its own wall ends
+      rather than four millimetres under the plate;
+    - the SPHERICAL MOUTH UNDERCUT is blind and flat-bottomed, and its
+      entry is the top of the BORE — the same convention
+      ``countersunk_blind_bore`` and ``chamfered_mouth_bore`` are pinned
+      on, that a relief cut at the mouth is not part of the hole.
+    """
+    diameter, depth, entry, axis, end, flat = D19R2_FIXTURES[name]
+    holes = _mine(fixtures_dir / f"{name}.step")
+    assert len(holes) == 1, f"{name}: got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, diameter)
+    _approx(hole.depth_mm, depth)
+    _approx_vec(hole.entry_point_mm, entry)
+    _approx_vec(hole.axis_unit, axis)
+    assert hole.end_condition is end, name
+    assert hole.flat_bottom is flat, name
+
+
+def _d19_round1_root_for_end(roots, t_edge, at_low, radius, t_inner, _material=None):
+    """`_root_for_end` exactly as D-19 round 1 shipped it.
+
+    The void bound and the nearest pick, with no material question and
+    no off-the-part refusal. Kept verbatim in the tests, not in the
+    miner, because round 2 replaced the rule and round 1's claims still
+    have to be checkable — both the one that was right (an undercut
+    seat's upper pole is not a floor) and the one that was not (nor is
+    a convex floor's crown).
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    if t_inner is None:
+        live = list(roots)
+    else:
+        sign = -1.0 if at_low else 1.0
+        slack = 0.5 * holes_mod._tangency_band(radius)
+        live = [root for root in roots if sign * (root[0] - t_inner) >= -slack]
+    return min(live or roots, key=lambda root: abs(root[0] - t_edge))
+
+
+def test_d19r2_the_before_table_is_measured_and_not_remembered(fixtures_dir: Path):
+    """`D19R2_BEFORE` is checkable, on the committed files, to the digit.
+
+    Put `_root_for_end` back to D-19 round 1 VERBATIM — void bound,
+    nearest pick, nothing else — and every entry has to come back out of
+    the real kernel: 30012 and THROUGH, 19.2 and THROUGH, 24.0 and BLIND
+    in a plate 20 mm thick, and 13.188 and UNKNOWN.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    original = holes_mod._root_for_end
+    holes_mod._root_for_end = _d19_round1_root_for_end
+    try:
+        for name, was in sorted(D19R2_BEFORE.items()):
+            holes = _mine(fixtures_dir / f"{name}.step")
+            assert len(holes) == 1, name
+            assert holes[0].depth_mm == pytest.approx(was[0], abs=TOL), name
+            assert holes[0].end_condition is was[1], name
+    finally:
+        holes_mod._root_for_end = original
+
+
+@pytest.mark.parametrize("name", sorted(D19R2_BEFORE))
+def test_d19r2_every_wrong_answer_was_an_over_quote(name):
+    """The mirror of D-19 round 1, and it costs money the other way.
+
+    Round 1's undercut seat came back SHORT — a pocket priced as a
+    fraction of itself. Round 2's parts come back LONG, every one of
+    them, and two of them longer than the plate is thick. An over-quote
+    loses the job rather than the margin, and a bore reported 30 metres
+    deep in a 20 mm plate is a number no downstream sanity check that
+    only looks at end conditions would catch: it came back THROUGH,
+    which is a perfectly ordinary thing for a hole to be.
+    """
+    was = D19R2_BEFORE[name][0]
+    truth = D19R2_FIXTURES[name][1]
+    assert was > truth + TOL, (name, was, truth)
+
+
+def test_d19r2_two_of_them_were_longer_than_the_part(fixtures_dir: Path):
+    """The claim that makes these impossible and not merely wrong.
+
+    A depth is a length and it can be argued about. A bore that ENTERS
+    outside the material cannot be argued about — there is nothing there
+    to start the drill in. Both of these did, and in opposite directions:
+    the domed pocket entered 29992 mm BELOW a plate that starts at z=0,
+    and the mouth-undercut bore put its far end 2.556 mm ABOVE a plate
+    that stops at z=20. Measured off the part's own bounding box, so the
+    claim is about the geometry rather than about two remembered numbers.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    original = holes_mod._root_for_end
+    holes_mod._root_for_end = _d19_round1_root_for_end
+    try:
+        outside = {}
+        for name in ("domed_floor_pocket", "spherical_mouth_undercut_bore"):
+            with _silence_stdout_fd():
+                shape = _load_step_shape(str(fixtures_dir / f"{name}.step"))
+            box = holes_mod.Bnd_Box()
+            holes_mod.BRepBndLib.Add_s(shape, box)
+            _x0, _y0, z_lo, _x1, _y1, z_hi = box.Get()
+            holes = holes_mod.mine_cylindrical_holes(shape)
+            assert len(holes) == 1, name
+            ends = (
+                holes[0].entry_point_mm[2],
+                holes[0].entry_point_mm[2] + holes[0].depth_mm * holes[0].axis_unit[2],
+            )
+            outside[name] = [z for z in ends if z < z_lo or z > z_hi]
+    finally:
+        holes_mod._root_for_end = original
+
+    assert outside["domed_floor_pocket"] == [-29992.0], outside
+    assert outside["spherical_mouth_undercut_bore"] == [
+        pytest.approx(22.556, abs=TOL)
+    ], outside
+
+
+def _domed_floor(crown, radius=6.0, wall_stop=8.0, plate=60.0, thickness=20.0):
+    """A convex-floored pocket built in memory from its dimensions.
+
+    Same construction as ``domed_floor_pocket`` with the crown free, so
+    the whole family can be swept without a STEP file per member. The
+    floor is the dome's crown at ``wall_stop + crown``.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCylinder,
+        BRepPrimAPI_MakeSphere,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    carrier = _crown_carrier(crown, radius)
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), plate, plate, thickness).Shape()
+    cutter = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(30.0, 30.0, wall_stop), gp_Dir(0, 0, 1)), radius, thickness + 10.0
+    ).Shape()
+    dome = BRepPrimAPI_MakeSphere(
+        gp_Pnt(30.0, 30.0, wall_stop + crown - carrier), carrier
+    ).Shape()
+    return BRepAlgoAPI_Cut(block, BRepAlgoAPI_Cut(cutter, dome).Shape()).Shape()
+
+
+#: The crown swept ACROSS the slack, which is 1.1e-3 mm at r=6. Below it
+#: the void bound never fired and round 1 was already right; above it the
+#: bound discarded the floor and the answer left the part. The boundary
+#: must not be visible in the answers.
+D19R2_CROWNS = (
+    1e-5,
+    1e-4,
+    5e-4,
+    1.0e-3,
+    1.1e-3,
+    1.2e-3,
+    2e-3,
+    1e-2,
+    0.1,
+    0.9,
+    2.0,
+    5.0,
+    9.0,
+)
+
+
+def _domed_verdicts(crowns=D19R2_CROWNS, radius=6.0, wall_stop=8.0, thickness=20.0):
+    """``{crown: (depth, end condition)}`` over the dome-floor family."""
+    out = {}
+    for crown in crowns:
+        holes = mine_cylindrical_holes(_domed_floor(crown, radius, wall_stop))
+        out[crown] = (
+            (holes[0].depth_mm, holes[0].end_condition) if len(holes) == 1 else None
+        )
+    return out
+
+
+def _domed_wrong(verdicts, wall_stop=8.0, thickness=20.0):
+    """The members of a sweep not at their built depth and BLIND."""
+    return {
+        crown: got
+        for crown, got in verdicts.items()
+        if got is None
+        or abs(got[0] - (thickness - wall_stop - crown)) > TOL
+        or got[1] is not HoleEndCondition.BLIND
+    }
+
+
+def test_d19r2_the_dome_floor_family_is_right_across_the_whole_crown_sweep():
+    """Thirteen crowns straddling the slack, one mechanism, no boundary.
+
+    The defect appeared and disappeared as the crown crossed the void
+    bound's slack — 1.1e-3 mm at r=6 — which is the signature of an
+    answer that is a property of a tolerance rather than of the part. A
+    pocket a micron flatter was perfect; a pocket a micron prouder came
+    back 30 metres deep. Sweeping the crown by six decades either side of
+    that figure is what says the boundary has stopped existing.
+    """
+    wrong = _domed_wrong(_domed_verdicts())
+    assert not wrong, f"{len(wrong)}/{len(D19R2_CROWNS)} domes mis-mined: {wrong}"
+
+
+def test_d19r2_the_dome_floor_family_is_right_across_the_cutter():
+    """The same family along the other axis: every cutter, one crown.
+
+    The wrong depth tracked the CARRIER, which is ``(r^2 + c^2) / 2c`` —
+    so it scaled with the square of the cutter and the reciprocal of the
+    crown, and no single part's arithmetic could show that. Six radii at
+    a fixed 1.2e-3 mm crown, which is the far pole ranging from z=-2075
+    to z=-53325.
+    """
+    wrong = {}
+    for radius in (0.5, 1.0, 2.0, 3.0, 4.0, 6.0):
+        verdicts = _domed_verdicts(crowns=(1.2e-3,), radius=radius)
+        bad = _domed_wrong(verdicts)
+        if bad:
+            wrong[radius] = bad
+    assert not wrong, f"{len(wrong)}/6 cutters mis-mined: {wrong}"
+
+
+def test_d19r2_round1s_own_rule_answers_the_seat_and_not_the_dome():
+    """Round 1 was right about the void and wrong about what proves it.
+
+    Put `_root_for_end` back to D-19 round 1 VERBATIM and the two halves
+    of round 2's finding come apart cleanly:
+
+    - the undercut-seat sweep is still perfect, so nothing round 1
+      claimed about a crossing in mid-void is being contradicted here;
+    - every dome whose crown clears the slack is wrong, and every dome
+      below it is right — the whole shape of the defect, an answer that
+      depended on whether a tolerance happened to swallow the floor.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    original = holes_mod._root_for_end
+    holes_mod._root_for_end = _d19_round1_root_for_end
+    try:
+        seats = _undercut_verdicts(radii=(2.0, 4.0, 6.0), undercuts=(1e-6, 0.1))
+        domes = _domed_verdicts()
+    finally:
+        holes_mod._root_for_end = original
+
+    assert not _undercut_wrong(seats), (
+        "round 1's rule must still answer the seat it was written for; "
+        f"it missed {sorted(_undercut_wrong(seats))}"
+    )
+
+    slack = 0.5 * holes_mod._tangency_band(6.0)
+    survived = sorted(crown for crown in domes if crown not in _domed_wrong(domes))
+    assert survived == sorted(crown for crown in D19R2_CROWNS if crown <= slack), (
+        "round 1's rule must answer exactly the domes whose crown the "
+        f"slack swallows and no others; it answered {survived} against a "
+        f"slack of {slack}"
+    )
+
+
+# ── the three knobs, pinned directly ─────────────────────────────────────
+#
+# All three of these live inside `_root_for_end`, and `_walk_caps` wraps
+# every call to it in `except Exception: continue`. So a knob removed by
+# hand does not necessarily RED anything — it can raise, get swallowed,
+# drop the cap silently, and leave an answer that happens not to move.
+# These three call `_root_for_end` DIRECTLY, with hand-built crossings
+# and no miner around them, so what they assert is the function's own
+# return value and nothing can eat it.
+
+
+def _root(t):
+    """A crossing at axial parameter ``t``, with a normal nothing reads."""
+    return (t, (0.0, 0.0, 1.0))
+
+
+def test_d19_the_empty_fallback_is_pinned_directly_not_through_the_miner():
+    """`min(live or roots, ...)`: the `or roots` half, asserted as a value.
+
+    Where the void bound would leave NO candidate it is not applied — a
+    bore straddling a convex rounded edge reaches a fillet whose carrier
+    crosses the axis entirely inward of the mouth, so both crossings read
+    as hollow and the bound has nothing to offer.
+    ``test_d19_the_void_bound_narrows_and_never_empties`` shows that the
+    straddle really reaches this case, but it shows it with a SPY, and a
+    spy that goes wrong is swallowed by `_walk_caps` and reports an empty
+    list rather than a failure — which is exactly what happened when
+    round 2 changed the signature underneath it.
+
+    So the fall-back is pinned here as arithmetic instead: two crossings,
+    both inward of the mouth, both discarded, and the function must still
+    return the nearer of them rather than raising or returning None.
+    Delete the `or roots` and this line reds on a ValueError from
+    `min(())` with nothing in the way to catch it.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    # Low end, mouth at t=0, both crossings well INWARD of it (t > 0).
+    roots = [_root(3.0), _root(7.0)]
+    got = holes_mod._root_for_end(roots, 0.0, True, 4.0, 0.0)
+    assert got is not None, "the bound emptied the contest and gave nothing back"
+    assert got[0] == 3.0, f"the fall-back must keep the NEAREST crossing; got {got[0]}"
+
+    # ... and the same at the high end, where inward is the other way.
+    roots = [_root(-3.0), _root(-7.0)]
+    got = holes_mod._root_for_end(roots, 0.0, False, 4.0, 0.0)
+    assert got is not None and got[0] == -3.0, got
+
+
+class _StubMaterial:
+    """An `_AxisMaterial` that answers from two sets instead of a solid.
+
+    `_root_for_end` asks the oracle exactly two questions, so a stub that
+    answers them is enough to pin the SELECTION rule on its own — without
+    a part, without a kernel, and without `_walk_caps`'s
+    `except Exception: continue` in the way.
+    """
+
+    def __init__(self, exits=(), off=()):
+        self._exits = set(exits)
+        self._off = set(off)
+
+    def off_the_part(self, t):
+        return t in self._off
+
+    def is_exit(self, t, sign, step):
+        return t in self._exits
+
+
+def test_d19r2_the_selection_rules_are_pinned_directly_as_arithmetic():
+    """The three round-2 outcomes, as return values, with a stub oracle.
+
+    The end-to-end fixtures say these rules produce the right PARTS. This
+    says what the rules ARE, on hand-built crossings, and it reaches one
+    thing the corpus does not: which of SEVERAL material exits wins.
+
+    No committed part has two exits on one cap face — a cap face is one
+    surface and the axis leaves the metal through it once — so the
+    "innermost wins" rule is reasoned rather than measured out there, and
+    swapping it for a nearest-the-mouth pick reds nothing in the corpus.
+    It is pinned here instead, because the reasoning is load bearing even
+    where the corpus is silent: walking out of the bore, the FIRST metal
+    is the floor, and a second exit further out is behind it, in a place
+    the drill never reached.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    # Low end, mouth at t=0, so inward is t > 0 and outward is t < 0.
+    crown, far = _root(0.5), _root(-900.0)
+
+    # 1. Without an oracle, the bound discards the crown for being inward
+    #    and the far crossing inherits the end. That is round 1, and it
+    #    is the defect.
+    assert holes_mod._root_for_end([crown, far], 0.0, True, 6.0, 0.0)[0] == -900.0
+
+    # 2. With one, a crossing that bounds metal takes the end outright,
+    #    inward of the mouth or not.
+    oracle = _StubMaterial(exits=(0.5,))
+    assert holes_mod._root_for_end([crown, far], 0.0, True, 6.0, 0.0, oracle)[0] == 0.5
+
+    # 3. Among several, the INNERMOST — the first metal on the way out —
+    #    and NOT the one nearest the mouth, which is the rule this would
+    #    otherwise be indistinguishable from. Two exits at t=1 and t=5
+    #    with the mouth at t=0: metal fills [1, 5], the bore's floor is
+    #    its near face at t=5, and t=1 is the far side of the same slab
+    #    with the drill never having reached it. Nearest-the-mouth would
+    #    answer 1.0 and quote four millimetres of metal as hole.
+    oracle = _StubMaterial(exits=(1.0, 5.0))
+    got = holes_mod._root_for_end(
+        [_root(1.0), _root(5.0)], 0.0, True, 6.0, 0.0, oracle
+    )
+    assert got[0] == 5.0, f"innermost, not nearest-the-mouth; got {got[0]}"
+    # ... and the same at the high end, where "innermost" is the other way.
+    oracle = _StubMaterial(exits=(-1.0, -5.0))
+    got = holes_mod._root_for_end(
+        [_root(-1.0), _root(-5.0)], 0.0, False, 6.0, 0.0, oracle
+    )
+    assert got[0] == -5.0, got
+
+    # 4. No exit anywhere, and the only survivor is off the part: the
+    #    face contributes NO cap rather than one in mid-air.
+    oracle = _StubMaterial(off=(-900.0,))
+    assert holes_mod._root_for_end([crown, far], 0.0, True, 6.0, 0.0, oracle) is None
+
+    # 5. ... but a survivor that is merely unvalidated still stands, so
+    #    the refusal is about being off the part and nothing else.
+    oracle = _StubMaterial()
+    assert holes_mod._root_for_end([crown, far], 0.0, True, 6.0, 0.0, oracle)[0] == -900.0
+
+
+def test_d19r2_the_void_slack_is_inert_and_is_pinned_as_inert():
+    """Nothing depends on the slack, and that is the assertion.
+
+    Round 6 broke a tangency tie with this figure, round 7 widened the
+    tie into a band, D-19 round 1 left it as the slack on the void bound,
+    and round 2 handed its last arguable job — a floor landing a hair
+    inward of its mouth — to the material question, which DECIDES it
+    instead of tolerating it. So there is nothing left for the slack to
+    do, and the honest thing is to say so in a form that would notice if
+    it stopped being true.
+
+    Zeroed here on its own rather than through `_tangency_band`, which is
+    now also the material probe's step: zeroing the band would remove two
+    things at once and the result would not say which.
+
+    Directly first — a crossing one part in ten thousand inward of the
+    mouth is discarded either way, since with the slack it is inside it
+    and without it there is nothing to be inside — then over the whole
+    committed corpus, where not one answer may move.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    assert holes_mod._void_slack(6.0) == pytest.approx(
+        0.5 * holes_mod._tangency_band(6.0)
+    )
+    assert holes_mod._void_slack(6.0) > 0.0, "the slack must exist to be inert"
+
+    original = holes_mod._void_slack
+    holes_mod._void_slack = lambda radius: 0.0
+    try:
+        zeroed = _corpus_verdicts()
+    finally:
+        holes_mod._void_slack = original
+
+    assert zeroed == _corpus_verdicts(), (
+        "an answer moved when the void slack was zeroed. That is not a "
+        "failure — it means the slack has become load bearing again and "
+        "this test's claim, and `_void_slack`'s docstring, are now wrong"
+    )
+
+
+def test_d19r2_the_material_probe_is_not_a_tuned_epsilon():
+    """The probe's step may be moved by decades without moving an answer.
+
+    `_AxisMaterial.is_exit` steps off the crossing by a `_tangency_band`
+    before asking the solid, and an epsilon tuned to make a fixture pass
+    has an answer that changes just outside it. This one does not: the
+    thing it must clear is the surface's own positional uncertainty
+    (~4e-15 mm of float noise, and OCCT's 1e-7 confusion figure), and the
+    thing it must not step over is the thinnest floor in the corpus. Four
+    decades of the confusion figure the band is derived from — 1e-11 to
+    1e-5 mm, which is a step from 1.5e-5 to 0.49 mm at r=6 — give the
+    same numbers on every committed part.
+
+    The upper end is where it stops, and that is a fact about the probe
+    rather than a weakness: a step of half a millimetre reaches through
+    the 1.2e-3 mm crown of ``domed_floor_pocket`` and out the other side.
+    A probe must be shorter than the metal it is probing for.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    baseline = _corpus_verdicts()
+    original = holes_mod._tangency_band
+    for confusion in (1e-11, 1e-10, 1e-8, 1e-7, 1e-6, 1e-5):
+        try:
+            holes_mod._tangency_band = lambda radius, _c=confusion: 2.0 * math.sqrt(
+                2.0 * max(radius, 0.0) * _c
+            )
+            got = _corpus_verdicts()
+        finally:
+            holes_mod._tangency_band = original
+        assert got == baseline, (
+            f"an answer moved when the surface-confusion figure was "
+            f"{confusion}; that would make the probe step a tuned epsilon. "
+            f"Moved: {sorted(k for k in baseline if baseline[k] != got[k])}"
+        )
+
+
+#: Every committed fixture that mines exactly one hole, and the depth +
+#: end condition it was BUILT from. Used where a test has to say that the
+#: answer which survived some rule is the RIGHT answer and not merely a
+#: surviving one. Assembled from the round-specific tables rather than
+#: re-typed, so it cannot disagree with them.
+COMMITTED_ONE_HOLE = dict(
+    {name: (spec[1], spec[4]) for name, spec in R7_FIXTURES.items()},
+    **{name: (spec[1], spec[4]) for name, spec in D19_FIXTURES.items()},
+    **{name: (spec[1], spec[4]) for name, spec in D19R2_FIXTURES.items()},
+)
+
+
+def _corpus_verdicts():
+    """``{fixture stem: [(depth, end condition, entry z)]}`` for every
+    committed part, as exact reprs — the shape a test compares when its
+    claim is "nothing moved"."""
+    import aberp_cad_extract.holes as holes_mod
+
+    here = Path(__file__).parent / "fixtures"
+    out = {}
+    for path in sorted(here.glob("*.step")):
+        with _silence_stdout_fd():
+            shape = _load_step_shape(str(path))
+        out[path.stem] = [
+            (repr(h.depth_mm), h.end_condition.name, repr(h.entry_point_mm[2]))
+            for h in holes_mod.mine_cylindrical_holes(shape)
+        ]
+    return out
+
+
+def test_d19r2_the_dome_floor_family_does_not_depend_on_the_root_order():
+    """S3 over the convex floor: OCCT's list order may not reach the answer.
+
+    `GeomAPI_IntCS` hands back a sphere's two poles in whatever order it
+    likes, and the round-2 defect was decided by which of them the
+    nearest pick was left with. Now the crown wins on being the material
+    boundary and the far pole loses on being off the part — neither of
+    them on being listed first — so reversing the list, and reversing the
+    face walk that reads the mouth bound, both have to leave the family
+    bit-identical.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    crowns = (1e-4, 1.2e-3, 0.1, 5.0)
+    forward = _domed_verdicts(crowns=crowns)
+
+    original = holes_mod._cap_axis_intersections
+    holes_mod._cap_axis_intersections = lambda face, origin, direction: list(
+        reversed(original(face, origin, direction))
+    )
+    try:
+        backward = _domed_verdicts(crowns=crowns)
+    finally:
+        holes_mod._cap_axis_intersections = original
+    assert repr(sorted(forward.items())) == repr(sorted(backward.items()))
+
+    collect = holes_mod._collect_faces
+    holes_mod._collect_faces = lambda shape: list(reversed(collect(shape)))
+    try:
+        reversed_walk = _domed_verdicts(crowns=crowns)
+    finally:
+        holes_mod._collect_faces = collect
+    assert repr(sorted(forward.items())) == repr(sorted(reversed_walk.items()))
+
+
+def test_d19r2_the_round_2_parts_are_stable_under_a_reversed_walk(fixtures_dir: Path):
+    """S3 on the committed four, through the STEP files themselves."""
+    import aberp_cad_extract.holes as holes_mod
+
+    forward = {
+        name: _mine(fixtures_dir / f"{name}.step") for name in sorted(D19R2_FIXTURES)
+    }
+    collect = holes_mod._collect_faces
+    holes_mod._collect_faces = lambda shape: list(reversed(collect(shape)))
+    try:
+        backward = {
+            name: _mine(fixtures_dir / f"{name}.step")
+            for name in sorted(D19R2_FIXTURES)
+        }
+    finally:
+        holes_mod._collect_faces = collect
+
+    show = lambda holes: [
+        (repr(h.depth_mm), h.end_condition.name, [repr(v) for v in h.entry_point_mm])
+        for h in holes
+    ]
+    for name in sorted(D19R2_FIXTURES):
+        assert show(forward[name]) == show(backward[name]), name

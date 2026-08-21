@@ -1357,6 +1357,128 @@ def undercut_ball_seat_below_the_confusion():
     return _undercut_ball_seat(8.0, 5e-8)
 
 
+# ── D-19 round 2: the MIRROR of the undercut ─────────────────────────────
+#
+# The undercut seat put a crossing in mid-void INWARD of the mouth and the
+# miner took it. These three put the real floor inward of the mouth, or no
+# floor at all, and the miner took a crossing OFF THE PART instead. Same
+# function, opposite direction, and it over-quotes where the undercut
+# under-quoted.
+
+
+def domed_floor_pocket():
+    """A Ø12 pocket whose floor is a CONVEX dome, crowning 1.2e-3 proud.
+
+    60 x 60 x 20 plate. The bore's wall stops at z=8 and the floor is a
+    sphere bulging UP into it, its crown 1.2e-3 mm above the mouth. That
+    is a form tool's crown, a domed seat, a ball-end plunge left proud —
+    and the crown IS the floor, because the metal starts there.
+
+    The carrier that makes it is enormous: to stand 1.2e-3 mm proud over
+    a 6 mm radius the sphere needs R = (6^2 + c^2) / 2c = 15000 mm, which
+    puts its FAR pole at z = -29992. The void bound discarded the crown
+    for being 1.2e-3 mm inward of the mouth — just past the 1.1e-3 mm
+    slack — and the nearest pick then had nothing left but that far pole.
+
+    Expected: 1 hole, O12.0, depth 11.9988, entry (30, 30, 20), axis
+    (0, 0, -1), BLIND, not flat. Before D-19 round 2: 30012.0 and
+    THROUGH, entering 29992 mm below a plate 20 mm thick.
+    """
+    return _domed_floor_pocket(1.2e-3)
+
+
+def domed_floor_pocket_proud():
+    """The same dome, 5 mm proud, so the defect is not about a hair.
+
+    The crown at z=13 is 5 mm inward of the mouth and unmistakably the
+    floor; the carrier is R=6.1 and its far pole sits at z=0.8, INSIDE
+    the plate. So the wrong answer here is not off the part at all — it
+    is an ordinary-looking 19.2 that happens to enter 0.8 mm above the
+    plate's bottom face, which is why the crown has to be RESCUED and not
+    merely the far pole refused. Only the material test does that.
+
+    Expected: 1 hole, O12.0, depth 7.0, entry (30, 30, 20), axis
+    (0, 0, -1), BLIND, not flat. Before D-19 round 2: 19.2 and THROUGH.
+    """
+    return _domed_floor_pocket(5.0)
+
+
+def _domed_floor_pocket(crown: float):
+    """A Ø12 pocket, wall stopping at z=8, floored by a dome ``crown``
+    mm proud of that.
+
+    The dome's carrier has R = (r^2 + c^2) / 2c centred at 8 + c - R,
+    which puts its upper pole at 8 + c and makes it meet radius 6 at
+    exactly z=8 — so the wall really does stop at the mouth and the
+    crown really does stand proud of it, both by construction.
+    """
+    radius = 6.0
+    carrier = (radius * radius + crown * crown) / (2.0 * crown)
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 60.0, 20.0).Shape()
+    cutter = _cyl(30.0, 30.0, 8.0, 0, 0, 1, radius, 30.0)
+    dome = BRepPrimAPI_MakeSphere(
+        gp_Pnt(30.0, 30.0, 8.0 + crown - carrier), carrier
+    ).Shape()
+    return BRepAlgoAPI_Cut(block, BRepAlgoAPI_Cut(cutter, dome).Shape()).Shape()
+
+
+def far_opening_through_bore():
+    """A Ø8 bore that breaks out through a sphere, and reads 24 in a 20.
+
+    60 x 60 x 20 plate. The cutter is a full-height Ø8 cylinder FUSED
+    with a sphere of R = 20/3 centred at z = 8/3, which breaks out
+    through the plate's bottom face and widens the bore below z=8. So the
+    bore's own cylindrical wall runs z=8..20 and the hole goes right
+    through the part.
+
+    The sphere's near crossing is at z=8, inward of the mouth and inside
+    the bore's own hollow, so the void bound discards it — correctly. Its
+    FAR crossing is at z=-4, four millimetres below a plate that starts
+    at zero, and the nearest pick took it because it was the only thing
+    left. Nothing checked that a cap 4 mm off the part is not a cap.
+
+    Expected: 1 hole, O8.0, depth 12.0, entry (30, 30, 8), axis
+    (0, 0, 1), THROUGH, not flat. Before D-19 round 2: 24.0 and BLIND,
+    entering at z=20 — 24 mm of hole in 20 mm of plate.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 60.0, 20.0).Shape()
+    shaft = _cyl(30.0, 30.0, -5.0, 0, 0, 1, 4.0, 35.0)
+    ball = BRepPrimAPI_MakeSphere(gp_Pnt(30.0, 30.0, 8.0 / 3.0), 20.0 / 3.0).Shape()
+    return BRepAlgoAPI_Cut(block, BRepAlgoAPI_Fuse(shaft, ball).Shape()).Shape()
+
+
+def spherical_mouth_undercut_bore():
+    """A flat-bottomed Ø4 bore with a SPHERICAL undercut at its mouth.
+
+    60 x 60 x 20 plate, flat floor at z=9.368, and a sphere of R=2.556
+    centred exactly on the plate's top face at z=20 fused into the
+    cutter — a spherical dish relieving the mouth, wider than the bore,
+    the way a countersink or a chamfer relieves one. The bore's own wall
+    therefore runs z=9.368..18.408417.
+
+    Both of the dish's axis crossings are worthless and the miner took
+    one anyway: the near one at z=17.444 is inside the bore's own hollow
+    and the void bound discards it, and the FAR one at z=22.556 is 2.556
+    mm above the plate's own top face. With the near one gone the nearest
+    pick took the far one, put the bore's end in mid-air above the part,
+    and — because the dish's normal there points the wrong way — called
+    the part UNKNOWN as well.
+
+    Depth is measured to the top of the BORE, not to the plate's face,
+    which is the same convention ``countersunk_blind_bore`` (11.0, not
+    14.0) and ``chamfered_mouth_bore`` (18.5, not 20.0) are pinned on: a
+    relief cut at the mouth is not part of the hole.
+
+    Expected: 1 hole, O4.0, depth 9.040417140077212, entry
+    (30, 30, 18.408417140077212), axis (0, 0, -1), BLIND, flat bottom.
+    Before D-19 round 2: 13.188 and UNKNOWN.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 60.0, 20.0).Shape()
+    shaft = _cyl(30.0, 30.0, 9.368, 0, 0, 1, 2.0, 20.0 - 9.368)
+    dish = BRepPrimAPI_MakeSphere(gp_Pnt(30.0, 30.0, 20.0), 2.556).Shape()
+    return BRepAlgoAPI_Cut(block, BRepAlgoAPI_Fuse(shaft, dish).Shape()).Shape()
+
+
 FIXTURES = {
     "plate_4_through_holes.step": plate_4_through_holes,
     "blind_hole_flat_bottom.step": blind_hole_flat_bottom,
@@ -1418,6 +1540,11 @@ FIXTURES = {
     "undercut_ball_seat_below_the_confusion.step": (
         undercut_ball_seat_below_the_confusion
     ),
+    # D-19 round 2: the mirror — a convex floor, and caps off the part.
+    "domed_floor_pocket.step": domed_floor_pocket,
+    "domed_floor_pocket_proud.step": domed_floor_pocket_proud,
+    "far_opening_through_bore.step": far_opening_through_bore,
+    "spherical_mouth_undercut_bore.step": spherical_mouth_undercut_bore,
 }
 
 

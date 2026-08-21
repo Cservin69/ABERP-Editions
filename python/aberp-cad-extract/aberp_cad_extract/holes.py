@@ -430,6 +430,7 @@ try:
     from OCP.BRep import BRep_Tool
     from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
     from OCP.BRepBndLib import BRepBndLib
+    from OCP.BRepClass3d import BRepClass3d_SolidClassifier
     from OCP.BRepTools import BRepTools
     from OCP.Geom import Geom_Line
     from OCP.GeomAbs import GeomAbs_SurfaceType
@@ -439,6 +440,7 @@ try:
     from OCP.TopAbs import (
         TopAbs_EDGE,
         TopAbs_FACE,
+        TopAbs_IN,
         TopAbs_REVERSED,
         TopAbs_VERTEX,
     )
@@ -622,6 +624,17 @@ DEGENERATE_PROBE_DIRECTIONS: int = 4
 #:
 #: Used only to size :func:`_tangency_band`, never to compare positions.
 SURFACE_CONFUSION_MM: float = 1e-7
+
+#: Tolerance handed to `BRepClass3d_SolidClassifier.Perform` when
+#: `_AxisMaterial` asks whether a point on the bore's axis is metal.
+#: OCCT treats a point within this of the boundary as ON it, and ON is
+#: neither of the two answers the probe wants — so it is kept far BELOW
+#: the distance the probe steps off the surface (a `_tangency_band`,
+#: 1.8e-3 mm on a O8 bore) and far ABOVE float noise. Nothing selects it
+#: within that range: `test_d19_the_material_probe_is_not_a_tuned_epsilon`
+#: moves the step, which is the quantity that could matter, over four
+#: decades and no answer follows.
+MATERIAL_PROBE_TOL_MM: float = 1e-9
 
 
 #: How far past the bore's MOUTH a part edge the bore CUT THROUGH is
@@ -2555,16 +2568,173 @@ def _tangency_band(radius: float) -> float:
     return 2.0 * math.sqrt(2.0 * max(radius, 0.0) * SURFACE_CONFUSION_MM)
 
 
+class _AxisMaterial:
+    """Where the METAL is along one bore's axis, asked of the solid.
+
+    :func:`_root_for_end` has to choose, among the crossings of one cap
+    face, the one that is the real END of the bore. Round 6 chose by
+    tangency, round 7 by a band, D-19 round 1 by POSITION — inward of the
+    mouth is the bore's own hollow, so no crossing there can bound the
+    solid. Position is the one that reaches furthest and it is still not
+    far enough, because it is a PRESUMPTION about geometry and there is a
+    common part on which the presumption is false.
+
+    A pocket with a DOUBLY-CURVED CONVEX floor — a domed seat, a form
+    tool's crown, a ball-end plunge left proud — bulges its floor UP into
+    the bore. The crown is inward of the mouth by however proud it
+    stands, and the crown IS the floor: the metal starts there. Position
+    says void; the part says metal. And the two cases cannot be told
+    apart by looking at the crossing, which is the point — the crown of a
+    convex floor and the upper pole of an UNDERCUT spherical seat sit in
+    the same place relative to the mouth and carry the same surface
+    normal, ``(0, 0, +1)`` on a Z-up bore, and one of them is the floor
+    and the other is a point in mid-air.
+
+    So the presumption is checked against the solid rather than trusted:
+    a crossing is the bore's end when the axis is AIR just inward of it
+    and METAL just outward of it. That is the definition of the material
+    boundary the drill would stop at, and it separates the two cases
+    exactly — the crown has metal under it, the undercut pole has the
+    seat's own void under it.
+
+    TWO QUESTIONS, TWO COSTS. :meth:`off_the_part` is free: it needs only
+    the part's own extent along the axis, and it can only ever REJECT — a
+    cap outside the extent of the metal is not a cap, whatever else it
+    is. :meth:`is_exit` costs a point-in-solid query and can only ever
+    ACCEPT. Neither is asked unless the cheap rules are in doubt; see
+    :func:`_root_for_end`, which owns when.
+
+    WHY A POINT CLASSIFIER IS BACK, having been removed in N2. It is not
+    the same use and it is not the same cost. N2 removed a ring of
+    THIRTY-SIX classifier queries PER BORE that answered "is this end
+    open?" — a question the cap face's own outward normal answers for
+    free, so the queries bought nothing and cost most of the subprocess
+    budget. This asks a different question, one no normal can answer
+    (a normal is local; "is there metal beyond this along the axis" is
+    not), and it asks it only of a crossing the position rule and the
+    part's extent have left genuinely undecided. An ordinary plate, a
+    through hole, a flat-bottomed pocket, a countersink — none of them
+    reach it and none of them construct a classifier at all. The instance
+    is built lazily and at most once per bore, and
+    ``test_n2_the_point_classifier_is_rationed_not_readmitted`` pins both
+    halves of that.
+
+    The extent comes from the caller's ``Bnd_Box`` — one box per part,
+    built once — projected onto the bore's axis. A box is a SUPERSET of
+    the metal, which is exactly the posture this wants: it rejects only
+    what is certainly off the part and never argues about anything near
+    the surface. A dome's crown sits 0.4 mm outside its own trim curve
+    and ON the box, and stays (ADR-0112 round 3, blocker 2); a spherical
+    breakout's far pole sits 4 mm past the plate's face and goes.
+    """
+
+    __slots__ = ("_shape", "_origin", "_direction", "_span", "_classifier", "_queries")
+
+    def __init__(self, shape, box, origin, direction) -> None:
+        self._shape = shape
+        self._origin = origin
+        self._direction = direction
+        self._span = _box_axial_span(box, origin, direction)
+        self._classifier = None
+        self._queries = 0
+
+    def off_the_part(self, t: float) -> bool:
+        """Is this axial parameter beyond the part's own extent?
+
+        Free, and one-sided: True means the crossing is certainly not a
+        cap, False means nothing at all.
+        """
+        if self._span is None:  # pragma: no cover — an empty box
+            return False
+        return t < self._span[0] or t > self._span[1]
+
+    def _inside(self, t: float) -> bool:
+        point = _point_on_axis(self._origin, self._direction, t)
+        if self._classifier is None:
+            self._classifier = BRepClass3d_SolidClassifier(self._shape)
+        self._queries += 1
+        self._classifier.Perform(
+            gp_Pnt(point[0], point[1], point[2]), MATERIAL_PROBE_TOL_MM
+        )
+        return self._classifier.State() == TopAbs_IN
+
+    def is_exit(self, t: float, sign: float, step: float) -> bool:
+        """Does the metal at this end of the bore begin at ``t``?
+
+        Air one ``step`` INWARD (back up the bore, ``-sign``), metal one
+        ``step`` OUTWARD (``+sign``). The step is a
+        :func:`_tangency_band`, the module's own figure for how far a
+        computed crossing may sit from where the surface really is: any
+        shorter and the probes are inside the surface's own uncertainty
+        and answer noise; any longer and a thin floor could be stepped
+        clean over. Nothing is tuned here —
+        ``test_d19_the_material_probe_is_not_a_tuned_epsilon`` walks the
+        step over four decades without moving an answer.
+        """
+        return not self._inside(t - sign * step) and self._inside(t + sign * step)
+
+
+def _box_axial_span(box, origin, direction) -> Optional[Tuple[float, float]]:
+    """A bounding box's extent along one axis, as axial parameters.
+
+    The box is world-axis-aligned, so for a bore that is not it this is a
+    superset of a superset. That is fine and it is deliberate: the only
+    claim made of it is that a crossing OUTSIDE it is off the part, and
+    a looser box makes that claim less often, never wrongly.
+    """
+    if box is None or box.IsVoid():  # pragma: no cover — a part with no faces
+        return None
+    x_lo, y_lo, z_lo, x_hi, y_hi, z_hi = box.Get()
+    ts = [
+        _dot((x - origin[0], y - origin[1], z - origin[2]), direction)
+        for x in (x_lo, x_hi)
+        for y in (y_lo, y_hi)
+        for z in (z_lo, z_hi)
+    ]
+    return min(ts), max(ts)
+
+
+def _void_slack(radius: float) -> float:
+    """How far the wrong side of its own mouth a cap may land and still count.
+
+    Half a :func:`_tangency_band`, and INERT — nothing in the corpus, in
+    the ball-nose sweep, in the undercut-seat family or in the dome-floor
+    family moves when it is set to zero, and
+    ``test_d19r2_the_void_slack_is_inert_and_is_pinned_as_inert`` is what
+    says so rather than this sentence.
+
+    Kept and pinned rather than deleted, because "this knob does nothing"
+    is a claim about the fix and not a tidy-up — the same posture round 7
+    took with the tangency band it had just stopped depending on. The
+    history is worth the four lines: round 6 broke a tangency tie with
+    it, round 7 widened the tie into a band because the tie was not
+    bit-stable, D-19 round 1 promoted the reason to a rule and left the
+    band as this slack, and round 2 gave the one case the slack was still
+    arguably for — a floor landing a hair inward of its mouth — to the
+    material question instead, where it is decided rather than tolerated.
+
+    Split out of :func:`_root_for_end` so that it can be zeroed on its
+    own. It used to be spelled inline as ``0.5 * _tangency_band(radius)``,
+    and the band is now ALSO the material probe's step: zeroing the band
+    would break the probe and a revert-proof could not tell which of the
+    two roles it had removed.
+    """
+    return 0.5 * _tangency_band(radius)
+
+
 def _root_for_end(
     roots: Sequence[Tuple[float, Tuple[float, float, float]]],
     t_edge: float,
     at_low: bool,
     radius: float,
     t_inner: Optional[float],
-) -> Tuple[float, Tuple[float, float, float]]:
+    material: Optional["_AxisMaterial"] = None,
+) -> Optional[Tuple[float, Tuple[float, float, float]]]:
     """Which crossing of ONE cap face belongs to THIS end of the bore.
 
-    Two rules, in order.
+    Three rules, in order — and the third one is checked against the
+    SOLID rather than reasoned from position, which is what D-19 round 2
+    had to add and why :class:`_AxisMaterial` exists.
 
     **A crossing inside the bore's own hollow is not a candidate.** The
     mouth is where the bore's wall stops; inward of the whole of it the
@@ -2646,7 +2816,61 @@ def _root_for_end(
     :meth:`_EndEvidence._skin_over_axis` goes on being what rejects it —
     a second, independent mechanism reaching the same verdict, which is
     where it belongs.
+
+    ── D-19 ROUND 2: THE MIRROR ────────────────────────────────────────
+
+    Everything above reasons about a crossing from WHERE IT IS. Round 2
+    is the finding that position is not enough, and it comes in a matched
+    pair — the two faults compound, and either alone would have been
+    caught by the numbers the other one produced.
+
+    **The void bound discards a floor that is really there.** A pocket
+    whose floor is a doubly-curved CONVEX dome crowns ABOVE the mouth: a
+    form tool's crown, a domed seat, a ball-end plunge left proud. The
+    crown is inward of the mouth by however proud it stands, and the
+    crown IS the floor — the metal starts there. Position cannot tell it
+    from an undercut seat's upper pole, which stands in the same place
+    and is mid-air, and neither can the normal: both read ``(0, 0, +1)``
+    on a Z-up bore. So the presumption is put to the solid. See
+    :class:`_AxisMaterial`.
+
+    **And then the OTHER crossing wins, unchallenged.** Discarding the
+    crown does not end the face's turn — the nearest pick simply takes
+    what is left, and what is left is the dome's far pole, which the far
+    bound does not constrain and which no rule had ever asked to be
+    anywhere near the part. On a Ø12 pocket in a 60 x 60 x 20 plate with
+    a crown standing 1.2e-3 mm proud, that is a bore 30012 mm deep,
+    reported THROUGH, entering 29992 mm below a 20 mm plate. It flips at
+    exactly the slack — 1.1e-3 mm at r=6 — so the same pocket a micron
+    flatter answers perfectly, which is the signature of an answer that
+    is not a property of the part. Six of 260 random parts, every one of
+    the dome-floored sub-family, and all of them right on the round
+    before.
+
+    The same pair, without a dome: a Ø8 bore fused with a sphere that
+    breaks out through the plate's bottom face reported 24 mm of depth in
+    a 20 mm plate, and a Ø4 bore with a spherical undercut at its MOUTH
+    put its far end 2.6 mm above the plate's own top face and called the
+    part UNKNOWN.
+
+    So: where the bound discards, what is left has to earn the end.
+    A crossing the axis really does leave the metal at takes it outright,
+    whichever side of the mouth it fell on. Failing that, a survivor
+    OUTSIDE the part's own extent is refused and the face contributes no
+    cap at all — the one path here that returns ``None`` — and the end
+    falls back to the bore's own parametric bound, a number the bore's
+    wall stands behind. Where the bound discards NOTHING not one of these
+    rules runs, no classifier is built, and every answer is the round-1
+    answer to the bit.
+
+    NOT closed by any of this, and recorded rather than half-fixed: a
+    TOROIDAL undercut — an O-ring or snap-ring gland at the bore's end —
+    still reads short and THROUGH. A ring torus never crosses its own
+    axis, so that face offers no crossing at all and nothing here is
+    asked to choose. See ``docs/BACKLOG-designed-to-live.md``, D-19.
     """
+    sign = -1.0 if at_low else 1.0
+
     if t_inner is None:
         # An edge whose curve OCCT declines to read has no bound to
         # give. The same edge would already have failed
@@ -2656,13 +2880,61 @@ def _root_for_end(
         # away deliberately.
         live = list(roots)
     else:
-        sign = -1.0 if at_low else 1.0
-        slack = 0.5 * _tangency_band(radius)
+        slack = _void_slack(radius)
         live = [root for root in roots if sign * (root[0] - t_inner) >= -slack]
+        if material is not None and len(live) != len(roots):
+            # THE BOUND HAS JUST DISCARDED SOMETHING, which is the only
+            # situation in which either of the next two rules can bite,
+            # and the reason they are inside this arm rather than above
+            # it. A crossing the bound KEEPS was reached from the bore's
+            # own mouth: it sits on the mouth or outside it, and the
+            # mouth is boundary of the solid, so the part vouches for
+            # it. A crossing that is left over only BECAUSE its nearer
+            # sibling was discarded has no such standing — nothing
+            # connects it to the mouth, and the far bound does not reach
+            # it either. So when the bound discards, what is left has to
+            # earn the end rather than inherit it.
+            step = _tangency_band(radius)
+            exits = [
+                root for root in roots if material.is_exit(root[0], sign, step)
+            ]
+            if exits:
+                # A crossing the axis really does leave the metal at IS
+                # the end of the bore, whichever side of the mouth it
+                # fell on — see :class:`_AxisMaterial`. This is what
+                # rescues a CONVEX floor, whose crown stands proud of
+                # the mouth and is still the floor, without rescuing an
+                # UNDERCUT seat's upper pole, which stands in the same
+                # place and is still mid-air.
+                #
+                # The INNERMOST of them: walking out of the bore, the
+                # first metal is the floor, and anything further out is
+                # behind it where the drill never went.
+                return min(exits, key=lambda root: sign * root[0])
+            if live:
+                # No crossing of this face bounds metal, and the bound
+                # has taken the ones with any claim on the mouth. What
+                # survives was promoted by the discard alone, so an
+                # answer OFF THE PART is refused outright rather than
+                # capping the bore with a point in mid-air — a spherical
+                # breakout's far pole 4 mm under a plate, a flat dome's
+                # far pole 30 metres under it.
+                #
+                # Refused, and not replaced: the face keeps its vote on
+                # openness as a TOUCHING neighbour, and the end falls
+                # back to the bore's own parametric bound, which is a
+                # number the bore's own wall stands behind.
+                live = [
+                    root for root in live if not material.off_the_part(root[0])
+                ]
+                if not live:
+                    return None
     return min(live or roots, key=lambda root: abs(root[0] - t_edge))
 
 
-def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence]:
+def _walk_caps(
+    group, ancestors, p_lo, p_hi, material=None
+) -> Tuple[_EndEvidence, _EndEvidence]:
     """Gather what caps each end of the bore. ONE walk, TWO answers.
 
     Walk the bore's own boundary edges, step across each to the
@@ -2766,9 +3038,19 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
                     ]
                     if not roots:
                         continue
-                    t_cap, normal = _root_for_end(
-                        roots, t_edge, at_low, group.radius, t_inner
+                    picked = _root_for_end(
+                        roots, t_edge, at_low, group.radius, t_inner, material
                     )
+                    if picked is None:
+                        # Every crossing this face offered is off the
+                        # part. The face still stands as a TOUCHING
+                        # neighbour and still votes on openness — it is
+                        # a real wall of the bore — but it has nothing
+                        # to say about WHERE the bore ends, so the end
+                        # falls back to the bore's own parametric bound
+                        # rather than to a point in mid-air.
+                        continue
+                    t_cap, normal = picked
                     end.caps.append(
                         (
                             t_cap,
@@ -2785,13 +3067,15 @@ def _walk_caps(group, ancestors, p_lo, p_hi) -> Tuple[_EndEvidence, _EndEvidence
     return low, high
 
 
-def _resolve_span(group, ancestors, p_lo, p_hi) -> Tuple[float, float, bool, bool]:
+def _resolve_span(
+    group, ancestors, p_lo, p_hi, material=None
+) -> Tuple[float, float, bool, bool]:
     """The bore's real axial span AND the openness of both its ends.
 
     One cap walk, both answers — see :func:`_walk_caps` and the module
     docstring's "Why UVBounds is not the answer" and "Open or capped".
     """
-    low, high = _walk_caps(group, ancestors, p_lo, p_hi)
+    low, high = _walk_caps(group, ancestors, p_lo, p_hi, material)
     origin, direction = group.origin, group.direction
     t_lo, lo_open = low.resolve(p_lo, origin, direction, -1.0, group.radius)
     t_hi, hi_open = high.resolve(p_hi, origin, direction, +1.0, group.radius)
@@ -2936,6 +3220,11 @@ def mine_cylindrical_holes(shape) -> List[LocatedHole]:
         else:
             groups.append(_BoreGroup(cyl))
 
+    # The part's extent, once. `_AxisMaterial` projects it onto each
+    # bore's own axis; nothing here walks the shape a second time.
+    box = Bnd_Box()
+    BRepBndLib.Add_s(shape, box)
+
     holes: List[LocatedHole] = []
     for group in groups:
         try:
@@ -2946,7 +3235,11 @@ def mine_cylindrical_holes(shape) -> List[LocatedHole]:
 
             radius, origin, direction = group.radius, group.origin, group.direction
             t_lo, t_hi, lo_open, hi_open = _resolve_span(
-                group, ancestors, group.lo, group.hi
+                group,
+                ancestors,
+                group.lo,
+                group.hi,
+                _AxisMaterial(shape, box, origin, direction),
             )
             depth = t_hi - t_lo
             if depth <= 0.0:
