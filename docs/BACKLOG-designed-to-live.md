@@ -431,6 +431,139 @@ corpus.
 
 ---
 
+<a id="d-90"></a>
+### D-90 (PROVISIONAL NUMBER) — EPIC: the no-touch cell and the dot-peen traceability spine
+
+> **⚠ NUMBERS PROVISIONAL — assign unique at merge.** `D-90` and its children
+> `D-91`…`D-95` are deliberate out-of-band placeholders, as are the ADR numbers
+> quoted below. Four unmerged branches are already colliding: the internal-portal
+> ADR (**ADR-0115 / D-20**), the auto-probe pricing ADR (**ADR-0113 / D-20**,
+> `docs/adr-auto-probe-inspection` @ `3058b20`), the QC report ADR
+> (**ADR-0199 / D-99**, `docs/adr-qc-inspection-report` @ `1520f29`), and the
+> pricing-queue head-of-line fix (**D-20**, `fix/pricing-queue-head-of-line`).
+> The highest id in this file on `origin/main` is **D-19**; the highest ADR is
+> **0112**. Whoever merges must renumber the epic, every child, the anchors, and
+> the cross-links in both directions.
+
+**Not a README row.** Like [D-19](#d-19) and D-99, this is a *build and phasing*
+entry, not a "Designed — awaiting hardware/endpoint" capability. The 1:1 README
+rule governs the Designed rows, not epics. Architecture:
+[docs/dream-shop-workflow.md](dream-shop-workflow.md).
+
+**What this epic is.** The connective tissue between five component designs that
+each stand alone and none of which join up. Read the architecture doc for the
+end-to-end flow and the spine design; this entry is the work breakdown.
+
+**The components it links** — each has its own design; this epic does not restate them:
+
+| Component | Design | Backlog | State |
+|---|---|---|---|
+| Auto-probe priced into every Defense quote | ADR-0113 *(prov., branch `docs/adr-auto-probe-inspection`)* | D-20 *(prov., collides)* | Design only |
+| Probe capture → verdict → auto-NCR | [ADR-0092](../adr/0092-on-machine-probe-ingestion-to-qc.md) | [D-02](#d-02) | **Built**; transports `todo!()` |
+| QC / FAIR report + Certificate of Conformance | ADR-0199 *(prov., branch `docs/adr-qc-inspection-report`)* | D-99 *(prov.)* | Design only |
+| Per-unit part UID marking + shipment gate | [ADR-0089](../adr/0089-part-uid-marking.md) | — | **Live (data only)** |
+| MTConnect capacity (`/sample`, `/probe`) | [ADR-0060](../adr/0060-stage3-manufacturing-adapter-framework.md) | [D-16](#d-16) | Live base + slots |
+| MIL-STD-130N IUID payload variant | [ADR-0089](../adr/0089-part-uid-marking.md) | [D-03](#d-03) | Designed, blocked on an IAC |
+
+**Surface today.** The two ends exist and the middle does not.
+
+Live: `wo_part_marks` with `part_uid` / `serial_number` / `data_matrix_payload` /
+`heat_lot_reference` (`apps/aberp/src/part_marking.rs:149`), `trace_part_uid`
+(`:471`), the defense part-UID shipment gate (`apps/aberp/src/serve.rs:17250`,
+`:17286`), `BarcodeScannerAdapter` emitting `CanonicalEvent::ScanReceived`
+(`crates/aberp-mes/src/adapters/barcode_scanner.rs:433`), `ZebraAdapter` with an
+inherent `print_zpl` (`crates/aberp-mes/src/adapters/zebra.rs`), `UrRtdeAdapter`
+(`ur_rtde.rs`), `MtconnectAdapter` polling `/current` (`mtconnect.rs`), the whole
+ADR-0092 QC measurement stack, and the hash-chained durable ledger.
+
+Verifiably absent, and this is the epic:
+
+1. **Nothing ever marks a part.** `print_zpl` has **zero call sites** outside its
+   own module and two doc comments. ADR-0089 said so — *"this session ships the
+   data, not the printer."*
+2. **Nothing consumes a scan.** `ScanReceived` has no non-test consumer anywhere
+   in the tree; it reaches the ledger as a generic `EventKind::MesAdapterEvent`
+   and stops.
+3. **Nothing links a measurement to a unit.** `qc_inspections.linked_part_uid`
+   exists and no code path populates it.
+
+**Children.**
+
+<a id="d-91"></a>
+**D-91 — UID lifecycle and the gate that must move with it.** Mint per-unit UIDs
+at **WO release** instead of at operator marking, add the
+`Allocated → Marked → Verified → Shipped` lifecycle (plus `MarkVerifyFailed`,
+`Scrapped`), and re-point `resolve_part_uid_gate` from *"a row exists"* to
+*"the row is `Verified`"*. **These are one change, not two:** under mint-at-release
+rows exist from release, so the existing gate predicate becomes vacuously true and
+a Live compliance gate silently stops gating. *Blocked on:* nothing. *Size:* small
+in code, high in care.
+
+<a id="d-92"></a>
+**D-92 — Mark payload variants and the scan resolver.** `MarkPayloadKind`
+(`AberpPointer` | `Iuid15434` | `Ata2000`), `render_mark_payload`, and one
+`resolve_scan` that parses all three plus the legacy `dp-…|serial|heat` composite.
+Default `AberpPointer` — the mark becomes a **pointer to the record**, reversing
+ADR-0089's composite payload (architecture doc §2.2; flagged decision §7.4).
+Free to change now: no part has ever been physically marked. *Blocked on:* an IAC
++ enterprise id for `Iuid15434` ([D-03](#d-03)) and a CAGE code for `Ata2000` —
+neither blocks the default. *Size:* small.
+
+<a id="d-93"></a>
+**D-93 — Genealogy events.** `part_genealogy_events` + a new `genealogy.*` event
+family, written on the **regulated** write path inside the caller's transaction
+(the `record_inspection` template), **not** on the lossy MES broadcast — the same
+call ADR-0061 §4 made for `stock_movements`, for the same reason, quoted verbatim
+in `crates/audit-ledger/src/entry/event_kind.rs`. Every scan lands a row including
+unresolved ones; station role is a closed vocab; device time is untrusted; vendor
+strings are bounded. *Blocked on:* nothing. *Size:* medium.
+
+<a id="d-94"></a>
+**D-94 — Physical marking and mark-verify.** The first `print_zpl` caller in the
+repo (ZPL `^BX` renders Data Matrix natively — no image library), scan-after-print
+verification, then a `MarkerAdapter` for a real dot-peen marker on the Zebra seam
+(raw TCP, health probe, bounded payload). Mark-then-verify with a re-mark-once
+rule, a quarantine branch, and a cell that continues past an unmarkable part.
+*Blocked on:* a marker purchase for the second half — constrained to a documented
+TCP/ASCII or Modbus-TCP command set, never a Windows-DLL-only device (the rule
+that produced ZPL over a vendor SDK and RTDE over PolyScope). *Size:* medium.
+
+<a id="d-95"></a>
+**D-95 — Cell orchestration and the probe transports.** `DprntFileSource` as a
+third `ProbeIngestionSource` against a shop-owned `ABERP-PROBE v1` line format
+(buildable and testable **today**, against fixtures, with no machine); then the
+cell command path. ⚠ **`ur_rtde` is read-only** — RTDE inputs and the Dashboard
+server (port 29999) are both explicit v1 non-goals (`ur_rtde.rs:99-103`), so
+"orchestration" has no transport today. Recommended architecture: ABERP posts
+**cell orders** and consumes completion events; the cell sequences itself
+(architecture doc §6.1, flagged decision §7.7). Shares its MTConnect work with
+[D-02](#d-02) and [D-16](#d-16) — do it once in the shared transport, not twice.
+*Blocked on:* physical access to the NTX and the robot, except the DPRNT parser
+and the format contract, which are not. *Size:* large.
+
+**Missing for Live.** Stated per child above. The epic reaches Live when a part
+can be quoted with its probe cycle priced, made unattended, marked, verified,
+scanned at three stations, reported on, shipped behind three gates, and
+reconstructed end to end from one `part_uid` in a hash-chained ledger.
+
+**Blocked on.** **Nine of the fourteen work items in the architecture doc's
+phasing need no machine at all** (D-91, D-92, D-93, D-94's label half, D-95's
+DPRNT parser, plus the ADR-0199 report work). Phase 0 ships the whole spine on a
+Zebra label and a TCP scanner — both already Live adapters — and swaps in the peen
+and the cell later. That is the scheduling argument for starting now.
+
+**Size.** Large as an epic; each child is independently shippable and independently
+useful. D-91 is the smallest and the most dangerous.
+
+**Twelve flagged decisions** are in the architecture doc §7. Three want an answer
+before code: whether a **US DoD deliverable** is ever in scope (§7.1 — it changes
+the mark payload from a pointer to a mandated UII), the **pointer-vs-composite**
+reversal (§7.4 — free today, expensive after the first peened part), and the
+**cell orchestration architecture** (§7.7 — it decides whether ABERP takes on
+real-time, safety-adjacent responsibility).
+
+---
+
 ## Expansion slots on a Live capability
 
 <a id="d-16"></a>
