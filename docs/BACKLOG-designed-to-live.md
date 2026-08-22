@@ -385,14 +385,27 @@ into FeatureGraph v6. The named parts below are where each defect lives:
 `_cap_axis_intersections`, `_has_flat_bottom`, `SURFACE_CONFUSION_MM`.
 
 **Missing for Live.** Eight items, in priority order — seven defects and
-one undecided convention. All are mutation-verified: items 1-5 from
-adversarial pass 8, items 6-8 from the D-19 round-2 pass. **Four are
-CLOSED**; four remain, and the gate stands until all of them are. Note
-that the defects do **not** all fail in the same direction: 1, 2, 3, 5 and
-7 under-quote, 4 and 6 over-quote, and 6 does so by three orders of
-magnitude. Item 8 is a decision, not a direction — and D-19 round 4 found
-a **second face of that same decision** at the far end of the bore, which
-is recorded under item 8 rather than as a defect.
+one convention. All are mutation-verified: items 1-5 from adversarial
+pass 8, items 6-8 from the D-19 round-2 pass. **Four are CLOSED**; item 8
+is now **DECIDED** at the far end of the bore and open only at the mouth
+(below); items 3, 5 and 7 remain, and the gate stands until they are
+closed. Note that the defects do **not** all fail in the same direction:
+1, 2, 3, 5 and 7 under-quote, 4 and 6 over-quote, and 6 does so by three
+orders of magnitude.
+
+**The depth convention is DECIDED: A — depth is TOOL TRAVEL, to the
+deepest point the tool reaches.** Ervin, on the conservative ground that
+*we will not lose jobs over it*: where two readings are defensible, take
+the one that never under-quotes. At the bore's far end that is the
+**pole**, which is what the corpus has been pinned to since D-19 round 1,
+so **nothing is re-pinned and no fixture moves**. What changes is the
+STATUS of a whole family of answers, not their values: the undercut ball
+seat, the ball nose, the wide spherical chamber and the domed floor are
+**working as intended under convention A**, not over-quote defects
+awaiting a fix. Any future oracle that measures a bore to the last place
+its own WALL is the boundary disagrees with the ratified convention and
+is wrong about this repo, not about the geometry. Recorded in full under
+item 8, and in ADR-0112 §B.2 where slice C's `L = h.depth_mm` reads it.
 
 1. ~~**N4 — undercut spherical cavity**~~ **— CLOSED.** (Ball-end seat;
    nose radius exceeds bore radius by `e >= 4e-7`.) Read **up to 87%
@@ -634,7 +647,17 @@ is recorded under item 8 rather than as a defect.
    gland at z=12 mines **6.5 THROUGH** where the axis has metal below
    z=12 (so it is BLIND) and the gland's own floor is at z=10.5 — **8.0
    or 9.5** depending on whether depth is measured on the axis or to the
-   deepest point of the feature, which is itself undecided. **Pre-existing
+   deepest point of the feature, which is itself undecided.
+
+   Item 8's convention A does **not** settle that, and the difference is
+   worth stating so nobody assumes it did. A rules on how far ONE tool
+   travels down ONE axis, and at the far end of a bore the deepest point
+   the drill reaches is on that axis. A gland's floor is not: it is cut
+   radially, by a different tool in a different operation, and charging
+   the drill for it would not be conservatism but a second operation's
+   time on the first one's line. So item 7 keeps both readings and its
+   own question — *does a radial relief in the wall lengthen the axial
+   drilling depth?* — which is orthogonal to A and still open. **Pre-existing
    and unchanged by the round-2 fix**, verified by running both rules over
    the same part: a **ring torus never crosses its own axis**, so that cap
    face offers *no* crossing at all and root selection is never asked. The
@@ -643,51 +666,93 @@ is recorded under item 8 rather than as a defect.
    `_EndEvidence.resolve` something to say when a cap face contributes no
    axis crossing — a different mechanism from items 1 and 6, which is why
    it was left rather than half-fixed.
-8. **R2-C — depth convention at a relieved mouth.** Not a defect so much
-   as an **undecided convention**, recorded because the round-2 pass
-   surfaced a disagreement about it. The miner measures a hole to the top
-   of its own **cylindrical wall**, so a countersink, a chamfer or a
-   spherical dish at the mouth is *not* part of the hole:
-   `countersunk_blind_bore` is pinned at **11.0, not 14.0**,
-   `chamfered_mouth_bore` at **18.5, not 20.0**, and
-   `spherical_mouth_undercut_bore` at **9.0404, not 10.632**. Measuring
-   from the part's face instead is defensible — it is what a drawing
-   dimension usually means — but it is a **corpus-wide convention change**
-   touching at least those three committed fixtures and their goldens, so
-   it needs its own decision and its own pass. Slice C must not price off
-   `located_holes` until it is settled, because the two readings differ by
-   the full depth of the relief.
+8. **R2-C — depth convention.** **DECIDED = A: depth is TOOL TRAVEL, to
+   the deepest point the tool reaches.** Ervin's call, on the
+   conservative ground that *we will not lose jobs over it* — between two
+   defensible readings, take the one that never under-quotes.
 
-   **The same decision at the FAR end (D-19 round 4).** The round-3
-   re-adversarial reported a Ø4 access hole into a R8 spherical chamber
-   as a **+91 % over-quote** — 33.0 against a solid-derived 17.254 — and
-   it is not a defect: it is this same undecided convention, at the
-   bottom of the bore instead of the mouth. That part is *literally*
-   `tools/generate_step_fixtures.py::_undercut_ball_seat` with a bigger
-   undercut, and the committed `undercut_ball_seat_blind_bore` is the
-   `undercut = 0.1` member of the same family, pinned at **14.1 — to the
-   cavity's far pole**, which is what D-19 round 1 was written to
-   install. The oracle that calls 33.0 an over-quote measures a bore to
-   the last place its **own wall** is the boundary, and by that measure
-   the committed fixture is wrong too: 6.9005 against its pinned 14.1, a
-   **51 % disagreement on a part nobody has called defective**. So the
-   question is the one item 8 already records — *how deep is a hole that
-   opens into something wider than itself: as far as the tool travels, or
-   as far as its own wall reaches?* — and nothing geometric separates the
-   two parts. The miner's answer is exactly "to the pole" at every
+   **THE FAR END OF THE BORE IS SETTLED, AND WAS ALREADY RIGHT.** Under A
+   a bore that opens into a cavity wider than itself ends at that
+   cavity's **pole**, because that is where a tool travelling down the
+   axis stops. The corpus has been pinned to the pole since D-19 round 1
+   and stays there: **no re-pin, no fixture moves, no code change.** What
+   moves is the classification. The family below is **working as intended
+   under convention A**, not a set of over-quote defects waiting on a fix:
+
+   - `undercut_ball_seat_blind_bore` (**14.1**) and
+     `undercut_ball_seat_blind_bore_d8`, and the whole undercut sweep
+     between them;
+   - the **ball-nose** family, which is the `undercut = 0` member of the
+     same sweep;
+   - the **wide spherical chamber** — a Ø4 access hole into an R8
+     cavity, **33.0**, which the round-3 re-adversarial reported as a
+     "+91 % over-quote" against a solid-derived 17.254. It is not an
+     over-quote. It is convention A, and the oracle that produced 17.254
+     measures a bore to the last place its own **wall** is the boundary,
+     which is convention B and is now the reading this repo does not use.
+     By that same oracle the committed `undercut_ball_seat_blind_bore`
+     would be 6.9005 against its pinned 14.1 — a 51 % disagreement on a
+     part nobody has ever called defective, which is what showed the two
+     were one semantic rather than a defect beside a correct answer;
+   - the **domed-floor** pocket family, whose floor is its crown for the
+     same reason.
+
+   The evidence that A is the only rule here that measures rather than
+   invents: the miner's answer is exactly "to the pole" at **every**
    undercut from a ball nose to a chamber, continuous, with no feature
-   anywhere along it to hang a rule on; every candidate rule that would
-   close the chamber and keep the committed fixture is a **threshold on
-   the undercut**, which would be inventing the boundary rather than
-   measuring it. Left, deliberately, and pinned as a family rather than
-   half-fixed:
+   anywhere along it to hang a rule on. Every candidate rule that would
+   have closed the chamber while keeping the committed fixture was a
+   **threshold on the undercut** — a boundary invented to make one part
+   agree with an oracle.
    `test_d19r4_the_wide_chamber_is_the_undercut_seat_family_not_a_defect`
-   walks the sweep and asserts the continuity, and also that the chamber
-   does **not** move under any of the round-4 rigid motions, so it is not
-   an orientation defect wearing this one's clothes. Settling item 8
-   settles both ends together, and it touches
-   `undercut_ball_seat_blind_bore`, `undercut_ball_seat_blind_bore_d8`
-   and the ball-nose family as well as the three fixtures named above.
+   walks that sweep and now pins it as the ratified convention, and also
+   pins that the chamber does not move under any rigid motion, so it is
+   not an orientation defect wearing this one's clothes.
+
+   **THE MOUTH DATUM IS NOT SETTLED BY THIS WORDING — FLAGGED, NOT
+   DECIDED.** Item 8 always had two ends, and the decision above is
+   stated at the far one ("the deepest point the tool reaches"). The
+   mouth end asks a different question — not how far the tool goes but
+   **where its travel starts** — and the two are independent. The miner
+   measures from the top of the bore's own **cylindrical wall**, so a
+   countersink, a chamfer or a spherical dish at the mouth is *not* part
+   of the hole: `countersunk_blind_bore` is pinned at **11.0, not 14.0**,
+   `chamfered_mouth_bore` at **18.5, not 20.0**, and
+   `spherical_mouth_undercut_bore` at **9.0404, not 10.632**.
+
+   This is flagged rather than folded in because **convention A's own
+   rationale points the other way here.** At the far end, "never
+   under-quote" and "what the corpus already does" agree — both give the
+   pole. At the mouth they do NOT: the tool starts cutting at the part's
+   face, so tool travel is the **longer** 14.0 / 20.0 / 10.632, while the
+   corpus is pinned to the **shorter** 11.0 / 18.5 / 9.0404. Pricing off
+   the current pinning therefore **under-quotes by the full depth of the
+   relief** — the direction A was chosen to avoid, and the direction this
+   module treats as the worse one because it never appears in a reasoning
+   log. Reading A as settling the mouth too would mean re-pinning those
+   three committed fixtures and their goldens, which is the corpus-wide
+   pass this entry has always said it needs, and which contradicts "no
+   re-pin". So it is left open and stated with its numbers, for a
+   one-line ruling rather than a guess.
+
+   **Gate.** Slice C may price off `depth_mm` at the bore's far end. It
+   must not price off the mouth datum until that half is ruled, because
+   the two readings differ by the full depth of the relief and the
+   current one is the under-quoting side.
+
+   **How the far end came to be asked (D-19 round 4).** The chamber
+   arrived as a reported defect, and the useful part of the history is
+   how it stopped being one. Round 3's re-adversarial filed the Ø4/R8
+   chamber as a +91 % over-quote against its own solid-derived oracle.
+   The part turned out to be *literally*
+   `tools/generate_step_fixtures.py::_undercut_ball_seat` with a bigger
+   undercut — the same construction as a committed fixture nobody had
+   ever questioned — and applying the oracle's rule to that fixture
+   condemned it too, by 51 %. One rule, two parts, two verdicts that
+   could not both be about geometry: what the pair actually exposed was a
+   **semantic** the corpus and the oracle disagreed about, which is why
+   round 4 recorded it here instead of fixing it. That is the
+   disagreement convention A now settles, in the corpus's favour.
 
 **Blocked on.** Nothing external. This is purely our own work in one file.
 The adversarial-8 repros lived in the branch's `scratchpad/` and were not
@@ -705,8 +770,10 @@ ball nose. Item 6 is that same fix's mirror and closed the same way, by
 replacing a presumption about position with a question put to the solid.
 Items 3, 5 and 7 are independent; item 4 was the constant change whose
 blast radius was said to be the whole fixture corpus and turned out to
-move none of it, and item 8 is a decision rather than a fix — now with
-two ends to settle at once.
+move none of it, and item 8 was never a fix at all — it is a convention,
+now **decided as A (tool travel) at the bore's far end** with no code and
+no fixture moving, and open only at the mouth datum, where a ruling costs
+a sentence and the re-pin it implies costs a corpus-wide pass.
 
 ---
 

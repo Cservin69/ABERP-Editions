@@ -468,7 +468,8 @@ pub located_holes: Vec<LocatedHole>,
 - **Separate `located_holes` field, not a richer `Feature`.** `Feature` is a locked wire contract with a golden (`tests/property.rs`); adding fields would force `#[serde(default)]` on a struct whose point is that all three fields are mandatory. Parallel vector — the same call ADR-0097 made for `critical_feature_tolerances` (`feature_graph.rs:271-278`).
 - **`axis_unit` normalised by the extractor.** The engine "does not second-guess the extractor" (`feature_graph.rs:300-303`). Extractor normalises; engine may assert.
 - **`end_condition: Unknown` is first-class, never a silent default to `Through`.** A blind hole mis-read as through under-counts peck cycles ⇒ under-prices. Unknown is priced conservatively (C.2) and reasoning-logged.
-- **Millimetres, in the part's own coordinate system.** No WCS, no fixture offset — the extractor has no idea where the part sits on a table. Already unit-normalised to MM at read (`extractors/step.py:104`).
+- **Millimetres, in the part's own coordinate system.** No WCS, no fixture offset — the extractor has no idea where the part sits on a table. Already unit-normalised to MM at read (`extractors/step.py:104`). And in the part's own coordinate system means exactly that: no located-hole value may move when the part is rotated or translated, which is a property the miner is held to by a composed rotation-and-translation sweep over the whole fixture corpus (D-19 rounds 4–5).
+- **`depth_mm` is TOOL TRAVEL — convention A, DECIDED.** Where a bore opens into something wider than itself (an undercut ball seat, a ball-nose pocket, a spherical chamber, a domed floor), depth runs to the **deepest point the tool reaches** — the cavity's pole — not to the last place the hole's own wall is the boundary. Ervin's ruling, on the conservative ground that *we will not lose jobs over it*: between two defensible readings, take the one that never under-quotes. This is what the extractor has always emitted, so nothing moves; what it settles is that C.2's `L` has one meaning and an oracle measuring to the wall disagrees with the convention rather than finding a defect. **Still open at the MOUTH:** depth is measured from the top of the bore's own cylindrical wall, so a countersink or chamfer is not part of `L` (`countersunk_blind_bore` = 11.0, not 14.0). At that end convention A's own logic points the other way — tool travel starts at the part face — so the current reading is the under-quoting one. Slice C must not price a mouth-relief datum until that half is ruled. Full statement and numbers: `docs/BACKLOG-designed-to-live.md`, D-19 item 8.
 - **Deliberately NOT in v6:** counterbores, countersinks, threads, tapped-vs-clearance, tool access, hole *groups*. Threads are not reliably recoverable from B-rep without semantic PMI, and guessing "M6 because Ø5.0" is exactly the silent-wrong-value class this codebase refuses (`extractors/step.py:91-98`). See Q5.
 
 ### B.3 Back-compat for stored v2 graphs
@@ -574,7 +575,7 @@ Wiring module **`apps/aberp/src/quoting_drilling_rates.rs`**, a direct structura
 
 ### C.2 The formula
 
-Per hole `h`, with `d = h.diameter_mm`, `L = h.depth_mm`:
+Per hole `h`, with `d = h.diameter_mm`, `L = h.depth_mm` — where `L` is **tool travel** per the decided depth convention, B.2:
 
 ```
 feed_mm_per_min = feed_mm_per_min_per_mm_dia · d

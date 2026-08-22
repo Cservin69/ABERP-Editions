@@ -6004,7 +6004,7 @@ def _undercut_ball_seat(bore_radius, undercut, centre_z=12.0):
 
 
 def test_d19r4_the_wide_chamber_is_the_undercut_seat_family_not_a_defect():
-    """The third round-3 over-quote, and why it is NOT closed here.
+    """The reported "+91 % over-quote" that is the DECIDED convention.
 
     Round 3's re-adversarial reported a Ø4 access hole into a R8
     spherical chamber as a +91 % over-quote: 33.0 against a
@@ -6022,26 +6022,35 @@ def test_d19r4_the_wide_chamber_is_the_undercut_seat_family_not_a_defect():
     is wrong too — 6.9005 against its pinned 14.1, a 51 % disagreement on
     a part nobody has called defective.
 
-    So the two are not a defect and a correct answer sitting side by
+    So the two were never a defect and a correct answer sitting side by
     side. They are ONE semantic, applied consistently, that the corpus
-    and the oracle disagree about:
+    and the oracle disagreed about:
 
       "how deep is a hole that opens into a cavity wider than itself" —
       as far as the tool travels (the corpus), or as far as the hole's
       own wall reaches (the oracle)?
 
-    Nothing geometric separates them. Every candidate rule that would
-    close the chamber and keep the committed fixture is a THRESHOLD on
-    the undercut, and the sweep below is what says so: the miner's answer
-    is exactly "to the pole" at every undercut from a ball nose to a
-    chamber, continuous and with no feature anywhere along it to hang a
-    rule on. Picking a threshold would be inventing the boundary rather
-    than measuring it, so this round leaves it and records the decision —
-    see ``docs/BACKLOG-designed-to-live.md``, D-19.
+    THAT QUESTION IS NOW RULED. Backlog D-19 item 8 is DECIDED = A:
+    depth is TOOL TRAVEL, to the deepest point the tool reaches — the
+    corpus's reading — on the conservative ground that between two
+    defensible answers we take the one that never under-quotes. Nothing
+    here moves, because nothing here was ever wrong; what changes is that
+    this family is WORKING AS INTENDED rather than an open over-quote,
+    and an oracle measuring to the wall now disagrees with a ratified
+    convention rather than reporting a defect.
+
+    The sweep below is the evidence that A measures rather than invents.
+    The miner's answer is exactly "to the pole" at every undercut from a
+    ball nose to a chamber, continuous and with no feature anywhere along
+    it to hang a rule on, so every candidate rule that would have closed
+    the chamber while keeping the committed fixture was a THRESHOLD on
+    the undercut — a boundary put in to make one part agree with an
+    oracle. It stays pinned as a family for that reason: it is what would
+    catch a later round quietly reintroducing such a threshold.
 
     NOT a rotation defect either, which is the other half of what this
     pins: the chamber answers the same at every orientation, so it is
-    genuinely outside what round 4 is about.
+    genuinely outside what rounds 4 and 5 are about.
     """
     for bore_radius, undercut in (
         (6.0, 0.0),
