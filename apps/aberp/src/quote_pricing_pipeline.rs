@@ -7449,8 +7449,13 @@ mod tests {
         let stale = "00000000-0000-0000-0000-00000000d004";
         let waiting = "00000000-0000-0000-0000-00000000d005";
         let fresh_started = "00000000-0000-0000-0000-00000000d006";
+        // Started 5 minutes ago — slow, not stuck. Pins the threshold from
+        // BELOW: shorten STALE_JOB_REAP_AFTER to seconds/minutes and this row
+        // gets reaped mid-extract, failing a customer's quote because the
+        // Python extractor was chewing on a large assembly.
+        let slow_started = "00000000-0000-0000-0000-00000000d008";
         let svc = s430_service(&addr, db.clone(), artifacts.clone());
-        for q in [stale, waiting, fresh_started] {
+        for q in [stale, waiting, fresh_started, slow_started] {
             svc.enqueue_one(s430_quote(q, "part.step")).await.unwrap();
         }
 
@@ -7460,7 +7465,11 @@ mod tests {
             .unwrap();
         {
             let conn = svc.deps.db.write().expect("stage via shared handle");
-            for (q, st) in [(stale, "extracting"), (fresh_started, "pricing")] {
+            for (q, st) in [
+                (stale, "extracting"),
+                (fresh_started, "pricing"),
+                (slow_started, "extracting"),
+            ] {
                 conn.execute(
                     "UPDATE quote_pricing_jobs SET state = ? WHERE quote_id = ?",
                     duckdb::params![st, q],
@@ -7476,6 +7485,10 @@ mod tests {
         d_priceq_backdate(&svc, waiting, long_ago, long_ago);
         // `fresh_started` is mid-flight right now.
         d_priceq_backdate(&svc, fresh_started, long_ago, &now_s);
+        let five_min_ago = (OffsetDateTime::now_utc() - time::Duration::minutes(5))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        d_priceq_backdate(&svc, slow_started, long_ago, &five_min_ago);
 
         let reaped = svc.reap_stale_jobs().await;
         assert_eq!(reaped, 1, "exactly the one stale STARTED row is reaped");
@@ -7497,6 +7510,12 @@ mod tests {
             d_priceq_row(&svc, fresh_started).0,
             "pricing",
             "a started row that moved recently is mid-flight, NOT stuck"
+        );
+        assert_eq!(
+            d_priceq_row(&svc, slow_started).0,
+            "extracting",
+            "5 minutes into a slow extract is NOT stuck — the threshold must \
+             stay well clear of the slowest legitimate single step"
         );
         // The reap is audited through the ordinary failure pair.
         assert_eq!(s430_count_kind(&db, "quote.pricing_failed"), 1);

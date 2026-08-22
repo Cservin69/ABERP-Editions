@@ -2408,7 +2408,8 @@ mod tests {
         let err = retry_job(&mut conn, "q4", "T", fixed_ts())
             .expect_err("a non-Failed row must not be silently requeued");
         assert!(
-            err.to_string().contains("only `failed` rows can be retried"),
+            err.to_string()
+                .contains("only `failed` rows can be retried"),
             "refusal must name the reason, got: {err}"
         );
         let rows = list_jobs(&conn, "T").expect("list");
