@@ -712,6 +712,146 @@ without making it churn.
 
 ---
 
+<a id="d-99"></a>
+### D-99 (PROVISIONAL NUMBER) — QC inspection reports + Certificate of Conformance, attached to the shipment
+
+> **⚠️ NUMBER PROVISIONAL — assign unique at merge; collides with
+> auto-probe / portal.** `D-99` and its ADR number (`ADR-0199`) are
+> deliberate placeholders. **D-20** is now taken on `origin/main` — the
+> pricing-queue head-of-line fix landed as `6182c6e` and owns the entry
+> directly above this one. Two *unmerged* branches still claim **D-20** as
+> well and will each need renumbering in turn: the internal-portal ADR
+> (ADR-0115 / D-20) and the auto-probe pricing ADR (ADR-0113 / D-20,
+> `docs/adr-auto-probe-inspection`). The highest id in this file on
+> `origin/main` is therefore **D-20**; the highest ADR is **0112**. Whoever
+> merges this must renumber the entry, the anchor, the ADR file, and the
+> cross-links in both directions.
+
+**Not a README row.** Like [D-19](#d-19), this is a *build and phasing*
+entry, not a "Designed — awaiting hardware/endpoint" capability. It has no
+README counterpart and adding one would be wrong — the 1:1 rule above
+governs the Designed rows, not gate/phasing entries. Design:
+[ADR-0199 (provisional)](../adr/0199-defense-qc-inspection-report-and-certificate-of-conformance.md).
+
+**Surface today.** The *measurement* half is Live and the *reporting* half
+does not exist.
+
+Live (ADR-0092 / S443, all reproduced at `origin/main` `9e4a6ee`):
+`qc_inspection_plans` and `qc_inspections`
+(`crates/aberp-qa/migrations/V002__qc.sql:22`, `:47`), the pure
+`compute_verdict` pass/minor/major/critical + calibration-stale rule
+(`crates/aberp-qa/src/qc/verdict.rs`), the `record_inspection` write
+chokepoint that emits the `qc.*` events inside the caller's tx
+(`crates/aberp-qa/src/qc/inspections.rs`), the `ProbeIngestionSource` trait +
+`RawProbeEvent` (`crates/aberp-qa/src/qc/probe.rs:52`), six `qc.*` event
+kinds (`crates/audit-ledger/src/entry/event_kind.rs:3086`), and the manual
+entry route `GET|POST /api/qc-inspections` (`apps/aberp/src/serve.rs:4603`).
+
+Adjacent surfaces the reporting work plugs into: the two existing
+defense-only shipment gates, whose shape the third one clones —
+`resolve_part_uid_gate` / `enforce_part_uid_gate_for_shipment`
+(`serve.rs:17250`, `:17286`) and `resolve_open_ncr_gate` /
+`enforce_open_ncr_gate_for_shipment` (`serve.rs:17384`, `:17427`);
+`mark_shipped`'s single transaction with its injected `InvoiceSpawner` +
+`ExportControlContext` (`crates/aberp-dispatch/src/repository.rs:530`);
+the pure PDF renderers `aberp-quote-pdf` (`src/lib.rs:214`) and
+`aberp-invoice-pdf` with their render-on-demand route precedent
+(`apps/aberp/src/print_invoice.rs:148`, `serve.rs:4283`); the traceability
+spine `wo_part_marks` + `trace_part_uid`
+(`apps/aberp/src/part_marking.rs:177`, `:471`) and
+`MaterialTraceabilitySeed.mill_cert_id`
+(`crates/aberp-compliance/src/lot_heat/mod.rs:164`); and the evidence bundle
+whose allow-list must be widened deliberately
+(`crates/aberp-verify/src/bundle.rs:120`).
+
+**Verifiably absent** (four sweeps over `*.rs` / `*.sql` / `*.svelte`):
+no report entity of any kind; no balloon/characteristic number, designator,
+type, method, or required flag on `qc_inspection_plans`; **no drawing number
+and no drawing revision anywhere in the repo** (`work_orders` carries
+`product_id` and nothing else — `crates/aberp-work-orders/migrations/V001__work_orders.sql:29-43`);
+and no link from a measurement to a serialised unit or to a dispatch.
+
+**Missing for Live — Phase 1 (ships on its own; works on today's manual
+actuals, before any probe transport exists).**
+
+- Six additive columns on `qc_inspection_plans` (`characteristic_number`,
+  `characteristic_designator`, `characteristic_type`, `inspection_method`,
+  `sheet_zone`, `is_required`) + a new `part_drawing_refs` table with
+  revision history, because nothing today can name a drawing.
+- `qc_reports` + `qc_report_lines` — a **frozen snapshot**, not a live view
+  over `qc_inspections`. Plans are mutable (`update_plan` /`archive_plan`,
+  `qc/plans.rs:157`/`:198`), so a live report would silently rewrite its own
+  history; `qc_inspections` already made this exact call and documented it
+  (`V002__qc.sql:41-46`).
+- **Characteristic accountability** (the AS9102 Form 3 discipline): the
+  report enumerates every enabled required characteristic for the product and
+  renders an explicit `not_measured` row for any without a measurement.
+  Unaccounted > 0 ⇒ disposition `incomplete`. A report that lists only what
+  was measured is the selective-recording failure mode moved to the printer.
+- The measured-characteristics input interface: three `Option` fields on
+  `RawProbeEvent` (`part_serial`, `characteristic_number`, `program_id`) and
+  one batch entry point `submit_measured_characteristics`, all-or-nothing per
+  unit, routing every element through the existing `record_inspection`
+  chokepoint. **Interface only — no transport.**
+- `aberp-qc-pdf`, a pure sibling of `aberp-quote-pdf`
+  (no clock / no I/O / no RNG ⇒ byte-identical output), rendering
+  `DimensionalInspection` + `CertificateOfConformance`.
+- The third shipment gate (`resolve_qc_report_gate` +
+  `enforce_qc_report_gate_for_shipment`) and a `ShipmentDocumentBinder`
+  injected into `mark_shipped` so the `dsp_id` binding rides the same
+  transaction as the state flip and the invoice spawn.
+- Six `qcr.*` event kinds (**187 → 193**; the pin is at
+  `event_kind.rs:4004` — reconcile the arithmetic at merge, other unmerged
+  branches also add kinds), with `rendered_sha256` + `renderer_version` on
+  `qcr.report_issued`. **The hash is pinned, the bytes are not stored** —
+  storing PDFs in the DB loads every durable checkpoint, mirror sync and
+  snapshot with a derivable payload, and the AP-artifact-on-disk pattern is
+  only sound for AP invoices because NAV holds the master copy. Nobody else
+  holds a QC report's master copy.
+- `qc_reporting_allowed_for(Edition)` in `build_profile.rs` (the
+  `storefront_polling_allowed_for` shape, `:249`), routes, SPA surface, and
+  the Portable byte-identity pin.
+
+**Phase 1b:** `As9102Fair` Forms 1/2/3 as a third render shape over the same
+data. **Phase 1c:** attaching the report to the shipment e-mail (off by
+default — mailing a compliance document automatically is its own decision).
+
+**Missing for Live — Phase 2 (auto-populated actuals).** The MC Connect
+probe-results pipeline (FANUC `DPRNT`-to-file / Siemens OPC-UA R-parameters /
+MTConnect) landing behind `submit_measured_characteristics`. This is
+[D-02](#d-02) and it shares its MTConnect work with [D-16](#d-16). If the
+seam in Phase 1 is drawn correctly, Phase 2 changes **no report code at
+all** — that is the test.
+
+**Blocked on.**
+
+- **Phase 1: nothing external.** Everything it reads exists at `9e4a6ee`.
+  The one non-code dependency is the drawing number/revision, which is
+  operator-entered master data, not an integration.
+- **Phase 2: physical access to the NTX and its control** — the same block as
+  [D-02](#d-02).
+- **Three decisions that are process commitments, not code.** Whether a
+  missing or incomplete report **blocks** a Defense shipment (the design
+  default is yes, mirroring the two existing gates — once on, a Defense
+  shipment cannot leave without a complete report); which standard/forms the
+  customers actually mandate (default AS9102 Rev C; primes and Nadcap may
+  layer their own); and whether an **unsigned** CoC is acceptable (a real
+  signing ceremony is [D-15](#d-15) + [D-06](#d-06)). All eleven flagged
+  decisions are in the ADR's Open questions.
+- **One documented breaking change.** `mark_shipped` gains a sixth parameter
+  and `aberp-verify`'s bundle allow-list (`bundle.rs:120`) must be widened
+  for a `qc/` directory — older verifiers will reject newer bundles, loudly
+  and deliberately.
+
+**Size.** Phase 1: large — three tables, one new crate, one gate, one
+injected trait through an existing atomic transaction, six event kinds, and
+an SPA surface. The renderer and the accountability computation are the two
+pieces with real logic; the rest follows existing templates closely enough
+to be mechanical. Phase 1b: small (one more layout over the same rows).
+Phase 2: medium per transport, and shared with [D-02](#d-02)/[D-16](#d-16).
+
+---
+
 ## Expansion slots on a Live capability
 
 <a id="d-16"></a>
