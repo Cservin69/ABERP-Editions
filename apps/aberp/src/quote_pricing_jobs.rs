@@ -604,9 +604,15 @@ pub fn set_state(
 
 /// Cheap helper — read just the `state` column for a single row. Returns
 /// `None` when no row matches. Used by `set_state` (and tests) for the
-/// SELECT-first defensive pattern. Tenant-scoped (matches every writer's
-/// `WHERE tenant_id = ?` posture).
-fn read_state(conn: &Connection, quote_id: &str, tenant_id: &str) -> Result<Option<JobState>> {
+/// SELECT-first defensive pattern, and by the pipeline's fail-loud wrapper
+/// (D-PRICEQ B1-CLASS) to ask whether an errored step left the row where it
+/// found it. Tenant-scoped (matches every writer's `WHERE tenant_id = ?`
+/// posture).
+pub(crate) fn read_state(
+    conn: &Connection,
+    quote_id: &str,
+    tenant_id: &str,
+) -> Result<Option<JobState>> {
     let mut stmt = conn
         .prepare(
             "SELECT state FROM quote_pricing_jobs

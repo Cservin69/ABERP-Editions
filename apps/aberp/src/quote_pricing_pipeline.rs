@@ -49,6 +49,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -421,6 +422,37 @@ pub struct PipelineCycleSummary {
     pub error: Option<String>,
 }
 
+/// D-PRICEQ B1-CLASS — which [`PricingPipelineService::advance_one_step`] arm
+/// a state dispatches to, and the `stage` string that arm's failures are
+/// audited under. `None` for the terminal states, which have no arm.
+///
+/// Two states share the extract arm, so "did the errored step move the row?"
+/// is a question about ARMS, not states: a row that went `Fetched` →
+/// `Extracting` and then errored is still headed straight back into
+/// [`PricingPipelineService::advance_extract`] next cycle.
+fn advance_arm_of(state: JobState) -> Option<&'static str> {
+    match state {
+        JobState::Fetched | JobState::Extracting => Some("extract"),
+        JobState::Pricing => Some("price"),
+        JobState::Rendering => Some("render"),
+        JobState::PostingBack => Some("post"),
+        JobState::Posted | JobState::Failed | JobState::Archived => None,
+    }
+}
+
+/// What [`PricingPipelineService::fail_loud_if_unmoved`] decided about an
+/// errored step, resolved inside the blocking task so the tracing lines stay
+/// off the DB thread.
+#[derive(Debug)]
+enum FailLoudVerdict {
+    /// The row never left the arm — terminalised `Failed`, audited.
+    Terminalised,
+    /// The row is gone (operator delete / archive raced the cycle).
+    Vanished,
+    /// The arm moved the row before it errored; the next cycle resumes.
+    Moved(JobState),
+}
+
 /// Per-cycle batch cap. Honest v1 latency: a slow Python extractor
 /// at 30s × 5 jobs = 150s, well under the 60s storefront poll cadence
 /// so the cycle still completes within roughly the cadence period.
@@ -443,10 +475,10 @@ const MAX_JOBS_PER_CYCLE: u32 = 5;
 /// `fetched` is NOT reapable — see `jobs::started_non_terminal_jobs` for why
 /// queue-wait must never be mistaken for stuck.
 ///
-/// The same span doubles as the reaper's UPTIME gate — a row must have been
-/// stale for this long *while the daemon was running* (see
-/// [`PricingPipelineService::started_at`]), not merely across an overnight
-/// close of the desktop app.
+/// The same span doubles as the reaper's LIVE-CYCLE gate — a row must have
+/// been stale for this long *while the daemon was actually running cycles*
+/// (see [`PricingPipelineService::cycles_completed`]), not merely across an
+/// overnight close — or an overnight SLEEP — of the desktop app.
 const STALE_JOB_REAP_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// D-PRICEQ — per-cycle cap on reaper work, so a pathological backlog cannot
@@ -507,22 +539,34 @@ pub struct PricingPipelineService {
     /// path encrypts downloaded CADs with `cad_blob.key`; the extract
     /// read path decrypts + emits `CadBlobRead` (debounced).
     cad_blob: CadBlobCtx,
-    /// D-PRICEQ adversarial B1 — when THIS daemon instance started, i.e. the
-    /// clock the stale-job reaper measures its window against.
+    /// D-PRICEQ adversarial B3 — how many pricing cycles THIS daemon instance
+    /// has actually completed. The clock the stale-job reaper measures its
+    /// window against, and deliberately NOT a clock at all.
     ///
-    /// A job's `updated_at` freezes while the process is down, and Defense is
-    /// a foreground Tauri desktop app the operator closes overnight. Measured
-    /// against pure wall-clock, every row left mid-flight by an ordinary
-    /// close — and `MAX_JOBS_PER_CYCLE` (5) vs 4 advances per job means a
-    /// cycle with ≥2 actionable jobs ends with exactly one — comes back after
-    /// the weekend already past the threshold and is terminalised on reopen
-    /// WITHOUT a single live attempt. Gating on uptime instead means every
-    /// reaped row has had [`STALE_JOB_REAP_AFTER`] of LIVE cycles that failed
-    /// to move it, which is the condition the reaper was written for.
+    /// A job's `updated_at` freezes whenever the daemon is not running cycles,
+    /// and Defense is a foreground Tauri desktop app: the operator closes it
+    /// overnight, and — `MAX_JOBS_PER_CYCLE` (5) vs 4 advances per job means a
+    /// cycle with ≥2 actionable jobs ends with exactly one — a mid-flight row
+    /// is the normal shape when they do. Measured against pure WALL CLOCK such
+    /// a row comes back past the threshold and is terminalised on reopen
+    /// without a single live attempt.
     ///
-    /// Set to `now` by [`Self::new`]; tests construct the struct directly and
-    /// backdate it (see `s430_service_started_at`).
-    started_at: OffsetDateTime,
+    /// The r2 fix gated on daemon UPTIME, which fixed the close-the-app case
+    /// and missed the one right beside it: a laptop that SLEEPS with the app
+    /// open advances the wall clock while running zero cycles, so uptime read
+    /// 16h against 0 attempts and the resumable row was condemned anyway.
+    /// Counting cycles cannot be fooled by either — the reaper fires only once
+    /// the job has been offered `STALE_JOB_REAP_AFTER` worth of cycles that
+    /// were REALLY RUN, which is what [`STALE_JOB_REAP_AFTER`]'s own doc
+    /// comment has claimed all along ("thirty consecutive cycles of no
+    /// progress").
+    ///
+    /// Incremented once per completed [`Self::poll_once`]; a cycle that bailed
+    /// before the advance loop (storefront list failure) is NOT counted,
+    /// because it gave the job no attempt either. Starts at 0 in
+    /// [`Self::new`]; tests construct the struct directly and preload it (see
+    /// `s430_service_cycles`).
+    cycles_completed: AtomicU64,
 }
 
 impl std::fmt::Debug for PricingPipelineService {
@@ -531,7 +575,10 @@ impl std::fmt::Debug for PricingPipelineService {
             .field("base_url", &self.config.base_url)
             .field("bearer", &"<redacted>")
             .field("poll_interval", &self.config.poll_interval)
-            .field("started_at", &self.started_at)
+            .field(
+                "cycles_completed",
+                &self.cycles_completed.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -551,7 +598,7 @@ impl PricingPipelineService {
             deps,
             client,
             cad_blob,
-            started_at: OffsetDateTime::now_utc(),
+            cycles_completed: AtomicU64::new(0),
         })
     }
 
@@ -618,8 +665,18 @@ impl PricingPipelineService {
                     // D-PRICEQ — was `break`, which abandoned the whole
                     // cycle: ONE unadvanceable job at the head froze every
                     // job queued behind it, every cycle, forever. Skip this
-                    // one and keep going; the reaper above is what
-                    // eventually terminalises it if it never moves.
+                    // one and keep going.
+                    //
+                    // B1-CLASS narrowed what can land here. An arm that
+                    // errors WITHOUT moving the row is now terminalised by
+                    // `advance_one_step`'s fail-loud wrapper and arrives as
+                    // `Ok(Failed)`, so an `Err` at this point means the row
+                    // DID move (or the DB is unwell) — nothing is wedged, and
+                    // the next cycle resumes it from its new state. The skip
+                    // list still matters: `next_actionable_job` is strict
+                    // FIFO `LIMIT 1`, so without it the same row comes back
+                    // on every iteration of this loop and the jobs behind it
+                    // never get a turn within the cycle.
                     tracing::warn!(
                         error = %e,
                         quote_id = %quote_id,
@@ -632,6 +689,14 @@ impl PricingPipelineService {
                 }
             }
         }
+
+        // D-PRICEQ adversarial B3 — one completed cycle, counted. This is the
+        // reaper's entire notion of elapsed time (see
+        // [`Self::cycles_completed`]): the early return above, which bails
+        // before the advance loop, deliberately does NOT reach here, because a
+        // cycle that never offered the queue an attempt must not age a job
+        // towards being condemned.
+        self.cycles_completed.fetch_add(1, Ordering::Relaxed);
 
         summary.elapsed_ms = started.elapsed().as_millis() as u64;
         self.emit_cycle_outcome_audit(&summary).await;
@@ -647,21 +712,36 @@ impl PricingPipelineService {
     /// is what distinguishes it in the ledger. Best-effort: a reaper fault is
     /// logged and the cycle continues (the advance loop is the priority).
     ///
-    /// **Uptime-gated** (D-PRICEQ adversarial B1): reaps nothing until this
-    /// daemon instance has been up for [`STALE_JOB_REAP_AFTER`], so a row is
-    /// only ever condemned after that many minutes of LIVE cycles failed to
-    /// move it — never for an `updated_at` that merely froze while the app was
-    /// closed. See [`Self::started_at`]. This keeps the reaper what it was
-    /// designed to be — a backstop; the real prod wedge (a job whose CAD
+    /// **Live-cycle-gated** (D-PRICEQ adversarial B1 → B3): reaps nothing until
+    /// this daemon instance has COMPLETED enough cycles to have offered the job
+    /// [`STALE_JOB_REAP_AFTER`] worth of attempts —
+    /// `cycles_completed × poll_interval`. A row is therefore only ever
+    /// condemned after that many minutes of cycles that were really run, never
+    /// for an `updated_at` that merely froze while the app was closed (B1) and
+    /// never for wall clock that ran on while the machine SLEPT with the app
+    /// open (B3). See [`Self::cycles_completed`]. This keeps the reaper what it
+    /// was designed to be — a backstop; the real prod wedge (a job whose CAD
     /// artifact was cleaned off disk) is terminalised by the fail-loud extract
     /// path on the FIRST cycle, with no reaper involvement at all.
     async fn reap_stale_jobs(&self) -> u32 {
-        let uptime = OffsetDateTime::now_utc() - self.started_at;
-        if uptime < time::Duration::seconds(STALE_JOB_REAP_AFTER.as_secs() as i64) {
+        // `.max(1)` only guards a degenerate sub-second cadence from making the
+        // gate vacuous; the shipped cadence is 60s.
+        let cadence_s = self.config.poll_interval.as_secs().max(1);
+        let live_s = self
+            .cycles_completed
+            .load(Ordering::Relaxed)
+            .saturating_mul(cadence_s);
+        // A cycle that runs LONGER than the cadence (D-20 A2's backlog
+        // re-download) only makes this conservative: the gate then represents
+        // more real time than it claims, so the reaper fires later, never
+        // sooner.
+        if live_s < STALE_JOB_REAP_AFTER.as_secs() {
             tracing::debug!(
-                uptime_s = uptime.whole_seconds(),
+                cycles_completed = self.cycles_completed.load(Ordering::Relaxed),
+                live_s,
                 threshold_s = STALE_JOB_REAP_AFTER.as_secs(),
-                "stale-job reaper: daemon uptime below the reap window; reaping nothing this cycle"
+                "stale-job reaper: too few completed cycles to have given any job a \
+                 fair run; reaping nothing this cycle"
             );
             return 0;
         }
@@ -1243,8 +1323,30 @@ impl PricingPipelineService {
 
     /// Advance one job by one state. Returns whether the job reached
     /// terminal `Posted`, terminal `Failed`, or simply advanced.
+    ///
+    /// **Fail-loud** (D-PRICEQ adversarial B1-CLASS). Every `Err` out of an
+    /// arm goes through [`Self::fail_loud_if_unmoved`] before it reaches the
+    /// cycle. Individual arms terminalise the failures they anticipate
+    /// (missing CAD, undecryptable blob, extractor error, writeback verdict);
+    /// this is the catch-all for the ones they do not, and there were nine of
+    /// those on the advance path — a `Pricing` row with no
+    /// `feature_graph_json`, a `Rendering` row whose persisted graph or
+    /// breakdown will not decode, a `posting_back` row whose hash column reads
+    /// back NULL. Each returned `Err` and left the row NON-TERMINAL, so
+    /// `retry_job` (which only touches a `Failed` row) could not reach it and
+    /// the operator had no lever at all. Before the `poll_once` fix that was
+    /// the head-of-line wedge; after it, the job merely errored forever in
+    /// silence, one wasted advance slot per cycle, with the reaper — correctly
+    /// gated on live cycles — as its only escape.
+    ///
+    /// Routing them here terminalises the job the same audited way the arms
+    /// do, and [`classify_failure`] still decides transient-vs-permanent from
+    /// the error's own text, so a retryable shape is not blanket-condemned.
     async fn advance_one_step(&self, row: PricingJobRow) -> Result<StepOutcome> {
-        match row.state {
+        let entry_arm = advance_arm_of(row.state);
+        let quote_id = row.quote_id.clone();
+        let attempt_n = row.attempt_n;
+        let stepped = match row.state {
             JobState::Fetched | JobState::Extracting => self.advance_extract(row).await,
             JobState::Pricing => self.advance_price(row).await,
             JobState::Rendering => self.advance_render(row).await,
@@ -1254,6 +1356,122 @@ impl PricingPipelineService {
             // S414's `archived` is excluded there too); if one does,
             // treat it as a no-op advance rather than panicking.
             JobState::Posted | JobState::Failed | JobState::Archived => Ok(StepOutcome::Advanced),
+        };
+        match (stepped, entry_arm) {
+            (Ok(outcome), _) => Ok(outcome),
+            // Unreachable: the terminal arm above cannot return `Err`. Kept
+            // total rather than `unreachable!()` — a panic here would take the
+            // whole daemon down for a state we simply did not expect.
+            (Err(e), None) => Err(e),
+            (Err(e), Some(stage)) => {
+                self.fail_loud_if_unmoved(&quote_id, stage, attempt_n, e)
+                    .await
+            }
+        }
+    }
+
+    /// D-PRICEQ B1-CLASS — an arm errored. Terminalise the job (audited) if
+    /// and only if it left the row where it found it; otherwise let the error
+    /// through unchanged.
+    ///
+    /// **Why the "unmoved" condition is the whole fix.** The failure mode being
+    /// closed is a job that CANNOT progress: the next cycle re-enters the same
+    /// arm, hits the same deterministic error, and the row never becomes
+    /// `Failed`, so the operator's Retry button — `retry_job` refuses a
+    /// non-`Failed` row — is disabled on the one row that needs it. That is
+    /// exactly the case where the row is still in the arm it entered.
+    ///
+    /// An error raised AFTER the arm already moved the row (the audit-append
+    /// block that follows `set_extracted` / `set_priced` / `set_rendered`) is
+    /// a different animal: the next cycle enters a DIFFERENT arm, so nothing
+    /// is wedged and the work is not lost. Terminalising those would throw
+    /// away a completed extract over a transient audit-tx fault. They keep
+    /// today's behaviour — logged by the caller, skipped for this cycle,
+    /// resumed on the next.
+    ///
+    /// Note "arm", not "state": `Fetched` and `Extracting` both dispatch to
+    /// [`Self::advance_extract`], so a row that errored after its own
+    /// `set_state(Extracting)` mark has NOT escaped, and must terminalise.
+    async fn fail_loud_if_unmoved(
+        &self,
+        quote_id: &str,
+        stage: &'static str,
+        attempt_n: u32,
+        e: anyhow::Error,
+    ) -> Result<StepOutcome> {
+        // The error chain leads, so a reason that already carries a classifier
+        // token (`writeback:<tag>` is prefix-matched) keeps classifying the
+        // same way it would have from inside the arm.
+        let reason = format!(
+            "{e:#} [fail-loud: the `{stage}` step returned an error without \
+             terminalising the job (D-PRICEQ)]"
+        );
+        let db = self.deps.db.clone();
+        let tenant_id = self.deps.tenant.as_str().to_string();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        let quote_id_owned = quote_id.to_string();
+        let joined = spawn_blocking(move || -> Result<FailLoudVerdict> {
+            let mut conn = db
+                .write()
+                .context("shared writer: fail-loud (ADR-0098 Gap 1a)")?;
+            audit_ensure_schema(&conn).context("audit schema")?;
+            jobs::ensure_schema(&conn).context("jobs schema")?;
+            match jobs::read_state(&conn, &quote_id_owned, &tenant_id)? {
+                None => Ok(FailLoudVerdict::Vanished),
+                Some(now) if advance_arm_of(now) == Some(stage) => {
+                    emit_failure(
+                        &mut conn,
+                        &tenant_id,
+                        binary_hash,
+                        &login,
+                        &quote_id_owned,
+                        stage,
+                        &reason,
+                        attempt_n,
+                    )?;
+                    Ok(FailLoudVerdict::Terminalised)
+                }
+                Some(now) => Ok(FailLoudVerdict::Moved(now)),
+            }
+        })
+        .await
+        .context("fail-loud spawn_blocking join")?;
+        match joined {
+            Ok(FailLoudVerdict::Terminalised) => {
+                tracing::warn!(
+                    quote_id = %quote_id,
+                    stage,
+                    error = %format!("{e:#}"),
+                    "pricing-pipeline step errored without terminalising; job marked Failed \
+                     so the operator can Retry and the queue keeps moving"
+                );
+                Ok(StepOutcome::Failed)
+            }
+            Ok(FailLoudVerdict::Vanished) => {
+                tracing::warn!(
+                    quote_id = %quote_id,
+                    stage,
+                    error = %format!("{e:#}"),
+                    "pricing-pipeline step errored and the row is gone; nothing to terminalise"
+                );
+                Ok(StepOutcome::Advanced)
+            }
+            Ok(FailLoudVerdict::Moved(now)) => {
+                tracing::warn!(
+                    quote_id = %quote_id,
+                    stage,
+                    now_state = %now.as_str(),
+                    error = %format!("{e:#}"),
+                    "pricing-pipeline step errored AFTER moving the row; the next cycle \
+                     resumes from the new state"
+                );
+                Err(e)
+            }
+            // The DB itself is unwell. Surfacing the ORIGINAL error keeps the
+            // cycle's diagnosis honest; the terminalise attempt is reported as
+            // its context.
+            Err(db_err) => Err(e.context(format!("fail-loud terminalise also failed: {db_err:#}"))),
         }
     }
 
@@ -1481,11 +1699,11 @@ impl PricingPipelineService {
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
             let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
-            let graph_json = arts
-                .feature_graph_json
-                .ok_or_else(|| anyhow!("Pricing state but no feature_graph_json"))?;
-            let mut graph: FeatureGraph =
-                serde_json::from_str(&graph_json).context("decode FeatureGraph")?;
+            let graph_json = arts.feature_graph_json.ok_or_else(|| {
+                anyhow!("Pricing state but no feature_graph_json (artifact missing)")
+            })?;
+            let mut graph: FeatureGraph = serde_json::from_str(&graph_json)
+                .context("decode FeatureGraph (artifact corrupt)")?;
 
             // Catalogue snapshot — read all four tables synchronously
             // inside the blocking task. Per-pricing-pass to honor live
@@ -1988,18 +2206,16 @@ impl PricingPipelineService {
             audit_ensure_schema(&conn).context("audit schema")?;
             jobs::ensure_schema(&conn).context("jobs schema")?;
             let arts = jobs::get_job_artifacts(&conn, &quote_id, &tenant_id_string)?;
-            let graph: FeatureGraph = serde_json::from_str(
-                arts.feature_graph_json
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("Rendering state but no feature_graph_json"))?,
-            )
-            .context("decode FeatureGraph for render")?;
-            let breakdown: QuoteBreakdown = serde_json::from_str(
-                arts.breakdown_json
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("Rendering state but no breakdown_json"))?,
-            )
-            .context("decode QuoteBreakdown for render")?;
+            let graph: FeatureGraph =
+                serde_json::from_str(arts.feature_graph_json.as_deref().ok_or_else(|| {
+                    anyhow!("Rendering state but no feature_graph_json (artifact missing)")
+                })?)
+                .context("decode FeatureGraph for render (artifact corrupt)")?;
+            let breakdown: QuoteBreakdown =
+                serde_json::from_str(arts.breakdown_json.as_deref().ok_or_else(|| {
+                    anyhow!("Rendering state but no breakdown_json (artifact missing)")
+                })?)
+                .context("decode QuoteBreakdown for render (artifact corrupt)")?;
             let valid_until = (OffsetDateTime::now_utc().date()
                 + time::Duration::days(DEFAULT_VALID_UNTIL_DAYS))
             .format(&time::format_description::parse("[year]-[month]-[day]").expect("valid"))
@@ -2163,8 +2379,16 @@ impl PricingPipelineService {
                 )?;
                 let mut rows = stmt.query(duckdb::params![qid, tid])?;
                 let r = rows.next()?.ok_or_else(|| anyhow!("no row for post"))?;
-                let hash: String = r.get(0)?;
-                let valid_until: String = r.get(1)?;
+                // A `posting_back` row whose hash / valid_until read back NULL
+                // is as unpostable as one whose PDF is gone, and just as
+                // permanent — carry the token `classify_failure` keys on so the
+                // fail-loud wrapper terminalises it with the right verdict.
+                let hash: String = r
+                    .get(0)
+                    .context("posting_back row has no feature_graph_hash (artifact missing)")?;
+                let valid_until: String = r
+                    .get(1)
+                    .context("posting_back row has no valid_until_iso (artifact missing)")?;
                 Ok((arts, hash, valid_until))
             })
             .await
@@ -3214,6 +3438,12 @@ pub fn is_extractable_cad(filename: &str) -> bool {
 ///
 /// Rules (in evaluation order):
 ///
+/// - **stage="post"** + reason starts with a `writeback:<tag>` token → that
+///   tag's verdict, and nothing below is consulted. FIRST because a
+///   post-stage reason embeds the storefront's own response body, so every
+///   substring rule under it is reachable by REMOTE text; the token is the
+///   one part of the reason the daemon wrote itself (S347, D-PRICEQ B2 +
+///   ADV-4).
 /// - reason contains `"not yet implemented"` → `Permanent`. PR-273
 ///   wired the OCCT-backed STEP extractor, but the Python `[step]`
 ///   extra is opt-in: in an environment without cadquery-ocp the
@@ -3257,6 +3487,18 @@ pub fn is_extractable_cad(filename: &str) -> bool {
 ///   Retry can never help; the customer must re-upload as STEP. ADR-0112
 ///   A.2 deliberately KEPT that literal in the new STL-specific message
 ///   so STL rejection inherits Permanent with no change here.
+/// - **stage in {extract, decrypt, price, render}** + reason contains
+///   `"artifact missing"` OR `"artifact corrupt"` → `Permanent`. The
+///   persisted-artifact defects the fail-loud wrapper newly routes
+///   (D-PRICEQ B1-CLASS): a `pricing` / `rendering` row whose
+///   `feature_graph_json` or `breakdown_json` column reads back NULL or
+///   will not decode. The column never repopulates itself, so no auto-retry
+///   helps; the operator's Retry re-enqueues at `Fetched` and regenerates
+///   it. Deliberately NOT stage-agnostic — see the first rule.
+/// - **stage="post"** + reason contains `"artifact missing"` → `Permanent`.
+///   The post arm's own local-artifact loss (deleted PDF, NULL breakdown or
+///   hash column). Checked only AFTER the token lookup above, so a remote
+///   body can never reach it.
 /// - **stage="post"** + reason contains `"HTTP 401"` OR `"HTTP 403"` →
 ///   `Permanent`. Auth — operator must rotate the storefront token via
 ///   Settings → Storefront credentials.
@@ -3276,6 +3518,29 @@ pub fn is_extractable_cad(filename: &str) -> bool {
 /// a future regression.
 pub fn classify_failure(stage: &str, reason: &str) -> FailureKind {
     let r = reason.to_ascii_lowercase();
+    // S347 + D-PRICEQ adversarial ADV-4 — FIRST, before any substring rule.
+    //
+    // A post-stage reason embeds the storefront's own response body
+    // (`WritebackOutcome::failure_reason` appends `; body={body}`), so every
+    // substring rule below is reachable by REMOTE text. r2 moved the
+    // post-stage `"artifact missing"` rule below this lookup; the four
+    // stage-AGNOSTIC Permanent arms underneath ("not yet implemented", "is not
+    // in the catalogue", "_schema_version mismatch" / "feature-graph schema
+    // version", "below configured floor") were still above it, so a retryable
+    // 503 whose body excerpt happened to contain any of those words was
+    // classified Permanent and the customer's quote was lost.
+    //
+    // The typed `writeback:<tag>` token is the ONE part of a post-stage reason
+    // the daemon wrote itself, so it is authoritative and is consulted before
+    // anything else. Scoped to `stage == "post"`, and the lookup itself
+    // requires the `writeback:` prefix, so no other stage's classification
+    // changes. Reasons without the token (a local post-stage failure, or a
+    // legacy pre-S347 row) fall through to exactly the code they did before.
+    if stage == "post" {
+        if let Some(kind) = writeback_failure_kind_from_reason(&r) {
+            return kind;
+        }
+    }
     // Permanent: extractor stubs / not-yet-implemented / bad input.
     if r.contains("not yet implemented") {
         return FailureKind::Permanent;
@@ -3322,6 +3587,26 @@ pub fn classify_failure(stage: &str, reason: &str) -> FailureKind {
     if stage == "extract" && r.contains("unsupported file extension") {
         return FailureKind::Permanent;
     }
+    // D-PRICEQ B1-CLASS — the LOCAL stages' persisted-artifact defects: a
+    // `pricing` / `rendering` row whose `feature_graph_json` or
+    // `breakdown_json` column reads back NULL or will not decode. Nine such
+    // sites used to bail with a bare `?`, leaving the row non-terminal and
+    // therefore un-Retryable; they now route through the fail-loud wrapper and
+    // need a verdict of their own, because none of the rules above matches
+    // "Rendering state but no breakdown_json".
+    //
+    // Permanent is the honest verdict: the column will not repopulate itself,
+    // so no auto-retry can help — the operator's Retry re-enqueues at
+    // `Fetched` and regenerates it, which is precisely the operator action
+    // `Permanent` means. Deliberately NOT stage-agnostic: `post` is the one
+    // stage whose reasons carry a remote response body, and letting remote
+    // text reach this rule is the ADV-4 trap all over again. `post` keeps its
+    // own `artifact missing` rule, below and after the token lookup.
+    if matches!(stage, "extract" | "decrypt" | "price" | "render")
+        && (r.contains("artifact missing") || r.contains("artifact corrupt"))
+    {
+        return FailureKind::Permanent;
+    }
     // D-PRICEQ — the stale-job reaper's verdict is Permanent by
     // construction: it only fires after the job has failed to move for
     // STALE_JOB_REAP_AFTER, i.e. after every cycle in that window already
@@ -3333,14 +3618,11 @@ pub fn classify_failure(stage: &str, reason: &str) -> FailureKind {
     // POST-back classification — split on HTTP status family + transport
     // failure shape.
     if stage == "post" {
-        // S347 / PR-39 (F2) — typed writeback verdicts embed a stable
-        // `writeback:<tag>` token. Classify on the token, NOT on incidental
-        // reqwest Display wording (the old `"connection"`/`"dns"` substrings
-        // were one reqwest upgrade away from misclassifying). The legacy
-        // string fallback below stays for pre-S347 Failed rows on disk.
-        if let Some(kind) = writeback_failure_kind_from_reason(&r) {
-            return kind;
-        }
+        // The typed `writeback:<tag>` lookup that used to sit here now runs at
+        // the very top of this function (D-PRICEQ ADV-4) — anything reaching
+        // this block carries no token, so the legacy string rules below are the
+        // whole post-stage policy for it.
+        //
         // D-PRICEQ — a rendered artifact that is GONE from disk (the post
         // arm's PDF, or the row's persisted breakdown) is permanent for the
         // same reason a missing CAD is: no amount of retrying re-creates a
@@ -6260,7 +6542,7 @@ mod tests {
             },
             client,
             cad_blob: CadBlobCtx::with_test_key(),
-            started_at: OffsetDateTime::now_utc() - time::Duration::days(1),
+            cycles_completed: AtomicU64::new(REAPER_GATE_CYCLES),
         }
     }
 
@@ -6746,7 +7028,7 @@ mod tests {
             },
             client,
             cad_blob: CadBlobCtx::with_test_key(),
-            started_at: OffsetDateTime::now_utc() - time::Duration::days(1),
+            cycles_completed: AtomicU64::new(REAPER_GATE_CYCLES),
         }
     }
 
@@ -6875,7 +7157,7 @@ mod tests {
             },
             client,
             cad_blob: CadBlobCtx::with_test_key(),
-            started_at: OffsetDateTime::now_utc() - time::Duration::days(1),
+            cycles_completed: AtomicU64::new(REAPER_GATE_CYCLES),
         }
     }
 
@@ -7026,29 +7308,28 @@ mod tests {
         addr
     }
 
-    /// A service whose daemon-uptime clock reads "up for a long time", so the
-    /// reaper's uptime gate (D-PRICEQ B1) is satisfied and reaper behaviour
-    /// stays deterministic in tests. The gate itself is pinned by
-    /// `d_priceq_mid_flight_row_survives_app_downtime`, which builds a
-    /// just-started service via [`s430_service_started_at`].
+    /// Completed cycles that satisfy the reaper's live-cycle gate at the 60s
+    /// cadence every test builder uses: `30 * 60 / 60`.
+    const REAPER_GATE_CYCLES: u64 = STALE_JOB_REAP_AFTER.as_secs() / 60;
+
+    /// A service that has already completed enough cycles for the reaper's
+    /// live-cycle gate (D-PRICEQ B3) to be satisfied, so reaper behaviour stays
+    /// deterministic in tests. The gate itself is pinned by
+    /// `d_priceq_mid_flight_row_survives_a_sleeping_laptop`, which builds a
+    /// fresh service via [`s430_service_cycles`].
     fn s430_service(
         addr: &std::net::SocketAddr,
         db_path: std::path::PathBuf,
         artifact_dir: std::path::PathBuf,
     ) -> PricingPipelineService {
-        s430_service_started_at(
-            addr,
-            db_path,
-            artifact_dir,
-            OffsetDateTime::now_utc() - time::Duration::days(1),
-        )
+        s430_service_cycles(addr, db_path, artifact_dir, REAPER_GATE_CYCLES)
     }
 
-    fn s430_service_started_at(
+    fn s430_service_cycles(
         addr: &std::net::SocketAddr,
         db_path: std::path::PathBuf,
         artifact_dir: std::path::PathBuf,
-        started_at: OffsetDateTime,
+        cycles_completed: u64,
     ) -> PricingPipelineService {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(800))
@@ -7073,7 +7354,7 @@ mod tests {
             },
             client,
             cad_blob: CadBlobCtx::with_test_key(),
-            started_at,
+            cycles_completed: AtomicU64::new(cycles_completed),
         }
     }
 
@@ -7393,15 +7674,20 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
-    /// **Bug 2 — one bad head froze the queue.** `poll_once`'s advance-error
-    /// arm did `tracing::warn!` then `break`, abandoning the cycle. The head
-    /// here is a `rendering` row with no `feature_graph_json`, which
-    /// `advance_render` still (correctly) reports as `Err` — a genuine
-    /// unadvanceable job that the failure path does not own. The row BEHIND
-    /// it must still be actioned in the SAME cycle.
+    /// **Bug 2 — one bad head froze the queue**, and **B1-CLASS — that head
+    /// now fails LOUD.** The head here is a `rendering` row with no
+    /// `feature_graph_json`. Before r1 it took the whole cycle down with it
+    /// (`poll_once`'s advance-error arm did `tracing::warn!` then `break`);
+    /// after r1 it was skipped but still returned `Err` every cycle forever,
+    /// non-terminal and therefore beyond `retry_job`'s reach. It must now be
+    /// terminalised `Failed` by the fail-loud wrapper on the FIRST cycle —
+    /// with no reaper involvement, which is what the third row is here to
+    /// contrast — and the row BEHIND it must still be actioned in the SAME
+    /// cycle.
     ///
-    /// Revert-proof: change the `continue` back to `break` and the second
-    /// job stays `fetched` — the assert on its terminal state fails.
+    /// Revert-proof: drop the fail-loud arm in `advance_one_step` and the head
+    /// stays `rendering` with `summary.errored == 1`; change the `continue`
+    /// back to `break` and the second job stays `fetched`.
     #[tokio::test]
     async fn d_priceq_erroring_head_does_not_freeze_the_jobs_behind_it() {
         let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
@@ -7425,10 +7711,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Head: force it into `rendering` with no feature_graph_json, so its
-        // advance returns Err (not Failed) every cycle. Backdate `fetched_at`
-        // so strict FIFO puts it first; keep `updated_at` fresh so the reaper
-        // does NOT fire and steal the point of this test.
+        // Head: force it into `rendering` with no feature_graph_json — the
+        // shape that used to bail with a bare `?`. Backdate `fetched_at` so
+        // strict FIFO puts it first; keep `updated_at` fresh so the reaper
+        // does NOT fire and steal the point of this test — the head must be
+        // terminalised by the ADVANCE path, on its first cycle.
         {
             let conn = svc.deps.db.write().expect("wedge via shared handle");
             conn.execute(
@@ -7462,8 +7749,9 @@ mod tests {
         let summary = svc.poll_once().await;
 
         assert_eq!(
-            summary.errored, 1,
-            "the head errored and was skipped, not aborted the cycle"
+            summary.errored, 0,
+            "B1-CLASS — no job may end a cycle merely 'errored' any more; \
+             summary = {summary:?}"
         );
         assert_eq!(
             summary.reaped, 1,
@@ -7488,9 +7776,28 @@ mod tests {
         );
         assert_eq!(behind_stage.as_deref(), Some("decrypt"));
 
-        // The head itself is untouched — skipping is not a verdict.
-        let (head_state, _, _) = d_priceq_row(&svc, head);
-        assert_eq!(head_state, "rendering");
+        // B1-CLASS — the head is TERMINALISED on its first cycle, attributed
+        // to the stage that could not advance it, and reachable by the
+        // operator's Retry (which refuses anything but a `Failed` row). Before
+        // this it sat non-terminal forever with no operator lever at all.
+        let (head_state, head_stage, head_kind) = d_priceq_row(&svc, head);
+        assert_eq!(
+            head_state, "failed",
+            "an advance error must terminalise the job, not leave it in limbo"
+        );
+        assert_eq!(head_stage.as_deref(), Some("render"));
+        assert_eq!(
+            head_kind.as_deref(),
+            Some("permanent"),
+            "a NULL feature_graph_json will not repopulate itself — classify \
+             must say so via the explicit `artifact missing` token"
+        );
+        assert_ne!(
+            head_stage.as_deref(),
+            Some("reaper"),
+            "the reaper is a backstop, not the mechanism — the advance path \
+             owns this failure on cycle 1"
+        );
 
         // Bug 4 — the cycle outcome is now in the LEDGER, not just the tty.
         assert_eq!(
@@ -7598,34 +7905,34 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
-    /// **D-PRICEQ adversarial B1 — downtime is not stuckness.** Defense is a
-    /// foreground Tauri desktop app the operator closes at the end of the day,
-    /// and `MAX_JOBS_PER_CYCLE` (5) against 4 advances per job means every
-    /// cycle with ≥2 actionable jobs ends with exactly one row mid-flight
-    /// (e.g. `pricing`). Its `updated_at` freezes while the process is down,
-    /// so against pure wall-clock it comes back past the threshold — and the
-    /// reaper runs at the TOP of `poll_once`, before the advance loop — so on
-    /// reopen a perfectly resumable job was terminalised Failed/permanent
-    /// silently, without one live attempt.
+    /// **D-PRICEQ adversarial B1+B3 — neither downtime nor a sleeping laptop
+    /// is stuckness.** Defense is a foreground Tauri desktop app, and
+    /// `MAX_JOBS_PER_CYCLE` (5) against 4 advances per job means every cycle
+    /// with ≥2 actionable jobs ends with exactly one row mid-flight (e.g.
+    /// `pricing`). That row's `updated_at` freezes whenever the daemon is not
+    /// running cycles, so against pure wall clock it comes back past the
+    /// threshold — and the reaper runs at the TOP of `poll_once`, before the
+    /// advance loop — so a perfectly resumable job was terminalised
+    /// Failed/permanent silently, without one live attempt.
     ///
-    /// Revert-proof: delete the uptime gate at the top of `reap_stale_jobs`
-    /// and the first assert fails — the row is reaped. The second half is what
-    /// keeps that non-vacuous: the SAME row on the SAME service, with only the
-    /// daemon's `started_at` moved back, IS reaped, so the row was genuinely
-    /// reapable and the uptime gate is the one thing that spared it.
+    /// r2 gated on daemon UPTIME, which fixed closing the app and missed the
+    /// case right beside it: a laptop that SLEEPS with the app open advances
+    /// the wall clock while running zero cycles. This test is the sleep case —
+    /// the service has been "up" for 16 hours and has completed ZERO cycles.
+    ///
+    /// Revert-proof: replace the live-cycle gate with any wall-clock reading
+    /// (uptime included) and the first assert fails — the row is reaped. The
+    /// second half is what keeps that non-vacuous: the SAME row on the SAME
+    /// service, with only the completed-cycle count raised, IS reaped, so the
+    /// row was genuinely reapable and the gate is the one thing that spared it.
     #[tokio::test]
-    async fn d_priceq_mid_flight_row_survives_app_downtime() {
+    async fn d_priceq_mid_flight_row_survives_a_sleeping_laptop() {
         let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
-        let db = s430_temp("downtime.duckdb");
+        let db = s430_temp("sleep.duckdb");
         let artifacts = s430_temp("art");
         let overnight = "00000000-0000-0000-0000-00000000d009";
-        // A daemon that started RIGHT NOW — the operator just reopened the app.
-        let mut svc = s430_service_started_at(
-            &addr,
-            db.clone(),
-            artifacts.clone(),
-            OffsetDateTime::now_utc(),
-        );
+        // A daemon that has run NOT ONE cycle. Wall clock will say 16h below.
+        let svc = s430_service_cycles(&addr, db.clone(), artifacts.clone(), 0);
         svc.enqueue_one(s430_quote(overnight, "part.step"))
             .await
             .unwrap();
@@ -7637,10 +7944,11 @@ mod tests {
             )
             .expect("force pricing");
         }
-        // Mid-flight when the app was closed last night; `updated_at` froze
-        // there. 31 minutes is past STALE_JOB_REAP_AFTER by wall-clock — and
-        // wall-clock is exactly what must NOT decide this.
-        let last_night = (OffsetDateTime::now_utc() - time::Duration::minutes(31))
+        // Mid-flight when the lid closed last night; `updated_at` froze there.
+        // 15h55m is far past STALE_JOB_REAP_AFTER by wall clock, on a process
+        // whose own wall-clock "uptime" is 16h — and neither reading may
+        // decide this, because zero cycles ran in that window.
+        let last_night = (OffsetDateTime::now_utc() - time::Duration::minutes(955))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
         d_priceq_backdate(&svc, overnight, &last_night, &last_night);
@@ -7648,13 +7956,13 @@ mod tests {
         assert_eq!(
             svc.reap_stale_jobs().await,
             0,
-            "a row whose updated_at only froze while the app was CLOSED must not \
+            "a row whose updated_at only froze while the machine SLEPT must not \
              be reaped — the daemon has not run a single cycle against it yet"
         );
         assert_eq!(
             d_priceq_row(&svc, overnight).0,
             "pricing",
-            "the resumable mid-flight row must survive mere downtime"
+            "the resumable mid-flight row must survive a sleeping laptop"
         );
         assert_eq!(
             s430_count_kind(&db, "quote.pricing_failed"),
@@ -7662,19 +7970,374 @@ mod tests {
             "no failure may be audited for a job that never had a live attempt"
         );
 
-        // Same row, same service — only the daemon's uptime changes. Now the
-        // window IS backed by live cycles, so the backstop fires as designed.
-        svc.started_at = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        // One cycle short of the gate — still spared. Pins the threshold from
+        // below, so a fix that quietly reaps "nearly enough" is red too.
+        svc.cycles_completed
+            .store(REAPER_GATE_CYCLES - 1, Ordering::Relaxed);
+        assert_eq!(
+            svc.reap_stale_jobs().await,
+            0,
+            "one cycle short of a fair run is still short"
+        );
+
+        // Same row, same service — only the completed-cycle count changes. Now
+        // the window IS backed by cycles that really ran, so the backstop
+        // fires as designed.
+        svc.cycles_completed
+            .store(REAPER_GATE_CYCLES, Ordering::Relaxed);
         assert_eq!(
             svc.reap_stale_jobs().await,
             1,
-            "with the window backed by LIVE uptime the same row is reapable — \
+            "with the window backed by LIVE cycles the same row is reapable — \
              the gate delays the reaper, it does not disable it"
         );
         let (state, stage, kind) = d_priceq_row(&svc, overnight);
         assert_eq!(state, "failed");
         assert_eq!(stage.as_deref(), Some("reaper"));
         assert_eq!(kind.as_deref(), Some("permanent"));
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **D-PRICEQ adversarial B3 — a completed cycle is what ages a job.** The
+    /// counter the reaper reads must be advanced by `poll_once` itself, or the
+    /// gate above is a permanent OFF switch and the backstop never fires at
+    /// all. Also pins the deliberate exception: a cycle that bailed before the
+    /// advance loop (storefront list failure) offered the queue no attempt and
+    /// must NOT age anything.
+    #[tokio::test]
+    async fn d_priceq_only_a_completed_cycle_counts_towards_the_reaper() {
+        let addr = d_priceq_mock(b"unused".to_vec()).await;
+        let db = s430_temp("cyclecount.duckdb");
+        let artifacts = s430_temp("art");
+        let svc = s430_service_cycles(&addr, db.clone(), artifacts.clone(), 0);
+
+        let summary = svc.poll_once().await;
+        assert!(summary.error.is_none(), "cycle must be clean: {summary:?}");
+        assert_eq!(
+            svc.cycles_completed.load(Ordering::Relaxed),
+            1,
+            "a completed cycle must age the queue by one"
+        );
+        svc.poll_once().await;
+        assert_eq!(svc.cycles_completed.load(Ordering::Relaxed), 2);
+
+        // Storefront unreachable → poll_once returns before the advance loop.
+        let dead = s430_service_cycles(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+            s430_temp("cyclecount-dead.duckdb"),
+            artifacts.clone(),
+            0,
+        );
+        let summary = dead.poll_once().await;
+        assert!(
+            summary.error.is_some(),
+            "the storefront-list bail is the branch under test"
+        );
+        assert_eq!(
+            dead.cycles_completed.load(Ordering::Relaxed),
+            0,
+            "a cycle that never reached the advance loop gave the queue no \
+             attempt and must not age a job towards being condemned"
+        );
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Count `quote.pricing_failed` rows through the service's OWN shared
+    /// handle. `s430_count_kind` opens the path a second time, which is fine
+    /// for a single end-of-test check but reads a stale view when called
+    /// repeatedly against a live handle (ADR-0098 Gap 1a).
+    fn d_priceq_count_failed_audits(svc: &PricingPipelineService) -> usize {
+        let conn = svc.deps.db.read().expect("read via shared handle");
+        aberp_audit_ledger::recent_entries(&conn, 500)
+            .expect("recent")
+            .iter()
+            .filter(|e| e.kind.as_str() == "quote.pricing_failed")
+            .count()
+    }
+
+    /// Fetch a live [`PricingJobRow`] by id so a test can hand it straight to
+    /// `advance_one_step` without going through FIFO ordering.
+    fn d_priceq_job_row(svc: &PricingPipelineService, qid: &str) -> PricingJobRow {
+        let conn = svc.deps.db.read().expect("read via shared handle");
+        jobs::list_jobs(&conn, svc.deps.tenant.as_str())
+            .expect("list_jobs")
+            .into_iter()
+            .find(|r| r.quote_id == qid)
+            .expect("row")
+    }
+
+    /// **D-PRICEQ adversarial B1-CLASS — every advance error terminalises.**
+    ///
+    /// Nine error exits on the advance path bailed with a bare `?`: the
+    /// `pricing` arm's missing / undecodable `feature_graph_json`, the
+    /// `rendering` arm's four (graph and breakdown, missing and undecodable),
+    /// and the `posting_back` arm's row read. Each returned `Err`, so the row
+    /// stayed NON-TERMINAL — which meant `retry_job`, the operator's only
+    /// lever, refused it (it touches `Failed` rows only), and with the reaper
+    /// now correctly gated on live cycles the head-of-line wedge was back with
+    /// its last escape disabled.
+    ///
+    /// Each case here is one of those sites. All must end `failed`, attributed
+    /// to the arm's stage, and — crucially — must leave the actionable queue
+    /// EMPTY, which is the wedge being gone.
+    ///
+    /// Revert-proof: delete the fail-loud arm in `advance_one_step` and every
+    /// case fails on the first assert (`Err`, not `Ok(Failed)`); restore any
+    /// one site's bare `?` and that case alone goes red.
+    #[tokio::test]
+    async fn d_priceq_advance_errors_terminalise_instead_of_wedging() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("failloud.duckdb");
+        let artifacts = s430_temp("art");
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+
+        let graph_ok = serde_json::to_string(&mk_graph(StockForm::RectangularBlock))
+            .expect("encode a valid FeatureGraph");
+        // (state, column patch, expected stage). Every case is one of the nine
+        // bare-`?` sites.
+        let cases: Vec<(&str, String, &str)> = vec![
+            ("pricing", "feature_graph_json = NULL".to_string(), "price"),
+            (
+                "pricing",
+                "feature_graph_json = '{ this is not json'".to_string(),
+                "price",
+            ),
+            (
+                "rendering",
+                "feature_graph_json = NULL".to_string(),
+                "render",
+            ),
+            (
+                "rendering",
+                "feature_graph_json = '{ this is not json'".to_string(),
+                "render",
+            ),
+            (
+                "rendering",
+                format!("feature_graph_json = '{graph_ok}', breakdown_json = NULL"),
+                "render",
+            ),
+            (
+                "rendering",
+                format!("feature_graph_json = '{graph_ok}', breakdown_json = '{{ not json'"),
+                "render",
+            ),
+        ];
+
+        for (i, (state, patch, stage)) in cases.iter().enumerate() {
+            let qid = format!("00000000-0000-0000-0000-0000000{:05}", 91000 + i);
+            svc.enqueue_one(s430_quote(&qid, "part.step"))
+                .await
+                .unwrap();
+            {
+                let conn = svc.deps.db.write().expect("stage via shared handle");
+                conn.execute(
+                    &format!(
+                        "UPDATE quote_pricing_jobs SET state = '{state}', {patch}
+                            WHERE quote_id = ?"
+                    ),
+                    duckdb::params![qid],
+                )
+                .expect("stage the row");
+            }
+            let row = d_priceq_job_row(&svc, &qid);
+            let outcome = svc.advance_one_step(row).await;
+            assert!(
+                matches!(outcome, Ok(StepOutcome::Failed)),
+                "case {i} ({state} / {patch}) must terminalise, not bubble Err: {outcome:?}"
+            );
+            let (row_state, row_stage, row_kind) = d_priceq_row(&svc, &qid);
+            assert_eq!(row_state, "failed", "case {i}");
+            assert_eq!(row_stage.as_deref(), Some(*stage), "case {i}");
+            assert_eq!(
+                row_kind.as_deref(),
+                Some("permanent"),
+                "case {i}: a NULL or undecodable persisted artifact never \
+                 repopulates itself, and the explicit token must say so"
+            );
+            assert_eq!(
+                d_priceq_count_failed_audits(&svc),
+                i + 1,
+                "case {i}: every terminalised job leaves an audit row behind — \
+                 the point of failing LOUD"
+            );
+        }
+
+        // The whole point: nothing is holding the head any more.
+        assert!(
+            svc.next_actionable_blocking(&[]).await.unwrap().is_none(),
+            "no terminalised job may remain actionable — that is the wedge"
+        );
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// The `posting_back` arm's own site (the row read at the top of
+    /// `advance_post`): a row whose `feature_graph_hash` reads back NULL is
+    /// unpostable forever, and used to bubble `Err` with the row left in
+    /// `posting_back`.
+    ///
+    /// Revert-proof: drop the `.context("... (artifact missing)")` on the hash
+    /// read and the classification assert flips to `unknown`; drop the
+    /// fail-loud arm and the row stays `posting_back`.
+    #[tokio::test]
+    async fn d_priceq_unpostable_row_terminalises_instead_of_wedging() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("failloud-post.duckdb");
+        let artifacts = s430_temp("art");
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        let qid = "00000000-0000-0000-0000-00000000d011";
+        svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap();
+
+        // A real PDF on disk + a persisted breakdown, so the artifact guard
+        // added in r1 passes and the row read is genuinely the failing site.
+        let pdf = artifacts.join(qid).join("priced.pdf");
+        std::fs::create_dir_all(pdf.parent().unwrap()).unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4 stub").unwrap();
+        {
+            let conn = svc.deps.db.write().expect("stage via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs
+                    SET state = 'posting_back', pdf_path = ?, breakdown_json = '{}',
+                        feature_graph_hash = NULL
+                    WHERE quote_id = ?",
+                duckdb::params![pdf.to_string_lossy().to_string(), qid],
+            )
+            .expect("stage the row");
+        }
+
+        let row = d_priceq_job_row(&svc, qid);
+        let outcome = svc.advance_one_step(row).await;
+        assert!(
+            matches!(outcome, Ok(StepOutcome::Failed)),
+            "an unpostable row must terminalise, not bubble Err: {outcome:?}"
+        );
+        let (state, stage, kind) = d_priceq_row(&svc, qid);
+        assert_eq!(state, "failed");
+        assert_eq!(stage.as_deref(), Some("post"));
+        assert_eq!(kind.as_deref(), Some("permanent"));
+        assert!(
+            svc.next_actionable_blocking(&[]).await.unwrap().is_none(),
+            "the unpostable row must leave the actionable set"
+        );
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **B1-CLASS, the half that must NOT change.** Fail-loud is scoped to an
+    /// error that left the row where the arm found it — the shape that wedges.
+    /// An error raised AFTER the arm already moved the row (the audit-append
+    /// block that follows `set_extracted` / `set_priced` / `set_rendered`)
+    /// wedges nothing: the next cycle enters a DIFFERENT arm. Terminalising
+    /// those would throw a completed extract away over a transient audit-tx
+    /// fault, so they keep bubbling — skipped for this cycle, resumed next.
+    ///
+    /// Also pins the third verdict: a row that VANISHED (operator delete raced
+    /// the cycle) has nothing to terminalise and must not resurrect as Failed.
+    ///
+    /// Revert-proof: make `fail_loud_if_unmoved` terminalise unconditionally
+    /// and both halves go red.
+    #[tokio::test]
+    async fn d_priceq_fail_loud_spares_a_row_the_arm_already_moved() {
+        let addr = d_priceq_mock(b"unused".to_vec()).await;
+        let db = s430_temp("failloud-moved.duckdb");
+        let artifacts = s430_temp("art");
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        let qid = "00000000-0000-0000-0000-00000000d012";
+        svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap();
+        {
+            let conn = svc.deps.db.write().expect("stage via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET state = 'rendering' WHERE quote_id = ?",
+                duckdb::params![qid],
+            )
+            .expect("force rendering");
+        }
+
+        // The extract arm errored — but the row is already past it.
+        let out = svc
+            .fail_loud_if_unmoved(qid, "extract", 0, anyhow!("audit tx wobbled"))
+            .await;
+        assert!(
+            out.is_err(),
+            "an error raised after the row moved on must bubble, not condemn it"
+        );
+        let (state, _, _) = d_priceq_row(&svc, qid);
+        assert_eq!(state, "rendering", "the moved row must be untouched");
+        assert_eq!(
+            d_priceq_count_failed_audits(&svc),
+            0,
+            "no failure may be audited for a job that made progress"
+        );
+
+        // Same error, same stage — but the row is gone.
+        {
+            let conn = svc.deps.db.write().expect("delete via shared handle");
+            conn.execute(
+                "DELETE FROM quote_pricing_jobs WHERE quote_id = ?",
+                duckdb::params![qid],
+            )
+            .expect("delete");
+        }
+        let out = svc
+            .fail_loud_if_unmoved(qid, "render", 0, anyhow!("boom"))
+            .await;
+        assert!(
+            matches!(out, Ok(StepOutcome::Advanced)),
+            "a vanished row has nothing to terminalise: {out:?}"
+        );
+        assert_eq!(d_priceq_count_failed_audits(&svc), 0);
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **B1-CLASS must not blanket-Permanent.** The fail-loud wrapper hands the
+    /// reason to `classify_failure` exactly like the arms do, so a genuinely
+    /// retryable shape stays Transient. Blanket-condemning here would lose a
+    /// customer's quote to a storefront blip — the same class of harm ADV-4
+    /// found in the classifier's ordering.
+    ///
+    /// Revert-proof: hardcode `FailureKind::Permanent` into the wrapper's
+    /// failure path and this flips to `permanent`.
+    #[tokio::test]
+    async fn d_priceq_fail_loud_lets_classify_keep_a_transient_error_retryable() {
+        let addr = d_priceq_mock(b"unused".to_vec()).await;
+        let db = s430_temp("failloud-transient.duckdb");
+        let artifacts = s430_temp("art");
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        let qid = "00000000-0000-0000-0000-00000000d013";
+        svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap();
+        {
+            let conn = svc.deps.db.write().expect("stage via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET state = 'posting_back' WHERE quote_id = ?",
+                duckdb::params![qid],
+            )
+            .expect("force posting_back");
+        }
+
+        // Built from the real producer so the fixture cannot drift.
+        let transient = WritebackOutcome::Timeout.failure_reason();
+        let out = svc
+            .fail_loud_if_unmoved(qid, "post", 0, anyhow!("{transient}"))
+            .await;
+        assert!(matches!(out, Ok(StepOutcome::Failed)), "{out:?}");
+        let (state, stage, kind) = d_priceq_row(&svc, qid);
+        assert_eq!(state, "failed");
+        assert_eq!(stage.as_deref(), Some("post"));
+        assert_eq!(
+            kind.as_deref(),
+            Some("transient"),
+            "a storefront timeout stays retryable even when the fail-loud \
+             wrapper is what terminalised it"
+        );
 
         let _ = std::fs::remove_dir_all(&artifacts);
         let _ = std::fs::remove_file(&db);
@@ -7727,6 +8390,119 @@ mod tests {
                 "local artifact loss must stay Permanent: {local}"
             );
         }
+    }
+
+    /// **D-PRICEQ adversarial ADV-4 — the four arms r2 left above the post
+    /// block.** r2 moved the post-stage `"artifact missing"` rule below the
+    /// `writeback:<tag>` lookup, but four STAGE-AGNOSTIC `Permanent` arms
+    /// still ran before it. A post-stage reason embeds the storefront's own
+    /// response body, so any 5xx whose excerpt contained "not yet
+    /// implemented" / "is not in the catalogue" / a schema-version phrase /
+    /// "below configured floor" was classified Permanent and a retryable
+    /// quote was lost. Same harm as B2, one layer up.
+    ///
+    /// Revert-proof: move the top-of-function post-stage token lookup back
+    /// inside the `stage == "post"` block and every case here flips to
+    /// `Permanent`. The local half keeps it honest — the four arms must still
+    /// fire for the stages they were written for.
+    #[test]
+    fn d_priceq_writeback_5xx_outranks_every_stage_agnostic_token() {
+        for body in [
+            "not yet implemented",
+            "material 17-4PH is not in the catalogue",
+            "_schema_version mismatch",
+            "feature-graph schema version 4 rejected",
+            "quote is below configured floor",
+        ] {
+            let reason = WritebackOutcome::AppErrored {
+                http_status: 503,
+                body_excerpt: body.to_string(),
+            }
+            .failure_reason();
+            assert_eq!(
+                classify_failure("post", &reason),
+                FailureKind::Transient,
+                "a storefront 5xx is retryable no matter what its body says: {reason}"
+            );
+        }
+
+        // The four arms are not disabled — they still own their own stages.
+        assert_eq!(
+            classify_failure("extract", "extractor: not yet implemented"),
+            FailureKind::Permanent
+        );
+        assert_eq!(
+            classify_failure("price", "material 17-4PH is not in the catalogue"),
+            FailureKind::Permanent
+        );
+        assert_eq!(
+            classify_failure("extract", "_schema_version mismatch"),
+            FailureKind::Permanent
+        );
+        assert_eq!(
+            classify_failure("price", "margin is below configured floor"),
+            FailureKind::Permanent
+        );
+    }
+
+    /// **B1-CLASS token coverage.** The six local-stage sites the fail-loud
+    /// wrapper newly routes carry an explicit `artifact missing` /
+    /// `artifact corrupt` token, because none of the pre-existing rules
+    /// matched their wording and they would otherwise all have landed
+    /// `Unknown`. The rule is deliberately NOT stage-agnostic: `post` is the
+    /// one stage whose reasons carry a remote response body, and letting
+    /// remote text reach it is the ADV-4 trap again.
+    ///
+    /// Revert-proof: widen the rule to every stage and the last case flips to
+    /// `Permanent`; drop a token from a site's message and its case goes
+    /// `Unknown`.
+    #[test]
+    fn d_priceq_local_artifact_defects_classify_permanent_but_only_locally() {
+        for (stage, reason) in [
+            (
+                "price",
+                "Pricing state but no feature_graph_json (artifact missing)",
+            ),
+            (
+                "price",
+                "decode FeatureGraph (artifact corrupt): expected value",
+            ),
+            (
+                "render",
+                "Rendering state but no feature_graph_json (artifact missing)",
+            ),
+            (
+                "render",
+                "decode FeatureGraph for render (artifact corrupt): expected value",
+            ),
+            (
+                "render",
+                "Rendering state but no breakdown_json (artifact missing)",
+            ),
+            (
+                "render",
+                "decode QuoteBreakdown for render (artifact corrupt): expected value",
+            ),
+        ] {
+            assert_eq!(
+                classify_failure(stage, reason),
+                FailureKind::Permanent,
+                "{stage}: {reason}"
+            );
+        }
+
+        // A storefront 503 whose body excerpt happens to say "artifact
+        // corrupt" must NOT be dragged into the local rule.
+        let remote = WritebackOutcome::AppErrored {
+            http_status: 503,
+            body_excerpt: "artifact corrupt in object store".to_string(),
+        }
+        .failure_reason();
+        assert_eq!(
+            classify_failure("post", &remote),
+            FailureKind::Transient,
+            "the local-artifact rule must never be reachable by remote text: {remote}"
+        );
     }
 
     /// An IDLE cycle writes NO cycle-outcome row. Without this the daemon

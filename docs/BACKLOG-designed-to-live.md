@@ -436,12 +436,15 @@ corpus.
 (`apps/aberp/src/quote_pricing_pipeline.rs`) closed the prod wedge: the
 extract path fails loud instead of returning `Err` forever, `poll_once`
 skips an erroring job instead of abandoning the cycle, a stale-job reaper
-backstops rows nothing can move (uptime-gated, so ordinary app downtime
-never condemns a job), every non-idle cycle writes a
-`quote.pricing_cycle_outcome` audit row, and the operator has a Retry
-route. The three items below were found by the adversarial pass on that
-fix, are **not** closed by it, and are recorded here deliberately rather
-than folded into it.
+backstops rows nothing can move (gated on COMPLETED CYCLES, so neither
+ordinary app downtime nor a sleeping laptop condemns a job), every non-idle
+cycle writes a `quote.pricing_cycle_outcome` audit row, and the operator has
+a Retry route. Round 3 additionally routed every remaining bare-`?` error
+exit on the advance path through the audited failure path, so no advance
+error can leave a row non-terminal and therefore beyond `retry_job`'s reach.
+The three items below were found by the adversarial passes on that fix, are
+**not** closed by it, and are recorded here deliberately rather than folded
+into it.
 
 **Missing for Live.**
 
@@ -454,8 +457,9 @@ than folded into it.
    preserves `fetched_at`, so a retried old row jumps back to the head — a
    healthy mid-flight row behind them never gets an attempt, and being the
    **oldest** `updated_at` it is the row the reaper terminalises **first**.
-   The uptime gate does **not** cover this: uptime accrues perfectly well
-   while the row is being starved.
+   The live-cycle gate does **not** cover this: completed cycles accrue
+   perfectly well while the row is being starved — indeed they accrue
+   *because* cycles are running.
 
    *Why it is not fixed here.* Every clean version of the fix changes
    design already reviewed and cleared. (a) Gating the reap on the set of
