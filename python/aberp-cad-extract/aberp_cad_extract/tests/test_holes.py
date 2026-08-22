@@ -12,6 +12,7 @@ exact kernel, so anything looser would hide a real defect.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from pathlib import Path
 
@@ -888,15 +889,25 @@ def test_n2_the_point_classifier_is_rationed_not_readmitted(fixtures_dir: Path):
         "round 1 spent 36 on EVERY bore, and that budget is the whole reason "
         "N2 removed them"
     )
-    assert corpus["nurbs_far_opening_through_bore"][0] == 488, (
+    assert corpus["nurbs_far_opening_through_bore"][0] == 480, (
         "the part whose mouth is split into many edges must still ASK many "
         f"times, or the memo below is not being exercised; got "
-        f"{corpus['nurbs_far_opening_through_bore'][0]}"
+        f"{corpus['nurbs_far_opening_through_bore'][0]}. (D-19 round 5 moved "
+        "this from 488: the intersection now runs in the BORE'S FRAME, so a "
+        "handful of this part's B-spline roots land on the pole precisely "
+        "enough to be refused as the degeneracies they are, and are never "
+        "probed. No committed answer moves with it — the whole corpus is "
+        "pinned field by field in `test_d19r5_the_corpus_moves_by_at_most_a_"
+        "last_bit`.)"
     )
-    assert corpus["nurbs_far_opening_through_bore"][2] == 19, (
-        "...and must still SPEND 19 classifier queries on it. 488 would "
-        "mean `_inside`'s memo is gone; a different small number means the "
-        "roots it is asked about have moved"
+    assert corpus["nurbs_far_opening_through_bore"][2] == 10, (
+        "...and must still SPEND a handful of classifier queries on it. 480 "
+        "would mean `_inside`'s memo is gone; a different small number means "
+        "the roots it is asked about have moved. (Round 5 moved this from 19 "
+        "for the same reason it moved the 488: nine of this part's B-spline "
+        "roots are degeneracies that only the in-frame intersection places "
+        "accurately enough to recognise, and a refused root is never probed. "
+        "The part's answer does not move.)"
     )
     loud = sorted(name for name, (_q, oracles, _s) in corpus.items() if oracles)
     assert loud == CLASSIFIER_PARTS, (
@@ -2513,7 +2524,9 @@ def test_r6_the_ball_nose_does_not_depend_on_the_root_order(
     monkeypatch.setattr(
         holes_mod,
         "_cap_axis_intersections",
-        lambda face, origin, direction: list(reversed(original(face, origin, direction))),
+        lambda face, origin, direction, radius: list(
+            reversed(original(face, origin, direction, radius))
+        ),
     )
     reversed_roots = _mine(fixtures_dir / "ball_nose_blind_bore.step")
 
@@ -3114,8 +3127,8 @@ def test_r7_the_ball_nose_sweep_does_not_depend_on_the_root_order(monkeypatch):
     monkeypatch.setattr(
         holes_mod,
         "_cap_axis_intersections",
-        lambda face, origin, direction: list(
-            reversed(original(face, origin, direction))
+        lambda face, origin, direction, radius: list(
+            reversed(original(face, origin, direction, radius))
         ),
     )
     backward = _ball_nose_verdicts(sizes)
@@ -3689,8 +3702,8 @@ def test_d19_the_undercut_family_does_not_depend_on_the_root_order():
     forward = _undercut_verdicts(radii=radii, undercuts=undercuts)
 
     original = holes_mod._cap_axis_intersections
-    holes_mod._cap_axis_intersections = lambda face, origin, direction: list(
-        reversed(original(face, origin, direction))
+    holes_mod._cap_axis_intersections = lambda face, origin, direction, radius: list(
+        reversed(original(face, origin, direction, radius))
     )
     try:
         backward = _undercut_verdicts(radii=radii, undercuts=undercuts)
@@ -5027,8 +5040,8 @@ def test_d19r3_the_extent_question_is_cheaper_and_cannot_go_back():
         "at all; round 2 built one for every part ever mined"
     )
     every = [call for calls in per_part.values() for call in calls]
-    assert len(every) == 135, (
-        f"the corpus asks the extent question {len(every)} times, not 135. "
+    assert len(every) == 134, (
+        f"the corpus asks the extent question {len(every)} times, not 134. "
         "That is not a budget — it is one per survivor the void bound "
         "promoted with nothing bounding metal, and a change in it means a "
         "change in which crossings reach the arm"
@@ -5213,8 +5226,8 @@ def test_d19r3_the_round_3_parts_are_stable_under_a_reversed_walk(fixtures_dir: 
         holes_mod._collect_faces = collect
 
     original = holes_mod._cap_axis_intersections
-    holes_mod._cap_axis_intersections = lambda face, origin, direction: list(
-        reversed(original(face, origin, direction))
+    holes_mod._cap_axis_intersections = lambda face, origin, direction, radius: list(
+        reversed(original(face, origin, direction, radius))
     )
     try:
         reordered = {
@@ -5281,8 +5294,8 @@ def test_d19r2_the_dome_floor_family_does_not_depend_on_the_root_order():
     forward = _domed_verdicts(crowns=crowns)
 
     original = holes_mod._cap_axis_intersections
-    holes_mod._cap_axis_intersections = lambda face, origin, direction: list(
-        reversed(original(face, origin, direction))
+    holes_mod._cap_axis_intersections = lambda face, origin, direction, radius: list(
+        reversed(original(face, origin, direction, radius))
     )
     try:
         backward = _domed_verdicts(crowns=crowns)
@@ -5717,53 +5730,158 @@ def test_d19r4_the_extent_is_the_patch_not_the_trim(fixtures_dir: Path):
     )
 
 
-def _round3_crossing_normal(surface, u, v, direction):
-    """`_crossing_normal` as D-19 round 3 shipped it.
+def _collapse_by_derivative(floor_of):
+    """`_crossing_normal` as rounds 3 and 4 shipped it, with the
+    collapsed-isoline test left as a parameter.
 
-    Identical but for the collapsed-isoline test, which compared the two
-    derivative magnitudes as a RATIO at 1e-9. Kept verbatim so round 3's
-    claim stays checkable on the parts that break it.
+    Both of those rounds decided COLLAPSED from the two DERIVATIVE
+    magnitudes at the root, and differed only in what they compared them
+    against: round 3 took their RATIO against 1e-9, round 4 took the
+    smaller of them as a LENGTH against 1e-4 mm. ``floor_of(mag_u, mag_v)``
+    is that difference and nothing else is, so one replica carries both
+    and the claims about each stay checkable side by side.
+
+    What neither did — and what makes the replica a replica only when it
+    is driven through :func:`_pre_r5_cap_axis_intersections` — is run the
+    intersection in the bore's frame. See that function.
     """
-    from OCP.GeomLProp import GeomLProp_SLProps
 
-    import aberp_cad_extract.holes as holes_mod
+    def rule(surface, u, v, direction, _radius):
+        from OCP.GeomLProp import GeomLProp_SLProps
 
-    ratio = 1e-9
-    props = GeomLProp_SLProps(surface, u, v, 1, 1e-7)
-    d_u, d_v = props.D1U(), props.D1V()
-    mag_u = math.sqrt(d_u.X() ** 2 + d_u.Y() ** 2 + d_u.Z() ** 2)
-    mag_v = math.sqrt(d_v.X() ** 2 + d_v.Y() ** 2 + d_v.Z() ** 2)
+        import aberp_cad_extract.holes as holes_mod
 
-    u_min, u_max, v_min, v_max = surface.Bounds()
-    if mag_u <= ratio * mag_v:
-        lo, hi, along_u = u_min, u_max, True
-    elif mag_v <= ratio * mag_u:
-        lo, hi, along_u = v_min, v_max, False
-    else:
-        if not props.IsNormalDefined():
+        props = GeomLProp_SLProps(surface, u, v, 1, 1e-7)
+        d_u, d_v = props.D1U(), props.D1V()
+        mag_u = math.sqrt(d_u.X() ** 2 + d_u.Y() ** 2 + d_u.Z() ** 2)
+        mag_v = math.sqrt(d_v.X() ** 2 + d_v.Y() ** 2 + d_v.Z() ** 2)
+        floor_u, floor_v = floor_of(mag_u, mag_v)
+
+        u_min, u_max, v_min, v_max = surface.Bounds()
+        if mag_u <= floor_u:
+            lo, hi, along_u = u_min, u_max, True
+        elif mag_v <= floor_v:
+            lo, hi, along_u = v_min, v_max, False
+        else:
+            if not props.IsNormalDefined():
+                return None
+            n = props.Normal()
+            normal = holes_mod._unit((float(n.X()), float(n.Y()), float(n.Z())))
+            return (
+                normal
+                if abs(holes_mod._dot(direction, normal))
+                > holes_mod.CAP_OUTWARD_MIN_COS
+                else None
+            )
+
+        if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
             return None
-        n = props.Normal()
-        normal = holes_mod._unit((float(n.X()), float(n.Y()), float(n.Z())))
+
+        w_pole, w_min, w_max = (v, v_min, v_max) if along_u else (u, u_min, u_max)
+        normal = holes_mod._degenerate_point_normal(
+            surface, u, v, along_u, lo, hi, w_pole, w_min, w_max
+        )
+        if normal is None:
+            return None
         return (
             normal
             if abs(holes_mod._dot(direction, normal)) > holes_mod.CAP_OUTWARD_MIN_COS
             else None
         )
 
-    if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
-        return None
+    return rule
 
-    w_pole, w_min, w_max = (v, v_min, v_max) if along_u else (u, u_min, u_max)
-    normal = holes_mod._degenerate_point_normal(
-        surface, u, v, along_u, lo, hi, w_pole, w_min, w_max
-    )
-    if normal is None:
-        return None
-    return (
-        normal
-        if abs(holes_mod._dot(direction, normal)) > holes_mod.CAP_OUTWARD_MIN_COS
-        else None
-    )
+
+#: Round 3's rule: a RATIO between two derivatives that are not
+#: commensurable, at 1e-9.
+_round3_crossing_normal = _collapse_by_derivative(
+    lambda mag_u, mag_v: (1e-9 * mag_v, 1e-9 * mag_u)
+)
+
+#: Round 4's rule: the smaller derivative as an absolute LENGTH, at
+#: 1e-4 mm. Commensurable at last, and still extrinsic — the length it is
+#: compared against is fixed while the root it is computed from is placed
+#: by an intersector whose absolute error grows with the part's world
+#: coordinates. That is D-19 round 5, blocker 1.
+_round4_crossing_normal = _collapse_by_derivative(lambda _u, _v: (1e-4, 1e-4))
+
+
+def _pre_r5_cap_axis_intersections(collapse_rule):
+    """`_cap_axis_intersections` as rounds 3 and 4 shipped it: the axis
+    intersected with the cap's surface IN THE WORLD FRAME.
+
+    This is the half of the historical path that cannot be replayed by
+    monkeypatching :func:`_crossing_normal` alone, and leaving it out
+    would quietly rewrite what those rounds did. ``GeomAPI_IntCS``'s
+    absolute error grows with the coordinates it is handed, so where the
+    root lands — and therefore what the collapse test is even shown — is
+    a function of where the part sits in the world. Drive round 3's or
+    round 4's collapse rule through the round-5 in-frame intersection and
+    it is handed a root on the apex to a nanometre, and both rules answer
+    correctly on parts they demonstrably got wrong.
+    """
+    from OCP.BRep import BRep_Tool
+    from OCP.Geom import Geom_Line
+    from OCP.GeomAbs import GeomAbs_SurfaceType
+    from OCP.GeomAPI import GeomAPI_IntCS
+    from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt
+
+    import aberp_cad_extract.holes as holes_mod
+
+    def intersections(face, origin, direction, radius):
+        planar = holes_mod._plane_axis_intersection(face, origin, direction)
+        if planar is not None:
+            return [planar]
+        if holes_mod._adaptor(face).GetType() == GeomAbs_SurfaceType.GeomAbs_Plane:
+            return []
+        surface = BRep_Tool.Surface_s(face)
+        if surface is None:
+            return []
+        line = Geom_Line(
+            gp_Ax1(
+                gp_Pnt(origin[0], origin[1], origin[2]),
+                gp_Dir(direction[0], direction[1], direction[2]),
+            )
+        )
+        intersector = GeomAPI_IntCS(line, surface)
+        if not intersector.IsDone():
+            return []
+        roots = []
+        for i in range(1, intersector.NbPoints() + 1):
+            u, v, _w = intersector.Parameters(i)
+            normal = collapse_rule(surface, u, v, direction, radius)
+            if normal is None:
+                continue
+            p = intersector.Point(i)
+            roots.append(
+                (
+                    holes_mod._dot(
+                        (
+                            float(p.X()) - origin[0],
+                            float(p.Y()) - origin[1],
+                            float(p.Z()) - origin[2],
+                        ),
+                        direction,
+                    ),
+                    normal,
+                )
+            )
+        return roots
+
+    return intersections
+
+
+@contextlib.contextmanager
+def _as_shipped(collapse_rule):
+    """Run the miner on a pre-round-5 crossing path."""
+    import aberp_cad_extract.holes as holes_mod
+
+    original = holes_mod._cap_axis_intersections
+    holes_mod._cap_axis_intersections = _pre_r5_cap_axis_intersections(collapse_rule)
+    try:
+        yield
+    finally:
+        holes_mod._cap_axis_intersections = original
 
 
 def test_d19r4_a_collapsed_isoline_is_a_length_not_a_ratio(fixtures_dir: Path):
@@ -5791,10 +5909,16 @@ def test_d19r4_a_collapsed_isoline_is_a_length_not_a_ratio(fixtures_dir: Path):
        the direction the module treats as the worse one because it is
        invisible in the reasoning log.
     3. The new floor is a length with the margin measured, not a tuned
-       number: across the corpus under nine orientations every collapsed
-       isoline measures at most 2.4e-07 mm and every live one at least
-       1.0 mm, so the answer is flat everywhere between — walked here
+       number, so the answer is flat everywhere between — walked here
        decade by decade.
+
+    Round 5 kept every one of those findings and corrected the third's
+    ARITHMETIC, which round 4 recorded from too small a sample: the gap
+    was not 2.4e-07 against 1.0 mm. Composing a rotation WITH a
+    translation puts the worst collapsed isoline at 1.13e-04 mm, above
+    the 1e-4 floor meant to catch it, and that is blocker 1 of round 5 —
+    see ``test_d19r5_the_collapsed_isoline_gap_is_measured_not_claimed``,
+    which measures both sides of the gap rather than asserting them.
     """
     import aberp_cad_extract.holes as holes_mod
 
@@ -5808,16 +5932,12 @@ def test_d19r4_a_collapsed_isoline_is_a_length_not_a_ratio(fixtures_dir: Path):
         return holes[0].depth_mm
 
     turns = [0.0, 1.0, 5.0, 45.0, 89.9, 90.0, 135.0, 180.0]
-    original = holes_mod._crossing_normal
-    holes_mod._crossing_normal = _round3_crossing_normal
-    try:
+    with _as_shipped(_round3_crossing_normal):
         was = {
             deg: depth(_moved(upright, "rotate", (0.0, 1.0, 0.0), deg))
             for deg in turns
         }
         was_far = depth(_moved(upright, "translate", (1000.0, 0.0, 0.0), 0.0))
-    finally:
-        holes_mod._crossing_normal = original
 
     wrong = sorted(deg for deg, d in was.items() if abs(d - 11.0) > 1e-3)
     right = sorted(deg for deg, d in was.items() if abs(d - 11.0) <= 1e-3)
@@ -5838,17 +5958,20 @@ def test_d19r4_a_collapsed_isoline_is_a_length_not_a_ratio(fixtures_dir: Path):
         pytest.approx(11.0, abs=TOL)
     )
 
-    # And the floor is flat across the whole measured gap.
-    floor = holes_mod.DEGENERATE_ISOLINE_SPAN_MM
+    # And the floor is flat across the whole measured gap. Round 5 made
+    # the floor a FRACTION of the bore's radius rather than a millimetre
+    # figure, so the decades walked here are decades of that fraction —
+    # on a Ø8 bore, 4e-14 mm to 4e-4 mm.
+    floor = holes_mod.DEGENERATE_ISOLINE_FRACTION
     try:
-        for exponent in range(-6, -1):
-            holes_mod.DEGENERATE_ISOLINE_SPAN_MM = 10.0**exponent
+        for exponent in range(-14, -3):
+            holes_mod.DEGENERATE_ISOLINE_FRACTION = 10.0**exponent
             for deg in (0.0, 1.0, 135.0):
                 assert depth(_moved(upright, "rotate", (0.0, 1.0, 0.0), deg)) == (
                     pytest.approx(11.0, abs=TOL)
                 ), (exponent, deg)
     finally:
-        holes_mod.DEGENERATE_ISOLINE_SPAN_MM = floor
+        holes_mod.DEGENERATE_ISOLINE_FRACTION = floor
 
 
 def _undercut_ball_seat(bore_radius, undercut, centre_z=12.0):
@@ -6009,10 +6132,15 @@ def test_d19r4_backlog_item_4_the_drill_point_apex_is_closed():
     the root's own distance from the axis in millimetres, being compared
     against a number that only reads as dimensionless because a cone's
     other derivative happens to be 1. So the fix is to compare it against
-    a LENGTH — :data:`holes.DEGENERATE_ISOLINE_SPAN_MM` — and this is the
+    a LENGTH, and this is the
     regression sweep item 4 asked for: two topologies × three included
     angles × five point positions, with the depth asserted to the bore's
-    own SHOULDER every time.
+    own SHOULDER every time. Round 5 kept the fix and moved the length off
+    the millimetre scale and onto the bore's own radius
+    (:data:`holes.DEGENERATE_ISOLINE_FRACTION`), which does not change what
+    this sweep shows — and it also moved the intersection into the bore's
+    frame, which is why round 3's rule has to be replayed through
+    :func:`_as_shipped` to be replayed at all.
 
     Under the round-3 ratio exactly two of those thirty end at the apex,
     both of them the 118° point at z=4: 16.0 against a true 13.5966,
@@ -6027,22 +6155,18 @@ def test_d19r4_backlog_item_4_the_drill_point_apex_is_closed():
         for z_tip in (4.0, 5.0, 6.0, 7.0, 8.0)
     ]
 
-    def measured(rule):
-        original = holes_mod._crossing_normal
-        holes_mod._crossing_normal = rule
-        try:
-            out = {}
-            for z_tip, included, fused in grid:
-                shape, depth = _drill_point_bore(z_tip, included, fused)
-                with _silence_stdout_fd():
-                    holes = mine_cylindrical_holes(shape)
-                assert len(holes) == 1, (z_tip, included, fused, len(holes))
-                out[(z_tip, included, fused)] = (holes[0].depth_mm, depth, 20.0 - z_tip)
-        finally:
-            holes_mod._crossing_normal = original
+    def sweep():
+        out = {}
+        for z_tip, included, fused in grid:
+            shape, depth = _drill_point_bore(z_tip, included, fused)
+            with _silence_stdout_fd():
+                holes = mine_cylindrical_holes(shape)
+            assert len(holes) == 1, (z_tip, included, fused, len(holes))
+            out[(z_tip, included, fused)] = (holes[0].depth_mm, depth, 20.0 - z_tip)
         return out
 
-    was = measured(_round3_crossing_normal)
+    with _as_shipped(_round3_crossing_normal):
+        was = sweep()
     at_apex = sorted(
         key for key, (got, _wall, apex) in was.items() if abs(got - apex) <= TOL
     )
@@ -6060,9 +6184,1439 @@ def test_d19r4_backlog_item_4_the_drill_point_apex_is_closed():
             f"{got} against {wall}"
         )
 
-    now = measured(holes_mod._crossing_normal)
+    now = sweep()
     for key, (got, wall, apex) in sorted(now.items()):
         assert got == pytest.approx(wall, abs=TOL), (
             f"{key}: a drill point's apex is not a cap — the bore ends at its "
             f"own shoulder, {wall}. Got {got} (the apex is at {apex})"
         )
+
+
+# ── D-19 round 5: the world-frame class, closed ────────────────────────
+#
+# Round 4 named this branch after the defect and did not finish it. It
+# replaced TWO world-frame quantities — `_face_axial_span`'s box and the
+# collapsed-isoline ratio — and left others standing, so the adversarial
+# came back with two more instances of the same class. What follows is
+# the class, not the instances: any geometric verdict that depends on
+# where the part sits in the world instead of on the part's own shape is
+# a bug, because a located hole is a property of the part.
+#
+# Two things about these probes are deliberate, and both are what round 4
+# was missing rather than what it got wrong:
+#
+# - the motions COMPOSE. Round 4 applied one rotation OR one translation
+#   at a time, and every one of them passed. A rotation puts the bore's
+#   axis off the world axes; a translation then makes the surface's
+#   coordinates large IN THE DIRECTIONS THE ROTATION OPENED UP. Neither
+#   half does that alone, and it is the product that broke the
+#   countersink.
+# - the gap is MEASURED. Round 4's docstring recorded a margin of "three
+#   and a half orders" from a sample that never composed the two motions.
+#   The real worst case is 1.10x of the floor — on the wrong side of it —
+#   and no assertion in the suite would have said so, because the margin
+#   lived in prose. `test_d19r5_the_collapsed_isoline_gap_is_measured_
+#   not_claimed` computes both sides of it.
+
+
+D19R5_CORPUS = {
+    'angled_blind_hole': (
+        (
+            8.0,
+            20.00000000000007,
+            (20.0, 30.0, 40.0),
+            (0.7071067811865476, 0.0, -0.7071067811865476),
+            'BLIND',
+            True,
+        ),
+    ),
+    'angled_far_opening_through_bore': (
+        (
+            8.0,
+            12.641777724762413,
+            (50.0, 46.36029765732854, 20.0),
+            (0.0, 0.34202014332593184, -0.9396926207858127),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'angled_through_hole': (
+        (
+            8.0,
+            23.094010767587953,
+            (31.547005383798364, 30.0, 0.0),
+            (0.50000000000019, 0.0, 0.866025403784329),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'assembly_two_solids': (
+    ),
+    'ball_nose_blind_bore': (
+        (
+            8.0,
+            16.0,
+            (20.0, 20.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            False,
+        ),
+    ),
+    'ball_nose_blind_bore_d4_deep': (
+        (
+            4.0,
+            16.26015079999996,
+            (20.0, 20.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            False,
+        ),
+    ),
+    'ball_nose_blind_bore_d6': (
+        (
+            6.0,
+            9.799999999999997,
+            (20.0, 20.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            False,
+        ),
+    ),
+    'blind_bore_beside_chamfered_edge': (
+        (
+            8.0,
+            12.0,
+            (32.0, 20.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            True,
+        ),
+    ),
+    'blind_bore_beside_two_chamfers_corner': (
+        (
+            8.0,
+            12.0,
+            (32.0, 32.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            True,
+        ),
+    ),
+    'blind_bore_straddling_a_rounded_edge': (
+        (
+            10.0,
+            12.0,
+            (30.0, 20.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            True,
+        ),
+    ),
+    'blind_bore_under_dome': (
+        (
+            10.0,
+            12.0,
+            (0.0, 0.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            True,
+        ),
+    ),
+    'blind_hole_curved_top': (
+        (
+            10.0,
+            17.9128784747792,
+            (10.0, 20.0, 22.9128784747792),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            True,
+        ),
+    ),
+    'blind_hole_drill_point': (
+        (
+            8.0,
+            25.0,
+            (20.0, 20.0, 40.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            False,
+        ),
+    ),
+    'blind_hole_flat_bottom': (
+        (
+            10.0,
+            18.0,
+            (20.0, 20.0, 30.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            True,
+        ),
+    ),
+    'bore_beside_a_conical_boss': (
+        (
+            8.0,
+            24.99999999999276,
+            (38.5, 22.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_beside_a_taller_conical_boss': (
+        (
+            8.0,
+            28.75000000001998,
+            (38.5, 22.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_beside_chamfered_edge': (
+        (
+            8.0,
+            20.0,
+            (32.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_beside_concave_corner_fillet': (
+        (
+            14.0,
+            20.0,
+            (21.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_beside_concave_fillet': (
+        (
+            8.0,
+            30.0,
+            (0.0, 20.0, 25.0),
+            (1.0, 0.0, 0.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_beside_two_chamfers_corner': (
+        (
+            8.0,
+            20.0,
+            (32.0, 32.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_beside_uneven_chamfer_corner': (
+        (
+            8.0,
+            20.0,
+            (32.0, 32.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_inside_a_chamfer': (
+        (
+            8.0,
+            14.000000000000002,
+            (32.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_into_fillet': (
+        (
+            6.0,
+            28.66025403784439,
+            (55.0, 30.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_on_a_chamfer_corner_boundary': (
+        (
+            8.0,
+            20.0,
+            (32.0, 34.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_over_centre_post': (
+        (
+            30.0,
+            20.0,
+            (30.0, 30.0, 40.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            True,
+        ),
+    ),
+    'bore_straddling_a_concave_fillet': (
+        (
+            6.0,
+            20.34314575050762,
+            (36.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_straddling_a_rounded_edge': (
+        (
+            10.0,
+            20.0,
+            (30.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_through_a_domed_shoulder': (
+        (
+            8.0,
+            27.416198487095663,
+            (37.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_through_nurbs_dome': (
+        (
+            8.0,
+            39.999999999999986,
+            (0.0, 0.0, -19.999999999999996),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_through_spherical_dome': (
+        (
+            8.0,
+            40.0,
+            (0.0, 0.0, -20.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'bore_through_torus_wall': (
+        (
+            4.0,
+            16.0,
+            (4.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'both_sides_drilled': (
+        (
+            8.0,
+            40.0,
+            (20.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'chamfered_mouth_bore': (
+        (
+            8.0,
+            18.5,
+            (20.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'coaxial_split_faces': (
+        (
+            9.0,
+            40.0,
+            (15.0, 15.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'concave_fillet_step': (
+    ),
+    'countersunk_blind_bore': (
+        (
+            8.0,
+            11.0,
+            (20.0, 20.0, 17.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            True,
+        ),
+    ),
+    'countersunk_blind_bore_turned': (
+        (
+            8.0,
+            11.000000000000137,
+            (22.33333333333058, 18.291881449008574, 16.37478521766258),
+            (-0.3333333333330485, 0.24401693585603548, -0.9106836025231323),
+            'BLIND',
+            True,
+        ),
+    ),
+    'countersunk_bore_120': (
+        (
+            8.0,
+            18.267949192431,
+            (20.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'countersunk_through_bore': (
+        (
+            8.0,
+            17.0,
+            (20.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'cross_drilled_shaft': (
+        (
+            8.0,
+            22.360679774997898,
+            (-11.180339887498947, 10.0, 30.0),
+            (1.0, 0.0, 0.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'domed_floor_pocket': (
+        (
+            12.0,
+            11.998800000000976,
+            (30.0, 30.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            False,
+        ),
+    ),
+    'domed_floor_pocket_proud': (
+        (
+            12.0,
+            6.999999999999968,
+            (30.0, 30.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            False,
+        ),
+    ),
+    'domed_floor_pocket_with_a_rib': (
+        (
+            12.0,
+            11.998800000000976,
+            (30.0, 30.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            False,
+        ),
+    ),
+    'far_opening_through_bore': (
+        (
+            8.0,
+            12.0,
+            (30.0, 30.0, 8.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'far_opening_through_bore_turned': (
+        (
+            8.0,
+            12.00000000000653,
+            (30.0, 15.980762113524985, 32.320508075691876),
+            (0.0, 0.50000000000019, -0.866025403784329),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'far_opening_through_bore_with_a_leg': (
+        (
+            8.0,
+            12.0,
+            (30.0, 30.0, 8.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'filleted_block': (
+    ),
+    'nurbs_far_opening_through_bore': (
+        (
+            8.0,
+            12.0,
+            (30.0, 30.0, 8.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'plate_4_through_holes': (
+        (
+            8.0,
+            12.0,
+            (20.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+        (
+            8.0,
+            12.0,
+            (20.0, 40.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+        (
+            8.0,
+            12.0,
+            (80.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+        (
+            8.0,
+            12.0,
+            (80.0, 40.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'seam_split_bore': (
+        (
+            8.0,
+            20.0,
+            (20.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'spherical_mouth_undercut_bore': (
+        (
+            4.0,
+            9.040417140076999,
+            (30.0, 30.0, 18.408417140077),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            True,
+        ),
+    ),
+    'spherical_mouth_undercut_bore_with_a_boss': (
+        (
+            4.0,
+            9.040417140076999,
+            (30.0, 30.0, 18.408417140077),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            True,
+        ),
+    ),
+    'stepped_bore': (
+        (
+            6.0,
+            17.0,
+            (25.0, 25.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+        (
+            14.0,
+            8.0,
+            (25.0, 25.0, 25.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            True,
+        ),
+    ),
+    'thin_plate': (
+    ),
+    'tube_od_not_a_hole': (
+        (
+            20.0,
+            50.0,
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'two_walls_far_apart': (
+        (
+            8.0,
+            10.0,
+            (25.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+        (
+            8.0,
+            10.0,
+            (25.0, 20.0, 90.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'two_walls_gapped': (
+        (
+            8.0,
+            10.0,
+            (25.0, 20.0, 0.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+        (
+            8.0,
+            10.0,
+            (25.0, 20.0, 30.0),
+            (0.0, 0.0, 1.0),
+            'THROUGH',
+            False,
+        ),
+    ),
+    'undercut_ball_seat_at_the_confusion_edge': (
+        (
+            16.0,
+            16.00000099999999,
+            (20.0, 20.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            False,
+        ),
+    ),
+    'undercut_ball_seat_below_the_confusion': (
+        (
+            16.0,
+            16.00000005000001,
+            (20.0, 20.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            False,
+        ),
+    ),
+    'undercut_ball_seat_blind_bore': (
+        (
+            12.0,
+            14.100000000000001,
+            (20.0, 20.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            False,
+        ),
+    ),
+    'undercut_ball_seat_blind_bore_d8': (
+        (
+            8.0,
+            12.099999999999994,
+            (20.0, 20.0, 20.0),
+            (0.0, 0.0, -1.0),
+            'BLIND',
+            False,
+        ),
+    ),
+    'unit_cube': (
+    ),
+}
+
+
+#: Rigid motions that COMPOSE a rotation with a translation, in both
+#: orders, plus translations far enough out to be an assembly export.
+#:
+#: :data:`D19R4_MOTIONS` is one motion at a time and every fixture passed
+#: it. That is the shape of round 5's blocker 1: `GeomAPI_IntCS`'s
+#: absolute error grows with the coordinates of the surface it is handed,
+#: and a translation only makes the coordinates large along the axes it
+#: translates. It takes a ROTATION first — putting the bore's own axis
+#: across those axes — for the error to land where the collapsed-isoline
+#: test reads it. Neither half alone reaches 1e-4 mm; the product reaches
+#: 1.13e-4 and the countersink caps at its own apex.
+#:
+#: 12.345 m and 15 m are not stress figures. A part exported from an
+#: assembly carries the assembly's origin, and a machine frame is metres
+#: across.
+D19R5_COMPOSED = [
+    ("rotate 31° about X, then 12.345 m along X", [
+        ("rotate", (1.0, 0.0, 0.0), 31.0),
+        ("translate", (12345.0, 0.0, 0.0), 0.0),
+    ]),
+    ("12.345 m along X, then rotate 31° about X", [
+        ("translate", (12345.0, 0.0, 0.0), 0.0),
+        ("rotate", (1.0, 0.0, 0.0), 31.0),
+    ]),
+    ("rotate 17° about Y, then 12.345 m along X", [
+        ("rotate", (0.0, 1.0, 0.0), 17.0),
+        ("translate", (12345.0, 0.0, 0.0), 0.0),
+    ]),
+    ("rotate 37° about Z, then 12.345 m along X", [
+        ("rotate", (0.0, 0.0, 1.0), 37.0),
+        ("translate", (12345.0, 0.0, 0.0), 0.0),
+    ]),
+    ("rotate 40° about (1,1,1), then 12.345 m along X", [
+        ("rotate", (1.0, 1.0, 1.0), 40.0),
+        ("translate", (12345.0, 0.0, 0.0), 0.0),
+    ]),
+    ("rotate 13.5° about (2,-1,3), then 12.345 m along X", [
+        ("rotate", (2.0, -1.0, 3.0), 13.5),
+        ("translate", (12345.0, 0.0, 0.0), 0.0),
+    ]),
+    ("12.345 m along X, then rotate 13.5° about (2,-1,3)", [
+        ("translate", (12345.0, 0.0, 0.0), 0.0),
+        ("rotate", (2.0, -1.0, 3.0), 13.5),
+    ]),
+    ("rotate 90° about X, then 15 m out on every axis", [
+        ("rotate", (1.0, 0.0, 0.0), 90.0),
+        ("translate", (15000.0, 15000.0, 15000.0), 0.0),
+    ]),
+    # ALONG the upright corpus's own bore axis. `_canonical_origin` puts
+    # the zero of the axial parameter at the foot of the perpendicular
+    # from the WORLD origin, so this is the motion — and the only one —
+    # that makes `t` itself large without making the part large.
+    ("15 m along Z", [("translate", (0.0, 0.0, 15000.0), 0.0)]),
+    ("rotate 40° about (1,1,1), then 15 m along Z", [
+        ("rotate", (1.0, 1.0, 1.0), 40.0),
+        ("translate", (0.0, 0.0, 15000.0), 0.0),
+    ]),
+]
+
+
+def _composed(shape, steps):
+    """``shape`` under a whole sequence of :data:`D19R5_COMPOSED` steps."""
+    for kind, vector, degrees in steps:
+        shape = _moved(shape, kind, vector, degrees)
+    return shape
+
+
+def test_d19r5_the_corpus_moves_by_at_most_a_last_bit(fixtures_dir: Path):
+    """Every hole of every committed fixture, against the table round 4
+    left, field by field.
+
+    Round 5 moves the axis/surface intersection into the bore's own frame.
+    That is arithmetic, so it cannot be bit-preserving and this is the
+    honest accounting of what it cost — measured across all 62 fixtures
+    and 63 holes rather than asserted:
+
+    - ``diameter_mm``, ``entry_point_mm``, ``axis_unit``,
+      ``end_condition`` and ``flat_bottom`` are unchanged BIT FOR BIT on
+      every row. ``flat_bottom`` is the one blocker 2 rewrites, so its
+      being untouched here is the whole claim that the rewrite changed
+      only wrong answers.
+    - ``depth_mm`` moves on eight rows, by at most 1.5e-13 mm — a fifth
+      of a picometre, twelve orders below the tightest tolerance any of
+      these parts could be made to.
+
+    And the direction of those eight is not neutral. Every one of them
+    moves TOWARDS its exact nominal dimension — 9.799999999999997 to 9.8,
+    6.999999999999968 to 7.0, 12.099999999999994 to 12.1 — which is what
+    a frame centred on the bore does to a subtraction that used to happen
+    at the part's distance from the world origin. Asserted below, so
+    "closer to nominal" cannot decay into a claim nobody checks.
+    """
+    moved_rows, worst = [], 0.0
+    for name, expected in sorted(D19R5_CORPUS.items()):
+        holes = _mine(fixtures_dir / f"{name}.step")
+        assert len(holes) == len(expected), (
+            f"{name}: {len(holes)} holes, table says {len(expected)}"
+        )
+        for hole, row in zip(holes, expected):
+            diameter, depth, entry, axis, end, flat = row
+            assert hole.diameter_mm == diameter, (name, hole.diameter_mm, diameter)
+            assert tuple(hole.entry_point_mm) == entry, (name, hole.entry_point_mm)
+            assert tuple(hole.axis_unit) == axis, (name, hole.axis_unit)
+            assert hole.end_condition.name == end, (name, hole.end_condition)
+            assert hole.flat_bottom is flat, (
+                f"{name}: `flat_bottom` is {hole.flat_bottom}, was {flat}. "
+                "Round 5 rewrites this rule and no committed answer may move "
+                "with it — the two that do move are in "
+                "`test_d19r5_a_spun_part_does_not_grow_a_flat_bottom`, and "
+                "they are wrong answers on a part the corpus does not have"
+            )
+            gap = abs(hole.depth_mm - depth)
+            worst = max(worst, gap)
+            if hole.depth_mm != depth:
+                moved_rows.append((name, depth, hole.depth_mm))
+
+    assert worst <= 1e-12, (
+        f"the worst depth moved {worst} mm, which is more than a last bit. "
+        "Moving the intersection into the bore's frame may cost the last "
+        "bits of a subtraction and nothing else"
+    )
+    assert len(moved_rows) == 8, (
+        f"eight rows moved when round 5 landed; {len(moved_rows)} move now: "
+        f"{moved_rows}"
+    )
+    closer = 0
+    for name, was, now in moved_rows:
+        # Nine decimals: the corpus is dimensioned to the nanometre at
+        # worst (`undercut_ball_seat_below_the_confusion` is 16.00000005),
+        # so this recovers the exact intended figure and not a rounding of
+        # it.
+        target = round(now, 9)
+        if abs(now - target) < abs(was - target):
+            closer += 1
+            continue
+        # The one row that does not is `bore_beside_a_conical_boss`, whose
+        # depth was ALREADY 7.2e-12 off its nominal 25.0 before round 5
+        # touched anything — its cap is a cone met at a shallow angle and
+        # 25.0 is not the number that computation lands on. "Closer to
+        # nominal" is not a direction for a row whose nominal it does not
+        # compute, so what is asserted there is only that it did not move
+        # by more than a last bit, which the bound above already says.
+        assert abs(was - target) > 1e-13, (
+            f"{name}: {was} -> {now} moved AWAY from a nominal it was landing "
+            f"on to {abs(was - target):.1e} mm. The bore's own frame is the "
+            "better-conditioned one; a row drifting off an exact answer is a "
+            "different change wearing this one's coat"
+        )
+    assert closer == 7, (
+        f"seven of the eight moved TOWARDS their exact nominal dimension; "
+        f"{closer} do now. That direction is the evidence that the bore's "
+        "frame is better conditioned rather than merely different"
+    )
+
+
+def test_d19r5_no_answer_moves_under_a_composed_rigid_motion(fixtures_dir: Path):
+    """The whole corpus under :data:`D19R5_COMPOSED` — the probe that
+    would have caught round 5's blocker 1, and did not exist.
+
+    This is `test_d19r4_the_corpus_is_invariant_under_rotation` with the
+    one thing round 4 left out: the motions compose, and they go far
+    enough out to be an assembly export. Under round 4's code SIX of
+    these 620 minings move, and every one of them is a countersink
+    capping at its own apex — see
+    `test_d19r5_a_composed_motion_capped_the_countersink_at_its_apex`,
+    which pins the six by name and by number.
+    """
+    for step in sorted(fixtures_dir.glob("*.step")):
+        with _silence_stdout_fd():
+            shape = _load_step_shape(str(step))
+            upright = _rigid_invariants(mine_cylindrical_holes(shape))
+            for label, steps in D19R5_COMPOSED:
+                moved = _rigid_invariants(
+                    mine_cylindrical_holes(_composed(shape, steps))
+                )
+                assert _same_invariants(upright, moved), (
+                    f"{step.stem} answers differently after {label}:\n"
+                    f"  upright {upright}\n  moved   {moved}"
+                )
+
+
+def test_d19r5_a_composed_motion_capped_the_countersink_at_its_apex(
+    fixtures_dir: Path,
+):
+    """Blocker 1, by name and by number, on both sides of the fix.
+
+    The rule round 4 shipped — the smaller derivative as an absolute
+    length against 1e-4 mm — is replayed here through the WORLD-FRAME
+    intersection it was shipped with, because that pairing is the defect
+    and neither half is it alone. Under that pairing:
+
+    - ``countersunk_blind_bore`` reads 7.000209 against a true 11.0. The
+      bore's entry is then 4 mm inside solid metal and its depth is 36 %
+      short — an UNDER-quote, which is the direction the module treats as
+      the worse one because it never appears in a reasoning log.
+    - ``countersunk_through_bore`` reads 13.0002 against a true 17.0.
+
+    Both are the most ordinary feature in the corpus, both are committed
+    fixtures, and the motion is a rotation of a few degrees followed by a
+    translation smaller than a machine tool's own frame.
+    """
+    motions = [
+        ("rotate 17° about Y, then 12.345 m along X", 0),
+        ("rotate 13.5° about (2,-1,3), then 12.345 m along X", 0),
+        ("12.345 m along X, then rotate 13.5° about (2,-1,3)", 0),
+    ]
+    by_label = dict(D19R5_COMPOSED)
+    truth = {"countersunk_blind_bore": 11.0, "countersunk_through_bore": 17.0}
+
+    broken = {}
+    with _as_shipped(_round4_crossing_normal):
+        for name in truth:
+            with _silence_stdout_fd():
+                shape = _load_step_shape(str(fixtures_dir / f"{name}.step"))
+                for label, _ in motions:
+                    holes = mine_cylindrical_holes(_composed(shape, by_label[label]))
+                    assert len(holes) == 1, (name, label, holes)
+                    broken[(name, label)] = holes[0].depth_mm
+
+    apex = {"countersunk_blind_bore": 7.0, "countersunk_through_bore": 13.0}
+    wrong = {k: v for k, v in broken.items() if abs(v - truth[k[0]]) > 1e-3}
+    assert len(wrong) == 5, (
+        "five of these six pairings were wrong when round 5 opened — the "
+        f"blind bore under all three motions and the through bore under two. Got {wrong}"
+    )
+    for (name, _label), got in wrong.items():
+        assert got == pytest.approx(apex[name], abs=1e-3), (name, got)
+        assert got < truth[name], (
+            f"{name}: capping at the apex is an UNDER-quote by construction — "
+            f"{got} against {truth[name]}"
+        )
+
+    # THE FRAME IS THE FIX, and round 5's intrinsic floor is not. Put the
+    # floor round 5 ships — a fraction of the bore's radius, judged
+    # against the isoline's real extent — back on top of the WORLD-frame
+    # intersection and every one of those five answers is still wrong, to
+    # the same micron. A root the intersector has already placed 1.13e-4
+    # mm off the apex is genuinely 1.13e-4 mm off the apex; no floor can
+    # recover an apex from a root that is not on one.
+    import aberp_cad_extract.holes as holes_mod
+
+    with _as_shipped(holes_mod._crossing_normal):
+        for name in truth:
+            with _silence_stdout_fd():
+                shape = _load_step_shape(str(fixtures_dir / f"{name}.step"))
+                for label, _ in motions:
+                    if (name, label) not in wrong:
+                        continue
+                    holes = mine_cylindrical_holes(_composed(shape, by_label[label]))
+                    assert len(holes) == 1, (name, label)
+                    assert holes[0].depth_mm == pytest.approx(
+                        broken[(name, label)], abs=1e-6
+                    ), (
+                        f"{name} under {label}: round 5's floor on round 4's "
+                        "frame answers "
+                        f"{holes[0].depth_mm}, not {broken[(name, label)]}. If "
+                        "the floor alone now rescues this, the claim that the "
+                        "FRAME is the fix has stopped being true and the "
+                        "constant's docstring is wrong"
+                    )
+
+    # And the same six, in the bore's own frame.
+    for name, want in truth.items():
+        with _silence_stdout_fd():
+            shape = _load_step_shape(str(fixtures_dir / f"{name}.step"))
+            for label, _ in motions:
+                holes = mine_cylindrical_holes(_composed(shape, by_label[label]))
+                assert len(holes) == 1, (name, label)
+                assert holes[0].depth_mm == pytest.approx(want, abs=TOL), (
+                    name,
+                    label,
+                    holes[0].depth_mm,
+                )
+
+
+def test_d19r5_the_collapsed_isoline_gap_is_measured_not_claimed(
+    fixtures_dir: Path,
+):
+    """Both sides of the degeneracy gap, computed.
+
+    Round 4 recorded the gap in a docstring — "every COLLAPSED isoline
+    measures at most 2.4e-07 mm; every LIVE one at least 1.0 mm. Three
+    and a half orders of margin below" — and nothing measured it, so when
+    composing two motions pushed the worst collapsed isoline to
+    1.13e-04 mm the claim went on reading true. It was not: the floor it
+    was compared against was 1e-4, so the real headroom was 1.10x on the
+    WRONG side.
+
+    So this test computes the two populations rather than describing
+    them, over the whole corpus under composed motions, on both the
+    world-frame path and the bore-frame one:
+
+    - IN THE WORLD FRAME the worst collapsed isoline exceeds 1e-4 mm.
+      That is the mechanism, stated as a number: the intersector's
+      absolute error grows with the coordinates, so the root it hands
+      back is not on the apex any more, and a root a tenth of a micron
+      off the apex reads as an ordinary point of the cone.
+    - IN THE BORE'S FRAME the same worst case is under 1e-8 mm, against a
+      live minimum of 1.0 mm — because the coordinates the intersector is
+      handed are now the PART's, not the part's distance from the world
+      origin.
+
+    The floor is a fraction of the bore's radius, which on this corpus is
+    between 5e-7 and 1.5e-5 mm, and it sits in a gap eight orders wide.
+    """
+    import aberp_cad_extract.holes as holes_mod
+    from OCP.GeomLProp import GeomLProp_SLProps
+
+    def spans(in_frame):
+        seen = []
+        original = holes_mod._crossing_normal
+
+        def spy(surface, u, v, direction, radius):
+            props = GeomLProp_SLProps(surface, u, v, 1, 1e-7)
+            d_u, d_v = props.D1U(), props.D1V()
+            seen.append(
+                math.sqrt(d_u.X() ** 2 + d_u.Y() ** 2 + d_u.Z() ** 2)
+            )
+            seen.append(
+                math.sqrt(d_v.X() ** 2 + d_v.Y() ** 2 + d_v.Z() ** 2)
+            )
+            return original(surface, u, v, direction, radius)
+
+        holes_mod._crossing_normal = spy
+        try:
+            for step in sorted(fixtures_dir.glob("*.step")):
+                with _silence_stdout_fd():
+                    shape = _load_step_shape(str(step))
+                    for _label, steps in D19R5_COMPOSED[:4]:
+                        moved = _composed(shape, steps)
+                        if in_frame:
+                            mine_cylindrical_holes(moved)
+                        else:
+                            with _as_shipped(spy):
+                                mine_cylindrical_holes(moved)
+        finally:
+            holes_mod._crossing_normal = original
+        return seen
+
+    def gap(values):
+        """(worst collapsed, smallest live), split at a millimetre — a
+        line no measurement lands anywhere near, which is the point."""
+        low = [v for v in values if v < 1e-2]
+        live = [v for v in values if v >= 1e-2]
+        return (max(low) if low else 0.0), (min(live) if live else float("inf"))
+
+    world_worst, world_live = gap(spans(in_frame=False))
+    frame_worst, frame_live = gap(spans(in_frame=True))
+
+    assert world_worst > 1e-4, (
+        "in the WORLD frame the worst collapsed isoline must exceed the "
+        f"1e-4 mm floor round 4 set for it — that is blocker 1. Got "
+        f"{world_worst:.3e}, so this probe is no longer showing it"
+    )
+    assert frame_worst < 1e-8, (
+        f"in the BORE'S frame the worst collapsed isoline is {frame_worst:.3e} "
+        "mm, which is not the part's own precision any more. Something has "
+        "put world coordinates back into the intersection"
+    )
+    assert frame_live > 0.99 and world_live > 0.99, (
+        f"a LIVE isoline may not get small: {frame_live:.3e} in frame, "
+        f"{world_live:.3e} in world. The axis meets a cone it is not coaxial "
+        "with on the flank, where the isoline is a circle of the order of the "
+        "bore's radius"
+    )
+    assert frame_live / frame_worst > 1e8, (
+        f"the gap is {frame_live / frame_worst:.2e} wide. It was 1.10x, on "
+        "the wrong side, when this branch opened; a floor set inside a gap "
+        "this size is a degeneracy floor and not a tuned number"
+    )
+
+
+def _world_box_reaches_point(face, point, reach):
+    """`_has_flat_bottom`'s lateral test as rounds 1 to 4 shipped it: a
+    WORLD-AXIS bounding box of the face, inflated by the bore's radius on
+    each of the three world axes.
+
+    Kept so that "a box of a face is not a property of that face" stays a
+    measurement rather than a sentence.
+    """
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+
+    box = Bnd_Box()
+    BRepBndLib.Add_s(face, box)
+    if box.IsVoid():
+        return False
+    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+    return (
+        xmin - reach <= point[0] <= xmax + reach
+        and ymin - reach <= point[1] <= ymax + reach
+        and zmin - reach <= point[2] <= zmax + reach
+    )
+
+
+def _ball_nose_beside_a_coplanar_slot(spin_deg):
+    """A Ø8 ball-nose blind pocket on (20,20) of a 60 x 60 x 20 plate, with
+    a slot elsewhere on the plate whose FLOOR lies in the same plane as the
+    lowest point of the ball nose — and the whole part spun about the
+    BORE'S OWN AXIS.
+
+    Spinning a part about the axis of one of its own bores moves no point
+    of that bore relative to any point of the part. Every property of the
+    hole is therefore the same at every angle, by construction, and that
+    is what makes this the right probe: there is nothing to argue about
+    in the geometry, so any answer that moves is the rule reading the
+    world instead of the part.
+
+    The slot is 1 mm clear of the bore laterally and never touches it. Its
+    floor is a real planar face perpendicular to the bore's axis at the
+    bore's own closed end, which is exactly the shape of face
+    `_has_flat_bottom` has to judge — and judging it by a world-axis box
+    turns the box by up to sqrt(2) as the part spins.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCylinder,
+        BRepPrimAPI_MakeSphere,
+    )
+    from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf
+
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 60.0, 20.0).Shape()
+    shaft = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(20.0, 20.0, 12.0), gp_Dir(0, 0, 1)), 4.0, 20.0
+    ).Shape()
+    nose = BRepPrimAPI_MakeSphere(gp_Pnt(20.0, 20.0, 12.0), 4.0).Shape()
+    slot = BRepPrimAPI_MakeBox(gp_Pnt(25.0, 19.0, 8.0), 31.0, 2.0, 20.0).Shape()
+    part = BRepAlgoAPI_Cut(
+        BRepAlgoAPI_Cut(block, BRepAlgoAPI_Fuse(shaft, nose).Shape()).Shape(), slot
+    ).Shape()
+    spin = gp_Trsf()
+    spin.SetRotation(
+        gp_Ax1(gp_Pnt(20.0, 20.0, 0.0), gp_Dir(0, 0, 1)), math.radians(spin_deg)
+    )
+    return BRepBuilderAPI_Transform(part, spin, True).Shape()
+
+
+def test_d19r5_a_spun_part_does_not_grow_a_flat_bottom():
+    """Blocker 2: `flat_bottom` flipped when the part span about the
+    BORE'S OWN AXIS.
+
+    A ball nose is round. A flat-bottom drill and a 118° point are
+    different cycles at different rates, so `flat_bottom` is a price, and
+    Part C will read it. Rounds 1 to 4 decided the LATERAL half of it —
+    does this planar face actually reach the bore — from a world-axis
+    `Bnd_Box` of the face inflated by the bore's radius. A world-axis box
+    of a face is not a property of that face: turn the part and the box
+    turns and grows and shrinks with it, by up to sqrt(2) in each axis.
+
+    So on the part above the answer walks: False at 0°, True from 30° to
+    60°, False at 75° and 90°, True again at 135°. Fourteen angles, five
+    of them wrong, on a part that has not changed at all — spinning a part
+    about the axis of one of its own bores is the identity as far as that
+    bore is concerned.
+
+    The fix is to ask the FACE for a DISTANCE instead
+    (:func:`holes._face_reaches_point`), which a rigid motion cannot
+    change. A box in the BORE'S frame would not have been enough and this
+    pins that too: `gp_Ax3(P, Dir)`'s X direction is an arbitrary choice
+    of OCCT's, so a frame box only relocates the arbitrariness — the
+    lateral question is radial and only the face can answer it.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    turns = (0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 45.0, 50.0, 60.0, 75.0, 90.0,
+             135.0, 180.0)
+
+    def verdicts():
+        out = {}
+        for deg in turns:
+            with _silence_stdout_fd():
+                holes = mine_cylindrical_holes(_ball_nose_beside_a_coplanar_slot(deg))
+            assert len(holes) == 1, (deg, holes)
+            out[deg] = (holes[0].depth_mm, holes[0].flat_bottom)
+        return out
+
+    original = holes_mod._face_reaches_point
+    holes_mod._face_reaches_point = _world_box_reaches_point
+    try:
+        was = verdicts()
+    finally:
+        holes_mod._face_reaches_point = original
+
+    phantom = sorted(deg for deg, (_d, flat) in was.items() if flat)
+    assert phantom == [30.0, 40.0, 45.0, 50.0, 60.0, 135.0], (
+        "the world box must still grow a phantom flat bottom on this part, "
+        f"or this probe is not showing blocker 2 any more; got {phantom}"
+    )
+
+    now = verdicts()
+    for deg in turns:
+        depth, flat = now[deg]
+        assert depth == pytest.approx(12.0, abs=TOL), (deg, depth)
+        assert flat is False, (
+            f"a ball nose is round at every angle; at {deg}° it is priced as a "
+            "flat-bottom drill"
+        )
+    assert {d for d, _f in now.values()} == {now[0.0][0]}, (
+        f"the depth may not move either: {now}"
+    )
+
+
+def test_d19r5_the_isoline_extent_does_not_depend_on_the_sample_count(
+    fixtures_dir: Path,
+):
+    """:data:`holes.ISOLINE_EXTENT_SAMPLES` is not a convergence knob.
+
+    The extent of an isoline is a maximum over a curve and this samples
+    it, so the honest worry is that the answer is being read off a
+    sampling density. It is not, and the reason is geometric rather than
+    numerical: on every surface the miner meets, the collapsed parameter
+    is the one swept ABOUT the bore's axis, so a LIVE isoline there is a
+    closed circle of the order of the bore's radius and any two samples a
+    half-turn apart already measure it at its diameter, while a COLLAPSED
+    one is a point at any density at all. Walked from 4 to 64 here,
+    against the countersink and the drill point that live on either side
+    of the distinction.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    names = {
+        "countersunk_blind_bore": 11.0,
+        "countersunk_through_bore": 17.0,
+        "blind_hole_drill_point": None,
+        "ball_nose_blind_bore": 16.0,
+        "blind_bore_under_dome": None,
+    }
+    shapes = {}
+    for name in names:
+        with _silence_stdout_fd():
+            shapes[name] = _load_step_shape(str(fixtures_dir / f"{name}.step"))
+
+    def verdicts():
+        out = {}
+        for name, shape in shapes.items():
+            for label, steps in (("upright", []), D19R5_COMPOSED[5]):
+                with _silence_stdout_fd():
+                    holes = mine_cylindrical_holes(_composed(shape, steps))
+                out[(name, label)] = _rigid_invariants(holes)
+        return out
+
+    reference = verdicts()
+    for name, want in names.items():
+        if want is not None:
+            got = reference[(name, "upright")]
+            assert got[0][1] == pytest.approx(want, abs=TOL), (name, got)
+
+    original = holes_mod.ISOLINE_EXTENT_SAMPLES
+    try:
+        for samples in (4, 5, 8, 16, 32, 64):
+            holes_mod.ISOLINE_EXTENT_SAMPLES = samples
+            assert verdicts() == reference, (
+                f"{samples} samples answers differently from {original}. The "
+                "extent is a diameter against a point; nothing here converges"
+            )
+    finally:
+        holes_mod.ISOLINE_EXTENT_SAMPLES = original
+
+
+def test_d19r5_the_only_world_axis_box_left_is_read_on_the_bores_own_axis():
+    """The class, closed structurally: no world-frame ruler decides
+    anything in `holes.py` any more.
+
+    Prose cannot carry this — the whole finding of round 5 is that round
+    4 fixed two instances of a class and a docstring implied it had fixed
+    the class. So the module is read, and every construction of a
+    bounding box in it is accounted for:
+
+    - :func:`holes._face_axial_span` builds ONE, and builds it of a patch
+      already moved into `gp_Ax3(bore origin, bore direction)`. Only the
+      box's Z range is read, and Z is the one direction of that frame the
+      BORE fixes; its X is an arbitrary choice of OCCT's and nothing may
+      depend on it.
+    - nothing else builds one. In particular `_has_flat_bottom` no longer
+      does — that was blocker 2 — and neither does `_AxisMaterial`, which
+      is where round 3 removed a box of the whole part.
+
+    A new `Bnd_Box` anywhere in this module fails here, and the way to
+    make it pass is to say which frame it is read in.
+    """
+    import inspect
+
+    import aberp_cad_extract.holes as holes_mod
+
+    source = inspect.getsource(holes_mod).splitlines()
+    builders = [
+        (n + 1, line.strip())
+        for n, line in enumerate(source)
+        if ("Bnd_Box()" in line or "BRepBndLib." in line)
+        and not line.lstrip().startswith("#")
+    ]
+    owner = inspect.getsource(holes_mod._face_axial_span)
+    for _line_no, line in builders:
+        assert line in owner, (
+            f"`{line}` builds or fills a bounding box outside "
+            "`_face_axial_span`. A world-axis box is not a property of the "
+            "geometry it bounds: it turns with the part. If the quantity is "
+            "axial, take it in the bore's frame and read only Z; if it is "
+            "lateral, it is radial and only the face can answer it — see "
+            "`_face_reaches_point`"
+        )
+    assert len(builders) == 2, (
+        f"`_face_axial_span` builds exactly one box in two lines; found "
+        f"{builders}"
+    )
+    assert "AddOptimal_s" in owner and "Add_s(" not in owner, (
+        "the surviving box is `AddOptimal`, which bounds the SURFACE; "
+        "`Add` bounds a B-spline by its poles and gave a NURBS twin a "
+        "different answer from its analytic original"
+    )
+
+
+
+def test_d19r5_the_intrinsic_floor_is_hardening_and_is_pinned_as_inert():
+    """:data:`holes.DEGENERATE_ISOLINE_FRACTION` moves no answer, and that
+    is asserted rather than assumed.
+
+    Round 5 fixed blocker 1 by moving the intersection into the bore's
+    frame, and separately made the collapse floor intrinsic — a fraction
+    of the bore's radius, judged against the isoline's real extent — for
+    reasons that are about the shape of the rule rather than about any
+    part in the corpus. Keeping a change that moves nothing is only
+    defensible if "it moves nothing" is a measurement, so here it is:
+    round 4's absolute 1e-4 mm floor, on round 5's frame, over a
+    countersunk bore swept across FOUR DECADES of radius — a Ø0.04
+    micro-drill to a Ø200 bore. Every pair agrees.
+
+    What the fraction buys is not visible here and is not claimed to be.
+    An absolute millimetre floor is a fiftieth of the micro-drill's radius
+    and a millionth of the Ø200's, so it holds the same relative
+    degeneracy to standards four decades apart; the corpus simply has
+    nothing that lands in the gap between them. The same posture
+    ``test_d19r2_the_void_slack_is_inert_and_is_pinned_as_inert`` takes,
+    for the same reason.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import (
+        BRepPrimAPI_MakeBox,
+        BRepPrimAPI_MakeCone,
+        BRepPrimAPI_MakeCylinder,
+    )
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    import aberp_cad_extract.holes as holes_mod
+
+    def countersunk(radius):
+        plate = max(20.0 * radius, 2.0)
+        depth = plate * 0.55
+        wide = max(60.0 * radius, 6.0)
+        block = BRepPrimAPI_MakeBox(
+            gp_Pnt(-wide / 2, -wide / 2, 0.0), wide, wide, plate
+        ).Shape()
+        bore = BRepPrimAPI_MakeCylinder(
+            gp_Ax2(gp_Pnt(0, 0, plate - depth), gp_Dir(0, 0, 1)), radius, depth + 1.0
+        ).Shape()
+        sink = BRepPrimAPI_MakeCone(
+            gp_Ax2(gp_Pnt(0, 0, plate - 2.0 * radius), gp_Dir(0, 0, 1)),
+            0.0,
+            2.0 * radius,
+            2.0 * radius,
+        ).Shape()
+        return BRepAlgoAPI_Cut(
+            BRepAlgoAPI_Cut(block, bore).Shape(), sink
+        ).Shape()
+
+    radii = (0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 4.0, 20.0, 100.0)
+    shapes = {r: countersunk(r) for r in radii}
+
+    def verdicts():
+        out = {}
+        for radius, shape in shapes.items():
+            with _silence_stdout_fd():
+                out[radius] = _rigid_invariants(mine_cylindrical_holes(shape))
+        return out
+
+    intrinsic = verdicts()
+    assert all(rows for rows in intrinsic.values()), (
+        f"every member of the sweep must yield a hole: {intrinsic}"
+    )
+
+    original = holes_mod._crossing_normal
+    holes_mod._crossing_normal = _round4_crossing_normal
+    try:
+        absolute = verdicts()
+    finally:
+        holes_mod._crossing_normal = original
+
+    assert absolute == intrinsic, (
+        "the intrinsic floor is not inert after all — it moves an answer "
+        "round 4's absolute one did not, across four decades of bore "
+        f"radius:\n  absolute {absolute}\n  intrinsic {intrinsic}. That is "
+        "not a failure, but it IS a claim the constant's docstring makes "
+        "the other way round, and one of the two has to change"
+    )
+
+
+def test_d19r5_the_lateral_basis_turns_with_the_part_but_keeps_its_hand():
+    """The one world-frame ruler left in the lateral rules, and why it
+    cannot move a verdict.
+
+    :func:`holes._perp_basis` builds the 2-D frame the mouth-ownership
+    test and the barrier tracks are measured in, and it builds it from the
+    WORLD axis least parallel to the bore. So the basis itself turns with
+    the part, and which world axis it picks changes DISCONTINUOUSLY as the
+    bore swings past 45°. That would be a defect of exactly the class
+    round 5 is closing, except for what is read through it: a signed area
+    (:func:`holes._mouth_owns_axis` asks which side of a chord the axis
+    falls on) and an interval union (:func:`holes._arc_union_length`).
+    Both are invariant under a COMMON rotation of the basis, and a common
+    rotation is all a change of pick can be — provided the pair keeps its
+    HANDEDNESS.
+
+    It does, and not by luck: ``e1`` is perpendicular to the bore and
+    ``e2 = direction x e1``, so ``e1 x e2 = direction`` identically. That
+    identity is the whole guarantee, so it is asserted here over a dense
+    sweep of directions including the ones that straddle a pick boundary —
+    a hand-flip would silently invert every sidedness test that reads it,
+    which is a wrong THROUGH rather than a wrong number.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    directions = []
+    for a in range(0, 360, 7):
+        for b in range(-89, 90, 11):
+            lat, lon = math.radians(b), math.radians(a)
+            directions.append(
+                (
+                    math.cos(lat) * math.cos(lon),
+                    math.cos(lat) * math.sin(lon),
+                    math.sin(lat),
+                )
+            )
+    # …and the exact straddles, where the pick changes.
+    root = 1.0 / math.sqrt(3.0)
+    directions += [
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+        (root, root, root),
+        (0.7071067811865476, 0.7071067811865476, 0.0),
+        (0.0, 0.7071067811865476, 0.7071067811865476),
+    ]
+
+    picks = set()
+    for d in directions:
+        d = holes_mod._unit(d)
+        e1, e2 = holes_mod._perp_basis(d)
+        picks.add(
+            min(
+                ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+                key=lambda a: abs(holes_mod._dot(a, d)),
+            )
+        )
+        for e in (e1, e2):
+            assert abs(math.sqrt(holes_mod._dot(e, e)) - 1.0) < 1e-12, (d, e)
+            assert abs(holes_mod._dot(e, d)) < 1e-12, (d, e)
+        assert abs(holes_mod._dot(e1, e2)) < 1e-12, (d, e1, e2)
+        hand = holes_mod._cross(e1, e2)
+        assert all(abs(hand[k] - d[k]) < 1e-12 for k in range(3)), (
+            f"e1 x e2 must BE the bore direction, and for {d} it is {hand}. A "
+            "left-handed pair inverts every signed area measured through this "
+            "basis, which is a wrong end condition and not a wrong number"
+        )
+    assert len(picks) == 3, (
+        "the sweep must actually cross all three picks, or it is not testing "
+        f"the discontinuity; it crossed {picks}"
+    )

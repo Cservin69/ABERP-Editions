@@ -357,8 +357,8 @@ the reader and 1.83 s is mining. Which is why ``DEFAULT_TIMEOUT`` is left
 at 30 s — raising it would buy headroom for the reader, not for this
 module, and that case should be argued from a measurement of the reader.
 
-The part is not upright (D-19 round 4)
----------------------------------------
+The part is not upright, and it is not at the origin (D-19 rounds 4–5)
+-----------------------------------------------------------------------
 
 Nothing above is allowed to depend on which way the part is facing. A
 hole is a property of the part, and a rigid motion cannot change one, so
@@ -387,6 +387,69 @@ The two rules, and both are stated in full where they live:
 
 ``test_d19r4_the_corpus_is_invariant_under_rotation`` runs the probe over
 the whole corpus, and it belongs on any rule added here from now on.
+
+Round 4 fixed those two and left the CLASS open, which is the more useful
+finding of round 5. The class is: any geometric verdict that reads the
+part's position or orientation in the WORLD rather than the part's own
+shape. Two more instances of it survived round 4 — one it had just
+written — and both were found the same way, by turning the part.
+
+- :func:`_cap_axis_intersections` intersected the axis with the cap's
+  surface in WORLD coordinates. ``GeomAPI_IntCS``'s absolute error grows
+  with the coordinates it is handed, so the countersink's apex root moved
+  1.13e-04 mm off the apex once the part was rotated AND translated 12 m,
+  which is further than the floor meant to recognise it — 11.0 mm of hole
+  read 7.000209, with its entry 4 mm inside solid metal. The intersection
+  runs in the bore's own frame now.
+- :func:`_has_flat_bottom` decided whether a planar face reached the bore
+  from a WORLD-axis ``Bnd_Box`` of that face. Spin a part about the axis
+  of one of its own bores — the identity, as far as that bore is
+  concerned — and the box turns and grows and the verdict flips: a
+  ball-nose floor priced as a flat drill at 30°, 45° and 135°, and not at
+  0°, 75° or 90°. It asks the face for a DISTANCE now.
+
+TWO THINGS ABOUT THE PROBE, both of them what round 4 was missing rather
+than what it got wrong, and both now permanent:
+
+- THE MOTIONS COMPOSE. Round 4's table applied one rotation OR one
+  translation at a time and every fixture passed it. A rotation puts the
+  bore's axis across the world axes; a translation then makes the
+  coordinates large IN THE DIRECTIONS THE ROTATION OPENED UP. It is the
+  product that breaks things, and the translations reach 15 m because a
+  part exported from an assembly carries the assembly's origin.
+  ``test_d19r5_no_answer_moves_under_a_composed_rigid_motion``.
+- THE MARGIN IS MEASURED. Round 4 recorded its degeneracy gap as "three
+  and a half orders" in a docstring, from a sample that never composed
+  the two motions, and nothing computed it. The real figure was 1.10x on
+  the wrong side of the floor.
+  ``test_d19r5_the_collapsed_isoline_gap_is_measured_not_claimed``
+  computes both sides of it.
+
+WHAT IS LEFT, and it is written down because the next round should not
+have to re-derive it. Three world-frame quantities remain in this module,
+all of them deliberate, none of them able to move a verdict:
+
+- :func:`_canonical_direction` forces the reported axis into a canonical
+  hemisphere OF THE WORLD FRAME, and :func:`_canonical_origin` puts the
+  zero of the axial parameter at the foot of the perpendicular from the
+  WORLD origin. Both pick a FRAME to report in, which is a determinism
+  choice (ADR-0112 S3) and not a measurement; neither is part of
+  :func:`_rigid_invariants`. The one thing the second could do is make
+  ``t`` large without making the part large — it does, for a part
+  translated along its own bore axis — so that motion is in the composed
+  sweep, at 15 m, and nothing moves.
+- :func:`_perp_basis` derives the lateral 2-D frame from the world axis
+  LEAST parallel to the bore, so the basis itself turns with the part.
+  Everything read through it is a SIGNED AREA or an interval union, and
+  both are invariant under a common rotation of the basis — which is what
+  this is, since ``(e1, e2, direction)`` is right-handed by construction
+  whichever world axis is picked. ``test_d19r5_the_lateral_basis_turns_
+  with_the_part_but_keeps_its_hand`` pins the handedness, which is the
+  part that would silently break the sign.
+- the surviving ``Bnd_Box`` in :func:`_face_axial_span`, which is taken
+  in the bore's frame and read only on Z — the one axis of that frame the
+  bore fixes. ``test_d19r5_the_only_world_axis_box_left_is_read_on_the_
+  bores_own_axis`` fails on any new box anywhere in the module.
 
 Contiguity (ADR-0112 adversarial, B3)
 --------------------------------------
@@ -461,8 +524,13 @@ try:
     from OCP.BRep import BRep_Tool
     from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
     from OCP.BRepBndLib import BRepBndLib
-    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_Transform
+    from OCP.BRepBuilderAPI import (
+        BRepBuilderAPI_MakeFace,
+        BRepBuilderAPI_MakeVertex,
+        BRepBuilderAPI_Transform,
+    )
     from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
     from OCP.BRepTools import BRepTools
     from OCP.Geom import Geom_Line
     from OCP.GeomAbs import GeomAbs_SurfaceType
@@ -555,41 +623,84 @@ MAX_MERGE_GAP_FLOOR_MM: float = 1.0
 #: distance a root may travel is bounded by ownership instead.
 CAP_OUTWARD_MIN_COS: float = 1e-6
 
-#: Under this many MILLIMETRES of surface travel per unit parameter, an
-#: isoline has collapsed to a single point. A cone's apex and a sphere's
-#: pole are both such points, and the miner meets both: a countersink's
-#: cone and a domed cap are each swept about the bore's own axis, so the
-#: axis lands exactly on the degeneracy.
+#: An isoline has COLLAPSED to a single point when the whole curve it
+#: sweeps over its own parameter range is shorter than this FRACTION of
+#: the bore's own radius. A cone's apex and a sphere's pole are both such
+#: points, and the miner meets both: a countersink's cone and a domed cap
+#: are each swept about the bore's own axis, so the axis lands exactly on
+#: the degeneracy.
 #:
-#: A LENGTH, and D-19 round 4 is the whole of that word. This used to be
-#: a RATIO between the two derivative magnitudes at the point, at 1e-9 —
-#: and the two are not commensurable. On a surface of revolution the
-#: collapsed derivative is the root's own distance from the axis in mm
-#: while its partner is O(1) mm per mm, so "a ratio under 1e-9" really
-#: read "is this root within a NANOMETRE of the apex" — a question only
-#: a part whose bore runs down a world axis can answer yes to.
+#: A RATIO OF TWO LENGTHS BELONGING TO THE PART, and D-19 round 5 is the
+#: whole of that phrase. The quantity has now been wrong twice, in two
+#: different ways, and the two are worth keeping apart:
 #:
-#: `GeomAPI_IntCS` lands the apex root at 5e-16 mm off the axis on an
-#: upright ``countersunk_blind_bore`` and at 2.4e-07 mm off it once the
-#: part is rotated: still a quarter of a nanometre, still unambiguously
-#: the apex, and 240 times over a floor set at 1e-9. So the cone was read
-#: as an ordinary point, OCCT handed back the normal of whichever
-#: generatrix the intersector landed on, and the countersink capped the
-#: bore AT ITS APEX — 7.0 mm deep against a true 11.0, entry 4 mm inside
-#: solid metal, on the most ordinary feature in the corpus. Bistable with
-#: orientation, not monotone: right at 0°, wrong at 1°, right at 5° and
-#: 45° and 89°, wrong from 89.9° to 90.01°, right at 90.1°, wrong at
-#: 135° and 180°. `test_d19r4_a_collapsed_isoline_is_a_length_not_a_ratio`
-#: is that sweep.
+#: - Round 3 made it a RATIO BETWEEN THE TWO DERIVATIVES at the point, at
+#:   1e-9. They are not commensurable — on a surface of revolution the
+#:   collapsed derivative is the root's own distance from the axis in mm
+#:   while its partner is O(1) mm per mm — so it really read "is this root
+#:   within a NANOMETRE of the apex", which only a part whose bore runs
+#:   down a world axis can answer yes to.
+#: - Round 4 made it an ABSOLUTE LENGTH, at 1e-4 mm. That fixed the
+#:   incommensurability and left the number EXTRINSIC: it was compared
+#:   against a derivative computed from a root ``GeomAPI_IntCS`` had
+#:   placed in WORLD coordinates, and that intersector's absolute error
+#:   grows with the coordinates. Measured across the corpus under nine
+#:   world-frame motions, the worst collapsed isoline came in at
+#:   1.13e-04 mm — ABOVE the floor meant to catch it, 1.10x of it — so
+#:   the margin round 4 recorded as "three and a half orders" was in fact
+#:   negative, and composing a rotation with a translation from round 4's
+#:   own motion table put ``countersunk_blind_bore`` at 7.000209 mm
+#:   against a true 11.0, entry 4 mm inside solid metal.
 #:
-#: A degeneracy floor, not a tuning knob, and measured across the whole
-#: corpus under nine orientations — 5401 roots. Every COLLAPSED isoline
-#: measures at most 2.4e-07 mm; every LIVE one at least 1.0 mm. Three and
-#: a half orders of margin below, four above, and nothing whatever in
-#: between. A live isoline cannot get small, either: the axis meets a
-#: cone it is NOT coaxial with on the flank, where the isoline is a
-#: circle of the order of the bore's own radius.
-DEGENERATE_ISOLINE_SPAN_MM: float = 1e-4
+#: WHAT ACTUALLY FIXES IT is not this constant, and saying so is the
+#: point of the paragraph. :func:`_cap_axis_intersections` now runs the
+#: intersection IN THE BORE'S FRAME, so the root lands on the apex to the
+#: part's own precision instead of to its distance from the world origin:
+#: the same worst case measures 5.5e-10 mm in frame against 1.13e-04 mm
+#: in the world, and every wrong answer goes with it. Keep the frame and
+#: put round 4's absolute 1e-4 mm floor back and the corpus does not move
+#: — ``test_d19r5_the_intrinsic_floor_is_hardening_and_is_pinned_as_inert``
+#: is that measurement, taken rather than guessed.
+#:
+#: So this constant is HARDENING, and it is kept as hardening rather than
+#: dropped, in the same posture :func:`_void_slack` takes: "this change
+#: moves nothing" is a claim about the fix and has to be pinned, not
+#: written down. What it removes is two dependencies the answer had no
+#: business having, neither of which the corpus happens to exercise:
+#:
+#: - a fixed MILLIMETRE figure judging a question of shape. 1e-4 mm is a
+#:   fiftieth of a Ø0.01 micro-drill's radius and a millionth of a Ø200
+#:   bore's; the same relative degeneracy was being held to standards four
+#:   decades apart. A fraction of the radius is one standard at every size.
+#: - a DERIVATIVE, which is a property of the parametrisation and not of
+#:   the surface. Rewrite a cap's "around" parameter from 0..2π to 0..1
+#:   and every derivative along it grows by 2π while nothing moves. The
+#:   isoline's real EXTENT over its range (:func:`_isoline_extent`) is the
+#:   same length either way.
+#:
+#: A degeneracy floor, not a tuning knob, and measured rather than
+#: asserted: ``test_d19r5_the_collapsed_isoline_gap_is_measured_not_claimed``
+#: walks the whole corpus under composed rotations and translations and
+#: reports both sides of the gap. A live isoline cannot get small either —
+#: the axis meets a cone it is NOT coaxial with on the flank, where the
+#: isoline is a circle of the order of the bore's own radius — so the two
+#: populations are separated by the bore's own size in both directions.
+DEGENERATE_ISOLINE_FRACTION: float = 1e-6
+
+#: How many points along an isoline's parameter range :func:`_isoline_extent`
+#: measures its travel at.
+#:
+#: The quantity being estimated is a MAXIMUM over a curve, so sampling can
+#: only ever under-report it, and under-reporting is the direction that
+#: calls a live isoline collapsed. That is why the number is not 2. On
+#: every surface the miner meets the collapsed parameter is the one swept
+#: ABOUT the bore's axis, so a live isoline there is a full circle and any
+#: two antipodal samples already measure it at its diameter; nine points
+#: over the range cannot land on one point of a circle. It is not a
+#: convergence parameter and nothing is refined —
+#: ``test_d19r5_the_isoline_extent_does_not_depend_on_the_sample_count``
+#: walks it from 4 to 64 without moving an answer.
+ISOLINE_EXTENT_SAMPLES: int = 8
 
 #: How far out of ONE PLANE, as a sine, the isoline tangents around a
 #: collapsed isoline may lie before that point is ruled to have no
@@ -1462,7 +1573,53 @@ def _degenerate_point_normal(
     return normal
 
 
-def _crossing_normal(surface, u, v, direction) -> Optional[Tuple[float, float, float]]:
+def _isoline_extent(surface, u, v, along_u, lo, hi) -> Optional[float]:
+    """How far, in MILLIMETRES, the isoline through ``(u, v)`` actually
+    travels over its own parameter range — or ``None`` when that range is
+    not a finite one.
+
+    The question :func:`_crossing_normal` needs answered is whether the
+    curve the surface sweeps in one parameter is a CURVE or a POINT, and
+    that is a property of the curve, not of the parametrisation it was
+    written in. A derivative is not: reparametrise a cap's "around"
+    direction from 0..2π to 0..1 and every derivative along it grows by
+    2π while the geometry does not move at all. So this measures the
+    curve, as the furthest any point of it gets from the root, and
+    :data:`DEGENERATE_ISOLINE_FRACTION` compares that against the bore's
+    own radius — two lengths, both belonging to the part.
+
+    Sampled rather than integrated, at :data:`ISOLINE_EXTENT_SAMPLES`
+    steps, and the direction of that approximation is the safe one: a
+    sampled maximum can only UNDER-report the true extent, and
+    under-reporting reads "collapsed", which refuses a root and leaves the
+    bore's own parametric end standing — the over-price direction, the
+    visible one. The margin is not near: on every surface the miner meets,
+    the collapsed parameter is the one swept ABOUT the bore's axis, so a
+    LIVE isoline there is a closed circle of the order of the bore's
+    radius and any two samples a half-turn apart already measure it at its
+    diameter.
+
+    ``None`` for a non-finite range — a cone's or a cylinder's generatrix
+    runs to infinity — and that reads NOT COLLAPSED, which is what an
+    infinite curve is.
+    """
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+        return None
+    try:
+        here = surface.Value(u, v)
+        far = 0.0
+        for k in range(ISOLINE_EXTENT_SAMPLES + 1):
+            w = lo + (hi - lo) * (k / ISOLINE_EXTENT_SAMPLES)
+            there = surface.Value(w, v) if along_u else surface.Value(u, w)
+            far = max(far, float(here.Distance(there)))
+    except Exception:  # noqa: BLE001 — a surface that stops answering has no extent
+        return None
+    return far
+
+
+def _crossing_normal(
+    surface, u, v, direction, radius
+) -> Optional[Tuple[float, float, float]]:
     """The surface normal where the bore's axis CROSSES ``surface`` at
     ``(u, v)`` — or ``None`` when the axis only TOUCHES it there.
 
@@ -1510,22 +1667,22 @@ def _crossing_normal(surface, u, v, direction) -> Optional[Tuple[float, float, f
     and was kept. Both are conical points, neither is a cap, and neither
     is special-cased now.
     """
-    props = GeomLProp_SLProps(surface, u, v, 1, 1e-7)
-    d_u, d_v = props.D1U(), props.D1V()
-    mag_u = math.sqrt(d_u.X() ** 2 + d_u.Y() ** 2 + d_u.Z() ** 2)
-    mag_v = math.sqrt(d_v.X() ** 2 + d_v.Y() ** 2 + d_v.Z() ** 2)
-
     u_min, u_max, v_min, v_max = surface.Bounds()
-    # Which isoline has COLLAPSED, asked as a length in mm rather than as
-    # a ratio between two derivatives that are not commensurable — see
-    # :data:`DEGENERATE_ISOLINE_SPAN_MM`, which is where the rotated
-    # countersink went wrong.
-    if mag_u <= DEGENERATE_ISOLINE_SPAN_MM:
+    # Which isoline has COLLAPSED, asked of the CURVE — how far it really
+    # travels over its own parameter range, against the bore's own radius
+    # — rather than of a derivative against a millimetre figure. See
+    # :data:`DEGENERATE_ISOLINE_FRACTION` for both of the ways that number
+    # was extrinsic, and :func:`_isoline_extent` for what replaced it.
+    floor = DEGENERATE_ISOLINE_FRACTION * radius
+    span_u = _isoline_extent(surface, u, v, True, u_min, u_max)
+    span_v = _isoline_extent(surface, u, v, False, v_min, v_max)
+    if span_u is not None and span_u <= floor and (span_v is None or span_u <= span_v):
         lo, hi, along_u = u_min, u_max, True
-    elif mag_v <= DEGENERATE_ISOLINE_SPAN_MM:
+    elif span_v is not None and span_v <= floor:
         lo, hi, along_u = v_min, v_max, False
     else:
         # A regular point. OCCT's own normal is trustworthy here.
+        props = GeomLProp_SLProps(surface, u, v, 1, 1e-7)
         if not props.IsNormalDefined():
             return None
         n = props.Normal()
@@ -1553,7 +1710,7 @@ def _crossing_normal(surface, u, v, direction) -> Optional[Tuple[float, float, f
 
 
 def _cap_axis_intersections(
-    face, origin, direction
+    face, origin, direction, radius
 ) -> List[Tuple[float, Tuple[float, float, float]]]:
     """Every point where the bore's axis CROSSES this face's UNBOUNDED
     surface, as an axial parameter paired with the surface normal there,
@@ -1604,38 +1761,61 @@ def _cap_axis_intersections(
     surface = BRep_Tool.Surface_s(face)
     if surface is None:
         return []
-    line = Geom_Line(
-        gp_Ax1(
-            gp_Pnt(origin[0], origin[1], origin[2]),
-            gp_Dir(direction[0], direction[1], direction[2]),
+    try:
+        frame = gp_Trsf()
+        frame.SetTransformation(
+            gp_Ax3(
+                gp_Pnt(origin[0], origin[1], origin[2]),
+                gp_Dir(direction[0], direction[1], direction[2]),
+            )
         )
-    )
-    intersector = GeomAPI_IntCS(line, surface)
+        local = surface.Transformed(frame)
+    except Exception:  # noqa: BLE001 — a surface OCCT will not move has no roots
+        return []
+    # IN THE BORE'S FRAME, and D-19 round 5 blocker 1 is the whole of that
+    # phrase. ``GeomAPI_IntCS``'s absolute error grows with the
+    # coordinates it is handed, and everything downstream of a root — the
+    # collapsed-isoline test above all — is a question about the part's
+    # own size. Asked in the world frame, the two are not the same
+    # quantity: the apex of ``countersunk_blind_bore``'s countersink lands
+    # 5e-16 mm off the axis with the part at the origin and 1.13e-04 mm
+    # off it once the part is rotated AND translated 12.3 m — which is an
+    # assembly-exported STEP coordinate, not a contrived one — and at
+    # 1.13e-04 the apex stops reading as an apex, the cone caps the bore
+    # at its own point, and 11.0 mm of hole becomes 7.000209 with its
+    # entry 4 mm inside solid metal.
+    #
+    # Moving the surface into the frame whose origin is the bore's and
+    # whose Z is the bore's axis bounds that error by the PART's size
+    # instead. Measured over the corpus under composed rotations and
+    # translations, the worst collapsed isoline goes from 1.13e-04 mm to
+    # 5.5e-10 mm, against a live minimum that does not move — see
+    # ``test_d19r5_the_collapsed_isoline_gap_is_measured_not_claimed``.
+    #
+    # The same frame :func:`_face_axial_span` already uses, and read the
+    # same way: the frame's Z IS the bore's axial parameter, so the root's
+    # own Z is ``t`` with no projection to do. Only Z is read, and Z is
+    # the one direction of ``gp_Ax3(P, Dir)`` that is fixed by the bore —
+    # its X is an arbitrary choice of OCCT's and nothing here may depend
+    # on it. The NORMAL does not: it is carried back to the world frame,
+    # where the openness verdict lives.
+    line = Geom_Line(gp_Ax1(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(0.0, 0.0, 1.0)))
+    intersector = GeomAPI_IntCS(line, local)
     if not intersector.IsDone():
         return []
+    back = frame.Inverted()
     roots: List[Tuple[float, Tuple[float, float, float]]] = []
     for i in range(1, intersector.NbPoints() + 1):
         u, v, _w = intersector.Parameters(i)
-        normal = _crossing_normal(surface, u, v, direction)
+        normal = _crossing_normal(local, u, v, (0.0, 0.0, 1.0), radius)
         if normal is None:
             continue
         p = intersector.Point(i)
-        # The axial parameter is taken from the POINT rather than from
-        # the line parameter ``_w`` the intersector also returns. They are
-        # the same number — ``Geom_Line`` is unit-speed from ``origin``
-        # along ``direction`` — and this is the arithmetic that was here
-        # before, kept so that no answer moves by a last bit.
+        world = gp_Vec(normal[0], normal[1], normal[2]).Transformed(back)
         roots.append(
             (
-                _dot(
-                    (
-                        float(p.X()) - origin[0],
-                        float(p.Y()) - origin[1],
-                        float(p.Z()) - origin[2],
-                    ),
-                    direction,
-                ),
-                normal,
+                float(p.Z()),
+                _unit((float(world.X()), float(world.Y()), float(world.Z()))),
             )
         )
     return roots
@@ -3287,7 +3467,9 @@ def _walk_caps(
                     key = end.note_mouth(face, edge)
                     roots = [
                         root
-                        for root in _cap_axis_intersections(face, origin, direction)
+                        for root in _cap_axis_intersections(
+                            face, origin, direction, group.radius
+                        )
                         if (root[0] <= far if at_low else root[0] >= far)
                     ]
                     if not roots:
@@ -3360,6 +3542,51 @@ def _classify_ends(lo_open: bool, hi_open: bool) -> HoleEndCondition:
     return HoleEndCondition.UNKNOWN
 
 
+def _face_reaches_point(face, point, reach: float) -> bool:
+    """Does ``face`` come within ``reach`` of ``point``, laterally?
+
+    Asked of the face's own trim rather than of a box around it, because a
+    box is drawn on axes the face knows nothing about — see
+    :func:`_has_flat_bottom`, whose lateral test this is.
+
+    The distance from the point to the TRIMMED face is what is measured,
+    which is zero where the point lands on the face and the gap to the
+    nearest rim where it does not. Both are wanted, and the second is the
+    one the counterbore needs: the floor of an annular counterbore does
+    not contain its own centre — the pilot bore does — so its centre is
+    OUT of that face by exactly the pilot radius, which is less than the
+    counterbore's own radius and therefore inside its reach.
+
+    A point classification will not do this job, which is worth recording
+    because it is the more obvious tool and it was tried:
+    ``BRepClass_FaceClassifier``'s tolerance is not a reach, and it
+    answers OUT for the centre of ``bore_over_centre_post``'s annular
+    floor at every tolerance from 1e-7 to 15 mm. A DISTANCE is the
+    quantity the rule was always describing.
+
+    Nothing here is drawn on a world axis, and that is the point of it:
+    :func:`_has_flat_bottom` has already established that the face's plane
+    passes through the bore's closed end, so this distance is purely
+    LATERAL, and a distance between two pieces of geometry is what a rigid
+    motion cannot change.
+
+    False for anything OCCT declines to answer, which reads "no flat
+    bottom", the conservative direction: a bore whose floor cannot be read
+    is priced as an ordinary drill point, and the flat-bottom cycle is the
+    slower one.
+    """
+    try:
+        vertex = BRepBuilderAPI_MakeVertex(
+            gp_Pnt(point[0], point[1], point[2])
+        ).Vertex()
+        gap = BRepExtrema_DistShapeShape(vertex, face)
+        if not gap.IsDone() or gap.NbSolution() < 1:
+            return False
+        return float(gap.Value()) <= reach
+    except Exception:  # noqa: BLE001 — a face OCCT will not read reaches nothing
+        return False
+
+
 def _has_flat_bottom(faces, origin, direction, radius, t_bottom) -> bool:
     """True when a PLANAR face perpendicular to the axis caps the bore.
 
@@ -3370,10 +3597,32 @@ def _has_flat_bottom(faces, origin, direction, radius, t_bottom) -> bool:
     rather than inferred — and a 118° point has no such face, so it
     correctly reports False.
 
-    The lateral test is against the face's BOUNDING BOX, not against the
-    plane's placement point: OCCT puts a cut face's surface origin
-    wherever the boolean left it, which for an annular counterbore floor
-    can be metres from the bore. The box is a property of the face.
+    THE LATERAL TEST ASKS THE FACE, and D-19 round 5 blocker 2 is the
+    whole of that phrase. It cannot ask the plane's placement point —
+    OCCT puts a cut face's surface origin wherever the boolean left it,
+    which for an annular counterbore floor can be metres from the bore —
+    so rounds 1 to 4 asked a ``Bnd_Box`` of the face instead, inflated by
+    the bore's radius on the three WORLD axes. A world-axis box of a face
+    is not a property of that face: spin the part about the BORE'S OWN
+    AXIS, which moves no point of the bore relative to any point of the
+    part, and the box of every other face turns and grows and shrinks.
+    So did the verdict. A Ø8 ball-nose pocket on a plate that also has a
+    slot floor lying in the same plane 5 mm clear of it reads
+    ``flat_bottom`` False at 0°, True at 30° through 60°, False at 75°,
+    True again at 135° — a ROUND floor priced as a flat drill, on nothing
+    but the angle the part happens to be exported at.
+    ``test_d19r5_a_spun_part_does_not_grow_a_flat_bottom`` is that sweep.
+
+    A box in the bore's own frame would not fix it either, and that is
+    worth saying because it is the obvious repair and it is wrong:
+    ``gp_Ax3(P, Dir)``'s X direction is an arbitrary choice of OCCT's and
+    is not rotation-equivariant, so a frame-box lateral test only moves
+    the arbitrariness. The lateral question is RADIAL — is any point of
+    this face within a bore radius of the axis — and only the face itself
+    can answer it, as a DISTANCE. See :func:`_face_reaches_point`, which
+    is also where the annular counterbore floor the docstring has always
+    claimed is kept: its centre is off that face, but only by the pilot
+    radius, which is less than the counterbore's own.
     """
     bottom_pt = _point_on_axis(origin, direction, t_bottom)
     for face in faces:
@@ -3399,17 +3648,7 @@ def _has_flat_bottom(faces, origin, direction, radius, t_bottom) -> bool:
                 continue
             # …and the face itself must reach the bore, not merely be a
             # far-away face of the part that happens to be coplanar.
-            box = Bnd_Box()
-            BRepBndLib.Add_s(face, box)
-            if box.IsVoid():
-                continue
-            xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
-            slack = radius + RADIUS_TOL_MM
-            if not (
-                xmin - slack <= bottom_pt[0] <= xmax + slack
-                and ymin - slack <= bottom_pt[1] <= ymax + slack
-                and zmin - slack <= bottom_pt[2] <= zmax + slack
-            ):
+            if not _face_reaches_point(face, bottom_pt, radius + RADIUS_TOL_MM):
                 continue
             return True
         except Exception:  # noqa: BLE001 — one odd face must not kill the scan

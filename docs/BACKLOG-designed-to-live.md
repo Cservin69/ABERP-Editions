@@ -382,7 +382,7 @@ landing.
 `python/aberp-cad-extract/aberp_cad_extract/holes.py` emits `located_holes`
 into FeatureGraph v6. The named parts below are where each defect lives:
 `_skin_over_axis`, `_root_for_end`, `_walk_caps`,
-`_cap_axis_intersections`, `SURFACE_CONFUSION_MM`.
+`_cap_axis_intersections`, `_has_flat_bottom`, `SURFACE_CONFUSION_MM`.
 
 **Missing for Live.** Eight items, in priority order — seven defects and
 one undecided convention. All are mutation-verified: items 1-5 from
@@ -439,8 +439,43 @@ is recorded under item 8 rather than as a defect.
    the same constant is what a rotated **countersink** needed, which is
    how round 4 found it. See round 4 under item 6.
 5. **N1 — breakout hole.** When the nose/point breaks the far face, the
-   hole reads **blind** with a depth *exceeding the plate*, because the
-   measurement runs to a pole in the air below the part.
+   hole reads **BLIND where it is through**.
+
+   **Re-characterised, D-19 round 5.** The item as written had two
+   halves and only one of them reproduces. The end-condition half does:
+   a Ø8 bore whose ball nose or 118° point breaks the far face of a
+   20 mm plate reads BLIND at every breakout depth measured. The
+   **"depth exceeding the plate"** half does **not** — the depth clamps
+   to the material and never runs past it. Measured over the whole
+   breakout family, shoulder at z = 6.0 down to −1.0 in a 20 mm plate:
+
+   | shoulder z | ball tip z | ball nose reads | 118° tip z | 118° point reads |
+   |---|---|---|---|---|
+   | 6.0 | +2.000 | 18 BLIND | +3.597 | 14 BLIND |
+   | 4.0 | +0.000 | 20 BLIND | +1.597 | 16 BLIND |
+   | 3.0 | −1.000 | 17 BLIND — **wrong** | +0.597 | 17 BLIND |
+   | 2.0 | −2.000 | 18 BLIND — **wrong** | −0.403 | 18 BLIND — **wrong** |
+   | 1.0 | −3.000 | 19 BLIND — **wrong** | −1.403 | 19 BLIND — **wrong** |
+   | 0.5 | −3.500 | 19.5 BLIND — **wrong** | −1.903 | 19.5 BLIND — **wrong** |
+   | 0.0 | −4.000 | 20 THROUGH | −2.403 | 20 THROUGH |
+
+   (A negative tip z means the nose is out the far face; those are the
+   rows that should read THROUGH. The two noses break out at different
+   shoulder depths, which is why the rows disagree at z = 3.0.)
+
+   So the direction is the opposite of what the item recorded: the depth
+   stops at the bore's own cylindrical shoulder, which is **short** of
+   the plate rather than past it — an **under-quote**, and it is the
+   whole point length short at the moment of breakout. Nothing anywhere
+   in the family reads past 20.0. The mechanism the item named — "the
+   measurement runs to a pole in the air below the part" — is what D-19
+   round 1's void bound and round 3's per-face extent between them
+   already stop; what survives is the end reading CAPPED, because the
+   nose face still carries that end and its outward normal still points
+   back into the bore.
+
+   Still open, still a gate, and still under-quoting; the entry is
+   corrected rather than closed.
 6. ~~**R2-A — convex floor / cap off the part**~~ **— CLOSED.** The
    *mirror* of N4, found by the round-2 adversarial pass, and the only
    item here that **over-quotes**. Two compounding faults in
@@ -529,6 +564,71 @@ is recorded under item 8 rather than as a defect.
    answers, which cost 1.5 s before the per-face and per-`t` memos and
    47 ms after. Eleven boxes are built across the whole corpus and the
    worst part spends 19 classifier queries.
+
+   **Round 5 — the CLASS, not the instances.** Round 4 replaced two
+   world-frame quantities and its docstrings read as though it had
+   closed the question. It had not: two more instances of the same class
+   survived, one of them written by round 4 itself, and both were found
+   by the same probe with one thing added — **the motions compose**.
+   Round 4's table applied one rotation *or* one translation at a time
+   and the whole corpus passed it. A rotation puts the bore's axis
+   across the world axes and a translation then makes the coordinates
+   large *in the directions the rotation opened up*; it is the product
+   that breaks things, and a 12 m translation is an ordinary
+   assembly-exported STEP coordinate rather than a stress figure.
+   - `_cap_axis_intersections` ran `GeomAPI_IntCS` in **world
+     coordinates**, and that intersector's absolute error grows with
+     them. The countersink's apex root, 5e-16 mm off the axis upright,
+     lands **1.13e-04 mm** off it once the part is rotated and moved
+     12.3 m — past the 1e-4 mm floor round 4 set to recognise it. So the
+     cone stopped reading as a cone and capped the bore at its own apex:
+     `countersunk_blind_bore` **7.000209 against a true 11.0** (−36 %,
+     entry 4 mm inside solid metal) and `countersunk_through_bore`
+     **13.0002 against 17.0**. Round 4's docstring claimed "three and a
+     half orders" of margin here; the real figure was **1.10x, on the
+     wrong side**, and nothing in the suite computed it. Fixed by
+     running the intersection **in the bore's own frame** — the same
+     frame `_face_axial_span` already uses — which bounds the error by
+     the *part's* size instead of by its distance from the world origin:
+     the same worst case measures **5.5e-10 mm**.
+   - `_has_flat_bottom` decided whether a planar face reached the bore
+     from a **world-axis `Bnd_Box`** of that face inflated by the bore
+     radius. Spin a part about the axis of one of its own bores — which
+     moves no point of the bore relative to any point of the part — and
+     the box turns, grows and shrinks with it. A Ø8 **ball-nose** pocket
+     beside a coplanar slot floor reads `flat_bottom` False at 0°, True
+     at 30°–60°, False at 75°–90°, **True again at 135°**: a round floor
+     priced as a flat-bottom drill on nothing but the export angle, and
+     `flat_bottom` is a signal slice C prices off. A box in the *bore's*
+     frame does not fix it either — `gp_Ax3(P, Dir)`'s X direction is an
+     arbitrary choice of OCCT's — so the lateral question is answered
+     where it belongs, as a **distance from the axis point to the
+     trimmed face**.
+
+   The **whole class** was then swept: every `Bnd_Box`/`BRepBndLib` use,
+   every absolute tolerance compared against intersector output, every
+   world-axis projection. Three world-frame quantities remain, all
+   deliberate and none able to move a verdict — `_canonical_direction`
+   and `_canonical_origin` choose a *frame to report in* (ADR-0112 S3,
+   and neither is part of `_rigid_invariants`), and `_perp_basis` turns
+   with the part but is only ever read through signed areas and interval
+   unions, which a common rotation cannot change. All three are pinned
+   rather than argued, and a **structural test fails on any new bounding
+   box anywhere in the module**.
+
+   Honest accounting of the cost: moving an intersection into another
+   frame is arithmetic, so it cannot be bit-preserving. **Eight of the
+   63 committed hole rows move, all in `depth_mm`, by at most 1.5e-13
+   mm** — and seven of the eight move *towards* their exact nominal
+   dimension, which is what a better-conditioned frame does. Diameter,
+   entry point, axis, end condition and `flat_bottom` are unchanged bit
+   for bit on every row. The other honest note: the frame is the fix,
+   and round 5's second change — making the collapse floor a **fraction
+   of the bore's radius** judged against the isoline's real extent
+   rather than an absolute 1e-4 mm judged against a derivative — moves
+   **no** answer, measured across four decades of bore radius. It is
+   kept as hardening and pinned as inert, the posture `_void_slack`
+   already sets.
 7. **R2-B — toroidal undercut (O-ring / snap-ring gland).** A gland at the
    bore's end reads **short and THROUGH**: a Ø8 bore with a R4 x 1.5
    gland at z=12 mines **6.5 THROUGH** where the axis has metal below
