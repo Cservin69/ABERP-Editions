@@ -1191,7 +1191,13 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         | EventKind::QcInspectionFailed
         | EventKind::QcAutoNcrCreated
         | EventKind::QcProbeCalibrationStaleWarning
-        | EventKind::QcProbeIngestionFailed => (None, ""),
+        | EventKind::QcProbeIngestionFailed
+        // D-PRICEQ — pricing-pipeline cycle roll-up + operator Retry click.
+        // Both are quoting-daemon operational events on the storefront side
+        // of the house; neither ever carries NAV invoice bytes (a quote is
+        // not an invoice — nothing on this path has been near the §169 XML).
+        | EventKind::QuotePricingCycleOutcome
+        | EventKind::QuotePricingJobRetried => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1213,7 +1219,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 187,
+        EventKind::ALL_KINDS_COUNT == 189,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

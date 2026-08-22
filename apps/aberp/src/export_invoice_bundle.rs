@@ -1050,7 +1050,13 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         | EventKind::QcInspectionFailed
         | EventKind::QcAutoNcrCreated
         | EventKind::QcProbeCalibrationStaleWarning
-        | EventKind::QcProbeIngestionFailed => None,
+        | EventKind::QcProbeIngestionFailed
+        // D-PRICEQ — pricing-pipeline cycle roll-up + operator Retry click.
+        // Both are quoting-daemon operational events; neither carries NAV
+        // invoice bytes (a quote is not an invoice), so nothing to extract
+        // into the bundle's `nav/` directory.
+        | EventKind::QuotePricingCycleOutcome
+        | EventKind::QuotePricingJobRetried => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1080,7 +1086,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 187,
+        EventKind::ALL_KINDS_COUNT == 189,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );

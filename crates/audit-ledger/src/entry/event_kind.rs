@@ -1763,6 +1763,56 @@ pub enum EventKind {
     /// F12 four-edit ritual fires once.
     QuotePollOutcome,
 
+    /// D-PRICEQ (2026-08-22 prod head-of-line incident) — the outcome of ONE
+    /// pricing-pipeline cycle (`PricingPipelineService::poll_once`). Before
+    /// this kind the cycle result existed ONLY as a `tracing` line on the
+    /// launch tty: a daemon that silently failed every 60s for two days left
+    /// no durable trace at all, which is exactly how the `aeb2771d`
+    /// head-of-line wedge stayed invisible. The reaper's own verdicts ride
+    /// the existing `QuotePricingFailed` + `QuotePricingFailureClassified`
+    /// pair (stage `"reaper"`); THIS kind is the cycle-level roll-up.
+    ///
+    /// **Emitted only on a non-idle cycle** — one that advanced, posted,
+    /// failed, reaped, skipped an errored job, or recorded a cycle error. An
+    /// idle cadence writes NOTHING, for the same reason `QuotePollOutcome`
+    /// fires only on failure: a row every 60s reproduces exactly the audit
+    /// spam S335 throttled for `EmailOutboxFetched`.
+    ///
+    /// Carries `tenant_id`, `fetched_from_storefront`, `enqueued`,
+    /// `advanced`, `posted`, `failed`, `reaped`, `errored`, `elapsed_ms`,
+    /// `error` (nullable cycle-level error string), `actor` (`"system"`),
+    /// `idempotency_key` (`quote_pricing_cycle_outcome:<ulid>` — a cycle has
+    /// no natural key, so a fresh ULID per emitted cycle).
+    ///
+    /// `quote.*` prefix family. Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricingCycleOutcome,
+
+    /// D-PRICEQ (2026-08-22 prod head-of-line incident) — the operator's
+    /// Retry click on a Failed pricing job (`POST
+    /// /api/quote-pricing-jobs/:quote_id/retry`), which flips the row
+    /// `Failed -> Fetched`, clears its error columns, and bumps `attempt_n`.
+    /// Before this kind that state change emitted NO audit event at all: the
+    /// prior terminal failure's `QuotePricingFailed` row stayed the last word
+    /// in the ledger while the row silently re-entered the queue, so a
+    /// forensic walker could not tell an operator-requeued job from one that
+    /// never failed. The sibling operator dispositions
+    /// (`QuotePricingMaterialEdited`, `QuotePricingFailureDeleted`) were
+    /// already audited; this closes the gap for the third.
+    ///
+    /// Carries `quote_id`, `tenant_id`, `previous_state` (always
+    /// `"failed"` — the only retryable state), `attempt_n` (post-bump),
+    /// `error_stage` / `error_reason` / `failure_kind` (the failure context
+    /// being cleared off the row, preserved here), `operator_user_id` (the
+    /// Bearer-subject login who clicked), `actor` (same login),
+    /// `idempotency_key` (`quote_pricing_job_retried:<quote_id>:<attempt_n>`
+    /// — the bumped attempt disambiguates repeat retries the way
+    /// `QuotePricingFailed`'s suffix does).
+    ///
+    /// `quote.*` prefix family. Payload: `serde_json::Value`.
+    /// F12 four-edit ritual fires once.
+    QuotePricingJobRetried,
+
     /// S350 / PR-39 (U5) — operator inline-edit of a pricing job's
     /// `material_grade`. Closes the F4/U5 dead-end: a row stuck
     /// `Permanent` on `material grade ... is not in the catalogue
@@ -3220,6 +3270,8 @@ impl EventKind {
             EventKind::QuotePricingOperatorAccepted => "quote.operator_accepted",
             EventKind::QuoteOperatorRefused => "quote.operator_refused",
             EventKind::QuotePollOutcome => "quote.poll_outcome",
+            EventKind::QuotePricingCycleOutcome => "quote.pricing_cycle_outcome",
+            EventKind::QuotePricingJobRetried => "quote.pricing_job_retried",
             EventKind::EmailOutboxFetched => "quote.email_outbox_fetched",
             EventKind::EmailOutboxClaimed => "quote.email_outbox_claimed",
             EventKind::EmailOutboxSent => "quote.email_outbox_sent",
@@ -3439,6 +3491,8 @@ impl EventKind {
             "quote.operator_accepted" => Ok(EventKind::QuotePricingOperatorAccepted),
             "quote.operator_refused" => Ok(EventKind::QuoteOperatorRefused),
             "quote.poll_outcome" => Ok(EventKind::QuotePollOutcome),
+            "quote.pricing_cycle_outcome" => Ok(EventKind::QuotePricingCycleOutcome),
+            "quote.pricing_job_retried" => Ok(EventKind::QuotePricingJobRetried),
             "quote.email_outbox_fetched" => Ok(EventKind::EmailOutboxFetched),
             "quote.email_outbox_claimed" => Ok(EventKind::EmailOutboxClaimed),
             "quote.email_outbox_sent" => Ok(EventKind::EmailOutboxSent),
@@ -3647,6 +3701,8 @@ impl EventKind {
         EventKind::QuotePricingOperatorAccepted,
         EventKind::QuoteOperatorRefused,
         EventKind::QuotePollOutcome,
+        EventKind::QuotePricingCycleOutcome,
+        EventKind::QuotePricingJobRetried,
         EventKind::EmailOutboxFetched,
         EventKind::EmailOutboxClaimed,
         EventKind::EmailOutboxSent,
@@ -3857,6 +3913,8 @@ mod tests {
             EventKind::QuotePricingFailureClassified,
             EventKind::QuotePricedWritebackOutcome,
             EventKind::QuotePollOutcome,
+            EventKind::QuotePricingCycleOutcome,
+            EventKind::QuotePricingJobRetried,
             EventKind::QuotePricingMaterialEdited,
             EventKind::QuotePricingFailureDeleted,
             EventKind::QuotePricingOperatorAccepted,
@@ -4001,7 +4059,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            187,
+            189,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -5972,6 +6030,82 @@ mod tests {
             EventKind::QuotePricingFailed,
             EventKind::QuotePricingFailureClassified,
             EventKind::QuotePricingRendered,
+        ] {
+            assert_ne!(
+                s,
+                sibling.as_str(),
+                "{s} collides with {}",
+                sibling.as_str()
+            );
+        }
+    }
+
+    /// D-PRICEQ — the pricing-CYCLE outcome kind round-trips, carries the
+    /// `quote.` prefix, and is distinct from every per-JOB sibling AND from
+    /// the storefront LIST-poll outcome. The collision that matters is with
+    /// `QuotePollOutcome`: both are cycle-scoped roll-ups of the same daemon,
+    /// and mis-bucketing the pricing cycle into the list-poll bucket would
+    /// hide exactly the wedge this kind exists to make visible.
+    #[test]
+    fn d_priceq_cycle_outcome_kind_round_trips_and_is_distinct() {
+        let k = EventKind::QuotePricingCycleOutcome;
+        let s = k.as_str();
+        assert_eq!(s, "quote.pricing_cycle_outcome");
+        assert!(s.starts_with("quote."), "{s} must start with quote.");
+        assert!(
+            !s.starts_with("invoice."),
+            "{s} must not start with invoice."
+        );
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+        for sibling in [
+            EventKind::QuotePollOutcome,
+            EventKind::QuotePricedWritebackOutcome,
+            EventKind::QuotePricingFetched,
+            EventKind::QuotePricingPosted,
+            EventKind::QuotePricingFailed,
+            EventKind::QuotePricingFailureClassified,
+            EventKind::QuotePricingJobRetried,
+        ] {
+            assert_ne!(
+                s,
+                sibling.as_str(),
+                "{s} collides with {}",
+                sibling.as_str()
+            );
+        }
+    }
+
+    /// D-PRICEQ — the operator-Retry kind round-trips and is distinct from
+    /// every sibling, in particular from the two operator dispositions that
+    /// were ALREADY audited (`material_grade_edited`, `pricing_failure_deleted`).
+    /// A collision there would file "operator requeued this job" under
+    /// "operator changed the grade" and lose the third disposition again.
+    #[test]
+    fn d_priceq_job_retried_kind_round_trips_and_is_distinct() {
+        let k = EventKind::QuotePricingJobRetried;
+        let s = k.as_str();
+        assert_eq!(s, "quote.pricing_job_retried");
+        assert!(s.starts_with("quote."), "{s} must start with quote.");
+        assert!(
+            !s.starts_with("invoice."),
+            "{s} must not start with invoice."
+        );
+        assert_eq!(
+            EventKind::from_storage_str(s).expect("round-trip"),
+            k,
+            "round-trip mismatch for {s}"
+        );
+        for sibling in [
+            EventKind::QuotePricingMaterialEdited,
+            EventKind::QuotePricingFailureDeleted,
+            EventKind::QuotePricingFailed,
+            EventKind::QuotePricingFailureClassified,
+            EventKind::QuotePricingFetched,
+            EventKind::QuotePricingCycleOutcome,
         ] {
             assert_ne!(
                 s,

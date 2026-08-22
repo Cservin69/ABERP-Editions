@@ -23867,14 +23867,34 @@ struct RetryResponse {
     new_attempt_n: u32,
 }
 
+/// D-PRICEQ — typed library-helper error for the retry route, mapped to an
+/// HTTP status by the handler. Mirrors [`DeletePricingJobRequestError`].
+#[derive(Debug)]
+pub enum RetryPricingJobRequestError {
+    /// No row for (tenant, quote_id) — 404.
+    NotFound,
+    /// Row exists but its current state is not `Failed` — 409. Carries the
+    /// offending state's wire string for the operator copy.
+    NotRetryable { state: String },
+    /// Unexpected internal failure — 500.
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for RetryPricingJobRequestError {
+    fn from(e: anyhow::Error) -> Self {
+        RetryPricingJobRequestError::Other(e)
+    }
+}
+
 async fn handle_retry_quote_pricing_job(
     AxumPath(quote_id): AxumPath<String>,
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
-    if let Err(resp) = require_ready(&state) {
-        return resp;
-    }
+    let operator_login = match require_ready(&state) {
+        Ok(login) => login,
+        Err(resp) => return resp,
+    };
     if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
         return resp;
     }
@@ -23888,25 +23908,147 @@ async fn handle_retry_quote_pricing_job(
         )
             .into_response();
     }
-    let db = state.db.clone();
-    let tenant_id = state.tenant.as_str().to_string();
+    let state_for_task = state.clone();
     let qid = quote_id.clone();
-    let new_n = match tokio::task::spawn_blocking(move || -> Result<u32> {
-        let mut conn = db.write().context("open DB")?;
-        let now = time::OffsetDateTime::now_utc();
-        crate::quote_pricing_jobs::retry_job(&mut conn, &qid, &tenant_id, now)
+    let result = tokio::task::spawn_blocking(move || {
+        retry_pricing_job_request(&state_for_task, &qid, &operator_login)
     })
-    .await
-    {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => return internal_error("retry_quote_pricing_job", e),
-        Err(e) => return internal_error("retry_quote_pricing_job:join", anyhow!(e)),
+    .await;
+    let outcome = match result {
+        Ok(r) => r,
+        Err(join_err) => {
+            return internal_error(
+                "retry_pricing_job_request:join",
+                anyhow!("blocking task panicked: {join_err}"),
+            );
+        }
     };
-    let body = RetryResponse {
+    match outcome {
+        Ok(new_n) => (
+            axum::http::StatusCode::OK,
+            axum::Json(RetryResponse {
+                quote_id,
+                new_attempt_n: new_n,
+            }),
+        )
+            .into_response(),
+        Err(RetryPricingJobRequestError::NotFound) => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(error_body(format!(
+                "no pricing job found with quote_id {quote_id}"
+            ))),
+        )
+            .into_response(),
+        Err(RetryPricingJobRequestError::NotRetryable { state: job_state }) => (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "error": "JobNotRetryable",
+                "state": job_state,
+                "message": format!(
+                    "a row in state `{job_state}` cannot be retried (only Failed rows are retryable)"
+                ),
+            })),
+        )
+            .into_response(),
+        Err(RetryPricingJobRequestError::Other(e)) => {
+            internal_error("retry_pricing_job_request", e)
+        }
+    }
+}
+
+/// D-PRICEQ — library helper backing the retry route. `pub` so an
+/// integration test can hit it without the HTTPS listener (same posture as
+/// [`delete_pricing_job_request`]). Applies the state-guarded requeue + the
+/// `quote.pricing_job_retried` audit row in ONE transaction.
+///
+/// **Why this exists.** The operator Retry click flips a row
+/// `Failed -> Fetched`, clears its error columns and bumps `attempt_n` — a
+/// real state change that, before D-PRICEQ, emitted NO audit event at all.
+/// On the 2026-08-22 prod incident that mattered directly: `aeb2771d` was
+/// operator-Retried out of a permanent Failed state at 08:00 and the ledger
+/// recorded nothing, so the ONLY evidence that the wedged job had been
+/// requeued by hand was the row's own mutated state. Its two sibling
+/// dispositions (material-grade edit, failure delete) were already audited.
+///
+/// Sync (DuckDB writes are blocking) — the handler wraps it in
+/// `spawn_blocking`.
+pub fn retry_pricing_job_request(
+    state: &AppState,
+    quote_id: &str,
+    operator_login: &str,
+) -> std::result::Result<u32, RetryPricingJobRequestError> {
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .context("await background binary hash compute")?;
+    let mut conn = state
+        .db
+        .write()
+        .with_context(|| format!("open tenant DuckDB at {}", state.db_path.display()))?;
+    let tenant = state.tenant.as_str().to_string();
+
+    crate::quote_pricing_jobs::ensure_schema(&conn).context("ensure quote_pricing_jobs schema")?;
+    aberp_audit_ledger::ensure_schema(&conn)
+        .context("ensure audit-ledger schema for retry audit")?;
+    let tx = conn.transaction().context("open retry transaction")?;
+    let outcome = crate::quote_pricing_jobs::retry_job_in_tx(
+        &tx,
         quote_id,
-        new_attempt_n: new_n,
+        &tenant,
+        time::OffsetDateTime::now_utc(),
+    )
+    .context("retry_job_in_tx")?;
+    let (new_attempt_n, error_stage, error_reason, failure_kind) = match outcome {
+        crate::quote_pricing_jobs::RetryJobOutcome::Applied {
+            new_attempt_n,
+            error_stage,
+            error_reason,
+            failure_kind,
+        } => (new_attempt_n, error_stage, error_reason, failure_kind),
+        crate::quote_pricing_jobs::RetryJobOutcome::NotFound => {
+            // Nothing written; drop the tx without committing.
+            return Err(RetryPricingJobRequestError::NotFound);
+        }
+        crate::quote_pricing_jobs::RetryJobOutcome::NotRetryable { state: job_state } => {
+            return Err(RetryPricingJobRequestError::NotRetryable {
+                state: job_state.as_str().to_string(),
+            });
+        }
     };
-    (axum::http::StatusCode::OK, axum::Json(body)).into_response()
+
+    // F12 audit-of-record — rides the SAME tx as the requeue UPDATE so the
+    // state change and its ledger entry commit atomically. The error columns
+    // are captured here because the UPDATE clears them off the row: after the
+    // commit, this audit entry is the only place the cleared failure context
+    // still exists.
+    let idempotency_key = format!("quote_pricing_job_retried:{quote_id}:{new_attempt_n}");
+    let payload = serde_json::json!({
+        "quote_id": quote_id,
+        "tenant_id": tenant,
+        "previous_state": crate::quote_pricing_jobs::STATE_FAILED,
+        "attempt_n": new_attempt_n,
+        "error_stage": error_stage,
+        "error_reason": error_reason,
+        "failure_kind": failure_kind,
+        "operator_user_id": operator_login,
+        "actor": operator_login,
+        "idempotency_key": idempotency_key,
+    });
+    let bytes = serde_json::to_vec(&payload).context("encode retry audit payload")?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    let actor = Actor::from_local_cli(Ulid::new().to_string(), operator_login);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        EventKind::QuotePricingJobRetried,
+        bytes,
+        actor,
+        Some(idempotency_key),
+    )
+    .context("append QuotePricingJobRetried")?;
+    tx.commit().context("commit retry transaction")?;
+
+    Ok(new_attempt_n)
 }
 
 /// S349 / PR-40 (U1) — wire shape for `GET /api/quote-pricing-jobs/:quote_id`,

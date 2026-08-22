@@ -835,20 +835,85 @@ pub fn set_failed(
     })
 }
 
-/// Operator retry — bump `attempt_n`, clear error fields, reset state
-/// to `Fetched`. The daemon's next sweep picks it up again. Returns
-/// the new `attempt_n` so the caller's audit-key suffix stays unique.
-pub fn retry_job(
-    conn: &mut Connection,
+/// D-PRICEQ — outcome of an operator Retry click, mirroring
+/// [`DeleteJobOutcome`]'s shape. The serve handler maps each variant to an
+/// HTTP status: `Applied` → 200, `NotFound` → 404, `NotRetryable` → 409.
+///
+/// Before D-PRICEQ [`retry_job`] returned a bare `u32` and could not tell
+/// "requeued" from "did nothing": the UPDATE is `... AND state = 'failed'`,
+/// so a click on a non-Failed row matched zero rows, yet the function still
+/// read back the untouched `attempt_n` and the route still answered 200. An
+/// audit row emitted off that path would have recorded a requeue that never
+/// happened, which is worse than the missing row it replaces.
+#[derive(Debug, Clone)]
+pub enum RetryJobOutcome {
+    /// Row reset to `Fetched`. Carries the post-bump `attempt_n` plus the
+    /// failure context being cleared off the row (preserved in the audit
+    /// payload — the row itself loses it).
+    Applied {
+        new_attempt_n: u32,
+        error_stage: Option<String>,
+        error_reason: Option<String>,
+        failure_kind: Option<String>,
+    },
+    /// No row for (tenant, quote_id) — 404.
+    NotFound,
+    /// Row exists but is not `Failed` — 409. Carries the offending state so
+    /// the operator copy can name it.
+    NotRetryable { state: JobState },
+}
+
+/// Operator retry, the tx-owned core — bump `attempt_n`, clear error
+/// fields, reset state to `Fetched`. The daemon's next sweep picks it up
+/// again.
+///
+/// State-guarded: reads the row's current state + error columns inside the
+/// caller's transaction (one consistent snapshot — no TOCTOU against a
+/// concurrent daemon transition) and refuses, without mutating, when the
+/// state is not [`JobState::Failed`].
+///
+/// **Does NOT commit** — the serve-layer caller appends the
+/// `quote.pricing_job_retried` audit row in the SAME transaction and commits
+/// both together, so the requeue and its audit-of-record are atomic (the
+/// same posture as [`delete_failed_job_in_tx`]). Caller guarantees
+/// [`ensure_schema`] has run.
+pub fn retry_job_in_tx(
+    tx: &duckdb::Transaction<'_>,
     quote_id: &str,
     tenant_id: &str,
     now: OffsetDateTime,
-) -> Result<u32> {
-    ensure_schema(conn)?;
+) -> Result<RetryJobOutcome> {
+    let current: Option<(String, Option<String>, Option<String>, Option<String>)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT state, error_stage, error_reason, failure_kind
+                    FROM quote_pricing_jobs
+                    WHERE quote_id = ? AND tenant_id = ?",
+            )
+            .context("prepare retry_job read")?;
+        let mut rows = stmt
+            .query(params![quote_id, tenant_id])
+            .context("execute retry_job read")?;
+        match rows.next().context("step retry_job read")? {
+            Some(r) => Some((
+                r.get(0).context("get state")?,
+                r.get(1).context("get error_stage")?,
+                r.get(2).context("get error_reason")?,
+                r.get(3).context("get failure_kind")?,
+            )),
+            None => None,
+        }
+    };
+    let Some((state_str, error_stage, error_reason, failure_kind)) = current else {
+        return Ok(RetryJobOutcome::NotFound);
+    };
+    let state = JobState::parse_str(&state_str)?;
+    if state != JobState::Failed {
+        return Ok(RetryJobOutcome::NotRetryable { state });
+    }
     let ts = now
         .format(&time::format_description::well_known::Rfc3339)
         .context("format updated_at")?;
-    let tx = conn.transaction().context("open retry_job tx")?;
     tx.execute(
         "UPDATE quote_pricing_jobs
             SET state = ?, updated_at = ?, error_stage = NULL, error_reason = NULL,
@@ -865,8 +930,46 @@ pub fn retry_job(
             |r| r.get(0),
         )
         .context("read attempt_n")?;
+    Ok(RetryJobOutcome::Applied {
+        new_attempt_n: new_n.max(0) as u32,
+        error_stage,
+        error_reason,
+        failure_kind,
+    })
+}
+
+/// `&mut Connection` wrapper over [`retry_job_in_tx`] for unit tests + any
+/// non-audit caller: runs [`ensure_schema`], opens a tx, applies the retry,
+/// and commits. Returns the post-bump `attempt_n`.
+///
+/// The serve handler does NOT use this — it needs the in-tx variant so the
+/// audit row rides the same transaction. Kept returning `u32` (rather than
+/// the richer [`RetryJobOutcome`]) so existing test call sites are
+/// untouched; a non-Failed row now surfaces as an error here instead of a
+/// silent no-op that looked like success.
+pub fn retry_job(
+    conn: &mut Connection,
+    quote_id: &str,
+    tenant_id: &str,
+    now: OffsetDateTime,
+) -> Result<u32> {
+    ensure_schema(conn)?;
+    let tx = conn.transaction().context("open retry_job tx")?;
+    let outcome = retry_job_in_tx(&tx, quote_id, tenant_id, now)?;
+    let n = match outcome {
+        RetryJobOutcome::Applied { new_attempt_n, .. } => new_attempt_n,
+        RetryJobOutcome::NotFound => {
+            return Err(anyhow!("no quote_pricing_jobs row for {quote_id}"))
+        }
+        RetryJobOutcome::NotRetryable { state } => {
+            return Err(anyhow!(
+                "quote {quote_id} is in state `{}`; only `failed` rows can be retried",
+                state.as_str()
+            ))
+        }
+    };
     tx.commit().context("commit retry_job")?;
-    Ok(new_n as u32)
+    Ok(n)
 }
 
 /// S350 / PR-39 (U5) — outcome of an operator material-grade override.
@@ -1096,6 +1199,43 @@ pub fn amend_material_grade(
 }
 
 /// SPA + daemon read path. Returns rows newest-first.
+/// Map ONE row of the canonical 16-column `quote_pricing_jobs` projection
+/// (see [`list_jobs`] / [`next_actionable_job_excluding`] /
+/// [`started_non_terminal_jobs`], which all SELECT the same ordinals) into a
+/// [`PricingJobRow`]. One mapping, three readers — a fourth reader adding a
+/// column must touch the projection and this function together, which is the
+/// point: S401 appended `customer_company` LAST precisely so the earlier
+/// ordinals could not shift, and three hand-copied `.get(N)` blocks are how
+/// that invariant silently rots.
+fn row_to_pricing_job(r: &duckdb::Row<'_>) -> Result<PricingJobRow> {
+    let state_str: String = r.get(2).context("get state")?;
+    let state = JobState::parse_str(&state_str)?;
+    let qty: i64 = r.get(8).context("get quantity")?;
+    let attempt_n: i64 = r.get(13).context("get attempt_n")?;
+    let failure_kind = match r.get::<_, Option<String>>(14).ok().flatten() {
+        Some(s) => Some(FailureKind::parse_str(&s)?),
+        None => None,
+    };
+    Ok(PricingJobRow {
+        quote_id: r.get(0).context("get quote_id")?,
+        tenant_id: r.get(1).context("get tenant_id")?,
+        state,
+        fetched_at: r.get(3).context("get fetched_at")?,
+        updated_at: r.get(4).context("get updated_at")?,
+        customer_email: r.get(5).context("get customer_email")?,
+        customer_name: r.get(6).context("get customer_name")?,
+        customer_company: r.get(15).ok(),
+        material_grade: r.get(7).context("get material_grade")?,
+        quantity: qty.max(0) as u32,
+        feature_graph_hash: r.get(9).ok(),
+        total_price_eur: r.get(10).ok(),
+        error_stage: r.get(11).ok(),
+        error_reason: r.get(12).ok(),
+        attempt_n: attempt_n.max(0) as u32,
+        failure_kind,
+    })
+}
+
 pub fn list_jobs(conn: &Connection, tenant_id: &str) -> Result<Vec<PricingJobRow>> {
     ensure_schema(conn)?;
     let mut stmt = conn
@@ -1121,32 +1261,7 @@ pub fn list_jobs(conn: &Connection, tenant_id: &str) -> Result<Vec<PricingJobRow
         .context("execute list_jobs")?;
     let mut out: Vec<PricingJobRow> = Vec::new();
     while let Some(r) = rows.next().context("step list_jobs")? {
-        let state_str: String = r.get(2).context("get state")?;
-        let state = JobState::parse_str(&state_str)?;
-        let qty: i64 = r.get(8).context("get quantity")?;
-        let attempt_n: i64 = r.get(13).context("get attempt_n")?;
-        let failure_kind = match r.get::<_, Option<String>>(14).ok().flatten() {
-            Some(s) => Some(FailureKind::parse_str(&s)?),
-            None => None,
-        };
-        out.push(PricingJobRow {
-            quote_id: r.get(0).context("get quote_id")?,
-            tenant_id: r.get(1).context("get tenant_id")?,
-            state,
-            fetched_at: r.get(3).context("get fetched_at")?,
-            updated_at: r.get(4).context("get updated_at")?,
-            customer_email: r.get(5).context("get customer_email")?,
-            customer_name: r.get(6).context("get customer_name")?,
-            customer_company: r.get(15).ok(),
-            material_grade: r.get(7).context("get material_grade")?,
-            quantity: qty.max(0) as u32,
-            feature_graph_hash: r.get(9).ok(),
-            total_price_eur: r.get(10).ok(),
-            error_stage: r.get(11).ok(),
-            error_reason: r.get(12).ok(),
-            attempt_n: attempt_n.max(0) as u32,
-            failure_kind,
-        });
+        out.push(row_to_pricing_job(r)?);
     }
     Ok(out)
 }
@@ -1168,51 +1283,71 @@ pub fn list_jobs(conn: &Connection, tenant_id: &str) -> Result<Vec<PricingJobRow
 /// silent auto-retry of a network blip would hide the failure from the
 /// SPA and lose the per-attempt audit chain.
 pub fn next_actionable_job(conn: &Connection, tenant_id: &str) -> Result<Option<PricingJobRow>> {
+    next_actionable_job_excluding(conn, tenant_id, &[])
+}
+
+/// D-PRICEQ (2026-08-22 prod head-of-line incident) — the same strict-FIFO
+/// lookup as [`next_actionable_job`], with a caller-supplied set of
+/// `quote_id`s to step OVER.
+///
+/// **Why this exists.** `next_actionable_job` is `ORDER BY fetched_at ASC
+/// LIMIT 1`, so it returns the SAME row every call until that row leaves the
+/// non-terminal set. On 2026-08-22 a job whose artifact directory had been
+/// cleaned off disk sat non-terminal at the head of the prod queue: the
+/// daemon re-picked it every 60s, errored, and the day's real quote — queued
+/// behind it — never priced. Marking the bad row Failed is the primary fix
+/// (see the pipeline's `advance_extract`), but a row can error for reasons
+/// the failure path does not own (a DB read blip, an audit-append failure),
+/// and one such row must never be able to freeze the whole queue again. The
+/// pipeline records each job that errored THIS cycle and passes it here, so
+/// the next lookup returns the row BEHIND it instead of the same head.
+///
+/// `skip` is a per-cycle, in-memory list — it is never persisted, so a row
+/// skipped this cycle is retried next cycle (the stale-job reaper, not this
+/// function, is what eventually terminalises a permanently-stuck row).
+/// Passing an empty slice is exactly [`next_actionable_job`].
+pub fn next_actionable_job_excluding(
+    conn: &Connection,
+    tenant_id: &str,
+    skip: &[String],
+) -> Result<Option<PricingJobRow>> {
     ensure_schema(conn)?;
-    let mut stmt = conn
-        .prepare(
-            // S401 — customer_company appended LAST (ordinal 15); see list_jobs.
-            "SELECT quote_id, tenant_id, state, fetched_at, updated_at,
-                    customer_email, customer_name, material_grade, quantity,
-                    feature_graph_hash, total_price_eur, error_stage, error_reason,
-                    attempt_n, failure_kind, customer_company
-                FROM quote_pricing_jobs
-                WHERE tenant_id = ?
-                  AND state IN ('fetched','extracting','pricing','rendering','posting_back')
-                ORDER BY fetched_at ASC
-                LIMIT 1",
+    // Bind the skip list positionally rather than interpolating it: the
+    // quote_id reaching here came off a storefront listing, and a hand-built
+    // `NOT IN ('...')` string would be an injection seam (CLAUDE.md rule 12).
+    let placeholders = if skip.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " AND quote_id NOT IN ({})",
+            std::iter::repeat_n("?", skip.len())
+                .collect::<Vec<_>>()
+                .join(",")
         )
-        .context("prepare next_actionable_job")?;
+    };
+    let sql = format!(
+        // S401 — customer_company appended LAST (ordinal 15); see list_jobs.
+        "SELECT quote_id, tenant_id, state, fetched_at, updated_at,
+                customer_email, customer_name, material_grade, quantity,
+                feature_graph_hash, total_price_eur, error_stage, error_reason,
+                attempt_n, failure_kind, customer_company
+            FROM quote_pricing_jobs
+            WHERE tenant_id = ?
+              AND state IN ('fetched','extracting','pricing','rendering','posting_back'){placeholders}
+            ORDER BY fetched_at ASC
+            LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql).context("prepare next_actionable_job")?;
+    let mut binds: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(1 + skip.len());
+    binds.push(&tenant_id);
+    for q in skip {
+        binds.push(q);
+    }
     let mut rows = stmt
-        .query(params![tenant_id])
+        .query(binds.as_slice())
         .context("execute next_actionable_job")?;
     if let Some(r) = rows.next().context("step next_actionable_job")? {
-        let state_str: String = r.get(2).context("get state")?;
-        let state = JobState::parse_str(&state_str)?;
-        let qty: i64 = r.get(8).context("get quantity")?;
-        let attempt_n: i64 = r.get(13).context("get attempt_n")?;
-        let failure_kind = match r.get::<_, Option<String>>(14).ok().flatten() {
-            Some(s) => Some(FailureKind::parse_str(&s)?),
-            None => None,
-        };
-        Ok(Some(PricingJobRow {
-            quote_id: r.get(0).context("get quote_id")?,
-            tenant_id: r.get(1).context("get tenant_id")?,
-            state,
-            fetched_at: r.get(3).context("get fetched_at")?,
-            updated_at: r.get(4).context("get updated_at")?,
-            customer_email: r.get(5).context("get customer_email")?,
-            customer_name: r.get(6).context("get customer_name")?,
-            customer_company: r.get(15).ok(),
-            material_grade: r.get(7).context("get material_grade")?,
-            quantity: qty.max(0) as u32,
-            feature_graph_hash: r.get(9).ok(),
-            total_price_eur: r.get(10).ok(),
-            error_stage: r.get(11).ok(),
-            error_reason: r.get(12).ok(),
-            attempt_n: attempt_n.max(0) as u32,
-            failure_kind,
-        }))
+        Ok(Some(row_to_pricing_job(r)?))
     } else {
         Ok(None)
     }
@@ -1245,6 +1380,54 @@ pub fn get_job_artifacts(
     } else {
         Err(anyhow!("no quote_pricing_jobs row for {quote_id}"))
     }
+}
+
+/// D-PRICEQ (2026-08-22 prod head-of-line incident) — reaper candidates:
+/// rows the daemon has STARTED (`extracting` / `pricing` / `rendering` /
+/// `posting_back`) and not moved since, oldest `updated_at` first.
+///
+/// **`fetched` is deliberately excluded.** A `fetched` row that has sat for
+/// hours is not stuck — it is merely waiting its FIFO turn behind a long
+/// backlog (`MAX_JOBS_PER_CYCLE` is 5), and its `updated_at` is its insert
+/// time. Reaping on queue-wait would fail perfectly healthy jobs the moment
+/// the queue got deep. Every state in the list below, by contrast, is one the
+/// daemon itself wrote when it began work on the row: if `updated_at` has not
+/// moved since, a cycle picked the row up and could not advance it.
+///
+/// The staleness CUTOFF is applied by the caller (in Rust, against the parsed
+/// RFC3339 `updated_at`) rather than in SQL: `updated_at` is a VARCHAR, and
+/// RFC3339 strings only sort lexicographically when their sub-second
+/// precision matches — which the `time` crate's formatter does not guarantee
+/// across rows. Comparing parsed instants is the honest version.
+///
+/// `limit` bounds the per-cycle reap work.
+pub fn started_non_terminal_jobs(
+    conn: &Connection,
+    tenant_id: &str,
+    limit: usize,
+) -> Result<Vec<PricingJobRow>> {
+    ensure_schema(conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT quote_id, tenant_id, state, fetched_at, updated_at,
+                    customer_email, customer_name, material_grade, quantity,
+                    feature_graph_hash, total_price_eur, error_stage, error_reason,
+                    attempt_n, failure_kind, customer_company
+                FROM quote_pricing_jobs
+                WHERE tenant_id = ?
+                  AND state IN ('extracting','pricing','rendering','posting_back')
+                ORDER BY updated_at ASC
+                LIMIT ?",
+        )
+        .context("prepare started_non_terminal_jobs")?;
+    let mut rows = stmt
+        .query(params![tenant_id, limit as i64])
+        .context("execute started_non_terminal_jobs")?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next().context("step started_non_terminal_jobs")? {
+        out.push(row_to_pricing_job(r)?);
+    }
+    Ok(out)
 }
 
 /// Artifacts attached to one job row. The fields go `Some(_)` as the
@@ -2194,8 +2377,18 @@ mod tests {
         assert_eq!(n2, 2);
     }
 
+    /// D-PRICEQ — was `retry_is_a_noop_when_state_is_not_failed`, which
+    /// pinned the SILENT no-op: the UPDATE's `AND state = 'failed'` matched
+    /// zero rows, `retry_job` read back the untouched `attempt_n`, and the
+    /// caller (the serve route) answered 200 as if the row had been
+    /// requeued. That is now an explicit refusal — necessary before the
+    /// route could emit an audit row, because an audit-of-record off the old
+    /// path would have claimed a requeue that never happened.
+    ///
+    /// The no-mutation half of the old contract is unchanged and still
+    /// asserted: the row stays exactly as it was.
     #[test]
-    fn retry_is_a_noop_when_state_is_not_failed() {
+    fn retry_refuses_without_mutating_when_state_is_not_failed() {
         let mut conn = open_mem();
         insert_fetched_job(
             &conn,
@@ -2211,12 +2404,16 @@ mod tests {
             fixed_ts(),
         )
         .expect("ins");
-        // No `Failed` state — retry must NOT advance.
-        let n = retry_job(&mut conn, "q4", "T", fixed_ts()).expect("retry");
-        // attempt_n stays 0 because the WHERE filter didn't match.
-        assert_eq!(n, 0);
+        // No `Failed` state — retry must refuse, loudly, and change nothing.
+        let err = retry_job(&mut conn, "q4", "T", fixed_ts())
+            .expect_err("a non-Failed row must not be silently requeued");
+        assert!(
+            err.to_string().contains("only `failed` rows can be retried"),
+            "refusal must name the reason, got: {err}"
+        );
         let rows = list_jobs(&conn, "T").expect("list");
-        assert_eq!(rows[0].state, JobState::Fetched);
+        assert_eq!(rows[0].state, JobState::Fetched, "state untouched");
+        assert_eq!(rows[0].attempt_n, 0, "attempt_n untouched");
     }
 
     #[test]

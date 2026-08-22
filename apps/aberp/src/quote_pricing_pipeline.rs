@@ -404,6 +404,15 @@ pub struct PipelineCycleSummary {
     /// Number of jobs that reached the terminal `Posted` state this
     /// cycle. UI badges key on this to surface "quote sent" toasts.
     pub posted: u32,
+    /// D-PRICEQ — jobs the stale-job reaper terminalised this cycle (stuck
+    /// in a started, non-terminal state past [`STALE_JOB_REAP_AFTER`]).
+    pub reaped: u32,
+    /// D-PRICEQ — jobs whose advance returned `Err` this cycle and were
+    /// SKIPPED for the rest of the cycle rather than aborting it. Distinct
+    /// from `failed`: a `failed` job reached the terminal `Failed` state with
+    /// an audit row; an `errored` job is still non-terminal and will be
+    /// re-picked next cycle (and reaped if it never moves).
+    pub errored: u32,
     /// Wall-clock elapsed_ms for the cycle.
     pub elapsed_ms: u64,
     /// Top-level cycle error if any (transport flake, audit-ledger
@@ -416,6 +425,29 @@ pub struct PipelineCycleSummary {
 /// at 30s × 5 jobs = 150s, well under the 60s storefront poll cadence
 /// so the cycle still completes within roughly the cadence period.
 const MAX_JOBS_PER_CYCLE: u32 = 5;
+
+/// D-PRICEQ (2026-08-22 prod head-of-line incident) — how long a job may sit
+/// in a STARTED, non-terminal state (`extracting` / `pricing` / `rendering` /
+/// `posting_back`) without its `updated_at` moving before the reaper
+/// terminalises it as `Failed`.
+///
+/// **Why 30 minutes.** The daemon cadence is ~60s and every state transition
+/// bumps `updated_at`, so a job the daemon can actually advance moves within
+/// one cycle — 30 minutes is thirty consecutive cycles of no progress. It is
+/// also comfortably longer than the slowest legitimate single step (the
+/// Python STEP extractor on a large assembly), so the reaper cannot fire on
+/// work that is merely slow. A row still stale at that point is one no cycle
+/// can move: on prod that meant a job whose artifact directory had been
+/// cleaned off disk, and it held the FIFO head for two days across restarts.
+///
+/// `fetched` is NOT reapable — see `jobs::started_non_terminal_jobs` for why
+/// queue-wait must never be mistaken for stuck.
+const STALE_JOB_REAP_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// D-PRICEQ — per-cycle cap on reaper work, so a pathological backlog cannot
+/// turn one cycle into an unbounded write storm. Anything beyond the cap is
+/// reaped on subsequent cycles.
+const MAX_REAP_PER_CYCLE: usize = 20;
 
 /// Default valid_until window for an indicative quote, in days. Per
 /// ADR-0004 the storefront requires `YYYY-MM-DD` in the future; 30
@@ -523,16 +555,32 @@ impl PricingPipelineService {
             }
         }
 
+        // D-PRICEQ — reap BEFORE the advance loop: a job stuck past the
+        // threshold is terminalised in this cycle, so the very same cycle's
+        // FIFO lookup already steps past it. Reaping after the loop would
+        // waste one full cadence on every wedge.
+        summary.reaped = self.reap_stale_jobs().await;
+
+        // D-PRICEQ — quote_ids that errored (not FAILED — errored) this
+        // cycle. `next_actionable_job` is strict FIFO `LIMIT 1`, so without
+        // this the same head comes back on every iteration and the jobs
+        // behind it never get a turn. In-memory and per-cycle: nothing is
+        // persisted, so a skipped row is retried on the next cadence.
+        let mut skip: Vec<String> = Vec::new();
         for _ in 0..MAX_JOBS_PER_CYCLE {
-            let row = match self.next_actionable_blocking().await {
+            let row = match self.next_actionable_blocking(&skip).await {
                 Ok(Some(r)) => r,
                 Ok(None) => break,
                 Err(e) => {
+                    // The LOOKUP failing is a DB-level fault, not one job's
+                    // problem — there is no next row to move on to, so this
+                    // one still ends the cycle.
                     tracing::warn!(error = %e, "pricing-pipeline next-job lookup failed");
                     summary.error = Some(format!("next_actionable: {e:#}"));
                     break;
                 }
             };
+            let quote_id = row.quote_id.clone();
             match self.advance_one_step(row).await {
                 Ok(StepOutcome::Advanced) => summary.advanced += 1,
                 Ok(StepOutcome::Posted) => {
@@ -544,15 +592,196 @@ impl PricingPipelineService {
                     summary.failed += 1;
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "pricing-pipeline advance error");
-                    summary.error = Some(format!("advance: {e:#}"));
-                    break;
+                    // D-PRICEQ — was `break`, which abandoned the whole
+                    // cycle: ONE unadvanceable job at the head froze every
+                    // job queued behind it, every cycle, forever. Skip this
+                    // one and keep going; the reaper above is what
+                    // eventually terminalises it if it never moves.
+                    tracing::warn!(
+                        error = %e,
+                        quote_id = %quote_id,
+                        "pricing-pipeline advance error; skipping this job for the rest of the cycle"
+                    );
+                    summary.error = Some(format!("advance {quote_id}: {e:#}"));
+                    summary.errored += 1;
+                    skip.push(quote_id);
+                    continue;
                 }
             }
         }
 
         summary.elapsed_ms = started.elapsed().as_millis() as u64;
+        self.emit_cycle_outcome_audit(&summary).await;
         summary
+    }
+
+    /// D-PRICEQ — terminalise jobs stuck in a STARTED, non-terminal state
+    /// past [`STALE_JOB_REAP_AFTER`]. Returns how many were reaped.
+    ///
+    /// Each reap goes through the ordinary [`emit_failure`] path, so a reaped
+    /// job gets the same `QuotePricingFailed` + `QuotePricingFailureClassified`
+    /// audit pair as any other terminal failure — with stage `"reaper"`, which
+    /// is what distinguishes it in the ledger. Best-effort: a reaper fault is
+    /// logged and the cycle continues (the advance loop is the priority).
+    async fn reap_stale_jobs(&self) -> u32 {
+        let db = self.deps.db.clone();
+        let tenant_id = self.deps.tenant.as_str().to_string();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        let res = spawn_blocking(move || -> Result<u32> {
+            let mut conn = db
+                .write()
+                .context("shared writer: stale-job reaper (ADR-0098 Gap 1a)")?;
+            audit_ensure_schema(&conn).context("audit schema")?;
+            jobs::ensure_schema(&conn).context("jobs schema")?;
+            let candidates =
+                jobs::started_non_terminal_jobs(&conn, &tenant_id, MAX_REAP_PER_CYCLE)?;
+            let now = OffsetDateTime::now_utc();
+            let cutoff = now - time::Duration::seconds(STALE_JOB_REAP_AFTER.as_secs() as i64);
+            let mut reaped = 0u32;
+            for row in candidates {
+                // `updated_at` is a VARCHAR; a row we cannot parse is NOT
+                // reaped (a reap is a terminal, customer-visible verdict —
+                // never issue one off an unreadable timestamp). Loud, so a
+                // format drift surfaces instead of silently disabling the
+                // reaper.
+                let updated = match OffsetDateTime::parse(
+                    &row.updated_at,
+                    &time::format_description::well_known::Rfc3339,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            quote_id = %row.quote_id,
+                            updated_at = %row.updated_at,
+                            error = %e,
+                            "stale-job reaper: unparseable updated_at; NOT reaping this row"
+                        );
+                        continue;
+                    }
+                };
+                if updated > cutoff {
+                    // Ordered by updated_at ASC — everything after this row
+                    // is newer still.
+                    break;
+                }
+                let stuck_for_s = (now - updated).whole_seconds().max(0);
+                let reason = format!(
+                    "job stuck in state `{}` since {} ({}s with no progress, threshold {}s); \
+                     reaped to Failed by the stale-job reaper so it cannot hold the queue head",
+                    row.state.as_str(),
+                    row.updated_at,
+                    stuck_for_s,
+                    STALE_JOB_REAP_AFTER.as_secs(),
+                );
+                emit_failure(
+                    &mut conn,
+                    &tenant_id,
+                    binary_hash,
+                    &login,
+                    &row.quote_id,
+                    "reaper",
+                    &reason,
+                    row.attempt_n,
+                )?;
+                tracing::warn!(
+                    quote_id = %row.quote_id,
+                    state = %row.state.as_str(),
+                    stuck_for_s,
+                    "stale-job reaper: job terminalised as Failed (operator Retry required)"
+                );
+                reaped += 1;
+            }
+            Ok(reaped)
+        })
+        .await;
+        match res {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "stale-job reaper failed");
+                0
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "stale-job reaper task panicked");
+                0
+            }
+        }
+    }
+
+    /// D-PRICEQ — write ONE `quote.pricing_cycle_outcome` audit row for a
+    /// NON-IDLE pricing cycle. Before this the cycle result lived only in a
+    /// `tracing` line on the launch tty, which prod does not capture to a
+    /// file: a pipeline that silently failed every 60s for two days left
+    /// nothing durable behind it.
+    ///
+    /// Idle cycles emit NOTHING — same posture, and the same reason, as
+    /// [`Self::emit_poll_outcome_audit`]: a row every cadence would reproduce
+    /// exactly the audit spam S335 throttled for `EmailOutboxFetched`. A
+    /// cycle counts as non-idle when it enqueued, advanced, posted, failed,
+    /// reaped, skipped an errored job, or recorded a cycle-level error.
+    /// Best-effort: an audit-write failure is logged and never changes the
+    /// cycle's already-decided outcome.
+    async fn emit_cycle_outcome_audit(&self, summary: &PipelineCycleSummary) {
+        let idle = summary.enqueued == 0
+            && summary.advanced == 0
+            && summary.posted == 0
+            && summary.failed == 0
+            && summary.reaped == 0
+            && summary.errored == 0
+            && summary.error.is_none();
+        if idle {
+            return;
+        }
+        let db = self.deps.db.clone();
+        let tenant_id = self.deps.tenant.as_str().to_string();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        let summary = summary.clone();
+        let res = spawn_blocking(move || -> Result<()> {
+            let mut conn = db
+                .write()
+                .context("shared writer: cycle-outcome audit (ADR-0098 Gap 1a)")?;
+            audit_ensure_schema(&conn).context("ensure audit-ledger schema")?;
+            let tx = conn.transaction().context("open cycle-outcome tx")?;
+            let meta =
+                LedgerMeta::new(TenantId::new(&tenant_id).context("tenant id")?, binary_hash);
+            let actor = Actor::from_local_cli(Ulid::new().to_string(), &login);
+            // A cycle has no natural key (it is not per-quote and not
+            // per-attempt), so the idempotency key is a fresh ULID.
+            let idempotency_key = format!("quote_pricing_cycle_outcome:{}", Ulid::new());
+            let payload = serde_json::json!({
+                "tenant_id": tenant_id,
+                "fetched_from_storefront": summary.fetched_from_storefront,
+                "enqueued": summary.enqueued,
+                "advanced": summary.advanced,
+                "posted": summary.posted,
+                "failed": summary.failed,
+                "reaped": summary.reaped,
+                "errored": summary.errored,
+                "elapsed_ms": summary.elapsed_ms,
+                "error": summary.error,
+                "actor": "system",
+                "idempotency_key": idempotency_key,
+            });
+            let bytes = serde_json::to_vec(&payload).context("encode cycle-outcome payload")?;
+            append_in_tx(
+                &tx,
+                &meta,
+                EventKind::QuotePricingCycleOutcome,
+                bytes,
+                actor,
+                Some(idempotency_key),
+            )
+            .context("append QuotePricingCycleOutcome")?;
+            tx.commit().context("commit cycle-outcome")?;
+            Ok(())
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "cycle-outcome audit write failed"),
+            Err(e) => tracing::warn!(error = %e, "cycle-outcome audit task panicked"),
+        }
     }
 
     async fn list_and_enqueue_received(&self) -> Result<(u32, u32)> {
@@ -957,14 +1186,15 @@ impl PricingPipelineService {
         }
     }
 
-    async fn next_actionable_blocking(&self) -> Result<Option<PricingJobRow>> {
+    async fn next_actionable_blocking(&self, skip: &[String]) -> Result<Option<PricingJobRow>> {
         let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
+        let skip = skip.to_vec();
         spawn_blocking(move || -> Result<Option<PricingJobRow>> {
             let conn = db
                 .read()
                 .context("shared read: next-job (ADR-0098 Gap 1a)")?;
-            jobs::next_actionable_job(&conn, &tenant_id)
+            jobs::next_actionable_job_excluding(&conn, &tenant_id, &skip)
         })
         .await
         .context("next-actionable spawn_blocking join")?
@@ -1029,8 +1259,38 @@ impl PricingPipelineService {
             // S430 / ADR-0083 — the on-disk CAD is encrypted at rest, but
             // the Python extractor reads a file PATH (not bytes), so we
             // decrypt to a short-lived sibling temp file deleted on drop.
-            let on_disk = std::fs::read(&arts.cad_local_path)
-                .with_context(|| format!("read CAD blob {}", arts.cad_local_path))?;
+            // D-PRICEQ (2026-08-22 prod head-of-line incident) — this read
+            // used to be a bare `?`. When the artifact directory had been
+            // cleaned off disk, ENOENT returned Err: the job was NEVER marked
+            // Failed, so it stayed non-terminal at the head of the strict-FIFO
+            // queue and every quote behind it stopped pricing — for two days,
+            // across restarts. The decrypt arm immediately below already had
+            // the right shape; a file that is GONE is no less permanent than
+            // one that will not decrypt. Mirror it: audit the failure, mark
+            // the row Failed, let the queue move.
+            let on_disk = match std::fs::read(&arts.cad_local_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    // "cad file missing" is the token `classify_failure`
+                    // already keys on for stage `extract` → Permanent. A
+                    // deleted artifact cannot come back on a retry; the
+                    // operator must re-request the upload.
+                    emit_failure(
+                        &mut conn,
+                        &tenant_id_string,
+                        binary_hash,
+                        &login,
+                        &quote_id,
+                        "extract",
+                        &format!(
+                            "CAD file missing or unreadable on disk at {}: {e}",
+                            arts.cad_local_path
+                        ),
+                        attempt_n,
+                    )?;
+                    return Ok(StepOutcome::Failed);
+                }
+            };
             let opened = match cad_blob.key.open(&on_disk) {
                 Ok(o) => o,
                 Err(e) => {
@@ -1805,6 +2065,43 @@ impl PricingPipelineService {
         Ok(outcome)
     }
 
+    /// D-PRICEQ — terminalise a `posting_back` row whose on-disk artifacts
+    /// are gone (or whose artifact columns are NULL), the same way the
+    /// extract arm terminalises a missing CAD. Returns `Failed` so the
+    /// cycle counts it and the FIFO head moves on.
+    async fn fail_post_artifact(
+        &self,
+        quote_id: &str,
+        attempt_n: u32,
+        reason: String,
+    ) -> Result<StepOutcome> {
+        let db = self.deps.db.clone();
+        let tenant_id_string = self.deps.tenant.as_str().to_string();
+        let binary_hash = self.deps.binary_hash;
+        let login = self.deps.operator_login.clone();
+        let quote_id = quote_id.to_string();
+        spawn_blocking(move || -> Result<StepOutcome> {
+            let mut conn = db
+                .write()
+                .context("shared writer: post-artifact failure (ADR-0098 Gap 1a)")?;
+            audit_ensure_schema(&conn).context("audit schema")?;
+            jobs::ensure_schema(&conn).context("jobs schema")?;
+            emit_failure(
+                &mut conn,
+                &tenant_id_string,
+                binary_hash,
+                &login,
+                &quote_id,
+                "post",
+                &reason,
+                attempt_n,
+            )?;
+            Ok(StepOutcome::Failed)
+        })
+        .await
+        .context("post-artifact-failure spawn_blocking join")?
+    }
+
     async fn advance_post(&self, row: PricingJobRow) -> Result<StepOutcome> {
         // Read row artifacts off-thread, then do the async HTTP POST
         // on the main runtime.
@@ -1833,13 +2130,34 @@ impl PricingPipelineService {
             .context("post-read spawn_blocking join")??
         };
         let (arts, hash, valid_until) = read_arts;
-        let pdf_path = arts
+        // D-PRICEQ — sibling of the extract-path artifact bug. These three
+        // reads used to bail with `?`, so a `posting_back` row whose PDF had
+        // been cleaned off disk (or whose artifact columns were NULL) returned
+        // Err forever: never terminal, never advanced, and — before the
+        // poll_once fix — holding the FIFO head. Route them through the same
+        // audited failure path the rest of the state machine uses.
+        // "artifact missing" is the token `classify_failure` keys on for
+        // stage `post` → Permanent; a deleted PDF never comes back.
+        let resolved: std::result::Result<(String, Vec<u8>), String> = arts
             .pdf_path
-            .ok_or_else(|| anyhow!("PostingBack state but no pdf_path"))?;
-        let breakdown_json = arts
-            .breakdown_json
-            .ok_or_else(|| anyhow!("PostingBack state but no breakdown_json"))?;
-        let pdf_bytes = std::fs::read(&pdf_path).with_context(|| format!("read pdf {pdf_path}"))?;
+            .ok_or_else(|| "PostingBack state but no pdf_path (artifact missing)".to_string())
+            .and_then(|p| {
+                let breakdown = arts.breakdown_json.ok_or_else(|| {
+                    "PostingBack state but no breakdown_json (artifact missing)".to_string()
+                })?;
+                let bytes = std::fs::read(&p).map_err(|e| {
+                    format!("PDF artifact missing or unreadable on disk at {p}: {e}")
+                })?;
+                Ok((breakdown, bytes))
+            });
+        let (breakdown_json, pdf_bytes) = match resolved {
+            Ok(t) => t,
+            Err(reason) => {
+                return self
+                    .fail_post_artifact(&quote_id, row.attempt_n, reason)
+                    .await
+            }
+        };
 
         let post_result = self
             .post_priced_writeback(
@@ -2961,6 +3279,22 @@ pub fn classify_failure(stage: &str, reason: &str) -> FailureKind {
     // wrapper bubbles that verbatim into the reason. Retry can never
     // help — the customer must re-upload in a supported format.
     if stage == "extract" && r.contains("unsupported file extension") {
+        return FailureKind::Permanent;
+    }
+    // D-PRICEQ — the stale-job reaper's verdict is Permanent by
+    // construction: it only fires after the job has failed to move for
+    // STALE_JOB_REAP_AFTER, i.e. after every cycle in that window already
+    // retried it. Auto-retrying it again would re-wedge the row the reaper
+    // exists to clear.
+    if stage == "reaper" {
+        return FailureKind::Permanent;
+    }
+    // D-PRICEQ — a rendered artifact that is GONE from disk (the post arm's
+    // PDF, or the row's persisted breakdown) is permanent for the same reason
+    // a missing CAD is: no amount of retrying re-creates a deleted file.
+    // Checked BEFORE the transport tokens below — this failure never reached
+    // the wire, so it has no HTTP verdict to classify on.
+    if stage == "post" && r.contains("artifact missing") {
         return FailureKind::Permanent;
     }
     // POST-back classification — split on HTTP status family + transport
@@ -6774,7 +7108,7 @@ mod tests {
         std::fs::write(&blob_path, &bytes).unwrap();
 
         let row = svc
-            .next_actionable_blocking()
+            .next_actionable_blocking(&[])
             .await
             .unwrap()
             .expect("a Fetched row is actionable");
@@ -6810,7 +7144,7 @@ mod tests {
         let svc = s430_service(&addr, db.clone(), artifacts.clone());
         svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap();
 
-        let row = svc.next_actionable_blocking().await.unwrap().unwrap();
+        let row = svc.next_actionable_blocking(&[]).await.unwrap().unwrap();
         let _ = svc.advance_one_step(row).await.unwrap();
 
         // The read fired exactly once (debounce is single-read here).
@@ -6825,6 +7159,372 @@ mod tests {
             stage.as_deref(),
             Some("decrypt"),
             "a valid encrypted blob must decrypt cleanly"
+        );
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── D-PRICEQ (2026-08-22 prod head-of-line incident) ──
+    //
+    // Prod symptom: a stale job (`aeb2771d`, an Aug-20 multi-solid STEP that
+    // failed permanently and was operator-Retried back to Fetched) sat
+    // non-terminal in `extracting` with its artifact directory already
+    // cleaned off disk. `next_actionable_job` is `ORDER BY fetched_at ASC
+    // LIMIT 1`, so every 60s cycle re-picked THAT row, hit a bare
+    // `fs::read(...)?`, returned Err, and `poll_once`'s error arm `break`ed
+    // the whole cycle. The day's real quote, queued behind it, never priced.
+    //
+    // Three pins below, one per compounding bug, plus the reaper backstop.
+    // All are python-free: the failures they drive are decrypt/read/state
+    // failures, never extractor-subprocess failures, so they hold on a box
+    // with no venv.
+
+    /// Mock storefront that answers the LIST poll with an empty (but
+    /// well-formed) quote list, so `poll_once` gets past
+    /// `list_and_enqueue_received` and into the advance loop, and serves CAD
+    /// bytes for any `/files/` GET.
+    async fn d_priceq_mock(cad_bytes: Vec<u8>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let cad = cad_bytes.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let resp: Vec<u8> = if req.contains("/files/") {
+                        let mut r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                             Content-Length: {}\r\n\r\n",
+                            cad.len()
+                        )
+                        .into_bytes();
+                        r.extend_from_slice(&cad);
+                        r
+                    } else if req.contains("/api/quotes") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 13\r\n\r\n{\"quotes\":[]}"
+                            .to_vec()
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 2\r\n\r\n{}"
+                            .to_vec()
+                    };
+                    let _ = sock.write_all(&resp).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Backdate a row's `fetched_at` / `updated_at` through the service's
+    /// OWN shared handle (a separate `Connection::open` would be invisible
+    /// to it — ADR-0098 Gap 1a).
+    fn d_priceq_backdate(
+        svc: &PricingPipelineService,
+        qid: &str,
+        fetched_at: &str,
+        updated_at: &str,
+    ) {
+        let conn = svc.deps.db.write().expect("backdate via shared handle");
+        conn.execute(
+            "UPDATE quote_pricing_jobs SET fetched_at = ?, updated_at = ?
+                WHERE quote_id = ?",
+            duckdb::params![fetched_at, updated_at, qid],
+        )
+        .expect("backdate UPDATE");
+    }
+
+    fn d_priceq_row(
+        svc: &PricingPipelineService,
+        qid: &str,
+    ) -> (String, Option<String>, Option<String>) {
+        let conn = svc.deps.db.read().expect("read via shared handle");
+        conn.query_row(
+            "SELECT state, error_stage, failure_kind FROM quote_pricing_jobs
+                WHERE quote_id = ?",
+            [qid],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .expect("job row")
+    }
+
+    /// **Bug 1 — the artifact that is gone.** `advance_extract` read the CAD
+    /// with a bare `std::fs::read(...)?`, so an ENOENT returned Err and the
+    /// job was NEVER marked Failed: it stayed non-terminal at the head of the
+    /// strict-FIFO queue forever, across restarts.
+    ///
+    /// Revert-proof: restore the bare `?` and this fails on the FIRST assert
+    /// — `advance_one_step` returns `Err`, not `Ok(StepOutcome::Failed)` —
+    /// and the row is left in `extracting`, exactly the prod state.
+    #[tokio::test]
+    async fn d_priceq_missing_cad_artifact_fails_the_job_not_the_cycle() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("missing-artifact.duckdb");
+        let artifacts = s430_temp("art");
+        let qid = "00000000-0000-0000-0000-00000000d001";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap();
+
+        // Prod condition: the artifact directory was cleaned off disk while
+        // the row stayed in the table.
+        std::fs::remove_dir_all(&artifacts).expect("clean the artifact dir");
+
+        let row = svc
+            .next_actionable_blocking(&[])
+            .await
+            .unwrap()
+            .expect("the Fetched row is actionable");
+        let outcome = svc
+            .advance_one_step(row)
+            .await
+            .expect("a missing artifact must NOT surface as Err — that is the bug");
+        assert!(
+            matches!(outcome, StepOutcome::Failed),
+            "a missing CAD artifact must terminalise the job, got {outcome:?}"
+        );
+
+        let (state, stage, kind) = d_priceq_row(&svc, qid);
+        assert_eq!(state, "failed", "row must be terminal");
+        assert_eq!(stage.as_deref(), Some("extract"));
+        assert_eq!(
+            kind.as_deref(),
+            Some("permanent"),
+            "a deleted file never comes back on a retry"
+        );
+        // The audited failure pair landed (the ledger is the durable record).
+        assert_eq!(s430_count_kind(&db, "quote.pricing_failed"), 1);
+        assert_eq!(s430_count_kind(&db, "quote.pricing_failure_classified"), 1);
+
+        // And the queue is unblocked: the head is gone from the actionable set.
+        assert!(
+            svc.next_actionable_blocking(&[]).await.unwrap().is_none(),
+            "a Failed row must leave the actionable set"
+        );
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **Bug 2 — one bad head froze the queue.** `poll_once`'s advance-error
+    /// arm did `tracing::warn!` then `break`, abandoning the cycle. The head
+    /// here is a `rendering` row with no `feature_graph_json`, which
+    /// `advance_render` still (correctly) reports as `Err` — a genuine
+    /// unadvanceable job that the failure path does not own. The row BEHIND
+    /// it must still be actioned in the SAME cycle.
+    ///
+    /// Revert-proof: change the `continue` back to `break` and the second
+    /// job stays `fetched` — the assert on its terminal state fails.
+    #[tokio::test]
+    async fn d_priceq_erroring_head_does_not_freeze_the_jobs_behind_it() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("head-of-line.duckdb");
+        let artifacts = s430_temp("art");
+        let head = "00000000-0000-0000-0000-00000000d002";
+        let behind = "00000000-0000-0000-0000-00000000d003";
+        // A third row, wedged long enough to be reaped — it pins that the
+        // reaper is actually WIRED INTO `poll_once` (the reaper's own
+        // behaviour is pinned separately below).
+        let wedged = "00000000-0000-0000-0000-00000000d007";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+
+        svc.enqueue_one(s430_quote(head, "head.step"))
+            .await
+            .unwrap();
+        svc.enqueue_one(s430_quote(behind, "behind.step"))
+            .await
+            .unwrap();
+        svc.enqueue_one(s430_quote(wedged, "wedged.step"))
+            .await
+            .unwrap();
+
+        // Head: force it into `rendering` with no feature_graph_json, so its
+        // advance returns Err (not Failed) every cycle. Backdate `fetched_at`
+        // so strict FIFO puts it first; keep `updated_at` fresh so the reaper
+        // does NOT fire and steal the point of this test.
+        {
+            let conn = svc.deps.db.write().expect("wedge via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET state = 'rendering' WHERE quote_id = ?",
+                duckdb::params![head],
+            )
+            .expect("force rendering");
+        }
+        let fresh = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        d_priceq_backdate(&svc, head, "2000-01-01T00:00:00Z", &fresh);
+        {
+            let conn = svc.deps.db.write().expect("wedge via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET state = 'posting_back' WHERE quote_id = ?",
+                duckdb::params![wedged],
+            )
+            .expect("force posting_back");
+        }
+        d_priceq_backdate(&svc, wedged, "2001-01-01T00:00:00Z", "2001-01-01T00:00:00Z");
+
+        // Behind: tamper its stored ciphertext so its extract fails at the
+        // DECRYPT stage — deterministic and python-free.
+        let blob = artifacts.join(behind).join("behind.step");
+        let mut bytes = std::fs::read(&blob).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&blob, &bytes).unwrap();
+
+        let summary = svc.poll_once().await;
+
+        assert_eq!(
+            summary.errored, 1,
+            "the head errored and was skipped, not aborted the cycle"
+        );
+        assert_eq!(
+            summary.reaped, 1,
+            "the reaper must run INSIDE the cycle — the wedged row is terminalised here, \
+             not one cadence later; summary = {summary:?}"
+        );
+        assert_eq!(
+            d_priceq_row(&svc, wedged).1.as_deref(),
+            Some("reaper"),
+            "the wedged row's terminal failure is attributed to the reaper"
+        );
+        assert!(
+            summary.failed >= 1,
+            "the job BEHIND the bad head must have been actioned this cycle; \
+             summary = {summary:?}"
+        );
+
+        let (behind_state, behind_stage, _) = d_priceq_row(&svc, behind);
+        assert_eq!(
+            behind_state, "failed",
+            "the job behind the wedged head must reach a terminal state in the SAME cycle"
+        );
+        assert_eq!(behind_stage.as_deref(), Some("decrypt"));
+
+        // The head itself is untouched — skipping is not a verdict.
+        let (head_state, _, _) = d_priceq_row(&svc, head);
+        assert_eq!(head_state, "rendering");
+
+        // Bug 4 — the cycle outcome is now in the LEDGER, not just the tty.
+        assert_eq!(
+            s430_count_kind(&db, "quote.pricing_cycle_outcome"),
+            1,
+            "a non-idle cycle writes exactly one cycle-outcome audit row"
+        );
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **Bug 3 — no reaper.** A job wedged in a STARTED, non-terminal state
+    /// held the head across reboots because nothing ever terminalised it.
+    /// Also pins the two false-positive guards: a `fetched` row is never
+    /// reaped no matter how old (queue-wait is not stuck), and a freshly
+    /// updated started row is never reaped.
+    ///
+    /// Revert-proof: gut `reap_stale_jobs` (or its threshold/state filter)
+    /// and the stale row stays `extracting`. This test drives the reaper
+    /// directly so the two false-positive guards stay deterministic; that it
+    /// is WIRED INTO `poll_once` is pinned by
+    /// `d_priceq_erroring_head_does_not_freeze_the_jobs_behind_it`.
+    #[tokio::test]
+    async fn d_priceq_stale_started_job_is_reaped_but_queue_wait_is_not() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("reaper.duckdb");
+        let artifacts = s430_temp("art");
+        let stale = "00000000-0000-0000-0000-00000000d004";
+        let waiting = "00000000-0000-0000-0000-00000000d005";
+        let fresh_started = "00000000-0000-0000-0000-00000000d006";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        for q in [stale, waiting, fresh_started] {
+            svc.enqueue_one(s430_quote(q, "part.step")).await.unwrap();
+        }
+
+        let long_ago = "2020-01-01T00:00:00Z";
+        let now_s = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        {
+            let conn = svc.deps.db.write().expect("stage via shared handle");
+            for (q, st) in [(stale, "extracting"), (fresh_started, "pricing")] {
+                conn.execute(
+                    "UPDATE quote_pricing_jobs SET state = ? WHERE quote_id = ?",
+                    duckdb::params![st, q],
+                )
+                .expect("force state");
+            }
+        }
+        // `stale` started work long ago and never moved.
+        d_priceq_backdate(&svc, stale, long_ago, long_ago);
+        // `waiting` has sat in `fetched` just as long — that is queue-wait,
+        // not stuck, and reaping it would fail a perfectly healthy job the
+        // moment the backlog got deep.
+        d_priceq_backdate(&svc, waiting, long_ago, long_ago);
+        // `fresh_started` is mid-flight right now.
+        d_priceq_backdate(&svc, fresh_started, long_ago, &now_s);
+
+        let reaped = svc.reap_stale_jobs().await;
+        assert_eq!(reaped, 1, "exactly the one stale STARTED row is reaped");
+
+        let (stale_state, stale_stage, stale_kind) = d_priceq_row(&svc, stale);
+        assert_eq!(stale_state, "failed");
+        assert_eq!(stale_stage.as_deref(), Some("reaper"));
+        assert_eq!(
+            stale_kind.as_deref(),
+            Some("permanent"),
+            "the reaper only fires after every cycle in the window already retried it"
+        );
+        assert_eq!(
+            d_priceq_row(&svc, waiting).0,
+            "fetched",
+            "an old `fetched` row is waiting its FIFO turn, NOT stuck"
+        );
+        assert_eq!(
+            d_priceq_row(&svc, fresh_started).0,
+            "pricing",
+            "a started row that moved recently is mid-flight, NOT stuck"
+        );
+        // The reap is audited through the ordinary failure pair.
+        assert_eq!(s430_count_kind(&db, "quote.pricing_failed"), 1);
+        assert_eq!(s430_count_kind(&db, "quote.pricing_failure_classified"), 1);
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// An IDLE cycle writes NO cycle-outcome row. Without this the daemon
+    /// appends a ledger entry every 60s forever — exactly the audit spam
+    /// S335 throttled for `EmailOutboxFetched`, and the reason
+    /// `QuotePollOutcome` fires only on failure.
+    #[tokio::test]
+    async fn d_priceq_idle_cycle_writes_no_audit_row() {
+        let addr = d_priceq_mock(b"unused".to_vec()).await;
+        let db = s430_temp("idle.duckdb");
+        let artifacts = s430_temp("art");
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+
+        let summary = svc.poll_once().await;
+        assert_eq!(summary.advanced, 0);
+        assert_eq!(summary.enqueued, 0);
+        assert!(summary.error.is_none(), "idle cycle must be clean");
+        assert_eq!(
+            s430_count_kind(&db, "quote.pricing_cycle_outcome"),
+            0,
+            "an idle cadence must write nothing"
         );
 
         let _ = std::fs::remove_dir_all(&artifacts);
