@@ -382,15 +382,17 @@ landing.
 `python/aberp-cad-extract/aberp_cad_extract/holes.py` emits `located_holes`
 into FeatureGraph v6. The named parts below are where each defect lives:
 `_skin_over_axis`, `_root_for_end`, `_walk_caps`,
-`DEGENERATE_ISOLINE_RATIO`, `SURFACE_CONFUSION_MM`.
+`_cap_axis_intersections`, `SURFACE_CONFUSION_MM`.
 
 **Missing for Live.** Eight items, in priority order — seven defects and
 one undecided convention. All are mutation-verified: items 1-5 from
-adversarial pass 8, items 6-8 from the D-19 round-2 pass. **Three are
-CLOSED**; five remain, and the gate stands until all of them are. Note
+adversarial pass 8, items 6-8 from the D-19 round-2 pass. **Four are
+CLOSED**; four remain, and the gate stands until all of them are. Note
 that the defects do **not** all fail in the same direction: 1, 2, 3, 5 and
 7 under-quote, 4 and 6 over-quote, and 6 does so by three orders of
-magnitude. Item 8 is a decision, not a direction.
+magnitude. Item 8 is a decision, not a direction — and D-19 round 4 found
+a **second face of that same decision** at the far end of the bore, which
+is recorded under item 8 rather than as a defect.
 
 1. ~~**N4 — undercut spherical cavity**~~ **— CLOSED.** (Ball-end seat;
    nose radius exceeds bore radius by `e >= 4e-7`.) Read **up to 87%
@@ -418,12 +420,24 @@ magnitude. Item 8 is a decision, not a direction.
    round-7 commit first recorded this as "4 of 92 configs"; that count was
    a grid-spacing artifact of the sweep and is corrected in that commit
    message.)
-4. **N2 — 118° drill-point apex admitted as a cap.** `DEGENERATE_ISOLINE_RATIO`
-   is `1e-9`, about **89× tighter** than `GeomAPI_IntCS`'s own noise floor,
-   so the apex passes as a cap. **Over-quotes** by the point length
-   (~0.3·D). Topology-dependent: 7/180 fused, ~49/100 two-step. Candidate
-   fix is raising the ratio to ~`1e-6`, which needs its own regression
-   sweep.
+4. ~~**N2 — 118° drill-point apex admitted as a cap.**~~ **— CLOSED by
+   D-19 round 4.** `DEGENERATE_ISOLINE_RATIO` was `1e-9` and the apex
+   passed as a cap, **over-quoting** by the point length (~0.3·D), in
+   both topologies. The round-4 diagnosis is sharper than "the ratio is
+   too tight", and it changes the fix: **the quantity is not a ratio at
+   all.** On a surface of revolution the collapsed derivative *is* the
+   root's own distance from the axis in millimetres, and its partner is
+   O(1) mm per mm, so the test only read as dimensionless by accident and
+   really asked *"is this root within a nanometre of the apex"* — which
+   only a part whose bore runs down a **world axis** answers yes to. So
+   the constant is now a LENGTH, `DEGENERATE_ISOLINE_SPAN_MM = 1e-4`,
+   with the margin measured across the corpus under nine orientations:
+   every collapsed isoline at most **2.4e-07 mm**, every live one at
+   least **1.0 mm**, nothing in between. The regression sweep item 4
+   asked for is `test_d19r4_backlog_item_4_the_drill_point_apex_is_closed`
+   — two topologies × three included angles × five point positions — and
+   the same constant is what a rotated **countersink** needed, which is
+   how round 4 found it. See round 4 under item 6.
 5. **N1 — breakout hole.** When the nose/point breaks the far face, the
    hole reads **blind** with a depth *exceeding the plate*, because the
    measurement runs to a pole in the air below the part.
@@ -474,6 +488,47 @@ magnitude. Item 8 is a decision, not a direction.
    **every part mined**, and the face box is built only where a survivor
    has to be judged — twelve times across the whole corpus, none of them
    on an ordinary plate.
+
+   **Round 4 — the bore that does not run down a world axis.** Round 3
+   asked the right OBJECT with the wrong RULER. A world-axis-aligned
+   bounding box projected onto a **tilted** axis is the face's real
+   extent *plus* its lateral extents times the direction's other
+   components, and that slack grows with the tilt — so the refusal that
+   stops the round-2 over-quote silently stops firing once the part is
+   tipped. Measured on the same breakout face: real axial extent ~10.7 mm
+   at every tilt, world-box projection 8.0 at 0°, 14.8 at 15°, 18.9 at
+   45°. The crossover is between **13° and 14°**, and past it
+   `far_opening_through_bore` is back to **24 mm of hole in a 20 mm
+   plate**. The probe that finds it is a whole-part **rotation**, and
+   under the round-3 rules **four of the 58 committed fixtures change
+   their answer** under one — both of round 2's flagship parts straight
+   back to the answers round 2 was written to fix. It was invisible
+   because every fixture that reaches this refusal has a
+   world-axis-parallel bore.
+   A second, independent leak in the same question: `BRepBndLib::Add`
+   bounds a B-spline by its **poles**, which stand outside the surface,
+   so the identical part read **12.0 THROUGH** as an analytic sphere and
+   **24.0 BLIND** one `BRepBuilderAPI_NurbsConvert` later — two answers
+   for one geometry, chosen by the exporter.
+   Fixed by asking the extent of the face's own **surface patch, in the
+   BORE's frame, optimally bounded**: the UV rectangle with the trim
+   thrown away (so a convex crown hidden under the bore's own exit hole
+   is still on it — a tight box of the *trimmed* face shortens
+   `bore_through_torus_wall` from 16.0 to 15.8997), transformed so the
+   bore's axis is Z, and `AddOptimal` rather than `Add` so a NURBS cap
+   measures as its analytic twin. **All 58 pre-existing fixtures are
+   bit-identical**, and the corpus is now invariant under **4350 rigid
+   motions** — 72 rotations and translations per part — where the
+   round-3 rules moved under 10.
+   Four new fixtures: a 20°-tilted breakout, the NURBS twin of
+   `far_opening_through_bore`, and two committed parts turned bodily.
+   Cost is split into ASKED and SPENT, because a bore whose mouth an
+   exporter has split into many edges reaches the same face once per
+   edge: `nurbs_far_opening_through_bore` asks the extent question 121
+   times and the material question 488 times about the same handful of
+   answers, which cost 1.5 s before the per-face and per-`t` memos and
+   47 ms after. Eleven boxes are built across the whole corpus and the
+   worst part spends 19 classifier queries.
 7. **R2-B — toroidal undercut (O-ring / snap-ring gland).** A gland at the
    bore's end reads **short and THROUGH**: a Ø8 bore with a R4 x 1.5
    gland at z=12 mines **6.5 THROUGH** where the axis has metal below
@@ -503,6 +558,37 @@ magnitude. Item 8 is a decision, not a direction.
    `located_holes` until it is settled, because the two readings differ by
    the full depth of the relief.
 
+   **The same decision at the FAR end (D-19 round 4).** The round-3
+   re-adversarial reported a Ø4 access hole into a R8 spherical chamber
+   as a **+91 % over-quote** — 33.0 against a solid-derived 17.254 — and
+   it is not a defect: it is this same undecided convention, at the
+   bottom of the bore instead of the mouth. That part is *literally*
+   `tools/generate_step_fixtures.py::_undercut_ball_seat` with a bigger
+   undercut, and the committed `undercut_ball_seat_blind_bore` is the
+   `undercut = 0.1` member of the same family, pinned at **14.1 — to the
+   cavity's far pole**, which is what D-19 round 1 was written to
+   install. The oracle that calls 33.0 an over-quote measures a bore to
+   the last place its **own wall** is the boundary, and by that measure
+   the committed fixture is wrong too: 6.9005 against its pinned 14.1, a
+   **51 % disagreement on a part nobody has called defective**. So the
+   question is the one item 8 already records — *how deep is a hole that
+   opens into something wider than itself: as far as the tool travels, or
+   as far as its own wall reaches?* — and nothing geometric separates the
+   two parts. The miner's answer is exactly "to the pole" at every
+   undercut from a ball nose to a chamber, continuous, with no feature
+   anywhere along it to hang a rule on; every candidate rule that would
+   close the chamber and keep the committed fixture is a **threshold on
+   the undercut**, which would be inventing the boundary rather than
+   measuring it. Left, deliberately, and pinned as a family rather than
+   half-fixed:
+   `test_d19r4_the_wide_chamber_is_the_undercut_seat_family_not_a_defect`
+   walks the sweep and asserts the continuity, and also that the chamber
+   does **not** move under any of the round-4 rigid motions, so it is not
+   an orientation defect wearing this one's clothes. Settling item 8
+   settles both ends together, and it touches
+   `undercut_ball_seat_blind_bore`, `undercut_ball_seat_blind_bore_d8`
+   and the ball-nose family as well as the three fixtures named above.
+
 **Blocked on.** Nothing external. This is purely our own work in one file.
 The adversarial-8 repros lived in the branch's `scratchpad/` and were not
 committed; they are regenerable from the descriptions above and from
@@ -517,9 +603,10 @@ they were indeed one fix — the boundary is gone rather than moved, so the
 answer no longer depends on whether OCCT can tell the seat from a tangent
 ball nose. Item 6 is that same fix's mirror and closed the same way, by
 replacing a presumption about position with a question put to the solid.
-Items 3, 4, 5 and 7 are independent; item 4 is a constant change whose
-blast radius is the whole fixture corpus, and item 8 is a decision rather
-than a fix.
+Items 3, 5 and 7 are independent; item 4 was the constant change whose
+blast radius was said to be the whole fixture corpus and turned out to
+move none of it, and item 8 is a decision rather than a fix — now with
+two ends to settle at once.
 
 ---
 

@@ -357,6 +357,37 @@ the reader and 1.83 s is mining. Which is why ``DEFAULT_TIMEOUT`` is left
 at 30 s — raising it would buy headroom for the reader, not for this
 module, and that case should be argued from a measurement of the reader.
 
+The part is not upright (D-19 round 4)
+---------------------------------------
+
+Nothing above is allowed to depend on which way the part is facing. A
+hole is a property of the part, and a rigid motion cannot change one, so
+any answer that moves when the part is turned is a defect in this module
+rather than a fact about the geometry.
+
+It is worth writing down because two rules broke it and neither was
+visible from the fixtures. Every committed part had its bore parallel to
+a world axis — a corpus of upright plates, which is what anyone builds —
+so a rule that only holds for an upright bore passed every one of them.
+Turning the whole part is the cheapest probe there is, and under the
+round-3 rules FOUR of the 58 committed fixtures changed their answer
+under one, two of them straight back to defects an earlier round had
+already fixed.
+
+The two rules, and both are stated in full where they live:
+
+- :func:`_face_axial_span` measured a face's reach along the bore's axis
+  with a WORLD-axis-aligned box, which on a tilted bore is a superset of
+  a superset — and past 13° of tilt the refusal it feeds stops firing.
+- :data:`DEGENERATE_ISOLINE_SPAN_MM` decided whether a root sits on a
+  collapsed isoline by a RATIO between two derivatives that are not
+  commensurable, which on a surface of revolution reduced to "is this
+  root within a nanometre of the axis" — true when the part is upright
+  and false a degree either side.
+
+``test_d19r4_the_corpus_is_invariant_under_rotation`` runs the probe over
+the whole corpus, and it belongs on any rule added here from now on.
+
 Contiguity (ADR-0112 adversarial, B3)
 --------------------------------------
 
@@ -430,13 +461,14 @@ try:
     from OCP.BRep import BRep_Tool
     from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
     from OCP.BRepBndLib import BRepBndLib
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_Transform
     from OCP.BRepClass3d import BRepClass3d_SolidClassifier
     from OCP.BRepTools import BRepTools
     from OCP.Geom import Geom_Line
     from OCP.GeomAbs import GeomAbs_SurfaceType
     from OCP.GeomAPI import GeomAPI_IntCS, GeomAPI_ProjectPointOnSurf
     from OCP.GeomLProp import GeomLProp_SLProps
-    from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Vec
+    from OCP.gp import gp_Ax1, gp_Ax3, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
     from OCP.TopAbs import (
         TopAbs_EDGE,
         TopAbs_FACE,
@@ -523,19 +555,41 @@ MAX_MERGE_GAP_FLOOR_MM: float = 1.0
 #: distance a root may travel is bounded by ownership instead.
 CAP_OUTWARD_MIN_COS: float = 1e-6
 
-#: Below this RATIO between the two surface-derivative magnitudes at a
-#: point, that point sits on a DEGENERATE isoline — a parametric line
-#: that has collapsed to a single point. A cone's apex and a sphere's
+#: Under this many MILLIMETRES of surface travel per unit parameter, an
+#: isoline has collapsed to a single point. A cone's apex and a sphere's
 #: pole are both such points, and the miner meets both: a countersink's
 #: cone and a domed cap are each swept about the bore's own axis, so the
 #: axis lands exactly on the degeneracy.
 #:
-#: A degeneracy floor, not a tuning knob, and measured with enormous
-#: margin on both sides. At a real degeneracy OCCT reports the collapsed
-#: derivative at ~1e-16 against ~1e0 for its partner — a ratio of 1e-16.
-#: At any regular point the two are within a few orders of magnitude of
-#: each other. Nothing real lives within nine orders of 1e-9.
-DEGENERATE_ISOLINE_RATIO: float = 1e-9
+#: A LENGTH, and D-19 round 4 is the whole of that word. This used to be
+#: a RATIO between the two derivative magnitudes at the point, at 1e-9 —
+#: and the two are not commensurable. On a surface of revolution the
+#: collapsed derivative is the root's own distance from the axis in mm
+#: while its partner is O(1) mm per mm, so "a ratio under 1e-9" really
+#: read "is this root within a NANOMETRE of the apex" — a question only
+#: a part whose bore runs down a world axis can answer yes to.
+#:
+#: `GeomAPI_IntCS` lands the apex root at 5e-16 mm off the axis on an
+#: upright ``countersunk_blind_bore`` and at 2.4e-07 mm off it once the
+#: part is rotated: still a quarter of a nanometre, still unambiguously
+#: the apex, and 240 times over a floor set at 1e-9. So the cone was read
+#: as an ordinary point, OCCT handed back the normal of whichever
+#: generatrix the intersector landed on, and the countersink capped the
+#: bore AT ITS APEX — 7.0 mm deep against a true 11.0, entry 4 mm inside
+#: solid metal, on the most ordinary feature in the corpus. Bistable with
+#: orientation, not monotone: right at 0°, wrong at 1°, right at 5° and
+#: 45° and 89°, wrong from 89.9° to 90.01°, right at 90.1°, wrong at
+#: 135° and 180°. `test_d19r4_a_collapsed_isoline_is_a_length_not_a_ratio`
+#: is that sweep.
+#:
+#: A degeneracy floor, not a tuning knob, and measured across the whole
+#: corpus under nine orientations — 5401 roots. Every COLLAPSED isoline
+#: measures at most 2.4e-07 mm; every LIVE one at least 1.0 mm. Three and
+#: a half orders of margin below, four above, and nothing whatever in
+#: between. A live isoline cannot get small, either: the axis meets a
+#: cone it is NOT coaxial with on the flank, where the isoline is a
+#: circle of the order of the bore's own radius.
+DEGENERATE_ISOLINE_SPAN_MM: float = 1e-4
 
 #: How far out of ONE PLANE, as a sine, the isoline tangents around a
 #: collapsed isoline may lie before that point is ruled to have no
@@ -1462,9 +1516,13 @@ def _crossing_normal(surface, u, v, direction) -> Optional[Tuple[float, float, f
     mag_v = math.sqrt(d_v.X() ** 2 + d_v.Y() ** 2 + d_v.Z() ** 2)
 
     u_min, u_max, v_min, v_max = surface.Bounds()
-    if mag_u <= DEGENERATE_ISOLINE_RATIO * mag_v:
+    # Which isoline has COLLAPSED, asked as a length in mm rather than as
+    # a ratio between two derivatives that are not commensurable — see
+    # :data:`DEGENERATE_ISOLINE_SPAN_MM`, which is where the rotated
+    # countersink went wrong.
+    if mag_u <= DEGENERATE_ISOLINE_SPAN_MM:
         lo, hi, along_u = u_min, u_max, True
-    elif mag_v <= DEGENERATE_ISOLINE_RATIO * mag_u:
+    elif mag_v <= DEGENERATE_ISOLINE_SPAN_MM:
         lo, hi, along_u = v_min, v_max, False
     else:
         # A regular point. OCCT's own normal is trustworthy here.
@@ -2657,7 +2715,15 @@ class _AxisMaterial:
     and goes.
     """
 
-    __slots__ = ("_shape", "_origin", "_direction", "_classifier", "_queries")
+    __slots__ = (
+        "_shape",
+        "_origin",
+        "_direction",
+        "_classifier",
+        "_queries",
+        "_extents",
+        "_metal",
+    )
 
     def __init__(self, shape, origin, direction) -> None:
         self._shape = shape
@@ -2665,6 +2731,35 @@ class _AxisMaterial:
         self._direction = direction
         self._classifier = None
         self._queries = 0
+        self._extents: List[Tuple[object, Optional[Tuple[float, float]]]] = []
+        self._metal: dict = {}
+
+    def _extent_of(self, face) -> Optional[Tuple[float, float]]:
+        """:func:`_face_axial_span` of ``face``, computed at most once.
+
+        Memoised PER FACE and per bore, which is the whole of what it is:
+        the span is a pure function of the face and this bore's axis, and
+        this oracle is built per bore. The walk reaches the same handful
+        of faces once per mouth EDGE, so on a bore whose mouth an
+        exporter has split into many edges the same face is asked over
+        and over — 121 times across ten faces on
+        ``nurbs_far_opening_through_bore``, at ~12 ms a call because
+        ``AddOptimal`` on a B-spline patch is not cheap. That is 1.5 s of
+        arithmetic for ten answers.
+
+        Note what is NOT cached, and could not be: any extent of the
+        WHOLE PART. That authority is what D-19 round 3 removed and
+        ``test_d19r3_the_extent_question_is_cheaper_and_cannot_go_back``
+        bans structurally. This holds one span per FACE, keyed on the
+        face itself, so it can only ever return the same answer a second
+        call would have computed.
+        """
+        for known, span in self._extents:
+            if face.IsSame(known):
+                return span
+        span = _face_axial_span(face, self._origin, self._direction)
+        self._extents.append((face, span))
+        return span
 
     def beyond_the_face(self, face, t: float) -> bool:
         """Is this crossing outside the extent of the face that made it?
@@ -2672,15 +2767,35 @@ class _AxisMaterial:
         One-sided: True means the crossing is certainly not this face's
         cap, False means nothing at all. Reached only where the void
         bound discarded a crossing AND no crossing of the face bounds
-        metal — ten times across the whole committed corpus — so the box
-        is built where it is asked for rather than cached.
+        metal — never on an ordinary plate — so the box is built where it
+        is asked for rather than for every part mined.
         """
-        span = _box_axial_span(face, self._origin, self._direction)
-        if span is None:  # pragma: no cover — a face with no extent
+        span = self._extent_of(face)
+        if span is None:  # pragma: no cover — a face OCCT will not bound
             return False
         return t < span[0] or t > span[1]
 
     def _inside(self, t: float) -> bool:
+        """Is the axis metal at ``t``? Asked of the solid, once per ``t``.
+
+        Memoised on ``t`` for the same reason :meth:`_extent_of` is
+        memoised on the face, and with the same guarantee: for one bore
+        this is a pure function of ``t``, so a second call can only
+        return what the first did.
+
+        Without it the cost tracks the number of EDGES the exporter split
+        the bore's mouth into rather than the number of crossings there
+        are to judge. ``nurbs_far_opening_through_bore`` reaches two
+        crossings and asked the classifier 488 times about them —
+        thirteen times round 1's whole-bore budget of 36, on a part with
+        one hole in it — which is what
+        ``test_n2_the_point_classifier_is_rationed_not_readmitted``
+        caught. It reaches them four times now, which is the number of
+        distinct questions.
+        """
+        cached = self._metal.get(t)
+        if cached is not None:
+            return cached
         point = _point_on_axis(self._origin, self._direction, t)
         if self._classifier is None:
             self._classifier = BRepClass3d_SolidClassifier(self._shape)
@@ -2688,7 +2803,9 @@ class _AxisMaterial:
         self._classifier.Perform(
             gp_Pnt(point[0], point[1], point[2]), MATERIAL_PROBE_TOL_MM
         )
-        return self._classifier.State() == TopAbs_IN
+        answer = self._classifier.State() == TopAbs_IN
+        self._metal[t] = answer
+        return answer
 
     def is_exit(self, t: float, sign: float, step: float) -> bool:
         """Does the metal at this end of the bore begin at ``t``?
@@ -2706,26 +2823,101 @@ class _AxisMaterial:
         return not self._inside(t - sign * step) and self._inside(t + sign * step)
 
 
-def _box_axial_span(shape, origin, direction) -> Optional[Tuple[float, float]]:
-    """One shape's bounding box, projected onto one axis.
+def _face_axial_span(face, origin, direction) -> Optional[Tuple[float, float]]:
+    """How far one face's own SURFACE reaches along ONE bore's axis.
 
-    The box is world-axis-aligned, so for a bore that is not it this is a
-    superset of a superset. That is fine and it is deliberate: the only
-    claim made of it is that a crossing OUTSIDE it is off the shape, and
-    a looser box makes that claim less often, never wrongly.
+    Three words, and each of them was a defect.
+
+    **ALONG THE AXIS.** The box has to be taken in the BORE'S frame, not
+    the world's. A world-axis-aligned box projected onto a tilted axis is
+    a superset of a superset: the projection of its eight corners spans
+    the face's true axial extent PLUS the lateral extents times the
+    direction's other components, and that slack grows with the tilt. On
+    the Ø8 breakout of ``far_opening_through_bore`` the face's real axial
+    extent is ~10.7 mm at every tilt, while the world box's projection
+    runs 8.0 at 0°, 14.8 at 15°, 18.9 at 45° — so a phantom pole 4 mm off
+    the part is refused while the part is upright and ADMITTED the moment
+    it is tipped. The crossover is between 13° and 14°, and past it the
+    round-2 over-quotes come back verbatim: 24 mm of hole in a 20 mm
+    plate. This is not a contrived orientation. A part arrives in the
+    orientation its CAD system left it in, and a hole is drilled where
+    the drawing says, not where the world axes are; a fixture corpus
+    whose every bore runs down Z simply cannot see it. Rotating the
+    committed corpus 31° about X and 40° about (1,1,1) moves FOUR of the
+    58 parts under the world box — including both of round 2's flagship
+    fixtures, each straight back to its pre-fix answer — and none at all
+    under this one. ``test_d19r4_the_corpus_is_invariant_under_rotation``
+    is that sweep, kept.
+
+    **THE FACE'S SURFACE**, not the trimmed face. A doubly-curved CONVEX
+    face's material boundary lies OUTSIDE its own trim curve, because the
+    bore cuts a disc out of the middle of the very crown it is measuring
+    against: a dome's crown stands 0.4 mm past where the bore trims it
+    (ADR-0112 round 3, blocker 2), and a torus wall's stands 0.1 mm past.
+    So the box is taken of the SURFACE PATCH over the face's UV
+    rectangle, with the trim — outer and inner alike — thrown away. The
+    crown is on the patch and stays; a breakout sphere's far pole is off
+    it and goes. A tight box of the TRIMMED face refuses the torus's
+    crown and shortens ``bore_through_torus_wall`` from 16.0 to 15.8997,
+    which is exactly the regression
+    ``test_r4_an_on_face_trim_test_would_have_re_broken_the_domes``
+    exists to forbid, and ``test_d19r4_the_extent_is_the_patch_not_the_trim``
+    pins the difference from the other side.
+
+    **OPTIMAL.** ``BRepBndLib::Add`` bounds a B-spline by its POLES, and
+    a NURBS sphere's poles stand well outside the sphere. So the same
+    geometry got two different answers depending only on which
+    representation the exporting CAD system happened to write: the
+    analytic ``far_opening_through_bore`` refuses its far pole and reads
+    12.0 THROUGH, and its NURBS twin — one ``BRepBuilderAPI_NurbsConvert``
+    apart, the same part by every measurement — admits it and reads 24.0
+    BLIND in a 20 mm plate. ``AddOptimal`` bounds the surface itself, so
+    the twins agree. ``test_d19r4_a_nurbs_cap_measures_as_its_analytic_twin``
+    pins the pair on both the breakout and the dome.
+
+    Still a BOX and still one-sided: True means the crossing is certainly
+    not this face's cap, False means nothing at all. A looser answer
+    refuses less often, never wrongly.
+
+    ``None`` where OCCT will not give a box at all — an unreadable
+    surface, a UV rectangle that is not finite — which
+    :meth:`_AxisMaterial.beyond_the_face` reads as no opinion, the safe
+    direction.
     """
-    box = Bnd_Box()
-    BRepBndLib.Add_s(shape, box)
-    if box.IsVoid():  # pragma: no cover — a shape with no geometry
+    try:
+        surface = BRep_Tool.Surface_s(face)
+        u_lo, u_hi, v_lo, v_hi = BRepTools.UVBounds_s(face)
+    except Exception:  # noqa: BLE001 — a face OCCT will not read has no extent
         return None
-    x_lo, y_lo, z_lo, x_hi, y_hi, z_hi = box.Get()
-    ts = [
-        _dot((x - origin[0], y - origin[1], z - origin[2]), direction)
-        for x in (x_lo, x_hi)
-        for y in (y_lo, y_hi)
-        for z in (z_lo, z_hi)
-    ]
-    return min(ts), max(ts)
+    if not all(math.isfinite(b) for b in (u_lo, u_hi, v_lo, v_hi)):
+        # An unbounded carrier — an infinite plane carried by a face OCCT
+        # declines to trim. It bounds nothing, so it refuses nothing.
+        return None
+    try:
+        patch = BRepBuilderAPI_MakeFace(
+            surface, u_lo, u_hi, v_lo, v_hi, SURFACE_CONFUSION_MM
+        )
+        if not patch.IsDone():  # pragma: no cover — a patch OCCT will not build
+            return None
+        frame = gp_Trsf()
+        frame.SetTransformation(
+            gp_Ax3(
+                gp_Pnt(origin[0], origin[1], origin[2]),
+                gp_Dir(direction[0], direction[1], direction[2]),
+            )
+        )
+        moved = BRepBuilderAPI_Transform(patch.Face(), frame, True).Shape()
+        box = Bnd_Box()
+        BRepBndLib.AddOptimal_s(moved, box, True, True)
+    except Exception:  # noqa: BLE001 — a surface OCCT will not bound has no extent
+        return None
+    if box.IsVoid():  # pragma: no cover — a patch with no geometry
+        return None
+    _x_lo, _y_lo, t_lo, _x_hi, _y_hi, t_hi = box.Get()
+    # `SetTransformation(gp_Ax3)` maps the world into the frame whose
+    # origin is the bore's and whose Z is the bore's direction, so the
+    # box's Z range IS the axial span, already in the bore's parameter.
+    return t_lo, t_hi
 
 
 def _void_slack(radius: float) -> float:

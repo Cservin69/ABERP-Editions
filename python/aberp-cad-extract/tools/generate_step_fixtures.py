@@ -38,7 +38,7 @@ from pathlib import Path
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
 from OCP.BRepAdaptor import BRepAdaptor_Curve
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer, BRepFilletAPI_MakeFillet
-from OCP.BRepBuilderAPI import BRepBuilderAPI_NurbsConvert
+from OCP.BRepBuilderAPI import BRepBuilderAPI_NurbsConvert, BRepBuilderAPI_Transform
 from OCP.BRepPrimAPI import (
     BRepPrimAPI_MakeBox,
     BRepPrimAPI_MakeCone,
@@ -47,7 +47,7 @@ from OCP.BRepPrimAPI import (
     BRepPrimAPI_MakeTorus,
 )
 from OCP.GeomAbs import GeomAbs_CurveType
-from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf
 from OCP.Interface import Interface_Static
 from OCP.ShapeUpgrade import ShapeUpgrade_ShapeDivideAngle
 from OCP.STEPControl import STEPControl_AsIs, STEPControl_Writer
@@ -62,6 +62,23 @@ def _cyl(x, y, z, dx, dy, dz, radius, height):
     """A cylinder of `radius`/`height` whose base sits at (x,y,z), axis (dx,dy,dz)."""
     axis = gp_Ax2(gp_Pnt(x, y, z), gp_Dir(dx, dy, dz))
     return BRepPrimAPI_MakeCylinder(axis, radius, height).Shape()
+
+
+def _turned(shape, centre, axis, degrees):
+    """``shape`` rigidly rotated ``degrees`` about ``axis`` through ``centre``.
+
+    A rigid motion, so every quantity the miner reports about a hole is
+    either invariant under it (diameter, depth, end condition, flat
+    bottom) or carried by it (entry point, axis). That is the whole point
+    of the fixtures that use it: the expected values are not measured off
+    the rotated part, they are the UPRIGHT part's own expectations put
+    through this same transform. See D-19 round 4.
+    """
+    move = gp_Trsf()
+    move.SetRotation(
+        gp_Ax1(gp_Pnt(*centre), gp_Dir(*axis)), math.radians(degrees)
+    )
+    return BRepBuilderAPI_Transform(shape, move, True).Shape()
 
 
 def _edges(shape):
@@ -1597,6 +1614,128 @@ def domed_floor_pocket_with_a_rib():
     return _domed_floor_pocket(1.2e-3, extra=_edge_rib(5.0))
 
 
+# ── D-19 round 4: the bore that does not run down a world axis ───────────
+#
+# Every fixture above this line has its bore parallel to a world axis, so
+# no rule that only holds for an axis-parallel bore could be caught by any
+# of them. Three of the four parts here are the SAME committed geometry
+# tilted or turned, which is the point: a rigid motion cannot change a
+# hole, and anything that moves under one is a defect in the miner rather
+# than a property of the part.
+
+
+def angled_far_opening_through_bore():
+    """``far_opening_through_bore``, drilled 20° off vertical.
+
+    100 x 100 x 20 plate. A O8 bore whose axis passes through
+    (50, 50, 10) at 20° from Z, relieved where it breaks out by a
+    R = 20/3 sphere centred 20/3 - 4 = 8/3 above the plate's underside on
+    that axis, exactly as the upright part is. One solid, cut from one
+    block.
+
+    Every dimension is stated, so the depth is arithmetic rather than a
+    measurement. Measuring along the axis from (50, 50, 10):
+
+    - the plate's top face is 10 mm above it in Z, so ``10 / cos 20°``
+      along the axis;
+    - the sphere's centre is at ``8/3 - 10 = -22/3``, and the bore's own
+      wall stops where the sphere meets it, ``sqrt(R² - r²) = 16/3``
+      back towards the plate — so the far end of the wall is at
+      ``-22/3 + 16/3 = -2``.
+
+    Depth is therefore ``2 + 10 / cos 20°``, and it is the same 12 mm of
+    wall the upright twin has, lengthened only by the obliquity.
+
+    Expected: 1 hole, O8.0, depth 12.641777724759122, THROUGH, not flat.
+
+    Before D-19 round 4: 24.641777724759122 and BLIND — 24 mm of hole in
+    a 20 mm plate, the round-2 over-quote back verbatim, because the
+    refusal that stops it read a WORLD-axis-aligned bounding box and
+    projected it onto a tilted axis. The crossover is between 13° and
+    14°; below it the part answers perfectly.
+    """
+    plate = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 100.0, 100.0, 20.0).Shape()
+    shaft = _cyl(50.0, 50.0, -10.0, 0, 0, 1, 4.0, 50.0)
+    ball = BRepPrimAPI_MakeSphere(gp_Pnt(50.0, 50.0, 8.0 / 3.0), 20.0 / 3.0).Shape()
+    cutter = _turned(
+        BRepAlgoAPI_Fuse(shaft, ball).Shape(), (50.0, 50.0, 10.0), (1, 0, 0), 20.0
+    )
+    return BRepAlgoAPI_Cut(plate, cutter).Shape()
+
+
+def nurbs_far_opening_through_bore():
+    """``far_opening_through_bore`` with its breakout carried as a B-SPLINE.
+
+    One ``BRepBuilderAPI_NurbsConvert`` apart from its analytic twin, and
+    the same part by every measurement — which is exactly why it belongs
+    here. A NURBS-exporting CAD system writes this and not the analytic
+    sphere, and the miner must not price the two differently.
+
+    Expected: identical to ``far_opening_through_bore`` — 1 hole, O8.0,
+    depth 12.0, entry (30, 30, 8), axis (0, 0, 1), THROUGH, not flat — to
+    fitting tolerance, as ``bore_through_nurbs_dome`` is.
+
+    Before D-19 round 4: 24.0 and BLIND against the twin's 12.0 and
+    THROUGH. ``BRepBndLib::Add`` bounds a B-spline by its POLES, and a
+    NURBS sphere's poles stand well outside the sphere, so the far pole
+    4 mm under the plate fell INSIDE the box that was supposed to refuse
+    it. Two answers for one geometry, chosen by the exporter.
+    """
+    block = _plate(None)
+    shaft = _cyl(30.0, 30.0, -5.0, 0, 0, 1, 4.0, 35.0)
+    ball = BRepPrimAPI_MakeSphere(gp_Pnt(30.0, 30.0, 8.0 / 3.0), 20.0 / 3.0).Shape()
+    nurbs = BRepBuilderAPI_NurbsConvert(ball, True).Shape()
+    return BRepAlgoAPI_Cut(block, BRepAlgoAPI_Fuse(shaft, nurbs).Shape()).Shape()
+
+
+def far_opening_through_bore_turned():
+    """``far_opening_through_bore``, the whole part turned 30° about X.
+
+    Not a new part: the committed file's own geometry under a rigid
+    motion about the world origin. Its hole is the committed hole, so its
+    expected diameter, depth, end condition and flat-bottom flag are the
+    committed ones to the bit, and its entry and axis are the committed
+    ones through the same rotation.
+
+    Before D-19 round 4: 24.0 and BLIND, which is
+    ``far_opening_through_bore``'s pre-round-2 answer restored by nothing
+    but turning the part over. Four of the 58 committed fixtures moved
+    under a rotation, and both of round 2's flagship parts went straight
+    back to the answers round 2 was written to fix.
+    """
+    return _turned(_far_opening(), (0.0, 0.0, 0.0), (1, 0, 0), 30.0)
+
+
+def countersunk_blind_bore_turned():
+    """``countersunk_blind_bore``, turned 30° about (1,1,1) through its centre.
+
+    The countersink's cone is swept about the bore's OWN axis, so the
+    axis meets it at exactly one point — the apex — and an apex is a
+    point the axis touches without crossing. `_crossing_normal` refuses
+    it by recognising that the root sits on a COLLAPSED isoline.
+
+    Before D-19 round 4 that recognition was a RATIO between two
+    derivative magnitudes that are not commensurable, and on a surface of
+    revolution it reduced to "is the root within a nanometre of the
+    apex". Upright, ``GeomAPI_IntCS`` lands it 5e-16 mm off and the test
+    fires. Turned, it lands 2.4e-07 mm off — still a quarter of a
+    nanometre, still unambiguously the apex — and the cone was read as an
+    ordinary surface: 7.000001 deep against a true 11.0, with the entry
+    at the apex, 4 mm inside solid metal. An UNDER-quote, and bistable
+    rather than monotone in the angle.
+
+    A translation does it too, and more plainly: the same part moved
+    1000 mm along X reads 7.000008, because the intersector's absolute
+    error grows with the coordinates and the floor it was compared
+    against did not. ``test_d19r4_a_collapsed_isoline_is_a_length_not_a_ratio``
+    keeps both.
+
+    Expected: the committed hole under the same rotation — O8.0, depth
+    11.0, BLIND, flat bottom.
+    """
+    return _turned(countersunk_blind_bore(), (20.0, 20.0, 10.0), (1, 1, 1), 30.0)
+
+
 FIXTURES = {
     "plate_4_through_holes.step": plate_4_through_holes,
     "blind_hole_flat_bottom.step": blind_hole_flat_bottom,
@@ -1669,6 +1808,11 @@ FIXTURES = {
         spherical_mouth_undercut_bore_with_a_boss
     ),
     "domed_floor_pocket_with_a_rib.step": domed_floor_pocket_with_a_rib,
+    # D-19 round 4: a bore that does not run down a world axis.
+    "angled_far_opening_through_bore.step": angled_far_opening_through_bore,
+    "nurbs_far_opening_through_bore.step": nurbs_far_opening_through_bore,
+    "far_opening_through_bore_turned.step": far_opening_through_bore_turned,
+    "countersunk_blind_bore_turned.step": countersunk_blind_bore_turned,
 }
 
 
