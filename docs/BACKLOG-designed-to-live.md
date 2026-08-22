@@ -446,6 +446,34 @@ magnitude. Item 8 is a decision, not a direction.
    same place and both read `(0,0,+1)`. Four committed fixtures, a
    13-crown sweep across the slack, a 6-cutter sweep, and direct
    arithmetic pins on all three selection rules.
+
+   **Round 3 — whose extent.** The refusal half above shipped keyed to
+   the **part's world bounding box**, and a bounding box is a property of
+   the whole part while the crossing it judges is a property of one face
+   of one bore. Any unrelated feature that reached past the crossing
+   enlarged the box and turned the refusal off, on a **single body cut
+   from one block**: a 4 mm leg under the far corner of the plate put
+   `far_opening_through_bore` back to **24 mm of hole in a 20 mm plate**
+   (+100%), and a 2.6 mm boss put `spherical_mouth_undercut_bore` back to
+   **13.188 and UNKNOWN** (+45.9%). Neither feature touches the bore, is
+   reached by it, or is within 20 mm of it. It was invisible because
+   every committed fixture held the part's overall extent fixed while
+   varying the bore, and because the direct pin on the selection rules
+   answered the refusal from a **stub**, which cannot have an extent at
+   all. Fixed by asking the extent of the **face that produced the
+   crossing** — the thing that made the claim, and the thing nothing
+   elsewhere on the part can move. Still a box, deliberately, because a
+   doubly-curved convex face's real material boundary lies *outside* its
+   own trim curve (a dome's crown sits 0.4 mm past it) and an on-face
+   test would re-break the domes. Three committed fixtures that vary the
+   part's extent while holding the bore fixed — a leg, a boss and a rib,
+   one per case — plus a four-shape / both-directions sweep bracketing
+   the flip at the pole itself, and the refusal re-pinned on a real face
+   and a real part instead of a stub. The stub is now barred from
+   answering it. Cheaper as well as right: the world box was built for
+   **every part mined**, and the face box is built only where a survivor
+   has to be judged — twelve times across the whole corpus, none of them
+   on an ordinary plate.
 7. **R2-B — toroidal undercut (O-ring / snap-ring gland).** A gland at the
    bore's end reads **short and THROUGH**: a Ø8 bore with a R4 x 1.5
    gland at z=12 mines **6.5 THROUGH** where the axis has metal below

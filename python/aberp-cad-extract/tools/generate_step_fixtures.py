@@ -1403,7 +1403,20 @@ def domed_floor_pocket_proud():
     return _domed_floor_pocket(5.0)
 
 
-def _domed_floor_pocket(crown: float):
+def _plate(extra=None):
+    """The 60 x 60 x 20 plate every round-2 and round-3 part is cut from.
+
+    ``extra`` is an unrelated feature fused in BEFORE the bore is cut, so
+    what comes out is one solid and not an assembly. D-19 round 3 is the
+    finding that such a feature used to change the bore's answer.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 60.0, 20.0).Shape()
+    if extra is None:
+        return block
+    return BRepAlgoAPI_Fuse(block, extra).Shape()
+
+
+def _domed_floor_pocket(crown: float, extra=None):
     """A Ø12 pocket, wall stopping at z=8, floored by a dome ``crown``
     mm proud of that.
 
@@ -1414,7 +1427,7 @@ def _domed_floor_pocket(crown: float):
     """
     radius = 6.0
     carrier = (radius * radius + crown * crown) / (2.0 * crown)
-    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 60.0, 20.0).Shape()
+    block = _plate(extra)
     cutter = _cyl(30.0, 30.0, 8.0, 0, 0, 1, radius, 30.0)
     dome = BRepPrimAPI_MakeSphere(
         gp_Pnt(30.0, 30.0, 8.0 + crown - carrier), carrier
@@ -1441,7 +1454,12 @@ def far_opening_through_bore():
     (0, 0, 1), THROUGH, not flat. Before D-19 round 2: 24.0 and BLIND,
     entering at z=20 — 24 mm of hole in 20 mm of plate.
     """
-    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 60.0, 20.0).Shape()
+    return _far_opening()
+
+
+def _far_opening(extra=None):
+    """:func:`far_opening_through_bore`, with an optional unrelated feature."""
+    block = _plate(extra)
     shaft = _cyl(30.0, 30.0, -5.0, 0, 0, 1, 4.0, 35.0)
     ball = BRepPrimAPI_MakeSphere(gp_Pnt(30.0, 30.0, 8.0 / 3.0), 20.0 / 3.0).Shape()
     return BRepAlgoAPI_Cut(block, BRepAlgoAPI_Fuse(shaft, ball).Shape()).Shape()
@@ -1473,10 +1491,110 @@ def spherical_mouth_undercut_bore():
     (30, 30, 18.408417140077212), axis (0, 0, -1), BLIND, flat bottom.
     Before D-19 round 2: 13.188 and UNKNOWN.
     """
-    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 60.0, 20.0).Shape()
+    return _mouth_undercut()
+
+
+def _mouth_undercut(extra=None):
+    """:func:`spherical_mouth_undercut_bore`, with an optional feature."""
+    block = _plate(extra)
     shaft = _cyl(30.0, 30.0, 9.368, 0, 0, 1, 2.0, 20.0 - 9.368)
     dish = BRepPrimAPI_MakeSphere(gp_Pnt(30.0, 30.0, 20.0), 2.556).Shape()
     return BRepAlgoAPI_Cut(block, BRepAlgoAPI_Fuse(shaft, dish).Shape()).Shape()
+
+
+# ── D-19 round 3: the extent that was the WRONG PART'S ───────────────────
+#
+# Round 2 refused a cap in mid-air for lying outside the PART's bounding
+# box. These three are round 2's own parts with ONE unrelated feature
+# added somewhere else on them — a leg, a boss, a rib, none of them
+# touching the bore, reached by it or near it — chosen so that the part's
+# box now reaches PAST the mid-air cap. Round 2 answers them the way it
+# answered before it was written; round 3 answers them correctly, because
+# it asks the extent of the FACE that produced the crossing.
+#
+# The feature's size is not a knob. The leg's foot is at z=-6 and the far
+# pole it must not rescue is at z=-4; the boss's top is at z=24 and the
+# pole is at 22.556. Anything that reaches past the pole does it, and
+# `test_d19r3_the_rescue_is_the_box_reaching_the_pole_and_nothing_else`
+# walks the size through the crossover to show that is the mechanism.
+
+
+def _corner_leg(depth: float):
+    """A 10 x 10 leg hanging ``depth`` mm UNDER the plate at (2, 2).
+
+    Thirty millimetres from a bore at (30, 30) and thirty from the Ø13.3
+    breakout sphere around it, so it shares no face, edge or vertex with
+    anything the miner looks at.
+    """
+    return BRepPrimAPI_MakeBox(gp_Pnt(2.0, 2.0, -depth), 10.0, 10.0, depth).Shape()
+
+
+def _corner_boss(height: float):
+    """A 10 x 10 boss standing ``height`` mm ON TOP of the plate at (2, 2)."""
+    return BRepPrimAPI_MakeBox(gp_Pnt(2.0, 2.0, 20.0), 10.0, 10.0, height).Shape()
+
+
+def _edge_rib(height: float):
+    """A 6 mm rib ``height`` mm tall along the whole y=0 edge of the plate."""
+    return BRepPrimAPI_MakeBox(gp_Pnt(0.0, 0.0, 20.0), 60.0, 6.0, height).Shape()
+
+
+def far_opening_through_bore_with_a_leg():
+    """`far_opening_through_bore` with a 6 mm leg under the far corner.
+
+    The plate is the same 60 x 60 x 20 and the bore is the same Ø8 that
+    breaks out through a sphere. The only change is a 10 x 10 leg hanging
+    6 mm below the plate at (2, 2) — 30 mm from the bore, fused into the
+    same single solid before the bore is cut.
+
+    The leg takes the part's bounding box down to z=-6. The breakout
+    sphere's far pole is at z=-4. So round 2's "is this cap outside the
+    part's extent?" now answers NO for a point four millimetres under the
+    plate's own bottom face, the refusal stops firing, and the bore comes
+    back 24.0 and BLIND in a plate 20 mm thick — exactly what it read
+    before round 2 was written.
+
+    Expected: 1 hole, O8.0, depth 12.0, entry (30, 30, 8), axis
+    (0, 0, 1), THROUGH, not flat — the same answer as the leg-less part,
+    to the bit. With the round-2 rule: 24.0 and BLIND.
+    """
+    return _far_opening(_corner_leg(6.0))
+
+
+def spherical_mouth_undercut_bore_with_a_boss():
+    """`spherical_mouth_undercut_bore` with a 4 mm boss on the far corner.
+
+    A 10 x 10 boss standing 4 mm proud of the plate's top face at (2, 2),
+    30 mm from the Ø4 bore and clear of the R2.556 dish that relieves its
+    mouth. It takes the part's box up to z=24; the dish's far pole is at
+    z=22.556, and round 2 stops refusing it.
+
+    Expected: 1 hole, O4.0, depth 9.040417140077212, entry
+    (30, 30, 18.408417140077212), axis (0, 0, -1), BLIND, flat bottom —
+    the boss-less answer to the bit. With the round-2 rule: 13.188 and
+    UNKNOWN, ending 2.556 mm above the plate's own top face.
+    """
+    return _mouth_undercut(_corner_boss(4.0))
+
+
+def domed_floor_pocket_with_a_rib():
+    """`domed_floor_pocket` with a 5 mm rib along one edge. THE CONTROL.
+
+    The dome's carrier is R=15000 and its far pole is 30 metres under the
+    plate, so no feature anyone would put on a 60 mm plate reaches it and
+    no bounding box was ever going to rescue it. This pocket is not saved
+    by the refusal at all — it is saved by the CROWN being recognised as
+    material, one branch earlier, and round 3 does not touch that branch.
+
+    Committed so that the claim is measured rather than reasoned: the
+    crown rescue must be bit-identical with an unrelated feature on the
+    part and without one.
+
+    Expected: 1 hole, O12.0, depth 11.9988, entry (30, 30, 20), axis
+    (0, 0, -1), BLIND, not flat — the rib-less answer to the bit, under
+    round 3 AND under round 2.
+    """
+    return _domed_floor_pocket(1.2e-3, extra=_edge_rib(5.0))
 
 
 FIXTURES = {
@@ -1545,6 +1663,12 @@ FIXTURES = {
     "domed_floor_pocket_proud.step": domed_floor_pocket_proud,
     "far_opening_through_bore.step": far_opening_through_bore,
     "spherical_mouth_undercut_bore.step": spherical_mouth_undercut_bore,
+    # D-19 round 3: an unrelated feature may not rescue a cap in mid-air.
+    "far_opening_through_bore_with_a_leg.step": far_opening_through_bore_with_a_leg,
+    "spherical_mouth_undercut_bore_with_a_boss.step": (
+        spherical_mouth_undercut_bore_with_a_boss
+    ),
+    "domed_floor_pocket_with_a_rib.step": domed_floor_pocket_with_a_rib,
 }
 
 

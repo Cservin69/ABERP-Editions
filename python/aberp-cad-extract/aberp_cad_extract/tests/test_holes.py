@@ -759,8 +759,11 @@ CLASSIFIER_PARTS = [
     "cross_drilled_shaft",
     "domed_floor_pocket",
     "domed_floor_pocket_proud",
+    "domed_floor_pocket_with_a_rib",
     "far_opening_through_bore",
+    "far_opening_through_bore_with_a_leg",
     "spherical_mouth_undercut_bore",
+    "spherical_mouth_undercut_bore_with_a_boss",
     "undercut_ball_seat_at_the_confusion_edge",
     "undercut_ball_seat_below_the_confusion",
     "undercut_ball_seat_blind_bore",
@@ -2437,7 +2440,7 @@ def test_r6_nearest_root_alone_re_breaks_the_ball_nose(
     monkeypatch.setattr(
         holes_mod,
         "_root_for_end",
-        lambda roots, t_edge, at_low, radius, t_inner, material=None: min(
+        lambda roots, t_edge, at_low, radius, t_inner, material=None, face=None: min(
             roots, key=lambda root: abs(root[0] - t_edge)
         ),
     )
@@ -2800,7 +2803,9 @@ def test_r7_the_tangency_tie_holds_as_the_pocket_is_walked_down():
     assert not wrong, f"{len(wrong)}/{len(depths)} depths mis-mined: {wrong[:5]}"
 
 
-def _round7_root_for_end(roots, t_edge, at_low, radius, _t_inner=None, _material=None):
+def _round7_root_for_end(
+    roots, t_edge, at_low, radius, _t_inner=None, _material=None, _face=None
+):
     """`_root_for_end` exactly as ADR-0112 round 7 shipped it.
 
     Nearest the mouth, with the two crossings of a TANGENT cap broken by
@@ -2847,7 +2852,7 @@ def test_r7_nearest_root_alone_re_breaks_the_whole_sweep(monkeypatch):
     monkeypatch.setattr(
         holes_mod,
         "_root_for_end",
-        lambda roots, t_edge, at_low, radius, t_inner, material=None: min(
+        lambda roots, t_edge, at_low, radius, t_inner, material=None, face=None: min(
             roots, key=lambda root: abs(root[0] - t_edge)
         ),
     )
@@ -2979,7 +2984,7 @@ def test_d19_no_true_cap_comes_near_the_void_bound(fixtures_dir: Path):
     kept, floors, hollow = [], [], []
     original = holes_mod._root_for_end
 
-    def spy(roots, t_edge, at_low, radius, t_inner, material=None):
+    def spy(roots, t_edge, at_low, radius, t_inner, material=None, face=None):
         if t_inner is not None:
             sign = -1.0 if at_low else 1.0
             slack = 0.5 * holes_mod._tangency_band(radius)
@@ -3002,7 +3007,7 @@ def test_d19_no_true_cap_comes_near_the_void_bound(fixtures_dir: Path):
                         else hollow
                     )
                     bucket.append(margin)
-        return original(roots, t_edge, at_low, radius, t_inner, material)
+        return original(roots, t_edge, at_low, radius, t_inner, material, face)
 
     holes_mod._root_for_end = spy
     checked = 0
@@ -3565,7 +3570,7 @@ def test_d19_nearest_root_alone_re_breaks_the_undercut_family():
 
     original = holes_mod._root_for_end
     holes_mod._root_for_end = (
-        lambda roots, t_edge, at_low, radius, t_inner, material=None: min(
+        lambda roots, t_edge, at_low, radius, t_inner, material=None, face=None: min(
             roots, key=lambda root: abs(root[0] - t_edge)
         )
     )
@@ -3683,13 +3688,13 @@ def test_d19_the_void_bound_narrows_and_never_empties(fixtures_dir: Path):
     emptied = []
     original = holes_mod._root_for_end
 
-    def spy(roots, t_edge, at_low, radius, t_inner, material=None):
+    def spy(roots, t_edge, at_low, radius, t_inner, material=None, face=None):
         if t_inner is not None:
             sign = -1.0 if at_low else 1.0
             slack = 0.5 * holes_mod._tangency_band(radius)
             if not [r for r in roots if sign * (r[0] - t_inner) >= -slack]:
                 emptied.append(len(roots))
-        return original(roots, t_edge, at_low, radius, t_inner, material)
+        return original(roots, t_edge, at_low, radius, t_inner, material, face)
 
     holes_mod._root_for_end = spy
     try:
@@ -3880,7 +3885,9 @@ def test_d19r2_fixtures_are_exact(fixtures_dir: Path, name):
     assert hole.flat_bottom is flat, name
 
 
-def _d19_round1_root_for_end(roots, t_edge, at_low, radius, t_inner, _material=None):
+def _d19_round1_root_for_end(
+    roots, t_edge, at_low, radius, t_inner, _material=None, _face=None
+):
     """`_root_for_end` exactly as D-19 round 1 shipped it.
 
     The void bound and the nearest pick, with no material question and
@@ -4166,31 +4173,53 @@ def test_d19_the_empty_fallback_is_pinned_directly_not_through_the_miner():
 
 
 class _StubMaterial:
-    """An `_AxisMaterial` that answers from two sets instead of a solid.
+    """An `_AxisMaterial` that answers the MATERIAL question from a set.
 
-    `_root_for_end` asks the oracle exactly two questions, so a stub that
-    answers them is enough to pin the SELECTION rule on its own — without
-    a part, without a kernel, and without `_walk_caps`'s
-    `except Exception: continue` in the way.
+    `_root_for_end` asks its oracle two questions and this stub answers
+    exactly one of them, which is the point. "Does the metal begin at
+    this crossing?" is a property of the crossing alone, so a stub can
+    stand in for the solid and pin the SELECTION rules without a part,
+    without a kernel and without `_walk_caps`'s `except Exception:
+    continue` in the way.
+
+    "Is this crossing outside the extent of the face that produced it?"
+    is NOT such a question — it is a question about a part and a face,
+    and a stub has neither. D-19 round 3 is the bill for having let one
+    answer it anyway: round 2's refusal keyed off the WHOLE PART's
+    bounding box, so any unrelated feature that enlarged the box turned
+    it off, and the stub could not see that because a stub has no extent
+    to vary. So it refuses to answer, loudly, and the arm is pinned on
+    real geometry by
+    ``test_d19r3_the_refusal_is_pinned_on_a_real_face_and_a_real_part``.
     """
 
-    def __init__(self, exits=(), off=()):
+    def __init__(self, exits=()):
         self._exits = set(exits)
-        self._off = set(off)
 
-    def off_the_part(self, t):
-        return t in self._off
+    def beyond_the_face(self, face, t):  # pragma: no cover — a guard
+        raise AssertionError(
+            "the off-the-face refusal may not be pinned by a stub: a stub "
+            "has no extent, and round 3's defect was that the refusal read "
+            "the wrong thing's extent. Pin it on real geometry instead — "
+            "see `test_d19r3_the_refusal_is_pinned_on_a_real_face_and_a_"
+            "real_part`"
+        )
 
     def is_exit(self, t, sign, step):
         return t in self._exits
 
 
 def test_d19r2_the_selection_rules_are_pinned_directly_as_arithmetic():
-    """The three round-2 outcomes, as return values, with a stub oracle.
+    """The round-2 SELECTION rules, as return values, with a stub oracle.
 
     The end-to-end fixtures say these rules produce the right PARTS. This
     says what the rules ARE, on hand-built crossings, and it reaches one
     thing the corpus does not: which of SEVERAL material exits wins.
+
+    Selection only. The refusal that follows it is a question about the
+    extent of a real face on a real part, the stub is barred from
+    answering it (see :class:`_StubMaterial`), and D-19 round 3 is what
+    happened the round a stub was allowed to.
 
     No committed part has two exits on one cap face — a cap face is one
     surface and the axis leaves the metal through it once — so the
@@ -4235,13 +4264,12 @@ def test_d19r2_the_selection_rules_are_pinned_directly_as_arithmetic():
     )
     assert got[0] == -5.0, got
 
-    # 4. No exit anywhere, and the only survivor is off the part: the
-    #    face contributes NO cap rather than one in mid-air.
-    oracle = _StubMaterial(off=(-900.0,))
-    assert holes_mod._root_for_end([crown, far], 0.0, True, 6.0, 0.0, oracle) is None
-
-    # 5. ... but a survivor that is merely unvalidated still stands, so
-    #    the refusal is about being off the part and nothing else.
+    # 4. No exit anywhere, and no face to judge the survivor against: it
+    #    stands, and the refusal arm is not reached. What the refusal
+    #    DOES is pinned on a real part and a real face by
+    #    `test_d19r3_the_refusal_is_pinned_on_a_real_face_and_a_real_part`,
+    #    because it is a question about extents and a stub has none —
+    #    which is exactly how round 2's defect stayed invisible.
     oracle = _StubMaterial()
     assert holes_mod._root_for_end([crown, far], 0.0, True, 6.0, 0.0, oracle)[0] == -900.0
 
@@ -4324,6 +4352,769 @@ def test_d19r2_the_material_probe_is_not_a_tuned_epsilon():
         )
 
 
+
+
+# ══ D-19 round 3: WHOSE extent ═══════════════════════════════════════════
+#
+# Round 2 refused a survivor crossing for lying outside the PART's own
+# bounding box. The refusal is right and the box is right; the PART is
+# not. A bounding box is a property of the whole shape and the crossing
+# is a property of one face of one bore, so any unrelated feature that
+# reaches further than the crossing does enlarges the box past it and
+# turns the refusal off — and both of round 2's over-quotes come back on
+# a single body cut from one block.
+#
+# What was invisible, and why. The end-to-end fixtures all held the
+# part's overall extent fixed while varying the bore, so not one of them
+# could see it; and the direct test of the selection rules answered the
+# refusal from a STUB, which cannot have an extent at all. The stub is
+# what hid the whole failure surface, so it no longer answers that
+# question — see `_StubMaterial.beyond_the_face`.
+
+
+def _r3_leg(depth):
+    """A 10 x 10 leg hanging ``depth`` mm under the plate at (2, 2)."""
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.gp import gp_Pnt
+
+    return BRepPrimAPI_MakeBox(gp_Pnt(2.0, 2.0, -depth), 10.0, 10.0, depth).Shape()
+
+
+def _r3_step(depth):
+    """A full-width step ``depth`` mm under the plate's y=0 edge."""
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.gp import gp_Pnt
+
+    return BRepPrimAPI_MakeBox(gp_Pnt(0.0, 0.0, -depth), 60.0, 8.0, depth).Shape()
+
+
+def _r3_boss(height):
+    """A 10 x 10 boss standing ``height`` mm on the plate at (2, 2)."""
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.gp import gp_Pnt
+
+    return BRepPrimAPI_MakeBox(gp_Pnt(2.0, 2.0, 20.0), 10.0, 10.0, height).Shape()
+
+
+def _r3_rib(height):
+    """A 6 mm rib ``height`` mm tall along the plate's whole y=0 edge."""
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.gp import gp_Pnt
+
+    return BRepPrimAPI_MakeBox(gp_Pnt(0.0, 0.0, 20.0), 60.0, 6.0, height).Shape()
+
+
+def _r3_plate(extra):
+    """The 60 x 60 x 20 plate, with ``extra`` fused in BEFORE the bore.
+
+    Fused first and cut second, so what the miner sees is ONE SOLID —
+    the finding is not about assemblies, and a part that arrived as two
+    bodies would be a different complaint.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.gp import gp_Pnt
+
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 60.0, 60.0, 20.0).Shape()
+    return block if extra is None else BRepAlgoAPI_Fuse(block, extra).Shape()
+
+
+def _r3_far_opening(extra=None):
+    """``far_opening_through_bore`` in memory, plus an unrelated feature."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeSphere
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    shaft = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(30.0, 30.0, -5.0), gp_Dir(0, 0, 1)), 4.0, 35.0
+    ).Shape()
+    ball = BRepPrimAPI_MakeSphere(gp_Pnt(30.0, 30.0, 8.0 / 3.0), 20.0 / 3.0).Shape()
+    return BRepAlgoAPI_Cut(
+        _r3_plate(extra), BRepAlgoAPI_Fuse(shaft, ball).Shape()
+    ).Shape()
+
+
+def _r3_mouth_undercut(extra=None):
+    """``spherical_mouth_undercut_bore`` in memory, plus a feature."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeSphere
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    shaft = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(30.0, 30.0, 9.368), gp_Dir(0, 0, 1)), 2.0, 20.0 - 9.368
+    ).Shape()
+    dish = BRepPrimAPI_MakeSphere(gp_Pnt(30.0, 30.0, 20.0), 2.556).Shape()
+    return BRepAlgoAPI_Cut(
+        _r3_plate(extra), BRepAlgoAPI_Fuse(shaft, dish).Shape()
+    ).Shape()
+
+
+def _r3_domed(extra=None, crown=1.2e-3):
+    """``domed_floor_pocket`` in memory, plus a feature."""
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeSphere
+    from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+
+    radius = 6.0
+    carrier = _crown_carrier(crown, radius)
+    cutter = BRepPrimAPI_MakeCylinder(
+        gp_Ax2(gp_Pnt(30.0, 30.0, 8.0), gp_Dir(0, 0, 1)), radius, 30.0
+    ).Shape()
+    dome = BRepPrimAPI_MakeSphere(
+        gp_Pnt(30.0, 30.0, 8.0 + crown - carrier), carrier
+    ).Shape()
+    return BRepAlgoAPI_Cut(
+        _r3_plate(extra), BRepAlgoAPI_Cut(cutter, dome).Shape()
+    ).Shape()
+
+
+#: The round-3 parts: name -> (diameter, depth, entry, axis, end, flat).
+#: Every one of them is a round-2 part with ONE unrelated feature added
+#: somewhere else on it, and every expected value is its round-2 twin's,
+#: unchanged — which is the whole claim.
+D19R3_FIXTURES = {
+    "far_opening_through_bore_with_a_leg": D19R2_FIXTURES["far_opening_through_bore"],
+    "spherical_mouth_undercut_bore_with_a_boss": D19R2_FIXTURES[
+        "spherical_mouth_undercut_bore"
+    ],
+    "domed_floor_pocket_with_a_rib": D19R2_FIXTURES["domed_floor_pocket"],
+}
+
+#: Which committed round-2 part each of them was built from.
+D19R3_TWINS = {
+    "far_opening_through_bore_with_a_leg": "far_opening_through_bore",
+    "spherical_mouth_undercut_bore_with_a_boss": "spherical_mouth_undercut_bore",
+    "domed_floor_pocket_with_a_rib": "domed_floor_pocket",
+}
+
+#: What the miner says on these parts when the refusal is put back to
+#: round 2 — the PART's world bounding box instead of the FACE's.
+#: name -> (depth, end condition). Measured on the committed files by
+#: ``test_d19r3_an_unrelated_feature_may_not_rescue_a_cap_in_mid_air``.
+D19R3_BEFORE = {
+    "far_opening_through_bore_with_a_leg": (24.0, HoleEndCondition.BLIND),
+    "spherical_mouth_undercut_bore_with_a_boss": (13.188, HoleEndCondition.UNKNOWN),
+    "domed_floor_pocket_with_a_rib": (12.0 - 1.2e-3, HoleEndCondition.BLIND),
+}
+
+
+def _round2_beyond_the_extent(self, _face, t):
+    """`_AxisMaterial.beyond_the_face` as D-19 round 2 shipped it.
+
+    The PART's world bounding box, projected onto the bore's axis, with
+    the face it is handed ignored — because round 2 was never handed one.
+    Kept verbatim in the tests so that round 2's claim stays checkable on
+    the parts that break it.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    span = holes_mod._box_axial_span(self._shape, self._origin, self._direction)
+    if span is None:
+        return False
+    return t < span[0] or t > span[1]
+
+
+@pytest.mark.parametrize("name", sorted(D19R3_FIXTURES))
+def test_d19r3_fixtures_are_exact(fixtures_dir: Path, name):
+    """The three round-3 parts, against the dimensions they were built from.
+
+    A 6 mm LEG under one corner, a 4 mm BOSS on another, and a 5 mm RIB
+    along one edge. None of them touches the bore, is reached by it, or
+    is within 20 mm of it; every one of them moves the part's bounding
+    box past a crossing the miner has to refuse.
+
+    ONE SOLID, asserted rather than intended. The feature is fused into
+    the block before the bore is cut, so this is a finding about a part a
+    machinist would recognise — a plate with a leg on it — and not about
+    an assembly, a multi-body STEP or anything the miner could reasonably
+    have declined to handle.
+    """
+    from OCP.TopAbs import TopAbs_SOLID
+    from OCP.TopExp import TopExp_Explorer
+
+    diameter, depth, entry, axis, end, flat = D19R3_FIXTURES[name]
+    with _silence_stdout_fd():
+        shape = _load_step_shape(str(fixtures_dir / f"{name}.step"))
+    explorer, solids = TopExp_Explorer(shape, TopAbs_SOLID), 0
+    while explorer.More():
+        solids += 1
+        explorer.Next()
+    assert solids == 1, f"{name}: {solids} solids; the finding is not about assemblies"
+
+    holes = _mine(fixtures_dir / f"{name}.step")
+    assert len(holes) == 1, f"{name}: got {[h.diameter_mm for h in holes]}"
+    hole = holes[0]
+    _approx(hole.diameter_mm, diameter)
+    _approx(hole.depth_mm, depth)
+    _approx_vec(hole.entry_point_mm, entry)
+    _approx_vec(hole.axis_unit, axis)
+    assert hole.end_condition is end, name
+    assert hole.flat_bottom is flat, name
+
+
+@pytest.mark.parametrize("name", sorted(D19R3_TWINS))
+def test_d19r3_the_unrelated_feature_moves_not_one_bit(fixtures_dir: Path, name):
+    """Stronger than "right": IDENTICAL to the part without the feature.
+
+    ``test_d19r3_fixtures_are_exact`` says the answers are correct to a
+    micron. This says they are the SAME FLOATS as the twin without the
+    leg, the boss or the rib — depth, end condition, entry point and axis
+    — because a feature 30 mm away has nothing to say about this bore and
+    a rule that reads its answer off the part's overall size is not
+    measuring the bore at all.
+    """
+    show = lambda holes: [
+        (
+            repr(h.diameter_mm),
+            repr(h.depth_mm),
+            h.end_condition.name,
+            [repr(v) for v in h.entry_point_mm],
+            [repr(v) for v in h.axis_unit],
+            h.flat_bottom,
+        )
+        for h in holes
+    ]
+    with_it = show(_mine(fixtures_dir / f"{name}.step"))
+    without = show(_mine(fixtures_dir / f"{D19R3_TWINS[name]}.step"))
+    assert with_it == without, name
+
+
+def test_d19r3_an_unrelated_feature_may_not_rescue_a_cap_in_mid_air(
+    fixtures_dir: Path,
+):
+    """THE REVERT-PROOF, and the measurement of :data:`D19R3_BEFORE`.
+
+    Put the refusal back to round 2 — the PART's world bounding box — and
+    the two breakout parts go straight back to the answers round 2 was
+    written to kill, on parts whose bores are bit-identical to the ones
+    round 2 fixed:
+
+    - the leg takes the box down to z=-6, past the breakout sphere's far
+      pole at z=-4, and the bore reads 24.0 and BLIND in a 20 mm plate —
+      four millimetres longer than the plate is thick, and a hole that
+      really does go right through it called closed at the bottom;
+    - the boss takes it up to z=24, past the mouth dish's far pole at
+      z=22.556, and the bore reads 13.188 and UNKNOWN.
+
+    The RIB part is the control and must not move under either rule: the
+    dome's far pole is 30 metres under the plate, so no box was ever
+    going to reach it, and what saves that pocket is the crown being
+    recognised as material one branch earlier. Round 3 does not touch
+    that branch and the assertion is that it did not.
+
+    The twins WITHOUT the feature are re-measured under the same reverted
+    rule in the same run, and must still be right — which is what makes
+    this a finding about the part's overall extent rather than about the
+    bore, the fixture or the reverted code being broken in general.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    original = holes_mod._AxisMaterial.beyond_the_face
+    holes_mod._AxisMaterial.beyond_the_face = _round2_beyond_the_extent
+    try:
+        rescued = {
+            name: _mine(fixtures_dir / f"{name}.step") for name in sorted(D19R3_BEFORE)
+        }
+        twins = {
+            name: _mine(fixtures_dir / f"{twin}.step")
+            for name, twin in sorted(D19R3_TWINS.items())
+        }
+    finally:
+        holes_mod._AxisMaterial.beyond_the_face = original
+
+    for name, was in sorted(D19R3_BEFORE.items()):
+        holes = rescued[name]
+        assert len(holes) == 1, name
+        assert holes[0].depth_mm == pytest.approx(was[0], abs=TOL), name
+        assert holes[0].end_condition is was[1], name
+
+    for name, twin in sorted(D19R3_TWINS.items()):
+        want = D19R2_FIXTURES[twin]
+        holes = twins[name]
+        assert len(holes) == 1, twin
+        assert holes[0].depth_mm == pytest.approx(want[1], abs=TOL), (
+            f"{twin} moved under the reverted rule, so this test is not "
+            "measuring what the extra feature did"
+        )
+        assert holes[0].end_condition is want[4], twin
+
+    # ... and the reverted rule really did move something, or the whole
+    # test is vacuous and the two rules are the same rule.
+    moved = [
+        name
+        for name in sorted(D19R3_BEFORE)
+        if abs(D19R3_BEFORE[name][0] - D19R3_FIXTURES[name][1]) > TOL
+    ]
+    assert moved == [
+        "far_opening_through_bore_with_a_leg",
+        "spherical_mouth_undercut_bore_with_a_boss",
+    ], moved
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "far_opening_through_bore_with_a_leg",
+        "spherical_mouth_undercut_bore_with_a_boss",
+    ],
+)
+def test_d19r3_every_rescued_answer_was_an_over_quote(name):
+    """And by how much, so the cost is a number and not an adjective.
+
+    The leg puts 24 mm of hole in a 20 mm plate — a 100 % over-quote, and
+    a depth longer than the material it is cut in. The boss quotes 13.188
+    against a true 9.0404 — 45.9 % — and calls a plainly blind pocket
+    UNKNOWN, which is what a downstream router does not know how to
+    price. Both are OVER, like the rest of round 2's family: an
+    over-quote loses the job rather than the margin.
+    """
+    was = D19R3_BEFORE[name][0]
+    truth = D19R3_FIXTURES[name][1]
+    assert was > truth + TOL, (name, was, truth)
+    over = 100.0 * (was - truth) / truth
+    expected = {
+        "far_opening_through_bore_with_a_leg": 100.0,
+        "spherical_mouth_undercut_bore_with_a_boss": 45.9,
+    }[name]
+    assert abs(over - expected) < 0.1, (name, over, expected)
+
+
+#: ``(builder, feature, sizes that clear the pole, sizes that reach past
+#: it, the pole's own axial position)`` — one row per round-2 defect, and
+#: the DOMED row is the control whose pole nothing reaches.
+D19R3_SWEEP = {
+    "far opening, leg": (
+        _r3_far_opening,
+        _r3_leg,
+        (1.0, 2.0, 3.0, 3.9),
+        (4.1, 6.0, 25.0),
+    ),
+    "far opening, step": (_r3_far_opening, _r3_step, (1.0, 3.9), (4.1, 12.0)),
+    "mouth undercut, boss": (
+        _r3_mouth_undercut,
+        _r3_boss,
+        (0.5, 1.0, 2.0, 2.5),
+        (2.6, 4.0, 10.0),
+    ),
+    "mouth undercut, rib": (_r3_mouth_undercut, _r3_rib, (0.5, 2.5), (2.6, 8.0)),
+    "domed floor, rib": (_r3_domed, _r3_rib, (0.5, 2.5, 2.6, 5.0, 40.0), ()),
+    "domed floor, leg": (_r3_domed, _r3_leg, (0.5, 4.1, 6.0, 40.0), ()),
+}
+
+
+def _r3_depth(shape):
+    """``(depth, end condition)`` of the one bore, or None."""
+    import aberp_cad_extract.holes as holes_mod
+
+    holes = holes_mod.mine_cylindrical_holes(shape)
+    if len(holes) != 1:
+        return None
+    return holes[0].depth_mm, holes[0].end_condition
+
+
+def test_d19r3_the_rescue_is_the_box_reaching_the_pole_and_nothing_else():
+    """The mechanism, swept: four feature shapes, both directions, either rule.
+
+    Three committed parts prove the defect exists. This proves what it
+    IS, which is the part of a finding that decides whether the fix is
+    the right one. A leg, a step, a boss and a rib — different shapes,
+    different faces, opposite sides of the plate — and the only thing
+    that matters about any of them is whether the box it makes reaches
+    PAST the mid-air crossing:
+
+    - under ROUND 2 every size short of the pole is right and every size
+      past it is wrong, on every shape, in both directions. The flip is
+      at z=-4 for the breakout sphere and z=+2.556 for the mouth dish,
+      which are the poles themselves and not a tolerance;
+    - under ROUND 3 nothing flips, anywhere, at any size, because the
+      face that produced the crossing does not grow when the part does.
+
+    The DOMED rows are the control: their pole is 30 metres under the
+    plate, no feature reaches it, and both rules are right at every size.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    truth = {
+        _r3_far_opening: (12.0, HoleEndCondition.THROUGH),
+        _r3_mouth_undercut: (
+            20.0 - math.sqrt(2.556**2 - 2.0**2) - 9.368,
+            HoleEndCondition.BLIND,
+        ),
+        _r3_domed: (12.0 - 1.2e-3, HoleEndCondition.BLIND),
+    }
+
+    def sweep():
+        out = {}
+        for label, (build, feature, clear, past) in sorted(D19R3_SWEEP.items()):
+            for size in clear + past:
+                out[(label, size)] = _r3_depth(build(feature(size)))
+        return out
+
+    got = sweep()
+    for (label, size), answer in sorted(got.items()):
+        build = D19R3_SWEEP[label][0]
+        want = truth[build]
+        assert answer is not None, f"round 3 dropped the bore: {label} {size}"
+        assert answer[0] == pytest.approx(want[0], abs=TOL), (label, size, answer)
+        assert answer[1] is want[1], (label, size, answer)
+
+    original = holes_mod._AxisMaterial.beyond_the_face
+    holes_mod._AxisMaterial.beyond_the_face = _round2_beyond_the_extent
+    try:
+        round2 = sweep()
+    finally:
+        holes_mod._AxisMaterial.beyond_the_face = original
+
+    for label, (build, _feature, clear, past) in sorted(D19R3_SWEEP.items()):
+        want = truth[build]
+        for size in clear:
+            answer = round2[(label, size)]
+            assert answer is not None and answer[0] == pytest.approx(
+                want[0], abs=TOL
+            ), (
+                f"{label} at {size} is SHORT of the pole and round 2 was "
+                f"already wrong there; got {answer}. That would make the "
+                "flip a tolerance rather than the pole"
+            )
+        for size in past:
+            answer = round2[(label, size)]
+            assert answer is None or abs(answer[0] - want[0]) > TOL, (
+                f"{label} at {size} reaches PAST the pole and round 2 still "
+                f"answered correctly; got {answer}. The sweep is not "
+                "reaching the defect it claims to bracket"
+            )
+
+
+def _r3_top_face(shape, origin, direction, want_span):
+    """The one face of ``shape`` whose axial box span is ``want_span``."""
+    import aberp_cad_extract.holes as holes_mod
+
+    found = [
+        face
+        for face in holes_mod._collect_faces(shape)
+        if holes_mod._box_axial_span(face, origin, direction)
+        == pytest.approx(want_span, abs=TOL)
+    ]
+    assert len(found) == 1, f"wanted one face spanning {want_span}, got {len(found)}"
+    return found[0]
+
+
+def test_d19r3_the_refusal_is_pinned_on_a_real_face_and_a_real_part():
+    """The refusal arm, as a return value, on geometry that VARIES the extent.
+
+    ``test_d19r2_the_selection_rules_are_pinned_directly_as_arithmetic``
+    pins the rest of `_root_for_end` with a stub oracle, and that is the
+    right shape for the rules that are pure selection. It is the WRONG
+    shape for this one, and round 3 is what that cost: a stub has no
+    extent, so a stub answering "is this crossing off the part?" cannot
+    have an opinion about which part, and the entire failure surface —
+    that the answer moved with a feature 30 mm from the bore — was
+    invisible to it. So this arm is pinned on a REAL part, a REAL face
+    and a REAL `_AxisMaterial`, twice: with an unrelated feature on the
+    part and without one.
+
+    The part is a plain 60 x 60 x 20 plate; the rib takes it to z=30. The
+    face is the plate's own TOP face, which spans exactly z=20 and z=20.
+    The crossings are hand-built: one at t=-0.5, inward of a mouth at
+    t=0, which the void bound discards, and one at t=25, which survives
+    only because of that discard. t=25 is INSIDE the ribbed part's box
+    and 5 mm OUTSIDE the face's, which is the whole difference between
+    the two rules stated as two numbers.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    origin, direction = (30.0, 30.0, 0.0), (0.0, 0.0, 1.0)
+    crossings = [_root(-0.5), _root(25.0)]
+
+    for label, extra in (("bare", None), ("ribbed", _r3_rib(10.0))):
+        shape = _r3_plate(extra)
+        top = _r3_top_face(shape, origin, direction, (20.0, 20.0))
+        material = holes_mod._AxisMaterial(shape, origin, direction)
+
+        # High end, mouth at t=0, so inward is t < 0 and outward is t > 0.
+        got = holes_mod._root_for_end(
+            crossings, 0.0, False, 6.0, 0.0, material, top
+        )
+        assert got is None, (
+            f"{label}: a crossing 5 mm past the face that produced it capped "
+            f"the bore anyway; got {got}"
+        )
+
+        # ... and the same survivor INSIDE the face's own extent stands,
+        # so the refusal is about being off the FACE and nothing else.
+        got = holes_mod._root_for_end(
+            [_root(-0.5), _root(20.0)], 0.0, False, 6.0, 0.0, material, top
+        )
+        assert got is not None and got[0] == 20.0, (label, got)
+
+    # And the two parts really do have different extents, or the loop
+    # above ran the same case twice.
+    spans = [
+        holes_mod._box_axial_span(_r3_plate(extra), origin, direction)
+        for extra in (None, _r3_rib(10.0))
+    ]
+    assert spans[0][1] == pytest.approx(20.0, abs=TOL), spans
+    assert spans[1][1] == pytest.approx(30.0, abs=TOL), spans
+
+
+
+def test_d19r3_the_extent_question_is_cheaper_and_cannot_go_back():
+    """The cost of the refusal, measured, and the old authority, banned.
+
+    Round 2 built ONE bounding box OF THE WHOLE PART for every part it
+    mined, whether any bore asked the question or not — `BRepBndLib` walks
+    every face of the shape, and an ordinary four-hole plate paid for it
+    and then never used it. Round 3 builds a box of ONE FACE, only where
+    the void bound has discarded a crossing AND nothing bounds metal, so:
+
+    - the four-hole plate builds NONE, where it used to build one;
+    - the whole committed corpus asks the question twelve times, each
+      time about a single face rather than a whole shape — ten on the
+      parts that were already there and one each on the two round-3
+      parts, which is what a rescued cap costs to refuse properly.
+
+    And the world box cannot quietly return. `_AxisMaterial` no longer
+    takes one, no longer caches one, and no longer answers the question
+    round 2 asked of it — pinned structurally rather than by prose,
+    because "we do not do that any more" is exactly the kind of claim
+    that decays into a comment.
+    """
+    import inspect
+
+    import aberp_cad_extract.holes as holes_mod
+    from OCP.TopAbs import TopAbs_FACE
+
+    assert not hasattr(holes_mod._AxisMaterial, "off_the_part"), (
+        "the part-wide extent test must stay gone: it answered a question "
+        "about one bore's crossing with a property of the whole part, and "
+        "any unrelated feature turned it off"
+    )
+    assert "_span" not in holes_mod._AxisMaterial.__slots__, (
+        "no per-part axial extent may be cached on the oracle again"
+    )
+    taken = list(inspect.signature(holes_mod._AxisMaterial.__init__).parameters)
+    assert taken == ["self", "shape", "origin", "direction"], (
+        f"`_AxisMaterial` must not be handed a part-wide box again; got {taken}"
+    )
+
+    here = Path(__file__).parent / "fixtures"
+    asked = []
+    original = holes_mod._AxisMaterial.beyond_the_face
+
+    def counting(self, face, t):
+        asked.append((face, t))
+        return original(self, face, t)
+
+    holes_mod._AxisMaterial.beyond_the_face = counting
+    try:
+        per_part = {}
+        for path in sorted(here.glob("*.step")):
+            asked.clear()
+            with _silence_stdout_fd():
+                shape = _load_step_shape(str(path))
+            holes_mod.mine_cylindrical_holes(shape)
+            per_part[path.stem] = list(asked)
+    finally:
+        holes_mod._AxisMaterial.beyond_the_face = original
+
+    assert per_part["plate_4_through_holes"] == [], (
+        "an ordinary plate must not build a bounding box for this question "
+        "at all; round 2 built one for every part ever mined"
+    )
+    every = [call for calls in per_part.values() for call in calls]
+    assert len(every) == 12, (
+        f"the corpus asks the extent question {len(every)} times, not 12. "
+        "That is not a budget — it is one per survivor the void bound "
+        "promoted with nothing bounding metal, and a change in it means a "
+        "change in which crossings reach the arm"
+    )
+    for face, _t in every:
+        assert face.ShapeType() == TopAbs_FACE, (
+            "the question must be asked of the FACE that produced the "
+            f"crossing, not of {face.ShapeType()}"
+        )
+    curious = sorted(name for name, calls in per_part.items() if calls)
+    assert curious == [
+        "bore_into_fillet",
+        "bore_through_a_domed_shoulder",
+        "bore_through_torus_wall",
+        "cross_drilled_shaft",
+        "far_opening_through_bore",
+        "far_opening_through_bore_with_a_leg",
+        "spherical_mouth_undercut_bore",
+        "spherical_mouth_undercut_bore_with_a_boss",
+    ], curious
+
+
+
+def _axial_material_root_for_end(
+    roots, t_edge, at_low, radius, t_inner, material=None, _face=None
+):
+    """`_root_for_end` with the refusal asked of the AXIS instead of the face.
+
+    Round 3's rule, with one line changed: a survivor is refused when the
+    solid says AIR one band inward and AIR one band outward — "this
+    crossing bounds no metal, so it is not a cap" — instead of when it
+    lies outside the extent of the face that produced it. It is the
+    obvious local replacement for the part's bounding box, it asks the
+    authority `is_exit` already asks, and it is WRONG. Kept here so that
+    the reason it is wrong is a measurement.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    sign = -1.0 if at_low else 1.0
+    if t_inner is None:
+        live = list(roots)
+    else:
+        slack = holes_mod._void_slack(radius)
+        live = [root for root in roots if sign * (root[0] - t_inner) >= -slack]
+        if material is not None and len(live) != len(roots):
+            step = holes_mod._tangency_band(radius)
+            exits = [r for r in roots if material.is_exit(r[0], sign, step)]
+            if exits:
+                return min(exits, key=lambda root: sign * root[0])
+            if live:
+                live = [
+                    root
+                    for root in live
+                    if material._inside(root[0] - sign * step)
+                    or material._inside(root[0] + sign * step)
+                ]
+                if not live:
+                    return None
+    return min(live or roots, key=lambda root: abs(root[0] - t_edge))
+
+
+#: The committed parts an AXIAL material refusal gets wrong, and what it
+#: makes of them. Every one is a THROUGH bore whose real cap is the
+#: part's own outer surface, which is where the rule breaks.
+D19R3_AXIAL_REFUSAL_BREAKS = {
+    "bore_into_fillet": 29.802602427879002,
+    "bore_through_a_domed_shoulder": 27.937253933193772,
+    "bore_through_torus_wall": 15.899748742132001,
+    "cross_drilled_shaft": 27.495454169736004,
+}
+
+
+def test_d19r3_an_axial_material_refusal_cannot_do_this_job():
+    """WHY the refusal is not a solid probe, measured rather than argued.
+
+    The round-3 report asked for the extent test to be replaced by a
+    material determination on the axis — the same authority `is_exit`
+    uses one branch earlier, and the obvious thing to reach for. It
+    cannot work, and the reason is geometric rather than incidental: at a
+    genuine OPEN cap the axis is AIR ON BOTH SIDES. Inward is the bore's
+    own hollow and outward is the outside world, so a true cap on a
+    through bore is bit-for-bit indistinguishable, to any point query on
+    the axis, from a phantom pole floating in space. Every probe within
+    one bore radius of the crossing sees the hole.
+
+    So the rule refuses the true cap along with the phantom, and four
+    committed parts say so in millimetres — a cross-drilled bar, a bore
+    through a fillet, a bore through a torus wall and a bore through a
+    domed shoulder, all of which then fall back to the bore's own
+    parametric bound and read LONG. Every one of them is exact under the
+    face-extent rule that shipped.
+
+    Pinned because "we tried the obvious thing and it was wrong" is a
+    claim about the fix, and the next round should not have to rediscover
+    it. Note what does NOT move: the crown rescue is a material question
+    on the axis and it is the right one, because a floor has metal under
+    it. The difference is that a floor bounds metal and an open cap does
+    not.
+    """
+    import aberp_cad_extract.holes as holes_mod
+
+    here = Path(__file__).parent / "fixtures"
+
+    def verdicts():
+        out = {}
+        for name in sorted(D19R3_AXIAL_REFUSAL_BREAKS):
+            with _silence_stdout_fd():
+                shape = _load_step_shape(str(here / f"{name}.step"))
+            holes = holes_mod.mine_cylindrical_holes(shape)
+            out[name] = holes[0].depth_mm if len(holes) == 1 else None
+        return out
+
+    shipped = verdicts()
+    original = holes_mod._root_for_end
+    holes_mod._root_for_end = _axial_material_root_for_end
+    try:
+        axial = verdicts()
+    finally:
+        holes_mod._root_for_end = original
+
+    for name, broken in sorted(D19R3_AXIAL_REFUSAL_BREAKS.items()):
+        want = COMMITTED_ONE_HOLE.get(name)
+        if want is not None:
+            assert shipped[name] == pytest.approx(want[0], abs=TOL), (
+                f"{name} is not exact under the rule that shipped"
+            )
+        assert axial[name] == pytest.approx(broken, abs=TOL), (
+            f"{name}: an axial material refusal gives {axial[name]}, not the "
+            f"{broken} this test was written on. Either the rule changed or "
+            "the part did, and the claim it stands for needs re-measuring"
+        )
+        assert abs(axial[name] - shipped[name]) > TOL, (
+            f"{name} did not move, so it is not evidence of anything"
+        )
+
+    # ... and the round-2 and round-3 parts stay right under it, which is
+    # what makes this a statement about OPEN CAPS and not about the arm
+    # being broken in general.
+    holes_mod._root_for_end = _axial_material_root_for_end
+    try:
+        for name in sorted(D19R3_FIXTURES):
+            holes = _mine(here / f"{name}.step")
+            assert len(holes) == 1, name
+            assert holes[0].depth_mm == pytest.approx(
+                D19R3_FIXTURES[name][1], abs=TOL
+            ), (
+                f"{name} is wrong under the axial rule too; this test claims "
+                "the axial rule fails on OPEN CAPS specifically"
+            )
+    finally:
+        holes_mod._root_for_end = original
+
+
+def test_d19r3_the_round_3_parts_are_stable_under_a_reversed_walk(fixtures_dir: Path):
+    """S3 on the committed three, through the STEP files themselves."""
+    import aberp_cad_extract.holes as holes_mod
+
+    forward = {
+        name: _mine(fixtures_dir / f"{name}.step") for name in sorted(D19R3_FIXTURES)
+    }
+    collect = holes_mod._collect_faces
+    holes_mod._collect_faces = lambda shape: list(reversed(collect(shape)))
+    try:
+        backward = {
+            name: _mine(fixtures_dir / f"{name}.step")
+            for name in sorted(D19R3_FIXTURES)
+        }
+    finally:
+        holes_mod._collect_faces = collect
+
+    original = holes_mod._cap_axis_intersections
+    holes_mod._cap_axis_intersections = lambda face, origin, direction: list(
+        reversed(original(face, origin, direction))
+    )
+    try:
+        reordered = {
+            name: _mine(fixtures_dir / f"{name}.step")
+            for name in sorted(D19R3_FIXTURES)
+        }
+    finally:
+        holes_mod._cap_axis_intersections = original
+
+    show = lambda holes: [
+        (repr(h.depth_mm), h.end_condition.name, [repr(v) for v in h.entry_point_mm])
+        for h in holes
+    ]
+    for name in sorted(D19R3_FIXTURES):
+        assert show(forward[name]) == show(backward[name]), name
+        assert show(forward[name]) == show(reordered[name]), name
+
+
 #: Every committed fixture that mines exactly one hole, and the depth +
 #: end condition it was BUILT from. Used where a test has to say that the
 #: answer which survived some rule is the RIGHT answer and not merely a
@@ -4333,6 +5124,7 @@ COMMITTED_ONE_HOLE = dict(
     {name: (spec[1], spec[4]) for name, spec in R7_FIXTURES.items()},
     **{name: (spec[1], spec[4]) for name, spec in D19_FIXTURES.items()},
     **{name: (spec[1], spec[4]) for name, spec in D19R2_FIXTURES.items()},
+    **{name: (spec[1], spec[4]) for name, spec in D19R3_FIXTURES.items()},
 )
 
 
