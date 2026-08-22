@@ -442,6 +442,11 @@ const MAX_JOBS_PER_CYCLE: u32 = 5;
 ///
 /// `fetched` is NOT reapable — see `jobs::started_non_terminal_jobs` for why
 /// queue-wait must never be mistaken for stuck.
+///
+/// The same span doubles as the reaper's UPTIME gate — a row must have been
+/// stale for this long *while the daemon was running* (see
+/// [`PricingPipelineService::started_at`]), not merely across an overnight
+/// close of the desktop app.
 const STALE_JOB_REAP_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// D-PRICEQ — per-cycle cap on reaper work, so a pathological backlog cannot
@@ -502,6 +507,22 @@ pub struct PricingPipelineService {
     /// path encrypts downloaded CADs with `cad_blob.key`; the extract
     /// read path decrypts + emits `CadBlobRead` (debounced).
     cad_blob: CadBlobCtx,
+    /// D-PRICEQ adversarial B1 — when THIS daemon instance started, i.e. the
+    /// clock the stale-job reaper measures its window against.
+    ///
+    /// A job's `updated_at` freezes while the process is down, and Defense is
+    /// a foreground Tauri desktop app the operator closes overnight. Measured
+    /// against pure wall-clock, every row left mid-flight by an ordinary
+    /// close — and `MAX_JOBS_PER_CYCLE` (5) vs 4 advances per job means a
+    /// cycle with ≥2 actionable jobs ends with exactly one — comes back after
+    /// the weekend already past the threshold and is terminalised on reopen
+    /// WITHOUT a single live attempt. Gating on uptime instead means every
+    /// reaped row has had [`STALE_JOB_REAP_AFTER`] of LIVE cycles that failed
+    /// to move it, which is the condition the reaper was written for.
+    ///
+    /// Set to `now` by [`Self::new`]; tests construct the struct directly and
+    /// backdate it (see `s430_service_started_at`).
+    started_at: OffsetDateTime,
 }
 
 impl std::fmt::Debug for PricingPipelineService {
@@ -510,6 +531,7 @@ impl std::fmt::Debug for PricingPipelineService {
             .field("base_url", &self.config.base_url)
             .field("bearer", &"<redacted>")
             .field("poll_interval", &self.config.poll_interval)
+            .field("started_at", &self.started_at)
             .finish()
     }
 }
@@ -529,6 +551,7 @@ impl PricingPipelineService {
             deps,
             client,
             cad_blob,
+            started_at: OffsetDateTime::now_utc(),
         })
     }
 
@@ -623,7 +646,25 @@ impl PricingPipelineService {
     /// audit pair as any other terminal failure — with stage `"reaper"`, which
     /// is what distinguishes it in the ledger. Best-effort: a reaper fault is
     /// logged and the cycle continues (the advance loop is the priority).
+    ///
+    /// **Uptime-gated** (D-PRICEQ adversarial B1): reaps nothing until this
+    /// daemon instance has been up for [`STALE_JOB_REAP_AFTER`], so a row is
+    /// only ever condemned after that many minutes of LIVE cycles failed to
+    /// move it — never for an `updated_at` that merely froze while the app was
+    /// closed. See [`Self::started_at`]. This keeps the reaper what it was
+    /// designed to be — a backstop; the real prod wedge (a job whose CAD
+    /// artifact was cleaned off disk) is terminalised by the fail-loud extract
+    /// path on the FIRST cycle, with no reaper involvement at all.
     async fn reap_stale_jobs(&self) -> u32 {
+        let uptime = OffsetDateTime::now_utc() - self.started_at;
+        if uptime < time::Duration::seconds(STALE_JOB_REAP_AFTER.as_secs() as i64) {
+            tracing::debug!(
+                uptime_s = uptime.whole_seconds(),
+                threshold_s = STALE_JOB_REAP_AFTER.as_secs(),
+                "stale-job reaper: daemon uptime below the reap window; reaping nothing this cycle"
+            );
+            return 0;
+        }
         let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
@@ -3289,14 +3330,6 @@ pub fn classify_failure(stage: &str, reason: &str) -> FailureKind {
     if stage == "reaper" {
         return FailureKind::Permanent;
     }
-    // D-PRICEQ — a rendered artifact that is GONE from disk (the post arm's
-    // PDF, or the row's persisted breakdown) is permanent for the same reason
-    // a missing CAD is: no amount of retrying re-creates a deleted file.
-    // Checked BEFORE the transport tokens below — this failure never reached
-    // the wire, so it has no HTTP verdict to classify on.
-    if stage == "post" && r.contains("artifact missing") {
-        return FailureKind::Permanent;
-    }
     // POST-back classification — split on HTTP status family + transport
     // failure shape.
     if stage == "post" {
@@ -3307,6 +3340,23 @@ pub fn classify_failure(stage: &str, reason: &str) -> FailureKind {
         // string fallback below stays for pre-S347 Failed rows on disk.
         if let Some(kind) = writeback_failure_kind_from_reason(&r) {
             return kind;
+        }
+        // D-PRICEQ — a rendered artifact that is GONE from disk (the post
+        // arm's PDF, or the row's persisted breakdown) is permanent for the
+        // same reason a missing CAD is: no amount of retrying re-creates a
+        // deleted file.
+        //
+        // Checked AFTER the `writeback:` token lookup above, and that order is
+        // load-bearing (D-PRICEQ adversarial B2). A post-stage writeback reason
+        // embeds the REMOTE response body excerpt (`; body=…`), so a storefront
+        // 503 whose body happens to contain the words "artifact missing" was
+        // classified Permanent — a retryable blip permanently failing a
+        // customer's quote, which is exactly the classify-on-incidental-wording
+        // trap the S347 note above warns about. A LOCAL artifact failure never
+        // reached the wire and so never carries a `writeback:` prefix: it falls
+        // straight through the token lookup to here.
+        if r.contains("artifact missing") {
+            return FailureKind::Permanent;
         }
         if r.contains("http 401") || r.contains("http 403") {
             return FailureKind::Permanent;
@@ -6210,6 +6260,7 @@ mod tests {
             },
             client,
             cad_blob: CadBlobCtx::with_test_key(),
+            started_at: OffsetDateTime::now_utc() - time::Duration::days(1),
         }
     }
 
@@ -6695,6 +6746,7 @@ mod tests {
             },
             client,
             cad_blob: CadBlobCtx::with_test_key(),
+            started_at: OffsetDateTime::now_utc() - time::Duration::days(1),
         }
     }
 
@@ -6823,6 +6875,7 @@ mod tests {
             },
             client,
             cad_blob: CadBlobCtx::with_test_key(),
+            started_at: OffsetDateTime::now_utc() - time::Duration::days(1),
         }
     }
 
@@ -6973,10 +7026,29 @@ mod tests {
         addr
     }
 
+    /// A service whose daemon-uptime clock reads "up for a long time", so the
+    /// reaper's uptime gate (D-PRICEQ B1) is satisfied and reaper behaviour
+    /// stays deterministic in tests. The gate itself is pinned by
+    /// `d_priceq_mid_flight_row_survives_app_downtime`, which builds a
+    /// just-started service via [`s430_service_started_at`].
     fn s430_service(
         addr: &std::net::SocketAddr,
         db_path: std::path::PathBuf,
         artifact_dir: std::path::PathBuf,
+    ) -> PricingPipelineService {
+        s430_service_started_at(
+            addr,
+            db_path,
+            artifact_dir,
+            OffsetDateTime::now_utc() - time::Duration::days(1),
+        )
+    }
+
+    fn s430_service_started_at(
+        addr: &std::net::SocketAddr,
+        db_path: std::path::PathBuf,
+        artifact_dir: std::path::PathBuf,
+        started_at: OffsetDateTime,
     ) -> PricingPipelineService {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(800))
@@ -7001,6 +7073,7 @@ mod tests {
             },
             client,
             cad_blob: CadBlobCtx::with_test_key(),
+            started_at,
         }
     }
 
@@ -7523,6 +7596,137 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&artifacts);
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// **D-PRICEQ adversarial B1 — downtime is not stuckness.** Defense is a
+    /// foreground Tauri desktop app the operator closes at the end of the day,
+    /// and `MAX_JOBS_PER_CYCLE` (5) against 4 advances per job means every
+    /// cycle with ≥2 actionable jobs ends with exactly one row mid-flight
+    /// (e.g. `pricing`). Its `updated_at` freezes while the process is down,
+    /// so against pure wall-clock it comes back past the threshold — and the
+    /// reaper runs at the TOP of `poll_once`, before the advance loop — so on
+    /// reopen a perfectly resumable job was terminalised Failed/permanent
+    /// silently, without one live attempt.
+    ///
+    /// Revert-proof: delete the uptime gate at the top of `reap_stale_jobs`
+    /// and the first assert fails — the row is reaped. The second half is what
+    /// keeps that non-vacuous: the SAME row on the SAME service, with only the
+    /// daemon's `started_at` moved back, IS reaped, so the row was genuinely
+    /// reapable and the uptime gate is the one thing that spared it.
+    #[tokio::test]
+    async fn d_priceq_mid_flight_row_survives_app_downtime() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("downtime.duckdb");
+        let artifacts = s430_temp("art");
+        let overnight = "00000000-0000-0000-0000-00000000d009";
+        // A daemon that started RIGHT NOW — the operator just reopened the app.
+        let mut svc = s430_service_started_at(
+            &addr,
+            db.clone(),
+            artifacts.clone(),
+            OffsetDateTime::now_utc(),
+        );
+        svc.enqueue_one(s430_quote(overnight, "part.step"))
+            .await
+            .unwrap();
+        {
+            let conn = svc.deps.db.write().expect("stage via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET state = 'pricing' WHERE quote_id = ?",
+                duckdb::params![overnight],
+            )
+            .expect("force pricing");
+        }
+        // Mid-flight when the app was closed last night; `updated_at` froze
+        // there. 31 minutes is past STALE_JOB_REAP_AFTER by wall-clock — and
+        // wall-clock is exactly what must NOT decide this.
+        let last_night = (OffsetDateTime::now_utc() - time::Duration::minutes(31))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        d_priceq_backdate(&svc, overnight, &last_night, &last_night);
+
+        assert_eq!(
+            svc.reap_stale_jobs().await,
+            0,
+            "a row whose updated_at only froze while the app was CLOSED must not \
+             be reaped — the daemon has not run a single cycle against it yet"
+        );
+        assert_eq!(
+            d_priceq_row(&svc, overnight).0,
+            "pricing",
+            "the resumable mid-flight row must survive mere downtime"
+        );
+        assert_eq!(
+            s430_count_kind(&db, "quote.pricing_failed"),
+            0,
+            "no failure may be audited for a job that never had a live attempt"
+        );
+
+        // Same row, same service — only the daemon's uptime changes. Now the
+        // window IS backed by live cycles, so the backstop fires as designed.
+        svc.started_at = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        assert_eq!(
+            svc.reap_stale_jobs().await,
+            1,
+            "with the window backed by LIVE uptime the same row is reapable — \
+             the gate delays the reaper, it does not disable it"
+        );
+        let (state, stage, kind) = d_priceq_row(&svc, overnight);
+        assert_eq!(state, "failed");
+        assert_eq!(stage.as_deref(), Some("reaper"));
+        assert_eq!(kind.as_deref(), Some("permanent"));
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **D-PRICEQ adversarial B2 — classify on the token, not on the remote
+    /// body.** `WritebackOutcome::failure_reason` appends the storefront's own
+    /// response body (`; body=…`) to the persisted reason, so the post-stage
+    /// `"artifact missing"` rule — when checked BEFORE the `writeback:<tag>`
+    /// token lookup — permanently failed a customer's quote on a retryable
+    /// 5xx whose body excerpt merely contained those words. That is the exact
+    /// regression the S347 note ("classify on the token, NOT on incidental
+    /// Display wording") was written to prevent.
+    ///
+    /// Revert-proof: hoist the `artifact missing` arm back above the
+    /// `if stage == "post"` block and the first assert flips to `Permanent`.
+    /// The local half keeps the fix honest — moving the rule must not stop a
+    /// genuinely deleted PDF from being Permanent.
+    #[test]
+    fn d_priceq_writeback_5xx_stays_transient_when_the_body_says_artifact_missing() {
+        // Built from the real producer, not hand-written, so the fixture
+        // cannot drift from the reason string the post arm actually persists.
+        let reason = WritebackOutcome::AppErrored {
+            http_status: 503,
+            body_excerpt: "artifact missing from object store".to_string(),
+        }
+        .failure_reason();
+        assert!(
+            reason.contains("artifact missing") && reason.starts_with("writeback:"),
+            "fixture must be a writeback reason carrying the remote wording: {reason}"
+        );
+        assert_eq!(
+            classify_failure("post", &reason),
+            FailureKind::Transient,
+            "a storefront 5xx is retryable no matter what its body happens to \
+             say: {reason}"
+        );
+
+        // A LOCAL post-stage artifact failure never reached the wire, so it
+        // carries no `writeback:` prefix and still falls through to the
+        // artifact rule. A deleted PDF never comes back on a retry.
+        for local in [
+            "PostingBack state but no pdf_path (artifact missing)",
+            "PostingBack state but no breakdown_json (artifact missing)",
+            "PDF artifact missing or unreadable on disk at /a/b.pdf: No such file (os error 2)",
+        ] {
+            assert_eq!(
+                classify_failure("post", local),
+                FailureKind::Permanent,
+                "local artifact loss must stay Permanent: {local}"
+            );
+        }
     }
 
     /// An IDLE cycle writes NO cycle-outcome row. Without this the daemon

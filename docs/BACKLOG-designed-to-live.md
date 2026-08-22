@@ -429,6 +429,79 @@ they are likely one fix. Items 3, 4 and 5 are independent, and item 4 in
 particular is a constant change whose blast radius is the whole fixture
 corpus.
 
+<a id="d-20"></a>
+### D-20 — Pricing-queue hardening: three follow-ups the D-PRICEQ fix did not close
+
+**Surface today.** The head-of-line fix on the pricing daemon
+(`apps/aberp/src/quote_pricing_pipeline.rs`) closed the prod wedge: the
+extract path fails loud instead of returning `Err` forever, `poll_once`
+skips an erroring job instead of abandoning the cycle, a stale-job reaper
+backstops rows nothing can move (uptime-gated, so ordinary app downtime
+never condemns a job), every non-idle cycle writes a
+`quote.pricing_cycle_outcome` audit row, and the operator has a Retry
+route. The three items below were found by the adversarial pass on that
+fix, are **not** closed by it, and are recorded here deliberately rather
+than folded into it.
+
+**Missing for Live.**
+
+1. **A1 — the reaper conflates "stuck" with "starved".** The reaper's only
+   signal is `updated_at`, so it cannot tell a row *nothing can move* from a
+   row *the advance loop never reached*. `MAX_JOBS_PER_CYCLE` is 5, and the
+   advance loop spends one iteration per erroring job (they go on the
+   per-cycle skip list). With five or more erroring jobs ahead of it in
+   strict FIFO — reachable in practice because the operator Retry route
+   preserves `fetched_at`, so a retried old row jumps back to the head — a
+   healthy mid-flight row behind them never gets an attempt, and being the
+   **oldest** `updated_at` it is the row the reaper terminalises **first**.
+   The uptime gate does **not** cover this: uptime accrues perfectly well
+   while the row is being starved.
+
+   *Why it is not fixed here.* Every clean version of the fix changes
+   design already reviewed and cleared. (a) Gating the reap on the set of
+   jobs the advance loop actually attempted this cycle requires moving the
+   reaper **after** the advance loop; it deliberately runs first, so the
+   same cycle's FIFO lookup already steps past a wedge, and moving it
+   changes what `d_priceq_erroring_head_does_not_freeze_the_jobs_behind_it`
+   asserts (`errored == 1`, `reaped == 1`) because a stale row would now
+   get one live attempt first and may terminalise through the ordinary path
+   under a different stage. (b) Keeping the order and carrying the
+   *previous* cycle's attempted set means new cross-cycle daemon state with
+   its own eviction and restart semantics. The honest fix is to give the
+   reaper a **second signal** rather than a heuristic — persist a
+   `last_attempt_at` on the job row, bumped whenever the advance loop picks
+   the row up, so "un-reached" is distinguishable from "stuck" in the row
+   itself and the reaper keeps running where it runs today. That is a
+   schema change plus a migration, which is its own piece of work.
+
+   *Severity.* No customer-visible loss beyond a wrongly-Failed quote the
+   operator can Retry, and it needs a five-deep erroring backlog to fire.
+
+2. **A2 — the enqueue loop re-downloads and re-encrypts every still-
+   `received` quote, every cycle, before the idempotency check.** Cycle
+   wall-clock therefore grows with the size of the un-enqueued storefront
+   backlog rather than with new work. This is now load-bearing in a way it
+   was not before: the reaper's window is denominated in cycles, so a cycle
+   that takes minutes stretches every timing assumption around it. The fix
+   is to hoist the idempotency check above the download, which needs care
+   that the check stays correct for a row whose artifact write was
+   interrupted.
+
+3. **A3 — the Retry route is not edition-gated.** The route and its
+   response codes are compiled into Portable as well as Defense. Harmless
+   today — Portable never runs the pricing daemon, so `quote_pricing_jobs`
+   is always empty there and every retry answers 404 — but it is an
+   edition-surface drift, and the sibling routes around it are gated.
+
+**Blocked on.** Nothing external; all three are our own work in the pricing
+daemon.
+
+**Size.** A1 medium — the schema change is small, the design decision (what
+the reaper is allowed to conclude from) is the real content. A2 small-to-
+medium. A3 small.
+
+---
+
 ---
 
 ## Expansion slots on a Live capability
