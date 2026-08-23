@@ -421,10 +421,11 @@ pub enum ExtractError {
     /// round 2). This `Display` renders as `subprocess exceeded timeout
     /// of 30s`, and `classify_failure`'s `"timeout"` rule is gated on
     /// `stage == "post"`, so at `stage == "extract"` the reason falls
-    /// through every rule to the default. Bounded and safe: `Unknown`
-    /// auto-retries at most `UNKNOWN_AUTO_RETRY_CAP` (3) times and then
-    /// freezes pending an operator click, so a part that is simply too
-    /// big burns three deadlines and stops rather than looping.
+    /// through every rule to the default. Safe, because `Unknown` does not
+    /// loop: no kind of `Failed` row is auto-re-enqueued (D-PRICEQ A4 —
+    /// `UNKNOWN_AUTO_RETRY_CAP` has no reader on any scheduling path), so a
+    /// part that is simply too big fails once and waits for an operator, who
+    /// can see the timeout and decide.
     ///
     /// Recorded here because the round-1 commit said `Permanent` — that
     /// is what `HoleMiningFailed` classifies as, and it was carried over

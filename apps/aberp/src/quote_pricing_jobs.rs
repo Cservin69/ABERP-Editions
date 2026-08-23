@@ -94,24 +94,35 @@ pub enum JobState {
 }
 
 /// S290 / PR-271 — closed-vocab classifier verdict that rides alongside
-/// every `Failed` row. Lets the daemon decide whether to auto-re-enqueue
-/// (Transient) or wait for an operator Retry click (Permanent / Unknown
-/// past the auto-retry cap).
+/// every `Failed` row.
+///
+/// **D-PRICEQ A4 — it labels; it does not schedule.** Every `Failed` row,
+/// whatever its kind, waits for an operator Retry click: [`next_actionable_job`]
+/// excludes `Failed` outright. The verdict's live consumers are the operator
+/// panel badge and the `QuotePricingFailureClassified` audit payload — it tells
+/// the operator whether clicking Retry is likely to work. Bounded auto-retry
+/// for `Transient` is booked as D-20 A4 in `docs/BACKLOG-designed-to-live.md`.
 pub const FAILURE_KIND_TRANSIENT: &str = "transient";
 /// S290 / PR-271 — wait-for-operator failure (extractor stub, schema
 /// version mismatch, MarginFloor, missing material, 4xx).
 pub const FAILURE_KIND_PERMANENT: &str = "permanent";
 /// S290 / PR-271 — default when the classifier didn't recognise the
-/// error shape. Treated as Transient up to [`UNKNOWN_AUTO_RETRY_CAP`]
-/// auto-retries, then frozen pending operator action — defence against
-/// silent permanent loops on a future error we haven't classified yet.
+/// error shape. The honest "we have not seen this before" label, rather than a
+/// wrong confident verdict; the row waits for an operator Retry like every
+/// other `Failed` row (D-PRICEQ A4).
 pub const FAILURE_KIND_UNKNOWN: &str = "unknown";
 
-/// Auto-retry cap for `Unknown`-classified Failed rows. Three matches
+/// Intended auto-retry cap for `Unknown`-classified Failed rows. Three matches
 /// the storefront's "retry once or twice before giving up" intuition;
 /// the cap lives in code (not config) because changing it without an
 /// audit-row-emit change would silently shift behavior on prod —
 /// CLAUDE.md rule 12.
+///
+/// **D-PRICEQ A4 — this constant has no reader on any scheduling path.** There
+/// is no auto-retry to cap: [`next_actionable_job`] excludes `Failed` rows, so
+/// nothing re-enqueues one without an operator click. Kept because it is the
+/// cap the design calls for and D-20 A4 will wire; do NOT read a doc that
+/// mentions it as evidence that auto-retry exists.
 pub const UNKNOWN_AUTO_RETRY_CAP: u32 = 3;
 
 /// Closed-vocab failure-kind verdict. Rides on a Failed row's
@@ -119,13 +130,15 @@ pub const UNKNOWN_AUTO_RETRY_CAP: u32 = 3;
 /// `Unknown` for daemon scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
-    /// Retry on next cycle (network blip, 5xx, timeout).
+    /// A blip outside the job — network, 5xx, timeout, a full disk. Retrying
+    /// has a real chance of working, so the operator's Retry is worth a click.
+    /// (Nothing retries it automatically today — D-PRICEQ A4.)
     Transient,
     /// Wait for operator Retry click (extractor stub / bad input /
     /// schema-version mismatch / 4xx).
     Permanent,
-    /// Classifier didn't recognise the error. Capped auto-retry, then
-    /// surfaces operator-action-required.
+    /// Classifier didn't recognise the error. Surfaces as
+    /// operator-action-required, like every other `Failed` row (D-PRICEQ A4).
     Unknown,
 }
 

@@ -47,6 +47,7 @@
 //! it up. Single-responsibility per daemon — easier to reason about
 //! cadences, audit emit, and shutdown semantics.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -477,8 +478,10 @@ const MAX_JOBS_PER_CYCLE: u32 = 5;
 ///
 /// The same span doubles as the reaper's LIVE-CYCLE gate — a row must have
 /// been stale for this long *while the daemon was actually running cycles*
-/// (see [`PricingPipelineService::cycles_completed`]), not merely across an
-/// overnight close — or an overnight SLEEP — of the desktop app.
+/// (see [`PricingPipelineService::recent_cycle_marks`]), not merely across an
+/// overnight close — or an overnight SLEEP — of the desktop app. Both bounds
+/// are required: this wall-clock span AND a full window of cycles that really
+/// ran, whichever is EARLIER (D-PRICEQ adversarial B4).
 const STALE_JOB_REAP_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// D-PRICEQ — per-cycle cap on reaper work, so a pathological backlog cannot
@@ -540,8 +543,10 @@ pub struct PricingPipelineService {
     /// read path decrypts + emits `CadBlobRead` (debounced).
     cad_blob: CadBlobCtx,
     /// D-PRICEQ adversarial B3 — how many pricing cycles THIS daemon instance
-    /// has actually completed. The clock the stale-job reaper measures its
-    /// window against, and deliberately NOT a clock at all.
+    /// has actually completed, for the life of the process. Diagnostics and
+    /// the cycle-accounting pin only: the reaper's gate reads
+    /// [`Self::recent_cycle_marks`], because a monotonic total cannot express
+    /// "recently" (B4).
     ///
     /// A job's `updated_at` freezes whenever the daemon is not running cycles,
     /// and Defense is a foreground Tauri desktop app: the operator closes it
@@ -567,6 +572,36 @@ pub struct PricingPipelineService {
     /// [`Self::new`]; tests construct the struct directly and preload it (see
     /// `s430_service_cycles`).
     cycles_completed: AtomicU64,
+    /// D-PRICEQ adversarial B4 — WHEN the most recent completed cycles
+    /// happened. Oldest first, capped at [`Self::reaper_window_cycles`]
+    /// entries; one timestamp is pushed by each completed [`Self::poll_once`],
+    /// beside the [`Self::cycles_completed`] bump and under the same rule (a
+    /// cycle that bailed before the advance loop records nothing).
+    ///
+    /// **Why a window and not the counter.** r3 replaced wall clock with
+    /// `cycles_completed × poll_interval`, which is an absolute count SINCE
+    /// PROCESS START and never resets. Thirty cycles into an uptime the gate
+    /// stands permanently open and the reaper is pure wall clock again — B3
+    /// verbatim, one latch later. Two freezes with NO restart then condemn
+    /// mid-flight rows on the first cycle back, with zero live attempts: a
+    /// laptop that suspends after the first half hour of uptime, and a
+    /// storefront outage ≥ [`STALE_JOB_REAP_AFTER`] (during which `poll_once`
+    /// bails before the advance loop, correctly counting nothing, while every
+    /// mid-flight row's `updated_at` freezes). Both are guaranteed a victim:
+    /// `MAX_JOBS_PER_CYCLE` (5) against 4 advances per job leaves exactly one
+    /// row mid-flight each cycle.
+    ///
+    /// A bounded window of RECENT marks says what the counter cannot — that
+    /// the last [`STALE_JOB_REAP_AFTER`] worth of cycles were really run, here,
+    /// now — and it drains itself by simply not being refilled.
+    ///
+    /// Each mark is stamped at the END of its cycle, so a full window's oldest
+    /// mark under-reads the run of cycles by one cycle's duration — the gate is
+    /// that much less conservative than "30 cycles ran", bounded to 1/30th of
+    /// the span and floored anyway by the wall clock in [`Self::reaper_cutoff`].
+    /// Recording at cycle START would trade that for the opposite skew on a
+    /// long cycle; neither is worth a second timestamp per cycle.
+    recent_cycle_marks: Mutex<VecDeque<OffsetDateTime>>,
 }
 
 impl std::fmt::Debug for PricingPipelineService {
@@ -579,6 +614,7 @@ impl std::fmt::Debug for PricingPipelineService {
                 "cycles_completed",
                 &self.cycles_completed.load(Ordering::Relaxed),
             )
+            .field("cycle_marks_in_window", &self.cycle_marks_len())
             .finish()
     }
 }
@@ -599,6 +635,7 @@ impl PricingPipelineService {
             client,
             cad_blob,
             cycles_completed: AtomicU64::new(0),
+            recent_cycle_marks: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -690,17 +727,116 @@ impl PricingPipelineService {
             }
         }
 
-        // D-PRICEQ adversarial B3 — one completed cycle, counted. This is the
-        // reaper's entire notion of elapsed time (see
-        // [`Self::cycles_completed`]): the early return above, which bails
-        // before the advance loop, deliberately does NOT reach here, because a
-        // cycle that never offered the queue an attempt must not age a job
-        // towards being condemned.
+        // D-PRICEQ adversarial B3+B4 — one completed cycle, counted AND
+        // timestamped. The window of marks is the reaper's notion of elapsed
+        // time (see [`Self::recent_cycle_marks`]); the counter beside it is
+        // diagnostics. The early return above, which bails before the advance
+        // loop, deliberately does NOT reach here, because a cycle that never
+        // offered the queue an attempt must not age a job towards being
+        // condemned — and because a storefront outage is exactly a run of such
+        // bails, that omission is also what drains the window during one.
         self.cycles_completed.fetch_add(1, Ordering::Relaxed);
+        self.record_cycle_mark(OffsetDateTime::now_utc());
 
         summary.elapsed_ms = started.elapsed().as_millis() as u64;
         self.emit_cycle_outcome_audit(&summary).await;
         summary
+    }
+
+    /// D-PRICEQ adversarial B4 — how many completed cycles make up the
+    /// reaper's window: enough of them, at this daemon's cadence, to span
+    /// [`STALE_JOB_REAP_AFTER`].
+    ///
+    /// `.max(1)` on the divisor only guards a degenerate sub-second cadence
+    /// from dividing by zero; `.max(1)` on the result keeps the window
+    /// non-empty for a cadence LONGER than the threshold (where one completed
+    /// cycle is already more than a fair run). The shipped cadence is 60s, so
+    /// this is 30.
+    fn reaper_window_cycles(&self) -> usize {
+        let cadence_s = self.config.poll_interval.as_secs().max(1);
+        (STALE_JOB_REAP_AFTER.as_secs() / cadence_s).max(1) as usize
+    }
+
+    /// Record that a cycle completed at `at`, evicting marks that have fallen
+    /// out of the window. Called once per completed [`Self::poll_once`].
+    ///
+    /// A poisoned lock is recovered rather than propagated: the reaper is a
+    /// backstop, and taking the whole daemon down — or silently freezing the
+    /// window at its last contents, which would let a stale mark set age a job
+    /// forever — are both worse than carrying on with the data we have.
+    fn record_cycle_mark(&self, at: OffsetDateTime) {
+        let window = self.reaper_window_cycles();
+        let mut marks = self
+            .recent_cycle_marks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        marks.push_back(at);
+        while marks.len() > window {
+            marks.pop_front();
+        }
+    }
+
+    /// How many marks the window currently holds (diagnostics + tests).
+    fn cycle_marks_len(&self) -> usize {
+        self.recent_cycle_marks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// D-PRICEQ adversarial B4 — the instant a job's `updated_at` must predate
+    /// for the reaper to condemn it, or `None` when the reaper must not fire at
+    /// all this cycle.
+    ///
+    /// TWO independent bounds, and the cutoff is the EARLIER (`min`) of them,
+    /// so BOTH must hold before a row is reapable:
+    ///
+    /// 1. **The cycle window.** `None` until the window is FULL — fewer marks
+    ///    than [`Self::reaper_window_cycles`] means this daemon has not
+    ///    recently run enough cycles to have offered any job a fair run, which
+    ///    is the state after a boot, after a suspend, and after a storefront
+    ///    outage long enough to drain the window. Once full, the oldest mark is
+    ///    the start of that run of real cycles: a row that moved after it has
+    ///    been advanced within the window and is not stuck.
+    ///
+    /// 2. **The wall-clock floor**, `now - STALE_JOB_REAP_AFTER`. This is
+    ///    load-bearing in the FAST direction, which marks alone cannot see:
+    ///    [`poll_loop`](Self::poll_loop) backs off 5s then 15s after an errored
+    ///    cycle, and an errored cycle that reached the advance loop still
+    ///    counts — so a run of them completes a full 30-cycle window in about
+    ///    two and a half minutes. The window would then open on a job that has
+    ///    been stuck for minutes, not the half hour the threshold promises.
+    ///
+    /// Taking the min is what makes the pair conservative in both directions:
+    /// cycles that ran SLOWER than cadence (a backlog re-download; an app that
+    /// was closed for the night) push the cutoff EARLIER and delay the reaper,
+    /// and cycles that ran FASTER than cadence cannot pull it later than the
+    /// wall-clock floor.
+    fn reaper_cutoff(&self, now: OffsetDateTime) -> Option<OffsetDateTime> {
+        let window = self.reaper_window_cycles();
+        let window_start = {
+            let marks = self
+                .recent_cycle_marks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if marks.len() < window {
+                return None;
+            }
+            // The EARLIEST mark, not `front()`. These are wall-clock stamps and
+            // the window's whole purpose is to survive a suspend — which is
+            // exactly when the machine also takes an NTP correction, so the
+            // marks are not guaranteed monotonic. `min` is the conservative
+            // reading either way: a clock that steps BACK makes the newest
+            // marks the earliest, pushing the cutoff further into the past and
+            // reaping LESS, where `front()` would have handed back a
+            // post-jump-stale bound and degenerated to wall clock alone — the
+            // B4 hole, re-entered through the one event most likely to
+            // accompany the freeze. Bounded by `reaper_window_cycles` (30), so
+            // the scan is free.
+            *marks.iter().min()?
+        };
+        let wall_floor = now - time::Duration::seconds(STALE_JOB_REAP_AFTER.as_secs() as i64);
+        Some(window_start.min(wall_floor))
     }
 
     /// D-PRICEQ — terminalise jobs stuck in a STARTED, non-terminal state
@@ -712,39 +848,31 @@ impl PricingPipelineService {
     /// is what distinguishes it in the ledger. Best-effort: a reaper fault is
     /// logged and the cycle continues (the advance loop is the priority).
     ///
-    /// **Live-cycle-gated** (D-PRICEQ adversarial B1 → B3): reaps nothing until
-    /// this daemon instance has COMPLETED enough cycles to have offered the job
-    /// [`STALE_JOB_REAP_AFTER`] worth of attempts —
-    /// `cycles_completed × poll_interval`. A row is therefore only ever
-    /// condemned after that many minutes of cycles that were really run, never
-    /// for an `updated_at` that merely froze while the app was closed (B1) and
-    /// never for wall clock that ran on while the machine SLEPT with the app
-    /// open (B3). See [`Self::cycles_completed`]. This keeps the reaper what it
-    /// was designed to be — a backstop; the real prod wedge (a job whose CAD
-    /// artifact was cleaned off disk) is terminalised by the fail-loud extract
-    /// path on the FIRST cycle, with no reaper involvement at all.
+    /// **Live-cycle-WINDOW-gated** (D-PRICEQ adversarial B1 → B3 → B4): a row is
+    /// condemned only if it has been unmoved since before a FULL window of
+    /// cycles that really ran, AND for at least [`STALE_JOB_REAP_AFTER`] of
+    /// wall clock. See [`Self::reaper_cutoff`] for why both bounds are needed
+    /// and why the cutoff is their EARLIER edge. That is never satisfied by an
+    /// `updated_at` that merely froze while the app was closed (B1), nor by
+    /// wall clock that ran on while the machine SLEPT with the app open (B3),
+    /// nor by an uptime long enough to have latched a monotonic counter open
+    /// (B4). This keeps the reaper what it was designed to be — a backstop; the
+    /// real prod wedge (a job whose CAD artifact was cleaned off disk) is
+    /// terminalised by the fail-loud extract path on the FIRST cycle, with no
+    /// reaper involvement at all.
     async fn reap_stale_jobs(&self) -> u32 {
-        // `.max(1)` only guards a degenerate sub-second cadence from making the
-        // gate vacuous; the shipped cadence is 60s.
-        let cadence_s = self.config.poll_interval.as_secs().max(1);
-        let live_s = self
-            .cycles_completed
-            .load(Ordering::Relaxed)
-            .saturating_mul(cadence_s);
-        // A cycle that runs LONGER than the cadence (D-20 A2's backlog
-        // re-download) only makes this conservative: the gate then represents
-        // more real time than it claims, so the reaper fires later, never
-        // sooner.
-        if live_s < STALE_JOB_REAP_AFTER.as_secs() {
+        let now = OffsetDateTime::now_utc();
+        let Some(cutoff) = self.reaper_cutoff(now) else {
             tracing::debug!(
                 cycles_completed = self.cycles_completed.load(Ordering::Relaxed),
-                live_s,
+                marks_in_window = self.cycle_marks_len(),
+                window_cycles = self.reaper_window_cycles(),
                 threshold_s = STALE_JOB_REAP_AFTER.as_secs(),
-                "stale-job reaper: too few completed cycles to have given any job a \
-                 fair run; reaping nothing this cycle"
+                "stale-job reaper: too few RECENT completed cycles to have given any \
+                 job a fair run; reaping nothing this cycle"
             );
             return 0;
-        }
+        };
         let db = self.deps.db.clone();
         let tenant_id = self.deps.tenant.as_str().to_string();
         let binary_hash = self.deps.binary_hash;
@@ -757,8 +885,6 @@ impl PricingPipelineService {
             jobs::ensure_schema(&conn).context("jobs schema")?;
             let candidates =
                 jobs::started_non_terminal_jobs(&conn, &tenant_id, MAX_REAP_PER_CYCLE)?;
-            let now = OffsetDateTime::now_utc();
-            let cutoff = now - time::Duration::seconds(STALE_JOB_REAP_AFTER.as_secs() as i64);
             let mut reaped = 0u32;
             for row in candidates {
                 // `updated_at` is a VARCHAR; a row we cannot parse is NOT
@@ -787,13 +913,22 @@ impl PricingPipelineService {
                     break;
                 }
                 let stuck_for_s = (now - updated).whole_seconds().max(0);
+                // The effective cutoff can be EARLIER than
+                // `STALE_JOB_REAP_AFTER` ago (D-PRICEQ B4: the window of real
+                // cycles is the other bound), so the reason names both — the
+                // operator reading this in the ledger needs the bar the row
+                // actually failed to clear, not just the nominal one.
                 let reason = format!(
-                    "job stuck in state `{}` since {} ({}s with no progress, threshold {}s); \
-                     reaped to Failed by the stale-job reaper so it cannot hold the queue head",
+                    "job stuck in state `{}` since {} ({}s with no progress, threshold {}s, \
+                     unmoved since before {}); reaped to Failed by the stale-job reaper so it \
+                     cannot hold the queue head",
                     row.state.as_str(),
                     row.updated_at,
                     stuck_for_s,
                     STALE_JOB_REAP_AFTER.as_secs(),
+                    cutoff
+                        .format(&Rfc3339)
+                        .unwrap_or_else(|_| cutoff.to_string()),
                 );
                 emit_failure(
                     &mut conn,
@@ -1572,6 +1707,9 @@ impl PricingPipelineService {
             // The daemon reads on behalf of the quote engine to (re-)price.
             let requester = login.clone();
             if opened.was_legacy_plaintext {
+                // D-PRICEQ A2 — an audit-tx fault here is a DB blip, not a
+                // defect in this job. Tagged Transient; the append itself
+                // stays mandatory (the read must be audited or not happen).
                 crate::cad_blob::emit_legacy_plaintext_read(
                     &mut conn,
                     &tenant_id_string,
@@ -1579,7 +1717,8 @@ impl PricingPipelineService {
                     &login,
                     &quote_id,
                     &requester,
-                )?;
+                )
+                .with_context(|| format!("emit legacy-plaintext CAD read {TRANSIENT_LOCAL_TAG}"))?;
             }
             if cad_blob
                 .debounce
@@ -1593,12 +1732,15 @@ impl PricingPipelineService {
                     &quote_id,
                     &requester,
                     ReadPurpose::Reprice,
-                )?;
+                )
+                .with_context(|| format!("emit CAD blob read {TRANSIENT_LOCAL_TAG}"))?;
             }
-            let temp = DecryptedTempFile::write_beside(
-                Path::new(&arts.cad_local_path),
-                &opened.plaintext,
-            )?;
+            // D-PRICEQ A2 — same shape one stage earlier: the blob decrypted,
+            // and only landing the plaintext beside it failed (disk full,
+            // volume gone). Transient, not a verdict on the job.
+            let temp =
+                DecryptedTempFile::write_beside(Path::new(&arts.cad_local_path), &opened.plaintext)
+                    .with_context(|| format!("write decrypted CAD temp {TRANSIENT_LOCAL_TAG}"))?;
             let extractor = CadExtractor::new().with_python_bin(python_bin);
             let req = ExtractRequest {
                 input_path: temp.path().to_path_buf(),
@@ -2251,9 +2393,15 @@ impl PricingPipelineService {
             match aberp_quote_pdf::render(&inputs) {
                 Ok(bytes) => {
                     let dest_dir = artifact_dir.join(&quote_id);
-                    std::fs::create_dir_all(&dest_dir).context("mkdir pdf dest")?;
+                    // D-PRICEQ A2 — a full volume or an unmounted artifact
+                    // disk is transient: the PDF renders fine, it just cannot
+                    // be LANDED. Tagged so `classify_failure` says `Transient`
+                    // rather than falling through to `Unknown`.
+                    std::fs::create_dir_all(&dest_dir)
+                        .with_context(|| format!("mkdir pdf dest {TRANSIENT_LOCAL_TAG}"))?;
                     let pdf_path = dest_dir.join("priced.pdf");
-                    std::fs::write(&pdf_path, &bytes).context("write priced.pdf")?;
+                    std::fs::write(&pdf_path, &bytes)
+                        .with_context(|| format!("write priced.pdf {TRANSIENT_LOCAL_TAG}"))?;
                     let pdf_path_str = pdf_path.to_string_lossy().into_owned();
                     let pdf_size = bytes.len() as u64;
                     let set_outcome = jobs::set_rendered(
@@ -3406,6 +3554,28 @@ fn backoff_duration(idx: usize, cadence: Duration) -> Duration {
     }
 }
 
+/// D-PRICEQ A2 — the marker the daemon stamps on its OWN unmoved-but-TRANSIENT
+/// failure sites, so [`classify_failure`] can tell them apart from the
+/// unmoved-and-PERMANENT ones without guessing from an OS error string.
+///
+/// The sites it marks are the ones where a step that CANNOT finish is
+/// nonetheless not the job's fault and not the operator's: the PDF write at
+/// `Rendering` (a full volume, an unmounted artifact disk), the decrypted-CAD
+/// temp write at `Extracting`, and the two CAD-blob read-audit appends (a
+/// transient audit-tx fault). Each leaves the row in the arm it entered, so
+/// [`PricingPipelineService::fail_loud_if_unmoved`] terminalises it — correctly,
+/// the operator needs a Retry lever — but before this marker every one of them
+/// landed on `classify_failure`'s `Unknown` default, which reads to the
+/// operator as "we do not know what this is" when in fact we know exactly what
+/// it is and that trying again is the right move.
+///
+/// A literal, distinctive, bracketed token rather than a wording match, for the
+/// same reason [`writeback_failure_kind_from_reason`] exists: substring rules
+/// that key on incidental phrasing are the ADV-4 trap. The classify rule that
+/// reads it also refuses to fire for `stage == "post"`, the one stage whose
+/// reasons carry a remote response body.
+pub const TRANSIENT_LOCAL_TAG: &str = "[transient-local]";
+
 /// The suffixes the storefront CAD picker will select, lowercase.
 ///
 /// **ADR-0112 Part A — STEP only.** This is deliberately the SAME set the
@@ -3508,9 +3678,30 @@ pub fn is_extractable_cad(filename: &str) -> bool {
 /// - **stage="post"** + reason contains `"HTTP 5"` (any 5xx) OR
 ///   `"timeout"` OR `"connection"` OR `"dns"` → `Transient`. Storefront
 ///   blip; the next cycle's retry has a real chance of succeeding.
-/// - Default → `Unknown`. Surfaces with a capped auto-retry policy
-///   per the daemon scheduler; better than silent permanent-loop on a
-///   future error shape we haven't classified yet.
+/// - **any stage except `post`** + reason contains [`TRANSIENT_LOCAL_TAG`] →
+///   `Transient` (D-PRICEQ A2). The daemon's own marker for a step that could
+///   not finish for a reason outside the job — a full disk under the PDF write
+///   or the decrypted-CAD temp, a transient audit-tx fault on a CAD-blob read
+///   append. Consulted before every substring rule below, and never for `post`.
+/// - Default → `Unknown`. The honest "we have not seen this shape before"
+///   label; better than a wrong confident verdict on a future error we have
+///   not classified.
+///
+/// **What the verdict does, and does not, do (D-PRICEQ A4).** It LABELS. It
+/// does not schedule anything. Nothing in this codebase auto-retries a Failed
+/// row of any kind: [`jobs::next_actionable_job`] excludes `Failed` outright,
+/// so `Transient`, `Unknown` and `Permanent` alike sit until an operator clicks
+/// Retry. [`jobs::UNKNOWN_AUTO_RETRY_CAP`] is a constant with no reader on any
+/// scheduling path. Earlier revisions of this doc promised "a capped auto-retry
+/// policy per the daemon scheduler" for `Unknown`; there is no such policy, and
+/// reading the verdict as one is how a `Transient` label gets mistaken for a
+/// self-healing job. The verdict's real consumers are the operator panel badge
+/// and the `QuotePricingFailureClassified` audit payload — which is exactly
+/// where its value is: it tells the operator whether clicking Retry is likely
+/// to work. Bounded auto-retry-with-backoff for `Transient` is a real gap, and
+/// is booked as its own backlog item (see
+/// `docs/BACKLOG-designed-to-live.md`) rather than smuggled in here — it has to
+/// be designed so it cannot re-introduce the D-PRICEQ head-of-line wedge.
 ///
 /// Stays case-INSENSITIVE on the reason match by lowercasing both
 /// sides (matchings use lowercase literals); the engine + wrapper
@@ -3540,6 +3731,16 @@ pub fn classify_failure(stage: &str, reason: &str) -> FailureKind {
         if let Some(kind) = writeback_failure_kind_from_reason(&r) {
             return kind;
         }
+    }
+    // D-PRICEQ A2 — the daemon's own transient-local marker. Consulted
+    // immediately after the `writeback:` token and before every substring rule,
+    // for the same reason: it is a token this binary WROTE at a known site, so
+    // it is authoritative, and letting an incidental-wording rule below preempt
+    // it would be the ADV-4 trap inverted. Scoped OUT of `post`, the one stage
+    // whose reasons embed a remote response body — a storefront cannot talk its
+    // way into this arm.
+    if stage != "post" && r.contains(TRANSIENT_LOCAL_TAG) {
+        return FailureKind::Transient;
     }
     // Permanent: extractor stubs / not-yet-implemented / bad input.
     if r.contains("not yet implemented") {
@@ -5930,12 +6131,12 @@ mod tests {
     /// through to the `Unknown` default.
     ///
     /// Which is the behaviour to want, and the reason this is a doc
-    /// correction rather than a code change. `Unknown` is bounded — the
-    /// daemon auto-retries it at most `UNKNOWN_AUTO_RETRY_CAP` times and
-    /// then freezes the row for an operator — so an over-large part
-    /// burns a fixed number of deadlines and stops. Permanent would
-    /// refuse to retry at all, which is wrong for the one extract-stage
-    /// failure that a less loaded box can genuinely clear.
+    /// correction rather than a code change. `Unknown` cannot loop — no
+    /// `Failed` row is auto-re-enqueued at all (D-PRICEQ A4), so an
+    /// over-large part fails once and waits for an operator who can see
+    /// the timeout for what it is. Permanent would say "never retry",
+    /// which is the wrong advice for the one extract-stage failure that a
+    /// less loaded box can genuinely clear.
     ///
     /// Built from the real `Display` rather than a hand-typed string, so
     /// this goes red if the wording drifts into some OTHER rule's
@@ -6543,6 +6744,9 @@ mod tests {
             client,
             cad_blob: CadBlobCtx::with_test_key(),
             cycles_completed: AtomicU64::new(REAPER_GATE_CYCLES),
+            // Empty on purpose: none of these builders' tests reach the
+            // reaper, so there are no real cycles to claim (D-PRICEQ B4).
+            recent_cycle_marks: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -7029,6 +7233,9 @@ mod tests {
             client,
             cad_blob: CadBlobCtx::with_test_key(),
             cycles_completed: AtomicU64::new(REAPER_GATE_CYCLES),
+            // Empty on purpose: none of these builders' tests reach the
+            // reaper, so there are no real cycles to claim (D-PRICEQ B4).
+            recent_cycle_marks: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -7158,6 +7365,9 @@ mod tests {
             client,
             cad_blob: CadBlobCtx::with_test_key(),
             cycles_completed: AtomicU64::new(REAPER_GATE_CYCLES),
+            // Empty on purpose: none of these builders' tests reach the
+            // reaper, so there are no real cycles to claim (D-PRICEQ B4).
+            recent_cycle_marks: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -7312,11 +7522,13 @@ mod tests {
     /// cadence every test builder uses: `30 * 60 / 60`.
     const REAPER_GATE_CYCLES: u64 = STALE_JOB_REAP_AFTER.as_secs() / 60;
 
-    /// A service that has already completed enough cycles for the reaper's
-    /// live-cycle gate (D-PRICEQ B3) to be satisfied, so reaper behaviour stays
-    /// deterministic in tests. The gate itself is pinned by
-    /// `d_priceq_mid_flight_row_survives_a_sleeping_laptop`, which builds a
-    /// fresh service via [`s430_service_cycles`].
+    /// A service that has already completed enough RECENT cycles for the
+    /// reaper's live-cycle-WINDOW gate (D-PRICEQ B3 → B4) to be satisfied, so
+    /// reaper behaviour stays deterministic in tests. The gate itself is pinned
+    /// by `d_priceq_mid_flight_row_survives_a_sleeping_laptop`,
+    /// `d_priceq_a_warm_daemon_that_stops_cycling_stops_reaping` and
+    /// `d_priceq_a_storefront_outage_does_not_condemn_the_rows_it_froze`, which
+    /// build a fresh service via [`s430_service_cycles`].
     fn s430_service(
         addr: &std::net::SocketAddr,
         db_path: std::path::PathBuf,
@@ -7325,6 +7537,15 @@ mod tests {
         s430_service_cycles(addr, db_path, artifact_dir, REAPER_GATE_CYCLES)
     }
 
+    /// Build a service whose completed-cycle history is `cycles_completed`
+    /// cycles that ran at the 60s test cadence and ENDED just now — counter and
+    /// mark window in agreement, which is the only way a real daemon can be.
+    ///
+    /// D-PRICEQ B4 — the counter alone is deliberately NOT enough to open the
+    /// reaper's gate any more. A test that wants the counter raised WITHOUT the
+    /// cycles having really run (the B4 defect itself) stores into
+    /// `cycles_completed` directly and leaves the window alone; see
+    /// `d_priceq_mid_flight_row_survives_a_sleeping_laptop`.
     fn s430_service_cycles(
         addr: &std::net::SocketAddr,
         db_path: std::path::PathBuf,
@@ -7335,7 +7556,7 @@ mod tests {
             .timeout(Duration::from_millis(800))
             .build()
             .expect("client");
-        PricingPipelineService {
+        let svc = PricingPipelineService {
             config: PricingPipelineConfig {
                 base_url: format!("http://{addr}"),
                 bearer_token: Zeroizing::new("t0k3n".to_string()),
@@ -7355,6 +7576,43 @@ mod tests {
             client,
             cad_blob: CadBlobCtx::with_test_key(),
             cycles_completed: AtomicU64::new(cycles_completed),
+            recent_cycle_marks: Mutex::new(VecDeque::new()),
+        };
+        d_priceq_seed_cycle_marks(&svc, cycles_completed, OffsetDateTime::now_utc());
+        svc
+    }
+
+    /// Seed the reaper's cycle-mark window as if `cycles` cycles ran at the
+    /// service's own cadence and the LAST of them completed at `ending_at`.
+    /// Replaces whatever the window held. `cycles` beyond the window size is
+    /// clamped by `record_cycle_mark`'s own eviction, exactly as in production.
+    fn d_priceq_seed_cycle_marks(
+        svc: &PricingPipelineService,
+        cycles: u64,
+        ending_at: OffsetDateTime,
+    ) {
+        let cadence_s = svc.config.poll_interval.as_secs().max(1) as i64;
+        svc.recent_cycle_marks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        // Oldest first, exactly as `record_cycle_mark` would have pushed them.
+        for back in (0..cycles).rev() {
+            svc.record_cycle_mark(ending_at - time::Duration::seconds(back as i64 * cadence_s));
+        }
+    }
+
+    /// Shift every mark in the window back by `by`, simulating that the cycles
+    /// the window records happened that long ago — the time machine the
+    /// stopped-cycling and storefront-outage probes need, since a test cannot
+    /// wait out `STALE_JOB_REAP_AFTER`.
+    fn d_priceq_age_cycle_marks(svc: &PricingPipelineService, by: time::Duration) {
+        let mut marks = svc
+            .recent_cycle_marks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for m in marks.iter_mut() {
+            *m -= by;
         }
     }
 
@@ -7579,6 +7837,65 @@ mod tests {
         addr
     }
 
+    /// [`d_priceq_mock`] with a kill switch. While the returned flag is set the
+    /// listener accepts and immediately hangs up, so every request fails at the
+    /// transport — a storefront outage as the daemon experiences one.
+    async fn d_priceq_mock_toggle(
+        cad_bytes: Vec<u8>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let down = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = down.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let cad = cad_bytes.clone();
+                let flag = flag.clone();
+                tokio::spawn(async move {
+                    if flag.load(Ordering::SeqCst) {
+                        // No response at all — reqwest surfaces a transport
+                        // error and `list_and_enqueue_received` returns Err.
+                        let _ = sock.shutdown().await;
+                        return;
+                    }
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let resp: Vec<u8> = if req.contains("/files/") {
+                        let mut r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                             Content-Length: {}\r\n\r\n",
+                            cad.len()
+                        )
+                        .into_bytes();
+                        r.extend_from_slice(&cad);
+                        r
+                    } else if req.contains("/api/quotes") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 13\r\n\r\n{\"quotes\":[]}"
+                            .to_vec()
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 2\r\n\r\n{}"
+                            .to_vec()
+                    };
+                    let _ = sock.write_all(&resp).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (addr, down)
+    }
+
     /// Backdate a row's `fetched_at` / `updated_at` through the service's
     /// OWN shared handle (a separate `Connection::open` would be invisible
     /// to it — ADR-0098 Gap 1a).
@@ -7686,8 +8003,31 @@ mod tests {
     /// cycle.
     ///
     /// Revert-proof: drop the fail-loud arm in `advance_one_step` and the head
-    /// stays `rendering` with `summary.errored == 1`; change the `continue`
-    /// back to `break` and the second job stays `fetched`.
+    /// stays `rendering` with `summary.errored == 1`.
+    ///
+    /// **NOT revert-proof against `continue` → `break`, and deliberately so.**
+    /// That was this test's other claim until the r3 adversarial measured it,
+    /// and it is false: swapping the `continue` for a `break` leaves every
+    /// assertion here green. After B1-CLASS an `Err` reaching that arm means
+    /// the row ALREADY MOVED — an arm that errors without moving is
+    /// terminalised by the fail-loud wrapper and arrives as `Ok(Failed)`, which
+    /// is the path the head takes here — and the job states form a strict
+    /// forward DAG, so the next cycle enters a different arm and nothing can
+    /// re-wedge. For WEDGE prevention the `continue` is now dead surface.
+    ///
+    /// It stays because it is still load-bearing for THROUGHPUT. Under a
+    /// persistent post-move fault — a transient audit-tx fault that recurs on
+    /// every job, say — `break` ends the cycle on the first `Err`, so the queue
+    /// drains at 1 advance per cadence instead of `MAX_JOBS_PER_CYCLE` (5).
+    /// The skip list is what keeps the `continue` honest: `next_actionable_job`
+    /// is strict FIFO `LIMIT 1`, so without it the same row comes straight back
+    /// on the next iteration.
+    ///
+    /// Pinning that difference would need a fault injected into production
+    /// dispatch — a `cfg(test)` branch in the advance path — and the r3
+    /// adversarial and this round agree the new prod surface is not worth it
+    /// for a throughput property. Stated here instead of half-claimed by a
+    /// test that does not test it.
     #[tokio::test]
     async fn d_priceq_erroring_head_does_not_freeze_the_jobs_behind_it() {
         let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
@@ -7920,11 +8260,20 @@ mod tests {
     /// the wall clock while running zero cycles. This test is the sleep case —
     /// the service has been "up" for 16 hours and has completed ZERO cycles.
     ///
-    /// Revert-proof: replace the live-cycle gate with any wall-clock reading
-    /// (uptime included) and the first assert fails — the row is reaped. The
-    /// second half is what keeps that non-vacuous: the SAME row on the SAME
-    /// service, with only the completed-cycle count raised, IS reaped, so the
-    /// row was genuinely reapable and the gate is the one thing that spared it.
+    /// **B4.** r3 then gated on `cycles_completed × poll_interval`, and the
+    /// non-vacuous half of THIS test encoded that bug as an expectation: it
+    /// raised the counter to the gate value and asserted the row was reaped,
+    /// on a service that had run not one cycle AGAINST that row. A monotonic
+    /// count of cycles since process start says nothing about whether any of
+    /// them happened recently, so once past it the gate stands open forever.
+    /// Raising the counter now proves nothing — the reaper reads the WINDOW of
+    /// recent marks — and the row must survive.
+    ///
+    /// Revert-proof: replace the window gate with any wall-clock reading
+    /// (uptime included) or with the r3 counter and the row is reaped. The last
+    /// stanza is what keeps that non-vacuous: the SAME row on the SAME service,
+    /// once a full window of cycles has REALLY run, IS reaped — so the row was
+    /// genuinely reapable and the gate is the one thing that spared it.
     #[tokio::test]
     async fn d_priceq_mid_flight_row_survives_a_sleeping_laptop() {
         let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
@@ -7970,8 +8319,9 @@ mod tests {
             "no failure may be audited for a job that never had a live attempt"
         );
 
-        // One cycle short of the gate — still spared. Pins the threshold from
-        // below, so a fix that quietly reaps "nearly enough" is red too.
+        // One cycle short of a full window — still spared. Pins the threshold
+        // from below, so a fix that quietly reaps "nearly enough" is red too.
+        d_priceq_seed_cycle_marks(&svc, REAPER_GATE_CYCLES - 1, OffsetDateTime::now_utc());
         svc.cycles_completed
             .store(REAPER_GATE_CYCLES - 1, Ordering::Relaxed);
         assert_eq!(
@@ -7980,21 +8330,729 @@ mod tests {
             "one cycle short of a fair run is still short"
         );
 
-        // Same row, same service — only the completed-cycle count changes. Now
-        // the window IS backed by cycles that really ran, so the backstop
-        // fires as designed.
+        // **B4** — raise the COUNTER to the gate value and leave the window
+        // where it is. That is precisely what an uptime past the threshold does
+        // to a monotonic counter, and it is what the r3 gate accepted as proof
+        // that thirty cycles had been offered to this row. It is not proof of
+        // anything: no cycle ran here.
         svc.cycles_completed
-            .store(REAPER_GATE_CYCLES, Ordering::Relaxed);
+            .store(REAPER_GATE_CYCLES * 100, Ordering::Relaxed);
+        assert_eq!(
+            svc.reap_stale_jobs().await,
+            0,
+            "a monotonic cycle COUNT is a since-boot latch, not a measure of \
+             recent work — raising it must not condemn a row no cycle has touched"
+        );
+        assert_eq!(
+            d_priceq_row(&svc, overnight).0,
+            "pricing",
+            "the resumable mid-flight row must survive a latched counter too"
+        );
+
+        // Same row, same service — now a full window of cycles has REALLY run,
+        // here, just now, and the row moved for none of them. The backstop
+        // fires as designed.
+        d_priceq_seed_cycle_marks(&svc, REAPER_GATE_CYCLES, OffsetDateTime::now_utc());
         assert_eq!(
             svc.reap_stale_jobs().await,
             1,
-            "with the window backed by LIVE cycles the same row is reapable — \
-             the gate delays the reaper, it does not disable it"
+            "with the window backed by cycles that really ran the same row is \
+             reapable — the gate delays the reaper, it does not disable it"
         );
         let (state, stage, kind) = d_priceq_row(&svc, overnight);
         assert_eq!(state, "failed");
         assert_eq!(stage.as_deref(), Some("reaper"));
         assert_eq!(kind.as_deref(), Some("permanent"));
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// A `QuoteBreakdown` good enough for `aberp_quote_pdf::render`.
+    fn d_priceq_breakdown() -> QuoteBreakdown {
+        QuoteBreakdown {
+            gear_cost: 0.0,
+            tolerance_cost: 0.0,
+            material_cost: 1.23,
+            machining_cost: 9.87,
+            cad_cam_cost: 2.10,
+            setup_cost: 4.56,
+            overhead: 1.50,
+            margin: 3.84,
+            total_price: 21.00,
+            machining_minutes: 11.25,
+            inspection_minutes: 2.0,
+            route_to_5_axis: false,
+            calibration_coefficient: 1.0,
+            engine_version: "aberp-quote-engine@0.0.0".to_string(),
+            reasoning_log: vec!["[totals] total_price = 21.00 EUR".to_string()],
+        }
+    }
+
+    /// Move an enqueued row to `rendering` with artifacts the render arm can
+    /// actually use, so the arm reaches its FILESYSTEM writes rather than
+    /// bailing on a missing column.
+    fn d_priceq_stage_renderable(svc: &PricingPipelineService, qid: &str) {
+        let graph = serde_json::to_string(&mk_graph(StockForm::RectangularBlock)).expect("graph");
+        let breakdown = serde_json::to_string(&d_priceq_breakdown()).expect("breakdown");
+        let conn = svc.deps.db.write().expect("stage via shared handle");
+        conn.execute(
+            "UPDATE quote_pricing_jobs
+                SET state = 'rendering', feature_graph_json = ?, breakdown_json = ?
+                WHERE quote_id = ?",
+            duckdb::params![graph, breakdown, qid],
+        )
+        .expect("stage rendering");
+    }
+
+    fn d_priceq_reason(svc: &PricingPipelineService, qid: &str) -> String {
+        let conn = svc.deps.db.read().expect("read via shared handle");
+        conn.query_row(
+            "SELECT error_reason FROM quote_pricing_jobs WHERE quote_id = ?",
+            [qid],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .expect("row")
+        .unwrap_or_default()
+    }
+
+    /// **D-PRICEQ A2 — a full disk is not a verdict on the quote.** The render
+    /// arm's two filesystem writes (`create_dir_all` for the per-quote artifact
+    /// dir, `fs::write` for `priced.pdf`) leave the row in the arm it entered,
+    /// so the fail-loud wrapper terminalises it — correctly; the operator needs
+    /// a Retry lever. But every one of these landed on `classify_failure`'s
+    /// `Unknown` default, which tells the operator "we don't know what this
+    /// is". We do: ENOSPC, an unmounted artifact volume, a path clobbered by
+    /// something else. Trying again once the disk is back is exactly right.
+    ///
+    /// Both sites are driven for real — a FILE where the dest dir belongs, and
+    /// a DIRECTORY where `priced.pdf` belongs — so this pins the whole chain:
+    /// the site's `with_context`, the anyhow chain through `fail_loud_if_unmoved`,
+    /// `classify_failure`, and the persisted `failure_kind` column.
+    ///
+    /// Revert-proof: drop [`TRANSIENT_LOCAL_TAG`] from either site, or the rule
+    /// that reads it, and the kind reads `unknown`.
+    #[tokio::test]
+    async fn d_priceq_a2_render_write_faults_are_transient_not_unknown() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("a2-render.duckdb");
+        let artifacts = s430_temp("art");
+        let no_dir = "00000000-0000-0000-0000-00000000d020";
+        let no_write = "00000000-0000-0000-0000-00000000d021";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+
+        // ── site 1: `create_dir_all` — a FILE sits where the dest dir goes.
+        svc.enqueue_one(s430_quote(no_dir, "part.step"))
+            .await
+            .unwrap();
+        d_priceq_stage_renderable(&svc, no_dir);
+        let dest = artifacts.join(no_dir);
+        std::fs::remove_dir_all(&dest).expect("clear dest dir");
+        std::fs::write(&dest, b"not a directory").expect("clobber dest dir");
+
+        let row = svc
+            .next_actionable_blocking(&[])
+            .await
+            .unwrap()
+            .expect("the rendering row is actionable");
+        assert_eq!(row.quote_id, no_dir);
+        let outcome = svc
+            .advance_one_step(row)
+            .await
+            .expect("terminalised, not Err");
+        assert!(matches!(outcome, StepOutcome::Failed), "got {outcome:?}");
+
+        let (state, stage, kind) = d_priceq_row(&svc, no_dir);
+        assert_eq!(state, "failed");
+        assert_eq!(stage.as_deref(), Some("render"));
+        assert_eq!(
+            kind.as_deref(),
+            Some("transient"),
+            "an unmakeable artifact directory is a disk problem, not a quote \
+             problem — reason was: {}",
+            d_priceq_reason(&svc, no_dir)
+        );
+        assert!(d_priceq_reason(&svc, no_dir).contains("mkdir pdf dest"));
+
+        // ── site 2: `fs::write` — a DIRECTORY sits where `priced.pdf` goes.
+        std::fs::remove_file(&dest).expect("unclobber");
+        svc.enqueue_one(s430_quote(no_write, "part.step"))
+            .await
+            .unwrap();
+        d_priceq_stage_renderable(&svc, no_write);
+        std::fs::create_dir_all(artifacts.join(no_write).join("priced.pdf"))
+            .expect("clobber priced.pdf");
+
+        let row = svc
+            .next_actionable_blocking(&[])
+            .await
+            .unwrap()
+            .expect("the second rendering row is actionable");
+        assert_eq!(row.quote_id, no_write);
+        let outcome = svc
+            .advance_one_step(row)
+            .await
+            .expect("terminalised, not Err");
+        assert!(matches!(outcome, StepOutcome::Failed), "got {outcome:?}");
+
+        let (state, stage, kind) = d_priceq_row(&svc, no_write);
+        assert_eq!(state, "failed");
+        assert_eq!(stage.as_deref(), Some("render"));
+        assert_eq!(
+            kind.as_deref(),
+            Some("transient"),
+            "an unwritable priced.pdf is a disk problem — reason was: {}",
+            d_priceq_reason(&svc, no_write)
+        );
+        assert!(d_priceq_reason(&svc, no_write).contains("write priced.pdf"));
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **D-PRICEQ A2 — the decrypted-CAD temp write, same shape one stage
+    /// earlier.** The blob decrypts; only landing the plaintext beside it
+    /// fails. Driven for real by making the per-quote artifact directory
+    /// read-only, which leaves the encrypted blob readable and fails exactly
+    /// the sibling write.
+    ///
+    /// Skipped rather than falsely green where the process can write into a
+    /// read-only directory anyway (running as root, or an FS that ignores the
+    /// mode) — a preflight probe decides, so the test never claims a pin it
+    /// did not get.
+    ///
+    /// Unix-only: the injection is a POSIX mode bit. Defense ships on macOS
+    /// and CI runs Linux, so this is the whole shipped surface; the site's
+    /// classification is covered platform-independently by
+    /// `d_priceq_a2_transient_local_tag_is_inert_at_the_post_stage`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn d_priceq_a2_decrypted_temp_write_faults_are_transient() {
+        use std::os::unix::fs::PermissionsExt;
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("a2-temp.duckdb");
+        let artifacts = s430_temp("art");
+        let qid = "00000000-0000-0000-0000-00000000d022";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap();
+
+        let dir = artifacts.join(qid);
+        let ro = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(&dir, ro).expect("chmod 555");
+        // Preflight: is the mode actually enforced for us?
+        let probe = dir.join("._writable_probe");
+        if std::fs::write(&probe, b"x").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::remove_dir_all(&artifacts);
+            let _ = std::fs::remove_file(&db);
+            eprintln!(
+                "skipping d_priceq_a2_decrypted_temp_write_faults_are_transient: this \
+                 process can write into a read-only directory (root?), so the fault \
+                 cannot be injected"
+            );
+            return;
+        }
+
+        let row = svc
+            .next_actionable_blocking(&[])
+            .await
+            .unwrap()
+            .expect("the fetched row is actionable");
+        let outcome = svc
+            .advance_one_step(row)
+            .await
+            .expect("terminalised, not Err");
+        assert!(matches!(outcome, StepOutcome::Failed), "got {outcome:?}");
+
+        let (state, stage, kind) = d_priceq_row(&svc, qid);
+        assert_eq!(state, "failed");
+        assert_eq!(stage.as_deref(), Some("extract"));
+        assert_eq!(
+            kind.as_deref(),
+            Some("transient"),
+            "the blob decrypted fine — only the temp write failed; reason was: {}",
+            d_priceq_reason(&svc, qid)
+        );
+        assert!(d_priceq_reason(&svc, qid).contains("write decrypted CAD temp"));
+
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **D-PRICEQ A2 — the two CAD-blob read-audit appends.** Both are `?` on
+    /// an audit-ledger write, i.e. a DB blip, not a defect in the job.
+    ///
+    /// Driven for real by renaming a column out from under the ledger's INSERT
+    /// (`ensure_schema` is `CREATE TABLE IF NOT EXISTS`, so it accepts the
+    /// altered table and the INSERT is what fails) — a genuine transient
+    /// audit-tx fault.
+    ///
+    /// Note the shape of the outcome: `emit_failure` stamps the row (with the
+    /// classified kind) BEFORE it appends the audit pair, so the row lands
+    /// `Failed`/`transient` and only the audit pair is lost to the same broken
+    /// ledger. `fail_loud_if_unmoved` therefore reports the terminalise as
+    /// having failed and `advance_one_step` returns the original error with
+    /// that as context — the designed DB-is-unwell path, not a regression. Both
+    /// halves are asserted below.
+    #[tokio::test]
+    async fn d_priceq_a2_cad_read_audit_faults_are_transient() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("a2-audit.duckdb");
+        let artifacts = s430_temp("art");
+        let encrypted = "00000000-0000-0000-0000-00000000d023";
+        let legacy = "00000000-0000-0000-0000-00000000d024";
+        let svc = s430_service(&addr, db.clone(), artifacts.clone());
+        svc.enqueue_one(s430_quote(encrypted, "part.step"))
+            .await
+            .unwrap();
+        svc.enqueue_one(s430_quote(legacy, "part.step"))
+            .await
+            .unwrap();
+        // A blob with no magic header takes the legacy-plaintext branch, which
+        // is the only way to reach the FIRST of the two appends.
+        std::fs::write(
+            artifacts.join(legacy).join("part.step"),
+            b"ISO-10303-21; x END-ISO-10303-21;",
+        )
+        .expect("plant a legacy plaintext blob");
+
+        // Break the ledger's INSERT without breaking `ensure_schema`.
+        {
+            let conn = svc.deps.db.write().expect("alter via shared handle");
+            conn.execute_batch("ALTER TABLE audit_ledger RENAME COLUMN event_sig TO event_sig_x")
+                .expect("rename audit column");
+        }
+
+        for (qid, marker) in [
+            (encrypted, "emit CAD blob read"),
+            (legacy, "emit legacy-plaintext CAD read"),
+        ] {
+            let row = svc
+                .next_actionable_blocking(&[])
+                .await
+                .unwrap()
+                .expect("an actionable row");
+            assert_eq!(row.quote_id, qid, "strict FIFO order");
+            let err = svc
+                .advance_one_step(row)
+                .await
+                .expect_err("a broken ledger cannot terminalise either");
+            let reason = format!("{err:#}");
+            assert!(
+                reason.contains(marker),
+                "expected the `{marker}` site to be the failing one; got: {reason}"
+            );
+            assert_eq!(
+                classify_failure("extract", &reason),
+                FailureKind::Transient,
+                "an audit-tx fault is a DB blip, not a verdict on the job; \
+                 reason was: {reason}"
+            );
+            // The row was still stamped — `set_failed` precedes the audit
+            // append inside `emit_failure` — so the classified verdict is
+            // durable even though this ledger could not record the pair.
+            let (state, stage, kind) = d_priceq_row(&svc, qid);
+            assert_eq!(state, "failed");
+            assert_eq!(stage.as_deref(), Some("extract"));
+            assert_eq!(kind.as_deref(), Some("transient"), "reason was: {reason}");
+        }
+
+        {
+            let conn = svc.deps.db.write().expect("restore via shared handle");
+            conn.execute_batch("ALTER TABLE audit_ledger RENAME COLUMN event_sig_x TO event_sig")
+                .expect("restore audit column");
+        }
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **D-PRICEQ A2 — the marker is scoped OUT of `post`.** `post` is the one
+    /// stage whose reasons embed a remote response body, and a storefront that
+    /// could put [`TRANSIENT_LOCAL_TAG`] in a 4xx body would be talking its way
+    /// out of a Permanent verdict — the ADV-4 trap inverted. Pins that it
+    /// cannot: post keeps classifying by its own rules.
+    #[test]
+    fn d_priceq_a2_transient_local_tag_is_inert_at_the_post_stage() {
+        let body = format!("priced-writeback HTTP 400 body=nice try {TRANSIENT_LOCAL_TAG}");
+        assert_eq!(
+            classify_failure("post", &body),
+            FailureKind::Permanent,
+            "a 4xx stays Permanent however the storefront words its body"
+        );
+        let local = format!("write priced.pdf {TRANSIENT_LOCAL_TAG}: No space left on device");
+        assert_eq!(classify_failure("render", &local), FailureKind::Transient);
+        assert_eq!(classify_failure("extract", &local), FailureKind::Transient);
+        // Untagged, unrecognised shapes still land on the honest default.
+        assert_eq!(
+            classify_failure("render", "write priced.pdf: No space left on device"),
+            FailureKind::Unknown,
+            "the tag is what carries the verdict — not the wording around it"
+        );
+    }
+
+    /// **D-PRICEQ adversarial B4 — a daemon that STOPS cycling stops reaping.**
+    /// The r3 gate multiplied a monotonic `cycles_completed` by the cadence, so
+    /// after roughly the first thirty cycles of any uptime it read "≥ 30
+    /// minutes of live cycles" forever, whatever the daemon did next. A laptop
+    /// that suspends with the app open after the first half hour — a 45-minute
+    /// lunch — then comes back to a reaper that is pure wall clock again, and
+    /// `MAX_JOBS_PER_CYCLE` (5) against 4 advances per job guarantees exactly
+    /// one mid-flight row to condemn.
+    ///
+    /// The window says what the counter cannot: the last cycle here ran 45
+    /// minutes ago, so no job has been offered anything since, and the row that
+    /// froze after that last cycle is resumable — not stuck.
+    ///
+    /// Revert-proof both ways. Drop the window and gate on the counter (r3) or
+    /// on wall clock (r2 and earlier) and the first assert fails — the row is
+    /// reaped without one live attempt. Then the same row, on the same service,
+    /// once the daemon really is cycling again, IS reaped: the gate delays the
+    /// backstop, it does not disable it.
+    #[tokio::test]
+    async fn d_priceq_a_warm_daemon_that_stops_cycling_stops_reaping() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("stopped-cycling.duckdb");
+        let artifacts = s430_temp("art");
+        let lunch = "00000000-0000-0000-0000-00000000d010";
+        // A WARM daemon: a full window of cycles behind it, counter latched
+        // well past the r3 gate. Exactly the state the B3 fix leaves prod in
+        // after half an hour of ordinary uptime.
+        let svc = s430_service_cycles(&addr, db.clone(), artifacts.clone(), REAPER_GATE_CYCLES * 4);
+        assert_eq!(
+            svc.cycle_marks_len(),
+            REAPER_GATE_CYCLES as usize,
+            "the window is bounded — a long uptime does not accumulate marks"
+        );
+
+        svc.enqueue_one(s430_quote(lunch, "part.step"))
+            .await
+            .unwrap();
+        {
+            let conn = svc.deps.db.write().expect("stage via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET state = 'pricing' WHERE quote_id = ?",
+                duckdb::params![lunch],
+            )
+            .expect("force pricing");
+        }
+
+        // The lid closes. Those warm cycles all happened 45 minutes ago, and
+        // the row was mid-flight when the last of them ended, so its
+        // `updated_at` froze 44 minutes ago — past the wall-clock threshold,
+        // which is the whole point: wall clock alone condemns it.
+        d_priceq_age_cycle_marks(&svc, time::Duration::minutes(45));
+        let froze = (OffsetDateTime::now_utc() - time::Duration::minutes(44))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        d_priceq_backdate(&svc, lunch, &froze, &froze);
+
+        assert_eq!(
+            svc.reap_stale_jobs().await,
+            0,
+            "no cycle has run for 45 minutes, so no job has been offered an \
+             attempt in 45 minutes — a mid-flight row must not be condemned \
+             for a window the daemon slept through"
+        );
+        assert_eq!(
+            d_priceq_row(&svc, lunch).0,
+            "pricing",
+            "the resumable mid-flight row must survive the lunch break"
+        );
+        assert_eq!(
+            s430_count_kind(&db, "quote.pricing_failed"),
+            0,
+            "no failure may be audited for a job that never had a live attempt"
+        );
+
+        // The operator opens the lid; the daemon cycles again, and this time
+        // the row really does refuse to move for a full window of them.
+        d_priceq_seed_cycle_marks(&svc, REAPER_GATE_CYCLES, OffsetDateTime::now_utc());
+        assert_eq!(
+            svc.reap_stale_jobs().await,
+            1,
+            "once the cycles are real again the backstop fires — the window \
+             gate delays the reaper, it does not disable it"
+        );
+        assert_eq!(d_priceq_row(&svc, lunch).1.as_deref(), Some("reaper"));
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **D-PRICEQ adversarial B4 — an NTP correction on resume must not open
+    /// the window.** The marks are wall-clock stamps, and the freeze the window
+    /// exists to survive — a laptop resuming from suspend — is the single event
+    /// most likely to come with a clock step. If the step goes BACKWARD the
+    /// newest marks are the earliest ones, so reading the window's start off
+    /// `front()` (oldest INSERTED) hands back a bound from before the jump and
+    /// the gate degenerates to wall clock alone: the B4 hole, re-entered
+    /// through the back door.
+    ///
+    /// Reading the EARLIEST mark instead is conservative in both directions.
+    /// This plants a full window whose last few marks are stamped an hour
+    /// before the ones ahead of them and pins that the row is still spared.
+    ///
+    /// Revert-proof: change `marks.iter().min()` back to `marks.front()` and
+    /// this goes red.
+    #[tokio::test]
+    async fn d_priceq_a_backward_clock_step_does_not_open_the_reaper_window() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("clockstep.duckdb");
+        let artifacts = s430_temp("art");
+        let qid = "00000000-0000-0000-0000-00000000d013";
+        let svc = s430_service_cycles(&addr, db.clone(), artifacts.clone(), 0);
+        svc.enqueue_one(s430_quote(qid, "part.step")).await.unwrap();
+        {
+            let conn = svc.deps.db.write().expect("stage via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET state = 'pricing' WHERE quote_id = ?",
+                duckdb::params![qid],
+            )
+            .expect("force pricing");
+        }
+
+        // A full window: cycles at cadence up to ~now, then the machine
+        // resumes and NTP steps the clock back an hour, so the LAST few marks
+        // are stamped an hour before the ones already in the deque.
+        let now = OffsetDateTime::now_utc();
+        svc.recent_cycle_marks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        for back in (3..REAPER_GATE_CYCLES).rev() {
+            svc.record_cycle_mark(now - time::Duration::seconds(back as i64 * 60));
+        }
+        for back in (0..3).rev() {
+            svc.record_cycle_mark(now - time::Duration::minutes(60 + back as i64));
+        }
+        assert_eq!(svc.cycle_marks_len(), REAPER_GATE_CYCLES as usize);
+
+        // The row froze 45 minutes ago — inside the stepped-back window, past
+        // the wall-clock floor. Only the `min` reading spares it.
+        let froze = (now - time::Duration::minutes(45))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        d_priceq_backdate(&svc, qid, &froze, &froze);
+        assert_eq!(
+            svc.reap_stale_jobs().await,
+            0,
+            "the window's real start is the EARLIEST mark — a backward clock \
+             step must make the reaper more conservative, never less"
+        );
+        assert_eq!(d_priceq_row(&svc, qid).0, "pricing");
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **D-PRICEQ adversarial B4 — a storefront outage must not condemn the
+    /// rows it froze.** Driven through the REAL [`PricingPipelineService::poll_once`]
+    /// loop, because the mechanism is a property of that loop: when the
+    /// storefront list fails, `poll_once` returns before the advance loop, so
+    /// it correctly counts nothing — and therefore correctly records no mark.
+    /// Every mid-flight row's `updated_at` freezes for the whole outage. Under
+    /// the r3 counter gate the first cycle after recovery reaped them at the
+    /// TOP of `poll_once`, before a single live attempt; under the window gate
+    /// the outage has drained the window's right-hand edge into the past, so
+    /// the cutoff moves back with it.
+    ///
+    /// Revert-proof: gate on the counter or on wall clock and the recovery
+    /// cycle reaps the frozen row.
+    #[tokio::test]
+    async fn d_priceq_a_storefront_outage_does_not_condemn_the_rows_it_froze() {
+        let (addr, down) =
+            d_priceq_mock_toggle(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("outage.duckdb");
+        let artifacts = s430_temp("art");
+        let frozen = "00000000-0000-0000-0000-00000000d011";
+        // A COLD daemon — the window is filled below by cycles that really run.
+        let svc = s430_service_cycles(&addr, db.clone(), artifacts.clone(), 0);
+        assert_eq!(svc.cycle_marks_len(), 0, "a fresh daemon has no marks");
+
+        // Warm up through the real loop until the window is full.
+        for _ in 0..REAPER_GATE_CYCLES {
+            let summary = svc.poll_once().await;
+            assert!(summary.error.is_none(), "warm-up cycle failed: {summary:?}");
+        }
+        assert_eq!(
+            svc.cycle_marks_len(),
+            REAPER_GATE_CYCLES as usize,
+            "a completed cycle records a mark"
+        );
+
+        svc.enqueue_one(s430_quote(frozen, "part.step"))
+            .await
+            .unwrap();
+        {
+            let conn = svc.deps.db.write().expect("stage via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET state = 'pricing' WHERE quote_id = ?",
+                duckdb::params![frozen],
+            )
+            .expect("force pricing");
+        }
+        // Those warm cycles ran 45 minutes ago and the row was mid-flight when
+        // the storefront went dark right after them. A test cannot wait out
+        // `STALE_JOB_REAP_AFTER`, so the marks are aged instead of slept.
+        d_priceq_age_cycle_marks(&svc, time::Duration::minutes(45));
+        let froze = (OffsetDateTime::now_utc() - time::Duration::minutes(44))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        d_priceq_backdate(&svc, frozen, &froze, &froze);
+
+        // ── the outage ──
+        //
+        // A FULL window of bailed cycles, not a token few. That is what a
+        // >= STALE_JOB_REAP_AFTER outage is at this cadence, and it is what
+        // makes the assertion below discriminating: if a bailed cycle recorded
+        // a mark, thirty of them would have replaced the whole window with
+        // stamps from just now, `window_start` would move to the present, and
+        // the recovery cycle would reap the row the outage froze.
+        down.store(true, Ordering::SeqCst);
+        for _ in 0..REAPER_GATE_CYCLES {
+            let summary = svc.poll_once().await;
+            assert!(
+                summary.error.is_some(),
+                "the storefront-list bail is the branch under test: {summary:?}"
+            );
+            assert_eq!(summary.reaped, 0, "a bailed cycle reaps nothing");
+        }
+        assert_eq!(
+            svc.cycle_marks_len(),
+            REAPER_GATE_CYCLES as usize,
+            "a cycle that never reached the advance loop offered no attempt and \
+             must record no mark"
+        );
+        assert_eq!(
+            svc.cycles_completed.load(Ordering::Relaxed),
+            REAPER_GATE_CYCLES,
+            "and it must not advance the counter either"
+        );
+        assert_eq!(
+            d_priceq_row(&svc, frozen).0,
+            "pricing",
+            "the mid-flight row is untouched during the outage"
+        );
+
+        // ── recovery ──
+        down.store(false, Ordering::SeqCst);
+        let summary = svc.poll_once().await;
+        assert_eq!(
+            summary.reaped, 0,
+            "the first cycle back must give the frozen row an ATTEMPT, not a \
+             verdict — its updated_at froze because the storefront was down, \
+             not because the job is stuck; summary = {summary:?}"
+        );
+        assert_ne!(
+            d_priceq_row(&svc, frozen).1.as_deref(),
+            Some("reaper"),
+            "nothing in the recovery cycle may be attributed to the reaper"
+        );
+
+        // Non-vacuous: put the row back where the outage left it, let a full
+        // window of cycles really run against it, and it IS reaped.
+        {
+            let conn = svc.deps.db.write().expect("reset via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET state = 'pricing', error_stage = NULL,
+                    error_reason = NULL, failure_kind = NULL WHERE quote_id = ?",
+                duckdb::params![frozen],
+            )
+            .expect("reset to pricing");
+        }
+        d_priceq_backdate(&svc, frozen, &froze, &froze);
+        d_priceq_seed_cycle_marks(&svc, REAPER_GATE_CYCLES, OffsetDateTime::now_utc());
+        assert_eq!(
+            svc.reap_stale_jobs().await,
+            1,
+            "the row was genuinely reapable — only the drained window spared it"
+        );
+        assert_eq!(d_priceq_row(&svc, frozen).1.as_deref(), Some("reaper"));
+
+        let _ = std::fs::remove_dir_all(&artifacts);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// **D-PRICEQ adversarial B4 — BOTH bounds, and the cutoff is the earlier
+    /// of them.** The mark window alone is not enough in the FAST direction:
+    /// `poll_loop` backs off 5s then 15s after an errored cycle, and an errored
+    /// cycle that reached the advance loop still counts, so a run of them fills
+    /// a thirty-cycle window in about two and a half minutes. A window-only
+    /// gate would then open on a job that has been stuck for minutes — the
+    /// threshold promises half an hour.
+    ///
+    /// So: `cutoff = min(window_start, now - STALE_JOB_REAP_AFTER)`, and a row
+    /// must predate BOTH. This pins the fast direction from both sides on the
+    /// same full-but-narrow window: a 10-minute-old row survives it, a
+    /// 35-minute-old row does not.
+    ///
+    /// Revert-proof: drop the wall-clock floor from the `min` and the first
+    /// assert fails; drop the window and take wall clock alone and the
+    /// stopped-cycling and outage probes fail.
+    #[tokio::test]
+    async fn d_priceq_the_reaper_needs_the_wall_clock_floor_too() {
+        let addr = d_priceq_mock(b"ISO-10303-21; x END-ISO-10303-21;".to_vec()).await;
+        let db = s430_temp("both-bounds.duckdb");
+        let artifacts = s430_temp("art");
+        let hot = "00000000-0000-0000-0000-00000000d012";
+        let svc = s430_service_cycles(&addr, db.clone(), artifacts.clone(), 0);
+        assert_eq!(
+            svc.reaper_window_cycles(),
+            REAPER_GATE_CYCLES as usize,
+            "the window is exactly STALE_JOB_REAP_AFTER worth of cadence"
+        );
+
+        svc.enqueue_one(s430_quote(hot, "part.step")).await.unwrap();
+        {
+            let conn = svc.deps.db.write().expect("stage via shared handle");
+            conn.execute(
+                "UPDATE quote_pricing_jobs SET state = 'pricing' WHERE quote_id = ?",
+                duckdb::params![hot],
+            )
+            .expect("force pricing");
+        }
+
+        // A FULL window of cycles — all of them inside the last ~2.5 minutes,
+        // which is what `backoff_duration`'s 5s first step produces under a
+        // persistent fault. `window_start` is therefore only ~145s back.
+        let now = OffsetDateTime::now_utc();
+        svc.recent_cycle_marks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        for back in (0..REAPER_GATE_CYCLES).rev() {
+            svc.record_cycle_mark(now - time::Duration::seconds(back as i64 * 5));
+        }
+        assert_eq!(svc.cycle_marks_len(), REAPER_GATE_CYCLES as usize);
+
+        let ten_min = (now - time::Duration::minutes(10))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        d_priceq_backdate(&svc, hot, &ten_min, &ten_min);
+        assert_eq!(
+            svc.reap_stale_jobs().await,
+            0,
+            "thirty cycles crammed into two and a half minutes of error backoff \
+             are not thirty minutes — the wall-clock floor is the other bound"
+        );
+        assert_eq!(d_priceq_row(&svc, hot).0, "pricing");
+
+        // Same narrow window, same service — only the row's age changes. Now
+        // BOTH bounds are cleared, so the backstop fires.
+        let thirty_five = (now - time::Duration::minutes(35))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        d_priceq_backdate(&svc, hot, &thirty_five, &thirty_five);
+        assert_eq!(
+            svc.reap_stale_jobs().await,
+            1,
+            "past the wall-clock floor AND behind a full window of live cycles \
+             is what stuck means"
+        );
+        assert_eq!(d_priceq_row(&svc, hot).1.as_deref(), Some("reaper"));
 
         let _ = std::fs::remove_dir_all(&artifacts);
         let _ = std::fs::remove_file(&db);

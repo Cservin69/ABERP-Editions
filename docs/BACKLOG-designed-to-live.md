@@ -430,19 +430,44 @@ particular is a constant change whose blast radius is the whole fixture
 corpus.
 
 <a id="d-20"></a>
-### D-20 — Pricing-queue hardening: three follow-ups the D-PRICEQ fix did not close
+### D-20 — Pricing-queue hardening: four follow-ups the D-PRICEQ fix did not close
 
 **Surface today.** The head-of-line fix on the pricing daemon
 (`apps/aberp/src/quote_pricing_pipeline.rs`) closed the prod wedge: the
 extract path fails loud instead of returning `Err` forever, `poll_once`
 skips an erroring job instead of abandoning the cycle, a stale-job reaper
-backstops rows nothing can move (gated on COMPLETED CYCLES, so neither
-ordinary app downtime nor a sleeping laptop condemns a job), every non-idle
-cycle writes a `quote.pricing_cycle_outcome` audit row, and the operator has
+backstops rows nothing can move, every non-idle cycle writes a
+`quote.pricing_cycle_outcome` audit row, and the operator has
 a Retry route. Round 3 additionally routed every remaining bare-`?` error
 exit on the advance path through the audited failure path, so no advance
 error can leave a row non-terminal and therefore beyond `retry_job`'s reach.
-The three items below were found by the adversarial passes on that fix, are
+
+**How the reaper is gated (round 4).** A row is condemned only when it has
+been unmoved since *before both* of two bounds, whichever is **earlier**:
+
+* a **full window of cycles that really ran** — the daemon keeps the
+  timestamps of its last `STALE_JOB_REAP_AFTER / poll_interval` completed
+  cycles (30 at the 60s cadence), and reaps nothing until that window is
+  full; and
+* the ordinary **wall-clock floor**, `now - STALE_JOB_REAP_AFTER`.
+
+Both bounds are load-bearing and in opposite directions. The window is what
+stops ordinary app downtime, a sleeping laptop, or a storefront outage from
+condemning a mid-flight row: a cycle that bails before the advance loop
+records no mark, so an outage drains the window instead of ageing the queue,
+and the window simply stops advancing while the machine is asleep. The
+wall-clock floor is what stops the window opening *early*: `poll_loop` backs
+off 5s then 15s after an errored cycle, so a run of errored-but-completed
+cycles fills a thirty-cycle window in about two and a half minutes.
+
+Note what this is **not**: a monotonic count of cycles since process start.
+That was the round-3 gate, and because it never resets it stood permanently
+open roughly half an hour into any uptime — at which point the reaper was
+pure wall clock again and both freezes above condemned a row on the first
+cycle back. A count cannot express *recently*; a bounded window of recent
+marks can, and drains itself by not being refilled.
+
+The four items below were found by the adversarial passes on that fix, are
 **not** closed by it, and are recorded here deliberately rather than folded
 into it.
 
@@ -459,7 +484,27 @@ into it.
    **oldest** `updated_at` it is the row the reaper terminalises **first**.
    The live-cycle gate does **not** cover this: completed cycles accrue
    perfectly well while the row is being starved — indeed they accrue
-   *because* cycles are running.
+   *because* cycles are running. Round 4's window gate does not cover it
+   either, for the same reason — the marks record that a cycle RAN, not that
+   it reached any particular row.
+
+   *A second shape of the same defect, found in round 4.* If
+   `next_actionable_job_excluding` itself returns `Err` — a DB-level lookup
+   fault, not one job's problem — `poll_once` breaks out of the advance loop
+   but still falls through to the counter bump and the mark. Thirty such
+   cycles fill the window with cycles that offered NO row an attempt, and the
+   next reap condemns whatever is mid-flight. Deliberately NOT closed inside
+   round 4: the round's mechanism was reviewed as prototyped, and skipping
+   the mark there is a behaviour change of its own (it would disable the
+   reaper whenever the lookup is unwell — arguably right, since a daemon that
+   cannot look a row up cannot clear a wedge either, but that is a call to
+   make deliberately). Narrow in practice: it needs the lookup SELECT to fail
+   persistently while the storefront list, the reaper's own write lock and
+   `started_non_terminal_jobs` all keep working. Same severity as the
+   starvation shape above — a wrongly-Failed quote the operator can Retry —
+   and the same honest fix closes both: a persisted `last_attempt_at` on the
+   row, so "un-reached" is legible in the row itself rather than inferred
+   from what the daemon was doing.
 
    *Why it is not fixed here.* Every clean version of the fix changes
    design already reviewed and cleared. (a) Gating the reap on the set of
@@ -484,12 +529,13 @@ into it.
 2. **A2 — the enqueue loop re-downloads and re-encrypts every still-
    `received` quote, every cycle, before the idempotency check.** Cycle
    wall-clock therefore grows with the size of the un-enqueued storefront
-   backlog rather than with new work. This is now load-bearing in a way it
-   was not before: the reaper's window is denominated in cycles, so a cycle
-   that takes minutes stretches every timing assumption around it. The fix
-   is to hoist the idempotency check above the download, which needs care
-   that the check stays correct for a row whose artifact write was
-   interrupted.
+   backlog rather than with new work. Round 4 took the reaper's timing
+   sensitivity off this: a slow cycle pushes the window's oldest mark
+   further into the past, which only ever *delays* a reap, and the
+   wall-clock floor bounds the other direction. It remains a real latency
+   defect. The fix is to hoist the idempotency check above the download,
+   which needs care that the check stays correct for a row whose artifact
+   write was interrupted.
 
 3. **A3 — the Retry route is not edition-gated.** The route and its
    response codes are compiled into Portable as well as Defense. Harmless
@@ -497,12 +543,44 @@ into it.
    is always empty there and every retry answers 404 — but it is an
    edition-surface drift, and the sibling routes around it are gated.
 
-**Blocked on.** Nothing external; all three are our own work in the pricing
+4. **A4 — bounded auto-retry-with-backoff for `Transient` pipeline
+   failures.** `classify_failure` labels every terminal failure
+   `Transient` / `Permanent` / `Unknown`, and round 4 widened `Transient` to
+   cover the daemon's own transient-local sites (a full disk under the PDF
+   write or the decrypted-CAD temp, a transient audit-tx fault on a CAD-blob
+   read append). **Nothing consumes the label.**
+   `next_actionable_job` excludes `Failed` rows outright, so a `Transient`
+   row waits for an operator Retry click exactly as a `Permanent` one does;
+   `UNKNOWN_AUTO_RETRY_CAP` is a constant with no reader on any scheduling
+   path. The verdict's live consumers are the operator panel badge and the
+   `QuotePricingFailureClassified` audit payload — genuinely useful, but not
+   self-healing.
+
+   *What to build.* A capped, backed-off auto re-enqueue for `Transient`
+   rows, so a network blip or a briefly-full disk resolves itself instead of
+   waiting on an operator who may be asleep. That is the never-lose-a-job
+   ethos the rest of this daemon is built to: a quote should not sit dead
+   overnight because a volume was unmounted for a minute.
+
+   *Why it is not built here.* It is a scheduler change, and the scheduler
+   is the exact surface the D-PRICEQ head-of-line incident came out of. An
+   auto-retry that re-enqueues at the FIFO head, or that does not cap, or
+   that does not distinguish "retried and failed the same way" from "not yet
+   retried", re-introduces the wedge in a new costume. It needs its own
+   design: where the row re-enters the queue, how the attempt counter and
+   backoff persist across restarts, how the audit chain records attempt *n*,
+   and how it interacts with the stale-job reaper (a row being auto-retried
+   is moving, so it must not be reapable — and must not be able to
+   auto-retry forever either). Until then, the honest position is stated in
+   `classify_failure`'s own doc comment: it labels; it does not retry.
+
+**Blocked on.** Nothing external; all four are our own work in the pricing
 daemon.
 
 **Size.** A1 medium — the schema change is small, the design decision (what
 the reaper is allowed to conclude from) is the real content. A2 small-to-
-medium. A3 small.
+medium. A3 small. A4 medium — the code is small, the scheduling design is
+the content.
 
 ---
 
