@@ -56,8 +56,13 @@
 //! 2. **Body framing is decided from the head**, before a byte of body
 //!    is read. Every way of disagreeing about framing is answered
 //!    immediately rather than discovered halfway through a decoder.
-//! 3. **Budgets are totals, armed once.** A per-read timeout is not a
-//!    bound: one byte every 59 seconds renews it forever.
+//! 3. **Budgets are totals, armed once — by the first byte read, and
+//!    checked in the loop.** A per-read timeout is not a bound: one
+//!    byte every 59 seconds renews it forever. Nor is a timeout *around
+//!    the read* enough on its own — it fires only when the inner future
+//!    is pending at the deadline, and a peer that keeps the socket full
+//!    makes every read ready. A timeout that wraps an I/O future bounds
+//!    waiting, not work.
 //!
 //! Silence is correct in exactly one place, and it is captured rather
 //! than chosen: a *partial but well-formed* head is waited for and then
@@ -501,7 +506,7 @@ where
         };
         first = false;
 
-        let head_bytes = match read_head(&mut stream, &mut buf, idle).await {
+        let head_bytes = match read_head(&mut stream, &mut buf, idle, HEADER_TIMEOUT).await {
             Ok(v) => v,
             Err(HeadError::Closed) => return,
             Err(HeadError::Refuse(class)) => {
@@ -722,23 +727,46 @@ async fn read_head<S>(
     stream: &mut S,
     buf: &mut Vec<u8>,
     idle: Duration,
+    budget: Duration,
 ) -> Result<Vec<u8>, HeadError>
 where
     S: AsyncRead + Unpin,
 {
-    // Armed by the first byte of the request and never rearmed. See
-    // [`HEADER_TIMEOUT`] on why this is a total budget rather than a
-    // per-read one.
+    // Armed by the first byte READ — not by the first byte *left in the
+    // buffer after the CRLF skip*, which is what it used to be and
+    // which was a hole big enough to hold a connection open forever.
+    // A stream of nothing but `\r\n` leaves the buffer empty on every
+    // pass, so the budget never armed, the idle wait was recomputed
+    // from `now` each time round, and the peer could keep the slot for
+    // as long as it kept typing. Free, silent and unbounded — the
+    // fourth costume of the same primitive, found by attacking the
+    // round-3 fix rather than the round-2 code.
     let mut deadline: Option<tokio::time::Instant> = None;
+    // Set once the request line has been checked, so a head arriving a
+    // byte at a time is not re-parsed on every pass. Without it a
+    // dribbled 8 KiB request line costs O(n²) parses for O(n) bytes.
+    let mut line_checked = false;
 
     loop {
+        // A budget enforced only by wrapping the read is not enforced
+        // at all: `timeout_at` yields `Err` only if the inner future is
+        // *pending* when the deadline passes, and a peer that keeps the
+        // socket full makes every read ready. The check has to be here,
+        // in the loop, where it holds however fast the bytes arrive.
+        if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+            return Err(HeadError::Closed);
+        }
         // Leading CRLFs before a request line are skipped by nginx —
         // they are legal debris from a previous pipelined request.
-        while buf.first().is_some_and(|b| *b == b'\r' || *b == b'\n') {
-            buf.remove(0);
-        }
-        if deadline.is_none() && !buf.is_empty() {
-            deadline = Some(tokio::time::Instant::now() + HEADER_TIMEOUT);
+        // Drained in one shift rather than one byte at a time, because
+        // `remove(0)` per byte is quadratic and the bytes are
+        // attacker-chosen.
+        let debris = buf
+            .iter()
+            .position(|b| *b != b'\r' && *b != b'\n')
+            .unwrap_or(buf.len());
+        if debris > 0 {
+            buf.drain(..debris);
         }
         if let Some((head, rest)) = split_head(buf) {
             *buf = rest;
@@ -783,8 +811,15 @@ where
         //
         // Only 1.0 and 1.1 have a header block to wait for; everything
         // else is complete at the end of its first line.
-        if let Some(head) = request_line_settles_it(buf)? {
-            return Ok(head);
+        if !line_checked {
+            if let Some(head) = request_line_settles_it(buf)? {
+                return Ok(head);
+            }
+            // `request_line_settles_it` returns `None` either because
+            // the line has not finished arriving or because it is a
+            // 1.0/1.1 line whose headers are still to come. Only the
+            // second is settled, and only that one may be memoised.
+            line_checked = buf.contains(&b'\n');
         }
 
         let until = deadline.unwrap_or_else(|| tokio::time::Instant::now() + idle);
@@ -807,6 +842,9 @@ where
             }
             Ok(Ok(n)) => n,
         };
+        // Whatever it was — request line, header bytes, or pure CRLF
+        // debris — the request has started and the budget starts here.
+        deadline.get_or_insert_with(|| tokio::time::Instant::now() + budget);
         buf.extend_from_slice(&chunk[..n]);
     }
 }
@@ -1745,6 +1783,121 @@ mod tests {
             out.windows(8).filter(|w| *w == b"HTTP/1.1").count(),
             2,
             "the second, pipelined request was not answered — the socket desynchronised"
+        );
+    }
+
+    /// A socket that is *always* ready with more `\r\n`. Never
+    /// pending, never closed — the shape a peer with a fast link and a
+    /// grudge presents.
+    struct EndlessCrlf;
+
+    impl AsyncRead for EndlessCrlf {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            b: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let n = b.remaining().min(512);
+            b.put_slice(&b"\r\n".repeat(n / 2));
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn an_endless_crlf_stream_runs_out_of_budget_rather_than_out_of_patience() {
+        // The bug this catches is subtle twice over, and neither half
+        // is visible from a `duplex` test:
+        //
+        // 1. the head budget was armed by "the buffer is non-empty
+        //    after the CRLF skip", and a stream of pure CRLFs leaves it
+        //    empty every pass, so the budget never armed at all;
+        // 2. even armed, wrapping the read in `timeout_at` would not
+        //    have helped — that yields `Err` only when the inner future
+        //    is PENDING at the deadline, and this peer's reads are
+        //    always ready. The budget has to be checked in the loop.
+        //
+        // Driven with a tiny budget so the test is fast and exact; the
+        // production path passes `HEADER_TIMEOUT`.
+        //
+        // Run on its own thread and joined with a channel timeout,
+        // rather than inside a `tokio::time::timeout`, because against
+        // the bug this loop NEVER YIELDS: every read is ready, so
+        // nothing returns `Pending`, the timer is never polled, and an
+        // in-runtime timeout can never fire. The test would hang — the
+        // worst outcome a regression guard can have — and so would the
+        // runtime's own shutdown.
+        //
+        // That is also the honest measure of the severity. Pre-fix this
+        // was not merely a held connection: it was an unyielding spin
+        // on a shared runtime, which starves every other connection the
+        // relay is serving.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime");
+            let got = rt.block_on(read_head(
+                &mut EndlessCrlf,
+                &mut Vec::new(),
+                Duration::from_secs(60),
+                Duration::from_millis(50),
+            ));
+            let _ = tx.send(got);
+        });
+
+        match rx.recv_timeout(BOUNDED) {
+            Ok(got) => assert_eq!(
+                got,
+                Err(HeadError::Closed),
+                "an exhausted head budget is answered with silence, as nginx answers it"
+            ),
+            Err(_) => panic!(
+                "read_head never returned. The head budget is not enforced against a \
+                 peer whose reads are always ready — it is still spinning now."
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_leading_crlfs_cannot_hold_the_connection_open() {
+        // Found by attacking the round-3 fix itself, and it is the same
+        // primitive in a fourth costume.
+        //
+        // nginx skips leading CRLFs before a request line — legal
+        // debris from a pipelined predecessor — and so do we. But the
+        // head budget was armed by "the buffer is non-empty AFTER the
+        // skip", and a stream of nothing but CRLFs leaves the buffer
+        // empty every single time. The budget never armed, the idle
+        // wait was recomputed from `now` on every pass, and the
+        // connection was held for as long as the peer cared to keep
+        // typing `\r\n`. Free, silent, unbounded.
+        //
+        // The budget is now armed by the first byte READ, whatever that
+        // byte turns out to be.
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(serve(server, None, Arc::new(Stub::default())));
+
+        // Enough CRLFs to run well past any plausible number of
+        // iterations, then a real request that must still be answered
+        // — the skip is a real nginx behaviour and must survive.
+        let mut raw = b"\r\n".repeat(8_000);
+        raw.extend_from_slice(b"GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        client.write_all(&raw).await.expect("write");
+
+        let out = tokio::time::timeout(BOUNDED, async {
+            task.await.expect("connection task");
+            let mut out = Vec::new();
+            client.read_to_end(&mut out).await.expect("read");
+            out
+        })
+        .await
+        .expect("the CRLF skip held the connection instead of answering");
+
+        assert!(
+            out.starts_with(b"HTTP/1.1 404 Not Found"),
+            "the debris must be skipped and the request behind it answered, got {:?}",
+            String::from_utf8_lossy(&out[..out.len().min(48)])
         );
     }
 

@@ -433,6 +433,21 @@ KiB on the front and 8 MiB on the agent leg. The head and body budgets are
 **totals armed once**, not per-read timers, because a per-read timer is not a
 bound: one byte every 59 seconds renews it forever.
 
+A **fourth** was then found by attacking the round-3 fix rather than the
+round-2 code, and it is the worst of the set: the head budget was armed by
+"the buffer is non-empty after the leading-CRLF skip", and a stream of
+nothing but `\r\n` leaves the buffer empty on every pass. The budget never
+armed, the idle wait was recomputed from `now` each time round, and the
+connection was held for as long as the peer kept typing. Worse, wrapping the
+read in a timeout would not have saved it: `timeout_at` fires only when the
+inner future is *pending* at the deadline, and a peer that keeps the socket
+full makes every read ready — so against a fast link this was not a held
+connection but an **unyielding spin**, starving every other connection
+sharing the runtime. The budget is now armed by the first byte *read*,
+whatever that byte is, and checked **in the loop** rather than only around
+the read. The lesson generalises: a timeout that wraps an I/O future bounds
+*waiting*, not *work*.
+
 **Thirty-six** request forms are now diffed against a live nginx, up from
 twenty-four, and the differential test no longer passes by not running (see
 below). The alternative was never "no parser" — it was hyper's parser
