@@ -162,7 +162,9 @@ impl TenantLogo {
         let rgb_bytes = match frame.color_type {
             png::ColorType::Rgb => pixels.to_vec(),
             png::ColorType::Rgba => pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|p| {
                     let a = p[3];
                     [
@@ -174,7 +176,9 @@ impl TenantLogo {
                 .collect(),
             png::ColorType::Grayscale => pixels.iter().flat_map(|&g| [g, g, g]).collect(),
             png::ColorType::GrayscaleAlpha => pixels
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .flat_map(|p| {
                     let v = composite_over_white(p[0], p[1]);
                     [v, v, v]
@@ -239,7 +243,12 @@ mod tests {
         assert_eq!(logo.width, 4);
         assert_eq!(logo.height, 3);
         assert_eq!(logo.rgb_bytes.len(), 4 * 3 * 3);
-        assert!(logo.rgb_bytes.chunks_exact(3).all(|p| p == [10, 20, 30]));
+        assert!(logo
+            .rgb_bytes
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .all(|p| *p == [10, 20, 30]));
     }
 
     #[test]
@@ -253,7 +262,11 @@ mod tests {
         let logo = TenantLogo::from_png_bytes(&png).expect("decode");
         assert_eq!(logo.rgb_bytes.len(), 2 * 2 * 3);
         assert!(
-            logo.rgb_bytes.chunks_exact(3).all(|p| p == [255, 255, 255]),
+            logo.rgb_bytes
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|p| *p == [255, 255, 255]),
             "α=0 must composite to white; got {:?}",
             logo.rgb_bytes
         );
@@ -265,7 +278,12 @@ mod tests {
         // resolves to src for any src∈[0,255].
         let png = synth_png(2, 2, png::ColorType::Rgba, &[200, 100, 50, 255]);
         let logo = TenantLogo::from_png_bytes(&png).expect("decode");
-        assert!(logo.rgb_bytes.chunks_exact(3).all(|p| p == [200, 100, 50]));
+        assert!(logo
+            .rgb_bytes
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .all(|p| *p == [200, 100, 50]));
     }
 
     #[test]
@@ -291,7 +309,12 @@ mod tests {
         let png = synth_png(3, 2, png::ColorType::Grayscale, &[128]);
         let logo = TenantLogo::from_png_bytes(&png).expect("decode");
         assert_eq!(logo.rgb_bytes.len(), 3 * 2 * 3);
-        assert!(logo.rgb_bytes.chunks_exact(3).all(|p| p == [128, 128, 128]));
+        assert!(logo
+            .rgb_bytes
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .all(|p| *p == [128, 128, 128]));
     }
 
     #[test]
@@ -338,7 +361,7 @@ mod tests {
     /// placement-matrix code path stayed sane for a single-pixel-wide
     /// vertical strip. The PR-185 dimension cap (`MAX_LOGO_DIMENSION`,
     /// 4096) bounds N; a 1×1024 fixture sits well under that and
-    /// exercises the `chunks_exact(...)` paths for grayscale + the
+    /// exercises the `as_chunks(...)` paths for grayscale + the
     /// `(width as usize).saturating_mul(height as usize)` length-check
     /// without tripping the cap.
     ///

@@ -113,7 +113,17 @@ pub fn decrypt_exchange_token(
 
     let mut out = Vec::with_capacity(ciphertext.len());
     let mut block = GenericArray::<u8, aes::cipher::typenum::U16>::default();
-    for chunk in ciphertext.chunks_exact(AES_BLOCK_SIZE) {
+    // `as_chunks::<AES_BLOCK_SIZE>()` yields exactly the 16-byte blocks
+    // `chunks_exact(AES_BLOCK_SIZE)` yielded, in the same order; the
+    // multiple-of-16 guard above makes the remainder provably empty, so
+    // no input byte is dropped. Shape unchanged — still block-by-block
+    // ECB per ADR-0020 §2 / ADR-0021 §A9.
+    let (blocks, remainder) = ciphertext.as_chunks::<AES_BLOCK_SIZE>();
+    debug_assert!(
+        remainder.is_empty(),
+        "length guard above guarantees a whole number of AES blocks"
+    );
+    for chunk in blocks {
         block.copy_from_slice(chunk);
         cipher.decrypt_block(&mut block);
         out.extend_from_slice(block.as_slice());
@@ -150,7 +160,7 @@ mod tests {
         let cipher = Aes128::new(key_array);
         let mut out = Vec::with_capacity(plaintext.len());
         let mut block = GenericArray::<u8, aes::cipher::typenum::U16>::default();
-        for chunk in plaintext.chunks_exact(16) {
+        for chunk in plaintext.as_chunks::<16>().0 {
             block.copy_from_slice(chunk);
             cipher.encrypt_block(&mut block);
             out.extend_from_slice(block.as_slice());
@@ -177,6 +187,70 @@ mod tests {
         let ciphertext = encrypt_blocks(&key, &plaintext);
         let decrypted = decrypt_exchange_token(&key, &ciphertext).expect("decrypt");
         assert_eq!(decrypted, plaintext);
+    }
+
+    /// Known-answer byte-equivalence pin for the ECB block loop.
+    ///
+    /// The round-trip tests above route BOTH directions through the
+    /// block loops in this file, so they cannot distinguish "the loop is
+    /// correct" from "the loop is wrong the same way twice". These two
+    /// tests pin decrypt output against ciphertext computed OUTSIDE this
+    /// crate, so any change to the loop's chunking — block size, block
+    /// count, or block ORDER — shows up as a byte diff.
+    ///
+    /// Vector: FIPS-197 §C.1, AES-128.
+    ///   key        000102030405060708090a0b0c0d0e0f
+    ///   plaintext  00112233445566778899aabbccddeeff
+    ///   ciphertext 69c4e0d86a7b0430d8cdb78070b4c55a
+    ///
+    /// Neither plaintext ends in a byte ≤ 16, so the PKCS#7 strip below
+    /// the loop is a no-op here and the assertion sees the raw AES
+    /// output.
+    #[test]
+    fn decrypts_fips197_known_answer_vector() {
+        let key: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let ciphertext: [u8; 16] = [
+            0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4,
+            0xc5, 0x5a,
+        ];
+        let expected: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let got = decrypt_exchange_token(&key, &ciphertext).expect("decrypt");
+        assert_eq!(
+            got, expected,
+            "FIPS-197 C.1 AES-128 vector must decrypt exactly"
+        );
+    }
+
+    /// Two-block KAT with DISTINCT blocks, so a loop that reversed,
+    /// duplicated, or dropped a block cannot pass. Block 2 is the ASCII
+    /// token `NAV-TOKEN-016BYT` under the same key; its ECB ciphertext
+    /// is 3685ffd03dd80a9617d2be0d104bd885.
+    #[test]
+    fn decrypts_two_block_known_answer_vector_in_order() {
+        let key: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let ciphertext: [u8; 32] = [
+            // block 1 -> 00112233445566778899aabbccddeeff
+            0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4,
+            0xc5, 0x5a, // block 2 -> b"NAV-TOKEN-016BYT"
+            0x36, 0x85, 0xff, 0xd0, 0x3d, 0xd8, 0x0a, 0x96, 0x17, 0xd2, 0xbe, 0x0d, 0x10, 0x4b,
+            0xd8, 0x85,
+        ];
+        let mut expected = vec![
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        expected.extend_from_slice(b"NAV-TOKEN-016BYT");
+        let got = decrypt_exchange_token(&key, &ciphertext).expect("decrypt");
+        assert_eq!(got, expected, "both blocks must decrypt, in input order");
     }
 
     #[test]
