@@ -264,9 +264,16 @@ pub trait Handler: Send + Sync + 'static {
         peer: Option<SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = Answer> + Send + 'a>>;
 
-    /// Called for a request this module refused before it could ever
-    /// become a [`RequestHead`] — a malformed request line, an
-    /// unsupported version, an over-long URI.
+    /// Called for a request this module refused before it could reach
+    /// [`Handler::handle`] — a malformed request line, an unsupported
+    /// version, an over-long URI, framing headers that cannot be
+    /// agreed, or a body that could not be read.
+    ///
+    /// The body cases were added in round 3 and are not incidental:
+    /// the three hang primitives all lived in the body reader and all
+    /// returned *before* this was called, so the trap never saw the
+    /// probes that found them — a blind spot at precisely the place a
+    /// prober was proved to aim.
     ///
     /// Synchronous and required to be non-blocking: it runs on the
     /// connection task, immediately before the refusal is written, and
