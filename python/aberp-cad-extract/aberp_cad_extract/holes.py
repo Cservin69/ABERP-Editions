@@ -394,6 +394,14 @@ part's position or orientation in the WORLD rather than the part's own
 shape. Two more instances of it survived round 4 — one it had just
 written — and both were found the same way, by turning the part.
 
+Round 5 then said the class was closed. It was not, and round 6 is the
+same lesson a third time: EVERY round of this has scoped its sweep by
+MECHANISM — "every ``Bnd_Box``", "every intersector tolerance" — and
+every time the next instance was a mechanism that was not in the bucket.
+So the sweep is BEHAVIOURAL now, and what is claimed is a MEASURED
+BOUND rather than closure. See "the verified bound" below, which is the
+form every future round of this should report in.
+
 - :func:`_cap_axis_intersections` intersected the axis with the cap's
   surface in WORLD coordinates. ``GeomAPI_IntCS``'s absolute error grows
   with the coordinates it is handed, so the countersink's apex root moved
@@ -426,8 +434,8 @@ than what it got wrong, and both now permanent:
   computes both sides of it.
 
 WHAT IS LEFT, and it is written down because the next round should not
-have to re-derive it. Three world-frame quantities remain in this module,
-all of them deliberate, none of them able to move a verdict:
+have to re-derive it. Three world-frame quantities are here DELIBERATELY,
+and are not the reason a verdict could still move:
 
 - :func:`_canonical_direction` forces the reported axis into a canonical
   hemisphere OF THE WORLD FRAME, and :func:`_canonical_origin` puts the
@@ -450,6 +458,81 @@ all of them deliberate, none of them able to move a verdict:
   in the bore's frame and read only on Z — the one axis of that frame the
   bore fixes. ``test_d19r5_the_only_world_axis_box_left_is_read_on_the_
   bores_own_axis`` fails on any new box anywhere in the module.
+
+ROUND 6 — THE CLASSIFIER'S FRAME, and the bound instead of the claim
+--------------------------------------------------------------------
+
+- :meth:`_AxisMaterial._inside` handed ``BRepClass3d_SolidClassifier`` a
+  point built in WORLD coordinates and asked it to resolve an INTRINSIC
+  step — a :func:`_tangency_band`, ~2e-03 mm. A classifier's usable
+  precision is RELATIVE to the coordinates it is given, so the step
+  vanishes into kernel noise as the part moves out. Measured on the
+  material boundary the probe exists to find, located by bisection rather
+  than assumed: 3.1e-08 mm off with the part 100 m out, 3.2e-05 mm at
+  1 km, and **3.9e-03 mm at 10 km — wider than the step itself**, so
+  ``is_exit`` is then comparing two answers that are noise. It is asked
+  in the bore's own anchored frame now
+  (:meth:`_AxisMaterial._anchored_shape`), where the same boundary moves
+  2.3e-10 mm at 10 km and stays linear in the distance out to 1e11 mm.
+  All 62 committed fixtures are bit-identical: the fix changes a
+  BOOLEAN, and it changes it only where the boolean was wrong.
+
+THE SWEEP IS BEHAVIOURAL NOW, and that is round 6's real finding. Rounds
+4 and 5 each scoped their sweep by MECHANISM — "every ``Bnd_Box``",
+"every intersector tolerance" — and each time the next instance was a
+mechanism that was not in the bucket. So the criterion is stated over the
+ANSWERS instead: for every located-hole verdict, over all 62 committed
+fixtures, under seven rotations crossed with three translation directions
+in both orders, walk the coordinate magnitude and find the first
+categorical flip. A LADDER and not a bisection, because the predicate is
+NOT monotone in the magnitude — a part can answer correctly at 8 km and
+wrongly at 6 km — so a bisection reports *a* boundary rather than *the*
+first one, and reports it too high.
+``test_d19r6_no_verdict_moves_below_the_measured_bound``.
+
+THE VERIFIED BOUND, which is what this module claims and all it claims —
+and it is a LADDER's bound, so it is stated as one: the rungs are
+``10 ** (1/6)`` apart (1.468x), the walk runs from 1e+04 mm to 1e+09 mm,
+and everything below 1.5e+04 mm is already covered by
+``test_d19r5_no_answer_moves_under_a_composed_rigid_motion``. "Nothing
+moves below X" therefore means "no rung below X moved anything", and the
+true first flip could sit up to 1.468x lower than the figure quoted.
+
+- no COUNT, END CONDITION or FLAT-BOTTOM verdict moves at any rung below
+  **2.15e+07 mm (21.5 km)**. Before round 6 that bound was
+  **6.81e+06 mm (6.8 km)** — ``undercut_ball_seat_blind_bore``, 14.1 mm
+  BLIND reading 6.9 mm THROUGH, and the mechanism was this classifier.
+  The number of fixtures that flip anywhere on the ladder drops from 18
+  to 11.
+- no DEPTH moves by more than a MICRON anywhere below **1.00e+07 mm
+  (10 km)** (before round 6: 4.64e+06 mm), and the fixture that sets both
+  is ``ball_nose_blind_bore_d4_deep``, whose cap is met at a tangency.
+- over the whole motion grid at **4e+06 mm (4 km)** nothing discrete
+  moves and no depth moves by more than **3.7e-04 mm**; at 1 km the worst
+  depth moves 1.8e-05 mm, and at 100 m, 2.2e-07 mm.
+- and there IS a flip above that, with a named mechanism, because
+  "closed" is the word that hid the last two instances:
+  :func:`_cap_axis_intersections` runs in ``gp_Ax3(origin, direction)``,
+  and :func:`_canonical_origin` puts ``origin`` at the foot of the
+  perpendicular from the WORLD origin — a point on the axis LINE, not on
+  the PART. A translation ALONG the bore's own axis therefore leaves the
+  surface at world magnitude inside "the bore's frame", and
+  ``GeomAPI_IntCS`` loses one of the two roots of a breakout sphere:
+  ``far_opening_through_bore`` returns roots (-1.31, 11.97) at 1e+08 mm
+  and the single root 5.33 at 2.15e+08 mm, so the void bound discards
+  nothing, this oracle is never asked, and 12.0 THROUGH reads 17.33
+  BLIND. EVERY residual flip on the ladder is that one mechanism, and
+  that is checked rather than inferred — all ELEVEN of them return to the
+  upright answer when the intersection frame is anchored on the bore —
+  ``domed_floor_pocket_proud`` 7.0 BLIND reading 13.1 THROUGH,
+  ``bore_beside_a_conical_boss`` 25.0 THROUGH reading 30.0 BLIND,
+  ``undercut_ball_seat_blind_bore_d8`` 12.1 reading 7.1 — and anchoring
+  THAT frame on the bore restores the exact nominal in every one of them,
+  out to 4.6e+08 mm. It is not bit-preserving: eight of the 62 committed
+  fixtures move in their last bits, two of them TOWARDS their nominal
+  (14.100000000000001 -> 14.1). So it is measured, named and filed rather
+  than folded into a round whose bar is bit-identity. See
+  ``docs/BACKLOG-designed-to-live.md``, D-19 item 9.
 
 Contiguity (ADR-0112 adversarial, B3)
 --------------------------------------
@@ -799,6 +882,17 @@ SURFACE_CONFUSION_MM: float = 1e-7
 #: within that range: `test_d19_the_material_probe_is_not_a_tuned_epsilon`
 #: moves the step, which is the quantity that could matter, over four
 #: decades and no answer follows.
+#:
+#: "Far above float noise" is a claim about the FRAME the classifier is
+#: asked in, and D-19 round 6 is where that stopped being taken on trust.
+#: Both this figure and the step it sits under are INTRINSIC — millimetres
+#: of the part — while a classifier's own precision is RELATIVE to the
+#: coordinates handed to it, so in world coordinates the noise floor
+#: climbs with the part's distance from the origin until it swallows both.
+#: Measured: the material boundary the probe locates moves 3.9e-03 mm with
+#: the part 10 km out, which is wider than the step. It is asked in the
+#: bore's own anchored frame now (`_AxisMaterial._anchored_shape`), where
+#: the same boundary moves 2.3e-10 mm.
 MATERIAL_PROBE_TOL_MM: float = 1e-9
 
 
@@ -2893,22 +2987,38 @@ class _AxisMaterial:
     forbids. The crown is 0.4 mm outside the trim and INSIDE the face's
     box; a spherical breakout's far pole is 4 mm outside the face's box
     and goes.
+
+    WHERE THE PART IS STANDING — D-19 round 6, and the last of the three
+    rulers this oracle carried. Round 2's was the wrong OBJECT (the part,
+    not the face), round 4's was the wrong RULER for a tilted bore (a
+    world-axis box), and round 6's is the wrong FRAME for a part that is
+    not near the origin: :meth:`_inside` handed
+    ``BRepClass3d_SolidClassifier`` a point built in WORLD coordinates
+    and asked it to resolve an INTRINSIC step — a :func:`_tangency_band`,
+    ~2e-03 mm. A classifier's usable precision is relative to the
+    coordinates it is given, so that step vanishes into kernel noise as
+    the part moves out, and the probe silently starts answering about
+    arithmetic instead of about metal. It is asked in
+    :meth:`_anchored_shape`'s frame now, and the measured cost of having
+    got it wrong is in that method's own docstring.
     """
 
     __slots__ = (
         "_shape",
         "_origin",
         "_direction",
+        "_anchor_t",
         "_classifier",
         "_queries",
         "_extents",
         "_metal",
     )
 
-    def __init__(self, shape, origin, direction) -> None:
+    def __init__(self, shape, origin, direction, anchor_t) -> None:
         self._shape = shape
         self._origin = origin
         self._direction = direction
+        self._anchor_t = anchor_t
         self._classifier = None
         self._queries = 0
         self._extents: List[Tuple[object, Optional[Tuple[float, float]]]] = []
@@ -2955,6 +3065,72 @@ class _AxisMaterial:
             return False
         return t < span[0] or t > span[1]
 
+    def _anchored_shape(self):
+        """The solid, translated so a point ON THIS BORE is the origin.
+
+        D-19 round 6, and the reason is the one round 5 wrote down and
+        did not follow all the way. A solid classifier's usable precision
+        is RELATIVE to the coordinates it is handed: it shoots a ray from
+        the query point and intersects it with the part's faces, and the
+        absolute error of that intersection grows with the numbers going
+        into it. What is being asked of it, though, is INTRINSIC — is
+        there metal a :func:`_tangency_band` outward of this crossing? —
+        and that band is 2.19e-03 mm on a O12 bore and 1.26e-03 mm on a
+        O4 one. Handed world coordinates, the intrinsic step disappears
+        into the kernel's own noise as the part moves away from the
+        origin, and the probe stops answering about the part.
+
+        Measured, on the material boundary the probe exists to find, by
+        locating it with a bisection instead of assuming it: on
+        ``ball_nose_blind_bore_d4_deep`` the boundary the world-frame
+        classifier reports sits 3.1e-08 mm from the truth with the part
+        100 m out, 3.2e-05 mm at 1 km and 3.9e-03 mm at 10 km — past the
+        1.26e-03 mm step the probe takes, so at 10 km ``is_exit`` is
+        comparing two answers that are noise. At 100 km it is 0.43 mm.
+        The same boundary in this frame: 7.3e-12 mm at 100 m, 5.8e-11 at
+        1 km, 2.3e-10 at 10 km, 7.5e-09 at 100 km, and it goes on being
+        LINEAR in the distance out to 1e11 mm, which is the floor of what
+        a double can represent at those coordinates and not a property of
+        this module.
+
+        ANCHORED ON THE BORE, and that is the whole of the fix rather
+        than a detail of it. The obvious frame — translate by
+        ``-origin`` — does almost nothing, because
+        :func:`_canonical_origin` puts ``origin`` at the foot of the
+        perpendicular from the WORLD origin, which is a point on the
+        AXIS LINE and not a point on the PART. A part 17 km away along
+        its own bore's direction has ``|origin|`` small and ``t`` equal
+        to 17 km, so ``t * direction`` is still 17 km from the frame's
+        own origin and the classifier is no better off: measured over
+        the corpus, ``-origin`` does not rescue a single verdict the world
+        frame loses — both round-6 regression tests fail under it exactly
+        as they fail under no fix at all, which is what pins the ANCHOR
+        rather than the translation as the fix. The anchor has to be a
+        point the PART is at, so it is the middle of the bore's own
+        parametric span — which is inside the metal, by construction,
+        for every bore this class is ever built for.
+
+        A pure TRANSLATION, not the ``gp_Ax3`` frame
+        :func:`_cap_axis_intersections` and :func:`_face_axial_span` use.
+        Those two read a coordinate OF the frame, so they need its Z to
+        be the bore's axis; this one only needs the numbers to be small,
+        and a rotation does not make a number smaller. Translating is
+        also the motion that costs the least to be exact about.
+
+        ``Copy=True``, which is load-bearing: with ``Copy=False`` OCCT
+        records the motion as a ``TopLoc_Location`` and leaves the
+        geometry where it was, so the classifier would compose the
+        location back in and be handed the same large coordinates again.
+        The copy is one per BORE — built lazily with the classifier, in
+        the same branch, so a part that never asks never pays — and it
+        costs nothing measurable: the whole corpus mines in 0.28 s with
+        it and 0.28 s without.
+        """
+        anchor = _point_on_axis(self._origin, self._direction, self._anchor_t)
+        move = gp_Trsf()
+        move.SetTranslation(gp_Vec(-anchor[0], -anchor[1], -anchor[2]))
+        return BRepBuilderAPI_Transform(self._shape, move, True).Shape()
+
     def _inside(self, t: float) -> bool:
         """Is the axis metal at ``t``? Asked of the solid, once per ``t``.
 
@@ -2972,16 +3148,28 @@ class _AxisMaterial:
         ``test_n2_the_point_classifier_is_rationed_not_readmitted``
         caught. It reaches them four times now, which is the number of
         distinct questions.
+
+        Asked in :meth:`_anchored_shape`'s frame — the solid moved so
+        that a point on THIS BORE is the origin — because a classifier's
+        precision is relative to the coordinates it is given and the
+        question put to it is intrinsic. D-19 round 6; the numbers are
+        there.
         """
         cached = self._metal.get(t)
         if cached is not None:
             return cached
-        point = _point_on_axis(self._origin, self._direction, t)
         if self._classifier is None:
-            self._classifier = BRepClass3d_SolidClassifier(self._shape)
+            self._classifier = BRepClass3d_SolidClassifier(self._anchored_shape())
+        offset = t - self._anchor_t
+        direction = self._direction
         self._queries += 1
         self._classifier.Perform(
-            gp_Pnt(point[0], point[1], point[2]), MATERIAL_PROBE_TOL_MM
+            gp_Pnt(
+                offset * direction[0],
+                offset * direction[1],
+                offset * direction[2],
+            ),
+            MATERIAL_PROBE_TOL_MM,
         )
         answer = self._classifier.State() == TopAbs_IN
         self._metal[t] = answer
@@ -3727,7 +3915,15 @@ def mine_cylindrical_holes(shape) -> List[LocatedHole]:
                 ancestors,
                 group.lo,
                 group.hi,
-                _AxisMaterial(shape, origin, direction),
+                # The MIDDLE of the bore's own parametric span is the
+                # frame the material question is asked in (D-19 round 6).
+                # Any point on the bore would do — see
+                # `_AxisMaterial._anchored_shape` for why it must be a
+                # point on the PART and not `origin`, which
+                # `_canonical_origin` puts on the axis LINE.
+                _AxisMaterial(
+                    shape, origin, direction, 0.5 * (group.lo + group.hi)
+                ),
             )
             depth = t_hi - t_lo
             if depth <= 0.0:

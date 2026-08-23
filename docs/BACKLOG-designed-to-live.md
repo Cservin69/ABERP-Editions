@@ -384,14 +384,15 @@ into FeatureGraph v6. The named parts below are where each defect lives:
 `_skin_over_axis`, `_root_for_end`, `_walk_caps`,
 `_cap_axis_intersections`, `_has_flat_bottom`, `SURFACE_CONFUSION_MM`.
 
-**Missing for Live.** Eight items, in priority order — seven defects and
+**Missing for Live.** Nine items, in priority order — eight defects and
 one convention. All are mutation-verified: items 1-5 from adversarial
-pass 8, items 6-8 from the D-19 round-2 pass. **Four are CLOSED**; item 8
-is now **DECIDED** at the far end of the bore and open only at the mouth
-(below); items 3, 5 and 7 remain, and the gate stands until they are
-closed. Note that the defects do **not** all fail in the same direction:
-1, 2, 3, 5 and 7 under-quote, 4 and 6 over-quote, and 6 does so by three
-orders of magnitude.
+pass 8, items 6-8 from the D-19 round-2 pass, item 9 from the D-19
+round-6 behavioural sweep. **Four are CLOSED**; item 8 is now **DECIDED**
+at the far end of the bore and open only at the mouth (below); items 3,
+5, 7 and 9 remain, and the gate stands until they are closed. Note that
+the defects do **not** all fail in the same direction: 1, 2, 3, 5 and 7
+under-quote, 4 and 6 over-quote, and 6 does so by three orders of
+magnitude; 9 does both, on different parts.
 
 **The depth convention is DECIDED: A — depth is TOOL TRAVEL, to the
 deepest point the tool reaches.** Ervin, on the conservative ground that
@@ -629,6 +630,81 @@ item 8, and in ADR-0112 §B.2 where slice C's `L = h.depth_mm` reads it.
    rather than argued, and a **structural test fails on any new bounding
    box anywhere in the module**.
 
+   **Round 6 — the point classifier's own frame, and a BOUND instead of
+   a claim.** Round 5 swept "every `Bnd_Box`, every intersector
+   tolerance, every world-axis projection" and reported the class closed.
+   It was not, and the instance it missed was in neither bucket:
+   `_AxisMaterial._inside` built its probe point in **world coordinates**
+   and handed it to `BRepClass3d_SolidClassifier` with an absolute
+   tolerance, to resolve a step that is **intrinsic** — a
+   `_tangency_band`, 1.26e-03 mm on a Ø4 bore. A solid classifier's
+   usable precision is *relative* to the coordinates it is given, so the
+   step shrinks into the kernel's noise as the part moves out and
+   `is_exit` ends up comparing two answers that are both noise.
+
+   Measured on the material boundary the probe exists to find, **located
+   by bisection rather than assumed**: the world-frame classifier puts it
+   3.1e-08 mm off with the part 100 m out, 3.2e-05 mm at 1 km and
+   **3.9e-03 mm at 10 km — wider than the step itself**. What that costs:
+   `undercut_ball_seat_blind_bore_d8`, a committed fixture and the very
+   part D-19 rounds 1 and 2 were written for, reads **7.0999999978
+   THROUGH against a true 12.1 BLIND** 10 km out — 41 % of the depth gone
+   *and* the end condition lost, which is round 1's own defect restored
+   by nothing but an assembly-scale coordinate.
+
+   Fixed by asking the classifier in a frame **anchored on the bore** —
+   the solid translated so the middle of the bore's own parametric span
+   is the origin. The obvious frame, translating by `-origin`, does
+   almost nothing and that is worth writing down: `_canonical_origin`
+   puts `origin` at the foot of the perpendicular from the **world**
+   origin, which is a point on the axis *line* and not a point on the
+   *part*, so a part 17 km out along its own bore direction still gets
+   `t = 17 km` in that frame. Measured over the corpus, `-origin` moves
+   the first categorical flip by a factor of **1.04**; the bore anchor
+   moves it by **23x**. The same boundary that moved 3.9e-03 mm at 10 km
+   moves **2.3e-10 mm**, and stays linear in the distance out to 1e+11
+   mm, which is the floor of what a double can represent at those
+   coordinates rather than a property of this module. **All 62 committed
+   fixtures are bit-identical at 17 significant digits** — the fix
+   changes a *boolean*, and only where the boolean was wrong.
+
+   **THE SWEEP IS BEHAVIOURAL NOW, which is round 6's real finding.**
+   Rounds 4 and 5 each scoped their sweep by *mechanism* and each time
+   the next instance was a mechanism that was not in the bucket
+   (round 4 → round 5's UV box, round 5 → round 6's classifier). So the
+   criterion is stated over the **answers**: for every located-hole
+   verdict, over all 62 committed fixtures, under seven rotations crossed
+   with three translation directions in both orders, walk the coordinate
+   magnitude on a ladder and find the first categorical flip. The
+   predicate is **not monotone** in the magnitude — a part can answer
+   correctly at 8 km and wrongly at 6 km — so it is a ladder and not a
+   bisection.
+
+   The bound it measured, which is what this feature claims and all it
+   claims. It is a **ladder's** bound and is stated as one: rungs
+   `10 ** (1/6)` apart (1.468x), walked from 1e+04 mm to 1e+09 mm, with
+   everything below 1.5e+04 mm already covered by round 5's own sweep.
+   "Nothing moves below X" means "no rung below X moved anything", and
+   the true first flip could sit up to 1.468x lower.
+
+   | quantity | before round 6 | after |
+   |---|---|---|
+   | nothing DISCRETE (count / end condition / flat bottom) moves below | 6.81e+06 mm | **2.15e+07 mm** |
+   | no DEPTH moves by more than a micron below | 4.64e+06 mm | **1.00e+07 mm** |
+   | fixtures that flip anywhere on the ladder | 18 | **11** |
+
+   And over the full motion grid at 4 km, nothing discrete moves and the
+   worst depth moves 3.7e-04 mm; at 1 km, 1.8e-05 mm; at 100 m,
+   2.2e-07 mm. `test_d19r6_no_verdict_moves_below_the_measured_bound`
+   keeps the 1 km row standing on every commit; the ladder itself takes a
+   quarter of an hour and is recorded here rather than re-walked.
+
+   And what is claimed is that measured **bound**, not closure. See item
+   9, which is what the sweep found next — and which is the mechanism
+   behind **every** residual flip in the "after" column: all eleven
+   return to the upright answer when that frame is anchored on the bore,
+   checked one by one rather than inferred from the first few.
+
    Honest accounting of the cost: moving an intersection into another
    frame is arithmetic, so it cannot be bit-preserving. **Eight of the
    63 committed hole rows move, all in `depth_mm`, by at most 1.5e-13
@@ -716,9 +792,28 @@ item 8, and in ADR-0112 §B.2 where slice C's `L = h.depth_mm` reads it.
    **where its travel starts** — and the two are independent. The miner
    measures from the top of the bore's own **cylindrical wall**, so a
    countersink, a chamfer or a spherical dish at the mouth is *not* part
-   of the hole: `countersunk_blind_bore` is pinned at **11.0, not 14.0**,
-   `chamfered_mouth_bore` at **18.5, not 20.0**, and
-   `spherical_mouth_undercut_bore` at **9.0404, not 10.632**.
+   of the hole.
+
+   **The re-pin is SEVEN rows across six parts, not three** — measured
+   over the whole corpus in D-19 round 6, because the earlier wording
+   named only the three parts the defect was first found on and a ruling
+   costed against three would be costed wrong. Every committed fixture
+   carrying a coaxial relief at its mouth, with both readings:
+
+   | fixture | pinned (bore wall) | tool travel (part face) |
+   |---|---|---|
+   | `countersunk_blind_bore` | 11.0 | 14.0 |
+   | `countersunk_blind_bore_turned` | 11.0 | 14.0 |
+   | `countersunk_through_bore` | 17.0 | 20.0 |
+   | `countersunk_bore_120` | 18.2679491924 | 20.0 |
+   | `chamfered_mouth_bore` | 18.5 | 20.0 |
+   | `spherical_mouth_undercut_bore` | 9.0404171401 | 10.632 |
+   | `spherical_mouth_undercut_bore_with_a_boss` | 9.0404171401 | 10.632 |
+
+   Six distinct geometries: `countersunk_blind_bore` and its `_turned`
+   twin are one part exported two ways, and the two spherical-mouth rows
+   differ only by a boss on the far corner that never touches the bore.
+   The goldens under `aberp_cad_extract/tests/` move with them.
 
    This is flagged rather than folded in because **convention A's own
    rationale points the other way here.** At the far end, "never
@@ -729,10 +824,10 @@ item 8, and in ADR-0112 §B.2 where slice C's `L = h.depth_mm` reads it.
    the current pinning therefore **under-quotes by the full depth of the
    relief** — the direction A was chosen to avoid, and the direction this
    module treats as the worse one because it never appears in a reasoning
-   log. Reading A as settling the mouth too would mean re-pinning those
-   three committed fixtures and their goldens, which is the corpus-wide
-   pass this entry has always said it needs, and which contradicts "no
-   re-pin". So it is left open and stated with its numbers, for a
+   log. Reading A as settling the mouth too would mean re-pinning the
+   seven committed rows tabled above and their goldens, which is the
+   corpus-wide pass this entry has always said it needs, and which
+   contradicts "no re-pin". So it is left open and stated with its numbers, for a
    one-line ruling rather than a guess.
 
    **Gate.** Slice C may price off `depth_mm` at the bore's far end. It
@@ -753,6 +848,74 @@ item 8, and in ADR-0112 §B.2 where slice C's `L = h.depth_mm` reads it.
    **semantic** the corpus and the oracle disagreed about, which is why
    round 4 recorded it here instead of fixing it. That is the
    disagreement convention A now settles, in the corpus's favour.
+
+9. **The INTERSECTION frame is anchored off the part.** Found by D-19
+   round 6's behavioural sweep, and it is the same root cause as the
+   classifier instance round 6 closed rather than a new kind of thing.
+   `_cap_axis_intersections` runs `GeomAPI_IntCS` in
+   `gp_Ax3(origin, direction)` — "the bore's frame" — and
+   `_canonical_origin` puts `origin` at the **foot of the perpendicular
+   from the WORLD origin**, which is a point on the axis *line* and not a
+   point on the *part*. Removing the perpendicular offset is all that
+   frame does, so a translation **along the bore's own axis** leaves the
+   surface at world magnitude inside it, and `GeomAPI_IntCS` starts
+   losing roots.
+
+   Round 5 knew about that motion — "the one motion that makes `t` large
+   without making the part large" — and tested it at **15 m**, where
+   nothing moves. The ladder walks it to 1e+09 mm and it does.
+
+   Measured, on committed fixtures, and it fails in **both** directions:
+
+   | fixture | true | reads | at |
+   |---|---|---|---|
+   | `far_opening_through_bore` | 12.0 THROUGH | **17.33 BLIND** | 2.15e+08 mm |
+   | `far_opening_through_bore_turned` | 12.0 THROUGH | **17.33 BLIND** | 2.15e+08 mm |
+   | `far_opening_through_bore_with_a_leg` | 12.0 THROUGH | **17.33 BLIND** | 2.15e+08 mm |
+   | `angled_far_opening_through_bore` | 12.64 THROUGH | **17.98 BLIND** | 2.15e+08 mm |
+   | `domed_floor_pocket_proud` | 7.0 BLIND | **13.1 THROUGH** | 2.15e+08 mm |
+   | `bore_beside_a_conical_boss` | 25.0 THROUGH | **30.0 BLIND** (+20 %) | 1.47e+08 mm |
+   | `bore_beside_a_taller_conical_boss` | 28.75 THROUGH | **35.0 BLIND** (+21.7 %) | 2.15e+08 mm |
+   | `undercut_ball_seat_blind_bore_d8` | 12.1 BLIND | **7.1 THROUGH** (−41 %) | 2.15e+07 mm |
+   | `undercut_ball_seat_blind_bore` | 14.1 BLIND | **6.9 THROUGH** (−51 %) | 3.16e+07 mm |
+   | `undercut_ball_seat_at_the_confusion_edge` | 16.0 BLIND | **8.0 THROUGH** | 2.15e+08 mm |
+
+   The mechanism, stated as the numbers it turns on:
+   `far_opening_through_bore`'s breakout sphere gives the axis two roots
+   at 1e+08 mm — t = −1.31 and t = 11.97, the near one inside the bore's
+   own hollow — and **one** root at 2.15e+08 mm. With only one root the
+   void bound discards nothing, so `_root_for_end`'s material arm never
+   runs, `_AxisMaterial` is never built, and the surviving root caps the
+   bore in mid-air. Every rule D-19 rounds 1, 2, 3 and 6 added to that
+   arm is simply not reached.
+
+   **The fix is one line and it is not free.** Anchor that `gp_Ax3` on
+   the bore — the same anchor round 6 gave the classifier, the middle of
+   the bore's own parametric span — and every row above returns to its
+   exact nominal, out to 4.6e+08 mm. But moving an intersection into a
+   different frame is arithmetic: **eight of the 62 committed fixtures
+   move in their last bits** (`bore_beside_a_conical_boss`,
+   `bore_beside_a_taller_conical_boss`, `bore_through_nurbs_dome`,
+   `cross_drilled_shaft`, `domed_floor_pocket`,
+   `domed_floor_pocket_with_a_rib`, `undercut_ball_seat_blind_bore`,
+   `undercut_ball_seat_blind_bore_d8`), two of them **towards** their
+   nominal — 14.100000000000001 → 14.1 and 12.100000000000001 → 12.1,
+   which is the signature round 5 recorded for a better-conditioned
+   frame. That is a corpus re-pin and therefore **Ervin's call**, exactly
+   like the mouth datum under item 8, and it is why round 6 measured and
+   filed this instead of folding it in: round 6's bar was bit-identity.
+
+   Pinned as a measurement rather than as prose by
+   `test_d19r6_the_intersection_frame_is_the_next_instance_and_is_measured`,
+   which asserts the broken answers, asserts that the anchored frame
+   gives the exact nominal, and asserts the count of moved fixtures — so
+   the item cannot rot, and closing it is a small diff plus a golden
+   re-pin.
+
+   **Priority.** Below items 3, 5 and 7 for a shop, since 21.5 km is not
+   a coordinate a part arrives at; above them for anyone importing from a
+   plant-coordinate assembly, since the failure is silent and, on the
+   undercut-seat family, an **under-quote**.
 
 **Blocked on.** Nothing external. This is purely our own work in one file.
 The adversarial-8 repros lived in the branch's `scratchpad/` and were not
