@@ -139,6 +139,62 @@ So the rule is restated per class:
 The anti-oracle property is untouched: nothing in the mimic reads the
 target, and the class is chosen entirely from the shape of the request.
 
+#### What is actually guaranteed (round 3 — narrowed)
+
+Round 2 stated this as "byte for byte" with no stated edge. That was
+broader than the code could hold, and broader than it needs to be. The
+claim as it now stands:
+
+> **No hang, no socket desynchronisation, and byte-identical bytes on
+> the enumerated common request classes.**
+
+Taken one clause at a time:
+
+- **No hang.** Every parser path answers within a bounded time, and the
+  bound is set by the *request*, not by the peer's willingness to keep
+  typing. A request line is decided at its newline; body framing is
+  decided from the head; the head and body budgets are totals armed
+  once, not per-read timers a dripping client can renew forever.
+- **No socket desynchronisation.** Bodies are drained or the connection
+  closes. A chunk's terminator is *verified* rather than assumed, so
+  the parser and the sender cannot silently disagree about where a
+  chunk ended.
+- **Byte-identical on the enumerated classes.** Thirty-six raw request
+  forms, listed in `tests/nginx_differential.rs`, diffed against a live
+  nginx. That list is the claim; nothing outside it is claimed.
+
+**Named residual: status class on pathological input.** For malformed
+requests outside those classes, nginx reaches for status codes this
+relay does not implement — `501 Not Implemented` for an unknown
+transfer-coding, `413 Request Entity Too Large` for an over-long
+`Content-Length`, and a *distinct, longer* `400` body ("Request Header
+Or Cookie Too Large") for an oversized header block. All three are
+answered here with the ordinary `400`.
+
+This is accepted rather than fixed, and the reasoning is worth stating
+because it is the difference between an honest disguise and a
+bottomless one:
+
+1. **The de-anonymising signal was the hang, and the hang is gone.** A
+   host that goes silent for sixty seconds where every other server on
+   the internet answers in a millisecond has identified itself, whatever
+   status code it eventually fails to send. A host that answers `400`
+   where nginx answers `501` has produced a difference an attacker must
+   already suspect *this specific host* to look for.
+2. **Real nginx deployments vary here themselves.** `413` depends on
+   `client_max_body_size` and the oversized-header `400` on
+   `large_client_header_buffers` — both per-site configuration. There is
+   no single "what nginx does" to match.
+3. **Byte-parity across nginx's full status table is unbounded work.**
+   Each code added is another body, another `Content-Length`, another
+   capture to keep true against a version nobody controls, in a parser
+   whose maintenance cost this ADR already names as its honest price.
+
+The residual is asserted rather than merely written down:
+`RESIDUAL_CASES` in `tests/nginx_differential.rs` sends each of these to
+both servers and requires that **both answer, and both answer
+promptly** — the status may differ, the response time may not.
+
 **We own the connection below the web framework.** This is the part that
 made the decision real rather than aspirational. Running the front on
 `axum`/`hyper` meant hyper answered anything that failed to parse — its own
@@ -189,6 +245,22 @@ are 404; an impossible method byte is answered **immediately** rather than
 waiting for a terminator, because a TLS `ClientHello` never sends one and a
 server that sat silent there would be distinguishable by its silence; and a
 socket that opens and closes is answered with **nothing at all**.
+
+**Silence is also a captured behaviour, in exactly one place.** Measured
+against nginx 1.31.4: a `client_header_timeout` on a *partial but
+well-formed* HTTP/1.1 head is answered with **silence**, not with the
+`408` the RFC would suggest. Volunteering a `408` there would be as
+distinguishing as a hang, in the other direction. The rule that
+separates the two is which side is waiting for whom: a request that is
+**complete** is answered immediately, and a request that is genuinely
+still arriving is waited for and then dropped without a word.
+
+**A body nginx cannot drain is not a protocol error to it.** Also
+measured: a bogus chunk size, a chunk whose terminator is not CRLF, or a
+body that never finishes arriving gets nginx's *ordinary parked page*
+with `Connection: close` — 289 bytes rather than the keep-alive form's
+294 — not a `400`. Round 2 answered `400` there, which was a
+fingerprint. It now matches.
 
 **No HSTS, no CSP on parked responses.** Round 1 stamped HSTS "uniformly, on
 every answer including the 404". That was exactly backwards: a parked nginx
@@ -244,7 +316,7 @@ the relay being honest.**
 
 **§4.3a — Require `attestation: "direct"` and verify Apple's anonymous
 attestation chain.** Against the **pinned Apple WebAuthn Root CA**, vendored
-at `crates/aberp-portal-agent/assets/` with its provenance and SHA-256 in a
+at `crates/aberp-portal-agent/roots/` with its provenance and SHA-256 in a
 README beside it, and re-asserted by a test so a substituted anchor fails
 the build. Verified, in order: format is `apple` with an `x5c`; every
 certificate is inside its validity window *including the anchor*; each is
@@ -334,14 +406,58 @@ accepted because the platform is already Apple-only.
 ## Adversarial review
 
 **"You built an HTTP parser. That is where the next vulnerability is."**
-Fair, and the reason the surface is deliberately small: no HTTP/2, no
-upgrades, no `100-continue`, no trailers, no compression. Everything is
-bounded before it is read — request line 8 KiB, header block 32 KiB, body 64
-KiB on the front and 8 MiB on the agent leg, chunked decoding bounded by the
-same constant. Twenty-four request classes are diffed against a live nginx.
-The alternative was not "no parser" — it was hyper's parser answering
-protocol probes with hyper's fingerprint, which is a certainty rather than a
-risk.
+Fair — and round 3 proved it, which is the honest way to report this.
+Adversarial review found **three separate ~60-second hang primitives** in
+that parser, each obtainable for the price of one short line, each of which
+de-anonymised the host by going silent where nginx answers instantly, and
+each of which returned *before* the canary was fed, so the trap never saw the
+probe that found it:
+
+1. a real HTTP/0.9 request (`GET /nope\r\n`) — `read_head` waited for a
+   blank line that HTTP/0.9 has no reason to send. The differential test's
+   own 0.9 case sent `\r\n\r\n` and so walked straight past it;
+2. `Transfer-Encoding: xchunked` — matched with `contains("chunked")`, which
+   routed a `Content-Length` body into the chunked decoder, where it blocked
+   on a chunk size that was really the body's first bytes;
+3. a chunked body whose trailer section never terminates — an unbounded loop
+   with no exit but the peer's good manners.
+
+All three are dead, and the fix for the first turned out to cover a whole
+family: a request line is now decided **at its newline**, so an unterminated
+`NOT A VALID REQUEST LINE`, `GET /no pe HTTP/1.1` or `GET /nope HTTP/9.9` is
+answered in microseconds rather than waited out in silence. The surface stays
+deliberately small — no HTTP/2, no upgrades, no `100-continue`, no
+compression, trailers bounded and refused — and everything is bounded before
+it is read: request line 8 KiB, header block 32 KiB, trailers 4 KiB, body 64
+KiB on the front and 8 MiB on the agent leg. The head and body budgets are
+**totals armed once**, not per-read timers, because a per-read timer is not a
+bound: one byte every 59 seconds renews it forever.
+
+**Thirty-six** request forms are now diffed against a live nginx, up from
+twenty-four, and the differential test no longer passes by not running (see
+below). The alternative was never "no parser" — it was hyper's parser
+answering protocol probes with hyper's fingerprint, which is a certainty
+rather than a risk. But the round-3 finding is the fair reading of this
+objection, and it is recorded here rather than in a changelog nobody opens.
+
+**"A test that skips is a test that lies."** The differential guard used to
+`return` with an `eprintln!` when nginx was absent, which `cargo test`
+reports as **`ok`**. It therefore read as passing on every machine without
+nginx — including CI, where it has never run — for the entire life of the
+branch, while three hang primitives sat behind it. It is now `#[ignore]`d, so
+`cargo test` prints `ignored` with the reason rather than a green tick, and a
+missing nginx is a hard failure when it is run. Running it in CI needs an
+`nginx-light` install step and is carried as a named follow-on in D-20.
+
+**"An unbounded `tokio::spawn` per accept is a relay that holds
+something."** It was, and it is bounded now: `MAX_CONNECTIONS` per listener,
+with the permit taken **before** `accept()` so surplus connections wait in
+the kernel's listen backlog rather than being accepted and dropped — which is
+what nginx does when `worker_connections` is exhausted, and the only version
+that does not hand a prober an "accepted, then closed without a byte"
+signature. The TLS handshake is bounded too: none of the parser's timeouts
+have started while it is in progress, so a peer that opens a socket and sends
+nothing would otherwise hold a slot inside a future that never completes.
 
 **"The disguise is security by obscurity."** It is, and it is not the
 security. The knock is a 256-bit token compared in constant time; the

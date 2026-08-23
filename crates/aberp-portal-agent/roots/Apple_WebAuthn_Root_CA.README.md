@@ -24,6 +24,18 @@ It is also not fetched at *build* time, which would make a green build
 depend on Apple's web server being reachable and would put an
 unreviewed certificate into a binary.
 
+## Why it lives in `roots/` and not `assets/`
+
+Because `.gitignore` has a blanket `*.pem` secret guard, and the only
+exception is `!crates/*/roots/*.pem`. This file spent one round in
+`crates/aberp-portal-agent/assets/`, where that exception did not reach
+it — so it was never committed, and the branch did **not** build from a
+clean checkout: `attestation.rs` includes it at compile time. The
+directory name is load-bearing. Vendored public trust anchors go in
+`crates/<crate>/roots/`, which is also where ADR-0020's NAV anchor
+lives. `tests/vendored_anchor_is_committed.rs` now asserts the file is
+tracked, so the next one cannot be swallowed silently.
+
 ## Verifying this copy
 
 ```sh

@@ -168,13 +168,31 @@ async fn main() -> Result<()> {
 }
 
 /// Accept forever, terminate TLS, hand each connection to `http1`.
+///
+/// # The permit is taken before `accept`
+///
+/// Both loops here used to be `loop { accept().await; tokio::spawn(…) }`
+/// with no bound of any kind — an unbounded task, buffer and file
+/// descriptor allocator handed to anyone able to open a socket, on a
+/// box whose entire claim is that it holds nothing. The bound is a
+/// [`http1::ConnectionLimit`], and it is acquired **before** the accept
+/// rather than after, which is the part that matters twice over:
+///
+/// - surplus connections wait in the kernel's listen backlog instead of
+///   being accepted and immediately dropped, which is what nginx does
+///   when `worker_connections` is exhausted;
+/// - a prober therefore cannot tell a loaded relay from a loaded nginx.
+///   "Accepted, then closed without a byte" is a signature; "not
+///   accepted yet" is what every busy server on the internet looks like.
 async fn serve_tls<H: http1::Handler>(
     listener: TcpListener,
     tls: Arc<rustls::ServerConfig>,
     handler: Arc<H>,
 ) {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    let limit = http1::ConnectionLimit::default();
     loop {
+        let permit = limit.acquire().await;
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
@@ -185,22 +203,33 @@ async fn serve_tls<H: http1::Handler>(
         let acceptor = acceptor.clone();
         let handler = Arc::clone(&handler);
         tokio::spawn(async move {
+            // Held for exactly as long as the connection lives.
+            let _permit = permit;
             // Metadata-only logging, Ervin's §9.5 decision: peer address
             // and timestamps, no paths, no tokens, no bodies.
-            match acceptor.accept(tcp).await {
-                Ok(stream) => http1::serve(stream, Some(peer), handler).await,
+            //
+            // The handshake is bounded because none of `http1`'s
+            // timeouts have started yet: a peer that opens a socket and
+            // sends nothing would otherwise hold this slot forever,
+            // inside a future that never completes.
+            match tokio::time::timeout(http1::HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+                Ok(Ok(stream)) => http1::serve(stream, Some(peer), handler).await,
                 // A failed handshake — including an unpinned client
                 // certificate on Leg B — is answered with silence.
                 // Nothing was served, and nothing is said about why.
-                Err(e) => tracing::debug!(%peer, error = %e, "handshake refused"),
+                Ok(Err(e)) => tracing::debug!(%peer, error = %e, "handshake refused"),
+                Err(_) => tracing::debug!(%peer, "handshake timed out"),
             }
         });
     }
 }
 
-/// The loopback-only plaintext front.
+/// The loopback-only plaintext front. Bounded identically — see
+/// [`serve_tls`] on why the permit is taken before the accept.
 async fn serve_plain<H: http1::Handler>(listener: TcpListener, handler: Arc<H>) {
+    let limit = http1::ConnectionLimit::default();
     loop {
+        let permit = limit.acquire().await;
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
@@ -209,7 +238,10 @@ async fn serve_plain<H: http1::Handler>(listener: TcpListener, handler: Arc<H>) 
             }
         };
         let handler = Arc::clone(&handler);
-        tokio::spawn(async move { http1::serve(tcp, Some(peer), handler).await });
+        tokio::spawn(async move {
+            let _permit = permit;
+            http1::serve(tcp, Some(peer), handler).await;
+        });
     }
 }
 

@@ -1357,8 +1357,36 @@ The end-to-end path is exercised in one process on loopback —
 `crates/aberp-portal-agent/tests/e2e_portal.rs` and `e2e_canary.rs` — with
 the real front, the real relay, the real pinned Leg-B handshake, the real
 poll transport and the real relying party. The disguise is diffed against a
-**live nginx** across 24 request classes by
+**live nginx** across 36 request classes by
 `crates/aberp-portal-relay/tests/nginx_differential.rs`.
+
+**What the disguise claims, exactly.** Round 3 narrowed it, because the
+round-2 wording was broader than the code could hold: **no hang, no socket
+desynchronisation, byte-identical on the enumerated common request
+classes**. The **named residual** is status *class* on pathological
+malformed input — nginx answers `501` to an unknown transfer-coding, `413`
+to an over-long `Content-Length`, and a distinct longer `400` to an
+oversized header block, and this relay answers the ordinary `400` to all
+three. Accepted deliberately: the de-anonymising signal is the hang and the
+hang is gone, real nginx deployments vary on those three themselves (they
+are per-site configuration), and byte-parity across nginx's full status
+table is unbounded work. `RESIDUAL_CASES` in the differential test asserts
+what does hold — both servers answer, and both answer promptly. Full
+reasoning in ADR-0115 §2.
+
+**Follow-on, named rather than assumed: the differential test does not run
+in CI.** It needs a live nginx, CI has none, and until round 3 it *silently
+passed* when nginx was absent — reporting `ok` for a check that never ran,
+on every machine without nginx, for the whole life of the branch. Three
+sixty-second hang primitives shipped behind that green tick. It is now
+`#[ignore]`d (so `cargo test` prints `ignored` with the reason rather than a
+tick) and hard-fails when run without nginx. Making it *gate* a merge needs
+an `nginx-light` install step in `.github/workflows/ci.yml`; that step is
+**not** added here, because the goldens were captured on nginx 1.31.4 and
+the runner ships a different version, so it must be validated against the
+runner's nginx before it can be allowed to block a protected branch. Until
+then the transcribed goldens in `tests/fixtures/nginx-goldens.txt` are the
+CI-side guard, and this test is a local pre-merge step run by hand.
 
 **Missing for Live.** Not code — deployment, and three things only the
 operator can supply:

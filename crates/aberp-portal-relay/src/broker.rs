@@ -254,14 +254,34 @@ impl Broker {
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
+
+        // The waiter is registered BEFORE the request becomes visible
+        // to a poll, and the order is load-bearing.
+        //
+        // Registering it after left a window: a poll running between
+        // the `push_back` and the `insert` takes the request, the Mac
+        // answers it, and `deliver` looks the id up in `pending` — which
+        // does not contain it yet. The delivery is dropped as
+        // unclaimed, the front task then waits out the full
+        // `DISPATCH_TIMEOUT` for an answer that already came and went,
+        // and the browser gets a 60-second pause and then the parked
+        // 404. Rare, silent, and indistinguishable from "the Mac is
+        // down" — which is exactly the kind of thing that gets
+        // diagnosed as flakiness for a year.
+        //
+        // Inserting first cannot have the mirror-image bug: an id in
+        // `pending` that never reaches `parked` is simply never
+        // delivered to, and the `Overloaded` path below removes it.
+        lock(&self.pending).insert(id, tx);
         {
             let mut q = lock(&self.parked);
             if q.len() >= MAX_PARKED {
+                drop(q);
+                lock(&self.pending).remove(&id);
                 return Err(DispatchError::Overloaded);
             }
             q.push_back(Parked { id, req });
         }
-        lock(&self.pending).insert(id, tx);
         self.work_ready.notify_waiters();
 
         match tokio::time::timeout(DISPATCH_TIMEOUT, rx).await {
@@ -685,6 +705,85 @@ mod tests {
             })
             .collect();
         assert_eq!(seqs.first(), Some(&2), "the oldest was the one dropped");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delivery_racing_the_park_is_not_dropped() {
+        // The window the ordering fix closes: a poll that collects the
+        // request between it being queued and its waiter being
+        // registered. Reproduced deterministically by driving the poll
+        // and the delivery from the moment the request appears in the
+        // queue — with the old order, `deliver` finds no waiter, the
+        // ack is `accepted: false`, and `park` sits out its full
+        // DISPATCH_TIMEOUT.
+        // Needs real threads: with the queue write and the waiter
+        // registration adjacent and no `.await` between them, a
+        // single-threaded runtime can never interleave, and a test on
+        // one would pass against the bug. So the collector runs on its
+        // own worker, spinning exactly as a poll arriving at the wrong
+        // microsecond does, and the whole thing is repeated enough
+        // times to hit a window measured in nanoseconds.
+        const ROUNDS: usize = 60;
+        /// Parked concurrently per round, so the collector thread has
+        /// many chances per round to land inside the window rather than
+        /// one.
+        const CONCURRENT: usize = 48;
+
+        let b = std::sync::Arc::new(Broker::new());
+        b.poll(&poll_req("t", "e1", 0, 0)).await.expect("lease");
+
+        let taker = std::sync::Arc::clone(&b);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopper = std::sync::Arc::clone(&stop);
+        let collector = std::thread::spawn(move || {
+            let mut unclaimed = 0usize;
+            while !stopper.load(Ordering::Relaxed) {
+                // `take_work` drains the whole queue, so every item it
+                // returns must be answered — dropping the tail would
+                // strand requests and blame the broker for it.
+                for w in taker.take_work() {
+                    let Work::Request { id, .. } = w else {
+                        continue;
+                    };
+                    let ack = taker.deliver(Delivery {
+                        id,
+                        epoch: "e1".into(),
+                        res: PortalResponse::json(200, r#"{"ok":true}"#),
+                    });
+                    if !ack.accepted {
+                        unclaimed += 1;
+                    }
+                }
+                std::hint::spin_loop();
+            }
+            unclaimed
+        });
+
+        for round in 0..ROUNDS {
+            let mut fleet = Vec::with_capacity(CONCURRENT);
+            for _ in 0..CONCURRENT {
+                let bb = std::sync::Arc::clone(&b);
+                fleet.push(tokio::spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(10), bb.park(request("/api/status")))
+                        .await
+                }));
+            }
+            for (i, task) in fleet.into_iter().enumerate() {
+                let parked = task.await.expect("park task").unwrap_or_else(|_| {
+                    panic!(
+                        "round {round} request {i}: park waited out its dispatch timeout \
+                         for an answer that had already been delivered"
+                    )
+                });
+                assert!(parked.is_ok(), "round {round} request {i}: {parked:?}");
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(
+            collector.join().expect("collector"),
+            0,
+            "the Mac was told an answer was unclaimed — its waiter was not yet registered"
+        );
     }
 
     #[tokio::test]

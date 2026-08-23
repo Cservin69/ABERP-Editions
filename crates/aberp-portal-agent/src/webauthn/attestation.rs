@@ -34,7 +34,7 @@
 //! 1. the statement format is `apple` and carries an `x5c` chain;
 //! 2. every certificate in the chain is inside its validity window;
 //! 3. each certificate is signed by the next, and the last is signed by
-//!    the **pinned Apple WebAuthn Root CA** (`assets/`, vendored — see
+//!    the **pinned Apple WebAuthn Root CA** (`roots/`, vendored — see
 //!    that directory's README for why it is not fetched);
 //! 4. the leaf carries Apple's nonce extension
 //!    (`1.2.840.113635.100.8.2`) and the nonce inside it equals
@@ -67,8 +67,8 @@ use x509_cert::Certificate;
 use super::cose::Es256PublicKey;
 
 /// The pinned trust anchor. Vendored, not fetched — see
-/// `assets/Apple_WebAuthn_Root_CA.README.md`.
-const APPLE_ROOT_PEM: &str = include_str!("../../assets/Apple_WebAuthn_Root_CA.pem");
+/// `roots/Apple_WebAuthn_Root_CA.README.md`.
+const APPLE_ROOT_PEM: &str = include_str!("../../roots/Apple_WebAuthn_Root_CA.pem");
 
 /// SHA-256 of the anchor's DER, asserted in the tests so a substituted
 /// file fails the build rather than silently widening trust.
