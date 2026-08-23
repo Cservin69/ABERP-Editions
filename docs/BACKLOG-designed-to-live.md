@@ -771,6 +771,26 @@ and no drawing revision anywhere in the repo** (`work_orders` carries
 `product_id` and nothing else — `crates/aberp-work-orders/migrations/V001__work_orders.sql:29-43`);
 and no link from a measurement to a serialised unit or to a dispatch.
 
+> ### ✅ PHASE 1 IMPLEMENTED — 2026-08-23
+>
+> Ervin accepted the spec and **every flagged decision at its conservative
+> default**, confirming two explicitly: **AS9102 Rev C** is the default FAIR
+> form, and an **incomplete report BLOCKS a Defense shipment**. The Phase-1
+> list below is built, on branch `docs/adr-qc-inspection-report`, with two
+> deliberate deltas from what the design pass predicted:
+>
+> - **AS9102 Forms 1/2/3 shipped in Phase 1, not Phase 1b** — Ervin named
+>   Rev C as the default form, so it is built rather than scheduled.
+> - **`submit_measured_characteristics` + the three `RawProbeEvent` fields
+>   were NOT built.** That batch entry point is the Phase-2 seam and it has
+>   no Phase-1 caller: reports read the `qc_inspections` rows the live
+>   manual route already writes. Building an interface with no caller would
+>   have been speculative, so it moves to the Phase-2 session — where its
+>   first real consumer is.
+>
+> Phase 1c (auto-attach to the shipment e-mail) remains OFF and unbuilt, as
+> decided. See the ADR's §"Open questions" for every resolved decision.
+
 **Missing for Live — Phase 1 (ships on its own; works on today's manual
 actuals, before any probe transport exists).**
 

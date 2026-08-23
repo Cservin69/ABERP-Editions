@@ -63,6 +63,15 @@ fn seed_plan(conn: &Connection, feature: &str, nominal: f64, upper: f64, lower: 
             units: "mm".into(),
             optional_probe_cycle_id: None,
             enabled: true,
+            // ADR-0199 §D3(a) — this fixture predates the identity columns
+            // and deliberately leaves them unset, which pins that the
+            // ADR-0092 write path is unchanged by their addition.
+            characteristic_number: None,
+            characteristic_designator: None,
+            characteristic_type: None,
+            inspection_method: None,
+            sheet_zone: None,
+            is_required: None,
         },
     )
     .unwrap()
@@ -273,6 +282,12 @@ fn plan_unique_product_feature_enforced() {
             units: "mm".into(),
             optional_probe_cycle_id: None,
             enabled: true,
+            characteristic_number: None,
+            characteristic_designator: None,
+            characteristic_type: None,
+            inspection_method: None,
+            sheet_zone: None,
+            is_required: None,
         },
     );
     assert!(matches!(dup, Err(QcError::Validation(_))));
@@ -323,6 +338,12 @@ fn plan_rejects_degenerate_tolerance_band() {
             units: "mm".into(),
             optional_probe_cycle_id: None,
             enabled: true,
+            characteristic_number: None,
+            characteristic_designator: None,
+            characteristic_type: None,
+            inspection_method: None,
+            sheet_zone: None,
+            is_required: None,
         },
     );
     assert!(matches!(bad, Err(QcError::Validation(_))));

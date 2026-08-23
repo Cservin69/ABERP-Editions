@@ -292,6 +292,70 @@ impl InvoiceSpawner for NoopInvoiceSpawner {
     }
 }
 
+// ── Shipment document binder trait (ADR-0199 §D6) ──────────────────
+
+/// Binds the shipment's compliance documents — today, the ADR-0199 QC
+/// inspection report(s) — to the dispatch, INSIDE [`mark_shipped`]'s
+/// transaction.
+///
+/// ## Why injected rather than called directly
+///
+/// `aberp-dispatch` must not gain a dependency on `aberp-qa`: the
+/// dispatch crate reads only the `work_orders` column contract and owns
+/// no quality concepts. This is the same dependency-inversion escape
+/// hatch [`InvoiceSpawner`] and [`ExportControlContext`] already use —
+/// the app layer, which can see both crates, supplies the implementation.
+///
+/// ## Why inside the transaction
+///
+/// A shipment that commits while its report binding rolls back is a
+/// shipped part with no attached QC record — precisely the audit finding
+/// this feature exists to prevent. Conversely a bound report on a
+/// rolled-back shipment is a document claiming a delivery that never
+/// happened. One transaction, both or neither.
+///
+/// Implementations MUST run inside the supplied transaction. An error
+/// propagates out of `mark_shipped` as
+/// [`DispatchError::ShipmentDocumentBindFailed`] and rolls the ENTIRE
+/// transaction back — no state flip, no stock movement, no invoice draft,
+/// no audit rows. The precedent is exact:
+/// [`DispatchError::InvoiceSpawnFailed`] already refuses to let a failed
+/// spawn commit a shipment.
+pub trait ShipmentDocumentBinder {
+    /// Bind the issued QC report(s) for this WO to `dsp_id`, in `tx`.
+    /// Returns the bound report ids for the caller's response body.
+    fn bind_qc_reports(
+        &self,
+        tx: &Transaction<'_>,
+        tenant: &str,
+        wo_id: &str,
+        dsp_id: &str,
+    ) -> anyhow::Result<Vec<String>>;
+}
+
+/// No-op [`ShipmentDocumentBinder`] — binds nothing, returns no ids.
+///
+/// This is the correct production binder for a build where QC reporting
+/// is not a capability (ADR-0199 §D9 — Portable), and the binder the
+/// dispatch crate's own round-trip tests use so they need not know
+/// anything about QC. It is NOT a stub awaiting implementation: "this
+/// shipment carries no QC documents" is a real, valid outcome for the
+/// commercial path.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopShipmentDocumentBinder;
+
+impl ShipmentDocumentBinder for NoopShipmentDocumentBinder {
+    fn bind_qc_reports(
+        &self,
+        _tx: &Transaction<'_>,
+        _tenant: &str,
+        _wo_id: &str,
+        _dsp_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
 // ── Create dispatch ───────────────────────────────────────────────
 
 /// Inputs to [`create_dispatch`].
@@ -475,6 +539,11 @@ pub struct MarkShippedOutcome {
     /// in the same tx. Surfaced for the route layer's success body so
     /// the SPA can render "Stock decremented by N — view ledger entry".
     pub stock_movement_id: String,
+    /// ADR-0199 §D6 — the QC report ids the injected
+    /// [`ShipmentDocumentBinder`] bound to this dispatch, in the SAME
+    /// transaction as the state flip. Empty for the commercial path and
+    /// for the [`NoopShipmentDocumentBinder`].
+    pub bound_qc_report_ids: Vec<String>,
 }
 
 /// Flip a Drafted dispatch to Shipped per ADR-0064 §4 + §5 +
@@ -534,6 +603,7 @@ pub fn mark_shipped(
     inputs: MarkShippedInputs,
     spawner: &dyn InvoiceSpawner,
     export_ctx: &ExportControlContext<'_>,
+    document_binder: &dyn ShipmentDocumentBinder,
 ) -> Result<MarkShippedOutcome, DispatchError> {
     if inputs.idempotency_key.trim().is_empty() {
         return Err(DispatchError::Validation(
@@ -556,6 +626,11 @@ pub fn mark_shipped(
             dispatch: prior,
             spawned_invoice_id: None,
             stock_movement_id: "<idempotent-noop>".to_string(),
+            // The already-Shipped row's reports were bound on the FIRST
+            // ship. Re-binding here would append a second
+            // `qcr.report_attached_to_shipment` for the same pair on an
+            // operator's second click against a stale UI.
+            bound_qc_report_ids: Vec::new(),
         });
     }
 
@@ -795,6 +870,21 @@ pub fn mark_shipped(
     )
     .map_err(|e| DispatchError::Storage(anyhow!("audit append ExportShipmentLogged: {e}")))?;
 
+    // 8c. ADR-0199 §D6 — bind the issued QC report(s) to this dispatch, in
+    //      the SAME tx as the state flip they describe. A failure rolls the
+    //      whole shipment back: a part that leaves with no attached QC
+    //      record is exactly the audit finding the feature exists to
+    //      prevent, and a report bound to a shipment that never committed
+    //      is a document claiming a delivery that did not happen.
+    //
+    //      The binder is injected so this crate keeps no quality dependency
+    //      (see `ShipmentDocumentBinder`). It runs AFTER the export appends
+    //      so the report is only ever bound to a shipment that was actually
+    //      authorised to leave.
+    let bound_qc_report_ids = document_binder
+        .bind_qc_reports(tx, ctx.tenant, &prior.wo_id, dsp_id)
+        .map_err(|e| DispatchError::ShipmentDocumentBindFailed(format!("{e:#}")))?;
+
     // 9. Read back the live row.
     let live = read_dispatch_in_tx(tx, ctx.tenant, dsp_id)?.ok_or_else(|| {
         DispatchError::Storage(anyhow!("mark_shipped: live row vanished after write"))
@@ -804,6 +894,7 @@ pub fn mark_shipped(
         dispatch: live,
         spawned_invoice_id,
         stock_movement_id: movement.movement_id,
+        bound_qc_report_ids,
     })
 }
 

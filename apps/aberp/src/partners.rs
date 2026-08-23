@@ -737,6 +737,27 @@ UPDATE partners
     WHERE customer_type IS NULL;
 ";
 
+/// ADR-0199 §D2 — additive `qc_report_template` column: which QC-report
+/// layout family this customer receives.
+///
+/// Nullable with NO SQL `DEFAULT` and NO backfill UPDATE, unlike the
+/// `customer_type` migration above — deliberately. NULL here is not a
+/// missing value to be repaired: it is the honest "this customer has not
+/// been given a specific template", and the resolution order in
+/// [`resolve_qc_report_template`] reads it as "fall back to the house
+/// default". Writing `'aben_standard'` into every row instead would be
+/// indistinguishable from an operator having *chosen* the house template,
+/// and would re-apply on every replay (the DuckDB DEFAULT-on-replay trap
+/// the PR-97 migration documents).
+///
+/// The closed-vocab invariant lives in
+/// `aberp_qa::QcReportTemplate::from_storage_str` at the app layer, not
+/// in a SQL CHECK ([[no-sql-specific]]).
+const PARTNERS_ADR0199_QC_TEMPLATE_MIGRATION_SQL: &str = "
+ALTER TABLE partners
+    ADD COLUMN IF NOT EXISTS qc_report_template VARCHAR;
+";
+
 /// Idempotent `CREATE TABLE IF NOT EXISTS` + PR-97 additive migration
 /// for the partners table. Callers (HTTP route handlers, tests) hit
 /// this on every entry so a fresh tenant DB picks up the schema lazily
@@ -765,7 +786,91 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     // boot (ALTER is IF NOT EXISTS); fills pre-S428 rows with 'unset'.
     conn.execute_batch(PARTNERS_S428_CUSTOMER_TYPE_MIGRATION_SQL)
         .context("apply S428 partners customer_type migration")?;
+    // ADR-0199 — additive `qc_report_template` column. Idempotent; leaves
+    // pre-ADR-0199 rows NULL (= "no customer-specific template").
+    conn.execute_batch(PARTNERS_ADR0199_QC_TEMPLATE_MIGRATION_SQL)
+        .context("apply ADR-0199 partners qc_report_template migration")?;
     Ok(())
+}
+
+// ── ADR-0199 §D2 — per-customer QC report template ─────────────────
+
+/// Read the customer-specific QC report template, if one was set.
+///
+/// Returns `Ok(None)` both when the partner is unknown and when the
+/// column is NULL — the caller falls back either way, and distinguishing
+/// them here would give the caller a decision it has no better answer to.
+///
+/// An UNKNOWN stored token is an error, not a silent fallback: a token
+/// that no longer parses means someone hand-edited the row or a variant
+/// was removed, and quietly rendering the house template instead would
+/// hand the customer a document in a layout their contract does not name.
+pub fn get_qc_report_template(
+    conn: &Connection,
+    tenant: &str,
+    partner_id: &str,
+) -> Result<Option<aberp_qa::QcReportTemplate>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT qc_report_template FROM partners
+             WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL LIMIT 1;",
+        )
+        .context("prepare partners.qc_report_template read")?;
+    let mut rows = stmt
+        .query_map(params![tenant, partner_id], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .context("query partners.qc_report_template")?;
+    let Some(row) = rows.next() else {
+        return Ok(None); // unknown partner — caller falls back
+    };
+    let Some(token) = row.context("read partners.qc_report_template row")? else {
+        return Ok(None);
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    aberp_qa::QcReportTemplate::from_storage_str(token)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("{e}: partner {partner_id} carries {token:?}"))
+}
+
+/// Set (or clear, with `None`) a customer's QC report template.
+pub fn set_qc_report_template(
+    conn: &Connection,
+    tenant: &str,
+    partner_id: &str,
+    template: Option<aberp_qa::QcReportTemplate>,
+) -> Result<()> {
+    let affected = conn
+        .execute(
+            "UPDATE partners SET qc_report_template = ?
+             WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL;",
+            params![template.map(|t| t.as_str()), tenant, partner_id],
+        )
+        .context("update partners.qc_report_template")?;
+    if affected == 0 {
+        anyhow::bail!("partner {partner_id} not found");
+    }
+    Ok(())
+}
+
+/// ADR-0199 §D2 — resolve the template for a customer, most specific
+/// first: the partner's own column → the house default.
+///
+/// The ADR names a third tier between them (a tenant-wide default, in the
+/// `quoting_parameters` singleton style). It is NOT built: no tenant has
+/// asked for one, and an unused settings row is a place for configuration
+/// to drift out of sync with what customers actually receive. Adding it
+/// later is a one-line change HERE and nowhere else, which is the point of
+/// funnelling every caller through this function.
+pub fn resolve_qc_report_template(
+    conn: &Connection,
+    tenant: &str,
+    partner_id: &str,
+) -> Result<aberp_qa::QcReportTemplate> {
+    Ok(get_qc_report_template(conn, tenant, partner_id)?.unwrap_or_default())
 }
 
 /// Empty-string-to-None coercion so the SPA can emit `""` for unset

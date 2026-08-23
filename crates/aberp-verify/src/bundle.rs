@@ -63,6 +63,16 @@ pub struct Archive {
     /// Keyed by the `nav/...` portion so a lookup keyed on
     /// "nav/00012_invoice_submission_attempt.xml" matches.
     pub nav_files: HashMap<String, Vec<u8>>,
+    /// ADR-0199 §D7 — map of archive-relative path to verbatim bytes for
+    /// every `bundle/qc/<qcr_id>.pdf` entry, keyed by the `qc/...`
+    /// portion.
+    ///
+    /// These are RE-RENDERED QC reports exported for an auditor, not a
+    /// stored master copy: ABERP never persists PDF bytes, it persists the
+    /// SHA-256 in the hash chain. The verifier's job is therefore to check
+    /// that a PDF an auditor was handed hashes to what the chain says was
+    /// issued (see `verify::check_qc_report_pins`).
+    pub qc_files: HashMap<String, Vec<u8>>,
     /// Every entry path observed inside the archive, in iteration
     /// order. The verifier asserts every path starts with
     /// `"bundle/"` (ADR-0029 §3 — single top-level directory).
@@ -85,6 +95,7 @@ pub fn read_archive(path: &Path) -> Result<Archive> {
     let mut manifest_bytes: Option<Vec<u8>> = None;
     let mut chain_jsonl_bytes: Option<Vec<u8>> = None;
     let mut nav_files: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut qc_files: HashMap<String, Vec<u8>> = HashMap::new();
     let mut all_paths: Vec<String> = Vec::new();
 
     for entry_result in ar.entries().context("iterate tar entries")? {
@@ -114,15 +125,25 @@ pub fn read_archive(path: &Path) -> Result<Archive> {
             _ if rel.starts_with("nav/") => {
                 nav_files.insert(rel.to_string(), buf);
             }
+            // ADR-0199 §D7 — the `qc/` directory. Widened DELIBERATELY: the
+            // allow-list below is the reason a new artifact class cannot be
+            // smuggled into a bundle, so admitting one is an explicit,
+            // reviewed edit here and a matching check in `verify`. Older
+            // verifiers reject newer bundles — a loud, versioned break, not
+            // silent forward-compat (ADR-0199 §Consequences).
+            _ if rel.starts_with("qc/") => {
+                qc_files.insert(rel.to_string(), buf);
+            }
             _ => {
                 // Unknown archive entry; the §3 check 1 invariant
-                // says "manifest + chain.jsonl + nav/*". An entry
-                // outside this set is a structural divergence that
-                // should fail loud per CLAUDE.md rule 12 (no silent
-                // skip of mystery files).
+                // says "manifest + chain.jsonl + nav/* + qc/*". An
+                // entry outside this set is a structural divergence
+                // that should fail loud per CLAUDE.md rule 12 (no
+                // silent skip of mystery files).
                 bail!(
-                    "tar entry {path:?} is neither manifest.json, chain.jsonl, \
-                     nor under nav/ — bundle shape divergence per ADR-0029 §3"
+                    "tar entry {path:?} is none of manifest.json, chain.jsonl, \
+                     nav/, or qc/ — bundle shape divergence per ADR-0029 §3 \
+                     (as widened by ADR-0199 §D7)"
                 );
             }
         }
@@ -137,6 +158,7 @@ pub fn read_archive(path: &Path) -> Result<Archive> {
         manifest_bytes,
         chain_jsonl_bytes,
         nav_files,
+        qc_files,
         all_paths,
     })
 }
@@ -322,6 +344,16 @@ pub fn nav_archive_path(seq: u64, kind: EventKind) -> String {
     format!("nav/{:05}_{}.xml", seq, kind.as_str().replace('.', "_"))
 }
 
+/// ADR-0199 §D7 — the archive path a re-rendered QC report occupies.
+///
+/// Keyed by `qcr_id` rather than by sequence, unlike
+/// [`nav_archive_path`]: a QC report is re-rendered on demand and can
+/// appear in more than one bundle, whereas a NAV exchange happens once at
+/// a known chain position. The id is the stable identity in both places.
+pub fn qc_archive_path(qcr_id: &str) -> String {
+    format!("qc/{qcr_id}.pdf")
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Tests — manifest + chain.jsonl parse round-trips + entry
 // reconstruction + nav-path composition.
@@ -350,6 +382,100 @@ mod tests {
             "mirror_file_status": "verified-agreement",
         });
         serde_json::to_vec(&m).unwrap()
+    }
+
+    /// Pack `entries` into a `bundle/`-rooted `.tar.zst` at a temp path.
+    fn pack(entries: &[(&str, &[u8])]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join("aberp-verify-bundle-shape")
+            .join(ulid::Ulid::new().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bundle.tar.zst");
+        let file = std::fs::File::create(&path).unwrap();
+        let enc = zstd::stream::write::Encoder::new(file, 3)
+            .unwrap()
+            .auto_finish();
+        let mut builder = tar::Builder::new(enc);
+        for (rel, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("{BUNDLE_DIR}/{rel}"), *bytes)
+                .unwrap();
+        }
+        builder.into_inner().unwrap();
+        path
+    }
+
+    /// ADR-0199 §D7 — **the widened allow-list, from both sides.**
+    ///
+    /// The `qc/` directory is admitted, and it is the ONLY thing that was
+    /// admitted: an entry outside `{manifest.json, chain.jsonl, nav/, qc/}`
+    /// still fails LOUD. That refusal is the reason a new artifact class
+    /// cannot be smuggled into an evidence bundle, so widening it had to be
+    /// a deliberate edit — and this test is what stops the next widening
+    /// from being an accident.
+    #[test]
+    fn the_archive_allow_list_admits_qc_and_still_refuses_everything_else() {
+        let manifest = fixture_manifest_json();
+        let chain = b"".to_vec();
+
+        // qc/ is accepted and keyed by its `qc/...` portion.
+        let ok = pack(&[
+            ("manifest.json", manifest.as_slice()),
+            ("chain.jsonl", chain.as_slice()),
+            ("nav/00001_invoice_submission_attempt.xml", b"<x/>"),
+            ("qc/qcr_A.pdf", b"%PDF-1.5"),
+        ]);
+        let archive = read_archive(&ok).expect("a bundle with qc/ must read");
+        assert_eq!(archive.qc_files.len(), 1);
+        assert_eq!(
+            archive.qc_files.get("qc/qcr_A.pdf").map(|b| b.as_slice()),
+            Some(b"%PDF-1.5".as_slice())
+        );
+        assert_eq!(archive.nav_files.len(), 1);
+
+        // Anything else still bails.
+        let smuggled = pack(&[
+            ("manifest.json", manifest.as_slice()),
+            ("chain.jsonl", chain.as_slice()),
+            ("secrets/creds.json", b"{}"),
+        ]);
+        let err =
+            read_archive(&smuggled).expect_err("an entry outside the allow-list must fail loud");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bundle shape divergence"),
+            "the refusal must name the divergence: {msg}"
+        );
+        assert!(
+            msg.contains("qc/"),
+            "the diagnostic must list the CURRENT allow-list, including qc/: {msg}"
+        );
+    }
+
+    /// A `qc/`-lookalike that is not actually under the directory
+    /// (`qcx/…`) is refused — the prefix check is on `qc/`, not `qc`.
+    #[test]
+    fn a_qc_lookalike_prefix_is_not_admitted() {
+        let manifest = fixture_manifest_json();
+        let path = pack(&[
+            ("manifest.json", manifest.as_slice()),
+            ("chain.jsonl", b""),
+            ("qcx/sneaky.pdf", b"%PDF"),
+        ]);
+        assert!(read_archive(&path).is_err());
+    }
+
+    /// The archive-path helper is keyed by report id, not by sequence.
+    #[test]
+    fn qc_archive_path_is_keyed_by_report_id() {
+        assert_eq!(
+            qc_archive_path("qcr_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            "qc/qcr_01ARZ3NDEKTSV4RRFFQ69G5FAV.pdf"
+        );
     }
 
     #[test]

@@ -148,6 +148,17 @@ mod tests {
             enabled: true,
             created_at: "2026-06-17T00:00:00Z".into(),
             archived_at: None,
+            // ADR-0199 §D3(a) — identity metadata. The verdict does not
+            // read any of it (the tier is a pure function of nominal +
+            // band + calibration), so the fixture leaves it unset; that
+            // absence is itself the pin that ADR-0199 did not change
+            // ADR-0092's verdict.
+            characteristic_number: None,
+            characteristic_designator: None,
+            characteristic_type: None,
+            inspection_method: None,
+            sheet_zone: None,
+            is_required: None,
         }
     }
 

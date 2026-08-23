@@ -19,8 +19,8 @@ use aberp_audit_ledger::{compute_entry_hash, genesis_hash, Entry, EventKind, Ten
 use serde::Deserialize;
 
 use crate::bundle::{
-    nav_archive_path, parse_chain_jsonl, parse_manifest, reconstruct_entry, Archive,
-    ChainJsonlLine, Manifest, SUPPORTED_MANIFEST_VERSION,
+    nav_archive_path, parse_chain_jsonl, parse_manifest, qc_archive_path, reconstruct_entry,
+    Archive, ChainJsonlLine, Manifest, SUPPORTED_MANIFEST_VERSION,
 };
 use crate::report::{CheckOutcome, Report};
 
@@ -93,8 +93,10 @@ pub fn run_checks(bundle_path: &Path, archive: &Archive) -> Report {
     report.push(CheckOutcome::ok(
         "archive shape",
         format!(
-            "bundle/ root + manifest.json + chain.jsonl + {} nav/*.xml files",
-            archive.nav_files.len()
+            "bundle/ root + manifest.json + chain.jsonl + {} nav/*.xml files \
+             + {} qc/*.pdf files",
+            archive.nav_files.len(),
+            archive.qc_files.len()
         ),
     ));
 
@@ -197,6 +199,9 @@ pub fn run_checks(bundle_path: &Path, archive: &Archive) -> Report {
 
     // §3 check 13/14 — per-NAV-bearing-entry XML pin + cross-totals.
     check_nav_xml_pins(&entries, &archive.nav_files, &mut report);
+
+    // ADR-0199 §D7 — per-QC-report SHA pin + cross-totals.
+    check_qc_report_pins(&entries, &archive.qc_files, &mut report);
 
     // Echo the deferred-gate posture so an inspector reading the
     // report sees them named alongside every other check (per
@@ -635,6 +640,133 @@ fn check_nav_xml_pins(
                  of unreferenced bytes is the wrong affordance)",
                 orphans.len(),
                 orphans
+            ),
+        ));
+    }
+}
+
+/// ADR-0199 §D7 — the QC-report retention check.
+///
+/// ## What is being proved
+///
+/// ABERP stores **no PDF bytes**. It stores the SHA-256 of the bytes it
+/// emitted at issuance, inside a hash-chained `qcr.report_issued` entry.
+/// A `qc/<qcr_id>.pdf` file in a bundle is therefore a re-render handed to
+/// an auditor, and the only question worth asking about it is: *do these
+/// bytes hash to what the chain says was issued?*
+///
+/// Two independent things have to hold for a `PASS` here, and the check
+/// fails loud on either:
+///
+/// 1. The bundled PDF's SHA-256 equals the `rendered_sha256` on the
+///    matching `qcr.report_issued` entry. A tampered PDF fails.
+/// 2. The chain entry itself is intact — but that is check 8's job, and
+///    it runs on every entry including this one. Editing
+///    `rendered_sha256` to match a doctored PDF therefore breaks the
+///    entry hash, which breaks the chain link. **Both halves have to be
+///    forged at once, and the second is what the hash chain exists to
+///    make infeasible.**
+///
+/// A `qc/` file with no matching issued entry is a FAIL, not a NOTE: an
+/// unexplained document in an evidence bundle is exactly the thing an
+/// evidence bundle must not contain.
+///
+/// An issued report with no bundled PDF is NOT a failure — bundles are
+/// per-invoice slices and most of them carry no QC document at all.
+fn check_qc_report_pins(
+    entries: &[Entry],
+    qc_files: &HashMap<String, Vec<u8>>,
+    report: &mut Report,
+) {
+    use sha2::{Digest, Sha256};
+
+    /// The subset of the `qcr.report_issued` payload this check reads.
+    #[derive(Deserialize)]
+    struct IssuedPayload {
+        qcr_id: String,
+        rendered_sha256: Option<String>,
+        report_number: Option<String>,
+    }
+
+    let mut checked = 0usize;
+    let mut expected_paths: BTreeSet<String> = BTreeSet::new();
+
+    for entry in entries {
+        if entry.kind != EventKind::QcReportIssued {
+            continue;
+        }
+        let issued: IssuedPayload = match serde_json::from_slice(&entry.payload) {
+            Ok(p) => p,
+            Err(e) => {
+                report.push(CheckOutcome::fail(
+                    "qc report payload",
+                    format!(
+                        "seq {} qcr.report_issued payload does not decode: {e}",
+                        entry.seq.as_u64()
+                    ),
+                ));
+                continue;
+            }
+        };
+        let path = qc_archive_path(&issued.qcr_id);
+        expected_paths.insert(path.clone());
+        let Some(bytes) = qc_files.get(&path) else {
+            // Not bundled — legitimate and common. Nothing to check.
+            continue;
+        };
+        let Some(pinned) = issued.rendered_sha256.as_deref() else {
+            report.push(CheckOutcome::fail(
+                "qc report SHA pin",
+                format!(
+                    "bundle carries {path} but its qcr.report_issued entry (seq {}) \
+                     records no rendered_sha256 — the document cannot be verified",
+                    entry.seq.as_u64()
+                ),
+            ));
+            continue;
+        };
+        let actual = hex::encode(Sha256::digest(bytes));
+        if actual.eq_ignore_ascii_case(pinned.trim()) {
+            checked += 1;
+        } else {
+            report.push(CheckOutcome::fail(
+                "qc report SHA pin",
+                format!(
+                    "{path} hashes to {actual} but the chain pins {pinned} \
+                     (report {} , seq {}) — the bundled document is NOT the one that \
+                     was issued",
+                    issued.report_number.as_deref().unwrap_or("(unnumbered)"),
+                    entry.seq.as_u64()
+                ),
+            ));
+        }
+    }
+
+    // Cross-total: every qc/ file must be explained by an issued entry.
+    let archive_paths: BTreeSet<&String> = qc_files.keys().collect();
+    let orphans: Vec<&&String> = archive_paths
+        .iter()
+        .filter(|p| !expected_paths.contains(**p))
+        .collect();
+    if orphans.is_empty() {
+        report.push(CheckOutcome::ok(
+            "qc report SHA pin",
+            format!(
+                "{checked}/{} bundled QC report(s) hash to their chain-pinned SHA-256",
+                qc_files.len()
+            ),
+        ));
+    } else {
+        report.push(CheckOutcome::fail(
+            "qc report cross-totals",
+            format!(
+                "{} qc/ file(s) have no matching qcr.report_issued entry: {}",
+                orphans.len(),
+                orphans
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         ));
     }
@@ -1197,7 +1329,20 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
         // of the house; neither ever carries NAV invoice bytes (a quote is
         // not an invoice — nothing on this path has been near the §169 XML).
         | EventKind::QuotePricingCycleOutcome
-        | EventKind::QuotePricingJobRetried => (None, ""),
+        | EventKind::QuotePricingJobRetried
+        // ADR-0199 — the `qcr.*` QC-report family. NO NAV bytes: a QC
+        // report is a customer- and auditor-facing manufacturing record
+        // that never reaches a NAV endpoint. `qcr.report_issued` carries a
+        // `rendered_sha256`, NOT document bytes — the bytes are never
+        // stored anywhere (ADR-0199 §D7), so there is nothing here for the
+        // NAV extractor to find. Decided deliberately per ADR-0081, not
+        // folded into the no-NAV group by default.
+        | EventKind::QcReportDrafted
+        | EventKind::QcReportIssued
+        | EventKind::QcReportAttachedToShipment
+        | EventKind::QcReportRendered
+        | EventKind::QcReportShipmentBlocked
+        | EventKind::QcReportVoided => (None, ""),
     };
 
     Ok(NavExtraction {
@@ -1219,7 +1364,7 @@ fn extract_nav_xml(entry: &Entry) -> anyhow::Result<NavExtraction> {
 /// the per-family `*_no_nav_bytes` runtime tests below.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 189,
+        EventKind::ALL_KINDS_COUNT == 195,
         "EventKind count changed — re-review aberp-verify::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1603,6 +1748,186 @@ mod tests {
         ledger.entries().expect("entries").remove(0)
     }
 
+    // ═════════════════════════════════════════════════════════════════
+    // ADR-0199 §D7 / §AC10 — the QC-report retention pin.
+    //
+    // The safety-critical claim: **tampering the rendered bytes or the
+    // pinned SHA fails LOUD.** These tests drive `check_qc_report_pins`
+    // directly against a real in-memory Ledger, so the assertion is about
+    // the check's behaviour, not about a mocked report object.
+    // ═════════════════════════════════════════════════════════════════
+
+    /// Append one `qcr.report_issued` entry pinning `sha` for `qcr_id`.
+    fn issued_entry(qcr_id: &str, sha: &str) -> Vec<Entry> {
+        let (mut ledger, actor) = fixture_ledger();
+        let payload = serde_json::json!({
+            "qcr_id": qcr_id,
+            "report_number": "QCR-2026-0001",
+            "rendered_sha256": sha,
+            "renderer_version": "aberp-qc-pdf@0.0.0",
+            "disposition": "accept",
+        });
+        ledger
+            .append(
+                EventKind::QcReportIssued,
+                serde_json::to_vec(&payload).unwrap(),
+                actor,
+                None,
+            )
+            .unwrap();
+        ledger.entries().unwrap()
+    }
+
+    fn sha_of(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// The rendered report text — `compose_for_test` is the public read
+    /// surface on `Report`, so the assertions below read the same lines an
+    /// inspector reads rather than reaching into private state.
+    fn rendered(report: &Report) -> String {
+        report.compose_for_test()
+    }
+
+    /// An untampered bundled report PASSES. The positive control: without
+    /// it, a check that always failed would satisfy every negative test
+    /// below.
+    #[test]
+    fn an_intact_qc_report_passes_the_sha_pin() {
+        let bytes = b"%PDF-1.5 genuine report bytes".to_vec();
+        let entries = issued_entry("qcr_A", &sha_of(&bytes));
+        let mut files = HashMap::new();
+        files.insert("qc/qcr_A.pdf".to_string(), bytes);
+
+        let mut report = Report::new(std::path::PathBuf::from("t.tar.zst"));
+        check_qc_report_pins(&entries, &files, &mut report);
+        assert!(
+            report.is_ok(),
+            "an intact bundled QC report must verify:\n{}",
+            rendered(&report)
+        );
+    }
+
+    /// **Tampering the PDF fails loud.** One byte flipped in the bundled
+    /// document and the check FAILs, naming both hashes.
+    #[test]
+    fn a_tampered_qc_report_pdf_fails_loud() {
+        let genuine = b"%PDF-1.5 genuine report bytes".to_vec();
+        let entries = issued_entry("qcr_A", &sha_of(&genuine));
+
+        let mut tampered = genuine.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01; // ONE bit.
+        let mut files = HashMap::new();
+        files.insert("qc/qcr_A.pdf".to_string(), tampered);
+
+        let mut report = Report::new(std::path::PathBuf::from("t.tar.zst"));
+        check_qc_report_pins(&entries, &files, &mut report);
+        assert!(!report.is_ok(), "a tampered QC report must NOT verify");
+        let text = rendered(&report);
+        assert!(
+            text.contains("NOT the one that"),
+            "the failure must say the document is not the issued one:\n{text}"
+        );
+    }
+
+    /// **Tampering the PINNED SHA fails loud too** — the other direction.
+    ///
+    /// Editing `rendered_sha256` in the chain to match a doctored PDF is
+    /// the obvious attack on the check above. It fails here because the
+    /// forged pin no longer matches the genuine bytes; and forging BOTH
+    /// halves at once additionally breaks the entry hash, which
+    /// `check_per_entry_hash` catches. Two independent failures, one
+    /// forgery.
+    #[test]
+    fn a_tampered_sha_pin_fails_loud_and_breaks_the_entry_hash() {
+        let genuine = b"%PDF-1.5 genuine report bytes".to_vec();
+        let mut entries = issued_entry("qcr_A", &sha_of(&genuine));
+
+        // Rewrite the pin in the payload, leaving the bytes alone.
+        let forged = serde_json::json!({
+            "qcr_id": "qcr_A",
+            "report_number": "QCR-2026-0001",
+            "rendered_sha256": "0".repeat(64),
+            "renderer_version": "aberp-qc-pdf@0.0.0",
+            "disposition": "accept",
+        });
+        entries[0].payload = serde_json::to_vec(&forged).unwrap();
+
+        let mut files = HashMap::new();
+        files.insert("qc/qcr_A.pdf".to_string(), genuine);
+
+        let mut report = Report::new(std::path::PathBuf::from("t.tar.zst"));
+        check_qc_report_pins(&entries, &files, &mut report);
+        assert!(!report.is_ok(), "a forged SHA pin must NOT verify");
+
+        // …and the payload edit also broke the entry hash, so the chain
+        // itself refuses it independently of the QC check.
+        let mut hash_report = Report::new(std::path::PathBuf::from("t.tar.zst"));
+        check_per_entry_hash(&entries, &mut hash_report);
+        assert!(
+            !hash_report.is_ok(),
+            "editing a payload must break the entry hash — that is what makes \
+             forging both halves at once infeasible"
+        );
+    }
+
+    /// An issued report with NO `rendered_sha256` cannot be verified, so a
+    /// bundle carrying its PDF fails rather than silently accepting an
+    /// unverifiable document.
+    #[test]
+    fn a_bundled_report_with_no_pinned_sha_fails() {
+        let (mut ledger, actor) = fixture_ledger();
+        ledger
+            .append(
+                EventKind::QcReportIssued,
+                serde_json::to_vec(&serde_json::json!({ "qcr_id": "qcr_A" })).unwrap(),
+                actor,
+                None,
+            )
+            .unwrap();
+        let entries = ledger.entries().unwrap();
+        let mut files = HashMap::new();
+        files.insert("qc/qcr_A.pdf".to_string(), b"anything".to_vec());
+
+        let mut report = Report::new(std::path::PathBuf::from("t.tar.zst"));
+        check_qc_report_pins(&entries, &files, &mut report);
+        assert!(!report.is_ok());
+    }
+
+    /// A `qc/` file with no matching issued entry is a FAIL — an
+    /// unexplained document in an evidence bundle is exactly what an
+    /// evidence bundle must not contain.
+    #[test]
+    fn an_orphan_qc_file_fails_the_cross_totals() {
+        let bytes = b"%PDF-1.5".to_vec();
+        let entries = issued_entry("qcr_A", &sha_of(&bytes));
+        let mut files = HashMap::new();
+        files.insert("qc/qcr_A.pdf".to_string(), bytes);
+        files.insert(
+            "qc/qcr_SMUGGLED.pdf".to_string(),
+            b"%PDF-1.5 other".to_vec(),
+        );
+
+        let mut report = Report::new(std::path::PathBuf::from("t.tar.zst"));
+        check_qc_report_pins(&entries, &files, &mut report);
+        assert!(
+            !report.is_ok(),
+            "an unexplained qc/ file must fail the bundle"
+        );
+    }
+
+    /// An issued report whose PDF is simply NOT bundled is fine — bundles
+    /// are per-invoice slices and most carry no QC document at all.
+    #[test]
+    fn an_issued_report_with_no_bundled_pdf_is_not_a_failure() {
+        let entries = issued_entry("qcr_A", &"ab".repeat(32));
+        let mut report = Report::new(std::path::PathBuf::from("t.tar.zst"));
+        check_qc_report_pins(&entries, &HashMap::new(), &mut report);
+        assert!(report.is_ok());
+    }
+
     /// Assert every kind in `family` extracts to no NAV bytes. Shared by
     /// the per-family pins below (S364 / ADR-0081 belt-and-braces — the
     /// exhaustive match already forces an arm at compile time; this pins
@@ -1711,6 +2036,22 @@ mod tests {
             EventKind::QcAutoNcrCreated,
             EventKind::QcProbeCalibrationStaleWarning,
             EventKind::QcProbeIngestionFailed,
+        ]);
+    }
+
+    // ADR-0199 — the six QC REPORT kinds (`qcr.*`) carry app-layer JSON, no
+    // NAV XML bytes. `qcr.report_issued` carries a `rendered_sha256`, not
+    // document bytes: the PDF is never stored anywhere (ADR-0199 §D7), so a
+    // QC report can never produce a `nav/` file.
+    #[test]
+    fn qc_report_no_nav_bytes() {
+        assert_family_no_nav(&[
+            EventKind::QcReportDrafted,
+            EventKind::QcReportIssued,
+            EventKind::QcReportAttachedToShipment,
+            EventKind::QcReportRendered,
+            EventKind::QcReportShipmentBlocked,
+            EventKind::QcReportVoided,
         ]);
     }
 

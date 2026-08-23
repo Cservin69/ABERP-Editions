@@ -12,8 +12,32 @@
 > file, the in-file references, the backlog anchor (`d-99`), and the
 > cross-links in both directions. `0199` is chosen far enough out of band that
 > it cannot be mistaken for a real allocation.
+>
+> ### Merge reconciliation — measured at implementation time (2026-08-23)
+>
+> The three sibling branches were diffed against `main` while implementing
+> this, so the merge cost is known rather than guessed:
+>
+> - **`docs/adr-auto-probe-inspection` is DOCS-ONLY.** It touches no `.rs`
+>   at all — only its own ADR and `docs/BACKLOG-designed-to-live.md`. The
+>   sole conflict with this branch is the backlog file and the D-number.
+> - **`fix/pricing-queue-head-of-line` adds TWO event kinds**
+>   (`quote.pricing_cycle_outcome`, `quote.pricing_job_retried`) and pins
+>   `ALL_KINDS_COUNT == 189`. This branch adds six and pins `193`. **Merged
+>   together the correct pin is 195**, in all three places that carry it:
+>   `event_kind.rs`'s `all_kinds_count_is_pinned`, the `const _` in
+>   `aberp-verify::verify.rs`, and the `const _` in
+>   `export_invoice_bundle.rs`. Do not trust either branch's number.
+> - **`serve.rs` does not actually collide.** The pricing-queue hunks are in
+>   the quote-pricing handler region (~line 23 900); this branch touches
+>   `build_router`'s tail, the shipment-gate block (~17 500) and a new
+>   handler block (~26 800). Different regions — but re-read the merged
+>   `build_router` anyway, since both branches add routes.
+> - The real three-way conflicts are `event_kind.rs`, `aberp-verify/verify.rs`,
+>   `export_invoice_bundle.rs` (each: variant list + exhaustive match + count
+>   pin) and `docs/BACKLOG-designed-to-live.md`.
 
-- **Status:** Proposed (design pass; **no engine, report, or schema code written in this session**). Conservative defaults chosen throughout; every one is flagged — see *Open questions / decisions flagged for Ervin*.
+- **Status:** **Accepted — Phase 1 implemented** (2026-08-23). Ervin accepted the specification and **every flagged decision at its conservative default**, and confirmed two of them explicitly: **AS9102 Rev C is the default FAIR form**, and **an incomplete report BLOCKS a Defense shipment** (Q3 = yes, block). See *Open questions / decisions flagged for Ervin* below — each entry now carries its RESOLVED verdict. The design pass that authored this file wrote no code; the Phase-1 implementation session that followed wrote the code described in §Phasing → Phase 1 and is recorded in §"Phase 1 — what actually landed".
 - **Date:** 2026-08-22
 - **Deciders:** Ervin — verbatim direction: *"every part is auto-probed no-touch on a DMG MORI NTX; the probe measured values must land in ABERP so that ABERP will print the QC reports attached to shipments, also part of the aerospace audit."*
 - **Base:** Editions `origin/main` @ `9e4a6ee`. Every file:line below was reproduced in this session at that SHA.
@@ -795,6 +819,110 @@ all**. That is the test of whether D3(b) drew the seam in the right place.
 
 ---
 
+## Phase 1 — what actually landed (2026-08-23)
+
+Implemented on branch `docs/adr-qc-inspection-report`, off `origin/main`
+`9e4a6ee`, in the same commit series as this ADR so the design travels with
+the code.
+
+| Piece | Where |
+|---|---|
+| `qc_reports` + `qc_report_lines` + `part_drawing_refs` + the six additive plan columns | `crates/aberp-qa/migrations/V003__qc_report.sql` (additive only; no CHECK / DEFAULT / UNIQUE) |
+| Closed vocabularies (`QcReportKind`, `QcReportTemplate`, `QcReportState`, `CharacteristicDesignator`, `CharacteristicType`, `InspectionMethod`, `Accountability`, `Disposition`) | `crates/aberp-qa/src/qc/vocab.rs` |
+| Drawing refs with revision history (`supersede_and_create`, one-current-per-product enforced in code) | `crates/aberp-qa/src/qc/drawings.rs` |
+| The frozen record + the **pure** accountability core (`build_report_lines` / `summarise` / `compute_disposition`) + freeze / issue / bind / render-audit / void | `crates/aberp-qa/src/qc/reports.rs` |
+| The pure renderer — `DimensionalInspection`, `CertificateOfConformance`, **AS9102 Rev C Forms 1/2/3** | `crates/aberp-qc-pdf/` (new crate) |
+| `ShipmentDocumentBinder` + `NoopShipmentDocumentBinder`, `mark_shipped`'s 7th parameter, `DispatchError::ShipmentDocumentBindFailed` | `crates/aberp-dispatch/src/repository.rs`, `error.rs` |
+| Orchestration: traceability resolution, issuance + SHA pin, `QcShipmentDocumentBinder` | `apps/aberp/src/qc_report.rs` (new) |
+| The third shipment gate (`resolve_qc_report_gate` + `enforce_qc_report_gate_for_shipment`) and eight routes | `apps/aberp/src/serve.rs` |
+| `qc_reporting_allowed_for(Edition)` + `assert_qc_reporting_allowed` | `apps/aberp/src/build_profile.rs` |
+| `partners.qc_report_template` + `resolve_qc_report_template` | `apps/aberp/src/partners.rs` |
+| Six `qcr.*` kinds, `ALL_KINDS_COUNT` 187 → 193, both NAV-leakage pins | `crates/audit-ledger/src/entry/event_kind.rs`, `aberp-verify/src/verify.rs`, `apps/aberp/src/export_invoice_bundle.rs` |
+| Bundle allow-list widened to `qc/` + the SHA re-hash check | `crates/aberp-verify/src/bundle.rs`, `verify.rs` |
+
+### Deltas from the design pass — stated, not silent
+
+1. **AS9102 Forms 1/2/3 shipped in Phase 1, not Phase 1b.** Ervin named Rev C
+   as the default form, so it is built rather than scheduled.
+2. **`submit_measured_characteristics` and the three `RawProbeEvent` fields
+   (§D3(b)) were NOT built.** They are the Phase-2 seam and have no Phase-1
+   caller: the report reads the `qc_inspections` rows the live manual route
+   already writes. Shipping an interface with no consumer would have been
+   speculative, so D3(b) moves to the Phase-2 session, where its first real
+   caller lives. **§D3(b)'s design stands unchanged** — this is a scheduling
+   change, not a redesign.
+3. **The `qc/` bundle directory is READ-side only.** `aberp-verify` accepts,
+   re-hashes and cross-totals `qc/` entries; nothing WRITES one yet.
+   `export_invoice_bundle` is invoice-scoped and would need an
+   invoice→dispatch→WO→report join to decide which reports belong in a
+   slice. That join is real scope and was not in this session's brief. The
+   verifier half is what makes the widening safe to land now; the writer is
+   an auditor-export feature that can follow.
+4. **The tenant-default template tier was not built.** §D2's resolution order
+   names `partner → tenant default → AbenStandard`; the implementation is
+   `partner → AbenStandard`, funnelled through one function
+   (`partners::resolve_qc_report_template`) so adding the middle tier is a
+   one-line change in exactly one place. No tenant asked for it, and an
+   unused settings row is a place for configuration to drift away from what
+   customers actually receive.
+5. **`mill_cert_id`, `machine_id` and `program_id` snapshot as `NULL` on the
+   manual path.** No mill-cert record is wired to a WO today, and the machine
+   and NC-program identities arrive on a probe event — which is Phase 2. They
+   print as blanks rather than guesses.
+6. **The issued SHA-256 is not printed on the page it hashes, and neither
+   is the dispatch id.** Both fall out of one constraint that the design
+   pass did not surface, and that implementation did:
+
+   > **Nothing that changes after issuance may appear in the hashed bytes.**
+
+   The gate requires a report to be ISSUED before the shipment may proceed,
+   so `qc_reports.dsp_id` is written by `mark_shipped` strictly *after* the
+   hash is taken. A first cut printed the dispatch in the identity block —
+   which would have made **every correctly shipped report report itself as
+   tampered** on the first download, i.e. turned the tamper signal into
+   noise on exactly the documents that matter. Four fields are affected
+   (`rendered_sha256`, `dsp_id`, `state`, `superseded_by_qcr_id`); all four
+   are normalised by ONE function, `qc_report::canonical_for_render`, which
+   both issuance and re-render go through so they provably agree. The
+   renderer carries a NOTE at the former site so a future edit does not
+   "restore the missing row".
+
+   Nothing is lost: the dispatch linkage is a chain event
+   (`qcr.report_attached_to_shipment`) and is on both HTTP surfaces; the
+   hash is in the chain, on the API response, and in the
+   `x-aberp-qc-sha-matches-issued` response header (which reports `draft`,
+   not `false`, when there is no pin to compare against).
+
+7. **`qty_reported` is the marked-unit count.** With no marked units the
+   report degrades to a single lot-level document and records `1`. The WO's
+   `qty_target` is not read: the report states what it accounted for, and
+   claiming a quantity it did not enumerate would be the same class of
+   overstatement the accountability rule exists to prevent.
+
+### Behaviours pinned by mutation testing
+
+Both safety-critical behaviours were verified by mutation rather than by
+coverage: each mutation below was applied to the working tree, the scoped
+test suite was confirmed RED, and the mutation reverted.
+
+- **(a) missing required characteristic ⇒ `incomplete` ⇒ shipment refused**
+  — 10/10 mutations killed, spanning the disposition rule, the line builder
+  (silent omission), `permits_shipment`, the tally, the NULL-`is_required`
+  reading, four gate arms, and the route's gate call.
+- **(b) tampering the frozen snapshot or the `rendered_sha256` ⇒ verify
+  fails loud** — 13/13 mutations killed, spanning the SHA comparison, the
+  unpinned-document arm, the orphan cross-total, both halves of the bundle
+  allow-list, renderer determinism, the blank-vs-zero cell, strict decoding
+  of frozen line and header vocabularies, the re-issue refusal, the hash
+  recipe, and the measured-band-vs-live-plan freeze.
+- **(c) the canonical hashed form** — 5/5 mutations killed, covering each
+  normalised field, over-normalisation in both directions, and the
+  operator-login trim. This set exists because writing it is what surfaced
+  the `dsp_id` bug in delta 6 above; the first two mutations initially
+  SURVIVED, which is what showed the guard was untested.
+
+---
+
 ## Acceptance criteria (for the Phase-1 implementation session)
 
 1. **End-to-end, manual actuals:** plan with 4 required characteristics →
@@ -842,6 +970,26 @@ all**. That is the test of whether D3(b) drew the seam in the right place.
 
 ## Open questions / decisions flagged for Ervin
 
+> ### ✅ ALL RESOLVED — 2026-08-23
+>
+> **Ervin accepted the specification and every flagged decision at its
+> conservative default**, confirming two explicitly:
+>
+> - **Q1 — AS9102 Rev C is the default FAIR form.** Rev C it is; Rev B is
+>   not built. A prime-specific or Nadcap form remains a future
+>   `QcReportTemplate` variant plus a render function, never a schema change.
+> - **Q3 — an incomplete report BLOCKS a Defense shipment: YES.** The gate
+>   is live as the third clone of the part-UID / open-NCR pattern. Once a
+>   Defense/Aerospace dispatch's WO has required characteristics, that
+>   dispatch cannot ship without an `issued`, `accept`-or-`accept_with_ncr`
+>   report bound to it.
+>
+> Q2, Q4–Q10 stand at their stated defaults; Q11 (the number) is still
+> open and is a merge-time chore, not a design decision. Each entry below
+> now carries its resolved verdict inline. **Resolution is recorded here,
+> not re-litigated:** any later change to one of these is a new decision
+> with its own ADR entry.
+
 Every one of these was decided conservatively so implementation is not
 blocked. Each is a default that can be overridden without redesign.
 
@@ -850,21 +998,33 @@ blocked. Each is a default that can be overridden without redesign.
    output and the FAIR as Phase 1b. Confirm Rev C vs Rev B, and name any
    prime-specific or Nadcap-mandated form now — each is a `QcReportTemplate`
    variant and a render function.
+
+    **✅ RESOLVED — Rev C, confirmed explicitly.** `As9102RevC` is the only FAIR variant built, and Forms 1/2/3 ship in Phase 1 rather than 1b. `AbenStandard` (house dimensional layout) and `CocOnly` are the other two `QcReportTemplate` tokens. No prime-specific or Nadcap form was named, so none is built.
+
 2. **⚠️ One report per shipment, or one per part?** Default: **one report per
    dispatch**, with a characteristic table per serialised unit inside it, plus
    one CoC. Some primes want one FAIR per part number and one CoC per
    shipment; a few want a per-serial certificate. Changes layout only, not the
    schema.
+
+    **✅ RESOLVED — default accepted.** One report per dispatch, characteristic rows per serialised unit inside it, plus one CoC. Per-serial certificates stay a layout change if a prime later asks.
+
 3. **⚠️ Should a missing/incomplete/rejected report BLOCK the shipment?**
    Default: **yes, block** — Defense/Aerospace customers only, mirroring the
    part-UID and open-NCR gates. This is a process commitment: once on, a
    Defense shipment cannot leave without an issued, complete report. The
    alternative (warn-only) is one predicate away.
+
+    **✅ RESOLVED — YES, block; confirmed explicitly.** Implemented as `resolve_qc_report_gate` / `enforce_qc_report_gate_for_shipment`, the third clone of the part-UID and open-NCR gates: pure resolver, 409, one `qcr.report_shipment_blocked` audit row. Defense/Aerospace partners only; the commercial path is untouched.
+
 4. **⚠️ Drawing number + revision — where do they come from?** Nothing in the
    repo carries them. Default: **operator-entered per product**, with revision
    history. Alternatives: extract from the STEP file header (unreliable —
    varies by CAD), or from the customer PO. This is the largest data-entry
    burden the feature adds.
+
+    **✅ RESOLVED — default accepted.** Operator-entered per product via `part_drawing_refs`, with revision history (`superseded_at`). No STEP-header or customer-PO extraction. The data-entry burden is accepted.
+
 5. **⚠️ Signature on the CoC.** Default Phase 1: **printed name + operator
    login + the `qcr.report_issued` chain reference**, no cryptographic
    signature. A real signing ceremony is
@@ -872,22 +1032,42 @@ blocked. Each is a default that can be overridden without redesign.
    e-signature) and **[D-06](../docs/BACKLOG-designed-to-live.md#d-06)**
    (NETLOCK qualified TSA). Confirm whether an unsigned CoC is acceptable to
    the customers in question — for some primes it is not.
+
+    **✅ RESOLVED — default accepted.** Phase 1 prints name + operator login + the `qcr.report_issued` chain reference. No cryptographic signature; D-15 / D-06 still own the real signing ceremony.
+
 6. **⚠️ Retention period.** Contract-specified in aerospace, commonly 7–40
    years. Nothing deletes a report today; confirm the obligation so it can be
    stated on the document and in the tenant policy.
+
+    **✅ RESOLVED for the mechanism; the contract term is still owed.** Nothing deletes a report — there is no delete path, only `voided` and `superseded_by_qcr_id`. The number of years to *print* on the document is a contract fact Ervin still has to supply, and no code depends on it.
+
 7. **⚠️ 100% inspection, or a sampling plan?** Default: **100%**, consistent
    with ADR-0113's "every part is auto-probed". No AQL / C=0 sampling model is
    designed. If any customer accepts sampling, that is a real feature
    (sampling plan, lot definition, AQL tables), not a knob.
+
+    **✅ RESOLVED — default accepted.** 100% inspection. No AQL / C=0 sampling model exists or is stubbed.
+
 8. **⚠️ Auto-attach to the shipment e-mail (Phase 1c)?** Default: **off** —
    generating a compliance document is one decision, mailing it to a customer
    automatically is another.
+
+    **✅ RESOLVED — default accepted: OFF.** Phase 1 ships no automatic mailing of a compliance document. Not built.
+
 9. **⚠️ Language.** Default: **English** for QC documents (aerospace audits and
    primes are English-speaking), unlike the invoice/quote which are HU-first.
    Bilingual HU/EN is a layout change if wanted.
+
+    **✅ RESOLVED — default accepted.** QC documents render in English only.
+
 10. **⚠️ Lot-level characteristics.** Default: a measurement with no
     `part_serial` renders once for the shipment, attributed to the lot. Confirm
     this is how material/process characteristics (hardness, coating thickness,
     heat-treat cert) should read.
+
+    **✅ RESOLVED — default accepted.** A line with no `part_serial` is lot-level: it renders once for the shipment and is never attributed to a serial.
+
 11. **The number.** `ADR-0199` / `D-99` are placeholders. See the banner at the
     top of this file.
+
+    **⏳ STILL OPEN — a merge-time chore, not a design decision.** `ADR-0199` / `D-99` remain placeholders; see the banner at the top of this file.

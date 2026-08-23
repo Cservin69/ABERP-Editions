@@ -80,6 +80,8 @@ pub mod quality;
 // S443 (ADR-0092) — QC dimensional inspection orchestrator (verdict +
 // auto-NCR; manual entry today, probe sources stubbed).
 pub mod qc_inspection;
+/// ADR-0199 — QC inspection report / CoC / AS9102 FAIR orchestration.
+pub mod qc_report;
 // S229 / PR-225 — Stage 3 manufacturing-adapter framework boot wiring.
 // Reads `ABERP_BARCODE_SCANNER_*` env vars and spawns the barcode
 // scanner adapter + per-adapter ledger-writer task. Default-off.

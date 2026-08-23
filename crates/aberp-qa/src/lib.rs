@@ -74,6 +74,17 @@ pub use qc::{
     RecordedInspection, RenishawCentralSource, Verdict,
 };
 
+// ADR-0199 — QC inspection reports + CoC (the REPORTING layer, flat).
+pub use qc::{
+    bind_reports_to_dispatch, build_report_lines, compute_disposition, current_drawing_ref,
+    freeze_report, get_drawing_ref, get_report, issue_report, list_drawing_refs, list_report_lines,
+    list_reports_for_dispatch, list_reports_for_wo, record_drawing_ref, record_render,
+    serial_range_of, summarise, void_report, Accountability, AccountabilityCounts,
+    CharacteristicDesignator, CharacteristicType, Disposition, DraftLine, FreezeReportInputs,
+    InspectionMethod, NewPartDrawingRef, PartDrawingRef, QcReport, QcReportKind, QcReportLine,
+    QcReportState, QcReportTemplate, ReportTraceability, ReportUnit,
+};
+
 /// Apply both QA (`V001`) and QC (`V002`) schemas. Idempotent. Extended
 /// in S443 to also create the QC tables so they exist wherever the QA
 /// queue does (one boot call, no new wiring at the call site).

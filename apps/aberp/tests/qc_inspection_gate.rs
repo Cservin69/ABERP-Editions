@@ -142,6 +142,15 @@ fn seed_plan(fx: &Fixture) -> String {
             units: "mm".into(),
             optional_probe_cycle_id: None,
             enabled: true,
+            // ADR-0199 §D3(a) — deliberately unset. This fixture predates
+            // the identity columns, and leaving them None pins that the
+            // ADR-0092 inspection path is unchanged by their addition.
+            characteristic_number: None,
+            characteristic_designator: None,
+            characteristic_type: None,
+            inspection_method: None,
+            sheet_zone: None,
+            is_required: None,
         },
     )
     .unwrap()

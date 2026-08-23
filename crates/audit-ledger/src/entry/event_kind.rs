@@ -3170,6 +3170,76 @@ pub enum EventKind {
     ///
     /// Payload (`serde_json::Value`): `reason`, `raw_excerpt`.
     QcProbeIngestionFailed,
+
+    // ── ADR-0199 — QC inspection reports + CoC. `qcr.*` family ──────
+    //
+    // A NEW PREFIX, not an extension of `qc.*`, for the reason ADR-0092
+    // gives when it created `qc.*`: keep each existing prefix consumer's
+    // glob narrow. A dashboard subscribed to `qc.*` measurements must not
+    // start receiving document lifecycle events.
+    //
+    // All six are NON-NAV. A QC report is a customer- and auditor-facing
+    // manufacturing record; it carries no invoice, no tax number, and
+    // never reaches a NAV endpoint (ADR-0081 re-review: decided
+    // deliberately, not folded in).
+    /// ADR-0199 §D8 — a QC report record was created (state `drafted`).
+    /// The lines are frozen at this point but the document has no
+    /// chain-pinned identity yet. `qcr.*` family. NON-NAV.
+    ///
+    /// Payload (`serde_json::Value`): `qcr_id`, `report_number`,
+    /// `report_kind`, `template`, `wo_id`, `product_id`, `partner_id`,
+    /// `disposition`, the five accountability counts + the
+    /// calibration-stale count.
+    QcReportDrafted,
+
+    /// ADR-0199 §D8 — **the load-bearing one.** The report was issued: the
+    /// renderer ran once, and the SHA-256 of the emitted bytes is pinned
+    /// here. The BYTES ARE NOT STORED anywhere — the report re-renders
+    /// deterministically from the frozen `qc_report_lines`, and this chain
+    /// entry proves the bytes anyone re-renders are the bytes that were
+    /// issued (ADR-0199 §D7). `qcr.*` family. NON-NAV.
+    ///
+    /// Payload (`serde_json::Value`): `qcr_id`, `report_number`,
+    /// `report_kind`, `template`, `wo_id`, `product_id`, `partner_id`,
+    /// `drawing_number`, `drawing_rev`, `serial_range`, `qty_reported`,
+    /// `heat_lot_reference`, `mill_cert_id`, `machine_id`, `program_id`,
+    /// `disposition`, the five accountability counts, `rendered_sha256`,
+    /// `renderer_version`, `issued_by`, `issued_at_utc`.
+    QcReportIssued,
+
+    /// ADR-0199 §D8 — the report was bound to a dispatch. Fired INSIDE
+    /// `mark_shipped`'s single transaction, so it can never disagree with
+    /// the `dispatch.shipped` entry beside it. `qcr.*` family. NON-NAV.
+    ///
+    /// Payload (`serde_json::Value`): `qcr_id`, `report_number`,
+    /// `report_kind`, `dsp_id`, `wo_id`, `disposition`.
+    QcReportAttachedToShipment,
+
+    /// ADR-0199 §D8 — every re-render. Carries the SHA of the bytes just
+    /// produced plus whether they matched the issued SHA, so a divergence
+    /// is detectable in the chain without anyone storing a byte.
+    /// `qcr.*` family. NON-NAV.
+    ///
+    /// Payload (`serde_json::Value`): `qcr_id`, `rendered_sha256`,
+    /// `renderer_version`, `matches_issued_sha256`.
+    QcReportRendered,
+
+    /// ADR-0199 §D6 — the shipment gate's denial row. Appended STANDALONE
+    /// (the 409 path has no business tx to ride), mirroring
+    /// `ncr.wo_blocked_by_open_ncr` exactly. `qcr.*` family. NON-NAV.
+    ///
+    /// Payload (`serde_json::Value`): `dispatch_id`, `work_order_id`,
+    /// `partner_id`, `customer_type`, `reason`, `qcr_id`, `disposition`,
+    /// `operator_user_id`, `blocked_at`.
+    QcReportShipmentBlocked,
+
+    /// ADR-0199 §D7 — the report was withdrawn or superseded. There is no
+    /// delete path: a mistake is corrected by a new document, never by
+    /// editing the old one. `qcr.*` family. NON-NAV.
+    ///
+    /// Payload (`serde_json::Value`): `qcr_id`, `report_number`, `reason`,
+    /// `superseded_by_qcr_id`, `new_state`.
+    QcReportVoided,
 }
 
 impl EventKind {
@@ -3380,6 +3450,12 @@ impl EventKind {
             EventKind::QcAutoNcrCreated => "qc.auto_ncr_created",
             EventKind::QcProbeCalibrationStaleWarning => "qc.probe_calibration_stale_warning",
             EventKind::QcProbeIngestionFailed => "qc.probe_ingestion_failed",
+            EventKind::QcReportDrafted => "qcr.report_drafted",
+            EventKind::QcReportIssued => "qcr.report_issued",
+            EventKind::QcReportAttachedToShipment => "qcr.report_attached_to_shipment",
+            EventKind::QcReportRendered => "qcr.report_rendered",
+            EventKind::QcReportShipmentBlocked => "qcr.report_shipment_blocked",
+            EventKind::QcReportVoided => "qcr.report_voided",
         }
     }
 
@@ -3602,6 +3678,13 @@ impl EventKind {
             "qc.auto_ncr_created" => Ok(EventKind::QcAutoNcrCreated),
             "qc.probe_calibration_stale_warning" => Ok(EventKind::QcProbeCalibrationStaleWarning),
             "qc.probe_ingestion_failed" => Ok(EventKind::QcProbeIngestionFailed),
+            // ADR-0199 — QC inspection reports + CoC.
+            "qcr.report_drafted" => Ok(EventKind::QcReportDrafted),
+            "qcr.report_issued" => Ok(EventKind::QcReportIssued),
+            "qcr.report_attached_to_shipment" => Ok(EventKind::QcReportAttachedToShipment),
+            "qcr.report_rendered" => Ok(EventKind::QcReportRendered),
+            "qcr.report_shipment_blocked" => Ok(EventKind::QcReportShipmentBlocked),
+            "qcr.report_voided" => Ok(EventKind::QcReportVoided),
             _ => Err("unknown EventKind storage string"),
         }
     }
@@ -3810,6 +3893,13 @@ impl EventKind {
         EventKind::QcAutoNcrCreated,
         EventKind::QcProbeCalibrationStaleWarning,
         EventKind::QcProbeIngestionFailed,
+        // ADR-0199 — QC inspection reports + CoC.
+        EventKind::QcReportDrafted,
+        EventKind::QcReportIssued,
+        EventKind::QcReportAttachedToShipment,
+        EventKind::QcReportRendered,
+        EventKind::QcReportShipmentBlocked,
+        EventKind::QcReportVoided,
     ];
 
     /// Count of [`EventKind::ALL_KINDS`]. Pinned by the NAV-leakage
@@ -4026,6 +4116,12 @@ mod tests {
             EventKind::QcAutoNcrCreated,
             EventKind::QcProbeCalibrationStaleWarning,
             EventKind::QcProbeIngestionFailed,
+            EventKind::QcReportDrafted,
+            EventKind::QcReportIssued,
+            EventKind::QcReportAttachedToShipment,
+            EventKind::QcReportRendered,
+            EventKind::QcReportShipmentBlocked,
+            EventKind::QcReportVoided,
         ];
         for v in &variants {
             let s = v.as_str();
@@ -4059,7 +4155,7 @@ mod tests {
     fn all_kinds_count_is_pinned() {
         assert_eq!(
             EventKind::ALL_KINDS_COUNT,
-            189,
+            195,
             "EventKind count changed — update this pin AND the matching \
              `const _` drift assertions in aberp-verify::extract_nav_xml and \
              export_invoice_bundle::extract_nav_xml, re-reviewing the new \
@@ -6815,6 +6911,57 @@ mod tests {
             assert!(seen.insert(s), "duplicate storage string {s}");
         }
         assert_eq!(seen.len(), 6, "six distinct QC inspection kinds");
+    }
+
+    /// ADR-0199 — the six QC REPORT kinds round-trip and carry the NEW
+    /// `qcr.*` prefix.
+    ///
+    /// The prefix separation is asserted in both directions: every new kind
+    /// starts with `qcr.` AND none of them starts with `qc.`-and-not-`qcr.`.
+    /// That second half is the point of the family — ADR-0199 §D8 chose a new
+    /// prefix precisely so a consumer globbing `qc.*` for MEASUREMENTS does
+    /// not silently start receiving DOCUMENT lifecycle events.
+    #[test]
+    fn adr0199_qc_report_kinds_round_trip_and_use_qcr_prefix() {
+        let new = [
+            (EventKind::QcReportDrafted, "qcr.report_drafted"),
+            (EventKind::QcReportIssued, "qcr.report_issued"),
+            (
+                EventKind::QcReportAttachedToShipment,
+                "qcr.report_attached_to_shipment",
+            ),
+            (EventKind::QcReportRendered, "qcr.report_rendered"),
+            (
+                EventKind::QcReportShipmentBlocked,
+                "qcr.report_shipment_blocked",
+            ),
+            (EventKind::QcReportVoided, "qcr.report_voided"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (k, expected) in new {
+            let s = k.as_str();
+            assert_eq!(s, expected, "as_str mismatch for {k:?}");
+            assert!(s.starts_with("qcr."), "{s} must start with qcr.");
+            assert_eq!(
+                EventKind::from_storage_str(s).expect("round-trip"),
+                k,
+                "round-trip mismatch for {s}"
+            );
+            assert!(seen.insert(s), "duplicate storage string {s}");
+        }
+        assert_eq!(seen.len(), 6, "six distinct QC report kinds");
+
+        // The `qc.*` measurement family stayed exactly six — the report kinds
+        // did NOT widen it (ADR-0199 §D8's stated reason for a new prefix).
+        let qc_measurement_kinds = EventKind::ALL_KINDS
+            .iter()
+            .filter(|k| k.as_str().starts_with("qc.") && !k.as_str().starts_with("qcr."))
+            .count();
+        assert_eq!(
+            qc_measurement_kinds, 6,
+            "the qc.* measurement family must stay at six — a report kind that \
+             leaked into it would widen every qc.* consumer's glob"
+        );
     }
 
     // ── S358 / PR-45 (ADR-0075) — part.* per-unit serialization family ──────

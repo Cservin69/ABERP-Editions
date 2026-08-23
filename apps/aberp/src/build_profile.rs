@@ -259,6 +259,74 @@ pub const fn storefront_polling_allowed() -> bool {
     storefront_polling_allowed_for(EDITION)
 }
 
+// ── ADR-0199 §D9 — compile-time QC-reporting edition gate ────────────────
+//
+// QC inspection reports, the Certificate of Conformance and the AS9102 Rev C
+// FAIR are an aerospace/defence compliance surface: they carry drawing
+// revisions, heat/lot traceability, characteristic accountability and a
+// disposition that REFUSES a shipment. That is a Defense-edition capability,
+// bound at COMPILE time exactly like storefront reach above and the edition DB
+// root below — not merely gated by config (FOUNDATION §5: capability derived
+// from the build, never user-supplied).
+//
+// SCOPE — read this before assuming what the gate covers:
+//
+// - The MIGRATION runs in BOTH editions. `V003__qc_report.sql` is strictly
+//   additive, and a Portable tenant simply has zero rows in all three new
+//   tables, exactly as a non-probing tenant has zero `qc_inspections` rows
+//   today. Gating the schema would mean two divergent physical schemas.
+// - The ROUTES, the RENDERER and the SHIPMENT GATE are Defense-only. On a
+//   Portable build no QC-report route is mounted, no report can be drafted or
+//   issued, and `resolve_qc_report_gate` returns `Pass` unconditionally — so a
+//   Portable shipment behaves precisely as it did before ADR-0199.
+// - The existing ADR-0092 QC MEASUREMENT surface (plans, inspections, the
+//   verdict) is untouched in both editions. This gate covers the REPORT layer
+//   only.
+
+/// Whether a given [`Edition`] may produce QC inspection reports,
+/// Certificates of Conformance and AS9102 FAIRs — and, consequently, whether
+/// the ADR-0199 §D6 shipment gate can refuse a dispatch.
+///
+/// Pure, total over `Edition`, and the SINGLE source of truth for the
+/// decision: ONLY [`Edition::Defense`]. Parameterised so BOTH edition arms are
+/// provable in one compile (the binary only ever pins its own [`EDITION`], but
+/// a test can check every arm) — the exact shape of
+/// [`storefront_polling_allowed_for`]. `const fn` for const-context use.
+pub const fn qc_reporting_allowed_for(edition: Edition) -> bool {
+    matches!(edition, Edition::Defense)
+}
+
+/// `true` iff THIS build's edition may produce QC reports. Compile-time
+/// constant derived from [`EDITION`] via [`qc_reporting_allowed_for`]:
+/// Defense ⇒ `true`, Portable (and the never-built `Prod` arm) ⇒ `false`.
+pub const fn qc_reporting_allowed() -> bool {
+    qc_reporting_allowed_for(EDITION)
+}
+
+/// Defence-in-depth QC-reporting gate — the runtime backstop behind the
+/// compile-time [`qc_reporting_allowed`] binding, mirroring
+/// [`assert_storefront_reach_allowed`].
+///
+/// A Defense build has the gate LIFTED. Any other build REFUSES loud rather
+/// than issuing a compliance document it has no business issuing: a Portable
+/// demo that could print a Certificate of Conformance would be producing a
+/// document that looks like aerospace evidence and is not.
+pub fn assert_qc_reporting_allowed(intent: &str) -> anyhow::Result<()> {
+    if !qc_reporting_allowed() {
+        anyhow::bail!(
+            "ADR-0199 edition isolation: the {} edition refuses QC reporting ({}) — \
+             inspection reports, Certificates of Conformance and AS9102 FAIRs are a \
+             Defense-only capability, compiled OUT of this build. The ADR-0092 QC \
+             measurement surface (plans, inspections, verdicts) stays available; only \
+             the REPORT layer is Defense-only. Rebuild as Defense \
+             (`cargo build --features production`) to enable QC reporting.",
+            edition_label(),
+            intent,
+        );
+    }
+    Ok(())
+}
+
 /// Defence-in-depth storefront-reach gate — the runtime backstop behind the
 /// compile-time [`storefront_polling_allowed`] binding, mirroring
 /// [`assert_endpoint_allowed`] (prod NAV) and
@@ -397,8 +465,15 @@ mod tests {
         assert!(storefront_polling_allowed_for(Edition::Defense));
         assert!(!storefront_polling_allowed_for(Edition::Portable));
         assert!(!storefront_polling_allowed_for(Edition::Prod));
+
+        // ADR-0199 §D9 / §AC7 — the QC-reporting capability, all three arms
+        // provable in ONE compile regardless of which edition this binary is.
+        assert!(qc_reporting_allowed_for(Edition::Defense));
+        assert!(!qc_reporting_allowed_for(Edition::Portable));
+        assert!(!qc_reporting_allowed_for(Edition::Prod));
         // This build's predicate agrees with its own EDITION.
         assert_eq!(storefront_polling_allowed(), EDITION == Edition::Defense);
+        assert_eq!(qc_reporting_allowed(), EDITION == Edition::Defense);
     }
 
     #[cfg(not(feature = "production"))]
@@ -407,6 +482,7 @@ mod tests {
         // Portable: the capability is compiled OUT.
         assert_eq!(EDITION, Edition::Portable);
         assert!(!storefront_polling_allowed());
+        assert!(!qc_reporting_allowed());
         // The runtime backstop loud-fails even when config is "present"
         // — the storefront base_url / token never reaches the network.
         assert!(assert_storefront_reach_allowed("quote-intake poll daemon").is_err());

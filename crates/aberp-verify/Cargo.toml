@@ -56,6 +56,14 @@ zstd = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 
+# ADR-0199 §D7 — the QC-report retention pin. A `qc/` bundle entry is
+# checked by re-hashing its bytes and comparing against the
+# `rendered_sha256` the `qcr.report_issued` chain entry carries. Same
+# hash primitive the audit chain's own `entry_hash` uses (the
+# audit-ledger crate already depends on it), so no new algorithm and no
+# second SHA implementation enters the verifier's trust boundary.
+sha2 = { workspace = true }
+
 # Time + ULID for entry reconstruction (parsing RFC3339 `time_wall`
 # strings + the `aud_<ULID>` entry-id prefix per ADR-0005).
 time = { workspace = true }

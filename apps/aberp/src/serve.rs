@@ -4375,7 +4375,7 @@ pub const NAV_POLL_DAEMON_CONCURRENCY: usize = 50;
 /// serves without the OS-keychain dependency a full subprocess boot
 /// carries).
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(handle_health))
         // S166 / prod-prep PR #2 — the operator's one-time consent to
         // real fiscal operation. A `/health` subroute (read by the SPA's
@@ -5179,8 +5179,46 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/email-relay/queue/:id",
             get(handle_get_email_relay_row),
-        )
-        .with_state(state)
+        );
+
+    // ── ADR-0199 §D9 — QC reporting is mounted ONLY on Defense ──
+    //
+    // Not a handler-level refusal like the storefront gate: these routes are
+    // simply absent from a Portable router, so a Portable build 404s them.
+    // That is the stronger posture for a compliance surface — there is no
+    // code path on which a non-Defense build could emit a Certificate of
+    // Conformance, not even a refused one. `qc_reporting_allowed()` is a
+    // compile-time constant, so on Portable the whole block is dead code the
+    // optimiser drops; the handlers still additionally assert the capability
+    // (defence in depth), and `resolve_qc_report_gate` returns `Pass`
+    // unconditionally so no shipment behaviour changes on Portable.
+    let router = if crate::build_profile::qc_reporting_allowed() {
+        router
+            .route(
+                "/api/qc-reports",
+                get(handle_list_qc_reports).post(handle_draft_qc_report),
+            )
+            .route("/api/qc-reports/:id", get(handle_get_qc_report))
+            .route("/api/qc-reports/:id/issue", post(handle_issue_qc_report))
+            .route("/api/qc-reports/:id/pdf", get(handle_get_qc_report_pdf))
+            .route("/api/qc-reports/:id/void", post(handle_void_qc_report))
+            .route(
+                "/api/dispatches/:id/qc-reports",
+                get(handle_list_dispatch_qc_reports),
+            )
+            .route(
+                "/api/part-drawing-refs",
+                get(handle_list_drawing_refs).post(handle_record_drawing_ref),
+            )
+            .route(
+                "/api/partners/:id/qc-report-template",
+                post(handle_set_partner_qc_report_template),
+            )
+    } else {
+        router
+    };
+
+    router.with_state(state)
 }
 
 /// PR-46α / session-62 — typed response body emitted when the backend
@@ -17598,6 +17636,298 @@ fn enforce_open_ncr_gate_for_shipment(
     )))
 }
 
+/// ADR-0199 §D6 — why this refusal is a shipment gate rather than a
+/// missing-document warning.
+///
+/// A QC report that is missing, incomplete or rejected means one of three
+/// things: nobody produced the evidence of conformity, a required
+/// characteristic went unmeasured, or a measured characteristic failed. In
+/// all three cases a part leaving the building for a defence or aerospace
+/// customer is a part whose conformity ABERP cannot demonstrate to an
+/// AS9100 auditor. Ervin confirmed the blocking posture explicitly
+/// (ADR-0199 §Open Q3, resolved 2026-08-23).
+///
+/// Only `Defense` / `Aerospace` partners are gated. The commercial path is
+/// completely unaffected — the same three early `Pass` exits the two
+/// sibling gates already carry.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QcReportGate {
+    /// Shipment may proceed: not defense/aero, no WO, no required
+    /// characteristics, or an issued report whose disposition releases.
+    Pass,
+    /// Shipment refused.
+    Blocked {
+        work_order_id: String,
+        customer_type: String,
+        reason: QcReportBlockReason,
+        /// The offending report, when one exists at all.
+        qcr_id: Option<String>,
+        /// Its disposition token, for the audit payload.
+        disposition: Option<String>,
+    },
+}
+
+/// Why the QC-report gate refused. Named separately from the message so
+/// the audit payload carries a machine-readable cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QcReportBlockReason {
+    /// No report has been issued for this work order at all.
+    NoIssuedReport,
+    /// A report exists but a required characteristic is unaccounted for
+    /// (or a line is calibration-stale).
+    Incomplete,
+    /// A report exists and a characteristic failed.
+    Rejected,
+}
+
+impl QcReportBlockReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            QcReportBlockReason::NoIssuedReport => "no_issued_report",
+            QcReportBlockReason::Incomplete => "incomplete",
+            QcReportBlockReason::Rejected => "rejected",
+        }
+    }
+}
+
+/// Pure resolver mirroring [`resolve_open_ncr_gate`]: a dispatch's customer
+/// (`partner_id`) → `customer_type`, and if defense/aerospace, require an
+/// issued QC report whose disposition permits shipment.
+///
+/// Read-only; no audit, no I/O beyond the supplied conn — unit-testable end
+/// to end, which is what lets the mutation tests pin it without standing up
+/// a server.
+///
+/// ## The four `Pass` exits, and why each is correct
+///
+/// 1. **Unknown partner** → `Pass`. Nothing to gate on; same as the siblings.
+/// 2. **Not `Defense`/`Aerospace`** → `Pass`. The commercial path never sees
+///    this feature.
+/// 3. **WO gone** → `Pass`. Defer to the dispatch crate's own checks.
+/// 4. **This build cannot produce QC reports** → `Pass`. On Portable no
+///    report can exist, so blocking would refuse every shipment over a
+///    capability the build does not have (ADR-0199 §D9).
+///
+/// A fifth exit is deliberately NOT here: a product with **no required
+/// characteristics** does pass, because there is genuinely no evidence to
+/// demand — but a product WITH characteristics and no report does not. That
+/// asymmetry is the whole gate.
+pub fn resolve_qc_report_gate(
+    conn: &Connection,
+    tenant: &str,
+    dispatch: &aberp_dispatch::Dispatch,
+) -> anyhow::Result<QcReportGate> {
+    resolve_qc_report_gate_with_capability(
+        conn,
+        tenant,
+        dispatch,
+        crate::build_profile::qc_reporting_allowed(),
+    )
+}
+
+/// The gate's real body, with the edition capability as a PARAMETER.
+///
+/// Parameterised for the same reason `qc_reporting_allowed_for(Edition)`
+/// is: the binary only ever pins its own edition, so a
+/// `qc_reporting_allowed()` read inside the body would make the
+/// Defense-blocking arms unreachable — and therefore untested — on a
+/// Portable build, and vice versa. With the capability passed in, BOTH
+/// arms are provable in one compile, which is what lets the
+/// safety-critical mutation tests run on every gate arm rather than only
+/// under `--features production`.
+///
+/// Production callers must go through [`resolve_qc_report_gate`]; this
+/// function is `pub` only so the tests can drive both arms.
+pub fn resolve_qc_report_gate_with_capability(
+    conn: &Connection,
+    tenant: &str,
+    dispatch: &aberp_dispatch::Dispatch,
+    qc_reporting_enabled: bool,
+) -> anyhow::Result<QcReportGate> {
+    // Exit 4 — edition capability (ADR-0199 §D9).
+    if !qc_reporting_enabled {
+        return Ok(QcReportGate::Pass);
+    }
+    let Some(partner) = crate::partners::get_partner(conn, tenant, &dispatch.partner_id)? else {
+        return Ok(QcReportGate::Pass); // unknown partner → nothing to gate on
+    };
+    use crate::partners::CustomerType;
+    if !matches!(
+        partner.customer_type,
+        CustomerType::Defense | CustomerType::Aerospace
+    ) {
+        return Ok(QcReportGate::Pass); // commercial path unaffected
+    }
+    let customer_type = partner.customer_type.as_db_str().to_string();
+    let Some(wo) = aberp_work_orders::read_work_order(conn, tenant, &dispatch.wo_id)? else {
+        return Ok(QcReportGate::Pass); // WO gone → defer to dispatch crate's checks
+    };
+
+    let reports = aberp_qa::list_reports_for_wo(conn, tenant, &wo.wo_id)
+        .map_err(|e| anyhow!("list QC reports for {}: {e}", wo.wo_id))?;
+    // The reports that can release a shipment: issued, and either already
+    // bound to THIS dispatch or not yet bound to any. A report bound to a
+    // DIFFERENT dispatch released those parts, not these.
+    let releasing: Vec<&aberp_qa::QcReport> = reports
+        .iter()
+        .filter(|r| r.state == aberp_qa::QcReportState::Issued)
+        .filter(|r| match r.dsp_id.as_deref() {
+            None => true,
+            Some(d) => d == dispatch.dsp_id,
+        })
+        .collect();
+
+    if releasing.is_empty() {
+        // No issued report. If the product has no required characteristics
+        // there is no evidence to demand, so the shipment passes: demanding
+        // a report for a part nobody defined an inspection for would block
+        // every Defense shipment the moment this feature landed, which is a
+        // policy change disguised as a bug.
+        let plans = aberp_qa::list_inspection_plans(conn, tenant, Some(&wo.product_id), false)
+            .map_err(|e| anyhow!("list inspection plans for {}: {e}", wo.product_id))?;
+        let required = plans
+            .iter()
+            .filter(|p| p.enabled && p.counts_toward_accountability())
+            .count();
+        if required == 0 {
+            return Ok(QcReportGate::Pass);
+        }
+        return Ok(QcReportGate::Blocked {
+            work_order_id: wo.wo_id,
+            customer_type,
+            reason: QcReportBlockReason::NoIssuedReport,
+            qcr_id: None,
+            disposition: None,
+        });
+    }
+
+    // At least one issued report exists. The shipment may proceed as soon as
+    // ONE of them releases — a superseding report that fixed an earlier
+    // rejection must not stay blocked by its predecessor.
+    if releasing.iter().any(|r| r.disposition.permits_shipment()) {
+        return Ok(QcReportGate::Pass);
+    }
+
+    // None of them releases. Name the WORST one so the operator is told the
+    // most serious problem rather than an arbitrary one.
+    let worst = releasing
+        .iter()
+        .min_by_key(|r| match r.disposition {
+            aberp_qa::Disposition::Reject => 0,
+            aberp_qa::Disposition::Incomplete => 1,
+            _ => 2,
+        })
+        .expect("non-empty checked above");
+    let reason = match worst.disposition {
+        aberp_qa::Disposition::Reject => QcReportBlockReason::Rejected,
+        _ => QcReportBlockReason::Incomplete,
+    };
+    Ok(QcReportGate::Blocked {
+        work_order_id: wo.wo_id,
+        customer_type,
+        reason,
+        qcr_id: Some(worst.qcr_id.clone()),
+        disposition: Some(worst.disposition.as_str().to_string()),
+    })
+}
+
+/// ADR-0199 §D6 — enforce the QC-report gate at the dispatch-ship route
+/// (extends the S438 part-UID and S439 open-NCR gates). On block, emits one
+/// `qcr.report_shipment_blocked` audit entry through the ONE shared Handle
+/// writer and returns a 409 naming what is missing. The non-defense path and
+/// the missing-dispatch path are unaffected.
+fn enforce_qc_report_gate_for_shipment(
+    state: &AppState,
+    dsp_id: &str,
+    operator_login: &str,
+) -> std::result::Result<(), WorkOrderRouteError> {
+    let (gate, partner_id) = {
+        let conn = state.db.read().map_err(|e| {
+            WorkOrderRouteError::Other(anyhow!("open tenant DuckDB for QC-report gate: {e}"))
+        })?;
+        aberp_dispatch::ensure_schema(&conn)
+            .map_err(|e| WorkOrderRouteError::Other(anyhow!("ensure dispatch schema: {e}")))?;
+        let Some(dispatch) = aberp_dispatch::get_dispatch(&conn, state.tenant.as_str(), dsp_id)
+            .map_err(WorkOrderRouteError::Other)?
+        else {
+            return Ok(()); // missing dispatch → defer to the normal 404 path
+        };
+        let gate = resolve_qc_report_gate(&conn, state.tenant.as_str(), &dispatch)
+            .map_err(WorkOrderRouteError::Other)?;
+        (gate, dispatch.partner_id)
+    };
+
+    let QcReportGate::Blocked {
+        work_order_id,
+        customer_type,
+        reason,
+        qcr_id,
+        disposition,
+    } = gate
+    else {
+        return Ok(());
+    };
+
+    let binary_hash = state
+        .binary_hash
+        .wait()
+        .map_err(|e| WorkOrderRouteError::Other(anyhow!("binary hash unavailable: {e}")))?;
+    let payload = serde_json::json!({
+        "work_order_id": work_order_id,
+        "dispatch_id": dsp_id,
+        "partner_id": partner_id,
+        "customer_type": customer_type,
+        "reason": reason.as_str(),
+        "qcr_id": qcr_id,
+        "disposition": disposition,
+        "operator_user_id": operator_login,
+        "blocked_at": time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+    });
+    // ADR-0099 — audit append via the ONE shared Handle writer.
+    let mut conn = state.db.write().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("shared writer for qc-report-block audit: {e}"))
+    })?;
+    aberp_audit_ledger::ensure_schema(&conn).map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("ensure schema for qc-report-block audit: {e}"))
+    })?;
+    let tx = conn.transaction().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("begin tx for qc-report-block audit: {e}"))
+    })?;
+    let ledger_meta = aberp_audit_ledger::LedgerMeta::new(state.tenant.clone(), binary_hash);
+    aberp_audit_ledger::append_in_tx(
+        &tx,
+        &ledger_meta,
+        aberp_audit_ledger::EventKind::QcReportShipmentBlocked,
+        serde_json::to_vec(&payload).expect("serialize qc-report-blocked payload"),
+        Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        None,
+    )
+    .map_err(|e| WorkOrderRouteError::Other(anyhow!("append qc-report-block audit: {e}")))?;
+    tx.commit().map_err(|e| {
+        WorkOrderRouteError::Other(anyhow!("commit tx for qc-report-block audit: {e}"))
+    })?;
+
+    let detail = match reason {
+        QcReportBlockReason::NoIssuedReport => {
+            "no QC inspection report has been issued for this work order".to_string()
+        }
+        QcReportBlockReason::Incomplete => format!(
+            "QC report {} is incomplete — a required characteristic is unaccounted for \
+             or was measured with a stale-calibration probe",
+            qcr_id.as_deref().unwrap_or("(unknown)")
+        ),
+        QcReportBlockReason::Rejected => format!(
+            "QC report {} is a REJECT — a characteristic failed",
+            qcr_id.as_deref().unwrap_or("(unknown)")
+        ),
+    };
+    Err(WorkOrderRouteError::Conflict(format!(
+        "Shipment blocked: {detail}. Complete and issue the QC report before shipping."
+    )))
+}
+
 /// GET /api/products/:id/bom — list active BOM rows.
 async fn handle_get_product_bom(
     headers: HeaderMap,
@@ -18292,6 +18622,15 @@ fn map_dispatch_err(e: aberp_dispatch::DispatchError) -> WorkOrderRouteError {
         D::InvoiceSpawnFailed(msg) => {
             WorkOrderRouteError::Other(anyhow!("invoice spawn failed: {msg}"))
         }
+        // ADR-0199 §D6 — the QC-report binding failed inside the ship tx, so
+        // the ENTIRE shipment rolled back. 500 rather than 409: unlike the
+        // gate (which refuses a shipment the operator can fix by completing
+        // the report), reaching here means the binding itself broke after the
+        // gate already said the report was good — that is a system fault, not
+        // an operator one, and the message carries the binder's reason.
+        D::ShipmentDocumentBindFailed(msg) => {
+            WorkOrderRouteError::Other(anyhow!("QC report binding failed: {msg}"))
+        }
         // S440 — the export-control gate refused the shipment. 409 (an operator
         // must adjudicate), same class as the S438 / S439 shipment gates. The
         // caller appends the standalone `export.access_check` denial BEFORE
@@ -18728,6 +19067,9 @@ pub struct MarkDispatchShippedResponse {
     /// from ADR-0064 §5.
     pub spawned_invoice_id: Option<String>,
     pub stock_movement_id: String,
+    /// ADR-0199 §D6 — the QC report ids bound to this dispatch in the same
+    /// transaction. Empty on the commercial path and on a Portable build.
+    pub bound_qc_report_ids: Vec<String>,
 }
 
 pub fn mark_dispatch_shipped_request(
@@ -18751,6 +19093,13 @@ pub fn mark_dispatch_shipped_request(
     // unit referenced by an Open/Contained NCR cannot ship until the NCR is
     // resolved or escalated. [[trust-code-not-operator]]; non-defense unaffected.
     enforce_open_ncr_gate_for_shipment(state, dsp_id, operator_login)?;
+
+    // ADR-0199 §D6 — QC-report shipment gate, the THIRD instance of the same
+    // pattern. A defense/aerospace dispatch cannot ship without an issued QC
+    // report whose disposition permits release. Ervin confirmed "block"
+    // explicitly (ADR-0199 §Open Q3). [[trust-code-not-operator]] — the
+    // refusal is here, not operator discipline; non-defense unaffected.
+    enforce_qc_report_gate_for_shipment(state, dsp_id, operator_login)?;
 
     // S440 — resolve the consignee ONCE, here, for the export-control gate
     // inside `mark_shipped`. The `partners` table is owned by this app, not by
@@ -18814,6 +19163,15 @@ pub fn mark_dispatch_shipped_request(
         exporter_party_id: state.tenant.as_str().to_string(),
         operator_user_id: operator_login.to_string(),
     };
+    // ADR-0199 §D6 — the QC-report binder. Runs INSIDE this same tx, so the
+    // report's `dsp_id` and the dispatch's Shipped state commit together or
+    // not at all. On a non-Defense build it binds nothing (no report can
+    // exist there) and the commercial path is unchanged.
+    let document_binder = crate::qc_report::QcShipmentDocumentBinder {
+        ledger_meta: &ledger_meta,
+        ledger_actor: Actor::from_local_cli(Ulid::new().to_string(), operator_login),
+        operator: operator_login.to_string(),
+    };
     let outcome = match aberp_dispatch::mark_shipped(
         &tx,
         &ctx,
@@ -18826,6 +19184,7 @@ pub fn mark_dispatch_shipped_request(
         },
         &spawner,
         &export_ctx,
+        &document_binder,
     ) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -18864,6 +19223,7 @@ pub fn mark_dispatch_shipped_request(
         dispatch: outcome.dispatch,
         spawned_invoice_id: outcome.spawned_invoice_id,
         stock_movement_id: outcome.stock_movement_id,
+        bound_qc_report_ids: outcome.bound_qc_report_ids,
     })
 }
 
@@ -26544,6 +26904,24 @@ struct InspectionPlanBody {
     optional_probe_cycle_id: Option<String>,
     #[serde(default = "default_true")]
     enabled: bool,
+
+    // ── ADR-0199 §D3(a) — AS9102 characteristic identity ──
+    //
+    // Every one is `#[serde(default)]`, so a pre-ADR-0199 SPA body still
+    // deserialises and the plan form keeps working unchanged while the
+    // operator surface catches up.
+    #[serde(default)]
+    characteristic_number: Option<String>,
+    #[serde(default)]
+    characteristic_designator: Option<aberp_qa::CharacteristicDesignator>,
+    #[serde(default)]
+    characteristic_type: Option<aberp_qa::CharacteristicType>,
+    #[serde(default)]
+    inspection_method: Option<aberp_qa::InspectionMethod>,
+    #[serde(default)]
+    sheet_zone: Option<String>,
+    #[serde(default)]
+    is_required: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -26595,6 +26973,12 @@ async fn handle_create_inspection_plan(
                     units: body.units,
                     optional_probe_cycle_id: body.optional_probe_cycle_id,
                     enabled: body.enabled,
+                    characteristic_number: body.characteristic_number,
+                    characteristic_designator: body.characteristic_designator,
+                    characteristic_type: body.characteristic_type,
+                    inspection_method: body.inspection_method,
+                    sheet_zone: body.sheet_zone,
+                    is_required: body.is_required,
                 },
             )
         },
@@ -26642,6 +27026,12 @@ async fn handle_update_inspection_plan(
                     units: body.units,
                     optional_probe_cycle_id: body.optional_probe_cycle_id,
                     enabled: body.enabled,
+                    characteristic_number: body.characteristic_number,
+                    characteristic_designator: body.characteristic_designator,
+                    characteristic_type: body.characteristic_type,
+                    inspection_method: body.inspection_method,
+                    sheet_zone: body.sheet_zone,
+                    is_required: body.is_required,
                 },
             )
         },
@@ -26939,6 +27329,580 @@ async fn handle_set_qc_calibration_window(
         Ok(Err(e)) => internal_error("set_qc_calibration_window", e),
         Err(j) => internal_error(
             "set_qc_calibration_window:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+// ── ADR-0199 — QC inspection report / CoC / AS9102 FAIR routes ──────
+//
+// Mounted ONLY on a Defense build (see `build_router`). Every handler
+// additionally goes through `crate::qc_report`, which asserts the
+// capability again — defence in depth, matching the storefront gate's
+// compile-time-plus-runtime posture.
+
+fn qc_report_error_response(e: crate::qc_report::QcReportError) -> Response {
+    use crate::qc_report::QcReportError as E;
+    let msg = e.to_string();
+    match e {
+        E::NotFound(_) => (StatusCode::NOT_FOUND, Json(error_body(msg))).into_response(),
+        E::Validation(_) => (StatusCode::BAD_REQUEST, Json(error_body(msg))).into_response(),
+        // 403, not 404: the build genuinely refuses, and saying so beats
+        // pretending the resource does not exist.
+        E::NotPermitted(_) => (StatusCode::FORBIDDEN, Json(error_body(msg))).into_response(),
+        E::Other(err) => internal_error("qc_report_route", err),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DraftQcReportBody {
+    wo_id: String,
+    /// `dimensional_inspection` (default) | `coc` | `as9102_fair`.
+    #[serde(default)]
+    report_kind: Option<String>,
+    /// Operator override; absent → resolved from the customer.
+    #[serde(default)]
+    template: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+async fn handle_draft_qc_report(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<DraftQcReportBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let report_kind = match body.report_kind.as_deref().map(str::trim) {
+        Some(k) if !k.is_empty() => match aberp_qa::QcReportKind::from_storage_str(k) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!("unknown report_kind {k:?}"))),
+                )
+                    .into_response()
+            }
+        },
+        _ => aberp_qa::QcReportKind::DimensionalInspection,
+    };
+    let template = match body.template.as_deref().map(str::trim) {
+        Some(t) if !t.is_empty() => match aberp_qa::QcReportTemplate::from_storage_str(t) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!("unknown template {t:?}"))),
+                )
+                    .into_response()
+            }
+        },
+        _ => None,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::qc_report::draft_report(
+            &state_for_task.db,
+            state_for_task.tenant.clone(),
+            binary_hash,
+            &operator,
+            time::OffsetDateTime::now_utc(),
+            crate::qc_report::DraftReportRequest {
+                wo_id: body.wo_id,
+                report_kind,
+                template,
+                notes: body.notes,
+            },
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(r)) => (StatusCode::CREATED, Json(r)).into_response(),
+        Ok(Err(e)) => qc_report_error_response(e),
+        Err(j) => internal_error(
+            "draft_qc_report:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+async fn handle_issue_qc_report(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(qcr_id): AxumPath<String>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::qc_report::issue_report(
+            &state_for_task.db,
+            state_for_task.tenant.clone(),
+            binary_hash,
+            &operator,
+            time::OffsetDateTime::now_utc(),
+            &qcr_id,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(r)) => Json(r).into_response(),
+        Ok(Err(e)) => qc_report_error_response(e),
+        Err(j) => internal_error(
+            "issue_qc_report:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QcReportListQuery {
+    wo_id: Option<String>,
+}
+
+async fn handle_list_qc_reports(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(q): Query<QcReportListQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let Some(wo_id) = q
+        .wo_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body("wo_id is required".into())),
+        )
+            .into_response();
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<aberp_qa::QcReport>> {
+        let conn = state_for_task.db.read()?;
+        aberp_qa::list_reports_for_wo(&conn, state_for_task.tenant.as_str(), &wo_id)
+            .map_err(|e| anyhow!("{e}"))
+    })
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "reports": rows })).into_response(),
+        Ok(Err(e)) => internal_error("list_qc_reports", e),
+        Err(j) => internal_error(
+            "list_qc_reports:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+async fn handle_list_dispatch_qc_reports(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(dsp_id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<aberp_qa::QcReport>> {
+        let conn = state_for_task.db.read()?;
+        aberp_qa::list_reports_for_dispatch(&conn, state_for_task.tenant.as_str(), &dsp_id)
+            .map_err(|e| anyhow!("{e}"))
+    })
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "reports": rows })).into_response(),
+        Ok(Err(e)) => internal_error("list_dispatch_qc_reports", e),
+        Err(j) => internal_error(
+            "list_dispatch_qc_reports:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+async fn handle_get_qc_report(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(qcr_id): AxumPath<String>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<Option<crate::qc_report::ReportWithLines>> {
+            let conn = state_for_task.db.read()?;
+            let tenant = state_for_task.tenant.as_str();
+            let Some(report) =
+                aberp_qa::get_report(&conn, tenant, &qcr_id).map_err(|e| anyhow!("{e}"))?
+            else {
+                return Ok(None);
+            };
+            let lines =
+                aberp_qa::list_report_lines(&conn, tenant, &qcr_id).map_err(|e| anyhow!("{e}"))?;
+            Ok(Some(crate::qc_report::ReportWithLines { report, lines }))
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(Some(r))) => Json(r).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(error_body("QC report not found".into())),
+        )
+            .into_response(),
+        Ok(Err(e)) => internal_error("get_qc_report", e),
+        Err(j) => internal_error("get_qc_report:join", anyhow!("blocking task panicked: {j}")),
+    }
+}
+
+/// GET /api/qc-reports/:id/pdf — RENDER ON DEMAND from the frozen rows.
+///
+/// No PDF bytes are persisted anywhere (ADR-0199 §D7), exactly as
+/// `GET /api/invoices/:id/pdf` re-renders from the ledger. Every render
+/// appends one `qcr.report_rendered` carrying the SHA of the bytes just
+/// produced plus whether they matched the issued SHA — so a divergence is
+/// detectable in the chain without anyone storing a byte.
+async fn handle_get_qc_report_pdf(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(qcr_id): AxumPath<String>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<
+            (String, Vec<u8>, Option<bool>),
+            crate::qc_report::QcReportError,
+        > {
+            // Render under the WRITE guard: the render read and the
+            // `qcr.report_rendered` append must see the same rows, and
+            // re-acquiring the writer after a separate read would let an
+            // issuance land in between and audit a hash for a state that no
+            // longer exists.
+            let mut guard = state_for_task.db.write().map_err(|e| {
+                crate::qc_report::QcReportError::Other(anyhow!("shared writer for render: {e}"))
+            })?;
+            aberp_audit_ledger::ensure_schema(&guard).map_err(|e| {
+                crate::qc_report::QcReportError::Other(anyhow!("ensure audit schema: {e}"))
+            })?;
+            let (report, bytes, sha, matches) =
+                crate::qc_report::render_report(&guard, state_for_task.tenant.as_str(), &qcr_id)?;
+            let ledger_meta =
+                aberp_audit_ledger::LedgerMeta::new(state_for_task.tenant.clone(), binary_hash);
+            let ctx = aberp_qa::QcWriteContext {
+                tenant: state_for_task.tenant.as_str(),
+                actor: aberp_inventory::ActorKind::SpaOperator {
+                    operator_login: operator.clone(),
+                },
+                ledger_meta: &ledger_meta,
+                ledger_actor: Actor::from_local_cli(Ulid::new().to_string(), &operator),
+            };
+            let tx = guard.transaction().map_err(|e| {
+                crate::qc_report::QcReportError::Other(anyhow!("begin render-audit tx: {e}"))
+            })?;
+            aberp_qa::record_render(
+                &tx,
+                &ctx,
+                &qcr_id,
+                &sha,
+                aberp_qc_pdf::QC_PDF_RENDERER_VERSION,
+                matches,
+            )?;
+            tx.commit().map_err(|e| {
+                crate::qc_report::QcReportError::Other(anyhow!("commit render-audit tx: {e}"))
+            })?;
+            Ok((report.report_number, bytes, matches))
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok((report_number, bytes, matches))) => {
+            let filename = format!(
+                "{}.pdf",
+                report_number
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    })
+                    .collect::<String>()
+            );
+            (
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        "application/pdf".to_string(),
+                    ),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{filename}\""),
+                    ),
+                    // Surface the integrity verdict in a header so an operator
+                    // (or a script) can see a divergence without parsing the
+                    // audit chain. The bytes are still served: withholding them
+                    // would hide the evidence of the divergence.
+                    (
+                        axum::http::HeaderName::from_static("x-aberp-qc-sha-matches-issued"),
+                        // "draft" — not "false" — when there is no pin to
+                        // match. Conflating the two would train a reader to
+                        // ignore the header.
+                        match matches {
+                            Some(true) => "true".to_string(),
+                            Some(false) => "false".to_string(),
+                            None => "draft".to_string(),
+                        },
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => qc_report_error_response(e),
+        Err(j) => internal_error(
+            "get_qc_report_pdf:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct VoidQcReportBody {
+    reason: String,
+    #[serde(default)]
+    superseded_by_qcr_id: Option<String>,
+}
+
+async fn handle_void_qc_report(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(qcr_id): AxumPath<String>,
+    Json(body): Json<VoidQcReportBody>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    if body.reason.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(error_body("reason is required to void a QC report".into())),
+        )
+            .into_response();
+    }
+    let binary_hash = match resolve_binary_hash(&state) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut guard = state_for_task.db.write()?;
+        aberp_audit_ledger::ensure_schema(&guard)?;
+        let ledger_meta =
+            aberp_audit_ledger::LedgerMeta::new(state_for_task.tenant.clone(), binary_hash);
+        let ctx = aberp_qa::QcWriteContext {
+            tenant: state_for_task.tenant.as_str(),
+            actor: aberp_inventory::ActorKind::SpaOperator {
+                operator_login: operator.clone(),
+            },
+            ledger_meta: &ledger_meta,
+            ledger_actor: Actor::from_local_cli(Ulid::new().to_string(), &operator),
+        };
+        let tx = guard.transaction()?;
+        aberp_qa::void_report(
+            &tx,
+            &ctx,
+            &qcr_id,
+            body.reason.trim(),
+            body.superseded_by_qcr_id.as_deref(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(Err(e)) => internal_error("void_qc_report", e),
+        Err(j) => internal_error(
+            "void_qc_report:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DrawingRefQuery {
+    product_id: String,
+}
+
+async fn handle_list_drawing_refs(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(q): Query<DrawingRefQuery>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<aberp_qa::PartDrawingRef>> {
+        let conn = state_for_task.db.read()?;
+        aberp_qa::list_drawing_refs(&conn, state_for_task.tenant.as_str(), &q.product_id)
+            .map_err(|e| anyhow!("{e}"))
+    })
+    .await;
+    match result {
+        Ok(Ok(rows)) => Json(serde_json::json!({ "drawing_refs": rows })).into_response(),
+        Ok(Err(e)) => internal_error("list_drawing_refs", e),
+        Err(j) => internal_error(
+            "list_drawing_refs:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+async fn handle_record_drawing_ref(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<aberp_qa::NewPartDrawingRef>,
+) -> Response {
+    let operator = match require_ready(&state) {
+        Ok(l) => l,
+        Err(resp) => return resp,
+    };
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(
+        move || -> std::result::Result<aberp_qa::PartDrawingRef, aberp_qa::QcError> {
+            let conn = state_for_task
+                .db
+                .write()
+                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
+            aberp_qa::ensure_schema(&conn)
+                .map_err(|e| aberp_qa::QcError::Storage(anyhow!("ensure qa/qc schema: {e}")))?;
+            aberp_qa::record_drawing_ref(
+                &conn,
+                state_for_task.tenant.as_str(),
+                body,
+                &operator,
+                time::OffsetDateTime::now_utc(),
+            )
+        },
+    )
+    .await;
+    match result {
+        Ok(Ok(row)) => (StatusCode::CREATED, Json(row)).into_response(),
+        Ok(Err(e)) => qc_validation_response(e),
+        Err(j) => internal_error(
+            "record_drawing_ref:join",
+            anyhow!("blocking task panicked: {j}"),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetQcTemplateBody {
+    /// `null` clears the override (fall back to the house default).
+    #[serde(default)]
+    template: Option<String>,
+}
+
+async fn handle_set_partner_qc_report_template(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(partner_id): AxumPath<String>,
+    Json(body): Json<SetQcTemplateBody>,
+) -> Response {
+    if let Err(resp) = require_ready(&state) {
+        return resp;
+    }
+    if let Some(resp) = check_bearer_rejection(&headers, &state.session_token) {
+        return resp;
+    }
+    let template = match body.template.as_deref().map(str::trim) {
+        Some(t) if !t.is_empty() => match aberp_qa::QcReportTemplate::from_storage_str(t) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(error_body(format!("unknown template {t:?}"))),
+                )
+                    .into_response()
+            }
+        },
+        _ => None,
+    };
+    let state_for_task = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = state_for_task.db.write()?;
+        crate::partners::ensure_schema(&conn)?;
+        crate::partners::set_qc_report_template(
+            &conn,
+            state_for_task.tenant.as_str(),
+            &partner_id,
+            template,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Json(serde_json::json!({
+            "ok": true,
+            "template": template.map(|t| t.as_str()),
+        }))
+        .into_response(),
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, Json(error_body(e.to_string()))).into_response(),
+        Err(j) => internal_error(
+            "set_partner_qc_report_template:join",
             anyhow!("blocking task panicked: {j}"),
         ),
     }

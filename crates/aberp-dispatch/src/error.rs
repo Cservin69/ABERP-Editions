@@ -58,6 +58,20 @@ pub enum DispatchError {
     #[error("invoice spawn failed: {0}")]
     InvoiceSpawnFailed(String),
 
+    /// ADR-0199 §D6 — the injected `ShipmentDocumentBinder` failed while
+    /// binding the shipment's QC report(s) to the dispatch. Same posture
+    /// as [`DispatchError::InvoiceSpawnFailed`]: the ENTIRE `mark_shipped`
+    /// transaction rolls back — no state flip, no stock movement, no
+    /// invoice draft, no audit rows.
+    ///
+    /// Rolling back is the conservative direction on purpose. The two
+    /// failure modes are "a part ships with no attached QC record" and
+    /// "an operator has to retry the ship click"; only the first is an
+    /// audit finding. Route layer → 500 (the binder's message is carried
+    /// so the operator sees WHY, not just that something failed).
+    #[error("shipment document binding failed: {0}")]
+    ShipmentDocumentBindFailed(String),
+
     /// S440 — the export-control gate refused the shipment: the consignee
     /// screened to a denied-party or restricted match. Per
     /// [[trust-code-not-operator]] the refusal is in code, so the whole

@@ -103,7 +103,8 @@ pub use repository::{
     list_eligible_work_orders, mark_shipped, null_spawned_invoice_id_in_tx, CreateDispatchInputs,
     Dispatch, DispatchStateCounts, DispatchWriteContext, EligibleWorkOrder, ExportControlContext,
     InvoiceSpawner, MarkShippedInputs, MarkShippedOutcome, NoopInvoiceSpawner,
-    MAX_DISPATCH_LIST_LIMIT, MAX_ELIGIBLE_WO_LIMIT,
+    NoopShipmentDocumentBinder, ShipmentDocumentBinder, MAX_DISPATCH_LIST_LIMIT,
+    MAX_ELIGIBLE_WO_LIMIT,
 };
 pub use state::{next_dispatch_state, DispatchAction, DispatchStateError};
 pub use types::{CarrierKind, DispatchState};

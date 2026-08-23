@@ -75,6 +75,7 @@ members = [
     "crates/aberp-quote-engine",
     "crates/aberp-cad-extract-wrapper",
     "crates/aberp-quote-pdf",
+    "crates/aberp-qc-pdf",
     "crates/aberp-inventory",
     "crates/aberp-work-orders",
     "crates/aberp-qa",

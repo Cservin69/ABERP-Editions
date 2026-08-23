@@ -1,0 +1,25 @@
+[package]
+name = "aberp-qc-pdf"
+description = "QC inspection-report / Certificate-of-Conformance / AS9102 Rev C FAIR PDF renderer. ADR-0199."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aberp_qc_pdf"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+lopdf = { workspace = true }
+# The frozen report rows this crate renders. `aberp-qa` is the schema
+# author; this crate holds NO model of its own, so a schema change cannot
+# leave the renderer describing rows that no longer exist.
+aberp-qa = { path = "../aberp-qa" }
+
+[lints]
+workspace = true

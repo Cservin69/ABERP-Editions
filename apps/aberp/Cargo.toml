@@ -93,6 +93,8 @@ aberp-quote-intake = { path = "../../crates/aberp-quote-intake" }
 aberp-quote-engine = { path = "../../crates/aberp-quote-engine" }
 aberp-cad-extract-wrapper = { path = "../../crates/aberp-cad-extract-wrapper" }
 aberp-quote-pdf = { path = "../../crates/aberp-quote-pdf" }
+# ADR-0199 — the pure QC-report / CoC / AS9102 Rev C renderer.
+aberp-qc-pdf = { path = "../../crates/aberp-qc-pdf" }
 # S279 / PR-265 — blake3 backs the `feature_graph_hash` idempotency key
 # that the storefront's priced-writeback uses to detect retried POSTs
 # (ADR-0004). The engine is pure so the hash is purely derived from the

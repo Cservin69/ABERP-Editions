@@ -1056,7 +1056,20 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
         // invoice bytes (a quote is not an invoice), so nothing to extract
         // into the bundle's `nav/` directory.
         | EventKind::QuotePricingCycleOutcome
-        | EventKind::QuotePricingJobRetried => None,
+        | EventKind::QuotePricingJobRetried
+        // ADR-0199 — the `qcr.*` QC-report family. NO NAV bytes: a QC
+        // report is a customer- and auditor-facing manufacturing record
+        // that never reaches a NAV endpoint. `qcr.report_issued` carries a
+        // `rendered_sha256`, NOT document bytes — the bytes are never
+        // stored anywhere (ADR-0199 §D7), so there is nothing here for the
+        // NAV extractor to find. Decided deliberately per ADR-0081, not
+        // folded into the no-NAV group by default.
+        | EventKind::QcReportDrafted
+        | EventKind::QcReportIssued
+        | EventKind::QcReportAttachedToShipment
+        | EventKind::QcReportRendered
+        | EventKind::QcReportShipmentBlocked
+        | EventKind::QcReportVoided => None,
     };
     // The EventKind storage string uses dots (e.g.
     // "invoice.submission_attempt") which produce
@@ -1086,7 +1099,7 @@ fn extract_nav_xml(entry: &Entry) -> Result<Option<NavXmlFile>> {
 /// per-family `extract_nav_xml_returns_none_for_*_kinds` runtime tests.
 const _: () = {
     assert!(
-        EventKind::ALL_KINDS_COUNT == 189,
+        EventKind::ALL_KINDS_COUNT == 195,
         "EventKind count changed — re-review export_invoice_bundle::extract_nav_xml \
          for the new variant's NAV decision, then bump this pin (ADR-0081)"
     );
@@ -1930,6 +1943,35 @@ mod tests {
                 .append(
                     kind.clone(),
                     br#"{"qci_id":"qci_01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#.to_vec(),
+                    actor,
+                    None,
+                )
+                .unwrap();
+            let entries = ledger.entries().unwrap();
+            let nav = extract_nav_xml(&entries[0]).unwrap();
+            assert!(nav.is_none(), "{} must produce no nav/ file", kind.as_str());
+        }
+    }
+
+    /// ADR-0199 — the six QC REPORT kinds (`qcr.*`) carry app-layer JSON,
+    /// never NAV XML. `qcr.report_issued` carries a `rendered_sha256`, NOT
+    /// document bytes — the PDF is never stored (ADR-0199 §D7) — so a QC
+    /// report can never produce a `nav/` file in an export bundle.
+    #[test]
+    fn extract_nav_xml_returns_none_for_qc_report_kinds() {
+        for kind in [
+            EventKind::QcReportDrafted,
+            EventKind::QcReportIssued,
+            EventKind::QcReportAttachedToShipment,
+            EventKind::QcReportRendered,
+            EventKind::QcReportShipmentBlocked,
+            EventKind::QcReportVoided,
+        ] {
+            let (mut ledger, actor, _bh) = fixture_ledger();
+            ledger
+                .append(
+                    kind.clone(),
+                    br#"{"qcr_id":"qcr_01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#.to_vec(),
                     actor,
                     None,
                 )

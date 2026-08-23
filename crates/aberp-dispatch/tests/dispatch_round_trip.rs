@@ -30,6 +30,7 @@ use aberp_dispatch::{
     get_dispatch, list_dispatches, list_eligible_work_orders, mark_shipped, CarrierKind,
     CreateDispatchInputs, Dispatch, DispatchError, DispatchState, DispatchWriteContext,
     ExportControlContext, InvoiceSpawner, MarkShippedInputs, NoopInvoiceSpawner,
+    NoopShipmentDocumentBinder,
 };
 use aberp_inventory::{
     current_stock, ensure_schema as ensure_inventory_schema, record_movement, ActorKind,
@@ -624,6 +625,7 @@ fn mark_shipped_writes_movement_and_audit_in_same_tx_with_noop_spawner() {
         },
         &NoopInvoiceSpawner,
         &test_export_ctx(),
+        &NoopShipmentDocumentBinder,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -694,6 +696,7 @@ fn mark_shipped_writes_movement_and_spawns_draft_in_same_tx() {
         },
         &spawner,
         &test_export_ctx(),
+        &NoopShipmentDocumentBinder,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -771,6 +774,7 @@ fn mark_shipped_rolls_back_on_draft_failure() {
         },
         &spawner,
         &test_export_ctx(),
+        &NoopShipmentDocumentBinder,
     );
     // Tx is dropped without commit — DuckDB rolls back automatically.
     drop(tx);
@@ -855,6 +859,7 @@ fn mark_shipped_idempotent_on_already_shipped() {
         },
         &NoopInvoiceSpawner,
         &test_export_ctx(),
+        &NoopShipmentDocumentBinder,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -882,6 +887,7 @@ fn mark_shipped_idempotent_on_already_shipped() {
         },
         &NoopInvoiceSpawner,
         &test_export_ctx(),
+        &NoopShipmentDocumentBinder,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -991,6 +997,7 @@ fn cancel_shipped_dispatch_is_refused() {
         },
         &NoopInvoiceSpawner,
         &test_export_ctx(),
+        &NoopShipmentDocumentBinder,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -1100,6 +1107,7 @@ fn dispatch_shipped_audit_payload_parses_with_expected_fields() {
         },
         &MockInvoiceSpawner::return_some("inv_payload_test"),
         &test_export_ctx(),
+        &NoopShipmentDocumentBinder,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -1361,6 +1369,7 @@ fn count_dispatches_by_state_groups_correctly() {
         },
         &NoopInvoiceSpawner,
         &test_export_ctx(),
+        &NoopShipmentDocumentBinder,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -1457,6 +1466,7 @@ fn count_dispatches_shipped_today_matches_iso_date_prefix() {
         },
         &NoopInvoiceSpawner,
         &test_export_ctx(),
+        &NoopShipmentDocumentBinder,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -1589,6 +1599,7 @@ fn ship_with_export_ctx(
         },
         spawner,
         export_ctx,
+        &NoopShipmentDocumentBinder,
     );
     let outcome = match result {
         Ok(_) => {
@@ -2153,6 +2164,7 @@ fn review_s440_shipment_logged_also_rolls_back_when_the_commit_never_lands() {
         },
         &NoopInvoiceSpawner,
         &export_ctx,
+        &NoopShipmentDocumentBinder,
     )
     .expect("the ship itself succeeds — all three export appends execute");
 
@@ -2217,6 +2229,7 @@ fn review_s440_retried_ship_does_not_duplicate_the_export_family() {
             },
             &NoopInvoiceSpawner,
             &export_ctx,
+            &NoopShipmentDocumentBinder,
         )
         .unwrap_or_else(|e| panic!("attempt {attempt} failed: {e}"));
         tx.commit().unwrap();
@@ -2283,4 +2296,266 @@ fn review_s440_screening_stamps_must_not_be_operator_back_datable() {
         "classified_at_ms={} — same falsification on the classification row.",
         c.classified_at_ms
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// ADR-0199 §D6 — the injected ShipmentDocumentBinder is ATOMIC with the
+// ship. Mirrors `mark_shipped_rolls_back_on_draft_failure` exactly: the
+// binder is the sixth thing that can refuse a shipment, and it refuses
+// the same way.
+// ─────────────────────────────────────────────────────────────────────
+
+/// A binder that records its calls and can be told to fail.
+#[derive(Debug)]
+struct MockDocumentBinder {
+    outcome: Result<Vec<String>, String>,
+    calls: std::cell::Cell<usize>,
+    seen: std::cell::RefCell<Vec<(String, String)>>,
+}
+
+impl MockDocumentBinder {
+    fn returning(ids: &[&str]) -> Self {
+        Self {
+            outcome: Ok(ids.iter().map(|s| s.to_string()).collect()),
+            calls: std::cell::Cell::new(0),
+            seen: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+    fn failing(msg: &str) -> Self {
+        Self {
+            outcome: Err(msg.to_string()),
+            calls: std::cell::Cell::new(0),
+            seen: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+    fn calls(&self) -> usize {
+        self.calls.get()
+    }
+}
+
+impl aberp_dispatch::ShipmentDocumentBinder for MockDocumentBinder {
+    fn bind_qc_reports(
+        &self,
+        _tx: &duckdb::Transaction<'_>,
+        _tenant: &str,
+        wo_id: &str,
+        dsp_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        self.calls.set(self.calls.get() + 1);
+        self.seen
+            .borrow_mut()
+            .push((wo_id.to_string(), dsp_id.to_string()));
+        match &self.outcome {
+            Ok(ids) => Ok(ids.clone()),
+            Err(m) => Err(anyhow::anyhow!("{m}")),
+        }
+    }
+}
+
+/// A binder that errors rolls back the WHOLE `mark_shipped` — no state
+/// flip, no stock movement, no invoice draft, no audit rows.
+///
+/// This is the mechanism behind ADR-0199 §D6's atomicity claim: a
+/// shipment that commits while its QC-report binding rolls back would be
+/// a shipped part with no attached QC record, which is precisely the
+/// audit finding the feature exists to prevent.
+#[test]
+fn adr0199_mark_shipped_rolls_back_when_the_document_binder_fails() {
+    let mut conn = setup_db();
+    let meta = meta();
+    let wo_id = create_completed_wo(&mut conn, &meta, "WO-QCR-BIND-ROLLBACK");
+
+    let tx = conn.transaction().unwrap();
+    let dsp = create_dispatch(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        CreateDispatchInputs {
+            wo_id,
+            partner_id: "ptr_acme".to_string(),
+            notes: None,
+            idempotency_key: "create-dsp-qcr-bind".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let stock_before = current_stock(&conn, TEST_TENANT, "prd_widget")
+        .unwrap()
+        .unwrap();
+    let shipped_before = count_kind(&conn, "mes.dispatch_shipped");
+    let classification_before = count_kind(&conn, "export.classification_set");
+
+    let binder = MockDocumentBinder::failing("no issued QC report for this work order");
+    let tx = conn.transaction().unwrap();
+    let result = mark_shipped(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        &dsp.dsp_id,
+        MarkShippedInputs {
+            carrier_kind: CarrierKind::Dpd,
+            tracking_number: Some("DPD-QCR".to_string()),
+            shipped_at: None,
+            idempotency_key: "ship-qcr-bind-rollback".to_string(),
+        },
+        &NoopInvoiceSpawner,
+        &test_export_ctx(),
+        &binder,
+    );
+    drop(tx); // no commit — DuckDB rolls back.
+
+    assert!(
+        matches!(result, Err(DispatchError::ShipmentDocumentBindFailed(_))),
+        "expected ShipmentDocumentBindFailed, got {result:?}"
+    );
+    assert_eq!(binder.calls(), 1);
+
+    // Nothing persisted: the dispatch is still Drafted.
+    let after = get_dispatch(&conn, TEST_TENANT, &dsp.dsp_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, DispatchState::Drafted);
+    assert!(after.shipped_at.is_none());
+    assert!(after.carrier_kind.is_none());
+
+    // Stock unchanged.
+    assert_eq!(
+        current_stock(&conn, TEST_TENANT, "prd_widget")
+            .unwrap()
+            .unwrap(),
+        stock_before
+    );
+
+    // No audit rows — including the export.* rows appended EARLIER in the
+    // same tx, which is the point of running the binder inside it.
+    assert_eq!(count_kind(&conn, "mes.dispatch_shipped"), shipped_before);
+    assert_eq!(
+        count_kind(&conn, "export.classification_set"),
+        classification_before,
+        "the export appends must roll back with the failed binding"
+    );
+}
+
+/// The happy path: the binder is called once with the dispatch's own
+/// (wo_id, dsp_id), and the ids it returns reach the outcome.
+#[test]
+fn adr0199_successful_binding_reaches_the_outcome() {
+    let mut conn = setup_db();
+    let meta = meta();
+    let wo_id = create_completed_wo(&mut conn, &meta, "WO-QCR-BIND-OK");
+
+    let tx = conn.transaction().unwrap();
+    let dsp = create_dispatch(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        CreateDispatchInputs {
+            wo_id: wo_id.clone(),
+            partner_id: "ptr_acme".to_string(),
+            notes: None,
+            idempotency_key: "create-dsp-qcr-ok".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let binder = MockDocumentBinder::returning(&["qcr_A", "qcr_B"]);
+    let tx = conn.transaction().unwrap();
+    let outcome = mark_shipped(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        &dsp.dsp_id,
+        MarkShippedInputs {
+            carrier_kind: CarrierKind::Gls,
+            tracking_number: None,
+            shipped_at: None,
+            idempotency_key: "ship-qcr-bind-ok".to_string(),
+        },
+        &NoopInvoiceSpawner,
+        &test_export_ctx(),
+        &binder,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(outcome.dispatch.state, DispatchState::Shipped);
+    assert_eq!(
+        outcome.bound_qc_report_ids,
+        vec!["qcr_A".to_string(), "qcr_B".to_string()]
+    );
+    assert_eq!(binder.calls(), 1);
+    assert_eq!(
+        binder.seen.borrow().as_slice(),
+        &[(wo_id, dsp.dsp_id.clone())],
+        "the binder must be handed THIS dispatch's work order and id"
+    );
+}
+
+/// A second ship click against a stale UI must NOT re-bind: the
+/// already-Shipped early return is idempotent, so the binder is never
+/// called and no second `qcr.report_attached_to_shipment` can be minted
+/// for the same (report, dispatch) pair.
+#[test]
+fn adr0199_idempotent_reship_does_not_rebind() {
+    let mut conn = setup_db();
+    let meta = meta();
+    let wo_id = create_completed_wo(&mut conn, &meta, "WO-QCR-BIND-IDEM");
+
+    let tx = conn.transaction().unwrap();
+    let dsp = create_dispatch(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        CreateDispatchInputs {
+            wo_id,
+            partner_id: "ptr_acme".to_string(),
+            notes: None,
+            idempotency_key: "create-dsp-qcr-idem".to_string(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let first = MockDocumentBinder::returning(&["qcr_ONE"]);
+    let tx = conn.transaction().unwrap();
+    mark_shipped(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        &dsp.dsp_id,
+        MarkShippedInputs {
+            carrier_kind: CarrierKind::Gls,
+            tracking_number: None,
+            shipped_at: None,
+            idempotency_key: "ship-qcr-idem".to_string(),
+        },
+        &NoopInvoiceSpawner,
+        &test_export_ctx(),
+        &first,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(first.calls(), 1);
+
+    let second = MockDocumentBinder::returning(&["qcr_TWO"]);
+    let tx = conn.transaction().unwrap();
+    let outcome = mark_shipped(
+        &tx,
+        &dispatch_ctx_for(&meta, "ervin"),
+        &dsp.dsp_id,
+        MarkShippedInputs {
+            carrier_kind: CarrierKind::Gls,
+            tracking_number: None,
+            shipped_at: None,
+            idempotency_key: "ship-qcr-idem-again".to_string(),
+        },
+        &NoopInvoiceSpawner,
+        &test_export_ctx(),
+        &second,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(
+        second.calls(),
+        0,
+        "the already-Shipped early return must not re-invoke the binder"
+    );
+    assert!(outcome.bound_qc_report_ids.is_empty());
 }

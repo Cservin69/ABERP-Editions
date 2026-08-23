@@ -20,6 +20,7 @@ dependencies = [
  "aberp-nav-transport",
  "aberp-nav-xsd-validator",
  "aberp-qa",
+ "aberp-qc-pdf",
  "aberp-quote-engine",
  "aberp-quote-intake",
  "aberp-quote-pdf",
@@ -279,6 +280,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aberp-qc-pdf"
+version = "0.0.0"
+dependencies = [
+ "aberp-qa",
+ "lopdf",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "aberp-quote-engine"
 version = "0.0.0"
 dependencies = [
@@ -363,6 +373,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "sha2",
  "tar",
  "time",
  "tracing",
