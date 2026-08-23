@@ -442,10 +442,22 @@ and are not the reason a verdict could still move:
   zero of the axial parameter at the foot of the perpendicular from the
   WORLD origin. Both pick a FRAME to report in, which is a determinism
   choice (ADR-0112 S3) and not a measurement; neither is part of
-  :func:`_rigid_invariants`. The one thing the second could do is make
-  ``t`` large without making the part large — it does, for a part
-  translated along its own bore axis — so that motion is in the composed
-  sweep, at 15 m, and nothing moves.
+  :func:`_rigid_invariants`.
+
+  ROUND 5 WROTE THE REST OF THIS BULLET AND WAS WRONG. It said: "the one
+  thing the second could do is make ``t`` large without making the part
+  large — it does, for a part translated along its own bore axis — so
+  that motion is in the composed sweep, at 15 m, and nothing moves." The
+  motion was the right one and 15 m was not far enough. Round 6's ladder
+  walked the same motion to 1e+09 mm and it moves: everything downstream
+  that reads ``t`` in a frame built at ``origin`` is at world magnitude
+  for a part translated along its own axis, which is what D-19 item 9
+  turned out to be. Both frames that read it are anchored ON THE BORE
+  now — :meth:`_AxisMaterial._anchored_shape` in round 6 and
+  :func:`_cap_axis_intersections` in round 7 — so the parametric zero is
+  a reporting choice again and nothing measures from it. What is left of
+  this bullet is only the reporting, which is what it always claimed to
+  be about.
 - :func:`_perp_basis` derives the lateral 2-D frame from the world axis
   LEAST parallel to the bore, so the basis itself turns with the part.
   Everything read through it is a SIGNED AREA or an interval union, and
@@ -454,10 +466,16 @@ and are not the reason a verdict could still move:
   whichever world axis is picked. ``test_d19r5_the_lateral_basis_turns_
   with_the_part_but_keeps_its_hand`` pins the handedness, which is the
   part that would silently break the sign.
-- the surviving ``Bnd_Box`` in :func:`_face_axial_span`, which is taken
-  in the bore's frame and read only on Z — the one axis of that frame the
-  bore fixes. ``test_d19r5_the_only_world_axis_box_left_is_read_on_the_
-  bores_own_axis`` fails on any new box anywhere in the module.
+- the two surviving ``Bnd_Box`` uses, both taken in the bore's own frame
+  and each read on the axes of it the BORE fixes and no others:
+  :func:`_face_axial_span` reads Z, which is the bore's axial parameter,
+  and :func:`_lateral_reach` (D-19 round 7) reads ``max(|x|, |y|)``,
+  which on a shape swept about that axis is the radius of its widest
+  point. Neither reads a single lateral coordinate, because the frame's
+  X direction is an arbitrary choice of OCCT's.
+  ``test_d19r5_the_only_world_axis_box_left_is_read_on_the_bores_own_axis``
+  fails on any new box anywhere in the module, and requires each owner to
+  name which coordinates of its box it reads.
 
 ROUND 6 — THE CLASSIFIER'S FRAME, and the bound instead of the claim
 --------------------------------------------------------------------
@@ -474,65 +492,102 @@ ROUND 6 — THE CLASSIFIER'S FRAME, and the bound instead of the claim
   in the bore's own anchored frame now
   (:meth:`_AxisMaterial._anchored_shape`), where the same boundary moves
   2.3e-10 mm at 10 km and stays linear in the distance out to 1e11 mm.
-  All 62 committed fixtures are bit-identical: the fix changes a
-  BOOLEAN, and it changes it only where the boolean was wrong.
+  All 62 committed fixtures were bit-identical when it landed: the fix
+  changes a BOOLEAN, and it changes it only where the boolean was wrong.
+  (Round 7 found that the classifier's frame and the intersection frame
+  COMPOUND: with round 7's anchor in, the world-frame classifier no
+  longer loses ``undercut_ball_seat_blind_bore_d8``'s floor at 1e+07 mm
+  or at 1e+08, and loses it at 1e+09. The fix is still load-bearing
+  there — 41 % short on a committed fixture — and
+  ``test_d19r6_an_undercut_seat_ten_kilometres_out_keeps_its_floor``
+  carries both magnitudes.)
 
-THE SWEEP IS BEHAVIOURAL NOW, and that is round 6's real finding. Rounds
-4 and 5 each scoped their sweep by MECHANISM — "every ``Bnd_Box``",
-"every intersector tolerance" — and each time the next instance was a
-mechanism that was not in the bucket. So the criterion is stated over the
-ANSWERS instead: for every located-hole verdict, over all 62 committed
-fixtures, under seven rotations crossed with three translation directions
-in both orders, walk the coordinate magnitude and find the first
-categorical flip. A LADDER and not a bisection, because the predicate is
-NOT monotone in the magnitude — a part can answer correctly at 8 km and
-wrongly at 6 km — so a bisection reports *a* boundary rather than *the*
-first one, and reports it too high.
-``test_d19r6_no_verdict_moves_below_the_measured_bound``.
+ROUND 7 — THE INTERSECTION'S FRAME, AND THE CONVENTION RATIFIED
+----------------------------------------------------------------
+
+- :func:`_cap_axis_intersections` ran ``GeomAPI_IntCS`` in
+  ``gp_Ax3(origin, direction)`` — "the bore's frame" — and it is the
+  bore's frame in its Z and not in its ORIGIN, because
+  :func:`_canonical_origin` puts ``origin`` at the foot of the
+  perpendicular from the WORLD origin. A part translated ALONG its own
+  bore axis is therefore still at world magnitude inside it, and the
+  intersector starts losing roots: with only one root of a breakout
+  sphere the void bound discards nothing, :class:`_AxisMaterial` is never
+  built, and every rule rounds 1, 2, 3 and 6 put into that arm is not
+  reached. 12.0 THROUGH reads 17.33 BLIND, 25.0 reads 30.0, and
+  ``undercut_ball_seat_blind_bore``'s 14.1 BLIND reads 6.9 THROUGH.
+  Anchored on the bore now, the same anchor round 6 gave the classifier.
+  It is NOT bit-preserving — eight committed rows move, six in depth and
+  two in an entry coordinate, by at most 4.6e-13 mm, three of them onto
+  an exact nominal — which is why round 6, whose bar was bit-identity,
+  measured and filed it instead of folding it in.
+
+- AND THE DEPTH CONVENTION IS RATIFIED AT BOTH ENDS, which is what
+  :func:`_across_a_relief` implements: *a hole's depth is the DRILL's own
+  travel, from the part FACE to the deepest point the drill reaches, and
+  what a DIFFERENT operation makes is its own feature and is not folded
+  in.* The mouth was measured from the top of the bore's own WALL, so a
+  countersink, a chamfer or a spherical dish shortened the hole by the
+  full depth of the relief — seven committed rows, re-pinned longer. An
+  O-ring gland at the far end read 6.5 THROUGH on a pocket with 12 mm of
+  metal under it, because a ring torus never crosses its own axis; it
+  reads 8.0 BLIND. One mechanism answers both: a face the drill's axis
+  does not END on is a different operation's face, so step across it and
+  ask the next one. See ADR-0112 §B.2.1 for the ruling and
+  ``docs/BACKLOG-designed-to-live.md`` D-19 items 7 and 8 for the tables.
+
+THE SWEEP IS BEHAVIOURAL, and that is round 6's real finding. Rounds 4
+and 5 each scoped their sweep by MECHANISM — "every ``Bnd_Box``", "every
+intersector tolerance" — and each time the next instance was a mechanism
+that was not in the bucket. So the criterion is stated over the ANSWERS
+instead: for every located-hole verdict, over every committed fixture,
+under seven rotations crossed with three translation directions in both
+orders, walk the coordinate magnitude and find the first categorical
+flip. A LADDER and not a bisection, because the predicate is NOT monotone
+in the magnitude — a part can answer correctly at 8 km and wrongly at
+6 km — so a bisection reports *a* boundary rather than *the* first one,
+and reports it too high.
 
 THE VERIFIED BOUND, which is what this module claims and all it claims —
-and it is a LADDER's bound, so it is stated as one: the rungs are
-``10 ** (1/6)`` apart (1.468x), the walk runs from 1e+04 mm to 1e+09 mm,
+and it is a LADDER's bound, so it is stated as one. The rungs are
+``10 ** (1/6)`` apart (1.468x), the walk runs from 1e+04 mm to 1e+11 mm,
 and everything below 1.5e+04 mm is already covered by
-``test_d19r5_no_answer_moves_under_a_composed_rigid_motion``. "Nothing
-moves below X" therefore means "no rung below X moved anything", and the
-true first flip could sit up to 1.468x lower than the figure quoted.
+``test_d19r5_no_answer_moves_under_a_composed_rigid_motion``. The bound
+quoted is THE LAST RUNG THAT WAS CLEAN under every motion — round 6
+quoted the rung its flip was found AT, which is one rung optimistic,
+since that rung is precisely where something moved. The true first flip
+sits somewhere in the 1.468x between the two.
 
-- no COUNT, END CONDITION or FLAT-BOTTOM verdict moves at any rung below
-  **2.15e+07 mm (21.5 km)**. Before round 6 that bound was
-  **6.81e+06 mm (6.8 km)** — ``undercut_ball_seat_blind_bore``, 14.1 mm
-  BLIND reading 6.9 mm THROUGH, and the mechanism was this classifier.
-  The number of fixtures that flip anywhere on the ladder drops from 18
-  to 11.
-- no DEPTH moves by more than a MICRON anywhere below **1.00e+07 mm
-  (10 km)** (before round 6: 4.64e+06 mm), and the fixture that sets both
-  is ``ball_nose_blind_bore_d4_deep``, whose cap is met at a tangency.
-- over the whole motion grid at **4e+06 mm (4 km)** nothing discrete
-  moves and no depth moves by more than **3.7e-04 mm**; at 1 km the worst
-  depth moves 1.8e-05 mm, and at 100 m, 2.2e-07 mm.
-- and there IS a flip above that, with a named mechanism, because
-  "closed" is the word that hid the last two instances:
-  :func:`_cap_axis_intersections` runs in ``gp_Ax3(origin, direction)``,
-  and :func:`_canonical_origin` puts ``origin`` at the foot of the
-  perpendicular from the WORLD origin — a point on the axis LINE, not on
-  the PART. A translation ALONG the bore's own axis therefore leaves the
-  surface at world magnitude inside "the bore's frame", and
-  ``GeomAPI_IntCS`` loses one of the two roots of a breakout sphere:
-  ``far_opening_through_bore`` returns roots (-1.31, 11.97) at 1e+08 mm
-  and the single root 5.33 at 2.15e+08 mm, so the void bound discards
-  nothing, this oracle is never asked, and 12.0 THROUGH reads 17.33
-  BLIND. EVERY residual flip on the ladder is that one mechanism, and
-  that is checked rather than inferred — all ELEVEN of them return to the
-  upright answer when the intersection frame is anchored on the bore —
-  ``domed_floor_pocket_proud`` 7.0 BLIND reading 13.1 THROUGH,
-  ``bore_beside_a_conical_boss`` 25.0 THROUGH reading 30.0 BLIND,
-  ``undercut_ball_seat_blind_bore_d8`` 12.1 reading 7.1 — and anchoring
-  THAT frame on the bore restores the exact nominal in every one of them,
-  out to 4.6e+08 mm. It is not bit-preserving: eight of the 62 committed
-  fixtures move in their last bits, two of them TOWARDS their nominal
-  (14.100000000000001 -> 14.1). So it is measured, named and filed rather
-  than folded into a round whose bar is bit-identity. See
-  ``docs/BACKLOG-designed-to-live.md``, D-19 item 9.
+- no COUNT, END CONDITION or FLAT-BOTTOM verdict moves at any rung up to
+  and including **3.16e+09 mm (3162 km)**. Round 6's figure was **4.64e+06 mm**
+  (it quoted 2.15e+07, one rung high).
+- no DEPTH moves by more than a MICRON at any rung up to and including
+  **4.64e+08 mm (464 km)** (round 6: **3.16e+06 mm**, quoted as 1.00e+07).
+- over the whole motion grid at 4e+06 mm (4 km) nothing discrete moves
+  and no depth moves by more than 3.7e-04 mm; at 1 km the worst depth
+  moves 1.8e-05 mm, and at 100 m, 2.2e-07 mm.
+- and there IS a flip above each, named rather than hidden behind the
+  word "closed". The DEPTH one is round 7's own mouth
+  walk: at 6.81e+08 mm ``countersunk_through_bore`` reads 16.999999963
+  against 20.0 — the ownership and flare tests stop resolving, the walk
+  declines to step across the countersink, and the hole falls back to
+  the top of its own wall, which is the pre-round-7 answer. It degrades
+  to the ROUND-6 reading rather than to nonsense, and that reading is
+  the SHORT one, which is the direction to watch. The DISCRETE one is at
+  4.64e+09 mm, on ``angled_blind_hole``'s ``flat_bottom`` flag.
+- and the comparison that matters, because the ladder is two decades
+  longer than round 6's: over exactly the range round 6 walked (1e+04 to
+  1e+09 mm), where ELEVEN fixtures moved something, **no fixture moves
+  anything discrete at all and two move a depth by more than a micron**.
+
+The ladder takes hours and is recorded here rather than re-walked;
+``test_d19r6_no_verdict_moves_below_the_measured_bound`` keeps its 1 km
+row standing on every commit.
+
+NOT "CLOSED", and the word is avoided on purpose: it is the word that hid
+round 5's instance from round 6 and round 6's from round 7. What is
+claimed is the measured bound above and the mechanism behind whatever
+sits past it — nothing more.
 
 Contiguity (ADR-0112 adversarial, B3)
 --------------------------------------
@@ -879,7 +934,7 @@ SURFACE_CONFUSION_MM: float = 1e-7
 #: neither of the two answers the probe wants — so it is kept far BELOW
 #: the distance the probe steps off the surface (a `_tangency_band`,
 #: 1.8e-3 mm on a O8 bore) and far ABOVE float noise. Nothing selects it
-#: within that range: `test_d19_the_material_probe_is_not_a_tuned_epsilon`
+#: within that range: `test_d19r2_the_material_probe_is_not_a_tuned_epsilon`
 #: moves the step, which is the quantity that could matter, over four
 #: decades and no answer follows.
 #:
@@ -1804,7 +1859,7 @@ def _crossing_normal(
 
 
 def _cap_axis_intersections(
-    face, origin, direction, radius
+    face, origin, direction, radius, anchor_t: float = 0.0
 ) -> List[Tuple[float, Tuple[float, float, float]]]:
     """Every point where the bore's axis CROSSES this face's UNBOUNDED
     surface, as an axial parameter paired with the surface normal there,
@@ -1842,6 +1897,27 @@ def _cap_axis_intersections(
     noise (see :data:`DEGENERATE_COPLANARITY_TOL`). The vector computed
     here is the one the geometry actually has, and the openness verdict
     is entitled to it.
+
+    ``anchor_t`` is where the frame's ORIGIN sits on the bore's axis, and
+    D-19 round 7 is that argument. Round 5 moved this intersection into
+    ``gp_Ax3(origin, direction)`` and called it "the bore's frame"; it is
+    the bore's frame in its Z and not in its origin, because
+    :func:`_canonical_origin` puts ``origin`` at the foot of the
+    perpendicular from the WORLD origin — a point on the axis LINE and
+    not on the PART. Removing the perpendicular offset is all that frame
+    did, so a part translated ALONG its own bore axis is still at world
+    magnitude inside it, and ``GeomAPI_IntCS`` starts losing roots: with
+    only one root of a breakout sphere the void bound discards nothing,
+    :class:`_AxisMaterial` is never built, and every rule D-19 rounds 1,
+    2, 3 and 6 put into that arm is simply not reached — 12.0 THROUGH
+    reading 17.33 BLIND, 25.0 reading 30.0, 14.1 BLIND reading 6.9
+    THROUGH. The caller passes the middle of the bore's own parametric
+    span, the same anchor round 6 gave the classifier and for the same
+    reason: it has to be a point the PART is at. The root's ``t`` is then
+    the frame's Z plus the anchor. See the module docstring's round-7
+    section for what it cost and
+    ``test_d19r7_the_intersection_frame_is_anchored_and_its_flips_are_closed``
+    for the measurement.
     """
     planar = _plane_axis_intersection(face, origin, direction)
     if planar is not None:
@@ -1856,10 +1932,11 @@ def _cap_axis_intersections(
     if surface is None:
         return []
     try:
+        anchor = _point_on_axis(origin, direction, anchor_t)
         frame = gp_Trsf()
         frame.SetTransformation(
             gp_Ax3(
-                gp_Pnt(origin[0], origin[1], origin[2]),
+                gp_Pnt(anchor[0], anchor[1], anchor[2]),
                 gp_Dir(direction[0], direction[1], direction[2]),
             )
         )
@@ -1908,7 +1985,7 @@ def _cap_axis_intersections(
         world = gp_Vec(normal[0], normal[1], normal[2]).Transformed(back)
         roots.append(
             (
-                float(p.Z()),
+                anchor_t + float(p.Z()),
                 _unit((float(world.X()), float(world.Y()), float(world.Z()))),
             )
         )
@@ -3117,14 +3194,31 @@ class _AxisMaterial:
         and a rotation does not make a number smaller. Translating is
         also the motion that costs the least to be exact about.
 
-        ``Copy=True``, which is load-bearing: with ``Copy=False`` OCCT
-        records the motion as a ``TopLoc_Location`` and leaves the
-        geometry where it was, so the classifier would compose the
-        location back in and be handed the same large coordinates again.
-        The copy is one per BORE — built lazily with the classifier, in
-        the same branch, so a part that never asks never pays — and it
-        costs nothing measurable: the whole corpus mines in 0.28 s with
-        it and 0.28 s without.
+        ``Copy=True``, and the round-6 docstring called that LOAD-BEARING
+        on the reasoning that ``Copy=False`` makes OCCT record the motion
+        as a ``TopLoc_Location`` and leave the geometry where it was, so
+        the classifier would compose the location back in and be handed
+        the same large coordinates again. **That reasoning is wrong and
+        the claim was never pinned.** Measured, at D-19 round 7: with
+        ``Copy=False`` every row of the committed corpus is byte-identical
+        at ``repr`` precision, and so is every verdict on the four parts
+        this oracle decides — the undercut seats, the proud dome, the deep
+        ball nose, the breakout — under a composed rotation and
+        translation at 1e+07, 1e+09, 1e+10 and 1e+11 mm.
+        ``test_d19r7_the_anchoring_copy_is_pinned_as_inert`` is that
+        measurement, and it exists because "load-bearing" is a claim about
+        the fix rather than a description of it, and this module does not
+        keep those in prose.
+
+        Kept as ``Copy=True`` anyway, and the reason is now the honest
+        one: it is the flag that says the geometry really is where the
+        classifier is told it is, rather than the flag that makes it so.
+        A located shape's precision is OCCT's business and this module has
+        no way to hold it to that; a copy is a promise it can keep. It
+        costs nothing measurable — one copy per BORE, built lazily with
+        the classifier in the same branch, so a part that never asks never
+        pays, and the whole corpus mines in 0.28 s with it and 0.28 s
+        without.
         """
         anchor = _point_on_axis(self._origin, self._direction, self._anchor_t)
         move = gp_Trsf()
@@ -3185,7 +3279,7 @@ class _AxisMaterial:
         shorter and the probes are inside the surface's own uncertainty
         and answer noise; any longer and a thin floor could be stepped
         clean over. Nothing is tuned here —
-        ``test_d19_the_material_probe_is_not_a_tuned_epsilon`` walks the
+        ``test_d19r2_the_material_probe_is_not_a_tuned_epsilon`` walks the
         step over four decades without moving an answer.
         """
         return not self._inside(t - sign * step) and self._inside(t + sign * step)
@@ -3476,11 +3570,18 @@ def _root_for_end(
     past the face. Nothing else on the part can move it. See
     :meth:`_AxisMaterial.beyond_the_face`.
 
-    NOT closed by any of this, and recorded rather than half-fixed: a
-    TOROIDAL undercut — an O-ring or snap-ring gland at the bore's end —
-    still reads short and THROUGH. A ring torus never crosses its own
-    axis, so that face offers no crossing at all and nothing here is
-    asked to choose. See ``docs/BACKLOG-designed-to-live.md``, D-19.
+    ── D-19 ROUND 7: WHERE THIS FUNCTION STOPS ─────────────────────────
+
+    Everything above decides among the crossings ONE face offers. What it
+    has nothing to say about is a face that offers NONE — a countersink's
+    cone, met only at its apex, which is a touch; an O-ring gland's ring
+    torus, which never crosses its own axis at all. Round 7 does not
+    change a rule here; it gives the caller something to do when this
+    function comes back empty-handed, which is to step ACROSS that face
+    and ask the next one. See :func:`_across_a_relief`, which then calls
+    this again for the second ring — so a crossing beyond a relief is
+    judged by exactly the rules above, with the relief's own rim as its
+    mouth.
     """
     sign = -1.0 if at_low else 1.0
 
@@ -3554,6 +3655,414 @@ def _root_for_end(
     return min(live or roots, key=lambda root: abs(root[0] - t_edge))
 
 
+def _lateral_reach(shape, origin, direction, anchor_t: float) -> Optional[float]:
+    """How far from the bore's AXIS a face or an edge reaches, at its widest.
+
+    A bounding box taken in the bore's own frame — the same frame and the
+    same ``AddOptimal`` :func:`_face_axial_span` uses, read in the other
+    two directions. ``max(|x|, |y|)`` and not ``hypot`` of the two,
+    because the frame's X direction is an arbitrary choice of OCCT's and
+    no single lateral coordinate of it means anything: what is wanted is
+    a RADIUS, and on a shape that goes the whole way round this axis the
+    box is ``[-R, R]`` in both directions and ``max(|x|, |y|)`` is
+    exactly that radius.
+
+    EXACT FOR A FULL TURN, and every relief the one caller
+    (:func:`_opens_outward`) asks about is one: a countersink's cone, a
+    chamfer's, a spherical dish, a gland's torus. OCCT splits some of
+    them into several faces — a torus at its equator, which is a cut in
+    Z — but not into sectors, and the caller pools the whole feature
+    anyway. On a partial sweep this reads LOW, by at most ``sqrt(2)``: a
+    lone point at 45° in the frame's own X-Y fills a box half its own
+    radius on each side. That direction is stated rather than defended —
+    it makes a feature look narrower than it is, so the flare test
+    accepts where it might have refused, and the flare test accepting is
+    the LONGER reading. The one-sided refusals in
+    :func:`_across_a_relief` all fail short; this is the one measurement
+    in that walk whose error would fail long, and it cannot arise on a
+    surface of revolution about the bore's own axis.
+
+    The TRIMMED shape, not the carrier, and here that is the opposite
+    choice from :func:`_face_axial_span`'s — deliberately, because the
+    question is the opposite. That one asks how far a face's own SURFACE
+    could bound the solid, and a dome's crown lies outside its own trim.
+    This one asks how WIDE the feature that was actually cut is, which is
+    a property of the cut and not of the carrier: a countersink's cone is
+    built by OCCT out to a tool height nobody drilled, and its carrier is
+    Ø20 where the countersink is Ø14.
+
+    ``None`` where OCCT will not give a box, which the caller reads as no
+    opinion.
+    """
+    try:
+        anchor = _point_on_axis(origin, direction, anchor_t)
+        frame = gp_Trsf()
+        frame.SetTransformation(
+            gp_Ax3(
+                gp_Pnt(anchor[0], anchor[1], anchor[2]),
+                gp_Dir(direction[0], direction[1], direction[2]),
+            )
+        )
+        moved = BRepBuilderAPI_Transform(shape, frame, True).Shape()
+        box = Bnd_Box()
+        BRepBndLib.AddOptimal_s(moved, box, True, True)
+    except Exception:  # noqa: BLE001 — a shape OCCT will not bound has no reach
+        return None
+    if box.IsVoid():  # pragma: no cover — a shape with no geometry
+        return None
+    x_lo, y_lo, _t_lo, x_hi, y_hi, _t_hi = box.Get()
+    return max(abs(x_lo), abs(x_hi), abs(y_lo), abs(y_hi))
+
+
+def _opens_outward(relief, rim, origin, direction, anchor_t: float) -> bool:
+    """Is ``relief`` a feature the DRILL CAME IN THROUGH, or one it ran into?
+
+    This is the one thing the geometry does not hand over, and the reason
+    it has to be asked at all is worth stating plainly, because it looks
+    at first like a defect in the rule rather than a fact about parts.
+
+    A countersink at a bore's mouth and a spherical BREAKOUT at its far
+    end are MIRROR IMAGES. ``spherical_mouth_undercut_bore`` is a plate
+    with a Ø4 bore and a sphere fused into the cutter at the top face;
+    ``far_opening_through_bore`` is a plate with a Ø8 bore and a sphere
+    fused into the cutter near the bottom face. Reflect one and you have
+    the other's construction. Every question that can be put to the shape
+    alone answers the same for both — where the relief's rim is, whether
+    the axis has metal anywhere near it, how wide the void is at the
+    drill's own radius, which side the solid is on, whether the bore's
+    own wall reaches the part's face. They are pinned to DIFFERENT
+    readings — 10.632 measured from the plate's face, and 12.0 measured
+    to where the drill stops — because the depth convention has two
+    different data at the two ends of one hole (ADR-0112, "The depth
+    convention"): the part FACE where the travel starts, the deepest
+    reach where it ends. So something has to say which end of the bore
+    this is, and no rule about where the feature SITS can.
+
+    What tells them apart is what could have MADE them. A relief the
+    drill came in through was cut by a tool travelling down this same
+    axis — a countersink, a chamfer, a spherical dish — and such a tool
+    cannot leave a feature wider inside than the opening it comes in
+    through. A breakout is the bore running into a cavity made some other
+    way, and it bulges: ``far_opening_through_bore``'s sphere is Ø13.3 at
+    its equator and Ø12.2 where it breaks the face.
+
+    So: the widest point of the WHOLE relief — every face the walk
+    crossed, because OCCT splits a torus at its own equator and a relief
+    is a feature rather than a face — against the widest point of the rim
+    it opens through. Measured over the committed corpus, the two
+    readings and the gap between them:
+
+    - every mouth relief is exactly its own rim — 7.0 against 7.0 on
+      three countersinks, 5.5 on a chamfer, 2.556 on the spherical dish —
+      to the bit on five of the seven rows and 8.9e-16 mm on the other
+      two, which is a ULP of the figure and not a shape;
+    - every breakout stands 0.062 mm to 0.557 mm proud of its own rim,
+      the narrowest being ``angled_far_opening_through_bore``, where the
+      part is tipped and the rim is an ellipse;
+    - an O-ring gland stands 3.0 mm proud of its own, which is why it is
+      the material rule and not this one that finds a gland's floor.
+
+    :data:`SURFACE_CONFUSION_MM` is the slack, and the measurement above
+    is what it is judged by rather than a guess: it sits **five and a
+    half orders below the nearest breakout and eight above the widest
+    flare**, so any figure across those eight decades separates the same
+    two sets and there is nothing here to tune.
+    ``test_d19r7_the_flare_test_is_measured_not_tuned`` walks both
+    populations rather than asserting the gap.
+
+    ONE-SIDED, and the side is chosen: no answer means "not a mouth
+    relief", which leaves the end where it already was. That is the
+    SHORTER reading, so a wrong refusal under-quotes — the direction
+    ADR-0112's convention is written against. It is one-sided anyway,
+    because the alternative is to fold a cavity into a hole's depth on
+    evidence that has just failed.
+    """
+    if not rim or not relief:  # pragma: no cover — the caller passes both
+        return False
+    widest = None
+    for face in relief:
+        reach = _lateral_reach(face, origin, direction, anchor_t)
+        if reach is None:  # pragma: no cover — a face OCCT will not bound
+            return False
+        widest = reach if widest is None else max(widest, reach)
+    opening = None
+    for edge in rim:
+        reach = _lateral_reach(edge, origin, direction, anchor_t)
+        if reach is None:  # pragma: no cover — an edge OCCT will not bound
+            continue
+        opening = reach if opening is None else max(opening, reach)
+    if opening is None:  # pragma: no cover — as above
+        return False
+    return widest <= opening + SURFACE_CONFUSION_MM
+
+
+def _shared_edges(face, others) -> List:
+    """Every edge ``face`` shares with any of ``others``.
+
+    The bore's MOUTH in a neighbouring face, when ``others`` is the
+    bore's own cylinders: pooled across all of them, because a
+    seam-split bore reaches one cap along four quarter-arcs and the
+    mouth is only a loop when they are held together.
+    """
+    shared: List = []
+    explorer = TopExp_Explorer(face, TopAbs_EDGE)
+    while explorer.More():
+        edge = TopoDS.Edge_s(explorer.Current())
+        explorer.Next()
+        for other in others:
+            inner = TopExp_Explorer(other, TopAbs_EDGE)
+            found = False
+            while inner.More():
+                if edge.IsSame(TopoDS.Edge_s(inner.Current())):
+                    found = True
+                    break
+                inner.Next()
+            if found:
+                shared.append(edge)
+                break
+    return shared
+
+
+def _outward_rims(face, ancestors, own, origin, direction, sign, t_edge, seen):
+    """This face's openings that lead FURTHER OUT, paired with what is beyond.
+
+    An opening is a set of edges shared with ONE other face, pooled the
+    way :meth:`_EndEvidence.note_mouth` pools a mouth — because an
+    exporter may hand the same circle over in several arcs, and a rim is
+    only a loop when they are held together.
+
+    Outward is measured from ``t_edge``, the bore's own mouth, and not
+    from the face just left: a relief is one FEATURE and OCCT may cut it
+    into several faces at parameters of its own choosing. A torus splits
+    at its equator, so a gland's outer rim and its inner rim sit at the
+    SAME axial level, and a step-by-step comparison would stop halfway
+    across a feature it had correctly started to cross.
+    """
+    rims: List[Tuple[object, List]] = []
+    explorer = TopExp_Explorer(face, TopAbs_EDGE)
+    while explorer.More():
+        edge = TopoDS.Edge_s(explorer.Current())
+        explorer.Next()
+        t_rim = _edge_axial_mean(edge, origin, direction)
+        if t_rim is None or sign * (t_rim - t_edge) <= 0.0:
+            continue
+        for neighbour in ancestors.of(edge):
+            if neighbour.IsSame(face) or seen.Contains(neighbour):
+                continue
+            if any(neighbour.IsSame(bore) for bore in own):
+                continue
+            for known, edges in rims:
+                if known.IsSame(neighbour):
+                    if not any(edge.IsSame(other) for other in edges):
+                        edges.append(edge)
+                    break
+            else:
+                rims.append((neighbour, [edge]))
+    return rims
+
+
+def _across_a_relief(
+    face,
+    group,
+    ancestors,
+    origin,
+    direction,
+    at_low,
+    t_edge,
+    bound,
+    anchor_t,
+    material,
+    far,
+) -> List[Tuple[Tuple[float, Tuple[float, float, float]], object, List]]:
+    """What lies BEYOND a face that is not the end of the drill's travel.
+
+    D-19 round 7, and it is ONE mechanism answering the two halves of
+    ADR-0112's depth convention — *a hole's depth is the DRILL's own
+    travel, from the part FACE to the deepest point the drill reaches;
+    what a DIFFERENT operation makes is its own feature and is not folded
+    in.* Both halves were open as backlog items, because both look like
+    the bore ending at its own wall and neither is:
+
+    - **The mouth datum (item 8).** A countersink, a chamfer or a
+      spherical dish at the mouth eats the top of the bore's own
+      cylinder, so the wall stops SHORT of the part's face — at z=17 in a
+      20 mm plate on ``countersunk_blind_bore`` — and the miner measured
+      from there. The drill did not start there; it started at the face.
+      Under-quoting by the full depth of the relief, on the commonest
+      feature in any shop.
+    - **The gland (item 7).** A ring torus NEVER CROSSES ITS OWN AXIS, so
+      an O-ring gland at a bore's end offers no crossing at all, the end
+      falls back to the bore's parametric bound, and the touching vote
+      calls it open: 6.5 THROUGH on a Ø8 bore whose flat floor is at
+      z=12 with metal under it. Short AND the wrong end condition.
+
+    One rule reaches both: **a face the axis does not END on is a
+    different operation's face, so step across it and ask the next one.**
+    A countersink's cone meets the axis at its apex and a TOUCH is not a
+    crossing (:func:`_crossing_normal` is what says so); a dish's two
+    crossings are one in the bore's own hollow and one off the part; a
+    gland's torus has none. All three are the same fact — this face does
+    not bound the drill's travel — and beyond each of them is the face
+    the convention measures to: the part's top plane, the part's top
+    plane, and the pocket's flat floor.
+
+    A WALK AND NOT A STEP, because a relief is a FEATURE and a face is
+    not. OCCT cuts a torus in two at its own equator, so a gland arrives
+    as two faces and the floor is two steps out; the walk crosses faces
+    that offer the axis no end until it reaches one that does, marking
+    each visited so it cannot circle. It stops at the first face that has
+    a crossing to offer — whether or not that crossing then earns the
+    end — so it cannot wander off across the part.
+
+    THREE THINGS ARE ASKED, and none of them is a number anybody chose:
+
+    - **Every rim crossed must SURROUND THE AXIS** —
+      :func:`_mouth_owns_axis`, the round-4 ownership test, put to the
+      relief's openings instead of to the bore's own mouth. The drill
+      went through the opening or it did not. Without it a bore that
+      breaks out of the SIDE of a block picks up the block's side wall —
+      a face parallel to the axis, which crosses nothing and caps nothing
+      — and walks across its outer edges onto whatever the block has:
+      five candidate crossings on ``bore_beside_a_conical_boss`` at 0,
+      10, 20, 25 and 35. A straight edge of a rectangular face has two
+      loose ends and lies flat against the chord between them, so that
+      test refuses it on its own terms, with no special case for planes.
+    - **Then the crossing must be EARNED**, by one of exactly two rules,
+      because the two ends of a hole are measured to two different
+      things:
+
+      * the axis genuinely LEAVES THE METAL there
+        (:meth:`_AxisMaterial.is_exit`) — this is the far end, the
+        deepest point the drill reaches, and it is what finds a gland's
+        floor without folding the gland into the depth. The floor at
+        z=12 has metal under it and the gland's own deepest point at
+        z=10.5 does not, so the drill's 8.0 is measured and the
+        feature's 9.5 is not;
+      * or the relief OPENS OUTWARD (:func:`_opens_outward`) — this is
+        the mouth, and beyond a flare is the part's own face.
+        ``far_opening_through_bore``'s breakout sphere fails both: the
+        plate's bottom face is air on both sides of it, and the sphere is
+        wider than the hole it makes in that face. It stays at 12.0.
+    - **And it must lie OUTWARD OF ``bound``**, the bore's own parametric
+      extent at this end — the number this end falls back to when nothing
+      caps it, and therefore the shortest reading anything here could
+      replace. It makes *a relief can only LENGTHEN a hole* a property of
+      the code rather than a consequence of the two ownership tests, and
+      it matters because the end's winner is chosen by
+      :meth:`_EndEvidence._rim_winner`, which ranks rims by how far OUT
+      their own edges reach: a relief rim landing inside a cap the bore
+      already has would out-rank it and shorten the hole.
+
+      INERT AS SHIPPED, and pinned as inert rather than described as
+      load-bearing — the posture :func:`_void_slack` sets. It was the
+      only thing standing between the corpus and a 40 % under-quote
+      until the mouth-ownership test above went in; with that test asked
+      FIRST, neutering this bound moves nothing on the corpus and nothing
+      on either part it was written for.
+      ``test_d19r7_the_outward_bound_is_hardening_and_is_pinned_as_inert``
+      is that measurement. It is kept because the two are different
+      kinds of claim: ownership says the drill went through this
+      opening, and this says that whatever is found beyond it is further
+      out than the wall the bore itself stands on. The second does not
+      follow from the first, and it is the one whose failure direction
+      is SHORT — the direction ADR-0112's convention is written against,
+      and the direction every other refusal here deliberately fails in.
+
+    REACHED ONLY WHERE A FACE CONTRIBUTED NO CAP, which on an ordinary
+    plate is never. :func:`_walk_caps` memoises the answer per face and
+    per end, because a bore whose mouth an exporter split into 121 edges
+    would otherwise pay for one verdict 121 times.
+    """
+    sign = -1.0 if at_low else 1.0
+    if not _mouth_owns_axis(
+        _shared_edges(face, group.faces), origin, direction
+    ):
+        # THE DRILL DID NOT COME IN THROUGH THIS FACE. Ownership is the
+        # round-4 test and it is asked twice here, of the two openings a
+        # relief has: the bore's own mouth in it, which is this, and each
+        # rim it opens through, below. A face the bore merely breaks out
+        # SIDEWAYS into owns an arc of its mouth and no more, and it is
+        # not on the drill's path at either end.
+        #
+        # Without it a bore that breaks out of the side of a block picks
+        # up the block's side wall — parallel to the axis, so it crosses
+        # nothing and caps nothing — and walks off it onto whatever the
+        # block has. ``bore_beside_a_conical_boss`` reads 15.0 against
+        # 25.0 and ``bore_through_a_domed_shoulder`` 14.83 against
+        # 27.416, at 4.6e+06 mm and 3.2e+06 mm respectively: the walk
+        # reaches a crossing that lands ON the bore's own parametric
+        # bound, so the outward guard below is decided by float noise
+        # rather than by geometry. Asked of the mouth the question is
+        # exact — a straight edge of a rectangular face lies flat against
+        # the chord between its own two ends — and it is asked FIRST, so
+        # nothing downstream has to be well conditioned to refuse it.
+        return []
+    seen = TopTools_IndexedMapOfShape()
+    seen.Add(face)
+    relief = [face]
+    frontier = [face]
+    found: List[Tuple[Tuple[float, Tuple[float, float, float]], object, List]] = []
+    while frontier:
+        current = frontier.pop()
+        for neighbour, rim in _outward_rims(
+            current, ancestors, group.faces, origin, direction, sign, t_edge, seen
+        ):
+            if not _mouth_owns_axis(rim, origin, direction):
+                continue
+            seen.Add(neighbour)
+            outer = max(
+                rim,
+                key=lambda edge: sign * _edge_axial_mean(edge, origin, direction),
+            )
+            t_rim = _edge_axial_mean(outer, origin, direction)
+            roots = [
+                root
+                for root in _cap_axis_intersections(
+                    neighbour, origin, direction, group.radius, anchor_t
+                )
+                if (root[0] <= far if at_low else root[0] >= far)
+            ]
+            picked = (
+                _root_for_end(
+                    roots,
+                    t_rim,
+                    at_low,
+                    group.radius,
+                    _mouth_inward_bound(outer, origin, direction, sign),
+                    material,
+                    neighbour,
+                )
+                if roots
+                else None
+            )
+            if picked is None:
+                # Another face of the same relief — a torus's second half,
+                # a chamfer under a countersink. Keep walking outward.
+                relief.append(neighbour)
+                frontier.append(neighbour)
+                continue
+            if sign * (picked[0] - bound) <= 0.0:
+                continue
+            found.append((picked, neighbour, rim))
+    # THE GATE IS PUT AFTER THE WALK, not inside it, because
+    # :func:`_opens_outward` is asked of the WHOLE relief and the walk is
+    # what finds out what the whole relief is. Judging each candidate as
+    # it arrived would judge it against however much of the feature had
+    # been crossed by then, which is OCCT's explorer order reaching the
+    # answer — the one thing S3 does not allow.
+    return [
+        candidate
+        for candidate in found
+        if (
+            material is not None
+            and material.is_exit(
+                candidate[0][0], sign, _tangency_band(group.radius)
+            )
+        )
+        or _opens_outward(relief, candidate[2], origin, direction, anchor_t)
+    ]
+
+
 def _walk_caps(
     group, ancestors, p_lo, p_hi, material=None
 ) -> Tuple[_EndEvidence, _EndEvidence]:
@@ -3617,6 +4126,12 @@ def _walk_caps(
     mid = 0.5 * (p_lo + p_hi)
     pad = 1e-6
     low, high = _EndEvidence(), _EndEvidence()
+    # What lies beyond a face that offers this end no cap, memoised per
+    # face and per end — see :func:`_across_a_relief`. The answer depends
+    # on nothing else: `t_edge` is one level per end, and every other
+    # argument is a property of the bore.
+    reliefs = TopTools_IndexedMapOfShape()
+    beyond: dict = {}
 
     for cyl_face in group.faces:
         explorer = TopExp_Explorer(cyl_face, TopAbs_EDGE)
@@ -3656,23 +4171,74 @@ def _walk_caps(
                     roots = [
                         root
                         for root in _cap_axis_intersections(
-                            face, origin, direction, group.radius
+                            face, origin, direction, group.radius, mid
                         )
                         if (root[0] <= far if at_low else root[0] >= far)
                     ]
-                    if not roots:
-                        continue
-                    picked = _root_for_end(
-                        roots, t_edge, at_low, group.radius, t_inner, material, face
+                    picked = (
+                        _root_for_end(
+                            roots,
+                            t_edge,
+                            at_low,
+                            group.radius,
+                            t_inner,
+                            material,
+                            face,
+                        )
+                        if roots
+                        else None
                     )
                     if picked is None:
-                        # Every crossing this face offered is nowhere
-                        # near it. The face still stands as a TOUCHING
-                        # neighbour and still votes on openness — it is
-                        # a real wall of the bore — but it has nothing
-                        # to say about WHERE the bore ends, so the end
-                        # falls back to the bore's own parametric bound
-                        # rather than to a point in mid-air.
+                        # THIS FACE IS NOT THE END OF THE DRILL'S TRAVEL.
+                        # It still stands as a TOUCHING neighbour and
+                        # still votes on openness — it is a real wall of
+                        # the bore — but it has nothing to say about
+                        # WHERE the bore ends.
+                        #
+                        # D-19 round 7: so ask what is BEYOND it. A
+                        # countersink, a chamfer, a spherical dish and an
+                        # O-ring gland all land here, and behind each of
+                        # them is the face the depth convention actually
+                        # measures to — see :func:`_across_a_relief`,
+                        # which owns every rule that decides whether
+                        # there is one. Where there is not, the end falls
+                        # back to the bore's own parametric bound as it
+                        # always did, rather than to a point in mid-air.
+                        step = (reliefs.Add(face), at_low)
+                        if step in beyond:
+                            # Asked once per face per end, not once per
+                            # mouth edge: the answer depends on neither,
+                            # and a bore whose mouth an exporter split
+                            # into 121 edges would otherwise pay 121
+                            # bounding boxes for one verdict.
+                            continue
+                        beyond[step] = True
+                        for found, neighbour, rim in _across_a_relief(
+                            face,
+                            group,
+                            ancestors,
+                            origin,
+                            direction,
+                            at_low,
+                            t_edge,
+                            p_lo if at_low else p_hi,
+                            mid,
+                            material,
+                            far,
+                        ):
+                            t_cap, normal = found
+                            for rim_edge in rim:
+                                rim_key = end.note_mouth(neighbour, rim_edge)
+                            end.caps.append(
+                                (
+                                    t_cap,
+                                    neighbour,
+                                    _point_on_axis(origin, direction, t_cap),
+                                    normal,
+                                    rim_key,
+                                    rim[0],
+                                )
+                            )
                         continue
                     t_cap, normal = picked
                     end.caps.append(

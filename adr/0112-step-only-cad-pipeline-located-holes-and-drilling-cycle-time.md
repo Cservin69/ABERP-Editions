@@ -468,9 +468,92 @@ pub located_holes: Vec<LocatedHole>,
 - **Separate `located_holes` field, not a richer `Feature`.** `Feature` is a locked wire contract with a golden (`tests/property.rs`); adding fields would force `#[serde(default)]` on a struct whose point is that all three fields are mandatory. Parallel vector — the same call ADR-0097 made for `critical_feature_tolerances` (`feature_graph.rs:271-278`).
 - **`axis_unit` normalised by the extractor.** The engine "does not second-guess the extractor" (`feature_graph.rs:300-303`). Extractor normalises; engine may assert.
 - **`end_condition: Unknown` is first-class, never a silent default to `Through`.** A blind hole mis-read as through under-counts peck cycles ⇒ under-prices. Unknown is priced conservatively (C.2) and reasoning-logged.
-- **Millimetres, in the part's own coordinate system.** No WCS, no fixture offset — the extractor has no idea where the part sits on a table. Already unit-normalised to MM at read (`extractors/step.py:104`). And in the part's own coordinate system means exactly that: no located-hole value may move when the part is rotated or translated. The miner is held to it by a composed rotation-and-translation sweep over the whole fixture corpus (D-19 rounds 4–5), and from **D-19 round 6 what is claimed is a MEASURED BOUND rather than closure** — rounds 4 and 5 each scoped that sweep by mechanism and each time the next instance was a mechanism not in the bucket. The bound, stated as the ladder that measured it (rungs 1.468× apart, 1e+04 → 1e+09 mm): no rung below **2.15e+07 mm (21.5 km)** moves anything discrete (count, end condition, flat bottom), and at 4 km no depth moves by more than 3.7e-04 mm. Above that a flip does exist, with a named mechanism and a costed fix: `docs/BACKLOG-designed-to-live.md`, D-19 item 9.
-- **`depth_mm` is TOOL TRAVEL — convention A, DECIDED.** Where a bore opens into something wider than itself (an undercut ball seat, a ball-nose pocket, a spherical chamber, a domed floor), depth runs to the **deepest point the tool reaches** — the cavity's pole — not to the last place the hole's own wall is the boundary. Ervin's ruling, on the conservative ground that *we will not lose jobs over it*: between two defensible readings, take the one that never under-quotes. This is what the extractor has always emitted, so nothing moves; what it settles is that C.2's `L` has one meaning and an oracle measuring to the wall disagrees with the convention rather than finding a defect. **Still open at the MOUTH:** depth is measured from the top of the bore's own cylindrical wall, so a countersink or chamfer is not part of `L` (`countersunk_blind_bore` = 11.0, not 14.0). At that end convention A's own logic points the other way — tool travel starts at the part face — so the current reading is the under-quoting one. Slice C must not price a mouth-relief datum until that half is ruled. Full statement and numbers: `docs/BACKLOG-designed-to-live.md`, D-19 item 8.
+- **Millimetres, in the part's own coordinate system.** No WCS, no fixture offset — the extractor has no idea where the part sits on a table. Already unit-normalised to MM at read (`extractors/step.py:104`). And in the part's own coordinate system means exactly that: no located-hole value may move when the part is rotated or translated. The miner is held to it by a composed rotation-and-translation sweep over the whole fixture corpus (D-19 rounds 4–5), and from **D-19 round 6 what is claimed is a MEASURED BOUND rather than closure** — rounds 4 and 5 each scoped that sweep by mechanism and each time the next instance was a mechanism not in the bucket. The bound is stated as the ladder that measured it (rungs 1.468× apart, walked 1e+04 → 1e+11 mm), and it is quoted at the **last rung that was clean under every motion** rather than at the rung where something moved: nothing discrete (count, end condition, flat bottom) moves at or below **3.16e+09 mm (3162 km)**, and no depth moves by more than a micron at or below **4.64e+08 mm (464 km)**. Over exactly the range round 6 walked, 1e+04 → 1e+09 mm, where eleven fixtures used to move something, **none moves anything discrete and two move a depth by more than a micron**. Above those bounds flips exist and are named, not hidden: `docs/BACKLOG-designed-to-live.md`, D-19 items 6 and 9.
+- **`depth_mm` is TOOL TRAVEL — convention A, RATIFIED AT BOTH ENDS.** See *The depth convention* immediately below, which is the statement of record. In one line: a located hole's depth is the DRILL's own travel, from the part FACE to the deepest point the drill reaches, and what a DIFFERENT operation makes is its own feature and is not folded in. That is what C.2's `L` means.
 - **Deliberately NOT in v6:** counterbores, countersinks, threads, tapped-vs-clearance, tool access, hole *groups*. Threads are not reliably recoverable from B-rep without semantic PMI, and guessing "M6 because Ø5.0" is exactly the silent-wrong-value class this codebase refuses (`extractors/step.py:91-98`). See Q5.
+
+### B.2.1 The depth convention (RATIFIED — Ervin, D-19 round 7)
+
+> **A located hole's `depth_mm` is the DRILL's own tool travel: from the
+> part FACE to the deepest point the drill reaches. Anything a DIFFERENT
+> operation makes — a countersink, a chamfer, an O-ring gland, a relief,
+> a breakout cavity — is its own feature and is NOT folded into the hole's
+> depth.**
+
+Ervin's ruling, on the conservative ground that *we will not lose jobs
+over it*: where two readings are defensible, take the one that never
+under-quotes. It closes what the backlog carried as D-19 items 7, 8 and
+9, and all three are **DECIDED and IMPLEMENTED** as of round 7.
+
+The rule has two ends and they are measured to two different things,
+which is the part that had to be ruled rather than derived:
+
+| | datum | what it means |
+|---|---|---|
+| **the mouth** | the part's **FACE** | where the drill's travel starts. A relief cut at the mouth does not SHORTEN the hole. |
+| **the far end** | the deepest point the drill **reaches** | where its travel stops. A cavity or a gland at the far end does not LENGTHEN it. |
+
+Both halves are the same sentence — *the relief is not the hole* — and
+each is the conservative reading at its own end.
+
+**What moved (item 8, the mouth datum).** Depth used to be measured from
+the top of the bore's own cylindrical WALL, so a countersink, a chamfer or
+a spherical dish shortened the hole by the full depth of the relief. That
+is the under-quoting side, and it is the commonest feature in any shop.
+**Seven committed rows across six geometries are re-pinned**, and on the
+four blind ones the `entry_point_mm` moves with the depth, because the
+drill starts at the face:
+
+| fixture | was (bore wall) | now (part face) |
+|---|---|---|
+| `countersunk_blind_bore` | 11.0 | **14.0** |
+| `countersunk_blind_bore_turned` | 11.0 | **14.0** |
+| `countersunk_through_bore` | 17.0 | **20.0** |
+| `countersunk_bore_120` | 18.2679491924 | **20.0** |
+| `chamfered_mouth_bore` | 18.5 | **20.0** |
+| `spherical_mouth_undercut_bore` | 9.0404171401 | **10.632** |
+| `spherical_mouth_undercut_bore_with_a_boss` | 9.0404171401 | **10.632** |
+
+**What did not move (the far end).** A bore opening into something wider
+than itself still ends at that cavity's pole — the undercut ball seats,
+the ball-nose family, the wide spherical chamber, the domed-floor pockets
+— because that is where a tool travelling down the axis stops. The corpus
+has been pinned there since D-19 round 1 and stays. Equally, a bore that
+breaks out INTO a cavity still stops where the drill does:
+`far_opening_through_bore` is 12.0 and not the plate's 20.0.
+
+**What was closed (item 7, the gland).** An O-ring or snap-ring gland at
+a bore's end read **6.5 THROUGH** on a pocket with 12 mm of metal under
+it — short and misclassified, because a ring torus never crosses its own
+axis and so offered no crossing at all. It now reads **8.0 BLIND**: the
+drill's own reach to the flat floor at z=12, with the gland's own deepest
+point at z=10.5 left to the grooving operation that made it. New fixture
+`toroidal_gland_blind_bore.step`.
+
+**How both are implemented.** One mechanism, `_across_a_relief`: *a face
+the drill's axis does not END on is a different operation's face, so step
+across it and ask the next one.* A countersink's cone meets the axis only
+at its apex and a touch is not a crossing; a dish's crossings are one in
+the bore's own hollow and one off the part; a gland's torus has none. What
+lies beyond each is the part's top plane, the part's top plane and the
+pocket's flat floor. What is found there earns the end by one of exactly
+two rules — the axis genuinely leaves the metal (the far end), or the
+relief opens outward and so is one the drill came in through (the mouth).
+
+**The one thing the geometry does not settle**, stated because a reader
+will look for it: a countersink at a mouth and a spherical breakout at a
+far end are **mirror images** — the same construction reflected — and no
+question about where the feature sits tells them apart. What does is what
+could have MADE them: a tool travelling down the bore's own axis cannot
+leave a feature wider inside than the opening it comes in through. On the
+committed corpus every mouth relief is exactly its own rim (0.0 to 8.9e-16
+mm) and every breakout stands 0.062–0.557 mm proud of its own. The slack
+that separates them sits five and a half orders below the nearest breakout
+and eight above the widest flare — eight decades of figures would all
+separate the same two sets.
+
+**Gate.** Slice C may now price off `depth_mm` at both ends. The mouth
+half of the gate is lifted.
 
 ### B.3 Back-compat for stored v2 graphs
 
@@ -575,7 +658,7 @@ Wiring module **`apps/aberp/src/quoting_drilling_rates.rs`**, a direct structura
 
 ### C.2 The formula
 
-Per hole `h`, with `d = h.diameter_mm`, `L = h.depth_mm` — where `L` is **tool travel** per the decided depth convention, B.2:
+Per hole `h`, with `d = h.diameter_mm`, `L = h.depth_mm` — where `L` is **tool travel** per the ratified depth convention, B.2.1 (part FACE to deepest reach, reliefs excluded at both ends):
 
 ```
 feed_mm_per_min = feed_mm_per_min_per_mm_dia · d

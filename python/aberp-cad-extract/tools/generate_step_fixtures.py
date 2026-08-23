@@ -1736,6 +1736,52 @@ def countersunk_blind_bore_turned():
     return _turned(countersunk_blind_bore(), (20.0, 20.0, 10.0), (1, 1, 1), 30.0)
 
 
+# ── D-19 round 7: the two ends of a hole are measured to two things ──────
+#
+# ADR-0112's depth convention: a hole's depth is the DRILL's own travel,
+# from the part FACE to the deepest point the drill reaches, and what a
+# DIFFERENT operation makes is its own feature and is not folded in. The
+# countersinks and the spherical dish above are the mouth half of that
+# and were already committed; this is the far half, and the corpus had no
+# part carrying it.
+
+
+def toroidal_gland_blind_bore():
+    """A Ø8 blind bore with an O-RING GLAND cut into the end of its wall.
+
+    40 x 40 x 20 block. The cutter is a Ø8 cylinder running from z=12 up
+    through the top face, FUSED with a ring torus of major radius 4 — the
+    bore's own radius — and minor radius 1.5, centred on z=12. That is a
+    snap-ring or O-ring gland, the way any hydraulic body carries one,
+    and it is a SECOND OPERATION: cut radially, by a grooving tool, after
+    the drill has been and gone.
+
+    Three levels, and the whole of D-19 item 7 is which of them is the
+    hole's depth:
+
+    - **z=13.5**, where the bore's own cylindrical wall stops, because
+      the gland has eaten the bottom 1.5 mm of it. The miner read here
+      and called the end OPEN: **6.5 THROUGH** in a pocket with 12 mm of
+      metal under it, short AND misclassified. A ring torus never crosses
+      its own axis, so that face offered no crossing, root selection was
+      never asked, and the end fell back to the bore's parametric bound
+      with the touching vote calling it air.
+    - **z=12**, the flat floor the DRILL left, a Ø5 disc in the middle of
+      the gland's own opening. Depth **8.0**. This is the answer.
+    - **z=10.5**, the deepest point of the GLAND, which is 9.5 and is the
+      grooving tool's travel, not the drill's.
+
+    Expected: 1 hole, Ø8.0, depth 8.0, axis (0,0,-1), entry (20,20,20),
+    BLIND, flat_bottom=True. Before D-19 round 7: 6.5 and THROUGH.
+    """
+    block = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 40.0, 40.0, 20.0).Shape()
+    shaft = _cyl(20.0, 20.0, 12.0, 0, 0, 1, 4.0, 13.0)
+    gland = BRepPrimAPI_MakeTorus(
+        gp_Ax2(gp_Pnt(20.0, 20.0, 12.0), gp_Dir(0, 0, 1)), 4.0, 1.5
+    ).Shape()
+    return BRepAlgoAPI_Cut(block, BRepAlgoAPI_Fuse(shaft, gland).Shape()).Shape()
+
+
 FIXTURES = {
     "plate_4_through_holes.step": plate_4_through_holes,
     "blind_hole_flat_bottom.step": blind_hole_flat_bottom,
@@ -1813,6 +1859,8 @@ FIXTURES = {
     "nurbs_far_opening_through_bore.step": nurbs_far_opening_through_bore,
     "far_opening_through_bore_turned.step": far_opening_through_bore_turned,
     "countersunk_blind_bore_turned.step": countersunk_blind_bore_turned,
+    # D-19 round 7: the far end's own relief.
+    "toroidal_gland_blind_bore.step": toroidal_gland_blind_bore,
 }
 
 
