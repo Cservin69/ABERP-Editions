@@ -1357,22 +1357,52 @@ The end-to-end path is exercised in one process on loopback —
 `crates/aberp-portal-agent/tests/e2e_portal.rs` and `e2e_canary.rs` — with
 the real front, the real relay, the real pinned Leg-B handshake, the real
 poll transport and the real relying party. The disguise is diffed against a
-**live nginx** across 36 request classes by
+**live nginx** across 81 request classes by
 `crates/aberp-portal-relay/tests/nginx_differential.rs`.
 
 **What the disguise claims, exactly.** Round 3 narrowed it, because the
 round-2 wording was broader than the code could hold: **no hang, no socket
 desynchronisation, byte-identical on the enumerated common request
-classes**. The **named residual** is status *class* on pathological
-malformed input — nginx answers `501` to an unknown transfer-coding, `413`
-to an over-long `Content-Length`, and a distinct longer `400` to an
-oversized header block, and this relay answers the ordinary `400` to all
-three. Accepted deliberately: the de-anonymising signal is the hang and the
-hang is gone, real nginx deployments vary on those three themselves (they
-are per-site configuration), and byte-parity across nginx's full status
-table is unbounded work. `RESIDUAL_CASES` in the differential test asserts
-what does hold — both servers answer, and both answer promptly. Full
+classes**. Round 4 found a fifth hang and, in the course of closing it,
+found that the residual had been *understated as a closed list of three*.
+
+The fifth hang was the body-side twin of the head-side family: any request
+that **declared a body and then withheld it** — a `Content-Length` with no
+payload, a `Transfer-Encoding: chunked` with no chunk size — made the front
+go silent for the full 60-second body timeout and only then answer, where
+real nginx answers in under a millisecond with its ordinary keep-alive
+page. It was both the de-anonymising tell the disguise exists to remove and
+a one-packet way to pin one of 512 connection slots for a minute. The fix
+is structural rather than a shorter timeout (nginx answers at once
+regardless, so *any* wait is measurable): the body is read only on the one
+path whose answer needs it — the post-knock `/api/` forward, which costs a
+valid knock token to reach — and every other class is answered from the
+head with the body discarded, before the write for whatever already
+arrived and afterwards on nginx's five-second lingering budget for the
+rest.
+
+The **residual** is status *class* on pathological malformed input, and it
+is now stated as a shape rather than a list, because the list was wrong:
+round 4 measured five more divergences nobody had enumerated (lowercase
+method, a control character in the target, `HTTP/1.11`, `Content-Length:
++5`, a `+A` chunk size — the last two also hangs, since Rust's `parse`
+accepts a leading `+` and nginx does not). All five are closed. What is
+claimed now: **promptness holds everywhere, byte-parity holds on the
+enumerated classes, and outside them the status class may differ.**
+`RESIDUAL_CASES` in the differential carries the known remainder and
+asserts of each that both servers answer and both answer promptly. Full
 reasoning in ADR-0115 §2.
+
+**Follow-on, named rather than assumed: the request line is a `&str`, and
+nginx's is bytes.** `GET /no\x80pe` — a high byte in the target — is passed
+through by nginx to its ordinary `404`, and refused here with `400`,
+because `parse_head` requires the whole head to be valid UTF-8. It is a
+genuine status oracle and it is in `RESIDUAL_CASES`. It is *not* fixed in
+round 4 on purpose: closing it means parsing the head at byte level
+throughout, which is a real change to a parser two adversarial rounds have
+cleared, and bundling it behind a hang fix is how a fix becomes a
+regression. The safe shape is a lossy target — a replacement character can
+never match a knock token, which is ASCII — but it wants its own round.
 
 **Follow-on, named rather than assumed: the differential test does not run
 in CI.** It needs a live nginx, CI has none, and until round 3 it *silently

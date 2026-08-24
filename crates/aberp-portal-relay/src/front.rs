@@ -83,6 +83,29 @@ impl Handler for Front {
         Box::pin(self.respond(head, body, peer))
     }
 
+    fn needs_body(&self, head: &RequestHead) -> bool {
+        // The ONLY path on this listener whose answer depends on the
+        // request body is the post-knock `/api/` forward, which hands
+        // the bytes to the Mac. Everything else — the parked 404, a
+        // wrong knock, the shell, a knocked caller asking for a path
+        // the portal does not have — is decided by the head alone.
+        //
+        // That asymmetry is what makes the round-4 body-side hang fix
+        // safe as well as correct: reaching the one body-reading path
+        // costs a valid knock token, so no prober is ever on it, and
+        // every request a prober CAN send is answered from the head
+        // without waiting for a byte it may never send. See
+        // [`crate::http1::serve`].
+        //
+        // The knock is compared here and again in `respond`. That is
+        // deliberate: identical work either way, so the extra
+        // comparison cannot be timed apart from the answer it precedes.
+        let Some((knock, rest)) = split_knock(head.path()) else {
+            return false;
+        };
+        self.broker.knock_matches(knock) && rest.starts_with("/api/")
+    }
+
     fn observe_protocol_error(&self, class: Class, peer: Option<SocketAddr>, hint: Option<&str>) {
         // A malformed request line never produced a `RequestHead`, so
         // there is no method and no path to record — but "somebody sent

@@ -49,7 +49,12 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 rcgen = { workspace = true }
 reqwest = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "macros"] }
+# `test-util` is what gives the hang tests a PAUSED clock. It is the
+# difference between a regression test and a slow one: a sixty-second
+# hold the fix removed costs sixty *virtual* seconds, so reverting the
+# fix fails the suite in milliseconds instead of holding CI for a
+# minute per case. Dev-only — it cannot reach the binary.
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "macros", "test-util"] }
 
 [lints]
 workspace = true

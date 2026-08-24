@@ -154,25 +154,63 @@ Taken one clause at a time:
   bound is set by the *request*, not by the peer's willingness to keep
   typing. A request line is decided at its newline; body framing is
   decided from the head; the head and body budgets are totals armed
-  once, not per-read timers a dripping client can renew forever.
+  once, not per-read timers a dripping client can renew forever. Round
+  4 added the clause that was missing and cost the fifth hang: **an
+  answer that does not depend on the body does not wait for one.**
+  Everything an unauthenticated caller can reach is decided from the
+  head and its body merely discarded — before the write for whatever
+  already arrived, after it on nginx's lingering budget for the rest.
+  Only the post-knock `/api/` forward reads a body, and reaching it
+  costs a valid knock token.
 - **No socket desynchronisation.** Bodies are drained or the connection
   closes. A chunk's terminator is *verified* rather than assumed, so
   the parser and the sender cannot silently disagree about where a
-  chunk ended.
-- **Byte-identical on the enumerated classes.** Thirty-six raw request
+  chunk ended. Answering before the drain finishes does not weaken
+  this: the drain still happens, and a body that does not finish
+  arriving closes the connection instead of keeping it.
+- **Byte-identical on the enumerated classes.** Eighty-one raw request
   forms, listed in `tests/nginx_differential.rs`, diffed against a live
   nginx. That list is the claim; nothing outside it is claimed.
 
-**Named residual: status class on pathological input.** For malformed
-requests outside those classes, nginx reaches for status codes this
-relay does not implement — `501 Not Implemented` for an unknown
-transfer-coding, `413 Request Entity Too Large` for an over-long
-`Content-Length`, and a *distinct, longer* `400` body ("Request Header
-Or Cookie Too Large") for an oversized header block. All three are
-answered here with the ordinary `400`.
+**Residual: status class on pathological input.** For malformed
+requests outside the enumerated classes, nginx may reach for a status
+this relay does not implement — `501 Not Implemented` for a
+transfer-coding it does not support, `413 Request Entity Too Large` for
+an over-long body, and a *distinct, longer* `400` body ("Request Header
+Or Cookie Too Large") for an oversized header block. Those are answered
+here with the ordinary `400`.
 
-This is accepted rather than fixed, and the reasoning is worth stating
-because it is the difference between an honest disguise and a
+**This was written as three named cases, and that was an
+overstatement.** Round 4 measured the boundary instead of re-reading
+it, and found five more status divergences nobody had enumerated: a
+lowercase method (nginx `400`, ours `405`), a tab, NUL, bare CR or DEL
+in the target (nginx `400`, ours `404` — the one place the target's
+*content* changed the answer, in a mimic whose whole claim is that it
+never reads the target), `HTTP/1.11` and its family (nginx serves them
+as 1.x, ours said `505`), `Content-Length: +5` and a `+A` chunk size
+(Rust's `parse` and `from_str_radix` accept a leading `+`; nginx
+accepts neither). The last two were not merely status differences —
+they *parsed*, so each was a withheld-body hang wearing a different
+hat.
+
+All of those are closed, and each is now a case in the differential.
+What replaces "three named cases" is a claim at the strength the code
+actually holds:
+
+> **Promptness holds everywhere. Byte-parity holds on the enumerated
+> classes. Outside them the status class may differ.**
+
+The known remainder is carried in `RESIDUAL_CASES` rather than in this
+prose, so it cannot drift out of date the way the list of three did —
+and it now includes one found while closing the others: a non-UTF-8
+byte in the target, which nginx passes through to its ordinary `404`
+and this parser refuses with `400` because it holds the request line as
+a `&str`. Closing that means parsing the head at byte level, which is a
+real change to a parser two adversarial rounds have cleared, so it is
+carried as a follow-on in D-20 rather than rushed in behind a hang fix.
+
+The residual is accepted rather than fixed, and the reasoning is worth
+stating because it is the difference between an honest disguise and a
 bottomless one:
 
 1. **The de-anonymising signal was the hang, and the hang is gone.** A
@@ -194,6 +232,12 @@ The residual is asserted rather than merely written down:
 `RESIDUAL_CASES` in `tests/nginx_differential.rs` sends each of these to
 both servers and requires that **both answer, and both answer
 promptly** — the status may differ, the response time may not.
+
+That assertion is also what the fifth hang taught: byte-parity alone
+would not have caught it. The old code sent nginx's exact bytes for a
+withheld body — sixty seconds late. So the withheld-body family is
+timed to first byte, not merely diffed, and the connection slot it used
+to pin for a minute is measured against nginx's own five seconds.
 
 **We own the connection below the web framework.** This is the part that
 made the decision real rather than aspirational. Running the front on

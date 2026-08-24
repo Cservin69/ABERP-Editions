@@ -39,9 +39,18 @@
 //! must be identical. [`RESIDUAL_CASES`] is the honest remainder — the
 //! pathological inputs where nginx reaches for a status class this
 //! relay does not implement (`501`, `413`, its distinct oversized-header
-//! `400`). There the assertion is the one the disguise actually rests
-//! on: **a prompt answer, never a hang**. See ADR-0115 §2, "the named
-//! residual".
+//! `400`) or accepts bytes this parser cannot hold. There the assertion
+//! is the one the disguise actually rests on: **a prompt answer, never
+//! a hang**. See ADR-0115 §2.
+//!
+//! # And [`WITHHELD`], because byte-parity is not the whole claim
+//!
+//! The fifth hang primitive sent nginx's *exact bytes* — sixty seconds
+//! late. A diff cannot see that. So the requests that declare a body
+//! and never send it are timed to their first byte against nginx's, and
+//! the connection slot one of them pins is measured against nginx's own
+//! five seconds. Every body-bearing case in [`CASES`] before round 4
+//! sent a COMPLETE body, which is precisely the gap the bug lived in.
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
@@ -104,6 +113,123 @@ const CASES: &[(&str, &[u8])] = &[
     ("404-close bogus chunk size", b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nZZZZ\r\n"),
     ("404-close chunk not CRLF-terminated", b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcZZ0\r\n\r\n"),
     ("404 chunked then pipelined request", b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nGET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+    // ── Bodies that are DECLARED and WITHHELD ───────────────────────
+    //
+    // The gap that let the fifth hang primitive through: every
+    // body-bearing case above sends a COMPLETE body, so none of them
+    // ever asked what happens when the head promises bytes that never
+    // arrive. Each of these used to make the front go silent for the
+    // full 60 s `BODY_TIMEOUT` and only then answer, while nginx
+    // answers in ~0 ms — measured, both servers, on this exact list.
+    //
+    // Note what nginx's answer IS, because it is not what "the body
+    // could not be drained" suggests: the ordinary **keep-alive** 404,
+    // the same 294 bytes as any other 404, with the socket dropped five
+    // seconds later. The prompt answer and the lingering drain are two
+    // different things, and only the first is on the wire.
+    ("404 withheld CL body", b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n"),
+    ("404 withheld CL body, HEAD", b"HEAD /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n"),
+    ("404 partial CL body", b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nab"),
+    ("404 withheld CL body, Connection: close", b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\nConnection: close\r\n\r\n"),
+    ("404 withheld CL body, HTTP/1.0", b"POST /nope HTTP/1.0\r\nHost: x\r\nContent-Length: 10\r\n\r\n"),
+    ("405 withheld CL body", b"FROBNICATE /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n"),
+    ("404 withheld chunk size", b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"),
+    ("404 withheld chunk data", b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab"),
+    ("404 withheld trailer terminator", b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n"),
+    ("400 no Host, withheld body", b"POST /nope HTTP/1.1\r\nContent-Length: 10\r\n\r\n"),
+    ("505 withheld body", b"POST /nope HTTP/2.0\r\nHost: x\r\nContent-Length: 10\r\n\r\n"),
+    // ── A leading `+` is not a number ───────────────────────────────
+    //
+    // `parse::<u64>` and `from_str_radix` both accept one; nginx
+    // accepts neither. The status divergence was the small half — the
+    // large half is that `+5` and `+A` PARSED, so each was also a
+    // withheld-body hang wearing a different hat.
+    ("400 Content-Length with a leading plus", b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: +5\r\n\r\nabcde"),
+    ("404-close chunk size with a leading plus", b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n+A\r\n"),
+    ("404-close chunk size with a leading minus", b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n-A\r\n"),
+    ("404-close chunk size with a leading space", b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n 3\r\nabc\r\n0\r\n\r\n"),
+    ("404 chunk size padded after the digits", b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3 ;a=b\r\nabc\r\n0\r\n\r\n"),
+    ("404 Content-Length with leading zeroes", b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 005\r\n\r\nabcde"),
+    // ── A control character in the target is a 400, not a 404 ───────
+    //
+    // The one class of input where the target's CONTENT changed the
+    // answer, in a mimic whose whole claim is that it never reads the
+    // target. A high byte is passed through, and stays a 404.
+    ("400 tab in target", b"GET /no\tpe HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("400 NUL in target", b"GET /no\0pe HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("400 bare CR in target", b"GET /no\rpe HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("400 DEL in target", b"GET /no\x7fpe HTTP/1.1\r\nHost: x\r\n\r\n"),
+    // ── The method charset is [A-Z_-], not RFC-9110 `token` ─────────
+    ("400 lowercase method", b"get /nope HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("400 mixed-case method", b"Get /nope HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("400 digit in method", b"GET2 /nope HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("400 tilde in method", b"GE~T /nope HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("400 dot in method", b"GE.T /nope HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("405 underscore in method", b"GET_X /nope HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("405 hyphen in method", b"GE-T /nope HTTP/1.1\r\nHost: x\r\n\r\n"),
+    // TRACE and CONNECT are the two verbs nginx singles out: a 405 that
+    // closes, and a 400 from the request-line parser.
+    ("405-close TRACE", b"TRACE /nope HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("405-close CONNECT authority form", b"CONNECT x:443 HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("400 CONNECT with a path target", b"CONNECT /nope HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("400 GET with an authority-form target", b"GET x:443 HTTP/1.1\r\nHost: x\r\n\r\n"),
+    ("405 PUT", b"PUT /nope HTTP/1.1\r\nHost: x\r\n\r\n"),
+    // ── The version grammar, which was wrong in five directions ─────
+    ("404 HTTP/1.11", b"GET /nope HTTP/1.11\r\nHost: x\r\n\r\n"),
+    ("404 HTTP/1.2", b"GET /nope HTTP/1.2\r\nHost: x\r\n\r\n"),
+    ("404 HTTP/1.9", b"GET /nope HTTP/1.9\r\nHost: x\r\n\r\n"),
+    ("404 HTTP/1.01", b"GET /nope HTTP/1.01\r\nHost: x\r\n\r\n"),
+    ("404 HTTP/1.999", b"GET /nope HTTP/1.999\r\nHost: x\r\n\r\n"),
+    // A zero minor is HTTP/1.0 semantics, however it is spelled — which
+    // is what decides keep-alive, so this is a 289-byte close.
+    ("404-close HTTP/1.00", b"GET /nope HTTP/1.00\r\nHost: x\r\n\r\n"),
+    ("400 HTTP/01.1", b"GET /nope HTTP/01.1\r\nHost: x\r\n\r\n"),
+    ("400 HTTP/0.9", b"GET /nope HTTP/0.9\r\nHost: x\r\n\r\n"),
+    ("400 HTTP/1.1000", b"GET /nope HTTP/1.1000\r\nHost: x\r\n\r\n"),
+    ("400 HTTP/1.", b"GET /nope HTTP/1.\r\nHost: x\r\n\r\n"),
+    ("505 HTTP/11.1", b"GET /nope HTTP/11.1\r\nHost: x\r\n\r\n"),
+    ("505 HTTP/1000.1", b"GET /nope HTTP/1000.1\r\nHost: x\r\n\r\n"),
+];
+
+/// The withheld-body family, timed rather than merely diffed.
+///
+/// [`CASES`] proves these are answered with the same BYTES; this list
+/// is where the same inputs are held to the same CLOCK. Byte parity
+/// alone would have been satisfied by the bug: the old code sent
+/// exactly these bytes — sixty seconds late.
+const WITHHELD: &[(&str, &[u8])] = &[
+    (
+        "withheld CL body",
+        b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n",
+    ),
+    (
+        "withheld CL body, HEAD",
+        b"HEAD /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n",
+    ),
+    (
+        "withheld CL body on the 405 path",
+        b"FROBNICATE /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n",
+    ),
+    (
+        "withheld chunk size",
+        b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
+    ),
+    (
+        "withheld chunk data",
+        b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab",
+    ),
+    (
+        "withheld trailer terminator",
+        b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n",
+    ),
+    (
+        "partial CL body",
+        b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nab",
+    ),
+    (
+        "withheld body behind a leading-plus chunk size",
+        b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n+A\r\n",
+    ),
 ];
 
 /// Inputs where our **status class** is knowingly not nginx's.
@@ -130,8 +256,32 @@ const RESIDUAL_CASES: &[(&str, &[u8])] = &[
         b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: xchunked\r\n\r\nabc",
     ),
     (
+        "transfer-coding LIST (nginx 501, ours 400)",
+        b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n",
+    ),
+    (
         "over-long Content-Length (nginx 413, ours 400)",
         b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999\r\n\r\n",
+    ),
+    // A chunk larger than `MAX_REQUEST_BODY`. Same status as nginx —
+    // it has not seen the body yet either — but we mark the connection
+    // unreusable where nginx keeps it alive, because we have already
+    // decided we will not drain it. `client_max_body_size` is per-site
+    // configuration, so there is no single nginx answer to match.
+    (
+        "over-long chunk (same 404, ours closes where nginx keeps alive)",
+        b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n200000\r\n",
+    ),
+    // Found in round 4 while closing the control-character oracle, and
+    // named here rather than quietly left out: nginx's request line is
+    // BYTES, ours is a `&str`, so a high byte in the target that nginx
+    // passes through to its ordinary 404 is a 400 here. Closing it
+    // means parsing the head at byte level — a real change to the
+    // parser round 3 cleared, not a one-liner — so it is carried as a
+    // follow-on in D-20 rather than rushed in behind this fix.
+    (
+        "non-UTF-8 byte in the target (nginx 404, ours 400)",
+        b"GET /no\x80pe HTTP/1.1\r\nHost: x\r\n\r\n",
     ),
 ];
 
@@ -185,6 +335,44 @@ fn exchange(port: u16, raw: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&chunk[..n]);
     }
     out
+}
+
+/// Time to the FIRST response byte, and the bytes that came with it.
+///
+/// Distinct from [`exchange`], which reads to EOF: the withheld-body
+/// answers are `keep-alive`, so "read to EOF" would be timing the
+/// lingering drain rather than the answer. The answer is the tell.
+fn first_byte(port: u16, raw: &[u8]) -> (Vec<u8>, Duration) {
+    let started = std::time::Instant::now();
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
+        return (Vec::new(), started.elapsed());
+    };
+    s.set_read_timeout(Some(PROMPT)).ok();
+    if s.write_all(raw).is_err() {
+        return (Vec::new(), started.elapsed());
+    }
+    let mut chunk = [0u8; 8192];
+    match s.read(&mut chunk) {
+        Ok(n) if n > 0 => (chunk[..n].to_vec(), started.elapsed()),
+        _ => (Vec::new(), started.elapsed()),
+    }
+}
+
+/// How long a server holds the connection slot for a body that never
+/// arrives — measured from the request to the close.
+fn time_to_close(port: u16, raw: &[u8], patience: Duration) -> Option<Duration> {
+    let started = std::time::Instant::now();
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(patience)).ok();
+    s.write_all(raw).ok()?;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) => return Some(started.elapsed()),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
 }
 
 /// The status line of a response, for the residual report.
@@ -337,6 +525,65 @@ fn our_front_is_byte_identical_to_a_live_nginx_across_every_request_class() {
     println!(
         "\nall {} request classes are byte-identical to nginx",
         CASES.len()
+    );
+
+    // ── The withheld body, held to the CLOCK as well as the bytes ───
+    //
+    // The fifth hang primitive, and the reason this section exists at
+    // all: byte parity is not enough when the bug SENDS THE RIGHT BYTES
+    // and merely sends them a minute late.
+    println!("\nwithheld bodies — the answer is prompt, the drain is what lingers:");
+    for (name, raw) in WITHHELD {
+        let (theirs, nginx_took) = first_byte(nginx.port, raw);
+        let (mine, our_took) = first_byte(ours, raw);
+        assert!(
+            !theirs.is_empty(),
+            "{name}: nginx itself said nothing — the case no longer probes what it claims to"
+        );
+        assert!(
+            !mine.is_empty(),
+            "{name}: WE said nothing inside {PROMPT:?}. This is the exact shape of the \n\
+             de-anonymising tell: nginx answered in {nginx_took:?}, and a host that goes \n\
+             silent where every other server on the internet answers has identified itself."
+        );
+        assert!(
+            our_took < PROMPT,
+            "{name}: our first byte took {our_took:?} — nginx took {nginx_took:?}. \n\
+             Waiting for a body before deciding an answer that never depended on it is \n\
+             the whole bug, and shortening the body timeout does not fix it."
+        );
+        println!(
+            "  ok   {name}\n         nginx: {} ({nginx_took:?})\n         ours : {} ({our_took:?})",
+            status_of(&theirs),
+            status_of(&mine)
+        );
+    }
+
+    // And the slot: a connection that declares a body and withholds it
+    // must be given up on the lingering budget, not held for the body
+    // one. It used to cost one packet to pin one of `MAX_CONNECTIONS`
+    // for a full minute; nginx gives up after five seconds and so do
+    // we. The bound is generous either side of both, so it cannot pass
+    // by accident — but it is four times under the 60 s this cost.
+    const SLOT: Duration = Duration::from_secs(15);
+    let raw = &b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n"[..];
+    let theirs = time_to_close(nginx.port, raw, SLOT);
+    let mine = time_to_close(ours, raw, SLOT);
+    assert!(
+        theirs.is_some(),
+        "nginx did not give the slot up inside {SLOT:?} — the case no longer probes what it claims to"
+    );
+    let mine = mine.unwrap_or_else(|| {
+        panic!(
+            "we held the connection slot for more than {SLOT:?} on a body that was never \n\
+             sent, where nginx let go after {:?}. That is a one-packet slot-exhaustion \n\
+             primitive against MAX_CONNECTIONS.",
+            theirs.unwrap_or_default()
+        )
+    });
+    println!(
+        "\n  ok   the withheld-body slot frees\n         nginx: {:?}\n         ours : {mine:?}",
+        theirs.unwrap_or_default()
     );
 
     // ── The named residual, asserted rather than asserted-away ──────

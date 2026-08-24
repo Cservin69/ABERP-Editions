@@ -53,6 +53,15 @@ impl Handler for AgentLeg {
         Box::pin(self.respond(head, body))
     }
 
+    fn needs_body(&self, head: &RequestHead) -> bool {
+        // Both endpoints are `POST`s carrying a JSON document, and
+        // neither can be answered without it. Anything else on this
+        // listener is the parked 404, which the head settles — so a
+        // peer that somehow got past the pinning still cannot hold a
+        // slot by declaring a body it never sends.
+        head.method == "POST" && (head.path() == POLL_PATH || head.path() == DELIVER_PATH)
+    }
+
     fn observe_protocol_error(
         &self,
         _class: Class,
