@@ -1357,8 +1357,9 @@ The end-to-end path is exercised in one process on loopback —
 `crates/aberp-portal-agent/tests/e2e_portal.rs` and `e2e_canary.rs` — with
 the real front, the real relay, the real pinned Leg-B handshake, the real
 poll transport and the real relying party. The disguise is diffed against a
-**live nginx** across 81 request classes by
-`crates/aberp-portal-relay/tests/nginx_differential.rs`.
+**live nginx** across 101 request classes by
+`crates/aberp-portal-relay/tests/nginx_differential.rs`, which also pins
+fifteen prefixes both servers must answer with silence.
 
 **What the disguise claims, exactly.** Round 3 narrowed it, because the
 round-2 wording was broader than the code could hold: **no hang, no socket
@@ -1392,6 +1393,22 @@ enumerated classes, and outside them the status class may differ.**
 `RESIDUAL_CASES` in the differential carries the known remainder and
 asserts of each that both servers answer and both answer promptly. Full
 reasoning in ADR-0115 §2.
+
+**Follow-on, named rather than assumed: four enumerated status
+divergences, and one configuration question.** Round 5's adversarial
+measured four more places the two parsers disagree about validity, in
+both directions: a repeated space in the request line (nginx 404, ours
+400), a header line with no colon (nginx ignores it and 404s, ours
+400), and a NUL or bare CR in a header *value* (nginx 400, ours accepts
+and 404s). All four are prompt, all four are now in `RESIDUAL_CASES`,
+and none is fixed here — the round that closes them should be the round
+that adversarially reviews them, not one that bundles them behind a
+hang fix. Separately, and needing a human decision rather than a patch:
+**`GET /`**. The differential's fixture nginx has an empty root, so `/`
+is a **403**; a vhost parked on the stock `index.html` would be a
+**200**; ours is a `404` whatever the path. `/` is the likeliest
+request a scanner sends, so what the production vhost is actually
+parked as is a deployment decision that should be made deliberately.
 
 **Follow-on, named rather than assumed: the request line is a `&str`, and
 nginx's is bytes.** `GET /no\x80pe` — a high byte in the target — is passed

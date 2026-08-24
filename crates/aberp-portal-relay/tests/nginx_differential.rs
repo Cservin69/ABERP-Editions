@@ -98,9 +98,42 @@ const CASES: &[(&str, &[u8])] = &[
     // The same family: a complete request line that will never be
     // followed by a blank line, because it will never be followed by
     // anything. nginx answers each of these instantly.
-    ("400 bad request line, unterminated", b"NOT A VALID REQUEST LINE\r\n"),
-    ("400 space in target, unterminated", b"GET /no pe HTTP/1.1\r\n"),
-    ("505 HTTP/9.9, unterminated", b"GET /nope HTTP/9.9\r\n"),
+    //
+    // These three were named "unterminated" and were nothing of the
+    // sort — they end in `\r\n`, which is the very newline the parser
+    // keys on, so they answered instantly while the real case behind
+    // them hung for sixty seconds. Renamed to what they actually are,
+    // and the LF-less family they were standing in for is below.
+    ("400 bad request line, no blank line", b"NOT A VALID REQUEST LINE\r\n"),
+    ("400 space in target, no blank line", b"GET /no pe HTTP/1.1\r\n"),
+    ("505 HTTP/9.9, no blank line", b"GET /nope HTTP/9.9\r\n"),
+    // ── Request lines with NO `\n` ANYWHERE ─────────────────────────
+    //
+    // The sixth hang primitive. nginx rejects a line it can already
+    // prove wrong at the offending BYTE — it never waits for a
+    // terminator to do it — and each of these used to be a 60-second
+    // silent hold that the canary never even saw. `GET\rZ` is five
+    // bytes.
+    ("400 garbage line, no LF", b"NOT A VALID REQUEST LINE"),
+    ("400 bare CR after the method", b"GET\rZ"),
+    ("400 bare CR, nothing after", b"GET\r"),
+    ("400 bare CR after a complete line", b"GET /nope HTTP/1.1\rX"),
+    ("400 NUL in target, no LF", b"GET /no\0pe HTTP/1.1"),
+    ("400 tab in target, no LF", b"GET /no\tpe HTTP/1.1"),
+    ("400 DEL in target, no LF", b"GET /no\x7fpe HTTP/1.1"),
+    ("400 ctrl in target, no LF", b"GET /no\x01pe HTTP/1.1"),
+    ("400 space in target, no LF", b"GET /no pe HTTP/1.1"),
+    ("400 fourth field, no LF", b"GET /nope HTTP/1.1 junk"),
+    ("400 authority form on GET, no LF", b"GET x:44"),
+    ("400 lowercase method, no LF", b"get /nope HTTP/1.1"),
+    ("400 malformed version, no LF", b"GET /nope HTTP/x"),
+    ("400 zero major, no LF", b"GET /nope HTTP/0"),
+    ("400 leading-zero major, no LF", b"GET /nope HTTP/01"),
+    ("400 not HTTP at all, no LF", b"GET /nope HTTPX"),
+    ("400 trailing junk in version, no LF", b"GET /nope HTTP/1x"),
+    ("505 unsupported major, no LF", b"GET /nope HTTP/9"),
+    ("505 two-digit major, no LF", b"GET /nope HTTP/10"),
+    ("505 HTTP/2.0, no LF", b"GET /nope HTTP/2.0"),
     // Body framing the head can settle on its own.
     ("400 duplicate Content-Length", b"POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc"),
     ("400 Content-Length and chunked", b"POST /nope HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n0\r\n\r\n"),
@@ -282,6 +315,42 @@ const RESIDUAL_CASES: &[(&str, &[u8])] = &[
     (
         "non-UTF-8 byte in the target (nginx 404, ours 400)",
         b"GET /no\x80pe HTTP/1.1\r\nHost: x\r\n\r\n",
+    ),
+    // ── Enumerated in round 5's adversarial, measured here ──────────
+    //
+    // The lesson of the `+` in a `Content-Length` is that an
+    // unenumerated divergence is where the next hang hides, so these
+    // are written down and held to the promptness bound rather than
+    // left latent. Each is a place the two parsers disagree about
+    // VALIDITY — in both directions, which is what makes them
+    // fingerprints rather than mere strictness.
+    (
+        "repeated space in the request line (nginx 404, ours 400)",
+        b"GET  /nope HTTP/1.1\r\nHost: x\r\n\r\n",
+    ),
+    (
+        "header line with no colon (nginx ignores it and 404s, ours 400)",
+        b"GET /nope HTTP/1.1\r\nHost: x\r\nBadHeaderNoColon\r\n\r\n",
+    ),
+    (
+        "NUL in a header value (nginx 400, ours accepts and 404s)",
+        b"GET /nope HTTP/1.1\r\nHost: x\r\nX: a\0b\r\n\r\n",
+    ),
+    (
+        "bare CR in a header value (nginx 400, ours accepts and 404s)",
+        b"GET /nope HTTP/1.1\r\nHost: x\r\nX: a\rb\r\n\r\n",
+    ),
+    // Not a parser divergence at all — a CONFIGURATION one, and the
+    // only case in this file whose nginx answer is decided by the
+    // fixture rather than by nginx. This test's parked vhost has an
+    // EMPTY root, so `/` is a 403; a parked vhost with the stock
+    // `index.html` would be a 200, and ours is a 404 whatever the
+    // path. Recorded because `/` is the single likeliest request a
+    // scanner sends, and because what the production vhost is parked
+    // as is a deployment decision this crate cannot make for it.
+    (
+        "the root path (fixture nginx 403, ours 404 — config-dependent)",
+        b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     ),
 ];
 
@@ -604,12 +673,15 @@ fn our_front_is_byte_identical_to_a_live_nginx_across_every_request_class() {
         .collect();
 
     for (name, raw) in residual {
-        let started = std::time::Instant::now();
-        let theirs = exchange(nginx.port, raw);
-        let nginx_took = started.elapsed();
-        let started = std::time::Instant::now();
-        let mine = exchange(ours, raw);
-        let our_took = started.elapsed();
+        // Timed to the FIRST byte, not to EOF. Several of these are
+        // answered `keep-alive` by one side or the other, and reading
+        // to EOF there measures the probe's own patience rather than
+        // the server's — it reports ~700 ms for an answer that arrived
+        // in 200 µs, which is both meaningless and enough to fail the
+        // bound. The same distinction the withheld-body family is
+        // built on.
+        let (theirs, nginx_took) = first_byte(nginx.port, raw);
+        let (mine, our_took) = first_byte(ours, raw);
 
         assert!(
             !theirs.is_empty(),
@@ -643,6 +715,23 @@ fn our_front_is_byte_identical_to_a_live_nginx_across_every_request_class() {
     for (name, raw) in [
         ("partial head", &b"GET /nope HTTP/1.1\r\nHost: x\r\n"[..]),
         ("nothing at all", b""),
+        // The other half of the sixth hang, and not optional: a host
+        // that ANSWERS where nginx waits has identified itself just as
+        // surely as one that waits where nginx answers. Every one of
+        // these is a request-line prefix that could still become valid.
+        ("a valid line, no terminator", b"GET /nope HTTP/1.1"),
+        ("mid-version", b"GET /nope HTTP/1."),
+        ("mid-major", b"GET /nope HTTP/1"),
+        ("mid-literal", b"GET /nope HTT"),
+        ("mid-target", b"GET /no"),
+        ("mid-method", b"GE"),
+        ("an underscore method", b"GET_X /nope"),
+        ("absolute form, one slash so far", b"GET http:/"),
+        ("absolute form", b"GET http://x/p"),
+        ("a bare host, no colon yet", b"GET x"),
+        ("a trailing space", b"GET /nope HTTP/1.1 "),
+        ("the CR of a line it has", b"GET /nope HTTP/1.1\r"),
+        ("a four-digit zero minor", b"GET /nope HTTP/1.0000"),
     ] {
         assert!(
             exchange(nginx.port, raw).is_empty(),

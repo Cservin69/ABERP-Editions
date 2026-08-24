@@ -39,22 +39,30 @@
 //! parity with nginx", which is broader than this code holds and
 //! broader than it needs to be.
 //!
-//! *No hang* is the load-bearing half, and it is the half rounds 3 and
-//! 4 had to fix. Five inputs each bought a ~60-second **silent** hold
-//! for the price of one short line: a real HTTP/0.9 request, a
+//! *No hang* is the load-bearing half, and it is the half rounds 3, 4
+//! and 5 had to fix. Six inputs each bought a ~60-second **silent**
+//! hold for the price of one short line: a real HTTP/0.9 request, a
 //! `Transfer-Encoding` that merely *contained* `chunked`, a chunked
 //! trailer section that never terminates, an endless stream of leading
-//! CRLFs — and, on the body side, **any request that declares a body
-//! and then withholds it**. Each was worse than a wrong answer. Real
-//! nginx answers all five in microseconds — measured — so the hang
-//! identified the host outright, and each returned before
-//! `observe_protocol_error`, so the canary never saw the probe that
-//! found it. Four rules keep them dead:
+//! CRLFs, **any request that declares a body and then withholds it**,
+//! and **any doomed request line that carries no `\n`** — `GET\rZ`, five
+//! bytes. Each was worse than a wrong answer. Real nginx answers all
+//! six in microseconds — measured — so the hang identified the host
+//! outright, and each returned before `observe_protocol_error`, so the
+//! canary never saw the probe that found it. Four rules keep them
+//! dead:
 //!
-//! 1. **A request line is decided at its newline.** Only HTTP/1.0 and
-//!    1.1 have a header block to wait for. Everything else — 0.9, an
-//!    unsupported version, a line that can never parse — is complete
-//!    when the line is.
+//! 1. **A request line is decided as soon as it CAN be — which is
+//!    usually before its newline, and sometimes before its last
+//!    byte.** Only HTTP/1.0 and 1.1 have a header block to wait for;
+//!    everything else is complete when the line is. But "when the
+//!    line is" was still too late, and that was the sixth primitive:
+//!    a line that can never parse is refused at the offending byte,
+//!    with no terminator required, exactly as nginx's scanner does —
+//!    see [`request_line_prefix_verdict`]. The converse is equally
+//!    load-bearing: a prefix that could still become valid is waited
+//!    for in silence, because answering where nginx waits is the same
+//!    tell pointing the other way.
 //! 2. **Body framing is decided from the head**, before a byte of body
 //!    is read. Every way of disagreeing about framing is answered
 //!    immediately rather than discovered halfway through a decoder.
@@ -1240,6 +1248,16 @@ where
         if method_is_impossible(buf) {
             return Err(HeadError::Refuse(Class::BadRequest));
         }
+        // ...and so is the REST of the request line. Round 5 shipped
+        // with only the method checked here, which left the sixth
+        // costume of the same primitive: a request line that can never
+        // parse but contains no `\n` was waited on for the full
+        // `HEADER_TIMEOUT` and then dropped in silence. `GET\rZ` — five
+        // bytes — bought sixty seconds and never reached the canary,
+        // because the timeout path returns `Closed`.
+        if let Some(class) = request_line_prefix_verdict(buf) {
+            return Err(HeadError::Refuse(class));
+        }
         if buf.len() > MAX_HEAD {
             return Err(HeadError::Refuse(Class::BadRequest));
         }
@@ -1334,6 +1352,160 @@ fn request_line_settles_it(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, HeadErr
     let head = buf[..nl].to_vec();
     buf.drain(..=nl);
     Ok(Some(head))
+}
+
+/// The verdict on a request line that has **not finished arriving**.
+///
+/// [`request_line_settles_it`] answers a request line at its newline.
+/// That is not early enough, and round 5 shipped believing it was: the
+/// three cases in the differential named "unterminated" all ended in
+/// `\r\n`, so they carried the very newline the parser keys on and
+/// answered instantly. Strip it — which nginx does not require — and
+/// each was a sixty-second silent hold, answered by nobody and seen by
+/// nothing, since the head timeout returns [`HeadError::Closed`] and
+/// never reaches `observe_protocol_error`.
+///
+/// nginx does not wait for a terminator to reject a line it can
+/// already prove wrong, and it does not reject one it cannot. Measured
+/// against nginx 1.31.4, with **no `\n` anywhere** in the input:
+///
+/// | prefix | nginx |
+/// |---|---|
+/// | `GET\r`, `GET\rZ` | 400 |
+/// | `GET /nope HTTP/1.1\r` | *waits* — the CR of a line it accepted |
+/// | `GET /nope HTTP/1.1\rX` | 400 |
+/// | `GET /no\x01pe …`, `\t`, `\0`, `\x7f` | 400 |
+/// | `GET x:44` | 400 — not origin-form, and not `scheme://` either |
+/// | `GET http:/`, `GET http://x/p`, `GET x` | *waits* |
+/// | `GET /no p` | 400 — a third field that cannot be a version |
+/// | `GET /nope HTTP/1.1 j` | 400 — a fourth field |
+/// | `GET /nope HTTP/1.1 ` | *waits* — an empty fourth field is a space |
+/// | `GET /nope HTTP/9`, `/2`, `/10` | 505 — before the minor arrives |
+/// | `GET /nope HTTP/1`, `/1.`, `/1.1` | *waits* |
+/// | `GET /nope HTTP/0`, `/01`, `/x`, `/1x`, `HTTPX` | 400 |
+///
+/// Both halves matter. Refusing too late is the hang; refusing too
+/// early is the same tell pointing the other way, because a host that
+/// answers where nginx waits has also identified itself. Every "waits"
+/// row above is a case this function must return `None` for, and they
+/// are pinned in the differential's silence section.
+fn request_line_prefix_verdict(buf: &[u8]) -> Option<Class> {
+    // Only the first line is this function's business. If a newline
+    // has arrived, the full parser has already had its say.
+    let line = match buf.iter().position(|b| *b == b'\n') {
+        Some(i) => &buf[..i],
+        None => buf,
+    };
+
+    // A CR is legal in exactly one place: immediately before the LF
+    // that ends a request line nginx has already accepted. That is why
+    // `GET\r` is refused with nothing after it at all, while
+    // `GET /nope HTTP/1.1\r` is waited for — nginx is not waiting for
+    // the line there, it is waiting for the LF of a line it has.
+    let Some(cr) = line.iter().position(|b| *b == b'\r') else {
+        return fields_verdict(line);
+    };
+    // Whatever the bytes before the CR already prove, they prove
+    // regardless of the CR — and "complete" is not "valid". A line
+    // ending `HTTP/9.9` is COMPLETE and answered 505; asking only
+    // whether it PARSES would call it malformed and answer 400.
+    if let Some(class) = fields_verdict(&line[..cr]) {
+        return Some(class);
+    }
+    let complete = std::str::from_utf8(&line[..cr])
+        .ok()
+        .is_some_and(|s| parse_request_line(s).is_ok());
+    if !complete || cr + 1 < line.len() {
+        return Some(Class::BadRequest);
+    }
+    None
+}
+
+/// The space-delimited half of [`request_line_prefix_verdict`], on a
+/// run of bytes known to contain no CR and no LF.
+fn fields_verdict(line: &[u8]) -> Option<Class> {
+    let mut fields = line.split(|b| *b == b' ');
+    // The method's charset is [`method_is_impossible`]'s job, and it
+    // has already run.
+    fields.next();
+    let target = fields.next()?;
+    if let Some(class) = target_prefix_verdict(target) {
+        return Some(class);
+    }
+    let version = fields.next()?;
+    if let Some(class) = version_prefix_verdict(version) {
+        return Some(class);
+    }
+    // A fourth field cannot become part of a request line. An EMPTY
+    // one is a trailing space, which nginx waits on.
+    fields.any(|f| !f.is_empty()).then_some(Class::BadRequest)
+}
+
+/// Whether a partially-arrived target is already impossible.
+fn target_prefix_verdict(target: &[u8]) -> Option<Class> {
+    // A control character is refused at the byte, not at the newline.
+    if target.iter().any(|b| *b < 0x20 || *b == 0x7f) {
+        return Some(Class::BadRequest);
+    }
+    if target.is_empty() || target.first() == Some(&b'/') {
+        return None;
+    }
+    // Not origin-form, so the only thing it can still become is
+    // absolute-form. Measured: `GET x:44` is refused the moment the
+    // byte after the colon is not a slash, while `GET http:/` — one
+    // slash so far — is still waited for.
+    let colon = target.iter().position(|b| *b == b':')?;
+    target[colon + 1..]
+        .iter()
+        .take(2)
+        .any(|b| *b != b'/')
+        .then_some(Class::BadRequest)
+}
+
+/// Whether a partially-arrived version is already impossible — or
+/// already known to be one this server does not speak.
+fn version_prefix_verdict(v: &[u8]) -> Option<Class> {
+    const LIT: &[u8] = b"HTTP/";
+    let bad = Some(Class::BadRequest);
+    if v.len() < LIT.len() {
+        return if LIT.starts_with(v) { None } else { bad };
+    }
+    if !v.starts_with(LIT) {
+        return bad;
+    }
+    let rest = &v[LIT.len()..];
+    let &first = rest.first()?;
+    if !first.is_ascii_digit() || first == b'0' {
+        return bad;
+    }
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    // The major is decided the moment it cannot be 1, which is before
+    // the minor has arrived at all: `HTTP/9` and `HTTP/10` are both
+    // 505 on their own.
+    if first > b'1' || digits > 1 {
+        return Some(Class::VersionNotSupported);
+    }
+    match rest.get(digits) {
+        // Still inside the major digit run.
+        None => return None,
+        Some(b'.') => {}
+        Some(_) => return bad,
+    }
+    // Compared by VALUE, not by digit count: `HTTP/1.0000` is a
+    // perfectly good HTTP/1.0 and nginx serves it, while `HTTP/1.1000`
+    // is malformed. Digits only ever get appended, so a value that has
+    // already passed 999 can never come back under it.
+    let mut minor: u32 = 0;
+    for b in &rest[digits + 1..] {
+        if !b.is_ascii_digit() {
+            return bad;
+        }
+        minor = (minor * 10 + u32::from(b - b'0')).min(1_000);
+    }
+    if minor > 999 {
+        return bad;
+    }
+    None
 }
 
 /// `true` once the buffered bytes prove the request line cannot be
@@ -2229,6 +2401,123 @@ mod tests {
             let got = String::from_utf8_lossy(&out[..out.len().min(want.len())]).to_string();
             assert_eq!(got, want, "input {:?}", String::from_utf8_lossy(raw));
             assert_eq!(seen.len(), 1, "and each one reaches the canary");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hang_6_a_doomed_request_line_with_no_newline_is_not_awaited() {
+        // Round 5 checked only the METHOD before a newline arrived, so
+        // any request line that could never parse but carried no `\n`
+        // was held for the full HEADER_TIMEOUT and then dropped in
+        // SILENCE — never answered, and never seen by the canary,
+        // because the timeout path returns `Closed`. `GET\rZ` is five
+        // bytes. nginx answers every one of these in ~0.1 ms.
+        //
+        // The differential's three "unterminated" cases all ended in
+        // `\r\n`, which is the newline the parser keys on — the test
+        // and the bug passed each other in the dark for the second
+        // time.
+        for (name, raw, want) in [
+            (
+                "garbage line",
+                &b"NOT A VALID REQUEST LINE"[..],
+                &b"HTTP/1.1 400"[..],
+            ),
+            ("bare CR after the method", b"GET\rZ", b"HTTP/1.1 400"),
+            ("bare CR, nothing after it", b"GET\r", b"HTTP/1.1 400"),
+            (
+                "bare CR after a complete line",
+                b"GET /nope HTTP/1.1\rX",
+                b"HTTP/1.1 400",
+            ),
+            (
+                "NUL in the target",
+                b"GET /no\0pe HTTP/1.1",
+                b"HTTP/1.1 400",
+            ),
+            (
+                "tab in the target",
+                b"GET /no\tpe HTTP/1.1",
+                b"HTTP/1.1 400",
+            ),
+            (
+                "DEL in the target",
+                b"GET /no\x7fpe HTTP/1.1",
+                b"HTTP/1.1 400",
+            ),
+            (
+                "space in the target",
+                b"GET /no pe HTTP/1.1",
+                b"HTTP/1.1 400",
+            ),
+            (
+                "a fourth field",
+                b"GET /nope HTTP/1.1 junk",
+                b"HTTP/1.1 400",
+            ),
+            ("authority form on GET", b"GET x:44", b"HTTP/1.1 400"),
+            ("malformed version", b"GET /nope HTTP/x", b"HTTP/1.1 400"),
+            ("zero major", b"GET /nope HTTP/0", b"HTTP/1.1 400"),
+            ("leading zero major", b"GET /nope HTTP/01", b"HTTP/1.1 400"),
+            ("not HTTP at all", b"GET /nope HTTPX", b"HTTP/1.1 400"),
+            // Decided before the minor has arrived at all.
+            ("unsupported major", b"GET /nope HTTP/9", b"HTTP/1.1 505"),
+            ("two-digit major", b"GET /nope HTTP/10", b"HTTP/1.1 505"),
+            (
+                "HTTP/2 in the clear",
+                b"GET /nope HTTP/2.0",
+                b"HTTP/1.1 505",
+            ),
+        ] {
+            let (out, waited) = timed_answer(raw).await;
+            assert!(!out.is_empty(), "{name}: answered with silence");
+            assert!(
+                waited < Duration::from_secs(1),
+                "{name}: took {waited:?}; nginx answers it in ~0.1 ms"
+            );
+            assert!(
+                out.starts_with(want),
+                "{name}: got {:?}",
+                String::from_utf8_lossy(&out[..out.len().min(48)])
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_line_that_could_still_become_valid_is_not_refused_early() {
+        // The other half, and it is not optional: a host that ANSWERS
+        // where nginx waits has identified itself just as surely as one
+        // that waits where nginx answers. Every one of these is a
+        // prefix nginx stays silent on — measured — so refusing them
+        // eagerly would trade the sixth hang for a sixth tell.
+        for (name, raw) in [
+            (
+                "a valid line, no terminator yet",
+                &b"GET /nope HTTP/1.1"[..],
+            ),
+            ("mid-version", b"GET /nope HTTP/1."),
+            ("mid-major", b"GET /nope HTTP/1"),
+            ("mid-literal", b"GET /nope HTT"),
+            ("mid-target", b"GET /no"),
+            ("mid-method", b"GE"),
+            ("an underscore method", b"GET_X /nope"),
+            ("absolute form, one slash so far", b"GET http:/"),
+            ("absolute form", b"GET http://x/p"),
+            ("a bare host, no colon yet", b"GET x"),
+            ("a trailing space", b"GET /nope HTTP/1.1 "),
+            ("the CR of a line it has", b"GET /nope HTTP/1.1\r"),
+            ("a four-digit zero minor", b"GET /nope HTTP/1.0000"),
+        ] {
+            let (mut client, server) = tokio::io::duplex(4096);
+            let task = tokio::spawn(serve(server, None, Arc::new(Stub::default())));
+            client.write_all(raw).await.expect("write");
+            let mut byte = [0u8; 1];
+            let spoke = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte)).await;
+            assert!(
+                spoke.is_err(),
+                "{name}: we volunteered {byte:?} where nginx stays silent"
+            );
+            task.abort();
         }
     }
 

@@ -152,11 +152,18 @@ Taken one clause at a time:
 
 - **No hang.** Every parser path answers within a bounded time, and the
   bound is set by the *request*, not by the peer's willingness to keep
-  typing. A request line is decided at its newline; body framing is
-  decided from the head; the head and body budgets are totals armed
-  once, not per-read timers a dripping client can renew forever. Round
-  4 added the clause that was missing and cost the fifth hang: **an
-  answer that does not depend on the body does not wait for one.**
+  typing. A request line is decided as soon as it *can* be — at the
+  offending byte, with no terminator required, which is what round 5's
+  adversarial cost: "decided at its newline" was still too late, and a
+  doomed line carrying no `\n` (`GET\rZ`, five bytes) was a
+  sixty-second silent hold the canary never saw. The converse is
+  equally binding: a prefix that could still become valid is waited for
+  in silence, because answering where nginx waits is the same tell
+  pointing the other way. Body framing is decided from the head; the
+  head and body budgets are totals armed once, not per-read timers a
+  dripping client can renew forever. Round 4 added the clause that was
+  missing and cost the fifth hang: **an answer that does not depend on
+  the body does not wait for one.**
   Everything an unauthenticated caller can reach is decided from the
   head and its body merely discarded — before the write for whatever
   already arrived, after it on nginx's lingering budget for the rest.
@@ -168,9 +175,14 @@ Taken one clause at a time:
   chunk ended. Answering before the drain finishes does not weaken
   this: the drain still happens, and a body that does not finish
   arriving closes the connection instead of keeping it.
-- **Byte-identical on the enumerated classes.** Eighty-one raw request
-  forms, listed in `tests/nginx_differential.rs`, diffed against a live
-  nginx. That list is the claim; nothing outside it is claimed.
+- **Byte-identical on the enumerated classes.** A hundred and one raw
+  request forms, listed in `tests/nginx_differential.rs`, diffed
+  against a live nginx, plus a silence list of fifteen prefixes on
+  which both servers must say **nothing**. That silence list is not
+  decoration: two of the six hang primitives were "we wait where nginx
+  answers", and the fix for the sixth could have traded that for "we
+  answer where nginx waits" without it. Those lists are the claim;
+  nothing outside them is claimed.
 
 **Residual: status class on pathological input.** For malformed
 requests outside the enumerated classes, nginx may reach for a status
