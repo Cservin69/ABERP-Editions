@@ -77,12 +77,13 @@ pub use qc::{
 // ADR-0199 — QC inspection reports + CoC (the REPORTING layer, flat).
 pub use qc::{
     bind_reports_to_dispatch, build_report_lines, compute_disposition, current_drawing_ref,
-    freeze_report, get_drawing_ref, get_report, issue_report, list_drawing_refs, list_report_lines,
-    list_reports_for_dispatch, list_reports_for_wo, record_drawing_ref, record_render,
-    serial_range_of, summarise, void_report, Accountability, AccountabilityCounts,
-    CharacteristicDesignator, CharacteristicType, Disposition, DraftLine, FreezeReportInputs,
-    InspectionMethod, NewPartDrawingRef, PartDrawingRef, QcReport, QcReportKind, QcReportLine,
-    QcReportState, QcReportTemplate, ReportTraceability, ReportUnit,
+    freeze_report, get_drawing_ref, get_report, issuance_chain_ref, issue_report,
+    list_drawing_refs, list_report_lines, list_reports_for_dispatch, list_reports_for_wo,
+    record_drawing_ref, record_render, serial_range_of, summarise, void_report, Accountability,
+    AccountabilityCounts, CharacteristicDesignator, CharacteristicType, Disposition, DraftLine,
+    FreezeReportInputs, InspectionMethod, NewPartDrawingRef, PartDrawingRef, QcReport,
+    QcReportKind, QcReportLine, QcReportState, QcReportTemplate, ReportCustomer,
+    ReportTraceability, ReportUnit,
 };
 
 /// Apply both QA (`V001`) and QC (`V002`) schemas. Idempotent. Extended

@@ -52,6 +52,10 @@ pub enum QcReportError {
     /// This build is not allowed to produce QC reports (ADR-0199 §D9).
     #[error("{0}")]
     NotPermitted(String),
+    /// The report exists but has been VOIDED — there is no valid document
+    /// to hand out. Surfaced as 409, never as bytes.
+    #[error("{0}")]
+    Voided(String),
     /// Everything else — surfaced as 500.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -91,6 +95,14 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// | `state` | on supersede / void |
 /// | `superseded_by_qcr_id` | on supersede |
 ///
+/// Two of the four are now ALSO absent from the rendered page — the
+/// renderer prints neither `state` nor `rendered_sha256` (see
+/// `aberp_qc_pdf::push_header` / `push_footer`), because normalising a
+/// mutable field is only half a fix: forcing `state` to `Issued` is what
+/// let a VOIDED report re-render with a confident ISSUED header. This
+/// function stays as the defence in depth that keeps the hash stable if a
+/// future edit reintroduces either field to the layout.
+///
 /// `dsp_id` is the one that actually bit: a report must be ISSUED before the
 /// gate lets the shipment proceed, so the dispatch id is assigned strictly
 /// after the hash is taken. Rendering it would make **every correctly
@@ -113,6 +125,34 @@ fn canonical_for_render(report: &QcReport) -> QcReport {
     c.state = aberp_qa::QcReportState::Issued;
     c.superseded_by_qcr_id = None;
     c
+}
+
+/// **The ONE way a report becomes bytes.**
+///
+/// Issuance and every later re-render call this and nothing else, so the
+/// two cannot drift: the canonicalisation, the chain reference and the
+/// renderer call all live in a single place. Both used to build
+/// `QcReportInputs` separately, and both hard-coded `chain_reference: ""`
+/// — so every Certificate of Conformance printed `Audit chain ref: —`
+/// directly under a fixed statement promising "the tamper-evident audit
+/// chain entry cited below".
+fn render_canonical(report: &QcReport, lines: &[QcReportLine]) -> Result<Vec<u8>, QcReportError> {
+    let canonical = canonical_for_render(report);
+    // A DRAFT has no `qcr.report_issued` entry yet, so it cites nothing
+    // rather than citing an entry that does not exist. Issuance renders
+    // against a copy whose `issued_at_utc` is already set, so the bytes
+    // hashed at issuance carry the same reference a re-render produces.
+    let chain_reference = if canonical.issued_at_utc.is_some() {
+        aberp_qa::issuance_chain_ref(&canonical.qcr_id)
+    } else {
+        String::new()
+    };
+    aberp_qc_pdf::render(&aberp_qc_pdf::QcReportInputs {
+        report: &canonical,
+        lines,
+        chain_reference: &chain_reference,
+    })
+    .map_err(|e| QcReportError::Other(anyhow!("render QC report: {e}")))
 }
 
 /// What the operator asked for when drafting a report.
@@ -316,6 +356,10 @@ pub fn draft_report(
     let inspections = aberp_qa::list_inspections_for_wo(&guard, tenant.as_str(), &req.wo_id)?;
     let open_ncr =
         open_ncr_against(&guard, tenant.as_str(), &units).map_err(QcReportError::Other)?;
+    // The ONLY read of `partners` on the whole report path. Resolved here,
+    // at freeze, and snapshotted onto the header — see
+    // `aberp_qa::QcReport::customer_name`.
+    let customer = customer_info(&guard, tenant.as_str(), &partner_id)?;
 
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash);
     let session_id = ulid::Ulid::new().to_string();
@@ -338,6 +382,7 @@ pub fn draft_report(
             units: &units,
             open_ncr_against_reported_part: open_ncr,
             traceability: trace,
+            customer: customer.into_snapshot(),
             created_by: operator,
         },
         now,
@@ -373,7 +418,6 @@ pub fn issue_report(
     let report = aberp_qa::get_report(&guard, tenant.as_str(), qcr_id)?
         .ok_or_else(|| QcReportError::NotFound(format!("QC report {qcr_id}")))?;
     let lines = aberp_qa::list_report_lines(&guard, tenant.as_str(), qcr_id)?;
-    let customer = customer_info(&guard, tenant.as_str(), &report.partner_id)?;
 
     // Render against a copy whose issuance stamps are already set, so the
     // bytes hashed here are the bytes a later re-render reproduces. The
@@ -391,14 +435,7 @@ pub fn issue_report(
             .map_err(|e| QcReportError::Other(anyhow!("format issue stamp: {e}")))?,
     );
     to_render.renderer_version = Some(aberp_qc_pdf::QC_PDF_RENDERER_VERSION.to_string());
-    let to_render = canonical_for_render(&to_render);
-    let bytes = aberp_qc_pdf::render(&aberp_qc_pdf::QcReportInputs {
-        report: &to_render,
-        lines: &lines,
-        customer: customer.as_party(),
-        chain_reference: "",
-    })
-    .map_err(|e| QcReportError::Other(anyhow!("render QC report: {e}")))?;
+    let bytes = render_canonical(&to_render, &lines)?;
     let sha = sha256_hex(&bytes);
 
     let ledger_meta = LedgerMeta::new(tenant.clone(), binary_hash);
@@ -434,11 +471,18 @@ pub struct CustomerBlock {
 }
 
 impl CustomerBlock {
-    fn as_party(&self) -> aberp_qc_pdf::QcPartyInfo<'_> {
-        aberp_qc_pdf::QcPartyInfo {
-            name: &self.name,
-            address_line: &self.address_line,
-            purchase_order: &self.purchase_order,
+    /// Into the shape `freeze_report` snapshots onto the header. A blank
+    /// field becomes `None` rather than `Some("")` so the two spellings of
+    /// "absent" cannot produce two different documents.
+    fn into_snapshot(self) -> aberp_qa::ReportCustomer {
+        fn some_if_set(v: String) -> Option<String> {
+            let t = v.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        }
+        aberp_qa::ReportCustomer {
+            name: some_if_set(self.name),
+            address_line: some_if_set(self.address_line),
+            purchase_order: some_if_set(self.purchase_order),
         }
     }
 }
@@ -499,19 +543,32 @@ pub fn render_report(
         .map_err(|e| QcReportError::NotPermitted(e.to_string()))?;
     let report = aberp_qa::get_report(conn, tenant, qcr_id)?
         .ok_or_else(|| QcReportError::NotFound(format!("QC report {qcr_id}")))?;
+    // **A VOIDED report is not rendered at all.**
+    //
+    // The rendered page cannot carry `state` (it is post-issuance-mutable,
+    // and printing it breaks the §D7 pin), so a voided report would come
+    // out looking exactly like a valid issued one — a repudiated document
+    // that still reads as evidence of conformity. Refusing is the honest
+    // answer: the report, its void reason and its superseding id are all
+    // still on `GET /api/qc-reports/:id`, and the void is a chain entry.
+    // Handing an auditor a VOID-stamped copy would be strictly better and
+    // is flagged in the ADR as Phase 2 — it needs the stamp drawn OUTSIDE
+    // the hashed byte-form, which is a renderer change, not a route one.
+    if report.state == aberp_qa::QcReportState::Voided {
+        return Err(QcReportError::Voided(format!(
+            "QC report {qcr_id} was voided{} — no document is issued for it",
+            report
+                .superseded_by_qcr_id
+                .as_deref()
+                .map(|s| format!(" and superseded by {s}"))
+                .unwrap_or_default(),
+        )));
+    }
     let lines = aberp_qa::list_report_lines(conn, tenant, qcr_id)?;
-    let customer = customer_info(conn, tenant, &report.partner_id)?;
 
-    // Hash the SAME shape that was hashed at issuance — see
-    // `canonical_for_render` for which fields are normalised and why.
-    let canonical = canonical_for_render(&report);
-    let bytes = aberp_qc_pdf::render(&aberp_qc_pdf::QcReportInputs {
-        report: &canonical,
-        lines: &lines,
-        customer: customer.as_party(),
-        chain_reference: "",
-    })
-    .map_err(|e| QcReportError::Other(anyhow!("render QC report: {e}")))?;
+    // Hash the SAME shape that was hashed at issuance — ONE helper does
+    // both, so they cannot drift.
+    let bytes = render_canonical(&report, &lines)?;
     let sha = sha256_hex(&bytes);
     // `None` for a DRAFT: it has no pinned hash, so there is nothing to
     // match. Reporting `false` there would flag every legitimate preview as
@@ -609,6 +666,9 @@ mod tests {
             created_at: "2026-08-23T11:00:00Z".into(),
             created_by: "ervin".into(),
             notes: None,
+            customer_name: Some("Prime Aerospace Kft.".into()),
+            customer_address_line: Some("1117 Budapest, Fő utca 1., HU".into()),
+            customer_purchase_order: Some("PO-2026-889".into()),
         }
     }
 

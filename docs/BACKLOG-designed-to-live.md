@@ -870,6 +870,38 @@ pieces with real logic; the rest follows existing templates closely enough
 to be mechanical. Phase 1b: small (one more layout over the same rows).
 Phase 2: medium per transport, and shared with [D-02](#d-02)/[D-16](#d-16).
 
+#### Still owed after Phase 1 (round-2 review, 2026-08-23)
+
+Three items the adversarial pass named that were deliberately NOT closed in
+the round-2 fix. Each is scope, not an oversight.
+
+1. **A WRITER for the `qc/` bundle entry — the AC10 scope gap.** Retention
+   itself is wired: `qcr.report_issued` pins the SHA-256 into the chain, and
+   `aberp-verify` accepts, re-hashes and cross-totals `qc/` entries. What
+   has no producer is the auditor-facing bundle: `qc_archive_path` has zero
+   non-test callers, so no export ever emits a `qc/` file for the verifier
+   to check. Closing it needs the invoice→dispatch→WO→report join that
+   decides which reports belong in an invoice-scoped slice.
+   *Size:* small-to-medium, and it is the last thing between AC10 and a
+   genuinely auditor-ready export.
+2. **`plan_drift` cannot see a characteristic PROMOTED from optional to
+   required.** The gate blocks when a required characteristic is *added*
+   after a releasing report froze, by comparing name sets. It cannot see a
+   promotion, because `qc_report_lines` does not persist `required` —
+   `parse_line_row` reconstructs it as `true` — so the frozen row cannot
+   say whether the characteristic counted toward accountability when it
+   froze. Needs an additive `is_required` column on `qc_report_lines` plus
+   the freeze-side write.
+   *Size:* small.
+3. **A VOID-stamped rendering for auditors.** A voided report is currently
+   refused with a 409 rather than rendered, because `state` cannot appear
+   in the hashed bytes and a voided report would otherwise look exactly
+   like a valid certificate. A VOID-stamped copy is strictly better, but
+   the stamp has to be drawn OUTSIDE the byte-form the SHA is taken over —
+   a renderer change, not a route one.
+   *Size:* small, but it needs a design decision on how the stamp and the
+   hash coexist.
+
 ---
 
 ## Expansion slots on a Live capability

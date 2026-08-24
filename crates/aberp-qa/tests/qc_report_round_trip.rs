@@ -19,7 +19,7 @@ use aberp_qa::{
     record_inspection, update_inspection_plan, Accountability, CharacteristicType, Disposition,
     FreezeReportInputs, InspectionMethod, NewInspectionPlan, NewPartDrawingRef, QcReportKind,
     QcReportState, QcReportTemplate, QcSource, QcWriteContext, RecordInspectionInputs,
-    ReportTraceability, ReportUnit,
+    ReportCustomer, ReportTraceability, ReportUnit,
 };
 use duckdb::Connection;
 use time::format_description::well_known::Rfc3339;
@@ -154,6 +154,11 @@ fn freeze(
                 drawing_rev: Some("C".into()),
                 heat_lot_reference: Some("HL-9911".into()),
                 ..Default::default()
+            },
+            customer: ReportCustomer {
+                name: Some("Prime Aerospace Kft.".into()),
+                address_line: Some("1117 Budapest, Fo utca 1., HU".into()),
+                purchase_order: None,
             },
             created_by: "ervin",
         },
@@ -518,6 +523,7 @@ fn a_coc_only_customer_cannot_be_handed_a_characteristic_table() {
             units: &[],
             open_ncr_against_reported_part: false,
             traceability: ReportTraceability::default(),
+            customer: ReportCustomer::default(),
             created_by: "ervin",
         },
         now(),
@@ -566,9 +572,9 @@ fn report_numbers_are_allocated_in_sequence() {
 
 #[test]
 fn a_new_drawing_revision_supersedes_without_losing_history() {
-    let conn = setup_db();
+    let mut conn = setup_db();
     let rev_b = record_drawing_ref(
-        &conn,
+        &mut conn,
         TEST_TENANT,
         NewPartDrawingRef {
             product_id: "prd_bracket".into(),
@@ -582,7 +588,7 @@ fn a_new_drawing_revision_supersedes_without_losing_history() {
     assert!(rev_b.is_current());
 
     let rev_c = record_drawing_ref(
-        &conn,
+        &mut conn,
         TEST_TENANT,
         NewPartDrawingRef {
             product_id: "prd_bracket".into(),
@@ -613,9 +619,9 @@ fn a_new_drawing_revision_supersedes_without_losing_history() {
 /// double-click must not manufacture a spurious revision event.
 #[test]
 fn recording_the_same_current_revision_is_idempotent() {
-    let conn = setup_db();
+    let mut conn = setup_db();
     let first = record_drawing_ref(
-        &conn,
+        &mut conn,
         TEST_TENANT,
         NewPartDrawingRef {
             product_id: "prd_bracket".into(),
@@ -627,7 +633,7 @@ fn recording_the_same_current_revision_is_idempotent() {
     )
     .unwrap();
     let again = record_drawing_ref(
-        &conn,
+        &mut conn,
         TEST_TENANT,
         NewPartDrawingRef {
             product_id: "prd_bracket".into(),
@@ -651,9 +657,9 @@ fn recording_the_same_current_revision_is_idempotent() {
 /// unfalsifiable claim on a compliance record.
 #[test]
 fn a_drawing_without_a_revision_is_refused() {
-    let conn = setup_db();
+    let mut conn = setup_db();
     let bad = record_drawing_ref(
-        &conn,
+        &mut conn,
         TEST_TENANT,
         NewPartDrawingRef {
             product_id: "prd_bracket".into(),

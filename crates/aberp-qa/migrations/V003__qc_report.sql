@@ -124,7 +124,15 @@ CREATE TABLE IF NOT EXISTS qc_reports (
     superseded_by_qcr_id VARCHAR,
     created_at          VARCHAR NOT NULL,
     created_by          VARCHAR NOT NULL,
-    notes               VARCHAR
+    notes               VARCHAR,
+    -- Customer identity, SNAPSHOT at freeze (§D3(c)). The identity block
+    -- is printed inside the bytes whose SHA-256 is pinned at issuance
+    -- (§D7), so a live `partners` join at render time meant an address
+    -- edit — or a soft-delete — permanently flipped every one of that
+    -- customer's issued reports to "does not match the issued hash".
+    customer_name           VARCHAR,
+    customer_address_line   VARCHAR,
+    customer_purchase_order VARCHAR
 );
 
 -- ── (d) The frozen characteristic lines ─────────────────────────────

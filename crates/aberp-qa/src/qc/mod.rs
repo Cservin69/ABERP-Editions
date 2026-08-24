@@ -53,9 +53,10 @@ pub use drawings::{
 };
 pub use reports::{
     bind_reports_to_dispatch, build_report_lines, compute_disposition, freeze_report, get_report,
-    issue_report, list_report_lines, list_reports_for_dispatch, list_reports_for_wo, record_render,
-    serial_range_of, summarise, void_report, AccountabilityCounts, DraftLine, FreezeReportInputs,
-    QcReport, QcReportLine, ReportTraceability, ReportUnit,
+    issuance_chain_ref, issue_report, list_report_lines, list_reports_for_dispatch,
+    list_reports_for_wo, record_render, serial_range_of, summarise, void_report,
+    AccountabilityCounts, DraftLine, FreezeReportInputs, QcReport, QcReportLine, ReportCustomer,
+    ReportTraceability, ReportUnit,
 };
 pub use vocab::{
     Accountability, CharacteristicDesignator, CharacteristicType, Disposition, InspectionMethod,

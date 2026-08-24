@@ -32,7 +32,8 @@ use aberp_qa::{
     create_inspection_plan, freeze_report, issue_report, list_inspection_plans,
     list_inspections_for_wo, record_inspection, CharacteristicType, Disposition,
     FreezeReportInputs, InspectionMethod, NewInspectionPlan, QcReportKind, QcReportTemplate,
-    QcSource, QcWriteContext, RecordInspectionInputs, ReportTraceability, ReportUnit,
+    QcSource, QcWriteContext, RecordInspectionInputs, ReportCustomer, ReportTraceability,
+    ReportUnit,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -197,6 +198,46 @@ fn measure(conn: &mut Connection, plan_id: &str, part_uid: &str, actual: f64) {
     tx.commit().unwrap();
 }
 
+/// `measure`, but at an explicit instant. `latest_measurement` breaks a
+/// timestamp tie on the ULID `qci_id`, and two ULIDs minted in the same
+/// millisecond order by their RANDOM suffix — so a re-measurement test
+/// that relied on the fixed `now()` would be a coin flip.
+fn measure_at(
+    conn: &mut Connection,
+    plan_id: &str,
+    part_uid: &str,
+    actual: f64,
+    at: OffsetDateTime,
+) {
+    let m = meta();
+    let plan = aberp_qa::get_inspection_plan(conn, T, plan_id)
+        .unwrap()
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    record_inspection(
+        &tx,
+        &ctx(&m),
+        RecordInspectionInputs {
+            plan: &plan,
+            source: QcSource::Manual,
+            source_event_id: None,
+            actual_value: actual,
+            units: "mm".into(),
+            probe_serial: None,
+            last_calibration_at: None,
+            measured_at: at,
+            current_time: at,
+            stale_window_seconds: 86_400,
+            linked_part_uid: Some(part_uid.into()),
+            linked_heat_lot: Some("HL-9911".into()),
+            linked_wo_id: Some("wo-def".into()),
+            recorded_by: "ervin".into(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
 /// Freeze + issue a report for `wo-def`, returning `(qcr_id, disposition)`.
 fn issue_report_for(conn: &mut Connection, units: &[ReportUnit]) -> (String, Disposition) {
     let m = meta();
@@ -217,6 +258,7 @@ fn issue_report_for(conn: &mut Connection, units: &[ReportUnit]) -> (String, Dis
             units,
             open_ncr_against_reported_part: false,
             traceability: ReportTraceability::default(),
+            customer: ReportCustomer::default(),
             created_by: "ervin",
         },
         now(),
@@ -377,6 +419,7 @@ fn a_drafted_report_does_not_release_the_shipment() {
             units: &units,
             open_ncr_against_reported_part: false,
             traceability: ReportTraceability::default(),
+            customer: ReportCustomer::default(),
             created_by: "ervin",
         },
         now(),
@@ -835,4 +878,487 @@ fn a_draft_render_reports_no_pin_rather_than_a_mismatch() {
         aberp::qc_report::render_report(&conn, T, &drafted.report.qcr_id).unwrap();
     assert!(bytes.starts_with(b"%PDF-"), "a draft still previews");
     assert_eq!(matches, None, "a draft has no pin to match");
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// ROUND 2 — a REJECTED part must not ship (the reason the gate exists).
+// ═════════════════════════════════════════════════════════════════════
+
+/// **A stale `accept` must NOT outrank a current `reject`.**
+///
+/// The gate used to release the shipment if ANY issued unbound report
+/// permitted it (`releasing.iter().any(..)`), written for the supersede
+/// case — a corrected report must not stay blocked by the predecessor it
+/// fixed. But `any` is symmetric, and this is the other direction: an
+/// in-tolerance early measurement is issued as `accept`, the part then
+/// FAILS final inspection and a second report is issued as `reject`, and
+/// the shipment went out SHIPPED with both reports bound and no 409.
+///
+/// The fix is that the CURRENT report decides. Note what makes this test
+/// sharp: both reports share a `created_at` (the fixture clock is fixed),
+/// so "current" is decided by `report_number`, not by the timestamp and
+/// not by ULID luck.
+#[test]
+fn a_stale_accept_does_not_outrank_the_current_reject() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+
+    // In-process check: in tolerance ⇒ the first report accepts.
+    measure_at(&mut conn, &p1, &units[0].part_uid, 25.0, now());
+    let (accept_id, d1) = issue_report_for(&mut conn, &units);
+    assert_eq!(
+        d1,
+        Disposition::Accept,
+        "precondition: the early report releases"
+    );
+
+    // Final inspection, an hour later: 99.0 against 25.0 ± 0.05.
+    measure_at(
+        &mut conn,
+        &p1,
+        &units[0].part_uid,
+        99.0,
+        now() + time::Duration::hours(1),
+    );
+    let (reject_id, d2) = issue_report_for(&mut conn, &units);
+    assert_eq!(d2, Disposition::Reject, "precondition: the part failed");
+    assert_ne!(accept_id, reject_id);
+
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason,
+            qcr_id,
+            disposition,
+            ..
+        } => {
+            assert_eq!(
+                reason,
+                QcReportBlockReason::Rejected,
+                "a part that failed final inspection must not ship"
+            );
+            assert_eq!(
+                qcr_id.as_deref(),
+                Some(reject_id.as_str()),
+                "the gate must name the CURRENT report, not the flattering one"
+            );
+            assert_eq!(disposition.as_deref(), Some("reject"));
+        }
+        other => panic!("a rejected part shipped: {other:?}"),
+    }
+}
+
+/// The supersede case the `any()` was written for, kept explicit: a
+/// rejected report that is SUPERSEDED by a corrected one leaves
+/// `releasing`, so the corrected report is both the newest and the only
+/// candidate — and the shipment is released.
+///
+/// Without this, "the current report decides" could be satisfied by a gate
+/// that simply never releases once anything was ever rejected.
+#[test]
+fn a_superseded_rejection_does_not_block_the_corrected_report() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+
+    measure_at(&mut conn, &p1, &units[0].part_uid, 99.0, now());
+    let (bad_id, d1) = issue_report_for(&mut conn, &units);
+    assert_eq!(d1, Disposition::Reject);
+
+    // Rework, re-measure, re-issue.
+    measure_at(
+        &mut conn,
+        &p1,
+        &units[0].part_uid,
+        25.0,
+        now() + time::Duration::hours(1),
+    );
+    let (good_id, d2) = issue_report_for(&mut conn, &units);
+    assert_eq!(d2, Disposition::Accept);
+
+    // Supersede the rejection, as the correction workflow does.
+    let m = meta();
+    let tx = conn.transaction().unwrap();
+    aberp_qa::void_report(&tx, &ctx(&m), &bad_id, "reworked", Some(&good_id)).unwrap();
+    tx.commit().unwrap();
+
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "a corrected report must release the shipment its predecessor blocked"
+    );
+}
+
+/// **A required characteristic ADDED after an accept re-blocks the
+/// shipment.** The releasing report enumerated two characteristics; the
+/// plan now demands three, so its release covers evidence that was never
+/// gathered.
+///
+/// `characteristics_required` on the header is a LINE count (one per
+/// characteristic-unit pair), not a plan count, so the gate compares the
+/// SET of characteristic names instead.
+#[test]
+fn a_required_characteristic_added_after_issuance_re_blocks_the_shipment() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure_at(&mut conn, &p1, &units[0].part_uid, 25.0, now());
+    let (qcr_id, d1) = issue_report_for(&mut conn, &units);
+    assert_eq!(d1, Disposition::Accept);
+
+    // The positive control first: as things stand, it ships.
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the report releases before the plan changes"
+    );
+
+    // Engineering adds a required characteristic AFTER the report froze.
+    seed_plan(&conn, "Face Z", "2", true);
+
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
+            assert_eq!(reason, QcReportBlockReason::PlanDrift);
+            assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
+        }
+        other => panic!("expected Blocked(PlanDrift), got {other:?}"),
+    }
+
+    // And an OPTIONAL addition does not: it never counted toward
+    // accountability, so demanding it would block on nothing.
+    let db2 = setup();
+    let mut conn2 = Connection::open(&db2).unwrap();
+    let buyer2 = create_partner(
+        &conn2,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn2, "wo-def", "1");
+    seed_dispatch(&conn2, "dsp-def", "wo-def", &buyer2.id);
+    let units2 = mark_units(&conn2, "wo-def", 1);
+    let q1 = seed_plan(&conn2, "Bore D", "1", true);
+    measure_at(&mut conn2, &q1, &units2[0].part_uid, 25.0, now());
+    issue_report_for(&mut conn2, &units2);
+    seed_plan(&conn2, "Face Z", "2", false);
+    let d2 = dispatch(&conn2, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn2, T, &d2, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "an OPTIONAL characteristic added later is not evidence anyone owes"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// ROUND 2 — the document must not make false statements about itself.
+// ═════════════════════════════════════════════════════════════════════
+
+/// Issue one accepted report through the REAL app path and hand back
+/// `(handle, tenant, partner_id, qcr_id, pinned_sha)`.
+fn issue_one_through_the_app(
+    db: &std::path::Path,
+) -> (aberp_db::HandleArc, TenantId, String, String, String) {
+    let mut conn = Connection::open(db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure_at(&mut conn, &p1, &units[0].part_uid, 25.0, now());
+    drop(conn);
+
+    let tenant = TenantId::new(T).unwrap();
+    let handle = aberp::serve::open_tenant_handle(db, tenant.clone()).unwrap();
+    let hash = BinaryHash::from_bytes([0u8; 32]);
+    let drafted = aberp::qc_report::draft_report(
+        &handle,
+        tenant.clone(),
+        hash,
+        "ervin",
+        now(),
+        aberp::qc_report::DraftReportRequest {
+            wo_id: "wo-def".into(),
+            report_kind: QcReportKind::DimensionalInspection,
+            template: None,
+            notes: None,
+        },
+    )
+    .expect("draft");
+    let issued = aberp::qc_report::issue_report(
+        &handle,
+        tenant.clone(),
+        hash,
+        "ervin",
+        now(),
+        &drafted.report.qcr_id,
+    )
+    .expect("issue");
+    let sha = issued.report.rendered_sha256.clone().unwrap();
+    (handle, tenant, buyer.id, issued.report.qcr_id, sha)
+}
+
+/// **Editing the customer AFTER issuance must not flip the report to
+/// tampered.**
+///
+/// The identity block is printed inside the bytes whose SHA-256 is pinned
+/// at issuance, and it used to be filled by joining `partners` LIVE at
+/// both issuance and re-render. So a customer moving office — or
+/// `soft_delete_partner` running — permanently flipped every one of their
+/// issued reports to `matches_issued_sha256: false`: a tamper signal on an
+/// untampered document, and unrecoverable, because the true bytes are
+/// never stored. The identity is now a SNAPSHOT on `qc_reports`.
+#[test]
+fn a_partner_edit_after_issuance_leaves_the_issued_sha_intact() {
+    if !aberp::build_profile::qc_reporting_allowed() {
+        return; // issuance + render are Defense-only
+    }
+    let db = setup();
+    let (handle, _tenant, partner_id, qcr_id, pinned) = issue_one_through_the_app(&db);
+
+    // Precondition — the snapshot really carries the identity, so this
+    // test cannot pass vacuously by rendering a blank customer block.
+    {
+        let conn = handle.read().unwrap();
+        let report = aberp_qa::get_report(&conn, T, &qcr_id).unwrap().unwrap();
+        assert_eq!(
+            report.customer_name.as_deref(),
+            Some("Prime Aero"),
+            "the customer identity must be snapshotted at freeze"
+        );
+        let (_, bytes, sha, matches) = aberp::qc_report::render_report(&conn, T, &qcr_id).unwrap();
+        assert_eq!(sha, pinned);
+        assert_eq!(matches, Some(true));
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("Prime Aero"),
+            "the identity block must actually be on the page"
+        );
+    }
+
+    // The customer moves, and is then removed from the address book.
+    {
+        let guard = handle.write().unwrap();
+        // A name with NO substring overlap with the snapshot, so
+        // "the old name is still on the page" cannot pass vacuously.
+        let mut edited = partner_inputs("Nordwind Systems", CustomerType::Defense);
+        edited.legal_name = "Nordwind Systems Zrt.".into();
+        edited.address_city = Some("Debrecen".into());
+        edited.address_street = Some("Uj utca 42.".into());
+        aberp::partners::update_partner(&guard, T, &partner_id, &edited)
+            .unwrap()
+            .expect("the partner exists");
+        assert!(aberp::partners::soft_delete_partner(&guard, T, &partner_id).unwrap());
+    }
+
+    let conn = handle.read().unwrap();
+    let (_, bytes, sha, matches) = aberp::qc_report::render_report(&conn, T, &qcr_id).unwrap();
+    assert_eq!(
+        sha, pinned,
+        "a customer-record edit must not change one byte of an issued document"
+    );
+    assert_eq!(matches, Some(true));
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("Prime Aero"),
+        "the document keeps the identity it was ISSUED with, not today's"
+    );
+    assert!(
+        !text.contains("Nordwind"),
+        "today's partner row must not reach an already-issued document"
+    );
+}
+
+/// **A VOIDED report is refused, not re-rendered as an ISSUED one.**
+///
+/// The page cannot carry `state` (it is post-issuance-mutable, and
+/// printing it breaks the §D7 pin), and the old canonicalisation forced it
+/// to `Issued` — so a voided report came out looking exactly like a valid
+/// certificate of conformity, with no void marker anywhere and no route
+/// refusing to serve it.
+#[test]
+fn a_voided_report_refuses_to_render() {
+    if !aberp::build_profile::qc_reporting_allowed() {
+        return;
+    }
+    let db = setup();
+    let (handle, _tenant, _partner_id, qcr_id, _pinned) = issue_one_through_the_app(&db);
+
+    // Positive control: it renders while it is valid.
+    {
+        let conn = handle.read().unwrap();
+        assert!(aberp::qc_report::render_report(&conn, T, &qcr_id).is_ok());
+    }
+
+    {
+        let mut guard = handle.write().unwrap();
+        let m = meta();
+        let tx = guard.transaction().unwrap();
+        aberp_qa::void_report(&tx, &ctx(&m), &qcr_id, "issued in error", None).unwrap();
+        tx.commit().unwrap();
+    }
+
+    let conn = handle.read().unwrap();
+    match aberp::qc_report::render_report(&conn, T, &qcr_id) {
+        Err(aberp::qc_report::QcReportError::Voided(msg)) => {
+            assert!(msg.contains(&qcr_id), "the refusal names the report: {msg}");
+        }
+        Ok((_, bytes, _, _)) => panic!(
+            "a voided report rendered {} bytes of valid-looking certificate",
+            bytes.len()
+        ),
+        Err(other) => panic!("expected Voided, got {other:?}"),
+    }
+}
+
+/// **An issued PDF does not stamp itself `(draft — not issued)`, and does
+/// cite its audit-chain entry.**
+///
+/// Both were consequences of the canonical render form: `rendered_sha256`
+/// is normalised to `None` (a document cannot contain its own hash), so
+/// the footer's "Issued SHA-256" line printed the draft placeholder on
+/// EVERY issued document; and both call sites passed `chain_reference:
+/// ""`, so the CoC's fixed statement — "the tamper-evident audit chain
+/// entry cited below" — sat directly above `Audit chain ref: —`.
+#[test]
+fn an_issued_pdf_cites_its_chain_entry_and_is_not_stamped_draft() {
+    if !aberp::build_profile::qc_reporting_allowed() {
+        return;
+    }
+    let db = setup();
+    let (handle, _tenant, _partner_id, qcr_id, _pinned) = issue_one_through_the_app(&db);
+    let conn = handle.read().unwrap();
+    let (_, bytes, _, _) = aberp::qc_report::render_report(&conn, T, &qcr_id).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+
+    assert!(
+        !text.contains("draft — not issued") && !text.contains("DRAFT — NOT ISSUED"),
+        "an ISSUED document must not describe itself as a draft"
+    );
+    assert!(
+        !text.contains("Issued SHA-256"),
+        "a document cannot contain its own hash; the pin is served out-of-band"
+    );
+    let expected_ref = aberp_qa::issuance_chain_ref(&qcr_id);
+    assert!(
+        text.contains(&expected_ref),
+        "the page must cite the real chain entry ({expected_ref}), not a dash"
+    );
+    assert!(
+        !text.contains("SUPERSEDED") && !text.contains("VOIDED"),
+        "`state` is post-issuance-mutable and must not be on the page"
+    );
+
+    // And the sharp form of the same claim: SUPERSEDING the report changes
+    // `state` on the row and must not change one byte of the document.
+    {
+        drop(conn);
+        let mut guard = handle.write().unwrap();
+        let m = meta();
+        let tx = guard.transaction().unwrap();
+        aberp_qa::void_report(&tx, &ctx(&m), &qcr_id, "reworked", Some("qcr_later")).unwrap();
+        tx.commit().unwrap();
+    }
+    let conn = handle.read().unwrap();
+    let (report, after, _, matches) = aberp::qc_report::render_report(&conn, T, &qcr_id).unwrap();
+    assert_eq!(
+        report.state,
+        aberp_qa::QcReportState::Superseded,
+        "precondition: the supersede really did mutate the row"
+    );
+    assert_eq!(
+        after, bytes,
+        "a state change must not perturb the hashed byte-form"
+    );
+    assert_eq!(matches, Some(true));
+}
+
+/// The other direction: a DRAFT preview says so. Without this, dropping
+/// `state` from the header could be satisfied by a renderer that never
+/// distinguishes a preview from a certificate.
+#[test]
+fn a_draft_pdf_says_it_is_a_draft() {
+    if !aberp::build_profile::qc_reporting_allowed() {
+        return;
+    }
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure_at(&mut conn, &p1, &units[0].part_uid, 25.0, now());
+    drop(conn);
+
+    let tenant = TenantId::new(T).unwrap();
+    let handle = aberp::serve::open_tenant_handle(&db, tenant.clone()).unwrap();
+    let drafted = aberp::qc_report::draft_report(
+        &handle,
+        tenant,
+        BinaryHash::from_bytes([0u8; 32]),
+        "ervin",
+        now(),
+        aberp::qc_report::DraftReportRequest {
+            wo_id: "wo-def".into(),
+            report_kind: QcReportKind::DimensionalInspection,
+            template: None,
+            notes: None,
+        },
+    )
+    .expect("draft");
+
+    let conn = handle.read().unwrap();
+    let (_, bytes, _, _) =
+        aberp::qc_report::render_report(&conn, T, &drafted.report.qcr_id).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("DRAFT"),
+        "a preview must be visibly a preview"
+    );
+    assert!(
+        !text.contains(&aberp_qa::issuance_chain_ref(&drafted.report.qcr_id)),
+        "a draft has no issuance entry to cite"
+    );
 }

@@ -923,6 +923,170 @@ test suite was confirmed RED, and the mutation reverted.
 
 ---
 
+## Round 2 — the adversarial review's three blockers (2026-08-23)
+
+An adversarial pass over the Phase-1 commit found three compliance-critical
+defects. All three are fixed here; each is pinned by a test that a mutation
+of the fix turns red. They are recorded as first-class decisions because
+each one changed what the shipped artefact *says* or *permits*.
+
+### R1 — the CURRENT report decides, not any releasing report
+
+`resolve_qc_report_gate_with_capability` released the shipment if **any**
+issued, unbound report permitted it:
+
+```rust
+if releasing.iter().any(|r| r.disposition.permits_shipment()) { Pass }
+```
+
+That was written for the supersede case — a corrected report must not stay
+blocked by the predecessor it fixed — but `any` is symmetric, and the other
+direction is the one that ships a bad part. Proven end to end: an
+in-tolerance early measurement issued `accept`; final inspection at 99.0
+against 25.0 ± 0.05 issued `reject`; `mark_shipped` returned **SHIPPED**,
+with both reports bound and no 409. **The whole reason the gate exists.**
+
+The gate now takes the newest releasing report and decides on that one
+alone. The supersede case is preserved by the filter that was already
+there: `state == Issued` excludes superseded and voided predecessors, so a
+corrected report is both the newest *and* the only candidate left.
+
+"Newest" is `(created_at, report_number, qcr_id)`, descending. The middle
+term is load-bearing: `qcr_id` is a ULID, and two ULIDs minted in the same
+millisecond order by their **random** suffix, so an id-only tiebreak can
+put the older report first. `report_number` is `QCR-<YYYY>-<NNNN>`,
+allocated by a COUNT under the one shared writer, so it is strictly
+monotonic within a year — and two reports sharing a `created_at`
+necessarily share a year. `list_reports_for_wo` orders the same way, and
+the gate re-sorts anyway so it does not depend on an `ORDER BY` in another
+crate.
+
+**A fourth block reason, `plan_drift`,** closes the adjacent hole the same
+review named: the gate only re-counted plans when *no* report released, so
+a required characteristic ADDED after an `accept` left that report
+releasing forever. `characteristics_required` is a LINE count (one per
+characteristic-unit pair), not a plan count, so the check compares the
+**set** of characteristic names — `(product, feature_name)` is the plan
+table's own uniqueness key and is exactly what `build_report_lines` writes
+into `characteristic_name`. An *optional* addition does not block: it never
+counted toward accountability.
+
+### R2 — customer identity is a snapshot, and the renderer cannot take any other kind
+
+`canonical_for_render` normalised the mutable *row* fields, but
+`customer_info()` joined `partners` **live** at both issuance and
+re-render, and `push_identity_block` printed the name and address into the
+hashed bytes. So a customer editing their address — or `soft_delete_partner`
+running — permanently flipped every one of their issued reports to
+`matches_issued_sha256: false`: a tamper signal on untampered documents,
+and unrecoverable, because §D7 stores the hash and never the bytes.
+
+`customer_name`, `customer_address_line` and `customer_purchase_order` are
+now snapshot columns on `qc_reports`, resolved once at freeze — the same
+discipline `drawing_number` / `drawing_rev` already used. The fix is
+structural rather than careful: `QcPartyInfo` and the `customer` field on
+`QcReportInputs` are **deleted**, so the renderer has no parameter through
+which a live join could arrive. `partners` is read exactly once on the
+whole report path, in `draft_report`.
+
+### R3 — the document no longer makes false statements about itself
+
+Three, all consequences of the canonical render form and none previously
+test-covered:
+
+- **`state` is off the page.** It is post-issuance-mutable, so delta 6's
+  rule applies to it identically — and forcing it to `Issued` before
+  rendering is what let a **VOIDED report re-render with a confident
+  ISSUED header** and no void marker anywhere. The header now prints
+  `Issued <timestamp>` or `DRAFT — NOT ISSUED`, both derived from
+  `issued_at_utc`, which is written exactly once and never mutates.
+- **The SHA-256 is off the page.** A document cannot contain its own hash:
+  `rendered_sha256` is normalised to `None`, so the footer stamped
+  **every** correctly issued PDF `(draft — not issued)`. The pin is served
+  out-of-band instead — in the chain entry, on
+  `GET /api/qc-reports/:id`, and in the new `x-aberp-qc-sha256` response
+  header alongside `x-aberp-qc-sha-matches-issued`.
+- **`Audit chain ref` is real.** Both call sites passed
+  `chain_reference: ""`, so every certificate printed `Audit chain ref: —`
+  directly under a fixed statement promising "the tamper-evident audit
+  chain entry cited below". `aberp_qa::issuance_chain_ref(qcr_id)` is now
+  the ONE definition of that string, used by the `qcr.report_issued` writer
+  as its idempotency key and by the renderer's caller as the citation — so
+  a mutation to either breaks the other. It is derivable at render time,
+  which a generated entry id would not be: issuance hashes the bytes
+  *before* the chain entry exists.
+
+**A voided report is refused, not rendered** (`409`, `QcReportError::Voided`).
+With `state` legitimately off the page, a voided report would otherwise come
+out looking exactly like a valid certificate. Handing an auditor a
+VOID-stamped copy would be strictly better and is **Phase 2**: the stamp has
+to be drawn outside the hashed byte-form, which is a renderer change, not a
+route one. A SUPERSEDED report still renders — it is a legitimate historical
+record, and its bytes are byte-identical to the ones issued.
+
+`canonical_for_render` stays, as defence in depth, for the two fields no
+longer on the page. Issuance and re-render now share ONE function,
+`qc_report::render_canonical`, so the canonicalisation, the chain reference
+and the renderer call cannot drift between them.
+
+### Advisories fixed in the same pass
+
+- **`renderer_version` was `0.0.0` forever.** `aberp-qc-pdf` inherited the
+  workspace version, so the field answered none of the "renderer changed or
+  rows tampered?" question it exists for. The crate now carries its own
+  `version`, to be bumped in the same commit as any change to the rendered
+  bytes.
+- **`drawings::supersede_and_create` ran UPDATE + INSERT as two bare
+  statements.** A failure between them left a product with ZERO current
+  revisions, and `current_for_product` then returned `None` — so every
+  later report froze a blank drawing number on a document whose job is to
+  name the revision it was inspected against. Both now ride one
+  transaction.
+- **`GET /api/qc-reports/:id/pdf` mutated on every download.** It took the
+  exclusive WRITE guard and appended one `qcr.report_rendered` per read:
+  unbounded chain growth driven by a GET, and every download serialised
+  behind the single writer. It renders under the READ guard and appends
+  only on a SHA divergence — which is a real integrity event — re-rendering
+  under the writer in that case so the audited hash is the hash of the
+  bytes served.
+
+### Advisories deliberately deferred
+
+- **The `qc/` bundle has no WRITER (AC10 scope gap).** Retention itself is
+  wired — `qcr.report_issued` pins the SHA into the chain — and
+  `aberp-verify` accepts, re-hashes and cross-totals `qc/` entries. What is
+  missing is the auditor-facing bundle *producer*: `qc_archive_path` has no
+  non-test caller. This is delta 3 restated with a sharper name; it needs
+  the invoice→dispatch→WO→report join, which is real scope. Tracked in
+  `docs/BACKLOG-designed-to-live.md`.
+- **A characteristic PROMOTED from optional to required does not trip
+  `plan_drift`.** `qc_report_lines` does not persist `required` —
+  `parse_line_row` reconstructs it as `true` — so the frozen row cannot say
+  whether the characteristic counted toward accountability when it froze.
+  Detecting promotion needs an additive `is_required` column on
+  `qc_report_lines` and is a separate change. The *added*-characteristic
+  case, which is the one the review named, is closed.
+- **A VOID-stamped rendering** for auditors, as above.
+
+### Round-2 behaviours pinned by mutation testing
+
+- **(d) a stale `accept` must not outrank a current `reject`** — the fix is
+  pinned by `a_stale_accept_does_not_outrank_the_current_reject`, with
+  `a_superseded_rejection_does_not_block_the_corrected_report` as the
+  positive control that stops "never release once anything was rejected"
+  from passing.
+- **(e) a partner edit must not perturb an issued document** — pinned by
+  `a_partner_edit_after_issuance_leaves_the_issued_sha_intact`, whose
+  edited name shares no substring with the snapshot so the assertion cannot
+  pass vacuously.
+- **(f) the document's self-description** — pinned by
+  `a_voided_report_refuses_to_render`,
+  `an_issued_pdf_cites_its_chain_entry_and_is_not_stamped_draft` (which
+  also asserts a supersede leaves the bytes untouched), and
+  `a_draft_pdf_says_it_is_a_draft` as the other direction.
+
+---
+
 ## Acceptance criteria (for the Phase-1 implementation session)
 
 1. **End-to-end, manual actuals:** plan with 4 required characteristics →

@@ -78,6 +78,17 @@ pub struct QcReport {
     pub source_quote_id: Option<String>,
     pub drawing_number: Option<String>,
     pub drawing_rev: Option<String>,
+    /// **Customer identity, SNAPSHOT at freeze time.** Same discipline as
+    /// `drawing_number` / `drawing_rev`, and for a sharper reason: the
+    /// identity block is printed INSIDE the bytes whose SHA-256 is pinned
+    /// at issuance (§D7). Joining `partners` live at render time meant a
+    /// customer editing their address — or `soft_delete_partner` running —
+    /// permanently flipped every one of their issued reports to
+    /// `matches_issued_sha256: false`: a tamper signal on an untampered
+    /// document, unrecoverable because the true bytes are never stored.
+    pub customer_name: Option<String>,
+    pub customer_address_line: Option<String>,
+    pub customer_purchase_order: Option<String>,
     pub qty_reported: u32,
     pub serial_range: Option<String>,
     pub heat_lot_reference: Option<String>,
@@ -529,6 +540,13 @@ fn rfc3339(ts: OffsetDateTime) -> Result<String, QcError> {
         .map_err(|e| QcError::Storage(anyhow::anyhow!("format timestamp: {e}")))
 }
 
+/// Trim an optional snapshot string, collapsing a blank to `None` so the
+/// renderer's "field absent" and "field present but empty" cases cannot
+/// diverge between issuance and a later re-render.
+fn trimmed(v: Option<&str>) -> Option<&str> {
+    v.map(str::trim).filter(|s| !s.is_empty())
+}
+
 fn emit(
     tx: &Transaction<'_>,
     ctx: &QcWriteContext<'_>,
@@ -564,6 +582,19 @@ pub struct ReportTraceability {
     pub notes: Option<String>,
 }
 
+/// The customer identity to SNAPSHOT onto the report header.
+///
+/// `aberp-qa` owns no `partners` table, so the app layer resolves this
+/// ONCE, at draft time, and hands it in — the same shape `drawing_number`
+/// / `drawing_rev` already take. Nothing here is ever re-derived at render
+/// time: see [`QcReport::customer_name`] for what a live join costs.
+#[derive(Debug, Clone, Default)]
+pub struct ReportCustomer {
+    pub name: Option<String>,
+    pub address_line: Option<String>,
+    pub purchase_order: Option<String>,
+}
+
 /// Everything [`freeze_report`] needs.
 #[derive(Debug)]
 pub struct FreezeReportInputs<'a> {
@@ -582,6 +613,8 @@ pub struct FreezeReportInputs<'a> {
     /// Supplied by the app layer (see [`compute_disposition`]).
     pub open_ncr_against_reported_part: bool,
     pub traceability: ReportTraceability,
+    /// Customer identity, snapshotted onto the header (§D3(c)).
+    pub customer: ReportCustomer,
     pub created_by: &'a str,
 }
 
@@ -636,9 +669,10 @@ pub fn freeze_report(
             characteristics_required, characteristics_measured, characteristics_passed,
             characteristics_failed, characteristics_unaccounted,
             rendered_sha256, renderer_version, issued_at_utc, issued_by,
-            superseded_by_qcr_id, created_at, created_by, notes
+            superseded_by_qcr_id, created_at, created_by, notes,
+            customer_name, customer_address_line, customer_purchase_order
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?);",
+                   ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?);",
         params![
             &qcr_id,
             ctx.tenant,
@@ -667,6 +701,9 @@ pub fn freeze_report(
             &created_at,
             inputs.created_by.trim(),
             t.notes.as_deref(),
+            trimmed(inputs.customer.name.as_deref()),
+            trimmed(inputs.customer.address_line.as_deref()),
+            trimmed(inputs.customer.purchase_order.as_deref()),
         ],
     )
     .map_err(|e| QcError::Storage(anyhow::anyhow!("INSERT qc_reports: {e}")))?;
@@ -793,6 +830,23 @@ fn allocate_report_number(
     Ok(format!("{prefix}{:04}", n.max(0) + 1))
 }
 
+/// **The audit-chain reference for a report's issuance entry.**
+///
+/// The `qcr.report_issued` row's idempotency key, and therefore the string
+/// an auditor greps the chain for. It is ALSO what the rendered document
+/// prints as `Audit chain ref` — the CoC's fixed conformance statement
+/// promises "the tamper-evident audit chain entry cited below", and before
+/// this both call sites passed `""`, so every certificate cited a dash.
+///
+/// Deriving it from `qcr_id` (rather than reading the chain entry's own id
+/// back) is what makes it available at render time at all: issuance
+/// renders and hashes the bytes BEFORE the chain entry exists, so a
+/// generated id would be circular. One function, used by the writer and by
+/// the renderer's caller, so a mutation to either side breaks the other.
+pub fn issuance_chain_ref(qcr_id: &str) -> String {
+    format!("qcr_issued:{qcr_id}")
+}
+
 /// Issue a drafted report: pin the rendered bytes' SHA-256 and flip to
 /// `issued`. Emits one `qcr.report_issued` carrying the hash, the
 /// renderer version, the full accountability counts and the traceability
@@ -870,7 +924,7 @@ pub fn issue_report(
             "issued_by": issued_by.trim(),
             "issued_at_utc": issued_at,
         }),
-        format!("qcr_issued:{qcr_id}"),
+        issuance_chain_ref(qcr_id),
     )?;
 
     get_report_in_tx(tx, ctx.tenant, qcr_id)?
@@ -1012,7 +1066,8 @@ const REPORT_COLUMNS: &str = "qcr_id, report_number, report_kind, template, stat
      qty_reported, serial_range, heat_lot_reference, mill_cert_id, machine_id, program_id,
      disposition, characteristics_required, characteristics_measured, characteristics_passed,
      characteristics_failed, characteristics_unaccounted, rendered_sha256, renderer_version,
-     issued_at_utc, issued_by, superseded_by_qcr_id, created_at, created_by, notes";
+     issued_at_utc, issued_by, superseded_by_qcr_id, created_at, created_by, notes,
+     customer_name, customer_address_line, customer_purchase_order";
 
 /// Fetch one report by id (tenant-scoped).
 pub fn get_report(
@@ -1030,6 +1085,13 @@ pub fn get_report(
 }
 
 /// Every report for a work order, newest first.
+///
+/// `report_number` sits between the timestamp and the id deliberately: it
+/// is allocated by a COUNT under the one shared writer, so it is strictly
+/// monotonic within a year, whereas two `qcr_<ULID>`s minted in the same
+/// millisecond order by their RANDOM suffix. The D6 shipment gate decides
+/// which report is CURRENT from this order, so an id-only tiebreak could
+/// let a stale `accept` outrank a fresh `reject`.
 pub fn list_reports_for_wo(
     conn: &Connection,
     tenant: &str,
@@ -1037,7 +1099,8 @@ pub fn list_reports_for_wo(
 ) -> Result<Vec<QcReport>, QcError> {
     query_reports(
         conn,
-        "WHERE tenant_id = ? AND wo_id = ? ORDER BY created_at DESC, qcr_id DESC",
+        "WHERE tenant_id = ? AND wo_id = ?
+         ORDER BY created_at DESC, report_number DESC, qcr_id DESC",
         params![tenant, wo_id],
     )
 }
@@ -1193,6 +1256,9 @@ fn parse_report_row(row: &duckdb::Row<'_>) -> duckdb::Result<Result<QcReport, an
             created_at: row.get(29)?,
             created_by: row.get(30)?,
             notes: row.get(31)?,
+            customer_name: row.get(32)?,
+            customer_address_line: row.get(33)?,
+            customer_purchase_order: row.get(34)?,
         })
     })())
 }

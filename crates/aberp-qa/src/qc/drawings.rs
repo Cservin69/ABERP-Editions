@@ -99,8 +99,16 @@ fn validate(input: &NewPartDrawingRef) -> Result<(), QcError> {
 ///
 /// `now` is passed in (not read from a clock here) so the whole module
 /// is deterministic and testable.
+///
+/// **ONE transaction.** The close (`UPDATE … superseded_at`) and the open
+/// (`INSERT`) used to run as two bare statements: a failure between them
+/// left the product with ZERO current revisions, and
+/// [`current_for_product`] then returned `None` — so every subsequent
+/// report froze a blank drawing number and blank revision, silently, on a
+/// compliance document whose whole job is to name the revision it was
+/// inspected against. Both or neither.
 pub fn supersede_and_create(
-    conn: &Connection,
+    conn: &mut Connection,
     tenant: &str,
     input: NewPartDrawingRef,
     created_by: &str,
@@ -111,12 +119,16 @@ pub fn supersede_and_create(
     let drawing_number = input.drawing_number.trim();
     let drawing_rev = input.drawing_rev.trim();
 
-    if let Some(current) = current_for_product(conn, tenant, product_id)? {
+    let tx = conn
+        .transaction()
+        .map_err(|e| QcError::Storage(anyhow::anyhow!("begin drawing-ref tx: {e}")))?;
+
+    if let Some(current) = current_for_product(&tx, tenant, product_id)? {
         if current.drawing_number == drawing_number && current.drawing_rev == drawing_rev {
             return Ok(current);
         }
         let stamp = rfc3339(now)?;
-        conn.execute(
+        tx.execute(
             "UPDATE part_drawing_refs SET superseded_at = ?
              WHERE tenant_id = ? AND drawing_ref_id = ?;",
             params![&stamp, tenant, &current.drawing_ref_id],
@@ -126,7 +138,7 @@ pub fn supersede_and_create(
 
     let drawing_ref_id = format!("pdr_{}", Ulid::new());
     let stamp = rfc3339(now)?;
-    conn.execute(
+    tx.execute(
         "INSERT INTO part_drawing_refs (
             drawing_ref_id, tenant_id, product_id, drawing_number, drawing_rev,
             effective_from, superseded_at, created_at, created_by
@@ -144,8 +156,11 @@ pub fn supersede_and_create(
     )
     .map_err(|e| QcError::Storage(anyhow::anyhow!("INSERT part_drawing_refs: {e}")))?;
 
-    get(conn, tenant, &drawing_ref_id)?
-        .ok_or_else(|| QcError::Storage(anyhow::anyhow!("drawing ref vanished after insert")))
+    let row = get(&tx, tenant, &drawing_ref_id)?
+        .ok_or_else(|| QcError::Storage(anyhow::anyhow!("drawing ref vanished after insert")))?;
+    tx.commit()
+        .map_err(|e| QcError::Storage(anyhow::anyhow!("commit drawing-ref tx: {e}")))?;
+    Ok(row)
 }
 
 /// The CURRENT revision for a product, or `None` when the product has no

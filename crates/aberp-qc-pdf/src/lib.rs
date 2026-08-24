@@ -60,9 +60,15 @@ pub use aberp_qa::{
     QcReport, QcReportKind, QcReportLine, QcReportTemplate, Verdict,
 };
 
-/// Crate version stamp — printed in the footer and recorded as
+/// Renderer LAYOUT version — printed in the footer and recorded as
 /// `renderer_version` on the issued report, so an auditor can tell which
 /// renderer produced the bytes a SHA was taken over.
+///
+/// This crate carries its own `version` in `Cargo.toml` rather than
+/// inheriting the workspace's, which is `0.0.0`: a constant stamp answers
+/// none of the "renderer changed or rows tampered?" question this field
+/// exists for. Bump the crate version in the same commit as any change to
+/// the rendered bytes.
 pub const QC_PDF_RENDERER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The AS9102 revision this crate's FAIR forms implement. Ervin confirmed
@@ -118,29 +124,27 @@ const COC_STATEMENT: &str = concat!(
     "inspection report and in the tamper-evident audit chain entry cited below."
 );
 
-/// Party identification for the customer block. Supplied by the caller
-/// (the app layer owns the `partners` table; this crate does not).
-#[derive(Debug, Clone, Default)]
-pub struct QcPartyInfo<'a> {
-    /// Customer display / legal name.
-    pub name: &'a str,
-    /// Optional single-line address.
-    pub address_line: &'a str,
-    /// Optional customer purchase-order reference.
-    pub purchase_order: &'a str,
-}
-
 /// Everything [`render`] needs. All of it comes from frozen rows.
+///
+/// There is deliberately NO customer parameter. The identity block is
+/// printed inside the bytes whose SHA-256 is pinned at issuance, so it may
+/// only be fed from the report's own SNAPSHOT columns
+/// (`customer_name` / `customer_address_line` / `customer_purchase_order`).
+/// An earlier revision took a `QcPartyInfo` that the app layer filled by
+/// joining `partners` LIVE at both issuance and re-render — which meant a
+/// customer editing their address permanently flipped every one of their
+/// issued reports to "does not match the issued hash". Removing the
+/// parameter makes that class of bug unrepresentable rather than merely
+/// fixed.
 #[derive(Debug, Clone)]
 pub struct QcReportInputs<'a> {
     /// The frozen `qc_reports` row.
     pub report: &'a QcReport,
     /// The frozen `qc_report_lines`, in `line_no` order.
     pub lines: &'a [QcReportLine],
-    /// The customer this document is for.
-    pub customer: QcPartyInfo<'a>,
-    /// The chain entry an auditor can look the issuance up by. Empty
-    /// string when the report is still a draft.
+    /// The chain entry an auditor can look the issuance up by
+    /// (`aberp_qa::issuance_chain_ref`). Empty string when the report is
+    /// still a draft and no issuance entry exists yet.
     pub chain_reference: &'a str,
 }
 
@@ -355,7 +359,7 @@ fn build_fair(inputs: &QcReportInputs<'_>) -> Vec<Vec<Operation>> {
         &mut ops,
         y,
         "12. P.O. Number",
-        inputs.customer.purchase_order,
+        opt(&r.customer_purchase_order),
     );
     y = push_form_kv(&mut ops, y, "13. Detail / Assembly FAI", "Detail Part FAI");
     y = push_form_kv(&mut ops, y, "14. Full / Partial FAI", "Full FAI");
@@ -478,6 +482,13 @@ fn push_header(ops: &mut Vec<Operation>, inputs: &QcReportInputs<'_>, title: &st
     let mut y = MARGIN_TOP;
     push_text_c(ops, MARGIN_LEFT, y, "F2", 18, INK, title);
     y -= 20;
+    // `state` is deliberately NOT printed. It is post-issuance-mutable
+    // (supersede / void), so the delta-6 rule that keeps `dsp_id` off the
+    // page applies to it identically — and the old code hid that by forcing
+    // it to `Issued` before rendering, which made a VOIDED report re-render
+    // with a confident ISSUED header and no void marker anywhere on it.
+    // `issued_at_utc` says everything the header legitimately can: it is
+    // written exactly once, at issuance, and never mutates afterwards.
     push_text_c(
         ops,
         MARGIN_LEFT,
@@ -486,10 +497,12 @@ fn push_header(ops: &mut Vec<Operation>, inputs: &QcReportInputs<'_>, title: &st
         9,
         MUTED,
         &format!(
-            "Report {}   ·   {}   ·   {}",
+            "Report {}   ·   {}",
             r.report_number,
-            r.state.as_str().to_uppercase(),
-            r.issued_at_utc.as_deref().unwrap_or("not issued"),
+            match r.issued_at_utc.as_deref() {
+                Some(t) => format!("Issued {t}"),
+                None => "DRAFT — NOT ISSUED".to_string(),
+            },
         ),
     );
     y -= 18;
@@ -500,19 +513,26 @@ fn push_header(ops: &mut Vec<Operation>, inputs: &QcReportInputs<'_>, title: &st
 /// Customer + part + drawing identity, two columns.
 fn push_identity_block(ops: &mut Vec<Operation>, inputs: &QcReportInputs<'_>, mut y: i64) -> i64 {
     let r = inputs.report;
-    let c = &inputs.customer;
     let right = MARGIN_LEFT + 280;
 
     push_text_c(ops, MARGIN_LEFT, y, "F2", 10, MUTED, "CUSTOMER");
     push_text_c(ops, right, y, "F2", 10, MUTED, "PART");
     y -= 14;
-    push_kv_at(ops, MARGIN_LEFT, y, "Name", c.name);
+    // Every customer cell is a SNAPSHOT column, never a live join — see
+    // `QcReportInputs`.
+    push_kv_at(ops, MARGIN_LEFT, y, "Name", opt(&r.customer_name));
     push_kv_at(ops, right, y, "Part number", &r.product_id);
     y -= 12;
-    push_kv_at(ops, MARGIN_LEFT, y, "Address", c.address_line);
+    push_kv_at(
+        ops,
+        MARGIN_LEFT,
+        y,
+        "Address",
+        opt(&r.customer_address_line),
+    );
     push_kv_at(ops, right, y, "Drawing", opt(&r.drawing_number));
     y -= 12;
-    push_kv_at(ops, MARGIN_LEFT, y, "P.O.", c.purchase_order);
+    push_kv_at(ops, MARGIN_LEFT, y, "P.O.", opt(&r.customer_purchase_order));
     push_kv_at(ops, right, y, "Drawing rev", opt(&r.drawing_rev));
     y -= 12;
     push_kv_at(ops, MARGIN_LEFT, y, "Work order", &r.wo_id);
@@ -870,20 +890,16 @@ fn push_footer(ops: &mut Vec<Operation>, inputs: &QcReportInputs<'_>) {
                 .unwrap_or(QC_PDF_RENDERER_VERSION),
         ),
     );
-    push_text_c(
-        ops,
-        MARGIN_LEFT,
-        footer_y - 4,
-        "F1",
-        7,
-        MUTED,
-        &format!(
-            "Issued SHA-256: {}",
-            r.rendered_sha256
-                .as_deref()
-                .unwrap_or("(draft — not issued)")
-        ),
-    );
+    // The SHA-256 is deliberately NOT printed.
+    //
+    // A document cannot contain its own hash: `rendered_sha256` is written
+    // at issuance, AFTER these bytes are hashed, so the canonical render
+    // form normalises it to `None` — which meant this line stamped EVERY
+    // correctly issued PDF `(draft — not issued)`. The pin is not lost: it
+    // is in the `qcr.report_issued` chain entry that `Audit chain ref`
+    // above names, on `GET /api/qc-reports/:id`, and in the
+    // `x-aberp-qc-sha256` / `x-aberp-qc-sha-matches-issued` response
+    // headers the PDF route sets.
 }
 
 // ─── Primitives (ported from aberp-quote-pdf) ─────────────────────────
@@ -1093,6 +1109,9 @@ mod tests {
             created_at: "2026-08-23T11:00:00Z".into(),
             created_by: "ervin".into(),
             notes: None,
+            customer_name: Some("Prime Aerospace Kft.".into()),
+            customer_address_line: Some("1117 Budapest, Fő utca 1., HU".into()),
+            customer_purchase_order: Some("PO-2026-889".into()),
         }
     }
 
@@ -1134,12 +1153,7 @@ mod tests {
         QcReportInputs {
             report: r,
             lines,
-            customer: QcPartyInfo {
-                name: "Prime Aerospace Kft.",
-                address_line: "1117 Budapest, Fő utca 1., HU",
-                purchase_order: "PO-2026-889",
-            },
-            chain_reference: "aud_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            chain_reference: "qcr_issued:qcr_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         }
     }
 

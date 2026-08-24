@@ -17678,6 +17678,11 @@ pub enum QcReportBlockReason {
     Incomplete,
     /// A report exists and a characteristic failed.
     Rejected,
+    /// The current report RELEASES, but the product's inspection plan has
+    /// gained a required characteristic since that report was frozen — so
+    /// the release was granted over evidence that no longer covers what
+    /// must be inspected.
+    PlanDrift,
 }
 
 impl QcReportBlockReason {
@@ -17686,6 +17691,7 @@ impl QcReportBlockReason {
             QcReportBlockReason::NoIssuedReport => "no_issued_report",
             QcReportBlockReason::Incomplete => "incomplete",
             QcReportBlockReason::Rejected => "rejected",
+            QcReportBlockReason::PlanDrift => "plan_drift",
         }
     }
 }
@@ -17768,13 +17774,29 @@ pub fn resolve_qc_report_gate_with_capability(
     // The reports that can release a shipment: issued, and either already
     // bound to THIS dispatch or not yet bound to any. A report bound to a
     // DIFFERENT dispatch released those parts, not these.
-    let releasing: Vec<&aberp_qa::QcReport> = reports
+    let mut releasing: Vec<&aberp_qa::QcReport> = reports
         .iter()
         .filter(|r| r.state == aberp_qa::QcReportState::Issued)
         .filter(|r| match r.dsp_id.as_deref() {
             None => true,
             Some(d) => d == dispatch.dsp_id,
         })
+        .collect();
+    // NEWEST FIRST, deterministically — see `report_recency_key`. The
+    // caller's SQL already orders this way; re-sorting here means the gate
+    // does not silently depend on an `ORDER BY` in another crate, which a
+    // future query change could drop without any test noticing.
+    releasing.sort_by(|a, b| report_recency_key(b).cmp(&report_recency_key(a)));
+
+    // The characteristics the product requires TODAY. Read once, and used
+    // by both arms below — the empty case is the "nothing to demand" exit,
+    // and the non-empty case is what a releasing report has to still cover.
+    let plans = aberp_qa::list_inspection_plans(conn, tenant, Some(&wo.product_id), false)
+        .map_err(|e| anyhow!("list inspection plans for {}: {e}", wo.product_id))?;
+    let required_now: std::collections::BTreeSet<&str> = plans
+        .iter()
+        .filter(|p| p.enabled && p.counts_toward_accountability())
+        .map(|p| p.feature_name.trim())
         .collect();
 
     if releasing.is_empty() {
@@ -17783,13 +17805,7 @@ pub fn resolve_qc_report_gate_with_capability(
         // a report for a part nobody defined an inspection for would block
         // every Defense shipment the moment this feature landed, which is a
         // policy change disguised as a bug.
-        let plans = aberp_qa::list_inspection_plans(conn, tenant, Some(&wo.product_id), false)
-            .map_err(|e| anyhow!("list inspection plans for {}: {e}", wo.product_id))?;
-        let required = plans
-            .iter()
-            .filter(|p| p.enabled && p.counts_toward_accountability())
-            .count();
-        if required == 0 {
+        if required_now.is_empty() {
             return Ok(QcReportGate::Pass);
         }
         return Ok(QcReportGate::Blocked {
@@ -17801,24 +17817,51 @@ pub fn resolve_qc_report_gate_with_capability(
         });
     }
 
-    // At least one issued report exists. The shipment may proceed as soon as
-    // ONE of them releases — a superseding report that fixed an earlier
-    // rejection must not stay blocked by its predecessor.
-    if releasing.iter().any(|r| r.disposition.permits_shipment()) {
-        return Ok(QcReportGate::Pass);
+    // At least one issued report exists. **The CURRENT one decides.**
+    //
+    // This used to be `releasing.iter().any(|r| r.permits_shipment())`,
+    // written for the supersede case: a corrected report must not stay
+    // blocked by the predecessor it fixed. But `any` is symmetric, and the
+    // other direction is the one that ships a bad part — an early `accept`
+    // outranked a later `reject`, so a part that FAILED final inspection
+    // shipped, with both reports bound to the dispatch and no 409. The
+    // supersede case is still handled: `state == Issued` already filters
+    // superseded and voided predecessors out of `releasing`, so a corrected
+    // report is the newest AND the only one left standing.
+    let current = releasing[0];
+    if current.disposition.permits_shipment() {
+        // …but only over the characteristics it actually enumerated.
+        //
+        // `characteristics_required` on the header is a LINE count (one per
+        // characteristic-unit pair), not a plan count, so comparing it to
+        // the number of plans says nothing. The honest check is the set:
+        // every characteristic the plan requires today must appear among
+        // the report's frozen lines. Adding a required characteristic after
+        // an `accept` otherwise left the old report releasing forever, over
+        // evidence that never covered the new one.
+        //
+        // `(product, feature_name)` is the plan table's own uniqueness key
+        // and is exactly what `build_report_lines` writes into
+        // `characteristic_name`, so it is the join.
+        let report_lines = aberp_qa::list_report_lines(conn, tenant, &current.qcr_id)
+            .map_err(|e| anyhow!("list QC report lines for {}: {e}", current.qcr_id))?;
+        let covered: std::collections::BTreeSet<&str> = report_lines
+            .iter()
+            .map(|l| l.characteristic_name.as_str())
+            .collect();
+        if required_now.iter().all(|n| covered.contains(n)) {
+            return Ok(QcReportGate::Pass);
+        }
+        return Ok(QcReportGate::Blocked {
+            work_order_id: wo.wo_id,
+            customer_type,
+            reason: QcReportBlockReason::PlanDrift,
+            qcr_id: Some(current.qcr_id.clone()),
+            disposition: Some(current.disposition.as_str().to_string()),
+        });
     }
 
-    // None of them releases. Name the WORST one so the operator is told the
-    // most serious problem rather than an arbitrary one.
-    let worst = releasing
-        .iter()
-        .min_by_key(|r| match r.disposition {
-            aberp_qa::Disposition::Reject => 0,
-            aberp_qa::Disposition::Incomplete => 1,
-            _ => 2,
-        })
-        .expect("non-empty checked above");
-    let reason = match worst.disposition {
+    let reason = match current.disposition {
         aberp_qa::Disposition::Reject => QcReportBlockReason::Rejected,
         _ => QcReportBlockReason::Incomplete,
     };
@@ -17826,9 +17869,27 @@ pub fn resolve_qc_report_gate_with_capability(
         work_order_id: wo.wo_id,
         customer_type,
         reason,
-        qcr_id: Some(worst.qcr_id.clone()),
-        disposition: Some(worst.disposition.as_str().to_string()),
+        qcr_id: Some(current.qcr_id.clone()),
+        disposition: Some(current.disposition.as_str().to_string()),
     })
+}
+
+/// Recency key for "which QC report is the CURRENT one", newest-largest.
+///
+/// `created_at` first, then `report_number`, then `qcr_id`. The middle term
+/// is the one that matters: `qcr_id` is a `Ulid`, and two ULIDs minted in
+/// the SAME millisecond order by their random suffix, not by time — so an
+/// id-only tiebreak can put the older report first. `report_number` is
+/// `QCR-<YYYY>-<NNNN>` allocated by a COUNT under the one shared writer, so
+/// it is strictly monotonic within a year, and two reports sharing a
+/// `created_at` necessarily share a year. `qcr_id` remains as the final
+/// term so the ordering is total even if a future numbering scheme repeats.
+fn report_recency_key(r: &aberp_qa::QcReport) -> (&str, &str, &str) {
+    (
+        r.created_at.as_str(),
+        r.report_number.as_str(),
+        r.qcr_id.as_str(),
+    )
 }
 
 /// ADR-0199 §D6 — enforce the QC-report gate at the dispatch-ship route
@@ -17920,6 +17981,11 @@ fn enforce_qc_report_gate_for_shipment(
         ),
         QcReportBlockReason::Rejected => format!(
             "QC report {} is a REJECT — a characteristic failed",
+            qcr_id.as_deref().unwrap_or("(unknown)")
+        ),
+        QcReportBlockReason::PlanDrift => format!(
+            "QC report {} no longer covers the inspection plan — a required \
+             characteristic was added after it was issued",
             qcr_id.as_deref().unwrap_or("(unknown)")
         ),
     };
@@ -27350,6 +27416,11 @@ fn qc_report_error_response(e: crate::qc_report::QcReportError) -> Response {
         // 403, not 404: the build genuinely refuses, and saying so beats
         // pretending the resource does not exist.
         E::NotPermitted(_) => (StatusCode::FORBIDDEN, Json(error_body(msg))).into_response(),
+        // 409, not 404 and not 200-with-bytes: the report exists, and the
+        // honest answer is that no valid document does. Serving a voided
+        // report's PDF would hand out a repudiated certificate that reads
+        // as evidence of conformity.
+        E::Voided(_) => (StatusCode::CONFLICT, Json(error_body(msg))).into_response(),
         E::Other(err) => internal_error("qc_report_route", err),
     }
 }
@@ -27590,10 +27661,19 @@ async fn handle_get_qc_report(
 /// GET /api/qc-reports/:id/pdf — RENDER ON DEMAND from the frozen rows.
 ///
 /// No PDF bytes are persisted anywhere (ADR-0199 §D7), exactly as
-/// `GET /api/invoices/:id/pdf` re-renders from the ledger. Every render
-/// appends one `qcr.report_rendered` carrying the SHA of the bytes just
-/// produced plus whether they matched the issued SHA — so a divergence is
-/// detectable in the chain without anyone storing a byte.
+/// `GET /api/invoices/:id/pdf` re-renders from the ledger.
+///
+/// **A matching download does not write.** This route used to take the
+/// exclusive WRITE guard and append one `qcr.report_rendered` per
+/// download: reading a document mutated the audit chain, every download
+/// serialised behind the single writer, and the chain grew without bound
+/// under a read. It now renders under the READ guard and appends only when
+/// the recomputed SHA does NOT match the pin — which is a real event
+/// (the frozen rows no longer produce the bytes the chain says were
+/// issued) and is bounded by how often that actually happens. On
+/// divergence the render is REDONE under the writer, so the hash that
+/// lands in the chain is the hash of the bytes served, not of a snapshot
+/// an issuance could have raced past.
 async fn handle_get_qc_report_pdf(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -27613,14 +27693,23 @@ async fn handle_get_qc_report_pdf(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<
-            (String, Vec<u8>, Option<bool>),
+            (String, Vec<u8>, String, Option<bool>),
             crate::qc_report::QcReportError,
         > {
-            // Render under the WRITE guard: the render read and the
-            // `qcr.report_rendered` append must see the same rows, and
-            // re-acquiring the writer after a separate read would let an
-            // issuance land in between and audit a hash for a state that no
-            // longer exists.
+            // The common path: a pure read.
+            let (report, bytes, sha, matches) = {
+                let guard = state_for_task.db.read().map_err(|e| {
+                    crate::qc_report::QcReportError::Other(anyhow!("read guard for render: {e}"))
+                })?;
+                crate::qc_report::render_report(&guard, state_for_task.tenant.as_str(), &qcr_id)?
+            };
+            if matches != Some(false) {
+                return Ok((report.report_number, bytes, sha, matches));
+            }
+
+            // Divergence — a real integrity event, so it goes in the chain.
+            // Re-render under the writer so the audited hash is the hash of
+            // the bytes this response actually carries.
             let mut guard = state_for_task.db.write().map_err(|e| {
                 crate::qc_report::QcReportError::Other(anyhow!("shared writer for render: {e}"))
             })?;
@@ -27653,12 +27742,12 @@ async fn handle_get_qc_report_pdf(
             tx.commit().map_err(|e| {
                 crate::qc_report::QcReportError::Other(anyhow!("commit render-audit tx: {e}"))
             })?;
-            Ok((report.report_number, bytes, matches))
+            Ok((report.report_number, bytes, sha, matches))
         },
     )
     .await;
     match result {
-        Ok(Ok((report_number, bytes, matches))) => {
+        Ok(Ok((report_number, bytes, sha, matches))) => {
             let filename = format!(
                 "{}.pdf",
                 report_number
@@ -27684,6 +27773,14 @@ async fn handle_get_qc_report_pdf(
                     // (or a script) can see a divergence without parsing the
                     // audit chain. The bytes are still served: withholding them
                     // would hide the evidence of the divergence.
+                    // The SHA of the bytes in THIS response. It is not on
+                    // the page — a document cannot contain its own hash —
+                    // so it is surfaced out-of-band, here and on the chain
+                    // entry `Audit chain ref` names.
+                    (
+                        axum::http::HeaderName::from_static("x-aberp-qc-sha256"),
+                        sha,
+                    ),
                     (
                         axum::http::HeaderName::from_static("x-aberp-qc-sha-matches-issued"),
                         // "draft" — not "false" — when there is no pin to
@@ -27824,14 +27921,14 @@ async fn handle_record_drawing_ref(
     let state_for_task = state.clone();
     let result = tokio::task::spawn_blocking(
         move || -> std::result::Result<aberp_qa::PartDrawingRef, aberp_qa::QcError> {
-            let conn = state_for_task
+            let mut conn = state_for_task
                 .db
                 .write()
                 .map_err(|e| aberp_qa::QcError::Storage(anyhow!("open DuckDB: {e}")))?;
             aberp_qa::ensure_schema(&conn)
                 .map_err(|e| aberp_qa::QcError::Storage(anyhow!("ensure qa/qc schema: {e}")))?;
             aberp_qa::record_drawing_ref(
-                &conn,
+                &mut conn,
                 state_for_task.tenant.as_str(),
                 body,
                 &operator,
