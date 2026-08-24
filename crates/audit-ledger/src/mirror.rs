@@ -562,7 +562,7 @@ fn trim_mirror_to_inner(
 /// Opened `append`-mode so every write lands at EOF regardless of the file
 /// offset, and `create` so the bootstrap path can lock before the file exists.
 ///
-/// ADR-0099 R3 — the wait is BOUNDED ([`MIRROR_LOCK_TIMEOUT`]). `flock` is
+/// ADR-0099 R3 — the wait is BOUNDED ([`RECONCILE_LOCK_TIMEOUT`]). `flock` is
 /// cross-process, and the only caller ([`ensure_consistent_with_db`]) is invoked
 /// by `aberp::snapshot::reconcile_mirror_for` while that fn holds `aberp_db`'s
 /// single writer mutex. An untimed wait therefore let ANY stuck peer — a hung
@@ -571,52 +571,68 @@ fn trim_mirror_to_inner(
 /// this untimed on the reasoning that a timeout must choose between refusing to
 /// boot and proceeding unsynchronised; that is a false dilemma. The timeout
 /// FAILS LOUD ([`AppendError::MirrorLockTimeout`]) and never proceeds
-/// unsynchronised, so the TOCTOU R2 closed stays closed and the wedge is gone.
+/// unsynchronised, so the TOCTOU R2 closed stays closed.
+///
+/// This bound alone did NOT remove the wedge, which is what R3 first claimed:
+/// the per-commit taker was still untimed, and that is the one holding the
+/// writer mutex on every commit. [`sync_mirror_lockstep`] bounds that one
+/// (round 4), benignly (round 5).
 fn lock_mirror_exclusive(mirror_path: &Path) -> Result<File, AppendError> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(mirror_path)
-        .map_err(AppendError::MirrorIo)?;
+    let file = open_mirror_for_append(mirror_path)?;
     lock_exclusive_bounded(&file, mirror_path, RECONCILE_LOCK_TIMEOUT)?;
     Ok(file)
 }
 
-/// ADR-0099 R3 (round 4) — take the mirror's exclusive `flock` with a BOUNDED
-/// wait, returning [`AppendError::MirrorLockTimeout`] rather than blocking
-/// forever.
+/// ADR-0099 R3 — take the mirror's exclusive `flock` with a BOUNDED wait,
+/// returning [`AppendError::MirrorLockTimeout`] rather than blocking forever.
 ///
-/// `fs2` exposes no timed blocking acquire, so the bound is a `try_lock` spin at
-/// [`MIRROR_LOCK_POLL`]. Only the documented contention sentinel is retried; any
-/// other I/O error is a real failure and is surfaced verbatim.
+/// This is the **bounded-FATAL** form, and (round 5) its only caller is
+/// [`lock_mirror_exclusive`], i.e. the booting/pre-snapshot reconciler. That is
+/// the one taker for which a timeout is both genuinely fatal AND safe: it has
+/// committed nothing, so refusing loses no work, and refusing to proceed is what
+/// keeps R2's TOCTOU closed.
 ///
-/// **Both** mirror-lock takers go through this. R3's first pass bounded only
-/// [`lock_mirror_exclusive`], which was the arm that could afford to wait — the
-/// reconciler runs once at boot and once per snapshot. [`sync_mirror`] is the
-/// one on the per-commit hot path, called from `aberp_db`'s `WriteGuard::drop`
-/// **while the single writer mutex is still held**, so leaving it untimed left
-/// the actual wedge fully intact: a stuck peer still froze every serve DB write
-/// for its whole lifetime, with no diagnostic. Measured before this fix — one
-/// ordinary `Handle::write()` + guard drop took 30.03 s against a peer holding
-/// the lock for 30 s. Bounding the reconciler alone also inverted the asymmetry:
-/// under contention the `sync_mirror` holder always won and the *booting*
-/// process took the fatal timeout.
+/// The per-commit taker is deliberately NOT here. It needs the same bound for a
+/// different reason (it holds `aberp_db`'s writer mutex) but the opposite
+/// consequence (its transaction has already committed, so an `Err` would report
+/// failure for durable work). It goes through [`try_lock_exclusive_within`] and
+/// reports [`LockstepSync::SkippedLockContended`] — see [`sync_mirror_lockstep`].
 fn lock_exclusive_bounded(
     file: &File,
     mirror_path: &Path,
     budget: std::time::Duration,
 ) -> Result<(), AppendError> {
+    if try_lock_exclusive_within(file, budget)? {
+        Ok(())
+    } else {
+        Err(AppendError::MirrorLockTimeout {
+            path: mirror_path.display().to_string(),
+            waited_ms: budget.as_millis() as u64,
+        })
+    }
+}
+
+/// Try to take `file`'s exclusive `flock`, giving up after `budget`.
+/// `Ok(false)` means the budget ran out with a peer still holding it.
+///
+/// ADR-0099 R3 (round 5) — "we did not get the lock" and "that is fatal" are
+/// two different questions, and only the CALLER can answer the second. Round 4
+/// fused them into one helper that always returned `Err`, which is why the 2 s
+/// budget reached fifteen already-committed money-CLI callers as a hard error.
+/// The spin (`fs2` exposes no timed blocking acquire) polls at
+/// [`MIRROR_LOCK_POLL`]; only the documented contention sentinel is retried, any
+/// other I/O error is a real failure and is surfaced verbatim.
+fn try_lock_exclusive_within(
+    file: &File,
+    budget: std::time::Duration,
+) -> Result<bool, AppendError> {
     let deadline = std::time::Instant::now() + budget;
     loop {
         match file.try_lock_exclusive() {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(true),
             Err(e) if e.kind() == fs2::lock_contended_error().kind() => {
                 if std::time::Instant::now() >= deadline {
-                    return Err(AppendError::MirrorLockTimeout {
-                        path: mirror_path.display().to_string(),
-                        waited_ms: budget.as_millis() as u64,
-                    });
+                    return Ok(false);
                 }
                 std::thread::sleep(MIRROR_LOCK_POLL);
             }
@@ -630,19 +646,36 @@ fn lock_exclusive_bounded(
 /// and every legitimate holder is orders of magnitude below this.
 const RECONCILE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long the LOCKSTEP [`sync_mirror`] waits. Deliberately much shorter than
+/// How long [`sync_mirror_lockstep`] waits. Deliberately much shorter than
 /// [`RECONCILE_LOCK_TIMEOUT`], because the two have opposite consequences and
 /// the budget follows the consequence, not the caller:
 ///
 /// * The reconciler failing is fatal, so waiting is worth it.
-/// * `sync_mirror` failing is BENIGN — its caller logs and continues, the mirror
-///   simply stays BEHIND, and the next write or the pre-snapshot reconcile
-///   catches it up. A behind mirror is the safe direction (ADR-0110 D3: the
-///   dangerous one is a mirror that runs AHEAD of the DB).
+/// * The lockstep sync failing is BENIGN — it reports
+///   [`LockstepSync::SkippedLockContended`], `WriteGuard::drop` logs it and
+///   continues, the mirror simply stays BEHIND, and the next write or the
+///   pre-snapshot reconcile catches it up.
+///
+/// **A behind mirror is the safe direction, with one witness caveat.** It is
+/// safe in the sense ADR-0110 D3 means: the dangerous state is a mirror that
+/// runs AHEAD of the DB, because that is the one the reconciler must treat as a
+/// possible lost DB commit. What a skipped sync costs is the mirror's role as
+/// the WITNESS for the rows it skipped. Had the sync run, a later loss of those
+/// rows would surface at the next reconcile as
+/// [`AppendError::MirrorAheadOfDb`] and be replayed back with ZERO row loss;
+/// with the sync skipped, DB and mirror simply agree that the rows are absent
+/// and that loss is INVISIBLE until some later, synced row is lost and the
+/// control catches THAT one as `MirrorAheadOfDb`. So skipping trades detection
+/// latency for liveness — it never creates the dangerous direction, but it does
+/// not leave detection untouched either.
 ///
 /// So on the hot path we tolerate a normal hand-off — brief contention with the
 /// in-process reconciler is routine and a zero-wait `try_lock` would skip
-/// spuriously — and bail out fast on a genuine wedge, keeping serve responsive.
+/// spuriously — and bail out on a genuine wedge. That BOUNDS the damage rather
+/// than removing it: while a peer stays stuck, every commit still pays the full
+/// budget with `aberp_db`'s writer mutex held (measured 2.06 s per commit), so
+/// serve is slowed, not kept responsive. An unbounded freeze becomes a bounded
+/// per-commit cost, which is the whole of the claim.
 const SYNC_MIRROR_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Poll interval for the bounded lock waits. Short enough that an
@@ -782,19 +815,102 @@ pub fn sync_mirror(
 ) -> Result<u64, AppendError> {
     // 1. Open (or create) the mirror file in append+read mode. The
     //    advisory lock is held on this handle for the whole call.
-    let file = OpenOptions::new()
+    let file = open_mirror_for_append(mirror_path)?;
+    // ADR-0099 R3 (round 5) — this acquire is UNBOUNDED, deliberately, and the
+    // bound lives on [`sync_mirror_lockstep`] instead. Round 4 put a 2 s
+    // bounded-FATAL budget here, which is the wrong place: every direct caller
+    // of this fn has ALREADY COMMITTED (and, on the money paths, already
+    // submitted to NAV) and propagates the result with `?`. A budget here turns
+    // a slow peer into a command that reports failure for work that landed —
+    // measured by the round-4 adversarial as `Err(MirrorLockTimeout)` at 2.05 s
+    // where the untimed acquire returned `Ok(1)` at 4.99 s against a 5 s peer.
+    // Waiting is the benign outcome for these callers; the wedge that actually
+    // needed bounding is the per-commit one, which holds `aberp_db`'s writer
+    // mutex — see [`sync_mirror_lockstep`].
+    file.lock_exclusive().map_err(AppendError::MirrorIo)?;
+    sync_mirror_locked(conn, meta, mirror_path, file)
+}
+
+/// What the LOCKSTEP mirror sync did. ADR-0099 R3 (round 5).
+///
+/// The per-commit sync is the one taker that must never block for long and must
+/// never fail its caller: it runs in `aberp_db`'s `WriteGuard::drop`, after the
+/// transaction has committed, with the single writer mutex still held. Both of
+/// those force the outcome to be a REPORT rather than a `Result` the caller can
+/// only propagate — hence a variant for "did not run", not an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockstepSync {
+    /// The mirror was locked, verified and brought to the DB's head, whose seq
+    /// this carries (identical to [`sync_mirror`]'s success value).
+    Synced(u64),
+    /// A peer still held the mirror's `flock` when the budget ran out, so the
+    /// sync was SKIPPED. The commit itself is untouched and durable; the mirror
+    /// is left BEHIND the DB — see [`SYNC_MIRROR_LOCK_TIMEOUT`] for what that
+    /// costs and what it does not.
+    SkippedLockContended {
+        /// How long the acquire waited before giving up, in milliseconds.
+        waited_ms: u64,
+    },
+}
+
+/// Synchronise the mirror on the PER-COMMIT path, bounded and BENIGN.
+/// ADR-0099 R3 (round 5).
+///
+/// Identical to [`sync_mirror`] except for how it takes the lock. This is the
+/// variant `aberp_db`'s `WriteGuard::drop` calls, and it is the only caller in
+/// the tree that both (a) runs while the single writer mutex is held, so an
+/// untimed acquire freezes every DB write in the process behind a stuck peer,
+/// and (b) has nowhere to propagate a failure to, because its transaction has
+/// already committed. So the wait is bounded at [`SYNC_MIRROR_LOCK_TIMEOUT`]
+/// and exhausting it yields [`LockstepSync::SkippedLockContended`] — a report,
+/// not an `Err`.
+///
+/// Round 4 measured the unbounded form: one ordinary `Handle::write()` + guard
+/// drop took 30.03 s against a peer holding the mirror `flock` for 30 s.
+///
+/// # Errors
+///
+/// The same set as [`sync_mirror`] — a contended lock is NOT among them.
+pub fn sync_mirror_lockstep(
+    conn: &Connection,
+    meta: &LedgerMeta,
+    mirror_path: &Path,
+) -> Result<LockstepSync, AppendError> {
+    let file = open_mirror_for_append(mirror_path)?;
+    if !try_lock_exclusive_within(&file, SYNC_MIRROR_LOCK_TIMEOUT)? {
+        return Ok(LockstepSync::SkippedLockContended {
+            waited_ms: SYNC_MIRROR_LOCK_TIMEOUT.as_millis() as u64,
+        });
+    }
+    Ok(LockstepSync::Synced(sync_mirror_locked(
+        conn,
+        meta,
+        mirror_path,
+        file,
+    )?))
+}
+
+/// Open (or create) the mirror in append+read mode — the shape every mirror
+/// writer needs. `append` so writes land at EOF regardless of the file offset,
+/// `create` so the bootstrap path can lock before the file exists.
+fn open_mirror_for_append(mirror_path: &Path) -> Result<File, AppendError> {
+    OpenOptions::new()
         .create(true)
         .append(true)
         .read(true)
         .open(mirror_path)
-        .map_err(AppendError::MirrorIo)?;
-    // ADR-0099 R3 (round 4) — BOUNDED. This runs inside `WriteGuard::drop` with
-    // `aberp_db`'s writer mutex still held, so an untimed acquire here wedges
-    // every DB write in the process behind whatever peer holds the mirror. On
-    // timeout the caller logs and continues; the mirror stays BEHIND and the
-    // next write or the pre-snapshot reconcile catches it up.
-    lock_exclusive_bounded(&file, mirror_path, SYNC_MIRROR_LOCK_TIMEOUT)?;
+        .map_err(AppendError::MirrorIo)
+}
 
+/// The body of [`sync_mirror`], from the point the mirror's exclusive `flock` is
+/// already held on `file`. Split out so the two entry points can differ ONLY in
+/// how they acquire that lock and what a contended acquire means to them.
+fn sync_mirror_locked(
+    conn: &Connection,
+    meta: &LedgerMeta,
+    mirror_path: &Path,
+    file: File,
+) -> Result<u64, AppendError> {
     // 2. Re-stat now that the lock is held — the bytes we read are
     //    the bytes we own. `read_mirror_entries` opens the file
     //    separately for read; that's fine because the lock is
@@ -1253,7 +1369,9 @@ pub fn ensure_consistent_with_db(
 ///    while the mirror still held the row. That is a lost committed audit entry
 ///    reported as healthy — the exact class this ADR exists for. Requiring the
 ///    DB to hold `head.seq` rows over `[1..=head.seq]` closes it for one more
-///    `COUNT(*)`.
+///    aggregate — `COUNT(*)` **and** `COUNT(DISTINCT seq)`, because without a
+///    `UNIQUE(seq)` a duplicate offsets a hole and `COUNT(*)` alone still reads
+///    as agreement (round 5; see [`read_db_seq_counts_up_to`]).
 ///
 /// `Ok(Some(seq))` = the earliest seq at which the two disagree, or at which the
 /// DB has no row at all (the DB lost it).
@@ -1268,7 +1386,7 @@ fn first_divergent_seq(
     match read_db_entry_at_seq(conn, head.seq)? {
         Some(e)
             if hex::encode(e.entry_hash.as_bytes()) == head.entry_hash
-                && read_db_entry_count_up_to(conn, head.seq)? == head.seq =>
+                && read_db_seq_counts_up_to(conn, head.seq)? == (head.seq, head.seq) =>
         {
             return Ok(None)
         }
@@ -1289,17 +1407,27 @@ fn first_divergent_seq(
     Ok(Some(head.seq))
 }
 
-/// ADR-0099 R3 (round 4) — how many `audit_ledger` rows the DB holds over
-/// `[1..=up_to]`. A hash chain proves what its surviving rows say; it cannot
-/// prove that none were DELETEd out from under it, because removing an interior
-/// row rewrites nothing. This is the cardinality half of that proof.
-fn read_db_entry_count_up_to(conn: &Connection, up_to: u64) -> Result<u64, AppendError> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM audit_ledger WHERE seq <= ?",
+/// ADR-0099 R3 — `(rows, distinct_seqs)` that the DB holds over `[1..=up_to]`.
+/// A hash chain proves what its surviving rows say; it cannot prove that none
+/// were DELETEd out from under it, because removing an interior row rewrites
+/// nothing. This is the cardinality half of that proof.
+///
+/// **Round 5 — `COUNT(*)` alone is not the cardinality half.** `audit_ledger`
+/// has no `UNIQUE(seq)` (S341 dropped that ART index, duckdb#23046 / S332), so
+/// a duplicate seq is representable and OFFSETS a hole one-for-one: with
+/// `db = [1, 2, 2, 4, 5]` against `mirror = [1..=5]` the head hash matches and
+/// `COUNT(*)` is 5, so the pair reconciled `Ok(Unchanged)` while the DB had lost
+/// its committed entry at seq 3. Requiring `COUNT(DISTINCT seq)` to agree as
+/// well closes it: the two counts can only BOTH equal `head.seq` when the DB
+/// holds each of `[1..=head.seq]` exactly once. Still O(1) — one query, two
+/// aggregates.
+fn read_db_seq_counts_up_to(conn: &Connection, up_to: u64) -> Result<(u64, u64), AppendError> {
+    let (rows, distinct): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COUNT(DISTINCT seq) FROM audit_ledger WHERE seq <= ?",
         [up_to as i64],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    Ok(n.max(0) as u64)
+    Ok((rows.max(0) as u64, distinct.max(0) as u64))
 }
 
 /// Read the DB's max entry seq (0 if the table is empty). Reuses the

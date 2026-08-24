@@ -1338,17 +1338,39 @@ impl Drop for WriteGuard<'_> {
         //      shared connection + the once-built meta, so it sees exactly what
         //      the just-finished txn committed. Gated on the data flush above:
         //      a mirror row must never be durable before the row it mirrors.
+        //      ADR-0099 R3 (round 5) — through `sync_mirror_lockstep`, NOT
+        //      `sync_mirror`: this is the one caller that holds the writer mutex
+        //      while it runs, so its lock wait must be bounded, AND the one with
+        //      nowhere to report to, so exhausting that bound must not be an
+        //      error. Both non-Synced outcomes are logged and stepped over; the
+        //      mirror is left BEHIND, which the next write or the pre-snapshot
+        //      reconcile catches up.
         if data_is_durable {
             if let Some(conn) = self.inner.conn.as_ref() {
-                if let Err(e) =
-                    aberp_audit_ledger::sync_mirror(conn, &handle.meta, &handle.mirror_path)
-                {
-                    tracing::warn!(
-                        error = %e,
-                        mirror = %handle.mirror_path.display(),
-                        "aberp-db: lockstep sync_mirror failed (post-commit); mirror will \
-                         reconcile on the next write or at the pre-snapshot fsync"
-                    );
+                match aberp_audit_ledger::sync_mirror_lockstep(
+                    conn,
+                    &handle.meta,
+                    &handle.mirror_path,
+                ) {
+                    Ok(aberp_audit_ledger::LockstepSync::Synced(_)) => {}
+                    Ok(aberp_audit_ledger::LockstepSync::SkippedLockContended { waited_ms }) => {
+                        tracing::warn!(
+                            waited_ms,
+                            mirror = %handle.mirror_path.display(),
+                            "aberp-db: lockstep sync_mirror SKIPPED — a peer held the mirror \
+                             lock for the whole budget; the commit is durable and the mirror \
+                             is left behind, to be caught up by the next write or the \
+                             pre-snapshot reconcile. If this repeats, `lsof` the mirror path"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            mirror = %handle.mirror_path.display(),
+                            "aberp-db: lockstep sync_mirror failed (post-commit); mirror will \
+                             reconcile on the next write or at the pre-snapshot fsync"
+                        );
+                    }
                 }
             }
         }

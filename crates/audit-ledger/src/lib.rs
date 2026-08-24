@@ -50,7 +50,8 @@ pub use entry::{Actor, BinaryHash, Entry, EntryHash, EntryId, EventKind, Sequenc
 pub use error::{AppendError, VerifyError};
 pub use mirror::{
     ensure_consistent_with_db, mirror_path_for, read_mirror_entries, read_mirror_under_tail_policy,
-    replay_mirror_delta, sync_mirror, MirrorEntry, MirrorTailPolicy, RecoveryAction,
+    replay_mirror_delta, sync_mirror, sync_mirror_lockstep, LockstepSync, MirrorEntry,
+    MirrorTailPolicy, RecoveryAction,
 };
 // S344 / PR-38 — OPTIONAL digital-identity attestation for future audit
 // payloads (foundation only; no event populates it yet). See [`signer`].

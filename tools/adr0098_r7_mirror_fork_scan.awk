@@ -6,7 +6,11 @@
 #       (open_in_memory excluded: the sanctioned shared-instance seam.
 #       from_connection is NOT excluded — ADR-0105 F1: line-scoped laundering.
 #        seams), AND
-#   (2) a `.sync_mirror(` call.
+#   (2) a `.sync_mirror(` call — matched on the `sync_mirror` PREFIX, so every
+#       spelling of the mirror-write entry point counts (ADR-0099 R3 round 5
+#       added `sync_mirror_lockstep`; a bare `sync_mirror(`-only token would
+#       have let a rogue opener paired with the new name walk straight through
+#       this gate, the name-keyed-bypass class ADR-0111 R2 was bitten by).
 # That pair IS the write-fork signature the 415/416 forensic named: a separate
 # DuckDB instance, opened off the DB PATH, reads a STALE ledger head, re-assigns
 # an already-used sequence, and then rewrites the mirror FROM ITS OWN VIEW. A
@@ -49,6 +53,6 @@ BEGIN{ depth=0; tdepth=-1; pending=0; inblk=0; instr=0; curfn=""; curfn_depth=-1
   intest=(tdepth>=0)
   if(!intest && curfn!=""){
     if((code ~ /(Connection::open(_with_flags)?|Ledger::open|DuckDbBillingStore::open|Database::open)\(/ || code ~ /append_reopen[ \t]*\(/) && code !~ /open_in_memory/) has_open=1
-    if(code ~ /sync_mirror[ \t]*\(/) has_mirror=1
+    if(code ~ /sync_mirror[A-Za-z0-9_]*[ \t]*\(/) has_mirror=1
   }
 }
