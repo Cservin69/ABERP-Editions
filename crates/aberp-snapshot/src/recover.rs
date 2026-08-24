@@ -935,11 +935,20 @@ pub fn live_durable_checkpoint(db_path: &Path, tenant: &str) -> Result<Option<Ch
 /// therefore produced an evidence copy missing exactly the rows the operator
 /// needs, and the originals were unlinked seconds later — irrecoverably.
 ///
-/// Copying the WAL to `<dest>.wal` keeps the evidence a COMPLETE, openable
-/// database: `duckdb <db>.CORRUPT-<tag>` replays it and shows the rows as
-/// committed. A missing WAL is normal (a freshly checkpointed DB has none) and
-/// is not an error; a WAL that exists and cannot be copied IS one, because
-/// silently shipping a partial evidence copy is the failure this closes.
+/// Copying the WAL to `<dest>.wal` keeps the evidence an openable database:
+/// `duckdb <db>.CORRUPT-<tag>` replays it and shows the rows as committed. A
+/// missing WAL is normal (a freshly checkpointed DB has none) and is not an
+/// error; a WAL that exists and cannot be copied IS one, because silently
+/// shipping a partial evidence copy is the failure this closes.
+///
+/// NOT ATOMIC against a concurrent writer, and deliberately not claimed to be.
+/// The main file and the WAL are copied in two steps, so a checkpoint landing
+/// between them yields old-main + folded-WAL. That window is real on the
+/// `aberp recover` CLI path, which an operator can type while `serve` is up —
+/// but the enclosing operation is already unsafe against a live writer (it
+/// `atomic_install`s over the live path), so closing this window alone would buy
+/// nothing. Recorded in ADR §R3.7 rather than papered over with a guarantee the
+/// two `fs::copy` calls cannot make.
 fn preserve_corrupt_db(db_path: &Path) -> Result<PathBuf> {
     let dest = sibling(db_path, &format!("{CORRUPT_INFIX}{}", unique_tag()));
     std::fs::copy(db_path, &dest).map_err(|e| SnapshotError::io(&dest, e))?;

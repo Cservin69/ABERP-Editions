@@ -454,12 +454,55 @@ fn read_mirror_under_tail_policy_inner(
 /// `.corrupt-` points the operator at the mirror, when the mirror is the intact
 /// party and the DB is the one that lost entries.
 fn preserve_diverged_mirror(mirror_path: &Path) -> Result<PathBuf, AppendError> {
+    preserve_mirror_copy(mirror_path, "diverged")
+}
+
+/// Copy `mirror_path` aside to `<mirror>.<infix>-<nanos>.bak` — unless an
+/// existing `.<infix>-*.bak` is already byte-identical, in which case that one
+/// IS the evidence and its path is returned instead.
+///
+/// ADR-0099 R3 (round 4) — the de-duplication is load-bearing now that a
+/// divergence is TERMINAL. Under R2 the diverged route "succeeded" and stopped;
+/// under R3 it refuses, so a supervisor restart loop re-runs the reconcile every
+/// boot, and `reconcile_mirror_for` is best-effort so a *running* process also
+/// re-runs it every snapshot cycle. Copying unconditionally meant one full copy
+/// of the mirror per attempt, forever — measured at 4 copies in 4 calls — and
+/// the audit mirror is typically the largest file in the tenant directory, on
+/// the same filesystem as the DB. Filling that disk while refusing to boot would
+/// turn a recoverable incident into an unrecoverable one.
+///
+/// Byte-comparison, not just existence: if the mirror has CHANGED since the last
+/// preserve (the torn-tail path trims it after preserving), the new state is new
+/// evidence and gets its own copy. Nothing is ever overwritten or removed.
+fn preserve_mirror_copy(mirror_path: &Path, infix: &str) -> Result<PathBuf, AppendError> {
+    let current = std::fs::read(mirror_path).map_err(AppendError::MirrorIo)?;
+    let prefix = format!(
+        "{}.{infix}-",
+        mirror_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
+    if let Some(dir) = mirror_path.parent() {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&prefix)
+                    && name.ends_with(".bak")
+                    && std::fs::read(e.path()).is_ok_and(|b| b == current)
+                {
+                    return Ok(e.path());
+                }
+            }
+        }
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let mut os = mirror_path.as_os_str().to_owned();
-    os.push(format!(".diverged-{nanos}.bak"));
+    os.push(format!(".{infix}-{nanos}.bak"));
     let backup = PathBuf::from(os);
     std::fs::copy(mirror_path, &backup).map_err(AppendError::MirrorIo)?;
     Ok(backup)
@@ -470,15 +513,7 @@ fn preserve_diverged_mirror(mirror_path: &Path) -> Result<PathBuf, AppendError> 
 /// [`preserve_ahead_mirror`], writing `<mirror>.corrupt-<nanos>.bak`. Returns
 /// the backup path for the surfaced log/error.
 fn preserve_corrupt_mirror(mirror_path: &Path) -> Result<PathBuf, AppendError> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut os = mirror_path.as_os_str().to_owned();
-    os.push(format!(".corrupt-{nanos}.bak"));
-    let backup = PathBuf::from(os);
-    std::fs::copy(mirror_path, &backup).map_err(AppendError::MirrorIo)?;
-    Ok(backup)
+    preserve_mirror_copy(mirror_path, "corrupt")
 }
 
 /// Durably truncate the mirror to `keep_len` bytes (the verified-intact
@@ -544,17 +579,43 @@ fn lock_mirror_exclusive(mirror_path: &Path) -> Result<File, AppendError> {
         .read(true)
         .open(mirror_path)
         .map_err(AppendError::MirrorIo)?;
-    let deadline = std::time::Instant::now() + MIRROR_LOCK_TIMEOUT;
+    lock_exclusive_bounded(&file, mirror_path, RECONCILE_LOCK_TIMEOUT)?;
+    Ok(file)
+}
+
+/// ADR-0099 R3 (round 4) — take the mirror's exclusive `flock` with a BOUNDED
+/// wait, returning [`AppendError::MirrorLockTimeout`] rather than blocking
+/// forever.
+///
+/// `fs2` exposes no timed blocking acquire, so the bound is a `try_lock` spin at
+/// [`MIRROR_LOCK_POLL`]. Only the documented contention sentinel is retried; any
+/// other I/O error is a real failure and is surfaced verbatim.
+///
+/// **Both** mirror-lock takers go through this. R3's first pass bounded only
+/// [`lock_mirror_exclusive`], which was the arm that could afford to wait — the
+/// reconciler runs once at boot and once per snapshot. [`sync_mirror`] is the
+/// one on the per-commit hot path, called from `aberp_db`'s `WriteGuard::drop`
+/// **while the single writer mutex is still held**, so leaving it untimed left
+/// the actual wedge fully intact: a stuck peer still froze every serve DB write
+/// for its whole lifetime, with no diagnostic. Measured before this fix — one
+/// ordinary `Handle::write()` + guard drop took 30.03 s against a peer holding
+/// the lock for 30 s. Bounding the reconciler alone also inverted the asymmetry:
+/// under contention the `sync_mirror` holder always won and the *booting*
+/// process took the fatal timeout.
+fn lock_exclusive_bounded(
+    file: &File,
+    mirror_path: &Path,
+    budget: std::time::Duration,
+) -> Result<(), AppendError> {
+    let deadline = std::time::Instant::now() + budget;
     loop {
         match file.try_lock_exclusive() {
-            Ok(()) => return Ok(file),
-            // Contended: the documented `fs2` sentinel. Any OTHER io error is a
-            // real failure and is surfaced verbatim, not retried.
+            Ok(()) => return Ok(()),
             Err(e) if e.kind() == fs2::lock_contended_error().kind() => {
                 if std::time::Instant::now() >= deadline {
                     return Err(AppendError::MirrorLockTimeout {
                         path: mirror_path.display().to_string(),
-                        waited_ms: MIRROR_LOCK_TIMEOUT.as_millis() as u64,
+                        waited_ms: budget.as_millis() as u64,
                     });
                 }
                 std::thread::sleep(MIRROR_LOCK_POLL);
@@ -564,16 +625,29 @@ fn lock_mirror_exclusive(mirror_path: &Path) -> Result<File, AppendError> {
     }
 }
 
-/// ADR-0099 R3 — how long [`lock_mirror_exclusive`] waits for the cross-process
-/// mirror lock before failing loud. Generous relative to every legitimate holder
-/// (`sync_mirror` holds it for one append + fsync; the reconciler for one
-/// bounded compare), and far below any human's patience for a wedged serve.
-const MIRROR_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long [`ensure_consistent_with_db`] waits for the mirror lock. Generous:
+/// it runs at boot and before a snapshot, its failure is FATAL (boot refuses),
+/// and every legitimate holder is orders of magnitude below this.
+const RECONCILE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Poll interval for the bounded lock wait. `fs2` exposes no timed blocking
-/// acquire, so the bound is a `try_lock` spin; the interval is short enough that
-/// an uncontended-after-a-moment handoff is not perceptibly delayed and long
-/// enough that a 10 s wait is ~200 syscalls, not a spin loop.
+/// How long the LOCKSTEP [`sync_mirror`] waits. Deliberately much shorter than
+/// [`RECONCILE_LOCK_TIMEOUT`], because the two have opposite consequences and
+/// the budget follows the consequence, not the caller:
+///
+/// * The reconciler failing is fatal, so waiting is worth it.
+/// * `sync_mirror` failing is BENIGN — its caller logs and continues, the mirror
+///   simply stays BEHIND, and the next write or the pre-snapshot reconcile
+///   catches it up. A behind mirror is the safe direction (ADR-0110 D3: the
+///   dangerous one is a mirror that runs AHEAD of the DB).
+///
+/// So on the hot path we tolerate a normal hand-off — brief contention with the
+/// in-process reconciler is routine and a zero-wait `try_lock` would skip
+/// spuriously — and bail out fast on a genuine wedge, keeping serve responsive.
+const SYNC_MIRROR_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Poll interval for the bounded lock waits. Short enough that an
+/// uncontended-after-a-moment hand-off is not perceptibly delayed, long enough
+/// that a 10 s wait is ~200 syscalls rather than a spin loop.
 const MIRROR_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Replay the mirror's append-only JSONL delta — every record with
@@ -714,7 +788,12 @@ pub fn sync_mirror(
         .read(true)
         .open(mirror_path)
         .map_err(AppendError::MirrorIo)?;
-    file.lock_exclusive().map_err(AppendError::MirrorIo)?;
+    // ADR-0099 R3 (round 4) — BOUNDED. This runs inside `WriteGuard::drop` with
+    // `aberp_db`'s writer mutex still held, so an untimed acquire here wedges
+    // every DB write in the process behind whatever peer holds the mirror. On
+    // timeout the caller logs and continues; the mirror stays BEHIND and the
+    // next write or the pre-snapshot reconcile catches it up.
+    lock_exclusive_bounded(&file, mirror_path, SYNC_MIRROR_LOCK_TIMEOUT)?;
 
     // 2. Re-stat now that the lock is held — the bytes we read are
     //    the bytes we own. `read_mirror_entries` opens the file
@@ -1155,11 +1234,26 @@ pub fn ensure_consistent_with_db(
 /// ADR-0099 R2 — does the mirror's prefix `[1..=mirror_max_seq]` agree with the
 /// DB's? Returns `Ok(None)` when it does.
 ///
-/// **O(1) on the happy path, by construction.** Both stores are hash chains, so
-/// the mirror's head `entry_hash` commits to its ENTIRE prefix and the DB's row
-/// at that seq commits to its own. Equal hashes therefore prove the whole
-/// prefix agrees — one row read, no scan. The full scan happens only once we
-/// already know we are going to refuse, to name the seq for the operator.
+/// **O(1) on the happy path, by construction** — two reads, no scan. The full
+/// scan happens only once we already know we are going to refuse, to name the
+/// seq for the operator.
+///
+/// The two reads are BOTH required, and the second is the one ADR-0099 R3's
+/// first pass was missing:
+///
+/// 1. **Head hash.** Both stores are hash chains, so the mirror's head
+///    `entry_hash` commits to its entire prefix and the DB's row at that seq
+///    commits to its own. Equal hashes prove the two agree *about the rows the
+///    DB still has*.
+/// 2. **Cardinality.** A hash chain commits to its history, NOT to its own
+///    continued existence in the table. `DELETE FROM audit_ledger WHERE seq = 3`
+///    leaves every surviving row's `entry_hash` untouched, head included — so
+///    the head compare passes and an interior hole reads as agreement. Measured:
+///    a 5-entry ledger with seq 3 deleted from the DB reconciled `Ok(Unchanged)`
+///    while the mirror still held the row. That is a lost committed audit entry
+///    reported as healthy — the exact class this ADR exists for. Requiring the
+///    DB to hold `head.seq` rows over `[1..=head.seq]` closes it for one more
+///    `COUNT(*)`.
 ///
 /// `Ok(Some(seq))` = the earliest seq at which the two disagree, or at which the
 /// DB has no row at all (the DB lost it).
@@ -1170,9 +1264,14 @@ fn first_divergent_seq(
     let Some(head) = mirror_entries.last() else {
         return Ok(None);
     };
-    // The O(1) proof.
+    // The O(1) proof: the head hash AND the row count it presupposes.
     match read_db_entry_at_seq(conn, head.seq)? {
-        Some(e) if hex::encode(e.entry_hash.as_bytes()) == head.entry_hash => return Ok(None),
+        Some(e)
+            if hex::encode(e.entry_hash.as_bytes()) == head.entry_hash
+                && read_db_entry_count_up_to(conn, head.seq)? == head.seq =>
+        {
+            return Ok(None)
+        }
         _ => {}
     }
     // Refusal path only: locate the earliest disagreement for the message.
@@ -1188,6 +1287,19 @@ fn first_divergent_seq(
     }
     // The head disagreed but no interior did — the head IS the divergence.
     Ok(Some(head.seq))
+}
+
+/// ADR-0099 R3 (round 4) — how many `audit_ledger` rows the DB holds over
+/// `[1..=up_to]`. A hash chain proves what its surviving rows say; it cannot
+/// prove that none were DELETEd out from under it, because removing an interior
+/// row rewrites nothing. This is the cardinality half of that proof.
+fn read_db_entry_count_up_to(conn: &Connection, up_to: u64) -> Result<u64, AppendError> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM audit_ledger WHERE seq <= ?",
+        [up_to as i64],
+        |r| r.get(0),
+    )?;
+    Ok(n.max(0) as u64)
 }
 
 /// Read the DB's max entry seq (0 if the table is empty). Reuses the
@@ -1208,15 +1320,7 @@ fn read_db_max_seq(conn: &Connection) -> Result<u64, AppendError> {
 /// the boot reconcile keeps surfacing the AHEAD condition until a human
 /// resolves it. Returns the backup path for the surfaced error message.
 fn preserve_ahead_mirror(mirror_path: &Path) -> Result<PathBuf, AppendError> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut os = mirror_path.as_os_str().to_owned();
-    os.push(format!(".ahead-{nanos}.bak"));
-    let backup = PathBuf::from(os);
-    std::fs::copy(mirror_path, &backup).map_err(AppendError::MirrorIo)?;
-    Ok(backup)
+    preserve_mirror_copy(mirror_path, "ahead")
 }
 
 /// Truncate the mirror and rewrite it from the DB's full entry set

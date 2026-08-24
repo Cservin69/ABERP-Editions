@@ -30266,6 +30266,13 @@ mod tests {
     /// `ensure_consistent_with_db` now proves the shared prefix agrees before it
     /// reports AHEAD: such a mirror strictly EXTENDS the DB's chain, so
     /// snapshot+replay puts back what was lost and drops nothing.
+    ///
+    /// HONEST SCOPE — this pins the CLASSIFIER, not the boot path. Re-inlining
+    /// R2's routing directly into the `match` in `run` would leave this test
+    /// green. Extracting the decision is what makes it testable at all (it lived
+    /// inside a 30k-line fn), but the extraction is a convention the boot path
+    /// must keep honouring, and nothing here enforces that. Recorded as a
+    /// residual in ADR §R3.7 rather than papered over.
     #[test]
     fn only_a_clean_mirror_ahead_is_routed_to_auto_recovery() {
         use aberp_audit_ledger::AppendError;
@@ -30287,7 +30294,7 @@ mod tests {
                 first_divergent_seq: 2508,
                 mirror_max_seq: 2509,
                 db_max_seq: 2511,
-                preserved: "/tmp/m.ahead.bak".into(),
+                preserved: "/tmp/m.diverged.bak".into(),
             }),
             BootMirrorRoute::RefuseFatal,
             "a DIVERGENCE must never reach the recovery engine: it rebuilds from a snapshot \
@@ -30330,7 +30337,7 @@ mod tests {
             first_divergent_seq: 2508,
             mirror_max_seq: 2509,
             db_max_seq: 2511,
-            preserved: "/tmp/m.ahead.bak".into(),
+            preserved: "/tmp/m.diverged.bak".into(),
         });
         assert!(
             msg.contains("aberp recover"),

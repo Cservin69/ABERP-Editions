@@ -447,3 +447,148 @@ fn a_stuck_peer_cannot_wedge_the_reconciler_forever() {
         "the reconciler waited {waited:?} — that is the peer's lifetime, not a bound"
     );
 }
+
+// ── ROUND 4 — what the R3 adversarial found ─────────────────────────────────
+
+/// R3 bounded the WRONG lock. `ensure_consistent_with_db` runs at boot and
+/// before a snapshot; `sync_mirror` runs on EVERY COMMIT, from
+/// `aberp_db`'s `WriteGuard::drop`, **while the single writer mutex is still
+/// held**. Leaving that one untimed left the actual wedge fully intact: a stuck
+/// peer still froze every DB write in the serve process for its whole lifetime,
+/// with no diagnostic — verbatim the failure ADR §R3.5 claimed to have removed.
+///
+/// Measured before the fix: one ordinary `write()` + guard drop took 30.03 s
+/// against a peer holding the mirror lock for 30 s.
+///
+/// The peer here holds for 20 s and is not joined, so restoring the untimed
+/// `lock_exclusive()` fails this assertion rather than hanging the suite.
+#[test]
+fn a_stuck_peer_cannot_wedge_the_per_commit_write_path() {
+    let t = Tmp::new("wedgecommit");
+    let db = t.db();
+    let h = handle(&db);
+    beat(&h, "warm-up"); // establish the mirror before contending for it
+    let mirror = mirror_path_for(&db);
+
+    let held = mirror.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&held)
+            .unwrap();
+        f.lock_exclusive().unwrap();
+        tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        let _ = FileExt::unlock(&f);
+    });
+    rx.recv().expect("the peer took the mirror lock");
+
+    // One ordinary commit through the shared writer. The guard drop runs the
+    // lockstep sync_mirror, which must NOT park on the peer indefinitely.
+    let started = std::time::Instant::now();
+    beat(&h, "under-contention");
+    let waited = started.elapsed();
+
+    assert!(
+        waited < std::time::Duration::from_secs(10),
+        "a commit took {waited:?} while an unrelated process held the mirror lock. That is \
+         the peer's lifetime, not a bound — and it is taken with aberp_db's writer mutex \
+         held, so EVERY DB write in this process is frozen behind a stuck peer."
+    );
+    // The commit itself still succeeded; only the mirror sync was skipped, which
+    // leaves the mirror BEHIND (the safe direction — ADR-0110 D3).
+    assert_eq!(db_rows(&db).len(), 2, "the committed write is not lost");
+}
+
+/// R3's prose claimed the head `entry_hash` "commits to its ENTIRE prefix", so
+/// one row read proves the whole prefix agrees. A hash chain commits to its
+/// HISTORY, not to its own continued existence in the table: deleting an
+/// interior row rewrites nothing, head included. So an interior hole — the DB
+/// losing a committed audit entry, which is the entire subject of this ADR —
+/// read as agreement and reconciled to `Unchanged`.
+#[test]
+fn an_interior_row_the_db_lost_is_not_reported_as_agreement() {
+    let t = Tmp::new("midhole");
+    let db = t.db();
+    let h = handle(&db);
+    for at in ["a", "b", "c", "d", "e"] {
+        beat(&h, at);
+    }
+    let mirror = mirror_path_for(&db);
+    assert_eq!(mirror_seqs(&mirror), vec![1, 2, 3, 4, 5]);
+
+    // A HOLE, not a lost tail: the head and every other row survive untouched,
+    // so every surviving `entry_hash` still matches the mirror's.
+    {
+        let g = h.write().unwrap();
+        g.execute_batch("DELETE FROM audit_ledger WHERE seq = 3;")
+            .unwrap();
+    }
+    drop(h);
+    assert_eq!(
+        db_rows(&db).iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        vec![1, 2, 4, 5],
+        "the DB lost seq 3 and kept its head"
+    );
+
+    let conn = duckdb::Connection::open(&db).unwrap();
+    match ensure_consistent_with_db(&conn, &mirror) {
+        Err(AppendError::MirrorDivergedFromDb {
+            first_divergent_seq,
+            ..
+        }) => assert_eq!(
+            first_divergent_seq, 3,
+            "the refusal must name the hole, not the head"
+        ),
+        other => panic!(
+            "an interior row the DB lost was reported as {other:?}. The mirror holds a \
+             committed entry the DB does not, and the reconciler called it healthy — a head \
+             hash cannot see a hole behind it."
+        ),
+    }
+}
+
+/// Divergence is TERMINAL now, so the reconcile re-runs every boot (supervisor
+/// restart loop) and every snapshot cycle (`reconcile_mirror_for` is
+/// best-effort). Copying the mirror aside unconditionally on each attempt meant
+/// one full copy per attempt, forever, on the same filesystem as the DB — the
+/// audit mirror is usually the largest file in the tenant directory. Filling
+/// that disk while refusing to boot turns a recoverable incident into an
+/// unrecoverable one.
+#[test]
+fn repeated_refusals_do_not_grow_the_evidence_without_bound() {
+    let t = Tmp::new("evidence");
+    let (_db_before, mirror) = build_fork_shape(&t);
+    let dir = mirror.parent().unwrap().to_path_buf();
+    let baks = || {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".diverged-"))
+            .count()
+    };
+
+    let conn = duckdb::Connection::open(t.db()).unwrap();
+    let mut seqs = Vec::new();
+    for _ in 0..4 {
+        match ensure_consistent_with_db(&conn, &mirror) {
+            Err(AppendError::MirrorDivergedFromDb {
+                first_divergent_seq,
+                ..
+            }) => seqs.push(first_divergent_seq),
+            other => panic!("expected a repeated refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(seqs, vec![4, 4, 4, 4], "the verdict must not decay");
+    assert_eq!(
+        baks(),
+        1,
+        "four refusals produced {} copies of an UNCHANGED mirror. A terminal condition is \
+         re-evaluated on every boot and every snapshot cycle, so an unconditional copy is \
+         unbounded growth on the filesystem holding the DB.",
+        baks()
+    );
+}
