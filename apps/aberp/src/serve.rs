@@ -805,6 +805,62 @@ enum BootRecovery {
     Refused(String),
 }
 
+/// ADR-0099 R3 — which boot arm a mirror-reconcile failure takes. Extracted from
+/// the boot `match` so the routing decision is a value that can be asserted on
+/// directly: the defect this closes was a ROUTING defect, and a routing defect
+/// hidden inside a 30k-line `run` is one no test can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootMirrorRoute {
+    /// The DB lost a clean TAIL that the mirror still holds, and the two AGREE
+    /// over their shared prefix. `aberp_snapshot::recover_or_refuse` rebuilds
+    /// from the latest valid snapshot and replays the mirror on top, so every
+    /// row that exists in either store survives. Safe to automate.
+    AutoRecover { trigger: &'static str },
+    /// Terminal. Preserve the evidence and REFUSE to boot.
+    RefuseFatal,
+}
+
+/// Classify a boot mirror-reconcile failure into its [`BootMirrorRoute`].
+///
+/// **Only a clean mirror-AHEAD may auto-recover.** Recovery rebuilds from a
+/// SNAPSHOT and replays the MIRROR's delta; any row that lives in neither input
+/// is discarded by construction. For a clean AHEAD there is no such row (the
+/// mirror strictly extends the DB's chain). For a DIVERGENCE there always is:
+/// the DB's own entries at the re-used seqs. R2 routed divergence here anyway,
+/// on a `SequenceConflict` guarantee that does not exist (see the call site);
+/// the result was a silent loss of committed audit rows where the pre-R2 tree
+/// went boot-fatal and a human looked.
+fn boot_mirror_route(err: &aberp_audit_ledger::AppendError) -> BootMirrorRoute {
+    match err {
+        aberp_audit_ledger::AppendError::MirrorAheadOfDb { .. } => BootMirrorRoute::AutoRecover {
+            trigger: "mirror_ahead",
+        },
+        _ => BootMirrorRoute::RefuseFatal,
+    }
+}
+
+/// The operator-facing context attached to a boot-fatal mirror refusal. Named
+/// per variant so the message says what to do NEXT, not merely what broke.
+fn boot_mirror_refusal_context(err: &aberp_audit_ledger::AppendError) -> &'static str {
+    match err {
+        aberp_audit_ledger::AppendError::MirrorAheadOfDb { .. } => {
+            "audit-ledger mirror is AHEAD of the DB at boot (possible lost DB commit after a \
+             torn write). The ahead mirror was preserved to a side file; investigate before \
+             re-running. For an intentional dev DB-nuke, move the stale <db>.audit.log aside \
+             and re-run."
+        }
+        aberp_audit_ledger::AppendError::MirrorDivergedFromDb { .. } => {
+            "audit-ledger mirror DIVERGES from the DB at a shared seq at boot (the DB lost \
+             committed entries and re-used their seqs). The mirror was preserved to a side \
+             file and holds the ONLY copy of the lost entries, and the DB still holds its own \
+             rows at those seqs. Reconcile the two by hand — do NOT rebuild the mirror from \
+             the DB, and do NOT run `aberp recover` (it rebuilds from a snapshot + the mirror, \
+             which would discard the DB\'s divergent rows)."
+        }
+        _ => "reconcile audit-ledger mirror with DB at serve boot",
+    }
+}
+
 /// Human suffix naming the retained `<db>.CORRUPT-<tag>` evidence copy, if any.
 fn retained_suffix(retained: &Option<PathBuf>) -> String {
     match retained {
@@ -1740,120 +1796,105 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         let mirror_path = aberp_audit_ledger::mirror_path_for(&args.db);
         match aberp_audit_ledger::ensure_consistent_with_db(&conn, &mirror_path) {
             Ok(action) => tracing::info!(?action, "audit-ledger mirror reconciled at boot"),
-            Err(e @ aberp_audit_ledger::AppendError::MirrorAheadOfDb { .. }) => {
-                // ADR-0095 §1 — an ahead mirror is the fingerprint of a
-                // torn-write / lost DB commit (root cause #4). Instead of a
-                // fatal stop, attempt the guarded, reversible auto-recovery:
-                // rebuild from the latest VALID snapshot and REPLAY the
-                // preserved ahead mirror (the chunk-3 P1 guard already copied
-                // it to `<mirror>.ahead-*.bak`; recover_or_refuse READS it,
-                // never truncates it). On a guard-rail refusal keep today's
-                // preserve-and-surface (demoted from the ONLY outcome to the
-                // last resort). Drop the open handle first so the atomic swap
-                // can rename over the live path cleanly.
-                tracing::error!(
-                    error = %e,
-                    "audit-ledger mirror is AHEAD of the DB — attempting ADR-0095 §1 auto-recovery"
-                );
-                drop(conn);
-                let recovery = attempt_db_auto_recovery(
-                    &args.db,
-                    &tenant,
-                    &binary_hash_handle,
-                    "mirror_ahead",
-                );
-                match recovery {
-                    Ok(BootRecovery::Recovered) => {
-                        tracing::warn!(
-                            "ADR-0095 §1 — auto-recovery reconciled the ahead mirror with the DB at boot"
-                        );
-                    }
-                    Ok(BootRecovery::Refused(reason)) => {
-                        tracing::error!(
-                            reason = %reason,
-                            "REFUSING to boot — ahead mirror could not be safely auto-recovered"
-                        );
-                        return Err(anyhow::Error::new(e)).context(
-                            "audit-ledger mirror is AHEAD of the DB at boot (possible lost DB commit                      after a torn write). The ahead mirror was preserved to a side file;                      investigate before re-running. For an intentional dev DB-nuke, move the                      stale <db>.audit.log aside and re-run.",
-                        );
-                    }
-                    Err(rec_err) => {
-                        return Err(rec_err).context(
-                            "ADR-0095 auto-recovery of an ahead mirror failed mechanically at boot",
-                        );
-                    }
-                }
-            }
-            Err(
-                e @ aberp_audit_ledger::AppendError::MirrorDivergedFromDb {
-                    first_divergent_seq,
-                    ..
-                },
-            ) => {
-                // ADR-0099 R2 — the mirror and the DB hold DIFFERENT entries at
-                // the SAME seq. Same root cause as the AHEAD arm above (the DB
-                // lost committed entries), one step later: the chain head fell
-                // back, so the DB re-used the lost seqs for later entries and
-                // the length asymmetry the AHEAD arm keys on is gone.
-                //
-                // Routed to the SAME sanctioned recovery path rather than a
-                // bespoke one, with a distinct trigger so the `db.auto_recovered`
-                // row records which case it was. The distinction is load-bearing
-                // and is NOT re-derived here: `replay_mirror_delta` refuses with
-                // `SequenceConflict` the moment it is asked to replay a mirror
-                // entry onto a seq the staging DB already holds, which is
-                // exactly the diverged case. So a diverged mirror can only reach
-                // `Recovered` if the replay was genuinely conflict-free; any
-                // other outcome falls through to preserve-and-surface below.
-                // Nothing here rebuilds the mirror from the DB — that would
-                // discard the only surviving copy of what the DB lost, which is
-                // what the undocumented 2026-08-20 hand-rebuild did.
-                tracing::error!(
-                    error = %e,
-                    first_divergent_seq,
-                    "audit-ledger mirror DIVERGES from the DB at seq {first_divergent_seq} — \
-                     the DB lost entries the mirror still holds and re-used their seqs. \
-                     Attempting ADR-0095 §1 auto-recovery"
-                );
-                drop(conn);
-                let recovery = attempt_db_auto_recovery(
-                    &args.db,
-                    &tenant,
-                    &binary_hash_handle,
-                    "mirror_diverged_from_db",
-                );
-                match recovery {
-                    Ok(BootRecovery::Recovered) => {
-                        tracing::warn!(
-                            first_divergent_seq,
-                            "ADR-0095 §1 — auto-recovery reconciled the diverged mirror with the \
-                             DB at boot"
-                        );
-                    }
-                    Ok(BootRecovery::Refused(reason)) => {
-                        tracing::error!(
-                            reason = %reason,
-                            first_divergent_seq,
-                            "REFUSING to boot — diverged mirror could not be safely auto-recovered"
-                        );
-                        return Err(anyhow::Error::new(e)).context(
-                            "audit-ledger mirror DIVERGES from the DB at a shared seq at boot \
-                             (the DB lost committed entries and re-used their seqs). The mirror \
-                             was preserved to a side file and holds the ONLY copy of the lost \
-                             entries; investigate before re-running. Do NOT rebuild the mirror \
-                             from the DB.",
-                        );
-                    }
-                    Err(rec_err) => {
-                        return Err(rec_err).context(
-                            "ADR-0095 auto-recovery of a diverged mirror failed mechanically at boot",
-                        );
-                    }
-                }
-            }
             Err(e) => {
-                return Err(anyhow::Error::new(e))
-                    .context("reconcile audit-ledger mirror with DB at serve boot")
+                // ADR-0099 R3 — the route is decided by `boot_mirror_route`, and
+                // ONLY a clean mirror-AHEAD is auto-recoverable.
+                //
+                // R2 also routed `MirrorDivergedFromDb` here, on the reasoning
+                // that `replay_mirror_delta` refuses a colliding replay with
+                // `SequenceConflict`, so a diverged mirror could only reach
+                // `Recovered` if the replay was conflict-free. That safety was
+                // UNREACHABLE, twice over:
+                //
+                //   * `replay_mirror_delta` is only ever asked to replay seqs
+                //     ABOVE the imported snapshot's head, into a STAGING DB that
+                //     by construction holds only `[1..=snapshot_head]`. It never
+                //     targets an occupied seq, so it never collides.
+                //   * Even if it did, `audit_ledger` has NO `UNIQUE(seq)` — S341
+                //     dropped that ART index (duckdb#23046 / S332) — so a
+                //     colliding INSERT still reports `rows_changed = 1` and
+                //     returns `Ok`.
+                //
+                // And the loss is structural, not incidental: recovery rebuilds
+                // from a SNAPSHOT and replays the MIRROR's delta, so the DB's
+                // rows at the re-used seqs (2508/2509 in the incident) — which
+                // exist in NEITHER input — are dropped, `Recovered` is logged,
+                // and boot continues with a WARN. Measured on the fork shape:
+                // four committed DB rows gone. Pre-R2 that same shape returned
+                // `MirrorCorruptPreserved` and went boot-fatal, so a human
+                // looked. Making the diagnosis precise must not make the
+                // handling lossy.
+                //
+                // There is no automatic resolution: two different committed
+                // entries claim one seq, and choosing between them is a business
+                // question about which events really happened. Both copies are on
+                // disk (the mirror preserved to a side file, the DB untouched),
+                // and boot refuses so an operator reconciles them.
+                let route = boot_mirror_route(&e);
+                let refusal_context = boot_mirror_refusal_context(&e);
+                match route {
+                    BootMirrorRoute::AutoRecover { trigger } => {
+                        // ADR-0095 §1 — a CLEAN ahead mirror is the fingerprint of
+                        // a torn-write / lost DB commit (root cause #4). Instead of
+                        // a fatal stop, attempt the guarded, reversible
+                        // auto-recovery: rebuild from the latest VALID snapshot and
+                        // REPLAY the preserved ahead mirror (the chunk-3 P1 guard
+                        // already copied it to `<mirror>.ahead-*.bak`;
+                        // recover_or_refuse READS it, never truncates it). Nothing
+                        // is dropped: `ensure_consistent_with_db` proved the shared
+                        // prefix agrees before reporting AHEAD, so the mirror
+                        // strictly EXTENDS the DB's chain. On a guard-rail refusal
+                        // keep today's preserve-and-surface (demoted from the ONLY
+                        // outcome to the last resort). Drop the open handle first so
+                        // the atomic swap can rename over the live path cleanly.
+                        tracing::error!(
+                            error = %e,
+                            trigger,
+                            "audit-ledger mirror is AHEAD of the DB — attempting ADR-0095 §1 \
+                             auto-recovery"
+                        );
+                        drop(conn);
+                        let recovery = attempt_db_auto_recovery(
+                            &args.db,
+                            &tenant,
+                            &binary_hash_handle,
+                            trigger,
+                        );
+                        match recovery {
+                            Ok(BootRecovery::Recovered) => {
+                                tracing::warn!(
+                                    "ADR-0095 §1 — auto-recovery reconciled the ahead mirror \
+                                     with the DB at boot"
+                                );
+                            }
+                            Ok(BootRecovery::Refused(reason)) => {
+                                tracing::error!(
+                                    reason = %reason,
+                                    "REFUSING to boot — ahead mirror could not be safely \
+                                     auto-recovered"
+                                );
+                                return Err(anyhow::Error::new(e)).context(refusal_context);
+                            }
+                            Err(rec_err) => {
+                                return Err(rec_err).context(
+                                    "ADR-0095 auto-recovery of an ahead mirror failed \
+                                     mechanically at boot",
+                                );
+                            }
+                        }
+                    }
+                    BootMirrorRoute::RefuseFatal => {
+                        tracing::error!(
+                            target: "audit_event",
+                            event = "audit_mirror_boot_refused",
+                            error = %e,
+                            "REFUSING to boot — the audit-ledger mirror could not be reconciled \
+                             with the DB and the condition is NOT auto-recoverable. Evidence is \
+                             preserved on disk; investigate before re-running (ADR-0099 R3)"
+                        );
+                        return Err(anyhow::Error::new(e)).context(refusal_context);
+                    }
+                }
             }
         }
     }
@@ -30209,6 +30250,97 @@ mod tests {
     use super::*;
     use aberp_audit_ledger::{Actor, BinaryHash, Ledger, TenantId};
     use aberp_billing::IdempotencyKey;
+
+    /// ADR-0099 R3 — THE ROUTING REGRESSION, asserted as a value.
+    ///
+    /// R2 sent `MirrorDivergedFromDb` to `attempt_db_auto_recovery` on a
+    /// `SequenceConflict` guarantee that does not exist (`replay_mirror_delta`
+    /// only ever targets seqs above the snapshot import, so it never collides;
+    /// and `audit_ledger` has no `UNIQUE(seq)` since S341, so a collision would
+    /// not be caught anyway). Measured consequence, pinned in
+    /// `aberp-db/tests/adr0099r3_diverged_is_terminal.rs`: four committed DB
+    /// rows silently discarded, `Recovered` logged, boot continuing on a WARN —
+    /// where `main` returned `MirrorCorruptPreserved` and went boot-fatal.
+    ///
+    /// ONLY a clean mirror-AHEAD may auto-recover, and only because
+    /// `ensure_consistent_with_db` now proves the shared prefix agrees before it
+    /// reports AHEAD: such a mirror strictly EXTENDS the DB's chain, so
+    /// snapshot+replay puts back what was lost and drops nothing.
+    #[test]
+    fn only_a_clean_mirror_ahead_is_routed_to_auto_recovery() {
+        use aberp_audit_ledger::AppendError;
+
+        assert_eq!(
+            boot_mirror_route(&AppendError::MirrorAheadOfDb {
+                mirror_max_seq: 5,
+                db_max_seq: 3,
+                preserved: "/tmp/m.ahead.bak".into(),
+            }),
+            BootMirrorRoute::AutoRecover {
+                trigger: "mirror_ahead"
+            },
+            "a clean lost TAIL is the one condition this system can safely fix by itself"
+        );
+
+        assert_eq!(
+            boot_mirror_route(&AppendError::MirrorDivergedFromDb {
+                first_divergent_seq: 2508,
+                mirror_max_seq: 2509,
+                db_max_seq: 2511,
+                preserved: "/tmp/m.ahead.bak".into(),
+            }),
+            BootMirrorRoute::RefuseFatal,
+            "a DIVERGENCE must never reach the recovery engine: it rebuilds from a snapshot \
+             and replays the mirror, so the DB's rows at the re-used seqs — in NEITHER input \
+             — are discarded. Two different committed entries claim one seq and choosing \
+             between them is not a decision code gets to make silently."
+        );
+
+        // Everything else is terminal too: an unknown reconcile failure must
+        // never fall into the recovering arm by default.
+        for e in [
+            AppendError::MirrorCorruptPreserved {
+                preserved: "/tmp/m.corrupt.bak".into(),
+                reason: "gap at seq 9".into(),
+            },
+            AppendError::MirrorLockTimeout {
+                path: "/tmp/m".into(),
+                waited_ms: 10_000,
+            },
+            AppendError::MirrorCorrupt {
+                reason: "torn line".into(),
+            },
+        ] {
+            assert_eq!(
+                boot_mirror_route(&e),
+                BootMirrorRoute::RefuseFatal,
+                "unclassified reconcile failures are fail-closed: {e}"
+            );
+        }
+    }
+
+    /// The refusal message must tell the operator what to do NEXT, and for a
+    /// divergence that includes NOT running `aberp recover` — the CLI entry
+    /// point to the very engine that would discard the DB's divergent rows.
+    #[test]
+    fn the_divergence_refusal_warns_against_the_lossy_recovery_cli() {
+        use aberp_audit_ledger::AppendError;
+
+        let msg = boot_mirror_refusal_context(&AppendError::MirrorDivergedFromDb {
+            first_divergent_seq: 2508,
+            mirror_max_seq: 2509,
+            db_max_seq: 2511,
+            preserved: "/tmp/m.ahead.bak".into(),
+        });
+        assert!(
+            msg.contains("aberp recover"),
+            "the message must name the CLI it is warning about, got: {msg}"
+        );
+        assert!(
+            msg.contains("do NOT"),
+            "and must say not to run it, got: {msg}"
+        );
+    }
 
     /// S434 — the demo sample-data seed migrates the demo DB and inserts 3
     /// partners + 2 products, idempotently (a second run is a no-op).

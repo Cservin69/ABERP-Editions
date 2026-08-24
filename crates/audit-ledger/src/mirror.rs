@@ -442,6 +442,29 @@ fn read_mirror_under_tail_policy_inner(
     }
 }
 
+/// ADR-0099 R3 — preserve a mirror that DIVERGES from the DB to
+/// `<mirror>.diverged-<nanos>.bak`. A byte-for-byte copy; the original is left
+/// in place, so the boot reconcile keeps surfacing the condition until a human
+/// resolves it.
+///
+/// Its own infix, because divergence is its own class and the two existing names
+/// both misdescribe it. `.ahead-` is what R2 reused, and the seq numbers are
+/// precisely NOT ahead in the behind- and equal-length shapes — mislabelling
+/// this is how the incident got misdiagnosed the first time (§R2.1).
+/// `.corrupt-` points the operator at the mirror, when the mirror is the intact
+/// party and the DB is the one that lost entries.
+fn preserve_diverged_mirror(mirror_path: &Path) -> Result<PathBuf, AppendError> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut os = mirror_path.as_os_str().to_owned();
+    os.push(format!(".diverged-{nanos}.bak"));
+    let backup = PathBuf::from(os);
+    std::fs::copy(mirror_path, &backup).map_err(AppendError::MirrorIo)?;
+    Ok(backup)
+}
+
 /// Preserve the current (corrupt) mirror to a timestamped side file so the
 /// evidence is never destroyed — the torn-tail analogue of
 /// [`preserve_ahead_mirror`], writing `<mirror>.corrupt-<nanos>.bak`. Returns
@@ -503,6 +526,17 @@ fn trim_mirror_to_inner(
 ///
 /// Opened `append`-mode so every write lands at EOF regardless of the file
 /// offset, and `create` so the bootstrap path can lock before the file exists.
+///
+/// ADR-0099 R3 — the wait is BOUNDED ([`MIRROR_LOCK_TIMEOUT`]). `flock` is
+/// cross-process, and the only caller ([`ensure_consistent_with_db`]) is invoked
+/// by `aberp::snapshot::reconcile_mirror_for` while that fn holds `aberp_db`'s
+/// single writer mutex. An untimed wait therefore let ANY stuck peer — a hung
+/// `aberp` CLI, a crashed-but-not-reaped process still owning the fd — freeze
+/// every DB write in the serve process behind it, with no diagnostic. R2 left
+/// this untimed on the reasoning that a timeout must choose between refusing to
+/// boot and proceeding unsynchronised; that is a false dilemma. The timeout
+/// FAILS LOUD ([`AppendError::MirrorLockTimeout`]) and never proceeds
+/// unsynchronised, so the TOCTOU R2 closed stays closed and the wedge is gone.
 fn lock_mirror_exclusive(mirror_path: &Path) -> Result<File, AppendError> {
     let file = OpenOptions::new()
         .create(true)
@@ -510,9 +544,37 @@ fn lock_mirror_exclusive(mirror_path: &Path) -> Result<File, AppendError> {
         .read(true)
         .open(mirror_path)
         .map_err(AppendError::MirrorIo)?;
-    file.lock_exclusive().map_err(AppendError::MirrorIo)?;
-    Ok(file)
+    let deadline = std::time::Instant::now() + MIRROR_LOCK_TIMEOUT;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            // Contended: the documented `fs2` sentinel. Any OTHER io error is a
+            // real failure and is surfaced verbatim, not retried.
+            Err(e) if e.kind() == fs2::lock_contended_error().kind() => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(AppendError::MirrorLockTimeout {
+                        path: mirror_path.display().to_string(),
+                        waited_ms: MIRROR_LOCK_TIMEOUT.as_millis() as u64,
+                    });
+                }
+                std::thread::sleep(MIRROR_LOCK_POLL);
+            }
+            Err(e) => return Err(AppendError::MirrorIo(e)),
+        }
+    }
 }
+
+/// ADR-0099 R3 — how long [`lock_mirror_exclusive`] waits for the cross-process
+/// mirror lock before failing loud. Generous relative to every legitimate holder
+/// (`sync_mirror` holds it for one append + fsync; the reconciler for one
+/// bounded compare), and far below any human's patience for a wedged serve.
+const MIRROR_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Poll interval for the bounded lock wait. `fs2` exposes no timed blocking
+/// acquire, so the bound is a `try_lock` spin; the interval is short enough that
+/// an uncontended-after-a-moment handoff is not perceptibly delayed and long
+/// enough that a 10 s wait is ~200 syscalls, not a spin loop.
+const MIRROR_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Replay the mirror's append-only JSONL delta — every record with
 /// `seq > after_seq` — back into the `audit_ledger` table of `conn`,
@@ -795,11 +857,16 @@ pub enum RecoveryAction {
     /// Mirror was behind the DB; replayed the missing DB entries
     /// `[mirror_max_seq+1..=db_max_seq]`.
     Extended { entries_added: u64 },
-    /// Mirror was the same length as the DB but its last `entry_hash`
-    /// disagreed (or the mirror file was corrupt/unparseable). Full
-    /// rebuild from the DB.
-    Rebuilt { entries_written: u64 },
 }
+
+// ADR-0099 R3 — there is NO `Rebuilt` variant, deliberately. It was carried
+// here (and in this fn's doc decision-tree) long after its last producer was
+// removed, still describing a "full rebuild from the DB" on equal-length
+// divergence. That branch now PRESERVES AND REFUSES, because rebuilding the
+// mirror from the DB discards the only surviving copy of what the DB lost —
+// exactly the manoeuvre ADR-0099 R2.4 identifies as the one that makes this
+// incident class invisible. A variant no code can produce is an invitation to
+// write the arm back, so it is gone rather than documented.
 
 /// Boot-time reconciliation of the mirror against the DB. Session
 /// 152b / Part A. Called once per process at serve boot AFTER
@@ -812,12 +879,16 @@ pub enum RecoveryAction {
 /// tree (Part B):
 ///
 /// - mirror file missing → create fresh from DB → [`RecoveryAction::Created`]
-/// - mirror behind DB → replay missing entries → [`RecoveryAction::Extended`]
-/// - mirror ahead of DB → preserve the ahead mirror + REFUSE
-///   ([`AppendError::MirrorAheadOfDb`]) — never silently truncated
+/// - mirror behind DB, shared prefix AGREES → replay missing entries →
+///   [`RecoveryAction::Extended`]
+/// - mirror ahead of DB, shared prefix AGREES → preserve the ahead mirror +
+///   REFUSE ([`AppendError::MirrorAheadOfDb`]) — never silently truncated
 /// - equal length, last hash matches → [`RecoveryAction::Unchanged`]
-/// - equal length, last hash differs, OR mirror corrupt → full
-///   rebuild → [`RecoveryAction::Rebuilt`]
+/// - **shared prefix DISAGREES at any length** (behind, ahead, or equal) →
+///   preserve + REFUSE ([`AppendError::MirrorDivergedFromDb`])
+///
+/// Nothing here rebuilds the mirror from the DB. ADR-0099 R2.4: that is the one
+/// manoeuvre that destroys the only surviving copy of what the DB lost.
 ///
 /// Idempotent: a second call on a healthy state returns
 /// [`RecoveryAction::Unchanged`].
@@ -951,40 +1022,55 @@ pub fn ensure_consistent_with_db(
 
     let mirror_max_seq = mirror_entries.last().map(|e| e.seq).unwrap_or(0);
 
+    // ADR-0099 R2/R3 — PROVE THE SHARED PREFIX BEFORE ACTING, IN EVERY BRANCH.
+    //
+    // R2 proved it only on the BEHIND branch, which is where the fifth
+    // recurrence hid: `Extended` used to append DB rows after `mirror_max_seq`
+    // without ever comparing the two stores, so a mirror that DISAGREED with the
+    // DB got DB rows stapled onto it — destroying the length asymmetry
+    // `MirrorAheadOfDb` keys on AND the head-hash equality the equal-length
+    // branch keys on, and relabelling a lost DB commit as "corrupt mirror".
+    //
+    // R3 hoists the proof ABOVE the length branch, because the AHEAD branch had
+    // the same hole with a worse consequence. An ahead-AND-diverged mirror
+    // reported plain `MirrorAheadOfDb`, boot routed that to the snapshot+replay
+    // auto-recovery, and recovery replays only the MIRROR — so the DB's
+    // divergent rows, present in neither the snapshot nor the mirror, were
+    // DISCARDED. Divergence is a property of the SHARED PREFIX
+    // `[1..=min(mirror_max, db_max)]`, not of which store is longer, so it is
+    // decided once, here, over exactly that prefix.
+    //
+    // The prefix slice matters: `mirror_entries` is seq-ascending, so
+    // `partition_point` cuts it at `db_max_seq`. Without the cut, an AHEAD
+    // mirror's legitimately DB-absent tail (`seq > db_max_seq`) would read as a
+    // divergence at `db_max_seq + 1` and turn every honest lost-tail — including
+    // an intentional dev DB-nuke — into a boot-fatal refusal.
+    let shared_prefix = &mirror_entries[..mirror_entries.partition_point(|e| e.seq <= db_max_seq)];
+    if let Some(seq) = first_divergent_seq(conn, shared_prefix)? {
+        let preserved = preserve_diverged_mirror(mirror_path)?;
+        tracing::error!(
+            target: "audit_event",
+            event = "audit_mirror_diverged_from_db",
+            mirror_path = %mirror_path.display(),
+            first_divergent_seq = seq,
+            mirror_max_seq,
+            db_max_seq,
+            preserved = %preserved.display(),
+            "audit_mirror DIVERGES from the DB at seq {seq} over their SHARED prefix — the DB \
+             lost entries the mirror still holds and then re-used their seqs. REFUSING (never \
+             graft, never truncate, never auto-recover: the DB's rows at those seqs exist in \
+             NEITHER the mirror nor any snapshot, so any automatic resolution drops them). \
+             Preserved the mirror (ADR-0099 R3)"
+        );
+        return Err(AppendError::MirrorDivergedFromDb {
+            first_divergent_seq: seq,
+            mirror_max_seq,
+            db_max_seq,
+            preserved: preserved.display().to_string(),
+        });
+    }
+
     if mirror_max_seq < db_max_seq {
-        // ADR-0099 R2 — PROVE THE SHARED PREFIX BEFORE GRAFTING.
-        //
-        // This branch is the one that let the fifth recurrence hide. It used to
-        // append DB rows after `mirror_max_seq` without ever comparing the two
-        // stores, so a mirror that DISAGREED with the DB got DB rows stapled
-        // onto it — which destroyed the length asymmetry `MirrorAheadOfDb` keys
-        // on and the head-hash equality the equal-length branch keys on, and
-        // relabelled a lost DB commit as "corrupt mirror" (the mirror's own
-        // prev_hash link check then failed one seq later). Refuse instead, and
-        // name the seq. `sync_mirror` has always made exactly this check before
-        // appending; the reconciler simply did not, and the two disagreed.
-        if let Some(seq) = first_divergent_seq(conn, &mirror_entries)? {
-            let preserved = preserve_ahead_mirror(mirror_path)?;
-            tracing::error!(
-                target: "audit_event",
-                event = "audit_mirror_diverged_from_db",
-                mirror_path = %mirror_path.display(),
-                first_divergent_seq = seq,
-                mirror_max_seq,
-                db_max_seq,
-                preserved = %preserved.display(),
-                "audit_mirror DIVERGES from the DB at seq {seq} while the mirror is BEHIND on \
-                 seq count — the DB lost entries the mirror still holds and then re-used their \
-                 seqs. REFUSING to append DB rows onto it (that would erase the evidence); \
-                 preserved the mirror (ADR-0099 R2)"
-            );
-            return Err(AppendError::MirrorDivergedFromDb {
-                first_divergent_seq: seq,
-                mirror_max_seq,
-                db_max_seq,
-                preserved: preserved.display().to_string(),
-            });
-        }
         let added = append_db_entries_after_locked(conn, &lock, mirror_max_seq)?;
         tracing::info!(
             mirror_path = %mirror_path.display(),
@@ -997,8 +1083,10 @@ pub fn ensure_consistent_with_db(
             entries_added: added,
         })
     } else if mirror_max_seq > db_max_seq {
-        // The mirror is AHEAD of the DB — the fingerprint of a torn-write /
-        // lost DB commit (the 2026-06-22 corruption class) or a dev DB-nuke.
+        // The mirror is AHEAD of the DB and their SHARED PREFIX AGREES (proven
+        // above) — the DB lost a clean TAIL and nothing else, which is the
+        // fingerprint of a torn-write / lost DB commit (the 2026-06-22
+        // corruption class) or a dev DB-nuke.
         // ADR-0093 chunk 3 / ADR-0082 reconcile safety: NEVER silently
         // truncate (that destroys the only surviving record of what the DB
         // lost). Preserve the ahead mirror to a side file FIRST, then
@@ -1032,32 +1120,30 @@ pub fn ensure_consistent_with_db(
         if db_hash == mirror_hash {
             Ok(RecoveryAction::Unchanged)
         } else {
-            // ADR-0098 R1 (finding D): equal-length head-hash DIVERGENCE. Two
-            // chains of equal length with different heads on prod-class data is
-            // evidence of something worse than a torn tail — NEVER auto-resolve
-            // by rebuilding from the DB (that would destroy the mirror's record
-            // of what it holds). Preserve + REFUSE.
-            // ADR-0099 R2 — this is the same class as the Extended branch's
-            // refusal, not generic corruption: both stores hold a row at the
-            // divergent seq and they disagree. Report it as such so boot can
-            // route it to the recovery arm and the operator is told the DB lost
-            // entries, rather than being pointed at a "corrupt mirror".
-            let seq = first_divergent_seq(conn, &mirror_entries)?.unwrap_or(db_max_seq);
-            let preserved = preserve_corrupt_mirror(mirror_path)?;
+            // ADR-0098 R1 (finding D) / ADR-0099 R3 — equal-length head-hash
+            // divergence. At equal length the shared prefix IS the whole mirror,
+            // so the hoisted prefix proof above already refused every case this
+            // arm was written for and it is unreachable in practice. Kept as a
+            // fail-closed backstop: if the head hashes ever disagree while
+            // `first_divergent_seq` reports agreement, that is a contradiction
+            // between two reads of the same rows, and the one thing we must not
+            // do is fall through to `Unchanged`.
+            let preserved = preserve_diverged_mirror(mirror_path)?;
             tracing::error!(
                 target: "audit_event",
                 event = "audit_mirror_diverged_from_db",
-                first_divergent_seq = seq,
+                first_divergent_seq = db_max_seq,
                 mirror_path = %mirror_path.display(),
                 db_max_seq,
                 preserved = %preserved.display(),
                 ?db_hash,
                 ?mirror_hash,
-                "audit_mirror head entry_hash DIVERGES from the DB at equal length — REFUSING \
+                "audit_mirror head entry_hash DIVERGES from the DB at equal length while the \
+                 prefix comparison reported agreement — contradictory reads. REFUSING \
                  (preserved original; never auto-resolve equal-length divergence) (ADR-0098 R1)"
             );
             Err(AppendError::MirrorDivergedFromDb {
-                first_divergent_seq: seq,
+                first_divergent_seq: db_max_seq,
                 mirror_max_seq,
                 db_max_seq,
                 preserved: preserved.display().to_string(),
@@ -1134,8 +1220,9 @@ fn preserve_ahead_mirror(mirror_path: &Path) -> Result<PathBuf, AppendError> {
 }
 
 /// Truncate the mirror and rewrite it from the DB's full entry set
-/// `[1..=db_max_seq]`. Used by the Created and Rebuilt recovery paths — in
-/// both `up_to == db_max_seq`, so the full DB scan IS `[1..=db_max_seq]`.
+/// `[1..=db_max_seq]`. Used by the Created (bootstrap) recovery path ONLY —
+/// there `up_to == db_max_seq`, so the full DB scan IS `[1..=db_max_seq]`, and
+/// there is no pre-existing mirror content to destroy.
 /// Returns the entry count written. (The mirror-ahead case no longer
 /// rebuilds: it preserves + refuses via [`preserve_ahead_mirror`].)
 fn rebuild_mirror_from_db_locked(conn: &Connection, file: &File) -> Result<u64, AppendError> {
@@ -1649,6 +1736,15 @@ mod tests {
         // truncate the ahead mirror (that would destroy the only record of
         // what the DB lost). It preserves the ahead mirror to a side file
         // and REFUSES (surfaces) so a human investigates.
+        //
+        // ADR-0099 R3 — the DB must be a genuine PREFIX of the mirror for this
+        // to be the AHEAD case at all. The fixture used to build a SEPARATE DB
+        // with its own seq-1 entry, so the two disagreed at seq 1 and the shape
+        // was really a divergence; R2's prefix proof ran only on the BEHIND
+        // branch, so nothing noticed. That distinction is load-bearing — a clean
+        // AHEAD is the one condition boot auto-recovers, and routing a
+        // divergence there discards the DB's own rows. The diverged variant of
+        // this fixture is pinned just below.
         let dir = tempdir_under_target();
         let mirror = dir.join("ahead.audit.log");
         let (conn_old, meta_old) = open_conn_with_two_entries();
@@ -1656,10 +1752,11 @@ mod tests {
         assert_eq!(read_mirror_entries(&mirror).unwrap().len(), 2);
         let before = std::fs::read(&mirror).unwrap();
 
-        let mut conn_fresh = Connection::open_in_memory().unwrap();
-        ensure_schema(&conn_fresh).unwrap();
-        let meta_fresh = mk_meta();
-        append_one(&mut conn_fresh, &meta_fresh, "fresh-1", b"fresh-payload-1");
+        // The DB loses its TAIL and nothing else: seq 1 stays byte-identical.
+        conn_old
+            .execute_batch("DELETE FROM audit_ledger WHERE seq >= 2;")
+            .unwrap();
+        let conn_fresh = conn_old;
 
         let err = ensure_consistent_with_db(&conn_fresh, &mirror)
             .expect_err("mirror ahead of DB must REFUSE, never silently truncate");
@@ -1684,6 +1781,50 @@ mod tests {
             read_mirror_entries(&mirror).unwrap().len(),
             2,
             "the ahead mirror must be left intact (never auto-truncated)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0099 R3 — ahead on COUNT is not enough. A mirror whose entries
+    /// disagree with the DB over their SHARED prefix is a DIVERGENCE however the
+    /// lengths compare, and must never be reported as the auto-recoverable AHEAD:
+    /// recovery rebuilds from a snapshot and replays the mirror, so the DB's
+    /// divergent rows — in neither input — would be discarded.
+    #[test]
+    fn ensure_consistent_reports_an_ahead_but_diverged_mirror_as_divergence() {
+        let dir = tempdir_under_target();
+        let mirror = dir.join("ahead-diverged.audit.log");
+        let (conn_old, meta_old) = open_conn_with_two_entries();
+        sync_mirror(&conn_old, &meta_old, &mirror).unwrap();
+        let before = std::fs::read(&mirror).unwrap();
+
+        // A DIFFERENT DB holding its own seq 1: mirror head 2 > DB head 1, and
+        // yet the two disagree at seq 1.
+        let mut conn_other = Connection::open_in_memory().unwrap();
+        ensure_schema(&conn_other).unwrap();
+        let meta_other = mk_meta();
+        append_one(&mut conn_other, &meta_other, "fresh-1", b"fresh-payload-1");
+
+        match ensure_consistent_with_db(&conn_other, &mirror) {
+            Err(AppendError::MirrorDivergedFromDb {
+                first_divergent_seq,
+                mirror_max_seq,
+                db_max_seq,
+                preserved,
+            }) => {
+                assert_eq!(first_divergent_seq, 1);
+                assert_eq!((mirror_max_seq, db_max_seq), (2, 1));
+                assert_eq!(std::fs::read(&preserved).unwrap(), before);
+            }
+            other => panic!(
+                "ahead-on-count but disagreeing at seq 1 must be a DIVERGENCE, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            std::fs::read(&mirror).unwrap(),
+            before,
+            "refusal must leave the mirror untouched"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1740,11 +1881,19 @@ mod tests {
             before,
             "refusal must leave the mirror untouched"
         );
-        // Exactly one `.corrupt-*.bak` preserved copy.
+        // Exactly one preserved copy, named for the class it actually is
+        // (ADR-0099 R3): the mirror is the INTACT party here — the DB is the one
+        // that lost entries — so `.corrupt-` would point the operator at the
+        // wrong subsystem, which is how this incident got misdiagnosed.
+        assert_eq!(
+            count_diverged_baks(&dir),
+            1,
+            "exactly one preserved diverged copy"
+        );
         assert_eq!(
             count_corrupt_baks(&dir),
-            1,
-            "exactly one preserved corrupt copy"
+            0,
+            "a divergence is NOT mirror corruption and must not be labelled as such"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1831,6 +1980,14 @@ mod tests {
     }
 
     /// Count `<mirror>.corrupt-*.bak` preserved copies in a test dir.
+    fn count_diverged_baks(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".diverged-"))
+            .count()
+    }
+
     fn count_corrupt_baks(dir: &std::path::Path) -> usize {
         std::fs::read_dir(dir)
             .unwrap()

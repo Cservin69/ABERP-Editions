@@ -89,9 +89,15 @@ pub enum AppendError {
 
     /// ADR-0093 chunk 3 / ADR-0082 reconcile safety — at boot the audit
     /// mirror (`<db>.audit.log`) was found AHEAD of the DB (its max seq is
-    /// greater than the DB's). This is the fingerprint of a torn-write /
-    /// lost-commit on the DB side (the 2026-06-22 corruption class), or a
-    /// dev DB-nuke. The editions tree REFUSES to silently auto-truncate the
+    /// greater than the DB's) **and their shared prefix `[1..=db_max_seq]`
+    /// AGREES** (ADR-0099 R3 — an ahead mirror that also disagrees over the
+    /// prefix is [`Self::MirrorDivergedFromDb`], not this). This is the
+    /// fingerprint of a torn-write / lost-commit on the DB side (the
+    /// 2026-06-22 corruption class), or a dev DB-nuke.
+    ///
+    /// Because the mirror strictly EXTENDS the DB's chain here, this is the one
+    /// reconcile failure boot may auto-recover: rebuilding from a snapshot and
+    /// replaying the mirror puts back exactly what was lost and drops nothing. The editions tree REFUSES to silently auto-truncate the
     /// ahead mirror (that would destroy the only surviving record of what
     /// the DB lost); the ahead mirror is first PRESERVED to a side file and
     /// boot surfaces this so a human investigates before anything is
@@ -114,16 +120,23 @@ pub enum AppendError {
     /// `seq`. Distinct from [`Self::MirrorAheadOfDb`], and the distinction is
     /// load-bearing for recovery:
     ///
-    /// * **AHEAD** (`mirror_max_seq > db_max_seq`) — the DB lost a TAIL. The
+    /// * **AHEAD** (`mirror_max_seq > db_max_seq` AND the shared prefix
+    ///   `[1..=db_max_seq]` AGREES) — the DB lost a TAIL and nothing else. The
     ///   mirror-only entries are the ONLY surviving copy, so recovery replays
-    ///   them back into the DB and the DB catches up.
+    ///   them back into the DB and the DB catches up with zero row loss. A
+    ///   mirror that is ahead AND disagrees over the shared prefix is NOT this
+    ///   case: it reports as DIVERGED (below), because replaying it would drop
+    ///   the DB's divergent rows.
     /// * **DIVERGED** (this variant) — the DB lost entries and then RE-USED
     ///   their seqs for later ones, so both stores have rows at
     ///   `first_divergent_seq` and they disagree. The mirror's copies are still
     ///   the only record of what the DB lost, so this must NEVER be resolved by
-    ///   silently rebuilding the mirror from the DB. `replay_mirror_delta`
-    ///   refuses such a replay with [`Self::SequenceConflict`], which is the
-    ///   backstop that keeps the recovery path honest.
+    ///   silently rebuilding the mirror from the DB — and, ADR-0099 R3, never by
+    ///   the snapshot+replay auto-recovery either. That path rebuilds from a
+    ///   snapshot and replays only the MIRROR's delta, so the DB's divergent
+    ///   rows — which exist in neither the snapshot nor the mirror — would be
+    ///   DISCARDED. This variant is therefore terminal: preserve and REFUSE, so
+    ///   a human reconciles the two sets of entries.
     ///
     /// How the fifth prod recurrence (seq 2508) produced this: two committed
     /// heartbeats were lost from the DB while durable in the mirror; the chain
@@ -136,10 +149,13 @@ pub enum AppendError {
     #[error(
         "audit-ledger mirror DIVERGES from the DB at seq {first_divergent_seq} (mirror seq \
          {mirror_max_seq}, DB seq {db_max_seq}): both hold an entry there and they disagree, \
-         so the DB lost entries the mirror still has. The mirror was preserved to {preserved}. \
-         Do NOT rebuild the mirror from the DB — that discards the only copy. Recover with \
-         `aberp recover --db <db> --tenant <tenant> --store <store>`. Magyarul: a napló-tükör \
-         és a DB ugyanannál a sorszámnál eltér; az eredetit félretettem, ne építsd újra a DB-ből."
+         so the DB lost entries the mirror still has. The mirror was preserved to {preserved}; \
+         the DB's own rows at those seqs are untouched. Reconcile the two BY HAND. Do NOT \
+         rebuild the mirror from the DB (that discards the mirror's only copy), and do NOT run \
+         `aberp recover` (ADR-0099 R3: it rebuilds from a snapshot + the mirror, so it discards \
+         the DB's divergent rows instead). Magyarul: a napló-tükör és a DB ugyanannál a \
+         sorszámnál eltér; mindkét másolat megvan, kézzel kell összevetni — se újraépítés, se \
+         `aberp recover`."
     )]
     MirrorDivergedFromDb {
         first_divergent_seq: u64,
@@ -147,6 +163,24 @@ pub enum AppendError {
         db_max_seq: u64,
         preserved: String,
     },
+
+    /// ADR-0099 R3 — the mirror's exclusive advisory `flock` could not be
+    /// acquired within the bounded wait. The lock is CROSS-PROCESS, so a stuck
+    /// or wedged peer (a hung `aberp` CLI holding the mirror) used to block
+    /// [`crate::ensure_consistent_with_db`] forever — and `reconcile_mirror_for`
+    /// calls it while holding `aberp_db`'s single writer mutex, so an untimed
+    /// wait there froze EVERY serve DB write behind an unrelated process.
+    ///
+    /// Bounded and LOUD: on timeout the reconcile fails rather than proceeding
+    /// unsynchronised (proceeding without the lock is the TOCTOU this ADR
+    /// exists to remove). Recovery: find the peer holding the lock
+    /// (`lsof <mirror>`), stop it, and re-run.
+    #[error(
+        "audit-ledger mirror lock at {path} was not acquired within {waited_ms} ms — another \
+         process is holding it. Refusing to reconcile unsynchronised. Find and stop the holder \
+         (`lsof {path}`), then re-run. Magyarul: a napló-tükör zárolását más folyamat tartja."
+    )]
+    MirrorLockTimeout { path: String, waited_ms: u64 },
 
     /// ADR-0098 R1 (Fable-5 findings D + E) — the audit-ledger mirror is
     /// corrupt in a way the unified torn-tail policy will NOT auto-heal:

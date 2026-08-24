@@ -44,6 +44,11 @@ aberp-snapshot = { path = "../aberp-snapshot" }
 # it samples any head. Same `fs2` the mirror writer itself uses, so the two are
 # provably the same lock (a different locking primitive would not exclude).
 fs2 = { workspace = true }
+# ADR-0099 R3: tests/adr0099r3_diverged_is_terminal.rs takes a real snapshot
+# (`aberp_snapshot::take_snapshot(.., now)`) so it can drive the actual recovery
+# engine over the fork shape and MEASURE the rows it drops. Already a workspace
+# dep everywhere else -> no Cargo.lock change.
+time = { workspace = true }
 
 [lints]
 workspace = true

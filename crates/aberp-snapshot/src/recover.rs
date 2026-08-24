@@ -920,13 +920,42 @@ pub fn live_durable_checkpoint(db_path: &Path, tenant: &str) -> Result<Option<Ch
     Ok(Some(report))
 }
 
-/// Copy a torn/replaced live DB aside to `<db>.CORRUPT-<tag>` and return the
-/// retained path. A COPY (not a move): the original stays in place until the
-/// rebuild is atomically swapped over it, so a failure before the swap leaves
-/// the operator with both the original and the copy.
+/// Copy a torn/replaced live DB aside to `<db>.CORRUPT-<tag>` — **with its
+/// `.wal`** — and return the retained path. A COPY (not a move): the original
+/// stays in place until the rebuild is atomically swapped over it, so a failure
+/// before the swap leaves the operator with both the original and the copy.
+///
+/// ADR-0099 R3 — THE WAL IS PART OF THE EVIDENCE, and copying only the main
+/// file made this "preserve" destructive on the `aberp recover` CLI path. Every
+/// `Handle` commit is WAL-only (the main bytes do not change until a checkpoint
+/// — proven on duckdb 1.5.3 by ADR-0098 R5), so a live DB's most recent
+/// committed rows can live ENTIRELY in `<db>.wal`. [`atomic_install`] then
+/// deliberately unlinks the target's stale `.wal` at step 4 (an old WAL beside a
+/// fresh self-contained file would corrupt it). Main-file-only preservation
+/// therefore produced an evidence copy missing exactly the rows the operator
+/// needs, and the originals were unlinked seconds later — irrecoverably.
+///
+/// Copying the WAL to `<dest>.wal` keeps the evidence a COMPLETE, openable
+/// database: `duckdb <db>.CORRUPT-<tag>` replays it and shows the rows as
+/// committed. A missing WAL is normal (a freshly checkpointed DB has none) and
+/// is not an error; a WAL that exists and cannot be copied IS one, because
+/// silently shipping a partial evidence copy is the failure this closes.
 fn preserve_corrupt_db(db_path: &Path) -> Result<PathBuf> {
     let dest = sibling(db_path, &format!("{CORRUPT_INFIX}{}", unique_tag()));
     std::fs::copy(db_path, &dest).map_err(|e| SnapshotError::io(&dest, e))?;
+    let wal = wal_sibling(db_path);
+    if wal.exists() {
+        let dest_wal = wal_sibling(&dest);
+        std::fs::copy(&wal, &dest_wal).map_err(|e| SnapshotError::io(&dest_wal, e))?;
+        tracing::warn!(
+            db = %db_path.display(),
+            retained = %dest.display(),
+            retained_wal = %dest_wal.display(),
+            "ADR-0099 R3 — preserved the live DB's WAL alongside the evidence copy; the \
+             committed rows that live only in the WAL are part of what recovery is about to \
+             replace"
+        );
+    }
     Ok(dest)
 }
 
@@ -1130,6 +1159,74 @@ mod tests {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.contains(".CORRUPT-")),
             "evidence is named with the .CORRUPT- infix"
+        );
+    }
+
+    /// ADR-0099 R3 — THE EVIDENCE COPY MUST INCLUDE THE `.wal`.
+    ///
+    /// Every `Handle` commit is WAL-only (the main file's bytes do not change
+    /// until a checkpoint — ADR-0098 R5 proved this on duckdb 1.5.3), so a live
+    /// DB's most recent committed rows can live ENTIRELY in `<db>.wal`. Copying
+    /// only the main file therefore produced an evidence copy missing exactly
+    /// the rows the operator needs — and `atomic_install` unlinks the target's
+    /// stale `.wal` moments later, so on the `aberp recover` CLI path those rows
+    /// were DESTROYED, not preserved. A "preserve" step that loses evidence is
+    /// worse than none: it is the loud reassurance that nothing was lost.
+    #[test]
+    fn preserve_corrupt_db_copies_the_wal_so_the_evidence_survives_atomic_install() {
+        let t = Tmp::new("preservewal");
+        let live = t.join("aberp.duckdb");
+        std::fs::write(&live, b"main-file-bytes").unwrap();
+        // The committed-but-uncheckpointed rows: main file unchanged, WAL holds
+        // everything since the last checkpoint.
+        std::fs::write(wal_sibling(&live), b"committed-rows-only-in-the-wal").unwrap();
+
+        let retained = preserve_corrupt_db(&live).unwrap();
+        let retained_wal = wal_sibling(&retained);
+        assert!(
+            retained_wal.exists(),
+            "the evidence copy is missing the WAL — the committed rows that live only there \
+             are exactly what a torn/diverged DB is being preserved FOR"
+        );
+        assert_eq!(
+            std::fs::read(&retained_wal).unwrap(),
+            b"committed-rows-only-in-the-wal",
+            "byte-for-byte, so the retained pair opens as a real database"
+        );
+
+        // Now do what recovery does next: swap the rebuild over the live path.
+        // Step 4 of `atomic_install` unlinks the live `.wal` — the originals are
+        // gone from here on, and only the evidence copy still has them.
+        let staged = t.join("aberp.duckdb.staged");
+        std::fs::write(&staged, b"rebuilt").unwrap();
+        atomic_install(&staged, &live).unwrap();
+
+        assert!(
+            !wal_sibling(&live).exists(),
+            "atomic_install unlinks the live WAL (an old WAL beside a fresh self-contained \
+             file would corrupt it) — which is precisely why the copy had to happen first"
+        );
+        assert_eq!(
+            std::fs::read(&retained_wal).unwrap(),
+            b"committed-rows-only-in-the-wal",
+            "and the evidence still holds them"
+        );
+        assert_eq!(std::fs::read(&retained).unwrap(), b"main-file-bytes");
+    }
+
+    /// A DB with no pending WAL is the normal, freshly-checkpointed case: the
+    /// copy is main-file-only and that is not an error.
+    #[test]
+    fn preserve_corrupt_db_without_a_wal_is_not_an_error() {
+        let t = Tmp::new("preservenowal");
+        let live = t.join("aberp.duckdb");
+        std::fs::write(&live, b"self-contained").unwrap();
+
+        let retained = preserve_corrupt_db(&live).unwrap();
+        assert_eq!(std::fs::read(&retained).unwrap(), b"self-contained");
+        assert!(
+            !wal_sibling(&retained).exists(),
+            "no WAL to preserve, so none is fabricated"
         );
     }
 

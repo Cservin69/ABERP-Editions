@@ -663,7 +663,14 @@ durability ordering exactly inverted, so an unclean stop keeps the mirror line
 and loses the DB row. D3 fixed that for the serve path in v0.4.0, and
 `daemon_heartbeats_are_power_loss_durable` pins it.
 
-**The same inversion is still live on the CLI paths.** 15 runtime sites do:
+**The same inversion is still live on the CLI paths — as CODE, on this tree.**
+ADR-0099 §R2.2's "a pre-existing residual of the DEPLOYED binary, not a live code
+gap" is true of the **serve/daemon** path only (durability closed by ADR-0110 D3
+/ ADR-0111 from v0.4.x, power-loss-proven by
+`daemon_heartbeats_are_power_loss_durable`). It is **not** true of these sites:
+they are the pre-D3 inversion, unfixed at `main`, on NAV **money** paths. That
+makes D-22 an elevated fix awaiting scheduling — not a backlog nice-to-have.
+15 runtime sites do:
 
 ```rust
 let ledger = Ledger::open(db_path, …);   // independent connection, no Handle

@@ -94,7 +94,9 @@ v0.2.11's checkpoint is path-based (`live_durable_checkpoint(&self.db_path, …)
 
 **Is it preventable, and is it already prevented?** Both, on this tree — and the claim is measured, not asserted. `daemon_heartbeats_are_power_loss_durable` drives six real heartbeats, copies only the files the write path *certified* durable (its `fsynced_paths` journal plus the two pre-D3 constants), boots that copy, and demands all six back. It passes on `main`, and the WAL is in the journal. Restore the pre-D3 drop and it fails with the incident's exact shape: **mirror 6, DB 1.**
 
-So: **the lost commit is a pre-existing residual of the DEPLOYED binary, not a live code gap.** The fix for the loss itself already shipped in v0.4.0; what was missing is that it is *not deployed* — a deployment gap, which this ADR cannot close.
+So: **on the serve/daemon path**, the lost commit is a pre-existing residual of the DEPLOYED binary, not a live code gap. The fix for the loss itself already shipped in v0.4.0 (ADR-0110 D3 `durable_ack` / ADR-0111's inode fence); what was missing is that it is *not deployed* — a deployment gap, which this ADR cannot close.
+
+**That qualifier is load-bearing and the unqualified sentence was wrong.** The CLI **money**-submission paths on THIS tree still carry the pre-D3 inversion: `retry_submission.rs`, `drain_submission_queue.rs` and the rest of the D-22 sites do `Ledger::open` → `append` → `sync_mirror` with no `durable_ack`, no `fsync_data_paths`, and `PRAGMA disable_checkpoint_on_shutdown` set — the mirror explicitly `fsync`ed, the DB explicitly not folded. That is a **live code gap on NAV money paths**, not a deployment gap, and it is live at `main` right now. It is out of scope here only because folding a money-path change into a daemon-heartbeat fix would have made both unreviewable; it is tracked as **[D-22](../docs/BACKLOG-designed-to-live.md#d-22)** with the sites enumerated, the target shape named (`submit_invoice`), and the census extension specified — an elevated fix awaiting scheduling, not a backlog shrug.
 
 One live hardening is added anyway. ADR-0110's existing power-loss spec drives a **money** path, so a change that made the flush conditional on money paths would leave it green while daemon heartbeats silently lost durability again. The new test pins the **daemon** path specifically.
 
@@ -137,7 +139,9 @@ The check is **O(1) on the happy path by construction**: both stores are hash ch
 
 Reusing `MirrorAheadOfDb` for the diverged case was rejected: the seq numbers genuinely are not ahead, only the content is, and lying about that in the operator message is how this got misdiagnosed the first time.
 
-**Boot routes it to the sanctioned recovery path**, not a bespoke one — `attempt_db_auto_recovery(…, "mirror_diverged_from_db")`, so the `db.auto_recovered` row records which case it was. The safety of that routing is **not re-derived at the call site**: `replay_mirror_delta` already refuses with `SequenceConflict` the instant it is asked to replay a mirror entry onto a seq the staging DB holds, which is exactly the diverged case. A diverged mirror can therefore only reach `Recovered` if the replay was genuinely conflict-free; anything else falls through to preserve-and-surface.
+~~**Boot routes it to the sanctioned recovery path**, not a bespoke one — `attempt_db_auto_recovery(…, "mirror_diverged_from_db")` … `replay_mirror_delta` already refuses with `SequenceConflict` …~~
+
+**WITHDRAWN — the safety it rested on does not exist, and the route silently discarded committed audit rows. Superseded by [§R3](#r3-2026-08-24--a-divergence-is-terminal-the-r2-recovery-route-was-lossy).** Struck through rather than deleted, because "the call site does not re-derive the safety, a lower layer already guarantees it" is a specific and repeatable way to be wrong, and the reasoning is worth keeping visible next to what it cost.
 
 **Single-writer routing** (carried from the earlier pass, still correct, now correctly *scoped* as hardening rather than as the root cause):
 
@@ -179,4 +183,85 @@ Mutations, each killing exactly its own test and nothing else: pre-R2 `Extended`
 - **`fsync_data_paths` skips the WAL when `wal_path.exists()` is false** and still returns `Ok`. Not reachable in the measured runs (the journal always carried the WAL), but it is a silent-skip on a durability path and is flagged rather than redesigned.
 - **`serve.rs::run` is allow-listed by 10M, 10N and 10P alike** — a fork planted in the boot fn passes all three. Genuinely pre-Handle, but a real hole.
 - **`append_in_tx` still takes no lock**, so the two serialization domains remain distinct; `with_ledger` is still the only construct holding both. 10P's `LEDGER_LOCKED` is a *classification*, not a proof. ADR-0105's residual, unchanged.
-- **`ensure_consistent_with_db` now blocks on the `flock` with no timeout**, including at boot. Deliberate: a timeout would have to choose between refusing to boot and proceeding unsynchronised, and the second is the failure this ADR exists to remove.
+- ~~**`ensure_consistent_with_db` now blocks on the `flock` with no timeout**, including at boot. Deliberate: a timeout would have to choose between refusing to boot and proceeding unsynchronised, and the second is the failure this ADR exists to remove.~~ **Closed in §R3.5** — a false dilemma. The bound fails *loud* and never proceeds unsynchronised, so the TOCTOU stays closed and a stuck peer can no longer wedge every serve DB write.
+
+# R3 (2026-08-24) — a divergence is TERMINAL; the R2 recovery route was lossy
+
+- **Status:** Accepted (implemented). Same branch `fix/audit-fork-class-0099`, on top of R2. No merge, no cut.
+- **Trigger:** the R2 adversarial review.
+
+R2 got the *detection* right and the *handling* wrong, and the handling was a **regression against `main`**. Having correctly named the seq-2508 shape (`MirrorDivergedFromDb`), it routed that shape into `attempt_db_auto_recovery`. Measured on the fork shape: boot logs `Recovered`, **four committed DB audit rows cease to exist**, and serve continues on a WARN. On `main` the same shape returned `MirrorCorruptPreserved`, boot was fatal, and a human looked at it. Making the diagnosis precise must not make the handling lossy.
+
+## R3.1 — Why the `SequenceConflict` safety was never real
+
+R2's justification was that the call site need not re-derive safety because `replay_mirror_delta` refuses a colliding replay with `SequenceConflict`. That guard is unreachable **twice over**:
+
+1. **It is never asked to collide.** `replay_mirror_delta(conn, mirror, after_seq)` replays only `seq > after_seq`, and `after_seq` is the imported snapshot's audit head — into a *staging* DB that by construction holds exactly `[1..=after_seq]`. Every replayed seq is above every occupied seq. There is no collision to refuse.
+2. **A collision would not be caught anyway.** `audit_ledger` has **no `UNIQUE(seq)`** — S341 dropped that inline ART index (duckdb#23046 / S332), as `AppendError::SequenceConflict`'s own doc comment states. A duplicate-seq INSERT still reports `rows_changed = 1` and returns `Ok`. The variant survives as a defensive row-count catch, not as a uniqueness guarantee.
+
+And the loss underneath is **structural, not incidental**. Recovery rebuilds from a SNAPSHOT and replays the MIRROR's delta. The DB's own entries at the re-used seqs exist in *neither* input, so a "successful" recovery reconciles the two stores by deleting them. No conflict guard at any layer could have changed that: the rows are not overwritten, they are simply never rebuilt.
+
+The general lesson, and the reason §R2.5 is struck through rather than deleted: *"the call site does not re-derive the safety, a lower layer already guarantees it"* is only as good as having read the lower layer. Here the lower layer's own doc comment said the opposite.
+
+## R3.2 — Divergence is terminal
+
+`MirrorDivergedFromDb` now returns the preserve-and-refuse path: boot-fatal, both copies retained (the mirror preserved to `<mirror>.ahead-<nanos>.bak`, the DB untouched).
+
+This is not conservatism, it is arithmetic. Two *different* committed entries claim one seq. Which of them really happened is a question about the business's own history, and the answer is not derivable from either store. An operator reconciles them; code that picks silently is code that deletes audit rows.
+
+The boot routing is now a value — `boot_mirror_route(&AppendError) -> BootMirrorRoute` — extracted out of `serve::run`. The defect R2 shipped was a *routing* defect, and a routing defect buried in a 30k-line `run` is one no test can reach. It is fail-closed: `AutoRecover` is reachable from exactly one variant and every other reconcile failure, known or not, is `RefuseFatal`.
+
+The refusal message names `aberp recover` explicitly **as something not to run**. It is the CLI entry point to the same lossy engine, and an operator staring at a boot refusal that says "recover with `aberp recover`" — which the `MirrorDivergedFromDb` error text itself used to say — would have completed the loss by hand.
+
+## R3.3 — The AHEAD branch had the same hole
+
+R2 proved the shared prefix only on the BEHIND branch. A mirror that was ahead on **count** and *also* disagreed over the shared prefix therefore reported plain `MirrorAheadOfDb` — the one condition boot auto-recovers — and recovery discarded the DB's divergent rows exactly as above.
+
+Divergence is a property of the **shared prefix** `[1..=min(mirror_max, db_max)]`, not of which store is longer, so the proof is hoisted above the length branch and decided once. The prefix *slice* is load-bearing in the other direction: comparing the whole mirror would read an ahead mirror's legitimately DB-absent tail as a divergence at `db_max_seq + 1`, turning every honest lost-tail — and every intentional dev DB-nuke — into a boot-fatal refusal, i.e. removing the one condition this system can safely fix by itself. `state_a_mirror_ahead_is_reported_as_ahead_not_as_divergence` is the pin for that direction.
+
+The equal-length arm is now unreachable (at equal length the shared prefix *is* the whole mirror). It is kept as a fail-closed backstop: if the head hashes ever disagree while the prefix comparison reports agreement, that is two contradictory reads of the same rows, and the one thing we must not do is fall through to `Unchanged`.
+
+The preserved evidence for a divergence now gets **its own infix**, `<mirror>.diverged-<nanos>.bak`. R2 reused `.ahead-`, and in the behind- and equal-length shapes the seq numbers are precisely *not* ahead — mislabelling that is how the incident got misdiagnosed in the first place (§R2.1). `.corrupt-` is worse: it points the operator at the mirror, when the mirror is the intact party and the DB is the one that lost entries.
+
+**The in-crate `…_when_mirror_ahead_of_db` fixture was itself a divergence, and nothing had noticed.** It built the mirror from one DB and then compared it against a *separate* DB holding its own seq-1 entry, so the two disagreed at seq 1 — a shape CI has been running by name (`ci.yml`) as the canonical clean-AHEAD case. R2's BEHIND-only proof never looked at it. The fixture now loses a genuine tail (`DELETE FROM audit_ledger WHERE seq >= 2` on the same DB), and the diverged variant is pinned separately as `ensure_consistent_reports_an_ahead_but_diverged_mirror_as_divergence`.
+
+`RecoveryAction::Rebuilt` is **deleted**, not re-documented. It had no producer, and both remaining rebuild call sites return `Created`; the fn's doc decision tree still promised a "full rebuild from the DB" on equal-length divergence — the exact manoeuvre §R2.4 identifies as the one that makes this incident class invisible. A variant no code can produce is an invitation to write the arm back.
+
+## R3.4 — The evidence copy was destroying evidence
+
+`preserve_corrupt_db` copied only `<db>.duckdb`. Every `Handle` commit is **WAL-only** — the main file's bytes do not change until a checkpoint (ADR-0098 R5, measured on duckdb 1.5.3) — so a live DB's most recent committed rows can live *entirely* in `<db>.wal`. Step 4 of `atomic_install` then deliberately unlinks the target's stale `.wal`.
+
+So on the `aberp recover` CLI path the sequence was: copy the main file (missing the recent rows), rebuild, rename over the live path, unlink the live WAL. The rows were **destroyed**, and the operator was told they had been preserved. A preserve step that loses evidence is worse than none.
+
+The WAL is now copied to `<dest>.wal` before anything unlinks anything, so the retained pair opens as a real database and shows the rows as committed. A missing WAL is normal (a freshly checkpointed DB has none) and is not an error; a WAL that exists and cannot be copied *is* one.
+
+## R3.5 — The cross-process lock is bounded
+
+`aberp::snapshot::reconcile_mirror_for` holds `aberp_db`'s single writer mutex across `ensure_consistent_with_db`, which blocks on a **cross-process** `flock`. Untimed, any stuck peer — a hung `aberp` CLI, a crashed-but-not-reaped process still owning the fd — froze *every DB write in the serve process*, indefinitely, with no diagnostic.
+
+§R2.8 defended the untimed wait as a choice between refusing to boot and proceeding unsynchronised. That is a false dilemma: the bound **fails loud** (`AppendError::MirrorLockTimeout`, naming the path and telling the operator to `lsof` it) and never proceeds unsynchronised, so R2's TOCTOU stays closed. 10 s, generous against every legitimate holder (`sync_mirror` holds it for one append + fsync) and far below any human's patience for a wedged serve. `fs2` exposes no timed acquire, so the bound is a `try_lock` spin at 50 ms — ~200 syscalls over the full wait.
+
+## R3.6 — What is pinned
+
+`crates/aberp-db/tests/adr0099r3_diverged_is_terminal.rs`, plus two unit tests in `serve.rs` and two in `aberp-snapshot::recover`.
+
+| test | pins | mutation that kills it (and nothing else) |
+|---|---|---|
+| `serve::only_a_clean_mirror_ahead_is_routed_to_auto_recovery` | the routing: AHEAD → recover, everything else → refuse | route `MirrorDivergedFromDb` back to `AutoRecover` (the R2 behaviour) |
+| `serve::the_divergence_refusal_warns_against_the_lossy_recovery_cli` | the message says *not* to run `aberp recover` | — |
+| `the_fork_shape_refuses_and_preserves_without_touching_either_store` | the 2510 fork shape refuses; mirror byte-identical, every DB row in place | — |
+| `recovery_on_a_diverged_mirror_discards_the_dbs_own_rows` | **the measurement**: the real engine reports `Recovered` while seqs 4,5,6,7 vanish | — (characterisation; see below) |
+| `an_ahead_but_diverged_mirror_refuses_instead_of_reporting_a_recoverable_ahead` | R3.3 | prove the prefix only when `mirror_max < db_max` |
+| `a_clean_ahead_mirror_still_recovers_with_zero_row_loss` | a clean AHEAD stays AHEAD **and** recovers losing nothing | drop the prefix *slice* (also reddens R2's `state_a`) |
+| `a_stuck_peer_cannot_wedge_the_reconciler_forever` | R3.5 | restore `lock_exclusive()`; the peer holds for 25 s so the mutation fails the assertion rather than hanging the suite |
+| `recover::preserve_corrupt_db_copies_the_wal_so_the_evidence_survives_atomic_install` | R3.4, through a real `atomic_install` | skip the WAL copy |
+| `recover::preserve_corrupt_db_without_a_wal_is_not_an_error` | the no-WAL case is not fabricated into a failure | — |
+
+`recovery_on_a_diverged_mirror_discards_the_dbs_own_rows` is a **characterisation** test of the recovery engine, not a specification of it. Dropping rows that are in neither the snapshot nor the mirror is inherent to what a snapshot+mirror rebuild *is* — which is precisely why nothing may route a divergence into it. If a later change teaches the engine to detect divergence and refuse, that test goes red: delete it and pin the stronger property (recovery never returns `Recovered` while losing a row) in its place.
+
+## R3.7 — Honest residuals
+
+- **The recovery engine itself is still willing to run on a diverged pair.** R3 closes every *route* into it (boot classifies fail-closed; the refusal message warns off the CLI), but `aberp recover --db … --tenant …` typed by hand on a diverged pair will still rebuild and drop rows. Defence-in-depth would be a divergence check inside `recover_or_refuse`. Not done here: it belongs with the engine, it needs its own refusal semantics, and R3 is a scoped fix to a regression this branch introduced.
+- **The 10 s lock bound is a judgement, not a measurement.** Every legitimate holder is orders of magnitude below it (`sync_mirror` = one append + one `fsync`; the reconciler = one bounded compare), and the worst plausible case — a cross-process `sync_mirror` doing a first-time backfill of a very large ledger — is still JSONL writes plus one `fsync`. If a real holder ever does exceed it, the failure is a loud, actionable, retryable boot refusal naming the path to `lsof`, not a silent or data-losing one. That asymmetry is why the bound is set where it is; if a legitimate >10 s holder is ever observed, raise the constant rather than removing the bound.
+- **§R2.8's residuals otherwise stand**, including the one that matters most: the deployment gap. Every release ≤ v0.3.0 can lose a committed audit append, and nothing in this branch changes that.
+- **The CLI money-path inversion (D-22) is a live code gap on this tree**, not a deployment gap — see the correction in §R2.2. Out of scope here by scheduling, not by triage.

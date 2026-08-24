@@ -371,6 +371,13 @@ fn emit_reopen_cli(
 /// `flock` (ADR-0099 R2) covers the cross-process half. Lock order is
 /// handle-mutex → mirror-flock, the same order the lockstep path takes.
 ///
+/// ADR-0099 R3 — that `flock` wait is BOUNDED (`MirrorLockTimeout`). It is
+/// cross-process, and this fn holds the shared writer mutex across it, so an
+/// untimed acquire let any stuck peer — a hung `aberp` CLI, a crashed-but-not-
+/// reaped process still owning the fd — freeze EVERY serve DB write behind it,
+/// with no diagnostic. The timeout fails loud rather than proceeding
+/// unsynchronised, so the TOCTOU the lock exists to close stays closed.
+///
 /// Best-effort, exactly as the in-`take_snapshot` call it replaces: a reconcile
 /// failure is surfaced loud and the snapshot is still taken (the EXPORT of the
 /// live DB is independently valuable, and boot `ensure_consistent_with_db` owns
