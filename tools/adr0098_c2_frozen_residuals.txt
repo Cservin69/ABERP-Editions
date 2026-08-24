@@ -65,7 +65,7 @@
 1 apps/aberp/src/restore_from_nav_extract.rs
 9 apps/aberp/src/restore_from_nav_outgoing.rs
 8 apps/aberp/src/retry_submission.rs
-29 apps/aberp/src/serve.rs
+27 apps/aberp/src/serve.rs
 1 apps/aberp/src/snapshot.rs
 3 apps/aberp/src/submit_annulment.rs
 1 apps/aberp/src/tenant_registry.rs

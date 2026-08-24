@@ -39,6 +39,11 @@ duckdb = { workspace = true }
 # get their extern crates from dev-dependencies, so it is duplicated here (same
 # path dep -> no Cargo.lock change), matching the duckdb/audit-ledger convention.
 aberp-snapshot = { path = "../aberp-snapshot" }
+# ADR-0099 R2: tests/adr0099r2_mirror_reconcile_race.rs takes the mirror's own
+# advisory lock from the test thread to prove the reconciler parks on it BEFORE
+# it samples any head. Same `fs2` the mirror writer itself uses, so the two are
+# provably the same lock (a different locking primitive would not exclude).
+fs2 = { workspace = true }
 
 [lints]
 workspace = true

@@ -582,6 +582,88 @@ else
   fi
 fi
 
+# ── CHECK 10P — ADR-0099 R2 audit-writer provenance ──────────────────────────
+# These probe the FOUR blind spots that let the class recur a fifth time. Two of
+# them also assert that 10M/10N stay SILENT, because a probe that only proves
+# "something went red" would not distinguish 10P from the checks it supplements.
+
+echo "[CHECK 10P] B1 — a daemon heartbeat appending on a db.read() CLONE (no writer mutex, no AUDIT_APPEND_LOCK): 10P must go red where 10M/10N are structurally blind"
+c="$(fresh)"
+printf 'fn _adr0099r2_probe_read_clone_appender(db: &aberp_db::HandleArc) {\n    let mut conn = db.read().unwrap();\n    let tx = conn.transaction().unwrap();\n    let _ = aberp_audit_ledger::append_in_tx(&tx, todo!(), todo!(), vec![], todo!(), None);\n    tx.commit().unwrap();\n}\n' > "$c/apps/aberp/src/zz_adr0099r2_probe_read.rs"
+if ! assert_planted "$c"; then
+  printf '  ✗ HARNESS BUG: CHECK 10P B1 probe — the plant modified NOTHING.\n'; bad=$((bad+1))
+else
+  rc="$(gate_rc "$c")"
+  p10p="$(grep -c 'NON-SHARED audit writer appeared outside the frozen residual' "$c/.out" || true)"
+  p10mn="$(grep -c 'NEW/REGROWN write-fork\|WRAPPER-HIDDEN write-fork\|REGREW an in-process write-fork' "$c/.out" || true)"
+  if [[ "$rc" != "0" && "$p10p" != "0" && "$p10mn" == "0" ]]; then
+    printf '  ✓ caught: CHECK 10P — the read-clone appender is caught by 10P alone; 10M/10N stay blind (their opener set has no .read(), which is blind spot B1)  (exit=%s)\n' "$rc"; pass=$((pass+1))
+  elif [[ "$rc" != "0" && "$p10p" != "0" ]]; then
+    printf '  ✗ HARNESS BUG: CHECK 10P B1 — 10M/10N now ALSO catch the read-clone appender, so the B1 premise no longer holds. Re-verify the overlap and update this probe deliberately.\n'; bad=$((bad+1))
+  else
+    printf '  ✗ ESCAPED: CHECK 10P B1 — a second audit writer on a db.read() clone passed the gate (exit=%s). This is the seq-fork primitive with a different name.\n' "$rc"
+    sed 's/^/        /' "$c/.out"; bad=$((bad+1))
+  fi
+fi
+
+echo "[CHECK 10P] B4 — a non-shared MIRROR writer (Connection::open + ensure_consistent_with_db): 10L cannot see it (its append token is .sync_mirror only). NOT the seq-2508 mechanism — that was a lost DB commit (ADR-0099 R2.2); this is the second-writer class 10P exists for"
+c="$(fresh)"
+printf 'fn _adr0099r2_probe_mirror_writer(p: &std::path::Path) {\n    let conn = duckdb::Connection::open(p).unwrap();\n    let mp = aberp_audit_ledger::mirror_path_for(p);\n    let _ = aberp_audit_ledger::ensure_consistent_with_db(&conn, &mp);\n}\n' > "$c/apps/aberp/src/zz_adr0099r2_probe_mirror.rs"
+if ! assert_planted "$c"; then
+  printf '  ✗ HARNESS BUG: CHECK 10P B4 probe — the plant modified NOTHING.\n'; bad=$((bad+1))
+else
+  rc="$(gate_rc "$c")"
+  p10p="$(grep -c 'NON-SHARED audit writer appeared outside the frozen residual' "$c/.out" || true)"
+  p10l="$(grep -c 'write-fork) site appeared\|ADR-0098 R7 regression' "$c/.out" || true)"
+  if [[ "$rc" != "0" && "$p10p" != "0" && "$p10l" == "0" ]]; then
+    printf '  ✓ caught: CHECK 10P — the reconcile-shaped mirror writer is caught by 10P alone; CHECK 10L stays blind (blind spot B4)  (exit=%s)\n' "$rc"; pass=$((pass+1))
+  elif [[ "$rc" != "0" && "$p10p" != "0" ]]; then
+    printf '  ✗ HARNESS BUG: CHECK 10P B4 — CHECK 10L now ALSO catches the reconcile-shaped mirror writer. Re-verify the overlap and update this probe deliberately.\n'; bad=$((bad+1))
+  else
+    printf '  ✗ ESCAPED: CHECK 10P B4 — a mirror writer on its own connection passed the gate (exit=%s). The mirror is half the ledger; a forked mirror refuses the next boot.\n' "$rc"
+    sed 's/^/        /' "$c/.out"; bad=$((bad+1))
+  fi
+fi
+
+echo "[CHECK 10P] B4/scope — the same mirror writer planted inside crates/aberp-snapshot, which 10i/10k/10L all EXCLUDE from their corpus (where the real defect lived)"
+c="$(fresh)"
+printf 'pub fn _adr0099r2_probe_snapshot_scope(p: &std::path::Path) {\n    let conn = duckdb::Connection::open(p).unwrap();\n    let mp = aberp_audit_ledger::mirror_path_for(p);\n    let _ = aberp_audit_ledger::ensure_consistent_with_db(&conn, &mp);\n}\n' > "$c/crates/aberp-snapshot/src/zz_adr0099r2_probe_scope.rs"
+expect_fail "$c" "NON-SHARED audit writer appeared outside the frozen residual" "CHECK 10P — a non-shared ledger writer inside crates/aberp-snapshot (outside every other check's corpus) is caught"
+
+echo "[CHECK 10P] B2 — a SPLIT fork: the independent opener here, the append one call away behind a &mut Connection parameter (the qc_inspection shape). The taint fixpoint must classify the OPENER's fn."
+c="$(fresh)"
+printf 'fn _adr0099r2_probe_split_opener(p: &std::path::Path) {\n    let mut conn = duckdb::Connection::open(p).unwrap();\n    _adr0099r2_probe_split_append(&mut conn);\n}\nfn _adr0099r2_probe_split_append(conn: &mut duckdb::Connection) {\n    let tx = conn.transaction().unwrap();\n    let _ = aberp_audit_ledger::append_in_tx(&tx, todo!(), todo!(), vec![], todo!(), None);\n    tx.commit().unwrap();\n}\n' > "$c/apps/aberp/src/zz_adr0099r2_probe_split.rs"
+expect_fail "$c" "NON-SHARED audit writer appeared outside the frozen residual" "CHECK 10P — a split (helper-parameter) fork is classified at the opener via the taint fixpoint"
+
+echo "[CHECK 10P] the exact writer R2 removed — serve.rs's post-tx Ledger::open + sync_mirror best-effort helper — replanted must go red"
+c="$(fresh)"
+printf '\nfn _adr0099r2_probe_best_effort_mirror(db_path: &std::path::Path, tenant: aberp_audit_ledger::TenantId, binary_hash: aberp_audit_ledger::BinaryHash) {\n    let mirror_path = aberp_audit_ledger::mirror_path_for(db_path);\n    if let Ok(ledger) = Ledger::open(db_path, tenant, binary_hash) {\n        let _ = ledger.sync_mirror(&mirror_path);\n    }\n}\n' >> "$c/apps/aberp/src/serve.rs"
+expect_fail "$c" "NON-SHARED audit writer appeared outside the frozen residual" "CHECK 10P — the removed serve.rs second mirror writer, replanted, is caught (an IMMUTABLE Ledger binding still writes the mirror)"
+
+echo "[CHECK 10P] NON-TRIGGER — a db.read() clone used ONLY for verify_chain must stay GREEN (this is the shape ~7 money paths use; a gate that reddens it would be switched off)"
+c="$(fresh)"
+printf '\nfn _adr0099r2_probe_verify_only(db: &aberp_db::HandleArc, t: aberp_audit_ledger::TenantId, bh: aberp_audit_ledger::BinaryHash) {\n    let mut conn = db.write().unwrap();\n    let tx = conn.transaction().unwrap();\n    let _ = aberp_audit_ledger::append_in_tx(&tx, todo!(), todo!(), vec![], todo!(), None);\n    tx.commit().unwrap();\n    drop(conn);\n    let verify_conn = db.read().unwrap();\n    let ledger = Ledger::from_connection(verify_conn, t, bh);\n    let _ = ledger.verify_chain();\n}\n' >> "$c/apps/aberp/src/serve.rs"
+expect_pass "$c" "CHECK 10P — write-then-verify-on-a-read-clone is correctly GREEN (provenance travels only along connection derivations, so a read clone that never writes is not a fork)"
+
+echo "[CHECK 10P] NON-TRIGGER — a read-clone appender inside #[cfg(test)] must NOT trip 10P (cfg(test)-aware precision)"
+c="$(fresh)"
+printf '\n#[cfg(test)]\nmod adr0099r2_test_probe {\n    fn t(db: &aberp_db::HandleArc) {\n        let mut conn = db.read().unwrap();\n        let tx = conn.transaction().unwrap();\n        let _ = aberp_audit_ledger::append_in_tx(&tx, todo!(), todo!(), vec![], todo!(), None);\n    }\n}\n' >> "$c/apps/aberp/src/serve.rs"
+expect_pass "$c" "CHECK 10P — a read-clone appender inside #[cfg(test)] is correctly IGNORED"
+
+echo "[CHECK 10P] HARNESS — deleting the scanner must NOT read as \"no violations\"; the gate must say so"
+c="$(fresh)"
+rm -f "$c/tools/adr0099_audit_writer_scan.awk"
+expect_fail "$c" "audit-writer scanner or frozen residual missing" "CHECK 10P — a deleted scanner is RED, not vacuously green"
+
+echo "[CHECK 10P] HARNESS — breaking the scanner's shared-Handle verdict must be RED (corpus liveness), not a silent green"
+c="$(fresh)"
+# Neuter only the HANDLE_WRITE recognition. Every real writer then falls to
+# UNCLASSIFIED, which must trip 10P-2; and the 10P-3 corpus-liveness floor is
+# what makes the OPPOSITE mutation (a scanner that emits nothing at all) red too.
+perl -0pi -e 's/if \(stmt ~ \/\\\.write\[ \\t\]\*\\\(\[ \\t\]\*\\\)\/\)      src="W"/if (0) src="W"/' "$c/tools/adr0099_audit_writer_scan.awk"
+expect_fail "$c" "NON-SHARED audit writer appeared outside the frozen residual" "CHECK 10P — a scanner that stops recognising the shared writer goes RED instead of reporting a clean tree"
+
+
 echo
 echo "probes passed: $pass   broken/escaped: $bad"
 if [[ "$bad" -ne 0 ]]; then echo "NEGATIVE-PROBES: ✗ FAILED"; exit 1; fi

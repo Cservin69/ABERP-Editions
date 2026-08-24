@@ -1020,6 +1020,138 @@ else
   rm -f "$wf_cur" "$wf_froz"
 fi
 
+# ── CHECK 10P — ADR-0099 R2: AUDIT-WRITER PROVENANCE. CHECK 10M/10N fire on
+#    `independent opener AND audit-table append`. That predicate let the class
+#    recur a FIFTH time (mirror-side, seq 2508, two duplicated quote-intake
+#    heartbeats), because it has four blind spots:
+#      B1 `Handle::read()` is not in their opener set, yet it hands back a
+#         WRITABLE `Connection` holding neither the writer mutex nor
+#         AUDIT_APPEND_LOCK — a second audit writer by any other name.
+#      B2 a fn that appends on a `&Transaction`/`&mut Ledger`/`&mut Connection`
+#         PARAMETER has no opener of its own, so it scores clean whatever its
+#         caller opened (the qc_inspection split fork, found by hand).
+#      B3 they are BAN-lists: a provenance they do not already know is silently
+#         clean.
+#      B4 they only count appends to the audit TABLE. The `<db>.audit.log`
+#         MIRROR is the ledger's other half and its writers (`sync_mirror`,
+#         `ensure_consistent_with_db`, `replay_mirror_delta`) were not in the
+#         append set at all — which is exactly where the recurrence lived.
+#         10M/10N also EXCLUDE crates/aberp-db and crates/aberp-snapshot from
+#         their corpus, and the snapshot daemon's reconciler is in the second
+#         of those.
+#    10P inverts the predicate: it fires on the WRITE — table or mirror — and
+#    demands each site PROVE its serialization domain (shared `.write()` guard,
+#    `with_ledger`, an AUDIT_APPEND_LOCK-holding `Ledger` api, or a
+#    caller-owned tx). A site it cannot classify is RED, so there is no
+#    "not on the ban-list" escape. `TX_PARAM` sites are not trusted on faith:
+#    the driver iterates the scanner to a FIXPOINT, re-running it with each
+#    pass's caller-owned-tx fns treated as writes, so a fn that writes only by
+#    handing its connection to a helper is classified by its OWN provenance.
+#    Corpus is the WHOLE workspace, aberp-db and aberp-snapshot included.
+#    Detector: tools/adr0099_audit_writer_scan.awk (comment/string/
+#    cfg(test)-aware, STATEMENT-scoped so a multi-line `let mut conn = db\n
+#    .write()?` is read as one statement — cf. ADR-0105 F1's line-scoped
+#    laundering).
+#    Teeth: cut_gate_negative_probes.sh "[CHECK 10P]" plants a daemon heartbeat
+#    appending on a `db.read()` clone, an independent mirror writer, and a
+#    split (helper-parameter) fork, and asserts each goes RED.
+#    ENFORCE_AUDIT_WRITER=0 disables it for a deliberate, temporary local probe.
+echo "[CHECK 10P] ADR-0099 R2 — audit-writer provenance: every table/mirror write proves its serialization domain; residual frozen (ENFORCED · D5)"
+enforce10P="${ENFORCE_AUDIT_WRITER:-1}"
+flag10P() { note "$1"; if [[ "$enforce10P" == "1" ]]; then fail=1; else note "  (enforcement disabled — not failing)"; fi; }
+aw_scan="tools/adr0099_audit_writer_scan.awk"
+aw_manifest="tools/adr0099_audit_writer_residuals.txt"
+if [[ ! -f "$aw_scan" || ! -f "$aw_manifest" ]]; then
+  flag10P "✗ audit-writer scanner or frozen residual missing: $aw_scan / $aw_manifest"
+else
+  aw_files="$(mktemp "${TMPDIR:-/tmp}/aw_files.XXXXXX")"
+  find apps/aberp/src modules crates -name '*.rs' 2>/dev/null | grep -vE '/tests/' | sort > "$aw_files"
+
+  # 10P-0 — MATCHER LIVENESS (always enforced). A gate whose scanner silently
+  # stops matching reports "no violations" — the most dangerous green there is.
+  # Three fixtures pin the three verdicts the gate actually rests on.
+  aw_probe="$(mktemp "${TMPDIR:-/tmp}/aw_probe.XXXXXX")"
+  printf 'fn h(db: &Db) {\n    let mut c = db\n        .read()\n        .unwrap();\n    let tx = c.transaction().unwrap();\n    append_in_tx(&tx, &m, k, p, a, None).unwrap();\n}\n' > "$aw_probe"
+  awk -f "$aw_scan" "$aw_probe" | grep -q 'READ_CLONE' \
+    || { flag10P "✗ HARNESS: scanner no longer verdicts a db.read()+append fn as READ_CLONE (blind spot B1 reopened)"; }
+  printf 'fn h(db: &Db) {\n    let mut c = db\n        .write()\n        .unwrap();\n    let tx = c.transaction().unwrap();\n    append_in_tx(&tx, &m, k, p, a, None).unwrap();\n}\n' > "$aw_probe"
+  awk -f "$aw_scan" "$aw_probe" | grep -q 'HANDLE_WRITE' \
+    || { flag10P "✗ HARNESS: scanner no longer verdicts a db.write()+append fn as HANDLE_WRITE — it would cry wolf on the whole tree"; }
+  printf '/// let mut c = Connection::open(p);\nfn h(tx: &Transaction) {\n    // Connection::open(p)\n    append_in_tx(tx, &m, k, p, a, None).unwrap();\n}\n' > "$aw_probe"
+  awk -f "$aw_scan" "$aw_probe" | grep -q 'TX_PARAM' \
+    || { flag10P "✗ HARNESS: scanner counted a doc/line comment as an opener, or lost caller-owned-tx detection"; }
+  printf 'fn h(db: &Db) {\n    let mut l = Ledger::open(p, t, b).unwrap();\n    l.append(k, p, a, None).unwrap();\n}\n' > "$aw_probe"
+  awk -f "$aw_scan" "$aw_probe" | grep -q 'INDEP_OPENER' \
+    || { flag10P "✗ HARNESS: scanner no longer verdicts an independent Ledger::open+append as INDEP_OPENER"; }
+  printf 'fn h(db: &Db) {\n    let mut l = Ledger::open(p, t, b).unwrap();\n    l.sync_mirror(&mp).unwrap();\n}\n' > "$aw_probe"
+  awk -f "$aw_scan" "$aw_probe" | grep -q 'INDEP_OPENER' \
+    || { flag10P "✗ HARNESS: scanner no longer treats a MIRROR write as a ledger write (blind spot B4 reopened)"; }
+  rm -f "$aw_probe"
+
+  # 10P-1 — iterate to a FIXPOINT over the caller-owned-tx set (blind spot B2).
+  aw_out="$(mktemp "${TMPDIR:-/tmp}/aw_out.XXXXXX")"
+  aw_taint=""
+  for _pass in 1 2 3 4 5 6; do
+    # ONE awk process over the corpus per pass. The scanner resets its
+    # positional state at FNR==1 and attributes each record to the file the fn
+    # was DECLARED in, so multi-file is byte-identical to per-file — and a
+    # fixpoint over ~400 files stops costing ~400 process spawns per pass.
+    #
+    # PREFILTER (sound, not a sample): a file can only produce a record if it
+    # contains a ledger-write token, or calls one of THIS PASS's tainted fns.
+    # Recomputed every pass from `$aw_taint`, so growing the taint set grows the
+    # file set — dropping the filter must not change the output, and CHECK 10P-0
+    # + 10P-3 are what catch it if a future edit makes it lossy.
+    : > "$aw_out"
+    aw_re='append_in_tx|[.]append|append_reopen|sync_mirror|ensure_consistent_with_db|replay_mirror_delta'
+    [[ -n "$aw_taint" ]] && aw_re="$aw_re|$(printf '%s' "$aw_taint" | tr ',' '|')"
+    aw_hits="$(mktemp "${TMPDIR:-/tmp}/aw_hits.XXXXXX")"
+    xargs grep -lE "$aw_re" < "$aw_files" > "$aw_hits" 2>/dev/null || true
+    if [[ -s "$aw_hits" ]]; then
+      xargs awk -v taint="$aw_taint" -f "$aw_scan" < "$aw_hits" >> "$aw_out" 2>/dev/null
+    fi
+    rm -f "$aw_hits"
+    aw_next="$(grep ':TX_PARAM@' "$aw_out" | sed 's/^[^:]*:\([^:]*\):.*/\1/' | sort -u | paste -sd, -)"
+    [[ "$aw_next" == "$aw_taint" ]] && break
+    aw_taint="$aw_next"
+  done
+  note "  (taint fixpoint over ${#aw_taint} bytes of caller-owned-tx fn names)"
+
+  # 10P-2 — every unclassifiable / non-shared writer must be on the frozen list.
+  aw_cur="$(mktemp "${TMPDIR:-/tmp}/aw_cur.XXXXXX")"
+  aw_froz="$(mktemp "${TMPDIR:-/tmp}/aw_froz.XXXXXX")"
+  grep -E ':(READ_CLONE|INDEP_OPENER|UNCLASSIFIED)@' "$aw_out" \
+    | sed -E 's/@L[0-9]+$//; s/:(READ_CLONE|INDEP_OPENER|UNCLASSIFIED)$//' \
+    | sort -u > "$aw_cur" || true
+  grep -vE '^#' "$aw_manifest" | sed 's/[[:space:]]*#.*$//;s/[[:space:]]*$//' \
+    | grep -vE '^$' | sort -u > "$aw_froz" || true
+  aw_grew="$(comm -13 "$aw_froz" "$aw_cur")"
+  if [[ -n "$aw_grew" ]]; then
+    flag10P "✗ a NON-SHARED audit writer appeared outside the frozen residual — route it through the shared aberp_db::Handle writer (ADR-0099 R2). Verdicts: READ_CLONE = appends on a db.read() clone; INDEP_OPENER = its own Connection/Ledger; UNCLASSIFIED = provenance not provable:"
+    printf '%s\n' "$aw_grew" | sed 's/^/      /'
+    grep -E ':(READ_CLONE|INDEP_OPENER|UNCLASSIFIED)@' "$aw_out" \
+      | grep -Ff <(printf '%s\n' "$aw_grew") | sed 's/^/        /' || true
+  fi
+  aw_shrunk="$(comm -23 "$aw_froz" "$aw_cur")"
+  if [[ -n "$aw_shrunk" ]]; then
+    note "  (info) non-shared audit writers migrated off since freeze — refresh $aw_manifest to lock the smaller set:"
+    printf '%s\n' "$aw_shrunk" | sed 's/^/      /'
+  fi
+  # 10P-3 — corpus liveness. A `find` that matches nothing, or a scanner that
+  # emits nothing, makes 10P-2 vacuously green. The tree has ~50 shared-Handle
+  # writers; require the classification to be non-trivial in the SAFE direction
+  # too, so "no violations" can never mean "no scan".
+  aw_ok="$(grep -cE ':(HANDLE_WRITE|WITH_LEDGER)@' "$aw_out" || true)"
+  if [[ "${aw_ok:-0}" -lt 20 ]]; then
+    flag10P "✗ HARNESS: only ${aw_ok:-0} shared-Handle audit writers classified across the workspace — the corpus or the scanner is broken, so a green 10P-2 means nothing"
+  fi
+  if [[ -z "$aw_grew" ]]; then
+    aw_n="$(grep -vcE '^#|^$' "$aw_manifest" || true)"
+    note "✓ audit-writer provenance holds (${aw_ok:-0} writes on the shared Handle; ${aw_n:-0} frozen sanctioned non-shared writers; a NEW one anywhere — table OR mirror, aberp-db and aberp-snapshot included — fails here)"
+  fi
+  rm -f "$aw_cur" "$aw_froz" "$aw_out" "$aw_files"
+fi
+
 # ── CHECK 10N — ADR-0105: the WRAPPER-HIDDEN write-fork. CHECK 10M above is a
 #    per-FUNCTION scan: it fires only when the independent opener token and the
 #    audit-append token appear in the SAME fn body. That model is structurally

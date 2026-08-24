@@ -141,11 +141,57 @@ fn fail(msg: String) -> ValidationReport {
 /// `record.meta.valid` to decide whether to emit `SnapshotCreated` or
 /// `SnapshotValidationFailed`. A hard error (source missing, export failed,
 /// rename failed) is returned as `Err`.
+/// ADR-0099 R2 — who reconciles the audit MIRROR before the EXPORT.
+///
+/// The pre-snapshot reconcile ([`ensure_consistent_with_db`]) is a WRITER of the
+/// audit mirror, and the mirror is half of the audit ledger. Running it on this
+/// module's own short-lived `Connection::open` made it a SECOND audit writer
+/// inside `aberp serve`, on a connection that is not the shared instance — and
+/// a separate DuckDB instance does not replay the live writer's WAL, so its
+/// `db_max_seq` reads STALE-LOW while the lockstep `sync_mirror` has already
+/// carried the mirror to the true head. The reconciler then sees
+/// `mirror_max > db_max` and fires a spurious `MirrorAheadOfDb` — preserving a
+/// side file and raising a P0 signal on a perfectly healthy pair.
+///
+/// The "sanctioned residual" rationale below justified this connection as
+/// READ-ONLY *with respect to the live DB*. That is true and was never the
+/// question: nobody asked whether it was read-only with respect to the MIRROR.
+/// It is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorReconcile {
+    /// `aberp serve`: the caller has ALREADY reconciled the mirror through the
+    /// ONE shared `aberp_db::Handle` writer, on the coherent shared instance.
+    /// This module must not touch the mirror at all.
+    AlreadyDoneByCaller,
+    /// Separate-process CLI one-shot (`aberp snapshot now`): no shared Handle
+    /// exists, and the export connection is the only opener in the process, so
+    /// reconciling on it is coherent and cannot race anything.
+    OnExportConnection,
+}
+
 pub fn take_snapshot(
     db_path: &Path,
     store_dir: &Path,
     tenant: &str,
     now: OffsetDateTime,
+) -> Result<SnapshotRecord> {
+    take_snapshot_with(
+        db_path,
+        store_dir,
+        tenant,
+        now,
+        MirrorReconcile::OnExportConnection,
+    )
+}
+
+/// [`take_snapshot`] with the mirror-reconcile owner made explicit. See
+/// [`MirrorReconcile`].
+pub fn take_snapshot_with(
+    db_path: &Path,
+    store_dir: &Path,
+    tenant: &str,
+    now: OffsetDateTime,
+    reconcile: MirrorReconcile,
 ) -> Result<SnapshotRecord> {
     if !db_path.exists() {
         return Err(SnapshotError::SourceMissing(db_path.to_path_buf()));
@@ -218,29 +264,42 @@ pub fn take_snapshot(
         // error are SURFACED, never fatal — the EXPORT of the live DB is
         // independently valuable and Gap 2a remains the safety net.
         let mirror_path = mirror_path_for(db_path);
-        match ensure_consistent_with_db(&conn, &mirror_path) {
-            Ok(action) => tracing::debug!(
-                ?action,
+        // ADR-0099 R2 — SKIPPED when the caller already reconciled through the
+        // shared Handle. See [`MirrorReconcile`] for why this connection must
+        // not be the one that writes the mirror inside `aberp serve`.
+        match reconcile {
+            MirrorReconcile::AlreadyDoneByCaller => tracing::debug!(
                 mirror = %mirror_path.display(),
-                "ADR-0098 2b — pre-snapshot mirror reconcile + fsync"
+                "ADR-0099 R2 — pre-snapshot mirror reconcile SKIPPED here; the caller \
+                 already ran it through the shared aberp_db::Handle writer"
             ),
-            Err(AppendError::MirrorAheadOfDb {
-                mirror_max_seq,
-                db_max_seq,
-                preserved,
-            }) => tracing::warn!(
-                mirror_max_seq,
-                db_max_seq,
-                preserved,
-                "ADR-0098 2b — pre-snapshot mirror is AHEAD of the DB; preserved + surfaced \
-                 (boot recovery owns the ahead-mirror P0). Taking the snapshot anyway"
-            ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                mirror = %mirror_path.display(),
-                "ADR-0098 2b — pre-snapshot mirror reconcile failed (best-effort); \
-                 taking the snapshot anyway"
-            ),
+            MirrorReconcile::OnExportConnection => {
+                match ensure_consistent_with_db(&conn, &mirror_path) {
+                    Ok(action) => tracing::debug!(
+                        ?action,
+                        mirror = %mirror_path.display(),
+                        "ADR-0098 2b — pre-snapshot mirror reconcile + fsync"
+                    ),
+                    Err(AppendError::MirrorAheadOfDb {
+                        mirror_max_seq,
+                        db_max_seq,
+                        preserved,
+                    }) => tracing::warn!(
+                        mirror_max_seq,
+                        db_max_seq,
+                        preserved,
+                        "ADR-0098 2b — pre-snapshot mirror is AHEAD of the DB; preserved + \
+                         surfaced (boot recovery owns the ahead-mirror P0). Taking the \
+                         snapshot anyway"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        mirror = %mirror_path.display(),
+                        "ADR-0098 2b — pre-snapshot mirror reconcile failed (best-effort); \
+                         taking the snapshot anyway"
+                    ),
+                }
+            }
         }
 
         conn.execute_batch(&format!(

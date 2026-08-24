@@ -31,7 +31,8 @@ use aberp_audit_ledger::{Actor, BinaryHash, EventKind, Ledger, LedgerMeta, Tenan
 use aberp_db::HandleArc;
 use aberp_snapshot::{
     edition_store_dir, ensure_not_prod_path, ensure_restore_allowed, find_snapshot, list_snapshots,
-    plan_retention, prune, restore_into, take_snapshot, RetentionPolicy, SnapshotRecord,
+    plan_retention, prune, restore_into, take_snapshot_with, MirrorReconcile, RetentionPolicy,
+    SnapshotRecord,
 };
 
 use crate::build_profile;
@@ -360,6 +361,53 @@ fn emit_reopen_cli(
 // Shared operations (CLI + daemon + HTTP all call these)
 // ──────────────────────────────────────────────────────────────────────
 
+/// ADR-0099 R2 — run the pre-snapshot audit-mirror reconcile through the ONE
+/// shared [`aberp_db::Handle`] writer when this process has one, and report back
+/// which owner `take_snapshot_with` should assume.
+///
+/// Holding the write guard across [`aberp_audit_ledger::ensure_consistent_with_db`]
+/// is what makes it exclusive against the lockstep `sync_mirror` that fires from
+/// every other `WriteGuard::drop` in the process; the reconciler's own mirror
+/// `flock` (ADR-0099 R2) covers the cross-process half. Lock order is
+/// handle-mutex → mirror-flock, the same order the lockstep path takes.
+///
+/// Best-effort, exactly as the in-`take_snapshot` call it replaces: a reconcile
+/// failure is surfaced loud and the snapshot is still taken (the EXPORT of the
+/// live DB is independently valuable, and boot `ensure_consistent_with_db` owns
+/// the ahead-mirror P0).
+fn reconcile_mirror_for(audit: &SnapshotAudit<'_>, db_path: &Path) -> MirrorReconcile {
+    let handle = match audit {
+        SnapshotAudit::Handle(h) => *h,
+        // No Handle in this process — the export connection is the only opener,
+        // so let `take_snapshot_with` reconcile on it as it always has.
+        SnapshotAudit::Reopen => return MirrorReconcile::OnExportConnection,
+    };
+    let mirror_path = aberp_audit_ledger::mirror_path_for(db_path);
+    match handle.write() {
+        Ok(guard) => match aberp_audit_ledger::ensure_consistent_with_db(&guard, &mirror_path) {
+            Ok(action) => tracing::debug!(
+                ?action,
+                mirror = %mirror_path.display(),
+                "ADR-0099 R2 — pre-snapshot mirror reconcile via the shared Handle writer"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                mirror = %mirror_path.display(),
+                "ADR-0099 R2 — pre-snapshot mirror reconcile via the shared Handle FAILED \
+                 (best-effort); taking the snapshot anyway"
+            ),
+        },
+        Err(e) => tracing::warn!(
+            error = %e,
+            "ADR-0099 R2 — could not take the shared writer for the pre-snapshot mirror \
+             reconcile (best-effort); taking the snapshot anyway"
+        ),
+    }
+    // The reconcile is owned here either way: on failure we must NOT fall back
+    // to the export connection, which is the second-writer path R2 removes.
+    MirrorReconcile::AlreadyDoneByCaller
+}
+
 /// Take one validated snapshot and emit the appropriate audit event
 /// (`SnapshotCreated` on success, `SnapshotValidationFailed` if the
 /// snapshot was produced but failed its built-in validation — in which case
@@ -380,7 +428,17 @@ pub fn take_and_emit(
         anyhow::anyhow!("snapshot source DB must not be under the frozen prod line: {e}")
     })?;
     let now = OffsetDateTime::now_utc();
-    let rec = take_snapshot(db_path, store_dir, tenant.as_str(), now)
+    // ADR-0099 R2 — the pre-EXPORT audit-MIRROR reconcile is a WRITER of the
+    // audit ledger's mirror half. In `aberp serve` it must run on the ONE shared
+    // instance, under the ONE serialized writer — not on `take_snapshot`'s own
+    // short-lived export connection, which is a separate DuckDB instance that
+    // does not replay the live writer's WAL and therefore reads a STALE-LOW
+    // `db_max_seq` (spurious `MirrorAheadOfDb`). The CLI has no Handle and is
+    // the only opener in its process, so it keeps reconciling on the export
+    // connection. Same seam as the audit append: `SnapshotAudit` already carries
+    // the Handle, so no signature changes.
+    let reconcile = reconcile_mirror_for(audit, db_path);
+    let rec = take_snapshot_with(db_path, store_dir, tenant.as_str(), now, reconcile)
         .with_context(|| format!("take snapshot of {}", db_path.display()))?;
 
     let created_at = rfc3339(rec.meta.created_at);
@@ -834,5 +892,85 @@ mod tests {
     fn rfc3339_is_z_suffixed() {
         let dt = time::macros::datetime!(2026-06-15 14:30:00 UTC);
         assert_eq!(rfc3339(dt), "2026-06-15T14:30:00Z");
+    }
+
+    // ── ADR-0099 R2 — who owns the pre-snapshot mirror reconcile ────────────
+    //
+    // The seq-2508 fork was the snapshot daemon reconciling the audit MIRROR on
+    // `take_snapshot`'s own export connection: a second mirror writer inside
+    // `aberp serve`, on a DuckDB instance that does not replay the shared
+    // writer's WAL. R2 hoists that reconcile onto the shared Handle for the
+    // in-process arm and leaves the CLI arm (no Handle in that process) alone.
+    //
+    // Both halves are pinned, because either one failing is SILENT: an arm that
+    // returns the wrong owner still produces a correct-looking mirror, and a
+    // reconcile that never runs still produces a correct-looking snapshot.
+
+    fn r2_tmp(label: &str) -> std::path::PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p =
+            std::env::temp_dir().join(format!("aberp-r2-owner-{label}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn reconcile_mirror_for_handle_runs_it_here_and_claims_ownership() {
+        let dir = r2_tmp("handle");
+        let db = dir.join("aberp.duckdb");
+        let tenant = TenantId::new("defense".to_string()).unwrap();
+        // Seed a short chain, then remove the mirror so "did the reconcile run?"
+        // is answerable by the file's existence alone.
+        {
+            let mut ledger =
+                Ledger::open(&db, tenant.clone(), BinaryHash::from_bytes([1u8; 32])).unwrap();
+            ledger
+                .append(EventKind::Test, b"{}".to_vec(), cli_actor("t"), None)
+                .unwrap();
+        }
+        let mirror = aberp_audit_ledger::mirror_path_for(&db);
+        let _ = std::fs::remove_file(&mirror);
+
+        let handle = aberp_db::Handle::open(
+            &db,
+            tenant,
+            aberp_db::HandleConfig {
+                checkpoint_enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let owner = reconcile_mirror_for(&SnapshotAudit::Handle(&handle), &db);
+
+        assert_eq!(
+            owner,
+            MirrorReconcile::AlreadyDoneByCaller,
+            "the in-process arm must claim the reconcile, or `take_snapshot_with` \
+             does it again on its own export connection — the second mirror writer \
+             ADR-0099 R2 removed"
+        );
+        assert!(
+            mirror.exists(),
+            "claiming ownership without actually reconciling would leave the mirror \
+             un-reconciled before every snapshot"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_mirror_for_cli_defers_to_the_export_connection() {
+        let dir = r2_tmp("cli");
+        let db = dir.join("aberp.duckdb");
+        let owner = reconcile_mirror_for(&SnapshotAudit::Reopen, &db);
+        assert_eq!(
+            owner,
+            MirrorReconcile::OnExportConnection,
+            "the CLI process has no shared Handle, so `take_snapshot_with` must keep \
+             reconciling on its export connection (its only opener)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

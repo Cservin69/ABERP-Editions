@@ -1,0 +1,67 @@
+# ADR-0099 R2 — FROZEN audit-WRITER provenance residual (cut-gate CHECK 10P).
+#
+# Format: <file>:<fname>  (line numbers dropped so a benign shift never churns
+# it — cf. CHECK 10k). One line per RUNTIME fn that writes the audit ledger
+# (table OR mirror) and whose connection provenance is NOT the shared
+# `aberp_db::Handle` writer, as classified by
+# tools/adr0099_audit_writer_scan.awk. Every entry below is a SANCTIONED
+# non-shared writer with the reason it cannot fork the `aberp serve` writer.
+#
+# NOTE (ADR-0099 R2): this gate covers the SECOND-WRITER class. The seq-2508
+# incident was NOT that class — it was a lost DB commit (R2.2). Kept because the
+# second-writer class is real and recurred four times, not because it explains
+# seq 2508.
+#
+# Anything NOT on this list that the scanner verdicts READ_CLONE, INDEP_OPENER
+# or UNCLASSIFIED fails the build. Unlike CHECK 10M this is not a ban-list of
+# known-bad names: the scanner fires on the WRITE and demands a provable
+# provenance for it, so an unrecognised one is RED by default.
+#
+# ── SEPARATE-PROCESS CLI ONE-SHOTS ──────────────────────────────────────────
+# `aberp <subcommand>` is a different process from `aberp serve`. It has no
+# shared Handle to route through, and its writes cannot collide with the serve
+# writer's in-process seq assignment (cross-process racing is backstopped by
+# the hash chain, as it always has been — see AUDIT_APPEND_LOCK's docs).
+apps/aberp/src/drain_submission_queue.rs:drive_one_invoice
+apps/aberp/src/mark_abandoned.rs:run
+apps/aberp/src/observe_receiver_confirmation.rs:run
+apps/aberp/src/poll_annulment_ack.rs:run
+apps/aberp/src/recover_from_nav.rs:run
+apps/aberp/src/request_technical_annulment.rs:run
+apps/aberp/src/retry_submission.rs:run
+apps/aberp/src/retry_submission.rs:perform_layer_2_check
+apps/aberp/src/submit_annulment.rs:run
+apps/aberp/src/snapshot.rs:emit_reopen_cli
+apps/aberp/src/tenant_registry.rs:emit_tenant_reopen
+#
+# ── PRE-HANDLE BOOT ─────────────────────────────────────────────────────────
+# Runs BEFORE `open_tenant_handle` (apps/aberp/src/serve.rs) and before any
+# daemon is spawned, so there is exactly one thread and no Handle to share.
+# `serve.rs:run` is the boot fn itself and carries the boot mirror reconcile;
+# it is allow-listed by CHECK 10M and 10N for the same reason. KNOWN HOLE,
+# named in ADR-0099 §R2: a fork planted inside `run` passes all three checks.
+apps/aberp/src/serve.rs:run
+apps/aberp/src/serve.rs:record_upgrade_snapshot_mismatch_audit
+crates/aberp-snapshot/src/recover.rs:append_staged_audit_row
+crates/aberp-snapshot/src/recover.rs:build_and_validate
+#
+# ── SANCTIONED CLI-ONLY RECONCILE SEAM ──────────────────────────────────────
+# `take_snapshot_with(.., MirrorReconcile::OnExportConnection)` — the CLI arm
+# only. In `aberp serve` the reconcile is hoisted to the caller and runs under
+# the shared Handle writer (`aberp::snapshot::reconcile_mirror_for`); the CLI
+# has no Handle and its export connection is the only opener in the process.
+crates/aberp-snapshot/src/take.rs:take_snapshot_with
+#
+# ── INSIDE THE DURABILITY CORE / THE PRIMITIVES THEMSELVES ──────────────────
+# `WriteGuard::drop` IS the lockstep mirror sync, running with the writer mutex
+# held. `emit_poison_recovery_audit` runs under the same held mutex on a
+# `try_clone` of the shared instance (lock order handle → AUDIT_APPEND_LOCK,
+# the `with_ledger` shape). The audit-ledger `Ledger` methods and
+# `append_reopen` ARE the append primitives, and each holds AUDIT_APPEND_LOCK
+# across read-head → insert → commit.
+crates/aberp-db/src/lib.rs:drop
+crates/aberp-db/src/lib.rs:emit_poison_recovery_audit
+crates/audit-ledger/src/storage/mod.rs:append
+crates/audit-ledger/src/storage/mod.rs:append_signed
+crates/audit-ledger/src/storage/mod.rs:sync_mirror
+crates/audit-ledger/src/storage/mod.rs:append_reopen

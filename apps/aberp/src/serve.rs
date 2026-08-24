@@ -1784,6 +1784,73 @@ pub fn run(args: &ServeArgs) -> Result<()> {
                     }
                 }
             }
+            Err(
+                e @ aberp_audit_ledger::AppendError::MirrorDivergedFromDb {
+                    first_divergent_seq,
+                    ..
+                },
+            ) => {
+                // ADR-0099 R2 — the mirror and the DB hold DIFFERENT entries at
+                // the SAME seq. Same root cause as the AHEAD arm above (the DB
+                // lost committed entries), one step later: the chain head fell
+                // back, so the DB re-used the lost seqs for later entries and
+                // the length asymmetry the AHEAD arm keys on is gone.
+                //
+                // Routed to the SAME sanctioned recovery path rather than a
+                // bespoke one, with a distinct trigger so the `db.auto_recovered`
+                // row records which case it was. The distinction is load-bearing
+                // and is NOT re-derived here: `replay_mirror_delta` refuses with
+                // `SequenceConflict` the moment it is asked to replay a mirror
+                // entry onto a seq the staging DB already holds, which is
+                // exactly the diverged case. So a diverged mirror can only reach
+                // `Recovered` if the replay was genuinely conflict-free; any
+                // other outcome falls through to preserve-and-surface below.
+                // Nothing here rebuilds the mirror from the DB — that would
+                // discard the only surviving copy of what the DB lost, which is
+                // what the undocumented 2026-08-20 hand-rebuild did.
+                tracing::error!(
+                    error = %e,
+                    first_divergent_seq,
+                    "audit-ledger mirror DIVERGES from the DB at seq {first_divergent_seq} — \
+                     the DB lost entries the mirror still holds and re-used their seqs. \
+                     Attempting ADR-0095 §1 auto-recovery"
+                );
+                drop(conn);
+                let recovery = attempt_db_auto_recovery(
+                    &args.db,
+                    &tenant,
+                    &binary_hash_handle,
+                    "mirror_diverged_from_db",
+                );
+                match recovery {
+                    Ok(BootRecovery::Recovered) => {
+                        tracing::warn!(
+                            first_divergent_seq,
+                            "ADR-0095 §1 — auto-recovery reconciled the diverged mirror with the \
+                             DB at boot"
+                        );
+                    }
+                    Ok(BootRecovery::Refused(reason)) => {
+                        tracing::error!(
+                            reason = %reason,
+                            first_divergent_seq,
+                            "REFUSING to boot — diverged mirror could not be safely auto-recovered"
+                        );
+                        return Err(anyhow::Error::new(e)).context(
+                            "audit-ledger mirror DIVERGES from the DB at a shared seq at boot \
+                             (the DB lost committed entries and re-used their seqs). The mirror \
+                             was preserved to a side file and holds the ONLY copy of the lost \
+                             entries; investigate before re-running. Do NOT rebuild the mirror \
+                             from the DB.",
+                        );
+                    }
+                    Err(rec_err) => {
+                        return Err(rec_err).context(
+                            "ADR-0095 auto-recovery of a diverged mirror failed mechanically at boot",
+                        );
+                    }
+                }
+            }
             Err(e) => {
                 return Err(anyhow::Error::new(e))
                     .context("reconcile audit-ledger mirror with DB at serve boot")
@@ -16455,20 +16522,16 @@ pub fn create_stock_movement_request(
     .map_err(map_inventory_err)?;
     tx.commit().context("commit stock-movement transaction")?;
 
-    // Mirror the audit-ledger sidecar so the per-tenant
-    // `<db>.audit.log` stays in step with the DB row, same posture
-    // every other audit-emitting route uses (PR-209 / S213 graceful
-    // shutdown writer, S177 / PR-177 AP-side ingestion writer).
-    let mirror_path = aberp_audit_ledger::mirror_path_for(&state.db_path);
-    if let Ok(ledger) = Ledger::open(&*state.db_path, state.tenant.clone(), binary_hash) {
-        // Best-effort sync — the canonical row already landed in the
-        // DB tx above. A mirror failure should not poison the
-        // operator's response; the next write (or boot) will heal it
-        // per ADR-0030 §6's bootstrap-from-DB posture.
-        if let Err(e) = ledger.sync_mirror(&mirror_path) {
-            tracing::warn!(error = ?e, "stock-movement mirror sync failed; will heal on next write");
-        }
-    }
+    // ADR-0099 R2 — the mirror sync is the shared `WriteGuard`'s job. This route
+    // used to follow its tx with `Ledger::open` + `sync_mirror`: a SECOND live-DB
+    // opener and a SECOND mirror writer inside `aberp serve`, invisible to the
+    // 10M fork gate because its append set counted audit-table appends and not
+    // mirror appends. It was also actively wrong post-D3 — when the guard's data
+    // `fsync` fails it deliberately SKIPS the mirror sync so the mirror stays
+    // BEHIND the DB (the benign direction), and this call put it back AHEAD, the
+    // one direction that forks the chain at the next boot auto-heal.
+    // `conn`'s drop below runs the lockstep sync under the same serialized
+    // writer that made the row.
 
     Ok(movement)
 }
@@ -16799,8 +16862,6 @@ pub fn create_work_order_request(
     tx.commit()
         .context("commit work-order create transaction")?;
 
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
-
     Ok(CreateWorkOrderResponse {
         work_order: wo,
         routing_ops,
@@ -17087,7 +17148,6 @@ pub fn transition_work_order_request(
         }
     }
 
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
     Ok(TransitionWorkOrderResponse {
         work_order: outcome.wo,
         warnings: outcome.warnings,
@@ -17742,7 +17802,6 @@ pub fn transition_routing_op_request(
         aberp_work_orders::transition_routing_op(&tx, &ctx, op_id, inputs).map_err(map_wo_err)?;
     tx.commit()
         .context("commit routing-op transition transaction")?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
     Ok(TransitionRoutingOpResponse {
         routing_op: outcome.routing_op,
         next_op_activated: outcome.next_op_activated,
@@ -18095,7 +18154,6 @@ pub fn decide_qa_inspection_request(
     };
 
     tx.commit().context("commit QA decide transaction")?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
     Ok(DecideQaInspectionResponse {
         inspection: outcome.inspection,
         superseded_qa_id: outcome.superseded_qa_id,
@@ -18582,7 +18640,6 @@ pub fn create_dispatch_request(
     tx.commit()
         .context("commit create_dispatch transaction")
         .map_err(WorkOrderRouteError::Other)?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
     Ok(outcome)
 }
 
@@ -18762,7 +18819,6 @@ pub fn mark_dispatch_shipped_request(
     tx.commit()
         .context("commit mark_shipped transaction")
         .map_err(WorkOrderRouteError::Other)?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
     Ok(MarkDispatchShippedResponse {
         dispatch: outcome.dispatch,
         spawned_invoice_id: outcome.spawned_invoice_id,
@@ -18839,7 +18895,6 @@ pub fn cancel_dispatch_request(
     tx.commit()
         .context("commit cancel_dispatch transaction")
         .map_err(WorkOrderRouteError::Other)?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
     Ok(outcome)
 }
 
@@ -19001,31 +19056,7 @@ pub fn delete_invoice_draft_request(
         },
     )?;
     tx.commit().context("commit delete_invoice_draft tx")?;
-    if outcome.deleted {
-        sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
-    }
     Ok(outcome)
-}
-
-/// Best-effort audit-mirror sync after a successful write transaction.
-/// Mirrors the inventory route's posture: the canonical row already
-/// landed in the DB tx; a mirror failure should not poison the
-/// operator's response, and the next write (or boot) will heal per
-/// ADR-0030 §6's bootstrap-from-DB posture.
-fn sync_audit_mirror_best_effort(
-    db_path: &std::path::Path,
-    tenant: aberp_audit_ledger::TenantId,
-    binary_hash: aberp_audit_ledger::BinaryHash,
-) {
-    let mirror_path = aberp_audit_ledger::mirror_path_for(db_path);
-    if let Ok(ledger) = Ledger::open(db_path, tenant, binary_hash) {
-        if let Err(e) = ledger.sync_mirror(&mirror_path) {
-            tracing::warn!(
-                error = ?e,
-                "work-order mirror sync failed; will heal on next write"
-            );
-        }
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -23671,9 +23702,9 @@ pub fn pickup_quote_as_draft_request(
             idempotency_key,
         },
     )?;
-    if !outcome.was_existing {
-        sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
-    }
+    // ADR-0099 R2 — the `was_existing == false` arm used to run a best-effort
+    // `Ledger::open` + `sync_mirror`; the shared `WriteGuard`'s drop does it,
+    // under the same serialized writer that made the row.
     Ok(outcome)
 }
 
@@ -25497,11 +25528,6 @@ async fn handle_assign_heat_lot(
                 binary_hash,
                 &assignment,
             )?;
-            sync_audit_mirror_best_effort(
-                &state_for_task.db_path,
-                state_for_task.tenant.clone(),
-                binary_hash,
-            );
             Ok(assignment)
         },
     )
@@ -25793,7 +25819,6 @@ fn mark_parts_request(
         &marks,
     )
     .map_err(WorkOrderRouteError::Other)?;
-    sync_audit_mirror_best_effort(&state.db_path, state.tenant.clone(), binary_hash);
 
     Ok(MarkPartsResponse { part_marks: marks })
 }

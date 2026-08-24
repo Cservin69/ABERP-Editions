@@ -23,7 +23,5 @@ apps/aberp/src/request_technical_annulment.rs|run
 apps/aberp/src/restore_from_nav_outgoing.rs|process_digest
 apps/aberp/src/retry_submission.rs|perform_layer_2_check
 apps/aberp/src/retry_submission.rs|run
-apps/aberp/src/serve.rs|create_stock_movement_request
 apps/aberp/src/serve.rs|set_restored_partner_request
-apps/aberp/src/serve.rs|sync_audit_mirror_best_effort
 apps/aberp/src/submit_annulment.rs|run

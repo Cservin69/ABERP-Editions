@@ -584,6 +584,125 @@ the content.
 
 ---
 
+<a id="d-21"></a>
+### D-21 — Audit single-writer: the three residuals ADR-0099 R2 did not close
+
+**Surface today.** Every in-process writer of *either* half of the audit
+ledger — the DuckDB `audit_ledger` table and the `<db>.audit.log` mirror —
+now routes through the one shared `aberp_db::Handle` writer, and
+`ensure_consistent_with_db` holds the mirror's exclusive `flock` across its
+whole decide→act window. Cut-gate **CHECK 10P**
+(`tools/adr0099_audit_writer_scan.awk` +
+`tools/adr0099_audit_writer_residuals.txt`) classifies all 214 runtime write
+sites across the workspace and fails the build on any site that cannot prove
+its serialization domain. See ADR-0099 §R2.
+
+The three items below are named in ADR-0099 §R2.8 as honest residuals. None
+is implicated in any incident to date; each is a way the second-writer class
+could return that R2 does not structurally prevent.
+
+Note the scope honestly: this gate covers the **second-writer** class. The
+seq-2508 incident was **not** that class — it was a lost DB commit (ADR-0099
+§R2.2), tracked separately as [D-22](#d-22).
+
+**R1 — cross-process table-side forks are still detection-only.** A CLI
+subcommand (`aberp retry-submission`, `aberp drain-pending-retries`, …)
+running while `aberp serve` holds the DB is outside every in-process lock,
+exactly as `AUDIT_APPEND_LOCK`'s own docs state. R2 closes the *mirror* half
+of this (its `flock` is genuinely cross-process); the table half is
+backstopped by hash-chain detection alone. The fix is the whole-DB advisory
+lock ADR-0099 already flagged for v0.2.9 — an `fs2` flock on the tenant DB,
+pattern `submission_lock.rs`, so a CLI **refuses** while serve holds it
+rather than racing it.
+*Blocked on:* our own work. *Size:* medium — the lock is small; deciding
+what a refused CLI should print, and whether `serve` must publish liveness,
+is the content.
+
+**R2 — `serve.rs::run` is allow-listed by CHECK 10M, 10N and 10P alike.** A
+fork planted in the boot fn passes all three gates. The allow-list is
+justified (it runs before `open_tenant_handle`, single-threaded, no daemons
+spawned yet) but it is a real hole in a 3,000-line function that only grows.
+The fix is to extract the pre-Handle boot sequence into named, individually
+allow-listed fns so the exemption covers the boot *steps* rather than the
+whole of `run`.
+*Blocked on:* our own work. *Size:* medium, mostly mechanical, but it
+touches the boot ordering, which is load-bearing for durability (ADR-0110
+D3 / ADR-0111).
+
+**R3 — `append_in_tx` still takes no lock.** The two serialization domains
+(the handle writer mutex, and audit-ledger's `AUDIT_APPEND_LOCK`) remain
+distinct; `Handle::with_ledger` is still the only construct that holds both.
+CHECK 10P's `LEDGER_LOCKED` verdict is a *classification* — "this site holds
+the append lock end-to-end" — not a proof that a `Ledger`-domain writer
+cannot race a handle-domain one. Closing it means making the audit-append
+chokepoint itself acquire the one lock, which needs a split public/`_locked`
+pair so `Ledger::append` and `append_reopen` (which already hold it) do not
+deadlock re-entrantly, **and** the lock must span the *caller's* commit, not
+just the insert — otherwise two writers on different connections still read
+the same head. That last point is why it is not a small change.
+*Blocked on:* our own work. *Size:* large — it is ADR-0105's residual, and
+the commit-spanning requirement means an API change at ~120 call sites, not
+a lock added inside one function.
+
+**Not in scope here.** The scanner is a heuristic over text with no type
+information: a connection that reaches a writer through a struct field or a
+trait object lands in `UNCLASSIFIED`, which is RED — the intended direction
+— but it means the frozen residual file, not the compiler, is what keeps the
+sanctioned set honest. Making that a type-level property is a different
+(and much larger) piece of work than R1–R3.
+
+---
+
+<a id="d-22"></a>
+### D-22 — Audit durability: the 15 CLI sites that fsync the mirror and not the DB
+
+**Why this exists.** ADR-0099 §R2 established that the seq-2508 incident was a
+**lost DB commit**, not a writer fork: pre-ADR-0110-D3, `WriteGuard::drop`
+`fsync`ed the audit MIRROR on every commit and never flushed the DB — the
+durability ordering exactly inverted, so an unclean stop keeps the mirror line
+and loses the DB row. D3 fixed that for the serve path in v0.4.0, and
+`daemon_heartbeats_are_power_loss_durable` pins it.
+
+**The same inversion is still live on the CLI paths.** 15 runtime sites do:
+
+```rust
+let ledger = Ledger::open(db_path, …);   // independent connection, no Handle
+ledger.append(…);                        // commit
+ledger.sync_mirror(&mirror_path);        // mirror → sync_all()  DURABLE
+```
+
+No Handle, no `durable_ack`, no `fsync_data_paths` — and `Ledger::open` sets
+`PRAGMA disable_checkpoint_on_shutdown`, so the connection's close deliberately
+folds nothing either. The mirror is explicitly made durable; the DB's durability
+is left to whatever DuckDB does with its WAL on commit, which is precisely the
+assumption D3 exists to stop relying on.
+
+**Where.** `drain_submission_queue` (×3), `retry_submission` (×4),
+`submit_annulment`, `poll_annulment_ack`, `observe_receiver_confirmation`,
+`recover_from_nav`, `mark_abandoned`, `request_technical_annulment`, plus two in
+`aberp-snapshot::recover`. These are NAV **money** paths.
+
+`submit_invoice` is the one benign case and is worth reading as the target
+shape: it opens a shared Handle and does its `db.write()` windows first, so the
+guard drop flushes the DB *before* the later explicit `sync_mirror`.
+
+**Why it is not fixed in R2.** Deliberately out of scope: seq-2508 was a
+serve-path daemon heartbeat, and folding a money-path change into that fix would
+have made it much harder to review. Splitting it was Ervin's call.
+
+**Missing for Live.** Bring the 15 under the same *data-before-the-record-that-
+points-to-it* ordering — route them through the shared Handle where the process
+has one, or give them an explicit flush before the mirror sync where it does
+not. Then extend the `cut_gate_durable_ack.sh` census so a new unordered site
+cannot appear unlisted: today that census tracks Handle-routed `durable_ack()`
+money-path sites, and these use `Ledger::open` instead, so they were never in
+its scope.
+
+**Blocked on:** our own work. **Size:** medium — the edit per site is small and
+mechanical; the content is deciding the CLI posture (a cross-process advisory
+lock is the neighbouring question, [D-21](#d-21) R1) and extending the census
+without making it churn.
+
 ---
 
 ## Expansion slots on a Live capability

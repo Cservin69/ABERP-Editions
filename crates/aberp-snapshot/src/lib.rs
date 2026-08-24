@@ -65,8 +65,8 @@ pub use store::{
     default_store_dir, edition_store_dir, find_snapshot, list_snapshots, SnapshotRecord,
 };
 pub use take::{
-    ensure_not_prod_path, ensure_restore_allowed, restore_into, take_snapshot, validate_export,
-    ValidationReport,
+    ensure_not_prod_path, ensure_restore_allowed, restore_into, take_snapshot, take_snapshot_with,
+    validate_export, MirrorReconcile, ValidationReport,
 };
 
 /// Typed error surface for the snapshot subsystem. Library crate → no

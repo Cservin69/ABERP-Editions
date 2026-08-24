@@ -110,6 +110,44 @@ pub enum AppendError {
         preserved: String,
     },
 
+    /// ADR-0099 R2 — the mirror and the DB hold DIFFERENT entries at the SAME
+    /// `seq`. Distinct from [`Self::MirrorAheadOfDb`], and the distinction is
+    /// load-bearing for recovery:
+    ///
+    /// * **AHEAD** (`mirror_max_seq > db_max_seq`) — the DB lost a TAIL. The
+    ///   mirror-only entries are the ONLY surviving copy, so recovery replays
+    ///   them back into the DB and the DB catches up.
+    /// * **DIVERGED** (this variant) — the DB lost entries and then RE-USED
+    ///   their seqs for later ones, so both stores have rows at
+    ///   `first_divergent_seq` and they disagree. The mirror's copies are still
+    ///   the only record of what the DB lost, so this must NEVER be resolved by
+    ///   silently rebuilding the mirror from the DB. `replay_mirror_delta`
+    ///   refuses such a replay with [`Self::SequenceConflict`], which is the
+    ///   backstop that keeps the recovery path honest.
+    ///
+    /// How the fifth prod recurrence (seq 2508) produced this: two committed
+    /// heartbeats were lost from the DB while durable in the mirror; the chain
+    /// head fell back, so the next two heartbeats legitimately took the same
+    /// seqs. Pre-R2 the reconciler's `Extended` branch then appended DB rows
+    /// onto the divergent mirror without ever comparing the shared prefix,
+    /// which erased the length asymmetry `MirrorAheadOfDb` keys on AND the
+    /// head-hash equality the equal-length branch keys on — turning a precise
+    /// "the DB lost N entries" into a misleading "corrupt mirror".
+    #[error(
+        "audit-ledger mirror DIVERGES from the DB at seq {first_divergent_seq} (mirror seq \
+         {mirror_max_seq}, DB seq {db_max_seq}): both hold an entry there and they disagree, \
+         so the DB lost entries the mirror still has. The mirror was preserved to {preserved}. \
+         Do NOT rebuild the mirror from the DB — that discards the only copy. Recover with \
+         `aberp recover --db <db> --tenant <tenant> --store <store>`. Magyarul: a napló-tükör \
+         és a DB ugyanannál a sorszámnál eltér; az eredetit félretettem, ne építsd újra a DB-ből."
+    )]
+    MirrorDivergedFromDb {
+        first_divergent_seq: u64,
+        mirror_max_seq: u64,
+        db_max_seq: u64,
+        preserved: String,
+    },
+
     /// ADR-0098 R1 (Fable-5 findings D + E) — the audit-ledger mirror is
     /// corrupt in a way the unified torn-tail policy will NOT auto-heal:
     /// either corruption DEEPER than a single torn trailing line (a
