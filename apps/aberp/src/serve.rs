@@ -17685,6 +17685,13 @@ pub enum QcReportBlockReason {
     /// an unmeasured accountability row. Either way the release was granted
     /// over evidence that does not cover what must be inspected.
     PlanDrift,
+    /// The current report RELEASES, but the serialised units it enumerated
+    /// are not the units that exist on the work order today — most sharply,
+    /// the report was frozen BEFORE the parts were marked, so it enumerates
+    /// NO serials at all while N marked units are about to leave the
+    /// building. The evidence is real; it is just not evidence about these
+    /// parts (round 4, B-2).
+    UnitDrift,
 }
 
 impl QcReportBlockReason {
@@ -17694,6 +17701,7 @@ impl QcReportBlockReason {
             QcReportBlockReason::Incomplete => "incomplete",
             QcReportBlockReason::Rejected => "rejected",
             QcReportBlockReason::PlanDrift => "plan_drift",
+            QcReportBlockReason::UnitDrift => "unit_drift",
         }
     }
 }
@@ -17834,6 +17842,75 @@ pub fn resolve_qc_report_gate_with_capability(
     // report is the newest AND the only one left standing.
     let current = releasing[0];
     if current.disposition.permits_shipment() {
+        // ── Round 4, B-2 — the report's UNIT SCOPE, checked before its
+        // characteristic coverage. ──────────────────────────────────────
+        //
+        // `resolve_context` resolves the report's units from `wo_part_marks`
+        // ONCE, at draft time, and `freeze_report` snapshots them onto the row
+        // as `serial_range` (and `qty_reported`). Nothing re-checked that
+        // snapshot afterwards, and nothing makes marking happen BEFORE
+        // drafting — the two are separate routes with no enforced ordering
+        // between them, so the sequence below is entirely ordinary:
+        //
+        //   freeze + issue a report while NO parts are marked
+        //     → `build_report_lines` sees `units.is_empty()` and degrades
+        //       every characteristic to ONE lot-level line, matched by
+        //       `latest_measurement(.., lot_level = true)` against ANY
+        //       measurement of that characteristic
+        //     → the report is a clean `accept`, `serial_range` is `None`,
+        //       `qty_reported` is 1
+        //   THEN mark N parts and ship
+        //     → the characteristic-coverage join below is name-keyed, so the
+        //       single lot-level line covers every required name and the gate
+        //       passes — releasing N serialised units over a document that
+        //       enumerates none of them.
+        //
+        // The check is written as scope EQUALITY rather than as the narrower
+        // "marks exist and the report enumerates none", and the difference
+        // between the two is deliberately a BACKSTOP, not a second live case.
+        // `record_part_marks` is the only writer of `wo_part_marks` and it
+        // refuses outright (`PartMarkError::AlreadyMarked`) once a WO has any
+        // mark, so through the application a WO's mark set is written once,
+        // all at once — which makes the `None` form the only arm reachable
+        // today. Equality costs one comparison instead of one emptiness test
+        // and closes, in advance, the successor round 3 already met on the
+        // coverage set (B1-a′): the same defect one unit over, where a report
+        // frozen over SN-001…SN-002 name-covers a later SN-003. It is the same
+        // posture as `refuse_unparseable_report_timestamps` — a refusal only
+        // an out-of-band write can reach, kept because guessing there is worse
+        // than stopping. Both arms are tested; the second one has to write the
+        // extra mark directly, because the route will not.
+        //
+        // Recomputed through `aberp_qa::serial_range_of` — the SAME pure
+        // function that produced the stored value at freeze time — so the two
+        // sides cannot drift on formatting. Equality here is therefore exactly
+        // "the marks today are the marks the report froze over".
+        //
+        // This cannot false-block the normal sequence (mark → measure →
+        // freeze → issue → ship): `resolve_context` reads ALL of the WO's
+        // marks, so a report frozen after marking always enumerates exactly
+        // the current set and the two strings are identical. It blocks only
+        // when the marks changed AFTER issuance, and the remedy is the one the
+        // 409 names: issue a fresh report.
+        let marks_now = crate::part_marking::list_part_marks(conn, tenant, &wo.wo_id)
+            .with_context(|| format!("list part marks for {}", wo.wo_id))?;
+        let units_now: Vec<aberp_qa::ReportUnit> = marks_now
+            .iter()
+            .map(|m| aberp_qa::ReportUnit {
+                part_serial: m.serial_number.clone(),
+                part_uid: m.part_uid.clone(),
+            })
+            .collect();
+        if current.serial_range != aberp_qa::serial_range_of(&units_now) {
+            return Ok(QcReportGate::Blocked {
+                work_order_id: wo.wo_id,
+                customer_type,
+                reason: QcReportBlockReason::UnitDrift,
+                qcr_id: Some(current.qcr_id.clone()),
+                disposition: Some(current.disposition.as_str().to_string()),
+            });
+        }
+
         // …but only over the characteristics it actually enumerated.
         //
         // `characteristics_required` on the header is a LINE count (one per
@@ -18107,6 +18184,14 @@ fn qc_report_block_detail(reason: QcReportBlockReason, qcr_id: Option<&str>) -> 
             "QC report {id} no longer covers the inspection plan — a required \
              characteristic was added, or promoted from optional to required, \
              after it was issued, and it carries no measurement for it"
+        ),
+        // Round 4 — the unit scope, not the characteristic set. The wording
+        // has to send the operator to the MARKS, not to the plan, or they
+        // will go looking for a characteristic that is not the problem.
+        QcReportBlockReason::UnitDrift => format!(
+            "QC report {id} does not enumerate the serialised units being shipped — \
+             the parts were marked after it was issued, or the marked units changed \
+             since. Issue a fresh report covering the units on this work order"
         ),
     }
 }
@@ -31663,7 +31748,28 @@ mod tests {
             "…and what is actually missing is a MEASUREMENT: {drift}"
         );
 
-        // Each reason that has a report names it, and the four sentences are
+        // Round 4 — `unit_drift` is about the UNITS, and an operator sent to
+        // the inspection plan by a plan-shaped sentence would find nothing
+        // wrong with it. It has to name the marks and the remedy.
+        let unit = d(QcReportBlockReason::UnitDrift);
+        assert!(
+            unit.contains("serialised units"),
+            "the unit-scope cause must name the units: {unit}"
+        );
+        assert!(
+            unit.contains("marked"),
+            "…and point at the MARKS, not the plan: {unit}"
+        );
+        assert!(
+            unit.contains("fresh report"),
+            "…and name the remedy: {unit}"
+        );
+        assert!(
+            !unit.contains("characteristic"),
+            "…and must not send the operator hunting a characteristic: {unit}"
+        );
+
+        // Each reason that has a report names it, and the five sentences are
         // distinct — a copy-paste that gave two reasons the same wording
         // would leave the operator unable to tell them apart.
         let all = [
@@ -31671,6 +31777,7 @@ mod tests {
             QcReportBlockReason::Incomplete,
             QcReportBlockReason::Rejected,
             QcReportBlockReason::PlanDrift,
+            QcReportBlockReason::UnitDrift,
         ];
         let msgs: Vec<String> = all.iter().map(|r| d(*r)).collect();
         for (r, m) in all.iter().zip(&msgs) {
@@ -31680,6 +31787,23 @@ mod tests {
         }
         let distinct: std::collections::BTreeSet<&str> = msgs.iter().map(String::as_str).collect();
         assert_eq!(distinct.len(), all.len(), "two reasons share wording");
+
+        // The machine-readable token is the other half of the block record —
+        // it is what lands in the `qcr.report_shipment_blocked` payload, so an
+        // analyst filtering the chain sees it, not the sentence. One token per
+        // reason, all distinct.
+        let tokens: Vec<&str> = all.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            tokens,
+            vec![
+                "no_issued_report",
+                "incomplete",
+                "rejected",
+                "plan_drift",
+                "unit_drift"
+            ],
+            "the audit tokens are part of the record's contract"
+        );
     }
 
     /// S434 — the demo sample-data seed migrates the demo DB and inserts 3

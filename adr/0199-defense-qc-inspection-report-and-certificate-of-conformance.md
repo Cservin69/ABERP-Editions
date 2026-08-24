@@ -589,7 +589,8 @@ pub enum QcReportGate {
     Blocked {
         work_order_id: String,
         customer_type: String,
-        reason: QcReportBlockReason,   // NoIssuedReport | Incomplete | Rejected
+        // NoIssuedReport | Incomplete | Rejected | PlanDrift (r3) | UnitDrift (r4)
+        reason: QcReportBlockReason,
         qcr_id: Option<String>,
     },
 }
@@ -1190,6 +1191,110 @@ while pinning the second.
   the over-blocking direction of an out-of-band-only condition, and
   narrowing the scan would mean re-deriving the join the refusal exists to
   protect.
+
+### Round-4 behaviours pinned by mutation testing
+
+The round-3 adversarial confirmed every round-3 fix and then found two more
+paths to the same outcome. **Neither is a round-3 regression** — both are
+original Phase-1 gaps that the earlier rounds' fixes made visible by closing
+everything above them. Both are joins the gate performs on data the WRITES
+normalise differently, or do not re-read at all.
+
+- **(B-1) `ensure_unique` compared the RAW plan name; the writes store it
+  TRIMMED.** `create_plan` / `update_plan` persist `product_id.trim()` and
+  `feature_name.trim()`, but the in-code uniqueness check queried on the
+  operator's untrimmed input. A second plan submitted as `" Bore D "`
+  therefore matched no existing row — the stored value is `"Bore D"` — passed
+  the check, and was then written under the *same stored key*. Two ACTIVE
+  plans, one name.
+
+  That is a shipment defect, not a tidiness one, because
+  `(product, feature_name)` is the join the gate decides on. `required_now`
+  is a `BTreeSet` of trimmed plan names, so two plans sharing a stored name
+  collapse to ONE element: plan 1's measurement covers plan 2's name, and
+  plan 2 — required, never measured — releases with it. The `NotMeasured`
+  subtraction from round 3 cannot see it either, because the duplicate plan
+  is created AFTER the freeze and has no frozen line at all.
+
+  Fixed at source: `ensure_unique` normalises both key columns with the same
+  `.trim()` the writes apply, so the check and the storage cannot disagree.
+  Trim-only, deliberately — case folding or whitespace collapsing would
+  refuse names the writes keep distinct, which is a different and unasked-for
+  policy. Pinned by
+  `a_padded_duplicate_plan_name_cannot_collapse_the_gates_join`, whose
+  mutation arm asserts the escape (both plans stored under one name, gate
+  says `Pass`) before failing, and which carries two counter-directions: a
+  plan re-saved under its OWN padded name must still succeed
+  (`exclude_plan_id`), and a genuinely distinct required characteristic must
+  still be accepted and still block.
+
+- **(B-2) the gate never re-checked the report's UNIT SCOPE.**
+  `resolve_context` resolves the report's units from `wo_part_marks` once, at
+  draft time, and `freeze_report` snapshots them as `serial_range` /
+  `qty_reported`. Freeze and issue a report while NO parts are marked and
+  `build_report_lines` takes its `units.is_empty()` branch: every
+  characteristic degrades to ONE lot-level line, matched by
+  `latest_measurement(.., lot_level = true)` against ANY measurement of that
+  characteristic. The report is a clean `accept` with `serial_range = None`.
+  Mark N parts afterwards and ship: the characteristic-coverage join is
+  name-keyed, so the single lot-level line covers every required name and the
+  gate passed — releasing N serialised units on a document that enumerates
+  none of them.
+
+  Blocked now, under its own reason `UnitDrift`, so the 409 and the audit
+  payload send the operator to the MARKS rather than to a characteristic that
+  is not the problem. Pinned by
+  `a_report_frozen_before_part_marking_does_not_release_the_marked_units`,
+  which asserts the pre-marking `Pass` first (the block must be caused by the
+  marking, not by the report being unserialised) and re-measures + re-issues
+  afterwards so "block everything" does not pass.
+
+- **B-2 is written as scope EQUALITY, and the extra reach is a backstop.**
+  The check recomputes `aberp_qa::serial_range_of` over the marks as they
+  stand and compares it to the stored snapshot — the same pure function that
+  produced the stored value, so the two sides cannot drift on formatting.
+  That is strictly wider than the `serial_range.is_none()` form the finding
+  named, and the difference is deliberately not a second live case:
+  `record_part_marks` is the ONLY writer of `wo_part_marks` and refuses once
+  a WO has any mark (`PartMarkError::AlreadyMarked`), so through the
+  application a WO's mark set is written once, all at once, and the `None`
+  form is the only arm reachable today. Equality costs one comparison instead
+  of one emptiness test and closes in advance the successor round 3 already
+  met on the coverage set (g′): a report frozen over SN-001…SN-002
+  name-covers a later SN-003. Same posture as
+  `refuse_unparseable_report_timestamps` — a refusal only an out-of-band
+  write can reach, kept because guessing there is worse than stopping. Pinned
+  anyway, by
+  `a_report_covering_only_some_marked_units_does_not_release_the_rest`, which
+  has to write the third mark directly because the route will not.
+
+- **No new audit EventKind; `ALL_KINDS_COUNT` stays 195.** The gate emits ONE
+  kind, `qcr.report_shipment_blocked`, and carries the cause as a
+  machine-readable `reason` STRING in its payload. `UnitDrift` is a fifth
+  value of that string (`"unit_drift"`), not a fifth event. Minting a kind
+  per block reason would fork one auditable fact — *this shipment was
+  refused* — across five chain vocabularies, and §D8's count is reconciled at
+  195 across `event_kind.rs`, `export_invoice_bundle.rs` and `verify.rs`
+  unchanged. The token is pinned alongside the four existing ones in
+  `every_qc_report_block_reason_names_its_cause`.
+
+### Round-4 residuals, stated
+
+- **A report frozen over the right units can still go stale on the
+  MEASUREMENTS.** `UnitDrift` compares the unit scope and the
+  `NotMeasured` subtraction compares the characteristic names; neither
+  re-reads `qc_inspections`. A measurement recorded, or corrected, after
+  issuance does not re-open the gate — by design, since the report is a
+  frozen record (§C3) and a live re-derivation is exactly what §D7's hash pin
+  forbids. The remedy is the existing one: supersede the report.
+- **`UnitDrift` compares the rendered range string, not the serial SET.**
+  `serial_range_of` prints first … last (n units), so a mark set with the
+  same first serial, last serial and count but a different middle compares
+  equal. That is unreachable through `record_part_marks` (which writes the
+  set once) and would require an out-of-band write that preserves all three
+  terms; comparing the full set would mean re-deriving the enumeration from
+  `qc_report_lines`, which is itself empty of per-unit rows when every
+  characteristic is lot-level.
 
 ---
 

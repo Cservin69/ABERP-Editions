@@ -941,6 +941,57 @@ the round-2 fix. Each is scope, not an oversight.
    real operator surface.
    *Size:* small.
 
+#### Closed in round 4 (2026-08-24)
+
+The round-3 adversarial confirmed every round-3 fix and found two further
+paths to the same outcome. **Neither is a round-3 regression** — both are
+original Phase-1 gaps, and both are joins the gate performs on data the
+WRITES normalise differently, or do not re-read at all. Both are closed;
+neither needed a schema change or a new event kind.
+
+6. **`ensure_unique` compared the RAW plan name while the writes stored it
+   TRIMMED.** A second active plan submitted as `" Bore D "` matched no
+   existing row, passed the in-code uniqueness check, and was then written
+   under the same STORED name as the first. `(product, feature_name)` is the
+   key the shipment gate joins on and `required_now` is a SET of trimmed
+   names, so the two plans collapsed to one element — the first plan's
+   measurement covered the second plan's name, and a required characteristic
+   nobody ever measured shipped with it. The round-3 `NotMeasured`
+   subtraction could not see it: the duplicate is created after the freeze
+   and has no frozen line. `ensure_unique` now normalises both key columns
+   with the same `.trim()` the writes apply. Pinned by
+   `a_padded_duplicate_plan_name_cannot_collapse_the_gates_join`, which
+   carries the self-collision and distinct-characteristic counter-directions.
+7. **The gate never re-checked the report's UNIT SCOPE.** A report frozen
+   and issued BEFORE any part was marked takes `build_report_lines`'
+   `units.is_empty()` branch — every characteristic degrades to one
+   lot-level line matched against ANY measurement of it — so it issues as a
+   clean `accept` with `serial_range = None`. Mark N parts afterwards and the
+   name-keyed coverage join still passed: N serialised units released on a
+   document enumerating none of them. Blocked now under a new gate reason
+   `UnitDrift`, whose 409 points at the marks rather than at a characteristic
+   that is not the problem. The check is written as scope EQUALITY against a
+   recomputed `serial_range_of`, which is wider than the finding's `is_none`
+   form; the extra reach is a BACKSTOP, not a second live case
+   (`record_part_marks` refuses once a WO has any mark, so the mark set is
+   written once, all at once). Pinned by
+   `a_report_frozen_before_part_marking_does_not_release_the_marked_units`
+   and, for the backstop arm,
+   `a_report_covering_only_some_marked_units_does_not_release_the_rest`.
+   **No new EventKind:** the gate emits one kind and carries the cause as a
+   `reason` string, so `ALL_KINDS_COUNT` stays **195** at all three pins.
+
+#### Still owed after round 4
+
+8. **The report does not re-open on a LATE measurement.** `UnitDrift`
+   compares the unit scope and the round-3 subtraction compares the
+   characteristic names; neither re-reads `qc_inspections`. A measurement
+   recorded or corrected after issuance therefore does not re-open the gate
+   — by design, since the report is a frozen record and a live
+   re-derivation is what the §D7 hash pin forbids. The remedy today is to
+   supersede the report, which is a manual operator step with no prompt.
+   *Size:* small; it is a nudge on the report surface, not a mechanism.
+
 ---
 
 ## Expansion slots on a Live capability

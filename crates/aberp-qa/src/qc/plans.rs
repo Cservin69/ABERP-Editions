@@ -151,6 +151,30 @@ fn validate(input: &NewInspectionPlan) -> Result<(), QcError> {
 /// Reject a duplicate (product, feature) among NON-archived plans (the
 /// in-code unique invariant). `exclude_plan_id` skips the row being
 /// edited.
+///
+/// **Compared on the TRIMMED form, because that is what the writes store**
+/// (round 4, B-1). `create_plan` and `update_plan` both persist
+/// `product_id.trim()` / `feature_name.trim()`, but this check used to
+/// query on the RAW operator input. A second plan submitted as
+/// `" Bore D "` therefore matched nothing (the stored value is `"Bore D"`,
+/// not `" Bore D "`), passed the check, and was then written under the
+/// same STORED name as the first — two active plans, one stored key.
+///
+/// That is not a cosmetic duplicate. `(product, feature_name)` is the join
+/// the shipment gate uses to decide whether an issued QC report still
+/// covers the inspection plan (`resolve_qc_report_gate_with_capability`):
+/// it builds `required_now` as a SET of trimmed plan names and asks whether
+/// every one of them is covered by the report's frozen lines. Two active
+/// plans sharing a stored name collapse to ONE element of that set, so the
+/// first plan's measurement covers the second plan's name — and a required
+/// characteristic that was never measured at all rides out on it. Refusing
+/// the duplicate at source is what keeps the name-keyed join honest.
+///
+/// The comparison is trim-only, deliberately: it is the exact
+/// normalisation the writes apply, so the check and the storage cannot
+/// disagree. Anything more (case folding, whitespace collapsing) would
+/// refuse names the writes would happily keep distinct, which is a
+/// different — and unasked-for — policy.
 fn ensure_unique(
     conn: &Connection,
     tenant: &str,
@@ -158,6 +182,8 @@ fn ensure_unique(
     feature_name: &str,
     exclude_plan_id: Option<&str>,
 ) -> Result<(), QcError> {
+    let product_id = product_id.trim();
+    let feature_name = feature_name.trim();
     let mut stmt = conn
         .prepare(
             "SELECT plan_id FROM qc_inspection_plans

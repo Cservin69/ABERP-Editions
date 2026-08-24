@@ -266,6 +266,41 @@ fn measure_at(
     tx.commit().unwrap();
 }
 
+/// A measurement attributed to the CHARACTERISTIC but to no part UID — the
+/// first-article check taken before any unit carries a mark. With no marked
+/// units, `build_report_lines` degrades every characteristic to one
+/// lot-level line and `latest_measurement(.., lot_level = true)` accepts
+/// this row, which is what makes the round-4 B-2 fixture a clean `accept`.
+fn measure_lot_level(conn: &mut Connection, plan_id: &str, actual: f64) {
+    let m = meta();
+    let plan = aberp_qa::get_inspection_plan(conn, T, plan_id)
+        .unwrap()
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    record_inspection(
+        &tx,
+        &ctx(&m),
+        RecordInspectionInputs {
+            plan: &plan,
+            source: QcSource::Manual,
+            source_event_id: None,
+            actual_value: actual,
+            units: "mm".into(),
+            probe_serial: None,
+            last_calibration_at: None,
+            measured_at: now(),
+            current_time: now(),
+            stale_window_seconds: 86_400,
+            linked_part_uid: None,
+            linked_heat_lot: Some("HL-9911".into()),
+            linked_wo_id: Some("wo-def".into()),
+            recorded_by: "ervin".into(),
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
 /// Freeze + issue a report for `wo-def`, returning `(qcr_id, disposition)`.
 fn issue_report_for(conn: &mut Connection, units: &[ReportUnit]) -> (String, Disposition) {
     issue_report_for_at(conn, units, now())
@@ -1864,4 +1899,378 @@ fn a_draft_pdf_says_it_is_a_draft() {
         !text.contains(&aberp_qa::issuance_chain_ref(&drafted.report.qcr_id)),
         "a draft has no issuance entry to cite"
     );
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Round 4 — the two ways a bad part still shipped through a gate that
+// had already stopped every characteristic-level bypass.
+// ═════════════════════════════════════════════════════════════════════
+
+/// **B-1 — a second active plan under the same STORED name collapses the
+/// gate's name-keyed join, and an unmeasured REQUIRED characteristic
+/// ships.**
+///
+/// `create_plan` / `update_plan` persist `feature_name.trim()`, but
+/// `ensure_unique` used to query on the RAW operator input. So `" Bore D "`
+/// matched no existing row (the stored value is `"Bore D"`), passed the
+/// uniqueness check, and was then written as `"Bore D"` — two ACTIVE plans,
+/// one stored key.
+///
+/// That is a shipment bug, not a tidiness bug. The drift check builds
+/// `required_now` as a `BTreeSet` of trimmed plan names and asks whether
+/// every one is covered by the report's frozen lines. Two plans sharing a
+/// stored name collapse to ONE element, so plan 1's measurement covers plan
+/// 2's name — and plan 2, a required characteristic nobody ever measured,
+/// rides out on it.
+///
+/// **The mutation:** revert either `.trim()` in `ensure_unique`. The
+/// duplicate is then accepted, the `Err` arm below is never taken, and the
+/// `Ok` arm asserts the escape it buys before failing.
+#[test]
+fn a_padded_duplicate_plan_name_cannot_collapse_the_gates_join() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "1");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 1);
+
+    // One required characteristic, measured in tolerance. This is the plan
+    // whose measurement the duplicate would hide behind.
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure_at(&mut conn, &p1, &units[0].part_uid, 25.0, now());
+
+    let (qcr_id, d1) = issue_report_for(&mut conn, &units);
+    assert_eq!(d1, Disposition::Accept, "precondition: the report releases");
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the shipment is released before the duplicate exists"
+    );
+
+    // Engineering adds a SECOND characteristic — balloon 7, required, never
+    // measured — and types the name with the surrounding whitespace a
+    // copy-paste from a drawing carries.
+    let dup = create_inspection_plan(
+        &conn,
+        T,
+        NewInspectionPlan {
+            product_id: "prd_bracket".into(),
+            feature_name: "  Bore D  ".into(),
+            nominal_value: 25.0,
+            upper_tol: 0.05,
+            lower_tol: -0.05,
+            units: "mm".into(),
+            optional_probe_cycle_id: None,
+            enabled: true,
+            characteristic_number: Some("7".into()),
+            characteristic_designator: None,
+            characteristic_type: Some(CharacteristicType::Dimensional),
+            inspection_method: Some(InspectionMethod::OnMachineProbe),
+            sheet_zone: None,
+            is_required: Some(true),
+        },
+    );
+
+    match dup {
+        Err(aberp_qa::QcError::Validation(msg)) => {
+            assert!(
+                msg.contains("Bore D"),
+                "the refusal must name the colliding feature: {msg}"
+            );
+        }
+        Ok(second) => {
+            // The fix is reverted. Show exactly what that buys before
+            // failing, so the mutation report reads as a shipment escape
+            // rather than as a uniqueness nit.
+            let stored: Vec<String> = list_inspection_plans(&conn, T, Some("prd_bracket"), false)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.feature_name)
+                .collect();
+            assert_eq!(
+                stored,
+                vec!["Bore D".to_string(), "Bore D".to_string()],
+                "the WRITE trims, so both plans landed under one stored name"
+            );
+            let d = dispatch(&conn, "dsp-def");
+            let gate =
+                resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap();
+            assert_eq!(
+                gate,
+                QcReportGate::Pass,
+                "…and the collapsed join released the shipment"
+            );
+            panic!(
+                "ensure_unique compared the RAW feature_name: plan {} was accepted under \
+                 the same STORED name as {p1}, collapsing the gate's name-keyed join — a \
+                 required characteristic that was never measured shipped on report {qcr_id}",
+                second.plan_id
+            );
+        }
+        Err(other) => panic!("expected a Validation refusal, got {other:?}"),
+    }
+
+    // The PRODUCT id is the other half of the same key and is trimmed by the
+    // same writes, so it carries the same collapse: a plan filed under
+    // `" prd_bracket "` is stored as `prd_bracket` and lands inside the very
+    // set `required_now` is built from (`list_inspection_plans` filters on
+    // the trimmed, stored value).
+    let dup_product = create_inspection_plan(
+        &conn,
+        T,
+        NewInspectionPlan {
+            product_id: "  prd_bracket  ".into(),
+            feature_name: "Bore D".into(),
+            nominal_value: 25.0,
+            upper_tol: 0.05,
+            lower_tol: -0.05,
+            units: "mm".into(),
+            optional_probe_cycle_id: None,
+            enabled: true,
+            characteristic_number: Some("8".into()),
+            characteristic_designator: None,
+            characteristic_type: Some(CharacteristicType::Dimensional),
+            inspection_method: Some(InspectionMethod::OnMachineProbe),
+            sheet_zone: None,
+            is_required: Some(true),
+        },
+    );
+    assert!(
+        matches!(dup_product, Err(aberp_qa::QcError::Validation(_))),
+        "a padded PRODUCT id collapses onto the same stored key and must be          refused too, got {dup_product:?}"
+    );
+
+    // ── Counter-direction 1: the fix must not make a plan collide with
+    // ITSELF. Editing plan 1 and re-typing its own name with padding goes
+    // through the same check with `exclude_plan_id = Some(p1)`, so it must
+    // still succeed — and must leave the release untouched, because the
+    // stored name did not change.
+    promote_plan_to_required(&conn, &p1, "  Bore D  ", "1");
+    let after = aberp_qa::get_inspection_plan(&conn, T, &p1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.feature_name, "Bore D",
+        "the edit stored the trimmed name, as it always did"
+    );
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "a plan re-saved under its own name must not block its own shipment"
+    );
+
+    // ── Counter-direction 2: a genuinely DIFFERENT required characteristic
+    // is still accepted, and still blocks. Without this, refusing every
+    // second plan outright would satisfy the assertions above.
+    let p2 = seed_plan(&conn, "Face Z", "7", true);
+    assert_ne!(p2, p1);
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked { reason, .. } => assert_eq!(
+            reason,
+            QcReportBlockReason::PlanDrift,
+            "a distinct, unmeasured required characteristic still blocks"
+        ),
+        other => panic!("a new required characteristic did not block: {other:?}"),
+    }
+}
+
+/// **B-2 — a report frozen BEFORE the parts were marked releases units it
+/// enumerates none of.**
+///
+/// `resolve_context` resolves the report's units from `wo_part_marks` once,
+/// at draft time. With no marks yet, `build_report_lines` degrades every
+/// characteristic to ONE lot-level line — matched against ANY measurement of
+/// that characteristic — so the report comes out a clean `accept` with
+/// `serial_range = None` and `qty_reported = 1`. Nothing re-checked that
+/// snapshot afterwards, and the characteristic-coverage join is name-keyed,
+/// so marking N parts and shipping passed the gate on a document that names
+/// none of them.
+///
+/// **The mutation:** delete the `serial_range` comparison in
+/// `resolve_qc_report_gate_with_capability`. The gate then returns `Pass`
+/// after the marking and the `Blocked` assertion goes red.
+#[test]
+fn a_report_frozen_before_part_marking_does_not_release_the_marked_units() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "2");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    // Deliberately NO marks yet — the parts are still on the machine.
+    ensure_part_schema(&conn).unwrap();
+
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    // A first-article measurement, taken before any part carries a UID.
+    measure_lot_level(&mut conn, &p1, 25.0);
+
+    let (qcr_id, d1) = issue_report_for(&mut conn, &[]);
+    assert_eq!(
+        d1,
+        Disposition::Accept,
+        "precondition: with no units, every characteristic reports once at lot \
+         level and the report is a clean accept"
+    );
+    let frozen = aberp_qa::get_report(&conn, T, &qcr_id).unwrap().unwrap();
+    assert_eq!(
+        frozen.serial_range, None,
+        "precondition: the report enumerates NO serials"
+    );
+    assert_eq!(
+        frozen.qty_reported, 1,
+        "precondition: and accounts for one lot-level document"
+    );
+
+    // Positive control: while nothing is marked, this report legitimately
+    // releases — an unserialised lot is exactly what it documents.
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the block below must be caused by the MARKING, not by \
+         the report being unserialised"
+    );
+
+    // The parts come off the machine and get marked: two serialised units
+    // the issued report has never heard of.
+    let units = mark_units(&conn, "wo-def", 2);
+    assert_eq!(units.len(), 2);
+
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason,
+            qcr_id: id,
+            disposition,
+            ..
+        } => {
+            assert_eq!(
+                reason,
+                QcReportBlockReason::UnitDrift,
+                "two serialised units must not ship on a report that enumerates none"
+            );
+            assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
+            assert_eq!(
+                disposition.as_deref(),
+                Some("accept"),
+                "the audit payload records that the refusal overrode a RELEASING \
+                 report — that is the whole point of the finding"
+            );
+        }
+        other => panic!("two unenumerated units shipped: {other:?}"),
+    }
+
+    // Counter-direction: measure both marked units, issue a fresh report
+    // that DOES enumerate them, and the shipment releases again. Without
+    // this, hard-coding the block would satisfy the assertion above.
+    measure_at(&mut conn, &p1, &units[0].part_uid, 25.0, now());
+    measure_at(&mut conn, &p1, &units[1].part_uid, 25.0, now());
+    let (qcr2, d2) = issue_report_for(&mut conn, &units);
+    assert_ne!(qcr2, qcr_id);
+    assert_eq!(d2, Disposition::Accept, "both units measured");
+    let reissued = aberp_qa::get_report(&conn, T, &qcr2).unwrap().unwrap();
+    assert_eq!(
+        reissued.serial_range.as_deref(),
+        Some("SN-001 … SN-002 (2 units)"),
+        "the fresh report enumerates the units it releases"
+    );
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "a report whose unit scope matches the marks releases — the block is \
+         caused by the drift, not by the gate refusing everything"
+    );
+}
+
+/// **B-2, the backstop arm — a report that enumerates SOME of the marked
+/// units does not release the rest.**
+///
+/// The same defect one unit over, and the reason the check is written as
+/// scope EQUALITY rather than as "marks exist and the report enumerates
+/// none": the characteristic-coverage join is name-keyed, so a report frozen
+/// over SN-001…SN-002 covers `Bore D` for a later SN-003 that nobody
+/// measured.
+///
+/// This arm is NOT reachable through the application: `record_part_marks`
+/// refuses once a WO has any mark (`PartMarkError::AlreadyMarked`), so the
+/// extra mark has to be written directly — the same posture as
+/// `refuse_unparseable_report_timestamps`, which also only an out-of-band
+/// write can reach. It is pinned anyway so the equality form is not a
+/// silently untested widening.
+///
+/// **The mutation:** narrow the check back to
+/// `current.serial_range.is_none() && !marks_now.is_empty()`. The extra unit
+/// then ships.
+#[test]
+fn a_report_covering_only_some_marked_units_does_not_release_the_rest() {
+    let db = setup();
+    let mut conn = Connection::open(&db).unwrap();
+    let buyer = create_partner(
+        &conn,
+        T,
+        &partner_inputs("Prime Aero", CustomerType::Defense),
+    )
+    .unwrap();
+    seed_wo(&conn, "wo-def", "3");
+    seed_dispatch(&conn, "dsp-def", "wo-def", &buyer.id);
+    let units = mark_units(&conn, "wo-def", 2);
+
+    let p1 = seed_plan(&conn, "Bore D", "1", true);
+    measure_at(&mut conn, &p1, &units[0].part_uid, 25.0, now());
+    measure_at(&mut conn, &p1, &units[1].part_uid, 25.0, now());
+
+    let (qcr_id, d1) = issue_report_for(&mut conn, &units);
+    assert_eq!(d1, Disposition::Accept);
+    let d = dispatch(&conn, "dsp-def");
+    assert_eq!(
+        resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap(),
+        QcReportGate::Pass,
+        "precondition: the report covers exactly the two marked units"
+    );
+
+    // A third unit appears in `wo_part_marks`. The marking ROUTE refuses
+    // this (`AlreadyMarked`), so it is written directly — which is the only
+    // way this arm is reachable at all.
+    let extra_uid = generate_part_uid();
+    conn.execute(
+        "INSERT INTO wo_part_marks (
+            tenant_id, wo_id, unit_index, part_uid, serial_number,
+            data_matrix_payload, heat_lot_reference, marked_at_utc, marked_by_operator
+         ) VALUES (?1, 'wo-def', 3, ?2, 'SN-003', ?3, 'HL-9911', '2026-08-02T00:00:00Z', 'op')",
+        params![
+            T,
+            &extra_uid,
+            data_matrix_payload(&extra_uid, "SN-003", None)
+        ],
+    )
+    .unwrap();
+
+    let d = dispatch(&conn, "dsp-def");
+    match resolve_qc_report_gate_with_capability(&conn, T, &d, QC_REPORTING_ON).unwrap() {
+        QcReportGate::Blocked {
+            reason, qcr_id: id, ..
+        } => {
+            assert_eq!(
+                reason,
+                QcReportBlockReason::UnitDrift,
+                "a third unit the report never enumerated must not ship on it"
+            );
+            assert_eq!(id.as_deref(), Some(qcr_id.as_str()));
+        }
+        other => panic!("an unenumerated third unit shipped: {other:?}"),
+    }
 }
